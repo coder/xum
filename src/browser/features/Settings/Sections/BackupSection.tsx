@@ -172,6 +172,14 @@ function draftsEqual(left: BackupDraft, right: BackupDraft): boolean {
   );
 }
 
+/** The save error for the first required field the draft leaves blank, or null. */
+function getMissingFieldError(draft: BackupDraft): string | null {
+  if (draft.repoUrl.trim() === "") return "Repository URL is required.";
+  if (draft.branch.trim() === "") return "Branch is required.";
+  if (draft.path.trim() === "") return "Subdirectory is required.";
+  return null;
+}
+
 function getOperationErrorMessage(error: BackupOperationError): string {
   if (!error.files?.length) return error.message;
   return `${error.message}: ${error.files.join(", ")}`;
@@ -312,6 +320,7 @@ export function BackupSection() {
   const refreshGenerationRef = useRef(0);
   const draftRef = useRef(draft);
   const savedDraftRef = useRef(savedDraft);
+  const settingsLoadedRef = useRef(false);
   const refreshRef = useRef<((options?: { markFresh?: boolean }) => Promise<void>) | null>(null);
   draftRef.current = draft;
   savedDraftRef.current = savedDraft;
@@ -341,7 +350,9 @@ export function BackupSection() {
     // Liveness belongs to this API subscription. An older effect can finish after its
     // replacement starts, so sharing this flag across generations creates stale writes.
     let streamLive = false;
-    setLoading(true);
+    // Only the first load hides the form: a new client (reconnect) reloads behind the shown
+    // settings. Destructive actions still wait until the reload is fresh.
+    if (!settingsLoadedRef.current) setLoading(true);
     setSettingsFresh(false);
     setSaveError(null);
 
@@ -360,6 +371,7 @@ export function BackupSection() {
           setDraft(nextDraft);
         }
         savedDraftRef.current = nextDraft;
+        settingsLoadedRef.current = true;
         setSavedDraft(nextDraft);
         if (options?.markFresh !== false && streamLive) setSettingsFresh(true);
         setSaveError(null);
@@ -445,16 +457,9 @@ export function BackupSection() {
 
   async function handleSave() {
     if (!api || activeAction !== null) return;
-    if (draft.repoUrl.trim() === "") {
-      setSaveError("Repository URL is required.");
-      return;
-    }
-    if (draft.branch.trim() === "") {
-      setSaveError("Branch is required.");
-      return;
-    }
-    if (draft.path.trim() === "") {
-      setSaveError("Subdirectory is required.");
+    const missingField = getMissingFieldError(draft);
+    if (missingField != null) {
+      setSaveError(missingField);
       return;
     }
 

@@ -18,6 +18,7 @@ import { useChatTranscriptFullWidth } from "@/browser/hooks/useChatTranscriptFul
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { useTranscriptDensity } from "@/browser/hooks/useTranscriptDensity";
 import { useAPI } from "@/browser/contexts/API";
+import { isAbortError } from "@/browser/utils/isAbortError";
 import { useExperiment, useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import assert from "@/common/utils/assert";
@@ -314,7 +315,8 @@ export function GeneralSection() {
       return;
     }
 
-    setArchiveSettingsLoaded(false);
+    // No setArchiveSettingsLoaded(false): a new client (reconnect) reloads behind the loaded
+    // values, and the nonces below keep a choice the user makes meanwhile.
     const archiveBehaviorNonce = ++archiveBehaviorLoadNonceRef.current;
     const llmDebugLogsNonce = ++llmDebugLogsLoadNonceRef.current;
     const keepScreenAwakeNonce = ++keepScreenAwakeLoadNonceRef.current;
@@ -350,7 +352,10 @@ export function GeneralSection() {
           setKeepScreenAwake(keepScreenAwakeSavedRef.current);
         }
       })
-      .catch(() => {
+      .catch((error: unknown) => {
+        // A lost connection is no read failure: the reconnect reads again. The defaults must
+        // not become editable (and saved) in the meantime.
+        if (isAbortError(error)) return;
         if (archiveBehaviorNonce === archiveBehaviorLoadNonceRef.current) {
           // Fall back to the safe defaults already in state so the controls can recover after a
           // config read failure and the next user change can persist a fresh value.
@@ -358,6 +363,8 @@ export function GeneralSection() {
         }
       });
   }, [api]);
+
+  const archiveControlsDisabled = !api?.config?.updateCoderPrefs || !archiveSettingsLoaded;
 
   const queueArchiveBehaviorUpdate = useCallback(() => {
     if (!api?.config?.updateCoderPrefs || !archiveSettingsLoaded) {
@@ -1147,7 +1154,7 @@ export function GeneralSection() {
               onValueChange={(value) =>
                 handleArchiveBehaviorChange(value as CoderWorkspaceArchiveBehavior)
               }
-              disabled={!api?.config?.updateCoderPrefs || !archiveSettingsLoaded}
+              disabled={archiveControlsDisabled}
             >
               <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
                 <SelectValue />
@@ -1175,7 +1182,7 @@ export function GeneralSection() {
               onValueChange={(value) =>
                 handleWorktreeArchiveBehaviorChange(value as WorktreeArchiveBehavior)
               }
-              disabled={!api?.config?.updateCoderPrefs || !archiveSettingsLoaded}
+              disabled={archiveControlsDisabled}
             >
               <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
                 <SelectValue />

@@ -46,6 +46,7 @@ import {
 } from "@/common/types/thinking";
 import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import { getErrorMessage } from "@/common/utils/errors";
+import { isAbortError } from "@/browser/utils/isAbortError";
 import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
@@ -282,6 +283,11 @@ function areAgentAiDefaultsEqual(a: AgentAiDefaults, b: AgentAiDefaults): boolea
 
   return true;
 }
+function clearSaveTimer(timerRef: { current: ReturnType<typeof setTimeout> | null }): void {
+  if (timerRef.current) clearTimeout(timerRef.current);
+  timerRef.current = null;
+}
+
 function coerceAgentId(value: unknown): string {
   return normalizeAgentId(value, WORKSPACE_DEFAULTS.agentId);
 }
@@ -424,12 +430,13 @@ export function TasksSection() {
   // Resolve the workspace's active model so that when a sub-agent's model is
   // "Inherit", we show thinking levels for the workspace model (falling back to
   // the global default). This mirrors the workspace model resolution chain used when sending messages.
-  const selectedWorkspaceId = selectedWorkspace?.workspaceId ?? null;
-  const workspaceModel = useWorkspaceAiSelection(selectedWorkspaceId ?? "").model;
+  const selectedWorkspaceId = selectedWorkspace?.workspaceId ?? "";
+  const workspaceModel = useWorkspaceAiSelection(selectedWorkspaceId).model;
   const inheritedEffectiveModel = selectedWorkspaceId ? workspaceModel : getDefaultModel();
 
   const lastSyncedTaskSettingsRef = useRef<TaskSettings | null>(null);
   const lastSyncedAgentAiDefaultsRef = useRef<AgentAiDefaults | null>(null);
+  const shownAgentsScopeRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!api) return;
@@ -441,6 +448,12 @@ export function TasksSection() {
     void api.config
       .getConfig()
       .then((cfg) => {
+        // A reload after a reconnect keeps values the user changed and not yet saved: the
+        // autosave sends them through the new client once `loaded` is back.
+        if (pendingSaveRef.current != null || savingRef.current) {
+          setLoaded(true);
+          return;
+        }
         const normalizedTaskSettings = normalizeTaskSettings(cfg.taskSettings);
         setTaskSettings(normalizedTaskSettings);
         const normalizedAgentDefaults = normalizeAgentAiDefaults(cfg.agentAiDefaults);
@@ -453,6 +466,8 @@ export function TasksSection() {
         setLoaded(true);
       })
       .catch((error: unknown) => {
+        // A lost connection is no load failure: the reconnect loads again.
+        if (isAbortError(error)) return;
         setSaveError(getErrorMessage(error));
         setLoadFailed(true);
         setLoaded(true);
@@ -473,8 +488,14 @@ export function TasksSection() {
     }
 
     let cancelled = false;
-    setAgentsLoaded(false);
-    setAgentsLoadFailed(false);
+    // Only a new scope shows "Loading agents…": a new client (reconnect) reloads the same
+    // scope behind the shown list.
+    const scope = JSON.stringify([projectPath, workspaceId]);
+    if (shownAgentsScopeRef.current !== scope) {
+      shownAgentsScopeRef.current = scope;
+      setAgentsLoaded(false);
+      setAgentsLoadFailed(false);
+    }
 
     void Promise.all([
       api.agents.list({ projectPath, workspaceId }),
@@ -487,8 +508,8 @@ export function TasksSection() {
         setAgentsLoadFailed(false);
         setAgentsLoaded(true);
       })
-      .catch(() => {
-        if (cancelled) return;
+      .catch((error: unknown) => {
+        if (cancelled || isAbortError(error)) return;
         setAgents([]);
         setEnabledAgentIds(FALLBACK_AGENTS.map((agent) => agent.id));
         setAgentsLoadFailed(true);
@@ -519,20 +540,14 @@ export function TasksSection() {
       areAgentAiDefaultsEqual(lastAgentDefaults, agentAiDefaults)
     ) {
       pendingSaveRef.current = null;
-      if (saveTimerRef.current) {
-        clearTimeout(saveTimerRef.current);
-        saveTimerRef.current = null;
-      }
+      clearSaveTimer(saveTimerRef);
       return;
     }
 
     // Readers of the shared store see the edit before the debounced save lands.
     getAppConfigStore().updateOptimistically({ agentAiDefaults });
 
-    if (saveTimerRef.current) {
-      clearTimeout(saveTimerRef.current);
-      saveTimerRef.current = null;
-    }
+    clearSaveTimer(saveTimerRef);
 
     saveTimerRef.current = setTimeout(() => {
       const flush = () => {
@@ -600,10 +615,7 @@ export function TasksSection() {
     }, 400);
 
     return () => {
-      if (saveTimerRef.current) {
-        clearTimeout(saveTimerRef.current);
-        saveTimerRef.current = null;
-      }
+      clearSaveTimer(saveTimerRef);
     };
   }, [api, agentAiDefaults, loaded, loadFailed, taskSettings]);
 
@@ -614,10 +626,7 @@ export function TasksSection() {
     if (loadFailed) return;
 
     return () => {
-      if (saveTimerRef.current) {
-        clearTimeout(saveTimerRef.current);
-        saveTimerRef.current = null;
-      }
+      clearSaveTimer(saveTimerRef);
 
       if (savingRef.current) return;
       const payload = pendingSaveRef.current;

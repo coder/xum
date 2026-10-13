@@ -7,6 +7,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { APIProvider } from "@/browser/contexts/API";
+import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
 import {
   createTestApiClient,
   createTestConfig,
@@ -941,6 +942,43 @@ describe("GeneralSection", () => {
 
     act(() => resolveWrite?.());
     await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
+  });
+
+  // A reconnect reloads the config through the new client. The archive controls keep their
+  // loaded values and stay enabled while that reload is pending.
+  describe.each([...GAP_MODES])("across a reconnect (%s)", (mode) => {
+    test("keeps the archive controls enabled while the reload is pending", async () => {
+      const setup = createMockAPI({ worktreeArchiveBehavior: "delete" });
+      mockApi = setup.api;
+      getAppConfigStore().setClient(createTestApiClient(mockApi));
+      const harness = createConnectionHarness(mode, () => mockApi);
+      const view = render(
+        <harness.Wrapper>
+          <ThemeProvider forcedTheme="dark">
+            <GeneralSection />
+          </ThemeProvider>
+        </harness.Wrapper>
+      );
+      await waitFor(() => {
+        const trigger = getSelectTrigger(view, "Worktree archive behavior");
+        expect(trigger.textContent).toContain("Delete checkout");
+        expect(trigger.hasAttribute("disabled")).toBe(false);
+      });
+
+      mockApi = {
+        ...setup.api,
+        config: { ...setup.api.config, getConfig: () => new Promise(() => undefined) },
+      };
+      await harness.drop();
+      harness.reconnect();
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      });
+
+      const trigger = getSelectTrigger(view, "Worktree archive behavior");
+      expect(trigger.textContent).toContain("Delete checkout");
+      expect(trigger.hasAttribute("disabled")).toBe(false);
+    });
   });
 
   test("renders the worktree archive behavior copy and loads the saved value", async () => {

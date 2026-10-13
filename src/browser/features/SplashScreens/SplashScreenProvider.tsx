@@ -14,6 +14,7 @@ import {
   type SplashConfig,
 } from "./index";
 import { useAPI } from "@/browser/contexts/API";
+import { isAbortError } from "@/browser/utils/isAbortError";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 
 const SplashScreenActiveContext = createContext(false);
@@ -41,6 +42,17 @@ export function useOnboardingPause(): OnboardingPauseContextValue {
   return ctx;
 }
 
+/** The registry's undismissed splashes, sorted by priority (highest number first). */
+function getActiveSplashQueue(viewedIds: readonly string[]): SplashConfig[] {
+  return SPLASH_REGISTRY.filter((splash) => {
+    // Priority 0 = never show
+    if (splash.priority === 0) return false;
+
+    // Check if this splash has been viewed
+    return !viewedIds.includes(splash.id);
+  }).sort((a, b) => b.priority - a.priority); // Higher number = higher priority = shown first
+}
+
 export function SplashScreenProvider({ children }: { children: ReactNode }) {
   const { api } = useAPI();
   const { registerOnClose } = useSettings();
@@ -60,18 +72,10 @@ export function SplashScreenProvider({ children }: { children: ReactNode }) {
     void (async () => {
       try {
         const viewedIds = await api.splashScreens.getViewedSplashScreens();
-
-        // Filter registry to undismissed splashes, sorted by priority (highest number first)
-        const activeQueue = SPLASH_REGISTRY.filter((splash) => {
-          // Priority 0 = never show
-          if (splash.priority === 0) return false;
-
-          // Check if this splash has been viewed
-          return !viewedIds.includes(splash.id);
-        }).sort((a, b) => b.priority - a.priority); // Higher number = higher priority = shown first
-
-        setQueue(activeQueue);
+        setQueue(getActiveSplashQueue(viewedIds));
       } catch (error) {
+        // A lost connection is no load failure: keep the shown splash for the reconnect.
+        if (isAbortError(error)) return;
         console.error("Failed to load viewed splash screens:", error);
         // On error, don't show any splash screens
         setQueue([]);

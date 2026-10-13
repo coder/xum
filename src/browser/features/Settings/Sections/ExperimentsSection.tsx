@@ -23,6 +23,7 @@ import {
 import type { ApiServerStatus, DesktopPrereqStatus } from "@/common/orpc/types";
 import { Input } from "@/browser/components/Input/Input";
 import { useAPI } from "@/browser/contexts/API";
+import { isAbortError } from "@/browser/utils/isAbortError";
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { ArtifactsExperimentConfig } from "./ArtifactsExperimentConfig";
 import { AutoModelRoutingExperimentConfig } from "./AutoModelRoutingExperimentConfig";
@@ -94,6 +95,10 @@ function ExperimentRow(props: ExperimentRowProps) {
   );
 }
 
+function isPortableDesktopBinaryMissing(status: DesktopPrereqStatus | null): boolean {
+  return !status?.available && status?.reason === "binary_not_found";
+}
+
 export function PortableDesktopExperimentWarning() {
   const enabled = useExperimentValue(EXPERIMENT_IDS.PORTABLE_DESKTOP);
   const { api } = useAPI();
@@ -125,7 +130,8 @@ export function PortableDesktopExperimentWarning() {
 
       setPrereqStatus(nextStatus);
     } catch (e) {
-      if (requestIdRef.current !== requestId) {
+      // A lost connection is no check failure: the reconnect checks again.
+      if (requestIdRef.current !== requestId || isAbortError(e)) {
         return;
       }
 
@@ -140,10 +146,13 @@ export function PortableDesktopExperimentWarning() {
   useEffect(() => {
     if (!enabled || !api) {
       requestIdRef.current += 1;
-      setPrereqStatus(null);
       setLoading(false);
       setRestarting(false);
-      setError(null);
+      // Offline (`!api`), keep the shown status: the reconnect checks again.
+      if (!enabled) {
+        setPrereqStatus(null);
+        setError(null);
+      }
       return;
     }
 
@@ -173,7 +182,7 @@ export function PortableDesktopExperimentWarning() {
     }
   }, [api]);
 
-  const isBinaryMissing = !prereqStatus?.available && prereqStatus?.reason === "binary_not_found";
+  const isBinaryMissing = isPortableDesktopBinaryMissing(prereqStatus);
 
   if (!enabled || !isBinaryMissing) {
     return null;

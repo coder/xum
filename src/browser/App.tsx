@@ -298,7 +298,7 @@ function AppInner() {
   const [supportedUpdateChannels, setSupportedUpdateChannels] = useState<UpdateChannel[]>([]);
 
   useEffect(() => {
-    setSupportedUpdateChannels([]);
+    // No reset here: a reconnect (new client) keeps the listed channels until the reload answers.
     if (!api) return;
 
     let active = true;
