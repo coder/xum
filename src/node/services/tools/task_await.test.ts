@@ -1385,6 +1385,37 @@ describe("task_await tool", () => {
     expect((await read({ offset_chars: 0 })).structuredOutput).toEqual(structuredOutput);
   });
 
+  it("drops structuredOutput from a later-page read of an empty report", async () => {
+    using tempDir = new TestTempDir("test-task-await-tool-empty-report-pages");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const structuredOutput = { findings: "x".repeat(60_000) };
+    const tool = createTaskAwaitTool({
+      ...baseConfig,
+      ...createFakeTaskServices({
+        listActiveDescendantAgentTaskIds: mock(() => ["t1"]),
+        isDescendantAgentTask: mock(() => Promise.resolve(true)),
+        getAgentTaskStatus: mock(() => "reported" as const),
+        waitForAgentReport: mock(() => Promise.resolve({ reportMarkdown: "", structuredOutput })),
+      }),
+    });
+    const read = async (offset: number) => {
+      const result = (await Promise.resolve(
+        tool.execute!(
+          { task_ids: ["t1"], timeout_secs: 0, offset_chars: offset },
+          mockToolCallOptions
+        )
+      )) as { results: Array<ReportPage & { structuredOutput?: unknown }> };
+      return result.results[0];
+    };
+
+    // An empty report reads back the same empty text at any offset: the requested offset,
+    // not the text, decides which read is the first page.
+    expect((await read(0)).structuredOutput).toEqual(structuredOutput);
+    const later = await read(TOOL_TEXT_PAGE_MAX_CHARS);
+    expect(later.reportMarkdown).toBe("");
+    expect(later).not.toHaveProperty("structuredOutput");
+  });
+
   it("returns retry_from_checkpoint guidance for checkpoint-retryable failed workflow runs", async () => {
     using tempDir = new TestTempDir("test-task-await-tool-workflow-retryable-failed");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });

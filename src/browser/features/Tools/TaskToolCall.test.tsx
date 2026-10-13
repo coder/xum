@@ -385,6 +385,109 @@ describe("TaskToolCall", () => {
     expect(view.container.textContent).toContain(report);
   });
 
+  describe("paged foreground reports", () => {
+    const report = "Page zero. Page one. Page two.";
+    const foregroundArgs = {
+      subagent_type: "explore",
+      prompt: "Look around.",
+      title: "Explore task",
+      run_in_background: false,
+    };
+    const firstPage = pageToolText(report, 0, 10);
+    const awaitPage = (taskId: string, offset: number, text = report) => {
+      const page = pageToolText(text, offset, 10);
+      return createToolMessage({
+        toolName: "task_await",
+        args: { task_ids: [taskId], ...(offset > 0 ? { offset_chars: offset } : {}) },
+        result: {
+          results: [
+            {
+              status: "completed",
+              taskId,
+              reportMarkdown: page.text,
+              ...(page.startCharOffset != null ? { startCharOffset: page.startCharOffset } : {}),
+              ...(page.nextCharOffset != null ? { nextCharOffset: page.nextCharOffset } : {}),
+            },
+          ],
+        },
+      });
+    };
+    const renderCard = (result: unknown, laterMessages: DisplayedMessage[]) => {
+      workspaceContextMock = { workspaceMetadata: new Map() };
+      const linking = computeTaskReportLinking([
+        createToolMessage({ toolName: "task", args: foregroundArgs, result }),
+        ...laterMessages,
+      ]);
+      const AgentTaskToolCall = getToolComponent("task", foregroundArgs, undefined);
+      const view = render(
+        <TooltipProvider>
+          <AgentTaskToolCall
+            args={foregroundArgs}
+            result={result}
+            taskReportLinking={linking}
+            status="completed"
+          />
+        </TooltipProvider>
+      );
+      fireEvent.click(view.getByText("task"));
+      return { linking, text: view.container.textContent ?? "" };
+    };
+    const singleResult = (taskId: string) => ({
+      status: "completed",
+      taskId,
+      reportMarkdown: firstPage.text,
+      nextCharOffset: firstPage.nextCharOffset,
+    });
+
+    test("shows the whole report after the agent rereads every page from 0", () => {
+      const card = renderCard(singleResult("fg-reread"), [
+        awaitPage("fg-reread", 0),
+        awaitPage("fg-reread", 10),
+        awaitPage("fg-reread", 20),
+      ]);
+      expect(card.linking.suppressReportInAwaitTaskIds.has("fg-reread")).toBe(true);
+      expect(card.text).toContain(report);
+    });
+
+    test("joins continuation pages onto a best-of candidate's first page", () => {
+      const card = renderCard(
+        {
+          status: "completed",
+          taskIds: ["fg-a", "fg-b"],
+          reports: [
+            {
+              taskId: "fg-a",
+              reportMarkdown: firstPage.text,
+              nextCharOffset: firstPage.nextCharOffset,
+            },
+            { taskId: "fg-b", reportMarkdown: "Short report." },
+          ],
+        },
+        [awaitPage("fg-a", 10), awaitPage("fg-a", 20)]
+      );
+      expect(card.linking.suppressReportInAwaitTaskIds.has("fg-a")).toBe(true);
+      expect(card.text).toContain(report);
+      expect(card.text).toContain("Short report.");
+    });
+
+    test("starts a new join when a woken task reports again", () => {
+      // The second attempt's first page matches the first attempt's text.
+      const secondReport = "Page zero. Fresh end.";
+      const card = renderCard(singleResult("fg-again"), [
+        awaitPage("fg-again", 10),
+        awaitPage("fg-again", 20),
+        createToolMessage({
+          toolName: "task_send_message",
+          args: { task_id: "fg-again", message: "Once more." },
+          result: { status: "reactivated", taskId: "fg-again" },
+        }),
+        awaitPage("fg-again", 0, secondReport),
+      ]);
+      expect(card.linking.reportByTaskId.get("fg-again")?.reportMarkdown).toBe("Page zero.");
+      expect(card.text).not.toContain("Page one.");
+    });
+  });
+
   test("joins a report page at the start the pager rounded to", () => {
     // offset_chars 10 points inside the emoji's surrogate pair: the pager starts at 9.
     const report = `${"a".repeat(9)}😀tail`;

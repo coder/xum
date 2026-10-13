@@ -117,25 +117,29 @@ function pageCompletedReport<T extends { status: string; taskId: string }>(
   result: T,
   offsetChars: number | null | undefined
 ): T {
-  if (result.status !== "completed" || fromBashTaskId(result.taskId) != null) return result;
-  if (!("reportMarkdown" in result) || typeof result.reportMarkdown !== "string") return result;
+  if (!isPageableReport(result)) return result;
   const { text, ...paging } = pageTaskReportForResult(
     result.taskId,
     result.reportMarkdown,
     offsetChars
   );
-  // A whole report keeps its result as is (including the re-fetch note).
-  if (text === result.reportMarkdown) return result;
-  return dropStructuredOutputAfterFirstPage({ ...result, reportMarkdown: text, ...paging });
+  const firstPage = (offsetChars ?? 0) === 0;
+  // A whole report read from the start keeps its result as is (including the re-fetch note).
+  if (firstPage && text === result.reportMarkdown) return result;
+  const page = { ...result, reportMarkdown: text, ...paging };
+  // structuredOutput has no size bound: only a read from offset 0 carries it, so reading a
+  // report page by page does not repeat it. Decided by the requested offset, not by the text:
+  // an empty report reads back the same empty text at any offset.
+  if (!firstPage) Reflect.deleteProperty(page, "structuredOutput");
+  return page;
 }
 
-/**
- * structuredOutput has no size bound: only the first page carries it, so reading a report
- * page by page does not repeat it on every page.
- */
-function dropStructuredOutputAfterFirstPage<T extends { startCharOffset?: number }>(page: T): T {
-  if (page.startCharOffset != null) Reflect.deleteProperty(page, "structuredOutput");
-  return page;
+/** A completed, non-bash result with a string report: the results report paging applies to. */
+function isPageableReport<T extends { status: string; taskId: string }>(
+  result: T
+): result is T & { reportMarkdown: string } {
+  if (result.status !== "completed" || fromBashTaskId(result.taskId) != null) return false;
+  return "reportMarkdown" in result && typeof result.reportMarkdown === "string";
 }
 
 function getWorkflowRunElapsedMs(run: WorkflowRunRecord): number | undefined {
