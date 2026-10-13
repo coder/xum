@@ -88,7 +88,7 @@ export function useArchiveWorkspaceConfirmation(options: UseArchiveWorkspaceConf
       }
     }
 
-    options.showError(workspaceId, result.error ?? "Failed to archive chat", anchorEl);
+    options.showError(workspaceId, result.error ?? "Failed to archive workspace", anchorEl);
   };
 
   /** Entry point for archive actions: archives now, asks for confirmation, or shows an error. */
@@ -132,7 +132,7 @@ export function useArchiveWorkspaceConfirmation(options: UseArchiveWorkspaceConf
       ? "Archive workspace with untracked files?"
       : confirmation?.displayTitle
         ? `Archive "${confirmation.displayTitle}" while streaming?`
-        : "Archive chat?",
+        : "Archive workspace?",
     description: buildArchiveConfirmDescription(isStreaming, untrackedPaths),
     warning: buildArchiveConfirmWarning(isStreaming, untrackedPaths),
     confirmLabel: untrackedPaths ? "Archive and delete files" : "Archive",

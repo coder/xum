@@ -299,6 +299,44 @@ export function isAnthropic1MEffectivelyEnabled(
   return hasAnthropic1MIntentForModel(modelString, capabilityModel, muxProviderOptions);
 }
 
+/** The provider options with Anthropic 1M context turned on for `modelString`. */
+export function withAnthropic1MContextIntent(
+  modelString: string,
+  muxProviderOptions: MuxProviderOptions | undefined
+): MuxProviderOptions {
+  const existingModels = muxProviderOptions?.anthropic?.use1MContextModels ?? [];
+  return {
+    ...muxProviderOptions,
+    anthropic: {
+      ...muxProviderOptions?.anthropic,
+      use1MContext: true,
+      use1MContextModels: existingModels.includes(modelString)
+        ? existingModels
+        : [...existingModels, modelString],
+    },
+  };
+}
+
+/**
+ * True when 1M context is off for `modelString` and turning it on would take effect. This is
+ * the case in which AgentSession.resolveCompactionRetryPlan retries a compaction request with
+ * 1M context, so resolveCompactionInputBudgetTokens leaves its first attempt untrimmed.
+ */
+export function canSwitchToAnthropic1MContext(
+  modelString: string,
+  muxProviderOptions: MuxProviderOptions | undefined,
+  providersConfig: ProvidersConfigMap | null | undefined
+): boolean {
+  return (
+    !isAnthropic1MEffectivelyEnabled(modelString, muxProviderOptions, providersConfig) &&
+    isAnthropic1MEffectivelyEnabled(
+      modelString,
+      withAnthropic1MContextIntent(modelString, muxProviderOptions),
+      providersConfig
+    )
+  );
+}
+
 /**
  * Route-aware eligibility for Anthropic's thinking block-binding control.
  *

@@ -733,6 +733,12 @@ export const TaskAwaitToolArgsSchema = z
       .describe(
         "Return once this many awaited tasks complete (default 1, clamped to the count). Use the batch size when you must compare every result, e.g. best-of-n."
       ),
+    offset_chars: z
+      .number()
+      .int()
+      .min(0)
+      .nullish()
+      .describe("Long reports come in pages: pass the previous result's nextCharOffset."),
   })
   .strict()
   .superRefine((args, ctx) => {
@@ -741,6 +747,40 @@ export const TaskAwaitToolArgsSchema = z
         code: z.ZodIssueCode.custom,
         message: "filter_exclude requires filter to be set",
         path: ["filter_exclude"],
+      });
+    }
+    // One offset pages one report: with several IDs (or none, which awaits every task), each
+    // other completed report would silently lose its first offset_chars characters.
+    const ids = new Set(args.task_ids ?? []);
+    const offset = args.offset_chars ?? 0;
+    // Bash output has no report pages: each read returns the next unread output by itself, so
+    // an offset there would only mislead the model into thinking it skipped or re-read output.
+    const bashId = offset > 0 ? [...ids].find((id) => id.startsWith("bash:")) : undefined;
+    if (bashId !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "offset_chars pages agent reports, not bash output. Bash output pages by itself: call " +
+          `task_await(task_ids: [${JSON.stringify(bashId)}], timeout_secs: 0) without offset_chars ` +
+          "to read the next unread output.",
+        path: ["offset_chars"],
+      });
+      return;
+    }
+    if (offset > 0 && ids.size !== 1) {
+      const calls = [...ids].map(
+        (id) =>
+          `task_await(task_ids: [${JSON.stringify(id)}], timeout_secs: 0, offset_chars: ${offset})`
+      );
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "offset_chars pages one report, so it needs exactly one task ID. Call " +
+          (calls.length > 0
+            ? calls.join(" or ")
+            : `task_await(task_ids: ["<id>"], timeout_secs: 0, offset_chars: ${offset})`) +
+          ", and await other tasks without offset_chars.",
+        path: ["offset_chars"],
       });
     }
   });
@@ -815,6 +855,10 @@ export const TaskAwaitToolCompletedResultSchema = z
     elapsed_ms: z.number().optional(),
     exitCode: z.number().optional(),
     note: z.string().optional(),
+    /** Set when reportMarkdown is one page of a longer report (see offset_chars). */
+    nextCharOffset: z.number().optional(),
+    /** Where this reportMarkdown page starts, when the call passed offset_chars. */
+    startCharOffset: z.number().optional(),
     artifacts: TaskAwaitToolArtifactsSchema.optional(),
   })
   .strict();
@@ -2839,6 +2883,16 @@ export const TOOL_DEFINITIONS = {
         owner: z.string().describe("GitHub owner from skills_catalog_search"),
         repo: z.string().describe("GitHub repo from skills_catalog_search"),
         skillId: SkillNameSchema.describe("Skill ID from skills_catalog_search"),
+        offset_chars: z
+          .number()
+          .int()
+          .min(0)
+          .nullish()
+          .describe("Long bodies come in pages: pass the previous result's nextCharOffset."),
+        snapshot: z
+          .string()
+          .nullish()
+          .describe("With offset_chars: the previous result's snapshot."),
       })
       .strict(),
   },

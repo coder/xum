@@ -54,11 +54,11 @@ interface BuiltDocument {
 }
 
 /**
- * SECURITY AUDIT: gate for `window.xum.openWorkspace`. The artifact's script can post it at any
- * time, so the host honours it only while the user's own click or key press inside `frame` is
- * live: focus is on the iframe (a click or Tab into a frame moves the app's activeElement to it,
- * and a hidden frame cannot hold focus), and the app has transient user activation (a gesture
- * in a child frame also activates its ancestors). Each check alone is not enough: typing in the
+ * SECURITY AUDIT: gate for `window.xum.openWorkspace` and the frame's "C" (annotate) key. The
+ * artifact's script can post either at any time, so the host honours them only while the user's
+ * own click or key press inside `frame` is live: focus is on the iframe (a click or Tab into a
+ * frame moves the app's activeElement to it, and a hidden frame cannot hold focus), and the app
+ * has transient user activation (a gesture in a child frame also activates its ancestors). Each check alone is not enough: typing in the
  * composer also activates the app, and focus stays on the frame long after the click.
  * No confirm strip: a switch sends nothing and reveals nothing to the frame, the user can switch
  * back, and the right sidebar is keyed by workspace, so the switch unmounts this frame.
@@ -94,6 +94,34 @@ export function useArtifactsAllowCdnScripts(): boolean {
 }
 
 /**
+ * Host side of `window.xum.openWorkspace`: switch the app to the workspace an artifact names,
+ * or show a notice when that workspace is not available. Callers check the user's gesture
+ * first (hasLiveUserGesture).
+ */
+function useArtifactWorkspaceOpener() {
+  // Targets: the app's active workspaces (archived ones are not in the map).
+  // Optional contexts: hosts without the workspace shell (the VS Code webview) open nothing.
+  const workspaces = useOptionalWorkspaceMetadata()?.workspaceMetadata;
+  const setSelectedWorkspace = useWorkspaceActionsOptional()?.setSelectedWorkspace;
+  const [openWorkspaceRefused, setOpenWorkspaceRefused] = useState(false);
+  const openWorkspace = (workspaceId: string) => {
+    const target = findArtifactWorkspace(workspaces, workspaceId);
+    if (
+      target == null ||
+      setSelectedWorkspace == null ||
+      isWorkspaceArchived(target.archivedAt, target.unarchivedAt)
+    ) {
+      setOpenWorkspaceRefused(true);
+      return;
+    }
+    setOpenWorkspaceRefused(false);
+    // The same navigation the sidebar and the task tool's Open use.
+    setSelectedWorkspace(toWorkspaceSelection(target));
+  };
+  return { openWorkspace, openWorkspaceRefused };
+}
+
+/**
  * HTML and SVG artifacts in a sandboxed iframe (srcdoc + CSP + postMessage bridge).
  * This is the app's only iframe for agent-written content; see artifactCsp.ts,
  * artifactDocument.ts and artifactBridge.ts for the layered rules.
@@ -119,11 +147,7 @@ export function SandboxedArtifactFrame(props: {
   const [initialTheme] = useState(theme);
   const [allowMessage] = useState(() => createBridgeRateLimiter());
   const [built, setBuilt] = useState<BuiltDocument | null>(null);
-  // openWorkspace targets: the app's active workspaces (archived ones are not in the map).
-  // Optional contexts: hosts without the workspace shell (the VS Code webview) open nothing.
-  const workspaces = useOptionalWorkspaceMetadata()?.workspaceMetadata;
-  const setSelectedWorkspace = useWorkspaceActionsOptional()?.setSelectedWorkspace;
-  const [openWorkspaceRefused, setOpenWorkspaceRefused] = useState(false);
+  const { openWorkspace, openWorkspaceRefused } = useArtifactWorkspaceOpener();
   const frameRef = useRef<HTMLIFrameElement | null>(null);
   const { kind, content, path } = props;
   // SECURITY AUDIT: the persisted state goes into the srcdoc, never through postMessage (which
@@ -179,6 +203,10 @@ export function SandboxedArtifactFrame(props: {
       if (message == null) return;
       switch (message.type) {
         case "key":
+          // "C" (the annotate shortcut) can turn annotate mode on, so, like openWorkspace, it
+          // needs the user's own key press in this frame: the artifact's script could post it at
+          // any time. "Escape" and "F" only ever exit, so they need no gesture.
+          if (message.key === "C" && !hasLiveUserGesture(frameRef.current)) break;
           onFrameKey?.(message.key);
           break;
         case "send":
@@ -193,18 +221,7 @@ export function SandboxedArtifactFrame(props: {
           // copies stay read-only. Ignored without a gesture, with no notice, so a script cannot
           // spam the notice either.
           if (interactions == null || !hasLiveUserGesture(frameRef.current)) break;
-          const target = findArtifactWorkspace(workspaces, message.workspaceId);
-          if (
-            target == null ||
-            setSelectedWorkspace == null ||
-            isWorkspaceArchived(target.archivedAt, target.unarchivedAt)
-          ) {
-            setOpenWorkspaceRefused(true);
-            break;
-          }
-          setOpenWorkspaceRefused(false);
-          // The same navigation the sidebar and the task tool's Open use.
-          setSelectedWorkspace(toWorkspaceSelection(target));
+          openWorkspace(message.workspaceId);
           break;
         }
         case "annotate": {
@@ -218,15 +235,7 @@ export function SandboxedArtifactFrame(props: {
     };
     window.addEventListener("message", handler);
     return () => window.removeEventListener("message", handler);
-  }, [
-    allowMessage,
-    onFrameKey,
-    interactions,
-    onAnnotate,
-    navigatedRef,
-    workspaces,
-    setSelectedWorkspace,
-  ]);
+  }, [allowMessage, onFrameKey, interactions, onAnnotate, navigatedRef, openWorkspace]);
 
   const annotating = onAnnotate != null;
   useEffect(() => {
