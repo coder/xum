@@ -274,7 +274,9 @@ class GenerationIterator implements AsyncIteratorObject<unknown, unknown, unknow
   }
 
   async throw(error?: unknown): Promise<IteratorResult<unknown, unknown>> {
-    if (this.inner.throw == null) {
+    // A finished or lost stream has no inner cleanup left to wait for, and after detach() nothing
+    // would settle it: throw the error at once, as a finished generator does.
+    if (this.finished || this.inner.throw == null) {
       this.finish();
       throw error;
     }
