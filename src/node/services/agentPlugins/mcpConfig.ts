@@ -25,7 +25,12 @@ import {
   readPluginFileWithinRootCapped,
 } from "./discovery";
 import { expandPluginPlaceholders, type PluginPlaceholderValues } from "./expansion";
-import { readOpenAIMcpAuth, toServerOAuthConfig, translateCodexMcpEntry } from "./openaiMcpAuth";
+import {
+  PLUGIN_MCP_CONFIG_PARSE_ERROR,
+  readOpenAIMcpAuth,
+  toServerOAuthConfig,
+  translateCodexMcpEntry,
+} from "./openaiMcpAuth";
 
 /**
  * Agent Plugins MCP documents become default-disabled, read-only Xum servers.
@@ -587,9 +592,10 @@ export async function loadPluginMcpServers(
   let raw: unknown;
   try {
     raw = JSON.parse(text) as unknown;
-  } catch (error) {
-    // §7.2.2 rule 2: invalid JSON disables MCP for this plugin only.
-    return disableMcp(`${fileLabel} is not valid JSON: ${getErrorMessage(error)}`);
+  } catch {
+    // §7.2.2 rule 2: invalid JSON disables MCP for this plugin only. The parser message is
+    // not reported: it quotes source text, and a Codex `.mcp.json` holds `client_secret` (#6297).
+    return disableMcp(`${fileLabel}: ${PLUGIN_MCP_CONFIG_PARSE_ERROR}`);
   }
 
   if (!isPlainObject(raw)) {

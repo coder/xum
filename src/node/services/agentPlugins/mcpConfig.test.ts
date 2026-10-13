@@ -322,7 +322,7 @@ describe("loadPluginMcpServers", () => {
     using tmp = new DisposableTempDir("plugin-mcp");
 
     const cases: Array<{ doc: unknown; messagePart: string }> = [
-      { doc: "{ not json", messagePart: "not valid JSON" },
+      { doc: "{ not json", messagePart: "could not be parsed" },
       { doc: [1, 2], messagePart: "must be a JSON object" },
       {
         doc: { $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0, mcpServers: {}, extra: 1 },
@@ -346,6 +346,28 @@ describe("loadPluginMcpServers", () => {
       expect(diagnostics).toHaveLength(1);
       expect(diagnostics[0].severity).toBe("error");
       expect(diagnostics[0].message).toContain(testCase.messagePart);
+    }
+  });
+
+  test("a malformed .mcp.json never reports its secret in a diagnostic or log (#6297)", async () => {
+    using tmp = new DisposableTempDir("plugin-mcp");
+    // An unquoted value: the JSON parser quotes it in its error message.
+    const plugin = await makePlugin(
+      tmp.path,
+      "malformed-codex",
+      '{"gh": {"type": "http", "url": "https://x", "oauth": {"client_id": "c", "client_secret": s3cr3tValue}}}',
+      { fileName: ".mcp.json" }
+    );
+    const warn = spyOn(log, "warn");
+    try {
+      const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
+      expect(servers).toEqual({});
+      expect(diagnostics.map((d) => d.severity)).toEqual(["error"]);
+      expect(JSON.stringify(diagnostics)).not.toContain("s3cr3tValue");
+      expect(warn).toHaveBeenCalled();
+      expect(JSON.stringify(warn.mock.calls)).not.toContain("s3cr3tValue");
+    } finally {
+      warn.mockRestore();
     }
   });
 

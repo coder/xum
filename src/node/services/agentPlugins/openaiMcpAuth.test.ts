@@ -201,8 +201,40 @@ test("readPluginClientSecret reads wrapped and flat Codex server maps", async ()
   const entry = { type: "http", url: "https://x", oauth: { client_id: "c", client_secret: "s1" } };
   for (const doc of [{ mcpServers: { gh: entry } }, { gh: entry }]) {
     await fs.writeFile(mcpConfigPath, JSON.stringify(doc));
-    expect(await readPluginClientSecret({ pluginRoot, mcpConfigPath, serverName: "gh" })).toBe(
+    expect(await readPluginClientSecret({ pluginRoot, mcpConfigPath, serverName: "gh" }, "c")).toBe(
       "s1"
     );
   }
+});
+
+test("readPluginClientSecret returns no secret once the file names another client (#6297)", async () => {
+  using tmp = new DisposableTempDir("plugin-secret");
+  const pluginRoot = await fs.realpath(tmp.path);
+  const mcpConfigPath = path.join(pluginRoot, ".mcp.json");
+  // An edit replaced the client after the flow captured client "c".
+  const entry = { type: "http", url: "https://x", oauth: { client_id: "d", client_secret: "s2" } };
+  await fs.writeFile(mcpConfigPath, JSON.stringify({ gh: entry }));
+  expect(
+    await readPluginClientSecret({ pluginRoot, mcpConfigPath, serverName: "gh" }, "c")
+  ).toBeUndefined();
+});
+
+test("readPluginClientSecret reports malformed JSON without the parser's excerpt (#6297)", async () => {
+  using tmp = new DisposableTempDir("plugin-secret");
+  const pluginRoot = await fs.realpath(tmp.path);
+  const mcpConfigPath = path.join(pluginRoot, ".mcp.json");
+  // An unquoted value: the JSON parser quotes it in its error message.
+  await fs.writeFile(
+    mcpConfigPath,
+    '{"gh": {"oauth": {"client_id": "c", "client_secret": s3cr3tValue}}}'
+  );
+  const error = await readPluginClientSecret(
+    { pluginRoot, mcpConfigPath, serverName: "gh" },
+    "c"
+  ).then(
+    () => undefined,
+    (thrown: unknown) => thrown
+  );
+  expect(error).toBeInstanceOf(Error);
+  expect(String(error)).not.toContain("s3cr3tValue");
 });
