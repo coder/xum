@@ -113,6 +113,7 @@ const PromptCacheWireSchema = z.object({
     .string()
     .refine((value) => !Number.isNaN(Date.parse(value)))
     .optional(),
+  observedSeq: z.number().int().nonnegative().optional(),
 });
 
 /** The wire record of a log row, or undefined when absent or damaged (self-healing). */

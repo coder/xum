@@ -22,6 +22,8 @@ async function send(params: {
   respond: () => Promise<Response>;
   injectCacheControl?: boolean;
   routeIdentity?: typeof ROUTE;
+  signal?: AbortSignal;
+  observeFinalBody?: () => void;
 }): Promise<void> {
   const wrapped = wrapFetchWithAnthropicCacheControl(
     (() => params.respond()) as unknown as typeof fetch,
@@ -29,12 +31,14 @@ async function send(params: {
     {
       injectCacheControl: params.injectCacheControl ?? true,
       routeIdentity: "routeIdentity" in params ? params.routeIdentity : ROUTE,
+      observeFinalBody: params.observeFinalBody,
     }
   );
   await wrapped("https://gateway.example/v1/messages?beta=true", {
     method: "POST",
     headers: params.stepId != null ? { [DEVTOOLS_STEP_ID_HEADER]: params.stepId } : {},
     body: BODY,
+    signal: params.signal,
   }).catch(() => undefined);
 }
 
@@ -102,6 +106,42 @@ describe("wrapFetchWithAnthropicCacheControl — DevTools prompt-cache wire fact
     expect(consumePromptCacheWire("step-abort")).toMatchObject({ dispatched: true });
     await send({ stepId: "step-abort", respond: () => Promise.resolve(new Response("{}")) });
     expect(consumePromptCacheWire("step-abort")).toBeUndefined();
+  });
+
+  it("does not observe an OK response that arrives after the request's abort", async () => {
+    // A fetch that ignored the cancellation returns 2xx after the turn closed the step: the
+    // audit gets no wire record, so the runtime monitor must not move its baseline either.
+    const abort = new AbortController();
+    const observed: string[] = [];
+    await send({
+      stepId: "step-late-ok",
+      signal: abort.signal,
+      observeFinalBody: () => observed.push("late"),
+      respond: () => {
+        abort.abort();
+        closeCapturedRequestBody("step-late-ok");
+        return Promise.resolve(new Response("{}"));
+      },
+    });
+    expect(observed).toEqual([]);
+    expect(consumePromptCacheWire("step-late-ok")).toBeUndefined();
+    // Control: the same OK response without an abort is observed.
+    await send({
+      stepId: "step-in-time",
+      signal: new AbortController().signal,
+      observeFinalBody: () => observed.push("in time"),
+      respond: () => Promise.resolve(new Response("{}")),
+    });
+    expect(observed).toEqual(["in time"]);
+  });
+
+  it("numbers observations so same-millisecond responses keep their order", async () => {
+    await send({ stepId: "step-first", respond: () => Promise.resolve(new Response("{}")) });
+    await send({ stepId: "step-second", respond: () => Promise.resolve(new Response("{}")) });
+    const first = consumePromptCacheWire("step-first")?.observedSeq;
+    const second = consumePromptCacheWire("step-second")?.observedSeq;
+    expect(first).toBeNumber();
+    expect(second).toBeGreaterThan(first ?? Infinity);
   });
 
   it("records nothing without a DevTools step or a route identity", async () => {

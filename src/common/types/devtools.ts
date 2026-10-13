@@ -74,6 +74,11 @@ export interface DevToolsPromptCacheWire {
    * when no attempt got an OK response; such a request neither creates nor breaks a cache entry.
    */
   observedAt?: string;
+  /**
+   * Process-wide observation counter, taken with observedAt: it orders two OK responses that
+   * arrived in the same millisecond. It restarts with the process. Absent in older logs.
+   */
+  observedSeq?: number;
 }
 
 /**

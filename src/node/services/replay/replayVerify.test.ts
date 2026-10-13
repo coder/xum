@@ -346,6 +346,7 @@ describe("replayVerifySession pairing", () => {
       cacheMarkersInjected: true,
       dispatched: true,
       observedAt: firstStep.startedAt,
+      observedSeq: 7,
     };
     ctx.devtoolsLines.splice(
       2,
@@ -390,6 +391,11 @@ describe("replayVerifySession pairing", () => {
       comparedPairs: 2,
       breaks: [{ runId: "run-2", boundary: "turn" }],
     });
+    // The observation counter survives the read: it orders same-millisecond responses.
+    const cut = (await readRecordedSteps(ctx.sessionDir)).find(
+      (step) => step.stepId === "step-cut"
+    );
+    expect(cut?.promptCacheWire?.observedSeq).toBe(7);
     // A damaged wire record falls back to the old rule, which drops a failed step without usage.
     ctx.devtoolsLines[3] = JSON.stringify({
       type: "step-update",

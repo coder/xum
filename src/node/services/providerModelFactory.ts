@@ -835,6 +835,26 @@ function stripAnthropicCacheControlMarkers(json: Record<string, unknown>): void 
  * One fetch attempt of the Anthropic cache wrapper, recording its outcome on the request's
  * DevTools step when the wrapper knows its route (see recordPromptCacheWire).
  */
+/**
+ * Whether the runtime monitor observes this response. Only a request Anthropic accepted with
+ * cache markers: one that rejected before reaching it (auth refresh, connection error) or that
+ * it refused (overloaded, rate limited) neither creates nor breaks a cache entry, so it must
+ * not move the baseline or record a break. Nor does a response that arrived after the
+ * request's abort fired (a fetch that ignored the cancellation): the turn already finalized
+ * that DevTools step as aborted without a wire record, so the replay audit cannot count it,
+ * and the monitor must not either.
+ */
+function isObservableResponse(
+  response: Response,
+  cacheMarkersInjected: boolean,
+  signal: AbortSignal | null | undefined
+): boolean {
+  return cacheMarkersInjected && response.ok && signal?.aborted !== true;
+}
+
+/** Orders observations within one process (see DevToolsPromptCacheWire.observedSeq). */
+let promptCacheObservationSeq = 0;
+
 async function fetchRecordingPromptCacheWire(
   baseFetch: typeof fetch,
   input: Parameters<typeof fetch>[0],
@@ -848,7 +868,7 @@ async function fetchRecordingPromptCacheWire(
 ): Promise<Response> {
   const routeIdentity = wire.options?.routeIdentity;
   if (routeIdentity == null) return baseFetch(input, init);
-  const record = (outcome: { dispatched: boolean; observedAt?: string }) =>
+  const record = (outcome: { dispatched: boolean; observedAt?: string; observedSeq?: number }) =>
     recordPromptCacheWire(wire.stepHeaders, {
       ...routeIdentity,
       // The monitor keys by the request's endpoint too (another base URL, another cache).
@@ -866,7 +886,13 @@ async function fetchRecordingPromptCacheWire(
   // Taken when the monitor observes (right after this returns), so the audit measures the
   // cache TTL from the same time.
   record(
-    response.ok ? { dispatched: true, observedAt: new Date().toISOString() } : { dispatched: true }
+    response.ok
+      ? {
+          dispatched: true,
+          observedAt: new Date().toISOString(),
+          observedSeq: ++promptCacheObservationSeq,
+        }
+      : { dispatched: true }
   );
   return response;
 }
@@ -988,11 +1014,7 @@ export function wrapFetchWithAnthropicCacheControl(
       { ...init, headers: outHeaders, body: newBody },
       { stepHeaders: init.headers, options, cacheMarkersInjected: injectCacheControl }
     );
-    // Observe only a request Anthropic accepted: one that rejected before
-    // reaching it (auth refresh, connection error) or that it refused
-    // (overloaded, rate limited) neither creates nor breaks a cache entry, so
-    // it must not move the baseline or record a break.
-    if (injectCacheControl && response.ok) {
+    if (isObservableResponse(response, injectCacheControl, init.signal)) {
       try {
         options?.observeFinalBody?.(json, requestUrlOf(input));
       } catch {

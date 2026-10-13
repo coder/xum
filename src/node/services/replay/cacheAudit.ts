@@ -307,19 +307,41 @@ function baselineKeyOf(step: RecordedStepRequest): string {
     : `provider\u0000${step.provider ?? ""}\u0000${step.modelId}`;
 }
 
+interface ObservationSortKey {
+  step: RecordedStepRequest;
+  /** Position in the log: the last tie-breaker, and the whole order for older logs. */
+  index: number;
+  at: number;
+  /** Process-wide observation counter (DevToolsPromptCacheWire.observedSeq), when recorded. */
+  seq: number | undefined;
+}
+
+/**
+ * Observation time, then the observation counter for responses in the same millisecond,
+ * then the log order (older logs without a counter, unreadable times).
+ */
+function compareObservation(a: ObservationSortKey, b: ObservationSortKey): number {
+  const delta = a.at - b.at;
+  if (!Number.isNaN(delta) && delta !== 0) return delta;
+  if (a.seq != null && b.seq != null && a.seq !== b.seq) return a.seq - b.seq;
+  return a.index - b.index;
+}
+
 /**
  * Steps in the order the monitor observed them. Overlapping runs can get their OK responses
  * in another order than they started (the log order). Logs without observation times keep
- * the log order; ties and unreadable times keep it too.
+ * the log order.
  */
 function inObservationOrder(steps: readonly RecordedStepRequest[]): RecordedStepRequest[] {
   if (!steps.some((step) => step.promptCacheWire?.observedAt != null)) return [...steps];
   return steps
-    .map((step, index) => ({ step, index, at: stepObservedAtMs(step) }))
-    .sort((a, b) => {
-      const delta = a.at - b.at;
-      return Number.isNaN(delta) || delta === 0 ? a.index - b.index : delta;
-    })
+    .map((step, index) => ({
+      step,
+      index,
+      at: stepObservedAtMs(step),
+      seq: step.promptCacheWire?.observedSeq,
+    }))
+    .sort(compareObservation)
     .map(({ step }) => step);
 }
 

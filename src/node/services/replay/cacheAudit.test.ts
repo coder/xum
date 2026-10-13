@@ -425,6 +425,22 @@ describe("auditStepPrefixes with recorded wire facts", () => {
     expect(audit).toMatchObject({ comparedPairs: 1, breaks: [] });
   });
 
+  test("OK responses in the same millisecond compare in observation-counter order", () => {
+    // Both observed at 10:00:10.000; run-short was observed first (counter 1), though
+    // run-long comes first in the log, so run-long extends run-short's baseline.
+    const audit = auditStepPrefixes([
+      wired("run-long", ["a", "b"], { observedAt: iso(0, 10), observedSeq: 2 }),
+      wired("run-short", ["a"], { observedAt: iso(0, 10), observedSeq: 1 }),
+    ]);
+    expect(audit).toMatchObject({ comparedPairs: 1, breaks: [] });
+    // Older logs without the counter keep the log order for a tie (and report the break).
+    const legacy = auditStepPrefixes([
+      wired("run-long", ["a", "b"], { observedAt: iso(0, 10) }),
+      wired("run-short", ["a"], { observedAt: iso(0, 10) }),
+    ]);
+    expect(legacy).toMatchObject({ comparedPairs: 1, breaks: [{ runId: "run-short" }] });
+  });
+
   test("the cache TTL runs from the observation time, not the start", () => {
     // Started 10:00 but answered OK at 10:04; the next request at 10:06 is two minutes
     // after the monitor's observation, inside the 5-minute default TTL: compared.
