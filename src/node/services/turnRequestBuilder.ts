@@ -198,6 +198,7 @@ import {
   WORKFLOW_RESULT_METADATA_TYPE,
 } from "@/common/utils/workflowRunMessages";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
+import { createPathSkillActivation } from "@/node/services/agentSkills/pathSkillActivation";
 import { eventSpine, type RequestAssembleContext } from "@/node/services/events/eventSpine";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import type { PTCEventWithParent } from "@/node/services/tools/code_execution";
@@ -2629,6 +2630,14 @@ export class TurnRequestBuilder {
       // Dynamic context for tool descriptions (moved from system prompt for better model attention)
       availableSubagents: agentDefinitions,
       availableSkills,
+      // Built once per turn (refusal-fallback rebuilds reuse this config) from the
+      // context window, so path-scoped skills surface once per window.
+      pathSkillActivation: createPathSkillActivation({
+        skills: availableSkills,
+        messages: activeContextMessages,
+        cwd: workspacePath,
+        runtime,
+      }),
       mcpPromptRuntime,
       // Session-segment memory index advertised in the memory tool
       // description (same disclosure mechanic as skills).

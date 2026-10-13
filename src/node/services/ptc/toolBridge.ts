@@ -112,8 +112,15 @@ function extractAdmissionHandle(result: unknown): TaskSpawnAdmissionHandle {
  * independent launches into one cohort, mixing completion/winner selection
  * across prompts.
  */
+const PTC_TOOL_CALL_ID_PREFIX = "ptc-";
+
 function syntheticToolCallId(toolName: string): string {
-  return `ptc-${toolName}-${randomUUID()}`;
+  return `${PTC_TOOL_CALL_ID_PREFIX}${toolName}-${randomUUID()}`;
+}
+
+/** True for a tool execution bridged from a code_execution guest (not a direct model call). */
+export function isPtcBridgedToolCallId(toolCallId: string): boolean {
+  return toolCallId.startsWith(PTC_TOOL_CALL_ID_PREFIX);
 }
 
 /**
