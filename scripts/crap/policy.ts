@@ -205,15 +205,18 @@ function judgeNew(
 
 /**
  * Coverage-based findings on a function whose coverage the Bun inlined-const
- * bug may hide become warnings: the score may be wrong, so it must not block.
- * Floor-cc compares complexity only, so it stays a violation. Remove with the
- * detector (see the REMOVAL TRIGGER in crapper_report.py).
+ * bug may hide become warnings: the head score may be too high, so it must
+ * not block. Only the head counts: the bug only hides hits, so a suspect base
+ * score is no lower than the real one and a head above it still regressed.
+ * The relief applies only when the same rules pass the head at full coverage
+ * (CRAP = CC), so a finding that CC alone proves, and floor-cc, stay
+ * violations. Remove with the detector (see the REMOVAL TRIGGER in
+ * crapper_report.py).
  */
-const COVERAGE_RULES: ReadonlySet<Rule> = new Set(["floor-crap", "crap-tax", "new-function"]);
-
-function bunInlinedConstRelief(finding: Finding): Finding {
-  const suspect = finding.head.bunInlinedConstSuspect === true || finding.base?.bunInlinedConstSuspect === true;
-  if (!suspect || !COVERAGE_RULES.has(finding.rule)) return finding;
+function bunInlinedConstRelief(finding: Finding, judge: (head: FunctionRow) => Finding | null): Finding {
+  const { head } = finding;
+  if (head.bunInlinedConstSuspect !== true || head.crap === null) return finding;
+  if (judge({ ...head, coverage: 1, crap: head.complexity }) !== null) return finding;
   return {
     ...finding,
     severity: "warning",
@@ -248,10 +251,10 @@ export function evaluate(
   const findings: Finding[] = [];
   for (const [key, head] of heads) {
     const before = base.get(key);
-    const finding = before
-      ? compare(key, before, head, changed)
-      : judgeNew(key, head, totals, moves);
-    if (finding) findings.push(bunInlinedConstRelief(finding));
+    const judge = (row: FunctionRow) =>
+      before ? compare(key, before, row, changed) : judgeNew(key, row, totals, moves);
+    const finding = judge(head);
+    if (finding) findings.push(bunInlinedConstRelief(finding, judge));
   }
   findings.sort((a, b) => a.key.localeCompare(b.key));
   return { findings, totalComplexity: totals };

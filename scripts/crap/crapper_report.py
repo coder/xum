@@ -263,11 +263,10 @@ def function_percent(reports: list[dict[int, int]], start: int, end: int, is_cod
 # shape: an unbroken run of listed 0-hit lines (blank lines included, which a
 # process that ran the code never lists) that starts on the line of a literal
 # const's value and ends inside a later function U that uses the const. Lines
-# from the const down to U's start are suspect. F is flagged when it overlaps
-# them and the report decides F's score: it ran F (its entry line is hit, so
-# its zeros count as misses), or no report ran F (it scores 0%). A flagged row
-# keeps its score: a function that never ran also matches when it sits in that
-# range, so the gate warns instead of dropping it.
+# from the const down to U's start are suspect: that report may have run any
+# of them. F is flagged when it overlaps them and scores below 100%. A flagged
+# row keeps its score: a function that never ran also matches when it sits in
+# that range, so the gate warns instead of dropping it.
 INLINED_LITERALS = {"string", "number", "true", "false", "null", "undefined"}
 # Wrappers that keep a literal inlinable (checked on Bun 1.4.3).
 LITERAL_WRAPPERS = {"parenthesized_expression", "as_expression", "satisfies_expression"}
@@ -301,11 +300,33 @@ def inlined_literal(node) -> bool:
     return node.type in INLINED_LITERALS or (node.type == "identifier" and node.text == b"undefined")
 
 
+EARLY_EXITS = {"return_statement", "throw_statement"}
+
+
+def leaves_early_before(body, declaration) -> bool:
+    """Whether a statement of `body` before `declaration` holds a return or throw of this function."""
+
+    for statement in body.named_children:
+        if statement.start_byte >= declaration.start_byte:
+            return False
+        stack = [statement]
+        while stack:
+            node = stack.pop()
+            if node.type in EARLY_EXITS:
+                return True
+            if node.type not in FUNCTION_NODES:
+                stack.extend(node.children)
+    return False
+
+
 def literal_const_scopes(root) -> dict[str, list[tuple[int, object]]]:
     """Literal consts by name: (value line, scope node) for each declaration.
 
     Only module-scope consts and consts directly in a function body: a block
-    inside a function (an `if` body) may not run when the function does.
+    inside a function (an `if` body) may not run when the function does. A
+    body const after a statement that can return or throw is skipped too: when
+    the function leaves early, a correct report also lists the const and an
+    uncalled closure that uses it at 0.
     """
 
     consts: dict[str, list[tuple[int, object]]] = {}
@@ -319,6 +340,8 @@ def literal_const_scopes(root) -> dict[str, list[tuple[int, object]]]:
             scope is not None and scope.type == "statement_block" and scope.parent.type in FUNCTION_NODES
         )
         if scope is None or not (scope.type == "program" or is_function_body):
+            continue
+        if is_function_body and leaves_early_before(scope, node):
             continue
         for declarator in node.named_children:
             name = declarator.child_by_field_name("name")
@@ -392,20 +415,15 @@ def suspect_windows(report: dict[int, int], users: set[tuple[int, int, int]]) ->
     return windows
 
 
-def inlined_const_suspect(
-    reports: list[dict[int, int]], windows: list[list[tuple[int, int]]], start: int, end: int
-) -> bool:
-    """Whether a report hit by the inlined-const bug decides this function's score (see above)."""
+def inlined_const_suspect(windows: list[list[tuple[int, int]]], start: int, end: int, percent: float) -> bool:
+    """Whether the inlined-const bug may have hidden some of this function's coverage (see above).
 
-    hit = [
-        index
-        for index, report_windows in enumerate(windows)
-        if any(first <= end and start <= last for first, last in report_windows)
-    ]
-    if not hit:
-        return False
-    spans = [{line: hits for line, hits in report.items() if start <= line <= end} for report in reports]
-    return any(ran_function(spans[index]) for index in hit) or not any(ran_function(span) for span in spans)
+    A zeroed report may have run any line in its window, and other reports
+    cannot show which lines it covered, so only full coverage clears the flag.
+    """
+
+    overlaps = any(first <= end and start <= last for report_windows in windows for first, last in report_windows)
+    return overlaps and percent < 100.0
 
 
 def score(
@@ -438,9 +456,7 @@ def score(
                     windows = [suspect_windows(report, users) for report in reports] if users else []
                 found = function_percent(reports, function.start_line, function.end_line, is_code)
                 percent = 0.0 if found is None else found
-                suspect = bool(windows) and inlined_const_suspect(
-                    reports, windows, function.start_line, function.end_line
-                )
+                suspect = inlined_const_suspect(windows, function.start_line, function.end_line, percent)
             entry = make_entry(function, percent)
             assert entry.namespace.startswith(old_module), (entry.namespace, old_module)
             rows.append(

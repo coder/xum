@@ -472,9 +472,14 @@ def test_a_called_user_does_not_flag(tmp_path, capsys):
     }
 
 
-def test_another_report_that_ran_the_function_decides_its_score(tmp_path, capsys):
+def test_only_full_coverage_from_another_report_clears_the_flag(tmp_path, capsys):
+    # The zeroed report may have run lines that no other report did.
     ran = "DA:1,12\nDA:2,13\nDA:3,12\nDA:5,12\nDA:6,13\nDA:9,0\n"
     assert suspects(capsys, tmp_path, REPRO, REPRO_CALLED_ONLY, ran)["called"] == (1.0, False)
+    source = REPRO.replace("  return x * 2;\n", "  if (x > 0) return x;\n  return x * 2;\n")
+    partly = "DA:1,12\nDA:2,13\nDA:3,12\nDA:5,12\nDA:6,13\nDA:7,0\nDA:10,0\n"
+    zeroed = "DA:1,12\n" + "".join(f"DA:{line},0\n" for line in range(2, 11))
+    assert suspects(capsys, tmp_path, source, zeroed, partly)["called"] == (0.6667, True)
 
 
 def test_a_local_const_used_by_an_uncalled_closure_flags_the_function_that_ran(tmp_path, capsys):
@@ -495,3 +500,25 @@ export function outer(items: number[]): number {
     # score stays.
     report = "DA:1,16\nDA:2,0\nDA:3,0\nDA:4,0\nDA:5,0\nDA:6,0\nDA:7,0\nDA:10,12\n"
     assert suspects(capsys, tmp_path, source, report) == {"outer": (0.2857, True)}
+
+
+def test_a_local_const_after_an_early_return_does_not_flag(tmp_path, capsys):
+    source = """\
+export function outer(items: number[]): number {
+  if (items.length === 0) return 0;
+  const STEP = 3;
+  let total = 0;
+  const later = () => {
+    return total + STEP;
+  };
+  return total;
+}
+"""
+    # Bun 1.4.3, outer([]) called: the early return skipped lines 3-8, so their
+    # zeros are right.
+    report = "DA:1,16\nDA:2,34\nDA:3,0\nDA:4,0\nDA:5,0\nDA:6,0\nDA:8,0\n"
+    assert suspects(capsys, tmp_path, source, report) == {"outer": (0.2857, False)}
+    # A return inside a nested function leaves only that function.
+    nested = source.replace("  if (items.length === 0) return 0;\n", "  items.map(() => {\n    return 1;\n  });\n")
+    shifted = "DA:1,16\nDA:2,34\nDA:3,1\nDA:4,1\n" + "".join(f"DA:{line},0\n" for line in (5, 6, 7, 8, 10))
+    assert suspects(capsys, tmp_path, nested, shifted)["outer"][1] is True

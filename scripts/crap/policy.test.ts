@@ -207,25 +207,44 @@ test("a Crap-Debt downgrades every violation to a warning", () => {
 describe("Bun inlined-const suspects", () => {
   const suspect = (base: FunctionRow): FunctionRow => ({ ...base, bunInlinedConstSuspect: true });
 
-  test("coverage-based findings warn when the head or base row is suspect", () => {
+  test("coverage-based findings on a suspect head warn", () => {
     const base = row("f", 5, [1, 9], 1);
     const lost = row("f", 5, [1, 9], 0);
     expect(verdicts([base], [lost])).toEqual([["floor-crap", "violation", `${PATH}::demo.mod::f`]]);
     expect(verdicts([base], [suspect(lost)])).toEqual([
       ["floor-crap", "warning", `${PATH}::demo.mod::f`],
     ]);
-    // A suspect base score is no floor either.
-    expect(verdicts([suspect(row("f", 6, [1, 9], 0))], [row("f", 6, [1, 9], 0)], touchedAt(3))).toEqual([
+    const hotspot = row("f", 6, [1, 9], 0);
+    expect(verdicts([hotspot], [hotspot], touchedAt(3))).toEqual([
+      ["crap-tax", "violation", `${PATH}::demo.mod::f`],
+    ]);
+    expect(verdicts([hotspot], [suspect(hotspot)], touchedAt(3))).toEqual([
       ["crap-tax", "warning", `${PATH}::demo.mod::f`],
     ]);
-    expect(verdicts([row("f", 6, [1, 9], 0)], [row("f", 6, [1, 9], 0)], touchedAt(3))).toEqual([
-      ["crap-tax", "violation", `${PATH}::demo.mod::f`],
+    expect(verdicts([], [row("g", 3, [1, 9], 0)])).toEqual([
+      ["new-function", "violation", `${PATH}::demo.mod::g`],
     ]);
     expect(verdicts([], [suspect(row("g", 3, [1, 9], 0))])).toEqual([
       ["new-function", "warning", `${PATH}::demo.mod::g`],
     ]);
-    expect(verdicts([], [row("g", 3, [1, 9], 0)])).toEqual([
+  });
+
+  test("a suspect base gets no relief: the bug can only raise its score", () => {
+    const hotspot = row("f", 6, [1, 9], 0);
+    expect(verdicts([suspect(hotspot)], [hotspot], touchedAt(3))).toEqual([
+      ["crap-tax", "violation", `${PATH}::demo.mod::f`],
+    ]);
+  });
+
+  test("findings that CC alone proves stay violations", () => {
+    // CRAP is at least CC: a new CC 9 function fails even at full coverage.
+    expect(verdicts([], [suspect(row("g", 9, [1, 9], 0))])).toEqual([
       ["new-function", "violation", `${PATH}::demo.mod::g`],
+    ]);
+    // A fully covered CC 31 hotspot that keeps its CC cannot end lower: at
+    // full coverage it passes the CRAP floor but still owes the CRAP tax.
+    expect(verdicts([row("f", 31, [1, 9], 1)], [suspect(row("f", 31, [1, 9], 0))], touchedAt(3))).toEqual([
+      ["floor-crap", "violation", `${PATH}::demo.mod::f`],
     ]);
   });
 
