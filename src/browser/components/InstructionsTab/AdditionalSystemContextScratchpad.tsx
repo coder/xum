@@ -2,13 +2,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowUpRight, BookOpen } from "lucide-react";
 
 import { ChatInputDecoration } from "@/browser/components/ChatPane/ChatInputDecoration";
-import { useAPI, type APIClient } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import {
   type AdditionalSystemContextSnapshot,
   getAdditionalSystemContextFocusGeneration,
   getAdditionalSystemContextVersion,
   queueAdditionalSystemContextSave,
-  readAdditionalSystemContextSnapshot,
   requestAdditionalSystemContextFocus,
   subscribeAdditionalSystemContextFocus,
   updateAdditionalSystemContextSnapshot,
@@ -42,6 +41,11 @@ interface ScratchpadState {
   content: string;
   enabled: boolean;
   loading: boolean;
+  /**
+   * Editing is off while the text loads, and while there is no live connection to save to (the
+   * editor keeps showing the text).
+   */
+  disabled: boolean;
   /** True once the save has been in flight longer than the indicator delay. */
   savingVisible: boolean;
   error: string | null;
@@ -49,121 +53,21 @@ interface ScratchpadState {
   setEnabled: (enabled: boolean) => void;
 }
 
-/** Shows "Saving…" once a save takes longer than the indicator delay. */
-function useSavingIndicator() {
-  const [savingVisible, setSavingVisible] = useState(false);
-  const mountedRef = useRef(true);
-  const savingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const clearSavingTimer = () => {
-    if (savingTimerRef.current != null) {
-      clearTimeout(savingTimerRef.current);
-      savingTimerRef.current = null;
-    }
-  };
-
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-      clearSavingTimer();
-    };
-  }, []);
-
-  const startSaving = useCallback(() => {
-    // Only show the "Saving…" message if the save takes more than a beat —
-    // sub-second writes shouldn't flicker the UI on every keystroke.
-    clearSavingTimer();
-    savingTimerRef.current = setTimeout(() => {
-      if (mountedRef.current) setSavingVisible(true);
-      savingTimerRef.current = null;
-    }, SAVING_INDICATOR_DELAY_MS);
-  }, []);
-
-  const hideSaving = useCallback(() => {
-    clearSavingTimer();
-    setSavingVisible(false);
-  }, []);
-
-  return { savingVisible, startSaving, hideSaving, mountedRef };
-}
-
 /**
- * Sends the editor's saves through the store's save queue.
+ * Loads the workspace's instructions into the store; returns whether the first load is pending.
  *
- * The editor stays editable while Xum reconnects. An edit that no client received (made without a
- * client, or its save cut off by the lost connection) is kept and sent to the next client.
- * Otherwise it would look saved, and the reload would skip it as a local edit, but the backend
- * would never get it.
+ * A re-run for the shown workspace (a new API client after a reconnect) keeps the editor as it
+ * is: it does not flash "Loading…" or take focus from the textarea. A local edit the backend has
+ * not settled (`dirtyRef`) is not replaced by the load.
  */
-function useChatInstructionsSave(
-  api: APIClient | null,
-  setError: (error: string | null) => void,
-  /** The queue settled with nothing left for a later client: the next load may replace the text. */
-  onSettled: () => void
-) {
-  const { savingVisible, startSaving, hideSaving, mountedRef } = useSavingIndicator();
-  // The workspace whose latest edit no client has received yet.
-  const unsentWorkspaceIdRef = useRef<string | null>(null);
-
-  const send = useCallback(
-    (client: APIClient, workspaceId: string, next: AdditionalSystemContextSnapshot) => {
-      setError(null);
-      startSaving();
-      queueAdditionalSystemContextSave(client, workspaceId, next, {
-        onError: (err) => {
-          if (!mountedRef.current) return;
-          // A lost connection is not a save error: the next client gets the edit.
-          if (isConnectionLostError(err)) {
-            unsentWorkspaceIdRef.current = workspaceId;
-            return;
-          }
-          setError(getErrorMessage(err));
-        },
-        onIdle: () => {
-          if (!mountedRef.current) return;
-          hideSaving();
-          if (unsentWorkspaceIdRef.current !== workspaceId) onSettled();
-        },
-      });
-    },
-    [setError, startSaving, hideSaving, mountedRef, onSettled]
-  );
-
-  // A new client (after a reconnect) gets the edit the last one did not, as the store holds it now.
-  useEffect(() => {
-    const unsentWorkspaceId = unsentWorkspaceIdRef.current;
-    if (api == null || unsentWorkspaceId == null) return;
-    unsentWorkspaceIdRef.current = null;
-    send(api, unsentWorkspaceId, readAdditionalSystemContextSnapshot(unsentWorkspaceId));
-  }, [api, send]);
-
-  const save = (workspaceId: string, next: AdditionalSystemContextSnapshot) => {
-    if (api == null) {
-      unsentWorkspaceIdRef.current = workspaceId;
-      return;
-    }
-    send(api, workspaceId, next);
-  };
-
-  return { savingVisible, save, hideSaving };
-}
-
-export function useChatInstructions(workspaceId: string): ScratchpadState {
+function useChatInstructionsLoad(
+  workspaceId: string,
+  dirtyRef: { current: boolean },
+  setError: (error: string | null) => void
+): boolean {
   const { api } = useAPI();
-  const snapshot = useAdditionalSystemContextSnapshot(workspaceId);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  // An edit the backend has not settled yet: a load must not replace it. A failed save settles
-  // it too, so a later reload shows what the backend stored.
-  const dirtyRef = useRef(false);
-  const markSettled = useCallback(() => {
-    dirtyRef.current = false;
-  }, []);
-  const { savingVisible, save, hideSaving } = useChatInstructionsSave(api, setError, markSettled);
-  // The workspace whose instructions the editor shows (loaded, or failed to load). A re-run for it
-  // (a new API client after a reconnect) keeps the editor enabled and the user's edits: it does
-  // not flash "Loading…" or take focus from the textarea.
+  // The workspace whose instructions the editor shows (loaded, or failed to load).
   const loadedWorkspaceIdRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -171,7 +75,6 @@ export function useChatInstructions(workspaceId: string): ScratchpadState {
       loadedWorkspaceIdRef.current = null;
       dirtyRef.current = false;
       setLoading(true);
-      hideSaving();
     }
     setError(null);
 
@@ -204,15 +107,73 @@ export function useChatInstructions(workspaceId: string): ScratchpadState {
     return () => {
       cancelled = true;
     };
-  }, [api, workspaceId, hideSaving]);
+  }, [api, workspaceId, dirtyRef, setError]);
+
+  return loading;
+}
+
+export function useChatInstructions(workspaceId: string): ScratchpadState {
+  // Saves need a live connection. While Xum reconnects the editor keeps showing the text but is
+  // read-only, so no edit waits for a later client.
+  const liveApi = useLiveAPI();
+  const snapshot = useAdditionalSystemContextSnapshot(workspaceId);
+  const [savingVisible, setSavingVisible] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // An edit the backend has not settled yet: a load must not replace it. A failed save settles
+  // it too, so a later reload shows what the backend stored.
+  const dirtyRef = useRef(false);
+  const mountedRef = useRef(true);
+  const savingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const loading = useChatInstructionsLoad(workspaceId, dirtyRef, setError);
+
+  const clearSavingTimer = () => {
+    if (savingTimerRef.current != null) {
+      clearTimeout(savingTimerRef.current);
+      savingTimerRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      clearSavingTimer();
+    };
+  }, []);
+
+  // Another workspace starts without the previous one's "Saving…".
+  useEffect(() => {
+    setSavingVisible(false);
+    clearSavingTimer();
+  }, [workspaceId]);
 
   const queue = useCallback(
     (next: AdditionalSystemContextSnapshot) => {
+      if (!liveApi) return;
       dirtyRef.current = true;
       updateAdditionalSystemContextSnapshot(workspaceId, next);
-      save(workspaceId, next);
+      setError(null);
+      // Only show the "Saving…" message if the save takes more than a beat —
+      // sub-second writes shouldn't flicker the UI on every keystroke.
+      clearSavingTimer();
+      savingTimerRef.current = setTimeout(() => {
+        if (mountedRef.current) setSavingVisible(true);
+        savingTimerRef.current = null;
+      }, SAVING_INDICATOR_DELAY_MS);
+      queueAdditionalSystemContextSave(liveApi, workspaceId, next, {
+        onError: (err) => {
+          if (!mountedRef.current) return;
+          setError(getErrorMessage(err));
+        },
+        onIdle: () => {
+          dirtyRef.current = false;
+          if (!mountedRef.current) return;
+          clearSavingTimer();
+          setSavingVisible(false);
+        },
+      });
     },
-    [save, workspaceId]
+    [liveApi, workspaceId]
   );
 
   const setContent = useCallback(
@@ -233,6 +194,7 @@ export function useChatInstructions(workspaceId: string): ScratchpadState {
     content: snapshot.content,
     enabled: snapshot.enabled,
     loading,
+    disabled: loading || liveApi == null,
     savingVisible,
     error,
     setContent,
@@ -310,7 +272,7 @@ export function ChatInstructionsEditor(props: ChatInstructionsEditorProps) {
           props.textareaClassName
         )}
         aria-label={`${CHAT_INSTRUCTIONS_LABEL} editor`}
-        disabled={state.loading}
+        disabled={state.disabled}
       />
       <div className="text-muted flex min-h-4 items-center justify-between gap-2 text-[10px]">
         <label className="flex cursor-pointer items-center gap-1.5 select-none">
@@ -318,7 +280,7 @@ export function ChatInstructionsEditor(props: ChatInstructionsEditorProps) {
             type="checkbox"
             className="accent-[var(--color-accent)]"
             checked={state.enabled}
-            disabled={state.loading}
+            disabled={state.disabled}
             onChange={(event) => state.setEnabled(event.currentTarget.checked)}
             aria-label="Enable Chat Instructions"
           />

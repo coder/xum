@@ -251,25 +251,25 @@ describe.each([...GAP_MODES])("edits and navigation while reconnecting (%s)", (m
     cleanupDom = null;
   });
 
-  test("a chat-instructions edit made while reconnecting reaches the next client", async () => {
-    // The instructions store is per workspace and process-wide: a fresh workspace per mode.
+  test("the chat-instructions editor is read-only while offline, and editable again after the reconnect", async () => {
     const workspaceId = `ws-offline-edit-${mode}`;
+    answerInstructions = () => Promise.resolve({ files: [], totalTokens: 0 });
     answerChatInstructions = () => Promise.resolve({ content: "be brief", enabled: true });
-    const view = renderHook(() => useChatInstructions(workspaceId), { wrapper: Wrapper });
-    await waitFor(() => expect(view.result.current.content).toBe("be brief"));
+    const view = render(<InstructionsTab workspaceId={workspaceId} />, { wrapper: Wrapper });
+    const editor = (await view.findByLabelText("Chat Instructions editor")) as HTMLTextAreaElement;
+    const toggle = view.getByLabelText("Enable Chat Instructions") as HTMLInputElement;
+    await waitFor(() => expect(editor.value).toBe("be brief"));
+    expect(editor.disabled).toBe(false);
 
     await drop();
-    act(() => view.result.current.setContent("be kind"));
-    await flush();
-    expect(view.result.current.error).toBeNull();
+    expect(editor.value).toBe("be brief");
+    expect(editor.disabled).toBe(true);
+    expect(toggle.disabled).toBe(true);
 
-    // The next server still stores the old text: the edit must reach it and stay on screen.
     await reconnect();
-    await waitFor(() =>
-      expect(savedChatInstructions).toEqual([{ content: "be kind", enabled: true }])
-    );
-    expect(view.result.current.content).toBe("be kind");
-    expect(view.result.current.error).toBeNull();
+    await waitFor(() => expect(editor.disabled).toBe(false));
+    expect(toggle.disabled).toBe(false);
+    expect(savedChatInstructions).toEqual([]);
   });
 
   test("after a failed save, a reconnect shows what the server stored", async () => {
@@ -287,25 +287,27 @@ describe.each([...GAP_MODES])("edits and navigation while reconnecting (%s)", (m
     await waitFor(() => expect(view.result.current.content).toBe("be brief"));
   });
 
-  test("a goal-defaults edit made while reconnecting reaches the next client", async () => {
+  test("the goal defaults are read-only while offline, and editable again after the reconnect", async () => {
     answerOverride = () => Promise.resolve(turnCapOverride(5));
     const view = render(<GoalDefaultsSection workspaceId="ws-1" embedded />, {
       wrapper: Wrapper,
     });
     const turnCap = () =>
       view.getByLabelText("Workspace default goal turn cap") as HTMLInputElement;
+    const stopOverriding = () =>
+      view.getByRole("button", { name: "Stop overriding Default turn cap" }) as HTMLButtonElement;
     await waitFor(() => expect(turnCap().value).toBe("5"));
+    expect(turnCap().disabled).toBe(false);
 
     await drop();
-    fireEvent.change(turnCap(), { target: { value: "9" } });
-    fireEvent.blur(turnCap());
-    await flush();
+    expect(turnCap().value).toBe("5");
+    expect(turnCap().disabled).toBe(true);
+    expect(stopOverriding().disabled).toBe(true);
 
-    // The next server still stores 5: the edit must reach it, and its read must not undo it.
     await reconnect();
-    await waitFor(() => expect(savedOverrides).toHaveLength(1));
-    expect(savedOverrides[0]).toMatchObject({ workspaceId: "ws-1", defaultTurnCap: 9 });
-    expect(turnCap().value).toBe("9");
+    await waitFor(() => expect(turnCap().disabled).toBe(false));
+    expect(stopOverriding().disabled).toBe(false);
+    expect(savedOverrides).toEqual([]);
   });
 
   test("the MCP overview never shows one project's servers under another", async () => {

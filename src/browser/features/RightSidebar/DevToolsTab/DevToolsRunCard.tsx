@@ -44,7 +44,6 @@ async function readRunDetail(
 function useRunDetail(expanded: boolean, workspaceId: string, runId: string) {
   const { api } = useAPI();
   const [steps, setSteps] = useState<DevToolsStep[] | null>(null);
-  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const needsDetail = expanded && steps === null;
@@ -53,11 +52,9 @@ function useRunDetail(expanded: boolean, workspaceId: string, runId: string) {
       return;
     }
     let cancelled = false;
-    setLoading(true);
     setError(null);
     void readRunDetail(api, workspaceId, runId).then((read) => {
       if (cancelled || read.status === "lost") return;
-      setLoading(false);
       if (read.status === "ok") {
         setSteps(read.steps);
       } else {
@@ -69,12 +66,12 @@ function useRunDetail(expanded: boolean, workspaceId: string, runId: string) {
     };
   }, [api, needsDetail, workspaceId, runId]);
 
-  return { steps, loading, error };
+  return { steps, error };
 }
 
 export function DevToolsRunCard(props: DevToolsRunCardProps) {
   const [expanded, setExpanded] = useState(false);
-  const { steps, loading, error } = useRunDetail(expanded, props.workspaceId, props.run.id);
+  const { steps, error } = useRunDetail(expanded, props.workspaceId, props.run.id);
   const displaySteps = mergeDisplaySteps(steps, props.liveSteps);
 
   const handleToggle = () => {
@@ -111,7 +108,9 @@ export function DevToolsRunCard(props: DevToolsRunCardProps) {
 
       {expanded && (
         <div className="border-border-light min-w-0 border-t px-2 py-1.5">
-          {loading && steps === null ? (
+          {/* No steps and no error: the detail is loading, or waits for a client (it loads
+              once Xum reconnects), so this never claims "No steps recorded" too early. */}
+          {steps === null && error === null ? (
             <div className="flex justify-center py-2">
               <Loader2 className="text-muted h-4 w-4 animate-spin" />
             </div>

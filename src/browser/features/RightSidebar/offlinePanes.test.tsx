@@ -18,8 +18,11 @@ import { SettingsProvider } from "@/browser/contexts/SettingsContext";
 import type { TestApiOverrides } from "@/browser/testUtils";
 import type { DevToolsRunSummary } from "@/common/types/devtools";
 import type { GoalBoardSnapshot } from "@/common/types/goal";
-import type { AvailableWorkflow } from "@/common/types/workflow";
+import type { AvailableWorkflow, WorkflowRunRecord } from "@/common/types/workflow";
 import { DevToolsRunCard } from "./DevToolsTab/DevToolsRunCard";
+import { DevToolsTab } from "./DevToolsTab/DevToolsTab";
+import { projectWorkflowRun } from "./Workflows/projectWorkflowRun";
+import { WorkflowRunHeader } from "./Workflows/WorkflowRunHeader";
 import { GoalBoardSections } from "./GoalBoardSections";
 import { WorkflowsTab } from "./Workflows/WorkflowsTab";
 
@@ -82,7 +85,17 @@ function serverOverrides(): TestApiOverrides<APIClient> {
       listScripts: () => Promise.resolve([workflowScript()]),
       start: mutation("start"),
     },
-    devtools: { getRunDetail: () => answerRunDetail() },
+    devtools: {
+      getRunDetail: () => answerRunDetail(),
+      subscribe: () =>
+        Promise.resolve(
+          (async function* () {
+            yield { type: "snapshot", runs: [devToolsRun()] };
+            await new Promise(() => undefined);
+          })()
+        ),
+      clear: mutation("clear"),
+    },
     config: { getConfig: () => Promise.resolve({}) },
   } as unknown as TestApiOverrides<APIClient>;
 }
@@ -128,6 +141,22 @@ function devToolsRun(): DevToolsRunSummary {
     isInProgress: false,
     hasError: false,
   } as unknown as DevToolsRunSummary;
+}
+
+function workflowRun(status: WorkflowRunRecord["status"]): WorkflowRunRecord {
+  return {
+    id: "wfr_test",
+    workspaceId: "ws-1",
+    workflow: { name: "deploy", description: "deploy", scope: "project", executable: true },
+    source: "export default function workflow() { return null; }",
+    sourceHash: "sha256:test",
+    args: {},
+    status,
+    createdAt: "2026-05-29T00:00:00.000Z",
+    updatedAt: "2026-05-29T00:00:01.000Z",
+    events: [],
+    steps: [],
+  };
 }
 
 let harness: ConnectionHarness;
@@ -274,5 +303,67 @@ describe.each([...GAP_MODES])("panes kept across a dropped connection (%s)", (mo
     await reconnect();
     await view.findByText("No steps recorded");
     expect(view.queryByText(/Not connected/)).toBeNull();
+  });
+
+  test("the run header's actions are disabled while there is no live client", async () => {
+    const live = workflowRun("running");
+    const interrupted = workflowRun("interrupted");
+    const view = render(
+      <>
+        <WorkflowRunHeader workspaceId="ws-1" run={live} view={projectWorkflowRun(live)} />
+        <WorkflowRunHeader
+          workspaceId="ws-1"
+          run={interrupted}
+          view={projectWorkflowRun(interrupted)}
+        />
+      </>,
+      { wrapper: Wrapper }
+    );
+    const interrupt = () => view.getByRole("button", { name: /Interrupt/ }) as HTMLButtonElement;
+    const resume = () => view.getByRole("button", { name: /Resume/ }) as HTMLButtonElement;
+    expect(interrupt().disabled).toBe(false);
+    expect(resume().disabled).toBe(false);
+
+    await drop();
+    expect(interrupt().disabled).toBe(true);
+    expect(resume().disabled).toBe(true);
+
+    await reconnect();
+    expect(interrupt().disabled).toBe(false);
+    expect(resume().disabled).toBe(false);
+  });
+
+  test("DevTools Clear is disabled while there is no live client", async () => {
+    const view = render(<DevToolsTab workspaceId="ws-1" />, { wrapper: Wrapper });
+    const clear = () => view.getByRole("button", { name: "Clear debug logs" }) as HTMLButtonElement;
+    await view.findByText("hello");
+    expect(clear().disabled).toBe(false);
+
+    await drop();
+    expect(view.queryByText("hello")).not.toBeNull();
+    expect(clear().disabled).toBe(true);
+
+    await reconnect();
+    expect(clear().disabled).toBe(false);
+    fireEvent.click(clear());
+    await waitFor(() => expect(mutations).toEqual(["clear"]));
+  });
+
+  test("a DevTools run expanded while reconnecting waits for its detail instead of showing none", async () => {
+    answerRunDetail = () => Promise.resolve(null);
+    const view = render(<DevToolsRunCard run={devToolsRun()} workspaceId="ws-1" />, {
+      wrapper: Wrapper,
+    });
+    await drop();
+    // In the kept gap the kept client's read fails at once with a lost connection.
+    answerRunDetail = pending;
+    fireEvent.click(view.getByRole("button", { name: /hello/ }));
+    await flush();
+    expect(view.queryByText("No steps recorded")).toBeNull();
+    expect(view.container.querySelector(".animate-spin")).not.toBeNull();
+
+    answerRunDetail = () => Promise.resolve(null);
+    await reconnect();
+    await view.findByText("No steps recorded");
   });
 });
