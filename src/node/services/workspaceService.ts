@@ -97,6 +97,7 @@ import type { ExperimentsService } from "@/node/services/experimentsService";
 import { ARTIFACT_INTERACTION_METADATA_RESERVED_MESSAGE } from "@/common/constants/artifactInteractions";
 import {
   isNestedCompactionFollowUp,
+  isNestedCompactionPendingFollowUp,
   NESTED_COMPACTION_FOLLOW_UP_MESSAGE,
   stripClientPluginSendHookFields,
 } from "@/common/utils/messages/pluginSendHookFields";
@@ -18802,6 +18803,11 @@ export class WorkspaceService
     // pending follow-up that recovery dispatches. Refused before anything is cleared.
     if (carriesPlanReviewMetadata(summaryMessage.metadata?.muxMetadata)) {
       return Err(PLAN_REVIEW_METADATA_RESERVED_MESSAGE);
+    }
+    // A pending follow-up that is itself a compaction request is refused, as sendMessage refuses
+    // it (isNestedCompactionFollowUp): the strip below covers one level only.
+    if (isNestedCompactionPendingFollowUp(summaryMessage.metadata?.muxMetadata)) {
+      return Err(NESTED_COMPACTION_FOLLOW_UP_MESSAGE);
     }
     // Hook markers on a summary's pending follow-up say its message.send hooks already ran.
     // Only Xum's own compaction may set them: a client-supplied row would make recovery skip
