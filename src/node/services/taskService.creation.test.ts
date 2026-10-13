@@ -116,10 +116,16 @@ describe("TaskService", () => {
     }
   }, 20_000);
 
-  test("default task settings admit an orchestration chain 4 levels below the root", async () => {
-    // pstack-style orchestration: root -> track coordinator -> worker -> verifier -> helper.
+  test("default task settings admit 5 nested levels below the root and refuse a 6th", async () => {
+    // pstack-style orchestration nests 4 levels below the root (track coordinator -> worker ->
+    // verifier -> helper); the default keeps one level of headroom and still stops runaway
+    // recursion past it.
     const config = await createTestConfig(rootDir);
-    stubStableIds(config, ["aaaaaaaaa1", "aaaaaaaaa2", "aaaaaaaaa3", "aaaaaaaaa4", "aaaaaaaaa5"]);
+    stubStableIds(
+      config,
+      ["aaaaaaaaa1", "aaaaaaaaa2", "aaaaaaaaa3", "aaaaaaaaa4", "aaaaaaaaa5"],
+      "aaaaaaaaa6"
+    );
 
     const projectPath = await createTestProject(rootDir);
     const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
@@ -150,11 +156,17 @@ describe("TaskService", () => {
     const { taskService } = createTaskServiceHarness(config);
 
     let ownerId = parentId;
-    for (let depth = 1; depth <= 4; depth++) {
+    for (let depth = 1; depth <= 5; depth++) {
       const created = await createAgentTask(taskService, ownerId, `level ${depth}`);
       expect(created.success).toBe(true);
       if (!created.success) return;
       ownerId = created.data.taskId;
+    }
+
+    const tooDeep = await createAgentTask(taskService, ownerId, "level 6");
+    expect(tooDeep.success).toBe(false);
+    if (!tooDeep.success) {
+      expect(tooDeep.error).toContain("maxTaskNestingDepth");
     }
   }, 60_000);
 
