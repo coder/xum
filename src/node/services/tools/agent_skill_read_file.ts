@@ -3,6 +3,7 @@ import { tool } from "ai";
 import type { AgentSkillReadFileToolResult } from "@/common/types/tools";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
+import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { SkillNameSchema } from "@/common/orpc/schemas";
 import { readAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
@@ -65,6 +66,12 @@ function numberPageLines(
   startIdx: number,
   endIdx: number
 ): { numberedLines: string[] } | { error: string } {
+  // The input schema only admits whole-number offset/limit; a fractional index
+  // would read `undefined` rows instead of failing.
+  assert(
+    Number.isInteger(startIdx) && Number.isInteger(endIdx),
+    `numberPageLines needs whole-number bounds (got ${startIdx}..${endIdx})`
+  );
   const numberedLines: string[] = [];
   let totalBytesAccumulated = 0;
   const MAX_LINES = 1000;
@@ -79,11 +86,11 @@ function numberPageLines(
     const numberedLine = `${lineNumber}\t${lines[i]}`;
     const numberedLineBytes = Buffer.byteLength(numberedLine, "utf-8");
 
-    if (numberedLines.length === 0 && numberedLineBytes > MAX_TOTAL_BYTES) {
-      // Paging cannot shrink a single line, so say that instead of asking for
-      // a smaller offset/limit window.
+    if (numberedLineBytes > MAX_TOTAL_BYTES) {
+      // Paging cannot shrink a single line, so name it (wherever it sits in the
+      // window) instead of asking for a smaller offset/limit window.
       return {
-        error: `Line ${lineNumber} is ${numberedLineBytes} bytes, more than the ${MAX_TOTAL_BYTES}-byte output limit, so agent_skill_read_file cannot return it.`,
+        error: `Line ${lineNumber} is ${numberedLineBytes} bytes, more than the ${MAX_TOTAL_BYTES}-byte output limit, so agent_skill_read_file cannot return it. Read the lines around it with offset and limit.`,
       };
     }
 
