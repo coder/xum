@@ -462,7 +462,7 @@ describe("MemoryTab", () => {
       "---\ndescription: likes tea\n---\n# Heading\n\nbody text",
       "sha-original"
     );
-    const { findByText, findByRole, queryByLabelText, container } = renderWithApi(
+    const { findByText, findByRole, queryByRole, container } = renderWithApi(
       <MemoryTab workspaceId="ws-1" />
     );
 
@@ -475,7 +475,7 @@ describe("MemoryTab", () => {
       );
     });
     expect(container.querySelector("h2")).toBeNull();
-    expect(queryByLabelText("Memory file content")).toBeNull();
+    expect(queryByRole("textbox", { name: "Memory file content" })).toBeNull();
   });
 
   test("preview renders the unsaved draft and Save sends it from preview", async () => {
@@ -509,23 +509,68 @@ describe("MemoryTab", () => {
   test("the toggle shortcut switches between preview and edit, repeatedly from the editor", async () => {
     fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
     fake.setContent("/memories/global/prefs.md", "# Heading", "sha-original");
-    const { findByText, findByLabelText, findByRole, queryByLabelText } = renderWithApi(
-      <MemoryTab workspaceId="ws-1" />
-    );
+    const { findByText, findByRole, queryByRole } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
 
     fireEvent.click(await findByText("prefs.md"));
     await findByRole("heading", { name: "Heading" });
     // Opening focuses the editor, so the shortcut works without clicking into it first.
     fireEvent.keyDown(document.activeElement!, { key: "e", ctrlKey: true });
-    const editor = await findByLabelText("Memory file content");
+    const editor = await findByRole("textbox", { name: "Memory file content" });
     expect(document.activeElement).toBe(editor);
 
     fireEvent.keyDown(editor, { key: "e", ctrlKey: true });
     await findByRole("heading", { name: "Heading" });
-    expect(queryByLabelText("Memory file content")).toBeNull();
+    expect(queryByRole("textbox", { name: "Memory file content" })).toBeNull();
 
     fireEvent.keyDown(document.activeElement!, { key: "e", ctrlKey: true });
-    expect(document.activeElement).toBe(await findByLabelText("Memory file content"));
+    expect(document.activeElement).toBe(
+      await findByRole("textbox", { name: "Memory file content" })
+    );
+  });
+
+  test("a preview round trip keeps the same textarea with its value and selection", async () => {
+    fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
+    fake.setContent("/memories/global/prefs.md", "likes tea", "sha-original");
+    const { findByText, findByRole, queryByRole } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    fireEvent.click(await findByText("prefs.md"));
+    fireEvent.click(await findByRole("button", { name: "Edit" }));
+    const editor = (await findByRole("textbox", {
+      name: "Memory file content",
+    })) as HTMLTextAreaElement;
+    fireEvent.input(editor, { target: { value: "likes green tea" } });
+    editor.setSelectionRange(6, 11);
+
+    fireEvent.click(await findByRole("button", { name: "Preview" }));
+    expect(queryByRole("textbox", { name: "Memory file content" })).toBeNull();
+    fireEvent.click(await findByRole("button", { name: "Edit" }));
+
+    expect(await findByRole("textbox", { name: "Memory file content" })).toBe(editor);
+    expect(editor.value).toBe("likes green tea");
+    expect([editor.selectionStart, editor.selectionEnd]).toEqual([6, 11]);
+    expect(document.activeElement).toBe(editor);
+  });
+
+  test("focus returns to the editor after Reload removes its banner, so shortcuts keep working", async () => {
+    fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
+    fake.setContent("/memories/global/prefs.md", "# Heading", "sha-original");
+    const { findByText, findByRole, findByLabelText, queryByRole } = renderWithApi(
+      <MemoryTab workspaceId="ws-1" />
+    );
+
+    fireEvent.click(await findByText("prefs.md"));
+    await findByRole("heading", { name: "Heading" });
+    fake.state.nextSaveConflict = true;
+    fireEvent.click(await findByLabelText("Save memory file"));
+    const reload = await findByLabelText("Reload memory file");
+    reload.focus();
+    fireEvent.click(reload);
+    await waitFor(() => expect(queryByRole("alert")).toBeNull());
+
+    fireEvent.keyDown(document.activeElement!, { key: "e", ctrlKey: true });
+    expect(document.activeElement).toBe(
+      await findByRole("textbox", { name: "Memory file content" })
+    );
   });
 
   test("a non-Markdown file opens in the editor with no preview toggle", async () => {

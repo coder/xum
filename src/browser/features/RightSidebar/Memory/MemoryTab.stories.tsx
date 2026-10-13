@@ -176,7 +176,7 @@ export const Editor: Story = {
         }
       }
     });
-    await expect(canvas.queryByLabelText("Memory file content")).toBeNull();
+    await expect(canvas.queryByRole("textbox", { name: "Memory file content" })).toBeNull();
     await userEvent.hover(canvasElement);
     blurActiveElement();
   },

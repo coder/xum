@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent, type RefObject } from "react";
+import { flushSync } from "react-dom";
 import { ArrowLeft } from "lucide-react";
 
 import { Button } from "@/browser/components/Button/Button";
@@ -52,6 +53,17 @@ export function MemoryFileEditor(props: MemoryFileEditorProps) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const view = useMarkdownViewMode(props.path, rootRef, textareaRef, setDraft);
 
+  // When the control holding focus goes away (Save is disabled while saving,
+  // Reload unmounts with its banner), focus falls to <body> and the editor
+  // shortcuts stop working. Pull it back to the editor, but never move focus
+  // the user put elsewhere.
+  const refocusEditorIfLost = (leaving: Element | null) => {
+    const active = document.activeElement;
+    if (active === null || active === document.body || (leaving?.contains(active) ?? false)) {
+      rootRef.current?.focus();
+    }
+  };
+
   useEffect(() => {
     if (!api) return;
     const controller = new AbortController();
@@ -96,6 +108,7 @@ export function MemoryFileEditor(props: MemoryFileEditorProps) {
       setSaveError({ kind: "error", message: getErrorMessage(err) });
     } finally {
       setSaving(false);
+      refocusEditorIfLost(null);
     }
   };
 
@@ -109,7 +122,8 @@ export function MemoryFileEditor(props: MemoryFileEditorProps) {
     }
   };
 
-  const handleReload = () => {
+  const handleReload = (button: HTMLElement) => {
+    refocusEditorIfLost(button);
     setSaveError(null);
     setReloadTick((n) => n + 1);
   };
@@ -140,24 +154,27 @@ export function MemoryFileEditor(props: MemoryFileEditorProps) {
         <div className="text-error px-3 py-2 text-xs" role="alert">
           {loadError}
         </div>
-      ) : view.mode === "preview" ? (
-        <div className="min-h-48 flex-1 overflow-auto p-3">
-          <MarkdownFilePreview content={draft} />
-        </div>
       ) : (
-        <textarea
-          ref={textareaRef}
-          // flex-1 fills the available height; the min-h floor keeps the
-          // editor usable on very short viewports.
-          className="min-h-48 flex-1 resize-none bg-transparent p-3 font-mono text-xs outline-none"
-          aria-label="Memory file content"
-          value={draft}
-          spellCheck={false}
-          // Only Markdown files open in Preview, so a mounting textarea there
-          // means the user switched to Edit and wants to type.
-          autoFocus={view.isMarkdown}
-          onChange={(e) => setDraft(e.target.value)}
-        />
+        <>
+          {view.mode === "preview" && (
+            <div className="min-h-48 flex-1 overflow-auto p-3">
+              <MarkdownFilePreview content={draft} />
+            </div>
+          )}
+          {/* Stays mounted (hidden) in Preview, as GitHub's Write/Preview tabs
+              do, so a round trip keeps the caret and undo history. */}
+          <textarea
+            ref={textareaRef}
+            hidden={view.mode === "preview"}
+            // flex-1 fills the available height; the min-h floor keeps the
+            // editor usable on very short viewports.
+            className="min-h-48 flex-1 resize-none bg-transparent p-3 font-mono text-xs outline-none"
+            aria-label="Memory file content"
+            value={draft}
+            spellCheck={false}
+            onChange={(e) => setDraft(e.target.value)}
+          />
+        </>
       )}
     </div>
   );
@@ -165,7 +182,7 @@ export function MemoryFileEditor(props: MemoryFileEditorProps) {
 
 /**
  * Preview/Edit state for Markdown files. Switching keeps the draft: leaving
- * Edit copies the textarea's live value out before it unmounts.
+ * Edit copies the textarea's live value out before Preview renders it.
  */
 function useMarkdownViewMode(
   path: string,
@@ -175,6 +192,8 @@ function useMarkdownViewMode(
 ) {
   const isMarkdown = getLanguageFromPath(path) === "markdown";
   const [mode, setMode] = useState<ViewMode>(isMarkdown ? "preview" : "edit");
+  // Chromium resets scrollTop while an element is display:none.
+  const editScrollTopRef = useRef(0);
 
   // Focus the editor on open so its shortcuts work at once (the clicked row
   // unmounts, so focus would fall to <body>). Never the textarea: opening a
@@ -184,14 +203,25 @@ function useMarkdownViewMode(
   }, [rootRef]);
 
   const switchMode = (next: ViewMode) => {
+    if (next === mode) return;
     const textarea = textareaRef.current;
-    if (next === "preview" && textarea !== null) {
-      onLeaveEdit(textarea.value);
-      // The textarea unmounts; keep focus inside the editor so the next
-      // shortcut press still reaches it.
-      if (document.activeElement === textarea) rootRef.current?.focus();
+    if (next === "preview") {
+      if (textarea !== null) {
+        onLeaveEdit(textarea.value);
+        editScrollTopRef.current = textarea.scrollTop;
+        // The textarea is hidden; keep focus inside the editor so the next
+        // shortcut press still reaches it.
+        if (document.activeElement === textarea) rootRef.current?.focus();
+      }
+      setMode(next);
+      return;
     }
-    setMode(next);
+    // Show the textarea synchronously so it can take focus in this handler.
+    flushSync(() => setMode(next));
+    if (textarea !== null) {
+      textarea.focus();
+      textarea.scrollTop = editScrollTopRef.current;
+    }
   };
 
   return {
@@ -220,7 +250,7 @@ function MemoryFileHeader(props: MemoryFileHeaderProps) {
       <RowActionButton aria-label="Back to memory list" onClick={props.onBack}>
         <ArrowLeft className="h-3.5 w-3.5" aria-hidden="true" />
       </RowActionButton>
-      <span className="min-w-0 flex-1 truncate text-xs font-medium">{props.path}</span>
+      <MemoryFilePath path={props.path} />
       {props.showModeToggle && (
         <TooltipIfPresent
           tooltip={
@@ -254,7 +284,24 @@ function MemoryFileHeader(props: MemoryFileHeaderProps) {
   );
 }
 
-function SaveErrorBanner(props: { error: MemorySaveError; onReload: () => void }) {
+/**
+ * The directory part truncates first so the file name stays readable on a
+ * phone; the name truncates only when it alone is wider than the slot.
+ */
+function MemoryFilePath(props: { path: string }) {
+  const nameStart = props.path.lastIndexOf("/") + 1;
+  return (
+    <span className="flex min-w-0 flex-1 text-xs font-medium">
+      <span className="min-w-0 truncate">{props.path.slice(0, nameStart)}</span>
+      <span className="max-w-full shrink-0 truncate">{props.path.slice(nameStart)}</span>
+    </span>
+  );
+}
+
+function SaveErrorBanner(props: {
+  error: MemorySaveError;
+  onReload: (button: HTMLElement) => void;
+}) {
   return (
     <div
       className={cn(
@@ -268,7 +315,7 @@ function SaveErrorBanner(props: { error: MemorySaveError; onReload: () => void }
         <RowActionButton
           className="shrink-0"
           aria-label="Reload memory file"
-          onClick={props.onReload}
+          onClick={(e) => props.onReload(e.currentTarget)}
         >
           Reload
         </RowActionButton>
