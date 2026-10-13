@@ -270,6 +270,59 @@ describe("compaction input trim on the wire", () => {
     expect(JSON.stringify(budgeted.messages)).toBe(JSON.stringify(plain.messages));
   });
 
+  test("sizes an SVG attachment as the source text the provider receives", async () => {
+    // About 45k characters of markup: inlineSvgAsTextForProvider sends it as text, not as an
+    // image, so it is well over this budget.
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg">${'<rect x="1" y="2"/>'.repeat(2_300)}</svg>`;
+    const url = `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`;
+    const history: MuxMessage[] = [
+      {
+        id: "svg-user",
+        role: "user",
+        parts: [
+          { type: "text", text: "Fix this icon." },
+          { type: "file", mediaType: "image/svg+xml", url },
+        ],
+      },
+      createMuxMessage("svg-answer", "assistant", "Done."),
+      createMuxMessage("next-user", "user", "next"),
+      createMuxMessage("next-answer", "assistant", "ok"),
+      HISTORY[HISTORY.length - 1],
+    ];
+    const text = JSON.stringify((await assemble("openai", 5_000, history)).messages);
+    expect(text).toContain("1 oldest turns were left out");
+    expect(text).not.toContain('<rect x="1"');
+  });
+
+  test("sizes a malformed tool input as the empty object the provider receives", async () => {
+    // sanitizeToolInputs sends a non-object input as {}: this 200k-character string never
+    // reaches the provider, so the history fits.
+    const history: MuxMessage[] = [
+      createMuxMessage("bad-user", "user", "run it"),
+      {
+        id: "bad-assistant",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call_bad",
+            toolName: "bash",
+            input: "x".repeat(200_000),
+            state: "output-available",
+            output: { success: true, output: "ok" },
+          },
+        ],
+      },
+      createMuxMessage("next-user", "user", "next"),
+      createMuxMessage("next-answer", "assistant", "ok"),
+      HISTORY[HISTORY.length - 1],
+    ];
+    const plain = await assemble("openai", undefined, history);
+    const sized = await assemble("openai", 5_000, history);
+    expect(JSON.stringify(sized.messages)).toBe(JSON.stringify(plain.messages));
+    expect(JSON.stringify(sized.messages)).not.toContain("Compaction input trimmed");
+  });
+
   test("recounts a row after replacing its result, so dense text left in it still counts", async () => {
     const cjk = "这是一个测试句子，用于检查分词器的密度。".repeat(400);
     // One row: a large low-density result next to dense CJK text.

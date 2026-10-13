@@ -13,6 +13,7 @@
  * replaces 217 to 371 results and recounts their rows.
  */
 import { applyToolOutputRedaction } from "@/browser/utils/messages/applyToolOutputRedaction";
+import { sanitizeToolInputs } from "@/browser/utils/messages/sanitizeToolInput";
 import { IMAGE_TOKEN_ESTIMATE } from "@/common/constants/contextBudget";
 import type { MuxMessage } from "@/common/types/message";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -22,6 +23,7 @@ import {
   type CountCompactionRowTokens,
 } from "@/common/utils/messages/compactionRowSizing";
 import { estimateCompactionInputTokens } from "@/common/utils/messages/trimCompactionInput";
+import { inlineSvgAsTextForProvider } from "@/node/utils/messages/inlineSvgAsTextForProvider";
 import { estimateToolResultTokensForModel } from "./contextBudgetCounting";
 import { log } from "./log";
 
@@ -46,9 +48,14 @@ export function createCompactionRowCounter(modelString: string): CountCompaction
   };
 }
 
-/** The provider-bound projection the trim sizes and edits. */
+/**
+ * The provider-bound projection the trim sizes and edits: the first transforms of
+ * prepareMessagesForProvider, in its order. A malformed tool input is sent as {}, and an SVG
+ * attachment as its source text (or a short omission note), so each is sized that way. The
+ * later transforms run again on the result and change nothing these did.
+ */
 export function projectCompactionInput(messages: MuxMessage[]): MuxMessage[] {
-  return applyToolOutputRedaction(messages);
+  return inlineSvgAsTextForProvider(sanitizeToolInputs(applyToolOutputRedaction(messages)));
 }
 
 /** The model-aware size of a history's provider-bound projection, in tokens. */

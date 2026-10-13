@@ -113,7 +113,9 @@ async function withPlaceholderOutput(
 ): Promise<MuxMessage> {
   const part = message.parts[partIndex];
   assert(part.type === "dynamic-tool" && part.state === "output-available", "not a tool result");
-  const tokens = await countRow({ ...message, parts: [part] });
+  // The result's own size: the call's input stays in the request, so counting it here would
+  // overstate what the placeholder removed.
+  const tokens = await countRow({ ...message, parts: [{ ...part, input: {} }] });
   // nestedCalls never reach the provider (convertToModelMessages reads input/output only),
   // and sizing skips them. Drop them with the output so the summary input carries none.
   const placeholder: Part = {
