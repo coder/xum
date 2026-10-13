@@ -160,11 +160,15 @@ export function skillDirectoryEnv(dir: SkillDirectory): Record<string, string> {
   };
 }
 
-/** `$NAME` and `${NAME}` references to the skill-directory variables in shell code. */
-const SKILL_DIRECTORY_SHELL_REF_RE = /\$\{?(CLAUDE_SKILL_DIR|CLAUDE_PLUGIN_ROOT)\b/g;
+/**
+ * Any mention of a skill-directory variable name in shell code. Matching the
+ * bare name (not only `$NAME`/`${NAME}`) also catches indirect reads such as
+ * `$(printenv NAME)`, `${!ref}` set from it, or `eval`.
+ */
+const SKILL_DIRECTORY_SHELL_REF_RE = /\b(CLAUDE_SKILL_DIR|CLAUDE_PLUGIN_ROOT)\b/g;
 
 /**
- * Throw when `command` refers to a skill-directory variable that `env` does not
+ * Throw when `command` names a skill-directory variable that `env` does not
  * set. The shell would expand it to an empty string, so a directive such as
  * `sh "${CLAUDE_SKILL_DIR}/x.sh"` would run `/x.sh` from the filesystem root.
  * Directive runners call this before executing a command.

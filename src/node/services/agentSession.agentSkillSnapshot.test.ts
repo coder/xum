@@ -181,7 +181,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     const { workspacePath: projectPath } = await createTestWorkspaceWithSkill({
       skillName: "proj-hello",
       skillBody:
-        'Run sh ${CLAUDE_SKILL_DIR}/scripts/hello.sh\n!`echo ran-$((20+22)) "${CLAUDE_SKILL_DIR}"`\n!`echo ran-$((40+2)) $CLAUDE_SKILL_DIR`',
+        'Run sh ${CLAUDE_SKILL_DIR}/scripts/hello.sh\n!`echo ran-$((20+22)) "${CLAUDE_SKILL_DIR}"`\n!`echo ran-$((40+2)) $CLAUDE_SKILL_DIR`\n!`echo ran-$((41+1)) "$(printenv CLAUDE_SKILL_DIR)"`',
     });
     const srcBaseDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-agent-skill-src-"));
     const worktreePath = path.join(srcBaseDir, "proj", "ws");
