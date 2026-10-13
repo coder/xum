@@ -469,6 +469,15 @@ class FollowUpReadError extends Error {}
  * records stay in history for the UI but never reach a provider, so routing (evaluator context,
  * attachment gating) must use the same hidden-record filter as the chat request.
  */
+/**
+ * The model a compaction request overflowed on: the one its failed stream ran on (a refusal
+ * fallback after a swap), or the requested model when the error does not say (a pre-start
+ * failure). The retry plan depends on the model whose window was too small.
+ */
+function overflowedModel(request: { modelString: string }, failedModel: string | undefined) {
+  return failedModel ?? request.modelString;
+}
+
 function isProviderVisibleUserRow(message: MuxMessage): boolean {
   return (
     message.role === "user" && isProviderEligibleMessage(message) && !isModelHiddenMessage(message)
@@ -8591,6 +8600,7 @@ export class AgentSession {
         }),
         openaiTruncationModeOverride,
         ...this.compactionRetryInputBudget(),
+        compactionContextRetryAvailable: this.hasCompactionContextRetry(),
         // Mid-turn thinking overrides clamp against the same floor as the
         // send-time level above (single source of truth for the floor).
         minThinkingLevel,
@@ -8781,9 +8791,11 @@ export class AgentSession {
     return supports1MContext(modelString, this.getProvidersConfigSafe());
   }
 
+  /** `options` with 1M context on for `modelString`; the request still runs on `requestModel`. */
   private withAnthropic1MContext(
     modelString: string,
-    options: SendMessageOptions | undefined
+    options: SendMessageOptions | undefined,
+    requestModel: string
   ): SendMessageOptions | null {
     const providerOptions = withAnthropic1MContextIntent(modelString, options?.providerOptions);
     // Providers config resolves Coder gateway instances (the raw
@@ -8795,7 +8807,7 @@ export class AgentSession {
     }
     return options
       ? { ...options, providerOptions }
-      : { model: modelString, agentId: WORKSPACE_DEFAULTS.agentId, providerOptions };
+      : { model: requestModel, agentId: WORKSPACE_DEFAULTS.agentId, providerOptions };
   }
 
   private isGptClassModel(modelString: string): boolean {
@@ -8809,27 +8821,33 @@ export class AgentSession {
    * input budget. Anthropic models that can switch to 1M: 1M context, whose larger window sets
    * the trim budget (their first attempt is not trimmed, see resolveCompactionInputBudgetTokens).
    * Every other model: half the input budget, so trimCompactionInput drops more old history.
+   * `model` is the model that overflowed: a refusal fallback when the stream swapped to one.
+   * The retry still starts on the requested model, and its fallback rebuild gets the same
+   * options and budget scale.
    */
-  private resolveCompactionRetryPlan(context: {
-    modelString: string;
-    options?: SendMessageOptions;
-  }): {
+  private resolveCompactionRetryPlan(
+    context: {
+      modelString: string;
+      options?: SendMessageOptions;
+    },
+    model: string
+  ): {
     options?: SendMessageOptions;
     label: string;
     openaiTruncation?: "auto";
     budgetScale?: number;
   } {
     const halfBudget = COMPACTION_RETRY_INPUT_BUDGET_SCALE;
-    if (this.isGptClassModel(context.modelString)) {
+    if (this.isGptClassModel(model)) {
       const label = "OpenAI truncation";
       return { options: context.options, label, openaiTruncation: "auto", budgetScale: halfBudget };
     }
     const providersConfig = this.activeStreamContext?.providersConfig ?? null;
     if (
-      this.supports1MContextRetry(context.modelString) &&
-      !this.is1MContextEnabledForModel(context.modelString, context.options, providersConfig)
+      this.supports1MContextRetry(model) &&
+      !this.is1MContextEnabledForModel(model, context.options, providersConfig)
     ) {
-      const with1M = this.withAnthropic1MContext(context.modelString, context.options);
+      const with1M = this.withAnthropic1MContext(model, context.options, context.modelString);
       if (with1M) return { options: with1M, label: "Anthropic 1M context" };
     }
     const label = "half the compaction input budget";
@@ -8843,9 +8861,22 @@ export class AgentSession {
     return scale != null ? { compactionInputBudgetScale: scale } : {};
   }
 
+  /**
+   * Whether this stream's compaction request still has its one context_exceeded retry. A
+   * compact-agent stream without compaction-request metadata has none (no
+   * activeCompactionRequest), so TurnRequestBuilder trims its first attempt even on a model
+   * that could retry at 1M.
+   */
+  private hasCompactionContextRetry(): boolean {
+    const request = this.activeCompactionRequest;
+    return request != null && !this.compactionRetryAttempts.has(request.id);
+  }
+
   private async maybeRetryCompactionOnContextExceeded(data: {
     messageId: string;
     errorType?: string;
+    /** The model whose request failed (StreamErrorPayload.model), when the engine knows it. */
+    model?: string;
   }): Promise<boolean> {
     const expectedTurnId = this.coordinator.turnId;
     const expectedOperationId = this.coordinator.operationId;
@@ -8869,10 +8900,11 @@ export class AgentSession {
       label: retryLabel,
       openaiTruncation,
       budgetScale,
-    } = this.resolveCompactionRetryPlan(context);
+    } = this.resolveCompactionRetryPlan(context, overflowedModel(context, data.model));
     log.info(`Compaction hit context limit; retrying once with ${retryLabel}`, {
       workspaceId: this.workspaceId,
       model: context.modelString,
+      failedModel: data.model,
       compactionRequestId: context.id,
     });
 
@@ -9329,6 +9361,7 @@ export class AgentSession {
       await this.maybeRetryCompactionOnContextExceeded({
         messageId: data.messageId,
         errorType: data.errorType,
+        model: data.model,
       })
     ) {
       return; // retry set PREPARING
