@@ -1155,15 +1155,14 @@ const configLoadFailureStates = new Map<string, ConfigLoadFailureState>();
 const aliasConflictBackupFailures = new Map<string, { message: string; signature: string }>();
 
 /**
- * Write `rawBytes` next to config.json as `config.json.<tag>-<ms>`, or reuse a byte-identical
- * sidecar with that tag. Throws when neither works. Shared by the corrupt-file backup and the
- * alias-conflict backup (#5929).
+ * A `config.json.<tag>-*` sidecar that already holds exactly `rawBytes`, tightened to 0600, or
+ * null when none does.
  */
-function writeConfigBytesSidecar(
+function findIdenticalConfigSidecar(
   configFile: string,
   tag: string,
   rawBytes: Buffer
-): { path: string; reused: boolean } {
+): string | null {
   const configDir = path.dirname(configFile);
   const prefix = `${path.basename(configFile)}.${tag}-`;
   // Reuse a byte-identical sidecar only if it can also be secured: one from an older
@@ -1179,12 +1178,27 @@ function writeConfigBytesSidecar(
     try {
       if (fs.readFileSync(candidatePath).equals(rawBytes)) {
         fs.chmodSync(candidatePath, 0o600);
-        return { path: candidatePath, reused: true };
+        return candidatePath;
       }
     } catch {
       // Unusable candidate; keep scanning.
     }
   }
+  return null;
+}
+
+/**
+ * Write `rawBytes` next to config.json as `config.json.<tag>-<ms>`, or reuse a byte-identical
+ * sidecar with that tag. Throws when neither works. Shared by the corrupt-file backup and the
+ * alias-conflict backup (#5929).
+ */
+function writeConfigBytesSidecar(
+  configFile: string,
+  tag: string,
+  rawBytes: Buffer
+): { path: string; reused: boolean } {
+  const reusedPath = findIdenticalConfigSidecar(configFile, tag, rawBytes);
+  if (reusedPath !== null) return { path: reusedPath, reused: true };
   // Write the bytes the caller parsed (not a re-read of the file, which another process
   // may have replaced), leaving the source in place so throwOnError cleanup guards
   // continue to reject it. "wx" creates exclusively; on a same-millisecond collision
@@ -1745,6 +1759,27 @@ export class Config {
   }
 
   /**
+   * After a cacheable load: cache it for readers that passed a snapshot `key`, or give an edit's
+   * fresh read back the snapshot it kept (see readConfigOrDefault).
+   */
+  private storeLoadedSnapshot(
+    config: ProjectsConfig,
+    parsed: Partial<AppConfigOnDisk>,
+    key: string | undefined,
+    kept: Config["configSnapshot"]
+  ): void {
+    if (key !== undefined) {
+      this.configSnapshot = {
+        key,
+        config,
+        writeId: typeof parsed.writeId === "string" ? parsed.writeId : "-",
+      };
+    } else if (kept !== undefined) {
+      this.configSnapshot = kept;
+    }
+  }
+
+  /**
    * Back up the loaded bytes when the load merged alias rows that conflict (#5929): the merged
    * view keeps one variant of each conflicting row, and the backup keeps the other. Returns false
    * when the backup failed. Edits then refuse to write until a later load backs the bytes up, so
@@ -1890,18 +1925,10 @@ export class Config {
         // the other one. Back up the bytes first. Every save loads through here, so no save
         // can run on this view before the backup exists (#5929).
         if (!this.preserveAliasConflictBytes(rawBytes, aliasConflicts)) cacheable = false;
-        if (key !== undefined && cacheable) {
-          this.configSnapshot = {
-            key,
-            config,
-            writeId: typeof parsed.writeId === "string" ? parsed.writeId : "-",
-          };
-        } else if (cacheable && kept !== undefined) {
-          // Give it back only after a successful, cacheable read. A failed read leaves it
-          // cleared: otherwise later gate loads would hit it and never retry the read that
-          // clears a recorded load failure, refusing every edit until a restart.
-          this.configSnapshot = kept;
-        }
+        // An uncacheable load stores nothing and leaves `kept` cleared: otherwise later gate
+        // loads would hit it and never retry the read that clears a recorded load failure (or
+        // the alias-conflict backup), refusing every edit until a restart.
+        if (cacheable) this.storeLoadedSnapshot(config, parsed, key, kept);
         configLoadFailureStates.delete(this.configFile);
         return config;
       }
@@ -3436,12 +3463,7 @@ export class Config {
    * binds the approval to the current bytes and shrinks the window to the atomic write itself.
    */
   private assertConfigWritable(): void {
-    const aliasBackupFailure = aliasConflictBackupFailures.get(this.configFile);
-    if (aliasBackupFailure !== undefined) {
-      const message = `Skipping config write to ${this.configFile}: config.json has project entries that conflict, and Xum could not back them up (${aliasBackupFailure.message}). Fix the backup failure, then retry.`;
-      log.error(message);
-      throw new Error(message);
-    }
+    this.assertAliasConflictsBackedUp();
     const failureState = configLoadFailureStates.get(this.configFile);
     if (!failureState) return;
     const rejectEdit = (reason: string): never => {
@@ -3474,6 +3496,18 @@ export class Config {
         "the file changed after this edit loaded it and the new content has no confirmed backup. Retry the settings change."
       );
     }
+  }
+
+  /**
+   * The alias-conflict part of the edit gate (#5929): the last load merged rows that conflict
+   * but could not back up the bytes, so a save would drop the variant the merge did not keep.
+   */
+  private assertAliasConflictsBackedUp(): void {
+    const failure = aliasConflictBackupFailures.get(this.configFile);
+    if (failure === undefined) return;
+    const message = `Skipping config write to ${this.configFile}: config.json has project entries that conflict, and Xum could not back them up (${failure.message}). Fix the backup failure, then retry.`;
+    log.error(message);
+    throw new Error(message);
   }
 
   private describeConfigLoadFailure(state: ConfigLoadFailureState): string {
