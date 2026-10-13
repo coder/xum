@@ -361,7 +361,11 @@ export function useCoderWorkspace({
               if (onlyPreset && currentConfig.preset !== onlyPreset.name) {
                 onCoderConfigChange({ ...currentConfig, preset: onlyPreset.name });
               }
-            } else if (result.presets.length >= 2 && !currentConfig.preset) {
+            } else if (
+              result.presets.length >= 2 &&
+              // Also a kept preset the server removed (for example while offline).
+              !result.presets.some((preset) => preset.name === currentConfig.preset)
+            ) {
               // Auto-select default preset if available, otherwise first preset
               // This keeps UI and config in sync (UI falls back to first preset for display)
               const defaultPreset = result.presets.find((p) => p.isDefault);

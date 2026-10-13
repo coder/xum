@@ -274,9 +274,12 @@ describe.each([...GAP_MODES])("useWorkspaceHeartbeat across a reconnect (%s)", (
     });
     expect(view.result.current.isLoading).toBe(false);
     expect(view.result.current.settings.message).toBe("old");
+    // A save waits for the new client's read: the old form would overwrite server changes.
+    expect(view.result.current.isReloading).toBe(true);
 
     act(() => answer?.("new"));
     await waitFor(() => expect(view.result.current.settings.message).toBe("new"));
+    expect(view.result.current.isReloading).toBe(false);
 
     // Another workspace shows "loading" (not the first workspace's settings) until it loads.
     serverMessage = new Promise(() => undefined);

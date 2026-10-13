@@ -319,8 +319,9 @@ export function GeneralSection() {
       return;
     }
 
-    // No setArchiveSettingsLoaded(false): a new client (reconnect) reloads behind the loaded
-    // values, and the nonces below keep a choice the user makes meanwhile.
+    // The two archive selects are written together, so they stay disabled (showing the kept
+    // values) until this read answers: a change before it would send a stale value for the other.
+    setArchiveSettingsLoaded(false);
     const archiveBehaviorNonce = ++archiveBehaviorLoadNonceRef.current;
     const llmDebugLogsNonce = ++llmDebugLogsLoadNonceRef.current;
     const keepScreenAwakeNonce = ++keepScreenAwakeLoadNonceRef.current;

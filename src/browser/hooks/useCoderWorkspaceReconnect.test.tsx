@@ -157,6 +157,30 @@ describe.each([...GAP_MODES])("useCoderWorkspace across a reconnect (%s)", (mode
     expect(view.result.current.loadingPresets).toBe(false);
   });
 
+  // The selected preset can be removed on the server while offline: the reload must replace it.
+  test("a reload that no longer lists the selected preset selects a listed one", async () => {
+    const lists = (presets: CoderPreset[]): ServerLists => ({
+      templates: [template("t1")],
+      presets,
+      workspaces: [workspace("w1")],
+    });
+    serverLists = lists([preset("gone"), preset("p1")]);
+    harness = createConnectionHarness(mode, serverOverrides);
+    const { view, onChange } = renderCoder({ ...CONFIG, preset: "gone" });
+    await waitFor(() => expect(view.result.current.presets.length).toBe(2));
+    expect(onChange).not.toHaveBeenCalled();
+
+    serverLists = lists([preset("p1"), preset("p2")]);
+    await harness.drop();
+    harness.reconnect();
+    await waitFor(() =>
+      expect((onChange.mock.calls.at(-1) as unknown[] | undefined)?.[0]).toEqual({
+        ...CONFIG,
+        preset: "p1",
+      })
+    );
+  });
+
   test("a window focus while offline keeps the Coder info and config", async () => {
     const { view, onChange } = renderCoder(CONFIG);
     await waitFor(() => expect(view.result.current.coderInfo?.state).toBe("available"));

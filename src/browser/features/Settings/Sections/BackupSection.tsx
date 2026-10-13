@@ -335,6 +335,10 @@ export function BackupSection() {
   const configured = settingsFresh && savedDraft.repoUrl.trim() !== "";
   const saving = activeAction === "save";
   const busy = activeAction !== null;
+  // A settings read is pending (a reconnect keeps the form on screen while it reloads). Save
+  // waits for it: the draft's untouched fields would overwrite changes made on the server.
+  const [reading, setReading] = useState(false);
+  const saveBlocked = busy || reading;
 
   useEffect(() => {
     if (!api) {
@@ -359,6 +363,7 @@ export function BackupSection() {
     const refresh = async (options?: { markFresh?: boolean }) => {
       const version = (refreshGenerationRef.current += 1);
       setSettingsFresh(false);
+      setReading(true);
 
       try {
         const settings = await api.backup.getSettings();
@@ -399,6 +404,7 @@ export function BackupSection() {
       } finally {
         if (!signal.aborted && version === refreshGenerationRef.current) {
           setLoading(false);
+          setReading(false);
         }
       }
     };
@@ -456,7 +462,7 @@ export function BackupSection() {
   }, [api]);
 
   async function handleSave() {
-    if (!api || activeAction !== null) return;
+    if (!api || saveBlocked) return;
     const missingField = getMissingFieldError(draft);
     if (missingField != null) {
       setSaveError(missingField);
@@ -898,7 +904,7 @@ export function BackupSection() {
           <Button
             size="sm"
             onClick={() => void handleSave()}
-            disabled={busy || !isDirty}
+            disabled={saveBlocked || !isDirty}
             tooltip={`Save settings (${formatKeybind(KEYBINDS.SETTINGS_BACKUP_SAVE)})`}
             className="w-full sm:w-auto"
           >

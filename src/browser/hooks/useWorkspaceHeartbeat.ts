@@ -19,6 +19,8 @@ interface UseWorkspaceHeartbeatParams {
 export interface UseWorkspaceHeartbeatResult {
   settings: HeartbeatFormSettings;
   isLoading: boolean;
+  /** Shown settings wait for the current client's read (after a reconnect, or offline). */
+  isReloading: boolean;
   isSaving: boolean;
   error: string | null;
   save: (next: HeartbeatFormSettings) => Promise<boolean>;
@@ -101,6 +103,9 @@ export function useWorkspaceHeartbeat(
     getDefaultHeartbeatSettings()
   );
   const [isLoading, setIsLoading] = useState(true);
+  // The client whose read answered. A reconnect keeps the form on screen, but a save waits for
+  // the new client's read: the form would overwrite changes made on the server while offline.
+  const [readClient, setReadClient] = useState<typeof api>(null);
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [globalDefaultPrompt, setGlobalDefaultPrompt] = useState<string | undefined>(undefined);
@@ -152,6 +157,8 @@ export function useWorkspaceHeartbeat(
         setGlobalDefaultIntervalMs(globalDefaults.intervalMs);
         setError(null);
         setIsLoading(false);
+        // The client is a callable proxy: pass it through an updater, never as the state.
+        setReadClient(() => api);
       })
       .catch((loadError) => {
         // A lost connection is no load failure: keep the shown settings for the reconnect.
@@ -163,6 +170,7 @@ export function useWorkspaceHeartbeat(
           getHeartbeatErrorMessage(loadError, "Failed to load workspace heartbeat settings")
         );
         setIsLoading(false);
+        setReadClient(() => api);
       });
 
     return () => {
@@ -247,6 +255,7 @@ export function useWorkspaceHeartbeat(
   return {
     settings,
     isLoading,
+    isReloading: !isLoading && workspaceId != null && readClient !== api,
     isSaving,
     error,
     save,

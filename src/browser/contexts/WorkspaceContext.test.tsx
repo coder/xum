@@ -1102,6 +1102,32 @@ describe("WorkspaceContext", () => {
       await waitFor(() => expect(contexts.workspace().loading).toBe(true));
       expect(contexts.workspace().loaded).toBe(false);
     });
+
+    // A stream lost with the connection rejects with ConnectionLostError: no load failure, so
+    // the startup loader stays for the whole outage, not only once the new client arrives.
+    test("a drop before the first snapshot keeps loading during the outage", async () => {
+      const { workspace: workspaceApi } = createMockAPI();
+      workspaceApi.onMetadata.mockImplementation(() =>
+        Promise.resolve(
+          // eslint-disable-next-line require-yield
+          (async function* () {
+            await new Promise(() => undefined);
+          })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+        )
+      );
+      const contexts = await setupWithConnection(mode, { awaitLoad: false });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      });
+      expect(contexts.workspace().loading).toBe(true);
+
+      await contexts.harness.drop();
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      });
+      expect(contexts.workspace().loading).toBe(true);
+      expect(contexts.workspace().loaded).toBe(false);
+    });
   });
 
   describe("archiveWorkspace", () => {
@@ -2498,7 +2524,7 @@ function createDraftServiceClient(service: DraftService): TestApiOverrides<APICl
 }
 
 /** Like setupWithProjectContext(), over a connection the test drops (connection.testHarness). */
-async function setupWithConnection(mode: GapMode) {
+async function setupWithConnection(mode: GapMode, options?: { awaitLoad?: boolean }) {
   const harness = createConnectionHarness(mode, () => currentClientMock);
   const workspaceRef = { current: null as WorkspaceContext | null };
   const projectRef = { current: null as ReturnType<typeof useProjectContext> | null };
@@ -2519,7 +2545,9 @@ async function setupWithConnection(mode: GapMode) {
     </harness.Wrapper>
   );
   getWorkspaceStoreRaw().setClient(harness.client);
-  await waitFor(() => expect(workspaceRef.current?.loading).toBe(false));
+  if (options?.awaitLoad !== false) {
+    await waitFor(() => expect(workspaceRef.current?.loading).toBe(false));
+  }
   return { harness, workspace: () => workspaceRef.current!, project: () => projectRef.current! };
 }
 

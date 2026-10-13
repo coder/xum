@@ -945,9 +945,10 @@ describe("GeneralSection", () => {
   });
 
   // A reconnect reloads the config through the new client. The archive controls keep their
-  // loaded values and stay enabled while that reload is pending.
+  // loaded values, but stay disabled until the reload answers: they are written together, so a
+  // change before it would send a stale value for the other one.
   describe.each([...GAP_MODES])("across a reconnect (%s)", (mode) => {
-    test("keeps the archive controls enabled while the reload is pending", async () => {
+    test("keeps the archive values and locks the controls while the reload is pending", async () => {
       const setup = createMockAPI({ worktreeArchiveBehavior: "delete" });
       mockApi = setup.api;
       getAppConfigStore().setClient(createTestApiClient(mockApi));
@@ -977,7 +978,7 @@ describe("GeneralSection", () => {
 
       const trigger = getSelectTrigger(view, "Worktree archive behavior");
       expect(trigger.textContent).toContain("Delete checkout");
-      expect(trigger.hasAttribute("disabled")).toBe(false);
+      expect(trigger.hasAttribute("disabled")).toBe(true);
     });
 
     // Offline the loaded values stay, but a control that writes to the server must not look

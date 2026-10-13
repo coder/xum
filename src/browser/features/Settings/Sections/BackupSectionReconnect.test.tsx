@@ -42,6 +42,18 @@ function serverOverrides(): TestApiOverrides<APIClient> {
   };
 }
 
+// happy-dom does not deliver React's synthetic onChange for controlled fields, so call the
+// field's React onChange prop directly (same workaround as SecretsSection.test.tsx).
+function typeInto(field: HTMLElement, value: string) {
+  const reactPropsKey = Object.keys(field).find((key) => key.startsWith("__reactProps"));
+  const reactProps = (
+    reactPropsKey ? (field as unknown as Record<string, unknown>)[reactPropsKey] : null
+  ) as { onChange?: (event: { target: { value: string } }) => void } | null;
+  const onChange = reactProps?.onChange;
+  if (!onChange) throw new Error("Expected the field to expose its onChange handler");
+  act(() => onChange({ target: { value } }));
+}
+
 // A reconnect reloads the backup settings through the new client. The form stays on screen
 // ("Loading backup settings..." replaces it only before the first load).
 describe.each([...GAP_MODES])("BackupSection across a reconnect (%s)", (mode) => {
@@ -83,5 +95,36 @@ describe.each([...GAP_MODES])("BackupSection across a reconnect (%s)", (mode) =>
 
     act(() => answer?.({ repoUrl: "git@example.com:new.git", branch: "main", path: "mux/" }));
     await waitFor(() => expect(view.queryByDisplayValue("git@example.com:new.git")).not.toBeNull());
+  });
+
+  // A dirty draft survives the reconnect. Its untouched fields are stale until the reload
+  // answers, so Save must wait for it.
+  test("disables Save for a kept draft until the reload answers", async () => {
+    const view = render(
+      <harness.Wrapper>
+        <ThemeProvider forcedTheme="dark">
+          <TooltipProvider>
+            <BackupSection />
+          </TooltipProvider>
+        </ThemeProvider>
+      </harness.Wrapper>
+    );
+    const branch = await waitFor(() => view.getByDisplayValue("main"));
+    typeInto(branch, "edited");
+    const save = view.getByRole("button", { name: "Save settings" }) as HTMLButtonElement;
+    await waitFor(() => expect(save.disabled).toBe(false));
+
+    let answer: ((settings: BackupSettings) => void) | null = null;
+    serverSettings = new Promise((resolve) => (answer = resolve));
+    await harness.drop();
+    harness.reconnect();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    });
+    expect(view.queryByDisplayValue("edited")).not.toBeNull();
+    expect(save.disabled).toBe(true);
+
+    act(() => answer?.({ repoUrl: "git@example.com:new.git", branch: "main", path: "mux/" }));
+    await waitFor(() => expect(save.disabled).toBe(false));
   });
 });
