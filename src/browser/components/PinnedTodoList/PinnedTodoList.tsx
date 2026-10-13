@@ -5,9 +5,37 @@ import { ChatInputDecoration } from "../ChatPane/ChatInputDecoration";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { getPinnedTodoExpandedKey } from "@/common/constants/storage";
+import type { TodoItem } from "@/common/types/tools";
 
 interface PinnedTodoListProps {
   workspaceId: string;
+}
+
+/**
+ * The panel scrolls once the list outgrows its max height (MAX_TODOS allows lists taller than
+ * it), and completed items always come first, so a long list would open with the current item
+ * below the fold. Bring the first unfinished item into view, with one finished row above it for
+ * context. This syncs with a DOM scroll position, so it needs an effect; it reruns only when the
+ * panel opens or the current item moves, so it never fights the user's own scrolling. It sets
+ * the panel's own scrollTop instead of calling scrollIntoView, which would also scroll the chat.
+ */
+function useScrollToCurrentTodo(expanded: boolean, todos: readonly TodoItem[]) {
+  const contentRef = useRef<HTMLDivElement>(null);
+  const currentIndex = todos.findIndex((todo) => todo.status !== "completed");
+  useLayoutEffect(() => {
+    const container = contentRef.current;
+    if (!expanded || container === null || currentIndex < 0) {
+      return;
+    }
+    const target =
+      container.querySelectorAll<HTMLElement>("[data-todo-row]")[Math.max(0, currentIndex - 1)];
+    if (target === undefined) {
+      return;
+    }
+    container.scrollTop +=
+      target.getBoundingClientRect().top - container.getBoundingClientRect().top;
+  }, [expanded, currentIndex]);
+  return contentRef;
 }
 
 /**
@@ -33,27 +61,7 @@ export const PinnedTodoList: React.FC<PinnedTodoListProps> = ({ workspaceId }) =
     () => workspaceStore.getWorkspaceState(workspaceId).todos
   );
 
-  // The panel scrolls once the list outgrows its max height (MAX_TODOS allows lists taller than
-  // it), and completed items always come first, so a long list would open with the current item
-  // below the fold. Bring the first unfinished item into view, with one finished row above it for
-  // context. This syncs with a DOM scroll position, so it needs an effect; it reruns only when the
-  // panel opens or the current item moves, so it never fights the user's own scrolling. It sets
-  // the panel's own scrollTop instead of calling scrollIntoView, which would also scroll the chat.
-  const contentRef = useRef<HTMLDivElement>(null);
-  const currentIndex = todos.findIndex((todo) => todo.status !== "completed");
-  useLayoutEffect(() => {
-    const container = contentRef.current;
-    if (!expanded || container === null || currentIndex < 0) {
-      return;
-    }
-    const rows = container.querySelectorAll<HTMLElement>("[data-todo-row]");
-    const target = rows[Math.max(0, currentIndex - 1)];
-    if (target === undefined) {
-      return;
-    }
-    container.scrollTop +=
-      target.getBoundingClientRect().top - container.getBoundingClientRect().top;
-  }, [expanded, currentIndex]);
+  const contentRef = useScrollToCurrentTodo(expanded, todos);
 
   // No todos have been written yet in this session
   if (todos.length === 0) {
