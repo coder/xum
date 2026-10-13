@@ -196,6 +196,7 @@ export interface AgentSessionHarnessOptions extends Pick<
   | "autoModelRouter"
   | "hasExternalSendPreflight"
   | "hasExternalManualSendPreflight"
+  | "callerOwnsTurnEnd"
 > {
   workspaceId: string;
   contextManagement?: ContextManagementService;
@@ -307,6 +308,7 @@ export async function createAgentSessionHarness(
     autoModelRouter: options.autoModelRouter,
     hasExternalSendPreflight: options.hasExternalSendPreflight,
     hasExternalManualSendPreflight: options.hasExternalManualSendPreflight,
+    callerOwnsTurnEnd: options.callerOwnsTurnEnd,
   });
 
   const events: WorkspaceChatMessage[] = [];
