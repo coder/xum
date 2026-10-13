@@ -643,6 +643,12 @@ interface StopContinuationProvenance {
   agentInitiated?: boolean;
   /** The stream was a delegated workspace turn: WorkspaceTurnManager owns its end. */
   delegatedWorkspaceTurn: boolean;
+  /**
+   * A client outside this session owns the turn's end: an ACP prompt (its `prompt()` resolves on
+   * this stream-end) or a caller with `callerOwnsTurnEnd` (`xum run`, which stops waiting and can
+   * exit). A continuation queued after stream-end would run after that owner saw the turn end.
+   */
+  externallyOwnedTurn: boolean;
 }
 
 function extractAgentSkillRefs(metadata: MuxMessageMetadata | undefined): AgentSkillReference[] {
@@ -1051,6 +1057,12 @@ interface AgentSessionOptions {
   onTurnSuperseded?: (previous: symbol, next: symbol) => void;
   /** Test seam for PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS (see completion policy). */
   planSnapshotCaptureTimeoutMs?: number;
+  /**
+   * The caller waits for each stream-end and treats it as the end of the turn (`xum run`). The
+   * turn.stop hooks still run for its turns, but cannot continue them: a continuation queued
+   * after stream-end would run after the caller stopped waiting.
+   */
+  callerOwnsTurnEnd?: boolean;
 }
 
 interface CachedMemoryContext {
@@ -1286,6 +1298,7 @@ export class AgentSession {
   private readonly autoModelRouter?: Pick<AutoModelRouter, "classify">;
   private readonly keepBackgroundProcesses: boolean;
   private readonly sanitizeCliWorkspaceRegistration?: AgentSessionOptions["sanitizeCliWorkspaceRegistration"];
+  private readonly callerOwnsTurnEnd: boolean;
   private readonly onPostCompactionStateChange?: () => void;
   private readonly hasExternalSendPreflight?: () => boolean;
   private readonly hasExternalManualSendPreflight?: () => boolean;
@@ -1736,6 +1749,7 @@ export class AgentSession {
       autoModelRouter,
       keepBackgroundProcesses,
       sanitizeCliWorkspaceRegistration,
+      callerOwnsTurnEnd,
       onCompactionComplete,
       onIdleCompactionOutcome,
       onPostCompactionStateChange,
@@ -1777,6 +1791,7 @@ export class AgentSession {
     this.autoModelRouter = autoModelRouter;
     this.keepBackgroundProcesses = keepBackgroundProcesses ?? false;
     this.sanitizeCliWorkspaceRegistration = sanitizeCliWorkspaceRegistration;
+    this.callerOwnsTurnEnd = callerOwnsTurnEnd ?? false;
     this.onPostCompactionStateChange = onPostCompactionStateChange;
     this.hasExternalSendPreflight = hasExternalSendPreflight;
     this.hasExternalManualSendPreflight = hasExternalManualSendPreflight;
@@ -10095,6 +10110,11 @@ export class AgentSession {
       goalId: this.activeStreamContext?.goalId,
       agentInitiated: this.activeStreamContext?.agentInitiated,
       delegatedWorkspaceTurn: this.activeStreamContext?.workspaceTurnMetadata != null,
+      externallyOwnedTurn:
+        this.callerOwnsTurnEnd ||
+        payload.acpPromptId != null ||
+        (normalizeAcpPromptId(activeStreamOptions?.acpPromptId) ??
+          extractAcpPromptId(activeStreamOptions?.muxMetadata)) != null,
     };
 
     let goalContinuationRequest: {
@@ -10388,6 +10408,15 @@ export class AgentSession {
       stopHookActive: this.stopHookContinuations > 0,
     });
     if (outcome.kind === "none" || options == null) {
+      this.stopHookContinuations = 0;
+      return;
+    }
+    // The hook ran (its notices are shown), but it cannot continue a turn whose end an outside
+    // client already received (Codex PRRT_kwDOPxxmWM6rxPMC).
+    if (provenance.externallyOwnedTurn) {
+      log.info("Prompt hooks: an ACP or xum run turn cannot be continued by turn.stop", {
+        workspaceId: this.workspaceId,
+      });
       this.stopHookContinuations = 0;
       return;
     }
