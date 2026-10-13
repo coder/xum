@@ -1646,6 +1646,39 @@ describe("MessageQueue", () => {
       expect(dispatched.options != null && "authoredText" in dispatched.options).toBe(false);
     });
 
+    it("restores a /compact follow-up's attachments and review notes from its compaction metadata", () => {
+      // Codex P1 (PRRT_kwDOPxxmWM6r_ubq): prepareCompactionMessage keeps them only under
+      // parsed.followUpContent; a message.send block that restores the entry must give them back.
+      const review = { filePath: "src/a.ts", lineRange: "1", selectedCode: "a()", userNote: "n" };
+      const fileParts = [{ url: "data:image/png;base64,aGVsbG8=", mediaType: "image/png" }];
+      queue.add("Summarize the conversation.", {
+        model: "claude-3-5-sonnet-20241022",
+        agentId: "compact",
+        muxMetadata: {
+          type: "compaction-request",
+          rawCommand: "/compact\nfix the bug",
+          parsed: {
+            followUpContent: {
+              text: "fix the bug",
+              fileParts,
+              reviews: [review],
+              model: "claude-3-5-sonnet-20241022",
+              agentId: "exec",
+            },
+          },
+        },
+      });
+
+      expect(queue.getInputForRestore()).toEqual({
+        text: "/compact\nfix the bug",
+        fileParts,
+        reviews: [review],
+      });
+      expect(queue.getInputsForRestore()).toEqual([
+        expect.objectContaining({ fileParts, reviews: [review] }),
+      ]);
+    });
+
     it("captures a refused task-attempt entry's full original send only for manual user input", () => {
       const token = () => ({
         admissionStale: () => true,
