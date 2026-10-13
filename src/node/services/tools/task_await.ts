@@ -18,7 +18,7 @@ import {
 } from "@/common/types/workflow";
 
 import { fromBashTaskId, isWorkflowRunTaskId, toBashTaskId } from "./taskId";
-import { pageToolTextForResult } from "@/common/utils/tools/pageToolText";
+import { pageTaskReportForResult } from "@/common/utils/tools/pageToolText";
 import { formatBashOutputReport } from "./bashTaskReport";
 import {
   dedupeStrings,
@@ -119,13 +119,23 @@ function pageCompletedReport<T extends { status: string; taskId: string }>(
 ): T {
   if (result.status !== "completed" || fromBashTaskId(result.taskId) != null) return result;
   if (!("reportMarkdown" in result) || typeof result.reportMarkdown !== "string") return result;
-  const { text, ...paging } = pageToolTextForResult(
+  const { text, ...paging } = pageTaskReportForResult(
+    result.taskId,
     result.reportMarkdown,
-    offsetChars,
-    `task_await(task_ids: ["${result.taskId}"], timeout_secs: 0, offset_chars: <offset>)`
+    offsetChars
   );
   // A whole report keeps its result as is (including the re-fetch note).
-  return text === result.reportMarkdown ? result : { ...result, reportMarkdown: text, ...paging };
+  if (text === result.reportMarkdown) return result;
+  return dropStructuredOutputAfterFirstPage({ ...result, reportMarkdown: text, ...paging });
+}
+
+/**
+ * structuredOutput has no size bound: only the first page carries it, so reading a report
+ * page by page does not repeat it on every page.
+ */
+function dropStructuredOutputAfterFirstPage<T extends { startCharOffset?: number }>(page: T): T {
+  if (page.startCharOffset != null) Reflect.deleteProperty(page, "structuredOutput");
+  return page;
 }
 
 function getWorkflowRunElapsedMs(run: WorkflowRunRecord): number | undefined {

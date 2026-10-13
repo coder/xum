@@ -1348,6 +1348,43 @@ describe("task_await tool", () => {
     });
   });
 
+  it("returns a workflow's structuredOutput on the first report page only", async () => {
+    using tempDir = new TestTempDir("test-task-await-tool-workflow-pages");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const report = "r".repeat(TOOL_TEXT_PAGE_MAX_CHARS + 10);
+    const structuredOutput = { findings: "x".repeat(1_000) };
+    const completedRun = createWorkflowRun("completed", [
+      {
+        sequence: 1,
+        type: "result",
+        at: "2026-01-01T00:00:04.000Z",
+        result: { reportMarkdown: report, structuredOutput },
+      },
+    ]);
+    const tool = createTaskAwaitTool({
+      ...baseConfig,
+      ...createFakeTaskServices({}),
+      workflowService: {
+        getRun: mock(() => Promise.resolve(completedRun)),
+      } as unknown as TestWorkflowService,
+    });
+    const read = async (args: Record<string, unknown>) => {
+      const result = (await Promise.resolve(
+        tool.execute!({ task_ids: ["wfr_demo"], timeout_secs: 0, ...args }, mockToolCallOptions)
+      )) as { results: Array<ReportPage & { structuredOutput?: unknown }> };
+      return result.results[0];
+    };
+
+    const first = await read({});
+    expect(first.structuredOutput).toEqual(structuredOutput);
+    expect(first.nextCharOffset).toBe(TOOL_TEXT_PAGE_MAX_CHARS);
+    const second = await read({ offset_chars: first.nextCharOffset });
+    expect(second.reportMarkdown).toBe("r".repeat(10));
+    expect(second).not.toHaveProperty("structuredOutput");
+    // Rereading the first page with an explicit 0 still returns it.
+    expect((await read({ offset_chars: 0 })).structuredOutput).toEqual(structuredOutput);
+  });
+
   it("returns retry_from_checkpoint guidance for checkpoint-retryable failed workflow runs", async () => {
     using tempDir = new TestTempDir("test-task-await-tool-workflow-retryable-failed");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });

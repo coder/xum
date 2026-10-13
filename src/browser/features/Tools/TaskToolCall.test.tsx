@@ -331,6 +331,60 @@ describe("TaskToolCall", () => {
     );
   });
 
+  test("keeps the later pages when the agent rereads an earlier page", () => {
+    workspaceContextMock = { workspaceMetadata: new Map() };
+    const agentTaskArgs = {
+      subagent_type: "explore",
+      prompt: "Look around.",
+      title: "Explore task",
+      run_in_background: true,
+    };
+    const spawnResult = { status: "running", taskId: "task-reread", note: "Started." };
+    const report = "Page zero. Page one. Page two.";
+    const awaitPage = (offset: number) => {
+      const page = pageToolText(report, offset, 10);
+      return createToolMessage({
+        toolName: "task_await",
+        args: { task_ids: ["task-reread"], ...(offset > 0 ? { offset_chars: offset } : {}) },
+        result: {
+          results: [
+            {
+              status: "completed",
+              taskId: "task-reread",
+              reportMarkdown: page.text,
+              ...(page.startCharOffset != null ? { startCharOffset: page.startCharOffset } : {}),
+              ...(page.nextCharOffset != null ? { nextCharOffset: page.nextCharOffset } : {}),
+            },
+          ],
+        },
+      });
+    };
+    const linking = computeTaskReportLinking([
+      createToolMessage({ toolName: "task", args: agentTaskArgs, result: spawnResult }),
+      awaitPage(0),
+      awaitPage(10),
+      awaitPage(20),
+      // The agent reads the first page again after the last one.
+      awaitPage(0),
+    ]);
+    expect(linking.reportByTaskId.get("task-reread")?.reportMarkdown).toBe(report);
+    expect(linking.suppressReportInAwaitTaskIds.has("task-reread")).toBe(true);
+
+    const AgentTaskToolCall = getToolComponent("task", agentTaskArgs, undefined);
+    const view = render(
+      <TooltipProvider>
+        <AgentTaskToolCall
+          args={agentTaskArgs}
+          result={spawnResult}
+          taskReportLinking={linking}
+          status="completed"
+        />
+      </TooltipProvider>
+    );
+    fireEvent.click(view.getByText("task"));
+    expect(view.container.textContent).toContain(report);
+  });
+
   test("joins a report page at the start the pager rounded to", () => {
     // offset_chars 10 points inside the emoji's surrogate pair: the pager starts at 9.
     const report = `${"a".repeat(9)}😀tail`;
@@ -381,6 +435,38 @@ describe("TaskToolCall", () => {
       }),
     ]);
     expect(linking.suppressReportInAwaitTaskIds.has("task-gap")).toBe(false);
+  });
+
+  test("keeps a later page's await row visible when the first page is read after it", () => {
+    const report = "Page zero. Page one.";
+    const awaitPage = (offset: number) => {
+      const page = pageToolText(report, offset, 10);
+      return createToolMessage({
+        toolName: "task_await",
+        args: { task_ids: ["task-late-first"], offset_chars: offset },
+        result: {
+          results: [
+            {
+              status: "completed",
+              taskId: "task-late-first",
+              reportMarkdown: page.text,
+              ...(page.nextCharOffset != null ? { nextCharOffset: page.nextCharOffset } : {}),
+            },
+          ],
+        },
+      });
+    };
+    const linking = computeTaskReportLinking([
+      createToolMessage({
+        toolName: "task",
+        args: { subagent_type: "explore", prompt: "p", title: "t", run_in_background: true },
+        result: { status: "running", taskId: "task-late-first" },
+      }),
+      awaitPage(10),
+      awaitPage(0),
+    ]);
+    expect(linking.reportByTaskId.get("task-late-first")?.reportMarkdown).toBe("Page zero.");
+    expect(linking.suppressReportInAwaitTaskIds.has("task-late-first")).toBe(false);
   });
 
   test("falls back to result-carried settings after workspace cleanup", () => {

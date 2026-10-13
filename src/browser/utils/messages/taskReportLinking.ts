@@ -109,9 +109,23 @@ function getReportPageOffset(result: unknown, args: unknown): number {
 }
 
 /**
+ * Whether a page with more text after it (nextCharOffset) repeats the text already joined at
+ * its offset: the agent reread an earlier page, so the later pages it read stay joined.
+ */
+function isRereadPage(
+  previous: string | undefined,
+  page: string,
+  offset: number,
+  hasMore: boolean
+) {
+  return hasMore && previous?.startsWith(page, offset) === true;
+}
+
+/**
  * Join a report page onto the report read so far. A page at offset 0 starts the report over;
- * a page at or before the end replaces the text from its offset on (a page read twice). A page
- * past the end leaves a gap: null, and the caller keeps the await rows visible instead.
+ * a page at or before the end replaces the text from its offset on (the last page, or another
+ * report under the same task ID). A page past the end leaves a gap: null, and the caller keeps
+ * the await rows visible instead.
  */
 function joinReportPage(previous: string | undefined, page: string, offset: number) {
   if (offset === 0) return page;
@@ -207,6 +221,34 @@ function readReportAiSettings(r: {
 }
 
 /**
+ * Join one task_await result entry's report page into reportByTaskId. Tasks whose pages left
+ * a gap go into incompleteReportTaskIds: their await rows keep showing each page.
+ */
+function linkAwaitReportPage(
+  r: unknown,
+  args: unknown,
+  reportByTaskId: Map<string, LinkedTaskReport>,
+  incompleteReportTaskIds: Set<string>
+): void {
+  const page = readCompletedAwaitReport(r);
+  if (page == null) return;
+  const pageOffset = getReportPageOffset(r, args);
+  const previous = reportByTaskId.get(page.taskId)?.reportMarkdown;
+  const hasMore = toPageOffset((r as { nextCharOffset?: unknown }).nextCharOffset) != null;
+  if (isRereadPage(previous, page.reportMarkdown, pageOffset, hasMore)) return;
+  const joined = joinReportPage(previous, page.reportMarkdown, pageOffset);
+  if (joined == null) {
+    incompleteReportTaskIds.add(page.taskId);
+    return;
+  }
+  // Only a join that reaches the report's end clears a gap: a first page read after a later
+  // one does not cover the later page, so its await row stays visible.
+  if (!hasMore) incompleteReportTaskIds.delete(page.taskId);
+  // Last-wins (history order)
+  reportByTaskId.set(page.taskId, { ...page, reportMarkdown: joined });
+}
+
+/**
  * Render-time helper that links completed task reports (from `task_await`) back to the
  * original `task` tool call that spawned the background work.
  *
@@ -264,21 +306,7 @@ export function computeTaskReportLinking(messages: DisplayedMessage[]): TaskRepo
     if (!Array.isArray(results)) continue;
 
     for (const r of results) {
-      const page = readCompletedAwaitReport(r);
-      if (page == null) continue;
-      const pageOffset = getReportPageOffset(r, msg.args);
-      const joined = joinReportPage(
-        reportByTaskId.get(page.taskId)?.reportMarkdown,
-        page.reportMarkdown,
-        pageOffset
-      );
-      if (joined == null) {
-        incompleteReportTaskIds.add(page.taskId);
-        continue;
-      }
-      if (pageOffset === 0) incompleteReportTaskIds.delete(page.taskId);
-      // Last-wins (history order)
-      reportByTaskId.set(page.taskId, { ...page, reportMarkdown: joined });
+      linkAwaitReportPage(r, msg.args, reportByTaskId, incompleteReportTaskIds);
     }
   }
 

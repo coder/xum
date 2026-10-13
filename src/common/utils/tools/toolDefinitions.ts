@@ -581,6 +581,9 @@ const TaskToolCompletedReportSchema = z
   .object({
     taskId: z.string(),
     reportMarkdown: z.string(),
+    /** Set when reportMarkdown is the first page of a longer report; note names the next read. */
+    nextCharOffset: z.number().optional(),
+    note: z.string().optional(),
     title: z.string().optional(),
     structuredOutput: z.unknown().optional(),
     planFilePath: z.string().optional(),
@@ -634,6 +637,8 @@ export const TaskToolCompletedResultSchema = z
     taskId: z.string().optional(),
     taskIds: z.array(z.string()).min(1).optional(),
     reportMarkdown: z.string().optional(),
+    /** Set when reportMarkdown is the first page of a longer report (see note). */
+    nextCharOffset: z.number().optional(),
     title: z.string().optional(),
     structuredOutput: z.unknown().optional(),
     planFilePath: z.string().optional(),
