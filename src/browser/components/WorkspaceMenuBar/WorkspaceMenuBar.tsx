@@ -14,7 +14,6 @@ import {
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { cn } from "@/common/lib/utils";
-import { getErrorMessage } from "@/common/utils/errors";
 import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
 
 import { RIGHT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
@@ -24,7 +23,7 @@ import {
   useUserPreferences,
 } from "@/browser/stores/AppConfigStore";
 import { WorkspaceHeartbeatModal } from "../WorkspaceHeartbeatModal";
-import { WorkspaceUnrelatedMessagingModal } from "../WorkspaceUnrelatedMessagingModal";
+import { WorkspaceUnrelatedMessagingDialog } from "../WorkspaceUnrelatedMessagingModal/WorkspaceUnrelatedMessagingDialog";
 import { WorkspaceMCPModal } from "../WorkspaceMCPModal/WorkspaceMCPModal";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { Popover, PopoverTrigger, PopoverContent } from "../Popover/Popover";
@@ -42,13 +41,7 @@ import {
 import { useRuntimeStatus, useRuntimeStatusStoreRaw } from "@/browser/stores/RuntimeStatusStore";
 import { useWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import { Button } from "@/browser/components/Button/Button";
-import {
-  isDevcontainerRuntime,
-  isLocalProjectRuntime,
-  isWorktreeRuntime,
-  type RuntimeConfig,
-} from "@/common/types/runtime";
-import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
+import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import { useTutorial } from "@/browser/contexts/TutorialContext";
 
 import type { TerminalSessionCreateOptions } from "@/browser/utils/terminal";
@@ -62,6 +55,11 @@ import { DebugLlmRequestModal } from "../DebugLlmRequestModal/DebugLlmRequestMod
 import { ConfirmationModal } from "../ConfirmationModal/ConfirmationModal";
 import { PopoverError } from "../PopoverError/PopoverError";
 import { WorkspaceActionsMenuContent } from "../WorkspaceActionsMenuContent/WorkspaceActionsMenuContent";
+import {
+  forkWorkspaceFromMenu,
+  getErrorAnchor,
+  stopWorkspaceRuntime,
+} from "../WorkspaceActionsMenuContent/workspaceActionHandlers";
 import { WorkspaceTerminalIcon } from "../icons/WorkspaceTerminalIcon/WorkspaceTerminalIcon";
 import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 
@@ -72,7 +70,6 @@ import { useAPI } from "@/browser/contexts/API";
 import { useWorkspaceActions, useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { formatProjectHierarchyLabel } from "@/common/utils/subProjects";
-import { forkWorkspace } from "@/browser/utils/chatCommands";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
@@ -80,6 +77,7 @@ import {
   NARROW_VIEWPORT_MAX_WIDTH_PX,
   WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX,
 } from "@/constants/layout";
+import { appViewTabFor } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { focusRightSidebarTab } from "@/browser/utils/rightSidebarTabFocus";
 import type { TabType } from "@/browser/types/rightSidebar";
@@ -400,9 +398,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     return () => window.removeEventListener("keydown", handler);
   }, [artifactsExperimentEnabled, isTimelineSidebarHidden, openSidebarTab]);
 
-  // "Open in Artifacts" on an MCP Apps tool card and openArtifact() (chat cards, file cards,
-  // Review, palette): while the sidebar is hidden, they show the Artifacts tab full-screen
-  // (RightSidebar handles the same events on wider layouts).
+  // openArtifact() (chat cards, file cards, Review, palette) and "Open in tab" on an MCP Apps
+  // tool card: while the sidebar is hidden, they show their tab full-screen (RightSidebar
+  // handles the same events on wider layouts).
   useEffect(() => {
     if (!artifactsExperimentEnabled) {
       return;
@@ -414,38 +412,25 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       }
       openSidebarTab("artifacts", activeElement());
     };
-    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handler);
+    // "Open in tab" shows the view's own app tab full-screen: the tab RightSidebar opens or
+    // focuses on wider layouts, so the view still runs in one place.
+    const appViewHandler = (event: Event) => {
+      const detail = (event as CustomEvent<{ workspaceId: string; toolCallId: string }>).detail;
+      if (detail?.workspaceId !== workspaceId || !isTimelineSidebarHidden()) {
+        return;
+      }
+      openSidebarTab(appViewTabFor(detail.toolCallId), activeElement());
+    };
+    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, appViewHandler);
     window.addEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handler);
     return () => {
-      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handler);
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, appViewHandler);
       window.removeEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handler);
     };
   }, [artifactsExperimentEnabled, isTimelineSidebarHidden, openSidebarTab, workspaceId]);
 
   const isDevcontainerWorkspace = isDevcontainerRuntime(runtimeConfig);
   const isRuntimeRunning = isDevcontainerWorkspace && runtimeStatus === "running";
-  // Mirrors TaskService.isLocalUnrelatedMessagingEndpoint: unrelated delivery requires local or
-  // worktree runtimes on both endpoints, so remote/container workspaces get no consent switch —
-  // a grant there could never be honoured. The dialog itself stays reachable everywhere because
-  // its hold-until-turn-end preference also covers same-tree senders, which work on any runtime.
-  // An unset config resolves to the same canonical default the backend applies.
-  const unrelatedMessagingRuntime = runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
-  const unrelatedMessagingSupported =
-    isLocalProjectRuntime(unrelatedMessagingRuntime) ||
-    isWorktreeRuntime(unrelatedMessagingRuntime);
-
-  const getMoreMenuAnchor = useCallback(() => {
-    const rect = moreActionsButtonRef.current?.getBoundingClientRect();
-    if (!rect) {
-      return undefined;
-    }
-
-    return {
-      top: rect.top + window.scrollY,
-      left: rect.right + 10,
-    };
-  }, []);
-
   const handleOpenTouchFullscreenReview = useCallback(() => {
     window.dispatchEvent(
       createCustomEvent(CUSTOM_EVENTS.OPEN_TOUCH_REVIEW_IMMERSIVE, {
@@ -496,60 +481,18 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const handleArchiveChat = (anchorEl?: HTMLElement) =>
     archiveFlow.requestArchive(workspaceId, anchorEl);
 
-  const handleForkChat = useCallback(
-    async (anchorEl: HTMLElement) => {
-      if (!api) {
-        const rect = anchorEl.getBoundingClientRect();
-        forkError.showError(workspaceId, "Not connected to server", {
-          top: rect.top + window.scrollY,
-          left: rect.right + 10,
-        });
-        return;
-      }
+  const handleForkWorkspace = async (anchorEl: HTMLElement) => {
+    const anchor = getErrorAnchor(anchorEl);
+    const error = await forkWorkspaceFromMenu(api, workspaceId);
+    if (error) forkError.showError(workspaceId, error, anchor);
+  };
 
-      const rect = anchorEl.getBoundingClientRect();
-      const anchor = { top: rect.top + window.scrollY, left: rect.right + 10 };
-
-      try {
-        const result = await forkWorkspace({
-          client: api,
-          sourceWorkspaceId: workspaceId,
-        });
-        if (!result.success) {
-          forkError.showError(workspaceId, result.error ?? "Failed to fork chat", anchor);
-        }
-      } catch (error) {
-        const message = getErrorMessage(error);
-        forkError.showError(workspaceId, message, anchor);
-      }
-    },
-    [api, forkError, workspaceId]
-  );
-
-  const handleStopRuntime = useCallback(async () => {
-    if (!api) {
-      stopRuntimeError.showError(workspaceId, "Not connected to server", getMoreMenuAnchor());
-      return;
+  const handleStopRuntime = async () => {
+    const error = await stopWorkspaceRuntime(api, runtimeStatusStore, workspaceId);
+    if (error) {
+      stopRuntimeError.showError(workspaceId, error, getErrorAnchor(moreActionsButtonRef.current));
     }
-
-    try {
-      const result = await api.workspace.stopRuntime({ workspaceId });
-      if (!result.success) {
-        stopRuntimeError.showError(
-          workspaceId,
-          result.error ?? "Failed to stop container",
-          getMoreMenuAnchor()
-        );
-        return;
-      }
-
-      // Clear the cached running state immediately so both menu entry points converge
-      // on a fresh backend read after the container stop succeeds.
-      runtimeStatusStore.invalidateWorkspace(workspaceId);
-    } catch (error) {
-      stopRuntimeError.showError(workspaceId, getErrorMessage(error), getMoreMenuAnchor());
-    }
-  }, [api, getMoreMenuAnchor, runtimeStatusStore, stopRuntimeError, workspaceId]);
+  };
 
   // Start workspace tutorial on first entry
   useEffect(() => {
@@ -709,7 +652,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           onForkChat={
             hasRepository
               ? (anchorEl) => {
-                  void handleForkChat(anchorEl);
+                  void handleForkWorkspace(anchorEl);
                 }
               : null
           }
@@ -1061,31 +1004,16 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         open={heartbeatModalOpen}
         onOpenChange={setHeartbeatModalOpen}
       />
-      <WorkspaceUnrelatedMessagingModal
+      <WorkspaceUnrelatedMessagingDialog
         // Remount per workspace: the keyed open state above only closes the dialog, while
         // the modal's own pending/error state and in-flight request id would otherwise
         // survive the switch and surface in the next workspace's dialog.
         key={workspaceId}
+        workspaceId={workspaceId}
+        runtimeConfig={runtimeConfig}
+        workspace={workspaceEntry}
         open={unrelatedMessagingModalOpen}
         onOpenChange={(open) => setUnrelatedMessagingWorkspaceId(open ? workspaceId : null)}
-        consentSupported={unrelatedMessagingSupported}
-        // Read straight from published metadata: the switch moves only after the backend
-        // commits and republishes, never on the local ack alone.
-        enabled={workspaceEntry?.unrelatedWorkspaceConsent != null}
-        onSetEnabled={(enabled) =>
-          api
-            ? api.workspace.setUnrelatedWorkspaceConsent({ workspaceId, enabled })
-            : Promise.resolve({ success: false as const, error: "Not connected to server" })
-        }
-        holdUntilTurnEnd={workspaceEntry?.agentMessageDispatchMode === "turn-end"}
-        onSetHoldUntilTurnEnd={(hold) =>
-          api
-            ? api.workspace.setAgentMessageDispatchMode({
-                workspaceId,
-                mode: hold ? "turn-end" : "tool-end",
-              })
-            : Promise.resolve({ success: false as const, error: "Not connected to server" })
-        }
       />
       <WorkspaceMCPModal
         workspaceId={workspaceId}
@@ -1107,12 +1035,12 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       />
       <PopoverError
         error={forkError.error}
-        prefix="Failed to fork chat"
+        prefix="Failed to fork workspace"
         onDismiss={forkError.clearError}
       />
       <PopoverError
         error={archiveError.error}
-        prefix="Failed to archive chat"
+        prefix="Failed to archive workspace"
         onDismiss={archiveError.clearError}
       />
     </div>

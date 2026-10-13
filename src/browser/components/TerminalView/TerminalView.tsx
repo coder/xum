@@ -101,6 +101,34 @@ async function preloadTerminalWebfonts(
   }
 }
 
+/** RIS (full reset): clears the screen, the scrollback and the modes inside the VT itself. */
+const FULL_RESET = "\x1bc";
+
+/**
+ * Writes a full screen from the server (may be empty for new sessions).
+ *
+ * `replace` is set after a reconnect, when the router reattaches and sends the full screen again
+ * (TerminalSessionRouter). clear() keeps the scrollback, so writing on top would repeat it: the
+ * screen is written after a full reset instead, in one write, so no empty frame shows.
+ *
+ * Not Terminal.reset(): in ghostty-web it frees the WASM terminal and makes a new one, but the
+ * selection manager and input handler keep the freed one, and the next write after a second
+ * reconnect failed with "memory access out of bounds" and garbled the screen.
+ */
+export function writeScreenState(
+  term: Pick<Terminal, "write">,
+  state: string,
+  replace: boolean
+): void {
+  if (!replace && !state) return;
+  try {
+    term.write(replace ? FULL_RESET + state : state);
+  } catch (err) {
+    // xterm WASM can throw "memory access out of bounds" intermittently
+    console.warn("[TerminalView] Error writing screenState:", err);
+  }
+}
+
 interface TerminalViewProps {
   workspaceId: string;
   /** Session ID to connect to (required - must be created before mounting) */
@@ -365,16 +393,8 @@ export function TerminalView({
           console.warn("[TerminalView] Error writing output:", err);
         }
       },
-      onScreenState: (state) => {
-        // Write screen state (may be empty for new sessions)
-        if (state) {
-          try {
-            term.write(state);
-          } catch (err) {
-            // xterm WASM can throw "memory access out of bounds" intermittently
-            console.warn("[TerminalView] Error writing screenState:", err);
-          }
-        }
+      onScreenState: (state, options) => {
+        writeScreenState(term, state, options?.replace === true);
         // Mark loading complete - we now have valid content to show
         setIsLoading(false);
       },

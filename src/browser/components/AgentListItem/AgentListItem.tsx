@@ -406,7 +406,7 @@ function QuickArchiveButton(props: {
             <ArchiveIcon className="h-3 w-3 shrink-0" />
           </button>
         </TooltipTrigger>
-        <TooltipContent side="right">Archive chat</TooltipContent>
+        <TooltipContent side="right">Archive workspace</TooltipContent>
       </Tooltip>
     </div>
   );
@@ -1215,7 +1215,9 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                   align={ctxMenu.position ? "start" : "end"}
                   side={ctxMenu.position ? "right" : "bottom"}
                   sideOffset={ctxMenu.position ? 0 : 6}
-                  className="bg-surface-primary w-[250px] min-w-0! p-1"
+                  // Size to the widest row ("Archive workspace" + its shortcut overflowed a
+                  // fixed 250px), but never wider than the viewport, like the menu bar's menu.
+                  className="bg-surface-primary w-max max-w-[calc(100vw-1rem)] min-w-[250px]! p-1"
                   onClick={(event: React.MouseEvent<HTMLDivElement>) => {
                     event.stopPropagation();
                   }}
@@ -1263,6 +1265,8 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                           }
                     }
                     onCloseMenu={() => ctxMenu.close()}
+                    // Phones have no keyboard: hide the hints, as the menu bar does.
+                    shortcutClassName="mobile-hide-shortcut-hints"
                   />
                   {!isSelected && !isUnread && (
                     <PositionedMenuItem

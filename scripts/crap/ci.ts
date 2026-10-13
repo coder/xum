@@ -7,8 +7,8 @@
 // EXPECTED_UNIT and EXPECTED_INTEGRATION (shard counts), CRAP_DEBT_LABEL
 // ("true" when the PR has the crap-debt label), GITHUB_STEP_SUMMARY.
 import { spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { appendFileSync, existsSync, readdirSync, statSync } from "node:fs";
+import { basename, join } from "node:path";
 import type { DebtUse, Finding } from "./policy";
 
 export interface CheckReport {
@@ -66,7 +66,7 @@ export function summary(
     "## Quality / CRAP (informational)",
     "",
     coverage,
-    "Unit reports cover the shared-process suites only (isolated suites run without coverage). No base coverage: the CRAP tax compares CC and only warns.",
+    "Unit reports cover every Bun unit suite except the isolated ones marked `no-coverage:` in scripts/test-unit-ci.sh (Bun coverage crashes them). A suite whose coverage run crashed twice passes on a retry without coverage, so it has no report: its Test / Unit job shows a warning. No base coverage: the CRAP tax compares CC and only warns.",
     "`.tsx` coverage comes from Bun unit tests only, because Jest does not collect `.tsx` coverage yet: a component only Jest UI tests render scores 0%.",
     "",
   ];
@@ -95,10 +95,29 @@ export function summary(
   return `${lines.join("\n")}\n`;
 }
 
-function lcovFiles(dir: string): { artifacts: string[]; files: string[] } {
+/**
+ * Lists every `lcov.info` under each artifact folder, at any depth: a unit shard
+ * uploads one report for its shared process plus one per isolated file and one for
+ * the tooling run (scripts/test-unit-ci.sh). An artifact counts as a shard report
+ * only with its top-level `lcov.info`: when the shared process passes only on its
+ * last retry, which runs without coverage, the shard's nested reports still count
+ * as coverage but the summary shows it as partial.
+ */
+export function lcovFiles(dir: string): { artifacts: string[]; files: string[] } {
   if (!existsSync(dir)) return { artifacts: [], files: [] };
-  const artifacts = readdirSync(dir).filter((name) => existsSync(join(dir, name, "lcov.info")));
-  return { artifacts, files: artifacts.map((name) => join(dir, name, "lcov.info")) };
+  const artifacts: string[] = [];
+  const files: string[] = [];
+  for (const name of readdirSync(dir).sort()) {
+    const root = join(dir, name);
+    if (!statSync(root).isDirectory()) continue;
+    const found = readdirSync(root, { recursive: true, encoding: "utf8" })
+      .filter((path) => basename(path) === "lcov.info")
+      .sort()
+      .map((path) => join(root, path));
+    if (existsSync(join(root, "lcov.info"))) artifacts.push(name);
+    files.push(...found);
+  }
+  return { artifacts, files };
 }
 
 function main(): void {
