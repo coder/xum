@@ -58,10 +58,11 @@ interface TopBarActionsState extends CommonActionsState {
 export type WorkspaceActionsState = SidebarActionsState | TopBarActionsState;
 
 /**
- * The one decision of which items each menu shows, and in which order. Each surface keeps the
- * rows and order it had before the two menus shared this list.
+ * The one decision of which items each menu shows, in the approved group order: Title,
+ * Settings, View, Sidebar row, Lifecycle. Empty groups are dropped, so the menu draws a
+ * separator only between groups that show.
  */
-export function getWorkspaceActions(state: WorkspaceActionsState): WorkspaceActionId[] {
+export function getWorkspaceActionGroups(state: WorkspaceActionsState): WorkspaceActionId[][] {
   // Heartbeats never fire for sub-agent workspaces.
   const isSubAgent = state.workspace?.parentWorkspaceId != null;
   // Scratch chats have no repo: the backend rejects forking them and RightSidebar ignores
@@ -69,22 +70,29 @@ export function getWorkspaceActions(state: WorkspaceActionsState): WorkspaceActi
   const hasRepository = hasWorkspaceRepository(state.workspace);
   const topBar = state.surface === "topbar" ? state : null;
   const sidebar = state.surface === "sidebar" ? state : null;
-  const ids: Array<WorkspaceActionId | false | null> = [
-    sidebar && "editTitle",
-    topBar && "configureMcp",
-    !isSubAgent && "configureHeartbeat",
-    topBar && "configureMessaging",
-    topBar && hasRepository && topBar.isTouchMobileScreen && "touchFullscreenReview",
-    topBar && hasRepository && !topBar.isTouchMobileScreen && "immersiveReview",
-    topBar?.isRightSidebarHidden === true && "openSidebar",
-    topBar?.isPhoneHeader === true && "openTerminal",
-    state.isRuntimeRunning && "stopRuntime",
-    hasRepository && "fork",
-    state.workspace != null && isWorkspacePinnable(state.workspace) && "togglePinned",
-    !state.showsSubAgent && "archive",
-    sidebar?.canMarkUnread === true && "markUnread",
-    sidebar?.canToggleSubAgents === true && "toggleSubAgents",
-    sidebar && "generateTitle",
+  const groups: Array<Array<WorkspaceActionId | false>> = [
+    ["editTitle", "generateTitle"],
+    ["configureMcp", !isSubAgent && "configureHeartbeat", "configureMessaging"],
+    topBar
+      ? [
+          hasRepository && !topBar.isTouchMobileScreen && "immersiveReview",
+          hasRepository && topBar.isTouchMobileScreen && "touchFullscreenReview",
+          topBar.isRightSidebarHidden && "openSidebar",
+          topBar.isPhoneHeader && "openTerminal",
+        ]
+      : [],
+    [
+      state.workspace != null && isWorkspacePinnable(state.workspace) && "togglePinned",
+      sidebar?.canMarkUnread === true && "markUnread",
+      sidebar?.canToggleSubAgents === true && "toggleSubAgents",
+    ],
+    [
+      hasRepository && "fork",
+      state.isRuntimeRunning && "stopRuntime",
+      !state.showsSubAgent && "archive",
+    ],
   ];
-  return ids.filter((id): id is WorkspaceActionId => typeof id === "string");
+  return groups
+    .map((group) => group.filter((id): id is WorkspaceActionId => id !== false))
+    .filter((group) => group.length > 0);
 }

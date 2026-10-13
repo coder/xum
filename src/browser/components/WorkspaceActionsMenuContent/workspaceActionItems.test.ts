@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
-  getWorkspaceActions,
+  getWorkspaceActionGroups,
   type WorkspaceActionId,
   type WorkspaceActionsState,
 } from "./workspaceActionItems";
@@ -41,133 +41,145 @@ function topBar(overrides: Partial<Omit<TopBarState, "surface">>): TopBarState {
   };
 }
 
-const cases: Array<{ name: string; state: WorkspaceActionsState; ids: WorkspaceActionId[] }> = [
-  {
-    name: "sidebar, root workspace",
-    state: sidebar({}),
-    ids: ["editTitle", "configureHeartbeat", "fork", "togglePinned", "archive", "generateTitle"],
-  },
-  {
-    name: "sidebar, root with a running devcontainer, read, with completed sub-agents",
-    state: sidebar({ isRuntimeRunning: true, canMarkUnread: true, canToggleSubAgents: true }),
-    ids: [
-      "editTitle",
-      "configureHeartbeat",
-      "stopRuntime",
-      "fork",
-      "togglePinned",
-      "archive",
-      "markUnread",
-      "toggleSubAgents",
-      "generateTitle",
-    ],
-  },
-  {
-    name: "sidebar, sub-agent nested under its parent",
-    state: sidebar({ workspace: subAgent, showsSubAgent: true }),
-    ids: ["editTitle", "fork", "generateTitle"],
-  },
-  {
-    name: "sidebar, sub-agent shown as a root row (parent hidden)",
-    state: sidebar({ workspace: subAgent }),
-    ids: ["editTitle", "fork", "archive", "generateTitle"],
-  },
-  {
-    name: "sidebar, scratch chat",
-    state: sidebar({ workspace: scratch }),
-    ids: ["editTitle", "configureHeartbeat", "togglePinned", "archive", "generateTitle"],
-  },
-  {
-    name: "sidebar, archived workspace",
-    state: sidebar({ workspace: archived }),
-    ids: ["editTitle", "configureHeartbeat", "fork", "archive", "generateTitle"],
-  },
-  {
-    name: "top bar, root workspace on a desktop",
-    state: topBar({}),
-    ids: [
-      "configureMcp",
-      "configureHeartbeat",
-      "configureMessaging",
-      "immersiveReview",
-      "fork",
-      "togglePinned",
-      "archive",
-    ],
-  },
-  {
-    name: "top bar, root workspace on a touch phone with the sidebar hidden",
-    state: topBar({ isTouchMobileScreen: true, isPhoneHeader: true, isRightSidebarHidden: true }),
-    ids: [
-      "configureMcp",
-      "configureHeartbeat",
-      "configureMessaging",
-      "touchFullscreenReview",
-      "openSidebar",
-      "openTerminal",
-      "fork",
-      "togglePinned",
-      "archive",
-    ],
-  },
-  {
-    name: "top bar, scratch chat on a touch phone",
-    state: topBar({
-      workspace: scratch,
-      isTouchMobileScreen: true,
-      isPhoneHeader: true,
-      isRightSidebarHidden: true,
-    }),
-    ids: [
-      "configureMcp",
-      "configureHeartbeat",
-      "configureMessaging",
-      "openSidebar",
-      "openTerminal",
-      "togglePinned",
-      "archive",
-    ],
-  },
-  {
-    name: "top bar, sub-agent",
-    state: topBar({ workspace: subAgent, showsSubAgent: true }),
-    ids: ["configureMcp", "configureMessaging", "immersiveReview", "fork"],
-  },
-  {
-    name: "top bar, root with a running devcontainer",
-    state: topBar({ isRuntimeRunning: true }),
-    ids: [
-      "configureMcp",
-      "configureHeartbeat",
-      "configureMessaging",
-      "immersiveReview",
-      "stopRuntime",
-      "fork",
-      "togglePinned",
-      "archive",
-    ],
-  },
-  {
-    name: "top bar, archived workspace",
-    state: topBar({ workspace: archived }),
-    ids: [
-      "configureMcp",
-      "configureHeartbeat",
-      "configureMessaging",
-      "immersiveReview",
-      "fork",
-      "archive",
-    ],
-  },
-  {
-    name: "top bar, before the workspace's metadata arrives",
-    state: topBar({ workspace: undefined }),
-    ids: ["configureMcp", "configureHeartbeat", "configureMessaging", "archive"],
-  },
-];
+const TITLE: WorkspaceActionId[] = ["editTitle", "generateTitle"];
+const SETTINGS: WorkspaceActionId[] = ["configureMcp", "configureHeartbeat", "configureMessaging"];
+const SUB_AGENT_SETTINGS: WorkspaceActionId[] = ["configureMcp", "configureMessaging"];
 
-describe("getWorkspaceActions", () => {
-  test.each(cases)("$name", ({ state, ids }) => {
-    expect(getWorkspaceActions(state)).toEqual(ids);
+const cases: Array<{ name: string; state: WorkspaceActionsState; groups: WorkspaceActionId[][] }> =
+  [
+    {
+      name: "sidebar, root workspace",
+      state: sidebar({}),
+      groups: [TITLE, SETTINGS, ["togglePinned"], ["fork", "archive"]],
+    },
+    {
+      name: "sidebar, root with a running devcontainer, read, with completed sub-agents",
+      state: sidebar({ isRuntimeRunning: true, canMarkUnread: true, canToggleSubAgents: true }),
+      groups: [
+        TITLE,
+        SETTINGS,
+        ["togglePinned", "markUnread", "toggleSubAgents"],
+        ["fork", "stopRuntime", "archive"],
+      ],
+    },
+    {
+      name: "sidebar, sub-agent nested under its parent",
+      state: sidebar({ workspace: subAgent, showsSubAgent: true }),
+      groups: [TITLE, SUB_AGENT_SETTINGS, ["fork"]],
+    },
+    {
+      name: "sidebar, sub-agent shown as a root row (parent hidden)",
+      state: sidebar({ workspace: subAgent }),
+      groups: [TITLE, SUB_AGENT_SETTINGS, ["fork", "archive"]],
+    },
+    {
+      name: "sidebar, scratch chat",
+      state: sidebar({ workspace: scratch }),
+      groups: [TITLE, SETTINGS, ["togglePinned"], ["archive"]],
+    },
+    {
+      name: "sidebar, archived workspace",
+      state: sidebar({ workspace: archived }),
+      groups: [TITLE, SETTINGS, ["fork", "archive"]],
+    },
+    {
+      name: "top bar, root workspace on a desktop",
+      state: topBar({}),
+      groups: [TITLE, SETTINGS, ["immersiveReview"], ["togglePinned"], ["fork", "archive"]],
+    },
+    {
+      name: "top bar, root workspace on a touch phone with the sidebar hidden",
+      state: topBar({ isTouchMobileScreen: true, isPhoneHeader: true, isRightSidebarHidden: true }),
+      groups: [
+        TITLE,
+        SETTINGS,
+        ["touchFullscreenReview", "openSidebar", "openTerminal"],
+        ["togglePinned"],
+        ["fork", "archive"],
+      ],
+    },
+    {
+      name: "top bar, root workspace on a touch tablet",
+      state: topBar({ isTouchMobileScreen: true }),
+      groups: [TITLE, SETTINGS, ["touchFullscreenReview"], ["togglePinned"], ["fork", "archive"]],
+    },
+    {
+      name: "top bar, scratch chat on a touch phone",
+      state: topBar({
+        workspace: scratch,
+        isTouchMobileScreen: true,
+        isPhoneHeader: true,
+        isRightSidebarHidden: true,
+      }),
+      groups: [TITLE, SETTINGS, ["openSidebar", "openTerminal"], ["togglePinned"], ["archive"]],
+    },
+    {
+      name: "top bar, sub-agent",
+      state: topBar({ workspace: subAgent, showsSubAgent: true }),
+      groups: [TITLE, SUB_AGENT_SETTINGS, ["immersiveReview"], ["fork"]],
+    },
+    {
+      name: "top bar, root with a running devcontainer",
+      state: topBar({ isRuntimeRunning: true }),
+      groups: [
+        TITLE,
+        SETTINGS,
+        ["immersiveReview"],
+        ["togglePinned"],
+        ["fork", "stopRuntime", "archive"],
+      ],
+    },
+    {
+      name: "top bar, archived workspace",
+      state: topBar({ workspace: archived }),
+      groups: [TITLE, SETTINGS, ["immersiveReview"], ["fork", "archive"]],
+    },
+    {
+      name: "top bar, before the workspace's metadata arrives",
+      state: topBar({ workspace: undefined }),
+      groups: [TITLE, SETTINGS, ["archive"]],
+    },
+  ];
+
+describe("getWorkspaceActionGroups", () => {
+  test.each(cases)("$name", ({ state, groups }) => {
+    expect(getWorkspaceActionGroups(state)).toEqual(groups);
+  });
+
+  // The issue's promise: apart from the view items (top bar) and row items (sidebar), both menus
+  // show the same actions in the same order for the same workspace.
+  const SURFACE_ONLY = new Set<WorkspaceActionId>([
+    "immersiveReview",
+    "touchFullscreenReview",
+    "openSidebar",
+    "openTerminal",
+    "markUnread",
+    "toggleSubAgents",
+  ]);
+  const shared = (state: WorkspaceActionsState) =>
+    getWorkspaceActionGroups(state)
+      .flat()
+      .filter((id) => !SURFACE_ONLY.has(id));
+
+  test.each([
+    { name: "root", workspace: root, showsSubAgent: false },
+    { name: "sub-agent", workspace: subAgent, showsSubAgent: true },
+    { name: "scratch", workspace: scratch, showsSubAgent: false },
+    { name: "archived", workspace: archived, showsSubAgent: false },
+  ])("both menus share their core actions: $name workspace", (kind) => {
+    const common = { workspace: kind.workspace, showsSubAgent: kind.showsSubAgent };
+    const sidebarIds = shared(
+      sidebar({ ...common, isRuntimeRunning: true, canMarkUnread: true, canToggleSubAgents: true })
+    );
+    const topBarIds = shared(
+      topBar({
+        ...common,
+        isRuntimeRunning: true,
+        isTouchMobileScreen: true,
+        isPhoneHeader: true,
+        isRightSidebarHidden: true,
+      })
+    );
+    expect(sidebarIds).toEqual(topBarIds);
   });
 });

@@ -58,6 +58,8 @@ import { WorkspaceActionsMenuContent } from "../WorkspaceActionsMenuContent/Work
 import {
   forkWorkspaceFromMenu,
   getErrorAnchor,
+  requestEditWorkspaceTitle,
+  requestGenerateWorkspaceTitle,
   stopWorkspaceRuntime,
 } from "../WorkspaceActionsMenuContent/workspaceActionHandlers";
 import { WorkspaceTerminalIcon } from "../icons/WorkspaceTerminalIcon/WorkspaceTerminalIcon";
@@ -492,6 +494,12 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     }
   };
 
+  // The sidebar row owns the inline title edit, so open the left sidebar to show it.
+  const handleEditTitle = () => {
+    if (leftSidebarCollapsed) onToggleLeftSidebarCollapsed();
+    requestEditWorkspaceTitle(workspaceId);
+  };
+
   // Start workspace tutorial on first entry
   useEffect(() => {
     // Small delay to ensure UI is rendered
@@ -639,6 +647,8 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
             isRightSidebarHidden: timelineSidebarHidden,
           }}
           actions={{
+            editTitle: handleEditTitle,
+            generateTitle: () => requestGenerateWorkspaceTitle(workspaceId),
             configureMcp: () => setMcpModalOpen(true),
             configureHeartbeat: () => setHeartbeatModalOpen(true),
             configureMessaging: () => setUnrelatedMessagingWorkspaceId(workspaceId),

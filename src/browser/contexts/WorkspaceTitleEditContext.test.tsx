@@ -47,6 +47,45 @@ describe("WorkspaceTitleEditContext", () => {
     delete (globalThis as unknown as { alert?: typeof alert }).alert;
   });
 
+  // #6202: an edit started for a row the sidebar does not render has no input to finish it.
+  test("an edit blocks another only while the sidebar renders its row", async () => {
+    const testWindow = new GlobalWindow();
+    globalThis.window = testWindow as unknown as Window & typeof globalThis;
+    globalThis.document = testWindow.document as unknown as Document;
+
+    let contextValue: ReturnType<typeof useTitleEdit> | null = null;
+    const editingId = () => contextValue?.editingWorkspaceId;
+    render(
+      <TitleEditProvider onUpdateTitle={() => Promise.resolve({ success: true })}>
+        <ContextProbe onValue={(value) => (contextValue = value)} />
+      </TitleEditProvider>
+    );
+    await waitFor(() => expect(contextValue).not.toBeNull());
+
+    // The sidebar row markup that getVisibleWorkspaceIds reads.
+    const row = document.createElement("div");
+    row.setAttribute("data-workspace-id", "ws-shown");
+    row.setAttribute("data-workspace-path", "/ws-shown");
+    document.body.appendChild(row);
+
+    let accepted: boolean | undefined;
+    act(() => {
+      contextValue?.requestEdit("ws-shown", "Shown");
+    });
+    act(() => {
+      accepted = contextValue?.requestEdit("ws-other", "Other");
+    });
+    expect(accepted).toBe(false);
+    expect(editingId()).toBe("ws-shown");
+
+    row.remove();
+    act(() => {
+      accepted = contextValue?.requestEdit("ws-other", "Other");
+    });
+    expect(accepted).toBe(true);
+    expect(editingId()).toBe("ws-other");
+  });
+
   test("ignores duplicate regenerate requests while one is already in flight", async () => {
     const testWindow = new GlobalWindow();
     globalThis.window = testWindow as unknown as Window & typeof globalThis;

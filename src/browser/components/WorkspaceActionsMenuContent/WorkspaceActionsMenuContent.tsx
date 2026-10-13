@@ -18,7 +18,7 @@ import {
 } from "lucide-react";
 import React from "react";
 import {
-  getWorkspaceActions,
+  getWorkspaceActionGroups,
   type WorkspaceActionId,
   type WorkspaceActionsState,
 } from "./workspaceActionItems";
@@ -133,7 +133,7 @@ function WorkspaceActionButton(props: WorkspaceActionButtonProps) {
 }
 
 interface WorkspaceActionsMenuContentProps {
-  /** Decides which rows show; see getWorkspaceActions. */
+  /** Decides which rows show; see getWorkspaceActionGroups. */
   state: WorkspaceActionsState;
   /** A row shows only when its caller wires a handler (stories may leave some out). */
   actions: WorkspaceActionHandlers;
@@ -144,11 +144,13 @@ interface WorkspaceActionsMenuContentProps {
 }
 
 /** The rows the menu renders: the shared gating, minus rows the caller did not wire. */
-export function getShownWorkspaceActions(
+export function getShownWorkspaceActionGroups(
   state: WorkspaceActionsState,
   actions: WorkspaceActionHandlers
-): WorkspaceActionId[] {
-  return getWorkspaceActions(state).filter((id) => actions[id] != null);
+): WorkspaceActionId[][] {
+  return getWorkspaceActionGroups(state)
+    .map((group) => group.filter((id) => actions[id] != null))
+    .filter((group) => group.length > 0);
 }
 
 function getActionRow(id: WorkspaceActionId, props: WorkspaceActionsMenuContentProps): ActionRow {
@@ -159,26 +161,33 @@ function getActionRow(id: WorkspaceActionId, props: WorkspaceActionsMenuContentP
 
 /**
  * Shared menu content for workspace actions, used by both sidebar rows and the workspace menu bar.
- * Both menus take their rows from getWorkspaceActions, so the two entry points cannot drift.
+ * Both menus take their rows from getWorkspaceActionGroups, so the two entry points cannot drift.
  * It renders only while its popover is open, so the gating runs only then.
  */
 export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentProps> = (props) => {
-  const shown = getShownWorkspaceActions(props.state, props.actions);
+  const groups = getShownWorkspaceActionGroups(props.state, props.actions);
   return (
     // No menu role on purpose: the menu/menuitem pattern also requires roving Tab focus and
     // changes how the sidebar row's long-press handling sees this portal. The Radix Popover
     // stays a dialog of buttons, and the arrow keys are an extra on top of Tab (#6103).
     <div onKeyDown={handleRowArrowKeys}>
-      {shown.map((id) => (
-        <WorkspaceActionButton
-          key={id}
-          row={getActionRow(id, props)}
-          onClick={(e) => {
-            e.stopPropagation();
-            props.onCloseMenu();
-            props.actions[id]?.(e.currentTarget);
-          }}
-        />
+      {groups.map((group, groupIndex) => (
+        <React.Fragment key={group[0]}>
+          {groupIndex > 0 && (
+            <div role="separator" className="border-separator-light my-1 border-t" />
+          )}
+          {group.map((id) => (
+            <WorkspaceActionButton
+              key={id}
+              row={getActionRow(id, props)}
+              onClick={(e) => {
+                e.stopPropagation();
+                props.onCloseMenu();
+                props.actions[id]?.(e.currentTarget);
+              }}
+            />
+          ))}
+        </React.Fragment>
       ))}
     </div>
   );

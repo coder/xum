@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useCallback, useRef } from "react";
 import type { Result } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
+import { getVisibleWorkspaceIds } from "@/browser/utils/ui/workspaceDomNav";
 
 interface TitleEditResult {
   success: boolean;
@@ -30,6 +31,16 @@ interface TitleEditProviderProps {
   ) => Promise<{ success: boolean; error?: string }>;
 }
 
+/**
+ * Whether the edit in progress refuses a request for another workspace. An edit whose row the
+ * sidebar does not render (an inactive sub-agent, a collapsed project: F2 or the menu bar's Edit
+ * title can start one) has no input to finish it, so it must not block the next edit (#6202).
+ */
+function blocksOtherEdits(editingWorkspaceId: string | null, workspaceId: string): boolean {
+  if (editingWorkspaceId === null || editingWorkspaceId === workspaceId) return false;
+  return getVisibleWorkspaceIds().includes(editingWorkspaceId);
+}
+
 export const TitleEditProvider: React.FC<TitleEditProviderProps> = ({
   children,
   onUpdateTitle,
@@ -39,8 +50,8 @@ export const TitleEditProvider: React.FC<TitleEditProviderProps> = ({
 
   const requestEdit = useCallback(
     (workspaceId: string, currentTitle: string): boolean => {
-      // Only allow one workspace to be edited at a time
-      if (editingWorkspaceId !== null && editingWorkspaceId !== workspaceId) {
+      // Only allow one workspace to be edited at a time.
+      if (blocksOtherEdits(editingWorkspaceId, workspaceId)) {
         return false;
       }
 

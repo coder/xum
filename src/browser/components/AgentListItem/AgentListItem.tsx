@@ -71,6 +71,8 @@ import type { PinnedDropEdge } from "@/browser/utils/ui/pinnedReorder";
 import { WorkspaceHeartbeatModal } from "../WorkspaceHeartbeatModal";
 import { WorkspaceActionsMenuContent } from "../WorkspaceActionsMenuContent/WorkspaceActionsMenuContent";
 import { requestGenerateWorkspaceTitle } from "../WorkspaceActionsMenuContent/workspaceActionHandlers";
+import { WorkspaceMCPModal } from "../WorkspaceMCPModal/WorkspaceMCPModal";
+import { WorkspaceUnrelatedMessagingDialog } from "../WorkspaceUnrelatedMessagingModal/WorkspaceUnrelatedMessagingDialog";
 import { useWorkspaceActionsOptional } from "@/browser/contexts/WorkspaceContext";
 
 export interface WorkspaceSelection {
@@ -645,7 +647,12 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
       : workspaceTitle;
   const isEditing = editingWorkspaceId === workspaceId;
   const isPinned = isWorkspacePinned(metadata);
-  const [heartbeatModalOpen, setHeartbeatModalOpen] = useState(false);
+  // The menu's settings dialogs mount on demand, so a row with its menu closed runs none of
+  // their hooks or subscriptions (#6202).
+  const [openModal, setOpenModal] = useState<"heartbeat" | "mcp" | "messaging" | null>(null);
+  const closeModalOnHide = (open: boolean) => {
+    if (!open) setOpenModal(null);
+  };
   const overflowMenuButtonRef = useRef<HTMLButtonElement | null>(null);
   const overflowMenuFrameRef = useRef<number | null>(null);
 
@@ -1221,7 +1228,9 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                     actions={{
                       editTitle: startEditing,
                       generateTitle: () => requestGenerateWorkspaceTitle(workspaceId),
-                      configureHeartbeat: () => setHeartbeatModalOpen(true),
+                      configureMcp: () => setOpenModal("mcp"),
+                      configureHeartbeat: () => setOpenModal("heartbeat"),
+                      configureMessaging: () => setOpenModal("messaging"),
                       togglePinned: setWorkspacePinned
                         ? () => {
                             // Fire-and-forget: optimistic reorder happens synchronously
@@ -1251,11 +1260,28 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
               </Popover>
               {/* Mounted on demand so each sidebar row skips the modal's hooks and
                   context requirements until the user opens it. */}
-              {heartbeatModalOpen && (
+              {openModal === "heartbeat" && (
                 <WorkspaceHeartbeatModal
                   workspaceId={workspaceId}
                   open
-                  onOpenChange={setHeartbeatModalOpen}
+                  onOpenChange={closeModalOnHide}
+                />
+              )}
+              {openModal === "mcp" && (
+                <WorkspaceMCPModal
+                  workspaceId={workspaceId}
+                  projectPath={projectPath}
+                  open
+                  onOpenChange={closeModalOnHide}
+                />
+              )}
+              {openModal === "messaging" && (
+                <WorkspaceUnrelatedMessagingDialog
+                  workspaceId={workspaceId}
+                  runtimeConfig={metadata.runtimeConfig}
+                  workspace={metadata}
+                  open
+                  onOpenChange={closeModalOnHide}
                 />
               )}
             </ActionButtonWrapper>

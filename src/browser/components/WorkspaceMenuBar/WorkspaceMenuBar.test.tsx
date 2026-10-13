@@ -110,10 +110,10 @@ function getLastMenuContentProps() {
 function menuAction(id: WorkspaceActionId): ((anchorEl: HTMLElement) => void) | null {
   const props = getLastMenuContentProps();
   if (!props) return null;
-  const shown = WorkspaceActionsMenuContentModule.getShownWorkspaceActions(
+  const shown = WorkspaceActionsMenuContentModule.getShownWorkspaceActionGroups(
     props.state,
     props.actions
-  );
+  ).flat();
   return shown.includes(id) ? (props.actions[id] ?? null) : null;
 }
 
@@ -297,9 +297,9 @@ function installWorkspaceMenuBarTestDoubles() {
   spyOn(WorkspaceActionsMenuContentModule, "WorkspaceActionsMenuContent").mockImplementation(((
     props: ComponentProps<typeof WorkspaceActionsMenuContentModule.WorkspaceActionsMenuContent>
   ) =>
-    WorkspaceActionsMenuContentModule.getShownWorkspaceActions(props.state, props.actions).includes(
-      "archive"
-    ) ? (
+    WorkspaceActionsMenuContentModule.getShownWorkspaceActionGroups(props.state, props.actions)
+      .flat()
+      .includes("archive") ? (
       <button type="button" onClick={(event) => props.actions.archive?.(event.currentTarget)}>
         Archive workspace
       </button>

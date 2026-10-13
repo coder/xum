@@ -650,6 +650,36 @@ const ProjectDragLayer: React.FC = () => {
 };
 
 /**
+ * Starts the inline title edit asked for by the workspace menu bar's "Edit workspace title" row.
+ * The menu bar opens the left sidebar first, so unlike F2 this does not check `collapsed`.
+ */
+function useEditTitleRequests(
+  sortedWorkspacesByProject: Map<string, FrontendWorkspaceMetadata[]>,
+  requestEdit: (workspaceId: string, currentTitle: string) => boolean
+) {
+  useEffect(() => {
+    const handleEditTitleRequest: EventListener = (event) => {
+      const { workspaceId } = (
+        event as CustomEventType<typeof CUSTOM_EVENTS.WORKSPACE_EDIT_TITLE_REQUESTED>
+      ).detail;
+      for (const workspaces of sortedWorkspacesByProject.values()) {
+        const meta = workspaces.find((m) => m.id === workspaceId);
+        if (meta) {
+          requestEdit(workspaceId, meta.title ?? meta.name);
+          return;
+        }
+      }
+    };
+    window.addEventListener(CUSTOM_EVENTS.WORKSPACE_EDIT_TITLE_REQUESTED, handleEditTitleRequest);
+    return () =>
+      window.removeEventListener(
+        CUSTOM_EVENTS.WORKSPACE_EDIT_TITLE_REQUESTED,
+        handleEditTitleRequest
+      );
+  }, [sortedWorkspacesByProject, requestEdit]);
+}
+
+/**
  * Handles F2 (edit title) and Shift+F2 (generate new title) keybinds.
  * Rendered inside TitleEditProvider so it can access useTitleEdit().
  */
@@ -701,6 +731,8 @@ function SidebarTitleEditKeybinds(props: {
     requestEdit,
     regenerateTitleForWorkspace,
   ]);
+
+  useEditTitleRequests(props.sortedWorkspacesByProject, requestEdit);
 
   useEffect(() => {
     const handleGenerateTitleRequest: EventListener = (event) => {

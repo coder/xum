@@ -97,6 +97,12 @@ export const CUSTOM_EVENTS = {
   WORKSPACE_GENERATE_TITLE_REQUESTED: "mux:workspaceGenerateTitleRequested",
 
   /**
+   * Event to start the inline title edit of a workspace's sidebar row.
+   * Detail: { workspaceId: string }
+   */
+  WORKSPACE_EDIT_TITLE_REQUESTED: "mux:workspaceEditTitleRequested",
+
+  /**
    * Event to execute a command from the command palette
    * Detail: { commandId: string }
    */
@@ -249,6 +255,9 @@ export interface CustomEventPayloads {
     branch: string;
   };
   [CUSTOM_EVENTS.WORKSPACE_GENERATE_TITLE_REQUESTED]: {
+    workspaceId: string;
+  };
+  [CUSTOM_EVENTS.WORKSPACE_EDIT_TITLE_REQUESTED]: {
     workspaceId: string;
   };
   [CUSTOM_EVENTS.EXECUTE_COMMAND]: {
