@@ -300,23 +300,26 @@ def inlined_literal(node) -> bool:
     return node.type in INLINED_LITERALS or (node.type == "identifier" and node.text == b"undefined")
 
 
-EARLY_EXITS = {"return_statement", "throw_statement"}
+def runs_whenever_called(body, declaration) -> bool:
+    """Whether nothing in `body` before `declaration` can skip it: no return, throw or call.
 
-
-def leaves_early_before(body, declaration) -> bool:
-    """Whether a statement of `body` before `declaration` holds a return or throw of this function."""
+    Every earlier statement must be a declaration whose values are all literals
+    (inlined_literal) or absent, so the declaration runs whenever the function
+    does.
+    """
 
     for statement in body.named_children:
         if statement.start_byte >= declaration.start_byte:
+            return True
+        if statement.type == "comment":
+            continue
+        if statement.type != "lexical_declaration":
             return False
-        stack = [statement]
-        while stack:
-            node = stack.pop()
-            if node.type in EARLY_EXITS:
-                return True
-            if node.type not in FUNCTION_NODES:
-                stack.extend(node.children)
-    return False
+        for declarator in statement.named_children:
+            value = declarator.child_by_field_name("value")
+            if value is not None and not inlined_literal(value):
+                return False
+    return True
 
 
 def literal_const_scopes(root) -> dict[str, list[tuple[int, object]]]:
@@ -324,9 +327,9 @@ def literal_const_scopes(root) -> dict[str, list[tuple[int, object]]]:
 
     Only module-scope consts and consts directly in a function body: a block
     inside a function (an `if` body) may not run when the function does. A
-    body const after a statement that can return or throw is skipped too: when
-    the function leaves early, a correct report also lists the const and an
-    uncalled closure that uses it at 0.
+    body const after a statement that can return, throw or call is skipped
+    too: when the function leaves early, a correct report also lists the const
+    and an uncalled closure that uses it at 0.
     """
 
     consts: dict[str, list[tuple[int, object]]] = {}
@@ -341,7 +344,7 @@ def literal_const_scopes(root) -> dict[str, list[tuple[int, object]]]:
         )
         if scope is None or not (scope.type == "program" or is_function_body):
             continue
-        if is_function_body and leaves_early_before(scope, node):
+        if is_function_body and not runs_whenever_called(scope, node):
             continue
         for declarator in node.named_children:
             name = declarator.child_by_field_name("name")

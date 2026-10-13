@@ -518,7 +518,17 @@ export function outer(items: number[]): number {
     # zeros are right.
     report = "DA:1,16\nDA:2,34\nDA:3,0\nDA:4,0\nDA:5,0\nDA:6,0\nDA:8,0\n"
     assert suspects(capsys, tmp_path, source, report) == {"outer": (0.2857, False)}
-    # A return inside a nested function leaves only that function.
-    nested = source.replace("  if (items.length === 0) return 0;\n", "  items.map(() => {\n    return 1;\n  });\n")
-    shifted = "DA:1,16\nDA:2,34\nDA:3,1\nDA:4,1\n" + "".join(f"DA:{line},0\n" for line in (5, 6, 7, 8, 10))
-    assert suspects(capsys, tmp_path, nested, shifted)["outer"][1] is True
+    # Any call before the const may throw, so it does not flag either.
+    called_first = source.replace("  if (items.length === 0) return 0;\n", "  check(items);\n")
+    assert suspects(capsys, tmp_path, called_first, report)["outer"][1] is False
+    # Literal declarations before it cannot skip it.
+    literal_first = source.replace("  if (items.length === 0) return 0;\n", "  let seen = 0;\n")
+    assert suspects(capsys, tmp_path, literal_first, report)["outer"][1] is True
+
+
+def test_javascript_sources_flag_too(tmp_path, capsys):
+    # Bun 1.4.3 zeroes a .js module the same way (lines 2-9 at 0).
+    relative = write(tmp_path, "src/demo/repro.js", REPRO.replace(": number", ""))
+    report = lcov_file(tmp_path, "r.info", relative, REPRO_CALLED_ONLY)
+    rows = run(capsys, tmp_path, "--lcov", report, relative)
+    assert {row["name"]: row["bunInlinedConstSuspect"] for row in rows} == {"called": True, "unused": False}
