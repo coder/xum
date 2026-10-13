@@ -2702,14 +2702,13 @@ export class ProviderModelFactory {
           // skip injection when beta features are off. It sits inside the file-part
           // normalization, so its prefix observer sees the body the gateway receives
           // (normalization does not touch cache markers, so the order is otherwise neutral).
+          const gatewayRoute = { route: muxGatewayPromptCacheRoute(couponCode), modelString };
           const fetchWithCacheControl = isAnthropicModel
             ? wrapFetchWithAnthropicCacheControl(baseFetch, effectiveAnthropicCacheTtl, {
                 injectCacheControl: !disableBeta,
-                observeFinalBody: self.promptCacheObserver(opts, {
-                  route: muxGatewayPromptCacheRoute(couponCode),
-                  modelString,
-                }),
-                routeIdentity: { route: "mux-gateway", modelString },
+                observeFinalBody: self.promptCacheObserver(opts, gatewayRoute),
+                // The same per-account route as the monitor, so the audit keys alike.
+                routeIdentity: gatewayRoute,
               })
             : baseFetch;
           const fetchWithAutoLogout = wrapFetchWithMuxGatewayAutoLogout(
