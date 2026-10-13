@@ -11,7 +11,9 @@ import { checkRequest, Ledger, MAX_BODY_BYTES, MAX_OUTPUT_TOKENS, usageCost } fr
 const asset = (rel: string) => fs.readFileSync(path.join(import.meta.dir, "../../..", rel));
 const screenshot = asset("src/browser/stories/assets/notion-mcp.png");
 const icon = asset("public/icon-512.png");
-const job = { models: ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5"] };
+const job = {
+  models: ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5", "claude-haiku-5-5"],
+};
 
 /** Runs one AI SDK call against a loopback server and returns the request it sent. */
 async function capture(model: string, stream: boolean, maxOutputTokens?: number) {
@@ -84,11 +86,15 @@ const bodyOf = (result: ReturnType<typeof checkRequest>) => {
   return JSON.parse(result.body) as Record<string, unknown>;
 };
 
-/** Usage that the gateway reported on 2026-10-10 for these requests with maxOutputTokens 200. */
+/**
+ * Usage that the gateway reported on 2026-10-10 (Haiku 5.5: 2026-10-13, no effort set) for these
+ * requests with maxOutputTokens 200.
+ */
 const recorded = {
   "claude-opus-5-5": { input_tokens: 866, output_tokens: 103, cache_read_input_tokens: 0 },
   "claude-sonnet-5-5": { input_tokens: 866, output_tokens: 57, cache_read_input_tokens: 0 },
   "claude-haiku-4-5": { input_tokens: 1057, output_tokens: 48, cache_read_input_tokens: 0 },
+  "claude-haiku-5-5": { input_tokens: 866, output_tokens: 200, cache_read_input_tokens: 0 },
 };
 
 test.each(job.models)(
