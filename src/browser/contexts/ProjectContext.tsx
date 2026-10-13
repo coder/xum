@@ -19,6 +19,7 @@ import { getDraftScopeId } from "@/common/constants/storage";
 import { deleteWorkspaceStorage } from "@/browser/utils/workspaceStorage";
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import { getErrorMessage } from "@/common/utils/errors";
+import { isAbortError } from "@/browser/utils/isAbortError";
 import type { ProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
@@ -136,6 +137,10 @@ function toNonEmptyTrimmed(value?: string | null): string | null {
   return trimmed && trimmed.length > 0 ? trimmed : null;
 }
 
+function findSystemProjectPath(projects: Map<string, ProjectConfig>): string | null {
+  return [...projects.entries()].find(([, cfg]) => cfg.projectKind === "system")?.[0] ?? null;
+}
+
 export function ProjectProvider(props: { children: ReactNode }) {
   const { api } = useAPI();
   // Handlers use only the live client: offline they keep returning their result (for example
@@ -149,9 +154,7 @@ export function ProjectProvider(props: { children: ReactNode }) {
     [allProjectsInternal]
   );
   const systemProjectPath = useMemo(
-    () =>
-      [...allProjectsInternal.entries()].find(([, cfg]) => cfg.projectKind === "system")?.[0] ??
-      null,
+    () => findSystemProjectPath(allProjectsInternal),
     [allProjectsInternal]
   );
   const [loading, setLoading] = useState(true);
@@ -180,7 +183,7 @@ export function ProjectProvider(props: { children: ReactNode }) {
     const refresh = projectsRefreshRef.current;
     if (refresh.api !== api) return Promise.resolve();
     if (!api) {
-      setLoaded(false);
+      // Keep `loaded` and the shown projects: the reconnect reloads them (stale-while-revalidate).
       setLoadError("API not connected");
       return Promise.resolve();
     }
@@ -200,6 +203,8 @@ export function ProjectProvider(props: { children: ReactNode }) {
             setLoadError(null);
           } catch (error) {
             if (refresh !== projectsRefreshRef.current || !refresh.api) continue;
+            // A lost connection is no load error: the reconnect reloads.
+            if (isAbortError(error)) continue;
             // Keep successful data when a later refresh fails.
             console.error("Failed to load projects:", error);
             setLoadError(getErrorMessage(error));
@@ -598,7 +603,8 @@ export function ProjectProvider(props: { children: ReactNode }) {
       hasAnyProject,
       resolveNewChatProjectPath,
       getProjectConfig,
-      loading,
+      // Only the first load counts: a reload after a reconnect keeps the loaded projects shown.
+      loading: loading && !loaded,
       loaded,
       loadError,
       refreshProjects,

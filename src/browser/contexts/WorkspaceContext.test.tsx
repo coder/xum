@@ -1003,6 +1003,69 @@ describe("WorkspaceContext", () => {
     });
   });
 
+  // A reconnect reloads projects and metadata through the new client. Until the reload answers,
+  // both contexts keep what they show and do not report "loading" again (stale-while-revalidate).
+  describe.each([...GAP_MODES])("reload after a reconnect (%s)", (mode) => {
+    test("keeps the loaded projects and metadata until the reload answers", async () => {
+      createMockAPI({
+        workspace: { list: () => Promise.resolve([createWorkspaceMetadata({ id: "ws-old" })]) },
+        projects: { list: () => Promise.resolve([["/old", { workspaces: [] }]]) },
+      });
+      const contexts = await setupWithConnection(mode);
+      await waitFor(() => expect(contexts.project().userProjects.has("/old")).toBe(true));
+      expect(contexts.workspace().workspaceMetadata.has("ws-old")).toBe(true);
+
+      // The next server answers only when the test lets it.
+      let answerProjects: (() => void) | null = null;
+      let answerSnapshot: (() => void) | null = null;
+      const projectsAnswered = new Promise<void>((resolve) => (answerProjects = resolve));
+      const snapshotAnswered = new Promise<void>((resolve) => (answerSnapshot = resolve));
+      currentClientMock = {
+        ...currentClientMock,
+        projects: {
+          ...currentClientMock.projects,
+          list: () => projectsAnswered.then(() => [["/new", { workspaces: [] }]]),
+        },
+        workspace: {
+          ...currentClientMock.workspace,
+          onMetadata: () =>
+            Promise.resolve(
+              (async function* () {
+                await snapshotAnswered;
+                yield {
+                  type: "snapshot" as const,
+                  workspaces: [createWorkspaceMetadata({ id: "ws-new" })],
+                };
+                await new Promise(() => undefined);
+              })()
+            ),
+        },
+      };
+
+      await contexts.harness.drop();
+      contexts.harness.reconnect();
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      });
+
+      expect(contexts.project().loading).toBe(false);
+      expect(contexts.project().loaded).toBe(true);
+      expect(contexts.project().userProjects.has("/old")).toBe(true);
+      expect(contexts.workspace().loading).toBe(false);
+      expect(contexts.workspace().loaded).toBe(true);
+      expect(contexts.workspace().workspaceMetadata.has("ws-old")).toBe(true);
+
+      act(() => {
+        answerSnapshot?.();
+        answerProjects?.();
+      });
+      await waitFor(() => expect(contexts.workspace().workspaceMetadata.has("ws-new")).toBe(true));
+      await waitFor(() => expect(contexts.project().userProjects.has("/new")).toBe(true));
+      expect(contexts.workspace().workspaceMetadata.has("ws-old")).toBe(false);
+      expect(contexts.project().userProjects.has("/old")).toBe(false);
+    });
+  });
+
   describe("archiveWorkspace", () => {
     test("succeeds even when persisted layout is invalid JSON shape", async () => {
       const workspaceId = "ws-archive-invalid-layout";
