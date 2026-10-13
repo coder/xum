@@ -259,7 +259,8 @@ const playTab = async (canvasElement: HTMLElement) => {
 export const McpAppTabLaptop: Story = {
   args: { toolName: "demo_app_show_dice_board" },
   globals: { viewport: { value: "laptop1200", isRotated: false } },
-  parameters: { pixel: { matrix: { themes: ["dark"], viewports: ["laptop"] } } },
+  // Play only: the stack adds no Pixel snapshots (shared cap).
+  parameters: { pixel: PIXEL_DISABLED },
   render: () =>
     withView(
       <div className="bg-background flex h-screen justify-end">
