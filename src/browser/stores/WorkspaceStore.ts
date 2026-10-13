@@ -4431,10 +4431,6 @@ export class WorkspaceStore {
   }
 
   /**
-   * Subscribe to workspace chat events (history replay + live streaming).
-   * Retries on unexpected iterator termination to avoid requiring a full app restart.
-   */
-  /**
    * onChat loop error policy: log the error, and return true to stop the loop when retrying
    * cannot help (a refused session tape replay, or a workspace removed during validation).
    */
@@ -4464,6 +4460,10 @@ export class WorkspaceStore {
     return false;
   }
 
+  /**
+   * Subscribe to workspace chat events (history replay + live streaming).
+   * Retries on unexpected iterator termination to avoid requiring a full app restart.
+   */
   private async runOnChatSubscription(workspaceId: string, signal: AbortSignal): Promise<void> {
     await runSubscriptionLoop({
       name: "onChat(" + workspaceId + ")",
