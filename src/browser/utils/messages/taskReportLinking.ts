@@ -21,7 +21,8 @@ export interface TaskReportLinking {
    * Completed task reports indexed by taskId.
    *
    * If the same taskId appears multiple times (multiple task_await calls), the last one
-   * in the message history wins.
+   * in the message history wins. Pages of one long report (task_await offset_chars) are
+   * joined back into the full report by their offsets.
    */
   reportByTaskId: Map<string, LinkedTaskReport>;
 
@@ -85,6 +86,24 @@ function getTaskIdsFromToolResult(result: unknown): string[] {
   return Array.from(taskIds);
 }
 
+/** The task_await call's offset_chars: where every completed report page it returned starts. */
+function getAwaitPageOffset(args: unknown): number {
+  if (typeof args !== "object" || args === null) return 0;
+  const offset = (args as { offset_chars?: unknown }).offset_chars;
+  return typeof offset === "number" && Number.isInteger(offset) && offset > 0 ? offset : 0;
+}
+
+/**
+ * Join a report page onto the report read so far. A page at offset 0 starts the report over;
+ * a page at or before the end replaces the text from its offset on (a page read twice). A page
+ * past the end leaves a gap: null, and the caller keeps the await rows visible instead.
+ */
+function joinReportPage(previous: string | undefined, page: string, offset: number) {
+  if (offset === 0) return page;
+  if (previous == null || offset > previous.length) return null;
+  return previous.slice(0, offset) + page;
+}
+
 function getTitleFromTaskToolArgs(args: unknown): string | null {
   if (typeof args !== "object" || args === null) return null;
   if (!("title" in args)) return null;
@@ -135,6 +154,43 @@ function getBashSpawnInfoFromArgs(args: unknown): BashTaskSpawnInfo | null {
   };
 }
 
+/** One completed report (page) from a task_await result entry; null for anything else. */
+function readCompletedAwaitReport(r: unknown): LinkedTaskReport | null {
+  if (typeof r !== "object" || r === null) return null;
+  if ((r as { status?: unknown }).status !== "completed") return null;
+
+  const taskId = (r as { taskId?: unknown }).taskId;
+  if (typeof taskId !== "string" || taskId.trim().length === 0) return null;
+
+  const reportMarkdown = (r as { reportMarkdown?: unknown }).reportMarkdown;
+  if (typeof reportMarkdown !== "string") return null;
+
+  const title = (r as { title?: unknown }).title;
+  return {
+    taskId,
+    reportMarkdown,
+    title: typeof title === "string" ? title : undefined,
+    ...readReportAiSettings(r),
+  };
+}
+
+/** Report-time AI settings of a completed task_await result entry, when valid. */
+function readReportAiSettings(r: {
+  modelString?: unknown;
+  thinkingLevel?: unknown;
+}): Pick<LinkedTaskReport, "modelString" | "thinkingLevel"> {
+  const { modelString, thinkingLevel } = r;
+  return {
+    modelString:
+      typeof modelString === "string" && modelString.trim().length > 0 ? modelString : undefined,
+    thinkingLevel:
+      typeof thinkingLevel === "string" &&
+      (THINKING_LEVELS as readonly string[]).includes(thinkingLevel)
+        ? (thinkingLevel as ThinkingLevel)
+        : undefined,
+  };
+}
+
 /**
  * Render-time helper that links completed task reports (from `task_await`) back to the
  * original `task` tool call that spawned the background work.
@@ -180,8 +236,11 @@ export function computeTaskReportLinking(messages: DisplayedMessage[]): TaskRepo
 
   // Second pass: collect completed reports from `task_await` results.
   const reportByTaskId = new Map<string, LinkedTaskReport>();
+  // Tasks whose pages left a gap: their await rows keep showing each page.
+  const incompleteReportTaskIds = new Set<string>();
   for (const msg of messages) {
     if (msg.type !== "tool" || msg.toolName !== "task_await") continue;
+    const pageOffset = getAwaitPageOffset(msg.args);
 
     const rawResult = msg.result;
     if (typeof rawResult !== "object" || rawResult === null) continue;
@@ -191,36 +250,20 @@ export function computeTaskReportLinking(messages: DisplayedMessage[]): TaskRepo
     if (!Array.isArray(results)) continue;
 
     for (const r of results) {
-      if (typeof r !== "object" || r === null) continue;
-
-      const status = (r as { status?: unknown }).status;
-      if (status !== "completed") continue;
-
-      const taskId = (r as { taskId?: unknown }).taskId;
-      if (typeof taskId !== "string" || taskId.trim().length === 0) continue;
-
-      const reportMarkdown = (r as { reportMarkdown?: unknown }).reportMarkdown;
-      if (typeof reportMarkdown !== "string") continue;
-
-      const title = (r as { title?: unknown }).title;
-      const modelString = (r as { modelString?: unknown }).modelString;
-      const thinkingLevel = (r as { thinkingLevel?: unknown }).thinkingLevel;
-
+      const page = readCompletedAwaitReport(r);
+      if (page == null) continue;
+      const joined = joinReportPage(
+        reportByTaskId.get(page.taskId)?.reportMarkdown,
+        page.reportMarkdown,
+        pageOffset
+      );
+      if (joined == null) {
+        incompleteReportTaskIds.add(page.taskId);
+        continue;
+      }
+      if (pageOffset === 0) incompleteReportTaskIds.delete(page.taskId);
       // Last-wins (history order)
-      reportByTaskId.set(taskId, {
-        taskId,
-        reportMarkdown,
-        title: typeof title === "string" ? title : undefined,
-        modelString:
-          typeof modelString === "string" && modelString.trim().length > 0
-            ? modelString
-            : undefined,
-        thinkingLevel:
-          typeof thinkingLevel === "string" &&
-          (THINKING_LEVELS as readonly string[]).includes(thinkingLevel)
-            ? (thinkingLevel as ThinkingLevel)
-            : undefined,
-      });
+      reportByTaskId.set(page.taskId, { ...page, reportMarkdown: joined });
     }
   }
 
@@ -230,6 +273,7 @@ export function computeTaskReportLinking(messages: DisplayedMessage[]): TaskRepo
   for (const [taskId, completed] of reportByTaskId) {
     if (!taskToolCallTaskIds.has(taskId)) continue;
     if (completed.reportMarkdown.trim().length === 0) continue;
+    if (incompleteReportTaskIds.has(taskId)) continue;
 
     suppressReportInAwaitTaskIds.add(taskId);
   }

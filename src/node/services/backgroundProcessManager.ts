@@ -448,6 +448,12 @@ export interface BackgroundProcess {
    * trailing line, plus every line after a capped (or interrupted) read's cut.
    */
   incompleteLineBuffer: string;
+  /**
+   * True when incompleteLineBuffer starts with the tail of a line a capped read split (a kept
+   * line over BASH_MAX_TOTAL_BYTES). The next read keeps that tail without testing the filter:
+   * the tail alone can stop matching the filter its whole line matched.
+   */
+  unreadStartsWithKeptLine?: boolean;
   /** Optional write-time monitor that wakes the agent on matching output lines. */
   monitor?: BackgroundProcessMonitorState;
 }
@@ -502,6 +508,8 @@ interface BackgroundOutputPage {
   unread: string;
   /** True when the read stopped at the cap with complete lines still unread. */
   capped: boolean;
+  /** True when `unread` starts with the tail of a kept line this read split. */
+  unreadStartsWithKeptLine: boolean;
 }
 
 /**
@@ -509,7 +517,8 @@ interface BackgroundOutputPage {
  * result has the same bound in-turn and on replay. Nothing is dropped: the raw rest stays unread
  * for the next read. No line cap: the byte cap already bounds the context cost, and a line cap
  * would multiply the reads for logs of short lines. A single line over the byte cap returns
- * its head and leaves its tail as the first unread line (a filter then tests that tail alone).
+ * its head and leaves its tail as the first unread line; `firstLineKept` tells the next read to
+ * keep that tail whatever the filter says, because its whole line was kept.
  *
  * While the process runs, the last element of the split is an incomplete fragment (or "" after a
  * trailing newline), which always stays unread. On exit every line counts and, as before, empty
@@ -518,17 +527,37 @@ interface BackgroundOutputPage {
 function takeBackgroundOutputPage(
   raw: string,
   exited: boolean,
+  firstLineKept: boolean,
   keepLine: (line: string) => boolean
 ): BackgroundOutputPage {
   const lines = raw.split("\n");
   const fragment = exited ? null : (lines.pop() ?? "");
-  const { shown, rest } = takeLinesWithinByteCap(
+  const { shown, rest, splitLine } = takeLinesWithinByteCap(
     lines,
-    (line) => (!exited || line.length > 0) && keepLine(line)
+    pageLineFilter(exited, firstLineKept, keepLine)
   );
   const capped = rest.length > 0;
   if (fragment != null) rest.push(fragment);
-  return { output: shown.join("\n"), unread: rest.join("\n"), capped };
+  return {
+    output: shown.join("\n"),
+    unread: rest.join("\n"),
+    capped,
+    // A complete continuation line that did not fit stays the first unread line.
+    unreadStartsWithKeptLine: splitLine || (firstLineKept && shown.length === 0 && capped),
+  };
+}
+
+/** Which lines a page keeps: the continuation of a split kept line, then the filter's picks. */
+function pageLineFilter(
+  exited: boolean,
+  firstLineKept: boolean,
+  keepLine: (line: string) => boolean
+): (line: string, index: number) => boolean {
+  return (line, index) => {
+    if (index === 0 && firstLineKept) return true;
+    // On exit, empty lines are not returned (the trailing "" of a final newline included).
+    return (!exited || line.length > 0) && keepLine(line);
+  };
 }
 
 /**
@@ -538,24 +567,25 @@ function takeBackgroundOutputPage(
  */
 function takeLinesWithinByteCap(
   lines: string[],
-  keepLine: (line: string) => boolean
-): { shown: string[]; rest: string[] } {
+  keepLine: (line: string, index: number) => boolean
+): { shown: string[]; rest: string[]; splitLine: boolean } {
   const shown: string[] = [];
   let bytes = 0;
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index];
-    if (!keepLine(line)) continue;
+    if (!keepLine(line, index)) continue;
     const lineBytes = Buffer.byteLength(line, "utf8") + (shown.length > 0 ? 1 : 0);
     if (bytes + lineBytes <= BASH_MAX_TOTAL_BYTES) {
       shown.push(line);
       bytes += lineBytes;
       continue;
     }
-    if (shown.length > 0) return { shown, rest: lines.slice(index) };
+    if (shown.length > 0) return { shown, rest: lines.slice(index), splitLine: false };
     const head = truncateUtf8Prefix(line, BASH_MAX_TOTAL_BYTES);
-    return { shown: [head], rest: [line.slice(head.length), ...lines.slice(index + 1)] };
+    const tail = [line.slice(head.length), ...lines.slice(index + 1)];
+    return { shown: [head], rest: tail, splitLine: true };
   }
-  return { shown, rest: [] };
+  return { shown, rest: [], splitLine: false };
 }
 
 /** Tells the model how to read what a capped getOutput read left unread. */
@@ -2595,8 +2625,10 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       // When using filter_exclude, check if we have meaningful (non-excluded) output.
       // We only consider complete lines as "meaningful" here; fragments are buffered for the next read.
       const filteredOutput = applyFilter(completeLines);
+      // A split line's tail counts too: the read returns it whatever the filter says.
       const hasMeaningfulOutput = filterExclude
-        ? filteredOutput.trim().length > 0
+        ? filteredOutput.trim().length > 0 ||
+          (proc.unreadStartsWithKeptLine === true && completeLines.length > 0)
         : completeLines.length > 0;
 
       // Return immediately if:
@@ -2692,9 +2724,11 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     const page = takeBackgroundOutputPage(
       previousBuffer + accumulatedRaw,
       currentStatus !== "running",
+      proc.unreadStartsWithKeptLine === true,
       (line) => !filterRegex || filterRegex.test(line) !== (filterExclude === true)
     );
     proc.incompleteLineBuffer = page.unread;
+    proc.unreadStartsWithKeptLine = page.unreadStartsWithKeptLine;
 
     const shownThroughOffsetBeforeRead = proc.shownThroughOffset;
     const terminalStatusShownBeforeRead = proc.terminalStatusShownToAgent;

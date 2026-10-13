@@ -97,6 +97,46 @@ describe("skills_catalog_read", () => {
     }
   });
 
+  it("reads later pages from the first page's fetch, and says so when that copy expired", async () => {
+    using tempDir = new TestTempDir("test-skills-catalog-read-pinned");
+    const config = createTestToolConfig(tempDir.path, { workspaceId: GLOBAL_WORKSPACE_ID });
+    const skillMd = (revision: string) =>
+      `---\nname: pinned-skill\ndescription: A big skill\n---\n${revision}\n${"step\n".repeat(25_000)}`;
+    let revision = "rev-1";
+    const fetchContentSpy = spyOn(catalogFetch, "fetchSkillContent").mockImplementation(() =>
+      Promise.resolve({ content: skillMd(revision), path: "skills/p/SKILL.md", branch: "main" })
+    );
+    let now = 1_000_000;
+    const nowSpy = spyOn(Date, "now").mockImplementation(() => now);
+    const read = async (offset?: number) => {
+      const result = (await createSkillsCatalogReadTool(config).execute!(
+        { owner: "o", repo: "r", skillId: "pinned-skill", offset_chars: offset },
+        mockToolCallOptions
+      )) as SkillsCatalogReadToolResult;
+      if (!result.success) throw new Error(result.error);
+      return result;
+    };
+
+    try {
+      const first = await read();
+      // The branch moves after the first page: later pages still read the first copy.
+      revision = "rev-2";
+      const second = await read(first.nextCharOffset);
+      expect(fetchContentSpy).toHaveBeenCalledTimes(1);
+      expect(second.note).not.toContain("expired");
+      expect(first.body.startsWith("rev-1")).toBe(true);
+
+      // Past the pin's lifetime, the page fetches again and says the copy can differ.
+      now += 11 * 60 * 1000;
+      const third = await read(second.nextCharOffset);
+      expect(fetchContentSpy).toHaveBeenCalledTimes(2);
+      expect(third.note).toContain("expired");
+    } finally {
+      fetchContentSpy.mockRestore();
+      nowSpy.mockRestore();
+    }
+  });
+
   it("returns parsed skill content on success", async () => {
     using tempDir = new TestTempDir("test-skills-catalog-read-success");
     const config = createTestToolConfig(tempDir.path, {

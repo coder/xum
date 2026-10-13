@@ -3370,11 +3370,11 @@ describe("BackgroundProcessManager", () => {
     describe("per-read cap", () => {
       // Reads every page of the process's pending output (timeout 0 each), checking each page
       // against foreground bash's byte cap.
-      async function readAllPages(processId: string) {
+      async function readAllPages(processId: string, filter?: string, filterExclude?: boolean) {
         const pages: string[] = [];
         const notes: Array<string | undefined> = [];
         for (let attempt = 0; attempt < 50; attempt++) {
-          const read = await manager.getOutput(processId, undefined, undefined, 0);
+          const read = await manager.getOutput(processId, filter, filterExclude, 0);
           expect(read.success).toBe(true);
           if (!read.success) throw new Error(read.error);
           expect(Buffer.byteLength(read.output, "utf8")).toBeLessThanOrEqual(BASH_MAX_TOTAL_BYTES);
@@ -3417,6 +3417,26 @@ describe("BackgroundProcessManager", () => {
         // Two full pages of the line's head, then its tail and the next line.
         expect(pages).toHaveLength(3);
         expect(pages.join("")).toBe(`${longLine}\nafter`);
+      });
+
+      // The tail of a split line no longer starts with what made its whole line match ("^M"),
+      // or starts with what the exclude filter drops ("^x"). It must still be returned.
+      it.each([
+        { name: "filter", filter: "^M", exclude: false },
+        { name: "filter_exclude", filter: "^x", exclude: true },
+      ])("keeps a split line's tail under its line's $name decision", async (testCase) => {
+        const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+          cwd: process.cwd(),
+          displayName: "test",
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        const longLine = `M${"x".repeat(BASH_MAX_TOTAL_BYTES * 2)}`;
+        const log = [longLine, testCase.exclude ? "xdrop" : "skip", "M after", ""].join("\n");
+        await fs.appendFile(path.join(result.outputDir, "output.log"), log);
+
+        const { pages } = await readAllPages(result.processId, testCase.filter, testCase.exclude);
+        expect(pages.join("")).toBe(`${longLine}\nM after`);
       });
 
       it("keeps the rest after exit readable", async () => {
