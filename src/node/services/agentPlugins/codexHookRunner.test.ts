@@ -3,7 +3,6 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { loadPluginCodexHooks } from "./codexHooks";
-import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import { EventSpine, type ToolExecuteContext } from "@/node/services/events/eventSpine";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { PluginHookDefinition } from "./codexHooks";
@@ -468,10 +467,8 @@ describe("Codex tool names", () => {
         },
       })
     );
-    const { hooks } = await loadPluginCodexHooks({
-      rootPath: await fs.realpath(tmp.path),
-      manifest: { schemaId: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "guard" },
-    });
+    // No com.openai extension: the default hooks/hooks.json.
+    const { hooks } = await loadPluginCodexHooks({ rootPath: await fs.realpath(tmp.path) });
     const { spine, calls } = setup(hooks, () => deny);
 
     const ctx = await runTool(spine, "bash", { script: "rm -rf /", display_name: "Clean" });
