@@ -413,7 +413,7 @@ export function useCreationWorkspace({
       // File-only sends are valid; the attached-files notice or provider file
       // parts carry the content.
       const hasSendableAttachments = pendingFilesToStage.length > 0 || (fileParts?.length ?? 0) > 0;
-      if ((!messageText.trim() && !hasSendableAttachments) || isSending || !api) {
+      if ((!messageText.trim() && !hasSendableAttachments) || isSending || !liveApi) {
         return { success: false };
       }
 
@@ -570,8 +570,8 @@ export function useCreationWorkspace({
 
         const createResult =
           kind === "scratch"
-            ? await api.workspace.createScratch({ title: createTitle })
-            : await api.workspace.create({
+            ? await liveApi.workspace.createScratch({ title: createTitle })
+            : await liveApi.workspace.create({
                 projectPath,
                 branchName: identity.name,
                 trunkBranch: settings.trunkBranch,
@@ -599,7 +599,7 @@ export function useCreationWorkspace({
         // is portable across devices even before the first stream starts. Initial /goal commands do
         // not send a normal user message, so they await this write before setting the goal; that lets
         // the backend kickoff continuation use the same model/agent selected in creation.
-        const initialAiSettingsPersisted = api.workspace
+        const initialAiSettingsPersisted = liveApi.workspace
           .updateAgentAISettings({
             workspaceId: metadata.id,
             agentId: creationAgentId,
@@ -744,7 +744,7 @@ export function useCreationWorkspace({
         // first send so the attached-files notice can reference real staged paths.
         const stagingOutcome =
           pendingFilesToStage.length > 0
-            ? await stagePendingFiles(api, metadata.id, pendingFilesToStage)
+            ? await stagePendingFiles(liveApi, metadata.id, pendingFilesToStage)
             : { staged: [], failures: [] };
         const stagingFailed = stagingOutcome.failures.length > 0;
 
@@ -776,7 +776,7 @@ export function useCreationWorkspace({
         if (initialSlashCommand) {
           await initialAiSettingsPersisted;
           const commandEnv: SlashCommandEnv = {
-            api,
+            api: liveApi,
             workspaceId: metadata.id,
             variant: "workspace",
             projectPath: metadata.projectPath,
@@ -885,7 +885,7 @@ export function useCreationWorkspace({
         // A transport-level rejection (e.g. oRPC disconnect) must flow through
         // the same failure branch as success:false: the outer catch would skip
         // the staged-draft transfer and the creation draft is already cleared.
-        const sendResult = await api.workspace
+        const sendResult = await liveApi.workspace
           .sendMessage({
             workspaceId: metadata.id,
             message: appendStagedAttachmentNotice(messageText, stagingOutcome.staged),
@@ -952,7 +952,7 @@ export function useCreationWorkspace({
     },
     [
       kind,
-      api,
+      liveApi,
       isSending,
       projectPath,
       projectScopeId,

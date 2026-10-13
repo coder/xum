@@ -290,6 +290,11 @@ function AppInner() {
   const { api, status, error, authenticate, retry } = useAPI();
   // Handlers and command sources see null offline, even while useAPI() keeps the last client.
   const liveApi = useLiveAPI();
+  // Read after a confirmation dialog: the connection can drop while it is open.
+  const liveApiRef = useRef(liveApi);
+  useEffect(() => {
+    liveApiRef.current = liveApi;
+  }, [liveApi]);
   const [supportedUpdateChannels, setSupportedUpdateChannels] = useState<UpdateChannel[]>([]);
 
   useEffect(() => {
@@ -973,7 +978,7 @@ function AppInner() {
   );
   const removeSubagentFromPalette = async (workspaceId: string, title: string) => {
     const notice = await confirmAndRemoveSubagent({
-      api: liveApi,
+      getApi: () => liveApiRef.current,
       confirm: confirmDialog,
       removeSubagent,
       workspaceId,

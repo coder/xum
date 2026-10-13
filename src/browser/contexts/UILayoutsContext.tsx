@@ -141,9 +141,11 @@ export function UILayoutsProvider(props: { children: ReactNode }) {
         return;
       }
 
-      await applyLayoutPresetToWorkspace(api ?? null, workspaceId, preset);
+      // Offline, the preset is not applied: a terminal list cut off by the lost connection would
+      // look empty and drop the layout's terminal tabs.
+      await applyLayoutPresetToWorkspace(liveApi, workspaceId, preset);
     },
-    [api, layoutPresets]
+    [liveApi, layoutPresets]
   );
 
   const saveCurrentWorkspaceToSlot = useCallback(

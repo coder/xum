@@ -13,6 +13,19 @@ import ts from "typescript";
  * useAPI()`, `{ api: client } = useAPI()`, `useAPI().api`, or `state.api` with
  * `state = useAPI()`.
  */
+/** The names an offline gate checks: `!x`, `x == null`, and each operand of `a || b`. */
+function missingCheckNames(expression: ts.Expression): ts.Identifier[] {
+  if (
+    ts.isBinaryExpression(expression) &&
+    expression.operatorToken.kind === ts.SyntaxKind.BarBarToken
+  ) {
+    return [...missingCheckNames(expression.left), ...missingCheckNames(expression.right)];
+  }
+  if (ts.isParenthesizedExpression(expression)) return missingCheckNames(expression.expression);
+  const name = missingCheckName(expression);
+  return name == null ? [] : [name];
+}
+
 function missingCheckName(expression: ts.Expression): ts.Identifier | null {
   if (
     ts.isPrefixUnaryExpression(expression) &&
@@ -80,10 +93,10 @@ function isUseAPIClient(name: string, declaration: ts.VariableDeclaration): bool
 }
 
 function isUseAPIClientCheck(expression: ts.Expression): boolean {
-  const name = missingCheckName(expression);
-  if (name == null) return false;
-  const declaration = findDeclaration(name.text, expression);
-  return declaration != null && isUseAPIClient(name.text, declaration);
+  return missingCheckNames(expression).some((name) => {
+    const declaration = findDeclaration(name.text, expression);
+    return declaration != null && isUseAPIClient(name.text, declaration);
+  });
 }
 
 function isOfflineResult(statement: ts.Statement | undefined, source: ts.SourceFile): boolean {
@@ -141,7 +154,7 @@ describe("offline result gates", () => {
       "function useX() {",
       `  ${declaration}`,
       "  const run = () => {",
-      `    if (!${name}) return { success: false, error: "offline" };`,
+      `    if (!ready || !${name}) return { success: false, error: "offline" };`,
       "  };",
       "}",
     ].join("\n");
