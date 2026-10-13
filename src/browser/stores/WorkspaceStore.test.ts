@@ -7129,6 +7129,273 @@ describe("WorkspaceStore", () => {
     });
   });
 
+  // The timeline panel reads one refcounted backend subscription per workspace: its snapshot is
+  // the newest page, live batches merge into it, and older pages load from the snapshot cursor.
+  describe("workspace timeline", () => {
+    const timelineEvent = (seq: number) => ({
+      v: 1 as const,
+      seq,
+      id: `event-${seq}`,
+      ts: seq,
+      kind: "turn.completed" as const,
+      source: { system: "workspace" as const },
+    });
+    type TimelineUpdate =
+      | {
+          type: "snapshot";
+          events: Array<ReturnType<typeof timelineEvent>>;
+          nextCursor: number | null;
+          hasOlder: boolean;
+        }
+      | { type: "appended"; events: Array<ReturnType<typeof timelineEvent>> };
+    type TimelinePage = Omit<Extract<TimelineUpdate, { type: "snapshot" }>, "type">;
+
+    let feed: ControllableAsyncIterable<TimelineUpdate>;
+    let subscribeSignals: AbortSignal[];
+    const mockTimelineSubscribe = mock(
+      (_input: { workspaceId: string }, options?: { signal?: AbortSignal }) => {
+        if (options?.signal) subscribeSignals.push(options.signal);
+        return Promise.resolve(feed.iterable);
+      }
+    );
+    const mockTimelineList = mock(
+      (_input: { workspaceId: string; cursor: number }): Promise<TimelinePage> =>
+        Promise.resolve({ events: [], nextCursor: null, hasOlder: false })
+    );
+
+    beforeEach(() => {
+      feed = createControllableAsyncIterable<TimelineUpdate>();
+      subscribeSignals = [];
+      mockTimelineSubscribe.mockClear();
+      mockTimelineList.mockClear();
+      resetStore();
+      store.setClient({
+        ...mockClient,
+        workspace: {
+          ...mockClient.workspace,
+          timeline: { subscribe: mockTimelineSubscribe, list: mockTimelineList },
+        },
+      } as unknown as Parameters<WorkspaceStore["setClient"]>[0]);
+    });
+
+    const seqs = (workspaceId: string) =>
+      store.getWorkspaceTimeline(workspaceId).events.map((event) => event.seq);
+
+    /** Register and subscribe a workspace whose snapshot is events 3 and 2, with older events. */
+    const openTimeline = async (workspaceId: string) => {
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      const unsubscribe = store.subscribeTimeline(workspaceId, () => undefined);
+      feed.push({
+        type: "snapshot",
+        events: [timelineEvent(3), timelineEvent(2)],
+        nextCursor: 2,
+        hasOlder: true,
+      });
+      expect(await waitUntil(() => store.getWorkspaceTimeline(workspaceId).initialized)).toBe(true);
+      return unsubscribe;
+    };
+
+    it("shares one backend subscription between listeners and shows its snapshot", async () => {
+      const workspaceId = "timeline-shared";
+      const listener = mock(() => undefined);
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      store.subscribeTimeline(workspaceId, listener);
+      store.subscribeTimeline(workspaceId, () => undefined);
+      expect(mockTimelineSubscribe).toHaveBeenCalledTimes(1);
+      expect(mockTimelineSubscribe.mock.calls[0][0]).toEqual({ workspaceId });
+
+      feed.push({ type: "snapshot", events: [timelineEvent(3)], nextCursor: 3, hasOlder: true });
+
+      expect(await waitUntil(() => listener.mock.calls.length > 0)).toBe(true);
+      expect(store.getWorkspaceTimeline(workspaceId)).toEqual({
+        events: [timelineEvent(3)],
+        nextCursor: 3,
+        hasOlder: true,
+        initialized: true,
+        loadingOlder: false,
+        loadError: null,
+        loadErrorKind: null,
+      });
+    });
+
+    it("marks an empty snapshot as initialized so the panel shows its empty state", async () => {
+      const workspaceId = "timeline-empty";
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      store.subscribeTimeline(workspaceId, () => undefined);
+      feed.push({ type: "snapshot", events: [], nextCursor: null, hasOlder: false });
+
+      expect(await waitUntil(() => store.getWorkspaceTimeline(workspaceId).initialized)).toBe(true);
+      expect(store.getWorkspaceTimeline(workspaceId).events).toEqual([]);
+    });
+
+    it("merges appended live events and skips empty batches", async () => {
+      const workspaceId = "timeline-appended";
+      const listener = mock(() => undefined);
+      await openTimeline(workspaceId);
+      store.subscribeTimeline(workspaceId, listener);
+
+      feed.push({ type: "appended", events: [] });
+      feed.push({ type: "appended", events: [timelineEvent(4)] });
+
+      expect(await waitUntil(() => seqs(workspaceId).length === 3)).toBe(true);
+      expect(seqs(workspaceId)).toEqual([4, 3, 2]);
+      // Only the non-empty batch notified listeners.
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(store.getWorkspaceTimeline(workspaceId)).toMatchObject({
+        nextCursor: 2,
+        hasOlder: true,
+      });
+    });
+
+    it("closes the backend subscription and drops the timeline after the last listener", async () => {
+      const workspaceId = "timeline-refcount";
+      const unsubscribeFirst = await openTimeline(workspaceId);
+      const unsubscribeSecond = store.subscribeTimeline(workspaceId, () => undefined);
+
+      unsubscribeFirst();
+      expect(subscribeSignals[0].aborted).toBe(false);
+      expect(seqs(workspaceId)).toEqual([3, 2]);
+
+      unsubscribeSecond();
+      expect(subscribeSignals[0].aborted).toBe(true);
+      expect(store.getWorkspaceTimeline(workspaceId).initialized).toBe(false);
+      expect(seqs(workspaceId)).toEqual([]);
+
+      // A later listener opens a fresh subscription.
+      store.subscribeTimeline(workspaceId, () => undefined);
+      expect(mockTimelineSubscribe).toHaveBeenCalledTimes(2);
+    });
+
+    it("subscribes a listener that came before the workspace was registered", () => {
+      const workspaceId = "timeline-early-listener";
+      store.subscribeTimeline(workspaceId, () => undefined);
+      expect(mockTimelineSubscribe).not.toHaveBeenCalled();
+
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      expect(mockTimelineSubscribe).toHaveBeenCalledTimes(1);
+    });
+
+    it("closes a subscription that opens after its listener left", async () => {
+      const workspaceId = "timeline-late-open";
+      const onReturn = mock(() => undefined);
+      feed = createControllableAsyncIterable<TimelineUpdate>({ onReturn });
+      let openSubscription!: () => void;
+      mockTimelineSubscribe.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            openSubscription = () => resolve(feed.iterable);
+          })
+      );
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      const unsubscribe = store.subscribeTimeline(workspaceId, () => undefined);
+
+      unsubscribe();
+      openSubscription();
+
+      expect(await waitUntil(() => onReturn.mock.calls.length > 0)).toBe(true);
+      expect(store.getWorkspaceTimeline(workspaceId).initialized).toBe(false);
+    });
+
+    it("shows a failed subscription as an error until the user retries", async () => {
+      const workspaceId = "timeline-subscription-error";
+      mockTimelineSubscribe.mockImplementationOnce(() => Promise.reject(new Error("backend gone")));
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      store.subscribeTimeline(workspaceId, () => undefined);
+
+      expect(
+        await waitUntil(() => store.getWorkspaceTimeline(workspaceId).loadError !== null)
+      ).toBe(true);
+      expect(store.getWorkspaceTimeline(workspaceId)).toMatchObject({
+        initialized: true,
+        loadError: "backend gone",
+        loadErrorKind: "subscription",
+      });
+
+      store.retryTimeline(workspaceId);
+      expect(mockTimelineSubscribe).toHaveBeenCalledTimes(2);
+      expect(store.getWorkspaceTimeline(workspaceId)).toMatchObject({
+        initialized: false,
+        loadError: null,
+      });
+      feed.push({
+        type: "snapshot",
+        events: [timelineEvent(1)],
+        nextCursor: null,
+        hasOlder: false,
+      });
+      expect(await waitUntil(() => seqs(workspaceId).length === 1)).toBe(true);
+    });
+
+    it("loads the next older page from the snapshot cursor", async () => {
+      const workspaceId = "timeline-older-page";
+      await openTimeline(workspaceId);
+      let resolvePage!: (page: TimelinePage) => void;
+      mockTimelineList.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolvePage = resolve;
+          })
+      );
+
+      const loading = store.loadOlderTimeline(workspaceId);
+      expect(mockTimelineList).toHaveBeenCalledWith({ workspaceId, cursor: 2 });
+      expect(store.getWorkspaceTimeline(workspaceId).loadingOlder).toBe(true);
+      // A second request while the page loads does not fetch it twice.
+      await store.loadOlderTimeline(workspaceId);
+      expect(mockTimelineList).toHaveBeenCalledTimes(1);
+
+      resolvePage({ events: [timelineEvent(1)], nextCursor: null, hasOlder: false });
+      await loading;
+
+      expect(seqs(workspaceId)).toEqual([3, 2, 1]);
+      expect(store.getWorkspaceTimeline(workspaceId)).toMatchObject({
+        nextCursor: null,
+        hasOlder: false,
+        loadingOlder: false,
+      });
+      // Without older events there is nothing left to load.
+      await store.loadOlderTimeline(workspaceId);
+      expect(mockTimelineList).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps the loaded events and shows a pagination error when a page fails", async () => {
+      const workspaceId = "timeline-older-page-error";
+      await openTimeline(workspaceId);
+      mockTimelineList.mockImplementationOnce(() => Promise.reject(new Error("page failed")));
+
+      await store.loadOlderTimeline(workspaceId);
+
+      expect(seqs(workspaceId)).toEqual([3, 2]);
+      expect(store.getWorkspaceTimeline(workspaceId)).toMatchObject({
+        nextCursor: 2,
+        hasOlder: true,
+        loadingOlder: false,
+        loadError: "page failed",
+        loadErrorKind: "pagination",
+      });
+    });
+
+    it("drops an older page that resolves after the timeline was reset", async () => {
+      const workspaceId = "timeline-older-page-stale";
+      await openTimeline(workspaceId);
+      let resolvePage!: (page: TimelinePage) => void;
+      mockTimelineList.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolvePage = resolve;
+          })
+      );
+
+      const loading = store.loadOlderTimeline(workspaceId);
+      store.retryTimeline(workspaceId);
+      resolvePage({ events: [timelineEvent(1)], nextCursor: null, hasOlder: false });
+      await loading;
+
+      expect(seqs(workspaceId)).toEqual([]);
+      expect(store.getWorkspaceTimeline(workspaceId).loadingOlder).toBe(false);
+    });
+  });
+
   describe("getWorkspaceRecency", () => {
     it("should return stable reference when values unchanged", () => {
       const recency1 = store.getWorkspaceRecency();
