@@ -51,6 +51,7 @@ import {
 import type { TodoItem } from "@/common/types/tools";
 import { buildStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import { revealTimelineTarget } from "@/browser/utils/timelineReveal";
+import { computeProvidersConfigFingerprint } from "@/common/utils/providers/configFingerprint";
 import {
   findRenderedRefineProposalHash,
   mergeTimelineEvents,
@@ -7884,6 +7885,117 @@ describe("WorkspaceStore", () => {
         ["mixed-turn", 31_000, false],
         ["tool-only-turn", 30_000, true],
       ]);
+    });
+  });
+
+  // The Costs tab's consumer breakdown comes from the token-stats cache persisted in
+  // session-usage.json when it still matches the history; otherwise the store recounts.
+  describe("consumer breakdown from the token-stats cache", () => {
+    const MODEL = "anthropic:claude-opus-4-5";
+    const CACHED_CONSUMERS = [{ name: "User", tokens: 42, percentage: 100 }];
+
+    const tokenStatsCache = (history: { messageCount: number; maxHistorySequence?: number }) => ({
+      version: 1 as const,
+      computedAt: 1,
+      // The beforeEach store loads an empty provider config.
+      providersConfigVersion: computeProvidersConfigFingerprint({}),
+      model: MODEL,
+      tokenizerName: "cached-tokenizer",
+      history,
+      consumers: CACHED_CONSUMERS,
+      totalTokens: 42,
+    });
+
+    /** Replay a two-message history (sequences 3 and 7) after the session usage loaded. */
+    const replayHistory = async (
+      workspaceId: string,
+      cache: ReturnType<typeof tokenStatsCache>
+    ) => {
+      mockGetSessionUsage.mockImplementation((input: { workspaceId: string }) =>
+        Promise.resolve(
+          input.workspaceId === workspaceId
+            ? { byModel: {}, tokenStatsCache: cache, version: 1 as const }
+            : undefined
+        )
+      );
+      mockChatScript(
+        [
+          // Hold the replay until the cache is in memory, so catch-up can use it.
+          waitUntil(() => store.isSessionUsageKnown(workspaceId)).then(() => tick(10)),
+          createHistoryMessageEvent("user-1", 3),
+          {
+            type: "message",
+            id: "assistant-1",
+            role: "assistant",
+            parts: [{ type: "text", text: "reply" }],
+            metadata: { historySequence: 7, timestamp: 7, model: MODEL },
+          },
+          caughtUpEvent(),
+        ],
+        { keepOpen: true }
+      );
+      createAndAddWorkspace(store, workspaceId);
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).loading === false)).toBe(
+        true
+      );
+    };
+
+    it("shows the cached breakdown when the history still matches it", async () => {
+      const workspaceId = "consumers-cache-hit";
+      await replayHistory(workspaceId, tokenStatsCache({ messageCount: 2, maxHistorySequence: 7 }));
+
+      expect(store.getWorkspaceConsumers(workspaceId)).toEqual({
+        consumers: CACHED_CONSUMERS,
+        tokenizerName: "cached-tokenizer",
+        totalTokens: 42,
+        topFilePaths: undefined,
+        isCalculating: false,
+      });
+    });
+
+    it("recounts when the newest history sequence differs from the cached one", async () => {
+      // Same message count, but the history changed: the cache saw sequence 5 as newest.
+      const workspaceId = "consumers-cache-stale-sequence";
+      await replayHistory(workspaceId, tokenStatsCache({ messageCount: 2, maxHistorySequence: 5 }));
+
+      const state = store.getWorkspaceConsumers(workspaceId);
+      expect(state.isCalculating).toBe(true);
+      expect(state.consumers).toEqual([]);
+    });
+
+    it("recounts when the cache saw a different number of messages", async () => {
+      const workspaceId = "consumers-cache-stale-count";
+      await replayHistory(workspaceId, tokenStatsCache({ messageCount: 3, maxHistorySequence: 7 }));
+
+      expect(store.getWorkspaceConsumers(workspaceId).isCalculating).toBe(true);
+    });
+
+    it("trusts the message count when the cache has no history sequence", async () => {
+      const workspaceId = "consumers-cache-count-only";
+      await replayHistory(workspaceId, tokenStatsCache({ messageCount: 2 }));
+
+      expect(store.getWorkspaceConsumers(workspaceId)).toMatchObject({
+        consumers: CACHED_CONSUMERS,
+        isCalculating: false,
+      });
+    });
+
+    it("recounts on the next read after a provider config change drops the cache", async () => {
+      const workspaceId = "consumers-cache-config-change";
+      await replayHistory(workspaceId, tokenStatsCache({ messageCount: 2, maxHistorySequence: 7 }));
+      expect(store.getWorkspaceConsumers(workspaceId).isCalculating).toBe(false);
+
+      // A new fingerprint invalidates the breakdown and the persisted cache.
+      mockGetProvidersConfig.mockResolvedValueOnce({
+        ollama: { apiKeySet: false, isEnabled: true, isConfigured: true },
+      });
+      providerConfigChanges.push(undefined);
+
+      // The reads themselves schedule the recount: nothing else re-triggers it.
+      expect(await waitUntil(() => store.getWorkspaceConsumers(workspaceId).isCalculating)).toBe(
+        true
+      );
+      expect(store.getWorkspaceConsumers(workspaceId).consumers).toEqual([]);
     });
   });
 
