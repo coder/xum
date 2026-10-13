@@ -53,17 +53,6 @@ export function MemoryFileEditor(props: MemoryFileEditorProps) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const view = useMarkdownViewMode(props.path, rootRef, textareaRef, setDraft);
 
-  // When the control holding focus goes away (Save is disabled while saving,
-  // Reload unmounts with its banner), focus falls to <body> and the editor
-  // shortcuts stop working. Pull it back to the editor, but never move focus
-  // the user put elsewhere.
-  const refocusEditorIfLost = (leaving: Element | null) => {
-    const active = document.activeElement;
-    if (active === null || active === document.body || (leaving?.contains(active) ?? false)) {
-      rootRef.current?.focus();
-    }
-  };
-
   useEffect(() => {
     if (!api) return;
     const controller = new AbortController();
@@ -108,7 +97,7 @@ export function MemoryFileEditor(props: MemoryFileEditorProps) {
       setSaveError({ kind: "error", message: getErrorMessage(err) });
     } finally {
       setSaving(false);
-      refocusEditorIfLost(null);
+      focusEditorIfFocusLost(rootRef.current, null);
     }
   };
 
@@ -123,7 +112,7 @@ export function MemoryFileEditor(props: MemoryFileEditorProps) {
   };
 
   const handleReload = (button: HTMLElement) => {
-    refocusEditorIfLost(button);
+    focusEditorIfFocusLost(rootRef.current, button);
     setSaveError(null);
     setReloadTick((n) => n + 1);
   };
@@ -181,6 +170,19 @@ export function MemoryFileEditor(props: MemoryFileEditorProps) {
 }
 
 /**
+ * When the control holding focus goes away (Save is disabled while saving,
+ * Reload unmounts with its banner, the textarea hides in Preview), focus falls
+ * to <body> and the editor shortcuts stop working. Pull it back to the editor
+ * root, but never move focus the user put elsewhere.
+ */
+function focusEditorIfFocusLost(root: HTMLElement | null, leaving: Element | null) {
+  const active = document.activeElement;
+  if (active === null || active === document.body || (leaving?.contains(active) ?? false)) {
+    root?.focus();
+  }
+}
+
+/**
  * Preview/Edit state for Markdown files. Switching keeps the draft: leaving
  * Edit copies the textarea's live value out before Preview renders it.
  */
@@ -203,25 +205,20 @@ function useMarkdownViewMode(
   }, [rootRef]);
 
   const switchMode = (next: ViewMode) => {
-    if (next === mode) return;
     const textarea = textareaRef.current;
+    // No textarea means a load error, which shows the same message in both modes.
+    if (next === mode || textarea === null) return;
     if (next === "preview") {
-      if (textarea !== null) {
-        onLeaveEdit(textarea.value);
-        editScrollTopRef.current = textarea.scrollTop;
-        // The textarea is hidden; keep focus inside the editor so the next
-        // shortcut press still reaches it.
-        if (document.activeElement === textarea) rootRef.current?.focus();
-      }
+      onLeaveEdit(textarea.value);
+      editScrollTopRef.current = textarea.scrollTop;
+      focusEditorIfFocusLost(rootRef.current, textarea);
       setMode(next);
       return;
     }
     // Show the textarea synchronously so it can take focus in this handler.
     flushSync(() => setMode(next));
-    if (textarea !== null) {
-      textarea.focus();
-      textarea.scrollTop = editScrollTopRef.current;
-    }
+    textarea.focus();
+    textarea.scrollTop = editScrollTopRef.current;
   };
 
   return {
