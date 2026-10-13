@@ -1,7 +1,9 @@
 import assert from "@/common/utils/assert";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
+import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
+import { toPosixPath } from "@/node/utils/paths";
 
 import type { ResolvedAgentSkill } from "./agentSkillsService";
 import { isSkillDynamicDirectiveLine } from "./skillDynamicContext";
@@ -69,10 +71,14 @@ export function resolveSkillDirectory(
   if (reason != null) return { available: false, reason };
 
   assert(resolved.skillDir.length > 0, "on-disk skills must have a skill directory");
+  // Host paths are native on Windows (drive letter, backslashes), but bash runs
+  // in Git Bash there: give it the POSIX form. toPosixPath is a no-op off Windows; remote paths
+  // are already POSIX.
+  const forBash = resolved.sourceRuntime instanceof RemoteRuntime ? (p: string) => p : toPosixPath;
   return {
     available: true,
-    skillDir: resolved.skillDir,
-    ...(resolved.pluginRoot != null ? { pluginRoot: resolved.pluginRoot } : {}),
+    skillDir: forBash(resolved.skillDir),
+    ...(resolved.pluginRoot != null ? { pluginRoot: forBash(resolved.pluginRoot) } : {}),
   };
 }
 
@@ -92,9 +98,13 @@ function getSkillDirectoryUnavailableReason(
   if (discoveredOutsideWorkspace && resolved.package.scope === "project") {
     return OTHER_CHECKOUT_REASON;
   }
-  const sameRuntime = resolved.sourceRuntime === workspaceRuntime;
+  // A shared instance proves a shared filesystem only for remote runtimes, which
+  // read and execute on the same machine. A DevcontainerRuntime (or a wrapper
+  // around one) reads the host but executes in the container.
+  const sameRemote =
+    resolved.sourceRuntime === workspaceRuntime && workspaceRuntime instanceof RemoteRuntime;
   const bothOnHost = execsOnHost(resolved.sourceRuntime) && execsOnHost(workspaceRuntime);
-  return sameRuntime || bothOnHost ? null : OFF_HOST_REASON;
+  return sameRemote || bothOnHost ? null : OFF_HOST_REASON;
 }
 
 /**

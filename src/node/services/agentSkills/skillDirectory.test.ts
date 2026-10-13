@@ -44,13 +44,16 @@ describe("resolveSkillDirectory for off-host workspaces", () => {
     expect(bodyFor(skill, remoteRuntime)).toBe("sh /workspace/.xum/skills/demo/scripts/x.sh");
   });
 
-  for (const [label, workspaceRuntime] of [
-    ["SSH/Docker", remoteRuntime],
-    ["devcontainer", devcontainerRuntime],
+  for (const [label, sourceRuntime, workspaceRuntime] of [
+    ["an SSH/Docker workspace", hostRuntime, remoteRuntime],
+    ["a devcontainer workspace", hostRuntime, devcontainerRuntime],
+    // Global skills in a devcontainer are read through the workspace runtime
+    // itself, which reads the host but runs bash in the container.
+    ["the devcontainer runtime that read it", devcontainerRuntime, devcontainerRuntime],
   ] as const) {
-    it(`withholds a host path from a ${label} workspace (plugin, host-fallback skills)`, () => {
+    it(`withholds a host path from ${label}`, () => {
       const dir = resolveSkillDirectory(
-        resolvedSkill(hostRuntime, "/host/.xum/plugins/p/skills/demo"),
+        resolvedSkill(sourceRuntime, "/host/.xum/skills/demo"),
         workspaceRuntime
       );
       expect(dir.available).toBe(false);
