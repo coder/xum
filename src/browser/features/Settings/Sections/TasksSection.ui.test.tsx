@@ -1089,4 +1089,39 @@ describe.each([...GAP_MODES])("TasksSection across a reconnect (%s)", (mode) => 
     await waitFor(() => expect(saveConfig).toHaveBeenCalled(), { timeout: 2_000 });
     expect(saveConfig.mock.calls.at(-1)?.[0].taskSettings.maxParallelAgentTasks).toBe(7);
   });
+
+  // An offline change cannot be saved yet. It must say so, stay pending, and be saved by the
+  // next client, not dropped while it looks saved.
+  test("reports a change made offline and saves it after the reconnect", async () => {
+    const firstSave = connect(3, Promise.resolve(FALLBACK_AGENTS));
+    const harness = createConnectionHarness(mode, () => apiMock ?? {});
+    const view = render(
+      <harness.Wrapper>
+        <TasksSection />
+      </harness.Wrapper>
+    );
+    await waitFor(() => expect(maxParallelInput(view).value).toBe("3"));
+
+    await harness.drop();
+    const input = maxParallelInput(view);
+    const reactPropsKey = Object.keys(input).find((key) => key.startsWith("__reactProps"));
+    const props = (
+      reactPropsKey ? (input as unknown as Record<string, unknown>)[reactPropsKey] : null
+    ) as { onChange?: (event: { target: { value: string } }) => void } | null;
+    if (!props?.onChange) throw new Error("Expected the input to expose its onChange handler");
+    const change = props.onChange;
+    act(() => change({ target: { value: "7" } }));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    });
+    expect(view.queryByText(/Not connected to the Xum server/)).not.toBeNull();
+
+    const saveConfig = connect(5, Promise.resolve(FALLBACK_AGENTS));
+    harness.reconnect();
+    await waitFor(() => expect(saveConfig).toHaveBeenCalled(), { timeout: 2_000 });
+    expect(saveConfig.mock.calls.at(-1)?.[0].taskSettings.maxParallelAgentTasks).toBe(7);
+    expect(maxParallelInput(view).value).toBe("7");
+    await waitFor(() => expect(view.queryByText(/Not connected to the Xum server/)).toBeNull());
+    expect(firstSave).not.toHaveBeenCalled();
+  });
 });

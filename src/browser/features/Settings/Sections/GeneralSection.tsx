@@ -17,7 +17,7 @@ import {
 import { useChatTranscriptFullWidth } from "@/browser/hooks/useChatTranscriptFullWidth";
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { useTranscriptDensity } from "@/browser/hooks/useTranscriptDensity";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useExperiment, useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -177,6 +177,10 @@ let compactionStrategyWrites: Promise<void> = Promise.resolve();
 export function GeneralSection() {
   const { themePreference, setTheme } = useTheme();
   const { api } = useAPI();
+  // Offline, the loaded values stay on screen, but the controls that write to the server directly
+  // are disabled: their write could not reach it, and the control must not look saved.
+  const liveApi = useLiveAPI();
+  const offline = liveApi == null;
   const telemetry = useTelemetry();
   const [continuousCompaction, setContinuousCompaction] = useExperiment(
     EXPERIMENT_IDS.CONTINUOUS_COMPACTION
@@ -364,7 +368,8 @@ export function GeneralSection() {
       });
   }, [api]);
 
-  const archiveControlsDisabled = !api?.config?.updateCoderPrefs || !archiveSettingsLoaded;
+  const archiveControlsDisabled =
+    offline || !api?.config?.updateCoderPrefs || !archiveSettingsLoaded;
 
   const queueArchiveBehaviorUpdate = useCallback(() => {
     if (!api?.config?.updateCoderPrefs || !archiveSettingsLoaded) {
@@ -440,7 +445,7 @@ export function GeneralSection() {
   );
 
   const handleChatTranscriptFullWidthChange = (checked: boolean) => {
-    saveConfigOptimistically(api ?? null, { chatTranscriptFullWidth: checked }, (client) => {
+    saveConfigOptimistically(liveApi, { chatTranscriptFullWidth: checked }, (client) => {
       // Chained so a quick toggle back cannot land before the toggle it reverses.
       const update = chatTranscriptFullWidthUpdateChainRef.current.then(() =>
         client.config.updateChatTranscriptFullWidth({ enabled: checked })
@@ -1131,6 +1136,7 @@ export function GeneralSection() {
               <Switch
                 checked={keepScreenAwake}
                 onCheckedChange={handleKeepScreenAwakeChange}
+                disabled={offline}
                 aria-label="Toggle keep screen awake while agents are working"
               />
             </div>
@@ -1255,6 +1261,7 @@ export function GeneralSection() {
             <Switch
               checked={llmDebugLogs}
               onCheckedChange={handleLlmDebugLogsChange}
+              disabled={offline}
               aria-label="Toggle API Debug Logs"
             />
           </div>
@@ -1273,6 +1280,7 @@ export function GeneralSection() {
                   handleSshHostChange(e.target.value)
                 }
                 placeholder={window.location.hostname}
+                disabled={offline}
                 className="border-border-medium bg-background-secondary h-9 w-40"
               />
             </div>
@@ -1297,7 +1305,7 @@ export function GeneralSection() {
               }
               onBlur={handleCloneDirBlur}
               placeholder="~/.xum/projects"
-              disabled={!cloneDirLoaded}
+              disabled={!cloneDirLoaded || offline}
               className="border-border-medium bg-background-secondary h-9 w-80"
             />
           </div>

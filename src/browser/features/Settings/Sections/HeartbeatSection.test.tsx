@@ -284,4 +284,42 @@ describe.each([...GAP_MODES])("HeartbeatSection across a reconnect (%s)", (mode)
     expect(promptField.value).toBe("Typed, not saved");
     expect(promptField.disabled).toBe(false);
   });
+
+  // A save that the drop cut off never reached the server. After the reconnect the field must
+  // show the saved value, not the unsaved one as if it were saved. Offline it is disabled.
+  test("shows the saved prompt after a save the drop cut off", async () => {
+    const first = createMockAPI({ heartbeatDefaultPrompt: "Saved prompt" });
+    first.api.config.updateHeartbeatDefaultPrompt = mock(() => new Promise<void>(() => undefined));
+    mockApi = first.api;
+    const harness = createConnectionHarness(mode, () => mockApi);
+    const view = render(
+      <harness.Wrapper>
+        <TooltipProvider>
+          <ThemeProvider forcedTheme="dark">
+            <HeartbeatSection />
+          </ThemeProvider>
+        </TooltipProvider>
+      </harness.Wrapper>
+    );
+    const promptField = (await waitFor(() =>
+      view.getByLabelText("Default heartbeat prompt")
+    )) as HTMLTextAreaElement;
+    await waitFor(() => expect(promptField.value).toBe("Saved prompt"));
+
+    typeIntoTextarea(promptField, "Cut off");
+    fireEvent.blur(promptField);
+    await waitFor(() => expect(first.api.config.updateHeartbeatDefaultPrompt).toHaveBeenCalled());
+
+    mockApi = createMockAPI({ heartbeatDefaultPrompt: "Saved prompt" }).api;
+    await harness.drop();
+    expect(promptField.disabled).toBe(true);
+    // A real reconnect takes at least a socket round trip: the cut-off save rejects before it.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    harness.reconnect();
+
+    await waitFor(() => expect(promptField.value).toBe("Saved prompt"));
+    expect(promptField.disabled).toBe(false);
+  });
 });

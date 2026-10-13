@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 
 import { Input } from "@/browser/components/Input/Input";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import {
   clampIntervalMinutes,
   formatIntervalMinutes,
@@ -33,8 +34,35 @@ function isUneditedLoad(
   return nonce === nonceRef.current && !editedSinceLoadRef.current;
 }
 
+/**
+ * Offline (the field was disabled while focused) a blur does not save: drop the edit mark, so the
+ * reload after the reconnect shows the saved value again instead of an unsaved one.
+ */
+function forgetOfflineEdit(offline: boolean, editedSinceLoadRef: { current: boolean }): void {
+  if (offline) editedSinceLoadRef.current = false;
+}
+
+/**
+ * After a save that the lost connection cut off, drop the edit mark (unless the user typed again
+ * since `nonce`). The reload after the reconnect then shows the saved value again: an unsaved
+ * value kept on screen would look saved.
+ */
+function forgetLostEdit(
+  error: unknown,
+  nonce: number,
+  nonceRef: { current: number },
+  editedSinceLoadRef: { current: boolean }
+): void {
+  if (isConnectionLostError(error) && nonce === nonceRef.current) {
+    editedSinceLoadRef.current = false;
+  }
+}
+
 export function HeartbeatSection() {
   const { api } = useAPI();
+  // Offline the fields are disabled: a save could not reach the server.
+  const liveApi = useLiveAPI();
+  const offline = liveApi == null;
   const [heartbeatDefaultPrompt, setHeartbeatDefaultPrompt] = useState("");
   const [heartbeatDefaultPromptLoaded, setHeartbeatDefaultPromptLoaded] = useState(false);
   const [heartbeatDefaultPromptLoadedOk, setHeartbeatDefaultPromptLoadedOk] = useState(false);
@@ -108,7 +136,8 @@ export function HeartbeatSection() {
   }, [api]);
 
   const handleHeartbeatDefaultPromptBlur = useCallback(() => {
-    if (!heartbeatDefaultPromptLoaded || !api?.config?.updateHeartbeatDefaultPrompt) {
+    if (!heartbeatDefaultPromptLoaded || !liveApi?.config?.updateHeartbeatDefaultPrompt) {
+      forgetOfflineEdit(offline, heartbeatDefaultPromptEditedSinceLoadRef);
       return;
     }
 
@@ -116,6 +145,7 @@ export function HeartbeatSection() {
     if (!heartbeatDefaultPromptLoadedOk && !heartbeatDefaultPromptEditedSinceLoadRef.current) {
       return;
     }
+    const nonce = heartbeatDefaultPromptLoadNonceRef.current;
 
     setHeartbeatDefaultPrompt(trimmedDefaultPrompt);
 
@@ -124,7 +154,7 @@ export function HeartbeatSection() {
         // Best-effort only.
       })
       .then(() =>
-        api.config.updateHeartbeatDefaultPrompt({
+        liveApi.config.updateHeartbeatDefaultPrompt({
           defaultPrompt: trimmedDefaultPrompt || null,
         })
       )
@@ -132,19 +162,40 @@ export function HeartbeatSection() {
         setHeartbeatDefaultPromptLoadedOk(true);
         heartbeatDefaultPromptEditedSinceLoadRef.current = false;
       })
-      .catch(() => {
+      .catch((error: unknown) => {
         // Best-effort persistence.
+        forgetLostEdit(
+          error,
+          nonce,
+          heartbeatDefaultPromptLoadNonceRef,
+          heartbeatDefaultPromptEditedSinceLoadRef
+        );
       });
-  }, [api, heartbeatDefaultPrompt, heartbeatDefaultPromptLoaded, heartbeatDefaultPromptLoadedOk]);
+  }, [
+    liveApi,
+    offline,
+    heartbeatDefaultPrompt,
+    heartbeatDefaultPromptLoaded,
+    heartbeatDefaultPromptLoadedOk,
+  ]);
 
   const handleHeartbeatDefaultIntervalBlur = useCallback(() => {
-    if (!heartbeatDefaultIntervalLoaded || !api?.config?.updateHeartbeatDefaultIntervalMs) {
+    if (!heartbeatDefaultIntervalLoaded || !liveApi?.config?.updateHeartbeatDefaultIntervalMs) {
+      forgetOfflineEdit(offline, heartbeatDefaultIntervalEditedSinceLoadRef);
       return;
     }
 
     if (!heartbeatDefaultIntervalLoadedOk && !heartbeatDefaultIntervalEditedSinceLoadRef.current) {
       return;
     }
+    const nonce = heartbeatDefaultIntervalLoadNonceRef.current;
+    const onSaveError = (error: unknown) =>
+      forgetLostEdit(
+        error,
+        nonce,
+        heartbeatDefaultIntervalLoadNonceRef,
+        heartbeatDefaultIntervalEditedSinceLoadRef
+      );
 
     const parsedMinutes = parseIntervalMinutes(draftIntervalMinutes);
 
@@ -157,14 +208,13 @@ export function HeartbeatSection() {
           .catch(() => {
             /* Best-effort. */
           })
-          .then(() => api.config.updateHeartbeatDefaultIntervalMs({ intervalMs: null }))
+          .then(() => liveApi.config.updateHeartbeatDefaultIntervalMs({ intervalMs: null }))
           .then(() => {
             setHeartbeatDefaultIntervalLoadedOk(true);
             heartbeatDefaultIntervalEditedSinceLoadRef.current = false;
           })
-          .catch(() => {
-            /* Best-effort. */
-          });
+          // Best-effort.
+          .catch(onSaveError);
       return;
     }
 
@@ -179,7 +229,7 @@ export function HeartbeatSection() {
         // Best-effort only.
       })
       .then(() =>
-        api.config.updateHeartbeatDefaultIntervalMs({
+        liveApi.config.updateHeartbeatDefaultIntervalMs({
           intervalMs: intervalMinutesToMs(clampedMinutes),
         })
       )
@@ -187,10 +237,15 @@ export function HeartbeatSection() {
         setHeartbeatDefaultIntervalLoadedOk(true);
         heartbeatDefaultIntervalEditedSinceLoadRef.current = false;
       })
-      .catch(() => {
-        // Best-effort persistence.
-      });
-  }, [api, draftIntervalMinutes, heartbeatDefaultIntervalLoaded, heartbeatDefaultIntervalLoadedOk]);
+      // Best-effort persistence.
+      .catch(onSaveError);
+  }, [
+    liveApi,
+    offline,
+    draftIntervalMinutes,
+    heartbeatDefaultIntervalLoaded,
+    heartbeatDefaultIntervalLoadedOk,
+  ]);
 
   return (
     <div className="flex flex-col gap-6">
@@ -237,6 +292,7 @@ export function HeartbeatSection() {
                 setDraftIntervalMinutes(event.target.value);
               }}
               onBlur={handleHeartbeatDefaultIntervalBlur}
+              disabled={offline}
               className="border-border-medium bg-background-secondary h-9 w-24 text-right"
               aria-label="Default heartbeat threshold in minutes"
             />
@@ -263,6 +319,7 @@ export function HeartbeatSection() {
             setHeartbeatDefaultPrompt(event.target.value);
           }}
           onBlur={handleHeartbeatDefaultPromptBlur}
+          disabled={offline}
           className="border-border-medium bg-background-secondary text-foreground focus:border-accent focus:ring-accent mt-3 min-h-[120px] w-full resize-y rounded-md border p-3 text-sm leading-relaxed focus:ring-1 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
           placeholder={HEARTBEAT_DEFAULT_MESSAGE_BODY}
           aria-label="Default heartbeat prompt"

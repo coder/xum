@@ -110,6 +110,23 @@ describe.each([...GAP_MODES])("SecretsSection across a reconnect (%s)", (mode) =
     expect(view.queryByDisplayValue("EDITED_KEY")).not.toBeNull();
     expect(view.queryByDisplayValue("SERVER_KEY")).toBeNull();
   });
+
+  // Offline the edited rows stay, but a Save could not reach the server: it must be disabled.
+  test("disables Save for an edited row while offline", async () => {
+    const view = renderSecrets();
+    const keyField = await waitFor(() => view.getByDisplayValue("OLD_KEY"));
+    typeInto(keyField, "EDITED_KEY");
+    const save = view.getByRole("button", { name: "Save" }) as HTMLButtonElement;
+    await waitFor(() => expect(save.disabled).toBe(false));
+
+    await harness.drop();
+    await settle();
+    expect(view.queryByDisplayValue("EDITED_KEY")).not.toBeNull();
+    expect(save.disabled).toBe(true);
+
+    harness.reconnect();
+    await waitFor(() => expect(save.disabled).toBe(false));
+  });
 });
 
 // The Secrets and MCP sections offer the global secret keys as {secret:"KEY"} references.

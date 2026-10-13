@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import { Input } from "@/browser/components/Input/Input";
@@ -53,6 +53,9 @@ import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { FALLBACK_AGENTS, deriveTasksSectionAgentGroups } from "./TasksSection.agents";
 
 const INHERIT = "__inherit__";
+/** Shown while an autosave waits for the connection. */
+const OFFLINE_SAVE_MESSAGE =
+  "Not connected to the Xum server. Your changes save after it reconnects.";
 
 // Agents whose requests run outside the send path (raw streamText: Dream in
 // memoryConsolidation, Name Workspace in workspaceTitleGenerator) and never
@@ -390,6 +393,13 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
 
 export function TasksSection() {
   const { api } = useAPI();
+  // The autosave sends only through a live client. Offline it keeps the change pending and says
+  // so: the reload after the reconnect keeps a pending change, and the autosave sends it then.
+  const liveApi = useLiveAPI();
+  const liveApiRef = useRef(liveApi);
+  useEffect(() => {
+    liveApiRef.current = liveApi;
+  }, [liveApi]);
   const { selectedWorkspace } = useWorkspaceContext();
 
   const selectedWorkspaceRef = useRef(selectedWorkspace);
@@ -522,7 +532,6 @@ export function TasksSection() {
   }, [api, selectedWorkspace?.projectPath, selectedWorkspace?.workspaceId]);
 
   useEffect(() => {
-    if (!api) return;
     if (!loaded) return;
     if (loadFailed) return;
 
@@ -544,6 +553,14 @@ export function TasksSection() {
       return;
     }
 
+    if (!liveApi) {
+      // Offline: the change stays pending (the reload after the reconnect keeps it) and the
+      // autosave sends it once this effect runs with the new client.
+      clearSaveTimer(saveTimerRef);
+      setSaveError(OFFLINE_SAVE_MESSAGE);
+      return;
+    }
+
     // Readers of the shared store see the edit before the debounced save lands.
     getAppConfigStore().updateOptimistically({ agentAiDefaults });
 
@@ -552,14 +569,17 @@ export function TasksSection() {
     saveTimerRef.current = setTimeout(() => {
       const flush = () => {
         if (savingRef.current) return;
-        if (!api) return;
+        // The live client now, not this effect's: a retry after a lost connection must not take
+        // the pending change while offline (it would fail again and lose it).
+        const client = liveApiRef.current;
+        if (!client) return;
 
         const payload = pendingSaveRef.current;
         if (!payload) return;
 
         pendingSaveRef.current = null;
         savingRef.current = true;
-        void api.config
+        void client.config
           .saveConfig(payload)
           .then(() => {
             const previousAgentDefaults = lastSyncedAgentAiDefaultsRef.current;
@@ -585,8 +605,8 @@ export function TasksSection() {
               // while the user tweaks values.
               setAgentsLoadFailed(false);
               void Promise.all([
-                api.agents.list({ projectPath, workspaceId }),
-                api.agents.list({ projectPath, workspaceId, includeDisabled: true }),
+                client.agents.list({ projectPath, workspaceId }),
+                client.agents.list({ projectPath, workspaceId, includeDisabled: true }),
               ])
                 .then(([enabled, all]) => {
                   setAgents(all);
@@ -617,7 +637,7 @@ export function TasksSection() {
     return () => {
       clearSaveTimer(saveTimerRef);
     };
-  }, [api, agentAiDefaults, loaded, loadFailed, taskSettings]);
+  }, [liveApi, agentAiDefaults, loaded, loadFailed, taskSettings]);
 
   // Flush any pending debounced save on unmount so changes aren't lost.
   useEffect(() => {

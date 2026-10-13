@@ -270,6 +270,34 @@ describe("PortableDesktopExperimentWarning", () => {
       });
       expect(view.container.textContent).toContain("Portable Desktop is currently disabled");
     });
+
+    // Offline the kept warning's buttons could not reach the server: they must be disabled.
+    test("disables the warning's buttons while offline", async () => {
+      const harness = createConnectionHarness(
+        mode,
+        (): TestApiOverrides<APIClient> => ({
+          desktop: {
+            getPrereqStatus: () =>
+              Promise.resolve({ available: false as const, reason: "binary_not_found" as const }),
+          },
+        })
+      );
+      const view = render(
+        <harness.Wrapper>
+          <PortableDesktopExperimentWarning />
+        </harness.Wrapper>
+      );
+      const restart = (await view.findByRole("button", {
+        name: "Restart Xum",
+      })) as HTMLButtonElement;
+      const checkAgain = view.getByRole("button", { name: "Check again" }) as HTMLButtonElement;
+      await waitFor(() => expect(restart.disabled).toBe(false));
+
+      await harness.drop();
+      expect(view.container.textContent).toContain("Portable Desktop is currently disabled");
+      expect(restart.disabled).toBe(true);
+      expect(checkAgain.disabled).toBe(true);
+    });
   });
 
   test("loads prereq status on mount and shows the missing-binary warning when needed", async () => {

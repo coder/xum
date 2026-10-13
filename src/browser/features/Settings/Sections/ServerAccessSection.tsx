@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { Button } from "@/browser/components/Button/Button";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import type { ServerAuthSession } from "@/common/orpc/types";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -36,7 +36,7 @@ function formatRelativeTime(timestampMs: number): string {
 
 function SessionRow(props: {
   session: ServerAuthSession;
-  loading: boolean;
+  disabled: boolean;
   revoking: boolean;
   onRevoke: () => void;
 }) {
@@ -58,7 +58,7 @@ function SessionRow(props: {
         variant={session.isCurrent ? "destructive" : "ghost"}
         size="sm"
         onClick={props.onRevoke}
-        disabled={props.loading || props.revoking}
+        disabled={props.disabled || props.revoking}
       >
         {props.revoking ? "Revoking..." : session.isCurrent ? "Log out" : "Revoke"}
       </Button>
@@ -68,6 +68,9 @@ function SessionRow(props: {
 
 export function ServerAccessSection() {
   const { api, retry } = useAPI();
+  // Offline, the kept sessions stay on screen, but every action is disabled: it could not reach
+  // the server, and a click must not look like it did something.
+  const offline = useLiveAPI() == null;
   const [sessions, setSessions] = useState<ServerAuthSession[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -172,7 +175,7 @@ export function ServerAccessSection() {
           variant="secondary"
           size="sm"
           onClick={() => void refreshSessions()}
-          disabled={loading}
+          disabled={loading || offline}
         >
           Refresh
         </Button>
@@ -182,7 +185,7 @@ export function ServerAccessSection() {
           onClick={() => {
             void handleRevokeOthers();
           }}
-          disabled={loading || revokingOthers || !canRevokeOtherSessions}
+          disabled={loading || offline || revokingOthers || !canRevokeOtherSessions}
         >
           {revokingOthers ? "Revoking..." : "Revoke other sessions"}
         </Button>
@@ -201,7 +204,7 @@ export function ServerAccessSection() {
             <SessionRow
               key={session.id}
               session={session}
-              loading={loading}
+              disabled={loading || offline}
               revoking={revokingSessionId === session.id}
               onRevoke={() => {
                 void handleRevokeSession(session);

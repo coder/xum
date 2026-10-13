@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Loader2, Trash2 } from "lucide-react";
 import type { ProjectConfig } from "@/common/types/project";
 import type { Secret } from "@/common/types/secrets";
-import { useAPI, type APIClient } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI, type APIClient } from "@/browser/contexts/API";
 import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useSettings } from "@/browser/contexts/SettingsContext";
@@ -151,6 +151,8 @@ export function useGlobalSecretKeys(api: APIClient | null) {
 
 export const SecretsSection: React.FC = () => {
   const { api } = useAPI();
+  // Offline, edited rows stay on screen, but Save is disabled: it could not reach the server.
+  const offline = useLiveAPI() == null;
   const { userProjects } = useProjectContext();
   const { secretsProjectPath, setSecretsProjectPath } = useSettings();
   const projectList = getTopLevelProjectEntries(userProjects).map(([projectPath]) => projectPath);
@@ -794,7 +796,11 @@ export const SecretsSection: React.FC = () => {
         <Button variant="secondary" type="button" onClick={handleReset} disabled={actionsDisabled}>
           Reset
         </Button>
-        <Button type="button" onClick={() => void handleSave()} disabled={actionsDisabled}>
+        <Button
+          type="button"
+          onClick={() => void handleSave()}
+          disabled={actionsDisabled || offline}
+        >
           {saving ? "Saving..." : "Save"}
         </Button>
       </div>

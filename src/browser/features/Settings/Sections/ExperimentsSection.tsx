@@ -22,7 +22,7 @@ import {
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import type { ApiServerStatus, DesktopPrereqStatus } from "@/common/orpc/types";
 import { Input } from "@/browser/components/Input/Input";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { ArtifactsExperimentConfig } from "./ArtifactsExperimentConfig";
@@ -97,6 +97,36 @@ function ExperimentRow(props: ExperimentRowProps) {
 
 function isPortableDesktopBinaryMissing(status: DesktopPrereqStatus | null): boolean {
   return !status?.available && status?.reason === "binary_not_found";
+}
+
+/** The warning's buttons. Offline they are disabled: they could not reach the server. */
+function PortableDesktopWarningActions(props: {
+  loading: boolean;
+  restarting: boolean;
+  onCheckAgain: () => void;
+  onRestart: () => void;
+}) {
+  const offline = useLiveAPI() == null;
+  return (
+    <div className="flex flex-wrap gap-2">
+      <Button
+        variant="outline"
+        size="xs"
+        onClick={props.onCheckAgain}
+        disabled={props.restarting || offline}
+      >
+        {props.loading ? "Checking…" : "Check again"}
+      </Button>
+      <Button
+        variant="outline"
+        size="xs"
+        onClick={props.onRestart}
+        disabled={props.loading || props.restarting || offline}
+      >
+        {props.restarting ? "Restarting…" : "Restart Xum"}
+      </Button>
+    </div>
+  );
 }
 
 export function PortableDesktopExperimentWarning() {
@@ -207,28 +237,17 @@ export function PortableDesktopExperimentWarning() {
             to enable this feature. If you installed it into a location that xum can already see,
             choose Check again. If you changed PATH after xum launched, restart xum to pick it up.
           </div>
-          <div className="flex flex-wrap gap-2">
-            <Button
-              variant="outline"
-              size="xs"
-              onClick={() => {
-                void loadPrereqStatus();
-              }}
-              disabled={restarting}
-            >
-              {loading ? "Checking…" : "Check again"}
-            </Button>
-            <Button
-              variant="outline"
-              size="xs"
-              onClick={() => {
-                void handleRestart();
-              }}
-              disabled={loading || restarting}
-            >
-              {restarting ? "Restarting…" : "Restart Xum"}
-            </Button>
-          </div>
+          {/* Offline the kept warning stays, but its buttons are disabled. */}
+          <PortableDesktopWarningActions
+            loading={loading}
+            restarting={restarting}
+            onCheckAgain={() => {
+              void loadPrereqStatus();
+            }}
+            onRestart={() => {
+              void handleRestart();
+            }}
+          />
           {error && <div className="text-[11px]">{error}</div>}
         </div>
       </div>

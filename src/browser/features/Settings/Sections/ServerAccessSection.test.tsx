@@ -65,6 +65,26 @@ describe.each([...GAP_MODES])("ServerAccessSection across a reconnect (%s)", (mo
     await view.findByText("Phone");
     await waitFor(() => expect(view.queryByText("Laptop")).toBeNull());
   });
+
+  // A revoke offline cannot reach the server: the kept rows must not offer it.
+  test("disables the session actions while offline", async () => {
+    const view = render(
+      <harness.Wrapper>
+        <ServerAccessSection />
+      </harness.Wrapper>
+    );
+    const revoke = (await view.findByRole("button", { name: "Revoke" })) as HTMLButtonElement;
+    const refresh = view.getByRole("button", { name: "Refresh" }) as HTMLButtonElement;
+    expect(revoke.disabled).toBe(false);
+
+    await harness.drop();
+    expect(view.queryByText("Laptop")).not.toBeNull();
+    expect(revoke.disabled).toBe(true);
+    expect(refresh.disabled).toBe(true);
+
+    harness.reconnect();
+    await waitFor(() => expect(revoke.disabled).toBe(false));
+  });
 });
 
 // A server cancel on a live socket is a plain AbortError. It is a real failure: no reconnect
