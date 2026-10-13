@@ -33,6 +33,13 @@ const LOOPBACK_ADDRESSES = new Set(["127.0.0.1", "127.0.0.2", "::1"]);
 const PROXY_ENV = ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "ALL_PROXY"];
 const PROXY_ENV_ALL = [...PROXY_ENV, "all_proxy", "NO_PROXY", "no_proxy", "CURL_HOME"];
 const hasCurl = Bun.which("curl") != null;
+// Probed at load, because it.skipIf needs the answer before the suite runs (#5990): a host
+// without ::1 shows the IPv6 case as skipped, and CI fails it instead of losing coverage.
+const hasIpv6Loopback = await new Promise<boolean>((resolve) => {
+  const probe = net.createServer();
+  probe.once("error", () => resolve(false));
+  probe.listen(0, "::1", () => probe.close(() => resolve(true)));
+});
 
 interface Hit {
   host: string | undefined;
@@ -129,7 +136,7 @@ describe.skipIf(!hasCurl)("web_fetch pins the validated address (real curl)", ()
 
   beforeAll(async () => {
     v4 = await startHttpFixture("127.0.0.1");
-    v6 = await startHttpFixture("::1").catch(() => null); // hosts without IPv6 skip that case
+    v6 = hasIpv6Loopback ? await startHttpFixture("::1").catch(() => null) : null;
   });
   afterAll(async () => {
     for (const fixture of [v4, v6]) {
@@ -194,13 +201,16 @@ describe.skipIf(!hasCurl)("web_fetch pins the validated address (real curl)", ()
     expect(await fetchUrl(`http://rebind.test.:${v4.port}/`)).toMatchObject({ success: true });
   });
 
-  it("connects to a validated IPv6 address", async () => {
-    if (v6 == null) return console.warn("skipped: no IPv6 loopback on this host");
-    dns = { "rebind6.test": ["::1"] };
-    const result = await fetchUrl(`http://rebind6.test:${v6.port}/`);
-    expect(result).toMatchObject({ success: true, content: "pinned ok" });
-    expect(v6.hits).toEqual([{ host: `rebind6.test:${v6.port}`, path: "/" }]);
-  });
+  it.skipIf(!hasIpv6Loopback && process.env.CI !== "true")(
+    "connects to a validated IPv6 address",
+    async () => {
+      if (v6 == null) throw new Error("no IPv6 loopback (::1) fixture: IPv6 pinning is untested");
+      dns = { "rebind6.test": ["::1"] };
+      const result = await fetchUrl(`http://rebind6.test:${v6.port}/`);
+      expect(result).toMatchObject({ success: true, content: "pinned ok" });
+      expect(v6.hits).toEqual([{ host: `rebind6.test:${v6.port}`, path: "/" }]);
+    }
+  );
 
   it("validates and pins each redirect hop, and still blocks a private redirect", async () => {
     dns = {
@@ -342,6 +352,7 @@ describe("web_fetch curl version probe", () => {
       ["XUM_CURL_ROUTE=93.184.216.34;0", true],
       ["XUM_CURL_ROUTE=10.9.9.9;1", true], // through a proxy: remote_ip is the proxy
       ["XUM_CURL_ROUTE=10.9.9.9;0", false], // direct to another address
+      ["XUM_CURL_ROUTE=;0", false], // direct, with a response but no reported address (#5990)
       ["", false], // missing route line with a response
       ["XUM_CURL_ROUTE=garbage", false],
     ];
@@ -351,6 +362,20 @@ describe("web_fetch curl version probe", () => {
       expect({ stderr, success: result.success }).toEqual({ stderr, success: allowed });
       expect(env.calls.fetches[0]).toContain("%{proxy_used}");
     }
+  });
+
+  it("on curl 8.7+, reports a failed connection as the curl error, not a wrong route", async () => {
+    // curl that never connected reports an empty address and no response (#5990).
+    using env = setup(version("8.7.1"), () => ({
+      stdout: "",
+      stderr: "curl: (7) Failed to connect\nXUM_CURL_ROUTE=;0",
+      exitCode: 7,
+      duration: 1,
+    }));
+    expect(await env.run()).toEqual({
+      success: false,
+      error: "Failed to fetch URL: Failed to connect",
+    });
   });
 
   it("on curl before 8.7, pins without the route check", async () => {
