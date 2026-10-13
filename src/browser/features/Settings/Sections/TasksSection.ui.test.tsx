@@ -1014,7 +1014,9 @@ describe.each([...GAP_MODES])("TasksSection across a reconnect (%s)", (mode) => 
   });
 
   function connect(maxParallelAgentTasks: number, agents: Promise<AgentDefinitionDescriptor[]>) {
-    const saveConfig = mock(() => Promise.resolve(undefined));
+    const saveConfig = mock((_payload: { taskSettings: { maxParallelAgentTasks: number } }) =>
+      Promise.resolve(undefined)
+    );
     apiMock = {
       config: {
         getConfig: mock(() =>
@@ -1085,9 +1087,6 @@ describe.each([...GAP_MODES])("TasksSection across a reconnect (%s)", (mode) => 
 
     expect(maxParallelInput(view).value).toBe("7");
     await waitFor(() => expect(saveConfig).toHaveBeenCalled(), { timeout: 2_000 });
-    const payload = saveConfig.mock.calls.at(-1)?.[0] as unknown as {
-      taskSettings: { maxParallelAgentTasks: number };
-    };
-    expect(payload.taskSettings.maxParallelAgentTasks).toBe(7);
+    expect(saveConfig.mock.calls.at(-1)?.[0].taskSettings.maxParallelAgentTasks).toBe(7);
   });
 });
