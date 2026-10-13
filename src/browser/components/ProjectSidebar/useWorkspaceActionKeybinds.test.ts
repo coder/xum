@@ -10,15 +10,23 @@ import { useWorkspaceActionKeybinds } from "./useWorkspaceActionKeybinds";
 // Fork workspace (Ctrl+Alt+Shift+B) and Stop container (Ctrl+Alt+Shift+X) act on the selected
 // workspace, and only where its menu would offer them (#6328).
 
-const repoWorkspace = {
-  id: "ws-1",
-  runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
-} as FrontendWorkspaceMetadata;
-const devcontainerWorkspace = {
-  id: "ws-1",
+function workspace(overrides: Partial<FrontendWorkspaceMetadata>): FrontendWorkspaceMetadata {
+  const metadata: FrontendWorkspaceMetadata = {
+    id: "ws-1",
+    name: "ws-1",
+    projectName: "demo",
+    projectPath: "/projects/demo",
+    namedWorkspacePath: "/projects/demo/ws-1",
+    runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
+    ...overrides,
+  };
+  return metadata;
+}
+const repoWorkspace = workspace({});
+const devcontainerWorkspace = workspace({
   runtimeConfig: { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" },
-} as FrontendWorkspaceMetadata;
-const scratchWorkspace = { id: "ws-1", kind: "scratch" } as FrontendWorkspaceMetadata;
+});
+const scratchWorkspace = workspace({ kind: "scratch" });
 
 function press(key: "B" | "X", target: EventTarget = document.body) {
   const event = new window.KeyboardEvent("keydown", {
