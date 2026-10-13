@@ -10,10 +10,13 @@ import type { TerminalSessionRouter } from "./TerminalSessionRouter";
 
 /** One entry per connect: the attach calls that connection's server saw. */
 let attachesPerConnection: number[] = [];
+/** One entry per connect: the sizes that connection's server got. */
+let resizesPerConnection: Array<Array<{ cols: number; rows: number }>> = [];
 
 function serverOverrides() {
   const index = attachesPerConnection.length;
   attachesPerConnection.push(0);
+  resizesPerConnection.push([]);
   return {
     terminal: {
       attach: () => {
@@ -33,7 +36,10 @@ function serverOverrides() {
             yield 0;
           })()
         ),
-      resize: () => Promise.resolve(),
+      resize: (input: { cols: number; rows: number }) => {
+        resizesPerConnection[index]?.push({ cols: input.cols, rows: input.rows });
+        return Promise.resolve();
+      },
     },
   };
 }
@@ -64,6 +70,7 @@ describe.each([...GAP_MODES])("TerminalRouterProvider across a reconnect (%s)", 
   beforeEach(() => {
     cleanupDom = installDom();
     attachesPerConnection = [];
+    resizesPerConnection = [];
     routers = [];
     subscribes = 0;
     screens = [];
@@ -87,7 +94,11 @@ describe.each([...GAP_MODES])("TerminalRouterProvider across a reconnect (%s)", 
     expect(router).not.toBeNull();
 
     await harness.drop();
+    // A resize in the gap goes to no client, and to the PTY once the next client attaches.
+    await router?.resize("t1", 100, 30);
+    expect(resizesPerConnection[0]).toEqual([]);
     harness.reconnect();
+    await waitFor(() => expect(resizesPerConnection[1]).toEqual([{ cols: 100, rows: 30 }]));
     await waitFor(() => expect(attachesPerConnection).toEqual([1, 1]));
     await waitFor(() => expect(screens.at(-1)).toEqual({ state: "screen-1", replace: true }));
 

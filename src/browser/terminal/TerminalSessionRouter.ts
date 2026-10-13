@@ -357,15 +357,17 @@ export class TerminalSessionRouter {
 
     console.debug(`[TerminalRouter] Starting stream for session ${sessionId}`);
     const size = this.sizes.get(sessionId);
-    if (size != null) {
-      // The PTY may have missed a resize while the connection was down.
-      api.terminal
-        .resize({ sessionId, ...size })
-        .catch((err: unknown) =>
-          console.debug(`[TerminalRouter] Resize after reattach failed:`, err)
-        );
-    }
-    void this.runAttachStream(api, sessionId, session, signal, isCurrent);
+    // The PTY may have missed a resize while the connection was down. attach waits for it: its
+    // first message is the server's screen, which must already have the new size (PTY first).
+    const resized =
+      size == null
+        ? Promise.resolve()
+        : api.terminal
+            .resize({ sessionId, ...size })
+            .catch((err: unknown) =>
+              console.debug(`[TerminalRouter] Resize after reattach failed:`, err)
+            );
+    void this.runAttachStream(api, sessionId, session, signal, isCurrent, resized);
     void this.runExitStream(api, sessionId, session, signal, isCurrent);
   }
 
@@ -374,8 +376,11 @@ export class TerminalSessionRouter {
     sessionId: string,
     session: SessionState,
     signal: AbortSignal,
-    isCurrent: () => boolean
+    isCurrent: () => boolean,
+    resized: Promise<void>
   ): Promise<void> {
+    await resized;
+    if (!isCurrent()) return;
     try {
       const iterator = await api.terminal.attach(
         this.popout ? { sessionId, popout: true } : { sessionId },

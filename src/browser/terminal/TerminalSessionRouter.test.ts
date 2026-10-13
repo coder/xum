@@ -12,6 +12,8 @@ function fakeServer(name: string) {
   const resizes: Array<{ cols: number; rows: number }> = [];
   let releaseAttach: (() => void) | null = null;
   let holdAttach = false;
+  let heldResize: { resolve: () => void; reject: (error: Error) => void } | null = null;
+  let holdResize = false;
 
   function stream<T>(register: (push: (value: T) => void) => void, signal?: AbortSignal) {
     const queue: T[] = [];
@@ -52,7 +54,8 @@ function fakeServer(name: string) {
       },
       resize: (input: { cols: number; rows: number }) => {
         resizes.push({ cols: input.cols, rows: input.rows });
-        return Promise.resolve();
+        if (!holdResize) return Promise.resolve();
+        return new Promise<void>((resolve, reject) => (heldResize = { resolve, reject }));
       },
     },
   });
@@ -69,6 +72,14 @@ function fakeServer(name: string) {
     releaseAttach() {
       holdAttach = false;
       releaseAttach?.();
+    },
+    holdNextResize() {
+      holdResize = true;
+    },
+    settleResize(error?: Error) {
+      holdResize = false;
+      if (error == null) heldResize?.resolve();
+      else heldResize?.reject(error);
     },
   };
 }
@@ -155,6 +166,29 @@ describe("TerminalSessionRouter across reconnects", () => {
     router.sendInput("t1", "typed");
     await settle();
     expect(second.inputs).toEqual(["typed"]);
+  });
+
+  // attach's first message is the server's screen: taken before the resize, it has the old width.
+  test.each([
+    ["succeeds", undefined],
+    ["fails", new Error("resize failed")],
+  ])("after a reconnect, attach waits until the replayed resize %s", async (_, error) => {
+    const first = fakeServer("first");
+    const router = new TerminalSessionRouter(first.client);
+    router.subscribe("t1", recorder().callbacks);
+    await settle();
+    router.setClient(null);
+    await router.resize("t1", 120, 40);
+
+    const second = fakeServer("second");
+    second.holdNextResize();
+    router.setClient(second.client);
+    await settle();
+    expect(second.resizes).toEqual([{ cols: 120, rows: 40 }]);
+    expect(second.attaches).toHaveLength(0);
+    second.settleResize(error);
+    await settle();
+    expect(second.attaches).toHaveLength(1);
   });
 
   test("an exited session is not restarted", async () => {

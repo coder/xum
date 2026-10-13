@@ -6,7 +6,7 @@
  */
 
 import { createContext, useContext, useEffect, useState } from "react";
-import { useAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
 import { TerminalSessionRouter } from "./TerminalSessionRouter";
 
 const TerminalRouterContext = createContext<TerminalSessionRouter | null>(null);
@@ -27,7 +27,8 @@ interface TerminalRouterProviderProps {
  * Always renders children so the app UI stays visible during reconnection.
  */
 export function TerminalRouterProvider(props: TerminalRouterProviderProps) {
-  const { api } = useAPI();
+  // Only the live client: a reconnecting state can keep the old one, and calls on it fail.
+  const api = useLiveAPI();
   const [router, setRouter] = useState<TerminalSessionRouter | null>(null);
   const popout = props.popout === true;
 
