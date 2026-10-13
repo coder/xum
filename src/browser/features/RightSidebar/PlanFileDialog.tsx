@@ -9,7 +9,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/browser/components/Dialog/Dialog";
-import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { getErrorMessage } from "@/common/utils/errors";
 
 interface PlanFileDialogProps {
@@ -33,7 +33,7 @@ export const PlanFileDialog: React.FC<PlanFileDialogProps> = (props) => (
 type PlanRead =
   | { status: "ok"; content: string; path: string }
   | { status: "error"; error: string }
-  /** Cut off by a lost connection (an abort): not a plan error. */
+  /** Cut off by a lost connection (ConnectionLostError): not a plan error. */
   | { status: "lost" };
 
 async function readPlan(api: APIClient, workspaceId: string): Promise<PlanRead> {
@@ -45,7 +45,7 @@ async function readPlan(api: APIClient, workspaceId: string): Promise<PlanRead> 
     assert(result.data.path.length > 0, "Plan path should be non-empty");
     return { status: "ok", content: result.data.content, path: result.data.path };
   } catch (error: unknown) {
-    return isAbortError(error)
+    return isConnectionLostError(error)
       ? { status: "lost" }
       : { status: "error", error: getErrorMessage(error) };
   }

@@ -14,7 +14,7 @@ import { ErrorBox, LoadingDots } from "./Shared/ToolPrimitives";
 import { MessageRenderer } from "@/browser/features/Messages/MessageRenderer";
 import { ModelDisplay } from "@/browser/features/Messages/ModelDisplay";
 import { BashCollapsedSummaryModeProvider } from "./BashCollapsedSummaryModeContext";
-import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { getErrorMessage } from "@/common/utils/errors";
 
 interface SubagentTranscriptDialogProps {
@@ -139,7 +139,7 @@ const SubagentTranscriptViewer: React.FC<{
       } catch (err: unknown) {
         // A lost connection (or this effect's own cleanup) is not a transcript error: keep what
         // is shown for the next client.
-        if (cancelled || isAbortError(err)) return;
+        if (cancelled || isConnectionLostError(err)) return;
         setIsLoading(false);
         setError(getErrorMessage(err));
       }

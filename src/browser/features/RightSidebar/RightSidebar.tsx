@@ -39,7 +39,7 @@ import type { GoalCreateIntent } from "@/browser/features/RightSidebar/GoalTab";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
-import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { getErrorMessage } from "@/common/utils/errors";
 import { showFeedbackToast } from "@/browser/utils/feedbackToast";
 import { openSideChat } from "@/browser/utils/chatCommands";
@@ -884,7 +884,7 @@ export function useLlmDebugLogsEnabled(api: APIClient | null): boolean | null {
       })
       .catch((error: unknown) => {
         // A lost connection says nothing about the setting: keep the Debug tab for the next client.
-        if (cancelled || isAbortError(error)) {
+        if (cancelled || isConnectionLostError(error)) {
           return;
         }
 
@@ -944,7 +944,7 @@ export function useDesktopAvailable(
       })
       .catch((error: unknown) => {
         // A lost connection is not a missing capability: keep the Desktop tab for the next client.
-        if (!cancelled && !isAbortError(error)) {
+        if (!cancelled && !isConnectionLostError(error)) {
           setDesktopAvailable(false);
         }
       });

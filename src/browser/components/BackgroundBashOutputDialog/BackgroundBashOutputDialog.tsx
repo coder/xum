@@ -4,7 +4,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "../Dialog/Dial
 import { DetailContent } from "@/browser/features/Tools/Shared/ToolPrimitives";
 import { useAPI } from "@/browser/contexts/API";
 import { useBackgroundProcesses } from "@/browser/stores/BackgroundBashStore";
-import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import {
   appendLiveBashOutputChunk,
   type LiveBashOutputInternal,
@@ -142,10 +142,12 @@ const BackgroundBashOutputViewer: React.FC<{ workspaceId: string; processId: str
     };
 
     // A rejected read stops polling with the error shown instead of escaping as an unhandled
-    // rejection; reopening the dialog starts a fresh read. A lost connection (an abort) shows no
-    // error and keeps the output: the next client polls again.
+    // rejection; reopening the dialog starts a fresh read. Only a lost connection
+    // (ConnectionLostError) shows no error and keeps the output: the next client polls again. A
+    // server cancel on a live socket is a plain AbortError, and no new client would ever re-run
+    // this poll, so it shows its error.
     run().catch((err: unknown) => {
-      if (cancelled || isAbortError(err)) return;
+      if (cancelled || isConnectionLostError(err)) return;
       setIsLoading(false);
       setError(getErrorMessage(err));
     });

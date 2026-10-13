@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { Input } from "@/browser/components/Input/Input";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
-import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { GoalDefaultsControls } from "@/browser/features/Settings/Sections/GoalsSection";
 import { cn } from "@/common/lib/utils";
 import type { WorkspaceGoalDefaultsOverride } from "@/browser/utils/goals/resolveGoalSetIntent";
@@ -122,7 +122,7 @@ class GoalOverrideWriter {
         .catch((error: unknown) => {
           // Other errors are swallowed (the optimistic edit already updated local state), as
           // in the global panel. A newer edit replaces a lost one.
-          if (isAbortError(error) && this.latest === edit.override) {
+          if (isConnectionLostError(error) && this.latest === edit.override) {
             this.unsent = edit;
           }
         })
@@ -186,7 +186,7 @@ function useWorkspaceGoalOverride(workspaceId: string, onPersist: (() => void) |
       .catch((error: unknown) => {
         // A lost connection keeps what is shown for the next client. Another failure enables
         // the controls on what is shown (the empty override on a first read), as before.
-        if (cancelled || isAbortError(error)) return;
+        if (cancelled || isConnectionLostError(error)) return;
         setIsLoading(false);
         loadedWorkspaceIdRef.current = workspaceId;
       });

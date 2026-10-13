@@ -6,7 +6,7 @@ import { useSettings } from "@/browser/contexts/SettingsContext";
 import { Button } from "@/browser/components/Button/Button";
 import { getMCPServersKey } from "@/common/constants/storage";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 
 interface ProjectMCPOverviewProps {
   projectPath: string;
@@ -63,7 +63,7 @@ export const ProjectMCPOverview: React.FC<ProjectMCPOverviewProps> = (props) => 
       .catch((err) => {
         // A lost connection is not a load error: keep the shown servers (and the spinner) for
         // the next client, which loads them again.
-        if (cancelled || isAbortError(err)) return;
+        if (cancelled || isConnectionLostError(err)) return;
         setShown({ projectPath, servers: {} });
         setError(err instanceof Error ? err.message : "Failed to load MCP servers");
         setLoading(false);

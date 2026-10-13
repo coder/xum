@@ -1,7 +1,7 @@
 import { useCallback, useContext, useEffect, useState } from "react";
 
 import { APIContext, type APIClient } from "@/browser/contexts/API";
-import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import type { GoalBoardSnapshot } from "@/common/types/goal";
 
 /**
@@ -34,7 +34,7 @@ async function readGoalBoard(
   try {
     return (await api.workspace.getGoalBoard({ workspaceId })) ?? EMPTY_BOARD;
   } catch (error) {
-    return isAbortError(error) ? null : EMPTY_BOARD;
+    return isConnectionLostError(error) ? null : EMPTY_BOARD;
   }
 }
 

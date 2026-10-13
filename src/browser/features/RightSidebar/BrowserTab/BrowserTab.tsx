@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent }
 import { Check, ChevronDown, Globe2, Loader2, Play, TriangleAlert } from "lucide-react";
 import { useAPI } from "@/browser/contexts/API";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
-import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { getBrowserSelectedSessionKey } from "@/common/constants/storage";
 import { cn } from "@/common/lib/utils";
@@ -221,7 +221,7 @@ export function BrowserTab(props: BrowserTabProps) {
         );
       } catch (error) {
         // A lost connection is not a discovery failure; the next client re-lists the sessions.
-        if (cancelled || isAbortError(error)) {
+        if (cancelled || isConnectionLostError(error)) {
           return;
         }
 
@@ -303,7 +303,7 @@ export function BrowserTab(props: BrowserTabProps) {
         );
         setPageTabsError(null);
       } catch (error) {
-        if (cancelled || isAbortError(error)) {
+        if (cancelled || isConnectionLostError(error)) {
           return;
         }
 

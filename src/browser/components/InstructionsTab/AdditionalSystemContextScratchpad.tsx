@@ -15,7 +15,7 @@ import {
   useAdditionalSystemContextSnapshot,
 } from "@/browser/utils/additionalSystemContextStore";
 import { focusInstructionsTab } from "@/browser/utils/instructionsTabFocus";
-import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { cn } from "@/common/lib/utils";
 import { getErrorMessage } from "@/common/utils/errors";
 
@@ -109,7 +109,7 @@ function useChatInstructionsSave(api: APIClient | null, setError: (error: string
         onError: (err) => {
           if (!mountedRef.current) return;
           // A lost connection is not a save error: the next client gets the edit.
-          if (isAbortError(err)) {
+          if (isConnectionLostError(err)) {
             unsentWorkspaceIdRef.current = workspaceId;
             return;
           }
@@ -184,7 +184,7 @@ export function useChatInstructions(workspaceId: string): ScratchpadState {
       })
       .catch((err) => {
         // A lost connection is not a load error: keep the editor as it is for the next client.
-        if (cancelled || isAbortError(err)) return;
+        if (cancelled || isConnectionLostError(err)) return;
         setError(getErrorMessage(err));
         setLoading(false);
         loadedWorkspaceIdRef.current = workspaceId;
