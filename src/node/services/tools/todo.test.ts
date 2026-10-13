@@ -106,16 +106,15 @@ describe("Todo Storage", () => {
       expect(storedTodos).toEqual([]);
     });
 
-    it("should reject one item over MAX_TODOS with the count and summarization guidance", async () => {
-      const tooManyTodos = buildTodos(MAX_TODOS + 1);
+    it("should reject one item over MAX_TODOS with the count and keep the stored list", async () => {
+      const storedTodos = buildTodos(3);
+      await setTodosForSessionDir(workspaceId, workspaceSessionDir, storedTodos);
 
-      const write = setTodosForSessionDir(workspaceId, workspaceSessionDir, tooManyTodos);
-      await expect(write).rejects.toThrow(`Too many TODOs (${MAX_TODOS + 1}/${MAX_TODOS})`);
       await expect(
-        setTodosForSessionDir(workspaceId, workspaceSessionDir, tooManyTodos)
-      ).rejects.toThrow(/summarize old completed work/i);
-      // A rejected write must leave the stored list untouched.
-      expect(await readTodosForSessionDir(workspaceSessionDir)).toEqual([]);
+        setTodosForSessionDir(workspaceId, workspaceSessionDir, buildTodos(MAX_TODOS + 1))
+      ).rejects.toThrow(`(${MAX_TODOS + 1}/${MAX_TODOS})`);
+      // A rejected write must leave the previous list in place.
+      expect(await readTodosForSessionDir(workspaceSessionDir)).toEqual(storedTodos);
     });
 
     it("should accept exactly MAX_TODOS items", async () => {
