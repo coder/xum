@@ -773,6 +773,7 @@ async function main(): Promise<number> {
         projectPath: projectDir,
         branchName,
         trunkBranch,
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         workspacePath: createResult.workspacePath!,
         initLogger,
         env: createEnv,
@@ -798,6 +799,7 @@ async function main(): Promise<number> {
     }
 
     // Docker maps to /src in-container; SSH returns the remote checkout path.
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     workspacePath = createResult.workspacePath!;
   }
 

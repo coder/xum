@@ -1850,6 +1850,62 @@ describe("ArtifactsPanel", () => {
     await waitFor(() => expect(document.activeElement).toBe(dialog));
   });
 
+  // E.g. a phone rotated back to portrait after the full-screen sidebar closed: the sidebar
+  // hides again with the panel still pinned, and the app behind it must not stay inert.
+  test("fullscreen ends once the panel is hidden, and the rest of the page works again", async () => {
+    // Observers of the panel: the ones that see it change size.
+    const callbacks: Array<() => void> = [];
+    const OriginalResizeObserver = globalThis.ResizeObserver;
+    globalThis.ResizeObserver = class {
+      private readonly callback: ResizeObserverCallback;
+      constructor(callback: ResizeObserverCallback) {
+        this.callback = callback;
+      }
+      observe(target: Element) {
+        if (target.getAttribute("data-testid") === "artifacts-panel") {
+          callbacks.push(() => this.callback([], this as unknown as ResizeObserver));
+        }
+      }
+      unobserve() {
+        // The test drives the callbacks by hand.
+      }
+      disconnect() {
+        // Nothing to stop: no real observation runs.
+      }
+    } as unknown as typeof ResizeObserver;
+    try {
+      fake = createFakeArtifactsApi(
+        {
+          available: true,
+          dir: "/scratch/artifacts",
+          entries: [entry("a.txt", 1, "text")],
+          truncated: false,
+        },
+        { "a.txt": textFile("a.txt", "text", "alpha") }
+      );
+      const outside = document.body.appendChild(document.createElement("button"));
+      const view = renderPanel();
+      const panel = view.getByTestId("artifacts-panel");
+      expect(await view.findByText("alpha")).toBeTruthy();
+      fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+      expect(view.getByRole("dialog", { name: "Artifact a.txt" })).toBeTruthy();
+      expect(outside.inert).toBe(true);
+
+      // Still shown: a resize alone keeps fullscreen.
+      act(() => callbacks.forEach((callback) => callback()));
+      expect(view.queryByRole("dialog", { name: "Artifact a.txt" })).toBeTruthy();
+
+      // A hidden ancestor leaves the panel with no box.
+      panel.getClientRects = () => [] as unknown as DOMRectList;
+      act(() => callbacks.forEach((callback) => callback()));
+      expect(view.queryByRole("dialog", { name: "Artifact a.txt" })).toBeNull();
+      expect(outside.inert).toBe(false);
+      outside.remove();
+    } finally {
+      globalThis.ResizeObserver = OriginalResizeObserver;
+    }
+  });
+
   test("the fullscreen dialog shows its focus ring while shortcuts focus it", async () => {
     fake = createFakeArtifactsApi(
       {
@@ -1885,7 +1941,7 @@ describe("ArtifactsPanel", () => {
     expect(dialog.getAttribute("data-shortcut-focus")).toBe("true");
   });
 
-  // A narrow window mounts ArtifactsDialog while the CSS-hidden sidebar panel stays mounted.
+  // Every mounted panel reads the same view choices.
   test("two mounted panels share annotate mode, JSON mode and tree expansion", async () => {
     const workspaceId = "ws-two-panels";
     fake = createFakeArtifactsApi(

@@ -30,6 +30,7 @@ const GOOGLE = ids("GEMINI_31_PRO", "GEMINI_FLASH");
 const XAI = ids("GROK_47");
 const DEEPSEEK = ids("DEEPSEEK_V4_PRO", "DEEPSEEK_V4_FLASH");
 const MOONSHOT = ids("KIMI_K3");
+const META = ids("MUSE_WONDER");
 const ZAI = ids("GLM_53_FLASH");
 const ALL_BUILT_INS = [
   ...ANTHROPIC,
@@ -38,6 +39,7 @@ const ALL_BUILT_INS = [
   ...XAI,
   ...DEEPSEEK,
   ...MOONSHOT,
+  ...META,
   ...ZAI,
 ];
 const OPENROUTER_ROUTABLE_BUILT_INS = [
@@ -75,6 +77,12 @@ function select(overrides: Partial<SelectableModelsInput>): string[] {
 }
 
 describe("computeSelectableModels", () => {
+  test("makes Muse Wonder selectable only when Meta is configured and enabled", () => {
+    expect(select({ providersConfig: { meta: provider() } })).toEqual(META);
+    expect(select({ providersConfig: { meta: provider({ isConfigured: false }) } })).toEqual([]);
+    expect(select({ providersConfig: { meta: provider({ isEnabled: false }) } })).toEqual([]);
+  });
+
   test("fixture lists cover the built-in catalog in picker order", () => {
     expect(ALL_BUILT_INS).toEqual(BUILT_IN_MODELS);
   });

@@ -8,8 +8,8 @@ import {
 } from "@/browser/utils/ui/keybinds";
 
 /**
- * Close an overlay (the narrow-screen sidebar drawer) on Escape, but only when nothing else
- * claimed the key.
+ * Close an overlay (the narrow-screen sidebar drawer, the full-screen right sidebar) on Escape,
+ * but only when nothing else claimed the key.
  *
  * The overlay does not own focus, so Escape usually arrives from somewhere else, often the
  * composer. A capture-phase listener took Escape from every popover, menu, dialog and edit mode
@@ -23,17 +23,28 @@ import {
  * while an overlay is open: one Escape never does both. When no overlay is open, no listener
  * exists and Escape behaves exactly as it does without this hook.
  *
- * Only one overlay uses this hook. Before a second one does, decide which of them answers
- * Escape: listeners run in registration order, not in visual order.
+ * Two overlays use this hook: the narrow-screen sidebar drawer and the full-screen right sidebar
+ * (WorkspaceShell). Both can be open at once (the New tab shortcut opens the full-screen sidebar
+ * over an open drawer, Ctrl+P opens the drawer under it). Listeners run in registration order,
+ * not in visual order, so each overlay passes its `layer` and only the open overlay with the
+ * highest layer answers Escape: one Escape closes the overlay the user sees. Ties go to the one
+ * opened last.
  */
-let openOverlayCount = 0;
+const openOverlays: Array<{ layer: number }> = [];
 
 /** True while an overlay that closes on Escape is open (see useEscapeToDismiss). */
 export function isEscapeDismissOverlayOpen(): boolean {
-  return openOverlayCount > 0;
+  return openOverlays.length > 0;
 }
 
-export function useEscapeToDismiss(enabled: boolean, onDismiss: () => void): void {
+function isTopOverlay(overlay: { layer: number }): boolean {
+  // The last entry wins ties, because it opened last.
+  const top = openOverlays.reduce((best, entry) => (entry.layer >= best.layer ? entry : best));
+  return top === overlay;
+}
+
+/** `layer`: the overlay's stacking order (higher is drawn above lower). */
+export function useEscapeToDismiss(enabled: boolean, onDismiss: () => void, layer = 0): void {
   // A ref keeps one subscription per open overlay. Re-subscribing on every render would move this
   // listener behind later window listeners and change which one sees Escape first.
   const onDismissRef = useRef(onDismiss);
@@ -43,6 +54,7 @@ export function useEscapeToDismiss(enabled: boolean, onDismiss: () => void): voi
 
   useEffect(() => {
     if (!enabled) return;
+    const overlay = { layer };
 
     const handleKeyDown = (e: KeyboardEvent) => {
       // KEYBINDS.CANCEL is bare Escape: modified Escape belongs to other shortcuts.
@@ -53,16 +65,18 @@ export function useEscapeToDismiss(enabled: boolean, onDismiss: () => void): voi
       if (isTerminalFocused(e.target) || isDesktopViewportFocused(e.target)) return;
       // A modal above the overlay closes first.
       if (isDialogOpen()) return;
+      // Another overlay is drawn above this one: it answers.
+      if (!isTopOverlay(overlay)) return;
 
       e.preventDefault();
       onDismissRef.current();
     };
 
-    openOverlayCount += 1;
+    openOverlays.push(overlay);
     window.addEventListener("keydown", handleKeyDown);
     return () => {
-      openOverlayCount -= 1;
+      openOverlays.splice(openOverlays.indexOf(overlay), 1);
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [enabled]);
+  }, [enabled, layer]);
 }
