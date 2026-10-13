@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import { Err, Ok } from "@/common/types/result";
 import { parseAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
@@ -221,6 +222,45 @@ describe("TaskService tagged-chat messaging", () => {
     expect(await taskService.sendAgentTreeMessage("alpha", "beta", "do not deliver")).toEqual(
       Err({ code: "invalid_scope" })
     );
+  });
+
+  test("tagged checkout failures stay opaque to the untrusted sender", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const srcBaseDir = path.join(rootDir, "src");
+    const worktree = { type: "worktree", srcBaseDir } as const;
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "wt-a", "wt-a", {
+          runtimeConfig: worktree,
+          messagingTag: "research",
+        }),
+        projectWorkspace(projectPath, "wt-b", "wt-b", {
+          runtimeConfig: worktree,
+          messagingTag: "research",
+          projects: [
+            { projectPath: path.join(rootDir, "repo-a"), projectName: "repo-a" },
+            { projectPath: path.join(rootDir, "repo-b"), projectName: "repo-b" },
+          ],
+        }),
+      ],
+      testTaskSettings()
+    );
+    // Only one of the target's two constituent checkouts exists.
+    await fsPromises.mkdir(path.join(srcBaseDir, "repo-a", "wt-b", ".git"), { recursive: true });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const result = await taskService.sendAgentTreeMessage("wt-a", "wt-b", "are you there?");
+    // Cross-tree senders never learn the target's local checkout path.
+    expect(result).toEqual(
+      Err({
+        code: "refused",
+        reason: "The target workspace's checkout is unavailable, so it cannot receive messages.",
+      })
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
   });
 
   test("archived tagged chats disappear from discovery and refuse delivery", async () => {

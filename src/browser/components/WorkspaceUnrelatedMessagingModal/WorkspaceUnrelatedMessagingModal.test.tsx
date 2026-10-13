@@ -73,6 +73,7 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
         onSetEnabled={onSetEnabled}
         holdUntilTurnEnd={false}
         onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
+        tagSupported={true}
         messagingTag={undefined}
         onSetMessagingTag={() => Promise.resolve(Ok(undefined))}
       />
@@ -108,6 +109,7 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
         onSetEnabled={onSetEnabled}
         holdUntilTurnEnd={false}
         onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
+        tagSupported={true}
         messagingTag={undefined}
         onSetMessagingTag={() => Promise.resolve(Ok(undefined))}
       />
@@ -135,6 +137,7 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
         onSetEnabled={onSetEnabled}
         holdUntilTurnEnd={false}
         onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
+        tagSupported={true}
         messagingTag={undefined}
         onSetMessagingTag={() => Promise.resolve(Ok(undefined))}
       />
@@ -168,6 +171,7 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
         onSetEnabled={onSetEnabled}
         holdUntilTurnEnd={false}
         onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
+        tagSupported={true}
         messagingTag={undefined}
         onSetMessagingTag={() => Promise.resolve(Ok(undefined))}
       />
@@ -206,6 +210,7 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
         onSetEnabled={() => Promise.resolve(Ok(undefined))}
         holdUntilTurnEnd={false}
         onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
+        tagSupported={true}
         messagingTag={messagingTag}
         onSetMessagingTag={onSetMessagingTag}
       />
@@ -243,6 +248,7 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
         onSetEnabled={() => Promise.resolve(Ok(undefined))}
         holdUntilTurnEnd={false}
         onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
+        tagSupported={true}
         messagingTag={"research"}
         onSetMessagingTag={onSetMessagingTag}
       />
@@ -271,6 +277,7 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
         onSetEnabled={() => Promise.resolve(Ok(undefined))}
         holdUntilTurnEnd={false}
         onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
+        tagSupported={true}
         messagingTag={"research"}
         onSetMessagingTag={onSetMessagingTag}
       />
@@ -287,6 +294,66 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
     expect(input().disabled).toBe(false);
   });
 
+  test("hides the tag editor for non-root chats", () => {
+    const view = render(
+      <WorkspaceUnrelatedMessagingModal
+        open={true}
+        onOpenChange={() => undefined}
+        consentSupported={true}
+        enabled={false}
+        onSetEnabled={() => Promise.resolve(Ok(undefined))}
+        holdUntilTurnEnd={false}
+        onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
+        tagSupported={false}
+        messagingTag={undefined}
+        onSetMessagingTag={() => Promise.resolve(Ok(undefined))}
+      />
+    );
+    expect(view.queryByLabelText(/messaging tag/i)).toBeNull();
+  });
+
+  test("a save published before its ack does not clobber the new tag text", async () => {
+    let resolveSave: ((result: Result<void, string>) => void) | undefined;
+    const onSetMessagingTag = mock(
+      (_tag: string | null) =>
+        new Promise<Result<void, string>>((resolve) => {
+          resolveSave = resolve;
+        })
+    );
+    const renderModal = (messagingTag: string | undefined) => (
+      <WorkspaceUnrelatedMessagingModal
+        open={true}
+        onOpenChange={() => undefined}
+        consentSupported={true}
+        enabled={false}
+        onSetEnabled={() => Promise.resolve(Ok(undefined))}
+        holdUntilTurnEnd={false}
+        onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
+        tagSupported={true}
+        messagingTag={messagingTag}
+        onSetMessagingTag={onSetMessagingTag}
+      />
+    );
+    const view = render(renderModal("research"));
+    const input = () => view.getByLabelText(/messaging tag/i) as HTMLInputElement;
+    const user = userEvent.setup({ document: view.container.ownerDocument });
+    await user.click(input());
+    await user.clear(input());
+    await user.type(input(), "@deep-dive");
+    fireEvent.blur(input());
+    await waitFor(() => {
+      expect(onSetMessagingTag).toHaveBeenCalledTimes(1);
+    });
+    // The backend publishes before it acks: the new metadata remounts the input
+    // while this save is still in flight. Resolving must not write the old text back.
+    view.rerender(renderModal("deep-dive"));
+    resolveSave?.(Ok(undefined));
+    await waitFor(() => {
+      expect(input().disabled).toBe(false);
+    });
+    expect(input().value).toBe("@deep-dive");
+  });
+
   test("renders nothing while closed", () => {
     const view = render(
       <WorkspaceUnrelatedMessagingModal
@@ -297,6 +364,7 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
         onSetEnabled={() => Promise.resolve(Ok(undefined))}
         holdUntilTurnEnd={false}
         onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
+        tagSupported={true}
         messagingTag={undefined}
         onSetMessagingTag={() => Promise.resolve(Ok(undefined))}
       />
@@ -318,6 +386,7 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
         onSetEnabled={() => Promise.resolve(Ok(undefined))}
         holdUntilTurnEnd={hold}
         onSetHoldUntilTurnEnd={onSetHoldUntilTurnEnd}
+        tagSupported={true}
         messagingTag={undefined}
         onSetMessagingTag={() => Promise.resolve(Ok(undefined))}
       />
@@ -352,6 +421,7 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
         onSetEnabled={() => Promise.resolve(Ok(undefined))}
         holdUntilTurnEnd={false}
         onSetHoldUntilTurnEnd={() => pending.promise}
+        tagSupported={true}
         messagingTag={undefined}
         onSetMessagingTag={() => Promise.resolve(Ok(undefined))}
       />

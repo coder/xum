@@ -283,7 +283,14 @@ import { formatSendMessageError } from "@/node/services/utils/sendMessageError";
 import {
   AgentPeerMessageBroker,
   type AgentPeerMessageAdmissionError,
+  type PeerPathRelation,
 } from "@/node/services/agentPeerMessageBroker";
+
+/** Cross-tree senders are untrusted: their refusal reasons carry no path/runtime detail. */
+const OPAQUE_CHECKOUT_RELATIONS: ReadonlySet<PeerPathRelation> = new Set([
+  "target_unrelated",
+  "target_tagged",
+]);
 import { taskQueueDebug } from "@/node/services/taskQueueDebug";
 import {
   readSubagentGitPatchArtifact,
@@ -10745,10 +10752,9 @@ export class TaskService implements AgentTaskIntegration {
       if (checkoutError != null) {
         return Err({
           code: "refused" as const,
-          reason:
-            relation === "target_unrelated"
-              ? "The target workspace's checkout is unavailable, so it cannot receive messages."
-              : `The target workspace's checkout is unavailable (${checkoutError}), so it cannot receive messages.`,
+          reason: OPAQUE_CHECKOUT_RELATIONS.has(relation)
+            ? "The target workspace's checkout is unavailable, so it cannot receive messages."
+            : `The target workspace's checkout is unavailable (${checkoutError}), so it cannot receive messages.`,
         });
       }
 
