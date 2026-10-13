@@ -191,6 +191,23 @@ describe("TerminalSessionRouter across reconnects", () => {
     expect(second.attaches).toHaveLength(1);
   });
 
+  test("a resize that fails is not sent again after a reconnect", async () => {
+    const first = fakeServer("first");
+    const router = new TerminalSessionRouter(first.client);
+    router.subscribe("t1", recorder().callbacks);
+    await settle();
+    await router.resize("t1", 100, 30);
+    first.holdNextResize();
+    const failed = router.resize("t1", 120, 40).catch((error: unknown) => error);
+    first.settleResize(new Error("connection lost"));
+    expect(await failed).toEqual(new Error("connection lost"));
+
+    const second = fakeServer("second");
+    router.setClient(second.client);
+    await settle();
+    expect(second.resizes).toEqual([{ cols: 100, rows: 30 }]);
+  });
+
   test("an exited session is not restarted", async () => {
     const first = fakeServer("first");
     const router = new TerminalSessionRouter(first.client);
