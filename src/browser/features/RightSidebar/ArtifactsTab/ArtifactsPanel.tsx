@@ -667,7 +667,20 @@ export function ArtifactsPanel(props: {
     // J/K and Escape missed the panel (Escape could even reach Escape-to-interrupt). Do the same.
     // Watch all of <body>, not just the panel: a portaled menu outside it can take focus away
     // too, and watching only the panel restored focus at its next change (#5715).
+    // Not while focus is moving: Tab blurs one control before it focuses the next, and in between
+    // focus sits on <body>. The blurred button's tooltip closes then (a mutation), and taking
+    // focus back there cancelled the move, so Tab never got past a button with a tooltip (#6200).
+    let movingTo: EventTarget | null = null;
+    const onFocusOut = (event: FocusEvent) => {
+      movingTo = event.relatedTarget;
+    };
+    const onFocusIn = () => {
+      movingTo = null;
+    };
+    document.addEventListener("focusout", onFocusOut, true);
+    document.addEventListener("focusin", onFocusIn, true);
     const observer = new MutationObserver(() => {
+      if (movingTo instanceof Node && movingTo.isConnected) return;
       if (document.activeElement == null || document.activeElement === document.body) {
         panel.focus();
       }
@@ -686,6 +699,8 @@ export function ArtifactsPanel(props: {
     return () => {
       sizeObserver.disconnect();
       observer.disconnect();
+      document.removeEventListener("focusout", onFocusOut, true);
+      document.removeEventListener("focusin", onFocusIn, true);
       restore();
       // Back to the opener when it is still a control of this panel, else to the panel, so J/K
       // keep working without another click: keys from the panel's controls bubble to it. Not to
