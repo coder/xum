@@ -94,6 +94,37 @@ A skill is a directory named after the skill:
 
 Skill directory names must match `^[a-z0-9]+(?:-[a-z0-9]+)*$` (1–64 chars).
 
+## Bundled files and the skill directory
+
+A skill can ship scripts and other files next to `SKILL.md`. The skill does not need to know where it is installed: Xum tells the agent.
+
+- The `agent_skill_read` result includes `skillDir`, the absolute path of the skill's directory. Plugin skills also get `pluginRoot`, the absolute path of the plugin. Both paths are valid where the workspace's `bash` runs, so the agent can run a bundled script or pass the path to a sub-agent.
+- Xum replaces these placeholders in the skill body. They use the same names as Claude Code, so skills written for Claude Code work unchanged:
+  - `${CLAUDE_SKILL_DIR}`: the skill's directory.
+  - `${CLAUDE_PLUGIN_ROOT}`: the plugin's directory. Xum replaces it only in plugin skills.
+
+Xum replaces the placeholders when the agent loads a skill with `agent_skill_read` and when you invoke it (`/{skill-name}` or `$skill-name`). For invoked skills, the order is: [arguments](#skill-arguments), then placeholders, then [dynamic context](#dynamic-context-injection-experiment). A directive such as `` !`sh ${CLAUDE_SKILL_DIR}/scripts/status.sh` `` therefore runs the bundled script.
+
+```md
+---
+name: release-notes
+description: Draft release notes from merged PRs
+---
+
+Run `sh ${CLAUDE_SKILL_DIR}/scripts/collect.sh` and summarize its output.
+```
+
+Xum reports a directory only when the path is valid where `bash` runs. Otherwise `skillDir` is absent and `skillDirUnavailable` tells the agent why. The agent can still read every bundled file with `agent_skill_read_file`.
+
+| Skill                                              | Local and worktree workspaces | SSH and Docker workspaces                         | Devcontainer workspaces |
+| -------------------------------------------------- | ----------------------------- | ------------------------------------------------- | ----------------------- |
+| Project skills                                     | Path                          | Path (on the remote)                              | No path                 |
+| Global and universal skills                        | Path                          | Docker: path. SSH: no path (read on the Xum host) | No path                 |
+| Plugin skills (read on the Xum host)               | Path                          | No path                                           | No path                 |
+| Built-in skills (bundled in the app, no directory) | No path                       | No path                                           | No path                 |
+
+When there is no directory, the placeholders stay as literal text. Xum does not expand `${PLUGIN_ROOT}` in skill bodies: Agent Plugins defines it only for [MCP server](/config/mcp-servers#agent-plugins-servers) configuration.
+
 ## `SKILL.md` format
 
 `SKILL.md` must start with YAML frontmatter delimited by `---` on its own line.
@@ -248,7 +279,7 @@ Substitution rules:
 - Placeholders are substituted everywhere in the body, including code blocks.
 - Only a single digit is consumed: `$10` means `$1` followed by a literal `0`.
 - If the body contains no placeholders, nothing changes: the arguments simply remain visible in your message (for example “Using skill deploy: 123”).
-- Substitution applies only to slash invocations. Inline `$skill-name` references and model-initiated `agent_skill_read` loads receive the raw body.
+- Substitution applies only to slash invocations. Inline `$skill-name` references and model-initiated `agent_skill_read` loads receive the body without argument substitution (Xum still replaces the [skill directory placeholders](#bundled-files-and-the-skill-directory)).
 
 Use the `argument-hint` frontmatter field to document the expected arguments in invocation UIs.
 
@@ -276,7 +307,7 @@ Rules and limits:
 - Directives must occupy the whole line; mid-line `` !`...` `` is ignored.
 - Directives run after [argument substitution](#skill-arguments), so `` !`git log $1` `` sees resolved arguments.
 - Commands run sequentially in the workspace directory, with a 10-second timeout and a 16KB output cap per command, and at most 10 directives per skill. A failing command injects its output plus an `[exit code N]` note instead of aborting the invocation.
-- Directives run only when **you** invoke a skill (`/{skill-name}` or a `$skill-name` reference). Skills the model loads via `agent_skill_read` always receive the raw body — the model cannot trigger command execution this way.
+- Directives run only when **you** invoke a skill (`/{skill-name}` or a `$skill-name` reference). Skills the model loads via `agent_skill_read` never run directives — the model cannot trigger command execution this way.
 - Enabling the experiment requires flipping the toggle in Settings yourself; remote experiment rollout can never switch it on.
 
 <Warning>

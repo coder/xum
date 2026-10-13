@@ -8,6 +8,10 @@ import { SkillNameSchema } from "@/common/orpc/schemas";
 import { getErrorMessage } from "@/common/utils/errors";
 import { readAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
+import {
+  resolveSkillDirectory,
+  substituteSkillDirectoryPlaceholders,
+} from "@/node/services/agentSkills/skillDirectory";
 
 /** Single-line skill description for the index, cut with an ellipsis past the cap. */
 function formatSkillIndexDescription(description: string): string {
@@ -100,9 +104,22 @@ export const createAgentSkillReadTool: ToolFactory = (config: ToolConfiguration)
             includeClaudeSkills,
           }
         );
+        // Skills that ship scripts locate themselves through skillDir (or the
+        // ${CLAUDE_SKILL_DIR} placeholder) instead of a hard-coded install path.
+        // Judged against config.runtime: that is where the model's bash runs.
+        const dir = resolveSkillDirectory(resolved, config.runtime);
         return {
           success: true,
-          skill: resolved.package,
+          skill: {
+            ...resolved.package,
+            body: substituteSkillDirectoryPlaceholders(resolved.package.body, dir),
+          },
+          ...(dir.available
+            ? {
+                skillDir: dir.skillDir,
+                ...(dir.pluginRoot != null ? { pluginRoot: dir.pluginRoot } : {}),
+              }
+            : { skillDirUnavailable: dir.reason }),
         };
       } catch (error) {
         return {

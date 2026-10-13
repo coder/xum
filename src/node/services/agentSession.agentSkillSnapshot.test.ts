@@ -894,6 +894,37 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     expect(getMessageText(messages[0])).toContain("```text (output of: echo hi)\nhi\n```");
   });
 
+  it("runs a bundled script through ${CLAUDE_SKILL_DIR} in a dynamic context directive", async () => {
+    const { workspacePath } = await createTestWorkspaceWithSkill({
+      skillName: "bundled",
+      skillBody: "!`sh ${CLAUDE_SKILL_DIR}/scripts/hello.sh`",
+    });
+    const skillDir = path.join(workspacePath, ".mux", "skills", "bundled");
+    await fs.mkdir(path.join(skillDir, "scripts"), { recursive: true });
+    await fs.writeFile(path.join(skillDir, "scripts", "hello.sh"), "echo bundled-ok\n", "utf-8");
+    const { session, messages } = await createSessionHarness({
+      workspacePath,
+      aiServiceOverrides: {
+        isExperimentEnabled: mock((id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT),
+      },
+    });
+
+    const result = await session.sendMessage("use bundled", {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+      muxMetadata: {
+        type: "agent-skill",
+        rawCommand: "/bundled",
+        skillName: "bundled",
+        scope: "project",
+      },
+    });
+
+    expect(result.success).toBe(true);
+    // The directive ran the skill's own script, located without an install path.
+    expect(getMessageText(messages[0])).toContain("\nbundled-ok\n```");
+  });
+
   it("injects dynamic context for inline skill refs (also user-initiated)", async () => {
     const { workspacePath } = await createTestWorkspaceWithSkill({
       skillName: "dyn",

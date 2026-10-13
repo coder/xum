@@ -315,6 +315,10 @@ import {
 } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import { substituteSkillArguments } from "@/node/services/agentSkills/skillArguments";
 import {
+  resolveSkillDirectory,
+  substituteSkillDirectoryPlaceholders,
+} from "@/node/services/agentSkills/skillDirectory";
+import {
   injectSkillDynamicContext,
   SKILL_DYNAMIC_COMMAND_TIMEOUT_MS,
   SKILL_DYNAMIC_OUTPUT_CAP_BYTES,
@@ -12877,10 +12881,17 @@ export class AgentSession {
         muxMetadata.skillName === ref.skillName
           ? (muxMetadata.arguments ?? "")
           : null;
-      const substitutedBody =
+      const argumentBody =
         slashArgumentText != null
           ? substituteSkillArguments(skill.body, slashArgumentText).body
           : skill.body;
+      // ${CLAUDE_SKILL_DIR}/${CLAUDE_PLUGIN_ROOT} next: after arguments (Claude Code's
+      // order), before dynamic context so !`sh ${CLAUDE_SKILL_DIR}/x.sh` runs the
+      // bundled script. `runtime` is where bash and directives run.
+      const substitutedBody = substituteSkillDirectoryPlaceholders(
+        argumentBody,
+        resolveSkillDirectory(resolved, runtime)
+      );
 
       // Dynamic context injection (default-off experiment): replace whole-line
       // !`command` directives with their output. Ordering matters: it runs after
@@ -12889,7 +12900,7 @@ export class AgentSession {
       // (different command outputs naturally produce distinct snapshots). Every
       // ref in this materialization path is user-initiated (slash "/skill" or
       // inline "$skill"); the model-side agent_skill_read tool takes a separate
-      // path and always sees the raw body.
+      // path and never runs directives (it only substitutes skill directories).
       const body = await this.maybeInjectSkillDynamicContext({
         skillName: skill.frontmatter.name,
         body: substitutedBody,
