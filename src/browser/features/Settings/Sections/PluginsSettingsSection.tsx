@@ -3,6 +3,7 @@ import {
   ArrowDownToLine,
   ArrowLeft,
   CircleAlert,
+  ExternalLink,
   Loader2,
   Plus,
   RefreshCw,
@@ -17,6 +18,7 @@ import { cn } from "@/common/lib/utils";
 import type {
   AgentPluginComponents,
   AgentPluginInstallPreview,
+  AgentPluginInterfaceSummary,
   AgentPluginListItem,
   AgentPluginUpdateCheck,
   AgentPluginUpdateReview,
@@ -54,11 +56,14 @@ function formatSource(item: AgentPluginListItem): string | null {
 
 const Badge: React.FC<{
   tone: "muted" | "accent" | "warning" | "error";
+  /** Manifest text (up to 120 chars) must wrap on narrow cards; status words stay on one line. */
+  wrap?: boolean;
   children: React.ReactNode;
 }> = (props) => (
   <span
     className={cn(
-      "rounded px-1.5 py-0.5 text-[10px] font-medium whitespace-nowrap",
+      "rounded px-1.5 py-0.5 text-[10px] font-medium",
+      props.wrap === true ? "max-w-full wrap-anywhere" : "whitespace-nowrap",
       props.tone === "muted" && "bg-foreground/10 text-muted",
       props.tone === "accent" && "bg-accent/15 text-accent",
       props.tone === "warning" && "bg-warning/15 text-warning",
@@ -68,6 +73,60 @@ const Badge: React.FC<{
     {props.children}
   </span>
 );
+
+/**
+ * OpenAI `interface` metadata. Every manifest string renders as React text
+ * (escaped, no HTML or markdown). The logo is a backend-read data URL, links
+ * are https only and open externally (the desktop main process routes
+ * _blank navigations through shell.openExternal).
+ */
+const PluginInterfaceDetails: React.FC<{ info: AgentPluginInterfaceSummary }> = (props) => {
+  const links: Array<{ label: string; url: string | undefined }> = [
+    { label: "Website", url: props.info.websiteURL },
+    { label: "Privacy", url: props.info.privacyPolicyURL },
+    { label: "Terms", url: props.info.termsOfServiceURL },
+    { label: "Support", url: props.info.supportURL },
+  ];
+  const httpsLinks = links.filter((link) => link.url?.startsWith("https://") === true);
+  return (
+    <div className="mt-1 flex min-w-0 items-start gap-2" data-testid="plugin-interface">
+      {props.info.logoDataUrl?.startsWith("data:image/") && (
+        <img src={props.info.logoDataUrl} alt="" className="size-8 shrink-0 rounded" />
+      )}
+      <div className="min-w-0 space-y-0.5">
+        <p className="text-foreground text-xs break-words">
+          <span className="font-medium">{props.info.displayName}</span>
+          <span className="text-muted"> · by {props.info.developerName}</span>
+        </p>
+        <p className="text-muted text-xs break-words">{props.info.shortDescription}</p>
+        {props.info.capabilities !== undefined && props.info.capabilities.length > 0 && (
+          <div className="flex flex-wrap gap-1">
+            {props.info.capabilities.map((capability) => (
+              <Badge key={capability} tone="muted" wrap>
+                {capability}
+              </Badge>
+            ))}
+          </div>
+        )}
+        {httpsLinks.length > 0 && (
+          <div className="flex flex-wrap gap-x-3 text-[11px]">
+            {httpsLinks.map(({ label, url }) => (
+              <a
+                key={label}
+                href={url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-link inline-flex items-center gap-1"
+              >
+                {label} <ExternalLink aria-hidden className="size-3" />
+              </a>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
 
 /** Only skills/MCP are selective; keep full-package consent below this shared chooser. */
 const ComponentChooser: React.FC<{
@@ -545,6 +604,9 @@ const AddPluginPanel: React.FC<{
             </div>
             {preview.manifest.description && (
               <p className="text-muted text-xs">{preview.manifest.description}</p>
+            )}
+            {preview.manifest.interface && (
+              <PluginInterfaceDetails info={preview.manifest.interface} />
             )}
             {/* break-all: URLs and a 64-char separator-free plugin dir name
                 have no natural break points and would overflow the card on
@@ -1150,6 +1212,7 @@ export const PluginsSettingsSection: React.FC = () => {
                       {item.description && (
                         <p className="text-muted mt-0.5 text-xs">{item.description}</p>
                       )}
+                      {item.interface && <PluginInterfaceDetails info={item.interface} />}
                       {/* break-all: locations/sources can contain unbreakable
                           64-char tokens (max-length plugin names) that would
                           otherwise overflow the card at phone widths. */}
