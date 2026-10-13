@@ -1,8 +1,16 @@
 // Bootstrap Happy DOM before react-dom evaluates (see MemoryTab.test.tsx).
 import "../../../../../tests/ui/dom";
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import {
+  act,
+  cleanup,
+  configure,
+  fireEvent,
+  getConfig,
+  render,
+  waitFor,
+} from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import type { APIClient } from "@/browser/contexts/API";
@@ -222,8 +230,14 @@ function postFromFrame(frame: HTMLIFrameElement, data: unknown) {
 // Every case runs with the provider of today (null-gap) and after the switch (kept-gap).
 describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", (mode) => {
   let cleanupDom: (() => void) | null = null;
+  let asyncUtilTimeout = 0;
 
   beforeEach(() => {
+    // The first render in a busy test process can take over findBy's 1 s default to show the
+    // frame (8 parallel copies of this file: 4 of 144 runs). The waits are for the right state,
+    // so only their budget grows. The one timed state (Send arming) keeps its own budget.
+    asyncUtilTimeout = getConfig().asyncUtilTimeout;
+    configure({ asyncUtilTimeout: 3000 });
     harness = createConnectionHarness(mode, serverOverrides);
     cleanupDom = installDom();
     window.localStorage.clear();
@@ -246,6 +260,7 @@ describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", 
     cleanup();
     cleanupDom?.();
     cleanupDom = null;
+    configure({ asyncUtilTimeout });
   });
 
   test("an interactive artifact keeps its frame, and states set while offline are saved", async () => {
@@ -290,30 +305,42 @@ describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", 
   });
 
   test("failed refreshes after a reconnect keep the artifact on screen", async () => {
-    persistedState = { step: 1 };
-    const view = render(<ArtifactsPanel workspaceId="ws-r" />, { wrapper: ConnectionWrapper });
-    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
-    await flush();
-    const srcdoc = frame.getAttribute("srcdoc");
-    const statesRead = getStateCalls;
+    // Run the 3 s poll by hand (as ArtifactsPanel.test.tsx does). Waiting for the real interval
+    // left this test under 2 s of its 5 s budget, and a loaded runner ran out (#6391). The
+    // timed-out body kept running into the next tests, which then failed too.
+    const setIntervalSpy = spyOn(window, "setInterval");
+    try {
+      persistedState = { step: 1 };
+      const view = render(<ArtifactsPanel workspaceId="ws-r" />, { wrapper: ConnectionWrapper });
+      const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+      await flush();
+      const srcdoc = frame.getAttribute("srcdoc");
+      const statesRead = getStateCalls;
 
-    await dropConnection();
-    failWith = "Backend is starting";
-    await reconnect();
-    // The error is shown, but beside the artifact, not instead of it.
-    expect(view.getAllByText("Backend is starting").length).toBeGreaterThan(0);
-    expectSameFrame(view.queryByTestId("artifact-frame"), frame);
-    expect(frame.getAttribute("srcdoc")).toBe(srcdoc);
+      await dropConnection();
+      failWith = "Backend is starting";
+      await reconnect();
+      // The error is shown, but beside the artifact, not instead of it.
+      expect(view.getAllByText("Backend is starting").length).toBeGreaterThan(0);
+      expectSameFrame(view.queryByTestId("artifact-frame"), frame);
+      expect(frame.getAttribute("srcdoc")).toBe(srcdoc);
 
-    // The next refresh (poll) succeeds: the error goes away and the frame still stays.
-    failWith = null;
-    await waitFor(() => expect(view.queryByText("Backend is starting")).toBeNull(), {
-      timeout: 5000,
-    });
-    await flush();
-    expectSameFrame(view.queryByTestId("artifact-frame"), frame);
-    expect(frame.getAttribute("srcdoc")).toBe(srcdoc);
-    expect(getStateCalls).toBe(statesRead);
+      // The next refresh (poll) succeeds: the error goes away and the frame still stays. The
+      // last 3 s interval is the live one: the null-gap reconnect registers a new one.
+      const poll = setIntervalSpy.mock.calls.findLast((call) => call[1] === 3000)?.[0];
+      if (typeof poll !== "function") throw new Error("Test bug: no 3 s poll registered");
+      failWith = null;
+      const listsBefore = listCalls;
+      act(() => poll());
+      await waitFor(() => expect(listCalls).toBeGreaterThan(listsBefore));
+      await waitFor(() => expect(view.queryByText("Backend is starting")).toBeNull());
+      await flush();
+      expectSameFrame(view.queryByTestId("artifact-frame"), frame);
+      expect(frame.getAttribute("srcdoc")).toBe(srcdoc);
+      expect(getStateCalls).toBe(statesRead);
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
   });
 
   test("an MCP App view keeps its frame and host", async () => {
