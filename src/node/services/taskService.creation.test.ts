@@ -21,6 +21,7 @@ import * as forkOrchestrator from "@/node/services/utils/forkOrchestrator";
 import { Ok, Err, type Result } from "@/common/types/result";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { TASK_SETTINGS_LIMITS } from "@/common/config/schemas/taskSettings";
 import { defaultModel } from "@/common/utils/ai/models";
 import { createMuxMessage, parseWorkspaceTurnTaskCorrelation } from "@/common/types/message";
 import type { InitStateManager } from "@/node/services/initStateManager";
@@ -114,6 +115,48 @@ describe("TaskService", () => {
       expect(third.error).toContain("maxTaskNestingDepth");
     }
   }, 20_000);
+
+  test("default task settings admit an orchestration chain 4 levels below the root", async () => {
+    // pstack-style orchestration: root -> track coordinator -> worker -> verifier -> helper.
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["aaaaaaaaa1", "aaaaaaaaa2", "aaaaaaaaa3", "aaaaaaaaa4", "aaaaaaaaa5"]);
+
+    const projectPath = await createTestProject(rootDir);
+    const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
+    const runtime = createRuntime(runtimeConfig, { projectPath });
+    const parentCreate = await runtime.createWorkspace({
+      projectPath,
+      branchName: "parent",
+      trunkBranch: "main",
+      directoryName: "parent",
+      initLogger: createNullInitLogger(),
+    });
+    expect(parentCreate.success).toBe(true);
+
+    const parentId = "1111111111";
+    // No saved taskSettings: the limits come from the defaults, as on a fresh install.
+    await saveWorkspaces(config, projectPath, [
+      {
+        path: runtime.getWorkspacePath(projectPath, "parent"),
+        id: parentId,
+        name: "parent",
+        createdAt: new Date().toISOString(),
+        runtimeConfig,
+      },
+    ]);
+    expect(config.loadConfigOrDefault().taskSettings?.maxTaskNestingDepth).toBe(
+      TASK_SETTINGS_LIMITS.maxTaskNestingDepth.default
+    );
+    const { taskService } = createTaskServiceHarness(config);
+
+    let ownerId = parentId;
+    for (let depth = 1; depth <= 4; depth++) {
+      const created = await createAgentTask(taskService, ownerId, `level ${depth}`);
+      expect(created.success).toBe(true);
+      if (!created.success) return;
+      ownerId = created.data.taskId;
+    }
+  }, 60_000);
 
   test("plan is only runnable for workflow-owned task creation", async () => {
     const config = await createTestConfig(rootDir);

@@ -37,6 +37,7 @@ import {
   sanitizeModelFallbacks,
 } from "@/common/utils/ai/modelFallbacks";
 import { DEFAULT_TASK_SETTINGS, normalizeTaskSettings } from "@/common/types/tasks";
+import { PREVIOUS_TASK_SETTINGS_DEFAULTS } from "@/common/config/schemas/taskSettings";
 import {
   getDefaultAutoModelRoutingConfig,
   normalizeAutoModelRoutingConfig,
@@ -645,6 +646,25 @@ function normalizeConfigMigrations(value: unknown): AppConfigMigrations {
     }
   }
   return migrations;
+}
+
+/**
+ * Move task limits that still hold PREVIOUS_TASK_SETTINGS_DEFAULTS to the current defaults and
+ * keep every other value. Saves write the normalized settings, so an old default on disk is
+ * almost always Xum's write, not the user's choice. Known limit: a user who picked exactly an
+ * old default is moved once; after the migration flag is set, a value they set back sticks.
+ */
+function raisePreviousTaskSettingsDefaults(raw: unknown): Record<string, unknown> {
+  const record =
+    raw && typeof raw === "object" && !Array.isArray(raw)
+      ? { ...(raw as Record<string, unknown>) }
+      : {};
+  for (const key of ["maxParallelAgentTasks", "maxTaskNestingDepth"] as const) {
+    if (record[key] === PREVIOUS_TASK_SETTINGS_DEFAULTS[key]) {
+      record[key] = DEFAULT_TASK_SETTINGS[key];
+    }
+  }
+  return record;
 }
 
 function parseOptionalPort(value: unknown): number | undefined {
@@ -1863,6 +1883,7 @@ export class Config {
         defaultModelFallbacksSeededFable51: true,
         persistentSubagentsDefaulted: true,
         agentHeartbeatsSeeded: true,
+        taskSettingsDefaultsRaised: true,
       },
     };
   }
@@ -2195,6 +2216,14 @@ export class Config {
         parsed.agentHeartbeatsEnabled = true;
       }
       parsed.migrations = { ...heartbeatMigrations, agentHeartbeatsSeeded: true };
+      configModified = true;
+    }
+    // The task-limit defaults were raised for orchestration fan-out and depth. Configs that
+    // still hold the previous defaults (written by every save) move once; explicit values stay.
+    const taskLimitMigrations = normalizeConfigMigrations(parsed.migrations);
+    if (taskLimitMigrations.taskSettingsDefaultsRaised !== true) {
+      parsed.taskSettings = raisePreviousTaskSettingsDefaults(parsed.taskSettings);
+      parsed.migrations = { ...taskLimitMigrations, taskSettingsDefaultsRaised: true };
       configModified = true;
     }
     const taskSettings = normalizeTaskSettings(parsed.taskSettings);
