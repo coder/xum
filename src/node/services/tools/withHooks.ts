@@ -209,6 +209,11 @@ export async function runThroughToolHookPipeline<TArgs, TResult>(input: {
     ctx.executed,
     `tool.execute middleware for ${toolName} neither executed nor blocked the tool`
   );
+  // A post hook blocked the output: the result is its feedback (what the model sees, unchanged
+  // for an ordinary tool call), and a nested caller must not use the output it captured.
+  if (ctx.postBlocked) {
+    return { blocked: true, result: ctx.result };
+  }
   return { blocked: false, result: ctx.result as TResult };
 }
 
