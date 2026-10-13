@@ -36,6 +36,8 @@ interface RemoteLikeRuntimeOptions {
   throwOnSpawn?: { value: boolean };
   outputProbeFailure?: ProbeFailureControl;
   exitProbeFailure?: ProbeFailureControl;
+  /** Counts the bytes the output.log reads (`tail -c`) send back. */
+  tailReadBytes?: { value: number };
 }
 
 /**
@@ -72,6 +74,20 @@ function createRemoteLikeRuntime(base: LocalRuntime, options?: RemoteLikeRuntime
               return base.exec(`exit ${options.exitProbeFailure.exitCode}`, opts);
             }
             throw new Error("SSH exit probe failed");
+          }
+          const tailReadBytes = options?.tailReadBytes;
+          if (tailReadBytes != null && command.includes("tail -c +")) {
+            return base.exec(command, opts).then((stream) => ({
+              ...stream,
+              stdout: stream.stdout.pipeThrough(
+                new TransformStream<Uint8Array, Uint8Array>({
+                  transform(chunk, controller) {
+                    tailReadBytes.value += chunk.byteLength;
+                    controller.enqueue(chunk);
+                  },
+                })
+              ),
+            }));
           }
           return base.exec(command, opts);
         };
@@ -3524,7 +3540,7 @@ describe("BackgroundProcessManager", () => {
           expect(pages.join("\n")).toBe(expected.join("\n"));
         });
 
-        it("still rewinds over valid text after an invalid byte", async () => {
+        it("keeps memory bounded after an invalid byte", async () => {
           const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
             cwd: process.cwd(),
             displayName: "test",
@@ -3556,7 +3572,8 @@ describe("BackgroundProcessManager", () => {
           expect(result.success).toBe(true);
           if (!result.success) return;
           const outputPath = path.join(result.outputDir, "output.log");
-          const lines = Array.from({ length: 4_000 }, (_, i) => `line ${i} ${"z".repeat(50)}`);
+          // Under one page, so the first read reaches the end of the file.
+          const lines = Array.from({ length: 100 }, (_, i) => `line ${i} ${"z".repeat(50)}`);
           // The first read ends inside "é" (0xC3 0xA9): its two halves decode separately.
           const head = Buffer.concat([
             Buffer.from(`${lines.join("\n")}\ncut-`),
@@ -3584,7 +3601,13 @@ describe("BackgroundProcessManager", () => {
           expect(Buffer.byteLength(read.output, "utf8")).toBeLessThanOrEqual(BASH_MAX_TOTAL_BYTES);
           text += read.output;
           if (!read.note?.includes("continues the current line")) text += "\n";
-          if (!read.note?.includes("more bytes are unread")) return text;
+          // At most the read window of raw bytes stays in memory (decoded: no more UTF-16 units).
+          const retained = (await manager.getProcess(processId))?.incompleteLineBuffer ?? "";
+          expect(retained.length).toBeLessThanOrEqual(4 * BASH_MAX_TOTAL_BYTES + 3);
+          if (read.note?.includes("more bytes are unread")) continue;
+          // Paging is not polling: the last read gets no polling advice.
+          expect(read.note).toBeUndefined();
+          return text;
         }
         throw new Error("output never drained");
       }
@@ -3606,6 +3629,123 @@ describe("BackgroundProcessManager", () => {
 
         const text = await drainAndRebuild(result.processId);
         expect(text).toBe(jsonl);
+      });
+
+      describe("bounded log reads", () => {
+        // A log of lines that cut multi-byte characters at many read edges, with invalid bytes, a
+        // truncated sequence, lines that start with a byte-order mark, empty lines, a line over
+        // one page and a line longer than the read window.
+        function mixedLog(targetBytes: number): Buffer {
+          const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+          const lines: Buffer[] = [];
+          let size = 0;
+          for (let i = 0; size < targetBytes; i++) {
+            const line = [
+              Buffer.from(`{"i":${i},"s":"${"é€😀".repeat(i % 40)}"}`),
+              Buffer.concat([
+                Buffer.from(`${i} bad `),
+                Buffer.from([0xff, 0xe2, 0x82]),
+                Buffer.from("x"),
+              ]),
+              Buffer.concat([bom, Buffer.from(`bom ${i} ${"€".repeat(i % 9)}`)]),
+              Buffer.from(""),
+              Buffer.from(i % 50 === 4 ? "😀".repeat(BASH_MAX_TOTAL_BYTES / 2 + i) : `${i}`),
+              Buffer.from(i === 5 ? `${"é".repeat(BASH_MAX_TOTAL_BYTES * 3)}` : "short"),
+            ][i % 6];
+            lines.push(line, Buffer.from("\n"));
+            size += line.length + 1;
+          }
+          return Buffer.concat(lines);
+        }
+
+        // Bytes the manager's reads consumed from output.log, through the process's handle.
+        async function countHandleReadBytes(processId: string): Promise<{ value: number }> {
+          const proc = await manager.getProcess(processId);
+          if (proc == null) throw new Error("process missing");
+          const counter = { value: 0 };
+          const realReadOutput = proc.handle.readOutput.bind(proc.handle);
+          spyOn(proc.handle, "readOutput").mockImplementation(async (offset, maxBytes) => {
+            const read = await realReadOutput(offset, maxBytes);
+            counter.value += read.newOffset - offset;
+            return read;
+          });
+          return counter;
+        }
+
+        const decode = (raw: Buffer) => new TextDecoder("utf-8", { ignoreBOM: true }).decode(raw);
+
+        it("reads a large log once, and its pages rebuild it exactly", async () => {
+          const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+            cwd: process.cwd(),
+            displayName: "test",
+          });
+          expect(result.success).toBe(true);
+          if (!result.success) return;
+          const raw = mixedLog(2 * 1024 * 1024);
+          await fs.appendFile(path.join(result.outputDir, "output.log"), raw);
+          const readBytes = await countHandleReadBytes(result.processId);
+
+          expect(await drainAndRebuild(result.processId)).toBe(decode(raw));
+          // Each byte once: reading to the end of the file on each page read the log ~64 times.
+          expect(readBytes.value).toBe(raw.length);
+        });
+
+        it("reads a large remote log once, and its pages rebuild it exactly", async () => {
+          const tailReadBytes = { value: 0 };
+          const remote = createRemoteLikeRuntime(new LocalRuntime(process.cwd()), {
+            tailReadBytes,
+          });
+          const result = await manager.spawn(remote, testWorkspaceId, "sleep 60", {
+            cwd: process.cwd(),
+            displayName: "test",
+          });
+          expect(result.success).toBe(true);
+          if (!result.success) return;
+          const raw = mixedLog(512 * 1024);
+          await fs.appendFile(path.join(result.outputDir, "output.log"), raw);
+
+          expect(await drainAndRebuild(result.processId)).toBe(decode(raw));
+          // What tail sent back: each byte about once (plus a few to finish a character per read).
+          expect(tailReadBytes.value).toBeGreaterThanOrEqual(raw.length);
+          expect(tailReadBytes.value).toBeLessThan(raw.length * 1.05);
+        });
+
+        // A line longer than the read window is decided on its head, and its tail, which
+        // matches differently, follows that decision. A line that fits in the window is decided
+        // whole, though it spans pages. The other lines go past many page edges.
+        it.each([
+          { name: "filter", filter: "^M|keep", exclude: false },
+          { name: "filter_exclude", filter: "^D|drop", exclude: true },
+        ])("keeps each line's $name decision across read windows", async (testCase) => {
+          const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+            cwd: process.cwd(),
+            displayName: "test",
+          });
+          expect(result.success).toBe(true);
+          if (!result.success) return;
+          const kept = `M${"x".repeat(BASH_MAX_TOTAL_BYTES * 5)}`;
+          const dropped = `D${"x".repeat(BASH_MAX_TOTAL_BYTES * 5)}keep`;
+          const keptWhole = `${"w".repeat(BASH_MAX_TOTAL_BYTES * 2)} keep`;
+          const droppedWhole = `${"w".repeat(BASH_MAX_TOTAL_BYTES * 2)} drop`;
+          const lines: string[] = [];
+          for (let i = 0; i < 3_000; i++)
+            lines.push(`keep ${i} ${"y".repeat(i % 90)}`, `drop ${i}`);
+          lines.splice(1_000, 0, kept);
+          // After dropped lines, so the window holds little else when each one starts.
+          const dropRun = Array.from({ length: 500 }, () => "drop run");
+          lines.splice(2_000, 0, ...dropRun, keptWhole, ...dropRun, droppedWhole);
+          lines.splice(3_000, 0, dropped);
+          const raw = Buffer.from(`${lines.join("\n")}\n`);
+          await fs.appendFile(path.join(result.outputDir, "output.log"), raw);
+          const readBytes = await countHandleReadBytes(result.processId);
+
+          const text = await drainAndRebuild(result.processId, testCase.filter, testCase.exclude);
+          const expected = lines.filter(
+            (line) => line.startsWith("keep") || line === kept || line === keptWhole
+          );
+          expect(text).toBe(`${expected.join("\n")}\n`);
+          expect(readBytes.value).toBe(raw.length);
+        });
       });
 
       it("keeps the rest after exit readable", async () => {
