@@ -9,7 +9,7 @@ import { GlobalWindow } from "happy-dom";
 import type { ReactElement, ReactNode } from "react";
 
 import * as RealWorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
-import type * as ModelsFromSettingsModule from "@/browser/hooks/useModelsFromSettings";
+import * as RealModelsFromSettingsModule from "@/browser/hooks/useModelsFromSettings";
 import { APIProvider } from "@/browser/contexts/API";
 import { overlayWorkspaceStoreRaw } from "@/browser/stores/workspaceStoreTestOverlay";
 
@@ -137,10 +137,9 @@ void mock.module("@/browser/contexts/SettingsContext", () => ({
 // before running tests), deleting exports that later-evaluated suites need (seen as
 // GeneralSection/MemoryTab CI failures).
 
-/* eslint-disable @typescript-eslint/no-require-imports */
-const actualModelsFromSettings =
-  require("@/browser/hooks/useModelsFromSettings?real=1") as typeof ModelsFromSettingsModule;
-/* eslint-enable @typescript-eslint/no-require-imports */
+// A snapshot, not a require("...?real=1") copy, which would replace useModelsFromSettings.test.ts's
+// coverage in the shard (see actualWorkspaceStore above).
+const actualModelsFromSettings = { ...RealModelsFromSettingsModule };
 
 restoreModulesAfterSuite([
   ["@/browser/hooks/useModelsFromSettings", { ...actualModelsFromSettings }],
