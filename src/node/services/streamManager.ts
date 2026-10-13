@@ -410,8 +410,8 @@ function publishLiveRouting(streamInfo: WorkspaceStreamInfo): void {
 
 /**
  * Same-turn message transforms applied before every provider step: strip workflow run records
- * from same-turn tool results (history-level redaction in applyToolOutputRedaction can't see
- * these), neutralize protocol-envelope lookalikes in same-turn tool inputs/results
+ * and redact binary-like strings in same-turn tool results (history-level redaction in
+ * applyToolOutputRedaction can't see these), neutralize protocol-envelope lookalikes in same-turn tool inputs/results
  * (messagePipeline's neutralizer only sees persisted history), then extract supported
  * attachments out of tool-result JSON so providers don't treat them as text. Idempotent on an
  * already-transformed prefix. The settled-step budget floor reuses it so it measures exactly the
@@ -2394,6 +2394,11 @@ export class StreamManager {
         contextProviderMetadata,
         model: streamInfo.model,
         metadataModel: streamInfo.metadataModel,
+        // Same tool-model usage the committed partial gets below, so the renderer's
+        // per-turn cost views match history replay without a reload.
+        ...(streamInfo.toolModelUsages.length > 0
+          ? { toolModelUsages: streamInfo.toolModelUsages.map(clonePersistedToolModelUsage) }
+          : {}),
       },
       abortReason,
       abandonPartial,
@@ -3785,6 +3790,7 @@ export class StreamManager {
         toolName: event.toolName,
         result: event.result ?? (event.error ? { error: event.error } : undefined),
         ...(mcpServer ? { mcpServer } : {}),
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         timestamp: event.endTime!,
         parentToolCallId: event.parentToolCallId,
       });

@@ -24,7 +24,7 @@ On SSH, Docker and dev container workspaces the scratch folder exists only while
 
 - Press `Ctrl+Shift+K` (`Cmd+Shift+K` on macOS).
 - Click an artifact card in the chat. The card shows the file name, its version and its title.
-- On narrow windows, where the right sidebar is hidden, the same shortcut opens the artifacts in a dialog.
+- On narrow windows, where the right sidebar is hidden, the same shortcut shows the sidebar full-screen on the Artifacts tab.
 
 The toolbar has a picker for the file, a version menu, and buttons for fullscreen and reload. A dot in the picker marks files that changed since you last looked at them.
 
@@ -61,9 +61,7 @@ Files over 10 MB are not rendered. The tab offers to copy their path.
 
 Xum keeps old versions of each artifact, so a later edit does not lose what you saw earlier.
 
-- When the agent calls the `artifact` tool, Xum saves a labeled version at once. Publishing changed content adds the next version; publishing identical bytes reuses the latest one.
-- When the agent shows an artifact with `attach_file`, that also saves a version.
-- If a turn changes artifact files without publishing any, Xum saves one version of each changed file when the turn ends. Ten edits in one turn give one version. Stopped turns save nothing.
+Xum saves a version only when the agent calls the `artifact` tool. Changed content adds the next version. Identical bytes reuse the latest one. Edits without a publish change only **Latest (live)**.
 
 Pick a version from the version menu. **Latest (live)** follows the file as it changes. Versions are stored with the workspace on your machine, so they survive app restarts and lost containers.
 
@@ -90,13 +88,15 @@ HTML artifacts can send messages to the agent with a small script API:
 
 ```js
 window.xum.send("Use strategy B", { ttl: 30 }); // asks you to send a message
-window.xum.setState({ selected: ["lru", "ttl"] }); // saved with this version
+window.xum.setState({ selected: ["lru", "ttl"] }); // saved with this artifact
 window.xum.theme; // "dark" or "light"
+window.xum.openWorkspace("a1b2c3d4e5"); // switches Xum to that workspace
 ```
 
 - `send` never sends on its own. Xum shows the text above the artifact with **Send** and **Dismiss**. Only your click or the Send shortcut sends it, and Send waits a moment after the message appears.
 - A sent message arrives as your message, labeled "from artifact". If the agent is busy, it arrives at the next tool step. A message you sent survives an app restart, even if it was still waiting for the agent. A message you have not sent yet does not.
-- `setState` saves a small JSON value for the current version. The agent sees it in `artifact_list`.
+- `setState` saves a small JSON value for the artifact. A new version keeps it. The agent sees it in `artifact_list`.
+- `openWorkspace` switches Xum to the workspace with that ID. A task ID from the `task` tool works too, for a sub-agent or a workspace task. Call it from a click or key handler: Xum ignores it unless you just clicked or typed inside the artifact. For an unknown or archived workspace, nothing switches and Xum shows a short notice above the artifact. The artifact never gets an answer, and no workspace list or title reaches it. Pinned files and shelf copies cannot switch workspaces.
 
 ## Canvases
 
@@ -136,7 +136,7 @@ MCP servers that support [MCP Apps](https://github.com/modelcontextprotocol/ext-
 - **Open in tab** on the tool card opens the app in its own tab in the right sidebar, named after the tool and its server. If the app already has a tab, Xum selects it.
 - The command palette has an **Open App View** entry for each app in the workspace.
 - An app runs in one place at a time. While its tab is open, the tool card shows **Go to tab** instead. Close the tab to bring the app back to the card.
-- On narrow windows, where the right sidebar is hidden, **Open in tab** opens the app in a sheet. When the sidebar shows again, Xum selects the app's tab.
+- On narrow windows, where the right sidebar is hidden, **Open in tab** shows the sidebar full-screen on the app's tab.
 
 - The app asks before it calls a tool that the agent can also call, before it opens a link, and before it inserts text into your message.
 - It cannot reach domains it did not declare, and only declared domains that are on the CDN list below.

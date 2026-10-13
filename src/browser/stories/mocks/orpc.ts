@@ -2339,13 +2339,12 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       pinToShelf: (input: { artifactId: string }) =>
         Promise.resolve({ success: true as const, data: { name: input.artifactId } }),
       unpinShelf: () => Promise.resolve({ success: true as const, data: undefined }),
-      getState: (input: { workspaceId: string; path: string; version: number | null }) =>
+      getState: (input: { workspaceId: string; path: string }) =>
         Promise.resolve({
           success: true as const,
-          data: { version: input.version ?? 0, state: artifacts.states?.[input.path] ?? null },
+          data: { state: artifacts.states?.[input.path] ?? null },
         }),
-      setState: (input: { workspaceId: string; path: string; version: number | null }) =>
-        Promise.resolve({ success: true as const, data: { version: input.version ?? 0 } }),
+      setState: () => Promise.resolve({ success: true as const, data: undefined }),
       sendInteraction: () =>
         Promise.resolve({ success: true as const, data: { id: "story-interaction" } }),
     },

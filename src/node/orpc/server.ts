@@ -11,6 +11,7 @@ import * as fs from "fs/promises";
 import * as http from "http";
 import type * as net from "net";
 import * as path from "path";
+import * as zlib from "zlib";
 import { WebSocketServer, type WebSocket } from "ws";
 import { RPCHandler } from "@orpc/server/node";
 import { RPCHandler as ORPCWebSocketServerHandler } from "@orpc/server/websocket";
@@ -57,7 +58,12 @@ import {
 } from "@/common/constants/coderOAuth";
 import { MUX_GATEWAY_ORIGIN } from "@/common/constants/muxGatewayOAuth";
 import { assert } from "@/common/utils/assert";
-import { isHashedStaticAssetName, PRECOMPRESSED_ENCODINGS } from "@/node/orpc/staticAssets";
+import {
+  findFirstViewFont,
+  firstViewFontPreload,
+  isHashedStaticAssetName,
+  PRECOMPRESSED_ENCODINGS,
+} from "@/node/orpc/staticAssets";
 import { getAppProxyBasePathFromPathname, stripAppProxyBasePath } from "@/common/appProxyBasePath";
 
 type AliveWebSocket = WebSocket & { isAlive?: boolean };
@@ -152,6 +158,20 @@ function escapeHtmlAttribute(value: string): string {
 
 const SLASHLESS_ROOT_REDIRECT_SCRIPT =
   '<script>(()=>{const pathname=location.pathname;if(pathname.startsWith("//")||pathname.endsWith("/"))return;location.replace(location.origin+pathname+"/"+location.search+location.hash);})();</script>';
+
+const NEGOTIATED_ENCODINGS = [...PRECOMPRESSED_ENCODINGS.map((e) => e.encoding), "identity"];
+
+/**
+ * The encoding to send, or undefined for identity. Client q-values decide first. On ties the server
+ * order wins (brotli, then gzip): req.acceptsEncodings breaks ties by header order and would pick
+ * gzip for every browser ("gzip, deflate, br, zstd").
+ */
+function negotiateEncoding(req: express.Request) {
+  const [encoding] = new Negotiator(req).encodings(NEGOTIATED_ENCODINGS, {
+    preferred: NEGOTIATED_ENCODINGS,
+  });
+  return PRECOMPRESSED_ENCODINGS.find((e) => e.encoding === encoding);
+}
 
 function injectBaseHref(
   indexHtml: string,
@@ -1015,12 +1035,21 @@ export async function createOrpcServer({
   });
 
   let rawSpaIndexHtml: string | null = null;
+  let firstViewFont: string | undefined;
 
   // Static file serving (optional)
   if (serveStatic) {
     try {
       const indexHtmlPath = path.join(staticDir, "index.html");
       rawSpaIndexHtml = await fs.readFile(indexHtmlPath, "utf8");
+      // The font file comes from the stylesheets index.html links, so a rebuild with new hashes needs
+      // no code change. A stylesheet that cannot be read only costs the preload.
+      for (const [, href] of rawSpaIndexHtml.matchAll(
+        /<link[^>]*rel="stylesheet"[^>]*href="\.?\/?([^"]+\.css)"/g
+      )) {
+        const css = await fs.readFile(path.join(staticDir, href), "utf8").catch(() => "");
+        firstViewFont ??= findFirstViewFont(css);
+      }
     } catch (error) {
       log.error("Failed to read index.html for SPA fallback:", error);
     }
@@ -1032,7 +1061,6 @@ export async function createOrpcServer({
     // sibling when the client accepts it. These headers are set only when a file is actually
     // sent, so a missing hashed-looking path still reaches the SPA fallback untouched.
     const hashedOptions = { index: false, maxAge: "1y", immutable: true } as const;
-    const negotiatedEncodings = [...PRECOMPRESSED_ENCODINGS.map((e) => e.encoding), "identity"];
     const serveHashedIdentity = express.static(staticDir, {
       ...hashedOptions,
       setHeaders: (res) => res.vary("Accept-Encoding"),
@@ -1055,13 +1083,7 @@ export async function createOrpcServer({
         serveStaticAssets(req, res, next);
         return;
       }
-      // Client q-values decide first. On ties the server order wins (brotli, then gzip):
-      // req.acceptsEncodings breaks ties by header order and would pick gzip for every browser
-      // ("gzip, deflate, br, zstd").
-      const [encoding] = new Negotiator(req).encodings(negotiatedEncodings, {
-        preferred: negotiatedEncodings,
-      });
-      const precompressed = PRECOMPRESSED_ENCODINGS.find((e) => e.encoding === encoding);
+      const precompressed = negotiateEncoding(req);
       const requestPath = splitRequestUrlPathAndQuery(req.url);
       if (!precompressed || !requestPath) {
         serveHashedIdentity(req, res, next);
@@ -1630,9 +1652,27 @@ export async function createOrpcServer({
           getBrowserProxyUriTemplate()
         );
         varyPublicBasePathHeaders(res);
-        res.setHeader("Content-Type", "text/html");
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
         res.setHeader("Cache-Control", "no-store");
-        res.send(spaIndexHtml);
+        // After the injected <base>, so the relative font URLs resolve under a proxy base path.
+        const html = spaIndexHtml.replace(
+          /<\/head>/i,
+          `${firstViewFontPreload(firstViewFont)}</head>`
+        );
+        // Compressed per response, because the HTML is rewritten per request (base href, redirect).
+        // br quality 5 takes about 0.15 ms for this page. Quality 11 blocks for about 10 ms.
+        res.vary("Accept-Encoding");
+        const encoding = negotiateEncoding(req)?.encoding;
+        if (encoding) res.setHeader("Content-Encoding", encoding);
+        res.send(
+          encoding === "br"
+            ? zlib.brotliCompressSync(html, {
+                params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 5 },
+              })
+            : encoding === "gzip"
+              ? zlib.gzipSync(html)
+              : html
+        );
         return;
       }
 

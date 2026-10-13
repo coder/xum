@@ -7,7 +7,6 @@ import {
   ArtifactVersionSchema,
   type ArtifactPin,
   type ArtifactVersion,
-  type ArtifactVersionSource,
 } from "@/common/orpc/schemas/artifacts";
 import type { ArtifactKind } from "@/common/utils/artifactKind";
 import { assert } from "@/common/utils/assert";
@@ -32,25 +31,14 @@ export const ARTIFACT_VERSIONS_DIR_NAME = "artifact-versions";
 const INDEX_FILE_NAME = "index.json";
 const INDEX_LOCK_FILE_NAME = "index.lock";
 
-const StoredVersionSchema = ArtifactVersionSchema.extend({
-  /**
-   * Source file mtime when copied; lets turn-end snapshots skip unchanged files unread. Kept only
-   * when unambiguous (see unambiguousSourceModifiedMs).
-   */
-  sourceModifiedMs: z.number().optional(),
-});
-export type StoredArtifactVersion = z.infer<typeof StoredVersionSchema>;
-
 const ArtifactIndexSchema = z.object({
   id: z.string(),
   path: z.string(),
   pin: ArtifactPinSchema.nullable(),
-  /**
-   * Last publish (artifact tool or attach_file), including a deduped one that added no version:
-   * any publish during a turn suppresses that turn's end snapshot.
-   */
-  lastPublishedAtMs: z.number().optional(),
-  versions: z.array(StoredVersionSchema),
+  // Indexes written before only the artifact tool made versions also carry `lastPublishedAtMs`
+  // and per-version `sourceModifiedMs` (turn-end snapshot bookkeeping). The plain objects strip
+  // them on read, and the next index write drops them.
+  versions: z.array(ArtifactVersionSchema),
 });
 export type ArtifactVersionIndex = z.infer<typeof ArtifactIndexSchema>;
 
@@ -123,12 +111,10 @@ export interface RecordArtifactVersionParams {
   /** POSIX path relative to the artifacts dir. */
   relPath: string;
   bytes: Buffer;
-  source: ArtifactVersionSource;
   label: string | null;
   kind?: ArtifactKind;
   /** Undefined keeps the current pin; null clears it. */
   pin?: ArtifactPin | null;
-  sourceModifiedMs?: number;
   nowMs?: number;
   /** Checked under the index lock: an aborted publish writes nothing. */
   abortSignal?: AbortSignal;
@@ -136,24 +122,10 @@ export interface RecordArtifactVersionParams {
 
 export const ARTIFACT_PUBLISH_INTERRUPTED = "Publish was interrupted";
 
-/**
- * The source mtime worth recording, or undefined. Runtime stat reports whole seconds, so a
- * same-size rewrite within the second of the mtime keeps it: an mtime is trusted (and the
- * turn-end fast path may skip the file unread) only when the bytes were read at least 1 s later.
- */
-function unambiguousSourceModifiedMs(
-  sourceModifiedMs: number | undefined,
-  nowMs: number
-): number | undefined {
-  return sourceModifiedMs != null && nowMs >= sourceModifiedMs + 1000
-    ? sourceModifiedMs
-    : undefined;
-}
-
 export interface RecordArtifactVersionResult {
   artifactId: string;
   /** The new version, or the latest one when the bytes were unchanged. */
-  version: StoredArtifactVersion;
+  version: ArtifactVersion;
   created: boolean;
   pin: ArtifactPin | null;
 }
@@ -175,31 +147,19 @@ export async function recordArtifactVersion(
     };
     const nextPin = params.pin === undefined ? index.pin : params.pin;
     const nowMs = params.nowMs ?? Date.now();
-    const lastPublishedAtMs = params.source === "turn-end" ? index.lastPublishedAtMs : nowMs;
     const sha256 = sha256Hex(params.bytes);
     const latest = index.versions.at(-1);
-    const sourceModifiedMs = unambiguousSourceModifiedMs(params.sourceModifiedMs, nowMs);
     if (params.abortSignal?.aborted) throw new Error(ARTIFACT_PUBLISH_INTERRUPTED);
     if (latest?.sha256 === sha256) {
-      // Same bytes: no new version, but presentation and snapshot metadata follow the latest
-      // publish (an explicit kind override, the file's current mtime).
-      const { sourceModifiedMs: _previousModifiedMs, ...latestRest } = latest;
-      const refreshed: StoredArtifactVersion = {
-        ...latestRest,
+      // Same bytes: no new version, but an explicit kind override follows the latest publish.
+      const refreshed: ArtifactVersion = {
+        ...latest,
         ...(params.kind != null ? { kind: params.kind } : {}),
-        ...(sourceModifiedMs != null ? { sourceModifiedMs } : {}),
       };
-      const metadataChanged =
-        refreshed.kind !== latest.kind || refreshed.sourceModifiedMs !== latest.sourceModifiedMs;
-      if (
-        metadataChanged ||
-        nextPin !== index.pin ||
-        lastPublishedAtMs !== index.lastPublishedAtMs
-      ) {
+      if (refreshed.kind !== latest.kind || nextPin !== index.pin) {
         await writeIndex(dir, {
           ...index,
           pin: nextPin,
-          lastPublishedAtMs,
           versions: [...index.versions.slice(0, -1), refreshed],
         });
       }
@@ -209,16 +169,17 @@ export async function recordArtifactVersion(
     // number past them so a new version never overwrites an old blob (or reuses its number).
     // Only then is the directory scanned: a healthy index already names the latest version, and
     // an orphan v<latest+1> beside it (a crash before the index write) is safe to overwrite.
-    const entry: StoredArtifactVersion = {
+    const entry: ArtifactVersion = {
       version: (latest == null ? await highestVersionBlob(dir) : latest.version) + 1,
       label: params.label,
-      source: params.source,
+      // Only the artifact tool makes versions now; "turn-end" and "attach_file" are read-only
+      // values that older indexes still hold.
+      source: "publish",
       createdAtMs: nowMs,
       sha256,
       size: params.bytes.length,
       path: params.relPath,
       ...(params.kind != null ? { kind: params.kind } : {}),
-      ...(sourceModifiedMs != null ? { sourceModifiedMs } : {}),
     };
     await fs.mkdir(dir, { recursive: true });
     await writeFileAtomic(path.join(dir, `v${entry.version}`), params.bytes);
@@ -229,7 +190,6 @@ export async function recordArtifactVersion(
       ...index,
       path: params.relPath,
       pin: nextPin,
-      ...(lastPublishedAtMs != null ? { lastPublishedAtMs } : {}),
       versions: [...index.versions, entry],
     });
     return { artifactId, version: entry, created: true, pin: nextPin };
@@ -313,26 +273,11 @@ export async function listArtifactIndexes(sessionDir: string): Promise<ArtifactV
   return indexes.filter((index): index is ArtifactVersionIndex => index != null);
 }
 
-/**
- * True when anything was published (artifact tool or attach_file) at or after `sinceMs`. The
- * turn-end snapshot rule keys on this, so no in-memory per-turn state is needed and the rule
- * holds across restarts.
- */
-export function hasPublishSince(indexes: ArtifactVersionIndex[], sinceMs: number): boolean {
-  return indexes.some((index) => (index.lastPublishedAtMs ?? -Infinity) >= sinceMs);
-}
-
-/** Public view of a stored version (drops internal bookkeeping fields). */
-export function toPublicVersion(version: StoredArtifactVersion): ArtifactVersion {
-  const { sourceModifiedMs: _sourceModifiedMs, ...rest } = version;
-  return rest;
-}
-
 export async function readArtifactVersionBytes(
   sessionDir: string,
   artifactId: string,
   version: number
-): Promise<{ version: StoredArtifactVersion; bytes: Buffer } | null> {
+): Promise<{ version: ArtifactVersion; bytes: Buffer } | null> {
   const index = await readArtifactIndex(sessionDir, artifactId);
   const entry = index?.versions.find((v) => v.version === version);
   if (!entry) return null;
@@ -346,24 +291,20 @@ export async function readArtifactVersionBytes(
 }
 
 /**
- * `window.xum.setState` storage (Artifacts M5b): `v<N>.state.json` beside the version's bytes,
- * latest write wins. Version 0 holds the state of an artifact that has no stored version yet.
+ * `window.xum.setState` storage: one `state.json` per artifact, latest write wins. It does not
+ * follow versions, so a republish keeps what the user picked (like Claude's per-artifact storage).
+ * Older builds wrote `v<N>.state.json` per version; those files are left on disk and not read.
  */
-function artifactStatePath(sessionDir: string, artifactId: string, version: number): string {
-  assert(Number.isInteger(version) && version >= 0, "state version must be a non-negative integer");
-  return path.join(artifactDir(sessionDir, artifactId), `v${version}.state.json`);
+function artifactStatePath(sessionDir: string, artifactId: string): string {
+  return path.join(artifactDir(sessionDir, artifactId), "state.json");
 }
 
 /** Saved state, or null when none (or unreadable: a corrupt file is treated as no state). */
-export async function readArtifactState(
-  sessionDir: string,
-  artifactId: string,
-  version: number
-): Promise<unknown> {
+export async function readArtifactState(sessionDir: string, artifactId: string): Promise<unknown> {
   if (!isValidArtifactId(artifactId)) return null;
   let text: string;
   try {
-    text = await fs.readFile(artifactStatePath(sessionDir, artifactId, version), "utf8");
+    text = await fs.readFile(artifactStatePath(sessionDir, artifactId), "utf8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
@@ -379,10 +320,9 @@ export async function readArtifactState(
 export async function writeArtifactState(
   sessionDir: string,
   artifactId: string,
-  version: number,
   state: unknown
 ): Promise<void> {
-  const filePath = artifactStatePath(sessionDir, artifactId, version);
+  const filePath = artifactStatePath(sessionDir, artifactId);
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   await writeFileAtomic(filePath, JSON.stringify(state));
 }

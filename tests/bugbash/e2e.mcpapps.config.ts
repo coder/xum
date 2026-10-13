@@ -27,7 +27,7 @@ const mcpContext = [
   "cards) opens the view in its own right-sidebar tab, named after the tool and server, plus the",
   "call's arguments when several calls share a name; the card then shows 'Go to tab' instead of",
   "the view, and closing the tab ('Close App view' or 'Close view') brings it back. On a phone,",
-  "where the right sidebar is hidden, 'Open in tab' opens the view in a sheet instead. The command",
+  "where the right sidebar is hidden, 'Open in tab' shows that tab in the full-screen sidebar. The command",
   "palette has an 'Open App View' entry per view. The Artifacts tab lists only files, never app",
   "views. The 4d6 call kept its result; the 2d20 call's",
   "result record is missing on purpose, so its view says the result is no longer available; the",

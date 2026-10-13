@@ -11,6 +11,7 @@ import { Err, Ok } from "@/common/types/result";
 import { ProviderModelFactory } from "@/node/services/providerModelFactory";
 import { shouldRunIntegrationTests } from "../../testUtils";
 import { setupProviders } from "../../ipc/setup";
+import { trackApiCalls, type ApiCallTracker } from "../apiCallTracker";
 import { createAppHarness } from "../harness";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
@@ -18,7 +19,14 @@ const MODEL_A = KNOWN_MODELS.OPUS.id;
 const MODEL_B = KNOWN_MODELS.SONNET.id;
 const FALLBACK_MODEL = KNOWN_MODELS.HAIKU.id;
 
-async function selectAgent(container: HTMLElement, agentId: string): Promise<void> {
+async function selectAgent(
+  container: HTMLElement,
+  agentId: string,
+  agentList: ApiCallTracker
+): Promise<void> {
+  // The picker shows "Loading agents…" until the app's agents.list answers, and that call waits
+  // for workspace init. Await it rather than race it with waitFor's 1 s default (#6143).
+  await agentList.settled();
   const user = userEvent.setup({ document: container.ownerDocument });
   await user.click(within(container).getByRole("button", { name: "Select agent" }));
   const option = await waitFor(() => {
@@ -66,8 +74,10 @@ describeIntegration("Calling-chat Exec inheritance", () => {
     const delegated = new Set<string>();
     // MockAiRouter emits canned tool results without executing them. Mock only the
     // provider instead so picker -> send -> task -> child runs the real backend.
+    const agentList = trackApiCalls("agents", "list");
     const app = await createAppHarness({
       branchPrefix: "exec-inheritance",
+      wrapApiClient: agentList.wrap,
       aiMode: "none",
       beforeRenderEnvironment: async (env) => {
         await setupProviders(env, { anthropic: { apiKey: "provider-free-test-key" } });
@@ -141,7 +151,7 @@ describeIntegration("Calling-chat Exec inheritance", () => {
     });
 
     try {
-      await selectAgent(app.view.container, "exec");
+      await selectAgent(app.view.container, "exec", agentList);
       await selectModel(app.view.container, MODEL_A);
       // Do not pre-seed workspace AI settings or wait for their persistence: the
       // very first send must save the selected Exec model before task execution.
@@ -186,8 +196,10 @@ describeIntegration("Calling-chat Exec inheritance", () => {
   test("reawakened children follow the current Delegated default unless pinned", async () => {
     const requestLog: { workspaceId: string; model: string }[] = [];
     const handled = new Set<string>();
+    const agentList = trackApiCalls("agents", "list");
     const app = await createAppHarness({
       branchPrefix: "exec-reawaken",
+      wrapApiClient: agentList.wrap,
       aiMode: "none",
       beforeRenderEnvironment: async (env) => {
         await setupProviders(env, { anthropic: { apiKey: "provider-free-test-key" } });
@@ -286,7 +298,7 @@ describeIntegration("Calling-chat Exec inheritance", () => {
       requestLog.filter((entry) => entry.workspaceId === workspaceId).map((entry) => entry.model);
 
     try {
-      await selectAgent(app.view.container, "exec");
+      await selectAgent(app.view.container, "exec", agentList);
       await sendMessage(app.view.container, "Delegate the first review.");
       await app.chat.expectTranscriptContains("Finished reviewing.");
       await app.chat.expectStreamComplete();
