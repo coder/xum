@@ -1112,8 +1112,19 @@ describe.each([...GAP_MODES])("TasksSection across a reconnect (%s)", (mode) => 
     // The kept value stays on screen.
     expect(maxParallelInput(view).value).toBe("3");
 
+    // Until the reload answers the controls stay disabled: an edit then would be replaced by it.
+    let answer: (() => void) | null = null;
+    const answered = new Promise<void>((resolve) => (answer = resolve));
     connect(3, Promise.resolve(FALLBACK_AGENTS));
+    const config = apiMock?.config.getConfig;
+    if (!apiMock || !config) throw new Error("connect() sets the client");
+    apiMock.config.getConfig = mock(() => answered.then(() => config() as unknown));
     harness.reconnect();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    });
+    expect(isDisabled(maxParallelInput(view))).toBe(true);
+    act(() => answer?.());
     await waitFor(() => expect(isDisabled(maxParallelInput(view))).toBe(false));
   });
 });

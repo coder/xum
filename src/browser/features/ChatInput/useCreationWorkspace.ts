@@ -354,8 +354,8 @@ export function useCreationWorkspace({
     }
   }, [kind, projectPath, api]);
 
-  // The project whose branches and runtimes are shown. Only a new project shows "loading" again:
-  // a new client (reconnect) reloads the same project behind the shown values.
+  // The project whose runtimes are shown. Only a new project shows the runtimes as "loading"
+  // again: a new client (reconnect) reloads the same project behind the shown values.
   const shownProjectPathRef = useRef<string | null>(null);
 
   // Load branches and runtime availability on mount with mounted guard
@@ -366,9 +366,11 @@ export function useCreationWorkspace({
     }
     if (!projectPath.length || !api) return;
     let mounted = true;
+    // Every load clears `branchesLoaded`, a reload (reconnect) too: it is the send barrier for a
+    // trunk branch (#6033), and the branches can change while offline.
+    setBranchesLoaded(false);
     if (shownProjectPathRef.current !== projectPath) {
       shownProjectPathRef.current = projectPath;
-      setBranchesLoaded(false);
       setRuntimeAvailabilityState({ status: "loading" });
     }
     // Both requests run at once and settle independently. Send waits for the branch list (#6033),

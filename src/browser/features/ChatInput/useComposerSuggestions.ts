@@ -217,6 +217,8 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
   const mcpRequestId = useRef(0);
   const mcpRequest = useRef<Promise<void> | null>(null);
   const mcpLoadedAt = useRef(0);
+  // The client the prompts were listed with: a new one (reconnect) lists them again.
+  const mcpClient = useRef<typeof api>(null);
   const mcpWorkspace = useRef<string | null>(null);
   const mcpAbort = useRef<AbortController | null>(null);
   const listId = useId();
@@ -295,6 +297,11 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
       mcpLoadedAt.current = 0;
       dropMcpRequest();
       setMcpPrompts([]);
+    }
+    if (mcpClient.current !== api) {
+      // Prompts can change while offline: the shown ones stay, but the next client lists again.
+      mcpClient.current = api;
+      mcpLoadedAt.current = 0;
     }
     if (!api) {
       // Offline: drop the lost client's request, keep the shown prompts for the reconnect.

@@ -286,6 +286,11 @@ function areAgentAiDefaultsEqual(a: AgentAiDefaults, b: AgentAiDefaults): boolea
 
   return true;
 }
+/** Offline, or before a load answered: an edit then would be lost or replaced. */
+function areControlsLocked(offline: boolean, loaded: boolean): boolean {
+  return offline || !loaded;
+}
+
 function clearSaveTimer(timerRef: { current: ReturnType<typeof setTimeout> | null }): void {
   if (timerRef.current) clearTimeout(timerRef.current);
   timerRef.current = null;
@@ -1131,8 +1136,9 @@ export function TasksSection() {
 
   return (
     // Offline every control is disabled: an edit kept only in this section's state is lost when
-    // the user leaves the section before the reconnect.
-    <fieldset disabled={liveApi == null} className="min-w-0 space-y-6">
+    // the user leaves the section before the reconnect. Until a load answers, too: the autosave
+    // does not track an edit made then, so the answer would replace it.
+    <fieldset disabled={areControlsLocked(liveApi == null, loaded)} className="min-w-0 space-y-6">
       <div>
         <h3 className="text-foreground mb-4 text-sm font-medium">Task Settings</h3>
         <div className="space-y-4">

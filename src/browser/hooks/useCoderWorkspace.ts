@@ -314,18 +314,22 @@ export function useCoderWorkspace({
     // Capture template/org at request time to detect stale responses
     const templateAtRequest = coderConfig.template;
     const orgAtRequest = coderConfig.templateOrg;
-    // Only another template shows "loading": a reload (reconnect) keeps the shown presets.
     const presetsKey = JSON.stringify([templateAtRequest, orgAtRequest]);
     if (shownPresetsKeyRef.current !== presetsKey) {
       // The shown presets belong to another template: never offer them, offline either.
       shownPresetsKeyRef.current = null;
       setPresets([]);
-      setLoadingPresets(api != null);
     }
     // Offline, keep the shown presets of this template: the reconnect reloads them.
-    if (!api) return;
+    if (!api) {
+      setLoadingPresets(false);
+      return;
+    }
 
     let mounted = true;
+    // Every load sets "loading", a reload (reconnect) too: ChatInput blocks a Coder send on it,
+    // so no send can use a preset the server removed while offline.
+    setLoadingPresets(true);
     setPresetsError(null);
 
     api.coder

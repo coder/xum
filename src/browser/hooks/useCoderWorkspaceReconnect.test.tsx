@@ -111,7 +111,9 @@ describe.each([...GAP_MODES])("useCoderWorkspace across a reconnect (%s)", (mode
     await settle();
 
     const shown = view.result.current;
-    expect(shown.loadingTemplates || shown.loadingPresets || shown.loadingWorkspaces).toBe(false);
+    expect(shown.loadingTemplates || shown.loadingWorkspaces).toBe(false);
+    // ChatInput blocks a Coder send on loadingPresets: the reload must hold it.
+    expect(shown.loadingPresets).toBe(true);
     expect(shown.templates.map((t) => t.name)).toEqual(["t1"]);
     expect(shown.presets.map((p) => p.name)).toEqual(["p1", "p2"]);
     expect(shown.existingWorkspaces.map((w) => w.name)).toEqual(["w1"]);
@@ -128,6 +130,7 @@ describe.each([...GAP_MODES])("useCoderWorkspace across a reconnect (%s)", (mode
     );
     expect(view.result.current.templates.map((t) => t.name)).toEqual(["t1", "t2"]);
     expect(view.result.current.presets.map((p) => p.name)).toEqual(["p1", "p2", "p3"]);
+    expect(view.result.current.loadingPresets).toBe(false);
   });
 
   test("another template shows loading presets", async () => {

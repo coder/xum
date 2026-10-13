@@ -131,6 +131,18 @@ describe.each([...GAP_MODES])("composer suggestions across a reconnect (%s)", (m
     expect(hasGreetPrompt(view.result.current.suggestions)).toBe(true);
   });
 
+  // Prompts listed just before the drop are inside the 30 s cache window. The new client must
+  // list them again: they can change while offline.
+  test("MCP prompts listed before a drop are listed again after the reconnect", async () => {
+    const view = renderSuggestions("ws-a");
+    await waitFor(() => expect(hasGreetPrompt(view.result.current.suggestions)).toBe(true));
+
+    serverPrompts = [];
+    await harness.drop();
+    harness.reconnect();
+    await waitFor(() => expect(hasGreetPrompt(view.result.current.suggestions)).toBe(false));
+  });
+
   test("an MCP prompt request lost with the connection is asked again after the reconnect", async () => {
     // The first server never answers: the request is still in flight when the connection drops.
     serverPrompts = new Promise(() => undefined);
