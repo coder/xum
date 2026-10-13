@@ -288,13 +288,14 @@ function isObservedByMonitor(step: RecordedStepRequest): boolean {
 }
 
 /**
- * Requests compare only within one route and effective model, like the monitor's baseline
- * key. Older logs have no route: they key by the AI SDK provider id and model id.
+ * Requests compare only within one route, endpoint and effective model, like the monitor's
+ * baseline key. Older logs have no route: they key by the AI SDK provider id and model id.
+ * Logs from before the endpoint was recorded key it as empty.
  */
 function baselineKeyOf(step: RecordedStepRequest): string {
   const wire = step.promptCacheWire;
   return wire != null
-    ? `route\u0000${wire.route}\u0000${wire.modelString}`
+    ? `route\u0000${wire.route}\u0000${wire.endpoint ?? ""}\u0000${wire.modelString}`
     : `provider\u0000${step.provider ?? ""}\u0000${step.modelId}`;
 }
 

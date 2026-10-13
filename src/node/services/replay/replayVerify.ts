@@ -106,6 +106,7 @@ export interface DevtoolsLogSnapshot {
 const PromptCacheWireSchema = z.object({
   route: z.string(),
   modelString: z.string(),
+  endpoint: z.string().optional(),
   cacheMarkersInjected: z.boolean(),
   dispatched: z.boolean(),
   observedAt: z

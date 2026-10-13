@@ -841,7 +841,7 @@ async function fetchRecordingPromptCacheWire(
   wire: {
     /** The caller's headers: they still carry the synthetic DevTools step id. */
     stepHeaders: HeadersInit | undefined;
-    options: { routeIdentity?: PromptCacheRouteIdentity } | undefined;
+    options: { routeIdentity?: Omit<PromptCacheRouteIdentity, "endpoint"> } | undefined;
     cacheMarkersInjected: boolean;
   }
 ): Promise<Response> {
@@ -850,6 +850,8 @@ async function fetchRecordingPromptCacheWire(
   const record = (outcome: { dispatched: boolean; observedAt?: string }) =>
     recordPromptCacheWire(wire.stepHeaders, {
       ...routeIdentity,
+      // The monitor keys by the request's endpoint too (another base URL, another cache).
+      endpoint: requestEndpoint(requestUrlOf(input)),
       cacheMarkersInjected: wire.cacheMarkersInjected,
       ...outcome,
     });
@@ -897,7 +899,7 @@ export function wrapFetchWithAnthropicCacheControl(
      * of a DevTools-tracked request records it with the dispatch outcome on the step, so the
      * replay audit can apply the monitor's rules (see recordPromptCacheWire).
      */
-    routeIdentity?: PromptCacheRouteIdentity;
+    routeIdentity?: Omit<PromptCacheRouteIdentity, "endpoint">;
   }
 ): typeof fetch {
   const injectCacheControl = options?.injectCacheControl ?? true;

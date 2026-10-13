@@ -63,6 +63,8 @@ export interface DevToolsPromptCacheWire {
   route: string;
   /** The effective model string the monitor keys baselines by. */
   modelString: string;
+  /** Origin and path of the request URL, as the monitor keys it. Absent in older logs. */
+  endpoint?: string;
   /** False when cache markers were stripped (beta features off): no cache entry exists. */
   cacheMarkersInjected: boolean;
   /** True once the provider answered (any HTTP status); false when the fetch itself failed. */

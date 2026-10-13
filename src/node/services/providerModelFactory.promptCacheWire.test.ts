@@ -30,7 +30,7 @@ async function send(params: {
       routeIdentity: "routeIdentity" in params ? params.routeIdentity : ROUTE,
     }
   );
-  await wrapped("https://gateway.example/v1/messages", {
+  await wrapped("https://gateway.example/v1/messages?beta=true", {
     method: "POST",
     headers: params.stepId != null ? { [DEVTOOLS_STEP_ID_HEADER]: params.stepId } : {},
     body: BODY,
@@ -42,7 +42,13 @@ describe("wrapFetchWithAnthropicCacheControl — DevTools prompt-cache wire fact
     const before = Date.now();
     await send({ stepId: "step-ok", respond: () => Promise.resolve(new Response("{}")) });
     const wire = consumePromptCacheWire("step-ok");
-    expect(wire).toMatchObject({ ...ROUTE, cacheMarkersInjected: true, dispatched: true });
+    expect(wire).toMatchObject({
+      ...ROUTE,
+      // Query and credentials never reach the key.
+      endpoint: "https://gateway.example/v1/messages",
+      cacheMarkersInjected: true,
+      dispatched: true,
+    });
     const observedAt = Date.parse(wire?.observedAt ?? "");
     expect(observedAt).toBeGreaterThanOrEqual(before);
     expect(observedAt).toBeLessThanOrEqual(Date.now());
@@ -57,6 +63,7 @@ describe("wrapFetchWithAnthropicCacheControl — DevTools prompt-cache wire fact
     });
     expect(consumePromptCacheWire("step-529")).toEqual({
       ...ROUTE,
+      endpoint: "https://gateway.example/v1/messages",
       cacheMarkersInjected: true,
       dispatched: true,
     });

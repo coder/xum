@@ -376,6 +376,16 @@ describe("auditStepPrefixes with recorded wire facts", () => {
     expect(audit).toMatchObject({ comparedPairs: 2, breaks: [] });
   });
 
+  test("steps on two endpoints of one route keep separate baselines", () => {
+    // Another base URL reaches another cache, as in the monitor's key.
+    const audit = auditStepPrefixes([
+      wired("run-1", ["a"], { endpoint: "https://proxy-a.example/v1/messages" }),
+      wired("run-2", ["x"], { endpoint: "https://proxy-b.example/v1/messages" }),
+      wired("run-3", ["a", "b"], { endpoint: "https://proxy-a.example/v1/messages" }),
+    ]);
+    expect(audit).toMatchObject({ comparedPairs: 1, breaks: [] });
+  });
+
   test.each([
     ["was not dispatched", { dispatched: false, observedAt: undefined }],
     ["got no OK response", { observedAt: undefined }],
