@@ -7,7 +7,6 @@ import { getReviewImmersiveKey, RIGHT_SIDEBAR_COLLAPSED_KEY } from "@/common/con
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { useEffect, type MutableRefObject } from "react";
 import { installDom } from "../../../../tests/ui/dom";
-import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import * as RealLottieModule from "lottie-react";
 import * as RealWorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import * as RealChatPaneModule from "@/browser/components/ChatPane/ChatPane";
