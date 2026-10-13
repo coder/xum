@@ -67,6 +67,7 @@ import {
   areActivityGoalsEqual,
   findRenderedRefineProposalHash,
   mergeTimelineEvents,
+  resolveSidebarAgentStatus,
   WorkspaceStore,
   type TranscriptRefreshOutcome,
   type WorkspaceStoreOptions,
@@ -8899,5 +8900,78 @@ describe("findRenderedRefineProposalHash", () => {
     // "Load all" disables the cap: the proposal is now actually rendered.
     aggregator.setShowAllMessages(true);
     expect(findRenderedRefineProposalHash(aggregator)).toBe(HASH);
+  });
+});
+
+describe("resolveSidebarAgentStatus", () => {
+  const display = { emoji: "D", message: "compacting" };
+  const persisted = { emoji: "P", message: "summary" };
+  const agent = { emoji: "A", message: "status_set" };
+  const todos: TodoItem[] = [{ content: "write tests", status: "in_progress" }];
+  const liveTodo = { emoji: "🔄", message: "write tests" };
+  const activity = (overrides: Partial<WorkspaceActivitySnapshot>): WorkspaceActivitySnapshot => ({
+    recency: 1,
+    streaming: false,
+    lastModel: null,
+    lastThinkingLevel: null,
+    ...overrides,
+  });
+
+  describe("an inactive workspace (activity snapshot is the source)", () => {
+    const resolve = (snapshot: WorkspaceActivitySnapshot | undefined, todoItems = todos) =>
+      resolveSidebarAgentStatus({
+        useAggregatorState: false,
+        activity: snapshot,
+        todos: todoItems,
+        aggregatorAgentStatus: agent,
+      });
+
+    it("shows the system display status over everything else", () => {
+      expect(resolve(activity({ displayStatus: display, todoStatus: persisted }))).toEqual(display);
+    });
+
+    it("falls back to the persisted todo status, never to the aggregator's status", () => {
+      expect(resolve(activity({ displayStatus: null, todoStatus: persisted }))).toEqual(persisted);
+    });
+
+    it("derives a status from the cached todos when none was persisted", () => {
+      expect(resolve(activity({}))).toEqual(liveTodo);
+      expect(resolve(undefined)).toEqual(liveTodo);
+    });
+
+    it("shows nothing for a todo list the backend reports as cleared", () => {
+      expect(resolve(activity({ hasTodos: false }))).toBeUndefined();
+    });
+  });
+
+  describe("an active, caught-up workspace (the aggregator is the source)", () => {
+    const resolve = (
+      snapshot: WorkspaceActivitySnapshot | undefined,
+      todoItems: TodoItem[],
+      aggregatorAgentStatus: typeof agent | undefined
+    ) =>
+      resolveSidebarAgentStatus({
+        useAggregatorState: true,
+        activity: snapshot,
+        todos: todoItems,
+        aggregatorAgentStatus,
+      });
+
+    it("ignores the display status and prefers the live todo status", () => {
+      expect(
+        resolve(activity({ displayStatus: display, todoStatus: persisted }), todos, agent)
+      ).toEqual(liveTodo);
+    });
+
+    it("prefers the aggregator's status over the persisted todo status", () => {
+      expect(resolve(activity({ todoStatus: persisted }), [], agent)).toEqual(agent);
+    });
+
+    it("falls back to the persisted todo status", () => {
+      expect(resolve(activity({ todoStatus: persisted, hasTodos: false }), [], undefined)).toEqual(
+        persisted
+      );
+      expect(resolve(undefined, [], undefined)).toBeUndefined();
+    });
   });
 });

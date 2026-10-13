@@ -770,6 +770,51 @@ function repriceSessionUsage(
 }
 
 /**
+ * Sidebar status precedence, split into four tiers so each signal
+ * wins exactly when it should. Active and inactive workspaces draw
+ * from different sources but resolve through the same priority.
+ *
+ *   1. displayStatus (inactive only): system-driven transient status
+ *      from disk, e.g. "Compacting idle workspace…". Always wins.
+ *   2. liveTodoStatus (active only): the agent's most recent
+ *      `todo_write`, processed synchronously by the aggregator.
+ *      Beats the aggregator's persisted status_set value because
+ *      todo_write is the freshest explicit signal; beats persisted
+ *      todoStatus because the live aggregator state is ahead of
+ *      the async setTodoStatus + activity-emit round-trip.
+ *   3. fallbackAgentStatus (active only): aggregator.getAgentStatus()
+ *      — a blend of heartbeat / idle-compaction / background-turn
+ *      `displayStatus` events (genuinely transient) and the agent's
+ *      own `status_set` tool result (a pinned high-level intent).
+ *      Wins over persisted todoStatus so an AI-generated summary
+ *      doesn't mask an explicit system or agent-set message.
+ *   4. persistedTodoStatus: activity.todoStatus from disk. Either
+ *      a stale todo derivation or an AgentStatusService AI summary —
+ *      both writers target the same slot, last write wins. The
+ *      lowest tier so a newer in-memory signal always preempts.
+ *      For inactive workspaces, `hasTodos === false` blocks the
+ *      legacy aggregator-derive fallback so a freshly cleared todo
+ *      list doesn't briefly resurrect the stale derivation.
+ */
+export function resolveSidebarAgentStatus(input: {
+  /** Active (live onChat) and caught up: the aggregator is authoritative. */
+  useAggregatorState: boolean;
+  activity: WorkspaceActivitySnapshot | undefined;
+  todos: readonly TodoItem[];
+  aggregatorAgentStatus: WorkspaceState["agentStatus"];
+}): WorkspaceState["agentStatus"] {
+  const { useAggregatorState, activity, todos } = input;
+  const displayStatus = useAggregatorState ? undefined : (activity?.displayStatus ?? undefined);
+  const liveTodoStatus = useAggregatorState ? deriveTodoStatus(todos) : undefined;
+  const fallbackAgentStatus = useAggregatorState ? input.aggregatorAgentStatus : undefined;
+  const persistedTodoStatus = useAggregatorState
+    ? (activity?.todoStatus ?? undefined)
+    : (activity?.todoStatus ??
+      (activity?.hasTodos === false ? undefined : deriveTodoStatus(todos)));
+  return displayStatus ?? liveTodoStatus ?? fallbackAgentStatus ?? persistedTodoStatus;
+}
+
+/**
  * External store for workspace aggregators and streaming state.
  *
  * This store lives outside React's lifecycle and manages all workspace
@@ -2500,40 +2545,13 @@ export class WorkspaceStore {
         !transient.fullReplayInFlight &&
         getOnChatReplayMode(aggregator)?.type === "since";
       const aggregatorTodos = aggregator.getCurrentTodos();
-      // Sidebar status precedence, split into four tiers so each signal
-      // wins exactly when it should. Active and inactive workspaces draw
-      // from different sources but resolve through the same priority.
-      //
-      //   1. displayStatus (inactive only): system-driven transient status
-      //      from disk, e.g. "Compacting idle workspace…". Always wins.
-      //   2. liveTodoStatus (active only): the agent's most recent
-      //      `todo_write`, processed synchronously by the aggregator.
-      //      Beats the aggregator's persisted status_set value because
-      //      todo_write is the freshest explicit signal; beats persisted
-      //      todoStatus because the live aggregator state is ahead of
-      //      the async setTodoStatus + activity-emit round-trip.
-      //   3. fallbackAgentStatus (active only): aggregator.getAgentStatus()
-      //      — a blend of heartbeat / idle-compaction / background-turn
-      //      `displayStatus` events (genuinely transient) and the agent's
-      //      own `status_set` tool result (a pinned high-level intent).
-      //      Wins over persisted todoStatus so an AI-generated summary
-      //      doesn't mask an explicit system or agent-set message.
-      //   4. persistedTodoStatus: activity.todoStatus from disk. Either
-      //      a stale todo derivation or an AgentStatusService AI summary —
-      //      both writers target the same slot, last write wins. The
-      //      lowest tier so a newer in-memory signal always preempts.
-      //      For inactive workspaces, `hasTodos === false` blocks the
-      //      legacy aggregator-derive fallback so a freshly cleared todo
-      //      list doesn't briefly resurrect the stale derivation.
-      const displayStatus = useAggregatorState ? undefined : (activity?.displayStatus ?? undefined);
-      const liveTodoStatus = useAggregatorState ? deriveTodoStatus(aggregatorTodos) : undefined;
-      const fallbackAgentStatus = useAggregatorState ? aggregator.getAgentStatus() : undefined;
-      const persistedTodoStatus = useAggregatorState
-        ? (activity?.todoStatus ?? undefined)
-        : (activity?.todoStatus ??
-          (activity?.hasTodos === false ? undefined : deriveTodoStatus(aggregatorTodos)));
-      const agentStatus =
-        displayStatus ?? liveTodoStatus ?? fallbackAgentStatus ?? persistedTodoStatus;
+      const agentStatus = resolveSidebarAgentStatus({
+        useAggregatorState,
+        activity,
+        todos: aggregatorTodos,
+        // A plain getter: reading it for inactive workspaces too has no side effect.
+        aggregatorAgentStatus: aggregator.getAgentStatus(),
+      });
       const activeWorkflowRunIds = activity?.activeWorkflowRunIds ?? EMPTY_ACTIVE_WORKFLOW_RUN_IDS;
       const activeWorkflowRunCount = activity?.activeWorkflowRunCount ?? 0;
       const activeBashMonitorCount = activity?.activeBashMonitorCount ?? 0;
