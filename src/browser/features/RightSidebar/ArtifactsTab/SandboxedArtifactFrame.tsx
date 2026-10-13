@@ -54,7 +54,7 @@ interface BuiltDocument {
 }
 
 /**
- * SECURITY AUDIT: gate for `window.xum.openWorkspace` and the frame's C (annotate) key. The
+ * SECURITY AUDIT: gate for `window.xum.openWorkspace` and the frame's "C" (annotate) key. The
  * artifact's script can post either at any time, so the host honours them only while the user's
  * own click or key press inside `frame` is live: focus is on the iframe (a click or Tab into a
  * frame moves the app's activeElement to it, and a hidden frame cannot hold focus), and the app
@@ -203,9 +203,9 @@ export function SandboxedArtifactFrame(props: {
       if (message == null) return;
       switch (message.type) {
         case "key":
-          // C can turn annotate mode on, so, like openWorkspace, it needs the user's own key
-          // press in this frame: the artifact's script could post it at any time. Escape and
-          // Shift+F only ever exit, so they need no gesture.
+          // "C" (the annotate shortcut) can turn annotate mode on, so, like openWorkspace, it
+          // needs the user's own key press in this frame: the artifact's script could post it at
+          // any time. "Escape" and "F" only ever exit, so they need no gesture.
           if (message.key === "C" && !hasLiveUserGesture(frameRef.current)) break;
           onFrameKey?.(message.key);
           break;

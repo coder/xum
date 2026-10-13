@@ -16,8 +16,9 @@ function setWorkspaceAnnotating(workspaceId: string, on: boolean) {
 /**
  * Annotate mode (M5b) of the Artifacts panel: comments on the selected artifact become review
  * notes in the composer. Owns whether the mode is on and the open comment box (the pick), and
- * the rules every way in uses: the toolbar button, C on the panel and C from inside an HTML
- * frame toggle it, and Escape (panel or frame) peels one layer per press.
+ * the rules every way in uses: the toolbar button and the annotate shortcut (on the panel, or
+ * from inside an HTML frame) toggle it, and the cancel shortcut (panel or frame) peels one layer
+ * per press.
  *
  * `support` is the selected artifact's annotate flavour (null: it cannot be annotated, so the
  * mode reads as off). `pickKey` identifies the shown file version: a pick made on another
@@ -48,9 +49,9 @@ export function useArtifactAnnotateMode(
       setWorkspaceAnnotating(workspaceId, !annotating);
     },
     /**
-     * Escape steps out of annotating one layer at a time: an open comment box first, then
-     * annotate mode. Returns whether it consumed the key, so fullscreen closes only on a later
-     * Escape.
+     * The cancel shortcut steps out of annotating one layer at a time: an open comment box
+     * first, then annotate mode. Returns whether it consumed the key, so fullscreen closes only
+     * on a later press.
      */
     escapeAnnotate: (): boolean => {
       if (pendingPick != null) {

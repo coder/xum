@@ -19,9 +19,10 @@ import {
  * - Frame -> host (M3): `{ type: "key", key: "Escape" | "F" | "C", shiftKey }`, so Escape and
  *   Shift+F can exit fullscreen while focus is inside the frame (the host never lets a frame
  *   message enter fullscreen: the artifact's script can post these without a key press).
- *   C toggles annotate mode, which a click into the frame (focus then sits in it) made
- *   unreachable from the keyboard. It can turn annotate mode on, so the host honours it only
- *   during a live user gesture in this frame (hasLiveUserGesture, SandboxedArtifactFrame.tsx).
+ *   "C" is the annotate shortcut (KEYBINDS.TOGGLE_ARTIFACT_ANNOTATE), which a click into the
+ *   frame (focus then sits in it) made unreachable from the keyboard. It can turn annotate mode
+ *   on, so the host honours it only during a live user gesture in this frame
+ *   (hasLiveUserGesture, SandboxedArtifactFrame.tsx).
  * - Frame -> host (M5b): `{ type: "send", text, data? }` (window.xum.send) only fills the
  *   host-owned confirm strip, never sends by itself; `{ type: "setState", state }`
  *   (window.xum.setState) is persisted per artifact, for all its versions. Text and JSON sizes
@@ -373,11 +374,12 @@ function plainSingleKey(keybind: Keybind): string | null {
 const ANNOTATE_FRAME_KEY = plainSingleKey(KEYBINDS.TOGGLE_ARTIFACT_ANNOTATE);
 
 /**
- * C (annotate) is forwarded only once the key event has finished dispatching, so every handler
- * in the artifact (window listeners registered after this one included) has run: an artifact
- * that uses that key itself (a game, a keyboard widget) calls preventDefault and keeps it.
- * window.setTimeout reads the final defaultPrevented; it is not a timing guess. Escape and
- * Shift+F keep their capture-phase listener.
+ * The annotate key is forwarded (as "C") only once the key event has finished dispatching, so
+ * every handler in the artifact (window listeners registered after this one included) has run:
+ * an artifact that uses that key itself (a game, a keyboard widget) calls preventDefault or
+ * stopPropagation and keeps it.
+ * window.setTimeout reads the final defaultPrevented; it is not a timing guess. The exit keys
+ * keep their capture-phase listener.
  */
 const ANNOTATE_KEY_LISTENER =
   ANNOTATE_FRAME_KEY == null

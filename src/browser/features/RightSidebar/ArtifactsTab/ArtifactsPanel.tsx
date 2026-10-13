@@ -897,9 +897,10 @@ export function ArtifactsPanel(props: {
   // the frame or the toolbar button.
   // Escape peels the same layers as outside the frame (comment box, annotate mode, then
   // fullscreen); leaving annotate mode is an exit too, so the frame may trigger it.
-  // C toggles annotate mode as it does outside the frame: a click into the artifact moves focus
-  // into the frame, and C did nothing from then on. SandboxedArtifactFrame passes C on only
-  // during the user's own gesture in the frame, because it can turn annotate mode on.
+  // The frame's "C" message is the annotate shortcut pressed inside the frame, and toggles annotate
+  // mode as outside it: a click into the artifact moves focus into the frame, and the shortcut did
+  // nothing from then on. SandboxedArtifactFrame passes it on only during the user's own gesture
+  // in the frame, because it can turn annotate mode on.
   const handleFrameKey = (key: ArtifactFrameKey) => {
     if (key === "C") {
       toggleAnnotate();
