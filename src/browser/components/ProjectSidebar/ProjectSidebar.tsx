@@ -108,6 +108,7 @@ import { TitleEditProvider, useTitleEdit } from "@/browser/contexts/WorkspaceTit
 import { useConfirmDialog } from "@/browser/contexts/ConfirmDialogContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
+import { useWorkspaceActionKeybinds } from "./useWorkspaceActionKeybinds";
 import { useContextMenuPosition } from "@/browser/hooks/useContextMenuPosition";
 import {
   PositionedMenu,
@@ -1111,6 +1112,14 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     },
     [api, runtimeStatusStore, workspaceStopRuntimeError]
   );
+
+  useWorkspaceActionKeybinds({
+    selectedWorkspaceId: visibleSelectedWorkspaceId,
+    getWorkspaceMetadata: (workspaceId) => workspaceStore.getWorkspaceMetadata(workspaceId),
+    runtimeStatusStore,
+    onForkWorkspace: (workspaceId) => void handleForkWorkspace(workspaceId),
+    onStopRuntime: (workspaceId) => void handleStopRuntime(workspaceId),
+  });
 
   const hasActiveStream = useCallback(
     (workspaceId: string) => {
