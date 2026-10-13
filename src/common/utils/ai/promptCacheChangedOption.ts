@@ -25,3 +25,12 @@ export function describeChangedOption(option: PromptCacheChangedOption): string 
   if (option.previous === undefined && option.next === undefined) return option.key;
   return `${option.key} ${String(option.previous ?? null)} -> ${String(option.next ?? null)}`;
 }
+
+/** Every changed option on one line, or undefined when the break has none. */
+export function describeChangedOptions(
+  options: readonly PromptCacheChangedOption[] | undefined
+): string | undefined {
+  return options != null && options.length > 0
+    ? options.map(describeChangedOption).join(", ")
+    : undefined;
+}

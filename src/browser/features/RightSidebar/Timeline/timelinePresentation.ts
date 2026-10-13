@@ -42,7 +42,7 @@ import {
   type TimelineEvent,
   type TimelineEventKind,
 } from "@/common/orpc/schemas/timeline";
-import { describeChangedOption } from "@/common/utils/ai/promptCacheChangedOption";
+import { describeChangedOptions } from "@/common/utils/ai/promptCacheChangedOption";
 import { capitalize } from "@/common/utils/capitalize";
 import { classifyMachineTurnPromptKind } from "@/common/utils/machineTurnPrompts";
 
@@ -255,7 +255,7 @@ export interface PromptCacheBreakView {
   before: string;
   after: string;
   /** The request options that changed, when the break is in an options block. */
-  changedOptions?: string;
+  changedOptions: string | undefined;
 }
 
 function describeCacheBlock(block: PromptCacheBlockData | undefined): string {
@@ -275,9 +275,7 @@ export function getPromptCacheBreakView(event: TimelineEvent): PromptCacheBreakV
     position: `${capitalize(cacheBreak.boundary)} boundary · ${matched}`,
     before: describeCacheBlock(cacheBreak.previous),
     after: describeCacheBlock(cacheBreak.next),
-    ...(cacheBreak.changedOptions != null && cacheBreak.changedOptions.length > 0
-      ? { changedOptions: cacheBreak.changedOptions.map(describeChangedOption).join(", ") }
-      : {}),
+    changedOptions: describeChangedOptions(cacheBreak.changedOptions),
   };
 }
 

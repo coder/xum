@@ -58,7 +58,7 @@
 
 import { createHash } from "node:crypto";
 import {
-  describeChangedOption,
+  describeChangedOptions,
   type PromptCacheChangedOption,
   type PromptCacheOptionValue,
 } from "@/common/utils/ai/promptCacheChangedOption";
@@ -130,19 +130,21 @@ function sha256(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
 
+/** One option as PromptCacheBlock.options keeps it. */
+function reportedOption(key: string, value: unknown): PromptCacheOptionValue {
+  const serialized = JSON.stringify(value) ?? "null";
+  if (KEY_ONLY_OPTIONS.has(key)) return sha256(serialized).slice(0, 16);
+  if (value === null || typeof value === "boolean") return value;
+  // Strings (effort, speed) as they are; objects (thinking, toolChoice) as short JSON.
+  return (typeof value === "string" ? value : serialized).slice(0, 128);
+}
+
 /** The reportable form of one sentinel's options (see PromptCacheBlock.options). */
 function optionValues(sentinel: Record<string, unknown>): Record<string, PromptCacheOptionValue> {
-  const values: Record<string, PromptCacheOptionValue> = {};
-  for (const [key, value] of Object.entries(sentinel)) {
-    if (key === "type") continue;
-    const serialized = JSON.stringify(value) ?? "null";
-    if (KEY_ONLY_OPTIONS.has(key)) values[key] = sha256(serialized).slice(0, 16);
-    else if (typeof value === "string") values[key] = value.slice(0, 128);
-    else if (value === null || typeof value === "number" || typeof value === "boolean") {
-      values[key] = value;
-    } else values[key] = serialized.slice(0, 128);
-  }
-  return values;
+  const { type: _type, ...options } = sentinel;
+  return Object.fromEntries(
+    Object.entries(options).map(([key, value]) => [key, reportedOption(key, value)])
+  );
 }
 
 /**
@@ -653,25 +655,24 @@ function summarize(block: PromptCacheBlock): PromptCacheBlockSummary {
   return summary;
 }
 
-/** The options that differ when both blocks are the same options sentinel, else undefined. */
-function changedOptions(
+/**
+ * The break's `changedOptions` field: the options that differ when both blocks
+ * are the same options sentinel, else no field.
+ */
+function changedOptionsField(
   previous: PromptCacheBlock,
   next: PromptCacheBlock | undefined
-): PromptCacheChangedOption[] | undefined {
-  if (previous.options == null || next?.options == null || previous.type !== next.type) {
-    return undefined;
-  }
+): Pick<PromptCachePrefixBreak, "changedOptions"> {
   const before = previous.options;
-  const after = next.options;
-  const keys = [...new Set([...Object.keys(before), ...Object.keys(after)])];
-  const changed = keys
+  const after = next?.type === previous.type ? next.options : undefined;
+  if (before == null || after == null) return {};
+  // One sentinel type always has the same keys, so `before` lists them all.
+  const changed = Object.keys(before)
     .filter((key) => before[key] !== after[key])
     .map((key) =>
-      KEY_ONLY_OPTIONS.has(key)
-        ? { key }
-        : { key, previous: before[key] ?? null, next: after[key] ?? null }
+      KEY_ONLY_OPTIONS.has(key) ? { key } : { key, previous: before[key], next: after[key] }
     );
-  return changed.length > 0 ? changed : undefined;
+  return changed.length > 0 ? { changedOptions: changed } : {};
 }
 
 /**
@@ -705,7 +706,6 @@ export function comparePromptCachePrefix(
     nextBlock != null && order(nextBlock) < order(previousBlock)
       ? nextBlock.section
       : previousBlock.section;
-  const changed = changedOptions(previousBlock, nextBlock);
   return {
     kind: "break",
     section,
@@ -714,8 +714,13 @@ export function comparePromptCachePrefix(
     nextBlockCount: next.length,
     previous: summarize(previousBlock),
     ...(nextBlock != null ? { next: summarize(nextBlock) } : {}),
-    ...(changed != null ? { changedOptions: changed } : {}),
+    ...changedOptionsField(previousBlock, nextBlock),
   };
+}
+
+function describeChangedOptionsSuffix(options: readonly PromptCacheChangedOption[] | undefined) {
+  const changed = describeChangedOptions(options);
+  return changed != null ? `; changed options: ${changed}` : "";
 }
 
 function describeBlock(block: PromptCacheBlockSummary | undefined): string {
@@ -730,8 +735,6 @@ export function describePromptCacheBreak(comparison: PromptCachePrefixBreak): st
     `Prompt cache prefix broke in ${comparison.section} at block ${comparison.blockIndex} ` +
     `of ${comparison.previousBlockCount}: ` +
     `${describeBlock(comparison.previous)} -> ${describeBlock(comparison.next)}` +
-    (comparison.changedOptions != null
-      ? `; changed options: ${comparison.changedOptions.map(describeChangedOption).join(", ")}`
-      : "")
+    describeChangedOptionsSuffix(comparison.changedOptions)
   );
 }
