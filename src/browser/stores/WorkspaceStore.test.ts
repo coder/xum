@@ -1820,6 +1820,7 @@ describe("WorkspaceStore", () => {
     it("warns and retries when a client change aborts the attempt mid-error", async () => {
       const workspaceId = "workspace-error-after-client-change";
       let subscriptions = 0;
+      // eslint-disable-next-line require-yield -- the attempt only waits, then fails
       mockOnChat.mockImplementation(async function* (_input, options) {
         subscriptions++;
         if (subscriptions > 1) return await waitForAbortSignal(options?.signal);
@@ -1832,11 +1833,11 @@ describe("WorkspaceStore", () => {
       try {
         createAndAddWorkspace(store, workspaceId);
         expect(await waitUntil(() => subscriptions === 1)).toBe(true);
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
-        store.setClient({ ...mockClient } as any);
+        // A new client object, so the store treats it as a client change.
+        store.setClient({ ...mockClient } as unknown as Parameters<WorkspaceStore["setClient"]>[0]);
 
         expect(await waitUntil(() => subscriptions === 2)).toBe(true);
-        expect(consoleWarn.mock.calls.map(([message]) => message)).toContain(
+        expect(consoleWarn.mock.calls.map(([message]: unknown[]) => message)).toContain(
           `[WorkspaceStore] onChat subscription aborted for ${workspaceId}; retrying...`
         );
         expect(consoleError).not.toHaveBeenCalled();
@@ -3879,6 +3880,41 @@ describe("WorkspaceStore", () => {
       } finally {
         for (const undo of restore) undo();
       }
+    });
+
+    it("forwards a legacy auto-retry boolean once and drops it after the subscribe", async () => {
+      const workspaceId = "workspace-auto-retry-forward";
+      const autoRetryKey = getAutoRetryKey(workspaceId);
+      global.window.localStorage.setItem(autoRetryKey, JSON.stringify(false));
+      let storedAtSubscribe: string | null = "unread";
+      // A plain function runs when the store calls onChat; a generator body would run later.
+      mockOnChat.mockImplementation(((
+        input?: { workspaceId: string },
+        options?: { signal?: AbortSignal }
+      ) => {
+        if (input?.workspaceId === workspaceId) {
+          storedAtSubscribe = global.window.localStorage.getItem(autoRetryKey);
+        }
+        // eslint-disable-next-line require-yield -- an open stream that never yields
+        return (async function* () {
+          await waitForAbortSignal(options?.signal);
+        })();
+      }) as unknown as Parameters<typeof mockOnChat.mockImplementation>[0]);
+
+      createAndAddWorkspace(store, workspaceId);
+      expect(await waitUntil(() => mockOnChat.mock.calls.length > 0, 1_000)).toBe(true);
+
+      expect(mockOnChat.mock.calls[0]?.[0]).toMatchObject({
+        workspaceId,
+        legacyAutoRetryEnabled: false,
+        batchReplay: true,
+        replayWindow: true,
+      });
+      // Still stored while the subscribe runs, so a failed subscribe can forward it again.
+      expect(storedAtSubscribe).toBe("false");
+      expect(await waitUntil(() => global.window.localStorage.getItem(autoRetryKey) === null)).toBe(
+        true
+      );
     });
 
     it("sanitizes malformed legacy auto-retry values before subscribing", async () => {
