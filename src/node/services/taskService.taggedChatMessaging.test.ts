@@ -192,6 +192,23 @@ describe("TaskService tagged-chat messaging", () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
+  test("a malformed blank parent marker cannot promote a child entry into a tagged root", async () => {
+    const { config } = await setup();
+    await updateWorkspace(config, "child", { parentWorkspaceId: "" });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    expect(taskService.listTaskTreeAgents("alpha").relatedChats ?? []).not.toContainEqual(
+      expect.objectContaining({ workspaceId: "child" })
+    );
+    expect(await taskService.sendAgentTreeMessage("alpha", "child", "not a root")).toEqual(
+      Err({ code: "not_found" })
+    );
+    expect(await taskService.sendAgentTreeMessage("child", "beta", "not a root")).toMatchObject({
+      success: false,
+    });
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
   test("changing either tag fences already queued tagged dispatch", async () => {
     const { config } = await setup();
     const sendMessage = mock((...args: Parameters<WorkspaceHost["sendMessage"]>) => {

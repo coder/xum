@@ -4762,6 +4762,9 @@ export class Config {
           pendingRemoval: existing.pendingRemoval,
           pendingArchive: existing.pendingArchive,
           unrelatedWorkspaceConsentPending: existing.unrelatedWorkspaceConsentPending,
+          // Server-owned and unpublished on metadata: a round trip must not drop it,
+          // or in-flight tagged sends would read a spurious revocation.
+          messagingTagGeneration: existing.messagingTagGeneration,
           delegatedCreation: existing.delegatedCreation,
           // Monotone (#5174): a metadata round trip never un-marks a migrated plan.
           remotePlanMigrated: existing.remotePlanMigrated,

@@ -4397,6 +4397,38 @@ describe("Config", () => {
       expect(row()).toMatchObject({ title: "Renamed", taskTerminalFailure: marker });
     });
 
+    it("keeps the messaging-tag revocation generation through reload and a metadata write", async () => {
+      const projectPath = path.join(tempDir, "project");
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [
+            {
+              id: "tagged",
+              name: "tagged",
+              path: projectPath,
+              createdAt: "2025-01-01T00:00:00.000Z",
+              runtimeConfig: { type: "local" },
+              messagingTag: "research",
+              messagingTagGeneration: "gen-1",
+            },
+          ],
+        });
+        return cfg;
+      });
+      const reloaded = new Config(tempDir);
+      const row = () =>
+        new Config(tempDir).loadConfigOrDefault().projects.get(projectPath)?.workspaces[0];
+      // The tag publishes on metadata; its server-owned generation never does.
+      const [metadata] = await reloaded.getAllWorkspaceMetadata();
+      expect(metadata.messagingTag).toBe("research");
+      await reloaded.addWorkspace(projectPath, { ...metadata, title: "Renamed" });
+      expect(row()).toMatchObject({
+        title: "Renamed",
+        messagingTag: "research",
+        messagingTagGeneration: "gen-1",
+      });
+    });
+
     it("keeps a parent's reservation tombstones through reload and a metadata write", async () => {
       const projectPath = path.join(tempDir, "project");
       await config.editConfig((cfg) => {

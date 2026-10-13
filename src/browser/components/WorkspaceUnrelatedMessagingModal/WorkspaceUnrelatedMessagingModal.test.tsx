@@ -264,6 +264,40 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
     expect(onSetMessagingTag.mock.calls[0]?.[0]).toBeNull();
   });
 
+  test("a normalized no-op save restores the canonical tag text", async () => {
+    const onSetMessagingTag = mock((_tag: string | null) =>
+      Promise.resolve(Ok(undefined) as Result<void, string>)
+    );
+    const view = render(
+      <WorkspaceUnrelatedMessagingModal
+        open={true}
+        onOpenChange={() => undefined}
+        consentSupported={true}
+        enabled={false}
+        onSetEnabled={() => Promise.resolve(Ok(undefined))}
+        holdUntilTurnEnd={false}
+        onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
+        tagSupported={true}
+        messagingTag={"research"}
+        onSetMessagingTag={onSetMessagingTag}
+      />
+    );
+    const input = () => view.getByLabelText(/messaging tag/i) as HTMLInputElement;
+    const user = userEvent.setup({ document: view.container.ownerDocument });
+    await user.click(input());
+    await user.clear(input());
+    await user.type(input(), "RESEARCH");
+    fireEvent.blur(input());
+    await waitFor(() => {
+      expect(onSetMessagingTag).toHaveBeenCalledTimes(1);
+    });
+    // The persisted tag is unchanged, so no remount happens: the input must
+    // fall back to the canonical @form instead of keeping the raw draft.
+    await waitFor(() => {
+      expect(input().value).toBe("@research");
+    });
+  });
+
   test("a rejected tag save surfaces the error and reverts to the persisted tag", async () => {
     const onSetMessagingTag = mock((_tag: string | null) =>
       Promise.resolve(Err("Invalid messaging tag") as Result<void, string>)

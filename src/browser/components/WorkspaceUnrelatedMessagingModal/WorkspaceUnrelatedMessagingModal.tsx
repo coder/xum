@@ -239,9 +239,10 @@ interface MessagingTagSettingProps {
 
 /**
  * The messaging-tag row. The input is uncontrolled, keyed by the persisted tag: a save
- * reads the DOM value on blur/submit, and only a failed save resets it to the persisted
- * text — on success the republished metadata (which may arrive before the ack) owns the
- * display, so writing the old text back would clobber the newly keyed input.
+ * reads the DOM value on blur/submit and then restores the canonical persisted text on
+ * that same element (failed saves revert; normalized no-op saves show the canonical
+ * form). The republished metadata — which may arrive before the ack and remount the
+ * input under a new key — owns the display after a successful change.
  */
 /** Empty drafts clear the tag; anything else is sent raw for backend normalization. */
 function draftToTag(draft: string): string | null {
@@ -257,9 +258,14 @@ function MessagingTagSetting(props: MessagingTagSettingProps) {
     if (draft === persistedTagText) {
       return;
     }
-    const saved = await props.onSaveTag(draftToTag(draft));
-    if (!saved && tagInputRef.current) {
-      tagInputRef.current.value = persistedTagText;
+    // Restore the canonical persisted text only on the element that submitted the
+    // draft: on success the backend may have republished before the ack, remounting
+    // the input under a new key (writing there would clobber the new tag), while a
+    // normalized no-op save never remounts and must not leave the noncanonical draft.
+    const submittedElement = tagInputRef.current;
+    await props.onSaveTag(draftToTag(draft));
+    if (submittedElement != null && tagInputRef.current === submittedElement) {
+      submittedElement.value = persistedTagText;
     }
   };
   const submitDraft = () => {

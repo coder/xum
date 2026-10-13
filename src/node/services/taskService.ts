@@ -16070,8 +16070,11 @@ export class TaskService implements AgentTaskIntegration {
     if (
       sender.sideChatParentWorkspaceId != null ||
       target.sideChatParentWorkspaceId != null ||
-      coerceNonEmptyString(sender.parentWorkspaceId) != null ||
-      coerceNonEmptyString(target.parentWorkspaceId) != null ||
+      // Raw presence, not coercion: config loads leniently, so a malformed non-string
+      // or blank parent marker must fail closed as a child, exactly as setMessagingTag
+      // rejects any non-null marker — never silently promote it to a root chat.
+      sender.parentWorkspaceId != null ||
+      target.parentWorkspaceId != null ||
       sender.id == null ||
       sender.id === target.id
     ) {
