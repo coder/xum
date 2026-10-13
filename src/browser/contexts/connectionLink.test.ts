@@ -164,6 +164,20 @@ describe("ConnectionLink", () => {
     expect(isConnectionLostError(error)).toBe(false);
   });
 
+  test("a late detach for an old generation leaves the new one attached", async () => {
+    const link = new ConnectionLink();
+    const oldId = link.attach(controlledLink().link);
+    link.detach(oldId);
+    const next = controlledLink();
+    link.attach(next.link);
+    // The old socket's close event arrives after the forced reconnect.
+    link.detach(oldId);
+    expect(link.isAttached).toBe(true);
+    const pending = link.call(["general", "ping"], undefined, NO_OPTIONS);
+    next.calls[0]?.resolve("pong");
+    expect(await pending).toBe("pong");
+  });
+
   test("attach() twice is a programmer error", () => {
     const link = new ConnectionLink();
     link.attach(controlledLink().link);
@@ -223,6 +237,32 @@ describe("ConnectionLink", () => {
       link.detach();
       expect(isConnectionLostError(await loop)).toBe(true);
       expect(seen).toEqual([1]);
+    });
+
+    test("a completed stream stays done after a later detach", async () => {
+      const { link, source, iterator } = await openStream();
+      const last = iterator.next();
+      source.pulls[0]?.resolve({ done: true, value: undefined });
+      expect((await last).done).toBe(true);
+      link.detach();
+      expect(await iterator.next()).toEqual({ done: true, value: undefined });
+    });
+
+    test("a pull after a caller abort and a detach keeps the caller's reason", async () => {
+      const link = new ConnectionLink();
+      const inner = controlledLink();
+      link.attach(inner.link);
+      const controller = new AbortController();
+      const opened = link.call(["terminal", "attach"], undefined, {
+        context: {},
+        signal: controller.signal,
+      });
+      inner.calls[0]?.resolve(controlledStream().stream);
+      const iterator = (await opened) as AsyncIteratorObject<unknown>;
+      const reason = new DOMException("user closed the view", "AbortError");
+      controller.abort(reason);
+      link.detach();
+      expect(await iterator.next().catch((e: unknown) => e)).toBe(reason);
     });
 
     test("return() reaches the inner stream once", async () => {

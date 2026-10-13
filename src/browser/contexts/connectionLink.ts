@@ -90,10 +90,15 @@ export class ConnectionLink implements Link {
     return generation.id;
   }
 
-  /** Synchronous and idempotent. */
-  detach(): void {
+  /**
+   * Synchronous and idempotent. With a generation number (from attach()), it detaches only that
+   * generation: a late `close` event of an old socket must not detach the socket that replaced
+   * it after a forced reconnect.
+   */
+  detach(generationId?: number): void {
     const generation = this.current;
     if (generation == null) return;
+    if (generationId != null && generationId !== generation.id) return;
     this.current = null;
     generation.detached = true;
     const lost = new ConnectionLostError();
@@ -217,6 +222,8 @@ function settleUnlessLost<T, R>(
  */
 class GenerationIterator implements AsyncIteratorObject<unknown, unknown, unknown>, LiveIterator {
   private finished = false;
+  /** Ended by detach(), not by the stream itself: later pulls report the lost connection. */
+  private lost = false;
   private readonly waiting = new Set<(error: ConnectionLostError) => void>();
 
   constructor(
@@ -230,6 +237,7 @@ class GenerationIterator implements AsyncIteratorObject<unknown, unknown, unknow
   /** Called by detach(). */
   end(): void {
     if (this.finished) return;
+    this.lost = true;
     this.finish();
     const lost = new ConnectionLostError();
     for (const lose of this.waiting) lose(lost);
@@ -238,7 +246,9 @@ class GenerationIterator implements AsyncIteratorObject<unknown, unknown, unknow
   }
 
   next(): Promise<IteratorResult<unknown, unknown>> {
-    if (this.generation.detached) return Promise.reject(new ConnectionLostError());
+    // A stream that completed (or was returned) stays done, even after a later detach.
+    // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- the caller's reason, or ConnectionLostError
+    if (this.lost) return Promise.reject(this.lossError());
     if (this.finished) return Promise.resolve({ done: true, value: undefined });
     return settleUnlessLost(this.inner.next(), {
       waiters: this.waiting,
@@ -273,6 +283,11 @@ class GenerationIterator implements AsyncIteratorObject<unknown, unknown, unknow
 
   async [Symbol.asyncDispose](): Promise<void> {
     await this.return();
+  }
+
+  /** The caller's abort wins over the connection loss, as for one-shot calls. */
+  private lossError(): unknown {
+    return this.signal?.aborted ? this.signal.reason : new ConnectionLostError();
   }
 
   private finish(): void {
