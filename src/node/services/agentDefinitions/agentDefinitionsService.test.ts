@@ -1042,6 +1042,7 @@ base: a
         const pkg = await readAgentDefinition(runtime, checkout.path, "host-helper");
         expect(pkg.scope).toBe("global");
         expect(pkg.frontmatter.name).toBe("Host Helper");
+        // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types `rejects` as void
         await expect(
           readAgentDefinition(runtime, checkout.path, "checkout-helper")
         ).rejects.toThrow();
