@@ -93,6 +93,7 @@ import {
   statusSetResultStatus,
 } from "@/node/services/aiServiceEventGuards";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
+import { normalizeLegacyMuxMetadata } from "@/node/utils/messages/legacy";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import { ARTIFACT_INTERACTION_METADATA_RESERVED_MESSAGE } from "@/common/constants/artifactInteractions";
@@ -18800,6 +18801,10 @@ export class WorkspaceService
     if (isSessionTapeReplayMode()) {
       return Err(SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE);
     }
+    // History reads promote a legacy `cmuxMetadata` to `muxMetadata` (normalizeLegacyMuxMetadata),
+    // so every check below must see the row as recovery will read it: otherwise a forged receipt
+    // or plan-review envelope under `cmuxMetadata` passes them (Codex PRRT_kwDOPxxmWM6r2iIo).
+    summaryMessage = normalizeLegacyMuxMetadata(summaryMessage);
     // The row is client-supplied (workspace.replaceChatHistory). Plan-review rows may only come
     // from the dedicated endpoints; with a matching envelope this row would otherwise persist an
     // authentic record that skipped their validation, directly or as a compaction summary's
