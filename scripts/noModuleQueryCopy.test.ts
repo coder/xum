@@ -43,6 +43,7 @@ test("reports static imports and re-exports of query copies", () => {
   expect(reportCount(`export { x } from "./module?real=1";`)).toBe(1);
   expect(reportCount(`export * from "./module?real=1";`)).toBe(1);
   expect(reportCount(`import { y } from "./module.helpers?copy=1";`)).toBe(1);
+  expect(reportCount(`import { y } from "@shared/browser/App?real=1";`)).toBe(1);
 });
 
 test("allows plain repo specifiers, package and asset queries, and type-only imports", () => {
@@ -51,6 +52,9 @@ test("allows plain repo specifiers, package and asset queries, and type-only imp
   expect(reportCount(`import Logo from "@/browser/assets/logos/logo.svg?react";`)).toBe(0);
   expect(reportCount(`import type * as M from "./module?real=1";`)).toBe(0);
   expect(reportCount(`export type { T } from "./module?real=1";`)).toBe(0);
+  expect(reportCount(`import { type A, type B } from "./module?real=1";`)).toBe(0);
+  expect(reportCount(`export { type T } from "./module?real=1";`)).toBe(0);
+  expect(reportCount(`import { type A, b } from "./module?real=1";`)).toBe(1);
 });
 
 test("allows only the listed specifiers of the listed file", () => {

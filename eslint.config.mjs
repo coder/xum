@@ -575,7 +575,9 @@ const localPlugin = {
         const isRepoQueryCopy = (specifier) => {
           const queryStart = specifier.indexOf("?");
           return (
-            (specifier.startsWith("@/") || specifier.startsWith(".")) &&
+            (specifier.startsWith("@/") ||
+              specifier.startsWith("@shared/") ||
+              specifier.startsWith(".")) &&
             queryStart !== -1 &&
             !/\.(svg|png|jpe?g|gif|webp|avif|ico|css|json|txt|md|html|wasm|woff2?|ttf)$/.test(
               specifier.slice(0, queryStart)
@@ -601,12 +603,21 @@ const localPlugin = {
           ImportExpression(node) {
             check(node, node.source);
           },
-          // Type-only imports and exports load nothing at runtime.
+          // Type-only imports and exports load nothing at runtime, whether the declaration
+          // (`import type`) or every specifier (`import { type A, type B }`) is type-only.
           ImportDeclaration(node) {
-            if (node.importKind !== "type") check(node, node.source);
+            const typeOnly =
+              node.importKind === "type" ||
+              (node.specifiers.length > 0 &&
+                node.specifiers.every((specifier) => specifier.importKind === "type"));
+            if (!typeOnly) check(node, node.source);
           },
           ExportNamedDeclaration(node) {
-            if (node.exportKind !== "type") check(node, node.source);
+            const typeOnly =
+              node.exportKind === "type" ||
+              (node.specifiers.length > 0 &&
+                node.specifiers.every((specifier) => specifier.exportKind === "type"));
+            if (!typeOnly) check(node, node.source);
           },
           ExportAllDeclaration(node) {
             if (node.exportKind !== "type") check(node, node.source);
@@ -2827,6 +2838,44 @@ export default defineConfig([
     rules: {
       "local/no-cast-to-api-client": "error",
       "local/no-clear-dom-global": "error",
+      "local/require-module-mock-restore": [
+        "error",
+        {
+          allow: {
+            // bun 1.3.5 cannot load the real noVNC RFB module (`require() async module
+            // .../util/browser.js is unsupported`), so there are no real exports to restore and
+            // no later suite can observe the stub.
+            "src/browser/features/desktop/DesktopPanel.test.tsx": ["@novnc/novnc/lib/rfb"],
+            "src/browser/features/desktop/useDesktopConnection.test.tsx": ["@novnc/novnc/lib/rfb"],
+          },
+        },
+      ],
+    },
+    languageOptions: {
+      globals: {
+        describe: "readonly",
+        it: "readonly",
+        test: "readonly",
+        expect: "readonly",
+        jest: "readonly",
+        beforeEach: "readonly",
+        afterEach: "readonly",
+        beforeAll: "readonly",
+        afterAll: "readonly",
+      },
+    },
+  },
+  {
+    // Test files and the support code they load run in the same covered bun process.
+    files: [
+      "**/*.test.ts",
+      "**/*.test.tsx",
+      "tests/**/*.{ts,tsx}",
+      "src/**/*.testHarness.{ts,tsx}",
+      "src/**/*.testUtils.{ts,tsx}",
+      "src/**/test[A-Z]*.{ts,tsx}",
+    ],
+    rules: {
       "local/no-module-query-copy": [
         "error",
         {
@@ -2873,31 +2922,6 @@ export default defineConfig([
           },
         },
       ],
-      "local/require-module-mock-restore": [
-        "error",
-        {
-          allow: {
-            // bun 1.3.5 cannot load the real noVNC RFB module (`require() async module
-            // .../util/browser.js is unsupported`), so there are no real exports to restore and
-            // no later suite can observe the stub.
-            "src/browser/features/desktop/DesktopPanel.test.tsx": ["@novnc/novnc/lib/rfb"],
-            "src/browser/features/desktop/useDesktopConnection.test.tsx": ["@novnc/novnc/lib/rfb"],
-          },
-        },
-      ],
-    },
-    languageOptions: {
-      globals: {
-        describe: "readonly",
-        it: "readonly",
-        test: "readonly",
-        expect: "readonly",
-        jest: "readonly",
-        beforeEach: "readonly",
-        afterEach: "readonly",
-        beforeAll: "readonly",
-        afterAll: "readonly",
-      },
     },
   },
   {
