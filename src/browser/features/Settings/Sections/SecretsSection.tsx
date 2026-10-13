@@ -149,6 +149,15 @@ export function useGlobalSecretKeys(api: APIClient | null) {
   return [globalSecretKeys, setGlobalSecretKeys] as const;
 }
 
+/** Save needs a dirty form, a live client and a current read (see `reading`). */
+function isSaveDisabled(state: {
+  actionsDisabled: boolean;
+  offline: boolean;
+  reading: boolean;
+}): boolean {
+  return state.actionsDisabled || state.offline || state.reading;
+}
+
 export const SecretsSection: React.FC = () => {
   const { api } = useAPI();
   // Offline, edited rows stay on screen, but Save is disabled: it could not reach the server.
@@ -188,6 +197,9 @@ export const SecretsSection: React.FC = () => {
 
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  // A read is pending (a reconnect reloads behind the shown rows). Save waits for it: the whole
+  // list is written, so a stale one would overwrite secrets changed on the server while offline.
+  const [reading, setReading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const scopeLabel = scope === "global" ? "Global" : "Project";
@@ -266,6 +278,7 @@ export const SecretsSection: React.FC = () => {
       return;
     }
 
+    setReading(true);
     const applyLoadedSecrets = (nextSecrets: Secret[]) => {
       shownSecretsKeyRef.current = secretsKey;
       setLoadedSecrets(nextSecrets);
@@ -332,6 +345,7 @@ export const SecretsSection: React.FC = () => {
     } finally {
       if (!isStaleRequest()) {
         setLoading(false);
+        setReading(false);
       }
     }
   }, [api, currentProjectPath, scope]);
@@ -798,7 +812,7 @@ export const SecretsSection: React.FC = () => {
         <Button
           type="button"
           onClick={() => void handleSave()}
-          disabled={actionsDisabled || offline}
+          disabled={isSaveDisabled({ actionsDisabled, offline, reading })}
         >
           {saving ? "Saving..." : "Save"}
         </Button>

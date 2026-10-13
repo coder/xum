@@ -130,6 +130,28 @@ describe.each([...GAP_MODES])("SecretsSection across a reconnect (%s)", (mode) =
     expect(view.queryByDisplayValue("SERVER_KEY")).toBeNull();
   });
 
+  // An edit kept across the reconnect is stale until the read answers. Save writes the whole
+  // list, so it must wait: it would overwrite secrets changed on the server while offline.
+  test("disables Save for a kept edit until the reload answers", async () => {
+    const view = renderSecrets();
+    const keyField = await waitFor(() => view.getByDisplayValue("OLD_KEY"));
+    typeInto(keyField, "EDITED_KEY");
+    const save = view.getByRole("button", { name: "Save" }) as HTMLButtonElement;
+    await waitFor(() => expect(save.disabled).toBe(false));
+
+    let answer: ((secrets: Secret[]) => void) | null = null;
+    serverSecrets = new Promise((resolve) => (answer = resolve));
+    await harness.drop();
+    harness.reconnect();
+    await settle();
+    expect(view.queryByDisplayValue("EDITED_KEY")).not.toBeNull();
+    expect(save.disabled).toBe(true);
+
+    act(() => answer?.([{ key: "SERVER_KEY", value: "server" }]));
+    await waitFor(() => expect(save.disabled).toBe(false));
+    expect(view.queryByDisplayValue("EDITED_KEY")).not.toBeNull();
+  });
+
   // Offline the edited rows stay, but a Save could not reach the server: it must be disabled.
   test("disables Save for an edited row while offline", async () => {
     const view = renderSecrets();
