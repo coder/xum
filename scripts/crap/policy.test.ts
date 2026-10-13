@@ -203,3 +203,44 @@ test("a Crap-Debt downgrades every violation to a warning", () => {
   const debt = [{ source: "--debt", reason: "hotfix" }];
   expect(applyDebt(findings, debt).map((finding) => finding.severity)).toEqual(["warning"]);
 });
+
+describe("Bun inlined-const suspects", () => {
+  const suspect = (base: FunctionRow): FunctionRow => ({ ...base, bunInlinedConstSuspect: true });
+
+  test("coverage-based findings warn when the head or base row is suspect", () => {
+    const base = row("f", 5, [1, 9], 1);
+    const lost = row("f", 5, [1, 9], 0);
+    expect(verdicts([base], [lost])).toEqual([["floor-crap", "violation", `${PATH}::demo.mod::f`]]);
+    expect(verdicts([base], [suspect(lost)])).toEqual([
+      ["floor-crap", "warning", `${PATH}::demo.mod::f`],
+    ]);
+    // A suspect base score is no floor either.
+    expect(verdicts([suspect(row("f", 6, [1, 9], 0))], [row("f", 6, [1, 9], 0)], touchedAt(3))).toEqual([
+      ["crap-tax", "warning", `${PATH}::demo.mod::f`],
+    ]);
+    expect(verdicts([row("f", 6, [1, 9], 0)], [row("f", 6, [1, 9], 0)], touchedAt(3))).toEqual([
+      ["crap-tax", "violation", `${PATH}::demo.mod::f`],
+    ]);
+    expect(verdicts([], [suspect(row("g", 3, [1, 9], 0))])).toEqual([
+      ["new-function", "warning", `${PATH}::demo.mod::g`],
+    ]);
+    expect(verdicts([], [row("g", 3, [1, 9], 0)])).toEqual([
+      ["new-function", "violation", `${PATH}::demo.mod::g`],
+    ]);
+  });
+
+  test("the warning says why, and a complexity gain stays a violation", () => {
+    const { findings } = evaluate(
+      [row("f", 5, [1, 9], 1), row("h", 2, [11, 12], 1)],
+      [suspect(row("f", 5, [1, 9], 0)), suspect(row("h", 3, [11, 13], 0))],
+      NOTHING_CHANGED
+    );
+    expect(findings.map((finding) => [finding.rule, finding.severity])).toEqual([
+      ["floor-crap", "warning"],
+      ["floor-cc", "violation"],
+    ]);
+    expect(findings[0].bunInlinedConstSuspect).toBe(true);
+    expect(findings[0].message).toContain("inlined-const");
+    expect(findings[1].bunInlinedConstSuspect).toBeUndefined();
+  });
+});

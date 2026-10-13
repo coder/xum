@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { annotation, coverageStatus, lcovFiles } from "./ci";
+import { annotation, coverageStatus, lcovFiles, summary } from "./ci";
 import type { Finding } from "./policy";
 
 test("coverage is partial when any expected shard report is missing", () => {
@@ -80,4 +80,36 @@ test("reads every nested lcov.info, but counts only artifacts with a top-level r
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("the summary lists Bun inlined-const suspects in their own group", () => {
+  const head = {
+    path: "src/a.ts",
+    name: "f",
+    namespace: "a",
+    startLine: 1,
+    endLine: 9,
+    complexity: 12,
+    coverage: 0,
+    crap: 156,
+  };
+  const findings: Finding[] = [
+    { rule: "floor-cc", severity: "violation", key: "a", base: null, head, message: "grew" },
+    {
+      rule: "new-function",
+      severity: "warning",
+      key: "b",
+      base: null,
+      head: { ...head, bunInlinedConstSuspect: true },
+      message: "hidden",
+      bunInlinedConstSuspect: true,
+    },
+  ];
+  const expected = { unit: 1, integration: 0 };
+  const text = summary({ findings, debt: [], ok: false }, coverageStatus(["crap-lcov-unit-1"], expected), expected, "");
+  const group = text.indexOf("### Coverage Bun may hide (1 warning(s))");
+  expect(group).toBeGreaterThan(0);
+  expect(text.indexOf("| violation | floor-cc | grew |")).toBeLessThan(group);
+  expect(text.indexOf("| warning | new-function | hidden |")).toBeGreaterThan(group);
+  expect(text).toContain("**1 violation(s), 1 warning(s).**");
 });

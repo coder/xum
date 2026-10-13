@@ -85,11 +85,24 @@ export function summary(
     `**${violations} violation(s), ${report.findings.length - violations} warning(s).**`,
     ""
   );
-  if (report.findings.length > 0) {
+  const table = (findings: readonly Finding[]) => {
     lines.push("| Severity | Rule | Finding |", "| --- | --- | --- |");
-    for (const finding of report.findings) {
+    for (const finding of findings) {
       lines.push(`| ${finding.severity} | ${finding.rule} | ${cell(finding.message)} |`);
     }
+  };
+  const suspects = report.findings.filter((finding) => finding.bunInlinedConstSuspect === true);
+  const others = report.findings.filter((finding) => finding.bunInlinedConstSuspect !== true);
+  if (others.length > 0) table(others);
+  if (suspects.length > 0) {
+    if (others.length > 0) lines.push("");
+    lines.push(
+      `### Coverage Bun may hide (${suspects.length} warning(s))`,
+      "",
+      "Bun's coverage reports these functions' lines as unrun when an uncalled function uses an inlined literal `const` above them (the inlined-const bug, see scripts/crap/crapper_report.py). Their score may be wrong, so these findings only warn. Check the function's tests by hand.",
+      ""
+    );
+    table(suspects);
   }
   for (const use of report.debt) lines.push("", `Crap-Debt (${use.source}): ${cell(use.reason)}`);
   return `${lines.join("\n")}\n`;

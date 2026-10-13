@@ -400,3 +400,98 @@ def test_javascript_files_use_their_own_grammar_for_comments(tmp_path, capsys):
     ran = lcov_file(tmp_path, "ran.info", script, "DA:1,1\nDA:2,1\nDA:3,0\nDA:4,0\nDA:5,0\nDA:6,0\nDA:7,1\n")
 
     assert coverage_of(capsys, tmp_path, script, "step", ran) == 0.6667
+
+
+# The Bun inlined-const bug (see crapper_report.py). REPRO is the bug report's
+# module with a called function between the const and its uncalled user.
+# Bun 1.4.3 with a test that calls only `called` lists lines 2-9 at 0 (blank
+# lines included), so `called` shows no run. A test that calls nothing gives
+# the same report, so a flagged row keeps its 0% score.
+REPRO = """\
+const A = 1;
+const B = 2;
+const C = 3;
+
+export function called(x: number): number {
+  return x * 2;
+}
+
+export function unused(x: number): number {
+  return x + B;
+}
+"""
+REPRO_CALLED_ONLY = "DA:1,12\n" + "".join(f"DA:{line},0\n" for line in range(2, 10))
+# Bun 1.4.3, a test that calls both functions: no bug.
+REPRO_CALLED_BOTH = "DA:1,12\nDA:2,13\nDA:3,12\nDA:5,12\nDA:6,13\nDA:9,12\nDA:10,11\n"
+
+
+def suspects(capsys, root: Path, source: str, *reports: str) -> dict[str, tuple[float, bool]]:
+    relative = write(root, "src/demo/repro.ts", source)
+    paths = [lcov_file(root, f"r{index}.info", relative, records) for index, records in enumerate(reports)]
+    rows = run(capsys, root, *[arg for path in paths for arg in ("--lcov", path)], relative)
+    return {row["name"]: (row["coverage"], row["bunInlinedConstSuspect"]) for row in rows}
+
+
+def test_the_bun_repro_flags_the_function_between_the_const_and_its_uncalled_user(tmp_path, capsys):
+    # `unused` really did not run in that process: its 0% is right, so only
+    # `called` is flagged. Both keep their score.
+    assert suspects(capsys, tmp_path, REPRO, REPRO_CALLED_ONLY) == {
+        "called": (0.0, True),
+        "unused": (0.0, False),
+    }
+
+
+def test_every_inlined_literal_kind_flags(tmp_path, capsys):
+    for value in ('"two"', "-0x1f", "true", "null", "undefined", "`two`", '"two" as const', "(2)"):
+        source = REPRO.replace("const B = 2;", f"const B = {value};")
+        assert suspects(capsys, tmp_path, source, REPRO_CALLED_ONLY)["called"] == (0.0, True), value
+
+
+def test_values_bun_does_not_inline_do_not_flag(tmp_path, capsys):
+    # Bun reports these right; the same zero run here must not flag either.
+    for declaration in ("let B = 2;", "const B = Number(2);", 'const B = "a" + "b";', "const B = 2n;"):
+        source = REPRO.replace("const B = 2;", declaration)
+        assert suspects(capsys, tmp_path, source, REPRO_CALLED_ONLY)["called"] == (0.0, False), declaration
+
+
+def test_an_uncalled_function_that_does_not_use_the_const_does_not_flag(tmp_path, capsys):
+    source = REPRO.replace("return x + B;", "return x + 1;")
+    assert suspects(capsys, tmp_path, source, REPRO_CALLED_ONLY)["called"] == (0.0, False)
+
+
+def test_a_zero_run_that_stops_before_the_user_does_not_flag(tmp_path, capsys):
+    # Lines 7-8 are missing, so the run from the const ends inside `called`.
+    report = "DA:1,12\n" + "".join(f"DA:{line},0\n" for line in (2, 3, 4, 5, 6, 9))
+    assert suspects(capsys, tmp_path, REPRO, report)["called"] == (0.0, False)
+
+
+def test_a_called_user_does_not_flag(tmp_path, capsys):
+    assert suspects(capsys, tmp_path, REPRO, REPRO_CALLED_BOTH) == {
+        "called": (1.0, False),
+        "unused": (1.0, False),
+    }
+
+
+def test_another_report_that_ran_the_function_decides_its_score(tmp_path, capsys):
+    ran = "DA:1,12\nDA:2,13\nDA:3,12\nDA:5,12\nDA:6,13\nDA:9,0\n"
+    assert suspects(capsys, tmp_path, REPRO, REPRO_CALLED_ONLY, ran)["called"] == (1.0, False)
+
+
+def test_a_local_const_used_by_an_uncalled_closure_flags_the_function_that_ran(tmp_path, capsys):
+    source = """\
+export function outer(items: number[]): number {
+  const STEP = 3;
+  let total = 0;
+  for (const item of items) {
+    total += item;
+  }
+  const later = () => {
+    return total + STEP;
+  };
+  return total;
+}
+"""
+    # Bun 1.4.3, outer([1, 2]) called: lines 2-7 ran but list 0. The partial
+    # score stays.
+    report = "DA:1,16\nDA:2,0\nDA:3,0\nDA:4,0\nDA:5,0\nDA:6,0\nDA:7,0\nDA:10,12\n"
+    assert suspects(capsys, tmp_path, source, report) == {"outer": (0.2857, True)}

@@ -22,6 +22,12 @@ export interface FunctionRow {
   /** Fraction 0..1, or null when the snapshot has no coverage data. */
   coverage: number | null;
   crap: number | null;
+  /**
+   * True when the Bun inlined-const coverage bug probably hid some of this
+   * function's coverage (crapper_report.py, inlined_const_suspect). Absent in
+   * rows scored before the field existed.
+   */
+  bunInlinedConstSuspect?: boolean;
 }
 
 export type Rule = "floor-cc" | "floor-crap" | "new-function" | "crap-tax";
@@ -33,6 +39,8 @@ export interface Finding {
   head: FunctionRow;
   base: FunctionRow | null;
   message: string;
+  /** Set when bunInlinedConstRelief turned the finding into a warning. */
+  bunInlinedConstSuspect?: boolean;
 }
 
 /** Head-side line spans of `git diff -U0` hunks, per path. */
@@ -195,6 +203,25 @@ function judgeNew(
   };
 }
 
+/**
+ * Coverage-based findings on a function whose coverage the Bun inlined-const
+ * bug may hide become warnings: the score may be wrong, so it must not block.
+ * Floor-cc compares complexity only, so it stays a violation. Remove with the
+ * detector (see the REMOVAL TRIGGER in crapper_report.py).
+ */
+const COVERAGE_RULES: ReadonlySet<Rule> = new Set(["floor-crap", "crap-tax", "new-function"]);
+
+function bunInlinedConstRelief(finding: Finding): Finding {
+  const suspect = finding.head.bunInlinedConstSuspect === true || finding.base?.bunInlinedConstSuspect === true;
+  if (!suspect || !COVERAGE_RULES.has(finding.rule)) return finding;
+  return {
+    ...finding,
+    severity: "warning",
+    bunInlinedConstSuspect: true,
+    message: `${finding.message} [warning only: Bun's coverage may hide this function's tests (inlined-const bug, bunInlinedConstSuspect)]`,
+  };
+}
+
 function totalComplexity(rows: readonly FunctionRow[]): number {
   return rows.reduce((sum, row) => sum + row.complexity, 0);
 }
@@ -224,7 +251,7 @@ export function evaluate(
     const finding = before
       ? compare(key, before, head, changed)
       : judgeNew(key, head, totals, moves);
-    if (finding) findings.push(finding);
+    if (finding) findings.push(bunInlinedConstRelief(finding));
   }
   findings.sort((a, b) => a.key.localeCompare(b.key));
   return { findings, totalComplexity: totals };

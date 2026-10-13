@@ -22,10 +22,13 @@ Given FILEs (relative to --root), it keeps only the production files among
 them, so callers can pass a raw changed-file list. Rows go to stdout as a JSON
 array sorted by path and start line:
 
-    {path, name, namespace, startLine, endLine, complexity, coverage, crap}
+    {path, name, namespace, startLine, endLine, complexity, coverage, crap,
+     bunInlinedConstSuspect}
 
 `coverage` is a fraction from 0 to 1 and `crap` is CC^2 * (1 - coverage)^3 +
-CC. Both are null without --lcov. With --lcov, a function the report does not
+CC. Both are null without --lcov. `bunInlinedConstSuspect` is true when a Bun
+coverage bug probably hid some of the function's coverage (see
+inlined_const_suspect); it is always false without --lcov. With --lcov, a function the report does not
 mention scores 0% coverage (Crapper's rule). This script never runs tests:
 Crapper's own coverage command ignores every report when it fails.
 
@@ -230,6 +233,181 @@ def function_percent(reports: list[dict[int, int]], start: int, end: int, is_cod
     return 100.0 * sum(1 for hits in merged.values() if hits > 0) / len(merged)
 
 
+# Bun bug: an inlined `const` zeroes the lines above an uncalled user.
+#
+# REMOVAL TRIGGER: oven-sh/bun issue TBD ("bun test --coverage: an uncalled
+# function that uses an inlined `const` zeroes every line from that const down
+# to the function"). Seen on Bun 1.2.15 through 1.4.3, not on Node. When a
+# Bun release fixes it and the repo's Bun pin (package.json packageManager)
+# reaches that release, delete this block, the bunInlinedConstSuspect row
+# field and its handling in scripts/crap/policy.ts and scripts/crap/ci.ts.
+#
+# Bun's transpiler inlines a `const` whose value is a literal. When a function
+# that uses the const never runs in a test process, that process's LCOV lists
+# every line from the literal's line down to the uncalled function at 0 hits,
+# lines that ran included. Repro (Bun 1.4.3), with a test that only imports m:
+#
+#     const A = 1;                                  DA:1,12
+#     const B = 2;                                  DA:2,0
+#     const C = 3;                                  DA:3,0
+#                                                   DA:4,0
+#     export function unused(x: number): number {   DA:5,0
+#       return x + B;
+#     }
+#
+# With `let B = 2` it lists DA:2,10 and DA:3,12. A function between B and
+# `unused` that the test calls lists all its lines at 0 too, so the report
+# hides that it ran, and the file's real coverage is lost.
+#
+# The detector flags a function F only when one report shows the bug's exact
+# shape: an unbroken run of listed 0-hit lines (blank lines included, which a
+# process that ran the code never lists) that starts on the line of a literal
+# const's value and ends inside a later function U that uses the const. Lines
+# from the const down to U's start are suspect. F is flagged when it overlaps
+# them and the report decides F's score: it ran F (its entry line is hit, so
+# its zeros count as misses), or no report ran F (it scores 0%). A flagged row
+# keeps its score: a function that never ran also matches when it sits in that
+# range, so the gate warns instead of dropping it.
+INLINED_LITERALS = {"string", "number", "true", "false", "null", "undefined"}
+# Wrappers that keep a literal inlinable (checked on Bun 1.4.3).
+LITERAL_WRAPPERS = {"parenthesized_expression", "as_expression", "satisfies_expression"}
+FUNCTION_NODES = {
+    "function_declaration",
+    "generator_function_declaration",
+    "function_expression",
+    "generator_function",
+    "arrow_function",
+    "method_definition",
+}
+
+
+def inlined_literal(node) -> bool:
+    """Whether Bun inlines a const with this initializer.
+
+    Kept to the cases checked on Bun 1.4.3: `1n`, `Number(2)`, `"a" + "b"` and
+    `let`/`var` do not trigger the bug. Bun also folds `a${1}` into a literal;
+    only templates with no substitution count here.
+    """
+
+    while node.type in LITERAL_WRAPPERS and node.named_children:
+        node = node.named_children[0]
+    if node.type == "unary_expression" and node.child_count == 2 and node.children[0].type == "-":
+        node = node.children[1]
+        return node.type == "number" and not node.text.endswith(b"n")
+    if node.type == "number":
+        return not node.text.endswith(b"n")
+    if node.type == "template_string":
+        return not any(child.type == "template_substitution" for child in node.children)
+    return node.type in INLINED_LITERALS or (node.type == "identifier" and node.text == b"undefined")
+
+
+def literal_const_scopes(root) -> dict[str, list[tuple[int, object]]]:
+    """Literal consts by name: (value line, scope node) for each declaration.
+
+    Only module-scope consts and consts directly in a function body: a block
+    inside a function (an `if` body) may not run when the function does.
+    """
+
+    consts: dict[str, list[tuple[int, object]]] = {}
+    for node in descendants(root):
+        if node.type != "lexical_declaration" or node.child_count == 0 or node.children[0].type != "const":
+            continue
+        scope = node.parent
+        if scope is not None and scope.type == "export_statement":
+            scope = scope.parent
+        is_function_body = (
+            scope is not None and scope.type == "statement_block" and scope.parent.type in FUNCTION_NODES
+        )
+        if scope is None or not (scope.type == "program" or is_function_body):
+            continue
+        for declarator in node.named_children:
+            name = declarator.child_by_field_name("name")
+            value = declarator.child_by_field_name("value")
+            if name is None or value is None or name.type != "identifier" or not inlined_literal(value):
+                continue
+            consts.setdefault(name.text.decode("utf-8"), []).append((value.start_point[0] + 1, scope))
+    return consts
+
+
+def inlined_const_users(source: str, grammar_path: str) -> set[tuple[int, int, int]]:
+    """(literal line, user start, user end) per literal const and later function that uses it.
+
+    A use is an identifier with the const's name inside the const's scope, in
+    a function that starts below the literal. Shadowing is not resolved.
+    """
+
+    _, tree = parse(source, typescript_grammar(grammar_path))
+    consts = literal_const_scopes(tree.root_node)
+    users: set[tuple[int, int, int]] = set()
+    if not consts:
+        return users
+    for node in descendants(tree.root_node):
+        if node.type not in {"identifier", "shorthand_property_identifier"}:
+            continue
+        declarations = consts.get(node.text.decode("utf-8"))
+        if not declarations:
+            continue
+        functions = []
+        current = node.parent
+        while current is not None:
+            if current.type in FUNCTION_NODES:
+                functions.append(current)
+            current = current.parent
+        for line, scope in declarations:
+            if not scope.start_byte <= node.start_byte < scope.end_byte:
+                continue
+            for function in functions:
+                start, end = function.start_point[0] + 1, function.end_point[0] + 1
+                if start > line:
+                    users.add((line, start, end))
+    return users
+
+
+def zero_runs(report: dict[int, int]) -> dict[int, tuple[int, int]]:
+    """The run (first, last) of consecutive listed 0-hit lines, keyed by its first line."""
+
+    runs: dict[int, tuple[int, int]] = {}
+    run: list[int] = []
+    for line in sorted(report):
+        if report[line] == 0 and run and line == run[-1] + 1:
+            run.append(line)
+            continue
+        if run:
+            runs[run[0]] = (run[0], run[-1])
+        run = [line] if report[line] == 0 else []
+    if run:
+        runs[run[0]] = (run[0], run[-1])
+    return runs
+
+
+def suspect_windows(report: dict[int, int], users: set[tuple[int, int, int]]) -> list[tuple[int, int]]:
+    """Line spans one report zeroed through the inlined-const bug: literal line to user start - 1."""
+
+    runs = zero_runs(report)
+    windows = []
+    for line, start, end in users:
+        run = runs.get(line)
+        if run is not None and start <= run[1] <= end:
+            windows.append((line, start - 1))
+    return windows
+
+
+def inlined_const_suspect(
+    reports: list[dict[int, int]], windows: list[list[tuple[int, int]]], start: int, end: int
+) -> bool:
+    """Whether a report hit by the inlined-const bug decides this function's score (see above)."""
+
+    hit = [
+        index
+        for index, report_windows in enumerate(windows)
+        if any(first <= end and start <= last for first, last in report_windows)
+    ]
+    if not hit:
+        return False
+    spans = [{line: hits for line, hits in report.items() if start <= line <= end} for report in reports]
+    return any(ran_function(spans[index]) for index in hit) or not any(ran_function(span) for span in spans)
+
+
 def score(
     root: Path, files: list[str], coverage: dict[str, list[dict[int, int]]] | None, renames: dict[str, str]
 ) -> list[dict]:
@@ -245,19 +423,24 @@ def score(
         old_module = module_namespace(relative, str(root))
         new_module = module_namespace(shown, str(root))
         is_code: list[bool] | None = None
+        reports = [] if coverage is None else coverage.get(relative, [])
+        windows: list[list[tuple[int, int]]] = []
         for function in functions_in_file(language, source, relative, str(root)):
             percent = None
+            suspect = False
             if coverage is not None:
                 if is_code is None:
                     # Every scored src/ file is TypeScript or JavaScript today; other
                     # grammars keep every listed line.
-                    is_code = (
-                        code_lines(source, relative)
-                        if language == "typescript"
-                        else [True] * len(source.split("\n"))
-                    )
-                found = function_percent(coverage.get(relative, []), function.start_line, function.end_line, is_code)
+                    typescript = language == "typescript"
+                    is_code = code_lines(source, relative) if typescript else [True] * len(source.split("\n"))
+                    users = inlined_const_users(source, relative) if typescript and reports else set()
+                    windows = [suspect_windows(report, users) for report in reports] if users else []
+                found = function_percent(reports, function.start_line, function.end_line, is_code)
                 percent = 0.0 if found is None else found
+                suspect = bool(windows) and inlined_const_suspect(
+                    reports, windows, function.start_line, function.end_line
+                )
             entry = make_entry(function, percent)
             assert entry.namespace.startswith(old_module), (entry.namespace, old_module)
             rows.append(
@@ -270,6 +453,7 @@ def score(
                     "complexity": entry.complexity,
                     "coverage": None if entry.coverage is None else round(entry.coverage / 100, 4),
                     "crap": entry.crap,
+                    "bunInlinedConstSuspect": suspect,
                 }
             )
     rows.sort(key=lambda row: (row["path"], row["startLine"], row["name"]))
@@ -280,14 +464,26 @@ def print_top(rows: list[dict], count: int) -> None:
     def rank(row: dict) -> float:
         return row["crap"] if row["crap"] is not None else row["complexity"]
 
-    worst = sorted(rows, key=rank, reverse=True)[:count]
-    print(f"{len(rows)} functions. Worst {len(worst)}:", file=sys.stderr)
-    for row in worst:
+    def show(row: dict) -> None:
         crap = "" if row["crap"] is None else f"  crap {row['crap']:.1f}"
         print(
             f"  cc {row['complexity']:>4}{crap}  {row['path']}:{row['startLine']}  {row['name']}",
             file=sys.stderr,
         )
+
+    worst = sorted(rows, key=rank, reverse=True)[:count]
+    print(f"{len(rows)} functions. Worst {len(worst)}:", file=sys.stderr)
+    for row in worst:
+        show(row)
+    suspects = [row for row in rows if row["bunInlinedConstSuspect"]]
+    if suspects:
+        print(
+            f"{len(suspects)} functions whose coverage the Bun inlined-const bug may hide"
+            f" (bunInlinedConstSuspect, see crapper_report.py). Worst {min(count, len(suspects))}:",
+            file=sys.stderr,
+        )
+        for row in sorted(suspects, key=rank, reverse=True)[:count]:
+            show(row)
 
 
 def main(argv: list[str]) -> int:
