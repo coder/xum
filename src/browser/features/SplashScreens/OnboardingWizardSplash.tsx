@@ -1185,6 +1185,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
 
         <div
           key={currentStep.key}
+          data-onboarding-step={currentStep.key}
           className={`flex flex-col gap-3 ${stepEntryClassName(direction, firstRunView.skipStepEntry)}`}
         >
           <div className="text-foreground flex items-center gap-2 text-sm font-medium">

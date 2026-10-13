@@ -46,13 +46,16 @@ jest.mock("@/browser/hooks/useMuxGatewayAccountStatus", () => ({
 
 import { OnboardingWizardSplash } from "@/browser/features/SplashScreens/OnboardingWizardSplash";
 
-const LOADING_TEXT = "Checking your provider configuration…";
-const GATEWAY_TEXT = "OSS contributors with GitHub accounts";
+// Steps are found by their key (data-onboarding-step), so rewording the copy does not break these tests.
+const LOADING_STEP = "loading";
+const GATEWAY_STEP = "mux-gateway";
 
 const dialog = () => document.body.querySelector<HTMLElement>("[role=dialog]");
 const overlay = () => document.body.querySelector<HTMLElement>("[data-modal-dialog-overlay]");
-const stepBody = () => dialog()?.querySelector<HTMLElement>("[class*='slide-in-from']") ?? null;
-const showsText = (text: string) => document.body.textContent?.includes(text) === true;
+const step = () => document.body.querySelector<HTMLElement>("[data-onboarding-step]");
+const shows = (key: string) => step()?.dataset.onboardingStep === key;
+const animatesIn = () =>
+  step()?.className.includes("animate-in fade-in-0 slide-in-from-right-2") === true;
 
 function renderWizard() {
   return render(React.createElement(OnboardingWizardSplash, { onDismiss: jest.fn() }));
@@ -67,7 +70,7 @@ describe("the onboarding wizard without a static first-run view", () => {
   test("shows its loading step, then the gateway step, with the dialog's entry animation", () => {
     mockProviders = { config: null, loading: true };
     const view = renderWizard();
-    expect(showsText(LOADING_TEXT)).toBe(true);
+    expect(shows(LOADING_STEP)).toBe(true);
     expect(dialog()?.className).toContain("data-[state=open]:zoom-in-95");
     expect(overlay()?.className).toContain("data-[state=open]:fade-in-0");
     expect(dialog()?.style.animation).toBe("");
@@ -75,9 +78,9 @@ describe("the onboarding wizard without a static first-run view", () => {
 
     mockProviders = { config: {}, loading: false };
     act(() => view.rerender(React.createElement(OnboardingWizardSplash, { onDismiss: jest.fn() })));
-    expect(showsText(LOADING_TEXT)).toBe(false);
-    expect(showsText(GATEWAY_TEXT)).toBe(true);
-    expect(stepBody()?.className).toContain("animate-in fade-in-0 slide-in-from-right-2");
+    expect(shows(LOADING_STEP)).toBe(false);
+    expect(shows(GATEWAY_STEP)).toBe(true);
+    expect(animatesIn()).toBe(true);
     expect(dialog()?.style.animation).toBe("");
   });
 
@@ -87,8 +90,8 @@ describe("the onboarding wizard without a static first-run view", () => {
     fireEvent.click(
       Array.from(dialog()!.querySelectorAll("button")).find((b) => b.textContent === "Next")!
     );
-    expect(showsText(GATEWAY_TEXT)).toBe(false);
-    expect(stepBody()?.className).toContain("animate-in fade-in-0 slide-in-from-right-2");
+    expect(shows(GATEWAY_STEP)).toBe(false);
+    expect(animatesIn()).toBe(true);
   });
 });
 
@@ -110,7 +113,7 @@ describe("the onboarding wizard under the static first-run view (#xum-pre)", () 
     // before passive effects: the point where the browser would paint.
     const viewAtGatewayCommit: boolean[] = [];
     const onRender = () => {
-      if (showsText(GATEWAY_TEXT)) viewAtGatewayCommit.push(firstRunView() != null);
+      if (shows(GATEWAY_STEP)) viewAtGatewayCommit.push(firstRunView() != null);
     };
     const tree = () =>
       React.createElement(
@@ -131,9 +134,9 @@ describe("the onboarding wizard under the static first-run view (#xum-pre)", () 
     // The static view showed this frame, so nothing animates in, until the user moves on.
     expect(dialog()?.style.animation).toBe("none");
     expect(overlay()?.style.animation).toBe("none");
-    expect(stepBody()).toBeNull();
+    expect(animatesIn()).toBe(false);
     clickNext();
-    expect(stepBody()?.className).toContain("animate-in fade-in-0 slide-in-from-right-2");
+    expect(animatesIn()).toBe(true);
     // The dialog and overlay stay open, so dropping their override would replay their entry.
     expect(dialog()?.style.animation).toBe("none");
     expect(overlay()?.style.animation).toBe("none");
@@ -142,7 +145,7 @@ describe("the onboarding wizard under the static first-run view (#xum-pre)", () 
   test("removes the static view when it opens past the gateway step", () => {
     mockProviders = { config: { anthropic: { isConfigured: true } }, loading: false };
     renderWizard();
-    expect(showsText(GATEWAY_TEXT)).toBe(false);
+    expect(shows(GATEWAY_STEP)).toBe(false);
     expect(firstRunView()).toBeNull();
   });
 });
