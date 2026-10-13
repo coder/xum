@@ -1,10 +1,13 @@
 import type { AppStory } from "@/browser/stories/meta.js";
-import { appMeta, AppWithMocks } from "@/browser/stories/meta.js";
+import { appMeta, AppWithMocks, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
+import { applyTouchPointerRules } from "@/browser/stories/helpers/touchPointer";
 import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
 import { createGenericTool, createPendingTool } from "@/browser/stories/mocks/tools";
 import { STABLE_TIMESTAMP } from "@/browser/stories/mocks/workspaces";
-import { within, userEvent } from "@storybook/test";
+import { MOBILE_TOUCH_TARGET_PX } from "@/constants/layout";
+import { within, userEvent, waitFor } from "@storybook/test";
+import type { ComponentType } from "react";
 
 const meta = { ...appMeta, title: "App/Chat/Tools/AskUserQuestion" };
 export default meta;
@@ -214,4 +217,75 @@ export const AskUserQuestionOther: AppStory = {
       }
     />
   ),
+};
+
+function PhoneWidthDecorator(Story: ComponentType) {
+  return (
+    <div style={{ width: 390, height: 844, overflow: "hidden" }}>
+      <Story />
+    </div>
+  );
+}
+
+/**
+ * Touch phones give every button and `role=button` a 44px minimum (globals.css). An option row is
+ * a `role=button`, so the row is the touch target and its checkbox must keep its drawn size on
+ * the line of the option's label (#5835, #6320).
+ *
+ * The seeded bug-bash app cannot show this card: the mock AI has no ask_user_question reply. The
+ * Storybook test-runner plays at desktop size and matches no coarse pointer, so the play forces a
+ * phone width with the decorator and copies the coarse-pointer rules itself.
+ */
+export const AskUserQuestionTouchPhone: AppStory = {
+  render: AskUserQuestionPending.render,
+  decorators: [PhoneWidthDecorator],
+  // The play removes the copied rules again, so a snapshot would only repeat the narrow layout.
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    const canvas = within(storyRoot);
+    const toolTitle = await canvas.findByText(/ask_user_question/, {}, { timeout: 8000 });
+    if (!canvas.queryByText("Summary")) {
+      await userEvent.click(toolTitle);
+    }
+    // The card keeps its draft across stories (AskUserQuestionPending answers the first question),
+    // so open the first question explicitly.
+    const sections = await canvas.findAllByRole("button");
+    const approach = sections.find(
+      (el) => el.tagName === "BUTTON" && (el.textContent ?? "").startsWith("Approach")
+    );
+    if (!approach) throw new Error("Approach section button not found");
+    await userEvent.click(approach);
+    await canvas.findByText("Which approach should we take?", {}, { timeout: 8000 });
+
+    const removeTouchRules = applyTouchPointerRules(canvasElement.ownerDocument);
+    try {
+      await waitFor(() => {
+        const checkbox = storyRoot.querySelector('[role="button"] > button[role="checkbox"]');
+        // The checkbox draws its box on this span: the Radix button is an invisible hit area.
+        const box = checkbox?.querySelector(':scope > [aria-hidden="true"]');
+        const row = checkbox?.parentElement;
+        const label = checkbox?.nextElementSibling?.firstElementChild;
+        if (!checkbox || !box || !row || !label) {
+          throw new Error("Option row, checkbox box or option label not found");
+        }
+        const b = box.getBoundingClientRect();
+        const l = label.getBoundingClientRect();
+        const rowHeight = row.getBoundingClientRect().height;
+        if (rowHeight < MOBILE_TOUCH_TARGET_PX) {
+          throw new Error(`Option row is ${rowHeight}px tall, under the touch minimum`);
+        }
+        const drawnBox = Math.max(b.width, b.height);
+        if (drawnBox > 20) {
+          throw new Error(`Checkbox draws a ${drawnBox}px box in an option row`);
+        }
+        const centerGap = Math.abs(b.top + b.height / 2 - (l.top + l.height / 2));
+        if (centerGap > 2) {
+          throw new Error(`Checkbox sits ${centerGap}px off its option label's line`);
+        }
+      });
+    } finally {
+      removeTouchRules();
+    }
+  },
 };

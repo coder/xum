@@ -49,6 +49,9 @@ import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { McpAppResultStore } from "./mcpAppResultStore";
+import { createMcpPromptGetTool } from "./tools/mcp_prompt_get";
+import { createTestToolConfig } from "./tools/testHelpers";
+import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
 import { jsonSchema, type Tool } from "ai";
 import {
   MCP_IDLE_CHECK_INTERVAL_MS,
@@ -2891,6 +2894,105 @@ describe("MCPServerManager", () => {
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     expect(servers.connectCount("cmd")).toBe(1);
     manager.releaseLease(workspaceId);
+  });
+
+  describe("prompt catalog across an idle restart", () => {
+    const REVIEW = { name: "review", description: "Review the current work" };
+    /** First connection lists REVIEW; every later prompts/list fails (a 10 s timeout live). */
+    function servePromptsThenFailingList(command: string): void {
+      servers.serve(command, (attempt) => ({
+        listPrompts: () =>
+          attempt === 1 ? Promise.resolve([REVIEW]) : Promise.reject(new Error("timed out")),
+        getPrompt: () =>
+          Promise.resolve({
+            messages: [{ role: "user", content: { type: "text", text: "review it" } }],
+          }),
+      }));
+    }
+    /** The tools-section bytes this turn's descriptors produce. */
+    function promptGetDescription(prompts: MCPPromptDescriptor[]): string {
+      const { description } = createMcpPromptGetTool({
+        ...createTestToolConfig("/tmp"),
+        mcpPromptRuntime: { prompts, getPrompt: () => Promise.resolve({ text: "" }) },
+      });
+      if (typeof description !== "string") throw new Error("expected a static description");
+      return description;
+    }
+
+    test("a failed prompts/list after an idle restart keeps the mcp_prompt_get description", async () => {
+      const workspaceId = "ws-idle-prompts";
+      const sweepIdleServers = useManagerWithIdleSweep();
+      configService.listServers = mock(() => Promise.resolve({ notion: stdioConfig("cmd") }));
+      servePromptsThenFailingList("cmd");
+      const before = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+      expect(before.promptDescriptors.map((prompt) => prompt.promptName)).toEqual(["review"]);
+
+      setSystemTime(new Date(Date.now() + MCP_IDLE_TIMEOUT_MS + 60_000));
+      sweepIdleServers();
+      const after = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+      expect(servers.connectCount("cmd")).toBe(2);
+      expect(after.promptDescriptors).toEqual(before.promptDescriptors);
+      expect(promptGetDescription(after.promptDescriptors)).toBe(
+        promptGetDescription(before.promptDescriptors)
+      );
+      // The seeded prompt dispatches to the restarted, live server.
+      expect((await manager.getPrompt(workspaceId, "notion", "review", {})).text).toBe("review it");
+    });
+
+    test("an idle restart under a changed config does not carry the old catalog", async () => {
+      const workspaceId = "ws-idle-prompts-reconfigured";
+      const sweepIdleServers = useManagerWithIdleSweep();
+      configService.listServers = mock(() => Promise.resolve({ notion: stdioConfig("cmd") }));
+      servePromptsThenFailingList("cmd");
+      await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+      setSystemTime(new Date(Date.now() + MCP_IDLE_TIMEOUT_MS + 60_000));
+      sweepIdleServers();
+      configService.listServers = mock(() =>
+        Promise.resolve({ notion: stdioConfig("cmd"), other: stdioConfig("other-cmd") })
+      );
+      servers.serve("other-cmd");
+      const after = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+      expect(servers.connectCount("cmd")).toBe(2);
+      expect(after.promptDescriptors).toEqual([]);
+    });
+
+    test("a plugin invalidation after an idle stop drops that server's old catalog", async () => {
+      const workspaceId = "ws-idle-prompts-plugin";
+      const sweepIdleServers = useManagerWithIdleSweep();
+      configService.listServers = mock(() => Promise.resolve({ notion: stdioConfig("cmd") }));
+      servePromptsThenFailingList("cmd");
+      await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+      setSystemTime(new Date(Date.now() + MCP_IDLE_TIMEOUT_MS + 60_000));
+      sweepIdleServers();
+      await manager.stopServersWithKeyPrefix("notion");
+      const after = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+      expect(servers.connectCount("cmd")).toBe(2);
+      expect(after.promptDescriptors).toEqual([]);
+    });
+
+    test("a server that does not come back after an idle stop drops its prompts", async () => {
+      const workspaceId = "ws-idle-prompts-down";
+      const sweepIdleServers = useManagerWithIdleSweep();
+      configService.listServers = mock(() => Promise.resolve({ notion: stdioConfig("cmd") }));
+      servers.serve("cmd", (attempt) =>
+        attempt === 1
+          ? { prompts: [REVIEW] }
+          : { connect: () => Promise.reject(new Error("connection refused")) }
+      );
+      await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+      setSystemTime(new Date(Date.now() + MCP_IDLE_TIMEOUT_MS + 60_000));
+      sweepIdleServers();
+      const after = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+      expect(after.stats.failedServerNames).toEqual(["notion"]);
+      expect(after.promptDescriptors).toEqual([]);
+    });
   });
 
   test("a startup that never finishes fails as a timeout and is retried after its backoff", async () => {

@@ -9,7 +9,7 @@ import { PROXY_PATH, startProxy, type CallRecord } from "./proxy";
 import { Ledger, MAX_BODY_BYTES, usageCost } from "./proxyPolicy";
 
 const KEY = "sk-host-secret-key-for-the-proxy-test";
-const MODEL = "claude-haiku-4-5";
+const MODEL = "claude-haiku-5-5";
 const cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();

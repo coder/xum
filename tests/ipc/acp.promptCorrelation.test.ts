@@ -1,4 +1,15 @@
-import { AgentSideConnection, PROTOCOL_VERSION, ndJsonStream } from "@agentclientprotocol/sdk";
+import {
+  AgentSideConnection,
+  PROTOCOL_VERSION,
+  ndJsonStream,
+  type ContentBlock,
+} from "@agentclientprotocol/sdk";
+import { KNOWN_MODELS } from "../../src/common/constants/knownModels";
+import {
+  DEFAULT_COMPACTION_WORD_TARGET,
+  WORDS_TO_TOKENS_RATIO,
+  buildCompactionPrompt,
+} from "../../src/common/constants/ui";
 import { STOP_UNRECORDED_MESSAGE } from "../../src/common/constants/workspace";
 import type { OnChatMode, WorkspaceChatMessage } from "../../src/common/orpc/types";
 import type { AgentSkillListResult } from "../../src/common/types/agentSkill";
@@ -296,6 +307,8 @@ interface HarnessOptions {
   /** Custom output WritableStream for simulating stdout backpressure. */
   acpOutputStream?: WritableStream<Uint8Array>;
   agentOptions?: ConstructorParameters<typeof MuxAgent>[2];
+  /** Extra fields for every workspace `workspace.create` returns (e.g. a compact bucket). */
+  workspaceOverrides?: Partial<WorkspaceInfo>;
 }
 
 function createHarness(options?: HarnessOptions): Harness {
@@ -367,6 +380,7 @@ function createHarness(options?: HarnessOptions): Harness {
           projectPath: input.projectPath,
           namedWorkspacePath: `${input.projectPath}/.mux/${input.branchName}`,
           runtimeConfig: input.runtimeConfig ?? { type: "local" },
+          ...options?.workspaceOverrides,
         });
         workspacesById.set(workspaceId, metadata);
 
@@ -2179,5 +2193,212 @@ describe("ACP /send-held (#5170)", () => {
 
     harness.closeConnection();
     await harness.connectionClosed;
+  });
+});
+
+/** Send one prompt, finish its turn, and return the `workspace.sendMessage` call it made. */
+async function sendPromptAndFinish(
+  harness: Harness,
+  sessionId: string,
+  prompt: ContentBlock[]
+): Promise<Harness["sendMessageCalls"][number]> {
+  const sentBefore = harness.sendMessageCalls.length;
+  const promptPromise = harness.agent.prompt({ sessionId, prompt });
+  await waitForCondition(() => harness.sendMessageCalls.length > sentBefore);
+  const promptCorrelationId = getPromptCorrelationId(harness);
+  harness.pushChatEvent(
+    streamStart(sessionId, "assistant-reply", { acpPromptId: promptCorrelationId })
+  );
+  harness.pushChatEvent(streamEnd(sessionId, "assistant-reply"));
+  await expect(promptPromise).resolves.toMatchObject({ stopReason: "end_turn" });
+
+  const sent = harness.sendMessageCalls.at(-1);
+  if (sent == null) {
+    throw new Error("sendPromptAndFinish: expected a workspace.sendMessage call");
+  }
+  return sent;
+}
+
+async function withSession(
+  options: HarnessOptions | undefined,
+  run: (harness: Harness, sessionId: string) => Promise<void>
+): Promise<void> {
+  const harness = createHarness(options);
+  await initializeDefaultAgent(harness);
+  const { sessionId } = await createDefaultSession(harness);
+  await run(harness, sessionId);
+  harness.closeConnection();
+  await harness.connectionClosed;
+}
+
+const PNG_BLOCK: ContentBlock = { type: "image", data: "aW1n", mimeType: "image/png" };
+const PNG_FILE_PART = { url: "data:image/png;base64,aW1n", mediaType: "image/png" };
+
+describe("ACP prompt content blocks", () => {
+  it("joins text and text resources in order, skips blank text and names empty resources", async () => {
+    await withSession(undefined, async (harness, sessionId) => {
+      const sent = await sendPromptAndFinish(harness, sessionId, [
+        { type: "text", text: "first" },
+        { type: "text", text: "   " },
+        { type: "resource", resource: { uri: "file:///notes.md", text: "resource body" } },
+        { type: "resource", resource: { uri: "file:///empty.md", text: "  " } },
+        { type: "text", text: "last" },
+      ]);
+
+      expect(sent.message.split("\n\n")).toEqual([
+        "first",
+        "resource body",
+        // A resource without inline content still gives the model its URI.
+        expect.stringContaining("file:///empty.md"),
+        "last",
+      ]);
+      expect(sent.options.fileParts).toBeUndefined();
+    });
+  });
+
+  it("sends images and blob resources as data-URI file parts", async () => {
+    await withSession(undefined, async (harness, sessionId) => {
+      const sent = await sendPromptAndFinish(harness, sessionId, [
+        PNG_BLOCK,
+        {
+          type: "resource",
+          resource: { uri: "file:///doc.pdf", blob: "cGRm", mimeType: "application/pdf" },
+        },
+        { type: "resource", resource: { uri: "file:///raw.bin", blob: "cmF3" } },
+      ]);
+
+      expect(sent.options.fileParts).toEqual([
+        PNG_FILE_PART,
+        { url: "data:application/pdf;base64,cGRm", mediaType: "application/pdf" },
+        // A blob without a MIME type is sent as opaque bytes.
+        {
+          url: "data:application/octet-stream;base64,cmF3",
+          mediaType: "application/octet-stream",
+        },
+      ]);
+      // A prompt with no text still sends a non-empty message, without the attachment data.
+      expect(sent.message.trim()).not.toBe("");
+      expect(sent.message).not.toContain("aW1n");
+    });
+  });
+
+  it.each([
+    { type: "audio", data: "YXVkaW8=", mimeType: "audio/wav" },
+    { type: "resource_link", uri: "file:///linked.md", name: "linked.md" },
+  ] as const)("refuses a $type block before sending anything", async (block) => {
+    await withSession(undefined, async (harness, sessionId) => {
+      await expect(
+        harness.agent.prompt({ sessionId, prompt: [{ type: "text", text: "hello" }, block] })
+      ).rejects.toThrow(block.type);
+      expect(harness.sendMessageCalls).toEqual([]);
+    });
+  });
+});
+
+describe("ACP /compact", () => {
+  const SESSION_MODEL = "openai:gpt-5.2";
+
+  /** Pick the session's own model and thinking level, as an editor's picker would. */
+  async function pickSessionSettings(harness: Harness, sessionId: string): Promise<void> {
+    for (const [configId, value] of [
+      ["model", SESSION_MODEL],
+      ["thinkingLevel", "high"],
+    ]) {
+      await harness.agent.setSessionConfigOption({ sessionId, configId, value });
+    }
+  }
+
+  function compactMetadata(sent: Harness["sendMessageCalls"][number]): Record<string, unknown> {
+    const muxMetadata = sent.options.muxMetadata;
+    if (!isRecord(muxMetadata) || !isRecord(muxMetadata.parsed)) {
+      throw new Error("Expected a compaction-request muxMetadata with parsed data");
+    }
+    return muxMetadata;
+  }
+
+  it("sends a tool-free compaction request with the -t length, the -m model and the follow-up", async () => {
+    await withSession(undefined, async (harness, sessionId) => {
+      await pickSessionSettings(harness, sessionId);
+      const sent = await sendPromptAndFinish(harness, sessionId, [
+        { type: "text", text: "/compact -t 1000 -m haiku\nkeep going" },
+        PNG_BLOCK,
+      ]);
+
+      // -t is a token budget: the prompt asks for the matching word count.
+      const expectedPrompt = buildCompactionPrompt(Math.round(1000 / WORDS_TO_TOKENS_RATIO));
+      expect(sent.message.startsWith(expectedPrompt)).toBe(true);
+      expect(sent.message).toContain("keep going");
+      expect(sent.options).toMatchObject({
+        model: KNOWN_MODELS.HAIKU.id,
+        agentId: "compact",
+        maxOutputTokens: 1000,
+        skipAiSettingsPersistence: true,
+        toolPolicy: [{ regex_match: ".*", action: "disable" }],
+      });
+      // Attachments belong to the follow-up turn, not to the compaction request.
+      expect(sent.options.fileParts).toBeUndefined();
+      expect(compactMetadata(sent)).toMatchObject({
+        type: "compaction-request",
+        commandPrefix: "/compact",
+        requestedModel: KNOWN_MODELS.HAIKU.id,
+        parsed: {
+          model: KNOWN_MODELS.HAIKU.id,
+          maxOutputTokens: 1000,
+          // The follow-up runs with the session's own settings, not the compaction model.
+          followUpContent: {
+            text: "keep going",
+            fileParts: [PNG_FILE_PART],
+            model: SESSION_MODEL,
+            agentId: "exec",
+            thinkingLevel: "high",
+          },
+        },
+      });
+    });
+  });
+
+  it.each([
+    { label: "the workspace compact model", compact: { model: DEFAULT_MODEL } },
+    { label: "the session model without a compact bucket", compact: undefined },
+  ])("bare /compact uses the default length, $label and no follow-up", async ({ compact }) => {
+    const workspaceOverrides: Partial<WorkspaceInfo> | undefined =
+      compact == null
+        ? undefined
+        : {
+            aiSettingsByAgent: {
+              exec: { model: DEFAULT_MODEL, thinkingLevel: "medium" },
+              compact: { ...compact, thinkingLevel: "low" },
+            },
+          };
+    await withSession({ workspaceOverrides }, async (harness, sessionId) => {
+      await pickSessionSettings(harness, sessionId);
+      const sent = await sendPromptAndFinish(harness, sessionId, [
+        { type: "text", text: "/compact" },
+      ]);
+
+      expect(sent.message).toBe(buildCompactionPrompt(DEFAULT_COMPACTION_WORD_TARGET));
+      const expectedModel = compact?.model ?? SESSION_MODEL;
+      expect(sent.options).toMatchObject({ model: expectedModel, agentId: "compact" });
+      expect(sent.options.maxOutputTokens).toBeUndefined();
+      const metadata = compactMetadata(sent);
+      expect(metadata.requestedModel).toBe(expectedModel);
+      expect(metadata.parsed).toMatchObject({ model: expectedModel });
+      expect((metadata.parsed as Record<string, unknown>).followUpContent).toBeUndefined();
+    });
+  });
+
+  it("keeps an attachment-only follow-up", async () => {
+    await withSession(undefined, async (harness, sessionId) => {
+      const sent = await sendPromptAndFinish(harness, sessionId, [
+        { type: "text", text: "/compact" },
+        PNG_BLOCK,
+      ]);
+
+      // No follow-up text: the prompt gets no continue line, but the image still waits.
+      expect(sent.message).toBe(buildCompactionPrompt(DEFAULT_COMPACTION_WORD_TARGET));
+      expect(compactMetadata(sent).parsed).toMatchObject({
+        followUpContent: { text: "", fileParts: [PNG_FILE_PART] },
+      });
+    });
   });
 });
