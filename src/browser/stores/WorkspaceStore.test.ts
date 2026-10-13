@@ -65,6 +65,7 @@ import type { APIClient } from "@/browser/contexts/API";
 import { computeProvidersConfigFingerprint } from "@/common/utils/providers/configFingerprint";
 import {
   areActivityGoalsEqual,
+  findLastContextUsage,
   findRenderedRefineProposalHash,
   mergeTimelineEvents,
   resolveSidebarAgentStatus,
@@ -8973,5 +8974,65 @@ describe("resolveSidebarAgentStatus", () => {
       );
       expect(resolve(undefined, [], undefined)).toBeUndefined();
     });
+  });
+});
+
+describe("findLastContextUsage", () => {
+  const usage = (inputTokens: number) => ({
+    inputTokens,
+    outputTokens: 0,
+    totalTokens: inputTokens,
+  });
+  const assistant = (id: string, metadata: NonNullable<MuxMessage["metadata"]>): MuxMessage =>
+    createMuxMessage(id, "assistant", "reply", metadata);
+  const boundary = (id: string, contextTokens?: number): MuxMessage =>
+    assistant(id, {
+      compactionBoundary: true,
+      compacted: "user",
+      compactionEpoch: 1,
+      model: "anthropic:claude-opus-4-5",
+      ...(contextTokens === undefined ? {} : { contextUsage: usage(contextTokens) }),
+    });
+  const identity = (model: string) => model;
+  const inputTokens = (messages: MuxMessage[], currentModel?: string) =>
+    findLastContextUsage(messages, currentModel, identity)?.input.tokens;
+
+  it("reads the newest assistant message that has context usage", () => {
+    const messages = [
+      assistant("a1", { contextUsage: usage(10) }),
+      assistant("a2", { contextUsage: usage(20) }),
+      createMuxMessage("u1", "user", "next"),
+      assistant("a3", {}),
+    ];
+    expect(inputTokens(messages)).toBe(20);
+  });
+
+  it("skips compaction summaries", () => {
+    const messages = [
+      assistant("a1", { contextUsage: usage(10) }),
+      assistant("summary", { compacted: true, contextUsage: usage(99) }),
+    ];
+    expect(inputTokens(messages)).toBe(10);
+  });
+
+  it("does not read across a compaction boundary", () => {
+    const messages = [assistant("old", { contextUsage: usage(500) }), boundary("b1")];
+    expect(findLastContextUsage(messages, undefined, identity)).toBeUndefined();
+  });
+
+  it("uses the post-compaction estimate on the boundary itself", () => {
+    const messages = [assistant("old", { contextUsage: usage(500) }), boundary("b1", 7)];
+    expect(inputTokens(messages)).toBe(7);
+  });
+
+  it("prices with the resolved model and falls back to the current model", () => {
+    const resolve = mock((model: string) => `resolved:${model}`);
+    const result = findLastContextUsage(
+      [assistant("a1", { contextUsage: usage(10) })],
+      "openai:gpt-4o",
+      resolve
+    );
+    expect(resolve).toHaveBeenCalledWith("openai:gpt-4o");
+    expect(result?.model).toBe("openai:gpt-4o");
   });
 });
