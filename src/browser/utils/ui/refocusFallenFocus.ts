@@ -9,13 +9,21 @@ export function refocusFallenFocus(element: HTMLElement): () => void {
   // Not while focus is moving: Tab blurs one control before it focuses the next, and in between
   // focus sits on <body>. The blurred button's tooltip closes then (a mutation), and taking focus
   // back there cancelled the move, so Tab never got past a button with a tooltip (#6200).
+  // The browser fires the move's focusout and focusin in one task, so the guard lasts at most that
+  // task: a target that never takes focus (made inert in a focusout handler) gets no focusin, and
+  // the recovery must not stay off until the user's next click (#6291).
   let movingTo: EventTarget | null = null;
-  const onFocusOut = (event: FocusEvent) => {
-    movingTo = event.relatedTarget;
-  };
-  const onFocusIn = () => {
+  let moveEnd: ReturnType<typeof setTimeout> | undefined;
+  const endMove = () => {
+    clearTimeout(moveEnd);
     movingTo = null;
   };
+  const onFocusOut = (event: FocusEvent) => {
+    clearTimeout(moveEnd);
+    movingTo = event.relatedTarget;
+    moveEnd = setTimeout(endMove, 0);
+  };
+  const onFocusIn = endMove;
   document.addEventListener("focusout", onFocusOut, true);
   document.addEventListener("focusin", onFocusIn, true);
   const observer = new MutationObserver(() => {
@@ -26,6 +34,7 @@ export function refocusFallenFocus(element: HTMLElement): () => void {
   });
   observer.observe(document.body, { childList: true, subtree: true });
   return () => {
+    clearTimeout(moveEnd);
     observer.disconnect();
     document.removeEventListener("focusout", onFocusOut, true);
     document.removeEventListener("focusin", onFocusIn, true);
