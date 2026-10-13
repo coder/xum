@@ -8,9 +8,13 @@
  * Optimistic + bounded-cost contract:
  *   - Worker calls are serialized in the client and each call has a hard
  *     time budget (HIGHLIGHT_TIMEOUT_MS) that starts only once that payload
- *     reaches the front of the queue. When it expires we assume the worker is
- *     wedged in native code (e.g. Oniguruma catastrophic backtracking on a
- *     TextMate grammar) and terminate the worker, freeing its CPU immediately.
+ *     reaches the front of the queue and a ready worker. When it expires we
+ *     assume the worker is wedged in native code (e.g. Oniguruma catastrophic
+ *     backtracking on a TextMate grammar) and terminate the worker, freeing its
+ *     CPU immediately.
+ *   - Worker start-up (script load, Shiki's engine, the language's grammar) is
+ *     not part of that budget: it has its own limit (WORKER_START_TIMEOUT_MS).
+ *     A start that exceeds it ends the worker but never marks the input.
  *   - Inputs that exceeded the budget are remembered by fingerprint so
  *     subsequent re-renders (theme changes, streaming, scroll) don't kill
  *     a fresh worker for the same payload.
@@ -44,6 +48,43 @@ const HIGHLIGHT_TIMEOUT_MS = 5000;
 // Sentinel thrown internally when the time budget is exceeded. Kept distinct
 // from generic Errors so the caller path can choose how loudly to log it.
 const TIMEOUT_MARKER = "HIGHLIGHT_TIMEOUT";
+
+// Limit for a worker to start: load its script and get Shiki and the language's grammar ready.
+// A cold dev server compiles the worker module and Shiki's chunks on first use, which took more
+// than the 5 s budget (#6292); 20 s leaves room for that on a slow machine. The limit only
+// guards a worker that never starts (a script that never loads): the queue waits that long, and
+// those diffs show as plain text meanwhile, so a longer limit costs nothing on a healthy start.
+const WORKER_START_TIMEOUT_MS = 20_000;
+const START_TIMEOUT_MARKER = "HIGHLIGHT_WORKER_START_TIMEOUT";
+// The worker fired `onerror` (its script failed to load, or it crashed) while a call waited.
+const WORKER_DIED_MARKER = "HIGHLIGHT_WORKER_DIED";
+// The worker fired `onerror` before it was ready (a script that failed to load): a start failure,
+// as transient as a start time-out (#6309).
+const START_FAILED_MARKER = "HIGHLIGHT_WORKER_START_FAILED";
+
+/**
+ * True when the worker did not start: it timed out, or it died before it was ready. Transient,
+ * unlike a budget timeout: the input is not marked, so callers must not cache their plain-text
+ * fallback for it either, and highlightCode retries it once a worker is ready.
+ */
+export function isHighlightStartFailure(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error.message === START_TIMEOUT_MARKER || error.message === START_FAILED_MARKER)
+  );
+}
+
+function isHighlightStartTimeout(error: unknown): boolean {
+  return error instanceof Error && error.message === START_TIMEOUT_MARKER;
+}
+
+/** A failure whose worker is already ended: it did not start, or it died mid-call. */
+function isWorkerGoneFailure(error: unknown): boolean {
+  return (
+    isHighlightStartFailure(error) ||
+    (error instanceof Error && error.message === WORKER_DIED_MARKER)
+  );
+}
 
 // Inputs that previously exceeded the time budget. We don't ship them to a
 // new worker again — that would just terminate another worker for the same
@@ -105,6 +146,18 @@ let workerAPI: Comlink.Remote<HighlightWorkerAPI> | null = null;
 // worker, since the previous one may have been wedged in native code.
 let workerStructurallyUnavailable = false;
 let warnedVscodeWorkerDisabled = false;
+// Languages the current worker has loaded (its `prepare` resolved). Cleared with the worker.
+const preparedLanguages = new Set<string>();
+// Rejecters of the calls waiting on the current worker. Its `onerror` rejects them all, because
+// recycleWorker's Comlink `releaseProxy` drops a call's pending listener without rejecting it: a
+// call to a dead worker would wait out its limit, 20 s to start, or 5 s that also marked the
+// input (#6303). A set, not one long-pending promise raced by every call: each race would add a
+// reaction to that promise, kept (with its result) for the worker's whole life.
+let workerCalls: Set<(error: Error) => void> | null = null;
+// After a start failure: per language, one shared start of the next worker that every request of
+// that language whose worker did not start waits on, then retries once (#6303). Per language, so
+// one grammar's failed recovery does not end another language's wait (#6309).
+const workerRecoveries = new Map<string, Promise<void>>();
 
 /**
  * Tear down the current worker so the next call to `getWorkerAPI` builds a
@@ -127,6 +180,8 @@ function recycleWorker(expectedWorker?: Worker): void {
   const currentWorkerAPI = workerAPI;
   worker = null;
   workerAPI = null;
+  workerCalls = null;
+  preparedLanguages.clear();
 
   if (currentWorkerAPI !== null) {
     try {
@@ -179,6 +234,8 @@ function getWorkerAPI(): Comlink.Remote<HighlightWorkerAPI> | null {
       name: "shiki-highlighter", // Shows up in DevTools
     });
     worker = createdWorker;
+    const calls = new Set<(error: Error) => void>();
+    workerCalls = calls;
 
     createdWorker.onerror = (e) => {
       // A worker that errored out is not necessarily permanently broken — the
@@ -187,6 +244,7 @@ function getWorkerAPI(): Comlink.Remote<HighlightWorkerAPI> | null {
       // the active worker. Stale error events from already-replaced workers
       // must not terminate a healthy replacement.
       console.error("[highlightWorkerClient] Worker errored; recycling:", e);
+      failWorkerCalls(calls);
       recycleWorker(createdWorker);
     };
 
@@ -254,11 +312,82 @@ export function isAbortedHighlight(error: unknown, signal: AbortSignal | undefin
   return signal?.aborted === true && error === signal.reason;
 }
 
+/** Rejects every call still waiting on a worker that fired `onerror`. */
+function failWorkerCalls(calls: Set<(error: Error) => void>): void {
+  for (const reject of calls) reject(new Error(WORKER_DIED_MARKER));
+  calls.clear();
+}
+
+/**
+ * `call`, or a rejection once its worker fires `onerror` first. The rejecter leaves `calls` when
+ * the call settles, so nothing outlives the call.
+ */
+function untilWorkerDies<T>(
+  call: Promise<T>,
+  calls: Set<(error: Error) => void> | null
+): Promise<T> {
+  if (calls === null) return call;
+  return new Promise<T>((resolve, reject) => {
+    calls.add(reject);
+    call.then(resolve, reject).finally(() => calls.delete(reject));
+  });
+}
+
+/** `call()`, or a rejection with Error(`marker`) once `ms` pass first. */
+async function raceTimeout<T>(call: () => Promise<T>, ms: number, marker: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      call(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(marker)), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * The error a failed `prepare` rejects with. A start time-out ends the worker that did not start.
+ * A worker that died before it was ready (onerror already recycled it) is a start failure, not a
+ * highlight failure, so it is retried like a time-out and never cached as plain text (#6309).
+ */
+function startError(e: unknown, startingWorker: Worker | undefined): unknown {
+  if (isHighlightStartTimeout(e)) recycleWorker(startingWorker);
+  if (e instanceof Error && e.message === WORKER_DIED_MARKER) return new Error(START_FAILED_MARKER);
+  return e;
+}
+
+/**
+ * Get the worker ready for `language` (start it, load Shiki and the grammar) within
+ * WORKER_START_TIMEOUT_MS. Runs at the front of the queue before the budget starts. A worker
+ * that does not start in time is ended; the next request starts a new one.
+ */
+async function prepareWorker(language: string): Promise<void> {
+  const api = getWorkerAPI();
+  if (!api || preparedLanguages.has(language)) return;
+  const startingWorker = worker ?? undefined;
+  const calls = workerCalls;
+  try {
+    await raceTimeout(
+      () => untilWorkerDies(api.prepare(language), calls),
+      WORKER_START_TIMEOUT_MS,
+      START_TIMEOUT_MARKER
+    );
+  } catch (e) {
+    throw startError(e, startingWorker);
+  }
+  if (worker === startingWorker) preparedLanguages.add(language);
+}
+
 /**
  * Race `call` against the time budget. On budget expiry:
  *   - invoke `onTimeout` (production: terminate the wedged worker),
  *   - remember the input fingerprint so we don't retry it,
  *   - throw the timeout sentinel so the caller renders plain text.
+ *
+ * `prepare` runs first, outside the budget: worker start-up is not this input's work (#6292).
  *
  * Exported for unit testing. Production callers should use `highlightCode`.
  */
@@ -269,7 +398,8 @@ export async function highlightWithBudget(
   call: () => Promise<string>,
   onTimeout: () => void,
   timeoutMs: number = HIGHLIGHT_TIMEOUT_MS,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  prepare: () => Promise<void> = () => Promise.resolve()
 ): Promise<string> {
   // Skip work whose caller already moved on, before the timer starts and before the cache is
   // read or written: an aborted request must never terminate the worker or mark its input.
@@ -281,14 +411,11 @@ export async function highlightWithBudget(
     throw new Error(TIMEOUT_MARKER);
   }
 
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  await prepare();
+  // The caller may have moved on while the worker started.
+  signal?.throwIfAborted();
   try {
-    return await Promise.race([
-      call(),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(TIMEOUT_MARKER)), timeoutMs);
-      }),
-    ]);
+    return await raceTimeout(call, timeoutMs, TIMEOUT_MARKER);
   } catch (e) {
     if (e instanceof Error && e.message === TIMEOUT_MARKER) {
       timedOutInputs.add(key);
@@ -297,9 +424,33 @@ export async function highlightWithBudget(
       onTimeout();
     }
     throw e;
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
   }
+}
+
+/** Runs `job` once every job queued before it has settled (the worker runs one at a time). */
+function enqueue<T>(job: () => Promise<T>): Promise<T> {
+  const result = workerHighlightQueue.then(job, job);
+  workerHighlightQueue = result.then(
+    () => undefined,
+    () => undefined
+  );
+  return result;
+}
+
+/**
+ * Resolves once a worker is ready for `language` after a start time-out; rejects when that start
+ * times out too. Shared: the requests that wait on it trigger one more worker start between them,
+ * not one each, and a worker that never starts ends the wait instead of looping.
+ */
+function whenWorkerRecovered(language: string): Promise<void> {
+  let recovery = workerRecoveries.get(language);
+  if (!recovery) {
+    recovery = enqueue(() => prepareWorker(language)).finally(() => {
+      workerRecoveries.delete(language);
+    });
+    workerRecoveries.set(language, recovery);
+  }
+  return recovery;
 }
 
 /**
@@ -318,17 +469,41 @@ export function enqueueHighlightWithBudget(
   call: () => Promise<string>,
   onTimeout: () => void,
   timeoutMs: number = HIGHLIGHT_TIMEOUT_MS,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  prepare?: () => Promise<void>
 ): Promise<string> {
   // The abort is checked only when the job reaches the front. A job that already runs keeps its
   // slot until it settles or times out, because the single worker is still busy with it.
-  const run = () => highlightWithBudget(code, language, theme, call, onTimeout, timeoutMs, signal);
-  const result = workerHighlightQueue.then(run, run);
-  workerHighlightQueue = result.then(
-    () => undefined,
-    () => undefined
+  return enqueue(() =>
+    highlightWithBudget(code, language, theme, call, onTimeout, timeoutMs, signal, prepare)
   );
-  return result;
+}
+
+/**
+ * Logs why a highlight failed and recycles the worker only when its state is unknown. A budget
+ * time-out already ended the worker inside highlightWithBudget, and a start time-out already
+ * ended the worker that did not start (prepareWorker).
+ */
+function reportHighlightFailure(e: unknown, language: string, codeLength: number): void {
+  if (e instanceof Error && e.message === TIMEOUT_MARKER) {
+    // Demote to a warn once per pathological input — `timedOutInputs` is the dedupe key.
+    console.warn(
+      `[highlightWorkerClient] highlight exceeded ${HIGHLIGHT_TIMEOUT_MS}ms budget for ${language}; ` +
+        `rendering as plain text and skipping this input henceforth (${codeLength} chars)`
+    );
+  } else if (isWorkerGoneFailure(e)) {
+    // The worker is already ended (a start time-out, or onerror), and the input is not marked
+    // (#6292, #6303): log why, but do not recycle again, which could hit a newer worker.
+    console.warn(
+      `[highlightWorkerClient] worker did not start or died (${String(e)}); ` +
+        `rendering ${language} as plain text`
+    );
+  } else {
+    // Non-timeout error — the worker may be in an indeterminate state. Recycle so the next call
+    // gets a fresh one. Don't main-thread fallback (same engine, same risk).
+    console.warn("[highlightWorkerClient] worker highlight failed; recycling:", e);
+    recycleWorker();
+  }
 }
 
 /**
@@ -359,6 +534,26 @@ export async function highlightCode(
   signal?: AbortSignal
 ): Promise<string> {
   try {
+    return await requestHighlight(code, language, theme, signal);
+  } catch (e) {
+    // A worker that did not start says nothing about this input. The caller shows plain text
+    // meanwhile and has no reason to ask again, so retry here, once, after a worker is ready:
+    // a mounted block then highlights without a remount (#6303).
+    if (!isHighlightStartFailure(e)) throw e;
+    signal?.throwIfAborted();
+    await whenWorkerRecovered(language);
+    return requestHighlight(code, language, theme, signal);
+  }
+}
+
+/** One highlight request through the queue and its budget, with failures logged. */
+async function requestHighlight(
+  code: string,
+  language: string,
+  theme: "dark" | "light",
+  signal: AbortSignal | undefined
+): Promise<string> {
+  try {
     return await enqueueHighlightWithBudget(
       code,
       language,
@@ -377,32 +572,27 @@ export async function highlightCode(
           return highlightMainThread(code, language, theme, signal);
         }
 
-        return api.highlight(code, language, theme);
+        return untilWorkerDies(api.highlight(code, language, theme), workerCalls);
       },
       recycleWorker,
       HIGHLIGHT_TIMEOUT_MS,
-      signal
+      signal,
+      () => prepareWorker(language)
     );
   } catch (e) {
     // Expected when the caller moved on: the worker is fine, so do not warn or recycle it.
     if (isAbortedHighlight(e, signal)) throw e;
-    if (e instanceof Error && e.message === TIMEOUT_MARKER) {
-      // Demote to a warn once per pathological input — `timedOutInputs` is the
-      // dedupe key. The terminate side effect already happened inside
-      // `highlightWithBudget`.
-      console.warn(
-        `[highlightWorkerClient] highlight exceeded ${HIGHLIGHT_TIMEOUT_MS}ms budget for ${language}; ` +
-          `rendering as plain text and skipping this input henceforth (${code.length} chars)`
-      );
-    } else {
-      // Non-timeout error — worker may be in an indeterminate state. Recycle
-      // so the next call gets a fresh one. Don't main-thread fallback (same
-      // engine, same risk).
-      console.warn("[highlightWorkerClient] worker highlight failed; recycling:", e);
-      recycleWorker();
-    }
+    reportHighlightFailure(e, language, code.length);
     throw e;
   }
+}
+
+/**
+ * Test-only: how many calls still wait on the current worker. A settled call must leave this
+ * count, or every highlight of a long session would stay reachable (#6303).
+ */
+export function __pendingWorkerCallCountForTests(): number {
+  return workerCalls?.size ?? 0;
 }
 
 /**
@@ -415,5 +605,6 @@ export function __resetForTests(): void {
   workerHighlightQueue = Promise.resolve();
   workerStructurallyUnavailable = false;
   warnedVscodeWorkerDisabled = false;
+  workerRecoveries.clear();
   timedOutInputs.clear();
 }
