@@ -4,6 +4,7 @@ import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
 
 import type { ResolvedAgentSkill } from "./agentSkillsService";
+import { isSkillDynamicDirectiveLine } from "./skillDynamicContext";
 
 /**
  * Where a skill's bundled files live, as seen by `bash` in the workspace.
@@ -122,19 +123,57 @@ export function substituteSkillDirectoryPlaceholders(body: string, dir: SkillDir
 }
 
 /**
- * Throw when `command` still contains a skill-directory placeholder.
- *
- * A placeholder stays literal when Xum has no valid path for it. A shell would
- * expand `${CLAUDE_SKILL_DIR}` to an empty string, so a directive such as
+ * Substitute the placeholders everywhere except whole-line !`command`
+ * directives. A directive is shell code: a spliced path containing `$()`,
+ * backticks or quotes would be reparsed as shell syntax. Directives get the
+ * values as environment variables instead (see skillDirectoryEnv), so the
+ * shell expands `"${CLAUDE_SKILL_DIR}"` itself and the path stays one word.
+ */
+export function substituteSkillDirectoryPlaceholdersOutsideDirectives(
+  body: string,
+  dir: SkillDirectory
+): string {
+  return body
+    .split("\n")
+    .map((line) =>
+      isSkillDynamicDirectiveLine(line) ? line : substituteSkillDirectoryPlaceholders(line, dir)
+    )
+    .join("\n");
+}
+
+/** Environment for directive commands: the placeholder names with their values. */
+export function skillDirectoryEnv(dir: SkillDirectory): Record<string, string> {
+  if (!dir.available) return {};
+  return {
+    CLAUDE_SKILL_DIR: dir.skillDir,
+    ...(dir.pluginRoot != null ? { CLAUDE_PLUGIN_ROOT: dir.pluginRoot } : {}),
+  };
+}
+
+/** `$NAME` and `${NAME}` references to the skill-directory variables in shell code. */
+const SKILL_DIRECTORY_SHELL_REF_RE = /\$\{?(CLAUDE_SKILL_DIR|CLAUDE_PLUGIN_ROOT)\b/g;
+
+/**
+ * Throw when `command` refers to a skill-directory variable that `env` does not
+ * set. The shell would expand it to an empty string, so a directive such as
  * `sh "${CLAUDE_SKILL_DIR}/x.sh"` would run `/x.sh` from the filesystem root.
  * Directive runners call this before executing a command.
  */
-export function assertSkillDirectoryPlaceholdersResolved(command: string): void {
+export function assertSkillDirectoryPlaceholdersResolved(
+  command: string,
+  env: Record<string, string>
+): void {
   assert(typeof command === "string", "assertSkillDirectoryPlaceholdersResolved requires a string");
-  const unresolved = new RegExp(SKILL_DIRECTORY_PLACEHOLDER_RE.source).exec(command)?.[0];
+  const unresolved = [...command.matchAll(SKILL_DIRECTORY_SHELL_REF_RE)].find(
+    (match) => env[match[1]] == null
+  );
   if (unresolved != null) {
-    throw new Error(
-      `not run: ${unresolved} has no value in this workspace (call agent_skill_read for the skill directory)`
-    );
+    // Only CLAUDE_SKILL_DIR can be recovered via agent_skill_read; a plugin root
+    // exists for plugin skills only.
+    const hint =
+      unresolved[1] === "CLAUDE_SKILL_DIR"
+        ? " (call agent_skill_read for the skill directory)"
+        : " (only plugin skills have a plugin root)";
+    throw new Error(`not run: ${unresolved[1]} has no value in this workspace${hint}`);
   }
 }

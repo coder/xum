@@ -181,7 +181,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     const { workspacePath: projectPath } = await createTestWorkspaceWithSkill({
       skillName: "proj-hello",
       skillBody:
-        'Run sh ${CLAUDE_SKILL_DIR}/scripts/hello.sh\n!`echo ran-$((20+22)) "${CLAUDE_SKILL_DIR}"`',
+        'Run sh ${CLAUDE_SKILL_DIR}/scripts/hello.sh\n!`echo ran-$((20+22)) "${CLAUDE_SKILL_DIR}"`\n!`echo ran-$((40+2)) $CLAUDE_SKILL_DIR`',
     });
     const srcBaseDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-agent-skill-src-"));
     const worktreePath = path.join(srcBaseDir, "proj", "ws");
@@ -214,7 +214,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     // A directive with the unresolved placeholder must not run: the shell would
     // expand it to "" and hit a path at the filesystem root.
     expect(snapshotText).not.toContain("ran-42");
-    expect(snapshotText).toContain("not run: ${CLAUDE_SKILL_DIR} has no value");
+    expect(snapshotText).toContain("not run: CLAUDE_SKILL_DIR has no value");
   });
 
   it("resolves checkout-level plugin skills for subproject execution paths (agent-plugins)", async () => {
@@ -940,11 +940,16 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
   });
 
   it("runs a bundled script through ${CLAUDE_SKILL_DIR} in a dynamic context directive", async () => {
-    const { workspacePath } = await createTestWorkspaceWithSkill({
-      skillName: "bundled",
-      skillBody: "!`sh ${CLAUDE_SKILL_DIR}/scripts/hello.sh`",
-    });
+    // Shell syntax in the checkout path must stay data: a spliced path would run
+    // `$(echo injected)` and miss the script.
+    const workspacePath = await fs.mkdtemp(path.join(os.tmpdir(), "mux-skill-$(echo injected)-"));
     const skillDir = path.join(workspacePath, ".mux", "skills", "bundled");
+    await fs.mkdir(skillDir, { recursive: true });
+    await fs.writeFile(
+      path.join(skillDir, "SKILL.md"),
+      '---\nname: bundled\ndescription: Test skill\n---\n\n!`sh "${CLAUDE_SKILL_DIR}/scripts/hello.sh"`\n',
+      "utf-8"
+    );
     await fs.mkdir(path.join(skillDir, "scripts"), { recursive: true });
     await fs.writeFile(path.join(skillDir, "scripts", "hello.sh"), "echo bundled-ok\n", "utf-8");
     const { session, messages } = await createSessionHarness({
