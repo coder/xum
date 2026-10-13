@@ -91,3 +91,55 @@ describe("the onboarding wizard without a static first-run view", () => {
     expect(stepBody()?.className).toContain("animate-in fade-in-0 slide-in-from-right-2");
   });
 });
+
+describe("the onboarding wizard under the static first-run view (#xum-pre)", () => {
+  const firstRunView = () => document.getElementById("xum-pre");
+  const clickNext = () =>
+    fireEvent.click(
+      Array.from(dialog()!.querySelectorAll("button")).find((b) => b.textContent === "Next")!
+    );
+
+  beforeEach(() => {
+    const view = document.createElement("div");
+    view.id = "xum-pre";
+    document.body.append(view);
+  });
+
+  test("never paints its loading step, and no commit shows the gateway step and the static view together", () => {
+    // A Profiler's onRender runs in each commit of the wizard, after its layout effects and
+    // before passive effects: the point where the browser would paint.
+    const viewAtGatewayCommit: boolean[] = [];
+    const onRender = () => {
+      if (showsText(GATEWAY_TEXT)) viewAtGatewayCommit.push(firstRunView() != null);
+    };
+    const tree = () =>
+      React.createElement(
+        React.Profiler,
+        { id: "wizard", onRender },
+        React.createElement(OnboardingWizardSplash, { onDismiss: jest.fn() })
+      );
+    mockProviders = { config: null, loading: true };
+    const view = render(tree());
+    expect(dialog()).toBeNull();
+    expect(firstRunView()).not.toBeNull();
+
+    mockProviders = { config: {}, loading: false };
+    act(() => view.rerender(tree()));
+    expect(viewAtGatewayCommit.length).toBeGreaterThan(0);
+    expect(viewAtGatewayCommit).not.toContain(true);
+    expect(firstRunView()).toBeNull();
+    // The static view showed this frame, so nothing animates in, until the user moves on.
+    expect(dialog()?.style.animation).toBe("none");
+    expect(overlay()?.style.animation).toBe("none");
+    expect(stepBody()).toBeNull();
+    clickNext();
+    expect(stepBody()?.className).toContain("animate-in fade-in-0 slide-in-from-right-2");
+  });
+
+  test("removes the static view when it opens past the gateway step", () => {
+    mockProviders = { config: { anthropic: { isConfigured: true } }, loading: false };
+    renderWizard();
+    expect(showsText(GATEWAY_TEXT)).toBe(false);
+    expect(firstRunView()).toBeNull();
+  });
+});

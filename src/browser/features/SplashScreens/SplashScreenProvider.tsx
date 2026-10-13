@@ -21,6 +21,11 @@ import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { FIRST_RUN_VIEW_ID } from "@/common/constants/firstRunView";
 import { ONBOARDING_VIEWED_KEY } from "@/common/constants/storage";
 
+/** Whether the server's static first-run view is on screen (T3 #5971, C step 2). */
+export function hasFirstRunView(): boolean {
+  return document.getElementById(FIRST_RUN_VIEW_ID) != null;
+}
+
 /** Removes the static first-run view. Callers do it whenever the live wizard will not replace it. */
 export function removeFirstRunView(): void {
   document.getElementById(FIRST_RUN_VIEW_ID)?.remove();

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowLeft,
   Bot,
@@ -9,7 +9,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import { SplashScreen } from "./SplashScreen";
-import { useOnboardingPause } from "./SplashScreenProvider";
+import { hasFirstRunView, removeFirstRunView, useOnboardingPause } from "./SplashScreenProvider";
 import { DocsLink } from "@/browser/components/DocsLink/DocsLink";
 import { ProviderWithIcon } from "@/browser/components/ProviderIcon/ProviderIcon";
 import {
@@ -191,6 +191,32 @@ function CommandPalettePreview(props: { shortcut: string }) {
       </div>
     </div>
   );
+}
+
+/**
+ * T3 #5971, C step 2: the server's static first-run view (#xum-pre) already shows the gateway step.
+ * The live wizard renders nothing while it loads under that view, then swaps it out in its first
+ * real commit (a layout effect runs before paint), opening without entry animations until the user
+ * moves on. A wizard that starts past the gateway step replaces the view too.
+ */
+function useFirstRunViewHandoff(isLoading: boolean) {
+  const [startsUnderFirstRunView] = useState(hasFirstRunView);
+  const [skipEntryAnimation, setSkipEntryAnimation] = useState(startsUnderFirstRunView);
+  useLayoutEffect(() => {
+    if (!isLoading) removeFirstRunView();
+  }, [isLoading]);
+  return {
+    hideWhileLoading: isLoading && startsUnderFirstRunView,
+    skipEntryAnimation,
+    stopSkipping: () => setSkipEntryAnimation(false),
+  };
+}
+
+function stepEntryClassName(direction: Direction, skipEntryAnimation: boolean): string {
+  if (skipEntryAnimation) return "";
+  return direction === "forward"
+    ? "animate-in fade-in-0 slide-in-from-right-2"
+    : "animate-in fade-in-0 slide-in-from-left-2";
 }
 
 export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
@@ -1043,6 +1069,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
 
   const totalSteps = steps.length;
   const currentStep = steps[stepIndex] ?? steps[0];
+  const firstRunView = useFirstRunViewHandoff(isLoading);
 
   useEffect(() => {
     if (currentStep?.key !== "mux-gateway" && muxGatewayLoginInProgress) {
@@ -1050,7 +1077,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
     }
   }, [cancelMuxGatewayLogin, currentStep?.key, muxGatewayLoginInProgress]);
 
-  if (!currentStep) {
+  if (!currentStep || firstRunView.hideWhileLoading) {
     return null;
   }
 
@@ -1062,6 +1089,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
       return;
     }
     setDirection("back");
+    firstRunView.stopSkipping();
     // Changing steps remounts the project form without its inline error, so
     // clear the stale flag or the "click Next" nudge stays hidden on return.
     setProjectFormHasError(false);
@@ -1073,6 +1101,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
       return;
     }
     setDirection("forward");
+    firstRunView.stopSkipping();
     setProjectFormHasError(false);
     setStepIndex((i) => Math.min(totalSteps - 1, i + 1));
   };
@@ -1091,6 +1120,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
         props.onDismiss();
       }}
       dismissLabel={null}
+      skipEntryAnimation={firstRunView.skipEntryAnimation}
       footerClassName="justify-between"
       footer={
         <>
@@ -1152,11 +1182,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
 
         <div
           key={currentStep.key}
-          className={`flex flex-col gap-3 ${
-            direction === "forward"
-              ? "animate-in fade-in-0 slide-in-from-right-2"
-              : "animate-in fade-in-0 slide-in-from-left-2"
-          }`}
+          className={`flex flex-col gap-3 ${stepEntryClassName(direction, firstRunView.skipEntryAnimation)}`}
         >
           <div className="text-foreground flex items-center gap-2 text-sm font-medium">
             <span className="bg-accent/10 text-accent inline-flex h-8 w-8 items-center justify-center rounded-md">
