@@ -749,6 +749,26 @@ export const TaskAwaitToolArgsSchema = z
         path: ["filter_exclude"],
       });
     }
+    // One offset pages one report: with several IDs (or none, which awaits every task), each
+    // other completed report would silently lose its first offset_chars characters.
+    const ids = new Set(args.task_ids ?? []);
+    const offset = args.offset_chars ?? 0;
+    if (offset > 0 && ids.size !== 1) {
+      const calls = [...ids].map(
+        (id) =>
+          `task_await(task_ids: [${JSON.stringify(id)}], timeout_secs: 0, offset_chars: ${offset})`
+      );
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "offset_chars pages one report, so it needs exactly one task ID. Call " +
+          (calls.length > 0
+            ? calls.join(" or ")
+            : `task_await(task_ids: ["<id>"], timeout_secs: 0, offset_chars: ${offset})`) +
+          ", and await other tasks without offset_chars.",
+        path: ["offset_chars"],
+      });
+    }
   });
 
 export const SubagentGitPatchArtifactStatusSchema = z.enum([
