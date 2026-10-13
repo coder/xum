@@ -43,6 +43,7 @@ import {
   markCodexOauthRoutedResponse,
   normalizeOpenAICompatibleBaseURL,
   resolveAIProviderHeaderSource,
+  requestEndpoint,
   resolveOpenAIWebSocketResponsesUrl,
   wrapFetchWithAnthropicCacheControl,
   wrapFetchWithXAIServiceTier,
@@ -6049,5 +6050,52 @@ describe("ProviderModelFactory prompt-cache prefix observation", () => {
       await sendTo("https://proxy-b.example.com/v1", "third");
       expect(recorded).toHaveLength(1);
     });
+  });
+
+  it("keys a base-URL query by its hash: another tenant is another baseline", async () => {
+    await withTempConfig(async (_config, factory) => {
+      const sent: Array<Record<string, unknown>> = [];
+      const sendTo = async (baseURL: string, text: string) => {
+        const scope = factory.createPromptCacheTurnScope("ws-query", recorder);
+        const result = await factory.createModel(
+          "anthropic:claude-sonnet-4-5",
+          {},
+          {
+            promptCacheScope: scope,
+            providersConfig: {
+              anthropic: { apiKey: "test-key", baseURL, fetch: capturingFetch(sent) },
+            } as unknown as ProvidersConfig,
+          }
+        );
+        if (!result.success) throw new Error("expected an Anthropic model");
+        await send(result.data, [{ role: "user", content: text }]);
+      };
+      // The proxy picks the account by the query: tenant B's first request is a new baseline.
+      await sendTo("https://proxy.example.com/v1?token=tenant-a-secret", "first");
+      await sendTo("https://proxy.example.com/v1?token=tenant-b-secret", "second");
+      expect(sent).toHaveLength(2);
+      expect(recorded).toEqual([]);
+      // The same query is the same cache, so a rewritten prompt is reported.
+      await sendTo("https://proxy.example.com/v1?token=tenant-b-secret", "third");
+      expect(recorded).toHaveLength(1);
+      expect(JSON.stringify(recorded)).not.toContain("secret");
+    });
+  });
+
+  it("requestEndpoint keeps no query text, only a stable hash of it", () => {
+    const tenantA = requestEndpoint("https://proxy.example.com/v1?token=tenant-a-secret/messages");
+    const tenantB = requestEndpoint("https://proxy.example.com/v1?token=tenant-b-secret/messages");
+    expect(tenantA).toMatch(/^https:\/\/proxy\.example\.com\/v1\?sha256:[0-9a-f]{16}$/);
+    expect(tenantA).not.toBe(tenantB);
+    expect(requestEndpoint("https://proxy.example.com/v1?token=tenant-a-secret/messages")).toBe(
+      tenantA
+    );
+    for (const endpoint of [tenantA, tenantB, requestEndpoint("not a url ?token=secret")]) {
+      expect(endpoint).not.toContain("token");
+      expect(endpoint).not.toContain("secret");
+    }
+    expect(requestEndpoint("https://api.anthropic.com/v1/messages")).toBe(
+      "https://api.anthropic.com/v1/messages"
+    );
   });
 });
