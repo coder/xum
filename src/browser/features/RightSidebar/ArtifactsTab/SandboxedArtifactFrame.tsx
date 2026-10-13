@@ -57,8 +57,8 @@ interface BuiltDocument {
  * SECURITY AUDIT: gate for `window.xum.openWorkspace` and the frame's C (annotate) key. The
  * artifact's script can post either at any time, so the host honours them only while the user's
  * own click or key press inside `frame` is live: focus is on the iframe (a click or Tab into a
- * frame moves the app's activeElement to it, and a hidden frame cannot hold focus), and the app has transient user activation (a gesture
- * in a child frame also activates its ancestors). Each check alone is not enough: typing in the
+ * frame moves the app's activeElement to it, and a hidden frame cannot hold focus), and the app
+ * has transient user activation (a gesture in a child frame also activates its ancestors). Each check alone is not enough: typing in the
  * composer also activates the app, and focus stays on the frame long after the click.
  * No confirm strip: a switch sends nothing and reveals nothing to the frame, the user can switch
  * back, and the right sidebar is keyed by workspace, so the switch unmounts this frame.

@@ -70,12 +70,13 @@ describe("acceptArtifactFrameMessage", () => {
 
 /** Run the bridge script against a minimal window; returns its keydown handler and posts. */
 function runBridgeScript() {
-  const listeners = new Map<string, (event: unknown) => void>();
+  // Every listener, in registration order: keys use a capture listener and a bubble one.
+  const listeners: Array<{ type: string; listener: (event: unknown) => void }> = [];
   const posted: unknown[] = [];
   const fakeWindow: { xum?: { openWorkspace: (id: unknown) => void } } & Record<string, unknown> = {
     parent: { postMessage: (message: unknown) => posted.push(message) },
     addEventListener: (type: string, listener: (event: unknown) => void) => {
-      listeners.set(type, listener);
+      listeners.push({ type, listener });
     },
   };
   // The script mirrors the theme onto the root element (data-xum-theme).
@@ -91,15 +92,25 @@ function runBridgeScript() {
     buildArtifactBridgeScript("dark")
   ) as (window: unknown, document: unknown, customEvent: unknown) => void;
   run(fakeWindow, fakeDocument, class {});
-  const keydown = (key: string, target: unknown, shiftKey = false) =>
-    listeners.get("keydown")?.({
+  /** One key press through every keydown listener; `defaultPrevented`: the artifact kept it. */
+  const keydown = (
+    key: string,
+    target: unknown,
+    shiftKey = false,
+    extra: { ctrlKey?: boolean; defaultPrevented?: boolean; composedPath?: unknown[] } = {}
+  ) => {
+    const event = {
       key,
       target,
       shiftKey,
-      ctrlKey: false,
+      ctrlKey: extra.ctrlKey ?? false,
       metaKey: false,
       altKey: false,
-    });
+      defaultPrevented: extra.defaultPrevented ?? false,
+      ...(extra.composedPath ? { composedPath: () => extra.composedPath } : {}),
+    };
+    for (const entry of listeners) if (entry.type === "keydown") entry.listener(event);
+  };
   return { keydown, posted, xum: fakeWindow.xum };
 }
 
@@ -121,6 +132,22 @@ describe("bridge script keys", () => {
     expect(bridge.posted).toEqual([]);
     bridge.keydown("F", div, true);
     expect(bridge.posted).toEqual([{ xumArtifact: 1, type: "key", key: "F", shiftKey: true }]);
+  });
+
+  test("plain C is posted unless typed, chorded, or kept by the artifact", () => {
+    const bridge = runBridgeScript();
+    bridge.keydown("c", input);
+    bridge.keydown("C", div, true);
+    bridge.keydown("c", div, false, { ctrlKey: true });
+    bridge.keydown("c", div, false, { defaultPrevented: true });
+    // Typed in an input inside a web component: window sees the (non-editable) shadow host.
+    bridge.keydown("c", div, false, { composedPath: [input, div] });
+    expect(bridge.posted).toEqual([]);
+    bridge.keydown("c", div);
+    // Caps Lock gives "C" without Shift.
+    bridge.keydown("C", div);
+    const c = { xumArtifact: 1, type: "key", key: "C", shiftKey: false };
+    expect(bridge.posted).toEqual([c, c]);
   });
 });
 

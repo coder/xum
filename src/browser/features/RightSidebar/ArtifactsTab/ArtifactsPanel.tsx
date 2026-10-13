@@ -628,7 +628,7 @@ export function ArtifactsPanel(props: {
     annotating,
     pendingPick,
     openAnnotation,
-    clearAnnotationPick,
+    setAnnotationPick,
     toggleAnnotate,
     escapeAnnotate,
   } = useArtifactAnnotateMode(props.workspaceId, annotateSupport, readKey ?? "");
@@ -642,7 +642,7 @@ export function ArtifactsPanel(props: {
   // The comment box sits at the selection's screen position, which the layout change moves:
   // left open, it floated over the sidebar far from its text. Annotate mode itself stays on.
   const setFullscreenMode = (next: boolean) => {
-    clearAnnotationPick();
+    setAnnotationPick(null);
     setFullscreen(next);
   };
 
@@ -671,8 +671,8 @@ export function ArtifactsPanel(props: {
     // behind nothing. Leave fullscreen once the panel has no box.
     const sizeObserver = new ResizeObserver(() => {
       if (panel.getClientRects().length > 0) return;
-      // setFullscreenMode's steps; both functions are stable, so the effect does not re-run.
-      clearAnnotationPick();
+      // setFullscreenMode's steps; its state setters are stable, so the effect does not re-run.
+      setAnnotationPick(null);
       setFullscreen(false);
     });
     sizeObserver.observe(panel);
@@ -694,7 +694,7 @@ export function ArtifactsPanel(props: {
       // focus on <body>.
       if (document.activeElement !== returnTo) panel.focus();
     };
-  }, [showFullscreen, clearAnnotationPick]);
+  }, [showFullscreen, setAnnotationPick]);
 
   // Picker order: pinned files first, then artifacts, then deleted artifacts with stored
   // versions. A selected version whose working file is gone keeps its own entry so the picker
@@ -811,7 +811,7 @@ export function ArtifactsPanel(props: {
       artifact: { version: annotationVersion, anchor: pick.anchor },
     });
     window.getSelection()?.removeAllRanges();
-    clearAnnotationPick();
+    setAnnotationPick(null);
   };
 
   // Tab-scoped shortcuts: they only fire while focus is inside this panel (fullscreen included:
@@ -1292,7 +1292,7 @@ export function ArtifactsPanel(props: {
   // first, while the box's control still holds it.
   const closeAnnotationBox = () => {
     if (document.activeElement != null) keepFocusForShortcuts(document.activeElement);
-    clearAnnotationPick();
+    setAnnotationPick(null);
   };
   const annotationPopover =
     pendingPick == null ? null : (

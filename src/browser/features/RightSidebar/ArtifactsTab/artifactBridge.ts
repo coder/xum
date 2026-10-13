@@ -1,4 +1,7 @@
+import assert from "@/common/utils/assert";
 import { z } from "zod";
+import { KEYBINDS } from "@/browser/utils/ui/keybinds";
+import type { Keybind } from "@/common/types/keybind";
 import {
   ARTIFACT_ANNOTATION_CONTEXT_CHARS,
   ARTIFACT_ANNOTATION_QUOTE_MAX_CHARS,
@@ -351,6 +354,26 @@ export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
     });
   })();`;
 
+/**
+ * The annotate shortcut the frame forwards, lowercased, from the keybind the panel and Settings
+ * use, so the three cannot drift. The shim checks only the key with no modifiers, so a keybind
+ * with modifiers or a `code` would need a shim change: fail at load instead of forwarding the
+ * wrong key.
+ */
+const ANNOTATE_FRAME_KEY = (() => {
+  const keybind: Keybind = KEYBINDS.TOGGLE_ARTIFACT_ANNOTATE;
+  assert(
+    keybind.key.length === 1 &&
+      keybind.code == null &&
+      !keybind.ctrl &&
+      !keybind.shift &&
+      !keybind.alt &&
+      !keybind.meta,
+    "artifact frame shim forwards only a plain single-key annotate shortcut"
+  );
+  return keybind.key.toLowerCase();
+})();
+
 export function buildArtifactBridgeScript(
   initialTheme: ArtifactTheme,
   initialState: unknown = null
@@ -477,6 +500,11 @@ export function buildArtifactBridgeScript(
     }
     host.postMessage(message, "*");
   }, true);
+  // The innermost target: a key typed in an input inside an open shadow root reaches window
+  // retargeted to the shadow host, which is not editable.
+  function keyTarget(event) {
+    return typeof event.composedPath === "function" ? event.composedPath()[0] || event.target : event.target;
+  }
   function isEditable(target) {
     if (!target || target.nodeType !== 1) return false;
     var tag = target.tagName;
@@ -488,12 +516,19 @@ export function buildArtifactBridgeScript(
     // Escape is checked before the editable exclusion: keys inside the frame never reach the
     // host, so this is the only way to leave fullscreen while an artifact input has focus.
     if (event.key === "Escape") key = "Escape";
-    else if (isEditable(event.target)) return;
+    else if (isEditable(keyTarget(event))) return;
     else if (plain && event.shiftKey && (event.key === "F" || event.key === "f")) key = "F";
-    else if (plain && !event.shiftKey && (event.key === "c" || event.key === "C")) key = "C";
     if (key === null) return;
     host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "key", key: key, shiftKey: event.shiftKey }, "*");
   }, true);
+  // C (annotate) listens in the bubble phase, after the artifact's own handlers: an artifact that
+  // uses plain C itself (a game, a keyboard-driven widget) calls preventDefault and keeps the key.
+  window.addEventListener("keydown", function (event) {
+    if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+    if (typeof event.key !== "string" || event.key.toLowerCase() !== ${JSON.stringify(ANNOTATE_FRAME_KEY)}) return;
+    if (isEditable(keyTarget(event))) return;
+    host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "key", key: "C", shiftKey: false }, "*");
+  });
   ${ARTIFACT_IN_PAGE_LINK_SCRIPT}
 })();`;
 }

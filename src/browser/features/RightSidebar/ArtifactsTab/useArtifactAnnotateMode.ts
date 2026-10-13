@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useState } from "react";
 import { ARTIFACTS_SELECTION_MAX_WORKSPACES } from "@/common/constants/storage";
 import type { ArtifactAnnotationPick, ArtifactAnnotationSupport } from "./artifactAnnotation";
 import { createCappedMemory, useCappedMemory } from "./cappedMemory";
@@ -32,15 +32,16 @@ export function useArtifactAnnotateMode(
   const [pick, setPick] = useState<{ key: string; pick: ArtifactAnnotationPick } | null>(null);
   const annotating = on && support != null;
   const pendingPick = annotating && pick?.key === pickKey ? pick.pick : null;
-  // A stable identity, not a memoization: the panel's fullscreen effect calls it, and a new
-  // function each render would re-run that effect (focus, inert siblings) on every render.
-  const clearAnnotationPick = useCallback(() => setPick(null), []);
+  // React's state setter, so its identity is stable: the panel's fullscreen effect clears the
+  // pick, and a new function each render would re-run that effect (focus, inert siblings).
+  // Typed to clearing only: openAnnotation is the one way to open a box (it sets the key).
+  const setAnnotationPick: (value: null) => void = setPick;
   return {
     annotating,
     /** The open comment box's pick, if one is open on the shown version. */
     pendingPick,
     openAnnotation: (next: ArtifactAnnotationPick) => setPick({ key: pickKey, pick: next }),
-    clearAnnotationPick,
+    setAnnotationPick,
     toggleAnnotate: () => {
       if (support == null) return;
       setPick(null);
