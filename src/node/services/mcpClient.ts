@@ -9,6 +9,11 @@ import {
 import { dynamicTool, jsonSchema, type JSONSchema7, type Tool } from "ai";
 import assert from "@/common/utils/assert";
 import {
+  advertisedMCPSettingsToolNames,
+  parseMCPSettingsCapability,
+  type MCPSettingsCapability,
+} from "@/common/utils/mcpSettings";
+import {
   isModelVisibleTool,
   MCP_APP_MIME_TYPE,
   MCP_APPS_EXTENSION_ID,
@@ -152,6 +157,18 @@ export interface MCPClientHandle {
   ): Promise<MCPRawCallToolResult>;
   /** MCP Apps only: resources/read for a view's ui:// resource. */
   readResource(uri: string, options?: { signal?: AbortSignal }): Promise<MCPReadResourceResult>;
+  /** The server's `openai/settings` capability, read once at connect. */
+  settingsCapability(): MCPSettingsCapability | undefined;
+  /**
+   * tools/call for the host's settings UI only (the model never sees these
+   * tools). `meta` becomes the request `_meta`.
+   */
+  callSettingsTool(
+    name: string,
+    args: Record<string, unknown>,
+    meta: Record<string, unknown>,
+    options?: { signal?: AbortSignal; timeoutMs?: number }
+  ): Promise<MCPRawCallToolResult>;
   close(): Promise<void>;
 }
 
@@ -297,6 +314,11 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
     : config.transport;
 
   await client.connect(transport, config.prior !== undefined ? { prior: config.prior } : {});
+  const settings = parseMCPSettingsCapability(client.getServerCapabilities());
+  // Only the host reads and writes settings: hiding the tools keeps the model
+  // from changing what the user configured.
+  // Every advertised name, even from a half-malformed capability: hiding stays on.
+  const settingsTools = new Set(advertisedMCPSettingsToolNames(client.getServerCapabilities()));
 
   return {
     tools: async () => {
@@ -306,6 +328,9 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
       const tools: Record<string, Tool> = {};
       const listed = new Map<string, MCPToolUi | undefined>();
       for (const definition of listResult.tools) {
+        // Settings tools are host-only: left out of the listing too, so an MCP App view
+        // cannot call them through callToolForApp (hasTool is false for them).
+        if (settingsTools.has(definition.name)) continue;
         const ui = mcpApps ? parseMCPToolUiMeta(definition._meta) : undefined;
         listed.set(definition.name, ui);
         // MCP Apps: "Host MUST NOT include tools in the agent's tool list" when visibility
@@ -392,6 +417,17 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
         { uri },
         {
           timeout: RESOURCE_READ_TIMEOUT_MS,
+          ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+        }
+      );
+    },
+    settingsCapability: () => settings,
+    callSettingsTool: (name, args, meta, options) => {
+      assert(settingsTools.has(name), "callSettingsTool only calls the advertised settings tools");
+      return client.callTool(
+        { name, arguments: args, _meta: meta },
+        {
+          timeout: options?.timeoutMs ?? APP_TOOL_CALL_TIMEOUT_MS,
           ...(options?.signal !== undefined ? { signal: options.signal } : {}),
         }
       );

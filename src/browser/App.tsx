@@ -145,7 +145,7 @@ import { Err, Ok } from "@/common/types/result";
 // T3 #5971 (route split): each page is its own chunk. The workspace page's ErrorBoundary sits inside
 // its chunk, so a failed chunk load reaches PageArea's LazyFeature (Reload, which can recover).
 let aiViewChunk: Promise<typeof AIViewModule> | undefined;
-const loadAIView = () => (aiViewChunk ??= import("./components/AIView/AIView"));
+export const loadAIView = () => (aiViewChunk ??= import("./components/AIView/AIView"));
 const AIView = React.lazy(async () => {
   const { AIView: View } = await loadAIView();
   return {
@@ -172,6 +172,25 @@ const startupRoute =
 // the same way), and this runs during module evaluation, where a throw would stop the app.
 if (typeof startupRoute === "string" && startupRoute.startsWith("/workspace/")) {
   loadAIView().catch(() => undefined); // React.lazy reports it
+}
+
+/**
+ * The app shell's ref: marks the shell ready, then (#6255) on desktop starts the workspace page chunk
+ * once the renderer is idle. Desktop often starts off a workspace route, and its first workspace
+ * click then waited for the chunk (+50-100 ms in the nightly workspace-open scenarios). Not in the
+ * browser: there it would add page-code evaluation to the first-run page's Lighthouse window. A
+ * module function, so React calls it only on attach and detach (see markAppShellReady).
+ */
+export function appShellRef(element: HTMLElement | null): void {
+  markAppShellReady(element);
+  if (element == null || window.location.protocol !== "file:") return;
+  if (typeof requestIdleCallback !== "function") return;
+  requestIdleCallback(
+    () => {
+      loadAIView().catch(() => undefined); // React.lazy reports it
+    },
+    { timeout: 2_000 } // load it even if the renderer stays busy
+  );
 }
 
 /**
@@ -1500,7 +1519,7 @@ function AppInner() {
     <>
       <div
         className="bg-surface-primary mobile-layout flex h-full overflow-hidden pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]"
-        ref={markAppShellReady}
+        ref={appShellRef}
       >
         <LeftSidebar
           collapsed={sidebarCollapsed}
