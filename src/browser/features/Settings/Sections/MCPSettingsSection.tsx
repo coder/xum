@@ -1,4 +1,9 @@
 import { useClaudeDesign } from "@/browser/hooks/useClaudeDesign";
+import {
+  McpAppViewDomainsSection,
+  unlistedMcpAppViewDomains,
+  useMcpAppViewDomains,
+} from "./McpAppViewDomains";
 import { getOwn } from "@/common/utils/getOwn";
 import { ClaudeDesignCard } from "./ClaudeDesignCard";
 import { CLAUDE_DESIGN_SERVER_NAME } from "@/common/constants/claudeDesign";
@@ -659,7 +664,7 @@ const RemoteMCPOAuthSection: React.FC<{
     setAuthStatusError(null);
 
     try {
-      const status = await mcpOauthApi.getAuthStatus({ serverUrl: url });
+      const status = await mcpOauthApi.getAuthStatus({ serverUrl: url, serverName });
       setAuthStatus(status);
     } catch (err) {
       setAuthStatus(null);
@@ -667,7 +672,7 @@ const RemoteMCPOAuthSection: React.FC<{
     } finally {
       setAuthStatusLoading(false);
     }
-  }, [api, url]);
+  }, [api, url, serverName]);
 
   useEffect(() => {
     void refreshAuthStatus();
@@ -876,6 +881,7 @@ export const MCPSettingsSection: React.FC = () => {
     Record<string, { serverInfo: MCPServerIdentity; icon?: string }>
   >({});
   const [mcpOauthRefreshNonce, setMcpOauthRefreshNonce] = useState(0);
+  const viewDomains = useMcpAppViewDomains();
 
   interface EditableServer {
     name: string;
@@ -1657,11 +1663,22 @@ export const MCPSettingsSection: React.FC = () => {
                       )}
                     </div>
                   )}
+                  <McpAppViewDomainsSection
+                    entries={viewDomains.entries.filter((e) => e.serverName === name)}
+                    onRevoke={(e) => void viewDomains.revoke(e)}
+                    error={viewDomains.revokeError}
+                  />
                 </div>
               );
             })
           )}
         </div>
+        <McpAppViewDomainsSection
+          entries={unlistedMcpAppViewDomains(viewDomains.entries, servers)}
+          onRevoke={(e) => void viewDomains.revoke(e)}
+          showServer
+          error={viewDomains.revokeError}
+        />
 
         {/* Add server form */}
         <details className="group mt-3">

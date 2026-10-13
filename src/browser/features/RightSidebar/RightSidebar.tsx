@@ -81,6 +81,7 @@ import {
   isNewTab,
   isTabType,
   isTerminalTab,
+  getAppViewTabKey,
   getSideChatTabWorkspaceId,
   getTerminalSessionId,
   makeSideChatTabType,
@@ -124,6 +125,13 @@ import {
   type TerminalSessionCreateOptions,
 } from "@/browser/utils/terminal";
 import { SideChatTabTitle } from "./Tabs/TabLabels";
+import { AppViewTabLabel, AppViewTabPanel, AppViewTabTooltip } from "./AppViewTab/AppViewTab";
+import {
+  appViewTabToolCallId,
+  liveAppViewTabs,
+  nextRecentAppViewTabs,
+  withAppViewTab,
+} from "./AppViewTab/appViewTabs";
 import { ReviewAssistedStatsReporter } from "@/browser/features/RightSidebar/CodeReview/ReviewPanel";
 import {
   NewTabLabel,
@@ -484,6 +492,16 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
   // Count terminal tabs in this tabset for numbering (Terminal, Terminal 2, etc.)
   const terminalTabs = props.node.tabs.filter(isTerminalTab);
   const activeSideChatWorkspaceId = getSideChatTabWorkspaceId(props.node.activeTab);
+  // App tabs stay mounted while hidden, so switching tabs never reloads a view (its state and
+  // any running work live in the iframe). Only the few most recently active ones per tabset,
+  // though: each is a live document, and an unbounded set of hidden iframes would keep every
+  // app the user ever opened running. Older ones remount (fresh tool-input and tool-result)
+  // when selected again. Render-time adjustment: the order only changes with the active tab.
+  const [recentAppTabs, setRecentAppTabs] = React.useState<TabType[]>([]);
+  if (getAppViewTabKey(props.node.activeTab) != null && recentAppTabs[0] !== props.node.activeTab) {
+    setRecentAppTabs(nextRecentAppViewTabs(recentAppTabs, props.node.activeTab, props.node.tabs));
+  }
+  const liveAppTabs = liveAppViewTabs(recentAppTabs, props.node.tabs);
 
   const items = props.node.tabs.flatMap((tab) => {
     const tabId = `${tabsetBaseId}-tab-${tab}`;
@@ -514,6 +532,11 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
         <SideChatTabTitle workspaceId={sideChatWorkspaceId} />
         {keybindStr && ` (${keybindStr})`}
       </>
+    ) : getAppViewTabKey(tab) != null ? (
+      <>
+        <AppViewTabTooltip workspaceId={props.workspaceId} toolCallId={appViewTabToolCallId(tab)} />
+        {keybindStr && ` (${keybindStr})`}
+      </>
     ) : (
       keybindStr
     );
@@ -537,6 +560,10 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
           onPopOut={() => props.onPopOutTerminal(tab)}
           onClose={() => props.onCloseTerminal(tab)}
         />
+      );
+    } else if (getAppViewTabKey(tab) != null) {
+      label = (
+        <AppViewTabLabel workspaceId={props.workspaceId} toolCallId={appViewTabToolCallId(tab)} />
       );
     } else if (sideChatWorkspaceId != null) {
       label = (
@@ -733,6 +760,23 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
             />
           </div>
         )}
+
+        {liveAppTabs.map((tab) => (
+          <div
+            key={`${tabsetBaseId}-panel-${tab}`}
+            role="tabpanel"
+            id={`${tabsetBaseId}-panel-${tab}`}
+            aria-labelledby={`${tabsetBaseId}-tab-${tab}`}
+            className="h-full"
+            hidden={props.node.activeTab !== tab}
+          >
+            <AppViewTabPanel
+              workspaceId={props.workspaceId}
+              toolCallId={appViewTabToolCallId(tab)}
+              onClose={() => props.onCloseTab(props.node.id, tab)}
+            />
+          </div>
+        ))}
 
         {/* Render all terminal tabs (keep-alive: hidden but mounted) */}
         {terminalTabs.map((terminalTab) => {
@@ -1111,10 +1155,16 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     () => parseRightSidebarLayoutState(layoutDraft ?? layoutRaw, initialActiveTab),
     [layoutDraft, layoutRaw, initialActiveTab]
   );
-  const layout = React.useMemo(
-    () => (canReviewDiffs ? parsedLayout : removeTabEverywhere(parsedLayout, "review")),
-    [canReviewDiffs, parsedLayout]
-  );
+  const layout = React.useMemo(() => {
+    let next = canReviewDiffs ? parsedLayout : removeTabEverywhere(parsedLayout, "review");
+    // App tabs exist only behind the artifacts experiment, like MCP Apps themselves.
+    if (!artifactsExperimentEnabled) {
+      for (const tab of collectAllTabs(next.root)) {
+        if (getAppViewTabKey(tab) != null) next = removeTabEverywhere(next, tab);
+      }
+    }
+    return next;
+  }, [artifactsExperimentEnabled, canReviewDiffs, parsedLayout]);
 
   const hasReviewPanelMounted = React.useMemo(
     () => !collapsed && hasMountedReviewPanel(layout.root),
@@ -1337,24 +1387,33 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       window.removeEventListener(CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB, handleOpenSideChatTab);
   }, [setCollapsed, setLayout, workspaceId]);
 
-  // "Open in Artifacts" on an MCP Apps tool card and openArtifact() (chat cards, file cards,
-  // Review, palette) persist their selection, then ask for the tab like OPEN_GOAL_TAB. On small
-  // viewports WorkspaceMenuBar shows the tab in the full-screen sidebar instead; this handler
-  // then stays out, so one event never acts twice.
+  // openArtifact() (chat cards, file cards, Review, palette) persists its selection, then asks
+  // for the tab like OPEN_GOAL_TAB; "Open in tab" on an MCP Apps tool card (and the palette)
+  // asks for the view's own app tab, focusing it when it is already open. On small viewports
+  // WorkspaceMenuBar shows the tab in the full-screen sidebar instead; these handlers then stay
+  // out, so one event never acts twice.
   React.useEffect(() => {
     if (!artifactsExperimentEnabled) return;
+    const shown = () => {
+      const container = sidebarContainerRef.current;
+      return container == null || !isRightSidebarResponsivelyHidden(container);
+    };
     const handleOpenArtifactsTab = (event: Event) => {
       const detail = (event as CustomEvent<{ workspaceId: string }>).detail;
-      if (detail?.workspaceId !== workspaceId) return;
-      const container = sidebarContainerRef.current;
-      if (container != null && isRightSidebarResponsivelyHidden(container)) return;
+      if (detail?.workspaceId !== workspaceId || !shown()) return;
       setCollapsed(false);
       setLayout((prev) => selectOrAddTab(prev, "artifacts"));
     };
-    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handleOpenArtifactsTab);
+    const handleOpenAppViewTab = (event: Event) => {
+      const detail = (event as CustomEvent<{ workspaceId: string; toolCallId: string }>).detail;
+      if (detail?.workspaceId !== workspaceId || !shown()) return;
+      setCollapsed(false);
+      setLayout((prev) => withAppViewTab(prev, detail.toolCallId));
+    };
+    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handleOpenAppViewTab);
     window.addEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handleOpenArtifactsTab);
     return () => {
-      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handleOpenArtifactsTab);
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handleOpenAppViewTab);
       window.removeEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handleOpenArtifactsTab);
     };
   }, [artifactsExperimentEnabled, setCollapsed, setLayout, workspaceId]);

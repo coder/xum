@@ -12,7 +12,7 @@ import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 
 interface TerminalSubscribeCallbacks {
   onOutput: (data: string) => void;
-  onScreenState: (state: string) => void;
+  onScreenState: (state: string, options?: { replace: boolean }) => void;
   onExit: (code: number) => void;
 }
 
@@ -55,8 +55,14 @@ class MockTerminal {
   cols = 80;
   rows = 24;
   options: MockTerminalOptions;
+  calls: string[] = [];
   clear = mock(() => undefined);
-  write = mock((_data: string) => undefined);
+  reset = mock(() => {
+    this.calls.push("reset");
+  });
+  write = mock((data: string) => {
+    this.calls.push(`write:${data}`);
+  });
   resize = mock((cols: number, rows: number) => {
     this.cols = cols;
     this.rows = rows;
@@ -175,6 +181,24 @@ describe("TerminalView", () => {
     cleanupDom?.();
     cleanupDom = null;
     mock.restore();
+  });
+
+  // After a reconnect the router sends the full screen again. Written on top of the old screen,
+  // the scrollback would repeat, so a replacing screen starts from an empty terminal.
+  test("a screen that replaces the old one is written after a full VT reset", async () => {
+    renderTerminal(mock((_exitCode: number) => undefined));
+    await waitFor(() => expect(mockRouter.subscribe).toHaveBeenCalledTimes(1));
+    const terminal = terminalInstances[0];
+    expect(terminal?.calls).toEqual(["write:initial screen"]);
+
+    act(() => subscribeCallbacks[0]?.onScreenState("screen after reconnect", { replace: true }));
+    // One write: a full reset (RIS) in the VT, then the screen. Never Terminal.reset(), which
+    // frees ghostty's WASM terminal while other parts of ghostty-web still use it.
+    expect(terminal?.calls).toEqual(["write:initial screen", "write:\x1bcscreen after reconnect"]);
+    expect(terminal?.reset).toHaveBeenCalledTimes(0);
+    // The view keeps its one subscription: no new subscribe, no clear.
+    expect(mockRouter.subscribe).toHaveBeenCalledTimes(1);
+    expect(terminal?.clear).toHaveBeenCalledTimes(1);
   });
 
   test("keeps the router subscription stable when onExit changes", async () => {
