@@ -1085,6 +1085,7 @@ export async function resolveAgentDiscoveryContext(
       metadata,
     };
   }
+  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
   const projectPath = input.projectPath!;
   return {
     runtime: createRuntime({ type: "local", srcBaseDir: context.config.srcDir }, { projectPath }),

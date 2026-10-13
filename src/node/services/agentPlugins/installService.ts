@@ -49,7 +49,7 @@ import {
   type WorkspaceMcpOverridesService,
 } from "@/node/services/workspaceMcpOverridesService";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
-import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
+import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { shellQuote } from "@/common/utils/shell";
 import { execFileAsync } from "@/node/utils/disposableExec";
@@ -57,8 +57,10 @@ import {
   CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
   discoverAgentPluginAt,
   discoverAgentPlugins,
+  ensurePluginPathContained,
   journalDerivedDiscoveryGate,
   PLUGIN_MANIFEST_RELATIVE_PATH,
+  PluginGitPathError,
   setAgentPluginDiscoveryGate,
   type AgentPluginContainer,
   type AgentPluginInfo,
@@ -1584,12 +1586,14 @@ export class AgentPluginInstallService {
         // allowMissing (matching runtime assertSkillDirValid): resolve through
         // the symlinked dir even when SKILL.md is absent, so an escaping
         // symlink fails containment instead of hiding behind ENOENT.
-        containedSkillPath = await ensurePathContained(plugin.rootPath, skillPath, {
+        containedSkillPath = await ensurePluginPathContained(plugin.rootPath, skillPath, {
           allowMissing: true,
         });
       } catch (error) {
         if (!hasErrorCode(error, "ENOENT")) {
-          warnings.push(`skills/${dirName}: resolves outside the plugin root; it will not load`);
+          warnings.push(
+            `skills/${dirName}: ${error instanceof PluginGitPathError ? "resolves into the plugin's .git directory" : "resolves outside the plugin root"}; it will not load`
+          );
         }
         // ENOENT (unresolvable path) → not a skill dir; skip silently.
         continue;

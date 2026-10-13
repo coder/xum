@@ -4,7 +4,7 @@ import type {
   AgentAiSubagentProfile,
   SubagentAiDefaults,
 } from "@/common/config/schemas/appConfigOnDisk";
-import { AgentIdSchema } from "@/common/orpc/schemas";
+import { AgentIdSchema } from "@/common/schemas/ids";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import { coerceOpenAIReasoningMode, coerceThinkingLevel, type ThinkingLevel } from "./thinking";
 

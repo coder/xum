@@ -14,7 +14,7 @@
  * Pure (no fs): tapes hold full chat content, so callers decide where text comes from.
  */
 import { RPCJsonSerializer } from "@orpc/client";
-import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas";
+import { WorkspaceChatMessageSchema } from "@/common/orpc/schemas/stream";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import {
   SESSION_TAPE_MASKING,

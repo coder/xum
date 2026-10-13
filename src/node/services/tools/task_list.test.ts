@@ -931,6 +931,50 @@ describe("task_list tool", () => {
     };
   }
 
+  it.each(["main_chat", "side_chat"] as const)(
+    "lists direct %s links only in tree scope, with workspace filtering and no ownership fields",
+    async (relationship) => {
+      using tempDir = new TestTempDir("test-task-list-linked-chat");
+      const listTaskTreeAgents = mock(() => ({
+        rootWorkspaceId: "caller",
+        rootRelationship: "self" as const,
+        tasks: [],
+        relatedChats: [{ workspaceId: "linked-chat", title: "Linked", relationship }],
+      }));
+      const tool = createTaskListTool({
+        ...createTestToolConfig(tempDir.path, { workspaceId: "caller" }),
+        taskService: {
+          listTaskTreeAgents,
+          listDescendantAgentTasks: mock(() => []),
+        } as unknown as TaskService,
+      });
+      const expectedRows = [
+        { taskId: "caller", status: "workspace", relationship: "self", depth: 0 },
+        { taskId: "linked-chat", status: "workspace", title: "Linked", relationship, depth: 0 },
+      ];
+      expect(await tool.execute!({ scope: "tree" }, mockToolCallOptions)).toMatchObject({
+        tasks: expectedRows,
+      });
+      expect(
+        await tool.execute!({ scope: "tree", statuses: ["workspace"] }, mockToolCallOptions)
+      ).toMatchObject({
+        tasks: expectedRows,
+      });
+      expect(
+        await tool.execute!({ scope: "tree", statuses: ["running"] }, mockToolCallOptions)
+      ).toMatchObject({
+        tasks: [],
+      });
+      expect(await tool.execute!({}, mockToolCallOptions)).toEqual({ tasks: [] });
+      expect(listTaskTreeAgents).toHaveBeenCalledTimes(3);
+      // Compare whole rows so a fake parent/execution handle cannot sneak into these addresses.
+      const parsed = (await tool.execute!({ scope: "tree" }, mockToolCallOptions)) as {
+        tasks: unknown[];
+      };
+      expect(parsed.tasks).toEqual(expectedRows);
+    }
+  );
+
   it("tree scope includes the root row by default and filters inactive rows", async () => {
     using tempDir = new TestTempDir("test-task-list-tree-default");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-self" });

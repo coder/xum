@@ -82,6 +82,36 @@ export interface PluginFileReadResult {
   modifiedTime: Date;
 }
 
+/** A plugin path that resolves into the plugin root's `.git` directory (#6161). */
+export class PluginGitPathError extends Error {
+  constructor() {
+    super("Path resolves into the plugin's .git directory.");
+    this.name = "PluginGitPathError";
+  }
+}
+
+/**
+ * Contained resolution of a path inside a plugin root (ensurePathContained), which also refuses
+ * the root's `.git` directory and anything under it. A staged clone still holds `.git` (its
+ * config can carry the remote's credentials), and a committed symlink into it passes plain
+ * containment, so a preview would disclose it as a hook or skill body (#6161). The one rule for
+ * every plugin component read: the contained reader, component resolution and the install
+ * preview's skill scan.
+ */
+export async function ensurePluginPathContained(
+  pluginRoot: string,
+  candidatePath: string,
+  options?: { allowMissing?: boolean }
+): Promise<string> {
+  const resolved = await ensurePathContained(pluginRoot, candidatePath, options);
+  const relative = path.relative(await fsPromises.realpath(pluginRoot), resolved);
+  // Case-insensitive: on macOS and Windows `.GIT` is the same directory.
+  if (relative.split(path.sep)[0].toLowerCase() === ".git") {
+    throw new PluginGitPathError();
+  }
+  return resolved;
+}
+
 /**
  * Read a consented plugin component file (hooks.js, mcp.json, agents/*.md,
  * SKILL.md + referenced skill files, workflows/*.js) through a bounded
@@ -134,7 +164,7 @@ export async function readPluginFileWithinRootCapped(args: {
         `${label} cannot be read: the plugin root pathname no longer resolves to itself (replaced since discovery): ${pluginRoot}`
       );
     }
-    const resolvedPath = await ensurePathContained(pluginRoot, filePath);
+    const resolvedPath = await ensurePluginPathContained(pluginRoot, filePath);
     const linkStat = await fsPromises.lstat(resolvedPath, { bigint: true });
     if (!linkStat.isFile() || linkStat.dev !== stat.dev || linkStat.ino !== stat.ino) {
       throw new Error(
@@ -258,7 +288,7 @@ async function resolveComponentPath(args: {
 
   let canonical: string;
   try {
-    canonical = await ensurePathContained(args.rootReal, candidate);
+    canonical = await ensurePluginPathContained(args.rootReal, candidate);
   } catch (error) {
     if (hasErrorCode(error, "ENOENT")) {
       return undefined;
@@ -322,7 +352,8 @@ async function readManifestCandidate(
 ): Promise<ManifestCandidate> {
   let manifestReal: string;
   try {
-    manifestReal = await ensurePathContained(rootReal, path.join(rootReal, relative));
+    // #6161: neither manifest candidate may resolve into the plugin's .git.
+    manifestReal = await ensurePluginPathContained(rootReal, path.join(rootReal, relative));
   } catch (error) {
     // ENOTDIR: a `.codex-plugin` file is not a manifest directory either.
     if (hasErrorCode(error, "ENOENT") || hasErrorCode(error, "ENOTDIR")) {
@@ -330,7 +361,10 @@ async function readManifestCandidate(
     }
     return {
       status: "invalid",
-      message: `${relative} resolves outside the plugin root: ${getErrorMessage(error)}`,
+      message:
+        error instanceof PluginGitPathError
+          ? `${relative} resolves into the plugin's .git directory`
+          : `${relative} resolves outside the plugin root: ${getErrorMessage(error)}`,
     };
   }
   const stat = await fsPromises.stat(manifestReal).catch(() => null);
@@ -519,6 +553,7 @@ export function computeAgentPluginContainers(args: {
   if (args.projectRoot !== undefined && projectTrusted && path.isAbsolute(args.projectRoot)) {
     containers.push(
       ...listProjectMetadataRelativePaths("plugins").map((relativePath) => ({
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         path: path.join(args.projectRoot!, relativePath),
         scope: "project" as const,
       })),

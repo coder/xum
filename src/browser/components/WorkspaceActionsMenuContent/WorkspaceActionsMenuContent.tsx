@@ -2,13 +2,11 @@ import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 import { WorkspaceTerminalIcon } from "../icons/WorkspaceTerminalIcon/WorkspaceTerminalIcon";
 import {
-  BarChart3,
   GitBranch,
   HeartPulse,
-  AppWindow,
-  History,
   Maximize2,
   MessagesSquare,
+  PanelRight,
   Pencil,
   Pin,
   PinOff,
@@ -30,7 +28,9 @@ function WorkspaceActionButton(props: WorkspaceActionButtonProps) {
   return (
     <button
       type="button"
-      className="text-content-secondary bg-surface-primary hover:bg-hover block w-full rounded-sm px-2 py-1.5 text-left text-xs whitespace-nowrap"
+      data-workspace-action-row
+      // focus:bg-hover marks the row the arrow keys reached, like the hover state (#6103).
+      className="text-content-secondary bg-surface-primary hover:bg-hover focus:bg-hover block w-full rounded-sm px-2 py-1.5 text-left text-xs whitespace-nowrap outline-none"
       onClick={props.onClick}
       data-testid={props.testId}
     >
@@ -63,12 +63,12 @@ interface WorkspaceActionsMenuContentProps {
   /** Mobile workspace-header action: open immersive review in full-screen touch mode. */
   onOpenTouchFullscreenReview?: (() => void) | null;
   onEnterImmersiveReview?: (() => void) | null;
-  /** Small-viewport action: open the timeline dialog (the right sidebar hosting the tab is hidden there). */
-  onOpenTimeline?: (() => void) | null;
-  /** Small viewports only: the Artifacts dialog (the right sidebar is hidden there). */
-  onOpenArtifacts?: (() => void) | null;
-  /** Stats dialog; only set while the right sidebar (home of the Stats tab) is hidden. */
-  onOpenStats?: (() => void) | null;
+  /**
+   * Small viewports only: show the hidden right sidebar full-screen. One row for the whole
+   * sidebar, not one per tool, so the menu does not grow with every sidebar tab: the sidebar's
+   * own New tab launcher lists the tools.
+   */
+  onOpenSidebar?: (() => void) | null;
   /** Touch phones only: the header row carries Stats and Artifacts there, so New terminal moves here. */
   onOpenTerminal?: (() => void) | null;
   onStopRuntime?: (() => void) | null;
@@ -88,7 +88,10 @@ interface WorkspaceActionsMenuContentProps {
  */
 export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentProps> = (props) => {
   return (
-    <>
+    // No menu role on purpose: the menu/menuitem pattern also requires roving Tab focus and
+    // changes how the sidebar row's long-press handling sees this portal. The Radix Popover
+    // stays a dialog of buttons, and the arrow keys are an extra on top of Tab (#6103).
+    <div onKeyDown={handleRowArrowKeys}>
       {props.onEditTitle && (
         <WorkspaceActionButton
           label="Edit chat title"
@@ -167,46 +170,16 @@ export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentPr
           }}
         />
       )}
-      {props.onOpenTimeline && (
+      {props.onOpenSidebar && (
         <WorkspaceActionButton
-          label="Timeline"
-          shortcut={formatKeybind(KEYBINDS.OPEN_TIMELINE_DIALOG)}
-          shortcutClassName={props.shortcutClassName}
-          icon={<History className="h-3 w-3 shrink-0" />}
+          label="Sidebar"
+          icon={<PanelRight className="h-3 w-3 shrink-0" />}
           onClick={(e) => {
             e.stopPropagation();
             props.onCloseMenu();
-            props.onOpenTimeline?.();
+            props.onOpenSidebar?.();
           }}
-          testId="workspace-timeline-button"
-        />
-      )}
-      {props.onOpenStats && (
-        <WorkspaceActionButton
-          label="Stats"
-          shortcut={formatKeybind(KEYBINDS.OPEN_STATS_DIALOG)}
-          shortcutClassName={props.shortcutClassName}
-          icon={<BarChart3 className="h-3 w-3 shrink-0" />}
-          onClick={(e) => {
-            e.stopPropagation();
-            props.onCloseMenu();
-            props.onOpenStats?.();
-          }}
-          testId="workspace-stats-button"
-        />
-      )}
-      {props.onOpenArtifacts && (
-        <WorkspaceActionButton
-          label="Artifacts"
-          shortcut={formatKeybind(KEYBINDS.OPEN_ARTIFACTS_TAB)}
-          shortcutClassName={props.shortcutClassName}
-          icon={<AppWindow className="h-3 w-3 shrink-0" />}
-          onClick={(e) => {
-            e.stopPropagation();
-            props.onCloseMenu();
-            props.onOpenArtifacts?.();
-          }}
-          testId="workspace-artifacts-button"
+          testId="workspace-open-sidebar"
         />
       )}
       {props.onOpenTerminal && (
@@ -277,6 +250,19 @@ export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentPr
           }}
         />
       )}
-    </>
+    </div>
   );
 };
+
+// ArrowDown/ArrowUp move focus between the rows and stop at the ends, as in ArtifactVersionMenu.
+// Tab still works. The popover focuses the first row when it opens (#6103).
+function handleRowArrowKeys(event: React.KeyboardEvent<HTMLElement>) {
+  if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+  event.preventDefault();
+  const rows = Array.from(
+    event.currentTarget.querySelectorAll<HTMLElement>("[data-workspace-action-row]")
+  );
+  const index = rows.findIndex((row) => row === document.activeElement);
+  const next = event.key === "ArrowDown" ? index + 1 : index - 1;
+  rows[Math.min(Math.max(next, 0), rows.length - 1)]?.focus();
+}

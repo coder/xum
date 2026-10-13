@@ -580,11 +580,11 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
 
     // Convert Node.js streams to Web Streams (casts required for ExecStream compatibility)
     // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-    const stdout = Readable.toWeb(childProcess.stdout!) as unknown as ReadableStream<Uint8Array>;
+    const stdout = Readable.toWeb(childProcess.stdout!) as unknown as ReadableStream<Uint8Array>; // eslint-disable-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-    const stderr = Readable.toWeb(childProcess.stderr!) as unknown as ReadableStream<Uint8Array>;
+    const stderr = Readable.toWeb(childProcess.stderr!) as unknown as ReadableStream<Uint8Array>; // eslint-disable-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-    const stdin = Writable.toWeb(childProcess.stdin!) as unknown as WritableStream<Uint8Array>;
+    const stdin = Writable.toWeb(childProcess.stdin!) as unknown as WritableStream<Uint8Array>; // eslint-disable-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
 
     let timedOut = false;
     let aborted = false;
