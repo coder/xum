@@ -46,8 +46,9 @@ interface MarkdownCoreProps {
   renderRawHtml?: boolean;
   /**
    * Show a file (memory file, AGENTS.md) that must stay inert when it opens: raw HTML renders as
-   * text, images are blocked unless inlined as data: URLs, and relative links are blocked, since
-   * nothing resolves them against the file's folder. Overrides renderRawHtml. Default: false.
+   * text, images are blocked unless inlined as data: URLs, relative links are blocked, since
+   * nothing resolves them against the file's folder, and Mermaid fences show as code. Overrides
+   * renderRawHtml. Default: false.
    */
   filePreview?: boolean;
 }
@@ -279,8 +280,27 @@ const REHYPE_PLUGINS_RAW_HTML_AS_TEXT: Pluggable[] = [
   ...rehypePluginsAfterRawHtml(HARDEN_OPTIONS),
 ];
 
+// SECURITY: a rendered Mermaid diagram is an SVG that can load images and styles from any URL,
+// past the URL rules above, so a file preview shows a mermaid fence as plain code instead.
+const rehypeMermaidAsCode: Plugin<[], Root> = () => (tree) => {
+  const visit = (node: Root | RootContent) => {
+    if (
+      node.type === "element" &&
+      node.tagName === "code" &&
+      Array.isArray(node.properties.className)
+    ) {
+      node.properties.className = node.properties.className.filter(
+        (name) => name !== "language-mermaid"
+      );
+    }
+    if ("children" in node) node.children.forEach(visit);
+  };
+  visit(tree);
+};
+
 const REHYPE_PLUGINS_FILE_PREVIEW: Pluggable[] = [
   rehypeRawHtmlAsText,
+  rehypeMermaidAsCode,
   ...rehypePluginsAfterRawHtml(FILE_PREVIEW_HARDEN_OPTIONS),
 ];
 

@@ -14,7 +14,8 @@ interface MarkdownFilePreviewProps {
  *
  * SECURITY AUDIT: file contents are attacker-influenceable; they reach the DOM only through
  * MarkdownCore's sanitize and harden pipeline, with raw HTML rendered as text. Opening a file
- * loads nothing: images are blocked unless inlined as data: URLs, and relative links are blocked.
+ * loads nothing: images are blocked unless inlined as data: URLs, relative links are blocked, and
+ * Mermaid fences show as code instead of a diagram.
  */
 export function MarkdownFilePreview(props: MarkdownFilePreviewProps) {
   return (
