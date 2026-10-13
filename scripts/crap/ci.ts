@@ -98,8 +98,10 @@ export function summary(
 /**
  * Lists every `lcov.info` under each artifact folder, at any depth: a unit shard
  * uploads one report for its shared process plus one per isolated file and one for
- * the tooling run (scripts/test-unit-ci.sh). An artifact counts once, however many
- * reports it holds.
+ * the tooling run (scripts/test-unit-ci.sh). An artifact counts as a shard report
+ * only with its top-level `lcov.info`: when the shared process passes only on its
+ * last retry, which runs without coverage, the shard's nested reports still count
+ * as coverage but the summary shows it as partial.
  */
 export function lcovFiles(dir: string): { artifacts: string[]; files: string[] } {
   if (!existsSync(dir)) return { artifacts: [], files: [] };
@@ -112,8 +114,7 @@ export function lcovFiles(dir: string): { artifacts: string[]; files: string[] }
       .filter((path) => basename(path) === "lcov.info")
       .sort()
       .map((path) => join(root, path));
-    if (found.length === 0) continue;
-    artifacts.push(name);
+    if (existsSync(join(root, "lcov.info"))) artifacts.push(name);
     files.push(...found);
   }
   return { artifacts, files };

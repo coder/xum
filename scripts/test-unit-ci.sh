@@ -170,6 +170,11 @@ bun_test_with_stall_watchdog() {
   return "$exit_code"
 }
 
+# Root of every LCOV report this lane writes. scripts/test-unit-ci.test.ts runs this
+# script from inside the tooling run, so it points the nested run elsewhere: a
+# nested run on the default root would delete the outer run's reports.
+UNIT_COVERAGE_DIR="${UNIT_COVERAGE_DIR:-coverage}"
+
 # Usage: bun_test_retrying_crashes <label> <coverage dir, or "" for none> <bun test args>...
 # With a coverage dir, each attempt writes <dir>/lcov.info. The last attempt runs
 # without coverage: a Bun crash under coverage must not fail a required job, and the
@@ -206,7 +211,7 @@ for i in "${!isolated_unit_tests[@]}"; do
   [[ -z "$mode" ]] || break
   ((i % SHARD_TOTAL == SHARD_INDEX - 1)) || continue
   coverage_dir=""
-  ((isolated_coverage[i] == 0)) || coverage_dir="coverage/isolated/$i"
+  ((isolated_coverage[i] == 0)) || coverage_dir="$UNIT_COVERAGE_DIR/isolated/$i"
   bun_test_retrying_crashes "${isolated_unit_tests[$i]}" "$coverage_dir" "${isolated_unit_tests[$i]}"
 done
 
@@ -249,7 +254,7 @@ done < <(
     "${find_excludes[@]}" | LC_ALL=C sort
 )
 if [[ -z "$mode" ]] && ((SHARD_INDEX == 1 && ${#tooling_files[@]} > 0)); then
-  bun_test_retrying_crashes "tooling tests" coverage/tooling "${tooling_files[@]}"
+  bun_test_retrying_crashes "tooling tests" "$UNIT_COVERAGE_DIR/tooling" "${tooling_files[@]}"
 fi
 
 # Deterministic, size-balanced split: largest files first, each assigned to the
@@ -292,4 +297,4 @@ echo "Unit shard ${SHARD_INDEX}/${SHARD_TOTAL}: ${#unit_files[@]} shared-process
 if ((${#unit_files[@]} == 0)); then
   exit 0
 fi
-bun_test_retrying_crashes "unit shard ${SHARD_INDEX}/${SHARD_TOTAL}" coverage "${unit_files[@]}"
+bun_test_retrying_crashes "unit shard ${SHARD_INDEX}/${SHARD_TOTAL}" "$UNIT_COVERAGE_DIR" "${unit_files[@]}"
