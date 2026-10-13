@@ -14,6 +14,7 @@ import {
   useAdditionalSystemContextSnapshot,
 } from "@/browser/utils/additionalSystemContextStore";
 import { focusInstructionsTab } from "@/browser/utils/instructionsTabFocus";
+import { isAbortError } from "@/browser/utils/isAbortError";
 import { cn } from "@/common/lib/utils";
 import { getErrorMessage } from "@/common/utils/errors";
 
@@ -56,6 +57,10 @@ export function useChatInstructions(workspaceId: string): ScratchpadState {
   const dirtyRef = useRef(false);
   const mountedRef = useRef(true);
   const savingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // The workspace whose instructions the editor shows (loaded, or failed to load). A re-run for it
+  // (a new API client after a reconnect) keeps the editor enabled and the user's edits: it does
+  // not flash "Loading…" or take focus from the textarea.
+  const loadedWorkspaceIdRef = useRef<string | null>(null);
 
   const clearSavingTimer = () => {
     if (savingTimerRef.current != null) {
@@ -73,20 +78,24 @@ export function useChatInstructions(workspaceId: string): ScratchpadState {
   }, []);
 
   useEffect(() => {
-    dirtyRef.current = false;
-    setLoading(true);
-    setSavingVisible(false);
-    clearSavingTimer();
+    if (loadedWorkspaceIdRef.current !== workspaceId) {
+      loadedWorkspaceIdRef.current = null;
+      dirtyRef.current = false;
+      setLoading(true);
+      setSavingVisible(false);
+      clearSavingTimer();
+    }
     setError(null);
 
     if (!api) return;
 
     const loadVersion = getAdditionalSystemContextVersion(workspaceId);
+    // Set by the cleanup, which also runs on unmount.
     let cancelled = false;
     api.workspace
       .getAdditionalSystemContext({ workspaceId })
       .then((result) => {
-        if (cancelled || !mountedRef.current) return;
+        if (cancelled) return;
         if (!dirtyRef.current && getAdditionalSystemContextVersion(workspaceId) === loadVersion) {
           updateAdditionalSystemContextSnapshot(workspaceId, {
             content: result.content,
@@ -94,11 +103,14 @@ export function useChatInstructions(workspaceId: string): ScratchpadState {
           });
         }
         setLoading(false);
+        loadedWorkspaceIdRef.current = workspaceId;
       })
       .catch((err) => {
-        if (cancelled || !mountedRef.current) return;
+        // A lost connection is not a load error: keep the editor as it is for the next client.
+        if (cancelled || isAbortError(err)) return;
         setError(getErrorMessage(err));
         setLoading(false);
+        loadedWorkspaceIdRef.current = workspaceId;
       });
 
     return () => {

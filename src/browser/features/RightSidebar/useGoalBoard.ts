@@ -1,6 +1,7 @@
 import { useCallback, useContext, useEffect, useState } from "react";
 
-import { APIContext } from "@/browser/contexts/API";
+import { APIContext, type APIClient } from "@/browser/contexts/API";
+import { isAbortError } from "@/browser/utils/isAbortError";
 import type { GoalBoardSnapshot } from "@/common/types/goal";
 
 /**
@@ -20,6 +21,23 @@ import type { GoalBoardSnapshot } from "@/common/types/goal";
  * tighter coupling could push board snapshots through the activity
  * channel; today's reads are cheap enough to drive on-demand.
  */
+const EMPTY_BOARD: GoalBoardSnapshot = { entries: [] };
+
+/**
+ * Reads a workspace's board. A failed read is an empty board, as before, but a read cut off by a
+ * lost connection resolves to null: the caller keeps the board it shows for the next client.
+ */
+async function readGoalBoard(
+  api: APIClient,
+  workspaceId: string
+): Promise<GoalBoardSnapshot | null> {
+  try {
+    return (await api.workspace.getGoalBoard({ workspaceId })) ?? EMPTY_BOARD;
+  } catch (error) {
+    return isAbortError(error) ? null : EMPTY_BOARD;
+  }
+}
+
 export interface UseGoalBoardResult {
   board: GoalBoardSnapshot;
   isLoading: boolean;
@@ -46,30 +64,24 @@ export function useGoalBoard(
   // `useGoalDefaults`.
   const context = useContext(APIContext);
   const api = context?.api ?? null;
-  const [board, setBoard] = useState<GoalBoardSnapshot>({ entries: [] });
+  const [board, setBoard] = useState<GoalBoardSnapshot>(EMPTY_BOARD);
   const [isLoading, setIsLoading] = useState(true);
   const [refreshKey, setRefreshKey] = useState(0);
 
   useEffect(() => {
     if (!api || !workspaceId) {
-      setBoard({ entries: [] });
+      // No client (a reconnect) keeps the shown board; no workspace has no board.
+      setBoard((current) => (workspaceId ? current : EMPTY_BOARD));
       setIsLoading(false);
       return;
     }
     let cancelled = false;
     setIsLoading(true);
-    void api.workspace
-      .getGoalBoard({ workspaceId })
-      .then((snapshot) => {
-        if (cancelled) return;
-        setBoard(snapshot ?? { entries: [] });
-        setIsLoading(false);
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setBoard({ entries: [] });
-        setIsLoading(false);
-      });
+    void readGoalBoard(api, workspaceId).then((snapshot) => {
+      if (cancelled || snapshot == null) return;
+      setBoard(snapshot);
+      setIsLoading(false);
+    });
     return () => {
       cancelled = true;
     };

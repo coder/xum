@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { Input } from "@/browser/components/Input/Input";
 import { useAPI } from "@/browser/contexts/API";
+import { isAbortError } from "@/browser/utils/isAbortError";
 import { GoalDefaultsControls } from "@/browser/features/Settings/Sections/GoalsSection";
 import { cn } from "@/common/lib/utils";
 import type { WorkspaceGoalDefaultsOverride } from "@/browser/utils/goals/resolveGoalSetIntent";
@@ -67,11 +68,12 @@ function parseTurnCapValue(value: string): number | null {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
-export function GoalDefaultsSection(props: GoalDefaultsSectionProps) {
+/**
+ * The workspace's stored override, read once per workspace. The panel edits it optimistically
+ * through `setEditedOverride`.
+ */
+function useWorkspaceGoalOverride(workspaceId: string) {
   const { api } = useAPI();
-  const [globalDefaults, setGlobalDefaults] = useState<GoalDefaults>(() => ({
-    ...DEFAULT_GOAL_DEFAULTS,
-  }));
   const [override, setOverride] = useState<WorkspaceGoalDefaultsOverride | null>(null);
   // Distinguishes "loaded; no override stored" (override === null, isLoading
   // === false) from "still loading" (override === null, isLoading === true).
@@ -80,6 +82,61 @@ export function GoalDefaultsSection(props: GoalDefaultsSectionProps) {
   // which `set` then writes — clobbering any saved override on disk.
   // Preserve saved workspace defaults while loading.
   const [isLoading, setIsLoading] = useState(true);
+  // The workspace whose override is loaded. A re-read for it (a new API client after a reconnect)
+  // keeps the controls shown and enabled; only another workspace resets them.
+  const loadedWorkspaceIdRef = useRef<string | null>(null);
+  // Counts the user's edits, so an edit made while a re-read is in flight wins over its result.
+  const editCountRef = useRef(0);
+
+  // Workspace override is loaded once per workspaceId. `null` (the
+  // canonical "no override" state) is what we expect for fresh workspaces.
+  // Reset `isLoading` whenever the workspaceId changes so a workspace
+  // switch doesn't let the new workspace's edits race the old read.
+  useEffect(() => {
+    if (loadedWorkspaceIdRef.current !== workspaceId) {
+      loadedWorkspaceIdRef.current = null;
+      setOverride(null);
+      setIsLoading(true);
+    }
+    if (!api) return;
+    let cancelled = false;
+    const editCountAtStart = editCountRef.current;
+    void api.workspace.goalDefaults
+      .get({ workspaceId })
+      .then((value) => {
+        if (cancelled) return;
+        if (editCountRef.current === editCountAtStart) {
+          setOverride(value ?? null);
+        }
+        setIsLoading(false);
+        loadedWorkspaceIdRef.current = workspaceId;
+      })
+      .catch((error: unknown) => {
+        // A lost connection keeps what is shown for the next client. Another failure enables
+        // the controls on what is shown (the empty override on a first read), as before.
+        if (cancelled || isAbortError(error)) return;
+        setIsLoading(false);
+        loadedWorkspaceIdRef.current = workspaceId;
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [api, workspaceId]);
+
+  const setEditedOverride = (next: WorkspaceGoalDefaultsOverride) => {
+    editCountRef.current += 1;
+    setOverride(next);
+  };
+
+  return { override, isLoading, setEditedOverride };
+}
+
+export function GoalDefaultsSection(props: GoalDefaultsSectionProps) {
+  const { api } = useAPI();
+  const [globalDefaults, setGlobalDefaults] = useState<GoalDefaults>(() => ({
+    ...DEFAULT_GOAL_DEFAULTS,
+  }));
+  const { override, isLoading, setEditedOverride } = useWorkspaceGoalOverride(props.workspaceId);
 
   // Pull the global defaults so we can render inherited values inside the
   // workspace-override panel. We only re-read on mount/api change; updates
@@ -105,31 +162,6 @@ export function GoalDefaultsSection(props: GoalDefaultsSectionProps) {
     };
   }, [api]);
 
-  // Workspace override is loaded once per workspaceId. `null` (the
-  // canonical "no override" state) is what we expect for fresh workspaces.
-  // Reset `isLoading` whenever the workspaceId changes so a workspace
-  // switch doesn't let the new workspace's edits race the old read.
-  useEffect(() => {
-    if (!api) return;
-    let cancelled = false;
-    setIsLoading(true);
-    void api.workspace.goalDefaults
-      .get({ workspaceId: props.workspaceId })
-      .then((value) => {
-        if (cancelled) return;
-        setOverride(value ?? null);
-        setIsLoading(false);
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setOverride(null);
-        setIsLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [api, props.workspaceId]);
-
   const onPersistProp = props.onPersist;
   // Serialize workspace-default saves. The backend setter
   // reads → mutates → writes the full config record, so two saves in
@@ -144,7 +176,7 @@ export function GoalDefaultsSection(props: GoalDefaultsSectionProps) {
     // Otherwise a stale all-null shape could overwrite saved overrides.
     // The UI also disables the toggles via `isLoading` below.
     if (isLoading) return;
-    setOverride(next);
+    setEditedOverride(next);
     if (!api) return;
     saveChainRef.current = saveChainRef.current
       .catch(() => {
