@@ -265,7 +265,9 @@ function applyStepBackwardCompatibilityDefaults(step: DevToolsStep): DevToolsSte
   };
 }
 
-type PendingRunMetadata = Partial<Pick<DevToolsRun, "toolPolicy" | "requestHistorySequence">>;
+type PendingRunMetadata = Partial<
+  Pick<DevToolsRun, "toolPolicy" | "requestHistorySequence" | "contextEpoch">
+>;
 
 export class DevToolsService extends EventEmitter {
   private readonly workspaces = new Map<string, WorkspaceData>();

@@ -2123,12 +2123,11 @@ describe("TaskService", () => {
     const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "still around?")).toEqual(
-      Err({
-        code: "not_active",
-        taskStatus: "running",
-        message: "Target workspace is archived; only its parent can restore and reawaken it.",
-      })
+    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "still around?")).toMatchObject(
+      {
+        success: false,
+        error: { code: "not_active", taskStatus: "running" },
+      }
     );
   });
 

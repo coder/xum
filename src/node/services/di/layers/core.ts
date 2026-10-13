@@ -703,6 +703,8 @@ export const CoreWiringLive: Layer.Layer<
         workspaceService.getGoalContinuationKickoffSendOptions(workspaceId),
       refuseUnavailableAgent: (workspaceId, options, isCurrent) =>
         workspaceService.refuseUnavailableGoalTurnAgent(workspaceId, options, isCurrent),
+      abandonGoalAutoRetry: (workspaceId, goalId) =>
+        workspaceService.abandonGoalAutoRetry(workspaceId, goalId),
     });
   })
 );

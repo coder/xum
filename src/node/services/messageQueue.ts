@@ -721,6 +721,7 @@ export class MessageQueue {
     const entry = this.addInternal(message, options, internal, dedupeKey);
     if (entry != null && dedupeKey !== undefined) {
       entry.dedupeKeys.add(dedupeKey);
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       entry.acceptanceOrigins.at(-1)!.dedupeKey = dedupeKey;
     }
     return entry != null;

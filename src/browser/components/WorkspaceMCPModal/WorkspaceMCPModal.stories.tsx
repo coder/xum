@@ -226,6 +226,9 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const WorkspaceMCPNoOverrides: Story = {
+  // Pixel snapshot budget: its frame (mux, then posthog switched on) repeats
+  // WorkspaceMCPEnabledOverride minus the project label; its play still runs.
+  parameters: { pixel: PIXEL_DISABLED },
   render: () =>
     renderWorkspaceMCPModal({
       servers: {
@@ -332,6 +335,9 @@ export const WorkspaceMCPEnabledOverride: Story = {
 };
 
 export const WorkspaceMCPDisabledOverride: Story = {
+  // Pixel snapshot budget: its frame (mux, then posthog switched off) repeats
+  // WorkspaceMCPProjectDisabledServer minus the project label; its play still runs.
+  parameters: { pixel: PIXEL_DISABLED },
   render: () =>
     renderWorkspaceMCPModal({
       servers: {
@@ -427,6 +433,8 @@ export const WorkspaceMCPHelpTextContrastLight: Story = {
 };
 
 export const ToolSelectorInteraction: Story = {
+  // Pixel snapshot budget, play-only: its frame repeats the mux row other snapshots show.
+  parameters: { pixel: PIXEL_DISABLED },
   render: () =>
     renderWorkspaceMCPModal({
       servers: {
@@ -467,6 +475,8 @@ export const ToolSelectorInteraction: Story = {
 };
 
 export const ToggleServerEnabled: Story = {
+  // Pixel snapshot budget, play-only: its frame repeats WorkspaceMCPEnabledOverride.
+  parameters: { pixel: PIXEL_DISABLED },
   render: () =>
     renderWorkspaceMCPModal({
       servers: {
@@ -659,8 +669,8 @@ export const WorkspaceMCPServerSettingsNarrow: Story = {
 };
 
 // Settings stories marked PIXEL_DISABLED exist for their plays (which still run in Test /
-// Storybook). Their first frame adds no look beyond WorkspaceMCPServerSettings, Narrow and
-// ReadError, so they skip Pixel to stay within the snapshot budget.
+// Storybook). Their first frame adds no look beyond WorkspaceMCPServerSettings and its Narrow
+// variant, so they skip Pixel to stay within the snapshot budget.
 /** Not running yet: the dialog does not start it on open; Fetch Tools connects it. */
 export const WorkspaceMCPServerSettingsNotConnected: Story = {
   parameters: { pixel: PIXEL_DISABLED },
@@ -704,6 +714,9 @@ export const WorkspaceMCPServerSettingsOneRead: Story = {
 
 /** A connected server whose settings read fails shows the error on open (not silence). */
 export const WorkspaceMCPServerSettingsReadError: Story = {
+  // Pixel snapshot budget: the error is a one-line note in the same style as the
+  // "Connect the server" note other snapshots show; the play checks the text.
+  parameters: { pixel: PIXEL_DISABLED },
   render: () =>
     renderWorkspaceMCPModal({
       ...settingsStoryOptions(),
