@@ -1,4 +1,4 @@
-import { highlightCode } from "./highlightWorkerClient";
+import { highlightCode, isHighlightStartTimeout } from "./highlightWorkerClient";
 import { isLightThemeMode } from "./shiki-shared";
 import type { ThemeMode } from "@/browser/contexts/ThemeContext";
 import type { DiffChunk } from "./diffChunking";
@@ -54,7 +54,7 @@ export interface HighlightedChunk {
 
 /**
  * Highlight a chunk of code using Shiki.
- * Falls back to plain text on error.
+ * Falls back to plain text on error, except a worker start timeout, which rejects.
  */
 export async function highlightDiffChunk(
   chunk: DiffChunk,
@@ -222,12 +222,24 @@ export async function highlightDiffChunks(
       usedFallback: false,
     }));
   } catch (error) {
-    console.warn(
-      `Syntax highlighting failed for language ${language} (${sourceLines.length} lines):`,
-      error
-    );
-    return chunks.map(createFallbackChunk);
+    return fallbackAfterHighlightError(error, chunks, language, sourceLines.length);
   }
+}
+
+/**
+ * Plain-text chunks after a failed highlight. A worker that did not start is transient: that
+ * error is rethrown, so DiffRenderer does not cache this fallback for the session and a later
+ * render highlights the diff (#6292).
+ */
+function fallbackAfterHighlightError(
+  error: unknown,
+  chunks: readonly DiffChunk[],
+  language: string,
+  lineCount: number
+): HighlightedChunk[] {
+  if (isHighlightStartTimeout(error)) throw error;
+  console.warn(`Syntax highlighting failed for language ${language} (${lineCount} lines):`, error);
+  return chunks.map(createFallbackChunk);
 }
 
 /**
