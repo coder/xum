@@ -388,6 +388,32 @@ export function enqueueHighlightWithBudget(
 }
 
 /**
+ * Logs why a highlight failed and recycles the worker only when its state is unknown. A budget
+ * time-out already ended the worker inside highlightWithBudget, and a start time-out already
+ * ended the worker that did not start (prepareWorker).
+ */
+function reportHighlightFailure(e: unknown, language: string, codeLength: number): void {
+  if (e instanceof Error && e.message === TIMEOUT_MARKER) {
+    // Demote to a warn once per pathological input — `timedOutInputs` is the dedupe key.
+    console.warn(
+      `[highlightWorkerClient] highlight exceeded ${HIGHLIGHT_TIMEOUT_MS}ms budget for ${language}; ` +
+        `rendering as plain text and skipping this input henceforth (${codeLength} chars)`
+    );
+  } else if (isHighlightStartTimeout(e)) {
+    // The input is not marked: the next render highlights on a new worker (#6292).
+    console.warn(
+      `[highlightWorkerClient] worker did not start within ${WORKER_START_TIMEOUT_MS}ms; ` +
+        `rendering ${language} as plain text for now`
+    );
+  } else {
+    // Non-timeout error — the worker may be in an indeterminate state. Recycle so the next call
+    // gets a fresh one. Don't main-thread fallback (same engine, same risk).
+    console.warn("[highlightWorkerClient] worker highlight failed; recycling:", e);
+    recycleWorker();
+  }
+}
+
+/**
  * Highlight code with syntax highlighting (off-main-thread)
  *
  * Highlighting runs in a Web Worker to avoid blocking the main thread, with
@@ -443,21 +469,7 @@ export async function highlightCode(
   } catch (e) {
     // Expected when the caller moved on: the worker is fine, so do not warn or recycle it.
     if (isAbortedHighlight(e, signal)) throw e;
-    if (e instanceof Error && e.message === TIMEOUT_MARKER) {
-      // Demote to a warn once per pathological input — `timedOutInputs` is the
-      // dedupe key. The terminate side effect already happened inside
-      // `highlightWithBudget`.
-      console.warn(
-        `[highlightWorkerClient] highlight exceeded ${HIGHLIGHT_TIMEOUT_MS}ms budget for ${language}; ` +
-          `rendering as plain text and skipping this input henceforth (${code.length} chars)`
-      );
-    } else {
-      // Non-timeout error — worker may be in an indeterminate state. Recycle
-      // so the next call gets a fresh one. Don't main-thread fallback (same
-      // engine, same risk).
-      console.warn("[highlightWorkerClient] worker highlight failed; recycling:", e);
-      recycleWorker();
-    }
+    reportHighlightFailure(e, language, code.length);
     throw e;
   }
 }
