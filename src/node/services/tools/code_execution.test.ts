@@ -15,6 +15,8 @@ import { DisposableTempDir } from "@/node/services/tempDir";
 import { SandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { createKernelFileLoader } from "@/node/services/tools/kernelFileLoad";
+import { registerCodexPluginHooks } from "@/node/services/agentPlugins/codexHookRunner";
+import { eventSpine } from "@/node/services/events/eventSpine";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RESULT_HANDLE_VARS_CAP_BYTES, VARS_SNAPSHOT_MAX_BYTES } from "@/constants/resultHandles";
 import { KERNEL_RETAINED_MEDIA_BUDGET_BYTES } from "@/constants/kernelOutput";
@@ -2866,6 +2868,75 @@ describe("createCodeExecutionTool", () => {
       expect(errors[0]).toContain("reserved");
       expect(errors[1].length).toBeGreaterThan(0);
       await host.disposeScope("ws-load-err");
+    });
+
+    it("a PostToolUse block on file_read makes mux.load throw; vars[key] stays unset", async () => {
+      // Codex P1 (PRRT_kwDOPxxmWM6r6NnK): a post-block replaced only the hook-visible summary, so
+      // the whole file still reached vars and the script could return it to the model.
+      using tmp = new DisposableTempDir("code-exec-load-post-block");
+      await fs.writeFile(nodePath.join(tmp.path, "secret.txt"), "SECRET_VALUE_42\n", "utf8");
+      const workspaceId = "ws-load-post-block";
+      const unregister = registerCodexPluginHooks(eventSpine, {
+        workspaceId,
+        pluginName: "guard",
+        order: 0,
+        hooks: [
+          {
+            key: "hooks/hooks.json#PostToolUse[0][0]",
+            hash: "h".repeat(64),
+            event: "PostToolUse",
+            matcher: "^file_read$",
+            handler: { type: "mcp_tool", server: "guard", tool: "check", input: {} },
+            status: "runnable",
+            source: "hooks/hooks.json",
+          },
+        ],
+        deps: {
+          isHookAllowed: () => Promise.resolve(true),
+          callPluginTool: () =>
+            Promise.resolve({
+              structuredContent: { decision: "block", reason: "secrets stay out" },
+            }),
+          notifyUser: () => undefined,
+        },
+      });
+      const host = new SandboxHostService();
+      try {
+        const runtime = new LocalRuntime(tmp.path);
+        const tool = await createCodeExecutionTool(
+          runtimeFactory,
+          new ToolBridge(fileReadTools()),
+          undefined,
+          kernelRunner(host, workspaceId, tmp.path),
+          {
+            loadFile: createKernelFileLoader({
+              cwd: tmp.path,
+              runtime,
+              hooks: { runtime, cwd: tmp.path, runtimeTempDir: tmp.path, workspaceId },
+            }),
+          }
+        );
+
+        const result = (await tool.execute!(
+          {
+            code: `
+              let error = "";
+              try { mux.load({ path: "secret.txt", key: "data" }); } catch (e) { error = String(e); }
+              return { error, data: typeof vars.data };
+            `,
+          },
+          mockToolCallOptions
+        )) as PTCExecutionResult;
+
+        expect(result.success).toBe(true);
+        const returned = result.result as { error: string; data: string };
+        expect(returned.error).toContain("[plugin:guard] secrets stay out");
+        expect(returned.data).toBe("undefined");
+        expect(JSON.stringify(result)).not.toContain("SECRET_VALUE_42");
+      } finally {
+        unregister();
+        await host.disposeScope(workspaceId);
+      }
     });
 
     it("honors grants: file_read denied => mux.load denied", async () => {
