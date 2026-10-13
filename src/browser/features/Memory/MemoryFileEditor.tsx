@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type KeyboardEvent, type RefObject } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent, type Ref, type RefObject } from "react";
 import { flushSync } from "react-dom";
 import { ArrowLeft } from "lucide-react";
 
@@ -159,7 +159,7 @@ function MemoryFileBody(props: {
   loadError: string | null;
   mode: ViewMode;
   draft: string;
-  textareaRef: RefObject<HTMLTextAreaElement | null>;
+  textareaRef: Ref<HTMLTextAreaElement>;
   onDraftChange: (draft: string) => void;
 }) {
   if (props.loadError !== null) {
