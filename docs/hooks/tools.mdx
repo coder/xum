@@ -728,13 +728,14 @@ If a value is too large for the environment, it may be omitted (not set). Xum al
 </details>
 
 <details>
-<summary>skills_catalog_read (3)</summary>
+<summary>skills_catalog_read (4)</summary>
 
-| Env var                   | JSON path | Type   | Description                             |
-| ------------------------- | --------- | ------ | --------------------------------------- |
-| `XUM_TOOL_INPUT_OWNER`    | `owner`   | string | GitHub owner from skills_catalog_search |
-| `XUM_TOOL_INPUT_REPO`     | `repo`    | string | GitHub repo from skills_catalog_search  |
-| `XUM_TOOL_INPUT_SKILL_ID` | `skillId` | string | Skill ID from skills_catalog_search     |
+| Env var                       | JSON path      | Type   | Description                                                           |
+| ----------------------------- | -------------- | ------ | --------------------------------------------------------------------- |
+| `XUM_TOOL_INPUT_OFFSET_CHARS` | `offset_chars` | number | Long bodies come in pages: pass the previous result's nextCharOffset. |
+| `XUM_TOOL_INPUT_OWNER`        | `owner`        | string | GitHub owner from skills_catalog_search                               |
+| `XUM_TOOL_INPUT_REPO`         | `repo`         | string | GitHub repo from skills_catalog_search                                |
+| `XUM_TOOL_INPUT_SKILL_ID`     | `skillId`      | string | Skill ID from skills_catalog_search                                   |
 
 </details>
 
@@ -788,13 +789,14 @@ If a value is too large for the environment, it may be omitted (not set). Xum al
 </details>
 
 <details>
-<summary>task_await (6)</summary>
+<summary>task_await (7)</summary>
 
 | Env var                           | JSON path           | Type    | Description                                                                                                                                                                                                                                      |
 | --------------------------------- | ------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `XUM_TOOL_INPUT_FILTER`           | `filter`            | string  | Bash tasks: regex; keep only matching lines (or drop them with filter_exclude). Dropped lines are lost.                                                                                                                                          |
 | `XUM_TOOL_INPUT_FILTER_EXCLUDE`   | `filter_exclude`    | boolean | Drop lines matching filter instead (requires filter).                                                                                                                                                                                            |
 | `XUM_TOOL_INPUT_MIN_COMPLETED`    | `min_completed`     | number  | Return once this many awaited tasks complete (default 1, clamped to the count). Use the batch size when you must compare every result, e.g. best-of-n.                                                                                           |
+| `XUM_TOOL_INPUT_OFFSET_CHARS`     | `offset_chars`      | number  | Long reports come in pages: pass the previous result's nextCharOffset.                                                                                                                                                                           |
 | `XUM_TOOL_INPUT_TASK_IDS_<INDEX>` | `task_ids[<INDEX>]` | string  | IDs returned by task, bash or workflow_run; never invent one. Omit to await every active descendant and top-level workflow run (not workflow-owned tasks), only after something was spawned in an earlier step.                                  |
 | `XUM_TOOL_INPUT_TASK_IDS_COUNT`   | `task_ids.length`   | number  | Number of elements in task_ids (IDs returned by task, bash or workflow_run; never invent one. Omit to await every active descendant and top-level workflow run (not workflow-owned tasks), only after something was spawned in an earlier step.) |
 | `XUM_TOOL_INPUT_TIMEOUT_SECS`     | `timeout_secs`      | number  | Max wait per task in seconds (0 = status check). Bash tasks wait for new output or exit. On timeout the task stays active.                                                                                                                       |

@@ -139,6 +139,9 @@ export type SkillsCatalogReadToolResult =
       frontmatter: AgentSkillFrontmatter;
       body: string;
       url: string;
+      /** Set when body is one page of a longer body (see offset_chars). */
+      nextCharOffset?: number;
+      note?: string;
     }
   | { success: false; error: string };
 

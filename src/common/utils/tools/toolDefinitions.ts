@@ -733,6 +733,12 @@ export const TaskAwaitToolArgsSchema = z
       .describe(
         "Return once this many awaited tasks complete (default 1, clamped to the count). Use the batch size when you must compare every result, e.g. best-of-n."
       ),
+    offset_chars: z
+      .number()
+      .int()
+      .min(0)
+      .nullish()
+      .describe("Long reports come in pages: pass the previous result's nextCharOffset."),
   })
   .strict()
   .superRefine((args, ctx) => {
@@ -815,6 +821,8 @@ export const TaskAwaitToolCompletedResultSchema = z
     elapsed_ms: z.number().optional(),
     exitCode: z.number().optional(),
     note: z.string().optional(),
+    /** Set when reportMarkdown is one page of a longer report (see offset_chars). */
+    nextCharOffset: z.number().optional(),
     artifacts: TaskAwaitToolArtifactsSchema.optional(),
   })
   .strict();
@@ -2839,6 +2847,12 @@ export const TOOL_DEFINITIONS = {
         owner: z.string().describe("GitHub owner from skills_catalog_search"),
         repo: z.string().describe("GitHub repo from skills_catalog_search"),
         skillId: SkillNameSchema.describe("Skill ID from skills_catalog_search"),
+        offset_chars: z
+          .number()
+          .int()
+          .min(0)
+          .nullish()
+          .describe("Long bodies come in pages: pass the previous result's nextCharOffset."),
       })
       .strict(),
   },

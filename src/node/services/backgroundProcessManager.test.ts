@@ -20,6 +20,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
+import { BASH_MAX_TOTAL_BYTES } from "@/common/constants/toolLimits";
 import { createBashTool } from "@/node/services/tools/bash";
 import { createBashOutputTool } from "@/node/services/tools/bash_output";
 import { TestTempDir, createTestToolConfig } from "@/node/services/tools/testHelpers";
@@ -3364,6 +3365,77 @@ describe("BackgroundProcessManager", () => {
       expect(resumed.success).toBe(true);
       if (!resumed.success) return;
       expect(resumed.output).toContain("partialdone");
+    });
+
+    describe("per-read cap", () => {
+      // Reads every page of the process's pending output (timeout 0 each), checking each page
+      // against foreground bash's byte cap.
+      async function readAllPages(processId: string) {
+        const pages: string[] = [];
+        const notes: Array<string | undefined> = [];
+        for (let attempt = 0; attempt < 50; attempt++) {
+          const read = await manager.getOutput(processId, undefined, undefined, 0);
+          expect(read.success).toBe(true);
+          if (!read.success) throw new Error(read.error);
+          expect(Buffer.byteLength(read.output, "utf8")).toBeLessThanOrEqual(BASH_MAX_TOTAL_BYTES);
+          pages.push(read.output);
+          notes.push(read.note);
+          if (!read.note?.includes("more bytes are unread")) return { pages, notes, last: read };
+        }
+        throw new Error("output never drained");
+      }
+
+      it("pages output over the cap instead of returning it in one read", async () => {
+        const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+          cwd: process.cwd(),
+          displayName: "test",
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        const lines = Array.from({ length: 1_000 }, (_, i) => `line ${i} ${"é".repeat(30)}`);
+        await fs.appendFile(path.join(result.outputDir, "output.log"), `${lines.join("\n")}\n`);
+
+        const { pages, notes } = await readAllPages(result.processId);
+        expect(pages.length).toBeGreaterThan(2);
+        expect(notes[0]).toContain(
+          `bash_output(process_id: "${result.processId}", timeout_secs: 0)`
+        );
+        expect(pages.join("\n")).toBe(lines.join("\n"));
+      });
+
+      it("splits a single line over the byte cap across reads", async () => {
+        const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+          cwd: process.cwd(),
+          displayName: "test",
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        const longLine = "x".repeat(BASH_MAX_TOTAL_BYTES * 2 + 5);
+        await fs.appendFile(path.join(result.outputDir, "output.log"), `${longLine}\nafter\n`);
+
+        const { pages } = await readAllPages(result.processId);
+        // Two full pages of the line's head, then its tail and the next line.
+        expect(pages).toHaveLength(3);
+        expect(pages.join("")).toBe(`${longLine}\nafter`);
+      });
+
+      it("keeps the rest after exit readable", async () => {
+        const result = await manager.spawn(runtime, testWorkspaceId, "seq 1 20000", {
+          cwd: process.cwd(),
+          displayName: "test",
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        for (let attempt = 0; attempt < 100; attempt++) {
+          if ((await manager.getProcess(result.processId))?.status !== "running") break;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+
+        const { pages, last } = await readAllPages(result.processId);
+        expect(last.success && last.status).toBe("exited");
+        const expected = Array.from({ length: 20_000 }, (_, i) => String(i + 1)).join("\n");
+        expect(pages.join("\n")).toBe(expected);
+      });
     });
 
     it("should return stderr from a running process", async () => {

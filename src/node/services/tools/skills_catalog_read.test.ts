@@ -2,6 +2,7 @@ import { describe, expect, it, spyOn } from "bun:test";
 import type { ToolExecutionOptions } from "ai";
 
 const GLOBAL_WORKSPACE_ID = "workspace-global";
+import { TOOL_TEXT_PAGE_MAX_CHARS } from "@/common/constants/toolLimits";
 import type { SkillsCatalogReadToolResult } from "@/common/types/tools";
 import { createSkillsCatalogReadTool } from "./skills_catalog_read";
 import * as catalogFetch from "./skillsCatalogFetch";
@@ -60,6 +61,40 @@ describe("skills_catalog_read", () => {
     }
 
     fetchContentSpy.mockRestore();
+  });
+
+  it("pages a long body and reads the rest with offset_chars", async () => {
+    using tempDir = new TestTempDir("test-skills-catalog-read-pages");
+    const config = createTestToolConfig(tempDir.path, { workspaceId: GLOBAL_WORKSPACE_ID });
+    const body = `# Big Skill\n\n${"step\n".repeat(25_000)}`;
+    const fetchContentSpy = spyOn(catalogFetch, "fetchSkillContent").mockResolvedValue({
+      content: `---\nname: test-skill\ndescription: A big skill\n---\n${body}`,
+      path: "skills/test-skill/SKILL.md",
+      branch: "main",
+    });
+
+    try {
+      const tool = createSkillsCatalogReadTool(config);
+      const pages: string[] = [];
+      let offset: number | undefined;
+      for (let call = 0; call < 5; call++) {
+        const result = (await tool.execute!(
+          { owner: "o", repo: "r", skillId: "test-skill", offset_chars: offset },
+          mockToolCallOptions
+        )) as SkillsCatalogReadToolResult;
+        if (!result.success) throw new Error(result.error);
+        expect(result.body.length).toBeLessThanOrEqual(TOOL_TEXT_PAGE_MAX_CHARS);
+        pages.push(result.body);
+        offset = result.nextCharOffset;
+        if (offset == null) break;
+        expect(result.note).toContain(`offset_chars: ${offset})`);
+      }
+
+      expect(pages).toHaveLength(3);
+      expect(pages.join("")).toBe(body);
+    } finally {
+      fetchContentSpy.mockRestore();
+    }
   });
 
   it("returns parsed skill content on success", async () => {
