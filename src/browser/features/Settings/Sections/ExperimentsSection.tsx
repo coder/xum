@@ -23,7 +23,7 @@ import {
 import type { ApiServerStatus, DesktopPrereqStatus } from "@/common/orpc/types";
 import { Input } from "@/browser/components/Input/Input";
 import { useAPI } from "@/browser/contexts/API";
-import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { ArtifactsExperimentConfig } from "./ArtifactsExperimentConfig";
 import { AutoModelRoutingExperimentConfig } from "./AutoModelRoutingExperimentConfig";
@@ -131,7 +131,7 @@ export function PortableDesktopExperimentWarning() {
       setPrereqStatus(nextStatus);
     } catch (e) {
       // A lost connection is no check failure: the reconnect checks again.
-      if (requestIdRef.current !== requestId || isAbortError(e)) {
+      if (requestIdRef.current !== requestId || isConnectionLostError(e)) {
         return;
       }
 

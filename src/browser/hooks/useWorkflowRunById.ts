@@ -1,7 +1,7 @@
 import { useContext, useEffect, useState } from "react";
 
 import { APIContext } from "@/browser/contexts/API";
-import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { isActiveWorkflowRunStatus, type WorkflowRunRecord } from "@/common/types/workflow";
 
 const WORKFLOW_RUN_REFRESH_INTERVAL_MS = 2_000;
@@ -108,7 +108,7 @@ export function useWorkflowRunById(input: {
         }
       } catch (fetchError) {
         // A lost connection is no load failure: keep the shown run, the reconnect polls again.
-        if (ignore || isAbortError(fetchError)) {
+        if (ignore || isConnectionLostError(fetchError)) {
           return;
         }
         setError(fetchError instanceof Error ? fetchError.message : "Failed to load workflow run");

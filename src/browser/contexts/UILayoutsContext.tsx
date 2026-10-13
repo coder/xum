@@ -8,7 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { useAPI, useLiveAPI } from "@/browser/contexts/API";
-import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import assert from "@/common/utils/assert";
 import {
   DEFAULT_LAYOUT_PRESETS_CONFIG,
@@ -99,7 +99,7 @@ export function UILayoutsProvider(props: { children: ReactNode }) {
       setLoadFailed(false);
     } catch (error) {
       // A lost connection is no load failure: keep the shown presets for the reconnect.
-      if (isAbortError(error)) return;
+      if (isConnectionLostError(error)) return;
       setLayoutPresets(DEFAULT_LAYOUT_PRESETS_CONFIG);
       setLoaded(true);
       setLoadFailed(true);

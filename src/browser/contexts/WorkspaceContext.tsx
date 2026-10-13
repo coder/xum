@@ -41,6 +41,7 @@ import {
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { appendPinnedTimestamp, reassignPinnedTimestamps } from "@/common/utils/pin";
 import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { findAdjacentWorkspaceId } from "@/browser/utils/ui/workspaceDomNav";
 import { useRouter } from "@/browser/contexts/RouterContext";
 import { setWorkspaceAiMetadata } from "@/browser/utils/aiSelectionIntent";
@@ -1581,7 +1582,7 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       setLoadError(null);
     } catch (error) {
       // A lost connection is no load error: the reconnect reloads.
-      if (isAbortError(error)) return;
+      if (isConnectionLostError(error)) return;
       console.error("Failed to load workspace metadata:", error);
       // Keep the previous metadata map on failure so scoped preferences are not pruned.
       setLoadError(getErrorMessage(error));

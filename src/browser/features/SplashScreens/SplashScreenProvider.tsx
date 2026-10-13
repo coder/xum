@@ -14,7 +14,7 @@ import {
   type SplashConfig,
 } from "./index";
 import { useAPI } from "@/browser/contexts/API";
-import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 
 const SplashScreenActiveContext = createContext(false);
@@ -75,7 +75,7 @@ export function SplashScreenProvider({ children }: { children: ReactNode }) {
         setQueue(getActiveSplashQueue(viewedIds));
       } catch (error) {
         // A lost connection is no load failure: keep the shown splash for the reconnect.
-        if (isAbortError(error)) return;
+        if (isConnectionLostError(error)) return;
         console.error("Failed to load viewed splash screens:", error);
         // On error, don't show any splash screens
         setQueue([]);

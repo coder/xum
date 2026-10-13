@@ -7,7 +7,7 @@ import { useAPI } from "@/browser/contexts/API";
 import type { analytics } from "@/common/orpc/schemas/analytics";
 import type { SavedQuery } from "@/common/types/savedQueries";
 import { getErrorMessage } from "@/common/utils/errors";
-import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 
 export type Summary = z.infer<typeof analytics.getSummary.output>;
 export type SpendOverTimeItem = z.infer<typeof analytics.getSpendOverTime.output>[number];
@@ -150,7 +150,7 @@ function startAnalyticsFetch<T>(
     })
     .catch((error: unknown) => {
       // A lost connection is no query failure: the reconnect runs the query again.
-      if (ignore || isAbortError(error)) {
+      if (ignore || isConnectionLostError(error)) {
         return;
       }
       setState((previousState) => ({

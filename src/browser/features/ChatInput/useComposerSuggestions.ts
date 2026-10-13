@@ -1,7 +1,7 @@
 import { useEffect, useId, useRef, useState } from "react";
 import type { RefObject } from "react";
 import { useAPI } from "@/browser/contexts/API";
-import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -267,7 +267,7 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
         if (mounted) setPluginCommandsState({ workspaceId: chatWorkspaceId, commands });
       })
       .catch((error: unknown) => {
-        if (mounted && !isAbortError(error)) {
+        if (mounted && !isConnectionLostError(error)) {
           setPluginCommandsState({ workspaceId: chatWorkspaceId, commands: NO_PLUGIN_COMMANDS });
         }
       });
@@ -317,7 +317,7 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
       })
       .catch((error: unknown) => {
         // A lost connection is no answer: leave the prompts unloaded so the reconnect asks again.
-        if (isAbortError(error)) return;
+        if (isConnectionLostError(error)) return;
         if (mcpWorkspace.current === chatWorkspaceId && mcpRequestId.current === requestId) {
           mcpLoadedAt.current = Date.now();
         }

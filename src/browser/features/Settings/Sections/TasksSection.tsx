@@ -46,7 +46,7 @@ import {
 } from "@/common/types/thinking";
 import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import { getErrorMessage } from "@/common/utils/errors";
-import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
@@ -467,7 +467,7 @@ export function TasksSection() {
       })
       .catch((error: unknown) => {
         // A lost connection is no load failure: the reconnect loads again.
-        if (isAbortError(error)) return;
+        if (isConnectionLostError(error)) return;
         setSaveError(getErrorMessage(error));
         setLoadFailed(true);
         setLoaded(true);
@@ -509,7 +509,7 @@ export function TasksSection() {
         setAgentsLoaded(true);
       })
       .catch((error: unknown) => {
-        if (cancelled || isAbortError(error)) return;
+        if (cancelled || isConnectionLostError(error)) return;
         setAgents([]);
         setEnabledAgentIds(FALLBACK_AGENTS.map((agent) => agent.id));
         setAgentsLoadFailed(true);

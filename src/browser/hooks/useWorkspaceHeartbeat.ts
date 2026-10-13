@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useAPI } from "@/browser/contexts/API";
-import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useWorkspaceActions } from "@/browser/contexts/WorkspaceContext";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import {
@@ -155,7 +155,7 @@ export function useWorkspaceHeartbeat(
       })
       .catch((loadError) => {
         // A lost connection is no load failure: keep the shown settings for the reconnect.
-        if (cancelled || isAbortError(loadError)) return;
+        if (cancelled || isConnectionLostError(loadError)) return;
         if (currentWorkspaceIdRef.current !== workspaceId) return;
 
         setGlobalDefaultPrompt(undefined);

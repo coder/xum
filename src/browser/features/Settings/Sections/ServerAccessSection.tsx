@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Button } from "@/browser/components/Button/Button";
 import { useAPI } from "@/browser/contexts/API";
-import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import type { ServerAuthSession } from "@/common/orpc/types";
 import { getErrorMessage } from "@/common/utils/errors";
 
@@ -89,7 +89,7 @@ export function ServerAccessSection() {
       setSessions(nextSessions);
     } catch (refreshError) {
       // A lost connection is no load failure: keep the shown sessions for the reconnect.
-      if (isAbortError(refreshError)) return;
+      if (isConnectionLostError(refreshError)) return;
       const message = getErrorMessage(refreshError);
       setError(message);
       setSessions([]);

@@ -12,7 +12,7 @@ import {
 } from "react";
 
 import { useAPI } from "@/browser/contexts/API";
-import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useOptionalWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
@@ -172,7 +172,7 @@ function AgentProviderWithState(props: {
         }
       } catch (error) {
         // A lost connection (or the reconnect that replaced the client) is no load failure.
-        if (isAbortError(error)) return;
+        if (isConnectionLostError(error)) return;
         if (isSameFetch(fetchParamsRef.current, projectPath, workspaceId) && isMountedRef.current) {
           setAgents([]);
           setAgentBases(getScopeId(workspaceId, projectPath), []);

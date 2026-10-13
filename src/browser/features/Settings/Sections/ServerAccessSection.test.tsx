@@ -66,3 +66,38 @@ describe.each([...GAP_MODES])("ServerAccessSection across a reconnect (%s)", (mo
     await waitFor(() => expect(view.queryByText("Laptop")).toBeNull());
   });
 });
+
+// A server cancel on a live socket is a plain AbortError. It is a real failure: no reconnect
+// comes to reload, so swallowing it would leave the section stuck on stale or no sessions.
+describe("ServerAccessSection on a server cancel", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  test("reports the cancel while connected", async () => {
+    harness = createConnectionHarness(
+      "kept-gap",
+      (): TestApiOverrides<APIClient> => ({
+        serverAuth: {
+          listSessions: () => Promise.reject(new DOMException("Request cancelled", "AbortError")),
+        },
+      })
+    );
+    const view = render(
+      <harness.Wrapper>
+        <ServerAccessSection />
+      </harness.Wrapper>
+    );
+
+    await view.findByText("Request cancelled");
+    expect(view.queryByText("Loading sessions...")).toBeNull();
+  });
+});

@@ -19,7 +19,7 @@ import { getDraftScopeId } from "@/common/constants/storage";
 import { deleteWorkspaceStorage } from "@/browser/utils/workspaceStorage";
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import { getErrorMessage } from "@/common/utils/errors";
-import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import type { ProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
@@ -204,7 +204,7 @@ export function ProjectProvider(props: { children: ReactNode }) {
           } catch (error) {
             if (refresh !== projectsRefreshRef.current || !refresh.api) continue;
             // A lost connection is no load error: the reconnect reloads.
-            if (isAbortError(error)) continue;
+            if (isConnectionLostError(error)) continue;
             // Keep successful data when a later refresh fails.
             console.error("Failed to load projects:", error);
             setLoadError(getErrorMessage(error));

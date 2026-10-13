@@ -18,7 +18,7 @@ import { useChatTranscriptFullWidth } from "@/browser/hooks/useChatTranscriptFul
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { useTranscriptDensity } from "@/browser/hooks/useTranscriptDensity";
 import { useAPI } from "@/browser/contexts/API";
-import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useExperiment, useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import assert from "@/common/utils/assert";
@@ -355,7 +355,7 @@ export function GeneralSection() {
       .catch((error: unknown) => {
         // A lost connection is no read failure: the reconnect reads again. The defaults must
         // not become editable (and saved) in the meantime.
-        if (isAbortError(error)) return;
+        if (isConnectionLostError(error)) return;
         if (archiveBehaviorNonce === archiveBehaviorLoadNonceRef.current) {
           // Fall back to the safe defaults already in state so the controls can recover after a
           // config read failure and the next user change can persist a fresh value.

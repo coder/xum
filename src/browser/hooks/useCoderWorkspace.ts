@@ -7,7 +7,7 @@
  */
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useAPI } from "@/browser/contexts/API";
-import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import type {
   CoderInfo,
   CoderTemplate,
@@ -164,7 +164,7 @@ export function useCoderWorkspace({
       }
     } catch (error) {
       // A lost connection says nothing about the CLI: keep the info and the user's Coder config.
-      if (seq !== latestAuthSeqRef.current || isAbortError(error)) {
+      if (seq !== latestAuthSeqRef.current || isConnectionLostError(error)) {
         return;
       }
 
@@ -239,7 +239,7 @@ export function useCoderWorkspace({
         }
       })
       .catch((error) => {
-        if (!mounted || isAbortError(error)) return;
+        if (!mounted || isConnectionLostError(error)) return;
         setTemplates([]);
         setTemplatesError(formatCoderListError(error));
       })
@@ -287,7 +287,7 @@ export function useCoderWorkspace({
         }
       })
       .catch((error) => {
-        if (!mounted || isAbortError(error)) return;
+        if (!mounted || isConnectionLostError(error)) return;
         setExistingWorkspaces([]);
         setWorkspacesError(formatCoderListError(error));
       })
@@ -370,7 +370,7 @@ export function useCoderWorkspace({
         }
       })
       .catch((error) => {
-        if (!mounted || isAbortError(error)) {
+        if (!mounted || isConnectionLostError(error)) {
           return;
         }
         if (!isTemplateSelected(coderConfigRef.current, templateAtRequest, orgAtRequest)) {

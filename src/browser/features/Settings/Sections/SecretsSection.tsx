@@ -3,7 +3,7 @@ import { Loader2, Trash2 } from "lucide-react";
 import type { ProjectConfig } from "@/common/types/project";
 import type { Secret } from "@/common/types/secrets";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
-import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { Button } from "@/browser/components/Button/Button";
@@ -136,7 +136,7 @@ export function useGlobalSecretKeys(api: APIClient | null) {
         if (cancelled) return;
         setGlobalSecretKeys(secrets.map((s) => s.key));
       } catch (err) {
-        if (cancelled || isAbortError(err)) return;
+        if (cancelled || isConnectionLostError(err)) return;
         console.error("Failed to load global secrets:", err);
         setGlobalSecretKeys([]);
       }
@@ -301,7 +301,7 @@ export const SecretsSection: React.FC = () => {
           }
           setInjectedGlobalSecretKeys(injectedKeys);
         } catch (err) {
-          if (isStaleRequest() || isAbortError(err)) {
+          if (isStaleRequest() || isConnectionLostError(err)) {
             return;
           }
           const message = err instanceof Error ? err.message : "Failed to load injected globals";
@@ -318,7 +318,7 @@ export const SecretsSection: React.FC = () => {
       }
     } catch (err) {
       // A lost connection is no load failure: keep the shown secrets for the reconnect.
-      if (isStaleRequest() || isAbortError(err)) {
+      if (isStaleRequest() || isConnectionLostError(err)) {
         return;
       }
       const message = err instanceof Error ? err.message : "Failed to load secrets";
