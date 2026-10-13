@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent, type RefObject } from "react";
 import { ArrowLeft } from "lucide-react";
 
 import { Button } from "@/browser/components/Button/Button";
@@ -50,15 +50,7 @@ export function MemoryFileEditor(props: MemoryFileEditorProps) {
   // happy-dom, and the DOM is authoritative for what the user typed anyway.
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
-  const isMarkdown = getLanguageFromPath(props.path) === "markdown";
-  const [mode, setMode] = useState<ViewMode>(isMarkdown ? "preview" : "edit");
-
-  // Focus the editor on open so its shortcuts work at once (the clicked row
-  // unmounts, so focus would fall to <body>). Never the textarea: opening a
-  // file to read it must not pop up the phone keyboard.
-  useEffect(() => {
-    rootRef.current?.focus();
-  }, []);
+  const view = useMarkdownViewMode(props.path, rootRef, textareaRef, setDraft);
 
   useEffect(() => {
     if (!api) return;
@@ -107,25 +99,13 @@ export function MemoryFileEditor(props: MemoryFileEditorProps) {
     }
   };
 
-  const switchMode = (next: ViewMode) => {
-    if (next === mode) return;
-    if (next === "preview") {
-      const textarea = textareaRef.current;
-      if (textarea) setDraft(textarea.value);
-      // The textarea unmounts; keep focus inside the editor so the next
-      // shortcut press still reaches it.
-      if (textarea !== null && document.activeElement === textarea) rootRef.current?.focus();
-    }
-    setMode(next);
-  };
-
   const handleKeyDown = (e: KeyboardEvent) => {
     if (matchesKeybind(e, KEYBINDS.SAVE_EDIT)) {
       e.preventDefault();
       void handleSave();
-    } else if (isMarkdown && matchesKeybind(e, KEYBINDS.TOGGLE_MARKDOWN_PREVIEW)) {
+    } else if (view.isMarkdown && matchesKeybind(e, KEYBINDS.TOGGLE_MARKDOWN_PREVIEW)) {
       e.preventDefault();
-      switchMode(mode === "preview" ? "edit" : "preview");
+      view.toggle();
     }
   };
 
@@ -145,62 +125,22 @@ export function MemoryFileEditor(props: MemoryFileEditorProps) {
       onKeyDown={handleKeyDown}
       className="flex h-full min-h-0 flex-1 flex-col outline-none"
     >
-      <div className="border-border-light flex items-center gap-2 border-b px-2 py-2">
-        <RowActionButton aria-label="Back to memory list" onClick={props.onBack}>
-          <ArrowLeft className="h-3.5 w-3.5" aria-hidden="true" />
-        </RowActionButton>
-        <span className="min-w-0 flex-1 truncate text-xs font-medium">{props.path}</span>
-        {isMarkdown && (
-          <TooltipIfPresent
-            tooltip={
-              <>
-                Toggle preview
-                <span className="mobile-hide-shortcut-hints">
-                  {" "}
-                  ({formatKeybind(KEYBINDS.TOGGLE_MARKDOWN_PREVIEW)})
-                </span>
-              </>
-            }
-          >
-            <div className="shrink-0">
-              <ToggleGroup options={VIEW_MODE_OPTIONS} value={mode} onChange={switchMode} />
-            </div>
-          </TooltipIfPresent>
-        )}
-        <Button
-          size="sm"
-          aria-label="Save memory file"
-          disabled={loaded === null || saving}
-          onClick={() => void handleSave()}
-        >
-          {saving ? "Saving…" : "Save"}
-        </Button>
-      </div>
-      {saveError !== null && (
-        <div
-          className={cn(
-            "flex items-center gap-2 px-3 py-2 text-xs",
-            saveError.kind === "conflict" ? "bg-warning/10 text-warning" : "bg-error/10 text-error"
-          )}
-          role="alert"
-        >
-          <span className="min-w-0 flex-1">{saveError.message}</span>
-          {saveError.kind === "conflict" && (
-            <RowActionButton
-              className="shrink-0"
-              aria-label="Reload memory file"
-              onClick={handleReload}
-            >
-              Reload
-            </RowActionButton>
-          )}
-        </div>
-      )}
+      <MemoryFileHeader
+        path={props.path}
+        showModeToggle={view.isMarkdown}
+        mode={view.mode}
+        onModeChange={view.switchMode}
+        saveDisabled={loaded === null || saving}
+        saving={saving}
+        onBack={props.onBack}
+        onSave={() => void handleSave()}
+      />
+      {saveError !== null && <SaveErrorBanner error={saveError} onReload={handleReload} />}
       {loadError !== null ? (
         <div className="text-error px-3 py-2 text-xs" role="alert">
           {loadError}
         </div>
-      ) : mode === "preview" ? (
+      ) : view.mode === "preview" ? (
         <div className="min-h-48 flex-1 overflow-auto p-3">
           <MarkdownFilePreview content={draft} />
         </div>
@@ -215,9 +155,123 @@ export function MemoryFileEditor(props: MemoryFileEditorProps) {
           spellCheck={false}
           // Only Markdown files open in Preview, so a mounting textarea there
           // means the user switched to Edit and wants to type.
-          autoFocus={isMarkdown}
+          autoFocus={view.isMarkdown}
           onChange={(e) => setDraft(e.target.value)}
         />
+      )}
+    </div>
+  );
+}
+
+/**
+ * Preview/Edit state for Markdown files. Switching keeps the draft: leaving
+ * Edit copies the textarea's live value out before it unmounts.
+ */
+function useMarkdownViewMode(
+  path: string,
+  rootRef: RefObject<HTMLDivElement | null>,
+  textareaRef: RefObject<HTMLTextAreaElement | null>,
+  onLeaveEdit: (draft: string) => void
+) {
+  const isMarkdown = getLanguageFromPath(path) === "markdown";
+  const [mode, setMode] = useState<ViewMode>(isMarkdown ? "preview" : "edit");
+
+  // Focus the editor on open so its shortcuts work at once (the clicked row
+  // unmounts, so focus would fall to <body>). Never the textarea: opening a
+  // file to read it must not pop up the phone keyboard.
+  useEffect(() => {
+    rootRef.current?.focus();
+  }, [rootRef]);
+
+  const switchMode = (next: ViewMode) => {
+    const textarea = textareaRef.current;
+    if (next === "preview" && textarea !== null) {
+      onLeaveEdit(textarea.value);
+      // The textarea unmounts; keep focus inside the editor so the next
+      // shortcut press still reaches it.
+      if (document.activeElement === textarea) rootRef.current?.focus();
+    }
+    setMode(next);
+  };
+
+  return {
+    isMarkdown,
+    mode,
+    switchMode,
+    toggle: () => switchMode(mode === "preview" ? "edit" : "preview"),
+  };
+}
+
+interface MemoryFileHeaderProps {
+  path: string;
+  /** Only Markdown files have a preview. */
+  showModeToggle: boolean;
+  mode: ViewMode;
+  onModeChange: (mode: ViewMode) => void;
+  saveDisabled: boolean;
+  saving: boolean;
+  onBack: () => void;
+  onSave: () => void;
+}
+
+function MemoryFileHeader(props: MemoryFileHeaderProps) {
+  return (
+    <div className="border-border-light flex items-center gap-2 border-b px-2 py-2">
+      <RowActionButton aria-label="Back to memory list" onClick={props.onBack}>
+        <ArrowLeft className="h-3.5 w-3.5" aria-hidden="true" />
+      </RowActionButton>
+      <span className="min-w-0 flex-1 truncate text-xs font-medium">{props.path}</span>
+      {props.showModeToggle && (
+        <TooltipIfPresent
+          tooltip={
+            <>
+              Toggle preview
+              <span className="mobile-hide-shortcut-hints">
+                {" "}
+                ({formatKeybind(KEYBINDS.TOGGLE_MARKDOWN_PREVIEW)})
+              </span>
+            </>
+          }
+        >
+          <div className="shrink-0">
+            <ToggleGroup
+              options={VIEW_MODE_OPTIONS}
+              value={props.mode}
+              onChange={props.onModeChange}
+            />
+          </div>
+        </TooltipIfPresent>
+      )}
+      <Button
+        size="sm"
+        aria-label="Save memory file"
+        disabled={props.saveDisabled}
+        onClick={props.onSave}
+      >
+        {props.saving ? "Saving…" : "Save"}
+      </Button>
+    </div>
+  );
+}
+
+function SaveErrorBanner(props: { error: MemorySaveError; onReload: () => void }) {
+  return (
+    <div
+      className={cn(
+        "flex items-center gap-2 px-3 py-2 text-xs",
+        props.error.kind === "conflict" ? "bg-warning/10 text-warning" : "bg-error/10 text-error"
+      )}
+      role="alert"
+    >
+      <span className="min-w-0 flex-1">{props.error.message}</span>
+      {props.error.kind === "conflict" && (
+        <RowActionButton
+          className="shrink-0"
+          aria-label="Reload memory file"
+          onClick={props.onReload}
+        >
+          Reload
+        </RowActionButton>
       )}
     </div>
   );
