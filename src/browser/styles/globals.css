@@ -943,6 +943,7 @@ body,
   }
 
   label:has(button[role="checkbox"]) {
+    /* Keep in sync with MOBILE_TOUCH_TARGET_PX, which tests use to reproduce this rule. */
     min-height: 44px;
   }
 

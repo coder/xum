@@ -383,6 +383,8 @@ describe("StreamManager - Anthropic preserved thinking replay", () => {
       const row = history.data.find((message) => message.id === scripted.messageId);
       expect(row?.metadata?.partial).not.toBe(true);
       expect(row?.metadata?.anthropicThinkingReplay).toBe("off");
+      // The whole row loses its thinking, including steps after the server tool.
+      expect(row?.metadata?.anthropicThinkingReplayFromStep).toBe("end");
 
       const next = await nextTurnBody(workspaceId, scripted);
       expect(thinkingTypes(next)).toEqual([]);
