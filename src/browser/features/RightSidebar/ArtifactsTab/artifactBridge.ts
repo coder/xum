@@ -1,4 +1,3 @@
-import assert from "@/common/utils/assert";
 import { z } from "zod";
 import { KEYBINDS } from "@/browser/utils/ui/keybinds";
 import type { Keybind } from "@/common/types/keybind";
@@ -355,24 +354,44 @@ export const ARTIFACT_IN_PAGE_LINK_SCRIPT = `(function () {
   })();`;
 
 /**
- * The annotate shortcut the frame forwards, lowercased, from the keybind the panel and Settings
- * use, so the three cannot drift. The shim checks only the key with no modifiers, so a keybind
- * with modifiers or a `code` would need a shim change: fail at load instead of forwarding the
- * wrong key.
+ * The annotate key the frame forwards, lowercased, from the keybind the panel and Settings use,
+ * so the three cannot drift. The shim checks only a key with no modifiers, so a keybind with
+ * modifiers or a `code` turns forwarding off (null) rather than forwarding the wrong key. Not
+ * an assert: this module loads with the app, and startup must never crash. The shim tests send
+ * the keybind's key, so such a change fails them.
  */
-const ANNOTATE_FRAME_KEY = (() => {
-  const keybind: Keybind = KEYBINDS.TOGGLE_ARTIFACT_ANNOTATE;
-  assert(
+function plainSingleKey(keybind: Keybind): string | null {
+  const plain =
     keybind.key.length === 1 &&
-      keybind.code == null &&
-      !keybind.ctrl &&
-      !keybind.shift &&
-      !keybind.alt &&
-      !keybind.meta,
-    "artifact frame shim forwards only a plain single-key annotate shortcut"
-  );
-  return keybind.key.toLowerCase();
-})();
+    keybind.code == null &&
+    !keybind.ctrl &&
+    !keybind.shift &&
+    !keybind.alt &&
+    !keybind.meta;
+  return plain ? keybind.key.toLowerCase() : null;
+}
+const ANNOTATE_FRAME_KEY = plainSingleKey(KEYBINDS.TOGGLE_ARTIFACT_ANNOTATE);
+
+/**
+ * C (annotate) is forwarded only once the key event has finished dispatching, so every handler
+ * in the artifact (window listeners registered after this one included) has run: an artifact
+ * that uses that key itself (a game, a keyboard widget) calls preventDefault and keeps it.
+ * window.setTimeout reads the final defaultPrevented; it is not a timing guess. Escape and
+ * Shift+F keep their capture-phase listener.
+ */
+const ANNOTATE_KEY_LISTENER =
+  ANNOTATE_FRAME_KEY == null
+    ? ""
+    : `
+  window.addEventListener("keydown", function (event) {
+    if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+    if (typeof event.key !== "string" || event.key.toLowerCase() !== ${JSON.stringify(ANNOTATE_FRAME_KEY)}) return;
+    if (isEditable(keyTarget(event))) return;
+    window.setTimeout(function () {
+      if (event.defaultPrevented) return;
+      host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "key", key: "C", shiftKey: false }, "*");
+    }, 0);
+  });`;
 
 export function buildArtifactBridgeScript(
   initialTheme: ArtifactTheme,
@@ -521,14 +540,7 @@ export function buildArtifactBridgeScript(
     if (key === null) return;
     host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "key", key: key, shiftKey: event.shiftKey }, "*");
   }, true);
-  // C (annotate) listens in the bubble phase, after the artifact's own handlers: an artifact that
-  // uses plain C itself (a game, a keyboard-driven widget) calls preventDefault and keeps the key.
-  window.addEventListener("keydown", function (event) {
-    if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
-    if (typeof event.key !== "string" || event.key.toLowerCase() !== ${JSON.stringify(ANNOTATE_FRAME_KEY)}) return;
-    if (isEditable(keyTarget(event))) return;
-    host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "key", key: "C", shiftKey: false }, "*");
-  });
+  ${ANNOTATE_KEY_LISTENER}
   ${ARTIFACT_IN_PAGE_LINK_SCRIPT}
 })();`;
 }
