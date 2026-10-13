@@ -1,7 +1,7 @@
 import React from "react";
 import { ChevronLeft } from "lucide-react";
 
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import type { AvailableWorkflow } from "@/common/types/workflow";
 
 import { WorkflowEmptyState } from "./WorkflowEmptyState";
@@ -17,6 +17,9 @@ import { useWorkflowRuns } from "./useWorkflowRuns";
  */
 function useWorkflowLauncher(workspaceId: string, onStarted: () => void) {
   const { api } = useAPI();
+  // Starting a run needs a live connection. While Xum reconnects, the list stays on screen but
+  // its Run buttons are disabled (`offline`), so a click never silently does nothing.
+  const liveApi = useLiveAPI();
   const [scripts, setScripts] = React.useState<AvailableWorkflow[]>([]);
   const [busyScriptPath, setBusyScriptPath] = React.useState<string | null>(null);
   const [runError, setRunError] = React.useState<string | null>(null);
@@ -54,13 +57,13 @@ function useWorkflowLauncher(workspaceId: string, onStarted: () => void) {
   }, [api, workspaceId]);
 
   const runScript = async (script: AvailableWorkflow, args: Record<string, unknown>) => {
-    if (api == null || busyScriptPath != null) {
+    if (liveApi == null || busyScriptPath != null) {
       return;
     }
     setBusyScriptPath(script.scriptPath);
     setRunError(null);
     try {
-      await api.workflows.start({
+      await liveApi.workflows.start({
         workspaceId,
         scriptPath: script.scriptPath,
         args,
@@ -76,7 +79,7 @@ function useWorkflowLauncher(workspaceId: string, onStarted: () => void) {
     }
   };
 
-  return { scripts, busyScriptPath, runError, runScript };
+  return { scripts, busyScriptPath, runError, runScript, offline: liveApi == null };
 }
 
 /**
@@ -87,7 +90,7 @@ function useWorkflowLauncher(workspaceId: string, onStarted: () => void) {
 export const WorkflowsTab: React.FC<{ workspaceId: string }> = (props) => {
   const { runs, loading, error } = useWorkflowRuns(props.workspaceId);
   const [overrideRunId, setOverrideRunId] = React.useState<string | null>(null);
-  const { scripts, busyScriptPath, runError, runScript } = useWorkflowLauncher(
+  const { scripts, busyScriptPath, runError, runScript, offline } = useWorkflowLauncher(
     props.workspaceId,
     () => setOverrideRunId(null)
   );
@@ -108,6 +111,7 @@ export const WorkflowsTab: React.FC<{ workspaceId: string }> = (props) => {
           scripts={scripts}
           onRun={(script, args) => void runScript(script, args)}
           busyScriptPath={busyScriptPath}
+          offline={offline}
         />
       </div>
     );

@@ -2,7 +2,7 @@
 import "../../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { act, cleanup, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
@@ -141,6 +141,36 @@ describe.each([...GAP_MODES])("BrowserTab across a dropped connection (%s)", (mo
       });
     await reconnect();
     await view.findByTestId("browser-page-tab-t3");
+    expect(view.queryByTestId("browser-page-tab-t2")).toBeNull();
+  });
+
+  test("picking another session while reconnecting clears the previous session's page tabs", async () => {
+    answerSessions = () =>
+      Promise.resolve({
+        sessions: [
+          { sessionName: "alpha", status: "attachable" },
+          { sessionName: "beta", status: "attachable" },
+        ],
+        otherSessions: [],
+      });
+    const view = render(<BrowserTab workspaceId="ws-1" projectPath="/project" />, {
+      wrapper: Wrapper,
+    });
+    await view.findByTestId("browser-page-tab-t2");
+
+    await drop();
+    fireEvent.click(view.getByText("alpha"));
+    fireEvent.click(view.getByTestId("browser-session-beta"));
+    await flush();
+    expect(view.queryByTestId("browser-page-tab-t2")).toBeNull();
+
+    answerTabs = () =>
+      Promise.resolve({
+        tabs: [pageTab("b1", "Beta one", true), pageTab("b2", "Beta two", false)],
+        error: undefined,
+      });
+    await reconnect();
+    await view.findByTestId("browser-page-tab-b2");
     expect(view.queryByTestId("browser-page-tab-t2")).toBeNull();
   });
 });

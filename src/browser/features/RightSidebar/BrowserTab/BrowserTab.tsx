@@ -246,8 +246,17 @@ export function BrowserTab(props: BrowserTabProps) {
   }, [api, props.workspaceId, setSelectedCurrentSessionName]);
 
   useEffect(() => {
+    // Another session never shows the previous session's tabs, even without a client: picking a
+    // kept discovered session while Xum reconnects clears the strip at once.
+    if (pageTabsSessionNameRef.current !== selectedSessionName) {
+      pageTabsSessionNameRef.current = selectedSessionName;
+      setPageTabs((currentTabs) => (currentTabs.length === 0 ? currentTabs : []));
+      setPageTabsError(null);
+      pendingTabIdRef.current = null;
+      setPendingTabId(null);
+    }
     // Without a client (a reconnect), keep the tab strip of the selected session as it is: the
-    // new client re-lists its tabs, and only another session resets them below.
+    // new client re-lists its tabs.
     if (api == null) {
       tabRefreshInFlightSessionNameRef.current = null;
       return;
@@ -263,13 +272,6 @@ export function BrowserTab(props: BrowserTabProps) {
     }
 
     let cancelled = false;
-    if (pageTabsSessionNameRef.current !== selectedSessionName) {
-      pageTabsSessionNameRef.current = selectedSessionName;
-      setPageTabs((currentTabs) => (currentTabs.length === 0 ? currentTabs : []));
-      setPageTabsError(null);
-      pendingTabIdRef.current = null;
-      setPendingTabId(null);
-    }
 
     const refreshTabs = async (): Promise<void> => {
       if (tabRefreshInFlightSessionNameRef.current === selectedSessionName) {
