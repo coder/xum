@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { isAbortError } from "@/browser/utils/isAbortError";
 import assert from "@/common/utils/assert";
 import {
   DEFAULT_LAYOUT_PRESETS_CONFIG,
@@ -62,6 +63,16 @@ export function useUILayouts(): UILayoutsContextValue {
   return ctx;
 }
 
+/** The typed name, else the slot's current name, else "Slot N". */
+function resolveSlotName(
+  name: string | null | undefined,
+  existingName: string | undefined,
+  slot: LayoutSlotNumber
+): string {
+  const trimmedName = name?.trim();
+  return trimmedName && trimmedName.length > 0 ? trimmedName : (existingName ?? `Slot ${slot}`);
+}
+
 export function UILayoutsProvider(props: { children: ReactNode }) {
   const { api } = useAPI();
   const liveApi = useLiveAPI();
@@ -74,7 +85,8 @@ export function UILayoutsProvider(props: { children: ReactNode }) {
 
   const refresh = useCallback(async (): Promise<void> => {
     if (!api) {
-      setLayoutPresets(DEFAULT_LAYOUT_PRESETS_CONFIG);
+      // Keep the shown presets offline (the defaults before the first load): the reconnect
+      // reloads them.
       setLoaded(true);
       setLoadFailed(false);
       return;
@@ -85,7 +97,9 @@ export function UILayoutsProvider(props: { children: ReactNode }) {
       setLayoutPresets(getLayoutsConfigOrDefault(remote));
       setLoaded(true);
       setLoadFailed(false);
-    } catch {
+    } catch (error) {
+      // A lost connection is no load failure: keep the shown presets for the reconnect.
+      if (isAbortError(error)) return;
       setLayoutPresets(DEFAULT_LAYOUT_PRESETS_CONFIG);
       setLoaded(true);
       setLoadFailed(true);
@@ -162,11 +176,7 @@ export function UILayoutsProvider(props: { children: ReactNode }) {
       const base = await getConfigForWrite();
       const existingPreset = getPresetForSlot(base, slot);
 
-      const trimmedName = name?.trim();
-      const resolvedName =
-        trimmedName && trimmedName.length > 0
-          ? trimmedName
-          : (existingPreset?.name ?? `Slot ${slot}`);
+      const resolvedName = resolveSlotName(name, existingPreset?.name, slot);
 
       const result = createPresetFromCurrentWorkspace(
         workspaceId,

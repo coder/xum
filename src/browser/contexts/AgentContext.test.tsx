@@ -12,6 +12,7 @@ import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { AgentProvider, useAgent, type AgentContextValue } from "./AgentContext";
 import { APIProvider, type APIClient } from "./API";
+import { createConnectionHarness, GAP_MODES, type ConnectionHarness } from "./connection.testHarness";
 import { ProjectProvider } from "./ProjectContext";
 import { RouterProvider } from "./RouterContext";
 import { WorkspaceProvider } from "./WorkspaceContext";
@@ -19,6 +20,7 @@ import {
   createTestApiClient,
   createTestConfig,
   createTestPreferencesConfig,
+  type TestApiOverrides,
 } from "@/browser/testUtils";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
@@ -510,5 +512,84 @@ describe("AgentContext", () => {
         handleOpenPicker as EventListener
       );
     }
+  });
+});
+
+// A reconnect brings a new client, so the agents load again. The picker keeps the agents it shows
+// until that reload answers; only another workspace or project clears them.
+describe.each([...GAP_MODES])("AgentContext across a reconnect (%s)", (mode) => {
+  let originalWindow: typeof globalThis.window;
+  let originalDocument: typeof globalThis.document;
+  let harness: ConnectionHarness;
+  /** The agents the next server lists, or a promise that answers later. */
+  let serverAgents: AgentDefinitionDescriptor[] | Promise<AgentDefinitionDescriptor[]>;
+  let latest: AgentContextValue | undefined;
+
+  beforeEach(() => {
+    originalWindow = globalThis.window;
+    originalDocument = globalThis.document;
+    const dom = new GlobalWindow();
+    globalThis.window = dom as unknown as Window & typeof globalThis;
+    globalThis.document = dom.document as unknown as Document;
+    latest = undefined;
+    serverAgents = [EXEC_AGENT];
+    harness = createConnectionHarness(mode, (): TestApiOverrides<APIClient> => {
+      const answer = serverAgents;
+      return { agents: { list: () => Promise.resolve(answer) } };
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    globalThis.window = originalWindow;
+    globalThis.document = originalDocument;
+  });
+
+  function renderAgents(workspaceId: string) {
+    const tree = (id: string) => (
+      <harness.Wrapper>
+        <AgentProvider workspaceId={id} projectPath="/tmp/project">
+          <Harness onChange={(value) => (latest = value)} />
+        </AgentProvider>
+      </harness.Wrapper>
+    );
+    const view = render(tree(workspaceId));
+    return { rerender: (id: string) => view.rerender(tree(id)) };
+  }
+
+  test("keeps the shown agents until the reload answers", async () => {
+    renderAgents("ws-a");
+    await waitFor(() => expect(latest?.agents.map((agent) => agent.id)).toEqual(["exec"]));
+
+    let answer: ((agents: AgentDefinitionDescriptor[]) => void) | null = null;
+    serverAgents = new Promise((resolve) => (answer = resolve));
+    await harness.drop();
+    harness.reconnect();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    });
+
+    expect(latest?.loaded).toBe(true);
+    expect(latest?.loadFailed).toBe(false);
+    expect(latest?.agents.map((agent) => agent.id)).toEqual(["exec"]);
+
+    act(() => answer?.([EXEC_AGENT, PLAN_AGENT]));
+    await waitFor(() => expect(latest?.agents.map((agent) => agent.id)).toEqual(["exec", "plan"]));
+  });
+
+  test("a workspace switch while offline clears the shown agents", async () => {
+    const view = renderAgents("ws-a");
+    await waitFor(() => expect(latest?.agents.map((agent) => agent.id)).toEqual(["exec"]));
+
+    await harness.drop();
+    view.rerender("ws-b");
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    });
+    expect(latest?.agents).toEqual([]);
+
+    serverAgents = [PLAN_AGENT];
+    harness.reconnect();
+    await waitFor(() => expect(latest?.agents.map((agent) => agent.id)).toEqual(["plan"]));
   });
 });

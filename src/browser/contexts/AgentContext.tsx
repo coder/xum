@@ -12,6 +12,7 @@ import {
 } from "react";
 
 import { useAPI } from "@/browser/contexts/API";
+import { isAbortError } from "@/browser/utils/isAbortError";
 import { useOptionalWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
@@ -63,6 +64,14 @@ type AgentProviderProps =
 
 function getScopeId(workspaceId: string | undefined, projectPath: string | undefined): string {
   return workspaceId ?? (projectPath ? getProjectScopeId(projectPath) : GLOBAL_SCOPE_ID);
+}
+
+function isSameFetch(
+  current: { projectPath: string | undefined; workspaceId: string | undefined },
+  projectPath: string | undefined,
+  workspaceId: string | undefined
+): boolean {
+  return current.projectPath === projectPath && current.workspaceId === workspaceId;
 }
 
 function coerceAgentId(value: unknown): string {
@@ -144,7 +153,9 @@ function AgentProviderWithState(props: {
 
       if (!api || (!projectPath && !workspaceId)) {
         if (isMountedRef.current) {
-          setAgents([]);
+          // No setAgents([]): offline, keep the agents shown for this scope, the reconnect
+          // reloads them. A scope change (also to no scope) already cleared them in the load
+          // effect below.
           setLoaded(true);
           setLoadFailed(false);
         }
@@ -153,24 +164,16 @@ function AgentProviderWithState(props: {
 
       try {
         const result = await api.agents.list({ projectPath, workspaceId });
-        const current = fetchParamsRef.current;
-        if (
-          current.projectPath === projectPath &&
-          current.workspaceId === workspaceId &&
-          isMountedRef.current
-        ) {
+        if (isSameFetch(fetchParamsRef.current, projectPath, workspaceId) && isMountedRef.current) {
           setAgents(result);
           setAgentBases(getScopeId(workspaceId, projectPath), result);
           setLoadFailed(false);
           setLoaded(true);
         }
-      } catch {
-        const current = fetchParamsRef.current;
-        if (
-          current.projectPath === projectPath &&
-          current.workspaceId === workspaceId &&
-          isMountedRef.current
-        ) {
+      } catch (error) {
+        // A lost connection (or the reconnect that replaced the client) is no load failure.
+        if (isAbortError(error)) return;
+        if (isSameFetch(fetchParamsRef.current, projectPath, workspaceId) && isMountedRef.current) {
           setAgents([]);
           setAgentBases(getScopeId(workspaceId, projectPath), []);
           setLoadFailed(true);
@@ -181,10 +184,17 @@ function AgentProviderWithState(props: {
     [api]
   );
 
+  // The scope whose agents are shown. Only a new scope clears them: a new client (reconnect)
+  // reloads the same scope behind the shown agents.
+  const shownScopeRef = useRef<string | null>(null);
   useEffect(() => {
-    setAgents([]);
-    setLoaded(false);
-    setLoadFailed(false);
+    const scope = JSON.stringify([props.projectPath, props.workspaceId]);
+    if (shownScopeRef.current !== scope) {
+      shownScopeRef.current = scope;
+      setAgents([]);
+      setLoaded(false);
+      setLoadFailed(false);
+    }
     void fetchAgents(props.projectPath, props.workspaceId);
   }, [fetchAgents, props.projectPath, props.workspaceId]);
 
