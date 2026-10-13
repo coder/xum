@@ -10,6 +10,7 @@ import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks"
 import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
 import { sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
+import { getAssistantMessageModelUsages } from "@/common/utils/tokens/messageModelUsages";
 import {
   normalizeUsage,
   withCacheWriteMetadata,
@@ -19,8 +20,7 @@ import type { RolledUpChildEntry } from "@/common/orpc/schemas/chatStats";
 import { SessionUsageTokenStatsCacheSchema } from "@/common/orpc/schemas/chatStats";
 import type { TokenConsumer } from "@/common/types/chatStats";
 import { HEADLESS_USAGE_FILE_NAME } from "@/common/constants/paths";
-import type { MuxMessage, PersistedToolModelUsage } from "@/common/types/message";
-import { hasTokenUsage, MODEL_FALLBACK_REFUSAL_TOOL_NAME } from "@/common/types/message";
+import type { MuxMessage } from "@/common/types/message";
 import {
   normalizeUsageModelKey,
   resolveModelForMetadata,
@@ -94,14 +94,6 @@ export interface SessionUsageFile {
  * per-model usage breakdowns. Usage is accumulated on stream-end, never
  * subtracted, making costs immune to message deletion.
  */
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isPersistedToolModelUsage(value: unknown): value is PersistedToolModelUsage {
-  return isPlainRecord(value) && typeof value.model === "string" && isPlainRecord(value.usage);
-}
-
 export class SessionUsageService {
   private readonly SESSION_USAGE_FILE = "session-usage.json";
   private readonly fileLocks = workspaceFileLocks;
@@ -191,6 +183,7 @@ export class SessionUsageService {
       const current = await this.readFile(workspaceId);
       const existing = current.byModel[model];
       // CRITICAL: Accumulate, don't overwrite
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       current.byModel[model] = existing ? sumUsageHistory([existing, usage])! : usage;
       if (options?.skipLastRequestUpdate !== true) {
         current.lastRequest = { model, usage, timestamp: Date.now() };
@@ -520,6 +513,7 @@ export class SessionUsageService {
 
       for (const [model, usage] of entries) {
         const existing = current.byModel[model];
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         current.byModel[model] = existing ? sumUsageHistory([existing, usage])! : usage;
       }
 
@@ -691,49 +685,8 @@ export class SessionUsageService {
     ): void => {
       const model = usageBucketKey(rawModel, metadataModel);
       const existing = result.byModel[model];
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       result.byModel[model] = existing ? sumUsageHistory([existing, usage])! : usage;
-    };
-
-    const rebuildToolModelUsage = (toolModelUsage: unknown): void => {
-      // History on disk is not schema-validated, so skip malformed tool snapshots instead of
-      // letting one bad entry abort the entire rebuild.
-      if (!isPersistedToolModelUsage(toolModelUsage)) {
-        return;
-      }
-
-      const rawModel = toolModelUsage.model.trim();
-      if (!rawModel) {
-        return;
-      }
-
-      // Zero-usage refusal markers exist only so analytics can count refused
-      // attempts; the live path never records them in the session ledger
-      // (recordRefusedAttemptUsage skips recordSessionUsage without tokens).
-      // Skip them here too so a rebuilt ledger matches the live one instead
-      // of growing 0-token/$0 Costs rows for models that only ever refused.
-      if (
-        toolModelUsage.toolName === MODEL_FALLBACK_REFUSAL_TOOL_NAME &&
-        !hasTokenUsage(toolModelUsage.usage)
-      ) {
-        return;
-      }
-
-      const providerMetadata = isPlainRecord(toolModelUsage.providerMetadata)
-        ? toolModelUsage.providerMetadata
-        : undefined;
-      const metadataModel =
-        typeof toolModelUsage.metadataModel === "string" ? toolModelUsage.metadataModel : undefined;
-      const usage = createDisplayUsage(
-        toolModelUsage.usage,
-        rawModel,
-        providerMetadata,
-        metadataModel
-      );
-      if (!usage) {
-        return;
-      }
-
-      mergeUsageForModel(rawModel, usage, metadataModel);
     };
 
     for (const msg of messages) {
@@ -746,33 +699,19 @@ export class SessionUsageService {
         if (historicalUsage) {
           const existing = result.byModel.historical;
           result.byModel.historical = existing
-            ? sumUsageHistory([existing, historicalUsage])!
+            ? // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+              sumUsageHistory([existing, historicalUsage])!
             : historicalUsage;
         }
 
-        // Extract current message's usage
-        if (msg.metadata?.usage) {
-          const rawModel = msg.metadata.model ?? "unknown";
-          const usage = createDisplayUsage(
-            msg.metadata.usage,
-            rawModel,
-            msg.metadata.providerMetadata,
-            msg.metadata.metadataModel
-          );
-
-          if (usage) {
-            mergeUsageForModel(rawModel, usage, msg.metadata.metadataModel);
+        // The message's own usage plus its model-backed tool and refused-attempt usage.
+        for (const entry of getAssistantMessageModelUsages(msg.metadata)) {
+          mergeUsageForModel(entry.model, entry.usage, entry.metadataModel);
+          if (entry.isMessageUsage) {
             lastAssistantUsage = {
-              model: usageBucketKey(rawModel, msg.metadata.metadataModel),
-              usage,
+              model: usageBucketKey(entry.model, entry.metadataModel),
+              usage: entry.usage,
             };
-          }
-        }
-
-        const toolModelUsages = msg.metadata?.toolModelUsages;
-        if (Array.isArray(toolModelUsages)) {
-          for (const toolModelUsage of toolModelUsages) {
-            rebuildToolModelUsage(toolModelUsage);
           }
         }
       }

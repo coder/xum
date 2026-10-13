@@ -676,6 +676,7 @@ export class TerminalService {
         log.info(
           `Opening terminal window for workspace: ${workspaceId}${sessionId ? ` (session: ${sessionId})` : ""}`
         );
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         await this.terminalWindowManager!.openTerminalWindow(workspaceId, sessionId, initialTitle);
       } else {
         log.info(

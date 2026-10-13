@@ -1,6 +1,13 @@
 import { render, type RenderResult, waitFor } from "@testing-library/react";
 
 import { AppLoader } from "@/browser/components/AppLoader/AppLoader";
+// App renders its pages through React.lazy (#6206), so the first page navigation of a test file
+// required the whole page module tree inside the bounded waitForPageSettled (tests/ui/helpers.ts).
+// A cold Jest transform with coverage instrumentation, as in CI, outran that bound (#6252).
+// Importing the pages here loads them with the test file, so React.lazy resolves them at once.
+import "@/browser/components/AIView/AIView";
+import "@/browser/components/ProjectPage/ProjectPage";
+import "@/browser/components/ScratchPage/ScratchPage";
 import type { APIClient } from "@/browser/contexts/API";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 

@@ -1328,6 +1328,7 @@ export class ProjectService {
       try {
         while (!processEnded) {
           if (stderrChunks.length > 0) {
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
             yield { type: "progress", line: stderrChunks.shift()! };
             continue;
           }
@@ -1344,6 +1345,7 @@ export class ProjectService {
       }
 
       while (stderrChunks.length > 0) {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         yield { type: "progress", line: stderrChunks.shift()! };
       }
 
@@ -1736,6 +1738,7 @@ export class ProjectService {
       if (!validation.valid) {
         throw new Error(validation.error ?? "Invalid project path");
       }
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const normalizedPath = validation.expandedPath!;
 
       // Non-git repos return empty branches - they're restricted to local runtime only.
@@ -1843,6 +1846,7 @@ export class ProjectService {
       if (!validation.valid) {
         return Err(validation.error ?? "Invalid project path");
       }
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const normalizedPath = validation.expandedPath!;
       // Same exclusive claim as create(): concurrent initializations of one directory
       // could double-commit or let one call's failure rollback delete the other's .git.
@@ -1883,6 +1887,7 @@ export class ProjectService {
       return { paths: [] };
     }
 
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     const normalizedPath = validation.expandedPath!;
 
     let cacheEntry = this.fileCompletionsCache.get(normalizedPath);

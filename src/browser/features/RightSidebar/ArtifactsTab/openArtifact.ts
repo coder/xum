@@ -15,7 +15,7 @@ export interface OpenArtifactTarget {
 }
 
 /**
- * The one way to open the Artifacts tab on something (chat cards, attach_file, file cards,
+ * The one way to open the Artifacts tab on something (chat cards, file cards,
  * Review, palette). The selection is persisted first, so the panel (which reads the same state
  * with a listener) shows it whether it is already mounted or mounts because of the event;
  * RightSidebar (or the small-viewport dialog) only has to bring the tab into view.

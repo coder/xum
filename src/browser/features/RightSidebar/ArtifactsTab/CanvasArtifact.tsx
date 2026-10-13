@@ -11,7 +11,6 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { useAPI } from "@/browser/contexts/API";
 import {
   ANALYTICS_CHART_COLORS,
   CHART_AXIS_STROKE,
@@ -374,7 +373,6 @@ export function CanvasArtifact(props: {
    */
   reloadToken?: number;
 }) {
-  const { api } = useAPI();
   const parsed = parseCanvas(props.content);
   const blocks = parsed.ok ? parsed.blocks : [];
   const readableRefs = [
@@ -447,7 +445,9 @@ export function CanvasArtifact(props: {
     if (ref == null) return null;
     const error = referenceError(props.path, ref);
     if (error != null) return { status: "error", message: error };
-    if (api == null || props.workspaceId == null) {
+    // Not `api == null`: the API is null while Xum reconnects, and the blocks keep showing the
+    // data they already read (useArtifactAssetReader).
+    if (props.workspaceId == null) {
       return { status: "error", message: `File references are not available here: ${ref}` };
     }
     if (loaded?.key !== loadKey) return { status: "loading" };

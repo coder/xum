@@ -1451,23 +1451,21 @@ export const artifacts = {
     }),
     output: ResultSchema(z.object({ id: z.string() }), z.string()),
   },
-  /** Persisted window.xum.state for an artifact version (null when none). */
+  /** Persisted window.xum.state of an artifact (null when none); one state for all versions. */
   getState: {
     input: z.object({
       workspaceId: z.string(),
       path: z.string(),
-      version: z.number().int().nonnegative().nullable(),
     }),
-    output: ResultSchema(z.object({ version: z.number(), state: z.unknown() }), z.string()),
+    output: ResultSchema(z.object({ state: z.unknown() }), z.string()),
   },
   setState: {
     input: z.object({
       workspaceId: z.string(),
       path: z.string(),
-      version: z.number().int().nonnegative().nullable(),
       state: z.unknown(),
     }),
-    output: ResultSchema(z.object({ version: z.number() }), z.string()),
+    output: ResultSchema(z.void(), z.string()),
   },
 };
 

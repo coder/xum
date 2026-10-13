@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import type { ModelMessage } from "ai";
+import type { JSONValue, ModelMessage } from "ai";
 import { applyToolOutputRedaction } from "@/browser/utils/messages/applyToolOutputRedaction";
 import { stripWorkflowRunRecordsFromModelMessages } from "./stripWorkflowRunRecordsFromModelMessages";
 
@@ -118,6 +118,67 @@ describe("stripWorkflowRunRecordsFromModelMessages", () => {
     expect(replayedOutput).toEqual(
       inStreamOutput?.type === "json" ? inStreamOutput.value : undefined
     );
+  });
+
+  it("sanitizes tool output strings the same way replay-time redaction does", () => {
+    // Nested 7 levels below the output value: the sanitizer's depth limit must count from the
+    // value in both paths, not from the SDK's { type, value } wrapper.
+    let deep: unknown = { body: "deep\u0000body" };
+    for (let level = 0; level < 6; level++) deep = { level: deep };
+    const outputs: unknown[] = [
+      { success: true, output: "PNG\u0000\u0001\ufffd body" },
+      { success: true, content: "line\n".repeat(5_000) },
+      { success: true, deep },
+      "plain string \u0000 output",
+    ];
+
+    for (const toolOutput of outputs) {
+      const wrapped =
+        typeof toolOutput === "string"
+          ? { type: "text" as const, value: toolOutput }
+          : { type: "json" as const, value: toolOutput as JSONValue };
+      const [inStream] = stripWorkflowRunRecordsFromModelMessages([
+        {
+          role: "tool",
+          content: [
+            { type: "tool-result", toolCallId: "call-1", toolName: "bash", output: wrapped },
+          ],
+        },
+      ]);
+      const part = inStream?.role === "tool" ? inStream.content[0] : undefined;
+      const inStreamOutput = part?.type === "tool-result" ? part.output : undefined;
+
+      const [replayed] = applyToolOutputRedaction([
+        {
+          id: "assistant-1",
+          role: "assistant",
+          parts: [
+            {
+              type: "dynamic-tool",
+              toolCallId: "call-1",
+              toolName: "bash",
+              state: "output-available",
+              input: {},
+              output: toolOutput,
+            },
+          ],
+        },
+      ]);
+      const replayedPart = replayed?.parts[0];
+      const replayedOutput =
+        replayedPart?.type === "dynamic-tool" && replayedPart.state === "output-available"
+          ? replayedPart.output
+          : undefined;
+
+      expect(inStreamOutput?.type).toBe(wrapped.type);
+      // Byte parity: the wire carries the JSON text of each value.
+      expect(
+        JSON.stringify(
+          inStreamOutput != null && "value" in inStreamOutput ? inStreamOutput.value : null
+        )
+      ).toBe(JSON.stringify(replayedOutput));
+      expect(JSON.stringify(replayedOutput)).not.toContain("\\u0000");
+    }
   });
 
   it("does not redact original inline workflow tool-call inputs", () => {
