@@ -159,16 +159,17 @@ export function resolveSkillPaths(frontmatter: {
   return result.paths;
 }
 
-const matcherCache = new Map<string, (input: string) => boolean>();
+/**
+ * One matcher for a skill's globs: true when a workspace-root-relative POSIX path
+ * matches any of them. There is no process-wide cache: callers that match often
+ * (pathSkillActivation) keep the matcher for the turn, so untrusted repositories
+ * cannot grow memory across turns.
+ */
+export function createSkillPathsMatcher(paths: readonly string[]): (path: string) => boolean {
+  return picomatch([...paths], PICOMATCH_OPTIONS);
+}
 
 /** True when a workspace-root-relative POSIX path matches any of the skill's globs. */
 export function matchesSkillPaths(paths: readonly string[], relativePosixPath: string): boolean {
-  return paths.some((pattern) => {
-    let matcher = matcherCache.get(pattern);
-    if (matcher === undefined) {
-      matcher = picomatch(pattern, PICOMATCH_OPTIONS);
-      matcherCache.set(pattern, matcher);
-    }
-    return matcher(relativePosixPath);
-  });
+  return createSkillPathsMatcher(paths)(relativePosixPath);
 }
