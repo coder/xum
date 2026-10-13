@@ -22,7 +22,7 @@ import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "./log";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
-import { BASH_MAX_LINE_BYTES } from "@/common/constants/toolLimits";
+import { BASH_MAX_LINE_BYTES, BASH_MAX_TOTAL_BYTES } from "@/common/constants/toolLimits";
 import { stripAnsiControlChars } from "@/node/utils/ansi";
 import { truncateUtf8Prefix } from "@/node/utils/utf8";
 import type { BashMonitorFailedOperation } from "@/common/types/message";
@@ -443,8 +443,17 @@ export interface BackgroundProcess {
   outputLock: AsyncMutex;
   /** Tracks how many times getOutput() has been called (for polling detection) */
   getOutputCallCount: number;
-  /** Buffer for incomplete lines (no trailing newline) from previous read */
+  /**
+   * Output already consumed from output.log that no read has returned yet: the incomplete
+   * trailing line, plus every line after a capped (or interrupted) read's cut.
+   */
   incompleteLineBuffer: string;
+  /**
+   * True when incompleteLineBuffer starts with the tail of a line a capped read split (a kept
+   * line over BASH_MAX_TOTAL_BYTES). The next read keeps that tail without testing the filter:
+   * the tail alone can stop matching the filter its whole line matched.
+   */
+  unreadStartsWithKeptLine?: boolean;
   /** Optional write-time monitor that wakes the agent on matching output lines. */
   monitor?: BackgroundProcessMonitorState;
 }
@@ -490,6 +499,184 @@ export interface BackgroundProcessManagerEvents {
   "monitor:match": [workspaceId: string, payload: MonitorMatchPayload];
   "monitor:armed": [workspaceId: string, payload: MonitorArmedPayload];
   "monitor:stopped": [workspaceId: string, payload: MonitorStoppedPayload];
+}
+
+interface BackgroundOutputPage {
+  /** What this read returns (lines joined by "\n"). */
+  output: string;
+  /** Raw output this read leaves for the next one; it starts at the first line not returned. */
+  unread: string;
+  /** True when the read stopped at the cap with complete lines still unread. */
+  capped: boolean;
+  /** True when `unread` starts with the tail of a kept line this read split. */
+  unreadStartsWithKeptLine: boolean;
+}
+
+/**
+ * Cut one getOutput read to foreground bash's byte cap (BASH_MAX_TOTAL_BYTES), so the tool
+ * result has the same bound in-turn and on replay. Nothing is dropped: the raw rest stays unread
+ * for the next read. No line cap: the byte cap already bounds the context cost, and a line cap
+ * would multiply the reads for logs of short lines. A single line over the byte cap returns
+ * its head and leaves its tail as the first unread line; `firstLineKept` tells the next read to
+ * keep that tail whatever the filter says, because its whole line was kept.
+ *
+ * While the process runs, the last element of the split is an incomplete fragment (or "" after a
+ * trailing newline), which always stays unread. On exit every line counts and, as before, empty
+ * lines are not returned.
+ */
+function takeBackgroundOutputPage(
+  raw: string,
+  exited: boolean,
+  firstLineKept: boolean,
+  keepLine: (line: string) => boolean
+): BackgroundOutputPage {
+  const lines = raw.split("\n");
+  const fragment = exited ? null : (lines.pop() ?? "");
+  const { shown, rest, splitLine } = takeLinesWithinByteCap(
+    lines,
+    pageLineFilter(exited, firstLineKept, keepLine)
+  );
+  const capped = rest.length > 0;
+  if (fragment != null) rest.push(fragment);
+  return {
+    output: shown.join("\n"),
+    unread: rest.join("\n"),
+    capped,
+    // A complete continuation line that did not fit stays the first unread line.
+    unreadStartsWithKeptLine: splitLine || (firstLineKept && shown.length === 0 && capped),
+  };
+}
+
+/** Which lines a page keeps: the continuation of a split kept line, then the filter's picks. */
+function pageLineFilter(
+  exited: boolean,
+  firstLineKept: boolean,
+  keepLine: (line: string) => boolean
+): (line: string, index: number) => boolean {
+  return (line, index) => {
+    if (index === 0 && firstLineKept) return true;
+    // On exit, empty lines are not returned (the trailing "" of a final newline included).
+    return (!exited || line.length > 0) && keepLine(line);
+  };
+}
+
+/**
+ * Leading kept lines whose "\n"-joined size fits BASH_MAX_TOTAL_BYTES, and every line after
+ * them. When the first kept line alone is over the cap, its head is shown and its tail becomes
+ * the first remaining line, so each read makes progress.
+ */
+function takeLinesWithinByteCap(
+  lines: string[],
+  keepLine: (line: string, index: number) => boolean
+): { shown: string[]; rest: string[]; splitLine: boolean } {
+  const shown: string[] = [];
+  let bytes = 0;
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
+    if (!keepLine(line, index)) continue;
+    const lineBytes = Buffer.byteLength(line, "utf8") + (shown.length > 0 ? 1 : 0);
+    if (bytes + lineBytes <= BASH_MAX_TOTAL_BYTES) {
+      shown.push(line);
+      bytes += lineBytes;
+      continue;
+    }
+    if (shown.length > 0) return { shown, rest: lines.slice(index), splitLine: false };
+    const head = truncateUtf8Prefix(line, BASH_MAX_TOTAL_BYTES);
+    const tail = [line.slice(head.length), ...lines.slice(index + 1)];
+    return { shown: [head], rest: tail, splitLine: true };
+  }
+  return { shown, rest: [], splitLine: false };
+}
+
+/** Tells the model how to read what a capped getOutput read left unread. */
+function formatCappedReadNote(
+  processId: string,
+  unreadBytes: number,
+  toolName: string,
+  filter: string | undefined,
+  filterExclude: boolean | undefined
+): string {
+  // The exact call, filter mode included: a read without filter_exclude would keep the lines
+  // this read dropped and drop the ones it kept.
+  const filterArgs =
+    filter == null
+      ? ""
+      : `, filter: ${JSON.stringify(filter)}${filterExclude === true ? ", filter_exclude: true" : ""}`;
+  const call =
+    toolName === "task_await"
+      ? `task_await(task_ids: ["bash:${processId}"], timeout_secs: 0${filterArgs})`
+      : `${toolName}(process_id: "${processId}", timeout_secs: 0${filterArgs})`;
+  return (
+    `Output capped at ${BASH_MAX_TOTAL_BYTES} bytes per read; ` +
+    `${unreadBytes} more bytes are unread. Read the next part with ${call}.`
+  );
+}
+
+// Unread output kept in memory between reads, at most this many pages. A read still loads from
+// the cursor to the end of output.log; the rest past this bound goes back to the file: the
+// cursor moves back over it, so the next reads load it again.
+const MAX_RETAINED_UNREAD_BYTES = 4 * BASH_MAX_TOTAL_BYTES;
+
+/**
+ * Keep at most MAX_RETAINED_UNREAD_BYTES of `unread` (whole lines when one fits), and move the
+ * file cursor back over the rest, so the next reads load it from output.log again.
+ *
+ * `unread` is the end of what the reads consumed, and `decodedThisRead` is the text this call
+ * decoded from the bytes just before the cursor (both end at the cursor). The cursor counts raw
+ * bytes, the text is decoded: an invalid byte (Latin-1, binary, a character cut at a read
+ * boundary) decodes to U+FFFD, 3 bytes for 1. So the cursor only moves back over text that
+ * maps 1:1 onto raw bytes: a suffix of `decodedThisRead` with no U+FFFD (every other character
+ * decodes from exactly its own UTF-8 bytes). What cannot be rewound stays in memory, as it did
+ * before reads were capped.
+ */
+function retainUnreadOutput(
+  proc: BackgroundProcess,
+  unread: string,
+  decodedThisRead: string
+): void {
+  const head = truncateUtf8Prefix(unread, MAX_RETAINED_UNREAD_BYTES);
+  if (head.length === unread.length) {
+    proc.incompleteLineBuffer = unread;
+    return;
+  }
+  const lastNewline = head.lastIndexOf("\n");
+  const dropped = unread.slice(lastNewline >= 0 ? lastNewline + 1 : head.length);
+  const rewound = dropped.slice(rewindableStart(dropped, decodedThisRead.length));
+  const outputBytesRead = proc.outputBytesRead - Buffer.byteLength(rewound, "utf8");
+  // Checked before any state changes: a failed assert must leave the process as it was.
+  assert(outputBytesRead >= 0, "the rewound unread output must come from output.log");
+  proc.incompleteLineBuffer = unread.slice(0, unread.length - rewound.length);
+  proc.outputBytesRead = outputBytesRead;
+}
+
+/** Where the rewindable part of `dropped` starts (see retainUnreadOutput). */
+function rewindableStart(dropped: string, decodedThisReadLength: number): number {
+  const afterLastReplacement = dropped.lastIndexOf("\uFFFD") + 1;
+  return Math.max(afterLastReplacement, dropped.length - decodedThisReadLength);
+}
+
+/** Polling guidance for getOutput (see the callers' 3+ call heuristics). */
+function formatPollingNote(
+  callCount: number,
+  filterExclude: boolean | undefined,
+  running: boolean,
+  pollingToolName: string
+): string | undefined {
+  if (callCount < 3 || !running) return undefined;
+  if (!filterExclude) {
+    return (
+      `STOP POLLING. You've called ${pollingToolName} 3+ times on this process. ` +
+      "This wastes tokens and clutters the conversation. " +
+      "Instead, make ONE call with: filter='⏳|progress|waiting|\\\\\\.\\\\\\.\\\\\\.', " +
+      "filter_exclude=true, timeout_secs=120. This blocks until meaningful output arrives."
+    );
+  }
+  return (
+    "You're using filter_exclude but still polling frequently. " +
+    "Your filter pattern may not be matching the actual output. " +
+    "Try a broader pattern like: filter='\\\\.|\\\\d+%|running|progress|pending|⏳|waiting'. " +
+    "Wait for the FULL timeout before checking again."
+  );
 }
 
 export class BackgroundProcessManager extends EventEmitter<BackgroundProcessManagerEvents> {
@@ -2420,8 +2607,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // await to settle, then remains deliverable if its matched output was filtered out.
     using _readTracker = this.trackMonitorWakeBlockingRead(proc, filter, noteToolName);
 
-    // Track call count for polling detection
-    proc.getOutputCallCount++;
+    // Track call count for polling detection. Reading what a capped read left unread is paging,
+    // not polling, so it does not count.
+    if (!proc.incompleteLineBuffer.includes("\n")) proc.getOutputCallCount++;
     const callCount = proc.getOutputCallCount;
 
     log.debug(
@@ -2486,8 +2674,10 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       // When using filter_exclude, check if we have meaningful (non-excluded) output.
       // We only consider complete lines as "meaningful" here; fragments are buffered for the next read.
       const filteredOutput = applyFilter(completeLines);
+      // A split line's tail counts too: the read returns it whatever the filter says.
       const hasMeaningfulOutput = filterExclude
-        ? filteredOutput.trim().length > 0
+        ? filteredOutput.trim().length > 0 ||
+          (proc.unreadStartsWithKeptLine === true && completeLines.length > 0)
         : completeLines.length > 0;
 
       // Return immediately if:
@@ -2526,7 +2716,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         // so preserve them in the line buffer; otherwise the next getOutput() would resume past
         // this content and silently drop it. This matters now that task_await aborts a still-
         // pending bash read once min_completed is satisfied (not just on user interrupt).
-        proc.incompleteLineBuffer = previousBuffer + accumulatedRaw;
+        retainUnreadOutput(proc, previousBuffer + accumulatedRaw, accumulatedRaw);
         const elapsed_ms = Date.now() - startTime;
         return {
           success: true,
@@ -2578,19 +2768,17 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         }
       }
     }
-    const rawWithBuffer = previousBuffer + accumulatedRaw;
-    const allLines = rawWithBuffer.split("\n");
-    const hasTrailingNewline = rawWithBuffer.endsWith("\n");
-
-    // On process exit, include incomplete line; otherwise keep it buffered
-    const linesToReturn =
-      currentStatus !== "running"
-        ? allLines.filter((l) => l.length > 0) // Include all non-empty lines on exit
-        : allLines.slice(0, -1); // While running, drop the trailing fragment (buffered for next read)
-
-    // Update buffer for next call (clear on exit, keep incomplete line otherwise)
-    proc.incompleteLineBuffer =
-      currentStatus === "running" && !hasTrailingNewline ? allLines[allLines.length - 1] : "";
+    // On exit, include the incomplete line; otherwise keep it buffered. The page also leaves
+    // everything past the per-read cap buffered for the next call.
+    const page = takeBackgroundOutputPage(
+      previousBuffer + accumulatedRaw,
+      currentStatus !== "running",
+      proc.unreadStartsWithKeptLine === true,
+      (line) => !filterRegex || filterRegex.test(line) !== (filterExclude === true)
+    );
+    const unreadBytes = Buffer.byteLength(page.unread, "utf8");
+    retainUnreadOutput(proc, page.unread, accumulatedRaw);
+    proc.unreadStartsWithKeptLine = page.unreadStartsWithKeptLine;
 
     const shownThroughOffsetBeforeRead = proc.shownThroughOffset;
     const terminalStatusShownBeforeRead = proc.terminalStatusShownToAgent;
@@ -2632,10 +2820,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     }
 
     log.debug(
-      `BackgroundProcessManager.getOutput: read rawLen=${accumulatedRaw.length}, completeLines=${linesToReturn.length}`
+      `BackgroundProcessManager.getOutput: read rawLen=${accumulatedRaw.length}, returnedChars=${page.output.length}, capped=${page.capped}`
     );
-
-    const filteredOutput = applyFilter(linesToReturn);
 
     if (
       proc.shownThroughOffset > shownThroughOffsetBeforeRead ||
@@ -2653,35 +2839,16 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       });
     }
 
-    // Suggest filter_exclude if polling too frequently on a running process
-    const shouldSuggestFilterExclude =
-      callCount >= 3 && !filterExclude && currentStatus === "running";
-
-    // Suggest better pattern if using filter_exclude but still polling frequently
-    const shouldSuggestBetterPattern =
-      callCount >= 3 && filterExclude && currentStatus === "running";
-
     const pollingToolName = noteToolName ?? "bash_output";
-
-    let note: string | undefined;
-    if (shouldSuggestFilterExclude) {
-      note =
-        `STOP POLLING. You've called ${pollingToolName} 3+ times on this process. ` +
-        "This wastes tokens and clutters the conversation. " +
-        "Instead, make ONE call with: filter='⏳|progress|waiting|\\\\\\.\\\\\\.\\\\\\.', " +
-        "filter_exclude=true, timeout_secs=120. This blocks until meaningful output arrives.";
-    } else if (shouldSuggestBetterPattern) {
-      note =
-        "You're using filter_exclude but still polling frequently. " +
-        "Your filter pattern may not be matching the actual output. " +
-        "Try a broader pattern like: filter='\\\\.|\\\\d+%|running|progress|pending|⏳|waiting'. " +
-        "Wait for the FULL timeout before checking again.";
-    }
+    // A capped read must say how to read the rest; polling advice would contradict it.
+    const note = page.capped
+      ? formatCappedReadNote(processId, unreadBytes, pollingToolName, filter, filterExclude)
+      : formatPollingNote(callCount, filterExclude, currentStatus === "running", pollingToolName);
 
     return {
       success: true,
       status: currentStatus,
-      output: filteredOutput,
+      output: page.output,
       exitCode:
         currentStatus !== "running"
           ? ((await this.getProcess(processId))?.exitCode ?? undefined)

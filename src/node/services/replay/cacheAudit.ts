@@ -186,15 +186,22 @@ export interface StepPrefixAudit {
  * the provider re-processes the conversation from the first differing block
  * uncached. The turn envelope comparison above only sees prefix inputs; this
  * also catches a rebuild that changes history bytes (lost step boundaries,
- * truncated tool results). Each provider and model keeps its own baseline, like
+ * truncated tool results). Each route and model keeps its own baseline, like
  * the runtime monitor, so Sonnet -> Opus -> Sonnet compares the two Sonnet
  * requests. Pairs across a context epoch change are not compared, and a side
  * run (compaction) is skipped and resets every baseline. A non-Anthropic step is skipped and keeps the last Anthropic
  * baseline, as the runtime monitor (which observes only Anthropic wires) does.
+ * With recorded wire facts (DevToolsStep.promptCacheWire), steps run in the order
+ * their OK responses arrived, the TTL runs from that time, and a step without an
+ * OK response or without cache markers is skipped, all as the monitor does.
  * A pair with a request the fingerprint does not model (`unsupported`) is not
  * counted, and that request becomes the baseline.
  */
-/** AI SDK Anthropic provider ids start with "anthropic" (e.g. "anthropic.messages"). */
+/**
+ * Legacy check for steps without a wire record: the AI SDK provider id starts with "anthropic"
+ * for the Anthropic provider (e.g. "anthropic.messages"). A wire record proves an Anthropic
+ * wire by itself (see isMonitoredAnthropicStep).
+ */
 function isAnthropicStep(step: RecordedStepRequest): boolean {
   return step.provider?.startsWith("anthropic") === true;
 }
@@ -266,6 +273,78 @@ function stepCacheTtlMs(step: RecordedStepRequest): number {
   return markable.some(isHourMarker) ? ONE_HOUR_MS : FIVE_MINUTES_MS;
 }
 
+/**
+ * When the runtime monitor observed the step: the time its OK response arrived, else (older
+ * logs, non-Anthropic wires) its start time. NaN when unreadable.
+ */
+function stepObservedAtMs(step: RecordedStepRequest): number {
+  return Date.parse(step.promptCacheWire?.observedAt ?? step.startedAt);
+}
+
+/**
+ * Whether the runtime monitor observed this step on an Anthropic wire. A wire record decides:
+ * only the Anthropic cache wrapper writes one, also behind SDKs that report another provider
+ * id (the mux-gateway SDK reports "gateway"), and the monitor observes a request only once it
+ * was answered OK with cache markers injected. One that failed before, got an error status, or
+ * ran with caching off neither created nor broke a cache entry. Older logs carry no record:
+ * their Anthropic steps stay audited.
+ */
+function isMonitoredAnthropicStep(step: RecordedStepRequest): boolean {
+  const wire = step.promptCacheWire;
+  if (wire == null) return isAnthropicStep(step);
+  return wire.dispatched && wire.cacheMarkersInjected && wire.observedAt != null;
+}
+
+/**
+ * Requests compare only within one route, endpoint and effective model, like the monitor's
+ * baseline key. Older logs have no route: they key by the AI SDK provider id and model id.
+ * Logs from before the endpoint was recorded key it as empty.
+ */
+function baselineKeyOf(step: RecordedStepRequest): string {
+  const wire = step.promptCacheWire;
+  return wire != null
+    ? `route\u0000${wire.route}\u0000${wire.endpoint ?? ""}\u0000${wire.modelString}`
+    : `provider\u0000${step.provider ?? ""}\u0000${step.modelId}`;
+}
+
+interface ObservationSortKey {
+  step: RecordedStepRequest;
+  /** Position in the log: the last tie-breaker, and the whole order for older logs. */
+  index: number;
+  at: number;
+  /** Process-wide observation counter (DevToolsPromptCacheWire.observedSeq), when recorded. */
+  seq: number | undefined;
+}
+
+/**
+ * Observation time, then the observation counter for responses in the same millisecond,
+ * then the log order (older logs without a counter, unreadable times).
+ */
+function compareObservation(a: ObservationSortKey, b: ObservationSortKey): number {
+  const delta = a.at - b.at;
+  if (!Number.isNaN(delta) && delta !== 0) return delta;
+  if (a.seq != null && b.seq != null && a.seq !== b.seq) return a.seq - b.seq;
+  return a.index - b.index;
+}
+
+/**
+ * Steps in the order the monitor observed them. Overlapping runs can get their OK responses
+ * in another order than they started (the log order). Logs without observation times keep
+ * the log order.
+ */
+function inObservationOrder(steps: readonly RecordedStepRequest[]): RecordedStepRequest[] {
+  if (!steps.some((step) => step.promptCacheWire?.observedAt != null)) return [...steps];
+  return steps
+    .map((step, index) => ({
+      step,
+      index,
+      at: stepObservedAtMs(step),
+      seq: step.promptCacheWire?.observedSeq,
+    }))
+    .sort(compareObservation)
+    .map(({ step }) => step);
+}
+
 function wireOptionsFromStep(step: RecordedStepRequest): Record<string, unknown> {
   const providerOptions = isRecord(step.providerOptions) ? step.providerOptions : {};
   const anthropic = isRecord(providerOptions.anthropic) ? providerOptions.anthropic : {};
@@ -293,7 +372,7 @@ export function auditStepPrefixes(
   // Keyed by provider and model: a model switch must not discard the other model's
   // baseline while its cache entry is still live.
   const baselines = new Map<string, { step: RecordedStepRequest; blocks: PromptCacheBlock[] }>();
-  for (const step of steps) {
+  for (const step of inObservationOrder(steps)) {
     if (isIgnored(step)) continue;
     auditedSteps++;
     if (isSideRun(step)) {
@@ -302,8 +381,9 @@ export function auditStepPrefixes(
     }
     // Block order and normalization are Anthropic's, like the runtime detector, which
     // observes only Anthropic wires: other providers neither break nor replace the baseline.
-    if (!isAnthropicStep(step)) continue;
-    const baselineKey = `${step.provider ?? ""}\u0000${step.modelId}`;
+    // Neither does a request the monitor did not observe.
+    if (!isMonitoredAnthropicStep(step)) continue;
+    const baselineKey = baselineKeyOf(step);
     let previous = baselines.get(baselineKey);
     // `/clear`, "start here" or a rollover replaced the context: a new baseline, no break.
     // Runs from older binaries carry no epoch and keep the old behavior.
@@ -314,22 +394,24 @@ export function auditStepPrefixes(
     ) {
       previous = undefined;
     }
-    // The previous step's cache entry expired before this one started: cold by time, like the
-    // runtime monitor, so start a new baseline without a break. An unreadable time compares.
+    // The previous step's cache entry expired before this one was observed: cold by time, like
+    // the runtime monitor, so start a new baseline without a break. An unreadable time compares.
     if (
       previous != null &&
-      Date.parse(step.startedAt) - Date.parse(previous.step.startedAt) >
-        stepCacheTtlMs(previous.step)
+      stepObservedAtMs(step) - stepObservedAtMs(previous.step) > stepCacheTtlMs(previous.step)
     ) {
       previous = undefined;
     }
     // The DevTools record is the AI SDK prompt (system messages inline), the
     // same shape the gateway wire carries.
-    const blocks = fingerprintAnthropicRequest({
-      tools: step.tools,
-      prompt: step.prompt,
-      ...wireOptionsFromStep(step),
-    });
+    const blocks = fingerprintAnthropicRequest(
+      {
+        tools: step.tools,
+        prompt: step.prompt,
+        ...wireOptionsFromStep(step),
+      },
+      { modelId: step.modelId }
+    );
     if (previous != null) {
       const comparison = comparePromptCachePrefix(previous.blocks, blocks);
       if (comparison.kind !== "unsupported") comparedPairs++;
