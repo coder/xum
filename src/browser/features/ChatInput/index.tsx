@@ -1974,7 +1974,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     const commandFileParts = chatAttachmentsToFileParts(attachments, { validate: true });
     const asyncCommandToken = ++asyncCommandTokenRef.current;
     const commandEnv: SlashCommandEnv = {
-      api,
+      // Commands report "Not connected to server" themselves when there is no live client.
+      api: liveApi,
       aiScopeId: sendOptionsScopeId,
       variant,
       workspaceId: commandWorkspaceId,
