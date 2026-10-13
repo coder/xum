@@ -15,13 +15,23 @@ describe("normalizeSkillPaths", () => {
     expect(normalizeSkillPaths(undefined)).toEqual({ ok: true, paths: undefined });
   });
 
-  test("a comma inside a [...] class is rejected in the string form, kept in the list form", () => {
-    for (const raw of ["[),],*.ts", "[]a,],*.ts", "src/[,]x.ts, *.ts"]) {
+  test("the comma-string form rejects [ and ( (use the list form); the list form keeps them", () => {
+    for (const raw of ["[),],*.ts", "[{],*.ts", "*.@(ts,tsx)", "src/[ab].ts"]) {
       const result = normalizeSkillPaths(raw);
       expect(result.ok).toBe(false);
       if (!result.ok) expect(result.error).toContain("list form");
     }
-    expect(normalizeSkillPaths(["src/[,]x.ts"])).toEqual({ ok: true, paths: ["src/[,]x.ts"] });
+    expect(normalizeSkillPaths(["src/[,]x.ts", "[{]", "*.@(ts|tsx)"])).toEqual({
+      ok: true,
+      paths: ["src/[,]x.ts", "[{]", "*.@(ts|tsx)"],
+    });
+  });
+
+  test("allows negative extglobs and root files with a colon", () => {
+    expect(normalizeSkillPaths(["!(*.test).ts", "a:b.ts"])).toEqual({
+      ok: true,
+      paths: ["!(*.test).ts", "a:b.ts"],
+    });
   });
 
   test("list entries keep their whitespace; string fragments are trimmed", () => {

@@ -24,12 +24,17 @@ export type NormalizeSkillPathsResult =
   | { ok: false; error: string };
 
 /**
- * Split a comma-separated `paths` string. Only commas inside `{...}` (`*.{ts,tsx}`)
- * belong to a glob. A comma inside a `[...]` class leaves an unclosed `[` in a
- * fragment, which validation then rejects with a hint to use the list form, so a
- * class is never split silently.
+ * The comma-separated string form supports plain globs and `{a,b}` alternation only.
+ * A comma inside a `[...]` class or an `@(...)` extglob is ambiguous with the pattern
+ * separator, so those patterns must use the list form (rejected up front, never split
+ * silently).
  */
-function splitTopLevelCommas(value: string): string[] {
+function splitCommaString(value: string): string[] | { error: string } {
+  if (/[[(]/.test(value)) {
+    return {
+      error: "the comma-separated form does not support '[' or '(' in patterns; use the list form",
+    };
+  }
   const parts = [""];
   let braceDepth = 0;
   for (const char of value) {
@@ -61,13 +66,14 @@ const SKILL_PATH_SHAPE_RULES: ReadonlyArray<(pattern: string) => string | undefi
       ? `pattern '${p}' must use '/' as the path separator (backslashes are not supported)`
       : undefined,
   (p) =>
-    p.startsWith("/") || /^[A-Za-z]:/.test(p)
+    p.startsWith("/") || /^[A-Za-z]:\//.test(p)
       ? `pattern '${p}' must be relative to the workspace root, not absolute`
       : undefined,
   // Patterns are OR-ed (any match activates the skill), so a negated glob would
   // match every other file and make the skill global. Reject it instead.
+  // `!(...)` is a negative extglob (an include pattern), not whole-pattern negation.
   (p) =>
-    p.startsWith("!")
+    p.startsWith("!") && !p.startsWith("!(")
       ? `pattern '${p}' must not be negated (patterns are combined with OR)`
       : undefined,
   // Tool paths are normalized, so a '.' or '..' segment could never match.
@@ -99,19 +105,10 @@ function validateSkillPathPattern(pattern: string): string | undefined {
   return undefined;
 }
 
-/** The first invalid pattern's error, with a list-form hint for split `[...]` classes. */
-function firstPatternError(
-  entries: readonly string[],
-  fromCommaString: boolean
-): string | undefined {
+function firstPatternError(entries: readonly string[]): string | undefined {
   for (const entry of entries) {
     const error = validateSkillPathPattern(entry);
-    if (error !== undefined) {
-      const splitClass = fromCommaString && entry.includes("[");
-      return splitClass
-        ? `${error} (a comma inside [...] splits the comma-separated form; use the list form)`
-        : error;
-    }
+    if (error !== undefined) return error;
   }
   return undefined;
 }
@@ -127,7 +124,11 @@ export function normalizeSkillPaths(raw: string | string[] | undefined): Normali
 
   // List entries are taken as written (whitespace is valid in file names); only the
   // fragments of a comma-separated string are trimmed.
-  const entries = (typeof raw === "string" ? splitTopLevelCommas(raw) : raw).map((entry) =>
+  const split = typeof raw === "string" ? splitCommaString(raw) : raw;
+  if (!Array.isArray(split)) {
+    return { ok: false, error: split.error };
+  }
+  const entries = split.map((entry) =>
     // A leading "./" is a common way to spell "relative to the root"; matching sees
     // paths without it.
     entry.replace(/^(\.\/)+/, "")
@@ -139,7 +140,7 @@ export function normalizeSkillPaths(raw: string | string[] | undefined): Normali
     return { ok: false, error: `at most ${MAX_SKILL_PATHS} patterns are allowed` };
   }
 
-  const error = firstPatternError(entries, typeof raw === "string");
+  const error = firstPatternError(entries);
   if (error !== undefined) {
     return { ok: false, error };
   }
