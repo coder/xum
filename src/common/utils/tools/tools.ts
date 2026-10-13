@@ -561,28 +561,25 @@ function markReadSkillSurfaced(
   }
 }
 
+/** The slice of an AI SDK tool this wrapper reads and replaces (no `any` casts). */
+interface ExecutableTool {
+  execute?: (args: unknown, options: unknown) => unknown;
+}
+
 function wrapToolExecuteWithPathSkills(
   toolName: string,
   baseTool: Tool,
   activation: PathSkillActivation
 ): Tool {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any, local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-  const baseToolRecord = baseTool as any as Record<string, unknown>;
-  const originalExecute = baseToolRecord.execute;
-
-  if (typeof originalExecute !== "function") {
+  const executeFn = (baseTool as ExecutableTool).execute;
+  if (typeof executeFn !== "function") {
     return baseTool;
   }
-
-  const executeFn = originalExecute as (this: unknown, args: unknown, options: unknown) => unknown;
 
   // Avoid mutating cached tools in place; repeated getToolsForModel() calls must not
   // stack wrappers.
   const wrappedTool = cloneToolPreservingDescriptors(baseTool);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any, local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-  const wrappedToolRecord = wrappedTool as any as Record<string, unknown>;
-
-  wrappedToolRecord.execute = async (args: unknown, options: unknown) => {
+  (wrappedTool as ExecutableTool).execute = async (args: unknown, options: unknown) => {
     const result: unknown = await executeFn.call(baseTool, args, options);
     // Matching never fails the tool call: on error the original result is returned.
     try {
