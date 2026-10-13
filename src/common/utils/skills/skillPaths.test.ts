@@ -15,6 +15,14 @@ describe("normalizeSkillPaths", () => {
     expect(normalizeSkillPaths(undefined)).toEqual({ ok: true, paths: undefined });
   });
 
+  test("a comma or closer inside a [...] class stays in the pattern", () => {
+    expect(normalizeSkillPaths("[),],*.ts")).toEqual({ ok: true, paths: ["[),]", "*.ts"] });
+    expect(normalizeSkillPaths("src/[,]x.ts, *.{ts,tsx}")).toEqual({
+      ok: true,
+      paths: ["src/[,]x.ts", "*.{ts,tsx}"],
+    });
+  });
+
   test.each([
     ["unclosed bracket", ["src/[abc"], "src/[abc"],
     ["empty entry", "**/*.ts,,", "empty"],
@@ -23,6 +31,7 @@ describe("normalizeSkillPaths", () => {
     ["absolute windows", ["C:/src/*.ts"], "C:/src/*.ts"],
     ["parent segment", ["src/../../*.ts"], ".."],
     ["negated pattern", ["src/**/*.ts", "!src/**/*.test.ts"], "!src/**/*.test.ts"],
+    ["backslash separator", ["src\\**\\*.ts"], "use '/'"],
   ])("rejects %s with an error naming the problem", (_label, raw, fragment) => {
     const result = normalizeSkillPaths(raw);
     expect(result.ok).toBe(false);

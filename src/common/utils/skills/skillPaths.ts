@@ -23,28 +23,34 @@ export type NormalizeSkillPathsResult =
   | { ok: true; paths: string[] | undefined }
   | { ok: false; error: string };
 
-const BRACKET_DEPTH_DELTA: Record<string, number> = {
-  "{": 1,
-  "[": 1,
-  "(": 1,
-  "}": -1,
-  "]": -1,
-  ")": -1,
-};
+const GROUP_CLOSERS: Record<string, string> = { "{": "}", "(": ")" };
+
+/** The open-delimiter stack after `char`: a `[...]` class swallows every char but `]`. */
+function nextGroupStack(stack: string[], char: string): void {
+  const expected = stack[stack.length - 1];
+  if (expected === "]") {
+    if (char === "]") stack.pop();
+    return;
+  }
+  if (char === "[") stack.push("]");
+  else if (GROUP_CLOSERS[char] !== undefined) stack.push(GROUP_CLOSERS[char]);
+  else if (char === expected) stack.pop();
+}
 
 /**
- * Split a comma-separated `paths` string. Commas inside `{}`/`[]`/`()` belong to the
- * glob (`*.{ts,tsx}`), so only top-level commas separate patterns.
+ * Split a comma-separated `paths` string. Commas inside `{}`/`()` groups or a `[...]`
+ * class belong to the glob (`*.{ts,tsx}`, `[,]`), so only top-level commas separate
+ * patterns. Backslashes are rejected later, so no escape handling is needed here.
  */
 function splitTopLevelCommas(value: string): string[] {
   const parts = [""];
-  let depth = 0;
+  const stack: string[] = [];
   for (const char of value) {
-    if (char === "," && depth === 0) {
+    if (char === "," && stack.length === 0) {
       parts.push("");
       continue;
     }
-    depth = Math.max(0, depth + (BRACKET_DEPTH_DELTA[char] ?? 0));
+    nextGroupStack(stack, char);
     parts[parts.length - 1] += char;
   }
   return parts;
@@ -58,7 +64,12 @@ function validateSkillPathShape(pattern: string): string | undefined {
   if (pattern.length > MAX_SKILL_PATH_LENGTH) {
     return `pattern '${pattern.slice(0, 40)}…' is longer than ${MAX_SKILL_PATH_LENGTH} characters`;
   }
-  if (/^[/\\]/.test(pattern) || /^[A-Za-z]:/.test(pattern)) {
+  // A backslash cannot be both a glob escape and a Windows separator, so patterns use
+  // '/' only (match a literal '[' with '[[]').
+  if (pattern.includes("\\")) {
+    return `pattern '${pattern}' must use '/' as the path separator (backslashes are not supported)`;
+  }
+  if (pattern.startsWith("/") || /^[A-Za-z]:/.test(pattern)) {
     return `pattern '${pattern}' must be relative to the workspace root, not absolute`;
   }
   // Patterns are OR-ed (any match activates the skill), so a negated glob would
@@ -66,7 +77,7 @@ function validateSkillPathShape(pattern: string): string | undefined {
   if (pattern.startsWith("!")) {
     return `pattern '${pattern}' must not be negated (patterns are combined with OR)`;
   }
-  if (pattern.split(/[/\\]/).includes("..")) {
+  if (pattern.split("/").includes("..")) {
     return `pattern '${pattern}' must not contain '..' segments`;
   }
   return undefined;
