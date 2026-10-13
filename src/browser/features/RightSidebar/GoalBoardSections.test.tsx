@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 
 import { installDom } from "../../../../tests/ui/dom";
@@ -65,6 +65,10 @@ function createBoardApi(options: BoardApiOptions = {}) {
     return Promise.resolve(value);
   };
   const api: APIClient = createTestApiClient({
+    // The goal-defaults load never settles: the sections under test do not
+    // read the defaults, and a load that never resolves leaves no React state
+    // update to race the assertions or teardown.
+    config: { getConfig: () => new Promise<never>(() => undefined) },
     workspace: {
       archiveGoal: (input) => respond("archiveGoal", input, undefined),
       promoteUpcomingGoal: (input) => respond("promoteUpcomingGoal", input, null),
@@ -75,7 +79,7 @@ function createBoardApi(options: BoardApiOptions = {}) {
   return { api, calls, release: () => release() };
 }
 
-async function renderBoard(board: GoalBoardSnapshot, api: APIClient) {
+function renderBoard(board: GoalBoardSnapshot, api: APIClient) {
   const onMutated = mock(() => undefined);
   const wrapper = (props: { children: ReactNode }) => (
     <APIContext.Provider
@@ -94,9 +98,6 @@ async function renderBoard(board: GoalBoardSnapshot, api: APIClient) {
     <GoalBoardSections workspaceId={WORKSPACE_ID} board={board} onMutated={onMutated} />,
     { wrapper }
   );
-  // Let the goal-defaults load settle inside act, so its state update does not
-  // land between assertions.
-  await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
   return { ...view, onMutated };
 }
 
@@ -134,15 +135,15 @@ describe("GoalBoardSections", () => {
     cleanupDom = null;
   });
 
-  test("an empty board shows only the queue button", async () => {
-    const view = await renderBoard({ entries: [] }, createBoardApi().api);
+  test("an empty board shows only the queue button", () => {
+    const view = renderBoard({ entries: [] }, createBoardApi().api);
 
     expect(view.getByLabelText("Queue another goal")).toBeTruthy();
     expect(view.queryByText("Upcoming")).toBeNull();
     expect(view.queryByText("Completed")).toBeNull();
   });
 
-  test("upcoming starts open; completed and archived start closed and hide when empty", async () => {
+  test("upcoming starts open; completed and archived start closed and hide when empty", () => {
     const board = {
       entries: [
         entry("upcoming", { objective: "Write docs", budgetCents: 500 }),
@@ -150,7 +151,7 @@ describe("GoalBoardSections", () => {
         entry("complete", { objective: "Old work", costCents: 1234 }),
       ],
     };
-    const view = await renderBoard(board, createBoardApi().api);
+    const view = renderBoard(board, createBoardApi().api);
 
     expect(sectionToggle(view, "Upcoming").getAttribute("aria-expanded")).toBe("true");
     expect(sectionToggle(view, "Upcoming").textContent).toContain("(2)");
@@ -171,7 +172,7 @@ describe("GoalBoardSections", () => {
   test("promote and remove send the goal id, then refresh the board", async () => {
     const upcoming = entry("upcoming", { objective: "Next up" });
     const { api, calls } = createBoardApi();
-    const view = await renderBoard({ entries: [upcoming] }, api);
+    const view = renderBoard({ entries: [upcoming] }, api);
 
     fireEvent.click(view.getByLabelText("Promote Next up"));
     await waitFor(() => expect(view.onMutated).toHaveBeenCalledTimes(1));
@@ -190,7 +191,7 @@ describe("GoalBoardSections", () => {
     const failing = createBoardApi({
       failures: { promoteUpcomingGoal: new Error("Goal is busy") },
     });
-    const view = await renderBoard({ entries: [upcoming] }, failing.api);
+    const view = renderBoard({ entries: [upcoming] }, failing.api);
 
     fireEvent.click(view.getByLabelText("Promote Next up"));
     await waitFor(() => expect(alertText(view)).toBe("Goal is busy"));
@@ -205,7 +206,7 @@ describe("GoalBoardSections", () => {
   test("a rejection without an Error message falls back to the action's own text", async () => {
     const upcoming = entry("upcoming", { objective: "Next up" });
     const failing = createBoardApi({ failures: { archiveGoal: "nope" } });
-    const view = await renderBoard({ entries: [upcoming] }, failing.api);
+    const view = renderBoard({ entries: [upcoming] }, failing.api);
 
     fireEvent.click(view.getByLabelText("Remove Next up"));
     await waitFor(() => expect(alertText(view)).toBe("Failed to remove goal."));
@@ -214,7 +215,7 @@ describe("GoalBoardSections", () => {
   test("completed goals archive, and a failure shows its reason", async () => {
     const done = entry("complete", { objective: "Shipped" });
     const ok = createBoardApi();
-    const view = await renderBoard({ entries: [done] }, ok.api);
+    const view = renderBoard({ entries: [done] }, ok.api);
     fireEvent.click(sectionToggle(view, "Completed"));
 
     fireEvent.click(view.getByLabelText("Archive Shipped"));
@@ -230,7 +231,7 @@ describe("GoalBoardSections", () => {
     const failing = createBoardApi({
       failures: { archiveGoal: new Error("Locked") },
     });
-    const failedView = await renderBoard({ entries: [done] }, failing.api);
+    const failedView = renderBoard({ entries: [done] }, failing.api);
     fireEvent.click(sectionToggle(failedView, "Completed"));
     fireEvent.click(failedView.getByLabelText("Archive Shipped"));
     await waitFor(() => expect(alertText(failedView)).toBe("Locked"));
@@ -240,7 +241,7 @@ describe("GoalBoardSections", () => {
   test("archived goals revive, and a failure without a message shows the fallback", async () => {
     const stashed = entry("archived", { objective: "Parked" });
     const ok = createBoardApi();
-    const view = await renderBoard({ entries: [stashed] }, ok.api);
+    const view = renderBoard({ entries: [stashed] }, ok.api);
     fireEvent.click(sectionToggle(view, "Archived"));
 
     fireEvent.click(view.getByLabelText("Revive Parked"));
@@ -256,31 +257,31 @@ describe("GoalBoardSections", () => {
     const failing = createBoardApi({
       failures: { reviveArchivedGoal: new Error("") },
     });
-    const failedView = await renderBoard({ entries: [stashed] }, failing.api);
+    const failedView = renderBoard({ entries: [stashed] }, failing.api);
     fireEvent.click(sectionToggle(failedView, "Archived"));
     fireEvent.click(failedView.getByLabelText("Revive Parked"));
     await waitFor(() => expect(alertText(failedView)).toBe("Failed to revive."));
   });
 
   describe("upcoming row editor", () => {
-    async function openEditor(goal: Partial<GoalRecordV1>, options?: BoardApiOptions) {
+    function openEditor(goal: Partial<GoalRecordV1>, options?: BoardApiOptions) {
       const upcoming = entry("upcoming", { objective: "Draft plan", ...goal });
       const boardApi = createBoardApi(options);
-      const view = await renderBoard({ entries: [upcoming] }, boardApi.api);
+      const view = renderBoard({ entries: [upcoming] }, boardApi.api);
       fireEvent.click(view.getByLabelText(`Edit ${upcoming.goal.objective}`));
       return { ...boardApi, view, goalId: upcoming.goal.goalId };
     }
 
-    test("prefills the goal's current values", async () => {
-      const { view } = await openEditor({ budgetCents: 500, turnCap: 10 });
+    test("prefills the goal's current values", () => {
+      const { view } = openEditor({ budgetCents: 500, turnCap: 10 });
 
       expect((view.getByLabelText("Goal objective") as HTMLInputElement).value).toBe("Draft plan");
       expect((view.getByLabelText("Goal budget") as HTMLInputElement).value).toBe("5.00");
       expect((view.getByLabelText("Goal turn cap") as HTMLInputElement).value).toBe("10");
     });
 
-    test("rejects invalid input locally without calling the backend", async () => {
-      const { view, calls } = await openEditor({});
+    test("rejects invalid input locally without calling the backend", () => {
+      const { view, calls } = openEditor({});
       const save = view.getByText("Save");
 
       typeInto(view.getByLabelText("Goal objective"), "   ");
@@ -301,8 +302,8 @@ describe("GoalBoardSections", () => {
       expect(view.getByLabelText("Goal objective")).toBeTruthy();
     });
 
-    test("closes without a backend call when nothing changed", async () => {
-      const { view, calls } = await openEditor({ budgetCents: 500, turnCap: 10 });
+    test("closes without a backend call when nothing changed", () => {
+      const { view, calls } = openEditor({ budgetCents: 500, turnCap: 10 });
 
       fireEvent.click(view.getByText("Save"));
 
@@ -312,7 +313,7 @@ describe("GoalBoardSections", () => {
     });
 
     test("sends only the changed fields, with blank meaning no limit", async () => {
-      const { view, calls, goalId } = await openEditor({
+      const { view, calls, goalId } = openEditor({
         budgetCents: 500,
         turnCap: 10,
       });
@@ -340,7 +341,7 @@ describe("GoalBoardSections", () => {
     });
 
     test("parses a new budget and turn cap", async () => {
-      const { view, calls } = await openEditor({});
+      const { view, calls } = openEditor({});
 
       typeInto(view.getByLabelText("Goal budget"), "$7.25");
       typeInto(view.getByLabelText("Goal turn cap"), "3");
@@ -352,7 +353,7 @@ describe("GoalBoardSections", () => {
     });
 
     test("disables Save while the update is in flight", async () => {
-      const { view, release } = await openEditor({}, { hold: "updateUpcomingGoal" });
+      const { view, release } = openEditor({}, { hold: "updateUpcomingGoal" });
 
       typeInto(view.getByLabelText("Goal turn cap"), "4");
       fireEvent.click(view.getByText("Save"));
@@ -366,10 +367,7 @@ describe("GoalBoardSections", () => {
     });
 
     test("stays open and shows the backend reason when the update fails", async () => {
-      const { view } = await openEditor(
-        {},
-        { failures: { updateUpcomingGoal: new Error("Too long") } }
-      );
+      const { view } = openEditor({}, { failures: { updateUpcomingGoal: new Error("Too long") } });
 
       typeInto(view.getByLabelText("Goal objective"), "A much longer plan");
       fireEvent.click(view.getByText("Save"));
@@ -381,8 +379,8 @@ describe("GoalBoardSections", () => {
       expect(view.onMutated).not.toHaveBeenCalled();
     });
 
-    test("Escape and Cancel discard the edit", async () => {
-      const { view, calls } = await openEditor({});
+    test("Escape and Cancel discard the edit", () => {
+      const { view, calls } = openEditor({});
 
       typeInto(view.getByLabelText("Goal objective"), "Changed");
       fireEvent.keyDown(view.getByLabelText("Goal objective"), {
