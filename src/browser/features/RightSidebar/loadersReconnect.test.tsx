@@ -46,6 +46,7 @@ let answerChatInstructions: () => Promise<unknown>;
 let answerOverride: () => Promise<unknown>;
 let savedOverrides: unknown[] = [];
 let savedChatInstructions: Array<{ content: string; enabled: boolean }> = [];
+let failChatSave: Error | null = null;
 
 function board(goalId: string) {
   return { entries: [{ section: "upcoming", goal: { goalId } }] };
@@ -66,6 +67,7 @@ function serverOverrides(): TestApiOverrides<APIClient> {
       getInstructions: () => answerInstructions(),
       getAdditionalSystemContext: () => answerChatInstructions(),
       setAdditionalSystemContext: (input: { content: string; enabled: boolean }) => {
+        if (failChatSave) return Promise.reject(failChatSave);
         savedChatInstructions.push({ content: input.content, enabled: input.enabled });
         return Promise.resolve({ content: input.content, enabled: input.enabled });
       },
@@ -131,6 +133,7 @@ describe.each([...GAP_MODES])("loaded panes across a dropped connection (%s)", (
     harness = createConnectionHarness(mode, serverOverrides);
     savedOverrides = [];
     savedChatInstructions = [];
+    failChatSave = null;
   });
 
   afterEach(() => {
@@ -239,6 +242,7 @@ describe.each([...GAP_MODES])("edits and navigation while reconnecting (%s)", (m
     harness = createConnectionHarness(mode, serverOverrides);
     savedOverrides = [];
     savedChatInstructions = [];
+    failChatSave = null;
   });
 
   afterEach(() => {
@@ -266,6 +270,21 @@ describe.each([...GAP_MODES])("edits and navigation while reconnecting (%s)", (m
     );
     expect(view.result.current.content).toBe("be kind");
     expect(view.result.current.error).toBeNull();
+  });
+
+  test("after a failed save, a reconnect shows what the server stored", async () => {
+    const workspaceId = `ws-failed-save-${mode}`;
+    answerChatInstructions = () => Promise.resolve({ content: "be brief", enabled: true });
+    const view = renderHook(() => useChatInstructions(workspaceId), { wrapper: Wrapper });
+    await waitFor(() => expect(view.result.current.content).toBe("be brief"));
+
+    failChatSave = new Error("disk full");
+    act(() => view.result.current.setContent("be kind"));
+    await waitFor(() => expect(view.result.current.error).toBe("disk full"));
+
+    await drop();
+    await reconnect();
+    await waitFor(() => expect(view.result.current.content).toBe("be brief"));
   });
 
   test("a goal-defaults edit made while reconnecting reaches the next client", async () => {

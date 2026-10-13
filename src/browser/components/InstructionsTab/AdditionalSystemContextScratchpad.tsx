@@ -96,7 +96,12 @@ function useSavingIndicator() {
  * Otherwise it would look saved, and the reload would skip it as a local edit, but the backend
  * would never get it.
  */
-function useChatInstructionsSave(api: APIClient | null, setError: (error: string | null) => void) {
+function useChatInstructionsSave(
+  api: APIClient | null,
+  setError: (error: string | null) => void,
+  /** The queue settled with nothing left for a later client: the next load may replace the text. */
+  onSettled: () => void
+) {
   const { savingVisible, startSaving, hideSaving, mountedRef } = useSavingIndicator();
   // The workspace whose latest edit no client has received yet.
   const unsentWorkspaceIdRef = useRef<string | null>(null);
@@ -118,10 +123,11 @@ function useChatInstructionsSave(api: APIClient | null, setError: (error: string
         onIdle: () => {
           if (!mountedRef.current) return;
           hideSaving();
+          if (unsentWorkspaceIdRef.current !== workspaceId) onSettled();
         },
       });
     },
-    [setError, startSaving, hideSaving, mountedRef]
+    [setError, startSaving, hideSaving, mountedRef, onSettled]
   );
 
   // A new client (after a reconnect) gets the edit the last one did not, as the store holds it now.
@@ -148,8 +154,13 @@ export function useChatInstructions(workspaceId: string): ScratchpadState {
   const snapshot = useAdditionalSystemContextSnapshot(workspaceId);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const { savingVisible, save, hideSaving } = useChatInstructionsSave(api, setError);
+  // An edit the backend has not settled yet: a load must not replace it. A failed save settles
+  // it too, so a later reload shows what the backend stored.
   const dirtyRef = useRef(false);
+  const markSettled = useCallback(() => {
+    dirtyRef.current = false;
+  }, []);
+  const { savingVisible, save, hideSaving } = useChatInstructionsSave(api, setError, markSettled);
   // The workspace whose instructions the editor shows (loaded, or failed to load). A re-run for it
   // (a new API client after a reconnect) keeps the editor enabled and the user's edits: it does
   // not flash "Loading…" or take focus from the textarea.
