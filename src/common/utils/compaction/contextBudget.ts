@@ -183,6 +183,7 @@ function measureBudgetContent(
       | "output";
   }> = [{ value: result, kind }];
   while (stack.length > 0) {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     const entry = stack.pop()!;
     const value = entry.value;
     if (value == null) {

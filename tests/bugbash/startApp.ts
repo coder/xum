@@ -12,8 +12,8 @@
  * Steps:
  * 1. Create a temp root holding XUM_ROOT, HOME and a throwaway git repo.
  * 2. Start the server on a private port and seed it through the HTTP API: the demo project
- *    (trusted), one workspace with a few artifacts, onboarding marked seen, the artifacts
- *    experiment, and a fake Anthropic provider on a dead loopback port.
+ *    (trusted), one workspace with a few artifacts (one with stored versions), onboarding marked
+ *    seen, the artifacts experiment, and a fake Anthropic provider on a dead loopback port.
  * 3. Stop that server, then serve the same root on `--port`. e2e polls `--port` for readiness,
  *    so no explorer can open the app before seeding has finished.
  *
@@ -38,6 +38,7 @@
  */
 
 import { spawn, spawnSync, type ChildProcess } from "child_process";
+import { createHash } from "crypto";
 import * as fs from "fs";
 import * as net from "net";
 import * as os from "os";
@@ -375,7 +376,119 @@ async function seed(
     gitEnv,
     artifactsDir
   );
+  // An HTML artifact with in-page "#" links (repros/artifactsInPageLinks.e2e.ts). Dated an hour
+  // back so it lists last and the newest artifact stays the one the tab opens by default.
+  const guide = path.join(artifactsDir, "guide.html");
+  fs.writeFileSync(guide, GUIDE_ARTIFACT_HTML);
+  const anHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+  fs.utimesSync(guide, anHourAgo, anHourAgo);
+  await seedVersionedArtifact(base, xumRoot, workspaceId, artifactsDir);
   return workspaceId;
+}
+
+/** Contents, two tall sections with a link back to the top, and a status line its own script updates on scroll. */
+const GUIDE_ARTIFACT_HTML = `<!doctype html>
+<html>
+  <body>
+    <p id="status" style="position: fixed; top: 0; right: 8px">At the top</p>
+    <h1>Guide</h1>
+    <nav>
+      <a href="#setup">Setup</a>
+      <a href="#usage">Usage</a>
+    </nav>
+    <h2 id="setup" style="margin-top: 1500px">Setup</h2>
+    <h2 id="usage" style="margin-top: 1500px">Usage</h2>
+    <p style="margin-bottom: 1500px"><a href="#top">Back to top</a></p>
+    <script>
+      addEventListener("scroll", function () {
+        document.getElementById("status").textContent = scrollY > 0 ? "Scrolled" : "At the top";
+      });
+    </script>
+  </body>
+</html>
+`;
+
+/**
+ * Same id as getArtifactId (src/node/services/artifactVersionStore.ts): a slug plus a short hash
+ * of the exact path. The harness imports nothing from src/, so seedVersionedArtifact checks the
+ * result through the listVersions route instead of trusting this copy.
+ */
+function artifactId(relPath: string): string {
+  const slug = relPath
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^[-.]+|[-.]+$/g, "")
+    .slice(0, 60);
+  return `${slug || "artifact"}-${createHash("sha256").update(relPath).digest("hex").slice(0, 10)}`;
+}
+
+/** An interactive page: its checkboxes save through window.xum.setState. */
+function optionsPage(title: string): string {
+  return `<!doctype html><html><body><h1>${title}</h1>
+<label><input type="checkbox" id="lru"> LRU</label> <label><input type="checkbox" id="ttl"> TTL</label>
+<p id="saved"></p><script>
+const lru = document.getElementById("lru"), ttl = document.getElementById("ttl");
+const saved = document.getElementById("saved");
+const state = window.xum && window.xum.state;
+if (state) { lru.checked = !!state.lru; ttl.checked = !!state.ttl; }
+function show() { saved.textContent = "saved: " + JSON.stringify(window.xum ? window.xum.state : null); }
+function save() { window.xum.setState({ lru: lru.checked, ttl: ttl.checked }); show(); }
+lru.onchange = save; ttl.onchange = save; show();
+</script></body></html>
+`;
+}
+
+/**
+ * A published HTML artifact with two stored versions, so explorers can use the version menu and
+ * window.xum.setState without a model publishing anything (real mode has no agent tools). The
+ * index is in the format older builds wrote: v1 is a turn-end snapshot and the index keeps the
+ * old bookkeeping fields, so the run also covers reading old history.
+ */
+async function seedVersionedArtifact(
+  base: string,
+  xumRoot: string,
+  workspaceId: string,
+  artifactsDir: string
+): Promise<void> {
+  const relPath = "options.html";
+  const id = artifactId(relPath);
+  const dir = path.join(xumRoot, "sessions", workspaceId, "artifact-versions", id);
+  fs.mkdirSync(dir, { recursive: true });
+  const now = Date.now();
+  const versions = [
+    { title: "Options v1", label: null, source: "turn-end", at: now - 3_600_000 },
+    { title: "Options v2", label: "Options v2", source: "publish", at: now - 600_000 },
+  ].map((entry, i) => {
+    const bytes = Buffer.from(optionsPage(entry.title));
+    fs.writeFileSync(path.join(dir, `v${i + 1}`), bytes);
+    return {
+      version: i + 1,
+      label: entry.label,
+      source: entry.source,
+      createdAtMs: entry.at,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+      size: bytes.length,
+      path: relPath,
+      sourceModifiedMs: entry.at,
+    };
+  });
+  fs.writeFileSync(
+    path.join(dir, "index.json"),
+    JSON.stringify({ id, path: relPath, pin: null, lastPublishedAtMs: now - 600_000, versions })
+  );
+  // Dated back like guide.html, so the artifact the tab opens by default stays the same.
+  const live = path.join(artifactsDir, relPath);
+  fs.writeFileSync(live, optionsPage("Options v2"));
+  const anHourAgo = new Date(now - 60 * 60 * 1000);
+  fs.utimesSync(live, anHourAgo, anHourAgo);
+  const listed = await api<{ success: boolean; data?: { versions: unknown[] } }>(
+    base,
+    "artifacts/listVersions",
+    { workspaceId, path: relPath }
+  );
+  if (!listed.success || listed.data?.versions.length !== versions.length) {
+    fail(`seeded ${relPath} versions are not listed: ${JSON.stringify(listed).slice(0, 300)}`);
+  }
 }
 
 async function main(): Promise<void> {

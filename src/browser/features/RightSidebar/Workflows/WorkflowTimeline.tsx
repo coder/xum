@@ -367,6 +367,7 @@ const WorkflowStepRow: React.FC<WorkflowStepRowProps> = (props) => {
                     <div className="text-content-secondary text-[12.5px]">
                       <WorkflowLongText
                         markdown
+                        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
                         text={step.result!.reportMarkdown}
                         title={`${step.title} — report`}
                       />

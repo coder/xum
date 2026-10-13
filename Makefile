@@ -91,6 +91,7 @@ include fmt.mk
 .PHONY: all build dev start clean help
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
 .PHONY: lint lint-fix typecheck static-check static-check-full
+.PHONY: crap crap-check test-crap-scripts
 .PHONY: test-bugbash-repros test-bugbash-known-failures bugbash-sandbox-key bugbash-sandbox-image bugbash-sandbox-publish bug-bash-sandbox-recover bug-bash-sandbox-check test-bugbash-repros-sandbox
 .PHONY: test test-unit test-unit-ci test-integration test-watch test-coverage test-e2e test-e2e-perf perf-tape-replay smoke-test
 .PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
@@ -480,7 +481,7 @@ build/icon.png: docs/img/logo-white.svg scripts/generate-icons.ts
 # verification stay in static-check-full so local validation remains responsive.
 static-check: lint typecheck fmt-check check-startup-imports check-react-compiler check-code-docs-links check-test-routing check-test-seam-comments lint-shellcheck lint-hadolint ## Run fast local static checks
 
-static-check-full: static-check check-bench-agent test-bench-scripts check-docs-links ## Run the full CI static check suite
+static-check-full: static-check check-bench-agent test-bench-scripts test-crap-scripts check-docs-links ## Run the full CI static check suite
 
 # Harbor version for benchmark-terminal and the adapter tests below, so CI tests the
 # adapter against the same Harbor API the scheduled benchmark runs.
@@ -491,6 +492,36 @@ test-bench-scripts: ## Test the Terminal-Bench result checker and agent adapter 
 	@uv run --no-project --with pytest python -m pytest -q scripts/check_tbench_results_test.py
 	@# Harbor requires Python >=3.12 and CI's system python is older; uv fetches a managed 3.12 if needed.
 	@uv run --no-project --python 3.12 --with 'harbor==$(TB_HARBOR_VERSION)' --with pytest python -m pytest -q benchmarks/terminal_bench/mux_agent_test.py
+
+# CRAP scores (scripts/crap/). uv reads the Crapper and grammar pins from the
+# adapter's inline script header, so no virtualenv is committed or reused.
+CRAP_REPORT := uv run --quiet --script scripts/crap/crapper_report.py
+
+crap: ## Score every production src/ function with Crapper into .metrics/crap.json [COVERAGE="<lcov>..."]
+	@mkdir -p .metrics
+	@# Replace the last snapshot only after the report succeeds.
+	@$(CRAP_REPORT) --top 20 $(foreach lcov,$(COVERAGE),--lcov $(lcov)) > .metrics/crap.json.tmp
+	@mv .metrics/crap.json.tmp .metrics/crap.json
+	@echo "Wrote .metrics/crap.json"
+
+# The script exits 0 pass, 1 violations, 2 tool error; make reports any failure
+# as 2, so hooks and CI call the script directly.
+crap-check: ## CRAP gate on files changed since BASE (default: merge-base with origin/main) [COVERAGE="<lcov>..."] [CRAP_CHECK_ARGS=--json]
+	@bun scripts/crap/check.ts --base "$(or $(BASE),$$(git merge-base origin/main HEAD))" \
+		$(foreach lcov,$(COVERAGE),--coverage $(lcov)) $(CRAP_CHECK_ARGS)
+
+CRAP_PYTHON := PYTHONDONTWRITEBYTECODE=1 uv run --quiet --no-project --with pytest --with-requirements scripts/crap/crapper_report.py python
+
+test-crap-scripts: ## Test the Crapper adapter (hand-counted fixtures) and crap-check end to end (needs uv)
+	@# tree-sitter-language-pack downloads its grammars from GitHub releases on
+	@# first use. This target is in static-check-full (Required), so retry a
+	@# transient failure there (seen: HTTP 504) before the tests use them.
+	@for attempt in 1 2 3; do \
+		$(CRAP_PYTHON) -c 'from tree_sitter_language_pack import download; download(["typescript", "tsx", "javascript"])' && break; \
+		[ $$attempt -lt 3 ] || exit 1; echo "grammar download failed, retrying ($$attempt/3)" >&2; sleep 10; \
+	done
+	@$(CRAP_PYTHON) -m pytest -q -p no:cacheprovider scripts/crap/crapper_report_test.py
+	@bun test ./scripts/crap/check.test.ts ./scripts/crap/agentGate.test.ts
 
 check-test-routing: node_modules/.installed ## Fail when a *.test.ts(x) file is run by no CI lane (or by two)
 	@./scripts/check-test-routing.sh

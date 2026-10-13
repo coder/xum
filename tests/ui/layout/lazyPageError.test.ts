@@ -1,12 +1,16 @@
 /**
  * T3 #5971 (route split): a page chunk that fails to load (a tab opened before a server upgrade asks
  * for an old hashed chunk) shows LazyFeature's Reload state inside the page's one `main`, not a
- * blank page. A thrown module factory stands in for the rejected `import()`.
+ * blank page. A throwing export stands in for the rejected `import()`: App's lazy loader reads
+ * `ProjectPage`, so its promise rejects. The throw is on the export, not the module factory,
+ * because renderReviewPanel imports the page modules up front (#6252) and reads no export.
  */
 
-jest.mock("@/browser/components/ProjectPage/ProjectPage", () => {
-  throw new Error("Failed to fetch dynamically imported module");
-});
+jest.mock("@/browser/components/ProjectPage/ProjectPage", () => ({
+  get ProjectPage(): never {
+    throw new Error("Failed to fetch dynamically imported module");
+  },
+}));
 
 import "../dom";
 import { fireEvent, waitFor } from "@testing-library/react";

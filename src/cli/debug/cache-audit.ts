@@ -5,13 +5,14 @@ import {
   collapseEnvelopesToFinalPerSequence,
 } from "@/node/services/replay/cacheAudit";
 import {
+  auditRecordedStepPrefixes,
   collectAssistantTurns,
   collectFullHistory,
   type AssistantTurn,
   type TurnEnvelopeEvent,
 } from "@/node/services/replay/replayVerify";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
-import { resolveReplaySessionDir } from "./replay-verify";
+import { printStepPrefixAudit, resolveReplaySessionDir } from "./replay-verify";
 
 /**
  * Debug command: diff consecutive turn-envelope rows and attribute
@@ -32,16 +33,20 @@ export async function cacheAuditCommand(workspaceId: string): Promise<void> {
   );
 
   console.log(`\n=== Cache-bust audit for workspace: ${workspaceId} ===\n`);
-  if (envelopes.length === 0) {
-    console.log("No turn-envelope rows found in durable-events.jsonl — nothing to audit.");
-    return;
-  }
-
   // Usage pairing: assistant turns come from the FULL history (all compaction
   // epochs, like the envelopes). Envelopes carrying requestHistorySequence
   // join on that key; legacy envelopes fall back to tail alignment (both
   // sequences end at the most recent turn).
   const historyResult = await collectFullHistory(historyService, workspaceId);
+  if (envelopes.length === 0) {
+    console.log("No turn-envelope rows found in durable-events.jsonl — nothing to audit.");
+    // The step audit needs only devtools.jsonl, so older logs without envelopes still get it.
+    printStepPrefixAudit(
+      await auditRecordedStepPrefixes(sessionDir, historyResult.success ? historyResult.data : [])
+    );
+    return;
+  }
+
   const turns = historyResult.success ? collectAssistantTurns(historyResult.data) : [];
   const turnsBySeq = new Map<number, AssistantTurn>(
     turns.map((turn) => [turn.requestHistorySequence, turn])
@@ -91,7 +96,11 @@ export async function cacheAuditCommand(workspaceId: string): Promise<void> {
 
   console.log(
     `\n${bustedTurns}/${audit.length - 1} follow-up turns busted the prompt prefix` +
-      (bustedTokens > 0 ? ` (~${bustedTokens.toLocaleString()} tokens re-processed)` : "") +
-      `\n`
+      (bustedTokens > 0 ? ` (~${bustedTokens.toLocaleString()} tokens re-processed)` : "")
+  );
+  // Envelopes only see prefix inputs (system prompt, tools, model); the step
+  // audit also catches history bytes that changed between requests.
+  printStepPrefixAudit(
+    await auditRecordedStepPrefixes(sessionDir, historyResult.success ? historyResult.data : [])
   );
 }

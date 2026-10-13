@@ -42,7 +42,6 @@ describe("shelf routes", () => {
       sessionDir: path.join(root, "sessions", "a"),
       relPath: "chart.html",
       bytes: Buffer.from("<p>v1</p>"),
-      source: "publish",
       label: "interactive chart",
     });
   });

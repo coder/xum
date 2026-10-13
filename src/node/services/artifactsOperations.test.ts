@@ -137,7 +137,6 @@ describe("artifacts operations", () => {
       relPath: "deleted.md",
       bytes: Buffer.from("kept"),
       kind: "markdown",
-      source: "publish",
       label: null,
       pin: null,
     });

@@ -33,6 +33,7 @@ export const TIMELINE_EVENT_KINDS = [
   "agent.event",
   "agent.plan_proposed",
   "agent.notified",
+  "cache.prefix_break",
 ] as const;
 
 export const TimelineEventKindSchema = z.enum(TIMELINE_EVENT_KINDS);
@@ -124,6 +125,27 @@ export function boundTimelineTextFields(
   return bounded;
 }
 
+// A prompt-cache prefix break (PromptCachePrefixMonitor) carries only roles, block types, tool
+// names, indices and counts: never message text or tool input/output.
+const promptCacheBlockShape = {
+  role: z.string().min(1),
+  type: z.string().min(1),
+  length: z.number().int().nonnegative(),
+  toolName: z.string().min(1).optional(),
+};
+
+const promptCacheBreakShape = {
+  section: z.enum(["tools", "system", "messages"]),
+  // "turn": the first request of a new turn broke the previous turn's prefix; "step": a later
+  // request inside one turn did.
+  boundary: z.enum(["turn", "step"]),
+  blockIndex: z.number().int().nonnegative(),
+  previousBlockCount: z.number().int().nonnegative(),
+  nextBlockCount: z.number().int().nonnegative(),
+  previous: z.object(promptCacheBlockShape).strict(),
+  next: z.object(promptCacheBlockShape).strict().optional(),
+};
+
 const timelineEventDataShape = {
   model: z.string().optional(),
   mode: z.string().optional(),
@@ -142,6 +164,7 @@ const timelineEventDataShape = {
   scheduledAt: z.number().optional(),
   runId: z.string().optional(),
   goalId: z.string().optional(),
+  promptCacheBreak: z.object(promptCacheBreakShape).strict().optional(),
 };
 
 export const TimelineEventDataSchema = z.object(timelineEventDataShape).strict();
@@ -176,7 +199,21 @@ export const TimelineStoredEventSchema = z.object({
   source: z.object({ ...timelineSourceShape, system: z.string().min(1) }),
   anchor: z.object(timelineAnchorShape).optional(),
   status: z.string().min(1).optional(),
-  data: z.object({ ...timelineEventDataShape, category: z.string().min(1).optional() }).optional(),
+  data: z
+    .object({
+      ...timelineEventDataShape,
+      category: z.string().min(1).optional(),
+      promptCacheBreak: z
+        .object({
+          ...promptCacheBreakShape,
+          section: z.string().min(1),
+          boundary: z.string().min(1),
+          previous: z.object(promptCacheBlockShape),
+          next: z.object(promptCacheBlockShape).optional(),
+        })
+        .optional(),
+    })
+    .optional(),
 });
 
 // Sequence recovery must survive rows this build cannot otherwise parse, or a new append could

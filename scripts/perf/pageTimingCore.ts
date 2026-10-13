@@ -62,6 +62,28 @@ export function hostIsQuiet(load: number, pressureCpu: string | null, cpus: numb
   return load < 0.75 * cpus && avg10 < 10;
 }
 
+/**
+ * Runs fn under the lock on a quiet host. It waits for quiet outside the lock, so a busy host never
+ * holds it, and probes once more inside: busy releases the lock at once (at most `attempts` takes).
+ */
+export async function runOnQuietHost<T>(
+  host: { isQuiet: () => boolean; sleep: (ms: number) => Promise<unknown> },
+  withLock: <R>(fn: () => Promise<R>) => Promise<R>,
+  fn: () => Promise<T>,
+  attempts = 30
+): Promise<T> {
+  assert(attempts >= 1, `bad attempts ${attempts}`);
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    for (let check = 1; !host.isQuiet(); check++) {
+      if (check >= 60) throw new Error("the host stayed busy for 10 minutes: the block is aborted");
+      await host.sleep(10_000);
+    }
+    const ran = await withLock(async () => (host.isQuiet() ? { value: await fn() } : null));
+    if (ran) return ran.value;
+  }
+  throw new Error("the host turned busy at every lock take: the block is aborted");
+}
+
 export interface Run {
   page: Page;
   pair: number;
