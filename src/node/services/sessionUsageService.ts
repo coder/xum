@@ -626,10 +626,9 @@ export class SessionUsageService {
    *
    * Forked workspaces need an explicit empty session-usage.json so later reads do not
    * rebuild historical costs from the copied messages. `forkedAt` marks where the fork's
-   * own history begins (see SessionUsageFileSchema).
+   * own history begins (see SessionUsageFileSchema); undefined writes no marker.
    */
-  async resetSessionUsage(workspaceId: string, forkedAt: number): Promise<void> {
-    assert(Number.isSafeInteger(forkedAt), "resetSessionUsage requires a ms timestamp");
+  async resetSessionUsage(workspaceId: string, forkedAt?: number): Promise<void> {
     return this.fileLocks.withLock(workspaceId, async () => {
       await this.writeFile(workspaceId, { ...this.createEmptyUsageFile(), forkedAt });
     });

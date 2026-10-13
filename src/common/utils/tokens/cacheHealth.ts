@@ -43,8 +43,11 @@ export interface CacheHealthPart {
  */
 function getUncachedInputTokens(part: CacheHealthPart): number {
   const cacheTokens = part.usage.cached.tokens + part.usage.cacheCreate.tokens;
-  return part.rawInputTokens !== undefined && part.rawInputTokens < cacheTokens
-    ? part.rawInputTokens
+  // Self-healing: only a real token count can be a legacy row's uncached input. A malformed
+  // raw count (negative, NaN, infinite) keeps the display usage's clamped value.
+  const raw = part.rawInputTokens;
+  return raw !== undefined && Number.isFinite(raw) && raw >= 0 && raw < cacheTokens
+    ? raw
     : part.usage.input.tokens;
 }
 

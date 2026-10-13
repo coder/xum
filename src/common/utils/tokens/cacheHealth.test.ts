@@ -104,6 +104,19 @@ describe("getCacheHealth", () => {
     ).toBeUndefined();
   });
 
+  test("ignores a malformed raw input count instead of reading it as legacy input", () => {
+    const usage = createDisplayUsage(
+      { inputTokens: 10_000, cachedInputTokens: 9_000, outputTokens: 10 },
+      MODEL,
+      { anthropic: { cacheCreationInputTokens: 1_000 } }
+    );
+    if (usage === undefined) throw new Error("expected display usage");
+    const health = getCacheHealth([{ usage, rawInputTokens: -50_000 }]);
+    // The clamped display input (0) stands: 9k read of a 10k prompt.
+    expect(health.readRatio).toBeCloseTo(0.9, 12);
+    expect(getCacheHealth([{ usage, rawInputTokens: Number.NaN }])).toEqual(health);
+  });
+
   test("reads a pre-AI-SDK-v6 row's uncached input from its raw usage", () => {
     // Before v6, Anthropic's inputTokens excluded cache tokens: 9k uncached, 1k read, 9.5k written.
     const legacyRow = {
