@@ -418,6 +418,21 @@ describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", 
     await waitFor(() => expect(sends).toEqual([{ version: null }]));
   });
 
+  test("Send while offline shows the reconnecting message and sends nothing", async () => {
+    const view = render(<ArtifactsPanel workspaceId="ws-r" />, { wrapper: ConnectionWrapper });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    await flush();
+    postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Ship" });
+    const sendButton = (await view.findByRole("button", { name: "Send" })) as HTMLButtonElement;
+    await waitFor(() => expect(sendButton.disabled).toBe(false), {
+      timeout: CONFIRM_ARM_DELAY_MS + 1000,
+    });
+    await dropConnection();
+    fireEvent.click(sendButton);
+    await view.findByText("Xum is reconnecting. Send again once it is back.");
+    expect(sends).toEqual([]);
+  });
+
   test("a canvas keeps its data through a refresh made while offline", async () => {
     files["data/s.json"] = ok("data/s.json", JSON.stringify({ series: [{ q: "Q1", v: 1 }] }));
     const content = JSON.stringify({

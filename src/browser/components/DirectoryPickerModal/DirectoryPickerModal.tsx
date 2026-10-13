@@ -12,7 +12,7 @@ import { Checkbox } from "../Checkbox/Checkbox";
 import { Input } from "@/browser/components/Input/Input";
 import type { FileTreeNode } from "@/common/utils/git/numstatParser";
 import { DirectoryTree } from "../DirectoryTree/DirectoryTree";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { formatKeybind, isMac } from "@/browser/utils/ui/keybinds";
 import { getErrorMessage } from "@/common/utils/errors";
 
@@ -32,6 +32,7 @@ export const DirectoryPickerModal: React.FC<DirectoryPickerModalProps> = ({
   onSelectPath,
 }) => {
   const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const [root, setRoot] = useState<FileTreeNode | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -45,7 +46,7 @@ export const DirectoryPickerModal: React.FC<DirectoryPickerModalProps> = ({
 
   const loadDirectory = useCallback(
     async (path: string) => {
-      if (!api) {
+      if (!liveApi) {
         setError("Not connected to server");
         return;
       }
@@ -54,7 +55,7 @@ export const DirectoryPickerModal: React.FC<DirectoryPickerModalProps> = ({
       setCanCreateFolder(false);
 
       try {
-        const result = await api.general.listDirectory({ path });
+        const result = await liveApi.general.listDirectory({ path });
 
         if (!result.success) {
           const errorMessage = typeof result.error === "string" ? result.error : "Unknown error";
@@ -82,7 +83,7 @@ export const DirectoryPickerModal: React.FC<DirectoryPickerModalProps> = ({
         setIsLoading(false);
       }
     },
-    [api]
+    [liveApi]
   );
 
   // Sync pathInput with initialPath when modal opens (component stays mounted)

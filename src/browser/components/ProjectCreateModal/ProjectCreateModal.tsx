@@ -15,7 +15,7 @@ import {
   ToggleGroupItem,
 } from "@/browser/components/ToggleGroupPrimitive/ToggleGroupPrimitive";
 import type { ProjectConfig } from "@/node/config";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 
 type ApiClient = ReturnType<typeof useAPI>["api"];
 
@@ -125,6 +125,7 @@ export const ProjectCreateForm = React.forwardRef<ProjectCreateFormHandle, Proje
     ref
   ) {
     const { api } = useAPI();
+    const liveApi = useLiveAPI();
     const resolvedSubmitLabel =
       submitLabel ?? (createNewGitRepo ? "Create Project" : "Add Project");
     const resolvedPlaceholder =
@@ -190,7 +191,7 @@ export const ProjectCreateForm = React.forwardRef<ProjectCreateFormHandle, Proje
       }
 
       setError("");
-      if (!api) {
+      if (!liveApi) {
         setError("Not connected to server");
         return false;
       }
@@ -198,11 +199,11 @@ export const ProjectCreateForm = React.forwardRef<ProjectCreateFormHandle, Proje
 
       try {
         // First check if project already exists
-        const existingProjects = await api.projects.list();
+        const existingProjects = await liveApi.projects.list();
         const existingPaths = new Map(existingProjects);
 
         // Backend handles path resolution (bare names → ~/.xum/projects/name)
-        const result = await api.projects.create({
+        const result = await liveApi.projects.create({
           projectPath: trimmedPath,
           initGit: createNewGitRepo || undefined,
         });
@@ -233,7 +234,17 @@ export const ProjectCreateForm = React.forwardRef<ProjectCreateFormHandle, Proje
       } finally {
         setCreating(false);
       }
-    }, [api, createNewGitRepo, isCreating, onClose, onSuccess, path, reset, setCreating, setError]);
+    }, [
+      liveApi,
+      createNewGitRepo,
+      isCreating,
+      onClose,
+      onSuccess,
+      path,
+      reset,
+      setCreating,
+      setError,
+    ]);
 
     const handleKeyDown = useCallback(
       (e: React.KeyboardEvent) => {
@@ -401,6 +412,7 @@ function processTerminalOutput(raw: string): string {
 const ProjectCloneForm = React.forwardRef<ProjectCloneFormHandle, ProjectCloneFormProps>(
   function ProjectCloneForm(props, ref) {
     const { api } = useAPI();
+    const liveApi = useLiveAPI();
     const [repoUrl, setRepoUrl] = useState("");
     const [cloneParentDir, setCloneParentDir] = useState(props.defaultProjectDir);
     const [hasEditedCloneParentDir, setHasEditedCloneParentDir] = useState(false);
@@ -520,7 +532,7 @@ const ProjectCloneForm = React.forwardRef<ProjectCloneFormHandle, ProjectCloneFo
         return false;
       }
 
-      if (!api) {
+      if (!liveApi) {
         setError("Not connected to server");
         return false;
       }
@@ -535,7 +547,7 @@ const ProjectCloneForm = React.forwardRef<ProjectCloneFormHandle, ProjectCloneFo
       abortControllerRef.current = controller;
 
       try {
-        const cloneEvents = await api.projects.clone(
+        const cloneEvents = await liveApi.projects.clone(
           {
             repoUrl: trimmedRepoUrl,
             cloneParentDir: trimmedCloneParentDir || undefined,
@@ -590,10 +602,10 @@ const ProjectCloneForm = React.forwardRef<ProjectCloneFormHandle, ProjectCloneFo
           setCreating(false);
         }
       }
-    }, [api, isCreating, props, repoUrl, reset, setCreating, setError, trimmedCloneParentDir]);
+    }, [liveApi, isCreating, props, repoUrl, reset, setCreating, setError, trimmedCloneParentDir]);
 
     const handleAddExistingProject = useCallback(async () => {
-      if (!api || !destinationExistsPath) {
+      if (!liveApi || !destinationExistsPath) {
         return;
       }
 
@@ -602,7 +614,7 @@ const ProjectCloneForm = React.forwardRef<ProjectCloneFormHandle, ProjectCloneFo
       addProjectAbortControllerRef.current = controller;
 
       try {
-        const result = await api.projects.create(
+        const result = await liveApi.projects.create(
           { projectPath: destinationExistsPath },
           { signal: controller.signal }
         );
@@ -631,7 +643,7 @@ const ProjectCloneForm = React.forwardRef<ProjectCloneFormHandle, ProjectCloneFo
           setIsAddingProject(false);
         }
       }
-    }, [api, destinationExistsPath, props, reset, setError]);
+    }, [liveApi, destinationExistsPath, props, reset, setError]);
 
     const handleRetry = useCallback(() => {
       setError("");

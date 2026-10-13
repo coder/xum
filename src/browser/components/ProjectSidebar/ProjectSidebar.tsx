@@ -42,7 +42,7 @@ import {
   isEditableElement,
   KEYBINDS,
 } from "@/browser/utils/ui/keybinds";
-import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
 import {
   CUSTOM_EVENTS,
   getStorageChangeEvent,
@@ -764,7 +764,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   useWorkspaceAttentionSubscription(sortedWorkspacesByProject, workspaceStore);
   const runtimeStatusStore = useRuntimeStatusStoreRaw();
   const { navigateToProject, isAnalyticsOpen } = useRouter();
-  const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const { confirm: confirmDialog } = useConfirmDialog();
   const settings = useSettings();
   // The settings and analytics modals cover the chat without changing the route's workspace;
@@ -1097,19 +1097,19 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const handleForkWorkspace = useCallback(
     async (workspaceId: string, buttonElement?: HTMLElement) => {
       const anchor = getErrorAnchor(buttonElement);
-      const error = await forkWorkspaceFromMenu(api, workspaceId);
+      const error = await forkWorkspaceFromMenu(liveApi, workspaceId);
       if (error) workspaceForkError.showError(workspaceId, error, anchor);
     },
-    [api, workspaceForkError]
+    [liveApi, workspaceForkError]
   );
 
   const handleStopRuntime = useCallback(
     async (workspaceId: string, buttonElement?: HTMLElement) => {
       const anchor = getErrorAnchor(buttonElement);
-      const error = await stopWorkspaceRuntime(api, runtimeStatusStore, workspaceId);
+      const error = await stopWorkspaceRuntime(liveApi, runtimeStatusStore, workspaceId);
       if (error) workspaceStopRuntimeError.showError(workspaceId, error, anchor);
     },
-    [api, runtimeStatusStore, workspaceStopRuntimeError]
+    [liveApi, runtimeStatusStore, workspaceStopRuntimeError]
   );
 
   const hasActiveStream = useCallback(

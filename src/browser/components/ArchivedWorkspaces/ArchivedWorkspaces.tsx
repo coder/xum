@@ -8,7 +8,7 @@ import type {
   WorkspaceRemovalDescendant,
 } from "@/common/types/workspace";
 import { getErrorMessage } from "@/common/utils/errors";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
@@ -334,6 +334,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
 
   const { unarchiveWorkspace, removeWorkspace, setSelectedWorkspace } = useWorkspaceContext();
   const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const [searchQuery, setSearchQuery] = React.useState("");
   const [processingIds, setProcessingIds] = React.useState<Set<string>>(new Set());
   const [deleteWorktreeIds, setDeleteWorktreeIds] = React.useState<Set<string>>(new Set());
@@ -701,7 +702,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
     const rect = anchorEl?.getBoundingClientRect();
     const anchor = rect ? { top: rect.top + window.scrollY, left: rect.right + 10 } : undefined;
 
-    if (!api) {
+    if (!liveApi) {
       deleteWorktreeError.showError(workspaceId, "Not connected to server", anchor);
       return;
     }
@@ -709,7 +710,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
     setProcessingIds((prev) => new Set(prev).add(workspaceId));
     setDeleteWorktreeIds((prev) => new Set(prev).add(workspaceId));
     try {
-      const result = await api.workspace.deleteWorktree({ workspaceId });
+      const result = await liveApi.workspace.deleteWorktree({ workspaceId });
       if (result.success) {
         onWorkspacesChanged?.();
         return;

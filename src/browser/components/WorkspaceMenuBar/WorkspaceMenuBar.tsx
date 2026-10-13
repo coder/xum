@@ -65,7 +65,7 @@ import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 
 import { SkillIndicator } from "../SkillIndicator/SkillIndicator";
 import { WorkspaceLinks } from "../WorkspaceLinks/WorkspaceLinks";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 
 import { useWorkspaceActions, useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
@@ -150,6 +150,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   sidebarFullscreen = false,
 }) => {
   const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const { preflightArchiveWorkspace, archiveWorkspace, archivingWorkspaceIds, setWorkspacePinned } =
     useWorkspaceActions();
   const isArchiving = archivingWorkspaceIds.has(workspaceId);
@@ -481,12 +482,12 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
 
   const handleForkWorkspace = async (anchorEl: HTMLElement) => {
     const anchor = getErrorAnchor(anchorEl);
-    const error = await forkWorkspaceFromMenu(api, workspaceId);
+    const error = await forkWorkspaceFromMenu(liveApi, workspaceId);
     if (error) forkError.showError(workspaceId, error, anchor);
   };
 
   const handleStopRuntime = async () => {
-    const error = await stopWorkspaceRuntime(api, runtimeStatusStore, workspaceId);
+    const error = await stopWorkspaceRuntime(liveApi, runtimeStatusStore, workspaceId);
     if (error) {
       stopRuntimeError.showError(workspaceId, error, getErrorAnchor(moreActionsButtonRef.current));
     }

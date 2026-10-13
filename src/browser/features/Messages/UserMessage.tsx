@@ -1,5 +1,5 @@
 import React from "react";
-import { APIContext } from "@/browser/contexts/API";
+import { APIContext, liveClientOf } from "@/browser/contexts/API";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { cn } from "@/common/lib/utils";
 import type { DisplayedMessage } from "@/common/types/message";
@@ -111,7 +111,8 @@ export const UserMessage: React.FC<UserMessageProps> = ({
     window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches;
 
   const apiState = React.useContext(APIContext);
-  const api = apiState?.api ?? null;
+  // The live client only: offline, the download reports its own error.
+  const api = apiState == null ? null : liveClientOf(apiState);
   const workspaceContext = useOptionalWorkspaceContext();
   // Prefer the transcript's own workspace: a /side chat transcript renders next to the routed
   // (selected) workspace, so the selection would download, cache-key, and guard against the wrong

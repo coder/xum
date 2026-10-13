@@ -28,7 +28,7 @@ import { Button } from "@/browser/components/Button/Button";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { getStoredAuthToken } from "@/browser/components/AuthTokenModal/AuthTokenModal";
 import { getBrowserBackendBaseUrl } from "@/browser/utils/backendBaseUrl";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useRouting } from "@/browser/hooks/useRouting";
@@ -218,6 +218,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
   const [direction, setDirection] = useState<Direction>("forward");
 
   const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const {
     data: muxGatewayAccountStatus,
     error: muxGatewayAccountError,
@@ -289,18 +290,18 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
       setMuxGatewayServerState(null);
 
       if (isDesktop) {
-        if (!api) {
+        if (!liveApi) {
           setMuxGatewayLoginStatus("error");
           setMuxGatewayLoginError("Xum API not connected.");
           return;
         }
 
         setMuxGatewayLoginStatus("starting");
-        const startResult = await api.muxGatewayOauth.startDesktopFlow();
+        const startResult = await liveApi.muxGatewayOauth.startDesktopFlow();
 
         if (attempt !== muxGatewayLoginAttemptRef.current) {
           if (startResult.success) {
-            void api.muxGatewayOauth.cancelDesktopFlow({ flowId: startResult.data.flowId });
+            void liveApi.muxGatewayOauth.cancelDesktopFlow({ flowId: startResult.data.flowId });
           }
           return;
         }
@@ -322,7 +323,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
           return;
         }
 
-        const waitResult = await api.muxGatewayOauth.waitForDesktopFlow({ flowId });
+        const waitResult = await liveApi.muxGatewayOauth.waitForDesktopFlow({ flowId });
 
         if (attempt !== muxGatewayLoginAttemptRef.current) {
           return;
@@ -429,7 +430,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
       setMuxGatewayLoginStatus("error");
       setMuxGatewayLoginError(message);
     }
-  }, [api, backendBaseUrl, disableMuxGatewayRoute, isDesktop, refreshMuxGatewayAccountStatus]);
+  }, [liveApi, backendBaseUrl, disableMuxGatewayRoute, isDesktop, refreshMuxGatewayAccountStatus]);
 
   useEffect(() => {
     const attempt = muxGatewayLoginAttemptRef.current;

@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, RefreshCw } from "lucide-react";
 import { useUserPreferences } from "@/browser/stores/AppConfigStore";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useWorkspaceState } from "@/browser/stores/WorkspaceStore";
 import { getLastMainRetryCandidateMessage } from "@/common/utils/messages/retryEligibility";
 import {
@@ -149,6 +149,7 @@ const RetryButton: React.FC<{ disabled: boolean; onRetry: () => void }> = (props
 
 export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) => {
   const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const [countdown, setCountdown] = useState(0);
   const [manualRetryError, setManualRetryError] = useState<string | null>(null);
   const [isManualRetrying, setIsManualRetrying] = useState(false);
@@ -170,11 +171,12 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
   const manualRetryRollbackPendingRef = useRef(false);
   const manualRetryRollbackArmedRef = useRef(false);
   const manualRetryRollbackBaselineMessageCountRef = useRef<number | null>(null);
-  const apiRef = useRef(api);
+  // The rollback skips while offline, as it did when useAPI() went null in the gap.
+  const apiRef = useRef(liveApi);
 
   useEffect(() => {
-    apiRef.current = api;
-  }, [api]);
+    apiRef.current = liveApi;
+  }, [liveApi]);
 
   const rollbackManualRetryAutoRetryIfNeeded = useCallback(
     async (options?: { suppressErrors?: boolean }): Promise<void> => {
@@ -290,7 +292,7 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
     }
   }, [isAutoRetryActive]);
   const handleManualRetry = async () => {
-    if (!api) {
+    if (!liveApi) {
       setManualRetryError("Not connected to server");
       return;
     }
@@ -327,7 +329,7 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
           options = applyCompactionOverrides(options, lastUserMessage.compactionRequest.parsed);
         }
 
-        const enableResult = await api.workspace.setAutoRetryEnabled?.({
+        const enableResult = await liveApi.workspace.setAutoRetryEnabled?.({
           workspaceId: props.workspaceId,
           enabled: true,
           persist: false,
@@ -346,7 +348,7 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
           manualRetryRollbackBaselineMessageCountRef.current = props.messages.length;
         }
 
-        const resumeResult = await api.workspace.resumeStream({
+        const resumeResult = await liveApi.workspace.resumeStream({
           workspaceId: props.workspaceId,
           options,
         });

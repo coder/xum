@@ -8,7 +8,7 @@ import { getOwn } from "@/common/utils/getOwn";
 import { ClaudeDesignCard } from "./ClaudeDesignCard";
 import { CLAUDE_DESIGN_SERVER_NAME } from "@/common/constants/claudeDesign";
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import {
   Trash2,
   Play,
@@ -347,13 +347,14 @@ function getMCPOAuthLoginFlowMode(input: {
 }
 
 function useMCPOAuthLogin(input: {
-  api: ReturnType<typeof useAPI>["api"];
   isDesktop: boolean;
   serverName: string;
   pendingServer?: MCPOAuthPendingServerConfig;
   onSuccess?: () => void | Promise<void>;
 }) {
-  const { api, isDesktop, serverName, pendingServer, onSuccess } = input;
+  const { isDesktop, serverName, pendingServer, onSuccess } = input;
+  // The live client only: offline, startLogin shows its own "not connected" error.
+  const api = useLiveAPI();
   const loginAttemptRef = useRef(0);
   const [flowId, setFlowId] = useState<string | null>(null);
 
@@ -623,9 +624,7 @@ const MCPOAuthRequiredCallout: React.FC<{
   disabledReason?: string;
   onLoginSuccess?: () => void | Promise<void>;
 }> = (props) => {
-  const { api } = useAPI();
   const login = useMCPOAuthLogin({
-    api,
     isDesktop: !!window.api,
     serverName: props.serverName,
     pendingServer: props.pendingServer,
@@ -679,7 +678,6 @@ const RemoteMCPOAuthSection: React.FC<{
   }, [refreshAuthStatus, transport, url, oauthRefreshNonce]);
 
   const { loginStatus, loginError, loginInProgress, startLogin, cancelLogin } = useMCPOAuthLogin({
-    api,
     isDesktop,
     serverName,
     onSuccess: refreshAuthStatus,
@@ -1235,7 +1233,6 @@ export const MCPSettingsSection: React.FC = () => {
       ? "OAuth login is only supported for remote (http/sse) MCP servers."
       : undefined;
   const newServerOauthLogin = useMCPOAuthLogin({
-    api,
     isDesktop: !!window.api,
     serverName: newServerName,
     pendingServer: newServerOauthPendingServer,

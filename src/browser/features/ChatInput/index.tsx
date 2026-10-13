@@ -29,7 +29,7 @@ import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useAgent } from "@/browser/contexts/AgentContext";
 import { ThinkingSelector } from "@/browser/components/ThinkingSelector/ThinkingSelector";
-import { useAPI, type APIClient } from "@/browser/contexts/API";
+import { useAPI, type APIClient, useLiveAPI } from "@/browser/contexts/API";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
 import {
@@ -311,6 +311,7 @@ interface EditSession {
 
 const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const { variant } = props;
   // A /side chat composer is mounted next to the main one. Window shortcuts act only in the pane
   // that owns the focused element, and unscoped palette events (open model selector, voice, toasts)
@@ -636,7 +637,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     onSend: () => void handleSend(),
     isTranscriptionAvailable,
     useRecordingKeybinds: true,
-    api,
+    api: liveApi,
   });
 
   const voiceInputUnavailableMessage =
@@ -2299,7 +2300,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           messageText,
           agentSkillDescriptors,
           mcpPromptDescriptors,
-          api,
+          api: liveApi,
           discovery: skillDiscovery,
           signal: resolutionSignal,
         });
@@ -2314,7 +2315,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             messageText,
             slashInvocation: resolution.skillInvocation,
             agentSkillDescriptors,
-            api,
+            api: liveApi,
             discovery: skillDiscovery,
             candidates: inlineReferenceCandidates,
           }),
@@ -2322,7 +2323,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             messageText,
             slashInvocation: resolution.mcpPromptInvocation,
             descriptors: mcpPromptDescriptors,
-            api,
+            api: liveApi,
             discovery: skillDiscovery,
             candidates: inlineReferenceCandidates,
             signal: resolutionSignal,
@@ -2398,7 +2399,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       let creationOptionsOverride: Partial<SendMessageOptions> | undefined;
 
       if (skillInvocation) {
-        if (!api) {
+        if (!liveApi) {
           pushToast({ type: "error", message: "Not connected to server" });
           return;
         }
@@ -2516,7 +2517,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         mcpPromptInvocation?.userText ??
         messageText;
 
-      if (!api) {
+      if (!liveApi) {
         pushToast({ type: "error", message: "Not connected to server" });
         return;
       }
@@ -2527,7 +2528,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       let sendAttachments = attachments;
       const pendingFilesForSend = getPendingFileAttachments(attachments);
       if (pendingFilesForSend.length > 0) {
-        const stagingOutcome = await stagePendingFiles(api, props.workspaceId, pendingFilesForSend);
+        const stagingOutcome = await stagePendingFiles(
+          liveApi,
+          props.workspaceId,
+          pendingFilesForSend
+        );
         if (stagingOutcome.staged.length > 0) {
           sendAttachments = replacePendingFilesWithStaged(attachments, stagingOutcome.staged);
           // Swap staged chips into the composer so a later failure or retry
@@ -2678,7 +2683,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               metadata,
               sendOptions,
             } = prepareCompactionMessage({
-              api,
+              api: liveApi,
               workspaceId: props.workspaceId,
               maxOutputTokens: parsed.maxOutputTokens,
               // Include current attachments + reviews in followUpContent so they're queued
@@ -2859,10 +2864,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
         props.onMessageSendStarted?.(overrides?.queueDispatchMode ?? "tool-end");
 
-        let result: Awaited<ReturnType<typeof api.workspace.sendMessage>> | undefined;
+        let result: Awaited<ReturnType<typeof liveApi.workspace.sendMessage>> | undefined;
         let thrown: unknown;
         try {
-          result = await api.workspace.sendMessage({
+          result = await liveApi.workspace.sendMessage({
             workspaceId: props.workspaceId,
             message: finalMessageText,
             options: { ...sendOptions, sendId },
@@ -2886,7 +2891,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           // draft entry.)
           if (outcome === "accepted" || outcome === "pending") accepted = true;
         } else if (!accepted) {
-          accepted = await isEditSendAccepted(api, props.workspaceId, sendId);
+          accepted = await isEditSendAccepted(liveApi, props.workspaceId, sendId);
         }
 
         if (!accepted) {

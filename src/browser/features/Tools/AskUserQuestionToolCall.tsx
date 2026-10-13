@@ -3,7 +3,7 @@ import assert from "@/common/utils/assert";
 import { AlertTriangle, Check } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyCompactionOverrides } from "@/browser/utils/messages/compactionOptions";
@@ -270,11 +270,13 @@ export function AskUserQuestionToolCall(props: {
   const autoRetryRollbackArmedRef = useRef(false);
   const autoRetryRollbackBaselineMessageCountRef = useRef<number | null>(null);
   const isMountedRef = useRef(true);
-  const apiRef = useRef(api);
+  // The rollback skips while offline, as it did when useAPI() went null in the gap.
+  const liveApi = useLiveAPI();
+  const apiRef = useRef(liveApi);
 
   useEffect(() => {
-    apiRef.current = api;
-  }, [api]);
+    apiRef.current = liveApi;
+  }, [liveApi]);
 
   const rollbackAutoRetryIfNeeded = useCallback(
     async (options?: { suppressErrors?: boolean }): Promise<void> => {

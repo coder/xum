@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { cn } from "@/common/lib/utils";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useTheme } from "@/browser/contexts/ThemeContext";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
@@ -204,11 +204,13 @@ export function McpAppFrame(props: {
   const { toolCallId, serverName, resourceUri } = view;
   // The view's host lives as long as its frame. The API is null while Xum reconnects and a new
   // client afterwards; tearing the host down for either reset the view. So the host calls tools
-  // through the latest client, and a call made while offline fails.
-  const apiRef = useRef(api);
+  // through the latest live client, and a call made while offline fails with its own message
+  // (useAPI() can keep the last client while Xum reconnects).
+  const liveApi = useLiveAPI();
+  const apiRef = useRef(liveApi);
   useEffect(() => {
-    apiRef.current = api;
-  }, [api]);
+    apiRef.current = liveApi;
+  }, [liveApi]);
   // Fetched once per tool call: a reconnect must not fetch it again (a failed refetch replaced a
   // working view with an error). A failed fetch is retried with the next client.
   const viewLoaded = loaded?.toolCallId === toolCallId && loaded.view != null;
