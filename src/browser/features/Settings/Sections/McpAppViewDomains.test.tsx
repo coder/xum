@@ -40,8 +40,14 @@ let subscribeFailures = 0;
 let subscribeEndsAtOnce = 0;
 let subscribeCalls = 0;
 let subscriptions: AbortSignal[] = [];
+// The next listViewDomains read stays pending until the test settles it (a read in flight).
+let holdNextList = false;
+let heldList: { reject: (error: Error) => void } | null = null;
+// Each api() is a new connection; reads through an older one fail, as after a reconnect.
+let connection = 0;
 
 function api(): APIClient {
+  const own = ++connection;
   const overrides: TestApiOverrides<APIClient> = {
     config: {
       onConfigChanged: (_input: void, options?: { signal?: AbortSignal }) => {
@@ -92,6 +98,13 @@ function api(): APIClient {
         }),
       listViewDomains: () => {
         listCalls++;
+        if (own !== connection) return Promise.reject(new Error("connection closed"));
+        if (holdNextList) {
+          holdNextList = false;
+          return new Promise<McpAppViewDomains[]>((_resolve, reject) => {
+            heldList = { reject };
+          });
+        }
         if (listFailures > 0) {
           listFailures--;
           return Promise.reject(new Error("transient IPC failure"));
@@ -151,6 +164,8 @@ describe("MCP Apps allowed view domains", () => {
     subscribeEndsAtOnce = 0;
     subscribeCalls = 0;
     subscriptions = [];
+    holdNextList = false;
+    heldList = null;
   });
   afterEach(() => {
     cleanup();
@@ -278,6 +293,25 @@ describe("MCP Apps allowed view domains", () => {
       await waitFor(async () => expect(await frameCsp(view)).not.toContain(API_ORIGIN));
     });
   }
+
+  test("a revoke during a reconnect applies once the old client's pending read fails", async () => {
+    holdNextList = true;
+    const view = renderWith(<McpAppFrame workspaceId="ws" view={VIEW} />);
+    expect(await frameCsp(view)).toContain(`connect-src ${API_ORIGIN}`);
+    // The old client's read (when its listener starts) is still in flight.
+    await waitFor(() => expect(heldList).not.toBeNull());
+    // Xum reconnects with a new client, and the domain was revoked during the outage. No config
+    // event is replayed for that revoke, so only the re-read the reconnect asks for can catch it.
+    stored = [];
+    client = api();
+    view.rerender(withFrame());
+    await settle();
+    await act(async () => {
+      heldList?.reject(new Error("connection closed"));
+      await Promise.resolve();
+    });
+    await waitFor(async () => expect(await frameCsp(view)).not.toContain(API_ORIGIN));
+  });
 
   test("a subscription that always ends at once is not retried in a loop", async () => {
     const view = await renderEmpty();

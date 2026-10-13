@@ -1,5 +1,6 @@
 import { useEffect, useSyncExternalStore } from "react";
 import type { APIClient } from "@/browser/contexts/API";
+import assert from "@/common/utils/assert";
 
 /**
  * MCP Apps view-domain approvals this renderer changed (artifacts experiment), per project and
@@ -76,32 +77,49 @@ const followers = new Set<Follower>();
 let following: { api: APIClient; controller: AbortController; ready: boolean } | null = null;
 let reconciling: Promise<void> | null = null;
 let reconcileAgain = false;
+/** The client of the newest reconcile request: a reconnect replaces the one a read started on. */
+let latestApi: APIClient | null = null;
 
 /**
- * Re-read the stored approvals once and publish them for every follower that uses an origin
- * no longer stored. A request made while one runs is coalesced into one more read after it.
+ * Re-read the stored approvals and publish them for every follower that uses an origin no longer
+ * stored. A request made while one runs is coalesced into one more read after it, on the newest
+ * client. That read also runs when the current one fails: after a reconnect, the old client's
+ * read is cut off, and only the new client's read can catch a revoke made during the outage
+ * (config events are not replayed). A failed read with no newer request ends the loop, and its
+ * error is the result.
  */
 async function reconcile(api: APIClient): Promise<void> {
+  latestApi = api;
   if (reconciling != null) {
     reconcileAgain = true;
     return reconciling;
   }
   reconciling = (async () => {
+    let failure: { error: unknown } | null = null;
     do {
       reconcileAgain = false;
+      const client = latestApi;
+      assert(client != null, "reconcile: no client to read with");
       const requestSeq = beginMcpAppViewDomainsRequest();
-      const list = await api.mcpApps.listViewDomains();
-      for (const follower of followers) {
-        const stored =
-          list.find(
-            (entry) =>
-              entry.projectPath === follower.projectPath && entry.serverName === follower.serverName
-          )?.origins ?? [];
-        if (follower.approved.some((origin) => !stored.includes(origin))) {
-          publishMcpAppViewDomains(follower.projectPath, follower.serverName, stored, requestSeq);
+      try {
+        const list = await client.mcpApps.listViewDomains();
+        failure = null;
+        for (const follower of followers) {
+          const stored =
+            list.find(
+              (entry) =>
+                entry.projectPath === follower.projectPath &&
+                entry.serverName === follower.serverName
+            )?.origins ?? [];
+          if (follower.approved.some((origin) => !stored.includes(origin))) {
+            publishMcpAppViewDomains(follower.projectPath, follower.serverName, stored, requestSeq);
+          }
         }
+      } catch (error) {
+        failure = { error };
       }
     } while (reconcileAgain);
+    if (failure != null) throw failure.error;
   })().finally(() => {
     reconciling = null;
   });
