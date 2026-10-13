@@ -941,7 +941,7 @@ export function wrapFetchWithAnthropicCacheControl(
     // it must not move the baseline or record a break.
     if (injectCacheControl && response.ok) {
       try {
-        options?.observeFinalBody?.(json, input instanceof Request ? input.url : String(input));
+        options?.observeFinalBody?.(json, requestUrlOf(input));
       } catch {
         // Observation is diagnostic only and must never affect the request.
       }
@@ -1013,6 +1013,10 @@ function wrapFetchStrippingEmptyAuthHeaders(baseFetch: typeof fetch): typeof fet
     return baseFetch(input, { ...init, headers });
   };
   return Object.assign(wrappedFetch, baseFetch) as typeof fetch;
+}
+
+function requestUrlOf(input: Parameters<typeof fetch>[0]): string {
+  return input instanceof Request ? input.url : String(input);
 }
 
 /** Origin and path of a request URL: the cache endpoint, without query or credentials. */
