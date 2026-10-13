@@ -3,9 +3,8 @@ import { useSyncExternalStore } from "react";
 /**
  * A capped, in-memory key -> value map that mounted components read through
  * useSyncExternalStore. View choices (annotate mode, JSON mode, tree expansion) must outlive
- * remounts, and must also reach every mounted copy: a narrow window mounts ArtifactsDialog
- * while the CSS-hidden sidebar panel stays mounted, and a value copied into one instance's state
- * went stale in the other. In memory only: these choices do not need to survive a reload.
+ * remounts, and must also reach every mounted copy: a value copied into one instance's state
+ * would go stale in the other. In memory only: these choices do not need to survive a reload.
  */
 export interface CappedMemory<V> {
   get: (key: string) => V | undefined;

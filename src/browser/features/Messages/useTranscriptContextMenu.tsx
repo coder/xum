@@ -103,6 +103,7 @@ export function useTranscriptContextMenu(
         return;
       }
 
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       transcriptMenuTextRef.current = text ?? selectedMarkdown!.text;
       transcriptMenuLinkRef.current = "";
       setMode({ kind: "text" });

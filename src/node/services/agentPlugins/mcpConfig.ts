@@ -552,6 +552,7 @@ export async function loadPluginMcpServers(
   const disableMcp = (message: string): LoadPluginMcpServersResult => {
     log.warn(`Agent plugin ${plugin.rootPath}: ${message}`);
     diagnostics.push({
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       path: plugin.mcpConfigPath!,
       scope: plugin.scope,
       severity: "error",
@@ -649,6 +650,7 @@ export async function loadPluginMcpServers(
       const fullMessage = `${fileLabel} server '${serverName}': ${message}; skipping this server`;
       log.warn(`Agent plugin ${plugin.rootPath}: ${fullMessage}`);
       diagnostics.push({
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         path: plugin.mcpConfigPath!,
         scope: plugin.scope,
         severity,

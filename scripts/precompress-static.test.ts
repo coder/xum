@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
-import { brotliDecompressSync, gunzipSync } from "zlib";
+import { brotliCompressSync, brotliDecompressSync, constants, gunzipSync } from "zlib";
 
 const SCRIPT = path.join(import.meta.dir, "precompress-static.ts");
 
@@ -61,5 +61,39 @@ describe("precompress-static", () => {
     await runScript(dir);
     expect(await fs.readFile(path.join(dir, "main-AbCd1234.js.br"), "utf-8")).toBe("kept br");
     expect(await fs.readFile(path.join(dir, "main-AbCd1234.js.gz"), "utf-8")).toBe("kept gz");
+  });
+
+  test("uses brotli quality 11 from 256 KiB and 9 below, and both decompress to the exact file", async () => {
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), "precompress-static-"));
+    // Varied text, so quality 11 and quality 9 produce different bytes.
+    const text = (bytes: number) => {
+      let out = "";
+      for (let i = 0; out.length < bytes; i++) out += `const v${i} = ${(i * 7919) % 104729};\n`;
+      return out.slice(0, bytes);
+    };
+    const sizes = { "below-AbCd1234.js": 256 * 1024 - 1, "at-AbCd1234.js": 256 * 1024 };
+    for (const [name, bytes] of Object.entries(sizes)) {
+      await fs.writeFile(path.join(dir, name), text(bytes));
+    }
+
+    await runScript(dir);
+
+    const brotliAt = (data: Buffer, quality: number) =>
+      brotliCompressSync(data, {
+        params: {
+          [constants.BROTLI_PARAM_QUALITY]: quality,
+          [constants.BROTLI_PARAM_SIZE_HINT]: data.length,
+        },
+      });
+    for (const [name, quality] of [
+      ["below-AbCd1234.js", 9],
+      ["at-AbCd1234.js", 11],
+    ] as const) {
+      const data = await fs.readFile(path.join(dir, name));
+      const served = await fs.readFile(path.join(dir, `${name}.br`));
+      expect(brotliDecompressSync(served).equals(data)).toBe(true);
+      expect(served.equals(brotliAt(data, quality))).toBe(true);
+      expect(served.equals(brotliAt(data, quality === 11 ? 9 : 11))).toBe(false);
+    }
   });
 });
