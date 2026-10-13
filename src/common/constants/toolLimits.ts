@@ -24,6 +24,11 @@ export const WEB_FETCH_TIMEOUT_SECS = 15; // curl timeout
 export const WEB_FETCH_MAX_OUTPUT_BYTES = 64 * 1024; // 64KB markdown output
 export const WEB_FETCH_MAX_HTML_BYTES = 5 * 1024 * 1024; // 5MB HTML input (curl --max-filesize)
 
+// Page size for long text a tool returns whole from storage (task_await reports, catalog
+// skill bodies). Since #6268 the rebuild no longer cuts tool strings at 12,000 chars, so this is
+// the cap: the tool returns one page and the offset of the next one (offset_chars paging).
+export const TOOL_TEXT_PAGE_MAX_CHARS = 50_000;
+
 // MCP tool results are server-controlled and previously unbounded: a 62MB
 // Grafana trace result persisted into chat.jsonl froze the renderer and made
 // every later provider request exceed API payload limits (#3138). Bound the

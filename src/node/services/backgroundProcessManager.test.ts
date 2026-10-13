@@ -20,6 +20,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
+import { BASH_MAX_TOTAL_BYTES } from "@/common/constants/toolLimits";
 import { createBashTool } from "@/node/services/tools/bash";
 import { createBashOutputTool } from "@/node/services/tools/bash_output";
 import { TestTempDir, createTestToolConfig } from "@/node/services/tools/testHelpers";
@@ -3364,6 +3365,232 @@ describe("BackgroundProcessManager", () => {
       expect(resumed.success).toBe(true);
       if (!resumed.success) return;
       expect(resumed.output).toContain("partialdone");
+    });
+
+    describe("per-read cap", () => {
+      // Reads every page of the process's pending output (timeout 0 each), checking each page
+      // against foreground bash's byte cap.
+      async function readAllPages(processId: string, filter?: string, filterExclude?: boolean) {
+        const pages: string[] = [];
+        const notes: Array<string | undefined> = [];
+        for (let attempt = 0; attempt < 50; attempt++) {
+          const read = await manager.getOutput(processId, filter, filterExclude, 0);
+          expect(read.success).toBe(true);
+          if (!read.success) throw new Error(read.error);
+          expect(Buffer.byteLength(read.output, "utf8")).toBeLessThanOrEqual(BASH_MAX_TOTAL_BYTES);
+          pages.push(read.output);
+          notes.push(read.note);
+          if (!read.note?.includes("more bytes are unread")) return { pages, notes, last: read };
+        }
+        throw new Error("output never drained");
+      }
+
+      it("pages output over the cap instead of returning it in one read", async () => {
+        const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+          cwd: process.cwd(),
+          displayName: "test",
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        const lines = Array.from({ length: 1_000 }, (_, i) => `line ${i} ${"é".repeat(30)}`);
+        await fs.appendFile(path.join(result.outputDir, "output.log"), `${lines.join("\n")}\n`);
+
+        const { pages, notes } = await readAllPages(result.processId);
+        expect(pages.length).toBeGreaterThan(2);
+        expect(notes[0]).toContain(
+          `bash_output(process_id: "${result.processId}", timeout_secs: 0)`
+        );
+        expect(pages.join("\n")).toBe(lines.join("\n"));
+      });
+
+      it("splits a single line over the byte cap across reads", async () => {
+        const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+          cwd: process.cwd(),
+          displayName: "test",
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        const longLine = "x".repeat(BASH_MAX_TOTAL_BYTES * 2 + 5);
+        await fs.appendFile(path.join(result.outputDir, "output.log"), `${longLine}\nafter\n`);
+
+        const { pages } = await readAllPages(result.processId);
+        // Two full pages of the line's head, then its tail and the next line.
+        expect(pages).toHaveLength(3);
+        expect(pages.join("")).toBe(`${longLine}\nafter`);
+      });
+
+      // The tail of a split line no longer starts with what made its whole line match ("^M"),
+      // or starts with what the exclude filter drops ("^x"). It must still be returned.
+      it.each([
+        { name: "filter", filter: "^M", exclude: false },
+        { name: "filter_exclude", filter: "^x", exclude: true },
+      ])("keeps a split line's tail under its line's $name decision", async (testCase) => {
+        const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+          cwd: process.cwd(),
+          displayName: "test",
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        const longLine = `M${"x".repeat(BASH_MAX_TOTAL_BYTES * 2)}`;
+        const log = [longLine, testCase.exclude ? "xdrop" : "skip", "M after", ""].join("\n");
+        await fs.appendFile(path.join(result.outputDir, "output.log"), log);
+
+        const { pages } = await readAllPages(result.processId, testCase.filter, testCase.exclude);
+        expect(pages.join("")).toBe(`${longLine}\nM after`);
+      });
+
+      it("names the filter mode in the next-read call", async () => {
+        const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+          cwd: process.cwd(),
+          displayName: "test",
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        const lines = Array.from({ length: 1_000 }, (_, i) => `keep ${i} ${"y".repeat(40)}`);
+        await fs.appendFile(path.join(result.outputDir, "output.log"), `${lines.join("\n")}\n`);
+
+        const read = await manager.getOutput(result.processId, "^drop", true, 0);
+        expect(read.success && read.note).toContain(
+          `bash_output(process_id: "${result.processId}", timeout_secs: 0, filter: "^drop", filter_exclude: true)`
+        );
+      });
+
+      it("keeps at most a few pages of unread output in memory", async () => {
+        const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+          cwd: process.cwd(),
+          displayName: "test",
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        // About 30 pages of output, plus one line longer than the retention bound.
+        const lines = Array.from({ length: 8_000 }, (_, i) => `line ${i} ${"z".repeat(50)}`);
+        lines.splice(4_000, 0, "L".repeat(BASH_MAX_TOTAL_BYTES * 5));
+        const text = `${lines.join("\n")}\n`;
+        await fs.appendFile(path.join(result.outputDir, "output.log"), text);
+
+        const first = await manager.getOutput(result.processId, undefined, undefined, 0);
+        expect(first.success).toBe(true);
+        const proc = await manager.getProcess(result.processId);
+        if (proc == null) throw new Error("process missing");
+        const retained = Buffer.byteLength(proc.incompleteLineBuffer, "utf8");
+        expect(retained).toBeLessThanOrEqual(4 * BASH_MAX_TOTAL_BYTES);
+        // The rest stays on disk: the cursor sits right after what is in memory.
+        expect(proc.outputBytesRead).toBeLessThan(Buffer.byteLength(text, "utf8"));
+
+        // Nothing lost or read twice. (A split line's pieces come back as separate pages, so
+        // compare without line breaks.)
+        const { pages } = await readAllPages(result.processId);
+        const all = [first.success ? first.output : "", ...pages].join("").replaceAll("\n", "");
+        expect(all).toBe(lines.join(""));
+      });
+
+      // The cursor counts raw bytes and the text is decoded: an invalid byte decodes to U+FFFD
+      // (3 UTF-8 bytes for 1 raw byte), so a rewind by the text's size moved it too far back.
+      describe("output that is not valid UTF-8", () => {
+        async function readEverything(processId: string, logSize: number) {
+          const pages: string[] = [];
+          for (let attempt = 0; attempt < 200; attempt++) {
+            const read = await manager.getOutput(processId, undefined, undefined, 0);
+            expect(read.success).toBe(true);
+            if (!read.success) throw new Error(read.error);
+            const proc = await manager.getProcess(processId);
+            expect(proc?.outputBytesRead).toBeGreaterThanOrEqual(0);
+            expect(proc?.outputBytesRead).toBeLessThanOrEqual(logSize);
+            pages.push(read.output);
+            if (!read.note?.includes("more bytes are unread")) return pages;
+          }
+          throw new Error("output never drained");
+        }
+
+        it("reads 120 KB of 0xff bytes back once, in order", async () => {
+          const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+            cwd: process.cwd(),
+            displayName: "test",
+          });
+          expect(result.success).toBe(true);
+          if (!result.success) return;
+          // 120 lines of 1,000 0xff bytes: each decodes to 1,000 U+FFFD (3,000 bytes).
+          const line = Buffer.alloc(1_000, 0xff);
+          const raw = Buffer.concat(
+            Array.from({ length: 120 }, (_, i) =>
+              Buffer.concat([Buffer.from(`${i}:`), line, Buffer.from("\n")])
+            )
+          );
+          await fs.appendFile(path.join(result.outputDir, "output.log"), raw);
+
+          const pages = await readEverything(result.processId, raw.length);
+          expect(pages.length).toBeGreaterThan(4);
+          const expected = Array.from({ length: 120 }, (_, i) => `${i}:${"\uFFFD".repeat(1_000)}`);
+          expect(pages.join("\n")).toBe(expected.join("\n"));
+        });
+
+        it("still rewinds over valid text after an invalid byte", async () => {
+          const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+            cwd: process.cwd(),
+            displayName: "test",
+          });
+          expect(result.success).toBe(true);
+          if (!result.success) return;
+          const lines = Array.from({ length: 4_000 }, (_, i) => `line ${i} ${"z".repeat(50)}`);
+          const raw = Buffer.concat([
+            Buffer.from([0xff, 0x0a]),
+            Buffer.from(`${lines.join("\n")}\n`),
+          ]);
+          await fs.appendFile(path.join(result.outputDir, "output.log"), raw);
+
+          const first = await manager.getOutput(result.processId, undefined, undefined, 0);
+          expect(first.success).toBe(true);
+          const retained = (await manager.getProcess(result.processId))?.incompleteLineBuffer ?? "";
+          expect(Buffer.byteLength(retained, "utf8")).toBeLessThanOrEqual(4 * BASH_MAX_TOTAL_BYTES);
+          const rest = await readEverything(result.processId, raw.length);
+          const pages = [first.success ? first.output : "", ...rest];
+          // The invalid byte is in the first page: the rest is valid, so memory stays bounded.
+          expect(pages.join("\n")).toBe(["\uFFFD", ...lines].join("\n"));
+        });
+
+        it("keeps a character cut at a read boundary once, with the lines around it", async () => {
+          const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+            cwd: process.cwd(),
+            displayName: "test",
+          });
+          expect(result.success).toBe(true);
+          if (!result.success) return;
+          const outputPath = path.join(result.outputDir, "output.log");
+          const lines = Array.from({ length: 4_000 }, (_, i) => `line ${i} ${"z".repeat(50)}`);
+          // The first read ends inside "é" (0xC3 0xA9): its two halves decode separately.
+          const head = Buffer.concat([
+            Buffer.from(`${lines.join("\n")}\ncut-`),
+            Buffer.from([0xc3]),
+          ]);
+          await fs.appendFile(outputPath, head);
+          const first = await manager.getOutput(result.processId, undefined, undefined, 0);
+          expect(first.success).toBe(true);
+          const tail = Buffer.concat([Buffer.from([0xa9]), Buffer.from("-end\nafter\n")]);
+          await fs.appendFile(outputPath, tail);
+
+          const rest = await readEverything(result.processId, head.length + tail.length);
+          const all = [first.success ? first.output : "", ...rest].join("\n");
+          expect(all).toBe([...lines, "cut-\uFFFD\uFFFD-end", "after"].join("\n"));
+        });
+      });
+
+      it("keeps the rest after exit readable", async () => {
+        const result = await manager.spawn(runtime, testWorkspaceId, "seq 1 20000", {
+          cwd: process.cwd(),
+          displayName: "test",
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        for (let attempt = 0; attempt < 100; attempt++) {
+          if ((await manager.getProcess(result.processId))?.status !== "running") break;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+
+        const { pages, last } = await readAllPages(result.processId);
+        expect(last.success && last.status).toBe("exited");
+        const expected = Array.from({ length: 20_000 }, (_, i) => String(i + 1)).join("\n");
+        expect(pages.join("\n")).toBe(expected);
+      });
     });
 
     it("should return stderr from a running process", async () => {

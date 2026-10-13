@@ -9,8 +9,11 @@ import type { OnStepSettled } from "./streamManager";
 import { measureAssembledRequestBudgetForModel } from "./contextBudgetCounting";
 import { ContextBudgetExceededError } from "./contextBudgetError";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
+import { SUMMARIZER_INPUT_FRACTION } from "@/constants/continuousCompaction";
+import { measureCompactionInputTokens } from "./compactionInputSizing";
 import {
   anthropicBetweenToolsRouteAvailable,
+  canSwitchToAnthropic1MContext,
   isAnthropic1MEffectivelyEnabled,
 } from "@/common/utils/ai/providerOptions";
 import * as path from "path";
@@ -366,6 +369,11 @@ export interface StreamMessageOptions {
   muxMetadata?: MuxMessageMetadata;
   openaiTruncationModeOverride?: "auto" | "disabled";
   /**
+   * Compaction requests only: the share of the compaction input budget to trim to (default 1).
+   * AgentSession passes 0.5 for the one retry after the request hit context_exceeded.
+   */
+  compactionInputBudgetScale?: number;
+  /**
    * Model floor already resolved by AgentSession (config.json
    * minThinkingLevelByModel → resolveMinimumThinkingLevel). Passed down so
    * mid-turn overrides clamp against the same floor as the send-time level;
@@ -455,6 +463,71 @@ function pinCoderInstanceRawProvidersConfig(
       additionalProviders: [{ name: instance.name, type: instance.type }],
     },
   };
+}
+
+/**
+ * The estimated token budget a compaction request's history must fit (trimCompactionInput):
+ * SUMMARIZER_INPUT_FRACTION of the model's effective window, the share continuous compaction's
+ * summarizer uses, so the system prompt and the summary fit beside it. Per attempt, because a
+ * fallback model has its own window. Undefined, so nothing is trimmed, when the window is
+ * unknown, or when the model can still switch to 1M context: its context_exceeded retry does
+ * that and trims to the 1M window, which keeps more history than a trim to 200k would.
+ */
+export function resolveCompactionInputBudgetTokens(
+  modelString: string,
+  providerOptions: MuxProviderOptions | undefined,
+  providersConfig: ProvidersConfigMap | null | undefined,
+  scale = 1
+): number | undefined {
+  assert(scale > 0 && scale <= 1, "compaction input budget scale must be in (0, 1]");
+  if (canSwitchToAnthropic1MContext(modelString, providerOptions, providersConfig)) {
+    return undefined;
+  }
+  const limit = getEffectiveContextLimit(
+    modelString,
+    isAnthropic1MEffectivelyEnabled(modelString, providerOptions, providersConfig),
+    providersConfig,
+    { openaiWireFormat: providerOptions?.openai?.wireFormat }
+  );
+  return limit == null ? undefined : Math.floor(limit * SUMMARIZER_INPUT_FRACTION * scale);
+}
+
+/**
+ * assemblePromptPayload's compaction budget option: set for compaction requests only. A retry
+ * (scale set) on a model whose window is unknown has no window to derive a budget from; it
+ * trims to `scale` of the history's own estimate instead, so it does not resend the history
+ * that just hit context_exceeded unchanged.
+ */
+async function compactionInputBudgetOption(
+  isCompactionRequest: boolean,
+  model: {
+    modelString: string;
+    providerOptions: MuxProviderOptions | undefined;
+    providersConfig: ProvidersConfigMap | null | undefined;
+  },
+  history: MuxMessage[],
+  scale: number | undefined
+): Promise<{ compactionInputBudgetTokens?: number }> {
+  if (!isCompactionRequest) return {};
+  const budget =
+    resolveCompactionInputBudgetTokens(
+      model.modelString,
+      model.providerOptions,
+      model.providersConfig,
+      scale
+    ) ?? (scale == null ? undefined : await retryBudgetFromHistory(history, model, scale));
+  return budget == null ? {} : { compactionInputBudgetTokens: budget };
+}
+
+/** `scale` of the history's model-aware size: the same measure the trim then fits to it. */
+async function retryBudgetFromHistory(
+  history: MuxMessage[],
+  model: { modelString: string },
+  scale: number
+): Promise<number | undefined> {
+  const size = await measureCompactionInputTokens(history, model.modelString);
+  const budget = Math.floor(size * scale);
+  return budget > 0 ? budget : undefined;
 }
 
 /**
@@ -1005,6 +1078,7 @@ export class TurnRequestBuilder {
       contextBudgetRolloverAvailable,
       requestAssemblySnapshot,
       openaiTruncationModeOverride,
+      compactionInputBudgetScale,
       muxMetadata,
       minThinkingLevel: providedMinThinkingLevel,
     } = opts;
@@ -2909,6 +2983,17 @@ export class TurnRequestBuilder {
         const firstStepToolNames = new Set(
           forcedFirstStepToolNames?.length ? forcedFirstStepToolNames : toolNamesForSentinel
         );
+        // Recorded in the DevTools run so the replay verifier trims the same way.
+        const compactionInputBudget = await compactionInputBudgetOption(
+          isCompactionRequest,
+          {
+            modelString: seed.rawModelString,
+            providerOptions: effectiveMuxProviderOptions,
+            providersConfig: seed.providersConfig,
+          },
+          attemptProviderRequestMessages,
+          compactionInputBudgetScale
+        );
         // Shared by the initial build and thinking rebuilds so their assembly
         // inputs cannot drift apart mid-turn. `measureOnly` assembles a candidate history and
         // returns its estimate without throwing: it runs after `request.assemble`, so no hook,
@@ -2938,6 +3023,7 @@ export class TurnRequestBuilder {
               anthropicCacheTtl: effectiveAnthropicCacheTtl,
               workspaceId,
               tagHistoryItemIds: tokenBudgetEnabled,
+              ...compactionInputBudget,
               requestContextMessage: mcpAppContextMessage,
             },
             {
@@ -3006,6 +3092,7 @@ export class TurnRequestBuilder {
           engineSystem: attemptPayload.system,
           contextBudgetLimit: attemptPayload.contextBudgetLimit,
           contextBudgetEstimate: attemptPayload.contextBudgetEstimate,
+          ...compactionInputBudget,
           measureMessages: (history: MuxMessage[]) =>
             assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel, { history }),
           systemMessageTokens: attemptSystemTokens,
@@ -3319,6 +3406,8 @@ export class TurnRequestBuilder {
           ...(promptCacheScope.contextEpoch != null
             ? { contextEpoch: promptCacheScope.contextEpoch }
             : {}),
+          // Undefined unless this is a budgeted compaction request (JSON drops the key).
+          compactionInputBudgetTokens: primaryRequest.compactionInputBudgetTokens,
         });
         this.dependencies.trackPendingDevToolsRunMetadata(
           assistantMessageId,

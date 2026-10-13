@@ -10,8 +10,10 @@ import type { ReactElement, ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import * as RealExperimentsModule from "@/browser/hooks/useExperiments";
 import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
+import { formatKeybindForAria, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type {
   MemoryConsolidationRecordPayload,
@@ -218,7 +220,12 @@ function ApiWrapper(props: { children: ReactNode }) {
   if (!fake) {
     throw new Error("Test bug: assign `fake` before rendering MemoryTab");
   }
-  return <APIProvider client={createTestApiClient(fake.api)}>{props.children}</APIProvider>;
+  // Rendered Markdown code blocks read the theme.
+  return (
+    <ThemeProvider forcedTheme="dark">
+      <APIProvider client={createTestApiClient(fake.api)}>{props.children}</APIProvider>
+    </ThemeProvider>
+  );
 }
 
 function renderWithApi(ui: ReactElement) {
@@ -402,9 +409,12 @@ describe("MemoryTab", () => {
   test("opens a file, edits it, and saves with the loaded sha", async () => {
     fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
     fake.setContent("/memories/global/prefs.md", "likes tea", "sha-original");
-    const { findByText, findByLabelText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+    const { findByText, findByLabelText, findByRole } = renderWithApi(
+      <MemoryTab workspaceId="ws-1" />
+    );
 
     fireEvent.click(await findByText("prefs.md"));
+    fireEvent.click(await findByRole("button", { name: "Edit" }));
     const editor = (await findByLabelText("Memory file content")) as HTMLTextAreaElement;
     expect(editor.value).toBe("likes tea");
 
@@ -425,9 +435,12 @@ describe("MemoryTab", () => {
   test("shows a conflict banner when a save is rejected and reloads on request", async () => {
     fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
     fake.setContent("/memories/global/prefs.md", "likes tea", "sha-original");
-    const { findByText, findByLabelText } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+    const { findByText, findByLabelText, findByRole } = renderWithApi(
+      <MemoryTab workspaceId="ws-1" />
+    );
 
     fireEvent.click(await findByText("prefs.md"));
+    fireEvent.click(await findByRole("button", { name: "Edit" }));
     const editor = (await findByLabelText("Memory file content")) as HTMLTextAreaElement;
     fireEvent.input(editor, { target: { value: "draft edit" } });
 
@@ -441,6 +454,192 @@ describe("MemoryTab", () => {
     await waitFor(() => {
       expect(editor.value).toBe("agent version");
     });
+  });
+
+  test("a Markdown file opens in a rendered preview of its content", async () => {
+    fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
+    fake.setContent(
+      "/memories/global/prefs.md",
+      "---\ndescription: likes tea\n---\n# Heading\n\nbody text",
+      "sha-original"
+    );
+    const { findByText, findByRole, queryByRole, container } = renderWithApi(
+      <MemoryTab workspaceId="ws-1" />
+    );
+
+    fireEvent.click(await findByText("prefs.md"));
+    expect((await findByRole("heading", { name: "Heading" })).tagName).toBe("H1");
+    // Frontmatter is code, not a thematic break plus a setext heading.
+    await waitFor(() => {
+      expect(container.querySelector('[data-code-language="yaml"]')?.textContent).toContain(
+        "description: likes tea"
+      );
+    });
+    expect(container.querySelector("h2")).toBeNull();
+    expect(queryByRole("textbox", { name: "Memory file content" })).toBeNull();
+    // The shortcut tooltip describes the toggle's wrapper, so the focusable buttons carry it.
+    for (const name of ["Preview", "Edit"]) {
+      expect(queryByRole("button", { name })?.getAttribute("aria-keyshortcuts")).toBe(
+        formatKeybindForAria(KEYBINDS.TOGGLE_MARKDOWN_PREVIEW)
+      );
+    }
+  });
+
+  test("preview renders the unsaved draft and Save sends it from preview", async () => {
+    fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
+    fake.setContent("/memories/global/prefs.md", "likes tea", "sha-original");
+    const { findByText, findByLabelText, findByRole } = renderWithApi(
+      <MemoryTab workspaceId="ws-1" />
+    );
+
+    fireEvent.click(await findByText("prefs.md"));
+    fireEvent.click(await findByRole("button", { name: "Edit" }));
+    const editor = (await findByLabelText("Memory file content")) as HTMLTextAreaElement;
+    expect(editor.value).toBe("likes tea");
+    fireEvent.input(editor, { target: { value: "## Draft heading" } });
+
+    fireEvent.click(await findByRole("button", { name: "Preview" }));
+    await findByRole("heading", { name: "Draft heading" });
+    fireEvent.click(await findByLabelText("Save memory file"));
+
+    await waitFor(() => {
+      expect(fake!.state.saveCalls).toEqual([
+        {
+          path: "/memories/global/prefs.md",
+          content: "## Draft heading",
+          expectedSha256: "sha-original",
+        },
+      ]);
+    });
+  });
+
+  test("the save shortcut works from preview, outside the textarea", async () => {
+    fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
+    fake.setContent("/memories/global/prefs.md", "# Heading", "sha-original");
+    const { findByText, findByRole } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    fireEvent.click(await findByText("prefs.md"));
+    await findByRole("heading", { name: "Heading" });
+    fireEvent.keyDown(document.activeElement!, { key: "Enter", ctrlKey: true });
+
+    await waitFor(() => {
+      expect(fake!.state.saveCalls).toEqual([
+        { path: "/memories/global/prefs.md", content: "# Heading", expectedSha256: "sha-original" },
+      ]);
+    });
+  });
+
+  test("the toggle shortcut switches between preview and edit, repeatedly from the editor", async () => {
+    fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
+    fake.setContent("/memories/global/prefs.md", "# Heading", "sha-original");
+    const { findByText, findByRole, queryByRole } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    fireEvent.click(await findByText("prefs.md"));
+    await findByRole("heading", { name: "Heading" });
+    // Opening focuses the editor, so the shortcut works without clicking into it first.
+    fireEvent.keyDown(document.activeElement!, { key: "e", ctrlKey: true });
+    const editor = await findByRole("textbox", { name: "Memory file content" });
+    expect(document.activeElement).toBe(editor);
+
+    fireEvent.keyDown(editor, { key: "e", ctrlKey: true });
+    await findByRole("heading", { name: "Heading" });
+    expect(queryByRole("textbox", { name: "Memory file content" })).toBeNull();
+    // happy-dom keeps focus on the hidden textarea where a browser drops it to
+    // <body>, so check that focus moved to the editor root explicitly.
+    expect(document.activeElement).toBe(await findByRole("group", { name: /prefs\.md/ }));
+
+    fireEvent.keyDown(document.activeElement!, { key: "e", ctrlKey: true });
+    expect(document.activeElement).toBe(
+      await findByRole("textbox", { name: "Memory file content" })
+    );
+  });
+
+  test("a held toggle shortcut switches once, not on every key repeat", async () => {
+    fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
+    fake.setContent("/memories/global/prefs.md", "# Heading", "sha-original");
+    const { findByText, findByRole, queryByRole } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    fireEvent.click(await findByText("prefs.md"));
+    await findByRole("heading", { name: "Heading" });
+    fireEvent.keyDown(document.activeElement!, { key: "e", ctrlKey: true });
+    const editor = await findByRole("textbox", { name: "Memory file content" });
+
+    // A repeat is still swallowed, so the browser's own handling of the chord does not run either.
+    expect(fireEvent.keyDown(editor, { key: "e", ctrlKey: true, repeat: true })).toBe(false);
+    expect(queryByRole("textbox", { name: "Memory file content" })).toBe(editor);
+  });
+
+  test("a Markdown file that fails to load shows no preview toggle", async () => {
+    fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
+    const { findByText, queryByRole } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    fireEvent.click(await findByText("prefs.md"));
+    await findByText("No memory file at /memories/global/prefs.md");
+    expect(queryByRole("button", { name: "Preview" })).toBeNull();
+  });
+
+  test("a preview round trip keeps the same textarea with its value and selection", async () => {
+    fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
+    fake.setContent("/memories/global/prefs.md", "likes tea", "sha-original");
+    const { findByText, findByRole, queryByRole } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    fireEvent.click(await findByText("prefs.md"));
+    fireEvent.click(await findByRole("button", { name: "Edit" }));
+    const editor = (await findByRole("textbox", {
+      name: "Memory file content",
+    })) as HTMLTextAreaElement;
+    fireEvent.input(editor, { target: { value: "likes green tea" } });
+    editor.setSelectionRange(6, 11);
+
+    fireEvent.click(await findByRole("button", { name: "Preview" }));
+    expect(queryByRole("textbox", { name: "Memory file content" })).toBeNull();
+    fireEvent.click(await findByRole("button", { name: "Edit" }));
+
+    expect(await findByRole("textbox", { name: "Memory file content" })).toBe(editor);
+    expect(editor.value).toBe("likes green tea");
+    expect([editor.selectionStart, editor.selectionEnd]).toEqual([6, 11]);
+    expect(document.activeElement).toBe(editor);
+  });
+
+  test("focus returns to the editor after Reload removes its banner, so shortcuts keep working", async () => {
+    fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
+    fake.setContent("/memories/global/prefs.md", "# Heading", "sha-original");
+    const { findByText, findByRole, findByLabelText, queryByRole } = renderWithApi(
+      <MemoryTab workspaceId="ws-1" />
+    );
+
+    fireEvent.click(await findByText("prefs.md"));
+    await findByRole("heading", { name: "Heading" });
+    fake.state.nextSaveConflict = true;
+    fireEvent.click(await findByLabelText("Save memory file"));
+    const reload = await findByLabelText("Reload memory file");
+    reload.focus();
+    fireEvent.click(reload);
+    await waitFor(() => expect(queryByRole("alert")).toBeNull());
+
+    fireEvent.keyDown(document.activeElement!, { key: "e", ctrlKey: true });
+    expect(document.activeElement).toBe(
+      await findByRole("textbox", { name: "Memory file content" })
+    );
+  });
+
+  test("a non-Markdown file opens in the editor with no preview toggle", async () => {
+    fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/notes.txt" })]);
+    fake.setContent("/memories/global/notes.txt", "# not a heading", "sha-original");
+    const { findByText, findByLabelText, queryByRole } = renderWithApi(
+      <MemoryTab workspaceId="ws-1" />
+    );
+
+    fireEvent.click(await findByText("notes.txt"));
+    const editor = (await findByLabelText("Memory file content")) as HTMLTextAreaElement;
+    await waitFor(() => expect(editor.value).toBe("# not a heading"));
+    expect(queryByRole("button", { name: "Preview" })).toBeNull();
+
+    // happy-dom skips React's bubbling keydown handlers when the target lacks focus.
+    editor.focus();
+    fireEvent.keyDown(editor, { key: "e", ctrlKey: true });
+    // The textarea stays mounted in Preview, hidden, so a visible textbox means no mode switch.
+    expect(queryByRole("textbox", { name: "Memory file content" })).toBe(editor);
   });
 
   test("deletes a file from the list after confirming the modal", async () => {

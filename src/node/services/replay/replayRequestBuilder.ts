@@ -92,6 +92,12 @@ export interface ReplayRequestInputs {
    * production rewrites into tool_reference blocks. Derived from the recorded wire tools.
    */
   deferLoadingToolNames?: ReadonlySet<string>;
+  /**
+   * The budget production trimmed a compaction request's history to, from the recorded
+   * DevTools run (DevToolsRun.compactionInputBudgetTokens). It depends on the 1M setting and
+   * the retry scale, which no durable log row carries.
+   */
+  compactionInputBudgetTokens?: number;
   workspaceId: string;
 }
 
@@ -232,6 +238,7 @@ export async function buildReplayRequest(inputs: ReplayRequestInputs): Promise<R
     anthropicCacheTtl: inputs.anthropicCacheTtl,
     workspaceId: inputs.workspaceId,
     deferLoadingToolNames: inputs.deferLoadingToolNames,
+    compactionInputBudgetTokens: inputs.compactionInputBudgetTokens,
     requestContextMessage: inputs.mcpAppModelContext ?? undefined,
   });
 

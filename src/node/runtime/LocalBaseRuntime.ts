@@ -2,7 +2,8 @@ import { spawn } from "child_process";
 import * as fs from "fs";
 import * as fsPromises from "fs/promises";
 import * as path from "path";
-import { Readable, Writable } from "stream";
+import type { Readable } from "stream";
+import { Writable } from "stream";
 
 import type {
   Runtime,
@@ -35,6 +36,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
 import { buildShellExport } from "./shellEnv";
 import { sanitizeXumChildEnv } from "./childProcessEnv";
+import { nodeReadableToWeb } from "@/node/utils/nodeReadableToWeb";
 
 /**
  * Acquire a regular file for ReadFileOptions.requireRegularFile.
@@ -121,8 +123,7 @@ function wrapNodeReadable(
     start: async (controller: ReadableStreamDefaultController<Uint8Array>) => {
       try {
         const nodeStream = await acquire();
-        // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-        const webStream = Readable.toWeb(nodeStream) as unknown as ReadableStream<Uint8Array>;
+        const webStream = nodeReadableToWeb(nodeStream);
         reader = webStream.getReader();
         if (cancelled || abortSignal?.aborted) {
           // Landed while acquiring (reader did not exist yet): release the source now.
@@ -283,11 +284,10 @@ export abstract class LocalBaseRuntime implements Runtime {
     // Wrap in DisposableProcess for automatic cleanup
     const disposable = new DisposableProcess(childProcess);
 
-    // Convert Node.js streams to Web Streams
-    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-    const stdout = Readable.toWeb(childProcess.stdout) as unknown as ReadableStream<Uint8Array>;
-    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-    const stderr = Readable.toWeb(childProcess.stderr) as unknown as ReadableStream<Uint8Array>;
+    // Convert Node.js streams to Web Streams. Not Readable.toWeb: on Bun 1.4.3 it can throw an
+    // uncaught error when the bash tool cancels a reader on output overflow (nodeReadableToWeb).
+    const stdout = nodeReadableToWeb(childProcess.stdout);
+    const stderr = nodeReadableToWeb(childProcess.stderr);
     // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     const stdin = Writable.toWeb(childProcess.stdin) as unknown as WritableStream<Uint8Array>;
 

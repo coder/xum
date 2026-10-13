@@ -400,6 +400,52 @@ export interface WorkspaceUsageState {
   recentTurnCacheHealth?: TurnCacheHealth[];
 }
 
+/**
+ * Prompt-cache health of the newest completed assistant turns, newest first.
+ *
+ * A turn sums every usage the session ledger charges for its message (its own usage plus
+ * model-backed tool and refused-attempt usage), so a turn's rewrite cost matches its share
+ * of the session cost.
+ */
+function getRecentTurnCacheHealth(
+  messages: readonly MuxMessage[],
+  forkedAt: number | undefined
+): TurnCacheHealth[] {
+  const turns: TurnCacheHealth[] = [];
+  for (let i = messages.length - 1; i >= 0 && turns.length < RECENT_TURN_CACHE_HEALTH_LIMIT; i--) {
+    const turn = getTurnCacheHealth(messages[i], forkedAt);
+    if (turn) turns.push(turn);
+  }
+  return turns;
+}
+
+/** One message's turn row, or undefined when the message is not a priced own turn. */
+function getTurnCacheHealth(
+  msg: MuxMessage,
+  forkedAt: number | undefined
+): TurnCacheHealth | undefined {
+  const metadata = msg.metadata;
+  // Compaction summaries keep `usage` but CompactionHandler strips their
+  // providerMetadata (cache-write counts included), so their cache health is unknown.
+  if (msg.role !== "assistant" || metadata === undefined || metadata.compacted) return undefined;
+  // Rows a fork copied from its parent are not the fork's own turns.
+  if (isInheritedForkRow(metadata.timestamp, forkedAt)) return undefined;
+  // Priced exactly as SessionUsageService's history rebuild: neither the current
+  // model nor the live provider mapping, only the record-time model identity.
+  const turnUsages = getAssistantMessageModelUsages(metadata);
+  if (turnUsages.length === 0) return undefined;
+  return { messageId: msg.id, timestamp: metadata.timestamp, ...getCacheHealth(turnUsages) };
+}
+
+/**
+ * True for a row a fork copied from its parent: at or before the ledger's `forkedAt`.
+ * Rows without a timestamp, and workspaces without the marker (old forks, non-forks),
+ * count as the workspace's own.
+ */
+function isInheritedForkRow(timestamp: number | undefined, forkedAt: number | undefined): boolean {
+  return timestamp !== undefined && forkedAt !== undefined && timestamp <= forkedAt;
+}
+
 /** Turns shown in the Costs tab's prompt-cache table; bounds work per usage bump. */
 const RECENT_TURN_CACHE_HEALTH_LIMIT = 10;
 
@@ -813,6 +859,81 @@ export function resolveSidebarAgentStatus(input: {
     : (activity?.todoStatus ??
       (activity?.hasTodos === false ? undefined : deriveTodoStatus(todos)));
   return displayStatus ?? liveTodoStatus ?? fallbackAgentStatus ?? persistedTodoStatus;
+}
+
+/**
+ * Context usage of the newest assistant message in the current compaction epoch, for the
+ * context indicator. Pre-boundary messages carry stale contextUsage from before compaction;
+ * including them inflates the usage indicator and triggers premature auto-compaction.
+ */
+export function findLastContextUsage(
+  messages: readonly MuxMessage[],
+  currentModel: string | undefined,
+  resolveMetadataModel: (model: string) => string
+): ChatUsageDisplay | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (isDurableCompactionBoundaryMarker(msg)) {
+      // Idle/manual compaction boundary messages can include a post-compaction
+      // context estimate. Read it before breaking so context usage does not
+      // disappear when switching back to a compacted workspace.
+      const rawUsage = msg.metadata?.contextUsage;
+      if (rawUsage && msg.role === "assistant") {
+        const msgModel = msg.metadata?.model ?? currentModel ?? "unknown";
+        return createDisplayUsage(rawUsage, msgModel, undefined);
+      }
+      break;
+    }
+    if (msg.role === "assistant") {
+      if (msg.metadata?.compacted) continue;
+      const rawUsage = msg.metadata?.contextUsage;
+      const providerMeta = msg.metadata?.contextProviderMetadata ?? msg.metadata?.providerMetadata;
+      if (rawUsage) {
+        const msgModel = msg.metadata?.model ?? currentModel ?? "unknown";
+        return createDisplayUsage(rawUsage, msgModel, providerMeta, resolveMetadataModel(msgModel));
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * onChat subscribe input. A boolean auto-retry setting left in localStorage by older builds
+ * is forwarded once as `legacyAutoRetryEnabled` (the caller drops it after the subscribe
+ * succeeds); any other stored value is malformed and is dropped here.
+ */
+export function buildOnChatInput(
+  workspaceId: string,
+  mode: OnChatMode | undefined
+): {
+  input: {
+    workspaceId: string;
+    mode: OnChatMode | undefined;
+    legacyAutoRetryEnabled?: boolean;
+    batchReplay: true;
+    replayWindow: true;
+  };
+  legacyAutoRetryEnabled: boolean | undefined;
+} {
+  const autoRetryKey = getAutoRetryKey(workspaceId);
+  const legacyRaw = readPersistedState<unknown>(autoRetryKey, undefined);
+  const legacyAutoRetryEnabled = typeof legacyRaw === "boolean" ? legacyRaw : undefined;
+  if (legacyRaw !== undefined && legacyAutoRetryEnabled === undefined)
+    updatePersistedState<boolean | undefined>(autoRetryKey, undefined);
+  // batchReplay: this store unpacks `message-batch` replay events (#4868).
+  // replayWindow: a full replay sends only the newest rows of the active epoch; older rows
+  // load through loadOlderHistory (#4961).
+  const input =
+    legacyAutoRetryEnabled === undefined
+      ? { workspaceId, mode, batchReplay: true as const, replayWindow: true as const }
+      : {
+          workspaceId,
+          mode,
+          legacyAutoRetryEnabled,
+          batchReplay: true as const,
+          replayWindow: true as const,
+        };
+  return { input, legacyAutoRetryEnabled };
 }
 
 /**
@@ -3398,70 +3519,11 @@ export class WorkspaceStore {
         }
       }
 
-      // Get last message's context usage — only search within the current
-      // compaction epoch. Pre-boundary messages carry stale contextUsage from
-      // before compaction; including them inflates the usage indicator and
-      // triggers premature auto-compaction.
-      const lastContextUsage = (() => {
-        for (let i = messages.length - 1; i >= 0; i--) {
-          const msg = messages[i];
-          if (isDurableCompactionBoundaryMarker(msg)) {
-            // Idle/manual compaction boundary messages can include a post-compaction
-            // context estimate. Read it before breaking so context usage does not
-            // disappear when switching back to a compacted workspace.
-            const rawUsage = msg.metadata?.contextUsage;
-            if (rawUsage && msg.role === "assistant") {
-              const msgModel = msg.metadata?.model ?? model ?? "unknown";
-              return createDisplayUsage(rawUsage, msgModel, undefined);
-            }
-            break;
-          }
-          if (msg.role === "assistant") {
-            if (msg.metadata?.compacted) continue;
-            const rawUsage = msg.metadata?.contextUsage;
-            const providerMeta =
-              msg.metadata?.contextProviderMetadata ?? msg.metadata?.providerMetadata;
-            if (rawUsage) {
-              const msgModel = msg.metadata?.model ?? model ?? "unknown";
-              return createDisplayUsage(
-                rawUsage,
-                msgModel,
-                providerMeta,
-                this.resolveMetadataModel(msgModel)
-              );
-            }
-          }
-        }
-        return undefined;
-      })();
+      const lastContextUsage = findLastContextUsage(messages, model, (msgModel) =>
+        this.resolveMetadataModel(msgModel)
+      );
 
-      // A turn sums every usage the session ledger charges for its message (its own
-      // usage plus model-backed tool and refused-attempt usage), so a turn's rewrite
-      // cost matches its share of the session cost.
-      const recentTurnCacheHealth: TurnCacheHealth[] = [];
-      for (
-        let i = messages.length - 1;
-        i >= 0 && recentTurnCacheHealth.length < RECENT_TURN_CACHE_HEALTH_LIMIT;
-        i--
-      ) {
-        const msg = messages[i];
-        // Compaction summaries keep `usage` but CompactionHandler strips their
-        // providerMetadata (cache-write counts included), so their cache health is unknown.
-        if (msg.role !== "assistant" || msg.metadata?.compacted) continue;
-        const turnUsage = sumUsageHistory(
-          // No fallback to the current model: a row without a record-time model stays
-          // "unknown" (rewrite cost "-"), as in SessionUsageService's history rebuild.
-          getAssistantMessageModelUsages(msg.metadata, {
-            resolveMetadataModel: (msgModel) => this.resolveMetadataModel(msgModel),
-          }).map((entry) => entry.usage)
-        );
-        if (!turnUsage) continue;
-        recentTurnCacheHealth.push({
-          messageId: msg.id,
-          timestamp: msg.metadata?.timestamp,
-          ...getCacheHealth(turnUsage),
-        });
-      }
+      const recentTurnCacheHealth = getRecentTurnCacheHealth(messages, sessionData?.forkedAt);
 
       // Live streaming data (unchanged)
       const activeStreamId = aggregator.getActiveStreamMessageId();
@@ -4389,6 +4451,36 @@ export class WorkspaceStore {
   }
 
   /**
+   * onChat loop error policy: log the error, and return true to stop the loop when retrying
+   * cannot help (a refused session tape replay, or a workspace removed during validation).
+   */
+  private handleOnChatError(workspaceId: string, error: unknown, attemptAborted: boolean): boolean {
+    const abortError = isAbortError(error);
+    if (attemptAborted) {
+      if (!abortError)
+        console.warn(
+          "[WorkspaceStore] onChat subscription aborted for " + workspaceId + "; retrying..."
+        );
+    } else if (isSessionTapeReplayRefusal(error)) {
+      // Perf harness (XUM_REPLAY_TAPES): this workspace is mapped to a tape the backend
+      // cannot serve. Retrying cannot help and there is no live fallback: show the refusal
+      // and stop the loop.
+      this.showSessionTapeReplayRefusal(workspaceId, error.message);
+      return true;
+    } else if (isIteratorValidationFailed(error)) {
+      if (!this.isWorkspaceRegistered(workspaceId)) return true;
+      console.error(
+        "[WorkspaceStore] Event validation failed for " + workspaceId + ": " + error.message
+      );
+    } else if (!abortError)
+      console.error(
+        "[WorkspaceStore] Error in onChat subscription for " + workspaceId + ":",
+        error
+      );
+    return false;
+  }
+
+  /**
    * Subscribe to workspace chat events (history replay + live streaming).
    * Retries on unexpected iterator termination to avoid requiring a full app restart.
    */
@@ -4433,21 +4525,11 @@ export class WorkspaceStore {
             };
           }
         }
-        const autoRetryKey = getAutoRetryKey(workspaceId);
-        const legacyRaw = readPersistedState<unknown>(autoRetryKey, undefined);
-        const legacyAutoRetryEnabled = typeof legacyRaw === "boolean" ? legacyRaw : undefined;
-        if (legacyRaw !== undefined && legacyAutoRetryEnabled === undefined)
-          updatePersistedState<boolean | undefined>(autoRetryKey, undefined);
-        // batchReplay: this store unpacks `message-batch` replay events (#4868).
-        // replayWindow: a full replay sends only the newest rows of the active epoch; older rows
-        // load through loadOlderHistory (#4961).
-        const input =
-          legacyAutoRetryEnabled === undefined
-            ? { workspaceId, mode, batchReplay: true, replayWindow: true }
-            : { workspaceId, mode, legacyAutoRetryEnabled, batchReplay: true, replayWindow: true };
+        const { input, legacyAutoRetryEnabled } = buildOnChatInput(workspaceId, mode);
         const iterator = await client.workspace.onChat(input, { signal: attemptSignal });
+        // The backend took over the legacy setting: drop it only after the subscribe succeeded.
         if (legacyAutoRetryEnabled !== undefined)
-          updatePersistedState<boolean | undefined>(autoRetryKey, undefined);
+          updatePersistedState<boolean | undefined>(getAutoRetryKey(workspaceId), undefined);
         const isFullReplay = !mode || mode.type === "full";
         if (isFullReplay) this.resetChatStateForReplay(workspaceId);
         const established = this.chatTransientState.get(workspaceId);
@@ -4473,30 +4555,8 @@ export class WorkspaceStore {
                 workspaceId +
                 "; retrying..."
         ),
-      onError: (error, { attemptAborted }) => {
-        const abortError = isAbortError(error);
-        if (attemptAborted) {
-          if (!abortError)
-            console.warn(
-              "[WorkspaceStore] onChat subscription aborted for " + workspaceId + "; retrying..."
-            );
-        } else if (isSessionTapeReplayRefusal(error)) {
-          // Perf harness (XUM_REPLAY_TAPES): this workspace is mapped to a tape the backend
-          // cannot serve. Retrying cannot help and there is no live fallback: show the refusal
-          // and stop the loop.
-          this.showSessionTapeReplayRefusal(workspaceId, error.message);
-          return true;
-        } else if (isIteratorValidationFailed(error)) {
-          if (!this.isWorkspaceRegistered(workspaceId)) return true;
-          console.error(
-            "[WorkspaceStore] Event validation failed for " + workspaceId + ": " + error.message
-          );
-        } else if (!abortError)
-          console.error(
-            "[WorkspaceStore] Error in onChat subscription for " + workspaceId + ":",
-            error
-          );
-      },
+      onError: (error, { attemptAborted }) =>
+        this.handleOnChatError(workspaceId, error, attemptAborted),
       onAttemptFinished: () => {
         // The transport withholds this callback once the loop signal is aborted, so the entry
         // is this loop's own attempt; the guard keeps that true by construction should a

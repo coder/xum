@@ -209,6 +209,65 @@ const CATEGORY_EVENTS: TimelineEvent[] = [
   }),
 ];
 
+// Prompt-cache prefix breaks carry block metadata only (roles, types, tool names, sizes).
+const CACHE_BREAK_EVENTS: TimelineEvent[] = [
+  makeEvent("cache-break-turn", "cache.prefix_break", 25, {
+    data: {
+      model: "anthropic:claude-sonnet-5-5",
+      description:
+        "Prompt cache prefix broke in messages at block 6 of 7: user tool_result read_file (16820 chars) -> user tool_result read_file (12043 chars)",
+      promptCacheBreak: {
+        section: "messages",
+        boundary: "turn",
+        blockIndex: 6,
+        previousBlockCount: 7,
+        nextBlockCount: 7,
+        previous: { role: "user", type: "tool_result", length: 16_820, toolName: "read_file" },
+        next: { role: "user", type: "tool_result", length: 12_043, toolName: "read_file" },
+      },
+    },
+  }),
+  makeEvent("cache-break-rule-1", "turn.completed", 24, {
+    status: "completed",
+    data: { durationMs: 42_000 },
+  }),
+  makeEvent("cache-break-tools", "cache.prefix_break", 23, {
+    data: {
+      model: "anthropic:claude-opus-5-5",
+      description:
+        "Prompt cache prefix broke in tools at block 31 of 214: request system_options (93 chars) -> tool function mcp_search_issues (2418 chars)",
+      promptCacheBreak: {
+        section: "tools",
+        boundary: "turn",
+        blockIndex: 31,
+        previousBlockCount: 214,
+        nextBlockCount: 215,
+        previous: { role: "request", type: "system_options", length: 93 },
+        next: { role: "tool", type: "function", length: 2_418, toolName: "mcp_search_issues" },
+      },
+    },
+  }),
+  makeEvent("cache-break-rule-2", "turn.completed", 22, {
+    status: "completed",
+    data: { durationMs: 95_000 },
+  }),
+  makeEvent("cache-break-step", "cache.prefix_break", 21, {
+    data: {
+      model: "anthropic:claude-sonnet-5-5",
+      description:
+        "Prompt cache prefix broke in messages at block 12 of 13: assistant tool_use bash (240 chars) -> (end of request)",
+      promptCacheBreak: {
+        section: "messages",
+        boundary: "step",
+        blockIndex: 12,
+        previousBlockCount: 13,
+        nextBlockCount: 12,
+        previous: { role: "assistant", type: "tool_use", length: 240, toolName: "bash" },
+      },
+    },
+  }),
+];
+
 const STORY_STORE: TimelineWorkspaceStore = {
   getWorkspaceState: () => ({ messages: [], muxMessages: [], hasOlderHistory: false }),
   loadOlderHistory: () => Promise.resolve("exhausted"),
@@ -296,6 +355,25 @@ export const Phone390: Story = {
       matrix: { viewports: ["phone"] },
     },
   },
+};
+
+export const PromptCacheBreaks: Story = {
+  args: {
+    workspaceId: `${WORKSPACE_ID}-cache-breaks`,
+    timeline: { ...populatedTimeline, events: CACHE_BREAK_EVENTS },
+    workspaceStore: STORY_STORE,
+  },
+};
+
+export const PromptCacheBreaksPhone390: Story = {
+  args: {
+    workspaceId: `${WORKSPACE_ID}-cache-breaks-phone`,
+    timeline: { ...populatedTimeline, events: CACHE_BREAK_EVENTS },
+    workspaceStore: STORY_STORE,
+  },
+  globals: Phone390.globals,
+  decorators: Phone390.decorators,
+  parameters: Phone390.parameters,
 };
 
 export const AgentEventCategories: Story = {
