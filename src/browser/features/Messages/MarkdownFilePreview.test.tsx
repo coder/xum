@@ -47,4 +47,20 @@ describe("MarkdownFilePreview", () => {
     expect(linkTargets).toEqual(["https://example.com/page"]);
     expect(view.container.textContent).toContain("guide");
   });
+
+  test("raw HTML in a file shows as typed", async () => {
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <MarkdownFilePreview
+          content={"say <b>x</b> here\n\n<details><summary>more</summary>hidden</details>"}
+        />
+      </ThemeProvider>
+    );
+
+    await waitFor(() => expect(view.container.textContent).toContain("say <b>x</b> here"));
+    expect(view.container.textContent).toContain(
+      "<details><summary>more</summary>hidden</details>"
+    );
+    expect(view.container.querySelector("b, details")).toBeNull();
+  });
 });

@@ -183,6 +183,9 @@ export const Editor: Story = {
     const tooltip = await within(document.body).findByRole("tooltip");
     await expect(tooltip.querySelector(".mobile-hide-shortcut-hints")).not.toBeNull();
     await userEvent.unhover(toggle);
+    // Radix keeps a hoverable tooltip open after pointerleave until a pointermove leaves its
+    // grace area, which a synthetic unhover never sends, so close it with Escape.
+    await userEvent.keyboard("{Escape}");
     await waitFor(() => expect(within(document.body).queryByRole("tooltip")).toBeNull());
     await userEvent.hover(canvasElement);
     blurActiveElement();
