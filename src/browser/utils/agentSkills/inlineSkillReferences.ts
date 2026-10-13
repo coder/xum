@@ -68,8 +68,12 @@ function isQualifiedTokenChar(ch: string | undefined): boolean {
 /** The qualified lookup name starting at `start`, or null when none parses there. */
 function matchQualifiedSkillToken(text: string, start: number): string | null {
   QUALIFIED_SKILL_TOKEN_RE.lastIndex = start;
-  const token = QUALIFIED_SKILL_TOKEN_RE.exec(text)?.[0].replace(/-+$/, "");
-  return token != null && parseSkillLookupName(token)?.pluginName != null ? token : null;
+  const match = QUALIFIED_SKILL_TOKEN_RE.exec(text)?.[0];
+  // `_` continues a token but is invalid in names: `$pstack:tdd_notes` is no
+  // qualified reference, just as a bare `$tdd_notes` is no reference.
+  if (match == null || text[start + match.length] === "_") return null;
+  const token = match.replace(/-+$/, "");
+  return parseSkillLookupName(token)?.pluginName != null ? token : null;
 }
 
 /** Wrap a bare candidate in its qualified form when one parses at the same `$`. */
@@ -291,10 +295,9 @@ export async function resolveInlineSkillReferences(
     }
     seenSkillNames.add(candidate.skillName);
 
-    // An unknown `$plugin:skill` falls back to its bare `$plugin` prefix.
     const skill =
       (await resolveInlineSkill(candidate.skillName, options)) ??
-      (candidate.fallback ? await resolveInlineSkill(candidate.fallback.skillName, options) : null);
+      (await resolveInlineSkillFallback(candidate, options));
     if (!skill) {
       continue;
     }
@@ -303,6 +306,24 @@ export async function resolveInlineSkillReferences(
   }
 
   return dedupeAgentSkillRefs(refs);
+}
+
+/**
+ * An unknown `$plugin:skill` falls back to its bare `$plugin` prefix (`$tdd:notes`
+ * loads `tdd`), but only when no loaded skill belongs to that plugin: then the
+ * text after `:` is prose. For a known plugin the user meant one of its skills,
+ * and the client cannot tell a missing skill from an unreadable one.
+ */
+async function resolveInlineSkillFallback(
+  candidate: InlineSkillCandidate,
+  options: InlineSkillResolveOptions
+): Promise<InvocableSkill | null> {
+  if (candidate.fallback == null) return null;
+  const pluginName = parseSkillLookupName(candidate.skillName)?.pluginName;
+  if (options.agentSkillDescriptors.some((descriptor) => descriptor.pluginName === pluginName)) {
+    return null;
+  }
+  return resolveInlineSkill(candidate.fallback.skillName, options);
 }
 
 async function resolveInlineSkill(

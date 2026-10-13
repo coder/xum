@@ -405,6 +405,24 @@ describe("plugin skill namespaces ($plugin:skill)", () => {
     expect(refs.map((ref) => ref.skillName)).toEqual(["pstack:tdd", "tdd"]);
   });
 
+  test("a qualified token followed by `_` is no candidate, like a bare `$tdd_notes`", () => {
+    expect(extractInlineSkillReferenceCandidates("$pstack:tdd_notes and $tdd_notes")).toEqual([
+      { skillName: "pstack", startIndex: 0, endIndex: 7 },
+    ]);
+  });
+
+  test("does not fall back to the bare prefix when the qualifier names a known plugin", async () => {
+    // `$pstack:missing` meant a pstack skill: attaching an unrelated bare `pstack` would be wrong,
+    // and the client cannot tell a missing skill from an unreadable one.
+    const refs = await resolveInlineSkillReferences({
+      candidates: extractInlineSkillReferenceCandidates("$pstack:missing"),
+      agentSkillDescriptors: [descriptor("pstack"), { ...descriptor("tdd"), pluginName: "pstack" }],
+      api: apiClient(() => Promise.reject(new Error("EACCES"))),
+      discovery: { kind: "project", projectPath: "/repo" },
+    });
+    expect(refs).toEqual([]);
+  });
+
   test("keeps the typed qualified name when the remote fallback resolves it", async () => {
     // The backend package carries the bare frontmatter name; `tdd` alone could load another skill.
     const api = apiClient(() => Promise.resolve(skillPackage("tdd")));
