@@ -933,6 +933,19 @@ body,
     min-width: 44px;
   }
 
+  /* A checkbox in a label or a clickable row: the row is the touch target, so the row gets the
+     44px minimum and the checkbox keeps its drawn size. A 44px checkbox there sat off its label's
+     line in top-aligned rows (#5835). A checkbox with a sibling label keeps its own 44px hit
+     area; the Checkbox component centers its drawn box inside it. */
+  :is(label, [role="button"]) button[role="checkbox"] {
+    min-height: 0;
+    min-width: 0;
+  }
+
+  label:has(button[role="checkbox"]) {
+    min-height: 44px;
+  }
+
   /* Full-width rows above the composer (TODO, sub-agents, background bash) read as a list;
      44px each made a short stack taller than the composer. */
   .mobile-touch-row {

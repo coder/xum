@@ -2394,3 +2394,90 @@ describe("Right Sidebar: Add Tool palette action (#5767)", () => {
     });
   });
 });
+
+test("app view entries tell several calls of one tool apart", () => {
+  const call = (toolCallId: string, args: unknown) => ({
+    type: "tool",
+    toolCallId,
+    toolName: "dice_show_dice_board",
+    args,
+    status: "completed",
+    mcpServer: {
+      connection: { key: "dice", transport: "stdio" },
+      identity: { name: "dice", version: "1.0.0" },
+      source: "connection",
+      app: { resourceUri: "ui://dice/board.html" },
+    },
+  });
+  const actions = getActions({
+    artifactsEnabled: true,
+    selectedWorkspaceState: {
+      messages: [call("a", { count: 2 }), call("b", { count: 4 }), call("c", { count: 4 })],
+    } as unknown as WorkspaceState,
+  });
+  const subtitles = ["a", "b", "c"].map(
+    (id) => actions.find((a) => a.id === CommandIds.navOpenAppView(id))?.subtitle
+  );
+  expect(subtitles.every((s) => s?.startsWith("dice"))).toBe(true);
+  expect(new Set(subtitles).size).toBe(3);
+});
+
+test("a plugin view's palette entry shows its server part and keeps the full key searchable", () => {
+  const key = "plugin:0123456789abcdef:tray";
+  const actions = getActions({
+    artifactsEnabled: true,
+    selectedWorkspaceState: {
+      messages: [
+        {
+          type: "tool",
+          toolCallId: "p",
+          toolName: "tray_show",
+          args: {},
+          status: "completed",
+          mcpServer: {
+            connection: { key, transport: "stdio" },
+            identity: { name: "tray", version: "1.0.0" },
+            source: "connection",
+            app: { resourceUri: "ui://tray/view.html" },
+          },
+        },
+      ],
+    } as unknown as WorkspaceState,
+  });
+  const entry = actions.find((a) => a.id === CommandIds.navOpenAppView("p"));
+  expect(entry?.subtitle).toBe("tray");
+  expect(entry?.keywords).toContain(key);
+});
+
+test("two plugin installs with one server name keep their instance markers apart", () => {
+  const call = (toolCallId: string, key: string) => ({
+    type: "tool",
+    toolCallId,
+    toolName: "tray_show",
+    args: {},
+    status: "completed",
+    mcpServer: {
+      connection: { key, transport: "stdio" },
+      identity: { name: "tray", version: "1.0.0" },
+      source: "connection",
+      app: { resourceUri: "ui://tray/view.html" },
+    },
+  });
+  const actions = getActions({
+    artifactsEnabled: true,
+    selectedWorkspaceState: {
+      messages: [
+        call("i1", "plugin:0123456789abcdef:tray"),
+        call("i2", "plugin:fedcba9876543210:tray"),
+        call("own", "solo"),
+      ],
+    } as unknown as WorkspaceState,
+  });
+  const subtitle = (id: string) =>
+    actions.find((a) => a.id === CommandIds.navOpenAppView(id))?.subtitle;
+  expect([subtitle("i1"), subtitle("i2"), subtitle("own")]).toEqual([
+    "tray (plugin 01234567)",
+    "tray (plugin fedcba98)",
+    "solo",
+  ]);
+});

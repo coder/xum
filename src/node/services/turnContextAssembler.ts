@@ -197,6 +197,39 @@ export interface AssemblePromptPayloadOptions {
   workspaceId: string;
   /** Token budget: end each persisted user row with its session_history item ID. */
   tagHistoryItemIds?: boolean;
+  /**
+   * Request-only user-role context (MCP Apps model context), never persisted. It goes before the
+   * newest user row (insertRequestContextMessage has the trailing-partial rule), or last when
+   * the request ends without one, so the cached prefix (system prompt and earlier turns) is
+   * unchanged when it changes. The provider
+   * transform (mergeConsecutiveUserMessages) merges it into the start of that user message.
+   */
+  requestContextMessage?: MuxMessage;
+}
+
+/**
+ * `history` with `context` before its trailing user message, or appended without one. When the
+ * history ends in a partial assistant (an interrupted turn, or the refusal fallback continuing
+ * the refused output), `context` goes before the user request that partial answers: placed
+ * after the partial, it would read as a new context-only user turn, and the model would answer
+ * it instead of continuing the partial. Runs before addInterruptedSentinel, so the partial
+ * still gets its continuation sentinel.
+ */
+export function insertRequestContextMessage(
+  history: MuxMessage[],
+  context: MuxMessage | undefined
+): MuxMessage[] {
+  if (context === undefined) return history;
+  assert(context.role === "user", "request context must be a user-role message");
+  const last = history.at(-1);
+  let index = history.length;
+  if (last?.role === "user") {
+    index = history.length - 1;
+  } else if (last?.role === "assistant" && last.metadata?.partial === true) {
+    const request = history.findLastIndex((message) => message.role === "user");
+    index = request === -1 ? history.length - 1 : request;
+  }
+  return [...history.slice(0, index), context, ...history.slice(index)];
 }
 
 /**
@@ -219,8 +252,8 @@ function tagUserRowsWithHistoryItemIds(messages: MuxMessage[]): MuxMessage[] {
       return message;
     }
     const tag = `[id: ${getHistoryItemId(message)}]`;
-    // Append inside the last text part: mergeConsecutiveUserMessages keeps one text part per
-    // message, so a separate tag part is dropped when this row merges with a neighbour.
+    // Append inside the last text part: mergeConsecutiveUserMessages joins the text parts of
+    // merged rows into one, so the tag stays at the end of this row's text.
     const lastText = message.parts.findLastIndex((part) => part.type === "text");
     return {
       ...message,
@@ -246,9 +279,12 @@ export async function assemblePromptPayload(
   );
   let messages = await prepareMessagesForProvider({
     messagesWithSentinel: addInterruptedSentinel(
-      options.tagHistoryItemIds === true
-        ? tagUserRowsWithHistoryItemIds(prepared.providerRequestMessages)
-        : prepared.providerRequestMessages
+      insertRequestContextMessage(
+        options.tagHistoryItemIds === true
+          ? tagUserRowsWithHistoryItemIds(prepared.providerRequestMessages)
+          : prepared.providerRequestMessages,
+        options.requestContextMessage
+      )
     ),
     replayReceiptMessages: prepared.activeContextMessages,
     effectiveAgentId: options.effectiveAgentId,

@@ -562,6 +562,42 @@ describe("replayVerifySession pairing", () => {
     expect(devtoolsRaw).toContain("Partial output before the refusal.");
   });
 
+  test("MCP Apps model context is log-derivable from the envelope", async () => {
+    using tmp = new DisposableTempDir("replay-verify-mcp-app-context");
+    const ctx = createReplayFixtureSessionContext(tmp.path);
+    // Request-only user row before the newest prompt; it never reaches chat.jsonl, so the
+    // envelope blob must be enough to rebuild the request bytes.
+    const context = (text: string) =>
+      createMuxMessage("mcp-app-context", "user", `<mcp-app-context>${text}</mcp-app-context>`, {
+        synthetic: true,
+      });
+    await appendReplayFixtureTurn(ctx, {
+      userText: "Roll the dice.",
+      assistantText: "Rolled.",
+      systemPrompt: SYSTEM_PROMPT,
+      tools: tools(),
+      mcpAppModelContext: context("The view shows 4 and 6."),
+    });
+    // Same request bytes, but the envelope lacks the context: replay cannot rebuild them.
+    await appendReplayFixtureTurn(ctx, {
+      userText: "Again.",
+      assistantText: "Rolled again.",
+      systemPrompt: SYSTEM_PROMPT,
+      tools: tools(),
+      mcpAppModelContext: context("The view shows 1 and 2."),
+      envelopeOmitsMcpAppModelContext: true,
+    });
+
+    const result = await verify(ctx);
+    expect(result.turns.map((turn) => turn.status)).toEqual(["PASS", "FAIL"]);
+    expect(result.turns[1]).toMatchObject({ systemPromptMatch: true, messagesMatch: false });
+
+    // Guard against a vacuous pass: the context is model-visible in the recorded request.
+    const devtoolsRaw = await fs.readFile(`${tmp.path}/devtools.jsonl`, "utf-8");
+    // Provider shape: merged into the newest user message, block first (as live).
+    expect(devtoolsRaw).toContain("The view shows 4 and 6.</mcp-app-context>\\nRoll the dice.");
+  });
+
   test("native tool search results replay as tool references", async () => {
     using tmp = new DisposableTempDir("replay-verify-native-tool-search");
     const ctx = createReplayFixtureSessionContext(tmp.path);

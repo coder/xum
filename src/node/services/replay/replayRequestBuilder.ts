@@ -83,6 +83,11 @@ export interface ReplayRequestInputs {
    */
   partialContinuation?: MuxMessage | null;
   /**
+   * MCP Apps model context message from the turn-envelope blob. Request-only
+   * (never in chat.jsonl); assemblePromptPayload inserts it where production does.
+   */
+  mcpAppModelContext?: MuxMessage | null;
+  /**
    * Native tool search: deferred tool names, whose replayed tool_catalog_search results
    * production rewrites into tool_reference blocks. Derived from the recorded wire tools.
    */
@@ -227,6 +232,7 @@ export async function buildReplayRequest(inputs: ReplayRequestInputs): Promise<R
     anthropicCacheTtl: inputs.anthropicCacheTtl,
     workspaceId: inputs.workspaceId,
     deferLoadingToolNames: inputs.deferLoadingToolNames,
+    requestContextMessage: inputs.mcpAppModelContext ?? undefined,
   });
 
   const { prompt } = await captureLanguageModelPrompt({
