@@ -72,10 +72,11 @@ const RULE_SHAPES: Record<RestartRule, { describe: string; matches: (text: strin
     describe: "a setClient(client) method that the app feeds with the live client",
     matches: (text) => /\bsetClient\s*\(\s*\w+\s*:/.test(text),
   },
-  "router-per-client": {
-    describe: "a router bound to one client (the provider builds one per client)",
-    matches: (text) => /constructor\(api: APIClient\b/.test(text),
+  "router-setClient": {
+    describe: "a setClient(api) method that restarts the streams",
+    matches: (text) => /\bsetClient\s*\(\s*api\s*:/.test(text),
   },
+
   "holder-backoff": {
     describe: "a retry with a delay",
     matches: (text) => text.includes("setTimeout(") && /backoff|retry/i.test(text),
