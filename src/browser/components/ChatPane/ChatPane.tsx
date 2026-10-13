@@ -1981,7 +1981,9 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
   if (props.shouldShowPinnedTodoList) {
     addDecorationEntry({
       key: "pinned-todo-list",
-      node: <PinnedTodoList workspaceId={props.workspaceId} />,
+      // Keyed by workspace: ChatPane stays mounted across workspace switches, and the panel's
+      // scroll position (set to the current item on open) must not carry over to another chat.
+      node: <PinnedTodoList key={props.workspaceId} workspaceId={props.workspaceId} />,
     });
   }
   addDecorationEntry({
