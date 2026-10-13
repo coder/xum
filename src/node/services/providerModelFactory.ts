@@ -7,6 +7,7 @@ export {
   normalizeOpenAICompatibleBaseURL,
 } from "@/common/utils/providers/baseUrl";
 import assert from "node:assert";
+import { createHash } from "node:crypto";
 import { Effect } from "effect";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import type {
@@ -1071,13 +1072,28 @@ function requestUrlOf(input: Parameters<typeof fetch>[0]): string {
   return input instanceof Request ? input.url : String(input);
 }
 
-/** Origin and path of a request URL: the cache endpoint, without query or credentials. */
-function requestEndpoint(requestUrl: string): string {
+/** First 16 hex chars of sha256: tells values apart without revealing them. */
+function shortHash(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 16);
+}
+
+/** `?sha256:<hash>` for a non-empty query string, else "". */
+function hashedQuery(search: string): string {
+  return search.length > 0 ? `?sha256:${shortHash(search)}` : "";
+}
+
+/**
+ * The cache endpoint of a request URL: origin and path, plus a short hash of the query.
+ * normalizeAnthropicBaseURL keeps base-URL query parameters, and a proxy can pick an account
+ * or cache by them (`?token=...`), so another query is another cache. The query can hold
+ * credentials, so only its hash reaches baseline keys, logs and DevTools records.
+ */
+export function requestEndpoint(requestUrl: string): string {
   try {
     const url = new URL(requestUrl);
-    return `${url.origin}${url.pathname}`;
+    return `${url.origin}${url.pathname}${hashedQuery(url.search)}`;
   } catch {
-    return requestUrl;
+    return `unparsed:sha256:${shortHash(requestUrl)}`;
   }
 }
 
