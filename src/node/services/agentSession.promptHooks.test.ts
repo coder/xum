@@ -194,6 +194,41 @@ describe("message.send outcomes", () => {
     );
   });
 
+  test("a blocked queued /compact gives its attachment and review note back to the composer", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6r_ubq): they live only in the request's followUpContent, and the
+    // restore read the queue entry's own parts and reviews, so the block lost them silently.
+    const { h, streamed } = await setup(blockAll);
+    const fileParts = [{ url: "data:image/png;base64,iVBORw0KGgo=", mediaType: "image/png" }];
+    const review = { filePath: "src/a.ts", lineRange: "1", selectedCode: "a()", userNote: "n" };
+    const followUpContent = {
+      text: "fix it",
+      fileParts,
+      reviews: [review],
+      model: options.model,
+      agentId: "exec",
+    };
+    h.session.queueMessage("Summarize this conversation.", {
+      ...options,
+      muxMetadata: {
+        type: "compaction-request",
+        rawCommand: "/compact\nfix it",
+        parsed: { followUpContent },
+      },
+    });
+
+    h.session.drainQueuedMessagesIfIdle();
+    await waitForCondition(
+      () => streamed.length > 0 || h.events.some((event) => event.type === "restore-to-input")
+    );
+
+    const restored = h.events.find((event) => event.type === "restore-to-input");
+    expect(restored?.type === "restore-to-input" ? restored : undefined).toMatchObject({
+      text: "/compact\nfix it",
+      fileParts,
+      reviews: [review],
+    });
+  });
+
   test("a /compact with inline follow-up text runs the hooks on that text first", async () => {
     // Codex P1 (PRRT_kwDOPxxmWM6rN7of): the follow-up later dispatches as an automatic send,
     // which no plugin may block, so the block must stop the /compact itself.

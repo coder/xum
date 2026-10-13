@@ -7,7 +7,12 @@ import type { FilePart, SendMessageOptions, WorkspaceChatMessage } from "@/commo
 import { AGENT_PEER_MESSAGE_DEDUPE_PREFIX } from "@/constants/agentMessaging";
 import { getValidAgentPeerTriggerMeta } from "@/common/utils/agentMessageEnvelope";
 import type { SendMessageError } from "@/common/types/errors";
-import type { ArtifactInteractionMetadata, MuxMessage } from "@/common/types/message";
+import {
+  getCompactionFollowUpContent,
+  type ArtifactInteractionMetadata,
+  type MuxMessage,
+  type MuxMessageMetadata,
+} from "@/common/types/message";
 import { ArtifactInteractionMetadataSchema } from "@/common/orpc/schemas/stream";
 import type { ReviewNoteData } from "@/common/types/review";
 import type { TurnAcceptanceOrigin, TurnAdmissionToken } from "./taskWorkspaceSeam";
@@ -268,6 +273,17 @@ function restoredTextsOf(entry: QueueEntry): readonly string[] {
   return isCompactionMetadata(entry.muxMetadata)
     ? [entry.muxMetadata.rawCommand, ...entry.authoredMessages.slice(1)]
     : entry.authoredMessages;
+}
+
+/**
+ * A /compact's own follow-up: prepareCompactionMessage keeps its attachments and review notes
+ * only under `parsed.followUpContent` (rawCommand already holds its text), so a composer restore
+ * takes them from there (Codex PRRT_kwDOPxxmWM6r_ubq).
+ */
+function compactionFollowUpOf(entry: QueueEntry) {
+  return isCompactionMetadata(entry.muxMetadata)
+    ? getCompactionFollowUpContent(entry.muxMetadata as MuxMessageMetadata)
+    : undefined;
 }
 
 /**
@@ -1021,13 +1037,17 @@ export class MessageQueue {
   }
 
   private getFilePartsForEntries(entries: readonly QueueEntry[]): FilePart[] {
-    return entries.flatMap((entry) => entry.fileParts);
+    return entries.flatMap((entry) => [
+      ...(compactionFollowUpOf(entry)?.fileParts ?? []),
+      ...entry.fileParts,
+    ]);
   }
 
   private getReviewsForEntries(entries: readonly QueueEntry[]): ReviewNoteData[] | undefined {
-    const reviews = entries.flatMap((entry) =>
-      hasReviews(entry.muxMetadata) ? (entry.muxMetadata.reviews ?? []) : []
-    );
+    const reviews = entries.flatMap((entry) => [
+      ...(compactionFollowUpOf(entry)?.reviews ?? []),
+      ...(hasReviews(entry.muxMetadata) ? (entry.muxMetadata.reviews ?? []) : []),
+    ]);
     return reviews.length > 0 ? reviews : undefined;
   }
 
@@ -1115,9 +1135,10 @@ export class MessageQueue {
   }> {
     return this.restorableEntries(this.entries).map((entry) => {
       const reviews = this.getReviewsForEntries([entry]);
+      const fileParts = this.getFilePartsForEntries([entry]);
       return {
         text: this.getDisplayTextForEntries([entry], restoredTextsOf),
-        ...(entry.fileParts.length > 0 ? { fileParts: entry.fileParts } : {}),
+        ...(fileParts.length > 0 ? { fileParts } : {}),
         ...(reviews ? { reviews } : {}),
         sendIds: entry.sendIdentities.map(({ id }) => id),
       };
