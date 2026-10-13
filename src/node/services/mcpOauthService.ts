@@ -343,11 +343,12 @@ function withoutPluginSecret(
 }
 
 async function readClientSecret(config?: MCPServerOAuthConfig): Promise<string | undefined> {
-  if (config?.clientSecretSource === undefined) return undefined;
+  if (config?.clientSecretSource === undefined || config.clientId === undefined) return undefined;
   try {
-    return await readPluginClientSecret(config.clientSecretSource);
+    return await readPluginClientSecret(config.clientSecretSource, config.clientId);
   } catch (error) {
-    // Never log the file content: it holds the secret.
+    // Never log the file content: it holds the secret. readPluginClientSecret reports a
+    // parse failure as a fixed category; read errors name only the path.
     log.warn("[MCP OAuth] Could not read the plugin client secret", {
       serverName: config.clientSecretSource.serverName,
       error: getErrorMessage(error),
@@ -2019,13 +2020,12 @@ export class McpOauthService {
       // interleave: A saves client A, B saves client B, then A's token lands. One record per
       // URL cannot hold both, so a token for a client that is no longer stored is dropped
       // (never client B with token A). The losing server signs in once more; #6159 keys
-      // credentials by client to remove that extra sign-in.
+      // credentials by client to remove that extra sign-in. No stored client also drops the
+      // write: after a logout, a late token from client A would otherwise create a tokens-only
+      // entry that client B's later saveClientInformation keeps (#6297). Every flow saves its
+      // client (the SDK stamps the issuer on a provided client) before its tokens.
       const storedClientId = store.entries[input.serverUrl]?.clientInformation?.client_id;
-      if (
-        input.clientId !== undefined &&
-        storedClientId !== undefined &&
-        storedClientId !== input.clientId
-      ) {
+      if (input.clientId !== undefined && storedClientId !== input.clientId) {
         log.info("[MCP OAuth] Dropping tokens of a client that is no longer stored", {
           serverUrl: input.serverUrl,
         });

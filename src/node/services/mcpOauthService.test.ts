@@ -1239,6 +1239,103 @@ describe("McpOauthService OAuth flows", () => {
     });
   });
 
+  test("a late token write after logout leaves no tokens for the next client (#6297)", async () => {
+    await withAuthServer(async (base) => {
+      const serverUrl = `${base}/mcp`;
+      await fs.writeFile(
+        getStoreFilePath(xumHome),
+        JSON.stringify({
+          version: 2,
+          entries: {
+            [serverUrl]: {
+              serverUrl,
+              updatedAtMs: Date.now(),
+              clientInformation: { client_id: "client-a" },
+              tokens: { access_token: "at-a", token_type: "Bearer", refresh_token: "rt-a" },
+            },
+          },
+        })
+      );
+      // Server A's refresh is under way with client A...
+      const providerA = await service.getAuthProviderForServer({
+        serverUrl,
+        oauth: { clientId: "client-a" },
+      });
+      if (providerA === undefined) throw new Error("expected a provider");
+      expect((await providerA.clientInformation())?.client_id).toBe("client-a");
+      // ...the user logs out (the store entry is removed), then A's token lands late.
+      await service.logout({ serverUrl });
+      await providerA.saveTokens({ access_token: "at-a-late", token_type: "Bearer" } as never);
+      // Server B (same URL, client B) then signs in and saves client B.
+      spyOn(mcpConfigService, "listServers").mockResolvedValue({
+        b: { transport: "http", url: serverUrl, disabled: true, oauth: { clientId: "client-b" } },
+      });
+      const start = await service.startServerFlow({
+        projectPath,
+        serverName: "b",
+        redirectUri: "https://x/cb",
+      });
+      if (!start.success) throw new Error(start.error);
+      const store = JSON.parse(await fs.readFile(getStoreFilePath(xumHome), "utf-8")) as {
+        entries: Record<string, { clientInformation?: { client_id: string }; tokens?: unknown }>;
+      };
+      expect(store.entries[serverUrl].clientInformation?.client_id).toBe("client-b");
+      expect(JSON.stringify(store.entries[serverUrl].tokens ?? null)).not.toContain("at-a");
+      await service.cancelServerFlow(start.data.flowId);
+    });
+  });
+
+  test("a plugin secret reread for a replaced client is withheld, and parse errors are not logged (#6297)", async () => {
+    const serverUrl = "https://example.com/mcp";
+    await fs.writeFile(
+      getStoreFilePath(xumHome),
+      JSON.stringify({
+        version: 2,
+        entries: {
+          [serverUrl]: {
+            serverUrl,
+            updatedAtMs: Date.now(),
+            clientInformation: { client_id: "provided-id" },
+            tokens: { access_token: "at", token_type: "Bearer", refresh_token: "rt" },
+          },
+        },
+      })
+    );
+    const pluginRoot = await fs.realpath(projectPath);
+    const mcpConfigPath = path.join(pluginRoot, ".mcp.json");
+    const writeEntry = (oauthText: string) =>
+      fs.writeFile(
+        mcpConfigPath,
+        `{"github": {"type": "http", "url": "${serverUrl}", "oauth": ${oauthText}}}`
+      );
+    const oauth: MCPServerOAuthConfig = {
+      clientId: "provided-id",
+      clientSecretSource: { pluginRoot, mcpConfigPath, serverName: "github" },
+    };
+    const provider = await service.getAuthProviderForServer({ serverUrl, oauth });
+    if (provider === undefined) throw new Error("expected a provider");
+
+    await writeEntry('{"client_id": "provided-id", "client_secret": "current-secret"}');
+    expect((await provider.clientInformation())?.client_secret).toBe("current-secret");
+
+    // A plugin edit replaced the client: the stale provider gets no secret at all.
+    await writeEntry('{"client_id": "replacement-id", "client_secret": "replacement-secret"}');
+    const stale = await provider.clientInformation();
+    expect(stale?.client_id).toBe("provided-id");
+    expect(stale?.client_secret).toBeUndefined();
+
+    // A malformed file: the parser would quote the unquoted secret, and no log line holds it.
+    const logged = [spyOn(log, "warn"), spyOn(log, "debug"), spyOn(log, "info")];
+    try {
+      await writeEntry('{"client_id": "provided-id", "client_secret": s3cr3tValue}');
+      expect((await provider.clientInformation())?.client_secret).toBeUndefined();
+      expect(logged[0]).toHaveBeenCalled();
+      expect(JSON.stringify(logged.map((spy) => spy.mock.calls))).not.toContain("s3cr3tValue");
+    } finally {
+      for (const spy of logged) spy.mockRestore();
+    }
+  });
+
   test("stored tokens stay bound to the client they were issued to", async () => {
     const serverUrl = "https://example.com/mcp";
     await fs.writeFile(

@@ -390,11 +390,23 @@ export function toServerOAuthConfig(
 }
 
 /**
+ * Fixed message for a plugin MCP config file that is not valid JSON. SECURITY AUDIT: a
+ * `JSON.parse` error quotes source text, which can include a nearby `client_secret`, so
+ * callers report this category and never the parser message (#6297).
+ */
+export const PLUGIN_MCP_CONFIG_PARSE_ERROR = "the plugin's MCP config file could not be parsed";
+
+/**
  * Re-read a Codex `.mcp.json` client secret from the consented plugin file
  * (bounded, containment-checked read). The caller keeps it in memory only.
+ * The secret is returned only while the file's `oauth.client_id` is still
+ * `clientId`: an edit or update can replace the client between the config
+ * capture and this read, and a stale flow must not send the replacement
+ * secret to the old client's token endpoint (#6297).
  */
 export async function readPluginClientSecret(
-  source: NonNullable<MCPServerOAuthConfig["clientSecretSource"]>
+  source: NonNullable<MCPServerOAuthConfig["clientSecretSource"]>,
+  clientId: string
 ): Promise<string | undefined> {
   const { content } = await readPluginFileWithinRootCapped({
     filePath: source.mcpConfigPath,
@@ -402,7 +414,12 @@ export async function readPluginClientSecret(
     maxBytes: MAX_PLUGIN_MANIFEST_BYTES,
     label: ".mcp.json",
   });
-  const raw: unknown = JSON.parse(content);
+  let raw: unknown;
+  try {
+    raw = JSON.parse(content);
+  } catch {
+    throw new Error(PLUGIN_MCP_CONFIG_PARSE_ERROR);
+  }
   // Wrapped (`mcpServers`) or the flat Codex map, like loadPluginMcpServers.
   const servers = !isPlainObject(raw)
     ? {}
@@ -413,6 +430,7 @@ export async function readPluginClientSecret(
       : raw;
   const entry = getOwn(servers, source.serverName);
   const oauth = isPlainObject(entry) ? entry.oauth : undefined;
-  const secret = isPlainObject(oauth) ? oauth.client_secret : undefined;
+  if (!isPlainObject(oauth) || oauth.client_id !== clientId) return undefined;
+  const secret = oauth.client_secret;
   return typeof secret === "string" && secret.length > 0 ? secret : undefined;
 }
