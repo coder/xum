@@ -70,6 +70,23 @@ export function isNestedCompactionFollowUp(muxMetadata: unknown): boolean {
   });
 }
 
+/**
+ * True for a compaction summary (workspace.replaceChatHistory rows) whose pending follow-up is
+ * itself a compaction request: the shape {@link isNestedCompactionFollowUp} refuses on send.
+ * Recovery dispatches the pending follow-up through AgentSession directly, so this boundary
+ * refuses it too: the strip above covers only the outer follow-up, and the nested request's own
+ * follow-up would keep forged hook markers (Codex PRRT_kwDOPxxmWM6rxIVB).
+ */
+export function isNestedCompactionPendingFollowUp(muxMetadata: unknown): boolean {
+  if (!isRecord(muxMetadata)) return false;
+  const pending = muxMetadata.pendingFollowUp;
+  return (
+    isRecord(pending) &&
+    isRecord(pending.muxMetadata) &&
+    pending.muxMetadata.type === "compaction-request"
+  );
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
