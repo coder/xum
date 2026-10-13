@@ -597,7 +597,10 @@ describe("ImmersiveReviewView", () => {
   // highlight worker (a 5-20 s start). The 5 s reveal timer, or the preload's start failure,
   // then dropped the file that was read, and the overlay fell back to the compact hunks.
   describe("keeps full-file context while the highlighter is not ready", () => {
-    const fileContent = "new line\ncontext after selected hunk\n";
+    // Content no other test reads: DiffRenderer caches highlighted diffs per content for the
+    // module's life, and a cache hit would skip the slow highlighter this test needs.
+    const contextLine = "context kept while the highlighter starts";
+    const fileContent = `new line\n${contextLine}\n`;
     const readFile = () =>
       Promise.resolve(createTestBashResult({ output: encodeFileReadOutput(fileContent) }));
 
@@ -609,9 +612,8 @@ describe("ImmersiveReviewView", () => {
       try {
         const view = renderImmersiveReview();
         await waitFor(() => expect(mockApi.workspace.executeBash).toHaveBeenCalledTimes(1));
-        await waitFor(() =>
-          expect(view.container.textContent ?? "").toContain("context after selected hunk")
-        );
+        await waitFor(() => expect(view.container.textContent ?? "").toContain(contextLine));
+        expect(highlightSpy).toHaveBeenCalled();
       } finally {
         highlightSpy.mockRestore();
       }
@@ -636,7 +638,8 @@ describe("ImmersiveReviewView", () => {
           fakeTimers.advanceTimersByTime(6_000);
           for (let i = 0; i < 10; i++) await Promise.resolve();
         });
-        expect(view.container.textContent ?? "").toContain("context after selected hunk");
+        expect(view.container.textContent ?? "").toContain(contextLine);
+        expect(highlightSpy).toHaveBeenCalled();
       } finally {
         jest.useRealTimers();
         highlightSpy.mockRestore();
