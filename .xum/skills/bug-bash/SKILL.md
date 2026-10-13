@@ -46,8 +46,9 @@ Xum harness. Where the two differ, follow this skill.
 ## 1. Prepare
 
 1. Host: Linux on amd64, not root, with a local rootful Docker socket. Docker Desktop, rootless
-   Docker and a remote endpoint refuse (exit 2). The host needs git, make and Bun 1.3.12
-   (`bun --version`). It needs no Node.js or Chromium for the sandbox targets. On a fresh
+   Docker and a remote endpoint refuse (exit 2). The host needs git, make and the Bun version of
+   `packageManager` in `package.json` (`bun --version`): `make` builds with Bun and runs the
+   launchers with it. It needs no Node.js or Chromium for the sandbox targets. On a fresh
    checkout, run `bun install`.
 2. Env: `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL` (with or without `/v1`) and
    `BUGBASH_BUDGET_USD`. The runner reads the key only from `ANTHROPIC_API_KEY`: copy a key from
