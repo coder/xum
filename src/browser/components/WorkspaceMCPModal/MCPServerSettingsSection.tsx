@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useImperativeHandle, useState } from "react";
 import { Loader2, TriangleAlert } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { Input } from "@/browser/components/Input/Input";
@@ -26,6 +26,11 @@ interface MCPServerSettingsSectionProps {
   beginSave: () => (values: MCPSettingsSnapshot["values"]) => void;
 }
 
+/** Lets the dialog check, at Save time, for edits this section has not saved yet. */
+export interface MCPServerSettingsSectionHandle {
+  hasUnsavedChanges: () => boolean;
+}
+
 /**
  * OpenAI structured settings (`openai/settings`) of one workspace server:
  * native controls drawn from the server's schema, in its layout groups.
@@ -33,7 +38,10 @@ interface MCPServerSettingsSectionProps {
  * from the last values the server returned (read or update result); a failed
  * save shows the error and restores those values.
  */
-export const MCPServerSettingsSection: React.FC<MCPServerSettingsSectionProps> = (props) => {
+export const MCPServerSettingsSection = React.forwardRef<
+  MCPServerSettingsSectionHandle,
+  MCPServerSettingsSectionProps
+>(function MCPServerSettingsSection(props, ref) {
   const { api } = useAPI();
   const [saved, setSaved] = useState(props.snapshot.values);
   const [draft, setDraft] = useState(props.snapshot.values);
@@ -53,6 +61,8 @@ export const MCPServerSettingsSection: React.FC<MCPServerSettingsSectionProps> =
     if (message) errors[name] = `${schema.title} ${message}`;
   }
   const canSave = Object.keys(changed).length > 0 && Object.keys(errors).length === 0 && !saving;
+  // The dialog's Save does not send settings, so it must not close over a pending edit.
+  useImperativeHandle(ref, () => ({ hasUnsavedChanges: () => Object.keys(changed).length > 0 }));
 
   const setValue = (name: string, value: MCPSettingValue) => setDraft({ ...draft, [name]: value });
 
@@ -220,4 +230,4 @@ export const MCPServerSettingsSection: React.FC<MCPServerSettingsSectionProps> =
       </div>
     </div>
   );
-};
+});

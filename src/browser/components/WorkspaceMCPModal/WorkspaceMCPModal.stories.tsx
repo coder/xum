@@ -914,6 +914,38 @@ export const WorkspaceMCPServerSettingsSlowFirstRead: Story = {
   },
 };
 
+/**
+ * The dialog's Save does not include unsaved settings: with a settings edit pending it stays
+ * open and says so, instead of closing and dropping the edit. Once saved, Save closes it.
+ */
+export const WorkspaceMCPServerSettingsUnsavedOnSave: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <WorkspaceMCPModalStoryShell setup={() => setupWorkspaceMCPModalStory(settingsStoryOptions())}>
+      <ReopenableWorkspaceMCPModal />
+    </WorkspaceMCPModalStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    const section = within(await modal.findByTestId("mcp-server-settings"));
+    const zoom = section.getByLabelText("Default zoom setting");
+    await userEvent.clear(zoom);
+    await userEvent.type(zoom, "3");
+    await userEvent.click(modal.getByRole("button", { name: "Save" }));
+    await expect(modal.findByText(/Unsaved settings for cad/)).resolves.toBeInTheDocument();
+    await expect(queryWorkspaceMCPDialog(canvasElement.ownerDocument)).toBeInTheDocument();
+    await expect(zoom).toHaveValue(3);
+
+    const saveSettings = section.getByRole("button", { name: "Save settings" });
+    await userEvent.click(saveSettings);
+    await waitFor(() => expect(saveSettings).toBeDisabled());
+    await userEvent.click(modal.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(queryWorkspaceMCPDialog(canvasElement.ownerDocument)).not.toBeInTheDocument()
+    );
+  },
+};
+
 /** Pick `option` in a Radix select (its list renders in a portal). */
 async function chooseSetting(
   canvasElement: HTMLElement,

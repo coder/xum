@@ -20,7 +20,10 @@ import {
   type ServerSettingsEntry,
   type SettingsRequestScope,
 } from "./serverSettingsEntries";
-import { MCPServerSettingsSection } from "./MCPServerSettingsSection";
+import {
+  MCPServerSettingsSection,
+  type MCPServerSettingsSectionHandle,
+} from "./MCPServerSettingsSection";
 import { ToolSelector } from "@/browser/components/ToolSelector/ToolSelector";
 import {
   MCPServerIdentityBadge,
@@ -86,6 +89,8 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
   const [settingsRequests] = useState(() => new SettingsRequests());
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  // Mounted settings sections by server name (ref callbacks drop unmounted ones).
+  const settingsSections = useRef(new Map<string, MCPServerSettingsSectionHandle>());
   const [error, setError] = useState<string | null>(null);
 
   // Use shared cache for tool test results
@@ -359,6 +364,17 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
   // Save overrides
   const handleSave = useCallback(async () => {
     if (!api || overridesRevision === null) return;
+    // Save sends only the overrides. Closing over an unsaved settings edit would drop it
+    // silently, so the dialog stays open and says which servers still have one.
+    const unsaved = [...settingsSections.current]
+      .filter(([, section]) => section.hasUnsavedChanges())
+      .map(([name]) => name);
+    if (unsaved.length > 0) {
+      setError(
+        `Unsaved settings for ${unsaved.join(", ")}. Click Save settings or undo the changes first.`
+      );
+      return;
+    }
     setSaving(true);
     setError(null);
     try {
@@ -574,6 +590,10 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                         return (
                           <MCPServerSettingsSection
                             key={entry.fetchId}
+                            ref={(section) => {
+                              if (section) settingsSections.current.set(name, section);
+                              else settingsSections.current.delete(name);
+                            }}
                             workspaceId={workspaceId}
                             serverName={name}
                             snapshot={entry.snapshot}
