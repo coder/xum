@@ -62,4 +62,14 @@ describe("SessionUsageFileSchema conformance", () => {
     expect(parsed.rolledUpFrom).toBeUndefined();
     expect(parsed.tokenStatsCache).toBeUndefined();
   });
+
+  it("keeps a fork marker and drops a malformed one instead of failing the ledger", () => {
+    expect(SessionUsageFileSchema.parse({ byModel: {}, version: 1, forkedAt: 5 }).forkedAt).toBe(5);
+    // A value that cannot be a real timestamp would hide every turn: 1e300, a far-future
+    // time, a fraction.
+    for (const forkedAt of [-1, "5", null, 1e300, Date.now() + 30 * 24 * 60 * 60 * 1000, 5.5]) {
+      const parsed = SessionUsageFileSchema.parse({ byModel: {}, version: 1, forkedAt });
+      expect(parsed.forkedAt).toBeUndefined();
+    }
+  });
 });

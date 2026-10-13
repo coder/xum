@@ -24,6 +24,7 @@ import * as path from "node:path";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import YAML from "yaml";
 import assert from "@/common/utils/assert";
+import { FRONTMATTER_PATTERN } from "@/common/utils/markdownFrontmatter";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import {
   MEMORY_HOT_SET_MAX_ITEM_BYTES,
@@ -825,8 +826,6 @@ class LocalMemoryStore implements MemoryStore {
 // ---------------------------------------------------------------------------
 // Frontmatter description extraction (for the injected memory index)
 // ---------------------------------------------------------------------------
-
-const FRONTMATTER_PATTERN = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/;
 
 /** Memory body without its leading YAML frontmatter (the index already carries the description). */
 export function stripMemoryFrontmatter(content: string): string {
