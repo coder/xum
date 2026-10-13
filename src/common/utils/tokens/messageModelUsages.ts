@@ -18,6 +18,8 @@ export interface MessageModelUsage {
   model: string;
   metadataModel?: string;
   usage: ChatUsageDisplay;
+  /** The persisted `inputTokens` (cache health detects pre-AI-SDK-v6 rows with it). */
+  rawInputTokens?: number;
   /** True for the message's own `metadata.usage`; false for a `toolModelUsages` entry. */
   isMessageUsage: boolean;
 }
@@ -39,11 +41,7 @@ function isPersistedToolModelUsage(value: unknown): value is PersistedToolModelU
  * of failing the whole read.
  */
 export function getAssistantMessageModelUsages(
-  metadata: MuxMetadata | undefined,
-  options?: {
-    /** Pricing model for a usage without a persisted `metadataModel`. */
-    resolveMetadataModel?: (model: string) => string;
-  }
+  metadata: MuxMetadata | undefined
 ): MessageModelUsage[] {
   const result: MessageModelUsage[] = [];
   const push = (
@@ -53,13 +51,18 @@ export function getAssistantMessageModelUsages(
     metadataModel: string | undefined,
     isMessageUsage: boolean
   ) => {
-    const usage = createDisplayUsage(
-      rawUsage,
+    // No live provider mapping: a row without a record-time `metadataModel` prices by its
+    // persisted model alone, so a later mapping change cannot reprice history.
+    const usage = createDisplayUsage(rawUsage, model, providerMetadata, metadataModel);
+    if (!usage) return;
+    const rawInputTokens = rawUsage?.inputTokens;
+    result.push({
       model,
-      providerMetadata,
-      metadataModel ?? options?.resolveMetadataModel?.(model)
-    );
-    if (usage) result.push({ model, metadataModel, usage, isMessageUsage });
+      metadataModel,
+      usage,
+      ...(typeof rawInputTokens === "number" ? { rawInputTokens } : {}),
+      isMessageUsage,
+    });
   };
 
   if (metadata?.usage) {

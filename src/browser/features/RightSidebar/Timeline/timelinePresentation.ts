@@ -233,7 +233,46 @@ export function getTimelineEventKind(event: TimelineEvent): string {
 
 // A descriptive event payload reads better as the row title than the generic kind label.
 export function getTimelineEventTitle(event: TimelineEvent): string {
-  return event.data?.description ?? getTimelinePresentation(getTimelineEventKind(event)).label;
+  return eventDescription(event) ?? getTimelinePresentation(getTimelineEventKind(event)).label;
+}
+
+// A prompt-cache break's description repeats its structured fields in one long line; the row
+// shows those fields below a short title instead.
+function eventDescription(event: TimelineEvent): string | undefined {
+  return getPromptCacheBreakView(event)?.title ?? event.data?.description;
+}
+
+type PromptCacheBreakData = NonNullable<NonNullable<TimelineEvent["data"]>["promptCacheBreak"]>;
+type PromptCacheBlockData = PromptCacheBreakData["previous"];
+
+/** A prompt-cache break as readable rows: no block text exists in the event, only metadata. */
+export interface PromptCacheBreakView {
+  title: string;
+  /** Turn or step boundary, and how many blocks of the previous request still matched. */
+  position: string;
+  /** The first differing block of the previous and of the next request. */
+  before: string;
+  after: string;
+}
+
+function describeCacheBlock(block: PromptCacheBlockData | undefined): string {
+  if (block == null) return "Request ended here";
+  return [block.role, block.type, block.toolName, `${block.length.toLocaleString()} chars`]
+    .filter((part) => part != null && part !== "")
+    .join(" · ");
+}
+
+export function getPromptCacheBreakView(event: TimelineEvent): PromptCacheBreakView | null {
+  const cacheBreak = event.data?.promptCacheBreak;
+  if (cacheBreak == null) return null;
+  // `blockIndex` is the first differing block, so it also counts the blocks that still matched.
+  const matched = `${cacheBreak.blockIndex.toLocaleString()} of ${cacheBreak.previousBlockCount.toLocaleString()} blocks matched`;
+  return {
+    title: `Prompt cache broke in ${cacheBreak.section}`,
+    position: `${capitalize(cacheBreak.boundary)} boundary · ${matched}`,
+    before: describeCacheBlock(cacheBreak.previous),
+    after: describeCacheBlock(cacheBreak.next),
+  };
 }
 
 /**

@@ -34,7 +34,9 @@ async function fakeRoot(over: { init?: string; devices?: string[]; socket?: bool
   fs.writeFileSync(path.join(root, "repo/.sandbox-nonce"), "nonce-1");
   fs.mkdirSync(path.dirname(path.join(root, PROXY_SOCKET)), { recursive: true });
   if (over.socket !== false) {
-    const server = net.createServer((socket) => socket.end("proxy says hi"));
+    // resume(): an unread socket never sees the peer's FIN, so server.close() would wait for
+    // it forever (Node, and Bun since 1.4; Bun 1.3.12 closed it anyway).
+    const server = net.createServer((socket) => socket.resume().end("proxy says hi"));
     await new Promise<void>((resolve) => server.listen(path.join(root, PROXY_SOCKET), resolve));
     cleanups.push(() => new Promise((done) => server.close(done)));
   }
