@@ -134,6 +134,9 @@ describe("the onboarding wizard under the static first-run view (#xum-pre)", () 
     expect(stepBody()).toBeNull();
     clickNext();
     expect(stepBody()?.className).toContain("animate-in fade-in-0 slide-in-from-right-2");
+    // The dialog and overlay stay open, so dropping their override would replay their entry.
+    expect(dialog()?.style.animation).toBe("none");
+    expect(overlay()?.style.animation).toBe("none");
   });
 
   test("removes the static view when it opens past the gateway step", () => {

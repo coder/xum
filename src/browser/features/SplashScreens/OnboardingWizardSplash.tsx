@@ -196,19 +196,22 @@ function CommandPalettePreview(props: { shortcut: string }) {
 /**
  * T3 #5971, C step 2: the server's static first-run view (#xum-pre) already shows the gateway step.
  * The live wizard renders nothing while it loads under that view, then swaps it out in its first
- * real commit (a layout effect runs before paint), opening without entry animations until the user
- * moves on. A wizard that starts past the gateway step replaces the view too.
+ * real commit (a layout effect runs before paint). The dialog and overlay never play their entry
+ * animation in this mount: they stay open, so clearing the override later would replay it. The
+ * step skips its entry animation only until the user moves on. A wizard that starts past the
+ * gateway step replaces the view too.
  */
 function useFirstRunViewHandoff(isLoading: boolean) {
   const [startsUnderFirstRunView] = useState(hasFirstRunView);
-  const [skipEntryAnimation, setSkipEntryAnimation] = useState(startsUnderFirstRunView);
+  const [skipStepEntry, setSkipStepEntry] = useState(startsUnderFirstRunView);
   useLayoutEffect(() => {
     if (!isLoading) removeFirstRunView();
   }, [isLoading]);
   return {
     hideWhileLoading: isLoading && startsUnderFirstRunView,
-    skipEntryAnimation,
-    stopSkipping: () => setSkipEntryAnimation(false),
+    skipDialogEntry: startsUnderFirstRunView,
+    skipStepEntry,
+    stopSkipping: () => setSkipStepEntry(false),
   };
 }
 
@@ -1120,7 +1123,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
         props.onDismiss();
       }}
       dismissLabel={null}
-      skipEntryAnimation={firstRunView.skipEntryAnimation}
+      skipEntryAnimation={firstRunView.skipDialogEntry}
       footerClassName="justify-between"
       footer={
         <>
@@ -1182,7 +1185,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
 
         <div
           key={currentStep.key}
-          className={`flex flex-col gap-3 ${stepEntryClassName(direction, firstRunView.skipEntryAnimation)}`}
+          className={`flex flex-col gap-3 ${stepEntryClassName(direction, firstRunView.skipStepEntry)}`}
         >
           <div className="text-foreground flex items-center gap-2 text-sm font-medium">
             <span className="bg-accent/10 text-accent inline-flex h-8 w-8 items-center justify-center rounded-md">
