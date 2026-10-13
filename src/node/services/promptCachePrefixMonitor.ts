@@ -5,8 +5,9 @@
  * but the next turn's first request is rebuilt from chat.jsonl, and any byte
  * difference re-processes the conversation uncached. This compares every
  * chat-turn request with the previous request of its workspace and records
- * the first block that broke the prefix. It keeps hashes only, in memory, for
- * a bounded set of workspaces.
+ * the first block that broke the prefix. It keeps hashes only (plus the
+ * request options of the two sentinel blocks, never prompt text), in memory,
+ * for a bounded set of workspaces.
  */
 
 import { log } from "@/node/services/log";

@@ -5334,10 +5334,11 @@ describe("AIService.streamMessage multi-project trust gating", () => {
 
   // Untrusted repos and the project-automation kill switch get blanked provider keys in bash, so
   // the bash AI proxy must not hand them a proxy URL either (it would pair with a blank key).
-  for (const [label, trusted, killSwitch, expected] of [
-    ["trusted project", true, false, "http://proxy"],
-    ["untrusted project", false, false, undefined],
-    ["project automation kill switch", true, true, undefined],
+  // The proxy service logs the reason it gets (#6357).
+  for (const [label, trusted, killSwitch, expected, blockedBy] of [
+    ["trusted project", true, false, "http://proxy", []],
+    ["untrusted project", false, false, undefined, ["untrusted"]],
+    ["project automation kill switch", true, true, undefined, ["kill_switch"]],
   ] as const) {
     it(`adds bash AI proxy variables only for shared-trusted execution (${label})`, async () => {
       using xumHome = new DisposableTempDir("ai-service-bash-ai-proxy-trust");
@@ -5345,8 +5346,10 @@ describe("AIService.streamMessage multi-project trust gating", () => {
       await fs.mkdir(projectPath, { recursive: true });
       const workspaceId = "workspace-bash-ai-proxy-trust";
       const harness = createHarness(xumHome.path, createTrustMetadata(workspaceId, [projectPath]));
+      const blocked: string[] = [];
       harness.service.turnRequestBuilderBindings.bashAiProxy = {
         envFor: () => Promise.resolve({ ANTHROPIC_BASE_URL: "http://proxy" }),
+        noteBlocked: (_workspaceId, reason) => blocked.push(reason),
       };
       await harness.config.editConfig((cfg) => {
         cfg.projects.set(projectPath, { workspaces: [], trusted });
@@ -5364,6 +5367,7 @@ describe("AIService.streamMessage multi-project trust gating", () => {
         | { xumEnv?: Record<string, string> }
         | undefined;
       expect(toolConfig?.xumEnv?.ANTHROPIC_BASE_URL).toBe(expected);
+      expect(blocked).toEqual([...blockedBy]);
     });
   }
 
