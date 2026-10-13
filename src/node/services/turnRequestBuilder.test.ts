@@ -477,6 +477,33 @@ describe("TurnRequestBuilder tool scope", () => {
 });
 
 describe("TurnRequestBuilder model attempt preparation", () => {
+  it("merges saved Meta extras into the Responses SDK namespace", async () => {
+    const harness = await createPreparationHarness();
+    try {
+      harness.providersConfigStore.saveProvidersConfig({
+        meta: { modelParameters: { "*": { parallelToolCalls: false } } },
+      });
+      const prepared = harness.builder.prepareModelAttempt(
+        preparationOptions(harness.providerService.getConfig() ?? {}, {
+          rawModelString: "meta:muse-wonder-1.0",
+          canonicalModelString: "meta:muse-wonder-1.0",
+          canonicalProviderName: "meta",
+          effectiveModelString: "meta:muse-wonder-1.0",
+          optionsModelString: "meta:muse-wonder-1.0",
+          wireProviderName: "meta",
+          routeProvider: "meta",
+          effectiveThinkingLevel: "high",
+        })
+      );
+      expect(prepared.providerOptions).toMatchObject({
+        openai: { parallelToolCalls: false, reasoningEffort: "high", store: false },
+      });
+      expect(prepared.providerOptions).not.toHaveProperty("meta");
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
   it("merges call settings and provider extras at the resolved namespace", async () => {
     const harness = await createPreparationHarness();
     try {

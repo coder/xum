@@ -123,7 +123,7 @@ export async function discoverProviderModels(
     const anthropic = request.format === "anthropic";
     const base = anthropic
       ? normalizeAnthropicBaseURL(request.baseUrl)
-      : request.provider === "openai" || request.providerType
+      : ["openai", "meta"].includes(request.provider) || request.providerType
         ? normalizeOpenAICompatibleBaseURL(request.baseUrl)
         : request.baseUrl;
     let url = new URL(base);

@@ -204,6 +204,48 @@ describe("WorkspaceGoalService", () => {
       expect(completed).toBeDefined();
     });
 
+    // Promotion arms the next goal's kickoff: model output completing a paused goal must not
+    // undo the user's Pause that way, so the model's completion is refused while goals are
+    // queued. A user completion still promotes.
+    test.each([
+      { initiator: "model", promotes: false },
+      { initiator: "user", promotes: true },
+    ] as const)(
+      "completing a paused goal with goals queued is the user's call ($initiator)",
+      async ({ initiator, promotes }) => {
+        const paused = await setGoalOk(service, { workspaceId, objective: "First" });
+        const queued = await service.addUpcomingGoal({ workspaceId, objective: "Second" });
+        await setGoalOk(service, { workspaceId, status: "paused" });
+
+        const result = await service.setGoal({
+          workspaceId,
+          status: "complete",
+          completionSummary: "Done while paused.",
+          initiator,
+        });
+
+        // Target assertion: the model's completion is refused and nothing is promoted.
+        expect(result.success).toBe(promotes);
+        if (!result.success) expect(result.error.type).toBe("invalid_transition");
+        const board = await service.getGoalBoard(workspaceId);
+        const activeEntry = board.entries.find((e) => e.section === "active");
+        expect(activeEntry?.goal.goalId).toBe(promotes ? queued.goalId : paused.goalId);
+        expect(activeEntry?.goal.status).toBe(promotes ? "active" : "paused");
+      }
+    );
+
+    test("the model completes a paused goal when no goal is queued", async () => {
+      await setGoalOk(service, { workspaceId, objective: "Solo" });
+      await setGoalOk(service, { workspaceId, status: "paused" });
+      await setGoalOk(service, {
+        workspaceId,
+        status: "complete",
+        completionSummary: "Done while paused.",
+        initiator: "model",
+      });
+      expect((await service.getGoal(workspaceId))?.status).toBe("complete");
+    });
+
     test("completeGoalFromSilentContinuation promotes the next upcoming goal", async () => {
       // #3326 Codex P2 (PRRT_kwDOPxxmWM6DMh9j): silent-continuation
       // completion must run the deferred auto-promote pass, otherwise

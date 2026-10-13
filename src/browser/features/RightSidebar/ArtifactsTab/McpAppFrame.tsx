@@ -170,9 +170,19 @@ export function McpAppFrame(props: {
   const hostRef = useRef<McpAppHost | null>(null);
   const { workspaceId, view } = props;
   const { toolCallId, serverName, resourceUri } = view;
+  // The view's host lives as long as its frame. The API is null while Xum reconnects and a new
+  // client afterwards; tearing the host down for either reset the view. So the host calls tools
+  // through the latest client, and a call made while offline fails.
+  const apiRef = useRef(api);
+  useEffect(() => {
+    apiRef.current = api;
+  }, [api]);
+  // Fetched once per tool call: a reconnect must not fetch it again (a failed refetch replaced a
+  // working view with an error). A failed fetch is retried with the next client.
+  const viewLoaded = loaded?.toolCallId === toolCallId && loaded.view != null;
 
   useEffect(() => {
-    if (!api) return;
+    if (!api || viewLoaded) return;
     const controller = new AbortController();
     api.mcpApps
       .getView({ workspaceId, toolCallId, serverName, resourceUri }, { signal: controller.signal })
@@ -190,7 +200,7 @@ export function McpAppFrame(props: {
         }
       });
     return () => controller.abort();
-  }, [api, workspaceId, toolCallId, serverName, resourceUri]);
+  }, [api, workspaceId, toolCallId, serverName, resourceUri, viewLoaded]);
 
   const current = loaded?.toolCallId === toolCallId ? loaded : null;
   const grant = current?.view ? grantMcpAppCsp(current.view.csp, { allowCdn }) : null;
@@ -214,7 +224,7 @@ export function McpAppFrame(props: {
   });
 
   useEffect(() => {
-    if (srcDoc == null || grant == null || !api || guard.navigated) return;
+    if (srcDoc == null || grant == null || guard.navigated) return;
     const getHostContext = (): McpAppHostContext => ({
       theme: latest.current.theme,
       styles: { variables: readStyleVariables() },
@@ -247,7 +257,9 @@ export function McpAppFrame(props: {
       },
       getHostContext,
       callTool: async (toolName, args, consented) => {
-        const result = await api.mcpApps.callTool({
+        const client = apiRef.current;
+        if (client == null) throw new Error("Xum is reconnecting. Try again once it is back.");
+        const result = await client.mcpApps.callTool({
           workspaceId,
           serverName: boundServerName,
           toolName,
@@ -310,7 +322,6 @@ export function McpAppFrame(props: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     srcDoc,
-    api,
     workspaceId,
     serverName,
     boundServerName,

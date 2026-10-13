@@ -3414,6 +3414,71 @@ describe("WorkspaceStore", () => {
       expect(usage.liveMetadataModel).toBe("anthropic:claude-sonnet-4-20250514");
       expect(usage.liveCostUsage?.input.cost_usd).toBeGreaterThan(0);
     });
+
+    it("keeps tool-model usage on replayed rows and live stream-end for turn cache health", async () => {
+      const workspaceId = "live-tool-usage-cache-health";
+      const MODEL = "anthropic:claude-sonnet-5-5";
+      const coldToolUsage = {
+        toolName: "task",
+        model: MODEL,
+        usage: { inputTokens: 31_000, cachedInputTokens: 0, outputTokens: 10, totalTokens: 31_010 },
+        providerMetadata: { anthropic: { cacheCreationInputTokens: 30_000 } },
+      };
+      const warmUsage = {
+        inputTokens: 1_000,
+        cachedInputTokens: 900,
+        outputTokens: 10,
+        totalTokens: 1_010,
+      };
+      // Every event goes through the onChat output schema, which strips unknown fields.
+      const wire = (event: unknown) => WorkspaceChatMessageSchema.parse(event);
+      const send = openChat(workspaceId);
+      createAndAddWorkspace(store, workspaceId);
+
+      await send(
+        wire({
+          type: "message",
+          id: "replayed-turn",
+          role: "assistant",
+          parts: [{ type: "text", text: "replayed" }],
+          metadata: {
+            historySequence: 1,
+            timestamp: 1,
+            model: MODEL,
+            usage: warmUsage,
+            toolModelUsages: [coldToolUsage],
+          },
+        }),
+        caughtUpEvent(),
+        wire({
+          type: "stream-start",
+          workspaceId,
+          messageId: "live-turn",
+          historySequence: 2,
+          model: MODEL,
+          startTime: 2,
+        }),
+        wire({
+          type: "stream-end",
+          workspaceId,
+          messageId: "live-turn",
+          metadata: {
+            model: MODEL,
+            historySequence: 2,
+            timestamp: 3,
+            usage: warmUsage,
+            toolModelUsages: [coldToolUsage],
+          },
+          parts: [],
+        })
+      );
+
+      const turns = store.getWorkspaceUsage(workspaceId).recentTurnCacheHealth ?? [];
+      expect(turns.map((turn) => [turn.messageId, turn.cacheWriteTokens])).toEqual([
+        ["live-turn", 30_000],
+        ["replayed-turn", 30_000],
+      ]);
+    });
   });
 
   describe("session usage refresh on activation", () => {
@@ -5212,6 +5277,50 @@ describe("WorkspaceStore", () => {
       expect(state.hasOlderHistory).toBe(false);
       expect(state.loadingOlderHistory).toBe(false);
       expect(state.muxMessages.map((message) => message.id)).toEqual(["msg-older", "msg-newer"]);
+    });
+
+    it("shows older assistant turns in prompt-cache health after loading an older page", async () => {
+      const workspaceId = "history-pagination-cache-health";
+      const assistantTurn = (id: string, historySequence: number): WorkspaceChatMessage => ({
+        type: "message",
+        id,
+        role: "assistant",
+        parts: [{ type: "text", text: id }],
+        metadata: {
+          historySequence,
+          timestamp: historySequence,
+          model: "anthropic:claude-sonnet-5-5",
+          usage: { inputTokens: 2_000, outputTokens: 10, totalTokens: 2_010 },
+          providerMetadata: { anthropic: { cacheCreationInputTokens: 1_500 } },
+        },
+      });
+
+      mockOnChat.mockImplementation(async function* (
+        _input?: { workspaceId: string; mode?: unknown },
+        options?: { signal?: AbortSignal }
+      ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
+        yield assistantTurn("newer-turn", 5);
+        await Promise.resolve();
+        yield { type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: true };
+        await waitForAbortSignal(options?.signal);
+      });
+      mockHistoryLoadMore.mockResolvedValueOnce({
+        messages: [assistantTurn("older-turn", 3)],
+        nextCursor: null,
+        hasOlder: false,
+      });
+
+      createAndAddWorkspace(store, workspaceId);
+      await tick(10);
+      const turnIds = () =>
+        (store.getWorkspaceUsage(workspaceId).recentTurnCacheHealth ?? []).map(
+          (turn) => turn.messageId
+        );
+      expect(turnIds()).toEqual(["newer-turn"]);
+
+      await store.loadOlderHistory(workspaceId);
+
+      expect(turnIds()).toEqual(["newer-turn", "older-turn"]);
     });
 
     it("exposes loadingOlderHistory while requests are in flight and ignores concurrent loads", async () => {
@@ -7646,6 +7755,135 @@ describe("WorkspaceStore", () => {
       expect(usage.lastContextUsage?.input.tokens).toBe(42);
       expect(usage.lastContextUsage?.output.tokens).toBe(0);
       expect(usage.lastContextUsage?.model).toBe("claude-3-5-sonnet-20241022");
+    });
+
+    it("derives per-turn prompt-cache health from completed assistant turns, newest first", async () => {
+      const workspaceId = "turn-cache-health-workspace";
+      const assistantTurn = (
+        id: string,
+        historySequence: number,
+        cache: { read: number; write: number }
+      ) => ({
+        type: "message" as const,
+        id,
+        role: "assistant" as const,
+        parts: [{ type: "text" as const, text: id }],
+        metadata: {
+          historySequence,
+          timestamp: historySequence,
+          model: "anthropic:claude-sonnet-5-5",
+          usage: {
+            inputTokens: 1_000 + cache.read + cache.write,
+            cachedInputTokens: cache.read,
+            outputTokens: 10,
+          },
+          providerMetadata: { anthropic: { cacheCreationInputTokens: cache.write } },
+        },
+      });
+
+      mockChatScript([
+        Promise.resolve(),
+        assistantTurn("cold-turn", 1, { read: 0, write: 30_000 }),
+        {
+          type: "message",
+          id: "user-turn",
+          role: "user",
+          parts: [{ type: "text", text: "next" }],
+          metadata: { historySequence: 2, timestamp: 2 },
+        },
+        assistantTurn("warm-turn", 3, { read: 29_000, write: 1_000 }),
+        { type: "caught-up", historyReplayStatus: "complete" },
+      ]);
+
+      createAndAddWorkspace(store, workspaceId);
+      await tick(10);
+
+      const turns = store.getWorkspaceUsage(workspaceId).recentTurnCacheHealth ?? [];
+      expect(turns.map((turn) => [turn.messageId, turn.coldStart])).toEqual([
+        ["warm-turn", false],
+        ["cold-turn", true],
+      ]);
+      expect(turns[0].readRatio).toBeCloseTo(29_000 / 31_000, 12);
+      expect(turns[1].rewriteCostUsd).toBeGreaterThan(0);
+    });
+
+    it("leaves a legacy turn without a record-time model unpriced instead of using the current model", async () => {
+      const workspaceId = "turn-cache-health-legacy-model";
+      const assistantRow = (id: string, historySequence: number, model?: string) => ({
+        type: "message" as const,
+        id,
+        role: "assistant" as const,
+        parts: [{ type: "text" as const, text: id }],
+        metadata: {
+          historySequence,
+          timestamp: historySequence,
+          ...(model !== undefined ? { model } : {}),
+          usage: { inputTokens: 31_000, cachedInputTokens: 0, outputTokens: 10 },
+          providerMetadata: { anthropic: { cacheCreationInputTokens: 30_000 } },
+        },
+      });
+
+      mockChatScript([
+        Promise.resolve(),
+        assistantRow("legacy-turn", 1),
+        // The newest row makes Sonnet 5.5 the workspace's current (priced) model.
+        assistantRow("priced-turn", 2, "anthropic:claude-sonnet-5-5"),
+        { type: "caught-up", historyReplayStatus: "complete" },
+      ]);
+
+      createAndAddWorkspace(store, workspaceId);
+      await tick(10);
+
+      const turns = store.getWorkspaceUsage(workspaceId).recentTurnCacheHealth ?? [];
+      expect(turns.map((turn) => turn.messageId)).toEqual(["priced-turn", "legacy-turn"]);
+      expect(turns[0].rewriteCostUsd).toBeGreaterThan(0);
+      expect(turns[1].cacheWriteTokens).toBe(30_000);
+      expect(turns[1].rewriteCostUsd).toBeUndefined();
+    });
+
+    it("counts tool-model usage in a turn's cache health and skips compaction summaries", async () => {
+      const workspaceId = "turn-cache-health-tools-workspace";
+      const MODEL = "anthropic:claude-sonnet-5-5";
+      const coldToolUsage = {
+        toolName: "task",
+        model: MODEL,
+        usage: { inputTokens: 31_000, cachedInputTokens: 0, outputTokens: 10 },
+        providerMetadata: { anthropic: { cacheCreationInputTokens: 30_000 } },
+      };
+      const assistantRow = (id: string, historySequence: number, metadata: object) => ({
+        type: "message" as const,
+        id,
+        role: "assistant" as const,
+        parts: [{ type: "text" as const, text: id }],
+        metadata: { historySequence, timestamp: historySequence, model: MODEL, ...metadata },
+      });
+
+      mockChatScript([
+        Promise.resolve(),
+        assistantRow("tool-only-turn", 1, { toolModelUsages: [coldToolUsage] }),
+        assistantRow("mixed-turn", 2, {
+          usage: { inputTokens: 31_000, cachedInputTokens: 29_000, outputTokens: 10 },
+          providerMetadata: { anthropic: { cacheCreationInputTokens: 1_000 } },
+          toolModelUsages: [coldToolUsage],
+        }),
+        // CompactionHandler keeps the summary's usage but strips its providerMetadata.
+        assistantRow("compaction-summary", 3, {
+          usage: { inputTokens: 40_000, cachedInputTokens: 0, outputTokens: 500 },
+          compacted: "user",
+          compactionBoundary: true,
+          compactionEpoch: 1,
+        }),
+        { type: "caught-up", historyReplayStatus: "complete" },
+      ]);
+
+      createAndAddWorkspace(store, workspaceId);
+      await tick(10);
+
+      const turns = store.getWorkspaceUsage(workspaceId).recentTurnCacheHealth ?? [];
+      expect(turns.map((turn) => [turn.messageId, turn.cacheWriteTokens, turn.coldStart])).toEqual([
+        ["mixed-turn", 31_000, false],
+        ["tool-only-turn", 30_000, true],
+      ]);
     });
   });
 
