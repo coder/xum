@@ -107,7 +107,8 @@ export function MemoryFileEditor(props: MemoryFileEditorProps) {
       void handleSave();
     } else if (view.isMarkdown && matchesKeybind(e, KEYBINDS.TOGGLE_MARKDOWN_PREVIEW)) {
       e.preventDefault();
-      view.toggle();
+      // A held shortcut must not flip the mode on every key repeat.
+      if (!e.repeat) view.toggle();
     }
   };
 
@@ -125,12 +126,16 @@ export function MemoryFileEditor(props: MemoryFileEditorProps) {
     <div
       ref={rootRef}
       tabIndex={-1}
+      // Focused on open. Unnamed, it would be named after all of its text, which a screen
+      // reader then reads out.
+      role="group"
+      aria-label={`Memory file ${props.path}`}
       onKeyDown={handleKeyDown}
       className="flex h-full min-h-0 flex-1 flex-col outline-none"
     >
       <MemoryFileHeader
         path={props.path}
-        showModeToggle={view.isMarkdown}
+        showModeToggle={view.isMarkdown && loadError === null}
         mode={view.mode}
         onModeChange={view.switchMode}
         saveDisabled={loaded === null || saving}

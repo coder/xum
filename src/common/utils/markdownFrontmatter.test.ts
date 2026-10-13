@@ -26,4 +26,9 @@ describe("fenceFrontmatter", () => {
     const fenced = fenceFrontmatter(`---\n${yaml}\n---\nbody`);
     expect(fenced).toBe(`\`\`\`\`\`\`\`yaml\n---\n${yaml}\n---\n\`\`\`\`\`\`\`\n\nbody`);
   });
+
+  test("handles yaml with more backtick runs than a call accepts as arguments", () => {
+    const yaml = "`a".repeat(1_000_000);
+    expect(fenceFrontmatter(`---\n${yaml}\n---\nbody`).startsWith("```yaml\n---\n`a`a")).toBe(true);
+  });
 });

@@ -177,6 +177,13 @@ export const Editor: Story = {
       }
     });
     await expect(canvas.queryByRole("textbox", { name: "Memory file content" })).toBeNull();
+    // Pixel does not emulate touch, so pin the class that hides the shortcut on touch screens.
+    const toggle = canvas.getByRole("button", { name: "Preview" });
+    await userEvent.hover(toggle);
+    const tooltip = await within(document.body).findByRole("tooltip");
+    await expect(tooltip.querySelector(".mobile-hide-shortcut-hints")).not.toBeNull();
+    await userEvent.unhover(toggle);
+    await waitFor(() => expect(within(document.body).queryByRole("tooltip")).toBeNull());
     await userEvent.hover(canvasElement);
     blurActiveElement();
   },

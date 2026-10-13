@@ -539,16 +539,36 @@ describe("MemoryTab", () => {
     expect(queryByRole("textbox", { name: "Memory file content" })).toBeNull();
     // happy-dom keeps focus on the hidden textarea where a browser drops it to
     // <body>, so check that focus moved to the editor root explicitly.
-    expect(document.activeElement).not.toBe(editor);
-    expect(document.activeElement).not.toBe(document.body);
-    expect(document.activeElement?.contains(await findByRole("button", { name: "Preview" }))).toBe(
-      true
-    );
+    expect(document.activeElement).toBe(await findByRole("group", { name: /prefs\.md/ }));
 
     fireEvent.keyDown(document.activeElement!, { key: "e", ctrlKey: true });
     expect(document.activeElement).toBe(
       await findByRole("textbox", { name: "Memory file content" })
     );
+  });
+
+  test("a held toggle shortcut switches once, not on every key repeat", async () => {
+    fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
+    fake.setContent("/memories/global/prefs.md", "# Heading", "sha-original");
+    const { findByText, findByRole, queryByRole } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    fireEvent.click(await findByText("prefs.md"));
+    await findByRole("heading", { name: "Heading" });
+    fireEvent.keyDown(document.activeElement!, { key: "e", ctrlKey: true });
+    const editor = await findByRole("textbox", { name: "Memory file content" });
+
+    // A repeat is still swallowed, so the browser's own Ctrl+E does not run either.
+    expect(fireEvent.keyDown(editor, { key: "e", ctrlKey: true, repeat: true })).toBe(false);
+    expect(queryByRole("textbox", { name: "Memory file content" })).toBe(editor);
+  });
+
+  test("a Markdown file that fails to load shows no preview toggle", async () => {
+    fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
+    const { findByText, queryByRole } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    fireEvent.click(await findByText("prefs.md"));
+    await findByText("No memory file at /memories/global/prefs.md");
+    expect(queryByRole("button", { name: "Preview" })).toBeNull();
   });
 
   test("a preview round trip keeps the same textarea with its value and selection", async () => {

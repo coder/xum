@@ -13,13 +13,14 @@ interface MarkdownFilePreviewProps {
  * these files verbatim, so the view must not hide any of their text.
  *
  * SECURITY AUDIT: file contents are attacker-influenceable; they reach the DOM only through
- * MarkdownCore's sanitize and harden pipeline, with raw HTML rendered as text.
+ * MarkdownCore's sanitize and harden pipeline, with raw HTML rendered as text. Opening a file
+ * loads nothing: images are blocked unless inlined as data: URLs, and relative links are blocked.
  */
 export function MarkdownFilePreview(props: MarkdownFilePreviewProps) {
   return (
     <MarkdownRenderer
       content={fenceFrontmatter(props.content)}
-      renderRawHtml={false}
+      filePreview
       // Long unbroken URLs and paths must wrap instead of widening the sidebar.
       className={cn("min-w-0 [overflow-wrap:anywhere]", props.className)}
     />
