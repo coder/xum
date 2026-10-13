@@ -72,6 +72,7 @@ export async function scanHistoryReplacementRows(
           raw(bytes) {
             length += bytes.length;
             if (length > SESSION_HISTORY_MAX_LINE_BYTES) chunks = undefined;
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
             else chunks!.push(Buffer.from(bytes));
             rawReset.push(bytes);
           },

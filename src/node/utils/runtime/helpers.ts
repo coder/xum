@@ -73,7 +73,8 @@ export async function execBuffered(
   // Read stdout and stderr concurrently
   const readStream =
     options.maxOutputBytes !== undefined
-      ? (s: ReadableStream<Uint8Array>) => streamToStringCapped(s, options.maxOutputBytes!)
+      ? // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+        (s: ReadableStream<Uint8Array>) => streamToStringCapped(s, options.maxOutputBytes!)
       : streamToString;
   const [stdout, stderr, exitCode, duration] = await Promise.all([
     readStream(stream.stdout),

@@ -97,7 +97,6 @@ describe("artifact_list tool", () => {
       sessionDir,
       relPath: "gone.md",
       bytes: Buffer.from("old"),
-      source: "publish",
       label: "Old report",
     });
     const config = {
@@ -119,7 +118,7 @@ describe("artifact_list tool", () => {
     });
   });
 
-  test("shows the latest version's saved state for HTML artifacts", async () => {
+  test("shows the saved state of HTML artifacts", async () => {
     const scratchDir = path.join(tempDir, "scratch");
     const sessionDir = path.join(tempDir, "session");
     await fs.mkdir(path.join(scratchDir, "artifacts"), { recursive: true });
@@ -128,7 +127,6 @@ describe("artifact_list tool", () => {
     await setArtifactInteractionState(path.dirname(sessionDir), {
       workspaceId: path.basename(sessionDir),
       path: "form.html",
-      version: null,
       state: { step: 2 },
     });
     const tool = createArtifactListTool({
@@ -137,10 +135,10 @@ describe("artifact_list tool", () => {
       xumEnv: { XUM_SCRATCH_DIR: scratchDir, XUM_RUNTIME: "worktree" },
     });
     const result = (await tool.execute!({}, options)) as {
-      artifacts: Array<{ path: string; state?: string; stateVersion?: number }>;
+      artifacts: Array<{ path: string; state?: string }>;
     };
     const byPath = new Map(result.artifacts.map((entry) => [entry.path, entry]));
-    expect(byPath.get("form.html")).toMatchObject({ state: '{"step":2}', stateVersion: 0 });
+    expect(byPath.get("form.html")).toMatchObject({ state: '{"step":2}' });
     expect(byPath.get("notes.md")?.state).toBeUndefined();
   });
 
@@ -154,7 +152,6 @@ describe("artifact_list tool", () => {
     await setArtifactInteractionState(path.dirname(sessionDir), {
       workspaceId: path.basename(sessionDir),
       path: "page-3.html",
-      version: null,
       state: { step: 1 },
     });
     const summarize = spyOn(artifactInteractions, "summarizeArtifactState");

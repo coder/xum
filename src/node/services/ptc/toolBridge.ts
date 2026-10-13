@@ -330,6 +330,7 @@ export class ToolBridge {
 
         // Execute tool with full options (toolCallId and messages are required by type
         // but not used by most tools; messages stay synthetic for sandbox context)
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const result: unknown = await boundTool.execute!(validatedArgs, {
           abortSignal,
           toolCallId: bridgedToolCallId,
@@ -396,6 +397,7 @@ export class ToolBridge {
         if (abortSignal?.aborted) {
           throw new Error("Execution aborted");
         }
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const result: unknown = await taskTool.execute!(validatedArgs, {
           abortSignal,
           toolCallId: bridgedToolCallId,

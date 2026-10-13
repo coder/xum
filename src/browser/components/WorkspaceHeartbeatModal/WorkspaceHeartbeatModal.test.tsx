@@ -239,7 +239,9 @@ describe("WorkspaceHeartbeatModal", () => {
     const intervalField = (await waitFor(() =>
       view.getByLabelText("Heartbeat interval in minutes")
     )) as HTMLInputElement;
-    expect(intervalField.value).toBe("6");
+    // The field first renders with the built-in default. The modal's re-sync effect then sets the
+    // loaded global default, so wait for the value, not only the field (#6093).
+    await waitFor(() => expect(intervalField.value).toBe("6"));
     expect(workspaceHeartbeatGetMock).toHaveBeenCalledWith({ workspaceId: "ws-1" });
     expect(getConfigMock).toHaveBeenCalled();
 

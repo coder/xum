@@ -25,6 +25,14 @@ import {
   type MCPGetPromptResult,
   type MCPPrompt,
 } from "@/node/services/mcpClient";
+import {
+  MCP_SETTINGS_WORKSPACE_META_KEY,
+  filterMCPSettingValues,
+  parseMCPSettingsReadResult,
+  validateMCPSettingValue,
+  type MCPSettingValue,
+  type MCPSettingsSnapshot,
+} from "@/common/utils/mcpSettings";
 import type { McpAppResultRecord, McpAppResultStore } from "@/node/services/mcpAppResultStore";
 import { extractMcpAppResource, type McpAppResource } from "@/node/services/mcpAppResource";
 import type { McpAppToolCallResult } from "@/common/orpc/schemas/mcpApps";
@@ -1355,6 +1363,8 @@ interface MCPServerInstance {
    * extension. Tool metadata includes tools hidden from the model.
    */
   apps?: Pick<MCPClientHandle, "toolUi" | "hasTool" | "callToolForApp" | "readResource">;
+  /** OpenAI structured settings (`openai/settings`); its tools are hidden from the model. */
+  settings?: Pick<MCPClientHandle, "settingsCapability" | "callSettingsTool">;
   /** True once the underlying MCP client/transport has been closed. */
   isClosed: boolean;
   /**
@@ -4590,6 +4600,153 @@ export class MCPServerManager {
     return this.lastWorkspaceRequestOptions.has(workspaceId);
   }
 
+  /**
+   * Last settings values per server instance, then workspace. Memory only: the server persists
+   * them. Keyed by the instance that returned them, so a replaced, recycled or removed server
+   * (every path that drops an instance) can never serve the old instance's values.
+   */
+  private readonly settingsCache = new WeakMap<
+    MCPServerInstance,
+    Map<string, Record<string, MCPSettingValue>>
+  >();
+
+  /** Last settings values read or saved for this workspace's current server instance, if any. */
+  getCachedSettings(
+    workspaceId: string,
+    serverName: string
+  ): Record<string, MCPSettingValue> | undefined {
+    const instance = this.workspaceServers.get(workspaceId)?.instances.get(serverName);
+    return instance === undefined ? undefined : this.settingsCache.get(instance)?.get(workspaceId);
+  }
+
+  /**
+   * Latest settings request (read or update) per server instance, then workspace. A request
+   * takes its ID before dispatch, and its result is cached only while that ID is still the
+   * latest: an older read that settles last never overwrites a newer read or update.
+   */
+  private readonly settingsRequestIds = new WeakMap<MCPServerInstance, Map<string, number>>();
+  private settingsRequestCount = 0;
+
+  private takeSettingsRequestId(instance: MCPServerInstance, workspaceId: string): number {
+    const byWorkspace = this.settingsRequestIds.get(instance) ?? new Map<string, number>();
+    this.settingsRequestIds.set(instance, byWorkspace);
+    byWorkspace.set(workspaceId, ++this.settingsRequestCount);
+    return this.settingsRequestCount;
+  }
+
+  /** Caches `values` when `requestId` is still the latest request; returns whether it did. */
+  private cacheSettings(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    requestId: number,
+    values: Record<string, MCPSettingValue>
+  ): boolean {
+    if (this.settingsRequestIds.get(instance)?.get(workspaceId) !== requestId) return false;
+    const byWorkspace =
+      this.settingsCache.get(instance) ?? new Map<string, Record<string, MCPSettingValue>>();
+    byWorkspace.set(workspaceId, values);
+    this.settingsCache.set(instance, byWorkspace);
+    return true;
+  }
+
+  /** Calls a settings tool with the workspace `_meta`; returns its structuredContent. */
+  private async callSettingsTool(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    pick: "readTool" | "updateTool",
+    args: Record<string, unknown>,
+    options?: { signal?: AbortSignal; timeoutMs?: number }
+  ): Promise<unknown> {
+    const capability = instance.settings?.settingsCapability();
+    if (instance.settings === undefined || capability === undefined)
+      throw new Error(`MCP server '${instance.name}' has no settings`);
+    const result = await instance.settings.callSettingsTool(
+      capability[pick],
+      args,
+      { [MCP_SETTINGS_WORKSPACE_META_KEY]: workspaceId },
+      options
+    );
+    if (result.isError === true) {
+      const text = Array.isArray(result.content)
+        ? result.content.map((part) => (part.type === "text" ? part.text : "")).join(" ")
+        : "";
+      throw new Error(text.trim() || `MCP server '${instance.name}' refused the settings request`);
+    }
+    return result.structuredContent;
+  }
+
+  /** Read and validate a server's structured settings for one workspace (cached on success). */
+  async readSettings(
+    workspaceId: string,
+    serverName: string,
+    options?: { signal?: AbortSignal; timeoutMs?: number }
+  ): Promise<MCPSettingsSnapshot> {
+    let source: { instance: MCPServerInstance; requestId: number } | undefined;
+    const snapshot = await this.invokeServerOperation(
+      workspaceId,
+      serverName,
+      `MCP settings read for '${serverName}'`,
+      (instance) => {
+        source = { instance, requestId: this.takeSettingsRequestId(instance, workspaceId) };
+        return this.callSettingsTool(instance, workspaceId, "readTool", {}, options);
+      },
+      (content) => {
+        const parsed = parseMCPSettingsReadResult(content);
+        if ("error" in parsed) throw new Error(`MCP server '${serverName}': ${parsed.error}`);
+        return parsed;
+      },
+      options
+    );
+    for (const warning of snapshot.warnings)
+      log.warn(`[MCP] Settings of '${serverName}': ${warning}`, { workspaceId });
+    if (source !== undefined)
+      this.cacheSettings(source.instance, workspaceId, source.requestId, snapshot.values);
+    return snapshot;
+  }
+
+  /**
+   * Send changed settings (`{set}`) and cache the server's returned values.
+   * `prior` is the read the caller validated `set` against (its schema and values).
+   */
+  async updateSettings(
+    workspaceId: string,
+    serverName: string,
+    set: Record<string, MCPSettingValue>,
+    prior: Pick<MCPSettingsSnapshot, "properties" | "values">
+  ): Promise<Record<string, MCPSettingValue>> {
+    const { properties } = prior;
+    for (const [name, value] of Object.entries(set)) {
+      const schema = Object.hasOwn(properties, name) ? properties[name] : undefined;
+      const error = schema === undefined ? "is unknown" : validateMCPSettingValue(schema, value);
+      if (error !== null) throw new Error(`Setting '${name}' ${error}`);
+    }
+    // One-shot dispatch, like callMcpAppTool: an epoch retry must not send the update twice.
+    let dispatched: Promise<unknown> | null = null;
+    let source: { instance: MCPServerInstance; requestId: number } | undefined;
+    const values = await this.invokeServerOperation(
+      workspaceId,
+      serverName,
+      `MCP settings update for '${serverName}'`,
+      (instance) => {
+        source ??= { instance, requestId: this.takeSettingsRequestId(instance, workspaceId) };
+        return (dispatched ??= this.callSettingsTool(instance, workspaceId, "updateTool", { set }));
+      },
+      (content) => {
+        const warnings: string[] = [];
+        const raw = content !== null && typeof content === "object" ? content : {};
+        const result = filterMCPSettingValues(properties, Reflect.get(raw, "values"), warnings);
+        for (const warning of warnings)
+          log.warn(`[MCP] Settings update of '${serverName}': ${warning}`, { workspaceId });
+        // A property the result omits or sends invalid keeps its prior value: resetting it
+        // would show a false or empty control and forget what the server stores.
+        return { ...prior.values, ...result };
+      }
+    );
+    if (source !== undefined)
+      this.cacheSettings(source.instance, workspaceId, source.requestId, values);
+    return values;
+  }
+
   /** Host-only MCP Apps record (raw tool result) for a tool call, or null when missing. */
   async getMcpAppResult(
     workspaceId: string,
@@ -5153,6 +5310,7 @@ export class MCPServerManager {
     const start = Date.now();
     const projectPathProvided =
       typeof input.projectPath === "string" && input.projectPath.trim().length > 0;
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     const resolvedProjectPath = projectPathProvided ? input.projectPath! : this.config.rootDir;
     const trusted = projectPathProvided
       ? isProjectTrusted(this.config, resolvedProjectPath)
@@ -6649,6 +6807,7 @@ export class MCPServerManager {
           getPrompt: (promptName, args, options) =>
             readyClient.getPrompt(promptName, args, options),
           ...(appResultStore ? { apps: readyClient } : {}),
+          settings: readyClient,
           refreshPrompts: (options) => readyClient.prompts(options),
           isClosed: transportClosed,
           ...(isModernEra(negotiatedPrior)
@@ -6950,6 +7109,7 @@ export class MCPServerManager {
         prompts: [],
         getPrompt: (promptName, args, options) => activeClient.getPrompt(promptName, args, options),
         ...(appResultStore ? { apps: activeClient } : {}),
+        settings: activeClient,
         refreshPrompts: (options) => activeClient.prompts(options),
         isClosed: transportErrored || clientClosed,
         ...(isModernEra(negotiatedPrior)
