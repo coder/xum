@@ -60,6 +60,11 @@ function validateSkillPathPattern(pattern: string): string | undefined {
   if (/^[/\\]/.test(pattern) || /^[A-Za-z]:/.test(pattern)) {
     return `pattern '${pattern}' must be relative to the workspace root, not absolute`;
   }
+  // Patterns are OR-ed (any match activates the skill), so a negated glob would
+  // match every other file and make the skill global. Reject it instead.
+  if (pattern.startsWith("!")) {
+    return `pattern '${pattern}' must not be negated (patterns are combined with OR)`;
+  }
   if (pattern.split(/[/\\]/).includes("..")) {
     return `pattern '${pattern}' must not contain '..' segments`;
   }

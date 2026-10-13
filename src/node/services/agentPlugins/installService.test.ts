@@ -2661,6 +2661,24 @@ describe("AgentPluginInstallService", () => {
     expect(updated.lockedSha).toBe(newHead);
   });
 
+  test("update accepts a skill paths reordering as capability-neutral", async () => {
+    // paths patterns are OR-ed: reordering them surfaces the skill on the same files.
+    const skillWithPaths = (paths: string) =>
+      `---\nname: greet\ndescription: Greets people\npaths: ${paths}\n---\n\nSay hi.\n`;
+    const skillFile = path.join(remoteDir, "skills", "greet", "SKILL.md");
+    await fsPromises.writeFile(skillFile, skillWithPaths('["src/**", "tests/**"]'));
+    await commitAll(remoteDir, "paths in src,tests order");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    await writePluginFixture(remoteDir, { version: "1.0.1" });
+    await fsPromises.writeFile(skillFile, skillWithPaths('["tests/**", "src/**"]'));
+    const newHead = await commitAll(remoteDir, "paths reordered to tests,src");
+
+    const updated = await service.update({ name: "demo-plugin" });
+    expect(updated.lockedSha).toBe(newHead);
+  });
+
   test("preview rejects a repository exceeding the staged-checkout quota", async () => {
     // Remotes are untrusted: --depth 1 bounds history, not checkout bytes.
     // An oversized tree must be rejected (and its staging dir deleted)

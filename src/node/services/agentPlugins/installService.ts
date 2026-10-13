@@ -214,8 +214,9 @@ function describeSkillAdvertisement(skill: CollectedPluginSkill): {
       whenToUse: skill.whenToUse ?? null,
       advertise: skill.advertise ?? null,
       // Only path-scoped skills carry the key, so fingerprints of existing
-      // skills stay byte-identical (no spurious re-consent on update).
-      ...(skill.paths !== undefined ? { paths: skill.paths } : {}),
+      // skills stay byte-identical (no spurious re-consent on update). Patterns
+      // are OR-ed, so order is irrelevant: sort a copy so a reorder needs no consent.
+      ...(skill.paths !== undefined ? { paths: [...skill.paths].sort() } : {}),
     }),
     display: formatSkillAdvertisementDisplay(skill),
   };

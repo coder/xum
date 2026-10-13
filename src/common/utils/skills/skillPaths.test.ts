@@ -22,6 +22,7 @@ describe("normalizeSkillPaths", () => {
     ["absolute posix", ["/etc/*.conf"], "/etc/*.conf"],
     ["absolute windows", ["C:/src/*.ts"], "C:/src/*.ts"],
     ["parent segment", ["src/../../*.ts"], ".."],
+    ["negated pattern", ["src/**/*.ts", "!src/**/*.test.ts"], "!src/**/*.test.ts"],
   ])("rejects %s with an error naming the problem", (_label, raw, fragment) => {
     const result = normalizeSkillPaths(raw);
     expect(result.ok).toBe(false);
