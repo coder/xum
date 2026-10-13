@@ -1,6 +1,7 @@
 import type { AppStory } from "@/browser/stories/meta.js";
 import { appMeta, AppWithMocks, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
+import { applyTouchPointerRules } from "@/browser/stories/helpers/touchPointer";
 import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
 import { createGenericTool, createPendingTool } from "@/browser/stories/mocks/tools";
 import { STABLE_TIMESTAMP } from "@/browser/stories/mocks/workspaces";
@@ -218,27 +219,6 @@ export const AskUserQuestionOther: AppStory = {
   ),
 };
 
-/** Copies every rule of the shipped `pointer: coarse` media blocks into an unconditional stylesheet. */
-function applyTouchPointerRules(): HTMLStyleElement {
-  const css: string[] = [];
-  const visit = (rules: CSSRuleList) => {
-    for (const rule of rules) {
-      if (rule instanceof CSSMediaRule && rule.conditionText.includes("pointer: coarse")) {
-        for (const inner of rule.cssRules) css.push(inner.cssText);
-      } else if (rule instanceof CSSGroupingRule) {
-        visit(rule.cssRules);
-      }
-    }
-  };
-  for (const sheet of document.styleSheets) visit(sheet.cssRules);
-  // Without any copied rule the play would measure the desktop layout and pass for no reason.
-  if (css.length === 0) throw new Error("No pointer: coarse rules found in the stylesheets");
-  const style = document.createElement("style");
-  style.textContent = css.join("\n");
-  document.head.append(style);
-  return style;
-}
-
 function PhoneWidthDecorator(Story: ComponentType) {
   return (
     <div style={{ width: 390, height: 844, overflow: "hidden" }}>
@@ -278,7 +258,7 @@ export const AskUserQuestionTouchPhone: AppStory = {
     await userEvent.click(approach);
     await canvas.findByText("Which approach should we take?", {}, { timeout: 8000 });
 
-    const touchRules = applyTouchPointerRules();
+    const removeTouchRules = applyTouchPointerRules(canvasElement.ownerDocument);
     try {
       await waitFor(() => {
         const checkbox = storyRoot.querySelector('[role="button"] > button[role="checkbox"]');
@@ -305,7 +285,7 @@ export const AskUserQuestionTouchPhone: AppStory = {
         }
       });
     } finally {
-      touchRules.remove();
+      removeTouchRules();
     }
   },
 };
