@@ -11,6 +11,7 @@ import { runMessageSendHooks } from "./promptHooks";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { CodexPluginHookService, type EnsureCodexHooksArgs } from "./codexHookService";
+import { discoverAgentPluginAt } from "./discovery";
 import { loadPluginCodexHooks } from "./codexHooks";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import { buildPluginServerKey, computePluginInstanceId } from "./mcpConfig";
@@ -42,19 +43,40 @@ describe("CodexPluginHookService", () => {
   const pluginRoot = (name: string) => path.join(xumHome, "plugins", name);
   const instanceId = (name: string) => computePluginInstanceId(pluginRoot(name));
 
+  const preToolUse = (server: string) => ({
+    hooks: { PreToolUse: [{ hooks: [{ type: "mcp_tool", server, tool: "check" }] }] },
+  });
+
+  /**
+   * `document` is hooks/hooks.json. `manifests`: "root" writes plugin.json; "codex" only
+   * .codex-plugin/plugin.json; "overlay" a root plugin.json plus a .codex-plugin/plugin.json whose
+   * hooks pointer names hooks/custom.json (served by `custom`).
+   */
   async function writePlugin(
     name: string,
     server: string,
     managed = true,
-    document: unknown = {
-      hooks: { PreToolUse: [{ hooks: [{ type: "mcp_tool", server, tool: "check" }] }] },
-    }
+    document: unknown = preToolUse(server),
+    manifests: "root" | "codex" | "overlay" = "root"
   ) {
     await fs.mkdir(path.join(pluginRoot(name), "hooks"), { recursive: true });
-    await fs.writeFile(
-      path.join(pluginRoot(name), "plugin.json"),
-      JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name })
-    );
+    if (manifests !== "codex") {
+      await fs.writeFile(
+        path.join(pluginRoot(name), "plugin.json"),
+        JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name })
+      );
+    }
+    if (manifests !== "root") {
+      await fs.mkdir(path.join(pluginRoot(name), ".codex-plugin"), { recursive: true });
+      await fs.writeFile(
+        path.join(pluginRoot(name), ".codex-plugin", "plugin.json"),
+        JSON.stringify(manifests === "overlay" ? { name, hooks: "./hooks/custom.json" } : { name })
+      );
+      await fs.writeFile(
+        path.join(pluginRoot(name), "hooks", "custom.json"),
+        JSON.stringify(preToolUse("custom"))
+      );
+    }
     await fs.writeFile(
       path.join(pluginRoot(name), "hooks", "hooks.json"),
       JSON.stringify(document)
@@ -71,11 +93,18 @@ describe("CodexPluginHookService", () => {
     );
   }
 
-  async function trustAll(name: string) {
-    const { hooks } = await loadPluginCodexHooks({
-      rootPath: await fs.realpath(pluginRoot(name)),
-      manifest: { schemaId: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name },
+  /** The plugin as discovery sees it (the com.openai view the loader reads). */
+  async function discovered(name: string) {
+    const { plugin } = await discoverAgentPluginAt({
+      pluginDir: pluginRoot(name),
+      scope: "global",
     });
+    if (plugin === null) throw new Error(`${name} is not a plugin`);
+    return plugin;
+  }
+
+  async function trustAll(name: string) {
+    const { hooks } = await loadPluginCodexHooks(await discovered(name));
     for (const hook of hooks) {
       await setPluginHookTrust(xumHome, instanceId(name), {
         key: hook.key,
@@ -150,6 +179,23 @@ describe("CodexPluginHookService", () => {
     expect((await runBash()).executed).toBe(false);
     expect(calledKeys).toEqual([buildPluginServerKey(instanceId("guard"), "scanner")]);
   });
+
+  test.each([
+    { manifests: "codex" as const, server: "scanner" },
+    { manifests: "overlay" as const, server: "custom" },
+  ])(
+    "a trusted hook of a $manifests package runs, from the hooks discovery selected",
+    async (fixture) => {
+      // Codex PRRT_kwDOPxxmWM6r2lvU and PRRT_kwDOPxxmWM6r2lvb: the gate before each call reloads
+      // the hooks the way discovery reads the package, not from a root plugin.json alone.
+      await writePlugin("guard", "scanner", true, undefined, fixture.manifests);
+      await trustAll("guard");
+      await service.ensureWorkspaceHooks(args());
+
+      expect((await runBash()).executed).toBe(false);
+      expect(calledKeys).toEqual([buildPluginServerKey(instanceId("guard"), fixture.server)]);
+    }
+  );
 
   test("a hook turned off mid-turn does not run on the next call", async () => {
     await writePlugin("guard", "scanner");
@@ -351,10 +397,7 @@ describe("CodexPluginHookService", () => {
   test("an unmanaged plugin's hooks never run, even with a trust record", async () => {
     await writePlugin("loose", "scanner", false);
     // setPluginHookTrust refuses a plugin without a registry entry, so write the record directly.
-    const { hooks } = await loadPluginCodexHooks({
-      rootPath: await fs.realpath(pluginRoot("loose")),
-      manifest: { schemaId: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "loose" },
-    });
+    const { hooks } = await loadPluginCodexHooks(await discovered("loose"));
     const trustFile = getPluginHookTrustPath(xumHome, instanceId("loose"));
     await fs.mkdir(path.dirname(trustFile), { recursive: true });
     await fs.writeFile(
