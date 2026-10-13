@@ -32,7 +32,7 @@ import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/prov
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { ProviderIcon, ProviderWithIcon } from "@/browser/components/ProviderIcon/ProviderIcon";
 import { getStoredAuthToken } from "@/browser/components/AuthTokenModal/AuthTokenModal";
-import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
 import { ConfigSwitchSetting, type SettingsApi } from "./ConfigSwitchSetting";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
@@ -478,8 +478,11 @@ export function ProvidersSection() {
     setProvidersStartCoderLogin,
   } = useSettings();
 
-  const { api } = useAPI();
+  // The live client only, for gates, disabled states and writes: offline (the last client kept
+  // while reconnecting) a write would fail, and the optimistic value would look saved until the
+  // reconnect puts the server value back. Loads go through useProvidersConfig.
   const liveApi = useLiveAPI();
+  const api = liveApi;
   const { config, loading: configLoading, refresh, updateOptimistically } = useProvidersConfig();
   const { refreshWorkspaceMetadata } = useWorkspaceContext();
   const visibleProviders = useMemo(() => getProviderIdsForUi(config), [config]);
