@@ -150,17 +150,24 @@ function anthropicOptionsOf(part: Record<string, unknown>): Record<string, unkno
   return isRecord(anthropic) ? anthropic : {};
 }
 
-function isImage(part: Record<string, unknown>): boolean {
-  // The converter sends a referenced file with `containerUpload` as a `container_upload`
-  // block before it looks at the media type, so an image file sent that way is no image.
-  if (
+/**
+ * The converter sends a referenced file with `containerUpload` as a `container_upload`
+ * block before it looks at the media type, so an image file sent that way is no image.
+ */
+function isContainerUpload(part: Record<string, unknown>): boolean {
+  return (
     part.type === "file" &&
     isRecord(part.data) &&
     part.data.type === "reference" &&
     anthropicOptionsOf(part).containerUpload === true
-  ) {
-    return false;
-  }
+  );
+}
+
+function sendsImage(part: Record<string, unknown>): boolean {
+  return isImage(part) && !isContainerUpload(part);
+}
+
+function isImage(part: Record<string, unknown>): boolean {
   const mediaType = part.mediaType ?? part.media_type;
   return (
     part.type === "image" ||
@@ -205,17 +212,30 @@ function collectToolReferences(value: unknown, names: string[]): void {
   if (!isRecord(value)) return;
   // A removal names a tool without loading its definition; it is not a measured expansion.
   if (value.type === "tool_removal") return;
-  const anthropic = anthropicOptionsOf(value);
-  const name =
-    value.type === "tool_reference"
-      ? (value.tool_name ?? value.name ?? value.toolName)
-      : anthropic.type === "tool-reference"
-        ? anthropic.toolName
-        : value.type === "tool_addition"
-          ? value.toolName
-          : undefined;
+  const name = toolReferenceName(value);
   if (typeof name === "string") names.push(name);
   for (const nested of Object.values(value)) collectToolReferences(nested, names);
+}
+
+function toolReferenceName(value: Record<string, unknown>): unknown {
+  if (value.type === "tool_reference") return value.tool_name ?? value.name ?? value.toolName;
+  if (value.type === "tool_addition") return value.toolName;
+  const anthropic = anthropicOptionsOf(value);
+  return anthropic.type === "tool-reference" ? anthropic.toolName : undefined;
+}
+
+/**
+ * The definitions of the tools a block references, as an extra hash input: Anthropic
+ * expands a tool_reference into the tool's definition in place, so a changed definition
+ * of a referenced deferred tool changes this block (measured through the Coder gateway on
+ * Haiku 4.5 for a tool result and on Haiku 5.5 for a tool_addition; changing an
+ * unreferenced deferred tool kept the whole prefix).
+ */
+function referencedDefinitions(value: unknown, toolDefinitions: Map<string, unknown>): string {
+  const references: string[] = [];
+  collectToolReferences(value, references);
+  if (references.length === 0) return "";
+  return `\0${JSON.stringify(references.map((name) => toolDefinitions.get(name) ?? null))}`;
 }
 
 function claudeVersion(modelId: string): { family: string; version: number } | undefined {
@@ -315,22 +335,53 @@ interface FingerprintMessage {
  * dropped there. `clearAt` and `effort` are dropped too, except that an effort-only
  * message with empty text becomes a `role: "system"` message at the start of `messages`.
  */
-function leadingSystemBlocks(message: unknown): { system: unknown[]; messages: unknown[] } {
-  if (!isRecord(message) || typeof message.content !== "string") {
-    return { system: contentOf(isRecord(message) ? message.content : message), messages: [] };
-  }
+function leadingSystemBlocks(message: Record<string, unknown>): {
+  system: unknown[];
+  messages: unknown[];
+} {
+  if (typeof message.content !== "string")
+    return { system: contentOf(message.content), messages: [] };
   const anthropic = anthropicOptionsOf(message);
-  const toolChanges = Array.isArray(anthropic.toolChanges) ? anthropic.toolChanges.length : 0;
-  const hasOptions = toolChanges > 0 || anthropic.clearAt != null || anthropic.effort != null;
   const text = message.content;
   const effortOnly =
-    text === "" && toolChanges === 0 && anthropic.clearAt == null && anthropic.effort != null;
+    text === "" &&
+    anthropic.effort != null &&
+    !hasSystemMessageOptions({ ...anthropic, effort: undefined });
   return {
-    system: text !== "" || !hasOptions ? [text] : [],
+    system: text !== "" || !hasSystemMessageOptions(anthropic) ? [text] : [],
     messages: effortOnly
       ? [{ type: "message-options", providerOptions: { anthropic: { effort: anthropic.effort } } }]
       : [],
   };
+}
+
+function hasSystemMessageOptions(anthropic: Record<string, unknown>): boolean {
+  const toolChanges = Array.isArray(anthropic.toolChanges) ? anthropic.toolChanges : [];
+  return toolChanges.length > 0 || anthropic.clearAt != null || anthropic.effort != null;
+}
+
+function roleOf(message: unknown): string {
+  return (isRecord(message) ? label(message.role) : undefined) ?? "unknown";
+}
+
+/**
+ * The messages after the top-level system prompt, as Anthropic keeps them. Message-level
+ * Anthropic options (prompt form: a mid-conversation system message's `clearAt`, `effort`,
+ * `toolChanges`) are serialized into its wire message, so they count as a leading block.
+ */
+function conversationMessages(raw: unknown[], modelId: string | undefined): FingerprintMessage[] {
+  const messages = raw.map((message) => {
+    const content = contentOf(isRecord(message) ? message.content : message);
+    const options = isRecord(message)
+      ? withoutBlockMarker({ providerOptions: message.providerOptions })
+      : {};
+    const optionBlocks =
+      Object.keys(options).length > 0 ? [{ type: "message-options", ...options }] : [];
+    return { role: roleOf(message), content: [...optionBlocks, ...content] };
+  });
+  return modelId != null && stripsEarlierTurnThinking(modelId)
+    ? withoutEarlierTurnThinking(messages)
+    : messages;
 }
 
 function contentOf(content: unknown): unknown[] {
@@ -387,15 +438,8 @@ export function fingerprintAnthropicRequest(
     if (toolName != null && callId != null) toolNamesByCallId.set(callId, toolName);
     const resultId = label(record.tool_use_id);
     toolName ??= resultId != null ? toolNamesByCallId.get(resultId) : undefined;
-    // Anthropic expands a tool_reference into the tool's definition in place, so a changed
-    // definition of a referenced deferred tool changes this block (measured on Haiku 4.5 for
-    // a tool result and on Haiku 5.5 for a tool_addition; an unreferenced one does not).
-    const references: string[] = [];
-    if (section !== "tools") collectToolReferences(value, references);
-    const expansion =
-      references.length > 0
-        ? `\0${JSON.stringify(references.map((name) => toolDefinitions.get(name) ?? null))}`
-        : "";
+    // Tool definitions hold application JSON, not references.
+    const expansion = section === "tools" ? "" : referencedDefinitions(value, toolDefinitions);
     const hash = createHash("sha256")
       .update(`${section}\0${role}\0${serialized}${expansion}`)
       .digest("hex");
@@ -411,8 +455,6 @@ export function fingerprintAnthropicRequest(
 
   const rawMessages: unknown = Array.isArray(body.messages) ? body.messages : body.prompt;
   const rawList = Array.isArray(rawMessages) ? (rawMessages as unknown[]) : [];
-  const roleOf = (message: unknown) =>
-    (isRecord(message) ? label(message.role) : undefined) ?? "unknown";
   // Only the prompt form's leading system messages are the top-level system
   // prompt; a later one is a mid-conversation system message.
   const firstNonSystem = rawList.findIndex((message) => roleOf(message) !== "system");
@@ -421,27 +463,11 @@ export function fingerprintAnthropicRequest(
     : firstNonSystem === -1
       ? rawList.length
       : firstNonSystem;
-  const leading = rawList.slice(0, leadingSystemCount).map(leadingSystemBlocks);
-  let messages: FingerprintMessage[] = rawList.slice(leadingSystemCount).map((message) => {
-    const content = contentOf(isRecord(message) ? message.content : message);
-    // Message-level Anthropic options (prompt form: a mid-conversation system message's
-    // `clearAt`, `effort`, `toolChanges`) are serialized into its wire message, so they
-    // count as a leading block.
-    const messageOptions = isRecord(message)
-      ? withoutBlockMarker({ providerOptions: message.providerOptions })
-      : {};
-    return {
-      role: roleOf(message),
-      content:
-        Object.keys(messageOptions).length > 0
-          ? [{ type: "message-options", ...messageOptions }, ...content]
-          : content,
-    };
-  });
-  const modelId = typeof body.model === "string" ? body.model : options.modelId;
-  if (modelId != null && stripsEarlierTurnThinking(modelId)) {
-    messages = withoutEarlierTurnThinking(messages);
-  }
+  const leading = rawList.slice(0, leadingSystemCount).filter(isRecord).map(leadingSystemBlocks);
+  const messages = conversationMessages(
+    rawList.slice(leadingSystemCount),
+    typeof body.model === "string" ? body.model : options.modelId
+  );
   const allParts = [
     ...leading.flatMap((entry) => [...entry.system, ...entry.messages]),
     ...messages.flatMap((message) => message.content),
@@ -482,7 +508,7 @@ export function fingerprintAnthropicRequest(
     thinking: body.thinking ?? null,
     effort: isRecord(body.output_config) ? (body.output_config.effort ?? null) : null,
     toolChoice: body.tool_choice ?? null,
-    images: allParts.some((part) => someBlock(part, isImage)),
+    images: allParts.some((part) => someBlock(part, sendsImage)),
   });
   for (const part of leading.flatMap((entry) => entry.messages)) push("messages", "system", part);
   for (const message of messages) {
