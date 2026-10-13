@@ -723,7 +723,8 @@ describe("createDevToolsMiddleware", () => {
         params,
         model: createMockModel(),
       });
-      await streaming.catch(() => undefined);
+      // The provider call rejects after the abort; only the recorded step matters here.
+      await Promise.resolve(streaming).catch(() => undefined);
 
       // The abort handler finalizes in the background; wait for that update.
       const readStep = async () => {
