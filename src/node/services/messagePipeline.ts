@@ -16,6 +16,7 @@ import { neutralizeAgentEnvelopeLookalikesForProvider } from "@/node/utils/messa
 import { extractToolMediaAsUserMessages } from "@/node/utils/messages/extractToolMediaAsUserMessages";
 import { sanitizeAnthropicPdfFilenames } from "@/node/utils/messages/sanitizeAnthropicDocumentFilename";
 import { convertDataUriFilePartsForSdk } from "@/node/utils/messages/convertDataUriFilePartsForSdk";
+import { insertStepStartPartsForSdk } from "@/node/utils/messages/insertStepStartPartsForSdk";
 import {
   attachReasoningReplayMetadata,
   stripReasoningReplay,
@@ -98,7 +99,7 @@ export interface PrepareMessagesOptions {
  * 7. Sanitizing PDF filenames for Anthropic
  * 8. Extracting tool-result media as user message attachments
  * 9. Rewriting data-URI file parts to SDK-safe inline base64
- * 10. Converting to Vercel AI SDK ModelMessage format
+ * 10. Converting to Vercel AI SDK ModelMessage format, split at persisted step boundaries
  * 11. Self-healing: filtering empty/whitespace assistant messages
  * 12. Applying provider-specific message transforms
  * 13. Applying cache control headers
@@ -191,11 +192,16 @@ export async function prepareMessagesForProvider(
   // providerMetadata, the only field convertToModelMessages forwards to the request.
   const messagesWithReasoningReplay = attachReasoningReplayMetadata(messagesWithSdkSafeFileParts);
 
+  // Restore each assistant row's step boundaries, so the rebuild splits messages where the
+  // in-turn steps did (prompt-cache prefix). Last: every transform above keeps assistant parts
+  // 1:1, so the persisted stepStartPartIndices still point at the right parts.
+  const messagesWithStepStarts = insertStepStartPartsForSdk(messagesWithReasoningReplay);
+
   // --- Convert to ModelMessage format ---
 
   // Type assertion needed because XumMessage has custom tool parts for interrupted tools
   // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-argument
-  const rawModelMessages = await convertToModelMessages(messagesWithReasoningReplay as any, {
+  const rawModelMessages = await convertToModelMessages(messagesWithStepStarts as any, {
     // Drop unfinished tool calls (input-streaming/input-available) so downstream
     // transforms only see tool calls that actually produced outputs.
     ignoreIncompleteToolCalls: true,

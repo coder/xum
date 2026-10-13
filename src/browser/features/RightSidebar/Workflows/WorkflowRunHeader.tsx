@@ -81,14 +81,17 @@ export const WorkflowRunHeader: React.FC<WorkflowRunHeaderProps> = (props) => {
   // guard + error state) so they satisfy onClick's void-return contract.
   const interrupt = () => {
     void runAction(() =>
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       api!.workflows.interrupt({ workspaceId: props.workspaceId, runId: run.id })
     );
   };
   const resume = () => {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     void runAction(() => api!.workflows.resume({ workspaceId: props.workspaceId, runId: run.id }));
   };
   const retry = () => {
     void runAction(() =>
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       api!.workflows.retryFromCheckpoint({ workspaceId: props.workspaceId, runId: run.id })
     );
   };
@@ -97,6 +100,7 @@ export const WorkflowRunHeader: React.FC<WorkflowRunHeaderProps> = (props) => {
       return;
     }
     void runAction(() =>
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       api!.workflows.start({
         workspaceId: props.workspaceId,
         scriptPath: rerunScriptPath,

@@ -312,6 +312,11 @@
 
     /* Radius */
     --radius: 0.5rem;
+
+    /* Layout: the centered transcript column, shared by every docked surface under it
+       (`max-w-chat`). A comfortable reading measure that also leaves room for the collapsed right
+       sidebar's overview card beside it on laptop widths (see globals.css). */
+    --container-chat: 48rem;
   }
 
   --plan-mode-rgb: 31, 107, 184;
