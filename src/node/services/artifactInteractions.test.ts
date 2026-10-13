@@ -75,7 +75,6 @@ describe("artifact interactions", () => {
       sessionDir,
       relPath: "forms/plan.html",
       bytes: Buffer.from("<p>v1</p>"),
-      source: "publish",
       label: 'Plan "B" <draft>',
     });
     const result = await sendArtifactInteraction(deps(), {
@@ -291,53 +290,43 @@ describe("artifact interactions", () => {
   });
 
   describe("state", () => {
-    test("is stored per version, latest wins, and new versions start empty", async () => {
+    test("is stored per artifact, latest wins, and a new version keeps it", async () => {
       const base = { workspaceId: WS, path: "s.html" };
-      // No stored version yet: version 0.
-      expect(
-        await setArtifactInteractionState(sessionsDir, { ...base, version: null, state: { a: 1 } })
-      ).toEqual(Ok({ version: 0 }));
-      await setArtifactInteractionState(sessionsDir, { ...base, version: null, state: { a: 2 } });
-      expect(await getArtifactInteractionState(sessionsDir, { ...base, version: null })).toEqual(
-        Ok({ version: 0, state: { a: 2 } })
-      );
-      await recordArtifactVersion({
-        sessionDir,
-        relPath: "s.html",
-        bytes: Buffer.from("v1"),
-        source: "turn-end",
-        label: null,
-      });
-      expect(await getArtifactInteractionState(sessionsDir, { ...base, version: null })).toEqual(
-        Ok({ version: 1, state: null })
-      );
-      expect(await getArtifactInteractionState(sessionsDir, { ...base, version: 0 })).toEqual(
-        Ok({ version: 0, state: { a: 2 } })
-      );
+      expect(await getArtifactInteractionState(sessionsDir, base)).toEqual(Ok({ state: null }));
+      await setArtifactInteractionState(sessionsDir, { ...base, state: { a: 1 } });
+      await setArtifactInteractionState(sessionsDir, { ...base, state: { a: 2 } });
+      expect(await getArtifactInteractionState(sessionsDir, base)).toEqual(Ok({ state: { a: 2 } }));
+      // Publishing a new version must not reset what the user picked.
+      for (const bytes of ["v1", "v2"]) {
+        await recordArtifactVersion({
+          sessionDir,
+          relPath: "s.html",
+          bytes: Buffer.from(bytes),
+          label: null,
+        });
+      }
+      expect(await getArtifactInteractionState(sessionsDir, base)).toEqual(Ok({ state: { a: 2 } }));
     });
 
     test("refuses state over the 16 KB cap", async () => {
       const result = await setArtifactInteractionState(sessionsDir, {
         workspaceId: WS,
         path: "s.html",
-        version: null,
         state: { big: "x".repeat(ARTIFACT_JSON_MAX_BYTES) },
       });
       expect(result.success).toBe(false);
     });
 
-    test("artifact_list summary covers the latest version, cut to 2 KB", async () => {
+    test("artifact_list summary covers the artifact's state, cut to 2 KB", async () => {
       expect(await summarizeArtifactState(sessionDir, "s.html")).toBeNull();
       await setArtifactInteractionState(sessionsDir, {
         workspaceId: WS,
         path: "s.html",
-        version: null,
         state: { notes: "y".repeat(ARTIFACT_STATE_SUMMARY_MAX_CHARS) },
       });
       const summary = await summarizeArtifactState(sessionDir, "s.html");
       expect(summary?.truncated).toBe(true);
       expect(summary?.state).toHaveLength(ARTIFACT_STATE_SUMMARY_MAX_CHARS);
-      expect(summary?.version).toBe(0);
     });
   });
 });

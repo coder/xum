@@ -74,7 +74,8 @@ describe("GoalTab", () => {
     rerender(<GoalTab goal={goal({ status: "paused" })} onSetStatus={mock()} onClear={mock()} />);
     expect(getByLabelText("Resume goal")).toBeTruthy();
     expect(queryByLabelText("Pause goal")).toBeNull();
-    expect(queryByLabelText("Mark goal complete")).toBeNull();
+    // A paused goal's work can finish without a resume, so it stays completable.
+    expect(getByLabelText("Mark goal complete")).toBeTruthy();
 
     rerender(
       <GoalTab

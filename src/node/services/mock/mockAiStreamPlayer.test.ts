@@ -805,6 +805,50 @@ describe("MockAiStreamPlayer", () => {
     });
   });
 
+  describe("a reply that holds its tool calls", () => {
+    async function playHeld(workspaceId: string) {
+      const emitter = new EventEmitter();
+      const player = new MockAiStreamPlayer({
+        historyService,
+        aiService: emitter as unknown as AIService,
+      });
+      const toolStarts: string[] = [];
+      emitter.on("tool-call-start", (payload: { toolCallId: string }) => {
+        toolStarts.push(payload.toolCallId);
+      });
+      const started = new Promise<void>((resolve) => emitter.once("stream-start", () => resolve()));
+      const user = createMuxMessage("user-held", "user", "[mock:tool:parallel-step] go", {
+        timestamp: Date.now(),
+      });
+      const result = await player.play([user], workspaceId);
+      if (!result.success || !result.data) throw new Error("expected a stream handle");
+      await started;
+      // Every timer of the reply is due by now; only the hold keeps the tool calls back.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      return { player, toolStarts, completion: result.data.completion };
+    }
+
+    test("streams with no tool call until released, then finishes", async () => {
+      const { player, toolStarts, completion } = await playHeld("workspace-held");
+      expect(player.isStreaming("workspace-held")).toBe(true);
+      expect(toolStarts).toEqual([]);
+
+      player.releaseToolCalls("workspace-held");
+      expect(await completion).toMatchObject({ status: "completed" });
+      expect(toolStarts).toEqual(["tool-parallel-step-a", "tool-parallel-step-b"]);
+    });
+
+    test("stop does not wait for a release", async () => {
+      const { player, toolStarts, completion } = await playHeld("workspace-held-stop");
+      await player.stop("workspace-held-stop");
+      expect(await completion).toMatchObject({ status: "aborted" });
+      expect(toolStarts).toEqual([]);
+      expect(() => player.releaseToolCalls("workspace-held-stop")).toThrow(
+        "No mock stream in workspace-held-stop holds its tool calls"
+      );
+    });
+  });
+
   test("stop prevents queued stream events from emitting", async () => {
     const aiServiceStub = new EventEmitter();
 

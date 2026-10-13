@@ -42,7 +42,6 @@ export const createArtifactTool: ToolFactory = (config) =>
           sessionDir,
           location,
           relPath,
-          source: "publish",
           label: title,
           kind: input.kind ?? undefined,
           // Persisted for M5's shelf; omitted pin keeps a previously requested one.

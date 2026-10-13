@@ -92,6 +92,26 @@ export function simulateFileModifyingToolEnd(workspaceId: string): void {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
+ * Wait until a page navigation has settled. Pages are lazy chunks (T3 #5971): while a chunk loads,
+ * React keeps the previous page mounted with `display: none` next to the "Opening page..."
+ * fallback, so a query can match a control (an agent picker, a textarea) on the hidden old page.
+ */
+async function waitForPageSettled(container: HTMLElement): Promise<void> {
+  await waitFor(
+    () => {
+      const mains = [...container.querySelectorAll("main")];
+      if (
+        mains.some((main) => main.closest('[style*="display: none"]')) ||
+        mains.some((main) => main.textContent?.includes("Opening page"))
+      ) {
+        throw new Error("Page chunk still loading");
+      }
+    },
+    { timeout: 10_000 }
+  );
+}
+
+/**
  * Set up the full App UI and navigate to a workspace.
  * Expands project tree and selects the workspace.
  */
@@ -133,6 +153,7 @@ export async function setupWorkspaceView(
     { timeout: 10_000 }
   );
   fireEvent.click(workspaceElement);
+  await waitForPageSettled(view.container);
 
   // Ensure the workspace is registered and activated in the store so that
   // runOnChatSubscription starts. In the real app, WorkspaceContext handles
@@ -166,6 +187,7 @@ export async function openProjectCreationView(
   );
 
   fireEvent.click(projectRow);
+  await waitForPageSettled(view.container);
 
   await waitFor(
     () => {

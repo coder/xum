@@ -22,6 +22,7 @@ Most providers only need an API key. The UI handles validation and shows which p
 | **OpenAI**         | GPT-6                       | [platform.openai.com](https://platform.openai.com/)     |
 | **Google**         | Gemini Pro, Flash           | [aistudio.google.com](https://aistudio.google.com/)     |
 | **xAI**            | Grok                        | [console.x.ai](https://console.x.ai/)                   |
+| **Meta**           | Muse Wonder                 | [dev.meta.ai](https://dev.meta.ai/docs)                 |
 | **DeepSeek**       | DeepSeek Chat, Reasoner     | [platform.deepseek.com](https://platform.deepseek.com/) |
 | **Moonshot AI**    | Kimi K3                     | [platform.moonshot.ai](https://platform.moonshot.ai/)   |
 | **Z.ai**           | GLM 5.3 Flash               | [z.ai](https://z.ai/model-api)                          |
@@ -46,6 +47,7 @@ Providers also read from environment variables as fallback:
 | Google         | `GOOGLE_GENERATIVE_AI_API_KEY` or `GOOGLE_API_KEY` |
 | xAI            | `XAI_API_KEY`                                      |
 | OpenRouter     | `OPENROUTER_API_KEY`                               |
+| meta           | `META_MODEL_API_KEY` or `MODEL_API_KEY`            |
 | DeepSeek       | `DEEPSEEK_API_KEY`                                 |
 | Moonshot AI    | `MOONSHOT_API_KEY`                                 |
 | Z.ai           | `ZAI_API_KEY`                                      |
@@ -128,6 +130,23 @@ For advanced options not exposed in the UI, edit `~/.xum/providers.jsonc` direct
   },
 }
 ```
+
+### Meta
+
+Configure **Meta** in Settings → Providers with a Meta Model API key, or set
+`MODEL_API_KEY` as in Meta's quickstart. `META_MODEL_API_KEY` is also supported
+and takes precedence when both are set. The default endpoint is `https://api.meta.ai/v1`.
+Select **Muse Wonder** (`meta:muse-wonder-1.0`), or use `/model wonder`.
+
+Muse Wonder is in preview with a 1,048,576-token context window. Xum uses a
+practical output cap of 131,072 tokens from [models.dev](https://models.dev).
+[Published pricing](https://dev.meta.ai/docs/pricing-rate-limits) is $4 per million
+input tokens, $0.20 per million cached input tokens, and $20 per million output
+tokens, with no long-context premium.
+
+Reasoning is private: Xum offers low, medium, high, xhigh, and max effort, not off.
+Muse Wonder Full is only available in Muse Code, not the Model API; max effort
+does not select Full. See the [Meta API documentation](https://dev.meta.ai/docs).
 
 ### OpenAI wire format
 
