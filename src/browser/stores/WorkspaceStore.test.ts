@@ -41,7 +41,11 @@ import { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMe
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 import type { StreamStartEvent, ToolCallStartEvent } from "@/common/types/stream";
-import type { WorkspaceActivitySnapshot, WorkspaceChatMessage } from "@/common/orpc/types";
+import type {
+  WorkspaceActivitySnapshot,
+  WorkspaceChatMessage,
+  WorkspaceStatsSnapshot,
+} from "@/common/orpc/types";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import {
   getAutoRetryKey,
@@ -49,11 +53,22 @@ import {
   getStatusStateKey,
 } from "@/common/constants/storage";
 import type { TodoItem } from "@/common/types/tools";
+import type { GoalSnapshot } from "@/common/types/goal";
 import { buildStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import { revealTimelineTarget } from "@/browser/utils/timelineReveal";
+import type {
+  TimelineEvent,
+  TimelinePage,
+  TimelineSubscriptionEvent,
+} from "@/common/orpc/schemas/timeline";
+import type { APIClient } from "@/browser/contexts/API";
+import { computeProvidersConfigFingerprint } from "@/common/utils/providers/configFingerprint";
 import {
+  areActivityGoalsEqual,
   findRenderedRefineProposalHash,
   mergeTimelineEvents,
+  resolveSidebarAgentStatus,
   WorkspaceStore,
   type TranscriptRefreshOutcome,
   type WorkspaceStoreOptions,
@@ -61,6 +76,7 @@ import {
 import {
   createControllableAsyncIterable,
   type ControllableAsyncIterable,
+  type TestApiOverrides,
 } from "@/browser/testUtils";
 import {
   shouldNotifyOnResponseComplete,
@@ -3625,6 +3641,165 @@ describe("WorkspaceStore", () => {
     });
   });
 
+  // Loaded session usage is repriced against the current provider config, except for
+  // gateway-billed rows, whose zero costs are real: repricing them would inflate totals.
+  describe("session usage repricing", () => {
+    // A flat-priced model: $5/M input and $25/M output tokens.
+    const BILLABLE_MODEL = "anthropic:claude-opus-4-5";
+    const OPUS_COST_OF_1000_IN_100_OUT = { input: 0.005, output: 0.0025 };
+    // No pricing metadata, unless a provider config maps it to a priced model.
+    const CUSTOM_MODEL = "ollama:custom";
+    const MAPPED_CUSTOM_CONFIG = {
+      ollama: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        models: [{ id: "custom", mappedToModel: BILLABLE_MODEL }],
+      },
+    };
+
+    const usageRow = (
+      costs: { input: number; output: number },
+      markers: { costsIncluded?: boolean; hasUnknownCosts?: boolean } = {}
+    ) => ({
+      input: { tokens: 1000, cost_usd: costs.input },
+      cached: { tokens: 0, cost_usd: 0 },
+      cacheCreate: { tokens: 0, cost_usd: 0 },
+      output: { tokens: 100, cost_usd: costs.output },
+      reasoning: { tokens: 0, cost_usd: 0 },
+      ...markers,
+    });
+    type UsageRow = ReturnType<typeof usageRow>;
+
+    /** Load one row as both the model's session bucket and the last request. */
+    const loadUsage = async (workspaceId: string, model: string, row: UsageRow) => {
+      mockGetSessionUsage.mockImplementation((input: { workspaceId: string }) =>
+        Promise.resolve(
+          input.workspaceId === workspaceId
+            ? {
+                byModel: { [model]: structuredClone(row) },
+                lastRequest: { model, usage: structuredClone(row), timestamp: 1 },
+                version: 1 as const,
+              }
+            : undefined
+        )
+      );
+      // A caught-up chat: before catch-up, usage reads come from a pre-replay snapshot.
+      mockChatScript([caughtUpEvent()], { keepOpen: true });
+      createAndAddWorkspace(store, workspaceId);
+      expect(await waitUntil(() => store.isSessionUsageKnown(workspaceId))).toBe(true);
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).loading === false)).toBe(
+        true
+      );
+      // Repricing runs once the provider config has loaded too.
+      await tick(10);
+      const usage = store.getWorkspaceUsage(workspaceId);
+      return { bucket: usage.sessionByModel?.[model], lastRequest: usage.lastRequest?.usage };
+    };
+
+    const expectCosts = (row: unknown, costs: { input: number; output: number }) => {
+      expect(row).toMatchObject({ input: { tokens: 1000 }, output: { tokens: 100 } });
+      const priced = row as UsageRow;
+      expect(priced.input.cost_usd).toBeCloseTo(costs.input, 10);
+      expect(priced.output.cost_usd).toBeCloseTo(costs.output, 10);
+    };
+
+    it("reprices recorded costs with the current model pricing", async () => {
+      // One non-zero component is enough to rule out the legacy gateway-billed heuristic.
+      const { bucket, lastRequest } = await loadUsage(
+        "reprice-stale-costs",
+        BILLABLE_MODEL,
+        usageRow({ input: 0, output: 1 })
+      );
+
+      expectCosts(bucket, OPUS_COST_OF_1000_IN_100_OUT);
+      expectCosts(lastRequest, OPUS_COST_OF_1000_IN_100_OUT);
+    });
+
+    it("keeps the zero costs of rows marked as gateway-billed", async () => {
+      const { bucket, lastRequest } = await loadUsage(
+        "reprice-costs-included",
+        BILLABLE_MODEL,
+        // The costsIncluded marker wins over a stale unknown-cost flag.
+        usageRow({ input: 0, output: 0 }, { costsIncluded: true, hasUnknownCosts: true })
+      );
+
+      expectCosts(bucket, { input: 0, output: 0 });
+      expectCosts(lastRequest, { input: 0, output: 0 });
+    });
+
+    it("keeps legacy all-zero costs of a billable model as gateway-billed", async () => {
+      const { bucket, lastRequest } = await loadUsage(
+        "reprice-legacy-zero-costs",
+        BILLABLE_MODEL,
+        usageRow({ input: 0, output: 0 })
+      );
+
+      expectCosts(bucket, { input: 0, output: 0 });
+      expectCosts(lastRequest, { input: 0, output: 0 });
+      expect(bucket).not.toHaveProperty("hasUnknownCosts");
+    });
+
+    it("prices rows recorded without pricing metadata", async () => {
+      const { bucket, lastRequest } = await loadUsage(
+        "reprice-unknown-costs",
+        BILLABLE_MODEL,
+        usageRow({ input: 0, output: 0 }, { hasUnknownCosts: true })
+      );
+
+      expectCosts(bucket, OPUS_COST_OF_1000_IN_100_OUT);
+      expectCosts(lastRequest, OPUS_COST_OF_1000_IN_100_OUT);
+    });
+
+    it("does not treat all-zero costs of an unpriced model as gateway-billed", async () => {
+      const { bucket, lastRequest } = await loadUsage(
+        "reprice-unpriced-zero-costs",
+        CUSTOM_MODEL,
+        usageRow({ input: 0, output: 0 })
+      );
+
+      // Repricing an unpriced model strips the costs and flags them as unknown.
+      expect(bucket).toMatchObject({ hasUnknownCosts: true, input: { tokens: 1000 } });
+      expect(bucket?.input.cost_usd).toBeUndefined();
+      expect(lastRequest).toMatchObject({ hasUnknownCosts: true });
+    });
+
+    it("classifies a mapped custom model by the pricing of its mapped model", async () => {
+      mockGetProvidersConfig.mockResolvedValueOnce(MAPPED_CUSTOM_CONFIG);
+      recreateStore();
+
+      const { bucket, lastRequest } = await loadUsage(
+        "reprice-mapped-zero-costs",
+        CUSTOM_MODEL,
+        usageRow({ input: 0, output: 0 })
+      );
+
+      expectCosts(bucket, { input: 0, output: 0 });
+      expectCosts(lastRequest, { input: 0, output: 0 });
+      expect(bucket).not.toHaveProperty("hasUnknownCosts");
+    });
+
+    it("prices unknown-cost rows once a provider config change maps their model", async () => {
+      const workspaceId = "reprice-after-mapping";
+      const before = await loadUsage(workspaceId, CUSTOM_MODEL, usageRow({ input: 0, output: 0 }));
+      expect(before.bucket).toMatchObject({ hasUnknownCosts: true });
+
+      mockGetProvidersConfig.mockResolvedValueOnce(MAPPED_CUSTOM_CONFIG);
+      providerConfigChanges.push(undefined);
+
+      expect(
+        await waitUntil(
+          () =>
+            store.getWorkspaceUsage(workspaceId).sessionByModel?.[CUSTOM_MODEL]?.input.cost_usd !==
+            undefined
+        )
+      ).toBe(true);
+      const usage = store.getWorkspaceUsage(workspaceId);
+      expectCosts(usage.sessionByModel?.[CUSTOM_MODEL], OPUS_COST_OF_1000_IN_100_OUT);
+      expectCosts(usage.lastRequest?.usage, OPUS_COST_OF_1000_IN_100_OUT);
+    });
+  });
+
   describe("syncWorkspaces", () => {
     it("should add new workspaces", async () => {
       const metadata1 = makeWorkspaceMetadata("workspace-1", {
@@ -5429,6 +5604,86 @@ describe("WorkspaceStore", () => {
     });
   });
 
+  // A whole message that arrives live, after catch-up, updates every view that reads whole
+  // messages: the draft's pending sends, the last prompt, usage and the recency order.
+  describe("live whole messages after catch-up", () => {
+    it("resolves the draft send and refreshes prompt, usage and recency", async () => {
+      const workspaceId = "live-user-message";
+      const send = openChat(workspaceId);
+      const onSendEvent = spyOn(getDraftStore(), "onSendEvent");
+      try {
+        createAndAddWorkspace(store, workspaceId);
+        await send(createHistoryMessageEvent("msg-1", 1), caughtUpEvent());
+        const promptListener = mock(() => undefined);
+        const usageListener = mock(() => undefined);
+        const recencyListener = mock(() => undefined);
+        store.subscribeLastUserPrompt(workspaceId, promptListener);
+        store.subscribeUsage(workspaceId, usageListener);
+        store.subscribeDerived(recencyListener);
+
+        // Newer than the workspace's createdAt (now), so the recency order moves.
+        const timestamp = Date.now() + 60_000;
+        await send({
+          type: "message",
+          id: "msg-2",
+          role: "user",
+          parts: [{ type: "text", text: "live prompt" }],
+          metadata: { historySequence: 2, timestamp, sendIds: ["send-1"] },
+        });
+
+        expect(onSendEvent).toHaveBeenCalledWith(workspaceId, ["send-1"]);
+        expect(store.getWorkspaceLastUserPromptInfo(workspaceId)?.text).toBe("live prompt");
+        expect(promptListener).toHaveBeenCalled();
+        expect(usageListener).toHaveBeenCalled();
+        expect(recencyListener).toHaveBeenCalled();
+        expect(store.getWorkspaceRecency()[workspaceId]).toBe(timestamp);
+      } finally {
+        onSendEvent.mockRestore();
+      }
+    });
+
+    it("resets pagination for a compaction summary without a boundary flag", async () => {
+      const workspaceId = "live-compaction-summary-metadata";
+      const send = openChat(workspaceId);
+      let resolveLoadMore: ((value: LoadMoreResponse) => void) | undefined;
+      mockHistoryLoadMore.mockReturnValueOnce(
+        new Promise<LoadMoreResponse>((resolve) => {
+          resolveLoadMore = resolve;
+        })
+      );
+      createAndAddWorkspace(store, workspaceId);
+      await send(createHistoryMessageEvent("msg-newer", 5), {
+        type: "caught-up",
+        historyReplayStatus: "complete",
+        hasOlderHistory: true,
+      });
+      const loadOlder = store.loadOlderHistory(workspaceId);
+
+      await send({
+        type: "message",
+        id: "live-summary",
+        role: "assistant",
+        parts: [{ type: "text", text: "Compacted summary" }],
+        metadata: {
+          historySequence: 6,
+          timestamp: 6,
+          muxMetadata: { type: "compaction-summary" },
+        },
+      });
+      resolveLoadMore?.({
+        messages: [createHistoryMessageEvent("msg-stale-older", 3)],
+        nextCursor: { beforeHistorySequence: 3, beforeMessageId: "msg-stale-older" },
+        hasOlder: true,
+      });
+      await loadOlder;
+
+      // The refreshed pagination makes the in-flight page stale, so it is not merged.
+      expect(
+        store.getWorkspaceState(workspaceId).muxMessages.map((message) => message.id)
+      ).not.toContain("msg-stale-older");
+    });
+  });
+
   describe("windowed replay (#4961)", () => {
     const workspaceId = "windowed-replay";
     type ChatAttempt = ControllableAsyncIterable<WorkspaceChatMessage>;
@@ -6789,6 +7044,44 @@ describe("WorkspaceStore", () => {
     });
   });
 
+  describe("activity goal updates", () => {
+    const goal: GoalSnapshot = {
+      goalId: "00000000-0000-4000-8000-000000000001",
+      status: "active",
+      objective: "Ship it",
+      budgetCents: 500,
+      costCents: 10,
+      turnsUsed: 1,
+      turnCap: 5,
+      startedAtMs: 1,
+    };
+
+    it("re-renders the workspace when a compared goal field changes", async () => {
+      const workspaceId = "activity-goal-cost";
+      const listener = mock(() => undefined);
+      const releaseActivity = mockBackgroundActivityTransition(
+        workspaceId,
+        createActivitySnapshot(1, { streaming: false, goal }),
+        [
+          // Only startedAtMs changes: no re-render.
+          createActivitySnapshot(1, { streaming: false, goal: { ...goal, startedAtMs: 2 } }),
+          createActivitySnapshot(1, { streaming: false, goal: { ...goal, costCents: 11 } }),
+        ]
+      );
+      recreateStore();
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).goal != null)).toBe(true);
+      store.subscribeKey(workspaceId, listener);
+
+      releaseActivity();
+
+      expect(
+        await waitUntil(() => store.getWorkspaceState(workspaceId).goal?.costCents === 11)
+      ).toBe(true);
+      expect(listener).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe("terminal activity", () => {
     it("propagates terminal activity to sidebar state", async () => {
       const workspaceId = "terminal-activity-workspace";
@@ -6969,6 +7262,269 @@ describe("WorkspaceStore", () => {
     });
   });
 
+  // The timeline panel reads one refcounted backend subscription per workspace: its snapshot is
+  // the newest page, live batches merge into it, and older pages load from the snapshot cursor.
+  describe("workspace timeline", () => {
+    const timelineEvent = (seq: number): TimelineEvent => ({
+      v: 1,
+      seq,
+      id: `event-${seq}`,
+      ts: seq,
+      kind: "turn.completed",
+      source: { system: "workspace" },
+    });
+
+    // Inputs come from the store's client contract, payloads from the shared timeline schema,
+    // so a change on either side of the IPC boundary breaks these tests at compile time.
+    type TimelineClient = NonNullable<
+      Parameters<WorkspaceStore["setClient"]>[0]
+    >["workspace"]["timeline"];
+    let feed: ControllableAsyncIterable<TimelineSubscriptionEvent>;
+    let subscribeSignals: AbortSignal[];
+    const mockTimelineSubscribe = mock(
+      (_input: Parameters<TimelineClient["subscribe"]>[0], options?: { signal?: AbortSignal }) => {
+        if (options?.signal) subscribeSignals.push(options.signal);
+        return Promise.resolve(feed.iterable);
+      }
+    );
+    const mockTimelineList = mock(
+      (_input: Parameters<TimelineClient["list"]>[0]): Promise<TimelinePage> =>
+        Promise.resolve({ events: [], nextCursor: null, hasOlder: false })
+    );
+
+    beforeEach(() => {
+      feed = createControllableAsyncIterable<TimelineSubscriptionEvent>();
+      subscribeSignals = [];
+      mockTimelineSubscribe.mockClear();
+      mockTimelineList.mockClear();
+      resetStore();
+      store.setClient({
+        ...mockClient,
+        workspace: {
+          ...mockClient.workspace,
+          timeline: { subscribe: mockTimelineSubscribe, list: mockTimelineList },
+        },
+      } as unknown as Parameters<WorkspaceStore["setClient"]>[0]);
+    });
+
+    const seqs = (workspaceId: string) =>
+      store.getWorkspaceTimeline(workspaceId).events.map((event) => event.seq);
+
+    /** Register and subscribe a workspace whose snapshot is events 3 and 2, with older events. */
+    const openTimeline = async (workspaceId: string) => {
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      const unsubscribe = store.subscribeTimeline(workspaceId, () => undefined);
+      feed.push({
+        type: "snapshot",
+        events: [timelineEvent(3), timelineEvent(2)],
+        nextCursor: 2,
+        hasOlder: true,
+      });
+      expect(await waitUntil(() => store.getWorkspaceTimeline(workspaceId).initialized)).toBe(true);
+      return unsubscribe;
+    };
+
+    it("shares one backend subscription between listeners and shows its snapshot", async () => {
+      const workspaceId = "timeline-shared";
+      const listener = mock(() => undefined);
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      store.subscribeTimeline(workspaceId, listener);
+      store.subscribeTimeline(workspaceId, () => undefined);
+      expect(mockTimelineSubscribe).toHaveBeenCalledTimes(1);
+      expect(mockTimelineSubscribe.mock.calls[0][0]).toEqual({ workspaceId });
+
+      feed.push({ type: "snapshot", events: [timelineEvent(3)], nextCursor: 3, hasOlder: true });
+
+      expect(await waitUntil(() => listener.mock.calls.length > 0)).toBe(true);
+      expect(store.getWorkspaceTimeline(workspaceId)).toEqual({
+        events: [timelineEvent(3)],
+        nextCursor: 3,
+        hasOlder: true,
+        initialized: true,
+        loadingOlder: false,
+        loadError: null,
+        loadErrorKind: null,
+      });
+    });
+
+    it("marks an empty snapshot as initialized so the panel shows its empty state", async () => {
+      const workspaceId = "timeline-empty";
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      store.subscribeTimeline(workspaceId, () => undefined);
+      feed.push({ type: "snapshot", events: [], nextCursor: null, hasOlder: false });
+
+      expect(await waitUntil(() => store.getWorkspaceTimeline(workspaceId).initialized)).toBe(true);
+      expect(store.getWorkspaceTimeline(workspaceId).events).toEqual([]);
+    });
+
+    it("merges appended live events and skips empty batches", async () => {
+      const workspaceId = "timeline-appended";
+      const listener = mock(() => undefined);
+      await openTimeline(workspaceId);
+      store.subscribeTimeline(workspaceId, listener);
+
+      feed.push({ type: "appended", events: [] });
+      feed.push({ type: "appended", events: [timelineEvent(4)] });
+
+      expect(await waitUntil(() => seqs(workspaceId).length === 3)).toBe(true);
+      expect(seqs(workspaceId)).toEqual([4, 3, 2]);
+      // Only the non-empty batch notified listeners.
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(store.getWorkspaceTimeline(workspaceId)).toMatchObject({
+        nextCursor: 2,
+        hasOlder: true,
+      });
+    });
+
+    it("closes the backend subscription and drops the timeline after the last listener", async () => {
+      const workspaceId = "timeline-refcount";
+      const unsubscribeFirst = await openTimeline(workspaceId);
+      const unsubscribeSecond = store.subscribeTimeline(workspaceId, () => undefined);
+
+      unsubscribeFirst();
+      expect(subscribeSignals[0].aborted).toBe(false);
+      expect(seqs(workspaceId)).toEqual([3, 2]);
+
+      unsubscribeSecond();
+      expect(subscribeSignals[0].aborted).toBe(true);
+      expect(store.getWorkspaceTimeline(workspaceId).initialized).toBe(false);
+      expect(seqs(workspaceId)).toEqual([]);
+
+      // A later listener opens a fresh subscription.
+      store.subscribeTimeline(workspaceId, () => undefined);
+      expect(mockTimelineSubscribe).toHaveBeenCalledTimes(2);
+    });
+
+    it("subscribes a listener that came before the workspace was registered", () => {
+      const workspaceId = "timeline-early-listener";
+      store.subscribeTimeline(workspaceId, () => undefined);
+      expect(mockTimelineSubscribe).not.toHaveBeenCalled();
+
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      expect(mockTimelineSubscribe).toHaveBeenCalledTimes(1);
+    });
+
+    it("closes a subscription that opens after its listener left", async () => {
+      const workspaceId = "timeline-late-open";
+      const onReturn = mock(() => undefined);
+      feed = createControllableAsyncIterable<TimelineSubscriptionEvent>({ onReturn });
+      let openSubscription!: () => void;
+      mockTimelineSubscribe.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            openSubscription = () => resolve(feed.iterable);
+          })
+      );
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      const unsubscribe = store.subscribeTimeline(workspaceId, () => undefined);
+
+      unsubscribe();
+      openSubscription();
+
+      expect(await waitUntil(() => onReturn.mock.calls.length > 0)).toBe(true);
+      expect(store.getWorkspaceTimeline(workspaceId).initialized).toBe(false);
+    });
+
+    it("shows a failed subscription as an error until the user retries", async () => {
+      const workspaceId = "timeline-subscription-error";
+      mockTimelineSubscribe.mockImplementationOnce(() => Promise.reject(new Error("backend gone")));
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      store.subscribeTimeline(workspaceId, () => undefined);
+
+      expect(
+        await waitUntil(() => store.getWorkspaceTimeline(workspaceId).loadError !== null)
+      ).toBe(true);
+      expect(store.getWorkspaceTimeline(workspaceId)).toMatchObject({
+        initialized: true,
+        loadError: "backend gone",
+        loadErrorKind: "subscription",
+      });
+
+      store.retryTimeline(workspaceId);
+      expect(mockTimelineSubscribe).toHaveBeenCalledTimes(2);
+      expect(store.getWorkspaceTimeline(workspaceId)).toMatchObject({
+        initialized: false,
+        loadError: null,
+      });
+      feed.push({
+        type: "snapshot",
+        events: [timelineEvent(1)],
+        nextCursor: null,
+        hasOlder: false,
+      });
+      expect(await waitUntil(() => seqs(workspaceId).length === 1)).toBe(true);
+    });
+
+    it("loads the next older page from the snapshot cursor", async () => {
+      const workspaceId = "timeline-older-page";
+      await openTimeline(workspaceId);
+      let resolvePage!: (page: TimelinePage) => void;
+      mockTimelineList.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolvePage = resolve;
+          })
+      );
+
+      const loading = store.loadOlderTimeline(workspaceId);
+      expect(mockTimelineList).toHaveBeenCalledWith({ workspaceId, cursor: 2 });
+      expect(store.getWorkspaceTimeline(workspaceId).loadingOlder).toBe(true);
+      // A second request while the page loads does not fetch it twice.
+      await store.loadOlderTimeline(workspaceId);
+      expect(mockTimelineList).toHaveBeenCalledTimes(1);
+
+      resolvePage({ events: [timelineEvent(1)], nextCursor: null, hasOlder: false });
+      await loading;
+
+      expect(seqs(workspaceId)).toEqual([3, 2, 1]);
+      expect(store.getWorkspaceTimeline(workspaceId)).toMatchObject({
+        nextCursor: null,
+        hasOlder: false,
+        loadingOlder: false,
+      });
+      // Without older events there is nothing left to load.
+      await store.loadOlderTimeline(workspaceId);
+      expect(mockTimelineList).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps the loaded events and shows a pagination error when a page fails", async () => {
+      const workspaceId = "timeline-older-page-error";
+      await openTimeline(workspaceId);
+      mockTimelineList.mockImplementationOnce(() => Promise.reject(new Error("page failed")));
+
+      await store.loadOlderTimeline(workspaceId);
+
+      expect(seqs(workspaceId)).toEqual([3, 2]);
+      expect(store.getWorkspaceTimeline(workspaceId)).toMatchObject({
+        nextCursor: 2,
+        hasOlder: true,
+        loadingOlder: false,
+        loadError: "page failed",
+        loadErrorKind: "pagination",
+      });
+    });
+
+    it("drops an older page that resolves after the timeline was reset", async () => {
+      const workspaceId = "timeline-older-page-stale";
+      await openTimeline(workspaceId);
+      let resolvePage!: (page: TimelinePage) => void;
+      mockTimelineList.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolvePage = resolve;
+          })
+      );
+
+      const loading = store.loadOlderTimeline(workspaceId);
+      store.retryTimeline(workspaceId);
+      resolvePage({ events: [timelineEvent(1)], nextCursor: null, hasOlder: false });
+      await loading;
+
+      expect(seqs(workspaceId)).toEqual([]);
+      expect(store.getWorkspaceTimeline(workspaceId).loadingOlder).toBe(false);
+    });
+  });
+
   describe("getWorkspaceRecency", () => {
     it("should return stable reference when values unchanged", () => {
       const recency1 = store.getWorkspaceRecency();
@@ -6976,6 +7532,165 @@ describe("WorkspaceStore", () => {
 
       // Should be same reference (cached)
       expect(recency1).toBe(recency2);
+    });
+  });
+
+  // Timing stats stream from one refcounted backend subscription per workspace, opened only
+  // while the UI shows them.
+  describe("workspace timing stats", () => {
+    const snapshot = (generatedAt: number): WorkspaceStatsSnapshot => ({
+      workspaceId: "stats",
+      generatedAt,
+    });
+
+    // One feed per backend subscription, so a test can tell a replacement stream from the old one.
+    let feeds: Array<ControllableAsyncIterable<WorkspaceStatsSnapshot>>;
+    let subscribeSignals: AbortSignal[];
+    const mockStatsSubscribe = mock(
+      (_input: { workspaceId: string }, options?: { signal?: AbortSignal }) => {
+        if (options?.signal) subscribeSignals.push(options.signal);
+        const feed = createControllableAsyncIterable<WorkspaceStatsSnapshot>();
+        feeds.push(feed);
+        return Promise.resolve(feed.iterable);
+      }
+    );
+    // Typed against the real `workspace.stats.subscribe` procedure: a change to its input or
+    // snapshot schema fails the typecheck here.
+    const statsOverride: TestApiOverrides<APIClient> = {
+      workspace: { stats: { subscribe: mockStatsSubscribe } },
+    };
+    const statsClient = () =>
+      ({
+        ...mockClient,
+        workspace: { ...mockClient.workspace, ...statsOverride.workspace },
+      }) as unknown as Parameters<WorkspaceStore["setClient"]>[0];
+
+    beforeEach(() => {
+      feeds = [];
+      subscribeSignals = [];
+      mockStatsSubscribe.mockClear();
+      resetStore();
+      store.setClient(statsClient());
+    });
+
+    const generatedAt = (workspaceId: string) =>
+      store.getWorkspaceStatsSnapshot(workspaceId)?.generatedAt;
+
+    it("shares one backend subscription between listeners and shows its snapshots", async () => {
+      const workspaceId = "stats-shared";
+      const listener = mock(() => undefined);
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      // Registration alone does not subscribe: no UI shows the stats yet.
+      expect(mockStatsSubscribe).not.toHaveBeenCalled();
+
+      store.subscribeStats(workspaceId, listener);
+      store.subscribeStats(workspaceId, () => undefined);
+      expect(mockStatsSubscribe).toHaveBeenCalledTimes(1);
+      expect(mockStatsSubscribe.mock.calls[0][0]).toEqual({ workspaceId });
+      expect(store.getWorkspaceStatsSnapshot(workspaceId)).toBeNull();
+
+      feeds[0].push(snapshot(1));
+      feeds[0].push(snapshot(2));
+
+      expect(await waitUntil(() => generatedAt(workspaceId) === 2)).toBe(true);
+      expect(listener).toHaveBeenCalledTimes(2);
+    });
+
+    it("closes the backend subscription and drops the snapshot after the last listener", async () => {
+      const workspaceId = "stats-refcount";
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      const unsubscribeFirst = store.subscribeStats(workspaceId, () => undefined);
+      const unsubscribeSecond = store.subscribeStats(workspaceId, () => undefined);
+      feeds[0].push(snapshot(1));
+      expect(await waitUntil(() => generatedAt(workspaceId) === 1)).toBe(true);
+
+      unsubscribeFirst();
+      expect(subscribeSignals[0].aborted).toBe(false);
+      expect(generatedAt(workspaceId)).toBe(1);
+
+      unsubscribeSecond();
+      expect(subscribeSignals[0].aborted).toBe(true);
+      expect(store.getWorkspaceStatsSnapshot(workspaceId)).toBeNull();
+
+      // A later listener opens a fresh subscription, and its stream delivers.
+      store.subscribeStats(workspaceId, () => undefined);
+      expect(mockStatsSubscribe).toHaveBeenCalledTimes(2);
+      feeds[1].push(snapshot(2));
+      expect(await waitUntil(() => generatedAt(workspaceId) === 2)).toBe(true);
+    });
+
+    it("ignores an extra unsubscribe call once every listener is gone", () => {
+      const workspaceId = "stats-underflow";
+      const warn = spyOn(console, "warn").mockImplementation(() => undefined);
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      const unsubscribe = store.subscribeStats(workspaceId, () => undefined);
+      unsubscribe();
+
+      unsubscribe();
+      expect(warn).toHaveBeenCalledTimes(1);
+      warn.mockRestore();
+
+      // The count did not go negative: the next listener subscribes again.
+      store.subscribeStats(workspaceId, () => undefined);
+      expect(mockStatsSubscribe).toHaveBeenCalledTimes(2);
+    });
+
+    it("subscribes a listener that came before the workspace was registered", () => {
+      store.subscribeStats("stats-unregistered", () => undefined);
+      expect(mockStatsSubscribe).not.toHaveBeenCalled();
+
+      createAndAddWorkspace(store, "stats-unregistered", {}, false);
+      expect(mockStatsSubscribe).toHaveBeenCalledTimes(1);
+    });
+
+    it("subscribes a listener that came before the client", () => {
+      store.setClient(null);
+      store.subscribeStats("stats-early", () => undefined);
+      createAndAddWorkspace(store, "stats-early", {}, false);
+      expect(mockStatsSubscribe).not.toHaveBeenCalled();
+
+      store.setClient(statsClient());
+      expect(mockStatsSubscribe).toHaveBeenCalledTimes(1);
+      expect(mockStatsSubscribe.mock.calls[0][0]).toEqual({ workspaceId: "stats-early" });
+    });
+
+    it("closes the subscription when the client changes or the workspace is removed", async () => {
+      createAndAddWorkspace(store, "stats-reconnect", {}, false);
+      createAndAddWorkspace(store, "stats-removed", {}, false);
+      store.subscribeStats("stats-reconnect", () => undefined);
+      store.subscribeStats("stats-removed", () => undefined);
+      expect(subscribeSignals).toHaveLength(2);
+
+      // A reconnect resubscribes the workspaces that still have listeners.
+      store.setClient(statsClient());
+      expect(subscribeSignals.map((signal) => signal.aborted)).toEqual([true, true, false, false]);
+      const reconnectFeed =
+        feeds[
+          mockStatsSubscribe.mock.calls.findLastIndex(
+            ([input]) => input.workspaceId === "stats-reconnect"
+          )
+        ];
+      reconnectFeed.push(snapshot(3));
+      expect(await waitUntil(() => generatedAt("stats-reconnect") === 3)).toBe(true);
+
+      store.removeWorkspace("stats-removed");
+      expect(subscribeSignals[3].aborted).toBe(true);
+      expect(subscribeSignals[2].aborted).toBe(false);
+    });
+
+    it("logs a failed subscription and keeps showing no snapshot", async () => {
+      const workspaceId = "stats-error";
+      const warn = spyOn(console, "warn").mockImplementation(() => undefined);
+      const failure = new Error("stats gone");
+      mockStatsSubscribe.mockImplementationOnce(() => Promise.reject(failure));
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      store.subscribeStats(workspaceId, () => undefined);
+
+      expect(await waitUntil(() => warn.mock.calls.length > 0)).toBe(true);
+      // The log carries the error itself, not just a message.
+      expect(warn.mock.calls[0]).toContain(failure);
+      warn.mockRestore();
+      expect(store.getWorkspaceStatsSnapshot(workspaceId)).toBeNull();
     });
   });
 
@@ -7887,6 +8602,117 @@ describe("WorkspaceStore", () => {
     });
   });
 
+  // The Costs tab's consumer breakdown comes from the token-stats cache persisted in
+  // session-usage.json when it still matches the history; otherwise the store recounts.
+  describe("consumer breakdown from the token-stats cache", () => {
+    const MODEL = "anthropic:claude-opus-4-5";
+    const CACHED_CONSUMERS = [{ name: "User", tokens: 42, percentage: 100 }];
+
+    const tokenStatsCache = (history: { messageCount: number; maxHistorySequence?: number }) => ({
+      version: 1 as const,
+      computedAt: 1,
+      // The beforeEach store loads an empty provider config.
+      providersConfigVersion: computeProvidersConfigFingerprint({}),
+      model: MODEL,
+      tokenizerName: "cached-tokenizer",
+      history,
+      consumers: CACHED_CONSUMERS,
+      totalTokens: 42,
+    });
+
+    /** Replay a two-message history (sequences 3 and 7) after the session usage loaded. */
+    const replayHistory = async (
+      workspaceId: string,
+      cache: ReturnType<typeof tokenStatsCache>
+    ) => {
+      mockGetSessionUsage.mockImplementation((input: { workspaceId: string }) =>
+        Promise.resolve(
+          input.workspaceId === workspaceId
+            ? { byModel: {}, tokenStatsCache: cache, version: 1 as const }
+            : undefined
+        )
+      );
+      mockChatScript(
+        [
+          // Hold the replay until the cache is in memory, so catch-up can use it.
+          waitUntil(() => store.isSessionUsageKnown(workspaceId)).then(() => tick(10)),
+          createHistoryMessageEvent("user-1", 3),
+          {
+            type: "message",
+            id: "assistant-1",
+            role: "assistant",
+            parts: [{ type: "text", text: "reply" }],
+            metadata: { historySequence: 7, timestamp: 7, model: MODEL },
+          },
+          caughtUpEvent(),
+        ],
+        { keepOpen: true }
+      );
+      createAndAddWorkspace(store, workspaceId);
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).loading === false)).toBe(
+        true
+      );
+    };
+
+    it("shows the cached breakdown when the history still matches it", async () => {
+      const workspaceId = "consumers-cache-hit";
+      await replayHistory(workspaceId, tokenStatsCache({ messageCount: 2, maxHistorySequence: 7 }));
+
+      expect(store.getWorkspaceConsumers(workspaceId)).toEqual({
+        consumers: CACHED_CONSUMERS,
+        tokenizerName: "cached-tokenizer",
+        totalTokens: 42,
+        topFilePaths: undefined,
+        isCalculating: false,
+      });
+    });
+
+    it("recounts when the newest history sequence differs from the cached one", async () => {
+      // Same message count, but the history changed: the cache saw sequence 5 as newest.
+      const workspaceId = "consumers-cache-stale-sequence";
+      await replayHistory(workspaceId, tokenStatsCache({ messageCount: 2, maxHistorySequence: 5 }));
+
+      const state = store.getWorkspaceConsumers(workspaceId);
+      expect(state.isCalculating).toBe(true);
+      expect(state.consumers).toEqual([]);
+    });
+
+    it("recounts when the cache saw a different number of messages", async () => {
+      const workspaceId = "consumers-cache-stale-count";
+      await replayHistory(workspaceId, tokenStatsCache({ messageCount: 3, maxHistorySequence: 7 }));
+
+      expect(store.getWorkspaceConsumers(workspaceId).isCalculating).toBe(true);
+    });
+
+    it("trusts the message count when the cache has no history sequence", async () => {
+      const workspaceId = "consumers-cache-count-only";
+      await replayHistory(workspaceId, tokenStatsCache({ messageCount: 2 }));
+
+      expect(store.getWorkspaceConsumers(workspaceId)).toMatchObject({
+        consumers: CACHED_CONSUMERS,
+        isCalculating: false,
+      });
+    });
+
+    it("recounts on the next read after a provider config change drops the cache", async () => {
+      const workspaceId = "consumers-cache-config-change";
+      await replayHistory(workspaceId, tokenStatsCache({ messageCount: 2, maxHistorySequence: 7 }));
+      expect(store.getWorkspaceConsumers(workspaceId).isCalculating).toBe(false);
+
+      // A new fingerprint invalidates the breakdown and the persisted cache.
+      mockGetProvidersConfig.mockResolvedValueOnce({
+        ollama: { apiKeySet: false, isEnabled: true, isConfigured: true },
+      });
+      providerConfigChanges.push(undefined);
+
+      // The reads themselves schedule the recount: nothing else re-triggers it.
+      expect(await waitUntil(() => store.getWorkspaceConsumers(workspaceId).isCalculating)).toBe(
+        true
+      );
+      expect(store.getWorkspaceConsumers(workspaceId).consumers).toEqual([]);
+    });
+  });
+
   describe("mergeTimelineEvents", () => {
     const event = (seq: number) => ({
       v: 1 as const,
@@ -8079,6 +8905,48 @@ describe("WorkspaceStore", () => {
   });
 });
 
+describe("areActivityGoalsEqual", () => {
+  const goal: GoalSnapshot = {
+    goalId: "00000000-0000-4000-8000-000000000001",
+    status: "active",
+    objective: "Ship it",
+    budgetCents: 500,
+    costCents: 10,
+    turnsUsed: 1,
+    turnCap: 5,
+    startedAtMs: 1,
+  };
+
+  it("treats null and undefined as the same missing goal", () => {
+    expect(areActivityGoalsEqual(null, undefined)).toBe(true);
+    expect(areActivityGoalsEqual(undefined, undefined)).toBe(true);
+    expect(areActivityGoalsEqual(null, goal)).toBe(false);
+    expect(areActivityGoalsEqual(goal, undefined)).toBe(false);
+  });
+
+  it("detects a change in any compared goal field", () => {
+    const changes: Array<Partial<GoalSnapshot>> = [
+      { goalId: "00000000-0000-4000-8000-000000000002" },
+      { status: "paused" },
+      { objective: "Ship it later" },
+      { budgetCents: null },
+      { costCents: 11 },
+      { turnsUsed: 2 },
+      { turnCap: null },
+      { pendingPersistence: true },
+    ];
+    for (const change of changes) {
+      expect(areActivityGoalsEqual(goal, { ...goal, ...change })).toBe(false);
+    }
+  });
+
+  it("ignores the goal fields it does not compare", () => {
+    expect(
+      areActivityGoalsEqual(goal, { ...goal, startedAtMs: 2, completionSummary: "done" })
+    ).toBe(true);
+  });
+});
+
 describe("findRenderedRefineProposalHash", () => {
   const HASH = "a".repeat(64);
   const CREATED_AT = "2024-01-01T00:00:00.000Z";
@@ -8113,5 +8981,78 @@ describe("findRenderedRefineProposalHash", () => {
     // "Load all" disables the cap: the proposal is now actually rendered.
     aggregator.setShowAllMessages(true);
     expect(findRenderedRefineProposalHash(aggregator)).toBe(HASH);
+  });
+});
+
+describe("resolveSidebarAgentStatus", () => {
+  const display = { emoji: "D", message: "compacting" };
+  const persisted = { emoji: "P", message: "summary" };
+  const agent = { emoji: "A", message: "status_set" };
+  const todos: TodoItem[] = [{ content: "write tests", status: "in_progress" }];
+  const liveTodo = { emoji: "🔄", message: "write tests" };
+  const activity = (overrides: Partial<WorkspaceActivitySnapshot>): WorkspaceActivitySnapshot => ({
+    recency: 1,
+    streaming: false,
+    lastModel: null,
+    lastThinkingLevel: null,
+    ...overrides,
+  });
+
+  describe("an inactive workspace (activity snapshot is the source)", () => {
+    const resolve = (snapshot: WorkspaceActivitySnapshot | undefined, todoItems = todos) =>
+      resolveSidebarAgentStatus({
+        useAggregatorState: false,
+        activity: snapshot,
+        todos: todoItems,
+        aggregatorAgentStatus: agent,
+      });
+
+    it("shows the system display status over everything else", () => {
+      expect(resolve(activity({ displayStatus: display, todoStatus: persisted }))).toEqual(display);
+    });
+
+    it("falls back to the persisted todo status, never to the aggregator's status", () => {
+      expect(resolve(activity({ displayStatus: null, todoStatus: persisted }))).toEqual(persisted);
+    });
+
+    it("derives a status from the cached todos when none was persisted", () => {
+      expect(resolve(activity({}))).toEqual(liveTodo);
+      expect(resolve(undefined)).toEqual(liveTodo);
+    });
+
+    it("shows nothing for a todo list the backend reports as cleared", () => {
+      expect(resolve(activity({ hasTodos: false }))).toBeUndefined();
+    });
+  });
+
+  describe("an active, caught-up workspace (the aggregator is the source)", () => {
+    const resolve = (
+      snapshot: WorkspaceActivitySnapshot | undefined,
+      todoItems: TodoItem[],
+      aggregatorAgentStatus: typeof agent | undefined
+    ) =>
+      resolveSidebarAgentStatus({
+        useAggregatorState: true,
+        activity: snapshot,
+        todos: todoItems,
+        aggregatorAgentStatus,
+      });
+
+    it("ignores the display status and prefers the live todo status", () => {
+      expect(
+        resolve(activity({ displayStatus: display, todoStatus: persisted }), todos, agent)
+      ).toEqual(liveTodo);
+    });
+
+    it("prefers the aggregator's status over the persisted todo status", () => {
+      expect(resolve(activity({ todoStatus: persisted }), [], agent)).toEqual(agent);
+    });
+
+    it("falls back to the persisted todo status", () => {
+      expect(resolve(activity({ todoStatus: persisted, hasTodos: false }), [], undefined)).toEqual(
+        persisted
+      );
+      expect(resolve(undefined, [], undefined)).toBeUndefined();
+    });
   });
 });

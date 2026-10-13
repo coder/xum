@@ -15,7 +15,7 @@ import { getAppConfigStore } from "../../stores/AppConfigStore";
 import { getDraftStore, useDraftStoreReady } from "../../stores/DraftStore";
 import { getProvidersConfigStore } from "../../stores/ProvidersConfigStore";
 import { ProjectProvider, useProjectContext } from "../../contexts/ProjectContext";
-import { APIProvider, useAPI, type APIClient } from "@/browser/contexts/API";
+import { APIProvider, useAPI, useLiveAPI, type APIClient } from "@/browser/contexts/API";
 import { WorkspaceProvider, useWorkspaceContext } from "../../contexts/WorkspaceContext";
 import { RouterProvider } from "../../contexts/RouterContext";
 import { TerminalRouterProvider } from "../../terminal/TerminalRouterContext";
@@ -165,7 +165,9 @@ function AppLoaderInner() {
   const workspaceContext = useWorkspaceContext();
   const projectContext = useProjectContext();
   const apiState = useAPI();
-  const api = apiState.api;
+  // The stores must see "offline": they drop their client and resubscribe once it is back.
+  // useAPI().api can keep the last client while Xum reconnects (see useLiveAPI).
+  const api = useLiveAPI();
 
   const workspaceStoreInstance = useWorkspaceStoreRaw();
   const gitStatusStore = useGitStatusStoreRaw();

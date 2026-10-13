@@ -43,11 +43,8 @@ void mock.module("@/browser/stores/GitStatusStore", () => ({
 }));
 
 import { OVERVIEW_MAX_LIST_ROWS, RightSidebarOverview } from "./RightSidebarOverview";
-import {
-  closeMcpAppView,
-  openMcpAppView,
-  type McpAppViewRef,
-} from "./ArtifactsTab/mcpAppViewsStore";
+import { openMcpAppViewTab, type McpAppViewRef } from "./ArtifactsTab/mcpAppViewsStore";
+import { appViewTabFor } from "./AppViewTab/appViewTabs";
 
 const WORKSPACE_ID = "ws-main";
 
@@ -106,6 +103,8 @@ function renderOverview(
     artifactsEnabled?: boolean;
     unreadAssisted?: number;
     client?: APIClient;
+    /** A workspace of its own, for app views: the session list of opened views has no reset. */
+    workspaceId?: string;
   } = {}
 ) {
   const opened: TabType[] = [];
@@ -122,7 +121,7 @@ function renderOverview(
     <WorkspaceContext.Provider value={value as WorkspaceContextValue}>
       <TooltipProvider>
         <RightSidebarOverview
-          workspaceId={WORKSPACE_ID}
+          workspaceId={options.workspaceId ?? WORKSPACE_ID}
           onExpand={() => {
             expanded += 1;
           }}
@@ -436,7 +435,8 @@ describe("RightSidebarOverview", () => {
           }),
       },
     });
-    openMcpAppView(WORKSPACE_ID, {
+    const appsWorkspace = "ws-apps-newest";
+    openMcpAppViewTab(appsWorkspace, {
       toolCallId: "call-new",
       serverName: "dice",
       resourceUri: "ui://dice/roll",
@@ -446,23 +446,23 @@ describe("RightSidebarOverview", () => {
       cancelled: false,
       failed: false,
     });
-    try {
-      const { view } = renderOverview([workspace({ id: WORKSPACE_ID })], {
-        artifactsEnabled: true,
-        client,
-      });
-      const section = within(await view.findByRole("region", { name: "Outputs" }));
-      await waitFor(() =>
-        expect(section.getAllByRole("button").map((row) => row.textContent)).toEqual([
-          "a.md",
-          "b.md",
-          "Roll dice",
-          "1 more",
-        ])
-      );
-    } finally {
-      closeMcpAppView(WORKSPACE_ID, "call-new");
-    }
+    const { view, opened } = renderOverview([workspace({ id: appsWorkspace })], {
+      artifactsEnabled: true,
+      client,
+      workspaceId: appsWorkspace,
+    });
+    const section = within(await view.findByRole("region", { name: "Outputs" }));
+    await waitFor(() =>
+      expect(section.getAllByRole("button").map((row) => row.textContent)).toEqual([
+        "a.md",
+        "b.md",
+        "Roll dice",
+        "1 more",
+      ])
+    );
+    // An app view opens in its own app tab: the Artifacts tab lists only files.
+    fireEvent.click(section.getByRole("button", { name: /Roll dice/ }));
+    expect(opened).toEqual([appViewTabFor("call-new")]);
   });
 
   test("tells repeated MCP app calls apart and marks failed ones", async () => {
@@ -486,23 +486,21 @@ describe("RightSidebarOverview", () => {
       failed,
     });
     // Opened oldest first, so the newest ends up first, as the transcript lists them.
+    const appsWorkspace = "ws-apps-repeated";
     for (const view of [appView("call-1"), appView("call-2"), appView("call-3", true)]) {
-      openMcpAppView(WORKSPACE_ID, view);
+      openMcpAppViewTab(appsWorkspace, view);
     }
-    try {
-      const { view } = renderOverview([workspace({ id: WORKSPACE_ID })], {
-        artifactsEnabled: true,
-        client,
-      });
-      const section = within(await view.findByRole("region", { name: "Outputs" }));
-      expect(section.getAllByRole("button").map((row) => row.textContent)).toEqual([
-        "Roll dicefailed · sides: 6",
-        "Roll dicesides: 6 · #2",
-        "Roll dicesides: 6 · #1",
-      ]);
-    } finally {
-      for (const id of ["call-1", "call-2", "call-3"]) closeMcpAppView(WORKSPACE_ID, id);
-    }
+    const { view } = renderOverview([workspace({ id: appsWorkspace })], {
+      artifactsEnabled: true,
+      client,
+      workspaceId: appsWorkspace,
+    });
+    const section = within(await view.findByRole("region", { name: "Outputs" }));
+    expect(section.getAllByRole("button").map((row) => row.textContent)).toEqual([
+      "Roll dicefailed · sides: 6",
+      "Roll dicesides: 6 · #2",
+      "Roll dicesides: 6 · #1",
+    ]);
   });
 
   test("hides goal and activity when there is nothing to report", () => {

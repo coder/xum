@@ -155,7 +155,7 @@ export interface MCPClientHandle {
     args: Record<string, unknown>,
     options?: { signal?: AbortSignal }
   ): Promise<MCPRawCallToolResult>;
-  /** MCP Apps only: resources/read for a view's ui:// resource. */
+  /** MCP Apps only: resources/read for a view's ui:// resource or a view's own read. */
   readResource(uri: string, options?: { signal?: AbortSignal }): Promise<MCPReadResourceResult>;
   /** The server's `openai/settings` capability, read once at connect. */
   settingsCapability(): MCPSettingsCapability | undefined;
