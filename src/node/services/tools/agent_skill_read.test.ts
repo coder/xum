@@ -14,7 +14,7 @@ import type { Runtime } from "@/node/runtime/Runtime";
 import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { createAgentSkillReadTool } from "./agent_skill_read";
-import { createTestToolConfig, TestTempDir } from "./testHelpers";
+import { createTestToolConfig, TestTempDir, TrueRemotePathMappedRuntime } from "./testHelpers";
 
 const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
@@ -557,6 +557,54 @@ describe("agent_skill_read skill directory", () => {
       }
     });
   }
+
+  it("reports no skill directory for a global host plugin skill in a remote workspace", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-read-remote-plugin");
+    const root = await fs.realpath(tempDir.path);
+    // The Xum host's home holds the plugin; the remote checkout does not.
+    const hostXumHome = path.join(root, "host-xum-home");
+    await writeScriptSkill(
+      path.join(hostXumHome, "plugins", "demo-plugin", "skills", "host-plugin-skill"),
+      "host-plugin-skill",
+      "ran-host-plugin-skill"
+    );
+    await fs.writeFile(
+      path.join(hostXumHome, "plugins", "demo-plugin", "plugin.json"),
+      PLUGIN_MANIFEST,
+      "utf-8"
+    );
+    const remoteBase = path.join(root, "remote");
+    await fs.mkdir(path.join(remoteBase, "workspace"), { recursive: true });
+    const runtime = new TrueRemotePathMappedRuntime(remoteBase, "/remote");
+    const config = {
+      ...createTestToolConfig(root, {
+        runtime,
+        xumScope: {
+          type: "project",
+          xumHome: hostXumHome,
+          projectRoot: "/remote/workspace",
+          projectStorageAuthority: "runtime",
+        },
+      }),
+      cwd: "/remote/workspace",
+    };
+
+    const previousRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = hostXumHome;
+    try {
+      const result = await readSkill(config, "host-plugin-skill");
+      expect(result.skill.scope).toBe("global");
+      // The host path would not exist where bash runs: none is offered, and the
+      // reason points the model at agent_skill_read_file instead.
+      expect(result.skillDir).toBeUndefined();
+      expect(result.pluginRoot).toBeUndefined();
+      expect(result.skillDirUnavailable).toContain("agent_skill_read_file");
+      expect(result.skill.body).toContain("sh ${CLAUDE_SKILL_DIR}/scripts/hello.sh");
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+    }
+  });
 
   it("expands ${CLAUDE_PLUGIN_ROOT} only for plugin skills, never ${PLUGIN_ROOT}", async () => {
     using tempDir = new TestTempDir("test-agent-skill-read-plugin-root");

@@ -328,6 +328,7 @@ import {
 import { substituteSkillArguments } from "@/node/services/agentSkills/skillArguments";
 import {
   assertSkillDirectoryPlaceholdersResolved,
+  getSkillDirectoryOffHostNote,
   resolveSkillDirectory,
   skillDirectoryEnv,
   substituteSkillDirectoryPlaceholdersOutsideDirectives,
@@ -13437,13 +13438,18 @@ export class AgentSession {
       // ref in this materialization path is user-initiated (slash "/skill" or
       // inline "$skill"); the model-side agent_skill_read tool takes a separate
       // path and never runs directives (it only substitutes skill directories).
-      const body = await this.maybeInjectSkillDynamicContext({
+      const injectedBody = await this.maybeInjectSkillDynamicContext({
         skillName: skill.frontmatter.name,
         body: substitutedBody,
         runtime,
         workspacePath,
         env: skillDirectoryEnv(skillDirectory),
       });
+      // Host-read skills in off-host workspaces (e.g. global plugin skills on
+      // SSH/Docker) tell the model their files are not where bash runs. Added
+      // before hashing so the snapshot hash covers the note.
+      const offHostNote = getSkillDirectoryOffHostNote(skillDirectory);
+      const body = offHostNote == null ? injectedBody : `${injectedBody}\n\n${offHostNote}`;
 
       // Include the parsed YAML frontmatter in the hash so frontmatter-only edits (e.g. description)
       // generate a new snapshot and keep the UI hover preview in sync. The hash also covers

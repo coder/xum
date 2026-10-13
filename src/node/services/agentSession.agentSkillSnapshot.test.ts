@@ -217,6 +217,55 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     expect(snapshotText).toContain("not run: CLAUDE_SKILL_DIR has no value");
   });
 
+  it("tells the model when a slash skill's files are not where bash runs", async () => {
+    // A devcontainer reads skills on the host but runs bash in the container,
+    // the same split as host plugin skills in SSH/Docker workspaces. No tool
+    // result reaches the model for a slash skill, so the snapshot must say it.
+    const skillBody = "Run sh ${CLAUDE_SKILL_DIR}/scripts/hello.sh";
+    const offHost = await createTestWorkspaceWithSkill({ skillName: "split-skill", skillBody });
+    const onHost = await createTestWorkspaceWithSkill({ skillName: "split-skill", skillBody });
+    const cases = [
+      {
+        workspacePath: offHost.workspacePath,
+        runtimeConfig: {
+          type: "devcontainer",
+          configPath: ".devcontainer/devcontainer.json",
+        } as const,
+        expectNote: true,
+      },
+      {
+        workspacePath: onHost.workspacePath,
+        runtimeConfig: { type: "local" } as const,
+        expectNote: false,
+      },
+    ];
+
+    for (const testCase of cases) {
+      const { session, messages } = await createSessionHarness({
+        workspacePath: testCase.workspacePath,
+        runtimeConfig: testCase.runtimeConfig,
+      });
+      const result = await session.sendMessage("do X", {
+        model: "anthropic:claude-3-5-sonnet-latest",
+        agentId: "exec",
+        muxMetadata: {
+          type: "agent-skill",
+          rawCommand: "/split-skill",
+          skillName: "split-skill",
+          scope: "project",
+        },
+      });
+
+      expect(result.success).toBe(true);
+      const snapshotText = getMessageText(messages[0]);
+      expect(snapshotText.includes("agent_skill_read_file")).toBe(testCase.expectNote);
+      // The host path is never offered to the off-host bash.
+      expect(snapshotText.includes(testCase.workspacePath)).toBe(!testCase.expectNote);
+      await historyCleanup?.();
+      historyCleanup = undefined;
+    }
+  });
+
   it("resolves checkout-level plugin skills for subproject execution paths (agent-plugins)", async () => {
     const workspaceId = "ws-test";
 
