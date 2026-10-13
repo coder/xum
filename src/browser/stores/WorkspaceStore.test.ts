@@ -41,7 +41,11 @@ import { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMe
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 import type { StreamStartEvent, ToolCallStartEvent } from "@/common/types/stream";
-import type { WorkspaceActivitySnapshot, WorkspaceChatMessage } from "@/common/orpc/types";
+import type {
+  WorkspaceActivitySnapshot,
+  WorkspaceChatMessage,
+  WorkspaceStatsSnapshot,
+} from "@/common/orpc/types";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import {
   getAutoRetryKey,
@@ -7410,13 +7414,20 @@ describe("WorkspaceStore", () => {
   // Timing stats stream from one refcounted backend subscription per workspace, opened only
   // while the UI shows them.
   describe("workspace timing stats", () => {
-    const snapshot = (generatedAt: number) => ({ workspaceId: "stats", generatedAt });
-    type StatsSnapshot = ReturnType<typeof snapshot>;
+    // Inputs come from the store's client contract, payloads from the shared stats schema,
+    // so a change on either side of the IPC boundary breaks these tests at compile time.
+    type StatsClient = NonNullable<
+      Parameters<WorkspaceStore["setClient"]>[0]
+    >["workspace"]["stats"];
+    const snapshot = (generatedAt: number): WorkspaceStatsSnapshot => ({
+      workspaceId: "stats",
+      generatedAt,
+    });
 
-    let feed: ControllableAsyncIterable<StatsSnapshot>;
+    let feed: ControllableAsyncIterable<WorkspaceStatsSnapshot>;
     let subscribeSignals: AbortSignal[];
     const mockStatsSubscribe = mock(
-      (_input: { workspaceId: string }, options?: { signal?: AbortSignal }) => {
+      (_input: Parameters<StatsClient["subscribe"]>[0], options?: { signal?: AbortSignal }) => {
         if (options?.signal) subscribeSignals.push(options.signal);
         return Promise.resolve(feed.iterable);
       }
@@ -7428,7 +7439,7 @@ describe("WorkspaceStore", () => {
       }) as unknown as Parameters<WorkspaceStore["setClient"]>[0];
 
     beforeEach(() => {
-      feed = createControllableAsyncIterable<StatsSnapshot>();
+      feed = createControllableAsyncIterable<WorkspaceStatsSnapshot>();
       subscribeSignals = [];
       mockStatsSubscribe.mockClear();
       resetStore();
