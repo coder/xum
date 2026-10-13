@@ -848,7 +848,7 @@ describe("Config", () => {
       );
     });
 
-    it("keeps the previous default values a user sets after the migration ran", async () => {
+    it("keeps the previous default values a user sets after the migration ran", () => {
       writeTaskSettings(
         { ...PREVIOUS_TASK_SETTINGS_DEFAULTS },
         { taskSettingsDefaultsRaised: true }
