@@ -1,4 +1,9 @@
-import { PATH_SKILLS_RESULT_FIELD, type PathSkillsResultField } from "@/common/types/tools";
+import {
+  FILE_EDIT_TOOL_NAMES,
+  FILE_READ_TOOL_NAMES,
+  PATH_SKILLS_RESULT_FIELD,
+  type PathSkillsResultField,
+} from "@/common/types/tools";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { MuxMessage } from "@/common/types/message";
@@ -57,13 +62,42 @@ function collectPointerNames(output: Record<string, unknown> | undefined, names:
   for (const skill of skills) addName(names, asRecord(skill)?.name);
 }
 
+/** Only Xum's own file tools write pointers; the same key on any other output is not one. */
+const POINTER_TOOL_NAMES: ReadonlySet<unknown> = new Set([
+  ...FILE_READ_TOOL_NAMES,
+  ...FILE_EDIT_TOOL_NAMES,
+]);
+
+/** True for a successful agent_skill_read record (top-level output or nested record). */
+function isSuccessfulSkillRead(record: Record<string, unknown> | undefined): boolean {
+  return (
+    record?.toolName === "agent_skill_read" &&
+    record.error === undefined &&
+    record.ok !== false &&
+    asRecord(record.result)?.success === true
+  );
+}
+
+/**
+ * agent_skill_read calls nested in a code_execution output (`toolCalls` records, the
+ * shape loadedSkillSnapshots.ts reads). A failed record (error or ok: false) does not count.
+ */
+function collectNestedSkillReads(output: Record<string, unknown> | undefined, names: Set<string>) {
+  const toolCalls = output?.toolCalls;
+  if (!Array.isArray(toolCalls)) return;
+  for (const rawRecord of toolCalls) {
+    const record = asRecord(rawRecord);
+    if (isSuccessfulSkillRead(record)) addName(names, asRecord(record?.args)?.name);
+  }
+}
+
 function collectFromToolPart(part: Record<string, unknown>, names: Set<string>): void {
   const output = asRecord(part.output);
-  collectPointerNames(output, names);
+  if (output?.success !== true) return;
+  if (POINTER_TOOL_NAMES.has(part.toolName)) collectPointerNames(output, names);
   // A skill the model already read in this window needs no pointer.
-  if (part.toolName === "agent_skill_read" && output?.success === true) {
-    addName(names, asRecord(part.input)?.name);
-  }
+  if (part.toolName === "agent_skill_read") addName(names, asRecord(part.input)?.name);
+  if (part.toolName === "code_execution") collectNestedSkillReads(output, names);
 }
 
 function collectFromParts(parts: unknown, names: Set<string>): void {
@@ -106,13 +140,6 @@ function toWorkspaceRelativePath(
   return relativePath;
 }
 
-/**
- * Build the turn's activation, or undefined when no skill can activate (no model-
- * invocable skill has `paths`), so the file tools stay unwrapped.
- *
- * `messages` must be the current context window (already sliced at the latest
- * context boundary): pointers from before a boundary no longer reach the model.
- */
 /** Model-invocable path-scoped skills, capped (disable-model-invocation wins over paths). */
 function eligiblePathSkills(
   skills: readonly AgentSkillDescriptor[] | undefined
@@ -153,6 +180,13 @@ export function loadedSnapshotSkillNames(
   );
 }
 
+/**
+ * Build the turn's activation, or undefined when no skill can activate (no model-
+ * invocable skill has `paths`), so the file tools stay unwrapped.
+ *
+ * `messages` must be the current context window (already sliced at the latest
+ * context boundary): pointers from before a boundary no longer reach the model.
+ */
 export function createPathSkillActivation(params: {
   skills: readonly AgentSkillDescriptor[] | undefined;
   messages: readonly MuxMessage[];

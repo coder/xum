@@ -276,14 +276,42 @@ describe("getToolsForModel - path-scoped skill activation", () => {
       agentSkillSnapshot: { skillName: "ts-rules", scope: "project", sha256: "0" },
     });
 
+    // A skill read inside code_execution in an earlier turn is in the window too.
+    const priorNestedRead = createMuxMessage("a3", "assistant", "", undefined, [
+      toolPart(
+        "code_execution",
+        { code: "return xum.agent_skill_read({ name: 'ts-rules' })" },
+        {
+          success: true,
+          toolCalls: [
+            { toolName: "agent_skill_read", args: { name: "ts-rules" }, result: { success: true } },
+          ],
+        }
+      ),
+    ]);
+
     for (const history of [
       [...malformed, priorPointer],
+      [...malformed, priorNestedRead],
       [...malformed, priorRead],
       [...malformed, priorSnapshot],
     ]) {
       const tools = await buildTools(history);
       expect(surfacedNames(await call(tools.file_read, { path: "src/foo.ts" }))).toBeUndefined();
     }
+
+    // A `path_skills` key on a non-file tool result (MCP, custom) is not a pointer.
+    const spoofedPointer = createMuxMessage("a4", "assistant", "", undefined, [
+      toolPart(
+        "mcp_lookup",
+        {},
+        { success: true, [PATH_SKILLS_RESULT_FIELD]: { skills: [{ name: "ts-rules" }] } }
+      ),
+    ]);
+    const spoofedTools = await buildTools([spoofedPointer]);
+    expect(surfacedNames(await call(spoofedTools.file_read, { path: "src/foo.ts" }))).toEqual([
+      "ts-rules",
+    ]);
 
     // Malformed rows alone still allow activation.
     const tools = await buildTools(malformed);
