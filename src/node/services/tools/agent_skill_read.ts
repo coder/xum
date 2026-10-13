@@ -6,7 +6,11 @@ import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS } from "@/common/constants/toolLimits";
 import { SkillNameSchema } from "@/common/orpc/schemas";
 import { getErrorMessage } from "@/common/utils/errors";
-import { readAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
+import type { Runtime } from "@/node/runtime/Runtime";
+import {
+  readAgentSkill,
+  type ResolvedAgentSkill,
+} from "@/node/services/agentSkills/agentSkillsService";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import {
   resolveSkillDirectory,
@@ -60,6 +64,28 @@ function buildSkillReadDescription(config: ToolConfiguration): string {
 }
 
 /**
+ * Skills that ship scripts locate themselves through skillDir (or the
+ * ${CLAUDE_SKILL_DIR} placeholder) instead of a hard-coded install path.
+ */
+function buildSkillReadSuccess(
+  resolved: ResolvedAgentSkill,
+  workspaceRuntime: Runtime
+): AgentSkillReadToolResult {
+  const dir = resolveSkillDirectory(resolved, workspaceRuntime);
+  const location = dir.available
+    ? { skillDir: dir.skillDir, ...(dir.pluginRoot != null ? { pluginRoot: dir.pluginRoot } : {}) }
+    : { skillDirUnavailable: dir.reason };
+  return {
+    success: true,
+    skill: {
+      ...resolved.package,
+      body: substituteSkillDirectoryPlaceholders(resolved.package.body, dir),
+    },
+    ...location,
+  };
+}
+
+/**
  * Agent Skill read tool factory.
  * Reads and validates a skill's SKILL.md from project-local or global skills roots.
  */
@@ -104,23 +130,8 @@ export const createAgentSkillReadTool: ToolFactory = (config: ToolConfiguration)
             includeClaudeSkills,
           }
         );
-        // Skills that ship scripts locate themselves through skillDir (or the
-        // ${CLAUDE_SKILL_DIR} placeholder) instead of a hard-coded install path.
         // Judged against config.runtime: that is where the model's bash runs.
-        const dir = resolveSkillDirectory(resolved, config.runtime);
-        return {
-          success: true,
-          skill: {
-            ...resolved.package,
-            body: substituteSkillDirectoryPlaceholders(resolved.package.body, dir),
-          },
-          ...(dir.available
-            ? {
-                skillDir: dir.skillDir,
-                ...(dir.pluginRoot != null ? { pluginRoot: dir.pluginRoot } : {}),
-              }
-            : { skillDirUnavailable: dir.reason }),
-        };
+        return buildSkillReadSuccess(resolved, config.runtime);
       } catch (error) {
         return {
           success: false,
