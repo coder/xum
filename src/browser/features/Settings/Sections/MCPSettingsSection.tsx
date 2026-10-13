@@ -9,6 +9,7 @@ import { ClaudeDesignCard } from "./ClaudeDesignCard";
 import { CLAUDE_DESIGN_SERVER_NAME } from "@/common/constants/claudeDesign";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { useGlobalSecretKeys } from "./SecretsSection";
 import {
   Trash2,
   Play,
@@ -857,7 +858,8 @@ export const MCPSettingsSection: React.FC = () => {
   const { api } = useAPI();
   const [servers, setServers] = useState<Record<string, MCPServerInfo>>({});
   const [loading, setLoading] = useState(false);
-  const [globalSecretKeys, setGlobalSecretKeys] = useState<string[]>([]);
+  // Global secrets (used for {secret:"KEY"} header values).
+  const [globalSecretKeys] = useGlobalSecretKeys(api);
   const [error, setError] = useState<string | null>(null);
 
   // Test state with caching (global MCP config)
@@ -922,31 +924,6 @@ export const MCPSettingsSection: React.FC = () => {
     } finally {
       if (request === refreshRequest.current.id) setLoading(false);
     }
-  }, [api]);
-
-  // Load global secrets (used for {secret:"KEY"} header values).
-  useEffect(() => {
-    if (!api) {
-      setGlobalSecretKeys([]);
-      return;
-    }
-
-    let cancelled = false;
-    (async () => {
-      try {
-        const secrets = await api.secrets.get({});
-        if (cancelled) return;
-        setGlobalSecretKeys(secrets.map((s) => s.key));
-      } catch (err) {
-        if (cancelled) return;
-        console.error("Failed to load global secrets:", err);
-        setGlobalSecretKeys([]);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
   }, [api]);
 
   useEffect(() => {

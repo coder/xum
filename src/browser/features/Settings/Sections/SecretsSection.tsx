@@ -2,7 +2,8 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Loader2, Trash2 } from "lucide-react";
 import type { ProjectConfig } from "@/common/types/project";
 import type { Secret } from "@/common/types/secrets";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, type APIClient } from "@/browser/contexts/API";
+import { isAbortError } from "@/browser/utils/isAbortError";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { Button } from "@/browser/components/Button/Button";
@@ -119,6 +120,35 @@ function isProjectSecretsTarget(
   return project !== undefined && project.parentProjectPath == null;
 }
 
+/**
+ * The keys of the global secrets, loaded through `api`. Offline (and while a reconnect reloads),
+ * the shown keys stay. Shared by the Secrets and MCP sections.
+ */
+export function useGlobalSecretKeys(api: APIClient | null) {
+  const [globalSecretKeys, setGlobalSecretKeys] = useState<string[]>([]);
+  useEffect(() => {
+    if (!api) return;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const secrets = await api.secrets.get({});
+        if (cancelled) return;
+        setGlobalSecretKeys(secrets.map((s) => s.key));
+      } catch (err) {
+        if (cancelled || isAbortError(err)) return;
+        console.error("Failed to load global secrets:", err);
+        setGlobalSecretKeys([]);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [api]);
+  return [globalSecretKeys, setGlobalSecretKeys] as const;
+}
+
 export const SecretsSection: React.FC = () => {
   const { api } = useAPI();
   const { userProjects } = useProjectContext();
@@ -142,7 +172,8 @@ export const SecretsSection: React.FC = () => {
   const [secrets, setSecrets] = useState<Secret[]>([]);
   const [visibleSecrets, setVisibleSecrets] = useState<Set<number>>(() => new Set());
 
-  const [globalSecretKeys, setGlobalSecretKeys] = useState<string[]>([]);
+  // Global secret keys (used for {secret:"KEY"} project secret values).
+  const [globalSecretKeys, setGlobalSecretKeys] = useGlobalSecretKeys(api);
   const [injectedGlobalSecretKeys, setInjectedGlobalSecretKeys] = useState<string[]>([]);
 
   // Track the last plaintext value per row index so toggling Source back to
@@ -192,6 +223,12 @@ export const SecretsSection: React.FC = () => {
   const currentProjectPath = scope === "project" ? selectedProject : undefined;
 
   const isDirty = !secretsEqual(secrets, loadedSecrets);
+  // For loadSecrets: a reload must not replace rows the user edited.
+  const isDirtyRef = useRef(isDirty);
+  isDirtyRef.current = isDirty;
+  // The scope and project (JSON) whose loaded secrets are shown; null while none are.
+  const shownSecretsKeyRef = useRef<string | null>(null);
+  const actionsDisabled = !isDirty || saving || loading;
 
   const sortedGlobalSecretKeys = globalSecretKeys
     .slice()
@@ -207,28 +244,36 @@ export const SecretsSection: React.FC = () => {
 
     const isStaleRequest = () => loadSecretsRequestVersionRef.current !== requestVersion;
 
-    if (!api) {
+    // Only a new scope or project clears the list and shows "Loading": a new client (reconnect)
+    // reloads the same secrets behind the shown rows, and keeps rows the user edited.
+    const secretsKey = JSON.stringify([scope, currentProjectPath]);
+    if (shownSecretsKeyRef.current !== secretsKey) {
+      shownSecretsKeyRef.current = null;
       setLoadedSecrets([]);
       setSecrets([]);
       setInjectedGlobalSecretKeys([]);
       setVisibleSecrets(new Set());
-      setError(null);
-      setLoading(false);
-      return;
+      setLoading(true);
+      // The cleared rows hold no edit (the next render agrees).
+      isDirtyRef.current = false;
     }
-
-    if (scope === "project" && !currentProjectPath) {
-      setLoadedSecrets([]);
-      setSecrets([]);
-      setInjectedGlobalSecretKeys([]);
-      setVisibleSecrets(new Set());
-      setError(null);
-      setLoading(false);
-      return;
-    }
-
-    setLoading(true);
+    const keepEdits = isDirtyRef.current;
     setError(null);
+
+    if (!api) {
+      // Offline, keep the shown secrets: the reconnect reloads them.
+      setLoading(false);
+      return;
+    }
+
+    const applyLoadedSecrets = (nextSecrets: Secret[]) => {
+      shownSecretsKeyRef.current = secretsKey;
+      setLoadedSecrets(nextSecrets);
+      if (keepEdits) return;
+      setSecrets(nextSecrets);
+      setVisibleSecrets(new Set());
+      lastLiteralValuesRef.current = new Map();
+    };
 
     try {
       if (scope === "project") {
@@ -247,8 +292,7 @@ export const SecretsSection: React.FC = () => {
         if (isStaleRequest()) {
           return;
         }
-        setLoadedSecrets(nextSecrets);
-        setSecrets(nextSecrets);
+        applyLoadedSecrets(nextSecrets);
 
         try {
           const injectedKeys = await api.secrets.getInjectedGlobals({ projectPath });
@@ -257,7 +301,7 @@ export const SecretsSection: React.FC = () => {
           }
           setInjectedGlobalSecretKeys(injectedKeys);
         } catch (err) {
-          if (isStaleRequest()) {
+          if (isStaleRequest() || isAbortError(err)) {
             return;
           }
           const message = err instanceof Error ? err.message : "Failed to load injected globals";
@@ -269,18 +313,12 @@ export const SecretsSection: React.FC = () => {
         if (isStaleRequest()) {
           return;
         }
-        setLoadedSecrets(nextSecrets);
-        setSecrets(nextSecrets);
+        applyLoadedSecrets(nextSecrets);
         setInjectedGlobalSecretKeys([]);
       }
-
-      if (isStaleRequest()) {
-        return;
-      }
-      setVisibleSecrets(new Set());
-      lastLiteralValuesRef.current = new Map();
     } catch (err) {
-      if (isStaleRequest()) {
+      // A lost connection is no load failure: keep the shown secrets for the reconnect.
+      if (isStaleRequest() || isAbortError(err)) {
         return;
       }
       const message = err instanceof Error ? err.message : "Failed to load secrets";
@@ -300,31 +338,6 @@ export const SecretsSection: React.FC = () => {
   useEffect(() => {
     void loadSecrets();
   }, [loadSecrets]);
-
-  // Load global secret keys (used for {secret:"KEY"} project secret values).
-  useEffect(() => {
-    if (!api) {
-      setGlobalSecretKeys([]);
-      return;
-    }
-
-    let cancelled = false;
-    (async () => {
-      try {
-        const secrets = await api.secrets.get({});
-        if (cancelled) return;
-        setGlobalSecretKeys(secrets.map((s) => s.key));
-      } catch (err) {
-        if (cancelled) return;
-        console.error("Failed to load global secrets:", err);
-        setGlobalSecretKeys([]);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [api]);
 
   const addSecret = useCallback(() => {
     setSecrets((prev) => [...prev, { key: "", value: "" }]);
@@ -505,7 +518,7 @@ export const SecretsSection: React.FC = () => {
     } finally {
       setSaving(false);
     }
-  }, [api, currentProjectPath, scope, secrets]);
+  }, [api, currentProjectPath, scope, secrets, setGlobalSecretKeys]);
 
   return (
     <div className="space-y-6">
@@ -778,19 +791,10 @@ export const SecretsSection: React.FC = () => {
       </button>
 
       <div className="flex items-center justify-end gap-2">
-        <Button
-          variant="secondary"
-          type="button"
-          onClick={handleReset}
-          disabled={!isDirty || saving || loading}
-        >
+        <Button variant="secondary" type="button" onClick={handleReset} disabled={actionsDisabled}>
           Reset
         </Button>
-        <Button
-          type="button"
-          onClick={() => void handleSave()}
-          disabled={!isDirty || saving || loading}
-        >
+        <Button type="button" onClick={() => void handleSave()} disabled={actionsDisabled}>
           {saving ? "Saving..." : "Save"}
         </Button>
       </div>

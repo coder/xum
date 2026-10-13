@@ -21,6 +21,18 @@ const loadAgentHeartbeatsEnabled = async (api: SettingsApi) =>
 const saveAgentHeartbeatsEnabled = (api: SettingsApi, enabled: boolean) =>
   api.config.updateAgentHeartbeatsEnabled({ enabled });
 
+/**
+ * True when a config load may replace the field: no newer load or edit started since `nonce`,
+ * and the user has no unsaved value typed since the last load.
+ */
+function isUneditedLoad(
+  nonce: number,
+  nonceRef: { current: number },
+  editedSinceLoadRef: { current: boolean }
+): boolean {
+  return nonce === nonceRef.current && !editedSinceLoadRef.current;
+}
+
 export function HeartbeatSection() {
   const { api } = useAPI();
   const [heartbeatDefaultPrompt, setHeartbeatDefaultPrompt] = useState("");
@@ -44,26 +56,36 @@ export function HeartbeatSection() {
       return;
     }
 
-    setHeartbeatDefaultPromptLoaded(false);
+    // A new client (reconnect) reloads behind the shown values: the fields stay enabled (no
+    // `Loaded` reset), and a value the user typed since the last load stays (no edit-mark reset).
+    // Until the reload confirms the shown values, a blur without an edit must not save them.
     setHeartbeatDefaultPromptLoadedOk(false);
-    setHeartbeatDefaultIntervalLoaded(false);
     setHeartbeatDefaultIntervalLoadedOk(false);
-    heartbeatDefaultPromptEditedSinceLoadRef.current = false;
-    heartbeatDefaultIntervalEditedSinceLoadRef.current = false;
-
     const heartbeatDefaultPromptNonce = ++heartbeatDefaultPromptLoadNonceRef.current;
     const heartbeatDefaultIntervalNonce = ++heartbeatDefaultIntervalLoadNonceRef.current;
 
     void configPromise
       .then((cfg) => {
-        if (heartbeatDefaultPromptNonce === heartbeatDefaultPromptLoadNonceRef.current) {
+        if (
+          isUneditedLoad(
+            heartbeatDefaultPromptNonce,
+            heartbeatDefaultPromptLoadNonceRef,
+            heartbeatDefaultPromptEditedSinceLoadRef
+          )
+        ) {
           setHeartbeatDefaultPrompt(cfg.heartbeatDefaultPrompt ?? "");
           setHeartbeatDefaultPromptLoaded(true);
           setHeartbeatDefaultPromptLoadedOk(true);
           heartbeatDefaultPromptEditedSinceLoadRef.current = false;
         }
 
-        if (heartbeatDefaultIntervalNonce === heartbeatDefaultIntervalLoadNonceRef.current) {
+        if (
+          isUneditedLoad(
+            heartbeatDefaultIntervalNonce,
+            heartbeatDefaultIntervalLoadNonceRef,
+            heartbeatDefaultIntervalEditedSinceLoadRef
+          )
+        ) {
           setDraftIntervalMinutes(formatIntervalMinutes(cfg.heartbeatDefaultIntervalMs));
           setHeartbeatDefaultIntervalLoaded(true);
           setHeartbeatDefaultIntervalLoadedOk(true);
