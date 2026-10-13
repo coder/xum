@@ -264,6 +264,9 @@ async function runToolHooks(
       if (output.decision === "block" || output.continue === false) {
         const feedback = output.reason ?? output.stopReason ?? "Stopped by a plugin hook.";
         ctx.result = { error: `[plugin:${registration.pluginName}] ${feedback}` };
+        // A nested caller (mux.load) holds the original output outside ctx.result: it must not
+        // hand it on (Codex PRRT_kwDOPxxmWM6r6NnK).
+        ctx.postBlocked = true;
         break;
       }
     }
