@@ -391,4 +391,30 @@ exit 0
     }
     expect(seen).toEqual([schema]);
   });
+
+  test("a post-block keeps the model-visible result: the hook's feedback replaces the output", async () => {
+    // Codex PRRT_kwDOPxxmWM6r6NnK: the pipeline reports a post-block to nested callers, but an
+    // ordinary tool call still returns the feedback exactly as before.
+    const feedback = { error: "[plugin:guard] secrets stay out" };
+    const unregister = eventSpine.use(
+      "tool.execute",
+      async (ctx, next) => {
+        await next();
+        ctx.result = feedback;
+        ctx.postBlocked = true;
+      },
+      { workspaceId: "post-block-ws" }
+    );
+    try {
+      const wrapped = withHooks(
+        "test_tool",
+        createTestTool(() => Promise.resolve({ output: "SECRET" })),
+        { runtime, cwd: tempDir, runtimeTempDir: tempDir, workspaceId: "post-block-ws" }
+      );
+      const result: unknown = await wrapped.execute!({ input: "x" }, {} as never);
+      expect(result).toEqual(feedback);
+    } finally {
+      unregister();
+    }
+  });
 });
