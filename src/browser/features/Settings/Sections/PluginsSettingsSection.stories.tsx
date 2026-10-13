@@ -7,9 +7,44 @@ import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { createMockORPCClient, type MockORPCClientOptions } from "@/browser/stories/mocks/orpc";
-import type { AgentPluginListItem } from "@/common/orpc/schemas/agentPlugins";
+import type {
+  AgentPluginInterfaceSummary,
+  AgentPluginListItem,
+} from "@/common/orpc/schemas/agentPlugins";
 
 import { PluginsSettingsSection } from "./PluginsSettingsSection";
+
+/** 1x1 PNG: the backend sends logos as data URLs, never paths. */
+const LOGO_DATA_URL =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
+/** Manifest strings that look like markup must render as literal text. */
+const OPENAI_INTERFACE: AgentPluginInterfaceSummary = {
+  displayName: "Grill",
+  developerName: "Example Co",
+  shortDescription: "Plans, **grilled** <b>hard</b>",
+  capabilities: ["Interactive", "Read", "Write"],
+  websiteURL: "https://example.com",
+  privacyPolicyURL: "https://example.com/privacy",
+  termsOfServiceURL: "https://example.com/terms",
+  supportURL: "https://example.com/support",
+  logoDataUrl: LOGO_DATA_URL,
+};
+
+/** Shared play check: the interface renders, as text, with external https links. */
+async function expectInterfaceAsText(canvasElement: HTMLElement): Promise<void> {
+  const canvas = within(canvasElement);
+  const text = await canvas.findByText("Plans, **grilled** <b>hard</b>");
+  const details = text.closest<HTMLElement>("[data-testid='plugin-interface']");
+  if (details === null) throw new Error("Interface text is outside the interface details");
+  if (details.querySelector("b, strong") !== null) {
+    throw new Error("Manifest text was rendered as markup");
+  }
+  const website = within(details).getByRole("link", { name: /Website/ });
+  if (website.getAttribute("target") !== "_blank" || website.getAttribute("rel") === null) {
+    throw new Error("Interface links must open externally");
+  }
+}
 
 const MANAGED_ITEM: AgentPluginListItem = {
   name: "grill",
@@ -26,6 +61,7 @@ const MANAGED_ITEM: AgentPluginListItem = {
   },
   lockedSha: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
   installedAt: "2026-08-01T12:00:00.000Z",
+  interface: OPENAI_INTERFACE,
   skillCount: 3,
   mcpServerCount: 1,
 };
@@ -78,6 +114,7 @@ const MISSING_ITEM: AgentPluginListItem = {
 
 /** Valid max-length (64-char, separator-free) name: the worst case for narrow-width wrapping. */
 const MAX_LENGTH_NAME = "a".repeat(64);
+const MAX_LENGTH_CAPABILITY = "c".repeat(120);
 const MAX_LENGTH_ITEM: AgentPluginListItem = {
   name: MAX_LENGTH_NAME,
   managed: true,
@@ -92,6 +129,13 @@ const MAX_LENGTH_ITEM: AgentPluginListItem = {
   },
   lockedSha: "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3",
   installedAt: "2026-08-01T12:00:00.000Z",
+  // Max-length (120-char) separator-free capability: must wrap like the name.
+  interface: {
+    displayName: "Max",
+    developerName: "Example Co",
+    shortDescription: "Worst-case wrapping",
+    capabilities: [MAX_LENGTH_CAPABILITY],
+  },
   skillCount: 1,
   mcpServerCount: 0,
 };
@@ -165,6 +209,7 @@ export const InstalledWithUpdateStates: Story = {
     await canvas.findByText("tag moved");
     await canvas.findByText("unmanaged");
     await canvas.findByText("missing");
+    await expectInterfaceAsText(canvasElement);
     // Update action appears only for rows whose tracking ref moved.
     await canvas.findAllByRole("button", { name: /Update/ });
   },
@@ -212,12 +257,21 @@ export const InstalledPhoneViewport: Story = {
     await canvas.findByText("grill");
     await canvas.findByText("update available");
     await canvas.findByRole("button", { name: /Update/ });
+    await expectInterfaceAsText(canvasElement);
     // Max-length separator-free names must wrap instead of overflowing the
     // card's right edge at phone width.
     const maxRow = await canvas.findByText(MAX_LENGTH_NAME);
     const card = maxRow.closest("div[class*='rounded-md']");
     if (card instanceof HTMLElement && card.scrollWidth > card.clientWidth + 1) {
       throw new Error("Max-length plugin row overflows its card at phone width");
+    }
+    const capability = await canvas.findByText(MAX_LENGTH_CAPABILITY);
+    const capabilityCard = capability.closest("div[class*='rounded-md']");
+    if (
+      capabilityCard instanceof HTMLElement &&
+      capability.getBoundingClientRect().right > capabilityCard.getBoundingClientRect().right + 1
+    ) {
+      throw new Error("Max-length capability badge overflows its card at phone width");
     }
   },
 };
@@ -299,6 +353,7 @@ export const AddPluginConsentPreview: Story = {
               description: "Relentlessly grills your plans.",
               authorName: "Example Co",
               license: "MIT",
+              interface: OPENAI_INTERFACE,
             },
             skills: [
               { name: "grill", description: "Stress-test a plan before committing to it." },
@@ -344,6 +399,7 @@ export const AddPluginConsentPreview: Story = {
     await canvas.findByText("/grill");
     await canvas.findByText(/Unknown top-level field 'hooks' ignored/);
     await canvas.findByRole("button", { name: /Install/ });
+    await expectInterfaceAsText(canvasElement);
   },
 };
 
@@ -376,7 +432,7 @@ export const AddPluginConsentPreviewPhoneViewport: Story = {
               refType: "branch",
             },
             lockedSha: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
-            manifest: { name: MAX_LENGTH_NAME, version: "1.0.0" },
+            manifest: { name: MAX_LENGTH_NAME, version: "1.0.0", interface: OPENAI_INTERFACE },
             skills: [],
             mcpServers: [],
             agents: [],
@@ -407,6 +463,7 @@ export const AddPluginConsentPreviewPhoneViewport: Story = {
 
     // The separator-free target path must wrap instead of overflowing the
     // consent card's right edge at phone width.
+    await expectInterfaceAsText(canvasElement);
     const pathCode = await canvas.findByText(`~/.mux/plugins/${MAX_LENGTH_NAME}`);
     const card = pathCode.closest("div[class*='rounded-md']");
     if (!(card instanceof HTMLElement)) {

@@ -80,6 +80,7 @@ import {
   NARROW_VIEWPORT_MAX_WIDTH_PX,
   WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX,
 } from "@/constants/layout";
+import { appViewTabFor } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
 import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { focusRightSidebarTab } from "@/browser/utils/rightSidebarTabFocus";
 import type { TabType } from "@/browser/types/rightSidebar";
@@ -400,9 +401,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     return () => window.removeEventListener("keydown", handler);
   }, [artifactsExperimentEnabled, isTimelineSidebarHidden, openSidebarTab]);
 
-  // "Open in Artifacts" on an MCP Apps tool card and openArtifact() (chat cards, file cards,
-  // Review, palette): while the sidebar is hidden, they show the Artifacts tab full-screen
-  // (RightSidebar handles the same events on wider layouts).
+  // openArtifact() (chat cards, file cards, Review, palette) and "Open in tab" on an MCP Apps
+  // tool card: while the sidebar is hidden, they show their tab full-screen (RightSidebar
+  // handles the same events on wider layouts).
   useEffect(() => {
     if (!artifactsExperimentEnabled) {
       return;
@@ -414,10 +415,19 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       }
       openSidebarTab("artifacts", activeElement());
     };
-    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handler);
+    // "Open in tab" shows the view's own app tab full-screen: the tab RightSidebar opens or
+    // focuses on wider layouts, so the view still runs in one place.
+    const appViewHandler = (event: Event) => {
+      const detail = (event as CustomEvent<{ workspaceId: string; toolCallId: string }>).detail;
+      if (detail?.workspaceId !== workspaceId || !isTimelineSidebarHidden()) {
+        return;
+      }
+      openSidebarTab(appViewTabFor(detail.toolCallId), activeElement());
+    };
+    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, appViewHandler);
     window.addEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handler);
     return () => {
-      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, handler);
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, appViewHandler);
       window.removeEventListener(CUSTOM_EVENTS.OPEN_ARTIFACT, handler);
     };
   }, [artifactsExperimentEnabled, isTimelineSidebarHidden, openSidebarTab, workspaceId]);

@@ -1017,19 +1017,20 @@ function mergeConsecutiveUserMessages(messages: ModelMessage[]): ModelMessage[] 
       // Consecutive user message - merge with previous
       const prevMsg = merged[merged.length - 1];
 
-      // Get text content from both messages
-      const prevText = Array.isArray(prevMsg.content)
-        ? (prevMsg.content.find((c) => c.type === "text")?.text ?? "")
-        : prevMsg.content;
-
-      const currentText = Array.isArray(msg.content)
-        ? (msg.content.find((c) => c.type === "text")?.text ?? "")
-        : typeof msg.content === "string"
-          ? msg.content
-          : "";
-
-      // Merge with newline prefix
-      const mergedText = prevText + "\n" + currentText;
+      // Every text part of both messages, joined by newlines: a message can carry several (an
+      // SVG attachment becomes a second text part, inlineSvgAsTextForProvider), and keeping only
+      // the first silently dropped the rest from the provider request. A message without text
+      // counts as one empty text, so single-text merges keep their exact bytes.
+      const textsOf = (content: ModelMessage["content"]): string[] => {
+        const texts =
+          typeof content === "string"
+            ? [content]
+            : Array.isArray(content)
+              ? content.flatMap((c) => (c.type === "text" ? [c.text] : []))
+              : [];
+        return texts.length > 0 ? texts : [""];
+      };
+      const mergedText = [...textsOf(prevMsg.content), ...textsOf(msg.content)].join("\n");
 
       // Collect file/image parts from both messages
       const prevImageParts = Array.isArray(prevMsg.content)
