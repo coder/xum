@@ -2385,6 +2385,8 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "- **Workspace-local**: `.xum/plugins/<plugin>/` and `.agents/plugins/<plugin>/`",
       "- **Global**: `~/.xum/plugins/<plugin>/` and `~/.agents/plugins/<plugin>/`",
       "",
+      "Xum reads plugins from the Xum host only. SSH, Docker, and devcontainer workspaces load the global plugins (their skills and agents) from the Xum host. Xum does not load project plugins inside an SSH or Docker checkout, because that checkout is not on the Xum host.",
+      "",
       "Plugin skills have the lowest precedence within their scope and are read-only. A broken plugin (or a broken skill inside one) never affects other plugins or skills. Plugins can also ship MCP servers; see [MCP servers](/config/mcp-servers#agent-plugins-servers).",
       "",
       "Global plugins can be installed from git via **Settings → Plugins** (paste a git URL or `owner/repo[@ref]`). The preview lists the full package before anything is written. Select which skills and MCP servers to import; both groups start with all current items selected and support **Select all** and **Clear**. You can install with neither group selected. Agents, workflows, slash commands, and hooks are unaffected by this choice; review their disclosures too. Imported MCP servers remain disabled until you enable them per workspace.",
