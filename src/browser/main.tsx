@@ -11,6 +11,7 @@ import { trackAppStarted } from "@/browser/utils/telemetryLifecycle";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { initTitlebarInsets } from "@/browser/hooks/useDesktopTitlebar";
 import { resolveBrowserAssetUrl } from "@/browser/utils/frontendBasePath";
+import { removeFirstRunView } from "@/browser/features/SplashScreens/SplashScreenProvider";
 
 // Initialize telemetry on app startup
 try {
@@ -66,9 +67,36 @@ window.addEventListener("unhandledrejection", (event) => {
   }
 });
 
+/**
+ * T3 #5971, C step 2: an uncaught render error unmounts the whole root, and the static first-run
+ * view (outside #root) would stay on screen. This boundary removes it, then renders what such an
+ * error leaves today (an empty root) and reports the error as an uncaught one.
+ */
+export class FirstRunViewErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { failed: boolean }
+> {
+  state = { failed: false };
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  componentDidCatch(error: Error) {
+    removeFirstRunView();
+    window.reportError(error);
+  }
+
+  render() {
+    return this.state.failed ? null : this.props.children;
+  }
+}
+
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <AppLoader />
+    <FirstRunViewErrorBoundary>
+      <AppLoader />
+    </FirstRunViewErrorBoundary>
   </React.StrictMode>
 );
 
@@ -77,7 +105,7 @@ if ("serviceWorker" in navigator) {
   const isHttpProtocol =
     window.location.protocol === "http:" || window.location.protocol === "https:";
   if (isHttpProtocol) {
-    window.addEventListener("load", () => {
+    const registerServiceWorker = () => {
       navigator.serviceWorker
         .register(resolveBrowserAssetUrl("service-worker.js"))
         .then((registration) => {
@@ -86,6 +114,10 @@ if ("serviceWorker" in navigator) {
         .catch((error) => {
           console.log("Service Worker registration failed:", error);
         });
-    });
+    };
+    // C step 2 loads this module after the static first-run view paints, which can be after
+    // `load`: then the event never fires again.
+    if (document.readyState === "complete") registerServiceWorker();
+    else window.addEventListener("load", registerServiceWorker);
   }
 }

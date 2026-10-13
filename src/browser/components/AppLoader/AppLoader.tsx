@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, type ReactNode } from "react";
+import { useState, useEffect, useLayoutEffect, useRef, type ReactNode } from "react";
 import App from "../../App";
 import { AuthTokenModal } from "../AuthTokenModal/AuthTokenModal";
 import { ThemeProvider } from "../../contexts/ThemeContext";
@@ -20,8 +20,22 @@ import { WorkspaceProvider, useWorkspaceContext } from "../../contexts/Workspace
 import { RouterProvider } from "../../contexts/RouterContext";
 import { TerminalRouterProvider } from "../../terminal/TerminalRouterContext";
 import { UpdateRestartOverlay } from "@/browser/components/UpdateRestartOverlay/UpdateRestartOverlay";
+import { removeFirstRunView } from "@/browser/features/SplashScreens/SplashScreenProvider";
 
 const USER_PREFERENCES_BOOTSTRAP_TIMEOUT_MS = 2000;
+
+/**
+ * T3 #5971, C step 2: the static first-run view covers the page until the live wizard replaces it.
+ * It must never cover the token prompt, a startup error or the reconnect screen.
+ */
+export function FirstRunViewConnectionGuard() {
+  const { status } = useAPI();
+  const blocked = status === "auth_required" || status === "error" || status === "reconnecting";
+  useLayoutEffect(() => {
+    if (blocked) removeFirstRunView();
+  }, [blocked]);
+  return null;
+}
 
 function UserPreferencesStartupGate(props: { children: ReactNode }) {
   const apiState = useAPI();
@@ -143,6 +157,7 @@ export function AppLoader(props: AppLoaderProps) {
   return (
     <ThemeProvider>
       <APIProvider client={props.client}>
+        <FirstRunViewConnectionGuard />
         <UserPreferencesStartupGate>
           <RouterProvider>
             <ProjectProvider>
