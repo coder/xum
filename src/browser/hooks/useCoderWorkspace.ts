@@ -311,16 +311,21 @@ export function useCoderWorkspace({
       setLoadingPresets(false);
       return;
     }
-    // Offline, keep the shown presets: the reconnect reloads them.
-    if (!api) return;
-
-    let mounted = true;
     // Capture template/org at request time to detect stale responses
     const templateAtRequest = coderConfig.template;
     const orgAtRequest = coderConfig.templateOrg;
     // Only another template shows "loading": a reload (reconnect) keeps the shown presets.
     const presetsKey = JSON.stringify([templateAtRequest, orgAtRequest]);
-    if (shownPresetsKeyRef.current !== presetsKey) setLoadingPresets(true);
+    if (shownPresetsKeyRef.current !== presetsKey) {
+      // The shown presets belong to another template: never offer them, offline either.
+      shownPresetsKeyRef.current = null;
+      setPresets([]);
+      setLoadingPresets(api != null);
+    }
+    // Offline, keep the shown presets of this template: the reconnect reloads them.
+    if (!api) return;
+
+    let mounted = true;
     setPresetsError(null);
 
     api.coder

@@ -142,6 +142,18 @@ describe.each([...GAP_MODES])("useCoderWorkspace across a reconnect (%s)", (mode
     expect(view.result.current.loadingPresets).toBe(true);
   });
 
+  // Offline no reload can replace them: the old template's presets must not stay selectable.
+  test("another template while offline clears the shown presets", async () => {
+    const { view } = renderCoder(CONFIG);
+    await waitFor(() => expect(view.result.current.presets.length).toBe(2));
+
+    await harness.drop();
+    view.rerender({ config: { ...CONFIG, template: "t2" } });
+    await settle();
+    expect(view.result.current.presets).toEqual([]);
+    expect(view.result.current.loadingPresets).toBe(false);
+  });
+
   test("a window focus while offline keeps the Coder info and config", async () => {
     const { view, onChange } = renderCoder(CONFIG);
     await waitFor(() => expect(view.result.current.coderInfo?.state).toBe("available"));

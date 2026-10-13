@@ -1066,6 +1066,44 @@ describe("WorkspaceContext", () => {
     });
   });
 
+  // Only a loaded snapshot makes later reloads non-blocking. Without one the app must keep its
+  // loader for the new client, not leave it with an empty metadata map.
+  describe.each([...GAP_MODES])("reconnect before a first snapshot (%s)", (mode) => {
+    test("shows loading again for the new client", async () => {
+      const { workspace: workspaceApi } = createMockAPI();
+      workspaceApi.onMetadata.mockImplementation(() =>
+        Promise.resolve(
+          // eslint-disable-next-line require-yield
+          (async function* () {
+            await Promise.resolve();
+          })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+        )
+      );
+      const contexts = await setupWithConnection(mode);
+      await waitFor(() => expect(contexts.workspace().loading).toBe(false));
+      expect(contexts.workspace().loaded).toBe(false);
+
+      // The next server never sends its snapshot.
+      currentClientMock = {
+        ...currentClientMock,
+        workspace: {
+          ...currentClientMock.workspace,
+          onMetadata: () =>
+            Promise.resolve(
+              // eslint-disable-next-line require-yield
+              (async function* () {
+                await new Promise(() => undefined);
+              })()
+            ),
+        },
+      };
+      await contexts.harness.drop();
+      contexts.harness.reconnect();
+      await waitFor(() => expect(contexts.workspace().loading).toBe(true));
+      expect(contexts.workspace().loaded).toBe(false);
+    });
+  });
+
   describe("archiveWorkspace", () => {
     test("succeeds even when persisted layout is invalid JSON shape", async () => {
       const workspaceId = "ws-archive-invalid-layout";

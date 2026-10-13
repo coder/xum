@@ -1090,10 +1090,10 @@ describe.each([...GAP_MODES])("TasksSection across a reconnect (%s)", (mode) => 
     expect(saveConfig.mock.calls.at(-1)?.[0].taskSettings.maxParallelAgentTasks).toBe(7);
   });
 
-  // An offline change cannot be saved yet. It must say so, stay pending, and be saved by the
-  // next client, not dropped while it looks saved.
-  test("reports a change made offline and saves it after the reconnect", async () => {
-    const firstSave = connect(3, Promise.resolve(FALLBACK_AGENTS));
+  // Offline an edit would live only in this section's state, and leaving the section before the
+  // reconnect would lose it: the controls must be disabled until a live client is back.
+  test("disables the controls while offline", async () => {
+    connect(3, Promise.resolve(FALLBACK_AGENTS));
     const harness = createConnectionHarness(mode, () => apiMock ?? {});
     const view = render(
       <harness.Wrapper>
@@ -1101,27 +1101,19 @@ describe.each([...GAP_MODES])("TasksSection across a reconnect (%s)", (mode) => 
       </harness.Wrapper>
     );
     await waitFor(() => expect(maxParallelInput(view).value).toBe("3"));
+    // happy-dom does not apply a disabled <fieldset> to `:disabled`: read the fieldset (browsers
+    // disable every control inside it).
+    const isDisabled = (input: HTMLInputElement) =>
+      input.disabled || input.closest("fieldset")?.disabled === true;
+    expect(isDisabled(maxParallelInput(view))).toBe(false);
 
     await harness.drop();
-    const input = maxParallelInput(view);
-    const reactPropsKey = Object.keys(input).find((key) => key.startsWith("__reactProps"));
-    const props = (
-      reactPropsKey ? (input as unknown as Record<string, unknown>)[reactPropsKey] : null
-    ) as { onChange?: (event: { target: { value: string } }) => void } | null;
-    if (!props?.onChange) throw new Error("Expected the input to expose its onChange handler");
-    const change = props.onChange;
-    act(() => change({ target: { value: "7" } }));
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 500));
-    });
-    expect(view.queryByText(/Not connected to the Xum server/)).not.toBeNull();
+    await waitFor(() => expect(isDisabled(maxParallelInput(view))).toBe(true));
+    // The kept value stays on screen.
+    expect(maxParallelInput(view).value).toBe("3");
 
-    const saveConfig = connect(5, Promise.resolve(FALLBACK_AGENTS));
+    connect(3, Promise.resolve(FALLBACK_AGENTS));
     harness.reconnect();
-    await waitFor(() => expect(saveConfig).toHaveBeenCalled(), { timeout: 2_000 });
-    expect(saveConfig.mock.calls.at(-1)?.[0].taskSettings.maxParallelAgentTasks).toBe(7);
-    expect(maxParallelInput(view).value).toBe("7");
-    await waitFor(() => expect(view.queryByText(/Not connected to the Xum server/)).toBeNull());
-    expect(firstSave).not.toHaveBeenCalled();
+    await waitFor(() => expect(isDisabled(maxParallelInput(view))).toBe(false));
   });
 });

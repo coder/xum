@@ -1130,7 +1130,9 @@ export function TasksSection() {
   };
 
   return (
-    <div className="space-y-6">
+    // Offline every control is disabled: an edit kept only in this section's state is lost when
+    // the user leaves the section before the reconnect.
+    <fieldset disabled={liveApi == null} className="min-w-0 space-y-6">
       <div>
         <h3 className="text-foreground mb-4 text-sm font-medium">Task Settings</h3>
         <div className="space-y-4">
@@ -1265,6 +1267,6 @@ export function TasksSection() {
           <div className="space-y-4">{unknownAgentIds.map(renderUnknownAgentDefaults)}</div>
         </div>
       ) : null}
-    </div>
+    </fieldset>
   );
 }

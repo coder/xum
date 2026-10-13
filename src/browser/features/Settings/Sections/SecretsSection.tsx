@@ -249,17 +249,15 @@ export const SecretsSection: React.FC = () => {
     // Only a new scope or project clears the list and shows "Loading": a new client (reconnect)
     // reloads the same secrets behind the shown rows, and keeps rows the user edited.
     const secretsKey = JSON.stringify([scope, currentProjectPath]);
-    if (shownSecretsKeyRef.current !== secretsKey) {
+    const reloadsShownSecrets = shownSecretsKeyRef.current === secretsKey;
+    if (!reloadsShownSecrets) {
       shownSecretsKeyRef.current = null;
       setLoadedSecrets([]);
       setSecrets([]);
       setInjectedGlobalSecretKeys([]);
       setVisibleSecrets(new Set());
       setLoading(true);
-      // The cleared rows hold no edit (the next render agrees).
-      isDirtyRef.current = false;
     }
-    const keepEdits = isDirtyRef.current;
     setError(null);
 
     if (!api) {
@@ -271,7 +269,8 @@ export const SecretsSection: React.FC = () => {
     const applyLoadedSecrets = (nextSecrets: Secret[]) => {
       shownSecretsKeyRef.current = secretsKey;
       setLoadedSecrets(nextSecrets);
-      if (keepEdits) return;
+      // Read dirtiness at apply time: the user can edit while the reload is in flight.
+      if (reloadsShownSecrets && isDirtyRef.current) return;
       setSecrets(nextSecrets);
       setVisibleSecrets(new Set());
       lastLiteralValuesRef.current = new Map();

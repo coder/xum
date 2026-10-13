@@ -111,6 +111,25 @@ describe.each([...GAP_MODES])("SecretsSection across a reconnect (%s)", (mode) =
     expect(view.queryByDisplayValue("SERVER_KEY")).toBeNull();
   });
 
+  // The reload starts on a clean form. An edit made while it is in flight must survive its answer.
+  test("keeps a row the user edited while the reload was pending", async () => {
+    const view = renderSecrets();
+    await waitFor(() => expect(view.queryByDisplayValue("OLD_KEY")).not.toBeNull());
+
+    let answer: ((secrets: Secret[]) => void) | null = null;
+    serverSecrets = new Promise((resolve) => (answer = resolve));
+    await harness.drop();
+    harness.reconnect();
+    await settle();
+    typeInto(view.getByDisplayValue("OLD_KEY"), "EDITED_KEY");
+    await waitFor(() => expect(view.queryByDisplayValue("EDITED_KEY")).not.toBeNull());
+
+    act(() => answer?.([{ key: "SERVER_KEY", value: "server" }]));
+    await settle();
+    expect(view.queryByDisplayValue("EDITED_KEY")).not.toBeNull();
+    expect(view.queryByDisplayValue("SERVER_KEY")).toBeNull();
+  });
+
   // Offline the edited rows stay, but a Save could not reach the server: it must be disabled.
   test("disables Save for an edited row while offline", async () => {
     const view = renderSecrets();

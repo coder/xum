@@ -483,6 +483,9 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   const routedDraftIdRef = useRef<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [loaded, setLoaded] = useState(false);
+  // For the metadata effect: a new client shows the loader again until a first snapshot loads.
+  const loadedRef = useRef(loaded);
+  loadedRef.current = loaded;
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const [workspaceDraftPromotionsByProject, setWorkspaceDraftPromotionsByProject] =
@@ -902,13 +905,16 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   // The metadata stream owns the initial load: its first event is a snapshot built after the
   // server attached the listener, so no change can fall between the load and the updates (#5189).
   useEffect(() => {
-    // `loading` starts true and stays false after the first load: a new client (reconnect)
-    // reloads behind the shown metadata, so neither `loading` nor `loaded` resets here.
+    // After a first snapshot, a new client (reconnect) reloads behind the shown metadata, so
+    // neither `loading` nor `loaded` resets here.
     if (!api) {
       // api not available yet - effect will run again when api connects
       setLoadError("API not connected");
       return;
     }
+    // No snapshot loaded yet (a failure or a lost connection ended the last load): the new client
+    // shows the loader again, or the app would leave it with an empty metadata map.
+    if (!loadedRef.current) setLoading(true);
     const controller = new AbortController();
     const { signal } = controller;
     let snapshotApplied = false;
