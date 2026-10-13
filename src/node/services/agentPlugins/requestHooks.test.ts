@@ -2,7 +2,7 @@ import { afterEach, expect, spyOn, test } from "bun:test";
 import type { ProjectsConfig } from "@/common/types/project";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { Config } from "@/node/config";
-import type { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
+import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { codexPluginHookService, type EnsureCodexHooksArgs } from "./codexHookService";
 import { agentPluginHookService } from "./hookService";
 import { prepareWorkspaceRequestHooks } from "./requestHooks";
@@ -50,7 +50,7 @@ test("a multi-project workspace with an untrusted secondary project runs no Code
     config,
     metadata,
     hostCheckoutRoot: null,
-    journal: {} as DurableEventJournal,
+    journal: sharedDurableEventJournal("/xum/sessions/ws-multi"),
     mcpServerManager: mcp,
   });
 
