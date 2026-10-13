@@ -195,14 +195,16 @@ const playInTab = async (canvasElement: HTMLElement) => {
 };
 export const McpAppInTab: Story = {
   args: { toolName: "demo_app_show_dice_board" },
-  parameters: { pixel: { matrix: { themes: ["dark"], viewports: ["laptop"] } } },
+  // Play only: the stack adds no Pixel snapshots (shared cap).
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => renderInTab(),
   play: ({ canvasElement }) => playInTab(canvasElement),
 };
 export const McpAppInTabPhone: Story = {
   args: { toolName: "demo_app_show_dice_board" },
   globals: { viewport: { value: "phone390", isRotated: false } },
-  parameters: { pixel: { matrix: { themes: ["dark"], viewports: ["phone"] } } },
+  // Play only: the stack adds no Pixel snapshots (shared cap).
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => <div style={{ width: 358 }}>{renderInTab()}</div>,
   play: ({ canvasElement }) => playInTab(canvasElement),
 };
