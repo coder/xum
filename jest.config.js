@@ -11,10 +11,12 @@ module.exports = {
     // React code too: `make crap` and Quality / CRAP score .tsx functions from this
     // lcov, and without .tsx records every component tests/ui exercises scores 0%.
     "src/**/*.tsx",
-    // Storybook and bun:test files are not app code (Jest never runs them).
+    // Storybook and bun:test files and their helpers are not app code.
     "!src/**/*.stories.tsx",
     "!src/browser/stories/**",
+    "!src/**/*StoryUtils.tsx",
     "!src/**/*.test.tsx",
+    "!src/**/*.testHarness.tsx",
     "!src/**/*.d.ts",
     "!src/desktop/preload.ts",
     "!src/browser/api.ts",
