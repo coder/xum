@@ -87,6 +87,10 @@ export interface ReplayFixtureTurnSpec {
   postCompactionAttachments?: PostCompactionAttachment[];
   /** Refusal-fallback partial continuation (envelope-only, never in chat.jsonl). */
   partialContinuation?: MuxMessage;
+  /** MCP Apps model context message (request-only, never in chat.jsonl). */
+  mcpAppModelContext?: MuxMessage;
+  /** Simulate an envelope written without the model context it sent. */
+  envelopeOmitsMcpAppModelContext?: boolean;
   anthropicCacheTtl?: AnthropicCacheTtl;
   /** Volatile system tail length (production splits it into its own block). */
   systemVolatileSuffixLength?: number;
@@ -187,6 +191,8 @@ export async function appendReplayFixtureTurn(
       planFilePath: spec.planFilePath,
       postCompactionAttachments: spec.postCompactionAttachments,
       partialContinuationMessage: spec.partialContinuation,
+      mcpAppModelContextMessage:
+        spec.envelopeOmitsMcpAppModelContext === true ? undefined : spec.mcpAppModelContext,
     });
   }
 
@@ -205,6 +211,7 @@ export async function appendReplayFixtureTurn(
       planFilePath: spec.planFilePath,
       postCompactionAttachments: spec.postCompactionAttachments,
       partialContinuation: spec.partialContinuation,
+      mcpAppModelContext: spec.mcpAppModelContext,
       // Production derives these from the request tools (assemblePromptPayload).
       deferLoadingToolNames: collectDeferLoadingToolNames(spec.tools),
       workspaceId: ctx.workspaceId,

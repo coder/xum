@@ -40,10 +40,33 @@ export interface MCPSettingsSnapshot {
   /** Layout groups in order; properties no group lists go last, in "Other settings". */
   layout: MCPSettingsGroup[];
   warnings: string[];
+  /** Schema properties dropped (unsupported schema or no valid value); the UI notes them. */
+  droppedSettingCount: number;
 }
 
 const MAX_TEXT = 1024;
 const MAX_VALUE_LENGTH = 4096;
+// Collection bounds: the renderer mounts one control per setting, so a server must not be
+// able to send an unbounded schema or layout. Excess entries are dropped with one warning.
+export const MAX_MCP_SETTINGS = 100;
+const MAX_LAYOUT_GROUPS = 20;
+const MAX_GROUP_ITEMS = 100;
+/** Options one Select can show; a setting with more is dropped (counted as not shown). */
+export const MAX_MCP_SETTING_ENUM_OPTIONS = 100;
+/** Longest setting name, in code points: names are React keys and cross IPC. Longer = dropped. */
+export const MAX_MCP_SETTING_NAME = 128;
+/** Settings tool timeout in the dialog's bulk read: one hung server must not hold back the rest. */
+export const MCP_SETTINGS_READ_TIMEOUT_MS = 10_000;
+
+/**
+ * A settings error as sent to the renderer: at most MAX_TEXT UTF-16 units (about 1 KB), cut
+ * on a code point. Server error text is untrusted and otherwise unbounded.
+ */
+export function boundMCPSettingsError(message: string): string {
+  if (message.length <= MAX_TEXT) return message;
+  const cut = message.slice(0, MAX_TEXT);
+  return `${/[\uD800-\uDBFF]$/.test(cut) ? cut.slice(0, -1) : cut}…`;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -104,7 +127,14 @@ function parseSchema(raw: unknown): MCPSettingSchema | undefined {
   if (raw.type === "boolean") return { ...base, type: "boolean" };
   if (raw.type === "string") {
     const enumValues = raw.enum;
-    if (enumValues !== undefined && !(Array.isArray(enumValues) && enumValues.every(isEnumOption)))
+    if (
+      enumValues !== undefined &&
+      !(
+        Array.isArray(enumValues) &&
+        enumValues.length <= MAX_MCP_SETTING_ENUM_OPTIONS &&
+        enumValues.every(isEnumOption)
+      )
+    )
       return undefined;
     if ([raw.minLength, raw.maxLength].some((n) => n !== undefined && !isLength(n)))
       return undefined;
@@ -202,11 +232,24 @@ export function parseMCPSettingsReadResult(raw: unknown): MCPSettingsSnapshot | 
   const warnings: string[] = [];
   // Null prototypes: a setting named "__proto__" must stay an own key, not hit the legacy setter.
   const properties = Object.create(null) as Record<string, MCPSettingSchema>;
-  for (const [name, schema] of Object.entries(raw.schema.properties)) {
-    const parsed = parseSchema(schema);
+  // A counting loop, not Object.entries: a server can declare any number of properties, and
+  // only the first MAX_MCP_SETTINGS are parsed. The rest are only counted (as dropped).
+  const declaredProperties = raw.schema.properties;
+  let declared = 0;
+  for (const name in declaredProperties) {
+    if (!Object.hasOwn(declaredProperties, name) || ++declared > MAX_MCP_SETTINGS) continue;
+    if (exceedsCodePoints(name, MAX_MCP_SETTING_NAME)) {
+      warnings.push(
+        `A setting name is longer than ${MAX_MCP_SETTING_NAME} characters; ignoring it`
+      );
+      continue;
+    }
+    const parsed = parseSchema(declaredProperties[name]);
     if (parsed !== undefined) properties[name] = parsed;
     else warnings.push(`Setting '${name}' has an unsupported schema; ignoring it`);
   }
+  if (declared > MAX_MCP_SETTINGS)
+    warnings.push(`Only the first ${MAX_MCP_SETTINGS} settings are shown; ignoring the rest`);
   const values = filterMCPSettingValues(properties, raw.values, warnings);
   // A property without a valid current value cannot be edited safely.
   for (const name of Object.keys(properties)) {
@@ -215,13 +258,19 @@ export function parseMCPSettingsReadResult(raw: unknown): MCPSettingsSnapshot | 
 
   const layout: MCPSettingsGroup[] = [];
   const placed = new Set<string>();
-  for (const group of Array.isArray(raw.layout) ? raw.layout : []) {
+  const groups: unknown[] = Array.isArray(raw.layout) ? raw.layout : [];
+  if (groups.length > MAX_LAYOUT_GROUPS)
+    warnings.push(`Only the first ${MAX_LAYOUT_GROUPS} layout groups are used; ignoring the rest`);
+  for (const group of groups.slice(0, MAX_LAYOUT_GROUPS)) {
     if (!isRecord(group) || group.kind !== "group" || !isNonBlank(group.title)) {
       warnings.push("A settings layout group is malformed; ignoring it");
       continue;
     }
     const items: MCPSettingsLayoutItem[] = [];
-    for (const item of Array.isArray(group.items) ? group.items : []) {
+    const rawItems: unknown[] = Array.isArray(group.items) ? group.items : [];
+    if (rawItems.length > MAX_GROUP_ITEMS)
+      warnings.push(`'${group.title}' lists more than ${MAX_GROUP_ITEMS} items; ignoring the rest`);
+    for (const item of rawItems.slice(0, MAX_GROUP_ITEMS)) {
       if (isRecord(item) && item.kind === "property" && typeof item.property === "string") {
         // Own properties only: "toString" or "constructor" must not resolve through the prototype.
         if (Object.hasOwn(properties, item.property) && !placed.has(item.property)) {
@@ -232,7 +281,9 @@ export function parseMCPSettingsReadResult(raw: unknown): MCPSettingsSnapshot | 
         items.push({
           kind: "tool",
           tool: item.tool,
-          ...(typeof item.description === "string" ? { description: item.description } : {}),
+          ...(typeof item.description === "string" && item.description.length <= MAX_TEXT
+            ? { description: item.description }
+            : {}),
         });
       } else warnings.push(`A layout item in '${group.title}' is malformed; ignoring it`);
     }
@@ -244,5 +295,6 @@ export function parseMCPSettingsReadResult(raw: unknown): MCPSettingsSnapshot | 
       title: "Other settings",
       items: rest.map((property) => ({ kind: "property", property })),
     });
-  return { properties, values, layout, warnings };
+  const droppedSettingCount = declared - Object.keys(properties).length;
+  return { properties, values, layout, warnings, droppedSettingCount };
 }
