@@ -506,6 +506,22 @@ describe("MemoryTab", () => {
     });
   });
 
+  test("the save shortcut works from preview, outside the textarea", async () => {
+    fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
+    fake.setContent("/memories/global/prefs.md", "# Heading", "sha-original");
+    const { findByText, findByRole } = renderWithApi(<MemoryTab workspaceId="ws-1" />);
+
+    fireEvent.click(await findByText("prefs.md"));
+    await findByRole("heading", { name: "Heading" });
+    fireEvent.keyDown(document.activeElement!, { key: "Enter", ctrlKey: true });
+
+    await waitFor(() => {
+      expect(fake!.state.saveCalls).toEqual([
+        { path: "/memories/global/prefs.md", content: "# Heading", expectedSha256: "sha-original" },
+      ]);
+    });
+  });
+
   test("the toggle shortcut switches between preview and edit, repeatedly from the editor", async () => {
     fake = createFakeMemoryApi([fileInfo({ path: "/memories/global/prefs.md" })]);
     fake.setContent("/memories/global/prefs.md", "# Heading", "sha-original");
@@ -521,6 +537,13 @@ describe("MemoryTab", () => {
     fireEvent.keyDown(editor, { key: "e", ctrlKey: true });
     await findByRole("heading", { name: "Heading" });
     expect(queryByRole("textbox", { name: "Memory file content" })).toBeNull();
+    // happy-dom keeps focus on the hidden textarea where a browser drops it to
+    // <body>, so check that focus moved to the editor root explicitly.
+    expect(document.activeElement).not.toBe(editor);
+    expect(document.activeElement).not.toBe(document.body);
+    expect(document.activeElement?.contains(await findByRole("button", { name: "Preview" }))).toBe(
+      true
+    );
 
     fireEvent.keyDown(document.activeElement!, { key: "e", ctrlKey: true });
     expect(document.activeElement).toBe(
@@ -585,9 +608,11 @@ describe("MemoryTab", () => {
     await waitFor(() => expect(editor.value).toBe("# not a heading"));
     expect(queryByRole("button", { name: "Preview" })).toBeNull();
 
+    // happy-dom skips React's bubbling keydown handlers when the target lacks focus.
+    editor.focus();
     fireEvent.keyDown(editor, { key: "e", ctrlKey: true });
-    expect(queryByRole("heading", { name: "not a heading" })).toBeNull();
-    expect(editor.isConnected).toBe(true);
+    // The textarea stays mounted in Preview, hidden, so a visible textbox means no mode switch.
+    expect(queryByRole("textbox", { name: "Memory file content" })).toBe(editor);
   });
 
   test("deletes a file from the list after confirming the modal", async () => {
