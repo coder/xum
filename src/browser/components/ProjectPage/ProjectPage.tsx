@@ -10,6 +10,7 @@ import type { ChatInputAPI, WorkspaceCreatedOptions } from "@/browser/features/C
 import { ProjectMCPOverview } from "../ProjectMCPOverview/ProjectMCPOverview";
 import { ArchivedWorkspaces } from "../ArchivedWorkspaces/ArchivedWorkspaces";
 import { useAPI } from "@/browser/contexts/API";
+import { isStreamFailure } from "@/browser/contexts/connectionLink";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { getErrorMessage } from "@/common/utils/errors";
 import { GitInitBanner } from "../GitInitBanner/GitInitBanner";
@@ -156,7 +157,8 @@ const ProjectArchivedWorkspaces: React.FC<{ projectPath: string; projectName: st
           throw new Error("Archived workspace stream ended before its snapshot");
         }
       } catch (err) {
-        if (!controller.signal.aborted) {
+        // A lost connection is no load failure: the reconnect opens the stream again.
+        if (isStreamFailure(err, controller.signal)) {
           console.error("Failed to load archived workspaces:", err);
           setArchivedLoadError(getErrorMessage(err));
         }

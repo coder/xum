@@ -13,7 +13,7 @@ import {
   ONBOARDING_WIZARD_SPLASH_ID,
   type SplashConfig,
 } from "./index";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, type APIClient } from "@/browser/contexts/API";
 import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 
@@ -51,6 +51,17 @@ function getActiveSplashQueue(viewedIds: readonly string[]): SplashConfig[] {
     // Check if this splash has been viewed
     return !viewedIds.includes(splash.id);
   }).sort((a, b) => b.priority - a.priority); // Higher number = higher priority = shown first
+}
+
+/** Marks the splash viewed. False only when the lost connection kept the view from saving. */
+async function markViewed(api: APIClient, splashId: string): Promise<boolean> {
+  try {
+    await api.splashScreens.markSplashScreenViewed({ splashId });
+  } catch (error) {
+    if (isConnectionLostError(error)) return false;
+    console.error("Failed to mark splash screen as viewed:", error);
+  }
+  return true;
 }
 
 export function SplashScreenProvider({ children }: { children: ReactNode }) {
@@ -115,12 +126,8 @@ export function SplashScreenProvider({ children }: { children: ReactNode }) {
     setOnboardingPaused(false);
     setPausedOnboarding(null);
 
-    // Mark as viewed in config
-    try {
-      await api.splashScreens.markSplashScreenViewed({ splashId: currentSplash.id });
-    } catch (error) {
-      console.error("Failed to mark splash screen as viewed:", error);
-    }
+    // Offline the view is not saved: keep the splash, or it opens again after the reconnect.
+    if (!(await markViewed(api, currentSplash.id))) return;
 
     // Remove from queue, next one shows automatically
     setQueue((q) => q.slice(1));

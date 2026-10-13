@@ -321,6 +321,11 @@ interface EditSession {
 const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const { api } = useAPI();
   const liveApi = useLiveAPI();
+  // For refusals after an await: the send's closure holds the client from when it started.
+  const liveApiRef = useRef(liveApi);
+  useEffect(() => {
+    liveApiRef.current = liveApi;
+  }, [liveApi]);
   const { variant } = props;
   // A /side chat composer is mounted next to the main one. Window shortcuts act only in the pane
   // that owns the focused element, and unscoped palette events (open model selector, voice, toasts)
@@ -2243,7 +2248,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       !draftBypassesTranscriptBarrier &&
       !isTranscriptMutationAllowed(props.workspaceId)
     ) {
-      pushToast({ type: "error", message: transcriptBarrierMessage(liveApi == null) });
+      pushToast({ type: "error", message: transcriptBarrierMessage(liveApiRef.current == null) });
       return;
     }
     if (!canSend) {
@@ -2378,7 +2383,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       !commandBypassesTranscriptBarrier(parsed) &&
       !isTranscriptMutationAllowed(props.workspaceId)
     ) {
-      pushToast({ type: "error", message: transcriptBarrierMessage(liveApi == null) });
+      pushToast({ type: "error", message: transcriptBarrierMessage(liveApiRef.current == null) });
       return;
     }
 
@@ -2797,7 +2802,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // the meantime (switch, reconnect). Draft, attachments and edit state stay intact; the
         // outer `finally` releases sendingCount.
         if (!isTranscriptMutationAllowed(props.workspaceId)) {
-          pushToast({ type: "error", message: transcriptBarrierMessage(liveApi == null) });
+          pushToast({
+            type: "error",
+            message: transcriptBarrierMessage(liveApiRef.current == null),
+          });
           return;
         }
 

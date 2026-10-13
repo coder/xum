@@ -2,7 +2,7 @@
 import "../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { act, cleanup, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import type { APIClient } from "@/browser/contexts/API";
@@ -21,7 +21,17 @@ restoreModulesAfterSuite([["@/browser/features/SplashScreens/index", { ...RealSp
 void mock.module("@/browser/features/SplashScreens/index", () => ({
   ...RealSplashRegistry,
   DISABLE_SPLASH_SCREENS: false,
-  SPLASH_REGISTRY: [{ id: "test-splash", priority: 1, component: () => <p>Test splash</p> }],
+  SPLASH_REGISTRY: [
+    {
+      id: "test-splash",
+      priority: 1,
+      component: (props: { onDismiss: () => void }) => (
+        <button type="button" onClick={props.onDismiss}>
+          Test splash
+        </button>
+      ),
+    },
+  ],
 }));
 
 import { SplashScreenProvider } from "./SplashScreenProvider";
@@ -77,6 +87,27 @@ describe.each([...GAP_MODES])("SplashScreenProvider across a reconnect (%s)", (m
     await harness.drop();
     await settle();
 
+    expect(view.queryByText("Test splash")).not.toBeNull();
+  });
+
+  // Offline the view cannot be saved: the splash stays, or it would open again after the reconnect.
+  test("a dismiss while offline keeps the splash", async () => {
+    const view = render(
+      <harness.Wrapper>
+        <RouterProvider>
+          <SettingsProvider>
+            <SplashScreenProvider>
+              <span>app</span>
+            </SplashScreenProvider>
+          </SettingsProvider>
+        </RouterProvider>
+      </harness.Wrapper>
+    );
+    const splash = await view.findByText("Test splash");
+
+    await harness.drop();
+    fireEvent.click(splash);
+    await settle();
     expect(view.queryByText("Test splash")).not.toBeNull();
   });
 });

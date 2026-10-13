@@ -25,13 +25,16 @@ const USER_PREFERENCES_BOOTSTRAP_TIMEOUT_MS = 2000;
 
 function UserPreferencesStartupGate(props: { children: ReactNode }) {
   const apiState = useAPI();
+  // The bound runs only while connected: a drop cancels it, and the reconnect starts it again,
+  // so the timeout cannot pick the launch route from code defaults while offline.
+  const liveApi = useLiveAPI();
   const [ready, setReady] = useState(false);
   const bootstrappedRef = useRef(false);
 
   // The bound starts once the API client exists: a token prompt or a slow connect must not use it
   // up, or RouterProvider picks the launch route from code defaults.
   useEffect(() => {
-    if (bootstrappedRef.current || !apiState.api) {
+    if (bootstrappedRef.current || !liveApi) {
       return;
     }
 
@@ -79,7 +82,7 @@ function UserPreferencesStartupGate(props: { children: ReactNode }) {
         clearTimeout(timeoutId);
       }
     };
-  }, [apiState.api]);
+  }, [liveApi]);
 
   // bootstrappedRef is set together with `ready`, so `ready` alone decides here; reading
   // the ref during render would make React Compiler skip this component.
