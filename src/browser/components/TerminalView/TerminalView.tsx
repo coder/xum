@@ -101,6 +101,34 @@ async function preloadTerminalWebfonts(
   }
 }
 
+/**
+ * Writes a full screen from the server (may be empty for new sessions).
+ *
+ * `replace` is set after a reconnect, when the router reattaches and sends the full screen again
+ * (TerminalSessionRouter). clear() keeps the scrollback, so writing on top would repeat it:
+ * start from an empty terminal instead.
+ */
+export function writeScreenState(
+  term: Pick<Terminal, "reset" | "write">,
+  state: string,
+  replace: boolean
+): void {
+  if (replace) {
+    try {
+      term.reset();
+    } catch (err) {
+      console.warn("[TerminalView] Error resetting terminal:", err);
+    }
+  }
+  if (!state) return;
+  try {
+    term.write(state);
+  } catch (err) {
+    // xterm WASM can throw "memory access out of bounds" intermittently
+    console.warn("[TerminalView] Error writing screenState:", err);
+  }
+}
+
 interface TerminalViewProps {
   workspaceId: string;
   /** Session ID to connect to (required - must be created before mounting) */
@@ -365,16 +393,8 @@ export function TerminalView({
           console.warn("[TerminalView] Error writing output:", err);
         }
       },
-      onScreenState: (state) => {
-        // Write screen state (may be empty for new sessions)
-        if (state) {
-          try {
-            term.write(state);
-          } catch (err) {
-            // xterm WASM can throw "memory access out of bounds" intermittently
-            console.warn("[TerminalView] Error writing screenState:", err);
-          }
-        }
+      onScreenState: (state, options) => {
+        writeScreenState(term, state, options?.replace === true);
         // Mark loading complete - we now have valid content to show
         setIsLoading(false);
       },
