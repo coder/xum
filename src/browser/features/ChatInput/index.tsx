@@ -30,6 +30,7 @@ import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useAgent } from "@/browser/contexts/AgentContext";
 import { ThinkingSelector } from "@/browser/components/ThinkingSelector/ThinkingSelector";
 import { useAPI, type APIClient, useLiveAPI } from "@/browser/contexts/API";
+import { CONNECTION_LOST_MESSAGE } from "@/browser/contexts/connectionLink";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
 import {
@@ -284,6 +285,14 @@ async function forEachProviderConfigChange(
   } catch {
     // Subscription cancelled via abort signal - expected on cleanup
   }
+}
+
+/**
+ * Why a send waits for the transcript. Offline the transcript cannot catch up until the
+ * reconnect, so the toast says that instead of "still loading".
+ */
+function transcriptBarrierMessage(offline: boolean): string {
+  return offline ? CONNECTION_LOST_MESSAGE : TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE;
 }
 
 /** Composer attachments for a restored or edited message (provider files, then staged files). */
@@ -2234,7 +2243,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       !draftBypassesTranscriptBarrier &&
       !isTranscriptMutationAllowed(props.workspaceId)
     ) {
-      pushToast({ type: "error", message: TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE });
+      pushToast({ type: "error", message: transcriptBarrierMessage(liveApi == null) });
       return;
     }
     if (!canSend) {
@@ -2369,7 +2378,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       !commandBypassesTranscriptBarrier(parsed) &&
       !isTranscriptMutationAllowed(props.workspaceId)
     ) {
-      pushToast({ type: "error", message: TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE });
+      pushToast({ type: "error", message: transcriptBarrierMessage(liveApi == null) });
       return;
     }
 
@@ -2788,7 +2797,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // the meantime (switch, reconnect). Draft, attachments and edit state stay intact; the
         // outer `finally` releases sendingCount.
         if (!isTranscriptMutationAllowed(props.workspaceId)) {
-          pushToast({ type: "error", message: TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE });
+          pushToast({ type: "error", message: transcriptBarrierMessage(liveApi == null) });
           return;
         }
 

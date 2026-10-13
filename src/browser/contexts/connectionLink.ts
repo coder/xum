@@ -12,12 +12,15 @@ const CONNECTION_LOST_CODE = "XUM_CONNECTION_LOST";
  * keeps that behavior. Use isConnectionLostError() to tell it apart from a caller abort or a
  * server-side cancel, which carry the same name.
  */
+/** The message of ConnectionLostError, also for UI that refuses an action while offline. */
+export const CONNECTION_LOST_MESSAGE = "Not connected to the Xum server. Reconnecting…";
+
 export class ConnectionLostError extends Error {
   override readonly name = "AbortError" as const;
   readonly code = CONNECTION_LOST_CODE;
 
   constructor(options?: { cause?: unknown }) {
-    super("Not connected to the Xum server. Reconnecting…", options);
+    super(CONNECTION_LOST_MESSAGE, options);
   }
 }
 
