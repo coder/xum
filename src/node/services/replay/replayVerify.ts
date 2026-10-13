@@ -15,7 +15,9 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { asSchema } from "ai";
+import { z } from "zod";
 import type {
+  DevToolsPromptCacheWire,
   DevToolsLogEntry,
   DevToolsRun,
   DevToolsStep,
@@ -71,7 +73,10 @@ export interface RecordedStepRequest {
   runId: string;
   stepId: string;
   stepNumber: number;
-  /** ISO start time: the audit treats a gap longer than the cache TTL as an expired entry. */
+  /**
+   * ISO start time. The audit measures the cache TTL from promptCacheWire.observedAt, and
+   * from this time only for steps without it (older binaries).
+   */
   startedAt: string;
   modelId: string;
   /** AI SDK provider id, e.g. "anthropic.messages"; null when the SDK did not report one. */
@@ -84,6 +89,8 @@ export interface RecordedStepRequest {
   requestHistorySequence?: number;
   /** See DevToolsRun.contextEpoch; absent on runs recorded by older binaries. */
   contextEpoch?: string;
+  /** See DevToolsStep.promptCacheWire; absent on older binaries and non-Anthropic wires. */
+  promptCacheWire?: DevToolsPromptCacheWire;
 }
 
 /** One parse of devtools.jsonl, shared by the first-request replay and the step audit. */
@@ -94,6 +101,43 @@ export interface DevtoolsLogSnapshot {
   stepUsageUpdates: Map<string, DevToolsUsage | null>;
   /** Steps whose finalization recorded an error (aborted or rejected calls). */
   failedStepIds: Set<string>;
+  /** Wire facts from step finalization (step-update rows), by step id. */
+  stepPromptCacheWires: Map<string, DevToolsPromptCacheWire>;
+}
+
+const PromptCacheWireSchema = z.object({
+  route: z.string(),
+  modelString: z.string(),
+  endpoint: z.string().optional(),
+  cacheMarkersInjected: z.boolean(),
+  dispatched: z.boolean(),
+  observedAt: z
+    .string()
+    .refine((value) => !Number.isNaN(Date.parse(value)))
+    .optional(),
+  observedSeq: z.number().int().nonnegative().optional(),
+});
+
+/** The wire record of a log row, or undefined when absent or damaged (self-healing). */
+function parsePromptCacheWire(value: unknown): DevToolsPromptCacheWire | undefined {
+  const parsed = PromptCacheWireSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
+
+/** Fold one step-update row: only its usage, error and wire facts matter to replay. */
+function foldStepUpdate(
+  log: Pick<DevtoolsLogSnapshot, "stepUsageUpdates" | "failedStepIds" | "stepPromptCacheWires">,
+  stepId: string,
+  update: Partial<DevToolsStep>
+): void {
+  if (update.usage !== undefined) {
+    log.stepUsageUpdates.set(stepId, update.usage);
+  }
+  if (update.error != null) {
+    log.failedStepIds.add(stepId);
+  }
+  const wire = parsePromptCacheWire(update.promptCacheWire);
+  if (wire != null) log.stepPromptCacheWires.set(stepId, wire);
 }
 
 /**
@@ -107,11 +151,18 @@ export async function readDevtoolsLog(sessionDir: string): Promise<DevtoolsLogSn
   try {
     raw = await fs.readFile(path.join(sessionDir, DEVTOOLS_LOG_FILE_NAME), "utf-8");
   } catch {
-    return { runs: [], stepsInLogOrder: [], stepUsageUpdates, failedStepIds: new Set() };
+    return {
+      runs: [],
+      stepsInLogOrder: [],
+      stepUsageUpdates,
+      failedStepIds: new Set(),
+      stepPromptCacheWires: new Map(),
+    };
   }
 
   const orphanSteps: DevToolsStep[] = [];
   const failedStepIds = new Set<string>();
+  const stepPromptCacheWires = new Map<string, DevToolsPromptCacheWire>();
   for (const line of raw.split("\n")) {
     if (!line.trim()) {
       continue;
@@ -130,12 +181,11 @@ export async function readDevtoolsLog(sessionDir: string): Promise<DevtoolsLogSn
     } else if (entry.type === "step") {
       orphanSteps.push(entry.step);
     } else if (entry.type === "step-update") {
-      if (entry.update.usage !== undefined) {
-        stepUsageUpdates.set(entry.stepId, entry.update.usage);
-      }
-      if (entry.update.error != null) {
-        failedStepIds.add(entry.stepId);
-      }
+      foldStepUpdate(
+        { stepUsageUpdates, failedStepIds, stepPromptCacheWires },
+        entry.stepId,
+        entry.update
+      );
     }
   }
   const stepsInLogOrder: DevtoolsLogSnapshot["stepsInLogOrder"] = [];
@@ -148,7 +198,13 @@ export async function readDevtoolsLog(sessionDir: string): Promise<DevtoolsLogSn
   for (const { steps } of runs.values()) {
     steps.sort((a, b) => a.stepNumber - b.stepNumber);
   }
-  return { runs: [...runs.values()], stepsInLogOrder, stepUsageUpdates, failedStepIds };
+  return {
+    runs: [...runs.values()],
+    stepsInLogOrder,
+    stepUsageUpdates,
+    failedStepIds,
+    stepPromptCacheWires,
+  };
 }
 
 /**
@@ -189,12 +245,23 @@ function recordedRequestsFromLog(log: DevtoolsLogSnapshot): RecordedProviderRequ
  * Every recorded step with an input, in the order the log recorded them. Overlapping runs in one
  * workspace interleave (A0, B0, A1), and that order is the order the provider saw the requests.
  */
+/**
+ * With wire facts, the audit decides from them: a stream that failed after its OK response
+ * still created the cache entry the monitor observed. Without them (older binaries), a step
+ * that failed without usage is taken as rejected before Anthropic processed it.
+ */
+function isRejectedWithoutWireFacts(log: DevtoolsLogSnapshot, stepId: string): boolean {
+  return (
+    !log.stepPromptCacheWires.has(stepId) &&
+    log.failedStepIds.has(stepId) &&
+    log.stepUsageUpdates.get(stepId) == null
+  );
+}
+
 export function recordedStepsFromLog(log: DevtoolsLogSnapshot): RecordedStepRequest[] {
-  return log.stepsInLogOrder.flatMap(({ run, step }) =>
-    // A step that failed without usage never produced a cache read or write (aborted or
-    // rejected before Anthropic processed it), so like the runtime monitor it is not a request.
-    step.input == null ||
-    (log.failedStepIds.has(step.id) && log.stepUsageUpdates.get(step.id) == null)
+  return log.stepsInLogOrder.flatMap(({ run, step }) => {
+    const promptCacheWire = log.stepPromptCacheWires.get(step.id);
+    return step.input == null || isRejectedWithoutWireFacts(log, step.id)
       ? []
       : [
           {
@@ -214,9 +281,10 @@ export function recordedStepsFromLog(log: DevtoolsLogSnapshot): RecordedStepRequ
               ? { requestHistorySequence: run.requestHistorySequence }
               : {}),
             ...(run.contextEpoch != null ? { contextEpoch: run.contextEpoch } : {}),
+            ...(promptCacheWire != null ? { promptCacheWire } : {}),
           },
-        ]
-  );
+        ];
+  });
 }
 
 export async function readRecordedSteps(sessionDir: string): Promise<RecordedStepRequest[]> {

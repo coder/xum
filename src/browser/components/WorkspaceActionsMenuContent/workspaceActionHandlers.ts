@@ -1,5 +1,6 @@
 import type { RouterClient } from "@orpc/server";
 import type { AppRouter } from "@/node/orpc/router";
+import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { getErrorMessage } from "@/common/utils/errors";
 import { forkWorkspace } from "@/browser/utils/chatCommands";
 import type { RuntimeStatusStore } from "@/browser/stores/RuntimeStatusStore";
@@ -39,6 +40,13 @@ export async function stopWorkspaceRuntime(
   } catch (error) {
     return getErrorMessage(error);
   }
+}
+
+/** The sidebar owns title editing (TitleEditProvider), so both menus ask it by event. */
+export function requestGenerateWorkspaceTitle(workspaceId: string): void {
+  window.dispatchEvent(
+    createCustomEvent(CUSTOM_EVENTS.WORKSPACE_GENERATE_TITLE_REQUESTED, { workspaceId })
+  );
 }
 
 /** Where an action's error popover opens: just right of the element the user clicked. */

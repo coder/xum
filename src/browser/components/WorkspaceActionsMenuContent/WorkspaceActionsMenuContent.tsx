@@ -1,7 +1,9 @@
-import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
+import { formatKeybind, KEYBINDS, type Keybind } from "@/browser/utils/ui/keybinds";
 import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 import { WorkspaceTerminalIcon } from "../icons/WorkspaceTerminalIcon/WorkspaceTerminalIcon";
 import {
+  Eye,
+  EyeOff,
   GitBranch,
   HeartPulse,
   Maximize2,
@@ -11,17 +13,99 @@ import {
   Pin,
   PinOff,
   Server,
+  Sparkles,
   Square,
 } from "lucide-react";
 import React from "react";
+import {
+  getWorkspaceActionGroups,
+  type WorkspaceActionId,
+  type WorkspaceActionsState,
+} from "./workspaceActionItems";
+
+/** The menu passes the clicked row, so an error popover can anchor next to it. */
+export type WorkspaceActionHandlers = Partial<
+  Record<WorkspaceActionId, (anchorEl: HTMLElement) => void>
+>;
+
+interface ActionRow {
+  label: string;
+  icon: React.ReactNode;
+  keybind?: Keybind;
+  testId?: string;
+}
+
+// One noun for every workspace kind, scratch chats included (#6202).
+const ACTION_ROWS: Record<WorkspaceActionId, ActionRow> = {
+  editTitle: {
+    label: "Edit workspace title",
+    icon: <Pencil />,
+    keybind: KEYBINDS.EDIT_WORKSPACE_TITLE,
+  },
+  generateTitle: {
+    label: "Generate new title",
+    icon: <Sparkles />,
+    keybind: KEYBINDS.GENERATE_WORKSPACE_TITLE,
+  },
+  configureMcp: {
+    label: "Configure MCP servers",
+    icon: <Server />,
+    keybind: KEYBINDS.CONFIGURE_MCP,
+    testId: "workspace-mcp-button",
+  },
+  configureHeartbeat: {
+    label: "Configure heartbeat",
+    icon: <HeartPulse />,
+    keybind: KEYBINDS.CONFIGURE_HEARTBEAT,
+  },
+  configureMessaging: {
+    label: "Messages from other workspaces",
+    icon: <MessagesSquare />,
+    keybind: KEYBINDS.CONFIGURE_UNRELATED_MESSAGING,
+    testId: "workspace-unrelated-messaging-button",
+  },
+  immersiveReview: {
+    label: "Immersive review",
+    icon: <Maximize2 />,
+    keybind: KEYBINDS.TOGGLE_REVIEW_IMMERSIVE,
+  },
+  touchFullscreenReview: { label: "Mobile full-screen review", icon: <Maximize2 /> },
+  // One row for the whole sidebar, not one per tool, so the menu does not grow with every
+  // sidebar tab: the sidebar's own New tab launcher lists the tools.
+  openSidebar: { label: "Sidebar", icon: <PanelRight />, testId: "workspace-open-sidebar" },
+  openTerminal: {
+    label: "New terminal",
+    icon: <WorkspaceTerminalIcon />,
+    keybind: KEYBINDS.OPEN_TERMINAL,
+    testId: "workspace-terminal-button",
+  },
+  togglePinned: { label: "Pin workspace", icon: <Pin />, keybind: KEYBINDS.PIN_WORKSPACE },
+  markUnread: { label: "Mark unread", icon: <EyeOff /> },
+  toggleSubAgents: { label: "Show sub-agents", icon: <Eye /> },
+  fork: { label: "Fork workspace", icon: <GitBranch /> },
+  stopRuntime: { label: "Stop container", icon: <Square /> },
+  archive: {
+    label: "Archive workspace",
+    icon: <ArchiveIcon />,
+    keybind: KEYBINDS.ARCHIVE_WORKSPACE,
+  },
+};
+
+// The toggle rows while they are on.
+const UNPIN_ROW: ActionRow = {
+  ...ACTION_ROWS.togglePinned,
+  label: "Unpin workspace",
+  icon: <PinOff />,
+};
+const HIDE_SUB_AGENTS_ROW: ActionRow = { label: "Hide sub-agents", icon: <EyeOff /> };
+// Sidebar rows: the menu bar handles these shortcuts for the SELECTED workspace, so a hint in
+// another row's menu would promise the wrong target (Codex on #6301).
+const SIDEBAR_MCP_ROW: ActionRow = { ...ACTION_ROWS.configureMcp, keybind: undefined };
+const SIDEBAR_MESSAGING_ROW: ActionRow = { ...ACTION_ROWS.configureMessaging, keybind: undefined };
 
 interface WorkspaceActionButtonProps {
-  label: string;
-  shortcut?: string;
-  shortcutClassName?: string;
-  icon: React.ReactNode;
+  row: ActionRow;
   onClick: (e: React.MouseEvent<HTMLButtonElement>) => void;
-  testId?: string;
 }
 
 function WorkspaceActionButton(props: WorkspaceActionButtonProps) {
@@ -32,18 +116,19 @@ function WorkspaceActionButton(props: WorkspaceActionButtonProps) {
       // focus:bg-hover marks the row the arrow keys reached, like the hover state (#6103).
       className="text-content-secondary bg-surface-primary hover:bg-hover focus:bg-hover block w-full rounded-sm px-2 py-1.5 text-left text-xs whitespace-nowrap outline-none"
       onClick={props.onClick}
-      data-testid={props.testId}
+      data-testid={props.row.testId}
     >
       <span className="flex items-center gap-2">
-        <span className="h-3 w-3 shrink-0 [&_svg]:h-3 [&_svg]:w-3">{props.icon}</span>
+        <span className="h-3 w-3 shrink-0 [&_svg]:h-3 [&_svg]:w-3 [&_svg]:shrink-0">
+          {props.row.icon}
+        </span>
         {/* Label truncates and the shortcut never shrinks, so a narrow menu cannot
             push the shortcut outside the row. */}
-        <span className="min-w-0 truncate">{props.label}</span>
-        {props.shortcut && (
-          <span
-            className={`text-muted ml-auto shrink-0 pl-2 text-[10px] ${props.shortcutClassName ?? ""}`}
-          >
-            ({props.shortcut})
+        <span className="min-w-0 truncate">{props.row.label}</span>
+        {props.row.keybind && (
+          // Phones have no keyboard: both menus hide the hints there.
+          <span className="text-muted mobile-hide-shortcut-hints ml-auto shrink-0 pl-2 text-[10px]">
+            ({formatKeybind(props.row.keybind)})
           </span>
         )}
       </span>
@@ -52,204 +137,66 @@ function WorkspaceActionButton(props: WorkspaceActionButtonProps) {
 }
 
 interface WorkspaceActionsMenuContentProps {
-  /** Workspace title actions only make sense in the left sidebar where title text is visible. */
-  onEditTitle?: (() => void) | null;
-  /** Workspace-level settings action currently surfaced from the workspace menu bar. */
-  onConfigureMcp?: (() => void) | null;
-  /** Experiment-gated workspace heartbeat settings action. */
-  onConfigureHeartbeat?: (() => void) | null;
-  /** Recipient consent for discovery/messages from unrelated workspaces (menu bar only). */
-  onConfigureUnrelatedMessaging?: (() => void) | null;
-  /** Mobile workspace-header action: open immersive review in full-screen touch mode. */
-  onOpenTouchFullscreenReview?: (() => void) | null;
-  onEnterImmersiveReview?: (() => void) | null;
-  /**
-   * Small viewports only: show the hidden right sidebar full-screen. One row for the whole
-   * sidebar, not one per tool, so the menu does not grow with every sidebar tab: the sidebar's
-   * own New tab launcher lists the tools.
-   */
-  onOpenSidebar?: (() => void) | null;
-  /** Touch phones only: the header row carries Stats and Artifacts there, so New terminal moves here. */
-  onOpenTerminal?: (() => void) | null;
-  onStopRuntime?: (() => void) | null;
-  onForkChat?: ((anchorEl: HTMLElement) => void) | null;
-  /** Pin/unpin toggle; pass null on sub-agent rows (only root chats are pinnable). */
-  onTogglePinned?: (() => void) | null;
-  isPinned?: boolean;
-  onArchiveChat?: ((anchorEl: HTMLElement) => void) | null;
+  /** Decides which rows show; see getWorkspaceActionGroups. */
+  state: WorkspaceActionsState;
+  /** A row shows only when its caller wires a handler (stories may leave some out). */
+  actions: WorkspaceActionHandlers;
+  isPinned: boolean;
+  /** Sidebar rows: completed sub-agents are shown now. */
+  subAgentsExpanded?: boolean;
   onCloseMenu: () => void;
-  shortcutClassName?: string;
-  configureMcpTestId?: string;
+}
+
+/** The rows the menu renders: the shared gating, minus rows the caller did not wire. */
+export function getShownWorkspaceActionGroups(
+  state: WorkspaceActionsState,
+  actions: WorkspaceActionHandlers
+): WorkspaceActionId[][] {
+  return getWorkspaceActionGroups(state)
+    .map((group) => group.filter((id) => actions[id] != null))
+    .filter((group) => group.length > 0);
+}
+
+function getActionRow(id: WorkspaceActionId, props: WorkspaceActionsMenuContentProps): ActionRow {
+  if (id === "togglePinned" && props.isPinned) return UNPIN_ROW;
+  if (id === "toggleSubAgents" && props.subAgentsExpanded === true) return HIDE_SUB_AGENTS_ROW;
+  if (props.state.surface === "sidebar") {
+    if (id === "configureMcp") return SIDEBAR_MCP_ROW;
+    if (id === "configureMessaging") return SIDEBAR_MESSAGING_ROW;
+  }
+  return ACTION_ROWS[id];
 }
 
 /**
  * Shared menu content for workspace actions, used by both sidebar rows and the workspace menu bar.
- * Keeping these actions centralized prevents menu drift between entry points.
+ * Both menus take their rows from getWorkspaceActionGroups, so the two entry points cannot drift.
+ * It renders only while its popover is open, so the gating runs only then.
  */
 export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentProps> = (props) => {
+  const groups = getShownWorkspaceActionGroups(props.state, props.actions);
   return (
     // No menu role on purpose: the menu/menuitem pattern also requires roving Tab focus and
     // changes how the sidebar row's long-press handling sees this portal. The Radix Popover
     // stays a dialog of buttons, and the arrow keys are an extra on top of Tab (#6103).
     <div onKeyDown={handleRowArrowKeys}>
-      {props.onEditTitle && (
-        <WorkspaceActionButton
-          label="Edit workspace title"
-          shortcut={formatKeybind(KEYBINDS.EDIT_WORKSPACE_TITLE)}
-          shortcutClassName={props.shortcutClassName}
-          icon={<Pencil className="h-3 w-3 shrink-0" />}
-          onClick={(e) => {
-            e.stopPropagation();
-            props.onCloseMenu();
-            props.onEditTitle?.();
-          }}
-        />
-      )}
-      {props.onConfigureMcp && (
-        <WorkspaceActionButton
-          label="Configure MCP servers"
-          shortcut={formatKeybind(KEYBINDS.CONFIGURE_MCP)}
-          shortcutClassName={props.shortcutClassName}
-          icon={<Server className="h-3 w-3 shrink-0" />}
-          onClick={(e) => {
-            e.stopPropagation();
-            props.onCloseMenu();
-            props.onConfigureMcp?.();
-          }}
-          testId={props.configureMcpTestId}
-        />
-      )}
-      {props.onConfigureHeartbeat && (
-        <WorkspaceActionButton
-          label="Configure heartbeat"
-          shortcut={formatKeybind(KEYBINDS.CONFIGURE_HEARTBEAT)}
-          shortcutClassName={props.shortcutClassName}
-          icon={<HeartPulse className="h-3 w-3 shrink-0" />}
-          onClick={(e) => {
-            e.stopPropagation();
-            props.onCloseMenu();
-            props.onConfigureHeartbeat?.();
-          }}
-        />
-      )}
-      {props.onConfigureUnrelatedMessaging && (
-        <WorkspaceActionButton
-          label="Messages from other workspaces"
-          shortcut={formatKeybind(KEYBINDS.CONFIGURE_UNRELATED_MESSAGING)}
-          shortcutClassName={props.shortcutClassName}
-          icon={<MessagesSquare className="h-3 w-3 shrink-0" />}
-          onClick={(e) => {
-            e.stopPropagation();
-            props.onCloseMenu();
-            props.onConfigureUnrelatedMessaging?.();
-          }}
-          testId="workspace-unrelated-messaging-button"
-        />
-      )}
-      {props.onOpenTouchFullscreenReview && (
-        <WorkspaceActionButton
-          label="Mobile full-screen review"
-          icon={<Maximize2 className="h-3 w-3 shrink-0" />}
-          onClick={(e) => {
-            e.stopPropagation();
-            props.onCloseMenu();
-            props.onOpenTouchFullscreenReview?.();
-          }}
-        />
-      )}
-      {props.onEnterImmersiveReview && (
-        <WorkspaceActionButton
-          label="Immersive review"
-          shortcut={formatKeybind(KEYBINDS.TOGGLE_REVIEW_IMMERSIVE)}
-          shortcutClassName={props.shortcutClassName}
-          icon={<Maximize2 className="h-3 w-3 shrink-0" />}
-          onClick={(e) => {
-            e.stopPropagation();
-            props.onCloseMenu();
-            props.onEnterImmersiveReview?.();
-          }}
-        />
-      )}
-      {props.onOpenSidebar && (
-        <WorkspaceActionButton
-          label="Sidebar"
-          icon={<PanelRight className="h-3 w-3 shrink-0" />}
-          onClick={(e) => {
-            e.stopPropagation();
-            props.onCloseMenu();
-            props.onOpenSidebar?.();
-          }}
-          testId="workspace-open-sidebar"
-        />
-      )}
-      {props.onOpenTerminal && (
-        <WorkspaceActionButton
-          label="New terminal"
-          shortcut={formatKeybind(KEYBINDS.OPEN_TERMINAL)}
-          shortcutClassName={props.shortcutClassName}
-          icon={<WorkspaceTerminalIcon className="h-3 w-3 shrink-0" />}
-          onClick={(e) => {
-            e.stopPropagation();
-            props.onCloseMenu();
-            props.onOpenTerminal?.();
-          }}
-          testId="workspace-terminal-button"
-        />
-      )}
-      {props.onStopRuntime && (
-        <WorkspaceActionButton
-          label="Stop container"
-          icon={<Square className="h-3 w-3 shrink-0" />}
-          onClick={(e) => {
-            e.stopPropagation();
-            props.onCloseMenu();
-            props.onStopRuntime?.();
-          }}
-        />
-      )}
-      {props.onForkChat && (
-        <WorkspaceActionButton
-          label="Fork workspace"
-          icon={<GitBranch className="h-3 w-3 shrink-0" />}
-          onClick={(e) => {
-            e.stopPropagation();
-            props.onCloseMenu();
-            props.onForkChat?.(e.currentTarget);
-          }}
-        />
-      )}
-      {props.onTogglePinned && (
-        <WorkspaceActionButton
-          label={props.isPinned ? "Unpin workspace" : "Pin workspace"}
-          shortcut={formatKeybind(KEYBINDS.PIN_WORKSPACE)}
-          shortcutClassName={props.shortcutClassName}
-          icon={
-            props.isPinned ? (
-              <PinOff className="h-3 w-3 shrink-0" />
-            ) : (
-              <Pin className="h-3 w-3 shrink-0" />
-            )
-          }
-          onClick={(e) => {
-            e.stopPropagation();
-            props.onCloseMenu();
-            props.onTogglePinned?.();
-          }}
-        />
-      )}
-      {props.onArchiveChat && (
-        <WorkspaceActionButton
-          label="Archive workspace"
-          shortcut={formatKeybind(KEYBINDS.ARCHIVE_WORKSPACE)}
-          shortcutClassName={props.shortcutClassName}
-          icon={<ArchiveIcon className="h-3 w-3 shrink-0" />}
-          onClick={(e) => {
-            e.stopPropagation();
-            props.onCloseMenu();
-            props.onArchiveChat?.(e.currentTarget);
-          }}
-        />
-      )}
+      {groups.map((group, groupIndex) => (
+        <React.Fragment key={group[0]}>
+          {groupIndex > 0 && (
+            <div role="separator" className="border-separator-light my-1 border-t" />
+          )}
+          {group.map((id) => (
+            <WorkspaceActionButton
+              key={id}
+              row={getActionRow(id, props)}
+              onClick={(e) => {
+                e.stopPropagation();
+                props.onCloseMenu();
+                props.actions[id]?.(e.currentTarget);
+              }}
+            />
+          ))}
+        </React.Fragment>
+      ))}
     </div>
   );
 };

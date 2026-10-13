@@ -1402,19 +1402,47 @@ async function copyIfExists(sourcePath: string, destinationPath: string): Promis
   }
 }
 
+/**
+ * Newest row timestamp in a workspace's history, or undefined when no row has one.
+ * A fork's copied rows end here: every row the fork writes later is newer.
+ */
+async function getNewestHistoryTimestamp(
+  historyService: HistoryService,
+  workspaceId: string
+): Promise<number | undefined> {
+  let newest: number | undefined;
+  // Full scan: idle compaction keeps an older recency timestamp, so rows are not
+  // timestamp-ordered and the tail alone cannot give the maximum.
+  const result = await historyService.iterateFullHistory(workspaceId, "forward", (messages) => {
+    for (const message of messages) {
+      const timestamp = message.metadata?.timestamp;
+      if (typeof timestamp === "number" && Number.isSafeInteger(timestamp)) {
+        newest = Math.max(newest ?? timestamp, timestamp);
+      }
+    }
+  });
+  if (!result.success) throw new Error(result.error);
+  return newest;
+}
+
 async function resetForkedSessionUsage(
+  historyService: HistoryService,
   sessionUsageService: SessionUsageService | undefined,
   workspaceId: string,
   sessionDir: string
 ): Promise<void> {
+  // After the history copy, truncation and partial snapshot: the fork boundary is the
+  // newest copied row, not the reset time, so a first turn in the same millisecond as the
+  // reset still counts as the fork's own. No timestamped row: no marker (all turns shown).
+  const forkedAt = await getNewestHistoryTimestamp(historyService, workspaceId);
   if (sessionUsageService) {
-    await sessionUsageService.resetSessionUsage(workspaceId);
+    await sessionUsageService.resetSessionUsage(workspaceId, forkedAt);
     return;
   }
 
   await fsPromises.writeFile(
     path.join(sessionDir, "session-usage.json"),
-    JSON.stringify({ byModel: {}, version: 1 }, null, 2)
+    JSON.stringify({ byModel: {}, version: 1, forkedAt }, null, 2)
   );
 }
 
@@ -14193,7 +14221,12 @@ export class WorkspaceService
         // Forks inherit chat history, but their cost ledger must start fresh.
         // Persist an explicit empty usage file so later reads do not rebuild
         // historical costs from the copied messages.
-        await resetForkedSessionUsage(this.sessionUsageService, newWorkspaceId, newSessionDir);
+        await resetForkedSessionUsage(
+          this.historyService,
+          this.sessionUsageService,
+          newWorkspaceId,
+          newSessionDir
+        );
         // The plan is copied after the registration write below (#5175).
       } catch (copyError) {
         // Same ordering as abortForkRegistration below: background init still runs against this
@@ -14704,7 +14737,12 @@ export class WorkspaceService
         partialSnapshot,
         targetWorkspaceId: newWorkspaceId,
       });
-      await resetForkedSessionUsage(this.sessionUsageService, newWorkspaceId, newSessionDir);
+      await resetForkedSessionUsage(
+        this.historyService,
+        this.sessionUsageService,
+        newWorkspaceId,
+        newSessionDir
+      );
 
       const metadata: FrontendWorkspaceMetadata = {
         id: newWorkspaceId,

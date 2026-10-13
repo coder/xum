@@ -23,9 +23,22 @@ describe("WorkspaceActionsMenuContent keyboard navigation (#6103)", () => {
     const onArchiveChat = mock(() => undefined);
     const view = render(
       <WorkspaceActionsMenuContent
-        onConfigureMcp={onConfigureMcp}
-        onConfigureHeartbeat={onConfigureHeartbeat}
-        onArchiveChat={onArchiveChat}
+        state={{
+          surface: "topbar",
+          workspace: {},
+          showsSubAgent: false,
+          isRuntimeRunning: false,
+          isTouchMobileScreen: false,
+          isPhoneHeader: false,
+          isRightSidebarHidden: false,
+        }}
+        // Only these rows are wired, so only they render.
+        actions={{
+          configureMcp: onConfigureMcp,
+          configureHeartbeat: onConfigureHeartbeat,
+          archive: onArchiveChat,
+        }}
+        isPinned={false}
         onCloseMenu={() => undefined}
       />
     );
@@ -67,5 +80,54 @@ describe("WorkspaceActionsMenuContent keyboard navigation (#6103)", () => {
     // A focused <button> turns Enter into a click on itself.
     fireEvent.click(document.activeElement as HTMLElement);
     expect(onConfigureHeartbeat).toHaveBeenCalledTimes(1);
+  });
+});
+
+// The menu bar handles the MCP and messages shortcuts for the selected workspace, so only its own
+// menu may advertise them. A sidebar row's menu belongs to that row, which need not be selected.
+describe("WorkspaceActionsMenuContent shortcut hints per surface (#6202)", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  const common = { workspace: {}, showsSubAgent: false, isRuntimeRunning: false };
+  const surfaces = {
+    sidebar: { surface: "sidebar", ...common, canMarkUnread: false, canToggleSubAgents: false },
+    topbar: {
+      surface: "topbar",
+      ...common,
+      isTouchMobileScreen: false,
+      isPhoneHeader: false,
+      isRightSidebarHidden: false,
+    },
+  } as const;
+
+  test.each([
+    ["sidebar", false],
+    ["topbar", true],
+  ] as const)("%s menu shows the selected-workspace shortcut hints: %p", (surface, shown) => {
+    const noop = () => undefined;
+    const view = render(
+      <WorkspaceActionsMenuContent
+        state={surfaces[surface]}
+        actions={{ configureMcp: noop, configureMessaging: noop, archive: noop }}
+        isPinned={false}
+        onCloseMenu={noop}
+      />
+    );
+    const hintOf = (testId: string) =>
+      view.getByTestId(testId).querySelector(".mobile-hide-shortcut-hints") != null;
+    expect(hintOf("workspace-mcp-button")).toBe(shown);
+    expect(hintOf("workspace-unrelated-messaging-button")).toBe(shown);
+    // Archive acts on its own row's workspace in both menus, so it keeps its hint.
+    expect(view.getByRole("button", { name: /Archive workspace/ }).textContent).toContain("(");
   });
 });
