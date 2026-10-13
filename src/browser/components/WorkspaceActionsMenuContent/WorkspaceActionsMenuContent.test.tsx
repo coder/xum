@@ -23,9 +23,22 @@ describe("WorkspaceActionsMenuContent keyboard navigation (#6103)", () => {
     const onArchiveChat = mock(() => undefined);
     const view = render(
       <WorkspaceActionsMenuContent
-        onConfigureMcp={onConfigureMcp}
-        onConfigureHeartbeat={onConfigureHeartbeat}
-        onArchiveChat={onArchiveChat}
+        state={{
+          surface: "topbar",
+          workspace: {},
+          showsSubAgent: false,
+          isRuntimeRunning: false,
+          isTouchMobileScreen: false,
+          isPhoneHeader: false,
+          isRightSidebarHidden: false,
+        }}
+        // Only these rows are wired, so only they render.
+        actions={{
+          configureMcp: onConfigureMcp,
+          configureHeartbeat: onConfigureHeartbeat,
+          archive: onArchiveChat,
+        }}
+        isPinned={false}
         onCloseMenu={() => undefined}
       />
     );

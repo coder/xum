@@ -51,18 +51,15 @@ import {
   Trash,
   EllipsisVertical,
   Loader2,
-  Sparkles,
   PenLine,
   MessageCircleQuestionMark,
-  Eye,
-  EyeOff,
   ChevronDown,
   HeartPulse,
   Pin,
   Workflow,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
+import { isWorkspacePinned } from "@/common/utils/pin";
 import { WorkspaceStatusIndicator } from "../WorkspaceStatusIndicator/WorkspaceStatusIndicator";
 import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 import { WorkspaceTerminalIcon } from "../icons/WorkspaceTerminalIcon/WorkspaceTerminalIcon";
@@ -70,12 +67,10 @@ import {
   WORKSPACE_DRAG_TYPE,
   type WorkspaceDragItem,
 } from "../WorkspaceSectionDropZone/WorkspaceSectionDropZone";
-import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import type { PinnedDropEdge } from "@/browser/utils/ui/pinnedReorder";
 import { WorkspaceHeartbeatModal } from "../WorkspaceHeartbeatModal";
 import { WorkspaceActionsMenuContent } from "../WorkspaceActionsMenuContent/WorkspaceActionsMenuContent";
-import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
-import { useAPI } from "@/browser/contexts/API";
+import { requestGenerateWorkspaceTitle } from "../WorkspaceActionsMenuContent/workspaceActionHandlers";
 import { useWorkspaceActionsOptional } from "@/browser/contexts/WorkspaceContext";
 
 export interface WorkspaceSelection {
@@ -617,17 +612,10 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
   const runtimeStatus = useRuntimeStatus(workspaceId);
 
   // Get title edit context — manages inline title editing state across the sidebar
-  const {
-    editingWorkspaceId,
-    requestEdit,
-    confirmEdit,
-    cancelEdit,
-    generatingTitleWorkspaceIds,
-    wrapGenerateTitle,
-  } = useTitleEdit();
+  const { editingWorkspaceId, requestEdit, confirmEdit, cancelEdit, generatingTitleWorkspaceIds } =
+    useTitleEdit();
   const isGeneratingTitle = generatingTitleWorkspaceIds.has(workspaceId);
   const isPendingAutoTitle = metadata.pendingAutoTitle === true;
-  const { api } = useAPI();
   // Route pin toggles through the context wrapper: it applies an optimistic
   // pinnedAt (instant reorder on click) and works with mock API clients.
   // Optional because stories/tests render this row without WorkspaceProvider.
@@ -657,7 +645,6 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
       : workspaceTitle;
   const isEditing = editingWorkspaceId === workspaceId;
   const isPinned = isWorkspacePinned(metadata);
-  const isPinnable = isWorkspacePinnable(metadata);
   const [heartbeatModalOpen, setHeartbeatModalOpen] = useState(false);
   const overflowMenuButtonRef = useRef<HTMLButtonElement | null>(null);
   const overflowMenuFrameRef = useRef<number | null>(null);
@@ -1223,94 +1210,42 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                   }}
                 >
                   <WorkspaceActionsMenuContent
-                    onEditTitle={startEditing}
-                    // Heartbeats never fire for sub-agent workspaces.
-                    onConfigureHeartbeat={
-                      metadata.parentWorkspaceId == null ? () => setHeartbeatModalOpen(true) : null
-                    }
-                    onStopRuntime={
-                      isRuntimeRunning && onStopRuntime
-                        ? () =>
-                            void onStopRuntime(
-                              workspaceId,
-                              overflowMenuButtonRef.current ?? undefined
-                            )
-                        : null
-                    }
-                    // Scratch chats have no repo and the backend rejects
-                    // forking them, so hide the action instead of offering a
-                    // menu item that can only fail.
-                    onForkChat={
-                      hasWorkspaceRepository(metadata)
-                        ? (anchorEl) => {
-                            void onForkWorkspace(workspaceId, anchorEl);
-                          }
-                        : null
-                    }
-                    onTogglePinned={
-                      isPinnable && setWorkspacePinned
+                    state={{
+                      surface: "sidebar",
+                      workspace: metadata,
+                      showsSubAgent: isSubAgentRow,
+                      isRuntimeRunning,
+                      canMarkUnread: !isSelected && !isUnread,
+                      canToggleSubAgents: canToggleCompletedChildren,
+                    }}
+                    actions={{
+                      editTitle: startEditing,
+                      generateTitle: () => requestGenerateWorkspaceTitle(workspaceId),
+                      configureHeartbeat: () => setHeartbeatModalOpen(true),
+                      togglePinned: setWorkspacePinned
                         ? () => {
                             // Fire-and-forget: optimistic reorder happens synchronously
                             // inside setWorkspacePinned; errors are logged there.
                             void setWorkspacePinned(workspaceId, !isPinned);
                           }
-                        : null
-                    }
-                    isPinned={isPinned}
-                    onArchiveChat={
-                      isSubAgentRow
-                        ? null
-                        : (anchorEl) => {
-                            void onArchiveWorkspace(workspaceId, anchorEl);
-                          }
-                    }
-                    onCloseMenu={() => ctxMenu.close()}
-                    // Phones have no keyboard: hide the hints, as the menu bar does.
-                    shortcutClassName="mobile-hide-shortcut-hints"
-                  />
-                  {!isSelected && !isUnread && (
-                    <PositionedMenuItem
-                      icon={<EyeOff className="h-4 w-4 shrink-0" strokeWidth={1.8} />}
-                      label="Mark unread"
-                      onClick={() => {
-                        // Reset the read marker to epoch so existing activity is treated as unseen.
-                        updatePersistedState(getWorkspaceLastReadKey(workspaceId), 0);
-                        ctxMenu.close();
-                      }}
-                    />
-                  )}
-                  {canToggleCompletedChildren && (
-                    <PositionedMenuItem
-                      icon={
-                        isCompletedChildrenExpanded ? (
-                          <EyeOff className="h-4 w-4 shrink-0" strokeWidth={1.8} />
-                        ) : (
-                          <Eye className="h-4 w-4 shrink-0" strokeWidth={1.8} />
-                        )
-                      }
-                      label={isCompletedChildrenExpanded ? "Hide sub-agents" : "Show sub-agents"}
-                      onClick={() => {
-                        toggleCompletedChildren();
-                        ctxMenu.close();
-                      }}
-                    />
-                  )}
-                  <PositionedMenuItem
-                    icon={<Sparkles />}
-                    label="Generate new title"
-                    shortcut={formatKeybind(KEYBINDS.GENERATE_WORKSPACE_TITLE)}
-                    onClick={() => {
-                      ctxMenu.close();
-                      wrapGenerateTitle(workspaceId, () => {
-                        if (!api) {
-                          return Promise.resolve({
-                            success: false,
-                            error: "Not connected to server",
-                          });
-                        }
-                        return api.workspace.regenerateTitle({ workspaceId });
-                      });
+                        : undefined,
+                      // Reset the read marker to epoch so existing activity is treated as unseen.
+                      markUnread: () =>
+                        updatePersistedState(getWorkspaceLastReadKey(workspaceId), 0),
+                      toggleSubAgents: toggleCompletedChildren,
+                      fork: (anchorEl) => void onForkWorkspace(workspaceId, anchorEl),
+                      stopRuntime: onStopRuntime
+                        ? () =>
+                            void onStopRuntime(
+                              workspaceId,
+                              overflowMenuButtonRef.current ?? undefined
+                            )
+                        : undefined,
+                      archive: (anchorEl) => void onArchiveWorkspace(workspaceId, anchorEl),
                     }}
+                    isPinned={isPinned}
+                    subAgentsExpanded={isCompletedChildrenExpanded}
+                    onCloseMenu={() => ctxMenu.close()}
                   />
                 </PopoverContent>
               </Popover>

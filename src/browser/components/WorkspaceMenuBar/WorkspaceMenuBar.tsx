@@ -14,7 +14,7 @@ import {
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { cn } from "@/common/lib/utils";
-import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
+import { isWorkspacePinned } from "@/common/utils/pin";
 
 import { RIGHT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
 import {
@@ -71,7 +71,6 @@ import { useWorkspaceActions, useWorkspaceContext } from "@/browser/contexts/Wor
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { formatProjectHierarchyLabel } from "@/common/utils/subProjects";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
-import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import {
   NARROW_VIEWPORT_MAX_WIDTH_PX,
@@ -162,7 +161,6 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const workspaceEntry = workspaceMetadata.get(workspaceId);
   // Heartbeats never fire for sub-agent workspaces.
   const canConfigureHeartbeat = workspaceEntry?.parentWorkspaceId == null;
-  const hasRepository = hasWorkspaceRepository(workspaceEntry);
   // The workspace's metadata.projectName is the parent project (since worktrees
   // are owned by the top-most parent). When the workspace is scoped to a
   // sub-project we surface the hierarchy as "parent / child" so the menu bar
@@ -584,6 +582,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   // those controls and the MCP/editor/terminal buttons become unclickable.
   const isDesktop = isDesktopMode();
 
+  const workspaceIsPinned = workspaceEntry ? isWorkspacePinned(workspaceEntry) : false;
   // Mirror sidebar share/archive actions in the workspace menu bar for quick access.
   const moreActionsMenu = (
     <Popover open={moreMenuOpen} onOpenChange={setMoreMenuOpen}>
@@ -630,52 +629,35 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       >
         {/* Keep MCP configuration in the more actions menu to keep the workspace menu bar lean. */}
         <WorkspaceActionsMenuContent
-          onConfigureMcp={() => setMcpModalOpen(true)}
-          onConfigureHeartbeat={canConfigureHeartbeat ? () => setHeartbeatModalOpen(true) : null}
-          onConfigureUnrelatedMessaging={() => setUnrelatedMessagingWorkspaceId(workspaceId)}
-          onOpenTouchFullscreenReview={
-            hasRepository && isTouchMobileScreen ? handleOpenTouchFullscreenReview : null
-          }
-          onEnterImmersiveReview={
-            hasRepository && !isTouchMobileScreen ? handleEnterImmersiveReview : null
-          }
-          onOpenSidebar={
-            timelineSidebarHidden && onOpenSidebar != null
-              ? () => onOpenSidebar(moreActionsButtonRef.current)
-              : null
-          }
-          onOpenTerminal={isPhoneHeader ? handleOpenTerminal : null}
-          onStopRuntime={isRuntimeRunning ? () => void handleStopRuntime() : null}
-          // Scratch chats have no repo: review events are ignored by
-          // RightSidebar and fork is unsupported on the backend, so hide
-          // both instead of offering dead menu items.
-          onForkChat={
-            hasRepository
-              ? (anchorEl) => {
-                  void handleForkWorkspace(anchorEl);
-                }
-              : null
-          }
-          onTogglePinned={
-            workspaceEntry && isWorkspacePinnable(workspaceEntry)
-              ? () => {
-                  void setWorkspacePinned(workspaceId, !isWorkspacePinned(workspaceEntry));
-                }
-              : null
-          }
-          isPinned={workspaceEntry ? isWorkspacePinned(workspaceEntry) : false}
-          onArchiveChat={
-            workspaceEntry?.parentWorkspaceId != null
-              ? null
-              : (anchorEl) => {
-                  // handleArchiveChat runs preflight and opens a confirmation dialog
-                  // when streaming or untracked files are detected.
-                  void handleArchiveChat(anchorEl);
-                }
-          }
+          state={{
+            surface: "topbar",
+            workspace: workspaceEntry,
+            showsSubAgent: workspaceEntry?.parentWorkspaceId != null,
+            isRuntimeRunning,
+            isTouchMobileScreen,
+            isPhoneHeader,
+            isRightSidebarHidden: timelineSidebarHidden,
+          }}
+          actions={{
+            configureMcp: () => setMcpModalOpen(true),
+            configureHeartbeat: () => setHeartbeatModalOpen(true),
+            configureMessaging: () => setUnrelatedMessagingWorkspaceId(workspaceId),
+            immersiveReview: handleEnterImmersiveReview,
+            touchFullscreenReview: handleOpenTouchFullscreenReview,
+            openSidebar:
+              onOpenSidebar != null ? () => onOpenSidebar(moreActionsButtonRef.current) : undefined,
+            openTerminal: handleOpenTerminal,
+            togglePinned: () => {
+              void setWorkspacePinned(workspaceId, !workspaceIsPinned);
+            },
+            fork: (anchorEl) => void handleForkWorkspace(anchorEl),
+            stopRuntime: () => void handleStopRuntime(),
+            // Runs preflight and opens a confirmation dialog when streaming or untracked files
+            // are detected.
+            archive: (anchorEl) => void handleArchiveChat(anchorEl),
+          }}
+          isPinned={workspaceIsPinned}
           onCloseMenu={() => setMoreMenuOpen(false)}
-          shortcutClassName="mobile-hide-shortcut-hints"
-          configureMcpTestId="workspace-mcp-button"
         />
       </PopoverContent>
     </Popover>
