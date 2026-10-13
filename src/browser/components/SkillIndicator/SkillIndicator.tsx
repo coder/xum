@@ -1,4 +1,5 @@
 import React from "react";
+import { formatQualifiedSkillName } from "@/common/utils/agentSkills/skillLookupName";
 import { AlertTriangle, Check, CloudOff, EyeOff, XCircle } from "lucide-react";
 import { cn } from "@/common/lib/utils";
 import { SkillIcon } from "@/browser/components/icons/SkillIcon/SkillIcon";
@@ -45,8 +46,24 @@ interface SkillsPopoverContentProps {
   skillLoadErrors: SkillLoadError[];
 }
 
+/**
+ * Loaded skill names, with a qualified `<plugin>:<skill>` read folded onto the
+ * winning plugin skill that the list shows under its bare name.
+ */
+function getLoadedSkillNames(
+  loadedSkills: LoadedSkill[],
+  availableSkills: InvocableSkill[]
+): Set<string> {
+  const names = new Set(loadedSkills.map((skill) => skill.name));
+  for (const skill of availableSkills) {
+    if (skill.pluginName == null) continue;
+    if (names.delete(formatQualifiedSkillName(skill.pluginName, skill.name))) names.add(skill.name);
+  }
+  return names;
+}
+
 const SkillsPopoverContent: React.FC<SkillsPopoverContentProps> = (props) => {
-  const loadedSkillNames = new Set(props.loadedSkills.map((skill) => skill.name));
+  const loadedSkillNames = getLoadedSkillNames(props.loadedSkills, props.availableSkills);
 
   const skillsByScope = new Map<AgentSkillScope, InvocableSkill[]>();
   for (const skill of props.availableSkills) {
@@ -207,7 +224,7 @@ const SkillsPopoverContent: React.FC<SkillsPopoverContentProps> = (props) => {
  * Hover to preview skills organized by scope (Project, Global, Built-in); click to pin the list open.
  */
 export const SkillIndicator: React.FC<SkillIndicatorProps> = (props) => {
-  const loadedCount = props.loadedSkills.length;
+  const loadedCount = getLoadedSkillNames(props.loadedSkills, props.availableSkills).size;
   const totalCount = props.availableSkills.length;
   const invalidCount = props.invalidSkills?.length ?? 0;
   const unavailableCount = props.unavailableSources?.length ?? 0;

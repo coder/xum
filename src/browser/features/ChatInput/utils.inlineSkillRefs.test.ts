@@ -78,6 +78,18 @@ describe("parseCommandWithSkillInvocation", () => {
     expect(result.skillInvocation?.descriptor.name).toBe("tdd");
   });
 
+  test("a typed /pstack:tdd selects the plugin skill that won its bare name", async () => {
+    const result = await parseCommandWithSkillInvocation({
+      messageText: "/pstack:tdd now",
+      agentSkillDescriptors: [{ ...descriptor("tdd"), pluginName: "pstack" }],
+      api: null,
+      discovery: null,
+    });
+
+    // One identity per skill: the indicator and snapshots keep the listed bare name.
+    expect(result.skillInvocation?.descriptor.name).toBe("tdd");
+  });
+
   test("a typed /pstack:tdd keeps the qualified name through the remote fallback", async () => {
     // The backend package carries the bare frontmatter name; `tdd` alone could load another skill.
     const api = createTestApiClient({

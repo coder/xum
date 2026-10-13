@@ -8,7 +8,10 @@ import {
 } from "@/browser/utils/agentSkills/inlineSkillReferences";
 import { resolveSkillUserInvocable } from "@/common/orpc/schemas/agentSkill";
 import type { InvocableSkill } from "@/common/types/agentSkill";
-import { resolveSkillReadIdentity } from "@/common/utils/agentSkills/skillLookupName";
+import {
+  findInvocableSkill,
+  resolveSkillReadIdentity,
+} from "@/common/utils/agentSkills/skillLookupName";
 import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
 import {
   buildMcpPromptBaseKey,
@@ -240,8 +243,9 @@ async function resolveSkillInvocation(options: {
 
   // user-invocable: false skills must be treated as nonexistent for typed /skill-name
   // invocation (they remain model-invocable via agent_skill_read).
-  let skill: InvocableSkill | undefined = options.agentSkillDescriptors.find(
-    (candidate) => candidate.name === command && candidate.userInvocable !== false
+  let skill: InvocableSkill | undefined = findInvocableSkill(
+    options.agentSkillDescriptors.filter((candidate) => candidate.userInvocable !== false),
+    command
   );
 
   if (!skill && options.api && options.discovery) {

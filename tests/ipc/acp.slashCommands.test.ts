@@ -38,6 +38,21 @@ describe("ACP slash command support", () => {
     },
   ];
 
+  it("resolves /<plugin>:<skill> for a plugin skill that won its bare name", () => {
+    const pluginSkill: AgentSkillDescriptor = {
+      name: "plug-tdd",
+      description: "Plugin skill",
+      scope: "global",
+      pluginName: "pstack",
+    };
+    const parsed = parseAcpSlashCommand("/pstack:plug-tdd now", mapSkillsByName([pluginSkill]));
+    expect(parsed).toMatchObject({ kind: "skill", descriptor: { name: "plug-tdd" } });
+    // The alias is a lookup only: the advertised command list stays bare.
+    expect(buildAcpAvailableCommands([pluginSkill]).map((command) => command.name)).not.toContain(
+      "pstack:plug-tdd"
+    );
+  });
+
   it("builds ACP available command list with server commands and user-invocable skills", () => {
     const availableCommands = buildAcpAvailableCommands(skills);
     const commandNames = availableCommands.map((command) => command.name);

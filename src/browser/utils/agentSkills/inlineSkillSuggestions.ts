@@ -27,6 +27,9 @@ export function getInlineSkillSuggestions(
 ): SlashSuggestion[] {
   const skills = context.descriptors
     .filter((descriptor) => descriptor.userInvocable !== false)
+    // The inline `$` parser reads bare names only, so a qualified suggestion
+    // would be dropped on send.
+    .filter((descriptor) => !descriptor.name.includes(":"))
     .filter((descriptor) => matchesNameBySegmentPrefix(descriptor.name, context.partial))
     .map((descriptor) => ({
       id: `inline-skill:${descriptor.name}`,

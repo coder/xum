@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
-import { listInvocableSkills, parseSkillLookupName } from "./skillLookupName";
+import { findInvocableSkill, listInvocableSkills, parseSkillLookupName } from "./skillLookupName";
 
 describe("parseSkillLookupName", () => {
   test.each([
@@ -48,5 +48,21 @@ describe("listInvocableSkills", () => {
       "other:tdd",
       "pstack:tdd",
     ]);
+  });
+});
+
+describe("findInvocableSkill", () => {
+  const skills = [
+    { name: "tdd", pluginName: "pstack" },
+    { name: "review" },
+    { name: "other:review", pluginName: "other" },
+  ];
+
+  test("a qualified name also selects the plugin skill that won its bare name", () => {
+    expect(findInvocableSkill(skills, "pstack:tdd")).toBe(skills[0]);
+    expect(findInvocableSkill(skills, "other:review")).toBe(skills[2]);
+    // `review` is not a plugin skill, and `nope` is no plugin.
+    expect(findInvocableSkill(skills, "pstack:review")).toBeUndefined();
+    expect(findInvocableSkill(skills, "nope:tdd")).toBeUndefined();
   });
 });
