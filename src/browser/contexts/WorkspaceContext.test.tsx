@@ -35,6 +35,7 @@ import { resetWorkspaceStorageGcForTests } from "@/browser/utils/workspaceStorag
 import { resetCreationDraftStorageGcForTests } from "@/browser/utils/creationDraftStorageGc";
 
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { createConnectionHarness, GAP_MODES, type GapMode } from "./connection.testHarness";
 import * as path from "path";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: drafts run against the real backend service
 import { Config } from "@/node/config";
@@ -961,6 +962,43 @@ describe("WorkspaceContext", () => {
 
     expect(workspaceApi.remove).toHaveBeenCalledWith({ workspaceId: "parent", options });
     expect(result).toEqual(failure);
+  });
+
+  // useAPI() keeps the last client while reconnecting (kept-gap). The handlers must still see
+  // "offline": they return their result and do not call the lost connection.
+  describe.each([...GAP_MODES])("handlers while the connection is down (%s)", (mode) => {
+    test("return their offline result without calling the server", async () => {
+      const { workspace: workspaceApi } = createMockAPI();
+      const contexts = await setupWithConnection(mode);
+      await contexts.harness.drop();
+
+      const notConnected = { success: false, error: "API not connected" };
+      await act(async () => {
+        expect(await contexts.workspace().archiveWorkspace("ws-1")).toEqual(notConnected);
+        expect(await contexts.workspace().unarchiveWorkspace("ws-1")).toEqual(notConnected);
+        expect(await contexts.workspace().updateWorkspaceTitle("ws-1", "next")).toEqual(
+          notConnected
+        );
+        expect(await contexts.workspace().setWorkspacePinned("ws-1", true)).toEqual(notConnected);
+        expect(await contexts.workspace().removeWorkspace("ws-1")).toEqual(notConnected);
+        expect(await contexts.workspace().getWorkspaceInfo("ws-1")).toBeNull();
+        expect(
+          await contexts.project().assignWorkspaceToSubProject("/alpha", "ws-1", null)
+        ).toEqual(notConnected);
+        expect(await contexts.project().updateDisplayName("/alpha", "A")).toEqual(notConnected);
+        expect(await contexts.project().getSecrets("/alpha")).toEqual([]);
+        await expect(
+          contexts.workspace().createWorkspace("/alpha", "branch", "main")
+        ).rejects.toThrow("API not connected");
+      });
+      expect(workspaceApi.archive).not.toHaveBeenCalled();
+      expect(workspaceApi.unarchive).not.toHaveBeenCalled();
+      expect(workspaceApi.updateTitle).not.toHaveBeenCalled();
+      expect(workspaceApi.setPinned).not.toHaveBeenCalled();
+      expect(workspaceApi.remove).not.toHaveBeenCalled();
+      expect(workspaceApi.getInfo).not.toHaveBeenCalled();
+      expect(workspaceApi.create).not.toHaveBeenCalled();
+    });
   });
 
   describe("archiveWorkspace", () => {
@@ -2354,6 +2392,32 @@ function createDraftServiceClient(service: DraftService): TestApiOverrides<APICl
       })();
     },
   };
+}
+
+/** Like setupWithProjectContext(), over a connection the test drops (connection.testHarness). */
+async function setupWithConnection(mode: GapMode) {
+  const harness = createConnectionHarness(mode, () => currentClientMock);
+  const workspaceRef = { current: null as WorkspaceContext | null };
+  const projectRef = { current: null as ReturnType<typeof useProjectContext> | null };
+  function ContextCapture() {
+    workspaceRef.current = useWorkspaceContext();
+    projectRef.current = useProjectContext();
+    return null;
+  }
+  render(
+    <harness.Wrapper>
+      <RouterProvider>
+        <ProjectProvider>
+          <WorkspaceProvider>
+            <ContextCapture />
+          </WorkspaceProvider>
+        </ProjectProvider>
+      </RouterProvider>
+    </harness.Wrapper>
+  );
+  getWorkspaceStoreRaw().setClient(harness.client);
+  await waitFor(() => expect(workspaceRef.current?.loading).toBe(false));
+  return { harness, workspace: () => workspaceRef.current!, project: () => projectRef.current! };
 }
 
 async function setup() {
