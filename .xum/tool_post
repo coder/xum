@@ -26,3 +26,8 @@ if [[ "$XUM_TOOL" == file_edit_* ]]; then
       ;;
   esac
 fi
+
+# CRAP gate report after agent `git commit` / `git push` (warn mode only).
+if [[ "$XUM_TOOL" == "bash" ]]; then
+  "${0%/*}/../scripts/crap/agent-gate.sh" post
+fi

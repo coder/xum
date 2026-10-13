@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { buildGoalBudgetLimitMessage, buildGoalContinuationMessage } from "./goalPrompts";
+import {
+  buildGoalBudgetLimitMessage,
+  buildGoalContinuationMessage,
+  synthesizeSilentContinuationSummary,
+} from "./goalPrompts";
+import { SILENT_CONTINUATION_COMPLETION_SUMMARY_FALLBACK } from "./goals";
 import type { GoalRecordV1 } from "@/common/types/goal";
 
 function goal(overrides: Partial<GoalRecordV1> = {}): GoalRecordV1 {
@@ -95,6 +100,40 @@ describe("buildGoalBudgetLimitMessage", () => {
   test("fails fast for non-budget-limited goals", () => {
     expect(() => buildGoalBudgetLimitMessage(goal({ status: "active" }))).toThrow(
       "goal budget-limit prompt requires a budget-limited goal"
+    );
+  });
+});
+
+describe("synthesizeSilentContinuationSummary", () => {
+  const text = (value: string) => ({ type: "text" as const, text: value });
+  const tool = {
+    type: "dynamic-tool" as const,
+    toolCallId: "call-1",
+    toolName: "bash",
+    state: "output-available" as const,
+    input: {},
+    output: {},
+  };
+
+  // Streamed replies arrive as one text part per delta (bug bash: summaries of "?" and "iku.").
+  test("joins the streamed chunks of the final text block", () => {
+    expect(
+      synthesizeSilentContinuationSummary([text("Here is a ha"), text("iku."), text(" Done?")])
+    ).toBe("Here is a haiku. Done?");
+  });
+
+  test("uses the last text block, not text before a tool call", () => {
+    expect(
+      synthesizeSilentContinuationSummary([text("Checking"), tool, text("All "), text("done.")])
+    ).toBe("All done.");
+  });
+
+  test("skips a whitespace-only final block and falls back without text", () => {
+    expect(
+      synthesizeSilentContinuationSummary([text("Fin"), text("ished"), tool, text("  ")])
+    ).toBe("Finished");
+    expect(synthesizeSilentContinuationSummary([tool])).toBe(
+      SILENT_CONTINUATION_COMPLETION_SUMMARY_FALLBACK
     );
   });
 });

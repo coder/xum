@@ -497,8 +497,23 @@ test.each([
     expect(refusal).toContain("ANTHROPIC_API_KEY");
     expect(refusal).toContain(`127.0.0.1:9 (HTTP ${status})`);
     expect(refusal).not.toMatch(/\/v1|sk-run-test/);
+    // A 403 can also mean the key may not use the probed model (#6094 item 13): name the model
+    // and the variable that picks it. A mock run probes an explorer model, else the app model.
+    if (status === 403) {
+      expect(refusal).toContain("claude-haiku-4-5");
+      expect(refusal).toContain("BUGBASH_APP_MODEL");
+    }
   }
 );
+
+test("#6094 item 13: a 403 on a mock run's probe names the explorer model and BUGBASH_MODELS", async () => {
+  const { deps, lines } = fakeLaunch(() => ({ code: 0, cleanup: "removed" }), 403);
+  const stop = new AbortController().signal;
+  expect(await runBugBash([...charters("a")], { ...ENV, BUGBASH_AI: "mock" }, stop, deps)).toBe(2);
+  const refusal = lines.find((line) => line.startsWith("make bug-bash:"))!;
+  expect(refusal).toContain("claude-sonnet-5-5");
+  expect(refusal).toContain("BUGBASH_MODELS");
+});
 
 test("U5: a rejection seen only in the probe's record (an unreadable 401 body) refuses too", async () => {
   const { deps, calls, lines } = fakeLaunch(() => ({ code: 0, cleanup: "removed" }));

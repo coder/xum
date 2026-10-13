@@ -55,6 +55,7 @@ export function valueExceedsDepth(value: unknown, limit = MAX_TOOL_PAYLOAD_JSON_
   const stack: Array<{ value: object; depth: number }> = [];
   if (typeof value === "object" && value !== null) stack.push({ value, depth: 1 });
   while (stack.length > 0) {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     const { value: container, depth } = stack.pop()!;
     if (depth > limit) return true;
     const children: unknown[] = Array.isArray(container)

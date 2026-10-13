@@ -13,6 +13,7 @@ import * as fs from "node:fs/promises";
 import { describe, expect, test } from "bun:test";
 import { tool, type Tool } from "ai";
 import { z } from "zod";
+import type { DevToolsStep } from "@/common/types/devtools";
 import { createMuxMessage } from "@/common/types/message";
 import { TOOL_SEARCH_TOOL_NAME } from "@/common/utils/tools/toolCatalog";
 import { DisposableTempDir } from "@/node/services/tempDir";
@@ -27,6 +28,7 @@ import {
 } from "./replayFixture";
 import {
   collectFullHistory,
+  readRecordedSteps,
   replayVerifySession,
   type ReplayVerifySessionResult,
 } from "./replayVerify";
@@ -93,6 +95,233 @@ describe("replayVerifySession pairing", () => {
     // actually be model-visible in the recorded request.
     const devtoolsRaw = ctx.devtoolsLines.join("\n");
     expect(devtoolsRaw).toContain("1. do the thing");
+  });
+
+  test("the prefix rule checks every recorded step, not only each turn's first", async () => {
+    using tmp = new DisposableTempDir("replay-verify-step-prefix");
+    const ctx = createReplayFixtureSessionContext(tmp.path);
+    for (const userText of ["First.", "Second."]) {
+      await appendReplayFixtureTurn(ctx, {
+        userText,
+        assistantText: "Done.",
+        systemPrompt: SYSTEM_PROMPT,
+        tools: tools(),
+      });
+    }
+    // Record a tool step inside turn 1 that chat.jsonl does not keep, so the
+    // turn 2 rebuild drops it: each run's first request still verifies, but
+    // turn 2 no longer extends turn 1's last step.
+    const [, firstStepLine] = ctx.devtoolsLines;
+    const firstStep = (JSON.parse(firstStepLine) as { step: DevToolsStep }).step;
+    const firstPrompt = firstStep.input?.prompt as unknown[];
+    const toolCall = { type: "tool-call", toolCallId: "t1", toolName: "bash", input: {} };
+    // Insert it where it was sent: after turn 1's first step, before turn 2's run.
+    ctx.devtoolsLines.splice(
+      2,
+      0,
+      JSON.stringify({
+        type: "step",
+        step: {
+          ...firstStep,
+          id: "step-1b",
+          stepNumber: 1,
+          input: {
+            ...firstStep.input,
+            prompt: [...firstPrompt, { role: "assistant", content: [toolCall] }],
+          },
+        },
+      })
+    );
+
+    const result = await verify(ctx);
+    expect(result.turns.map((turn) => turn.status)).toEqual(["PASS", "PASS"]);
+    expect(result.stepPrefix.comparedPairs).toBe(2);
+    expect(result.stepPrefix.breaks).toMatchObject([
+      {
+        runId: "run-2",
+        stepNumber: 0,
+        boundary: "turn",
+        comparison: {
+          section: "messages",
+          previous: { role: "assistant", type: "tool-call", toolName: "bash" },
+          next: { role: "assistant", type: "text" },
+        },
+      },
+    ]);
+  });
+
+  test("the step audit keeps the log order of overlapping runs", async () => {
+    using tmp = new DisposableTempDir("replay-verify-step-order");
+    const ctx = createReplayFixtureSessionContext(tmp.path);
+    for (const userText of ["First.", "Second."]) {
+      await appendReplayFixtureTurn(ctx, {
+        userText,
+        assistantText: "Done.",
+        systemPrompt: SYSTEM_PROMPT,
+        tools: tools(),
+      });
+    }
+    // Run 1 sends a later step after run 2 started: the log order is A0, B0, A1.
+    const [, firstStepLine] = ctx.devtoolsLines;
+    const firstStep = (JSON.parse(firstStepLine) as { step: DevToolsStep }).step;
+    ctx.devtoolsLines.push(
+      JSON.stringify({ type: "step", step: { ...firstStep, id: "step-1b", stepNumber: 1 } })
+    );
+    await flushReplayFixtureDevtools(ctx);
+
+    const steps = await readRecordedSteps(ctx.sessionDir);
+    expect(steps.map((step) => `${step.runId}:${step.stepNumber}`)).toEqual([
+      "run-1:0",
+      "run-2:0",
+      "run-1:1",
+    ]);
+  });
+
+  test("a compact-agent turn without a compaction request row is skipped", async () => {
+    using tmp = new DisposableTempDir("replay-verify-compact-agent");
+    const ctx = createReplayFixtureSessionContext(tmp.path);
+    await appendReplayFixtureTurn(ctx, {
+      userText: "First.",
+      assistantText: "Done.",
+      systemPrompt: SYSTEM_PROMPT,
+      tools: tools(),
+    });
+    // The resume path runs the compact agent (another system prompt) with no request row.
+    await appendReplayFixtureTurn(ctx, {
+      userText: "Summarize.",
+      assistantText: "Summary.",
+      agentId: "compact",
+      systemPrompt: "You are running a compaction pass.",
+      tools: tools(),
+    });
+    await appendReplayFixtureTurn(ctx, {
+      userText: "Next.",
+      assistantText: "Done.",
+      systemPrompt: SYSTEM_PROMPT,
+      tools: tools(),
+    });
+
+    const result = await verify(ctx);
+    // The compact run is skipped and resets the baseline, so nothing is compared or broken.
+    expect(result.stepPrefix).toMatchObject({ comparedPairs: 0, breaks: [] });
+  });
+
+  test("a headless run without a request sequence is skipped by the step audit", async () => {
+    using tmp = new DisposableTempDir("replay-verify-headless");
+    const ctx = createReplayFixtureSessionContext(tmp.path);
+    for (const userText of ["First.", "Second."]) {
+      await appendReplayFixtureTurn(ctx, {
+        userText,
+        assistantText: "Done.",
+        systemPrompt: SYSTEM_PROMPT,
+        tools: tools(),
+      });
+    }
+    // A side call (for example a branch summary) logs its own run between the turns, without a
+    // request sequence and with another prompt.
+    const [runLine, firstStepLine] = ctx.devtoolsLines;
+    const run = (JSON.parse(runLine) as { run: { requestHistorySequence?: number } }).run;
+    const step = (JSON.parse(firstStepLine) as { step: DevToolsStep }).step;
+    const { requestHistorySequence: _seq, ...headlessRun } = { ...run, id: "headless-1" };
+    ctx.devtoolsLines.splice(
+      2,
+      0,
+      JSON.stringify({ type: "run", run: headlessRun }),
+      JSON.stringify({
+        type: "step",
+        step: {
+          ...step,
+          id: "headless-step",
+          runId: "headless-1",
+          input: {
+            ...step.input,
+            prompt: [{ role: "user", content: [{ type: "text", text: "Summarize." }] }],
+          },
+        },
+      })
+    );
+
+    const result = await verify(ctx);
+    // The two chat runs are compared with each other; the side call breaks nothing.
+    expect(result.stepPrefix).toMatchObject({ comparedPairs: 1, breaks: [] });
+  });
+
+  test("a healed duplicate run header keeps the first header and its steps", async () => {
+    using tmp = new DisposableTempDir("replay-verify-duplicate-run");
+    const ctx = createReplayFixtureSessionContext(tmp.path);
+    for (const userText of ["First.", "Second."]) {
+      await appendReplayFixtureTurn(ctx, {
+        userText,
+        assistantText: "Done.",
+        systemPrompt: SYSTEM_PROMPT,
+        tools: tools(),
+      });
+    }
+    // DevToolsService re-appends a header without the run metadata when a retention-evicted
+    // run logs another step; that step extends the run's first step.
+    const [runLine, firstStepLine] = ctx.devtoolsLines;
+    const run = (JSON.parse(runLine) as { run: { requestHistorySequence?: number } }).run;
+    const step = (JSON.parse(firstStepLine) as { step: DevToolsStep }).step;
+    const { requestHistorySequence: _seq, ...healedRun } = run;
+    const prompt = step.input?.prompt as unknown[];
+    ctx.devtoolsLines.splice(
+      2,
+      0,
+      JSON.stringify({ type: "run", run: healedRun }),
+      JSON.stringify({
+        type: "step",
+        step: {
+          ...step,
+          id: "step-1b",
+          stepNumber: 1,
+          input: {
+            ...step.input,
+            prompt: [...prompt, { role: "assistant", content: [{ type: "text", text: "Hm." }] }],
+          },
+        },
+      })
+    );
+
+    const result = await verify(ctx);
+    // run-1 step 0 -> run-1 step 1 -> run-2: the healed step is audited, not dropped as headless.
+    expect(result.stepPrefix).toMatchObject({ auditedSteps: 3, comparedPairs: 2 });
+  });
+
+  test("a step that failed before reaching the provider is not an audited request", async () => {
+    using tmp = new DisposableTempDir("replay-verify-failed-step");
+    const ctx = createReplayFixtureSessionContext(tmp.path);
+    for (const userText of ["First.", "Second."]) {
+      await appendReplayFixtureTurn(ctx, {
+        userText,
+        assistantText: "Done.",
+        systemPrompt: SYSTEM_PROMPT,
+        tools: tools(),
+      });
+    }
+    // Turn 1 started a second step with another prompt that was aborted locally: the step row
+    // exists, and its update records only the error.
+    const [, firstStepLine] = ctx.devtoolsLines;
+    const firstStep = (JSON.parse(firstStepLine) as { step: DevToolsStep }).step;
+    ctx.devtoolsLines.splice(
+      2,
+      0,
+      JSON.stringify({
+        type: "step",
+        step: {
+          ...firstStep,
+          id: "step-aborted",
+          stepNumber: 1,
+          input: {
+            ...firstStep.input,
+            prompt: [{ role: "user", content: [{ type: "text", text: "x" }] }],
+          },
+        },
+      }),
+      JSON.stringify({ type: "step-update", stepId: "step-aborted", update: { error: "aborted" } })
+    );
+
+    const result = await verify(ctx);
+    expect(result.stepPrefix).toMatchObject({ comparedPairs: 1, breaks: [] });
   });
 
   test("a turn without an assistant row skips only itself", async () => {
