@@ -59,6 +59,37 @@ const RESTART_RULES: Record<string, RestartRule> = {
   "src/browser/terminal/TerminalSessionRouter.ts": "router-per-client",
 };
 
+/**
+ * The code shape each rule needs, so a listed file cannot claim a rule its code does not follow.
+ * These are structural checks; the reconnect tests of each holder prove the behavior.
+ */
+const RULE_SHAPES: Record<RestartRule, { describe: string; matches: (text: string) => boolean }> = {
+  "effect-deps": {
+    describe: "a useEffect with `api` in its dependency list",
+    matches: (text) => text.includes("useEffect(") && /\[[^\]]*\bapi\b[^\]]*\]\s*\)/.test(text),
+  },
+  "store-live-feed": {
+    describe: "a setClient(client) method that the app feeds with the live client",
+    matches: (text) => /\bsetClient\s*\(\s*\w+\s*:/.test(text),
+  },
+  "router-per-client": {
+    describe: "a router bound to one client (the provider builds one per client)",
+    matches: (text) => /constructor\(api: APIClient\b/.test(text),
+  },
+  "holder-backoff": {
+    describe: "a retry with a delay",
+    matches: (text) => text.includes("setTimeout(") && /backoff|retry/i.test(text),
+  },
+  "operation-stream": {
+    describe: "one operation's stream (no restart by design)",
+    matches: () => true,
+  },
+  "capability-check": {
+    describe: "a typeof check of the procedure",
+    matches: (text) => /typeof [^\n]*=== "function"/.test(text),
+  },
+};
+
 const SCHEMA_PATH = "src/common/orpc/schemas/api.ts";
 
 /** Paths of every procedure whose output is `eventIterator(...)`, e.g. ["terminal", "onExit"]. */
@@ -149,6 +180,13 @@ describe("server stream holders", () => {
   test("every file that opens a server stream has a restart rule", () => {
     const unlisted = holders.filter((file) => !(file in RESTART_RULES));
     expect(unlisted).toEqual([]);
+  });
+
+  test("every listed file has the code shape of its rule", () => {
+    const mismatched = Object.entries(RESTART_RULES)
+      .filter(([file, rule]) => !RULE_SHAPES[rule].matches(readFileSync(file, "utf8")))
+      .map(([file, rule]) => `${file}: "${rule}" needs ${RULE_SHAPES[rule].describe}`);
+    expect(mismatched).toEqual([]);
   });
 
   test("every listed file still opens a server stream", () => {

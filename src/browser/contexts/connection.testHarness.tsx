@@ -103,8 +103,9 @@ export function createConnectionHarness(
       } else {
         link.detach();
         await act(async () => {
-          // Let the rejections reach their handlers before React sees the drop.
-          for (let i = 0; i < 5; i++) await Promise.resolve();
+          // Let the rejections reach their handlers before React sees the drop. A macrotask runs
+          // only after every queued microtask, however long each rejection chain is.
+          await new Promise((resolve) => setTimeout(resolve, 0));
         });
         setValue(reconnecting(client));
       }
