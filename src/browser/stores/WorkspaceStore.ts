@@ -852,6 +852,45 @@ export function findLastContextUsage(
 }
 
 /**
+ * onChat subscribe input. A boolean auto-retry setting left in localStorage by older builds
+ * is forwarded once as `legacyAutoRetryEnabled` (the caller drops it after the subscribe
+ * succeeds); any other stored value is malformed and is dropped here.
+ */
+export function buildOnChatInput(
+  workspaceId: string,
+  mode: OnChatMode | undefined
+): {
+  input: {
+    workspaceId: string;
+    mode: OnChatMode | undefined;
+    legacyAutoRetryEnabled?: boolean;
+    batchReplay: true;
+    replayWindow: true;
+  };
+  legacyAutoRetryEnabled: boolean | undefined;
+} {
+  const autoRetryKey = getAutoRetryKey(workspaceId);
+  const legacyRaw = readPersistedState<unknown>(autoRetryKey, undefined);
+  const legacyAutoRetryEnabled = typeof legacyRaw === "boolean" ? legacyRaw : undefined;
+  if (legacyRaw !== undefined && legacyAutoRetryEnabled === undefined)
+    updatePersistedState<boolean | undefined>(autoRetryKey, undefined);
+  // batchReplay: this store unpacks `message-batch` replay events (#4868).
+  // replayWindow: a full replay sends only the newest rows of the active epoch; older rows
+  // load through loadOlderHistory (#4961).
+  const input =
+    legacyAutoRetryEnabled === undefined
+      ? { workspaceId, mode, batchReplay: true as const, replayWindow: true as const }
+      : {
+          workspaceId,
+          mode,
+          legacyAutoRetryEnabled,
+          batchReplay: true as const,
+          replayWindow: true as const,
+        };
+  return { input, legacyAutoRetryEnabled };
+}
+
+/**
  * External store for workspace aggregators and streaming state.
  *
  * This store lives outside React's lifecycle and manages all workspace
@@ -4466,21 +4505,11 @@ export class WorkspaceStore {
             };
           }
         }
-        const autoRetryKey = getAutoRetryKey(workspaceId);
-        const legacyRaw = readPersistedState<unknown>(autoRetryKey, undefined);
-        const legacyAutoRetryEnabled = typeof legacyRaw === "boolean" ? legacyRaw : undefined;
-        if (legacyRaw !== undefined && legacyAutoRetryEnabled === undefined)
-          updatePersistedState<boolean | undefined>(autoRetryKey, undefined);
-        // batchReplay: this store unpacks `message-batch` replay events (#4868).
-        // replayWindow: a full replay sends only the newest rows of the active epoch; older rows
-        // load through loadOlderHistory (#4961).
-        const input =
-          legacyAutoRetryEnabled === undefined
-            ? { workspaceId, mode, batchReplay: true, replayWindow: true }
-            : { workspaceId, mode, legacyAutoRetryEnabled, batchReplay: true, replayWindow: true };
+        const { input, legacyAutoRetryEnabled } = buildOnChatInput(workspaceId, mode);
         const iterator = await client.workspace.onChat(input, { signal: attemptSignal });
+        // The backend took over the legacy setting: drop it only after the subscribe succeeded.
         if (legacyAutoRetryEnabled !== undefined)
-          updatePersistedState<boolean | undefined>(autoRetryKey, undefined);
+          updatePersistedState<boolean | undefined>(getAutoRetryKey(workspaceId), undefined);
         const isFullReplay = !mode || mode.type === "full";
         if (isFullReplay) this.resetChatStateForReplay(workspaceId);
         const established = this.chatTransientState.get(workspaceId);
