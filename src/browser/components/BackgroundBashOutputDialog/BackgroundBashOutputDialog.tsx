@@ -4,11 +4,13 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "../Dialog/Dial
 import { DetailContent } from "@/browser/features/Tools/Shared/ToolPrimitives";
 import { useAPI } from "@/browser/contexts/API";
 import { useBackgroundProcesses } from "@/browser/stores/BackgroundBashStore";
+import { isAbortError } from "@/browser/utils/isAbortError";
 import {
   appendLiveBashOutputChunk,
   type LiveBashOutputInternal,
 } from "@/browser/utils/messages/liveBashOutputBuffer";
 import { BASH_TRUNCATE_MAX_TOTAL_BYTES } from "@/common/constants/toolLimits";
+import { getErrorMessage } from "@/common/utils/errors";
 
 const BACKGROUND_BASH_INITIAL_TAIL_BYTES = 64_000;
 const BACKGROUND_BASH_POLL_INTERVAL_MS = 500;
@@ -47,7 +49,13 @@ export const BackgroundBashOutputDialog: React.FC<BackgroundBashOutputDialogProp
         )}
       </DialogHeader>
 
-      <BackgroundBashOutputViewer workspaceId={props.workspaceId} processId={props.processId} />
+      {/* Keyed by the process, so another process starts from an empty viewer, while a new API
+          client (a reconnect) only re-runs the viewer's read and keeps the output it shows. */}
+      <BackgroundBashOutputViewer
+        key={`${props.workspaceId}:${props.processId}`}
+        workspaceId={props.workspaceId}
+        processId={props.processId}
+      />
     </DialogContent>
   </Dialog>
 );
@@ -71,14 +79,11 @@ const BackgroundBashOutputViewer: React.FC<{ workspaceId: string; processId: str
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
-    setOutput(undefined);
-    setStatus("running");
-    setTruncatedStart(false);
+    // No reset of the shown output here: the first read below replaces it. Before the first
+    // read lands, the viewer still shows "Loading…" (its initial state).
     setError(null);
-    setIsLoading(true);
 
     if (!api) {
-      setIsLoading(false);
       setError("API unavailable");
       return;
     }
@@ -109,8 +114,11 @@ const BackgroundBashOutputViewer: React.FC<{ workspaceId: string; processId: str
         }
 
         setStatus(result.data.status);
-        if (result.data.truncatedStart) {
-          setTruncatedStart(true);
+        // The first read is a fresh tail (the only read that can be truncated at its start), so
+        // it replaces any output kept from an earlier run (a reconnect); later reads append.
+        if (offset === undefined) {
+          setTruncatedStart(result.data.truncatedStart);
+          setOutput(undefined);
         }
 
         offset = result.data.nextOffset;
@@ -133,12 +141,13 @@ const BackgroundBashOutputViewer: React.FC<{ workspaceId: string; processId: str
       }
     };
 
-    // A rejected read (e.g. a lost server connection) stops polling with the error shown instead
-    // of escaping as an unhandled rejection; reopening the dialog starts a fresh read.
+    // A rejected read stops polling with the error shown instead of escaping as an unhandled
+    // rejection; reopening the dialog starts a fresh read. A lost connection (an abort) shows no
+    // error and keeps the output: the next client polls again.
     run().catch((err: unknown) => {
-      if (cancelled) return;
+      if (cancelled || isAbortError(err)) return;
       setIsLoading(false);
-      setError(err instanceof Error ? err.message : String(err));
+      setError(getErrorMessage(err));
     });
 
     return () => {

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import assert from "@/common/utils/assert";
 import { useAPI } from "@/browser/contexts/API";
 import { MarkdownCore } from "@/browser/features/Messages/MarkdownCore";
@@ -9,6 +9,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/browser/components/Dialog/Dialog";
+import { isAbortError } from "@/browser/utils/isAbortError";
 import { getErrorMessage } from "@/common/utils/errors";
 
 interface PlanFileDialogProps {
@@ -17,31 +18,36 @@ interface PlanFileDialogProps {
   workspaceId: string;
 }
 
-export const PlanFileDialog: React.FC<PlanFileDialogProps> = (props) => {
+export const PlanFileDialog: React.FC<PlanFileDialogProps> = (props) => (
+  <Dialog open={props.open} onOpenChange={props.onOpenChange}>
+    <DialogContent className="flex max-h-[80vh] min-h-0 max-w-5xl flex-col overflow-hidden">
+      {/* PostCompactionSection renders this dialog while closed: the body, and so its plan
+          read, mounts only while the dialog is open. Keyed by workspace, so another workspace
+          (or reopening the dialog) starts from an empty body, while a new API client (a
+          reconnect) re-reads the plan in the background and keeps it shown. */}
+      <PlanFileBody key={props.workspaceId} workspaceId={props.workspaceId} />
+    </DialogContent>
+  </Dialog>
+);
+
+function usePlanFile(workspaceId: string) {
   const { api } = useAPI();
 
-  const [isLoading, setIsLoading] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [content, setContent] = useState<string | null>(null);
   const [path, setPath] = useState<string | null>(null);
+  // True once a plan is on screen: offline (no client during a reconnect) then keeps it.
+  const hasPlanRef = useRef(false);
 
   useEffect(() => {
-    // PostCompactionSection renders this dialog while closed.
-    // Delay IPC plan-file reads until the user explicitly opens the preview.
-    if (!props.open) {
-      return;
-    }
-
-    assert(props.workspaceId.trim().length > 0, "workspaceId is required to load plan preview");
-
-    setIsLoading(true);
-    setError(null);
-    setContent(null);
-    setPath(null);
+    assert(workspaceId.trim().length > 0, "workspaceId is required to load plan preview");
 
     if (!api) {
-      setIsLoading(false);
-      setError("API unavailable");
+      if (!hasPlanRef.current) {
+        setIsLoading(false);
+        setError("API unavailable");
+      }
       return;
     }
 
@@ -49,7 +55,7 @@ export const PlanFileDialog: React.FC<PlanFileDialogProps> = (props) => {
 
     const run = async () => {
       try {
-        const result = await api.workspace.getPlanContent({ workspaceId: props.workspaceId });
+        const result = await api.workspace.getPlanContent({ workspaceId });
 
         if (cancelled) {
           return;
@@ -63,11 +69,15 @@ export const PlanFileDialog: React.FC<PlanFileDialogProps> = (props) => {
 
         assert(result.data.path.length > 0, "Plan path should be non-empty");
 
+        setError(null);
         setContent(result.data.content);
         setPath(result.data.path);
         setIsLoading(false);
+        hasPlanRef.current = true;
       } catch (error: unknown) {
-        if (cancelled) {
+        // A lost connection (or this effect's own cleanup) is not a plan error: keep what is
+        // shown for the next client.
+        if (cancelled || isAbortError(error)) {
           return;
         }
 
@@ -81,42 +91,49 @@ export const PlanFileDialog: React.FC<PlanFileDialogProps> = (props) => {
     return () => {
       cancelled = true;
     };
-  }, [api, props.open, props.workspaceId]);
+  }, [api, workspaceId]);
+
+  return { isLoading, error, content, path };
+}
+
+function PlanFileBody(props: { workspaceId: string }) {
+  const { isLoading, error, content, path } = usePlanFile(props.workspaceId);
 
   return (
-    <Dialog open={props.open} onOpenChange={props.onOpenChange}>
-      <DialogContent className="flex max-h-[80vh] min-h-0 max-w-5xl flex-col overflow-hidden">
-        <DialogHeader>
-          <DialogTitle className="flex flex-col gap-1">
-            <span>Plan file</span>
-            {path && (
-              <code className="rounded bg-[var(--color-bg-tertiary)] px-1.5 py-0.5 font-mono text-[10px]">
-                {path}
-              </code>
-            )}
-          </DialogTitle>
-        </DialogHeader>
-
-        <div className="min-h-0 flex-1 overflow-y-auto rounded bg-[var(--color-bg-secondary)] p-3">
-          {error ? (
-            <div className="text-error text-[11px]" data-testid="plan-file-dialog-error">
-              {error}
-            </div>
-          ) : isLoading ? (
-            <div className="text-muted text-[11px] italic">Loading plan…</div>
-          ) : content !== null ? (
-            content.length > 0 ? (
-              <PlanMarkdownContainer>
-                <MarkdownCore content={content} />
-              </PlanMarkdownContainer>
-            ) : (
-              <div className="text-muted text-[11px] italic">Plan file is empty</div>
-            )
-          ) : (
-            <div className="text-muted text-[11px] italic">No plan loaded</div>
+    <>
+      <DialogHeader>
+        <DialogTitle className="flex flex-col gap-1">
+          <span>Plan file</span>
+          {path && (
+            <code className="rounded bg-[var(--color-bg-tertiary)] px-1.5 py-0.5 font-mono text-[10px]">
+              {path}
+            </code>
           )}
-        </div>
-      </DialogContent>
-    </Dialog>
+        </DialogTitle>
+      </DialogHeader>
+
+      <div className="min-h-0 flex-1 overflow-y-auto rounded bg-[var(--color-bg-secondary)] p-3">
+        {error ? (
+          <div className="text-error text-[11px]" data-testid="plan-file-dialog-error">
+            {error}
+          </div>
+        ) : isLoading ? (
+          <div className="text-muted text-[11px] italic">Loading plan…</div>
+        ) : content !== null ? (
+          content.length > 0 ? (
+            <PlanMarkdownContainer>
+              {/* Keyed by the text: a reload replaces the plan in place, and Streamdown's
+                  elements re-render only when their source position changes, so an edit that
+                  keeps the positions would otherwise stay stale on screen. */}
+              <MarkdownCore key={content} content={content} />
+            </PlanMarkdownContainer>
+          ) : (
+            <div className="text-muted text-[11px] italic">Plan file is empty</div>
+          )
+        ) : (
+          <div className="text-muted text-[11px] italic">No plan loaded</div>
+        )}
+      </div>
+    </>
   );
-};
+}
