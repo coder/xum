@@ -1,22 +1,17 @@
 import type { McpAppCspDeclaration } from "@/common/orpc/schemas/mcpApps";
+import { mcpAppGrantableOrigin } from "@/common/utils/mcpApps";
 import { ARTIFACT_IN_PAGE_LINK_SCRIPT } from "./artifactBridge";
-import {
-  ARTIFACT_CDN_FONT_SOURCES,
-  ARTIFACT_CDN_SCRIPT_SOURCES,
-  ARTIFACT_CDN_STYLE_SOURCES,
-} from "./artifactCsp";
 
 /**
  * CSP for MCP Apps views (artifacts experiment).
  *
- * SECURITY AUDIT: views run in the same sandbox as HTML artifacts (srcdoc, sandbox exactly
- * "allow-scripts", opaque origin), with this policy instead of the artifact one. The base is
- * the spec's default policy; `'self'` is dropped because it matches nothing in an opaque
- * origin. Declared `resourceDomains`/`connectDomains` are granted ONLY when they are https
- * origins that the artifacts CDN allowlist also allows and the "Allow CDN scripts in
- * artifacts" setting is on; the grant is the narrower of the two sources. Undeclared domains
- * are never granted, and `frameDomains`, `baseUriDomains`, `permissions` and `domain` never
- * are. What was granted is reported to the view in hostCapabilities.sandbox.csp.
+ * Views run in the same sandbox as HTML artifacts (srcdoc, sandbox exactly "allow-scripts",
+ * opaque origin), with this policy instead of the artifact one. The base is the spec's default
+ * policy; `'self'` is dropped because it matches nothing in an opaque origin. Declared
+ * `resourceDomains`/`connectDomains` that are bare https origins are granted only after the user
+ * approved them for the view's server (one approval per server and project, kept in project
+ * config). `frameDomains`, `baseUriDomains`, `permissions` and `domain` are never granted. What
+ * was granted is reported to the view in hostCapabilities.sandbox.csp.
  */
 
 export interface GrantedMcpAppCsp {
@@ -24,51 +19,34 @@ export interface GrantedMcpAppCsp {
   connectDomains: string[];
 }
 
-/** Every CDN source the artifacts allowlist knows (scripts, styles, fonts). */
-const CDN_SOURCES: readonly string[] = [
-  ...ARTIFACT_CDN_SCRIPT_SOURCES,
-  ...ARTIFACT_CDN_STYLE_SOURCES,
-  ...ARTIFACT_CDN_FONT_SOURCES,
-];
-
-/** The allowlist source matching a declared https origin, or null. */
-function allowlistedSourceFor(declared: string): string | null {
-  let url: URL;
-  try {
-    url = new URL(declared);
-  } catch {
-    return null;
-  }
-  // Only a bare https origin is a grantable declaration (no wildcards, paths or credentials).
-  if (
-    url.protocol !== "https:" ||
-    url.username !== "" ||
-    url.password !== "" ||
-    url.search !== "" ||
-    url.hash !== "" ||
-    (url.pathname !== "/" && url.pathname !== "") ||
-    declared.includes("*")
-  ) {
-    return null;
-  }
-  return CDN_SOURCES.find((source) => new URL(source).origin === url.origin) ?? null;
+export interface McpAppCspGrant {
+  granted: GrantedMcpAppCsp;
+  /** Declared grantable origins the server's approvals lack: what the strip asks for. */
+  pending: string[];
+  /** Declared domains that are never granted (not bare https, frames, base URIs). */
+  notGranted: string[];
 }
 
 export function grantMcpAppCsp(
   declared: McpAppCspDeclaration,
-  options: { allowCdn: boolean }
-): { granted: GrantedMcpAppCsp; notGranted: string[] } {
+  approved: readonly string[]
+): McpAppCspGrant {
   const granted: GrantedMcpAppCsp = { resourceDomains: [], connectDomains: [] };
+  const pending: string[] = [];
   const notGranted: string[] = [];
   for (const key of ["resourceDomains", "connectDomains"] as const) {
     for (const domain of declared[key] ?? []) {
-      const source = options.allowCdn ? allowlistedSourceFor(domain) : null;
-      if (source == null) notGranted.push(domain);
-      else if (!granted[key].includes(source)) granted[key].push(source);
+      const origin = mcpAppGrantableOrigin(domain);
+      // SECURITY AUDIT: an approved origin can receive any data the view has (its tool input,
+      // result and whatever it reads through the bridge), and can serve it code. That is what
+      // the user approves in the strip, per server, for exactly these origins.
+      if (origin == null) notGranted.push(domain);
+      else if (!approved.includes(origin)) pending.push(origin);
+      else if (!granted[key].includes(origin)) granted[key].push(origin);
     }
   }
   notGranted.push(...(declared.frameDomains ?? []), ...(declared.baseUriDomains ?? []));
-  return { granted, notGranted: [...new Set(notGranted)] };
+  return { granted, pending: [...new Set(pending)], notGranted: [...new Set(notGranted)] };
 }
 
 /**

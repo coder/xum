@@ -30,9 +30,12 @@ export type APIState =
   | { status: "connecting"; api: null; error: null }
   | { status: "connected"; api: APIClient; error: null }
   | { status: "degraded"; api: APIClient; error: null } // Connected but the backend answers slowly
-  | { status: "reconnecting"; api: null; error: null; attempt: number }
+  // While reconnecting, and in an error after a lost session, `api` can be the last client: the
+  // App stays mounted, and panes keep what they show. Calls on it then fail fast with
+  // ConnectionLostError (connectionLink.ts). Code that must know "offline" uses useLiveAPI().
+  | { status: "reconnecting"; api: APIClient | null; error: null; attempt: number }
   | { status: "auth_required"; api: null; error: string | null }
-  | { status: "error"; api: null; error: string };
+  | { status: "error"; api: APIClient | null; error: string };
 
 interface APIStateMethods {
   authenticate: (token: string) => void;
@@ -676,7 +679,8 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
         return { status: "error", api: null, error: state.error, ...base };
     }
   }, [state, authenticate, retry]);
-  useAppConfigStoreClient(value.api);
+  // The store must see "offline" to resubscribe after the reconnect.
+  useAppConfigStoreClient(liveClientOf(value));
 
   // Always render children - consumers handle their own loading/error states
   return (
@@ -737,6 +741,22 @@ export const useAPI = (): UseAPIResult => {
   }
   return context;
 };
+
+/** The client while the connection is live (connected or degraded), else null. */
+export function liveClientOf(state: APIState): APIClient | null {
+  return state.status === "connected" || state.status === "degraded" ? state.api : null;
+}
+
+/**
+ * The API client only while the connection is live; null while offline.
+ *
+ * `useAPI().api` can stay set while Xum reconnects, so the UI keeps what it shows. Code that must
+ * see "offline" uses this instead: the stores (they resubscribe when it comes back), deferred
+ * writes that must wait for a live server, and handlers that report "API not connected".
+ */
+export function useLiveAPI(): APIClient | null {
+  return liveClientOf(useAPI());
+}
 
 /**
  * Like {@link useAPI} but returns null instead of throwing when there is no APIProvider.

@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
   advertisedMCPSettingsToolNames,
+  boundMCPSettingsError,
+  MAX_MCP_SETTING_ENUM_OPTIONS,
+  MAX_MCP_SETTING_NAME,
+  MAX_MCP_SETTINGS,
   parseMCPSettingsCapability,
   parseMCPSettingsReadResult,
   validateMCPSettingValue,
@@ -83,6 +87,8 @@ describe("parseMCPSettingsReadResult", () => {
     ]);
     // color, badEnum, noTitle (schema); wrongValue, toString (value); mystery item; page group.
     expect(result.warnings).toHaveLength(7);
+    // Settings the UI cannot show: color, badEnum, noTitle, wrongValue and toString.
+    expect(result.droppedSettingCount).toBe(5);
   });
 
   test("ignores a server pattern (never runs server regexes) and accepts an empty enum option", () => {
@@ -101,6 +107,65 @@ describe("parseMCPSettingsReadResult", () => {
     expect(result.values).toEqual({ code: "y", mode: "" });
     expect(result.properties.code).toEqual({ type: "string", title: "Code" });
     expect(result.warnings).toEqual([]);
+  });
+
+  test("bounds the settings and layout a server can send; excess settings count as dropped", () => {
+    const names = Array.from({ length: MAX_MCP_SETTINGS + 5 }, (_, i) => `s${i}`);
+    const result = parseMCPSettingsReadResult({
+      schema: {
+        type: "object",
+        properties: Object.fromEntries(names.map((n) => [n, { type: "boolean", title: n }])),
+      },
+      values: Object.fromEntries(names.map((n) => [n, true])),
+      layout: Array.from({ length: 30 }, (_, i) => ({
+        kind: "group",
+        title: `g${i}`,
+        items: Array.from({ length: 150 }, () => ({ kind: "tool", tool: "t" })),
+      })),
+    });
+    if ("error" in result) throw new Error(result.error);
+    expect(Object.keys(result.properties)).toHaveLength(MAX_MCP_SETTINGS);
+    expect(result.droppedSettingCount).toBe(5);
+    // 20 groups of at most 100 items, then "Other settings" for the ungrouped properties.
+    expect(result.layout).toHaveLength(21);
+    expect(Math.max(...result.layout.map((group) => group.items.length))).toBe(100);
+  });
+
+  test("drops a setting whose name is longer than the name limit (counted in code points)", () => {
+    const fits = "😀".repeat(MAX_MCP_SETTING_NAME);
+    const tooLong = "a".repeat(MAX_MCP_SETTING_NAME + 1);
+    const result = parseMCPSettingsReadResult({
+      schema: {
+        type: "object",
+        properties: {
+          [fits]: { type: "boolean", title: "Fits" },
+          [tooLong]: { type: "boolean", title: "Too long" },
+        },
+      },
+      values: { [fits]: true, [tooLong]: true },
+    });
+    if ("error" in result) throw new Error(result.error);
+    expect(Object.keys(result.properties)).toEqual([fits]);
+    expect(result.droppedSettingCount).toBe(1);
+    // The warning does not echo the overlong name.
+    expect(result.warnings.join("\n")).not.toContain(tooLong);
+  });
+
+  test("drops a setting with more enum options than a Select can show", () => {
+    const options = (n: number) => Array.from({ length: n }, (_, i) => `o${i}`);
+    const result = parseMCPSettingsReadResult({
+      schema: {
+        type: "object",
+        properties: {
+          ok: { type: "string", title: "Ok", enum: options(MAX_MCP_SETTING_ENUM_OPTIONS) },
+          huge: { type: "string", title: "Huge", enum: options(MAX_MCP_SETTING_ENUM_OPTIONS + 1) },
+        },
+      },
+      values: { ok: "o0", huge: "o0" },
+    });
+    if ("error" in result) throw new Error(result.error);
+    expect(Object.keys(result.properties)).toEqual(["ok"]);
+    expect(result.droppedSettingCount).toBe(1);
   });
 
   test("a setting named __proto__ stays an own key of properties, values and layout", () => {
@@ -147,4 +212,11 @@ test("validateMCPSettingValue checks enum, code-point lengths, bounds and multip
   ).not.toBeNull();
   expect(validateMCPSettingValue({ type: "integer", title: "t" }, 1.5)).not.toBeNull();
   expect(validateMCPSettingValue({ type: "boolean", title: "t" }, "true")).not.toBeNull();
+});
+
+test("boundMCPSettingsError cuts long server error text without splitting a code point", () => {
+  expect(boundMCPSettingsError("short")).toBe("short");
+  const bounded = boundMCPSettingsError(`x${"😀".repeat(100_000)}`);
+  expect(bounded.length).toBeLessThanOrEqual(1025);
+  expect(bounded.endsWith("😀…")).toBe(true);
 });

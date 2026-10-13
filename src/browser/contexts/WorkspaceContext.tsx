@@ -27,7 +27,7 @@ import {
 import { deleteWorkspaceStorage, migrateWorkspaceStorage } from "@/browser/utils/workspaceStorage";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
@@ -464,7 +464,8 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     },
     [workspaceStore]
   );
-  useDiscardSideChatOnLeave(api, currentWorkspaceId, workspaceMetadata);
+  // The discard waits for a live server: useAPI().api can keep the last client while offline.
+  useDiscardSideChatOnLeave(useLiveAPI(), currentWorkspaceId, workspaceMetadata);
   // The routed creation draft id, for the startup creation-draft storage GC (never collected).
   const routedDraftIdRef = useRef<string | null>(null);
   const [loading, setLoading] = useState(true);
