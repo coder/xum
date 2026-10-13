@@ -230,4 +230,32 @@ describe("trimCompactionInput", () => {
     const trim = trimCompactionInput(messages, 15_000);
     expect(trim.omittedToolResults).toBe(1);
   });
+
+  it("keeps the turn boundary of a reasoning-only row it removes", () => {
+    // A stream that crashed early left an assistant row with only reasoning between u2 and u3.
+    const messages: MuxMessage[] = [
+      createMuxMessage("u1", "user", "y".repeat(40_000)),
+      createMuxMessage("a1", "assistant", "ok"),
+      createMuxMessage("u2", "user", "y".repeat(40_000)),
+      { id: "crashed", role: "assistant", parts: [{ type: "reasoning", text: "thinking" }] },
+      createMuxMessage("u3", "user", "small"),
+      createMuxMessage("a3", "assistant", "ok"),
+      COMPACTION_REQUEST,
+    ];
+    const trim = trimCompactionInput(messages, 1_000);
+    // u2 is its own turn and is dropped; the emptied row is not sent.
+    expect(trim.messages.map((message) => message.id)).toEqual(["u3", "a3", "request"]);
+    expect(trim.omittedTurns).toBe(2);
+  });
+
+  it("sizes rows with model-aware factors when given", () => {
+    const messages = [...toolTurn("a", 4_000), ...toolTurn("b", 4_000), COMPACTION_REQUEST];
+    const budget = tokensOf(messages) + 100;
+    expect(trimCompactionInput(messages, budget).messages).toBe(messages);
+    // A tokenizer that counts row "a-assistant" 5x denser pushes the history over the budget.
+    const dense = new Map([["a-assistant", 5]]);
+    const trim = trimCompactionInput(messages, budget, dense);
+    expect(trim.omittedToolResults).toBe(1);
+    expect(outputOf(trim.messages, "a")).toMatch(/^\[Tool result omitted/);
+  });
 });

@@ -9,6 +9,7 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { generateText, type LanguageModel } from "ai";
 
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { estimateCompactionInputTokens } from "@/common/utils/messages/trimCompactionInput";
 import { assemblePromptPayload } from "./turnContextAssembler";
 
 function toolTurn(id: string, outputChars: number): MuxMessage[] {
@@ -201,5 +202,49 @@ describe("compaction input trim on the wire", () => {
     // Sequential steps replay as two assistant messages, not one parallel call.
     expect(messageOf("call_s1")).toBeGreaterThanOrEqual(0);
     expect(messageOf("call_s2")).toBeGreaterThan(messageOf("call_s1"));
+  });
+
+  test("sizes the redacted projection: provider-invisible output does not trigger a trim", async () => {
+    // Most of this result is ui_only data, which applyToolOutputRedaction removes before send.
+    const uiOnlyTurn: MuxMessage[] = [
+      createMuxMessage("ui-user", "user", "edit"),
+      {
+        id: "ui-assistant",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call_ui",
+            toolName: "file_edit_replace_string",
+            input: { path: "a.ts" },
+            state: "output-available",
+            output: { success: true, ui_only: { file_edit: { diff: "d".repeat(200_000) } } },
+          },
+        ],
+      },
+    ];
+    const history = [...uiOnlyTurn, HISTORY[HISTORY.length - 1]];
+    const plain = await assemble("openai", undefined, history);
+    // The raw rows are about 50k tokens, the redacted ones a few dozen.
+    const sized = await assemble("openai", 5_000, history);
+    expect(JSON.stringify(sized.messages)).toBe(JSON.stringify(plain.messages));
+    expect(JSON.stringify(sized.messages)).not.toContain("Compaction input trimmed");
+  });
+
+  test("counts dense text with the model's tokenizer before deciding to trim", async () => {
+    const cjk = "这是一个测试句子，用于检查分词器的密度。".repeat(2_000);
+    const history: MuxMessage[] = [
+      createMuxMessage("cjk-old", "user", cjk),
+      createMuxMessage("cjk-old-answer", "assistant", "ok"),
+      createMuxMessage("cjk-new", "user", "next"),
+      createMuxMessage("cjk-new-answer", "assistant", "ok"),
+      HISTORY[HISTORY.length - 1],
+    ];
+    const charsEstimate = estimateCompactionInputTokens(history);
+    // chars/4 says the history fits twice over; the real count is several times larger.
+    const payload = await assemble("openai", charsEstimate * 2, history);
+    const text = JSON.stringify(payload.messages);
+    expect(text).toContain("Compaction input trimmed");
+    expect(text).not.toContain(cjk.slice(0, 50));
   });
 });

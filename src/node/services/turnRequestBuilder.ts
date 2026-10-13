@@ -10,7 +10,7 @@ import { measureAssembledRequestBudgetForModel } from "./contextBudgetCounting";
 import { ContextBudgetExceededError } from "./contextBudgetError";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import { SUMMARIZER_INPUT_FRACTION } from "@/constants/continuousCompaction";
-import { estimateCompactionInputTokens } from "@/common/utils/messages/trimCompactionInput";
+import { measureCompactionInputTokens } from "./compactionInputSizing";
 import {
   anthropicBetweenToolsRouteAvailable,
   canSwitchToAnthropic1MContext,
@@ -497,7 +497,7 @@ export function resolveCompactionInputBudgetTokens(
  * trims to `scale` of the history's own estimate instead, so it does not resend the history
  * that just hit context_exceeded unchanged.
  */
-function compactionInputBudgetOption(
+async function compactionInputBudgetOption(
   isCompactionRequest: boolean,
   model: {
     modelString: string;
@@ -506,7 +506,7 @@ function compactionInputBudgetOption(
   },
   history: MuxMessage[],
   scale: number | undefined
-): { compactionInputBudgetTokens?: number } {
+): Promise<{ compactionInputBudgetTokens?: number }> {
   if (!isCompactionRequest) return {};
   const budget =
     resolveCompactionInputBudgetTokens(
@@ -514,12 +514,18 @@ function compactionInputBudgetOption(
       model.providerOptions,
       model.providersConfig,
       scale
-    ) ?? (scale == null ? undefined : retryBudgetFromHistory(history, scale));
+    ) ?? (scale == null ? undefined : await retryBudgetFromHistory(history, model, scale));
   return budget == null ? {} : { compactionInputBudgetTokens: budget };
 }
 
-function retryBudgetFromHistory(history: MuxMessage[], scale: number): number | undefined {
-  const budget = Math.floor(estimateCompactionInputTokens(history) * scale);
+/** `scale` of the history's model-aware size: the same measure the trim then fits to it. */
+async function retryBudgetFromHistory(
+  history: MuxMessage[],
+  model: { modelString: string },
+  scale: number
+): Promise<number | undefined> {
+  const size = await measureCompactionInputTokens(history, model.modelString);
+  const budget = Math.floor(size * scale);
   return budget > 0 ? budget : undefined;
 }
 
@@ -2932,7 +2938,7 @@ export class TurnRequestBuilder {
           forcedFirstStepToolNames?.length ? forcedFirstStepToolNames : toolNamesForSentinel
         );
         // Recorded in the DevTools run so the replay verifier trims the same way.
-        const compactionInputBudget = compactionInputBudgetOption(
+        const compactionInputBudget = await compactionInputBudgetOption(
           isCompactionRequest,
           {
             modelString: seed.rawModelString,

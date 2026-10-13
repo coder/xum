@@ -56,9 +56,26 @@ export function estimateCompactionRowTokens(message: MuxMessage): number {
   return estimateMuxMessageTokens(message) + countMediaParts(message) * IMAGE_TOKEN_ESTIMATE;
 }
 
+/**
+ * Per-row multipliers from a model-aware count (measureCompactionTokenFactors): how many times
+ * more tokens the model's tokenizer counts for a row than estimateCompactionRowTokens. chars/4
+ * undercounts dense text (CJK about 5x, emoji about 8x), so the cutoff uses the larger count.
+ * Rows without a factor (and placeholder rows, which keep their row's factor) use 1.
+ */
+export type CompactionTokenFactors = ReadonlyMap<string, number>;
+
+function rowTokens(message: MuxMessage, factors: CompactionTokenFactors | undefined): number {
+  const factor = factors?.get(message.id) ?? 1;
+  assert(Number.isFinite(factor) && factor >= 1, "token factors must be finite and >= 1");
+  return Math.ceil(estimateCompactionRowTokens(message) * factor);
+}
+
 /** The estimate trimCompactionInput fits to a budget, for a whole history. */
-export function estimateCompactionInputTokens(messages: MuxMessage[]): number {
-  return messages.reduce((sum, message) => sum + estimateCompactionRowTokens(message), 0);
+export function estimateCompactionInputTokens(
+  messages: MuxMessage[],
+  factors?: CompactionTokenFactors
+): number {
+  return messages.reduce((sum, message) => sum + rowTokens(message, factors), 0);
 }
 
 function omittedToolResultText(tokens: number): string {
@@ -100,8 +117,10 @@ function withoutReasoning(messages: MuxMessage[]): MuxMessage[] {
     }
     const kept = message.parts.map((part) => part.type !== "reasoning");
     const parts = message.parts.filter((_part, index) => kept[index]);
-    // An assistant row with nothing left would reach the provider as an empty message.
-    if (parts.length === 0) return [];
+    // A row with nothing left stays (empty) until the end, so turn boundaries are the ones of
+    // the original rows: removing it would join the user rows around it into one turn that is
+    // never dropped. trimOverBudget leaves empty rows out of the result.
+    if (parts.length === 0) return [{ ...message, parts }];
     const starts = message.metadata?.stepStartPartIndices;
     // The persisted step boundaries index into parts: rebase them onto the parts that remain,
     // or the SDK would split the replayed steps at the wrong places.
@@ -121,10 +140,14 @@ function isOutputPart(part: Part): boolean {
 }
 
 /** The row with the tool result at `partIndex` replaced by a size placeholder. */
-function withPlaceholderOutput(message: MuxMessage, partIndex: number): MuxMessage {
+function withPlaceholderOutput(
+  message: MuxMessage,
+  partIndex: number,
+  factors: CompactionTokenFactors | undefined
+): MuxMessage {
   const part = message.parts[partIndex];
   assert(part.type === "dynamic-tool" && part.state === "output-available", "not a tool result");
-  const tokens = estimateCompactionRowTokens({ ...message, parts: [part] });
+  const tokens = rowTokens({ ...message, parts: [part] }, factors);
   // nestedCalls never reach the provider (convertToModelMessages reads input/output only),
   // but they count in the estimate, so drop them with the output.
   const placeholder: Part = {
@@ -156,9 +179,12 @@ class TrimState {
   /** Tool results replaced per row; rows of dropped turns do not count in the note. */
   readonly replaced: number[];
 
-  constructor(rows: MuxMessage[]) {
+  constructor(
+    rows: MuxMessage[],
+    private readonly factors: CompactionTokenFactors | undefined
+  ) {
     this.rows = [...rows];
-    this.tokens = this.rows.map(estimateCompactionRowTokens);
+    this.tokens = this.rows.map((row) => rowTokens(row, factors));
     this.total = this.tokens.reduce((sum, value) => sum + value, 0);
     this.replaced = this.rows.map(() => 0);
   }
@@ -176,8 +202,8 @@ class TrimState {
   }
 
   private replaceOutput(index: number, part: number): void {
-    const message = withPlaceholderOutput(this.rows[index], part);
-    const tokens = estimateCompactionRowTokens(message);
+    const message = withPlaceholderOutput(this.rows[index], part, this.factors);
+    const tokens = rowTokens(message, this.factors);
     this.total += tokens - this.tokens[index];
     this.rows[index] = message;
     this.tokens[index] = tokens;
@@ -195,6 +221,11 @@ class TrimState {
     }
     return dropped;
   }
+}
+
+/** An assistant row with nothing left would reach the provider as an empty message. */
+function isSendableRow(row: MuxMessage): boolean {
+  return row.role !== "assistant" || row.parts.length > 0;
 }
 
 function appendOmissionNote(request: MuxMessage, trim: Omit<CompactionInputTrim, "messages">) {
@@ -219,20 +250,21 @@ function appendOmissionNote(request: MuxMessage, trim: Omit<CompactionInputTrim,
 
 export function trimCompactionInput(
   messages: MuxMessage[],
-  budgetTokens: number
+  budgetTokens: number,
+  factors?: CompactionTokenFactors
 ): CompactionInputTrim {
   assert(Number.isFinite(budgetTokens) && budgetTokens > 0, "budgetTokens must be positive");
   const requestIndex = messages.findLastIndex((message) => message.role === "user");
-  const total = estimateCompactionInputTokens(messages);
+  const total = estimateCompactionInputTokens(messages, factors);
   if (requestIndex <= 0 || total <= budgetTokens) {
     return { messages, omittedToolResults: 0, omittedTurns: 0 };
   }
-  return trimOverBudget(new TrimState(withoutReasoning(messages)), budgetTokens);
+  return trimOverBudget(new TrimState(withoutReasoning(messages), factors), budgetTokens);
 }
 
 /** Phases 2-4 on a history already over the budget and without reasoning. */
 function trimOverBudget(state: TrimState, budgetTokens: number): CompactionInputTrim {
-  // Reasoning removal can drop rows, so find the request and the turns on the new rows.
+  // Reasoning removal keeps every row (emptied ones too), so these are the original indices.
   const request = state.rows.findLastIndex((message) => message.role === "user");
   const starts = turnStarts(state.rows, request);
   const firstTurn = starts[0] ?? request;
@@ -256,5 +288,5 @@ function trimOverBudget(state: TrimState, budgetTokens: number): CompactionInput
     changed ? appendOmissionNote(state.rows[request], omitted) : state.rows[request],
     ...state.rows.slice(request + 1),
   ];
-  return { messages: kept, ...omitted };
+  return { messages: kept.filter(isSendableRow), ...omitted };
 }
