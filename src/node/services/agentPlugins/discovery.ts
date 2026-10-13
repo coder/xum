@@ -239,6 +239,11 @@ export interface AgentPluginInfo {
   codexFallback?: true;
   /** Validated `extensions["com.openai"]` (parsed and exposed only; nothing consumes it yet). */
   openai?: OpenAIPluginExtension;
+  /**
+   * Root-relative manifest that supplied `openai`: `plugin.json`, or `.codex-plugin/plugin.json`
+   * (a Codex-only package or the overlay). Codex hooks label their inline entries with it.
+   */
+  openaiManifestPath?: string;
   /** Canonical `skills/` directory; present only when it exists, is a directory, and stays inside the root (§6.2). */
   skillsDir?: string;
   /** Canonical `mcp.json` path; present only when it exists, is a regular file, and stays inside the root (§6.2). */
@@ -473,6 +478,7 @@ async function discoverPluginAt(args: {
   // are never merged). The overlay contributes nothing else.
   let openaiSource: Pick<AgentPluginManifest, "extensions"> = validation.manifest;
   let openaiPath = manifestPath;
+  let openaiManifestPath = manifestRelative;
   if (!codexFallback && !isPlainObject(validation.manifest.extensions?.["com.openai"])) {
     const overlayPath = path.join(rootReal, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH);
     const overlay = await readManifestCandidate(rootReal, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH);
@@ -484,6 +490,7 @@ async function discoverPluginAt(args: {
       if (isPlainObject(extensions) && extensions["com.openai"] !== undefined) {
         openaiSource = { extensions: { "com.openai": extensions["com.openai"] } };
         openaiPath = overlayPath;
+        openaiManifestPath = CODEX_PLUGIN_MANIFEST_RELATIVE_PATH;
       }
     }
   }
@@ -554,7 +561,7 @@ async function discoverPluginAt(args: {
     dirName: args.dirName,
     manifest: validation.manifest,
     ...(codexFallback ? { codexFallback: true } : {}),
-    ...(openai.extension !== undefined ? { openai: openai.extension } : {}),
+    ...(openai.extension !== undefined ? { openai: openai.extension, openaiManifestPath } : {}),
     ...(skillsDir !== undefined ? { skillsDir } : {}),
     ...(mcpConfigPath !== undefined ? { mcpConfigPath } : {}),
     ...(mcpConfigPath !== undefined && mcpConfigDialect !== undefined ? { mcpConfigDialect } : {}),
