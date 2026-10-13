@@ -3,7 +3,7 @@ import { generateForkBranchName, generateForkTitle } from "./workspaceService";
 import * as fsPromises from "fs/promises";
 import { tmpdir } from "os";
 import path from "path";
-import { Err, Ok } from "@/common/types/result";
+import { Err, Ok, type Result } from "@/common/types/result";
 import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
 import { Config } from "@/node/config";
 import type { HistoryService } from "./historyService";
@@ -50,6 +50,35 @@ describe("WorkspaceService fork", () => {
 
   afterEach(async () => {
     await cleanupHistory();
+  });
+
+  test("a fork in flight refuses the pre-interruption archive hold on its source", async () => {
+    // Park the fork at its first await: its admission is counted in the synchronous entry block.
+    let releaseMetadata: (result: Result<WorkspaceMetadata, string>) => void = () => undefined;
+    const metadata = new Promise<Result<WorkspaceMetadata, string>>((resolve) => {
+      releaseMetadata = resolve;
+    });
+    const workspaceService = createWorkspaceServiceForTest({
+      config,
+      historyService,
+      aiService: createMockAIService({ getWorkspaceMetadata: mock(() => metadata) }),
+    });
+    const holdOptions = { queuedDelegatedTurnCount: 0, expectedDelegatedTurnCorrelations: [] };
+    const acquireHold = () =>
+      workspaceService.acquirePreInterruptionArchiveHold("fork-source", holdOptions);
+
+    const idle = acquireHold();
+    expect(idle.success).toBe(true);
+    if (idle.success) idle.data[Symbol.dispose]();
+
+    const forking = workspaceService.fork("fork-source");
+    expect(acquireHold().success).toBe(false);
+
+    releaseMetadata(Err("source is gone"));
+    expect((await forking).success).toBe(false);
+    const afterFork = acquireHold();
+    expect(afterFork.success).toBe(true);
+    if (afterFork.success) afterFork.data[Symbol.dispose]();
   });
 
   test("cleans up init state when orchestrateFork rejects", async () => {

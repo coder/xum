@@ -171,6 +171,7 @@ export async function buildWorkspaceComposition(
             ...defaultSkillRoots,
             projectPluginRoots: [
               ...listProjectMetadataRelativePaths("plugins").map((relativePath) =>
+                // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
                 args.runtime.normalizePath(relativePath, args.hostCheckoutRoot!)
               ),
               args.runtime.normalizePath(".agents/plugins", args.hostCheckoutRoot),

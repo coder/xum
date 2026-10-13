@@ -9,7 +9,7 @@
  *
  * Paths are checked lexically here (relative, no `..`, no absolute/home
  * prefix). A future consumer that opens one MUST resolve it through
- * discovery's realpath containment (ensurePathContained) first.
+ * discovery's realpath containment (ensurePluginPathContained, which also refuses .git) first.
  */
 import {
   AGENT_PLUGIN_SCHEMA_ID_1_0_0,

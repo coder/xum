@@ -43,6 +43,7 @@ export function createAsyncEventQueue<T>(): {
   async function* iterate(): AsyncGenerator<T> {
     while (!ended) {
       if (queue.length > 0) {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         yield queue.shift()!;
         continue;
       }

@@ -14,6 +14,12 @@ export interface DevToolsRun {
    * toggling). Absent on runs recorded by older binaries.
    */
   requestHistorySequence?: number;
+  /**
+   * The request's context epoch (the id of its first provider-request message), as the
+   * runtime prompt-cache monitor uses it. `/clear`, "start here" and context rollovers change
+   * it, and the replay step audit resets its baseline then. Absent on older runs.
+   */
+  contextEpoch?: string;
 }
 
 /** A "step" = a single LLM round-trip within a run. */

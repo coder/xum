@@ -18,6 +18,7 @@ export function compareMaps<K, V>(
 
   for (const [key, value] of next) {
     if (!prev.has(key)) return false;
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     if (!valueEquals(prev.get(key)!, value)) return false;
   }
 

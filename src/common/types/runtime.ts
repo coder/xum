@@ -4,7 +4,7 @@
 
 import type { z } from "zod";
 import type { RuntimeConfigSchema } from "../orpc/schemas";
-import { RuntimeEnablementIdSchema, RuntimeModeSchema } from "../orpc/schemas";
+import { RuntimeEnablementIdSchema, RuntimeModeSchema } from "../orpc/schemas/runtime";
 import type { CoderWorkspaceConfig } from "../orpc/schemas/coder";
 
 // Re-export CoderWorkspaceConfig type from schema (single source of truth)

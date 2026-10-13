@@ -161,11 +161,18 @@ interface ChatPaneProps {
   onOpenTerminal: (options?: TerminalSessionCreateOptions) => void;
   /** Hide + inactivate chat pane while immersive review overlay is active. */
   immersiveHidden?: boolean;
+  /** Phones: show the hidden right sidebar full-screen (see WorkspaceShell). */
+  onOpenSidebar?: (returnFocusTo: HTMLElement | null) => void;
+  sidebarFullscreen?: boolean;
 }
 
 export type ChatPaneContentProps = Omit<
   ChatPaneProps,
-  "leftSidebarCollapsed" | "onToggleLeftSidebarCollapsed" | "immersiveHidden"
+  | "leftSidebarCollapsed"
+  | "onToggleLeftSidebarCollapsed"
+  | "immersiveHidden"
+  | "onOpenSidebar"
+  | "sidebarFullscreen"
 > & {
   /**
    * Rendered inside another surface (the /side chat tab in the right sidebar) rather than as
@@ -295,6 +302,8 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
               namedWorkspacePath={props.namedWorkspacePath}
               runtimeConfig={props.runtimeConfig}
               onOpenTerminal={props.onOpenTerminal}
+              onOpenSidebar={props.onOpenSidebar}
+              sidebarFullscreen={props.sidebarFullscreen}
             />
           </PerfRenderMarker>
 
@@ -1544,7 +1553,12 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             // for visibility — using a container query rather than a viewport media
             // query means sidebars opening/closing correctly hide the TOC even when
             // the viewport width is unchanged. See `.plan-toc-aside` in globals.css.
-            className="@container/transcript flex h-full flex-col overflow-x-hidden overflow-y-auto px-[15px] pt-[15px] leading-[1.5] break-words whitespace-pre-wrap"
+            // `--chat-reserved-inline-end`: room a layout floats over the chat's right edge (the
+            // collapsed right sidebar's overview card, see globals.css). Padding by it centers the
+            // column, and the composer under it, in the space left of the overlay, so the column
+            // sits as far from the overlay as from the left edge. The transcript container query
+            // measures the content box, so the plan TOC sees the narrower gutters too.
+            className="@container/transcript flex h-full flex-col overflow-x-hidden overflow-y-auto pt-[15px] pr-[calc(15px+var(--chat-reserved-inline-end,0px))] pl-[15px] leading-[1.5] break-words whitespace-pre-wrap"
           >
             <div
               // While locked, opt the whole transcript subtree out of scroll
@@ -1564,7 +1578,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                 // overlap content or get clipped by `overflow-x-hidden`.
                 // `w-full` is required in the centered mode because auto cross-axis
                 // margins disable flex-item stretch.
-                chatTranscriptFullWidth ? "w-full" : "plan-toc-aware max-w-4xl mx-auto w-full",
+                chatTranscriptFullWidth ? "w-full" : "plan-toc-aware max-w-chat mx-auto w-full",
                 // Push the dock to the bottom for short transcripts without reserving
                 // loading space: cached replay overlays the dock edge, not transcript rows.
                 "flex-1",
@@ -1653,7 +1667,8 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                   --composer-h channel to lag a frame behind and tear), while
                   `sticky` keeps the composer visually pinned over the transcript
                   when the user scrolls up. `mx-[-15px]` cancels the scrollport's
-                  horizontal padding so the dock stays full-bleed; `whitespace-normal
+                  gutter so the dock reaches the edges (short of any reserved overlay
+                  room on the right); `whitespace-normal
                   break-normal` reset the transcript text inheritance. clientHeight
                   of the scrollport never changes with dock height (send-flash
                   invariant). `bg-surface-primary` keeps transcript content from

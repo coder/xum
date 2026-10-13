@@ -43,6 +43,7 @@ import {
   isProviderDefinedToolRecord,
   providerToolFingerprint,
 } from "@/node/services/turnEnvelope";
+import { auditStepPrefixes, type StepPrefixAudit } from "./cacheAudit";
 import { buildReplayRequest } from "./replayRequestBuilder";
 
 export const DEVTOOLS_LOG_FILE_NAME = "devtools.jsonl";
@@ -63,27 +64,52 @@ export interface RecordedProviderRequest {
   requestHistorySequence?: number;
 }
 
+/** Every step of one recorded run, for the step-by-step prefix rule (cacheAudit.ts). */
+export interface RecordedStepRequest {
+  runId: string;
+  stepId: string;
+  stepNumber: number;
+  /** ISO start time: the audit treats a gap longer than the cache TTL as an expired entry. */
+  startedAt: string;
+  modelId: string;
+  /** AI SDK provider id, e.g. "anthropic.messages"; null when the SDK did not report one. */
+  provider: string | null;
+  prompt: unknown;
+  tools: unknown;
+  /** The step's AI SDK call options: they carry thinking, effort and tool choice. */
+  providerOptions?: unknown;
+  toolChoice?: unknown;
+  requestHistorySequence?: number;
+  /** See DevToolsRun.contextEpoch; absent on runs recorded by older binaries. */
+  contextEpoch?: string;
+}
+
+/** One parse of devtools.jsonl, shared by the first-request replay and the step audit. */
+export interface DevtoolsLogSnapshot {
+  runs: Array<{ run: DevToolsRun; steps: DevToolsStep[] }>;
+  /** Steps of known runs in the order the log recorded them (overlapping runs interleave). */
+  stepsInLogOrder: Array<{ run: DevToolsRun; step: DevToolsStep }>;
+  stepUsageUpdates: Map<string, DevToolsUsage | null>;
+  /** Steps whose finalization recorded an error (aborted or rejected calls). */
+  failedStepIds: Set<string>;
+}
+
 /**
- * Parse devtools.jsonl into per-run first-step requests. Tolerant reader
- * (self-heal doctrine): malformed lines and unknown entry types are skipped.
- * Later steps of a run are SDK-internal tool loops whose extra messages come
- * from the streamed output (persisted at turn end), so the log-purity
- * comparison targets step 0 — the request assembled from chat.jsonl.
+ * Tolerant devtools.jsonl reader (self-heal doctrine): malformed lines and
+ * unknown entry types are skipped. Returns runs in log order with their steps.
  */
-export async function readRecordedRequests(sessionDir: string): Promise<RecordedProviderRequest[]> {
-  const filePath = path.join(sessionDir, DEVTOOLS_LOG_FILE_NAME);
+export async function readDevtoolsLog(sessionDir: string): Promise<DevtoolsLogSnapshot> {
+  const runs = new Map<string, { run: DevToolsRun; steps: DevToolsStep[] }>();
+  const stepUsageUpdates = new Map<string, DevToolsUsage | null>();
   let raw: string;
   try {
-    raw = await fs.readFile(filePath, "utf-8");
+    raw = await fs.readFile(path.join(sessionDir, DEVTOOLS_LOG_FILE_NAME), "utf-8");
   } catch {
-    return [];
+    return { runs: [], stepsInLogOrder: [], stepUsageUpdates, failedStepIds: new Set() };
   }
 
-  const runOrder: string[] = [];
-  const runsById = new Map<string, DevToolsRun>();
-  const firstSteps = new Map<string, DevToolsStep>();
-  const stepUsageUpdates = new Map<string, DevToolsUsage | null>();
-
+  const orphanSteps: DevToolsStep[] = [];
+  const failedStepIds = new Set<string>();
   for (const line of raw.split("\n")) {
     if (!line.trim()) {
       continue;
@@ -95,27 +121,55 @@ export async function readRecordedRequests(sessionDir: string): Promise<Recorded
       continue;
     }
     if (entry.type === "run") {
-      runOrder.push(entry.run.id);
-      runsById.set(entry.run.id, entry.run);
+      // DevToolsService appends a healed duplicate header (without the run metadata) when a
+      // retention-evicted run logs another step. The first header carries the metadata, so
+      // keep it; the duplicate's steps attach to it by run id below.
+      if (!runs.has(entry.run.id)) runs.set(entry.run.id, { run: entry.run, steps: [] });
     } else if (entry.type === "step") {
-      const existing = firstSteps.get(entry.step.runId);
-      if (existing == null || entry.step.stepNumber < existing.stepNumber) {
-        firstSteps.set(entry.step.runId, entry.step);
+      orphanSteps.push(entry.step);
+    } else if (entry.type === "step-update") {
+      if (entry.update.usage !== undefined) {
+        stepUsageUpdates.set(entry.stepId, entry.update.usage);
       }
-    } else if (entry.type === "step-update" && entry.update.usage !== undefined) {
-      stepUsageUpdates.set(entry.stepId, entry.update.usage);
+      if (entry.update.error != null) {
+        failedStepIds.add(entry.stepId);
+      }
     }
   }
+  const stepsInLogOrder: DevtoolsLogSnapshot["stepsInLogOrder"] = [];
+  for (const step of orphanSteps) {
+    const owner = runs.get(step.runId);
+    if (owner == null) continue;
+    owner.steps.push(step);
+    stepsInLogOrder.push({ run: owner.run, step });
+  }
+  for (const { steps } of runs.values()) {
+    steps.sort((a, b) => a.stepNumber - b.stepNumber);
+  }
+  return { runs: [...runs.values()], stepsInLogOrder, stepUsageUpdates, failedStepIds };
+}
 
+/**
+ * Parse devtools.jsonl into per-run first-step requests. Later steps of a run
+ * are SDK-internal tool loops whose extra messages come from the streamed
+ * output (persisted at turn end), so the log-purity comparison targets
+ * step 0 — the request assembled from chat.jsonl.
+ */
+export async function readRecordedRequests(sessionDir: string): Promise<RecordedProviderRequest[]> {
+  return recordedRequestsFromLog(await readDevtoolsLog(sessionDir));
+}
+
+function recordedRequestsFromLog(log: DevtoolsLogSnapshot): RecordedProviderRequest[] {
+  const { runs, stepUsageUpdates } = log;
   const requests: RecordedProviderRequest[] = [];
-  for (const runId of runOrder) {
-    const step = firstSteps.get(runId);
+  for (const { run, steps } of runs) {
+    const step = steps.at(0);
     if (step?.input == null) {
       continue;
     }
-    const requestHistorySequence = runsById.get(runId)?.requestHistorySequence;
+    const requestHistorySequence = run.requestHistorySequence;
     requests.push({
-      runId,
+      runId: run.id,
       stepId: step.id,
       startedAt: step.startedAt,
       modelId: step.modelId,
@@ -126,6 +180,44 @@ export async function readRecordedRequests(sessionDir: string): Promise<Recorded
     });
   }
   return requests;
+}
+
+/**
+ * Every recorded step with an input, in the order the log recorded them. Overlapping runs in one
+ * workspace interleave (A0, B0, A1), and that order is the order the provider saw the requests.
+ */
+export function recordedStepsFromLog(log: DevtoolsLogSnapshot): RecordedStepRequest[] {
+  return log.stepsInLogOrder.flatMap(({ run, step }) =>
+    // A step that failed without usage never produced a cache read or write (aborted or
+    // rejected before Anthropic processed it), so like the runtime monitor it is not a request.
+    step.input == null ||
+    (log.failedStepIds.has(step.id) && log.stepUsageUpdates.get(step.id) == null)
+      ? []
+      : [
+          {
+            runId: run.id,
+            stepId: step.id,
+            stepNumber: step.stepNumber,
+            startedAt: step.startedAt,
+            modelId: step.modelId,
+            provider: step.provider,
+            prompt: step.input.prompt,
+            tools: step.input.tools,
+            ...(step.input.providerOptions != null
+              ? { providerOptions: step.input.providerOptions }
+              : {}),
+            ...(step.input.toolChoice != null ? { toolChoice: step.input.toolChoice } : {}),
+            ...(run.requestHistorySequence != null
+              ? { requestHistorySequence: run.requestHistorySequence }
+              : {}),
+            ...(run.contextEpoch != null ? { contextEpoch: run.contextEpoch } : {}),
+          },
+        ]
+  );
+}
+
+export async function readRecordedSteps(sessionDir: string): Promise<RecordedStepRequest[]> {
+  return recordedStepsFromLog(await readDevtoolsLog(sessionDir));
 }
 
 /** First structural difference between two JSON values (depth-first). */
@@ -206,6 +298,8 @@ export interface ReplayVerifyTurnResult {
 
 export interface ReplayVerifySessionResult {
   turns: ReplayVerifyTurnResult[];
+  /** Prefix rule over every recorded step (not only each turn's first request). */
+  stepPrefix: StepPrefixAudit;
   /** Correlation notes (count mismatches between logs). */
   notes: string[];
 }
@@ -483,6 +577,58 @@ function pairSessionTurns(
   return pairings;
 }
 
+/**
+ * The prefix rule over every recorded step of a session (see auditStepPrefixes).
+ * Compaction runs send another system prompt and the summary request by
+ * design, so they are skipped. Their summary row drops requestHistorySequence,
+ * so they are keyed on the compaction request row: the newest row the run was
+ * built from.
+ */
+export function auditStepPrefixesFromLog(
+  log: DevtoolsLogSnapshot,
+  historyMessages: MuxMessage[]
+): StepPrefixAudit {
+  const compactionSequences = new Set(
+    historyMessages.flatMap((message) => {
+      const metadata = message.metadata;
+      // A compaction request row, or a compact-agent turn: the resume path sends agentId
+      // "compact" without a request row, and its run carries that turn's request sequence.
+      if (
+        message.role === "user" &&
+        metadata?.muxMetadata?.type === "compaction-request" &&
+        metadata.historySequence != null
+      ) {
+        return [metadata.historySequence];
+      }
+      if (
+        message.role === "assistant" &&
+        metadata?.agentId === "compact" &&
+        metadata.requestHistorySequence != null
+      ) {
+        return [metadata.requestHistorySequence];
+      }
+      return [];
+    })
+  );
+  // Only chat-turn runs carry requestHistorySequence (TurnRequestBuilder sets it with the turn's
+  // prompt-cache scope). Headless side calls (refinement, branch summaries, continuous compaction,
+  // intuition, evaluation) log runs without it: like the runtime monitor, ignore them, so they
+  // neither break nor replace the chat baseline. Older logs without the field are not audited.
+  return auditStepPrefixes(
+    recordedStepsFromLog(log),
+    (step) =>
+      step.requestHistorySequence != null && compactionSequences.has(step.requestHistorySequence),
+    (step) => step.requestHistorySequence == null
+  );
+}
+
+export async function auditRecordedStepPrefixes(
+  sessionDir: string,
+  historyMessages: MuxMessage[]
+): Promise<StepPrefixAudit> {
+  return auditStepPrefixesFromLog(await readDevtoolsLog(sessionDir), historyMessages);
+}
+
 /** Narrow the persisted envelope string to the AnthropicCacheTtl union. */
 function parseAnthropicCacheTtl(value: string | undefined): AnthropicCacheTtl | undefined {
   return value === "5m" || value === "1h" ? value : undefined;
@@ -506,11 +652,14 @@ export async function replayVerifySession(params: {
   const envelopes = events.filter(
     (event): event is TurnEnvelopeEvent => event.kind === "turn-envelope"
   );
-  const recorded = await readRecordedRequests(params.sessionDir);
+  // One snapshot for both checks: a live log can grow between two reads.
+  const devtoolsLog = await readDevtoolsLog(params.sessionDir);
+  const recorded = recordedRequestsFromLog(devtoolsLog);
   const turns = collectAssistantTurns(params.historyMessages);
 
   const notes: string[] = [];
   const pairings = pairSessionTurns(envelopes, recorded, turns, notes);
+  const stepPrefix = auditStepPrefixesFromLog(devtoolsLog, params.historyMessages);
 
   const results: ReplayVerifyTurnResult[] = [];
   for (const [i, pairing] of pairings.entries()) {
@@ -654,5 +803,5 @@ export async function replayVerifySession(params: {
     }
   }
 
-  return { turns: results, notes };
+  return { turns: results, stepPrefix, notes };
 }

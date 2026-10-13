@@ -16,6 +16,24 @@ import {
   resolveBetweenToolsThinkingLevel,
 } from "./policy";
 
+describe("Muse Wonder thinking policy", () => {
+  test("clamps disabled reasoning while preserving native xhigh and max", () => {
+    for (const model of ["meta:muse-wonder-1.0", "openrouter:meta/muse-wonder-1.0"]) {
+      expect(getThinkingPolicyForModel(model)).toEqual(["low", "medium", "high", "xhigh", "max"]);
+      expect(enforceThinkingPolicy(model, "off")).toBe("low");
+      expect(resolveEffectiveThinkingLevel(model, undefined)).toBe("low");
+      expect(enforceThinkingPolicy(model, "xhigh")).toBe("xhigh");
+      expect(enforceThinkingPolicy(model, "max")).toBe("max");
+      expect(getDefaultMinimumThinkingLevel(model)).toBe("medium");
+    }
+  });
+
+  test("does not infer Wonder capabilities for similarly named custom models", () => {
+    expect(enforceThinkingPolicy("meta:muse-wonder-1.0-custom", "off")).toBe("off");
+    expect(enforceThinkingPolicy("meta:muse-wonder-full", "max")).toBe("high");
+  });
+});
+
 describe("getThinkingPolicyForModel", () => {
   test.each(["gpt-6-luna"])("preserves off and native max for %s", (model) => {
     for (const id of [
