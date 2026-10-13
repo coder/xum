@@ -138,15 +138,21 @@ export function mapSkillsByName(skills: AgentSkillDescriptor[]): Map<string, Age
     }
     byName.set(skill.name, skill);
   }
-  // `/pstack:tdd` must also reach a plugin skill that won its bare name (it is
-  // listed bare). Shadowed ones are already listed qualified.
-  for (const skill of byName.values()) {
+
+  addQualifiedPluginAliases(byName);
+  return byName;
+}
+
+/**
+ * `/pstack:tdd` must also reach a plugin skill that won its bare name (it is
+ * listed bare). Shadowed ones are already listed qualified.
+ */
+function addQualifiedPluginAliases(byName: Map<string, AgentSkillDescriptor>): void {
+  for (const skill of [...byName.values()]) {
     if (skill.pluginName == null || skill.name.includes(":")) continue;
     const qualified = formatQualifiedSkillName(skill.pluginName, skill.name);
     if (!byName.has(qualified)) byName.set(qualified, skill);
   }
-
-  return byName;
 }
 
 export function parseAcpSlashCommand(
