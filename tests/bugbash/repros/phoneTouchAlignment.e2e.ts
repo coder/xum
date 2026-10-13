@@ -77,6 +77,40 @@ for (const width of [390, 768]) {
   );
 }
 
+/**
+ * Measures the first checkbox matching `selector` and the element `line` returns for it. The
+ * checkbox draws its box on an inner `aria-hidden` span, so `drawnBox` measures that span: the
+ * Radix button can be a larger, invisible hit area. Returns null if an element is missing.
+ */
+function measureCheckbox(
+  browser: Browser,
+  selector: string,
+  line: "nextTitle" | "forLabel"
+): Promise<{ drawnBox: number; button: number; centerGap: number; rowHeight: number } | null> {
+  return browser.evaluate(
+    ([sel, which]) => {
+      const checkbox = document.querySelector(sel);
+      const box = checkbox?.querySelector(':scope > [aria-hidden="true"]');
+      const text =
+        which === "nextTitle"
+          ? checkbox?.nextElementSibling?.firstElementChild
+          : document.querySelector(`label[for="${checkbox?.id ?? ""}"]`);
+      if (!checkbox || !box || !text) return null;
+      const b = box.getBoundingClientRect();
+      const t = text.getBoundingClientRect();
+      const button = checkbox.getBoundingClientRect();
+      const row = checkbox.closest("label") ?? checkbox;
+      return {
+        drawnBox: Math.round(Math.max(b.width, b.height)),
+        button: Math.round(Math.min(button.width, button.height)),
+        centerGap: Math.abs(b.top + b.height / 2 - (t.top + t.height / 2)),
+        rowHeight: Math.round(row.getBoundingClientRect().height),
+      };
+    },
+    [selector, line] as const
+  );
+}
+
 test(
   "Checkboxes keep their size and line up with their labels on a touch phone",
   { tags: ["bugbash", "touch-alignment", "5835"] },
@@ -87,28 +121,38 @@ test(
     await screen.getByRole("button", "Backup").tap();
     await applyTouchPointerRules(browser);
 
-    // Before the fix the 44px minimum drew each checkbox as a 44px square, and its middle sat
-    // 14px below the middle of its label's first line. Inside a label the button shrink-wraps the
-    // drawn box, so the button's size is the drawn size.
+    // A checkbox inside a label. Before the fix the 44px minimum drew each checkbox as a 44px
+    // square, and its middle sat 14px below the middle of its label's first line.
     const measure = () =>
-      browser.evaluate(() => {
-        const checkbox = document.querySelector('[role=dialog] label button[role="checkbox"]');
-        const title = checkbox?.nextElementSibling?.firstElementChild;
-        const row = checkbox?.closest("label");
-        if (!checkbox || !title || !row) return null;
-        const b = checkbox.getBoundingClientRect();
-        const t = title.getBoundingClientRect();
-        return {
-          drawnBox: Math.round(Math.max(b.width, b.height)),
-          centerGap: Math.abs(b.top + b.height / 2 - (t.top + t.height / 2)),
-          rowHeight: Math.round(row.getBoundingClientRect().height),
-        };
-      });
+      measureCheckbox(browser, '[role=dialog] label button[role="checkbox"]', "nextTitle");
     await expect.poll(async () => (await measure())?.drawnBox ?? 999).toBeLessThanOrEqual(20);
     const result = await measure();
     expect(result?.centerGap ?? 999).toBeLessThanOrEqual(2);
     // The label row stays a 44px touch target.
     expect(result?.rowHeight ?? 0).toBeGreaterThanOrEqual(44);
+  }
+);
+
+test(
+  "A checkbox beside its label keeps a 44px hit area and a small box on a touch phone",
+  { tags: ["bugbash", "touch-alignment", "5835"] },
+  async ({ app, screen, browser }) => {
+    await browser.setViewport({ width: 390, height: 844 });
+    await openPlayground(app, screen, browser);
+    await screen.getByTestId("workspace-more-actions").tap();
+    await screen.getByRole("button", /^Configure heartbeat/).tap();
+    await expect(screen.getByRole("dialog", "Configure heartbeat")).toBeVisible();
+    await applyTouchPointerRules(browser);
+
+    // The heartbeat modal's checkbox has a sibling <label for>, so the label is not a touch
+    // target: the button itself must stay 44px, and draw its box at its own size, centered on
+    // the label's line.
+    const measure = () =>
+      measureCheckbox(browser, "#workspace-heartbeat-use-default-interval", "forLabel");
+    await expect.poll(async () => (await measure())?.drawnBox ?? 999).toBeLessThanOrEqual(20);
+    const result = await measure();
+    expect(result?.button ?? 0).toBeGreaterThanOrEqual(44);
+    expect(result?.centerGap ?? 999).toBeLessThanOrEqual(2);
   }
 );
 

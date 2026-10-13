@@ -493,17 +493,19 @@ jobs:
           NODE_OPTIONS: --max-old-space-size=4096
           BUGBASH_REPROS: "0"
         run: make test-e2e PLAYWRIGHT_ARGS="tests/e2e/scenarios/windowLifecycle.spec.ts"
-      # A failed bug-bash repro writes its screen (accessibility tree, focus) under
-      # tests/bugbash/.e2e/, next to the report. On the host the app log goes to e2e.config.ts's
-      # default, .e2e/logs/app.log. Upload them, so a flaky failure (#5810) leaves evidence.
+      # A failed bug-bash repro writes its trace page, screen (accessibility tree, focus) and
+      # failure screenshot under tests/bugbash/.e2e/<phase>/results/<test>/ (e2e 0.20+), next to
+      # the report. On the host the app log goes to e2e.config.ts's default, .e2e/logs/app.log.
+      # Upload them, so a flaky failure (#5810) leaves evidence.
       - name: Upload bug-bash repro failures
         if: failure() && matrix.shard == '1/4'
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: bugbash-repro-failures
           path: |
-            tests/bugbash/.e2e/repros*/artifacts/**/failure/
-            tests/bugbash/.e2e/repros*/artifacts/**/screenshots/*-failure.png
+            tests/bugbash/.e2e/repros*/results/*/trace.md
+            tests/bugbash/.e2e/repros*/results/**/screen-at-failure.txt
+            tests/bugbash/.e2e/repros*/results/**/screenshots/*-failure.png
             tests/bugbash/.e2e/repros*/report.json
             tests/bugbash/.e2e/logs/app.log
           # Every path is under the hidden .e2e folder, which upload-artifact skips by default.

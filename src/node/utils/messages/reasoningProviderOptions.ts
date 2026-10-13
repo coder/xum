@@ -6,6 +6,13 @@ import type { MuxMessage, MuxReasoningPart } from "@/common/types/message";
 // providerMetadata.
 export type ReasoningProviderMetadata = NonNullable<MuxReasoningPart["providerOptions"]>;
 
+type AssistantModelPart = Exclude<
+  Extract<ModelMessage, { role: "assistant" }>["content"],
+  string
+>[number];
+/** A reasoning part of an assistant ModelMessage. */
+export type ReasoningModelPart = Extract<AssistantModelPart, { type: "reasoning" }>;
+
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null
     ? (value as Record<string, unknown>)
@@ -181,16 +188,26 @@ export function attachReasoningReplayMetadata(messages: MuxMessage[]): MuxMessag
   });
 }
 
+/** True for a reasoning part that replays `namespace` reasoning data. */
+function isReasoningReplayOf(
+  part: AssistantModelPart,
+  namespace: "openai" | "anthropic"
+): part is ReasoningModelPart {
+  return part.type === "reasoning" && part.providerOptions?.[namespace] != null;
+}
+
 /**
  * Remove one provider's rejected reasoning from a request, not persisted history.
  * SDK step messages also carry this namespace. Keep visible text, tools, and
  * other-provider reasoning; drop only assistants this repair leaves without
  * content (Anthropic rejects whitespace-only text blocks).
  * Preserve input identities on no-op so the caller can decline a useless retry.
+ * `onlyIf` narrows the strip to some of the namespace's parts (the receipt's point).
  */
 export function stripReasoningReplay(
   messages: ModelMessage[],
-  namespace: "openai" | "anthropic"
+  namespace: "openai" | "anthropic",
+  onlyIf: (part: ReasoningModelPart) => boolean = () => true
 ): ModelMessage[] {
   let changed = false;
   const stripped: ModelMessage[] = [];
@@ -200,7 +217,7 @@ export function stripReasoningReplay(
       continue;
     }
     const content = message.content.filter(
-      (part) => !(part.type === "reasoning" && part.providerOptions?.[namespace] != null)
+      (part) => !(isReasoningReplayOf(part, namespace) && onlyIf(part))
     );
     if (content.length === message.content.length) {
       stripped.push(message);
