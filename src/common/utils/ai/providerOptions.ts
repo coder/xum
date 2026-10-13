@@ -185,6 +185,37 @@ type ProviderOptions =
   | { bedrock: BedrockProviderOptions }
   | Record<string, never>; // Empty object for unsupported providers
 
+// Simple direct providers have self-contained reasoning controls. Keep these
+// separate from the gateway/OpenAI branches so vendor-only settings cannot leak.
+const DIRECT_REASONING_BUILDERS: Record<
+  string,
+  ((model: string, thinking: ThinkingLevel) => ProviderOptions) | undefined
+> = {
+  meta: (_model, thinking) => ({
+    // Meta uses the OpenAI Responses wire format. Stateless encrypted replay
+    // preserves reasoning across agent tool turns under the existing SDK namespace.
+    openai: {
+      forceReasoning: true, // The OpenAI SDK does not recognize Meta's model IDs.
+      store: false,
+      include: ["reasoning.encrypted_content"],
+      reasoningEffort: thinking === "off" ? "low" : thinking,
+      reasoningSummary: "auto",
+    },
+  }),
+  moonshotai: (model): ProviderOptions => {
+    // Kimi K3 always reasons and supports only max; do not rely on the API default.
+    return isKimiK3Model(model) ? { moonshotai: { reasoningEffort: "max" } } : {};
+  },
+  zai: (model, thinking): ProviderOptions => {
+    if (!isGlm53Model(model)) return {};
+    const reasoningEffort: ZaiLanguageModelChatOptions["reasoningEffort"] =
+      thinking === "max" ? "max" : thinking === "high" || thinking === "xhigh" ? "high" : "low";
+    return {
+      zai: { thinking: { type: "enabled" }, reasoningEffort, toolStream: true },
+    };
+  },
+};
+
 /** The subset of @ai-sdk/amazon-bedrock options Xum sends. */
 interface BedrockProviderOptions {
   [key: string]: JSONValue | undefined;
@@ -394,7 +425,9 @@ export function buildProviderOptions(
   // SDK payload-family selection: passthrough gateways use origin payloads,
   // while transforming gateways use the route provider's payload schema.
   const formatProvider =
-    providerOptionsNamespaceKey === origin ? origin : (routeProvider ?? origin);
+    providerOptionsNamespaceKey === resolveProviderOptionsNamespaceKey(origin)
+      ? origin
+      : (routeProvider ?? origin);
 
   // Fast mode follows the actual route/wire, not capability aliases or thinking.
   // Ultrafast is additionally model-gated; unsupported models drop the tier.
@@ -740,40 +773,13 @@ export function buildProviderOptions(
     return options;
   }
 
-  // Build Moonshot-specific options
-  if (formatProvider === "moonshotai") {
-    // Kimi K3 always reasons and supports only the max reasoning effort. Send it
-    // explicitly rather than relying on the API default.
-    if (isKimiK3Model(capabilityModel)) {
-      const options = {
-        moonshotai: { reasoningEffort: "max" },
-      } satisfies { moonshotai: MoonshotAIProviderOptions };
-      log.debug("buildProviderOptions: Returning Moonshot options", options);
-      return options;
-    }
-    return {};
-  }
-
-  // Build Z.ai-specific options
-  if (formatProvider === "zai") {
-    if (!isGlm53Model(capabilityModel)) {
-      return {};
-    }
-
-    const reasoningEffort: ZaiLanguageModelChatOptions["reasoningEffort"] =
-      effectiveThinking === "max"
-        ? "max"
-        : effectiveThinking === "high" || effectiveThinking === "xhigh"
-          ? "high"
-          : "low";
-    const options = {
-      zai: {
-        thinking: { type: "enabled" },
-        reasoningEffort,
-        toolStream: true,
-      },
-    } satisfies { zai: ZaiLanguageModelChatOptions };
-    log.debug("buildProviderOptions: Returning Z.ai options", options);
+  const directReasoningBuilder = DIRECT_REASONING_BUILDERS[formatProvider];
+  if (Object.hasOwn(DIRECT_REASONING_BUILDERS, formatProvider) && directReasoningBuilder) {
+    const options = directReasoningBuilder(capabilityModel, effectiveThinking);
+    log.debug("buildProviderOptions: Returning direct provider options", {
+      formatProvider,
+      options,
+    });
     return options;
   }
 

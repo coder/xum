@@ -71,6 +71,119 @@ describe("HistoryService partial persistence - Error Recovery", () => {
     expect(await partialService.readPartial(workspaceId)).toBeNull();
   });
 
+  test("commitPartial reports the empty errored reply row it deletes, and only that (#6116)", async () => {
+    const workspaceId = "test-workspace";
+    const deleted: Array<[string, number[]]> = [];
+    const stop = partialService.onEmptyErroredReplyDeleted((id, sequence) =>
+      deleted.push([id, sequence])
+    );
+    const errored = (id: string, historySequence: number, text?: string): MuxMessage => ({
+      id,
+      role: "assistant",
+      metadata: { historySequence, partial: true, error: "Stream error", errorType: "api" },
+      parts: text === undefined ? [] : [{ type: "text", text }],
+    });
+
+    // An errored reply with output is committed, not deleted: nothing to report.
+    const withOutput = errored("msg-1", 1, "half an answer");
+    await appendPlaceholder(partialService, workspaceId, withOutput);
+    expect((await partialService.writePartial(workspaceId, withOutput)).success).toBe(true);
+    expect((await partialService.commitPartial(workspaceId)).success).toBe(true);
+    expect(deleted).toEqual([]);
+
+    const empty = errored("msg-2", 2);
+    await appendPlaceholder(partialService, workspaceId, empty);
+    expect((await partialService.writePartial(workspaceId, empty)).success).toBe(true);
+    expect((await partialService.commitPartial(workspaceId)).success).toBe(true);
+    expect(deleted).toEqual([[workspaceId, [2]]]);
+    const history = await partialService.getHistoryFromLatestBoundary(workspaceId);
+    expect(history.success && history.data.map((m) => m.id)).toEqual(["msg-1"]);
+
+    stop();
+    const later = errored("msg-3", 3);
+    await appendPlaceholder(partialService, workspaceId, later);
+    expect((await partialService.writePartial(workspaceId, later)).success).toBe(true);
+    expect((await partialService.commitPartial(workspaceId)).success).toBe(true);
+    expect(deleted).toEqual([[workspaceId, [2]]]);
+  });
+
+  test("commitPartial reports a delete whose partial cleanup failed, and every duplicate it removed (#6116)", async () => {
+    const workspaceId = "test-workspace";
+    const deleted: number[][] = [];
+    const stop = partialService.onEmptyErroredReplyDeleted((_id, sequences) =>
+      deleted.push(sequences)
+    );
+    try {
+      const empty: MuxMessage = {
+        id: "msg-1",
+        role: "assistant",
+        metadata: { historySequence: 1, partial: true, error: "Stream error", errorType: "api" },
+        parts: [],
+      };
+      await appendPlaceholder(partialService, workspaceId, empty);
+      // Corrupted history: a later duplicate of the same id. The delete by id removes both.
+      await appendPlaceholder(partialService, workspaceId, {
+        ...empty,
+        metadata: { historySequence: 2 },
+      });
+      expect((await partialService.writePartial(workspaceId, empty)).success).toBe(true);
+
+      // The rows are deleted, then removing partial.json fails once.
+      const realUnlink = fs.unlink.bind(fs);
+      let failed = false;
+      const unlinkSpy = spyOn(fs, "unlink").mockImplementation((target) => {
+        if (!failed && String(target).endsWith("partial.json")) {
+          failed = true;
+          return Promise.reject(
+            Object.assign(new Error("EBUSY: resource busy"), { code: "EBUSY" })
+          );
+        }
+        return realUnlink(target);
+      });
+      try {
+        expect((await partialService.commitPartial(workspaceId)).success).toBe(false);
+      } finally {
+        unlinkSpy.mockRestore();
+      }
+      expect(deleted).toEqual([[1, 2]]);
+      const history = await partialService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success && history.data).toEqual([]);
+
+      // The retry finds the partial orphaned: nothing is left to report.
+      expect((await partialService.commitPartial(workspaceId)).success).toBe(true);
+      expect(deleted).toEqual([[1, 2]]);
+    } finally {
+      stop();
+    }
+  });
+
+  test("a throwing empty-errored-reply listener skips no other listener and no commit (#6116)", async () => {
+    const workspaceId = "test-workspace";
+    const received: number[][] = [];
+    const stopThrowing = partialService.onEmptyErroredReplyDeleted(() => {
+      throw new Error("listener failed");
+    });
+    const stopReceiving = partialService.onEmptyErroredReplyDeleted((_id, sequences) =>
+      received.push(sequences)
+    );
+    try {
+      const empty: MuxMessage = {
+        id: "msg-1",
+        role: "assistant",
+        metadata: { historySequence: 1, partial: true, error: "Stream error", errorType: "api" },
+        parts: [],
+      };
+      await appendPlaceholder(partialService, workspaceId, empty);
+      expect((await partialService.writePartial(workspaceId, empty)).success).toBe(true);
+      expect(await partialService.commitPartial(workspaceId)).toEqual(Ok(undefined));
+      expect(received).toEqual([[1]]);
+      expect(await partialService.readPartial(workspaceId)).toBeNull();
+    } finally {
+      stopThrowing();
+      stopReceiving();
+    }
+  });
+
   test("updatePartialIfMessageIdMatches waits out a commitPartial transaction and declines", async () => {
     const workspaceId = "test-workspace";
     const partial: MuxMessage = {

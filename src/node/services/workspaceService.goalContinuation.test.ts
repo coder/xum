@@ -732,6 +732,21 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
       expect(result?.model).toContain("sonnet");
     });
 
+    // A `/goal` before any chat message leaves the workspace without AI settings.
+    test("falls back to the configured default model when nothing else names one", async () => {
+      const projectPath = "/tmp/proj";
+      const workspaceId = "ws-1";
+      const projects = new Map([
+        [projectPath, { workspaces: [{ id: workspaceId, path: "/tmp/proj/ws" }] }],
+      ]);
+      const service = await makeServiceWithConfig({
+        projects,
+        defaultModel: "anthropic:claude-haiku-4-5",
+      });
+      const result = await service.getGoalContinuationKickoffSendOptions(workspaceId);
+      expect(result?.model).toBe("anthropic:claude-haiku-4-5");
+    });
+
     test("model-less reasoning-only agent default still contributes its fields", async () => {
       const projectPath = "/tmp/proj";
       const workspaceId = "ws-1";

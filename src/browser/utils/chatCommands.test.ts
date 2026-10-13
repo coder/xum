@@ -991,7 +991,7 @@ describe("processSlashCommand goal results", () => {
           workspace: {
             getGoal: mock(() =>
               Promise.resolve({
-                goal: { goalId: "11111111-1111-4111-8111-111111111111" },
+                goal: { goalId: "11111111-1111-4111-8111-111111111111", status: "active" },
               })
             ),
             setGoal,
@@ -1050,13 +1050,70 @@ describe("processSlashCommand goal results", () => {
     });
   });
 
+  // The backend lets the user move a completed goal to paused (a revive); /goal pause must not.
+  test.each(["complete", "paused", null] as const)(
+    "refuses /goal pause without a running goal (%p)",
+    async (status) => {
+      const setGoal = mock();
+      const settled = await finishCommand(
+        await processSlashCommand(
+          { type: "goal-pause" },
+          createGoalEnv({
+            workspace: {
+              getGoal: mock(() =>
+                Promise.resolve({ goal: status == null ? null : { goalId: "id", status } })
+              ),
+              setGoal,
+            },
+          } as unknown as SlashCommandEnv["api"])
+        )
+      );
+      expect(setGoal).not.toHaveBeenCalled();
+      expectDisposition(settled.result, "restore");
+      expect(settled.result.actions[0]).toMatchObject({
+        type: "show-toast",
+        toast: { type: "error" },
+      });
+    }
+  );
+
+  test.each([
+    { status: "paused", opensForm: true },
+    { status: "complete", opensForm: false },
+    { status: null, opensForm: false },
+  ] as const)(
+    "/goal complete without a summary opens the form only for a completable goal ($status)",
+    async ({ status, opensForm }) => {
+      ensureWindowDispatchEvent();
+      const settled = await finishCommand(
+        await processSlashCommand(
+          { type: "goal-complete" },
+          createGoalEnv({
+            workspace: {
+              getGoal: mock(() =>
+                Promise.resolve({ goal: status == null ? null : { goalId: "id", status } })
+              ),
+            },
+          } as unknown as SlashCommandEnv["api"])
+        )
+      );
+      expectDisposition(settled.result, opensForm ? "consume" : "restore");
+      if (!opensForm) {
+        expect(settled.result.actions[0]).toMatchObject({
+          type: "show-toast",
+          toast: { type: "error" },
+        });
+      }
+    }
+  );
+
   test("returns lifecycle success and pricing failure actions", async () => {
     const paused = await finishCommand(
       await processSlashCommand(
         { type: "goal-pause" },
         createGoalEnv({
           workspace: {
-            getGoal: mock(() => Promise.resolve({ goal: null })),
+            getGoal: mock(() => Promise.resolve({ goal: { goalId: "id", status: "active" } })),
             setGoal: mock(() =>
               Promise.resolve({ success: true, data: { goalId: "id", status: "paused" } })
             ),
