@@ -289,4 +289,37 @@ describe("trimCompactionInput", () => {
     expect(outputs?.[0]).toBe(true);
     expect(outputs?.[1]).toMatch(/^\[Tool result omitted/);
   });
+
+  it("finds the compaction request when snapshot rows follow it", async () => {
+    const request = createMuxMessage("compact-request", "user", "Summarize the conversation.", {
+      muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+    });
+    const snapshot = (id: string) =>
+      createMuxMessage(id, "user", `<snapshot ${id}>`, {
+        synthetic: true,
+        fileAtMentionSnapshot: [`${id}.ts`],
+      });
+    const turn = (id: string): MuxMessage[] => [
+      createMuxMessage(`${id}-user`, "user", "y".repeat(40_000)),
+      createMuxMessage(`${id}-assistant`, "assistant", "ok"),
+    ];
+    const messages = [...turn("old"), ...turn("newest"), request, snapshot("s1"), snapshot("s2")];
+
+    const trim = await trimCompactionInput(messages, 11_000);
+    // Only the older turn goes: the newest turn, the request and its snapshots stay.
+    expect(trim.omittedTurns).toBe(1);
+    expect(trim.messages.map((message) => message.id)).toEqual([
+      "newest-user",
+      "newest-assistant",
+      "compact-request",
+      "s1",
+      "s2",
+    ]);
+    const note = trim.messages[2]?.parts.at(-1);
+    expect(note?.type === "text" ? note.text : "").toContain("1 oldest turns were left out");
+
+    // Even a budget nothing meets keeps the real newest turn: it is never dropped.
+    const tight = await trimCompactionInput(messages, 1);
+    expect(tight.messages.map((message) => message.id)).toContain("newest-user");
+  });
 });

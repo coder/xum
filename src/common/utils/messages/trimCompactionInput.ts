@@ -238,7 +238,7 @@ export async function trimCompactionInput(
   countRow: CountCompactionRowTokens = estimateCompactionRowTokens
 ): Promise<CompactionInputTrim> {
   assert(Number.isFinite(budgetTokens) && budgetTokens > 0, "budgetTokens must be positive");
-  const requestIndex = messages.findLastIndex((message) => message.role === "user");
+  const requestIndex = findCompactionRequestIndex(messages);
   if (requestIndex <= 0) return { messages, omittedToolResults: 0, omittedTurns: 0 };
   // Rows reasoning removal leaves as they are reuse their first count.
   const counted = new Map<MuxMessage, number>();
@@ -258,13 +258,36 @@ export async function trimCompactionInput(
   );
 }
 
+/**
+ * The compaction request row. Synthetic snapshot rows (@file, skill, MCP prompt) can follow it
+ * (AgentSession.resolveCompactionRequest skips them the same way): they belong to the request,
+ * so the trim keeps them after it, and they must not stand in for the request, or the request
+ * would join the newest turn and the real newest turn could be dropped. Without a row that
+ * carries compaction-request metadata, the last user row is the request.
+ */
+function findCompactionRequestIndex(rows: MuxMessage[]): number {
+  let index = rows.length - 1;
+  while (index >= 0 && isSyntheticUserRow(rows[index])) index -= 1;
+  return index >= 0 && isCompactionRequestRow(rows[index])
+    ? index
+    : rows.findLastIndex((message) => message.role === "user");
+}
+
+function isSyntheticUserRow(row: MuxMessage): boolean {
+  return row.role === "user" && row.metadata?.synthetic === true;
+}
+
+function isCompactionRequestRow(row: MuxMessage): boolean {
+  return row.role === "user" && row.metadata?.muxMetadata?.type === "compaction-request";
+}
+
 /** Phases 2-4 on a history already over the budget and without reasoning. */
 async function trimOverBudget(
   state: TrimState,
   budgetTokens: number
 ): Promise<CompactionInputTrim> {
   // Reasoning removal keeps every row (emptied ones too), so these are the original indices.
-  const request = state.rows.findLastIndex((message) => message.role === "user");
+  const request = findCompactionRequestIndex(state.rows);
   const starts = turnStarts(state.rows, request);
   const firstTurn = starts[0] ?? request;
   const newestTurn = starts.at(-1) ?? request;
