@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 import type { RuntimeStatus } from "@/browser/stores/RuntimeStatusStore";
 import {
   isAltGraphPressed,
@@ -52,28 +52,30 @@ function keysMayAct(event: KeyboardEvent): boolean {
  * window listener.
  */
 export function useWorkspaceActionKeybinds(options: WorkspaceActionKeybindOptions): void {
-  const { selectedWorkspaceId, getWorkspaceMetadata, runtimeStatusStore } = options;
-  const { onForkWorkspace, onStopRuntime } = options;
+  // ProjectSidebar is not compiled (React Compiler skip, #4439), so its inline callbacks are new
+  // on every render. Keep the latest options in a ref so the window listener is added once per
+  // selected workspace, not on every sidebar render (perf owner on #6398).
+  const optionsRef = useRef(options);
+  useLayoutEffect(() => {
+    optionsRef.current = options;
+  });
+  const { selectedWorkspaceId } = options;
   useEffect(() => {
     if (selectedWorkspaceId == null) return;
     const handleKeyDown = (e: KeyboardEvent) => {
       if (!keysMayAct(e)) return;
-      const metadata = getWorkspaceMetadata(selectedWorkspaceId);
+      const current = optionsRef.current;
+      const metadata = current.getWorkspaceMetadata(selectedWorkspaceId);
       if (!metadata) return;
-      const action = getKeyAction(e, metadata, runtimeStatusStore.getStatus(selectedWorkspaceId));
+      const status = current.runtimeStatusStore.getStatus(selectedWorkspaceId);
+      const action = getKeyAction(e, metadata, status);
       if (action === null) return;
       e.preventDefault();
       // A held key auto-repeats: each repeat would start another fork or stop request.
       if (e.repeat) return;
-      (action === "fork" ? onForkWorkspace : onStopRuntime)(selectedWorkspaceId);
+      (action === "fork" ? current.onForkWorkspace : current.onStopRuntime)(selectedWorkspaceId);
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [
-    selectedWorkspaceId,
-    getWorkspaceMetadata,
-    runtimeStatusStore,
-    onForkWorkspace,
-    onStopRuntime,
-  ]);
+  }, [selectedWorkspaceId]);
 }

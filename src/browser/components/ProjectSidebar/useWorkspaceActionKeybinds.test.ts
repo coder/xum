@@ -1,7 +1,7 @@
 // Bootstrap the DOM before this file's imports evaluate (see tests/ui/dom.ts).
 import { installDom } from "../../../../tests/ui/dom";
 
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { cleanup, renderHook } from "@testing-library/react";
 import type { RuntimeStatus } from "@/browser/stores/RuntimeStatusStore";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -137,5 +137,29 @@ describe("useWorkspaceActionKeybinds", () => {
     expect(press("B").defaultPrevented).toBe(false);
     expect(onForkWorkspace).not.toHaveBeenCalled();
     overlay.remove();
+  });
+
+  // Perf owner on #6398: ProjectSidebar passes new callbacks on every render.
+  test("keeps one listener across renders and calls the latest callbacks", () => {
+    const addSpy = spyOn(window, "addEventListener");
+    const first = mock((_id: string) => undefined);
+    const latest = mock((_id: string) => undefined);
+    const view = renderHook(
+      (props: { onForkWorkspace: (id: string) => void }) =>
+        useWorkspaceActionKeybinds({
+          selectedWorkspaceId: "ws-1",
+          getWorkspaceMetadata: () => repoWorkspace,
+          runtimeStatusStore: { getStatus: () => null },
+          onForkWorkspace: props.onForkWorkspace,
+          onStopRuntime: () => undefined,
+        }),
+      { initialProps: { onForkWorkspace: first } }
+    );
+    view.rerender({ onForkWorkspace: latest });
+    press("B");
+    expect(first).not.toHaveBeenCalled();
+    expect(latest).toHaveBeenCalledTimes(1);
+    expect(addSpy.mock.calls.filter(([type]) => type === "keydown")).toHaveLength(1);
+    addSpy.mockRestore();
   });
 });
