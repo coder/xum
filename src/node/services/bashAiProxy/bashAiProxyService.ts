@@ -236,6 +236,7 @@ function hostNamesMixedWithSecretKey(
   );
 }
 
+/** Key of the per-workspace, per-provider log dedupe maps (loggedSkips, warnedMixes). */
 function skipLogKey(workspaceId: string, provider: BashAiProxyProvider): string {
   return `${workspaceId}\0${provider}`;
 }
@@ -390,7 +391,7 @@ export class BashAiProxyService {
     secretKeys: readonly string[]
   ): void {
     for (const route of ROUTES) {
-      const key = `${workspaceId}\0${route.provider}`;
+      const key = skipLogKey(workspaceId, route.provider);
       const hostNames = hostNamesMixedWithSecretKey(route, runtime, secretKeys);
       if (hostNames.length === 0) {
         this.warnedMixes.delete(key);
