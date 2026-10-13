@@ -605,7 +605,12 @@ const ProjectCloneForm = React.forwardRef<ProjectCloneFormHandle, ProjectCloneFo
     }, [liveApi, isCreating, props, repoUrl, reset, setCreating, setError, trimmedCloneParentDir]);
 
     const handleAddExistingProject = useCallback(async () => {
-      if (!liveApi || !destinationExistsPath) {
+      if (!destinationExistsPath) {
+        return;
+      }
+      // The button stays enabled while offline: say why the click does nothing.
+      if (!liveApi) {
+        setError("Not connected to server");
         return;
       }
 
