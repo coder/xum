@@ -13,7 +13,11 @@ export const BASH_TRUNCATE_MAX_FILE_BYTES = 1024 * 1024; // 1MB file limit (same
 // tmpfile policy limits (AI agent only)
 export const BASH_MAX_LINE_BYTES = 1024; // 1KB per line for AI agent
 
-export const MAX_TODOS = 7; // Maximum number of TODO items in a list
+// Maximum number of TODO items in a list. Playbook routers (e.g. pstack) copy a playbook's 8-9
+// steps into the list before any task items, so 7 overflowed before the agent added its own work.
+// 15 fits a 9-step playbook plus a few task items while keeping the summarization pressure the
+// original cap (PR #261) added to stop 50+ item lists from costing ~2,500 tokens per update.
+export const MAX_TODOS = 15;
 
 // Init hook output limits (prevents OOM/freeze with large rsync output)
 // Keep only the most recent lines (tail), drop older lines
