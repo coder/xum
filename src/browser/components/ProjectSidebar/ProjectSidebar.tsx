@@ -131,7 +131,11 @@ import { useWorkspaceActions } from "@/browser/contexts/WorkspaceContext";
 import { useRouter } from "@/browser/contexts/RouterContext";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { formatWorkspaceRemoveWarnings } from "@/browser/utils/workspace";
-import { forkWorkspace } from "@/browser/utils/chatCommands";
+import {
+  forkWorkspaceFromMenu,
+  getErrorAnchor,
+  stopWorkspaceRuntime,
+} from "@/browser/components/WorkspaceActionsMenuContent/workspaceActionHandlers";
 import { PopoverError } from "../PopoverError/PopoverError";
 import { SectionHeader } from "../SectionHeader/SectionHeader";
 import { WorkspaceSectionDropZone } from "../WorkspaceSectionDropZone/WorkspaceSectionDropZone";
@@ -1092,75 +1096,18 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
   const handleForkWorkspace = useCallback(
     async (workspaceId: string, buttonElement?: HTMLElement) => {
-      if (!api) {
-        workspaceForkError.showError(workspaceId, "Not connected to server");
-        return;
-      }
-
-      let anchor: { top: number; left: number } | undefined;
-      if (buttonElement) {
-        const rect = buttonElement.getBoundingClientRect();
-        anchor = {
-          top: rect.top + window.scrollY,
-          left: rect.right + 10,
-        };
-      }
-
-      try {
-        const result = await forkWorkspace({
-          client: api,
-          sourceWorkspaceId: workspaceId,
-        });
-        if (result.success) {
-          return;
-        }
-        workspaceForkError.showError(
-          workspaceId,
-          result.error ?? "Failed to fork workspace",
-          anchor
-        );
-      } catch (error) {
-        // IPC/transport failures throw instead of returning { success: false }
-        const message = getErrorMessage(error);
-        workspaceForkError.showError(workspaceId, message, anchor);
-      }
+      const anchor = getErrorAnchor(buttonElement);
+      const error = await forkWorkspaceFromMenu(api, workspaceId);
+      if (error) workspaceForkError.showError(workspaceId, error, anchor);
     },
     [api, workspaceForkError]
   );
 
   const handleStopRuntime = useCallback(
     async (workspaceId: string, buttonElement?: HTMLElement) => {
-      let anchor: { top: number; left: number } | undefined;
-      if (buttonElement) {
-        const rect = buttonElement.getBoundingClientRect();
-        anchor = {
-          top: rect.top + window.scrollY,
-          left: rect.right + 10,
-        };
-      }
-
-      if (!api) {
-        workspaceStopRuntimeError.showError(workspaceId, "Not connected to server", anchor);
-        return;
-      }
-
-      try {
-        const result = await api.workspace.stopRuntime({ workspaceId });
-        if (!result.success) {
-          workspaceStopRuntimeError.showError(
-            workspaceId,
-            result.error ?? "Failed to stop container",
-            anchor
-          );
-          return;
-        }
-
-        // A successful stop should hide the running indicator and menu action without
-        // forcing rows to own their own optimistic runtime state.
-        runtimeStatusStore.invalidateWorkspace(workspaceId);
-      } catch (error) {
-        workspaceStopRuntimeError.showError(workspaceId, getErrorMessage(error), anchor);
-      }
+      const anchor = getErrorAnchor(buttonElement);
+      const error = await stopWorkspaceRuntime(api, runtimeStatusStore, workspaceId);
+      if (error) workspaceStopRuntimeError.showError(workspaceId, error, anchor);
     },
     [api, runtimeStatusStore, workspaceStopRuntimeError]
   );
