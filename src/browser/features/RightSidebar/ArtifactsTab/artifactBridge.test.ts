@@ -104,13 +104,19 @@ function runBridgeScript() {
     key: string,
     target: unknown,
     shiftKey = false,
-    extra: { ctrlKey?: boolean; defaultPrevented?: boolean; composedPath?: unknown[] } = {}
+    extra: {
+      ctrlKey?: boolean;
+      repeat?: boolean;
+      defaultPrevented?: boolean;
+      composedPath?: unknown[];
+    } = {}
   ) => {
     const event = {
       key,
       target,
       shiftKey,
       ctrlKey: extra.ctrlKey ?? false,
+      repeat: extra.repeat ?? false,
       metaKey: false,
       altKey: false,
       defaultPrevented: false,
@@ -150,6 +156,7 @@ describe("bridge script keys", () => {
     bridge.keydown(key, input);
     bridge.keydown(key.toUpperCase(), div, true);
     bridge.keydown(key, div, false, { ctrlKey: true });
+    bridge.keydown(key, div, false, { repeat: true });
     bridge.keydown(key, div, false, { defaultPrevented: true });
     // Typed in an input inside a web component: window sees the (non-editable) shadow host.
     bridge.keydown(key, div, false, { composedPath: [input, div] });

@@ -384,7 +384,9 @@ const ANNOTATE_KEY_LISTENER =
     ? ""
     : `
   window.addEventListener("keydown", function (event) {
-    if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+    // Auto-repeat would toggle the mode at the repeat rate and spend the frame's message budget,
+    // so a held key could drop its send/setState messages.
+    if (event.repeat || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
     if (typeof event.key !== "string" || event.key.toLowerCase() !== ${JSON.stringify(ANNOTATE_FRAME_KEY)}) return;
     if (isEditable(keyTarget(event))) return;
     window.setTimeout(function () {
