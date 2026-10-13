@@ -25,8 +25,12 @@ import { printStepPrefixAudit, resolveReplaySessionDir } from "./replay-verify";
  * Usage: bun debug cache-audit <workspace-id>
  * (use the workspace ID "replay-fixture" to run against the committed fixture)
  */
-export async function cacheAuditCommand(workspaceId: string): Promise<void> {
-  const { sessionDir, historyService } = resolveReplaySessionDir(workspaceId);
+export async function cacheAuditCommand(
+  workspaceId: string,
+  // Tests pass the real instance they inject a failure into (AGENTS.md: real HistoryService).
+  session: ReturnType<typeof resolveReplaySessionDir> = resolveReplaySessionDir(workspaceId)
+): Promise<void> {
+  const { sessionDir, historyService } = session;
   const journal = new DurableEventJournal(sessionDir);
   const events = await journal.read();
   // Final envelope per sequence only: fallback turns emit a superseding row.
