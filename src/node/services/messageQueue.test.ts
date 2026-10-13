@@ -1674,9 +1674,9 @@ describe("MessageQueue", () => {
         fileParts,
         reviews: [review],
       });
-      expect(queue.getInputsForRestore()).toEqual([
-        expect.objectContaining({ fileParts, reviews: [review] }),
-      ]);
+      const [perSend] = queue.getInputsForRestore();
+      expect(perSend?.fileParts).toEqual(fileParts);
+      expect(perSend?.reviews).toEqual([review]);
     });
 
     it("captures a refused task-attempt entry's full original send only for manual user input", () => {
