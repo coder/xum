@@ -1042,6 +1042,8 @@ export type AgentTreeTargetRelation =
   | "target_descendant"
   | "target_ancestor"
   | "peer"
+  | "target_main_chat"
+  | "target_side_chat"
   | "target_unrelated";
 
 export type SendAgentTreeMessageError = SendAgentTaskMessageError | AgentPeerMessageAdmissionError;
@@ -1065,7 +1067,7 @@ type TreeMessageSpec =
       senderWorkspaceId: string;
       targetId: string;
       message: string;
-      targetRelation: "peer" | "target_ancestor" | "target_unrelated";
+      targetRelation: Exclude<AgentTreeTargetRelation, "target_descendant">;
       queueDispatchMode?: TaskMessageQueueDispatchMode;
       /** Set on the retry of a message that waited for a delegated turn (#4997). */
       awaitedDelegatedTurn?: PeerDelegatedTurnWait;
@@ -1141,6 +1143,12 @@ export interface TaskTreeAgentsResult {
    */
   callerPeerMessagingRestricted?: true;
   tasks: TreeAgentTaskInfo[];
+  /** Direct chat links only; these grant no task ancestry or lifecycle authority. */
+  relatedChats?: Array<{
+    workspaceId: string;
+    title?: string;
+    relationship: "main_chat" | "side_chat";
+  }>;
 }
 
 export interface InstanceWorkspacesResult {
@@ -5649,6 +5657,7 @@ export class TaskService implements AgentTaskIntegration {
     // Workflow cancellation is authoritative even when a child has its own Stop or question.
     for (const task of startupTasks()) {
       await this.interruptTaskRecoveryForInactiveWorkflowOwner(
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         task.id!,
         config,
         "startup-inactive-workflow-owner-prepass",
@@ -5662,16 +5671,19 @@ export class TaskService implements AgentTaskIntegration {
       await Promise.all(
         candidates.map(
           async (task) =>
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
             [task.id, await this.workspaceService.getStartupRecoveryState(task.id!)] as const
         )
       )
     );
     for (const task of candidates) {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const id = task.id!;
       if (states.get(id) !== "stopped") continue;
       await this.withTaskTreeLifecycleLock(id, async () => {
         if (this.aiService.isStreaming(id) || this.workspaceService.isBusyForMessage(id)) return;
         const stopped = await this.stopDescendantAgentTaskUnderLifecycleLock(
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           task.parentWorkspaceId!,
           id,
           false
@@ -5695,6 +5707,7 @@ export class TaskService implements AgentTaskIntegration {
     config = this.config.loadConfigOrDefault();
     taskIndex = this.buildAgentTaskIndex(config);
     const eligible = startupTasks().filter(
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       (task) => states.has(task.id) && !["blocked", "stopped"].includes(states.get(task.id)!)
     );
     const awaitingReportTasks = eligible.filter(
@@ -5706,8 +5719,10 @@ export class TaskService implements AgentTaskIntegration {
 
     const admitRecovery = async (task: (typeof eligible)[number], reason: string) => {
       if (
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         !(await this.admitTaskDesktopRecovery(task.id!)) ||
         (await this.interruptTaskRecoveryForInactiveWorkflowOwner(
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           task.id!,
           config,
           reason,
@@ -5716,6 +5731,7 @@ export class TaskService implements AgentTaskIntegration {
       )
         return false;
       // Earlier recovery awaits can finish other candidates; verify live status at each dispatch.
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const latest = findWorkspaceEntry(this.config.loadConfigOrDefault(), task.id!)?.workspace;
       return latest != null && latest.taskStatus === task.taskStatus;
     };
@@ -5997,6 +6013,7 @@ export class TaskService implements AgentTaskIntegration {
       if (isWorkspaceArchived(task.archivedAt, task.unarchivedAt)) continue;
       // A reported task that is streaming again (a client reactivated it) may be committing;
       // the continuation refresh that runs when that turn ends generates its artifact.
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       if (this.aiService.isStreaming(task.id!)) continue;
       try {
         let artifacts = patchArtifactsByParent.get(task.parentWorkspaceId);
@@ -6006,6 +6023,7 @@ export class TaskService implements AgentTaskIntegration {
           );
           patchArtifactsByParent.set(task.parentWorkspaceId, artifacts);
         }
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const artifact = artifacts.artifactsByChildTaskId[task.id!];
         if (artifact != null && artifact.status !== "pending") continue;
 
@@ -6013,6 +6031,7 @@ export class TaskService implements AgentTaskIntegration {
         // with (reported tasks x config size) on large deployments.
         await this.gitPatchArtifactService.maybeStartGeneration(
           task.parentWorkspaceId,
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           task.id!,
           (wsId) => this.requestReportedTaskCleanupRecheck(wsId),
           { config }
@@ -6142,6 +6161,7 @@ export class TaskService implements AgentTaskIntegration {
     );
     await Promise.all(
       candidates.map(async (task) => {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const taskId = task.id!;
         const use = await leases.findForeignUse(taskId);
         if (use == null) return;
@@ -10124,7 +10144,7 @@ export class TaskService implements AgentTaskIntegration {
     senderWorkspaceId: string,
     targetId: string,
     message: string,
-    queueDispatchMode?: TaskMessageQueueDispatchMode
+    queueDispatchMode: TaskMessageQueueDispatchMode = "tool-end"
   ): Promise<
     Result<
       SendAgentTaskMessageResult & { relation: AgentTreeTargetRelation },
@@ -10141,13 +10161,15 @@ export class TaskService implements AgentTaskIntegration {
 
     const cfg = this.config.loadConfigOrDefault();
     const relation = this.resolveAgentTreeTargetRelation(
+      cfg,
       this.buildAgentTaskIndex(cfg).parentById,
       senderWorkspaceId,
       targetId
     );
     if (relation == null) {
-      // Self-sends are out of scope; cross-tree targets take the untrusted peer path.
-      return Err({ code: "invalid_scope" as const });
+      // Private side chats must look like unknown IDs to anyone outside their direct link.
+      // Only self-sends reveal an invalid scope; discovery does not advertise private chats.
+      return Err({ code: senderWorkspaceId === targetId ? "invalid_scope" : "not_found" });
     }
 
     if (relation === "target_descendant") {
@@ -10156,7 +10178,7 @@ export class TaskService implements AgentTaskIntegration {
         senderWorkspaceId,
         targetId,
         message,
-        queueDispatchMode: queueDispatchMode ?? "tool-end",
+        queueDispatchMode,
       });
       return result.success ? Ok({ ...result.data, relation }) : result;
     }
@@ -10453,7 +10475,7 @@ export class TaskService implements AgentTaskIntegration {
 
       // Re-verify under the target's event lock: tree membership may have changed since routing.
       if (
-        this.resolveAgentTreeTargetRelation(index.parentById, senderWorkspaceId, targetId) !==
+        this.resolveAgentTreeTargetRelation(cfg, index.parentById, senderWorkspaceId, targetId) !==
         relation
       ) {
         return Err({ code: "invalid_scope" as const });
@@ -10482,8 +10504,8 @@ export class TaskService implements AgentTaskIntegration {
       // Preserve remote/container isolation without changing the existing same-tree policy.
       if (
         relation === "target_unrelated" &&
-        (!this.isLocalUnrelatedMessagingEndpoint(senderEntry.workspace) ||
-          !this.isLocalUnrelatedMessagingEndpoint(targetEntry.workspace))
+        (!this.isUnrelatedMessagingEndpoint(senderEntry.workspace) ||
+          !this.isUnrelatedMessagingEndpoint(targetEntry.workspace))
       ) {
         return Err(unrelatedRuntimeRefusal);
       }
@@ -10495,21 +10517,7 @@ export class TaskService implements AgentTaskIntegration {
         code: "refused" as const,
         reason: "Sender is no longer active; terminal or archived tasks cannot send peer messages.",
       };
-      const isInactivePeerSender = (workspace: WorkspaceConfigEntry): boolean => {
-        // Unrelated roots can send here too; archive must win before the root lifecycle shortcut.
-        if (isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) return true;
-        if (coerceNonEmptyString(workspace.parentWorkspaceId) == null) {
-          // Root workspaces have no task lifecycle to go terminal.
-          return false;
-        }
-        const status = workspace.taskStatus ?? "running";
-        return (
-          !this.hasLiveRunningExecution(workspace, senderWorkspaceId) &&
-          status !== "running" &&
-          status !== "awaiting_report"
-        );
-      };
-      if (isInactivePeerSender(senderEntry.workspace)) {
+      if (this.isInactivePeerMessagingEndpoint(senderEntry.workspace, senderWorkspaceId)) {
         return Err(senderInactiveRefusal);
       }
 
@@ -10538,15 +10546,15 @@ export class TaskService implements AgentTaskIntegration {
         });
       }
 
-      const legacyArchived = isWorkspaceArchived(
-        targetEntry.workspace.archivedAt,
-        targetEntry.workspace.unarchivedAt
-      );
-      if (legacyArchived) {
+      const targetUnavailable =
+        targetEntry.workspace.pendingRemoval != null ||
+        isWorkspaceArchived(targetEntry.workspace.archivedAt, targetEntry.workspace.unarchivedAt);
+      if (targetUnavailable) {
         return Err({
           code: "not_active" as const,
           taskStatus: targetEntry.workspace.taskStatus ?? "unknown",
-          message: "Target workspace is archived; only its parent can restore and reawaken it.",
+          message:
+            "Target workspace is archived or being removed; it cannot receive peer messages.",
         });
       }
 
@@ -10554,7 +10562,6 @@ export class TaskService implements AgentTaskIntegration {
       // queued prompts or reactivate terminal tasks without rerouting their report ownership.
       const targetIsAgentTask =
         coerceNonEmptyString(targetEntry.workspace.parentWorkspaceId) != null;
-      const unrelatedRoot = relation === "target_unrelated" && !targetIsAgentTask;
       // A root running a delegated workspace turn stays owner-only (#4997). Only the turn's OWNER
       // may CONTINUE it (correlation resolved below): the owner already steers the turn through
       // follow-ups. Any other sender, an opted-in unrelated root or a same-tree descendant, waits
@@ -10848,7 +10855,7 @@ export class TaskService implements AgentTaskIntegration {
           serviceTier: resumeOptions.serviceTier,
           muxMetadata: triggerMuxMetadata,
         };
-      } else if (unrelatedRoot || awaitedDelegatedTurn != null) {
+      } else if (!targetIsAgentTask || awaitedDelegatedTurn != null) {
         assert(!targetIsAgentTask);
         // Honor the recipient's selected identity (including plan), not the sender's or an
         // older history row. Without a selection, the shared history → exec fallback applies.
@@ -10949,7 +10956,7 @@ export class TaskService implements AgentTaskIntegration {
         if (
           freshSender == null ||
           senderChainInterrupted() ||
-          isInactivePeerSender(freshSender.workspace)
+          this.isInactivePeerMessagingEndpoint(freshSender.workspace, senderWorkspaceId)
         ) {
           admissionRefusal = senderInactiveRefusal;
           return true;
@@ -10957,6 +10964,19 @@ export class TaskService implements AgentTaskIntegration {
         const freshEntry = findWorkspaceEntry(freshCfg, targetId);
         if (freshEntry == null) {
           admissionRefusal = { code: "not_found" as const };
+          return true;
+        }
+        // A side-chat link authorizes only its own main chat, not a permanent cross-runtime
+        // grant. Recheck after preparation and again when queued input dispatches.
+        if (
+          this.resolveAgentTreeTargetRelation(
+            freshCfg,
+            this.buildAgentTaskIndex(freshCfg).parentById,
+            senderWorkspaceId,
+            targetId
+          ) !== relation
+        ) {
+          admissionRefusal = { code: "invalid_scope" as const };
           return true;
         }
         // An off/on cycle is a new grant, not permission to revive previously queued input.
@@ -10972,22 +10992,23 @@ export class TaskService implements AgentTaskIntegration {
         // Runtime can change during preparation or while queued; recheck both ends at dispatch.
         if (
           relation === "target_unrelated" &&
-          (!this.isLocalUnrelatedMessagingEndpoint(freshSender.workspace) ||
-            !this.isLocalUnrelatedMessagingEndpoint(freshEntry.workspace))
+          (!this.isUnrelatedMessagingEndpoint(freshSender.workspace) ||
+            !this.isUnrelatedMessagingEndpoint(freshEntry.workspace))
         ) {
           admissionRefusal = unrelatedRuntimeRefusal;
           return true;
         }
-        // Archive is reversible-only but stops delivery: a target archived after the initial
-        // check (archive does not synchronize with in-flight guarded sends) must refuse here
-        // rather than accept or queue a peer turn behind the archive boundary.
+        // Closing a side chat claims removal before tearing down its session; neither an
+        // in-flight reply nor queued input may wake it behind that discard/archive boundary.
         if (
+          freshEntry.workspace.pendingRemoval != null ||
           isWorkspaceArchived(freshEntry.workspace.archivedAt, freshEntry.workspace.unarchivedAt)
         ) {
           admissionRefusal = {
             code: "not_active" as const,
             taskStatus: freshEntry.workspace.taskStatus ?? "unknown",
-            message: "Target workspace is archived; only its parent can restore and reawaken it.",
+            message:
+              "Target workspace is archived or being removed; it cannot receive peer messages.",
           };
           return true;
         }
@@ -15065,6 +15086,7 @@ export class TaskService implements AgentTaskIntegration {
       })),
     ];
     while (stack.length > 0) {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const next = stack.pop()!;
       const entry = index.byId.get(next.taskId);
       const workflowOwned = next.workflowOwned || entry?.workflowTask != null;
@@ -15490,6 +15512,7 @@ export class TaskService implements AgentTaskIntegration {
         this.getTaskDepthFromParentById(index.parentById, a)
     );
     return taskIds.map((taskId) => {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const entry = index.byId.get(taskId)!;
       return {
         workspaceId: taskId,
@@ -15646,6 +15669,7 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     while (stack.length > 0) {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const next = stack.pop()!;
       const entry = index.byId.get(next.taskId);
       if (!entry) continue;
@@ -15767,6 +15791,7 @@ export class TaskService implements AgentTaskIntegration {
     const visited = new Set([workspaceId]);
     const stack: string[] = [...(index.childrenByParent.get(workspaceId) ?? [])];
     while (stack.length > 0) {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const next = stack.pop()!;
       if (visited.has(next)) {
         continue;
@@ -15954,6 +15979,13 @@ export class TaskService implements AgentTaskIntegration {
     );
   }
 
+  private isUnrelatedMessagingEndpoint(workspace: WorkspaceConfigEntry): boolean {
+    return (
+      workspace.sideChatParentWorkspaceId == null &&
+      this.isLocalUnrelatedMessagingEndpoint(workspace)
+    );
+  }
+
   private isLocalUnrelatedMessagingEndpoint(workspace: WorkspaceConfigEntry): boolean {
     let runtimeConfig = workspace.runtimeConfig;
     if (runtimeConfig === undefined) {
@@ -15971,11 +16003,54 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * Relation of `targetId` to `senderWorkspaceId`, or null for self-sends. Different trees
-   * route as unrelated peers. Only parentWorkspaceId chains define ancestry;
-   * workspace-turn ownership tags are a separate, unchanged graph.
+   * Side chats share their owner's runtime, but are not task children. Keep this direct-link
+   * permission separate from ancestry so neither chat gains lifecycle or trusted-guidance power,
+   * and a side chat cannot bridge isolated top-level workspaces (even with unrelated consent).
    */
+  private resolveDirectChatRelation(
+    sender: WorkspaceConfigEntry,
+    target: WorkspaceConfigEntry
+  ): "target_main_chat" | "target_side_chat" | null {
+    if (
+      sender.sideChatParentWorkspaceId != null &&
+      target.sideChatParentWorkspaceId == null &&
+      sender.sideChatParentWorkspaceId === target.id
+    ) {
+      return "target_main_chat";
+    }
+    if (
+      target.sideChatParentWorkspaceId != null &&
+      sender.sideChatParentWorkspaceId == null &&
+      target.sideChatParentWorkspaceId === sender.id
+    ) {
+      return "target_side_chat";
+    }
+    return null;
+  }
+
+  /** Relation for messaging only; side-chat links never enter the task ownership graph. */
   private resolveAgentTreeTargetRelation(
+    cfg: ProjectsConfig,
+    parentById: Map<string, string>,
+    senderWorkspaceId: string,
+    targetId: string
+  ): AgentTreeTargetRelation | null {
+    const sender = findWorkspaceEntry(cfg, senderWorkspaceId);
+    const target = findWorkspaceEntry(cfg, targetId);
+    if (sender == null || target == null) {
+      return this.resolveTaskAncestryRelation(parentById, senderWorkspaceId, targetId);
+    }
+    if (
+      sender.workspace.sideChatParentWorkspaceId == null &&
+      target.workspace.sideChatParentWorkspaceId == null
+    ) {
+      return this.resolveTaskAncestryRelation(parentById, senderWorkspaceId, targetId);
+    }
+    return this.resolveDirectChatRelation(sender.workspace, target.workspace);
+  }
+
+  /** Only task parent chains grant ancestry; chat links and workspace-turn ownership do not. */
+  private resolveTaskAncestryRelation(
     parentById: Map<string, string>,
     senderWorkspaceId: string,
     targetId: string
@@ -16045,7 +16120,7 @@ export class TaskService implements AgentTaskIntegration {
     const cfg = this.config.loadConfigOrDefault();
     const caller = findWorkspaceEntry(cfg, callerWorkspaceId);
     // Instance discovery must not bridge the runtime boundary closed by unrelated messaging.
-    if (caller == null || !this.isLocalUnrelatedMessagingEndpoint(caller.workspace)) {
+    if (caller == null || !this.isUnrelatedMessagingEndpoint(caller.workspace)) {
       return { rows: [], totalMatching: 0, callerPeerMessagingRestricted: true };
     }
     const index = this.buildAgentTaskIndex(cfg);
@@ -16073,7 +16148,7 @@ export class TaskService implements AgentTaskIntegration {
           // Same-tree visibility is unchanged; hide unrelated roots before matching or probing them.
           (id !== callerRoot &&
             getValidUnrelatedWorkspaceConsent(workspace.unrelatedWorkspaceConsent) == null) ||
-          !this.isLocalUnrelatedMessagingEndpoint(workspace) ||
+          !this.isUnrelatedMessagingEndpoint(workspace) ||
           isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt) ||
           this.interruptedParentWorkspaceIds.has(id) ||
           this.isWorkspaceStopInProgress(id) ||
@@ -16147,8 +16222,7 @@ export class TaskService implements AgentTaskIntegration {
     // chain — advertising root/sibling/ancestor rows to such a caller would direct it at
     // targets it can never message. Descendant guidance stays valid, so those rows survive.
     const callerWorkflowOwned = this.isWorkflowOwnedTaskUsingIndex(index, workspaceId);
-    const callerRestricted =
-      this.isBestOfChainUsingIndex(index, workspaceId) || callerWorkflowOwned;
+    const callerRestricted = this.isPeerMessagingRestricted(index, workspaceId);
     const rootWorkspaceId = this.resolveRootWorkspaceIdUsingParentById(
       index.parentById,
       workspaceId
@@ -16239,8 +16313,11 @@ export class TaskService implements AgentTaskIntegration {
       rootEntry != null &&
       isWorkspaceArchived(rootEntry.workspace.archivedAt, rootEntry.workspace.unarchivedAt);
 
+    const relatedChats = this.listRelatedChats(cfg, index, workspaceId);
+
     return {
       rootWorkspaceId,
+      ...(relatedChats.length > 0 ? { relatedChats } : {}),
       ...(rootTitle != null ? { rootTitle } : {}),
       rootRelationship: rootWorkspaceId === workspaceId ? "self" : "ancestor",
       ...(rootArchived ? { rootArchived: true as const } : {}),
@@ -16251,6 +16328,74 @@ export class TaskService implements AgentTaskIntegration {
       ...(callerRestricted ? { callerPeerMessagingRestricted: true as const } : {}),
       tasks,
     };
+  }
+
+  /** Shared by peer admission and linked-chat discovery so discarded/inactive chats never wake peers. */
+  private isInactivePeerMessagingEndpoint(
+    workspace: WorkspaceConfigEntry,
+    workspaceId: string
+  ): boolean {
+    // Removal claims the row before stopping its session. A winding-down side-chat tool call
+    // must not wake the main chat while that row still exists, including at final admission.
+    if (
+      workspace.pendingRemoval != null ||
+      isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
+    )
+      return true;
+    if (coerceNonEmptyString(workspace.parentWorkspaceId) == null) return false;
+    const status = workspace.taskStatus ?? "running";
+    return (
+      !this.hasLiveRunningExecution(workspace, workspaceId) &&
+      status !== "running" &&
+      status !== "awaiting_report"
+    );
+  }
+
+  private isPeerMessagingRestricted(index: AgentTaskIndex, workspaceId: string): boolean {
+    return (
+      this.isBestOfChainUsingIndex(index, workspaceId) ||
+      this.isWorkflowOwnedTaskUsingIndex(index, workspaceId)
+    );
+  }
+
+  private getRelatedChatInfo(
+    caller: WorkspaceConfigEntry,
+    candidate: WorkspaceConfigEntry
+  ): NonNullable<TaskTreeAgentsResult["relatedChats"]>[number] | undefined {
+    const relation = this.resolveDirectChatRelation(caller, candidate);
+    if (relation == null || candidate.id == null) return undefined;
+    return {
+      workspaceId: candidate.id,
+      title: coerceNonEmptyString(candidate.title) ?? coerceNonEmptyString(candidate.name),
+      relationship: relation === "target_main_chat" ? "main_chat" : "side_chat",
+    };
+  }
+
+  /** Discover direct chat links only, without joining task ownership or instance discovery. */
+  private listRelatedChats(
+    cfg: ProjectsConfig,
+    index: AgentTaskIndex,
+    workspaceId: string
+  ): NonNullable<TaskTreeAgentsResult["relatedChats"]> {
+    const caller = findWorkspaceEntry(cfg, workspaceId)?.workspace;
+    if (caller == null) return [];
+    if (
+      this.isInactivePeerMessagingEndpoint(caller, workspaceId) ||
+      this.isPeerMessagingRestricted(index, workspaceId)
+    )
+      return [];
+    const candidates = Array.from(cfg.projects.values()).flatMap((project) => project.workspaces);
+    return candidates.flatMap((candidate) => {
+      const info = this.getRelatedChatInfo(caller, candidate);
+      if (
+        info == null ||
+        this.isInactivePeerMessagingEndpoint(candidate, info.workspaceId) ||
+        this.isPeerMessagingRestricted(index, info.workspaceId)
+      ) {
+        return [];
+      }
+      return [info];
+    });
   }
 
   // --- Internal orchestration ---
@@ -16509,6 +16654,7 @@ export class TaskService implements AgentTaskIntegration {
       })),
     ];
     while (stack.length > 0) {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const next = stack.pop()!;
       const entry = index.byId.get(next.taskId);
       const workflowOwned = next.workflowOwned || entry?.workflowTask != null;

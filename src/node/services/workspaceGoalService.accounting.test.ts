@@ -838,17 +838,8 @@ describe("WorkspaceGoalService", () => {
       "Completion summary is required."
     );
 
+    // A paused goal completes directly, without a resume first.
     await setGoalOk(service, { workspaceId, status: "paused" });
-    await expectSetGoalError(
-      {
-        workspaceId,
-        status: "complete",
-        completionSummary: "Cannot complete from pause.",
-      },
-      "Cannot complete a goal that is not active or budget-limited."
-    );
-
-    await setGoalOk(service, { workspaceId, status: "active" });
     await setGoalOk(service, {
       workspaceId,
       status: "complete",

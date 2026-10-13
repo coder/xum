@@ -482,7 +482,10 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
     try {
       const mainPrompt = "[mock:long-stream] Continue working in the main chat";
       await app.chat.send(mainPrompt);
-      await waitFor(() => expect(isStreaming(app.workspaceId)).toBe(true));
+      // Every wait in this test names its budget: waitFor's 1 s default is too short for a stream
+      // to start, catch up or settle on a loaded runner (#6215). Same budgets as startStream and
+      // stopViaApi below.
+      await waitFor(() => expect(isStreaming(app.workspaceId)).toBe(true), { timeout: 30_000 });
       const parentPartial = await waitFor(
         async () => {
           const partial = await context.historyService.readPartial(app.workspaceId);
@@ -497,14 +500,21 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
 
       await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
       const childId = await waitForSideChatId(app);
-      await waitFor(() => expect(workspaceStore.isWorkspaceTranscriptCaughtUp(childId)).toBe(true));
+      await waitFor(
+        () => expect(workspaceStore.isWorkspaceTranscriptCaughtUp(childId)).toBe(true),
+        {
+          timeout: 10_000,
+        }
+      );
       // Join the actual recovery pass scheduled by onChat, not a grace-period sleep. A regression
       // that merely hides the banner still fails on a scheduled retry or automatic model send.
       await act(async () => {
         await service.getOrCreateSession(childId).ensureStartupAutoRetryCheck();
       });
       captureSideState();
-      await waitFor(() => expect(parentDeltas).toBeGreaterThan(deltasBeforeOpen));
+      await waitFor(() => expect(parentDeltas).toBeGreaterThan(deltasBeforeOpen), {
+        timeout: 10_000,
+      });
       expect(isStreaming(app.workspaceId)).toBe(true);
       expect(parentStops).toEqual([]);
       expect((await context.historyService.readPartial(app.workspaceId))?.id).toBe(
@@ -528,7 +538,7 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
         () => expect(getSidePane(app)?.textContent).toContain(`Mock response: ${question}`),
         { timeout: 30_000 }
       );
-      await waitFor(() => expect(isStreaming(childId)).toBe(false));
+      await waitFor(() => expect(isStreaming(childId)).toBe(false), { timeout: 10_000 });
       expect(sideStarts).toEqual([childId]);
       expect(
         modelCalls.mock.calls.filter(([options]) => options.workspaceId === childId)
