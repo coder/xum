@@ -246,6 +246,11 @@ export const MuxMessageSchema = z.object({
         .catch(undefined),
       // Anthropic thinking-signature repair receipt (see MuxMetadata.anthropicThinkingReplay).
       anthropicThinkingReplay: z.literal("off").optional().catch(undefined),
+      // A corrupt point degrades to the strip-all receipt, which is always valid.
+      anthropicThinkingReplayFromStep: z
+        .union([z.number().int().nonnegative(), z.literal("end")])
+        .optional()
+        .catch(undefined),
       usage: z.any().optional(),
       contextUsage: z.any().optional(),
       providerMetadata: z.record(z.string(), z.unknown()).optional(),

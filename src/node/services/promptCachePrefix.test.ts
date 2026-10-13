@@ -813,6 +813,55 @@ describe("fingerprintAnthropicRequest follows Anthropic's cache invalidation tab
   });
 });
 
+describe("a break in an options block names the changed options", () => {
+  test("an effort change in message_options records the key and both values", () => {
+    const effort = (value: string) => ({ output_config: { effort: value } });
+    const comparison = expectBreak(
+      body(baseMessages(), TOOLS, undefined, effort("xhigh")),
+      body(baseMessages(), TOOLS, undefined, effort("high"))
+    );
+    expect(comparison).toMatchObject({ section: "messages", blockIndex: MESSAGE_OPTIONS_INDEX });
+    expect(comparison.changedOptions).toEqual([{ key: "effort", previous: "xhigh", next: "high" }]);
+    expect(describePromptCacheBreak(comparison)).toEndWith("changed options: effort xhigh -> high");
+  });
+
+  test("a speed change in system_options records the key and both values", () => {
+    const comparison = expectBreak(
+      body(baseMessages()),
+      body(baseMessages(), TOOLS, undefined, { speed: "fast" })
+    );
+    expect(comparison).toMatchObject({ section: "system", blockIndex: SYSTEM_OPTIONS_INDEX });
+    expect(comparison.changedOptions).toEqual([
+      { key: "speed", previous: "standard", next: "fast" },
+    ]);
+  });
+
+  test("a server tool change records only the serverTools key, never its configuration", () => {
+    const webSearch = (domain: string) => ({
+      type: "web_search_20250305",
+      name: "web_search",
+      allowed_domains: [domain],
+    });
+    const comparison = expectBreak(
+      body(baseMessages(), [...TOOLS, webSearch("private-one.example")]),
+      body(baseMessages(), [...TOOLS, webSearch("private-two.example")])
+    );
+    expect(comparison).toMatchObject({ section: "system", blockIndex: SYSTEM_OPTIONS_INDEX });
+    expect(comparison.changedOptions).toEqual([{ key: "serverTools" }]);
+    expect(describePromptCacheBreak(comparison)).toEndWith("changed options: serverTools");
+    expect(JSON.stringify(comparison)).not.toContain("private-");
+  });
+
+  test("a break in an ordinary message block has no changedOptions", () => {
+    const messages = baseMessages();
+    const truncated = baseMessages();
+    truncated[2].content = [result("c1", "x".repeat(12_000))];
+    const comparison = expectBreak(body(messages), body(truncated));
+    expect(comparison).toMatchObject({ blockIndex: FIRST_RESULT_INDEX });
+    expect(comparison).not.toHaveProperty("changedOptions");
+  });
+});
+
 describe("thinking preservation by model", () => {
   test.each([
     ["claude-haiku-4-5", true],
