@@ -11,9 +11,7 @@ import { checkRequest, Ledger, MAX_BODY_BYTES, MAX_OUTPUT_TOKENS, usageCost } fr
 const asset = (rel: string) => fs.readFileSync(path.join(import.meta.dir, "../../..", rel));
 const screenshot = asset("src/browser/stories/assets/notion-mcp.png");
 const icon = asset("public/icon-512.png");
-const job = {
-  models: ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5", "claude-haiku-5-5"],
-};
+const job = { models: ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"] };
 
 /** Runs one AI SDK call against a loopback server and returns the request it sent. */
 async function capture(model: string, stream: boolean, maxOutputTokens?: number) {
@@ -39,7 +37,7 @@ async function capture(model: string, stream: boolean, maxOutputTokens?: number)
     },
     maxRetries: 0,
     maxOutputTokens,
-    providerOptions: model === "claude-haiku-4-5" ? undefined : { anthropic: { effort: "low" } },
+    providerOptions: { anthropic: { effort: "low" } },
   };
   if (!stream) await generateText(options).catch(() => undefined);
   else for await (const _ of streamText({ ...options, onError: () => undefined }).fullStream);
@@ -87,13 +85,12 @@ const bodyOf = (result: ReturnType<typeof checkRequest>) => {
 };
 
 /**
- * Usage that the gateway reported on 2026-10-10 (Haiku 5.5: 2026-10-13, no effort set) for these
- * requests with maxOutputTokens 200.
+ * Usage that the gateway reported on 2026-10-10 (Haiku 5.5: 2026-10-13) for these requests with
+ * maxOutputTokens 200.
  */
 const recorded = {
   "claude-opus-5-5": { input_tokens: 866, output_tokens: 103, cache_read_input_tokens: 0 },
   "claude-sonnet-5-5": { input_tokens: 866, output_tokens: 57, cache_read_input_tokens: 0 },
-  "claude-haiku-4-5": { input_tokens: 1057, output_tokens: 48, cache_read_input_tokens: 0 },
   "claude-haiku-5-5": { input_tokens: 866, output_tokens: 200, cache_read_input_tokens: 0 },
 };
 
@@ -209,9 +206,9 @@ test.each(refusedHeaders)("refuses with %s: %j", (reason, raw) => {
 });
 
 test("refuses a priced model that is not on the job's list (P3)", () => {
-  const haikuOnly = { models: ["claude-haiku-4-5"] };
+  const haikuOnly = { models: ["claude-haiku-5-5"] };
   expect(
-    checkRequest(haikuOnly, headers, encode({ ...minimal, model: "claude-haiku-4-5" })).ok
+    checkRequest(haikuOnly, headers, encode({ ...minimal, model: "claude-haiku-5-5" })).ok
   ).toBe(true);
   const result = checkRequest(haikuOnly, headers, encode(minimal)); // claude-sonnet-5-5
   expect(!result.ok && result.reason).toBe("model: not allowed");
@@ -263,8 +260,8 @@ test("forwards its own serialization, so duplicate JSON keys cannot be read diff
 
 test("ledger: a reservation that does not fit refuses, and keep counts it in full", () => {
   const ledger = new Ledger(0.01); // 10,000,000 nano-dollars
-  const id = ledger.reserve("claude-haiku-4-5", 6_000_000)!;
-  expect(ledger.reserve("claude-haiku-4-5", 5_000_000)).toBeUndefined();
+  const id = ledger.reserve("claude-haiku-5-5", 6_000_000)!;
+  expect(ledger.reserve("claude-haiku-5-5", 5_000_000)).toBeUndefined();
   ledger.keep(id);
   expect(ledger.totals()).toMatchObject({
     spentNanoUsd: 6_000_000,

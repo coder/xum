@@ -36,7 +36,7 @@
  * App AI: BUGBASH_AI (auto, real or mock; default auto, see aiMode.ts). The run resolves it once,
  * on the host: the probe goes through a proxy and the run's budget (sandbox/launch.ts probeApp),
  * never straight to the provider. In real mode each job's app reaches BUGBASH_APP_MODEL (default
- * Haiku 4.5, Anthropic only) through that job's proxy. Charters that name a `[mock:...]` prompt
+ * Haiku 5.5, Anthropic only) through that job's proxy. Charters that name a `[mock:...]` prompt
  * only work against the mock, so they always run with it. findings.md records each mode.
  *
  * Exit code: 0 when every charter ran (with or without findings). Else, in this order: 3 when a
@@ -227,7 +227,7 @@ function writeFindings(
       "",
       `## [${f.kind} ${f.severity}/5] ${f.title}`,
       "",
-      `- Model: \`${f.job.model}\`, charter: \`${f.job.charter.slug}\` (details and evidence: \`${dir}/summary.md\`, video under \`${dir}/artifacts/\`)`,
+      `- Model: \`${f.job.model}\`, charter: \`${f.job.charter.slug}\` (details and evidence: \`${dir}/summary.md\`, video under \`${dir}/results/\`)`,
       ...(f.path ? [`- Path: \`${f.path}\``] : []),
       `- Expected: ${f.expected}`,
       `- Actual: ${f.actual}`,
@@ -243,8 +243,8 @@ const DEFAULT_MODELS = ["anthropic:claude-sonnet-5-5"];
 
 /**
  * Measured list-price cost of one charter at --max-steps 6 and medium effort, explorer and app AI
- * together: four `make bug-bash` runs of Sonnet 5.5 on #5714, #6076 and #6079 averaged $0.34 to
- * $0.52 per charter (21 charters, $9.50 in all).
+ * together: five `make bug-bash` runs of Sonnet 5.5 on #5714, #6076, #6079 and 2026-10-13 (the
+ * Haiku 5.5 app) averaged $0.34 to $0.52 per charter (27 charters, $12.03 in all).
  */
 const MEASURED_USD_PER_JOB: Record<string, number> = { "claude-sonnet-5-5": 0.45 };
 const MEASURED_STEPS = 6;
@@ -258,11 +258,13 @@ const UNMEASURED_MARGIN = 2;
 const EFFORT_FACTOR: Record<string, number> = { low: 1, medium: 1, high: 2, xhigh: 3, max: 4 };
 
 /**
- * The real app AI's own share per charter with Haiku 4.5, the default app model: #6079's five
- * real-mode charters spent 19,545 input and 1,022 output tokens on it, about $0.005 each. That
- * share is already in the explorer measurement above, so only another app model adds to it.
+ * The real app AI's own share per charter with Haiku 5.5, the default app model: the five
+ * real-mode charters of a 2026-10-13 run spent 66 input, 15,122 cache-write, 12,257 cache-read and
+ * 2,123 output tokens on it, about $0.0042 each at the proxy's price (the upper tier,
+ * proxyPolicy.ts). That share is already in the explorer measurement above, so only another app
+ * model adds to it.
  */
-const MEASURED_APP_USD_PER_JOB = 0.005;
+const MEASURED_APP_USD_PER_JOB = 0.0042;
 
 /**
  * The run's cost estimate and the budget it needs. The estimate scales the measured cost per
@@ -271,7 +273,7 @@ const MEASURED_APP_USD_PER_JOB = 0.005;
  * Without it, the last jobs of a run that fits its estimate find the budget reserved and fail.
  * `appModel` is the app's model when its AI can be real (the probe decides later, so the check
  * assumes it is): its calls share the ledger, so its bound counts too, and a model other than the
- * measured Haiku 4.5 adds a guessed share per charter.
+ * measured default app model adds a guessed share per charter.
  */
 export function estimateRun(o: {
   models: string[];
