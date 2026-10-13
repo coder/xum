@@ -75,10 +75,44 @@ export interface MCPStdioServerInfo extends MCPServerBaseInfo {
   cwd?: string;
 }
 
+/**
+ * OAuth settings a plugin's mcp.json declares (OpenAI `com.openai.auth` or the
+ * Codex `.mcp.json` dialect). Backend-only: never accepted from mcp.jsonc,
+ * and never holds a client secret. Unset fields fall back to discovery + DCR.
+ */
+export interface MCPServerOAuthConfig {
+  /** A registered client; skips dynamic client registration. */
+  clientId?: string;
+  tokenEndpointAuthMethod?: "none" | "client_secret_basic" | "client_secret_post";
+  /**
+   * Discovery always supplies the authorization and token endpoints (#6142 tracks verified
+   * overrides). `authorizationServerBase` changes where authorization-server metadata is
+   * fetched (its issuer must be that URL). `registrationUrl` replaces the discovered
+   * registration endpoint only when it is that endpoint or sits under the issuer URL (dynamic
+   * registration only).
+   */
+  discovery?: { authorizationServerBase?: string; registrationUrl?: string };
+  /** Sent on every request. */
+  baseScopes?: string[];
+  /** Replaces the discovered default scopes ([] requests none). */
+  defaultScopes?: string[];
+  /** RFC 8707 resource indicator. */
+  resource?: string;
+  /**
+   * Where the Codex `.mcp.json` client secret lives. The OAuth service
+   * re-reads the value from this consented file per flow and keeps it in
+   * memory (RFC 8252 §8.5: a native-app secret is not confidential, but Xum
+   * still never persists, logs or displays it).
+   */
+  clientSecretSource?: { pluginRoot: string; mcpConfigPath: string; serverName: string };
+}
+
 /** HTTP-based server definition. */
 export interface MCPHttpServerInfo extends MCPServerBaseInfo {
   /** Backend-only provenance; never accepted from mcp.jsonc. */
   managed?: "claude-design";
+  /** Backend-only plugin OAuth settings (see MCPServerOAuthConfig). */
+  oauth?: MCPServerOAuthConfig;
   transport: "http" | "sse" | "auto";
   url: string;
   /** Optional headers (string literal or reference to a project secret key). */

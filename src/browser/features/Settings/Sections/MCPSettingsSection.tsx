@@ -659,7 +659,7 @@ const RemoteMCPOAuthSection: React.FC<{
     setAuthStatusError(null);
 
     try {
-      const status = await mcpOauthApi.getAuthStatus({ serverUrl: url });
+      const status = await mcpOauthApi.getAuthStatus({ serverUrl: url, serverName });
       setAuthStatus(status);
     } catch (err) {
       setAuthStatus(null);
@@ -667,7 +667,7 @@ const RemoteMCPOAuthSection: React.FC<{
     } finally {
       setAuthStatusLoading(false);
     }
-  }, [api, url]);
+  }, [api, url, serverName]);
 
   useEffect(() => {
     void refreshAuthStatus();
