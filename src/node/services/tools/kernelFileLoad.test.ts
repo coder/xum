@@ -317,3 +317,56 @@ describe("createKernelFileLoader Codex hook rewrites", () => {
     }
   });
 });
+
+describe("createKernelFileLoader Codex PostToolUse block", () => {
+  it("a PostToolUse block refuses the load with the hook's feedback (Codex PRRT_kwDOPxxmWM6r6NnK)", async () => {
+    // Codex keeps a blocked nested call's original result from the caller: the loaded content
+    // must never reach the script, only the hook's feedback.
+    using tmp = new DisposableTempDir("kernel-load-post-block");
+    await fs.writeFile(nodePath.join(tmp.path, "secret.txt"), "SECRET=1\n", "utf8");
+    const unregister = registerCodexPluginHooks(eventSpine, {
+      workspaceId: "kernel-post-block-ws",
+      pluginName: "guard",
+      order: 0,
+      hooks: [
+        {
+          key: "hooks/hooks.json#PostToolUse[0][0]",
+          hash: "h".repeat(64),
+          event: "PostToolUse",
+          matcher: "^file_read$",
+          handler: { type: "mcp_tool", server: "guard", tool: "check", input: {} },
+          status: "runnable",
+          source: "hooks/hooks.json",
+        },
+      ],
+      deps: {
+        isHookAllowed: () => Promise.resolve(true),
+        callPluginTool: () =>
+          Promise.resolve({ structuredContent: { decision: "block", reason: "secrets stay out" } }),
+        notifyUser: () => undefined,
+      },
+    });
+    try {
+      const runtime = new LocalRuntime(tmp.path);
+      const load = createKernelFileLoader({
+        cwd: tmp.path,
+        runtime,
+        hooks: {
+          runtime,
+          cwd: tmp.path,
+          runtimeTempDir: tmp.path,
+          workspaceId: "kernel-post-block-ws",
+        },
+      });
+      const refused: unknown = await load({ path: "secret.txt" }).then(
+        (loaded) => loaded,
+        (error: unknown) => error
+      );
+      expect(refused).toBeInstanceOf(Error);
+      expect(String(refused)).toContain("[plugin:guard] secrets stay out");
+      expect(String(refused)).not.toContain("SECRET=1");
+    } finally {
+      unregister();
+    }
+  });
+});
