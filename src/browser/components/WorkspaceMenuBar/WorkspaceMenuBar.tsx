@@ -58,7 +58,6 @@ import { WorkspaceActionsMenuContent } from "../WorkspaceActionsMenuContent/Work
 import {
   forkWorkspaceFromMenu,
   getErrorAnchor,
-  requestEditWorkspaceTitle,
   requestGenerateWorkspaceTitle,
   stopWorkspaceRuntime,
 } from "../WorkspaceActionsMenuContent/workspaceActionHandlers";
@@ -74,6 +73,7 @@ import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { formatProjectHierarchyLabel } from "@/common/utils/subProjects";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
+import { CommandIds } from "@/browser/utils/commandIds";
 import {
   NARROW_VIEWPORT_MAX_WIDTH_PX,
   WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX,
@@ -494,12 +494,6 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     }
   };
 
-  // The sidebar row owns the inline title edit, so open the left sidebar to show it.
-  const handleEditTitle = () => {
-    if (leftSidebarCollapsed) onToggleLeftSidebarCollapsed();
-    requestEditWorkspaceTitle(workspaceId);
-  };
-
   // Start workspace tutorial on first entry
   useEffect(() => {
     // Small delay to ensure UI is rendered
@@ -647,7 +641,15 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
             isRightSidebarHidden: timelineSidebarHidden,
           }}
           actions={{
-            editTitle: handleEditTitle,
+            // The palette's title prompt, not the sidebar row's inline edit: a collapsed sidebar,
+            // project, section or age tier keeps that row unmounted, and it would show no input.
+            // The prompt edits the selected workspace, which is the one this header shows.
+            editTitle: () =>
+              window.dispatchEvent(
+                createCustomEvent(CUSTOM_EVENTS.EXECUTE_COMMAND, {
+                  commandId: CommandIds.workspaceEditTitle(),
+                })
+              ),
             generateTitle: () => requestGenerateWorkspaceTitle(workspaceId),
             configureMcp: () => setMcpModalOpen(true),
             configureHeartbeat: () => setHeartbeatModalOpen(true),

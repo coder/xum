@@ -49,13 +49,6 @@ export function requestGenerateWorkspaceTitle(workspaceId: string): void {
   );
 }
 
-/** Starts the inline title edit of the workspace's sidebar row. */
-export function requestEditWorkspaceTitle(workspaceId: string): void {
-  window.dispatchEvent(
-    createCustomEvent(CUSTOM_EVENTS.WORKSPACE_EDIT_TITLE_REQUESTED, { workspaceId })
-  );
-}
-
 /** Where an action's error popover opens: just right of the element the user clicked. */
 export function getErrorAnchor(
   element: HTMLElement | null | undefined

@@ -86,6 +86,41 @@ describe("WorkspaceTitleEditContext", () => {
     expect(editingId()).toBe("ws-other");
   });
 
+  // Codex on #6301: an edit of B can start while A's save is in flight (A's row is hidden).
+  test("a save that settles after another edit started leaves that edit open", async () => {
+    const testWindow = new GlobalWindow();
+    globalThis.window = testWindow as unknown as Window & typeof globalThis;
+    globalThis.document = testWindow.document as unknown as Document;
+
+    const save = createDeferred<{ success: boolean }>();
+    let contextValue: ReturnType<typeof useTitleEdit> | null = null;
+    const editingId = () => contextValue?.editingWorkspaceId;
+    render(
+      <TitleEditProvider onUpdateTitle={() => save.promise}>
+        <ContextProbe onValue={(value) => (contextValue = value)} />
+      </TitleEditProvider>
+    );
+    await waitFor(() => expect(contextValue).not.toBeNull());
+
+    act(() => {
+      contextValue?.requestEdit("ws-a", "A");
+    });
+    let saving: Promise<unknown> | undefined;
+    act(() => {
+      saving = contextValue?.confirmEdit("ws-a", "A renamed");
+    });
+    act(() => {
+      contextValue?.requestEdit("ws-b", "B");
+    });
+    expect(editingId()).toBe("ws-b");
+
+    await act(async () => {
+      save.resolve({ success: true });
+      await saving;
+    });
+    expect(editingId()).toBe("ws-b");
+  });
+
   test("ignores duplicate regenerate requests while one is already in flight", async () => {
     const testWindow = new GlobalWindow();
     globalThis.window = testWindow as unknown as Window & typeof globalThis;

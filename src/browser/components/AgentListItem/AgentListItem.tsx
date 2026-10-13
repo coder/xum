@@ -71,9 +71,14 @@ import type { PinnedDropEdge } from "@/browser/utils/ui/pinnedReorder";
 import { WorkspaceHeartbeatModal } from "../WorkspaceHeartbeatModal";
 import { WorkspaceActionsMenuContent } from "../WorkspaceActionsMenuContent/WorkspaceActionsMenuContent";
 import { requestGenerateWorkspaceTitle } from "../WorkspaceActionsMenuContent/workspaceActionHandlers";
-import { WorkspaceMCPModal } from "../WorkspaceMCPModal/WorkspaceMCPModal";
-import { WorkspaceUnrelatedMessagingDialog } from "../WorkspaceUnrelatedMessagingModal/WorkspaceUnrelatedMessagingDialog";
+import { LazyFeature } from "../LazyFeature/LazyFeature";
 import { useWorkspaceActionsOptional } from "@/browser/contexts/WorkspaceContext";
+
+// The sidebar is on every page's first load, so its rows load these dialogs only when one opens
+// (#6202, the first-load split of #6206). The open state stays outside the lazy module.
+const RowSettingsDialog = React.lazy(async () => ({
+  default: (await import("./RowSettingsDialog")).RowSettingsDialog,
+}));
 
 export interface WorkspaceSelection {
   projectPath: string;
@@ -1267,23 +1272,6 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                   onOpenChange={closeModalOnHide}
                 />
               )}
-              {openModal === "mcp" && (
-                <WorkspaceMCPModal
-                  workspaceId={workspaceId}
-                  projectPath={projectPath}
-                  open
-                  onOpenChange={closeModalOnHide}
-                />
-              )}
-              {openModal === "messaging" && (
-                <WorkspaceUnrelatedMessagingDialog
-                  workspaceId={workspaceId}
-                  runtimeConfig={metadata.runtimeConfig}
-                  workspace={metadata}
-                  open
-                  onOpenChange={closeModalOnHide}
-                />
-              )}
             </ActionButtonWrapper>
           )
         )}
@@ -1434,6 +1422,20 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
           )}
         </div>
       </div>
+      {/* Outside the clickable row: React bubbles a portal's events through its React parents,
+          and a click on a dialog's backdrop (outside [role="dialog"]) would select the row. */}
+      {(openModal === "mcp" || openModal === "messaging") && (
+        // No loading fallback: the small chunk arrives in a moment, and an empty slot keeps the
+        // sidebar rows still. A failed load shows LazyFeature's Reload message under the row.
+        <LazyFeature name="Workspace settings">
+          <RowSettingsDialog
+            kind={openModal}
+            workspace={metadata}
+            projectPath={projectPath}
+            onClose={() => setOpenModal(null)}
+          />
+        </LazyFeature>
+      )}
       {titleError && isEditing && (
         <div className="bg-error-bg border-error text-error absolute top-full right-8 left-8 z-10 mt-1 rounded-sm border px-2 py-1.5 text-xs">
           {titleError}
