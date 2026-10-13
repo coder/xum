@@ -265,9 +265,12 @@ function linkReportPage(r: unknown, args: unknown, state: ReportJoinState): void
  */
 function readForegroundFirstPages(result: unknown): unknown[] {
   if (typeof result !== "object" || result === null) return [];
-  if ((result as { status?: unknown }).status !== "completed") return [];
+  // A best-of group whose other candidates were backgrounded, interrupted or timed out has a
+  // pending aggregate status, but each `reports` entry is still a completed report. Only a
+  // single-task result needs its own completed status.
   const reports = (result as { reports?: unknown }).reports;
-  const entries: unknown[] = Array.isArray(reports) ? reports : [result];
+  const isCompleted = (result as { status?: unknown }).status === "completed";
+  const entries: unknown[] = Array.isArray(reports) ? reports : isCompleted ? [result] : [];
   return entries
     .filter((entry) => toPageOffset((entry as { nextCharOffset?: unknown }).nextCharOffset) != null)
     .map((entry) => ({ ...(entry as object), status: "completed" }));

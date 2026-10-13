@@ -470,6 +470,49 @@ describe("TaskToolCall", () => {
       expect(card.text).toContain("Short report.");
     });
 
+    test("joins continuation pages onto a completed candidate of a pending best-of group", () => {
+      // One candidate finished with a report longer than one page; the other was backgrounded,
+      // so the foreground result has a pending status (buildPendingTaskResult).
+      const continuation = pageToolText(report, 10, 100);
+      const pendingResult = {
+        status: "running",
+        taskIds: ["fg-done", "fg-bg"],
+        tasks: [
+          { taskId: "fg-done", status: "completed" },
+          { taskId: "fg-bg", status: "interrupted" },
+        ],
+        note: "Tasks were sent to background because a new message was queued.",
+        reports: [
+          {
+            taskId: "fg-done",
+            reportMarkdown: firstPage.text,
+            nextCharOffset: firstPage.nextCharOffset,
+          },
+        ],
+      };
+      const continuationRead = createToolMessage({
+        toolName: "task_await",
+        args: { task_ids: ["fg-done"], offset_chars: firstPage.nextCharOffset },
+        result: {
+          results: [
+            {
+              status: "completed",
+              taskId: "fg-done",
+              reportMarkdown: continuation.text,
+              startCharOffset: continuation.startCharOffset,
+            },
+          ],
+        },
+      });
+      const linking = computeTaskReportLinking([
+        createToolMessage({ toolName: "task", args: foregroundArgs, result: pendingResult }),
+        continuationRead,
+      ]);
+      expect(linking.reportByTaskId.get("fg-done")?.reportMarkdown).toBe(report);
+      expect(linking.suppressReportInAwaitTaskIds.has("fg-done")).toBe(true);
+      expect(renderCard(pendingResult, [continuationRead]).text).toContain(report);
+    });
+
     test("starts a new join when a woken task reports again", () => {
       // The second attempt's first page matches the first attempt's text.
       const secondReport = "Page zero. Fresh end.";
