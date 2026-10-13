@@ -558,11 +558,12 @@ describe("agent_skill_read skill directory", () => {
     });
   }
 
-  it("expands ${CLAUDE_PLUGIN_ROOT} only for plugin skills", async () => {
+  it("expands ${CLAUDE_PLUGIN_ROOT} only for plugin skills, never ${PLUGIN_ROOT}", async () => {
     using tempDir = new TestTempDir("test-agent-skill-read-plugin-root");
     const projectRoot = await fs.realpath(tempDir.path);
     const pluginRoot = path.join(projectRoot, ".xum", "plugins", "demo-plugin");
-    const body = "shared: ${CLAUDE_PLUGIN_ROOT}/shared/x.sh";
+    // ${PLUGIN_ROOT} is Agent Plugins MCP-config syntax; skills that document it keep it literal.
+    const body = "shared: ${CLAUDE_PLUGIN_ROOT}/shared/x.sh mcp: ${PLUGIN_ROOT}";
     for (const dir of [
       path.join(pluginRoot, "skills", "plugin-skill"),
       path.join(projectRoot, ".xum", "skills", "project-skill"),
@@ -586,7 +587,7 @@ describe("agent_skill_read skill directory", () => {
     });
 
     expect((await readSkill(config, "plugin-skill")).skill.body.trim()).toBe(
-      `shared: ${pluginRoot}/shared/x.sh`
+      `shared: ${pluginRoot}/shared/x.sh mcp: \${PLUGIN_ROOT}`
     );
     // Not a plugin skill: Claude Code leaves the placeholder literal too.
     expect((await readSkill(config, "project-skill")).skill.body.trim()).toBe(body);
