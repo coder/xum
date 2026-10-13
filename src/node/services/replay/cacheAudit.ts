@@ -404,11 +404,14 @@ export function auditStepPrefixes(
     }
     // The DevTools record is the AI SDK prompt (system messages inline), the
     // same shape the gateway wire carries.
-    const blocks = fingerprintAnthropicRequest({
-      tools: step.tools,
-      prompt: step.prompt,
-      ...wireOptionsFromStep(step),
-    });
+    const blocks = fingerprintAnthropicRequest(
+      {
+        tools: step.tools,
+        prompt: step.prompt,
+        ...wireOptionsFromStep(step),
+      },
+      { modelId: step.modelId }
+    );
     if (previous != null) {
       const comparison = comparePromptCachePrefix(previous.blocks, blocks);
       if (comparison.kind !== "unsupported") comparedPairs++;

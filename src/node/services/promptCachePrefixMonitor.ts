@@ -163,7 +163,8 @@ export class PromptCachePrefixMonitor {
       // Re-inserting keeps Map order equal to recency, so eviction drops the oldest.
       this.latest.delete(key);
       if (scope.skip) return;
-      const blocks = fingerprintAnthropicRequest(body);
+      // The gateway prompt form names no model; the route identity does.
+      const blocks = fingerprintAnthropicRequest(body, { modelId: identity.modelString });
       const observedAt = this.now();
       this.latest.set(key, {
         workspaceId,
