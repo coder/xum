@@ -7,8 +7,9 @@ describe("pageToolText", () => {
     const text = "ab😀cd";
     // Offset 3 sits between the emoji's high (index 2) and low (index 3) surrogate.
     const page = pageToolText(text, 3, 10);
-    // Starts at the high surrogate: no unpaired low surrogate.
+    // Starts at the high surrogate: no unpaired low surrogate, and says where it started.
     expect(page.text).toBe("😀cd");
+    expect(page.startCharOffset).toBe(2);
   });
 
   it("never ends a page on a high surrogate", () => {

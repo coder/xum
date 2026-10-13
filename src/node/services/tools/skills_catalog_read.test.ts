@@ -77,17 +77,19 @@ describe("skills_catalog_read", () => {
       const tool = createSkillsCatalogReadTool(config);
       const pages: string[] = [];
       let offset: number | undefined;
+      let snapshot: string | undefined;
       for (let call = 0; call < 5; call++) {
         const result = (await tool.execute!(
-          { owner: "o", repo: "r", skillId: "test-skill", offset_chars: offset },
+          { owner: "o", repo: "r", skillId: "test-skill", offset_chars: offset, snapshot },
           mockToolCallOptions
         )) as SkillsCatalogReadToolResult;
         if (!result.success) throw new Error(result.error);
         expect(result.body.length).toBeLessThanOrEqual(TOOL_TEXT_PAGE_MAX_CHARS);
         pages.push(result.body);
         offset = result.nextCharOffset;
+        snapshot = result.snapshot;
         if (offset == null) break;
-        expect(result.note).toContain(`offset_chars: ${offset})`);
+        expect(result.note).toContain(`offset_chars: ${offset}, snapshot: "${snapshot ?? ""}")`);
       }
 
       expect(pages).toHaveLength(3);
@@ -97,44 +99,96 @@ describe("skills_catalog_read", () => {
     }
   });
 
-  it("reads later pages from the first page's fetch, and says so when that copy expired", async () => {
-    using tempDir = new TestTempDir("test-skills-catalog-read-pinned");
-    const config = createTestToolConfig(tempDir.path, { workspaceId: GLOBAL_WORKSPACE_ID });
+  describe("pinned copies", () => {
     const skillMd = (revision: string) =>
       `---\nname: pinned-skill\ndescription: A big skill\n---\n${revision}\n${"step\n".repeat(25_000)}`;
-    let revision = "rev-1";
-    const fetchContentSpy = spyOn(catalogFetch, "fetchSkillContent").mockImplementation(() =>
-      Promise.resolve({ content: skillMd(revision), path: "skills/p/SKILL.md", branch: "main" })
-    );
-    let now = 1_000_000;
-    const nowSpy = spyOn(Date, "now").mockImplementation(() => now);
-    const read = async (offset?: number) => {
-      const result = (await createSkillsCatalogReadTool(config).execute!(
-        { owner: "o", repo: "r", skillId: "pinned-skill", offset_chars: offset },
-        mockToolCallOptions
-      )) as SkillsCatalogReadToolResult;
-      if (!result.success) throw new Error(result.error);
-      return result;
-    };
 
-    try {
-      const first = await read();
-      // The branch moves after the first page: later pages still read the first copy.
-      revision = "rev-2";
-      const second = await read(first.nextCharOffset);
-      expect(fetchContentSpy).toHaveBeenCalledTimes(1);
-      expect(second.note).not.toContain("expired");
-      expect(first.body.startsWith("rev-1")).toBe(true);
-
-      // Past the pin's lifetime, the page fetches again and says the copy can differ.
-      now += 11 * 60 * 1000;
-      const third = await read(second.nextCharOffset);
-      expect(fetchContentSpy).toHaveBeenCalledTimes(2);
-      expect(third.note).toContain("expired");
-    } finally {
-      fetchContentSpy.mockRestore();
-      nowSpy.mockRestore();
+    function setup() {
+      const tempDir = new TestTempDir("test-skills-catalog-read-pinned");
+      const config = createTestToolConfig(tempDir.path, { workspaceId: GLOBAL_WORKSPACE_ID });
+      const state = { revision: "rev-1", now: 1_000_000 };
+      const fetchSpy = spyOn(catalogFetch, "fetchSkillContent").mockImplementation(() =>
+        Promise.resolve({
+          content: skillMd(state.revision),
+          path: "skills/p/SKILL.md",
+          branch: "main",
+        })
+      );
+      const nowSpy = spyOn(Date, "now").mockImplementation(() => state.now);
+      const read = async (page?: { nextCharOffset?: number; snapshot?: string }) => {
+        const result = (await createSkillsCatalogReadTool(config).execute!(
+          {
+            owner: "o",
+            repo: "r",
+            skillId: "pinned-skill",
+            offset_chars: page?.nextCharOffset,
+            snapshot: page?.snapshot,
+          },
+          mockToolCallOptions
+        )) as SkillsCatalogReadToolResult;
+        if (!result.success) throw new Error(result.error);
+        return result;
+      };
+      return {
+        state,
+        fetchSpy,
+        read,
+        [Symbol.dispose]: () => {
+          fetchSpy.mockRestore();
+          nowSpy.mockRestore();
+          tempDir[Symbol.dispose]();
+        },
+      };
     }
+
+    it("serves later pages from the first page's copy, named in the next-page call", async () => {
+      using h = setup();
+      const first = await h.read();
+      expect(first.note).toContain(`snapshot: "${first.snapshot ?? ""}"`);
+      // The branch moves after the first page: later pages still read the first copy.
+      h.state.revision = "rev-2";
+      const second = await h.read(first);
+      expect(h.fetchSpy).toHaveBeenCalledTimes(1);
+      expect(second.snapshot).toBe(first.snapshot);
+      expect(second.note).not.toContain("disagree");
+    });
+
+    it("keeps a sequence's copy when another reader starts over on a new revision", async () => {
+      using h = setup();
+      const readerA = await h.read();
+      h.state.revision = "rev-2";
+      const readerB = await h.read();
+      expect(readerB.snapshot).not.toBe(readerA.snapshot);
+
+      const nextA = await h.read(readerA);
+      expect(h.fetchSpy).toHaveBeenCalledTimes(2);
+      expect(nextA.snapshot).toBe(readerA.snapshot);
+      expect(nextA.note).not.toContain("disagree");
+    });
+
+    it("says so when the sequence's copy is gone and the skill changed", async () => {
+      using h = setup();
+      const first = await h.read();
+      // Expired and changed: the new copy can disagree with the first page.
+      h.state.now += 11 * 60 * 1000;
+      h.state.revision = "rev-2";
+      const late = await h.read(first);
+      expect(h.fetchSpy).toHaveBeenCalledTimes(2);
+      expect(late.note).toContain(`snapshot ${first.snapshot ?? ""} is no longer cached`);
+      // An unknown or absent snapshot is a miss too.
+      expect((await h.read({ ...first, snapshot: "unknown" })).note).toContain("disagree");
+      const noSnapshot = await h.read({ nextCharOffset: first.nextCharOffset });
+      expect(noSnapshot.note).toContain("No snapshot was passed");
+    });
+
+    it("needs no note when the refetched copy has the same bytes", async () => {
+      using h = setup();
+      const first = await h.read();
+      h.state.now += 11 * 60 * 1000;
+      const late = await h.read(first);
+      expect(h.fetchSpy).toHaveBeenCalledTimes(2);
+      expect(late.note).not.toContain("disagree");
+    });
   });
 
   it("returns parsed skill content on success", async () => {
