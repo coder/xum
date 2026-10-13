@@ -303,6 +303,11 @@ async function buildPluginScanCandidates(args: {
   return candidates;
 }
 
+/** Host Xum home that owns the plugin registry; see AgentSkillsRoots.pluginManagedHome. */
+function getPluginManagedHome(roots: AgentSkillsRoots): string | undefined {
+  return roots.pluginManagedHome ?? (roots.globalRoot ? path.dirname(roots.globalRoot) : undefined);
+}
+
 async function buildScanCandidates(
   runtime: Runtime,
   workspacePath: string,
@@ -311,8 +316,7 @@ async function buildScanCandidates(
 ): Promise<AgentSkillScanCandidate[]> {
   const globalRuntime = resolveGlobalRuntime(runtime, workspacePath);
   // Both scans can encounter the configured home, e.g. a project rooted at the user's home.
-  const managedHome =
-    roots.pluginManagedHome ?? (roots.globalRoot ? path.dirname(roots.globalRoot) : undefined);
+  const managedHome = getPluginManagedHome(roots);
 
   // Plugin skills sit at the lowest precedence within each scope, after the
   // standard (and .claude compat) roots of that scope.
