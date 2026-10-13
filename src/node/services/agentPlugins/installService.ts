@@ -568,11 +568,8 @@ async function interfaceSummary(
     warnings.push(`Plugin logo '${logoPath}' must be a PNG, JPEG or WebP image; ignoring`);
   } else if (logoPath !== undefined && mime !== undefined) {
     try {
-      // A staged clone still holds .git (its config can carry the remote's
-      // credentials), so a committed link into it must not become an image.
-      const real = await fsPromises.realpath(path.join(plugin.rootPath, logoPath));
-      if (path.relative(plugin.rootPath, real).split(path.sep)[0] === ".git")
-        throw new Error("it resolves into .git");
+      // The contained reader also refuses a link into the staged clone's .git
+      // (ensurePluginPathContained, #6161), so no separate check is needed here.
       const { bytes } = await readPluginFileWithinRootCapped({
         filePath: path.join(plugin.rootPath, logoPath),
         pluginRoot: plugin.rootPath,

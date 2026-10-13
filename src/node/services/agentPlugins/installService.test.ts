@@ -1985,7 +1985,9 @@ describe("AgentPluginInstallService", () => {
     await writeInterface("./assets/git.png");
     const intoGit = await service.preview({ input: remoteDir });
     expect(intoGit.manifest.interface?.logoDataUrl).toBeUndefined();
-    expect(intoGit.warnings.some((w) => w.includes("resolves into .git"))).toBe(true);
+    expect(
+      intoGit.warnings.some((w) => w.includes("resolves into the plugin's .git directory"))
+    ).toBe(true);
     expect(escaped.warnings.some((w) => w.includes("'./assets/escape.png' cannot be shown"))).toBe(
       true
     );
