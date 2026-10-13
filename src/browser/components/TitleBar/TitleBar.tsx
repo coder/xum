@@ -34,6 +34,7 @@ import {
   normalizeToCanonical,
 } from "@/common/utils/ai/models";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
 
@@ -136,18 +137,23 @@ export function TitleBar(props: TitleBarProps) {
           setUpdateStatus(status);
         }
       } catch (error) {
-        if (!signal.aborted) {
+        // A lost connection is not a stream error: the next client opens the stream again.
+        if (!signal.aborted && !isConnectionLostError(error)) {
           console.error("Update status stream error:", error);
         }
       }
     })();
 
+    // An offline check fails fast; the next one after the reconnect runs as usual.
+    const logCheckError = (error: unknown) => {
+      if (!isConnectionLostError(error)) console.error(error);
+    };
     // Check for updates on mount
-    api.update.check({ source: "auto" }).catch(console.error);
+    api.update.check({ source: "auto" }).catch(logCheckError);
 
     // Check periodically
     const checkInterval = setInterval(() => {
-      api.update.check({ source: "auto" }).catch(console.error);
+      api.update.check({ source: "auto" }).catch(logCheckError);
     }, UPDATE_CHECK_INTERVAL_MS);
 
     return () => {
