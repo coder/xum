@@ -51,6 +51,12 @@ import {
 import type { TodoItem } from "@/common/types/tools";
 import { buildStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import { revealTimelineTarget } from "@/browser/utils/timelineReveal";
+import type {
+  TimelineEvent,
+  TimelinePage,
+  TimelineSubscriptionEvent,
+} from "@/common/orpc/schemas/timeline";
+import { computeProvidersConfigFingerprint } from "@/common/utils/providers/configFingerprint";
 import {
   findRenderedRefineProposalHash,
   mergeTimelineEvents,
@@ -3625,6 +3631,165 @@ describe("WorkspaceStore", () => {
     });
   });
 
+  // Loaded session usage is repriced against the current provider config, except for
+  // gateway-billed rows, whose zero costs are real: repricing them would inflate totals.
+  describe("session usage repricing", () => {
+    // A flat-priced model: $5/M input and $25/M output tokens.
+    const BILLABLE_MODEL = "anthropic:claude-opus-4-5";
+    const OPUS_COST_OF_1000_IN_100_OUT = { input: 0.005, output: 0.0025 };
+    // No pricing metadata, unless a provider config maps it to a priced model.
+    const CUSTOM_MODEL = "ollama:custom";
+    const MAPPED_CUSTOM_CONFIG = {
+      ollama: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        models: [{ id: "custom", mappedToModel: BILLABLE_MODEL }],
+      },
+    };
+
+    const usageRow = (
+      costs: { input: number; output: number },
+      markers: { costsIncluded?: boolean; hasUnknownCosts?: boolean } = {}
+    ) => ({
+      input: { tokens: 1000, cost_usd: costs.input },
+      cached: { tokens: 0, cost_usd: 0 },
+      cacheCreate: { tokens: 0, cost_usd: 0 },
+      output: { tokens: 100, cost_usd: costs.output },
+      reasoning: { tokens: 0, cost_usd: 0 },
+      ...markers,
+    });
+    type UsageRow = ReturnType<typeof usageRow>;
+
+    /** Load one row as both the model's session bucket and the last request. */
+    const loadUsage = async (workspaceId: string, model: string, row: UsageRow) => {
+      mockGetSessionUsage.mockImplementation((input: { workspaceId: string }) =>
+        Promise.resolve(
+          input.workspaceId === workspaceId
+            ? {
+                byModel: { [model]: structuredClone(row) },
+                lastRequest: { model, usage: structuredClone(row), timestamp: 1 },
+                version: 1 as const,
+              }
+            : undefined
+        )
+      );
+      // A caught-up chat: before catch-up, usage reads come from a pre-replay snapshot.
+      mockChatScript([caughtUpEvent()], { keepOpen: true });
+      createAndAddWorkspace(store, workspaceId);
+      expect(await waitUntil(() => store.isSessionUsageKnown(workspaceId))).toBe(true);
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).loading === false)).toBe(
+        true
+      );
+      // Repricing runs once the provider config has loaded too.
+      await tick(10);
+      const usage = store.getWorkspaceUsage(workspaceId);
+      return { bucket: usage.sessionByModel?.[model], lastRequest: usage.lastRequest?.usage };
+    };
+
+    const expectCosts = (row: unknown, costs: { input: number; output: number }) => {
+      expect(row).toMatchObject({ input: { tokens: 1000 }, output: { tokens: 100 } });
+      const priced = row as UsageRow;
+      expect(priced.input.cost_usd).toBeCloseTo(costs.input, 10);
+      expect(priced.output.cost_usd).toBeCloseTo(costs.output, 10);
+    };
+
+    it("reprices recorded costs with the current model pricing", async () => {
+      // One non-zero component is enough to rule out the legacy gateway-billed heuristic.
+      const { bucket, lastRequest } = await loadUsage(
+        "reprice-stale-costs",
+        BILLABLE_MODEL,
+        usageRow({ input: 0, output: 1 })
+      );
+
+      expectCosts(bucket, OPUS_COST_OF_1000_IN_100_OUT);
+      expectCosts(lastRequest, OPUS_COST_OF_1000_IN_100_OUT);
+    });
+
+    it("keeps the zero costs of rows marked as gateway-billed", async () => {
+      const { bucket, lastRequest } = await loadUsage(
+        "reprice-costs-included",
+        BILLABLE_MODEL,
+        // The costsIncluded marker wins over a stale unknown-cost flag.
+        usageRow({ input: 0, output: 0 }, { costsIncluded: true, hasUnknownCosts: true })
+      );
+
+      expectCosts(bucket, { input: 0, output: 0 });
+      expectCosts(lastRequest, { input: 0, output: 0 });
+    });
+
+    it("keeps legacy all-zero costs of a billable model as gateway-billed", async () => {
+      const { bucket, lastRequest } = await loadUsage(
+        "reprice-legacy-zero-costs",
+        BILLABLE_MODEL,
+        usageRow({ input: 0, output: 0 })
+      );
+
+      expectCosts(bucket, { input: 0, output: 0 });
+      expectCosts(lastRequest, { input: 0, output: 0 });
+      expect(bucket).not.toHaveProperty("hasUnknownCosts");
+    });
+
+    it("prices rows recorded without pricing metadata", async () => {
+      const { bucket, lastRequest } = await loadUsage(
+        "reprice-unknown-costs",
+        BILLABLE_MODEL,
+        usageRow({ input: 0, output: 0 }, { hasUnknownCosts: true })
+      );
+
+      expectCosts(bucket, OPUS_COST_OF_1000_IN_100_OUT);
+      expectCosts(lastRequest, OPUS_COST_OF_1000_IN_100_OUT);
+    });
+
+    it("does not treat all-zero costs of an unpriced model as gateway-billed", async () => {
+      const { bucket, lastRequest } = await loadUsage(
+        "reprice-unpriced-zero-costs",
+        CUSTOM_MODEL,
+        usageRow({ input: 0, output: 0 })
+      );
+
+      // Repricing an unpriced model strips the costs and flags them as unknown.
+      expect(bucket).toMatchObject({ hasUnknownCosts: true, input: { tokens: 1000 } });
+      expect(bucket?.input.cost_usd).toBeUndefined();
+      expect(lastRequest).toMatchObject({ hasUnknownCosts: true });
+    });
+
+    it("classifies a mapped custom model by the pricing of its mapped model", async () => {
+      mockGetProvidersConfig.mockResolvedValueOnce(MAPPED_CUSTOM_CONFIG);
+      recreateStore();
+
+      const { bucket, lastRequest } = await loadUsage(
+        "reprice-mapped-zero-costs",
+        CUSTOM_MODEL,
+        usageRow({ input: 0, output: 0 })
+      );
+
+      expectCosts(bucket, { input: 0, output: 0 });
+      expectCosts(lastRequest, { input: 0, output: 0 });
+      expect(bucket).not.toHaveProperty("hasUnknownCosts");
+    });
+
+    it("prices unknown-cost rows once a provider config change maps their model", async () => {
+      const workspaceId = "reprice-after-mapping";
+      const before = await loadUsage(workspaceId, CUSTOM_MODEL, usageRow({ input: 0, output: 0 }));
+      expect(before.bucket).toMatchObject({ hasUnknownCosts: true });
+
+      mockGetProvidersConfig.mockResolvedValueOnce(MAPPED_CUSTOM_CONFIG);
+      providerConfigChanges.push(undefined);
+
+      expect(
+        await waitUntil(
+          () =>
+            store.getWorkspaceUsage(workspaceId).sessionByModel?.[CUSTOM_MODEL]?.input.cost_usd !==
+            undefined
+        )
+      ).toBe(true);
+      const usage = store.getWorkspaceUsage(workspaceId);
+      expectCosts(usage.sessionByModel?.[CUSTOM_MODEL], OPUS_COST_OF_1000_IN_100_OUT);
+      expectCosts(usage.lastRequest?.usage, OPUS_COST_OF_1000_IN_100_OUT);
+    });
+  });
+
   describe("syncWorkspaces", () => {
     it("should add new workspaces", async () => {
       const metadata1 = makeWorkspaceMetadata("workspace-1", {
@@ -6969,6 +7134,269 @@ describe("WorkspaceStore", () => {
     });
   });
 
+  // The timeline panel reads one refcounted backend subscription per workspace: its snapshot is
+  // the newest page, live batches merge into it, and older pages load from the snapshot cursor.
+  describe("workspace timeline", () => {
+    const timelineEvent = (seq: number): TimelineEvent => ({
+      v: 1,
+      seq,
+      id: `event-${seq}`,
+      ts: seq,
+      kind: "turn.completed",
+      source: { system: "workspace" },
+    });
+
+    // Inputs come from the store's client contract, payloads from the shared timeline schema,
+    // so a change on either side of the IPC boundary breaks these tests at compile time.
+    type TimelineClient = NonNullable<
+      Parameters<WorkspaceStore["setClient"]>[0]
+    >["workspace"]["timeline"];
+    let feed: ControllableAsyncIterable<TimelineSubscriptionEvent>;
+    let subscribeSignals: AbortSignal[];
+    const mockTimelineSubscribe = mock(
+      (_input: Parameters<TimelineClient["subscribe"]>[0], options?: { signal?: AbortSignal }) => {
+        if (options?.signal) subscribeSignals.push(options.signal);
+        return Promise.resolve(feed.iterable);
+      }
+    );
+    const mockTimelineList = mock(
+      (_input: Parameters<TimelineClient["list"]>[0]): Promise<TimelinePage> =>
+        Promise.resolve({ events: [], nextCursor: null, hasOlder: false })
+    );
+
+    beforeEach(() => {
+      feed = createControllableAsyncIterable<TimelineSubscriptionEvent>();
+      subscribeSignals = [];
+      mockTimelineSubscribe.mockClear();
+      mockTimelineList.mockClear();
+      resetStore();
+      store.setClient({
+        ...mockClient,
+        workspace: {
+          ...mockClient.workspace,
+          timeline: { subscribe: mockTimelineSubscribe, list: mockTimelineList },
+        },
+      } as unknown as Parameters<WorkspaceStore["setClient"]>[0]);
+    });
+
+    const seqs = (workspaceId: string) =>
+      store.getWorkspaceTimeline(workspaceId).events.map((event) => event.seq);
+
+    /** Register and subscribe a workspace whose snapshot is events 3 and 2, with older events. */
+    const openTimeline = async (workspaceId: string) => {
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      const unsubscribe = store.subscribeTimeline(workspaceId, () => undefined);
+      feed.push({
+        type: "snapshot",
+        events: [timelineEvent(3), timelineEvent(2)],
+        nextCursor: 2,
+        hasOlder: true,
+      });
+      expect(await waitUntil(() => store.getWorkspaceTimeline(workspaceId).initialized)).toBe(true);
+      return unsubscribe;
+    };
+
+    it("shares one backend subscription between listeners and shows its snapshot", async () => {
+      const workspaceId = "timeline-shared";
+      const listener = mock(() => undefined);
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      store.subscribeTimeline(workspaceId, listener);
+      store.subscribeTimeline(workspaceId, () => undefined);
+      expect(mockTimelineSubscribe).toHaveBeenCalledTimes(1);
+      expect(mockTimelineSubscribe.mock.calls[0][0]).toEqual({ workspaceId });
+
+      feed.push({ type: "snapshot", events: [timelineEvent(3)], nextCursor: 3, hasOlder: true });
+
+      expect(await waitUntil(() => listener.mock.calls.length > 0)).toBe(true);
+      expect(store.getWorkspaceTimeline(workspaceId)).toEqual({
+        events: [timelineEvent(3)],
+        nextCursor: 3,
+        hasOlder: true,
+        initialized: true,
+        loadingOlder: false,
+        loadError: null,
+        loadErrorKind: null,
+      });
+    });
+
+    it("marks an empty snapshot as initialized so the panel shows its empty state", async () => {
+      const workspaceId = "timeline-empty";
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      store.subscribeTimeline(workspaceId, () => undefined);
+      feed.push({ type: "snapshot", events: [], nextCursor: null, hasOlder: false });
+
+      expect(await waitUntil(() => store.getWorkspaceTimeline(workspaceId).initialized)).toBe(true);
+      expect(store.getWorkspaceTimeline(workspaceId).events).toEqual([]);
+    });
+
+    it("merges appended live events and skips empty batches", async () => {
+      const workspaceId = "timeline-appended";
+      const listener = mock(() => undefined);
+      await openTimeline(workspaceId);
+      store.subscribeTimeline(workspaceId, listener);
+
+      feed.push({ type: "appended", events: [] });
+      feed.push({ type: "appended", events: [timelineEvent(4)] });
+
+      expect(await waitUntil(() => seqs(workspaceId).length === 3)).toBe(true);
+      expect(seqs(workspaceId)).toEqual([4, 3, 2]);
+      // Only the non-empty batch notified listeners.
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(store.getWorkspaceTimeline(workspaceId)).toMatchObject({
+        nextCursor: 2,
+        hasOlder: true,
+      });
+    });
+
+    it("closes the backend subscription and drops the timeline after the last listener", async () => {
+      const workspaceId = "timeline-refcount";
+      const unsubscribeFirst = await openTimeline(workspaceId);
+      const unsubscribeSecond = store.subscribeTimeline(workspaceId, () => undefined);
+
+      unsubscribeFirst();
+      expect(subscribeSignals[0].aborted).toBe(false);
+      expect(seqs(workspaceId)).toEqual([3, 2]);
+
+      unsubscribeSecond();
+      expect(subscribeSignals[0].aborted).toBe(true);
+      expect(store.getWorkspaceTimeline(workspaceId).initialized).toBe(false);
+      expect(seqs(workspaceId)).toEqual([]);
+
+      // A later listener opens a fresh subscription.
+      store.subscribeTimeline(workspaceId, () => undefined);
+      expect(mockTimelineSubscribe).toHaveBeenCalledTimes(2);
+    });
+
+    it("subscribes a listener that came before the workspace was registered", () => {
+      const workspaceId = "timeline-early-listener";
+      store.subscribeTimeline(workspaceId, () => undefined);
+      expect(mockTimelineSubscribe).not.toHaveBeenCalled();
+
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      expect(mockTimelineSubscribe).toHaveBeenCalledTimes(1);
+    });
+
+    it("closes a subscription that opens after its listener left", async () => {
+      const workspaceId = "timeline-late-open";
+      const onReturn = mock(() => undefined);
+      feed = createControllableAsyncIterable<TimelineSubscriptionEvent>({ onReturn });
+      let openSubscription!: () => void;
+      mockTimelineSubscribe.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            openSubscription = () => resolve(feed.iterable);
+          })
+      );
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      const unsubscribe = store.subscribeTimeline(workspaceId, () => undefined);
+
+      unsubscribe();
+      openSubscription();
+
+      expect(await waitUntil(() => onReturn.mock.calls.length > 0)).toBe(true);
+      expect(store.getWorkspaceTimeline(workspaceId).initialized).toBe(false);
+    });
+
+    it("shows a failed subscription as an error until the user retries", async () => {
+      const workspaceId = "timeline-subscription-error";
+      mockTimelineSubscribe.mockImplementationOnce(() => Promise.reject(new Error("backend gone")));
+      createAndAddWorkspace(store, workspaceId, {}, false);
+      store.subscribeTimeline(workspaceId, () => undefined);
+
+      expect(
+        await waitUntil(() => store.getWorkspaceTimeline(workspaceId).loadError !== null)
+      ).toBe(true);
+      expect(store.getWorkspaceTimeline(workspaceId)).toMatchObject({
+        initialized: true,
+        loadError: "backend gone",
+        loadErrorKind: "subscription",
+      });
+
+      store.retryTimeline(workspaceId);
+      expect(mockTimelineSubscribe).toHaveBeenCalledTimes(2);
+      expect(store.getWorkspaceTimeline(workspaceId)).toMatchObject({
+        initialized: false,
+        loadError: null,
+      });
+      feed.push({
+        type: "snapshot",
+        events: [timelineEvent(1)],
+        nextCursor: null,
+        hasOlder: false,
+      });
+      expect(await waitUntil(() => seqs(workspaceId).length === 1)).toBe(true);
+    });
+
+    it("loads the next older page from the snapshot cursor", async () => {
+      const workspaceId = "timeline-older-page";
+      await openTimeline(workspaceId);
+      let resolvePage!: (page: TimelinePage) => void;
+      mockTimelineList.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolvePage = resolve;
+          })
+      );
+
+      const loading = store.loadOlderTimeline(workspaceId);
+      expect(mockTimelineList).toHaveBeenCalledWith({ workspaceId, cursor: 2 });
+      expect(store.getWorkspaceTimeline(workspaceId).loadingOlder).toBe(true);
+      // A second request while the page loads does not fetch it twice.
+      await store.loadOlderTimeline(workspaceId);
+      expect(mockTimelineList).toHaveBeenCalledTimes(1);
+
+      resolvePage({ events: [timelineEvent(1)], nextCursor: null, hasOlder: false });
+      await loading;
+
+      expect(seqs(workspaceId)).toEqual([3, 2, 1]);
+      expect(store.getWorkspaceTimeline(workspaceId)).toMatchObject({
+        nextCursor: null,
+        hasOlder: false,
+        loadingOlder: false,
+      });
+      // Without older events there is nothing left to load.
+      await store.loadOlderTimeline(workspaceId);
+      expect(mockTimelineList).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps the loaded events and shows a pagination error when a page fails", async () => {
+      const workspaceId = "timeline-older-page-error";
+      await openTimeline(workspaceId);
+      mockTimelineList.mockImplementationOnce(() => Promise.reject(new Error("page failed")));
+
+      await store.loadOlderTimeline(workspaceId);
+
+      expect(seqs(workspaceId)).toEqual([3, 2]);
+      expect(store.getWorkspaceTimeline(workspaceId)).toMatchObject({
+        nextCursor: 2,
+        hasOlder: true,
+        loadingOlder: false,
+        loadError: "page failed",
+        loadErrorKind: "pagination",
+      });
+    });
+
+    it("drops an older page that resolves after the timeline was reset", async () => {
+      const workspaceId = "timeline-older-page-stale";
+      await openTimeline(workspaceId);
+      let resolvePage!: (page: TimelinePage) => void;
+      mockTimelineList.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolvePage = resolve;
+          })
+      );
+
+      const loading = store.loadOlderTimeline(workspaceId);
+      store.retryTimeline(workspaceId);
+      resolvePage({ events: [timelineEvent(1)], nextCursor: null, hasOlder: false });
+      await loading;
+
+      expect(seqs(workspaceId)).toEqual([]);
+      expect(store.getWorkspaceTimeline(workspaceId).loadingOlder).toBe(false);
+    });
+  });
+
   describe("getWorkspaceRecency", () => {
     it("should return stable reference when values unchanged", () => {
       const recency1 = store.getWorkspaceRecency();
@@ -7884,6 +8312,117 @@ describe("WorkspaceStore", () => {
         ["mixed-turn", 31_000, false],
         ["tool-only-turn", 30_000, true],
       ]);
+    });
+  });
+
+  // The Costs tab's consumer breakdown comes from the token-stats cache persisted in
+  // session-usage.json when it still matches the history; otherwise the store recounts.
+  describe("consumer breakdown from the token-stats cache", () => {
+    const MODEL = "anthropic:claude-opus-4-5";
+    const CACHED_CONSUMERS = [{ name: "User", tokens: 42, percentage: 100 }];
+
+    const tokenStatsCache = (history: { messageCount: number; maxHistorySequence?: number }) => ({
+      version: 1 as const,
+      computedAt: 1,
+      // The beforeEach store loads an empty provider config.
+      providersConfigVersion: computeProvidersConfigFingerprint({}),
+      model: MODEL,
+      tokenizerName: "cached-tokenizer",
+      history,
+      consumers: CACHED_CONSUMERS,
+      totalTokens: 42,
+    });
+
+    /** Replay a two-message history (sequences 3 and 7) after the session usage loaded. */
+    const replayHistory = async (
+      workspaceId: string,
+      cache: ReturnType<typeof tokenStatsCache>
+    ) => {
+      mockGetSessionUsage.mockImplementation((input: { workspaceId: string }) =>
+        Promise.resolve(
+          input.workspaceId === workspaceId
+            ? { byModel: {}, tokenStatsCache: cache, version: 1 as const }
+            : undefined
+        )
+      );
+      mockChatScript(
+        [
+          // Hold the replay until the cache is in memory, so catch-up can use it.
+          waitUntil(() => store.isSessionUsageKnown(workspaceId)).then(() => tick(10)),
+          createHistoryMessageEvent("user-1", 3),
+          {
+            type: "message",
+            id: "assistant-1",
+            role: "assistant",
+            parts: [{ type: "text", text: "reply" }],
+            metadata: { historySequence: 7, timestamp: 7, model: MODEL },
+          },
+          caughtUpEvent(),
+        ],
+        { keepOpen: true }
+      );
+      createAndAddWorkspace(store, workspaceId);
+      expect(await waitUntil(() => store.getWorkspaceState(workspaceId).loading === false)).toBe(
+        true
+      );
+    };
+
+    it("shows the cached breakdown when the history still matches it", async () => {
+      const workspaceId = "consumers-cache-hit";
+      await replayHistory(workspaceId, tokenStatsCache({ messageCount: 2, maxHistorySequence: 7 }));
+
+      expect(store.getWorkspaceConsumers(workspaceId)).toEqual({
+        consumers: CACHED_CONSUMERS,
+        tokenizerName: "cached-tokenizer",
+        totalTokens: 42,
+        topFilePaths: undefined,
+        isCalculating: false,
+      });
+    });
+
+    it("recounts when the newest history sequence differs from the cached one", async () => {
+      // Same message count, but the history changed: the cache saw sequence 5 as newest.
+      const workspaceId = "consumers-cache-stale-sequence";
+      await replayHistory(workspaceId, tokenStatsCache({ messageCount: 2, maxHistorySequence: 5 }));
+
+      const state = store.getWorkspaceConsumers(workspaceId);
+      expect(state.isCalculating).toBe(true);
+      expect(state.consumers).toEqual([]);
+    });
+
+    it("recounts when the cache saw a different number of messages", async () => {
+      const workspaceId = "consumers-cache-stale-count";
+      await replayHistory(workspaceId, tokenStatsCache({ messageCount: 3, maxHistorySequence: 7 }));
+
+      expect(store.getWorkspaceConsumers(workspaceId).isCalculating).toBe(true);
+    });
+
+    it("trusts the message count when the cache has no history sequence", async () => {
+      const workspaceId = "consumers-cache-count-only";
+      await replayHistory(workspaceId, tokenStatsCache({ messageCount: 2 }));
+
+      expect(store.getWorkspaceConsumers(workspaceId)).toMatchObject({
+        consumers: CACHED_CONSUMERS,
+        isCalculating: false,
+      });
+    });
+
+    it("recounts on the next read after a provider config change drops the cache", async () => {
+      const workspaceId = "consumers-cache-config-change";
+      await replayHistory(workspaceId, tokenStatsCache({ messageCount: 2, maxHistorySequence: 7 }));
+      expect(store.getWorkspaceConsumers(workspaceId).isCalculating).toBe(false);
+
+      // A new fingerprint invalidates the breakdown and the persisted cache.
+      mockGetProvidersConfig.mockResolvedValueOnce({
+        ollama: { apiKeySet: false, isEnabled: true, isConfigured: true },
+      });
+      providerConfigChanges.push(undefined);
+
+      // The reads themselves schedule the recount: nothing else re-triggers it.
+      expect(await waitUntil(() => store.getWorkspaceConsumers(workspaceId).isCalculating)).toBe(
+        true
+      );
+      expect(store.getWorkspaceConsumers(workspaceId).consumers).toEqual([]);
     });
   });
 
