@@ -18,7 +18,7 @@ import { SettingsProvider } from "@/browser/contexts/SettingsContext";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import type { TestApiOverrides } from "@/browser/testUtils";
 import { GoalDefaultsSection } from "./GoalDefaultsSection";
-import { useGoalBoard } from "./useGoalBoard";
+import { useGoalBoard, type UseGoalBoardResult } from "./useGoalBoard";
 
 /*
  * Panes that load once per workspace or project keep what they show across a dropped
@@ -46,7 +46,7 @@ let answerOverride: () => Promise<unknown>;
 let savedOverrides: unknown[] = [];
 
 function board(goalId: string) {
-  return { entries: [{ id: goalId }] };
+  return { entries: [{ section: "upcoming", goal: { goalId } }] };
 }
 
 function servers(name: string) {
@@ -112,8 +112,8 @@ function pending(): Promise<unknown> {
   return new Promise(() => undefined);
 }
 
-function goalIds(result: { current: { board: { entries: Array<{ id: string }> } } }): string[] {
-  return result.current.board.entries.map((entry) => entry.id);
+function goalIds(result: { current: UseGoalBoardResult }): string[] {
+  return result.current.board.entries.map((entry) => entry.goal.goalId);
 }
 
 describe.each([...GAP_MODES])("loaded panes across a dropped connection (%s)", (mode) => {
