@@ -40,6 +40,7 @@ import {
   getTimelineEventKind,
   getAgentEventIcon,
   getAgentEventTint,
+  getPromptCacheBreakView,
   getTimelineEventTitle,
   getTimelinePresentation,
   isMachineryKind,
@@ -397,6 +398,21 @@ function TimelineRuleRow(props: {
   );
 }
 
+function PromptCacheBreakDetails(props: { event: TimelineEvent }) {
+  const view = getPromptCacheBreakView(props.event);
+  if (view == null) return null;
+  return (
+    <span className="text-muted counter-nums mt-1 grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5 text-[11px]">
+      {/* Wrap instead of truncating: the tool name and size at the end are what a reader needs. */}
+      <span className="col-span-2 min-w-0 break-words">{view.position}</span>
+      <span>Before</span>
+      <span className="text-content-secondary min-w-0 break-words">{view.before}</span>
+      <span>After</span>
+      <span className="text-content-secondary min-w-0 break-words">{view.after}</span>
+    </span>
+  );
+}
+
 function TimelineEventRow(props: {
   event: TimelineEvent;
   selected: boolean;
@@ -413,7 +429,6 @@ function TimelineEventRow(props: {
     presentation.icon;
   const failed = props.event.status === "failed";
   const interrupted = props.event.status === "interrupted";
-
   return (
     <button
       type="button"
@@ -462,6 +477,7 @@ function TimelineEventRow(props: {
             ) : null}
           </span>
         ) : null}
+        <PromptCacheBreakDetails event={props.event} />
       </span>
       <time
         dateTime={new Date(props.event.ts).toISOString()}

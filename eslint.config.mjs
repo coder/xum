@@ -540,6 +540,91 @@ const localPlugin = {
         };
       },
     },
+    "no-module-query-copy": {
+      meta: {
+        type: "problem",
+        docs: {
+          description:
+            'Disallow loading a second copy of a repo module with a query specifier (`require("./x?real=1")`)',
+        },
+        schema: [
+          {
+            type: "object",
+            properties: {
+              // Repo-relative test path -> query specifiers it may still load.
+              allow: {
+                type: "object",
+                additionalProperties: { type: "array", items: { type: "string" } },
+              },
+            },
+            additionalProperties: false,
+          },
+        ],
+        messages: {
+          copy: '"{{specifier}}" loads a second copy of a repo module. Bun\'s LCOV keeps only the last-loaded copy of a file, so in a shared CI shard this copy can replace the coverage that the module\'s own tests recorded (#6339). To get the real exports past a module mock, snapshot `{ ...RealModule }` from a static `import * as RealModule` at file scope, before the mock.module call.',
+        },
+      },
+      create(context) {
+        const allowed = new Set(
+          context.options[0]?.allow?.[
+            path.relative(context.cwd, context.filename).split(path.sep).join("/")
+          ] ?? []
+        );
+        // Package specifiers (react-dnd?real=1) stay allowed: their coverage is not reported.
+        // Asset loader queries (logo.svg?react) are the module's only specifier, not a copy.
+        const isRepoQueryCopy = (specifier) => {
+          const queryStart = specifier.indexOf("?");
+          return (
+            (specifier.startsWith("@/") ||
+              specifier.startsWith("@shared/") ||
+              specifier.startsWith(".")) &&
+            queryStart !== -1 &&
+            !/\.(svg|png|jpe?g|gif|webp|avif|ico|css|json|txt|md|html|wasm|woff2?|ttf)$/.test(
+              specifier.slice(0, queryStart)
+            )
+          );
+        };
+        const check = (node, source) => {
+          if (
+            source?.type === "Literal" &&
+            typeof source.value === "string" &&
+            isRepoQueryCopy(source.value) &&
+            !allowed.has(source.value)
+          ) {
+            context.report({ node, messageId: "copy", data: { specifier: source.value } });
+          }
+        };
+        return {
+          CallExpression(node) {
+            if (node.callee.type === "Identifier" && node.callee.name === "require") {
+              check(node, node.arguments[0]);
+            }
+          },
+          ImportExpression(node) {
+            check(node, node.source);
+          },
+          // Type-only imports and exports load nothing at runtime, whether the declaration
+          // (`import type`) or every specifier (`import { type A, type B }`) is type-only.
+          ImportDeclaration(node) {
+            const typeOnly =
+              node.importKind === "type" ||
+              (node.specifiers.length > 0 &&
+                node.specifiers.every((specifier) => specifier.importKind === "type"));
+            if (!typeOnly) check(node, node.source);
+          },
+          ExportNamedDeclaration(node) {
+            const typeOnly =
+              node.exportKind === "type" ||
+              (node.specifiers.length > 0 &&
+                node.specifiers.every((specifier) => specifier.exportKind === "type"));
+            if (!typeOnly) check(node, node.source);
+          },
+          ExportAllDeclaration(node) {
+            if (node.exportKind !== "type") check(node, node.source);
+          },
+        };
+      },
+    },
     "no-clear-dom-global": {
       meta: {
         type: "problem",
@@ -2778,6 +2863,65 @@ export default defineConfig([
         beforeAll: "readonly",
         afterAll: "readonly",
       },
+    },
+  },
+  {
+    // Test files and the support code they load run in the same covered bun process.
+    files: [
+      "**/*.test.ts",
+      "**/*.test.tsx",
+      "tests/**/*.{ts,tsx}",
+      "src/**/*.testHarness.{ts,tsx}",
+      "src/**/*.testUtils.{ts,tsx}",
+      "src/**/test[A-Z]*.{ts,tsx}",
+    ],
+    rules: {
+      "local/no-module-query-copy": [
+        "error",
+        {
+          // Existing copies. Each one can still lose coverage of its module in a shared shard;
+          // replace it with a file-scope snapshot or a static import, then drop it from here.
+          allow: {
+            "src/browser/AppEarlyPageImport.test.tsx": [
+              "@/browser/components/AIView/AIView?real=1",
+              "@/browser/App?earlyImport=root",
+              "@/browser/App?earlyImport=workspace",
+              "@/browser/App?prefetch=browser",
+              "@/browser/App?prefetch=desktop",
+            ],
+            "src/browser/components/AgentListItem/AgentListItem.test.tsx": [
+              "./AgentListItem?agent-list-item-test=1",
+            ],
+            "src/browser/components/ChatPane/WorkspaceFooterBar.test.tsx": [
+              "./WorkspaceFooterBar?workspace-footer-bar-test=1",
+              "./WorkspaceFooterBar?workspace-footer-bar-test=2",
+            ],
+            "src/browser/components/Dialog/Dialog.test.tsx": ["./Dialog?real=1"],
+            "src/browser/components/LoadingScreen/LoadingScreen.test.tsx": [
+              "../LoadingScreen/LoadingScreen?real=1",
+            ],
+            "src/browser/components/ProjectSidebar/ProjectSidebar.test.tsx": [
+              "../AgentListItem/AgentListItem?project-sidebar-real-row=1",
+              "./ProjectSidebar?project-sidebar-test=1",
+              "./ProjectSidebar?project-sidebar-scratch-test=1",
+              "./ProjectSidebar?project-sidebar-flat-test=1",
+            ],
+            "src/browser/components/WorkspaceMenuBar/WorkspaceMenuBar.test.tsx": [
+              "../Dialog/Dialog?real=1",
+              "./WorkspaceMenuBar?workspace-menu-bar-test=1",
+            ],
+            "src/browser/contexts/API.test.tsx": ["./API?real=1"],
+            "src/browser/features/Analytics/SavedQuerySqlDialog.test.tsx": [
+              "./SavedQuerySqlDialog?real=1",
+            ],
+            "src/browser/features/RightSidebar/BrowserTab/useBrowserBridgeConnection.test.tsx": [
+              "./useBrowserBridgeConnection.ts?test-isolation=static",
+            ],
+            "src/browser/utils/feedbackToast.test.tsx": ["../components/Dialog/Dialog?real=1"],
+            "src/browser/utils/perf/appShellReady.test.ts": ["./appShellReady?fresh=1"],
+          },
+        },
+      ],
     },
   },
   {

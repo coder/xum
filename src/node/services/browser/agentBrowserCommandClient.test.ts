@@ -88,7 +88,9 @@ describe("sendAgentBrowserDaemonCommand", () => {
     const server = net.createServer((socket) => {
       connectionCount += 1;
       if (connectionCount === 1) {
-        socket.end();
+        // resume(): an unread socket never sees the client's FIN, so closeServer() would wait
+        // for it forever (Node, and Bun since 1.4; Bun 1.3.12 closed it anyway).
+        socket.resume().end();
         return;
       }
 

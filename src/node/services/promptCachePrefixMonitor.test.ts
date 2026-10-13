@@ -8,7 +8,12 @@ import {
 } from "./promptCachePrefixMonitor";
 
 const SECRET_OUTPUT = "SECRET-FILE-CONTENTS ".repeat(800);
-const ANTHROPIC = { route: "anthropic", modelString: "anthropic:claude-sonnet-5-5" };
+const ENDPOINT = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC = {
+  route: "anthropic",
+  modelString: "anthropic:claude-sonnet-5-5",
+  endpoint: ENDPOINT,
+};
 
 function recorderFor(events: TimelineEventDraft[]) {
   return {
@@ -123,7 +128,11 @@ describe("PromptCachePrefixMonitor through the Anthropic wire wrapper", () => {
       {
         scope: scope(),
         body: requestBody("other model"),
-        identity: { route: "coder:anthropic", modelString: "coder:anthropic/claude-opus-5-5" },
+        identity: {
+          route: "coder:anthropic",
+          modelString: "coder:anthropic/claude-opus-5-5",
+          endpoint: ENDPOINT,
+        },
       },
     ]);
     expect(events).toEqual([]);
@@ -221,7 +230,7 @@ describe("PromptCachePrefixMonitor through the Anthropic wire wrapper", () => {
     const events: TimelineEventDraft[] = [];
     const monitor = new PromptCachePrefixMonitor();
     const scope = () => monitor.createTurnScope("ws-1", recorderFor(events));
-    const opus = { route: "anthropic", modelString: "anthropic:claude-opus-5-5" };
+    const opus = { ...ANTHROPIC, modelString: "anthropic:claude-opus-5-5" };
     // Sonnet -> Opus -> Sonnet: the second Sonnet request compares with the first.
     await send(monitor, [
       { scope: scope(), body: requestBody(SECRET_OUTPUT) },

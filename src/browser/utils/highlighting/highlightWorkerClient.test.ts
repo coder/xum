@@ -535,13 +535,13 @@ describe("highlightCode worker start-up", () => {
     const first = highlightCode("const a = 1;", "typescript", "dark");
     const queued = highlightCode("const b = 2;", "typescript", "dark");
     const both = Promise.allSettled([first, queued]);
-    expect(await settleWithin(both, 90_000)).not.toBe("pending");
+    expect(await settleWithin(both, 90_000, 1_000)).not.toBe("pending");
     for (const request of [first, queued]) {
       await expect(request).rejects.toThrow("HIGHLIGHT_WORKER_START_TIMEOUT");
     }
     // A worker per request, plus one recovery start that both waited on. Nothing starts later.
     expect(created).toHaveLength(3);
-    await advanceFakeTime(120_000);
+    await advanceFakeTime(120_000, undefined, 1_000);
     expect(created).toHaveLength(3);
   });
 
@@ -550,7 +550,11 @@ describe("highlightCode worker start-up", () => {
   it("a diff whose workers did not start rejects instead of returning a plain-text fallback", async () => {
     plan([null, null]);
     const chunks = groupDiffLines(["+const a = 1;"], 1, 1);
-    const outcome = await settleWithin(highlightDiffChunks(chunks, "typescript", "dark"), 60_000);
+    const outcome = await settleWithin(
+      highlightDiffChunks(chunks, "typescript", "dark"),
+      60_000,
+      1_000
+    );
     expect(outcome).toEqual({ error: "Error: HIGHLIGHT_WORKER_START_TIMEOUT" });
   });
 
@@ -589,7 +593,7 @@ describe("highlightCode worker start-up", () => {
     const ts = highlightCode("const a = 1;", "typescript", "dark");
     const py = highlightCode("a = 1", "python", "dark");
     const both = Promise.allSettled([ts, py]);
-    expect(await settleWithin(both, 120_000)).not.toBe("pending");
+    expect(await settleWithin(both, 120_000, 1_000)).not.toBe("pending");
     await expect(ts).rejects.toThrow("HIGHLIGHT_WORKER_START_TIMEOUT");
     await expect(py).resolves.toBe(html("a = 1"));
     expect(created).toHaveLength(4);
