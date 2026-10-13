@@ -197,31 +197,103 @@ function enablesCitations(part: Record<string, unknown>): boolean {
   return isRecord(citations) && citations.enabled === true;
 }
 
-/**
- * Names of the tools a block references with `tool_reference`: wire tool results and
- * `tool_search_tool_result`s (`tool_name`), wire `tool_addition` (`tool.name`), prompt-form
- * tool-result content (`providerOptions.anthropic.type: "tool-reference"`), provider tool
- * search output (`toolName`), and a prompt-form system message's `toolChanges`. Anthropic
- * expands each reference into the referenced tool's full definition at that position.
- */
-function collectToolReferences(value: unknown, names: string[]): void {
-  if (Array.isArray(value)) {
-    for (const item of value) collectToolReferences(item, names);
-    return;
-  }
-  if (!isRecord(value)) return;
-  // A removal names a tool without loading its definition; it is not a measured expansion.
-  if (value.type === "tool_removal") return;
-  const name = toolReferenceName(value);
-  if (typeof name === "string") names.push(name);
-  for (const nested of Object.values(value)) collectToolReferences(nested, names);
+/** `tool_name` of each wire `tool_reference` in a block list. */
+function wireReferenceNames(list: unknown): unknown[] {
+  return (Array.isArray(list) ? list : [])
+    .filter(isRecord)
+    .filter((item) => item.type === "tool_reference")
+    .map((item) => item.tool_name);
 }
 
-function toolReferenceName(value: Record<string, unknown>): unknown {
-  if (value.type === "tool_reference") return value.tool_name ?? value.name ?? value.toolName;
-  if (value.type === "tool_addition") return value.toolName;
-  const anthropic = anthropicOptionsOf(value);
-  return anthropic.type === "tool-reference" ? anthropic.toolName : undefined;
+function customReferenceNames(parts: unknown[]): unknown[] {
+  return parts
+    .map((item) => (isRecord(item) && item.type === "custom" ? anthropicOptionsOf(item) : {}))
+    .filter((anthropic) => anthropic.type === "tool-reference")
+    .map((anthropic) => anthropic.toolName);
+}
+
+/**
+ * A prompt-form tool result's references, where the pinned converter reads them
+ * (`convertToAnthropicPrompt`): a client tool result's `output: { type: "content" }` parts of
+ * type `custom` with `providerOptions.anthropic.type: "tool-reference"`, and the
+ * `output: { type: "json" }` of a provider-executed tool search, which the converter sends
+ * as a `tool_search_tool_result`. Any other JSON output is sent as text: application data.
+ */
+function promptResultReferenceNames(
+  part: Record<string, unknown>,
+  role: string,
+  toolSearchNames: ReadonlySet<string>
+): unknown[] {
+  const output = isRecord(part.output) ? part.output : {};
+  const value = Array.isArray(output.value) ? (output.value as unknown[]) : [];
+  if (output.type === "content") return customReferenceNames(value);
+  const isToolSearch =
+    role === "assistant" && output.type === "json" && toolSearchNames.has(String(part.toolName));
+  return isToolSearch
+    ? value
+        .filter(isRecord)
+        .filter((item) => item.type === "tool_reference")
+        .map((item) => item.toolName)
+    : [];
+}
+
+/**
+ * Names of the tools a message block references, read only from the protocol fields that
+ * carry references (never from tool input or a tool result's own JSON): a wire
+ * `tool_result.content` list, a wire `tool_search_tool_result`, a wire `tool_addition`, a
+ * prompt-form tool result (see promptResultReferenceNames), and the `tool_addition`s of a
+ * mid-conversation system message's `toolChanges`. A removal names a tool without loading
+ * its definition, so it is no expansion. Anthropic expands each reference into the
+ * referenced tool's full definition at that position.
+ */
+function toolReferenceNames(
+  block: Record<string, unknown>,
+  role: string,
+  toolSearchNames: ReadonlySet<string>
+): unknown[] {
+  switch (block.type) {
+    case "tool_result":
+      return wireReferenceNames(block.content);
+    case "tool_search_tool_result":
+      return wireReferenceNames(searchReferences(block.content));
+    case "tool_addition":
+      return wireAdditionNames(block.tool);
+    case "tool-result":
+      return promptResultReferenceNames(block, role, toolSearchNames);
+    case "message-options":
+      return toolAdditionNames(anthropicOptionsOf(block).toolChanges);
+    default:
+      return [];
+  }
+}
+
+function searchReferences(content: unknown): unknown {
+  return isRecord(content) ? content.tool_references : undefined;
+}
+
+/** A wire `tool_addition` names its tool as `tool: { type: "tool_reference", name }`. */
+function wireAdditionNames(tool: unknown): unknown[] {
+  return isRecord(tool) && tool.type === "tool_reference" ? [tool.name] : [];
+}
+
+function toolAdditionNames(changes: unknown): unknown[] {
+  return (Array.isArray(changes) ? changes : [])
+    .filter(isRecord)
+    .filter((change) => change.type === "tool_addition")
+    .map((change) => change.toolName);
+}
+
+/** Prompt-form names of the provider tool search tools (`anthropic.tool_search_*`). */
+function toolSearchToolNames(tools: unknown): Set<string> {
+  return new Set(
+    (Array.isArray(tools) ? tools : [])
+      .filter(isRecord)
+      .filter(
+        (tool) =>
+          typeof tool.id === "string" && /^anthropic\.tool_search_(regex|bm25)_\d+$/.test(tool.id)
+      )
+      .map((tool) => String(tool.name))
+  );
 }
 
 /**
@@ -231,11 +303,17 @@ function toolReferenceName(value: Record<string, unknown>): unknown {
  * Haiku 4.5 for a tool result and on Haiku 5.5 for a tool_addition; changing an
  * unreferenced deferred tool kept the whole prefix).
  */
-function referencedDefinitions(value: unknown, toolDefinitions: Map<string, unknown>): string {
-  const references: string[] = [];
-  collectToolReferences(value, references);
-  if (references.length === 0) return "";
-  return `\0${JSON.stringify(references.map((name) => toolDefinitions.get(name) ?? null))}`;
+function referencedDefinitions(
+  value: unknown,
+  role: string,
+  context: { toolDefinitions: Map<string, unknown>; toolSearchNames: ReadonlySet<string> }
+): string {
+  if (!isRecord(value)) return "";
+  const names = toolReferenceNames(value, role, context.toolSearchNames).filter(
+    (name): name is string => typeof name === "string"
+  );
+  if (names.length === 0) return "";
+  return `\0${JSON.stringify(names.map((name) => context.toolDefinitions.get(name) ?? null))}`;
 }
 
 function claudeVersion(modelId: string): { family: string; version: number } | undefined {
@@ -428,6 +506,7 @@ export function fingerprintAnthropicRequest(
   const blocks: PromptCacheBlock[] = [];
   const toolNamesByCallId = new Map<string, string>();
   const toolDefinitions = new Map<string, unknown>();
+  const referenceContext = { toolDefinitions, toolSearchNames: toolSearchToolNames(body.tools) };
   const push = (section: PromptCacheSection, role: string, value: unknown): void => {
     const serialized = JSON.stringify(value) ?? "null";
     const record = isRecord(value) ? value : {};
@@ -439,7 +518,8 @@ export function fingerprintAnthropicRequest(
     const resultId = label(record.tool_use_id);
     toolName ??= resultId != null ? toolNamesByCallId.get(resultId) : undefined;
     // Tool definitions hold application JSON, not references.
-    const expansion = section === "tools" ? "" : referencedDefinitions(value, toolDefinitions);
+    const expansion =
+      section === "tools" ? "" : referencedDefinitions(value, role, referenceContext);
     const hash = createHash("sha256")
       .update(`${section}\0${role}\0${serialized}${expansion}`)
       .digest("hex");

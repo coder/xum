@@ -711,6 +711,106 @@ describe("fingerprintAnthropicRequest follows Anthropic's cache invalidation tab
       ).kind
     ).toBe("extends");
   });
+
+  test("a tool_reference-shaped object in application JSON does not hash the definition", () => {
+    const deferred = (description: string) => [
+      ...TOOLS,
+      { name: "zulip_send", description, input_schema: { type: "object" }, defer_loading: true },
+    ];
+    const reference = { type: "tool_reference", tool_name: "zulip_send" };
+    const extendsAcrossDefinitions = (messages: Message[]) =>
+      compare(body(messages, deferred("v1")), body(messages, deferred("v2"))).kind;
+    const conversation = (assistant: unknown[], user: unknown[]): Message[] => [
+      { role: "user", content: [{ type: "text", text: "Go" }] },
+      { role: "assistant", content: assistant },
+      { role: "user", content: user },
+    ];
+    // Tool input, and a tool result's own data (a JSON string or a nested text block).
+    const inInput = { ...call("c1", "bash"), input: { echo: reference } };
+    expect(extendsAcrossDefinitions(conversation([inInput], [result("c1", "ok")]))).toBe("extends");
+    const asJson = result("c1", JSON.stringify([reference]));
+    expect(extendsAcrossDefinitions(conversation([call("c1", "bash")], [asJson]))).toBe("extends");
+    const nested = {
+      type: "tool_result",
+      tool_use_id: "c1",
+      content: [{ type: "text", text: "see", data: reference }],
+    };
+    expect(extendsAcrossDefinitions(conversation([call("c1", "bash")], [nested]))).toBe("extends");
+    // The protocol places still expand: tool_result content and a tool search result.
+    const real = { type: "tool_result", tool_use_id: "c1", content: [reference] };
+    expect(extendsAcrossDefinitions(conversation([call("c1", "bash")], [real]))).toBe("break");
+    const search = {
+      type: "tool_search_tool_result",
+      tool_use_id: "s1",
+      content: { type: "tool_search_tool_search_result", tool_references: [reference] },
+    };
+    const serverCall = {
+      type: "server_tool_use",
+      id: "s1",
+      name: "tool_search_tool_regex",
+      input: {},
+    };
+    expect(
+      extendsAcrossDefinitions(conversation([serverCall, search], [{ type: "text", text: "ok" }]))
+    ).toBe("break");
+
+    // Prompt form: a client tool's JSON output and its input are application data; a
+    // provider tool search's JSON output holds references.
+    const promptTools = (description: string) => [
+      { type: "provider", id: "anthropic.tool_search_regex_20251119", name: "search", args: {} },
+      {
+        type: "function",
+        name: "zulip_send",
+        description,
+        inputSchema: { type: "object" },
+        providerOptions: { anthropic: { deferLoading: true } },
+      },
+    ];
+    const promptReference = { type: "tool_reference", toolName: "zulip_send" };
+    const prompt = (description: string, messages: unknown[]) => ({
+      tools: promptTools(description),
+      prompt: [{ role: "user", content: [{ type: "text", text: "Go" }] }, ...messages],
+    });
+    const promptKind = (messages: unknown[]) =>
+      compare(prompt("v1", messages), prompt("v2", messages)).kind;
+    const toolResult = (toolName: string, output: object) => ({
+      type: "tool-result",
+      toolCallId: "c1",
+      toolName,
+      output,
+    });
+    const clientJson = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "c1",
+            toolName: "bash",
+            input: { echo: promptReference },
+          },
+        ],
+      },
+      { role: "tool", content: [toolResult("bash", { type: "json", value: [promptReference] })] },
+    ];
+    expect(promptKind(clientJson)).toBe("extends");
+    const providerSearch = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "c1",
+            toolName: "search",
+            input: {},
+            providerExecuted: true,
+          },
+          toolResult("search", { type: "json", value: [promptReference] }),
+        ],
+      },
+    ];
+    expect(promptKind(providerSearch)).toBe("break");
+  });
 });
 
 describe("thinking preservation by model", () => {
