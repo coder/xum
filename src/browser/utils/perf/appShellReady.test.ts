@@ -1,8 +1,14 @@
 import { expect, test } from "bun:test";
 import { installDom } from "../../../../tests/ui/dom";
-import { APP_SHELL_READY_MARK, markAppShellReady } from "./appShellReady";
+import { APP_SHELL_READY_MARK, type markAppShellReady as SharedMark } from "./appShellReady";
 
-// One test only: the "marked" flag is module-level, so the mark is once per module load.
+// One test only: the "marked" flag is module-level, so the mark is once per module load. A fresh
+// copy, because another suite in the same process can already have marked the shared one (#6255).
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { markAppShellReady } = require("./appShellReady?fresh=1") as {
+  markAppShellReady: typeof SharedMark;
+};
+
 test("sets the app-shell-ready mark on the first attach only", () => {
   const cleanupDom = installDom();
   try {

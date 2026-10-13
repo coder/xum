@@ -23,6 +23,7 @@ export const createXumConfigReadTool: ToolFactory = (config: ToolConfiguration) 
       { abortSignal: _abortSignal }
     ): Promise<XumConfigReadToolResult> => {
       try {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const xumHome = config.xumScope!.xumHome;
         const rawDocument = await readConfigDocumentUnvalidated(xumHome, args.file);
         const redactedDocument = redactConfigDocument(args.file, rawDocument);

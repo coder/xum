@@ -7,7 +7,9 @@ import { DisposableTempDir } from "@/node/services/tempDir";
 import {
   computeAgentPluginContainers,
   discoverAgentPlugins,
+  ensurePluginPathContained,
   journalDerivedDiscoveryGate,
+  readPluginFileWithinRootCapped,
   setAgentPluginDiscoveryGate,
 } from "./discovery";
 import { bumpContainerMutationEpoch, MUTATION_EPOCH_FILE, STAGING_DIR_NAME } from "./journals";
@@ -1341,5 +1343,40 @@ describe("computeAgentPluginContainers", () => {
       projectTrusted: false,
     });
     expect(containers.some((c) => c.path === path.join("/home/u/.mux", "plugins"))).toBe(true);
+  });
+});
+
+describe("plugin .git containment (#6161)", () => {
+  test("the contained reader refuses a link into .git; .gitignore-like names still read", async () => {
+    using tmp = new DisposableTempDir("plugin-git-link");
+    const root = await fs.realpath(tmp.path);
+    await fs.mkdir(path.join(root, ".git"));
+    await fs.writeFile(path.join(root, ".git", "config"), "url = https://user:SECRET@host\n");
+    await fs.symlink(".git/config", path.join(root, "hooks.js"));
+    await fs.symlink(".git", path.join(root, "linked-git"));
+    await fs.writeFile(path.join(root, ".gitignore"), "dist\n");
+    await fs.mkdir(path.join(root, ".github"));
+    await fs.writeFile(path.join(root, ".github", "notes.md"), "ok\n");
+    const read = (relative: string) =>
+      readPluginFileWithinRootCapped({
+        filePath: path.join(root, relative),
+        pluginRoot: root,
+        maxBytes: 1024,
+        label: "hooks.js",
+      });
+    for (const relative of ["hooks.js", ".git/config", "linked-git/config", ".GIT/config"]) {
+      const error: unknown = await read(relative).catch((caught: unknown) => caught);
+      // ".GIT" exists only on case-insensitive filesystems; elsewhere it is missing.
+      if (relative === ".GIT/config" && error instanceof Error && error.message.includes("ENOENT"))
+        continue;
+      expect(error).toBeInstanceOf(Error);
+      expect(String(error)).toContain(".git directory");
+      expect(String(error)).not.toContain("SECRET");
+    }
+    expect((await read(".gitignore")).content).toBe("dist\n");
+    expect((await read(".github/notes.md")).content).toBe("ok\n");
+    expect(await ensurePluginPathContained(root, path.join(root, ".gitignore"))).toBe(
+      path.join(root, ".gitignore")
+    );
   });
 });

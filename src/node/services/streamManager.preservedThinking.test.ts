@@ -778,3 +778,147 @@ describe("StreamManager - Anthropic preserved thinking replay", () => {
     });
   });
 });
+describe("StreamManager - Anthropic server tool deferred behind a client tool", () => {
+  // Claude can call web_search in parallel with a client tool. The API then stops with
+  // `tool_use` before running the search, and runs it once the client results arrive. The
+  // user message carrying those results may hold ONLY tool_result blocks; anything after them
+  // ends the turn, and the request fails with "`web_search` tool use with id ... was found
+  // without a corresponding `web_search_tool_result` block". Xum used to append a synthetic
+  // user message with extracted tool media (screenshots, attach_file) right there.
+  const png =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+  function clientToolUse(index: number, id: string): unknown[] {
+    return [
+      {
+        type: "content_block_start",
+        index,
+        content_block: { type: "tool_use", id, name: "screenshot", input: {} },
+      },
+      {
+        type: "content_block_delta",
+        index,
+        delta: { type: "input_json_delta", partial_json: "{}" },
+      },
+      { type: "content_block_stop", index },
+    ];
+  }
+
+  const toolUseStop = [
+    {
+      type: "message_delta",
+      delta: { stop_reason: "tool_use" },
+      usage: { output_tokens: 5 },
+    },
+    { type: "message_stop" },
+  ];
+
+  /** web_search and a client tool in one parallel group: the search result is deferred. */
+  const deferredSearchResponse = () =>
+    sse([
+      messageStart,
+      {
+        type: "content_block_start",
+        index: 0,
+        content_block: {
+          type: "server_tool_use",
+          id: "srvtoolu_1",
+          name: "web_search",
+          input: { query: "xum" },
+        },
+      },
+      { type: "content_block_stop", index: 0 },
+      ...clientToolUse(1, "toolu_1"),
+      ...toolUseStop,
+    ]);
+
+  /** The continued turn opens with the deferred search result, then calls the client tool again. */
+  const searchResultResponse = () =>
+    sse([
+      messageStart,
+      {
+        type: "content_block_start",
+        index: 0,
+        content_block: {
+          type: "web_search_tool_result",
+          tool_use_id: "srvtoolu_1",
+          content: [
+            {
+              type: "web_search_result",
+              url: "https://example.com/xum",
+              title: "Xum",
+              encrypted_content: "enc-1",
+              page_age: null,
+            },
+          ],
+        },
+      },
+      { type: "content_block_stop", index: 0 },
+      ...clientToolUse(1, "toolu_2"),
+      ...toolUseStop,
+    ]);
+
+  type Message = AnthropicRequestBody["messages"][number];
+  const blocks = (message: Message | undefined): AnthropicBlock[] =>
+    message == null || typeof message.content === "string" ? [] : message.content;
+  const withoutCacheControl = (messages: Message[]) =>
+    messages.map((message) => ({
+      ...message,
+      content: blocks(message).map(({ cache_control: _cc, ...block }) => block),
+    }));
+
+  test("keeps the user message after the deferred search to tool_result blocks only", async () => {
+    const workspaceId = "deferred-server-tool-media";
+    const { model, provider, bodies } = scriptedAnthropicModel([
+      deferredSearchResponse,
+      searchResultResponse,
+      textResponse,
+    ]);
+    const seeded = await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("user-1", "user", "search", { historySequence: 0 })
+    );
+    if (!seeded.success) throw new Error(seeded.error);
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: fakeStreamText((options) => aiSdk.streamText(options)),
+    });
+    await runTurnForTests(streamManager, {
+      workspaceId,
+      model,
+      modelString: "anthropic:claude-opus-5-5",
+      messages: [{ role: "user", content: "search" }],
+      tools: {
+        // Same cast as production (src/common/utils/tools/tools.ts).
+        web_search: provider.tools.webSearch_20250305({ maxUses: 5 }) as Tool,
+        // Media output, as attach_file and screenshot tools return it.
+        screenshot: tool({
+          inputSchema: z.object({}),
+          execute: () =>
+            Promise.resolve({
+              type: "content",
+              value: [{ type: "media", mediaType: "image/png", data: png }],
+            }),
+        }),
+      },
+    });
+    expect(bodies).toHaveLength(3);
+
+    // Request 2 resumes the open turn: the server tool is still waiting.
+    const resumed = bodies[1].messages;
+    expect(blocks(resumed[1]).map((block) => block.type)).toEqual(["server_tool_use", "tool_use"]);
+    const results = blocks(resumed[2]);
+    expect(results.map((block) => block.type)).toEqual(["tool_result"]);
+    // The screenshot still reaches the model, inside its tool_result.
+    expect(JSON.stringify(results[0].content)).toContain(png);
+
+    // Request 3 replays that prefix unchanged, and media after a client-only step still
+    // reaches the model the usual way.
+    const next = bodies[2].messages;
+    expect(withoutCacheControl(next.slice(0, 3))).toEqual(withoutCacheControl(resumed));
+    expect(blocks(next[3]).map((block) => block.type)).toEqual([
+      "web_search_tool_result",
+      "tool_use",
+    ]);
+    expect(blocks(next[4]).map((block) => block.type)).toEqual(["tool_result", "text", "image"]);
+  });
+});

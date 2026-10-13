@@ -64,6 +64,7 @@ export const createAskUserQuestionTool: ToolFactory = (config: ToolConfiguration
           "abort",
           () => {
             try {
+              // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
               askUserQuestionManager.cancel(config.workspaceId!, toolCallId, "Interrupted");
             } catch {
               // ignore
