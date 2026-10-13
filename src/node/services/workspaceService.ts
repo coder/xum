@@ -397,7 +397,6 @@ import { SendMessageOptionsSchema } from "@/common/orpc/schemas";
 import {
   type AgentMessageDispatchMode,
   getValidAgentMessageDispatchMode,
-  getValidMessagingTag,
   getValidUnrelatedWorkspaceConsent,
   normalizeMessagingTag,
 } from "@/common/orpc/schemas/workspace";
@@ -2390,6 +2389,53 @@ const DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA = SendMessageOptionsSchema.pick
 function aliasesProjectMetadataDir(projectName: string): boolean {
   const folded = projectName.replace(/[. ]+$/, "").toLowerCase();
   return PROJECT_METADATA_DIR_NAMES.some((dirName) => dirName === folded);
+}
+
+/**
+ * Why an entry may not carry a messaging tag, or null when it may (see setMessagingTag).
+ * Root chats only: a side chat is discarded with its main chat, and a sub-agent child's
+ * parent owns its messaging — tagging either would create a link that outlives its meaning.
+ */
+function messagingTagRootRefusal(
+  entry: Pick<Workspace, "parentWorkspaceId" | "sideChatParentWorkspaceId">
+): string | null {
+  if (entry.sideChatParentWorkspaceId != null) {
+    return "Messaging tags can only be set on a root chat, not a side chat.";
+  }
+  if (entry.parentWorkspaceId != null) {
+    return "Messaging tags can only be set on a root chat, not a sub-agent chat.";
+  }
+  return null;
+}
+
+/** Root-only refusal first, then tag validation: the value a tag write may persist. */
+function messagingTagWriteValue(
+  entry: Pick<Workspace, "parentWorkspaceId" | "sideChatParentWorkspaceId">,
+  tag: string | null
+): Result<string | null, string> {
+  const refusal = messagingTagRootRefusal(entry);
+  if (refusal != null) {
+    return Err(refusal);
+  }
+  return resolveMessagingTagValue(tag);
+}
+
+/**
+ * Resolves user tag input to the value to persist: null clears (null/empty input), a
+ * normalized tag sets, and anything else is an error the caller returns before any write.
+ */
+function resolveMessagingTagValue(tag: string | null): Result<string | null, string> {
+  if (tag === null || tag.trim() === "") {
+    return Ok(null);
+  }
+  const normalized = normalizeMessagingTag(tag);
+  if (normalized === null) {
+    return Err(
+      "Invalid messaging tag: use 1-32 characters, starting with a letter or digit, " +
+        "followed by letters, digits, hyphens, or underscores (an optional leading @ is allowed)."
+    );
+  }
+  return Ok(normalized);
 }
 
 function mintUnrelatedWorkspaceConsent(): string {
@@ -9271,30 +9317,17 @@ export class WorkspaceService
    */
   async setMessagingTag(workspaceId: string, tag: string | null): Promise<Result<void, string>> {
     try {
-      assert(tag === null || typeof tag === "string", "setMessagingTag requires a string or null");
       const resolved = this.resolveHeartbeatWorkspaceEntry(workspaceId, "setMessagingTag");
       if (!resolved.success) {
         return Err(resolved.error);
       }
       const { normalizedWorkspaceId, projectPath, workspacePath, workspaceEntry } = resolved.data;
-      // Root chats only: a side chat is discarded with its main chat, and a child's parent
-      // owns its messaging — tagging either would create a link that outlives its meaning.
-      if (workspaceEntry.sideChatParentWorkspaceId != null) {
-        return Err("Messaging tags can only be set on a root chat, not a side chat.");
+      // Root-only, then validate before any write: an invalid tag must not persist or publish.
+      const tagValue = messagingTagWriteValue(workspaceEntry, tag);
+      if (!tagValue.success) {
+        return Err(tagValue.error);
       }
-      if (workspaceEntry.parentWorkspaceId != null) {
-        return Err("Messaging tags can only be set on a root chat, not a sub-agent chat.");
-      }
-
-      // Validate before any write: an invalid tag must not persist or publish.
-      const clearsTag = tag === null || tag.trim() === "";
-      const normalizedTag = clearsTag ? null : normalizeMessagingTag(tag);
-      if (!clearsTag && normalizedTag === null) {
-        return Err(
-          "Invalid messaging tag: use 1-32 characters, starting with a letter or digit, " +
-            "followed by letters, digits, hyphens, or underscores (an optional leading @ is allowed)."
-        );
-      }
+      const normalizedTag = tagValue.data;
 
       // Mutate inside the serialized editConfig transform against the FRESH entry (see
       // findFreshWorkspaceEntry): a stale snapshot write could resurrect a removed workspace.
@@ -9310,12 +9343,9 @@ export class WorkspaceService
           return freshConfig;
         }
         // Re-check on the fresh entry: it may have become a child/side chat since resolution.
-        if (entry.sideChatParentWorkspaceId != null) {
-          outcome = Err("Messaging tags can only be set on a root chat, not a side chat.");
-          return freshConfig;
-        }
-        if (entry.parentWorkspaceId != null) {
-          outcome = Err("Messaging tags can only be set on a root chat, not a sub-agent chat.");
+        const freshRefusal = messagingTagRootRefusal(entry);
+        if (freshRefusal != null) {
+          outcome = Err(freshRefusal);
           return freshConfig;
         }
         outcome = Ok(undefined);
@@ -9328,16 +9358,6 @@ export class WorkspaceService
       });
       if (!outcome.success) {
         return Err(outcome.error);
-      }
-      // Belt and braces (same as the dispatch-mode setter): the write must read back as the
-      // validated tag, never as a malformed value another writer slipped in.
-      const persisted = this.findFreshWorkspaceEntry(this.config.loadConfigOrDefault(), {
-        projectPath,
-        workspaceId: normalizedWorkspaceId,
-        workspacePath,
-      });
-      if (getValidMessagingTag(persisted?.messagingTag) !== (normalizedTag ?? undefined)) {
-        return Err("Failed to save messaging tag: the config write did not persist.");
       }
       // Publish after every successful write, including no-ops (same reason as consent above):
       // Ok means committed AND published, so the UI only moves after this ack.

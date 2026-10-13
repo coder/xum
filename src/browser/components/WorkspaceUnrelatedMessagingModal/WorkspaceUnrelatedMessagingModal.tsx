@@ -64,12 +64,6 @@ export function WorkspaceUnrelatedMessagingModal(props: WorkspaceUnrelatedMessag
   const [error, setError] = useState<string | null>(null);
   // Only the newest request may settle the pending/error state (rapid toggles, unmounts).
   const latestRequestIdRef = useRef(0);
-  // The tag input is uncontrolled, keyed by the persisted tag: published metadata is the
-  // only source of truth, and a save reads the DOM value on blur/submit (then resets it to
-  // the persisted text, so only the republished metadata can change what is shown).
-  const persistedTagText = props.messagingTag != null ? `@${props.messagingTag}` : "";
-  const tagInputRef = useRef<HTMLInputElement>(null);
-
   const handleToggle = async (
     setting: "consent" | "hold" | "tag",
     save: () => Promise<Result<void, string>>
@@ -95,17 +89,8 @@ export function WorkspaceUnrelatedMessagingModal(props: WorkspaceUnrelatedMessag
     }
   };
 
-  const handleSaveTag = async (draft: string) => {
-    if (draft === persistedTagText) {
-      return;
-    }
-    await handleToggle("tag", () => props.onSetMessagingTag(draft.trim() === "" ? null : draft));
-    // Revert either way: on success the republished metadata takes over (the key below
-    // remounts the input), and on failure the error above explains why the edit was dropped.
-    if (tagInputRef.current) {
-      tagInputRef.current.value = persistedTagText;
-    }
-  };
+  const saveMessagingTag = (tag: string | null) =>
+    handleToggle("tag", () => props.onSetMessagingTag(tag));
 
   const HoldDescription = props.consentSupported ? "div" : DialogDescription;
 
@@ -157,43 +142,12 @@ export function WorkspaceUnrelatedMessagingModal(props: WorkspaceUnrelatedMessag
 
           {/* Tag linking works on every runtime (remote/container chats are the point), so
               this row is never gated on consentSupported. Only the user can set a tag. */}
-          <div className="border-border rounded-lg border p-4">
-            <div className="min-w-0">
-              <label htmlFor="messaging-tag-input" className="text-foreground text-sm font-medium">
-                Messaging tag
-              </label>
-              <p className="text-muted mt-1 text-xs">
-                Give this chat a tag such as <span className="font-mono">@research</span> and give
-                the same tag to other chats you want it to exchange agent messages with. Only you
-                can set or clear a tag; clearing it removes the link.
-              </p>
-              <form
-                className="mt-3 flex items-center gap-2"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  void handleSaveTag(tagInputRef.current?.value ?? persistedTagText);
-                }}
-              >
-                <Input
-                  key={persistedTagText}
-                  ref={tagInputRef}
-                  id="messaging-tag-input"
-                  defaultValue={persistedTagText}
-                  onBlur={(event) => void handleSaveTag(event.currentTarget.value)}
-                  disabled={isSaving}
-                  placeholder="@research"
-                  autoComplete="off"
-                  spellCheck={false}
-                  className="min-w-0 flex-1"
-                />
-                {savingSetting === "tag" && (
-                  <span role="status" className="text-muted shrink-0 text-xs">
-                    Saving
-                  </span>
-                )}
-              </form>
-            </div>
-          </div>
+          <MessagingTagSetting
+            messagingTag={props.messagingTag}
+            disabled={isSaving}
+            saving={savingSetting === "tag"}
+            onSaveTag={saveMessagingTag}
+          />
 
           <div className="border-border rounded-lg border p-4">
             <div className="flex items-center justify-between gap-4">
@@ -261,5 +215,75 @@ export function WorkspaceUnrelatedMessagingModal(props: WorkspaceUnrelatedMessag
         </div>
       </DialogContent>
     </Dialog>
+  );
+}
+interface MessagingTagSettingProps {
+  /** Persisted tag (without `@`) from published metadata; the only source of truth. */
+  messagingTag: string | undefined;
+  disabled: boolean;
+  saving: boolean;
+  onSaveTag: (tag: string | null) => Promise<void>;
+}
+
+/**
+ * The messaging-tag row. The input is uncontrolled, keyed by the persisted tag: a save
+ * reads the DOM value on blur/submit and then resets it to the persisted text, so only
+ * the republished metadata can change what is shown (a failed save reverts the edit).
+ */
+function MessagingTagSetting(props: MessagingTagSettingProps) {
+  const persistedTagText = props.messagingTag != null ? `@${props.messagingTag}` : "";
+  const tagInputRef = useRef<HTMLInputElement>(null);
+
+  const save = async (draft: string) => {
+    if (draft === persistedTagText) {
+      return;
+    }
+    await props.onSaveTag(draft.trim() === "" ? null : draft);
+    if (tagInputRef.current) {
+      tagInputRef.current.value = persistedTagText;
+    }
+  };
+
+  return (
+    <div className="border-border rounded-lg border p-4">
+      <div className="min-w-0">
+        <label htmlFor="messaging-tag-input" className="text-foreground text-sm font-medium">
+          Messaging tag
+        </label>
+        <p className="text-muted mt-1 text-xs">
+          Give this chat a tag such as <span className="font-mono">@research</span> and give the
+          same tag to other chats you want it to exchange agent messages with. Only you can set or
+          clear a tag; clearing it removes the link.
+        </p>
+        <form
+          className="mt-3 flex items-center gap-2"
+          onSubmit={(event) => {
+            event.preventDefault();
+            const input = tagInputRef.current;
+            if (input) {
+              void save(input.value);
+            }
+          }}
+        >
+          <Input
+            key={persistedTagText}
+            ref={tagInputRef}
+            id="messaging-tag-input"
+            defaultValue={persistedTagText}
+            onBlur={(event) => void save(event.currentTarget.value)}
+            disabled={props.disabled}
+            placeholder="@research"
+            autoComplete="off"
+            spellCheck={false}
+            className="min-w-0 flex-1"
+          />
+          {props.saving && (
+            <span role="status" className="text-muted shrink-0 text-xs">
+              Saving
+            </span>
+          )}
+        </form>
+      </div>
+    </div>
   );
 }

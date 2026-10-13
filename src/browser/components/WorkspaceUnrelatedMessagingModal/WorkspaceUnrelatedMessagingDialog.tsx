@@ -5,6 +5,7 @@ import {
   isWorktreeRuntime,
   type RuntimeConfig,
 } from "@/common/types/runtime";
+import type { Result } from "@/common/types/result";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 // The package index, not the file: test doubles replace the modal on the index module.
 import { WorkspaceUnrelatedMessagingModal } from ".";
@@ -20,6 +21,26 @@ interface WorkspaceUnrelatedMessagingDialogProps {
     | undefined;
   open: boolean;
   onOpenChange: (open: boolean) => void;
+}
+
+type DialogApi = ReturnType<typeof useAPI>["api"];
+
+/** Tag props for the modal: state from published metadata only, writes via setMessagingTag. */
+function messagingTagSettings(
+  api: DialogApi,
+  workspaceId: string,
+  workspace: WorkspaceUnrelatedMessagingDialogProps["workspace"]
+): {
+  messagingTag: string | undefined;
+  onSetMessagingTag: (tag: string | null) => Promise<Result<void, string>>;
+} {
+  return {
+    messagingTag: workspace?.messagingTag,
+    onSetMessagingTag: (tag) =>
+      api
+        ? api.workspace.setMessagingTag({ workspaceId, tag })
+        : Promise.resolve({ success: false as const, error: "Not connected to server" }),
+  };
 }
 
 /** The "Messages from other workspaces" dialog wired to the backend, for both menus (#6202). */
@@ -47,12 +68,7 @@ export function WorkspaceUnrelatedMessagingDialog(props: WorkspaceUnrelatedMessa
       }
       // Tag state likewise comes only from published metadata; the tag row shows on every
       // runtime because remote/container chats are the point of tag linking.
-      messagingTag={props.workspace?.messagingTag}
-      onSetMessagingTag={(tag) =>
-        api
-          ? api.workspace.setMessagingTag({ workspaceId, tag })
-          : Promise.resolve({ success: false as const, error: "Not connected to server" })
-      }
+      {...messagingTagSettings(api, workspaceId, props.workspace)}
       holdUntilTurnEnd={props.workspace?.agentMessageDispatchMode === "turn-end"}
       onSetHoldUntilTurnEnd={(hold) =>
         api
