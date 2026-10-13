@@ -665,7 +665,7 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
   desktopSessionManager?: DesktopSessionManager;
   computerUseService?: ComputerUseService;
   /** Routes AI calls from bash commands through Xum so their spend is accounted. */
-  bashAiProxy?: Pick<BashAiProxyService, "envFor">;
+  bashAiProxy?: Pick<BashAiProxyService, "envFor" | "noteBlocked">;
 }
 
 /**
@@ -1023,6 +1023,43 @@ export class TurnRequestBuilder {
     if (!context.admissionOnly) this.dependencies.emit("error", errorEvent);
     opts.onPreStartError?.(errorEvent);
     return { type: "finished", result: Err({ type: errorType, message: errorMessage }) };
+  }
+
+  /**
+   * AI calls from bash commands bypass the chat stream. Point their SDKs at the local proxy so
+   * the spend lands in this workspace's ledger (Costs tab and Analytics). envFor() skips any
+   * provider that project secrets configure: secrets override xumEnv in the bash tool, and a
+   * proxy URL must never pair with a real key.
+   * Best effort: a proxy problem leaves bash without the pair and never fails the turn.
+   * Untrusted projects and the project-automation kill switch blank provider keys in bash
+   * (gitNoRepoAutomationEnv), so repo code there must not spend through the proxy either.
+   * Add nothing rather than a proxy URL whose key the bash tool then blanks.
+   */
+  private async bashAiProxyEnv(
+    workspaceId: string,
+    runtimeType: ReturnType<typeof getRuntimeType>,
+    secretKeys: readonly string[],
+    sharedExecutionTrusted: boolean
+  ): Promise<Record<string, string> | undefined> {
+    const bashAiProxy = this.dependencies.bindings.bashAiProxy;
+    if (!bashAiProxy) return undefined;
+    if (!sharedExecutionTrusted) {
+      // Say why bash gets no proxy variables, so a user who turned the switch on can find out.
+      bashAiProxy.noteBlocked(
+        workspaceId,
+        projectAutomationDisabled() ? "kill_switch" : "untrusted"
+      );
+      return undefined;
+    }
+    try {
+      return await bashAiProxy.envFor(workspaceId, runtimeType, secretKeys);
+    } catch (error) {
+      log.warn("[bash-ai-proxy] env setup failed; bash AI calls stay uncounted", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+      return undefined;
+    }
   }
 
   private async prepareOrThrow(
@@ -2191,31 +2228,15 @@ export class TurnRequestBuilder {
       scratchDir,
     });
     const projectSecretsRecord = await secretsToRecord(projectSecrets);
-    // AI calls from bash commands bypass the chat stream. Point their SDKs at the local proxy so
-    // the spend lands in this workspace's ledger (Costs tab and Analytics). envFor() skips any
-    // provider that project secrets configure: secrets override xumEnv in the bash tool, and a
-    // proxy URL must never pair with a real key.
-    // Best effort: a proxy problem leaves bash without the pair and never fails the turn.
-    // Untrusted projects and the project-automation kill switch blank provider keys in bash
-    // (gitNoRepoAutomationEnv), so repo code there must not spend through the proxy either.
-    // Add nothing rather than a proxy URL whose key the bash tool then blanks.
-    if (sharedExecutionTrusted) {
-      try {
-        Object.assign(
-          xumEnv,
-          await this.dependencies.bindings.bashAiProxy?.envFor(
-            workspaceId,
-            runtimeType,
-            Object.keys(projectSecretsRecord)
-          )
-        );
-      } catch (error) {
-        log.warn("[bash-ai-proxy] env setup failed; bash AI calls stay uncounted", {
-          workspaceId,
-          error: getErrorMessage(error),
-        });
-      }
-    }
+    Object.assign(
+      xumEnv,
+      await this.bashAiProxyEnv(
+        workspaceId,
+        runtimeType,
+        Object.keys(projectSecretsRecord),
+        sharedExecutionTrusted
+      )
+    );
     const getWorkflowProjectTrusted = () =>
       isWorkspaceProjectTrusted(this.dependencies.config, metadata);
 
