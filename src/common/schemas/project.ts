@@ -145,6 +145,10 @@ export const WorkspaceConfigSchema = z.object({
   messagingTag: z.string().optional().meta({
     description: MESSAGING_TAG_DESCRIPTION,
   }),
+  messagingTagGeneration: z.string().optional().meta({
+    description:
+      "Revocation generation for messagingTag, re-minted on every tag change (set or clear). Tag-linked sends capture both endpoints' generations at admission and refuse if either changed, so a clear/re-tag cycle cannot revive queued input. Never published on metadata.",
+  }),
   unrelatedWorkspaceConsentPending: z.literal(true).optional().meta({
     description:
       "Set in the same write that registers a new root workspace that gets default unrelated-messaging consent once its setup completes. The grant runs only while this is set and consumes it; an explicit consent toggle (from any backend sharing this root) clears it, so the default can never reverse a choice already made (#4446).",

@@ -1109,6 +1109,8 @@ type TreeMessagePipelineError = SendAgentTreeMessageError | SendParentAgentMessa
 interface PeerDelegatedTurnWait {
   /** Recipient consent at first admission: an off/on cycle must not revive the message. */
   unrelatedConsent: string | undefined;
+  /** Both endpoints' tag generations at first admission: a clear/re-tag cycle is a new link. */
+  tagGenerations?: { sender: string | undefined; target: string | undefined };
   /**
    * The target's delegated-turn registration count when the message parked. Any later
    * registration is a replacement turn, which the message never waits through, even one that
@@ -10497,13 +10499,21 @@ export class TaskService implements AgentTaskIntegration {
       );
       // A retry after a delegated turn needs the grant it was first admitted under: an off/on
       // cycle is a new grant, not permission to revive input admitted before it.
-      if (
-        relation === "target_unrelated" &&
-        (unrelatedConsent == null ||
-          (awaitedDelegatedTurn != null &&
-            unrelatedConsent !== awaitedDelegatedTurn.unrelatedConsent))
-      ) {
+      if (this.unrelatedConsentRevoked(relation, unrelatedConsent, awaitedDelegatedTurn)) {
         return Err({ code: "not_found" as const });
+      }
+      // Same rule for tag links: both endpoints' generations are captured here and in
+      // the parked wait, so restoring the same tag string after a revocation is a new
+      // link and cannot revive a message admitted under the previous one.
+      const tagGenerations = {
+        sender: senderEntry.workspace.messagingTagGeneration,
+        target: targetEntry.workspace.messagingTagGeneration,
+      };
+      if (
+        awaitedDelegatedTurn != null &&
+        this.tagGenerationMismatch(relation, awaitedDelegatedTurn.tagGenerations, tagGenerations)
+      ) {
+        return Err({ code: "invalid_scope" as const });
       }
 
       const unrelatedRuntimeRefusal = {
@@ -10987,6 +10997,17 @@ export class TaskService implements AgentTaskIntegration {
           admissionRefusal = { code: "invalid_scope" as const };
           return true;
         }
+        // The relation can re-resolve as tagged after a clear/re-tag cycle with the
+        // same string; the generation fence is what permanently invalidates the send.
+        if (
+          this.tagGenerationMismatch(relation, tagGenerations, {
+            sender: freshSender.workspace.messagingTagGeneration,
+            target: freshEntry.workspace.messagingTagGeneration,
+          })
+        ) {
+          admissionRefusal = { code: "invalid_scope" as const };
+          return true;
+        }
         // An off/on cycle is a new grant, not permission to revive previously queued input.
         // Recheck through the final synchronous session gate as well as after preparation awaits.
         if (
@@ -11066,6 +11087,7 @@ export class TaskService implements AgentTaskIntegration {
           ...spec,
           awaitedDelegatedTurn: {
             unrelatedConsent,
+            tagGenerations,
             registrationEpoch:
               refusedAtRegistrationEpoch ?? this.workspaceTurnRegistrationEpochs.get(targetId) ?? 0,
             stopEpochs: new Map(capturedStopEpochs),
@@ -16084,6 +16106,36 @@ export class TaskService implements AgentTaskIntegration {
       );
     }
     return this.resolveDirectChatRelation(sender.workspace, target.workspace);
+  }
+
+  /** A retry needs the consent grant it was first admitted under (off/on is a new grant). */
+  private unrelatedConsentRevoked(
+    relation: PeerPathRelation,
+    unrelatedConsent: string | undefined,
+    awaitedDelegatedTurn: PeerDelegatedTurnWait | undefined
+  ): boolean {
+    return (
+      relation === "target_unrelated" &&
+      (unrelatedConsent == null ||
+        (awaitedDelegatedTurn != null &&
+          unrelatedConsent !== awaitedDelegatedTurn.unrelatedConsent))
+    );
+  }
+
+  /** True when a tagged send's endpoint generations differ from its admission baseline. */
+  private tagGenerationMismatch(
+    relation: PeerPathRelation,
+    expected: { sender: string | undefined; target: string | undefined } | undefined,
+    actual: { sender: string | undefined; target: string | undefined }
+  ): boolean {
+    return relation === "target_tagged" && !this.messagingTagGenerationsEqual(expected, actual);
+  }
+
+  private messagingTagGenerationsEqual(
+    a: { sender: string | undefined; target: string | undefined } | undefined,
+    b: { sender: string | undefined; target: string | undefined } | undefined
+  ): boolean {
+    return a?.sender === b?.sender && a?.target === b?.target;
   }
 
   /** Ancestry wins inside a tree; only cross-tree root pairs can be tag-linked. */

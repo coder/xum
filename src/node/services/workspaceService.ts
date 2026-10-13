@@ -2408,6 +2408,26 @@ function messagingTagRootRefusal(
   return null;
 }
 
+/**
+ * Applies a tag write to a fresh entry. Re-mints the revocation generation only on a
+ * real change (mirroring consent's repeat-on rule): a clear/re-tag cycle must fence
+ * tag-linked sends admitted under the previous link, while a no-op write fences nothing.
+ */
+function applyMessagingTag(
+  entry: Pick<Workspace, "messagingTag" | "messagingTagGeneration">,
+  normalizedTag: string | null
+): void {
+  if ((entry.messagingTag ?? null) === normalizedTag) {
+    return;
+  }
+  if (normalizedTag === null) {
+    delete entry.messagingTag;
+  } else {
+    entry.messagingTag = normalizedTag;
+  }
+  entry.messagingTagGeneration = crypto.randomUUID();
+}
+
 /** Root-only refusal first, then tag validation: the value a tag write may persist. */
 function messagingTagWriteValue(
   entry: Pick<Workspace, "parentWorkspaceId" | "sideChatParentWorkspaceId">,
@@ -9349,11 +9369,7 @@ export class WorkspaceService
           return freshConfig;
         }
         outcome = Ok(undefined);
-        if (normalizedTag === null) {
-          delete entry.messagingTag;
-        } else {
-          entry.messagingTag = normalizedTag;
-        }
+        applyMessagingTag(entry, normalizedTag);
         return freshConfig;
       });
       if (!outcome.success) {

@@ -209,6 +209,47 @@ describe("TaskService tagged-chat messaging", () => {
     expect(admissionStale?.()).toBe(true);
   });
 
+  test("restoring the same tag with a new generation does not revive queued dispatch", async () => {
+    const { config } = await setup();
+    const sendMessage = mock((...args: Parameters<WorkspaceHost["sendMessage"]>) => {
+      expect(args[3]?.admissionStale?.()).toBe(false);
+      return Promise.resolve(Ok(undefined));
+    });
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    expect(await taskService.sendAgentTreeMessage("alpha", "beta", "queued")).toMatchObject({
+      success: true,
+      data: { delivery: "queued" },
+    });
+    const admissionStale = sendMessage.mock.calls[0][3]?.admissionStale;
+    // Revoke, then restore the identical tag string: the relation resolves as
+    // tagged again, but the new generation is a new link.
+    await updateWorkspace(config, "beta", {
+      messagingTag: "other",
+      messagingTagGeneration: "gen-2",
+    });
+    await updateWorkspace(config, "beta", {
+      messagingTag: "research",
+      messagingTagGeneration: "gen-3",
+    });
+    expect(admissionStale?.()).toBe(true);
+  });
+
+  test("a generation change during send preparation refuses even with the same tag", async () => {
+    const { config } = await setup();
+    const sendMessage = mock(async (...args: Parameters<WorkspaceHost["sendMessage"]>) => {
+      expect(args[3]?.admissionStale?.()).toBe(false);
+      await updateWorkspace(config, "beta", { messagingTagGeneration: "gen-2" });
+      expect(args[3]?.admissionStale?.()).toBe(true);
+      return Err("admission canceled");
+    });
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    expect(await taskService.sendAgentTreeMessage("alpha", "beta", "do not deliver")).toEqual(
+      Err({ code: "invalid_scope" })
+    );
+  });
+
   test("removing a tag during send preparation refuses the tagged message", async () => {
     const { config } = await setup();
     const sendMessage = mock(async (...args: Parameters<WorkspaceHost["sendMessage"]>) => {

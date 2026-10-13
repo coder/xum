@@ -128,6 +128,24 @@ describe("WorkspaceService.setMessagingTag", () => {
     expect(reloaded.find((m) => m.id === WORKSPACE_ID)?.messagingTag).toBeUndefined();
   });
 
+  test("re-mints the revocation generation on change and clear, but not on no-ops", async () => {
+    await service.setMessagingTag(WORKSPACE_ID, "research");
+    const first = harness.persistedEntry()?.messagingTagGeneration;
+    expect(typeof first).toBe("string");
+
+    // Re-setting the same tag is a no-op write: the link generation survives.
+    await service.setMessagingTag(WORKSPACE_ID, "@Research");
+    expect(harness.persistedEntry()?.messagingTagGeneration).toBe(first);
+
+    await service.setMessagingTag(WORKSPACE_ID, "other");
+    const changed = harness.persistedEntry()?.messagingTagGeneration;
+    expect(changed).not.toBe(first);
+
+    await service.setMessagingTag(WORKSPACE_ID, null);
+    expect(harness.persistedEntry()?.messagingTag).toBeUndefined();
+    expect(harness.persistedEntry()?.messagingTagGeneration).not.toBe(changed);
+  });
+
   test("refuses child and side-chat workspaces without persisting", async () => {
     for (const [id, kind] of [
       [CHILD_ID, "sub-agent"],
