@@ -15,12 +15,18 @@ describe("normalizeSkillPaths", () => {
     expect(normalizeSkillPaths(undefined)).toEqual({ ok: true, paths: undefined });
   });
 
-  test("a comma or closer inside a [...] class stays in the pattern", () => {
-    expect(normalizeSkillPaths("[),],*.ts")).toEqual({ ok: true, paths: ["[),]", "*.ts"] });
-    expect(normalizeSkillPaths("src/[,]x.ts, *.{ts,tsx}")).toEqual({
-      ok: true,
-      paths: ["src/[,]x.ts", "*.{ts,tsx}"],
-    });
+  test("a comma inside a [...] class is rejected in the string form, kept in the list form", () => {
+    for (const raw of ["[),],*.ts", "[]a,],*.ts", "src/[,]x.ts, *.ts"]) {
+      const result = normalizeSkillPaths(raw);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error).toContain("list form");
+    }
+    expect(normalizeSkillPaths(["src/[,]x.ts"])).toEqual({ ok: true, paths: ["src/[,]x.ts"] });
+  });
+
+  test("list entries keep their whitespace; string fragments are trimmed", () => {
+    expect(normalizeSkillPaths([" leading.ts"])).toEqual({ ok: true, paths: [" leading.ts"] });
+    expect(normalizeSkillPaths(" a.ts , b.ts ")).toEqual({ ok: true, paths: ["a.ts", "b.ts"] });
   });
 
   test.each([
@@ -30,6 +36,7 @@ describe("normalizeSkillPaths", () => {
     ["absolute posix", ["/etc/*.conf"], "/etc/*.conf"],
     ["absolute windows", ["C:/src/*.ts"], "C:/src/*.ts"],
     ["parent segment", ["src/../../*.ts"], ".."],
+    ["interior current-dir segment", ["src/./**/*.ts"], "'.'"],
     ["negated pattern", ["src/**/*.ts", "!src/**/*.test.ts"], "!src/**/*.test.ts"],
     ["backslash separator", ["src\\**\\*.ts"], "use '/'"],
   ])("rejects %s with an error naming the problem", (_label, raw, fragment) => {

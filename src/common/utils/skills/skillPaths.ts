@@ -23,62 +23,64 @@ export type NormalizeSkillPathsResult =
   | { ok: true; paths: string[] | undefined }
   | { ok: false; error: string };
 
-const GROUP_CLOSERS: Record<string, string> = { "{": "}", "(": ")" };
-
-/** The open-delimiter stack after `char`: a `[...]` class swallows every char but `]`. */
-function nextGroupStack(stack: string[], char: string): void {
-  const expected = stack[stack.length - 1];
-  if (expected === "]") {
-    if (char === "]") stack.pop();
-    return;
-  }
-  if (char === "[") stack.push("]");
-  else if (GROUP_CLOSERS[char] !== undefined) stack.push(GROUP_CLOSERS[char]);
-  else if (char === expected) stack.pop();
-}
-
 /**
- * Split a comma-separated `paths` string. Commas inside `{}`/`()` groups or a `[...]`
- * class belong to the glob (`*.{ts,tsx}`, `[,]`), so only top-level commas separate
- * patterns. Backslashes are rejected later, so no escape handling is needed here.
+ * Split a comma-separated `paths` string. Only commas inside `{...}` (`*.{ts,tsx}`)
+ * belong to a glob. A comma inside a `[...]` class leaves an unclosed `[` in a
+ * fragment, which validation then rejects with a hint to use the list form, so a
+ * class is never split silently.
  */
 function splitTopLevelCommas(value: string): string[] {
   const parts = [""];
-  const stack: string[] = [];
+  let braceDepth = 0;
   for (const char of value) {
-    if (char === "," && stack.length === 0) {
+    if (char === "," && braceDepth === 0) {
       parts.push("");
       continue;
     }
-    nextGroupStack(stack, char);
+    if (char === "{") braceDepth += 1;
+    else if (char === "}") braceDepth = Math.max(0, braceDepth - 1);
     parts[parts.length - 1] += char;
   }
-  return parts;
+  return parts.map((part) => part.trim());
 }
 
-/** Shape rules: the pattern must be a non-empty, bounded, workspace-relative include glob. */
-function validateSkillPathShape(pattern: string): string | undefined {
-  if (pattern.length === 0) {
-    return "patterns must not be empty";
-  }
-  if (pattern.length > MAX_SKILL_PATH_LENGTH) {
-    return `pattern '${pattern.slice(0, 40)}…' is longer than ${MAX_SKILL_PATH_LENGTH} characters`;
-  }
+/**
+ * Shape rules, checked in order: the pattern must be a non-empty, bounded,
+ * workspace-relative include glob. Each rule returns its error, or undefined.
+ */
+const SKILL_PATH_SHAPE_RULES: ReadonlyArray<(pattern: string) => string | undefined> = [
+  (p) => (p.length === 0 ? "patterns must not be empty" : undefined),
+  (p) =>
+    p.length > MAX_SKILL_PATH_LENGTH
+      ? `pattern '${p.slice(0, 40)}…' is longer than ${MAX_SKILL_PATH_LENGTH} characters`
+      : undefined,
   // A backslash cannot be both a glob escape and a Windows separator, so patterns use
   // '/' only (match a literal '[' with '[[]').
-  if (pattern.includes("\\")) {
-    return `pattern '${pattern}' must use '/' as the path separator (backslashes are not supported)`;
-  }
-  if (pattern.startsWith("/") || /^[A-Za-z]:/.test(pattern)) {
-    return `pattern '${pattern}' must be relative to the workspace root, not absolute`;
-  }
+  (p) =>
+    p.includes("\\")
+      ? `pattern '${p}' must use '/' as the path separator (backslashes are not supported)`
+      : undefined,
+  (p) =>
+    p.startsWith("/") || /^[A-Za-z]:/.test(p)
+      ? `pattern '${p}' must be relative to the workspace root, not absolute`
+      : undefined,
   // Patterns are OR-ed (any match activates the skill), so a negated glob would
   // match every other file and make the skill global. Reject it instead.
-  if (pattern.startsWith("!")) {
-    return `pattern '${pattern}' must not be negated (patterns are combined with OR)`;
-  }
-  if (pattern.split("/").includes("..")) {
-    return `pattern '${pattern}' must not contain '..' segments`;
+  (p) =>
+    p.startsWith("!")
+      ? `pattern '${p}' must not be negated (patterns are combined with OR)`
+      : undefined,
+  // Tool paths are normalized, so a '.' or '..' segment could never match.
+  (p) =>
+    p.split("/").some((segment) => segment === "." || segment === "..")
+      ? `pattern '${p}' must not contain '.' or '..' segments`
+      : undefined,
+];
+
+function validateSkillPathShape(pattern: string): string | undefined {
+  for (const rule of SKILL_PATH_SHAPE_RULES) {
+    const error = rule(pattern);
+    if (error !== undefined) return error;
   }
   return undefined;
 }
@@ -97,6 +99,23 @@ function validateSkillPathPattern(pattern: string): string | undefined {
   return undefined;
 }
 
+/** The first invalid pattern's error, with a list-form hint for split `[...]` classes. */
+function firstPatternError(
+  entries: readonly string[],
+  fromCommaString: boolean
+): string | undefined {
+  for (const entry of entries) {
+    const error = validateSkillPathPattern(entry);
+    if (error !== undefined) {
+      const splitClass = fromCommaString && entry.includes("[");
+      return splitClass
+        ? `${error} (a comma inside [...] splits the comma-separated form; use the list form)`
+        : error;
+    }
+  }
+  return undefined;
+}
+
 /**
  * Normalize raw `paths` frontmatter (comma-separated string or list) into a deduped
  * pattern list, or an error naming the bad pattern. `undefined` means "not path-scoped".
@@ -106,10 +125,12 @@ export function normalizeSkillPaths(raw: string | string[] | undefined): Normali
     return { ok: true, paths: undefined };
   }
 
+  // List entries are taken as written (whitespace is valid in file names); only the
+  // fragments of a comma-separated string are trimmed.
   const entries = (typeof raw === "string" ? splitTopLevelCommas(raw) : raw).map((entry) =>
     // A leading "./" is a common way to spell "relative to the root"; matching sees
     // paths without it.
-    entry.trim().replace(/^(\.\/)+/, "")
+    entry.replace(/^(\.\/)+/, "")
   );
   if (entries.length === 0) {
     return { ok: false, error: "at least one pattern is required" };
@@ -118,11 +139,9 @@ export function normalizeSkillPaths(raw: string | string[] | undefined): Normali
     return { ok: false, error: `at most ${MAX_SKILL_PATHS} patterns are allowed` };
   }
 
-  for (const entry of entries) {
-    const error = validateSkillPathPattern(entry);
-    if (error !== undefined) {
-      return { ok: false, error };
-    }
+  const error = firstPatternError(entries, typeof raw === "string");
+  if (error !== undefined) {
+    return { ok: false, error };
   }
 
   return { ok: true, paths: [...new Set(entries)] };

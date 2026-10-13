@@ -228,7 +228,8 @@ function formatSkillAdvertisementDisplay(skill: CollectedPluginSkill): string {
     skill.description ?? "(no description)",
     ...(skill.whenToUse !== undefined ? [`When to use: ${skill.whenToUse}`] : []),
     ...(skill.advertise === false ? ["(not advertised to the model)"] : []),
-    ...(skill.paths !== undefined ? [`Surfaces on files matching: ${skill.paths.join(", ")}`] : []),
+    // Declared scope only: this text makes no claim about how the scope is enforced.
+    ...(skill.paths !== undefined ? [`Declared paths: ${skill.paths.join(", ")}`] : []),
   ].join("\n");
 }
 
