@@ -89,6 +89,48 @@ test("a focus move in flight is not taken over by the element", () => {
   stop();
 });
 
+// #6291: a focusout can name a node that stays in the page but never takes focus (made inert or
+// hidden in a focusout handler). Neither a focusin nor a mutation follows: setting inert changes
+// only an attribute, which the observer does not watch. The guard must not outlive the move's task.
+test("a focus move that never lands returns focus to the element after its task", async () => {
+  const { panel, first, second } = buildPanel();
+  const stop = refocusFallenFocus(panel);
+  first.focus();
+  first.blur();
+  first.dispatchEvent(new window.FocusEvent("focusout", { bubbles: true, relatedTarget: second }));
+  second.inert = true;
+  expect(document.activeElement).toBe(document.body);
+
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  expect(second.isConnected).toBe(true);
+  expect(document.activeElement).toBe(panel);
+  stop();
+});
+
+test("a focus move that lands keeps its focus after the guard's task", async () => {
+  const { panel, first, second } = buildPanel();
+  const stop = refocusFallenFocus(panel);
+  first.focus();
+  second.focus();
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  expect(document.activeElement).toBe(second);
+  stop();
+});
+
+// Focus that leaves to nowhere (relatedTarget null) is not a guarded move: it still waits for a
+// mutation, as before #6291.
+test("focus that leaves to nowhere waits for a mutation", async () => {
+  const { panel, first } = buildPanel();
+  const stop = refocusFallenFocus(panel);
+  first.focus();
+  first.blur();
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  expect(document.activeElement).toBe(document.body);
+  deliverMutation();
+  expect(document.activeElement).toBe(panel);
+  stop();
+});
+
 test("the undo stops watching", () => {
   const { panel, first } = buildPanel();
   refocusFallenFocus(panel)();

@@ -7,6 +7,7 @@ import {
   streamText,
   tool,
   type LanguageModel,
+  type ModelMessage,
   type Tool,
 } from "ai";
 import type { Experimental_EvaluationModelV4 } from "@ai-sdk/provider";
@@ -42,6 +43,8 @@ import {
   markCodexOauthRoutedResponse,
   normalizeOpenAICompatibleBaseURL,
   resolveAIProviderHeaderSource,
+  muxGatewayPromptCacheRoute,
+  requestEndpoint,
   resolveOpenAIWebSocketResponsesUrl,
   wrapFetchWithAnthropicCacheControl,
   wrapFetchWithXAIServiceTier,
@@ -54,6 +57,7 @@ import type { DevToolsService } from "./devToolsService";
 import { CodexOauthService } from "./codexOauthService";
 import type { CoderOauthService } from "./coderOauthService";
 import { ProviderService } from "./providerService";
+import type { TimelineEventDraft } from "@/common/orpc/schemas/timeline";
 
 const LOCAL_VLLM_BASE_URL = "http://localhost:8000/v1";
 const LOCAL_VLLM_MODEL = "qwen3-coder";
@@ -5941,5 +5945,196 @@ describe("ProviderModelFactory Ollama tool schemas", () => {
     const sent = await sendTools({ plain: rawTool(structuredClone(schema)) });
 
     expect(sent.plain).toEqual(schema);
+  });
+});
+
+describe("ProviderModelFactory prompt-cache prefix observation", () => {
+  const recorded: TimelineEventDraft[] = [];
+  const recorder = {
+    record: (_workspaceId: string, draft: TimelineEventDraft) => void recorded.push(draft),
+    closeWorkspace: () => Promise.resolve(),
+    reopenWorkspace: () => undefined,
+  };
+  beforeEach(() => {
+    recorded.length = 0;
+  });
+
+  /** A base fetch that records each sent body and answers with a status the observer accepts. */
+  function capturingFetch(sent: Array<Record<string, unknown>>): typeof fetch {
+    return Object.assign((_input: RequestInfo | URL, init?: RequestInit) => {
+      if (typeof init?.body === "string") {
+        sent.push(JSON.parse(init.body) as Record<string, unknown>);
+      }
+      return Promise.resolve(new Response("{}", { status: 200 }));
+    }, fetch) as typeof fetch;
+  }
+
+  /** One generateText call; the canned response does not parse, which is fine after dispatch. */
+  async function send(model: LanguageModel, messages: ModelMessage[]) {
+    await generateText({ model, messages, maxRetries: 0 }).catch(() => undefined);
+  }
+
+  it("observes mux-gateway requests after file-part normalization", async () => {
+    await withTempConfig(async (_config, factory) => {
+      const sent: Array<Record<string, unknown>> = [];
+      const providersConfig = {
+        "mux-gateway": { couponCode: "test-coupon", fetch: capturingFetch(sent) },
+      } as unknown as ProvidersConfig;
+      const messages = (image: string) => [
+        {
+          role: "user" as const,
+          content: [
+            { type: "text" as const, text: "What is in this image?" },
+            { type: "file" as const, mediaType: "image/png", data: image },
+          ],
+        },
+      ];
+      for (const image of ["AAAA", "BBBB"]) {
+        const scope = factory.createPromptCacheTurnScope("ws-gateway", recorder);
+        const result = await factory.createModel(
+          "mux-gateway:anthropic/claude-sonnet-4-5",
+          {},
+          {
+            promptCacheScope: scope,
+            providersConfig,
+          }
+        );
+        if (!result.success) throw new Error("expected a gateway model");
+        await send(result.data, messages(image));
+      }
+
+      // The changed image breaks the prefix, and the event describes the part as the gateway
+      // received it (the v3 data-URL string), not the SDK's v4 tagged object.
+      const sentFile = (sent[1].prompt as Array<{ content: Array<Record<string, unknown>> }>)
+        .flatMap((message) => message.content)
+        .find((part) => part.type === "file");
+      expect(sentFile?.data).toBe("data:image/png;base64,BBBB");
+      const { cache_control: _marker, ...unmarkedFile } = sentFile ?? {};
+      expect(recorded).toMatchObject([
+        {
+          kind: "cache.prefix_break",
+          data: {
+            promptCacheBreak: {
+              section: "messages",
+              next: { type: "file", length: JSON.stringify(unmarkedFile).length },
+            },
+          },
+        },
+      ]);
+    });
+  });
+
+  it("does not compare requests sent to another Anthropic base URL", async () => {
+    await withTempConfig(async (_config, factory) => {
+      const sent: Array<Record<string, unknown>> = [];
+      const sendTo = async (baseURL: string, text: string) => {
+        const scope = factory.createPromptCacheTurnScope("ws-base-url", recorder);
+        const result = await factory.createModel(
+          "anthropic:claude-sonnet-4-5",
+          {},
+          {
+            promptCacheScope: scope,
+            providersConfig: {
+              anthropic: { apiKey: "test-key", baseURL, fetch: capturingFetch(sent) },
+            } as unknown as ProvidersConfig,
+          }
+        );
+        if (!result.success) throw new Error("expected an Anthropic model");
+        await send(result.data, [{ role: "user", content: text }]);
+      };
+      await sendTo("https://proxy-a.example.com/v1", "first");
+      // Another endpoint holds another cache: its first request is a new baseline.
+      await sendTo("https://proxy-b.example.com/v1", "second");
+      expect(sent).toHaveLength(2);
+      expect(recorded).toEqual([]);
+      // On the same endpoint a rewritten prompt is still reported.
+      await sendTo("https://proxy-b.example.com/v1", "third");
+      expect(recorded).toHaveLength(1);
+    });
+  });
+
+  it("keys a base-URL query by its hash: another tenant is another baseline", async () => {
+    await withTempConfig(async (_config, factory) => {
+      const sent: Array<Record<string, unknown>> = [];
+      const sendTo = async (baseURL: string, text: string) => {
+        const scope = factory.createPromptCacheTurnScope("ws-query", recorder);
+        const result = await factory.createModel(
+          "anthropic:claude-sonnet-4-5",
+          {},
+          {
+            promptCacheScope: scope,
+            providersConfig: {
+              anthropic: { apiKey: "test-key", baseURL, fetch: capturingFetch(sent) },
+            } as unknown as ProvidersConfig,
+          }
+        );
+        if (!result.success) throw new Error("expected an Anthropic model");
+        await send(result.data, [{ role: "user", content: text }]);
+      };
+      // The proxy picks the account by the query: tenant B's first request is a new baseline.
+      await sendTo("https://proxy.example.com/v1?token=tenant-a-secret", "first");
+      await sendTo("https://proxy.example.com/v1?token=tenant-b-secret", "second");
+      expect(sent).toHaveLength(2);
+      expect(recorded).toEqual([]);
+      // The same query is the same cache, so a rewritten prompt is reported.
+      await sendTo("https://proxy.example.com/v1?token=tenant-b-secret", "third");
+      expect(recorded).toHaveLength(1);
+      expect(JSON.stringify(recorded)).not.toContain("secret");
+    });
+  });
+
+  it("keys mux-gateway baselines by account: another sign-in is another baseline", async () => {
+    await withTempConfig(async (_config, factory) => {
+      const sent: Array<Record<string, unknown>> = [];
+      const sendAs = async (couponCode: string, text: string) => {
+        const scope = factory.createPromptCacheTurnScope("ws-gateway-account", recorder);
+        const result = await factory.createModel(
+          "mux-gateway:anthropic/claude-sonnet-4-5",
+          {},
+          {
+            promptCacheScope: scope,
+            providersConfig: {
+              "mux-gateway": { couponCode, fetch: capturingFetch(sent) },
+            } as unknown as ProvidersConfig,
+          }
+        );
+        if (!result.success) throw new Error("expected a gateway model");
+        await send(result.data, [{ role: "user", content: text }]);
+      };
+      // Same base URL, another account: its first request is a new baseline.
+      await sendAs("account-a-secret", "first");
+      await sendAs("account-b-secret", "second");
+      expect(sent).toHaveLength(2);
+      expect(recorded).toEqual([]);
+      // The same account is the same cache, so a rewritten prompt is reported.
+      await sendAs("account-b-secret", "third");
+      expect(recorded).toHaveLength(1);
+      expect(JSON.stringify(recorded)).not.toContain("secret");
+    });
+  });
+
+  it("the mux-gateway route holds a stable hash of the account, not its credential", () => {
+    const accountA = muxGatewayPromptCacheRoute("account-a-secret");
+    expect(accountA).toMatch(/^mux-gateway:[0-9a-f]{16}$/);
+    expect(accountA).toBe(muxGatewayPromptCacheRoute("account-a-secret"));
+    expect(accountA).not.toBe(muxGatewayPromptCacheRoute("account-b-secret"));
+    expect(accountA).not.toContain("secret");
+  });
+
+  it("requestEndpoint keeps no query text, only a stable hash of it", () => {
+    const tenantA = requestEndpoint("https://proxy.example.com/v1?token=tenant-a-secret/messages");
+    const tenantB = requestEndpoint("https://proxy.example.com/v1?token=tenant-b-secret/messages");
+    expect(tenantA).toMatch(/^https:\/\/proxy\.example\.com\/v1\?sha256:[0-9a-f]{16}$/);
+    expect(tenantA).not.toBe(tenantB);
+    expect(requestEndpoint("https://proxy.example.com/v1?token=tenant-a-secret/messages")).toBe(
+      tenantA
+    );
+    for (const endpoint of [tenantA, tenantB, requestEndpoint("not a url ?token=secret")]) {
+      expect(endpoint).not.toContain("token");
+      expect(endpoint).not.toContain("secret");
+    }
+    expect(requestEndpoint("https://api.anthropic.com/v1/messages")).toBe(
+      "https://api.anthropic.com/v1/messages"
+    );
   });
 });

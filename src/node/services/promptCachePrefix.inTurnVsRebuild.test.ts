@@ -626,6 +626,9 @@ async function hotMemoryChangeKeepsHistoryCached(): Promise<void> {
   );
 
   expect(sendsAfter(first, second, MONITOR_WAKE)).toBe(true);
+  // The first turn's answer must precede the trigger: a fix that rebuilt the history without
+  // it would still keep the tail-only change below and pass the target assertion.
+  expect(endsWithAnswerThenTrigger(second)).toBe(true);
   // Each request must send its own hot memories: a fix that dropped the tail or kept "A"
   // would otherwise pass the prefix check below.
   expect(JSON.stringify(first)).toContain("<hot_memories>\\nA\\n</hot_memories>");

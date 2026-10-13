@@ -331,3 +331,123 @@ describe("auditStepPrefixes", () => {
     ).toHaveLength(1);
   });
 });
+
+describe("auditStepPrefixes with recorded wire facts", () => {
+  const MODEL = "anthropic:claude-sonnet-4-5";
+  const iso = (minutes: number, seconds = 0) =>
+    new Date(Date.UTC(2026, 9, 12, 10, minutes, seconds)).toISOString();
+  /** A step the cache wrapper saw on `route`; `wire` overrides the dispatch facts. */
+  const wired = (
+    runId: string,
+    texts: string[],
+    wire: Partial<NonNullable<RecordedStepRequest["promptCacheWire"]>> = {},
+    startedAt = iso(0)
+  ): RecordedStepRequest => ({
+    runId,
+    stepId: `${runId}-0`,
+    stepNumber: 0,
+    startedAt,
+    modelId: "claude-sonnet-4-5",
+    provider: "anthropic.messages",
+    tools: [],
+    prompt: [
+      { role: "system", content: "You are Xum." },
+      ...texts.map((text) => ({ role: "user", content: [{ type: "text", text }] })),
+    ],
+    promptCacheWire: {
+      route: "anthropic",
+      modelString: MODEL,
+      cacheMarkersInjected: true,
+      dispatched: true,
+      observedAt: startedAt,
+      ...wire,
+    },
+  });
+
+  test("mux-gateway steps are audited from their wire record", () => {
+    // The Gateway SDK reports provider "gateway", not "anthropic.*": the wire record the
+    // Anthropic cache wrapper wrote is what proves an Anthropic wire.
+    const gateway = (runId: string, texts: string[]): RecordedStepRequest => ({
+      ...wired(runId, texts, { route: "mux-gateway" }),
+      provider: "gateway",
+    });
+    const audit = auditStepPrefixes([gateway("run-1", ["a"]), gateway("run-2", ["b"])]);
+    expect(audit).toMatchObject({ comparedPairs: 1, breaks: [{ runId: "run-2" }] });
+    // Without a wire record (older logs), a non-Anthropic provider id is still skipped.
+    const { promptCacheWire: _wire, ...legacy } = gateway("run-3", ["c"]);
+    expect(auditStepPrefixes([legacy, { ...legacy, runId: "run-4" }])).toMatchObject({
+      comparedPairs: 0,
+    });
+  });
+
+  test("steps on two routes of one model keep separate baselines", () => {
+    // Direct Anthropic and a Coder gateway are separate caches, though both use the
+    // AI SDK provider id "anthropic.messages" and the same model id.
+    const audit = auditStepPrefixes([
+      wired("run-1", ["a"]),
+      wired("run-2", ["x"], { route: "coder:dogfood" }),
+      wired("run-3", ["a", "b"]),
+      wired("run-4", ["x", "y"], { route: "coder:dogfood" }),
+    ]);
+    expect(audit).toMatchObject({ comparedPairs: 2, breaks: [] });
+  });
+
+  test("steps on two endpoints of one route keep separate baselines", () => {
+    // Another base URL reaches another cache, as in the monitor's key.
+    const audit = auditStepPrefixes([
+      wired("run-1", ["a"], { endpoint: "https://proxy-a.example/v1/messages" }),
+      wired("run-2", ["x"], { endpoint: "https://proxy-b.example/v1/messages" }),
+      wired("run-3", ["a", "b"], { endpoint: "https://proxy-a.example/v1/messages" }),
+    ]);
+    expect(audit).toMatchObject({ comparedPairs: 1, breaks: [] });
+  });
+
+  test.each([
+    ["was not dispatched", { dispatched: false, observedAt: undefined }],
+    ["got no OK response", { observedAt: undefined }],
+    ["ran without cache markers", { cacheMarkersInjected: false }],
+  ])("a request that %s neither breaks nor replaces the baseline", (_name, wire) => {
+    const audit = auditStepPrefixes([
+      wired("run-1", ["a"]),
+      wired("run-2", ["other"], wire),
+      wired("run-3", ["a", "b"]),
+    ]);
+    expect(audit).toMatchObject({ comparedPairs: 1, breaks: [] });
+  });
+
+  test("overlapping runs compare in the order their OK responses arrived", () => {
+    // run-long starts first, but run-short's response arrives first, so the monitor
+    // takes run-short as the baseline and run-long extends it.
+    const audit = auditStepPrefixes([
+      wired("run-long", ["a", "b"], { observedAt: iso(0, 30) }, iso(0, 0)),
+      wired("run-short", ["a"], { observedAt: iso(0, 10) }, iso(0, 5)),
+    ]);
+    expect(audit).toMatchObject({ comparedPairs: 1, breaks: [] });
+  });
+
+  test("OK responses in the same millisecond compare in observation-counter order", () => {
+    // Both observed at 10:00:10.000; run-short was observed first (counter 1), though
+    // run-long comes first in the log, so run-long extends run-short's baseline.
+    const audit = auditStepPrefixes([
+      wired("run-long", ["a", "b"], { observedAt: iso(0, 10), observedSeq: 2 }),
+      wired("run-short", ["a"], { observedAt: iso(0, 10), observedSeq: 1 }),
+    ]);
+    expect(audit).toMatchObject({ comparedPairs: 1, breaks: [] });
+    // Older logs without the counter keep the log order for a tie (and report the break).
+    const legacy = auditStepPrefixes([
+      wired("run-long", ["a", "b"], { observedAt: iso(0, 10) }),
+      wired("run-short", ["a"], { observedAt: iso(0, 10) }),
+    ]);
+    expect(legacy).toMatchObject({ comparedPairs: 1, breaks: [{ runId: "run-short" }] });
+  });
+
+  test("the cache TTL runs from the observation time, not the start", () => {
+    // Started 10:00 but answered OK at 10:04; the next request at 10:06 is two minutes
+    // after the monitor's observation, inside the 5-minute default TTL: compared.
+    const audit = auditStepPrefixes([
+      wired("run-1", ["a"], { observedAt: iso(4) }, iso(0)),
+      wired("run-2", ["changed"], {}, iso(6)),
+    ]);
+    expect(audit).toMatchObject({ comparedPairs: 1, breaks: [{ runId: "run-2" }] });
+  });
+});
