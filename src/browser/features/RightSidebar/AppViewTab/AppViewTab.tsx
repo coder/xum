@@ -6,7 +6,6 @@ import {
   markMcpAppViewHosted,
   openMcpAppViewTab,
   useMcpAppView,
-  useMcpAppViewHostedBy,
   type McpAppViewRef,
 } from "../ArtifactsTab/mcpAppViewsStore";
 import { Notice } from "../ArtifactsTab/SourceText";
@@ -60,7 +59,7 @@ export function AppViewTabTooltip(props: { workspaceId: string; toolCallId: stri
 }
 
 /**
- * The body of an app tab (or the phone sheet standing in for it): the view, mounted again from
+ * The body of an app tab: the view, mounted again from
  * the result store after a reload, or a short unavailable state when the workspace no longer
  * has the view. While mounted it counts as the view's live instance, so its tool card shows a
  * placeholder instead of a second frame.
@@ -72,17 +71,11 @@ export function AppViewTabPanel(props: {
 }) {
   const view = useMcpAppView(props.workspaceId, props.toolCallId ?? "");
   const { workspaceId, toolCallId } = props;
-  // The narrow layout hides the right sidebar but keeps it mounted: its tab yields to the
-  // small-viewport dialog showing the same view.
-  const yieldToSheet = useMcpAppViewHostedBy(workspaceId, toolCallId ?? "", ["sheet"]);
   useEffect(() => {
-    if (toolCallId == null || yieldToSheet) return;
+    if (toolCallId == null) return;
     return markMcpAppViewHosted(workspaceId, toolCallId, "tab");
-  }, [workspaceId, toolCallId, yieldToSheet]);
+  }, [workspaceId, toolCallId]);
   if (view === "loading") return <Notice>Loading…</Notice>;
-  if (yieldToSheet && view != null) {
-    return <AppViewInTabNotice workspaceId={workspaceId} view={view} />;
-  }
   if (view == null) {
     return (
       <div className="flex flex-col items-start gap-2 p-4 text-xs">

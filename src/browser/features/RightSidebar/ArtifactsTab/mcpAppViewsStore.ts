@@ -381,9 +381,10 @@ export function useMcpAppView(
 }
 
 /**
- * Open a view in its own right-sidebar tab, or focus the tab it already has (RightSidebar and,
- * on small viewports, WorkspaceMenuBar's sheet handle OPEN_MCP_APP_VIEW). The ref is kept for
- * the session so a view from outside the loaded transcript window still resolves.
+ * Open a view in its own right-sidebar tab, or focus the tab it already has (RightSidebar handles
+ * OPEN_MCP_APP_VIEW, and on small viewports WorkspaceMenuBar shows that tab in the full-screen
+ * sidebar). The ref is kept for the session so a view from outside the loaded transcript window
+ * still resolves.
  */
 export function openMcpAppViewTab(workspaceId: string, view: McpAppViewRef) {
   const current = getMcpAppViews(workspaceId).filter((v) => v.toolCallId !== view.toolCallId);
@@ -395,12 +396,12 @@ export function openMcpAppViewTab(workspaceId: string, view: McpAppViewRef) {
 }
 
 /**
- * Where a view is mounted outside its tool card: its app tab, the small-viewport dialog standing
- * in for the hidden sidebar ("sheet"), or the Artifacts tab (which still lists app views).
- * Counted per workspace, tool call and host, so every place that can show a view yields to the
- * others and at most one live instance runs.
+ * Where a view is mounted outside its tool card: its app tab (also on phones, where the sidebar
+ * shows full-screen), or the Artifacts tab (which still lists app views). Counted per workspace,
+ * tool call and host, so every place that can show a view yields to the others and at most one
+ * live instance runs.
  */
-export type McpAppViewHost = "tab" | "sheet" | "artifacts";
+export type McpAppViewHost = "tab" | "artifacts";
 const hostedViews = new Map<string, number>();
 const hostedKey = (workspaceId: string, toolCallId: string, host: McpAppViewHost) =>
   `${workspaceId}\u0000${toolCallId}\u0000${host}`;

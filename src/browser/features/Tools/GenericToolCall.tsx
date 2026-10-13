@@ -99,11 +99,7 @@ const McpAppToolDetails: React.FC<{
 }> = (props) => {
   // A failed call's error is in the raw output: show it without a click.
   const [showRaw, setShowRaw] = React.useState(props.view.failed);
-  const inTab = useMcpAppViewInTab(props.workspaceId, props.view.toolCallId, [
-    "tab",
-    "sheet",
-    "artifacts",
-  ]);
+  const inTab = useMcpAppViewInTab(props.workspaceId, props.view.toolCallId, ["tab", "artifacts"]);
   if (!useMcpAppViewsSupported()) return <ToolDetails>{props.raw}</ToolDetails>;
   return (
     <ToolDetails>

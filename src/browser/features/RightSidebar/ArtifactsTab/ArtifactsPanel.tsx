@@ -300,7 +300,7 @@ const SELECTION_EXTENDING_KEYS = new Set([
 function ArtifactsAppView(props: { workspaceId: string; view: McpAppViewRef }) {
   const { workspaceId } = props;
   const { toolCallId } = props.view;
-  const inTab = useMcpAppViewInTab(workspaceId, toolCallId, ["tab", "sheet"]);
+  const inTab = useMcpAppViewInTab(workspaceId, toolCallId, ["tab"]);
   useEffect(() => {
     if (inTab) return;
     return markMcpAppViewHosted(workspaceId, toolCallId, "artifacts");
