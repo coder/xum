@@ -1031,9 +1031,11 @@ export function CreationControls(props: CreationControlsProps) {
     ? undefined
     : {
         enabled: coderEnabled ?? false,
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         onEnabledChange: coderOnEnabledChange!,
         coderInfo: coderInfo ?? null,
         coderConfig: coderConfig ?? null,
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         onCoderConfigChange: coderOnConfigChange!,
         templates: coderTemplates ?? [],
         templatesError: coderTemplatesError ?? null,

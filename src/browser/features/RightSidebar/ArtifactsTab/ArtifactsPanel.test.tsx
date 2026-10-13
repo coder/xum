@@ -1032,76 +1032,6 @@ describe("ArtifactsPanel", () => {
     }
   });
 
-  test("the small-viewport dialog runs a view whose tab sits in the hidden sidebar", async () => {
-    setTestExperiment(EXPERIMENT_IDS.ARTIFACTS, true);
-    fake = createFakeArtifactsApi(
-      { available: true, dir: "/scratch/artifacts", entries: [], truncated: false },
-      {}
-    );
-    fake.api.mcpApps = {
-      getView: () =>
-        Promise.resolve({
-          success: true as const,
-          data: {
-            html: "<p>view</p>",
-            csp: {},
-            prefersBorder: null,
-            resultAvailable: true,
-            result: { content: [] },
-            invocation: null,
-          },
-        }),
-    };
-    const workspaceId = "ws-dialog-owns";
-    const ref = {
-      toolCallId: "call-dialog",
-      serverName: "dice",
-      resourceUri: "ui://dice/board.html",
-      toolName: "dice_show_dice_board",
-      label: "Board",
-      arguments: {},
-      cancelled: false,
-      failed: false,
-    };
-    // Opened in its tab on a wide layout, then the viewport narrowed: the tab stays in the
-    // layout and its panel stays mounted (display:none) behind the dialog.
-    act(() => updateRightSidebarLayout(workspaceId, (s) => withAppViewTab(s, ref.toolCallId)));
-    openMcpAppView(workspaceId, ref);
-    try {
-      const view = render(
-        <ThemeProvider forcedTheme="dark">
-          <ApiWrapper>
-            <div data-testid="hidden-sidebar">
-              <AppViewTabPanel
-                workspaceId={workspaceId}
-                toolCallId={ref.toolCallId}
-                onClose={() => undefined}
-              />
-            </div>
-            <div data-testid="dialog">
-              <ArtifactsPanel workspaceId={workspaceId} inDialog />
-            </div>
-          </ApiWrapper>
-        </ThemeProvider>
-      );
-      const dialog = within(view.getByTestId("dialog"));
-      const sidebar = within(view.getByTestId("hidden-sidebar"));
-      await dialog.findByTestId("mcp-app-frame");
-      // The hidden tab yields; "Go to tab" in the dialog would only reopen the dialog.
-      await waitFor(() => expect(sidebar.queryByTestId("mcp-app-frame")).toBeNull());
-      expect(dialog.queryByRole("button", { name: "Go to tab" })).toBeNull();
-      expect(view.getAllByTestId("mcp-app-frame")).toHaveLength(1);
-    } finally {
-      resetTestExperiments();
-      closeMcpAppView(workspaceId, ref.toolCallId);
-      act(() =>
-        updateRightSidebarLayout(workspaceId, (s) =>
-          removeTabEverywhere(s, appViewTabFor(ref.toolCallId))
-        )
-      );
-    }
-  });
-
   test("lists app views from the transcript; Close returns to files and keeps them", async () => {
     fake = createFakeArtifactsApi(
       {
@@ -2027,6 +1957,62 @@ describe("ArtifactsPanel", () => {
     await waitFor(() => expect(document.activeElement).toBe(dialog));
   });
 
+  // E.g. a phone rotated back to portrait after the full-screen sidebar closed: the sidebar
+  // hides again with the panel still pinned, and the app behind it must not stay inert.
+  test("fullscreen ends once the panel is hidden, and the rest of the page works again", async () => {
+    // Observers of the panel: the ones that see it change size.
+    const callbacks: Array<() => void> = [];
+    const OriginalResizeObserver = globalThis.ResizeObserver;
+    globalThis.ResizeObserver = class {
+      private readonly callback: ResizeObserverCallback;
+      constructor(callback: ResizeObserverCallback) {
+        this.callback = callback;
+      }
+      observe(target: Element) {
+        if (target.getAttribute("data-testid") === "artifacts-panel") {
+          callbacks.push(() => this.callback([], this as unknown as ResizeObserver));
+        }
+      }
+      unobserve() {
+        // The test drives the callbacks by hand.
+      }
+      disconnect() {
+        // Nothing to stop: no real observation runs.
+      }
+    } as unknown as typeof ResizeObserver;
+    try {
+      fake = createFakeArtifactsApi(
+        {
+          available: true,
+          dir: "/scratch/artifacts",
+          entries: [entry("a.txt", 1, "text")],
+          truncated: false,
+        },
+        { "a.txt": textFile("a.txt", "text", "alpha") }
+      );
+      const outside = document.body.appendChild(document.createElement("button"));
+      const view = renderPanel();
+      const panel = view.getByTestId("artifacts-panel");
+      expect(await view.findByText("alpha")).toBeTruthy();
+      fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+      expect(view.getByRole("dialog", { name: "Artifact a.txt" })).toBeTruthy();
+      expect(outside.inert).toBe(true);
+
+      // Still shown: a resize alone keeps fullscreen.
+      act(() => callbacks.forEach((callback) => callback()));
+      expect(view.queryByRole("dialog", { name: "Artifact a.txt" })).toBeTruthy();
+
+      // A hidden ancestor leaves the panel with no box.
+      panel.getClientRects = () => [] as unknown as DOMRectList;
+      act(() => callbacks.forEach((callback) => callback()));
+      expect(view.queryByRole("dialog", { name: "Artifact a.txt" })).toBeNull();
+      expect(outside.inert).toBe(false);
+      outside.remove();
+    } finally {
+      globalThis.ResizeObserver = OriginalResizeObserver;
+    }
+  });
+
   test("the fullscreen dialog shows its focus ring while shortcuts focus it", async () => {
     fake = createFakeArtifactsApi(
       {
@@ -2062,7 +2048,7 @@ describe("ArtifactsPanel", () => {
     expect(dialog.getAttribute("data-shortcut-focus")).toBe("true");
   });
 
-  // A narrow window mounts ArtifactsDialog while the CSS-hidden sidebar panel stays mounted.
+  // Every mounted panel reads the same view choices.
   test("two mounted panels share annotate mode, JSON mode and tree expansion", async () => {
     const workspaceId = "ws-two-panels";
     fake = createFakeArtifactsApi(

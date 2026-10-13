@@ -1,13 +1,11 @@
 import { useEffect } from "react";
 import { AppWindow } from "lucide-react";
-import { cn } from "@/common/lib/utils";
 import { mcpServerDisplayName } from "@/common/utils/mcp/pluginServerKey";
 import { McpAppFrame } from "../ArtifactsTab/McpAppFrame";
 import {
   markMcpAppViewHosted,
   openMcpAppViewTab,
   useMcpAppView,
-  useMcpAppViewHostedBy,
   type McpAppViewRef,
 } from "../ArtifactsTab/mcpAppViewsStore";
 import { Notice } from "../ArtifactsTab/SourceText";
@@ -33,25 +31,15 @@ export function AppViewInTabNotice(props: { workspaceId: string; view: McpAppVie
 }
 
 /** Tab strip label of an app tab: the tool's title (or name), then its server. */
-export function AppViewTabLabel(props: {
-  workspaceId: string;
-  toolCallId: string | null;
-  /**
-   * Fit the label to its container's width, truncating the server too (the phone sheet header,
-   * where an unbroken server key of up to 80 characters would push its close button off the
-   * sheet). The tab strip keeps the full server: the tab's own max width clips it.
-   */
-  fitWidth?: boolean;
-}) {
+export function AppViewTabLabel(props: { workspaceId: string; toolCallId: string | null }) {
   const view = useMcpAppView(props.workspaceId, props.toolCallId ?? "");
   const ref = typeof view === "object" ? view : null;
-  const fit = props.fitWidth === true;
   return (
-    <span className={cn("min-w-0 items-center gap-1", fit ? "flex" : "inline-flex")}>
+    <span className="inline-flex min-w-0 items-center gap-1">
       <AppWindow className="h-3 w-3 shrink-0" />
       <span className="min-w-0 truncate">{ref?.label ?? "App view"}</span>
       {ref != null && (
-        <span className={cn("text-muted text-[10px]", fit ? "min-w-0 truncate" : "shrink-0")}>
+        <span className="text-muted shrink-0 text-[10px]">
           {mcpServerDisplayName(ref.serverName)}
         </span>
       )}
@@ -71,7 +59,7 @@ export function AppViewTabTooltip(props: { workspaceId: string; toolCallId: stri
 }
 
 /**
- * The body of an app tab (or the phone sheet standing in for it): the view, mounted again from
+ * The body of an app tab: the view, mounted again from
  * the result store after a reload, or a short unavailable state when the workspace no longer
  * has the view. While mounted it counts as the view's live instance, so its tool card shows a
  * placeholder instead of a second frame.
@@ -80,23 +68,14 @@ export function AppViewTabPanel(props: {
   workspaceId: string;
   toolCallId: string | null;
   onClose: () => void;
-  /** The phone sheet ("sheet") wins over a tab ("tab", default) the hidden sidebar still has. */
-  host?: "tab" | "sheet";
 }) {
   const view = useMcpAppView(props.workspaceId, props.toolCallId ?? "");
   const { workspaceId, toolCallId } = props;
-  const host = props.host ?? "tab";
-  // The narrow layout hides the right sidebar but keeps it mounted: its tab yields to the sheet.
-  const yieldToSheet =
-    useMcpAppViewHostedBy(workspaceId, toolCallId ?? "", ["sheet"]) && host === "tab";
   useEffect(() => {
-    if (toolCallId == null || yieldToSheet) return;
-    return markMcpAppViewHosted(workspaceId, toolCallId, host);
-  }, [workspaceId, toolCallId, host, yieldToSheet]);
+    if (toolCallId == null) return;
+    return markMcpAppViewHosted(workspaceId, toolCallId, "tab");
+  }, [workspaceId, toolCallId]);
   if (view === "loading") return <Notice>Loading…</Notice>;
-  if (yieldToSheet && view != null) {
-    return <AppViewInTabNotice workspaceId={workspaceId} view={view} />;
-  }
   if (view == null) {
     return (
       <div className="flex flex-col items-start gap-2 p-4 text-xs">

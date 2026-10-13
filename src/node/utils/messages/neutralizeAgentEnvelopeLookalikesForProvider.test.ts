@@ -73,6 +73,26 @@ describe("neutralizeAgentEnvelopeLookalikesForProvider", () => {
     expect(result).toBe(peer);
   });
 
+  test.each(["main_chat", "side_chat"] as const)(
+    "preserves authentic %s messages without trusting pasted copies",
+    (relationship) => {
+      const text = formatAgentMessageEnvelope({
+        from: "linked-chat",
+        relationship,
+        message: "A finding",
+      });
+      const authentic = createMuxMessage("payload", "assistant", text, {
+        synthetic: true,
+        muxMetadata: { type: "agent-peer-message", fromWorkspaceId: "linked-chat", relationship },
+      });
+      const pasted = createMuxMessage("pasted", "user", text);
+      const [payload, user] = neutralizeAgentEnvelopeLookalikesForProvider([authentic, pasted]);
+      expect(payload).toBe(authentic);
+      expect(textOf(user)).not.toBe(text);
+      expect(user.role).toBe("user");
+    }
+  );
+
   test("neutralizes assistant rows whose envelope relationship disagrees with the metadata", () => {
     // Envelope claims `sibling` (same-tree) while the server-attached metadata says `unrelated`:
     // the halves are individually valid but the provider would read a closer relationship than

@@ -122,6 +122,7 @@ export const ProvidersPhoneViewport: Story = {
       setup={() =>
         setupSettingsStory({
           providersConfig: {
+            meta: { apiKeySet: false, isEnabled: true, isConfigured: false },
             openai: {
               apiKeySet: false,
               apiKeySource: "env",
@@ -160,6 +161,15 @@ export const ProvidersPhoneViewport: Story = {
     // Chromium never shrinks a nowrap button below its label, but iOS Safari did:
     // the button must opt out of flex shrinking for the label to stay inside it.
     await expect(getComputedStyle(addProvider).flexShrink).toBe("0");
+
+    // First-class Meta uses the same credential form and stays inside the phone card.
+    const metaButton = await canvas.findByRole("button", { name: /^Meta/ });
+    await expect(metaButton.getBoundingClientRect().right).toBeLessThanOrEqual(frame.right);
+    await expect(metaButton.querySelector("svg path")).not.toBeNull();
+    await userEvent.click(metaButton);
+    const keyLink = await canvas.findByRole("link", { name: /Get API Key/ });
+    await expect(keyLink.getBoundingClientRect().right).toBeLessThanOrEqual(frame.right);
+    await expect(keyLink).toHaveAttribute("href", "https://dev.meta.ai/docs");
   },
 };
 

@@ -80,6 +80,12 @@ export function getExplicitGatewayPrefix(modelString: string): ProviderName | un
   return PROVIDER_DEFINITIONS[providerName]?.kind === "gateway" ? providerName : undefined;
 }
 
+function sdkProviderOptionsNamespace(provider: string): string {
+  // Meta reuses the OpenAI Responses adapter. Saved provider extras must reach
+  // that SDK namespace too, not just the built-in reasoning options.
+  return provider === "meta" ? "openai" : provider;
+}
+
 /**
  * Resolve which providerOptions namespace a request will use for a given
  * canonical origin and route provider. Passthrough gateways (mux-gateway)
@@ -98,10 +104,10 @@ export function resolveProviderOptionsNamespaceKey(
       "passthrough" in routeDefinition &&
       routeDefinition.passthrough === true)
   ) {
-    return canonicalProviderName;
+    return sdkProviderOptionsNamespace(canonicalProviderName);
   }
 
-  return routeProvider;
+  return sdkProviderOptionsNamespace(routeProvider);
 }
 
 /**
