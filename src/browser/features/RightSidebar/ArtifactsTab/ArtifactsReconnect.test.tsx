@@ -3,11 +3,16 @@ import "../../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
-import { useState, type ReactNode } from "react";
+import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
-import { APIContext, type APIClient, type UseAPIResult } from "@/browser/contexts/API";
+import type { APIClient } from "@/browser/contexts/API";
+import {
+  createConnectionHarness,
+  GAP_MODES,
+  type ConnectionHarness,
+} from "@/browser/contexts/connection.testHarness";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
-import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
+import type { TestApiOverrides } from "@/browser/testUtils";
 import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
 import { getArtifactKind } from "@/common/utils/artifactKind";
 import { ArtifactsPanel } from "./ArtifactsPanel";
@@ -68,8 +73,8 @@ function fail() {
   return Promise.resolve({ success: false as const, error: failWith ?? "" });
 }
 
-/** A fresh client, as each reconnect creates. */
-function createClient(): APIClient {
+/** The server's procedures. The harness builds a fresh client on them at each connect. */
+function serverOverrides(): TestApiOverrides<APIClient> {
   const api: TestApiOverrides<APIClient> = {
     artifacts: {
       list: () => {
@@ -164,30 +169,16 @@ function createClient(): APIClient {
       },
     },
   };
-  return createTestApiClient(api);
+  return api;
 }
 
-let setConnection: (api: APIClient | null) => void = () => undefined;
-const noop = () => undefined;
+let harness: ConnectionHarness;
 
-/** The API context as ManagedAPIProvider reports it: connected, or reconnecting with no client. */
 function ConnectionWrapper(props: { children: ReactNode }) {
-  const [api, setApi] = useState<APIClient | null>(() => createClient());
-  setConnection = setApi;
-  const value: UseAPIResult =
-    api != null
-      ? { status: "connected", api, error: null, authenticate: noop, retry: noop }
-      : {
-          status: "reconnecting",
-          api: null,
-          error: null,
-          attempt: 1,
-          authenticate: noop,
-          retry: noop,
-        };
+  const Connection = harness.Wrapper;
   return (
     <ThemeProvider forcedTheme="dark">
-      <APIContext.Provider value={value}>{props.children}</APIContext.Provider>
+      <Connection>{props.children}</Connection>
     </ThemeProvider>
   );
 }
@@ -200,14 +191,14 @@ async function flush() {
 }
 
 async function dropConnection() {
-  act(() => setConnection(null));
+  await harness.drop();
   await flush();
 }
 
 /** Reconnects and waits until the panel re-listed through the new client. */
 async function reconnect() {
   const before = listCalls;
-  act(() => setConnection(createClient()));
+  harness.reconnect();
   await waitFor(() => expect(listCalls).toBeGreaterThan(before));
   await flush();
 }
@@ -228,10 +219,12 @@ function postFromFrame(frame: HTMLIFrameElement, data: unknown) {
   });
 }
 
-describe("Artifacts tab across a dropped connection", () => {
+// Every case runs with the provider of today (null-gap) and after the switch (kept-gap).
+describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", (mode) => {
   let cleanupDom: (() => void) | null = null;
 
   beforeEach(() => {
+    harness = createConnectionHarness(mode, serverOverrides);
     cleanupDom = installDom();
     window.localStorage.clear();
     files = { "app.html": ok("app.html", "<button>Count</button>") };
@@ -334,7 +327,7 @@ describe("Artifacts tab across a dropped connection", () => {
     }) as Window["postMessage"];
 
     await dropConnection();
-    act(() => setConnection(createClient()));
+    harness.reconnect();
     await flush();
     expectSameFrame(view.queryByTestId("mcp-app-frame"), frame);
     // A torn-down host would have told the view to tear down.
@@ -394,7 +387,10 @@ describe("Artifacts tab across a dropped connection", () => {
     expect(savedStates).toEqual([]);
 
     // Reopening the tab (connected again) sends the held write before reading the state.
-    const reopened = render(<ArtifactsPanel workspaceId="ws-r" />, { wrapper: ConnectionWrapper });
+    harness.reconnect();
+    const reopened = render(<ArtifactsPanel workspaceId="ws-r" />, {
+      wrapper: ConnectionWrapper,
+    });
     await reopened.findByTestId("artifact-frame");
     await waitFor(() => expect(savedStates).toEqual([{ marker: "zq-offline" }]));
     await waitFor(() =>
@@ -450,7 +446,7 @@ describe("Artifacts tab across a dropped connection", () => {
     expect(view.getByText("Q")).toBeTruthy();
     expect(assetReads.length).toBe(reads);
 
-    act(() => setConnection(createClient()));
+    harness.reconnect();
     await waitFor(() => expect(assetReads.length).toBe(reads + 1));
     await flush();
     expect(view.queryByText(/Could not read/)).toBeNull();
@@ -487,7 +483,7 @@ describe("Artifacts tab across a dropped connection", () => {
     expect(view.queryByText(/Could not read/)).toBeNull();
 
     await dropConnection();
-    act(() => setConnection(createClient()));
+    harness.reconnect();
     await waitFor(() => expect(assetReads).toEqual(["data/s.json", "data/s.json"]));
     expect(await view.findByText("Q")).toBeTruthy();
     expect(view.queryByText(/Could not read/)).toBeNull();

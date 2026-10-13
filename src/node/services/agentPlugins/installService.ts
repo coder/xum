@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { Dirent } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
@@ -14,9 +14,11 @@ import {
   type AgentPluginInstallEntry,
 } from "@/common/config/schemas/agentPluginInstalls";
 import { isValidAgentPluginName } from "@/common/utils/agentPluginName";
+import { getOwn } from "@/common/utils/getOwn";
 import type {
   AgentPluginInstallPreview,
   AgentPluginComponents,
+  AgentPluginInterfaceSummary,
   AgentPluginListItem,
   AgentPluginManifestSummary,
   AgentPluginPreviewHook,
@@ -41,7 +43,13 @@ import {
 } from "@/common/orpc/schemas/agentSkill";
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
 import { log } from "@/node/services/log";
-import type { MCPServerInfo } from "@/common/types/mcp";
+import type { MCPServerInfo, MCPServerOAuthConfig } from "@/common/types/mcp";
+import type { McpOauthService } from "@/node/services/mcpOauthService";
+import {
+  pluginClientSecretFor,
+  readPluginClientSecrets,
+  type PluginClientSecret,
+} from "./openaiMcpAuth";
 import type { MCPConfigService } from "@/node/services/mcpConfigService";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import {
@@ -54,15 +62,19 @@ import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { shellQuote } from "@/common/utils/shell";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import {
+  CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
+  readPluginFileWithinRootCapped,
   discoverAgentPluginAt,
   discoverAgentPlugins,
   ensurePluginPathContained,
   journalDerivedDiscoveryGate,
+  PLUGIN_MANIFEST_RELATIVE_PATH,
   PluginGitPathError,
   setAgentPluginDiscoveryGate,
   type AgentPluginContainer,
   type AgentPluginInfo,
 } from "./discovery";
+import { checkLogoImage } from "./imageHeader";
 import {
   acquirePluginMutationLock,
   bumpContainerMutationEpoch,
@@ -407,6 +419,191 @@ function shortenHome(absPath: string): string {
   return absPath.startsWith(home + path.sep) ? `~${absPath.slice(home.length)}` : absPath;
 }
 
+/** Remote-server sign-in as the update review compares it. */
+interface SurfaceSignIn {
+  url: string;
+  oauth?: MCPServerOAuthConfig;
+  /** sha256 of the plugin client secret: compared, never shown. */
+  secretDigest?: string;
+  /** Tokens belong to this: client, endpoints, resource and scopes. */
+  identity: string;
+}
+
+interface SurfaceServer {
+  fingerprint: string;
+  display: string;
+  signIn?: SurfaceSignIn;
+}
+
+/** Per-scan memo: each `.mcp.json` is read and parsed once for all its servers. */
+type SecretReader = (
+  source: NonNullable<MCPServerOAuthConfig["clientSecretSource"]>,
+  clientId: string
+) => Promise<string | undefined>;
+
+function createSecretReader(): SecretReader {
+  const files = new Map<string, Promise<Map<string, PluginClientSecret>>>();
+  return (source, clientId) => {
+    let secrets = files.get(source.mcpConfigPath);
+    if (secrets === undefined) {
+      secrets = readPluginClientSecrets(source).catch(() => new Map<string, PluginClientSecret>());
+      files.set(source.mcpConfigPath, secrets);
+    }
+    // Only the secret of the client this scan captured (#6297).
+    return secrets.then((map) => pluginClientSecretFor(map, source.serverName, clientId));
+  };
+}
+
+async function readSignIn(
+  url: string,
+  oauth: MCPServerOAuthConfig | undefined,
+  readSecret: SecretReader
+): Promise<SurfaceSignIn> {
+  const secret =
+    oauth?.clientSecretSource !== undefined && oauth.clientId !== undefined
+      ? await readSecret(oauth.clientSecretSource, oauth.clientId)
+      : undefined;
+  return {
+    url,
+    ...(oauth !== undefined ? { oauth: { ...oauth, clientSecretSource: undefined } } : {}),
+    ...(secret !== undefined
+      ? { secretDigest: createHash("sha256").update(secret).digest("hex") }
+      : {}),
+    identity: stableStringify({
+      clientId: oauth?.clientId ?? null,
+      // Tokens were issued by this authorization server (discovery is pointed at it).
+      issuer: oauth?.discovery?.authorizationServerBase ?? null,
+      registrationUrl: oauth?.discovery?.registrationUrl ?? null,
+      resource: oauth?.resource ?? null,
+      baseScopes: oauth?.baseScopes ?? null,
+      defaultScopes: oauth?.defaultScopes ?? null,
+    }),
+  };
+}
+
+/** One review line per changed sign-in field. Secrets are named, never shown. */
+export function describeSignInChanges(before?: SurfaceSignIn, after?: SurfaceSignIn): string[] {
+  const lines: string[] = [];
+  const a = before?.oauth;
+  const b = after?.oauth;
+  const changed = (name: string, x?: string, y?: string): void => {
+    if (x === y) return;
+    lines.push(
+      y === undefined
+        ? `${name} removed`
+        : x === undefined
+          ? `${name} added (${y})`
+          : `${name} changed (${x} → ${y})`
+    );
+  };
+  changed("Sign-in client", a?.clientId, b?.clientId);
+  changed("Token auth method", a?.tokenEndpointAuthMethod, b?.tokenEndpointAuthMethod);
+  const hosts = (oauth?: MCPServerOAuthConfig): Set<string> =>
+    new Set(
+      [oauth?.discovery?.authorizationServerBase, oauth?.discovery?.registrationUrl]
+        .filter((url) => url !== undefined)
+        .map((url) => new URL(url).host)
+    );
+  const [oldHosts, newHosts] = [hosts(a), hosts(b)];
+  for (const host of newHosts) if (!oldHosts.has(host)) lines.push(`Sign-in at ${host} (new)`);
+  for (const host of oldHosts) if (!newHosts.has(host)) lines.push(`Sign-in at ${host} (removed)`);
+  if (
+    lines.every((line) => !line.startsWith("Sign-in at")) &&
+    stableStringify(a?.discovery ?? null) !== stableStringify(b?.discovery ?? null)
+  )
+    lines.push("Sign-in server changed");
+  const scopes = (oauth?: MCPServerOAuthConfig): string[] => [
+    ...(oauth?.baseScopes ?? []),
+    ...(oauth?.defaultScopes ?? []),
+  ];
+  // Sets: scope lists are plugin-controlled and can be long.
+  const [oldScopes, newScopes] = [new Set(scopes(a)), new Set(scopes(b))];
+  const added = [...newScopes].filter((scope) => !oldScopes.has(scope));
+  const removed = [...oldScopes].filter((scope) => !newScopes.has(scope));
+  if (added.length + removed.length > 0)
+    lines.push(
+      `Scopes changed: ${[...added.map((x) => `+ ${x}`), ...removed.map((x) => `- ${x}`)].join(" ")}`
+    );
+  else if (
+    stableStringify([a?.baseScopes ?? null, a?.defaultScopes ?? null]) !==
+    stableStringify([b?.baseScopes ?? null, b?.defaultScopes ?? null])
+  )
+    lines.push("Scopes changed");
+  changed("Resource", a?.resource, b?.resource);
+  const [oldSecret, newSecret] = [before?.secretDigest, after?.secretDigest];
+  if (oldSecret !== newSecret)
+    lines.push(
+      oldSecret === undefined
+        ? "Client secret added"
+        : newSecret === undefined
+          ? "Client secret removed"
+          : "Client secret changed"
+    );
+  return lines;
+}
+
+const LOGO_MAX_BYTES = 512 * 1024;
+// No SVG: a data-URL <img> cannot run script, but raster-only keeps the
+// renderer away from markup altogether. No GIF: OpenAI does not list it, and it
+// animates (no unrequested UI animation); animated PNG/WebP are refused by header.
+const LOGO_MIME_BY_EXTENSION: Record<string, string> = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+};
+
+/**
+ * UI projection of the OpenAI `interface`. SECURITY AUDIT: the logo crosses
+ * to the renderer only as a data URL read through the contained, capped
+ * reader (a symlink out of the plugin root fails there); never a file path.
+ */
+async function interfaceSummary(
+  plugin: Pick<AgentPluginInfo, "rootPath" | "openai">,
+  warnings: string[]
+): Promise<AgentPluginInterfaceSummary | undefined> {
+  const info = plugin.openai?.interface;
+  if (info === undefined) return undefined;
+  const logoPath = info.logo ?? info.composerIcon;
+  let logoDataUrl: string | undefined;
+  const mime =
+    logoPath === undefined
+      ? undefined
+      : getOwn(LOGO_MIME_BY_EXTENSION, path.extname(logoPath).toLowerCase());
+  if (logoPath !== undefined && mime === undefined) {
+    warnings.push(`Plugin logo '${logoPath}' must be a PNG, JPEG or WebP image; ignoring`);
+  } else if (logoPath !== undefined && mime !== undefined) {
+    try {
+      // The contained reader also refuses a link into the staged clone's .git
+      // (ensurePluginPathContained, #6161), so no separate check is needed here.
+      const { bytes } = await readPluginFileWithinRootCapped({
+        filePath: path.join(plugin.rootPath, logoPath),
+        pluginRoot: plugin.rootPath,
+        maxBytes: LOGO_MAX_BYTES,
+        label: "Plugin logo",
+      });
+      // SECURITY AUDIT: bounded decoded size (a tiny compressed file can decode to
+      // hundreds of MB in the renderer) and no animation, from the header alone.
+      const refusal = checkLogoImage(bytes, mime);
+      if (refusal !== null) throw new Error(refusal);
+      logoDataUrl = `data:${mime};base64,${bytes.toString("base64")}`;
+    } catch (error) {
+      warnings.push(`Plugin logo '${logoPath}' cannot be shown: ${getErrorMessage(error)}`);
+    }
+  }
+  return {
+    displayName: info.displayName,
+    developerName: info.developerName,
+    shortDescription: info.shortDescription,
+    ...(info.capabilities !== undefined ? { capabilities: info.capabilities } : {}),
+    ...(info.websiteURL !== undefined ? { websiteURL: info.websiteURL } : {}),
+    ...(info.privacyPolicyURL !== undefined ? { privacyPolicyURL: info.privacyPolicyURL } : {}),
+    ...(info.termsOfServiceURL !== undefined ? { termsOfServiceURL: info.termsOfServiceURL } : {}),
+    ...(info.supportURL !== undefined ? { supportURL: info.supportURL } : {}),
+    ...(logoDataUrl !== undefined ? { logoDataUrl } : {}),
+  };
+}
+
 function manifestSummary(manifest: AgentPluginManifest): AgentPluginManifestSummary {
   return {
     name: manifest.name,
@@ -420,6 +617,7 @@ function manifestSummary(manifest: AgentPluginManifest): AgentPluginManifestSumm
 }
 
 export class AgentPluginInstallService {
+  private mcpOauthService: Pick<McpOauthService, "logout" | "credentialKey"> | undefined;
   private readonly containerDir: string;
   private readonly stagingRoot: string;
   private readonly registryFile: string;
@@ -456,6 +654,8 @@ export class AgentPluginInstallService {
       mcpConfigService?: Pick<MCPConfigService, "pruneEnabledPluginServers">;
       /** Used to prune plugin server keys from per-workspace overrides on uninstall. */
       workspaceMcpOverridesService?: WorkspaceMcpOverridesService;
+      /** Signs out plugin servers whose sign-in identity an update changes. */
+      mcpOauthService?: Pick<McpOauthService, "logout" | "credentialKey">;
       /** Test override for the staged-clone checkout quota. */
       stagingQuota?: { maxBytes: number; maxFiles: number };
       /** Test override for the recovery wait bound. */
@@ -463,6 +663,7 @@ export class AgentPluginInstallService {
     }
   ) {
     assert(path.isAbsolute(config.rootDir), "AgentPluginInstallService: rootDir must be absolute");
+    this.mcpOauthService = deps.mcpOauthService;
     this.containerDir = path.join(config.rootDir, "plugins");
     this.stagingRoot = path.join(config.rootDir, STAGING_DIR_NAME);
     this.registryFile = path.join(config.rootDir, PLUGIN_REGISTRY_FILE_NAME);
@@ -1144,7 +1345,11 @@ export class AgentPluginInstallService {
     plugin: AgentPluginInfo;
     warnings: string[];
   }> {
-    const hasManifest = await pathExists(path.join(stagedDir, "plugin.json"));
+    // Discovery reads `.codex-plugin/plugin.json` when the root manifest is
+    // absent; both live in the staged tree the consent receipt hashes.
+    const hasManifest =
+      (await pathExists(path.join(stagedDir, PLUGIN_MANIFEST_RELATIVE_PATH))) ||
+      (await pathExists(path.join(stagedDir, CODEX_PLUGIN_MANIFEST_RELATIVE_PATH)));
     if (!hasManifest) {
       if (
         (await pathExists(path.join(stagedDir, ".claude-plugin", "plugin.json"))) ||
@@ -1155,7 +1360,7 @@ export class AgentPluginInstallService {
         );
       }
       throw new Error(
-        "No plugin.json found at the repository root. The repo is not an Agent Plugin — if the plugin lives in a subdirectory, monorepo subpath installs land in v2."
+        "No plugin.json (or .codex-plugin/plugin.json) found at the repository root. The repo is not an Agent Plugin — if the plugin lives in a subdirectory, monorepo subpath installs land in v2."
       );
     }
 
@@ -1240,14 +1445,15 @@ export class AgentPluginInstallService {
     warnings: string[]
   ): Promise<{
     hook: AgentPluginPreviewHook | undefined;
-    /** serverName → { fingerprint (compared), display (shown in the update review) }. */
-    servers: Map<string, { fingerprint: string; display: string }>;
+    /** serverName → { fingerprint (compared), display (shown in the update review), remote sign-in }. */
+    servers: Map<string, SurfaceServer>;
     /** skillName → { fingerprint (compared), display (the advertisement as the model sees it) }. */
     skills: Map<string, { fingerprint: string; display: string }>;
     agents: Map<string, string>;
     components: Set<string>;
   }> {
     const hook = this.collectHook(plugin);
+    const readSecret = createSecretReader();
     const skills = new Map<string, { fingerprint: string; display: string }>();
     for (const skill of await this.collectSkills(plugin, warnings)) {
       // EVERY model-visible advertisement field: description, whenToUse
@@ -1280,7 +1486,7 @@ export class AgentPluginInstallService {
         (command) => `slash command /${command.name}`
       ),
     ]);
-    const servers = new Map<string, { fingerprint: string; display: string }>();
+    const servers = new Map<string, SurfaceServer>();
     if (plugin.mcpConfigPath !== undefined) {
       const { servers: infos, diagnostics } = await loadPluginMcpServers(plugin, {
         xumHome: this.config.rootDir,
@@ -1291,6 +1497,10 @@ export class AgentPluginInstallService {
       const rewrite = (value: string): string => value.split(plugin.rootPath).join(finalTargetPath);
       for (const info of Object.values(infos)) {
         assert(info.plugin !== undefined, "plugin server info must carry provenance");
+        const signIn =
+          info.transport === "stdio"
+            ? undefined
+            : await readSignIn(info.url, info.oauth, readSecret);
         const fingerprint =
           info.transport === "stdio"
             ? JSON.stringify({
@@ -1307,10 +1517,17 @@ export class AgentPluginInstallService {
                 // root → writable PLUGIN_DATA), so it is consent-relevant.
                 ...(info.cwd !== undefined ? { cwd: normalize(info.cwd) } : {}),
               })
-            : JSON.stringify({ transport: info.transport, url: info.url });
+            : JSON.stringify({
+                transport: info.transport,
+                url: info.url,
+                // A changed auth block needs new consent. The secret takes
+                // part as a digest that never leaves this comparison.
+                signIn,
+              });
         servers.set(info.plugin.serverName, {
           fingerprint,
           display: this.describeMcpServer(info, rewrite, finalTargetPath).summary,
+          ...(signIn !== undefined ? { signIn } : {}),
         });
       }
     }
@@ -1335,7 +1552,9 @@ export class AgentPluginInstallService {
     name: string,
     installedPath: string,
     stagedPlugin: AgentPluginInfo,
-    stagedWarnings: string[]
+    stagedWarnings: string[],
+    /** Receives server URLs whose sign-in identity changes (stored tokens must go). */
+    signInResets?: string[]
   ): Promise<AgentPluginCapabilityChange[]> {
     const instanceId = this.instanceIdFor(name);
     const { plugin: currentPlugin } = await discoverAgentPluginAt({
@@ -1393,12 +1612,44 @@ export class AgentPluginInstallService {
       if (currentServer === undefined) {
         changes.push({ summary: `adds MCP server '${serverName}'`, after: server.display });
       } else if (currentServer.fingerprint !== server.fingerprint) {
+        const authLines = describeSignInChanges(currentServer.signIn, server.signIn);
         changes.push({
-          summary: `changes MCP server '${serverName}'`,
+          summary: [`changes MCP server '${serverName}'`, ...authLines].join(": "),
           before: currentServer.display,
           after: server.display,
         });
       }
+    }
+    // Stored credentials are keyed by the normalized server URL, not the
+    // server name: match sign-ins by that key, so a renamed server or a
+    // respelled URL (`/mcp` vs `/mcp/`) with a new identity still resets.
+    const credentialKey = (url: string): string | null =>
+      this.mcpOauthService?.credentialKey(url) ?? null;
+    // Compare each entry with its own previous identity (same name, same key): when two
+    // servers share a URL, another entry already using the new identity must not mask the
+    // change. A renamed (or added) entry has no previous self, and the stored credentials
+    // cannot be traced to one entry: reset whenever any identity at the key differs. A
+    // needless sign-out is acceptable; stale credentials offered under a new identity are not.
+    const currentIdentities = new Map<string, Set<string>>();
+    const currentEntryIdentity = new Map<string, string>();
+    for (const [serverName, server] of current?.servers ?? []) {
+      const key = server.signIn && credentialKey(server.signIn.url);
+      if (!key || !server.signIn) continue;
+      const identities = currentIdentities.get(key) ?? new Set<string>();
+      identities.add(server.signIn.identity);
+      currentIdentities.set(key, identities);
+      currentEntryIdentity.set(`${serverName}\0${key}`, server.signIn.identity);
+    }
+    for (const [serverName, server] of staged.servers) {
+      const key = server.signIn && credentialKey(server.signIn.url);
+      if (!key || !server.signIn) continue;
+      const previous = currentEntryIdentity.get(`${serverName}\0${key}`);
+      const identity = server.signIn.identity;
+      const changed =
+        previous !== undefined
+          ? previous !== identity
+          : [...(currentIdentities.get(key) ?? [])].some((other) => other !== identity);
+      if (changed) signInResets?.push(server.signIn.url);
     }
     // Skill advertisements interpolate into the model-visible skill index on
     // every request, so a new skill — or a reworded description — can inject
@@ -1687,10 +1938,29 @@ export class AgentPluginInstallService {
   ): AgentPluginPreviewMcpServer {
     assert(info.plugin !== undefined, "plugin server info must carry provenance");
     if (info.transport !== "stdio") {
+      // SECURITY AUDIT: the user consents to the server URL, so each auth host
+      // that differs from its host gets its own line. Exact host comparison:
+      // no public-suffix list exists here to make parent-domain matching safe.
+      const serverHost = new URL(info.url).host;
+      const discovery = info.oauth?.discovery;
+      const authHosts = new Set(
+        [discovery?.authorizationServerBase, discovery?.registrationUrl]
+          .filter((url) => url !== undefined)
+          .map((url) => new URL(url).host)
+          .filter((host) => host !== serverHost)
+      );
       return {
         serverName: info.plugin.serverName,
         transport: info.transport === "http" ? "http" : "sse",
-        summary: info.url,
+        summary: [
+          info.url,
+          ...[...authHosts].map((host) => `Sign-in at ${host}`),
+          // The token audience, when the plugin narrows or widens it.
+          ...(info.oauth?.resource !== undefined &&
+          new URL(info.oauth.resource).href !== new URL(info.url).href
+            ? [`Token resource: ${info.oauth.resource}`]
+            : []),
+        ].join("\n"),
       };
     }
     // Mirror the runtime's rendering (MCPServerManager shell-quotes every
@@ -1818,6 +2088,7 @@ export class AgentPluginInstallService {
         warnings
       );
       const hook = this.collectHook(plugin);
+      const openaiInterface = await interfaceSummary(plugin, warnings);
       const agents = (await this.collectAgentFiles(plugin.agentsDir)).map((agent) => agent.name);
       const workflows = await this.collectComponentFiles(plugin.workflowsDir, ".js");
       const slashCommands = (plugin.manifest.contributes?.slashCommands ?? []).map((command) => ({
@@ -1840,7 +2111,10 @@ export class AgentPluginInstallService {
       return {
         source,
         lockedSha: sha,
-        manifest: manifestSummary(plugin.manifest),
+        manifest: {
+          ...manifestSummary(plugin.manifest),
+          ...(openaiInterface !== undefined ? { interface: openaiInterface } : {}),
+        },
         skills,
         mcpServers,
         ...(hook !== undefined ? { hook } : {}),
@@ -2784,6 +3058,11 @@ export class AgentPluginInstallService {
   }
 
   /** Managed registry entries merged with unmanaged plugins found by global discovery. */
+  /** The OAuth service is built in a later DI layer than this service. */
+  setMcpOauthService(service: Pick<McpOauthService, "logout" | "credentialKey">): void {
+    this.mcpOauthService = service;
+  }
+
   async list(): Promise<AgentPluginListItem[]> {
     // Section open re-runs crash recovery (the startup pass may have failed
     // or predates recent journals) BEFORE discovery scans the container, so
@@ -2835,6 +3114,8 @@ export class AgentPluginInstallService {
           ? `plugin.json names itself '${plugin.name}' — the installed name '${entry.name}' stays authoritative.`
           : undefined;
       const description = manifestNameDrift ?? plugin.manifest.description;
+      // The install preview already disclosed logo problems; the row only shows what loads.
+      const openaiInterface = await interfaceSummary(plugin, []);
       items.push({
         name: entry?.name ?? plugin.name,
         managed: entry !== undefined,
@@ -2842,6 +3123,7 @@ export class AgentPluginInstallService {
         location: shortenHome(path.join(plugin.containerPath, plugin.dirName)),
         ...(plugin.manifest.version !== undefined ? { version: plugin.manifest.version } : {}),
         ...(description !== undefined ? { description } : {}),
+        ...(openaiInterface !== undefined ? { interface: openaiInterface } : {}),
         ...(entry !== undefined
           ? {
               source: entry.source,
@@ -3947,7 +4229,14 @@ export class AgentPluginInstallService {
         // capability surface against the installed tree; changes need a
         // consent from previewUpdate naming this exact (from, to) pair,
         // which the user gave after seeing every change.
-        const changes = await this.collectCapabilityChanges(entry.name, targetPath, plugin, []);
+        const signInResets: string[] = [];
+        const changes = await this.collectCapabilityChanges(
+          entry.name,
+          targetPath,
+          plugin,
+          [],
+          signInResets
+        );
         if (changes.length > 0 && args.consent === undefined) {
           throw new Error(
             `The update to '${entry.name}' ${changes.map((change) => change.summary).join("; ")}. Updates cannot expand a plugin's capabilities without review — open Settings → Plugins and review the update to confirm it.`
@@ -4142,6 +4431,19 @@ export class AgentPluginInstallService {
           // replaced tree. Servers restart on next use; default-disabled
           // state and workspace overrides are untouched (identity is the
           // lexical path).
+          // The new tree is in place: tokens issued to the old sign-in
+          // identity (client, endpoints, issuer, resource, scopes) must not be
+          // refreshed with the new client. Signed out, the server asks again.
+          // Runs BEFORE the final stop, so a startup that raced the sign-out
+          // is invalidated too, and a failing stop cannot skip it.
+          for (const serverUrl of new Set(signInResets)) {
+            const result = await this.mcpOauthService?.logout({ serverUrl });
+            if (result?.success === false)
+              log.warn("Could not sign out a plugin MCP server after its sign-in changed", {
+                plugin: entry.name,
+                error: result.error,
+              });
+          }
           await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
         }
 
