@@ -1031,6 +1031,15 @@ function hashedQuery(search: string): string {
 }
 
 /**
+ * The prompt-cache route of a mux-gateway account. Signing in as another account keeps the
+ * base URL but reaches another cache, so the account joins the baseline key, as a short
+ * hash: the credential never reaches keys, logs or events.
+ */
+export function muxGatewayPromptCacheRoute(couponCode: string): string {
+  return `mux-gateway:${shortHash(couponCode)}`;
+}
+
+/**
  * The cache endpoint of a request URL: origin and path, plus a short hash of the query.
  * normalizeAnthropicBaseURL keeps base-URL query parameters, and a proxy can pick an account
  * or cache by them (`?token=...`), so another query is another cache. The query can hold
@@ -2644,7 +2653,7 @@ export class ProviderModelFactory {
             ? wrapFetchWithAnthropicCacheControl(baseFetch, effectiveAnthropicCacheTtl, {
                 injectCacheControl: !disableBeta,
                 observeFinalBody: self.promptCacheObserver(opts, {
-                  route: "mux-gateway",
+                  route: muxGatewayPromptCacheRoute(couponCode),
                   modelString,
                 }),
               })

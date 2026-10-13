@@ -43,6 +43,7 @@ import {
   markCodexOauthRoutedResponse,
   normalizeOpenAICompatibleBaseURL,
   resolveAIProviderHeaderSource,
+  muxGatewayPromptCacheRoute,
   requestEndpoint,
   resolveOpenAIWebSocketResponsesUrl,
   wrapFetchWithAnthropicCacheControl,
@@ -6080,6 +6081,44 @@ describe("ProviderModelFactory prompt-cache prefix observation", () => {
       expect(recorded).toHaveLength(1);
       expect(JSON.stringify(recorded)).not.toContain("secret");
     });
+  });
+
+  it("keys mux-gateway baselines by account: another sign-in is another baseline", async () => {
+    await withTempConfig(async (_config, factory) => {
+      const sent: Array<Record<string, unknown>> = [];
+      const sendAs = async (couponCode: string, text: string) => {
+        const scope = factory.createPromptCacheTurnScope("ws-gateway-account", recorder);
+        const result = await factory.createModel(
+          "mux-gateway:anthropic/claude-sonnet-4-5",
+          {},
+          {
+            promptCacheScope: scope,
+            providersConfig: {
+              "mux-gateway": { couponCode, fetch: capturingFetch(sent) },
+            } as unknown as ProvidersConfig,
+          }
+        );
+        if (!result.success) throw new Error("expected a gateway model");
+        await send(result.data, [{ role: "user", content: text }]);
+      };
+      // Same base URL, another account: its first request is a new baseline.
+      await sendAs("account-a-secret", "first");
+      await sendAs("account-b-secret", "second");
+      expect(sent).toHaveLength(2);
+      expect(recorded).toEqual([]);
+      // The same account is the same cache, so a rewritten prompt is reported.
+      await sendAs("account-b-secret", "third");
+      expect(recorded).toHaveLength(1);
+      expect(JSON.stringify(recorded)).not.toContain("secret");
+    });
+  });
+
+  it("the mux-gateway route holds a stable hash of the account, not its credential", () => {
+    const accountA = muxGatewayPromptCacheRoute("account-a-secret");
+    expect(accountA).toMatch(/^mux-gateway:[0-9a-f]{16}$/);
+    expect(accountA).toBe(muxGatewayPromptCacheRoute("account-a-secret"));
+    expect(accountA).not.toBe(muxGatewayPromptCacheRoute("account-b-secret"));
+    expect(accountA).not.toContain("secret");
   });
 
   it("requestEndpoint keeps no query text, only a stable hash of it", () => {
