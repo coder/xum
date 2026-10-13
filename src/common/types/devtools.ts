@@ -24,7 +24,7 @@ export interface DevToolsRun {
    * The estimated token budget a compaction request's history was fitted to
    * (trimCompactionInput). The replay verifier uses the same budget. Absent on requests
    * without a budget (not compaction, a model that can still switch to 1M, an unknown
-   * window) and on older runs.
+   * window except on its retry) and on older runs.
    */
   compactionInputBudgetTokens?: number;
 }
