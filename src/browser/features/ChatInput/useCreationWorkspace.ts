@@ -227,6 +227,8 @@ interface CreationName {
   title?: string;
   nameGeneration?: WorkspaceNameGenerationRequest;
   submittedName: string;
+  /** Call it when no workspace was created: a handed-off naming goes back to the form. */
+  resumeNaming: () => void;
 }
 
 /**
@@ -239,10 +241,14 @@ async function resolveCreationName(
   canHandOff: boolean,
   nameState: Pick<UseWorkspaceNameReturn, "handOffGeneration" | "waitForGeneration" | "name">
 ): Promise<CreationName | null> {
-  const nameGeneration = canHandOff ? nameState.handOffGeneration() : null;
-  if (nameGeneration) {
+  const handOff = canHandOff ? nameState.handOffGeneration() : null;
+  if (handOff) {
     // The form still shows an older message's name (or none); it is dropped with the draft.
-    return { nameGeneration, submittedName: nameState.name };
+    return {
+      nameGeneration: handOff.request,
+      submittedName: nameState.name,
+      resumeNaming: handOff.resume,
+    };
   }
   const identity = await nameState.waitForGeneration();
   if (!identity) return null;
@@ -251,6 +257,8 @@ async function resolveCreationName(
     branchName: identity.name,
     title: normalizedTitle || undefined,
     submittedName: identity.name,
+    // The form kept its name: nothing to resume.
+    resumeNaming: () => undefined,
   };
 }
 
@@ -508,21 +516,10 @@ export function useCreationWorkspace({
       setToast(null);
 
       let createdWorkspaceId: string | null = null;
+      // Until the name is resolved, nothing has been handed off.
+      let resumeNaming: CreationName["resumeNaming"] = () => undefined;
 
       try {
-        // Wait for identity generation to complete (blocks if still in progress), unless a
-        // worktree creation hands it to the backend.
-        // Returns null if generation failed or manual name is empty (error already set in hook)
-        const creationName = await resolveCreationName(
-          kind !== "scratch" && runtimeSelection.mode === RUNTIME_MODE.WORKTREE,
-          { handOffGeneration, waitForGeneration, name: shownWorkspaceName }
-        );
-        if (!creationName) {
-          setIsSending(false);
-          return { success: false };
-        }
-        const createTitle = creationName.title;
-
         // Read send options at send time: render state can lag a pick made just
         // before sending.
         // Override agentId from current draft settings so first-send uses the same
@@ -600,6 +597,21 @@ export function useCreationWorkspace({
           // Trust was confirmed and set, continue with creation
         }
 
+        // Wait for identity generation to complete (blocks if still in progress), unless a
+        // worktree creation hands it to the backend. After the preflights, so that a hand-off
+        // reaches a create request.
+        // Returns null if generation failed or manual name is empty (error already set in hook)
+        const creationName = await resolveCreationName(
+          kind !== "scratch" && runtimeSelection.mode === RUNTIME_MODE.WORKTREE,
+          { handOffGeneration, waitForGeneration, name: shownWorkspaceName }
+        );
+        if (!creationName) {
+          setIsSending(false);
+          return { success: false };
+        }
+        resumeNaming = creationName.resumeNaming;
+        const createTitle = creationName.title;
+
         const createResult =
           kind === "scratch"
             ? await liveApi.workspace.createScratch({ title: createTitle })
@@ -614,6 +626,7 @@ export function useCreationWorkspace({
               });
 
         if (!createResult.success) {
+          resumeNaming();
           setToast({
             id: Date.now().toString(),
             type: "error",
@@ -968,6 +981,8 @@ export function useCreationWorkspace({
       } catch (err) {
         if (createdWorkspaceId) {
           workspaceStore.clearPendingInitialSendState(createdWorkspaceId);
+        } else {
+          resumeNaming();
         }
         const errorMessage = getErrorMessage(err);
         setToast({

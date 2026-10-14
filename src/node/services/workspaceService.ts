@@ -1128,10 +1128,11 @@ interface CreationNaming {
   settleBranch(): void;
 }
 
-/** Matches a creation's naming request to the creation form's request for the same message. */
-function draftNamingKey(request: WorkspaceNameGenerationRequest): string {
-  return JSON.stringify([request.message.trim(), request.candidates]);
-}
+/**
+ * How many creation-form naming requests stay available for a creation to take over. Most never
+ * are (the form shows the name, or the message changes); one per open creation form is enough.
+ */
+const MAX_RETAINED_DRAFT_NAMINGS = 16;
 
 /** Why a backend-generated branch name cannot replace the provisional one, if it cannot. */
 function refuseGeneratedBranchName(generated: string, provisional: string): string | undefined {
@@ -2970,8 +2971,10 @@ export class WorkspaceService
    */
   private readonly pendingCreationNamings = new Map<string, Promise<void>>();
   /**
-   * The creation form's naming requests still running, by draftNamingKey. The creation that
-   * sends the same message takes its request over instead of asking the model again.
+   * The creation form's naming requests by draftNamingId, oldest first, running or finished. The
+   * creation that hands one off takes it over instead of asking the model again. Kept after they
+   * finish: the form drops a result that arrives after its hand-off, and the creation request
+   * can reach the backend after that result.
    */
   private readonly draftNamings = new Map<
     string,
@@ -10820,21 +10823,32 @@ export class WorkspaceService
   }
 
   /**
-   * nameGeneration.generate: names a creation draft's message before its workspace exists.
-   * Registered while it runs, so the creation that hands the same message to the backend takes
-   * this request over (generateCreationIdentity) instead of asking the model a second time.
+   * nameGeneration.generate: names a creation draft's message before its workspace exists. With
+   * a draftNamingId, the creation that hands this request off takes it over
+   * (generateCreationIdentity) instead of asking the model a second time.
    */
-  async generateDraftIdentity(
+  generateDraftIdentity(
     request: WorkspaceNameGenerationRequest
   ): Promise<Result<GenerateWorkspaceIdentityResult, NameGenerationError>> {
-    const key = draftNamingKey(request);
     const generation = this.generatePreCreationIdentity(request.message, request.candidates);
-    this.draftNamings.set(key, generation);
-    try {
-      return await generation;
-    } finally {
-      if (this.draftNamings.get(key) === generation) this.draftNamings.delete(key);
+    if (request.draftNamingId !== undefined) {
+      this.draftNamings.set(request.draftNamingId, generation);
+      if (this.draftNamings.size > MAX_RETAINED_DRAFT_NAMINGS) {
+        const [oldest] = this.draftNamings.keys();
+        this.draftNamings.delete(oldest);
+      }
     }
+    return generation;
+  }
+
+  /** The creation form's naming request a creation hands off, once: see draftNamings. */
+  private takeDraftNaming(
+    draftNamingId: string | undefined
+  ): Promise<Result<GenerateWorkspaceIdentityResult, NameGenerationError>> | undefined {
+    if (draftNamingId === undefined) return undefined;
+    const draftNaming = this.draftNamings.get(draftNamingId);
+    this.draftNamings.delete(draftNamingId);
+    return draftNaming;
   }
 
   private async generatePreCreationIdentity(
@@ -10861,12 +10875,10 @@ export class WorkspaceService
     namingAbort: AbortController
   ): Promise<Result<GenerateWorkspaceIdentityResult, string>> {
     try {
-      // The form's request for this message, if still running, answers sooner and spares a
-      // second model call. One creation takes it: two workspaces given one generated name would
-      // collide on the branch.
-      const key = draftNamingKey(request);
-      const draftNaming = this.draftNamings.get(key);
-      this.draftNamings.delete(key);
+      // The form's request this creation hands off, running or finished, answers sooner and
+      // spares a second model call. One creation takes it: two workspaces given one generated
+      // name would collide on the branch.
+      const draftNaming = this.takeDraftNaming(request.draftNamingId);
       const generated = await raceWithAbortAndTimeout(
         draftNaming ??
           this.generatePreCreationIdentity(request.message.trim(), request.candidates, signal),

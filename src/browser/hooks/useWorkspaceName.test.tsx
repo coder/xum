@@ -124,7 +124,12 @@ describe("useWorkspaceName persisted draft state", () => {
       act(() => {
         handedOff.push(view.result.current.handOffGeneration());
       });
-      expect(handedOff).toEqual([{ message: "fix the sidebar", candidates: [] }]);
+      // Named so the backend can take the in-flight request's result over.
+      expect(handedOff[0]?.request).toEqual({
+        message: "fix the sidebar",
+        candidates: [],
+        draftNamingId: expect.any(String),
+      });
       expect(view.result.current.isGenerating).toBe(false);
 
       await act(async () => {

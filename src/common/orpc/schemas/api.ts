@@ -1817,6 +1817,11 @@ export const workspace = {
           message: z.string(),
           /** Caller fallback models, as for nameGeneration.generate. */
           candidates: z.array(z.string()),
+          /**
+           * The creation form's nameGeneration.generate request for this message, running or
+           * finished: its result names the workspace instead of a second model call.
+           */
+          draftNamingId: z.string().optional(),
         })
         .optional(),
     }),
@@ -3026,6 +3031,11 @@ export const nameGeneration = {
        * first, then these; gateway routing is resolved in createModel.
        */
       candidates: z.array(z.string()),
+      /**
+       * Set by the creation form, unique per request: a workspace.create that hands this request
+       * off (nameGeneration.draftNamingId) takes its result over.
+       */
+      draftNamingId: z.string().optional(),
     }),
     output: ResultSchema(
       z.object({

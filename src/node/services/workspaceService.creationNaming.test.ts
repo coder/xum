@@ -12,6 +12,7 @@ import * as path from "node:path";
 import { WORKSPACE_NAME_GENERATION_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import { Err, Ok, type Result } from "@/common/types/result";
 import type { NameGenerationError } from "@/common/types/errors";
+import type { WorkspaceNameGenerationRequest } from "@/common/orpc/schemas/api";
 import { formatNameGenerationError } from "@/common/utils/errors/formatNameGenerationError";
 import type { WorkspaceService } from "./workspaceService";
 import * as workspaceTitleGenerator from "./workspaceTitleGenerator";
@@ -37,6 +38,8 @@ const OTHER_GENERATED: IdentityResult = Ok({
   modelUsed: "anthropic:claude-haiku-4-5",
 });
 const NAME_REQUEST = { message: "Fix the sidebar layout", candidates: [] };
+/** The creation form's naming request for the same message, as a creation hands it off. */
+const FORM_REQUEST = { ...NAME_REQUEST, draftNamingId: "form-request-1" };
 // Records the branch the init hook sees and the workspace name it is given.
 const INIT_HOOK =
   '#!/usr/bin/env bash\necho "$(git branch --show-current) $XUM_WORKSPACE_NAME" > .init-observed\n';
@@ -125,7 +128,10 @@ describe("create() with nameGeneration", () => {
   });
 
   /** create() as the creation composer calls it; awaitMaterialization picks the eager checkout. */
-  async function createNamed(awaitMaterialization = false) {
+  async function createNamed(
+    awaitMaterialization = false,
+    nameGeneration: WorkspaceNameGenerationRequest = NAME_REQUEST
+  ) {
     const result = await service.create(
       projectPath,
       undefined,
@@ -135,7 +141,7 @@ describe("create() with nameGeneration", () => {
       undefined,
       undefined,
       undefined,
-      { nameGeneration: NAME_REQUEST, ...(awaitMaterialization && { awaitMaterialization }) }
+      { nameGeneration, ...(awaitMaterialization && { awaitMaterialization }) }
     );
     if (!result.success) throw new Error(result.error);
     const { metadata } = result.data;
@@ -311,9 +317,9 @@ describe("create() with nameGeneration", () => {
     const naming = createDeferred<IdentityResult>();
     generateIdentity.mockImplementation(() => naming.promise);
 
-    const formNaming = service.generateDraftIdentity(NAME_REQUEST);
+    const formNaming = service.generateDraftIdentity(FORM_REQUEST);
     await until(() => generateIdentity.mock.calls.length === 1);
-    const created = await createNamed();
+    const created = await createNamed(false, FORM_REQUEST);
     await waitForNamingStep(created.id);
     naming.resolve(GENERATED);
     await harness.initStateManager.waitForInit(created.id);
@@ -328,10 +334,10 @@ describe("create() with nameGeneration", () => {
     generateIdentity.mockImplementationOnce(() => formRequest.promise);
     generateIdentity.mockResolvedValueOnce(OTHER_GENERATED);
 
-    const formNaming = service.generateDraftIdentity(NAME_REQUEST);
+    const formNaming = service.generateDraftIdentity(FORM_REQUEST);
     await until(() => generateIdentity.mock.calls.length === 1);
-    const first = await createNamed();
-    const second = await createNamed();
+    const first = await createNamed(false, FORM_REQUEST);
+    const second = await createNamed(false, FORM_REQUEST);
     await waitForNamingStep(first.id);
     await waitForNamingStep(second.id);
     formRequest.resolve(GENERATED);
@@ -344,16 +350,49 @@ describe("create() with nameGeneration", () => {
     expect(await formNaming).toEqual(GENERATED);
   }, 30_000);
 
-  test("a creation sent after the form's naming request finished asks the model again", async () => {
-    generateIdentity.mockResolvedValueOnce(GENERATED);
-    generateIdentity.mockResolvedValueOnce(OTHER_GENERATED);
+  // The form drops a result that lands after its hand-off, so only the backend still has it.
+  test.each([
+    {
+      label: "hands it off takes its result",
+      request: FORM_REQUEST,
+      name: "sidebar-k3m9",
+      calls: 1,
+    },
+    // Matching by message would give it a name the form may already have used for a workspace.
+    {
+      label: "names no form request asks the model",
+      request: NAME_REQUEST,
+      name: "layout-x2p4",
+      calls: 2,
+    },
+  ])(
+    "after the form's naming request finished, a creation that $label",
+    async (c) => {
+      generateIdentity.mockResolvedValueOnce(GENERATED);
+      generateIdentity.mockResolvedValueOnce(OTHER_GENERATED);
 
-    expect(await service.generateDraftIdentity(NAME_REQUEST)).toEqual(GENERATED);
-    const created = await createNamed();
+      expect(await service.generateDraftIdentity(FORM_REQUEST)).toEqual(GENERATED);
+      const created = await createNamed(false, c.request);
+      await harness.initStateManager.waitForInit(created.id);
+
+      expect(await readObserved(created.path)).toBe(`${c.name} ${created.name}`);
+      expect(generateIdentity).toHaveBeenCalledTimes(c.calls);
+    },
+    30_000
+  );
+
+  test("only recent form naming requests stay available to take over", async () => {
+    generateIdentity.mockResolvedValueOnce(GENERATED);
+    generateIdentity.mockResolvedValue(OTHER_GENERATED);
+
+    await service.generateDraftIdentity(FORM_REQUEST);
+    for (let i = 0; i < 100; i++) {
+      await service.generateDraftIdentity({ ...NAME_REQUEST, draftNamingId: `later-${i}` });
+    }
+    const created = await createNamed(false, FORM_REQUEST);
     await harness.initStateManager.waitForInit(created.id);
 
     expect(await readObserved(created.path)).toBe(`layout-x2p4 ${created.name}`);
-    expect(generateIdentity).toHaveBeenCalledTimes(2);
   }, 30_000);
 
   test("a naming failure's init line gives the reason as the user reads it", async () => {

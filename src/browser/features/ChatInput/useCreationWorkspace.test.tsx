@@ -1120,9 +1120,13 @@ describe("useCreationWorkspace", () => {
 
       expect(handleSendResult).toEqual({ success: true });
       const createRequest = workspaceApi.create.mock.calls[0]?.[0];
+      const formRequest = nameGenerationMock.mock.calls[0]?.[0];
+      // The form's request still runs, so the create names it for the backend to take over.
+      expect(formRequest?.draftNamingId).toEqual(expect.any(String));
       expect(createRequest?.nameGeneration).toEqual({
         message: "launch workspace",
-        candidates: nameGenerationMock.mock.calls[0]?.[0]?.candidates ?? [],
+        candidates: formRequest?.candidates ?? [],
+        draftNamingId: formRequest?.draftNamingId,
       });
       expect(createRequest?.branchName).toBeUndefined();
       expect(createRequest?.title).toBeUndefined();
@@ -1135,6 +1139,61 @@ describe("useCreationWorkspace", () => {
         await generation.promise;
       });
       expect(getHook().nameState.name).toBe("");
+    });
+
+    test("a send the trust prompt stops leaves the name generating in the form", async () => {
+      mockProjectConfigMap = new Map([[TEST_PROJECT_PATH, { workspaces: [], trusted: false }]]);
+      const { generation, nameGenerationMock, workspaceApi, getHook } = setupPendingName({
+        mode: "worktree",
+      });
+      await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+      await waitFor(() => expect(nameGenerationMock.mock.calls.length).toBe(1));
+
+      let sendPromise: Promise<CreationSendResult> | undefined;
+      act(() => {
+        sendPromise = getHook().handleSend("launch workspace");
+      });
+      await waitFor(() => expect(getHook().trustDialog).not.toBeNull());
+      const trustDialog = getHook().trustDialog;
+      if (!trustDialog || typeof trustDialog !== "object" || !("props" in trustDialog)) {
+        throw new Error("Expected trust dialog props");
+      }
+      act(() => {
+        (trustDialog.props as { onCancel: () => void }).onCancel();
+      });
+      expect(await sendPromise).toEqual({ success: false });
+      expect(workspaceApi.create.mock.calls.length).toBe(0);
+
+      await act(async () => {
+        generation.resolve(generatedName);
+        await generation.promise;
+      });
+      expect(getHook().nameState.name).toBe("launch-a1b2");
+    });
+
+    test("a failed create names the message in the form again", async () => {
+      const { generation, nameGenerationMock, workspaceApi, getHook } = setupPendingName({
+        mode: "worktree",
+      });
+      workspaceApi.create.mockImplementationOnce(() =>
+        Promise.resolve({ success: false, error: "disk full" } as WorkspaceCreateResult)
+      );
+      await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+      await waitFor(() => expect(nameGenerationMock.mock.calls.length).toBe(1));
+
+      let handleSendResult: CreationSendResult | undefined;
+      await act(async () => {
+        handleSendResult = await getHook().handleSend("launch workspace");
+      });
+      expect(handleSendResult).toEqual({ success: false });
+      expect(workspaceApi.create.mock.calls[0]?.[0]?.nameGeneration).toBeDefined();
+
+      await act(async () => {
+        generation.resolve(generatedName);
+        await generation.promise;
+      });
+      await waitFor(() => expect(getHook().nameState.name).toBe("launch-a1b2"));
+      expect(nameGenerationMock.mock.calls.length).toBe(2);
     });
 
     test("a non-worktree runtime still waits for the generated name", async () => {
