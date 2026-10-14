@@ -157,18 +157,18 @@ describe("agent_skill_write", () => {
     expect((await fs.lstat(path.join(legacyRoot, "demo-skill"))).isSymbolicLink()).toBe(true);
   });
 
-  it("merges a legacy package into an incomplete canonical package before writing", async () => {
+  // The canonical manifest decides the merge: one discovery rejects (no description)
+  // takes the legacy package; one discovery loads (a display name) stays as is.
+  it.each([
+    ["merges a legacy package into an incomplete", "---\nname: demo-skill\n---\n", true],
+    ["keeps a display-name", "---\nname: Demo Skill\ndescription: Canonical\n---\n", false],
+  ] as const)("%s canonical package before writing", async (_label, manifest, merges) => {
     using tempDir = new TestTempDir("test-agent-skill-write-legacy-partial-canonical");
     const projectRoot = path.join(tempDir.path, "project");
     const canonicalRoot = path.join(projectRoot, ".xum", "skills");
     const legacyRoot = path.join(projectRoot, ".mux", "skills");
     await fs.mkdir(path.join(canonicalRoot, "demo-skill", "references"), { recursive: true });
-    await fs.writeFile(
-      path.join(canonicalRoot, "demo-skill", SKILL_FILENAME),
-      // No description: discovery rejects this manifest, so the legacy package merges in.
-      "---\nname: wrong-name\n---\n",
-      "utf-8"
-    );
+    await fs.writeFile(path.join(canonicalRoot, "demo-skill", SKILL_FILENAME), manifest, "utf-8");
     await fs.writeFile(
       path.join(canonicalRoot, "demo-skill", "references", "canonical.txt"),
       "canonical",
@@ -191,15 +191,20 @@ describe("agent_skill_write", () => {
 
     expect(result.success).toBe(true);
     const canonicalDir = path.join(canonicalRoot, "demo-skill");
-    expect(await fs.readFile(path.join(canonicalDir, SKILL_FILENAME), "utf-8")).toContain(
-      "name: demo-skill"
-    );
+    const writtenManifest = await fs.readFile(path.join(canonicalDir, SKILL_FILENAME), "utf-8");
+    if (merges) {
+      expect(writtenManifest).toContain("name: demo-skill\ndescription:");
+    } else {
+      expect(writtenManifest).toBe(manifest);
+    }
     expect(await fs.readFile(path.join(canonicalDir, "references/canonical.txt"), "utf-8")).toBe(
       "canonical"
     );
-    expect(await fs.readFile(path.join(canonicalDir, "references/legacy.txt"), "utf-8")).toBe(
-      "legacy"
+    const legacyCopied = await fs.stat(path.join(canonicalDir, "references/legacy.txt")).then(
+      () => true,
+      () => false
     );
+    expect(legacyCopied).toBe(merges);
     expect(await fs.readFile(path.join(canonicalDir, "references/new.txt"), "utf-8")).toBe("new");
   });
 
