@@ -1528,7 +1528,7 @@ export class Config {
     this.ensureConfigFileWatcher();
     return () => {
       this.emitter.off("configChanged", callback);
-      if (this.emitter.listenerCount("configChanged") === 0) this.closeConfigFileWatcher();
+      this.closeUnusedConfigFileWatcher();
     };
   }
 
@@ -1573,6 +1573,29 @@ export class Config {
   private closeConfigFileWatcher(): void {
     this.configFileWatcher?.close();
     this.configFileWatcher = null;
+  }
+
+  private closeUnusedConfigFileWatcher(): void {
+    if (this.emitter.listenerCount("configChanged") === 0) this.closeConfigFileWatcher();
+  }
+
+  /** writeFileAtomic for config.json that keeps the watcher from echoing this write. */
+  private async writeConfigFileTracked(text: string): Promise<void> {
+    // The watcher can see the rename before this write's stamp is recorded. It holds
+    // events until then, so the echo of this write compares equal and stays silent.
+    this.configSavesInFlight += 1;
+    try {
+      await writeFileAtomic(this.configFile, text, "utf-8");
+      this.notifiedConfigFileStamp = this.configFileStamp();
+    } finally {
+      this.configSavesInFlight -= 1;
+      if (this.configSavesInFlight === 0 && this.configFileEventHeld) {
+        this.configFileEventHeld = false;
+        this.handleConfigFileEvent();
+      }
+    }
+    // The first save creates the root dir, which a listener's earlier watch attempt lacked.
+    if (this.emitter.listenerCount("configChanged") > 0) this.ensureConfigFileWatcher();
   }
 
   private configSavesInFlight = 0;
@@ -2936,24 +2959,9 @@ export class Config {
       // and the npm write-file-atomic package renamed that truncated file over
       // config.json, which then loaded as an empty registry (coder/xum#4197).
       yield* Effect.tryPromise({
-        try: async () => {
-          // The watcher can see the rename before this write's stamp is recorded. It holds
-          // events until then, so the echo of this write compares equal and stays silent.
-          self.configSavesInFlight += 1;
-          try {
-            await writeFileAtomic(self.configFile, text, "utf-8");
-            self.notifiedConfigFileStamp = self.configFileStamp();
-          } finally {
-            self.configSavesInFlight -= 1;
-            if (self.configSavesInFlight === 0 && self.configFileEventHeld) {
-              self.configFileEventHeld = false;
-              self.handleConfigFileEvent();
-            }
-          }
-        },
+        try: () => self.writeConfigFileTracked(text),
         catch: (error) => error,
       });
-      if (self.emitter.listenerCount("configChanged") > 0) self.ensureConfigFileWatcher();
       // A competing rename may already have replaced our write; only a fresh read can publish it.
       // Keep a snapshot only if a reader already parsed the file that is on disk now (it read
       // real disk bytes, whoever wrote them), so the first reader after the save does not parse
