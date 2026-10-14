@@ -1,4 +1,5 @@
 import { FIRST_RUN_VIEW_ID } from "@/common/constants/firstRunView";
+import { AUTH_TOKEN_KEY, ONBOARDING_VIEWED_KEY } from "@/common/constants/storage";
 
 /**
  * The static first-run view (T3 #5971, Option C step 2, plan section 5.6): a copy of the onboarding
@@ -93,3 +94,80 @@ export const FIRST_RUN_VIEW_HTML = `<div id="${FIRST_RUN_VIEW_ID}" inert style="
     <button type="button" class="text-muted hover:text-foreground absolute top-4 right-4 rounded-sm transition-colors focus:outline-none disabled:pointer-events-none"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewbox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-x h-4 w-4" aria-hidden="true"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg><span class="sr-only">Close</span></button>
   </div>
 </div>`;
+
+/** The <template> that holds FIRST_RUN_VIEW_HTML on the served "/" (PR 4b). */
+export const FIRST_RUN_TEMPLATE_ID = "xum-pre-template";
+
+/** `{"script": href, "preload": [href, ...]}`, the app's modules: scripts/perf/firstLoadJs.ts reads it too. */
+const FIRST_RUN_MODULES_ID = "xum-pre-modules";
+
+/**
+ * The early script (plan section 5.6), for an inline <script> on the served "/" after the slashless
+ * redirect, the <base> tag and the module list (PR 4b injects them). Its only timer is the 1,000 ms
+ * abort of its two POSTs. With the paint-cache key set or a hidden tab it loads the app at once,
+ * with no API call. A failed, 401 or aborted POST loads the app with no view, as today. The view
+ * shows only when the wizard opens on the gateway step as captured: not viewed, no configured
+ * provider, and no gateway coupon (a coupon swaps that step's panel). The app then loads two frames
+ * later, or at once when the tab turns hidden. A failed module script removes the view.
+ * SECURITY AUDIT: no request or user data; the view comes from a template clone, never HTML.
+ */
+export const FIRST_RUN_EARLY_SCRIPT = `(() => {
+  const path = location.pathname;
+  if (!path.startsWith("//") && !path.endsWith("/")) return; // the redirect navigates away
+  let loaded = false;
+  const loadApp = () => {
+    if (loaded) return;
+    loaded = true;
+    let list;
+    try {
+      list = JSON.parse(document.getElementById(${JSON.stringify(FIRST_RUN_MODULES_ID)}).textContent);
+      if (typeof list.script !== "string" || !Array.isArray(list.preload)) throw new Error("bad list");
+    } catch (error) { // no list, no app to load: at least drop the view
+      document.getElementById(${JSON.stringify(FIRST_RUN_VIEW_ID)})?.remove();
+      return console.error("first-run view: no usable module list", error);
+    }
+    for (const href of list.preload) {
+      const link = document.createElement("link");
+      Object.assign(link, { rel: "modulepreload", crossOrigin: "", href });
+      document.head.appendChild(link);
+    }
+    const script = document.createElement("script");
+    Object.assign(script, { type: "module", crossOrigin: "", src: list.script });
+    script.addEventListener("error", () => document.getElementById(${JSON.stringify(FIRST_RUN_VIEW_ID)})?.remove());
+    // Unlike the deferred tag it replaces, a dynamic module runs once loaded: wait for #root.
+    const start = () => document.head.appendChild(script);
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start);
+    else start();
+  };
+  const read = (key) => { try { return localStorage.getItem(key); } catch { return null; } };
+  if (read(${JSON.stringify(ONBOARDING_VIEWED_KEY)}) === "true" || document.visibilityState === "hidden") return loadApp();
+  document.addEventListener("visibilitychange", () => document.visibilityState === "hidden" && loadApp());
+  const token = new URLSearchParams(location.search).get("token")?.trim() || read(${JSON.stringify(AUTH_TOKEN_KEY)});
+  const headers = token ? { Authorization: "Bearer " + token } : {};
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), 1000);
+  const post = (route) =>
+    fetch(new URL("api/" + route, document.baseURI), { method: "POST", headers, signal: abort.signal }).then((r) => {
+      if (!r.ok) throw new Error(String(r.status));
+      return r.json();
+    });
+  Promise.all([post("splashScreens/getViewedSplashScreens"), post("providers/getConfig")])
+    .then(([viewed, config]) => {
+      clearTimeout(timer);
+      const providers = Object.values(config ?? {});
+      const show =
+        Array.isArray(viewed) &&
+        !viewed.includes("onboarding-wizard-v1") && // ONBOARDING_WIZARD_SPLASH_ID
+        !providers.some((p) => p?.isConfigured === true) &&
+        config?.["mux-gateway"]?.couponCodeSet !== true;
+      const insert = () => {
+        const template = document.getElementById(${JSON.stringify(FIRST_RUN_TEMPLATE_ID)});
+        if (!show || loaded || !template) return loadApp();
+        document.body.appendChild(template.content.cloneNode(true));
+        requestAnimationFrame(() => requestAnimationFrame(loadApp));
+      };
+      if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", insert);
+      else insert();
+    })
+    .catch(loadApp);
+})();`;

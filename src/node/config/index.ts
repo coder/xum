@@ -37,6 +37,7 @@ import {
   sanitizeModelFallbacks,
 } from "@/common/utils/ai/modelFallbacks";
 import { DEFAULT_TASK_SETTINGS, normalizeTaskSettings } from "@/common/types/tasks";
+import { PREVIOUS_TASK_SETTINGS_DEFAULTS } from "@/common/config/schemas/taskSettings";
 import {
   getDefaultAutoModelRoutingConfig,
   normalizeAutoModelRoutingConfig,
@@ -645,6 +646,40 @@ function normalizeConfigMigrations(value: unknown): AppConfigMigrations {
     }
   }
   return migrations;
+}
+
+/**
+ * Move task limits that still hold PREVIOUS_TASK_SETTINGS_DEFAULTS to the current defaults and
+ * keep every other value. Saves write the normalized settings, so an old default on disk is
+ * almost always Xum's write, not the user's choice. Known limit: a user who picked exactly an
+ * old default is moved once; after the migration flag is set, a value they set back sticks.
+ */
+function raisePreviousTaskSettingsDefaults(raw: unknown): Record<string, unknown> {
+  const record =
+    raw && typeof raw === "object" && !Array.isArray(raw)
+      ? { ...(raw as Record<string, unknown>) }
+      : {};
+  for (const key of ["maxParallelAgentTasks", "maxTaskNestingDepth"] as const) {
+    if (record[key] === PREVIOUS_TASK_SETTINGS_DEFAULTS[key]) {
+      record[key] = DEFAULT_TASK_SETTINGS[key];
+    }
+  }
+  return record;
+}
+
+/**
+ * Run the one-time raised-defaults migration on `parsed` (mutated in place) and return whether
+ * the config now needs a write-back: true when it already did or when this migration ran.
+ */
+function migrateRaisedTaskSettingsDefaults(
+  parsed: Partial<AppConfigOnDisk> & Record<string, unknown>,
+  configModified: boolean
+): boolean {
+  const migrations = normalizeConfigMigrations(parsed.migrations);
+  if (migrations.taskSettingsDefaultsRaised === true) return configModified;
+  parsed.taskSettings = raisePreviousTaskSettingsDefaults(parsed.taskSettings);
+  parsed.migrations = { ...migrations, taskSettingsDefaultsRaised: true };
+  return true;
 }
 
 function parseOptionalPort(value: unknown): number | undefined {
@@ -1963,6 +1998,7 @@ export class Config {
         defaultModelFallbacksSeededFable51: true,
         persistentSubagentsDefaulted: true,
         agentHeartbeatsSeeded: true,
+        taskSettingsDefaultsRaised: true,
       },
     };
   }
@@ -2301,6 +2337,9 @@ export class Config {
       parsed.migrations = { ...heartbeatMigrations, agentHeartbeatsSeeded: true };
       configModified = true;
     }
+    // The task-limit defaults were raised for orchestration fan-out and depth. Configs that
+    // still hold the previous defaults (written by every save) move once; explicit values stay.
+    configModified = migrateRaisedTaskSettingsDefaults(parsed, configModified);
     const taskSettings = normalizeTaskSettings(parsed.taskSettings);
 
     const muxGatewayEnabled = parseOptionalBoolean(parsed.muxGatewayEnabled);

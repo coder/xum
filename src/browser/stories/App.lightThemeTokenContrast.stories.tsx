@@ -15,9 +15,15 @@
  * The dark code stories check every syntax-highlighted token, and every min-dark replacement
  * color, in dark and flexoki-dark on the code block, the diff tints and the review-range
  * highlight (#5983).
+ *
+ * The secondary-text stories check every `--color-secondary` text in dark and flexoki-dark, on
+ * the main surface and in the slash command list (#6021).
+ *
+ * The flexoki-light workspace story and the code stories' branch name check flexoki-light's
+ * muted and secondary token, and the Models story checks light `--color-muted-light` (#5984).
  */
 
-import { expect, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "@storybook/test";
 
 import type { ThemeMode } from "@/browser/contexts/ThemeContext";
 import { getRightSidebarLayoutKey, RIGHT_SIDEBAR_TAB_KEY } from "@/common/constants/storage";
@@ -45,6 +51,7 @@ import { createReview } from "./helpers/reviews";
 import { expandLeftSidebar, expandRightSidebar, selectWorkspace } from "./helpers/uiState";
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
+import { createAgentSkillReadTool } from "./mocks/tools";
 import { createMockORPCClient } from "./mocks/orpc";
 import { seedMockReviewState } from "./mocks/reviewState";
 import { createWorkspace, groupWorkspacesByProject, STABLE_TIMESTAMP } from "./mocks/workspaces";
@@ -165,15 +172,21 @@ async function waitForWorkspace(canvasElement: HTMLElement) {
   );
 }
 
-export const WorkspaceWithSidebars: AppStory = {
-  globals: { theme: "light" },
+const workspaceWithSidebarsStory = (theme: ThemeMode, token: string): AppStory => ({
+  globals: { theme },
   parameters: lightContract,
   render: () => <AppWithMocks setup={() => setupWorkspaceWithSidebars({ flatSidebar: false })} />,
   play: async ({ canvasElement }) => {
     await waitForWorkspace(canvasElement);
-    await expectTokenTextsReadable(canvasElement, { "--color-muted": 3 });
+    await expectTokenTextsReadable(canvasElement, { [token]: 3 });
   },
-};
+});
+
+export const WorkspaceWithSidebars = workspaceWithSidebarsStory("light", "--color-muted");
+export const WorkspaceWithSidebarsFlexokiLight = workspaceWithSidebarsStory(
+  "flexoki-light",
+  "--color-secondary"
+);
 
 // The flat sidebar's header adds "New chat", a `--color-muted` text since #6010 (it was the one
 // `--color-secondary` text on these screens), so it counts toward the muted minimum.
@@ -301,6 +314,30 @@ export const Settings: AppStory = {
   },
 };
 
+/**
+ * Light `--color-muted-light` text in Settings > Models: model rows label their aliases and
+ * limits with it. It now aliases `--color-muted`, so the texts match both tokens (#5984).
+ */
+export const MutedLightModels: AppStory = {
+  globals: { theme: "light" },
+  parameters: lightContract,
+  render: () => <AppWithMocks setup={() => setupSettingsStory({})} />,
+  play: async ({ canvasElement }) => {
+    const dialog = await openSettingsDialog(canvasElement);
+    await userEvent.click(within(dialog).getByRole("button", { name: "Models" }));
+    const found = await waitFor(
+      () => {
+        const texts = tokenTextContrasts(dialog, ["--color-muted-light"]);
+        if (texts.length < 5)
+          throw new Error(`expected 5+ muted-light texts, found ${texts.length}`);
+        return texts;
+      },
+      { timeout: 15_000 }
+    );
+    await expectReadable(found.map((entry) => ({ ...entry, label: entry.token })));
+  },
+};
+
 // ─── Code colors (#5980) and the selected-tab count (#5965) ─────────────────────────────────
 
 const CODE_ANSWER = [
@@ -411,7 +448,7 @@ const selectedTab = (root: HTMLElement) => [
  * screen does not happen to render (for example the warning token) is still proven, including
  * on the review diff's green and red line tints.
  */
-async function expectCodeReadable(canvasElement: HTMLElement, theme: ThemeMode) {
+async function expectCodeReadable(canvasElement: HTMLElement) {
   await within(canvasElement).findByText("Renamed", { exact: false }, { timeout: 15_000 });
   // The diff's added and removed lines carry a green and a red tint over the code background.
   // Look the tokens up on every retry: the diff can highlight after the first 8 tokens render.
@@ -435,14 +472,11 @@ async function expectCodeReadable(canvasElement: HTMLElement, theme: ThemeMode) 
     )
   );
   const tab = await findTexts("selected tab", 2, () => selectedTab(canvasElement));
-  // The branch name shows in the chat header and in the footer's branch selector (text-muted).
-  // Light only: flexoki-light's muted token is 4.47:1 on the footer, a token decision (#5984).
-  const branch =
-    theme === "light"
-      ? await findTexts("branch name", 2, () =>
-          within(canvasElement).queryAllByText("feature/light-code")
-        )
-      : [];
+  // The branch name shows in the chat header and in the footer's branch selector (text-muted),
+  // in both light themes since the flexoki-light muted token change (#5984).
+  const branch = await findTexts("branch name", 2, () =>
+    within(canvasElement).queryAllByText("feature/light-code")
+  );
   await expectReadable([...tokens, ...inlineCode, ...tab, ...branch]);
 
   const replacements = Object.values(SHIKI_COLOR_REPLACEMENTS[SHIKI_LIGHT_THEME]);
@@ -507,7 +541,7 @@ const codeStory = (theme: ThemeMode): AppStory => ({
   // With the seeded review, tokens also sit under the review-range highlight (#6006).
   render: () => <AppWithMocks setup={() => setupCodeWorkspace("review", true)} />,
   play: async ({ canvasElement }) => {
-    await expectCodeReadable(canvasElement, theme);
+    await expectCodeReadable(canvasElement);
   },
 });
 
@@ -589,3 +623,66 @@ const statsStory = (theme: ThemeMode): AppStory => ({
 
 export const StatsLight = statsStory("light");
 export const StatsFlexokiLight = statsStory("flexoki-light");
+
+// ─── Dark secondary text (#6021) ─────────────────────────────────────────────────────────────
+
+/**
+ * A chat with two skill tool calls (secondary text on the main surface) and the slash command
+ * list open (secondary descriptions on its darker rows, the lowest-contrast place it renders).
+ */
+function setupSecondaryTextWorkspace() {
+  return setupSimpleChatStory({
+    workspaceId: "ws-dark-secondary",
+    workspaceName: "feature/dark-secondary",
+    projectName: "my-app",
+    messages: [
+      createUserMessage("u1", "Write tests for this component.", {
+        historySequence: 1,
+        timestamp: STABLE_TIMESTAMP - 60_000,
+      }),
+      createAssistantMessage("a1", "Loading the project skills first.", {
+        historySequence: 2,
+        timestamp: STABLE_TIMESTAMP - 50_000,
+        toolCalls: [
+          createAgentSkillReadTool("tc-1", "tests", {
+            description: "Testing doctrine, commands, and test layout conventions",
+            scope: "project",
+          }),
+          createAgentSkillReadTool("tc-2", "react-effects", {
+            description: "Guidelines for when to use (and avoid) useEffect in React",
+            scope: "project",
+          }),
+        ],
+      }),
+    ],
+  });
+}
+
+const darkSecondaryStory = (theme: ThemeMode): AppStory => ({
+  globals: { theme },
+  parameters: lightContract,
+  render: () => <AppWithMocks setup={setupSecondaryTextWorkspace} />,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const composer = await canvas.findByRole("textbox", { name: "Message" }, { timeout: 15_000 });
+    await userEvent.click(composer);
+    await userEvent.keyboard("/");
+    const body = canvasElement.ownerDocument.body;
+    await within(body).findByRole("listbox", { name: "Slash command suggestions" });
+    // The list renders outside the canvas, so check the whole document.
+    const found = await waitFor(
+      () => {
+        const texts = tokenTextContrasts(body, ["--color-secondary"]);
+        // Two tool calls plus the command descriptions; an empty screen must not pass.
+        if (texts.length < 10)
+          throw new Error(`expected 10+ secondary texts, found ${texts.length}`);
+        return texts;
+      },
+      { timeout: 15_000 }
+    );
+    await expectReadable(found.map((entry) => ({ ...entry, label: entry.token })));
+  },
+});
+
+export const SecondaryTextDark = darkSecondaryStory("dark");
+export const SecondaryTextFlexokiDark = darkSecondaryStory("flexoki-dark");

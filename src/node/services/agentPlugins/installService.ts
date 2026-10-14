@@ -42,6 +42,7 @@ import {
   resolveSkillAdvertise,
   resolveSkillWhenToUse,
 } from "@/common/orpc/schemas/agentSkill";
+import { resolveSkillPaths } from "@/common/utils/skills/skillPaths";
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
 import { log } from "@/node/services/log";
 import type { MCPServerInfo, MCPServerOAuthConfig } from "@/common/types/mcp";
@@ -76,6 +77,7 @@ import {
   type AgentPluginInfo,
 } from "./discovery";
 import { checkLogoImage } from "./imageHeader";
+import type { OpenAIPluginInterface } from "./openaiExtension";
 import {
   acquirePluginMutationLock,
   bumpContainerMutationEpoch,
@@ -200,7 +202,47 @@ function stableStringify(value: unknown): string {
 type CollectedPluginSkill = AgentPluginPreviewSkill & {
   whenToUse?: string;
   advertise?: boolean;
+  paths?: string[];
 };
+
+/**
+ * EVERY model-visible advertisement field of a plugin skill: description, whenToUse
+ * (both interpolate into the agent_skill_read tool description on each request),
+ * advertise (a flip from hidden to visible surfaces a previously invisible skill), and
+ * paths (which files surface it). Changing any of them is re-consent territory, same as
+ * adding a skill. The fingerprint stays JSON (field boundaries are unambiguous); the
+ * display rendering is NOT used for comparison because a multi-line description could
+ * imitate it.
+ */
+function describeSkillAdvertisement(skill: CollectedPluginSkill): {
+  fingerprint: string;
+  display: string;
+} {
+  return {
+    fingerprint: JSON.stringify({
+      description: skill.description ?? null,
+      whenToUse: skill.whenToUse ?? null,
+      advertise: skill.advertise ?? null,
+      // Only path-scoped skills carry the key, so fingerprints of existing
+      // skills stay byte-identical (no spurious re-consent on update). Patterns
+      // are OR-ed, so order is irrelevant: sort a copy so a reorder needs no consent.
+      ...(skill.paths !== undefined ? { paths: [...skill.paths].sort() } : {}),
+    }),
+    display: formatSkillAdvertisementDisplay(skill),
+  };
+}
+
+/** The advertisement as the model sees it, shown in the update review. */
+function formatSkillAdvertisementDisplay(skill: CollectedPluginSkill): string {
+  return [
+    skill.description ?? "(no description)",
+    ...(skill.whenToUse !== undefined ? [`When to use: ${skill.whenToUse}`] : []),
+    ...(skill.advertise === false ? ["(not advertised to the model)"] : []),
+    // Declared scope only: this text makes no claim about how the scope is enforced.
+    // JSON quoting keeps entries unambiguous: ["a, b"] and ["a", "b"] render differently.
+    ...(skill.paths !== undefined ? [`Declared paths: ${JSON.stringify(skill.paths)}`] : []),
+  ].join("\n");
+}
 
 /** Result of resolving a user-supplied ref against the remote. */
 interface ResolvedRemoteRef {
@@ -594,9 +636,66 @@ const LOGO_MIME_BY_EXTENSION: Record<string, string> = {
 };
 
 /**
- * UI projection of the OpenAI `interface`. SECURITY AUDIT: the logo crosses
- * to the renderer only as a data URL read through the contained, capped
- * reader (a symlink out of the plugin root fails there); never a file path.
+ * One manifest image as a data URL, or undefined (with a warning) when it is
+ * missing, not a raster type, or refused by the reader or the header check.
+ * SECURITY AUDIT: the image crosses to the renderer only as a data URL read
+ * through the contained, capped reader (a symlink out of the plugin root fails
+ * there); never a file path.
+ */
+async function readLogoDataUrl(
+  rootPath: string,
+  logoPath: string | undefined,
+  label: string,
+  warnings: string[]
+): Promise<string | undefined> {
+  if (logoPath === undefined) return undefined;
+  const mime = getOwn(LOGO_MIME_BY_EXTENSION, path.extname(logoPath).toLowerCase());
+  if (mime === undefined) {
+    warnings.push(`${label} '${logoPath}' must be a PNG, JPEG or WebP image; ignoring`);
+    return undefined;
+  }
+  try {
+    // The contained reader also refuses a link into the staged clone's .git
+    // (ensurePluginPathContained, #6161), so no separate check is needed here.
+    const { bytes } = await readPluginFileWithinRootCapped({
+      filePath: path.join(rootPath, logoPath),
+      pluginRoot: rootPath,
+      maxBytes: LOGO_MAX_BYTES,
+      label,
+    });
+    // SECURITY AUDIT: bounded decoded size (a tiny compressed file can decode to
+    // hundreds of MB in the renderer) and no animation, from the header alone.
+    const refusal = checkLogoImage(bytes, mime);
+    if (refusal !== null) throw new Error(refusal);
+    return `data:${mime};base64,${bytes.toString("base64")}`;
+  } catch (error) {
+    warnings.push(`${label} '${logoPath}' cannot be shown: ${getErrorMessage(error)}`);
+    return undefined;
+  }
+}
+
+/**
+ * The light and dark image paths. OpenAI defines each dark field as the
+ * variant of its own light field (`logoDark` of `logo`, `composerIconDark` of
+ * `composerIcon`), so the dark path comes from the same family as the light
+ * one: a dark composer icon must not replace the listing logo in dark themes.
+ * Only with no light image at all does either dark field stand in.
+ */
+function logoPaths(info: OpenAIPluginInterface): { light?: string; dark?: string } {
+  if (info.logo !== undefined) return { light: info.logo, dark: info.logoDark };
+  if (info.composerIcon !== undefined) {
+    return { light: info.composerIcon, dark: info.composerIconDark };
+  }
+  return { dark: info.logoDark ?? info.composerIconDark };
+}
+
+/**
+ * UI projection of the OpenAI `interface`. The renderer picks the logo by
+ * theme (`logoDark`/`composerIconDark` are OpenAI's dark-theme variants) and
+ * falls back to the other one when a read fails. Budget: at most two
+ * LOGO_MAX_BYTES images per plugin (about 1.4 MiB as base64). list() is a local
+ * IPC call that Settings makes on open, the installed plugin count is the
+ * user's, and nothing here reaches model context, so no shared cap is needed.
  */
 async function interfaceSummary(
   plugin: Pick<AgentPluginInfo, "rootPath" | "openai">,
@@ -604,33 +703,14 @@ async function interfaceSummary(
 ): Promise<AgentPluginInterfaceSummary | undefined> {
   const info = plugin.openai?.interface;
   if (info === undefined) return undefined;
-  const logoPath = info.logo ?? info.composerIcon;
-  let logoDataUrl: string | undefined;
-  const mime =
-    logoPath === undefined
-      ? undefined
-      : getOwn(LOGO_MIME_BY_EXTENSION, path.extname(logoPath).toLowerCase());
-  if (logoPath !== undefined && mime === undefined) {
-    warnings.push(`Plugin logo '${logoPath}' must be a PNG, JPEG or WebP image; ignoring`);
-  } else if (logoPath !== undefined && mime !== undefined) {
-    try {
-      // The contained reader also refuses a link into the staged clone's .git
-      // (ensurePluginPathContained, #6161), so no separate check is needed here.
-      const { bytes } = await readPluginFileWithinRootCapped({
-        filePath: path.join(plugin.rootPath, logoPath),
-        pluginRoot: plugin.rootPath,
-        maxBytes: LOGO_MAX_BYTES,
-        label: "Plugin logo",
-      });
-      // SECURITY AUDIT: bounded decoded size (a tiny compressed file can decode to
-      // hundreds of MB in the renderer) and no animation, from the header alone.
-      const refusal = checkLogoImage(bytes, mime);
-      if (refusal !== null) throw new Error(refusal);
-      logoDataUrl = `data:${mime};base64,${bytes.toString("base64")}`;
-    } catch (error) {
-      warnings.push(`Plugin logo '${logoPath}' cannot be shown: ${getErrorMessage(error)}`);
-    }
-  }
+  const paths = logoPaths(info);
+  const logoDataUrl = await readLogoDataUrl(plugin.rootPath, paths.light, "Plugin logo", warnings);
+  const logoDarkDataUrl = await readLogoDataUrl(
+    plugin.rootPath,
+    paths.dark,
+    "Plugin dark logo",
+    warnings
+  );
   return {
     displayName: info.displayName,
     developerName: info.developerName,
@@ -641,6 +721,7 @@ async function interfaceSummary(
     ...(info.termsOfServiceURL !== undefined ? { termsOfServiceURL: info.termsOfServiceURL } : {}),
     ...(info.supportURL !== undefined ? { supportURL: info.supportURL } : {}),
     ...(logoDataUrl !== undefined ? { logoDataUrl } : {}),
+    ...(logoDarkDataUrl !== undefined ? { logoDarkDataUrl } : {}),
   };
 }
 
@@ -1496,25 +1577,7 @@ export class AgentPluginInstallService {
     const readSecret = createSecretReader();
     const skills = new Map<string, { fingerprint: string; display: string }>();
     for (const skill of await this.collectSkills(plugin, warnings)) {
-      // EVERY model-visible advertisement field: description, whenToUse
-      // (both interpolate into the agent_skill_read tool description on each
-      // request), and advertise (a flip from hidden to visible surfaces a
-      // previously invisible skill). Changing any of them is re-consent
-      // territory, same as adding a skill. The fingerprint stays JSON (field
-      // boundaries are unambiguous); the display rendering is NOT used for
-      // comparison because a multi-line description could imitate it.
-      skills.set(skill.name, {
-        fingerprint: JSON.stringify({
-          description: skill.description ?? null,
-          whenToUse: skill.whenToUse ?? null,
-          advertise: skill.advertise ?? null,
-        }),
-        display: [
-          skill.description ?? "(no description)",
-          ...(skill.whenToUse !== undefined ? [`When to use: ${skill.whenToUse}`] : []),
-          ...(skill.advertise === false ? ["(not advertised to the model)"] : []),
-        ].join("\n"),
-      });
+      skills.set(skill.name, describeSkillAdvertisement(skill));
     }
     const agents = new Map<string, string>();
     for (const agent of await this.collectAgentFiles(plugin.agentsDir)) {
@@ -1929,6 +1992,8 @@ export class AgentPluginInstallService {
           // the same helpers the runtime uses.
           whenToUse: resolveSkillWhenToUse(parsed.frontmatter),
           advertise: resolveSkillAdvertise(parsed.frontmatter),
+          // paths moves the skill from the static index to file-tool pointers.
+          paths: resolveSkillPaths(parsed.frontmatter),
         });
       } catch (error) {
         warnings.push(`skills/${dirName}: ${getErrorMessage(error)}`);

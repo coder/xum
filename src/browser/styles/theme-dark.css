@@ -71,7 +71,10 @@
     --color-content-tertiary: hsla(240, 5%, 34%);
     --color-content-disabled: hsl(240, 5%, 26%);
     --color-muted-foreground: hsl(0 0% 60%);
-    --color-secondary: hsl(0 0% 42%);
+    /* Lightened to reach WCAG AA (4.5:1) on the dark surfaces, down to the slash command rows
+       (#262626, 5.05:1) (#6021). It is now lighter than --color-muted (53%): the user accepted
+       that order change for AA. Also reaches the VS Code webview, which imports this file. */
+    --color-secondary: #969696;
     --color-surface-primary: hsla(240, 10%, 4%, 1);
     --color-surface-secondary: hsla(240, 6%, 10%, 1);
     --color-content-destructive: hsla(0, 91%, 71%, 1);

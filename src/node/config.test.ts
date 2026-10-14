@@ -14,6 +14,10 @@ import {
 import { acquireProcessFileLock } from "./utils/concurrency/fileLock";
 import { AppConfigOnDiskSchema } from "@/common/config/schemas/appConfigOnDisk";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
+import {
+  PREVIOUS_TASK_SETTINGS_DEFAULTS,
+  TASK_SETTINGS_LIMITS,
+} from "@/common/config/schemas/taskSettings";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS } from "@/common/constants/workspace";
@@ -780,6 +784,96 @@ describe("Config", () => {
         taskSettings?: { preserveSubagentsUntilArchive?: boolean };
       };
       expect(persisted.taskSettings?.preserveSubagentsUntilArchive).toBe(true);
+    });
+  });
+
+  describe("raised task-limit defaults migration", () => {
+    const writeTaskSettings = (
+      taskSettings: Record<string, unknown> | undefined,
+      migrations?: Record<string, boolean>
+    ) => {
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({ projects: [], taskSettings, migrations })
+      );
+    };
+    const readPersisted = () =>
+      JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        taskSettings?: { maxParallelAgentTasks?: number; maxTaskNestingDepth?: number };
+        migrations?: { taskSettingsDefaultsRaised?: boolean };
+      };
+
+    it("moves limits Xum wrote at the previous defaults to the new defaults once", async () => {
+      writeTaskSettings({ ...PREVIOUS_TASK_SETTINGS_DEFAULTS });
+
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.taskSettings?.maxParallelAgentTasks).toBe(
+        TASK_SETTINGS_LIMITS.maxParallelAgentTasks.default
+      );
+      expect(loaded.taskSettings?.maxTaskNestingDepth).toBe(
+        TASK_SETTINGS_LIMITS.maxTaskNestingDepth.default
+      );
+
+      await flushConfigEdits();
+      const persisted = readPersisted();
+      expect(persisted.taskSettings?.maxParallelAgentTasks).toBe(
+        TASK_SETTINGS_LIMITS.maxParallelAgentTasks.default
+      );
+      expect(persisted.taskSettings?.maxTaskNestingDepth).toBe(
+        TASK_SETTINGS_LIMITS.maxTaskNestingDepth.default
+      );
+      expect(persisted.migrations?.taskSettingsDefaultsRaised).toBe(true);
+    });
+
+    it.each([
+      [8, 2],
+      [64, 4],
+      // One field at the old default, the other explicit: only the old default moves.
+      [PREVIOUS_TASK_SETTINGS_DEFAULTS.maxParallelAgentTasks, 1],
+    ] as const)("keeps an explicit choice (%d parallel, depth %d)", async (parallel, depth) => {
+      writeTaskSettings({ maxParallelAgentTasks: parallel, maxTaskNestingDepth: depth });
+
+      config.loadConfigOrDefault();
+      await flushConfigEdits();
+
+      const persisted = readPersisted();
+      const expectedParallel =
+        parallel === PREVIOUS_TASK_SETTINGS_DEFAULTS.maxParallelAgentTasks
+          ? TASK_SETTINGS_LIMITS.maxParallelAgentTasks.default
+          : parallel;
+      expect(persisted.taskSettings?.maxParallelAgentTasks).toBe(expectedParallel);
+      expect(persisted.taskSettings?.maxTaskNestingDepth).toBe(depth);
+      expect(new Config(tempDir).loadConfigOrDefault().taskSettings?.maxTaskNestingDepth).toBe(
+        depth
+      );
+    });
+
+    it("keeps the previous default values a user sets after the migration ran", () => {
+      writeTaskSettings(
+        { ...PREVIOUS_TASK_SETTINGS_DEFAULTS },
+        { taskSettingsDefaultsRaised: true }
+      );
+
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.taskSettings?.maxParallelAgentTasks).toBe(
+        PREVIOUS_TASK_SETTINGS_DEFAULTS.maxParallelAgentTasks
+      );
+      expect(loaded.taskSettings?.maxTaskNestingDepth).toBe(
+        PREVIOUS_TASK_SETTINGS_DEFAULTS.maxTaskNestingDepth
+      );
+    });
+
+    it("gives a fresh install the new defaults and records the migration on first save", async () => {
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.taskSettings?.maxParallelAgentTasks).toBe(
+        TASK_SETTINGS_LIMITS.maxParallelAgentTasks.default
+      );
+      expect(loaded.taskSettings?.maxTaskNestingDepth).toBe(
+        TASK_SETTINGS_LIMITS.maxTaskNestingDepth.default
+      );
+
+      await flushConfigEdits();
+      expect(readPersisted().migrations?.taskSettingsDefaultsRaised).toBe(true);
     });
   });
 
