@@ -158,6 +158,25 @@ describe.each([...GAP_MODES])("DirectoryPickerModal across a reconnect (%s)", (m
     expect(input.value).toBe("/home");
   });
 
+  test("a load that loses the connection keeps the shown tree", async () => {
+    const { view, input } = renderPicker();
+    await view.findByText("b");
+
+    held["/home/b"] = new Promise<void>(() => undefined);
+    fireEvent.click(view.getByText("b"));
+    await waitFor(() => expect(listed).toEqual(["/home", "/home/b"]));
+    await harness.drop();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    });
+    expect(view.queryByText("b")).not.toBeNull();
+    expect(input.value).toBe("/home");
+
+    delete held["/home/b"];
+    harness.reconnect();
+    await waitFor(() => expect(listed).toEqual(["/home", "/home/b", "/home"]));
+  });
+
   // Add Project loads its default clone directory after a reconnect, which changes initialPath.
   test("a new initialPath while open keeps the typed path", async () => {
     const { input, rerender } = renderPicker("~");

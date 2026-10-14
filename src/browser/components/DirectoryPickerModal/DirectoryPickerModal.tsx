@@ -13,6 +13,7 @@ import { Input } from "@/browser/components/Input/Input";
 import type { FileTreeNode } from "@/common/utils/git/numstatParser";
 import { DirectoryTree } from "../DirectoryTree/DirectoryTree";
 import { useLiveAPI } from "@/browser/contexts/API";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { formatKeybind, isMac } from "@/browser/utils/ui/keybinds";
 import { getErrorMessage } from "@/common/utils/errors";
 
@@ -124,6 +125,12 @@ export const DirectoryPickerModal: React.FC<DirectoryPickerModalProps> = ({
         setSelection({ index: 0, path: null });
       } catch (err) {
         if (seq !== loadSeqRef.current) return;
+        // A lost connection says nothing about the directory: keep the shown tree, and the
+        // reconnect reloads it (#6383).
+        if (isConnectionLostError(err)) {
+          setError("Not connected to server");
+          return;
+        }
         const message = getErrorMessage(err);
         setError(`Failed to load directory: ${message}`);
         setRoot(null);
