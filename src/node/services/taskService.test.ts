@@ -11,6 +11,8 @@ import { recordAgentWorkflowRunReference } from "@/node/services/agentWorkflowRu
 import { Ok, Err, type Result } from "@/common/types/result";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
+import { TOOL_TEXT_PAGE_MAX_CHARS } from "@/common/constants/toolLimits";
+import { pageTaskReportForResult } from "@/common/utils/tools/pageToolText";
 import type { SendMessageError } from "@/common/types/errors";
 import { createMuxMessage } from "@/common/types/message";
 import { type DynamicToolPart } from "@/common/types/toolParts";
@@ -500,6 +502,78 @@ describe("TaskService", () => {
           }
         );
       }
+    }
+
+    // A foreground workspace turn (and a task_await read) returns one page of a long report.
+    // The page proves delivery only when it is that exact report's text at the page's offset.
+    const longTurnReport = `${"a".repeat(TOOL_TEXT_PAGE_MAX_CHARS)}${"b".repeat(1_000)}`;
+    const firstTurnPage = pageTaskReportForResult("wst_paged", longTurnReport, undefined);
+    const lastTurnPage = pageTaskReportForResult(
+      "wst_paged",
+      longTurnReport,
+      firstTurnPage.nextCharOffset
+    );
+    for (const [name, toolName, page, expectedWakes] of [
+      [
+        "a foreground first page with its continuation note",
+        "task",
+        {
+          reportMarkdown: firstTurnPage.text,
+          nextCharOffset: firstTurnPage.nextCharOffset,
+          note: firstTurnPage.note,
+        },
+        0,
+      ],
+      [
+        "a task_await continuation page",
+        "task_await",
+        { reportMarkdown: lastTurnPage.text, startCharOffset: lastTurnPage.startCharOffset },
+        0,
+      ],
+      [
+        "a page of a different report",
+        "task",
+        {
+          reportMarkdown: "c".repeat(TOOL_TEXT_PAGE_MAX_CHARS),
+          nextCharOffset: TOOL_TEXT_PAGE_MAX_CHARS,
+        },
+        1,
+      ],
+      [
+        "a page at another offset",
+        "task_await",
+        { reportMarkdown: lastTurnPage.text, startCharOffset: 0 },
+        1,
+      ],
+    ] satisfies Array<[string, string, Record<string, unknown>, number]>) {
+      test("paged workspace-turn receipt: " + name, async () => {
+        const record = workspaceTurnRecord("owner", taskId, "wst_paged", "completed", {
+          messageId: "workspace-final",
+          reportMarkdown: longTurnReport,
+        });
+        const fixture = await setup({
+          generationId: [record.handleId, record.status, record.updatedAt].join(":"),
+        });
+        await new TaskHandleStore(fixture.config).upsertWorkspaceTurn({
+          ...record,
+          ownerWorkspaceId: fixture.parentId,
+        });
+        const receipt = {
+          status: "completed",
+          taskId: record.handleId,
+          handleKind: "workspace_turn",
+          workspaceId: taskId,
+          messageId: record.messageId,
+          ...page,
+        };
+        fixture.assistant.parts = [
+          toolPart(toolName, toolName === "task" ? receipt : { results: [receipt] }),
+        ];
+        await fixture.historyService.updateHistory(fixture.parentId, fixture.assistant);
+        await fixture.drain();
+        await fixture.drain();
+        expect(fixture.resumeStream).toHaveBeenCalledTimes(expectedWakes);
+      });
     }
 
     test("reconciles a covered response in the drain without a stream-end callback", async () => {

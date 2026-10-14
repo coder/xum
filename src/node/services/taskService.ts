@@ -1716,7 +1716,36 @@ type CompletedTaskReportReceipt =
       handleId?: string;
       messageId: string;
       reportMarkdown: string;
+      /** Where reportMarkdown starts in the full report, when the row is one paged page. */
+      pageOffset?: number;
     };
+
+/**
+ * A paged row (task_await, or a foreground task since #6427) holds one page of a long report:
+ * its pageOffset is its startCharOffset, 0 for a first page that only carries nextCharOffset.
+ * Undefined for a whole report.
+ */
+function readReportPageOffset(row: Record<string, unknown>): number | undefined {
+  if (typeof row.startCharOffset === "number") return row.startCharOffset;
+  return typeof row.nextCharOffset === "number" ? 0 : undefined;
+}
+
+/**
+ * Whether a continuation receipt shows the owner this exact report: the whole text, or any
+ * non-empty page of it at the page's own offset. Reading one page (with its continuation note)
+ * delivers the result, so its terminal notification must not wake the owner again.
+ */
+function receiptMatchesReport(
+  receipt: Extract<CompletedTaskReportReceipt, { kind: "continuation" }>,
+  reportMarkdown: string | undefined
+): boolean {
+  if (receipt.reportMarkdown === reportMarkdown) return true;
+  if (reportMarkdown == null || receipt.pageOffset == null) return false;
+  return (
+    receipt.reportMarkdown.length > 0 &&
+    reportMarkdown.startsWith(receipt.reportMarkdown, receipt.pageOffset)
+  );
+}
 
 /** Read only canonical task-result containers, never arbitrary JSON or prose. */
 function completedTaskReports(toolName: unknown, output: unknown): CompletedTaskReportReceipt[] {
@@ -1747,7 +1776,14 @@ function completedTaskReports(toolName: unknown, output: unknown): CompletedTask
     if (taskId == null) return [];
     if (typeof messageId === "string") {
       return [
-        { kind: "continuation", taskId, handleId, messageId, reportMarkdown: row.reportMarkdown },
+        {
+          kind: "continuation",
+          taskId,
+          handleId,
+          messageId,
+          reportMarkdown: row.reportMarkdown,
+          pageOffset: readReportPageOffset(row),
+        },
       ];
     }
     return handleId == null
@@ -13211,7 +13247,7 @@ export class TaskService implements AgentTaskIntegration {
                   report.kind === "continuation" &&
                   (report.handleId == null || report.handleId === record.handleId) &&
                   report.messageId === record.messageId &&
-                  report.reportMarkdown === record.reportMarkdown
+                  receiptMatchesReport(report, record.reportMarkdown)
               );
           }
         }
