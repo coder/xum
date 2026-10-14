@@ -1662,7 +1662,8 @@ export const MCPSettingsSection: React.FC = () => {
 
         {/* Add server form */}
         <details className="group mt-3">
-          <summary className="text-accent-text hover:text-accent-text/80 flex cursor-pointer list-none items-center gap-1 text-sm font-medium">
+          {/* Hover underlines instead of fading: 80% accent text fell below 4.5:1 on the dialog (#5946). */}
+          <summary className="text-accent-text flex cursor-pointer list-none items-center gap-1 text-sm font-medium hover:underline">
             <ChevronRight className="h-4 w-4 transition-transform group-open:rotate-90" />
             Add server
           </summary>
