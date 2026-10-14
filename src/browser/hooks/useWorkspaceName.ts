@@ -12,6 +12,7 @@ import {
   getWorkspaceNameStateKey,
 } from "@/common/constants/storage";
 import type { NameGenerationError } from "@/common/types/errors";
+import type { WorkspaceNameGenerationRequest } from "@/common/orpc/schemas/api";
 import {
   validateWorkspaceBranchName,
   validateWorkspaceName,
@@ -87,12 +88,6 @@ export interface WorkspaceNameState {
   setAutoGenerate: (enabled: boolean) => void;
   /** Set manual name (for when auto-generate is off) */
   setName: (name: string) => void;
-}
-
-/** What workspace.create's nameGeneration needs to name the workspace in the backend. */
-export interface WorkspaceNameGenerationRequest {
-  message: string;
-  candidates: string[];
 }
 
 export interface UseWorkspaceNameReturn extends WorkspaceNameState {

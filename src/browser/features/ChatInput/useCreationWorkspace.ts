@@ -73,9 +73,9 @@ import {
   getNameFromPersistedState,
   useWorkspaceName,
   type UseWorkspaceNameReturn,
-  type WorkspaceNameGenerationRequest,
   type WorkspaceNameState,
 } from "@/browser/hooks/useWorkspaceName";
+import type { WorkspaceNameGenerationRequest } from "@/common/orpc/schemas/api";
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import {

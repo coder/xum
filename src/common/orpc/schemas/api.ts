@@ -2792,6 +2792,9 @@ export const workspace = {
 };
 
 export type WorkspaceSendMessageOutput = z.infer<typeof workspace.sendMessage.output>;
+export type WorkspaceNameGenerationRequest = NonNullable<
+  z.infer<typeof workspace.create.input>["nameGeneration"]
+>;
 export type ArchiveLossyUntrackedFilesConfirmation = z.infer<
   typeof ArchiveLossyUntrackedFilesConfirmationSchema
 >;

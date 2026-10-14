@@ -416,6 +416,7 @@ import type {
   ArchivePreflightResult,
   ArchiveWorkspaceResult,
   BackgroundProcessInfo,
+  WorkspaceNameGenerationRequest,
 } from "@/common/orpc/schemas/api";
 import type { SessionTimingService } from "@/node/services/sessionTimingService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
@@ -1111,12 +1112,6 @@ function logRegistrationRollbackFailure(workspaceId: string, error: unknown): vo
 interface CreationRollbackResult {
   entryGone: boolean;
   leftovers: string[];
-}
-
-/** What a creation that names its workspace in the backend (create's nameGeneration) asks for. */
-interface CreationNamingRequest {
-  message: string;
-  candidates: string[];
 }
 
 /** The backend naming of a workspace created before its generated name existed. */
@@ -6421,7 +6416,7 @@ export class WorkspaceService
        * Name the workspace after announcing it (see startCreationNaming): it opens under the
        * provisional "workspace-N" name, and its branch is renamed before the init hook runs.
        */
-      nameGeneration?: CreationNamingRequest;
+      nameGeneration?: WorkspaceNameGenerationRequest;
     }
   ): Promise<Result<{ metadata: FrontendWorkspaceMetadata; createdBranch?: boolean }>> {
     const defaultConsent = options?.defaultUnrelatedConsent ?? "after-setup";
@@ -10690,7 +10685,7 @@ export class WorkspaceService
 
   /** create()'s preflight for nameGeneration; returns the refusal, if any. */
   private refuseCreationNaming(
-    request: CreationNamingRequest | undefined,
+    request: WorkspaceNameGenerationRequest | undefined,
     branchName: string | undefined,
     title: string | undefined,
     runtimeConfig: RuntimeConfig
@@ -10720,7 +10715,7 @@ export class WorkspaceService
    */
   private startCreationNaming(
     workspaceId: string,
-    request: CreationNamingRequest | undefined,
+    request: WorkspaceNameGenerationRequest | undefined,
     initAbortSignal: AbortSignal
   ): CreationNaming | undefined {
     if (request === undefined) return undefined;
@@ -10773,7 +10768,7 @@ export class WorkspaceService
   }
 
   private async generateCreationIdentity(
-    request: CreationNamingRequest,
+    request: WorkspaceNameGenerationRequest,
     signal: AbortSignal,
     namingAbort: AbortController
   ): Promise<Result<GenerateWorkspaceIdentityResult, string>> {
