@@ -27,6 +27,19 @@ export function requireTestModule<T>(modulePath: string): T {
 }
 
 /**
+ * The text of a queried element, or null when the query found nothing.
+ *
+ * Assert "element is gone" as `expect(textOf(view.queryBy...(...))).toBeNull()`, never
+ * `expect(element).toBeNull()`. A failing Bun matcher formats a happy-dom element with its
+ * whole window graph (about 1M lines, 0.5-13 s per failure). Inside `waitFor` the early
+ * checks are expected to fail, so two such checks used up the 1 s waitFor budget and made
+ * the OutputTab and UpdateRestartOverlay tests flaky (#6443). A string fails in microseconds.
+ */
+export function textOf(element: Element | null): string | null {
+  return element === null ? null : (element.textContent ?? "");
+}
+
+/**
  * Helper type for recursive partial mocks.
  * Allows partial mocking of nested objects and async functions.
  */

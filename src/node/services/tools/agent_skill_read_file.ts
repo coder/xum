@@ -5,7 +5,7 @@ import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools"
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
-import { SkillNameSchema } from "@/common/orpc/schemas";
+import { parseSkillLookupName } from "@/common/utils/agentSkills/skillLookupName";
 import { readAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
 import { readPluginFileWithinRootCapped } from "@/node/services/agentPlugins/discovery";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
@@ -141,11 +141,11 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
       });
 
       // Defensive: validate again even though inputSchema should guarantee shape.
-      const parsedName = SkillNameSchema.safeParse(name);
-      if (!parsedName.success) {
+      const lookup = parseSkillLookupName(name);
+      if (lookup == null) {
         return {
           success: false,
-          error: parsedName.error.message,
+          error: `Invalid skill name: ${name}`,
         };
       }
 
@@ -157,20 +157,16 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
           };
         }
 
-        const resolvedSkill = await readAgentSkill(
-          skillCtx.runtime,
-          skillCtx.workspacePath,
-          parsedName.data,
-          {
-            roots: skillCtx.roots,
-            containment: skillCtx.containment,
-            includeClaudeSkills,
-          }
-        );
+        const resolvedSkill = await readAgentSkill(skillCtx.runtime, skillCtx.workspacePath, name, {
+          roots: skillCtx.roots,
+          containment: skillCtx.containment,
+          includeClaudeSkills,
+        });
 
         // Built-in skills are embedded in the app bundle (no filesystem access).
         if (resolvedSkill.package.scope === "built-in") {
-          const builtIn = readBuiltInSkillFile(parsedName.data, filePath);
+          assert(lookup.pluginName == null, "qualified skill lookups never resolve to built-ins");
+          const builtIn = readBuiltInSkillFile(lookup.skillName, filePath);
           return readContentWithFileReadLimits({
             fullContent: builtIn.content,
             fileSize: Buffer.byteLength(builtIn.content, "utf-8"),

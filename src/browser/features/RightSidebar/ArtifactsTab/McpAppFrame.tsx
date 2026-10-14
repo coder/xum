@@ -9,6 +9,7 @@ import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
 import { getErrorMessage } from "@/common/utils/errors";
+import { PlatformPaths } from "@/common/utils/paths";
 import { mcpServerConsentName, mcpServerDisplayName } from "@/common/utils/mcp/pluginServerKey";
 import { createBridgeRateLimiter, passesFrameGate } from "./artifactBridge";
 import { finalizeSandboxedDocument, parseArtifactHtml } from "./artifactDocument";
@@ -169,6 +170,8 @@ function inlineMaxHeight(): number {
  */
 function DomainsPrompt(props: {
   origins: readonly string[];
+  /** The project that keeps the approval (approvalProjectPathOf), named in the prompt. */
+  projectPath: string | null;
   /** False while Xum reconnects: Allow waits for a live client. */
   canAllow: boolean;
   /** Resolves with the error of a failed approval, or null. */
@@ -200,9 +203,7 @@ function DomainsPrompt(props: {
         role="alert"
         className="border-border-light bg-background-secondary flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-xs"
       >
-        <div className="text-foreground min-w-0 flex-1 break-words">
-          This view wants to reach: {props.origins.map((origin) => new URL(origin).host).join(", ")}
-        </div>
+        <DomainsPromptText origins={props.origins} projectPath={props.projectPath} />
         <button
           type="button"
           // Disabled briefly after the strip appears (confirmArming.ts), like the consent strip.
@@ -224,6 +225,23 @@ function DomainsPrompt(props: {
         </button>
       </div>
     </>
+  );
+}
+
+/** The domain prompt's text: the origins, and the project that keeps the approval. */
+function DomainsPromptText(props: { origins: readonly string[]; projectPath: string | null }) {
+  return (
+    <div className="text-foreground min-w-0 flex-1 break-words">
+      This view wants to reach: {props.origins.map((origin) => new URL(origin).host).join(", ")}
+      {/* For a task of a multi-project workspace this is the first project, not the task's own
+          (approvalProjectPathOf). */}
+      {props.projectPath != null && (
+        <span className="text-muted">
+          {" "}
+          (for project {PlatformPaths.getProjectName(props.projectPath)})
+        </span>
+      )}
+    </div>
   );
 }
 
@@ -567,6 +585,7 @@ export function McpAppFrame(props: {
         <DomainsPrompt
           key={toolCallId}
           origins={domainsPrompt}
+          projectPath={approvalProjectPath}
           canAllow={liveApi != null}
           allow={() => allowDomains(domainsPrompt)}
           onNotNow={() => setDomainsDismissed(toolCallId)}

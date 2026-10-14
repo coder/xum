@@ -1,6 +1,7 @@
 import { describe, it, expect } from "bun:test";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { getSlashCommandSuggestions } from "./suggestions";
+import { listInvocableSkills } from "@/common/utils/agentSkills/skillLookupName";
 import { resolveSlashCommandExperimentValue } from "./experimentVisibility";
 
 describe("resolveSlashCommandExperimentValue", () => {
@@ -212,6 +213,26 @@ describe("getSlashCommandSuggestions", () => {
     });
 
     expect(suggestions.map((s) => s.display)).toContain("/deep-review");
+  });
+
+  it("lists a shadowed plugin skill qualified and matches its skill segment", () => {
+    const tdd = { name: "tdd", description: "Test", scope: "global" as const };
+    const agentSkills = listInvocableSkills({
+      skills: [tdd],
+      shadowedPluginSkills: [
+        { ...tdd, pluginName: "pstack" },
+        { ...tdd, pluginName: "other" },
+      ],
+    });
+
+    // The bare name stays first, so `/tdd` + Enter still picks the global skill.
+    const tddLabels = getSlashCommandSuggestions("/tdd", { agentSkills }).map((s) => s.display);
+    expect(tddLabels).toEqual(["/tdd", "/other:tdd", "/pstack:tdd"]);
+    expect(
+      getSlashCommandSuggestions("/pstack:", { agentSkills }).find(
+        (s) => s.display === "/pstack:tdd"
+      )?.replacement
+    ).toBe("/pstack:tdd ");
   });
 
   it("filters top level commands by partial input", () => {

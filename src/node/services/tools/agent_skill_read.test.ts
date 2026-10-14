@@ -4,7 +4,7 @@ import * as path from "node:path";
 
 import { describe, it, expect, spyOn } from "bun:test";
 import type { ToolExecutionOptions } from "ai";
-import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
+import type { InvocableSkill } from "@/common/types/agentSkill";
 
 import { AgentSkillReadToolResultSchema } from "@/common/utils/tools/toolDefinitions";
 import { AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS } from "@/common/constants/toolLimits";
@@ -396,7 +396,7 @@ describe("agent_skill_read", () => {
     }
   });
 
-  function skillIndexLines(availableSkills: AgentSkillDescriptor[]): string[] {
+  function skillIndexLines(availableSkills: InvocableSkill[]): string[] {
     using tempDir = new TestTempDir("test-agent-skill-read-index");
     const tool = createAgentSkillReadTool({
       ...createTestToolConfig(tempDir.path),
@@ -484,6 +484,34 @@ describe("agent_skill_read", () => {
     expect(long?.endsWith("…")).toBe(true);
     expect(descriptionOf("short")).toBe("Short description");
     expect(descriptionOf("multi-line")).toBe("First line second line");
+  });
+
+  // The index lists whatever availableSkills holds; buildStreamSystemContext owns adding
+  // `pstack:tdd` to it (turnContextAssembler.test.ts). This test owns the read itself.
+  it("reads a shadowed plugin skill by <plugin>:<skill>", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-read-plugin-namespace");
+    await writeGlobalSkill(tempDir.path, "tdd", { description: "global tdd", body: "GLOBAL" });
+    const pluginDir = path.join(tempDir.path, "plugins", "pstack");
+    await fs.mkdir(pluginDir, { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, "plugin.json"),
+      JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "pstack",
+      })
+    );
+    await writeGlobalSkill(pluginDir, "tdd", { description: "pstack tdd", body: "PSTACK" });
+
+    const tool = createAgentSkillReadTool(createTestToolConfig(tempDir.path));
+
+    const bodyOf = async (name: string) => {
+      const parsed = AgentSkillReadToolResultSchema.parse(
+        await Promise.resolve(tool.execute!({ name }, mockToolCallOptions))
+      );
+      return parsed.success ? parsed.skill.body.trim() : parsed.error;
+    };
+    expect(await bodyOf("tdd")).toBe("GLOBAL");
+    expect(await bodyOf("pstack:tdd")).toBe("PSTACK");
   });
 
   it("does not split a surrogate pair at the length cap", () => {

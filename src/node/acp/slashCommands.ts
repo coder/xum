@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { formatQualifiedSkillName } from "@/common/utils/agentSkills/skillLookupName";
 import type { AvailableCommand } from "@agentclientprotocol/sdk";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import { SLASH_COMMAND_HINTS } from "@/common/constants/slashCommandHints";
@@ -138,7 +139,21 @@ export function mapSkillsByName(skills: AgentSkillDescriptor[]): Map<string, Age
     byName.set(skill.name, skill);
   }
 
+  addQualifiedPluginAliases(byName);
   return byName;
+}
+
+/**
+ * `/pstack:tdd` must also reach a plugin skill that won its bare name (it is
+ * listed bare). Shadowed ones are already listed qualified.
+ */
+function addQualifiedPluginAliases(byName: Map<string, AgentSkillDescriptor>): void {
+  for (const skill of [...byName.values()]) {
+    if (skill.pluginName == null || skill.name.includes(":")) continue;
+    const qualified = formatQualifiedSkillName(skill.pluginName, skill.name);
+    // The alias carries the typed name, which the send path resolves again.
+    if (!byName.has(qualified)) byName.set(qualified, { ...skill, name: qualified });
+  }
 }
 
 export function parseAcpSlashCommand(
