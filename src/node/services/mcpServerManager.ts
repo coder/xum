@@ -4814,15 +4814,13 @@ export class MCPServerManager {
   ): Promise<Record<string, Record<string, MCPSettingValue>>> {
     // Null prototype: a plugin server named "__proto__" stays an own key (JSON keeps it).
     const settings = Object.create(null) as Record<string, Record<string, MCPSettingValue>>;
-    // An override change waiting for repairEnablement can disable a server the entry still
-    // lists as enabled (#6186): wait for it, bounded like the read, and fail closed on timeout.
+    // One deadline for the repair wait and the reads (#6186): the reads get what is left.
+    const deadline = Date.now() + timeoutMs;
     // Only awaits when a repair is pending: without one, the reads start synchronously.
     const pendingRepair = this.pendingEnablementRepairs.get(workspaceId);
-    if (
-      pendingRepair !== undefined &&
-      (await raceWithAbortAndTimeout(pendingRepair, { timeoutMs })).kind !== "ok"
-    )
+    if (pendingRepair !== undefined && !(await this.awaitRepairForHooks(pendingRepair, timeoutMs)))
       return settings;
+    const readTimeoutMs = Math.max(0, deadline - Date.now());
     const entry = this.workspaceServers.get(workspaceId);
     if (entry === undefined) return settings;
     const sources: Array<{
@@ -4842,7 +4840,7 @@ export class MCPServerManager {
         instance,
         pluginServerName,
         ...(cached === undefined
-          ? { read: this.readSettingsForHooks(instance, workspaceId, timeoutMs) }
+          ? { read: this.readSettingsForHooks(instance, workspaceId, readTimeoutMs) }
           : {}),
       });
     }
@@ -4859,6 +4857,23 @@ export class MCPServerManager {
         this.settingsCache.get(source.instance)?.get(workspaceId) ?? reads[index] ?? {};
     });
     return settings;
+  }
+
+  /** Enablement repairs a hook already waited on until its timeout (see awaitRepairForHooks). */
+  private readonly hookTimedOutRepairs = new WeakSet<Promise<void>>();
+
+  /**
+   * An override change waiting for repairEnablement can disable a server the entry still lists
+   * as enabled (#6186). Waits for it, bounded by the hook timeout. False when it did not settle
+   * in time: the hook then gets no settings (fail closed). A repair that already outlasted one
+   * hook's wait is not waited on again, so serial plugin hooks of one dispatch (or later ones)
+   * do not add one timeout each.
+   */
+  private async awaitRepairForHooks(repair: Promise<void>, timeoutMs: number): Promise<boolean> {
+    if (this.hookTimedOutRepairs.has(repair)) return false;
+    if ((await raceWithAbortAndTimeout(repair, { timeoutMs })).kind === "ok") return true;
+    this.hookTimedOutRepairs.add(repair);
+    return false;
   }
 
   /**

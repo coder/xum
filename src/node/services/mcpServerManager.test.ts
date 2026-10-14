@@ -1126,14 +1126,23 @@ describe("MCPServerManager", () => {
         content: [],
         structuredContent: { schema, values: { units } },
       });
-      const reads: Array<{ server: string; settle: (units: string | null) => void }> = [];
+      const reads: Array<{
+        server: string;
+        timeoutMs: number | undefined;
+        settle: (units: string | null) => void;
+      }> = [];
       // While set, reads answer at once with these units.
       let immediateUnits: string | undefined = "mm";
       const settingsServer = (server: string) => ({
         tools: { draw: testTool() },
         settings: {
           settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
-          callSettingsTool: (name: string, args: Record<string, unknown>) => {
+          callSettingsTool: (
+            name: string,
+            args: Record<string, unknown>,
+            _meta: Record<string, unknown>,
+            options?: { timeoutMs?: number }
+          ) => {
             if (name === "s.update") {
               const set = args.set as { units: string };
               return Promise.resolve(result(set.units));
@@ -1142,6 +1151,7 @@ describe("MCPServerManager", () => {
             return new Promise<mcpSdk.MCPRawCallToolResult>((resolve, reject) =>
               reads.push({
                 server,
+                timeoutMs: options?.timeoutMs,
                 // null: the read fails (a server error or a timeout).
                 settle: (units) =>
                   units === null ? reject(new Error("server down")) : resolve(result(units)),
@@ -1184,6 +1194,60 @@ describe("MCPServerManager", () => {
       expect(await hookSettings).toEqual({});
       // The disabled server b is not even read.
       expect(started).toEqual([]);
+    });
+
+    test("a stuck repair costs one hook timeout, then later hooks fail closed at once", async () => {
+      const t = await setup("hooks-stuck-ws");
+      using _tmp = t.tmp;
+      const repairGate = Promise.withResolvers<void>();
+      configService.listServers.mockImplementationOnce(async () => {
+        await repairGate.promise;
+        return t.all;
+      });
+      const publication = manager.applyWorkspaceOverrides("hooks-stuck-ws", {});
+      try {
+        expect(
+          await manager.getSettingsForPluginHooks("hooks-stuck-ws", "plugin:abc:", 10)
+        ).toEqual({});
+        // A later plugin of the same dispatch must not wait on the stuck repair again: with this
+        // timeout, a second wait would outlast the test.
+        expect(
+          await manager.getSettingsForPluginHooks("hooks-stuck-ws", "plugin:abc:", 60_000)
+        ).toEqual({});
+      } finally {
+        repairGate.resolve();
+        await publication;
+      }
+    });
+
+    test("the repair wait is charged to the settings deadline", async () => {
+      const t = await setup("hooks-budget-ws");
+      using _tmp = t.tmp;
+      const repairGate = Promise.withResolvers<void>();
+      configService.listServers.mockImplementationOnce(async () => {
+        await repairGate.promise;
+        return t.all;
+      });
+      let now = 1_000_000;
+      const clock = spyOn(Date, "now").mockImplementation(() => now);
+      try {
+        const publication = manager.applyWorkspaceOverrides("hooks-budget-ws", {});
+        const hookSettings = manager.getSettingsForPluginHooks(
+          "hooks-budget-ws",
+          "plugin:abc:",
+          1000
+        );
+        // The repair takes 900 ms of the 1000 ms window.
+        now += 900;
+        repairGate.resolve();
+        await publication;
+        while (t.reads.length === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(t.reads.map((read) => [read.server, read.timeoutMs])).toEqual([["b", 100]]);
+        t.reads.splice(0).forEach((read) => read.settle("cm"));
+        expect(await hookSettings).toEqual({ a: { units: "mm" }, b: { units: "cm" } });
+      } finally {
+        clock.mockRestore();
+      }
     });
 
     test("a cached server disabled while a sibling's read is in flight is left out", async () => {
