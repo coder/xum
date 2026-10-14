@@ -1993,6 +1993,57 @@ describe("AgentPluginInstallService", () => {
     );
   });
 
+  test("the dark logo is sent beside the light one; a failed dark read keeps the light logo", async () => {
+    const light = pngHeader(64, 64);
+    const dark = pngHeader(96, 96);
+    await fsPromises.mkdir(path.join(remoteDir, "assets"));
+    await fsPromises.writeFile(path.join(remoteDir, "assets", "logo.png"), light);
+    await fsPromises.writeFile(path.join(remoteDir, "assets", "logo-dark.png"), dark);
+    const outside = path.join(muxRoot, "outside.png");
+    await fsPromises.writeFile(outside, "outside-secret");
+    await fsPromises.symlink(outside, path.join(remoteDir, "assets", "escape.png"));
+    const writeInterface = async (images: Record<string, string>): Promise<void> => {
+      await fsPromises.writeFile(
+        path.join(remoteDir, "plugin.json"),
+        JSON.stringify({
+          $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+          name: "demo-plugin",
+          version: "1.0.0",
+          extensions: {
+            "com.openai": {
+              interface: {
+                displayName: "Demo",
+                shortDescription: "d",
+                developerName: "E",
+                ...images,
+              },
+            },
+          },
+        })
+      );
+      await commitAll(remoteDir, `images ${JSON.stringify(images)}`);
+    };
+    const lightUrl = `data:image/png;base64,${light.toString("base64")}`;
+    const darkUrl = `data:image/png;base64,${dark.toString("base64")}`;
+
+    await writeInterface({ logo: "./assets/logo.png", logoDark: "./assets/logo-dark.png" });
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.manifest.interface?.logoDataUrl).toBe(lightUrl);
+    expect(preview.manifest.interface?.logoDarkDataUrl).toBe(darkUrl);
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    expect((await service.list())[0].interface?.logoDarkDataUrl).toBe(darkUrl);
+    await service.uninstall({ name: "demo-plugin", deletePluginData: true });
+
+    // composerIconDark stands in for a missing logoDark. Its read fails
+    // (a link out of the plugin root): the light logo stays and a warning names the dark one.
+    await writeInterface({ logo: "./assets/logo.png", composerIconDark: "./assets/escape.png" });
+    const failed = await service.preview({ input: remoteDir });
+    expect(failed.manifest.interface?.logoDataUrl).toBe(lightUrl);
+    expect(failed.manifest.interface?.logoDarkDataUrl).toBeUndefined();
+    expect(failed.warnings.some((w) => w.includes("dark logo './assets/escape.png'"))).toBe(true);
+    expect(JSON.stringify(failed)).not.toContain(Buffer.from("outside-secret").toString("base64"));
+  });
+
   test("an update signs out by credential key (rename, respelled URL, issuer) before the final stop", async () => {
     const order: string[] = [];
     const mcpStub = {

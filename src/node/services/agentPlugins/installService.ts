@@ -563,9 +563,51 @@ const LOGO_MIME_BY_EXTENSION: Record<string, string> = {
 };
 
 /**
- * UI projection of the OpenAI `interface`. SECURITY AUDIT: the logo crosses
- * to the renderer only as a data URL read through the contained, capped
- * reader (a symlink out of the plugin root fails there); never a file path.
+ * One manifest image as a data URL, or undefined (with a warning) when it is
+ * missing, not a raster type, or refused by the reader or the header check.
+ * SECURITY AUDIT: the image crosses to the renderer only as a data URL read
+ * through the contained, capped reader (a symlink out of the plugin root fails
+ * there); never a file path.
+ */
+async function readLogoDataUrl(
+  rootPath: string,
+  logoPath: string | undefined,
+  label: string,
+  warnings: string[]
+): Promise<string | undefined> {
+  if (logoPath === undefined) return undefined;
+  const mime = getOwn(LOGO_MIME_BY_EXTENSION, path.extname(logoPath).toLowerCase());
+  if (mime === undefined) {
+    warnings.push(`${label} '${logoPath}' must be a PNG, JPEG or WebP image; ignoring`);
+    return undefined;
+  }
+  try {
+    // The contained reader also refuses a link into the staged clone's .git
+    // (ensurePluginPathContained, #6161), so no separate check is needed here.
+    const { bytes } = await readPluginFileWithinRootCapped({
+      filePath: path.join(rootPath, logoPath),
+      pluginRoot: rootPath,
+      maxBytes: LOGO_MAX_BYTES,
+      label,
+    });
+    // SECURITY AUDIT: bounded decoded size (a tiny compressed file can decode to
+    // hundreds of MB in the renderer) and no animation, from the header alone.
+    const refusal = checkLogoImage(bytes, mime);
+    if (refusal !== null) throw new Error(refusal);
+    return `data:${mime};base64,${bytes.toString("base64")}`;
+  } catch (error) {
+    warnings.push(`${label} '${logoPath}' cannot be shown: ${getErrorMessage(error)}`);
+    return undefined;
+  }
+}
+
+/**
+ * UI projection of the OpenAI `interface`. The renderer picks the logo by
+ * theme (`logoDark`/`composerIconDark` are OpenAI's dark-theme variants) and
+ * falls back to the other one when a read fails. Budget: at most two
+ * LOGO_MAX_BYTES images per plugin (about 1.4 MiB as base64). list() is a local
+ * IPC call that Settings makes on open, the installed plugin count is the
+ * user's, and nothing here reaches model context, so no shared cap is needed.
  */
 async function interfaceSummary(
   plugin: Pick<AgentPluginInfo, "rootPath" | "openai">,
@@ -573,33 +615,18 @@ async function interfaceSummary(
 ): Promise<AgentPluginInterfaceSummary | undefined> {
   const info = plugin.openai?.interface;
   if (info === undefined) return undefined;
-  const logoPath = info.logo ?? info.composerIcon;
-  let logoDataUrl: string | undefined;
-  const mime =
-    logoPath === undefined
-      ? undefined
-      : getOwn(LOGO_MIME_BY_EXTENSION, path.extname(logoPath).toLowerCase());
-  if (logoPath !== undefined && mime === undefined) {
-    warnings.push(`Plugin logo '${logoPath}' must be a PNG, JPEG or WebP image; ignoring`);
-  } else if (logoPath !== undefined && mime !== undefined) {
-    try {
-      // The contained reader also refuses a link into the staged clone's .git
-      // (ensurePluginPathContained, #6161), so no separate check is needed here.
-      const { bytes } = await readPluginFileWithinRootCapped({
-        filePath: path.join(plugin.rootPath, logoPath),
-        pluginRoot: plugin.rootPath,
-        maxBytes: LOGO_MAX_BYTES,
-        label: "Plugin logo",
-      });
-      // SECURITY AUDIT: bounded decoded size (a tiny compressed file can decode to
-      // hundreds of MB in the renderer) and no animation, from the header alone.
-      const refusal = checkLogoImage(bytes, mime);
-      if (refusal !== null) throw new Error(refusal);
-      logoDataUrl = `data:${mime};base64,${bytes.toString("base64")}`;
-    } catch (error) {
-      warnings.push(`Plugin logo '${logoPath}' cannot be shown: ${getErrorMessage(error)}`);
-    }
-  }
+  const logoDataUrl = await readLogoDataUrl(
+    plugin.rootPath,
+    info.logo ?? info.composerIcon,
+    "Plugin logo",
+    warnings
+  );
+  const logoDarkDataUrl = await readLogoDataUrl(
+    plugin.rootPath,
+    info.logoDark ?? info.composerIconDark,
+    "Plugin dark logo",
+    warnings
+  );
   return {
     displayName: info.displayName,
     developerName: info.developerName,
@@ -610,6 +637,7 @@ async function interfaceSummary(
     ...(info.termsOfServiceURL !== undefined ? { termsOfServiceURL: info.termsOfServiceURL } : {}),
     ...(info.supportURL !== undefined ? { supportURL: info.supportURL } : {}),
     ...(logoDataUrl !== undefined ? { logoDataUrl } : {}),
+    ...(logoDarkDataUrl !== undefined ? { logoDarkDataUrl } : {}),
   };
 }
 
