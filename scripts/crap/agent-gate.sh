@@ -51,7 +51,7 @@ fi
 # match. Variable assignments and env/command/time/sudo with their options may
 # come first (GIT_EDITOR=true git commit, env -u GIT_DIR git push).
 q="'"
-word="(\\\\.|\"[^\"]*\"|${q}[^${q}]*${q}|[^[:space:];&|\"${q}\\\\]+)+"
+word="(\\\\.|\"([^\"\\\\]|\\\\.)*\"|${q}[^${q}]*${q}|[^[:space:];&|\"${q}\\\\]+)+"
 prefix="([A-Za-z_][A-Za-z0-9_]*=(${word})?|env|command|time|sudo|(-[uC]|--unset|--chdir)[[:space:]]+${word}|-[^[:space:];&|]*)[[:space:]]+"
 global="[[:space:]]+((-[Cc]|--git-dir|--work-tree|--namespace|--config-env)[[:space:]]+${word}|-[^[:space:];&|]*)"
 git_write="(^|[;&|({"$'\n'"])[[:space:]]*(${prefix})*git(${global})*[[:space:]]+(commit|push)([[:space:];&|)]|\$)"

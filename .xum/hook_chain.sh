@@ -7,8 +7,8 @@
 # Only bash builtins up to the exec: the hooks run around every tool call.
 
 # The Xum home the way the runtimes pick it: XUM_ROOT or MUX_ROOT, ~/.mux in an
-# SSH workspace, /var/mux in a Docker one (XUM_RUNTIME says which), else
-# getXumHome()'s order: ~/.xum if it has entries, the leftover home its
+# SSH workspace, /var/mux in a Docker one, ~/.xum as is in a devcontainer
+# (XUM_RUNTIME says which), else the local getXumHome() order: ~/.xum if it has entries, the leftover home its
 # .legacy-fallback marker names, ~/.xum, ~/.mux, ~/.cmux (-dev variants under a
 # development server).
 xum_home() {
@@ -24,6 +24,10 @@ xum_home() {
       ;;
     docker)
       printf '%s' /var/mux
+      return
+      ;;
+    devcontainer)
+      printf '%s' "$HOME/.xum"
       return
       ;;
   esac

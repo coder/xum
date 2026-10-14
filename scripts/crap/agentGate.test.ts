@@ -102,6 +102,7 @@ test("block mode stops a regressing commit before it runs, unless it carries Cra
     "env -i PATH=$PATH GIT_AUTHOR_NAME='a b' git commit -am x",
     "git -c core.editor=true --no-pager commit -am x",
     "git -c user.name=a\\ b commit -am x",
+    'git -c user.name="a\\"b" commit -am x',
     "git status; git commit -am x",
   ]) {
     expect({ commit, status: runGate(gate, "pre", commit).status }).toEqual({ commit, status: 1 });
@@ -310,6 +311,11 @@ test("the project hooks run the user's own hooks and pass their exit codes throu
   const legacy = join(dir, "legacy");
   userHook(join(legacy, ".mux"), "tool_pre", 5);
   expect(runHook(pre, "ls", { HOME: legacy, XUM_ROOT: "" }).status).toBe(5);
+  // A devcontainer takes ~/.xum as is, with no leftover-home fallback.
+  expect(runHook(pre, "ls", { HOME: legacy, XUM_ROOT: "", XUM_RUNTIME: "devcontainer" })).toEqual({
+    status: 0,
+    out: "",
+  });
   const marked = join(dir, "marked");
   mkdirSync(join(marked, ".xum"), { recursive: true });
   writeFileSync(join(marked, ".xum.legacy-fallback"), ".cmux\n");
