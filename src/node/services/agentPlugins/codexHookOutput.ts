@@ -40,12 +40,9 @@ export interface PreToolUseOutput extends Common {
 }
 
 export interface PostToolUseOutput extends Common {
-  /** decision block with its non-empty reason: the tool result is replaced, and it is a block. */
+  /** decision block with its non-empty reason: the tool result is replaced with it. */
   blockReason?: string;
-  /**
-   * continue: false: the tool result is replaced with this feedback (`reason`, else `stopReason`),
-   * but it is not a block (Codex post_tool_use.rs keeps it apart from should_block).
-   */
+  /** continue: false: the tool result is replaced with this feedback (`reason`, else `stopReason`). */
   stopFeedback?: string;
   additionalContext?: string;
 }

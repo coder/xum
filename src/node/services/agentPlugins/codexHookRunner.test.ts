@@ -819,14 +819,14 @@ describe("Codex output rules (output_parser.rs)", () => {
     expect(ctx.result).toEqual({ ran: { script: "safe" } });
   });
 
-  test("PostToolUse continue: false replaces the result but is not a block", async () => {
+  test("PostToolUse continue: false replaces the result, and a nested caller gets no output", async () => {
     const stopped = setup([hook("PostToolUse")], () =>
       json({ continue: false, stopReason: "Stop here." })
     );
     const ctx = await runTool(stopped.spine, "bash", {});
     expect(ctx.result).toEqual({ error: "[plugin:guard] Stop here." });
-    // A nested caller (mux.load) still gets its output.
-    expect(ctx.postBlocked).toBeUndefined();
+    // A nested caller (mux.load) must not hand on the output the hook replaced.
+    expect(ctx.postBlocked).toBe(true);
 
     const blocked = setup([hook("PostToolUse")], () => json({ decision: "block", reason: "No." }));
     expect((await runTool(blocked.spine, "bash", {})).postBlocked).toBe(true);

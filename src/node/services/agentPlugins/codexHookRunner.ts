@@ -245,11 +245,11 @@ async function runToolHooks(
       const feedback = output.blockReason ?? output.stopFeedback;
       if (feedback !== undefined) {
         ctx.result = { error: `[plugin:${registration.pluginName}] ${feedback}` };
-        // Only a block fails the call for a nested caller (mux.load), which holds the original
-        // output outside ctx.result and must not hand it on (Codex PRRT_kwDOPxxmWM6r6NnK).
-        // continue: false is not a block in Codex (post_tool_use.rs keeps it apart from
-        // should_block), so the nested call still succeeds (PRRT_kwDOPxxmWM6sDjM-).
-        if (output.blockReason !== undefined) ctx.postBlocked = true;
+        // A nested caller (mux.load) holds the original output outside ctx.result: it must not
+        // hand it on (Codex PRRT_kwDOPxxmWM6r6NnK). That holds for continue: false too, though
+        // Codex keeps it apart from a block: the hook replaced the output the model sees, so a
+        // nested call must not return it either (Codex security review PRRT_kwDOPxxmWM6sQaTG).
+        ctx.postBlocked = true;
         break;
       }
     }
