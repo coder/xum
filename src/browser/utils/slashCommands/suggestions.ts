@@ -69,7 +69,8 @@ function buildTopLevelSuggestions(
     .filter((skill) => !SLASH_COMMAND_DEFINITION_MAP.has(skill.name))
     .map((skill) => ({
       key: skill.name,
-      description: `${skill.description} (${formatScopeLabel(skill.scope)})`,
+      // A display name (SKILL.md `name` that is not the ID) labels the entry; matching stays on the ID.
+      description: `${skill.displayName ? `${skill.displayName}: ` : ""}${skill.description} (${formatScopeLabel(skill.scope)})`,
       argumentHint: skill.argumentHint,
     }));
 

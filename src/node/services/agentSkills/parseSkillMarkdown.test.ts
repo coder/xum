@@ -163,3 +163,47 @@ Body
     ).toThrow(AgentSkillParseError);
   });
 });
+
+describe("parseSkillMarkdown allowDisplayName", () => {
+  const parse = (name: string, dir: string, allowDisplayName?: boolean) => {
+    const content = `---\n${name}\ndescription: Router skill\n---\nBody\n`;
+    return parseSkillMarkdown({
+      content,
+      byteSize: Buffer.byteLength(content, "utf-8"),
+      directoryName: SkillNameSchema.parse(dir),
+      allowDisplayName,
+    });
+  };
+
+  test.each([
+    ["name: Poteto Mode", "poteto-mode", "Poteto Mode"],
+    ["name: deploy", "deploy-staging", "deploy"],
+    ["name: '  Make Bot UI  '", "make-bot-ui", "Make Bot UI"],
+  ])("%s in %s loads under the directory name", (name, dir, displayName) => {
+    const result = parse(name, dir, true);
+    expect(result.frontmatter.name).toBe(dir);
+    expect(result.displayName).toBe(displayName);
+  });
+
+  test("a valid skill parses the same with or without the option", () => {
+    const strict = parse("name: poteto-mode", "poteto-mode");
+    const lenient = parse("name: poteto-mode", "poteto-mode", true);
+    expect(lenient).toEqual(strict);
+    expect("displayName" in lenient).toBe(false);
+  });
+
+  test("strict callers still reject a name that differs from the directory", () => {
+    expect(() => parse("name: Poteto Mode", "poteto-mode")).toThrow(AgentSkillParseError);
+  });
+
+  test.each([
+    ["non-string", "name: 42"],
+    ["empty", "name: ''"],
+    ["whitespace", "name: '   '"],
+    ["too long", `name: ${"x".repeat(65)}`],
+    ["multi-line", "name: |\n  Poteto\n  Mode"],
+    ["missing", "license: MIT"],
+  ])("a %s name still throws with the option", (_label, name) => {
+    expect(() => parse(name, "poteto-mode", true)).toThrow(AgentSkillParseError);
+  });
+});

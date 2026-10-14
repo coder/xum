@@ -749,7 +749,7 @@ describe("AgentPluginInstallService", () => {
     }
   });
 
-  test("explicit imports reject unknown directory IDs, mismatched frontmatter and an unreviewed SHA", async () => {
+  test("explicit imports reject unknown directory IDs, frontmatter names and an unreviewed SHA", async () => {
     await fsPromises.mkdir(path.join(remoteDir, "skills", "other"));
     await fsPromises.writeFile(
       path.join(remoteDir, "skills", "other", "SKILL.md"),
@@ -757,7 +757,8 @@ describe("AgentPluginInstallService", () => {
     );
     await commitAll(remoteDir, "mismatched skill");
     const preview = await service.preview({ input: remoteDir });
-    for (const skills of [["missing"], ["other"], ["misleading"]]) {
+    // The skill ID is the directory name ("other"), never the frontmatter name.
+    for (const skills of [["missing"], ["misleading"]]) {
       const result = await service.installResult({
         source: preview.source,
         expectedSha: preview.lockedSha,
@@ -1941,20 +1942,22 @@ describe("AgentPluginInstallService", () => {
     }
   );
 
-  test("preview validates skills against their directory names like runtime discovery", async () => {
-    // skills/wrong-dir/SKILL.md advertising a different name never loads at
-    // runtime (parseSkillMarkdown rejects the mismatch), so the preview must
-    // not promise it — and the update capability surface must not count it.
-    await fsPromises.mkdir(path.join(remoteDir, "skills", "wrong-dir"), { recursive: true });
+  test("preview lists a display-name skill under its directory name like runtime discovery", async () => {
+    // pstack ships `name: Poteto Mode` in skills/poteto-mode: runtime discovery
+    // loads it as poteto-mode, so the preview must promise it under that ID
+    // and warn about the display name.
+    await fsPromises.mkdir(path.join(remoteDir, "skills", "poteto-mode"), { recursive: true });
     await fsPromises.writeFile(
-      path.join(remoteDir, "skills", "wrong-dir", "SKILL.md"),
-      "---\nname: other-name\ndescription: Mismatched\n---\n\nBody.\n"
+      path.join(remoteDir, "skills", "poteto-mode", "SKILL.md"),
+      "---\nname: Poteto Mode\ndescription: Router\n---\n\nBody.\n"
     );
-    await commitAll(remoteDir, "adds a dir-name-mismatched skill");
+    await commitAll(remoteDir, "adds a display-name skill");
 
     const preview = await service.preview({ input: remoteDir });
-    expect(preview.skills.map((skill) => skill.name)).toEqual(["greet"]);
-    expect(preview.warnings.join("\n")).toContain("skills/wrong-dir");
+    expect(preview.skills.map((skill) => skill.name).sort()).toEqual(["greet", "poteto-mode"]);
+    expect(preview.warnings).toEqual([
+      expect.stringMatching(/^skills\/poteto-mode: .*'Poteto Mode'.*'poteto-mode'/),
+    ]);
   });
 
   test("preview and list show the interface; the logo is a contained data URL", async () => {
@@ -2711,7 +2714,7 @@ describe("AgentPluginInstallService", () => {
     // and stay silent about the skill that stops loading.
     await fsPromises.writeFile(
       path.join(remoteDir, "skills", "greet", "SKILL.md"),
-      "---\nname: mismatched\ndescription: Greets people\n---\n\nSay hi.\n"
+      "---\nname: 42\ndescription: Greets people\n---\n\nSay hi.\n"
     );
     await fsPromises.mkdir(path.join(remoteDir, "skills", "extra"), { recursive: true });
     await fsPromises.writeFile(

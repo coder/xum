@@ -1999,7 +1999,14 @@ export class AgentPluginInstallService {
           content,
           byteSize: stat.size,
           directoryName: dirNameParsed.data,
+          // Mirror runtime discovery: a display name loads under the dir name.
+          allowDisplayName: true,
         });
+        if (parsed.displayName !== undefined) {
+          warnings.push(
+            `${label}/${dirName}: SKILL.md name '${parsed.displayName}' is not the directory name; it loads as '${dirName}'`
+          );
+        }
         skills.push({
           name: parsed.frontmatter.name,
           ...(parsed.frontmatter.description !== undefined

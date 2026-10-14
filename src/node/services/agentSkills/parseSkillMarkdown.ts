@@ -16,6 +16,8 @@ export class AgentSkillParseError extends Error {
 export interface ParsedSkillMarkdown {
   frontmatter: AgentSkillFrontmatter;
   body: string;
+  /** Raw frontmatter `name` when allowDisplayName replaced it with the directory name. */
+  displayName?: string;
 }
 
 function assertObject(value: unknown, message: string): asserts value is Record<string, unknown> {
@@ -35,6 +37,19 @@ function assertValidSkillPaths(frontmatter: AgentSkillFrontmatter): void {
   }
 }
 
+// A display name is a single line of 1-64 characters (no control characters).
+const DISPLAY_NAME_MAX_LENGTH = 64;
+// eslint-disable-next-line no-control-regex
+const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/;
+
+function qualifyDisplayName(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || trimmed.length > DISPLAY_NAME_MAX_LENGTH) return undefined;
+  if (CONTROL_CHARACTER_PATTERN.test(trimmed)) return undefined;
+  return trimmed;
+}
+
 /**
  * Parse a SKILL.md file into validated frontmatter + markdown body.
  *
@@ -46,6 +61,14 @@ export function parseSkillMarkdown(input: {
   content: string;
   byteSize: number;
   directoryName?: SkillName;
+  /**
+   * Discovered skills only (project, global, plugin roots): when the frontmatter `name`
+   * differs from the directory name, load the skill under the directory name and return
+   * the raw `name` as `displayName`. Skills from other harnesses need this, e.g. pstack's
+   * `name: Poteto Mode`; Cursor and Claude Code take the skill ID from the folder.
+   * Built-in skills and agent_skill_write stay strict.
+   */
+  allowDisplayName?: boolean;
 }): ParsedSkillMarkdown {
   if (input.byteSize > MAX_FILE_SIZE) {
     const sizeMB = (input.byteSize / (1024 * 1024)).toFixed(2);
@@ -85,7 +108,16 @@ export function parseSkillMarkdown(input: {
 
   assertObject(raw, "SKILL.md YAML frontmatter must be a mapping/object.");
 
-  const parsed = AgentSkillFrontmatterSchema.safeParse(raw);
+  let frontmatterInput: Record<string, unknown> = raw;
+  let displayName: string | undefined;
+  if (input.allowDisplayName && input.directoryName && raw.name !== input.directoryName) {
+    displayName = qualifyDisplayName(raw.name);
+    if (displayName !== undefined) {
+      frontmatterInput = { ...raw, name: input.directoryName };
+    }
+  }
+
+  const parsed = AgentSkillFrontmatterSchema.safeParse(frontmatterInput);
   if (!parsed.success) {
     throw new AgentSkillParseError(
       `Invalid SKILL.md frontmatter: ${formatZodIssues(parsed.error.issues)}`
@@ -100,5 +132,7 @@ export function parseSkillMarkdown(input: {
     );
   }
 
-  return { frontmatter: parsed.data, body };
+  return displayName !== undefined
+    ? { frontmatter: parsed.data, body, displayName }
+    : { frontmatter: parsed.data, body };
 }

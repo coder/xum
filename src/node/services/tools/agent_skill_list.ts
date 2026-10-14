@@ -129,6 +129,8 @@ async function readSkillDescriptor(
       content,
       byteSize: stat.size,
       directoryName,
+      // Agree with discovery; the display name stays out of this model-facing output.
+      allowDisplayName: true,
     });
 
     const descriptorResult = AgentSkillDescriptorSchema.safeParse({

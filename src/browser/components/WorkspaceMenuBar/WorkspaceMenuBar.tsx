@@ -875,6 +875,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           loadedSkills={loadedSkills}
           availableSkills={listInvocableSkills(skillList)}
           invalidSkills={skillList.invalidSkills}
+          skillWarnings={skillList.skillWarnings}
           unavailableSources={skillList.unavailableSources}
           skillLoadErrors={skillLoadErrors}
           loading={!skillListLoaded}

@@ -106,7 +106,13 @@ export async function migrateLegacyProjectSkill(
       if (stat.isDirectory || stat.size > MAX_FILE_SIZE) return false;
       const content = await readFileString(runtime, manifest);
       return Boolean(
-        parseSkillMarkdown({ content, byteSize: stat.size, directoryName: skillName })
+        // allowDisplayName matches discovery's validity rules.
+        parseSkillMarkdown({
+          content,
+          byteSize: stat.size,
+          directoryName: skillName,
+          allowDisplayName: true,
+        })
       );
     } catch {
       return false;
