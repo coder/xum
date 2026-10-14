@@ -2583,6 +2583,60 @@ describe("AgentPluginInstallService", () => {
       await oauth.dispose();
     });
 
+    test("overlapping discovery requests share one sign-out pass, and a failed one waits (#6627)", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      let logouts = 0;
+      restarted.setMcpOauthService({
+        logout: () => {
+          logouts++;
+          return Promise.resolve({ success: false, error: "offline" });
+        },
+        credentialKey: (url: string) => url,
+      } as unknown as McpOauthService);
+      const internals = restarted as unknown as {
+        pendingSignOutPass?: Promise<void>;
+        runExclusive: (fn: () => Promise<void>) => Promise<void>;
+      };
+      const settle = async () => {
+        await internals.pendingSignOutPass;
+        // Every pass runs under the mutation lock: this waits for all of them.
+        await internals.runExclusive(() => Promise.resolve());
+      };
+      await settle();
+      expect(logouts).toBe(1);
+
+      // Within the wait, requests start no pass.
+      await Promise.all([discovered(), discovered(), discovered()]);
+      await settle();
+      expect(logouts).toBe(1);
+
+      // After it, overlapping requests start exactly one.
+      const now = Date.now();
+      const clock = spyOn(Date, "now").mockReturnValue(now + 31_000);
+      try {
+        await Promise.all([discovered(), discovered(), discovered()]);
+        await settle();
+        expect(logouts).toBe(2);
+      } finally {
+        clock.mockRestore();
+      }
+      expect(await pendingSignOuts()).toEqual([serverUrl]);
+    });
+
+    test("component review names a pending sign-out instead of changed files (#6627)", async () => {
+      const { updater, failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await expect(updater.getComponents({ name: "demo-plugin" })).rejects.toThrow(
+        /sign-out from an update has not finished/
+      );
+      await failing.dispose();
+    });
+
     test("survives an uninstall of the plugin", async () => {
       const { updater, failing, result } = await updateWithFailingSignOut(stopStub);
       await result;
