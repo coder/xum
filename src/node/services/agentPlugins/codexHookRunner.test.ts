@@ -643,6 +643,42 @@ describe("PostToolUse", () => {
     }
   });
 
+  test("a block in a second plugin keeps the first plugin's feedback and context", async () => {
+    // Codex PRRT_kwDOPxxmWM6sXQ2G: each plugin is separate middleware on the spine.
+    const spine = new EventSpine();
+    for (const [order, pluginName] of [
+      [0, "outer"],
+      [1, "inner"],
+    ] as const) {
+      registerCodexPluginHooks(spine, {
+        workspaceId,
+        pluginName,
+        order,
+        hooks: [hook("PostToolUse")],
+        deps: {
+          isHookAllowed: () => Promise.resolve(true),
+          canCallPluginTool: () => true,
+          callPluginTool: () =>
+            Promise.resolve(
+              json({
+                decision: "block",
+                reason: `${pluginName} says no.`,
+                hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: pluginName },
+              })
+            ),
+          notifyUser: () => undefined,
+        },
+      });
+    }
+
+    const ctx = await runTool(spine, "file_read", {});
+
+    expect(ctx.result).toEqual({
+      error: "[plugin:inner] inner says no.\n\n[plugin:outer] outer says no.",
+      hook_output: "[plugin:inner] inner\n[plugin:outer] outer",
+    });
+  });
+
   test("the joined feedback of many blocking PostToolUse hooks is capped", async () => {
     // Codex PRRT_kwDOPxxmWM6sWuO7: up to MAX_PLUGIN_HOOKS hooks can each block.
     const reason = "r".repeat(15 * 1024);
