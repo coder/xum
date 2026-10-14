@@ -1010,6 +1010,75 @@ base: a
       expect(shared[1]?.pluginName).toBe("my-plugin");
     });
 
+    test("a Claude Code / Cursor format plugin agent spawns with Exec's tools; project agents keep Xum defaults", async () => {
+      using project = new DisposableTempDir("agent-defs-foreign-plugin-project");
+      using global = new DisposableTempDir("agent-defs-foreign-plugin-global");
+
+      const projectAgentsRoot = path.join(project.path, ".mux", "agents");
+      const pluginContainer = path.join(project.path, ".mux", "plugins");
+      // Upstream pstack's agents/poteto-agent.md frontmatter, verbatim keys.
+      const foreign = `---\nname: poteto-agent\ndescription: Delegate subagent\nis_background: true\n---\nYou are a delegate.\n`;
+      await writePluginWithAgent(pluginContainer, "pstack", "placeholder", "Placeholder");
+      await fs.writeFile(
+        path.join(pluginContainer, "pstack", "agents", "poteto-agent.md"),
+        foreign,
+        "utf-8"
+      );
+      await fs.mkdir(projectAgentsRoot, { recursive: true });
+      await fs.writeFile(path.join(projectAgentsRoot, "local-foreign.md"), foreign, "utf-8");
+
+      const roots = {
+        projectRoots: [projectAgentsRoot],
+        globalRoot: global.path,
+        projectPluginRoots: [pluginContainer],
+      };
+      const runtime = new LocalRuntime(project.path);
+
+      const agents = await discoverAgentDefinitions(runtime, project.path, { roots });
+      const plugin = agents.find((a) => a.id === "poteto-agent");
+      expect(plugin).toMatchObject({ subagentRunnable: true, uiSelectable: false, base: "exec" });
+      const local = agents.find((a) => a.id === "local-foreign");
+      expect(local).toMatchObject({ subagentRunnable: false, uiSelectable: true });
+      expect(local?.base).toBeUndefined();
+
+      const resolvePolicy = async (agentId: string) => {
+        const agentDefinition = await readAgentDefinition(
+          runtime,
+          project.path,
+          AgentIdSchema.parse(agentId),
+          { roots }
+        );
+        const chain = await resolveAgentInheritanceChain({
+          runtime,
+          workspacePath: project.path,
+          agentId: AgentIdSchema.parse(agentId),
+          agentDefinition,
+          workspaceId: "ws",
+        });
+        return {
+          body: agentDefinition.body,
+          policy: resolveToolPolicyForAgent({
+            agents: chain,
+            isSubagent: true,
+            disableTaskToolsForDepth: false,
+          }),
+        };
+      };
+      const sampleTools = ["bash", "file_read", "file_edit_insert", "task", "web_fetch"];
+      const pluginAgent = await resolvePolicy("poteto-agent");
+      const exec = await resolvePolicy("exec");
+      expect(applyToolPolicyToNames(sampleTools, pluginAgent.policy)).toEqual(sampleTools);
+      expect(applyToolPolicyToNames(sampleTools, pluginAgent.policy)).toEqual(
+        applyToolPolicyToNames(sampleTools, exec.policy)
+      );
+      // The plugin body is the whole system prompt, as in Claude Code and Cursor.
+      expect(pluginAgent.body.trim()).toBe("You are a delegate.");
+      // The project copy of the same file stays toolless.
+      expect(
+        applyToolPolicyToNames(sampleTools, (await resolvePolicy("local-foreign")).policy)
+      ).toEqual([]);
+    });
+
     test("remote runtimes list global host plugin agents but not project plugin agents", async () => {
       using hostHome = new DisposableTempDir("agent-defs-remote-plugin-host-home");
       using checkout = new DisposableTempDir("agent-defs-remote-plugin-checkout");

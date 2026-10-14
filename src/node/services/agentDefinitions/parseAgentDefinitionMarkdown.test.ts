@@ -104,4 +104,71 @@ Body
       require: ["propose_plan"],
     });
   });
+
+  describe("plugin source (Claude Code / Cursor format)", () => {
+    function parse(frontmatter: string, source?: "plugin") {
+      const content = `---\n${frontmatter}\n---\nBody\n`;
+      return parseAgentDefinitionMarkdown({
+        content,
+        byteSize: Buffer.byteLength(content, "utf-8"),
+        ...(source != null ? { source } : {}),
+      }).frontmatter;
+    }
+
+    test("an agent with only foreign keys becomes a hidden runnable Exec sub-agent", () => {
+      const frontmatter = parse(
+        "name: poteto-agent\ndescription: Delegate\nis_background: true",
+        "plugin"
+      );
+      expect(frontmatter).toEqual({
+        name: "poteto-agent",
+        description: "Delegate",
+        base: "exec",
+        ui: { hidden: true },
+        subagent: { runnable: true },
+      });
+    });
+
+    test("maps model, effort and readonly", () => {
+      const frontmatter = parse(
+        "name: a\nmodel: claude-opus-5-5\neffort: high\nreadonly: true",
+        "plugin"
+      );
+      expect(frontmatter.base).toBe("explore");
+      expect(frontmatter.ai).toEqual({ model: "anthropic:claude-opus-5-5", thinkingLevel: "high" });
+
+      expect(parse("name: a\nmodel: sonnet", "plugin").ai).toEqual({ model: "sonnet" });
+      // inherit (and an unknown effort) leave the AI defaults to inheritance.
+      expect(parse("name: a\nmodel: inherit\neffort: turbo", "plugin").ai).toBeUndefined();
+    });
+
+    test("a Claude tools or disallowedTools list skips the agent instead of granting every tool", () => {
+      for (const frontmatter of [
+        "name: a\ntools: Read, Grep",
+        "name: a\ntools: [Read]",
+        "name: a\ndisallowedTools: Write",
+      ]) {
+        expect(() => parse(frontmatter, "plugin")).toThrow(AgentDefinitionParseError);
+      }
+    });
+
+    test("any Xum-only key keeps Xum semantics", () => {
+      for (const frontmatter of [
+        "name: a\ntools:\n  add: [file_read]",
+        "name: a\nsubagent:\n  runnable: false",
+        "name: a\nui:\n  color: red",
+        "name: a\nprompt:\n  append: true",
+      ]) {
+        expect(parse(frontmatter, "plugin")).toEqual(parse(frontmatter));
+        expect(parse(frontmatter, "plugin").subagent?.runnable).not.toBe(true);
+      }
+    });
+
+    test("non-plugin sources keep Xum defaults for foreign-format files", () => {
+      expect(parse("name: a\ndescription: d\nis_background: true")).toEqual({
+        name: "a",
+        description: "d",
+      });
+    });
+  });
 });

@@ -396,7 +396,11 @@ async function readAgentDescriptorFromFile(
   }
 
   try {
-    const parsed = parseAgentDefinitionMarkdown({ content, byteSize });
+    const parsed = parseAgentDefinitionMarkdown({
+      content,
+      byteSize,
+      ...(pluginRoot != null ? { source: "plugin" as const } : {}),
+    });
 
     const { selectable } = resolveAgentVisibility(parsed.frontmatter.ui);
 
@@ -738,7 +742,11 @@ async function loadAgentDefinition(
         content = await readFileString(candidate.runtime, filePath, abortSignal);
         byteSize = stat.size;
       }
-      const parsed = parseAgentDefinitionMarkdown({ content, byteSize });
+      const parsed = parseAgentDefinitionMarkdown({
+        content,
+        byteSize,
+        ...(candidate.pluginRoot != null ? { source: "plugin" as const } : {}),
+      });
 
       const pkg: AgentDefinitionPackage = {
         id: agentId,

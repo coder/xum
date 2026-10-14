@@ -57,6 +57,23 @@ Higher-priority definitions **override** lower-priority ones with the same id.
 
 Definitions larger than 1 MB are rejected at parse time. Filenames that don't match the id schema are skipped with a warning.
 
+### Plugin agents in Claude Code or Cursor format
+
+[Agent plugins](/agents/agent-skills#agent-plugins) can ship `agents/*.md` files. A plugin agent that uses any Xum-only field (`base`, `tools` as an object, `subagent`, `ui`, `ai`, `prompt`, `disabled`) follows the Xum format below, unchanged.
+
+A plugin agent without any of those fields is read as a Claude Code or Cursor subagent. Both tools give such an agent every tool when it omits `tools`, so Xum maps it like this:
+
+| Plugin field                         | Xum meaning                                                          |
+| ------------------------------------ | -------------------------------------------------------------------- |
+| (always)                             | `base: exec`, `subagent.runnable: true`, `ui.hidden: true`           |
+| `readonly: true` (Cursor)            | `base: explore` instead (no file edits or task spawning; bash stays) |
+| `model`                              | `ai.model`. `inherit` and unknown models use the inherited model.    |
+| `effort` (Claude Code)               | `ai.thinkingLevel`, when it is a valid thinking level                |
+| `is_background`, `background`        | Ignored. The `task` caller chooses `run_in_background`.              |
+| `tools`, `disallowedTools` as a list | Not supported yet. Xum skips the agent rather than grant every tool. |
+
+So `task({ agentId: "<file name>" })` spawns the agent with Exec's tools: it can run shell commands and edit files. The body replaces Exec's prompt. The agent does not appear in the agent picker. This mapping applies only to plugin agents. A project or global agent file in the same format keeps the Xum defaults (not runnable, no tools).
+
 ## File Format
 
 ### Frontmatter

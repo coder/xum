@@ -4,6 +4,7 @@ import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
 import { formatZodIssues, normalizeNewlines, stripUtf8Bom } from "@/node/utils/markdownFrontmatter";
 import YAML from "yaml";
 import { getErrorMessage } from "@/common/utils/errors";
+import { mapForeignPluginAgentFrontmatter } from "./pluginAgentFormat";
 
 export class AgentDefinitionParseError extends Error {
   constructor(message: string) {
@@ -29,10 +30,15 @@ function assertObject(value: unknown, message: string): asserts value is Record<
  * Defensive constraints:
  * - Enforces the shared 1MB max file size
  * - Requires YAML frontmatter delimited by `---` on its own line at the top
+ *
+ * `source: "plugin"` maps Claude Code / Cursor format agents to Xum fields
+ * (see pluginAgentFormat.ts). Every plugin agent read must pass it, consent
+ * fingerprints included, so they describe the policy that actually runs.
  */
 export function parseAgentDefinitionMarkdown(input: {
   content: string;
   byteSize: number;
+  source?: "plugin";
 }): ParsedAgentDefinitionMarkdown {
   if (input.byteSize > MAX_FILE_SIZE) {
     const sizeMB = (input.byteSize / (1024 * 1024)).toFixed(2);
@@ -76,6 +82,14 @@ export function parseAgentDefinitionMarkdown(input: {
   }
 
   assertObject(raw, "Agent definition YAML frontmatter must be a mapping/object.");
+
+  if (input.source === "plugin") {
+    try {
+      raw = mapForeignPluginAgentFrontmatter(raw);
+    } catch (err) {
+      throw new AgentDefinitionParseError(getErrorMessage(err));
+    }
+  }
 
   const parsed = AgentDefinitionFrontmatterSchema.safeParse(raw);
   if (!parsed.success) {

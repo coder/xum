@@ -1873,6 +1873,38 @@ describe("AgentPluginInstallService", () => {
     expect(updated.lockedSha).toBe(cleanHead);
   });
 
+  test("update gates a Claude Code / Cursor agent change that widens its mapped tools", async () => {
+    // Foreign-format plugin agents are mapped before validation (readonly:
+    // true -> base explore, otherwise base exec). The schema strips the raw
+    // `readonly` key, so the fingerprint must cover the MAPPED frontmatter or
+    // dropping `readonly` would widen Explore to Exec without re-consent.
+    await fsPromises.mkdir(path.join(remoteDir, "agents"), { recursive: true });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "agents", "helper.md"),
+      "---\nname: helper\ndescription: Reviews\nreadonly: true\n---\nReview.\n"
+    );
+    // A Claude tools allowlist is not translated yet: runtime skips the
+    // agent, so the preview must not promise it.
+    await fsPromises.writeFile(
+      path.join(remoteDir, "agents", "narrow.md"),
+      "---\nname: narrow\ndescription: Reads\ntools: Read, Grep\n---\nRead.\n"
+    );
+    await commitAll(remoteDir, "adds foreign-format agents");
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.agents).toEqual(["helper.md"]);
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    await writePluginFixture(remoteDir, { version: "2.0.0" });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "agents", "helper.md"),
+      "---\nname: helper\ndescription: Reviews\n---\nReview.\n"
+    );
+    await commitAll(remoteDir, "v2 drops readonly");
+    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(
+      /changes the definition of agent helper\.md/
+    );
+  });
+
   test("a logo is refused (with a warning) when it decodes too large or is a GIF", async () => {
     await fsPromises.mkdir(path.join(remoteDir, "assets"));
     await fsPromises.writeFile(path.join(remoteDir, "assets", "huge.png"), pngHeader(10000, 10000));
