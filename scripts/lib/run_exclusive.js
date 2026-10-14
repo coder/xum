@@ -1,7 +1,7 @@
 "use strict";
 
-// Runs a command while holding a per-user lock, so only one copy runs at a time across every
-// worktree and checkout on the machine.
+// Runs a command while holding a per-user lock, so only one copy runs at a time across all of the
+// user's worktrees and checkouts on the machine.
 //
 // Usage: node scripts/lib/run_exclusive.js <lock-name> -- <command> [args...]
 //
@@ -23,8 +23,12 @@ const POLL_MS = 500;
 // Writing the file takes microseconds, so an ownerless lock this old is abandoned.
 const OWNERLESS_STALE_MS = 10_000;
 
+// The user id is in the name because os.tmpdir() is the shared /tmp on most Linux hosts: without it
+// users would block each other, and the sticky bit would stop one user from reclaiming another's
+// stale lock.
 function lockPathFor(name, env = process.env) {
-  return path.join(env.XUM_LOCK_DIR || os.tmpdir(), `xum-${name}.lock`);
+  const user = process.getuid?.() ?? os.userInfo().username;
+  return path.join(env.XUM_LOCK_DIR || os.tmpdir(), `xum-${user}-${name}.lock`);
 }
 
 function readOwner(lockPath) {
@@ -71,17 +75,19 @@ function isStale(lockPath, owner, now) {
 
 // Moves the lock aside before deleting it, so a waiter never deletes a lock someone else
 // created after it judged the old one stale (unless that happens between the two calls).
+// Returns false when the lock could not be moved, e.g. without write access to its parent.
 function removeStale(lockPath, staleOwner) {
   if (readOwner(lockPath)?.pid !== staleOwner?.pid) {
-    return;
+    return true; // Replaced meanwhile; retry against the new holder.
   }
   const aside = `${lockPath}.stale-${process.pid}-${Date.now()}`;
   try {
     fs.renameSync(lockPath, aside);
-  } catch {
-    return;
+  } catch (error) {
+    return error.code === "ENOENT";
   }
   fs.rmSync(aside, { recursive: true, force: true });
+  return true;
 }
 
 async function acquire(lockPath, onWait) {
@@ -93,8 +99,9 @@ async function acquire(lockPath, onWait) {
       return;
     }
     const owner = readOwner(lockPath);
-    if (isStale(lockPath, owner, Date.now())) {
-      removeStale(lockPath, owner);
+    // A stale lock that cannot be removed is waited on like a live one rather than retried in a
+    // tight loop.
+    if (isStale(lockPath, owner, Date.now()) && removeStale(lockPath, owner)) {
       continue;
     }
     if (!waited) {

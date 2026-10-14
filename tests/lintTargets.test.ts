@@ -62,6 +62,13 @@ describe("lint target selection", () => {
       files: [],
     });
   });
+
+  it("lints everything when a config file is removed", () => {
+    expect(lintTargets.selectLintTargets(["src/node/a.ts"], ["tsconfig.main.json"])).toEqual({
+      mode: "full",
+      reason: "tsconfig.main.json changed",
+    });
+  });
 });
 
 describe("lint target git discovery", () => {
@@ -125,6 +132,21 @@ describe("lint target git discovery", () => {
       "src/moved.ts",
       "tests/untracked.test.ts",
     ]);
+  });
+
+  it("lints everything when the branch deletes or moves a config file", () => {
+    write("tsconfig.json", "{}\n");
+    write("eslint.config.mjs", "export default [];\n");
+    git("add", ".");
+    git("commit", "-q", "-m", "configs");
+    const base = git("rev-parse", "HEAD");
+
+    fs.rmSync(path.join(repo, "tsconfig.json"));
+    expect(run({ XUM_LINT_BASE: base })).toEqual(["full tsconfig.json changed"]);
+
+    git("checkout", "-q", "--", "tsconfig.json");
+    git("mv", "eslint.config.mjs", "eslint.config.old.mjs");
+    expect(run({ XUM_LINT_BASE: base })).toEqual(["full eslint.config.mjs changed"]);
   });
 
   it("honors XUM_LINT_BASE", () => {

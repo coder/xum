@@ -5,6 +5,17 @@ import * as path from "node:path";
 
 const RUN_EXCLUSIVE = path.join(__dirname, "../scripts/lib/run_exclusive.js");
 
+// Local shape for the untyped CommonJS helper; only the members these tests exercise.
+interface RunExclusiveModule {
+  lockPathFor(name: string, env: Record<string, string | undefined>): string;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-require-imports -- plain CommonJS script helper with no ESM entry
+const runExclusive = require("../scripts/lib/run_exclusive.js") as RunExclusiveModule;
+
+// Unreadable directories do not stop root, so the permission test cannot run as root.
+const itUnlessRoot = process.platform === "win32" || process.getuid?.() === 0 ? it.skip : it;
+
 interface Result {
   code: number | null;
   stderr: string;
@@ -12,7 +23,7 @@ interface Result {
 
 describe("run_exclusive", () => {
   let lockDir: string;
-  const lockPath = () => path.join(lockDir, "xum-test-lock.lock");
+  const lockPath = () => runExclusive.lockPathFor("test-lock", { XUM_LOCK_DIR: lockDir });
 
   // Runs `node -e <script>` under the lock and resolves once it exits.
   const runLocked = (script: string): Promise<Result> =>
@@ -33,6 +44,7 @@ describe("run_exclusive", () => {
   });
 
   afterEach(() => {
+    fs.chmodSync(lockDir, 0o755); // In case a permission test failed before restoring it.
     fs.rmSync(lockDir, { recursive: true, force: true });
   });
 
@@ -93,5 +105,23 @@ describe("run_exclusive", () => {
     expect(result.code).toBe(0);
     expect(result.stderr).toContain(`Waiting for pid ${process.pid}`);
     expect(Date.now() - started).toBeGreaterThanOrEqual(700);
+  });
+
+  itUnlessRoot("waits on a stale lock it cannot remove instead of spinning", async () => {
+    const deadPid = spawnSync(process.execPath, ["-e", ""]).pid;
+    fs.mkdirSync(lockPath());
+    fs.writeFileSync(path.join(lockPath(), "owner.json"), JSON.stringify({ pid: deadPid }));
+    // Without write access to the parent, the stale lock cannot be moved aside, as with another
+    // user's lock under the sticky /tmp.
+    fs.chmodSync(lockDir, 0o555);
+    setTimeout(() => {
+      fs.chmodSync(lockDir, 0o755);
+      fs.rmSync(lockPath(), { recursive: true, force: true });
+    }, 800);
+
+    const result = await runLocked("");
+
+    expect(result.code).toBe(0);
+    expect(result.stderr).toContain(`Waiting for pid ${deadPid}`);
   });
 });
