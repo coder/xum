@@ -271,8 +271,8 @@ export const WorkspaceMetadataSchema = z.object({
   unrelatedWorkspaceConsent: z.string().optional().meta({
     description: UNRELATED_WORKSPACE_CONSENT_DESCRIPTION,
   }),
-  // Passed through from config so the settings UI reads the tag from metadata instead of
-  // keeping a duplicate copy; only a validated (normalized) tag is published.
+  // Passed through from config so API clients read the tag from metadata instead of keeping
+  // a duplicate copy; only a validated (normalized) tag is published.
   messagingTag: z.string().optional().meta({
     description: MESSAGING_TAG_DESCRIPTION,
   }),

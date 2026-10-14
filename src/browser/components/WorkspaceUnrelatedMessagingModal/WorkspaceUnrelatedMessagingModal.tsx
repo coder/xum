@@ -8,7 +8,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/browser/components/Dialog/Dialog";
-import { Input } from "@/browser/components/Input/Input";
 import { Switch } from "@/browser/components/Switch/Switch";
 import type { Result } from "@/common/types/result";
 
@@ -36,19 +35,6 @@ interface WorkspaceUnrelatedMessagingModalProps {
   holdUntilTurnEnd: boolean;
   /** Persists the delivery preference; same commit-then-publish contract as `onSetEnabled`. */
   onSetHoldUntilTurnEnd: (hold: boolean) => Promise<Result<void, string>>;
-  /**
-   * Current persisted messaging tag (without `@`), derived from workspace metadata. Same
-   * source-of-truth rule as `enabled`: the input shows this once no edit is in progress.
-   * Shown on every runtime — remote/container chats are the point of tag linking.
-   */
-  messagingTag: string | undefined;
-  /** Persists the tag (`null` clears it); same commit-then-publish contract as `onSetEnabled`. */
-  onSetMessagingTag: (tag: string | null) => Promise<Result<void, string>>;
-  /**
-   * True only for root chats. Sub-agent children and side chats cannot carry a tag
-   * (the backend refuses), so the editor is hidden for them instead of failing on save.
-   */
-  tagSupported: boolean;
 }
 
 /**
@@ -64,15 +50,16 @@ interface WorkspaceUnrelatedMessagingModalProps {
 export function WorkspaceUnrelatedMessagingModal(props: WorkspaceUnrelatedMessagingModalProps) {
   // Which switch has a request in flight: the "Saving" status renders beside that switch, and
   // both switches stay locked so requests never overlap.
-  const [savingSetting, setSavingSetting] = useState<"consent" | "hold" | "tag" | null>(null);
+  const [savingSetting, setSavingSetting] = useState<"consent" | "hold" | null>(null);
   const isSaving = savingSetting != null;
   const [error, setError] = useState<string | null>(null);
   // Only the newest request may settle the pending/error state (rapid toggles, unmounts).
   const latestRequestIdRef = useRef(0);
+
   const handleToggle = async (
-    setting: "consent" | "hold" | "tag",
+    setting: "consent" | "hold",
     save: () => Promise<Result<void, string>>
-  ): Promise<boolean> => {
+  ) => {
     const requestId = ++latestRequestIdRef.current;
     setSavingSetting(setting);
     setError(null);
@@ -86,18 +73,13 @@ export function WorkspaceUnrelatedMessagingModal(props: WorkspaceUnrelatedMessag
       };
     }
     if (requestId !== latestRequestIdRef.current) {
-      // A newer request owns the state; callers must not touch the UI on its behalf.
-      return true;
+      return;
     }
     setSavingSetting(null);
     if (!result.success) {
       setError(result.error);
     }
-    return result.success;
   };
-
-  const saveMessagingTag = (tag: string | null) =>
-    handleToggle("tag", () => props.onSetMessagingTag(tag));
 
   const HoldDescription = props.consentSupported ? "div" : DialogDescription;
 
@@ -146,17 +128,6 @@ export function WorkspaceUnrelatedMessagingModal(props: WorkspaceUnrelatedMessag
               </div>
             </div>
           )}
-
-          {/* Tag linking works on every runtime (remote/container chats are the point), so
-              this row is never gated on consentSupported — only on being a root chat.
-              Only the user can set a tag. */}
-          <MessagingTagSetting
-            supported={props.tagSupported}
-            messagingTag={props.messagingTag}
-            disabled={isSaving}
-            saving={savingSetting === "tag"}
-            onSaveTag={saveMessagingTag}
-          />
 
           <div className="border-border rounded-lg border p-4">
             <div className="flex items-center justify-between gap-4">
@@ -224,94 +195,5 @@ export function WorkspaceUnrelatedMessagingModal(props: WorkspaceUnrelatedMessag
         </div>
       </DialogContent>
     </Dialog>
-  );
-}
-interface MessagingTagSettingProps {
-  /** False for sub-agent children and side chats, which cannot carry a tag. */
-  supported: boolean;
-  /** Persisted tag (without `@`) from published metadata; the only source of truth. */
-  messagingTag: string | undefined;
-  disabled: boolean;
-  saving: boolean;
-  /** Resolves true when the save succeeded (metadata publication owns the display). */
-  onSaveTag: (tag: string | null) => Promise<boolean>;
-}
-
-/**
- * The messaging-tag row. The input is uncontrolled, keyed by the persisted tag: a save
- * reads the DOM value on blur/submit and then restores the canonical persisted text on
- * that same element (failed saves revert; normalized no-op saves show the canonical
- * form). The republished metadata — which may arrive before the ack and remount the
- * input under a new key — owns the display after a successful change.
- */
-/** Empty drafts clear the tag; anything else is sent raw for backend normalization. */
-function draftToTag(draft: string): string | null {
-  return draft.trim() === "" ? null : draft;
-}
-
-function MessagingTagSetting(props: MessagingTagSettingProps) {
-  const persistedTagText = props.messagingTag != null ? `@${props.messagingTag}` : "";
-  const tagInputRef = useRef<HTMLInputElement>(null);
-  if (!props.supported) return null;
-
-  const save = async (draft: string) => {
-    if (draft === persistedTagText) {
-      return;
-    }
-    // Restore the canonical persisted text only on the element that submitted the
-    // draft: on success the backend may have republished before the ack, remounting
-    // the input under a new key (writing there would clobber the new tag), while a
-    // normalized no-op save never remounts and must not leave the noncanonical draft.
-    const submittedElement = tagInputRef.current;
-    await props.onSaveTag(draftToTag(draft));
-    if (submittedElement != null && tagInputRef.current === submittedElement) {
-      submittedElement.value = persistedTagText;
-    }
-  };
-  const submitDraft = () => {
-    const input = tagInputRef.current;
-    if (input) {
-      void save(input.value);
-    }
-  };
-
-  return (
-    <div className="border-border rounded-lg border p-4">
-      <div className="min-w-0">
-        <label htmlFor="messaging-tag-input" className="text-foreground text-sm font-medium">
-          Messaging tag
-        </label>
-        <p className="text-muted mt-1 text-xs">
-          Give this chat a tag such as <span className="font-mono">@research</span> and give the
-          same tag to other chats you want it to exchange agent messages with. Only you can set or
-          clear a tag; clearing it removes the link.
-        </p>
-        <form
-          className="mt-3 flex items-center gap-2"
-          onSubmit={(event) => {
-            event.preventDefault();
-            submitDraft();
-          }}
-        >
-          <Input
-            key={persistedTagText}
-            ref={tagInputRef}
-            id="messaging-tag-input"
-            defaultValue={persistedTagText}
-            onBlur={(event) => void save(event.currentTarget.value)}
-            disabled={props.disabled}
-            placeholder="@research"
-            autoComplete="off"
-            spellCheck={false}
-            className="min-w-0 flex-1"
-          />
-          {props.saving && (
-            <span role="status" className="text-muted shrink-0 text-xs">
-              Saving
-            </span>
-          )}
-        </form>
-      </div>
-    </div>
   );
 }

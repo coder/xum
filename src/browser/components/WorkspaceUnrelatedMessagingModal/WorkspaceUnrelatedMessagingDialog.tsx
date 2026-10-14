@@ -5,7 +5,6 @@ import {
   isWorktreeRuntime,
   type RuntimeConfig,
 } from "@/common/types/runtime";
-import type { Result } from "@/common/types/result";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 // The package index, not the file: test doubles replace the modal on the index module.
 import { WorkspaceUnrelatedMessagingModal } from ".";
@@ -14,48 +13,10 @@ interface WorkspaceUnrelatedMessagingDialogProps {
   workspaceId: string;
   runtimeConfig: RuntimeConfig | undefined;
   workspace:
-    | Pick<
-        FrontendWorkspaceMetadata,
-        | "unrelatedWorkspaceConsent"
-        | "agentMessageDispatchMode"
-        | "messagingTag"
-        | "parentWorkspaceId"
-        | "sideChatParentWorkspaceId"
-      >
+    | Pick<FrontendWorkspaceMetadata, "unrelatedWorkspaceConsent" | "agentMessageDispatchMode">
     | undefined;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-}
-
-type DialogApi = ReturnType<typeof useAPI>["api"];
-
-/** Tag props for the modal: state from published metadata only, writes via setMessagingTag. */
-function messagingTagSettings(
-  api: DialogApi,
-  workspaceId: string,
-  workspace: WorkspaceUnrelatedMessagingDialogProps["workspace"]
-): {
-  messagingTag: string | undefined;
-  onSetMessagingTag: (tag: string | null) => Promise<Result<void, string>>;
-} {
-  return {
-    messagingTag: workspace?.messagingTag,
-    onSetMessagingTag: (tag) =>
-      api
-        ? api.workspace.setMessagingTag({ workspaceId, tag })
-        : Promise.resolve({ success: false as const, error: "Not connected to server" }),
-  };
-}
-
-/** Tags are root-chat only: neither a sub-agent child nor a side chat can carry one. */
-function isRootChatWorkspace(
-  workspace: WorkspaceUnrelatedMessagingDialogProps["workspace"]
-): boolean {
-  return (
-    workspace != null &&
-    workspace.parentWorkspaceId == null &&
-    workspace.sideChatParentWorkspaceId == null
-  );
 }
 
 /** The "Messages from other workspaces" dialog wired to the backend, for both menus (#6202). */
@@ -81,12 +42,6 @@ export function WorkspaceUnrelatedMessagingDialog(props: WorkspaceUnrelatedMessa
           ? api.workspace.setUnrelatedWorkspaceConsent({ workspaceId, enabled })
           : Promise.resolve({ success: false as const, error: "Not connected to server" })
       }
-      // Tag state likewise comes only from published metadata; the tag row shows on every
-      // runtime because remote/container chats are the point of tag linking.
-      {...messagingTagSettings(api, workspaceId, props.workspace)}
-      // Tags are root-chat only (the backend refuses children and side chats), so the
-      // editor is hidden there instead of offering a save that can only fail.
-      tagSupported={isRootChatWorkspace(props.workspace)}
       holdUntilTurnEnd={props.workspace?.agentMessageDispatchMode === "turn-end"}
       onSetHoldUntilTurnEnd={(hold) =>
         api

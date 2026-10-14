@@ -9328,7 +9328,7 @@ export class WorkspaceService
 
   /**
    * User-only messaging tag for a root chat: chats sharing a tag may message each other
-   * (TaskService resolves that relation). Only the settings UI calls this — no agent tool may
+   * (TaskService resolves that relation). Only user API clients call this — no agent tool may
    * set a tag, and it is never routed through the generic `tags` map. `null`/empty clears the
    * tag (absent is the only untagged representation); an invalid tag is rejected before any
    * write. Side chats and sub-agent children are refused: tagging is root-chat only. This
@@ -9376,7 +9376,7 @@ export class WorkspaceService
         return Err(outcome.error);
       }
       // Publish after every successful write, including no-ops (same reason as consent above):
-      // Ok means committed AND published, so the UI only moves after this ack.
+      // Ok means committed AND published, so clients observe the tag once this acks.
       await this.emitCurrentWorkspaceMetadata(normalizedWorkspaceId);
       return Ok(undefined);
     } catch (error) {

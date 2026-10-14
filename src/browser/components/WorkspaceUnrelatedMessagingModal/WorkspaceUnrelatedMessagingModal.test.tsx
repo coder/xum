@@ -3,7 +3,6 @@ import "../../../../tests/ui/dom";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
 import { installDom } from "../../../../tests/ui/dom";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
@@ -73,9 +72,6 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
         onSetEnabled={onSetEnabled}
         holdUntilTurnEnd={false}
         onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
-        tagSupported={true}
-        messagingTag={undefined}
-        onSetMessagingTag={() => Promise.resolve(Ok(undefined))}
       />
     );
 
@@ -109,9 +105,6 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
         onSetEnabled={onSetEnabled}
         holdUntilTurnEnd={false}
         onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
-        tagSupported={true}
-        messagingTag={undefined}
-        onSetMessagingTag={() => Promise.resolve(Ok(undefined))}
       />
     );
     expect(consentSwitch(view).getAttribute("aria-checked")).toBe("true");
@@ -137,9 +130,6 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
         onSetEnabled={onSetEnabled}
         holdUntilTurnEnd={false}
         onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
-        tagSupported={true}
-        messagingTag={undefined}
-        onSetMessagingTag={() => Promise.resolve(Ok(undefined))}
       />
     );
 
@@ -171,9 +161,6 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
         onSetEnabled={onSetEnabled}
         holdUntilTurnEnd={false}
         onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
-        tagSupported={true}
-        messagingTag={undefined}
-        onSetMessagingTag={() => Promise.resolve(Ok(undefined))}
       />
     );
 
@@ -196,198 +183,6 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
     expect(view.queryByRole("alert")).toBeNull();
   });
 
-  test("the tag input shows on every runtime, displays the @tag, and saves on blur", async () => {
-    const onSetMessagingTag = mock((_tag: string | null) =>
-      Promise.resolve(Ok(undefined) as Result<void, string>)
-    );
-    const renderModal = (messagingTag: string | undefined) => (
-      <WorkspaceUnrelatedMessagingModal
-        open={true}
-        onOpenChange={() => undefined}
-        // Remote runtimes hide consent, but tag linking is the point there: never gated.
-        consentSupported={false}
-        enabled={false}
-        onSetEnabled={() => Promise.resolve(Ok(undefined))}
-        holdUntilTurnEnd={false}
-        onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
-        tagSupported={true}
-        messagingTag={messagingTag}
-        onSetMessagingTag={onSetMessagingTag}
-      />
-    );
-    const view = render(renderModal("research"));
-    const input = () => view.getByLabelText(/messaging tag/i) as HTMLInputElement;
-    expect(input().value).toBe("@research");
-
-    // userEvent, not fireEvent.input: the latter does not reliably update controlled
-    // input state in happy-dom (see SshPromptDialog.test.tsx).
-    const user = userEvent.setup({ document: view.container.ownerDocument });
-    await user.click(input());
-    await user.clear(input());
-    await user.type(input(), "@Deep-Dive ");
-    fireEvent.blur(input());
-    await waitFor(() => {
-      expect(onSetMessagingTag).toHaveBeenCalledTimes(1);
-    });
-    expect(onSetMessagingTag.mock.calls[0]?.[0]).toBe("@Deep-Dive ");
-    // Ack alone does not rewrite the input; only the republished metadata does.
-    view.rerender(renderModal("deep-dive"));
-    expect(input().value).toBe("@deep-dive");
-  });
-
-  test("clearing the tag input removes the tag", async () => {
-    const onSetMessagingTag = mock((_tag: string | null) =>
-      Promise.resolve(Ok(undefined) as Result<void, string>)
-    );
-    const view = render(
-      <WorkspaceUnrelatedMessagingModal
-        open={true}
-        onOpenChange={() => undefined}
-        consentSupported={true}
-        enabled={false}
-        onSetEnabled={() => Promise.resolve(Ok(undefined))}
-        holdUntilTurnEnd={false}
-        onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
-        tagSupported={true}
-        messagingTag={"research"}
-        onSetMessagingTag={onSetMessagingTag}
-      />
-    );
-    const input = () => view.getByLabelText(/messaging tag/i) as HTMLInputElement;
-    const user = userEvent.setup({ document: view.container.ownerDocument });
-    await user.click(input());
-    await user.clear(input());
-    fireEvent.blur(input());
-    await waitFor(() => {
-      expect(onSetMessagingTag).toHaveBeenCalledTimes(1);
-    });
-    expect(onSetMessagingTag.mock.calls[0]?.[0]).toBeNull();
-  });
-
-  test("a normalized no-op save restores the canonical tag text", async () => {
-    const onSetMessagingTag = mock((_tag: string | null) =>
-      Promise.resolve(Ok(undefined) as Result<void, string>)
-    );
-    const view = render(
-      <WorkspaceUnrelatedMessagingModal
-        open={true}
-        onOpenChange={() => undefined}
-        consentSupported={true}
-        enabled={false}
-        onSetEnabled={() => Promise.resolve(Ok(undefined))}
-        holdUntilTurnEnd={false}
-        onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
-        tagSupported={true}
-        messagingTag={"research"}
-        onSetMessagingTag={onSetMessagingTag}
-      />
-    );
-    const input = () => view.getByLabelText(/messaging tag/i) as HTMLInputElement;
-    const user = userEvent.setup({ document: view.container.ownerDocument });
-    await user.click(input());
-    await user.clear(input());
-    await user.type(input(), "RESEARCH");
-    fireEvent.blur(input());
-    await waitFor(() => {
-      expect(onSetMessagingTag).toHaveBeenCalledTimes(1);
-    });
-    // The persisted tag is unchanged, so no remount happens: the input must
-    // fall back to the canonical @form instead of keeping the raw draft.
-    await waitFor(() => {
-      expect(input().value).toBe("@research");
-    });
-  });
-
-  test("a rejected tag save surfaces the error and reverts to the persisted tag", async () => {
-    const onSetMessagingTag = mock((_tag: string | null) =>
-      Promise.resolve(Err("Invalid messaging tag") as Result<void, string>)
-    );
-    const view = render(
-      <WorkspaceUnrelatedMessagingModal
-        open={true}
-        onOpenChange={() => undefined}
-        consentSupported={true}
-        enabled={false}
-        onSetEnabled={() => Promise.resolve(Ok(undefined))}
-        holdUntilTurnEnd={false}
-        onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
-        tagSupported={true}
-        messagingTag={"research"}
-        onSetMessagingTag={onSetMessagingTag}
-      />
-    );
-    const input = () => view.getByLabelText(/messaging tag/i) as HTMLInputElement;
-    const user = userEvent.setup({ document: view.container.ownerDocument });
-    await user.click(input());
-    await user.clear(input());
-    await user.type(input(), "@bad tag!");
-    fireEvent.blur(input());
-    const alert = await waitFor(() => view.getByRole("alert"));
-    expect(alert.textContent).toContain("Invalid messaging tag");
-    expect(input().value).toBe("@research");
-    expect(input().disabled).toBe(false);
-  });
-
-  test("hides the tag editor for non-root chats", () => {
-    const view = render(
-      <WorkspaceUnrelatedMessagingModal
-        open={true}
-        onOpenChange={() => undefined}
-        consentSupported={true}
-        enabled={false}
-        onSetEnabled={() => Promise.resolve(Ok(undefined))}
-        holdUntilTurnEnd={false}
-        onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
-        tagSupported={false}
-        messagingTag={undefined}
-        onSetMessagingTag={() => Promise.resolve(Ok(undefined))}
-      />
-    );
-    expect(view.queryByLabelText(/messaging tag/i)).toBeNull();
-  });
-
-  test("a save published before its ack does not clobber the new tag text", async () => {
-    let resolveSave: ((result: Result<void, string>) => void) | undefined;
-    const onSetMessagingTag = mock(
-      (_tag: string | null) =>
-        new Promise<Result<void, string>>((resolve) => {
-          resolveSave = resolve;
-        })
-    );
-    const renderModal = (messagingTag: string | undefined) => (
-      <WorkspaceUnrelatedMessagingModal
-        open={true}
-        onOpenChange={() => undefined}
-        consentSupported={true}
-        enabled={false}
-        onSetEnabled={() => Promise.resolve(Ok(undefined))}
-        holdUntilTurnEnd={false}
-        onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
-        tagSupported={true}
-        messagingTag={messagingTag}
-        onSetMessagingTag={onSetMessagingTag}
-      />
-    );
-    const view = render(renderModal("research"));
-    const input = () => view.getByLabelText(/messaging tag/i) as HTMLInputElement;
-    const user = userEvent.setup({ document: view.container.ownerDocument });
-    await user.click(input());
-    await user.clear(input());
-    await user.type(input(), "@deep-dive");
-    fireEvent.blur(input());
-    await waitFor(() => {
-      expect(onSetMessagingTag).toHaveBeenCalledTimes(1);
-    });
-    // The backend publishes before it acks: the new metadata remounts the input
-    // while this save is still in flight. Resolving must not write the old text back.
-    view.rerender(renderModal("deep-dive"));
-    resolveSave?.(Ok(undefined));
-    await waitFor(() => {
-      expect(input().disabled).toBe(false);
-    });
-    expect(input().value).toBe("@deep-dive");
-  });
-
   test("renders nothing while closed", () => {
     const view = render(
       <WorkspaceUnrelatedMessagingModal
@@ -398,9 +193,6 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
         onSetEnabled={() => Promise.resolve(Ok(undefined))}
         holdUntilTurnEnd={false}
         onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
-        tagSupported={true}
-        messagingTag={undefined}
-        onSetMessagingTag={() => Promise.resolve(Ok(undefined))}
       />
     );
     expect(view.queryByRole("switch", { name: CONSENT_NAME })).toBeNull();
@@ -420,9 +212,6 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
         onSetEnabled={() => Promise.resolve(Ok(undefined))}
         holdUntilTurnEnd={hold}
         onSetHoldUntilTurnEnd={onSetHoldUntilTurnEnd}
-        tagSupported={true}
-        messagingTag={undefined}
-        onSetMessagingTag={() => Promise.resolve(Ok(undefined))}
       />
     );
     const view = render(renderModal(false));
@@ -455,9 +244,6 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
         onSetEnabled={() => Promise.resolve(Ok(undefined))}
         holdUntilTurnEnd={false}
         onSetHoldUntilTurnEnd={() => pending.promise}
-        tagSupported={true}
-        messagingTag={undefined}
-        onSetMessagingTag={() => Promise.resolve(Ok(undefined))}
       />
     );
     expect(view.queryByRole("switch", { name: CONSENT_NAME })).toBeNull();
