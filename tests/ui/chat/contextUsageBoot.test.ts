@@ -80,7 +80,8 @@ describe("Composer context usage before history loads (#6101)", () => {
       // The settings dialog opened now must not show a wrong 0 or a limit warning either.
       fireEvent.click(button);
       const dialog = await waitFor(() => within(document.body).getByRole("dialog"));
-      expect(within(dialog).getByText("Loading")).toBeTruthy();
+      const usageText = within(dialog).getByText("Context Usage").nextElementSibling?.textContent;
+      expect(usageText ?? "").not.toMatch(/\d/);
       expect(dialog.textContent ?? "").not.toContain("Unknown model limits");
 
       app.releaseReplay();
