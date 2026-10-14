@@ -1048,7 +1048,7 @@ export class AgentPluginInstallService {
       await this.pendingSignOutReady;
       const bracket = await journalDerivedDiscoveryGate(containerPaths);
       // The bracket keeps the container closed while a sign-out is pending; start finishing it.
-      await this.startPendingSignOutPass({ retryNow: false });
+      this.startPendingSignOutPass({ retryNow: false });
       return {
         suppressed: [...new Set([...bracket.suppressed, ...unhealthySuppression])],
         confirm: async () => {
@@ -1084,7 +1084,7 @@ export class AgentPluginInstallService {
     const allConsumed = await this.reconcileJournals();
     // Started, not awaited: a slow or failed sign-out must not latch journal health (a
     // timed-out recovery stores false until the next section open). The record is its own fence.
-    await this.startPendingSignOutPass({ retryNow: true });
+    this.startPendingSignOutPass({ retryNow: true });
     return allConsumed;
   }
 
@@ -3704,21 +3704,44 @@ export class AgentPluginInstallService {
    *
    * The slot is set before any await, so callers that overlap share one pass (#6627). The gate
    * passes `retryNow: false`: after a pass that left the record it waits
-   * PENDING_SIGN_OUT_RETRY_MS. Startup and section open retry at once.
+   * PENDING_SIGN_OUT_RETRY_MS. Startup and section open pass `retryNow: true`: they retry at
+   * once, and when a pass already runs they get one more pass after it, because the running
+   * pass can have read the record before the user's retry.
    */
-  private startPendingSignOutPass(options: { retryNow: boolean }): Promise<void> {
-    if (this.signOutPassBlocked(options.retryNow)) return Promise.resolve();
-    const pass: Promise<void> = this.runPendingSignOutPass().finally(() => {
-      if (this.pendingSignOutPass === pass) this.pendingSignOutPass = undefined;
-    });
+  private startPendingSignOutPass(options: { retryNow: boolean }): void {
+    if (this.signOutPassRunning(options.retryNow) || this.signOutRetryWaits(options.retryNow))
+      return;
+    const pass: Promise<void> = this.runPendingSignOutPass().finally(() =>
+      this.endPendingSignOutPass(pass)
+    );
     this.pendingSignOutPass = pass;
-    return Promise.resolve();
   }
 
-  /** A pass runs, or the gate's wait after a pass that left the record has not ended. */
-  private signOutPassBlocked(retryNow: boolean): boolean {
-    if (this.pendingSignOutPass !== undefined) return true;
+  /** True when a pass runs. A `retryNow` caller then asks for one more pass after it. */
+  private signOutPassRunning(retryNow: boolean): boolean {
+    if (this.pendingSignOutPass === undefined) return false;
+    if (retryNow) this.pendingSignOutRerun = true;
+    return true;
+  }
+
+  /** True while the gate's wait after a pass that left the record runs. */
+  private signOutRetryWaits(retryNow: boolean): boolean {
     return !retryNow && Date.now() < this.pendingSignOutRetryAtMs;
+  }
+
+  /** Resolves once no pass runs, the passes that `retryNow` callers asked for included. */
+  private async settledSignOutPasses(): Promise<void> {
+    // endPendingSignOutPass starts a requested pass before the settled one resolves.
+    while (this.pendingSignOutPass !== undefined) await this.pendingSignOutPass;
+  }
+
+  /** Clears the slot of a settled pass, and starts the pass a `retryNow` caller asked for. */
+  private endPendingSignOutPass(pass: Promise<void>): void {
+    if (this.pendingSignOutPass !== pass) return;
+    this.pendingSignOutPass = undefined;
+    if (!this.pendingSignOutRerun) return;
+    this.pendingSignOutRerun = false;
+    this.startPendingSignOutPass({ retryNow: true });
   }
 
   /** One pass: finishes the record, and schedules the next gate retry when it is left. */
@@ -3735,6 +3758,8 @@ export class AgentPluginInstallService {
   private pendingSignOutPass: Promise<void> | undefined;
   /** See startPendingSignOutPass. */
   private pendingSignOutRetryAtMs = 0;
+  /** See signOutPassRunning. */
+  private pendingSignOutRerun = false;
 
   /** Managed registry entries merged with unmanaged plugins found by global discovery. */
   /** The OAuth service is built in a later DI layer than this service. */
@@ -3745,10 +3770,11 @@ export class AgentPluginInstallService {
     // Bounded like journal recovery: a hung logout (stalled store I/O) must not hang every
     // discovery request. On timeout discovery goes on, and the journal bracket keeps the
     // container closed while the sign-out is still pending.
-    const pass = this.startPendingSignOutPass({ retryNow: true }).then(
-      () => this.pendingSignOutPass
+    this.startPendingSignOutPass({ retryNow: true });
+    this.pendingSignOutReady = waitForPendingSignOuts(
+      this.settledSignOutPasses(),
+      this.deps.reconciliationTimeoutMs
     );
-    this.pendingSignOutReady = waitForPendingSignOuts(pass, this.deps.reconciliationTimeoutMs);
   }
 
   /** Started by setMcpOauthService. */

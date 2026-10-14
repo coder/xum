@@ -2598,22 +2598,17 @@ describe("AgentPluginInstallService", () => {
         },
         credentialKey: (url: string) => url,
       } as unknown as McpOauthService);
-      const internals = restarted as unknown as {
-        pendingSignOutPass?: Promise<void>;
-        runExclusive: (fn: () => Promise<void>) => Promise<void>;
-      };
-      const settle = async () => {
-        await internals.pendingSignOutPass;
-        // Every pass runs under the mutation lock: this waits for all of them.
-        await internals.runExclusive(() => Promise.resolve());
-      };
+      const internals = restarted as unknown as { settledSignOutPasses: () => Promise<void> };
+      const settle = () => internals.settledSignOutPasses();
       await settle();
-      expect(logouts).toBe(1);
+      // Startup tried at least once (recovery and the wiring can each ask for a pass).
+      const atStartup = logouts;
+      expect(atStartup).toBeGreaterThan(0);
 
       // Within the wait, requests start no pass.
       await Promise.all([discovered(), discovered(), discovered()]);
       await settle();
-      expect(logouts).toBe(1);
+      expect(logouts).toBe(atStartup);
 
       // After it, overlapping requests start exactly one.
       const now = Date.now();
@@ -2621,7 +2616,7 @@ describe("AgentPluginInstallService", () => {
       try {
         await Promise.all([discovered(), discovered(), discovered()]);
         await settle();
-        expect(logouts).toBe(2);
+        expect(logouts).toBe(atStartup + 1);
       } finally {
         clock.mockRestore();
       }
