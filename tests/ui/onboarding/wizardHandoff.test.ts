@@ -28,7 +28,11 @@ jest.mock("@/browser/contexts/SettingsContext", () => ({
 jest.mock("@/browser/contexts/ProjectContext", () => ({
   useProjectContext: () => ({ addProject: jest.fn(), userProjects: new Map() }),
 }));
-jest.mock("@/browser/contexts/API", () => ({ useAPI: () => ({ api: null }) }));
+// useLiveAPI is main's live-client hook (#6323): with no API it is null, like useAPI's api.
+jest.mock("@/browser/contexts/API", () => ({
+  useAPI: () => ({ api: null }),
+  useLiveAPI: () => null,
+}));
 jest.mock("@/browser/hooks/useRouting", () => ({
   useRouting: () => ({ navigateToProject: jest.fn() }),
 }));
