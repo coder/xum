@@ -1703,7 +1703,12 @@ export class MCPServerManager {
    */
   private readonly idleStoppedPromptCatalogs = new Map<
     string,
-    { configSignature: string; prompts: Map<string, MCPPrompt[]> }
+    {
+      configSignature: string;
+      prompts: Map<string, MCPPrompt[]>;
+      /** Servers whose catalog had settled a prompts/list (see awaitFirstPromptLists). */
+      listedServerNames: Set<string>;
+    }
   >();
   // Bumped by removal-style stops (stopServers without retainRestartOptions).
   // Startups run outside any lock shared with removal, so an abort-abandoned
@@ -2595,7 +2600,9 @@ export class MCPServerManager {
       const prompts = saved.prompts.get(serverName);
       if (prompts !== undefined && instance.prompts.length === 0) {
         instance.prompts = prompts;
-        this.markRestoredCatalogListed(instance);
+        // A restored catalog is a stale value: serve it while revalidating. A catalog that was
+        // never listed (warmed, then stopped idle) stays unlisted.
+        this.restorePromptListSettled(instance, saved.listedServerNames.has(serverName));
       }
     }
   }
@@ -2649,12 +2656,8 @@ export class MCPServerManager {
     if (signal?.aborted !== true) this.promptListSettledInstances.add(instance);
   }
 
-  /**
-   * A restored catalog is a stale value, not a missing one: serve it while revalidating. An
-   * empty one can come from a server that was never listed (warmed, then stopped idle).
-   */
-  private markRestoredCatalogListed(instance: MCPServerInstance): void {
-    if (instance.prompts.length > 0) this.promptListSettledInstances.add(instance);
+  private restorePromptListSettled(instance: MCPServerInstance, listed: boolean): void {
+    if (listed) this.promptListSettledInstances.add(instance);
   }
 
   /** Whether a served instance of the workspace never settled a prompts/list. */
@@ -2771,6 +2774,11 @@ export class MCPServerManager {
           configSignature: entry.configSignature,
           prompts: new Map(
             [...entry.instances].map(([serverName, instance]) => [serverName, instance.prompts])
+          ),
+          listedServerNames: new Set(
+            [...entry.instances]
+              .filter(([, instance]) => this.promptListSettledInstances.has(instance))
+              .map(([serverName]) => serverName)
           ),
         });
         void this.stopServers(workspaceId, { retainRestartOptions: true });
