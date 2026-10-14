@@ -2360,7 +2360,11 @@ describe("ACP /compact", () => {
         agentId: "compact",
         maxOutputTokens: 1000,
         skipAiSettingsPersistence: true,
-        toolPolicy: [{ regex_match: ".*", action: "disable" }],
+        // ACP appends its per-turn ask_user_question deny to every prompt send.
+        toolPolicy: [
+          { regex_match: ".*", action: "disable" },
+          { regex_match: "ask_user_question", action: "disable" },
+        ],
       });
       // Attachments belong to the follow-up turn, not to the compaction request.
       expect(sent.options.fileParts).toBeUndefined();
