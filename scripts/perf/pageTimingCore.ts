@@ -84,28 +84,6 @@ export function hostIsQuiet(load: number, pressureCpu: string | null, cpus: numb
 }
 
 /**
- * Ctrl-C or SIGTERM (#6204 item 4): runs the active cleanups newest first (browser, server, temp folder,
- * lock), each bounded and each even if an earlier one failed, then exits 130 (SIGINT) or 143 (SIGTERM).
- */
-export async function interrupt(
-  signal: "SIGINT" | "SIGTERM",
-  cleanups: Array<() => Promise<unknown>>,
-  exit: (code: number) => void,
-  boundMs = 15_000
-): Promise<void> {
-  for (const cleanup of [...cleanups].reverse()) {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const bound = new Promise((resolve) => (timer = setTimeout(resolve, boundMs)));
-    const done = Promise.resolve()
-      .then(cleanup)
-      .catch((error: unknown) => console.error(error));
-    await Promise.race([done, bound]);
-    clearTimeout(timer);
-  }
-  exit(signal === "SIGINT" ? 130 : 143);
-}
-
-/**
  * After the server stops, waits up to 10 s for the run's other processes (`find`) to exit. Survivors get
  * SIGKILL before the caller frees the lock (#6204 item 7), and the run is invalid: it throws.
  */
@@ -121,10 +99,8 @@ export async function reapRun(
     }
     const left = find();
     left.forEach(kill);
-    for (let j = 0; find().length > 0; j++) {
-      if (j === 10) throw new Error(`processes ${left} survived SIGKILL`);
-      await sleep(100);
-    }
+    // Until they are gone: one in uninterruptible I/O can take a while to die, and the lock waits for it.
+    while (find().length > 0) await sleep(100);
     throw new Error(`processes ${left} outlived the server by 10 s and were killed`);
   }
 }

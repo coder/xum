@@ -5,7 +5,6 @@ import {
   TARGET,
   hostIsQuiet,
   hostState,
-  interrupt,
   pairDiffs,
   qualifyHostPage,
   reapRun,
@@ -60,23 +59,6 @@ test("each run records the host's 1-minute load and PSI cpu some avg10, or null 
   expect(() => hostState(3.2, "garbage")).toThrow("/proc/pressure/cpu");
 });
 
-test("an interrupt runs every cleanup newest first, each bounded, then exits 130 or 143", async () => {
-  const [events, codes] = [[] as string[], [] as number[]];
-  const step = (name: string, result: () => Promise<unknown>) => () => {
-    events.push(name);
-    return result();
-  };
-  const cleanups = [
-    step("lock", () => Promise.resolve()),
-    step("server", () => Promise.reject(new Error("stop failed"))), // must not skip the lock
-    step("browser", () => new Promise(() => {})), // hangs: bounded
-  ];
-  await interrupt("SIGTERM", cleanups, (code) => codes.push(code), 10);
-  expect(events).toEqual(["browser", "server", "lock"]);
-  await interrupt("SIGINT", [], (code) => codes.push(code));
-  expect(codes).toEqual([143, 130]);
-});
-
 test("processes of a run that outlive the server by 10 s are killed before it returns, and the run is invalid", async () => {
   let [alive, killed, sleeps] = [[41, 42], [] as number[], 0];
   const sleep = async () => void sleeps++;
@@ -89,13 +71,10 @@ test("processes of a run that outlive the server by 10 s are killed before it re
   let polls = 3; // exits on its own within the wait: nothing is killed
   await reapRun(() => (polls-- > 0 ? [7] : []), kill, sleep);
   expect(killed).toEqual([41, 42]);
-  await expect(
-    reapRun(
-      () => [9],
-      () => {},
-      sleep
-    )
-  ).rejects.toThrow("survived SIGKILL");
+  let late = 130; // gone 30 polls after its SIGKILL (uninterruptible I/O): the reaper still waits for it
+  const lingering = () => (late-- > 0 ? [9] : []);
+  await expect(reapRun(lingering, () => {}, sleep)).rejects.toThrow("were killed");
+  expect(late).toBeLessThan(0);
 });
 
 test("paired differences are head - base in pair order, and a missing or doubled arm is refused", () => {
