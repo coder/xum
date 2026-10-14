@@ -1034,7 +1034,63 @@ function mergeProjectAliases(group: StoredProjectEntry[]): {
   return { config: merged, conflictingIds: [...conflictingIds] };
 }
 
-/** An alias group whose merge kept one of two different rows with the same id. */
+/**
+ * The ids of the rows that have one, by checkout path. Rows without a string path are left out:
+ * config.json rows are not schema-checked, and a load must not throw on a malformed row (#5929).
+ */
+function idRowIdsByPath(workspaces: ProjectConfig["workspaces"]): Map<string, string[]> {
+  const idsByPath = new Map<string, string[]>();
+  for (const workspace of workspaces) {
+    if (!workspace.id || typeof workspace.path !== "string") continue;
+    const ids = idsByPath.get(workspace.path);
+    if (ids) ids.push(workspace.id);
+    else idsByPath.set(workspace.path, [workspace.id]);
+  }
+  return idsByPath;
+}
+
+/**
+ * Drop each id-less legacy row that is the same workspace as an id row on its checkout path
+ * (#5929). One alias can hold a legacy row while another holds its migrated copy. The read-time
+ * id migration would give the legacy row that same id, and config.json would then keep two rows
+ * with one id. `resolveLegacyId` returns the id the migration would give a row, or undefined
+ * when that id is unknown. An unknown or different id keeps both rows: the legacy row is then
+ * another identity with its own session history. Returns the ids whose legacy copy was dropped.
+ */
+function dropLegacyDuplicateRows(
+  workspaces: ProjectConfig["workspaces"],
+  resolveLegacyId: (workspace: Workspace) => string | undefined
+): string[] {
+  const idsByPath = idRowIdsByPath(workspaces);
+  const dropped: string[] = [];
+  for (let index = workspaces.length - 1; index >= 0; index--) {
+    const workspace = workspaces[index];
+    // Only a legacy row that shares its path with an id row costs a lookup. idsByPath holds only
+    // string paths, so a row without one never matches.
+    const pathIds = workspace.id ? undefined : idsByPath.get(workspace.path);
+    if (pathIds === undefined) continue;
+    const resolvedId = resolveLegacyId(workspace);
+    if (resolvedId === undefined || !pathIds.includes(resolvedId)) continue;
+    workspaces.splice(index, 1);
+    dropped.push(resolvedId);
+  }
+  return dropped;
+}
+
+/**
+ * The non-empty string `id` that a legacy metadata.json names. Null when the file does not exist,
+ * undefined when it cannot be read or parsed, or names no id.
+ */
+function readLegacyMetadataId(file: string): string | null | undefined {
+  try {
+    const id = (JSON.parse(fs.readFileSync(file, "utf-8")) as { id?: unknown } | null)?.id;
+    return typeof id === "string" && id.length > 0 ? id : undefined;
+  } catch (error) {
+    return isEnoentError(error) ? null : undefined;
+  }
+}
+
+/** An alias group whose merge kept one of two different rows for the same workspace. */
 interface ProjectAliasConflict {
   path: string;
   storedKeys: string[];
@@ -1045,12 +1101,14 @@ interface ProjectAliasConflict {
  * Build the project map from the loaded entries. Stored keys that normalize to the same path
  * ("/repo" and "/repo/") are aliases of one project. `new Map(pairs)` used to keep only the last
  * alias, so the next save dropped the other aliases' workspace rows. Group every alias first,
- * then merge the group's rows. Groups with a same-id conflict go to `conflicts`, so the caller
- * can back up the original bytes before a save drops the other variant (#5929).
+ * then merge the group's rows. Groups with a same-id conflict, or with a legacy copy of an id row
+ * (see dropLegacyDuplicateRows), go to `conflicts`, so the caller can back up the original bytes
+ * before a save drops the other row (#5929).
  */
 function buildProjectsFromStoredEntries(
   entries: StoredProjectEntry[],
-  conflicts: ProjectAliasConflict[]
+  conflicts: ProjectAliasConflict[],
+  resolveLegacyId: (projectPath: string, workspace: Workspace) => string | undefined
 ): Map<string, ProjectConfig> {
   const groups = new Map<string, StoredProjectEntry[]>();
   for (const entry of entries) {
@@ -1066,8 +1124,14 @@ function buildProjectsFromStoredEntries(
     }
     const storedKeys = group.map((entry) => entry.storedKey);
     const merged = mergeProjectAliases(group);
-    if (merged.conflictingIds.length > 0) {
-      conflicts.push({ path: key, storedKeys, conflictingIds: merged.conflictingIds });
+    const conflictingIds = [
+      ...merged.conflictingIds,
+      ...dropLegacyDuplicateRows(merged.config.workspaces, (workspace) =>
+        resolveLegacyId(key, workspace)
+      ),
+    ];
+    if (conflictingIds.length > 0) {
+      conflicts.push({ path: key, storedKeys, conflictingIds });
     } else {
       log.warn("Merged project config entries with the same path", { path: key, storedKeys });
     }
@@ -1187,7 +1251,31 @@ const configLoadFailureStates = new Map<string, ConfigLoadFailureState>();
 // Config files whose last load merged conflicting alias rows but could not back up the bytes
 // (#5929): the backup error for the edit refusal, and a log-dedupe signature (content hash plus
 // errno code: fs messages embed the timestamped sidecar path). Process-scoped as above.
-const aliasConflictBackupFailures = new Map<string, { message: string; signature: string }>();
+const aliasConflictBackupFailures = new Map<string, { message: string }>();
+
+// Failed alias-conflict backups already logged, per config file: sha256 of the bytes plus the
+// errno code (#5929). While backups keep failing, a content that comes back does not log again.
+// A load that needs no backup, or a backup that succeeds, clears it. Capped, so a file that
+// keeps changing cannot grow it without bound.
+const loggedAliasBackupFailures = new Map<string, Set<string>>();
+const MAX_LOGGED_ALIAS_BACKUP_FAILURES = 16;
+
+/** Record `signature` for `configFile`; true when it was not recorded before. */
+function rememberAliasBackupFailure(configFile: string, signature: string): boolean {
+  let seen = loggedAliasBackupFailures.get(configFile);
+  if (seen === undefined) {
+    seen = new Set();
+    loggedAliasBackupFailures.set(configFile, seen);
+  }
+  if (seen.has(signature)) return false;
+  seen.add(signature);
+  // A Set iterates in insertion order: drop the oldest signature first.
+  for (const oldest of seen) {
+    if (seen.size <= MAX_LOGGED_ALIAS_BACKUP_FAILURES) break;
+    seen.delete(oldest);
+  }
+  return true;
+}
 
 /**
  * A `config.json.<tag>-*` sidecar that already holds exactly `rawBytes`, tightened to 0600, or
@@ -1220,6 +1308,10 @@ function findIdenticalConfigSidecar(
     }
   }
   return null;
+}
+
+function sha256Hex(bytes: Buffer): string {
+  return crypto.createHash("sha256").update(bytes).digest("hex");
 }
 
 /**
@@ -1823,31 +1915,45 @@ export class Config {
   private preserveAliasConflictBytes(rawBytes: Buffer, conflicts: ProjectAliasConflict[]): boolean {
     if (conflicts.length === 0) {
       aliasConflictBackupFailures.delete(this.configFile);
+      loggedAliasBackupFailures.delete(this.configFile);
       return true;
     }
     try {
+      // Every degraded load retries in full, including the search for an identical sidecar: that
+      // search is how a backup that becomes readable again is found (#5929).
       const sidecar = writeConfigBytesSidecar(this.configFile, "alias-conflict", rawBytes);
       aliasConflictBackupFailures.delete(this.configFile);
+      loggedAliasBackupFailures.delete(this.configFile);
       // A reused sidecar means an earlier load already logged this content.
       if (!sidecar.reused) {
         log.error(
-          `Project config entries share a path but hold different rows with the same id. Xum keeps the last alias's row for each such id. The original config.json bytes, with every variant, were backed up to ${sidecar.path}.`,
+          `Project config entries share a path and hold conflicting rows for the same workspace. Xum keeps one row per workspace. The original config.json bytes, with every row, were backed up to ${sidecar.path}.`,
           { conflicts }
         );
       }
       return true;
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const signature = `${crypto.createHash("sha256").update(rawBytes).digest("hex")}:${(error as NodeJS.ErrnoException).code ?? message}`;
-      if (aliasConflictBackupFailures.get(this.configFile)?.signature !== signature) {
-        log.error(
-          `Project config entries share a path but hold different rows with the same id, and the backup of ${this.configFile} failed (${message}). Settings changes will not overwrite config.json until a backup succeeds.`,
-          { conflicts }
-        );
-      }
-      aliasConflictBackupFailures.set(this.configFile, { message, signature });
+      this.recordAliasBackupFailure(rawBytes, error, conflicts);
       return false;
     }
+  }
+
+  /** Arm the edit gate for a failed alias-conflict backup, and log it once per signature. */
+  private recordAliasBackupFailure(
+    rawBytes: Buffer,
+    error: unknown,
+    conflicts: ProjectAliasConflict[]
+  ): void {
+    const message = error instanceof Error ? error.message : String(error);
+    // fs messages embed the timestamped sidecar path: dedupe on the errno code instead.
+    const signature = `${sha256Hex(rawBytes)}:${(error as NodeJS.ErrnoException).code ?? message}`;
+    if (rememberAliasBackupFailure(this.configFile, signature)) {
+      log.error(
+        `Project config entries share a path and hold conflicting rows for the same workspace, and the backup of ${this.configFile} failed (${message}). Settings changes will not overwrite config.json until a backup succeeds.`,
+        { conflicts }
+      );
+    }
+    aliasConflictBackupFailures.set(this.configFile, { message });
   }
 
   /** Failure state this instance's last failed load wrote; see getConfigLoadError. */
@@ -1970,9 +2076,11 @@ export class Config {
       // The last load decides the alias-conflict gate (#5929): a missing or corrupt file has
       // no merged rows to protect, and the corrupt-file gate below covers the latter.
       aliasConflictBackupFailures.delete(this.configFile);
+      loggedAliasBackupFailures.delete(this.configFile);
       configLoadFailureStates.delete(this.configFile);
     } catch (error) {
       aliasConflictBackupFailures.delete(this.configFile);
+      loggedAliasBackupFailures.delete(this.configFile);
       this.handleConfigLoadFailure(rawBytes, error);
       if (options?.throwOnError) throw error;
     }
@@ -2086,6 +2194,28 @@ export class Config {
     }
   }
 
+  /**
+   * The one id that an id-less legacy row stands for, or undefined when that is not certain. The
+   * read-time migration reads sessions/<legacy id>/metadata.json, and findWorkspace also resolves
+   * the old layout's sessions/<checkout basename>/metadata.json. Every such file that exists must
+   * name the same id. Two different ids, a file that cannot be read, or a file without an id
+   * give undefined, so the caller keeps the row: dropping it would hide the other identity from
+   * known-id checks that delete data (#5929). With no file, the row stands for the legacy id.
+   */
+  private resolveLegacyRowId(projectPath: string, workspace: Workspace): string | undefined {
+    const legacyId = this.generateLegacyId(projectPath, workspace.path);
+    // The same basename expression as buildWorkspaceMetadata (#6485 tracks its Windows gap).
+    const basename =
+      workspace.path.split("/").pop() ?? workspace.path.split("\\").pop() ?? "unknown";
+    const ids = new Set<string | undefined>();
+    for (const candidate of basename === legacyId ? [legacyId] : [legacyId, basename]) {
+      const id = readLegacyMetadataId(path.join(this.sessionsDir, candidate, "metadata.json"));
+      if (id !== null) ids.add(id);
+    }
+    if (ids.size === 0) return legacyId;
+    return ids.size === 1 ? [...ids][0] : undefined;
+  }
+
   private normalizeConfigProjects(
     projects: AppConfigOnDisk["projects"] | undefined,
     aliasConflicts: ProjectAliasConflict[]
@@ -2124,7 +2254,9 @@ export class Config {
           config: normalizeProjectRuntimeSettings(projectConfig),
         };
       });
-    return buildProjectsFromStoredEntries(storedEntries, aliasConflicts);
+    return buildProjectsFromStoredEntries(storedEntries, aliasConflicts, (projectPath, workspace) =>
+      this.resolveLegacyRowId(projectPath, workspace)
+    );
   }
 
   private normalizeParsedConfig(

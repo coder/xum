@@ -1014,6 +1014,37 @@ describe("agentSkillsService", () => {
     ).toContain("must match directory name");
   });
 
+  test("discoverAgentSkills reports invalid paths globs and keeps valid path-scoped skills", async () => {
+    using project = new DisposableTempDir("agent-skills-paths");
+    using global = new DisposableTempDir("agent-skills-paths-global");
+    const projectSkillsRoot = path.join(project.path, ".mux", "skills");
+
+    for (const [name, pathsYaml] of [
+      ["ts-rules", 'paths: "src/**/*.ts, *.{ts,tsx}"'],
+      ["bad-glob", 'paths: ["src/[abc"]'],
+    ] as const) {
+      await fs.mkdir(path.join(projectSkillsRoot, name), { recursive: true });
+      await fs.writeFile(
+        path.join(projectSkillsRoot, name, "SKILL.md"),
+        `---\nname: ${name}\ndescription: d\n${pathsYaml}\n---\nBody\n`,
+        "utf-8"
+      );
+    }
+
+    const diagnostics = await discoverAgentSkills(new LocalRuntime(project.path), project.path, {
+      roots: { projectRoot: projectSkillsRoot, globalRoot: global.path },
+    });
+
+    expect(diagnostics.skills.find((s) => s.name === "ts-rules")?.paths).toEqual([
+      "src/**/*.ts",
+      "*.{ts,tsx}",
+    ]);
+    expect(diagnostics.skills.some((s) => s.name === "bad-glob")).toBe(false);
+    const issue = diagnostics.invalidSkills.find((i) => i.directoryName === "bad-glob");
+    expect(issue?.message).toContain("paths");
+    expect(issue?.message).toContain("src/[abc");
+  });
+
   test("discovers symlinked skill directories", async () => {
     using project = new DisposableTempDir("agent-skills-symlink");
     using skillSource = new DisposableTempDir("agent-skills-source");
@@ -1451,6 +1482,35 @@ describe("agentSkillsService agent plugins", () => {
     await expect(
       readAgentSkill(runtime, tmp.path, SkillNameSchema.parse("blocked"), options)
     ).rejects.toThrow("not found");
+  });
+
+  test("a plugin with several skills roots serves each root's skills; the first root wins a name", async () => {
+    using tmp = new DisposableTempDir("plugin-skill-roots");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "multi");
+    await fs.mkdir(path.join(pluginDir, ".codex-plugin"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, ".codex-plugin", "plugin.json"),
+      JSON.stringify({ name: "multi", skills: ["./core", "./extra"] })
+    );
+    await writeSkill(path.join(pluginDir, "core"), "shared", "from core");
+    await writeSkill(path.join(pluginDir, "extra"), "shared", "from extra");
+    await writeSkill(path.join(pluginDir, "extra"), "summarize", "from extra");
+    const runtime = new LocalRuntime(tmp.path);
+    const roots = {
+      projectRoot: "",
+      globalRoot: path.join(tmp.path, "skills"),
+      universalRoot: "",
+      globalPluginRoots: [container],
+    };
+
+    const { skills } = await discoverAgentSkills(runtime, tmp.path, { roots });
+
+    expect(skills.find((s) => s.name === "shared")?.description).toBe("from core");
+    expect(
+      (await readAgentSkill(runtime, tmp.path, SkillNameSchema.parse("summarize"), { roots }))
+        .package.frontmatter.description
+    ).toBe("from extra");
   });
 
   test("managed imports gate enumeration and direct reads without shadowing allowed same-name fallbacks", async () => {
@@ -1911,6 +1971,119 @@ describe("agentSkillsService agent plugins", () => {
       expect(skills.find((s) => s.name === "linked-skill")).toBeUndefined();
     }
   );
+
+  describe("plugin skill namespaces (<plugin>:<skill>)", () => {
+    function setup(tmpPath: string) {
+      const runtime = new LocalRuntime(tmpPath);
+      const container = path.join(tmpPath, "plugins");
+      const roots = {
+        projectRoot: path.join(tmpPath, "project", "skills"),
+        globalRoot: path.join(tmpPath, "skills"),
+        universalRoot: "",
+        projectPluginRoots: [path.join(tmpPath, "project", "plugins")],
+        globalPluginRoots: [container],
+      };
+      const read = async (lookup: string) =>
+        (await readAgentSkill(runtime, tmpPath, lookup, { roots })).package;
+      const discover = () => discoverAgentSkills(runtime, tmpPath, { roots });
+      return { container, roots, read, discover };
+    }
+
+    test("qualified name reaches a plugin skill shadowed by a global skill", async () => {
+      using tmp = new DisposableTempDir("plugin-namespace-shadowed");
+      const { container, roots, read, discover } = setup(tmp.path);
+      await writeSkill(roots.globalRoot, "tdd", "global tdd");
+      await writePlugin(container, "pstack", [{ name: "tdd", description: "pstack tdd" }]);
+
+      expect((await read("tdd")).frontmatter.description).toBe("global tdd");
+      const qualified = await read("pstack:tdd");
+      expect(qualified.frontmatter.description).toBe("pstack tdd");
+      expect(qualified.scope).toBe("global");
+
+      const result = await discover();
+      const tdd = result.skills.find((skill) => skill.name === "tdd");
+      expect(tdd?.description).toBe("global tdd");
+      expect(tdd?.pluginName).toBeUndefined();
+      expect(result.shadowedPluginSkills).toEqual([
+        expect.objectContaining({ name: "tdd", pluginName: "pstack", description: "pstack tdd" }),
+      ]);
+    });
+
+    test("two plugins with the same skill name stay reachable", async () => {
+      using tmp = new DisposableTempDir("plugin-namespace-two-plugins");
+      const { container, read, discover } = setup(tmp.path);
+      await writePlugin(container, "alpha", [{ name: "tdd", description: "alpha tdd" }]);
+      await writePlugin(container, "beta", [{ name: "tdd", description: "beta tdd" }]);
+
+      expect((await read("tdd")).frontmatter.description).toBe("alpha tdd");
+      expect((await read("alpha:tdd")).frontmatter.description).toBe("alpha tdd");
+      expect((await read("beta:tdd")).frontmatter.description).toBe("beta tdd");
+      const { shadowedPluginSkills } = await discover();
+      expect(shadowedPluginSkills?.map((skill) => skill.pluginName)).toEqual(["beta"]);
+    });
+
+    test("a project plugin wins the qualified name over a global plugin of the same name", async () => {
+      using tmp = new DisposableTempDir("plugin-namespace-project-global");
+      const { container, roots, read, discover } = setup(tmp.path);
+      await writePlugin(roots.projectPluginRoots[0], "pstack", [
+        { name: "tdd", description: "project pstack" },
+      ]);
+      await writePlugin(container, "pstack", [{ name: "tdd", description: "global pstack" }]);
+
+      const qualified = await read("pstack:tdd");
+      expect(qualified.frontmatter.description).toBe("project pstack");
+      expect(qualified.scope).toBe("project");
+      // `pstack:tdd` already resolves to the project plugin, so the global one is unreachable.
+      expect((await discover()).shadowedPluginSkills).toBeUndefined();
+    });
+
+    test("qualified misses never fall back to other skills", async () => {
+      using tmp = new DisposableTempDir("plugin-namespace-miss");
+      const { container, roots, read } = setup(tmp.path);
+      await writeSkill(roots.globalRoot, "tdd", "global tdd");
+      await writeSkill(roots.globalRoot, "missing", "global missing");
+      await writePlugin(container, "pstack", [{ name: "tdd", description: "pstack tdd" }]);
+
+      await expect(read("nope:tdd")).rejects.toThrow("Agent skill not found: nope:tdd");
+      await expect(read("pstack:missing")).rejects.toThrow("Agent skill not found: pstack:missing");
+      // `orchestrate` is a built-in skill: a plugin qualifier must never return it.
+      expect((await read("orchestrate")).scope).toBe("built-in");
+      await expect(read("pstack:orchestrate")).rejects.toThrow("Agent skill not found");
+    });
+
+    test("import selection hides a non-imported skill from qualified lookup", async () => {
+      using tmp = new DisposableTempDir("plugin-namespace-selection");
+      const { container, read } = setup(tmp.path);
+      await writePlugin(container, "managed", [
+        { name: "allowed", description: "selected" },
+        { name: "blocked", description: "not selected" },
+      ]);
+      await fs.writeFile(
+        path.join(tmp.path, "plugins.json"),
+        JSON.stringify({
+          plugins: [
+            createTestPluginInstallEntry("managed", { skills: ["allowed"], mcpServers: [] }),
+          ],
+        })
+      );
+
+      expect((await read("managed:allowed")).frontmatter.description).toBe("selected");
+      await expect(read("managed:blocked")).rejects.toThrow("Agent skill not found");
+    });
+
+    test("an invalid shadowed plugin skill adds no diagnostics", async () => {
+      using tmp = new DisposableTempDir("plugin-namespace-invalid-shadow");
+      const { container, roots, discover } = setup(tmp.path);
+      await writeSkill(roots.globalRoot, "tdd", "global tdd");
+      const pluginDir = await writePlugin(container, "pstack", []);
+      await fs.mkdir(path.join(pluginDir, "skills", "tdd"), { recursive: true });
+      await fs.writeFile(path.join(pluginDir, "skills", "tdd", "SKILL.md"), "no frontmatter\n");
+
+      const result = await discover();
+      expect(result.invalidSkills).toEqual([]);
+      expect(result.shadowedPluginSkills).toBeUndefined();
+    });
+  });
 });
 
 // #4438: on SSH runtimes a transport failure says nothing about a skill. It must

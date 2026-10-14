@@ -210,8 +210,9 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
   const { api } = useAPI();
   const chatInputRef = useRef<ChatInputAPI | null>(null);
   const pendingAgentsInitSendRef = useRef(false);
-  // #6038: "Run /init" sends through the creation composer, which cannot send while its branch
-  // list loads (or failed). Off until the composer of this scope reports it can send.
+  // #6038, #6423: "Run /init" sends through the creation composer, so it is off whenever that
+  // composer's Send is off (branch list, Coder presets, a send in flight, ...). Off until the
+  // composer of this scope reports it can send.
   const creationComposerKey = `${projectPath}:${pendingDraftId ?? "__pending__"}`;
   const [creationSendBlocked, setCreationSendBlocked] = useCreationSendBlocked(creationComposerKey);
   const [showAgentsInitNudge, setShowAgentsInitNudge] = usePersistedState<boolean>(

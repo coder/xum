@@ -1,9 +1,6 @@
 import { useEffect, useState } from "react";
 import { useAPI } from "@/browser/contexts/API";
-import {
-  beginMcpAppViewDomainsRequest,
-  publishMcpAppViewDomains,
-} from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewDomainsStore";
+import { publishMcpAppViewDomains } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewDomainsStore";
 import type { McpAppViewDomains } from "@/common/orpc/schemas/mcpApps";
 import { getErrorMessage } from "@/common/utils/errors";
 
@@ -42,19 +39,20 @@ export function useMcpAppViewDomains() {
     revokeError,
     revoke: async (entry: Pick<McpAppViewDomains, "projectPath" | "serverName">) => {
       if (!api) return;
-      const requestSeq = beginMcpAppViewDomainsRequest();
+      let revision: number;
       try {
-        await api.mcpApps.revokeViewDomains({
+        ({ revision } = await api.mcpApps.revokeViewDomains({
           projectPath: entry.projectPath,
           serverName: entry.serverName,
-        });
+        }));
       } catch (error) {
         setRevokeError({ ...entry, message: getErrorMessage(error) });
         return;
       }
       setRevokeError(null);
-      // Mounted views of this server reload at once under the base policy (and ask again).
-      publishMcpAppViewDomains(entry.projectPath, entry.serverName, [], requestSeq);
+      // Mounted views of this server reload at once under the base policy (and ask again). An
+      // approval committed after this revoke has a newer revision, so it still applies.
+      publishMcpAppViewDomains(entry.projectPath, entry.serverName, [], revision);
       setTick((value) => value + 1);
     },
   };

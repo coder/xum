@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
-import { normalizeCodexManifest, readOpenAIExtension } from "./openaiExtension";
+import {
+  MAX_HOOK_POINTER_ENTRIES,
+  normalizeCodexManifest,
+  readOpenAIExtension,
+} from "./openaiExtension";
 
 const validInterface = { displayName: "Figma", shortDescription: "Design", developerName: "Figma" };
 
@@ -139,6 +143,33 @@ describe("readOpenAIExtension", () => {
     expect(warnings).toHaveLength(1);
   });
 
+  test("reads at most the hook loader's entry cap and reports the rest once", () => {
+    const { extension, warnings } = readOpenAIExtension({
+      extensions: {
+        "com.openai": { hooks: [...Array<string>(100_000).fill("/bad"), "./hooks/late.json"] },
+      },
+    });
+
+    // The late valid entry is past the cap, so no entry is valid: the default file stays off.
+    expect(extension).toEqual({ hooks: [] });
+    expect(warnings).toHaveLength(MAX_HOOK_POINTER_ENTRIES + 1);
+    expect(warnings.filter((warning) => warning.includes("100001 entries"))).toHaveLength(1);
+  });
+
+  test("keeps review and publication as opaque objects; other shapes warn", () => {
+    const review = { tests: [{ prompt: "Hi" }] };
+    const kept = readOpenAIExtension({
+      extensions: { "com.openai": { review, publication: { countries: [] } } },
+    });
+    expect(kept).toEqual({ extension: { review, publication: { countries: [] } }, warnings: [] });
+
+    const dropped = readOpenAIExtension({
+      extensions: { "com.openai": { review: "yes", publication: [] } },
+    });
+    expect(dropped.extension).toEqual({});
+    expect(dropped.warnings).toHaveLength(2);
+  });
+
   test("an absent namespace yields nothing; a non-object namespace warns", () => {
     expect(readOpenAIExtension({})).toEqual({ extension: undefined, warnings: [] });
     const result = readOpenAIExtension({ extensions: { "com.openai": "yes" } });
@@ -148,12 +179,24 @@ describe("readOpenAIExtension", () => {
 });
 
 describe("normalizeCodexManifest", () => {
-  test("maps a one-entry skills array; longer arrays stay unknown", () => {
+  test("maps a skills path or every entry of a skills array", () => {
     expect(normalizeCodexManifest({ name: "a", skills: ["./custom/"] }).manifest).toMatchObject({
-      contributes: { skills: "./custom" },
+      contributes: { skills: ["./custom"] },
     });
-    expect(normalizeCodexManifest({ name: "a", skills: ["./a", "./b"] }).manifest).toMatchObject({
-      skills: ["./a", "./b"],
+    const { manifest } = normalizeCodexManifest({ name: "a", skills: ["./a/", "./b", "../x", 3] });
+    // Unsafe entries pass through so the validator reports each one.
+    expect(manifest).toMatchObject({ contributes: { skills: ["./a", "./b", "../x", 3] } });
+    expect(manifest).not.toHaveProperty("skills");
+    // One MCP file only: a one-entry mcpServers array maps, a longer one stays unknown.
+    expect(
+      normalizeCodexManifest({ name: "a", mcpServers: ["./.mcp.json"] }).manifest
+    ).toMatchObject({ contributes: { mcp: "./.mcp.json" } });
+    expect(
+      normalizeCodexManifest({ name: "a", mcpServers: ["./a.json", "./b.json"] }).manifest
+    ).toMatchObject({ mcpServers: ["./a.json", "./b.json"] });
+    // Another shape stays top-level, and the validator reports it as unknown.
+    expect(normalizeCodexManifest({ name: "a", skills: { a: 1 } }).manifest).toMatchObject({
+      skills: { a: 1 },
     });
   });
 
