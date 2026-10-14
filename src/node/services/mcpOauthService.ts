@@ -316,8 +316,9 @@ function grantCoversBaseScopes(
 
 function assertGrantCoversBaseScopes(
   scope: string | undefined,
-  config: MCPServerOAuthConfig | undefined
+  plugin: { config: MCPServerOAuthConfig } | undefined
 ): void {
+  const config = plugin?.config;
   if (grantCoversBaseScopes(scope, config)) return;
   const granted = new Set(scope?.split(" ") ?? []);
   const missing = (config?.baseScopes ?? []).filter((base) => !granted.has(base));
@@ -351,7 +352,16 @@ function storedClientMatches(
 ): boolean {
   if (config?.clientId !== undefined && stored?.clientInformation?.client_id !== config.clientId)
     return false;
-  if (!grantCoversBaseScopes(stored?.tokens?.scope, config)) return false;
+  return (
+    grantCoversBaseScopes(stored?.tokens?.scope, config) && storedIssuerMatches(stored, config)
+  );
+}
+
+/** The pinned-issuer part of storedClientMatches. */
+function storedIssuerMatches(
+  stored: MCPOAuthStoredCredentials | null | undefined,
+  config: MCPServerOAuthConfig | undefined
+): boolean {
   const issuer = pinnedIssuer(config);
   if (issuer === undefined) return true;
   // Each record the SDK reads must be bound to the pinned issuer: its SEP-2352 stamp, or for a
@@ -1677,7 +1687,7 @@ export class McpOauthService {
       saveTokens: async (tokens) => {
         // Tokens without a base scope would read as signed out (storedClientMatches): fail the
         // sign-in with the reason instead of reporting "Login complete" (#6141).
-        assertGrantCoversBaseScopes(tokens.scope, flow.plugin?.config);
+        assertGrantCoversBaseScopes(tokens.scope, flow.plugin);
         await this.saveTokens({
           serverUrl: flow.serverUrlForStoreKey,
           // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
