@@ -787,6 +787,21 @@ describe("Codex output rules (output_parser.rs)", () => {
     });
   const stopInput = { messageId: "a1", lastAssistantMessage: "done", stopHookActive: false };
 
+  test("a voided output without a rewrite or a deny runs the original call", async () => {
+    // The unchanged case next to #6608's deny of a voided rewrite: nothing to bypass here.
+    for (const extra of [{ suppressOutput: true }, { unexpectedField: true }]) {
+      const { spine } = setup([hook("PreToolUse")], () =>
+        json({
+          ...extra,
+          hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: "Dropped." },
+        })
+      );
+      const ctx = await runTool(spine, "bash", { script: "ls" });
+      expect(ctx.executed).toBe(true);
+      expect(ctx.result).toEqual({ ran: { script: "ls" } });
+    }
+  });
+
   test("an unknown field voids the output, but not an explicit deny", async () => {
     // Codex rejects such an output (deny_unknown_fields). Xum keeps a deny next to it, as for
     // every semantic error (Codex security review PRRT_kwDOPxxmWM6sTlti).
