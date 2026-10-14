@@ -205,7 +205,10 @@ export async function generateWorkspaceIdentity(
   conversationContext?: string,
   /** Optional most recent user message; included as additional context only — not given precedence over older turns. */
   latestUserMessage?: string,
-  /** Stops the request in flight and every later candidate (a deadline, or the workspace went away). */
+  /**
+   * Stops the request in flight (a deadline, or the workspace went away). Later candidates then
+   * fail at once without a request, since their fetch starts with the signal already aborted.
+   */
   abortSignal?: AbortSignal
 ): Promise<Result<GenerateWorkspaceIdentityResult, NameGenerationError>> {
   if (candidates.length === 0) {
@@ -220,9 +223,6 @@ export async function generateWorkspaceIdentity(
   let lastError: NameGenerationError | null = null;
 
   for (let i = 0; i < maxAttempts; i++) {
-    if (abortSignal?.aborted) {
-      return Err({ type: "unknown", raw: "Name generation was aborted" });
-    }
     const candidate = candidates[i];
     const modelString = candidate.model;
 

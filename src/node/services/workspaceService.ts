@@ -53,7 +53,7 @@ import {
   workspacesSharingPlanDirectory,
   type Config,
 } from "@/node/config";
-import type { ProjectsConfig, Workspace } from "@/common/types/project";
+import type { ProjectConfig, ProjectsConfig, Workspace } from "@/common/types/project";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
 import { askUserQuestionManager } from "@/node/services/askUserQuestionManager";
@@ -1128,6 +1128,13 @@ interface CreationNaming {
    * apply; false aborts the naming.
    */
   settleCreation(created: boolean): void;
+}
+
+/** Why a backend-generated branch name cannot replace the provisional one, if it cannot. */
+function refuseGeneratedBranchName(generated: string, provisional: string): string | undefined {
+  const validation = validateWorkspaceBranchName(generated);
+  if (!validation.valid) return validation.error ?? "invalid generated branch name";
+  return generated === provisional ? "the generated name is the same" : undefined;
 }
 
 function describeRollbackLeftovers(leftovers: readonly string[]): string {
@@ -4114,42 +4121,37 @@ export class WorkspaceService
       // still opt in from the workspace's settings.
       return;
     }
-    if (args.naming) {
-      await this.renameBranchAfterCreationNaming(
-        runtime,
-        initParams,
-        args.workspaceName,
-        args.naming
-      );
-      // Removal may have started during the naming wait; it owns the checkout, as above.
-      if (this.removingWorkspaces.has(workspaceId)) return;
-    }
     // Checkout populated and sanitized: only now may other task trees discover and message
     // this workspace. Granting at registration would rely on waitForInit, which a second
     // backend sharing this root does not observe.
-    await this.grantPendingDefaultUnrelatedWorkspaceConsent(workspaceId);
-    await runBackgroundInit(
+    await this.runCreatedWorkspaceInit(
       runtime,
       initParams,
       workspaceId,
-      workspaceUseLeasesFor(this.config),
-      log
+      args.workspaceName,
+      args.naming,
+      () => this.grantPendingDefaultUnrelatedWorkspaceConsent(workspaceId)
     );
   }
 
-  /** The init of a checkout create() populated before announcing it. */
+  /**
+   * The init of a new workspace's populated checkout: a backend-named workspace's branch rename
+   * first, then `beforeInit`, then the init hook.
+   */
   private async runCreatedWorkspaceInit(
     runtime: Runtime,
     initParams: WorkspaceInitParams,
     workspaceId: string,
     workspaceName: string,
-    naming: CreationNaming | undefined
+    naming: CreationNaming | undefined,
+    beforeInit?: () => Promise<void>
   ): Promise<void> {
     if (naming) {
       await this.renameBranchAfterCreationNaming(runtime, initParams, workspaceName, naming);
       // Removal may have started during the naming wait; it now owns the checkout.
       if (this.removingWorkspaces.has(workspaceId)) return;
     }
+    await beforeInit?.();
     await runBackgroundInit(
       runtime,
       initParams,
@@ -6361,6 +6363,31 @@ export class WorkspaceService
     }
   }
 
+  /** The next free "workspace-N" name, as /new and backend-named creations use. */
+  private async nextAutoWorkspaceBranchName(
+    owningProjectPath: string,
+    projectConfig: ProjectConfig,
+    planDirectoryNames: ReadonlySet<string>
+  ): Promise<string> {
+    const existingNamesSet = new Set<string>(planDirectoryNames);
+    for (const entry of projectConfig.workspaces ?? []) {
+      if (typeof entry.name === "string") {
+        existingNamesSet.add(entry.name);
+      }
+    }
+    try {
+      for (const localBranch of await listLocalBranches(owningProjectPath)) {
+        existingNamesSet.add(localBranch);
+      }
+    } catch (error) {
+      log.debug("Failed to list local branches for /new auto-name preflight", {
+        projectPath: owningProjectPath,
+        error: getErrorMessage(error),
+      });
+    }
+    return generateForkBranchName(AUTO_NEW_WORKSPACE_BASE_NAME, [...existingNamesSet]);
+  }
+
   async create(
     projectPath: string,
     branchName: string | undefined,
@@ -6399,6 +6426,7 @@ export class WorkspaceService
   ): Promise<Result<{ metadata: FrontendWorkspaceMetadata; createdBranch?: boolean }>> {
     const defaultConsent = options?.defaultUnrelatedConsent ?? "after-setup";
     const delegatedCreation = options?.delegatedCreation;
+    const nameGeneration = options?.nameGeneration;
     assert(
       delegatedCreation == null ||
         (delegatedCreation.handleId.length > 0 && delegatedCreation.ownerWorkspaceId.length > 0),
@@ -6447,9 +6475,12 @@ export class WorkspaceService
       type: "worktree",
       srcBaseDir: this.config.srcDir,
     };
-    const namingRefusal =
-      options?.nameGeneration &&
-      this.refuseCreationNaming(options.nameGeneration, branchName, title, finalRuntimeConfig);
+    const namingRefusal = this.refuseCreationNaming(
+      nameGeneration,
+      branchName,
+      title,
+      finalRuntimeConfig
+    );
     if (namingRefusal) {
       return Err(namingRefusal);
     }
@@ -6475,30 +6506,13 @@ export class WorkspaceService
     // existing workspace names AND local git branches so numbering is stable.
     // Branches/worktrees are owned by the parent project, so always read from
     // owningProjectPath even when a sub-project initiated creation.
-    let resolvedBranchName: string;
-    if (branchName == null) {
-      const existingNamesSet = new Set<string>(planDirectoryNames);
-      for (const entry of projectConfig.workspaces ?? []) {
-        if (typeof entry.name === "string") {
-          existingNamesSet.add(entry.name);
-        }
-      }
-      try {
-        for (const localBranch of await listLocalBranches(owningProjectPath)) {
-          existingNamesSet.add(localBranch);
-        }
-      } catch (error) {
-        log.debug("Failed to list local branches for /new auto-name preflight", {
-          projectPath: owningProjectPath,
-          error: getErrorMessage(error),
-        });
-      }
-      resolvedBranchName = generateForkBranchName(AUTO_NEW_WORKSPACE_BASE_NAME, [
-        ...existingNamesSet,
-      ]);
-    } else {
-      resolvedBranchName = branchName;
-    }
+    const resolvedBranchName =
+      branchName ??
+      (await this.nextAutoWorkspaceBranchName(
+        owningProjectPath,
+        projectConfig,
+        planDirectoryNames
+      ));
 
     const validation = validateWorkspaceBranchName(resolvedBranchName);
     if (!validation.valid) {
@@ -6558,9 +6572,12 @@ export class WorkspaceService
     const initAbortController = new AbortController();
     this.initAbortControllers.set(workspaceId, initAbortController);
     // Settled in the finally below; started now so naming overlaps the checkout.
-    const naming =
-      options?.nameGeneration &&
-      this.startCreationNaming(workspaceId, options.nameGeneration, initAbortController.signal);
+    const naming = this.startCreationNaming(
+      workspaceId,
+      nameGeneration,
+      initAbortController.signal
+    );
+    let namingCreated = false;
 
     const initLogger = this.createInitLogger(workspaceId);
     // True once a retained owner (the deferred checkout's settlement) finalizes the pending
@@ -6938,7 +6955,7 @@ export class WorkspaceService
       eventSpine.emit("workspace.created", { workspaceId });
       // The caller now owns the pending default (see the option).
       if (defaultConsent === "caller-finalizes") pendingDefaultHandedOff = true;
-      naming?.settleCreation(true);
+      namingCreated = true;
       return Ok({
         metadata: this.enrichFrontendMetadata(completeMetadata),
         // Lets a caller that undoes this creation keep a branch it merely reused (#4819).
@@ -6961,8 +6978,8 @@ export class WorkspaceService
       if (!pendingDefaultHandedOff) {
         await this.clearPendingDefaultUnrelatedConsent(workspaceId);
       }
-      // No-op after the success above; any other exit aborts the naming.
-      naming?.settleCreation(false);
+      // Any exit but the success above aborts the naming.
+      naming?.settleCreation(namingCreated);
     }
   }
 
@@ -10673,11 +10690,14 @@ export class WorkspaceService
 
   /** create()'s preflight for nameGeneration; returns the refusal, if any. */
   private refuseCreationNaming(
-    request: CreationNamingRequest,
+    request: CreationNamingRequest | undefined,
     branchName: string | undefined,
     title: string | undefined,
     runtimeConfig: RuntimeConfig
   ): string | undefined {
+    if (request === undefined) {
+      return undefined;
+    }
     if (branchName != null || title != null) {
       return "nameGeneration cannot be combined with branchName or title";
     }
@@ -10700,9 +10720,10 @@ export class WorkspaceService
    */
   private startCreationNaming(
     workspaceId: string,
-    request: CreationNamingRequest,
+    request: CreationNamingRequest | undefined,
     initAbortSignal: AbortSignal
-  ): CreationNaming {
+  ): CreationNaming | undefined {
+    if (request === undefined) return undefined;
     this.autoTitlingWorkspaces.add(workspaceId);
     const namingAbort = new AbortController();
     let settleCreation!: (created: boolean) => void;
@@ -10742,13 +10763,9 @@ export class WorkspaceService
       .finally(() => {
         this.autoTitlingWorkspaces.delete(workspaceId);
       });
-    let creationSettled = false;
     return {
       outcome,
       settleCreation: (wasCreated) => {
-        // create() reports success, then its finally reports failure for every exit: first wins.
-        if (creationSettled) return;
-        creationSettled = true;
         if (!wasCreated) namingAbort.abort();
         settleCreation(wasCreated);
       },
@@ -10833,9 +10850,8 @@ export class WorkspaceService
     if (waited.kind !== "ok") return Err("workspace setup was cancelled");
     if (!waited.value.success) return Err(waited.value.error);
     const generatedBranch = waited.value.data.name;
-    const validation = validateWorkspaceBranchName(generatedBranch);
-    if (!validation.valid) return Err(validation.error ?? "invalid generated branch name");
-    if (generatedBranch === initParams.branchName) return Err("the generated name is the same");
+    const refusal = refuseGeneratedBranchName(generatedBranch, initParams.branchName);
+    if (refusal !== undefined) return Err(refusal);
     if (runtime.renameWorkspaceBranch === undefined) {
       return Err("this runtime cannot rename branches");
     }

@@ -141,6 +141,21 @@ function toStoredMessage(message: string): string {
 }
 
 /**
+ * Whether auto naming still has to name `message`: generation stores lastGeneratedFor together
+ * with the identity, so a match means an identity exists for exactly this message.
+ */
+function needsGenerationFor(
+  state: Pick<WorkspaceNamePersistedState, "autoGenerate" | "lastGeneratedFor">,
+  message: string
+): boolean {
+  return (
+    state.autoGenerate &&
+    message.trim().length > 0 &&
+    state.lastGeneratedFor !== toStoredMessage(message)
+  );
+}
+
+/**
  * Bound the user-input-sized fields of persisted name state so it fits its key budget; also
  * shrinks state that older builds stored unbounded. Returns null when `state` is not name state.
  */
@@ -379,7 +394,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     // - Auto-generation is disabled
     // - Message is empty
     // - Already generated for this message
-    if (!autoGenerate || !message.trim() || lastGeneratedFor === toStoredMessage(message)) {
+    if (!needsGenerationFor({ autoGenerate, lastGeneratedFor }, message)) {
       // Clear any pending timer since conditions changed
       if (debounceTimerRef.current) {
         clearTimeout(debounceTimerRef.current);
@@ -501,18 +516,10 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
   }, [autoGenerate, name, generatedIdentity, lastGeneratedFor, message, generateIdentity]);
 
   const handOffGeneration = useCallback((): WorkspaceNameGenerationRequest | null => {
-    if (!autoGenerate || !message.trim()) return null;
-    if (generatedIdentity && lastGeneratedFor === toStoredMessage(message)) return null;
+    if (!needsGenerationFor({ autoGenerate, lastGeneratedFor }, message)) return null;
     cancelPendingGeneration();
     return { message, candidates };
-  }, [
-    autoGenerate,
-    message,
-    generatedIdentity,
-    lastGeneratedFor,
-    cancelPendingGeneration,
-    candidates,
-  ]);
+  }, [autoGenerate, message, lastGeneratedFor, cancelPendingGeneration, candidates]);
 
   return useMemo(
     () => ({
