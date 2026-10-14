@@ -468,6 +468,24 @@ describe("on-send compaction follow-up", () => {
     ]);
   });
 
+  test("a redispatched follow-up keeps only the context under the persisted cap", async () => {
+    // Codex PRRT_kwDOPxxmWM6rPrJe: the handoff row is read from disk like any other row.
+    const { h } = await setup(addContext);
+    setOnSendCompaction(h, false);
+    const kept = { pluginId: "fake", text: "Ask for a reproduction first." };
+    await seedHandoff(h, {
+      text: "fix it",
+      model: options.model,
+      agentId: "exec",
+      pluginSendHooksApplied: true,
+      pluginHookContext: [kept, { pluginId: "fake", text: "x".repeat(70 * 1024) }],
+    });
+
+    expect(await h.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);
+
+    expect((await userRows(h)).at(-1)?.metadata?.pluginHookContext).toEqual([kept]);
+  });
+
   test("recovery runs the hooks for a client-replaced summary with forged markers", async () => {
     // Codex P1 (PRRT_kwDOPxxmWM6rZbml): WorkspaceService.replaceHistory sanitizes a client's
     // summary row this way before persisting it.

@@ -58,6 +58,7 @@ import {
 import { createPreservedTailCopyMessageId } from "@/node/services/utils/messageIds";
 import { stripAnthropicThinkingFromTailCopy } from "@/common/utils/compaction/tailCopyThinking";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
+import { readPersistedPluginHookContext } from "@/common/utils/messages/pluginHookContext";
 import {
   mergeLoadedSkillSnapshots,
   extractLoadedSkillSnapshotsFromMessages,
@@ -219,6 +220,44 @@ interface CompactionHandlerOptions {
  * - Appending compacted summaries as durable history boundaries
  * - Preserving cumulative usage across compactions
  */
+/**
+ * The metadata a tail copy keeps verbatim, when set (see buildPreservedTailCopy for the fields it
+ * must never copy):
+ * - `partial` keeps interrupted-tool sentinels applying.
+ * - `muxMetadata` drives provider-side filtering (workflow display rows).
+ *
+ * `pluginHookContext` is copied too, but through its persisted-row reader (see
+ * buildPreservedTailCopy).
+ */
+type RowMetadata = NonNullable<MuxMessage["metadata"]>;
+
+const TAIL_COPY_METADATA_KEYS = [
+  "timestamp",
+  "model",
+  "thinkingLevel",
+  "agentId",
+  "stepStartPartIndices",
+  "partial",
+  "muxMetadata",
+  "kind",
+  "fileAtMentionSnapshot",
+  "agentSkillSnapshot",
+] as const satisfies ReadonlyArray<keyof RowMetadata>;
+
+function pluginHookContextOf(source: RowMetadata | undefined): Partial<RowMetadata> {
+  const entries = readPersistedPluginHookContext(source?.pluginHookContext);
+  return entries.length > 0 ? { pluginHookContext: entries } : {};
+}
+
+function pickTailCopyMetadata(source: RowMetadata | undefined): Partial<RowMetadata> {
+  if (source === undefined) return {};
+  return Object.fromEntries(
+    TAIL_COPY_METADATA_KEYS.flatMap((key) =>
+      source[key] !== undefined ? [[key, source[key]]] : []
+    )
+  ) as Partial<RowMetadata>;
+}
+
 export class CompactionHandler {
   private readonly workspaceId: string;
   private readonly historyService: HistoryService;
@@ -1294,25 +1333,11 @@ export class CompactionHandler {
       metadata: {
         synthetic: true,
         rlmPreservedTailCopy: true,
-        ...(source?.timestamp !== undefined ? { timestamp: source.timestamp } : {}),
-        ...(source?.model !== undefined ? { model: source.model } : {}),
-        ...(source?.thinkingLevel !== undefined ? { thinkingLevel: source.thinkingLevel } : {}),
-        ...(source?.agentId !== undefined ? { agentId: source.agentId } : {}),
-        ...(source?.stepStartPartIndices !== undefined
-          ? { stepStartPartIndices: source.stepStartPartIndices }
-          : {}),
-        // Preserve partial so interrupted-tool sentinels keep applying.
-        ...(source?.partial !== undefined ? { partial: source.partial } : {}),
-        // muxMetadata drives provider-side filtering (workflow display rows),
-        // so it must ride along verbatim.
-        ...(source?.muxMetadata !== undefined ? { muxMetadata: source.muxMetadata } : {}),
-        ...(source?.kind !== undefined ? { kind: source.kind } : {}),
-        ...(source?.fileAtMentionSnapshot !== undefined
-          ? { fileAtMentionSnapshot: source.fileAtMentionSnapshot }
-          : {}),
-        ...(source?.agentSkillSnapshot !== undefined
-          ? { agentSkillSnapshot: source.agentSkillSnapshot }
-          : {}),
+        ...pickTailCopyMetadata(source),
+        // Request building renders a user row's prompt-hook context from its metadata, so the
+        // copy that replaces it must carry it (Codex PRRT_kwDOPxxmWM6rPqxI). chat.jsonl is
+        // untrusted on read: copy only the valid entries under the cap (PRRT_kwDOPxxmWM6sTcvx).
+        ...pluginHookContextOf(source),
         ...(mcpPromptSnapshot !== undefined ? { mcpPromptSnapshot } : {}),
       },
     });

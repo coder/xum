@@ -3,6 +3,7 @@ import type { RuntimeStatus } from "@/browser/stores/RuntimeStatusStore";
 import {
   isAltGraphPressed,
   isDialogOpen,
+  isCommandPaletteTarget,
   isEditableElement,
   KEYBINDS,
   matchesKeybind,
@@ -40,10 +41,17 @@ function getKeyAction(
 
 /**
  * Ctrl+Alt chords: AltGr types characters with the same modifiers in text fields. A modal
- * covers the workspace, so its keys must not act behind it.
+ * covers the workspace, so its keys must not act behind it. isDialogOpen() does not see the
+ * command palette, and a click on the palette outside its input focuses the palette itself
+ * (cmdk's root takes focus), so check the palette too (#6434).
  */
 function keysMayAct(event: KeyboardEvent): boolean {
-  return !isEditableElement(event.target) && !isAltGraphPressed(event) && !isDialogOpen();
+  return !targetOwnsKeys(event.target) && !isAltGraphPressed(event) && !isDialogOpen();
+}
+
+/** A text field or the open command palette handles its own keys. */
+function targetOwnsKeys(target: EventTarget | null): boolean {
+  return isEditableElement(target) || isCommandPaletteTarget(target);
 }
 
 /**

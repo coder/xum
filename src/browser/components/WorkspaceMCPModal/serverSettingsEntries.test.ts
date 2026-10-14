@@ -1,17 +1,20 @@
 import { expect, test } from "bun:test";
-import type { MCPSettingsSnapshot } from "@/common/utils/mcpSettings";
+import { getOwn } from "@/common/utils/getOwn";
+import type { MCPSettingsReadSnapshot, MCPSettingsSnapshot } from "@/common/utils/mcpSettings";
 import {
   applySavedSettings,
+  settingsErrors,
   SettingsRequests,
   type ServerSettingsEntry,
 } from "./serverSettingsEntries";
 
-const snapshot = (units: string): MCPSettingsSnapshot => ({
+const snapshot = (units: string): MCPSettingsReadSnapshot => ({
   properties: { units: { type: "string", title: "Units" } },
   values: { units },
   layout: [],
   warnings: [],
   droppedSettingCount: 0,
+  instanceToken: "instance-1",
 });
 
 test("settings requests: only a server's latest request in the current open applies", () => {
@@ -34,13 +37,29 @@ test("settings requests: only a server's latest request in the current open appl
   expect(requests.take(open, "cad").isLatest()).toBe(false);
 });
 
-test("a save's values become the snapshot's values", () => {
+test("a save's snapshot replaces the shown one under the save's request ID", () => {
   const entries: Record<string, ServerSettingsEntry> = {
     cad: { fetchId: 2, snapshot: snapshot("in") },
+    lathe: { notConnected: true },
   };
-  expect(applySavedSettings(entries, "cad", { units: "mm" }).cad).toEqual({
-    fetchId: 2,
+  expect(applySavedSettings(entries, "cad", 5, snapshot("mm")).cad).toEqual({
+    fetchId: 5,
     snapshot: snapshot("mm"),
   });
-  expect(applySavedSettings({}, "cad", { units: "mm" })).toEqual({});
+  // No section to update: an unread or unavailable server keeps its entry.
+  expect(applySavedSettings(entries, "lathe", 5, snapshot("mm")).lathe).toEqual({
+    notConnected: true,
+  });
+  expect(applySavedSettings({}, "cad", 5, snapshot("mm"))).toEqual({});
+});
+
+test("validation errors keep a setting named __proto__", () => {
+  // JSON.parse keeps "__proto__" as an own key, as the IPC payload does.
+  const properties = JSON.parse(
+    '{"__proto__": {"type": "string", "title": "Proto", "maxLength": 1}}'
+  ) as MCPSettingsSnapshot["properties"];
+  const draft = JSON.parse('{"__proto__": "too long"}') as MCPSettingsSnapshot["values"];
+  const errors = settingsErrors(properties, draft);
+  expect(Object.keys(errors)).toEqual(["__proto__"]);
+  expect(getOwn(errors, "__proto__")).toBe("Proto must be at most 1 characters");
 });

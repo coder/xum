@@ -231,7 +231,7 @@ export function TitleBar(props: TitleBarProps) {
                 {gitDescribe ?? "(dev)"}
               </div>
               {updateBadgeIcon && (
-                <div className="text-accent flex h-3.5 w-3.5 items-center justify-center">
+                <div className="text-accent-text flex h-3.5 w-3.5 items-center justify-center">
                   {updateBadgeIcon}
                 </div>
               )}

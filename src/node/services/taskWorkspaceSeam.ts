@@ -1008,7 +1008,7 @@ export interface WorkspaceTurnTaskHost {
   ): Promise<string[]>;
   listAgentTaskExecutionEntries(
     config: ReturnType<Config["loadConfigOrDefault"]>
-  ): Array<{ id?: string; taskExecutionId?: string }>;
+  ): Array<Pick<WorkspaceConfigEntry, "id" | "taskExecutionId" | "taskExecutionStatus">>;
   markTaskForegroundRelevant(taskId: string): void;
   maybeStartPatchGenerationForReportedTask(
     workspaceId: string,

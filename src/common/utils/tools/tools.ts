@@ -107,7 +107,7 @@ import type { TimelineService } from "@/node/services/timelineService";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { FileState } from "@/node/services/agentSession";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
-import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
+import type { InvocableSkill } from "@/common/types/agentSkill";
 import {
   FILE_EDIT_TOOL_NAMES,
   FILE_READ_TOOL_NAMES,
@@ -346,7 +346,7 @@ export interface ToolConfiguration {
   /** Available sub-agents for the task tool description (dynamic context) */
   availableSubagents?: AgentDefinitionDescriptor[];
   /** Available skills for the agent_skill_read tool description (dynamic context) */
-  availableSkills?: AgentSkillDescriptor[];
+  availableSkills?: InvocableSkill[];
   /**
    * Path-scoped skill activation (`paths` frontmatter). Per-turn state shared by every
    * tool rebuild in the turn, so a skill surfaces once per context window. Absent when

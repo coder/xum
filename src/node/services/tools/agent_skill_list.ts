@@ -296,7 +296,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
         ];
         const { plugins } = await discoverAgentPlugins(pluginContainers);
         for (const plugin of plugins) {
-          if (plugin.skillsDir == null) {
+          if (plugin.skillsDirs == null) {
             continue;
           }
           // Project plugin roots keep the repo-symlink posture of other project
@@ -312,12 +312,15 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
             }
           }
           // Per-skill containment anchors at the plugin root (§4.1).
-          roots.push({
-            skillsRoot: plugin.skillsDir,
-            containmentRoot: plugin.rootPath,
-            scope: plugin.scope,
-            importedSkills: plugin.importedComponents?.skills,
-          });
+          const importedSkills = plugin.importedComponents?.skills;
+          roots.push(
+            ...plugin.skillsDirs.map((skillsRoot) => ({
+              skillsRoot,
+              containmentRoot: plugin.rootPath,
+              scope: plugin.scope,
+              importedSkills,
+            }))
+          );
         }
 
         const skills: AgentSkillDescriptor[] = [];

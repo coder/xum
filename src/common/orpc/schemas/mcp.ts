@@ -349,39 +349,49 @@ export const MCPTestResultSchema = z.discriminatedUnion("success", [
   }),
 ]);
 
-/** OpenAI structured settings (validated by common/utils/mcpSettings before it crosses IPC). */
-const MCPSettingValueSchema = z.union([z.string(), z.number(), z.boolean()]);
-const MCPSettingSchemaSchema = z.object({
+/**
+ * OpenAI structured settings (validated by common/utils/mcpSettings before it crosses IPC).
+ * These schemas are the one source of the snapshot types: common/utils/mcpSettings derives
+ * its types from them, so the IPC schema and the parser cannot drift apart.
+ */
+export const MCPSettingValueSchema = z.union([z.string(), z.number(), z.boolean()]);
+const MCPSettingSchemaBase = z.object({ title: z.string(), description: z.string().optional() });
+export const MCPSettingSchemaSchema = z.discriminatedUnion("type", [
+  MCPSettingSchemaBase.extend({ type: z.literal("boolean") }),
+  // No `pattern`: Xum never runs a server's regex (see parseSchema in mcpSettings).
+  MCPSettingSchemaBase.extend({
+    type: z.literal("string"),
+    enum: z.array(z.string()).optional(),
+    minLength: z.number().optional(),
+    maxLength: z.number().optional(),
+  }),
+  MCPSettingSchemaBase.extend({
+    type: z.enum(["number", "integer"]),
+    minimum: z.number().optional(),
+    maximum: z.number().optional(),
+    multipleOf: z.number().optional(),
+  }),
+]);
+export const MCPSettingsLayoutItemSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("property"), property: z.string() }),
+  z.object({ kind: z.literal("tool"), tool: z.string(), description: z.string().optional() }),
+]);
+export const MCPSettingsGroupSchema = z.object({
   title: z.string(),
-  description: z.string().optional(),
-  type: z.enum(["boolean", "string", "number", "integer"]),
-  enum: z.array(z.string()).optional(),
-  minLength: z.number().optional(),
-  maxLength: z.number().optional(),
-  minimum: z.number().optional(),
-  maximum: z.number().optional(),
-  multipleOf: z.number().optional(),
+  items: z.array(MCPSettingsLayoutItemSchema),
 });
 export const MCPSettingsSnapshotSchema = z.object({
   properties: z.record(z.string(), MCPSettingSchemaSchema),
   values: z.record(z.string(), MCPSettingValueSchema),
-  layout: z.array(
-    z.object({
-      title: z.string(),
-      items: z.array(
-        z.discriminatedUnion("kind", [
-          z.object({ kind: z.literal("property"), property: z.string() }),
-          z.object({
-            kind: z.literal("tool"),
-            tool: z.string(),
-            description: z.string().optional(),
-          }),
-        ])
-      ),
-    })
-  ),
+  /** Layout groups in order; properties no group lists go last, in "Other settings". */
+  layout: z.array(MCPSettingsGroupSchema),
   warnings: z.array(z.string()),
+  /** Schema properties dropped (unsupported schema, no valid value, or over a budget); the UI notes them. */
   droppedSettingCount: z.number().int().nonnegative(),
+});
+/** A snapshot plus its server instance's token (MCPSettingsReadSnapshot). */
+export const MCPSettingsReadSnapshotSchema = MCPSettingsSnapshotSchema.extend({
+  instanceToken: z.string(),
 });
 export const MCPSettingsReadParamsSchema = z.object({
   workspaceId: z.string(),
@@ -401,4 +411,6 @@ export const MCPSettingsReadInputSchema = z.object({
 export const MCPSettingsUpdateParamsSchema = MCPSettingsReadParamsSchema.extend({
   /** Changed values only. */
   set: z.record(z.string(), MCPSettingValueSchema),
+  /** The read's instanceToken: a replaced or restarted server refuses the update. */
+  instanceToken: z.string(),
 });

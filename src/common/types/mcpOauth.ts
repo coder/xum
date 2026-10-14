@@ -81,6 +81,11 @@ export interface MCPOAuthClientInformation {
   token_endpoint?: string;
   /** See MCPOAuthTokens.issuer. */
   issuer?: string;
+  /**
+   * Set on a client a plugin provided (not registered by Xum): a server config without a
+   * provided client must not use it or its tokens (#6159).
+   */
+  provided_by_plugin?: boolean;
 }
 
 /**

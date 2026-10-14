@@ -1,6 +1,7 @@
 import { useClaudeDesign } from "@/browser/hooks/useClaudeDesign";
 import { publishGlobalMcpEnablementChanged } from "@/browser/utils/workspaceMcpMutations";
 import {
+  McpAppViewDomainsLoadError,
   McpAppViewDomainsSection,
   unlistedMcpAppViewDomains,
   useMcpAppViewDomains,
@@ -840,8 +841,8 @@ function ToolSearchSetting() {
       description={
         <>
           Defer MCP tool definitions until the model discovers them with{" "}
-          <code className="text-accent">tool_catalog_search</code>. With Anthropic prompt caching,
-          uses Anthropic&apos;s native deferred loading, which keeps the cache intact.
+          <code className="text-accent-text">tool_catalog_search</code>. With Anthropic prompt
+          caching, uses Anthropic&apos;s native deferred loading, which keeps the cache intact.
         </>
       }
       ariaLabel="Toggle MCP tool search"
@@ -1309,9 +1310,9 @@ export const MCPSettingsSection: React.FC = () => {
       <div>
         <p className="text-content-secondary mb-4 text-xs">
           Configure global MCP servers. Global config lives in{" "}
-          <code className="text-accent">~/.xum/mcp.jsonc</code>, with optional repo overrides in{" "}
-          <code className="text-accent">./.xum/mcp.jsonc</code> and workspace overrides in{" "}
-          <code className="text-accent">.xum/mcp.local.jsonc</code>.
+          <code className="text-accent-text">~/.xum/mcp.jsonc</code>, with optional repo overrides
+          in <code className="text-accent-text">./.xum/mcp.jsonc</code> and workspace overrides in{" "}
+          <code className="text-accent-text">.xum/mcp.local.jsonc</code>.
         </p>
       </div>
 
@@ -1525,7 +1526,7 @@ export const MCPSettingsSection: React.FC = () => {
                                   size="icon"
                                   onClick={() => void handleTest(name)}
                                   disabled={isTesting}
-                                  className="text-muted hover:text-accent h-7 w-7"
+                                  className="text-muted hover:text-accent-text h-7 w-7"
                                   aria-label="Test connection"
                                 >
                                   {isTesting ? (
@@ -1548,7 +1549,7 @@ export const MCPSettingsSection: React.FC = () => {
                                       variant="ghost"
                                       size="icon"
                                       onClick={() => handleStartEdit(name, entry)}
-                                      className="text-muted hover:text-accent h-7 w-7"
+                                      className="text-muted hover:text-accent-text h-7 w-7"
                                       aria-label="Edit server"
                                     >
                                       <Pencil className="h-4 w-4" />
@@ -1659,10 +1660,12 @@ export const MCPSettingsSection: React.FC = () => {
           showServer
           error={viewDomains.revokeError}
         />
+        <McpAppViewDomainsLoadError error={viewDomains.loadError} onRetry={viewDomains.retry} />
 
         {/* Add server form */}
         <details className="group mt-3">
-          <summary className="text-accent hover:text-accent/80 flex cursor-pointer list-none items-center gap-1 text-sm font-medium">
+          {/* Hover underlines instead of fading: 80% accent text fell below 4.5:1 on the dialog (#5946). */}
+          <summary className="text-accent-text flex cursor-pointer list-none items-center gap-1 text-sm font-medium hover:underline">
             <ChevronRight className="h-4 w-4 transition-transform group-open:rotate-90" />
             Add server
           </summary>

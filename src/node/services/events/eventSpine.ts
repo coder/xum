@@ -142,6 +142,13 @@ export interface MessageSendContext {
   readonly text: string;
   /** The workspace path (Codex common field `cwd`), when Xum could resolve it. */
   readonly cwd?: string;
+  /**
+   * The send's cancel signal. A withdrawn send ends its pending hook calls instead of waiting for
+   * the hook timeout (Codex PRRT_kwDOPxxmWM6rkl9A). The hooks run before any history write, so a
+   * send whose signal fired is always cancelled after them, and an ended hook cannot let it
+   * through.
+   */
+  readonly signal?: AbortSignal;
   /** Appended by middleware, in chain order; saved on the user row (pluginHookContext). */
   readonly additionalContext: Array<{ pluginId: string; text: string }>;
   /** Set to refuse the send. useBefore skips the rest of the chain (first block wins). */
@@ -193,6 +200,26 @@ interface Registration {
 }
 
 /** Duck-check for contexts that support blocking (tool.execute, message.send). */
+/** Per isolated point: snapshot what a consumer may change, and return its undo. */
+const ISOLATED_CONSUMERS = {
+  "message.send": (ctx: MessageSendContext) => {
+    const { blocked } = ctx;
+    const contextLength = ctx.additionalContext.length;
+    return () => {
+      ctx.blocked = blocked;
+      ctx.additionalContext.length = contextLength;
+    };
+  },
+  "turn.stop": (ctx: TurnStopContext) => {
+    const { halted } = ctx;
+    const reasons = ctx.continueReasons.length;
+    return () => {
+      ctx.halted = halted;
+      ctx.continueReasons.length = reasons;
+    };
+  },
+} satisfies Partial<{ [K in keyof WaterfallPointMap]: (ctx: WaterfallPointMap[K]) => () => void }>;
+
 function isBlocked(ctx: unknown): boolean {
   return (
     typeof ctx === "object" &&
@@ -299,14 +326,21 @@ export class EventSpine {
     return this.use(
       point,
       async (ctx, next) => {
-        if (point === "message.send") {
-          // message.send consumers are independent plugin guards: one that throws is logged and
-          // skipped, so it cannot end the chain before a later plugin's block. Isolated here
-          // because only the spine dispatches per consumer; runMessageSendHooks sees one chain.
+        const isolate = ISOLATED_CONSUMERS[point as keyof typeof ISOLATED_CONSUMERS] as
+          | ((ctx: WaterfallPointMap[K]) => () => void)
+          | undefined;
+        if (isolate !== undefined) {
+          // Prompt-hook consumers are independent plugin guards: one that throws is logged and
+          // skipped, so it cannot end the chain before a later plugin's decision. Isolated here
+          // because only the spine dispatches per consumer; the runners see one chain. Whatever
+          // the failed consumer changed before it threw is undone: a failed hook fails open as
+          // a whole (Codex PRRT_kwDOPxxmWM6rQd9y, PRRT_kwDOPxxmWM6rQeuF, PRRT_kwDOPxxmWM6rQfGc).
+          const restore = isolate(ctx);
           try {
             await callback(ctx);
           } catch (error) {
-            log.warn("Prompt hooks: a message.send consumer failed; running the next one", {
+            restore();
+            log.warn(`Prompt hooks: a ${point} consumer failed; running the next one`, {
               error: getErrorMessage(error),
             });
           }

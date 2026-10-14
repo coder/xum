@@ -323,7 +323,11 @@
       }
     },
     {
-      "files": ["src/browser/**/*.{ts,tsx}", "src/common/**/*.{ts,tsx}"],
+      "files": [
+        "src/browser/**/*.{ts,tsx}",
+        "src/common/**/*.{ts,tsx}",
+        "src/constants/**/*.{ts,tsx}"
+      ],
       "rules": {
         "no-restricted-imports": [
           "error",
@@ -343,9 +347,19 @@
                 "message": "Shiki must only be imported in highlightWorker.ts to avoid blocking the main thread. Use highlightCode() from highlightWorkerClient.ts instead."
               },
               {
-                "regex": "(^|/)orpc/schemas$",
+                "regex": "(^|/)orpc/schemas(\\.[jt]s)?([?#].*)?$",
                 "allowTypeImports": true,
                 "message": "Import schemas from their leaf module (e.g. @/common/orpc/schemas/runtime), not the @/common/orpc/schemas barrel: a value import of the barrel adds every schema to the first load. Type-only imports are fine."
+              },
+              {
+                "regex": "^(@/|@shared/|(\\.\\./)+)node(/|$)",
+                "allowTypeImports": true,
+                "message": "Browser and common code must not value-import src/node: backend modules can pull the @/common/orpc/schemas barrel and Node APIs into the browser bundle. Move the shared code to src/common. Type-only imports are fine."
+              },
+              {
+                "regex": "(^|/)(ai/providerOptions|tokens/tokenStatsCalculator|tools/tools)(\\.[jt]s)?([?#].*)?$",
+                "allowTypeImports": true,
+                "message": "This src/common module is backend-only: it value-imports src/node, so browser and common code must not value-import it. Type-only imports are fine."
               }
             ]
           }
@@ -369,7 +383,379 @@
       }
     },
     {
-      "files": ["src/**/*.test.{ts,tsx}"],
+      "files": [
+        "src/browser/**/*.test.{ts,tsx}",
+        "src/common/**/*.test.{ts,tsx}",
+        "src/constants/**/*.test.{ts,tsx}"
+      ],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "ai-tokenizer/encoding",
+                "allowTypeImports": true,
+                "message": "The ai-tokenizer/encoding barrel evaluates all four encodings (~14.5 s of CPU, #4816). Load one encoding through its subpath (ai-tokenizer/encoding/<name>) inside tokenizer.worker.ts."
+              }
+            ],
+            "patterns": [
+              {
+                "group": ["shiki"],
+                "importNamePattern": "^(?!type\\s)",
+                "allowTypeImports": true,
+                "message": "Shiki must only be imported in highlightWorker.ts to avoid blocking the main thread. Use highlightCode() from highlightWorkerClient.ts instead."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/browser/workers/highlightWorker.ts"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "ai-tokenizer/encoding",
+                "allowTypeImports": true,
+                "message": "The ai-tokenizer/encoding barrel evaluates all four encodings (~14.5 s of CPU, #4816). Load one encoding through its subpath (ai-tokenizer/encoding/<name>) inside tokenizer.worker.ts."
+              }
+            ],
+            "patterns": [
+              {
+                "regex": "(^|/)orpc/schemas(\\.[jt]s)?([?#].*)?$",
+                "allowTypeImports": true,
+                "message": "Import schemas from their leaf module (e.g. @/common/orpc/schemas/runtime), not the @/common/orpc/schemas barrel: a value import of the barrel adds every schema to the first load. Type-only imports are fine."
+              },
+              {
+                "regex": "^(@/|@shared/|(\\.\\./)+)node(/|$)",
+                "allowTypeImports": true,
+                "message": "Browser and common code must not value-import src/node: backend modules can pull the @/common/orpc/schemas barrel and Node APIs into the browser bundle. Move the shared code to src/common. Type-only imports are fine."
+              },
+              {
+                "regex": "(^|/)(ai/providerOptions|tokens/tokenStatsCalculator|tools/tools)(\\.[jt]s)?([?#].*)?$",
+                "allowTypeImports": true,
+                "message": "This src/common module is backend-only: it value-imports src/node, so browser and common code must not value-import it. Type-only imports are fine."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": [
+        "src/common/utils/ai/providerOptions.ts",
+        "src/common/utils/tokens/tokenStatsCalculator.ts",
+        "src/common/utils/tools/tools.ts"
+      ],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "ai-tokenizer/encoding",
+                "allowTypeImports": true,
+                "message": "The ai-tokenizer/encoding barrel evaluates all four encodings (~14.5 s of CPU, #4816). Load one encoding through its subpath (ai-tokenizer/encoding/<name>) inside tokenizer.worker.ts."
+              }
+            ],
+            "patterns": [
+              {
+                "group": ["shiki"],
+                "importNamePattern": "^(?!type\\s)",
+                "allowTypeImports": true,
+                "message": "Shiki must only be imported in highlightWorker.ts to avoid blocking the main thread. Use highlightCode() from highlightWorkerClient.ts instead."
+              },
+              {
+                "regex": "(^|/)orpc/schemas(\\.[jt]s)?([?#].*)?$",
+                "allowTypeImports": true,
+                "message": "Import schemas from their leaf module (e.g. @/common/orpc/schemas/runtime), not the @/common/orpc/schemas barrel: a value import of the barrel adds every schema to the first load. Type-only imports are fine."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/common/utils/ai/**/*.{ts,tsx}"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "ai-tokenizer/encoding",
+                "allowTypeImports": true,
+                "message": "The ai-tokenizer/encoding barrel evaluates all four encodings (~14.5 s of CPU, #4816). Load one encoding through its subpath (ai-tokenizer/encoding/<name>) inside tokenizer.worker.ts."
+              }
+            ],
+            "patterns": [
+              {
+                "group": ["shiki"],
+                "importNamePattern": "^(?!type\\s)",
+                "allowTypeImports": true,
+                "message": "Shiki must only be imported in highlightWorker.ts to avoid blocking the main thread. Use highlightCode() from highlightWorkerClient.ts instead."
+              },
+              {
+                "regex": "(^|/)orpc/schemas(\\.[jt]s)?([?#].*)?$",
+                "allowTypeImports": true,
+                "message": "Import schemas from their leaf module (e.g. @/common/orpc/schemas/runtime), not the @/common/orpc/schemas barrel: a value import of the barrel adds every schema to the first load. Type-only imports are fine."
+              },
+              {
+                "regex": "^(@/|@shared/|(\\.\\./)+)node(/|$)",
+                "allowTypeImports": true,
+                "message": "Browser and common code must not value-import src/node: backend modules can pull the @/common/orpc/schemas barrel and Node APIs into the browser bundle. Move the shared code to src/common. Type-only imports are fine."
+              },
+              {
+                "regex": "(^|/)(ai/providerOptions|tokens/tokenStatsCalculator|tools/tools)(\\.[jt]s)?([?#].*)?$",
+                "allowTypeImports": true,
+                "message": "This src/common module is backend-only: it value-imports src/node, so browser and common code must not value-import it. Type-only imports are fine."
+              },
+              {
+                "regex": "^(\\./|(\\.\\./)+)providerOptions(\\.[jt]s)?([?#].*)?$",
+                "allowTypeImports": true,
+                "message": "This src/common module is backend-only: it value-imports src/node, so browser and common code must not value-import it. Type-only imports are fine."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/common/utils/ai/providerOptions.ts"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "ai-tokenizer/encoding",
+                "allowTypeImports": true,
+                "message": "The ai-tokenizer/encoding barrel evaluates all four encodings (~14.5 s of CPU, #4816). Load one encoding through its subpath (ai-tokenizer/encoding/<name>) inside tokenizer.worker.ts."
+              }
+            ],
+            "patterns": [
+              {
+                "group": ["shiki"],
+                "importNamePattern": "^(?!type\\s)",
+                "allowTypeImports": true,
+                "message": "Shiki must only be imported in highlightWorker.ts to avoid blocking the main thread. Use highlightCode() from highlightWorkerClient.ts instead."
+              },
+              {
+                "regex": "(^|/)orpc/schemas(\\.[jt]s)?([?#].*)?$",
+                "allowTypeImports": true,
+                "message": "Import schemas from their leaf module (e.g. @/common/orpc/schemas/runtime), not the @/common/orpc/schemas barrel: a value import of the barrel adds every schema to the first load. Type-only imports are fine."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/common/utils/ai/**/*.test.{ts,tsx}"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "ai-tokenizer/encoding",
+                "allowTypeImports": true,
+                "message": "The ai-tokenizer/encoding barrel evaluates all four encodings (~14.5 s of CPU, #4816). Load one encoding through its subpath (ai-tokenizer/encoding/<name>) inside tokenizer.worker.ts."
+              }
+            ],
+            "patterns": [
+              {
+                "group": ["shiki"],
+                "importNamePattern": "^(?!type\\s)",
+                "allowTypeImports": true,
+                "message": "Shiki must only be imported in highlightWorker.ts to avoid blocking the main thread. Use highlightCode() from highlightWorkerClient.ts instead."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/common/utils/tokens/**/*.{ts,tsx}"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "ai-tokenizer/encoding",
+                "allowTypeImports": true,
+                "message": "The ai-tokenizer/encoding barrel evaluates all four encodings (~14.5 s of CPU, #4816). Load one encoding through its subpath (ai-tokenizer/encoding/<name>) inside tokenizer.worker.ts."
+              }
+            ],
+            "patterns": [
+              {
+                "group": ["shiki"],
+                "importNamePattern": "^(?!type\\s)",
+                "allowTypeImports": true,
+                "message": "Shiki must only be imported in highlightWorker.ts to avoid blocking the main thread. Use highlightCode() from highlightWorkerClient.ts instead."
+              },
+              {
+                "regex": "(^|/)orpc/schemas(\\.[jt]s)?([?#].*)?$",
+                "allowTypeImports": true,
+                "message": "Import schemas from their leaf module (e.g. @/common/orpc/schemas/runtime), not the @/common/orpc/schemas barrel: a value import of the barrel adds every schema to the first load. Type-only imports are fine."
+              },
+              {
+                "regex": "^(@/|@shared/|(\\.\\./)+)node(/|$)",
+                "allowTypeImports": true,
+                "message": "Browser and common code must not value-import src/node: backend modules can pull the @/common/orpc/schemas barrel and Node APIs into the browser bundle. Move the shared code to src/common. Type-only imports are fine."
+              },
+              {
+                "regex": "(^|/)(ai/providerOptions|tokens/tokenStatsCalculator|tools/tools)(\\.[jt]s)?([?#].*)?$",
+                "allowTypeImports": true,
+                "message": "This src/common module is backend-only: it value-imports src/node, so browser and common code must not value-import it. Type-only imports are fine."
+              },
+              {
+                "regex": "^(\\./|(\\.\\./)+)tokenStatsCalculator(\\.[jt]s)?([?#].*)?$",
+                "allowTypeImports": true,
+                "message": "This src/common module is backend-only: it value-imports src/node, so browser and common code must not value-import it. Type-only imports are fine."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/common/utils/tokens/tokenStatsCalculator.ts"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "ai-tokenizer/encoding",
+                "allowTypeImports": true,
+                "message": "The ai-tokenizer/encoding barrel evaluates all four encodings (~14.5 s of CPU, #4816). Load one encoding through its subpath (ai-tokenizer/encoding/<name>) inside tokenizer.worker.ts."
+              }
+            ],
+            "patterns": [
+              {
+                "group": ["shiki"],
+                "importNamePattern": "^(?!type\\s)",
+                "allowTypeImports": true,
+                "message": "Shiki must only be imported in highlightWorker.ts to avoid blocking the main thread. Use highlightCode() from highlightWorkerClient.ts instead."
+              },
+              {
+                "regex": "(^|/)orpc/schemas(\\.[jt]s)?([?#].*)?$",
+                "allowTypeImports": true,
+                "message": "Import schemas from their leaf module (e.g. @/common/orpc/schemas/runtime), not the @/common/orpc/schemas barrel: a value import of the barrel adds every schema to the first load. Type-only imports are fine."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/common/utils/tokens/**/*.test.{ts,tsx}"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "ai-tokenizer/encoding",
+                "allowTypeImports": true,
+                "message": "The ai-tokenizer/encoding barrel evaluates all four encodings (~14.5 s of CPU, #4816). Load one encoding through its subpath (ai-tokenizer/encoding/<name>) inside tokenizer.worker.ts."
+              }
+            ],
+            "patterns": [
+              {
+                "group": ["shiki"],
+                "importNamePattern": "^(?!type\\s)",
+                "allowTypeImports": true,
+                "message": "Shiki must only be imported in highlightWorker.ts to avoid blocking the main thread. Use highlightCode() from highlightWorkerClient.ts instead."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/common/utils/tools/**/*.{ts,tsx}"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "ai-tokenizer/encoding",
+                "allowTypeImports": true,
+                "message": "The ai-tokenizer/encoding barrel evaluates all four encodings (~14.5 s of CPU, #4816). Load one encoding through its subpath (ai-tokenizer/encoding/<name>) inside tokenizer.worker.ts."
+              }
+            ],
+            "patterns": [
+              {
+                "group": ["shiki"],
+                "importNamePattern": "^(?!type\\s)",
+                "allowTypeImports": true,
+                "message": "Shiki must only be imported in highlightWorker.ts to avoid blocking the main thread. Use highlightCode() from highlightWorkerClient.ts instead."
+              },
+              {
+                "regex": "(^|/)orpc/schemas(\\.[jt]s)?([?#].*)?$",
+                "allowTypeImports": true,
+                "message": "Import schemas from their leaf module (e.g. @/common/orpc/schemas/runtime), not the @/common/orpc/schemas barrel: a value import of the barrel adds every schema to the first load. Type-only imports are fine."
+              },
+              {
+                "regex": "^(@/|@shared/|(\\.\\./)+)node(/|$)",
+                "allowTypeImports": true,
+                "message": "Browser and common code must not value-import src/node: backend modules can pull the @/common/orpc/schemas barrel and Node APIs into the browser bundle. Move the shared code to src/common. Type-only imports are fine."
+              },
+              {
+                "regex": "(^|/)(ai/providerOptions|tokens/tokenStatsCalculator|tools/tools)(\\.[jt]s)?([?#].*)?$",
+                "allowTypeImports": true,
+                "message": "This src/common module is backend-only: it value-imports src/node, so browser and common code must not value-import it. Type-only imports are fine."
+              },
+              {
+                "regex": "^(\\./|(\\.\\./)+)tools(\\.[jt]s)?([?#].*)?$",
+                "allowTypeImports": true,
+                "message": "This src/common module is backend-only: it value-imports src/node, so browser and common code must not value-import it. Type-only imports are fine."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/common/utils/tools/tools.ts"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "ai-tokenizer/encoding",
+                "allowTypeImports": true,
+                "message": "The ai-tokenizer/encoding barrel evaluates all four encodings (~14.5 s of CPU, #4816). Load one encoding through its subpath (ai-tokenizer/encoding/<name>) inside tokenizer.worker.ts."
+              }
+            ],
+            "patterns": [
+              {
+                "group": ["shiki"],
+                "importNamePattern": "^(?!type\\s)",
+                "allowTypeImports": true,
+                "message": "Shiki must only be imported in highlightWorker.ts to avoid blocking the main thread. Use highlightCode() from highlightWorkerClient.ts instead."
+              },
+              {
+                "regex": "(^|/)orpc/schemas(\\.[jt]s)?([?#].*)?$",
+                "allowTypeImports": true,
+                "message": "Import schemas from their leaf module (e.g. @/common/orpc/schemas/runtime), not the @/common/orpc/schemas barrel: a value import of the barrel adds every schema to the first load. Type-only imports are fine."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/common/utils/tools/**/*.test.{ts,tsx}"],
       "rules": {
         "no-restricted-imports": [
           "error",
@@ -401,6 +787,11 @@
           {
             "paths": [
               {
+                "name": "ai-tokenizer/encoding",
+                "allowTypeImports": true,
+                "message": "The ai-tokenizer/encoding barrel evaluates all four encodings (~14.5 s of CPU, #4816). Load one encoding through its subpath (ai-tokenizer/encoding/<name>) inside tokenizer.worker.ts."
+              },
+              {
                 "name": "@/common/config/schemas",
                 "message": "Import config schemas via direct file paths (e.g., @/common/config/schemas/appConfigOnDisk), not the barrel."
               },
@@ -411,12 +802,71 @@
             ],
             "patterns": [
               {
-                "regex": "(^|/)orpc/schemas$",
+                "group": ["shiki"],
+                "importNamePattern": "^(?!type\\s)",
+                "allowTypeImports": true,
+                "message": "Shiki must only be imported in highlightWorker.ts to avoid blocking the main thread. Use highlightCode() from highlightWorkerClient.ts instead."
+              },
+              {
+                "regex": "(^|/)orpc/schemas(\\.[jt]s)?([?#].*)?$",
                 "allowTypeImports": true,
                 "message": "Import schemas from their leaf module (e.g. @/common/orpc/schemas/runtime), not the @/common/orpc/schemas barrel: a value import of the barrel adds every schema to the first load. Type-only imports are fine."
               },
               {
-                "regex": "^\\.\\.?/schemas$",
+                "regex": "^(@/|@shared/|(\\.\\./)+)node(/|$)",
+                "allowTypeImports": true,
+                "message": "Browser and common code must not value-import src/node: backend modules can pull the @/common/orpc/schemas barrel and Node APIs into the browser bundle. Move the shared code to src/common. Type-only imports are fine."
+              },
+              {
+                "regex": "(^|/)(ai/providerOptions|tokens/tokenStatsCalculator|tools/tools)(\\.[jt]s)?([?#].*)?$",
+                "allowTypeImports": true,
+                "message": "This src/common module is backend-only: it value-imports src/node, so browser and common code must not value-import it. Type-only imports are fine."
+              },
+              {
+                "regex": "^\\.\\.?/schemas(\\.[jt]s)?([?#].*)?$",
+                "allowTypeImports": true,
+                "message": "Import schemas from their leaf module (e.g. @/common/orpc/schemas/runtime), not the @/common/orpc/schemas barrel: a value import of the barrel adds every schema to the first load. Type-only imports are fine."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/common/orpc/**/*.test.ts"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "ai-tokenizer/encoding",
+                "allowTypeImports": true,
+                "message": "The ai-tokenizer/encoding barrel evaluates all four encodings (~14.5 s of CPU, #4816). Load one encoding through its subpath (ai-tokenizer/encoding/<name>) inside tokenizer.worker.ts."
+              },
+              {
+                "name": "@/common/config/schemas",
+                "message": "Import config schemas via direct file paths (e.g., @/common/config/schemas/appConfigOnDisk), not the barrel."
+              },
+              {
+                "name": "@/common/config/schemas/index",
+                "message": "Import config schemas via direct file paths (e.g., @/common/config/schemas/appConfigOnDisk), not the barrel."
+              }
+            ],
+            "patterns": [
+              {
+                "group": ["shiki"],
+                "importNamePattern": "^(?!type\\s)",
+                "allowTypeImports": true,
+                "message": "Shiki must only be imported in highlightWorker.ts to avoid blocking the main thread. Use highlightCode() from highlightWorkerClient.ts instead."
+              },
+              {
+                "regex": "(^|/)orpc/schemas(\\.[jt]s)?([?#].*)?$",
+                "allowTypeImports": true,
+                "message": "Import schemas from their leaf module (e.g. @/common/orpc/schemas/runtime), not the @/common/orpc/schemas barrel: a value import of the barrel adds every schema to the first load. Type-only imports are fine."
+              },
+              {
+                "regex": "^\\.\\.?/schemas(\\.[jt]s)?([?#].*)?$",
                 "allowTypeImports": true,
                 "message": "Import schemas from their leaf module (e.g. @/common/orpc/schemas/runtime), not the @/common/orpc/schemas barrel: a value import of the barrel adds every schema to the first load. Type-only imports are fine."
               }
@@ -431,15 +881,72 @@
         "no-restricted-imports": [
           "error",
           {
+            "paths": [
+              {
+                "name": "ai-tokenizer/encoding",
+                "allowTypeImports": true,
+                "message": "The ai-tokenizer/encoding barrel evaluates all four encodings (~14.5 s of CPU, #4816). Load one encoding through its subpath (ai-tokenizer/encoding/<name>) inside tokenizer.worker.ts."
+              }
+            ],
             "patterns": [
+              {
+                "group": ["shiki"],
+                "importNamePattern": "^(?!type\\s)",
+                "allowTypeImports": true,
+                "message": "Shiki must only be imported in highlightWorker.ts to avoid blocking the main thread. Use highlightCode() from highlightWorkerClient.ts instead."
+              },
+              {
+                "regex": "(^|/)orpc/schemas(\\.[jt]s)?([?#].*)?$",
+                "allowTypeImports": true,
+                "message": "Import schemas from their leaf module (e.g. @/common/orpc/schemas/runtime), not the @/common/orpc/schemas barrel: a value import of the barrel adds every schema to the first load. Type-only imports are fine."
+              },
+              {
+                "regex": "^(@/|@shared/|(\\.\\./)+)node(/|$)",
+                "allowTypeImports": true,
+                "message": "Browser and common code must not value-import src/node: backend modules can pull the @/common/orpc/schemas barrel and Node APIs into the browser bundle. Move the shared code to src/common. Type-only imports are fine."
+              },
+              {
+                "regex": "(^|/)(ai/providerOptions|tokens/tokenStatsCalculator|tools/tools)(\\.[jt]s)?([?#].*)?$",
+                "allowTypeImports": true,
+                "message": "This src/common module is backend-only: it value-imports src/node, so browser and common code must not value-import it. Type-only imports are fine."
+              },
               {
                 "group": ["@/common/orpc/schemas/*", "**/orpc/schemas/*"],
                 "message": "Config schemas must not import from ORPC; use @/common/schemas/* or @/common/config/schemas/* instead."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/common/config/schemas/**/*.test.ts"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "ai-tokenizer/encoding",
+                "allowTypeImports": true,
+                "message": "The ai-tokenizer/encoding barrel evaluates all four encodings (~14.5 s of CPU, #4816). Load one encoding through its subpath (ai-tokenizer/encoding/<name>) inside tokenizer.worker.ts."
+              }
+            ],
+            "patterns": [
+              {
+                "group": ["shiki"],
+                "importNamePattern": "^(?!type\\s)",
+                "allowTypeImports": true,
+                "message": "Shiki must only be imported in highlightWorker.ts to avoid blocking the main thread. Use highlightCode() from highlightWorkerClient.ts instead."
               },
               {
-                "regex": "(^|/)orpc/schemas$",
+                "regex": "(^|/)orpc/schemas(\\.[jt]s)?([?#].*)?$",
                 "allowTypeImports": true,
                 "message": "Import schemas from their leaf module (e.g. @/common/orpc/schemas/runtime), not the @/common/orpc/schemas barrel: a value import of the barrel adds every schema to the first load. Type-only imports are fine."
+              },
+              {
+                "group": ["@/common/orpc/schemas/*", "**/orpc/schemas/*"],
+                "message": "Config schemas must not import from ORPC; use @/common/schemas/* or @/common/config/schemas/* instead."
               }
             ]
           }

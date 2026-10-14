@@ -3108,17 +3108,11 @@ export class TurnRequestBuilder {
           compactionContextRetryAvailable === true
         );
         // Shared by the initial build and thinking rebuilds so their assembly
-        // inputs cannot drift apart mid-turn. `measureOnly` assembles a candidate history and
-        // returns its estimate without throwing: it runs after `request.assemble`, so no hook,
-        // tool-search seeding or skill step reruns. Turn-start stage decisions (#5286) count a
-        // candidate message list here.
-        const assemblePayloadForThinkingLevel = (
-          level: ThinkingLevel,
-          measureOnly?: { history: MuxMessage[] }
-        ) =>
+        // inputs cannot drift apart mid-turn.
+        const assemblePayloadForThinkingLevel = (level: ThinkingLevel) =>
           assembleBudgetCheckedPromptPayload(
             {
-              history: measureOnly?.history ?? options.sourceMessages,
+              history: options.sourceMessages,
               systemMessage: attemptSystem,
               volatileSystemSuffixLength: attemptVolatileSystemSuffixLength,
               tools: attemptTools,
@@ -3146,7 +3140,6 @@ export class TurnRequestBuilder {
               activeTools: forcedFirstStepToolNames?.length
                 ? forcedFirstStepToolNames
                 : (computeLoadedToolNames(toolSearchRuntime?.state) ?? [...firstStepToolNames]),
-              measureOnly: measureOnly != null,
             }
           );
         const prepareMessagesForProviderStartedAt = Date.now();
@@ -3206,8 +3199,6 @@ export class TurnRequestBuilder {
           contextBudgetLimit: attemptPayload.contextBudgetLimit,
           contextBudgetEstimate: attemptPayload.contextBudgetEstimate,
           ...compactionInputBudget,
-          measureMessages: (history: MuxMessage[]) =>
-            assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel, { history }),
           systemMessageTokens: attemptSystemTokens,
           tools: attemptTools,
           engineTools: attemptPayload.tools ?? attemptTools,

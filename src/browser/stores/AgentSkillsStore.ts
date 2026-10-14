@@ -3,7 +3,8 @@ import type { APIClient } from "@/browser/contexts/API";
 import { subscribeAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import { RefreshController } from "@/browser/utils/RefreshController";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
-import type { AgentSkillListResult } from "@/common/types/agentSkill";
+import type { AgentSkillListResult, InvocableSkill } from "@/common/types/agentSkill";
+import { listInvocableSkills } from "@/common/utils/agentSkills/skillLookupName";
 import { MapStore } from "./MapStore";
 
 /** The input of `agentSkills.list`: a workspace, or a project before its workspace exists. */
@@ -191,6 +192,14 @@ export function useAgentSkills(discovery: AgentSkillsDiscovery | null): AgentSki
     (listener) => (discovery ? store.subscribe(discovery, listener) : () => undefined),
     () => (discovery ? store.getResult(discovery) : EMPTY_RESULT)
   );
+}
+
+/**
+ * Skills for user invocation surfaces (slash menu, `$` suggestions, command
+ * palette): shadowed plugin skills join under `<plugin>:<skill>`.
+ */
+export function useInvocableSkills(discovery: AgentSkillsDiscovery | null): InvocableSkill[] {
+  return listInvocableSkills(useAgentSkills(discovery));
 }
 
 /** False while the first answer for `discovery` is pending (see AgentSkillsStore.hasResult). */
