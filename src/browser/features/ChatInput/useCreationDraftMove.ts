@@ -12,7 +12,6 @@ interface CreationDraftMoveSource {
   agent: CreationDraftAgent | undefined;
   sendInFlight: boolean;
   processingAttachmentCount: number;
-  payloadsLoaded: boolean;
   /** Voice input is requesting the microphone, recording, or transcribing. */
   voiceInputActive: boolean;
 }
@@ -28,14 +27,12 @@ export function useCreationDraftMove(source: CreationDraftMoveSource) {
     // The move waits for whatever is still on its way into the draft: the drafts themselves
     // (composers may render before they load, and an unloaded draft would move as an empty one),
     // a send in flight takes it, a file being read or a voice transcript is added to the draft it
-    // was meant for (and a microphone grant after the move would start a recording no one sees),
-    // and loading attachments would reach the moved copy only once loaded (lost if the user moved
-    // it on meanwhile).
+    // was meant for (and a microphone grant after the move would start a recording no one sees).
+    // Attachments not loaded yet need no wait: the backend move carries the stored ones.
     locked:
       !hydrated ||
       source.sendInFlight ||
       source.processingAttachmentCount > 0 ||
-      !source.payloadsLoaded ||
       source.voiceInputActive,
     move: (destination: string) =>
       moveWorkspaceDraft({

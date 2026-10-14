@@ -904,7 +904,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     agent: currentAgent,
     sendInFlight: isSendInFlight,
     processingAttachmentCount,
-    payloadsLoaded: draft.payloadsLoaded,
     voiceInputActive: voiceInput.state !== "idle",
   });
 

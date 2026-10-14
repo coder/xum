@@ -22,7 +22,7 @@ import {
   getTerminalTitlesKey,
   SELECTED_WORKSPACE_KEY,
 } from "@/common/constants/storage";
-import { copyWorkspaceStorage, deleteWorkspaceStorage } from "@/browser/utils/workspaceStorage";
+import { deleteWorkspaceStorage } from "@/browser/utils/workspaceStorage";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { useAPI, useLiveAPI } from "@/browser/contexts/API";
@@ -278,41 +278,14 @@ export interface WorkspaceDraftMove {
   agent: CreationDraftAgent | undefined;
 }
 
-/**
- * Moves a creation draft's text and attachments (the DraftStore deletes the source once the
- * destination is saved) and its workspace name state to a listed draft.
- */
-function moveCreationDraftBody(
-  from: { scope: DraftStoreScope; storageScopeId: string },
-  to: { projectPath: string; draftId: string }
-): void {
-  // Copied now for the destination composer, and deleted with the source draft only: a move that
-  // keeps the source (its save failed, another window edited it) keeps it whole.
-  const copied = copyWorkspaceStorage(
-    from.storageScopeId,
-    getDraftScopeId(to.projectPath, to.draftId)
-  );
-  getDraftStore()
-    .moveDraft(from.scope, { kind: "creation", projectPath: to.projectPath, draftId: to.draftId })
-    .then((sourceDeleted) => {
-      if (sourceDeleted && copied) deleteWorkspaceStorage(from.storageScopeId);
-    })
-    .catch((error: unknown) => {
-      console.warn("Failed to finish moving the draft's workspace name:", error);
-    });
-}
-
-/** The DraftStore scope and the name storage scope of a creation composer's draft. */
-function creationDraftSource(projectPath: string, draftId: string | null | undefined) {
+/** The DraftStore scope of a creation composer's draft (no listed id: the project's default). */
+function creationDraftScope(
+  projectPath: string,
+  draftId: string | null | undefined
+): DraftStoreScope {
   return draftId != null
-    ? {
-        scope: { kind: "creation", projectPath, draftId } satisfies DraftStoreScope,
-        storageScopeId: getDraftScopeId(projectPath, draftId),
-      }
-    : {
-        scope: defaultCreationDraftScope(projectPath),
-        storageScopeId: getPendingScopeId(projectPath),
-      };
+    ? { kind: "creation", projectPath, draftId }
+    : defaultCreationDraftScope(projectPath);
 }
 
 function findListedDraft(
@@ -349,15 +322,16 @@ function applyWorkspaceDraftMove(move: WorkspaceDraftMove, dest: WorkspaceCreati
   }
 
   const draftId = createDraftId();
-  getDraftStore().putCreationDraft(dest.projectPath, {
-    draftId,
-    subProjectPath: dest.subProjectPath,
-    createdAt: listed?.createdAt ?? Date.now(),
-  });
-  moveCreationDraftBody(creationDraftSource(move.projectPath, move.draftId), {
-    projectPath: dest.projectPath,
-    draftId,
-  });
+  // One backend step moves the body (its workspace name included) and lists the row; the
+  // destination shows the moved content at once. A failed move keeps the source whole.
+  getDraftStore()
+    .moveCreationDraft(creationDraftScope(move.projectPath, move.draftId), {
+      projectPath: dest.projectPath,
+      draftId,
+      subProjectPath: dest.subProjectPath,
+      createdAt: listed?.createdAt ?? Date.now(),
+    })
+    .catch((error: unknown) => console.warn("Failed to move the draft:", error));
   carryCreationAiSettings({
     sourceProjectPath: move.projectPath,
     destProjectPath: dest.projectPath,

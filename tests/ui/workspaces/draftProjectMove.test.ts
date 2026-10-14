@@ -34,13 +34,7 @@ import { getAutoRouting, getWorkspaceAiSelection } from "@/browser/utils/workspa
 import { readScopeAgentId, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
-import {
-  getDraftScopeId,
-  getPendingScopeId,
-  getProjectScopeId,
-  getWorkspaceNameStateKey,
-} from "@/common/constants/storage";
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { getProjectScopeId } from "@/common/constants/storage";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
@@ -306,11 +300,16 @@ describeIntegration("Creation project selector moves the draft", () => {
       expect(readScopeAgentId(getProjectScopeId(b))).toBe("plan");
       expect(getWorkspaceAiSelection(getProjectScopeId(b)).model).toBe(KNOWN_MODELS.HAIKU.id);
       expect(getAutoRouting(getProjectScopeId(b), "model")).toBe(false);
-      // The source is deleted once the destination is saved, so a reload shows it in B only.
+      // The backend moves the source into B, so a reload shows it in B only (with its name).
       await waitForDraftIds(a, []);
-      const saved = await getSharedEnv().services.draftService.get(creationScope(b, movedDraftId));
-      expect(saved.text).toBe("move me");
-      expect(saved.attachments.map(({ id }) => id)).toEqual([ATTACHMENT.id]);
+      await waitFor(async () => {
+        const saved = await getSharedEnv().services.draftService.get(
+          creationScope(b, movedDraftId)
+        );
+        expect(saved.text).toBe("move me");
+        expect(saved.attachments.map(({ id }) => id)).toEqual([ATTACHMENT.id]);
+        expect(saved.nameState?.manualName).toBe("moved-name");
+      }, WAIT);
     } finally {
       await cleanupView(view, cleanupDom);
     }
@@ -340,14 +339,9 @@ describeIntegration("Creation project selector moves the draft", () => {
         WAIT
       );
       expect(getWorkspaceDraftIds(a)).toEqual([]);
-      // No workspace name is left behind either: it would keep A's bare page non-empty.
-      await waitFor(
-        () =>
-          expect(
-            readPersistedState(getWorkspaceNameStateKey(getPendingScopeId(a)), null)
-          ).toBeNull(),
-        WAIT
-      );
+      // No workspace name is left behind either: the source composer's name request settled after
+      // the move, and a name would keep A's bare page non-empty.
+      expect(getDraftStore().getView(defaultCreationDraftScope(a)).nameState).toBeNull();
     } finally {
       naming.release();
       await cleanupView(view, cleanupDom);
@@ -502,8 +496,8 @@ describeIntegration("Creation project selector moves the draft", () => {
     }
   }, 90_000);
 
-  test("the project selector is disabled while the draft's attachments load", async () => {
-    const { view, cleanupDom, a } = await openTwoProjects();
+  test("a draft moves before its attachments load and keeps them", async () => {
+    const { view, cleanupDom, a, b } = await openTwoProjects();
     const { container } = view;
     const draftService = getSharedEnv().services.draftService;
     const realGet = draftService.get.bind(draftService);
@@ -531,11 +525,23 @@ describeIntegration("Creation project selector moves the draft", () => {
         });
         expect(getSpy).toHaveBeenCalled();
       }, WAIT);
+      expect(projectSelector(container)?.disabled).toBe(false);
 
-      // A move now would copy the text at once and the attachments only once they load.
-      await waitFor(() => expect(projectSelector(container)?.disabled).toBe(true), WAIT);
+      // The backend moves the stored attachments; the destination loads them after the move.
+      await moveDraftTo(container, path.basename(b));
+      const movedId = await onlyDraftId(b);
       releasePayloads();
-      await waitFor(() => expect(projectSelector(container)?.disabled).toBe(false), WAIT);
+
+      await waitFor(
+        () =>
+          expect(
+            getDraftStore()
+              .getView(creationScope(b, movedId))
+              .attachments.map(({ id }) => id)
+          ).toEqual([ATTACHMENT.id]),
+        WAIT
+      );
+      await waitForDraftIds(a, []);
     } finally {
       releasePayloads();
       getSpy.mockRestore();
@@ -644,17 +650,11 @@ describeIntegration("Creation project selector moves the draft", () => {
   test("a move that keeps its source keeps the source's workspace name", async () => {
     const { view, cleanupDom, a, b } = await openTwoProjects();
     const { container } = view;
-    const draftService = getSharedEnv().services.draftService;
-    const realUpdate = draftService.update.bind(draftService);
-    // The destination's save fails, so the move keeps the source draft.
-    const updateSpy = jest
-      .spyOn(draftService, "update")
-      .mockImplementation((input, acceptance) =>
-        input.scope.kind === "creation" && input.scope.projectPath === b
-          ? Promise.reject(new Error("destination save failed"))
-          : realUpdate(input, acceptance)
-      );
-    const moveSpy = jest.spyOn(getDraftStore(), "moveDraft");
+    // The backend move fails, so the move keeps the source draft.
+    const backendMoveSpy = jest
+      .spyOn(getSharedEnv().services.draftService, "moveCreation")
+      .mockRejectedValue(new Error("move failed"));
+    const moveSpy = jest.spyOn(getDraftStore(), "moveCreationDraft");
     try {
       await openProjectCreationView(view, a);
       const sourceDraftId = await onlyDraftId(a);
@@ -668,14 +668,17 @@ describeIntegration("Creation project selector moves the draft", () => {
 
       expect(await moveSpy.mock.results[0]?.value).toBe(false);
       expect(getWorkspaceDraftIds(a)).toEqual([sourceDraftId]);
-      expect(
-        readPersistedState(getWorkspaceNameStateKey(getDraftScopeId(a, sourceDraftId)), null)
-      ).toMatchObject({ manualName: "kept-name" });
+      expect(getWorkspaceDraftIds(b)).toEqual([]);
+      expect(getDraftStore().getView(creationScope(a, sourceDraftId)).nameState).toMatchObject({
+        manualName: "kept-name",
+      });
+      const saved = await getSharedEnv().services.draftService.get(
+        creationScope(a, sourceDraftId)
+      );
+      expect(saved.nameState?.manualName).toBe("kept-name");
     } finally {
       moveSpy.mockRestore();
-      updateSpy.mockRestore();
-      // Stops the destination's save retries.
-      await clearWorkspaceDrafts(b);
+      backendMoveSpy.mockRestore();
       await cleanupView(view, cleanupDom);
     }
   }, 90_000);
