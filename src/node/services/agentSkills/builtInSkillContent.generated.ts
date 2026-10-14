@@ -2496,7 +2496,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "Some skills from other tools set a `name` that is not kebab-case or is not the directory name, for example `name: Poteto Mode` in `poteto-mode/`.",
       "Xum loads such a skill from a project, global or plugin skills root under its directory name.",
       "Xum shows the `name` as a display name in the slash menu and the skills list, with a warning.",
-      "The display name must be a single line of at most 64 characters.",
+      "The display name must be a single line of at most 64 characters, with no control or invisible formatting characters.",
       "",
       "The skill ID stays the directory name:",
       "",

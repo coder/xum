@@ -4,6 +4,7 @@
 
 import { matchesNameBySegmentPrefix } from "@/browser/utils/suggestionMatching";
 import { MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
+import { formatSkillMenuDescription } from "@/common/utils/agentSkills/skillLookupName";
 import { formatModelDisplayName } from "@/common/utils/ai/modelDisplay";
 import { getSlashCommandDefinitions } from "./parser";
 import { isSlashCommandVisible, SLASH_COMMAND_DEFINITION_MAP } from "./registry";
@@ -28,15 +29,6 @@ function filterAndMapSuggestions<T extends SuggestionDefinition>(
       return matchesNameBySegmentPrefix(definition.key, partial);
     })
     .map((definition) => build(definition));
-}
-
-/** A display name (SKILL.md `name` that is not the ID) labels the entry; matching stays on the ID. */
-function formatSkillDescription(
-  skill: { description: string; displayName?: string },
-  scopeLabel: string
-): string {
-  const label = skill.displayName ? `${skill.displayName}: ` : "";
-  return `${label}${skill.description} (${scopeLabel})`;
 }
 
 function buildTopLevelSuggestions(
@@ -78,7 +70,7 @@ function buildTopLevelSuggestions(
     .filter((skill) => !SLASH_COMMAND_DEFINITION_MAP.has(skill.name))
     .map((skill) => ({
       key: skill.name,
-      description: formatSkillDescription(skill, formatScopeLabel(skill.scope)),
+      description: formatSkillMenuDescription(skill, formatScopeLabel(skill.scope)),
       argumentHint: skill.argumentHint,
     }));
 

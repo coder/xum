@@ -37,10 +37,11 @@ function assertValidSkillPaths(frontmatter: AgentSkillFrontmatter): void {
   }
 }
 
-// A display name is a single line of 1-64 characters (no control characters).
+// A display name is a single line of 1-64 characters. SKILL.md is repository-controlled
+// and the name renders in the UI and in diagnostics, so reject every control (C0, DEL,
+// C1), format (bidi overrides, zero-width) and line/paragraph separator character.
 const DISPLAY_NAME_MAX_LENGTH = 64;
-// eslint-disable-next-line no-control-regex
-const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f]/;
+const CONTROL_CHARACTER_PATTERN = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
 
 function qualifyDisplayName(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;

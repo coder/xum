@@ -202,6 +202,10 @@ describe("parseSkillMarkdown allowDisplayName", () => {
     ["whitespace", "name: '   '"],
     ["too long", `name: ${"x".repeat(65)}`],
     ["multi-line", "name: |\n  Poteto\n  Mode"],
+    // YAML double-quoted escapes: a C1 control, a line separator, a bidi override.
+    ["C1 control", 'name: "Poteto\\x85Mode"'],
+    ["line-separator", 'name: "Poteto\\u2028Mode"'],
+    ["bidi-override", 'name: "Poteto\\u202eMode"'],
     ["missing", "license: MIT"],
   ])("a %s name still throws with the option", (_label, name) => {
     expect(() => parse(name, "poteto-mode", true)).toThrow(AgentSkillParseError);
