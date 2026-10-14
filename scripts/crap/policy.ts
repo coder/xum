@@ -4,9 +4,11 @@ import {
   CRAP_TAX_STAGE,
   NEW_FUNCTION_MAX_SCORE,
   NEW_FUNCTION_ON_NET_DECREASE,
+  RELIEF_MAX_CRAP,
   TAX_WITHOUT_COVERAGE,
   moveRelief,
   netExtractionRelief,
+  reliefAllowsCrap,
   type Severity,
 } from "./thresholds";
 
@@ -183,6 +185,18 @@ function reliefNote(
   return null;
 }
 
+/** Relief applies only up to RELIEF_MAX_CRAP; above it the note says why it did not. */
+function relief(
+  head: FunctionRow,
+  totals: { base: number; head: number },
+  moves: MoveTotals
+): { note: string; relieved: boolean } | null {
+  const note = reliefNote(head, totals, moves);
+  if (note === null) return null;
+  if (reliefAllowsCrap(head.crap)) return { note, relieved: true };
+  return { note: `${note}, but relief needs CRAP <= ${RELIEF_MAX_CRAP}`, relieved: false };
+}
+
 function judgeNew(
   key: string,
   head: FunctionRow,
@@ -192,14 +206,14 @@ function judgeNew(
   const unit = head.crap === null ? "CC" : "CRAP";
   const score = head.crap ?? head.complexity;
   if (score <= NEW_FUNCTION_MAX_SCORE) return null;
-  const note = reliefNote(head, totals, moves);
+  const granted = relief(head, totals, moves);
   return {
     rule: "new-function",
-    severity: note ? NEW_FUNCTION_ON_NET_DECREASE : "violation",
+    severity: granted?.relieved ? NEW_FUNCTION_ON_NET_DECREASE : "violation",
     key,
     head,
     base: null,
-    message: `${where(head)}: new function ${unit} ${score} (max ${NEW_FUNCTION_MAX_SCORE}${note ? `, ${note}` : ""})`,
+    message: `${where(head)}: new function ${unit} ${score} (max ${NEW_FUNCTION_MAX_SCORE}${granted ? `, ${granted.note}` : ""})`,
   };
 }
 
@@ -216,8 +230,9 @@ function judgeNew(
  *
  * Only the head counts: missing hits only lower coverage, so a base score is
  * no lower than the real one and a head above it still regressed. The relief
- * applies only when the same rules pass the head at full coverage (CRAP = CC),
- * so a finding that CC alone proves, and floor-cc, keep their verdict.
+ * applies only when the same rules raise no violation on the head at full
+ * coverage (CRAP = CC), so a finding that CC alone proves, and floor-cc, keep
+ * their verdict.
  */
 function coverageRelief(
   finding: Finding,
@@ -232,7 +247,15 @@ function coverageRelief(
   ) {
     return finding;
   }
-  if (judge({ ...head, coverage: 1, crap: head.complexity }) !== null) return finding;
+  const atFullCoverage = judge({ ...head, coverage: 1, crap: head.complexity });
+  // A relieved new function is still a warning finding at full coverage. Only
+  // its CRAP above RELIEF_MAX_CRAP made it a violation, and that is coverage-based.
+  if (
+    atFullCoverage !== null &&
+    (atFullCoverage.severity === "violation" || finding.severity === "warning")
+  ) {
+    return finding;
+  }
   const why = bun
     ? "Bun's coverage may hide this function's tests (inlined-const bug, bunInlinedConstSuspect)"
     : `incomplete coverage, ${incompleteCoverage}`;

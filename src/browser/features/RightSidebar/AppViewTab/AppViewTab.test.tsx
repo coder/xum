@@ -104,6 +104,8 @@ describe("AppViewTabPanel", () => {
       expect(await view.findByText("This view is no longer available.")).toBeTruthy();
       expect(view.getByText("App view")).toBeTruthy();
       expect(view.queryByTestId("mcp-app-frame")).toBeNull();
+      // A missing record is final: asking again cannot find the view.
+      expect(view.queryByRole("button", { name: "Reload" })).toBeNull();
       fireEvent.click(view.getByRole("button", { name: "Close" }));
       expect(closed).toBe(1);
     } finally {
@@ -185,6 +187,57 @@ describe("AppViewTabPanel", () => {
       registered.mockRestore();
       state.mockRestore();
     }
+  });
+
+  test("a tab whose view failed to load offers Reload, which loads it again", async () => {
+    let calls = 0;
+    const client = createTestApiClient({
+      mcpApps: {
+        getView: () => {
+          calls += 1;
+          return Promise.resolve(
+            calls === 1
+              ? { success: false as const, error: "server not connected" }
+              : {
+                  success: true as const,
+                  data: {
+                    html: "<p>view</p>",
+                    csp: {},
+                    prefersBorder: null,
+                    resultAvailable: true,
+                    result: { content: [] },
+                    invocation: null,
+                  },
+                }
+          );
+        },
+      },
+    });
+    openMcpAppViewTab("ws-retry", {
+      toolCallId: "call-retry",
+      serverName: "dice",
+      resourceUri: "ui://dice/board.html",
+      toolName: "show",
+      label: "Board",
+      arguments: {},
+      cancelled: false,
+      failed: false,
+    });
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <APIProvider client={client}>
+          <AppViewTabPanel
+            workspaceId="ws-retry"
+            toolCallId="call-retry"
+            onClose={() => undefined}
+          />
+        </APIProvider>
+      </ThemeProvider>
+    );
+    expect(await view.findByText(/server not connected/)).toBeTruthy();
+    fireEvent.click(view.getByRole("button", { name: "Reload" }));
+    await view.findByTestId("mcp-app-frame");
+    expect(calls).toBe(2);
   });
 
   test("a restored tab of a failed or interrupted call outside the transcript gets tool-cancelled", async () => {
@@ -437,8 +490,8 @@ describe("AppViewTabPanel", () => {
     );
     try {
       const first = render(labels(true));
-      // Until it is retried, a failed lookup reads as unavailable.
-      expect(await first.findByText("This view is no longer available.")).toBeTruthy();
+      // Until it is retried, a failed lookup shows no view, only Reload and Close.
+      expect(await first.findByRole("button", { name: "Reload" })).toBeTruthy();
       // Three restored tabs, one request.
       expect(requests).toEqual([["b1", "b2", "b3"]]);
       first.unmount();
@@ -451,6 +504,62 @@ describe("AppViewTabPanel", () => {
         ["b1", "b2", "b3"],
         ["b1", "b2", "b3"],
       ]);
+    } finally {
+      registered.mockRestore();
+      state.mockRestore();
+    }
+  });
+
+  // E.g. the backend restarted while the layout was restored: the tab must not stay stuck until
+  // it remounts.
+  test("a restored tab whose record lookup failed offers Reload, which asks again", async () => {
+    const store = useWorkspaceStoreRaw();
+    const registered = spyOn(store, "hasRegisteredWorkspace").mockImplementation(
+      (id) => id === "ws-retry"
+    );
+    const state = spyOn(store, "getWorkspaceState").mockImplementation(
+      () =>
+        ({
+          messages: [],
+          loading: false,
+          isHydratingTranscript: false,
+        }) as unknown as WorkspaceState
+    );
+    let reachable = false;
+    const client = createTestApiClient({
+      mcpApps: {
+        getViewRecords: (input: { toolCallIds: string[] }) => {
+          if (!reachable) return Promise.reject(new Error("disconnected"));
+          return Promise.resolve({
+            success: true as const,
+            data: input.toolCallIds.map((toolCallId) => ({
+              toolCallId,
+              view: {
+                serverName: "dice",
+                toolName: "dice_show_dice_board",
+                resourceUri: "ui://dice/board.html",
+                arguments: {},
+              },
+            })),
+          });
+        },
+        getView: () => new Promise<never>(() => undefined),
+      },
+    });
+    try {
+      const view = render(
+        <ThemeProvider forcedTheme="dark">
+          <APIProvider client={client}>
+            <AppViewTabLabel workspaceId="ws-retry" toolCallId="call-r" />
+            <AppViewTabPanel workspaceId="ws-retry" toolCallId="call-r" onClose={() => undefined} />
+          </APIProvider>
+        </ThemeProvider>
+      );
+      const reload = await view.findByRole("button", { name: "Reload" });
+      reachable = true;
+      fireEvent.click(reload);
+      expect(await view.findByText("dice_show_dice_board")).toBeTruthy();
+      expect(view.queryByRole("button", { name: "Reload" })).toBeNull();
     } finally {
       registered.mockRestore();
       state.mockRestore();
@@ -580,6 +689,24 @@ describe("app view details", () => {
       registered.mockRestore();
       state.mockRestore();
     }
+  });
+
+  // A narrow tab cuts the label's detail off, so the tooltip carries it too.
+  test("the tooltip of one of several calls of a tool names that call's detail", () => {
+    for (const [id, args] of [
+      ["t-old", { count: 4 }],
+      ["t-new", { count: 6 }],
+    ] as const) {
+      openMcpAppViewTab("ws-tooltip", view(id, args));
+    }
+    const tooltip = (toolCallId: string) =>
+      render(
+        <APIProvider client={createTestApiClient({})}>
+          <AppViewTabTooltip workspaceId="ws-tooltip" toolCallId={toolCallId} />
+        </APIProvider>
+      ).container.textContent;
+    expect(tooltip("t-old")).toBe("Board · dice · count: 4");
+    expect(tooltip("t-new")).toBe("Board · dice · count: 6");
   });
 
   test("numbers repeats of the same call, oldest first", () => {

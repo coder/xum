@@ -61,6 +61,7 @@ import {
   updateMcpAppModelContext,
   approveMcpAppViewDomains,
   listMcpAppViewDomains,
+  readMcpAppViewDomains,
   revokeMcpAppViewDomains,
 } from "@/node/services/mcpAppsOperations";
 import {
@@ -1326,6 +1327,34 @@ export const router = (authToken?: string) => {
               )
             )
           ),
+        runTool: t
+          .input(schemas.mcp.settings.runTool.input)
+          .output(schemas.mcp.settings.runTool.output)
+          .handler(({ context, input, signal }) =>
+            runMcpSettingsRoute(context, input.workspaceId, signal, () =>
+              context.mcpServerManager.runSettingsTool(
+                input.workspaceId,
+                input.serverName,
+                input.toolName,
+                input.instanceToken,
+                { confirmed: input.confirmed, signal }
+              )
+            )
+          ),
+        openApp: t
+          .input(schemas.mcp.settings.openApp.input)
+          .output(schemas.mcp.settings.openApp.output)
+          .handler(({ context, input, signal }) =>
+            runMcpSettingsRoute(context, input.workspaceId, signal, () =>
+              context.mcpServerManager.openSettingsApp(
+                input.workspaceId,
+                input.serverName,
+                input.toolName,
+                input.instanceToken,
+                { confirmed: input.confirmed, signal }
+              )
+            )
+          ),
       },
       designStatus: t
         .input(schemas.mcp.designStatus.input)
@@ -1447,6 +1476,18 @@ export const router = (authToken?: string) => {
             name: input.name,
             consent: input.consent ?? undefined,
           })
+        ),
+      previewComponentReview: t
+        .input(schemas.agentPlugins.previewComponentReview.input)
+        .output(schemas.agentPlugins.previewComponentReview.output)
+        .handler(({ context, input }) =>
+          context.agentPluginInstallService.previewComponentReviewResult(input)
+        ),
+      confirmComponentReview: t
+        .input(schemas.agentPlugins.confirmComponentReview.input)
+        .output(schemas.agentPlugins.confirmComponentReview.output)
+        .handler(({ context, input }) =>
+          context.agentPluginInstallService.confirmComponentReviewResult(input)
         ),
     },
     mcpOauth: {
@@ -1837,6 +1878,10 @@ export const router = (authToken?: string) => {
         .input(schemas.mcpApps.listViewDomains.input)
         .output(schemas.mcpApps.listViewDomains.output)
         .handler(({ context }) => listMcpAppViewDomains(context)),
+      readViewDomains: t
+        .input(schemas.mcpApps.readViewDomains.input)
+        .output(schemas.mcpApps.readViewDomains.output)
+        .handler(({ context }) => readMcpAppViewDomains(context)),
       revokeViewDomains: t
         .input(schemas.mcpApps.revokeViewDomains.input)
         .output(schemas.mcpApps.revokeViewDomains.output)

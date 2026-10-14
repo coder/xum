@@ -964,6 +964,27 @@ describe("AIService turn engine events", () => {
     ]);
   });
 
+  it("a refusal fallback's tool hooks report the fallback model", async () => {
+    // Codex PRRT_kwDOPxxmWM6sXvVm: plugin hooks read `model` from this.
+    const primary = "openai:gpt-5.2";
+    const fallback = "anthropic:claude-haiku-4-5";
+    using harness = await createForwardingHarness(
+      "ai-service-hook-turn-fallback",
+      { modelString: primary },
+      { [primary]: { models: [fallback] } }
+    );
+    const prepared = await harness.startStreamCalls[0]?.modelFallback?.prepare(fallback);
+    expect(prepared?.success).toBe(true);
+
+    const getTools = toolsModule.getToolsForModel as unknown as {
+      mock: { calls: Array<[string, { hookTurn?: { turnId: string; model: string } }]> };
+    };
+    const turns = getTools.mock.calls.map(([, config]) => config.hookTurn);
+    expect(turns.map((turn) => turn?.model)).toEqual([primary, fallback]);
+    // One turn: both attempts report the same turn ID.
+    expect(new Set(turns.map((turn) => turn?.turnId)).size).toBe(1);
+  });
+
   it("forwards stream-abort without mutating a workspace partial", async () => {
     using harness = await createForwardingHarness("ai-service-stream-abort-forwarding");
     const { historyService, service, emitEngineEvent, trackedMessageId } = harness;
@@ -5324,9 +5345,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     appConfig = { ...baseAppConfig, routePriority: ["direct", "bedrock"] };
     expect(modelIds()).toEqual(anthropicBuiltIns);
 
-    // 4. A model hidden in config.json disappears.
-    appConfig = { ...appConfig, hiddenModels: [KNOWN_MODELS.SONNET.id] };
-    expect(modelIds()).toEqual(anthropicBuiltIns.filter((id) => id !== KNOWN_MODELS.SONNET.id));
+    // Hiding a model only changes the picker, not whether tasks can use it.
+    appConfig = { ...appConfig, hiddenModels: anthropicBuiltIns };
+    expect(modelIds()).toEqual(anthropicBuiltIns);
   });
 
   // #5086: Sonnet 5.5 "off" is between_tools at a pinned effort; after an effort

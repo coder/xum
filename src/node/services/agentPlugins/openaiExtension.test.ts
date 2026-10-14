@@ -189,6 +189,62 @@ describe("readOpenAIExtension", () => {
     }
   });
 
+  test("joiner and tag exceptions need their exact context; Hangul fillers are refused (#6560)", () => {
+    const read = (iface: Record<string, unknown>) =>
+      readOpenAIExtension({ extensions: { "com.openai": { interface: iface } } });
+    // A Devanagari half-form (ZWJ after a virama), and a mark after a Persian ZWNJ.
+    for (const text of ["\u0915\u094d\u200d\u0937", "\u0647\u200c\u0610\u0627"]) {
+      const good = read({ ...validInterface, displayName: text, developerName: text });
+      expect(good.warnings).toEqual([]);
+      expect(good.extension?.interface?.displayName).toBe(text);
+    }
+    for (const bad of [
+      // ZWJ without a virama shapes nothing, and a ZWJ across scripts is a spoof.
+      "\u0915\u200d\u0937",
+      "\u0627\u200d\u0915",
+      "\u0915\u094d\u200d\u0627",
+      // After the virama ZWJ must come a letter, not a digit or a vowel sign.
+      "\u0915\u094d\u200d\u0967",
+      "\u0915\u094d\u200d\u093e",
+      // A virama ZWJ needs a same-script letter before the virama too.
+      "\u094d\u200d\u0937",
+      "A\u094d\u200d\u0937",
+      // Only marks of a shaping script may sit after a ZWNJ (a Khmer vowel sign may not).
+      "\u0628\u200c\u17b6\u0628",
+      // ZWNJ between Arabic-Indic digits: digits are not letters.
+      "\u0661\u200c\u0662",
+      // A tag that is not a digit or lowercase letter, and a one-tag payload.
+      "\u{1f3f4}\u{e0021}\u{e0062}\u{e007f}",
+      "\u{1f3f4}\u{e0067}\u{e007f}",
+      // Hangul fillers are invisible letters.
+      "Fig\u3164ma",
+      "\u3164",
+      "Fig\uffa0ma",
+      "Fig\u115fma",
+      "Fig\u1160ma",
+    ]) {
+      expect(read({ ...validInterface, developerName: bad }).extension).toEqual({});
+    }
+  });
+
+  test("a long run of Arabic combining marks is checked in linear time (#6560)", () => {
+    // U+0610 is in an Arabic shaping script and is a mark. The old ZWNJ rule rescanned the rest of
+    // the string from each one: quadratic, about 50 ms per read on Bun and 200 ms on Node at the
+    // 4000-character longDescription cap. Twenty reads keep that far above the bound, and the
+    // linear rule far below it.
+    const marks = "\u0610".repeat(4000);
+    const extension = {
+      "com.openai": { interface: { ...validInterface, longDescription: marks } },
+    };
+    const started = performance.now();
+    for (let read = 0; read < 20; read++) {
+      expect(
+        readOpenAIExtension({ extensions: extension }).extension?.interface?.longDescription
+      ).toBe(marks);
+    }
+    expect(performance.now() - started).toBeLessThan(250);
+  });
+
   test("a blank capability drops the capability list with a warning", () => {
     const read = (capabilities: unknown) =>
       readOpenAIExtension({

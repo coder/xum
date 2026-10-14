@@ -16,6 +16,7 @@ import {
   openMcpAppEntrypoint,
   approveMcpAppViewDomains,
   listMcpAppViewDomains,
+  readMcpAppViewDomains,
   type McpAppsContext,
   readMcpAppServerResource,
   revokeMcpAppViewDomains,
@@ -434,6 +435,52 @@ describe("MCP Apps view domain approvals", () => {
     expect(after.success && after.data.approvedDomainsRevision).toBeGreaterThanOrEqual(
       revoked.revision
     );
+  });
+
+  // The live follow (#6181): another process's edit takes no revision, so each follow read
+  // takes its own, newer than every list a view read before it.
+  test("a follow read outranks earlier lists and waits for an edit in flight", async () => {
+    const { ctx, projects } = projectConfig();
+    const before = await getMcpAppView(ctx, request(), undefined, noWarm);
+    if (!before.success) throw new Error(before.error);
+    // Another Xum process allows an origin: only the config file changes.
+    projects.get("/repo")!.mcpAppViewDomains = { charts: ["https://other.example.com"] };
+    const foreign = await readMcpAppViewDomains(ctx);
+    expect(foreign.approvals).toEqual([
+      { projectPath: "/repo", serverName: "charts", origins: ["https://other.example.com"] },
+    ]);
+    expect(foreign.revision).toBeGreaterThan(before.data.approvedDomainsRevision ?? 0);
+
+    // An approval that took its revision but has not committed: the read waits for it, so it
+    // reads the approval and outranks its result.
+    const config = ctx.config as unknown as {
+      editConfig: (fn: (c: unknown) => unknown) => Promise<void>;
+    };
+    const commit = config.editConfig;
+    let releaseEdit = () => undefined as void;
+    const held = new Promise<void>((resolve) => (releaseEdit = resolve));
+    let reachEdit = () => undefined as void;
+    const editReached = new Promise<void>((resolve) => (reachEdit = resolve));
+    config.editConfig = async (fn) => {
+      reachEdit();
+      await held;
+      return commit(fn);
+    };
+    const approval = approveMcpAppViewDomains(ctx, approve(["https://a.example.com"]));
+    await editReached;
+    let readDone = false;
+    const read = readMcpAppViewDomains(ctx).then((result) => {
+      readDone = true;
+      return result;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(readDone).toBe(false);
+    releaseEdit();
+    const approved = await approval;
+    if (!approved.success) throw new Error(approved.error);
+    const after = await read;
+    expect(after.approvals[0]?.origins).toContain("https://a.example.com");
+    expect(after.revision).toBeGreaterThan(approved.data.revision);
   });
 
   test("one request carries a view's whole pending batch (resource and connect lists)", () => {

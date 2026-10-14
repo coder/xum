@@ -274,6 +274,14 @@ const SELECTION_EXTENDING_KEYS = new Set([
 ]);
 
 /**
+ * The annotate shortcut's first press, not its auto-repeat: a held key toggled annotate mode at
+ * the key-repeat rate (#6347). The frame's key bridge ignores repeats the same way.
+ */
+function matchesAnnotateShortcut(e: React.KeyboardEvent): boolean {
+  return !e.repeat && matchesKeybind(e, KEYBINDS.TOGGLE_ARTIFACT_ANNOTATE);
+}
+
+/**
  * Artifacts tab (experiment: "artifacts"): files the agent writes to
  * $XUM_SCRATCH_DIR/artifacts, listed newest first with a preview of the selected one.
  */
@@ -884,7 +892,7 @@ export function ArtifactsPanel(props: {
       e.preventDefault();
       keepFocusForShortcuts(e.target);
       unpinShelfSelected();
-    } else if (matchesKeybind(e, KEYBINDS.TOGGLE_ARTIFACT_ANNOTATE)) {
+    } else if (matchesAnnotateShortcut(e)) {
       e.preventDefault();
       toggleAnnotate();
     }

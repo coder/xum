@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { Maximize2, Minimize2, X } from "lucide-react";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { cn } from "@/common/lib/utils";
@@ -42,6 +42,7 @@ import {
 import {
   newestMcpAppViewDomains,
   publishMcpAppViewDomains,
+  useFollowMcpAppViewDomains,
   useMcpAppViewDomains,
 } from "./mcpAppViewDomainsStore";
 import { newConfirmPromptId, useConfirmArmed } from "./confirmArming";
@@ -129,6 +130,11 @@ function consentText(request: McpAppConsentRequest): [string, string, string] {
   }
 }
 
+/** The server as the user sees it: a plugin server's "<plugin> · <server>" label, when known. */
+function viewServerLabel(view: McpAppViewRef): string {
+  return view.serverLabel ?? mcpServerDisplayName(view.serverName);
+}
+
 /** Maximizes the app tab over the window, or restores it (#6165). None without a toggle. */
 function MaximizeViewButton(props: { maximized?: boolean; onToggle?: () => void }) {
   if (props.onToggle == null) return null;
@@ -152,6 +158,7 @@ function MaximizeViewButton(props: { maximized?: boolean; onToggle?: () => void 
 
 function McpAppViewHeader(props: {
   serverName: string;
+  serverLabel: string;
   onClose: () => void;
   /** Whether the tab is maximized over the window; undefined when the host offers no maximize. */
   maximized?: boolean;
@@ -162,7 +169,7 @@ function McpAppViewHeader(props: {
       <span className="text-muted min-w-0 flex-1 truncate">
         App view from{" "}
         <TooltipIfPresent tooltip={props.serverName}>
-          <span className="text-foreground">{mcpServerDisplayName(props.serverName)}</span>
+          <span className="text-foreground">{props.serverLabel}</span>
         </TooltipIfPresent>
       </span>
       <MaximizeViewButton maximized={props.maximized} onToggle={props.onToggleMaximized} />
@@ -435,6 +442,50 @@ function DomainsPromptText(props: { origins: readonly string[]; projectPath: str
   );
 }
 
+/** Hands a frame's close sequence to its host (McpAppFrame `closeRef`) while it is mounted. */
+function useExposedClose(
+  closeRef: { current: (() => void) | null } | undefined,
+  close: () => void
+): void {
+  useEffect(() => {
+    if (closeRef === undefined) return;
+    closeRef.current = close;
+    return () => {
+      closeRef.current = null;
+    };
+  });
+}
+
+/**
+ * A view that could not be shown. A failed load (an error) can be retried where the host
+ * offers Reload (its app tab remounts the frame); a missing view cannot.
+ */
+function McpAppViewUnavailable(props: {
+  header: ReactNode;
+  inline: boolean;
+  error: string | null;
+  onReload?: () => void;
+}) {
+  return (
+    <div className="flex min-h-0 flex-col">
+      {props.header}
+      <div className="text-danger p-4 text-xs">
+        {props.inline ? null : "This view is no longer available. "}
+        {props.error ?? "The view could not be loaded."}
+      </div>
+      {props.onReload != null && props.error != null && (
+        <button
+          type="button"
+          onClick={props.onReload}
+          className="border-border-light focus-visible:ring-accent mx-4 self-start rounded border px-2 py-0.5 text-xs focus-visible:ring-1"
+        >
+          Reload
+        </button>
+      )}
+    </div>
+  );
+}
+
 /**
  * Close the channel of a document that left the frame: a new one replaced it, it navigated away
  * (the frame is removed until Reload, which loads a new document), or the view unmounted. The
@@ -471,6 +522,13 @@ export function McpAppFrame(props: {
   /** Panel only: whether its tab is maximized over the window (#6165), and the toggle. */
   maximized?: boolean;
   onToggleMaximized?: () => void;
+  /** Panel only: loads the view again (its tab remounts the frame), offered when loading failed. */
+  onReload?: () => void;
+  /**
+   * Panel only: receives the frame's close sequence (the view's teardown, then onClose), so a
+   * host's own dismissal (a modal's Escape or outside click) closes the view the same way.
+   */
+  closeRef?: { current: (() => void) | null };
 }) {
   const inline = props.variant === "inline";
   const { api } = useAPI();
@@ -530,6 +588,8 @@ export function McpAppFrame(props: {
   const approvalProjectPath = current?.view?.approvalProjectPath ?? null;
   // An approval or revoke of this server committed after this view's read applies here too.
   const published = useMcpAppViewDomains(approvalProjectPath, boundServerName);
+  // A Revoke in another window or Xum process narrows this view while it stays mounted.
+  useFollowMcpAppViewDomains(approvalProjectPath, boundServerName);
   const approved = newestMcpAppViewDomains(published, current?.view);
   const grant = current?.view ? grantMcpAppCsp(current.view.csp, approved) : null;
   // Only a view with a result record can be approved (the record binds its server), and only
@@ -789,26 +849,34 @@ export function McpAppFrame(props: {
     await hostRef.current?.teardown("closed");
     props.onClose?.();
   };
+  useExposedClose(props.closeRef, () => void close());
 
   const header = inline ? null : (
     <McpAppViewHeader
       serverName={serverName}
+      serverLabel={viewServerLabel(view)}
       onClose={() => void close()}
       maximized={props.maximized}
       onToggleMaximized={props.onToggleMaximized}
     />
   );
 
-  if (current == null) return <Notice>Loading…</Notice>;
-  if (current.view == null || srcDoc == null || grant == null) {
+  // A panel keeps its Close header while it loads: a hung load must stay closable.
+  if (current == null)
     return (
       <div className="flex min-h-0 flex-col">
         {header}
-        <div className="text-danger p-4 text-xs">
-          {inline ? null : "This view is no longer available. "}
-          {current.error ?? "The view could not be loaded."}
-        </div>
+        <Notice>Loading…</Notice>
       </div>
+    );
+  if (current.view == null || srcDoc == null || grant == null) {
+    return (
+      <McpAppViewUnavailable
+        header={header}
+        inline={inline}
+        error={current.error}
+        onReload={props.onReload}
+      />
     );
   }
   return (

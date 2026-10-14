@@ -7,9 +7,11 @@ import {
   appViewServerNames,
   markMcpAppViewHosted,
   openMcpAppViewTab,
+  reloadMcpAppView,
   setMcpAppViewMaximized,
   useMcpAppViewMaximized,
   useMcpAppView,
+  useMcpAppViewLookupFailed,
   useMcpAppViewReloadKey,
   useMcpAppViews,
   type McpAppViewRef,
@@ -41,32 +43,44 @@ export function AppViewInTabNotice(props: { workspaceId: string; view: McpAppVie
   );
 }
 
+/** Whether another view of the workspace shows the same label and short server name. */
+function sharesLabel(views: readonly McpAppViewRef[], ref: McpAppViewRef): boolean {
+  // Compared by what the label shows: two plugin installs share a short server name.
+  return views.some(
+    (v) =>
+      v.toolCallId !== ref.toolCallId &&
+      v.label === ref.label &&
+      mcpServerDisplayName(v.serverName) === mcpServerDisplayName(ref.serverName)
+  );
+}
+
+/** The server and detail parts of a view's tab label; `index` is its place in `views`. */
+function tabTextOf(views: readonly McpAppViewRef[], ref: McpAppViewRef, index: number) {
+  if (index < 0) {
+    return { server: ref.serverLabel ?? mcpServerDisplayName(ref.serverName), detail: "" };
+  }
+  return {
+    server: appViewServerNames(views)[index],
+    detail: sharesLabel(views, ref) ? appViewDetails(views)[index] : "",
+  };
+}
+
 /**
  * Tab strip label of an app tab: the tool's title (or name), then its server. When another view
  * of the workspace reads the same, the call's detail (outcome, arguments, `#n`) follows, so tabs
- * of several calls of one tool stay apart.
+ * of several calls of one tool stay apart. The tooltip shows the same detail.
  */
-export function AppViewTabLabel(props: { workspaceId: string; toolCallId: string | null }) {
-  const view = useMcpAppView(props.workspaceId, props.toolCallId ?? "");
-  const views = useMcpAppViews(props.workspaceId);
+function useAppViewTabText(workspaceId: string, toolCallId: string | null) {
+  const view = useMcpAppView(workspaceId, toolCallId ?? "");
+  const views = useMcpAppViews(workspaceId);
   const ref = typeof view === "object" ? view : null;
-  const index = ref == null ? -1 : views.findIndex((v) => v.toolCallId === ref.toolCallId);
-  // Compared by what the label shows: two plugin installs share a short server name.
-  const ambiguous =
-    ref != null &&
-    views.some(
-      (v) =>
-        v.toolCallId !== ref.toolCallId &&
-        v.label === ref.label &&
-        mcpServerDisplayName(v.serverName) === mcpServerDisplayName(ref.serverName)
-    );
-  const detail = ambiguous && index >= 0 ? appViewDetails(views)[index] : "";
-  const server =
-    ref == null
-      ? ""
-      : index >= 0
-        ? appViewServerNames(views)[index]
-        : (ref.serverLabel ?? mcpServerDisplayName(ref.serverName));
+  if (ref == null) return { ref, server: "", detail: "" };
+  const index = views.findIndex((v) => v.toolCallId === ref.toolCallId);
+  return { ref, ...tabTextOf(views, ref, index) };
+}
+
+export function AppViewTabLabel(props: { workspaceId: string; toolCallId: string | null }) {
+  const { ref, server, detail } = useAppViewTabText(props.workspaceId, props.toolCallId);
   return (
     <span className="inline-flex min-w-0 items-center gap-1">
       <AppWindow className="h-3 w-3 shrink-0" />
@@ -81,13 +95,16 @@ export function AppViewTabLabel(props: { workspaceId: string; toolCallId: string
   );
 }
 
-/** Tab tooltip of an app tab: the label and the full server key (the label shows its short form). */
+/**
+ * Tab tooltip of an app tab: the label, the full server key (the label shows its short form),
+ * and the call's detail when the label has one, which a narrow tab cuts off.
+ */
 export function AppViewTabTooltip(props: { workspaceId: string; toolCallId: string | null }) {
-  const view = useMcpAppView(props.workspaceId, props.toolCallId ?? "");
-  const ref = typeof view === "object" ? view : null;
+  const { ref, detail } = useAppViewTabText(props.workspaceId, props.toolCallId);
   return ref == null ? null : (
     <span className="wrap-anywhere">
       {ref.label} · {withEntrypointScope(ref.serverLabel ?? ref.serverName, ref.entrypointType)}
+      {detail !== "" && ` · ${detail}`}
     </span>
   );
 }
@@ -106,6 +123,7 @@ export function AppViewTabPanel(props: {
   const viewKey = props.toolCallId ?? "";
   const view = useMcpAppView(props.workspaceId, viewKey);
   const reloadKey = useMcpAppViewReloadKey(props.workspaceId, viewKey);
+  const lookupFailed = useMcpAppViewLookupFailed(props.workspaceId, viewKey);
   const { workspaceId, toolCallId } = props;
   useEffect(() => {
     if (toolCallId == null) return;
@@ -114,16 +132,11 @@ export function AppViewTabPanel(props: {
   if (view === "loading") return <Notice>Loading…</Notice>;
   if (view == null) {
     return (
-      <div className="flex flex-col items-start gap-2 p-4 text-xs">
-        <span className="text-muted">This view is no longer available.</span>
-        <button
-          type="button"
-          onClick={props.onClose}
-          className="border-border-light focus-visible:ring-accent rounded border px-2 py-0.5 focus-visible:ring-1"
-        >
-          Close
-        </button>
-      </div>
+      <AppViewUnavailable
+        lookupFailed={lookupFailed}
+        onReload={() => reloadMcpAppView(workspaceId, viewKey)}
+        onClose={props.onClose}
+      />
     );
   }
   return (
@@ -135,6 +148,7 @@ export function AppViewTabPanel(props: {
           workspaceId={props.workspaceId}
           view={view}
           onClose={props.onClose}
+          onReload={() => reloadMcpAppView(props.workspaceId, view.toolCallId)}
           maximized={maximized}
           onToggleMaximized={() => setMaximized(!maximized)}
           // Keys inside the frame never reach the panel's onKeyDown: the frame forwards them.
@@ -236,4 +250,43 @@ function usePinnedOverWindow(
       if (panel.isConnected) panel.focus();
     };
   }, [panelRef, active]);
+}
+
+/**
+ * An app tab without its view: gone (only Close), or its record lookup failed (Reload too,
+ * since asking again can find it).
+ */
+function AppViewUnavailable(props: {
+  lookupFailed: boolean;
+  onReload: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="flex flex-col items-start gap-2 p-4 text-xs">
+      <span className="text-muted">
+        {props.lookupFailed
+          ? "This view could not be loaded."
+          : "This view is no longer available."}
+      </span>
+      <div className="flex gap-2">
+        {props.lookupFailed && (
+          // The record request failed (not a missing record): asking again can find the view.
+          <button
+            type="button"
+            onClick={props.onReload}
+            className="border-border-light focus-visible:ring-accent rounded border px-2 py-0.5 focus-visible:ring-1"
+          >
+            Reload
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={props.onClose}
+          className="border-border-light focus-visible:ring-accent rounded border px-2 py-0.5 focus-visible:ring-1"
+        >
+          Close
+        </button>
+      </div>
+    </div>
+  );
 }

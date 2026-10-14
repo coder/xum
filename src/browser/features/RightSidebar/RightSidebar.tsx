@@ -1,3 +1,4 @@
+import { RIGHT_SIDEBAR_DEFAULT_COLLAPSED } from "@/constants/layout";
 import React from "react";
 import { X } from "lucide-react";
 import {
@@ -64,7 +65,6 @@ import {
   isTerminalFocused,
   matchesNewSidebarTabKeybind,
 } from "@/browser/utils/ui/keybinds";
-import { SidebarCollapseButton } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
 import { Button } from "@/browser/components/Button/Button";
 import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
@@ -100,6 +100,7 @@ import {
   collectAllTabsWithTabset,
   dockTabToEdge,
   findTabset,
+  findTopRightTabsetId,
   getDefaultRightSidebarLayoutState,
   getFocusedActiveTab,
   moveTabToTabset,
@@ -118,6 +119,7 @@ import {
 import {
   RightSidebarTabStrip,
   getTabName,
+  isSidebarControlTarget,
   type TabDragData,
 } from "@/browser/features/RightSidebar/RightSidebarTabStrip";
 import {
@@ -371,6 +373,8 @@ interface RightSidebarTabsetNodeProps {
   onPopOutTerminal: (tab: TabType) => void;
   /** Handler for the strip's "+" button: open (or show) this tabset's New tab */
   onAddNewTab: (tabsetId: string) => void;
+  /** Set only for the tabset whose strip shows the sidebar's collapse button */
+  onCollapseSidebar?: () => void;
   /** Open a tool from this tabset's New tab launcher (replaces the New tab) */
   onOpenToolFromNewTab: (tabsetId: string, tool: BaseTabType) => void;
   /** Create a terminal from this tabset's New tab launcher (replaces the New tab) */
@@ -435,6 +439,32 @@ interface RightSidebarTabsetNodeProps {
   showTabShortcuts: boolean;
 }
 
+/** A tabset pane's root element: using anything inside the pane focuses the pane. */
+const TabsetPaneRoot: React.FC<{
+  tabsetId: string;
+  setLayout: RightSidebarTabsetNodeProps["setLayout"];
+  children: React.ReactNode;
+}> = (props) => {
+  const setFocused = (event: React.SyntheticEvent) => {
+    // The collapse button sits in one pane's strip but acts on the whole sidebar, so Expand
+    // later returns to the pane the user was in.
+    if (isSidebarControlTarget(event.target)) return;
+    props.setLayout((prev) => setFocusedTabset(prev, props.tabsetId));
+  };
+  return (
+    // Keyboard focus moving into a pane (Tab, a launcher or terminal taking focus) focuses it
+    // too, not just a click, so pane-scoped shortcuts act on the pane the user is in.
+    <div
+      className="flex min-h-0 min-w-0 flex-1 flex-col"
+      data-tabset-id={props.tabsetId}
+      onMouseDownCapture={setFocused}
+      onFocusCapture={setFocused}
+    >
+      {props.children}
+    </div>
+  );
+};
+
 const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) => {
   const tabsetBaseId = `${props.baseId}-${props.node.id}`;
   const { api } = useAPI();
@@ -476,10 +506,6 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
   const showDockHints =
     props.isDraggingTab &&
     (isOverContent || isOverTop || isOverBottom || isOverLeft || isOverRight);
-
-  const setFocused = () => {
-    props.setLayout((prev) => setFocusedTabset(prev, props.node.id));
-  };
 
   const selectTab = (tab: TabType) => {
     if (isTerminalTab(tab)) {
@@ -647,20 +673,14 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
   };
 
   return (
-    // Keyboard focus moving into a pane (Tab, a launcher or terminal taking focus) focuses it
-    // too, not just a click, so pane-scoped shortcuts act on the pane the user is in.
-    <div
-      className="flex min-h-0 min-w-0 flex-1 flex-col"
-      data-tabset-id={props.node.id}
-      onMouseDownCapture={setFocused}
-      onFocusCapture={setFocused}
-    >
+    <TabsetPaneRoot tabsetId={props.node.id} setLayout={props.setLayout}>
       <SortableContext items={sortableIds} strategy={rectSortingStrategy}>
         <RightSidebarTabStrip
           ariaLabel="Sidebar views"
           items={items}
           tabsetId={props.node.id}
           onAddNewTab={() => props.onAddNewTab(props.node.id)}
+          onCollapseSidebar={props.onCollapseSidebar}
         />
       </SortableContext>
       <div
@@ -827,7 +847,7 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
           );
         })}
       </div>
-    </div>
+    </TabsetPaneRoot>
   );
 };
 
@@ -1116,9 +1136,13 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 
   // Manual collapse state (persisted globally)
   // WorkspaceShell expands it when it opens the phone full-screen view (see there).
-  const [collapsed, setCollapsed] = usePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, false, {
-    listener: true,
-  });
+  const [collapsed, setCollapsed] = usePersistedState<boolean>(
+    RIGHT_SIDEBAR_COLLAPSED_KEY,
+    RIGHT_SIDEBAR_DEFAULT_COLLAPSED,
+    {
+      listener: true,
+    }
+  );
   const [isReviewImmersive, setIsReviewImmersive] = usePersistedState<boolean>(
     getReviewImmersiveKey(workspaceId),
     false,
@@ -2405,6 +2429,8 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   );
 
   const isDraggingTab = activeDragData !== null;
+  // Full-screen mode closes from its header instead.
+  const collapseTabsetId = fullscreen ? null : findTopRightTabsetId(layout.root);
 
   const renderLayoutNode = (node: RightSidebarLayoutNode): React.ReactNode => {
     if (node.type === "split") {
@@ -2457,6 +2483,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         setLayout={setLayout}
         onPopOutTerminal={handlePopOutTerminal}
         onAddNewTab={handleAddNewTab}
+        onCollapseSidebar={node.id === collapseTabsetId ? () => setCollapsed(true) : undefined}
         onOpenToolFromNewTab={handleOpenToolFromNewTab}
         onOpenTerminalFromNewTab={handleOpenTerminalFromNewTab}
         onOpenSideChatFromNewTab={canStartSideChat ? handleStartSideChat : undefined}
@@ -2544,7 +2571,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
             </Button>
           </div>
         )}
-        {!collapsed && (
+        {!collapsed ? (
           <div className="flex min-h-0 min-w-0 flex-1 flex-row">
             {/* Resize handle (left edge); full-screen mode has nothing to resize. */}
             {onStartResize && !fullscreen && (
@@ -2560,18 +2587,9 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 
             <div className="flex min-h-0 min-w-0 flex-1 flex-col">
               {renderLayoutNode(layout.root)}
-              {/* Full-screen mode closes from its header instead. */}
-              {!fullscreen && (
-                <SidebarCollapseButton
-                  collapsed={collapsed}
-                  onToggle={() => setCollapsed(!collapsed)}
-                  side="right"
-                />
-              )}
             </div>
           </div>
-        )}
-        {collapsed && (
+        ) : (
           <RightSidebarOverview
             workspaceId={workspaceId}
             onExpand={handleExpandFromOverview}

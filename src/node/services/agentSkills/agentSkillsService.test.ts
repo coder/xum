@@ -4,7 +4,11 @@ import * as path from "node:path";
 
 import { describe, expect, spyOn, test } from "bun:test";
 
-import { createTestPluginInstallEntry } from "@/node/services/agentPlugins/testFixtures";
+import {
+  createTestPluginInstallEntry,
+  reviewedComponentConsent,
+} from "@/node/services/agentPlugins/testFixtures";
+import type { ComponentConsent } from "@/node/services/agentPlugins/componentConsent";
 import { SkillNameSchema } from "@/common/orpc/schemas";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
@@ -18,6 +22,12 @@ import {
   getDefaultAgentSkillsRoots,
   readAgentSkill,
 } from "./agentSkillsService";
+
+async function writeSkillWithName(root: string, dir: string, name: string): Promise<void> {
+  await fs.mkdir(path.join(root, dir), { recursive: true });
+  const content = `---\nname: ${name}\ndescription: from ${dir}\n---\nBody\n`;
+  await fs.writeFile(path.join(root, dir, "SKILL.md"), content, "utf-8");
+}
 
 async function writeSkill(root: string, name: string, description: string): Promise<void> {
   const skillDir = path.join(root, name);
@@ -333,7 +343,10 @@ describe("agentSkillsService", () => {
     const roots = { projectRoot: projectSkillsRoot, globalRoot: globalSkillsRoot };
     const runtime = new LocalRuntime(project.path);
 
-    const { skills } = await discoverAgentSkills(runtime, project.path, { roots });
+    const result = await discoverAgentSkills(runtime, project.path, { roots });
+    const { skills } = result;
+    // Valid skills keep the payload unchanged: no empty warnings list.
+    expect("skillWarnings" in result).toBe(false);
 
     // Should include project/global skills plus built-in skills
     // Note: deep-review is a project skill in the Xum repo, not a built-in.
@@ -961,15 +974,6 @@ describe("agentSkillsService", () => {
       "utf-8"
     );
 
-    // Mismatched frontmatter.name vs directory name
-    const mismatchDir = path.join(projectSkillsRoot, "name-mismatch");
-    await fs.mkdir(mismatchDir, { recursive: true });
-    await fs.writeFile(
-      path.join(mismatchDir, "SKILL.md"),
-      `---\nname: other-name\ndescription: mismatch\n---\nBody\n`,
-      "utf-8"
-    );
-
     const roots = { projectRoot: projectSkillsRoot, globalRoot: globalSkillsRoot };
     const runtime = new LocalRuntime(project.path);
 
@@ -989,9 +993,7 @@ describe("agentSkillsService", () => {
     ]);
 
     const invalidNames = diagnostics.invalidSkills.map((issue) => issue.directoryName).sort();
-    expect(invalidNames).toEqual(
-      [invalidDirName, "bad-frontmatter", "missing-skill", "name-mismatch"].sort()
-    );
+    expect(invalidNames).toEqual([invalidDirName, "bad-frontmatter", "missing-skill"].sort());
 
     for (const issue of diagnostics.invalidSkills) {
       expect(issue.scope).toBe("project");
@@ -1009,9 +1011,36 @@ describe("agentSkillsService", () => {
     expect(
       diagnostics.invalidSkills.find((i) => i.directoryName === "bad-frontmatter")?.message
     ).toContain("Invalid SKILL.md frontmatter");
-    expect(
-      diagnostics.invalidSkills.find((i) => i.directoryName === "name-mismatch")?.message
-    ).toContain("must match directory name");
+  });
+
+  test("a SKILL.md name that is not the directory name loads as a display name", async () => {
+    using project = new DisposableTempDir("agent-skills-project");
+    using global = new DisposableTempDir("agent-skills-global");
+    const projectSkillsRoot = path.join(project.path, ".mux", "skills");
+    const globalSkillsRoot = global.path;
+
+    // pstack's router skill; a valid global skill with the same directory name loses as usual.
+    await writeSkillWithName(projectSkillsRoot, "poteto-mode", "Poteto Mode");
+    await writeSkill(globalSkillsRoot, "poteto-mode", "from global");
+    // A directory name that is not kebab-case stays an error.
+    await writeSkillWithName(projectSkillsRoot, "Poteto Mode", "Poteto Mode");
+
+    const roots = { projectRoot: projectSkillsRoot, globalRoot: globalSkillsRoot };
+    const runtime = new LocalRuntime(project.path);
+    const result = await discoverAgentSkills(runtime, project.path, { roots });
+
+    expect(result.skills.find((skill) => skill.name === "poteto-mode")).toMatchObject({
+      scope: "project",
+      displayName: "Poteto Mode",
+    });
+    expect(result.skillWarnings?.map((w) => [w.scope, w.directoryName])).toEqual([
+      ["project", "poteto-mode"],
+    ]);
+    expect(result.invalidSkills.map((issue) => issue.directoryName)).toEqual(["Poteto Mode"]);
+
+    const resolved = await readAgentSkill(runtime, project.path, "poteto-mode", { roots });
+    expect(resolved.package.scope).toBe("project");
+    expect(resolved.package.frontmatter.name).toBe("poteto-mode");
   });
 
   test("discoverAgentSkills reports invalid paths globs and keeps valid path-scoped skills", async () => {
@@ -1381,7 +1410,7 @@ describe("agentSkillsService agent plugins", () => {
       await fs.mkdir(physicalHome, { recursive: true });
       if (aliasHome) await fs.symlink(physicalHome, xumHome, "dir");
       const container = path.join(physicalHome, "plugins");
-      await writePlugin(container, "managed", [
+      const pluginDir = await writePlugin(container, "managed", [
         { name: "allowed", description: "imported" },
         { name: "blocked", description: "not imported" },
       ]);
@@ -1394,7 +1423,11 @@ describe("agentSkillsService agent plugins", () => {
         registryPath,
         JSON.stringify({
           plugins: [
-            createTestPluginInstallEntry("managed", { skills: ["allowed"], mcpServers: [] }),
+            createTestPluginInstallEntry(
+              "managed",
+              { skills: ["allowed"], mcpServers: [] },
+              await reviewedComponentConsent({ pluginDir })
+            ),
           ],
         })
       );
@@ -1516,7 +1549,7 @@ describe("agentSkillsService agent plugins", () => {
   test("managed imports gate enumeration and direct reads without shadowing allowed same-name fallbacks", async () => {
     using tmp = new DisposableTempDir("plugin-selected-skills");
     const container = path.join(tmp.path, "plugins");
-    await writePlugin(container, "a-selected", [
+    const selectedDir = await writePlugin(container, "a-selected", [
       { name: "allowed", description: "selected" },
       { name: "blocked", description: "not selected" },
       { name: "shared", description: "not selected shadow" },
@@ -1526,7 +1559,11 @@ describe("agentSkillsService agent plugins", () => {
       path.join(tmp.path, "plugins.json"),
       JSON.stringify({
         plugins: [
-          createTestPluginInstallEntry("a-selected", { skills: ["allowed"], mcpServers: [] }),
+          createTestPluginInstallEntry(
+            "a-selected",
+            { skills: ["allowed"], mcpServers: [] },
+            await reviewedComponentConsent({ pluginDir: selectedDir })
+          ),
         ],
       })
     );
@@ -1561,6 +1598,108 @@ describe("agentSkillsService agent plugins", () => {
       (await readAgentSkill(runtime, tmp.path, SkillNameSchema.parse("allowed"), { roots })).package
         .frontmatter.description
     ).toBe("selected");
+  });
+
+  test("a managed plugin skill loads only under the frontmatter the user reviewed (#6498)", async () => {
+    using tmp = new DisposableTempDir("plugin-skill-consent");
+    const container = path.join(tmp.path, "plugins");
+    const managedDir = await writePlugin(container, "a-managed", [
+      { name: "shared", description: "managed" },
+      { name: "solo", description: "managed only" },
+    ]);
+    await writePlugin(container, "b-unmanaged", [
+      { name: "shared", description: "fallback" },
+      { name: "free", description: "unmanaged" },
+    ]);
+    const registryFile = path.join(tmp.path, "plugins.json");
+    const saveConsent = (componentConsent?: ComponentConsent) =>
+      fs.writeFile(
+        registryFile,
+        JSON.stringify({
+          plugins: [createTestPluginInstallEntry("a-managed", undefined, componentConsent)],
+        })
+      );
+    const runtime = new LocalRuntime(tmp.path);
+    const roots = {
+      projectRoot: "",
+      globalRoot: path.join(tmp.path, "skills"),
+      universalRoot: "",
+      globalPluginRoots: [container],
+    };
+    const state = async () => {
+      const { skills } = await discoverAgentSkills(runtime, tmp.path, { roots });
+      const read = (name: string) =>
+        readAgentSkill(runtime, tmp.path, SkillNameSchema.parse(name), { roots }).then(
+          (skill) => skill.package.frontmatter.description,
+          () => "not found"
+        );
+      return {
+        listed: Object.fromEntries(
+          skills
+            .filter((skill) => ["shared", "solo", "free"].includes(skill.name))
+            .map((skill) => [skill.name, skill.description])
+        ),
+        read: { shared: await read("shared"), solo: await read("solo"), free: await read("free") },
+      };
+    };
+    const unreviewed = {
+      listed: { shared: "fallback", free: "unmanaged" },
+      read: { shared: "fallback", solo: "not found", free: "unmanaged" },
+    };
+    const reviewed = await reviewedComponentConsent({ pluginDir: managedDir });
+
+    // An install from before #6498 (no records) and a record for another fingerprint load nothing.
+    await saveConsent();
+    expect(await state()).toEqual(unreviewed);
+    await saveConsent({ skills: { shared: "0".repeat(64), solo: "0".repeat(64) }, mcpServers: {} });
+    expect(await state()).toEqual(unreviewed);
+
+    await saveConsent(reviewed);
+    expect(await state()).toEqual({
+      listed: { shared: "managed", solo: "managed only", free: "unmanaged" },
+      read: { shared: "managed", solo: "managed only", free: "unmanaged" },
+    });
+
+    // A frontmatter change under the same name needs a new review; the other skill keeps loading.
+    await writeSkill(path.join(managedDir, "skills"), "shared", "run every tool first");
+    expect(await state()).toEqual({
+      listed: { shared: "fallback", solo: "managed only", free: "unmanaged" },
+      read: { shared: "fallback", solo: "managed only", free: "unmanaged" },
+    });
+  });
+
+  // The display name replaces `name` in the parsed frontmatter, so the consent fingerprint must
+  // cover it separately, or an update could change user-visible text without a review.
+  test("a managed plugin skill with a display name needs a new review when the display name changes", async () => {
+    using tmp = new DisposableTempDir("plugin-skill-consent-display-name");
+    const container = path.join(tmp.path, "plugins");
+    const managedDir = await writePlugin(container, "pstack", []);
+    const skillFile = path.join(managedDir, "skills", "poteto-mode", "SKILL.md");
+    const writeName = async (name: string) => {
+      await fs.mkdir(path.dirname(skillFile), { recursive: true });
+      await fs.writeFile(skillFile, `---\nname: ${name}\ndescription: router\n---\nBody\n`);
+    };
+    await writeName("Poteto Mode");
+    const reviewed = await reviewedComponentConsent({ pluginDir: managedDir });
+    await fs.writeFile(
+      path.join(tmp.path, "plugins.json"),
+      JSON.stringify({ plugins: [createTestPluginInstallEntry("pstack", undefined, reviewed)] })
+    );
+    const runtime = new LocalRuntime(tmp.path);
+    const roots = {
+      projectRoot: "",
+      globalRoot: path.join(tmp.path, "skills"),
+      universalRoot: "",
+      globalPluginRoots: [container],
+    };
+    const loaded = async () => {
+      const { skills } = await discoverAgentSkills(runtime, tmp.path, { roots });
+      return skills.find((skill) => skill.name === "poteto-mode")?.displayName ?? "not loaded";
+    };
+
+    expect(await loaded()).toBe("Poteto Mode");
+    await writeName("Run Everything Mode");
+    expect(await loaded()).toBe("not loaded");
   });
 
   test.each([
@@ -1602,7 +1741,9 @@ describe("agentSkillsService agent plugins", () => {
   test("corrupt registry suppresses global component imports, recovers after repair, and never gates project plugins", async () => {
     using tmp = new DisposableTempDir("plugin-corrupt-imports");
     const container = path.join(tmp.path, "plugins");
-    await writePlugin(container, "managed", [{ name: "guarded", description: "valid skill" }]);
+    const pluginDir = await writePlugin(container, "managed", [
+      { name: "guarded", description: "valid skill" },
+    ]);
     const projectContainer = path.join(tmp.path, ".agents", "plugins");
     await writePlugin(projectContainer, "project-only", [
       { name: "guarded", description: "unmanaged project skill" },
@@ -1636,8 +1777,9 @@ describe("agentSkillsService agent plugins", () => {
         )
       ).toBe(true);
     }
-    // A legacy row and then an unmanaged directory both retain import-all behavior.
-    for (const plugins of [[createTestPluginInstallEntry("managed")], []]) {
+    // A reviewed legacy row and then an unmanaged directory both retain import-all behavior.
+    const consent = await reviewedComponentConsent({ pluginDir });
+    for (const plugins of [[createTestPluginInstallEntry("managed", undefined, consent)], []]) {
       await fs.writeFile(registryFile, JSON.stringify({ plugins }));
       expect(
         (await readAgentSkill(runtime, tmp.path, SkillNameSchema.parse("guarded"), { roots }))
@@ -1708,7 +1850,7 @@ describe("agentSkillsService agent plugins", () => {
   test("remote runtimes with an in-runtime global root honor host plugin import receipts", async () => {
     using hostHome = new DisposableTempDir("agent-skills-remote-plugin-receipts");
     using runtimeBase = new DisposableTempDir("agent-skills-remote-plugin-receipts-runtime");
-    await writePlugin(path.join(hostHome.path, "plugins"), "managed", [
+    const pluginDir = await writePlugin(path.join(hostHome.path, "plugins"), "managed", [
       { name: "imported-skill", description: "imported" },
       { name: "unimported-skill", description: "not imported" },
     ]);
@@ -1716,7 +1858,11 @@ describe("agentSkillsService agent plugins", () => {
       path.join(hostHome.path, "plugins.json"),
       JSON.stringify({
         plugins: [
-          createTestPluginInstallEntry("managed", { skills: ["imported-skill"], mcpServers: [] }),
+          createTestPluginInstallEntry(
+            "managed",
+            { skills: ["imported-skill"], mcpServers: [] },
+            await reviewedComponentConsent({ pluginDir })
+          ),
         ],
       })
     );
@@ -2009,6 +2155,25 @@ describe("agentSkillsService agent plugins", () => {
       ]);
     });
 
+    test("a shadowed display-name plugin skill stays reachable without a warning", async () => {
+      using tmp = new DisposableTempDir("plugin-namespace-display-name");
+      const { container, roots, read, discover } = setup(tmp.path);
+      await writeSkill(roots.globalRoot, "poteto-mode", "global poteto");
+      const pluginDir = await writePlugin(container, "pstack", []);
+      await writeSkillWithName(path.join(pluginDir, "skills"), "poteto-mode", "Poteto Mode");
+
+      const qualified = await read("pstack:poteto-mode");
+      expect(qualified.frontmatter.name).toBe("poteto-mode");
+      expect(qualified.frontmatter.description).toBe("from poteto-mode");
+
+      const result = await discover();
+      expect(result.shadowedPluginSkills).toEqual([
+        expect.objectContaining({ name: "poteto-mode", displayName: "Poteto Mode" }),
+      ]);
+      // Shadowed reads must not change diagnostics for bare-name users.
+      expect(result.skillWarnings).toBeUndefined();
+    });
+
     test("two plugins with the same skill name stay reachable", async () => {
       using tmp = new DisposableTempDir("plugin-namespace-two-plugins");
       const { container, read, discover } = setup(tmp.path);
@@ -2054,7 +2219,7 @@ describe("agentSkillsService agent plugins", () => {
     test("import selection hides a non-imported skill from qualified lookup", async () => {
       using tmp = new DisposableTempDir("plugin-namespace-selection");
       const { container, read } = setup(tmp.path);
-      await writePlugin(container, "managed", [
+      const pluginDir = await writePlugin(container, "managed", [
         { name: "allowed", description: "selected" },
         { name: "blocked", description: "not selected" },
       ]);
@@ -2062,7 +2227,11 @@ describe("agentSkillsService agent plugins", () => {
         path.join(tmp.path, "plugins.json"),
         JSON.stringify({
           plugins: [
-            createTestPluginInstallEntry("managed", { skills: ["allowed"], mcpServers: [] }),
+            createTestPluginInstallEntry(
+              "managed",
+              { skills: ["allowed"], mcpServers: [] },
+              await reviewedComponentConsent({ pluginDir })
+            ),
           ],
         })
       );

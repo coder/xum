@@ -18,6 +18,31 @@ const config: TestRunnerConfig = {
     await page.exposeFunction("__storybookUnhover", () => page.mouse.move(0, 0));
   },
   async postVisit(page, context) {
+    if (context.id === "app-rightsidebar-stable-tab-controls--wide") {
+      if (page.context().browser()?.browserType().name() !== "chromium") return;
+      // A tablet (coarse pointer above the phone breakpoint) gets no global 44px button floor,
+      // so the collapse button must size itself for touch. Plays cannot emulate the pointer.
+      const client = await page.context().newCDPSession(page);
+      const viewport = page.viewportSize();
+      try {
+        await client.send("Emulation.setTouchEmulationEnabled", { enabled: true });
+        await page.setViewportSize({ width: 1200, height: 900 });
+        await page.waitForFunction(() => matchMedia("(pointer: coarse)").matches, undefined, {
+          timeout: 5000,
+        });
+        const box = await page.getByRole("button", { name: "Collapse sidebar" }).boundingBox();
+        if (!box) throw new Error("Collapse sidebar button is missing");
+        assert(
+          box.width >= 44 && box.height >= 44,
+          `Collapse target is ${box.width}x${box.height}`
+        );
+      } finally {
+        await client.send("Emulation.setTouchEmulationEnabled", { enabled: false });
+        await client.detach();
+        if (viewport) await page.setViewportSize(viewport);
+      }
+      return;
+    }
     if (context.id !== "app-rightsidebar-stable-tab-controls--narrow") return;
     if (page.context().browser()?.browserType().name() !== "chromium") return;
     // Story plays dispatch synthetic events: only browser input can exercise native touch

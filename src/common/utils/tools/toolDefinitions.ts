@@ -2843,7 +2843,7 @@ export const TOOL_DEFINITIONS = {
   },
   models_list: {
     description:
-      "List selectable (non-hidden) models with aliases and thinking levels; a config snapshot, not an availability probe. Pass an ID only for a requested override; else leave `task.model` unset.",
+      "List model suggestions with aliases and thinking levels; not exhaustive or an availability probe. Other provider:model IDs may work with a configured provider. Pass an ID only for a requested override; else leave `task.model` unset.",
     schema: z.object({}).strict(),
     resultSchema: ModelsListToolResultSchema,
   },

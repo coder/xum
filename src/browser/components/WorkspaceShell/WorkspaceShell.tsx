@@ -36,6 +36,7 @@ import {
   LEFT_SIDEBAR_MAX_WIDTH_PX,
   LEFT_SIDEBAR_MIN_WIDTH_PX,
   NARROW_VIEWPORT_MAX_WIDTH_PX,
+  RIGHT_SIDEBAR_DEFAULT_COLLAPSED,
 } from "@/constants/layout";
 import { ChatPane } from "../ChatPane/ChatPane";
 
@@ -175,7 +176,10 @@ function LazyRightSidebar(
   props: React.ComponentProps<typeof RightSidebar> & { held: HeldSidebarInput[] }
 ) {
   const { held, ...sidebarProps } = props;
-  const collapsed = readPersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+  const collapsed = readPersistedState(
+    RIGHT_SIDEBAR_COLLAPSED_KEY,
+    RIGHT_SIDEBAR_DEFAULT_COLLAPSED
+  );
   // The failure state takes the expanded width even when collapsed: it needs room for its Reload
   // button, and the card's expand control is part of the sidebar that failed to load. The empty
   // loading box keeps its element (not display:none), so shortcut routing still sees a sidebar
@@ -263,9 +267,13 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   // Marks the shell so globals.css reserves the collapsed overview card's room beside the chat
   // from the first paint, read from state rather than from the card element: the sidebar chunk
   // loads lazily, and keying on the card would shift the transcript once it mounts.
-  const [rightSidebarCollapsed] = usePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, false, {
-    listener: true,
-  });
+  const [rightSidebarCollapsed] = usePersistedState<boolean>(
+    RIGHT_SIDEBAR_COLLAPSED_KEY,
+    RIGHT_SIDEBAR_DEFAULT_COLLAPSED,
+    {
+      listener: true,
+    }
+  );
 
   // WorkspaceShell switches to flex-col at this breakpoint, so in that stacked mode the
   // right sidebar doesn't need to "leave room" for ChatPane beside it.

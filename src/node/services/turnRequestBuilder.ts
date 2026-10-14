@@ -2507,9 +2507,15 @@ export class TurnRequestBuilder {
       }
       return created.data;
     };
+    // Codex hook fields: one turn ID for every tool call of this turn (its assistant message).
+    // One object for every attempt: each attempt sets the model it streams with, so a refusal
+    // fallback's tool calls, and the host-side hook config built once below (kernel file loads),
+    // report the fallback model (Codex PRRT_kwDOPxxmWM6sXvVm).
+    const hookTurn = { turnId: assistantMessageId, model: modelString };
     // Hoisted so refusal fallback can rebuild tools without changing their context.
     const toolsForModelConfig: ToolConfiguration = {
       cwd: workspacePath,
+      hookTurn,
       runtime,
       projects: getProjects(metadata),
       secrets: projectSecretsRecord,
@@ -2674,15 +2680,13 @@ export class TurnRequestBuilder {
       onConfigChanged: () => this.dependencies.providerService.notifyConfigChanged(),
       taskService: this.dependencies.bindings.taskService,
       workspaceTurnManager: this.dependencies.bindings.workspaceTurnManager,
-      // models_list: same pipeline as the composer picker, read from live backend
-      // state on every call (the tool object outlives config edits). Models are
+      // Read live backend state on every call (the tool object outlives config edits). Models are
       // resolved on the Xum host, so this is the source even for SSH workspaces.
       listAvailableModels: () => {
         const appConfig = this.dependencies.config.loadConfigOrDefault();
         return listAvailableModels(
           {
             providersConfig: this.dependencies.providerService.getConfig(),
-            hiddenModels: appConfig.hiddenModels ?? [],
             routePriority: appConfig.routePriority ?? [...DEFAULT_ROUTE_PRIORITY],
             routeOverrides: appConfig.routeOverrides ?? {},
           },
@@ -2806,6 +2810,7 @@ export class TurnRequestBuilder {
       cleanupModelOnError?: boolean;
     }) => {
       const { seed } = options;
+      hookTurn.model = seed.rawModelString;
       try {
         const attemptProviderRequestMessages =
           options.providerRequestMessages ??
@@ -2820,6 +2825,7 @@ export class TurnRequestBuilder {
           seed.toolsModelString,
           {
             ...toolsForModelConfig,
+            hookTurn: { ...hookTurn },
             capabilityModelString: seed.capabilityModelString,
             // Per attempt: a fallback model that calls set_goal must price and
             // kick off the goal on itself, not on the primary it replaced.

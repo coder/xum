@@ -107,7 +107,11 @@ import {
 } from "@/common/utils/tokens/usageHelpers";
 import { linkAbortSignal } from "@/node/utils/abort";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
-import { stripInternalToolResultFields } from "@/common/utils/tools/internalToolResultFields";
+import {
+  modelOnlyNotificationsField,
+  readModelOnlyToolNotifications,
+  stripInternalToolResultFields,
+} from "@/common/utils/tools/internalToolResultFields";
 import { summarizeInvalidToolInputErrors } from "@/node/utils/messages/summarizeInvalidToolInputErrors";
 import { buildRequiredToolPatterns, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { isAgentToolsDisabled } from "@/node/utils/agentToolsDisabled";
@@ -3600,7 +3604,8 @@ export class StreamManager {
     toolCallId: string,
     toolName: string,
     output: unknown,
-    providerExecuted?: boolean
+    providerExecuted?: boolean,
+    modelOnlyNotifications?: string[]
   ): Promise<void> {
     // Find and update the existing tool part
     const existingPartIndex = streamInfo.parts.findIndex(
@@ -3620,6 +3625,7 @@ export class StreamManager {
           ...(mcpServer ? { mcpServer } : {}),
           state: "output-available" as const,
           output,
+          ...modelOnlyNotificationsField(modelOnlyNotifications),
         };
       }
     } else {
@@ -3633,6 +3639,7 @@ export class StreamManager {
         state: "output-available" as const,
         input: toolCall?.input ?? null,
         output,
+        ...modelOnlyNotificationsField(modelOnlyNotifications),
         ...(mcpServer ? { mcpServer } : {}),
         timestamp: nextPartTimestamp(streamInfo),
         ...(pendingAttachment != null ? { workflowRun: pendingAttachment } : {}),
@@ -3677,7 +3684,8 @@ export class StreamManager {
     toolCallId: string,
     toolName: string,
     output: unknown,
-    providerExecuted?: boolean
+    providerExecuted?: boolean,
+    modelOnlyNotifications?: string[]
   ): Promise<void> {
     await this.completeToolCall(
       workspaceId,
@@ -3686,7 +3694,8 @@ export class StreamManager {
       toolCallId,
       toolName,
       output,
-      providerExecuted
+      providerExecuted,
+      modelOnlyNotifications
     );
     await this.checkSoftCancelStream(workspaceId, streamInfo);
   }
@@ -4887,6 +4896,10 @@ export class StreamManager {
                 const strippedOutput = stripInternalToolResultFields(
                   stripEncryptedContent(toolResultPart.output)
                 );
+                // Kept beside the output, so the next turn's rebuild can resend them.
+                const modelOnlyNotifications = readModelOnlyToolNotifications(
+                  toolResultPart.output
+                );
 
                 // Tool call completed successfully
                 const toolCall = toolCalls.get(toolResultPart.toolCallId);
@@ -4915,7 +4928,8 @@ export class StreamManager {
                   toolResultPart.toolCallId,
                   toolResultPart.toolName,
                   strippedOutput,
-                  toolResultPart.providerExecuted
+                  toolResultPart.providerExecuted,
+                  modelOnlyNotifications
                 );
                 break;
               }

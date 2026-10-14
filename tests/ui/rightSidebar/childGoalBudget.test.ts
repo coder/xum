@@ -22,7 +22,11 @@ import {
 } from "../../ipc/helpers";
 
 import { detectDefaultTrunkBranch } from "@/node/git";
-import { RIGHT_SIDEBAR_TAB_KEY, getRightSidebarLayoutKey } from "@/common/constants/storage";
+import {
+  RIGHT_SIDEBAR_COLLAPSED_KEY,
+  RIGHT_SIDEBAR_TAB_KEY,
+  getRightSidebarLayoutKey,
+} from "@/common/constants/storage";
 import { UNPRICED_CURRENT_MODEL_GOAL_MESSAGE } from "@/common/utils/goals/budgetPricing";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
@@ -95,6 +99,7 @@ describe("RightSidebar child goal budget (UI)", () => {
         }
 
         cleanupDom = installDom();
+        updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
         updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, "goal");
         updatePersistedState(getRightSidebarLayoutKey(target.id), null);
         markAiSelectionIntent(target.id, "model", UNPRICED_COMPOSER_MODEL);
