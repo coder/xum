@@ -477,7 +477,7 @@ export function createMcpAppHost(options: McpAppHostOptions) {
           requested !== undefined &&
           requested !== current &&
           (viewDisplayModes?.includes(requested) ?? true)
-            ? options.setDisplayMode(requested, "request")
+            ? options.setDisplayMode(requested)
             : null;
         const mode = move != null && requested !== undefined ? requested : current;
         respond(id, { mode });
