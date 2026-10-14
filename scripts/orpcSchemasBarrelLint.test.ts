@@ -48,6 +48,8 @@ describe("orpc schemas barrel guard", () => {
     ["src/browser/example.ts", 'import { X } from "@/common/orpc/schemas.ts";'],
     ["src/common/types/example.ts", 'import { X } from "../orpc/schemas.js";'],
     ["src/common/orpc/client.ts", 'import { X } from "./schemas.ts";'],
+    ["src/browser/example.ts", 'import X from "@/common/orpc/schemas?url";'],
+    ["src/common/orpc/client.ts", 'import X from "./schemas#x";'],
   ])("reports a value import in %s: %s", async (filePath, code) => {
     expect(await restrictedImports(filePath, code)).toEqual([barrelMessage]);
   });
@@ -97,6 +99,8 @@ describe("src/node guard for browser and common code", () => {
     ["src/common/config/schemas/example.ts", 'import { X } from "@/node/services/log";'],
     // tsconfig maps @shared/* to src/* too.
     ["src/common/types/example.ts", 'import { X } from "@shared/node/services/log";'],
+    // src/constants is shared with the browser too.
+    ["src/constants/example.ts", 'import { X } from "@/node/services/log";'],
     // The highlight worker is exempt from the shiki rule only.
     ["src/browser/workers/highlightWorker.ts", 'import { X } from "@/node/services/log";'],
   ])("reports a value import of src/node in %s: %s", async (filePath, code) => {
@@ -113,6 +117,9 @@ describe("src/node guard for browser and common code", () => {
     ["src/common/utils/tokens/example.ts", 'import { X } from "./tokenStatsCalculator.ts";'],
     ["src/common/utils/ai/example.ts", 'import { X } from "./providerOptions";'],
     ["src/common/orpc/client.ts", 'import { X } from "@/common/utils/ai/providerOptions";'],
+    // Vite resolves query and hash suffixes to the same module.
+    ["src/browser/example.ts", 'import X from "@/common/utils/tools/tools?worker";'],
+    ["src/common/utils/tools/example.ts", 'import X from "./tools.ts?raw";'],
     // Files in subfolders reach the module through "../".
     ["src/common/utils/tools/internal/example.ts", 'import { X } from "../tools";'],
     ["src/common/utils/ai/a/b/example.ts", 'import { X } from "../../providerOptions";'],

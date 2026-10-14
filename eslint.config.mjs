@@ -2159,8 +2159,11 @@ const SHIKI_RESTRICTION = {
 // Matches "@/common/orpc/schemas" and relative forms such as "../orpc/schemas", but not leaf
 // modules such as "@/common/orpc/schemas/runtime". Every later no-restricted-imports block that
 // matches browser or common files must include it, because that block replaces this one's options.
+// The end of a module specifier: an optional extension, then an optional Vite query or hash
+// (e.g. "?worker"), which still resolves to the same module.
+const MODULE_SPECIFIER_END = "(\\.[jt]s)?([?#].*)?$";
 const ORPC_SCHEMAS_BARREL_RESTRICTION = {
-  regex: "(^|/)orpc/schemas(\\.[jt]s)?$",
+  regex: `(^|/)orpc/schemas${MODULE_SPECIFIER_END}`,
   allowTypeImports: true,
   message:
     "Import schemas from their leaf module (e.g. @/common/orpc/schemas/runtime), not the @/common/orpc/schemas barrel: a value import of the barrel adds every schema to the first load. Type-only imports are fine.",
@@ -2193,7 +2196,7 @@ const backendOnlyCommonRestriction = (regex) => ({
 // module's folder or a subfolder imports it as "./tools" or "../tools", which the per-folder
 // blocks below cover.
 const BACKEND_ONLY_COMMON_RESTRICTION = backendOnlyCommonRestriction(
-  `(^|/)(${BACKEND_ONLY_COMMON_FILES.map((file) => file.split("/").slice(-2).join("/").replace(/\.ts$/, "")).join("|")})(\\.[jt]s)?$`
+  `(^|/)(${BACKEND_ONLY_COMMON_FILES.map((file) => file.split("/").slice(-2).join("/").replace(/\.ts$/, "")).join("|")})${MODULE_SPECIFIER_END}`
 );
 // Every no-restricted-imports block for browser or common files replaces the options of the
 // earlier blocks that match the same file, so each one starts from these lists.
@@ -2618,7 +2621,8 @@ export default defineConfig([
     // the api.ts router schemas, on the browser's first load (#5971). Type-only imports are
     // erased at compile time, so they stay allowed. Restates the block above, because this block
     // replaces its no-restricted-imports options for the files it matches.
-    files: ["src/browser/**/*.{ts,tsx}", "src/common/**/*.{ts,tsx}"],
+    // src/constants is shared with the browser, so it is guarded too.
+    files: ["src/browser/**/*.{ts,tsx}", "src/common/**/*.{ts,tsx}", "src/constants/**/*.{ts,tsx}"],
     ignores: ["src/browser/workers/highlightWorker.ts", TEST_FILES],
     rules: restrictedImportsRule([], BROWSER_COMMON_RESTRICTED_PATTERNS),
   },
@@ -2645,7 +2649,7 @@ export default defineConfig([
       [
         ...BROWSER_COMMON_RESTRICTED_PATTERNS,
         backendOnlyCommonRestriction(
-          `^(\\./|(\\.\\./)+)${path.posix.basename(file, ".ts")}(\\.[jt]s)?$`
+          `^(\\./|(\\.\\./)+)${path.posix.basename(file, ".ts")}${MODULE_SPECIFIER_END}`
         ),
       ]
     ),
@@ -2667,7 +2671,7 @@ export default defineConfig([
     ],
     patterns: [
       // Inside src/common/orpc, "./schemas" and "../schemas" are the barrel too.
-      { ...ORPC_SCHEMAS_BARREL_RESTRICTION, regex: "^\\.\\.?/schemas(\\.[jt]s)?$" },
+      { ...ORPC_SCHEMAS_BARREL_RESTRICTION, regex: `^\\.\\.?/schemas${MODULE_SPECIFIER_END}` },
     ],
   }),
   // Config schemas must remain independent from ORPC schema definitions
