@@ -70,6 +70,8 @@ async function setup(
     ending?: (turn: number) => "completed" | "aborted";
     /** Routing record the prepared request streams with (stream-start). */
     streamRouting?: (turn: number) => AutoModelRoutingRecord | undefined;
+    /** The model the stream-end reports (a refusal fallback answered); default `model`. */
+    endModel?: (turn: number) => string;
     /** Runs while turn N streams, before it ends. */
     whileStreaming?: (turn: number, h: AgentSessionHarness) => void;
     session?: Omit<AgentSessionHarnessOptions, "workspaceId" | "aiEmitter" | "aiServiceOverrides">;
@@ -110,7 +112,7 @@ async function setup(
                 streamEnd: {
                   type: "stream-end",
                   workspaceId,
-                  metadata: { model },
+                  metadata: { model: input.endModel?.(turns) ?? model },
                   parts: input.parts?.(turns) ?? [{ type: "text", text: `reply ${turns}` }],
                 },
               };
@@ -216,6 +218,18 @@ describe("turn.stop", () => {
       ...[false, true, true, true],
     ]);
     expect(streams()).toBe(8);
+  });
+
+  test("the Stop hooks see the model that answered after a refusal fallback", async () => {
+    // Codex PRRT_kwDOPxxmWM6sbewj: only the stream-end reports the fallback model.
+    const calls: StopCall[] = [];
+    addConsumer(() => undefined, calls);
+    const { h } = await setup({ endModel: () => "anthropic:claude-haiku-4-5" });
+
+    await h.session.sendMessage("fix the tests", options);
+    await settle(h);
+
+    expect(calls.map((call) => call.model)).toEqual(["anthropic:claude-haiku-4-5"]);
   });
 
   test("one consumer's halt overrides every continuation", async () => {

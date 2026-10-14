@@ -10563,7 +10563,9 @@ export class AgentSession {
       messageId: payload.messageId,
       lastAssistantMessage: lastAssistantText(payload.parts),
       stopHookActive: this.stopHookContinuations > 0,
-      model: provenance.streamModel,
+      // The model that answered: a refusal fallback swaps it during the stream, and only the
+      // stream-end payload reports that (Codex PRRT_kwDOPxxmWM6sbewj).
+      model: payload.metadata.model,
     });
     if (outcome.kind === "none" || options == null) {
       this.stopHookContinuations = 0;
