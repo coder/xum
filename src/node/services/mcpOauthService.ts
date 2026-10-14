@@ -499,11 +499,17 @@ function refreshedScope(input: { tokens: MCPOAuthTokens; refreshedFrom?: MCPOAut
   scope?: string;
   requested_scope?: string;
 } {
-  const scope = input.tokens.scope ?? input.refreshedFrom?.scope;
-  const requested = input.tokens.requested_scope ?? input.refreshedFrom?.requested_scope;
+  return { ...scopeFields(input.refreshedFrom), ...scopeFields(input.tokens) };
+}
+
+/** The defined scope fields of `tokens` (MCPOAuthTokens.scope and requested_scope). */
+function scopeFields(tokens: MCPOAuthTokens | undefined): {
+  scope?: string;
+  requested_scope?: string;
+} {
   return {
-    ...(scope !== undefined ? { scope } : {}),
-    ...(requested !== undefined ? { requested_scope: requested } : {}),
+    ...(tokens?.scope !== undefined ? { scope: tokens.scope } : {}),
+    ...(tokens?.requested_scope !== undefined ? { requested_scope: tokens.requested_scope } : {}),
   };
 }
 
