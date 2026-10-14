@@ -3,8 +3,12 @@
  * Source: the "Tool coverage" table on https://learn.chatgpt.com/docs/hooks.
  *
  * Mapped:
- * - `bash` → `Bash` ("Shell commands … Match as Bash"). Codex puts the script in
- *   `tool_input.command`; Xum's argument is `script`.
+ * - `bash` → `Bash` ("Shell commands … Match as Bash"). Codex's hook contract for its shell
+ *   (core/src/tools/context.rs, handlers/unified_exec.rs): `tool_input` is `{ command }` only,
+ *   `tool_response` is the output text as a string, and a command still running (Xum
+ *   `run_in_background`) gets no PostToolUse. A rewrite sets only the command: the call keeps
+ *   its other Xum arguments (Codex PRRT_kwDOPxxmWM6rPqzP, PRRT_kwDOPxxmWM6rPqzQ,
+ *   PRRT_kwDOPxxmWM6rPqzS).
  * - MCP tools → `mcp__<server>__<tool>`, from the tool's origin (MCP_TOOL_ORIGIN), not from Xum's
  *   normalized name (that name can be lowercased or hash-suffixed). For a plugin's own server
  *   (`plugin:<instanceId>:<name>`) the server part is `<name>`, the name the plugin declared.
@@ -43,22 +47,35 @@ export function readMcpToolOrigin(tool: unknown): McpToolOrigin | undefined {
     : undefined;
 }
 
+/** No PostToolUse for this result (Codex sends none for it). */
+export const NO_POST_TOOL_USE = Symbol("noPostToolUse");
+
 interface BuiltinAlias {
   codexName: string;
-  /** Codex-shaped fields added next to Xum's arguments in `tool_input`. */
-  toCodexFields(args: Record<string, unknown>): Record<string, unknown>;
-  /** Map a Codex-shaped `updatedInput` back to Xum's argument names. */
-  fromCodexInput(input: Record<string, unknown>): Record<string, unknown>;
+  /** The whole Codex `tool_input`: Codex's fields only, not Xum's arguments. */
+  toCodexInput(args: Record<string, unknown>): Record<string, unknown>;
+  /** Apply a Codex-shaped `updatedInput` to the call's arguments; undefined when it is invalid. */
+  fromCodexInput(
+    input: Record<string, unknown>,
+    original: Record<string, unknown>
+  ): Record<string, unknown> | undefined;
+  /** The Codex `tool_response` for a tool result, or NO_POST_TOOL_USE. */
+  toCodexResponse(result: unknown): unknown;
 }
 
 const BUILTIN_ALIASES: Record<string, BuiltinAlias> = {
   bash: {
     codexName: "Bash",
-    toCodexFields: (args) => (typeof args.script === "string" ? { command: args.script } : {}),
-    fromCodexInput: (input) => {
-      if (typeof input.command !== "string") return input;
-      const { command, ...rest } = input;
-      return { ...rest, script: command };
+    toCodexInput: (args) => (typeof args.script === "string" ? { command: args.script } : {}),
+    // Only the command: a hook must not set Xum-only arguments it never saw (run_in_background).
+    fromCodexInput: (input, original) =>
+      typeof input.command === "string" ? { ...original, script: input.command } : undefined,
+    toCodexResponse: (result) => {
+      if (!isPlainObject(result)) return result;
+      // A background command is still running (Codex: a live process_id).
+      if (typeof result.backgroundProcessId === "string") return NO_POST_TOOL_USE;
+      if (typeof result.output === "string") return result.output;
+      return typeof result.error === "string" ? result.error : "";
     },
   },
 };
@@ -66,22 +83,40 @@ const BUILTIN_ALIASES: Record<string, BuiltinAlias> = {
 export interface CodexToolView {
   /** The Codex name when one exists, else undefined (hooks then see Xum's name). */
   codexName?: string;
-  toCodexFields(args: unknown): Record<string, unknown>;
-  fromCodexInput(input: unknown): unknown;
+  /** The `tool_input` hooks see: Codex's fields for an aliased built-in, else Xum's arguments. */
+  toCodexInput(args: unknown): unknown;
+  /** The arguments after a hook's `updatedInput`; undefined when the rewrite is invalid. */
+  fromCodexInput(input: unknown, original: unknown): unknown;
+  /** The `tool_response` hooks see, or NO_POST_TOOL_USE. */
+  toCodexResponse(result: unknown): unknown;
 }
+
+/** The view of a tool without a Codex alias: hooks see Xum's arguments and result as they are. */
+const IDENTITY_VIEW = {
+  toCodexInput: (args: unknown) => args,
+  fromCodexInput: (input: unknown) => input,
+  toCodexResponse: (result: unknown) => result,
+};
 
 export function codexToolView(toolName: string, origin?: McpToolOrigin): CodexToolView {
   const builtin = Object.hasOwn(BUILTIN_ALIASES, toolName) ? BUILTIN_ALIASES[toolName] : undefined;
-  const codexName =
-    builtin?.codexName ??
-    (origin !== undefined
-      ? `mcp__${codexNamePart(codexServerName(origin.serverName))}__${codexNamePart(origin.toolName)}`
-      : undefined);
+  if (builtin !== undefined) return { codexName: builtin.codexName, ...builtinView(builtin) };
+  return origin !== undefined
+    ? {
+        codexName: `mcp__${codexNamePart(codexServerName(origin.serverName))}__${codexNamePart(origin.toolName)}`,
+        ...IDENTITY_VIEW,
+      }
+    : IDENTITY_VIEW;
+}
+
+function builtinView(builtin: BuiltinAlias): Omit<CodexToolView, "codexName"> {
   return {
-    ...(codexName !== undefined ? { codexName } : {}),
-    toCodexFields: (args) => (builtin && isPlainObject(args) ? builtin.toCodexFields(args) : {}),
-    fromCodexInput: (input) =>
-      builtin && isPlainObject(input) ? builtin.fromCodexInput(input) : input,
+    toCodexInput: (args) => (isPlainObject(args) ? builtin.toCodexInput(args) : args),
+    fromCodexInput: (input, original) =>
+      isPlainObject(input) && isPlainObject(original)
+        ? builtin.fromCodexInput(input, original)
+        : undefined,
+    toCodexResponse: (result) => builtin.toCodexResponse(result),
   };
 }
 

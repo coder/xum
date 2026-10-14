@@ -354,7 +354,7 @@ describe("CodexPluginHookService", () => {
                   type: "mcp_tool",
                   server: "scanner",
                   tool: "check",
-                  input: { cmd: "${tool_input.script}" },
+                  input: { cmd: "${tool_input.command}" },
                 },
               ],
             },

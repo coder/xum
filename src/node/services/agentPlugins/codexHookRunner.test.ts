@@ -96,7 +96,7 @@ const deny = json({
 describe("PreToolUse", () => {
   test("a deny blocks a matching tool with the reason; other tools still run", async () => {
     const { spine, calls } = setup(
-      [hook("PreToolUse", { matcher: "^bash$", input: { cmd: "${tool_input.script}" } })],
+      [hook("PreToolUse", { matcher: "^bash$", input: { cmd: "${tool_input.command}" } })],
       () => deny
     );
 
@@ -272,7 +272,7 @@ describe("PreToolUse", () => {
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
           permissionDecision: "allow",
-          updatedInput: { script: "safe" },
+          updatedInput: { command: "safe" },
         },
       })
     );
@@ -334,7 +334,7 @@ describe("PreToolUse", () => {
 
   test("an input too large to send denies the call instead of skipping the guard", async () => {
     const { spine, calls } = setup(
-      [hook("PreToolUse", { input: { cmd: "${tool_input.script}" } })],
+      [hook("PreToolUse", { input: { cmd: "${tool_input.command}" } })],
       () => null
     );
 
@@ -362,7 +362,7 @@ describe("PreToolUse", () => {
             hookSpecificOutput: {
               hookEventName: "PreToolUse",
               permissionDecision: "allow",
-              updatedInput: { script: "safe" },
+              updatedInput: { command: "safe" },
             },
           })
         ),
@@ -419,7 +419,7 @@ describe("PreToolUse", () => {
         hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision, updatedInput },
       });
     const cases: Array<[unknown, unknown, unknown]> = [
-      [rewrite("allow", { script: "ls" }), schema, { script: "ls" }],
+      [rewrite("allow", { command: "ls" }), schema, { script: "ls" }],
       [json({ hookSpecificOutput: { updatedInput: { script: "ls" } } }), schema, { script: "x" }],
     ];
     // MCP schemas: local $ref/$defs (2020-12 by default) and a draft-07 declaration.
@@ -431,8 +431,8 @@ describe("PreToolUse", () => {
     };
     const draft7 = { $schema: "http://json-schema.org/draft-07/schema#", ...schema };
     cases.push(
-      [rewrite("allow", { script: "ls" }), refSchema, { script: "ls" }],
-      [rewrite("allow", { script: "ls" }), draft7, { script: "ls" }]
+      [rewrite("allow", { command: "ls" }), refSchema, { script: "ls" }],
+      [rewrite("allow", { command: "ls" }), draft7, { script: "ls" }]
     );
     for (const [output, toolSchema, expected] of cases) {
       const { spine } = setup([hook("PreToolUse")], () => output);
@@ -442,8 +442,8 @@ describe("PreToolUse", () => {
     // A rewrite that does not match the schema is denied too: the guard allowed only the
     // rewritten call (Codex PRRT_kwDOPxxmWM6rb3ih).
     for (const [output, toolSchema] of [
-      [rewrite("allow", { script: 1 }), schema],
-      [rewrite("allow", { script: "" }), refSchema],
+      [rewrite("allow", { command: 1 }), schema],
+      [rewrite("allow", { command: "" }), refSchema],
     ] as const) {
       const { spine } = setup([hook("PreToolUse")], () => output);
       const ctx = await runTool(spine, "bash", { script: "x" }, toolSchema);
@@ -455,7 +455,7 @@ describe("PreToolUse", () => {
     }
     // No schema to check the rewrite against: the call is denied, never run with the original
     // arguments the guard meant to replace (Codex PRRT_kwDOPxxmWM6rRKxR).
-    const noSchema = setup([hook("PreToolUse")], () => rewrite("allow", { script: "ls" }));
+    const noSchema = setup([hook("PreToolUse")], () => rewrite("allow", { command: "ls" }));
     const denied = await runTool(noSchema.spine, "bash", { script: "x" });
     expect(denied.executed).toBe(false);
     expect(denied.blocked?.result).toEqual({
@@ -573,9 +573,16 @@ describe("Codex tool names", () => {
       })
     );
 
-    const ctx = await runTool(spine, "bash", { script: "rm -rf /" }, schema);
+    const ctx = await runTool(
+      spine,
+      "bash",
+      { script: "rm -rf /", display_name: "Remove" },
+      schema
+    );
 
-    expect(ctx.result).toEqual({ ran: { script: "echo rewritten", display_name: "Echo" } });
+    // Only the command applies: the call keeps its other Xum arguments, and a hook cannot set a
+    // Xum-only argument it never saw (Codex PRRT_kwDOPxxmWM6rPqzS).
+    expect(ctx.result).toEqual({ ran: { script: "echo rewritten", display_name: "Remove" } });
   });
 });
 
@@ -586,9 +593,9 @@ describe("PostToolUse", () => {
       () => json({ decision: "block", reason: "Output needs review." })
     );
 
-    const ctx = await runTool(spine, "bash", { script: "ls" });
+    const ctx = await runTool(spine, "file_read", { path: "a" });
 
-    expect(calls).toEqual([{ out: { ran: { script: "ls" } } }]);
+    expect(calls).toEqual([{ out: { ran: { path: "a" } } }]);
     expect(ctx.result).toEqual({ error: "[plugin:guard] Output needs review." });
   });
 
@@ -624,12 +631,41 @@ describe("PostToolUse", () => {
           : json({ decision: "block", reason: "Second." })
     );
 
-    const ctx = await runTool(spine, "bash", { script: "ls" });
+    const ctx = await runTool(spine, "file_read", { path: "a" });
 
     // The second hook still saw the tool's own response.
-    expect(calls[1]).toEqual({ n: 2, out: { ran: { script: "ls" } } });
+    expect(calls[1]).toEqual({ n: 2, out: { ran: { path: "a" } } });
     expect(ctx.result).toEqual({ error: "[plugin:guard] First.\n\n[plugin:guard] Second." });
     expect(ctx.postBlocked).toBe(true);
+  });
+
+  test("Bash hooks see Codex's shape: { command } in, the output text out, none while running", async () => {
+    // Codex PRRT_kwDOPxxmWM6rPqzP, PRRT_kwDOPxxmWM6rPqzQ (core/src/tools/context.rs).
+    const { spine, calls } = setup(
+      [
+        hook("PreToolUse", { input: { pre: "${tool_input}" } }),
+        hook("PostToolUse", { input: { post: "${tool_input}", out: "${tool_response}" } }),
+      ],
+      () => null
+    );
+    const args = { script: "ls", display_name: "List", timeout_secs: 5 };
+    const done = { success: true, output: "a.txt", exitCode: 0, wall_duration_ms: 1 };
+    const failed = { success: false, exitCode: 1, error: "boom", wall_duration_ms: 1 };
+    const background = { ...done, output: "", taskId: "t", backgroundProcessId: "p" };
+
+    await runTool(spine, "bash", args, undefined, undefined, { result: done });
+    await runTool(spine, "bash", args, undefined, undefined, { result: failed });
+    await runTool(spine, "bash", args, undefined, undefined, { result: background });
+
+    const command = { command: "ls" };
+    expect(calls).toEqual([
+      { pre: command },
+      { post: command, out: "a.txt" },
+      { pre: command },
+      { post: command, out: "boom" },
+      // A command still running gets no PostToolUse.
+      { pre: command },
+    ]);
   });
 
   test("context on a primitive, null or array result wraps it instead of losing it", async () => {
@@ -879,7 +915,7 @@ describe("Codex output rules (output_parser.rs)", () => {
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
           permissionDecision: "allow",
-          updatedInput: { script: "safe" },
+          updatedInput: { command: "safe" },
           additionalContext: "Dropped.",
         },
       })
@@ -932,7 +968,7 @@ describe("Codex output rules (output_parser.rs)", () => {
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
           permissionDecision: "allow",
-          updatedInput: { script: "safe" },
+          updatedInput: { command: "safe" },
           additionalContext: "Dropped.",
         },
       })
@@ -961,7 +997,7 @@ describe("Codex output rules (output_parser.rs)", () => {
           hookSpecificOutput: {
             hookEventName: "PreToolUse",
             permissionDecision: "allow",
-            updatedInput: { script: "safe" },
+            updatedInput: { command: "safe" },
           },
         })
       );
@@ -1030,7 +1066,7 @@ describe("Codex output rules (output_parser.rs)", () => {
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
           permissionDecision: "allow",
-          updatedInput: { script: "safe" },
+          updatedInput: { command: "safe" },
         },
       })
     );

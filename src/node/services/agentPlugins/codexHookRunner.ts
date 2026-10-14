@@ -25,7 +25,7 @@ import { AjvJsonSchemaValidator } from "@modelcontextprotocol/client/validators/
 import { log } from "@/node/services/log";
 import { compileHookMatcher, type PluginHookDefinition } from "./codexHooks";
 import { isPlainObject } from "./manifest";
-import { codexToolView, type CodexToolView } from "./codexToolNames";
+import { codexToolView, NO_POST_TOOL_USE, type CodexToolView } from "./codexToolNames";
 import {
   parsePostToolUseOutput,
   parsePreToolUseOutput,
@@ -193,9 +193,7 @@ async function runToolHooks(
   const view = codexToolView(ctx.toolName, ctx.mcpOrigin);
   const toolEvent = () => ({
     tool_name: view.codexName ?? ctx.toolName,
-    tool_input: isPlainObject(ctx.args)
-      ? { ...ctx.args, ...view.toCodexFields(ctx.args) }
-      : ctx.args,
+    tool_input: view.toCodexInput(ctx.args),
   });
   for (const hook of pre.filter((candidate) => matches(candidate, ctx.toolName, view))) {
     const output = await invoke(
@@ -255,11 +253,14 @@ async function runPostToolHooks(
   registration: CodexHookRegistration,
   call: { cwd?: string; abortSignal?: AbortSignal }
 ): Promise<void> {
+  // Codex's response shape for an aliased built-in (Bash: the output text).
+  const response = view.toCodexResponse(ctx.result);
+  if (response === NO_POST_TOOL_USE) return;
   const feedback: string[] = [];
   for (const hook of post.filter((candidate) => matches(candidate, ctx.toolName, view))) {
     const output = await invoke(
       hook,
-      { ...toolEvent(), tool_response: ctx.result },
+      { ...toolEvent(), tool_response: response },
       "PostToolUse",
       registration,
       parsePostToolUseOutput,
@@ -291,7 +292,7 @@ function applyUpdatedInput(
   hook: PluginHookDefinition
 ): void {
   // A Codex-shaped rewrite (Bash `command`) maps back to Xum's names before the schema check.
-  const updated = view.fromCodexInput(updatedInput);
+  const updated = view.fromCodexInput(updatedInput, ctx.args);
   const schema = ctx.inputJsonSchema?.();
   if (schema === undefined) {
     // No schema to check the rewrite against (a caller that omitted it): deny. Running the
