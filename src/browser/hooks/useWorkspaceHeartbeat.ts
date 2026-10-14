@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useWorkspaceActions } from "@/browser/contexts/WorkspaceContext";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -93,11 +93,26 @@ function getHeartbeatErrorMessage(error: unknown, fallbackMessage: string): stri
   return fallbackMessage;
 }
 
+/** The shown settings wait for a read of the live client: after a reconnect, or offline. */
+function isAwaitingRead(state: {
+  isLoading: boolean;
+  workspaceId: string | null;
+  offline: boolean;
+  /** The shown settings came from the current client. */
+  current: boolean;
+}): boolean {
+  if (state.isLoading || state.workspaceId == null) return false;
+  return state.offline || !state.current;
+}
+
 export function useWorkspaceHeartbeat(
   params: UseWorkspaceHeartbeatParams
 ): UseWorkspaceHeartbeatResult {
   const { workspaceId } = params;
   const { api } = useAPI();
+  // Null while offline. The kept client (`api`) still equals `readClient` then, but a save on it
+  // would fail with the connection-lost error, so the save gate also holds while offline.
+  const offline = useLiveAPI() == null;
   const { setWorkspaceMetadata } = useWorkspaceActions();
   const [settings, setSettings] = useState<HeartbeatFormSettings>(() =>
     getDefaultHeartbeatSettings()
@@ -255,7 +270,7 @@ export function useWorkspaceHeartbeat(
   return {
     settings,
     isLoading,
-    isReloading: !isLoading && workspaceId != null && readClient !== api,
+    isReloading: isAwaitingRead({ isLoading, workspaceId, offline, current: readClient === api }),
     isSaving,
     error,
     save,

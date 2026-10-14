@@ -289,4 +289,21 @@ describe.each([...GAP_MODES])("useWorkspaceHeartbeat across a reconnect (%s)", (
     expect(view.result.current.isLoading).toBe(true);
     expect(view.result.current.settings.message).not.toBe("new");
   });
+
+  // Offline a save cannot reach the server (it would fail with the connection-lost error), so
+  // the save gate holds during the whole outage. The shown settings stay.
+  test("holds the save gate while offline", async () => {
+    const view = renderHook(() => useWorkspaceHeartbeat({ workspaceId: TEST_WORKSPACE_ID }), {
+      wrapper: Wrapper,
+    });
+    await waitFor(() => expect(view.result.current.settings.message).toBe("old"));
+    expect(view.result.current.isReloading).toBe(false);
+
+    await harness.drop();
+    expect(view.result.current.isReloading).toBe(true);
+    expect(view.result.current.settings.message).toBe("old");
+
+    harness.reconnect();
+    await waitFor(() => expect(view.result.current.isReloading).toBe(false));
+  });
 });
