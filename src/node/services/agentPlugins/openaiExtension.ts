@@ -262,6 +262,19 @@ const CODEX_CONTRIBUTES_KEYS = [
 ] as const;
 
 /**
+ * The `contributes` value for a Codex component path, or undefined to leave the field top-level
+ * (the validator then reports it as unknown). Codex accepts a string or an array for both. Xum
+ * reads every skills root (#6121) but one MCP file, so only a one-entry `mcpServers` array maps.
+ * Unsafe paths pass through unchanged so the validator rejects each with its warning.
+ */
+function codexComponentPath(codexKey: "skills" | "mcpServers", value: unknown): unknown {
+  const normalize = (entry: unknown): unknown => normalizeOpenAIRelativePath(entry) ?? entry;
+  if (codexKey === "skills" && Array.isArray(value)) return value.map(normalize);
+  const single: unknown = Array.isArray(value) && value.length === 1 ? value[0] : value;
+  return typeof single === "string" ? normalize(single) : undefined;
+}
+
+/**
  * Rewrite a `.codex-plugin/plugin.json` document into the Agent Plugins 1.0.0
  * shape before the regular validator runs. Used ONLY for that fallback file:
  * the root `plugin.json` parse stays strict. Codex manifests omit `$schema`
@@ -312,15 +325,11 @@ export function normalizeCodexManifest(raw: unknown): { manifest: unknown; warni
     manifest.extensions = extensions;
   }
 
-  // Only a string path (or a one-entry array) maps: Xum has one skills root.
-  // Other forms stay top-level and the validator reports them as unknown.
   const contributes: Record<string, unknown> = {};
   for (const [codexKey, contributesKey] of CODEX_CONTRIBUTES_KEYS) {
-    const value: unknown = raw[codexKey];
-    const single: unknown = Array.isArray(value) && value.length === 1 ? value[0] : value;
-    if (typeof single !== "string") continue;
-    // An unsafe path is passed through so the validator rejects it with its warning.
-    contributes[contributesKey] = normalizeOpenAIRelativePath(single) ?? single;
+    const mapped = codexComponentPath(codexKey, raw[codexKey]);
+    if (mapped === undefined) continue;
+    contributes[contributesKey] = mapped;
     delete manifest[codexKey];
   }
   if (Object.keys(contributes).length > 0) manifest.contributes = contributes;

@@ -57,7 +57,11 @@ export interface AgentPluginSlashCommandContribution {
  * chat commands that have no on-disk convention.
  */
 export interface AgentPluginContributes {
-  skills?: string;
+  /**
+   * One skills root, or several (Codex `skills` may be an array: #6121). A list replaces the
+   * default `skills/`, as in Codex. On a duplicate skill name the earlier root wins.
+   */
+  skills?: string | string[];
   mcp?: string;
   agents?: string;
   workflows?: string;
@@ -65,8 +69,13 @@ export interface AgentPluginContributes {
   slashCommands?: AgentPluginSlashCommandContribution[];
 }
 
-const CONTRIBUTES_PATH_KEYS = ["skills", "mcp", "agents", "workflows", "hooks"] as const;
-const CONTRIBUTES_KEYS = new Set<string>([...CONTRIBUTES_PATH_KEYS, "slashCommands"]);
+const CONTRIBUTES_PATH_KEYS = ["mcp", "agents", "workflows", "hooks"] as const;
+const CONTRIBUTES_KEYS = new Set<string>([...CONTRIBUTES_PATH_KEYS, "skills", "slashCommands"]);
+/**
+ * Skills roots read per plugin. Each root costs a realpath and a directory scan in every
+ * discovery, and a 256 KiB manifest can list thousands of them.
+ */
+export const MAX_SKILLS_ROOTS = 16;
 
 /**
  * A contributes path must stay a plain relative path. Realpath containment is
@@ -142,6 +151,44 @@ function parseSlashCommandContributions(
   return commands;
 }
 
+const SKILLS_PATH_RULE =
+  "'contributes.skills' must be a relative path inside the plugin, or a list of them";
+
+/**
+ * `contributes.skills`: one safe path, or a list that keeps its safe, distinct entries. With none
+ * left the default `skills/` applies.
+ */
+function parseSkillsRoots(
+  raw: unknown,
+  warnings: string[]
+): Pick<AgentPluginContributes, "skills"> {
+  if (raw === undefined) return {};
+  if (typeof raw === "string" && isSafeContributesPath(raw)) return { skills: raw };
+  if (!Array.isArray(raw)) {
+    warnings.push(`${SKILLS_PATH_RULE}; ignoring (using the default location)`);
+    return {};
+  }
+  const roots = parseSkillsRootList(raw, warnings);
+  return roots.length > 0 ? { skills: roots } : {};
+}
+
+function parseSkillsRootList(raw: unknown[], warnings: string[]): string[] {
+  if (raw.length > MAX_SKILLS_ROOTS) {
+    warnings.push(
+      `'contributes.skills' has ${raw.length} entries; reading only the first ${MAX_SKILLS_ROOTS}`
+    );
+  }
+  const roots: string[] = [];
+  for (const entry of raw.slice(0, MAX_SKILLS_ROOTS)) {
+    if (typeof entry !== "string" || !isSafeContributesPath(entry)) {
+      warnings.push(`${SKILLS_PATH_RULE}; ignoring an entry`);
+    } else if (!roots.includes(entry)) {
+      roots.push(entry);
+    }
+  }
+  return roots;
+}
+
 function parseContributes(raw: unknown, warnings: string[]): AgentPluginContributes | undefined {
   if (raw === undefined) {
     return undefined;
@@ -172,6 +219,8 @@ function parseContributes(raw: unknown, warnings: string[]): AgentPluginContribu
     }
     contributes[key] = value;
   }
+
+  Object.assign(contributes, parseSkillsRoots(raw.skills, warnings));
 
   if (raw.slashCommands !== undefined) {
     const commands = parseSlashCommandContributions(raw.slashCommands, warnings);

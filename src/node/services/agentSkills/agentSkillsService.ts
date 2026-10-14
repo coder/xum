@@ -276,7 +276,7 @@ async function buildPluginScanCandidates(args: {
 
   const candidates: AgentSkillScanCandidate[] = [];
   for (const plugin of plugins) {
-    if (plugin.skillsDir == null) {
+    if (plugin.skillsDirs == null) {
       continue;
     }
 
@@ -291,14 +291,18 @@ async function buildPluginScanCandidates(args: {
       }
     }
 
-    candidates.push({
-      scope: args.scope,
-      root: plugin.skillsDir,
-      runtime: localRuntime,
-      pluginRoot: plugin.rootPath,
-      pluginName: plugin.name,
-      importedSkills: plugin.importedComponents?.skills,
-    });
+    // One candidate per root, in declared order: the scan keeps the first skill of a name.
+    const importedSkills = plugin.importedComponents?.skills;
+    candidates.push(
+      ...plugin.skillsDirs.map((root) => ({
+        scope: args.scope,
+        root,
+        runtime: localRuntime,
+        pluginRoot: plugin.rootPath,
+        pluginName: plugin.name,
+        importedSkills,
+      }))
+    );
   }
 
   return candidates;

@@ -1465,6 +1465,36 @@ describe("AgentPluginInstallService", () => {
     expect(preview.warnings.some((warning) => warning.includes("skills/escaping"))).toBe(true);
   });
 
+  test("consent preview lists the skills of every Codex skills root; a repeated name warns", async () => {
+    await fsPromises.rm(path.join(remoteDir, "plugin.json"));
+    await fsPromises.mkdir(path.join(remoteDir, ".codex-plugin"));
+    await fsPromises.writeFile(
+      path.join(remoteDir, ".codex-plugin", "plugin.json"),
+      JSON.stringify({ name: "demo-plugin", skills: ["./skills/", "./extra/"] })
+    );
+    for (const [dir, name] of [
+      ["extra", "summarize"],
+      ["extra", "greet"],
+    ]) {
+      await fsPromises.mkdir(path.join(remoteDir, dir, name), { recursive: true });
+      await fsPromises.writeFile(
+        path.join(remoteDir, dir, name, "SKILL.md"),
+        `---\nname: ${name}\ndescription: From ${dir}\n---\n\nBody.\n`
+      );
+    }
+    await commitAll(remoteDir, "two skills roots");
+
+    const preview = await service.preview({ input: remoteDir });
+    // skills/greet comes first, so extra/greet never loads and is not offered.
+    expect(preview.skills).toEqual([
+      { name: "greet", description: "Greets people" },
+      { name: "summarize", description: "From extra" },
+    ]);
+    expect(preview.warnings.filter((warning) => warning.startsWith("extra/greet:"))).toHaveLength(
+      1
+    );
+  });
+
   test("a hooks.js or skill symlinked into the staged clone's .git is refused (#6161)", async () => {
     // The staged clone keeps .git, whose config can carry the remote's credentials; a link
     // into it passes plain realpath containment.

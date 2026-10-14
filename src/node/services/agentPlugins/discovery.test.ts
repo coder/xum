@@ -88,7 +88,7 @@ describe("discoverAgentPlugins", () => {
     expect(plugin.name).toBe("hello-plugin");
     expect(plugin.scope).toBe("global");
     expect(plugin.rootPath).toBe(await fs.realpath(path.join(container, "hello-plugin")));
-    expect(plugin.skillsDir).toBe(path.join(plugin.rootPath, "skills"));
+    expect(plugin.skillsDirs).toEqual([path.join(plugin.rootPath, "skills")]);
     expect(plugin.mcpConfigPath).toBe(path.join(plugin.rootPath, "mcp.json"));
     expect(result.diagnostics).toEqual([]);
   });
@@ -936,9 +936,39 @@ describe("discoverAgentPlugins", () => {
 
     expect(result.plugins).toHaveLength(1);
     const plugin = result.plugins[0];
-    expect(plugin.skillsDir).toBe(path.join(plugin.rootPath, "lib", "skills"));
+    expect(plugin.skillsDirs).toEqual([path.join(plugin.rootPath, "lib", "skills")]);
     expect(plugin.workflowsDir).toBe(path.join(plugin.rootPath, "scripts"));
     expect(plugin.agentsDir).toBeUndefined();
+  });
+
+  test("a Codex skills array resolves every contained root; a missing or escaping one is skipped", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "multi");
+    await fs.mkdir(path.join(pluginDir, ".codex-plugin"), { recursive: true });
+    for (const dir of ["core", "extra", "skills"]) {
+      await fs.mkdir(path.join(pluginDir, dir), { recursive: true });
+    }
+    await fs.symlink(tmp.path, path.join(pluginDir, "outside"));
+    await fs.writeFile(
+      path.join(pluginDir, ".codex-plugin", "plugin.json"),
+      JSON.stringify({
+        name: "multi",
+        skills: ["./core/", "./missing", "./outside", "./extra", "./core"],
+      }),
+      "utf8"
+    );
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    const plugin = result.plugins[0];
+    // Declared roots replace the default skills/ (as in Codex), in declared order.
+    expect(plugin.skillsDirs).toEqual([
+      path.join(plugin.rootPath, "core"),
+      path.join(plugin.rootPath, "extra"),
+    ]);
+    expect(result.diagnostics).toHaveLength(1);
+    expect(result.diagnostics[0].message).toContain("outside/ resolves outside the plugin root");
   });
 
   test("discovers a manifest-only plugin without components", async () => {
@@ -949,7 +979,7 @@ describe("discoverAgentPlugins", () => {
     const result = await discoverAgentPlugins([{ path: container, scope: "project" }]);
 
     expect(result.plugins).toHaveLength(1);
-    expect(result.plugins[0].skillsDir).toBeUndefined();
+    expect(result.plugins[0].skillsDirs).toBeUndefined();
     expect(result.plugins[0].mcpConfigPath).toBeUndefined();
     expect(result.diagnostics).toEqual([]);
   });
@@ -995,7 +1025,7 @@ describe("discoverAgentPlugins", () => {
     expect(result.plugins).toHaveLength(1);
     const plugin = result.plugins[0];
     expect(plugin.name).toBe("figma");
-    expect(plugin.skillsDir).toBe(path.join(plugin.rootPath, "skills"));
+    expect(plugin.skillsDirs).toEqual([path.join(plugin.rootPath, "skills")]);
     expect(plugin.mcpConfigPath).toBe(path.join(plugin.rootPath, ".mcp.json"));
     // Parsed and exposed only: no hook component resolves from the legacy key.
     expect(plugin.hooksPath).toBeUndefined();
@@ -1055,7 +1085,7 @@ describe("discoverAgentPlugins", () => {
     expect(result.plugins).toHaveLength(1);
     const plugin = result.plugins[0];
     expect(plugin.codexFallback).toBe(true);
-    expect(plugin.skillsDir).toBe(path.join(plugin.rootPath, "skills"));
+    expect(plugin.skillsDirs).toEqual([path.join(plugin.rootPath, "skills")]);
     expect(plugin.hooksPath).toBeUndefined();
     expect(plugin.agentsDir).toBeUndefined();
     expect(plugin.workflowsDir).toBeUndefined();
@@ -1267,7 +1297,7 @@ describe("discoverAgentPlugins", () => {
     const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
 
     expect(result.plugins).toHaveLength(1);
-    expect(result.plugins[0].skillsDir).toBeUndefined();
+    expect(result.plugins[0].skillsDirs).toBeUndefined();
     // MCP component is unaffected (§6.2 narrowest-scope invalidation).
     expect(result.plugins[0].mcpConfigPath).toBeDefined();
     expect(result.diagnostics).toHaveLength(1);
@@ -1284,7 +1314,7 @@ describe("discoverAgentPlugins", () => {
 
     expect(result.plugins).toHaveLength(1);
     expect(result.plugins[0].mcpConfigPath).toBeUndefined();
-    expect(result.plugins[0].skillsDir).toBeDefined();
+    expect(result.plugins[0].skillsDirs).toBeDefined();
     expect(result.diagnostics).toHaveLength(1);
     expect(result.diagnostics[0].message).toContain("mcp.json");
   });
@@ -1298,7 +1328,7 @@ describe("discoverAgentPlugins", () => {
     const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
 
     expect(result.plugins).toHaveLength(1);
-    expect(result.plugins[0].skillsDir).toBeUndefined();
+    expect(result.plugins[0].skillsDirs).toBeUndefined();
     expect(result.plugins[0].mcpConfigPath).toBeDefined();
   });
 

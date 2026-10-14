@@ -244,8 +244,11 @@ export interface AgentPluginInfo {
    * (a Codex-only package or the overlay). Codex hooks label their inline entries with it.
    */
   openaiManifestPath?: string;
-  /** Canonical `skills/` directory; present only when it exists, is a directory, and stays inside the root (§6.2). */
-  skillsDir?: string;
+  /**
+   * Canonical skills roots in declared order (`skills/` by default, or `contributes.skills`).
+   * Each one exists, is a directory, and stays inside the root (§6.2). Absent when none does.
+   */
+  skillsDirs?: string[];
   /** Canonical `mcp.json` path; present only when it exists, is a regular file, and stays inside the root (§6.2). */
   mcpConfigPath?: string;
   /** "codex": the MCP file is in the Codex `.mcp.json` dialect (see loadPluginMcpServers). */
@@ -407,6 +410,20 @@ async function readManifestCandidate(
   }
 }
 
+/** Resolve each declared skills root (default `skills/`), dropping missing, invalid and repeated ones. */
+async function resolveSkillsRoots(
+  declared: string | string[] | undefined,
+  resolveComponent: (relativePath: string, expectKind: "directory") => Promise<string | undefined>
+): Promise<string[]> {
+  const roots: string[] = [];
+  for (const relative of typeof declared === "string" ? [declared] : (declared ?? ["skills"])) {
+    const canonical = await resolveComponent(relative, "directory");
+    // Two spellings (or a symlink) can name one directory: scan it once.
+    if (canonical !== undefined && !roots.includes(canonical)) roots.push(canonical);
+  }
+  return roots;
+}
+
 async function discoverPluginAt(args: {
   pluginDir: string;
   containerPath: string;
@@ -526,7 +543,7 @@ async function discoverPluginAt(args: {
       ...(options?.maxBytes !== undefined ? { maxBytes: options.maxBytes } : {}),
     });
 
-  const skillsDir = await resolveComponent(contributes?.skills ?? "skills", "directory");
+  const skillsDirs = await resolveSkillsRoots(contributes?.skills, resolveComponent);
   // Codex packages ship `.mcp.json`; it is the default only when `mcp.json` is
   // absent (an invalid `mcp.json` still reports its own diagnostic).
   const defaultMcpPath = (await fsPromises.lstat(path.join(rootReal, "mcp.json")).catch(() => null))
@@ -562,7 +579,7 @@ async function discoverPluginAt(args: {
     manifest: validation.manifest,
     ...(codexFallback ? { codexFallback: true } : {}),
     ...(openai.extension !== undefined ? { openai: openai.extension, openaiManifestPath } : {}),
-    ...(skillsDir !== undefined ? { skillsDir } : {}),
+    ...(skillsDirs.length > 0 ? { skillsDirs } : {}),
     ...(mcpConfigPath !== undefined ? { mcpConfigPath } : {}),
     ...(mcpConfigPath !== undefined && mcpConfigDialect !== undefined ? { mcpConfigDialect } : {}),
     ...(hooksPath !== undefined ? { hooksPath } : {}),

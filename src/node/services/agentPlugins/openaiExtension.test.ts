@@ -148,12 +148,24 @@ describe("readOpenAIExtension", () => {
 });
 
 describe("normalizeCodexManifest", () => {
-  test("maps a one-entry skills array; longer arrays stay unknown", () => {
+  test("maps a skills path or every entry of a skills array", () => {
     expect(normalizeCodexManifest({ name: "a", skills: ["./custom/"] }).manifest).toMatchObject({
-      contributes: { skills: "./custom" },
+      contributes: { skills: ["./custom"] },
     });
-    expect(normalizeCodexManifest({ name: "a", skills: ["./a", "./b"] }).manifest).toMatchObject({
-      skills: ["./a", "./b"],
+    const { manifest } = normalizeCodexManifest({ name: "a", skills: ["./a/", "./b", "../x", 3] });
+    // Unsafe entries pass through so the validator reports each one.
+    expect(manifest).toMatchObject({ contributes: { skills: ["./a", "./b", "../x", 3] } });
+    expect(manifest).not.toHaveProperty("skills");
+    // One MCP file only: a one-entry mcpServers array maps, a longer one stays unknown.
+    expect(
+      normalizeCodexManifest({ name: "a", mcpServers: ["./.mcp.json"] }).manifest
+    ).toMatchObject({ contributes: { mcp: "./.mcp.json" } });
+    expect(
+      normalizeCodexManifest({ name: "a", mcpServers: ["./a.json", "./b.json"] }).manifest
+    ).toMatchObject({ mcpServers: ["./a.json", "./b.json"] });
+    // Another shape stays top-level, and the validator reports it as unknown.
+    expect(normalizeCodexManifest({ name: "a", skills: { a: 1 } }).manifest).toMatchObject({
+      skills: { a: 1 },
     });
   });
 

@@ -1484,6 +1484,35 @@ describe("agentSkillsService agent plugins", () => {
     ).rejects.toThrow("not found");
   });
 
+  test("a plugin with several skills roots serves each root's skills; the first root wins a name", async () => {
+    using tmp = new DisposableTempDir("plugin-skill-roots");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "multi");
+    await fs.mkdir(path.join(pluginDir, ".codex-plugin"), { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, ".codex-plugin", "plugin.json"),
+      JSON.stringify({ name: "multi", skills: ["./core", "./extra"] })
+    );
+    await writeSkill(path.join(pluginDir, "core"), "shared", "from core");
+    await writeSkill(path.join(pluginDir, "extra"), "shared", "from extra");
+    await writeSkill(path.join(pluginDir, "extra"), "summarize", "from extra");
+    const runtime = new LocalRuntime(tmp.path);
+    const roots = {
+      projectRoot: "",
+      globalRoot: path.join(tmp.path, "skills"),
+      universalRoot: "",
+      globalPluginRoots: [container],
+    };
+
+    const { skills } = await discoverAgentSkills(runtime, tmp.path, { roots });
+
+    expect(skills.find((s) => s.name === "shared")?.description).toBe("from core");
+    expect(
+      (await readAgentSkill(runtime, tmp.path, SkillNameSchema.parse("summarize"), { roots }))
+        .package.frontmatter.description
+    ).toBe("from extra");
+  });
+
   test("managed imports gate enumeration and direct reads without shadowing allowed same-name fallbacks", async () => {
     using tmp = new DisposableTempDir("plugin-selected-skills");
     const container = path.join(tmp.path, "plugins");
