@@ -86,6 +86,36 @@ describe("new functions", () => {
     expect(verdicts(base, split(35))).toEqual([["new-function", "violation", piece]]);
   });
 
+  describe("relief with coverage", () => {
+    const base = [row("big", 40, [1, 99], 1)];
+    const piece = `${PATH}::demo.mod::piece`;
+    const withCrap = (crap: number): FunctionRow => ({ ...row("piece", 12, [61, 99], 0), crap });
+    // big keeps 29 of 40: a pure move (move relief); 25: a net decrease.
+    const moved = (bigCc: number, crap: number) => [row("big", bigCc, [1, 60], 1), withCrap(crap)];
+
+    test("covers a piece up to CRAP 30, either kind", () => {
+      for (const bigCc of [29, 25]) {
+        expect(verdicts(base, moved(bigCc, 30))).toEqual([["new-function", "warning", piece]]);
+        expect(verdicts(base, moved(bigCc, 30.5))).toEqual([["new-function", "violation", piece]]);
+      }
+    });
+
+    test("does not cover an untested piece, and says why", () => {
+      // CC 12 untested: CRAP 156. The CC-only move above warns for the same split.
+      const head = [row("big", 29, [1, 60], 1), row("piece", 12, [61, 99], 0)];
+      const [finding] = evaluate(base, head, NOTHING_CHANGED).findings;
+      expect(finding?.severity).toBe("violation");
+      expect(finding?.message).toContain("relief needs CRAP <= 30");
+    });
+
+    test("an incomplete coverage report turns the capped violation into a warning", () => {
+      // At full coverage the piece scores CRAP 12, under the cap, so only coverage blocks it.
+      const head = [row("big", 29, [1, 60], 1), row("piece", 12, [61, 99], 0)];
+      const findings = evaluate(base, head, NOTHING_CHANGED, "shard reports missing").findings;
+      expect(findings.map((finding) => finding.severity)).toEqual(["warning"]);
+    });
+  });
+
   describe("move relief", () => {
     const base = [row("big", 40, [1, 99])];
     const key = (name: string) => `${PATH}::demo.mod::${name}`;
@@ -243,9 +273,9 @@ describe("Bun inlined-const suspects", () => {
     ]);
     // A fully covered CC 31 hotspot that keeps its CC cannot end lower: at
     // full coverage it passes the CRAP floor but still owes the CRAP tax.
-    expect(verdicts([row("f", 31, [1, 9], 1)], [suspect(row("f", 31, [1, 9], 0))], touchedAt(3))).toEqual([
-      ["floor-crap", "violation", `${PATH}::demo.mod::f`],
-    ]);
+    expect(
+      verdicts([row("f", 31, [1, 9], 1)], [suspect(row("f", 31, [1, 9], 0))], touchedAt(3))
+    ).toEqual([["floor-crap", "violation", `${PATH}::demo.mod::f`]]);
   });
 
   test("the warning says why, and a complexity gain stays a violation", () => {
