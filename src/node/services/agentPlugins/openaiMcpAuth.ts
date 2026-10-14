@@ -278,7 +278,7 @@ function codexEnvVarName(item: unknown): string | undefined {
   const isLocalConfig =
     isPlainObject(item) &&
     Object.keys(item).every((key) => key === "name" || key === "source") &&
-    (item.source === undefined || item.source === "local");
+    (item.source == null || item.source === "local");
   const name = isLocalConfig ? item.name : item;
   // An empty name, '=' or NUL can never name an environment variable.
   return typeof name === "string" && /^[^=\0]+$/.test(name) ? name : undefined;

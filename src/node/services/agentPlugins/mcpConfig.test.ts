@@ -257,7 +257,15 @@ describe("loadPluginMcpServers", () => {
       {
         mcpServers: {
           // Codex accepts a bare name or { name, source } (codex-rs config mcp_types.rs).
-          named: { command: "node", env_vars: ["API_TOKEN", { name: "REGION", source: "local" }] },
+          named: {
+            command: "node",
+            // Codex's `source` is an Option<String>: null means unset, like an omitted source.
+            env_vars: [
+              "API_TOKEN",
+              { name: "REGION", source: "local" },
+              { name: "ZONE", source: null },
+            ],
+          },
           // Codex reads null as an absent optional list (serde Option), on any transport.
           nullList: { command: "node", env_vars: null },
           nullRemote: { url: "https://b.example.com/mcp", env_vars: null },
@@ -277,7 +285,7 @@ describe("loadPluginMcpServers", () => {
     expect(
       infos.map((s) => [s.plugin?.serverName, s.transport === "stdio" ? s.forwardEnv : s.url])
     ).toEqual([
-      ["named", ["API_TOKEN", "REGION"]],
+      ["named", ["API_TOKEN", "REGION", "ZONE"]],
       ["nullList", undefined],
       ["nullRemote", "https://b.example.com/mcp"],
     ]);
