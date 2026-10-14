@@ -26,13 +26,14 @@ import {
 import { mcpAppOpenAiShimScript, type McpAppOpenAiSeed } from "./mcpAppOpenAiShim";
 import {
   createMcpAppHost,
+  declaresFullscreenOnly,
   type McpAppConsentRequest,
   type McpAppHost,
   type McpAppHostContext,
 } from "./mcpAppHost";
 import {
   isMcpAppViewHosted,
-  markMcpAppViewFullscreenOnly,
+  setMcpAppViewFullscreenOnly,
   openMcpAppViewTab,
   reloadMcpAppView,
   type McpAppViewRef,
@@ -560,6 +561,8 @@ export function McpAppFrame(props: {
         },
       },
     });
+    /** Whether the view declared fullscreen but not inline (its last ui/initialize). */
+    let declaredFullscreenOnly = false;
     const host = createMcpAppHost({
       // Shown in consent prompts: the card's sanitized display key, never the raw bound key
       // (repo-defined keys can carry bidi/control characters). Tool calls use the raw key.
@@ -643,14 +646,24 @@ export function McpAppFrame(props: {
       // Inline only while the card is expanded in the loaded transcript: a collapsed (or
       // unloaded) card mounts no inline instance, so closing the tab would lose the view.
       // The host runs the move later; skip it once this instance is gone (closed meanwhile).
-      setDisplayMode: (mode, cause) => {
+      // A fullscreen-only view is never hosted inline: its cards show the "Open in tab" notice
+      // (mcpAppViewsStore.ts). A tab instance marks it at once. A card instance marks it only
+      // when its move to the tab runs: marking it earlier would unmount the card's frame first,
+      // and the move would then be dropped. A later declaration with inline clears it.
+      onViewDisplayModes: (modes) => {
+        declaredFullscreenOnly = declaresFullscreenOnly(modes);
+        if (!declaredFullscreenOnly || !inline) {
+          setMcpAppViewFullscreenOnly(workspaceId, toolCallId, declaredFullscreenOnly);
+        }
+      },
+      setDisplayMode: (mode) => {
         if (mode === "inline" && !isMcpAppViewHosted(workspaceId, toolCallId, "card")) return null;
         return () => {
           if (hostRef.current !== host) return;
           if (mode === "fullscreen") {
             // A fullscreen-only view: its card stops mounting it, so closing its tab does not
             // move it back to the tab again while the card is expanded.
-            if (cause === "declared") markMcpAppViewFullscreenOnly(workspaceId, toolCallId);
+            if (declaredFullscreenOnly) setMcpAppViewFullscreenOnly(workspaceId, toolCallId, true);
             openMcpAppViewTab(workspaceId, latest.current.view);
             return;
           }

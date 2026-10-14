@@ -456,16 +456,22 @@ export function useMcpAppViewReloadKey(workspaceId: string, toolCallId: string):
 }
 
 /**
- * Views that declared fullscreen but not inline, found when one first initialized in its tool
- * card and moved to its tab. Their cards then show the "Open in tab" notice instead of a frame.
- * Session only: a later session finds out again on first mount.
+ * Views that declared fullscreen but not inline in their latest ui/initialize. Their cards show
+ * the "Open in tab" notice instead of a frame. A server update that adds inline clears the
+ * mark at the view's next initialize. Session only: a later session finds out again on mount.
  */
 const fullscreenOnlyViews = new Set<string>();
 
-export function markMcpAppViewFullscreenOnly(workspaceId: string, toolCallId: string): void {
+/** Record whether the view declared fullscreen but not inline (its latest initialize). */
+export function setMcpAppViewFullscreenOnly(
+  workspaceId: string,
+  toolCallId: string,
+  fullscreenOnly: boolean
+): void {
   const key = lookupKey(workspaceId, toolCallId);
-  if (fullscreenOnlyViews.has(key)) return;
-  fullscreenOnlyViews.add(key);
+  if (fullscreenOnlyViews.has(key) === fullscreenOnly) return;
+  if (fullscreenOnly) fullscreenOnlyViews.add(key);
+  else fullscreenOnlyViews.delete(key);
   emit();
 }
 

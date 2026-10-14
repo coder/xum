@@ -10,7 +10,7 @@ import { removeTabEverywhere } from "@/browser/utils/rightSidebarLayout";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import {
   isMcpAppViewHosted,
-  markMcpAppViewFullscreenOnly,
+  setMcpAppViewFullscreenOnly,
 } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
 import { installDom } from "../../../../tests/ui/dom";
 import { APIContext, APIProvider } from "@/browser/contexts/API";
@@ -203,7 +203,7 @@ describe("GenericToolCall MCP Apps view", () => {
     const view = renderAppCall("completed", appSnapshot, workspaceId);
     await view.findByTestId("mcp-app-frame");
     act(() => {
-      markMcpAppViewFullscreenOnly(workspaceId, "call-1");
+      setMcpAppViewFullscreenOnly(workspaceId, "call-1", true);
       updateRightSidebarLayout(workspaceId, (s) => withAppViewTab(s, "call-1"));
     });
     await waitFor(() => expect(view.queryByTestId("mcp-app-frame")).toBeNull());

@@ -1178,6 +1178,10 @@ describe("McpAppFrame host strips", () => {
       };
       // It is told the mode it ends up in, never inline, which it did not declare.
       expect(init.hostContext.displayMode).toBe("fullscreen");
+      // The host sends no request (the move's teardown) before the view is initialized.
+      await tick();
+      expect(posted.some((m) => m.method === "ui/resource-teardown")).toBe(false);
+      postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
       const teardown = await waitFor(() => {
         const message = posted.find((m) => m.method === "ui/resource-teardown");
         if (message === undefined) throw new Error("no teardown yet");
@@ -1192,6 +1196,40 @@ describe("McpAppFrame host strips", () => {
     } finally {
       window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onOpen);
     }
+  });
+
+  // E.g. "Open in tab" on a collapsed card: the view first initializes in its tab. Its card must
+  // not host it inline later either, until a newer document declares inline.
+  test("a tab instance marks a fullscreen-only view at once; a declaration with inline clears it", async () => {
+    let isFullscreenOnly = () => false;
+    function FullscreenOnlyProbe() {
+      const marked = useMcpAppViewFullscreenOnly("ws-tab-only", "call-1");
+      isFullscreenOnly = () => marked;
+      return null;
+    }
+    const view = render(
+      <>
+        <McpAppFrame workspaceId="ws-tab-only" view={VIEW} />
+        <FullscreenOnlyProbe />
+      </>,
+      { wrapper: Wrapper }
+    );
+    const frame = await findOpenFrame(view);
+    const posted = capturePosted(frame);
+    const initialize = (id: number, modes: string[]) => {
+      postFromView(frame, {
+        jsonrpc: "2.0",
+        id,
+        method: "ui/initialize",
+        params: { appCapabilities: { availableDisplayModes: modes } },
+      });
+    };
+    initialize(1, ["fullscreen"]);
+    await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+    expect(isFullscreenOnly()).toBe(true);
+    initialize(2, ["inline", "fullscreen"]);
+    await waitFor(() => expect(posted.some((m) => m.id === 2)).toBe(true));
+    expect(isFullscreenOnly()).toBe(false);
   });
 
   // The user can collapse the card during the teardown wait: the tab must not close then.
