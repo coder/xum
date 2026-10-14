@@ -1410,6 +1410,36 @@ describe("MCPServerManager", () => {
     expect(calls).toHaveLength(1);
   });
 
+  test("warming a cold workspace for entry points does not wait for prompts/list", async () => {
+    using tmp = new DisposableTempDir("mcp-apps-entry-warm");
+    manager.setMcpApps({
+      isEnabled: () => true,
+      store: new McpAppResultStore((id) => path.join(tmp.path, id)),
+    });
+    configService.listServers.mockResolvedValue({ apps: stdioConfig("apps-entry-warm") });
+    const listPrompts = mock(() => new Promise<Array<{ name: string }>>(() => undefined));
+    servers.serve("apps-entry-warm", {
+      tools: { show: testTool() },
+      listPrompts,
+      apps: {
+        hasTool: () => true,
+        toolUi: () => undefined,
+        appEntrypoints: () => [
+          { toolName: "board", title: "Board", resourceUri: "ui://x/view", types: ["global"] },
+        ],
+      },
+    });
+    const request = workspaceRequest("apps-entry-warm");
+
+    // The stalled prompts/list would hold this for the prompt-list timeout.
+    await manager.warmWorkspaceServers(request);
+
+    expect(manager.hasWorkspaceRequestOptions(request.workspaceId)).toBe(true);
+    expect(
+      (await manager.listMcpAppEntrypoints(request.workspaceId)).map((entry) => entry.toolName)
+    ).toEqual(["board"]);
+  });
+
   test("overlapping opens of one entry point keep the newest open's result", async () => {
     using tmp = new DisposableTempDir("mcp-apps-entry-order");
     const store = new McpAppResultStore((id) => path.join(tmp.path, id));

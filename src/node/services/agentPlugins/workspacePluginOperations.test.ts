@@ -23,8 +23,8 @@ function createContext(options: {
   const waitForInit = mock(() => Promise.resolve());
   const ensureReady = mock(() => Promise.resolve({ ready: true as const }));
   const getPromptsForWorkspace = mock(options.getPromptsForWorkspace);
-  const getToolsForWorkspace = mock((_options: unknown, _callOptions?: unknown) =>
-    Promise.resolve({ tools: {} })
+  const warmWorkspaceServers = mock((_options: unknown, _callOptions?: unknown) =>
+    Promise.resolve()
   );
   const context = {
     workspaceService: {
@@ -42,9 +42,9 @@ function createContext(options: {
     },
     secretsStore: { getEffectiveSecrets: mock(() => []) },
     config: { loadConfigOrDefault: mock(() => ({ projects: new Map() })) },
-    mcpServerManager: { getPromptsForWorkspace, getToolsForWorkspace },
+    mcpServerManager: { getPromptsForWorkspace, warmWorkspaceServers },
   } as unknown as ORPCContext;
-  return { context, waitForInit, ensureReady, getPromptsForWorkspace, getToolsForWorkspace };
+  return { context, waitForInit, ensureReady, getPromptsForWorkspace, warmWorkspaceServers };
 }
 
 describe("getWorkspaceMcpOverrides", () => {
@@ -207,7 +207,7 @@ describe("listWorkspaceMcpPrompts archive admission", () => {
 });
 
 describe("warmWorkspaceMcpServers", () => {
-  test("starts the workspace's servers without waiting for prompts/list", async () => {
+  test("warms the servers with the resolved options, never through prompt discovery", async () => {
     // MCP App entry points warm servers before they list: a server that stalls prompts/list
     // must not hold the launcher for the prompt-list timeout.
     const dispose = mock(() => undefined);
@@ -218,8 +218,8 @@ describe("warmWorkspaceMcpServers", () => {
 
     await warmWorkspaceMcpServers(fixture.context, workspaceId);
 
-    expect(fixture.getToolsForWorkspace).toHaveBeenCalledTimes(1);
-    expect(fixture.getToolsForWorkspace.mock.calls[0]?.[0]).toMatchObject({
+    expect(fixture.warmWorkspaceServers).toHaveBeenCalledTimes(1);
+    expect(fixture.warmWorkspaceServers.mock.calls[0]?.[0]).toMatchObject({
       workspaceId,
       projectPath: metadata.projectPath,
       workspacePath: "/tmp/proj/ws",
@@ -236,6 +236,6 @@ describe("warmWorkspaceMcpServers", () => {
     await warmWorkspaceMcpServers(fixture.context, workspaceId);
 
     expect(fixture.ensureReady).not.toHaveBeenCalled();
-    expect(fixture.getToolsForWorkspace).not.toHaveBeenCalled();
+    expect(fixture.warmWorkspaceServers).not.toHaveBeenCalled();
   });
 });

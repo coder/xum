@@ -93,7 +93,7 @@ export async function warmWorkspaceMcpServers(
   callerSignal?: AbortSignal
 ): Promise<void> {
   await withWorkspaceMcpRequest(context, workspaceId, callerSignal, undefined, (options, signal) =>
-    context.mcpServerManager.getToolsForWorkspace(options, { signal })
+    context.mcpServerManager.warmWorkspaceServers(options, { signal })
   );
 }
 

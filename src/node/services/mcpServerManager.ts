@@ -4103,6 +4103,22 @@ export class MCPServerManager {
     return this.ensureWorkspaceServers(options, refreshToolCatalogs, readSignal);
   }
 
+  /**
+   * Start (or reuse) the workspace's servers and record its request options, without awaiting
+   * a prompts/list or tools/list refresh. MCP App entry points list and refresh the catalogs
+   * they need themselves, so one server that stalls prompts/list must not hold them.
+   */
+  async warmWorkspaceServers(
+    options: MCPWorkspaceRequestOptions,
+    callOptions?: { signal?: AbortSignal }
+  ): Promise<void> {
+    // `false`: no awaited catalog refresh (getToolsForWorkspace awaits prompts/list on a cold
+    // start). Inside the epoch bracket like every other serve.
+    await this.runWithStablePluginEpoch(() =>
+      this.ensureWorkspaceServers(options, false, callOptions?.signal)
+    );
+  }
+
   async getPromptsForWorkspace(
     options: MCPWorkspaceRequestOptions,
     callOptions?: { signal?: AbortSignal }
