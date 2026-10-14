@@ -34,6 +34,7 @@ import { DraftService } from "@/node/services/draftService";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
 import { TestTempDir } from "@/node/services/tools/testHelpers";
 import { installDom } from "../../../tests/ui/dom";
+import { restartLocalStorage } from "../../../tests/ui/quotaLimitedStorage";
 import { DraftStore } from "./DraftStore";
 
 // Older builds wrote these legacy keys; the key registry refuses them now, so seed them the way
@@ -78,6 +79,8 @@ function createClient(service: DraftService) {
     updateReplyGate: null as Promise<void> | null,
     getGate: null as Promise<void> | null,
     subscribeGate: null as Promise<void> | null,
+    /** Holds change events (not the snapshot) before the store sees them. */
+    eventGate: null as Promise<void> | null,
     updates: 0,
     listPuts: 0,
     failMoves: 0,
@@ -169,6 +172,7 @@ function createClient(service: DraftService) {
           while (!opts?.signal?.aborted) {
             const next = queue.shift();
             if (next) {
+              if (next.type !== "snapshot") await control.eventGate;
               yield next;
               continue;
             }
@@ -572,6 +576,41 @@ describe("DraftStore", () => {
     sendReply();
     await Promise.all([flushed, deleted]);
     expect((await service.get(scope)).text).toBe("");
+    expect(store.getView(scope).text).toBe("");
+  });
+
+  test("a delete that waits for a write is not undone by a reconnect snapshot", async () => {
+    using tempDir = new TestTempDir("draft-store-delete-during-reconnect");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    const scope: DraftScope = { kind: "creation", projectPath, draftId: "d1" };
+    store.putCreationDraft(projectPath, { draftId: "d1", subProjectPath: null, createdAt: 1 });
+    await waitFor(async () => (await service.getList()).entries.length === 1);
+    let sendUpdate: () => void = () => undefined;
+    let sendReply: () => void = () => undefined;
+    control.updateGate = new Promise<void>((resolve) => {
+      sendUpdate = resolve;
+    });
+    control.updateReplyGate = new Promise<void>((resolve) => {
+      sendReply = resolve;
+    });
+    store.setText(scope, "submitted as a workspace");
+    const flushed = store.flush(scope);
+    await waitFor(() => control.updates === 1);
+    const deleted = store.deleteDraft(scope);
+    sendUpdate();
+    await waitFor(async () => (await service.get(scope)).text.length > 0);
+    // The subscription reconnects while the delete waits: its snapshot holds the draft and row.
+    store.setClient(null);
+    await service.update({ scope: WS_SCOPE, text: "marks the snapshot" });
+    store.setClient(client);
+    await waitFor(() => store.getText(WS_SCOPE) === "marks the snapshot");
+    expect(store.getCreationDraftsByProject()[projectPath]).toBeUndefined();
+    sendReply();
+    await Promise.all([flushed, deleted]);
+    expect((await service.get(scope)).text).toBe("");
+    expect((await service.getList()).entries).toEqual([]);
     expect(store.getView(scope).text).toBe("");
   });
 
@@ -1126,6 +1165,88 @@ describe("DraftStore", () => {
     expect((await service.get(listed)).nameState).toEqual(NAME_STATE);
     expect((await service.get(defaultScope)).nameState?.manualName).toBe("default-name");
     expect(store.getView(defaultScope).nameState?.manualName).toBe("default-name");
+  });
+
+  // Older builds read these keys with a partial schema, and wrote keys holding only some fields.
+  test("imports a legacy name key that holds only some fields", async () => {
+    using tempDir = new TestTempDir("draft-store-legacy-partial-name");
+    const { projectPath, service, client } = await createHarness(tempDir);
+    const scope: DraftScope = { kind: "creation", projectPath, draftId: "draft-a" };
+    const key = getWorkspaceNameStateKey(getDraftScopeId(projectPath, "draft-a"));
+    seedLegacyKey(key, { autoGenerate: false, manualName: "typed-name" });
+
+    const store = createStore(client);
+    await store.whenReady();
+    expect((await service.get(scope)).nameState).toEqual({
+      generatedIdentity: null,
+      manualName: "typed-name",
+      autoGenerate: false,
+      lastGeneratedFor: "",
+    });
+    expect(store.getView(scope).nameState?.manualName).toBe("typed-name");
+    expect(listPersistedKeys("workspaceNameState:")).toEqual([]);
+  });
+
+  // The copy of a legacy pending draft's settings to its imported draft can fail (quota): its
+  // name must still end up in that draft, next to its text, never in the default draft.
+  test("imports a legacy pending draft's name into the draft its text went to", async () => {
+    using tempDir = new TestTempDir("draft-store-legacy-pending-name");
+    const { projectPath, service, client } = await createHarness(tempDir);
+    const pendingName = { ...NAME_STATE, manualName: "pending-name", autoGenerate: false };
+    seedLegacyKey(getInputKey(getPendingScopeId(projectPath)), "pending prompt");
+    seedLegacyKey(getWorkspaceNameStateKey(getPendingScopeId(projectPath)), pendingName);
+    const storage = restartLocalStorage();
+    const setItem = storage.setItem.bind(storage);
+    storage.setItem = (key, value) => {
+      if (key.startsWith("workspaceNameState:")) {
+        throw new DOMException("The quota has been exceeded.", "QuotaExceededError");
+      }
+      setItem(key, value);
+    };
+
+    const store = createStore(client);
+    await store.whenReady();
+    const imported: DraftScope = { kind: "creation", projectPath, draftId: "legacy-pending" };
+    const defaultScope: DraftScope = {
+      kind: "creation",
+      projectPath,
+      draftId: DEFAULT_CREATION_DRAFT_ID,
+    };
+    expect(await service.get(imported)).toMatchObject({
+      text: "pending prompt",
+      nameState: pendingName,
+    });
+    expect((await service.get(defaultScope)).nameState).toBeUndefined();
+    expect(store.getView(defaultScope).nameState).toBeNull();
+    expect(store.getView(imported).nameState).toEqual(pendingName);
+  });
+
+  // Another origin imported the pending draft's text already; this origin's import adds only the
+  // name. Its reply comes before the change event, which is then stale for this window.
+  test("shows the draft a partial legacy import stored, not the legacy input", async () => {
+    using tempDir = new TestTempDir("draft-store-legacy-partial-import");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const imported: DraftScope = { kind: "creation", projectPath, draftId: "legacy-pending" };
+    await service.update({ scope: imported, text: "imported by another origin" });
+    await service.putListEntry({ ...imported, subProjectPath: null, createdAt: 1 });
+    seedLegacyKey(getInputKey(getPendingScopeId(projectPath)), "stale pending prompt");
+    seedLegacyKey(getWorkspaceNameStateKey(getPendingScopeId(projectPath)), NAME_STATE);
+
+    let releaseEvents: () => void = () => undefined;
+    control.eventGate = new Promise<void>((resolve) => {
+      releaseEvents = resolve;
+    });
+    const store = createStore(client);
+    await store.whenReady();
+    expect(store.getView(imported)).toMatchObject({
+      text: "imported by another origin",
+      nameState: NAME_STATE,
+    });
+    releaseEvents();
+    expect(await service.get(imported)).toMatchObject({
+      text: "imported by another origin",
+      nameState: NAME_STATE,
+    });
   });
 
   test("moves the default draft in one step and shows the destination once it moved", async () => {

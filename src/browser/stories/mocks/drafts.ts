@@ -161,11 +161,24 @@ export function createMockDraftsApi() {
           ...input.entries.filter((entry) => !listEntries.some((listed) => isSame(listed, entry))),
         ])
       ),
+    // Like the backend: the body and the name were separate legacy keys, so each is imported only
+    // where the draft has none.
     importLegacy: (input: DraftUpdateInput) => {
-      if (drafts.has(draftScopeKey(input.scope))) {
+      const current = drafts.get(draftScopeKey(input.scope));
+      const bodyKept =
+        current !== undefined && (current.text.length > 0 || current.attachments.length > 0);
+      const nameKept = current?.nameState !== undefined;
+      if (bodyKept && (nameKept || input.nameState == null)) {
         return Promise.resolve({ result: "present" as const, revision });
       }
-      return Promise.resolve({ result: "applied" as const, ...write(input) });
+      return Promise.resolve({
+        result: "applied" as const,
+        ...write({
+          scope: input.scope,
+          ...(bodyKept ? {} : { text: input.text ?? "", attachments: input.attachments ?? [] }),
+          ...(nameKept ? {} : { nameState: input.nameState ?? null }),
+        }),
+      });
     },
     subscribe: async function* (_input?: void, opts?: { signal?: AbortSignal }) {
       const queue: DraftEvent[] = [

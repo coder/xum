@@ -1,8 +1,9 @@
-import { getDraftStore } from "@/browser/stores/DraftStore";
+import type { WorkspaceNamePersistedState } from "@/common/orpc/schemas/drafts";
 import {
   WORKSPACE_DRAFTS_BY_PROJECT_KEY,
   getDraftScopeId,
   getInputKey,
+  getWorkspaceNameStateKey,
 } from "@/common/constants/storage";
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -21,8 +22,10 @@ export interface WorkspaceDraftFixture {
 }
 
 /**
- * Seed workspace drafts for a project: the list and prompts as legacy localStorage keys (imported
- * on hydration), the workspace names through the DraftStore.
+ * Seed workspace drafts for a project as legacy localStorage keys (the list, prompts and workspace
+ * names), which the DraftStore imports into the story's mock backend on every hydration. Not
+ * through the DraftStore itself: it outlives a story (one preview page renders many), so a name
+ * set there can be saved to the previous story's backend, and the next story's snapshot clears it.
  */
 export function setWorkspaceDrafts(projectPath: string, drafts: WorkspaceDraftFixture[]): void {
   // Set the drafts index
@@ -50,18 +53,14 @@ export function setWorkspaceDrafts(projectPath: string, drafts: WorkspaceDraftFi
       localStorage.setItem(getInputKey(scopeId), JSON.stringify(draft.prompt));
     }
 
-    // The name lives in the draft body: set it like the creation form does. Unsaved until the
-    // story's mock backend hydrates the store, which then saves it there.
     if (draft.workspaceName !== undefined) {
-      getDraftStore().setNameState(
-        { kind: "creation", projectPath, draftId: draft.draftId },
-        {
-          generatedIdentity: null,
-          manualName: draft.workspaceName,
-          autoGenerate: false,
-          lastGeneratedFor: "",
-        }
-      );
+      const nameState: WorkspaceNamePersistedState = {
+        generatedIdentity: null,
+        manualName: draft.workspaceName,
+        autoGenerate: false,
+        lastGeneratedFor: "",
+      };
+      localStorage.setItem(getWorkspaceNameStateKey(scopeId), JSON.stringify(nameState));
     }
   }
 }

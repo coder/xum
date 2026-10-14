@@ -7,10 +7,8 @@ import { TestTempDir } from "@/node/services/tools/testHelpers";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { DEFAULT_CREATION_DRAFT_ID, MAX_DRAFT_JSON_BYTES } from "@/constants/drafts";
 import { draftTooLargeMessage, isDraftTooLargeError } from "@/common/utils/drafts";
-import {
-  WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS,
-  toStoredMessage,
-} from "@/common/utils/workspaceNameState";
+import { WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS } from "@/common/constants/storage";
+import { toStoredMessage } from "@/common/utils/workspaceNameState";
 import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import type {
   DraftAttachment,
@@ -1118,6 +1116,90 @@ describe("DraftService workspace name state", () => {
       text: "typed on the project page",
       nameState,
     });
+  });
+
+  it("answers a partial legacy import with the merged draft it stored", async () => {
+    using tempDir = new TestTempDir("drafts-name-import-merged");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    const bodyKept: DraftScope = { kind: "creation", projectPath, draftId: "body-kept" };
+    const nameKept: DraftScope = { kind: "creation", projectPath, draftId: "name-kept" };
+    await service.update({ scope: bodyKept, text: "newer backend text" });
+    await service.update({ scope: nameKept, nameState });
+
+    // A client applies the reply as the draft at its revision (a later same-revision change
+    // event is dropped as stale), so the reply must hold what was stored, not the legacy input.
+    const nameImport = await service.importLegacy({
+      scope: bodyKept,
+      text: "stale legacy text",
+      nameState,
+    });
+    expect(nameImport).toMatchObject({
+      result: "applied",
+      text: "newer backend text",
+      attachments: [],
+      nameState,
+    });
+    const other = { ...nameState, manualName: "legacy-name", autoGenerate: false };
+    const bodyImport = await service.importLegacy({
+      scope: nameKept,
+      text: "legacy text",
+      attachments: [image],
+      nameState: other,
+    });
+    expect(bodyImport).toMatchObject({
+      result: "applied",
+      text: "legacy text",
+      attachments: [{ id: image.id, mediaType: image.mediaType }],
+      nameState,
+    });
+    expect(nameImport.revision).toBe((await service.get(bodyKept)).revision);
+  });
+});
+
+describe("DraftService workspace name state size", () => {
+  const oversized = {
+    generatedIdentity: { name: "fix-a1b2", title: "t".repeat(MAX_DRAFT_JSON_BYTES) },
+    manualName: "",
+    autoGenerate: true,
+    lastGeneratedFor: "fix the sidebar",
+  };
+
+  async function rejection(write: Promise<unknown>): Promise<unknown> {
+    try {
+      await write;
+    } catch (error) {
+      return error;
+    }
+    return undefined;
+  }
+
+  it("refuses a write or legacy import whose name state makes the draft too large", async () => {
+    using tempDir = new TestTempDir("drafts-name-state-too-large");
+    const { config, projectPath } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    const scope: DraftScope = { kind: "creation", projectPath, draftId: "huge-name" };
+
+    expect(
+      isDraftTooLargeError(await rejection(service.update({ scope, nameState: oversized })))
+    ).toBe(true);
+    expect(
+      isDraftTooLargeError(
+        await rejection(service.importLegacy({ scope, text: "typed", nameState: oversized }))
+      )
+    ).toBe(true);
+    // A legacy name merged under a stored body counts that body too.
+    await service.update({ scope, text: "x".repeat(MAX_DRAFT_JSON_BYTES - 100) });
+    const nearLimitName = {
+      ...oversized,
+      generatedIdentity: { name: "n", title: "t".repeat(200) },
+    };
+    expect(
+      isDraftTooLargeError(
+        await rejection(service.importLegacy({ scope, nameState: nearLimitName }))
+      )
+    ).toBe(true);
+    expect((await new DraftService(config).get(scope)).nameState).toBeUndefined();
   });
 });
 

@@ -2,15 +2,19 @@ import {
   WorkspaceNamePersistedStateSchema,
   type WorkspaceNamePersistedState,
 } from "@/common/orpc/schemas/drafts";
+import {
+  WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS,
+  WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS,
+} from "@/common/constants/storage";
 import { truncateStringToChars } from "@/common/utils/truncateStringToChars";
 
-/** Name state stores at most this much (serialized) of the message it was generated for. */
-export const WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS = 2000;
-/**
- * Name state stores at most this much (serialized) of a typed manual name. Valid names are at
- * most 64 chars (validateWorkspaceBranchName), so only invalid names are cut.
- */
-export const WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS = 1024;
+/** Name state of a draft that has none yet. */
+export const DEFAULT_WORKSPACE_NAME_STATE: WorkspaceNamePersistedState = {
+  generatedIdentity: null,
+  manualName: "",
+  autoGenerate: true,
+  lastGeneratedFor: "",
+};
 
 /** FNV-1a (32-bit). Only detects changes past the stored prefix; not a security hash. */
 function hashMessage(message: string): string {

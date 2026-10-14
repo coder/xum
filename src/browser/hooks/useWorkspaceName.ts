@@ -9,7 +9,7 @@ import {
 } from "@/browser/stores/DraftStore";
 import type { WorkspaceIdentity, WorkspaceNamePersistedState } from "@/common/orpc/schemas/drafts";
 import type { NameGenerationError } from "@/common/types/errors";
-import { toStoredMessage } from "@/common/utils/workspaceNameState";
+import { DEFAULT_WORKSPACE_NAME_STATE, toStoredMessage } from "@/common/utils/workspaceNameState";
 import {
   validateWorkspaceBranchName,
   validateWorkspaceName,
@@ -84,13 +84,6 @@ export interface UseWorkspaceNameReturn extends WorkspaceNameState {
 /** Subscribed (never read) when the hook has no draft scope. */
 const NO_DRAFT_SCOPE: DraftStoreScope = { kind: "pending", projectPath: "" };
 
-const DEFAULT_PERSISTED_STATE: WorkspaceNamePersistedState = {
-  generatedIdentity: null,
-  manualName: "",
-  autoGenerate: true,
-  lastGeneratedFor: "",
-};
-
 /** The workspace name the creation form shows for persisted name state ("" when none). */
 export function getNameFromPersistedState(state: WorkspaceNamePersistedState | null): string {
   if (state === null) return "";
@@ -135,25 +128,38 @@ function useWorkspaceNameStorage(scope: DraftStoreScope | null) {
   // Always subscribe, but only *use* the draft when a scope is provided.
   const draft = useDraft(scope ?? NO_DRAFT_SCOPE);
   const hydrated = useDraftStoreHydrated();
-  const [localState, setLocalState] =
-    useState<WorkspaceNamePersistedState>(DEFAULT_PERSISTED_STATE);
-  // Callers build the scope inline: the setter reads the latest one, so it stays stable.
+  const [localState, setLocalState] = useState<WorkspaceNamePersistedState>(
+    DEFAULT_WORKSPACE_NAME_STATE
+  );
+  // Callers build the scope inline: the setters read the latest one, so they stay stable.
   const scopeRef = useRef(scope);
   scopeRef.current = scope;
-  const setStored = useCallback(
-    (update: (prev: WorkspaceNamePersistedState) => WorkspaceNamePersistedState) => {
-      const current = scopeRef.current;
-      if (current === null) {
+  const setStoredIn = useCallback(
+    (
+      target: DraftStoreScope | null,
+      update: (prev: WorkspaceNamePersistedState) => WorkspaceNamePersistedState
+    ) => {
+      if (target === null) {
         setLocalState(update);
         return;
       }
-      getDraftStore().setNameState(current, (prev) => update(prev ?? DEFAULT_PERSISTED_STATE));
+      getDraftStore().setNameState(target, (prev) => update(prev ?? DEFAULT_WORKSPACE_NAME_STATE));
     },
     []
   );
+  const setStored = useCallback(
+    (update: (prev: WorkspaceNamePersistedState) => WorkspaceNamePersistedState) =>
+      setStoredIn(scopeRef.current, update),
+    [setStoredIn]
+  );
+  // A generation writes to the draft it was started for: a draft switch renders the new scope
+  // before its effect cancels the request, so the latest scope may already be another draft.
+  const currentScope = useCallback(() => scopeRef.current, []);
   return {
-    stored: scope ? (draft.nameState ?? DEFAULT_PERSISTED_STATE) : localState,
+    stored: scope ? (draft.nameState ?? DEFAULT_WORKSPACE_NAME_STATE) : localState,
     setStored,
+    setStoredIn,
+    currentScope,
     scopeKey: scope === null ? null : draftStoreScopeKey(scope),
     canAutoGenerate: hydrated || !isBackendDraft(scope),
   };
@@ -190,7 +196,8 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
   const { api } = useAPI();
   const candidates = useMemo(() => buildNameGenCandidates(userModel), [userModel]);
 
-  const { stored, setStored, scopeKey, canAutoGenerate } = useWorkspaceNameStorage(scope);
+  const { stored, setStored, setStoredIn, currentScope, scopeKey, canAutoGenerate } =
+    useWorkspaceNameStorage(scope);
 
   const { generatedIdentity, manualName, autoGenerate, lastGeneratedFor } = stored;
 
@@ -198,8 +205,9 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
   const [error, setError] = useState<WorkspaceNameUIError | null>(null);
 
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Message pending in debounce timer (captured at schedule time)
+  // Message pending in debounce timer (captured at schedule time), and the draft it is for
   const pendingMessageRef = useRef<string>("");
+  const pendingScopeRef = useRef<DraftStoreScope | null>(null);
   // Generation request counter for cancellation
   const requestIdRef = useRef(0);
   // Current in-flight generation promise and its resolver
@@ -252,14 +260,22 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
   }, []);
 
   const generateIdentity = useCallback(
-    async (forMessage: string): Promise<WorkspaceIdentity | null> => {
+    async (
+      forMessage: string,
+      target: DraftStoreScope | null
+    ): Promise<WorkspaceIdentity | null> => {
       if (!api || !forMessage.trim()) {
         return null;
       }
 
       const requestId = ++requestIdRef.current;
       const storeIdentity = (identity: WorkspaceIdentity) =>
-        storeGeneratedIdentity(mountedRef, setStored, identity, forMessage);
+        storeGeneratedIdentity(
+          mountedRef,
+          (update) => setStoredIn(target, update),
+          identity,
+          forMessage
+        );
       setIsGenerating(true);
       setError(null);
 
@@ -320,7 +336,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
         }
       }
     },
-    [api, setStored, candidates]
+    [api, setStoredIn, candidates]
   );
 
   // Debounced generation effect
@@ -349,13 +365,14 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
 
     // Capture message for the debounced callback (avoid stale closure)
     pendingMessageRef.current = message;
+    pendingScopeRef.current = currentScope();
 
     // Debounce the generation
     debounceTimerRef.current = setTimeout(() => {
       const msg = pendingMessageRef.current;
       debounceTimerRef.current = null;
       pendingMessageRef.current = "";
-      void generateIdentity(msg);
+      void generateIdentity(msg, pendingScopeRef.current);
     }, debounceMs);
 
     return () => {
@@ -373,6 +390,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     debounceMs,
     generateIdentity,
     cancelPendingGeneration,
+    currentScope,
   ]);
 
   // When auto-generate is toggled, handle name preservation
@@ -429,7 +447,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
       const msg = pendingMessageRef.current;
       pendingMessageRef.current = "";
       if (msg.trim()) {
-        return generateIdentity(msg);
+        return generateIdentity(msg, pendingScopeRef.current);
       }
     }
 
@@ -445,11 +463,19 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
 
     // Otherwise generate a fresh identity for the current message
     if (message.trim()) {
-      return generateIdentity(message);
+      return generateIdentity(message, currentScope());
     }
 
     return null;
-  }, [autoGenerate, name, generatedIdentity, lastGeneratedFor, message, generateIdentity]);
+  }, [
+    autoGenerate,
+    name,
+    generatedIdentity,
+    lastGeneratedFor,
+    message,
+    generateIdentity,
+    currentScope,
+  ]);
 
   return useMemo(
     () => ({
