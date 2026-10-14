@@ -508,14 +508,26 @@ describe("generateWorkspaceIdentity candidate settings", () => {
     expect(createModelWithPinnedOptions).toHaveBeenCalledTimes(2);
   });
 
-  test("reports a failed request over a later candidate skipped for missing credentials", async () => {
-    const createModelWithPinnedOptions = mock((modelString: string) =>
-      Promise.resolve(
-        modelString.startsWith("openai:")
-          ? Err({ type: "api_key_not_found" as const, provider: "openai" })
+  test.each([
+    {
+      label: "a failed request over a later candidate skipped for missing credentials",
+      skippedProviders: ["openai"],
+      expected: { type: "service_unavailable", raw: "naming model unavailable" },
+    },
+    {
+      label: "the last skip when every candidate is skipped for missing credentials",
+      skippedProviders: ["anthropic", "openai"],
+      expected: { type: "authentication", authKind: "api_key_missing", provider: "openai" },
+    },
+  ])("reports $label", async (c) => {
+    const createModelWithPinnedOptions = mock((modelString: string) => {
+      const provider = modelString.split(":")[0] ?? modelString;
+      return Promise.resolve(
+        c.skippedProviders.some((skipped) => skipped === provider)
+          ? Err({ type: "api_key_not_found" as const, provider })
           : pinnedOptionsFor(modelString, createTitleModel(modelString))
-      )
-    );
+      );
+    });
     spyOn(aiSdk, "streamText").mockImplementation((() => {
       throw createApiCallError(500, "naming model unavailable");
     }) as unknown as typeof aiSdk.streamText);
@@ -528,10 +540,7 @@ describe("generateWorkspaceIdentity candidate settings", () => {
 
     expect(result.success).toBe(false);
     if (!result.success) {
-      expect(result.error).toEqual({
-        type: "service_unavailable",
-        raw: "naming model unavailable",
-      });
+      expect(result.error).toEqual(c.expected);
     }
     expect(createModelWithPinnedOptions).toHaveBeenCalledTimes(2);
   });

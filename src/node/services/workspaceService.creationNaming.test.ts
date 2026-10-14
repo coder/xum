@@ -12,6 +12,7 @@ import * as path from "node:path";
 import { WORKSPACE_NAME_GENERATION_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import { Err, Ok, type Result } from "@/common/types/result";
 import type { NameGenerationError } from "@/common/types/errors";
+import { formatNameGenerationError } from "@/common/utils/errors/formatNameGenerationError";
 import type { WorkspaceService } from "./workspaceService";
 import * as workspaceTitleGenerator from "./workspaceTitleGenerator";
 import {
@@ -28,6 +29,11 @@ type IdentityResult = Result<
 const GENERATED: IdentityResult = Ok({
   name: "sidebar-k3m9",
   title: "Fix sidebar layout",
+  modelUsed: "anthropic:claude-haiku-4-5",
+});
+const OTHER_GENERATED: IdentityResult = Ok({
+  name: "layout-x2p4",
+  title: "Rework layout",
   modelUsed: "anthropic:claude-haiku-4-5",
 });
 const NAME_REQUEST = { message: "Fix the sidebar layout", candidates: [] };
@@ -317,21 +323,80 @@ describe("create() with nameGeneration", () => {
     expect(generateIdentity).toHaveBeenCalledTimes(1);
   }, 30_000);
 
-  test("a fork made while the backend names its source waits for the generated title", async () => {
-    const naming = createDeferred<IdentityResult>();
-    generateIdentity.mockImplementation(() => naming.promise);
+  test("only one creation takes the form's naming request over", async () => {
+    const formRequest = createDeferred<IdentityResult>();
+    generateIdentity.mockImplementationOnce(() => formRequest.promise);
+    generateIdentity.mockResolvedValueOnce(OTHER_GENERATED);
+
+    const formNaming = service.generateDraftIdentity(NAME_REQUEST);
+    await until(() => generateIdentity.mock.calls.length === 1);
+    const first = await createNamed();
+    const second = await createNamed();
+    await waitForNamingStep(first.id);
+    await waitForNamingStep(second.id);
+    formRequest.resolve(GENERATED);
+    await harness.initStateManager.waitForInit(first.id);
+    await harness.initStateManager.waitForInit(second.id);
+
+    // One generated name for both would leave the second on its provisional branch.
+    expect(await readObserved(first.path)).toBe(`sidebar-k3m9 ${first.name}`);
+    expect(await readObserved(second.path)).toBe(`layout-x2p4 ${second.name}`);
+    expect(await formNaming).toEqual(GENERATED);
+  }, 30_000);
+
+  test("a creation sent after the form's naming request finished asks the model again", async () => {
+    generateIdentity.mockResolvedValueOnce(GENERATED);
+    generateIdentity.mockResolvedValueOnce(OTHER_GENERATED);
+
+    expect(await service.generateDraftIdentity(NAME_REQUEST)).toEqual(GENERATED);
+    const created = await createNamed();
+    await harness.initStateManager.waitForInit(created.id);
+
+    expect(await readObserved(created.path)).toBe(`layout-x2p4 ${created.name}`);
+    expect(generateIdentity).toHaveBeenCalledTimes(2);
+  }, 30_000);
+
+  test("a naming failure's init line gives the reason as the user reads it", async () => {
+    const error: NameGenerationError = {
+      type: "authentication",
+      authKind: "api_key_missing",
+      provider: "openai",
+    };
+    generateIdentity.mockResolvedValueOnce(Err(error));
 
     const created = await createNamed();
-    await waitForNamingStep(created.id);
-    const forked = service.fork(created.id);
-    naming.resolve(GENERATED);
-    const result = await forked;
-    if (!result.success) throw new Error(result.error);
     await harness.initStateManager.waitForInit(created.id);
-    await harness.initStateManager.waitForInit(result.data.metadata.id);
 
-    expect(result.data.metadata.title).toBe("Fix sidebar layout (1)");
+    expect(initLines(created.id)).toContain(
+      `Keeping branch ${created.name}: ${formatNameGenerationError(error).message}`
+    );
   }, 30_000);
+
+  test.each([
+    { label: "deferred checkout", awaitMaterialization: false },
+    { label: "eager checkout", awaitMaterialization: true },
+  ])(
+    "$label: a fork made while the backend names its source waits for the generated title",
+    async (c) => {
+      const naming = createDeferred<IdentityResult>();
+      generateIdentity.mockImplementation(() => naming.promise);
+
+      const created = await createNamed(c.awaitMaterialization);
+      await waitForNamingStep(created.id);
+      const forkStartedAt = Date.now();
+      const forked = service.fork(created.id);
+      naming.resolve(GENERATED);
+      const result = await forked;
+      if (!result.success) throw new Error(result.error);
+      // The wait ends once the branch is renamed, not at the naming deadline.
+      expect(Date.now() - forkStartedAt).toBeLessThan(WORKSPACE_NAME_GENERATION_TIMEOUT_MS);
+      await harness.initStateManager.waitForInit(created.id);
+      await harness.initStateManager.waitForInit(result.data.metadata.id);
+
+      expect(result.data.metadata.title).toBe("Fix sidebar layout (1)");
+    },
+    30_000
+  );
 
   test.each([
     { label: "a branch name", branchName: "feature", title: undefined, type: "worktree" },
