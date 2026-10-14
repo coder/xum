@@ -61,5 +61,7 @@ jobs:
             echo "Run $run_id has no Quality / CRAP job."
             exit 0
           fi
+          # GitHub also re-runs the jobs that need this one (Required), so in
+          # CRAP block mode the Required result follows the label too.
           gh run rerun "$run_id" --job "$job_id"
           echo "Re-ran Quality / CRAP: $GITHUB_SERVER_URL/$GH_REPO/actions/runs/$run_id"
