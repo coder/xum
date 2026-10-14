@@ -13,10 +13,20 @@ import {
   getInputKey,
   getAutoExpandPrefsKey,
   getPendingScopeId,
+  getWorkspaceNameStateKey,
   WORKSPACE_DRAFTS_BY_PROJECT_KEY,
 } from "@/common/constants/storage";
-import type { DraftAttachment, DraftEvent, DraftScope } from "@/common/orpc/schemas/drafts";
-import { DRAFT_STORE_READY_TIMEOUT_MS, MAX_DRAFT_JSON_BYTES } from "@/constants/drafts";
+import type {
+  DraftAttachment,
+  DraftEvent,
+  DraftScope,
+  WorkspaceNamePersistedState,
+} from "@/common/orpc/schemas/drafts";
+import {
+  DEFAULT_CREATION_DRAFT_ID,
+  DRAFT_STORE_READY_TIMEOUT_MS,
+  MAX_DRAFT_JSON_BYTES,
+} from "@/constants/drafts";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
 import { Config } from "@/node/config";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
@@ -24,8 +34,7 @@ import { DraftService } from "@/node/services/draftService";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
 import { TestTempDir } from "@/node/services/tools/testHelpers";
 import { installDom } from "../../../tests/ui/dom";
-import { getComposerDraftScope } from "@/browser/features/ChatInput/useComposerDraft";
-import { DraftStore, draftStoreScopeKey } from "./DraftStore";
+import { DraftStore } from "./DraftStore";
 
 // Older builds wrote these legacy keys; the key registry refuses them now, so seed them the way
 // an older build left them on disk.
@@ -35,6 +44,13 @@ function seedLegacyKey(key: string, value: unknown): void {
 
 const WS = "draft-store-ws";
 const WS_SCOPE: DraftScope = { kind: "workspace", workspaceId: WS };
+
+const NAME_STATE: WorkspaceNamePersistedState = {
+  generatedIdentity: { name: "fix-a1b2", title: "Fix the sidebar" },
+  manualName: "",
+  autoGenerate: true,
+  lastGeneratedFor: "fix the sidebar",
+};
 
 const image: DraftAttachment = {
   kind: "provider",
@@ -58,9 +74,15 @@ function createClient(service: DraftService) {
     /** Consumed one per putListEntry call, in call order. */
     listPutGates: [] as Array<Promise<void>>,
     updateGate: null as Promise<void> | null,
+    /** Held after the backend wrote (and pushed) the update, before the reply arrives. */
+    updateReplyGate: null as Promise<void> | null,
     getGate: null as Promise<void> | null,
     subscribeGate: null as Promise<void> | null,
     updates: 0,
+    listPuts: 0,
+    failMoves: 0,
+    /** Held before the backend runs a move. */
+    moveGate: null as Promise<void> | null,
   };
   const drafts = {
     list: () => service.list(),
@@ -79,7 +101,9 @@ function createClient(service: DraftService) {
         control.failUpdates--;
         throw new Error("update failed");
       }
-      return service.update(input);
+      const reply = await service.update(input);
+      await control.updateReplyGate;
+      return reply;
     },
     delete: async ({ scope }: { scope: DraftScope }) => {
       if (control.failDeletes > 0) {
@@ -95,7 +119,16 @@ function createClient(service: DraftService) {
       }
       return service.importLegacy(input);
     },
+    moveCreation: async (input: Parameters<DraftService["moveCreation"]>[0]) => {
+      await control.moveGate;
+      if (control.failMoves > 0) {
+        control.failMoves--;
+        throw new Error("move failed");
+      }
+      return service.moveCreation(input);
+    },
     putListEntry: async (entry: Parameters<DraftService["putListEntry"]>[0]) => {
+      control.listPuts++;
       await control.listPutGates.shift();
       if (control.failListPuts > 0) {
         control.failListPuts--;
@@ -170,6 +203,14 @@ async function waitFor(
     if (Date.now() > deadline) throw new Error("waitFor timed out");
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
+}
+
+/** The message `flush` rejects with, or "" when it resolves. */
+function flushError(store: DraftStore): Promise<string> {
+  return store.flush(WS_SCOPE).then(
+    () => "",
+    (error: unknown) => String(error)
+  );
 }
 
 let cleanupDom: (() => void) | undefined;
@@ -499,6 +540,34 @@ describe("DraftStore", () => {
     expect(store.getCreationDraftsByProject()[projectPath]).toBeUndefined();
   });
 
+  test("a delete that waits for a write is not undone by that write's push", async () => {
+    using tempDir = new TestTempDir("draft-store-delete-during-write");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    const scope: DraftScope = { kind: "creation", projectPath, draftId: "d1" };
+    let sendUpdate: () => void = () => undefined;
+    let sendReply: () => void = () => undefined;
+    control.updateGate = new Promise<void>((resolve) => {
+      sendUpdate = resolve;
+    });
+    control.updateReplyGate = new Promise<void>((resolve) => {
+      sendReply = resolve;
+    });
+    store.setText(scope, "submitted as a workspace");
+    const flushed = store.flush(scope);
+    await waitFor(() => control.updates === 1);
+    const deleted = store.deleteDraft(scope);
+    // The write lands after the delete started, and its push arrives before its reply.
+    sendUpdate();
+    await waitFor(async () => (await service.get(scope)).text.length > 0);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    sendReply();
+    await Promise.all([flushed, deleted]);
+    expect((await service.get(scope)).text).toBe("");
+    expect(store.getView(scope).text).toBe("");
+  });
+
   test("replaces a malformed legacy draft list, so its import still completes", async () => {
     using tempDir = new TestTempDir("draft-store-legacy-list-malformed");
     const { projectPath, service, client } = await createHarness(tempDir);
@@ -571,44 +640,6 @@ describe("DraftStore", () => {
     const store = createStore(client);
     await store.whenReady();
     expect((await service.get({ kind: "workspace", workspaceId })).text).toBe("underscored");
-  });
-
-  test("moves a draft only after the destination is saved", async () => {
-    using tempDir = new TestTempDir("draft-store-move");
-    const { projectPath, service, client, control } = await createHarness(tempDir);
-    const source: DraftScope = { kind: "creation", projectPath, draftId: "draft-a" };
-    await service.update({ scope: source, text: "moving" });
-    const store = createStore(client);
-    await store.whenReady();
-
-    control.failUpdates = 100;
-    expect(await store.moveDraft(source, WS_SCOPE)).toBe(false);
-    // A delete issued before the destination was saved would have landed by now.
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    expect((await service.get(source)).text).toBe("moving");
-
-    control.failUpdates = 0;
-    expect(await store.moveDraft(source, WS_SCOPE)).toBe(true);
-    expect((await service.get(WS_SCOPE)).text).toBe("moving");
-    expect((await service.get(source)).text).toBe("");
-  });
-
-  test("keeps a draft moved before the drafts loaded, when it only looked empty", async () => {
-    using tempDir = new TestTempDir("draft-store-move-unloaded");
-    const { projectPath, service, client, control } = await createHarness(tempDir);
-    const source: DraftScope = { kind: "creation", projectPath, draftId: "draft-a" };
-    await service.update({ scope: source, text: "not loaded yet" });
-    let releaseSubscribe: () => void = () => undefined;
-    control.subscribeGate = new Promise<void>((resolve) => {
-      releaseSubscribe = resolve;
-    });
-    const store = createStore(client);
-
-    const moved = store.moveDraft(source, { kind: "creation", projectPath, draftId: "draft-b" });
-    expect(await moved).toBe(false);
-    releaseSubscribe();
-    await store.whenReady();
-    expect((await service.get(source)).text).toBe("not loaded yet");
   });
 
   test("applies a queued attachment update when the server empties the list meanwhile", async () => {
@@ -876,97 +907,417 @@ describe("DraftStore", () => {
     expect(listPersistedKeys("input")).toEqual([]);
   });
 
-  test("keeps the source of a move that was edited while its payloads loaded", async () => {
-    using tempDir = new TestTempDir("draft-store-move-edit");
-    const { projectPath, service, client, control } = await createHarness(tempDir);
-    const source: DraftScope = { kind: "creation", projectPath, draftId: "draft-a" };
-    await service.update({ scope: source, text: "moving", attachments: [image] });
+  // #6438: a new backend (another process, its clock behind) numbers its revisions lower. The
+  // store kept the old backend's saved view, and a write reply below that view's revision put
+  // the old text back over what the user had just typed.
+  test("a write reply from a new backend with lower revisions keeps the typed text", async () => {
+    using tempDir = new TestTempDir("draft-store-new-backend");
+    const { config, client } = await createHarness(tempDir);
     const store = createStore(client);
     await store.whenReady();
+    store.setText(WS_SCOPE, "text on the old backend");
+    await store.flush(WS_SCOPE);
 
-    let release: () => void = () => undefined;
-    control.getGate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const moved = store.moveDraft(source, WS_SCOPE);
-    store.setText(source, "moving, edited");
-    release();
-    expect(await moved).toBe(false);
+    // The same drafts on disk, served by a new process whose revisions start lower.
+    const realNow = Date.now;
+    Date.now = () => realNow() - 3_600_000;
+    let service: DraftService;
+    try {
+      service = new DraftService(config);
+    } finally {
+      Date.now = realNow;
+    }
+    const next = createClient(service);
+    store.setClient(next.client);
+    await waitFor(() => next.control.updates === 0 && store.isHydrated());
 
-    expect(store.getText(source)).toBe("moving, edited");
-    await store.flush(source);
-    expect((await service.get(source)).text).toBe("moving, edited");
+    store.setText(WS_SCOPE, "typed after the switch");
+    await store.flush(WS_SCOPE);
+    expect(next.control.updates).toBeGreaterThan(0);
+    expect(store.getText(WS_SCOPE)).toBe("typed after the switch");
+    expect((await service.get(WS_SCOPE)).text).toBe("typed after the switch");
   });
 
-  // Another window's edit reaches this one as a server push, which bumps no local version.
-  const remoteEdits: ReadonlyArray<[string, { text?: string; attachments?: DraftAttachment[] }]> = [
-    ["text", { text: "edited elsewhere" }],
-    ["attachments", { attachments: [image] }],
-  ];
-  for (const [field, edit] of remoteEdits) {
-    test(`keeps the source of a move whose ${field} another window edited meanwhile`, async () => {
-      using tempDir = new TestTempDir("draft-store-move-remote-edit");
-      const { projectPath, service, client, control } = await createHarness(tempDir);
-      const source: DraftScope = { kind: "creation", projectPath, draftId: "draft-a" };
-      await service.update({ scope: source, text: "moving" });
-      const store = createStore(client);
-      await store.whenReady();
-
-      let release: () => void = () => undefined;
-      control.updateGate = new Promise<void>((resolve) => {
-        release = resolve;
-      });
-      const moved = store.moveDraft(source, WS_SCOPE);
-      await service.update({ scope: source, ...edit });
-      await waitFor(() => {
-        const view = store.getView(source);
-        return view.text !== "moving" || view.attachmentCount > 0;
-      });
-      release();
-      expect(await moved).toBe(false);
-
-      expect((await service.get(WS_SCOPE)).text).toBe("moving");
-      expect(await service.get(source)).toMatchObject(edit);
-    });
-  }
-
-  // The project page opened without a draft id: its text survived a reload in localStorage before
-  // drafts moved to the backend. When the first listed draft is created it takes over the text
-  // and the attachments, even ones whose payloads have not loaded yet.
-  test("saves the default creation composer's draft and moves it, attachments included", async () => {
-    using tempDir = new TestTempDir("draft-store-default-creation");
-    const { projectPath, service, client } = await createHarness(tempDir);
-    const scope = getComposerDraftScope({
-      variant: "creation",
-      workspaceId: null,
-      creationProjectPath: projectPath,
-    });
-    const first = createStore(client);
-    await first.whenReady();
-    first.setText(scope, "typed before reload");
-    first.setAttachments(scope, [image]);
-    await first.flush(scope);
-    first.setClient(null);
-
-    // Reload: a new store hydrates from the backend.
+  // #6438, review round 3: an edit saved to a new backend before its snapshot arrived. That
+  // reply was compared with the old backend's view, lost to it, and the old text came back. Each
+  // subscription start forgets the old views, so the reply is taken as it comes.
+  test("an edit saved to a new backend before its snapshot keeps the typed text", async () => {
+    using tempDir = new TestTempDir("draft-store-new-backend-early-write");
+    const { config, client } = await createHarness(tempDir);
     const store = createStore(client);
     await store.whenReady();
-    expect(store.getView(scope)).toMatchObject({
+    store.setText(WS_SCOPE, "text on the old backend");
+    await store.flush(WS_SCOPE);
+
+    const realNow = Date.now;
+    Date.now = () => realNow() - 3_600_000;
+    let service: DraftService;
+    try {
+      service = new DraftService(config);
+    } finally {
+      Date.now = realNow;
+    }
+    const next = createClient(service);
+    let releaseSnapshot: () => void = () => undefined;
+    next.control.subscribeGate = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    store.setClient(next.client);
+
+    store.setText(WS_SCOPE, "typed after the switch");
+    await store.flush(WS_SCOPE);
+    expect(next.control.updates).toBeGreaterThan(0);
+    expect(store.getText(WS_SCOPE)).toBe("typed after the switch");
+
+    releaseSnapshot();
+    await waitFor(() => store.isHydrated());
+    await store.flush(WS_SCOPE);
+    expect(store.getText(WS_SCOPE)).toBe("typed after the switch");
+    expect((await service.get(WS_SCOPE)).text).toBe("typed after the switch");
+    store.setText(WS_SCOPE, "typed later");
+    await store.flush(WS_SCOPE);
+    expect(store.getText(WS_SCOPE)).toBe("typed later");
+    expect((await service.get(WS_SCOPE)).text).toBe("typed later");
+  });
+
+  // #6438: forgetting the views on a reconnect must not touch what the composer shows.
+  test("a reconnect to the same backend keeps showing the draft until its snapshot", async () => {
+    using tempDir = new TestTempDir("draft-store-reconnect-view");
+    const { client, control } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    store.setText(WS_SCOPE, "saved text");
+    store.setAttachments(WS_SCOPE, [image]);
+    await store.flush(WS_SCOPE);
+
+    store.setClient(null);
+    let releaseSnapshot: () => void = () => undefined;
+    control.subscribeGate = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    store.setClient(client);
+    const view = store.getView(WS_SCOPE);
+    expect([view.text, view.attachments.map(({ id }) => id)]).toEqual(["saved text", ["img-1"]]);
+    releaseSnapshot();
+    await waitFor(() => store.isHydrated());
+    expect(store.getText(WS_SCOPE)).toBe("saved text");
+  });
+
+  // #6438: the reset at a reconnect forgets the backend's views, never an unsaved edit.
+  test("unsaved typing survives a reconnect and is saved after the snapshot", async () => {
+    using tempDir = new TestTempDir("draft-store-reconnect-unsaved");
+    const { client, control, service } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    store.setText(WS_SCOPE, "saved text");
+    await store.flush(WS_SCOPE);
+
+    control.failUpdates = 100;
+    store.setText(WS_SCOPE, "unsaved typing");
+    expect(await flushError(store)).toContain("update failed");
+    store.setClient(null);
+    store.setClient(client);
+    // The snapshot still holds the saved text.
+    await waitFor(() => store.isHydrated());
+    expect(store.getText(WS_SCOPE)).toBe("unsaved typing");
+    control.failUpdates = 0;
+    await store.flush(WS_SCOPE);
+    expect((await service.get(WS_SCOPE)).text).toBe("unsaved typing");
+  });
+
+  // #6438, the same switch with a write in flight: the old backend's late reply confirmed the
+  // edit, so it was never written to the new backend (lost on reload), and its view (the old
+  // backend's higher revision) again outranked every later reply of the new one.
+  test("an edit whose write was in flight when the backend changed reaches the new backend", async () => {
+    using oldDir = new TestTempDir("draft-store-old-backend");
+    using newDir = new TestTempDir("draft-store-switched-backend");
+    const old = await createHarness(oldDir);
+    const store = createStore(old.client);
+    await store.whenReady();
+    let release: () => void = () => undefined;
+    old.control.updateGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    store.setText(WS_SCOPE, "typed during the switch");
+    const inFlight = store.flush(WS_SCOPE).catch(() => undefined);
+    await waitFor(() => old.control.updates === 1);
+
+    const next = await createHarness(newDir);
+    let releaseSnapshot: () => void = () => undefined;
+    next.control.subscribeGate = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    store.setClient(next.client);
+    // The old backend answers before the new one's snapshot.
+    release();
+    await inFlight;
+    releaseSnapshot();
+    await waitFor(() => store.isHydrated());
+    await store.flush(WS_SCOPE);
+    expect((await next.service.get(WS_SCOPE)).text).toBe("typed during the switch");
+
+    store.setText(WS_SCOPE, "typed later");
+    await store.flush(WS_SCOPE);
+    expect(store.getText(WS_SCOPE)).toBe("typed later");
+  });
+
+  test("keeps an unsaved name edit over a push, saves it, and shows other windows' names", async () => {
+    using tempDir = new TestTempDir("draft-store-name-state");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const scope: DraftScope = { kind: "creation", projectPath, draftId: "named" };
+    const mine = { ...NAME_STATE, manualName: "this-window", autoGenerate: false };
+    const store = createStore(client);
+    const other = createStore(client);
+    await store.whenReady();
+    await other.whenReady();
+
+    control.updateGate = new Promise(() => undefined);
+    store.setNameState(scope, mine);
+    // Another window saves a name while this window's edit is unsaved: the edit stays shown.
+    await service.update({ scope, nameState: NAME_STATE });
+    await waitFor(() => other.getView(scope).nameState !== null);
+    expect(store.getView(scope).nameState).toEqual(mine);
+
+    control.updateGate = null;
+    await store.flush(scope);
+    expect((await service.get(scope)).nameState).toEqual(mine);
+    await waitFor(() => other.getView(scope).nameState?.manualName === "this-window");
+    // Clearing it removes the name from the body, not the body's text.
+    await service.update({ scope, text: "kept" });
+    store.setNameState(scope, null);
+    await store.flush(scope);
+    expect(await service.get(scope)).toMatchObject({ text: "kept" });
+    expect((await service.get(scope)).nameState).toBeUndefined();
+  });
+
+  test("imports legacy name keys into their drafts and removes a key only once the backend answered", async () => {
+    using tempDir = new TestTempDir("draft-store-legacy-names");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const listed: DraftScope = { kind: "creation", projectPath, draftId: "draft-a" };
+    const defaultScope: DraftScope = {
+      kind: "creation",
+      projectPath,
+      draftId: DEFAULT_CREATION_DRAFT_ID,
+    };
+    const listedKey = getWorkspaceNameStateKey(getDraftScopeId(projectPath, "draft-a"));
+    const pendingKey = getWorkspaceNameStateKey(getPendingScopeId(projectPath));
+    seedLegacyKey(listedKey, NAME_STATE);
+    seedLegacyKey(pendingKey, { ...NAME_STATE, manualName: "default-name", autoGenerate: false });
+
+    control.failImports = 100;
+    const failing = createStore(client);
+    await failing.whenReady();
+    expect(listPersistedKeys("workspaceNameState:").sort()).toEqual([listedKey, pendingKey].sort());
+    // Shown meanwhile, so the name is never lost while its import is retried.
+    expect(failing.getView(listed).nameState).toEqual(NAME_STATE);
+    failing.setClient(null);
+
+    control.failImports = 0;
+    const store = createStore(client);
+    await store.whenReady();
+    expect(listPersistedKeys("workspaceNameState:")).toEqual([]);
+    expect((await service.get(listed)).nameState).toEqual(NAME_STATE);
+    expect((await service.get(defaultScope)).nameState?.manualName).toBe("default-name");
+    expect(store.getView(defaultScope).nameState?.manualName).toBe("default-name");
+  });
+
+  test("moves the default draft in one step and shows the destination at once", async () => {
+    using tempDir = new TestTempDir("draft-store-move-creation");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const source: DraftScope = {
+      kind: "creation",
+      projectPath,
+      draftId: DEFAULT_CREATION_DRAFT_ID,
+    };
+    await service.update({ scope: source, text: "typed before reload", attachments: [image] });
+    await service.update({ scope: source, nameState: NAME_STATE });
+    // A reload: the source's attachment payloads have not loaded.
+    const store = createStore(client);
+    await store.whenReady();
+    const row = { projectPath, draftId: "first-listed", subProjectPath: null, createdAt: 5 };
+    const dest: DraftScope = { kind: "creation", projectPath, draftId: "first-listed" };
+    const updatesBefore = control.updates;
+
+    const moved = store.moveCreationDraft(source, row);
+    expect(store.getView(dest)).toMatchObject({
       text: "typed before reload",
       attachmentCount: 1,
-      payloadsLoaded: false,
+      nameState: NAME_STATE,
     });
+    expect(store.getCreationDraftsByProject()[projectPath]).toEqual([
+      { draftId: "first-listed", subProjectPath: null, createdAt: 5 },
+    ]);
+    expect(await moved).toBe(true);
 
-    const listed: DraftScope = { kind: "creation", projectPath, draftId: "first-listed" };
-    expect(await store.moveDraft(scope, listed)).toBe(true);
-    expect(await service.get(listed)).toMatchObject({
+    expect(await service.get(dest)).toMatchObject({
       text: "typed before reload",
       attachments: [image],
+      nameState: NAME_STATE,
     });
+    expect((await service.get(source)).text).toBe("");
+    expect((await service.getList()).entries).toEqual([row]);
+    // No separate body write or list put: the move did both.
+    expect(control.updates).toBe(updatesBefore);
+    expect(control.listPuts).toBe(0);
+  });
+
+  test("a destination's payload load before the move's reply waits for the move", async () => {
+    using tempDir = new TestTempDir("draft-store-move-payloads");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const source: DraftScope = { kind: "creation", projectPath, draftId: "src" };
+    await service.update({ scope: source, text: "with an image", attachments: [image] });
+    // A reload: the source's attachment payloads have not loaded.
+    const store = createStore(client);
+    await store.whenReady();
+    let release: () => void = () => undefined;
+    control.moveGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const dest: DraftScope = { kind: "creation", projectPath, draftId: "dst" };
+
+    const moved = store.moveCreationDraft(source, {
+      projectPath,
+      draftId: "dst",
+      subProjectPath: null,
+      createdAt: 1,
+    });
+    // The destination's composer loads its payloads while the backend has no destination yet.
+    const loaded = store.ensurePayloads(dest);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    release();
+    await moved;
+    await loaded;
+
+    expect(store.getView(dest)).toMatchObject({ attachmentCount: 1, payloadsLoaded: true });
+    expect(store.getAttachments(dest)).toEqual([image]);
+  });
+
+  test("holds a destination edit until the move's reply and saves it after", async () => {
+    using tempDir = new TestTempDir("draft-store-move-hold");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const source: DraftScope = { kind: "creation", projectPath, draftId: "src" };
+    await service.putListEntry({ projectPath, draftId: "src", subProjectPath: null, createdAt: 1 });
+    await service.update({ scope: source, text: "draft" });
+    const store = createStore(client);
+    await store.whenReady();
+    let release: () => void = () => undefined;
+    control.moveGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const row = { projectPath, draftId: "dst", subProjectPath: null, createdAt: 1 };
+    const dest: DraftScope = { kind: "creation", projectPath, draftId: "dst" };
+
+    const moved = store.moveCreationDraft(source, row);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    store.setText(dest, "draft, edited");
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    expect(control.updates).toBe(0);
+    // The source's row is hidden while the move runs.
+    expect(store.getCreationDraftsByProject()[projectPath]?.map(({ draftId }) => draftId)).toEqual([
+      "dst",
+    ]);
+    release();
+    await moved;
+    await store.flush(dest);
+
+    expect((await service.get(dest)).text).toBe("draft, edited");
+    expect(store.getView(dest).text).toBe("draft, edited");
+  });
+
+  test("moves another window's edit made during the move", async () => {
+    using tempDir = new TestTempDir("draft-store-move-changed");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const source: DraftScope = {
+      kind: "creation",
+      projectPath,
+      draftId: DEFAULT_CREATION_DRAFT_ID,
+    };
+    await service.update({ scope: source, text: "mine" });
+    const store = createStore(client);
+    await store.whenReady();
+    let release: () => void = () => undefined;
+    control.moveGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const dest: DraftScope = { kind: "creation", projectPath, draftId: "dst" };
+
+    const moved = store.moveCreationDraft(source, {
+      projectPath,
+      draftId: "dst",
+      subProjectPath: null,
+      createdAt: 1,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // Another window types into the source after this one flushed it.
+    await service.update({ scope: source, text: "mine and theirs" });
+    control.moveGate = null;
+    release();
+
+    expect(await moved).toBe(true);
+    expect((await service.get(dest)).text).toBe("mine and theirs");
+    expect(store.getView(dest).text).toBe("mine and theirs");
+    expect((await service.get(source)).text).toBe("");
+  });
+
+  test("a failed move keeps an edited destination as its own draft, and the source", async () => {
+    using tempDir = new TestTempDir("draft-store-move-fail-edited");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const source: DraftScope = { kind: "creation", projectPath, draftId: "src" };
+    await service.putListEntry({ projectPath, draftId: "src", subProjectPath: null, createdAt: 1 });
+    await service.update({ scope: source, text: "draft", nameState: NAME_STATE });
+    const store = createStore(client);
+    await store.whenReady();
+    let release: () => void = () => undefined;
+    control.moveGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    control.failMoves = 1;
+    const dest: DraftScope = { kind: "creation", projectPath, draftId: "dst" };
+
+    const moved = store.moveCreationDraft(source, {
+      projectPath,
+      draftId: "dst",
+      subProjectPath: null,
+      createdAt: 2,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    store.setText(dest, "draft, edited");
+    release();
+    expect(await moved).toBe(false);
+    await store.flush(dest);
+    await waitFor(async () => (await service.getList()).entries.length === 2);
+
+    expect(await service.get(dest)).toMatchObject({ text: "draft, edited", nameState: NAME_STATE });
+    expect((await service.get(source)).text).toBe("draft");
+    expect(store.getView(source).text).toBe("draft");
+  });
+
+  test("a failed move without edits drops the destination and shows the source again", async () => {
+    using tempDir = new TestTempDir("draft-store-move-fail");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const source: DraftScope = { kind: "creation", projectPath, draftId: "src" };
+    await service.putListEntry({ projectPath, draftId: "src", subProjectPath: null, createdAt: 1 });
+    await service.update({ scope: source, text: "draft" });
+    const store = createStore(client);
+    await store.whenReady();
+    control.failMoves = 1;
+    const dest: DraftScope = { kind: "creation", projectPath, draftId: "dst" };
+
     expect(
-      (await service.list()).some(
-        (draft) => draftStoreScopeKey(draft.scope) === draftStoreScopeKey(scope)
-      )
+      await store.moveCreationDraft(source, {
+        projectPath,
+        draftId: "dst",
+        subProjectPath: null,
+        createdAt: 2,
+      })
     ).toBe(false);
+
+    expect(store.getView(dest).text).toBe("");
+    expect(store.getView(source).text).toBe("draft");
+    expect(store.getCreationDraftsByProject()[projectPath]?.map(({ draftId }) => draftId)).toEqual([
+      "src",
+    ]);
+    expect((await service.get(source)).text).toBe("draft");
+    expect((await service.getList()).entries.map(({ draftId }) => draftId)).toEqual(["src"]);
   });
 });

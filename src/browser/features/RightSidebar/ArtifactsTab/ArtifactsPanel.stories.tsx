@@ -1080,7 +1080,8 @@ function DesktopApiStub(props: { children: ReactNode }) {
 function renderMcpAppView(
   html: string = MCP_APP_VIEW_HTML,
   // A non-https host is never granted, so it is listed as not granted.
-  csp: McpAppView["csp"] = { resourceDomains: ["http://tiles.example.com"] }
+  csp: McpAppView["csp"] = { resourceDomains: ["http://tiles.example.com"] },
+  approveViewDomainsError?: string
 ) {
   openMcpAppViewTab(WORKSPACE_ID, {
     toolCallId: MCP_APP_TOOL_CALL_ID,
@@ -1117,6 +1118,7 @@ function renderMcpAppView(
             input.consented
               ? { status: "ok", result: { content: [{ type: "text", text: "Sunny tomorrow" }] } }
               : { status: "consent_required" },
+          approveViewDomainsError,
         },
       })}
     >
@@ -1159,6 +1161,81 @@ export const McpAppViewPhone: Story = {
   ...PHONE,
   render: () => renderMcpAppView(),
   play: ({ canvasElement }) => playMcpAppView(canvasElement),
+};
+
+/**
+ * #6165: Maximize pins the app tab over the whole window (the spec's fullscreen), with the same
+ * frame (no reload), and Restore returns it to the sidebar. Play only (shared Pixel cap).
+ */
+export const McpAppViewMaximized: Story = {
+  ...LAPTOP,
+  render: () => renderMcpAppView(),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const frame = await canvas.findByTestId("mcp-app-frame");
+    const panel = canvas.getByTestId("app-view-tab-panel");
+    const sidebarWidth = panel.getBoundingClientRect().width;
+    await userEvent.click(canvas.getByRole("button", { name: "Maximize view" }));
+    await waitFor(() => expect(panel.getBoundingClientRect().width).toBe(window.innerWidth));
+    await expect(canvas.getByTestId("mcp-app-frame")).toBe(frame);
+    await userEvent.click(canvas.getByRole("button", { name: "Restore view" }));
+    await waitFor(() => expect(panel.getBoundingClientRect().width).toBe(sidebarWidth));
+    await expect(canvas.getByTestId("mcp-app-frame")).toBe(frame);
+  },
+};
+
+// A tab whose view failed to load offers Reload. The mock has no view for the call at first (the
+// load fails); the play adds it and presses Reload, which remounts the frame.
+const RELOAD_TOOL_CALL_ID = "call-weather-reload";
+const reloadViews: Record<string, McpAppView> = {};
+function renderMcpAppViewReload() {
+  delete reloadViews[RELOAD_TOOL_CALL_ID];
+  openMcpAppViewTab(WORKSPACE_ID, {
+    toolCallId: RELOAD_TOOL_CALL_ID,
+    serverName: "weather",
+    resourceUri: "ui://weather/view.html",
+    toolName: "show_weather",
+    label: "Show weather",
+    arguments: { city: "Berlin" },
+    cancelled: false,
+    failed: false,
+  });
+  return (
+    <APIProvider client={createMockORPCClient({ mcpApps: { views: reloadViews } })}>
+      {/* Pinned to a phone's sidebar width: the test runner plays at desktop size. */}
+      <div data-testid="phone-width" className="bg-sidebar h-screen" style={{ width: 358 }}>
+        <AppViewTabPanel
+          workspaceId={WORKSPACE_ID}
+          toolCallId={RELOAD_TOOL_CALL_ID}
+          onClose={() => undefined}
+        />
+      </div>
+    </APIProvider>
+  );
+}
+/** Failed load, then Reload: Play only (the stack adds no Pixel snapshots, shared cap). */
+export const McpAppViewReloadPhone: Story = {
+  ...PHONE,
+  render: () => renderMcpAppViewReload(),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByText(/No view for call-weather-reload/);
+    const reload = canvas.getByRole("button", { name: "Reload" });
+    // The button stays inside the narrow tab.
+    const tab = canvas.getByTestId("phone-width").getBoundingClientRect();
+    await expect(reload.getBoundingClientRect().right).toBeLessThanOrEqual(tab.right);
+    reloadViews[RELOAD_TOOL_CALL_ID] = {
+      html: "<p>Berlin</p>",
+      csp: {},
+      prefersBorder: null,
+      resultAvailable: true,
+      result: { content: [{ type: "text", text: "Berlin: 18°C" }] },
+      approvalProjectPath: "/repo",
+      invocation: null,
+    };
+    await userEvent.click(reload);
+    await canvas.findByTestId("mcp-app-frame");
+  },
 };
 
 // A view that declares https domains asks once per server; until then it runs on the base policy.
@@ -1215,6 +1292,34 @@ export const McpAppViewDomainsAllow: Story = {
       await expect(csp).toContain("https://cdn.example.com");
     });
     await expect(strip.isConnected).toBe(false);
+  },
+};
+
+// A failed Allow keeps the strip with its error, so Allow can retry (phone width: the error and
+// both buttons fit).
+export const McpAppViewDomainsAllowFailsPhone: Story = {
+  globals: { viewport: { value: "phone390", isRotated: false } },
+  parameters: { pixel: PIXEL_DISABLED },
+  // The test-runner ignores viewport globals, so the wrapper keeps the play at phone width.
+  render: () => (
+    <div style={{ width: 375, maxWidth: "100%", height: "100%" }}>
+      {renderMcpAppView(MCP_APP_VIEW_HTML, DOMAINS_CSP, "Could not write the project config")}
+    </div>
+  ),
+  play: async ({ canvasElement }) => {
+    const strip = await findDomainsStrip(canvasElement);
+    const allow = within(strip).getByRole("button", { name: "Allow" });
+    await waitFor(() => expect(allow).toBeEnabled(), { timeout: 5000 });
+    await userEvent.click(allow);
+    await within(canvasElement).findByText(/Could not allow the domains: Could not write/);
+    await waitFor(() => expect(allow).toBeEnabled());
+    await expect(within(strip).getByRole("button", { name: "Not now" })).toBeEnabled();
+    const csp = within(canvasElement).getByTestId("mcp-app-frame").getAttribute("srcdoc") ?? "";
+    await expect(csp).not.toContain("https://api.example.com");
+    // The strip and its buttons fit the phone width.
+    await expect(strip.getBoundingClientRect().right).toBeLessThanOrEqual(375);
+    await expect(strip.scrollWidth).toBeLessThanOrEqual(strip.clientWidth);
+    await expect(allow.getBoundingClientRect().right).toBeLessThanOrEqual(375);
   },
 };
 

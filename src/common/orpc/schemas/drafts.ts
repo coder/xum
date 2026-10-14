@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { DRAFT_ID_PATTERN } from "@/constants/drafts";
+import { DEFAULT_CREATION_DRAFT_ID, DRAFT_ID_PATTERN } from "@/constants/drafts";
 import { SendIdSchema, SendMessageOptionsSchema } from "./stream";
 
 /**
@@ -10,13 +10,15 @@ import { SendIdSchema, SendMessageOptionsSchema } from "./stream";
  * a draft id uses a fixed draft id (see defaultCreationDraftScope). The legacy renderer pending
  * scope (getPendingScopeId) is never a backend scope.
  */
+const CreationDraftScopeSchema = z.object({
+  kind: z.literal("creation"),
+  projectPath: z.string().min(1),
+  draftId: z.string().regex(DRAFT_ID_PATTERN),
+});
+
 export const DraftScopeSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("workspace"), workspaceId: z.string().min(1) }),
-  z.object({
-    kind: z.literal("creation"),
-    projectPath: z.string().min(1),
-    draftId: z.string().regex(DRAFT_ID_PATTERN),
-  }),
+  CreationDraftScopeSchema,
 ]);
 
 const ProviderDraftAttachmentSchema = z.object({
@@ -107,6 +109,25 @@ export const PendingSendSchema = z.object({
   }),
 });
 
+/** A generated workspace identity: a short git-safe name and a human-readable title. */
+export const WorkspaceIdentitySchema = z.object({
+  /** Short git-safe name with suffix (e.g., "plan-a1b2") */
+  name: z.string(),
+  /** Human-readable title (e.g., "Fix plan mode over SSH") */
+  title: z.string(),
+});
+
+/**
+ * A creation draft's workspace name state (useWorkspaceName), stored in the draft body next to
+ * its text so both move and persist together. Bounded by boundWorkspaceNamePersistedState.
+ */
+export const WorkspaceNamePersistedStateSchema = z.object({
+  generatedIdentity: WorkspaceIdentitySchema.nullable(),
+  manualName: z.string(),
+  autoGenerate: z.boolean(),
+  lastGeneratedFor: z.string(),
+});
+
 /**
  * Per-scope monotonic revision, bumped on every persisted change. Scopes start at the backend
  * process start time, so a restarted backend does not regress below the previous one in practice.
@@ -123,11 +144,13 @@ export const DraftSummarySchema = z.object({
   text: z.string(),
   attachments: z.array(DraftAttachmentMetadataSchema),
   pendingSends: z.array(PendingSendSchema).optional(),
+  nameState: WorkspaceNamePersistedStateSchema.optional(),
   revision: DraftRevisionSchema,
 });
 
 export const DraftGetOutputSchema = DraftSchema.extend({
   pendingSends: z.array(PendingSendSchema).optional(),
+  nameState: WorkspaceNamePersistedStateSchema.optional(),
   revision: DraftRevisionSchema,
 });
 
@@ -157,6 +180,8 @@ export const DraftUpdateInputSchema = z.object({
   // the VISIBLE part: the backend keeps what pending sends retain.
   text: z.string().optional(),
   attachments: z.array(DraftAttachmentSchema).optional(),
+  // Omitted keeps the stored name state, null clears it.
+  nameState: WorkspaceNamePersistedStateSchema.nullable().optional(),
   basisSends: z.array(BasisSendSchema).max(1000).optional(),
 });
 
@@ -166,6 +191,7 @@ export const DraftWriteOutputSchema = z.object({
   text: z.string(),
   attachments: z.array(DraftAttachmentMetadataSchema),
   pendingSends: z.array(PendingSendSchema).optional(),
+  nameState: WorkspaceNamePersistedStateSchema.optional(),
 });
 
 const WorkspaceDraftScopeSchema = z.object({
@@ -183,6 +209,12 @@ export const DraftBeginSendInputSchema = z.object({
    * instead of two before the send); the backend then takes the sent text out of it.
    */
   text: z.string().optional(),
+  /**
+   * #6405: the sender's visible text, the sent text followed only by keys typed after Enter. When
+   * the backend's visible text (after `text` is merged in) is exactly this, it takes exactly the
+   * sent prefix (takeSentText). Otherwise only the whitespace rule applies.
+   */
+  typedAfterSendText: z.string().optional(),
   /** As for drafts.update: the pending sends the sender's unsaved text was written against. */
   basisSends: z.array(BasisSendSchema).max(1000).optional(),
 });
@@ -243,6 +275,35 @@ export const DraftListEntrySchema = z.object({
   createdAt: z.number(),
 });
 
+/**
+ * Move a creation draft (the project's default draft or a listed one) to a new listed draft, in
+ * the same project or another: body and list row together, then the source is deleted.
+ */
+export const DraftMoveCreationInputSchema = z.object({
+  source: CreationDraftScopeSchema,
+  /** The source revision the client last confirmed; null when it knows of no stored source. */
+  sourceRevision: DraftRevisionSchema.nullable(),
+  /** A fresh draft id the client minted: a retry after a lost reply must find only its move. */
+  dest: CreationDraftScopeSchema.refine((scope) => scope.draftId !== DEFAULT_CREATION_DRAFT_ID, {
+    message: "The default creation draft is never a move destination",
+  }),
+  subProjectPath: z.string().min(1).nullable(),
+  createdAt: z.number(),
+});
+
+/**
+ * "moved": the destination's stored view and the list revision. "changed": the source changed
+ * since `sourceRevision` (its current revision); nothing was written.
+ */
+export const DraftMoveCreationOutputSchema = z.discriminatedUnion("result", [
+  z.object({
+    result: z.literal("moved"),
+    dest: DraftWriteOutputSchema,
+    listRevision: DraftRevisionSchema,
+  }),
+  z.object({ result: z.literal("changed"), revision: DraftRevisionSchema }),
+]);
+
 /** A creation draft deleted by a project removal (never the default draft). */
 export const RemovedCreationDraftSchema = DraftListEntrySchema.pick({
   projectPath: true,
@@ -272,6 +333,8 @@ export const DraftEventSchema = z.discriminatedUnion("type", [
 ]);
 
 export type DraftScope = z.infer<typeof DraftScopeSchema>;
+export type WorkspaceIdentity = z.infer<typeof WorkspaceIdentitySchema>;
+export type WorkspaceNamePersistedState = z.infer<typeof WorkspaceNamePersistedStateSchema>;
 export type DraftAttachment = z.infer<typeof DraftAttachmentSchema>;
 export type DraftAttachmentMetadata = z.infer<typeof DraftAttachmentMetadataSchema>;
 export type Draft = z.infer<typeof DraftSchema>;
@@ -290,4 +353,6 @@ export type DraftImportLegacyOutput = z.infer<typeof DraftImportLegacyOutputSche
 export type DraftEvent = z.infer<typeof DraftEventSchema>;
 export type DraftListEntry = z.infer<typeof DraftListEntrySchema>;
 export type DraftList = z.infer<typeof DraftListSchema>;
+export type DraftMoveCreationInput = z.infer<typeof DraftMoveCreationInputSchema>;
+export type DraftMoveCreationOutput = z.infer<typeof DraftMoveCreationOutputSchema>;
 export type RemovedCreationDraft = z.infer<typeof RemovedCreationDraftSchema>;

@@ -1506,6 +1506,9 @@ async function main(): Promise<number> {
                 run: () => backgroundProcessManager.terminateAll(),
               },
             ]),
+        // Hygiene, as in ServiceContainer.dispose: the watches are non-persistent, so they
+        // never hold the process open, but no callback reaches torn-down services.
+        { name: "config.stopWatchingConfigFile", run: () => config.stopWatchingConfigFile() },
         // Last: release the Effect runtime that owns the core graph.
         { name: "appRuntime.dispose", run: () => disposeAppRuntime(coreRuntime.managed) },
       ],

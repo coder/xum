@@ -8,6 +8,7 @@ import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useAPI } from "@/browser/contexts/API";
 import { cn } from "@/common/lib/utils";
 import type { MCPServerIdentity, MCPServerInfo, WorkspaceMCPOverrides } from "@/common/types/mcp";
+import type { MCPSettingsReadSnapshot } from "@/common/utils/mcpSettings";
 import {
   Dialog,
   DialogContent,
@@ -17,6 +18,8 @@ import {
 import { useMCPTestCache } from "@/browser/hooks/useMCPTestCache";
 import {
   applySavedSettings,
+  countSettingsSave,
+  isDialogSaveBlocked,
   SettingsRequests,
   type ServerSettingsEntry,
   type SettingsRequestScope,
@@ -88,6 +91,10 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
   const savedEnabledServers = useRef(new Set<string>());
   // One rule for every settings result (read or save): only a server's latest request applies.
   const [settingsRequests] = useState(() => new SettingsRequests());
+  // Servers whose settings save is in flight. Refresh Tools waits for it: its settings read
+  // would take a newer request ID, could show the pre-save values, and drop the save's result.
+  // A count, not a flag: a save started after a reopen can overlap one from before it.
+  const [savingSettings, setSavingSettings] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   // Mounted settings sections by server name (ref callbacks drop unmounted ones).
@@ -362,6 +369,27 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
     });
   }, []);
 
+  /** A settings save of `serverName` starts; the returned callback settles it. */
+  const beginSettingsSave = (serverName: string) => {
+    setSavingSettings((prev) => countSettingsSave(prev, serverName, 1));
+    const request = settingsRequests.take(settingsRequests.current(), serverName);
+    return (snapshot: MCPSettingsReadSnapshot | null) => {
+      setSavingSettings((prev) => countSettingsSave(prev, serverName, -1));
+      if (snapshot !== null && request.isLatest())
+        setServerSettings((prev) => applySavedSettings(prev, serverName, request.id, snapshot));
+    };
+  };
+
+  /**
+   * A settings tool action of `serverName` starts; the returned callback settles it. It counts
+   * like a save, so Refresh Tools waits: a refresh remounts the section, which would drop the
+   * run's result while the tool still runs (the user could run a writing tool twice).
+   */
+  const beginSettingsToolRun = (serverName: string) => {
+    setSavingSettings((prev) => countSettingsSave(prev, serverName, 1));
+    return () => setSavingSettings((prev) => countSettingsSave(prev, serverName, -1));
+  };
+
   // Save overrides
   const handleSave = useCallback(async () => {
     if (!api || overridesRevision === null) return;
@@ -446,7 +474,10 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                 <Button variant="ghost" onClick={() => onOpenChange(false)}>
                   Cancel
                 </Button>
-                <Button onClick={() => void handleSave()} disabled={saving}>
+                <Button
+                  onClick={() => void handleSave()}
+                  disabled={isDialogSaveBlocked(saving, savingSettings)}
+                >
                   {saving ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
                   Save
                 </Button>
@@ -538,7 +569,9 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                           // Safari lets a flex-item button shrink below its nowrap label.
                           className="shrink-0"
                           onClick={() => void fetchTools(name)}
-                          disabled={isLoadingTools}
+                          disabled={
+                            isLoadingTools === true || getOwn(savingSettings, name) !== undefined
+                          }
                         >
                           {isLoadingTools ? (
                             <Loader2 className="h-4 w-4 animate-spin" />
@@ -573,23 +606,15 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                       <div className="text-content-secondary mt-2 text-sm">No tools available</div>
                     )}
 
-                    {effectivelyEnabled &&
-                      (() => {
-                        const entry = getOwn(serverSettings, name);
-                        if (entry === undefined) return null;
-                        if ("error" in entry)
-                          return (
-                            <div className="text-content-secondary mt-4 border-t pt-4 text-xs wrap-anywhere">
-                              Settings unavailable: {entry.error}
-                            </div>
-                          );
-                        if ("notConnected" in entry)
-                          return (
-                            <div className="text-content-secondary mt-4 border-t pt-4 text-xs">
-                              Connect the server to see its settings
-                            </div>
-                          );
-                        return (
+                    {(() => {
+                      const entry = getOwn(serverSettings, name);
+                      if (entry === undefined) return null;
+                      if (!("snapshot" in entry))
+                        return <ServerSettingsNote entry={entry} hidden={!effectivelyEnabled} />;
+                      // Hidden, not unmounted, while the server is switched off: the section
+                      // keeps its draft, and the dialog's Save still sees the unsaved edit.
+                      return (
+                        <div hidden={!effectivelyEnabled}>
                           <MCPServerSettingsSection
                             key={entry.fetchId}
                             ref={(section) => {
@@ -599,21 +624,13 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                             workspaceId={workspaceId}
                             serverName={name}
                             snapshot={entry.snapshot}
-                            beginSave={() => {
-                              const request = settingsRequests.take(
-                                settingsRequests.current(),
-                                name
-                              );
-                              return (values) => {
-                                if (request.isLatest())
-                                  setServerSettings((prev) =>
-                                    applySavedSettings(prev, name, values)
-                                  );
-                              };
-                            }}
+                            beginSave={() => beginSettingsSave(name)}
+                            beginToolRun={() => beginSettingsToolRun(name)}
+                            refreshing={isLoadingTools === true}
                           />
-                        );
-                      })()}
+                        </div>
+                      );
+                    })()}
                   </div>
                 );
               })}
@@ -624,3 +641,23 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
     </Dialog>
   );
 };
+
+/** A server's settings note when no snapshot is shown: a failed read, or a server not running. */
+function ServerSettingsNote(props: {
+  entry: { error: string } | { notConnected: true };
+  /** The server is switched off in this dialog. */
+  hidden: boolean;
+}) {
+  if (props.hidden) return null;
+  if ("error" in props.entry)
+    return (
+      <div className="text-content-secondary mt-4 border-t pt-4 text-xs wrap-anywhere">
+        Settings unavailable: {props.entry.error}
+      </div>
+    );
+  return (
+    <div className="text-content-secondary mt-4 border-t pt-4 text-xs">
+      Connect the server to see its settings
+    </div>
+  );
+}

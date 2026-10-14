@@ -56,6 +56,7 @@ export const CommandIds = {
   navOpenLogFile: () => "nav:open-log-file" as const,
   navOpenArtifacts: () => "nav:open-artifacts" as const,
   navOpenAppView: (toolCallId: string) => `nav:open-app-view:${toolCallId}` as const,
+  navReloadAppView: (toolCallId: string) => `nav:reload-app-view:${toolCallId}` as const,
   navOpenAppEntrypoint: (viewKey: string) => `nav:open-app-entrypoint:${viewKey}` as const,
   navOpenFileAsArtifact: () => "nav:open-file-as-artifact" as const,
 
@@ -117,8 +118,10 @@ export const CommandIds = {
 
   // Agent Plugin commands
   pluginsInstall: () => "plugins:install" as const,
+  mcpAppsRevokeViewDomains: () => "mcp-apps:revoke-view-domains" as const,
   pluginsManageComponents: () => "plugins:manage-components" as const,
   pluginsReviewHooks: () => "plugins:review-hooks" as const,
+  pluginsReviewComponents: () => "plugins:review-components" as const,
   pluginsUninstall: () => "plugins:uninstall" as const,
   pluginsCheckUpdates: () => "plugins:check-updates" as const,
   pluginsUpdateAll: () => "plugins:update-all" as const,

@@ -4013,7 +4013,8 @@ export class WorkspaceService
     // Only removal may interrupt the file checkout itself: archive aborts init too but keeps
     // the checkout registered and never reruns it, so parking a half-populated worktree
     // would strand it. Archive awaits this settlement, so it parks complete files; every
-    // phase after them (hooks, .xumignore, fast-forward, submodules) honours its abort.
+    // other phase (the origin fetch before them; hooks, .xumignore, fast-forward, submodules
+    // after them) honours its abort.
     const checkoutAbort = new AbortController();
     const forwardRemovalAbort = () => {
       if (this.removingWorkspaces.has(workspaceId)) checkoutAbort.abort();

@@ -740,9 +740,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     }
 
     const bashOutputGroup = bashOutputGroupInfos[targetIndex];
-    const bashGroupKey = bashOutputGroup
-      ? deferredMessages[bashOutputGroup.firstIndex]?.id
-      : undefined;
+    const bashGroupKey = bashOutputGroup?.groupKey;
     if (bashGroupKey && !expandedBashGroups.has(bashGroupKey)) {
       expandBashGroup(bashGroupKey);
       return;
@@ -1449,7 +1447,6 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     const rowProps = getTranscriptRowProps({
       derivations: transcriptRowDerivations,
       userMessageNavigationByHistoryId,
-      messages: deferredMessages,
       message,
       index,
     });

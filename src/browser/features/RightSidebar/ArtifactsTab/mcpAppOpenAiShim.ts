@@ -1,7 +1,7 @@
 /**
  * ChatGPT compatibility for MCP Apps views: `window.openai` (Apps SDK) on top of the standard
  * MCP Apps bridge, so a view built for ChatGPT renders in Xum. Injected as the second script of
- * every view document, after MCP_APP_PREAMBLE_SCRIPT and before any view script.
+ * every view document, after mcpAppPreambleScript (mcpAppCsp.ts) and before any view script.
  *
  * SECURITY AUDIT: the shim adds no host power. It runs inside the view's own sandboxed document
  * (same opaque origin, same CSP) and only posts JSON-RPC messages the view could post itself
@@ -15,13 +15,24 @@
  * Handshake: standard views initialize themselves, and the shim reads the host's replies and
  * notifications passively. The shim sends its own ui/initialize only when the view first uses
  * `window.openai` and no handshake was seen yet, so a standard-only view gets no extra
- * handshake. The host sends the tool lifecycle (tool-input, tool-result or tool-cancelled) once
- * per frame, so if the view's own client connects after the shim, the shim replays the
- * lifecycle it received to that client, in this page, and leaves teardown replies to it.
- * Members without a standard equivalent warn once; their Promises reject and nothing throws. setWidgetState updates window.openai.widgetState in this page only: the state
- * lasts as long as the frame (a collapsed card or a move to the tab starts with null). Optional
+ * handshake. A widget that only listens for `openai:set_globals` never reads a global, so the
+ * shim also connects once the page loaded, if no client did by then.
+ * The host sends the tool lifecycle (tool-input, tool-result or tool-cancelled) once per frame.
+ * If the view's own client connects after the shim, the shim replays to it, in this page, the
+ * lifecycle messages that arrived before that client sent its ui/initialize: the client's
+ * listener is in place from then on (the ext-apps SDK starts its transport before it sends
+ * initialize), so it gets every later message from the host itself. The shim sees that moment
+ * because it wraps `window.parent.postMessage` (the document's port, mcpAppDocumentChannel.ts).
+ * Each lifecycle message is cached as a copy, so a widget that mutates its globals does not
+ * change what its client is replayed. The shim leaves teardown replies to that client.
+ * Members without a standard equivalent warn once; their Promises reject and nothing throws.
+ * setWidgetState updates window.openai.widgetState at once and sends the state to the host
+ * (xum/widget-state, the newest of a burst at most every 100 ms), which stores it in the view's
+ * result record. The next document of the same
+ * view instance (a remount, a move to the tab, an app restart) starts with it (#6178). Optional
  * extensions Xum lacks (uploadFile, selectFiles, getFileDownloadUrl, requestCheckout,
- * requestModal) are absent, so `if (window.openai?.selectFiles)` takes the view's fallback.
+ * requestModal, setOpenInAppUrl) are absent, so `if (window.openai?.selectFiles)` takes the
+ * view's fallback.
  * Shapes: https://developers.openai.com/plugins/reference.md and the Apps SDK example types.
  */
 /**
@@ -36,6 +47,12 @@ export interface McpAppOpenAiSeed {
   platform: string;
   /** The inline cap; null in a panel, whose frame is as tall as its container. */
   maxHeight: number | null;
+  /**
+   * The state this view instance last stored with setWidgetState (mcpAppWidgetState.ts), or
+   * null. The only seed value that comes from the view: it is the view's own data, read back by
+   * the same instance.
+   */
+  widgetState?: unknown;
 }
 
 export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
@@ -49,13 +66,21 @@ export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
     locale: seed.locale,
     platform: seed.platform,
     ...(seed.maxHeight != null ? { containerDimensions: { maxHeight: seed.maxHeight } } : {}),
-  })
+    widgetState: seed.widgetState,
+  });
+  // SECURITY AUDIT: the seed as a JS string literal (JSON.stringify of the JSON text), escaped as
+  // described above, so neither "</script>" nor U+2028/U+2029 can end the script or the literal.
+  const seedString = JSON.stringify(seedJson)
     .replace(/</g, "\\u003c")
     .replace(/\u2028/g, "\\u2028")
     .replace(/\u2029/g, "\\u2029");
   return `(function () {
   "use strict";
   var parentWindow = window.parent;
+  var send = parentWindow.postMessage;
+  var copy = typeof structuredClone === "function"
+    ? structuredClone
+    : function (value) { return JSON.parse(JSON.stringify(value)); };
   var dispatch = window.dispatchEvent.bind(window);
   var CustomEventCtor = window.CustomEvent;
   var MessageEventCtor = window.MessageEvent;
@@ -68,8 +93,10 @@ export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
   var ownHandshake = false;
   // A handshake reply that was not the shim's: the view's own MCP Apps client is connected.
   var standardClient = false;
-  // The tool lifecycle as the host sent it ({ data, origin }), for a client that connects late.
+  // The tool lifecycle as the host sent it ({ data, origin }, copies), for a late client.
   var lifecycle = [];
+  // lifecycle.length when the view's own client sent its ui/initialize; null before that.
+  var clientBoundary = null;
   var replaying = false;
   var warned = {};
   var globals = {
@@ -86,13 +113,47 @@ export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
     toolResponseMetadata: null,
     widgetState: null
   };
-  var seeded = fromHostContext(${seedJson});
+  // Parsed, not a JS literal: a "__proto__" key in the widget state stays an own property.
+  var seedValues = JSON.parse(${seedString});
+  var seeded = fromHostContext(seedValues);
   for (var seedKey in seeded) globals[seedKey] = seeded[seedKey];
+  // JSON drops an undefined seed: the Apps SDK's "no state" is null.
+  globals.widgetState = seedValues.widgetState === undefined ? null : seedValues.widgetState;
   setLang(globals.locale);
 
   function post(message) {
-    parentWindow.postMessage(message, "*");
+    send.call(parentWindow, message, "*");
   }
+  // xum/widget-state: the first state of a burst goes out at once (a collapse right after one
+  // call must not drop it), later ones at most every WIDGET_STATE_INTERVAL_MS with the newest
+  // state, so a slider drag stays under the document channel's rate limit.
+  var WIDGET_STATE_INTERVAL_MS = 100;
+  var widgetStateTimer = null;
+  var widgetStatePending = false;
+  var widgetStateNewest = null;
+  function sendWidgetState(value) {
+    widgetStateNewest = value;
+    if (widgetStateTimer !== null) {
+      widgetStatePending = true;
+      return;
+    }
+    post({ jsonrpc: "2.0", method: "xum/widget-state", params: { state: value } });
+    widgetStateTimer = setTimer(function () {
+      widgetStateTimer = null;
+      if (!widgetStatePending) return;
+      widgetStatePending = false;
+      sendWidgetState(widgetStateNewest);
+    }, WIDGET_STATE_INTERVAL_MS);
+  }
+  // Every message the view posts goes through here; the shim's own posts do not.
+  try {
+    parentWindow.postMessage = function (message) {
+      if (clientBoundary === null && message && message.method === "ui/initialize") {
+        clientBoundary = lifecycle.length;
+      }
+      return send.apply(parentWindow, arguments);
+    };
+  } catch (error) {}
   function setLang(locale) {
     try { document.documentElement.lang = locale; } catch (error) {}
   }
@@ -131,14 +192,14 @@ export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
   // After this task, so the client has handled its initialize reply and sent initialized.
   // Page-local: nothing reaches the host, and later messages reach the client directly.
   function replayLifecycle() {
-    var messages = lifecycle.slice();
+    var messages = lifecycle.slice(0, clientBoundary === null ? lifecycle.length : clientBoundary);
     if (messages.length === 0) return;
     setTimer(function () {
       replaying = true;
       try {
         messages.forEach(function (message) {
           dispatch(new MessageEventCtor("message", {
-            data: message.data,
+            data: copy(message.data),
             origin: message.origin,
             source: parentWindow
           }));
@@ -175,7 +236,7 @@ export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
       data.method === "ui/notifications/tool-result" ||
       data.method === "ui/notifications/tool-cancelled"
     ) {
-      lifecycle.push({ data: data, origin: event.origin });
+      lifecycle.push({ data: copy(data), origin: event.origin });
     }
     switch (data.method) {
       case "ui/notifications/tool-input":
@@ -210,7 +271,7 @@ export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
     });
   }
   function connect() {
-    if (handshakeSeen || ownHandshake) return;
+    if (handshakeSeen || ownHandshake || clientBoundary !== null) return;
     ownHandshake = true;
     request("ui/initialize", {
       protocolVersion: "2026-01-26",
@@ -259,11 +320,10 @@ export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
       request("ui/open-link", { url: String((args && args.href) || "") }).catch(function () {});
     },
     setWidgetState: function (state) {
-      setGlobals({ widgetState: state === undefined ? null : state });
+      var value = state === undefined ? null : state;
+      setGlobals({ widgetState: value });
+      sendWidgetState(value);
       return Promise.resolve();
-    },
-    setOpenInAppUrl: function () {
-      warnOnce("setOpenInAppUrl");
     }
   };
   // requestClose is a plain runtime API in the reference (views call it unguarded), so it gets
@@ -285,5 +345,12 @@ export function mcpAppOpenAiShimScript(seed: McpAppOpenAiSeed): string {
   try {
     Object.defineProperty(window, "openai", { value: api, writable: true, configurable: true });
   } catch (error) {}
+  // After load, and after the view's own load handlers and their tasks: a standard client had
+  // its chance to connect, so an event-only widget gets the shim's handshake.
+  function connectAfterLoad() {
+    setTimer(connect, 0);
+  }
+  if (document.readyState === "complete") connectAfterLoad();
+  else window.addEventListener("load", connectAfterLoad);
 })();`;
 }

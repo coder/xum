@@ -94,7 +94,9 @@ describe("ProjectContext", () => {
     // The draft list never hydrated in this renderer, so only the backend knows the draft ids.
     const scopeId = getDraftScopeId("/alpha", "d1");
     const keys = [getAutoExpandPrefsKey(scopeId), getWorkspaceNameStateKey(scopeId)];
-    for (const key of keys) updatePersistedState(key, "value");
+    updatePersistedState(keys[0], "value");
+    // A legacy name key not imported yet; the key registry refuses new writes to it.
+    window.localStorage.setItem(keys[1], JSON.stringify("value"));
 
     await act(async () => {
       await ctx().removeProject("/alpha");

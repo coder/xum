@@ -24,6 +24,7 @@ import {
   MAX_PLUGIN_MANIFEST_BYTES,
   readPluginFileWithinRootCapped,
 } from "./discovery";
+import { serverConsentFingerprint } from "./componentConsent";
 import { expandPluginPlaceholders, type PluginPlaceholderValues } from "./expansion";
 import {
   PLUGIN_MCP_CONFIG_PARSE_ERROR,
@@ -533,6 +534,36 @@ function normalizeRemoteEntry(
   };
 }
 
+/** Normalize one (translated) entry by its transport; a translation error skips it. */
+async function normalizeServerEntry(
+  translated: ReturnType<typeof translateCodexMcpEntry>,
+  ctx: NormalizeContext
+): Promise<{ info: MCPServerInfo } | { error: string } | { skip: string }> {
+  if (translated.error !== undefined) return { error: translated.error };
+  const entry = translated.entry;
+  if (entry.type === "streamable-http" || entry.type === "sse")
+    return normalizeRemoteEntry(entry, ctx);
+  if (entry.type !== "stdio")
+    return { error: `unknown server 'type' ${JSON.stringify(entry.type)}` };
+  const result = await normalizeStdioEntry(entry, ctx);
+  if ("info" in result && translated.forwardEnv !== undefined)
+    result.info.forwardEnv = translated.forwardEnv;
+  return result;
+}
+
+/**
+ * Why a server entry cannot load at all, before dialect handling. `__proto__` is refused because
+ * the registry's consent record (a `z.record`) drops that key on parse (#6534): the server could
+ * never keep its review, so it is skipped with a diagnostic instead of staying unreviewable.
+ */
+function checkServerEntryShape(
+  serverName: string,
+  rawEntry: unknown
+): { rawEntry: Record<string, unknown> } | { error: string } {
+  if (serverName === "__proto__") return { error: "the server name '__proto__' is reserved" };
+  return isPlainObject(rawEntry) ? { rawEntry } : { error: "server entry must be an object" };
+}
+
 /**
  * Load and normalize a plugin's `mcp.json` into default-disabled Xum server
  * records keyed by `plugin:<instanceId>:<serverName>`. The instance ID
@@ -645,7 +676,7 @@ export async function loadPluginMcpServers(
     vars: { PLUGIN_ROOT: plugin.rootPath, PLUGIN_DATA: dataPath },
   };
 
-  for (const [serverName, rawEntry] of Object.entries(doc.mcpServers)) {
+  for (const [serverName, rawEntryValue] of Object.entries(doc.mcpServers)) {
     // Filter before registration: saved workspace overrides cannot resurrect an unimported server.
     if (
       plugin.importedComponents != null &&
@@ -664,10 +695,12 @@ export async function loadPluginMcpServers(
       });
     };
 
-    if (!isPlainObject(rawEntry)) {
-      reportEntry("error", "server entry must be an object");
+    const shape = checkServerEntryShape(serverName, rawEntryValue);
+    if ("error" in shape) {
+      reportEntry("error", shape.error);
       continue;
     }
+    const { rawEntry } = shape;
     const codex = codexDialect
       ? translateCodexMcpEntry(rawEntry)
       : { entry: rawEntry, ignored: [], warnings: [], hasClientSecret: false };
@@ -675,16 +708,7 @@ export async function loadPluginMcpServers(
 
     // §7.2.2 rules 3-4: invalid entries and unknown transports are skipped
     // individually; sibling servers keep loading.
-    let result: { info: MCPServerInfo } | { error: string } | { skip: string };
-    if (entry.type === "stdio") {
-      result = await normalizeStdioEntry(entry, normalizeCtx);
-    } else if (entry.type === "streamable-http" || entry.type === "sse") {
-      result = normalizeRemoteEntry(entry, normalizeCtx);
-    } else {
-      reportEntry("error", `unknown server 'type' ${JSON.stringify(entry.type)}`);
-      continue;
-    }
-
+    const result = await normalizeServerEntry(codex, normalizeCtx);
     if ("error" in result) {
       reportEntry("error", result.error);
       continue;
@@ -735,6 +759,12 @@ export async function loadPluginMcpServers(
     );
     info.plugin.serverName = serverName;
     if (plugin.componentPolicy !== undefined) info.plugin.componentPolicy = plugin.componentPolicy;
+    // The fingerprint of what will launch (#6498). The lexical install path is a root spelling
+    // too: the install review normalized it, and a manifest can name it literally.
+    info.plugin.consentFingerprint = serverConsentFingerprint(info, {
+      rootPaths: [plugin.rootPath, path.join(plugin.containerPath, plugin.dirName)],
+      dataPaths: [dataPath],
+    });
     servers[buildPluginServerKey(instanceId, serverName)] = info;
   }
 

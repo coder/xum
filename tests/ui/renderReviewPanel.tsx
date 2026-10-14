@@ -85,6 +85,12 @@ export function renderApp(props: RenderReviewPanelParams): RenderedApp {
     async selectTab(tab: "costs" | "review" | "terminal"): Promise<void> {
       await waitFor(
         () => {
+          // Selecting a tool is an explicit open action even when chats start collapsed.
+          result.container
+            .querySelector<HTMLElement>(
+              '[aria-label="Workspace insights"] button[aria-label="Expand sidebar"]'
+            )
+            ?.click();
           // Find tab button by role and name
           const tabButton = result.container.querySelector<HTMLElement>(
             `[role="tab"][aria-controls*="${tab}"]`

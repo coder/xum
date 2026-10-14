@@ -1,6 +1,9 @@
 import { useEffect, useState } from "react";
 import { useAPI } from "@/browser/contexts/API";
-import { publishMcpAppViewDomains } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewDomainsStore";
+import {
+  revokeMcpAppViewDomains,
+  useMcpAppViewDomainsVersion,
+} from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewDomainsStore";
 import type { McpAppViewDomains } from "@/common/orpc/schemas/mcpApps";
 import { getErrorMessage } from "@/common/utils/errors";
 
@@ -15,47 +18,73 @@ export interface McpAppViewDomainsRevokeError {
   message: string;
 }
 
-export function useMcpAppViewDomains() {
+/**
+ * The stored approvals. Re-listed after every Allow or Revoke in this renderer (the palette's
+ * too), and on Retry. A failed load is kept with a Retry: an empty list would hide approvals the
+ * user can revoke (#6181).
+ */
+function useStoredMcpAppViewDomains() {
   const { api } = useAPI();
   const [entries, setEntries] = useState<McpAppViewDomains[]>([]);
-  const [revokeError, setRevokeError] = useState<McpAppViewDomainsRevokeError | null>(null);
-  const [tick, setTick] = useState(0);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const version = useMcpAppViewDomainsVersion();
+  const [retries, setRetries] = useState(0);
   useEffect(() => {
     if (!api) return;
     let cancelled = false;
     api.mcpApps
       .listViewDomains()
       .then((list) => {
-        if (!cancelled) setEntries(list);
+        if (cancelled) return;
+        setEntries(list);
+        setLoadError(null);
       })
-      // The section works without approvals; a failed read just lists none.
-      .catch(() => undefined);
+      .catch((error: unknown) => {
+        if (!cancelled) setLoadError(getErrorMessage(error));
+      });
     return () => {
       cancelled = true;
     };
-  }, [api, tick]);
+  }, [api, version, retries]);
+  return { entries, loadError, retry: () => setRetries((value) => value + 1) };
+}
+
+export function useMcpAppViewDomains() {
+  const { api } = useAPI();
+  const stored = useStoredMcpAppViewDomains();
+  const [revokeError, setRevokeError] = useState<McpAppViewDomainsRevokeError | null>(null);
   return {
-    entries,
+    ...stored,
     revokeError,
     revoke: async (entry: Pick<McpAppViewDomains, "projectPath" | "serverName">) => {
       if (!api) return;
-      let revision: number;
-      try {
-        ({ revision } = await api.mcpApps.revokeViewDomains({
-          projectPath: entry.projectPath,
-          serverName: entry.serverName,
-        }));
-      } catch (error) {
-        setRevokeError({ ...entry, message: getErrorMessage(error) });
-        return;
-      }
-      setRevokeError(null);
-      // Mounted views of this server reload at once under the base policy (and ask again). An
-      // approval committed after this revoke has a newer revision, so it still applies.
-      publishMcpAppViewDomains(entry.projectPath, entry.serverName, [], revision);
-      setTick((value) => value + 1);
+      const error = await revokeMcpAppViewDomains(api, entry);
+      setRevokeError(error == null ? null : { ...entry, message: error });
     },
   };
+}
+
+/** A failed load of the approvals, with a Retry. */
+export function McpAppViewDomainsLoadError(props: { error: string | null; onRetry: () => void }) {
+  if (props.error == null) return null;
+  return (
+    // An alert, so a screen reader announces a failure that appears after the section rendered.
+    <div
+      role="alert"
+      className="border-border-medium flex min-w-0 items-center gap-2 border-t px-3 py-2 text-xs"
+    >
+      <div className="text-danger min-w-0 flex-1 break-words">
+        Could not load allowed view domains: {props.error}
+      </div>
+      <button
+        type="button"
+        onClick={props.onRetry}
+        className="border-border-light focus-visible:ring-accent shrink-0 rounded border px-2 py-0.5 focus-visible:ring-1"
+      >
+        Retry
+      </button>
+    </div>
+  );
 }
 
 /**

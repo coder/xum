@@ -7,6 +7,17 @@
  * with a warning, never fatal, so one bad field does not hide the others.
  */
 
+import type { z } from "zod";
+import type {
+  MCPSettingSchemaSchema,
+  MCPSettingsGroupSchema,
+  MCPSettingsLayoutItemSchema,
+  MCPSettingsOpenAppResultSchema,
+  MCPSettingsSnapshotSchema,
+  MCPSettingsToolActionSchema,
+  MCPSettingValueSchema,
+} from "@/common/orpc/schemas/mcp";
+
 export const MCP_SETTINGS_CAPABILITY = "openai/settings";
 /** Request `_meta` key telling the server which Xum workspace the settings belong to. */
 export const MCP_SETTINGS_WORKSPACE_META_KEY = "xum/workspaceId";
@@ -16,33 +27,20 @@ export interface MCPSettingsCapability {
   updateTool: string;
 }
 
-export type MCPSettingValue = string | number | boolean;
+// Derived from the IPC schemas (type-only import), so the snapshot this module builds and
+// the schema that carries it over IPC cannot drift: a change to either side is a type error.
+export type MCPSettingValue = z.infer<typeof MCPSettingValueSchema>;
+export type MCPSettingSchema = z.infer<typeof MCPSettingSchemaSchema>;
+export type MCPSettingsLayoutItem = z.infer<typeof MCPSettingsLayoutItemSchema>;
+export type MCPSettingsGroup = z.infer<typeof MCPSettingsGroupSchema>;
+export type MCPSettingsSnapshot = z.infer<typeof MCPSettingsSnapshotSchema>;
+export type MCPSettingsToolAction = z.infer<typeof MCPSettingsToolActionSchema>;
 
-export type MCPSettingSchema = { title: string; description?: string } & (
-  | { type: "boolean" }
-  // No `pattern`: Xum never runs a server's regex (see parseSchema).
-  | { type: "string"; enum?: string[]; minLength?: number; maxLength?: number }
-  | { type: "number" | "integer"; minimum?: number; maximum?: number; multipleOf?: number }
-);
+/** A settings layout tool action's opened MCP App: what the modal mounts (McpAppViewRef). */
+export type MCPSettingsAppView = z.infer<typeof MCPSettingsOpenAppResultSchema>;
 
-export type MCPSettingsLayoutItem =
-  | { kind: "property"; property: string }
-  | { kind: "tool"; tool: string; description?: string };
-
-export interface MCPSettingsGroup {
-  title: string;
-  items: MCPSettingsLayoutItem[];
-}
-
-export interface MCPSettingsSnapshot {
-  properties: Record<string, MCPSettingSchema>;
-  values: Record<string, MCPSettingValue>;
-  /** Layout groups in order; properties no group lists go last, in "Other settings". */
-  layout: MCPSettingsGroup[];
-  warnings: string[];
-  /** Schema properties dropped (unsupported schema or no valid value); the UI notes them. */
-  droppedSettingCount: number;
-}
+/** Longest tool action result text sent to the renderer (UTF-16 units). */
+export const MAX_MCP_SETTINGS_TOOL_RESULT = 4096;
 
 const MAX_TEXT = 1024;
 const MAX_VALUE_LENGTH = 4096;
@@ -53,6 +51,15 @@ const MAX_LAYOUT_GROUPS = 20;
 const MAX_GROUP_ITEMS = 100;
 /** Options one Select can show; a setting with more is dropped (counted as not shown). */
 export const MAX_MCP_SETTING_ENUM_OPTIONS = 100;
+/**
+ * Enum budget for one snapshot, over all its settings: per-enum caps alone still let 100
+ * settings send 10,000 options of 1,024 characters (about 10 MB over IPC, 10,000 rendered
+ * options). Settings past either total are dropped, in `Object.entries` order (integer-like
+ * names first, then declaration order). One full enum fits.
+ */
+export const MAX_MCP_SETTINGS_ENUM_OPTIONS_TOTAL = 1_000;
+/** Total enum option text of one snapshot, in UTF-16 units (as MAX_TEXT counts). */
+export const MAX_MCP_SETTINGS_ENUM_TEXT = 128 * 1024;
 /** Longest setting name, in code points: names are React keys and cross IPC. Longer = dropped. */
 export const MAX_MCP_SETTING_NAME = 128;
 /** Settings tool timeout in the dialog's bulk read: one hung server must not hold back the rest. */
@@ -63,8 +70,17 @@ export const MCP_SETTINGS_READ_TIMEOUT_MS = 10_000;
  * on a code point. Server error text is untrusted and otherwise unbounded.
  */
 export function boundMCPSettingsError(message: string): string {
-  if (message.length <= MAX_TEXT) return message;
-  const cut = message.slice(0, MAX_TEXT);
+  return boundText(message, MAX_TEXT);
+}
+
+/** A tool action's result text as sent to the renderer: MAX_MCP_SETTINGS_TOOL_RESULT at most. */
+export function boundMCPSettingsToolResult(text: string): string {
+  return boundText(text, MAX_MCP_SETTINGS_TOOL_RESULT);
+}
+
+function boundText(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const cut = text.slice(0, max);
   return `${/[\uD800-\uDBFF]$/.test(cut) ? cut.slice(0, -1) : cut}…`;
 }
 
@@ -223,6 +239,31 @@ export function filterMCPSettingValues(
   return values;
 }
 
+/** Drop (with its value) each setting whose enum would pass the snapshot's enum budget. */
+function dropSettingsOverEnumBudget(
+  properties: Record<string, MCPSettingSchema>,
+  values: Record<string, MCPSettingValue>,
+  warnings: string[]
+): void {
+  let options = 0;
+  let text = 0;
+  for (const [name, schema] of Object.entries(properties)) {
+    if (schema.type !== "string" || schema.enum === undefined) continue;
+    const enumText = schema.enum.reduce((sum, option) => sum + option.length, 0);
+    if (
+      options + schema.enum.length > MAX_MCP_SETTINGS_ENUM_OPTIONS_TOTAL ||
+      text + enumText > MAX_MCP_SETTINGS_ENUM_TEXT
+    ) {
+      warnings.push(`Setting '${name}' passes this server's total option limit; ignoring it`);
+      delete properties[name];
+      delete values[name];
+      continue;
+    }
+    options += schema.enum.length;
+    text += enumText;
+  }
+}
+
 /** Validate a readTool `structuredContent` against the spec's SettingsReadResult. */
 export function parseMCPSettingsReadResult(raw: unknown): MCPSettingsSnapshot | { error: string } {
   if (!isRecord(raw) || !isRecord(raw.schema) || raw.schema.type !== "object")
@@ -255,6 +296,8 @@ export function parseMCPSettingsReadResult(raw: unknown): MCPSettingsSnapshot | 
   for (const name of Object.keys(properties)) {
     if (!Object.hasOwn(values, name)) delete properties[name];
   }
+  // After the value filter, so a setting dropped for its value spends no budget.
+  dropSettingsOverEnumBudget(properties, values, warnings);
 
   const layout: MCPSettingsGroup[] = [];
   const placed = new Set<string>();
@@ -298,3 +341,38 @@ export function parseMCPSettingsReadResult(raw: unknown): MCPSettingsSnapshot | 
   const droppedSettingCount = declared - Object.keys(properties).length;
   return { properties, values, layout, warnings, droppedSettingCount };
 }
+
+/**
+ * The snapshot as the renderer may receive it. The IPC schema's records (Zod) drop a
+ * "__proto__" key, which would hide such a setting without counting it. So it is dropped
+ * here, counted as a setting Xum cannot show. Hooks still get its value (they skip IPC).
+ */
+export function mcpSettingsSnapshotForIpc<T extends MCPSettingsSnapshot>(snapshot: T): T {
+  const reserved = "__proto__";
+  if (!Object.hasOwn(snapshot.properties, reserved)) return snapshot;
+  const properties = { ...snapshot.properties };
+  const values = { ...snapshot.values };
+  delete properties[reserved];
+  delete values[reserved];
+  const layout = snapshot.layout
+    .map((group) => ({
+      ...group,
+      items: group.items.filter((item) => item.kind !== "property" || item.property !== reserved),
+    }))
+    .filter((group) => group.items.length > 0);
+  return {
+    ...snapshot,
+    properties,
+    values,
+    layout,
+    warnings: [...snapshot.warnings, `Setting '${reserved}' cannot be shown; ignoring it`],
+    droppedSettingCount: snapshot.droppedSettingCount + 1,
+  };
+}
+
+/**
+ * A settings read for the workspace MCP dialog: the snapshot plus a token for the server
+ * instance that sent it. A save names the token, so it never validates against one instance
+ * and sends its update to another (a server replaced while the dialog was open).
+ */
+export type MCPSettingsReadSnapshot = MCPSettingsSnapshot & { instanceToken: string };

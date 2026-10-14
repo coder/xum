@@ -14,6 +14,7 @@ import {
 import type { TelemetryService } from "@/node/services/telemetryService";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { draftTooLargeMessage, isDraftTooLargeError } from "@/common/utils/drafts";
+import { DEFAULT_CREATION_DRAFT_ID } from "@/constants/drafts";
 import type { AutoModelRoutingDecision } from "@/common/types/autoModelRouting";
 import { AutoModelRouterTag } from "@/node/services/di/tags";
 import type { AutoModelRouter, AutoModelRouterFailure } from "@/node/services/autoModelRouter";
@@ -161,6 +162,28 @@ describe("router drafts.update", () => {
     expect(refused).toBeInstanceOf(ORPCError);
     expect((refused as ORPCError<string, unknown>).code).toBe("BAD_REQUEST");
     expect(isDraftTooLargeError(refused)).toBe(true);
+  });
+});
+
+describe("router drafts.moveCreation", () => {
+  test("refuses the default draft as a destination before the service runs", async () => {
+    const moveCreation = mock(() => Promise.reject(new Error("must not run")));
+    const context = { draftService: { moveCreation } } as unknown as ORPCContext;
+    const client = createRouterClient(router(), { context });
+    const source = { kind: "creation" as const, projectPath: "/p", draftId: "a1" };
+
+    let refused: unknown;
+    await client.drafts
+      .moveCreation({
+        source,
+        sourceRevision: 1,
+        dest: { ...source, draftId: DEFAULT_CREATION_DRAFT_ID },
+        subProjectPath: null,
+        createdAt: 1,
+      })
+      .catch((error: unknown) => (refused = error));
+    expect((refused as ORPCError<string, unknown>).code).toBe("BAD_REQUEST");
+    expect(moveCreation).not.toHaveBeenCalled();
   });
 });
 

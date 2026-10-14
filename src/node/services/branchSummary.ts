@@ -33,6 +33,7 @@ import assert from "@/common/utils/assert";
 import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
 import { getErrorMessage } from "@/common/utils/errors";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
+import { pluginHookContextTexts } from "@/common/utils/messages/pluginHookContext";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import {
   BRANCH_SUMMARY_MAX_ACCUMULATED_CHARS,
@@ -84,9 +85,13 @@ export function isRlmModeEnabled(
 }
 
 function extractTextForTranscript(message: MuxMessage): string {
-  return (message.parts ?? [])
+  const texts = (message.parts ?? [])
     .filter((part): part is { type: "text"; text: string } => part.type === "text")
-    .map((part) => part.text.trim())
+    .map((part) => part.text.trim());
+  // A user row's prompt-hook context is provider-visible, and the abandoned-branch token
+  // estimate counts it (estimateMuxMessageTokens), so the transcript carries it too (Codex
+  // PRRT_kwDOPxxmWM6rPqxL).
+  return [...texts, ...pluginHookContextTexts(message)]
     .filter((text) => text.length > 0)
     .join("\n");
 }

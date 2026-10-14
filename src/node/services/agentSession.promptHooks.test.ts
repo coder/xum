@@ -114,6 +114,53 @@ describe("message.send outcomes", () => {
     expect(h.events.some((event) => event.type === "stream-error")).toBe(false);
   });
 
+  // The cancel check after the hooks runs before their outcome is used, so a cancel during a
+  // slow hook ends the send as canceled whatever the hook decides (agentSession.ts, after
+  // runPluginSendHooks).
+  test.each([
+    ["blocks", blockAll],
+    ["adds context", addContext],
+  ] as const)(
+    "a send canceled while a hook that %s is pending is canceled and writes no row",
+    async (_label, decide) => {
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => (release = resolve));
+      let entered!: () => void;
+      const hookEntered = new Promise<void>((resolve) => (entered = resolve));
+      const { h, streamed } = await setup(() => undefined);
+      unregisters.push(
+        eventSpine.useBefore(
+          "message.send",
+          async (ctx) => {
+            entered();
+            await released;
+            decide(ctx);
+          },
+          { workspaceId }
+        )
+      );
+      const controller = new AbortController();
+      const canceled = mock(() => undefined);
+      const cancelState = { canceledBeforeAcceptance: false };
+
+      const sending = h.session.sendMessage("deploy to prod", options, {
+        acceptanceOrigin: "manual",
+        cancelSignal: controller.signal,
+        onCanceled: canceled,
+        cancelState,
+      });
+      await hookEntered;
+      controller.abort();
+      release();
+
+      expect(await sending).toEqual({ success: true, data: undefined });
+      expect(canceled).toHaveBeenCalledTimes(1);
+      expect(cancelState.canceledBeforeAcceptance).toBe(true);
+      expect(await userRows(h)).toEqual([]);
+      expect(streamed).toEqual([]);
+    }
+  );
+
   test("added context is saved on its user row and leaves the system prompt alone", async () => {
     let addHookContext = true;
     const { h, calls, streamed } = await setup((ctx) => {
@@ -184,6 +231,34 @@ describe("message.send outcomes", () => {
     // Codex P2 (PRRT_kwDOPxxmWM6rOvE1): the retry adds nothing, so the hooks (and their side
     // effects) do not run a second time.
     expect(calls).toEqual([]);
+  });
+
+  test("a send with send ids loads the lazy hooks once", async () => {
+    // Codex PRRT_kwDOPxxmWM6sVlZG: the accepted-send check's load must not repeat in the chain.
+    const { h, calls } = await setup(addContext);
+    const prepare = h.aiService.prepareMessageSendHooks?.bind(h.aiService);
+    const run = h.aiService.runMessageSendHooks?.bind(h.aiService);
+    assert(prepare != null && run != null);
+    let loads = 0;
+    const hooksLoaded: Array<boolean | undefined> = [];
+    h.aiService.prepareMessageSendHooks = (id) => {
+      loads++;
+      return prepare(id);
+    };
+    h.aiService.runMessageSendHooks = (id, input, signal, loaded) => {
+      hooksLoaded.push(loaded);
+      return run(id, input, signal, loaded);
+    };
+    const digest = computeSendDigest({ message: "fix the tests" });
+
+    const result = await h.session.sendMessage("fix the tests", options, {
+      sendIdentities: [{ id: "client-send-2", digest }],
+    });
+
+    expect(result.success).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(loads).toBe(1);
+    expect(hooksLoaded).toEqual([true]);
   });
 
   test("an automatic send ignores a block, so its sender cannot loop on it", async () => {
@@ -466,6 +541,24 @@ describe("on-send compaction follow-up", () => {
     expect(followUp?.metadata?.pluginHookContext).toEqual([
       { pluginId: "fake", text: "Ask for a reproduction first." },
     ]);
+  });
+
+  test("a redispatched follow-up keeps only the context under the persisted cap", async () => {
+    // Codex PRRT_kwDOPxxmWM6rPrJe: the handoff row is read from disk like any other row.
+    const { h } = await setup(addContext);
+    setOnSendCompaction(h, false);
+    const kept = { pluginId: "fake", text: "Ask for a reproduction first." };
+    await seedHandoff(h, {
+      text: "fix it",
+      model: options.model,
+      agentId: "exec",
+      pluginSendHooksApplied: true,
+      pluginHookContext: [kept, { pluginId: "fake", text: "x".repeat(70 * 1024) }],
+    });
+
+    expect(await h.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);
+
+    expect((await userRows(h)).at(-1)?.metadata?.pluginHookContext).toEqual([kept]);
   });
 
   test("recovery runs the hooks for a client-replaced summary with forged markers", async () => {

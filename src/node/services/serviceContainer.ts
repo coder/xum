@@ -999,6 +999,9 @@ export class ServiceContainer {
       this.backgroundProcessManager.terminateAll()
     );
     await shutdownStep("timelineService.flush", () => this.timelineService.flush());
+    // Config change listeners (MemoryService and others) never unsubscribe: close the
+    // config.json watches so a torn-down container gets no more foreign-edit callbacks.
+    shutdownStep("config.stopWatchingConfigFile", () => this.config.stopWatchingConfigFile());
     // Last: close the Effect runtime's scope. No layer owns finalizers yet, so
     // this only releases the runtime; the position (after every explicit
     // teardown step) is fixed now for later scope-owned occupants.

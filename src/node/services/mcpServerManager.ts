@@ -27,14 +27,21 @@ import {
   type MCPClientHandle,
   type MCPGetPromptResult,
   type MCPPrompt,
+  type MCPRawCallToolResult,
 } from "@/node/services/mcpClient";
 import {
   MCP_SETTINGS_WORKSPACE_META_KEY,
+  boundMCPSettingsToolResult,
+  MAX_MCP_SETTINGS_TOOL_RESULT,
   filterMCPSettingValues,
   parseMCPSettingsReadResult,
   validateMCPSettingValue,
   type MCPSettingValue,
+  type MCPSettingsReadSnapshot,
+  type MCPSettingsAppView,
+  type MCPSettingsGroup,
   type MCPSettingsSnapshot,
+  type MCPSettingsToolAction,
 } from "@/common/utils/mcpSettings";
 import type {
   McpAppModelContext,
@@ -51,6 +58,7 @@ import {
   MCP_APP_TOOL_CALL_WINDOW_MS,
   MCP_APP_TOOL_CALLS_PER_WINDOW,
   mcpAppEntrypointKey,
+  mcpSettingsAppKey,
   type MCPAppEntrypointType,
 } from "@/common/utils/mcpApps";
 import { sanitizeText } from "@/common/utils/mcp/displayText";
@@ -69,10 +77,11 @@ import type {
   WorkspaceMCPOverrides,
 } from "@/common/types/mcp";
 import assert from "@/common/utils/assert";
+import * as crypto from "crypto";
 import { isPngDataUrl } from "@/common/utils/mcp/pngDataUrl";
 import { shellQuote } from "@/common/utils/shell";
 import { requiredPropertyNames, schemaAcceptsNull } from "@/common/utils/tools/schemaSanitizer";
-import type { ExecStream, Runtime } from "@/node/runtime/Runtime";
+import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
 import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
@@ -419,6 +428,21 @@ function requireAppsConnection(
   return instance.apps;
 }
 
+/** The AI SDK tool call's abort signal, if its execution context carries one. */
+function toolCallAbortSignal(context: unknown): AbortSignal | undefined {
+  return context && typeof context === "object" && "abortSignal" in context
+    ? (context as { abortSignal?: AbortSignal }).abortSignal
+    : undefined;
+}
+
+/**
+ * How an MCP App tool call without a result ended, kept in its result record. A deadline is a
+ * failure, not a user interrupt: only the call's own abort signal counts as interrupted.
+ */
+function failedCallOutcome(signal: AbortSignal | undefined): "failed" | "interrupted" {
+  return signal?.aborted === true ? "interrupted" : "failed";
+}
+
 /**
  * Wrap MCP tools to transform their results to AI SDK format.
  * This ensures image content is properly converted to media type.
@@ -472,12 +496,9 @@ export function wrapMCPTools(
         let sanitizedArgs: unknown;
         let argsSanitized = false;
         let appResultRecorded = false;
+        // Hoisted so the failure path can tell an interrupted call from a failed one.
+        const abortSignal = toolCallAbortSignal(context);
         try {
-          const abortSignal =
-            context && typeof context === "object" && "abortSignal" in context
-              ? (context as { abortSignal?: AbortSignal }).abortSignal
-              : undefined;
-
           sanitizedArgs = sanitizeMCPToolArgs(args, rawInputSchema(tool.inputSchema));
           argsSanitized = true;
           const result: unknown = await runMCPToolWithDeadline(
@@ -563,6 +584,7 @@ export function wrapMCPTools(
               resourceUri: appResourceUri,
               arguments: sanitizedArgs,
               result: null,
+              outcome: failedCallOutcome(abortSignal),
             });
           }
           if (shouldRecycleClientAfterToolError(error)) {
@@ -900,6 +922,13 @@ interface StdioLaunch {
   command: string;
   cwd?: string;
   env?: Record<string, string>;
+  /**
+   * #6509: a plugin server gets only the minimal host environment plus its
+   * declared env, so the user's shell secrets are not passed to it. Not a sandbox:
+   * the server runs as the same OS user (see docs/config/mcp-servers.mdx). User-configured
+   * servers keep the full environment.
+   */
+  hostEnv: NonNullable<ExecOptions["hostEnv"]>;
 }
 
 /**
@@ -955,6 +984,23 @@ async function mkdirSelfHealing(target: string): Promise<void> {
 }
 
 /**
+ * Codex `env_vars`: copy only the named host variables (unset ones are skipped, as in
+ * codex-rs create_env_for_mcp_server). Configured env wins, so PLUGIN_ROOT/PLUGIN_DATA stay put.
+ */
+function withForwardedHostEnv(
+  forwardEnv: string[] | undefined,
+  env: Record<string, string> | undefined
+): Record<string, string> | undefined {
+  // Own properties only: `constructor` would read an inherited function. Object.fromEntries
+  // keeps a host variable named `__proto__`, which an assignment would drop.
+  const forwarded = (forwardEnv ?? []).flatMap((name): Array<[string, string]> => {
+    const value = Object.hasOwn(process.env, name) ? process.env[name] : undefined;
+    return typeof value === "string" ? [[name, value]] : [];
+  });
+  return forwarded.length > 0 ? { ...Object.fromEntries(forwarded), ...env } : env;
+}
+
+/**
  * Compose the shell command string and exec options for a stdio server.
  *
  * Servers with `args` set (Agent Plugins) run in argv mode: `command` and each
@@ -970,7 +1016,9 @@ export async function prepareStdioLaunch(info: MCPStdioServerInfo): Promise<Stdi
   const command =
     info.args !== undefined ? [info.command, ...info.args].map(shellQuote).join(" ") : info.command;
 
+  let hostEnv: StdioLaunch["hostEnv"] = "inherit";
   if (info.plugin !== undefined) {
+    hostEnv = "minimal";
     const dataPath = info.env?.PLUGIN_DATA;
     assert(
       dataPath !== undefined && path.isAbsolute(dataPath),
@@ -994,10 +1042,13 @@ export async function prepareStdioLaunch(info: MCPStdioServerInfo): Promise<Stdi
     }
   }
 
+  const env = withForwardedHostEnv(info.forwardEnv, info.env);
+
   return {
     command,
     ...(info.cwd !== undefined ? { cwd: info.cwd } : {}),
-    ...(info.env !== undefined ? { env: info.env } : {}),
+    ...(env !== undefined ? { env } : {}),
+    hostEnv,
   };
 }
 
@@ -1008,7 +1059,7 @@ export async function prepareStdioLaunch(info: MCPStdioServerInfo): Promise<Stdi
  */
 async function runServerTest(
   server:
-    | { transport: "stdio"; command: string; cwd?: string; env?: Record<string, string> }
+    | ({ transport: "stdio" } & StdioLaunch)
     | {
         transport: "http" | "sse" | "auto";
         url: string;
@@ -1060,6 +1111,7 @@ async function runServerTest(
           const execStream = await runtime.exec(server.command, {
             cwd: server.cwd ?? projectPath,
             ...(server.env !== undefined ? { env: server.env } : {}),
+            hostEnv: server.hostEnv,
             timeout: TEST_TIMEOUT_MS / 1000,
           });
 
@@ -1393,7 +1445,14 @@ interface MCPServerInstance {
     "toolUi" | "hasTool" | "callToolForApp" | "readResource" | "appEntrypoints"
   >;
   /** OpenAI structured settings (`openai/settings`); its tools are hidden from the model. */
-  settings?: Pick<MCPClientHandle, "settingsCapability" | "callSettingsTool">;
+  settings?: Pick<
+    MCPClientHandle,
+    | "settingsCapability"
+    | "callSettingsTool"
+    | "settingsToolAction"
+    | "callSettingsActionTool"
+    | "relistTools"
+  >;
   /** True once the underlying MCP client/transport has been closed. */
   isClosed: boolean;
   /**
@@ -1681,13 +1740,15 @@ export class MCPServerManager {
   private readonly pendingEnablementRepairs = new Map<string, Promise<void>>();
   private readonly latestProjectTrust = new Map<string, boolean>();
   private readonly workspaceRestartLocks = new MutexMap<string>();
+  /** Instances whose prompts/list settled at least once; see awaitFirstPromptLists. */
+  private readonly promptListSettledInstances = new WeakSet<MCPServerInstance>();
   /** Orders racing prompt refresh completions per instance; see refreshInstancePrompts. */
   private readonly promptRefreshSequences = new WeakMap<
     MCPServerInstance,
     { started: number; applied: number }
   >();
   /** Dedupes send-path background tool refreshes per instance; see refreshInstanceToolsInBackground. */
-  private readonly toolRefreshesInFlight = new WeakMap<MCPServerInstance, Promise<void>>();
+  private readonly toolRefreshesInFlight = new WeakMap<MCPServerInstance, Promise<boolean>>();
   /**
    * Prompt catalogs of idle-stopped servers, by workspace, with the start
    * config they were fetched under. The restart seeds each restarted
@@ -1701,7 +1762,12 @@ export class MCPServerManager {
    */
   private readonly idleStoppedPromptCatalogs = new Map<
     string,
-    { configSignature: string; prompts: Map<string, MCPPrompt[]> }
+    {
+      configSignature: string;
+      prompts: Map<string, MCPPrompt[]>;
+      /** Servers whose catalog had settled a prompts/list (see awaitFirstPromptLists). */
+      listedServerNames: Set<string>;
+    }
   >();
   // Bumped by removal-style stops (stopServers without retainRestartOptions).
   // Startups run outside any lock shared with removal, so an abort-abandoned
@@ -1841,7 +1907,7 @@ export class MCPServerManager {
     } catch (error) {
       log.debug("MCP component policy unavailable", { error });
     }
-    return { registryPath: this.componentPolicy?.registryPath ?? "", imports: null };
+    return { registryPath: this.componentPolicy?.registryPath ?? "", imports: null, consent: null };
   }
 
   private async withPluginAdmissionFence<T>(
@@ -2533,19 +2599,22 @@ export class MCPServerManager {
 
   /**
    * One deduped tools/list refresh of a modern-era instance; never rejects (a failed refresh
-   * keeps the cached tools). Legacy instances have no refresh and resolve at once.
+   * keeps the cached tools). Resolves false when the refresh failed. Legacy instances have no
+   * refresh and resolve true at once (tools/list_changed re-lists them).
    */
-  private refreshInstanceTools(instance: MCPServerInstance): Promise<void> {
+  private refreshInstanceTools(instance: MCPServerInstance): Promise<boolean> {
     const inFlight = this.toolRefreshesInFlight.get(instance);
     if (inFlight !== undefined) return inFlight;
-    if (instance.isClosed || !instance.refreshTools) return Promise.resolve();
+    if (instance.isClosed || !instance.refreshTools) return Promise.resolve(true);
     const refresh = instance
       .refreshTools()
+      .then(() => true)
       .catch((error: unknown) => {
         log.debug("[MCP] Tool list refresh failed; keeping cached tools", {
           name: instance.name,
           error: getErrorMessage(error),
         });
+        return false;
       })
       .finally(() => {
         if (this.toolRefreshesInFlight.get(instance) === refresh) {
@@ -2591,7 +2660,12 @@ export class MCPServerManager {
     if (saved.configSignature !== configSignature) return;
     for (const [serverName, instance] of instances) {
       const prompts = saved.prompts.get(serverName);
-      if (prompts !== undefined && instance.prompts.length === 0) instance.prompts = prompts;
+      if (prompts !== undefined && instance.prompts.length === 0) {
+        instance.prompts = prompts;
+        // A restored catalog is a stale value: serve it while revalidating. A catalog that was
+        // never listed (warmed, then stopped idle) stays unlisted.
+        this.restorePromptListSettled(instance, saved.listedServerNames.has(serverName));
+      }
     }
   }
 
@@ -2632,9 +2706,60 @@ export class MCPServerManager {
             name: instance.name,
             error: getErrorMessage(error),
           });
+        } finally {
+          this.markPromptListSettled(instance, signal);
         }
       })
     );
+  }
+
+  private markPromptListSettled(instance: MCPServerInstance, signal: AbortSignal | undefined) {
+    // A canceled list says nothing about the server: the next send still waits for one.
+    if (signal?.aborted !== true) this.promptListSettledInstances.add(instance);
+  }
+
+  private restorePromptListSettled(instance: MCPServerInstance, listed: boolean): void {
+    if (listed) this.promptListSettledInstances.add(instance);
+  }
+
+  /** Whether a served instance of the workspace never settled a prompts/list. */
+  private hasUnlistedPromptInstances(workspaceId: string): boolean {
+    const entry = this.workspaceServers.get(workspaceId);
+    return (
+      entry !== undefined &&
+      [...this.promptEligibleInstances(entry).values()].some(
+        (instance) => !this.promptListSettledInstances.has(instance)
+      )
+    );
+  }
+
+  /**
+   * Wait for the first prompts/list of the workspace's served instances. Returns true when the
+   * serve that just ran used a catalog that was never listed (`unlistedAtServe`, or found now),
+   * so the caller must serve again.
+   *
+   * Sends serve a cached entry's prompts stale-while-revalidate. An entry started without a
+   * prompt list (an MCP App entry point warm-up, a prompt dispatch) has an empty catalog, which
+   * is no value rather than a stale one. The first send after a Xum restart then had no
+   * mcp_prompt_get and the next one had it, and that tools change made Anthropic reject the
+   * replayed thinking blocks. A server whose list failed is not waited for again.
+   */
+  private async awaitFirstPromptLists(
+    workspaceId: string,
+    unlistedAtServe: boolean
+  ): Promise<boolean> {
+    // The serve's own background refresh can settle before this check runs.
+    if (!unlistedAtServe && !this.hasUnlistedPromptInstances(workspaceId)) return false;
+    // Share the entry's deduped background refresh with every concurrent send. A refresh that
+    // was already in flight covers only the instances it started with, so a second round lists
+    // an instance added since then.
+    for (let round = 0; round < 2 && this.hasUnlistedPromptInstances(workspaceId); round++) {
+      const entry = this.workspaceServers.get(workspaceId);
+      if (entry === undefined) break;
+      this.refreshInstancePromptsInBackground(entry);
+      await entry.promptRefreshInFlight;
+    }
+    return true;
   }
 
   /**
@@ -2711,6 +2836,11 @@ export class MCPServerManager {
           configSignature: entry.configSignature,
           prompts: new Map(
             [...entry.instances].map(([serverName, instance]) => [serverName, instance.prompts])
+          ),
+          listedServerNames: new Set(
+            [...entry.instances]
+              .filter(([, instance]) => this.promptListSettledInstances.has(instance))
+              .map(([serverName]) => serverName)
           ),
         });
         void this.stopServers(workspaceId, { retainRestartOptions: true });
@@ -3108,9 +3238,25 @@ export class MCPServerManager {
     options: MCPWorkspaceRequestOptions,
     readSignal?: AbortSignal
   ): Promise<MCPToolsForWorkspaceResult> {
-    return this.runWithStablePluginEpoch(() =>
-      this.ensureWorkspaceServers(options, true, readSignal)
+    return this.serveWithFirstPromptLists(options.workspaceId, () =>
+      this.runWithStablePluginEpoch(() => this.ensureWorkspaceServers(options, true, readSignal))
     );
+  }
+
+  /** Run `serve`, and again after awaitFirstPromptLists waited, so the result has the catalog. */
+  private async serveWithFirstPromptLists(
+    workspaceId: string,
+    serve: () => Promise<MCPToolsForWorkspaceResult>
+  ): Promise<MCPToolsForWorkspaceResult> {
+    const unlistedAtServe = this.hasUnlistedPromptInstances(workspaceId);
+    const stopEpoch = this.workspaceStopEpochs.get(workspaceId) ?? 0;
+    const result = await serve();
+    if (!(await this.awaitFirstPromptLists(workspaceId, unlistedAtServe))) return result;
+    // A removal-style stop since the first serve began owns the workspace: never start its
+    // servers again. Return what the first serve returned, as before the wait existed.
+    if ((this.workspaceStopEpochs.get(workspaceId) ?? 0) !== stopEpoch) return result;
+    // The second serve also picks up the current entry and enablement.
+    return serve();
   }
 
   /**
@@ -4351,6 +4497,8 @@ export class MCPServerManager {
           command: info.command,
           args: info.args ?? null,
           env: info.env ?? null,
+          // JSON.stringify drops it when unset, so other servers keep their signature.
+          forwardEnv: info.forwardEnv,
           cwd: info.cwd ?? null,
         };
         continue;
@@ -4827,7 +4975,7 @@ export class MCPServerManager {
    * workspace whose config key starts with `keyPrefix` (one plugin instance)
    * and that has `openai/settings`, keyed by the plugin's own server name.
    * Uses the cache; an empty cache is read once with a short timeout (all
-   * misses concurrently), and a failed read yields `{}` for that server.
+   * misses concurrently), and a failed read yields the current cache or `{}`.
    * Never starts servers and never throws: hooks must not stall or break the turn.
    */
   async getSettingsForPluginHooks(
@@ -4837,42 +4985,107 @@ export class MCPServerManager {
   ): Promise<Record<string, Record<string, MCPSettingValue>>> {
     // Null prototype: a plugin server named "__proto__" stays an own key (JSON keeps it).
     const settings = Object.create(null) as Record<string, Record<string, MCPSettingValue>>;
+    // Only awaits when a repair is pending: without one, the reads start synchronously.
+    const pendingRepair = this.pendingEnablementRepairs.get(workspaceId);
+    if (pendingRepair !== undefined && !(await this.awaitRepairForHooks(pendingRepair, timeoutMs)))
+      return settings;
+    // After a repair wait, cached values only (#6186): the wait already spent the hook's budget,
+    // and a read given only the rest could time out and stay memoized as failed for the instance.
+    // The next hook call reads the misses with the full timeout.
+    const mayRead = pendingRepair === undefined;
     const entry = this.workspaceServers.get(workspaceId);
     if (entry === undefined) return settings;
-    const misses: Array<Promise<void>> = [];
+    const sources: Array<{
+      name: string;
+      instance: MCPServerInstance;
+      pluginServerName: string;
+      read?: Promise<Record<string, MCPSettingValue> | undefined>;
+    }> = [];
     for (const [name, instance] of entry.instances) {
-      const pluginServerName = entry.enabledServers[name]?.plugin?.serverName;
-      if (
-        !name.startsWith(keyPrefix) ||
-        pluginServerName === undefined ||
-        !entry.enabledServerNames.has(name) ||
-        instance.isClosed ||
-        instance.settings?.settingsCapability() === undefined
-      )
-        continue;
+      const pluginServerName = name.startsWith(keyPrefix)
+        ? this.hookSettingsServerName(workspaceId, name, instance)
+        : undefined;
+      if (pluginServerName === undefined) continue;
       const cached = this.settingsCache.get(instance)?.get(workspaceId);
-      if (cached !== undefined) {
-        settings[pluginServerName] = cached;
-        continue;
-      }
-      misses.push(
-        this.readSettingsForHooks(instance, workspaceId, timeoutMs).then((values) => {
-          // Recheck after the await: a server disabled, removed or replaced meanwhile must not
-          // hand its settings to the hook.
-          const current = this.workspaceServers.get(workspaceId);
-          if (
-            current?.instances.get(name) !== instance ||
-            !current.enabledServerNames.has(name) ||
-            instance.isClosed
-          )
-            return;
-          settings[pluginServerName] = values ?? {};
-        })
-      );
+      sources.push({
+        name,
+        instance,
+        pluginServerName,
+        ...(cached === undefined && mayRead
+          ? { read: this.readSettingsForHooks(instance, workspaceId, timeoutMs) }
+          : {}),
+      });
     }
     // Concurrently: misses on several servers share one timeout window instead of adding up.
-    await Promise.all(misses);
+    const reads = await Promise.all(
+      sources.map((source) => source.read ?? Promise.resolve(undefined))
+    );
+    sources.forEach((source, index) => {
+      // Recheck every collected server, cached ones too (#6186): a server disabled, removed or
+      // replaced during any read must not hand its settings to the hook.
+      if (!this.isHookSettingsSourceCurrent(workspaceId, source.name, source.instance)) return;
+      // The cache first: a save that settled during a failed or older read holds newer values.
+      settings[source.pluginServerName] =
+        this.settingsCache.get(source.instance)?.get(workspaceId) ?? reads[index] ?? {};
+    });
     return settings;
+  }
+
+  /** Enablement repairs a hook already waited on until its timeout (see awaitRepairForHooks). */
+  private readonly hookTimedOutRepairs = new WeakSet<Promise<void>>();
+
+  /**
+   * An override change waiting for repairEnablement can disable a server the entry still lists
+   * as enabled (#6186). Waits for it, bounded by the hook timeout. False when it did not settle
+   * in time: the hook then gets no settings (fail closed). A repair that already outlasted one
+   * hook's wait is not waited on again, so serial plugin hooks of one dispatch (or later ones)
+   * do not add one timeout each.
+   */
+  private async awaitRepairForHooks(repair: Promise<void>, timeoutMs: number): Promise<boolean> {
+    if (this.hookTimedOutRepairs.has(repair)) return false;
+    if ((await raceWithAbortAndTimeout(repair, { timeoutMs })).kind === "ok") return true;
+    this.hookTimedOutRepairs.add(repair);
+    return false;
+  }
+
+  /**
+   * The plugin's own name for server `name` when `instance` can give a hook settings now: a
+   * plugin server that is current (isHookSettingsSourceCurrent) and has `openai/settings`.
+   */
+  private hookSettingsServerName(
+    workspaceId: string,
+    name: string,
+    instance: MCPServerInstance
+  ): string | undefined {
+    const pluginServerName =
+      this.workspaceServers.get(workspaceId)?.enabledServers[name]?.plugin?.serverName;
+    if (
+      pluginServerName === undefined ||
+      !this.isHookSettingsSourceCurrent(workspaceId, name, instance) ||
+      instance.settings?.settingsCapability() === undefined
+    )
+      return undefined;
+    return pluginServerName;
+  }
+
+  /**
+   * Whether `instance` may give its settings to a hook now: still this workspace's running
+   * instance for `name` and enabled, with no override invalidation or enablement repair pending
+   * (as canCallToolForPluginHook: hooks fail closed instead of re-deriving enablement).
+   */
+  private isHookSettingsSourceCurrent(
+    workspaceId: string,
+    name: string,
+    instance: MCPServerInstance
+  ): boolean {
+    const entry = this.workspaceServers.get(workspaceId);
+    return (
+      entry?.instances.get(name) === instance &&
+      entry.enabledServerNames.has(name) &&
+      !instance.isClosed &&
+      !this.overridesInvalidationGenerations.has(workspaceId) &&
+      !this.pendingEnablementRepairs.has(workspaceId)
+    );
   }
 
   private readSettingsForHooks(
@@ -4899,7 +5112,7 @@ export class MCPServerManager {
           return this.settingsCache.get(instance)?.get(workspaceId) ?? parsed.values;
         } catch (error) {
           log.warn(
-            `[MCP] Settings read for plugin hooks failed for '${instance.name}'; passing {}`,
+            `[MCP] Settings read for plugin hooks failed for '${instance.name}'; passing the cached values or {}`,
             {
               workspaceId,
               error: getErrorMessage(error),
@@ -4997,12 +5210,24 @@ export class MCPServerManager {
     );
   }
 
+  /** Random per server instance; see MCPSettingsReadSnapshot. */
+  private readonly settingsInstanceTokens = new WeakMap<MCPServerInstance, string>();
+
+  private settingsInstanceToken(instance: MCPServerInstance): string {
+    let token = this.settingsInstanceTokens.get(instance);
+    if (token === undefined) {
+      token = crypto.randomUUID();
+      this.settingsInstanceTokens.set(instance, token);
+    }
+    return token;
+  }
+
   async readSettings(
     workspaceId: string,
     serverName: string,
     /** `noStart`: read only a running instance; never start or restart the server. */
     options?: { signal?: AbortSignal; timeoutMs?: number; noStart?: boolean }
-  ): Promise<MCPSettingsSnapshot | null> {
+  ): Promise<MCPSettingsReadSnapshot | null> {
     const noSettings = Symbol("no settings");
     let source: { instance: MCPServerInstance; requestId: number } | undefined;
     const snapshot = await this.invokeServerOperation(
@@ -5026,9 +5251,401 @@ export class MCPServerManager {
     if (snapshot === null) return null;
     for (const warning of snapshot.warnings)
       log.warn(`[MCP] Settings of '${serverName}': ${warning}`, { workspaceId });
-    if (source !== undefined)
-      this.cacheSettings(source.instance, workspaceId, source.requestId, snapshot.values);
-    return snapshot;
+    assert(source !== undefined, "a settings snapshot comes from a server instance");
+    this.cacheSettings(source.instance, workspaceId, source.requestId, snapshot.values);
+    const { instance } = source;
+    const instanceToken = this.settingsInstanceToken(instance);
+    const read = {
+      ...snapshot,
+      layout: await this.withSettingsToolActions(
+        instance,
+        workspaceId,
+        serverName,
+        snapshot.layout,
+        options
+      ),
+    };
+    // The hash covers what this read returns (its layout carries the tool actions), the same
+    // object a save's fresh read is compared with (runSettingsSave).
+    this.rememberSettingsSchema(workspaceId, serverName, instanceToken, read);
+    return { ...read, instanceToken };
+  }
+
+  /**
+   * The layout with each tool item's action (see settingsToolAction). The catalog is refreshed
+   * first (bounded, as for MCP App entry points): after tools/list_changed the held catalog
+   * would show a new tool as unavailable and keep a removed one runnable.
+   */
+  private async withSettingsToolActions(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    serverName: string,
+    layout: MCPSettingsGroup[],
+    options: { signal?: AbortSignal } | undefined
+  ): Promise<MCPSettingsGroup[]> {
+    if (layout.some((group) => group.items.some((item) => item.kind === "tool")))
+      await this.refreshAppCatalogs([{ instance }], options?.signal);
+    return layout.map((group) => ({
+      ...group,
+      items: group.items.map((item) => {
+        if (item.kind !== "tool") return item;
+        const action = this.settingsToolAction(instance, workspaceId, serverName, item.tool);
+        return action === undefined ? item : { ...item, action };
+      }),
+    }));
+  }
+
+  /**
+   * A layout tool item's action: a tool the server lists and the tool allowlist allows. An MCP
+   * App tool needs MCP Apps (the artifacts experiment and an apps connection): without them it
+   * has no action, so it is never run as a regular tool without its view.
+   */
+  private settingsToolAction(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    serverName: string,
+    toolName: string
+  ): MCPSettingsToolAction | undefined {
+    const action = instance.settings?.settingsToolAction(toolName);
+    const allowlist = this.appToolAllowlist(workspaceId, serverName);
+    if (allowlist !== null && !allowlist.has(toolName)) return undefined;
+    return action?.opensApp === true && !this.canOpenApps(instance) ? undefined : action;
+  }
+
+  /** MCP Apps work on this instance now: the experiment is on and it has an apps connection. */
+  private canOpenApps(instance: MCPServerInstance): boolean {
+    return this.mcpApps?.isEnabled() === true && instance.apps !== undefined;
+  }
+
+  /**
+   * A fresh tools/list for a settings action: a modern instance refreshes through its response
+   * cache (refreshInstanceTools). A legacy instance has no such refresh, and without MCP Apps
+   * nothing re-lists it on tools/list_changed, so it lists again here. Resolves false on failure.
+   */
+  private refreshSettingsActionTools(instance: MCPServerInstance): Promise<boolean> {
+    if (instance.refreshTools !== undefined || instance.settings === undefined)
+      return this.refreshInstanceTools(instance);
+    return instance.settings.relistTools().then(
+      () => true,
+      (error: unknown) => {
+        log.debug("[MCP] Tool list refresh for a settings action failed", {
+          name: instance.name,
+          error: getErrorMessage(error),
+        });
+        return false;
+      }
+    );
+  }
+
+  /**
+   * Refresh the running instance's catalog before a settings action dispatch (bounded). Fails
+   * closed: when the refresh times out or fails, the held catalog can be stale (a tool that
+   * became writable still reads as read-only and would run without the user's confirmation),
+   * so the dispatch is refused instead of falling back to it.
+   */
+  private async refreshSettingsActionCatalog(
+    workspaceId: string,
+    serverName: string,
+    signal: AbortSignal | undefined
+  ): Promise<void> {
+    const instance = this.workspaceServers.get(workspaceId)?.instances.get(serverName);
+    if (instance === undefined || instance.isClosed) return;
+    const refreshed = await raceWithAbortAndTimeout(this.refreshSettingsActionTools(instance), {
+      ...(signal !== undefined ? { signal } : {}),
+      timeoutMs: MCP_APP_CATALOG_REFRESH_TIMEOUT_MS,
+    });
+    if (refreshed.kind !== "ok" || !refreshed.value)
+      throw new Error(`Could not refresh ${serverName}'s tools; try again`);
+  }
+
+  /**
+   * Run a settings layout tool action: the spec calls the same-server tool with `{}` and shows
+   * the text of its result. Refused when the server instance is not the one the dialog read,
+   * when the tool has no action (see settingsToolAction) or opens an MCP App, and when a tool
+   * without `readOnlyHint: true` runs without the user's confirmation.
+   */
+  async runSettingsTool(
+    workspaceId: string,
+    serverName: string,
+    toolName: string,
+    instanceToken: string,
+    options: { confirmed: boolean; signal?: AbortSignal }
+  ): Promise<{ text: string; isError: boolean }> {
+    // A tool that tools/list_changed removed since the dialog read is refused.
+    await this.refreshSettingsActionCatalog(workspaceId, serverName, options.signal);
+    // One-shot dispatch, like callMcpAppTool: an epoch retry must not run the tool twice.
+    let dispatched: Promise<MCPRawCallToolResult> | null = null;
+    return this.invokeServerOperation(
+      workspaceId,
+      serverName,
+      `MCP settings tool '${serverName}/${toolName}'`,
+      (instance) => {
+        if (dispatched !== null) return dispatched;
+        const refusal = this.settingsToolRefusal(instance, workspaceId, serverName, toolName, {
+          instanceToken,
+          confirmed: options.confirmed,
+          opensApp: false,
+        });
+        if (refusal !== null) return Promise.reject(refusal);
+        assert(instance.settings !== undefined, "a settings tool action has a settings client");
+        log.info("[MCP] Settings tool action", { workspaceId, serverName, toolName });
+        dispatched = instance.settings.callSettingsActionTool(
+          toolName,
+          { [MCP_SETTINGS_WORKSPACE_META_KEY]: workspaceId },
+          options
+        );
+        return dispatched;
+      },
+      settingsToolResultText,
+      options
+    );
+  }
+
+  /**
+   * Why runSettingsTool (`opensApp: false`) or openSettingsApp (`opensApp: true`) refuses to
+   * call the tool on this instance; null when it may. Each path takes only its own kind of tool.
+   */
+  private settingsToolRefusal(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    serverName: string,
+    toolName: string,
+    request: { instanceToken: string; confirmed: boolean; opensApp: boolean }
+  ): Error | null {
+    const currentToken = this.settingsInstanceToken(instance);
+    if (!this.isSettingsTokenAccepted(workspaceId, serverName, currentToken, request.instanceToken))
+      return staleSettingsInstanceError(serverName);
+    const action = this.settingsToolAction(instance, workspaceId, serverName, toolName);
+    if (action === undefined) return new Error(`'${serverName}' has no tool named '${toolName}'`);
+    if (action.opensApp !== request.opensApp)
+      return new Error(
+        `'${action.title}' ${action.opensApp ? "opens an MCP App" : "has no MCP App"}`
+      );
+    if (!action.readOnly && !request.confirmed)
+      return new Error(`'${action.title}' runs only after a confirmation`);
+    return null;
+  }
+
+  /** settingsToolRefusal for an app open, then the entry point budget (an open calls the tool). */
+  private settingsAppRefusal(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    serverName: string,
+    toolName: string,
+    request: { instanceToken: string; confirmed: boolean }
+  ): Error | null {
+    const refusal = this.settingsToolRefusal(instance, workspaceId, serverName, toolName, {
+      ...request,
+      opensApp: true,
+    });
+    if (refusal !== null) return refusal;
+    return this.allowEntrypointCall(workspaceId, serverName)
+      ? null
+      : new Error(`Too many app opens for '${serverName}'; try again shortly`);
+  }
+
+  /**
+   * Open a settings layout tool action's MCP App (the spec shows it in a modal on top of the
+   * settings): call the tool with `{}` and store the result as the view record under
+   * mcpSettingsAppKey, as an entry point open does, so the modal mounts it through
+   * getMcpAppView. The same checks as runSettingsTool apply, and the entry point budget.
+   */
+  async openSettingsApp(
+    workspaceId: string,
+    serverName: string,
+    toolName: string,
+    instanceToken: string,
+    options: { confirmed: boolean; signal?: AbortSignal }
+  ): Promise<MCPSettingsAppView> {
+    assert(this.mcpApps, "MCP Apps support is not configured");
+    const store = this.mcpApps.store;
+    // A tool that tools/list_changed removed or changed since the dialog read is refused.
+    await this.refreshSettingsActionCatalog(workspaceId, serverName, options.signal);
+    // One-shot dispatch, as in callMcpAppTool: an epoch retry must not call the tool twice.
+    let dispatched: Promise<MCPSettingsAppView> | null = null;
+    return this.invokeServerOperation(
+      workspaceId,
+      serverName,
+      `MCP settings app '${serverName}/${toolName}'`,
+      (instance): Promise<MCPSettingsAppView> => {
+        if (dispatched !== null) return dispatched;
+        const refusal = this.settingsAppRefusal(instance, workspaceId, serverName, toolName, {
+          instanceToken,
+          confirmed: options.confirmed,
+        });
+        if (refusal !== null) return Promise.reject(refusal);
+        const resourceUri = requireAppsConnection(instance).toolUi(toolName)?.resourceUri;
+        const settings = instance.settings;
+        const title = settings?.settingsToolAction(toolName)?.title;
+        assert(settings && resourceUri !== undefined && title !== undefined, "an app has a view");
+        log.info("[MCP Apps] Opening a settings app", { workspaceId, serverName, toolName });
+        const viewKey = mcpSettingsAppKey(serverName, toolName);
+        const order = ++this.entrypointOpenCount;
+        // Through the settings action path: `{}` plus the workspace `_meta` every settings call
+        // carries, so a server that scopes its settings by workspace sees the right one.
+        const call = settings.callSettingsActionTool(
+          toolName,
+          { [MCP_SETTINGS_WORKSPACE_META_KEY]: workspaceId },
+          options
+        );
+        dispatched = call.then(async (result) => {
+          const stored = await this.storeEntrypointResult(store, workspaceId, order, {
+            toolCallId: viewKey,
+            serverName,
+            toolName,
+            resourceUri,
+            arguments: {},
+            result,
+            // Not a tool call's view: a chat card or restored tab never resolves to it.
+            entrypoint: true,
+          });
+          // The key is stable per server and tool: an unstored result would open the view
+          // with the previous open's result, so the open fails instead.
+          assertSettingsAppStored(stored, title);
+          const serverLabel = this.appServerLabel(workspaceId, serverName);
+          return { viewKey, serverName, serverLabel, toolName, title, resourceUri };
+        });
+        return dispatched;
+      },
+      (result) => result,
+      options
+    );
+  }
+
+  /** Saves in flight per workspace and server (settingsSavesSettled). */
+  private readonly pendingSettingsSaves = new Map<string, Set<Promise<unknown>>>();
+
+  /**
+   * Resolves once this server's saves in flight settled. The dialog's reads wait for it: a
+   * dialog reopened during a save must not show the values from before the save. Resolves to
+   * the part of `timeoutMs` left (at least 1 ms), so the read that follows shares one deadline
+   * with the wait instead of starting a second full one.
+   */
+  async settingsSavesSettled(
+    workspaceId: string,
+    serverName: string,
+    /**
+     * The read's own deadline and abort: a stalled save (tool calls time out after minutes) must
+     * not hold the dialog's bulk read. Past either, the read goes ahead without waiting.
+     */
+    options: { signal?: AbortSignal; timeoutMs: number }
+  ): Promise<number> {
+    const saves = this.pendingSettingsSaves.get(settingsSaveKey(workspaceId, serverName));
+    if (saves === undefined) return options.timeoutMs;
+    const started = Date.now();
+    // A failed save is the save's own error; a read only waits for it.
+    await raceUntilAborted(Promise.allSettled([...saves]), [
+      AbortSignal.timeout(options.timeoutMs),
+      ...(options.signal !== undefined ? [options.signal] : []),
+    ]);
+    return Math.max(1, options.timeoutMs - (Date.now() - started));
+  }
+
+  /**
+   * The schema each recent instance token was read with, as a hash, per workspace and server: a
+   * save whose token names a restarted instance (idle stop, crash restart) still lands when the
+   * new instance shows the same schema. Keyed by server too, so a token read from one server
+   * never passes the check of a save to another. Bounded: the oldest entry is forgotten first,
+   * and its save is refused.
+   */
+  private readonly settingsSchemaHashes = new Map<string, string>();
+
+  /**
+   * Whether a request that names `requestToken` (the dialog's read) may act on this workspace
+   * and server's instance with `currentToken`: the same instance, or a restarted one (idle stop,
+   * crash restart) whose last read showed the same schema. Saves (runSettingsSave, right after a
+   * fresh read) and tool actions (settingsToolRefusal, against the instance's last read) share
+   * this rule. An instance no read has seen yet has no hash and is refused. Both lookups use the
+   * workspace and server, so a token read from another server never matches.
+   */
+  private isSettingsTokenAccepted(
+    workspaceId: string,
+    serverName: string,
+    currentToken: string,
+    requestToken: string
+  ): boolean {
+    if (currentToken === requestToken) return true;
+    const hashOf = (token: string) =>
+      this.settingsSchemaHashes.get(settingsSchemaKey(workspaceId, serverName, token));
+    const current = hashOf(currentToken);
+    return current !== undefined && current === hashOf(requestToken);
+  }
+
+  private rememberSettingsSchema(
+    workspaceId: string,
+    serverName: string,
+    instanceToken: string,
+    snapshot: MCPSettingsSnapshot
+  ): void {
+    const key = settingsSchemaKey(workspaceId, serverName, instanceToken);
+    // Each read overwrites its token's hash: the latest schema of an instance is the one a save
+    // validated against (the dialog shows that read).
+    this.settingsSchemaHashes.delete(key);
+    this.settingsSchemaHashes.set(key, settingsSchemaHash(snapshot));
+    if (this.settingsSchemaHashes.size > MAX_REMEMBERED_SETTINGS_SCHEMAS) {
+      const oldest = this.settingsSchemaHashes.keys().next().value;
+      if (oldest !== undefined) this.settingsSchemaHashes.delete(oldest);
+    }
+  }
+
+  /**
+   * The workspace MCP dialog's save: validate `set` against a fresh read, send it, and return
+   * the snapshot the server shows afterwards (its schema can change with the values). Refused
+   * when the server instance is not the one the dialog read (`instanceToken`).
+   */
+  async saveSettings(
+    workspaceId: string,
+    serverName: string,
+    set: Record<string, MCPSettingValue>,
+    instanceToken: string,
+    options?: { signal?: AbortSignal }
+  ): Promise<MCPSettingsReadSnapshot> {
+    const key = settingsSaveKey(workspaceId, serverName);
+    const save = this.runSettingsSave(workspaceId, serverName, set, instanceToken, options);
+    const saves = this.pendingSettingsSaves.get(key) ?? new Set<Promise<unknown>>();
+    saves.add(save);
+    this.pendingSettingsSaves.set(key, saves);
+    try {
+      return await save;
+    } finally {
+      saves.delete(save);
+      if (saves.size === 0 && this.pendingSettingsSaves.get(key) === saves)
+        this.pendingSettingsSaves.delete(key);
+    }
+  }
+
+  private async runSettingsSave(
+    workspaceId: string,
+    serverName: string,
+    set: Record<string, MCPSettingValue>,
+    instanceToken: string,
+    options?: { signal?: AbortSignal }
+  ): Promise<MCPSettingsReadSnapshot> {
+    // Validate against a fresh read: the renderer's schema can be stale.
+    const prior = await this.readSettings(workspaceId, serverName, options);
+    if (prior === null) throw new Error(`MCP server '${serverName}' has no settings`);
+    // Another instance (restarted or replaced since the dialog read): the save still lands when
+    // it shows the schema the dialog validated against, else the user must reopen.
+    if (!this.isSettingsTokenAccepted(workspaceId, serverName, prior.instanceToken, instanceToken))
+      throw staleSettingsInstanceError(serverName);
+    const values = await this.updateSettings(
+      workspaceId,
+      serverName,
+      set,
+      prior,
+      prior.instanceToken
+    );
+    try {
+      const after = await this.readSettings(workspaceId, serverName, options);
+      if (after !== null) return after;
+    } catch (error) {
+      // The update landed: report it as saved with the schema from before.
+      log.warn(`[MCP] Settings read after the update of '${serverName}' failed`, {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+    return { ...prior, values };
   }
 
   /**
@@ -5039,7 +5656,9 @@ export class MCPServerManager {
     workspaceId: string,
     serverName: string,
     set: Record<string, MCPSettingValue>,
-    prior: Pick<MCPSettingsSnapshot, "properties" | "values">
+    prior: Pick<MCPSettingsSnapshot, "properties" | "values">,
+    /** The instance `prior` came from: another instance refuses the update. */
+    expectedInstanceToken: string
   ): Promise<Record<string, MCPSettingValue>> {
     const { properties } = prior;
     for (const [name, value] of Object.entries(set)) {
@@ -5056,7 +5675,12 @@ export class MCPServerManager {
       `MCP settings update for '${serverName}'`,
       (instance) => {
         source ??= { instance, requestId: this.takeSettingsRequestId(instance, workspaceId) };
-        return (dispatched ??= this.callSettingsTool(instance, workspaceId, "updateTool", { set }));
+        return (dispatched ??= this.sendSettingsUpdate(
+          instance,
+          workspaceId,
+          set,
+          expectedInstanceToken
+        ));
       },
       (content) => {
         const warnings: string[] = [];
@@ -5072,6 +5696,19 @@ export class MCPServerManager {
     if (source !== undefined)
       this.cacheSettings(source.instance, workspaceId, source.requestId, values);
     return values;
+  }
+
+  /** The update tool call; refused when `expectedInstanceToken` names another instance. */
+  private sendSettingsUpdate(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    set: Record<string, MCPSettingValue>,
+    expectedInstanceToken: string
+  ): Promise<unknown> {
+    // The caller validated `set` against the schema of the instance that sent it.
+    if (this.settingsInstanceToken(instance) !== expectedInstanceToken)
+      return Promise.reject(staleSettingsInstanceError(instance.name));
+    return this.callSettingsTool(instance, workspaceId, "updateTool", { set });
   }
 
   /** Host-only MCP Apps record (raw tool result) for a tool call, or null when missing. */
@@ -5095,6 +5732,17 @@ export class MCPServerManager {
       toolName: record.toolName,
       text,
     });
+  }
+
+  /** window.openai widget state of the view of a result record; see McpAppResultStore. */
+  async setMcpAppWidgetState(
+    workspaceId: string,
+    toolCallId: string,
+    binding: string,
+    state: unknown
+  ): Promise<void> {
+    assert(this.mcpApps, "MCP Apps support is not configured");
+    await this.mcpApps.store.setWidgetState(workspaceId, toolCallId, binding, state);
   }
 
   /** The views' latest model context, newest first; none while MCP Apps is off. */
@@ -5307,6 +5955,7 @@ export class MCPServerManager {
             resourceUri: tool.resourceUri,
             arguments: {},
             result,
+            entrypoint: true,
           });
           return {
             serverName,
@@ -5343,6 +5992,30 @@ export class MCPServerManager {
       : displayConnectionKey(serverName);
   }
 
+  private readonly appCatalogListeners = new Set<(workspaceId: string) => void>();
+
+  /**
+   * Calls `listener` with the workspace of an MCP Apps server that sent tools/list_changed: its
+   * entry points can have changed (mcpApps.onEntrypointsChanged). Returns the unsubscribe.
+   */
+  onMcpAppCatalogChanged(listener: (workspaceId: string) => void): () => void {
+    this.appCatalogListeners.add(listener);
+    return () => this.appCatalogListeners.delete(listener);
+  }
+
+  /** The client option that reports a connection's tools/list_changed (MCP Apps only). */
+  private appCatalogChangeOption(
+    appResultStore: McpAppResultStore | null,
+    workspaceId: string | undefined
+  ): { onToolsListChanged?: () => void } {
+    if (appResultStore === null || workspaceId === undefined) return {};
+    return {
+      onToolsListChanged: () => {
+        for (const listener of [...this.appCatalogListeners]) listener(workspaceId);
+      },
+    };
+  }
+
   /** Effective tool allowlist of a server for MCP Apps calls (read at dispatch). */
   private appToolAllowlist(workspaceId: string, serverName: string): Set<string> | null {
     return effectiveToolAllowlist(
@@ -5375,11 +6048,12 @@ export class MCPServerManager {
     workspaceId: string,
     order: number,
     record: Parameters<McpAppResultStore["record"]>[1]
-  ): Promise<void> {
+  ): Promise<boolean> {
     const key = `${workspaceId}\0${record.toolCallId}`;
-    if ((this.entrypointStoredOpens.get(key) ?? 0) > order) return;
+    // A newer open's result is stored: this view shows it, which counts as stored.
+    if ((this.entrypointStoredOpens.get(key) ?? 0) > order) return true;
     this.entrypointStoredOpens.set(key, order);
-    await store.record(workspaceId, record);
+    return store.record(workspaceId, record);
   }
 
   /** The view tool-call budget (mcpAppHost), applied per workspace and server. */
@@ -6043,7 +6717,7 @@ export class MCPServerManager {
 
     if (command?.trim()) {
       return runServerTest(
-        { transport: "stdio", command },
+        { transport: "stdio", command, hostEnv: "inherit" },
         projectPath,
         "command",
         trimmedName ?? "command"
@@ -7159,6 +7833,7 @@ export class MCPServerManager {
             runtime.exec(launch.command, {
               cwd: launch.cwd ?? workspacePath,
               ...(launch.env !== undefined ? { env: launch.env } : {}),
+              hostEnv: launch.hostEnv,
               timeout: 60 * 60 * 24, // 24 hours — process lifetime, not startup
               abortSignal: AbortSignal.any([launchSignal, processAbort.signal]),
             }),
@@ -7338,6 +8013,7 @@ export class MCPServerManager {
             transport,
             ...(prior !== undefined ? { prior } : {}),
             mcpApps: appResultStore !== null,
+            ...this.appCatalogChangeOption(appResultStore, workspaceId),
           });
         } catch (error) {
           // The connect failure may have been the negotiation probe killing a
@@ -7530,6 +8206,7 @@ export class MCPServerManager {
             onUncaughtError,
             ...(prior !== undefined ? { prior } : {}),
             mcpApps: appResultStore !== null,
+            ...this.appCatalogChangeOption(appResultStore, workspaceId),
           }),
         signal,
         { workspaceId, releaseAfterMs: MCP_LAUNCH_INITIATION_FENCE_MS }
@@ -7548,6 +8225,7 @@ export class MCPServerManager {
             onUncaughtError,
             ...(prior !== undefined ? { prior } : {}),
             mcpApps: appResultStore !== null,
+            ...this.appCatalogChangeOption(appResultStore, workspaceId),
           }),
         signal,
         { workspaceId, releaseAfterMs: MCP_LAUNCH_INITIATION_FENCE_MS }
@@ -7763,4 +8441,72 @@ export class MCPServerManager {
       signal.removeEventListener("abort", onAbort);
     }
   }
+}
+
+function assertSettingsAppStored(stored: boolean, title: string): void {
+  if (!stored) throw new Error(`Xum could not keep the result of '${title}'. Try again.`);
+}
+
+/** A CallToolResult content part's text; "" for any other part. */
+function textPartOf(part: unknown): string {
+  if (part === null || typeof part !== "object" || Reflect.get(part, "type") !== "text") return "";
+  return String(Reflect.get(part, "text"));
+}
+
+/** A settings tool action's result for the dialog: its text parts, bounded. */
+function settingsToolResultText(result: MCPRawCallToolResult): { text: string; isError: boolean } {
+  const parts: unknown[] = Array.isArray(result.content) ? result.content : [];
+  // Collected only up to the bound (one unit past it, so the bound still marks the cut): many
+  // or huge server parts must not build an unbounded string first.
+  let text = "";
+  for (const part of parts) {
+    if (text.length > MAX_MCP_SETTINGS_TOOL_RESULT) break;
+    const partText = textPartOf(part);
+    if (partText === "") continue;
+    const room = MAX_MCP_SETTINGS_TOOL_RESULT + 1 - text.length;
+    text += (text.length > 0 ? "\n" : "") + partText.slice(0, room);
+  }
+  return { text: boundMCPSettingsToolResult(text), isError: result.isError === true };
+}
+
+/** Instance tokens whose settings schema is remembered (settingsSchemaHashes). */
+const MAX_REMEMBERED_SETTINGS_SCHEMAS = 256;
+
+function settingsSaveKey(workspaceId: string, serverName: string): string {
+  return `${workspaceId}\0${serverName}`;
+}
+
+/** Wait for `work` or the first abort of `signals`, then drop the abort listener. */
+async function raceUntilAborted(work: Promise<unknown>, signals: AbortSignal[]): Promise<void> {
+  const stop = AbortSignal.any(signals);
+  const onStop = Promise.withResolvers<void>();
+  const resolve = () => onStop.resolve();
+  if (stop.aborted) resolve();
+  stop.addEventListener("abort", resolve, { once: true });
+  try {
+    await Promise.race([work, onStop.promise]);
+  } finally {
+    stop.removeEventListener("abort", resolve);
+  }
+}
+
+function settingsSchemaKey(workspaceId: string, serverName: string, token: string): string {
+  return `${settingsSaveKey(workspaceId, serverName)}\0${token}`;
+}
+
+/**
+ * What a save or a tool action checks a restarted instance against (isSettingsTokenAccepted):
+ * the schema and its layout, tool actions included, never the values.
+ */
+function settingsSchemaHash(snapshot: Pick<MCPSettingsSnapshot, "properties" | "layout">): string {
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify([snapshot.properties, snapshot.layout]))
+    .digest("hex");
+}
+
+function staleSettingsInstanceError(serverName: string): Error {
+  return new Error(
+    `MCP server '${serverName}' was restarted or replaced since its settings were read. Reopen the dialog to see its current settings.`
+  );
 }

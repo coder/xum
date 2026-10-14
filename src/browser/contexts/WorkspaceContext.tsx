@@ -18,10 +18,8 @@ import type { ParsedRuntime, RuntimeConfig } from "@/common/types/runtime";
 import type { DeepLinkPayload } from "@/common/types/deepLink";
 import {
   getDraftScopeId,
-  getPendingScopeId,
   getRightSidebarLayoutKey,
   getTerminalTitlesKey,
-  getWorkspaceNameStateKey,
   SELECTED_WORKSPACE_KEY,
 } from "@/common/constants/storage";
 import { copyWorkspaceStorage, deleteWorkspaceStorage } from "@/browser/utils/workspaceStorage";
@@ -68,6 +66,7 @@ import {
   useDraftStoreReady,
   type CreationDraftsByProject,
   type DraftStoreScope,
+  type DraftView,
   type WorkspaceDraft,
 } from "@/browser/stores/DraftStore";
 import { createDraftId } from "@/common/utils/drafts";
@@ -117,30 +116,17 @@ type WorkspaceDraftPromotionsByProject = Record<string, Record<string, FrontendW
  * An empty draft can be reused when the user clicks "New Workspace" instead of creating another.
  */
 function isDraftEmpty(projectPath: string, draftId: string): boolean {
-  const scopeId = getDraftScopeId(projectPath, draftId);
-
-  // Text and attachments live in the backend-backed draft store (hydrated before render).
-  const draft = getDraftStore().getView({ kind: "creation", projectPath, draftId });
-  if (draft.text.trim().length > 0 || draft.attachmentCount > 0) {
-    return false;
-  }
-
-  // Check for workspace name state (auto-generated or manual)
-  const nameState = readPersistedState<unknown>(getWorkspaceNameStateKey(scopeId), null);
-  if (nameState !== null) {
-    return false;
-  }
-
-  return true;
+  return isDraftViewEmpty(getDraftStore().getView({ kind: "creation", projectPath, draftId }));
 }
 
 /** Whether the project's default creation composer (bare project page) holds nothing. */
 function isDefaultCreationDraftEmpty(projectPath: string): boolean {
-  const draft = getDraftStore().getView(defaultCreationDraftScope(projectPath));
-  if (draft.text.trim().length > 0 || draft.attachmentCount > 0) return false;
-  // A workspace name typed there counts too, as in isDraftEmpty.
-  const scopeId = getPendingScopeId(projectPath);
-  return readPersistedState<unknown>(getWorkspaceNameStateKey(scopeId), null) === null;
+  return isDraftViewEmpty(getDraftStore().getView(defaultCreationDraftScope(projectPath)));
+}
+
+/** The draft store (hydrated before render) holds the text, attachments and workspace name. */
+function isDraftViewEmpty(draft: DraftView): boolean {
+  return draft.text.trim().length === 0 && draft.attachmentCount === 0 && draft.nameState === null;
 }
 
 /**
@@ -1816,17 +1802,15 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       // One-time migration: if the user has an old per-project pending draft, move it
       // into the first draft scope so it stays accessible.
       // The default creation composer's draft (no draft id) moves into the first listed one.
-      if (existingDrafts.length === 0) {
-        const defaultScope = defaultCreationDraftScope(projectPath);
-        const pending = getDraftStore().getView(defaultScope);
-        if (pending.text.trim().length > 0 || pending.attachmentCount > 0) {
-          moveCreationDraftBody(
-            { scope: defaultScope, storageScopeId: getPendingScopeId(projectPath) },
-            { projectPath, draftId }
-          );
-        }
+      if (existingDrafts.length === 0 && !isDefaultCreationDraftEmpty(projectPath)) {
+        // One backend step moves the body (its workspace name included) and lists the row; the
+        // new draft shows the moved content at once.
+        getDraftStore()
+          .moveCreationDraft(defaultCreationDraftScope(projectPath), { projectPath, ...draft })
+          .catch((error: unknown) => console.warn("Failed to move the default draft:", error));
+      } else {
+        getDraftStore().putCreationDraft(projectPath, draft);
       }
-      getDraftStore().putCreationDraft(projectPath, draft);
 
       navigateToProject(projectPath, draftId, { replace: options?.replace });
     },

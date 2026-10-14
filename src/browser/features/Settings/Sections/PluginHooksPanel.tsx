@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { useAPI } from "@/browser/contexts/API";
 import { Button } from "@/browser/components/Button/Button";
 import { cn } from "@/common/lib/utils";
+import { effectiveHookTimeoutSeconds } from "@/constants/pluginHooks";
 import type {
   AgentPluginHook,
   AgentPluginHooks,
@@ -13,15 +14,30 @@ import { getErrorMessage } from "@/common/utils/errors";
 
 /** One-line handler summary, shared by the consent preview and the review panel. */
 export function describePluginHookHandler(handler: PluginHookHandler): string {
-  return handler.type === "mcp_tool"
-    ? // The timeout is part of what the user trusts (and of the hash): a changed hook may differ
-      // only there.
-      `MCP tool ${handler.server} / ${handler.tool}, ${
-        handler.timeoutSeconds === undefined
-          ? "default timeout"
-          : `timeout ${handler.timeoutSeconds}s`
-      }`
-    : `${handler.type}: ${handler.summary}`;
+  if (handler.type !== "mcp_tool") return `${handler.type}: ${handler.summary}`;
+  const summary = `MCP tool ${handler.server} / ${handler.tool}, ${describeHookTimeout(handler.timeoutSeconds)}`;
+  return summary + describeStatusMessage(handler.statusMessage);
+}
+
+/**
+ * Codex lists the status message with the hook (discovery.rs). The user sees it while the hook
+ * runs, so it is part of what they review (Codex PRRT_kwDOPxxmWM6rQdyp). React escapes it.
+ */
+function describeStatusMessage(statusMessage: string | undefined): string {
+  return statusMessage !== undefined ? `, status "${statusMessage}"` : "";
+}
+
+/**
+ * The timeout the call runs with (the runner caps it), not the parsed value: 2^64 must not show
+ * as a 20-digit timeout. The declared value is part of what the user trusts (and of the hash),
+ * so a changed hook may differ only there: a capped one also names what it declares.
+ */
+function describeHookTimeout(declaredSeconds: number | undefined): string {
+  const seconds = effectiveHookTimeoutSeconds(declaredSeconds);
+  if (declaredSeconds === undefined) return `default timeout ${seconds}s`;
+  return declaredSeconds === seconds
+    ? `timeout ${seconds}s`
+    : `timeout ${seconds}s (declares ${declaredSeconds > 1e9 ? "over 10^9" : declaredSeconds}s, capped)`;
 }
 
 /** Shown characters of a hook's input: the review renders before the user trusts anything. */
@@ -79,6 +95,9 @@ const REVIEW_LABEL: Record<PluginHookReviewState, { text: string; className: str
 export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> = (props) => {
   const { api } = useAPI();
   const [data, setData] = useState<AgentPluginHooks | null>(null);
+  // The last load's error and the last decision's error, apart: a successful reload clears only
+  // its own (Codex PRRT_kwDOPxxmWM6rgooW), and a refused decision stays visible after its reload.
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(true);
   const [loadAttempt, setLoadAttempt] = useState(0);
@@ -95,13 +114,13 @@ export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> =
         if (ignore) return;
         // A failed reload clears the list: after a decision, the old review states are stale.
         setData(result.success ? result.data : null);
-        if (!result.success) setError(result.error);
+        setLoadError(result.success ? null : result.error);
         setBusy(false);
       },
       (err: unknown) => {
         if (ignore) return;
         setData(null);
-        setError(getErrorMessage(err));
+        setLoadError(getErrorMessage(err));
         setBusy(false);
       }
     );
@@ -141,10 +160,13 @@ export const PluginHooksPanel: React.FC<{ name: string; onClose: () => void }> =
           Loading hooks…
         </p>
       )}
-      {error && (
-        <p role="alert" className="text-destructive text-xs break-words">
-          {error}
-        </p>
+      {[loadError, error].map(
+        (message, index) =>
+          message && (
+            <p key={index} role="alert" className="text-destructive text-xs break-words">
+              {message}
+            </p>
+          )
       )}
       {data?.hooks.length === 0 && <p className="text-muted text-xs">No hooks.json hooks.</p>}
       {data && data.hooks.length > 0 && (

@@ -6,7 +6,12 @@ import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { parseSkillLookupName } from "@/common/utils/agentSkills/skillLookupName";
-import { readAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
+import {
+  readAgentSkill,
+  type ResolvedAgentSkill,
+} from "@/node/services/agentSkills/agentSkillsService";
+import { pluginSiblingNoteFor } from "@/node/services/agentSkills/pluginSiblingNote";
+import type { InvocableSkill } from "@/common/types/agentSkill";
 import { readPluginFileWithinRootCapped } from "@/node/services/agentPlugins/discovery";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
@@ -111,6 +116,21 @@ function numberPageLines(
   }
 
   return { numberedLines };
+}
+
+/**
+ * Files of a plugin skill (playbooks, references) name sibling skills by bare
+ * name too, so they carry the plugin sibling note. It is a separate field so
+ * `content` line numbers stay exact.
+ */
+function withPluginSkillNote(
+  result: AgentSkillReadFileToolResult,
+  resolvedSkill: ResolvedAgentSkill,
+  availableSkills: readonly InvocableSkill[] | undefined
+): AgentSkillReadFileToolResult {
+  if (!result.success) return result;
+  const note = pluginSiblingNoteFor(resolvedSkill, availableSkills);
+  return note == null ? result : { ...result, pluginSkillNote: note };
 }
 
 /**
@@ -292,13 +312,17 @@ export const createAgentSkillReadFileTool: ToolFactory = (config: ToolConfigurat
           throw err;
         }
 
-        return readContentWithFileReadLimits({
-          fullContent,
-          fileSize: resultFileSize,
-          modifiedTime: resultModifiedTime,
-          offset,
-          limit,
-        });
+        return withPluginSkillNote(
+          readContentWithFileReadLimits({
+            fullContent,
+            fileSize: resultFileSize,
+            modifiedTime: resultModifiedTime,
+            offset,
+            limit,
+          }),
+          resolvedSkill,
+          config.availableSkills
+        );
       } catch (error) {
         return {
           success: false,

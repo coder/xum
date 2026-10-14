@@ -168,6 +168,11 @@ export interface MockORPCClientOptions {
     updateReview?: AgentPluginUpdateReview;
     /** agentPlugins.getHooks data by plugin name; setHookTrust updates it in memory. */
     hooks?: Record<string, AgentPluginHooks>;
+    /**
+     * Returned by agentPlugins.previewComponentReview for the named plugin. Confirming clears the
+     * plugin's reviewRequiredCount in `items`, like the backend does.
+     */
+    componentReview?: AgentPluginUpdateReview;
   };
   projects?: Map<string, ProjectConfig>;
   workspaces?: FrontendWorkspaceMetadata[];
@@ -244,9 +249,13 @@ export interface MockORPCClientOptions {
     states?: Record<string, unknown>;
   };
   /** MCP Apps views: mcpApps.getView by tool call ID, mcpApps.callTool per request. */
+  /** When set, mcpApps.listViewDomains fails with this error (Settings' load error). */
+  mcpAppViewDomainsListError?: string;
   mcpApps?: {
     views: Record<string, McpAppView>;
     callTool?: (input: { toolName: string; consented: boolean }) => McpAppToolCallResult;
+    /** When set, every approveViewDomains call fails with this error. */
+    approveViewDomainsError?: string;
   };
   /** Initial updater status for update.onStatus (About dialog stories). */
   updateStatus?: UpdateStatus;
@@ -332,10 +341,25 @@ export interface MockORPCClientOptions {
   mcpSettingsReads?: string[][];
   /** Servers whose settings read fails with this message. */
   mcpSettingsReadErrors?: Map<string, string>;
-  /** When set, settings updates wait for this promise (stories hold a save in flight). */
-  mcpSettingsUpdateGate?: { promise: Promise<void> };
+  /**
+   * When set, settings updates wait for this promise (stories hold a save in flight). A list
+   * holds each update on its own gate, in call order.
+   */
+  mcpSettingsUpdateGate?: { promise: Promise<void> } | Array<{ promise: Promise<void> }>;
+  /**
+   * Per server: the snapshot the server shows after its next update (the update's values are
+   * merged in). Stories use it for a schema that changes with the values.
+   */
+  mcpSettingsAfterUpdate?: Map<string, MCPSettingsSnapshot>;
   /** When set, the first settings read takes its values, then waits for this promise. */
   mcpSettingsFirstReadGate?: { promise: Promise<void> };
+  /**
+   * Records every settings tool action run or app open. A run returns "<tool> finished"; an app
+   * opens the view `settings:<server>:<tool>` (`ui://<server>/<tool>`) of `mcpApps.views`.
+   */
+  mcpSettingsToolRuns?: Array<{ toolName: string; confirmed: boolean }>;
+  /** When set, the first settings tool run waits for this promise (a run held in flight). */
+  mcpSettingsToolRunGate?: { promise: Promise<void> };
   /** When set, mcp.test waits for this promise (stories hold a Fetch Tools in flight). */
   mcpTestGate?: { promise: Promise<void> };
   /** Session icon registry for mcp.icon - maps iconRef to a PNG data URL (unknown refs resolve null) */
@@ -485,7 +509,10 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     mcpSettingsReads,
     mcpSettingsReadErrors,
     mcpSettingsUpdateGate,
+    mcpSettingsAfterUpdate,
     mcpSettingsFirstReadGate,
+    mcpSettingsToolRuns,
+    mcpSettingsToolRunGate,
     mcpTestGate,
     mcpIcons = new Map<string, string>(),
     mcpOauthAuthStatus = new Map<string, MCPOAuthAuthStatus>(),
@@ -1374,6 +1401,37 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           : Promise.resolve({ success: false, error: `No update review mock for '${input.name}'` }),
       update: (input: { name: string }) =>
         Promise.resolve({ success: false, error: `No update mock for '${input.name}'` }),
+      previewComponentReview: (input: { name: string }) =>
+        agentPluginsMock?.componentReview?.name === input.name
+          ? Promise.resolve({ success: true, data: agentPluginsMock.componentReview })
+          : Promise.resolve({
+              success: false,
+              error: `No component review mock for '${input.name}'`,
+            }),
+      confirmComponentReview: (input: { name: string; expectedLockedSha: string }) => {
+        const item = agentPluginsMock?.items?.find((entry) => entry.name === input.name);
+        if (item === undefined) {
+          return Promise.resolve({ success: false, error: `No plugin '${input.name}'` });
+        }
+        item.reviewRequiredCount = 0;
+        return Promise.resolve({
+          success: true,
+          data: {
+            entry: {
+              name: item.name,
+              scope: "global" as const,
+              source: item.source ?? {
+                type: "git" as const,
+                url: "",
+                ref: "main",
+                refType: "branch" as const,
+              },
+              lockedSha: input.expectedLockedSha,
+              installedAt: item.installedAt ?? new Date().toISOString(),
+            },
+          },
+        });
+      },
     },
     mcp: {
       settings: {
@@ -1390,19 +1448,69 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             const snapshot = mcpSettings?.get(serverName);
             return {
               success: true,
-              data: snapshot === undefined ? null : structuredClone(snapshot),
+              data:
+                snapshot === undefined
+                  ? null
+                  : { ...structuredClone(snapshot), instanceToken: mockSettingsToken(serverName) },
             };
           };
           const result = Object.fromEntries(input.serverNames.map((name) => [name, readOne(name)]));
           if (first) await mcpSettingsFirstReadGate?.promise;
           return result;
         },
-        update: async (input: { serverName: string; set: Record<string, MCPSettingValue> }) => {
-          await mcpSettingsUpdateGate?.promise;
-          const snapshot = mcpSettings?.get(input.serverName);
-          if (snapshot === undefined) return { success: false, error: "No settings mock" };
-          snapshot.values = { ...snapshot.values, ...input.set };
-          return { success: true, data: snapshot.values };
+        update: async (input: {
+          serverName: string;
+          set: Record<string, MCPSettingValue>;
+          instanceToken: string;
+        }) => {
+          await (Array.isArray(mcpSettingsUpdateGate)
+            ? mcpSettingsUpdateGate.shift()?.promise
+            : mcpSettingsUpdateGate?.promise);
+          const stored = mcpSettings?.get(input.serverName);
+          if (stored === undefined) return { success: false, error: "No settings mock" };
+          if (input.instanceToken !== mockSettingsToken(input.serverName))
+            return { success: false, error: "The server was replaced. Reopen the dialog." };
+          const after = mcpSettingsAfterUpdate?.get(input.serverName);
+          mcpSettingsAfterUpdate?.delete(input.serverName);
+          const snapshot = after === undefined ? stored : structuredClone(after);
+          snapshot.values = { ...stored.values, ...snapshot.values, ...input.set };
+          mcpSettings?.set(input.serverName, snapshot);
+          return {
+            success: true,
+            data: {
+              ...structuredClone(snapshot),
+              instanceToken: mockSettingsToken(input.serverName),
+            },
+          };
+        },
+        openApp: (input: { serverName: string; toolName: string; confirmed: boolean }) => {
+          mcpSettingsToolRuns?.push({ toolName: input.toolName, confirmed: input.confirmed });
+          // The backend titles the view with the action's display name.
+          const action = mcpSettings
+            ?.get(input.serverName)
+            ?.layout.flatMap((group) => group.items)
+            .find((item) => item.kind === "tool" && item.tool === input.toolName);
+          return Promise.resolve({
+            success: true,
+            data: {
+              viewKey: `settings:${input.serverName}:${input.toolName}`,
+              serverName: input.serverName,
+              // A plugin server's label, as the backend gives one (it differs from the key).
+              serverLabel: `cad-plugin · ${input.serverName}`,
+              toolName: input.toolName,
+              title: (action?.kind === "tool" ? action.action?.title : undefined) ?? input.toolName,
+              resourceUri: `ui://${input.serverName}/${input.toolName}`,
+            },
+          });
+        },
+        runTool: async (input: { toolName: string; confirmed: boolean }) => {
+          const gated = mcpSettingsToolRuns?.length === 0 ? mcpSettingsToolRunGate : undefined;
+          mcpSettingsToolRuns?.push({ toolName: input.toolName, confirmed: input.confirmed });
+          await gated?.promise;
+          return {
+            success: true,
+            data: { text: `${input.toolName} finished`, isError: false },
+          };
         },
       },
       list: (input?: { projectPath?: string }) => {
@@ -2458,6 +2566,12 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         serverName: string;
         origins: string[];
       }) => {
+        if (mcpApps?.approveViewDomainsError != null) {
+          return Promise.resolve({
+            success: false as const,
+            error: mcpApps.approveViewDomainsError,
+          });
+        }
         const view = mcpApps?.views[input.toolCallId];
         const entry = {
           projectPath: view?.approvalProjectPath ?? "",
@@ -2474,7 +2588,16 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           data: { approvedDomains: entry.origins, revision: ++mockViewDomainsRevision },
         });
       },
-      listViewDomains: () => Promise.resolve([...mockViewDomains.values()]),
+      setWidgetState: () => Promise.resolve({ success: true as const, data: {} }),
+      listViewDomains: () =>
+        options.mcpAppViewDomainsListError != null
+          ? Promise.reject(new Error(options.mcpAppViewDomainsListError))
+          : Promise.resolve([...mockViewDomains.values()]),
+      readViewDomains: () =>
+        Promise.resolve({
+          revision: ++mockViewDomainsRevision,
+          approvals: [...mockViewDomains.values()],
+        }),
       revokeViewDomains: (input: { projectPath: string; serverName: string }) => {
         mockViewDomains.delete(JSON.stringify([input.projectPath, input.serverName]));
         return Promise.resolve({ revision: ++mockViewDomainsRevision });
@@ -2558,4 +2681,9 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
     },
   } as unknown as APIClient;
+}
+
+/** The mock's settings servers never restart: one instance token per server name. */
+function mockSettingsToken(serverName: string): string {
+  return `mock-instance:${serverName}`;
 }

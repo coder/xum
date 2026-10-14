@@ -10,8 +10,10 @@ import { GITHUB_SHORTHAND_PATTERN, normalizeRepoUrlForClone } from "@/node/utils
  * Accepted inputs (one text field):
  * - `owner/repo` — GitHub shorthand
  * - `owner/repo@ref` — shorthand with a branch, tag, or full 40-hex commit SHA
- * - `owner/repo/sub/path[@ref]` — shorthand with a monorepo subpath (parsed
- *   and persisted from day one; the v1 installer rejects subpath installs)
+ * - `owner/repo/sub/path[@ref]` — shorthand with a monorepo subpath: only
+ *   that folder is fetched (sparse checkout) and installed as the plugin root.
+ *   The ref splits at the FIRST `@`, so a subpath containing `@` cannot be
+ *   written as shorthand; pass it through the API `subpath` argument instead.
  * - any git remote URL (`https://…`, `ssh://…`, `git@host:path`, `file://…`,
  *   absolute local paths) — passed to git unchanged; refs for URL inputs come
  *   from the separate ref field because `@` is ambiguous inside URLs
@@ -22,7 +24,7 @@ export interface ParsedAgentPluginSourceInput {
   url: string;
   /** Branch/tag name or full commit SHA parsed from `@ref` shorthand. */
   ref?: string;
-  /** Repo-relative plugin directory parsed from shorthand (monorepo installs; v2). */
+  /** Repo-relative plugin directory parsed from shorthand (normalized; see normalizeAgentPluginSubpath). */
   subpath?: string;
 }
 
@@ -64,6 +66,59 @@ export function assertNoAgentPluginUrlCredentials(url: string): void {
   if (hasUrlCredentials(url)) {
     throw new Error(
       "Remove the embedded credentials from the URL. Private repositories authenticate via git credential helpers or SSH."
+    );
+  }
+}
+
+/**
+ * Validate and normalize a repo-relative plugin folder (`a/b/c`). Throws a
+ * user-facing error for anything that could leave the repository or be read
+ * as a pattern: absolute paths, `.`/`..`/empty segments, `.git`, control
+ * characters, and sparse-checkout/glob specials (`* ? [ ] \ ! #`). Applied
+ * to parsed shorthand and again at the installer boundary, because registry
+ * entries and direct API sources never pass through the parser.
+ */
+export function normalizeAgentPluginSubpath(raw: string): string {
+  let subpath = raw.trim();
+  if (subpath.endsWith("/")) {
+    subpath = subpath.slice(0, -1);
+  }
+  if (subpath.length === 0) {
+    throw new Error("The plugin subpath must not be empty.");
+  }
+  // `/abs`, `~/home`, and Windows drive letters (`C:`).
+  if (/^(?:[/~]|[a-zA-Z]:)/.test(subpath)) {
+    throw new Error(
+      `'${subpath}' is an absolute path. The plugin subpath must be relative to the repository root.`
+    );
+  }
+  // eslint-disable-next-line no-control-regex -- rejecting control characters is the point
+  if (/[\u0000-\u001f\u007f]/.test(subpath)) {
+    throw new Error("The plugin subpath must not contain control characters.");
+  }
+  if (/[*?[\]\\!#]/.test(subpath)) {
+    throw new Error(
+      `'${subpath}' contains a character that is not allowed in a plugin subpath (* ? [ ] \\ ! #).`
+    );
+  }
+  for (const segment of subpath.split("/")) {
+    assertValidSubpathSegment(subpath, segment);
+  }
+  return subpath;
+}
+
+function assertValidSubpathSegment(subpath: string, segment: string): void {
+  if (segment.length === 0 || segment === "." || segment === "..") {
+    throw new Error(
+      `'${subpath}' is not a valid plugin subpath. Use a folder path inside the repository, like path/to/plugin (no empty, '.' or '..' parts).`
+    );
+  }
+  if (segment.toLowerCase() === ".git") {
+    throw new Error(`'${subpath}' points into the .git folder, which is not a plugin folder.`);
+  }
+  if (segment !== segment.trim()) {
+    throw new Error(
+      `'${subpath}' has a path part that starts or ends with whitespace, which is not allowed in a plugin subpath.`
     );
   }
 }
@@ -123,7 +178,9 @@ export function parseAgentPluginSourceInput(rawInput: string): ParsedAgentPlugin
     throw new Error("Ref after '@' must not be empty (use owner/repo@branch, @tag, or @sha).");
   }
 
-  const segments = pathPart.split("/");
+  // One trailing slash is harmless (`owner/repo/`, `owner/repo/sub/`); any
+  // other empty segment (`owner/repo//sub`) is a typo, not an absolute path.
+  const segments = pathPart.replace(/\/$/, "").split("/");
   if (segments.length < 2 || segments.some((segment) => segment.length === 0)) {
     throw new Error(
       `'${input}' is not a git URL or owner/repo shorthand. Examples: coder/mux, coder/mux@main, https://github.com/coder/mux.git`
@@ -135,10 +192,13 @@ export function parseAgentPluginSourceInput(rawInput: string): ParsedAgentPlugin
     throw new Error(`'${ownerRepo}' is not a valid owner/repo shorthand.`);
   }
 
-  const subpath = segments.slice(2).join("/");
+  // Everything after owner/repo is the plugin folder; normalizing here
+  // rejects escapes like `owner/repo/../x` before anything is fetched.
   return {
     url: normalizeRepoUrlForClone(ownerRepo).cloneUrl,
     ...(refPart !== undefined ? { ref: refPart } : {}),
-    ...(subpath.length > 0 ? { subpath } : {}),
+    ...(segments.length > 2
+      ? { subpath: normalizeAgentPluginSubpath(segments.slice(2).join("/")) }
+      : {}),
   };
 }

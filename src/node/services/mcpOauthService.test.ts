@@ -12,8 +12,14 @@ import {
   probeServerForBearerChallenge,
   resolveOAuthScope,
 } from "./mcpOauthService";
-import type { OAuthDiscoveryState } from "@modelcontextprotocol/client";
+import {
+  auth,
+  type OAuthClientProvider,
+  type OAuthDiscoveryState,
+} from "@modelcontextprotocol/client";
 import { Ok } from "@/common/types/result";
+import type { TelemetryService } from "@/node/services/telemetryService";
+import type { Result } from "@/common/types/result";
 import type { MCPServerOAuthConfig } from "@/common/types/mcp";
 import type {
   MCPOAuthClientInformation,
@@ -218,6 +224,38 @@ describe("McpOauthService store", () => {
     } finally {
       await fs.rm(otherProjectPath, { recursive: true, force: true });
     }
+  });
+
+  test("a corrupt store whose repair cannot be written still serves from memory", async () => {
+    if (process.getuid?.() === 0) return; // root ignores the read-only directory
+    await fs.writeFile(getStoreFilePath(xumHome), "{ not json");
+    await fs.chmod(xumHome, 0o500);
+    try {
+      expect(await service.hasAuthTokens({ serverUrl })).toBe(false);
+      expect((await service.logout({ serverUrl })).success).toBe(true);
+    } finally {
+      await fs.chmod(xumHome, 0o700);
+    }
+  });
+
+  test("a sign-out whose store write fails can be retried (#6122)", async () => {
+    if (process.getuid?.() === 0) return; // root ignores the read-only directory
+    await seedStoredCredentials({
+      clientInformation: { client_id: "client-id" },
+      tokens: { access_token: "access-token", token_type: "Bearer" },
+    });
+    expect(await service.hasAuthTokens({ serverUrl })).toBe(true);
+    await fs.chmod(xumHome, 0o500);
+    try {
+      expect((await service.logout({ serverUrl })).success).toBe(false);
+    } finally {
+      await fs.chmod(xumHome, 0o700);
+    }
+    // The failed write did not remove the credentials: they still read as stored, and the
+    // retry writes the sign-out.
+    expect(await service.hasAuthTokens({ serverUrl })).toBe(true);
+    expect((await service.logout({ serverUrl })).success).toBe(true);
+    expect(Object.keys((await readStoreFile()).entries)).toEqual([]);
   });
 
   test("set/get/clear works via hasAuthTokens + logout", async () => {
@@ -825,6 +863,197 @@ describe("McpOauthService OAuth flows", () => {
     });
   });
 
+  // A sign-in's deadline and Cancel must cover authorization-server discovery: a stalled
+  // metadata request must not keep the start pending (and the desktop listener bound) (#6164).
+  // A flow that settles before its start event sends no end event either (#6565).
+  test.each([
+    ["plugin registrationUrl discovery", true, false, []],
+    ["SDK discovery", false, false, ["mcp_oauth_flow_started", "mcp_oauth_flow_failed"]],
+    ["scope lookup", false, true, []],
+  ])(
+    "a sign-in settled during stalled %s returns at once",
+    async (_label, withRegistrationUrl, stallScope, events) => {
+      const captured: string[] = [];
+      await service.dispose();
+      service = new McpOauthService(config, mcpConfigService, undefined, {
+        capture: (payload: { event: string }) => captured.push(payload.event),
+      } as unknown as TelemetryService);
+      let stalled!: () => void;
+      const discoveryStalled = new Promise<void>((resolve) => (stalled = resolve));
+      const stalledPath = stallScope ? "/prm" : "/.well-known/oauth-authorization-server";
+      const server = createServer((req, res) => {
+        const pathname = (req.url ?? "/").split("?")[0];
+        if (pathname.startsWith(stalledPath)) {
+          stalled(); // Never answers until the client gives up.
+          req.on("close", () => res.destroy());
+          return;
+        }
+        if (pathname === "/mcp" && stallScope) {
+          // No scope in the challenge: the scope lookup fetches the resource metadata.
+          const prm = `http://${req.headers.host ?? ""}/prm`;
+          res.writeHead(401, { "WWW-Authenticate": `Bearer resource_metadata="${prm}"` });
+          res.end();
+          return;
+        }
+        res.statusCode = pathname === "/mcp" ? 401 : 404;
+        res.end();
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      try {
+        const address = server.address();
+        if (!address || typeof address === "string") throw new Error("Failed to bind");
+        const base = `http://127.0.0.1:${address.port}`;
+        spyOn(mcpConfigService, "listServers").mockResolvedValue({
+          docs: {
+            transport: "http",
+            url: `${base}/mcp`,
+            disabled: true,
+            oauth: {
+              clientId: "c",
+              ...(withRegistrationUrl
+                ? {
+                    discovery: {
+                      authorizationServerBase: base,
+                      registrationUrl: `${base}/register`,
+                    },
+                  }
+                : {}),
+            },
+          },
+        });
+        const starting = service.startDesktopFlow({ projectPath, serverName: "docs" });
+        await discoveryStalled;
+        // The update-time sign-out settles every flow of this server (the deadline does the same).
+        await service.logout({ serverUrl: `${base}/mcp` });
+        expect(await starting).toEqual({ success: false, error: "Signed out" });
+        expect(captured).toEqual(events);
+      } finally {
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    }
+  );
+
+  // The UI generates the flow ID, so Cancel reaches a sign-in that is still starting (#6565).
+  test.each(["desktop", "server"] as const)(
+    "a %s sign-in cancelled while it starts never registers",
+    async (mode) => {
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => (release = resolve));
+      spyOn(mcpConfigService, "listServers").mockImplementation(async () => {
+        await released;
+        return { docs: { transport: "http", url: "https://example.com/mcp", disabled: true } };
+      });
+      const flowId = "caller-flow-id-0123456789";
+      const input = { projectPath, serverName: "docs", flowId };
+      const starting =
+        mode === "desktop"
+          ? service.startDesktopFlow(input)
+          : service.startServerFlow({ ...input, redirectUri: "https://x/cb" });
+      await (mode === "desktop"
+        ? service.cancelDesktopFlow(flowId)
+        : service.cancelServerFlow(flowId));
+      release();
+      expect(await starting).toEqual({ success: false, error: "OAuth flow cancelled" });
+      const wait =
+        mode === "desktop" ? service.waitForDesktopFlow(flowId) : service.waitForServerFlow(flowId);
+      expect(await wait).toEqual({ success: false, error: "OAuth flow not found" });
+    }
+  );
+
+  test("a caller flow ID must be well-formed and unused (#6565)", async () => {
+    await withAuthServer(async (base) => {
+      spyOn(mcpConfigService, "listServers").mockResolvedValue({
+        docs: { transport: "http", url: `${base}/mcp`, disabled: true, oauth: { clientId: "c" } },
+      });
+      const input = { projectPath, serverName: "docs", redirectUri: "https://x/cb" };
+      expect(await service.startServerFlow({ ...input, flowId: "short" })).toEqual({
+        success: false,
+        error: "Invalid OAuth flow ID",
+      });
+      const flowId = "caller-flow-id-0123456789";
+      const first = await service.startServerFlow({ ...input, flowId });
+      expect(first.success && first.data.flowId).toBe(flowId);
+      expect(await service.startServerFlow({ ...input, flowId })).toEqual({
+        success: false,
+        error: "OAuth flow ID already in use",
+      });
+      await service.cancelServerFlow(flowId);
+    });
+  });
+
+  test("two starts with one caller flow ID never both register (#6565)", async () => {
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => (release = resolve));
+    spyOn(mcpConfigService, "listServers").mockImplementation(async () => {
+      await released;
+      return { docs: { transport: "http", url: "https://example.com/mcp", disabled: true } };
+    });
+    const input = {
+      projectPath,
+      serverName: "docs",
+      redirectUri: "https://x/cb",
+      flowId: "caller-flow-id-0123456789",
+    };
+    // Both lookups are pending: the second start must still see the first one's ID.
+    const first = service.startServerFlow(input);
+    expect(await service.startServerFlow(input)).toEqual({
+      success: false,
+      error: "OAuth flow ID already in use",
+    });
+    release();
+    await first;
+  });
+
+  test("a Cancel recorded before the flow deadline no longer refuses a later start (#6565)", async () => {
+    await withAuthServer(async (base) => {
+      spyOn(mcpConfigService, "listServers").mockResolvedValue({
+        docs: { transport: "http", url: `${base}/mcp`, disabled: true, oauth: { clientId: "c" } },
+      });
+      const flowId = "caller-flow-id-0123456789";
+      await service.cancelServerFlow(flowId);
+      // Eleven minutes later (past the 10-minute server flow deadline), nothing else ran.
+      const now = Date.now();
+      const clock = spyOn(Date, "now").mockReturnValue(now + 11 * 60 * 1000);
+      try {
+        const start = await service.startServerFlow({
+          projectPath,
+          serverName: "docs",
+          redirectUri: "https://x/cb",
+          flowId,
+        });
+        expect(start.success && start.data.flowId).toBe(flowId);
+        await service.cancelServerFlow(flowId);
+      } finally {
+        clock.mockRestore();
+      }
+    });
+  });
+
+  test("a flow whose start event failed to send sends no end event either (#6565)", async () => {
+    await withAuthServer(async (base) => {
+      const captured: string[] = [];
+      await service.dispose();
+      service = new McpOauthService(config, mcpConfigService, undefined, {
+        capture: (payload: { event: string }) => {
+          if (payload.event === "mcp_oauth_flow_started") throw new Error("telemetry down");
+          captured.push(payload.event);
+        },
+      } as unknown as TelemetryService);
+      spyOn(mcpConfigService, "listServers").mockResolvedValue({
+        docs: { transport: "http", url: `${base}/mcp`, disabled: true, oauth: { clientId: "c" } },
+      });
+      const start = await service.startServerFlow({
+        projectPath,
+        serverName: "docs",
+        redirectUri: "https://x/cb",
+      });
+      if (!start.success) throw new Error(start.error);
+      await service.cancelServerFlow(start.data.flowId);
+      expect(captured).toEqual([]);
+    });
+  });
+
   test("a token exchange in flight when the user signs out saves nothing", async () => {
     let tokenRequested!: () => void;
     const requested = new Promise<void>((resolve) => (tokenRequested = resolve));
@@ -899,10 +1128,84 @@ describe("McpOauthService OAuth flows", () => {
         iss: null,
         error: null,
       });
-      expect(await service.hasAuthTokens({ serverUrl: `${base}/mcp` })).toBe(true);
+      expect(
+        await service.hasAuthTokens({ serverUrl: `${base}/mcp`, oauth: { clientId: "c" } })
+      ).toBe(true);
     } finally {
       releaseToken();
       await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  // Two Xum backends can share mcp-oauth.json (XUM_ALLOW_MULTIPLE_INSTANCES): each one rereads
+  // the file when another changed it, before it uses or rewrites credentials (#6123).
+  test("a sign-out in another process is seen at once, and a write keeps its entries", async () => {
+    const urlA = "https://a.example.com/mcp";
+    const urlB = "https://b.example.com/mcp";
+    const entry = (serverUrl: string) => ({
+      serverUrl,
+      updatedAtMs: Date.now(),
+      clientInformation: { client_id: "c" },
+      tokens: { access_token: "at", token_type: "Bearer", refresh_token: "rt" },
+    });
+    await fs.writeFile(
+      getStoreFilePath(xumHome),
+      JSON.stringify({ version: 2, entries: { [urlA]: entry(urlA) } })
+    );
+    const other = new McpOauthService(config, mcpConfigService);
+    try {
+      expect(await service.hasAuthTokens({ serverUrl: urlA })).toBe(true);
+      expect(await other.hasAuthTokens({ serverUrl: urlA })).toBe(true);
+      // The other process signs the server out (a plugin update's sign-out).
+      await other.logout({ serverUrl: urlA });
+      expect(await service.hasAuthTokens({ serverUrl: urlA })).toBe(false);
+      expect(await service.getAuthProviderForServer({ serverUrl: urlA })).toBeUndefined();
+      // The other process signs in elsewhere; this process then writes: both entries stay.
+      await fs.writeFile(
+        getStoreFilePath(xumHome),
+        JSON.stringify({ version: 2, entries: { [urlB]: entry(urlB) } })
+      );
+      await service.logout({ serverUrl: urlA });
+      expect(await other.hasAuthTokens({ serverUrl: urlB })).toBe(true);
+      expect(await service.hasAuthTokens({ serverUrl: urlB })).toBe(true);
+    } finally {
+      await other.dispose();
+    }
+  });
+
+  test("a write that another process replaces at once is not taken as the current file (#6123)", async () => {
+    const urlA = "https://a.example.com/mcp";
+    const urlB = "https://b.example.com/mcp";
+    const entry = (serverUrl: string) => ({
+      serverUrl,
+      updatedAtMs: Date.now(),
+      clientInformation: { client_id: "c" },
+      tokens: { access_token: "at", token_type: "Bearer" },
+    });
+    const storePath = getStoreFilePath(xumHome);
+    await fs.writeFile(storePath, JSON.stringify({ version: 2, entries: { [urlA]: entry(urlA) } }));
+    expect(await service.hasAuthTokens({ serverUrl: urlA })).toBe(true);
+    // The sign-out stats the file once before its write. The other process replaces the file
+    // just before the next stat: right after the write, or at the next credential read.
+    const realStat = fs.stat.bind(fs);
+    let stats = 0;
+    const stat = spyOn(fs, "stat").mockImplementation((async (
+      ...args: Parameters<typeof fs.stat>
+    ) => {
+      if (++stats === 2) {
+        await fs.writeFile(
+          storePath,
+          JSON.stringify({ version: 2, entries: { [urlB]: entry(urlB) } })
+        );
+      }
+      return realStat(...args);
+    }) as typeof fs.stat);
+    try {
+      await service.logout({ serverUrl: urlA });
+      expect(await service.hasAuthTokens({ serverUrl: urlB })).toBe(true);
+      expect(stats).toBeGreaterThanOrEqual(2);
+    } finally {
+      stat.mockRestore();
     }
   });
 
@@ -1185,7 +1488,7 @@ describe("McpOauthService OAuth flows", () => {
       expect(await usable(pinned("https://b.example.com"))).toBe(false);
     });
 
-    test("a sign-in whose probe spans a sign-out writes credentials the new issuer never uses", async () => {
+    test("a sign-in whose probe spans a sign-out ends with it and writes nothing", async () => {
       let probing!: () => void;
       const probed = new Promise<void>((resolve) => (probing = resolve));
       let releaseProbe!: () => void;
@@ -1236,21 +1539,11 @@ describe("McpOauthService OAuth flows", () => {
         await probed;
         // The update's sign-out lands while the flow is still probing.
         await service.logout({ serverUrl: url });
-        releaseProbe();
-        const start = await starting;
-        if (!start.success) throw new Error(start.error);
-        await service.handleServerCallbackAndExchange({
-          state: start.data.flowId,
-          code: "the-code",
-          iss: null,
-          error: null,
-        });
-        // The old-identity flow did write; only the issuer it carries keeps it from serving B.
+        // The flow is registered before its probe, so the sign-out ends it and its probe at
+        // once (#6164): the old-identity flow never reaches the token endpoint.
+        expect(await starting).toEqual({ success: false, error: "Signed out" });
         expect(
           await service.getAuthProviderForServer({ serverUrl: url, oauth: configA })
-        ).toBeDefined();
-        expect(
-          await service.getAuthProviderForServer({ serverUrl: url, oauth: configB })
         ).toBeUndefined();
         expect(await service.hasAuthTokens({ serverUrl: url, oauth: configB })).toBe(false);
       } finally {
@@ -1359,6 +1652,423 @@ describe("McpOauthService OAuth flows", () => {
         issuer: issuerA,
       } as never);
       expect(await service.hasAuthTokens({ serverUrl, oauth: configB })).toBe(true);
+    });
+  });
+
+  test("stored tokens whose granted scope lacks a plugin's base scopes read as signed out (#6141)", async () => {
+    const serverUrl = "https://example.com/mcp";
+    const seed = async (scope: string | undefined, requestedScope?: string) => {
+      await service.dispose();
+      service = new McpOauthService(config, mcpConfigService);
+      await fs.writeFile(
+        getStoreFilePath(xumHome),
+        JSON.stringify({
+          version: 2,
+          entries: {
+            [serverUrl]: {
+              serverUrl,
+              updatedAtMs: Date.now(),
+              clientInformation: { client_id: "c" },
+              tokens: {
+                access_token: "at",
+                token_type: "Bearer",
+                ...(scope !== undefined ? { scope } : {}),
+                ...(requestedScope !== undefined ? { requested_scope: requestedScope } : {}),
+              },
+            },
+          },
+        })
+      );
+    };
+    const usable = async (oauth: MCPServerOAuthConfig) =>
+      (await service.getAuthProviderForServer({ serverUrl, oauth })) !== undefined &&
+      (await service.hasAuthTokens({ serverUrl, oauth })) &&
+      (await service.getAuthStatus({ serverUrl, oauth })).isLoggedIn;
+    // An earlier sign-in at this URL was granted only "read".
+    await seed("read");
+    expect(await usable({ clientId: "c", baseScopes: ["read", "write"] })).toBe(false);
+    expect(await usable({ clientId: "c", baseScopes: ["read"] })).toBe(true);
+    expect(await usable({ clientId: "c" })).toBe(true);
+    // Scope is a space-separated set: order and extra spaces do not matter.
+    await seed(" write  read admin");
+    expect(await usable({ clientId: "c", baseScopes: ["read", "write"] })).toBe(true);
+    // A stored token without scope proves nothing about this plugin's scopes: an earlier
+    // sign-in at this URL can have requested less. Only a plugin without baseScopes uses it.
+    await seed(undefined);
+    expect(await usable({ clientId: "c", baseScopes: ["read", "write"] })).toBe(false);
+    expect(await usable({ clientId: "c" })).toBe(true);
+    // A configured entry with spaces names several scopes, as in the authorization request.
+    await seed("read write");
+    expect(await usable({ clientId: "c", baseScopes: [" read write "] })).toBe(true);
+    expect(await usable({ clientId: "c", baseScopes: ["read admin"] })).toBe(false);
+    // The recorded request decides, in the plugin's own scope names (#6564).
+    await seed("read write", "read");
+    expect(await usable({ clientId: "c", baseScopes: ["read", "write"] })).toBe(false);
+    await seed("User.Read", "api://app/.default");
+    expect(await usable({ clientId: "c", baseScopes: ["api://app/.default"] })).toBe(true);
+  });
+
+  // The SDK's auth() reads the tokens with a context before it refreshes; a transport request
+  // reads them without one (@modelcontextprotocol/client auth(), StreamableHTTP transport).
+  const authCtx: Parameters<OAuthClientProvider["tokens"]>[0] = { issuer: "https://example.com" };
+
+  test.each([
+    ["auth() read only", false],
+    ["a transport read of the newer grant in between", true],
+  ])(
+    "a refresh whose token was replaced meanwhile never overwrites the newer grant (%s) (#6141)",
+    async (_label, transportRead) => {
+      const serverUrl = "https://example.com/mcp";
+      const oauth: MCPServerOAuthConfig = { clientId: "c", baseScopes: ["read", "write"] };
+      await fs.writeFile(
+        getStoreFilePath(xumHome),
+        JSON.stringify({
+          version: 2,
+          entries: {
+            [serverUrl]: {
+              serverUrl,
+              updatedAtMs: Date.now(),
+              clientInformation: { client_id: "c" },
+              tokens: { access_token: "at-narrow", token_type: "Bearer", scope: "read" },
+            },
+          },
+        })
+      );
+      // An old refresh reads the narrow token...
+      const old = await service.getAuthProviderForServer({ serverUrl });
+      if (old === undefined) throw new Error("expected a provider");
+      await old.clientInformation();
+      await old.tokens(authCtx);
+      // ...a newer write stores a wider grant for the same client...
+      const newer = await service.getAuthProviderForServer({ serverUrl });
+      if (newer === undefined) throw new Error("expected a provider");
+      await newer.clientInformation();
+      await newer.tokens(authCtx);
+      await newer.saveTokens({
+        access_token: "at-wide",
+        token_type: "Bearer",
+        scope: "read write",
+      } as never);
+      if (transportRead) await old.tokens();
+      // ...then the old refresh's answers land (with or without scope): both are dropped.
+      await old.saveTokens({ access_token: "at-narrow-2", token_type: "Bearer" } as never);
+      await old.saveTokens({
+        access_token: "at-narrow-3",
+        token_type: "Bearer",
+        scope: "read",
+      } as never);
+      const status = await service.getAuthStatus({ serverUrl, oauth });
+      expect(status.scope).toBe("read write");
+      expect(await service.hasAuthTokens({ serverUrl, oauth })).toBe(true);
+    }
+  );
+
+  // Parallel requests that all get a 401 run several auth() calls on one provider. Each call
+  // passes its own context object, so a later call's read must not rebind an earlier refresh.
+  test("an older overlapping refresh is dropped after a newer call read the replacing grant (#6537)", async () => {
+    const serverUrl = "https://example.com/mcp";
+    const oauth: MCPServerOAuthConfig = { clientId: "c", baseScopes: ["read"] };
+    await fs.writeFile(
+      getStoreFilePath(xumHome),
+      JSON.stringify({
+        version: 2,
+        entries: {
+          [serverUrl]: {
+            serverUrl,
+            updatedAtMs: Date.now(),
+            clientInformation: { client_id: "c" },
+            tokens: { access_token: "at-1", token_type: "Bearer", scope: "read" },
+          },
+        },
+      })
+    );
+    const provider = await service.getAuthProviderForServer({ serverUrl });
+    if (provider === undefined) throw new Error("expected a provider");
+    const [a, b, c] = [{ ...authCtx }, { ...authCtx }, { ...authCtx }];
+    // A and B read grant 1; B's rotating refresh stores grant 2 with a wider scope.
+    for (const ctx of [a, b]) {
+      await provider.clientInformation(ctx);
+      await provider.tokens(ctx);
+    }
+    await provider.saveTokens(
+      { access_token: "at-2", token_type: "Bearer", scope: "read write" } as never,
+      b
+    );
+    // C reads grant 2, then A's answer for grant 1 lands without scope.
+    await provider.clientInformation(c);
+    await provider.tokens(c);
+    await provider.saveTokens({ access_token: "at-1b", token_type: "Bearer" } as never, a);
+    const stored = JSON.parse(await fs.readFile(getStoreFilePath(xumHome), "utf-8")) as {
+      entries: Record<string, { tokens?: { access_token: string; scope?: string } }>;
+    };
+    // A's answer is dropped: it never gets grant 2's scope.
+    expect(stored.entries[serverUrl].tokens).toMatchObject({
+      access_token: "at-2",
+      scope: "read write",
+    });
+    expect(await service.hasAuthTokens({ serverUrl, oauth })).toBe(true);
+  });
+
+  // AuthCallReads keys each auth() call's reads by the context object the SDK passes. If an SDK
+  // update passes a new object per provider call, every write falls back to the latest read and
+  // the shared-slot race comes back silently (#6537). This pins that contract with the real auth().
+  test("the SDK's auth() passes one context object to every provider call of a refresh (#6537)", async () => {
+    await withAuthServer(async (base) => {
+      const serverUrl = `${base}/mcp`;
+      await fs.writeFile(
+        getStoreFilePath(xumHome),
+        JSON.stringify({
+          version: 2,
+          entries: {
+            [serverUrl]: {
+              serverUrl,
+              updatedAtMs: Date.now(),
+              clientInformation: { client_id: "c" },
+              tokens: { access_token: "old", token_type: "Bearer", refresh_token: "rt" },
+            },
+          },
+        })
+      );
+      const provider = await service.getAuthProviderForServer({ serverUrl });
+      if (provider === undefined) throw new Error("expected a provider");
+      const contexts = new Map<string, unknown[]>();
+      const recorded = new Proxy(provider, {
+        get(target, key, receiver) {
+          const value: unknown = Reflect.get(target, key, receiver);
+          const name = String(key);
+          if (
+            typeof value !== "function" ||
+            !/^(clientInformation|tokens|saveTokens|saveClientInformation)$/.test(name)
+          )
+            return value;
+          return (...args: unknown[]) => {
+            // The context is the last argument: (ctx) for reads, (value, ctx) for writes.
+            const ctx = name.startsWith("save") ? args[1] : args[0];
+            contexts.set(name, [...(contexts.get(name) ?? []), ctx]);
+            return (value as (...a: unknown[]) => unknown).apply(target, args);
+          };
+        },
+      });
+
+      expect(await auth(recorded, { serverUrl })).toBe("AUTHORIZED");
+
+      const all = [...contexts.values()].flat();
+      expect(contexts.get("clientInformation")?.length).toBeGreaterThan(0);
+      expect(contexts.get("tokens")?.length).toBeGreaterThan(0);
+      expect(contexts.get("saveTokens")?.length).toBeGreaterThan(0);
+      expect(all[0]).toBeDefined();
+      expect(all.every((ctx) => ctx === all[0])).toBe(true);
+      const stored = JSON.parse(await fs.readFile(getStoreFilePath(xumHome), "utf-8")) as {
+        entries: Record<string, { tokens?: { access_token: string } }>;
+      };
+      expect(stored.entries[serverUrl].tokens?.access_token).toBe("flow-token");
+    });
+  });
+
+  test("a grant without scope records the requested scope, and a refresh keeps it (#6141)", async () => {
+    await withAuthServer(async (base) => {
+      // withAuthServer's token endpoint omits scope.
+      const serverUrl = `${base}/mcp`;
+      const oauth: MCPServerOAuthConfig = { clientId: "c", baseScopes: ["read", "write"] };
+      spyOn(mcpConfigService, "listServers").mockResolvedValue({
+        docs: { transport: "http", url: serverUrl, disabled: true, oauth },
+      });
+      const start = await service.startServerFlow({
+        projectPath,
+        serverName: "docs",
+        redirectUri: "https://x/cb",
+      });
+      if (!start.success) throw new Error(start.error);
+      const result = await service.handleServerCallbackAndExchange({
+        state: start.data.flowId,
+        code: "code",
+        iss: null,
+        error: null,
+      });
+      expect(result.success).toBe(true);
+      expect(await service.hasAuthTokens({ serverUrl, oauth })).toBe(true);
+      // A refresh response without scope keeps the original grant (RFC 6749 §6). The SDK
+      // reads the client and the tokens before it refreshes.
+      const provider = await service.getAuthProviderForServer({ serverUrl, oauth });
+      if (provider === undefined) throw new Error("expected a provider");
+      await provider.clientInformation();
+      await provider.tokens(authCtx);
+      await provider.saveTokens({ access_token: "refreshed", token_type: "Bearer" } as never);
+      expect(await service.hasAuthTokens({ serverUrl, oauth })).toBe(true);
+      const stored = JSON.parse(await fs.readFile(getStoreFilePath(xumHome), "utf-8")) as {
+        entries: Record<string, { tokens?: { access_token: string; requested_scope?: string } }>;
+      };
+      // The refresh keeps the sign-in's recorded request (#6564).
+      expect(stored.entries[serverUrl].tokens).toMatchObject({
+        access_token: "refreshed",
+        requested_scope: "read write",
+      });
+    });
+  });
+
+  test("the stored client stays usable for a refresh after its tokens were invalidated (#6141)", async () => {
+    const serverUrl = "https://example.com/mcp";
+    const oauth: MCPServerOAuthConfig = { clientId: "c", baseScopes: ["read"] };
+    await fs.writeFile(
+      getStoreFilePath(xumHome),
+      JSON.stringify({
+        version: 2,
+        entries: {
+          [serverUrl]: {
+            serverUrl,
+            updatedAtMs: Date.now(),
+            clientInformation: { client_id: "c" },
+            tokens: { access_token: "at", token_type: "Bearer", scope: "read" },
+          },
+        },
+      })
+    );
+    const provider = await service.getAuthProviderForServer({ serverUrl, oauth });
+    if (provider === undefined) throw new Error("expected a provider");
+    // invalid_grant: the SDK drops the tokens, then retries with the stored client. Without it
+    // the SDK would register a new client instead of reaching the sign-in-required path.
+    await provider.invalidateCredentials?.("tokens");
+    expect((await provider.clientInformation())?.client_id).toBe("c");
+    expect(await provider.tokens()).toBeUndefined();
+  });
+
+  /** One server sign-in whose token endpoint answers `grant`; `check` runs before the stub closes. */
+  const signInWithGrant = async (
+    grant: Record<string, unknown>,
+    oauth: MCPServerOAuthConfig,
+    check: (serverUrl: string, result: Result<void, string>) => Promise<void>
+  ): Promise<void> => {
+    const server = createServer((req, res) => {
+      const pathname = (req.url ?? "/").split("?")[0];
+      if (pathname === "/token") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ access_token: "at", token_type: "Bearer", ...grant }));
+        return;
+      }
+      if (pathname === "/.well-known/oauth-authorization-server") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(authServerMetadata(`http://${req.headers.host ?? ""}`)));
+        return;
+      }
+      res.statusCode = pathname === "/mcp" ? 401 : 404;
+      res.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Failed to bind");
+      const serverUrl = `http://127.0.0.1:${address.port}/mcp`;
+      spyOn(mcpConfigService, "listServers").mockResolvedValue({
+        docs: { transport: "http", url: serverUrl, disabled: true, oauth },
+      });
+      const start = await service.startServerFlow({
+        projectPath,
+        serverName: "docs",
+        redirectUri: "https://x/cb",
+      });
+      if (!start.success) throw new Error(start.error);
+      const result = await service.handleServerCallbackAndExchange({
+        state: start.data.flowId,
+        code: "code",
+        iss: null,
+        error: null,
+      });
+      await check(serverUrl, result);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  };
+
+  test("a sign-in granted less than the plugin's base scopes fails and stores no token (#6141)", async () => {
+    const oauth = { clientId: "c", baseScopes: ["read", "write"] };
+    await signInWithGrant({ scope: "read" }, oauth, async (serverUrl, result) => {
+      expect(result.success).toBe(false);
+      // The reason names the request and the grant (#6564).
+      expect(result.success ? "" : result.error).toContain(
+        'requested "read write", granted "read"'
+      );
+      expect(await service.hasAuthTokens({ serverUrl })).toBe(false);
+    });
+  });
+
+  test("a sign-in whose server renames the granted scopes stays signed in (#6564)", async () => {
+    const oauth = { clientId: "c", baseScopes: ["api://app/.default"] };
+    // Entra-style: the request names `.default`, the grant lists the permissions.
+    await signInWithGrant({ scope: "User.Read Files.Read" }, oauth, async (serverUrl, result) => {
+      expect(result.success).toBe(true);
+      expect(await service.hasAuthTokens({ serverUrl, oauth })).toBe(true);
+      expect((await service.getAuthStatus({ serverUrl, oauth })).isLoggedIn).toBe(true);
+      // A plugin that needs more than that sign-in requested reads as signed out.
+      expect(
+        await service.hasAuthTokens({
+          serverUrl,
+          oauth: { clientId: "c", baseScopes: ["api://app/.default", "offline_access"] },
+        })
+      ).toBe(false);
+    });
+  });
+
+  test("a sign-in granted the URL form of a short scope name stays signed in (#6564)", async () => {
+    const oauth = { clientId: "c", baseScopes: ["email"] };
+    // Google-style: the request names `email`, the grant its URL form.
+    const grant = { scope: "https://www.googleapis.com/auth/userinfo.email openid" };
+    await signInWithGrant(grant, oauth, async (serverUrl, result) => {
+      expect(result.success).toBe(true);
+      expect(await service.hasAuthTokens({ serverUrl, oauth })).toBe(true);
+    });
+  });
+
+  test("a server-supplied requested_scope does not replace Xum's record (#6564)", async () => {
+    const oauth = { clientId: "c", baseScopes: ["read", "write"] };
+    const grant = { scope: "read write", requested_scope: "read" };
+    await signInWithGrant(grant, oauth, async (serverUrl, result) => {
+      expect(result.success).toBe(true);
+      expect(await service.hasAuthTokens({ serverUrl, oauth })).toBe(true);
+      // A refresh answer with its own requested_scope keeps the record too.
+      const provider = await service.getAuthProviderForServer({ serverUrl, oauth });
+      if (provider === undefined) throw new Error("expected a provider");
+      await provider.clientInformation();
+      await provider.tokens(authCtx);
+      await provider.saveTokens({
+        access_token: "refreshed",
+        token_type: "Bearer",
+        scope: "renamed",
+        requested_scope: "read",
+      } as never);
+      expect(await service.hasAuthTokens({ serverUrl, oauth })).toBe(true);
+    });
+  });
+
+  test("a server without a provided client never uses another plugin's provided-client sign-in (#6159)", async () => {
+    await withAuthServer(async (base) => {
+      const serverUrl = `${base}/mcp`;
+      // Plugin A signs in with its provided client.
+      spyOn(mcpConfigService, "listServers").mockResolvedValue({
+        a: { transport: "http", url: serverUrl, disabled: true, oauth: { clientId: "plugin-a" } },
+      });
+      const start = await service.startServerFlow({
+        projectPath,
+        serverName: "a",
+        redirectUri: "https://x/cb",
+      });
+      if (!start.success) throw new Error(start.error);
+      const signedIn = await service.handleServerCallbackAndExchange({
+        state: start.data.flowId,
+        code: "code",
+        iss: null,
+        error: null,
+      });
+      expect(signedIn.success).toBe(true);
+      expect(await service.hasAuthTokens({ serverUrl, oauth: { clientId: "plugin-a" } })).toBe(
+        true
+      );
+      // A server at the same URL that registers its own client (a DCR plugin or the user's
+      // own server) reads as signed out and gets no provider.
+      for (const oauth of [{ baseScopes: ["read"] }, undefined]) {
+        expect(await service.hasAuthTokens({ serverUrl, oauth })).toBe(false);
+        expect(await service.getAuthProviderForServer({ serverUrl, oauth })).toBeUndefined();
+        expect((await service.getAuthStatus({ serverUrl, oauth })).isLoggedIn).toBe(false);
+      }
     });
   });
 

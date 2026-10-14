@@ -3,17 +3,20 @@ import type {
   DraftBeginSendInput,
   DraftEvent,
   DraftListEntry,
+  DraftMoveCreationInput,
   DraftScope,
   DraftUpdateInput,
   DraftWriteOutput,
+  WorkspaceNamePersistedState,
 } from "@/common/orpc/schemas/drafts";
-import { removeSentText } from "@/common/utils/composerDraftText";
+import { takeSentText } from "@/common/utils/composerDraftText";
 import { draftScopeKey, summarizeDraft, toDraftAttachmentMetadata } from "@/common/utils/drafts";
 
 interface StoredDraft {
   scope: DraftScope;
   text: string;
   attachments: DraftAttachment[];
+  nameState?: WorkspaceNamePersistedState;
   revision: number;
 }
 
@@ -54,17 +57,24 @@ export function createMockDraftsApi() {
     const current = drafts.get(key);
     const text = input.text ?? current?.text ?? "";
     const attachments = input.attachments ?? current?.attachments ?? [];
+    const nameState =
+      input.nameState === undefined ? current?.nameState : (input.nameState ?? undefined);
     revision++;
-    if (text.length === 0 && attachments.length === 0) {
+    if (text.length === 0 && attachments.length === 0 && nameState === undefined) {
       drafts.delete(key);
       emit({ type: "deleted", scope: input.scope, revision });
     } else {
-      const next = { scope: input.scope, text, attachments, revision };
+      const next = { scope: input.scope, text, attachments, nameState, revision };
       drafts.set(key, next);
       emit({ type: "changed", ...summarizeDraft(input.scope, next, revision) });
     }
     // A write's reply carries the stored view (nothing is retained in stories).
-    return { revision, text, attachments: attachments.map(toDraftAttachmentMetadata) };
+    return {
+      revision,
+      text,
+      attachments: attachments.map(toDraftAttachmentMetadata),
+      ...(nameState !== undefined ? { nameState } : {}),
+    };
   };
 
   return {
@@ -74,6 +84,7 @@ export function createMockDraftsApi() {
       return Promise.resolve({
         text: draft?.text ?? "",
         attachments: draft?.attachments ?? [],
+        ...(draft?.nameState !== undefined ? { nameState: draft.nameState } : {}),
         revision: draft?.revision ?? revision,
       });
     },
@@ -81,11 +92,12 @@ export function createMockDraftsApi() {
     // Idempotent sends: story sends are accepted at once, so nothing is retained.
     beginSend: (input: DraftBeginSendInput) => {
       const current = drafts.get(draftScopeKey(input.scope));
+      const visible = input.text ?? current?.text ?? "";
       const taken = new Set(input.pendingSend.attachmentIds);
       return Promise.resolve(
         write({
           scope: input.scope,
-          text: removeSentText(input.text ?? current?.text ?? "", input.pendingSend.text),
+          text: takeSentText(visible, input.pendingSend.text, visible === input.typedAfterSendText),
           attachments: (current?.attachments ?? []).filter(({ id }) => !taken.has(id)),
         })
       );
@@ -93,7 +105,7 @@ export function createMockDraftsApi() {
     setSendReceiver: () => Promise.resolve({ revision, present: false }),
     resolveSends: () => Promise.resolve({ statuses: [] }),
     delete: (input: { scope: DraftScope }) => {
-      const result = write({ scope: input.scope, text: "", attachments: [] });
+      const result = write({ scope: input.scope, text: "", attachments: [], nameState: null });
       const { scope } = input;
       if (scope.kind === "creation") {
         setList(
@@ -116,6 +128,31 @@ export function createMockDraftsApi() {
             : [...listEntries, entry]
         )
       );
+    },
+    // Stories have one window, so the source never changed: always "moved".
+    moveCreation: (input: DraftMoveCreationInput) => {
+      const source = drafts.get(draftScopeKey(input.source));
+      const dest = write({
+        scope: input.dest,
+        text: source?.text ?? "",
+        attachments: source?.attachments ?? [],
+        nameState: source?.nameState ?? null,
+      });
+      write({ scope: input.source, text: "", attachments: [], nameState: null });
+      const row: DraftListEntry = {
+        projectPath: input.dest.projectPath,
+        draftId: input.dest.draftId,
+        subProjectPath: input.subProjectPath,
+        createdAt: input.createdAt,
+      };
+      const { source: from } = input;
+      const { revision: listRevision } = setList([
+        ...listEntries.filter(
+          (entry) => entry.projectPath !== from.projectPath || entry.draftId !== from.draftId
+        ),
+        row,
+      ]);
+      return Promise.resolve({ result: "moved" as const, dest, listRevision });
     },
     importLegacyList: (input: { entries: DraftListEntry[] }) =>
       Promise.resolve(

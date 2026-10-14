@@ -186,6 +186,24 @@ describe("getSlashCommandSuggestions", () => {
     expect(skillSuggestion?.replacement).toBe("/fix-issue ");
   });
 
+  it("labels a display-name skill but inserts and matches only its ID", () => {
+    const agentSkills = [
+      {
+        name: "poteto-mode",
+        displayName: "Poteto Mode",
+        description: "poteto's style",
+        scope: "global" as const,
+      },
+    ];
+
+    const skillSuggestion = getSlashCommandSuggestions("/pot", { agentSkills }).find(
+      (s) => s.id === "skill:poteto-mode"
+    );
+    expect(skillSuggestion?.display).toBe("/poteto-mode");
+    expect(skillSuggestion?.description.startsWith("Poteto Mode")).toBe(true);
+    expect(skillSuggestion?.replacement).toBe("/poteto-mode ");
+  });
+
   it("matches hyphenated skill segments", () => {
     const suggestions = getSlashCommandSuggestions("/r", {
       agentSkills: [

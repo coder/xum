@@ -79,6 +79,7 @@ import {
   McpAppApproveDomainsRequestSchema,
   McpAppEntrypointSchema,
   McpAppModelContextRequestSchema,
+  McpAppWidgetStateRequestSchema,
   McpAppOpenEntrypointRequestSchema,
   McpAppViewDomainsSchema,
   McpAppResourceReadRequestSchema,
@@ -137,6 +138,8 @@ import {
   DraftImportLegacyOutputSchema,
   DraftListEntrySchema,
   DraftListSchema,
+  DraftMoveCreationInputSchema,
+  DraftMoveCreationOutputSchema,
   DraftResolveSendsInputSchema,
   DraftResolveSendsOutputSchema,
   DraftRevisionOutputSchema,
@@ -187,8 +190,11 @@ import {
   MCPRemoveParamsSchema,
   MCPServerMapSchema,
   MCPSettingsReadInputSchema,
-  MCPSettingsSnapshotSchema,
+  MCPSettingsReadSnapshotSchema,
   MCPSettingsUpdateParamsSchema,
+  MCPSettingsRunToolParamsSchema,
+  MCPSettingsRunToolResultSchema,
+  MCPSettingsOpenAppResultSchema,
   MCPSetEnabledGlobalParamsSchema,
   MCPSetEnabledParamsSchema,
   MCPSetToolAllowlistGlobalParamsSchema,
@@ -205,6 +211,7 @@ import {
   AgentPluginInstallEntrySchema,
   AgentPluginInstallPreviewSchema,
   AgentPluginComponentsSchema,
+  AgentPluginComponentRefSchema,
   AgentPluginHooksSchema,
   AgentPluginListItemSchema,
   AgentPluginUpdateCheckSchema,
@@ -782,6 +789,8 @@ export const mcpOauth = {
         projectPath: z.string().optional(),
         serverName: z.string(),
         pendingServer: MCPOAuthPendingServerSchema.optional(),
+        // Caller-generated so Cancel can name the flow while the start runs (#6565).
+        flowId: z.string().optional(),
       })
       .strict(),
     output: ResultSchema(
@@ -812,6 +821,8 @@ export const mcpOauth = {
         projectPath: z.string().optional(),
         serverName: z.string(),
         pendingServer: MCPOAuthPendingServerSchema.optional(),
+        // Caller-generated so Cancel can name the flow while the start runs (#6565).
+        flowId: z.string().optional(),
       })
       .strict(),
     output: ResultSchema(
@@ -1019,6 +1030,7 @@ export const projects = {
           projectPath: z.string(),
           serverName: z.string(),
           pendingServer: MCPOAuthPendingServerSchema.optional(),
+          flowId: z.string().optional(),
         })
         .strict(),
       output: ResultSchema(
@@ -1049,6 +1061,7 @@ export const projects = {
           projectPath: z.string(),
           serverName: z.string(),
           pendingServer: MCPOAuthPendingServerSchema.optional(),
+          flowId: z.string().optional(),
         })
         .strict(),
       output: ResultSchema(
@@ -1156,7 +1169,7 @@ export const mcp = {
         z.string(),
         ResultSchema(
           z
-            .union([MCPSettingsSnapshotSchema, z.object({ notConnected: z.literal(true) })])
+            .union([MCPSettingsReadSnapshotSchema, z.object({ notConnected: z.literal(true) })])
             .nullable(),
           z.string()
         )
@@ -1164,7 +1177,18 @@ export const mcp = {
     },
     update: {
       input: MCPSettingsUpdateParamsSchema,
-      output: ResultSchema(MCPSettingsSnapshotSchema.shape.values, z.string()),
+      /** The snapshot the server shows after the update (its schema can change). */
+      output: ResultSchema(MCPSettingsReadSnapshotSchema, z.string()),
+    },
+    /** Run a layout tool action (a regular tool) and return its text result. */
+    runTool: {
+      input: MCPSettingsRunToolParamsSchema,
+      output: ResultSchema(MCPSettingsRunToolResultSchema, z.string()),
+    },
+    /** Open a layout tool action's MCP App: call the tool and store its view record. */
+    openApp: {
+      input: MCPSettingsRunToolParamsSchema,
+      output: ResultSchema(MCPSettingsOpenAppResultSchema, z.string()),
     },
   },
   configureDesign: {
@@ -1318,6 +1342,26 @@ export const agentPlugins = {
       consent: AgentPluginUpdateConsentSchema.nullish(),
     }),
     output: ResultSchema(AgentPluginInstallEntrySchema, z.string()),
+  },
+  /**
+   * Component review of the installed tree (#6498): every imported skill or MCP server whose
+   * current fingerprint the user has not reviewed, in the update review shape (fromSha = toSha).
+   */
+  previewComponentReview: {
+    input: z.object({ name: z.string() }),
+    output: ResultSchema(AgentPluginUpdateReviewSchema, z.string()),
+  },
+  /** Record consent for the reviewed components that still match the installed tree. */
+  confirmComponentReview: {
+    input: z.object({
+      name: z.string(),
+      expectedLockedSha: z.string(),
+      reviewed: z.array(AgentPluginComponentRefSchema),
+    }),
+    output: ResultSchema(
+      z.object({ entry: AgentPluginInstallEntrySchema, cleanupWarning: z.string().optional() }),
+      z.string()
+    ),
   },
 };
 
@@ -1555,6 +1599,14 @@ export const mcpApps = {
     ),
   },
   listViewDomains: { input: z.void(), output: z.array(McpAppViewDomainsSchema) },
+  /**
+   * Every project's approvals with the revision of this read, newer than every list committed
+   * before it: the live follow of mounted views re-reads after each config change (#6181).
+   */
+  readViewDomains: {
+    input: z.void(),
+    output: z.object({ revision: z.number(), approvals: z.array(McpAppViewDomainsSchema) }),
+  },
   /** Mounted views of the server in this renderer reload under the narrower policy. */
   revokeViewDomains: {
     input: McpAppViewDomainsSchema.pick({ projectPath: true, serverName: true }),
@@ -1565,10 +1617,20 @@ export const mcpApps = {
     input: McpAppModelContextRequestSchema,
     output: ResultSchema(z.object({}), z.string()),
   },
+  /** window.openai.setWidgetState of a view; kept in its result record (#6178). */
+  setWidgetState: {
+    input: McpAppWidgetStateRequestSchema,
+    output: ResultSchema(z.object({}), z.string()),
+  },
   /** Entry points of the servers enabled in the workspace (starts them like prompt discovery). */
   listEntrypoints: {
     input: z.object({ workspaceId: z.string().min(1) }),
     output: z.array(McpAppEntrypointSchema),
+  },
+  /** Ticks when a server of the workspace sends tools/list_changed: re-list entry points. */
+  onEntrypointsChanged: {
+    input: z.object({ workspaceId: z.string().min(1) }),
+    output: eventIterator(z.void()),
   },
   /** Call an entry point's tool with `{}` and store its view record (no chat row). */
   openEntrypoint: {
@@ -3717,6 +3779,11 @@ export const drafts = {
   putListEntry: {
     input: DraftListEntrySchema,
     output: DraftRevisionOutputSchema,
+  },
+  /** Move a creation draft's body and row to a new listed draft in one step (see the schema). */
+  moveCreation: {
+    input: DraftMoveCreationInputSchema,
+    output: DraftMoveCreationOutputSchema,
   },
   /** One-way import of the legacy localStorage list (never clobbers). Output: the list revision. */
   importLegacyList: {

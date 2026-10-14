@@ -2,9 +2,15 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { describe, it, expect } from "bun:test";
-import { createTestPluginInstallEntry } from "@/node/services/agentPlugins/testFixtures";
+import {
+  createTestPluginInstallEntry,
+  reviewedComponentConsent,
+} from "@/node/services/agentPlugins/testFixtures";
 import { AgentSkillReadFileToolResultSchema } from "@/common/utils/tools/toolDefinitions";
 import { createAgentSkillReadFileTool } from "./agent_skill_read_file";
+import { listInvocableSkills } from "@/common/utils/agentSkills/skillLookupName";
+import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
+import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import {
   createTestToolConfig,
   mockToolCallOptions,
@@ -83,7 +89,11 @@ describe("agent_skill_read_file", () => {
       path.join(tmp.path, "plugins.json"),
       JSON.stringify({
         plugins: [
-          createTestPluginInstallEntry("a-managed", { skills: ["allowed"], mcpServers: [] }),
+          createTestPluginInstallEntry(
+            "a-managed",
+            { skills: ["allowed"], mcpServers: [] },
+            await reviewedComponentConsent({ pluginDir: path.join(container, "a-managed") })
+          ),
         ],
       })
     );
@@ -145,7 +155,11 @@ describe("agent_skill_read_file", () => {
         registryPath,
         JSON.stringify({
           plugins: [
-            createTestPluginInstallEntry("managed", { skills: ["allowed"], mcpServers: [] }),
+            createTestPluginInstallEntry(
+              "managed",
+              { skills: ["allowed"], mcpServers: [] },
+              await reviewedComponentConsent({ pluginDir: pluginRoot })
+            ),
           ],
         })
       );
@@ -211,6 +225,55 @@ describe("agent_skill_read_file", () => {
     expect(await read("alpha:ns-fixture")).toMatchObject({ success: true, content: "1\talpha" });
     expect(await read("beta:ns-fixture")).toMatchObject({ success: true, content: "1\tbeta" });
     expect(await read("gamma:ns-fixture")).toMatchObject({ success: false });
+  });
+
+  it("adds the plugin sibling note to plugin skill files without changing content", async () => {
+    using tmp = new TestTempDir("plugin-read-file-sibling-note");
+    const pluginRoot = path.join(tmp.path, "plugins", "pstack");
+    await fs.mkdir(pluginRoot, { recursive: true });
+    await fs.writeFile(
+      path.join(pluginRoot, "plugin.json"),
+      JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "pstack",
+      })
+    );
+    const playbook = "See the **tdd** skill";
+    await writeGlobalSkill(pluginRoot, "poteto-mode", {
+      files: { "playbooks/bug-fix.md": playbook },
+    });
+    await writeGlobalSkill(pluginRoot, "tdd");
+    // The user's own skills: `tdd` shadows the plugin's sibling.
+    await writeGlobalSkill(tmp.path, "tdd");
+    await writeGlobalSkill(tmp.path, "mine", { files: { "notes.md": "mine" } });
+
+    // Production passes the turn's invocable list (turnContextAssembler); build it
+    // the same way from the same roots.
+    const config = createTestToolConfig(tmp.path);
+    const ctx = resolveSkillStorageContext({
+      runtime: config.runtime,
+      workspacePath: config.cwd,
+      xumScope: config.xumScope,
+    });
+    const discovery = await discoverAgentSkills(ctx.runtime, ctx.workspacePath, {
+      roots: ctx.roots,
+      containment: ctx.containment,
+    });
+    const tool = createAgentSkillReadFileTool({
+      ...config,
+      availableSkills: listInvocableSkills(discovery),
+    });
+
+    const pluginFile = await executeReadFile(tool, {
+      name: "poteto-mode",
+      filePath: "playbooks/bug-fix.md",
+    });
+    expect(pluginFile).toMatchObject({ success: true, content: `1\t${playbook}` });
+    expect(pluginFile.success && pluginFile.pluginSkillNote).toContain("`pstack:tdd`");
+
+    const ownFile = await executeReadFile(tool, { name: "mine", filePath: "notes.md" });
+    expect(ownFile).toMatchObject({ success: true, content: "1\tmine" });
+    expect(ownFile.success && ownFile.pluginSkillNote).toBeUndefined();
   });
 
   it("allows reading built-in skill files", async () => {

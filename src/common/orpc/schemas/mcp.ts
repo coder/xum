@@ -349,39 +349,68 @@ export const MCPTestResultSchema = z.discriminatedUnion("success", [
   }),
 ]);
 
-/** OpenAI structured settings (validated by common/utils/mcpSettings before it crosses IPC). */
-const MCPSettingValueSchema = z.union([z.string(), z.number(), z.boolean()]);
-const MCPSettingSchemaSchema = z.object({
+/**
+ * OpenAI structured settings (validated by common/utils/mcpSettings before it crosses IPC).
+ * These schemas are the one source of the snapshot types: common/utils/mcpSettings derives
+ * its types from them, so the IPC schema and the parser cannot drift apart.
+ */
+export const MCPSettingValueSchema = z.union([z.string(), z.number(), z.boolean()]);
+const MCPSettingSchemaBase = z.object({ title: z.string(), description: z.string().optional() });
+export const MCPSettingSchemaSchema = z.discriminatedUnion("type", [
+  MCPSettingSchemaBase.extend({ type: z.literal("boolean") }),
+  // No `pattern`: Xum never runs a server's regex (see parseSchema in mcpSettings).
+  MCPSettingSchemaBase.extend({
+    type: z.literal("string"),
+    enum: z.array(z.string()).optional(),
+    minLength: z.number().optional(),
+    maxLength: z.number().optional(),
+  }),
+  MCPSettingSchemaBase.extend({
+    type: z.enum(["number", "integer"]),
+    minimum: z.number().optional(),
+    maximum: z.number().optional(),
+    multipleOf: z.number().optional(),
+  }),
+]);
+/**
+ * What a layout tool item runs, resolved by Xum from the server's tools/list: the settings read
+ * names only the tool. The item has no action when the tool cannot run from settings (the
+ * server does not list it, or the tool allowlist excludes it).
+ */
+export const MCPSettingsToolActionSchema = z.object({
+  /** The spec's display name: `title`, then `annotations.title`, then `name` (cleaned). */
   title: z.string(),
-  description: z.string().optional(),
-  type: z.enum(["boolean", "string", "number", "integer"]),
-  enum: z.array(z.string()).optional(),
-  minLength: z.number().optional(),
-  maxLength: z.number().optional(),
-  minimum: z.number().optional(),
-  maximum: z.number().optional(),
-  multipleOf: z.number().optional(),
+  /** `annotations.readOnlyHint: true`. Any other tool asks the user before it runs. */
+  readOnly: z.boolean(),
+  /** An MCP App tool (a `ui://` view): the spec opens it in a modal (openSettingsApp). */
+  opensApp: z.boolean(),
+});
+export const MCPSettingsLayoutItemSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("property"), property: z.string() }),
+  z.object({
+    kind: z.literal("tool"),
+    tool: z.string(),
+    description: z.string().optional(),
+    /** Resolved by Xum from tools/list (MCPSettingsToolAction); none when it cannot run. */
+    action: MCPSettingsToolActionSchema.optional(),
+  }),
+]);
+export const MCPSettingsGroupSchema = z.object({
+  title: z.string(),
+  items: z.array(MCPSettingsLayoutItemSchema),
 });
 export const MCPSettingsSnapshotSchema = z.object({
   properties: z.record(z.string(), MCPSettingSchemaSchema),
   values: z.record(z.string(), MCPSettingValueSchema),
-  layout: z.array(
-    z.object({
-      title: z.string(),
-      items: z.array(
-        z.discriminatedUnion("kind", [
-          z.object({ kind: z.literal("property"), property: z.string() }),
-          z.object({
-            kind: z.literal("tool"),
-            tool: z.string(),
-            description: z.string().optional(),
-          }),
-        ])
-      ),
-    })
-  ),
+  /** Layout groups in order; properties no group lists go last, in "Other settings". */
+  layout: z.array(MCPSettingsGroupSchema),
   warnings: z.array(z.string()),
+  /** Schema properties dropped (unsupported schema, no valid value, or over a budget); the UI notes them. */
   droppedSettingCount: z.number().int().nonnegative(),
+});
+/** A snapshot plus its server instance's token (MCPSettingsReadSnapshot). */
+export const MCPSettingsReadSnapshotSchema = MCPSettingsSnapshotSchema.extend({
+  instanceToken: z.string(),
 });
 export const MCPSettingsReadParamsSchema = z.object({
   workspaceId: z.string(),
@@ -401,4 +430,30 @@ export const MCPSettingsReadInputSchema = z.object({
 export const MCPSettingsUpdateParamsSchema = MCPSettingsReadParamsSchema.extend({
   /** Changed values only. */
   set: z.record(z.string(), MCPSettingValueSchema),
+  /** The read's instanceToken: a replaced or restarted server refuses the update. */
+  instanceToken: z.string(),
+});
+/** A settings layout tool action: the spec calls the tool with `{}`. */
+export const MCPSettingsRunToolParamsSchema = MCPSettingsReadParamsSchema.extend({
+  toolName: z.string(),
+  /** The read's instanceToken: the tool must belong to the server instance the user saw. */
+  instanceToken: z.string(),
+  /** The user confirmed the run; required for a tool without `readOnlyHint: true`. */
+  confirmed: z.boolean(),
+});
+/** A settings layout tool action that opens an MCP App: the view to show in a modal. */
+export const MCPSettingsOpenAppResultSchema = z.object({
+  /** The view record's key (McpAppViewRef.toolCallId). */
+  viewKey: z.string().min(1),
+  serverName: z.string().min(1),
+  /** What the user sees for the server (a plugin server's key is internal). */
+  serverLabel: z.string(),
+  toolName: z.string().min(1),
+  title: z.string(),
+  resourceUri: z.string().refine(isMcpAppResourceUri),
+});
+/** The text parts of the tool result (bounded); `isError` when the tool reported an error. */
+export const MCPSettingsRunToolResultSchema = z.object({
+  text: z.string(),
+  isError: z.boolean(),
 });

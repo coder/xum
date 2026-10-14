@@ -8,6 +8,7 @@
 import "../dom";
 
 import { fireEvent, waitFor } from "@testing-library/react";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { shouldRunIntegrationTests } from "../../testUtils";
@@ -32,6 +33,26 @@ import {
   type DraftStoreScope,
 } from "@/browser/stores/DraftStore";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
+import type {
+  DraftAttachment,
+  DraftScope,
+  WorkspaceNamePersistedState,
+} from "@/common/orpc/schemas/drafts";
+import { DEFAULT_CREATION_DRAFT_ID } from "@/constants/drafts";
+
+const IMAGE: DraftAttachment = {
+  kind: "provider",
+  id: "img-promote",
+  url: "data:image/png;base64,iVBORw0KGgo=",
+  mediaType: "image/png",
+};
+
+const NAME_STATE: WorkspaceNamePersistedState = {
+  generatedIdentity: null,
+  manualName: "promoted-name",
+  autoGenerate: false,
+  lastGeneratedFor: "",
+};
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
@@ -397,6 +418,102 @@ describeIntegration("Draft workspace behavior", () => {
       // Backend drafts outlive the persisted draft list: drop them so later tests start clean.
       await Promise.all(createdScopes.map((scope) => getDraftStore().deleteDraft(scope)));
       await cleanupView(view, cleanupDom);
+    }
+  }, 60_000);
+
+  test("promoting the default draft into a listed draft keeps its text, attachments and name", async () => {
+    const env = getSharedEnv();
+    const projectPath = getSharedRepoPath();
+    const subProjectDir = path.join(projectPath, `promote-sub-${Date.now()}`);
+    await fs.mkdir(subProjectDir, { recursive: true });
+
+    const cleanupDom = setupTestDom();
+    const view = renderApp({ apiClient: env.orpc });
+    const createdScopes: DraftStoreScope[] = [];
+    let subProjectPath: string | null = null;
+
+    try {
+      await view.waitForReady();
+      const normalizedProjectPath = await addProjectViaUI(view, projectPath);
+      await clearWorkspaceDrafts(normalizedProjectPath);
+      // A sub-project's "new chat" lists a draft without opening the default one, so the default
+      // draft is promoted into the first listed draft.
+      const created = await env.orpc.projects.create({ projectPath: subProjectDir });
+      if (!created.success) throw new Error(created.error);
+      subProjectPath = created.data.normalizedPath;
+      const expandLabel = `Expand project ${path.basename(normalizedProjectPath)}`;
+      await waitFor(
+        () => {
+          const expand = view.container.querySelector<HTMLElement>(`[aria-label="${expandLabel}"]`);
+          if (expand) fireEvent.click(expand);
+          if (!view.container.querySelector('[aria-label="New chat in sub-project"]')) {
+            throw new Error("Sub-project section not shown");
+          }
+        },
+        { timeout: 10_000 }
+      );
+      const newSubProjectChat = await waitFor(
+        () => {
+          const button = view.container.querySelector<HTMLElement>(
+            '[aria-label="New chat in sub-project"]'
+          );
+          if (!button) throw new Error("Sub-project new chat button not found");
+          return button;
+        },
+        { timeout: 10_000 }
+      );
+
+      const defaultScope: DraftScope = {
+        kind: "creation",
+        projectPath: normalizedProjectPath,
+        draftId: DEFAULT_CREATION_DRAFT_ID,
+      };
+      createdScopes.push(defaultScope);
+      getDraftStore().setText(defaultScope, "typed on the project page");
+      getDraftStore().setAttachments(defaultScope, [IMAGE]);
+      getDraftStore().setNameState(defaultScope, NAME_STATE);
+      await getDraftStore().flush(defaultScope);
+
+      const updates = jest.spyOn(env.services.draftService, "update");
+      const listPuts = jest.spyOn(env.services.draftService, "putListEntry");
+      fireEvent.click(newSubProjectChat);
+      const [draftId] = await waitForDraftCount(normalizedProjectPath, 1);
+      const listedScope: DraftScope = {
+        kind: "creation",
+        projectPath: normalizedProjectPath,
+        draftId,
+      };
+      createdScopes.push(listedScope);
+      await waitFor(
+        async () => {
+          const moved = await env.orpc.drafts.get({ scope: listedScope });
+          expect(moved).toMatchObject({
+            text: "typed on the project page",
+            attachments: [IMAGE],
+            nameState: NAME_STATE,
+          });
+          const source = await env.orpc.drafts.get({ scope: defaultScope });
+          expect(source.text).toBe("");
+          expect(source.nameState).toBeUndefined();
+          const { entries } = await env.orpc.drafts.getList();
+          expect(entries.find((entry) => entry.draftId === draftId)?.subProjectPath).toBe(
+            subProjectPath
+          );
+        },
+        { timeout: 10_000 }
+      );
+      // One backend step moved the body and listed the row: no write or put of its own.
+      const isListed = (scope: DraftScope) =>
+        scope.kind === "creation" && scope.draftId === draftId;
+      expect(updates.mock.calls.filter(([input]) => isListed(input.scope))).toEqual([]);
+      expect(listPuts.mock.calls.filter(([entry]) => entry.draftId === draftId)).toEqual([]);
+      updates.mockRestore();
+      listPuts.mockRestore();
+    } finally {
+      await Promise.all(createdScopes.map((scope) => getDraftStore().deleteDraft(scope)));
+      if (subProjectPath !== null) await env.orpc.projects.remove({ projectPath: subProjectPath });
+      await cleanupView(view, cleanupDom);
+      await fs.rm(subProjectDir, { recursive: true, force: true });
     }
   }, 60_000);
 });

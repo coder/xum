@@ -2097,24 +2097,28 @@ export const XumConfigWriteToolResultSchema = z.union([
 /**
  * File read tool result - content or error.
  */
+const FileReadSuccessResultSchema = z.object({
+  success: z.literal(true),
+  file_size: z.number(),
+  modifiedTime: z.string(),
+  lines_read: z.number(),
+  content: z
+    .string()
+    .describe(
+      "File content with line numbers prepended as '<line_number>\\t<content>'. " +
+        "Line numbers are not part of the actual file content."
+    ),
+  warning: z.string().optional(),
+});
+
+const FileReadErrorResultSchema = z.object({
+  success: z.literal(false),
+  error: z.string(),
+});
+
 export const FileReadToolResultSchema = z.union([
-  z.object({
-    success: z.literal(true),
-    file_size: z.number(),
-    modifiedTime: z.string(),
-    lines_read: z.number(),
-    content: z
-      .string()
-      .describe(
-        "File content with line numbers prepended as '<line_number>\\t<content>'. " +
-          "Line numbers are not part of the actual file content."
-      ),
-    warning: z.string().optional(),
-  }),
-  z.object({
-    success: z.literal(false),
-    error: z.string(),
-  }),
+  FileReadSuccessResultSchema,
+  FileReadErrorResultSchema,
 ]);
 
 const AttachFileToolTextPartSchema = z
@@ -2223,10 +2227,14 @@ export const AgentSkillReadToolResultSchema = z.union([
 ]);
 
 /**
- * Agent Skill read_file tool result.
- * Uses the same shape/limits as file_read.
+ * agent_skill_read_file result: file_read's, plus the plugin sibling note
+ * (pluginSiblingNote.ts) for files of a plugin skill. The note is a separate
+ * field so `content` line numbers stay exact.
  */
-export const AgentSkillReadFileToolResultSchema = FileReadToolResultSchema;
+export const AgentSkillReadFileToolResultSchema = z.union([
+  FileReadSuccessResultSchema.extend({ pluginSkillNote: z.string().optional() }),
+  FileReadErrorResultSchema,
+]);
 
 /**
  * models_list tool result. Mirrors the shared `AvailableModel` domain type
@@ -2843,7 +2851,7 @@ export const TOOL_DEFINITIONS = {
   },
   models_list: {
     description:
-      "List selectable (non-hidden) models with aliases and thinking levels; a config snapshot, not an availability probe. Pass an ID only for a requested override; else leave `task.model` unset.",
+      "List model suggestions with aliases and thinking levels; not exhaustive or an availability probe. Other provider:model IDs may work with a configured provider. Pass an ID only for a requested override; else leave `task.model` unset.",
     schema: z.object({}).strict(),
     resultSchema: ModelsListToolResultSchema,
   },
@@ -3515,16 +3523,16 @@ export function getToolSchemas(): Record<string, ToolSchema> {
 }
 
 /**
- * Google's mixed built-in + function tool path is currently supported for Gemini 3.
+ * Google's mixed built-in + function tool path is supported for Gemini 3 and Gemini 4 Argon.
  * Keep native Google tools gated here so the prompt allowlist matches the actual toolset.
  */
 export function supportsGoogleNativeToolsWithFunctionTools(modelId: string): boolean {
   const bareModelId = modelId.split("/").pop() ?? modelId;
-  const match = /^gemini-(\d+)(?:[.-]|$)/.exec(bareModelId);
-  if (!match) return false;
-  const major = Number.parseInt(match[1], 10);
-  // The installed @ai-sdk/google mixed native/function serialization path is Gemini 3-only.
-  return major === 3;
+  // Gemini 4 Argon documents Search grounding and URL context alongside function calling,
+  // and @ai-sdk/google gives every post-2.x Gemini ID the mixed native/function
+  // serialization (includeServerSideToolInvocations). Other Gemini 4 IDs stay off until
+  // their docs list the same tools.
+  return /^gemini-(?:3(?:[.-]|$)|4-argon)/.test(bareModelId);
 }
 
 /**

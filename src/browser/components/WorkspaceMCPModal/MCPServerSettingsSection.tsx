@@ -8,22 +8,31 @@ import { useAPI } from "@/browser/contexts/API";
 import { formatKeybind, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { getOwn } from "@/common/utils/getOwn";
 import {
-  validateMCPSettingValue,
   type MCPSettingSchema,
   type MCPSettingValue,
-  type MCPSettingsSnapshot,
+  type MCPSettingsReadSnapshot,
 } from "@/common/utils/mcpSettings";
+import { MCPSettingsToolActionRow } from "./MCPSettingsToolActionRow";
+import { settingsErrors } from "./serverSettingsEntries";
 
 interface MCPServerSettingsSectionProps {
   workspaceId: string;
   serverName: string;
-  snapshot: MCPSettingsSnapshot;
+  snapshot: MCPSettingsReadSnapshot;
   /**
    * Called when a save starts (it takes the save's settings request); the returned callback
-   * gets the values a successful save returned. The dialog keeps them as the snapshot's
-   * values, so a remount (server toggled off and on) starts from what the server stored.
+   * runs when the save ends, with the snapshot a successful save returned (null on failure).
+   * The dialog shows that snapshot (the server's schema can change with its values), and
+   * keeps Refresh Tools disabled until the save ends.
    */
-  beginSave: () => (values: MCPSettingsSnapshot["values"]) => void;
+  beginSave: () => (snapshot: MCPSettingsReadSnapshot | null) => void;
+  /** A tool action run starts (Refresh Tools waits for it); the returned callback ends it. */
+  beginToolRun: () => () => void;
+  /**
+   * Refresh Tools runs for this server. Its settings read would take a newer request ID than
+   * a save started now, and the save's result would be dropped, so Save waits for it.
+   */
+  refreshing: boolean;
 }
 
 /** Lets the dialog check, at Save time, for edits this section has not saved yet. */
@@ -48,19 +57,21 @@ export const MCPServerSettingsSection = React.forwardRef<
   // Number inputs keep their raw text so a half-typed "1." is not rewritten.
   const [numberText, setNumberText] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
+  // Tool action runs in flight: Save waits for them, and they wait for a save (see below).
+  const [runningTools, setRunningTools] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
   const { properties } = props.snapshot;
   const changed = Object.fromEntries(
     Object.entries(draft).filter(([name, value]) => getOwn(saved, name) !== value)
   );
-  const errors: Record<string, string> = {};
-  for (const [name, value] of Object.entries(draft)) {
-    const schema = getOwn(properties, name);
-    const message = schema && validateMCPSettingValue(schema, value);
-    if (message) errors[name] = `${schema.title} ${message}`;
-  }
-  const canSave = Object.keys(changed).length > 0 && Object.keys(errors).length === 0 && !saving;
+  const errors = settingsErrors(properties, draft);
+  const canSave =
+    Object.keys(changed).length > 0 &&
+    Object.keys(errors).length === 0 &&
+    !saving &&
+    runningTools === 0 &&
+    !props.refreshing;
   // The dialog's Save does not send settings, so it must not close over a pending edit.
   useImperativeHandle(ref, () => ({ hasUnsavedChanges: () => Object.keys(changed).length > 0 }));
 
@@ -70,17 +81,19 @@ export const MCPServerSettingsSection = React.forwardRef<
     if (!api) return;
     setSaving(true);
     setError(null);
-    const onSaved = props.beginSave();
+    const onSettled = props.beginSave();
+    let savedSnapshot: MCPSettingsReadSnapshot | null = null;
     try {
       const result = await api.mcp.settings.update({
         workspaceId: props.workspaceId,
         serverName: props.serverName,
         set: changed,
+        instanceToken: props.snapshot.instanceToken,
       });
       if (result.success) {
-        setSaved(result.data);
-        setDraft(result.data);
-        onSaved(result.data);
+        setSaved(result.data.values);
+        setDraft(result.data.values);
+        savedSnapshot = result.data;
       } else {
         setError(result.error);
         setDraft(saved);
@@ -91,6 +104,7 @@ export const MCPServerSettingsSection = React.forwardRef<
     } finally {
       setNumberText({});
       setSaving(false);
+      onSettled(savedSnapshot);
     }
   };
 
@@ -182,14 +196,31 @@ export const MCPServerSettingsSection = React.forwardRef<
           {group.items.map((item) => {
             if (item.kind === "tool")
               return (
-                <div
+                <MCPSettingsToolActionRow
                   key={`tool:${item.tool}`}
-                  className="text-content-secondary flex items-center justify-between gap-3 text-xs opacity-60"
-                  aria-disabled="true"
-                >
-                  <span className="min-w-0 wrap-anywhere">{item.description ?? item.tool}</span>
-                  <span className="shrink-0">Opens in a later version</span>
-                </div>
+                  workspaceId={props.workspaceId}
+                  serverName={props.serverName}
+                  instanceToken={props.snapshot.instanceToken}
+                  item={item}
+                  // A save or refresh replaces the snapshot and remounts this section: a run
+                  // started meanwhile would lose its result.
+                  // One run at a time: two writing tools must not race on the server.
+                  // Unsaved edits block a run too: the tool sees the saved settings, not the draft.
+                  disabled={
+                    saving ||
+                    props.refreshing ||
+                    runningTools > 0 ||
+                    Object.keys(changed).length > 0
+                  }
+                  beginRun={() => {
+                    setRunningTools((count) => count + 1);
+                    const end = props.beginToolRun();
+                    return () => {
+                      setRunningTools((count) => count - 1);
+                      end();
+                    };
+                  }}
+                />
               );
             const schema = getOwn(properties, item.property);
             if (schema === undefined) return null;

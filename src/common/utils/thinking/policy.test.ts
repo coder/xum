@@ -301,10 +301,15 @@ describe("getThinkingPolicyForModel", () => {
     expect(resolveEffectiveThinkingLevel("anthropic:claude-sonnet-4-5", "high")).toBe("high");
   });
 
-  test("resolveEffectiveThinkingLevel clamps unset/off for Gemini 3.8 Flash but not older Flash", () => {
+  test("resolveEffectiveThinkingLevel clamps unset/off for Gemini 3.8 Flash and Argon but not older Flash", () => {
     // 3.8 Flash rejects "minimal": the tracked level must already be "low" so the
     // request envelope and debug snapshots agree with what the Google adapter sends.
-    for (const model of ["google:gemini-3.8-flash", "mux-gateway:google/gemini-3.8-flash"]) {
+    // Argon has no "off" either; unclamped, it would run at its medium default.
+    for (const model of [
+      "google:gemini-3.8-flash",
+      "mux-gateway:google/gemini-3.8-flash",
+      "google:gemini-4-argon",
+    ]) {
       expect(resolveEffectiveThinkingLevel(model, undefined)).toBe("low");
       expect(resolveEffectiveThinkingLevel(model, "off")).toBe("low");
       expect(resolveEffectiveThinkingLevel(model, "high")).toBe("high");
@@ -490,6 +495,14 @@ describe("getThinkingPolicyForModel", () => {
 
   test("returns low/high for Gemini 3.1 Pro", () => {
     expect(getThinkingPolicyForModel("google:gemini-3.1-pro-preview")).toEqual(["low", "high"]);
+  });
+
+  test("returns low/medium/high (no off) for Gemini 4 Argon, unlike the Gemini 3 Pro set", () => {
+    for (const model of ["google:gemini-4-argon", "openrouter:google/gemini-4-argon"]) {
+      expect(getThinkingPolicyForModel(model)).toEqual(["low", "medium", "high"]);
+      expect(enforceThinkingPolicy(model, "off")).toBe("low");
+      expect(enforceThinkingPolicy(model, "medium")).toBe("medium");
+    }
   });
 
   test("returns off/low/medium/high for stable Gemini 3.5 Flash", () => {

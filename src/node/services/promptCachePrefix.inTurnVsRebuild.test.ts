@@ -403,9 +403,11 @@ describe("prompt-cache prefix: next turn vs the previous turn's last step", () =
 
   // tools.ts wrapToolsWithModelOnlyNotifications (TodoListReminderSource on the 5th, 15th, ...
   // tool call while todos are open; HomeClutterReminderSource once per turn) attaches
-  // `__mux_notifications` to the result the model sees in-turn; StreamManager strips the
-  // field before persisting (stripInternalToolResultFields), so the next turn's rebuild
-  // cannot repeat the tool_result bytes the in-turn step sent.
+  // `__mux_notifications` to the result the model sees in-turn. StreamManager keeps the notes
+  // beside the persisted output (modelOnlyNotifications), and the rebuild puts them back, so
+  // the next turn repeats the tool_result bytes the in-turn step sent. Before that, the changed
+  // tool_result also made Anthropic reject every later thinking block of the row ("Content
+  // before this block differs"): the most frequent rejection on the dogfood server.
   test("model-only tool notifications keep the prefix", async () => {
     const reminded = tool({
       description: "bash tool",
@@ -417,14 +419,10 @@ describe("prompt-cache prefix: next turn vs the previous turn's last step", () =
           ])
         ),
     });
-    await expectReproFailure(
-      () =>
-        expectNextTurnExtendsLastStep({
-          tools: { bash: reminded, probe: plainTool("probe") },
-          firstTurn: toolThenTextTurn("bash", "call-1"),
-        }),
-      divergesAt(2)
-    );
+    await expectNextTurnExtendsLastStep({
+      tools: { bash: reminded, probe: plainTool("probe") },
+      firstTurn: toolThenTextTurn("bash", "call-1"),
+    });
   });
 
   // mcpClient.ts gives every MCP tool a toModelOutput (mcpToModelOutput) that turns the

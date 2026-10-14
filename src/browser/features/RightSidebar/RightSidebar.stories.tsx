@@ -24,7 +24,7 @@ import { UILayoutsProvider } from "@/browser/contexts/UILayoutsContext";
 import { WorkspaceProvider } from "@/browser/contexts/WorkspaceContext";
 import { SplashScreenProvider } from "@/browser/features/SplashScreens/SplashScreenProvider";
 import { TerminalRouterProvider } from "@/browser/terminal/TerminalRouterContext";
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
@@ -38,6 +38,7 @@ import { setHunkFirstSeen } from "@/browser/stories/helpers/reviews";
 import { collapseLeftSidebar, expandRightSidebar } from "@/browser/stories/helpers/uiState";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import {
+  RIGHT_SIDEBAR_COLLAPSED_KEY,
   RIGHT_SIDEBAR_TAB_KEY,
   RIGHT_SIDEBAR_WIDTH_KEY,
   SELECTED_WORKSPACE_KEY,
@@ -1775,7 +1776,6 @@ export const CollapsedOverview: Story = {
   render: () => (
     <AppWithMocks
       setup={() => {
-        // setupSimpleChatStory collapses the right sidebar, which is what this story shows.
         const client = setupSimpleChatStory({
           workspaceId: OVERVIEW_WORKSPACE_ID,
           workspaceName: "feature/settlement-reconciler",
@@ -1815,6 +1815,8 @@ export const CollapsedOverview: Story = {
           ],
         });
         collapseLeftSidebar();
+        // Exercise the app's default, not the helper's explicitly collapsed preference.
+        updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, null);
         return client;
       }}
     />

@@ -43,8 +43,10 @@ import {
 import {
   appViewDetails,
   appViewServerNames,
+  focusMcpAppViewTab,
   getMcpAppViews,
   openMcpAppViewTab,
+  reloadMcpAppView,
   transcriptViews,
   type McpAppViewRef,
 } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
@@ -53,7 +55,9 @@ import {
   openMcpAppEntrypoint,
 } from "@/browser/features/RightSidebar/AppViewTab/openMcpAppEntrypoint";
 import { mcpAppEntrypointDescription } from "@/browser/features/RightSidebar/AppViewTab/mcpAppEntrypoints";
+import { appViewTabFor } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
 import type { McpAppEntrypoint } from "@/common/orpc/schemas/mcpApps";
+import { revokeMcpAppViewDomains } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewDomainsStore";
 
 /**
  * One palette action per MCP App entry point: opens its app tab (calling the tool with {}) or
@@ -65,19 +69,101 @@ function entrypointActions(
   entrypoints: readonly McpAppEntrypoint[],
   navigation: string
 ): CommandAction[] {
-  return entrypoints.map((entrypoint) => ({
-    id: CommandIds.navOpenAppEntrypoint(entrypoint.viewKey),
-    title: `Open Plugin View: ${entrypoint.title}`,
-    subtitle: mcpAppEntrypointDescription(entrypoint),
-    section: navigation,
-    keywords: ["plugin", "view", "app", "mcp", entrypoint.serverName],
-    run: async () => {
-      const error = api
-        ? await openMcpAppEntrypoint(api, workspaceId, entrypoint)
-        : MCP_APP_ENTRYPOINT_NOT_CONNECTED;
-      if (error !== null) showCommandFeedbackToast({ type: "error", message: error });
+  return entrypoints.flatMap((entrypoint) => {
+    const subtitle = mcpAppEntrypointDescription(entrypoint);
+    const open: CommandAction = {
+      id: CommandIds.navOpenAppEntrypoint(entrypoint.viewKey),
+      title: `Open Plugin View: ${entrypoint.title}`,
+      subtitle,
+      section: navigation,
+      keywords: ["plugin", "view", "app", "mcp", entrypoint.serverName],
+      run: async () => {
+        const error = api
+          ? await openMcpAppEntrypoint(api, workspaceId, entrypoint)
+          : MCP_APP_ENTRYPOINT_NOT_CONNECTED;
+        if (error !== null) showCommandFeedbackToast({ type: "error", message: error });
+      },
+    };
+    // An entry point's tab is keyed by its view key. Open only focuses that tab while its
+    // record is current, so a failed load needs this action to retry from the keyboard.
+    const reload = reloadAppViewActions(workspaceId, entrypoint.viewKey, {
+      title: `Reload Plugin View: ${entrypoint.title}`,
+      subtitle,
+      section: navigation,
+      keywords: ["plugin", "view", "app", "mcp", "reload", "retry", entrypoint.serverName],
+    });
+    return [open, ...reload];
+  });
+}
+
+/**
+ * "Reload" for an app tab that is open (after a failed load, or a stuck view): remounts the
+ * tab's frame, which loads the view again, and focuses the tab. Empty when no tab is open.
+ */
+function reloadAppViewActions(
+  workspaceId: string,
+  toolCallId: string,
+  action: Pick<CommandAction, "title" | "subtitle" | "section" | "keywords">
+): CommandAction[] {
+  if (!hasTab(readRightSidebarLayout(workspaceId), appViewTabFor(toolCallId))) return [];
+  return [
+    {
+      ...action,
+      id: CommandIds.navReloadAppView(toolCallId),
+      run: () => {
+        reloadMcpAppView(workspaceId, toolCallId);
+        focusMcpAppViewTab(workspaceId, toolCallId);
+      },
     },
-  }));
+  ];
+}
+
+/**
+ * "Revoke MCP App View Domains…": the keyboard path to Revoke under "Allowed view domains" in
+ * Settings (#6181). Picks one stored approval (server and project) and revokes it. The palette
+ * has closed by the time the call settles, so the outcome shows as a toast.
+ */
+function revokeViewDomainsAction(api: APIClient | null, settings: string): CommandAction {
+  return {
+    id: CommandIds.mcpAppsRevokeViewDomains(),
+    title: "Revoke MCP App View Domains…",
+    subtitle: "Stop a server's views from reaching the domains you allowed",
+    section: settings,
+    keywords: ["mcp", "app", "view", "domains", "csp", "allowed", "revoke", "network"],
+    run: () => undefined,
+    prompt: {
+      title: "Revoke MCP App View Domains",
+      fields: [
+        {
+          type: "select",
+          name: "approval",
+          label: "Allowed view domains",
+          placeholder: "Choose a server and project…",
+          // A failed list rejects: the open palette shows the error (CommandPalette).
+          getOptions: async () => {
+            if (!api) throw new Error(MCP_APP_ENTRYPOINT_NOT_CONNECTED);
+            const approvals = await api.mcpApps.listViewDomains();
+            return approvals.map((approval) => ({
+              id: JSON.stringify([approval.projectPath, approval.serverName]),
+              label: `${approval.serverName} in ${approval.projectPath}: ${approval.origins.join(", ")}`,
+              keywords: [approval.serverName, approval.projectPath, ...approval.origins],
+            }));
+          },
+        },
+      ],
+      onSubmit: async (values) => {
+        const [projectPath, serverName] = JSON.parse(values.approval) as [string, string];
+        const error = api
+          ? await revokeMcpAppViewDomains(api, { projectPath, serverName })
+          : MCP_APP_ENTRYPOINT_NOT_CONNECTED;
+        showCommandFeedbackToast(
+          error == null
+            ? { type: "success", message: `Revoked the view domains of ${serverName}` }
+            : { type: "error", message: `Could not revoke: ${error}` }
+        );
+      },
+    },
+  };
 }
 
 /**
@@ -115,13 +201,12 @@ import type { LayoutPresetsConfig, LayoutSlotNumber } from "@/common/types/uiLay
 import {
   hasTab,
   openToolFromNewTab,
-  selectTabInTabset,
-  setFocusedTabset,
   splitFocusedTabset,
   toggleTab,
   type RightSidebarLayoutState,
 } from "@/browser/utils/rightSidebarLayout";
 import {
+  focusRightSidebarTab,
   readRightSidebarLayout,
   updateRightSidebarLayout,
 } from "@/browser/utils/rightSidebarTabFocus";
@@ -361,6 +446,11 @@ const findFirstTerminalSessionTab = (
   );
 };
 
+function focusExistingTerminalTab(workspaceId: string): void {
+  const found = findFirstTerminalSessionTab(readRightSidebarLayout(workspaceId).root);
+  if (found) focusRightSidebarTab(workspaceId, found.tab);
+}
+
 /**
  * Whether right-sidebar commands have a visible sidebar to act on. Narrow layouts hide the
  * sidebar entirely, so opening tabs there would produce no visible result (the keyboard
@@ -470,6 +560,46 @@ function openGoalPanel(workspaceId: string, openCompleteInput = false): void {
 /** Subtitle for an On/Off toggle backed by config.json; `fallback` until the value is known. */
 function describeConfigToggle(value: boolean | undefined, fallback: string): string {
   return value === undefined ? fallback : `Current: ${value ? "On" : "Off"}`;
+}
+
+/**
+ * The palette actions of the workspace's MCP App views: one "Open App View" per view (its tab,
+ * or the tab it has), and one "Reload App View" per view whose tab is open. The subtitle carries
+ * each call's detail, so several calls of one tool differ.
+ */
+function appViewActions(
+  wsId: string,
+  messages: Parameters<typeof appViewEntries>[1],
+  navigationSection: CommandAction["section"]
+): CommandAction[] {
+  return appViewEntries(wsId, messages).flatMap(({ view, server, detail }) => {
+    const subtitle = detail === "" ? server : `${server} · ${detail}`;
+    const open: CommandAction = {
+      id: CommandIds.navOpenAppView(view.toolCallId),
+      title: `Open App View: ${view.label}`,
+      subtitle,
+      section: navigationSection,
+      keywords: ["app", "view", "mcp", "tab", view.serverName],
+      run: () => openMcpAppViewTab(wsId, view),
+    };
+    // The keyboard path to an open tab's Reload.
+    const reload = reloadAppViewActions(wsId, view.toolCallId, {
+      title: `Reload App View: ${view.label}`,
+      subtitle,
+      section: navigationSection,
+      keywords: ["app", "view", "mcp", "reload", "retry", view.serverName],
+    });
+    return [open, ...reload];
+  });
+}
+
+/** Palette options: managed plugins with components not reviewed on this install (#6498). */
+async function pluginsNeedingReviewOptions(api: BuildSourcesParams["api"]) {
+  const result = await api?.agentPlugins.list();
+  if (!result?.success) return [];
+  return result.data
+    .filter((item) => item.managed && (item.reviewRequiredCount ?? 0) > 0)
+    .map((item) => ({ id: item.name, label: item.name, keywords: [item.name, item.location] }));
 }
 
 export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandAction[]> {
@@ -957,16 +1087,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               // One per MCP App view of the workspace (transcript or opened this session): opens
               // its tab or focuses the one it has, the keyboard path to "Open in tab".
               // The subtitle carries each call's detail, so several calls of one tool differ.
-              ...appViewEntries(wsId, p.selectedWorkspaceState?.messages ?? []).map(
-                ({ view, server, detail }) => ({
-                  id: CommandIds.navOpenAppView(view.toolCallId),
-                  title: `Open App View: ${view.label}`,
-                  subtitle: detail === "" ? server : `${server} · ${detail}`,
-                  section: section.navigation,
-                  keywords: ["app", "view", "mcp", "tab", view.serverName],
-                  run: () => openMcpAppViewTab(wsId, view),
-                })
-              ),
+              ...appViewActions(wsId, p.selectedWorkspaceState?.messages ?? [], section.navigation),
               // One per MCP App entry point of an enabled server: opens its app tab (calling
               // the tool with {}) or focuses the one it has.
               ...entrypointActions(p.api, wsId, p.mcpAppEntrypoints ?? [], section.navigation),
@@ -1001,28 +1122,25 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           id: CommandIds.navRightSidebarFocusTerminal(),
           title: "Right Sidebar: Focus Terminal",
           section: section.navigation,
-          run: () =>
-            updateRightSidebarLayout(wsId, (s) => {
-              const found = findFirstTerminalSessionTab(s.root);
-              if (!found) return s;
-              return selectTabInTabset(
-                setFocusedTabset(s, found.tabsetId),
-                found.tabsetId,
-                found.tab
-              );
-            }),
+          run: () => focusExistingTerminalTab(wsId),
         },
         {
           id: CommandIds.navRightSidebarSplitHorizontal(),
           title: "Right Sidebar: Split Horizontally",
           section: section.navigation,
-          run: () => updateRightSidebarLayout(wsId, (s) => splitFocusedTabset(s, "horizontal")),
+          run: () => {
+            updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+            updateRightSidebarLayout(wsId, (s) => splitFocusedTabset(s, "horizontal"));
+          },
         },
         {
           id: CommandIds.navRightSidebarSplitVertical(),
           title: "Right Sidebar: Split Vertically",
           section: section.navigation,
-          run: () => updateRightSidebarLayout(wsId, (s) => splitFocusedTabset(s, "vertical")),
+          run: () => {
+            updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+            updateRightSidebarLayout(wsId, (s) => splitFocusedTabset(s, "vertical"));
+          },
         },
         {
           id: CommandIds.navRightSidebarNewTab(),
@@ -1081,20 +1199,13 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               // "terminal" is now an alias for "focus an existing terminal session tab".
               // Creating new terminal sessions is handled in the main UI ("+" button).
               if (tool === "terminal") {
-                updateRightSidebarLayout(wsId, (s) => {
-                  const found = findFirstTerminalSessionTab(s.root);
-                  if (!found) return s;
-                  return selectTabInTabset(
-                    setFocusedTabset(s, found.tabsetId),
-                    found.tabsetId,
-                    found.tab
-                  );
-                });
+                focusExistingTerminalTab(wsId);
                 return;
               }
 
               // Same as picking the tool in the focused pane's New tab: it takes the New tab's
               // place, or is selected where it is already open.
+              updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
               updateRightSidebarLayout(wsId, (s) => openToolFromNewTab(s, s.focusedTabsetId, tool));
               // While the sidebar is hidden (phones) that tab cannot be seen, so WorkspaceMenuBar
               // shows it in the full-screen sidebar; with the sidebar visible it ignores the event.
@@ -2221,6 +2332,11 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     },
   ]);
 
+  // MCP App view-domain approvals: the palette path to Settings' Revoke.
+  // Not behind the artifacts experiment: Settings lists stored approvals with Revoke either way,
+  // so the palette keeps the keyboard path to them.
+  actions.push(() => [revokeViewDomainsAction(p.api, section.settings)]);
+
   // Settings
   if (p.onOpenSettings) {
     const openSettings = p.onOpenSettings;
@@ -2370,6 +2486,30 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           ],
           onSubmit: (values) => {
             publishPluginsSectionIntent({ type: "review-hooks", name: values.pluginName });
+            openSettings("plugins");
+          },
+        },
+      },
+      {
+        id: CommandIds.pluginsReviewComponents(),
+        title: "Review Plugin Components…",
+        subtitle: "Approve skills and MCP servers that do not load until you review them",
+        section: section.settings,
+        keywords: ["plugin", "components", "review", "approve", "skills", "mcp", "consent"],
+        run: () => undefined,
+        prompt: {
+          title: "Review Plugin Components",
+          fields: [
+            {
+              type: "select",
+              name: "pluginName",
+              label: "Plugin that needs review",
+              placeholder: "Search plugins that need review…",
+              getOptions: () => pluginsNeedingReviewOptions(p.api),
+            },
+          ],
+          onSubmit: (values) => {
+            publishPluginsSectionIntent({ type: "review-components", name: values.pluginName });
             openSettings("plugins");
           },
         },

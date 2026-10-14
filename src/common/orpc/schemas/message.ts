@@ -97,6 +97,10 @@ export const DynamicToolPartPendingSchema = MuxToolPartBase.extend({
 const DynamicToolPartAvailableSchema = MuxToolPartBase.extend({
   state: z.literal("output-available"),
   output: z.unknown(),
+  // Model-only notes the in-turn result carried (`__mux_notifications`), kept out of `output`
+  // so the transcript never shows them. The request build attaches them again: see
+  // readModelOnlyToolNotifications.
+  modelOnlyNotifications: z.array(z.string()).optional().catch(undefined),
   nestedCalls: z.array(NestedToolCallSchema).optional(),
 });
 const DynamicToolPartRedactedSchema = MuxToolPartBase.extend({

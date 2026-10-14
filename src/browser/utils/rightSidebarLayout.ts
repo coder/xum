@@ -249,6 +249,15 @@ export function findFirstTabsetId(root: RightSidebarLayoutNode): string | null {
   return findFirstTabsetId(root.children[0]) ?? findFirstTabsetId(root.children[1]);
 }
 
+/** The tabset in the sidebar's top-right corner: its strip holds the collapse button. */
+export function findTopRightTabsetId(root: RightSidebarLayoutNode): string {
+  if (root.type === "tabset") return root.id;
+  // "horizontal" stacks its two children top to bottom; "vertical" puts them left to right.
+  return findTopRightTabsetId(
+    root.direction === "horizontal" ? root.children[0] : root.children[1]
+  );
+}
+
 function allocId(state: RightSidebarLayoutState, prefix: "tabset" | "split") {
   const id = `${prefix}-${state.nextId}`;
   return { id, nextId: state.nextId + 1 };

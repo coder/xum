@@ -1,9 +1,13 @@
-import { createHash } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import * as fs from "fs/promises";
 import * as path from "path";
 import { z } from "zod";
 import assert from "@/common/utils/assert";
-import { isMcpAppResourceUri, MCP_APP_MODEL_CONTEXT_MAX_BYTES } from "@/common/utils/mcpApps";
+import {
+  isMcpAppResourceUri,
+  MCP_APP_MODEL_CONTEXT_MAX_BYTES,
+  MCP_APP_WIDGET_STATE_MAX_BYTES,
+} from "@/common/utils/mcpApps";
 import { log } from "@/node/services/log";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
@@ -41,6 +45,31 @@ const McpAppResultRecordSchema = z.object({
   /** Raw CallToolResult, or null when it was too large to keep. */
   result: z.unknown().nullable(),
   createdAt: z.number(),
+  /**
+   * Random per record (record() writes a new one each time): the view instance this record
+   * belongs to. Widget-state writes name it (mcpAppWidgetStateBindingOf). Absent on records
+   * written before it existed.
+   */
+  instanceId: z.string().min(1).optional(),
+  /**
+   * Written by an entry point open (MCPServerManager.openMcpAppEntrypoint) or a settings app
+   * open (openSettingsApp), never by a tool call. A restored tab whose entry point is gone is
+   * then unavailable, not a tool call's view.
+   */
+  entrypoint: z.literal(true).optional(),
+  /**
+   * How a call without a result ended: "interrupted" when it was aborted, "failed" when it threw
+   * or hit its deadline. A restored view outside the loaded transcript gets tool-cancelled from it
+   * (#6181). Absent on a completed call and on records written before this field.
+   */
+  outcome: z.enum(["failed", "interrupted"]).optional(),
+  /**
+   * The view's window.openai widget state (setWidgetState), JSON of at most
+   * MCP_APP_WIDGET_STATE_MAX_BYTES. Kept in the record so it belongs to this one view instance:
+   * a new record under a reused tool call ID starts without it, and pruning the record or
+   * removing the workspace removes it (#6178).
+   */
+  widgetState: z.unknown().optional(),
 });
 export type McpAppResultRecord = z.infer<typeof McpAppResultRecordSchema>;
 
@@ -70,6 +99,25 @@ const McpAppModelContextFileSchema = z.object({
   version: z.literal(MCP_APP_MODEL_CONTEXT_FILE_VERSION),
   views: z.array(McpAppModelContextSchema),
 });
+
+/** A widget state's JSON (null clears it); throws when it is not JSON or over the cap. */
+function widgetStateJson(state: unknown): string | null {
+  if (state === null) return null;
+  const json = JSON.stringify(state);
+  if (json === undefined) throw new Error("The widget state is not JSON");
+  if (Buffer.byteLength(json, "utf8") > MCP_APP_WIDGET_STATE_MAX_BYTES) {
+    throw new Error("The widget state is too large");
+  }
+  return json;
+}
+
+/**
+ * What a view's widget-state writes name to reach its own record: the record's random
+ * instanceId, or its creation time for a record written before instanceId existed.
+ */
+export function mcpAppWidgetStateBindingOf(record: McpAppResultRecord): string {
+  return record.instanceId ?? `created:${record.createdAt}`;
+}
 
 function fileNameFor(toolCallId: string): string {
   // Tool call IDs come from providers; hash them so they are always safe file names.
@@ -119,27 +167,35 @@ export class McpAppResultStore {
   }
 
   /** Record a tool result. Never throws: a failed write only means the view opens without it. */
+  /** Resolves true once the record is stored (a failure is logged, never thrown). */
   async record(
     workspaceId: string,
-    input: Omit<McpAppResultRecord, "version" | "createdAt">
-  ): Promise<void> {
+    input: Omit<McpAppResultRecord, "version" | "createdAt" | "instanceId">
+  ): Promise<boolean> {
     try {
-      let record: McpAppResultRecord = { version: 1, createdAt: Date.now(), ...input };
+      let record: McpAppResultRecord = {
+        version: 1,
+        createdAt: Date.now(),
+        instanceId: randomUUID(),
+        ...input,
+      };
       let serialized = JSON.stringify(record);
       if (Buffer.byteLength(serialized, "utf8") > MCP_APP_RESULT_MAX_BYTES) {
         record = { ...record, result: null };
         serialized = JSON.stringify(record);
-        if (Buffer.byteLength(serialized, "utf8") > MCP_APP_RESULT_MAX_BYTES) return;
+        if (Buffer.byteLength(serialized, "utf8") > MCP_APP_RESULT_MAX_BYTES) return false;
       }
       const dir = this.dirFor(workspaceId);
-      if (!(await this.writeRecord(workspaceId, dir, record.toolCallId, serialized))) return;
+      if (!(await this.writeRecord(workspaceId, dir, record.toolCallId, serialized))) return false;
       // Publish to memory only once the record is durable: a failed write must not leave a
       // record that opens now but vanishes on restart. Before prune, so a prune failure does
       // not hide a record that is already on disk.
       this.remember(workspaceId, record);
       await this.prune(dir);
+      return true;
     } catch (error) {
       log.debug("[MCP Apps] Failed to record tool result", { workspaceId, error });
+      return false;
     }
   }
 
@@ -164,22 +220,85 @@ export class McpAppResultStore {
     });
   }
 
-  async get(workspaceId: string, toolCallId: string): Promise<McpAppResultRecord | null> {
-    const cached = this.memory.get(`${workspaceId}\0${toolCallId}`);
-    if (cached) return cached;
+  /**
+   * Store the widget state of the view of record `toolCallId` whose binding
+   * (mcpAppWidgetStateBindingOf) is `binding`; null
+   * clears it. Throws when that record is gone (pruned, removed, or replaced by a new record under
+   * a reused tool call ID), so a late write of an old view never reaches the new one, and when the
+   * state is over MCP_APP_WIDGET_STATE_MAX_BYTES.
+   *
+   * The read-modify-write holds the session dir's target lock, like writeRecord, so a new record
+   * for the same ID and this write cannot interleave, and a removed workspace is refused. It reads
+   * the record from disk inside the lock: another backend may have replaced it.
+   */
+  async setWidgetState(
+    workspaceId: string,
+    toolCallId: string,
+    binding: string,
+    state: unknown
+  ): Promise<void> {
+    const stateJson = widgetStateJson(state);
+    const dir = this.dirFor(workspaceId);
+    const filePath = path.join(dir, fileNameFor(toolCallId));
+    const updated = await withTargetMutationLock(this.rootDir, path.dirname(dir), async () => {
+      if (this.rootDir !== null && (await isWorkspaceRemovalTombstoned(this.rootDir, workspaceId)))
+        throw new Error(`Widget state refused: workspace ${workspaceId} was removed`);
+      const read = await this.readRecordFile(filePath, toolCallId);
+      if (read === null || mcpAppWidgetStateBindingOf(read.record) !== binding) {
+        throw new Error("Widget state refused: the view's result record is gone");
+      }
+      // Patch the file's own object, so fields of a newer build survive a downgrade's write.
+      const { widgetState: _previous, ...rest } = read.raw;
+      const file =
+        stateJson === null ? rest : { ...rest, widgetState: JSON.parse(stateJson) as unknown };
+      // The record keeps its age: prune() drops the oldest file first, and a view in use must
+      // not push a newer view's record out.
+      const { atime, mtime } = await fs.stat(filePath);
+      await writeFileAtomic(filePath, JSON.stringify(file));
+      await fs.utimes(filePath, atime, mtime);
+      const { widgetState: _old, ...known } = read.record;
+      // Parsed back from its JSON, so memory holds exactly what the file holds.
+      return stateJson === null ? known : { ...known, widgetState: file.widgetState };
+    });
+    this.remember(workspaceId, updated);
+  }
+
+  /** A record file, or null when it is missing, corrupt or another tool call's. */
+  private async readRecord(
+    filePath: string,
+    toolCallId: string
+  ): Promise<McpAppResultRecord | null> {
+    return (await this.readRecordFile(filePath, toolCallId))?.record ?? null;
+  }
+
+  /** readRecord, plus the file's object as written (with fields this build does not know). */
+  private async readRecordFile(
+    filePath: string,
+    toolCallId: string
+  ): Promise<{ record: McpAppResultRecord; raw: Record<string, unknown> } | null> {
     try {
-      const raw = await fs.readFile(
-        path.join(this.dirFor(workspaceId), fileNameFor(toolCallId)),
-        "utf8"
-      );
-      const parsed = McpAppResultRecordSchema.safeParse(JSON.parse(raw));
-      // A corrupt or foreign record reads as missing (self-healing), never as an error.
+      const raw: unknown = JSON.parse(await fs.readFile(filePath, "utf8"));
+      const parsed = McpAppResultRecordSchema.safeParse(raw);
       if (!parsed.success || parsed.data.toolCallId !== toolCallId) return null;
-      this.remember(workspaceId, parsed.data);
-      return parsed.data;
+      return { record: parsed.data, raw: raw as Record<string, unknown> };
     } catch {
       return null;
     }
+  }
+
+  async get(workspaceId: string, toolCallId: string): Promise<McpAppResultRecord | null> {
+    const cached = this.memory.get(`${workspaceId}\0${toolCallId}`);
+    if (cached) return cached;
+    let filePath: string;
+    try {
+      filePath = path.join(this.dirFor(workspaceId), fileNameFor(toolCallId));
+    } catch {
+      return null;
+    }
+    // A corrupt or foreign record reads as missing (self-healing), never as an error.
+    const record = await this.readRecord(filePath, toolCallId);
+    if (record) this.remember(workspaceId, record);
+    return record;
   }
 
   /**

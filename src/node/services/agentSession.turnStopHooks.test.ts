@@ -8,6 +8,8 @@ import assert from "node:assert";
 import { EventEmitter } from "events";
 import type { CompletedMessagePart } from "@/common/types/stream";
 import { Ok } from "@/common/types/result";
+import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
+import type { AgentSessionAIService } from "./agentSession";
 import { eventSpine, type TurnStopContext } from "./events/eventSpine";
 import type { TurnCompletion } from "./streamManager";
 import {
@@ -35,7 +37,10 @@ afterEach(async () => {
   }
 });
 
-type StopCall = Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive">;
+type StopCall = Pick<
+  TurnStopContext,
+  "messageId" | "lastAssistantMessage" | "stopHookActive" | "model"
+>;
 
 function addConsumer(decide: (ctx: TurnStopContext) => void, calls?: StopCall[]): void {
   unregisters.push(
@@ -46,6 +51,7 @@ function addConsumer(decide: (ctx: TurnStopContext) => void, calls?: StopCall[])
           messageId: ctx.messageId,
           lastAssistantMessage: ctx.lastAssistantMessage,
           stopHookActive: ctx.stopHookActive,
+          model: ctx.model,
         });
         decide(ctx);
       },
@@ -62,25 +68,38 @@ async function setup(
   input: {
     parts?: (turn: number) => CompletedMessagePart[];
     ending?: (turn: number) => "completed" | "aborted";
+    /** Routing record the prepared request streams with (stream-start). */
+    streamRouting?: (turn: number) => AutoModelRoutingRecord | undefined;
+    /** A refusal fallback answered turn N with this model (stream-end metadata). */
+    fallbackModel?: (turn: number) => string | undefined;
+    /** Runs while turn N streams, before it ends. */
+    whileStreaming?: (turn: number, h: AgentSessionHarness) => void;
     session?: Omit<AgentSessionHarnessOptions, "workspaceId" | "aiEmitter" | "aiServiceOverrides">;
   } = {}
 ) {
   const emitter = new EventEmitter();
   let turns = 0;
+  const requests: Array<Parameters<AgentSessionAIService["streamMessage"]>[0]> = [];
+  const holder: { h?: AgentSessionHarness } = {};
   const h = await createAgentSessionHarness({
     ...input.session,
     workspaceId,
     aiEmitter: emitter,
     aiServiceOverrides: {
-      streamMessage: mock(() => {
+      streamMessage: mock<AgentSessionAIService["streamMessage"]>((request) => {
+        requests.push(request);
         const messageId = `a${++turns}`;
+        const routing = input.streamRouting?.(turns);
         emitter.emit("stream-start", {
           type: "stream-start",
           workspaceId,
           messageId,
-          model,
+          model: routing?.model ?? model,
           startTime: Date.now(),
+          ...(routing != null ? { autoModelRouting: routing } : {}),
         });
+        assert(holder.h != null);
+        input.whileStreaming?.(turns, holder.h);
         const completion: TurnCompletion =
           input.ending?.(turns) === "aborted"
             ? {
@@ -93,7 +112,7 @@ async function setup(
                 streamEnd: {
                   type: "stream-end",
                   workspaceId,
-                  metadata: { model },
+                  metadata: endMetadata(input.fallbackModel?.(turns)),
                   parts: input.parts?.(turns) ?? [{ type: "text", text: `reply ${turns}` }],
                 },
               };
@@ -101,8 +120,16 @@ async function setup(
       }),
     },
   });
+  holder.h = h;
   harnesses.push(h);
-  return { h, streams: () => turns };
+  return { h, streams: () => turns, requests };
+}
+
+/** Stream-end metadata: the turn's model, or a refusal fallback that answered instead. */
+function endMetadata(fallbackModel: string | undefined) {
+  return fallbackModel === undefined
+    ? { model }
+    : { model: fallbackModel, modelFallback: { requestedModel: model, refusedModels: [model] } };
 }
 
 /** Wait until no turn runs and nothing is queued (each continuation is its own turn). */
@@ -141,7 +168,7 @@ async function setupWithGoal() {
     },
   });
   unregisters.push(() => void history.cleanup());
-  return { ...session, goalId: goal.data.goalId };
+  return { ...session, goalId: goal.data.goalId, goalService };
 }
 
 /** A goal-loop continuation send, as WorkspaceGoalService dispatches it. */
@@ -186,6 +213,8 @@ describe("turn.stop", () => {
       messageId: "a1",
       lastAssistantMessage: "reply 1",
       stopHookActive: false,
+      // Codex `model` (PRRT_kwDOPxxmWM6rN7nt): the model the turn streamed with.
+      model,
     });
 
     // A new message from the user starts a new turn: Stop may continue it again.
@@ -196,6 +225,33 @@ describe("turn.stop", () => {
       ...[false, true, true, true],
     ]);
     expect(streams()).toBe(8);
+  });
+
+  test("the Stop hooks see the model that answered after a refusal fallback", async () => {
+    // Codex PRRT_kwDOPxxmWM6sbewj: only the stream-end reports the fallback model.
+    const calls: StopCall[] = [];
+    addConsumer(() => undefined, calls);
+    const { h } = await setup({
+      fallbackModel: (turn) => (turn === 1 ? "anthropic:claude-haiku-4-5" : undefined),
+    });
+
+    await h.session.sendMessage("fix the tests", options);
+    await settle(h);
+
+    expect(calls.map((call) => call.model)).toEqual(["anthropic:claude-haiku-4-5"]);
+  });
+
+  test("without a fallback the Stop hooks see the raw model the turn streamed with", async () => {
+    // Tool events send the raw provider-qualified string (gateway prefix kept): Stop matches it.
+    const calls: StopCall[] = [];
+    addConsumer(() => undefined, calls);
+    const gateway = "mux-gateway:anthropic/claude-haiku-4-5";
+    const { h } = await setup();
+
+    await h.session.sendMessage("fix the tests", { ...options, model: gateway });
+    await settle(h);
+
+    expect(calls.map((call) => call.model)).toEqual([gateway]);
   });
 
   test("one consumer's halt overrides every continuation", async () => {
@@ -470,5 +526,174 @@ describe("turn.stop", () => {
 
     expect(streams()).toBe(4);
     expect(promptHookTexts).toEqual(["fix the tests"]);
+  });
+
+  test("a send still in preflight when the turn ends does not skip the Stop hooks", async () => {
+    // Codex PRRT_kwDOPxxmWM6sT80F: the send can still fail before it starts a turn.
+    const calls: StopCall[] = [];
+    addConsumer(() => undefined, calls);
+    const { h, streams } = await setup({
+      session: { hasExternalManualSendPreflight: () => true },
+    });
+
+    await h.session.sendMessage("fix the tests", options);
+    await settle(h);
+
+    expect(streams()).toBe(1);
+    expect(calls.map((call) => call.messageId)).toEqual(["a1"]);
+  });
+
+  test("input queued during the turn skips the Stop hooks (the queue continues the turn)", async () => {
+    const calls: StopCall[] = [];
+    addConsumer(() => undefined, calls);
+    const { h, streams } = await setup({
+      whileStreaming: (turn, session) => {
+        if (turn === 1) session.session.queueMessage("also lint", options);
+      },
+    });
+
+    await h.session.sendMessage("fix the tests", options);
+    await settle(h);
+
+    expect(streams()).toBe(2);
+    // Only the queued turn's end runs the hooks.
+    expect(calls.map((call) => call.messageId)).toEqual(["a2"]);
+  });
+
+  test("a queued entry whose admission went stale does not skip the Stop hooks", async () => {
+    const calls: StopCall[] = [];
+    addConsumer(() => undefined, calls);
+    const { h } = await setup({
+      whileStreaming: (turn, session) => {
+        if (turn === 1)
+          session.session.queueMessage("stale work", options, {
+            acceptanceOrigin: "automatic",
+            synthetic: true,
+            admissionStale: () => true,
+          });
+        if (turn === 1)
+          session.session.queueMessage("stale capture", options, {
+            acceptanceOrigin: "automatic",
+            synthetic: true,
+            compactionAdmissionStale: () => true,
+          });
+      },
+    });
+
+    await h.session.sendMessage("fix the tests", options);
+    await settle(h);
+
+    // The drain refuses the stale entry, so turn 1 is the last turn: its Stop must run.
+    expect(calls.map((call) => call.messageId)).toEqual(["a1"]);
+  });
+
+  test("an ACP turn with queued input still runs its Stop hooks", async () => {
+    const calls: StopCall[] = [];
+    addConsumer(() => undefined, calls);
+    const { h } = await setup({
+      whileStreaming: (turn, session) => {
+        if (turn === 1) session.session.queueMessage("also lint", options);
+      },
+    });
+
+    await h.session.sendMessage("fix the tests", { ...options, acpPromptId: "acp-prompt-1" });
+    await settle(h);
+
+    expect(calls.map((call) => call.messageId)).toEqual(["a1", "a2"]);
+  });
+
+  test("a withdrawn queue entry does not cancel a Stop continuation", async () => {
+    addConsumer((ctx) => {
+      if (!ctx.stopHookActive) keepGoing(ctx);
+    });
+    const { h, streams } = await setup({
+      whileStreaming: (turn, session) => {
+        if (turn !== 1) return;
+        const withdrawn = new AbortController();
+        session.session.queueMessage("never mind", options, { cancelSignal: withdrawn.signal });
+        withdrawn.abort();
+      },
+    });
+
+    await h.session.sendMessage("fix the tests", options);
+    await settle(h);
+
+    expect(streams()).toBe(2);
+    expect(await userTexts(h)).toEqual(["fix the tests", "Run the failing tests again."]);
+  });
+
+  test("a continuation keeps the stream's prepared routing and Chat Instructions state", async () => {
+    addConsumer((ctx) => {
+      if (!ctx.stopHookActive) keepGoing(ctx);
+    });
+    const requested: AutoModelRoutingRecord = {
+      requestedFallbackModel: model,
+      model: "anthropic:claude-sonnet-4-5",
+      status: "routed",
+    };
+    // Request preparation could not build the tier model and fell back to the composer's.
+    const prepared: AutoModelRoutingRecord = { ...requested, model, status: "fallback" };
+    const { h, requests } = await setup({ streamRouting: () => prepared });
+
+    await h.session.sendMessage("fix the tests", {
+      ...options,
+      model: requested.model,
+      additionalSystemContext: "",
+      autoModelRoutingRecord: requested,
+    } as typeof options);
+    await settle(h);
+
+    expect(requests).toHaveLength(2);
+    expect(requests[1]).toMatchObject({
+      modelString: model,
+      autoModelRouting: prepared,
+      additionalSystemContext: "",
+    });
+  });
+
+  test("a goal admission that throws declines the continuation and still flushes the queue", async () => {
+    const { h, streams, goalId, goalService } = await setupWithGoal();
+    let typed = false;
+    addConsumer((ctx) => {
+      if (typed) return;
+      typed = true;
+      h.session.queueMessage("actually, stop", options);
+      keepGoing(ctx);
+    });
+    // Only the continuation's admission (after the hook ran) fails; the goal turn's own works.
+    const admit = goalService.buildGoalRedispatchAdmission.bind(goalService);
+    spyOn(goalService, "buildGoalRedispatchAdmission").mockImplementation((...args) =>
+      typed ? Promise.reject(new Error("goal store unreadable")) : admit(...args)
+    );
+
+    expect((await sendGoalTurn(h, goalId)).success).toBe(true);
+    await settle(h);
+
+    expect(streams()).toBe(2);
+    expect(await userTexts(h)).toEqual(["Continue the goal.", "actually, stop"]);
+  });
+
+  test("a compaction turn whose summary the handler rejected runs no Stop hook", async () => {
+    const calls: StopCall[] = [];
+    addConsumer(keepGoing, calls);
+    const { h, streams } = await setup();
+    const session = h.session as unknown as {
+      contextController: { compaction: { handleCompletion(...args: unknown[]): Promise<boolean> } };
+    };
+    spyOn(session.contextController.compaction, "handleCompletion").mockResolvedValue(false);
+
+    await h.session.sendMessage(
+      "Please compact",
+      {
+        ...options,
+        agentId: "compact",
+        muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+      },
+      { synthetic: true }
+    );
+    await settle(h);
+
+    expect(calls).toEqual([]);
+    expect(streams()).toBe(1);
   });
 });

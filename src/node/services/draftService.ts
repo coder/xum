@@ -31,18 +31,22 @@ import {
   type DraftImportLegacyOutput,
   type DraftList,
   type DraftListEntry,
+  type DraftMoveCreationInput,
+  type DraftMoveCreationOutput,
   type DraftScope,
   type DraftSetSendReceiverInput,
   type DraftSummary,
   type DraftUpdateInput,
   type DraftWriteOutput,
   type PendingSend,
+  type WorkspaceNamePersistedState,
 } from "@/common/orpc/schemas/drafts";
+import { boundWorkspaceNamePersistedState } from "@/common/utils/workspaceNameState";
 import {
   hasDraftBlock,
   joinDraftText,
   removeDraftBlock,
-  removeSentText,
+  takeSentText,
 } from "@/common/utils/composerDraftText";
 import {
   buildLegacyDraftText,
@@ -71,7 +75,7 @@ import {
  *   storing projectPath inside the file. Deleted by `delete`, by project removal
  *   (deleteProjectDrafts) and by the startup GC (collectOrphanedCreationDrafts).
  * - The creation draft list (sidebar rows, including empty drafts): `<xumRoot>/drafts/list.json`.
- *   Only `delete`, putListEntry, importLegacyList, project removal, the GC and the snapshot's
+ *   Only `delete`, putListEntry, moveCreation, importLegacyList, project removal, the GC and the snapshot's
  *   relisting of bodies without a row change it; clearing a draft's text never delists it.
  *   `delete` removes the body, then the entry, under the body lock: a crash in between leaves an
  *   empty listed row. Lock order: a project's drafts dir (body) lock, then the list lock; nothing
@@ -109,23 +113,68 @@ interface IndexEntry {
  * holds the retained ones (in entry order) before the visible ones. `pendingSends` is the
  * idempotent-send bookkeeping; an older build drops it on its next write, which leaves everything
  * visible (never lost). Only this service builds `text`; clients see and edit the visible part
- * (DraftSummary, DraftUpdateInput).
+ * (DraftSummary, DraftUpdateInput). `nameState` is a creation draft's workspace name state; an
+ * older build ignores it and drops it on its next write (the name resets, the text stays).
  */
 interface StoredDraft {
   text: string;
   attachments: DraftAttachment[];
   pendingSends: PendingSend[];
+  nameState?: WorkspaceNamePersistedState;
 }
 
 function emptyStoredDraft(): StoredDraft {
   return { text: "", attachments: [], pendingSends: [] };
 }
 
-/** No file: an attachment-only or review-only pending send still keeps its file. */
+/**
+ * No file: an attachment-only or review-only pending send still keeps its file, and so does a
+ * name-only creation draft (relisted like any other body without a row).
+ */
 function isStoredDraftEmpty(draft: StoredDraft): boolean {
+  return isBodyEmpty(draft) && draft.nameState === undefined;
+}
+
+/** No text, attachments or pending sends (a name state may still be stored). */
+function isBodyEmpty(draft: StoredDraft): boolean {
   return (
     draft.text.length === 0 && draft.attachments.length === 0 && draft.pendingSends.length === 0
   );
+}
+
+/** Like the text: an omitted name state keeps the stored one, and null clears it. */
+function mergeNameState(
+  current: StoredDraft,
+  write: DraftUpdateInput
+): WorkspaceNamePersistedState | undefined {
+  if (write.nameState === undefined) return current.nameState;
+  return boundWorkspaceNamePersistedState(write.nameState) ?? undefined;
+}
+
+/**
+ * What a legacy import stores, or null when the backend keeps its draft ("present"). The body and
+ * the name state were separate legacy keys, so each is imported only where the backend has none.
+ */
+function legacyImportOf(current: StoredDraft | null, legacy: StoredDraft): StoredDraft | null {
+  if (current === null) return legacy;
+  const bodyKept = !isBodyEmpty(current);
+  if (bodyKept && (current.nameState !== undefined || legacy.nameState === undefined)) return null;
+  return { ...(bodyKept ? current : legacy), nameState: current.nameState ?? legacy.nameState };
+}
+
+/** The name state of a parsed draft file; a malformed one is dropped (the draft still loads). */
+function loadNameState(
+  raw: unknown,
+  filePath: string
+): { nameState?: WorkspaceNamePersistedState } {
+  const stored = (raw as { nameState?: unknown } | null)?.nameState;
+  if (stored === undefined) return {};
+  const nameState = boundWorkspaceNamePersistedState(stored);
+  if (nameState === null) {
+    log.warn(`Dropping malformed workspace name state of draft file ${filePath}`);
+    return {};
+  }
+  return { nameState };
 }
 
 /** The composer's part of a validated stored draft (load drops bookkeeping that does not fit). */
@@ -135,9 +184,9 @@ function visibleTextOf(draft: StoredDraft): string {
   return visible;
 }
 
-/** The API view: visible text, every attachment (clients hide retained ones), pending sends. */
-function viewOf(draft: StoredDraft): Draft {
-  return { text: visibleTextOf(draft), attachments: draft.attachments };
+/** The API view: visible text, every attachment (clients hide retained ones), name state. */
+function viewOf(draft: StoredDraft): Draft & { nameState?: WorkspaceNamePersistedState } {
+  return { text: visibleTextOf(draft), attachments: draft.attachments, nameState: draft.nameState };
 }
 
 /**
@@ -253,7 +302,8 @@ function writeOutput(scope: DraftScope, draft: StoredDraft, revision: number): D
 function storedDraftFrom(
   visibleText: string,
   attachments: readonly DraftAttachment[],
-  pendingSends: PendingSend[]
+  pendingSends: PendingSend[],
+  nameState?: WorkspaceNamePersistedState
 ): StoredDraft {
   const byId = new Map(attachments.map((attachment) => [attachment.id, attachment]));
   const retainedIds = [...new Set(pendingSends.flatMap((send) => send.attachmentIds))];
@@ -273,6 +323,7 @@ function storedDraftFrom(
     text: buildLegacyDraftText(pendingSends, visibleText),
     attachments: [...retained, ...visible],
     pendingSends,
+    nameState,
   };
 }
 
@@ -501,7 +552,12 @@ export class DraftService extends EventEmitter {
       // Clients write the visible part; what pending sends retain stays (only their resolution
       // removes it), and what happened to the sends the client wrote against is merged here.
       const merged = mergeWrite(current, input, basis, accepted);
-      const next = storedDraftFrom(merged.visibleText, merged.attachments, current.pendingSends);
+      const next = storedDraftFrom(
+        merged.visibleText,
+        merged.attachments,
+        current.pendingSends,
+        mergeNameState(current, input)
+      );
       const bytes = draftJsonBytes(next);
       if (bytes > MAX_DRAFT_JSON_BYTES) {
         throw new Error(draftTooLargeMessage(bytes));
@@ -563,8 +619,78 @@ export class DraftService extends EventEmitter {
   }
 
   /**
-   * Non-clobbering one-way migration of a legacy localStorage draft: stored only when the backend
-   * has no draft for the scope. localStorage is per origin (desktop app vs browser tab) while this
+   * Move a creation draft (the default draft or a listed one) to a new listed draft in one step:
+   * body (text, attachments, name state) and row together, then the source goes. Under both
+   * projects' dir locks, then the list lock (the class comment's order). A crash loses no content:
+   * after the destination body, that body is unlisted (the next snapshot relists it) next to the
+   * intact source; after the source body's delete, the destination is still relisted that way,
+   * and a listed source stays as an empty row. A retry after a lost reply finds the destination
+   * listed and the source gone, and answers "moved". An unowned destination throws, so the client
+   * keeps the source.
+   */
+  async moveCreation(input: DraftMoveCreationInput): Promise<DraftMoveCreationOutput> {
+    const { source, dest } = input;
+    assert(dest.draftId !== DEFAULT_CREATION_DRAFT_ID, "a draft move never targets the default");
+    assert(draftScopeKey(source) !== draftScopeKey(dest), "a draft move needs a new destination");
+    const dirs = [source, dest].map((scope) => this.projectDraftsDir(scope.projectPath));
+    return withTargetMutationLocks(this.config.rootDir, dirs, async () => {
+      const stored = await this.load(source);
+      if (stored === null && isMoveDone((await this.readListFile()).entries, source, dest)) {
+        return this.movedOutput(dest, this.listRevision);
+      }
+      if (!(await this.hasOwner(dest))) {
+        throw new Error(`Draft move refused: project ${dest.projectPath} is not configured`);
+      }
+      const revision = this.getRevision(draftScopeKey(source));
+      if (stored !== null && revision !== input.sourceRevision) {
+        return { result: "changed", revision };
+      }
+      return this.moveStoredCreation(input, stored ?? emptyStoredDraft());
+    });
+  }
+
+  private async moveStoredCreation(
+    input: DraftMoveCreationInput,
+    stored: StoredDraft
+  ): Promise<DraftMoveCreationOutput> {
+    const { source, dest } = input;
+    // beginSend takes workspace scopes only, so this guards a future change: moving a pending
+    // send's retained text would detach it from its send.
+    if (stored.pendingSends.length > 0) {
+      throw new Error("Draft move refused: the source draft has pending sends");
+    }
+    if (!isStoredDraftEmpty(stored)) await this.persist(dest, this.filePathFor(dest), stored);
+    // Before the list write: writing a missing or damaged list relists every unlisted body.
+    await this.persist(source, this.filePathFor(source), emptyStoredDraft());
+    const row: DraftListEntry = {
+      projectPath: dest.projectPath,
+      draftId: dest.draftId,
+      subProjectPath: input.subProjectPath,
+      createdAt: input.createdAt,
+    };
+    // The destination may hold a synthesized row: its body's relisting after a crashed attempt.
+    const listRevision = await this.mutateList((entries) => [
+      ...entries.filter(
+        (listed) => ![source, dest].some((scope) => isSameListEntry(listed, scope))
+      ),
+      toApiEntry(row),
+    ]);
+    return this.movedOutput(dest, listRevision);
+  }
+
+  private async movedOutput(
+    dest: CreationScope,
+    listRevision: number
+  ): Promise<DraftMoveCreationOutput> {
+    const revision = this.getRevision(draftScopeKey(dest));
+    const stored = (await this.load(dest)) ?? emptyStoredDraft();
+    return { result: "moved", dest: writeOutput(dest, stored, revision), listRevision };
+  }
+
+  /**
+   * Non-clobbering one-way migration of a legacy localStorage draft: its body (text, attachments)
+   * is stored only when the backend has none for the scope, and its name state only when the
+   * backend has no name state. localStorage is per origin (desktop app vs browser tab) while this
    * store is shared, so another origin may already have imported (or since edited) this scope.
    */
   async importLegacy(input: DraftUpdateInput): Promise<DraftImportLegacyOutput> {
@@ -588,16 +714,20 @@ export class DraftService extends EventEmitter {
     if (bytes > MAX_DRAFT_JSON_BYTES) {
       throw new Error(draftTooLargeMessage(bytes));
     }
+    const imported: StoredDraft = {
+      ...legacy,
+      pendingSends: [],
+      nameState: boundWorkspaceNamePersistedState(input.nameState) ?? undefined,
+    };
     return this.withWriteLock(scope, async () => {
       const key = draftScopeKey(scope);
-      const current = await this.load(scope);
-      if (current !== null && !isStoredDraftEmpty(current)) {
+      const stored = legacyImportOf(await this.load(scope), imported);
+      if (stored === null) {
         return { result: "present", revision: this.getRevision(key) };
       }
       if (!(await this.hasOwner(scope))) {
         return { result: "orphaned", revision: this.getRevision(key) };
       }
-      const stored: StoredDraft = { ...legacy, pendingSends: [] };
       if (isStoredDraftEmpty(stored)) {
         return { result: "applied", revision: this.getRevision(key) };
       }
@@ -607,7 +737,7 @@ export class DraftService extends EventEmitter {
 
   /**
    * Idempotent sends: the one draft write before a composer send. The sent text leaves the visible
-   * text (removeSentText, computed here so another window's newer visible edits stay) and is
+   * text (takeSentText, computed here so another window's newer visible edits stay) and is
    * retained in the legacy text with the attachments; the entry keeps the exact request for
    * retries. Idempotent by send id: a repeat with the same send changes nothing but its receiver; a
    * different payload under a known id is refused.
@@ -655,9 +785,14 @@ export class DraftService extends EventEmitter {
       }
       const merged = mergeWrite(current, { text: input.text }, basis, accepted);
       const next = storedDraftFrom(
-        removeSentText(merged.visibleText, pendingSend.text),
+        takeSentText(
+          merged.visibleText,
+          pendingSend.text,
+          merged.visibleText === input.typedAfterSendText
+        ),
         attachments,
-        [...current.pendingSends, pendingSend]
+        [...current.pendingSends, pendingSend],
+        current.nameState
       );
       const bytes = draftJsonBytes(next);
       if (bytes > MAX_DRAFT_JSON_BYTES) throw new Error(draftTooLargeMessage(bytes));
@@ -736,7 +871,8 @@ export class DraftService extends EventEmitter {
       const next = storedDraftFrom(
         joinDraftText(...restoredTexts, visibleTextOf(current)),
         current.attachments.filter(({ id }) => !acceptedIds.has(id)),
-        current.pendingSends.filter((send) => statusOf(send) === undefined)
+        current.pendingSends.filter((send) => statusOf(send) === undefined),
+        current.nameState
       );
       await this.persist(scope, filePath, next);
     });
@@ -940,7 +1076,7 @@ export class DraftService extends EventEmitter {
             filePath
           )
         : [];
-    return { ...draft, pendingSends };
+    return { ...draft, pendingSends, ...loadNameState(raw, filePath) };
   }
 
   /**
@@ -1211,7 +1347,7 @@ export class DraftService extends EventEmitter {
     projectPath: string;
     draftId: string;
     filePath: string;
-    draft: Draft | null;
+    draft: (Draft & { nameState?: WorkspaceNamePersistedState }) | null;
   }> {
     for (const name of await readDirNames(projectDir)) {
       if (!name.endsWith(".json")) continue;
@@ -1246,7 +1382,7 @@ export class DraftService extends EventEmitter {
         projectPath,
         draftId,
         filePath,
-        draft,
+        draft: { ...draft, ...loadNameState(raw, filePath) },
       };
     }
   }
@@ -1288,6 +1424,16 @@ export class DraftService extends EventEmitter {
 function toApiEntry(entry: DraftListFileEntry): DraftListEntry {
   const { synthesized: _synthesized, ...apiEntry } = entry;
   return apiEntry;
+}
+
+/** A move's retry after a lost reply: its destination is listed and its source is not. */
+function isMoveDone(
+  entries: readonly DraftListFileEntry[],
+  source: CreationScope,
+  dest: CreationScope
+): boolean {
+  const listed = (scope: CreationScope) => entries.some((entry) => isSameListEntry(entry, scope));
+  return listed(dest) && !listed(source);
 }
 
 function isSameListEntry(

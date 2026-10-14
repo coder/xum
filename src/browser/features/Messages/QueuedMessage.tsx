@@ -155,7 +155,7 @@ export const QueuedMessage: React.FC<QueuedMessageProps> = (props) => {
                 onClick={() => setIsMenuOpen((open) => !open)}
                 aria-haspopup="menu"
                 aria-expanded={isMenuOpen}
-                className="text-secondary bg-muted/10 hover:bg-hover hover:text-foreground flex h-6 max-w-full items-center gap-1.5 rounded-md px-2 font-medium transition-colors"
+                className="text-foreground bg-muted/10 hover:bg-hover flex h-6 max-w-full items-center gap-1.5 rounded-md px-2 font-medium transition-colors"
                 data-component="QueuedMessageStatus"
               >
                 {pendingAction === "mode" ? (

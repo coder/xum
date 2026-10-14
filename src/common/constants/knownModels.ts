@@ -176,6 +176,15 @@ const MODEL_DEFINITIONS = {
     aliases: ["gemini-flash"],
     tokenizerOverride: "google/gemini-2.5-pro",
   },
+  // Gemini 4 Argon - Google's flagship reasoning model, GA on the paid Gemini API on
+  // October 13, 2026 (stable ID `gemini-4-argon`; not on the free tier). See
+  // models-extra for limits and pricing.
+  GEMINI_4_ARGON: {
+    provider: "google",
+    providerModelId: "gemini-4-argon",
+    aliases: ["argon", "gemini-argon", "gemini-4"],
+    tokenizerOverride: "google/gemini-2.5-pro",
+  },
   // Grok 4.7 - xAI's frontier coding and knowledge-work model, released September 21,
   // 2026. Supersedes Grok 4.6 at identical pricing and specs ($2/M in, $6/M out, 500K
   // context, native xhigh); Grok 4.6 remains usable as the custom model string
