@@ -88,7 +88,7 @@ describe("discoverAgentPlugins", () => {
     expect(plugin.name).toBe("hello-plugin");
     expect(plugin.scope).toBe("global");
     expect(plugin.rootPath).toBe(await fs.realpath(path.join(container, "hello-plugin")));
-    expect(plugin.skillsDir).toBe(path.join(plugin.rootPath, "skills"));
+    expect(plugin.skillsDirs).toEqual([path.join(plugin.rootPath, "skills")]);
     expect(plugin.mcpConfigPath).toBe(path.join(plugin.rootPath, "mcp.json"));
     expect(result.diagnostics).toEqual([]);
   });
@@ -169,6 +169,8 @@ describe("discoverAgentPlugins", () => {
       ];
       const manifestPath = await fs.realpath(path.join(owner, "managed", "plugin.json"));
       const reads = spyOn(fs, "readFile");
+      // Manifests are read through an opened handle (readPluginFileWithinRootCapped).
+      const opens = spyOn(fs, "open");
       try {
         const { plugins } = await discoverAgentPlugins(containers);
         expect(plugins).toHaveLength(2);
@@ -185,9 +187,10 @@ describe("discoverAgentPlugins", () => {
         });
         expect(plugins[0].rootPath).toBe(plugins[1].rootPath);
         expect(reads.mock.calls.filter(([file]) => file === registryPath)).toHaveLength(1);
-        expect(reads.mock.calls.filter(([file]) => file === manifestPath)).toHaveLength(1);
+        expect(opens.mock.calls.filter(([file]) => file === manifestPath)).toHaveLength(1);
       } finally {
         reads.mockRestore();
+        opens.mockRestore();
       }
       await fs.writeFile(registryPath, "{");
       const corrupt = await discoverAgentPlugins(containers);
@@ -936,9 +939,39 @@ describe("discoverAgentPlugins", () => {
 
     expect(result.plugins).toHaveLength(1);
     const plugin = result.plugins[0];
-    expect(plugin.skillsDir).toBe(path.join(plugin.rootPath, "lib", "skills"));
+    expect(plugin.skillsDirs).toEqual([path.join(plugin.rootPath, "lib", "skills")]);
     expect(plugin.workflowsDir).toBe(path.join(plugin.rootPath, "scripts"));
     expect(plugin.agentsDir).toBeUndefined();
+  });
+
+  test("a Codex skills array resolves every contained root; a missing or escaping one is skipped", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = path.join(container, "multi");
+    await fs.mkdir(path.join(pluginDir, ".codex-plugin"), { recursive: true });
+    for (const dir of ["core", "extra", "skills"]) {
+      await fs.mkdir(path.join(pluginDir, dir), { recursive: true });
+    }
+    await fs.symlink(tmp.path, path.join(pluginDir, "outside"));
+    await fs.writeFile(
+      path.join(pluginDir, ".codex-plugin", "plugin.json"),
+      JSON.stringify({
+        name: "multi",
+        skills: ["./core/", "./missing", "./outside", "./extra", "./core"],
+      }),
+      "utf8"
+    );
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    const plugin = result.plugins[0];
+    // Declared roots replace the default skills/ (as in Codex), in declared order.
+    expect(plugin.skillsDirs).toEqual([
+      path.join(plugin.rootPath, "core"),
+      path.join(plugin.rootPath, "extra"),
+    ]);
+    expect(result.diagnostics).toHaveLength(1);
+    expect(result.diagnostics[0].message).toContain("outside/ resolves outside the plugin root");
   });
 
   test("discovers a manifest-only plugin without components", async () => {
@@ -949,7 +982,7 @@ describe("discoverAgentPlugins", () => {
     const result = await discoverAgentPlugins([{ path: container, scope: "project" }]);
 
     expect(result.plugins).toHaveLength(1);
-    expect(result.plugins[0].skillsDir).toBeUndefined();
+    expect(result.plugins[0].skillsDirs).toBeUndefined();
     expect(result.plugins[0].mcpConfigPath).toBeUndefined();
     expect(result.diagnostics).toEqual([]);
   });
@@ -995,7 +1028,7 @@ describe("discoverAgentPlugins", () => {
     expect(result.plugins).toHaveLength(1);
     const plugin = result.plugins[0];
     expect(plugin.name).toBe("figma");
-    expect(plugin.skillsDir).toBe(path.join(plugin.rootPath, "skills"));
+    expect(plugin.skillsDirs).toEqual([path.join(plugin.rootPath, "skills")]);
     expect(plugin.mcpConfigPath).toBe(path.join(plugin.rootPath, ".mcp.json"));
     // Parsed and exposed only: no hook component resolves from the legacy key.
     expect(plugin.hooksPath).toBeUndefined();
@@ -1055,7 +1088,7 @@ describe("discoverAgentPlugins", () => {
     expect(result.plugins).toHaveLength(1);
     const plugin = result.plugins[0];
     expect(plugin.codexFallback).toBe(true);
-    expect(plugin.skillsDir).toBe(path.join(plugin.rootPath, "skills"));
+    expect(plugin.skillsDirs).toEqual([path.join(plugin.rootPath, "skills")]);
     expect(plugin.hooksPath).toBeUndefined();
     expect(plugin.agentsDir).toBeUndefined();
     expect(plugin.workflowsDir).toBeUndefined();
@@ -1098,6 +1131,73 @@ describe("discoverAgentPlugins", () => {
     });
     const second = await discoverAgentPlugins([{ path: container, scope: "global" }]);
     expect(second.plugins[0].openai).toEqual({ onboardingSkill: "./skills/a/SKILL.md" });
+  });
+
+  test("the overlay's interface, review and publication metadata reach the typed view", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = await writePlugin(container, "overlay-meta");
+    await fs.mkdir(path.join(pluginDir, ".codex-plugin"), { recursive: true });
+    // OpenAI's Codex layout: `interface` at the top level, review and publication under
+    // extensions.com.openai (https://developers.openai.com/plugins/deploy/submission).
+    const review = { tests: [{ prompt: "Open my file" }] };
+    const publication = { countries: ["US"], release_notes: "First release" };
+    await fs.writeFile(
+      path.join(pluginDir, ".codex-plugin", "plugin.json"),
+      JSON.stringify({
+        name: "overlay-meta",
+        interface: { displayName: "Meta", shortDescription: "Docs", developerName: "Acme" },
+        extensions: { "com.openai": { review, publication } },
+      }),
+      "utf8"
+    );
+
+    const { plugins, diagnostics } = await discoverAgentPlugins([
+      { path: container, scope: "global" },
+    ]);
+
+    expect(diagnostics).toEqual([]);
+    expect(plugins[0].openai).toEqual({
+      interface: { displayName: "Meta", shortDescription: "Docs", developerName: "Acme" },
+      review,
+      publication,
+    });
+  });
+
+  test("a manifest swapped for an outside link after its size check is not read", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = await fs.realpath(await writePlugin(container, "swapped"));
+    const outside = path.join(tmp.path, "outside.json");
+    await fs.writeFile(
+      outside,
+      JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "outside-name" }),
+      "utf8"
+    );
+    const manifestPath = path.join(pluginDir, "plugin.json");
+    // A local process replaces the manifest between discovery's size check and its read.
+    const realStat = fs.stat;
+    let swapped = false;
+    const stats = spyOn(fs, "stat").mockImplementation((async (
+      ...args: Parameters<typeof fs.stat>
+    ) => {
+      const result = await realStat(...args);
+      if (!swapped && args[0] === manifestPath) {
+        swapped = true;
+        await fs.rm(manifestPath);
+        await fs.symlink(outside, manifestPath);
+      }
+      return result;
+    }) as typeof fs.stat);
+    try {
+      const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+      expect(swapped).toBe(true);
+      expect(result.plugins).toEqual([]);
+      expect(result.diagnostics).toHaveLength(1);
+      expect(result.diagnostics[0]).toMatchObject({ path: manifestPath, severity: "error" });
+    } finally {
+      stats.mockRestore();
+    }
   });
 
   test("root plugin.json and mcp.json win over the Codex fallbacks", async () => {
@@ -1267,7 +1367,7 @@ describe("discoverAgentPlugins", () => {
     const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
 
     expect(result.plugins).toHaveLength(1);
-    expect(result.plugins[0].skillsDir).toBeUndefined();
+    expect(result.plugins[0].skillsDirs).toBeUndefined();
     // MCP component is unaffected (§6.2 narrowest-scope invalidation).
     expect(result.plugins[0].mcpConfigPath).toBeDefined();
     expect(result.diagnostics).toHaveLength(1);
@@ -1284,7 +1384,7 @@ describe("discoverAgentPlugins", () => {
 
     expect(result.plugins).toHaveLength(1);
     expect(result.plugins[0].mcpConfigPath).toBeUndefined();
-    expect(result.plugins[0].skillsDir).toBeDefined();
+    expect(result.plugins[0].skillsDirs).toBeDefined();
     expect(result.diagnostics).toHaveLength(1);
     expect(result.diagnostics[0].message).toContain("mcp.json");
   });
@@ -1298,7 +1398,7 @@ describe("discoverAgentPlugins", () => {
     const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
 
     expect(result.plugins).toHaveLength(1);
-    expect(result.plugins[0].skillsDir).toBeUndefined();
+    expect(result.plugins[0].skillsDirs).toBeUndefined();
     expect(result.plugins[0].mcpConfigPath).toBeDefined();
   });
 

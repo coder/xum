@@ -130,11 +130,7 @@ import {
 } from "@/constants/goals";
 import { synthesizeSilentContinuationSummary } from "@/constants/goalPrompts";
 import type { SendMessageError } from "@/common/types/errors";
-import {
-  ChatMuxMessageSchema,
-  SendMessageOptionsSchema,
-  SkillNameSchema,
-} from "@/common/orpc/schemas";
+import { ChatMuxMessageSchema, SendMessageOptionsSchema } from "@/common/orpc/schemas";
 import { AutoModelRoutingRecordSchema } from "@/common/orpc/schemas/message";
 import { ToolPolicySchema } from "@/common/orpc/schemas/stream";
 import {
@@ -351,7 +347,12 @@ import type { XumToolScope } from "@/common/types/toolScope";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { renderAgentSkillSnapshotText } from "@/common/utils/agentSkills/skillSnapshot";
+import { parseSkillLookupName } from "@/common/utils/agentSkills/skillLookupName";
 import type { MemorySessionContext } from "@/node/services/memoryService";
+import {
+  type CachedMemoryContext,
+  MemoryContextStore,
+} from "@/node/services/memoryContextPersistence";
 import { materializeFileAtMentions } from "@/node/services/fileAtMentions";
 import { parseSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -1090,11 +1091,24 @@ interface AgentSessionOptions {
   callerOwnsTurnEnd?: boolean;
 }
 
-interface CachedMemoryContext {
-  context: MemorySessionContext | null;
-  includesHotMemories: boolean;
-  memoryEnabled: boolean;
-  hotSetEnabled: boolean;
+/**
+ * Identity of a context window for the saved memory context: its first history row. Every
+ * window boundary (compaction, reset, rollover, history clear) starts a window with a new row.
+ */
+function contextWindowKey(rows: readonly MuxMessage[]): string | undefined {
+  return rows[0]?.id;
+}
+
+/** Memory/HotSet gate changes must not reuse a context built under the old gates. */
+function canReuseMemoryContext(
+  cached: CachedMemoryContext | undefined,
+  wanted: { memoryEnabled: boolean; hotSetEnabled: boolean; includeHotMemories: boolean }
+): cached is CachedMemoryContext {
+  return (
+    cached?.memoryEnabled === wanted.memoryEnabled &&
+    cached.hotSetEnabled === wanted.hotSetEnabled &&
+    (cached.includesHotMemories || !wanted.includeHotMemories)
+  );
 }
 
 interface SendMessageInternalOptions {
@@ -1249,6 +1263,22 @@ function checkCompactionFollowUpStillPending(
     : "consumed";
 }
 
+/** Messages the startup recovery probe reads from the end of history. */
+const STARTUP_TAIL_MESSAGE_COUNT = 20;
+
+/**
+ * Whether the startup follow-up dispatch (dispatchPendingFollowUpOnce without a targeted summary)
+ * can still act on this history tail. Conservative: it answers true whenever the tail cannot
+ * decide (only hidden rows, or a preserved tail copy whose epoch boundary may be further back).
+ */
+function mayEndInPendingCompactionFollowUp(tail: readonly MuxMessage[]): boolean {
+  const last = tail.findLast((message) => !isModelHiddenMessage(message));
+  if (last === undefined) return tail.length >= STARTUP_TAIL_MESSAGE_COUNT;
+  if (last.metadata?.rlmPreservedTailCopy === true) return true;
+  const metadata = last.metadata?.muxMetadata;
+  return isCompactionSummaryMetadata(metadata) && metadata.pendingFollowUp != null;
+}
+
 function pendingCompactionSummary(message: MuxMessage): CompactionCancellationSummary | undefined {
   const metadata = message.metadata?.muxMetadata;
   return message.role === "assistant" &&
@@ -1353,7 +1383,17 @@ export class AgentSession {
   private observedTurn: { id: symbol; idle: boolean } | undefined;
   private readonly planSnapshotCaptureTimeoutMs: number;
   private readonly onBeforeTurnCompletion?: AgentSessionOptions["onBeforeTurnCompletion"];
-  private readonly emitter = new EventEmitter();
+  // No listener cap: chat-event gets one listener from WorkspaceService, one per open onChat
+  // subscription (each client showing this workspace) and one per waitForIdleAndNoQueuedMessages
+  // caller (each sub-agent report deferred while this owner has queued or retrying work). Their
+  // number is not bounded by a constant, so Node's default cap of 10 gives a false
+  // MaxListenersExceededWarning. agentSession.chatListeners.test.ts checks that each subscriber
+  // releases its listener instead.
+  private readonly emitter = (() => {
+    const emitter = new EventEmitter();
+    emitter.setMaxListeners(0);
+    return emitter;
+  })();
   private readonly aiListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
     [];
   private readonly initListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
@@ -1604,15 +1644,23 @@ export class AgentSession {
    * the memory tool.
    *
    * Frozen per context window (#5248, user-requested prompt-cache stability):
-   * only a new window (compaction, rollover, reset) or a new session clears
-   * it. Memory writes do not, neither this session's nor other sessions' or
-   * Dream's. Rebuilding after every write rewrote the memory tool description
-   * and system prompt, so the next turn missed the provider cache for the
-   * whole transcript; 37% of measured turns carry a write. Freshness
-   * trade-off: the agent sees its own writes through the memory tool results
-   * and live `memory view`; other writers' notes appear at the next window.
+   * only a new window (compaction, rollover, reset) clears it. Memory writes do
+   * not, neither this session's nor other sessions' or Dream's. Rebuilding
+   * after every write rewrote the memory tool description and system prompt,
+   * so the next turn missed the provider cache for the whole transcript; 37%
+   * of measured turns carry a write. Freshness trade-off: the agent sees its
+   * own writes through the memory tool results and live `memory view`; other
+   * writers' notes appear at the next window.
+   *
+   * memoryContextStore saves it in the session dir, so a server restart keeps
+   * the window's bytes too (see MEMORY_CONTEXT_FILE_NAME for the live failure).
    */
   private memoryContextByModelString = new Map<string, CachedMemoryContext>();
+  private readonly memoryContextStore: MemoryContextStore;
+  /** Restores the saved window context once per session; resolved after a window boundary. */
+  private memoryContextRestore: Promise<void> | undefined;
+  /** The window key of the last save or restore; undefined when the file holds no window. */
+  private savedMemoryContextWindowKey: string | undefined;
 
   /**
    * Cache the last-known experiment state so we don't spam metadata refresh
@@ -1801,6 +1849,7 @@ export class AgentSession {
 
     this.workspaceId = trimmedWorkspaceId;
     this.config = config;
+    this.memoryContextStore = new MemoryContextStore(config, trimmedWorkspaceId);
     this.historyService = historyService;
     this.compactionCancellation = new CompactionCancellation(
       historyService.getCompactionCancellationStorage(trimmedWorkspaceId)
@@ -3313,6 +3362,14 @@ export class AgentSession {
     return retryRequest;
   }
 
+  private classifyStartupTail(
+    partial: MuxMessage | null,
+    history: MuxMessage[]
+  ): "interrupted" | "follow-up" | "idle" {
+    if (this.hasInterruptedStartupTail(partial, history)) return "interrupted";
+    return mayEndInPendingCompactionFollowUp(history) ? "follow-up" : "idle";
+  }
+
   private hasInterruptedStartupTail(partial: MuxMessage | null, history: MuxMessage[]): boolean {
     if (this.isPendingAskUserQuestion(partial)) return false;
     if (partial?.role === "assistant" && !this.isFinishedStartupPartial(partial, history)) {
@@ -3554,7 +3611,9 @@ export class AgentSession {
         this.historyService
           .readPartial(this.workspaceId, { throwOnError: strictPartial })
           .catch(() => undefined),
-        this.historyService.getLastMessages(this.workspaceId, 20).catch(() => null),
+        this.historyService
+          .getLastMessages(this.workspaceId, STARTUP_TAIL_MESSAGE_COUNT)
+          .catch(() => null),
       ])
     );
   }
@@ -3592,7 +3651,7 @@ export class AgentSession {
       this.isPendingAskUserQuestion(this.getLastNonSystemHistoryMessage(history.data))
     )
       return "question";
-    return this.hasInterruptedStartupTail(partial, history.data) ? "interrupted" : "idle";
+    return this.classifyStartupTail(partial, history.data);
   }
 
   ensureStartupAutoRetryCheck(): Promise<void> {
@@ -6659,7 +6718,7 @@ export class AgentSession {
     this.lastUsageState = undefined;
     this.contextController.reset("settings-changed");
     this.clearFileState();
-    this.memoryContextByModelString.clear();
+    await this.discardMemoryContext();
     if (!options?.deferCarryoverDiscard) await this.discardContextResetCarryover();
     try {
       await sandboxHostService.discardScope(
@@ -7007,6 +7066,8 @@ export class AgentSession {
         message: "Full request preparation is unavailable; use /compact or restart.",
       });
     const cache = new Map<string, CachedMemoryContext>();
+    // The rows open the new window, so its first row keys the saved context.
+    const windowKey = contextWindowKey(messages);
 
     const providersConfig = this.getProvidersConfigSafe();
     const minThinkingLevel = resolveMinimumThinkingLevel(
@@ -7065,7 +7126,7 @@ export class AgentSession {
         recordProposedPlan: this.recordProposedPlan,
         postCompactionAttachments: null,
         resolveMemoryContext: (model, memoryOptions) =>
-          this.resolveMemoryContext(model, memoryOptions, cache),
+          this.resolveMemoryContext(model, memoryOptions, cache, { windowKey }),
         workspaceGoalService: this.workspaceGoalService,
         goalTurnKind: goalKind,
         goalTurnGoalId: goalId,
@@ -7097,9 +7158,11 @@ export class AgentSession {
           })
         : prepared;
     return Ok({
-      start: (startOptions) => {
-        // The candidate's snapshot is the new window's frozen memory context.
+      start: async (startOptions) => {
+        // The candidate's snapshot is the new window's frozen memory context. Save it before
+        // the stream: a restart during this turn must not rebuild the window's bytes.
         this.memoryContextByModelString = cache;
+        await this.persistMemoryContext(cache, windowKey, { force: true });
         return prepared.data.start(startOptions);
       },
       [Symbol.asyncDispose]: () => prepared.data[Symbol.asyncDispose](),
@@ -8947,8 +9010,11 @@ export class AgentSession {
         // listing needs a running runtime). Still ordered after the
         // post-compaction check above: a just-consumed compaction boundary has
         // already reset the segment cache, so this stream recomputes the context.
+        // The window's first row keys the saved context (see resolveMemoryContext).
         resolveMemoryContext: (forModelString, memoryOptions) =>
-          this.resolveMemoryContext(forModelString, memoryOptions),
+          this.resolveMemoryContext(forModelString, memoryOptions, undefined, {
+            windowKey: contextWindowKey(historyResult.data),
+          }),
         workspaceGoalService: this.workspaceGoalService,
         goalTurnKind: goalKind,
         goalTurnGoalId: goalId,
@@ -12315,6 +12381,8 @@ export class AgentSession {
         return false;
       }
     } else {
+      // Keep mayEndInPendingCompactionFollowUp a superset of what this branch dispatches: startup
+      // recovery skips a legacy task whose probe is `idle` without calling this dispatch (#6511).
       // Read the last message from history — only need 1 message, avoid full-file read.
       // Startup recovery must retry on transient read failures, so bubble errors.
       const historyResult = await this.historyService.getLastMessages(this.workspaceId, 1);
@@ -12915,7 +12983,7 @@ export class AgentSession {
    * post-compaction.json) and the periodic capture of qualified carryover.
    */
   async clearPostCompactionState(): Promise<void> {
-    this.memoryContextByModelString.clear();
+    await this.discardMemoryContext();
     // In-memory clears stay unconditional: they stop THIS session from
     // injecting carryover even when the durable discard below fails.
     this.compactionOccurred = false;
@@ -12942,20 +13010,21 @@ export class AgentSession {
   private async resolveMemoryContext(
     modelString: string,
     options?: { includeHotMemories?: boolean },
-    cache = this.memoryContextByModelString
+    cache = this.memoryContextByModelString,
+    persistence?: { windowKey: string | undefined }
   ): Promise<MemorySessionContext | undefined> {
     assert(modelString.length > 0, "resolveMemoryContext requires a model string");
     const includeHotMemories = options?.includeHotMemories !== false;
     const enabled = (id: ExperimentId) => this.aiService.isExperimentEnabled(id);
     const memoryEnabled = enabled(EXPERIMENT_IDS.MEMORY);
     const hotSetEnabled = enabled(EXPERIMENT_IDS.MEMORY_HOT_SET);
+    const windowKey = persistence?.windowKey;
+    // The rollover candidate cache belongs to a window that may never start: only the
+    // live map is restored from disk.
+    if (cache === this.memoryContextByModelString) await this.restoreMemoryContext(windowKey);
     const cached = cache.get(modelString);
-    // Memory/HotSet gate changes must not reuse a context built under the old gates.
-    if (
-      cached?.memoryEnabled === memoryEnabled &&
-      cached.hotSetEnabled === hotSetEnabled &&
-      (cached.includesHotMemories || !includeHotMemories)
-    ) {
+    if (canReuseMemoryContext(cached, { memoryEnabled, hotSetEnabled, includeHotMemories })) {
+      await this.persistMemoryContext(cache, windowKey, { force: false });
       return cached.context ?? undefined;
     }
 
@@ -12972,7 +13041,58 @@ export class AgentSession {
       memoryEnabled,
       hotSetEnabled,
     });
+    await this.persistMemoryContext(cache, windowKey, { force: true });
     return context ?? undefined;
+  }
+
+  /**
+   * Restore the window's saved memory context once per session (the first resolve after a
+   * server restart). The file must name the same window: its first row id. A file left from
+   * an older window (a failed delete, or an older build that crossed a boundary without
+   * deleting it) is ignored. Entries this process already built win: they are what it sent.
+   */
+  private restoreMemoryContext(windowKey: string | undefined): Promise<void> {
+    // A blank id (corrupted history row) is no usable key: skip persistence, never throw.
+    if (!windowKey) return Promise.resolve();
+    this.memoryContextRestore ??= (async () => {
+      const map = this.memoryContextByModelString;
+      const saved = await this.memoryContextStore.load();
+      // load() returns null when a window boundary ran during the read. A rollover that
+      // started meanwhile swapped in its own map: the saved file is not its window.
+      if (this.memoryContextByModelString !== map || saved?.windowKey !== windowKey) return;
+      for (const [modelString, cached] of saved.contexts) {
+        if (!map.has(modelString)) map.set(modelString, cached);
+      }
+      this.savedMemoryContextWindowKey = windowKey;
+    })();
+    return this.memoryContextRestore;
+  }
+
+  /**
+   * Save the live map for this window. `force: false` (a cache hit) writes only when the file
+   * names another window, for example after a rollover keyed by its own first row.
+   */
+  private async persistMemoryContext(
+    cache: Map<string, CachedMemoryContext>,
+    windowKey: string | undefined,
+    options: { force: boolean }
+  ): Promise<void> {
+    // A rollover can swap the live map while a build is awaited.
+    if (!windowKey || cache !== this.memoryContextByModelString) return;
+    if (!options.force && this.savedMemoryContextWindowKey === windowKey) return;
+    // Record the key only after a confirmed write, so a failed save is retried on the next hit.
+    if (await this.memoryContextStore.save(windowKey, cache)) {
+      this.savedMemoryContextWindowKey = windowKey;
+    }
+  }
+
+  /** A window boundary: drop the cached context in memory and on disk. */
+  private async discardMemoryContext(): Promise<void> {
+    this.memoryContextByModelString.clear();
+    // The saved file belongs to the window that just ended: never restore it.
+    this.memoryContextRestore = Promise.resolve();
+    this.savedMemoryContextWindowKey = undefined;
+    await this.memoryContextStore.discard();
   }
 
   /**
@@ -12996,7 +13116,7 @@ export class AgentSession {
       // Compaction boundary: invalidate the session-cached memory context so
       // the next stream recomputes the index and hot set from current
       // files/pins/usage stats.
-      this.memoryContextByModelString.clear();
+      await this.discardMemoryContext();
       // Clear file state cache since history context is gone
       this.clearFileState();
 
@@ -13346,8 +13466,10 @@ export class AgentSession {
 
     const snapshotMessages: MuxMessage[] = [];
     for (const ref of refs) {
-      const parsedName = SkillNameSchema.safeParse(ref.skillName);
-      if (!parsedName.success) {
+      // A lookup name: bare, or `<plugin>:<skill>` for a plugin skill. The ref's
+      // lookup name is the snapshot identity, so a qualified invocation keeps
+      // naming the plugin's skill (bare refs equal frontmatter.name).
+      if (parseSkillLookupName(ref.skillName) == null) {
         if (ref.source === "slash") {
           throw new Error(`Invalid agent skill name: ${ref.skillName}`);
         }
@@ -13382,7 +13504,7 @@ export class AgentSession {
         resolved = await readAgentSkill(
           skillCtx?.runtime ?? runtime,
           skillCtx?.workspacePath ?? skillDiscoveryPath,
-          parsedName.data,
+          ref.skillName,
           {
             ...(skillCtx != null
               ? { roots: skillCtx.roots, containment: skillCtx.containment }
@@ -13456,7 +13578,7 @@ export class AgentSession {
       // distinct snapshots (dedupe must not collapse them).
       const frontmatterYaml = stringifyAgentSkillFrontmatter(skill.frontmatter);
       const snapshot = createLoadedSkillSnapshot({
-        name: skill.frontmatter.name,
+        name: ref.skillName,
         scope: skill.scope,
         body,
         frontmatterYaml,
@@ -13465,7 +13587,7 @@ export class AgentSession {
 
       if (
         recentSnapshots.some(
-          (recent) => recent.skillName === skill.frontmatter.name && recent.sha256 === sha256
+          (recent) => recent.skillName === ref.skillName && recent.sha256 === sha256
         )
       ) {
         continue;
@@ -13478,7 +13600,7 @@ export class AgentSession {
           timestamp: Date.now(),
           synthetic: true,
           agentSkillSnapshot: {
-            skillName: skill.frontmatter.name,
+            skillName: ref.skillName,
             scope: skill.scope,
             sha256,
             frontmatterYaml,
@@ -13488,7 +13610,7 @@ export class AgentSession {
 
       // Defense-in-depth: avoid double-loading this skill within the same turn even if
       // future metadata shapes bypass extractAgentSkillRefs dedupe.
-      recentSnapshots.push({ skillName: skill.frontmatter.name, sha256 });
+      recentSnapshots.push({ skillName: ref.skillName, sha256 });
     }
 
     return snapshotMessages;

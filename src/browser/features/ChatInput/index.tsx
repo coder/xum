@@ -192,7 +192,7 @@ import { normalizeAgentId } from "@/common/utils/agentIds";
 import { isGoalRunning } from "@/common/types/goal";
 import { appendStagedAttachmentNotice, getStagedAttachments } from "./stagedAttachments";
 import type { ChatAttachment } from "./ChatAttachments";
-import { hasDraftBlock, joinDraftText, removeSentText } from "@/common/utils/composerDraftText";
+import { hasDraftBlock, joinDraftText, takeSentText } from "@/common/utils/composerDraftText";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import {
   consumeAiSelectionIntent,
@@ -970,8 +970,18 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     props.kind !== "scratch" &&
     creationState.branchLoad !== "loaded" &&
     creationState.selectedRuntime.mode !== RUNTIME_MODE.LOCAL;
-  useReportCreationSendBlocked(creationBranchesLoading, props);
   const isProcessingAttachments = processingAttachmentCount > 0;
+  // #6423: the same blockers as canSend below, so "Run /init" is off whenever Send is.
+  useReportCreationSendBlocked(
+    {
+      disabled,
+      sendInFlight: sendInFlightBlocksInput,
+      processingAttachments: isProcessingAttachments,
+      coderPresetsLoading,
+      branchesNotLoaded: creationBranchesLoading,
+    },
+    props
+  );
   const hasSendableDraft = hasTypedText || hasImages || hasReviews;
   // Workspace sends/edits mutate history relative to the visible transcript, so they wait for
   // the onChat replay to finish; the creation composer has no transcript to catch up with.
@@ -2215,7 +2225,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     if (!isSameEdit()) return;
                     startEditTranscriptRefresh(editMessageId, precondition);
                   }}
-                  className="text-muted hover:text-accent cursor-pointer border-0 bg-transparent p-0 text-[10px] underline transition-colors"
+                  className="text-muted hover:text-accent-text cursor-pointer border-0 bg-transparent p-0 text-[10px] underline transition-colors"
                 >
                   {EDIT_RETRY_REFRESH_LABEL}
                 </button>
@@ -2245,9 +2255,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     const onEditSendPendingChange =
       variant === "workspace" && editingMessageForUi ? props.onEditSendPendingChange : undefined;
     onEditSendPendingChange?.(true);
+    // #6405: the composer stays on from Enter for a plain message.
+    const releaseTyping = typingLock.keepTypingOn(input);
     await runWithFinally(
       () => sendComposerInput(overrides),
-      () => onEditSendPendingChange?.(false)
+      () => {
+        releaseTyping();
+        onEditSendPendingChange?.(false);
+      }
     );
   };
   const sendComposerInput = async (overrides?: InternalSendOverrides) => {
@@ -2277,6 +2292,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     }
 
     closeSendModeMenu();
+    // #6405: past the send gate only, so a refused Enter never moves the mark of a send in flight.
+    getDraftStore().markSendStart(draftScope, input);
 
     const trimmedInput = input.trim();
     // #5695: a plain message keeps its first line's indentation (pasted code). Only leading
@@ -2874,8 +2891,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // Clear only what this send took: a draft restored meanwhile (an edit completing while
         // this send resolved its options) stays in the composer (#5226).
         const sentAttachmentIds = new Set([...attachments, ...sendAttachments].map(({ id }) => id));
+        // Read before the update below: takeSendMark ends the mark.
+        const typedAfterSend = getDraftStore().takeSendMark(draftScope, input);
         if (!tracksSend) {
-          setInput((current) => removeSentText(current, input));
+          setInput((current) => takeSentText(current, input, typedAfterSend));
           taken = { text: input };
         }
         // Likewise for notes: drop the override this send captured, keeping notes an edit's
@@ -2894,7 +2913,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           inputRef.current.style.height = "";
         }
         // The draft is out of the composer: typing can resume (#6259).
-        releaseTakenDraft = typingLock.markDraftTaken();
+        releaseTakenDraft = typingLock.markDraftTaken(input);
 
         props.onMessageSendStarted?.(overrides?.queueDispatchMode ?? "tool-end");
 

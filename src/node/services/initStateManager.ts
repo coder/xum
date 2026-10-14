@@ -131,6 +131,9 @@ export class InitStateManager extends EventEmitter {
 
   constructor(private readonly config: Config) {
     super();
+    // No listener cap, for the same reason as AIService: each live AgentSession adds one
+    // listener per init event, so the count tracks live sessions, not a leak.
+    this.setMaxListeners(0);
     this.store = new EventStore(
       config,
       "init-status.json",

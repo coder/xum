@@ -34,7 +34,12 @@ import type {
   SendStatus,
 } from "@/common/orpc/schemas/drafts";
 import type { FilePart } from "@/common/orpc/types";
-import { hasDraftBlock, joinDraftText, removeSentText } from "@/common/utils/composerDraftText";
+import {
+  hasDraftBlock,
+  joinDraftText,
+  removeSentText,
+  takeSentText,
+} from "@/common/utils/composerDraftText";
 import {
   draftJsonBytes,
   draftScopeKey,
@@ -206,6 +211,13 @@ interface Entry {
    */
   basisSends: Map<string, BasisSend>;
   /**
+   * #6405: the composer text at Enter (`sent`) while its send has not taken it. `last` is the
+   * text the latest setText wrote; `intact` stays true while every edit since Enter came through
+   * setText and appended to the text before it (keys typed after `sent`). Only then does the take cut
+   * exactly that prefix: a replaced or restored text keeps the whitespace rule (removeSentText).
+   */
+  sendMark: { sent: string; last: string; intact: boolean } | null;
+  /**
    * The newest server view (any push, snapshot or write reply). A field with an unsaved edit
    * keeps the edit; once its write is confirmed, the field takes this view.
    */
@@ -241,6 +253,38 @@ function retryDelayMs(attempt: number): number {
 
 export function draftStoreScopeKey(scope: DraftStoreScope): string {
   return scope.kind === "pending" ? `pending:${scope.projectPath}` : draftScopeKey(scope);
+}
+
+/** Marks the field versions a confirmed write sent as saved (only the fields it wrote). */
+function confirmWrite(
+  entry: Entry,
+  wrote: { text: boolean; attachments: boolean },
+  versions: { text: number; attachments: number }
+): void {
+  if (wrote.text) {
+    entry.confirmedTextVersion = Math.max(entry.confirmedTextVersion, versions.text);
+  }
+  if (wrote.attachments) {
+    entry.confirmedAttachmentsVersion = Math.max(
+      entry.confirmedAttachmentsVersion,
+      versions.attachments
+    );
+  }
+}
+
+/**
+ * A local edit to `next` keeps the send mark only if it appends to the text the mark last saw
+ * (so the sent text stays its prefix). A delete or a replace ends it.
+ */
+function followSendMark(entry: Entry, next: string): void {
+  const mark = entry.sendMark;
+  if (!mark) return;
+  mark.intact &&= entry.text === mark.last && next.startsWith(mark.last);
+  mark.last = next;
+}
+
+function typedAfterSendField(typedHere: boolean, text: string): { typedAfterSendText?: string } {
+  return typedHere ? { typedAfterSendText: text } : {};
 }
 
 function isTextDirty(entry: Entry): boolean {
@@ -760,10 +804,29 @@ export class DraftStore {
     const entry = this.getOrCreateEntry(scope);
     const next = typeof value === "function" ? value(entry.text) : value;
     if (next === entry.text) return;
+    followSendMark(entry, next);
     entry.text = next;
     entry.textVersion++;
     this.recompute(entry);
     this.scheduleFlush(entry);
+  }
+
+  /** #6405: Enter on `text`; keys typed until its send takes it follow it (see Entry.sendMark). */
+  markSendStart(scope: DraftStoreScope, text: string): void {
+    const entry = this.getOrCreateEntry(scope);
+    entry.sendMark = { sent: text, last: entry.text, intact: entry.text === text };
+  }
+
+  /**
+   * Whether the text holds `sent` followed only by keys typed after Enter (see Entry.sendMark).
+   * Ends the mark: one take per Enter.
+   */
+  takeSendMark(scope: DraftStoreScope, sent: string): boolean {
+    const entry = this.entries.get(draftStoreScopeKey(scope));
+    if (!entry) return false;
+    const mark = entry.sendMark;
+    entry.sendMark = null;
+    return mark?.intact === true && mark.sent === sent && mark.last === entry.text;
   }
 
   /**
@@ -941,6 +1004,10 @@ export class DraftStore {
       };
       const textBefore = entry.text;
       const unsavedText = isTextDirty(entry) ? textBefore : undefined;
+      // #6405: keys typed after Enter follow the sent text, and the take cuts exactly that prefix
+      // (takeSentText). The backend cuts it only from this same text (saved or not), never from
+      // a newer one another window wrote.
+      const typedHere = this.takeSendMark(scope, input.text);
       const missing = input.attachments.filter(
         (sent) => !entry.attachments.some(({ id }) => id === sent.id)
       );
@@ -951,7 +1018,7 @@ export class DraftStore {
         entry.attachments = [...entry.attachments, ...missing];
         entry.attachmentCount += missing.length;
       }
-      const textAfter = removeSentText(textBefore, input.text);
+      const textAfter = takeSentText(textBefore, input.text, typedHere);
       if (textAfter !== textBefore) {
         entry.text = textAfter;
         entry.textVersion++;
@@ -970,8 +1037,13 @@ export class DraftStore {
           pendingSend,
           attachments: input.attachments,
           ...(unsavedText !== undefined ? { text: unsavedText } : {}),
+          ...typedAfterSendField(typedHere, textBefore),
           ...(basisSends.length > 0 ? { basisSends } : {}),
         });
+        // A replaced backend's reply: the current one holds neither the removal nor the
+        // pending send, so handle it as a lost reply below (the text comes back and is saved
+        // to the current backend, and the caller does not send) (#6438).
+        this.assertCurrentClient(client);
         // The backend took the same text out of the same (or this window's unsaved) text.
         entry.confirmedTextVersion = Math.max(entry.confirmedTextVersion, removalVersion);
         entry.localSends.delete(pendingSend.sendId);
@@ -991,7 +1063,10 @@ export class DraftStore {
           attachmentIds: pendingSend.attachmentIds,
           undone: true,
         });
-        if (entry.text !== textBefore && removeSentText(entry.text, input.text) === entry.text) {
+        // Put the text back unless the composer holds it again as a whole block: keys can be
+        // typed during this request (#6405), so a text that merely starts with it ("okay" after
+        // "ok") gets it back beside it.
+        if (textAfter !== textBefore && !hasDraftBlock(entry.text, input.text)) {
           entry.text = joinDraftText(input.text, entry.text);
           entry.textVersion++;
         }
@@ -1460,6 +1535,7 @@ export class DraftStore {
       pendingSends: [],
       localSends: new Map(),
       basisSends: new Map(),
+      sendMark: null,
       serverView: null,
       view: EMPTY_VIEW,
     };
@@ -1658,6 +1734,7 @@ export class DraftStore {
     const controller = new AbortController();
     this.subscription = controller;
     const { signal } = controller;
+    this.forgetServerViews();
     if (!this.ready && !this.readyTimer) {
       // Startup must never hang on drafts (a subscription that never yields, a stuck legacy
       // import): let composers render after a bound. Writes still wait for hydration, and a late
@@ -1734,6 +1811,22 @@ export class DraftStore {
       }
     };
     run().catch((error: unknown) => console.error("Draft subscription failed:", error));
+  }
+
+  /**
+   * A subscription may reach another backend process (a new client, or a restarted backend),
+   * which numbers its revisions anew, possibly lower (its clock behind). The views and revisions
+   * of the backend before would outrank all of its replies and pushes, and put old text back
+   * over typing (#6438). Only the views: the composer keeps showing its fields, pending sends
+   * stay retained (`pendingSends`, `basisSends`), and unsaved edits keep winning over the
+   * snapshot (applyServerState). A write may go out before the new snapshot: with no view
+   * left, its reply is taken as it comes.
+   */
+  private forgetServerViews(): void {
+    for (const entry of this.entries.values()) {
+      entry.serverView = null;
+      entry.revision = Number.NEGATIVE_INFINITY;
+    }
   }
 
   private stopSubscription(): void {
@@ -1957,8 +2050,7 @@ export class DraftStore {
         await entry.inFlight;
         continue;
       }
-      const client = this.client;
-      if (!client) throw new Error("Draft save failed: not connected");
+      const client = this.writableClient();
       // The backend refuses drafts over the limit. That failure is permanent, so check here and
       // wait for the next change instead of pushing a multi-MB payload through the transport on
       // every retry. Only a loaded draft is measurable; otherwise the backend check applies.
@@ -1989,17 +2081,19 @@ export class DraftStore {
           // lost reply is retried with the same basis, which merges the same way again.
           ...(entry.basisSends.size > 0 ? { basisSends: [...entry.basisSends.values()] } : {}),
         });
+        // A reply of a replaced backend confirms nothing: the edit must reach the current one,
+        // so the loop writes it again there (#6438).
+        if (this.client !== client) continue;
         entry.flushAttempt = 0;
         entry.failing = false;
-        if (sendText) {
-          entry.confirmedTextVersion = Math.max(entry.confirmedTextVersion, textVersion);
-        }
-        if (sendAttachments) {
-          entry.confirmedAttachmentsVersion = Math.max(
-            entry.confirmedAttachmentsVersion,
-            attachmentsVersion
-          );
-        }
+        confirmWrite(
+          entry,
+          { text: sendText, attachments: sendAttachments },
+          {
+            text: textVersion,
+            attachments: attachmentsVersion,
+          }
+        );
       } catch (error) {
         this.reportSaveError(entry, key, error);
         // The backend's size refusal (measurable only there while payloads are unloaded) is
@@ -2019,6 +2113,19 @@ export class DraftStore {
       }
       this.applyWriteReply(entry, reply, { text: sendText, attachments: sendAttachments });
     }
+  }
+
+  /** The client a write may go to: connected, and drafts hydrated. */
+  private writableClient(): APIClient {
+    const client = this.client;
+    if (!client) throw new Error("Draft save failed: not connected");
+    if (!this.hydrated) throw new Error("Draft save failed: drafts are not loaded");
+    return client;
+  }
+
+  /** Throws when `client` was replaced (a new backend): its replies are not the current one's. */
+  private assertCurrentClient(client: APIClient): void {
+    if (this.client !== client) throw new Error("Draft save failed: the drafts backend changed");
   }
 
   /**

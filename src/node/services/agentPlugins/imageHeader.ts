@@ -7,6 +7,12 @@
 
 /** OpenAI's raster asset limit (submission guide, icons and screenshots). */
 export const LOGO_MAX_DIMENSION = 4096;
+/**
+ * OpenAI's package rule: "Icons and logos must be square and at least 48 by 48 pixels"
+ * (https://developers.openai.com/plugins/deploy/submission). Settings fits the logo into a
+ * square box, so a wide or tiny image renders distorted or blurry (#6162).
+ */
+export const LOGO_MIN_DIMENSION = 48;
 /** Decoded pixel budget: a 4096×4096 RGBA image is ~64 MB; keep it to ~16 M pixels. */
 export const LOGO_MAX_PIXELS = 16_000_000;
 
@@ -120,13 +126,21 @@ export function checkLogoImage(bytes: Buffer, mime: string): string | null {
           : `${mime} is not a supported logo type`;
   if (typeof info === "string") return info;
   if (info.animated) return "animated images are not supported";
+  return sizeRefusal(info);
+}
+
+/** Why the decoded size is refused, or null: the decode budget, then OpenAI's square minimum. */
+function sizeRefusal(info: ImageInfo): string | null {
+  const { width, height } = info;
   if (
-    info.width === 0 ||
-    info.height === 0 ||
-    info.width > LOGO_MAX_DIMENSION ||
-    info.height > LOGO_MAX_DIMENSION ||
-    info.width * info.height > LOGO_MAX_PIXELS
+    width === 0 ||
+    height === 0 ||
+    width > LOGO_MAX_DIMENSION ||
+    height > LOGO_MAX_DIMENSION ||
+    width * height > LOGO_MAX_PIXELS
   )
-    return `it is ${info.width}×${info.height}; the limit is ${LOGO_MAX_DIMENSION}×${LOGO_MAX_DIMENSION} and ${LOGO_MAX_PIXELS} pixels`;
+    return `it is ${width}×${height}; the limit is ${LOGO_MAX_DIMENSION}×${LOGO_MAX_DIMENSION} and ${LOGO_MAX_PIXELS} pixels`;
+  if (width !== height || width < LOGO_MIN_DIMENSION)
+    return `it is ${width}×${height}; a logo must be square and at least ${LOGO_MIN_DIMENSION}×${LOGO_MIN_DIMENSION}`;
   return null;
 }

@@ -32,8 +32,12 @@ let viewCsp: McpAppView["csp"] = {};
 let approvals: Array<{ serverName: string; origins: string[] }> = [];
 let approveFails: Error | null = null;
 let approvalProjectPath: string | null = "/repo";
-// When set, each approve call waits for the test to resolve it with the list it returns.
-let approveDeferred: Array<(approvedDomains: string[]) => void> | null = null;
+// When set, each approve call waits for the test to resolve it with the list it returns and the
+// backend commit revision of that list.
+let approveDeferred: Array<(approvedDomains: string[], revision: number) => void> | null = null;
+// Backend commit revisions. Never reset: the approval store outlives a test and keeps the list
+// with the newest revision.
+let revision = Date.now() * 1000;
 let toolCalls: Array<{
   serverName: string;
   toolName: string;
@@ -55,6 +59,8 @@ function serverApi(): TestApiOverrides<APIClient> {
             result: { content: [] },
             invocation,
             approvalProjectPath,
+            // Read now, like the backend: newer than every list published so far.
+            approvedDomainsRevision: ++revision,
           },
         });
       },
@@ -64,14 +70,14 @@ function serverApi(): TestApiOverrides<APIClient> {
         const deferred = approveDeferred;
         if (deferred) {
           return new Promise((resolve) =>
-            deferred.push((approvedDomains) =>
-              resolve({ success: true as const, data: { approvedDomains } })
+            deferred.push((approvedDomains, committed) =>
+              resolve({ success: true as const, data: { approvedDomains, revision: committed } })
             )
           );
         }
         return Promise.resolve({
           success: true as const,
-          data: { approvedDomains: input.origins },
+          data: { approvedDomains: input.origins, revision: ++revision },
         });
       },
       callTool: (input: {
@@ -180,7 +186,7 @@ describe("McpAppFrame", () => {
     cleanupDom = null;
   });
 
-  // A failed approval dismisses the strip for good, so offline Allow waits for the next client.
+  // Offline, Allow waits for the next client instead of failing.
   test.each([...GAP_MODES])(
     "Allow is disabled while offline and the prompt stays (%s)",
     async (mode) => {
@@ -247,6 +253,15 @@ describe("McpAppFrame", () => {
     expect(again.view.queryByText(/wants to reach/)).toBeNull();
   });
 
+  test("the prompt names the project that keeps the approval", async () => {
+    // A task of a multi-project workspace stores approvals on its first project, not its own.
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = { connectDomains: ["https://api.example.com"] };
+    approvalProjectPath = "/work/alpha";
+    const { view } = await renderFrame();
+    expect(view.getByRole("alert").textContent).toContain("alpha");
+  });
+
   test("an approval applies at once to every mounted view of the same server", async () => {
     invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
     viewCsp = { connectDomains: ["https://api.example.com"] };
@@ -270,7 +285,7 @@ describe("McpAppFrame", () => {
   test("an older approval response never replaces a newer one", async () => {
     invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
     viewCsp = { connectDomains: ["https://a.example.com", "https://b.example.com"] };
-    const responders: Array<(approvedDomains: string[]) => void> = [];
+    const responders: Array<(approvedDomains: string[], revision: number) => void> = [];
     approveDeferred = responders;
     const view = render(
       <>
@@ -286,16 +301,54 @@ describe("McpAppFrame", () => {
     await waitFor(() => expect(responders).toHaveLength(2));
     // The backend wrote both; the second request's (complete) answer arrives first.
     const both = ["https://a.example.com", "https://b.example.com"];
+    const older = ++revision;
+    const newer = ++revision;
     await act(async () => {
-      responders[1](both);
+      responders[1](both, newer);
       await Promise.resolve();
     });
     await act(async () => {
-      responders[0](["https://a.example.com"]);
+      responders[0](["https://a.example.com"], older);
       await Promise.resolve();
     });
     await waitFor(() => {
       for (const frame of view.getAllByTestId("mcp-app-frame")) {
+        expect(frame.getAttribute("srcdoc")).toContain("https://b.example.com");
+      }
+    });
+    expect(view.queryAllByRole("button", { name: "Allow" })).toHaveLength(0);
+  });
+
+  test("the list committed last wins, even when its request started first", async () => {
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = { connectDomains: ["https://a.example.com", "https://b.example.com"] };
+    const responders: Array<(approvedDomains: string[], revision: number) => void> = [];
+    approveDeferred = responders;
+    const view = render(
+      <>
+        <McpAppFrame workspaceId="ws" view={VIEW} />
+        <McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />
+      </>,
+      { wrapper: Wrapper }
+    );
+    await waitFor(() => expect(view.getAllByRole("button", { name: "Allow" })).toHaveLength(2));
+    const [first, second] = view.getAllByRole("button", { name: "Allow" });
+    await pressAllow(first);
+    await pressAllow(second);
+    await waitFor(() => expect(responders).toHaveLength(2));
+    // The second request reached the config first and stored only its own origin. The first
+    // request committed after it, so its answer is the complete list.
+    await act(async () => {
+      responders[1](["https://b.example.com"], ++revision);
+      await Promise.resolve();
+    });
+    await act(async () => {
+      responders[0](["https://b.example.com", "https://a.example.com"], ++revision);
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      for (const frame of view.getAllByTestId("mcp-app-frame")) {
+        expect(frame.getAttribute("srcdoc")).toContain("https://a.example.com");
         expect(frame.getAttribute("srcdoc")).toContain("https://b.example.com");
       }
     });
@@ -321,15 +374,50 @@ describe("McpAppFrame", () => {
     expect(view.queryByRole("button", { name: "Allow" })).toBeNull();
   });
 
-  test("a failed approval request shows its error instead of a silently armed strip", async () => {
+  test("a failed approval shows its error and keeps Allow for a retry", async () => {
     invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
     viewCsp = { connectDomains: ["https://api.example.com"] };
     approveFails = new Error("config write failed");
     const { view, frame } = await renderFrame();
     await pressAllow(view.getByRole("button", { name: "Allow" }));
     await view.findByText(/config write failed/);
-    expect(view.queryByRole("button", { name: "Allow" })).toBeNull();
     expect(frame.getAttribute("srcdoc")).not.toContain("api.example.com");
+    // The failure was transient: Allow again succeeds.
+    approveFails = null;
+    await pressAllow(view.getByRole("button", { name: "Allow" }));
+    await waitFor(() =>
+      expect(view.getByTestId("mcp-app-frame").getAttribute("srcdoc")).toContain(
+        "connect-src https://api.example.com"
+      )
+    );
+    expect(approvals).toHaveLength(2);
+    expect(view.queryByText(/config write failed/)).toBeNull();
+  });
+
+  test("the strip is disabled while its approval runs", async () => {
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = { connectDomains: ["https://api.example.com"] };
+    const responders: Array<(approvedDomains: string[], revision: number) => void> = [];
+    approveDeferred = responders;
+    const { view } = await renderFrame();
+    await pressAllow(view.getByRole("button", { name: "Allow" }));
+    await waitFor(() => expect(responders).toHaveLength(1));
+    const notNow = view.getByRole("button", { name: "Not now" }) as HTMLButtonElement;
+    expect(notNow.disabled).toBe(true);
+    expect((view.getByRole("button", { name: "Allow" }) as HTMLButtonElement).disabled).toBe(true);
+    // A Not now click while the call runs changes nothing: the user's Allow decides.
+    fireEvent.click(notNow);
+    expect(view.getByRole("alert").textContent).toContain("api.example.com");
+    await act(async () => {
+      responders[0](["https://api.example.com"], ++revision);
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(view.getByTestId("mcp-app-frame").getAttribute("srcdoc")).toContain(
+        "connect-src https://api.example.com"
+      )
+    );
+    expect(view.queryByRole("button", { name: "Not now" })).toBeNull();
   });
 
   test("the view is bound to the recorded tool call, not the card", async () => {

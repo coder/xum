@@ -2385,7 +2385,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
                     data-testid="immersive-review-complete"
                     className="flex max-w-md flex-col items-center gap-4 text-center"
                   >
-                    <div className="bg-accent/10 text-accent rounded-full p-3">
+                    <div className="bg-accent/10 text-accent-text rounded-full p-3">
                       <CheckCircle2 aria-hidden="true" className="h-8 w-8" />
                     </div>
                     <div className="space-y-2">

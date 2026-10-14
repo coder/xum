@@ -60,6 +60,13 @@ export interface OpenAIPluginExtension {
   /** Relative path to a packaged skill's SKILL.md. */
   onboardingSkill?: string;
   interface?: OpenAIPluginInterface;
+  /**
+   * Directory submission metadata, kept opaque: nothing in Xum reads it. Kept in the typed view
+   * so an overlay's values are not lost when the root manifest has no `com.openai`
+   * (Codex PRRT_kwDOPxxmWM6rvwzT, #6297).
+   */
+  review?: Record<string, unknown>;
+  publication?: Record<string, unknown>;
 }
 
 const FIELD = `extensions["${OPENAI_EXTENSION_NAMESPACE}"]`;
@@ -98,32 +105,74 @@ const TEXT_CAPS: Partial<Record<keyof OpenAIPluginInterface, number>> = {
   category: 64,
 };
 const RULES: Record<FieldKind, string> = {
-  name: "a non-empty single line without control or direction characters",
-  text: "a string without control or direction characters",
+  name: "a non-empty single line without control, direction or invisible formatting characters",
+  text: "a string without control, direction or invisible formatting characters",
   url: "an https URL (max 2048 characters)",
   color: "a #RRGGBB color",
   path: "a relative path inside the plugin",
-  labels: "at most 20 strings of at most 120 characters",
+  labels: "at most 20 non-empty strings of at most 120 characters",
   prompts: "at most 3 strings of at most 512 characters",
   paths: "at most 10 relative paths inside the plugin",
 };
 
 /**
- * Characters manifest text must not carry (OpenAI's package rules exclude them too): C0 and C1
- * controls, the Unicode line and paragraph separators, and the invisible direction controls
- * (LRM/RLM/ALM, embeddings/overrides, isolates), which can spoof a displayed plugin or developer.
- * `longDescription` may break lines with \n only.
+ * Characters manifest text must not carry. OpenAI's package rules exclude "control characters,
+ * Unicode line or paragraph separators, and unsupported invisible formatting characters"
+ * (https://developers.openai.com/plugins/deploy/submission-errors): C0 and C1 controls, U+2028
+ * and U+2029, the Unicode format category (`\p{Cf}`) and the variation selectors (U+FE00-U+FE0F,
+ * U+E0100-U+E01EF, category Mn). Cf holds the direction controls (LRM/RLM/ALM,
+ * embeddings/overrides, isolates) and the zero-width characters (U+200B, U+2060, U+FEFF, soft
+ * hyphen). All of them are invisible, so they can make a displayed plugin or developer name look
+ * like another, or a label look blank (#6162). `longDescription` may break lines with \n only.
  */
 const UNSAFE_TEXT =
   // eslint-disable-next-line no-control-regex -- the control characters are the point
-  /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]/;
+  /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029\p{Cf}\ufe00-\ufe0f\u{e0100}-\u{e01ef}]/u;
+/** Scripts in which ZWNJ changes how letters join or form conjuncts (Persian, Indic). */
+const ZWNJ_SCRIPTS =
+  "\\p{Script=Arabic}\\p{Script=Syriac}\\p{Script=Devanagari}\\p{Script=Bengali}\\p{Script=Gurmukhi}" +
+  "\\p{Script=Gujarati}\\p{Script=Oriya}\\p{Script=Tamil}\\p{Script=Telugu}\\p{Script=Kannada}" +
+  "\\p{Script=Malayalam}\\p{Script=Sinhala}";
+/**
+ * The invisible characters normal text needs, removed before the UNSAFE_TEXT test, but only inside
+ * the sequences that need them. Anywhere else they can spoof a name or fake a blank label (Codex
+ * PRRT_kwDOPxxmWM6sQExO, PRRT_kwDOPxxmWM6sQ79s, PRRT_kwDOPxxmWM6sQ79z). OpenAI names no exact
+ * list, but calls only "unsupported" formatting characters invalid.
+ * - ZWJ (U+200D) between emoji (after an optional skin tone or VS16), as in 👩‍💻.
+ * - ZWNJ (U+200C) between letters of a script that uses it (ZWNJ_SCRIPTS), as in Persian.
+ * - Tag characters (U+E0020-U+E007F) in a subdivision flag: U+1F3F4, tags, then U+E007F.
+ * - VS15/VS16 (U+FE0E, U+FE0F) after an emoji, and VS16 in a keycap (digit, VS16, U+20E3).
+ * The ZWJ rule runs first and keeps the emoji's VS16, which the selector rule then removes.
+ */
+// Capture groups, not lookbehind: Bun's engine (JavaScriptCore) fails a lookbehind that holds a
+// `\p{...}` escape, so the tests would not match the Node/Electron runtime.
+const ALLOWED_FORMAT_SEQUENCES: ReadonlyArray<[RegExp, string]> = [
+  [
+    /(\p{Extended_Pictographic}(?:[\u{1f3fb}-\u{1f3ff}]|\ufe0f)?)\u200d(?=\p{Extended_Pictographic})/gu,
+    "$1",
+  ],
+  [new RegExp(`([${ZWNJ_SCRIPTS}]\\p{M}*)\\u200c(?=[${ZWNJ_SCRIPTS}])`, "gu"), "$1"],
+  [/\u{1f3f4}[\u{e0020}-\u{e007e}]+\u{e007f}/gu, "\u{1f3f4}"],
+  [/(\p{Extended_Pictographic})(?:\ufe0e|\ufe0f)/gu, "$1"],
+  [/([0-9#*])\ufe0f(?=\u20e3)/gu, "$1"],
+];
+const hasUnsafeText = (value: string): boolean =>
+  UNSAFE_TEXT.test(
+    ALLOWED_FORMAT_SEQUENCES.reduce(
+      (text, [sequence, replacement]) => text.replace(sequence, replacement),
+      value
+    )
+  );
 const isText = (value: unknown, max: number, multiline = false): value is string =>
   typeof value === "string" &&
   value.length <= max &&
-  !UNSAFE_TEXT.test(value) &&
+  !hasUnsafeText(value) &&
   (multiline || !value.includes("\n"));
 const isTextList = (value: unknown, count: number, max: number): value is string[] =>
   Array.isArray(value) && value.length <= count && value.every((entry) => isText(entry, max));
+/** OpenAI: "Each capability must be non-empty"; a blank one would render as an empty badge. */
+const isLabelList = (value: unknown): value is string[] =>
+  isTextList(value, 20, 120) && value.every((label) => label.trim().length > 0);
 
 /** The validated value, or undefined when `value` breaks the rule for `kind`. */
 function parseField(kind: FieldKind, value: unknown, cap: number, multiline: boolean): unknown {
@@ -144,7 +193,7 @@ function parseField(kind: FieldKind, value: unknown, cap: number, multiline: boo
     case "path":
       return normalizeOpenAIRelativePath(value);
     case "labels":
-      return isTextList(value, 20, 120) ? value : undefined;
+      return isLabelList(value) ? value : undefined;
     case "prompts": {
       const prompts = typeof value === "string" ? [value] : value;
       return isTextList(prompts, 3, 512) ? prompts : undefined;
@@ -199,8 +248,26 @@ export function normalizeOpenAIRelativePath(value: unknown): string | undefined 
   return segments.every((segment) => segment === ".") ? undefined : trimmed;
 }
 
+/**
+ * Hook pointer entries read per plugin. Install Preview reads an untrusted repository, and a
+ * 256 KiB manifest can hold ~100k entries: discovery would emit one diagnostic per invalid entry,
+ * and the hook loader would reread a repeated file each time (#6297).
+ */
+export const MAX_HOOK_POINTER_ENTRIES = 32;
+
+/** The first MAX_HOOK_POINTER_ENTRIES entries; one warning reports the rest. */
+function capHookEntries(raw: unknown, warnings: string[]): unknown[] {
+  const all: unknown[] = Array.isArray(raw) ? raw : [raw];
+  if (all.length > MAX_HOOK_POINTER_ENTRIES) {
+    warnings.push(
+      `'${FIELD}.hooks' has ${all.length} entries; reading only the first ${MAX_HOOK_POINTER_ENTRIES}`
+    );
+  }
+  return all.slice(0, MAX_HOOK_POINTER_ENTRIES);
+}
+
 function readHooks(raw: unknown, warnings: string[]): OpenAIPluginHooksEntry[] {
-  const entries: unknown[] = Array.isArray(raw) ? raw : [raw];
+  const entries = capHookEntries(raw, warnings);
   const hooks: OpenAIPluginHooksEntry[] = [];
   for (const entry of entries) {
     if (isPlainObject(entry)) {
@@ -250,7 +317,22 @@ export function readOpenAIExtension(manifest: Pick<AgentPluginManifest, "extensi
     const parsed = readInterface(raw.interface, warnings);
     if (parsed !== undefined) extension.interface = parsed;
   }
+  readSubmissionMetadata(raw, extension, warnings);
   return { extension, warnings };
+}
+
+/** Copy `review` and `publication` as opaque objects; any other shape warns. */
+function readSubmissionMetadata(
+  raw: Record<string, unknown>,
+  extension: OpenAIPluginExtension,
+  warnings: string[]
+): void {
+  for (const key of ["review", "publication"] as const) {
+    const value = raw[key];
+    if (value === undefined) continue;
+    if (isPlainObject(value)) extension[key] = value;
+    else warnings.push(`'${FIELD}.${key}' must be an object; ignoring`);
+  }
 }
 
 /** Codex top-level fields that move into `extensions["com.openai"]`. */
@@ -260,6 +342,19 @@ const CODEX_CONTRIBUTES_KEYS = [
   ["skills", "skills"],
   ["mcpServers", "mcp"],
 ] as const;
+
+/**
+ * The `contributes` value for a Codex component path, or undefined to leave the field top-level
+ * (the validator then reports it as unknown). Codex accepts a string or an array for both. Xum
+ * reads every skills root (#6121) but one MCP file, so only a one-entry `mcpServers` array maps.
+ * Unsafe paths pass through unchanged so the validator rejects each with its warning.
+ */
+function codexComponentPath(codexKey: "skills" | "mcpServers", value: unknown): unknown {
+  const normalize = (entry: unknown): unknown => normalizeOpenAIRelativePath(entry) ?? entry;
+  if (codexKey === "skills" && Array.isArray(value)) return value.map(normalize);
+  const single: unknown = Array.isArray(value) && value.length === 1 ? value[0] : value;
+  return typeof single === "string" ? normalize(single) : undefined;
+}
 
 /**
  * Rewrite a `.codex-plugin/plugin.json` document into the Agent Plugins 1.0.0
@@ -312,15 +407,11 @@ export function normalizeCodexManifest(raw: unknown): { manifest: unknown; warni
     manifest.extensions = extensions;
   }
 
-  // Only a string path (or a one-entry array) maps: Xum has one skills root.
-  // Other forms stay top-level and the validator reports them as unknown.
   const contributes: Record<string, unknown> = {};
   for (const [codexKey, contributesKey] of CODEX_CONTRIBUTES_KEYS) {
-    const value: unknown = raw[codexKey];
-    const single: unknown = Array.isArray(value) && value.length === 1 ? value[0] : value;
-    if (typeof single !== "string") continue;
-    // An unsafe path is passed through so the validator rejects it with its warning.
-    contributes[contributesKey] = normalizeOpenAIRelativePath(single) ?? single;
+    const mapped = codexComponentPath(codexKey, raw[codexKey]);
+    if (mapped === undefined) continue;
+    contributes[contributesKey] = mapped;
     delete manifest[codexKey];
   }
   if (Object.keys(contributes).length > 0) manifest.contributes = contributes;

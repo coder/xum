@@ -261,7 +261,7 @@ export function SettingsPage(props: { focusReturn: ReturnType<typeof useModalFoc
                 onClick={() => setActiveSection(section.id)}
                 className={`flex h-auto shrink-0 items-center justify-start gap-2 rounded-md px-3 py-2 text-left text-sm whitespace-nowrap md:w-full ${
                   activeSection === section.id
-                    ? "bg-accent/20 text-accent hover:bg-accent/20 hover:text-accent"
+                    ? "bg-accent/20 text-accent-text hover:bg-accent/20 hover:text-accent-text"
                     : "text-muted hover:bg-hover hover:text-foreground"
                 }`}
               >

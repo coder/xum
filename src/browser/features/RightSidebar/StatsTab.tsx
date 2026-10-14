@@ -323,7 +323,7 @@ export function TimingPanel(props: TimingPanelProps) {
             <div className="flex items-center gap-3">
               <span className="text-foreground inline-flex shrink-0 items-baseline gap-1 font-medium">
                 Timing
-                {isActive && <span className="text-accent ml-1 animate-pulse text-xs">●</span>}
+                {isActive && <span className="text-accent-text ml-1 animate-pulse text-xs">●</span>}
               </span>
               <ToggleGroup options={VIEW_MODE_OPTIONS} value={viewMode} onChange={setViewMode} />
             </div>

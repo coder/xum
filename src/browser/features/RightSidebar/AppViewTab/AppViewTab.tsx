@@ -8,10 +8,12 @@ import {
   markMcpAppViewHosted,
   openMcpAppViewTab,
   useMcpAppView,
+  useMcpAppViewReloadKey,
   useMcpAppViews,
   type McpAppViewRef,
 } from "../ArtifactsTab/mcpAppViewsStore";
 import { Notice } from "../ArtifactsTab/SourceText";
+import { withEntrypointScope } from "./mcpAppEntrypoints";
 
 /**
  * Shown where a view would otherwise mount a second live instance (its tool card, a tab the
@@ -63,7 +65,11 @@ export function AppViewTabLabel(props: { workspaceId: string; toolCallId: string
     <span className="inline-flex min-w-0 items-center gap-1">
       <AppWindow className="h-3 w-3 shrink-0" />
       <span className="min-w-0 truncate">{ref?.label ?? "App view"}</span>
-      {ref != null && <span className="text-muted shrink-0 text-[10px]">{server}</span>}
+      {ref != null && (
+        <span className="text-muted shrink-0 text-[10px]">
+          {withEntrypointScope(server, ref.entrypointType)}
+        </span>
+      )}
       {detail !== "" && <span className="text-muted min-w-0 truncate text-[10px]">{detail}</span>}
     </span>
   );
@@ -75,7 +81,7 @@ export function AppViewTabTooltip(props: { workspaceId: string; toolCallId: stri
   const ref = typeof view === "object" ? view : null;
   return ref == null ? null : (
     <span className="wrap-anywhere">
-      {ref.label} · {ref.serverLabel ?? ref.serverName}
+      {ref.label} · {withEntrypointScope(ref.serverLabel ?? ref.serverName, ref.entrypointType)}
     </span>
   );
 }
@@ -91,7 +97,9 @@ export function AppViewTabPanel(props: {
   toolCallId: string | null;
   onClose: () => void;
 }) {
-  const view = useMcpAppView(props.workspaceId, props.toolCallId ?? "");
+  const viewKey = props.toolCallId ?? "";
+  const view = useMcpAppView(props.workspaceId, viewKey);
+  const reloadKey = useMcpAppViewReloadKey(props.workspaceId, viewKey);
   const { workspaceId, toolCallId } = props;
   useEffect(() => {
     if (toolCallId == null) return;
@@ -114,8 +122,8 @@ export function AppViewTabPanel(props: {
   }
   return (
     <McpAppFrame
-      // A new tool call is a new document.
-      key={view.toolCallId}
+      // A new tool call is a new document, and so is a reload (reloadMcpAppView).
+      key={`${view.toolCallId}:${reloadKey}`}
       workspaceId={props.workspaceId}
       view={view}
       onClose={props.onClose}

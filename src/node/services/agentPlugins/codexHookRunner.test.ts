@@ -658,6 +658,29 @@ describe("UserPromptSubmit and Stop", () => {
     ).toEqual({ kind: "blocked", pluginName: "guard", reason: "secret detected" });
   });
 
+  test("UserPromptSubmit: a withdrawn send ends a pending hook call and skips the rest", async () => {
+    // The default deadline is 10 s: only the cancel ends this wait in time.
+    const { spine, calls } = setup(
+      [
+        hook("UserPromptSubmit", { input: { n: 1 } }),
+        hook("UserPromptSubmit", { input: { n: 2 } }),
+      ],
+      () => new Promise(() => undefined)
+    );
+    const cancel = new AbortController();
+    setTimeout(() => cancel.abort(), 20);
+
+    const outcome = await runMessageSendHooks(spine, workspaceId, {
+      text: "fix",
+      origin: "user",
+      canBlock: true,
+      signal: cancel.signal,
+    });
+
+    expect(outcome).toEqual({ kind: "none" });
+    expect(calls).toEqual([{ n: 1 }]);
+  });
+
   test("prompt and Stop events carry the workspace cwd", async () => {
     const prompt = setup([hook("UserPromptSubmit", { input: { dir: "${cwd}" } })], () => null);
     await runMessageSendHooks(prompt.spine, workspaceId, {

@@ -171,9 +171,13 @@ export class AIService extends EventEmitter {
     )
   ) {
     super();
-    // Increase max listeners to accommodate multiple concurrent workspace listeners
-    // Each workspace subscribes to stream events, and we expect >10 concurrent workspaces
-    this.setMaxListeners(50);
+    // No listener cap: every live AgentSession adds one listener per forwarded event, and a
+    // session lives from first use of its workspace until archive, removal or shutdown, so the
+    // count tracks how many workspaces this process has touched. Any fixed cap is a false
+    // MaxListenersExceededWarning for a user with many workspaces or sub-agents. A leak (a
+    // disposed session that keeps its listeners) is caught by
+    // workspaceService.sessionListeners.test.ts instead.
+    this.setMaxListeners(0);
     this.workspaceMcpOverridesService =
       workspaceMcpOverridesService ?? new WorkspaceMcpOverridesService(config);
     this.providersConfigStore = providersConfigStore ?? new ProvidersConfigStore(config.rootDir);
@@ -539,8 +543,8 @@ export class AIService extends EventEmitter {
     }
     // Codex UserPromptSubmit hooks call their plugin's MCP server, which the turn only starts
     // after this chain: start it first (the turn's own startup, bounded), or the first prompt
-    // after a restart misses the hooks. A canceled send ends this wait; the hooks still run, so a
-    // send whose cancellation is disabled cannot skip them.
+    // after a restart misses the hooks. A canceled send ends this wait and its hook calls (see
+    // MessageSendContext.signal).
     await codexPluginHookService.prepareForPromptHooks(
       workspaceId,
       (signal) => this.turnRequestBuilder.startWorkspaceMcpServers(workspaceId, signal),
@@ -550,7 +554,7 @@ export class AIService extends EventEmitter {
     const cwd = eventSpine.hasMiddleware("message.send")
       ? await this.resolvePromptHookCwd(workspaceId)
       : undefined;
-    return runMessageSendHooks(eventSpine, workspaceId, { ...input, cwd });
+    return runMessageSendHooks(eventSpine, workspaceId, { ...input, cwd, signal: cancelSignal });
   }
 
   /** Run the turn.stop prompt-hook chain for one finished turn (fail-open). */
