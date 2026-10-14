@@ -127,17 +127,13 @@ import {
 import { SideChatTabTitle } from "./Tabs/TabLabels";
 import { AppViewTabLabel, AppViewTabPanel, AppViewTabTooltip } from "./AppViewTab/AppViewTab";
 import {
-  appViewTabFor,
   appViewTabToolCallId,
   liveAppViewTabs,
   nextRecentAppViewTabs,
   withAppViewTab,
 } from "./AppViewTab/appViewTabs";
 import { useMcpAppEntrypoints } from "./AppViewTab/mcpAppEntrypoints";
-import {
-  MCP_APP_ENTRYPOINT_NOT_CONNECTED,
-  openMcpAppEntrypoint,
-} from "./AppViewTab/openMcpAppEntrypoint";
+import { openMcpAppEntrypointInNewTab } from "./AppViewTab/openMcpAppEntrypoint";
 import { ReviewAssistedStatsReporter } from "@/browser/features/RightSidebar/CodeReview/ReviewPanel";
 import {
   NewTabLabel,
@@ -751,15 +747,11 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
               autoFocus={props.launcherAutoFocusTabsetId === props.node.id}
               onAutoFocusConsumed={props.onLauncherAutoFocusConsumed}
               entrypoints={entrypoints}
-              onOpenEntrypoint={(entrypoint) =>
-                api == null
-                  ? Promise.resolve(MCP_APP_ENTRYPOINT_NOT_CONNECTED)
-                  : // Like a tool: the app tab replaces this New tab (or the open one is focused).
-                    openMcpAppEntrypoint(api, props.workspaceId, entrypoint, (view) =>
-                      props.setLayout((prev) =>
-                        openToolFromNewTab(prev, props.node.id, appViewTabFor(view.toolCallId))
-                      )
-                    )
+              onOpenEntrypoint={(entrypoint, isCurrent) =>
+                // Like a tool: the app tab replaces this New tab (or the open one is focused).
+                openMcpAppEntrypointInNewTab(api, props.workspaceId, entrypoint, isCurrent, (tab) =>
+                  props.setLayout((prev) => openToolFromNewTab(prev, props.node.id, tab))
+                )
               }
             />
           </div>

@@ -3,6 +3,7 @@ import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { collectAllTabs, parseRightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 import { getRightSidebarLayoutKey } from "@/common/constants/storage";
 import type { McpAppEntrypoint } from "@/common/orpc/schemas/mcpApps";
+import type { TabType } from "@/browser/types/rightSidebar";
 import { getErrorMessage } from "@/common/utils/errors";
 import { focusMcpAppViewTab, type McpAppViewRef } from "../ArtifactsTab/mcpAppViewsStore";
 import { appViewTabFor } from "./appViewTabs";
@@ -44,6 +45,25 @@ export async function openMcpAppEntrypoint(
   } catch (error) {
     return getErrorMessage(error);
   }
+}
+
+/**
+ * The New tab launcher's open: the app tab replaces that pane's New tab. The open can outlive
+ * the launcher's choice: the user may pick another row, or close the pane, while it runs. Then
+ * its completion is dropped instead of overriding the newer choice (the view record stays, so a
+ * later pick reuses it).
+ */
+export function openMcpAppEntrypointInNewTab(
+  api: APIClient | null,
+  workspaceId: string,
+  entrypoint: McpAppEntrypoint,
+  isCurrent: () => boolean,
+  replaceNewTab: (tab: TabType) => void
+): Promise<string | null> {
+  if (api == null) return Promise.resolve(MCP_APP_ENTRYPOINT_NOT_CONNECTED);
+  return openMcpAppEntrypoint(api, workspaceId, entrypoint, (view) => {
+    if (isCurrent()) replaceNewTab(appViewTabFor(view.toolCallId));
+  });
 }
 
 /**

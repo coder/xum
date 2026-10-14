@@ -44,6 +44,17 @@ export function useMcpAppEntrypoints(workspaceId: string): readonly McpAppEntryp
   return useSyncExternalStore(subscribe, () => getMcpAppEntrypoints(workspaceId));
 }
 
+/**
+ * The line under an entry point's title (launcher row, palette subtitle): its server label
+ * first, so a narrow row keeps it before the ellipsis, then " · this chat" for a `thread` entry
+ * point, so a tool with both types does not show two identical rows.
+ */
+export function mcpAppEntrypointDescription(entrypoint: McpAppEntrypoint): string {
+  return entrypoint.type === "thread"
+    ? `${entrypoint.serverLabel} · this chat`
+    : entrypoint.serverLabel;
+}
+
 /** Publish a settled list, or `"pending"` while it is being listed. */
 function setMcpAppEntrypoints(workspaceId: string, list: readonly McpAppEntrypoint[] | "pending") {
   if (list === "pending") {

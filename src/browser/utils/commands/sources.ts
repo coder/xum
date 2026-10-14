@@ -52,6 +52,7 @@ import {
   MCP_APP_ENTRYPOINT_NOT_CONNECTED,
   openMcpAppEntrypoint,
 } from "@/browser/features/RightSidebar/AppViewTab/openMcpAppEntrypoint";
+import { mcpAppEntrypointDescription } from "@/browser/features/RightSidebar/AppViewTab/mcpAppEntrypoints";
 import type { McpAppEntrypoint } from "@/common/orpc/schemas/mcpApps";
 
 /**
@@ -67,7 +68,7 @@ function entrypointActions(
   return entrypoints.map((entrypoint) => ({
     id: CommandIds.navOpenAppEntrypoint(entrypoint.viewKey),
     title: `Open Plugin View: ${entrypoint.title}`,
-    subtitle: entrypoint.serverLabel,
+    subtitle: mcpAppEntrypointDescription(entrypoint),
     section: navigation,
     keywords: ["plugin", "view", "app", "mcp", entrypoint.serverName],
     run: async () => {

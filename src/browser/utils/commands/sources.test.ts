@@ -2620,3 +2620,22 @@ test("an entry point picked from the palette while disconnected says so in a toa
     }
   });
 });
+
+test("a tool's global and thread entry points get palette commands that read differently", () => {
+  const entrypoint = (type: "global" | "thread") => ({
+    serverName: "cad",
+    serverLabel: "cad",
+    toolName: "cad.board",
+    title: "Board",
+    resourceUri: "ui://cad/board",
+    type,
+    viewKey: `entrypoint:cad:cad.board:${type}`,
+  });
+  const entrypoints = [entrypoint("global"), entrypoint("thread")];
+  const actions = getActions({ artifactsEnabled: true, mcpAppEntrypoints: entrypoints });
+  const shown = entrypoints.map((e) => {
+    const action = actions.find((a) => a.id === CommandIds.navOpenAppEntrypoint(e.viewKey));
+    return [action?.title, action?.subtitle].join(" ");
+  });
+  expect(shown[0]).not.toBe(shown[1]);
+});

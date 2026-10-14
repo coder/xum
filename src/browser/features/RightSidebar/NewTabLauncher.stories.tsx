@@ -1,6 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, fn, userEvent, within } from "@storybook/test";
 import { NewTabLauncher } from "./NewTabLauncher";
+import { mcpAppEntrypointDescription } from "./AppViewTab/mcpAppEntrypoints";
 import { PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import type { McpAppEntrypoint } from "@/common/orpc/schemas/mcpApps";
 
@@ -101,8 +102,9 @@ async function expectPluginViews(canvasElement: HTMLElement, onOpen: unknown) {
   const container = canvasElement.firstElementChild!;
   await expect(container.scrollWidth).toBeLessThanOrEqual(container.clientWidth);
   await expect(canvasElement.textContent).not.toContain("plugin:0123456789abcdef");
-  // The long label is one line, cut with an ellipsis.
-  const label = canvas.getByText(ENTRYPOINTS[1].serverLabel);
+  // The long label (a thread entry point: " · this chat" follows it) is one line, cut with an
+  // ellipsis.
+  const label = canvas.getByText(mcpAppEntrypointDescription(ENTRYPOINTS[1]));
   await expect(label.scrollWidth).toBeGreaterThan(label.clientWidth);
   await expect(label.getBoundingClientRect().height).toBeLessThan(20);
 }

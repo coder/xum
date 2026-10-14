@@ -26,7 +26,7 @@ import { appViewTabFor } from "./appViewTabs";
 import { useLoadMcpAppEntrypoints, useMcpAppEntrypoints } from "./mcpAppEntrypoints";
 import { useMcpAppView, useMcpAppViews } from "../ArtifactsTab/mcpAppViewsStore";
 import { AppViewTabLabel, AppViewTabTooltip } from "./AppViewTab";
-import { openMcpAppEntrypoint } from "./openMcpAppEntrypoint";
+import { openMcpAppEntrypoint, openMcpAppEntrypointInNewTab } from "./openMcpAppEntrypoint";
 
 function entrypoint(title: string): McpAppEntrypoint {
   return {
@@ -215,6 +215,28 @@ describe("MCP App entry points", () => {
     expect(await openMcpAppEntrypoint(client, "ws-open", target, show)).toBeNull();
     expect(opens).toHaveLength(1);
     expect(shown).toEqual([target.viewKey, target.viewKey]);
+  });
+
+  test("a launcher open that a later pick made stale never replaces the pane's choice", async () => {
+    const target = entrypoint("Library");
+    const client = createTestApiClient({
+      mcpApps: {
+        openEntrypoint: () => Promise.resolve({ success: true as const, data: target }),
+      },
+    });
+    const replaced: string[] = [];
+    for (const current of [false, true]) {
+      expect(
+        await openMcpAppEntrypointInNewTab(
+          client,
+          `ws-launcher-${String(current)}`,
+          target,
+          () => current,
+          (tab) => replaced.push(tab)
+        )
+      ).toBeNull();
+    }
+    expect(replaced).toEqual([appViewTabFor(target.viewKey)]);
   });
 
   test("a picked entry point whose record was evicted runs again", async () => {

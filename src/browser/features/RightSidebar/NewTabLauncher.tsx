@@ -11,6 +11,7 @@ import type { McpAppEntrypoint } from "@/common/orpc/schemas/mcpApps";
 import { cn } from "@/common/lib/utils";
 import { formatKeybind, KEYBINDS, type Keybind } from "@/browser/utils/ui/keybinds";
 import { TAB_REGISTRY, type BaseTabType } from "./Tabs";
+import { mcpAppEntrypointDescription } from "./AppViewTab/mcpAppEntrypoints";
 
 /** Tools with a global shortcut of their own; the launcher shows it as a hint. */
 const TOOL_KEYBINDS: Partial<Record<BaseTabType, Keybind>> = {
@@ -33,8 +34,15 @@ interface NewTabLauncherProps {
   onAutoFocusConsumed: () => void;
   /** MCP App entry points of the workspace's enabled servers (artifacts experiment). */
   entrypoints?: readonly McpAppEntrypoint[];
-  /** Open (or focus) an entry point's app tab; resolves to an error message or null. */
-  onOpenEntrypoint?: (entrypoint: McpAppEntrypoint) => Promise<string | null>;
+  /**
+   * Open (or focus) an entry point's app tab; resolves to an error message or null. The open
+   * must apply its result only while `isCurrent()`: a later pick in this launcher, or its
+   * unmount (the New tab went away), makes it stale.
+   */
+  onOpenEntrypoint?: (
+    entrypoint: McpAppEntrypoint,
+    isCurrent: () => boolean
+  ) => Promise<string | null>;
 }
 
 /**
@@ -56,13 +64,28 @@ export const NewTabLauncher: React.FC<NewTabLauncherProps> = (props) => {
   const { autoFocus, onAutoFocusConsumed } = props;
   const [opening, setOpening] = React.useState<string | null>(null);
   const [openError, setOpenError] = React.useState<string | null>(null);
+  // Counts picks: an entry point open applies its result only if no later pick (or unmount)
+  // bumped it meanwhile. Other rows stay enabled while an open runs.
+  const pickRef = React.useRef(0);
+  const picked = (run: () => void) => () => {
+    pickRef.current += 1;
+    run();
+  };
+  React.useEffect(
+    () => () => {
+      pickRef.current += 1;
+    },
+    []
+  );
   const openEntrypoint = async (entrypoint: McpAppEntrypoint) => {
     if (props.onOpenEntrypoint == null) return;
+    const pick = ++pickRef.current;
+    const isCurrent = () => pickRef.current === pick;
     setOpening(entrypoint.viewKey);
     setOpenError(null);
-    const error = await props.onOpenEntrypoint(entrypoint);
+    const error = await props.onOpenEntrypoint(entrypoint, isCurrent);
     setOpening(null);
-    setOpenError(error);
+    if (isCurrent()) setOpenError(error);
   };
 
   // Moving DOM focus is a side effect on the rendered rows, so it runs after commit.
@@ -106,7 +129,7 @@ export const NewTabLauncher: React.FC<NewTabLauncherProps> = (props) => {
               name={reg.name}
               description={reg.description}
               shortcut={keybind ? formatKeybind(keybind) : undefined}
-              onClick={() => props.onOpenTool(tool)}
+              onClick={picked(() => props.onOpenTool(tool))}
             />
           );
         })}
@@ -115,7 +138,7 @@ export const NewTabLauncher: React.FC<NewTabLauncherProps> = (props) => {
           name="Terminal"
           description="Run commands in this workspace"
           shortcut={formatKeybind(KEYBINDS.OPEN_TERMINAL)}
-          onClick={props.onOpenTerminal}
+          onClick={picked(props.onOpenTerminal)}
         />
         {props.onOpenSideChat != null && (
           <LauncherRow
@@ -123,7 +146,7 @@ export const NewTabLauncher: React.FC<NewTabLauncherProps> = (props) => {
             name="Side chat"
             description="Ask separately with this conversation as context"
             shortcut="/side"
-            onClick={props.onOpenSideChat}
+            onClick={picked(props.onOpenSideChat)}
             disabled={props.creatingSideChat}
           />
         )}
@@ -136,7 +159,7 @@ export const NewTabLauncher: React.FC<NewTabLauncherProps> = (props) => {
                 Icon={ENTRYPOINT_ICONS[entrypoint.type]}
                 name={entrypoint.title}
                 // Never the raw server key (a plugin's carries an internal instance ID).
-                description={entrypoint.serverLabel}
+                description={mcpAppEntrypointDescription(entrypoint)}
                 singleLineDescription
                 onClick={() => void openEntrypoint(entrypoint)}
                 disabled={opening !== null}
