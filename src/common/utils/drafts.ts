@@ -92,7 +92,8 @@ export function draftJsonBytes(
       ...(draft.pendingSends != null && draft.pendingSends.length > 0
         ? { pendingSends: draft.pendingSends }
         : {}),
-      ...(draft.nameState != null ? { nameState: draft.nameState } : {}),
+      // Omitted from the JSON when undefined, as in the file.
+      nameState: draft.nameState,
     })
   );
 }
