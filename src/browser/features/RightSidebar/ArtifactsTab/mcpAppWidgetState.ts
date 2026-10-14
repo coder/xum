@@ -48,6 +48,8 @@ const keyOf = (target: McpAppWidgetStateTarget) =>
 const latest = new Map<string, unknown>();
 /** The seed each view document was built with, by its nonce. */
 const documentSeeds = new Map<string, unknown>();
+/** States saved while Xum reconnected (no live client), per view instance. */
+const offline = new Map<string, { target: McpAppWidgetStateTarget; state: unknown }>();
 /** Per view instance: the write waiting behind the one in flight (null when none waits). */
 const queues = new Map<string, { next: { api: APIClient; state: unknown } | null }>();
 
@@ -86,7 +88,13 @@ export function saveMcpAppWidgetState(
   if (target === null) return;
   const key = keyOf(target);
   setBounded(latest, key, state);
-  if (api === null) return;
+  if (api === null) {
+    // Kept until a client is back (flushOfflineMcpAppWidgetStates); the newest state wins.
+    offline.delete(key);
+    offline.set(key, { target, state });
+    return;
+  }
+  offline.delete(key);
   const queue = queues.get(key);
   if (queue !== undefined) {
     queue.next = { api, state };
@@ -122,4 +130,14 @@ async function writeQueued(
     queue.next = null;
   }
   queues.delete(key);
+}
+
+/**
+ * Send the states saved while Xum reconnected. Every mounted MCP App frame calls this when its
+ * live client comes back, so a state also lands when its own frame unmounted meanwhile.
+ */
+export function flushOfflineMcpAppWidgetStates(api: APIClient): void {
+  const pending = [...offline.values()];
+  offline.clear();
+  for (const { target, state } of pending) saveMcpAppWidgetState(api, target, state);
 }

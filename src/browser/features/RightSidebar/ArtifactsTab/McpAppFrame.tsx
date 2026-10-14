@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { cn } from "@/common/lib/utils";
-import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI, type APIClient } from "@/browser/contexts/API";
 import { useTheme } from "@/browser/contexts/ThemeContext";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
@@ -25,6 +25,7 @@ import {
 } from "./mcpAppDocumentChannel";
 import { mcpAppOpenAiShimScript, type McpAppOpenAiSeed } from "./mcpAppOpenAiShim";
 import {
+  flushOfflineMcpAppWidgetStates,
   mcpAppWidgetStateSeed,
   mcpAppWidgetStateTarget,
   saveMcpAppWidgetState,
@@ -326,6 +327,24 @@ function useCloseDiscardedDocumentChannel(
   }, [viewDocument, frameMounted]);
 }
 
+/** The widget state a view document starts with; null before the view loaded. */
+function widgetStateSeedOf(
+  workspaceId: string,
+  loaded: Loaded | null,
+  viewDocument: { nonce: string } | null
+): unknown {
+  if (loaded === null) return null;
+  const target = mcpAppWidgetStateTarget(workspaceId, loaded.toolCallId, loaded.view);
+  return mcpAppWidgetStateSeed(viewDocument, target);
+}
+
+/** Widget states saved while Xum reconnected go out with the new client (mcpAppWidgetState.ts). */
+function useFlushOfflineWidgetStates(liveApi: APIClient | null) {
+  useEffect(() => {
+    if (liveApi) flushOfflineMcpAppWidgetStates(liveApi);
+  }, [liveApi]);
+}
+
 export function McpAppFrame(props: {
   workspaceId: string;
   view: McpAppViewRef;
@@ -368,6 +387,7 @@ export function McpAppFrame(props: {
   useEffect(() => {
     apiRef.current = liveApi;
   }, [liveApi]);
+  useFlushOfflineWidgetStates(liveApi);
   // Fetched once per tool call: a reconnect must not fetch it again (a failed refetch replaced a
   // working view with an error). A failed fetch is retried with the next client.
   const viewLoaded = loaded?.toolCallId === toolCallId && loaded.view != null;
@@ -453,10 +473,9 @@ export function McpAppFrame(props: {
   const { navigatedRef, leave: leaveDocument } = guard;
   const viewDocument = useMcpAppViewDocument(documentKey, guard.frameKey);
   // The document starts with this view instance's last widget state (mcpAppWidgetState.ts).
-  const widgetStateTarget = mcpAppWidgetStateTarget(workspaceId, toolCallId, current?.view);
   const srcDoc = buildMcpAppViewSrcDoc(current, grant, viewDocument, {
     ...openAiSeed,
-    widgetState: mcpAppWidgetStateSeed(viewDocument, widgetStateTarget),
+    widgetState: widgetStateSeedOf(workspaceId, current, viewDocument),
   });
 
   // Values the long-lived host reads at message time.

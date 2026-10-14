@@ -66,15 +66,17 @@ const SizeChangedParams = z.object({
 });
 const LogParams = z.object({ level: z.string().max(32).optional(), data: z.unknown().optional() });
 /** xum/widget-state: JSON of at most MCP_APP_WIDGET_STATE_MAX_BYTES (the backend's cap too). */
-const WidgetStateParams = z.object({
-  state: z
-    .unknown()
-    .refine(
-      (state) =>
-        new TextEncoder().encode(JSON.stringify(state ?? null)).length <=
-        MCP_APP_WIDGET_STATE_MAX_BYTES
-    ),
-});
+const WidgetStateParams = z.object({ state: z.unknown().refine(isStorableWidgetState) });
+
+/** JSON within the cap. A cycle or a BigInt (structured-cloneable, not JSON) is not. */
+function isStorableWidgetState(state: unknown): boolean {
+  try {
+    const json = JSON.stringify(state ?? null);
+    return new TextEncoder().encode(json).length <= MCP_APP_WIDGET_STATE_MAX_BYTES;
+  } catch {
+    return false;
+  }
+}
 const ToolCallParams = z.object({
   name: z.string().min(1).max(256),
   arguments: z.record(z.string(), z.unknown()).optional(),
@@ -231,7 +233,7 @@ function handleWidgetState(
 ): void {
   const parsed = WidgetStateParams.safeParse(params);
   if (parsed.success) options.saveWidgetState(parsed.data.state);
-  else options.log("dropped widget state over the size limit");
+  else options.log("dropped widget state that is not JSON or over the size limit");
 }
 
 export function clampMcpAppHeight(height: number): number {

@@ -239,16 +239,17 @@ export class McpAppResultStore {
     const updated = await withTargetMutationLock(this.rootDir, path.dirname(dir), async () => {
       if (this.rootDir !== null && (await isWorkspaceRemovalTombstoned(this.rootDir, workspaceId)))
         throw new Error(`Widget state refused: workspace ${workspaceId} was removed`);
-      const record = await this.readRecord(filePath, toolCallId);
-      if (record === null || mcpAppWidgetStateBindingOf(record) !== binding) {
+      const read = await this.readRecordFile(filePath, toolCallId);
+      if (read === null || mcpAppWidgetStateBindingOf(read.record) !== binding) {
         throw new Error("Widget state refused: the view's result record is gone");
       }
-      const { widgetState: _previous, ...rest } = record;
+      // Patch the file's own object, so fields of a newer build survive a downgrade's write.
+      const { widgetState: _previous, ...rest } = read.raw;
+      const file = stateJson === null ? rest : { ...rest, widgetState: JSON.parse(stateJson) };
+      await writeFileAtomic(filePath, JSON.stringify(file));
+      const { widgetState: _old, ...known } = read.record;
       // Parsed back from its JSON, so memory holds exactly what the file holds.
-      const next: McpAppResultRecord =
-        stateJson === null ? rest : { ...rest, widgetState: JSON.parse(stateJson) as unknown };
-      await writeFileAtomic(filePath, JSON.stringify(next));
-      return next;
+      return stateJson === null ? known : { ...known, widgetState: file.widgetState as unknown };
     });
     this.remember(workspaceId, updated);
   }
@@ -258,11 +259,19 @@ export class McpAppResultStore {
     filePath: string,
     toolCallId: string
   ): Promise<McpAppResultRecord | null> {
+    return (await this.readRecordFile(filePath, toolCallId))?.record ?? null;
+  }
+
+  /** readRecord, plus the file's object as written (with fields this build does not know). */
+  private async readRecordFile(
+    filePath: string,
+    toolCallId: string
+  ): Promise<{ record: McpAppResultRecord; raw: Record<string, unknown> } | null> {
     try {
-      const parsed = McpAppResultRecordSchema.safeParse(
-        JSON.parse(await fs.readFile(filePath, "utf8"))
-      );
-      return parsed.success && parsed.data.toolCallId === toolCallId ? parsed.data : null;
+      const raw: unknown = JSON.parse(await fs.readFile(filePath, "utf8"));
+      const parsed = McpAppResultRecordSchema.safeParse(raw);
+      if (!parsed.success || parsed.data.toolCallId !== toolCallId) return null;
+      return { record: parsed.data, raw: raw as Record<string, unknown> };
     } catch {
       return null;
     }

@@ -362,6 +362,23 @@ describe("McpAppResultStore widget state", () => {
     expect((await store.get("ws", "c1"))?.widgetState).toBeUndefined();
   });
 
+  test("a write keeps record fields this build does not know (a newer build wrote them)", async () => {
+    using tmp = new DisposableTempDir("mcp-app-widget-state");
+    const store = new McpAppResultStore(sessionDirIn(tmp));
+    await store.record("ws", entry("c1"));
+    const record = await store.get("ws", "c1");
+    if (!record) throw new Error("expected the record");
+    const dir = path.join(tmp.path, "ws", MCP_APP_RESULT_DIR);
+    const [name] = await fs.readdir(dir);
+    const file = path.join(dir, name);
+    const raw = JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
+    await fs.writeFile(file, JSON.stringify({ ...raw, futureField: { kept: true } }));
+    await store.setWidgetState("ws", "c1", mcpAppWidgetStateBindingOf(record), { n: 1 });
+    const after = JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
+    expect(after.futureField).toEqual({ kept: true });
+    expect(after.widgetState).toEqual({ n: 1 });
+  });
+
   test("refuses state over the cap, and a missing record", async () => {
     using tmp = new DisposableTempDir("mcp-app-widget-state");
     const store = new McpAppResultStore(sessionDirIn(tmp));

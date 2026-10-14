@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { createTestApiClient } from "@/browser/testUtils";
 import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
 import {
+  flushOfflineMcpAppWidgetStates,
   mcpAppWidgetStateSeed,
   mcpAppWidgetStateTarget,
   saveMcpAppWidgetState,
@@ -87,6 +88,22 @@ describe("MCP App widget state", () => {
     saveMcpAppWidgetState(api, target, { n: 2 });
     expect(mcpAppWidgetStateSeed({ nonce: "doc-a" }, target)).toEqual({ n: 1 });
     expect(mcpAppWidgetStateSeed({ nonce: "doc-b" }, target)).toEqual({ n: 2 });
+  });
+
+  test("a write made while Xum reconnects is sent once a client is back", async () => {
+    const target = mcpAppWidgetStateTarget("ws-offline", "c1", loadedView("r10"));
+    saveMcpAppWidgetState(null, target, { n: 1 });
+    saveMcpAppWidgetState(null, target, { n: 2 });
+    const { api, writes } = deferredApi();
+    flushOfflineMcpAppWidgetStates(api);
+    await flush();
+    // Only the newest offline state is sent.
+    expect(writes.map((w) => w.state)).toEqual([{ n: 2 }]);
+    writes[0].settle(true);
+    // Sent once: a later flush has nothing left.
+    flushOfflineMcpAppWidgetStates(api);
+    await flush();
+    expect(writes).toHaveLength(1);
   });
 
   test("a view without a result record has no state to keep", () => {

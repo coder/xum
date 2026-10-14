@@ -294,6 +294,11 @@ describe("MCP Apps host router", () => {
       t.host.handleMessage({ jsonrpc: "2.0", method: "xum/widget-state", params: { state } });
     await send({ n: 1 });
     await send({ text: "x".repeat(MCP_APP_WIDGET_STATE_MAX_BYTES) });
+    // Not JSON (a view can post a cycle or a BigInt): dropped, and handleMessage still resolves.
+    const cycle: Record<string, unknown> = {};
+    cycle.self = cycle;
+    await send(cycle);
+    await send({ big: BigInt(1) });
     await send(null);
     expect(t.widgetStates).toEqual([{ n: 1 }, null]);
   });
