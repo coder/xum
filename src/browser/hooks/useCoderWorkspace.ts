@@ -78,6 +78,12 @@ interface UseCoderWorkspaceReturn {
   loadingTemplates: boolean;
   loadingPresets: boolean;
   loadingWorkspaces: boolean;
+  /**
+   * True while a list the send depends on has not answered for the current client: the presets
+   * in new mode, the workspaces in existing mode. A reconnect reload keeps the shown lists, but
+   * the server can have changed them while offline.
+   */
+  blocksSend: boolean;
 }
 
 /**
@@ -97,6 +103,34 @@ function formatCoderListError(error: unknown): string {
   const message =
     error instanceof Error ? error.message.split("\n")[0].slice(0, 200).trim() : "Unknown error";
   return message || "Unknown error";
+}
+
+/** True while the list the send of `config` depends on is not fresh (see `blocksSend`). */
+function listsBlockSend(
+  enabled: boolean,
+  config: CoderWorkspaceConfig | null,
+  workspacesFresh: boolean,
+  loadingPresets: boolean
+): boolean {
+  if (!enabled) return false;
+  return config?.existingWorkspace ? !workspacesFresh : loadingPresets;
+}
+
+/**
+ * Clears a picked workspace that a fresh list no longer offers (deleted while offline, for
+ * example): it cannot be sent, so the picker asks for another one. The picker hides deleted ones.
+ */
+function clearRemovedWorkspacePick(
+  config: CoderWorkspaceConfig | null,
+  workspaces: CoderWorkspace[],
+  onConfigChange: (config: CoderWorkspaceConfig) => void
+): void {
+  const name = config?.existingWorkspace ? config.workspaceName : undefined;
+  if (!config || !name) return;
+  const offered = workspaces.some(
+    (w) => w.name === name && w.status !== "deleted" && w.status !== "deleting"
+  );
+  if (!offered) onConfigChange({ ...config, workspaceName: undefined });
 }
 
 /** True while `config` still selects the template (and org) a presets request was made for. */
@@ -139,6 +173,9 @@ export function useCoderWorkspace({
   const [loadingTemplates, setLoadingTemplates] = useState(false);
   const [loadingPresets, setLoadingPresets] = useState(false);
   const [loadingWorkspaces, setLoadingWorkspaces] = useState(false);
+  // False until the current client's workspace list answers. Unlike `loadingWorkspaces`, a reload
+  // resets it too (#6383): the shown list stays selectable, but a send must wait for the fresh one.
+  const [workspacesFresh, setWorkspacesFresh] = useState(false);
   // What the lists show: a reload of shown data keeps it on screen instead of a spinner.
   const templatesShownRef = useRef(false);
   const workspacesShownRef = useRef(false);
@@ -270,16 +307,23 @@ export function useCoderWorkspace({
     let mounted = true;
     // Only the first load shows "loading": a reload keeps the shown workspaces.
     if (!workspacesShownRef.current) setLoadingWorkspaces(true);
+    setWorkspacesFresh(false);
     setWorkspacesError(null);
 
     api.coder
       .listWorkspaces()
       .then((result) => {
         if (!mounted) return;
+        setWorkspacesFresh(true);
         if (result.ok) {
           workspacesShownRef.current = true;
           setExistingWorkspaces(result.workspaces);
           setWorkspacesError(null);
+          clearRemovedWorkspacePick(
+            coderConfigRef.current,
+            result.workspaces,
+            onCoderConfigChangeRef.current
+          );
         } else {
           // Users reported "No workspaces found" even when the CLI failed; surface the error.
           setExistingWorkspaces([]);
@@ -287,7 +331,9 @@ export function useCoderWorkspace({
         }
       })
       .catch((error) => {
+        // A lost connection leaves the list not fresh: the next client reloads it.
         if (!mounted || isConnectionLostError(error)) return;
+        setWorkspacesFresh(true);
         setExistingWorkspaces([]);
         setWorkspacesError(formatCoderListError(error));
       })
@@ -447,5 +493,6 @@ export function useCoderWorkspace({
     loadingTemplates,
     loadingPresets,
     loadingWorkspaces,
+    blocksSend: listsBlockSend(enabled, coderConfig, workspacesFresh, loadingPresets),
   };
 }

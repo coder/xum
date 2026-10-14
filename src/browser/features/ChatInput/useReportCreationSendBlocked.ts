@@ -13,10 +13,16 @@ export interface CreationSendBlockers {
   sendInFlight: boolean;
   /** Attachments are still being processed. */
   processingAttachments: boolean;
-  /** Coder presets are loading (a send could bypass preset validation). */
-  coderPresetsLoading: boolean;
-  /** The branch list is loading or failed, for a runtime that needs a trunk (#6033, #6055). */
-  branchesNotLoaded: boolean;
+  /**
+   * The Coder list the send depends on is not fresh: the presets in new mode (a send could bypass
+   * preset validation), the workspaces in existing mode (#6383).
+   */
+  coderListsLoading: boolean;
+  /**
+   * The runtime data the send depends on is not ready: the branch list, for a runtime that needs a
+   * trunk (#6033, #6055), and the current runtime probe, for a Dev Container (#6383).
+   */
+  creationRuntimeLoading: boolean;
 }
 
 /**
