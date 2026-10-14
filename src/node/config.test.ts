@@ -2597,7 +2597,7 @@ describe("Config", () => {
       }
     });
 
-    it("keeps the config dir watch when the target folder's watch fails", async () => {
+    it("keeps watching after the target folder's watch fails", async () => {
       const dirA = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-a-"));
       const dirB = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-b-"));
       const link = path.join(tempDir, "config.json");
@@ -2620,21 +2620,20 @@ describe("Config", () => {
         fs.symlinkSync(path.join(dirA, "config.json"), link);
         let notified = Promise.withResolvers<void>();
         const unsubscribe = config.onConfigChanged(() => notified.resolve());
-        const rootWatcher = watchers.get(fs.realpathSync(tempDir));
         const targetWatcher = watchers.get(fs.realpathSync(dirA));
-        if (!rootWatcher || !targetWatcher) throw new Error("expected config and target watches");
-        const rootClose = spyOn(rootWatcher, "close");
-        // The target folder's mount went away.
+        if (!targetWatcher) throw new Error("expected a watch on the target dir");
+        // A transient failure: the link and dirA stay as they were.
         targetWatcher.emit("error", new Error("EPERM: operation not permitted"));
-        expect(rootClose).not.toHaveBeenCalled();
-        // The config dir watch still follows a relink.
-        repointLink(link, path.join(dirB, "config.json"));
-        await notified.promise;
-        notified = Promise.withResolvers<void>();
+        // The save lands in dirA, so only a reopened watch on dirA sees it.
         await new Config(tempDir).setUpdateChannel("nightly");
         await notified.promise;
-        unsubscribe();
         expect(config.getUpdateChannel()).toBe("nightly");
+        // The config dir watch still follows a relink.
+        notified = Promise.withResolvers<void>();
+        repointLink(link, path.join(dirB, "config.json"));
+        await notified.promise;
+        unsubscribe();
+        expect(config.getUpdateChannel()).toBe("npm");
       } finally {
         debugSpy.mockRestore();
         watchSpy.mockRestore();

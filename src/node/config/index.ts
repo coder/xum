@@ -1828,10 +1828,10 @@ export class Config {
     watcher.on("error", (error) => {
       log.debug("Config file watcher stopped", { dir, error });
       if (!this.configFileWatchers.includes(watcher)) return;
-      // Close only this watch: the others still see edits. A vanished dir changes the
-      // resolved dirs, so the relink check then moves the watch to an existing ancestor.
-      watcher.close();
-      this.configFileWatchers = this.configFileWatchers.filter((other) => other !== watcher);
+      // Rebuild the set instead of closing every watch for good: the relink check reopens
+      // each dir that still resolves (a vanished dir moves to an existing ancestor), and
+      // the stamp check after it reports an edit made while the watch was down.
+      this.watchedConfigFileDirsKey = null;
       this.handleConfigFileEventWithRelink();
     });
     return watcher;
