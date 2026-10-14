@@ -12,7 +12,11 @@ import {
   probeServerForBearerChallenge,
   resolveOAuthScope,
 } from "./mcpOauthService";
-import type { OAuthClientProvider, OAuthDiscoveryState } from "@modelcontextprotocol/client";
+import {
+  auth,
+  type OAuthClientProvider,
+  type OAuthDiscoveryState,
+} from "@modelcontextprotocol/client";
 import { Ok } from "@/common/types/result";
 import type { Result } from "@/common/types/result";
 import type { MCPServerOAuthConfig } from "@/common/types/mcp";
@@ -1675,6 +1679,62 @@ describe("McpOauthService OAuth flows", () => {
       scope: "read write",
     });
     expect(await service.hasAuthTokens({ serverUrl, oauth })).toBe(true);
+  });
+
+  // AuthCallReads keys each auth() call's reads by the context object the SDK passes. If an SDK
+  // update passes a new object per provider call, every write falls back to the latest read and
+  // the shared-slot race comes back silently (#6537). This pins that contract with the real auth().
+  test("the SDK's auth() passes one context object to every provider call of a refresh (#6537)", async () => {
+    await withAuthServer(async (base) => {
+      const serverUrl = `${base}/mcp`;
+      await fs.writeFile(
+        getStoreFilePath(xumHome),
+        JSON.stringify({
+          version: 2,
+          entries: {
+            [serverUrl]: {
+              serverUrl,
+              updatedAtMs: Date.now(),
+              clientInformation: { client_id: "c" },
+              tokens: { access_token: "old", token_type: "Bearer", refresh_token: "rt" },
+            },
+          },
+        })
+      );
+      const provider = await service.getAuthProviderForServer({ serverUrl });
+      if (provider === undefined) throw new Error("expected a provider");
+      const contexts = new Map<string, unknown[]>();
+      const recorded = new Proxy(provider, {
+        get(target, key, receiver) {
+          const value: unknown = Reflect.get(target, key, receiver);
+          const name = String(key);
+          if (
+            typeof value !== "function" ||
+            !/^(clientInformation|tokens|saveTokens|saveClientInformation)$/.test(name)
+          )
+            return value;
+          return (...args: unknown[]) => {
+            // The context is the last argument: (ctx) for reads, (value, ctx) for writes.
+            const ctx = name.startsWith("save") ? args[1] : args[0];
+            contexts.set(name, [...(contexts.get(name) ?? []), ctx]);
+            return (value as (...a: unknown[]) => unknown).apply(target, args);
+          };
+        },
+      });
+
+      expect(await auth(recorded, { serverUrl })).toBe("AUTHORIZED");
+
+      const all = [...contexts.values()].flat();
+      expect(contexts.get("clientInformation")?.length).toBeGreaterThan(0);
+      expect(contexts.get("tokens")?.length).toBeGreaterThan(0);
+      expect(contexts.get("saveTokens")?.length).toBeGreaterThan(0);
+      expect(all[0]).toBeDefined();
+      expect(all.every((ctx) => ctx === all[0])).toBe(true);
+      const stored = JSON.parse(await fs.readFile(getStoreFilePath(xumHome), "utf-8")) as {
+        entries: Record<string, { tokens?: { access_token: string } }>;
+      };
+      expect(stored.entries[serverUrl].tokens?.access_token).toBe("flow-token");
+    });
   });
 
   test("a grant without scope records the requested scope, and a refresh keeps it (#6141)", async () => {

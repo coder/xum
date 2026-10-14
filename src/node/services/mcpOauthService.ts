@@ -432,7 +432,12 @@ class AuthCallReads {
   }
 
   of(ctx: AuthCallContext): AuthCallRead {
-    return (ctx !== undefined ? this.byCall.get(ctx) : undefined) ?? this.latest;
+    if (ctx === undefined) return this.latest;
+    const read = this.byCall.get(ctx);
+    // The SDK contract this relies on changed: the old shared-slot race is back (#6537).
+    if (read === undefined)
+      log.debug("[MCP OAuth] A provider write has no read for its auth() call");
+    return read ?? this.latest;
   }
 }
 
