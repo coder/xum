@@ -57,6 +57,7 @@ import {
 } from "@/node/runtime/Runtime";
 import {
   coerceNonEmptyString,
+  readWorkspaceBranch,
   tryReadGitBranchMatchesOrigin,
   tryReadGitCurrentBranch,
   tryReadGitPathsClean,
@@ -1555,33 +1556,37 @@ export class WorkspaceTurnManager {
       }
     } else {
       let ownerContext: WorkspaceTurnAgentContext | undefined;
-      // Owner-side vouching for the created checkout's agent definitions requires proof
-      // that the target's base IS the branch actually checked out in the owner. The
-      // workspace name cannot prove it: branch→name sanitization is not injective
-      // (feature/foo and feature-foo both map to feature-foo) in BOTH directions — a
-      // request naming the owner's workspace name may be a distinct colliding branch, and
-      // the omitted-arg default (parentMeta.name, passed as trunkBranch to create below)
-      // may itself differ from a slash-branch owner's real branch. A different/unproven
-      // base means agents may exist only on the target branch (owner-side misses must not
-      // fail-fast) and the target branch may shadow ANY id (unreachable targets fail
-      // closed in validateWorkspaceTurnAgentIdForTarget).
-      const requestedTrunkBranch = coerceNonEmptyString(args.workspace?.trunkBranch);
-      let ownerVouchesForTargetBase = false;
-      if (requestedAgentId != null) {
-        ownerContext = buildWorkspaceAgentContext({
+      const buildOwnerContext = () =>
+        buildWorkspaceAgentContext({
           runtimeConfig: parentMeta.runtimeConfig,
           projectPath: parentMeta.projectPath,
           workspaceName: parentMeta.name,
           persistedWorkspacePath: parentEntry?.workspace.path,
           subProjectPath: parentMeta.subProjectPath,
         });
-        const effectiveTrunkBranch = requestedTrunkBranch ?? parentMeta.name;
+      // An omitted trunkBranch is the owner's branch: for a worktree owner, the branch its
+      // checkout is on, which an auto-named owner's workspace name does not name.
+      const trunkBranch =
+        coerceNonEmptyString(args.workspace?.trunkBranch) ??
+        (await readWorkspaceBranch(parentMeta.runtimeConfig, parentMeta.name, buildOwnerContext));
+      // Owner-side vouching for the created checkout's agent definitions requires proof
+      // that the target's base IS the branch actually checked out in the owner. The
+      // workspace name cannot prove it: branch→name sanitization is not injective
+      // (feature/foo and feature-foo both map to feature-foo) in BOTH directions — a
+      // request naming the owner's workspace name may be a distinct colliding branch, and
+      // the omitted-arg default (the workspace name, for owners other than worktrees) may
+      // itself differ from a slash-branch owner's real branch. A different/unproven
+      // base means agents may exist only on the target branch (owner-side misses must not
+      // fail-fast) and the target branch may shadow ANY id (unreachable targets fail
+      // closed in validateWorkspaceTurnAgentIdForTarget).
+      let ownerVouchesForTargetBase = false;
+      if (requestedAgentId != null) {
+        ownerContext = buildOwnerContext();
         const ownerBranch = await tryReadGitCurrentBranch(
           ownerContext.runtime,
           ownerContext.workspacePath
         );
-        const ownerBranchMatchesTargetBase =
-          ownerBranch != null && ownerBranch === effectiveTrunkBranch;
+        const ownerBranchMatchesTargetBase = ownerBranch != null && ownerBranch === trunkBranch;
         // Branch equality is not checkout equality: the child is created from COMMITTED
         // branch state, so uncommitted agent-definition changes in the owner (a shadow
         // added or removed) make owner-side resolution diverge from what the target will
@@ -1603,7 +1608,7 @@ export class WorkspaceTurnManager {
             ? await tryReadGitBranchMatchesOrigin(
                 ownerContext.runtime,
                 ownerContext.workspacePath,
-                effectiveTrunkBranch
+                trunkBranch
               )
             : undefined;
         // An explicit branchName can attach the worktree to an EXISTING branch of that
@@ -1617,10 +1622,11 @@ export class WorkspaceTurnManager {
           ownerCommitMatchesOrigin === true;
         // Pre-create stage: catch obviously bad ids (unknown/hidden/disabled) against the
         // OWNER's checkout before creating any workspace. Fatal only when the owner's
-        // checked-out branch provably IS the target's base (an omitted trunkBranch still
-        // resolves to parentMeta.name, which may be a DIFFERENT branch than a slash-branch
-        // owner's — that distinct branch could carry target-only agents); otherwise the
-        // miss is advisory and the target checkout is authoritative post-create.
+        // checked-out branch provably IS the target's base (an omitted trunkBranch of an owner
+        // other than a worktree still resolves to parentMeta.name, which may be a DIFFERENT
+        // branch than a slash-branch owner's — that distinct branch could carry target-only
+        // agents); otherwise the miss is advisory and the target checkout is authoritative
+        // post-create.
         const validation = await this.validateWorkspaceTurnAgentId({
           cfg,
           agentId: requestedAgentId,
@@ -1671,7 +1677,7 @@ export class WorkspaceTurnManager {
         : await this.workspaceService.create(
             parentMeta.projectPath,
             args.workspace?.branchName,
-            args.workspace?.trunkBranch ?? parentMeta.name,
+            trunkBranch,
             title,
             parentMeta.runtimeConfig,
             parentMeta.subProjectPath,

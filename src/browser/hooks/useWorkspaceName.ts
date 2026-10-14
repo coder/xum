@@ -9,6 +9,8 @@ import {
 } from "@/browser/stores/DraftStore";
 import type { WorkspaceIdentity, WorkspaceNamePersistedState } from "@/common/orpc/schemas/drafts";
 import type { NameGenerationError } from "@/common/types/errors";
+import type { WorkspaceNameGenerationRequest } from "@/common/orpc/schemas/api";
+import { createSendId } from "@/common/utils/drafts";
 import { DEFAULT_WORKSPACE_NAME_STATE, toStoredMessage } from "@/common/utils/workspaceNameState";
 import {
   validateWorkspaceBranchName,
@@ -76,9 +78,52 @@ export interface WorkspaceNameState {
   setName: (name: string) => void;
 }
 
+/** A naming handed to the backend (handOffGeneration). */
+export interface WorkspaceNameHandOff {
+  /** workspace.create's nameGeneration; names the in-flight request the backend takes over. */
+  request: WorkspaceNameGenerationRequest;
+  /** Names the message in the form again: for when no workspace was created to take it. */
+  resume: () => void;
+}
+
 export interface UseWorkspaceNameReturn extends WorkspaceNameState {
   /** Wait for any pending generation to complete, returns both name and title */
   waitForGeneration: () => Promise<WorkspaceIdentity | null>;
+  /**
+   * Hand the naming to the backend instead of waiting for it: when auto naming has no identity
+   * generated for exactly the current message, cancel the debounced or in-flight request (its
+   * late result must not land in the form) and return the hand-off. Null otherwise.
+   */
+  handOffGeneration: () => WorkspaceNameHandOff | null;
+}
+
+/**
+ * Whether auto naming still has to name `message`: generation stores lastGeneratedFor together
+ * with the identity, so a match means an identity exists for exactly this message.
+ */
+function needsGenerationFor(
+  state: Pick<WorkspaceNamePersistedState, "autoGenerate" | "lastGeneratedFor">,
+  message: string
+): boolean {
+  return (
+    state.autoGenerate &&
+    message.trim().length > 0 &&
+    state.lastGeneratedFor !== toStoredMessage(message)
+  );
+}
+
+/**
+ * The request a hand-off gives workspace.create. A request still running for exactly `message`
+ * goes with it, so the backend takes that result over, even one that lands after the hand-off
+ * drops it in the form.
+ */
+function buildHandOffRequest(
+  message: string,
+  candidates: string[],
+  running: { message: string; draftNamingId: string } | null
+): WorkspaceNameGenerationRequest {
+  const draftNamingId = running?.message === message ? running.draftNamingId : undefined;
+  return { message, candidates, draftNamingId };
 }
 
 /** Subscribed (never read) when the hook has no draft scope. */
@@ -221,6 +266,8 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     promise: Promise<WorkspaceIdentity | null>;
     resolve: (identity: WorkspaceIdentity | null) => void;
     requestId: number;
+    message: string;
+    draftNamingId: string;
   } | null>(null);
 
   // Name shown in CreationControls UI: generated name when auto, manual when not
@@ -288,7 +335,15 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
       // TypeScript doesn't understand the Promise executor runs synchronously
       // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const safeResolve = resolvePromise!;
-      generationPromiseRef.current = { promise, resolve: safeResolve, requestId };
+      // Any unique ID: a creation that hands this request off names it to the backend.
+      const draftNamingId = createSendId();
+      generationPromiseRef.current = {
+        promise,
+        resolve: safeResolve,
+        requestId,
+        message: forMessage,
+        draftNamingId,
+      };
 
       try {
         // Backend prepends the configured naming model and built-in fallbacks, then
@@ -296,6 +351,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
         const result = await api.nameGeneration.generate({
           message: forMessage,
           candidates,
+          draftNamingId,
         });
 
         // Check if this request is still current (wasn't cancelled)
@@ -346,12 +402,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     // - Auto-generation is disabled
     // - Message is empty
     // - Already generated for this message
-    if (
-      !canAutoGenerate ||
-      !autoGenerate ||
-      !message.trim() ||
-      lastGeneratedFor === toStoredMessage(message)
-    ) {
+    if (!canAutoGenerate || !needsGenerationFor({ autoGenerate, lastGeneratedFor }, message)) {
       // Clear any pending timer since conditions changed
       if (debounceTimerRef.current) {
         clearTimeout(debounceTimerRef.current);
@@ -478,6 +529,31 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     currentScope,
   ]);
 
+  const handOffGeneration = useCallback((): WorkspaceNameHandOff | null => {
+    if (!needsGenerationFor({ autoGenerate, lastGeneratedFor }, message)) return null;
+    const request = buildHandOffRequest(message, candidates, generationPromiseRef.current);
+    cancelPendingGeneration();
+    // A draft switch, an edit or a new request moves the request ID on: then the form has named
+    // (or will name) what it shows, and resuming would cancel that request for a stale message.
+    const handedOffAt = requestIdRef.current;
+    const target = currentScope();
+    return {
+      request,
+      resume: () => {
+        if (requestIdRef.current !== handedOffAt) return;
+        void generateIdentity(message, target);
+      },
+    };
+  }, [
+    autoGenerate,
+    message,
+    lastGeneratedFor,
+    cancelPendingGeneration,
+    candidates,
+    generateIdentity,
+    currentScope,
+  ]);
+
   return useMemo(
     () => ({
       name,
@@ -490,6 +566,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
       setAutoGenerate: handleSetAutoGenerate,
       setName: setNameManual,
       waitForGeneration,
+      handOffGeneration,
     }),
     [
       name,
@@ -501,6 +578,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
       handleSetAutoGenerate,
       setNameManual,
       waitForGeneration,
+      handOffGeneration,
     ]
   );
 }
