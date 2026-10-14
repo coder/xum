@@ -340,6 +340,10 @@ describe.each([...GAP_MODES])("HeartbeatSection save answers after a newer edit 
     cleanupDom = null;
   });
 
+  const serverConfig = {
+    heartbeatDefaultPrompt: "Server prompt",
+    heartbeatDefaultIntervalMs: 45 * 60_000,
+  };
   const cases = [
     { name: "prompt", label: "Default heartbeat prompt", saved: "First", newer: "Second" },
     // An empty interval clears the override (the `intervalMs: null` branch).
@@ -355,10 +359,7 @@ describe.each([...GAP_MODES])("HeartbeatSection save answers after a newer edit 
   test.each(cases.map((testCase) => [testCase.name, testCase] as const))(
     "keeps the newer %s across the reload",
     async (_name, testCase) => {
-      const first = createMockAPI({
-        heartbeatDefaultPrompt: "Server prompt",
-        heartbeatDefaultIntervalMs: 45 * 60_000,
-      });
+      const first = createMockAPI(serverConfig);
       let answerSave: (() => void) | null = null;
       const pendingSave = () => new Promise<void>((resolve) => (answerSave = resolve));
       first.api.config.updateHeartbeatDefaultPrompt = mock(pendingSave);
@@ -386,10 +387,7 @@ describe.each([...GAP_MODES])("HeartbeatSection save answers after a newer edit 
         await new Promise((resolve) => setTimeout(resolve, 0));
       });
 
-      mockApi = createMockAPI({
-        heartbeatDefaultPrompt: "Server prompt",
-        heartbeatDefaultIntervalMs: 45 * 60_000,
-      }).api;
+      mockApi = createMockAPI(serverConfig).api;
       await harness.drop();
       harness.reconnect();
       await act(async () => {

@@ -7,11 +7,7 @@ import { useEffect } from "react";
 import { installDom } from "../../../../tests/ui/dom";
 import type { APIClient } from "@/browser/contexts/API";
 import { AboutDialogProvider, useAboutDialog } from "@/browser/contexts/AboutDialogContext";
-import {
-  createConnectionHarness,
-  GAP_MODES,
-  type ConnectionHarness,
-} from "@/browser/contexts/connection.testHarness";
+import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import type { TestApiOverrides } from "@/browser/testUtils";
 import type { UpdateStatus } from "@/common/orpc/types";
@@ -45,34 +41,27 @@ function OpenAbout() {
   return <AboutDialog />;
 }
 
-/** Disabled directly, or through a disabled fieldset (happy-dom does not apply the latter). */
-function isDisabled(control: HTMLElement): boolean {
-  return (control as HTMLButtonElement).disabled || control.closest("fieldset")?.disabled === true;
-}
-
 /**
- * The names of the enabled update actions on screen (none while the dialog shows "Connecting…").
- * Names, not elements: a failed match on happy-dom elements prints their whole object graph.
+ * The enabled update actions among `names` (none while the dialog shows "Connecting…"). A
+ * disabled fieldset counts: happy-dom does not apply it to `disabled`. Names, not elements: a
+ * failed match on happy-dom elements prints their whole object graph.
  */
 function enabledActions(names: readonly string[]): string[] {
-  return actionButtons(names)
-    .filter((control) => !isDisabled(control))
-    .map((control) => control.textContent ?? "");
-}
-
-function actionButtons(names: readonly string[]): HTMLElement[] {
   const dialog = within(document.body.querySelector<HTMLElement>("[role=dialog]")!);
-  return names.flatMap((name) => [
-    ...dialog.queryAllByRole("radio", { name }),
-    ...dialog.queryAllByRole("button", { name }),
-  ]);
+  return names
+    .flatMap((name) => [
+      ...dialog.queryAllByRole("radio", { name }),
+      ...dialog.queryAllByRole("button", { name }),
+    ])
+    .filter((control) => !(control as HTMLButtonElement).disabled)
+    .filter((control) => control.closest("fieldset")?.disabled !== true)
+    .map((control) => control.textContent ?? "");
 }
 
 // Offline an update call cannot reach the server: a click would do nothing. The actions are
 // disabled while the shown update state stays, and they return after the reconnect.
 describe.each([...GAP_MODES])("AboutDialog while offline (%s)", (mode) => {
   let cleanupDom: (() => void) | null = null;
-  let harness: ConnectionHarness;
 
   beforeEach(() => {
     cleanupDom = installDom();
@@ -99,7 +88,7 @@ describe.each([...GAP_MODES])("AboutDialog while offline (%s)", (mode) => {
     "disables the %s actions while offline",
     async (_type, testCase) => {
       status = testCase.status;
-      harness = createConnectionHarness(mode, serverOverrides);
+      const harness = createConnectionHarness(mode, serverOverrides);
       render(
         <harness.Wrapper>
           <ThemeProvider forcedTheme="dark">
