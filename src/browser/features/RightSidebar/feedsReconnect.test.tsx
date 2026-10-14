@@ -15,7 +15,7 @@ import type { TestApiOverrides } from "@/browser/testUtils";
 import type { DevToolsRunSummary } from "@/common/types/devtools";
 import type { AvailableWorkflow, WorkflowRunRecord } from "@/common/types/workflow";
 import { useDevToolsSubscription } from "./DevToolsTab/useDevToolsSubscription";
-import { useWorkflowRuns } from "./Workflows/useWorkflowRuns";
+import { useWorkflowRunLiveSnapshot, useWorkflowRuns } from "./Workflows/useWorkflowRuns";
 import { WorkflowsTab } from "./Workflows/WorkflowsTab";
 
 /*
@@ -159,6 +159,30 @@ describe.each([...GAP_MODES])("live feeds across a dropped connection (%s)", (mo
 
     next.resolve(["run-b"]);
     await waitFor(() => expect(ids(view.result.current.runs)).toEqual(["run-b"]));
+  });
+
+  // A lost connection ends the stream without an error (the next client subscribes again). A
+  // server cancel on a live socket also arrives as an AbortError, but no new client follows: it
+  // must be reported, not leave the kept runs looking current.
+  test("the workflow feed reports a server cancel before the snapshot, not a lost connection", async () => {
+    const view = renderHook(
+      () => ({
+        feed: useWorkflowRuns("ws-1"),
+        live: useWorkflowRunLiveSnapshot({ workspaceId: "ws-1", runId: "run-a", enabled: true }),
+      }),
+      { wrapper: Wrapper }
+    );
+    await waitFor(() => expect(ids(view.result.current.feed.runs)).toEqual(["run-a"]));
+
+    await drop();
+    expect(view.result.current.feed.error).toBeNull();
+    expect(view.result.current.live.failed).toBe(false);
+
+    workflowSnapshot = () =>
+      Promise.reject(new DOMException("cancelled by the server", "AbortError"));
+    await reconnect();
+    await waitFor(() => expect(view.result.current.feed.error).toBe("cancelled by the server"));
+    expect(view.result.current.live.failed).toBe(true);
   });
 
   test("the Workflows tab keeps its empty state and script list while it reloads", async () => {

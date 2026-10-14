@@ -1,7 +1,7 @@
 import { useContext, useEffect, useRef, useState } from "react";
 
 import { APIContext, useAPI, type APIClient } from "@/browser/contexts/API";
-import { isAbortError } from "@/browser/utils/isAbortError";
+import { isStreamFailure } from "@/browser/contexts/connectionLink";
 import type { WorkflowRunRecord, WorkflowRunStreamEvent } from "@/common/types/workflow";
 import { assertNever } from "@/common/utils/assertNever";
 
@@ -101,7 +101,10 @@ export function useWorkflowRuns(workspaceId: string): UseWorkflowRunsResult {
     };
 
     subscribe().catch((subscriptionError: unknown) => {
-      if (signal.aborted || isAbortError(subscriptionError)) {
+      // Only this effect's own abort and a lost connection (the next client subscribes again)
+      // are quiet. A server cancel is also an AbortError, but nothing re-subscribes after it:
+      // the kept runs would look current, so it is reported.
+      if (!isStreamFailure(subscriptionError, signal)) {
         return;
       }
       setError(
@@ -192,7 +195,8 @@ function createWorkspaceWorkflowFeed(api: APIClient, workspaceId: string): Works
   };
 
   pump().catch((subscriptionError: unknown) => {
-    if (signal.aborted || isAbortError(subscriptionError)) {
+    // As in useWorkflowRuns: a server cancel fails the feed, a lost connection does not.
+    if (!isStreamFailure(subscriptionError, signal)) {
       return;
     }
     feed.failed = true;
