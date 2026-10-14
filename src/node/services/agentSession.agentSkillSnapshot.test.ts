@@ -382,12 +382,8 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     expect(getMessageText(messages[2])).toBe("do X");
   });
 
-  it("maps a plugin skill's shadowed siblings in its snapshot", async () => {
-    // A project `tdd` shadows pstack's `tdd`, which poteto-mode names by bare name.
-    const { workspacePath } = await createTestWorkspaceWithSkill({
-      skillName: "tdd",
-      skillBody: "PROJECT-TDD",
-    });
+  /** A project plugin `pstack` whose `poteto-mode` names its sibling `tdd` by bare name. */
+  async function writePstackPlugin(workspacePath: string): Promise<void> {
     const pluginDir = path.join(workspacePath, ".mux", "plugins", "pstack");
     await fs.mkdir(pluginDir, { recursive: true });
     await fs.writeFile(
@@ -399,6 +395,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     );
     for (const [name, body] of [
       ["tdd", "PSTACK-TDD"],
+      ["how", "PSTACK-HOW"],
       ["poteto-mode", "See the **tdd** skill. POTETO-BODY"],
     ]) {
       const skillDir = path.join(pluginDir, "skills", name);
@@ -408,6 +405,19 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
         `---\nname: ${name}\ndescription: Plugin ${name}\n---\n\n${body}\n`
       );
     }
+  }
+
+  it("maps a plugin skill's shadowed siblings in its snapshot", async () => {
+    // Project `tdd` and `how` shadow pstack's. Two shadowed siblings, so a note
+    // wrongly put on the project `tdd` would still map `how` (the self-skip
+    // alone would hide a `tdd`-only note).
+    const { workspacePath } = await createTestWorkspaceWithSkills({
+      skills: [
+        { skillName: "tdd", skillBody: "PROJECT-TDD" },
+        { skillName: "how", skillBody: "PROJECT-HOW" },
+      ],
+    });
+    await writePstackPlugin(workspacePath);
     const { session, messages } = await createSessionHarness({ workspacePath });
 
     const result = await session.sendMessage("do X", {
@@ -428,6 +438,41 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     expect(poteto.indexOf("`pstack:tdd`")).toBeLessThan(poteto.indexOf("POTETO-BODY"));
     expect(bare).toContain("PROJECT-TDD");
     expect(bare).not.toContain("pstack:");
+  });
+
+  it("sends a plugin skill snapshot without the sibling note when discovery fails", async () => {
+    const { workspacePath } = await createTestWorkspaceWithSkill({
+      skillName: "tdd",
+      skillBody: "PROJECT-TDD",
+    });
+    await writePstackPlugin(workspacePath);
+    const { session, messages } = await createSessionHarness({ workspacePath });
+    // The note is advisory: a failed discovery must not fail the send.
+    let discoverCalls = 0;
+    const discover = spyOn(agentSkillsService, "discoverAgentSkills").mockRejectedValue(
+      new RuntimeError("ssh: Connection refused", "network")
+    );
+
+    const result = await session
+      .sendMessage("do X", {
+        model: "anthropic:claude-3-5-sonnet-latest",
+        agentId: "exec",
+        muxMetadata: {
+          type: "normal",
+          agentSkillRefs: [{ skillName: "poteto-mode", scope: "project", source: "slash" }],
+        },
+      })
+      .finally(() => {
+        // Read before mockRestore, which clears the call records.
+        discoverCalls = discover.mock.calls.length;
+        discover.mockRestore();
+      });
+
+    expect(result.success).toBe(true);
+    expect(discoverCalls).toBeGreaterThan(0);
+    const poteto = getMessageText(messages[0]);
+    expect(poteto).toContain("POTETO-BODY");
+    expect(poteto).not.toContain("pstack:");
   });
 
   it("dedupes identical skill snapshots when recently inserted", async () => {

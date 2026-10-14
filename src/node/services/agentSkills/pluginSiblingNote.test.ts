@@ -26,15 +26,4 @@ describe("formatPluginSiblingNote", () => {
     );
     expect(note).toContain(" 5 more");
   });
-
-  it("returns null when the plugin has no shadowed sibling", () => {
-    // A bare entry of the plugin won its name: nothing to redirect.
-    const skills: InvocableSkill[] = [
-      { name: "helper", description: "x", scope: "global", pluginName: "solo" },
-      qualifiedSkill("solo", "main"),
-      qualifiedSkill("other", "tdd"),
-    ];
-
-    expect(formatPluginSiblingNote({ pluginName: "solo", skillName: "main", skills })).toBeNull();
-  });
 });

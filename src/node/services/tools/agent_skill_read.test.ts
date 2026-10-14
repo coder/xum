@@ -558,7 +558,8 @@ describe("agent_skill_read", () => {
         await Promise.resolve(tool.execute!({ name }, mockToolCallOptions))
       );
       if (!parsed.success) throw new Error(parsed.error);
-      return parsed.skill.body.trim();
+      // trimEnd only: a stray leading separator would change the body.
+      return parsed.skill.body.trimEnd();
     }
 
     it("maps shadowed siblings to qualified names on plugin skills only", async () => {
