@@ -5272,7 +5272,7 @@ export class MCPServerManager {
     toolName: string,
     request: { instanceToken: string; confirmed: boolean }
   ): Error | null {
-    if (this.settingsInstanceToken(instance) !== request.instanceToken)
+    if (!this.isSettingsTokenAccepted(this.settingsInstanceToken(instance), request.instanceToken))
       return staleSettingsInstanceError(serverName);
     const action = this.settingsToolAction(instance, workspaceId, serverName, toolName);
     if (action === undefined) return new Error(`'${serverName}' has no tool named '${toolName}'`);
@@ -5318,6 +5318,19 @@ export class MCPServerManager {
    * same schema. Bounded: the oldest token is forgotten first, and its save is refused.
    */
   private readonly settingsSchemaHashes = new Map<string, string>();
+
+  /**
+   * Whether a request that names `requestToken` (the dialog's read) may act on the instance with
+   * `currentToken`: the same instance, or a restarted one (idle stop, crash restart) whose last
+   * read showed the same schema. Saves (runSettingsSave, right after a fresh read) and tool
+   * actions (settingsToolRefusal, against the instance's last read) share this rule. An instance
+   * no read has seen yet has no hash and is refused.
+   */
+  private isSettingsTokenAccepted(currentToken: string, requestToken: string): boolean {
+    if (currentToken === requestToken) return true;
+    const current = this.settingsSchemaHashes.get(currentToken);
+    return current !== undefined && current === this.settingsSchemaHashes.get(requestToken);
+  }
 
   private rememberSettingsSchema(instanceToken: string, snapshot: MCPSettingsSnapshot): void {
     this.settingsSchemaHashes.delete(instanceToken);
@@ -5366,10 +5379,7 @@ export class MCPServerManager {
     if (prior === null) throw new Error(`MCP server '${serverName}' has no settings`);
     // Another instance (restarted or replaced since the dialog read): the save still lands when
     // it shows the schema the dialog validated against, else the user must reopen.
-    if (
-      prior.instanceToken !== instanceToken &&
-      this.settingsSchemaHashes.get(instanceToken) !== settingsSchemaHash(prior)
-    )
+    if (!this.isSettingsTokenAccepted(prior.instanceToken, instanceToken))
       throw staleSettingsInstanceError(serverName);
     const values = await this.updateSettings(
       workspaceId,
