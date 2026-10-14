@@ -612,15 +612,30 @@ async function runGit(
  * so a small plugin in a monorepo with large root files could not install.
  * cloneRef checks out after narrowToSubpath has set the sparse pattern.
  */
-function sparseCloneFlags(subpath: string | undefined): string[] {
+function sparseCloneFlags(subpath: string | undefined, url: string): string[] {
   // --no-local: for a plain local-path source, git's local-clone shortcut
   // ignores --depth and --filter and copies the whole repository history.
-  return subpath === undefined ? [] : ["--filter=blob:none", "--no-checkout", "--no-local"];
+  return subpath === undefined
+    ? []
+    : ["--filter=blob:none", "--no-checkout", "--no-local", ...localUploadPackFlags(url)];
 }
 
 /** `git fetch` counterpart of sparseCloneFlags (the sparse checkout is set before checkout). */
-function partialFetchFlags(subpath: string | undefined): string[] {
-  return subpath === undefined ? [] : ["--filter=blob:none"];
+function partialFetchFlags(subpath: string | undefined, url: string): string[] {
+  return subpath === undefined ? [] : ["--filter=blob:none", ...localUploadPackFlags(url)];
+}
+
+/**
+ * For a local source (absolute path or file://), git runs the source's
+ * upload-pack on this machine, and that upload-pack ignores --filter unless
+ * the SOURCE repository sets uploadpack.allowFilter (off by default). Every
+ * blob of the commit would then land in the clone and count toward its quota.
+ * Enabling it on the command line needs no change to the user's repository.
+ * Remote transports keep their server's own setting.
+ */
+function localUploadPackFlags(url: string): string[] {
+  const isLocal = url.startsWith("file://") || path.isAbsolute(url);
+  return isLocal ? ["--upload-pack", "git -c uploadpack.allowFilter=true upload-pack"] : [];
 }
 
 /** Git tree-entry modes that are not folders, for the subpath error. Other modes are files. */
@@ -1795,7 +1810,7 @@ export class AgentPluginInstallService {
         "--depth",
         "1",
         "--single-branch",
-        ...sparseCloneFlags(subpath),
+        ...sparseCloneFlags(subpath, url),
         "--branch",
         ref,
         "-c",
@@ -1826,7 +1841,7 @@ export class AgentPluginInstallService {
     // `init` + `fetch --filter` configures the promisor remote on its own, so
     // the sparse checkout below can lazy-fetch just the subpath's blobs.
     await runGit(
-      ["-C", dir, "fetch", "--depth", "1", ...partialFetchFlags(subpath), "origin", sha],
+      ["-C", dir, "fetch", "--depth", "1", ...partialFetchFlags(subpath, url), "origin", sha],
       { diskQuota }
     );
     // Must precede the checkout: a full checkout would materialize (and

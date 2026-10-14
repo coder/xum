@@ -4757,11 +4757,9 @@ describe("AgentPluginInstallService", () => {
     beforeEach(async () => {
       monoDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-plugin-mono-"));
       await initRemote(monoDir);
-      // Staging fetches with --filter=blob:none, which local-path remotes
-      // ignore; a file:// URL plus allowFilter in the remote's OWN config
-      // (staging runs with global/system git config disabled) makes the
-      // fixture take the real partial-clone path.
-      await git(monoDir, "config", "uploadpack.allowFilter", "true");
+      // No uploadpack.allowFilter here on purpose: like most local repos,
+      // the fixture keeps git's default, and the installer must enable the
+      // partial clone for local sources by itself.
       await git(monoDir, "config", "uploadpack.allowAnySHA1InWant", "true");
       monoUrl = pathToFileURL(monoDir).href;
       // The repo ROOT is a different plugin: staging the root instead of the
