@@ -144,6 +144,38 @@ describe("useWorkspaceName persisted draft state", () => {
       expect(view.result.current.name).toBe("");
     });
 
+    test("a resume after a switch to another draft leaves that draft's naming alone", async () => {
+      const draftB = Promise.withResolvers<Awaited<ReturnType<typeof generateMock>>>();
+      // Draft A's request is handed off and never answers; draft B's answers below.
+      generateMock.mockImplementationOnce(() => new Promise(() => undefined));
+      generateMock.mockImplementationOnce(() => draftB.promise);
+      const view = renderHook(
+        (props: { message: string; scopeId: string }) =>
+          useWorkspaceName({ message: props.message, debounceMs: 1, scopeId: props.scopeId }),
+        { wrapper: Wrapper, initialProps: { message: "fix the sidebar", scopeId: "draft-a" } }
+      );
+      await waitFor(() => expect(generateMock).toHaveBeenCalledTimes(1));
+      const handedOff: Array<ReturnType<typeof view.result.current.handOffGeneration>> = [];
+      act(() => {
+        handedOff.push(view.result.current.handOffGeneration());
+      });
+
+      view.rerender({ message: "rework the layout", scopeId: "draft-b" });
+      await waitFor(() => expect(generateMock).toHaveBeenCalledTimes(2));
+      // Draft A's create fails only now.
+      act(() => handedOff[0]?.resume());
+      await act(async () => {
+        draftB.resolve({
+          success: true as const,
+          data: { name: "layout-x2p4", title: "Rework layout", modelUsed: "test:model" },
+        });
+        await draftB.promise;
+      });
+
+      expect(view.result.current.name).toBe("layout-x2p4");
+      expect(generateMock).toHaveBeenCalledTimes(2);
+    });
+
     test("returns null when a name was generated for the current message", async () => {
       const view = renderWorkspaceName("fix the sidebar");
       await waitFor(() => expect(view.result.current.name).toBe("quotes-a1b2"));

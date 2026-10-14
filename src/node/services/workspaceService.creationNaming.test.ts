@@ -14,6 +14,7 @@ import { Err, Ok, type Result } from "@/common/types/result";
 import type { NameGenerationError } from "@/common/types/errors";
 import type { WorkspaceNameGenerationRequest } from "@/common/orpc/schemas/api";
 import { formatNameGenerationError } from "@/common/utils/errors/formatNameGenerationError";
+import * as gitModule from "@/node/git";
 import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
 import type { WorkspaceService } from "./workspaceService";
 import * as workspaceTitleGenerator from "./workspaceTitleGenerator";
@@ -293,6 +294,34 @@ describe("create() with nameGeneration", () => {
     expect(branchExists(projectPath, created.name)).toBe(false);
     expect(branchExists(projectPath, "sidebar-k3m9")).toBe(false);
     expect(entry(created.id)).toBeUndefined();
+  }, 30_000);
+
+  test("a structural rename while the backend names the workspace is refused", async () => {
+    const naming = createDeferred<IdentityResult>();
+    generateIdentity.mockImplementation(() => naming.promise);
+
+    const created = await createNamed();
+    await waitForNamingStep(created.id);
+    // It would move the checkout and the provisional branch under the pending branch rename.
+    expect((await service.rename(created.id, "renamed")).success).toBe(false);
+
+    naming.resolve(GENERATED);
+    await harness.initStateManager.waitForInit(created.id);
+    expect(await readObserved(created.path)).toBe(`sidebar-k3m9 ${created.name}`);
+  }, 30_000);
+
+  test("a creation that attached to an existing branch keeps that branch", async () => {
+    generateIdentity.mockResolvedValue(GENERATED);
+    git(projectPath, "branch", "workspace-1");
+    // The provisional name is picked while the branch listing fails, so it is a taken one.
+    spyOn(gitModule, "listLocalBranches").mockRejectedValueOnce(new Error("listing failed"));
+
+    const created = await createNamed();
+    await harness.initStateManager.waitForInit(created.id);
+
+    expect(created.name).toBe("workspace-1");
+    expect(await readObserved(created.path)).toBe("workspace-1 workspace-1");
+    expect(branchExists(projectPath, "sidebar-k3m9")).toBe(false);
   }, 30_000);
 
   test("archive during the naming wait cancels the naming and keeps the branch", async () => {

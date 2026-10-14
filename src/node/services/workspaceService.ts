@@ -4149,13 +4149,17 @@ export class WorkspaceService
       workspaceId,
       args.workspaceName,
       args.naming,
+      args.createdBranch,
       () => this.grantPendingDefaultUnrelatedWorkspaceConsent(workspaceId)
     );
   }
 
   /**
    * The init of a new workspace's populated checkout: a backend-named workspace's branch rename
-   * first, then `beforeInit`, then the init hook.
+   * first, then `beforeInit`, then the init hook. A backend-named workspace holds the init use
+   * lease (#4857) from before its naming wait, not only while the hook runs: a structural rename
+   * meanwhile, by this backend or another, would move the checkout and the provisional branch
+   * under the branch rename and the hook. runBackgroundInit's own hold nests inside it.
    */
   private async runCreatedWorkspaceInit(
     runtime: Runtime,
@@ -4163,21 +4167,33 @@ export class WorkspaceService
     workspaceId: string,
     workspaceName: string,
     naming: CreationNaming | undefined,
+    createdBranch: boolean,
     beforeInit?: () => Promise<void>
   ): Promise<void> {
-    if (naming) {
-      await this.renameBranchAfterCreationNaming(runtime, initParams, workspaceName, naming);
-      // Removal may have started during the naming wait; it now owns the checkout.
-      if (this.removingWorkspaces.has(workspaceId)) return;
-    }
-    await beforeInit?.();
-    await runBackgroundInit(
-      runtime,
-      initParams,
-      workspaceId,
-      workspaceUseLeasesFor(this.config),
-      log
-    );
+    const useLeases = workspaceUseLeasesFor(this.config);
+    const init = async () => {
+      if (naming) {
+        await this.renameBranchAfterCreationNaming(
+          runtime,
+          initParams,
+          workspaceName,
+          naming,
+          createdBranch
+        );
+        // Removal may have started during the naming wait; it now owns the checkout.
+        if (this.removingWorkspaces.has(workspaceId)) return;
+      }
+      await beforeInit?.();
+      await runBackgroundInit(runtime, initParams, workspaceId, useLeases, log);
+    };
+    if (!naming) return init();
+    await withInitUseLease(useLeases, workspaceId, init).catch((error: unknown) => {
+      // The hold refuses while another backend mutates the workspace: neither the rename nor the
+      // hook ran.
+      naming.settleBranch();
+      initParams.initLogger.logStderr(`Initialization failed: ${getErrorMessage(error)}`);
+      initParams.initLogger.logComplete(-1);
+    });
   }
 
   setWorkspaceGoalService(service: WorkspaceGoalService): void {
@@ -6610,6 +6626,9 @@ export class WorkspaceService
       let finalWorkspaceName = initialWorkspaceName;
       const hasSanitizedWorkspaceName = finalBranchName !== finalWorkspaceName;
       let createResult: WorkspaceCreationResult;
+      // Whether this creation made its branch: undoing the creation deletes only such a branch,
+      // and a backend-named workspace renames only such a branch.
+      let createdBranch = false;
 
       // A name another workspace's plan file uses (#5139) is occupied on every runtime, like a
       // taken checkout directory: it gets the same collision suffix (or, for a sanitized branch
@@ -6660,6 +6679,7 @@ export class WorkspaceService
           deferMaterialization:
             options?.awaitMaterialization !== true && runtime.materializeWorkspace !== undefined,
         });
+        createdBranch = createResult.createdBranch === true;
 
         if (createResult.success) break;
 
@@ -6756,9 +6776,7 @@ export class WorkspaceService
             initAbortController,
             // Force is what removes an unpopulated or hook-dirtied checkout, and its `branch -D`
             // is safe only on a branch this creation made.
-            checkout:
-              // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-              createResult!.createdBranch === true ? "force-delete" : "force-delete-keep-branch",
+            checkout: createdBranch ? "force-delete" : "force-delete-keep-branch",
           });
         // #4745: nothing references this checkout before the registration write lands; undo the
         // creation, then fail with the failed step's own error.
@@ -6947,8 +6965,7 @@ export class WorkspaceService
                 initParams,
                 pending: pendingMaterialization,
                 initAbortController,
-                // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-                createdBranch: createResult!.createdBranch === true,
+                createdBranch,
                 naming,
                 // Removal, failed checkout or failed sanitization: the default never applies,
                 // and the branch is never renamed.
@@ -6961,7 +6978,8 @@ export class WorkspaceService
                 initParams,
                 workspaceId,
                 finalWorkspaceName,
-                naming
+                naming,
+                createdBranch
               )
         );
       } else {
@@ -6982,8 +7000,7 @@ export class WorkspaceService
       return Ok({
         metadata: this.enrichFrontendMetadata(completeMetadata),
         // Lets a caller that undoes this creation keep a branch it merely reused (#4819).
-        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-        createdBranch: createResult!.createdBranch === true,
+        createdBranch,
       });
     } catch (error) {
       initLogger.logComplete(-1);
@@ -10927,7 +10944,8 @@ export class WorkspaceService
     runtime: Runtime,
     initParams: WorkspaceInitParams,
     workspaceName: string,
-    naming: CreationNaming
+    naming: CreationNaming,
+    createdBranch: boolean
   ): Promise<void> {
     initParams.initLogger.logStep("Naming branch...");
     // Never throws: the init must run whatever happens to the rename.
@@ -10935,7 +10953,8 @@ export class WorkspaceService
       runtime,
       initParams,
       workspaceName,
-      naming
+      naming,
+      createdBranch
     ).catch((error: unknown) => Err(getErrorMessage(error)));
     naming.settleBranch();
     if (renamed.success) {
@@ -10954,8 +10973,12 @@ export class WorkspaceService
     runtime: Runtime,
     initParams: WorkspaceInitParams,
     workspaceName: string,
-    naming: CreationNaming
+    naming: CreationNaming,
+    createdBranch: boolean
   ): Promise<Result<string, string>> {
+    // The creation attached to a branch that already existed (another process made it after the
+    // provisional name was picked): that branch is not this workspace's to rename.
+    if (!createdBranch) return Err("the branch existed before this workspace");
     const waited = await raceWithAbortAndTimeout(naming.outcome, {
       signal: initParams.abortSignal,
     });

@@ -548,9 +548,13 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     if (!needsGenerationFor({ autoGenerate, lastGeneratedFor }, message)) return null;
     const request = buildHandOffRequest(message, candidates, generationPromiseRef.current);
     cancelPendingGeneration();
+    // A draft switch, an edit or a new request moves the request ID on: then the form has named
+    // (or will name) what it shows, and resuming would cancel that request for a stale message.
+    const handedOffAt = requestIdRef.current;
     return {
       request,
       resume: () => {
+        if (requestIdRef.current !== handedOffAt) return;
         void generateIdentity(message);
       },
     };
