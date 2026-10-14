@@ -123,6 +123,7 @@ A skill is a directory named after the skill:
 ```
 
 Skill directory names must match `^[a-z0-9]+(?:-[a-z0-9]+)*$` (1–64 chars).
+The directory name is the skill ID. A directory name that does not match is an error, and Xum does not load the skill.
 
 ## Bundled files and the skill directory
 
@@ -164,7 +165,7 @@ Xum enforces a 1MB maximum file size for `SKILL.md`.
 
 Required fields:
 
-- `name`: must match the directory name
+- `name`: must match the directory name (see [Display names](#display-names))
 - `description`: short summary shown in Xum’s skills index
 
 Optional fields:
@@ -180,6 +181,21 @@ Optional fields:
 - `paths` (list or comma-separated string) — globs that limit the skill to matching files (see [Path-scoped skills](#path-scoped-skills)).
 
 Xum ignores unknown frontmatter keys (for example `allowed-tools`).
+
+### Display names
+
+Some skills from other tools set a `name` that is not kebab-case or is not the directory name, for example `name: Poteto Mode` in `poteto-mode/`.
+Xum loads such a skill from a project, global or plugin skills root under its directory name.
+Xum shows the `name` as a display name in the slash menu and the skills list, with a warning.
+The display name must be a single line of at most 64 characters, with no control or invisible formatting characters.
+
+The skill ID stays the directory name:
+
+- Invoke the skill as `/poteto-mode`.
+- The agent loads it with `agent_skill_read({ name: "poteto-mode" })`.
+- A plugin skill is also reachable as `<plugin>:poteto-mode`.
+
+Set `name` to the directory name to remove the warning. A missing `name` is still an error.
 
 ## Controlling who invokes a skill
 

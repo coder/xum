@@ -30,6 +30,16 @@ import { MCP_APP_ENTRYPOINT_NOT_CONNECTED } from "@/browser/features/RightSideba
 import { CommandIds } from "@/browser/utils/commandIds";
 import type { OpenLocalServerResult, RemoteConnectionApi } from "@/common/types/remoteConnection";
 
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { RIGHT_SIDEBAR_COLLAPSED_KEY, getRightSidebarLayoutKey } from "@/common/constants/storage";
+import { focusInstructionsTab } from "@/browser/utils/instructionsTabFocus";
+import { readRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
+import {
+  getDefaultRightSidebarLayoutState,
+  getFocusedActiveTab,
+  selectOrAddTab,
+} from "@/browser/utils/rightSidebarLayout";
+
 const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
   const userProjects = new Map<string, ProjectConfig>();
   userProjects.set("/repo/a", {
@@ -2395,6 +2405,76 @@ describe("Right Sidebar: New Tab palette action", () => {
       }
     });
   });
+});
+
+describe("explicit sidebar navigation from a collapsed chat", () => {
+  test.each([null, true])("Instructions opens with collapse preference %s", async (collapsed) => {
+    await withTestWindow(() => {
+      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, collapsed);
+      focusInstructionsTab("w1");
+      expect(readPersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true)).toBe(false);
+      expect(getFocusedActiveTab(readRightSidebarLayout("w1"), "new")).toBe("instructions");
+    });
+  });
+
+  test.each([null, true])("Add Tool opens with collapse preference %s", async (collapsed) => {
+    await withTestWindow(async () => {
+      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, collapsed);
+      const action = getActions().find((entry) => entry.id === CommandIds.navRightSidebarAddTool());
+      await action!.prompt!.onSubmit({ tool: "review" });
+      expect(readPersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true)).toBe(false);
+      const layout = readRightSidebarLayout("w1");
+      expect(layout.root).toMatchObject({ tabs: ["review"], activeTab: "review" });
+    });
+  });
+
+  test.each(["horizontal", "vertical"] as const)(
+    "splitting %s reveals the panes",
+    async (direction) => {
+      await withTestWindow(async () => {
+        const id =
+          direction === "horizontal"
+            ? CommandIds.navRightSidebarSplitHorizontal()
+            : CommandIds.navRightSidebarSplitVertical();
+        await getActions()
+          .find((entry) => entry.id === id)!
+          .run();
+        expect(readPersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true)).toBe(false);
+        expect(readRightSidebarLayout("w1").root).toMatchObject({ type: "split", direction });
+      });
+    }
+  );
+
+  test.each(["focus", "add"])(
+    "%s terminal reveals an existing session, but does not create one",
+    async (actionType) => {
+      await withTestWindow(async () => {
+        const actions = getActions();
+        const run = async () => {
+          if (actionType === "focus") {
+            await actions
+              .find((entry) => entry.id === CommandIds.navRightSidebarFocusTerminal())!
+              .run();
+          } else {
+            await actions
+              .find((entry) => entry.id === CommandIds.navRightSidebarAddTool())!
+              .prompt!.onSubmit({ tool: "terminal" });
+          }
+        };
+        await run();
+        // With no session there is nothing to focus: leave the new chat collapsed.
+        expect(readPersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true)).toBe(true);
+        const layout = selectOrAddTab(
+          getDefaultRightSidebarLayoutState("terminal:session-1"),
+          "costs"
+        );
+        updatePersistedState(getRightSidebarLayoutKey("w1"), layout);
+        await run();
+        expect(readPersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true)).toBe(false);
+        expect(getFocusedActiveTab(readRightSidebarLayout("w1"), "new")).toBe("terminal:session-1");
+      });
+    }
+  );
 });
 
 describe("Right Sidebar: Add Tool palette action (#5767)", () => {

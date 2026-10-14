@@ -132,6 +132,11 @@ export const AgentSkillDescriptorSchema = z.object({
   paths: z.array(z.string().min(1)).min(1).optional(),
   /** Agent Plugins: contributing plugin name (absent for non-plugin skills). */
   pluginName: z.string().min(1).optional(),
+  /**
+   * Raw SKILL.md `name` when it is not the skill ID (the directory name). User-facing
+   * only (slash menu, skill indicator); never model-facing.
+   */
+  displayName: z.string().min(1).max(64).optional(),
 });
 
 export const AgentSkillPackageSchema = z
@@ -179,4 +184,6 @@ export const AgentSkillListResultSchema = z.object({
    * reachable as `<pluginName>:<name>`. Omitted when empty.
    */
   shadowedPluginSkills: z.array(AgentSkillDescriptorSchema).optional(),
+  /** Loaded skills with a non-fatal problem (e.g. a display name). Omitted when empty. */
+  skillWarnings: z.array(AgentSkillIssueSchema).optional(),
 });

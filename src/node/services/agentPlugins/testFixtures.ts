@@ -6,7 +6,10 @@ import type {
   AgentPluginInstallEntry,
 } from "@/common/config/schemas/agentPluginInstalls";
 import { SkillNameSchema } from "@/common/orpc/schemas";
-import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
+import {
+  parseSkillMarkdown,
+  skillConsentFrontmatter,
+} from "@/node/services/agentSkills/parseSkillMarkdown";
 import {
   serverConsentFingerprint,
   skillConsentFingerprint,
@@ -69,15 +72,17 @@ export async function reviewedComponentConsent(args: {
       } catch {
         continue;
       }
-      const { frontmatter } = parseSkillMarkdown({
+      // Mirrors the install review (installService collectSkills).
+      const parsed = parseSkillMarkdown({
         content,
         byteSize: Buffer.byteLength(content),
         directoryName: directoryName.data,
+        allowDisplayName: true,
       });
       // The scan keeps the first skill of a name, in declared root order.
-      consent.skills[frontmatter.name] ??= skillConsentFingerprint({
+      consent.skills[parsed.frontmatter.name] ??= skillConsentFingerprint({
         relativeDir: path.relative(plugin.rootPath, path.join(skillsDir, dirName)),
-        frontmatter,
+        frontmatter: skillConsentFrontmatter(parsed),
       });
     }
   }

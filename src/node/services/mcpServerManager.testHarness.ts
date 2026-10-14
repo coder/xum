@@ -57,7 +57,16 @@ export interface FakeServerBehavior {
   /** Raw tools/call for plugin hooks (MCPServerManager.callToolForPluginHook). */
   callToolForHook?: MCPClientHandle["callToolForHook"];
   /** OpenAI structured settings client methods. */
-  settings?: Partial<Pick<MCPClientHandle, "settingsCapability" | "callSettingsTool">>;
+  settings?: Partial<
+    Pick<
+      MCPClientHandle,
+      | "settingsCapability"
+      | "callSettingsTool"
+      | "settingsToolAction"
+      | "callSettingsActionTool"
+      | "relistTools"
+    >
+  >;
 }
 
 type BehaviorSource =
@@ -281,6 +290,8 @@ export class FakeMcpServers {
         behavior.callToolForHook ?? (() => Promise.reject(new Error("no hook tool in this fake"))),
       ...behavior.apps,
       settingsCapability: () => undefined,
+      settingsToolAction: () => undefined,
+      relistTools: () => Promise.resolve(),
       ...behavior.settings,
     };
     // Tests supply loosely typed prompt/result fixtures; the manager validates them itself.

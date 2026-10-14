@@ -14,6 +14,7 @@ import {
 } from "./mcpOauthService";
 import type { OAuthClientProvider, OAuthDiscoveryState } from "@modelcontextprotocol/client";
 import { Ok } from "@/common/types/result";
+import type { TelemetryService } from "@/node/services/telemetryService";
 import type { Result } from "@/common/types/result";
 import type { MCPServerOAuthConfig } from "@/common/types/mcp";
 import type {
@@ -860,13 +861,19 @@ describe("McpOauthService OAuth flows", () => {
 
   // A sign-in's deadline and Cancel must cover authorization-server discovery: a stalled
   // metadata request must not keep the start pending (and the desktop listener bound) (#6164).
+  // A flow that settles before its start event sends no end event either (#6565).
   test.each([
-    ["plugin registrationUrl discovery", true, false],
-    ["SDK discovery", false, false],
-    ["scope lookup", false, true],
+    ["plugin registrationUrl discovery", true, false, []],
+    ["SDK discovery", false, false, ["mcp_oauth_flow_started", "mcp_oauth_flow_failed"]],
+    ["scope lookup", false, true, []],
   ])(
     "a sign-in settled during stalled %s returns at once",
-    async (_label, withRegistrationUrl, stallScope) => {
+    async (_label, withRegistrationUrl, stallScope, events) => {
+      const captured: string[] = [];
+      await service.dispose();
+      service = new McpOauthService(config, mcpConfigService, undefined, {
+        capture: (payload: { event: string }) => captured.push(payload.event),
+      } as unknown as TelemetryService);
       let stalled!: () => void;
       const discoveryStalled = new Promise<void>((resolve) => (stalled = resolve));
       const stalledPath = stallScope ? "/prm" : "/.well-known/oauth-authorization-server";
@@ -915,12 +922,133 @@ describe("McpOauthService OAuth flows", () => {
         // The update-time sign-out settles every flow of this server (the deadline does the same).
         await service.logout({ serverUrl: `${base}/mcp` });
         expect(await starting).toEqual({ success: false, error: "Signed out" });
+        expect(captured).toEqual(events);
       } finally {
         server.closeAllConnections();
         await new Promise<void>((resolve) => server.close(() => resolve()));
       }
     }
   );
+
+  // The UI generates the flow ID, so Cancel reaches a sign-in that is still starting (#6565).
+  test.each(["desktop", "server"] as const)(
+    "a %s sign-in cancelled while it starts never registers",
+    async (mode) => {
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => (release = resolve));
+      spyOn(mcpConfigService, "listServers").mockImplementation(async () => {
+        await released;
+        return { docs: { transport: "http", url: "https://example.com/mcp", disabled: true } };
+      });
+      const flowId = "caller-flow-id-0123456789";
+      const input = { projectPath, serverName: "docs", flowId };
+      const starting =
+        mode === "desktop"
+          ? service.startDesktopFlow(input)
+          : service.startServerFlow({ ...input, redirectUri: "https://x/cb" });
+      await (mode === "desktop"
+        ? service.cancelDesktopFlow(flowId)
+        : service.cancelServerFlow(flowId));
+      release();
+      expect(await starting).toEqual({ success: false, error: "OAuth flow cancelled" });
+      const wait =
+        mode === "desktop" ? service.waitForDesktopFlow(flowId) : service.waitForServerFlow(flowId);
+      expect(await wait).toEqual({ success: false, error: "OAuth flow not found" });
+    }
+  );
+
+  test("a caller flow ID must be well-formed and unused (#6565)", async () => {
+    await withAuthServer(async (base) => {
+      spyOn(mcpConfigService, "listServers").mockResolvedValue({
+        docs: { transport: "http", url: `${base}/mcp`, disabled: true, oauth: { clientId: "c" } },
+      });
+      const input = { projectPath, serverName: "docs", redirectUri: "https://x/cb" };
+      expect(await service.startServerFlow({ ...input, flowId: "short" })).toEqual({
+        success: false,
+        error: "Invalid OAuth flow ID",
+      });
+      const flowId = "caller-flow-id-0123456789";
+      const first = await service.startServerFlow({ ...input, flowId });
+      expect(first.success && first.data.flowId).toBe(flowId);
+      expect(await service.startServerFlow({ ...input, flowId })).toEqual({
+        success: false,
+        error: "OAuth flow ID already in use",
+      });
+      await service.cancelServerFlow(flowId);
+    });
+  });
+
+  test("two starts with one caller flow ID never both register (#6565)", async () => {
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => (release = resolve));
+    spyOn(mcpConfigService, "listServers").mockImplementation(async () => {
+      await released;
+      return { docs: { transport: "http", url: "https://example.com/mcp", disabled: true } };
+    });
+    const input = {
+      projectPath,
+      serverName: "docs",
+      redirectUri: "https://x/cb",
+      flowId: "caller-flow-id-0123456789",
+    };
+    // Both lookups are pending: the second start must still see the first one's ID.
+    const first = service.startServerFlow(input);
+    expect(await service.startServerFlow(input)).toEqual({
+      success: false,
+      error: "OAuth flow ID already in use",
+    });
+    release();
+    await first;
+  });
+
+  test("a Cancel recorded before the flow deadline no longer refuses a later start (#6565)", async () => {
+    await withAuthServer(async (base) => {
+      spyOn(mcpConfigService, "listServers").mockResolvedValue({
+        docs: { transport: "http", url: `${base}/mcp`, disabled: true, oauth: { clientId: "c" } },
+      });
+      const flowId = "caller-flow-id-0123456789";
+      await service.cancelServerFlow(flowId);
+      // Eleven minutes later (past the 10-minute server flow deadline), nothing else ran.
+      const now = Date.now();
+      const clock = spyOn(Date, "now").mockReturnValue(now + 11 * 60 * 1000);
+      try {
+        const start = await service.startServerFlow({
+          projectPath,
+          serverName: "docs",
+          redirectUri: "https://x/cb",
+          flowId,
+        });
+        expect(start.success && start.data.flowId).toBe(flowId);
+        await service.cancelServerFlow(flowId);
+      } finally {
+        clock.mockRestore();
+      }
+    });
+  });
+
+  test("a flow whose start event failed to send sends no end event either (#6565)", async () => {
+    await withAuthServer(async (base) => {
+      const captured: string[] = [];
+      await service.dispose();
+      service = new McpOauthService(config, mcpConfigService, undefined, {
+        capture: (payload: { event: string }) => {
+          if (payload.event === "mcp_oauth_flow_started") throw new Error("telemetry down");
+          captured.push(payload.event);
+        },
+      } as unknown as TelemetryService);
+      spyOn(mcpConfigService, "listServers").mockResolvedValue({
+        docs: { transport: "http", url: `${base}/mcp`, disabled: true, oauth: { clientId: "c" } },
+      });
+      const start = await service.startServerFlow({
+        projectPath,
+        serverName: "docs",
+        redirectUri: "https://x/cb",
+      });
+      if (!start.success) throw new Error(start.error);
+      await service.cancelServerFlow(start.data.flowId);
+      expect(captured).toEqual([]);
+    });
+  });
 
   test("a token exchange in flight when the user signs out saves nothing", async () => {
     let tokenRequested!: () => void;

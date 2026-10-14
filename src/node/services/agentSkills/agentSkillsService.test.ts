@@ -23,6 +23,12 @@ import {
   readAgentSkill,
 } from "./agentSkillsService";
 
+async function writeSkillWithName(root: string, dir: string, name: string): Promise<void> {
+  await fs.mkdir(path.join(root, dir), { recursive: true });
+  const content = `---\nname: ${name}\ndescription: from ${dir}\n---\nBody\n`;
+  await fs.writeFile(path.join(root, dir, "SKILL.md"), content, "utf-8");
+}
+
 async function writeSkill(root: string, name: string, description: string): Promise<void> {
   const skillDir = path.join(root, name);
   await fs.mkdir(skillDir, { recursive: true });
@@ -337,7 +343,10 @@ describe("agentSkillsService", () => {
     const roots = { projectRoot: projectSkillsRoot, globalRoot: globalSkillsRoot };
     const runtime = new LocalRuntime(project.path);
 
-    const { skills } = await discoverAgentSkills(runtime, project.path, { roots });
+    const result = await discoverAgentSkills(runtime, project.path, { roots });
+    const { skills } = result;
+    // Valid skills keep the payload unchanged: no empty warnings list.
+    expect("skillWarnings" in result).toBe(false);
 
     // Should include project/global skills plus built-in skills
     // Note: deep-review is a project skill in the Xum repo, not a built-in.
@@ -965,15 +974,6 @@ describe("agentSkillsService", () => {
       "utf-8"
     );
 
-    // Mismatched frontmatter.name vs directory name
-    const mismatchDir = path.join(projectSkillsRoot, "name-mismatch");
-    await fs.mkdir(mismatchDir, { recursive: true });
-    await fs.writeFile(
-      path.join(mismatchDir, "SKILL.md"),
-      `---\nname: other-name\ndescription: mismatch\n---\nBody\n`,
-      "utf-8"
-    );
-
     const roots = { projectRoot: projectSkillsRoot, globalRoot: globalSkillsRoot };
     const runtime = new LocalRuntime(project.path);
 
@@ -993,9 +993,7 @@ describe("agentSkillsService", () => {
     ]);
 
     const invalidNames = diagnostics.invalidSkills.map((issue) => issue.directoryName).sort();
-    expect(invalidNames).toEqual(
-      [invalidDirName, "bad-frontmatter", "missing-skill", "name-mismatch"].sort()
-    );
+    expect(invalidNames).toEqual([invalidDirName, "bad-frontmatter", "missing-skill"].sort());
 
     for (const issue of diagnostics.invalidSkills) {
       expect(issue.scope).toBe("project");
@@ -1013,9 +1011,36 @@ describe("agentSkillsService", () => {
     expect(
       diagnostics.invalidSkills.find((i) => i.directoryName === "bad-frontmatter")?.message
     ).toContain("Invalid SKILL.md frontmatter");
-    expect(
-      diagnostics.invalidSkills.find((i) => i.directoryName === "name-mismatch")?.message
-    ).toContain("must match directory name");
+  });
+
+  test("a SKILL.md name that is not the directory name loads as a display name", async () => {
+    using project = new DisposableTempDir("agent-skills-project");
+    using global = new DisposableTempDir("agent-skills-global");
+    const projectSkillsRoot = path.join(project.path, ".mux", "skills");
+    const globalSkillsRoot = global.path;
+
+    // pstack's router skill; a valid global skill with the same directory name loses as usual.
+    await writeSkillWithName(projectSkillsRoot, "poteto-mode", "Poteto Mode");
+    await writeSkill(globalSkillsRoot, "poteto-mode", "from global");
+    // A directory name that is not kebab-case stays an error.
+    await writeSkillWithName(projectSkillsRoot, "Poteto Mode", "Poteto Mode");
+
+    const roots = { projectRoot: projectSkillsRoot, globalRoot: globalSkillsRoot };
+    const runtime = new LocalRuntime(project.path);
+    const result = await discoverAgentSkills(runtime, project.path, { roots });
+
+    expect(result.skills.find((skill) => skill.name === "poteto-mode")).toMatchObject({
+      scope: "project",
+      displayName: "Poteto Mode",
+    });
+    expect(result.skillWarnings?.map((w) => [w.scope, w.directoryName])).toEqual([
+      ["project", "poteto-mode"],
+    ]);
+    expect(result.invalidSkills.map((issue) => issue.directoryName)).toEqual(["Poteto Mode"]);
+
+    const resolved = await readAgentSkill(runtime, project.path, "poteto-mode", { roots });
+    expect(resolved.package.scope).toBe("project");
+    expect(resolved.package.frontmatter.name).toBe("poteto-mode");
   });
 
   test("discoverAgentSkills reports invalid paths globs and keeps valid path-scoped skills", async () => {
@@ -1643,6 +1668,40 @@ describe("agentSkillsService agent plugins", () => {
     });
   });
 
+  // The display name replaces `name` in the parsed frontmatter, so the consent fingerprint must
+  // cover it separately, or an update could change user-visible text without a review.
+  test("a managed plugin skill with a display name needs a new review when the display name changes", async () => {
+    using tmp = new DisposableTempDir("plugin-skill-consent-display-name");
+    const container = path.join(tmp.path, "plugins");
+    const managedDir = await writePlugin(container, "pstack", []);
+    const skillFile = path.join(managedDir, "skills", "poteto-mode", "SKILL.md");
+    const writeName = async (name: string) => {
+      await fs.mkdir(path.dirname(skillFile), { recursive: true });
+      await fs.writeFile(skillFile, `---\nname: ${name}\ndescription: router\n---\nBody\n`);
+    };
+    await writeName("Poteto Mode");
+    const reviewed = await reviewedComponentConsent({ pluginDir: managedDir });
+    await fs.writeFile(
+      path.join(tmp.path, "plugins.json"),
+      JSON.stringify({ plugins: [createTestPluginInstallEntry("pstack", undefined, reviewed)] })
+    );
+    const runtime = new LocalRuntime(tmp.path);
+    const roots = {
+      projectRoot: "",
+      globalRoot: path.join(tmp.path, "skills"),
+      universalRoot: "",
+      globalPluginRoots: [container],
+    };
+    const loaded = async () => {
+      const { skills } = await discoverAgentSkills(runtime, tmp.path, { roots });
+      return skills.find((skill) => skill.name === "poteto-mode")?.displayName ?? "not loaded";
+    };
+
+    expect(await loaded()).toBe("Poteto Mode");
+    await writeName("Run Everything Mode");
+    expect(await loaded()).toBe("not loaded");
+  });
+
   test.each([
     { skills: ["guarded"] },
     { mcpServers: [] },
@@ -2094,6 +2153,25 @@ describe("agentSkillsService agent plugins", () => {
       expect(result.shadowedPluginSkills).toEqual([
         expect.objectContaining({ name: "tdd", pluginName: "pstack", description: "pstack tdd" }),
       ]);
+    });
+
+    test("a shadowed display-name plugin skill stays reachable without a warning", async () => {
+      using tmp = new DisposableTempDir("plugin-namespace-display-name");
+      const { container, roots, read, discover } = setup(tmp.path);
+      await writeSkill(roots.globalRoot, "poteto-mode", "global poteto");
+      const pluginDir = await writePlugin(container, "pstack", []);
+      await writeSkillWithName(path.join(pluginDir, "skills"), "poteto-mode", "Poteto Mode");
+
+      const qualified = await read("pstack:poteto-mode");
+      expect(qualified.frontmatter.name).toBe("poteto-mode");
+      expect(qualified.frontmatter.description).toBe("from poteto-mode");
+
+      const result = await discover();
+      expect(result.shadowedPluginSkills).toEqual([
+        expect.objectContaining({ name: "poteto-mode", displayName: "Poteto Mode" }),
+      ]);
+      // Shadowed reads must not change diagnostics for bare-name users.
+      expect(result.skillWarnings).toBeUndefined();
     });
 
     test("two plugins with the same skill name stay reachable", async () => {

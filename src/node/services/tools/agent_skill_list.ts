@@ -30,7 +30,10 @@ import {
   getDefaultAgentSkillsRoots,
   getProjectSkillRoots,
 } from "@/node/services/agentSkills/agentSkillsService";
-import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
+import {
+  parseSkillMarkdown,
+  skillConsentFrontmatter,
+} from "@/node/services/agentSkills/parseSkillMarkdown";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { log } from "@/node/services/log";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
@@ -145,8 +148,10 @@ async function readSkillDescriptor(
       content: file.content,
       byteSize: file.byteSize,
       directoryName,
+      // Agree with discovery; the display name stays out of this model-facing output.
+      allowDisplayName: true,
     });
-    if (!isPluginSkillConsented(skillConsent, skillDir, parsed.frontmatter)) {
+    if (!isPluginSkillConsented(skillConsent, skillDir, skillConsentFrontmatter(parsed))) {
       log.warn(`Skipping ${scope} plugin skill '${directoryName}': not reviewed on this install`);
       return null;
     }
@@ -231,6 +236,9 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
               return true;
             })
             .filter((skill) => includeUnadvertised === true || skill.advertise !== false)
+            // The display name is user-facing only: plugin model-visible fields are
+            // consent-fingerprinted (installService describeSkillAdvertisement).
+            .map(({ displayName: _displayName, ...skill }) => skill)
             .sort((a, b) => a.name.localeCompare(b.name));
 
           return {

@@ -752,7 +752,7 @@ describe("AgentPluginInstallService", () => {
     }
   });
 
-  test("explicit imports reject unknown directory IDs, mismatched frontmatter and an unreviewed SHA", async () => {
+  test("explicit imports reject unknown directory IDs, frontmatter names and an unreviewed SHA", async () => {
     await fsPromises.mkdir(path.join(remoteDir, "skills", "other"));
     await fsPromises.writeFile(
       path.join(remoteDir, "skills", "other", "SKILL.md"),
@@ -760,7 +760,8 @@ describe("AgentPluginInstallService", () => {
     );
     await commitAll(remoteDir, "mismatched skill");
     const preview = await service.preview({ input: remoteDir });
-    for (const skills of [["missing"], ["other"], ["misleading"]]) {
+    // The skill ID is the directory name ("other"), never the frontmatter name.
+    for (const skills of [["missing"], ["misleading"]]) {
       const result = await service.installResult({
         source: preview.source,
         expectedSha: preview.lockedSha,
@@ -2221,20 +2222,21 @@ describe("AgentPluginInstallService", () => {
     }
   );
 
-  test("preview validates skills against their directory names like runtime discovery", async () => {
-    // skills/wrong-dir/SKILL.md advertising a different name never loads at
-    // runtime (parseSkillMarkdown rejects the mismatch), so the preview must
-    // not promise it — and the update capability surface must not count it.
-    await fsPromises.mkdir(path.join(remoteDir, "skills", "wrong-dir"), { recursive: true });
+  test("preview lists a display-name skill under its directory name like runtime discovery", async () => {
+    // pstack ships `name: Poteto Mode` in skills/poteto-mode: runtime discovery
+    // loads it as poteto-mode, so the preview must promise it under that ID
+    // and warn about the display name.
+    await fsPromises.mkdir(path.join(remoteDir, "skills", "poteto-mode"), { recursive: true });
     await fsPromises.writeFile(
-      path.join(remoteDir, "skills", "wrong-dir", "SKILL.md"),
-      "---\nname: other-name\ndescription: Mismatched\n---\n\nBody.\n"
+      path.join(remoteDir, "skills", "poteto-mode", "SKILL.md"),
+      "---\nname: Poteto Mode\ndescription: Router\n---\n\nBody.\n"
     );
-    await commitAll(remoteDir, "adds a dir-name-mismatched skill");
+    await commitAll(remoteDir, "adds a display-name skill");
 
     const preview = await service.preview({ input: remoteDir });
-    expect(preview.skills.map((skill) => skill.name)).toEqual(["greet"]);
-    expect(preview.warnings.join("\n")).toContain("skills/wrong-dir");
+    expect(preview.skills.map((skill) => skill.name).sort()).toEqual(["greet", "poteto-mode"]);
+    expect(preview.warnings).toHaveLength(1);
+    expect(preview.warnings[0]).toMatch(/^skills\/poteto-mode: .*'Poteto Mode'.*'poteto-mode'/);
   });
 
   test("preview and list show the interface; the logo is a contained data URL", async () => {
@@ -2581,6 +2583,55 @@ describe("AgentPluginInstallService", () => {
       // Journal health stayed true, so the custom gate opens without another section open.
       expect(await discovered()).toBe(1);
       await oauth.dispose();
+    });
+
+    test("overlapping discovery requests share one sign-out pass, and a failed one waits (#6627)", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      let logouts = 0;
+      restarted.setMcpOauthService({
+        logout: () => {
+          logouts++;
+          return Promise.resolve({ success: false, error: "offline" });
+        },
+        credentialKey: (url: string) => url,
+      } as unknown as McpOauthService);
+      const internals = restarted as unknown as { settledSignOutPasses: () => Promise<void> };
+      const settle = () => internals.settledSignOutPasses();
+      await settle();
+      // Startup tried at least once (recovery and the wiring can each ask for a pass).
+      const atStartup = logouts;
+      expect(atStartup).toBeGreaterThan(0);
+
+      // Within the wait, requests start no pass.
+      await Promise.all([discovered(), discovered(), discovered()]);
+      await settle();
+      expect(logouts).toBe(atStartup);
+
+      // After it, overlapping requests start exactly one.
+      const now = Date.now();
+      const clock = spyOn(Date, "now").mockReturnValue(now + 31_000);
+      try {
+        await Promise.all([discovered(), discovered(), discovered()]);
+        await settle();
+        expect(logouts).toBe(atStartup + 1);
+      } finally {
+        clock.mockRestore();
+      }
+      expect(await pendingSignOuts()).toEqual([serverUrl]);
+    });
+
+    test("component review names a pending sign-out instead of changed files (#6627)", async () => {
+      const { updater, failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await expect(updater.getComponents({ name: "demo-plugin" })).rejects.toThrow(
+        /sign-out from an update has not finished/
+      );
+      await failing.dispose();
     });
 
     test("survives an uninstall of the plugin", async () => {
@@ -3237,7 +3288,7 @@ describe("AgentPluginInstallService", () => {
     // and stay silent about the skill that stops loading.
     await fsPromises.writeFile(
       path.join(remoteDir, "skills", "greet", "SKILL.md"),
-      "---\nname: mismatched\ndescription: Greets people\n---\n\nSay hi.\n"
+      "---\nname: 42\ndescription: Greets people\n---\n\nSay hi.\n"
     );
     await fsPromises.mkdir(path.join(remoteDir, "skills", "extra"), { recursive: true });
     await fsPromises.writeFile(
@@ -6648,6 +6699,26 @@ describe("describeSignInChanges", () => {
       "Sign-in at new.example.com (new)",
       "Sign-in at old.example.com (removed)",
       "Client registration changed (https://reg.example.com/tenant-a/register → https://reg.example.com/tenant-b/register)",
+    ]);
+  });
+
+  test("names a discovery URL added or removed on a host both versions use (#6565)", () => {
+    const before = { authorizationServerBase: "https://id.example.com/tenant-a" };
+    const after = {
+      authorizationServerBase: "https://id.example.com/tenant-b",
+      registrationUrl: "https://id.example.com/register",
+    };
+    expect(
+      describeSignInChanges(signIn({ discovery: before }), signIn({ discovery: after }))
+    ).toEqual([
+      "Sign-in server changed (https://id.example.com/tenant-a → https://id.example.com/tenant-b)",
+      "Client registration added (https://id.example.com/register)",
+    ]);
+    expect(
+      describeSignInChanges(signIn({ discovery: after }), signIn({ discovery: before }))
+    ).toEqual([
+      "Sign-in server changed (https://id.example.com/tenant-b → https://id.example.com/tenant-a)",
+      "Client registration removed (https://id.example.com/register)",
     ]);
   });
 });

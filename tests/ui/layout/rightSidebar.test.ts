@@ -164,6 +164,8 @@ describeIntegration("RightSidebar (UI)", () => {
 
   async function setupRightSidebarView(beforeRender?: () => void) {
     const cleanupDom = installDom();
+    // Most tests exercise open tools; individual tests can clear this to cover the default.
+    updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
     beforeRender?.();
     const view = renderApp({ apiClient: env.orpc, metadata });
 
@@ -240,6 +242,23 @@ describeIntegration("RightSidebar (UI)", () => {
         expect(browserTab).toBeNull();
         expect(desktopTab).toBeNull();
       });
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
+  test("a fresh chat starts collapsed and opens tools only on request", async () => {
+    const { sidebar, cleanup } = await setupRightSidebarView(() => {
+      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, null);
+    });
+
+    try {
+      expect(sidebar.classList.contains("right-sidebar-overview-card")).toBe(true);
+      expect(sidebar.querySelector('[role="tablist"]')).toBeNull();
+      expect(sidebar.querySelector('[role="tabpanel"]')).toBeNull();
+      fireEvent.click(within(sidebar).getByRole("button", { name: "Expand sidebar" }));
+      const launcher = await findSidebarPanel(sidebar, "-panel-new");
+      expect(within(launcher).getByRole("button", { name: "Review" })).toBeTruthy();
     } finally {
       await cleanup();
     }
@@ -561,6 +580,58 @@ describeIntegration("RightSidebar (UI)", () => {
         const tablist = sidebar.querySelector('[role="tablist"]');
         if (!tablist) throw new Error("Tablist should be visible after expand");
       });
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
+  test("collapsing from the top pane keeps the focused pane for Expand", async () => {
+    const splitLayout: RightSidebarLayoutState = {
+      version: 1,
+      openTabsOnly: true,
+      nextId: 10,
+      root: {
+        type: "split",
+        id: "split-1",
+        direction: "horizontal",
+        sizes: [50, 50],
+        children: [
+          { type: "tabset", id: "tabset-top", tabs: ["review"], activeTab: "review" },
+          { type: "tabset", id: "tabset-bottom", tabs: ["costs"], activeTab: "costs" },
+        ],
+      },
+      focusedTabsetId: "tabset-bottom",
+    };
+    const { view, sidebar, cleanup } = await setupRightSidebarView(() => {
+      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+      updatePersistedState(getRightSidebarLayoutKey(workspaceId), splitLayout);
+    });
+
+    try {
+      const collapseButton = await findRequiredElement(
+        sidebar,
+        'button[aria-label="Collapse sidebar"]',
+        "Collapse button not found"
+      );
+      // A real click: mousedown, then focus, then click.
+      fireEvent.mouseDown(collapseButton);
+      collapseButton.focus();
+      fireEvent.mouseUp(collapseButton);
+      fireEvent.click(collapseButton);
+
+      const collapsedSidebar = view.container.querySelector(
+        '[role="complementary"][aria-label="Workspace insights"]'
+      )!;
+      const expandButton = await findRequiredElement(
+        collapsedSidebar,
+        'button[aria-label="Expand sidebar"]',
+        "Expand button not found"
+      );
+      fireEvent.click(expandButton);
+
+      await waitFor(() =>
+        expect(activeTabDescription()).toMatch(/^tab .*-tabset-bottom-panel-costs$/)
+      );
     } finally {
       await cleanup();
     }
@@ -998,6 +1069,13 @@ describeIntegration("RightSidebar (UI)", () => {
       const reviewPanel = sidebar.querySelector('[role="tabpanel"][id*="review"]');
       expect(costsPanel).toBeTruthy();
       expect(reviewPanel).toBeTruthy();
+
+      // One collapse button for the whole sidebar, in the top pane's strip.
+      const collapseButtons = sidebar.querySelectorAll('button[aria-label="Collapse sidebar"]');
+      expect(collapseButtons.length).toBe(1);
+      expect(collapseButtons[0].closest("[data-tabset-id]")?.getAttribute("data-tabset-id")).toBe(
+        "tabset-top"
+      );
     } finally {
       await cleanup();
     }

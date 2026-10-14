@@ -12,6 +12,8 @@ test(
     // layout hides the right sidebar.
     await browser.setViewport({ width: 1440, height: 900 });
     await openPlayground(app, screen, browser);
+    // Open the tabs explicitly, then prove this preference and their order survive reload.
+    await screen.getByRole("button", /^Expand (right )?sidebar$/).tap();
     const tablist = screen.getByRole("tablist", "Sidebar views");
     // The strip shows only opened tabs: open Artifacts, then Goal after it, from New tabs.
     for (const tool of ["Artifacts", "Goal"]) {

@@ -325,7 +325,6 @@ describe("listAvailableModels", () => {
     const models = listAvailableModels(
       {
         providersConfig,
-        hiddenModels: [KNOWN_MODELS.HAIKU.id],
         routePriority: ["direct"],
         routeOverrides: {},
       },
@@ -359,6 +358,7 @@ describe("listAvailableModels", () => {
         aliases: ["sonnet"],
         thinkingLevels: [...getThinkingPolicyForModel(KNOWN_MODELS.SONNET.id)],
       },
+      { model: KNOWN_MODELS.HAIKU.id, aliases: ["haiku"], thinkingLevels: FULL_POLICY },
     ]);
   });
 
@@ -378,7 +378,6 @@ describe("listAvailableModels", () => {
     expect(
       listAvailableModels({
         providersConfig: {},
-        hiddenModels: [],
         routePriority: ["direct"],
         routeOverrides: {},
       })

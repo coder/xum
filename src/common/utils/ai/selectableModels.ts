@@ -15,11 +15,8 @@ import { getThinkingPolicyForModel } from "@/common/utils/thinking/policy";
 
 /**
  * Selectable-models pipeline shared by the composer model picker
- * (useModelsFromSettings) and the backend `models_list` tool. One implementation
- * keeps routing, credential, authoritative-catalog and hidden-model filtering
- * identical on both sides. The predicates below were moved verbatim from the
- * hook and take `providersConfig` as a plain argument instead of closing over
- * React state.
+ * (useModelsFromSettings) and the backend `models_list` tool. Routing, credential
+ * and authoritative-catalog filtering are shared; hidden-model filtering is picker-only.
  */
 
 export const BUILT_IN_MODELS: string[] = Object.values(KNOWN_MODELS).map((m) => m.id);
@@ -33,7 +30,7 @@ export interface SelectableModelsInput {
   routeOverrides: Record<string, string>;
 }
 
-/** One `models_list` entry: a picker selection in the form the `task` tool accepts. */
+/** One `models_list` suggestion in the form the `task` tool accepts. */
 export interface AvailableModel {
   /** Normalized selection ID accepted by task.model (explicit gateway prefixes preserved). */
   model: string;
@@ -211,7 +208,7 @@ export function computeSelectableModels(input: SelectableModelsInput): string[] 
 }
 
 /**
- * The picker entries in the form `task.model` accepts: each raw entry is run
+ * Model suggestions in the form `task.model` accepts: each raw entry is run
  * through `normalizeModelInput` (what `parseTaskAiOverrides` does), so the
  * emitted IDs are exactly the strings the task tool will accept unchanged.
  *
@@ -221,15 +218,16 @@ export function computeSelectableModels(input: SelectableModelsInput): string[] 
  *   data, not a programmer invariant, hence no assert).
  * - `unchecked_identity`: normalization changed the identity (e.g. a
  *   whitespace-padded custom entry) and the normalized ID is not itself a
- *   picker entry — advertising it would bypass the routing/credential/catalog/
- *   hidden checks the picker applied to the raw string.
+ *   catalog entry — advertising it would bypass the routing/credential/catalog
+ *   checks applied to the raw string.
  * Two raw entries normalizing to the same ID collapse into one.
  */
 export function listAvailableModels(
-  input: SelectableModelsInput & { providersConfig: ProvidersConfigMap },
+  input: Omit<SelectableModelsInput, "hiddenModels"> & { providersConfig: ProvidersConfigMap },
   onSkipped?: (raw: string, reason: SkippedModelReason) => void
 ): AvailableModel[] {
-  const rawEntries = computeSelectableModels(input);
+  // Hiding picker suggestions does not prevent tasks from using those models.
+  const rawEntries = computeSelectableModels({ ...input, hiddenModels: [] });
   const selectable = new Set(rawEntries);
 
   const aliasesByModel = new Map<string, string[]>();

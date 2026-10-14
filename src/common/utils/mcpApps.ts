@@ -205,6 +205,14 @@ export function mcpAppEntrypointKey(
 }
 
 /**
+ * The result-store key of a settings layout tool action that opens an MCP App (one view record
+ * per server and tool), encoded like mcpAppEntrypointKey.
+ */
+export function mcpSettingsAppKey(serverName: string, toolName: string): string {
+  return `settings:${encodeKeyPart(serverName)}:${encodeKeyPart(toolName)}`;
+}
+
+/**
  * Escape every UTF-16 code unit outside `[A-Za-z0-9._-]` as `%` + four hex digits. Total (unlike
  * encodeURIComponent, which throws on a lone surrogate: one bad name would fail the whole
  * listing) and injective (fixed width, `%` itself is escaped). The regex has no `u` flag, so it

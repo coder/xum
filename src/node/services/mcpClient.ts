@@ -12,6 +12,7 @@ import {
   advertisedMCPSettingsToolNames,
   parseMCPSettingsCapability,
   type MCPSettingsCapability,
+  type MCPSettingsToolAction,
 } from "@/common/utils/mcpSettings";
 import {
   isModelVisibleTool,
@@ -205,6 +206,22 @@ export interface MCPClientHandle {
     meta: Record<string, unknown>,
     options?: { signal?: AbortSignal; timeoutMs?: number }
   ): Promise<MCPRawCallToolResult>;
+  /**
+   * A tool of the latest tools() listing as a settings layout tool action (hidden tools
+   * included, settings tools excluded). Undefined when the listing has no such tool.
+   */
+  settingsToolAction(name: string): MCPSettingsToolAction | undefined;
+  /**
+   * Re-list the server's tools (tools/list), so settingsToolAction reflects the current catalog.
+   * Settings actions call it before a dispatch on a connection without another refresh.
+   */
+  relistTools(): Promise<void>;
+  /** tools/call for a settings layout tool action, with the spec's `{}` arguments. */
+  callSettingsActionTool(
+    name: string,
+    meta: Record<string, unknown>,
+    options?: { signal?: AbortSignal }
+  ): Promise<MCPRawCallToolResult>;
   close(): Promise<void>;
 }
 
@@ -242,6 +259,30 @@ function createHttpTransport(config: MCPHttpTransportConfig): Transport {
   return config.type === "http"
     ? new StreamableHTTPClientTransport(url, options)
     : new SSEClientTransport(url, options);
+}
+
+/**
+ * Record one tools/list entry as a settings layout tool action. The title follows the settings
+ * spec's display name order with the same cleaning as entry point titles; a tool whose name
+ * cleans to nothing is left out.
+ */
+function addSettingsToolAction(
+  actions: Map<string, MCPSettingsToolAction>,
+  definition: Awaited<ReturnType<Client["listTools"]>>["tools"][number],
+  ui: MCPToolUi | undefined
+): void {
+  const title = mcpAppEntrypointTitle(
+    [definition.title, definition.annotations?.title],
+    definition.name
+  );
+  if (title === undefined) return;
+  actions.set(definition.name, {
+    title,
+    readOnly: definition.annotations?.readOnlyHint === true,
+    // Parsed even without MCP Apps (where `ui` is undefined): an app tool must not run as a
+    // regular tool without its view (the manager gives it no action then).
+    opensApp: (ui ?? parseMCPToolUiMeta(definition._meta))?.resourceUri !== undefined,
+  });
 }
 
 /**
@@ -382,6 +423,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
   // Every tool of the latest listing (hidden ones included) -> its `_meta.ui`, if any.
   let listedTools = new Map<string, MCPToolUi | undefined>();
   let listedEntrypoints: readonly MCPAppEntrypointTool[] = [];
+  let listedSettingsActions = new Map<string, MCPSettingsToolAction>();
 
   if (config.onUncaughtError) {
     const onUncaughtError = config.onUncaughtError;
@@ -415,12 +457,14 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
       const tools: Record<string, Tool> = {};
       const listed = new Map<string, MCPToolUi | undefined>();
       const entrypoints: MCPAppEntrypointTool[] = [];
+      const settingsActions = new Map<string, MCPSettingsToolAction>();
       for (const definition of listResult.tools) {
         // Settings tools are host-only: left out of the listing too, so an MCP App view
         // cannot call them through callToolForApp (hasTool is false for them).
         if (settingsTools.has(definition.name)) continue;
         const ui = mcpApps ? parseMCPToolUiMeta(definition._meta) : undefined;
         listed.set(definition.name, ui);
+        addSettingsToolAction(settingsActions, definition, ui);
         // Read before the visibility filter below: entry points ignore visibility.
         if (ui?.resourceUri !== undefined) {
           const { types, skippedFile } = parseMCPAppEntrypoints(definition._meta);
@@ -488,6 +532,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
       }
       listedTools = listed;
       listedEntrypoints = entrypoints;
+      listedSettingsActions = settingsActions;
       return tools;
     },
     prompts: (options) => listServerPrompts(client, options?.signal),
@@ -541,6 +586,18 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
           timeout: options?.timeoutMs ?? APP_TOOL_CALL_TIMEOUT_MS,
           ...(options?.signal !== undefined ? { signal: options.signal } : {}),
         }
+      );
+    },
+    settingsToolAction: (name) => listedSettingsActions.get(name),
+    relistTools: async () => {
+      await handle.tools();
+    },
+    callSettingsActionTool: (name, meta, options) => {
+      assert(listedSettingsActions.has(name), "callSettingsActionTool only calls listed tools");
+      // The spec's layout tool accepts `{}`.
+      return client.callTool(
+        { name, arguments: {}, _meta: meta },
+        { ...options, timeout: APP_TOOL_CALL_TIMEOUT_MS }
       );
     },
     close: () => {

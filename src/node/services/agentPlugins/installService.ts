@@ -44,7 +44,10 @@ import {
   resolveSkillWhenToUse,
 } from "@/common/orpc/schemas/agentSkill";
 import { resolveSkillPaths } from "@/common/utils/skills/skillPaths";
-import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
+import {
+  parseSkillMarkdown,
+  skillConsentFrontmatter,
+} from "@/node/services/agentSkills/parseSkillMarkdown";
 import { log } from "@/node/services/log";
 import type { MCPServerInfo, MCPServerOAuthConfig, MCPStdioServerInfo } from "@/common/types/mcp";
 import type { McpOauthService } from "@/node/services/mcpOauthService";
@@ -195,6 +198,13 @@ const MUTATION_LOCK_ACQUIRE_TIMEOUT_MS = 10 * 60 * 1000;
 /** Bound discovery/settings waits on startup crash-recovery I/O. */
 const JOURNAL_RECONCILIATION_TIMEOUT_MS = 30_000;
 
+/**
+ * How long the discovery gate waits before it retries a pending sign-out pass that left the
+ * record (a failed logout, a corrupt record). Every agent request runs the gate, so without it
+ * an offline server is signed out, and a warning logged, once per request (#6627).
+ */
+const PENDING_SIGN_OUT_RETRY_MS = 30_000;
+
 const LS_REMOTE_TIMEOUT_MS = 30_000;
 const CLONE_TIMEOUT_MS = 120_000;
 
@@ -205,6 +215,12 @@ async function waitForPendingSignOuts(
 ): Promise<void> {
   const settled = await raceWithAbortAndTimeout(pass, { timeoutMs });
   if (settled.kind === "timeout") log.warn("Pending plugin sign-outs timed out", { timeoutMs });
+}
+
+function componentsChangedError(): Error {
+  return new Error(
+    "Installed plugin files changed during component review. Refresh the component inventory."
+  );
 }
 
 /** Deterministic JSON with recursively sorted object keys (fingerprinting). */
@@ -686,6 +702,18 @@ function stdioLaunchDetails(
   return details;
 }
 
+/** Preview warning for a skill whose SKILL.md `name` is only a display name. */
+function displayNameWarnings(
+  label: string,
+  dirName: string,
+  displayName: string | undefined
+): string[] {
+  if (displayName === undefined) return [];
+  return [
+    `${label}/${dirName}: SKILL.md name '${displayName}' is not the directory name; it loads as '${dirName}'`,
+  ];
+}
+
 function shortenHome(absPath: string): string {
   const home = os.homedir();
   if (absPath === home) {
@@ -802,25 +830,45 @@ function discoveryHosts(discovery: SignInDiscovery): Set<string> {
   );
 }
 
-/** `name changed (x → y)` for a URL that moved on its host (a host move has its own line). */
-function pathMoveLine(
+/**
+ * The line for one discovery URL whose host the host lines do not name: `changed (x → y)` for a
+ * move on its host, `added`/`removed` for a URL on a host that both versions use (#6565).
+ */
+function discoveryFieldLine(
   name: string,
   key: "authorizationServerBase" | "registrationUrl",
-  a: SignInDiscovery,
-  b: SignInDiscovery
+  [a, b]: [SignInDiscovery, SignInDiscovery],
+  hosts: [Set<string>, Set<string>]
 ): string[] {
   const [x, y] = [a?.[key], b?.[key]];
-  if (x === undefined || y === undefined || x === y) return [];
+  if (x === y) return [];
+  if (x === undefined || y === undefined) return addedOrRemovedLine(name, x, y, hosts);
   return new URL(x).host === new URL(y).host ? [`${name} changed (${x} → ${y})`] : [];
+}
+
+/** See discoveryFieldLine: exactly one of `x` (before) and `y` (after) is defined. */
+function addedOrRemovedLine(
+  name: string,
+  x: string | undefined,
+  y: string | undefined,
+  [oldHosts, newHosts]: [Set<string>, Set<string>]
+): string[] {
+  const url = x ?? y;
+  if (url === undefined) return [];
+  // The other version must use this host; otherwise its host line names the change.
+  const otherHosts = x === undefined ? oldHosts : newHosts;
+  if (!otherHosts.has(new URL(url).host)) return [];
+  return [`${name} ${x === undefined ? "added" : "removed"} (${url})`];
 }
 
 /**
  * Review lines for the sign-in discovery URLs: one per added or removed host, and one per URL
- * that moved on its host. Tenants share a host (`/tenant-a` → `/tenant-b`), so a path move gets
- * its own line, also when another discovery URL changed host (#6164).
+ * that changed on a host both versions use. Tenants share a host (`/tenant-a` → `/tenant-b`), so
+ * a path move gets its own line, also when another discovery URL changed host (#6164).
  */
 function describeDiscoveryChanges(a: SignInDiscovery, b: SignInDiscovery): string[] {
-  const [oldHosts, newHosts] = [discoveryHosts(a), discoveryHosts(b)];
+  const hosts: [Set<string>, Set<string>] = [discoveryHosts(a), discoveryHosts(b)];
+  const [oldHosts, newHosts] = hosts;
   const lines = [
     ...[...newHosts]
       .filter((host) => !oldHosts.has(host))
@@ -828,8 +876,8 @@ function describeDiscoveryChanges(a: SignInDiscovery, b: SignInDiscovery): strin
     ...[...oldHosts]
       .filter((host) => !newHosts.has(host))
       .map((host) => `Sign-in at ${host} (removed)`),
-    ...pathMoveLine("Sign-in server", "authorizationServerBase", a, b),
-    ...pathMoveLine("Client registration", "registrationUrl", a, b),
+    ...discoveryFieldLine("Sign-in server", "authorizationServerBase", [a, b], hosts),
+    ...discoveryFieldLine("Client registration", "registrationUrl", [a, b], hosts),
   ];
   if (lines.length === 0 && stableStringify(a ?? null) !== stableStringify(b ?? null))
     lines.push("Sign-in server changed");
@@ -1069,7 +1117,7 @@ export class AgentPluginInstallService {
       await this.pendingSignOutReady;
       const bracket = await journalDerivedDiscoveryGate(containerPaths);
       // The bracket keeps the container closed while a sign-out is pending; start finishing it.
-      await this.startPendingSignOutPass();
+      this.startPendingSignOutPass({ retryNow: false });
       return {
         suppressed: [...new Set([...bracket.suppressed, ...unhealthySuppression])],
         confirm: async () => {
@@ -1105,7 +1153,7 @@ export class AgentPluginInstallService {
     const allConsumed = await this.reconcileJournals();
     // Started, not awaited: a slow or failed sign-out must not latch journal health (a
     // timed-out recovery stores false until the next section open). The record is its own fence.
-    await this.startPendingSignOutPass();
+    this.startPendingSignOutPass({ retryNow: true });
     return allConsumed;
   }
 
@@ -2291,12 +2339,15 @@ export class AgentPluginInstallService {
           content,
           byteSize: stat.size,
           directoryName: dirNameParsed.data,
+          // Mirror runtime discovery: a display name loads under the dir name.
+          allowDisplayName: true,
         });
+        warnings.push(...displayNameWarnings(label, dirName, parsed.displayName));
         skills.push({
           name: parsed.frontmatter.name,
           ...skillConsentFields({
             relativeDir: path.relative(pluginRoot, path.join(skillsDir, dirName)),
-            frontmatter: parsed.frontmatter,
+            frontmatter: skillConsentFrontmatter(parsed),
           }),
           ...(parsed.frontmatter.description !== undefined
             ? { description: parsed.frontmatter.description }
@@ -3513,17 +3564,24 @@ export class AgentPluginInstallService {
     // live MCP admission. Reuse discovery's journal/epoch bracket to reject
     // overlapping installer moves, including a complete rollback or reinstall.
     const gate = await journalDerivedDiscoveryGate([this.containerDir]);
-    const changed = () =>
-      new Error(
-        "Installed plugin files changed during component review. Refresh the component inventory."
-      );
-    if (gate.suppressed.length > 0) throw changed();
+    if (gate.suppressed.length > 0) throw await this.closedComponentReviewError();
     const entry = (await this.readRegistry("strict")).find((entry) => entry.name === args.name);
     if (entry === undefined) throw new Error(`No managed plugin named '${args.name}'.`);
     const { fingerprints, ...inventory } = await this.readInstalledComponents(entry);
     assert(fingerprints !== undefined, "installed inventory carries consent fingerprints");
-    if ((await gate.confirm()).length > 0) throw changed();
+    if ((await gate.confirm()).length > 0) throw componentsChangedError();
     return inventory;
+  }
+
+  /**
+   * Why the bracket closed a component review. A pending sign-out also closes it, but then no
+   * file changed, and a refresh fails the same way until the sign-out finishes (#6627).
+   */
+  private async closedComponentReviewError(): Promise<Error> {
+    if (!(await this.hasPendingSignOuts())) return componentsChangedError();
+    return new Error(
+      "A plugin MCP sign-out from an update has not finished yet. Plugin components are unavailable until Xum finishes it; check the log for the reason."
+    );
   }
 
   async setComponents(args: {
@@ -3674,15 +3732,17 @@ export class AgentPluginInstallService {
    * Finishes the sign-outs that an update recorded but could not complete (#6122). Runs with
    * crash recovery and from the discovery gate. Without the sign-in service it does nothing.
    */
-  private async completePendingSignOuts(): Promise<void> {
+  /** True when it tried, and sign-outs are left. */
+  private async completePendingSignOuts(): Promise<boolean> {
     const oauth = this.mcpOauthService;
-    if (oauth === undefined || !(await this.hasPendingSignOuts())) return;
-    await this.runExclusive(async () => {
+    if (oauth === undefined || !(await this.hasPendingSignOuts())) return false;
+    return this.runExclusive(async () => {
       const left: string[] = [];
       for (const serverUrl of await this.readPendingSignOuts()) {
         if (!(await oauth.logout({ serverUrl })).success) left.push(serverUrl);
       }
       await this.writePendingSignOuts(left);
+      return left.length > 0;
     });
   }
 
@@ -3691,22 +3751,68 @@ export class AgentPluginInstallService {
   }
 
   /**
-   * Starts a pass that finishes the pending sign-outs, when one is pending and none runs. The
-   * discovery gate never waits for it: it takes the plugin mutation lock, which an update holds
-   * while it stops MCP servers. The journal bracket keeps the container closed meanwhile.
+   * Starts a pass that finishes the pending sign-outs, when none runs. The discovery gate never
+   * waits for it: it takes the plugin mutation lock, which an update holds while it stops MCP
+   * servers. The journal bracket keeps the container closed meanwhile.
+   *
+   * The slot is set before any await, so callers that overlap share one pass (#6627). The gate
+   * passes `retryNow: false`: after a pass that left the record it waits
+   * PENDING_SIGN_OUT_RETRY_MS. Startup and section open pass `retryNow: true`: they retry at
+   * once, and when a pass already runs they get one more pass after it, because the running
+   * pass can have read the record before the user's retry.
    */
-  private async startPendingSignOutPass(): Promise<void> {
-    if (this.pendingSignOutPass !== undefined || !(await this.hasPendingSignOuts())) return;
-    this.pendingSignOutPass = this.completePendingSignOuts()
-      .catch((error: unknown) => {
-        log.warn("Could not finish pending plugin sign-outs", { error: getErrorMessage(error) });
-      })
-      .finally(() => {
-        this.pendingSignOutPass = undefined;
-      });
+  private startPendingSignOutPass(options: { retryNow: boolean }): void {
+    if (this.signOutPassRunning(options.retryNow) || this.signOutRetryWaits(options.retryNow))
+      return;
+    const pass: Promise<void> = this.runPendingSignOutPass().finally(() =>
+      this.endPendingSignOutPass(pass)
+    );
+    this.pendingSignOutPass = pass;
+  }
+
+  /** True when a pass runs. A `retryNow` caller then asks for one more pass after it. */
+  private signOutPassRunning(retryNow: boolean): boolean {
+    if (this.pendingSignOutPass === undefined) return false;
+    if (retryNow) this.pendingSignOutRerun = true;
+    return true;
+  }
+
+  /** True while the gate's wait after a pass that left the record runs. */
+  private signOutRetryWaits(retryNow: boolean): boolean {
+    return !retryNow && Date.now() < this.pendingSignOutRetryAtMs;
+  }
+
+  /** Resolves once no pass runs, the passes that `retryNow` callers asked for included. */
+  private async settledSignOutPasses(): Promise<void> {
+    // endPendingSignOutPass starts a requested pass before the settled one resolves.
+    while (this.pendingSignOutPass !== undefined) await this.pendingSignOutPass;
+  }
+
+  /** Clears the slot of a settled pass, and starts the pass a `retryNow` caller asked for. */
+  private endPendingSignOutPass(pass: Promise<void>): void {
+    if (this.pendingSignOutPass !== pass) return;
+    this.pendingSignOutPass = undefined;
+    if (!this.pendingSignOutRerun) return;
+    this.pendingSignOutRerun = false;
+    this.startPendingSignOutPass({ retryNow: true });
+  }
+
+  /** One pass: finishes the record, and schedules the next gate retry when it is left. */
+  private async runPendingSignOutPass(): Promise<void> {
+    // A pass before the sign-in service is wired tries nothing, so it sets no wait.
+    const left = await this.completePendingSignOuts().catch((error: unknown) => {
+      // An unreadable record stays: it keeps discovery closed until the user deletes it.
+      log.warn("Could not finish pending plugin sign-outs", { error: getErrorMessage(error) });
+      return true;
+    });
+    this.pendingSignOutRetryAtMs = left ? Date.now() + PENDING_SIGN_OUT_RETRY_MS : 0;
   }
 
   private pendingSignOutPass: Promise<void> | undefined;
+  /** See startPendingSignOutPass. */
+  private pendingSignOutRetryAtMs = 0;
+  /** See signOutPassRunning. */
+  private pendingSignOutRerun = false;
 
   /** Managed registry entries merged with unmanaged plugins found by global discovery. */
   /** The OAuth service is built in a later DI layer than this service. */
@@ -3717,8 +3823,11 @@ export class AgentPluginInstallService {
     // Bounded like journal recovery: a hung logout (stalled store I/O) must not hang every
     // discovery request. On timeout discovery goes on, and the journal bracket keeps the
     // container closed while the sign-out is still pending.
-    const pass = this.startPendingSignOutPass().then(() => this.pendingSignOutPass);
-    this.pendingSignOutReady = waitForPendingSignOuts(pass, this.deps.reconciliationTimeoutMs);
+    this.startPendingSignOutPass({ retryNow: true });
+    this.pendingSignOutReady = waitForPendingSignOuts(
+      this.settledSignOutPasses(),
+      this.deps.reconciliationTimeoutMs
+    );
   }
 
   /** Started by setMcpOauthService. */
