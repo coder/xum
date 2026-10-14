@@ -17,6 +17,7 @@ import { textContrast } from "@/browser/stories/helpers/contrast";
 import { getMCPTestResultsKey } from "@/common/constants/storage";
 import type { MCPServerInfo } from "@/common/types/mcp";
 import type { MCPSettingsSnapshot } from "@/common/utils/mcpSettings";
+import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
 
 import { WorkspaceMCPModal } from "./WorkspaceMCPModal";
 
@@ -75,6 +76,8 @@ interface WorkspaceMCPStoryOptions {
   settingsAfterSave?: Record<string, MCPSettingsSnapshot>;
   settingsToolRuns?: Array<{ toolName: string; confirmed: boolean }>;
   settingsToolRunGate?: { promise: Promise<void> };
+  /** MCP Apps views by view key (a settings app action opens `settings:<server>:<tool>`). */
+  mcpAppViews?: Record<string, McpAppView>;
   testGate?: { promise: Promise<void> };
 }
 
@@ -156,6 +159,7 @@ function setupWorkspaceMCPModalStory(options: WorkspaceMCPStoryOptions = {}): AP
     mcpSettingsAfterUpdate: new Map(Object.entries(options.settingsAfterSave ?? {})),
     mcpSettingsToolRuns: options.settingsToolRuns,
     mcpSettingsToolRunGate: options.settingsToolRunGate,
+    ...(options.mcpAppViews ? { mcpApps: { views: options.mcpAppViews } } : {}),
     mcpTestGate: options.testGate,
   });
 }
@@ -646,7 +650,9 @@ async function exerciseServerSettings(
   const modal = within(dialog);
   const section = within(await modal.findByTestId("mcp-server-settings"));
   await expect(modal.getByRole("button", { name: "Fetch Tools" })).toBeInTheDocument();
-  await expect(section.findByText("Opens in a later version")).resolves.toBeInTheDocument();
+  await expect(
+    section.findByRole("button", { name: "Open Payment method" })
+  ).resolves.toBeInTheDocument();
   await expect(
     section.findByText(/This server sent 1 setting Xum cannot show/)
   ).resolves.toBeInTheDocument();
@@ -702,7 +708,8 @@ let toolActionRuns: Array<{ toolName: string; confirmed: boolean }> = [];
 let toolActionGate = Promise.withResolvers<void>();
 /**
  * Layout tool actions: a read-only tool runs at once and shows its text; a tool that can write
- * asks first (Cancel runs nothing); an MCP App tool and an unavailable tool stay disabled.
+ * asks first (Cancel runs nothing); an MCP App tool opens its view in a modal (after the same
+ * confirmation); an unavailable tool stays disabled.
  */
 export const WorkspaceMCPServerSettingsToolActions: Story = {
   parameters: { pixel: PIXEL_DISABLED },
@@ -714,6 +721,16 @@ export const WorkspaceMCPServerSettingsToolActions: Story = {
       ...settingsStoryOptions(),
       settingsToolRuns: runs,
       settingsToolRunGate: toolActionGate,
+      mcpAppViews: {
+        "settings:cad:cad.payment": {
+          html: "<!doctype html><html><body><strong>Card form</strong></body></html>",
+          csp: {},
+          prefersBorder: null,
+          resultAvailable: true,
+          result: { content: [] },
+          invocation: null,
+        },
+      },
     });
   },
   play: async ({ canvasElement }) => {
@@ -747,7 +764,6 @@ export const WorkspaceMCPServerSettingsToolActions: Story = {
     await expect(section.findByText("cad.reset finished")).resolves.toBeInTheDocument();
     await expect(toolActionRuns[1]).toEqual({ toolName: "cad.reset", confirmed: true });
 
-    await expect(section.getByText("Opens in a later version")).toBeInTheDocument();
     // An unsaved edit blocks the runs: the tool would see the saved settings, not the draft.
     const zoom = section.getByLabelText("Default zoom setting");
     await userEvent.clear(zoom);
@@ -762,7 +778,20 @@ export const WorkspaceMCPServerSettingsToolActions: Story = {
     );
 
     await expect(section.getByText("Not available")).toBeInTheDocument();
-    await expect(section.queryByRole("button", { name: /Payment method|cad\.export/ })).toBeNull();
+    await expect(section.queryByRole("button", { name: /cad\.export/ })).toBeNull();
+
+    // The MCP App tool can write too: it opens only after the confirmation, in a modal.
+    await userEvent.click(section.getByRole("button", { name: "Open Payment method" }));
+    await userEvent.click(await page.findByRole("button", { name: "Run" }));
+    const appDialog = await page.findByRole("dialog", { name: "Payment method" });
+    await expect(toolActionRuns[2]).toEqual({ toolName: "cad.payment", confirmed: true });
+    await waitFor(() => expect(appDialog.querySelector("iframe")).not.toBeNull());
+    // One Close control: the panel's own header (the dialog's corner button is hidden).
+    await expect(within(appDialog).getAllByRole("button", { name: /close/i })).toHaveLength(1);
+    // Escape closes the app modal and leaves the settings dialog open.
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(page.queryByRole("dialog", { name: "Payment method" })).toBeNull());
+    await expect(within(dialog).getByTestId("mcp-server-settings")).toBeInTheDocument();
   },
 };
 

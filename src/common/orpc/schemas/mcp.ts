@@ -382,7 +382,7 @@ export const MCPSettingsToolActionSchema = z.object({
   title: z.string(),
   /** `annotations.readOnlyHint: true`. Any other tool asks the user before it runs. */
   readOnly: z.boolean(),
-  /** An MCP App tool (a `ui://` view): the spec opens it in a modal, not supported yet. */
+  /** An MCP App tool (a `ui://` view): the spec opens it in a modal (openSettingsApp). */
   opensApp: z.boolean(),
 });
 export const MCPSettingsLayoutItemSchema = z.discriminatedUnion("kind", [
@@ -440,6 +440,17 @@ export const MCPSettingsRunToolParamsSchema = MCPSettingsReadParamsSchema.extend
   instanceToken: z.string(),
   /** The user confirmed the run; required for a tool without `readOnlyHint: true`. */
   confirmed: z.boolean(),
+});
+/** A settings layout tool action that opens an MCP App: the view to show in a modal. */
+export const MCPSettingsOpenAppResultSchema = z.object({
+  /** The view record's key (McpAppViewRef.toolCallId). */
+  viewKey: z.string().min(1),
+  serverName: z.string().min(1),
+  /** What the user sees for the server (a plugin server's key is internal). */
+  serverLabel: z.string(),
+  toolName: z.string().min(1),
+  title: z.string(),
+  resourceUri: z.string().refine(isMcpAppResourceUri),
 });
 /** The text parts of the tool result (bounded); `isError` when the tool reported an error. */
 export const MCPSettingsRunToolResultSchema = z.object({

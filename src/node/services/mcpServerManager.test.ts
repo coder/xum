@@ -1533,6 +1533,95 @@ describe("MCPServerManager", () => {
     expect(reads).toEqual(["apps-read ui://x/a"]);
   });
 
+  test("settings app actions: an MCP App tool opens with {} into a view record; the run path refuses it", async () => {
+    using tmp = new DisposableTempDir("mcp-settings-apps");
+    const store = new McpAppResultStore((id) => path.join(tmp.path, id));
+    let appsEnabled = true;
+    manager.setMcpApps({ isEnabled: () => appsEnabled, store });
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-apps") });
+    const actions: Record<string, MCPSettingsToolAction> = {
+      payment: { title: "Payment method", readOnly: false, opensApp: true },
+      library: { title: "Part library", readOnly: true, opensApp: false },
+    };
+    const calls: string[] = [];
+    servers.serve("settings-apps", {
+      tools: { draw: testTool() },
+      apps: {
+        hasTool: () => true,
+        toolUi: (name: string) =>
+          name === "payment" ? { resourceUri: "ui://cad/payment", visibility: ["app"] } : undefined,
+        appEntrypoints: () => [],
+        callToolForApp: () => Promise.reject(new Error("an app open sends the settings _meta")),
+      },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () =>
+          Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: {} },
+              values: {},
+              layout: [
+                { kind: "group", title: "Billing", items: [{ kind: "tool", tool: "payment" }] },
+              ],
+            },
+          }),
+        settingsToolAction: (name) => (Object.hasOwn(actions, name) ? actions[name] : undefined),
+        // The app open calls through the settings path: `{}` and the workspace `_meta`.
+        callSettingsActionTool: (name, meta) => {
+          calls.push(`${name} ${JSON.stringify(meta)}`);
+          return Promise.resolve({ content: [{ type: "text" as const, text: "form" }] });
+        },
+      },
+    });
+    const workspaceId = "settings-apps-ws";
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const snapshot = await manager.readSettings(workspaceId, "cad");
+    if (snapshot === null) throw new Error("expected settings");
+    const open = (tool: string, confirmed: boolean) =>
+      manager
+        .openSettingsApp(workspaceId, "cad", tool, snapshot.instanceToken, { confirmed })
+        .catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+
+    // Each path takes only its own kind of tool; a tool that can write needs a confirmation.
+    expect(await open("library", true)).toContain("has no MCP App");
+    expect(await open("payment", false)).toContain("confirmation");
+    const runRefusal = await manager
+      .runSettingsTool(workspaceId, "cad", "payment", snapshot.instanceToken, { confirmed: true })
+      .catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+    expect(runRefusal).toContain("opens an MCP App");
+    expect(calls).toEqual([]);
+
+    expect(await open("payment", true)).toEqual({
+      viewKey: "settings:cad:payment",
+      serverName: "cad",
+      serverLabel: "cad",
+      toolName: "payment",
+      title: "Payment method",
+      resourceUri: "ui://cad/payment",
+    });
+    expect(calls).toEqual([`payment {"xum/workspaceId":"${workspaceId}"}`]);
+    // getMcpAppView mounts the modal's view from this record; it is never a tool call's view.
+    // With the experiment switched off, nothing opens: the open is refused (the server restarts
+    // without MCP Apps), and a fresh read gives the app tool no action.
+    appsEnabled = false;
+    expect(await open("payment", true)).toContain("Reopen");
+    expect(calls).toHaveLength(1);
+    const reread = await manager.readSettings(workspaceId, "cad");
+    expect(snapshot.layout[0]?.items).toEqual([
+      { kind: "tool", tool: "payment", action: actions.payment },
+    ]);
+    expect(reread?.layout[0]?.items).toEqual([{ kind: "tool", tool: "payment" }]);
+    expect(await store.get(workspaceId, "settings:cad:payment")).toMatchObject({
+      serverName: "cad",
+      toolName: "payment",
+      resourceUri: "ui://cad/payment",
+      arguments: {},
+      result: { content: [{ type: "text", text: "form" }] },
+      entrypoint: true,
+    });
+  });
+
   test("entry points: listed per enabled server, opened with {} on their own server only", async () => {
     using tmp = new DisposableTempDir("mcp-apps-entrypoints");
     const store = new McpAppResultStore((id) => path.join(tmp.path, id));

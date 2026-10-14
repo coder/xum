@@ -42,8 +42,9 @@ const McpAppResultRecordSchema = z.object({
   result: z.unknown().nullable(),
   createdAt: z.number(),
   /**
-   * Written by an entry point open (MCPServerManager.openMcpAppEntrypoint), never by a tool
-   * call. A restored tab whose entry point is gone is then unavailable, not a tool call's view.
+   * Written by an entry point open (MCPServerManager.openMcpAppEntrypoint) or a settings app
+   * open (openSettingsApp), never by a tool call. A restored tab whose entry point is gone is
+   * then unavailable, not a tool call's view.
    */
   entrypoint: z.literal(true).optional(),
 });

@@ -191,6 +191,7 @@ import {
   MCPSettingsUpdateParamsSchema,
   MCPSettingsRunToolParamsSchema,
   MCPSettingsRunToolResultSchema,
+  MCPSettingsOpenAppResultSchema,
   MCPSetEnabledGlobalParamsSchema,
   MCPSetEnabledParamsSchema,
   MCPSetToolAllowlistGlobalParamsSchema,
@@ -1173,6 +1174,11 @@ export const mcp = {
     runTool: {
       input: MCPSettingsRunToolParamsSchema,
       output: ResultSchema(MCPSettingsRunToolResultSchema, z.string()),
+    },
+    /** Open a layout tool action's MCP App: call the tool and store its view record. */
+    openApp: {
+      input: MCPSettingsRunToolParamsSchema,
+      output: ResultSchema(MCPSettingsOpenAppResultSchema, z.string()),
     },
   },
   configureDesign: {

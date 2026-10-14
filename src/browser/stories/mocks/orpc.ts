@@ -348,7 +348,10 @@ export interface MockORPCClientOptions {
   mcpSettingsAfterUpdate?: Map<string, MCPSettingsSnapshot>;
   /** When set, the first settings read takes its values, then waits for this promise. */
   mcpSettingsFirstReadGate?: { promise: Promise<void> };
-  /** Records every settings tool action run; each one returns "<tool> finished". */
+  /**
+   * Records every settings tool action run or app open. A run returns "<tool> finished"; an app
+   * opens the view `settings:<server>:<tool>` (`ui://<server>/<tool>`) of `mcpApps.views`.
+   */
   mcpSettingsToolRuns?: Array<{ toolName: string; confirmed: boolean }>;
   /** When set, the first settings tool run waits for this promise (a run held in flight). */
   mcpSettingsToolRunGate?: { promise: Promise<void> };
@@ -1443,6 +1446,25 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
               instanceToken: mockSettingsToken(input.serverName),
             },
           };
+        },
+        openApp: (input: { serverName: string; toolName: string; confirmed: boolean }) => {
+          mcpSettingsToolRuns?.push({ toolName: input.toolName, confirmed: input.confirmed });
+          // The backend titles the view with the action's display name.
+          const action = mcpSettings
+            ?.get(input.serverName)
+            ?.layout.flatMap((group) => group.items)
+            .find((item) => item.kind === "tool" && item.tool === input.toolName);
+          return Promise.resolve({
+            success: true,
+            data: {
+              viewKey: `settings:${input.serverName}:${input.toolName}`,
+              serverName: input.serverName,
+              serverLabel: input.serverName,
+              toolName: input.toolName,
+              title: (action?.kind === "tool" ? action.action?.title : undefined) ?? input.toolName,
+              resourceUri: `ui://${input.serverName}/${input.toolName}`,
+            },
+          });
         },
         runTool: async (input: { toolName: string; confirmed: boolean }) => {
           const gated = mcpSettingsToolRuns?.length === 0 ? mcpSettingsToolRunGate : undefined;

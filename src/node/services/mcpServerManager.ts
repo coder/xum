@@ -38,6 +38,7 @@ import {
   validateMCPSettingValue,
   type MCPSettingValue,
   type MCPSettingsReadSnapshot,
+  type MCPSettingsAppView,
   type MCPSettingsGroup,
   type MCPSettingsSnapshot,
   type MCPSettingsToolAction,
@@ -57,6 +58,7 @@ import {
   MCP_APP_TOOL_CALL_WINDOW_MS,
   MCP_APP_TOOL_CALLS_PER_WINDOW,
   mcpAppEntrypointKey,
+  mcpSettingsAppKey,
   type MCPAppEntrypointType,
 } from "@/common/utils/mcpApps";
 import { sanitizeText } from "@/common/utils/mcp/displayText";
@@ -5147,6 +5149,7 @@ export class MCPServerManager {
         const refusal = this.settingsToolRefusal(instance, workspaceId, serverName, toolName, {
           instanceToken,
           confirmed: options.confirmed,
+          opensApp: false,
         });
         if (refusal !== null) return Promise.reject(refusal);
         assert(instance.settings !== undefined, "a settings tool action has a settings client");
@@ -5163,22 +5166,111 @@ export class MCPServerManager {
     );
   }
 
-  /** Why runSettingsTool refuses to call the tool on this instance; null when it may. */
+  /**
+   * Why runSettingsTool (`opensApp: false`) or openSettingsApp (`opensApp: true`) refuses to
+   * call the tool on this instance; null when it may. Each path takes only its own kind of tool.
+   */
   private settingsToolRefusal(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    serverName: string,
+    toolName: string,
+    request: { instanceToken: string; confirmed: boolean; opensApp: boolean }
+  ): Error | null {
+    if (this.settingsInstanceToken(instance) !== request.instanceToken)
+      return staleSettingsInstanceError(serverName);
+    const action = this.settingsToolAction(instance, workspaceId, serverName, toolName);
+    if (action === undefined) return new Error(`'${serverName}' has no tool named '${toolName}'`);
+    if (action.opensApp !== request.opensApp)
+      return new Error(
+        `'${action.title}' ${action.opensApp ? "opens an MCP App" : "has no MCP App"}`
+      );
+    if (!action.readOnly && !request.confirmed)
+      return new Error(`'${action.title}' runs only after a confirmation`);
+    return null;
+  }
+
+  /** settingsToolRefusal for an app open, then the entry point budget (an open calls the tool). */
+  private settingsAppRefusal(
     instance: MCPServerInstance,
     workspaceId: string,
     serverName: string,
     toolName: string,
     request: { instanceToken: string; confirmed: boolean }
   ): Error | null {
-    if (this.settingsInstanceToken(instance) !== request.instanceToken)
-      return staleSettingsInstanceError(serverName);
-    const action = this.settingsToolAction(instance, workspaceId, serverName, toolName);
-    if (action === undefined) return new Error(`'${serverName}' has no tool named '${toolName}'`);
-    if (action.opensApp) return new Error(`'${action.title}' opens an MCP App: not supported yet`);
-    if (!action.readOnly && !request.confirmed)
-      return new Error(`'${action.title}' runs only after a confirmation`);
-    return null;
+    const refusal = this.settingsToolRefusal(instance, workspaceId, serverName, toolName, {
+      ...request,
+      opensApp: true,
+    });
+    if (refusal !== null) return refusal;
+    return this.allowEntrypointCall(workspaceId, serverName)
+      ? null
+      : new Error(`Too many app opens for '${serverName}'; try again shortly`);
+  }
+
+  /**
+   * Open a settings layout tool action's MCP App (the spec shows it in a modal on top of the
+   * settings): call the tool with `{}` and store the result as the view record under
+   * mcpSettingsAppKey, as an entry point open does, so the modal mounts it through
+   * getMcpAppView. The same checks as runSettingsTool apply, and the entry point budget.
+   */
+  async openSettingsApp(
+    workspaceId: string,
+    serverName: string,
+    toolName: string,
+    instanceToken: string,
+    options: { confirmed: boolean; signal?: AbortSignal }
+  ): Promise<MCPSettingsAppView> {
+    assert(this.mcpApps, "MCP Apps support is not configured");
+    const store = this.mcpApps.store;
+    // A tool that tools/list_changed removed or changed since the dialog read is refused.
+    await this.refreshSettingsActionCatalog(workspaceId, serverName, options.signal);
+    // One-shot dispatch, as in callMcpAppTool: an epoch retry must not call the tool twice.
+    let dispatched: Promise<MCPSettingsAppView> | null = null;
+    return this.invokeServerOperation(
+      workspaceId,
+      serverName,
+      `MCP settings app '${serverName}/${toolName}'`,
+      (instance): Promise<MCPSettingsAppView> => {
+        if (dispatched !== null) return dispatched;
+        const refusal = this.settingsAppRefusal(instance, workspaceId, serverName, toolName, {
+          instanceToken,
+          confirmed: options.confirmed,
+        });
+        if (refusal !== null) return Promise.reject(refusal);
+        const resourceUri = requireAppsConnection(instance).toolUi(toolName)?.resourceUri;
+        const settings = instance.settings;
+        const title = settings?.settingsToolAction(toolName)?.title;
+        assert(settings && resourceUri !== undefined && title !== undefined, "an app has a view");
+        log.info("[MCP Apps] Opening a settings app", { workspaceId, serverName, toolName });
+        const viewKey = mcpSettingsAppKey(serverName, toolName);
+        const order = ++this.entrypointOpenCount;
+        // Through the settings action path: `{}` plus the workspace `_meta` every settings call
+        // carries, so a server that scopes its settings by workspace sees the right one.
+        const call = settings.callSettingsActionTool(
+          toolName,
+          { [MCP_SETTINGS_WORKSPACE_META_KEY]: workspaceId },
+          options
+        );
+        dispatched = call.then(async (result) => {
+          await this.storeEntrypointResult(store, workspaceId, order, {
+            toolCallId: viewKey,
+            serverName,
+            toolName,
+            resourceUri,
+            arguments: {},
+            result,
+            // Not a tool call's view: a chat card or restored tab never resolves to it.
+            entrypoint: true,
+          });
+          const serverLabel = this.appServerLabel(workspaceId, serverName);
+          return { viewKey, serverName, serverLabel, toolName, title, resourceUri };
+        });
+        return dispatched;
+      },
+      (result) => result,
+      options
+    );
   }
 
   /**

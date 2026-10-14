@@ -12,6 +12,7 @@ import type {
   MCPSettingSchemaSchema,
   MCPSettingsGroupSchema,
   MCPSettingsLayoutItemSchema,
+  MCPSettingsOpenAppResultSchema,
   MCPSettingsSnapshotSchema,
   MCPSettingsToolActionSchema,
   MCPSettingValueSchema,
@@ -34,6 +35,9 @@ export type MCPSettingsLayoutItem = z.infer<typeof MCPSettingsLayoutItemSchema>;
 export type MCPSettingsGroup = z.infer<typeof MCPSettingsGroupSchema>;
 export type MCPSettingsSnapshot = z.infer<typeof MCPSettingsSnapshotSchema>;
 export type MCPSettingsToolAction = z.infer<typeof MCPSettingsToolActionSchema>;
+
+/** A settings layout tool action's opened MCP App: what the modal mounts (McpAppViewRef). */
+export type MCPSettingsAppView = z.infer<typeof MCPSettingsOpenAppResultSchema>;
 
 /** Longest tool action result text sent to the renderer (UTF-16 units). */
 export const MAX_MCP_SETTINGS_TOOL_RESULT = 4096;

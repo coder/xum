@@ -554,7 +554,14 @@ export function McpAppFrame(props: {
     <McpAppViewHeader serverName={serverName} onClose={() => void close()} />
   );
 
-  if (current == null) return <Notice>Loading…</Notice>;
+  // A panel keeps its Close header while it loads: a hung load must stay closable.
+  if (current == null)
+    return (
+      <div className="flex min-h-0 flex-col">
+        {header}
+        <Notice>Loading…</Notice>
+      </div>
+    );
   if (current.view == null || srcDoc == null || grant == null) {
     return (
       <div className="flex min-h-0 flex-col">
