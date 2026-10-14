@@ -1492,7 +1492,7 @@ describe("McpOauthService OAuth flows", () => {
 
   test("stored tokens whose granted scope lacks a plugin's base scopes read as signed out (#6141)", async () => {
     const serverUrl = "https://example.com/mcp";
-    const seed = async (scope: string | undefined) => {
+    const seed = async (scope: string | undefined, requestedScope?: string) => {
       await service.dispose();
       service = new McpOauthService(config, mcpConfigService);
       await fs.writeFile(
@@ -1508,6 +1508,7 @@ describe("McpOauthService OAuth flows", () => {
                 access_token: "at",
                 token_type: "Bearer",
                 ...(scope !== undefined ? { scope } : {}),
+                ...(requestedScope !== undefined ? { requested_scope: requestedScope } : {}),
               },
             },
           },
@@ -1535,6 +1536,11 @@ describe("McpOauthService OAuth flows", () => {
     await seed("read write");
     expect(await usable({ clientId: "c", baseScopes: [" read write "] })).toBe(true);
     expect(await usable({ clientId: "c", baseScopes: ["read admin"] })).toBe(false);
+    // The recorded request decides, in the plugin's own scope names (#6564).
+    await seed("read write", "read");
+    expect(await usable({ clientId: "c", baseScopes: ["read", "write"] })).toBe(false);
+    await seed("User.Read", "api://app/.default");
+    expect(await usable({ clientId: "c", baseScopes: ["api://app/.default"] })).toBe(true);
   });
 
   // The SDK's auth() reads the tokens with a context before it refreshes; a transport request
@@ -1622,6 +1628,14 @@ describe("McpOauthService OAuth flows", () => {
       await provider.tokens(authCtx);
       await provider.saveTokens({ access_token: "refreshed", token_type: "Bearer" } as never);
       expect(await service.hasAuthTokens({ serverUrl, oauth })).toBe(true);
+      const stored = JSON.parse(await fs.readFile(getStoreFilePath(xumHome), "utf-8")) as {
+        entries: Record<string, { tokens?: { access_token: string; requested_scope?: string } }>;
+      };
+      // The refresh keeps the sign-in's recorded request (#6564).
+      expect(stored.entries[serverUrl].tokens).toMatchObject({
+        access_token: "refreshed",
+        requested_scope: "read write",
+      });
     });
   });
 
@@ -1651,12 +1665,19 @@ describe("McpOauthService OAuth flows", () => {
     expect(await provider.tokens()).toBeUndefined();
   });
 
-  test("a sign-in granted less than the plugin's base scopes fails and stores no token (#6141)", async () => {
+  test("a sign-in whose server renames the granted scopes stays signed in (#6564)", async () => {
     const server = createServer((req, res) => {
       const pathname = (req.url ?? "/").split("?")[0];
       if (pathname === "/token") {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ access_token: "narrow", token_type: "Bearer", scope: "read" }));
+        // Entra-style: the request names `.default`, the grant lists the permissions.
+        res.end(
+          JSON.stringify({
+            access_token: "at",
+            token_type: "Bearer",
+            scope: "User.Read Files.Read",
+          })
+        );
         return;
       }
       if (pathname === "/.well-known/oauth-authorization-server") {
@@ -1677,7 +1698,7 @@ describe("McpOauthService OAuth flows", () => {
           transport: "http",
           url: serverUrl,
           disabled: true,
-          oauth: { clientId: "c", baseScopes: ["read", "write"] },
+          oauth: { clientId: "c", baseScopes: ["api://app/.default"] },
         },
       });
       const start = await service.startServerFlow({
@@ -1692,11 +1713,17 @@ describe("McpOauthService OAuth flows", () => {
         iss: null,
         error: null,
       });
-      expect(result).toEqual({
-        success: false,
-        error: "The authorization server did not grant required scopes: write",
-      });
-      expect(await service.hasAuthTokens({ serverUrl })).toBe(false);
+      expect(result.success).toBe(true);
+      const oauth = { clientId: "c", baseScopes: ["api://app/.default"] };
+      expect(await service.hasAuthTokens({ serverUrl, oauth })).toBe(true);
+      expect((await service.getAuthStatus({ serverUrl, oauth })).isLoggedIn).toBe(true);
+      // A plugin that needs more than that sign-in requested reads as signed out.
+      expect(
+        await service.hasAuthTokens({
+          serverUrl,
+          oauth: { clientId: "c", baseScopes: ["api://app/.default", "offline_access"] },
+        })
+      ).toBe(false);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }

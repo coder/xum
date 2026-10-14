@@ -330,6 +330,17 @@ function grantCoversBaseScopes(
   return missingBaseScopes(scope, config).length === 0;
 }
 
+/**
+ * The base-scope check of stored tokens: Xum's recorded request when there is one (the plugin's
+ * own scope names, #6564), else the granted scope (tokens stored before the record existed).
+ */
+function tokensCoverBaseScopes(
+  tokens: MCPOAuthTokens | undefined,
+  config: MCPServerOAuthConfig | undefined
+): boolean {
+  return grantCoversBaseScopes(tokens?.requested_scope ?? tokens?.scope, config);
+}
+
 /** Scope strings are space-separated sets (RFC 6749 §3.3); a configured entry can hold several. */
 function scopeSet(scopes: readonly string[]): Set<string> {
   return new Set(scopes.flatMap((scope) => scope.split(/\s+/)).filter(Boolean));
@@ -345,20 +356,27 @@ function missingBaseScopes(
 }
 
 /**
- * The scope an interactive grant stores. A grant without scope is the requested scope (RFC 6749
- * §5.1): record it, so the base-scope check can read it later. Tokens without a base scope
- * would read as signed out (storedClientMatches): fail the sign-in with the reason instead of
- * reporting "Login complete" (#6141).
+ * The scope fields an interactive grant stores. A grant without scope is the requested scope
+ * (RFC 6749 §5.1). The request is recorded too: the base-scope check compares it, not the
+ * granted names, because some servers rename granted scopes (#6564). A grant that names fewer
+ * scopes than requested is kept: Xum cannot tell a renamed scope from a declined one. The
+ * request and the grant are logged, so a plugin author can see the mismatch.
  */
-function checkedGrantScope(
+function grantScopeFields(
   granted: string | undefined,
   flow: Pick<OAuthFlowBase, "scope" | "plugin">
-): string | undefined {
+): { scope?: string; requested_scope?: string } {
   const scope = granted ?? flow.scope;
   const missing = missingBaseScopes(scope, flow.plugin?.config);
-  if (missing.length === 0) return scope;
-  // The scope names come from the consented plugin config, not from the server.
-  throw new Error(`The authorization server did not grant required scopes: ${missing.join(" ")}`);
+  if (missing.length > 0)
+    log.warn("[MCP OAuth] The granted scope does not name every requested base scope", {
+      requested: flow.scope,
+      granted: scope,
+    });
+  return {
+    ...(scope !== undefined ? { scope } : {}),
+    ...(flow.scope !== undefined ? { requested_scope: flow.scope } : {}),
+  };
 }
 
 /**
@@ -385,7 +403,7 @@ function storedClientMatches(
   stored: MCPOAuthStoredCredentials | null | undefined,
   config: MCPServerOAuthConfig | undefined
 ): boolean {
-  return storedClientUsable(stored, config) && grantCoversBaseScopes(stored?.tokens?.scope, config);
+  return storedClientUsable(stored, config) && tokensCoverBaseScopes(stored?.tokens, config);
 }
 
 /**
@@ -479,9 +497,14 @@ function clientConflict(
 /** A refresh response without scope keeps the refreshed grant's scope (RFC 6749 §6). */
 function refreshedScope(input: { tokens: MCPOAuthTokens; refreshedFrom?: MCPOAuthTokens }): {
   scope?: string;
+  requested_scope?: string;
 } {
   const scope = input.tokens.scope ?? input.refreshedFrom?.scope;
-  return scope !== undefined ? { scope } : {};
+  const requested = input.tokens.requested_scope ?? input.refreshedFrom?.requested_scope;
+  return {
+    ...(scope !== undefined ? { scope } : {}),
+    ...(requested !== undefined ? { requested_scope: requested } : {}),
+  };
 }
 
 /** The same stored grant: the SDK's issuer back-stamp keeps both tokens. */
@@ -828,6 +851,13 @@ function deriveAuthorizationServerBinding(
   };
 }
 
+/** MCPOAuthTokens.requested_scope. */
+function parseRequestedScope(value: Record<string, unknown>): { requested_scope?: string } {
+  return typeof value.requested_scope === "string"
+    ? { requested_scope: value.requested_scope }
+    : {};
+}
+
 /** The provided-client mark (MCPOAuthClientInformation.provided_by_plugin). */
 function parseProvidedMark(value: Record<string, unknown>): { provided_by_plugin?: true } {
   return value.provided_by_plugin === true ? { provided_by_plugin: true } : {};
@@ -911,6 +941,7 @@ function parseStoredCredentials(value: unknown): MCPOAuthStoredCredentials | nul
         token_type: typeof tokensRaw.token_type === "string" ? tokensRaw.token_type : "",
         expires_in: typeof tokensRaw.expires_in === "number" ? tokensRaw.expires_in : undefined,
         scope: typeof tokensRaw.scope === "string" ? tokensRaw.scope : undefined,
+        ...parseRequestedScope(tokensRaw),
         refresh_token:
           typeof tokensRaw.refresh_token === "string" ? tokensRaw.refresh_token : undefined,
         ...parseAuthorizationServerBinding(tokensRaw),
@@ -1780,11 +1811,11 @@ export class McpOauthService {
     return {
       tokens: () => Promise.resolve(undefined),
       saveTokens: async (tokens) => {
-        const scope = checkedGrantScope(tokens.scope, flow);
+        const scopes = grantScopeFields(tokens.scope, flow);
         await this.saveTokens({
           serverUrl: flow.serverUrlForStoreKey,
           // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-          tokens: { ...tokens, scope } as unknown as MCPOAuthTokens,
+          tokens: { ...tokens, ...scopes } as unknown as MCPOAuthTokens,
           legacyBinding: deriveAuthorizationServerBinding(flow.discoveryState),
           flowGeneration: flow.signOutGeneration,
           clientId: flow.clientInformation?.client_id ?? flow.plugin?.config.clientId,

@@ -59,6 +59,12 @@ export interface MCPOAuthTokens {
    * first use.
    */
   issuer?: string;
+  /**
+   * The scope Xum requested in the sign-in that issued these tokens (refreshes keep it). The
+   * base-scope check reads it before the granted `scope`: some servers rename granted scopes
+   * (Entra `.default`, Google URL forms), so only the request uses the plugin's names (#6564).
+   */
+  requested_scope?: string;
 }
 
 /**
