@@ -1424,6 +1424,40 @@ describe("Config", () => {
       }
     );
 
+    // Perf contract (#5929): the alias merge adds no file reads or directory listings to a load
+    // without a legacy-copy shape, with or without aliases.
+    for (const [name, stored] of [
+      ["no aliases", () => [["/home/u/repo", { workspaces: [row("ws-one")] }]] as StoredPair[]],
+      [
+        "two aliases with distinct rows",
+        () =>
+          [
+            ["/home/u/repo", { workspaces: [row("ws-one")] }],
+            ["/home/u/repo/", { workspaces: [row("ws-two")] }],
+          ] as StoredPair[],
+      ],
+    ] as const) {
+      it(`reads no session metadata and lists no directory on a load with ${name}`, () => {
+        writeProjects(stored());
+        const readSpy = spyOn(fs, "readFileSync");
+        const readdirSpy = spyOn(fs, "readdirSync");
+        const warnSpy = spyOn(log, "warn").mockImplementation(() => undefined);
+        try {
+          config.loadConfigOrDefault();
+          // feature_flags.json is the existing legacy heartbeat probe, not the alias merge.
+          expect(readSpy.mock.calls.map(([file]) => path.basename(String(file))).sort()).toEqual([
+            "config.json",
+            "feature_flags.json",
+          ]);
+          expect(readdirSpy).not.toHaveBeenCalled();
+        } finally {
+          readSpy.mockRestore();
+          readdirSpy.mockRestore();
+          warnSpy.mockRestore();
+        }
+      });
+    }
+
     // #5929: an id-less legacy row in one alias and an id row in another, on one checkout path.
     describe("an id-less row and an id row on the same path", () => {
       // StoredPair rows need an id, so this writes the id-less row as plain JSON.
