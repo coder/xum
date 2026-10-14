@@ -212,6 +212,12 @@ interface ResolvedWorkspaceLifecycleTarget {
   metadata: WorkspaceMetadata | null;
 }
 
+type ExecutionMirror = Pick<WorkspaceConfigEntry, "taskExecutionId" | "taskExecutionStatus">;
+
+function sameExecutionMirror(a: ExecutionMirror, b: ExecutionMirror): boolean {
+  return a.taskExecutionId === b.taskExecutionId && a.taskExecutionStatus === b.taskExecutionStatus;
+}
+
 function parseTerminalSubagentExecutionVersion(content: string): string | null {
   const report = parseSubagentReportEnvelope(content);
   if (report?.executionVersion != null) return report.executionVersion;
@@ -6096,33 +6102,27 @@ export class WorkspaceTurnManager {
    */
   private async persistRecoveredTerminalExecutionMirror(
     workspaceId: string,
-    snapshot: Pick<WorkspaceConfigEntry, "taskExecutionId" | "taskExecutionStatus">,
+    snapshot: ExecutionMirror,
     record: WorkspaceTurnTaskHandleRecord
   ): Promise<void> {
     assert(
       !isActiveWorkspaceTurnTaskStatus(record.status),
       "persistRecoveredTerminalExecutionMirror: record must be terminal"
     );
+    const target: ExecutionMirror = {
+      taskExecutionId: record.handleId,
+      taskExecutionStatus: record.status,
+    };
     // The snapshot already holds this outcome, so the compare-and-set below could only leave the
     // row as it is. Skip the edit: each one rewrites the whole config file, and a large config has
     // hundreds of settled mirrors (#6511).
-    if (
-      snapshot.taskExecutionId === record.handleId &&
-      snapshot.taskExecutionStatus === record.status
-    ) {
-      return;
-    }
+    if (sameExecutionMirror(snapshot, target)) return;
     await this.taskHost.editWorkspaceEntry(
       workspaceId,
       (workspace) => {
-        if (
-          workspace.taskExecutionId !== snapshot.taskExecutionId ||
-          workspace.taskExecutionStatus !== snapshot.taskExecutionStatus
-        ) {
-          return;
-        }
-        workspace.taskExecutionId = record.handleId;
-        workspace.taskExecutionStatus = record.status;
+        if (!sameExecutionMirror(workspace, snapshot)) return;
+        workspace.taskExecutionId = target.taskExecutionId;
+        workspace.taskExecutionStatus = target.taskExecutionStatus;
       },
       { allowMissing: true }
     );
