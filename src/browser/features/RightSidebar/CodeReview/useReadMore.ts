@@ -16,6 +16,14 @@ import {
 } from "@/browser/utils/review/readFileLines";
 import { resolveRepoRootProjectPath } from "@/browser/utils/executeBash";
 
+/**
+ * readFileLines, with a failed call (a lost connection) read as "no lines": the loading row ends
+ * and the expand button stays, so the user can retry after the reconnect.
+ */
+function readContextLines(...args: Parameters<typeof readFileLines>): Promise<string[] | null> {
+  return readFileLines(...args).catch(() => null);
+}
+
 /** Expansion state for a single hunk */
 interface ReadMoreState {
   up: number; // Lines expanded upward (cumulative)
@@ -104,7 +112,7 @@ export function useReadMore(options: UseReadMoreOptions): UseReadMoreResult {
     const startLine = Math.max(1, hunk.oldStart - readMore.up);
     const endLine = hunk.oldStart - 1;
 
-    void readFileLines(
+    void readContextLines(
       api,
       workspaceId,
       workspaceMetadata.get(workspaceId),
@@ -150,7 +158,7 @@ export function useReadMore(options: UseReadMoreOptions): UseReadMoreResult {
     const startLine = hunkEnd + 1;
     const endLine = hunkEnd + readMore.down;
 
-    void readFileLines(
+    void readContextLines(
       api,
       workspaceId,
       workspaceMetadata.get(workspaceId),
