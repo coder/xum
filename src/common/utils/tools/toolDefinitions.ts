@@ -2496,7 +2496,7 @@ export const TOOL_DEFINITIONS = {
       "item_id is a returned itemId or a message's [id: ...] value; window IDs are w:<n> (w:0 = root). " +
       "Only list_items and search take role and tool_name (exact, includes nested calls; AND-combined) and max_chars_per_item (per-snippet cap). Lists are oldest-first; recent_first reverses them (IDs unchanged). " +
       "task_id reads a descendant sub-agent spawned in an earlier, settled turn, from its latest manual reset. " +
-      "task_id also accepts a non-descendant this workspace may message (a same-tree peer, ancestor or root, or an unrelated workspace that opted in to agent messages; see task_list scope tree/instance) or one running or following a turn it delegated with task(kind=\"workspace\"), read from its latest manual reset: use it to follow another workspace's replies, e.g. after new input there superseded your delegated turn. " +
+      'task_id also accepts a non-descendant this workspace may message (a same-tree peer, ancestor or root, or an unrelated workspace that opted in to agent messages; see task_list scope tree/instance) or one running or following a turn it delegated with task(kind="workspace"), read from its latest manual reset: use it to follow another workspace\'s replies, e.g. after new input there superseded your delegated turn. ' +
       "has_more means more matches: narrow by window_id, filters, or a smaller limit instead of paging. Retry history_changed; narrow and retry history_timeout; search again when an item_id stops resolving.",
     schema: z
       .object({

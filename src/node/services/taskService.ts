@@ -16213,11 +16213,14 @@ export class TaskService implements AgentTaskIntegration {
     if (!callerEntry || !targetEntry) return false;
     const index = this.buildAgentTaskIndex(cfg);
     const relation = this.resolveAgentTreeTargetRelation(
+      cfg,
       index.parentById,
       callerWorkspaceId,
       targetId
     );
-    // Descendants are not handled here: they need the caller's privacy-segment proof.
+    // Descendants are not handled here: they need the caller's privacy-segment proof. A null
+    // relation includes side chats seen from outside their direct link: they stay private.
+    // A main/side chat link alone grants no read; the delegated and consent checks below apply.
     if (relation == null || relation === "target_descendant") return false;
     if (
       this.isBestOfChainUsingIndex(index, callerWorkspaceId) ||
