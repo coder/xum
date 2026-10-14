@@ -164,6 +164,8 @@ describeIntegration("RightSidebar (UI)", () => {
 
   async function setupRightSidebarView(beforeRender?: () => void) {
     const cleanupDom = installDom();
+    // Most tests exercise open tools; individual tests can clear this to cover the default.
+    updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
     beforeRender?.();
     const view = renderApp({ apiClient: env.orpc, metadata });
 
@@ -240,6 +242,23 @@ describeIntegration("RightSidebar (UI)", () => {
         expect(browserTab).toBeNull();
         expect(desktopTab).toBeNull();
       });
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
+  test("a fresh chat starts collapsed and opens tools only on request", async () => {
+    const { sidebar, cleanup } = await setupRightSidebarView(() => {
+      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, null);
+    });
+
+    try {
+      expect(sidebar.classList.contains("right-sidebar-overview-card")).toBe(true);
+      expect(sidebar.querySelector('[role="tablist"]')).toBeNull();
+      expect(sidebar.querySelector('[role="tabpanel"]')).toBeNull();
+      fireEvent.click(within(sidebar).getByRole("button", { name: "Expand sidebar" }));
+      const launcher = await findSidebarPanel(sidebar, "-panel-new");
+      expect(within(launcher).getByRole("button", { name: "Review" })).toBeTruthy();
     } finally {
       await cleanup();
     }

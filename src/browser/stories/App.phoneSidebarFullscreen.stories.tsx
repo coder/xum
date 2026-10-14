@@ -84,8 +84,8 @@ function setup(layout: RightSidebarLayoutState = LAYOUT, workspaceId = WORKSPACE
     ],
   });
   updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, true);
-  // Collapsed on a wide layout earlier: opening the full-screen view expands it.
-  updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);
+  // Start without a preference: the default is collapsed, but the phone view must still open.
+  updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, null);
   updatePersistedState(getRightSidebarLayoutKey(workspaceId), layout);
   // The Browser tool polls for sessions; this story has none.
   client.browser = {

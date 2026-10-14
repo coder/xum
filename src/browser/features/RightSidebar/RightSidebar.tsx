@@ -1,3 +1,4 @@
+import { RIGHT_SIDEBAR_DEFAULT_COLLAPSED } from "@/constants/layout";
 import React from "react";
 import { X } from "lucide-react";
 import {
@@ -1116,9 +1117,13 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
 
   // Manual collapse state (persisted globally)
   // WorkspaceShell expands it when it opens the phone full-screen view (see there).
-  const [collapsed, setCollapsed] = usePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, false, {
-    listener: true,
-  });
+  const [collapsed, setCollapsed] = usePersistedState<boolean>(
+    RIGHT_SIDEBAR_COLLAPSED_KEY,
+    RIGHT_SIDEBAR_DEFAULT_COLLAPSED,
+    {
+      listener: true,
+    }
+  );
   const [isReviewImmersive, setIsReviewImmersive] = usePersistedState<boolean>(
     getReviewImmersiveKey(workspaceId),
     false,

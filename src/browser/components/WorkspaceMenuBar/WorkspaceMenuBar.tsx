@@ -76,6 +76,7 @@ import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/const
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import {
   NARROW_VIEWPORT_MAX_WIDTH_PX,
+  RIGHT_SIDEBAR_DEFAULT_COLLAPSED,
   WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX,
 } from "@/constants/layout";
 import { appViewTabFor } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
@@ -205,10 +206,14 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const forkError = usePopoverError();
   const stopRuntimeError = usePopoverError();
 
-  const [rightSidebarCollapsed] = usePersistedState<boolean>(RIGHT_SIDEBAR_COLLAPSED_KEY, false, {
-    // This state is toggled from RightSidebar, so we need cross-component updates.
-    listener: true,
-  });
+  const [rightSidebarCollapsed] = usePersistedState<boolean>(
+    RIGHT_SIDEBAR_COLLAPSED_KEY,
+    RIGHT_SIDEBAR_DEFAULT_COLLAPSED,
+    {
+      // This state is toggled from RightSidebar, so we need cross-component updates.
+      listener: true,
+    }
+  );
 
   // Notification on response toggle (workspace-level) - defaults to disabled
   const notifyOnResponse =
