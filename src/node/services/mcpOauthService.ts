@@ -10,6 +10,7 @@ import {
   checkResourceAllowed,
   discoverAuthorizationServerMetadata,
   discoverOAuthServerInfo,
+  type FetchLike,
   IssuerMismatchError,
   type OAuthClientProvider,
   type OAuthDiscoveryState,
@@ -140,6 +141,8 @@ interface OAuthFlowBase {
   settled: boolean;
   /** The server key's sign-out generation when the flow started (see signOutGenerations). */
   signOutGeneration: number;
+  /** Aborted when the flow settles: the start's discovery requests end with it (#6164). */
+  startAbort: AbortController;
 }
 
 interface DesktopFlow extends OAuthFlowBase {
@@ -192,7 +195,8 @@ function isUnderIssuer(url: string, issuer: string): boolean {
 async function pluginFlowDiscoveryState(
   config: MCPServerOAuthConfig,
   challenge: BearerChallenge | null,
-  serverUrlForDiscovery: string
+  serverUrlForDiscovery: string,
+  fetchFn: FetchLike
 ): Promise<OAuthDiscoveryState | undefined> {
   const registrationUrl = config.discovery?.registrationUrl;
   if (registrationUrl === undefined) return pluginDiscoveryState(config);
@@ -202,9 +206,12 @@ async function pluginFlowDiscoveryState(
       base !== undefined
         ? {
             authorizationServerUrl: base,
-            authorizationServerMetadata: await discoverAuthorizationServerMetadata(base),
+            authorizationServerMetadata: await discoverAuthorizationServerMetadata(base, {
+              fetchFn,
+            }),
           }
         : await discoverOAuthServerInfo(serverUrlForDiscovery, {
+            fetchFn,
             ...(challenge?.resourceMetadataUrl !== undefined
               ? { resourceMetadataUrl: challenge.resourceMetadataUrl }
               : {}),
@@ -232,6 +239,15 @@ async function pluginFlowDiscoveryState(
     log.debug("[MCP OAuth] Plugin registrationUrl discovery failed", { error });
     return pluginDiscoveryState(config);
   }
+}
+
+/** `fetch` whose requests also end when `signal` aborts. */
+function abortableFetch(signal: AbortSignal): FetchLike {
+  return (url, init) =>
+    fetch(url, {
+      ...init,
+      signal: init?.signal ? AbortSignal.any([init.signal, signal]) : signal,
+    });
 }
 
 /** A plugin's registered client (skips DCR). The SDK sends client_secret to the token endpoint only. */
@@ -1263,12 +1279,6 @@ export class McpOauthService {
       return Err(serverConfig.error);
     }
 
-    const serverUrlForDiscovery = serverConfig.data.serverUrlForDiscovery;
-    const serverUrlForStoreKey = serverConfig.data.serverUrlForStoreKey;
-    const transport = serverConfig.data.transport;
-
-    const projectKey = normalizeProjectPathKey(input.projectPath);
-
     const flowId = crypto.randomUUID();
     const { promise: resultPromise, resolve: resolveResult } =
       createDeferred<Result<void, string>>();
@@ -1334,81 +1344,110 @@ export class McpOauthService {
 
     const redirectUri = `http://127.0.0.1:${address.port}/callback`;
 
-    // Best-effort probe for OAuth hints (scope/resource_metadata). If it fails,
-    // the MCP SDK can still fall back to well-known discovery.
-    const challenge = await probeServerForBearerChallenge({
-      serverUrl: serverUrlForDiscovery,
-      transport,
-    });
-
+    // Register the flow and start its deadline before any network request, so the deadline,
+    // Cancel and a sign-out also end a stalled discovery (#6164).
     const flow: DesktopFlow = {
-      flowId,
-      projectPath: projectKey,
-      serverName: input.serverName,
-      serverUrlForDiscovery,
-      serverUrlForStoreKey,
-      transport,
-      startedAtMs: Date.now(),
-      clientInformation: null,
-      authorizeUrl: "",
-      redirectUri,
-      ...(await this.pluginFlowFields(
-        serverConfig.data.oauth,
-        challenge,
-        serverConfig.data.serverUrlForDiscovery
-      )),
-      resourceMetadataUrl: challenge?.resourceMetadataUrl,
-      codeVerifier: null,
+      ...this.newFlowBase(input, serverConfig.data, redirectUri),
       server: serverListener,
       timeout: setTimeout(() => {
         void this.finishDesktopFlow(flowId, Err("Timed out waiting for OAuth callback"));
       }, DEFAULT_DESKTOP_TIMEOUT_MS),
-      cleanupTimeout: null,
+      flowId,
       resultPromise,
       resolveResult,
-      settled: false,
-      signOutGeneration: this.signOutGeneration(serverUrlForStoreKey),
     };
-
     this.desktopFlows.set(flowId, flow);
 
-    this.captureTelemetry({
-      event: "mcp_oauth_flow_started",
-      properties: {
-        transport: flow.transport,
-        has_scope_hint: Boolean(flow.scope),
-        has_resource_metadata_hint: Boolean(flow.resourceMetadataUrl),
-      },
+    const started = await this.beginAuthorization(flow, serverConfig.data.oauth);
+    if (!started.success) {
+      await this.finishDesktopFlow(flowId, started);
+      return started;
+    }
+    log.debug("[MCP OAuth] Desktop flow started", {
+      flowId,
+      projectPath: flow.projectPath,
+      serverName: input.serverName,
     });
+    return Ok({ flowId, authorizeUrl: flow.authorizeUrl, redirectUri });
+  }
 
+  /** The fields every new flow starts with (the plugin fields are filled in by discovery). */
+  private newFlowBase(
+    input: { projectPath: string; serverName: string },
+    server: {
+      serverUrlForDiscovery: string;
+      serverUrlForStoreKey: string;
+      transport: OAuthFlowBase["transport"];
+    },
+    redirectUri: string
+  ): Omit<OAuthFlowBase, "flowId" | "timeout" | "resultPromise" | "resolveResult"> {
+    return {
+      projectPath: normalizeProjectPathKey(input.projectPath),
+      serverName: input.serverName,
+      serverUrlForDiscovery: server.serverUrlForDiscovery,
+      serverUrlForStoreKey: server.serverUrlForStoreKey,
+      transport: server.transport,
+      startedAtMs: Date.now(),
+      clientInformation: null,
+      authorizeUrl: "",
+      redirectUri,
+      discoveryState: undefined,
+      codeVerifier: null,
+      cleanupTimeout: null,
+      settled: false,
+      signOutGeneration: this.signOutGeneration(server.serverUrlForStoreKey),
+      startAbort: new AbortController(),
+    };
+  }
+
+  /**
+   * Probes and discovers for a registered flow, then runs the SDK's authorization start.
+   * Every request ends when the flow settles (deadline, Cancel, sign-out, shutdown); the result
+   * is then the settled one. The probe and the scope lookup carry their own 5 s timeouts.
+   */
+  private async beginAuthorization(
+    flow: OAuthFlowBase,
+    oauth: MCPServerOAuthConfig | undefined
+  ): Promise<Result<void, string>> {
+    const fetchFn = abortableFetch(flow.startAbort.signal);
     try {
-      // Force a user-interactive flow by not exposing existing tokens.
-      const provider = this.createFlowProvider(flow);
+      // Best-effort probe for OAuth hints (scope/resource_metadata). If it fails,
+      // the MCP SDK can still fall back to well-known discovery.
+      const challenge = await probeServerForBearerChallenge({
+        serverUrl: flow.serverUrlForDiscovery,
+        transport: flow.transport,
+      });
+      flow.resourceMetadataUrl = challenge?.resourceMetadataUrl;
+      Object.assign(
+        flow,
+        await this.pluginFlowFields(oauth, challenge, flow.serverUrlForDiscovery, fetchFn)
+      );
+      if (flow.settled) return await flow.resultPromise;
 
-      const result = await auth(provider, {
-        serverUrl: serverUrlForDiscovery,
+      this.captureTelemetry({
+        event: "mcp_oauth_flow_started",
+        properties: {
+          transport: flow.transport,
+          has_scope_hint: Boolean(flow.scope),
+          has_resource_metadata_hint: Boolean(flow.resourceMetadataUrl),
+        },
+      });
+
+      // Force a user-interactive flow by not exposing existing tokens.
+      const result = await auth(this.createFlowProvider(flow), {
+        serverUrl: flow.serverUrlForDiscovery,
         scope: flow.scope,
         resourceMetadataUrl: flow.resourceMetadataUrl,
+        fetchFn,
       });
-
-      if (result !== "REDIRECT" || !flow.authorizeUrl) {
-        // If auth() completes without redirecting the user, treat it as a failure
-        // and tear down the loopback listener.
-        await this.finishDesktopFlow(flowId, Err("Failed to start OAuth authorization"));
-        return Err("Failed to start OAuth authorization");
-      }
-
-      log.debug("[MCP OAuth] Desktop flow started", {
-        flowId,
-        projectPath: projectKey,
-        serverName: input.serverName,
-      });
-
-      return Ok({ flowId, authorizeUrl: flow.authorizeUrl, redirectUri });
+      if (flow.settled) return await flow.resultPromise;
+      // If auth() completes without redirecting the user, treat it as a failure
+      // and tear down the flow.
+      return result === "REDIRECT" && flow.authorizeUrl
+        ? Ok(undefined)
+        : Err("Failed to start OAuth authorization");
     } catch (error) {
-      const message = getErrorMessage(error);
-      await this.finishDesktopFlow(flowId, Err(message));
-      return Err(message);
+      return flow.settled ? await flow.resultPromise : Err(getErrorMessage(error));
     }
   }
 
@@ -1462,10 +1501,6 @@ export class McpOauthService {
       return Err(serverConfig.error);
     }
 
-    const serverUrlForDiscovery = serverConfig.data.serverUrlForDiscovery;
-    const serverUrlForStoreKey = serverConfig.data.serverUrlForStoreKey;
-    const transport = serverConfig.data.transport;
-
     let redirectUri: URL;
     try {
       redirectUri = new URL(input.redirectUri);
@@ -1477,85 +1512,33 @@ export class McpOauthService {
       return Err("OAuth redirect URI must be http(s)");
     }
 
-    const projectKey = normalizeProjectPathKey(input.projectPath);
-
     const flowId = crypto.randomUUID();
     const { promise: resultPromise, resolve: resolveResult } =
       createDeferred<Result<void, string>>();
 
-    // Best-effort probe for OAuth hints (scope/resource_metadata). If it fails,
-    // the MCP SDK can still fall back to well-known discovery.
-    const challenge = await probeServerForBearerChallenge({
-      serverUrl: serverUrlForDiscovery,
-      transport,
-    });
-
+    // Registered before any network request, like the desktop flow (#6164).
     const flow: ServerFlow = {
-      flowId,
-      projectPath: projectKey,
-      serverName: input.serverName,
-      serverUrlForDiscovery,
-      serverUrlForStoreKey,
-      transport,
-      startedAtMs: Date.now(),
-      clientInformation: null,
-      authorizeUrl: "",
-      redirectUri: redirectUri.toString(),
-      ...(await this.pluginFlowFields(
-        serverConfig.data.oauth,
-        challenge,
-        serverConfig.data.serverUrlForDiscovery
-      )),
-      resourceMetadataUrl: challenge?.resourceMetadataUrl,
-      codeVerifier: null,
+      ...this.newFlowBase(input, serverConfig.data, redirectUri.toString()),
       timeout: setTimeout(() => {
         void this.finishServerFlow(flowId, Err("Timed out waiting for OAuth callback"));
       }, DEFAULT_SERVER_TIMEOUT_MS),
-      cleanupTimeout: null,
+      flowId,
       resultPromise,
       resolveResult,
-      settled: false,
-      signOutGeneration: this.signOutGeneration(serverUrlForStoreKey),
     };
-
     this.serverFlows.set(flowId, flow);
 
-    this.captureTelemetry({
-      event: "mcp_oauth_flow_started",
-      properties: {
-        transport: flow.transport,
-        has_scope_hint: Boolean(flow.scope),
-        has_resource_metadata_hint: Boolean(flow.resourceMetadataUrl),
-      },
-    });
-
-    try {
-      // Force a user-interactive flow by not exposing existing tokens.
-      const provider = this.createFlowProvider(flow);
-
-      const result = await auth(provider, {
-        serverUrl: serverUrlForDiscovery,
-        scope: flow.scope,
-        resourceMetadataUrl: flow.resourceMetadataUrl,
-      });
-
-      if (result !== "REDIRECT" || !flow.authorizeUrl) {
-        await this.finishServerFlow(flowId, Err("Failed to start OAuth authorization"));
-        return Err("Failed to start OAuth authorization");
-      }
-
-      log.debug("[MCP OAuth] Server flow started", {
-        flowId,
-        projectPath: projectKey,
-        serverName: input.serverName,
-      });
-
-      return Ok({ flowId, authorizeUrl: flow.authorizeUrl, redirectUri: flow.redirectUri });
-    } catch (error) {
-      const message = getErrorMessage(error);
-      await this.finishServerFlow(flowId, Err(message));
-      return Err(message);
+    const started = await this.beginAuthorization(flow, serverConfig.data.oauth);
+    if (!started.success) {
+      await this.finishServerFlow(flowId, started);
+      return started;
     }
+    log.debug("[MCP OAuth] Server flow started", {
+      flowId,
+      projectPath: flow.projectPath,
+      serverName: input.serverName,
+    });
+    return Ok({ flowId, authorizeUrl: flow.authorizeUrl, redirectUri: flow.redirectUri });
   }
 
   async waitForServerFlow(
@@ -1669,14 +1652,20 @@ export class McpOauthService {
   private async pluginFlowFields(
     config: MCPServerOAuthConfig | undefined,
     challenge: BearerChallenge | null,
-    serverUrlForDiscovery: string
+    serverUrlForDiscovery: string,
+    fetchFn: FetchLike
   ): Promise<Pick<OAuthFlowBase, "scope" | "discoveryState" | "plugin">> {
     const scope = await resolveOAuthScope(challenge);
     if (config === undefined) return { scope, discoveryState: undefined };
     const clientSecret = await readClientSecret(config);
     return {
       scope: resolvePluginScope(config, scope),
-      discoveryState: await pluginFlowDiscoveryState(config, challenge, serverUrlForDiscovery),
+      discoveryState: await pluginFlowDiscoveryState(
+        config,
+        challenge,
+        serverUrlForDiscovery,
+        fetchFn
+      ),
       plugin: { config, ...(clientSecret !== undefined ? { clientSecret } : {}) },
     };
   }
@@ -1976,6 +1965,7 @@ export class McpOauthService {
 
     flow.settled = true;
     clearTimeout(flow.timeout);
+    flow.startAbort.abort();
 
     const durationMs = Math.max(0, Date.now() - flow.startedAtMs);
     const durationMsB2 = roundToBase2(durationMs);
@@ -2030,6 +2020,7 @@ export class McpOauthService {
 
     flow.settled = true;
     clearTimeout(flow.timeout);
+    flow.startAbort.abort();
 
     const durationMs = Math.max(0, Date.now() - flow.startedAtMs);
     const durationMsB2 = roundToBase2(durationMs);
