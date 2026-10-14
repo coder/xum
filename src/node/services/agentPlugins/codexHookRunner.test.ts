@@ -79,7 +79,7 @@ async function runTool(
     executed: false,
   };
   await spine.run("tool.execute", ctx, (c) => {
-    c.result = opts.result ?? { ran: c.args };
+    c.result = "result" in opts ? opts.result : { ran: c.args };
     c.executed = true;
   });
   return ctx;
@@ -279,6 +279,25 @@ describe("PreToolUse", () => {
     const schema = { type: "object", properties: { script: { type: "string" } } };
     const ran = await runTool(rewrite.spine, "bash", { script: "ls" }, schema);
     expect(ran.result).toEqual({ ran: { script: "ls" } });
+  });
+
+  test("context reaches the model when a later middleware blocks the call", async () => {
+    // Codex PRRT_kwDOPxxmWM6rPqkW: Codex records the context before any block.
+    const { spine } = setup([hook("PreToolUse")], () =>
+      json({ hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: "Seen." } })
+    );
+    // Default order 0 runs after plugin hooks (as the shell pre-hook does).
+    spine.useBefore("tool.execute", (ctx) => {
+      ctx.blocked = { result: { error: "blocked by the shell hook" } };
+    });
+
+    const ctx = await runTool(spine, "bash", {});
+
+    expect(ctx.executed).toBe(false);
+    expect(ctx.blocked?.result).toEqual({
+      error: "blocked by the shell hook",
+      hook_output: "[plugin:guard] Seen.",
+    });
   });
 
   test("a deny keeps its own context and the context of earlier hooks", async () => {
@@ -590,6 +609,53 @@ describe("PostToolUse", () => {
       error: "[plugin:guard] Review.",
       hook_output: "[plugin:guard] PreToolUse\n[plugin:guard] PostToolUse",
     });
+  });
+
+  test("every PostToolUse hook runs after a block; their feedback is joined", async () => {
+    // Codex PRRT_kwDOPxxmWM6sGB7x (post_tool_use.rs): any block, all feedback, all context.
+    const { spine, calls } = setup(
+      [
+        hook("PostToolUse", { input: { n: 1 } }),
+        hook("PostToolUse", { input: { n: 2, out: "${tool_response}" } }),
+      ],
+      (input) =>
+        input.n === 1
+          ? json({ decision: "block", reason: "First." })
+          : json({ decision: "block", reason: "Second." })
+    );
+
+    const ctx = await runTool(spine, "bash", { script: "ls" });
+
+    // The second hook still saw the tool's own response.
+    expect(calls[1]).toEqual({ n: 2, out: { ran: { script: "ls" } } });
+    expect(ctx.result).toEqual({ error: "[plugin:guard] First.\n\n[plugin:guard] Second." });
+    expect(ctx.postBlocked).toBe(true);
+  });
+
+  test("context on a primitive, null or array result wraps it instead of losing it", async () => {
+    // Codex PRRT_kwDOPxxmWM6rgsaI, PRRT_kwDOPxxmWM6rRKxT: the shell hooks wrap the same way.
+    const { spine } = setup([hook("PostToolUse")], () =>
+      json({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: "Note." } })
+    );
+    for (const result of ["text", null, [1, 2]]) {
+      const ctx = await runTool(spine, "bash", {}, undefined, undefined, { result });
+      expect(ctx.result).toEqual({ result, hook_output: "[plugin:guard] Note." });
+    }
+  });
+
+  test("the joined context of one call is capped", async () => {
+    // Codex PRRT_kwDOPxxmWM6rPqkc: each note is capped, the join is capped too.
+    const note = "x".repeat(15 * 1024);
+    const { spine } = setup(
+      [1, 2, 3].map((n) => hook("PostToolUse", { input: { n } })),
+      () => json({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: note } })
+    );
+
+    const ctx = await runTool(spine, "bash", {});
+
+    const output = (ctx.result as { hook_output: string }).hook_output;
+    expect(output.length).toBeLessThan(33 * 1024);
+    expect(output.endsWith("[plugin hook context cut]")).toBe(true);
   });
 
   test("context on an MCP-shaped result also rides in its content, which the model reads", async () => {
