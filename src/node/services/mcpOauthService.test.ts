@@ -970,6 +970,42 @@ describe("McpOauthService OAuth flows", () => {
     }
   });
 
+  // Two Xum backends can share mcp-oauth.json (XUM_ALLOW_MULTIPLE_INSTANCES): each one rereads
+  // the file when another changed it, before it uses or rewrites credentials (#6123).
+  test("a sign-out in another process is seen at once, and a write keeps its entries", async () => {
+    const urlA = "https://a.example.com/mcp";
+    const urlB = "https://b.example.com/mcp";
+    const entry = (serverUrl: string) => ({
+      serverUrl,
+      updatedAtMs: Date.now(),
+      clientInformation: { client_id: "c" },
+      tokens: { access_token: "at", token_type: "Bearer", refresh_token: "rt" },
+    });
+    await fs.writeFile(
+      getStoreFilePath(xumHome),
+      JSON.stringify({ version: 2, entries: { [urlA]: entry(urlA) } })
+    );
+    const other = new McpOauthService(config, mcpConfigService);
+    try {
+      expect(await service.hasAuthTokens({ serverUrl: urlA })).toBe(true);
+      expect(await other.hasAuthTokens({ serverUrl: urlA })).toBe(true);
+      // The other process signs the server out (a plugin update's sign-out).
+      await other.logout({ serverUrl: urlA });
+      expect(await service.hasAuthTokens({ serverUrl: urlA })).toBe(false);
+      expect(await service.getAuthProviderForServer({ serverUrl: urlA })).toBeUndefined();
+      // The other process signs in elsewhere; this process then writes: both entries stay.
+      await fs.writeFile(
+        getStoreFilePath(xumHome),
+        JSON.stringify({ version: 2, entries: { [urlB]: entry(urlB) } })
+      );
+      await service.logout({ serverUrl: urlA });
+      expect(await other.hasAuthTokens({ serverUrl: urlB })).toBe(true);
+      expect(await service.hasAuthTokens({ serverUrl: urlB })).toBe(true);
+    } finally {
+      await other.dispose();
+    }
+  });
+
   test("a registered client's token endpoint auth method survives a restart", async () => {
     const serverUrl = "https://example.com/mcp";
     await fs.writeFile(

@@ -37,6 +37,7 @@ import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { closeServer, createDeferred, renderOAuthCallbackHtml } from "@/node/utils/oauthUtils";
 import { getErrorMessage } from "@/common/utils/errors";
+import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 
 const DEFAULT_DESKTOP_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_SERVER_TIMEOUT_MS = 10 * 60 * 1000;
@@ -2301,8 +2302,34 @@ export class McpOauthService {
     rejectDroppedFlowSave(saved, input.flowGeneration);
   }
 
+  /**
+   * The identity of the store file the cache was read from (or last written). Another Xum
+   * backend can share mcp-oauth.json (XUM_ALLOW_MULTIPLE_INSTANCES) and sign a server out or in
+   * there: every use and every write first compares the file's identity and rereads it when it
+   * changed (#6123). Known limit: there is no cross-process lock, so two writes that interleave
+   * between another process's write and this stat can still lose one update.
+   */
+  private storeStamp: string | null = null;
+
+  /** Inode, size and times of the store file ("missing" without one). */
+  private async readStoreStamp(): Promise<string | null> {
+    try {
+      const stat = await fsPromises.stat(this.storeFilePath, { bigint: true });
+      return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) return "missing";
+      // Keep the cache on another stat error: a reread that fails resets the store on disk.
+      log.debug("[MCP OAuth] Could not stat the store file", { error });
+      return this.storeStamp;
+    }
+  }
+
+  private async cacheIsCurrent(): Promise<boolean> {
+    return this.store !== null && (await this.readStoreStamp()) === this.storeStamp;
+  }
+
   private async ensureStoreLoaded(): Promise<void> {
-    if (this.store) {
+    if (await this.cacheIsCurrent()) {
       return;
     }
 
@@ -2312,9 +2339,13 @@ export class McpOauthService {
   }
 
   private async ensureStoreLoadedLocked(): Promise<McpOauthStoreFile> {
-    if (this.store) {
+    // Stat before the read: a write in between only causes one more reread.
+    const stamp = await this.readStoreStamp();
+    if (this.store && stamp === this.storeStamp) {
       return this.store;
     }
+    this.store = null;
+    this.storeStamp = stamp;
 
     try {
       const raw = await fsPromises.readFile(this.storeFilePath, "utf-8");
@@ -2336,7 +2367,7 @@ export class McpOauthService {
       this.store = parsed;
       return parsed;
     } catch (error) {
-      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      if (hasErrorCode(error, "ENOENT")) {
         this.store = createEmptyStore();
         return this.store;
       }
@@ -2367,5 +2398,7 @@ export class McpOauthService {
       encoding: "utf-8",
       mode: 0o600,
     });
+    // The cache now matches the file this process wrote.
+    this.storeStamp = await this.readStoreStamp();
   }
 }
