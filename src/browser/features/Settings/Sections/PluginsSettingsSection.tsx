@@ -1197,6 +1197,14 @@ export const PluginsSettingsSection: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- fetch on mount / API reconnect only; refresh/checkForUpdates are plain handlers (compiler-memoized), not inputs
   }, [api]);
 
+  // The intent listener below subscribes once per API, so it reads the review actions through
+  // this ref: they must see the current busy state, or a palette review could start during a
+  // running update and clear its busy flag.
+  const latestComponentReview = useRef(componentReview);
+  useEffect(() => {
+    latestComponentReview.current = componentReview;
+  });
+
   // Live palette intents while mounted (see pluginsSectionIntents).
   useEffect(() => {
     return subscribePluginsSectionIntents((intent: PluginsSectionIntent) => {
@@ -1217,7 +1225,7 @@ export const PluginsSettingsSection: React.FC = () => {
           setUpdateReview(intent.review);
           break;
         case "review-components":
-          componentReview.openFromIntent(intent);
+          latestComponentReview.current.openFromIntent(intent);
           break;
         case "refresh":
           void refresh();
