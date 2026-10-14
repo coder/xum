@@ -123,6 +123,15 @@ describe("src/node guard for browser and common code", () => {
     // Files in subfolders reach the module through "../".
     ["src/common/utils/tools/internal/example.ts", 'import { X } from "../tools";'],
     ["src/common/utils/ai/a/b/example.ts", 'import { X } from "../../providerOptions";'],
+    // Every guarded folder, alias and re-export form.
+    ["src/constants/example.ts", 'import { X } from "@/common/utils/tools/tools";'],
+    ["src/browser/workers/highlightWorker.ts", 'import { X } from "@/common/utils/tools/tools";'],
+    ["src/common/config/schemas/example.ts", 'import { X } from "@/common/utils/tools/tools";'],
+    [
+      "src/browser/example.ts",
+      'import { X } from "@shared/common/utils/tokens/tokenStatsCalculator";',
+    ],
+    ["src/common/types/example.ts", 'export { X } from "@/common/utils/ai/providerOptions";'],
   ])("reports a value import of a backend-only module in %s: %s", async (filePath, code) => {
     expect(await restrictedImports(filePath, code)).toEqual([backendOnlyMessage]);
   });
@@ -134,7 +143,9 @@ describe("src/node guard for browser and common code", () => {
     ["src/common/orpc/schemas/api.ts", 'import { BashToolResultSchema } from "./tools";'],
     ["src/common/orpc/schemas/stream.ts", 'import { X } from "./providerOptions";'],
     ["src/common/types/example.ts", 'import { X } from "./tools";'],
-    // The backend-only modules themselves, and backend code.
+    // The backend-only modules themselves (also among each other), tests, and backend code.
+    ["src/common/utils/tools/tools.ts", 'import { X } from "@/common/utils/ai/providerOptions";'],
+    ["src/browser/example.test.ts", 'import { X } from "@/common/utils/tools/tools";'],
     [
       "src/common/utils/tools/tools.ts",
       'import { X } from "@/node/services/tools/agent_skill_read";',
