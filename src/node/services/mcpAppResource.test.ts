@@ -38,4 +38,32 @@ describe("extractMcpAppResource CSP", () => {
     expect(resource.csp).toEqual({ connectDomains: [] });
     expect(McpAppCspDeclarationSchema.safeParse(resource.csp).success).toBe(true);
   });
+
+  const hosts = (prefix: string, n: number) =>
+    Array.from({ length: n }, (_, i) => `https://${prefix}${i}.example.com`);
+
+  test("an invalid ui.csp grants nothing, and lets no legacy list in", () => {
+    const alias = { connect_domains: ["https://stale.example.com"] };
+    // Malformed, over the per-list limit, or not an object: the server declared the standard
+    // field, so a broken one never falls back to the legacy alias.
+    for (const csp of [
+      { connectDomains: "https://api.example.com" },
+      { connectDomains: hosts("ui", 33) },
+      "https://api.example.com",
+    ]) {
+      expect(read({ ui: { csp }, "openai/widgetCSP": alias }).csp).toEqual({});
+    }
+    // Without a ui.csp the alias applies in full.
+    expect(read({ "openai/widgetCSP": alias }).csp).toEqual({
+      connectDomains: ["https://stale.example.com"],
+    });
+  });
+
+  test("an alias-only declaration keeps the per-list limit", () => {
+    const full = read({ "openai/widgetCSP": { connect_domains: hosts("alias", 32) } });
+    expect(full.csp.connectDomains).toEqual(hosts("alias", 32));
+    expect(McpAppCspDeclarationSchema.safeParse(full.csp).success).toBe(true);
+    // One more is a malformed alias: it grants nothing.
+    expect(read({ "openai/widgetCSP": { connect_domains: hosts("alias", 33) } }).csp).toEqual({});
+  });
 });
