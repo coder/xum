@@ -120,6 +120,8 @@ describe("useWorkspaceName draft state", () => {
     const view = renderHook(
       (props: { scope: DraftStoreScope; suspend: boolean }) => {
         const result = useWorkspaceName({ message: "fix it", debounceMs: 1, scope: props.scope });
+        // The Suspense protocol (React 18 has no `use`): a pending render throws its promise.
+        // eslint-disable-next-line @typescript-eslint/only-throw-error
         if (props.suspend) throw pending;
         return result;
       },
