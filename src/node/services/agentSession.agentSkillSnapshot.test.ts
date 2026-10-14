@@ -13,6 +13,7 @@ import type { AIService } from "@/node/services/aiService";
 
 import { RuntimeError } from "@/node/runtime/Runtime";
 import * as agentSkillsService from "@/node/services/agentSkills/agentSkillsService";
+import { extractLoadedSkillSnapshotsFromMessages } from "@/node/services/agentSkills/loadedSkillSnapshots";
 
 import { createAgentSessionHarness } from "./agentSession.testHarness";
 
@@ -263,6 +264,46 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       expect(snapshotText.includes("agent_skill_read_file")).toBe(testCase.expectNote);
       // The host path is never offered to the off-host bash.
       expect(snapshotText.includes(testCase.workspacePath)).toBe(!testCase.expectNote);
+      await historyCleanup?.();
+      historyCleanup = undefined;
+    }
+  });
+
+  it("names the skill directory in /skill and $skill snapshots, also after compaction", async () => {
+    // Without the path, models searched the filesystem for the skill's files
+    // (and read another agent's copy). Local and worktree bash run on the host.
+    const srcBaseDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-agent-skill-src-"));
+    const runtimeConfigs = [{ type: "local" }, { type: "worktree", srcBaseDir }] as const;
+    for (const runtimeConfig of runtimeConfigs) {
+      const { workspacePath } = await createTestWorkspaceWithSkills({
+        skills: [
+          { skillName: "slash-skill", skillBody: "Open playbooks/a.md." },
+          { skillName: "inline-skill", skillBody: "Open playbooks/b.md." },
+        ],
+      });
+      const { session, messages } = await createSessionHarness({ workspacePath, runtimeConfig });
+      const result = await session.sendMessage("do X", {
+        model: "anthropic:claude-3-5-sonnet-latest",
+        agentId: "exec",
+        muxMetadata: {
+          type: "agent-skill",
+          rawCommand: "/slash-skill do X",
+          skillName: "slash-skill",
+          scope: "project",
+          agentSkillRefs: [{ skillName: "inline-skill", scope: "project", source: "inline" }],
+        },
+      });
+      expect(result.success).toBe(true);
+
+      const reinjected = extractLoadedSkillSnapshotsFromMessages(messages);
+      for (const name of ["slash-skill", "inline-skill"]) {
+        const skillDir = `\`${path.join(workspacePath, ".mux", "skills", name)}\``;
+        const snapshot = messages.find((m) => m.metadata?.agentSkillSnapshot?.skillName === name);
+        if (snapshot == null) throw new Error(`no snapshot for ${name}`);
+        // Line 0 is the <agent-skill> header; the directory line opens the body.
+        expect(getMessageText(snapshot).split("\n")[1]).toContain(skillDir);
+        expect(reinjected.find((s) => s.name === name)?.body.split("\n")[0]).toContain(skillDir);
+      }
       await historyCleanup?.();
       historyCleanup = undefined;
     }

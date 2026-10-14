@@ -333,7 +333,7 @@ import {
 import { substituteSkillArguments } from "@/node/services/agentSkills/skillArguments";
 import {
   assertSkillDirectoryPlaceholdersResolved,
-  prependSkillDirectoryOffHostNote,
+  prependSkillDirectoryNote,
   resolveSkillDirectory,
   skillDirectoryEnv,
   substituteSkillDirectoryPlaceholdersOutsideDirectives,
@@ -13732,13 +13732,13 @@ export class AgentSession {
         workspacePath,
         env: skillDirectoryEnv(skillDirectory),
       });
-      // Host-read skills in off-host workspaces (e.g. global plugin skills on
-      // SSH/Docker) tell the model their files are not where bash runs. Added
-      // before hashing so the snapshot hash covers the note.
+      // The snapshot names the skill directory when bash can use it, or says the
+      // files are not where bash runs (e.g. global plugin skills on SSH/Docker).
+      // Added before hashing so the snapshot hash covers the note.
       // Plugin skills name sibling skills by bare name; map the shadowed ones to
-      // their qualified names. The off-host note stays the very first line.
+      // their qualified names. The directory note stays the very first line.
       const siblingNote = await resolvePluginSiblingNote(resolved, lookupContext);
-      const body = prependSkillDirectoryOffHostNote(
+      const body = prependSkillDirectoryNote(
         prependPluginSiblingNote(injectedBody, siblingNote),
         skillDirectory
       );
