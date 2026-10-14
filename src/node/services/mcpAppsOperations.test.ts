@@ -210,6 +210,9 @@ describe("MCP Apps view domain approvals", () => {
       record?: McpAppResultRecord;
       // A multi-project workspace (stored under _multi, first project /a) and its servers.
       multi?: Record<string, Partial<MCPServerInfo>>;
+      // A task of a multi-project workspace: stored under its first project, but it keeps the
+      // parent's project list (Task.createMany).
+      multiTask?: boolean;
       // A scratch chat: stored under the shared _scratch bucket.
       scratch?: boolean;
     } = {}
@@ -226,7 +229,16 @@ describe("MCP Apps view domain approvals", () => {
         id !== "ws"
           ? null
           : options.multi
-            ? { projectPath: MULTI_PROJECT_CONFIG_KEY, attributionProjectPath: "/a" }
+            ? options.multiTask
+              ? {
+                  projectPath: "/a",
+                  attributionProjectPath: "/a",
+                  projects: [
+                    { projectPath: "/a", projectName: "a" },
+                    { projectPath: "/repo", projectName: "repo" },
+                  ],
+                }
+              : { projectPath: MULTI_PROJECT_CONFIG_KEY, attributionProjectPath: "/a" }
             : options.scratch
               ? {
                   projectPath: SCRATCH_PROJECT_CONFIG_KEY,
@@ -312,9 +324,12 @@ describe("MCP Apps view domain approvals", () => {
     expect(projects.get("/repo")?.mcpAppViewDomains).toBeUndefined();
   });
 
-  test("a multi-project workspace keeps approvals on its server's project, never in _multi", async () => {
+  test.each([
+    ["a multi-project workspace", false],
+    ["a task of a multi-project workspace", true],
+  ])("%s keeps approvals on its server's project, never in _multi", async (_name, multiTask) => {
     // The project's own server: its approval lands on that project.
-    const own = projectConfig({ multi: { charts: { configLayer: "project" } } });
+    const own = projectConfig({ multi: { charts: { configLayer: "project" } }, multiTask });
     expect(
       (await approveMcpAppViewDomains(own.ctx, approve(["https://api.example.com"]))).success
     ).toBe(true);
@@ -327,7 +342,7 @@ describe("MCP Apps view domain approvals", () => {
     expect(view.success && view.data.approvedDomains).toEqual(["https://api.example.com"]);
 
     // A global server has no single owner project there: refused, nothing stored anywhere.
-    const global = projectConfig({ multi: { charts: { configLayer: "global" } } });
+    const global = projectConfig({ multi: { charts: { configLayer: "global" } }, multiTask });
     expect(
       (await approveMcpAppViewDomains(global.ctx, approve(["https://api.example.com"]))).success
     ).toBe(false);

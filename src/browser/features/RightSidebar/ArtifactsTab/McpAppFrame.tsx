@@ -9,6 +9,7 @@ import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
 import { getErrorMessage } from "@/common/utils/errors";
+import { PlatformPaths } from "@/common/utils/paths";
 import { mcpServerConsentName, mcpServerDisplayName } from "@/common/utils/mcp/pluginServerKey";
 import { createBridgeRateLimiter, passesFrameGate } from "./artifactBridge";
 import { finalizeSandboxedDocument, parseArtifactHtml } from "./artifactDocument";
@@ -526,6 +527,14 @@ export function McpAppFrame(props: {
           <div className="text-foreground min-w-0 flex-1 break-words">
             This view wants to reach:{" "}
             {domainsPrompt.map((origin) => new URL(origin).host).join(", ")}
+            {/* The project that keeps the approval: for a task of a multi-project workspace it
+                is the first project, not the task's own (approvalProjectPathOf). */}
+            {approvalProjectPath != null && (
+              <span className="text-muted">
+                {" "}
+                (for project {PlatformPaths.getProjectName(approvalProjectPath)})
+              </span>
+            )}
           </div>
           <button
             type="button"
