@@ -170,5 +170,18 @@ export function mcpAppEntrypointKey(
   toolName: string,
   type: MCPAppEntrypointType
 ): string {
-  return `entrypoint:${encodeURIComponent(serverName)}:${encodeURIComponent(toolName)}:${type}`;
+  return `entrypoint:${encodeKeyPart(serverName)}:${encodeKeyPart(toolName)}:${type}`;
+}
+
+/**
+ * Escape every UTF-16 code unit outside `[A-Za-z0-9._-]` as `%` + four hex digits. Total (unlike
+ * encodeURIComponent, which throws on a lone surrogate: one bad name would fail the whole
+ * listing) and injective (fixed width, `%` itself is escaped). The regex has no `u` flag, so it
+ * matches code units, not code points.
+ */
+function encodeKeyPart(part: string): string {
+  return part.replace(
+    /[^A-Za-z0-9._-]/g,
+    (unit) => `%${unit.charCodeAt(0).toString(16).padStart(4, "0")}`
+  );
 }
