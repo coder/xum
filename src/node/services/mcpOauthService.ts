@@ -301,6 +301,31 @@ function issuersMatch(a: string, b: string): boolean {
 }
 
 /**
+ * Whether the tokens' granted scope holds every base scope of the plugin. A token response
+ * without `scope` means the requested scope was granted (RFC 6749 §5.1), so it passes; Xum
+ * requests the base scopes on every plugin sign-in.
+ */
+function grantCoversBaseScopes(
+  scope: string | undefined,
+  config: MCPServerOAuthConfig | undefined
+): boolean {
+  if (scope === undefined || config?.baseScopes === undefined) return true;
+  const granted = new Set(scope.split(" ").filter(Boolean));
+  return config.baseScopes.every((scope) => granted.has(scope));
+}
+
+function assertGrantCoversBaseScopes(
+  scope: string | undefined,
+  config: MCPServerOAuthConfig | undefined
+): void {
+  if (grantCoversBaseScopes(scope, config)) return;
+  const granted = new Set(scope?.split(" ") ?? []);
+  const missing = (config?.baseScopes ?? []).filter((base) => !granted.has(base));
+  // The scope names come from the consented plugin config, not from the server.
+  throw new Error(`The authorization server did not grant required scopes: ${missing.join(" ")}`);
+}
+
+/**
  * The use-time rule that decides whether stored credentials may serve a server: they belong
  * to the client and the issuer that minted them. A plugin with another provided client, or one
  * that pins another issuer (a second plugin at the same URL, an update, a remove and re-add),
@@ -315,9 +340,10 @@ function issuersMatch(a: string, b: string): boolean {
  * plugin update that moves authorizationServerBase to another origin could collect it. Without
  * a pinned issuer unstamped credentials pass, like in the SDK (non-plugin servers unchanged).
  *
- * Known limit: a change of only scopes or resource (same client, same issuer) keeps the old
- * tokens and their old grant until the server asks for re-authorization; the update-time
- * sign-out covers the normal path. Follow-up for scope coverage: #6141.
+ * Tokens whose granted scope lacks one of the plugin's baseScopes do not match either (#6141):
+ * a plugin can reuse a URL that an earlier sign-in authorized with narrower scopes. Known limit:
+ * a change of only defaultScopes or resource (same client, same issuer) keeps the old tokens
+ * until the server asks for re-authorization; the update-time sign-out covers the normal path.
  */
 function storedClientMatches(
   stored: MCPOAuthStoredCredentials | null | undefined,
@@ -325,6 +351,7 @@ function storedClientMatches(
 ): boolean {
   if (config?.clientId !== undefined && stored?.clientInformation?.client_id !== config.clientId)
     return false;
+  if (!grantCoversBaseScopes(stored?.tokens?.scope, config)) return false;
   const issuer = pinnedIssuer(config);
   if (issuer === undefined) return true;
   // Each record the SDK reads must be bound to the pinned issuer: its SEP-2352 stamp, or for a
@@ -1648,6 +1675,9 @@ export class McpOauthService {
     return {
       tokens: () => Promise.resolve(undefined),
       saveTokens: async (tokens) => {
+        // Tokens without a base scope would read as signed out (storedClientMatches): fail the
+        // sign-in with the reason instead of reporting "Login complete" (#6141).
+        assertGrantCoversBaseScopes(tokens.scope, flow.plugin?.config);
         await this.saveTokens({
           serverUrl: flow.serverUrlForStoreKey,
           // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern

@@ -1301,6 +1301,98 @@ describe("McpOauthService OAuth flows", () => {
     });
   });
 
+  test("stored tokens whose granted scope lacks a plugin's base scopes read as signed out (#6141)", async () => {
+    const serverUrl = "https://example.com/mcp";
+    const seed = async (scope: string | undefined) => {
+      await service.dispose();
+      service = new McpOauthService(config, mcpConfigService);
+      await fs.writeFile(
+        getStoreFilePath(xumHome),
+        JSON.stringify({
+          version: 2,
+          entries: {
+            [serverUrl]: {
+              serverUrl,
+              updatedAtMs: Date.now(),
+              clientInformation: { client_id: "c" },
+              tokens: {
+                access_token: "at",
+                token_type: "Bearer",
+                ...(scope !== undefined ? { scope } : {}),
+              },
+            },
+          },
+        })
+      );
+    };
+    const usable = async (oauth: MCPServerOAuthConfig) =>
+      (await service.getAuthProviderForServer({ serverUrl, oauth })) !== undefined &&
+      (await service.hasAuthTokens({ serverUrl, oauth })) &&
+      (await service.getAuthStatus({ serverUrl, oauth })).isLoggedIn;
+    // An earlier sign-in at this URL was granted only "read".
+    await seed("read");
+    expect(await usable({ clientId: "c", baseScopes: ["read", "write"] })).toBe(false);
+    expect(await usable({ clientId: "c", baseScopes: ["read"] })).toBe(true);
+    expect(await usable({ clientId: "c" })).toBe(true);
+    // Scope is a space-separated set: order and extra spaces do not matter.
+    await seed(" write  read admin");
+    expect(await usable({ clientId: "c", baseScopes: ["read", "write"] })).toBe(true);
+    // A token response without scope means the requested scope was granted (RFC 6749 §5.1).
+    await seed(undefined);
+    expect(await usable({ clientId: "c", baseScopes: ["read", "write"] })).toBe(true);
+  });
+
+  test("a sign-in granted less than the plugin's base scopes fails and stores no token (#6141)", async () => {
+    const server = createServer((req, res) => {
+      const pathname = (req.url ?? "/").split("?")[0];
+      if (pathname === "/token") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ access_token: "narrow", token_type: "Bearer", scope: "read" }));
+        return;
+      }
+      if (pathname === "/.well-known/oauth-authorization-server") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(authServerMetadata(`http://${req.headers.host ?? ""}`)));
+        return;
+      }
+      res.statusCode = pathname === "/mcp" ? 401 : 404;
+      res.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Failed to bind");
+      const serverUrl = `http://127.0.0.1:${address.port}/mcp`;
+      spyOn(mcpConfigService, "listServers").mockResolvedValue({
+        docs: {
+          transport: "http",
+          url: serverUrl,
+          disabled: true,
+          oauth: { clientId: "c", baseScopes: ["read", "write"] },
+        },
+      });
+      const start = await service.startServerFlow({
+        projectPath,
+        serverName: "docs",
+        redirectUri: "https://x/cb",
+      });
+      if (!start.success) throw new Error(start.error);
+      const result = await service.handleServerCallbackAndExchange({
+        state: start.data.flowId,
+        code: "code",
+        iss: null,
+        error: null,
+      });
+      expect(result).toEqual({
+        success: false,
+        error: "The authorization server did not grant required scopes: write",
+      });
+      expect(await service.hasAuthTokens({ serverUrl })).toBe(false);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   test("interleaved sign-ins of two clients at one URL never store client B with token A", async () => {
     await withAuthServer(async (base) => {
       const serverUrl = `${base}/mcp`;
