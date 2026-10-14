@@ -271,12 +271,26 @@ async function runPostToolHooks(
     const hookFeedback = output.blockReason ?? output.stopFeedback;
     if (hookFeedback !== undefined) feedback.push(hookFeedback);
   }
-  if (feedback.length === 0) return;
+  if (feedback.length > 0) replaceWithFeedback(ctx, feedback, registration);
+}
+
+/** Replace the tool result with the PostToolUse blockers' feedback (Codex `decision: "block"`). */
+function replaceWithFeedback(
+  ctx: ToolExecuteContext,
+  feedback: string[],
+  registration: CodexHookRegistration
+): void {
   // Codex: block or continue: false replaces the tool result with the hooks' feedback. The
   // context gathered so far still reaches the model (Codex adds it next to the feedback).
-  ctx.result = {
-    error: joinCapped(feedback, registration, "\n\n"),
-  };
+  const error = joinCapped(feedback, registration, "\n\n");
+  // Each plugin is its own middleware: an inner plugin that blocked already replaced the result.
+  // Its feedback and context stay, and this plugin's feedback is added (Codex
+  // PRRT_kwDOPxxmWM6sXQ2G).
+  const previous = ctx.postBlocked === true && isPlainObject(ctx.result) ? ctx.result : undefined;
+  ctx.result =
+    previous !== undefined && typeof previous.error === "string"
+      ? { ...previous, error: `${previous.error}\n\n${error}` }
+      : { error };
   // A nested caller (mux.load) holds the original output outside ctx.result: it must not hand it
   // on (Codex PRRT_kwDOPxxmWM6r6NnK). That holds for continue: false too, though Codex keeps it
   // apart from a block: the hook replaced the output the model sees, so a nested call must not
