@@ -36,9 +36,22 @@ export interface Options {
   chown?: { uid: number; gid: number };
   /** Set to false to skip fsync before the rename (default true). */
   fsync?: boolean;
+  /**
+   * Runs right before the rename, with the resolved target path. Throw to abort: the temp file is
+   * removed and the target stays untouched. Lets a caller refuse to replace bytes it did not read.
+   */
+  beforeRename?: (target: string) => void;
 }
 
-type ResolvedOptions = Options & { encoding: BufferEncoding };
+type ResolvedOptions = Options & {
+  encoding: BufferEncoding;
+  beforeRename: (target: string) => void;
+};
+
+/** The beforeRename default: replace the target without a check. */
+function noCheck(): void {
+  // Intentionally empty: callers without a check replace the target unconditionally.
+}
 
 let invocations = 0;
 const pendingTempFiles = new Set<string>();
@@ -59,9 +72,17 @@ process.once("exit", () => {
 
 function resolveOptions(options?: Options | BufferEncoding): ResolvedOptions {
   if (typeof options === "string") {
-    return { encoding: options };
+    return { encoding: options, beforeRename: noCheck };
   }
-  return { ...options, encoding: options?.encoding ?? "utf8" };
+  return {
+    ...options,
+    encoding: options?.encoding ?? "utf8",
+    beforeRename: beforeRenameOf(options),
+  };
+}
+
+function beforeRenameOf(options: Options | undefined): (target: string) => void {
+  return options?.beforeRename ?? noCheck;
 }
 
 function toBuffer(data: string | Buffer, encoding: BufferEncoding): Buffer {
@@ -170,10 +191,16 @@ export const renameRetryTiming = {
   sleep: (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms)),
 };
 
-async function renameWithRetry(tempFile: string, target: string): Promise<void> {
+async function renameWithRetry(
+  tempFile: string,
+  target: string,
+  beforeRename: (target: string) => void
+): Promise<void> {
   const deadline = renameRetryTiming.now() + RENAME_RETRY_BUDGET_MS;
   let delay = RENAME_RETRY_INITIAL_DELAY_MS;
   for (;;) {
+    // Before every attempt: the target can change during a retry sleep.
+    beforeRename(target);
     try {
       await promisify(fs.rename)(tempFile, target);
       return;
@@ -230,7 +257,7 @@ async function writeFileAtomicUnserialized(
     await promisify(fs.close)(fd);
     fd = undefined;
     await applyOwnership(tempFile, options);
-    await renameWithRetry(tempFile, target);
+    await renameWithRetry(tempFile, target, options.beforeRename);
     if (options.fsync !== false) {
       await fsyncParentDirectory(target);
     }
@@ -364,6 +391,7 @@ export function sync(
     // No retry: a synchronous one would block the event loop, so an in-process reader holding
     // the destination could never close it. Its callers write providers.jsonc, which no
     // in-process reader holds open.
+    resolved.beforeRename(target);
     fs.renameSync(tempFile, target);
     if (resolved.fsync !== false) {
       fsyncParentDirectorySync(target);

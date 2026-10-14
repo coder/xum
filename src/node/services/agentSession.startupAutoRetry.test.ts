@@ -1481,6 +1481,48 @@ describe("AgentSession startup auto-retry recovery", () => {
     }
   );
 
+  // Startup recovery skips an idle legacy task row without rewriting config, so the probe must
+  // report every tail the follow-up dispatch could still act on.
+  test.each([
+    { tail: "pending summary", expected: "follow-up" },
+    { tail: "pending summary + preserved tail copy", expected: "follow-up" },
+    { tail: "settled summary", expected: "idle" },
+  ] as const)("classifies a compaction summary tail ($tail)", async ({ tail, expected }) => {
+    const workspaceId = "startup-compaction-tail-state";
+    const { session, historyService, cleanup } = await createSessionBundle(workspaceId);
+    cleanups.push(cleanup);
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("summary", "assistant", "Summary", {
+        muxMetadata: {
+          type: "compaction-summary",
+          ...(tail === "settled summary"
+            ? {}
+            : {
+                pendingFollowUp: {
+                  text: "Continue original work",
+                  model: "openai:gpt-4o",
+                  agentId: "exec",
+                },
+              }),
+        },
+      })
+    );
+    if (tail === "pending summary + preserved tail copy") {
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("tail-copy", "assistant", "Earlier answer", {
+          rlmPreservedTailCopy: true,
+        })
+      );
+    }
+    try {
+      expect(await session.getStartupRecoveryState()).toBe(expected);
+    } finally {
+      await session.dispose();
+    }
+  });
+
   test.each([false, true])(
     "classifies completed versus interrupted assistant tails (%s)",
     async (partial) => {

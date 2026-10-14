@@ -71,6 +71,7 @@ interface WorkspaceMCPStoryOptions {
   settingsReadErrors?: Record<string, string>;
   settingsUpdateGate?: { promise: Promise<void> } | Array<{ promise: Promise<void> }>;
   settingsFirstReadGate?: { promise: Promise<void> };
+  settingsAfterSave?: Record<string, MCPSettingsSnapshot>;
   testGate?: { promise: Promise<void> };
 }
 
@@ -149,6 +150,7 @@ function setupWorkspaceMCPModalStory(options: WorkspaceMCPStoryOptions = {}): AP
     mcpSettingsReadErrors: new Map(Object.entries(options.settingsReadErrors ?? {})),
     mcpSettingsUpdateGate: options.settingsUpdateGate,
     mcpSettingsFirstReadGate: options.settingsFirstReadGate,
+    mcpSettingsAfterUpdate: new Map(Object.entries(options.settingsAfterSave ?? {})),
     mcpTestGate: options.testGate,
   });
 }
@@ -747,9 +749,8 @@ export const WorkspaceMCPServerSettingsSaveInFlight: Story = {
   render: () =>
     renderWorkspaceMCPModal({ ...settingsStoryOptions(), settingsUpdateGate: saveGate }),
   play: async ({ canvasElement }) => {
-    const section = within(
-      await within(await findWorkspaceMCPDialog(canvasElement)).findByTestId("mcp-server-settings")
-    );
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    const section = within(await modal.findByTestId("mcp-server-settings"));
     const zoom = section.getByLabelText("Default zoom setting");
     await userEvent.clear(zoom);
     await userEvent.type(zoom, "3");
@@ -757,8 +758,9 @@ export const WorkspaceMCPServerSettingsSaveInFlight: Story = {
     await waitFor(() => expect(zoom).toBeDisabled());
     await expect(section.getByLabelText("Show grid setting")).toBeDisabled();
     saveGate.open();
-    await waitFor(() => expect(zoom).toBeEnabled());
-    await expect(zoom).toHaveValue(3);
+    // The saved snapshot replaces the section (a new mount), so query the controls again.
+    await waitFor(() => expect(modal.getByLabelText("Default zoom setting")).toBeEnabled());
+    await expect(modal.getByLabelText("Default zoom setting")).toHaveValue(3);
   },
 };
 
@@ -802,6 +804,7 @@ const ReopenableWorkspaceMCPModal: FC = () => {
             workspaceId: WORKSPACE_ID,
             serverName: "cad",
             set: { zoom: 4 },
+            instanceToken: "mock-instance:cad",
           })
         }
       >
@@ -997,7 +1000,7 @@ export const WorkspaceMCPServerSettingsRefreshDuringSave: Story = {
     await expect(refresh).toBeDisabled();
     refreshDuringSaveGate.open();
     await waitFor(() => expect(refresh).toBeEnabled());
-    await expect(section.getByLabelText("Default zoom setting")).toHaveValue(3);
+    await expect(modal.getByLabelText("Default zoom setting")).toHaveValue(3);
   },
 };
 
@@ -1080,6 +1083,41 @@ export const WorkspaceMCPServerSettingsOverlappingSaves: Story = {
     await expect(fetchTools).toBeDisabled();
     overlapSecondSave.open();
     await waitFor(() => expect(fetchTools).toBeEnabled());
+  },
+};
+
+/** The server shows "Snap to grid" only once the grid is on: the dialog shows it after Save. */
+export const WorkspaceMCPServerSettingsSchemaAfterSave: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () =>
+    renderWorkspaceMCPModal({
+      ...settingsStoryOptions(),
+      settings: { cad: { ...CAD_SETTINGS, values: { ...CAD_SETTINGS.values, grid: false } } },
+      settingsAfterSave: {
+        cad: {
+          ...CAD_SETTINGS,
+          properties: {
+            ...CAD_SETTINGS.properties,
+            snap: { type: "boolean", title: "Snap to grid" },
+          },
+          values: { ...CAD_SETTINGS.values, snap: false },
+          layout: [
+            ...CAD_SETTINGS.layout,
+            { title: "Snapping", items: [{ kind: "property", property: "snap" }] },
+          ],
+        },
+      },
+    }),
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    const section = within(await modal.findByTestId("mcp-server-settings"));
+    await expect(section.queryByLabelText("Snap to grid setting")).toBeNull();
+    await userEvent.click(section.getByLabelText("Show grid setting"));
+    await userEvent.click(section.getByRole("button", { name: "Save settings" }));
+    const saved = within(await modal.findByTestId("mcp-server-settings"));
+    await expect(saved.findByLabelText("Snap to grid setting")).resolves.toBeInTheDocument();
+    await expect(saved.getByLabelText("Show grid setting")).toBeChecked();
+    await expect(saved.getByRole("button", { name: "Save settings" })).toBeDisabled();
   },
 };
 

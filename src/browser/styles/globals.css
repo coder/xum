@@ -246,8 +246,10 @@
   --color-accent-dark: hsl(207 90% 38%);
   --color-accent-darker: hsl(204 92% 30%);
   --color-accent-light: hsl(198 100% 70%);
-  /* Unchanged in light themes: the accent already serves as text here (#5946). */
-  --color-accent-text: var(--color-accent);
+  /* The accent's hue and saturation, darker: WCAG AA (4.5:1) on every light surface, down to the
+     selected-row tint #c8dff3 (4.64:1), where the accent itself was 3.46:1 (#6449).
+     --color-accent stays the button fill and focus ring. */
+  --color-accent-text: hsl(207 90% 35%);
   --color-accent-foreground: hsl(0 0% 100%); /* preserve contrast on blue buttons in light mode */
 
   --color-success: hsl(122 39% 45%);
@@ -503,7 +505,7 @@
   --color-accent-dark: color-mix(in srgb, var(--color-accent), black 14%);
   --color-accent-darker: color-mix(in srgb, var(--color-accent), black 24%);
   --color-accent-light: color-mix(in srgb, var(--color-accent), white 42%);
-  /* Unchanged in light themes: the accent already serves as text here (#5946). */
+  /* Flexoki blue-600 already reaches WCAG AA on every flexoki-light surface (#5946, #6449). */
   --color-accent-text: var(--color-accent);
   --color-accent-foreground: #fffcf0; /* high-contrast text on accent buttons */
 

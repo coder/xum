@@ -187,7 +187,7 @@ import {
   MCPRemoveParamsSchema,
   MCPServerMapSchema,
   MCPSettingsReadInputSchema,
-  MCPSettingsSnapshotSchema,
+  MCPSettingsReadSnapshotSchema,
   MCPSettingsUpdateParamsSchema,
   MCPSetEnabledGlobalParamsSchema,
   MCPSetEnabledParamsSchema,
@@ -1156,7 +1156,7 @@ export const mcp = {
         z.string(),
         ResultSchema(
           z
-            .union([MCPSettingsSnapshotSchema, z.object({ notConnected: z.literal(true) })])
+            .union([MCPSettingsReadSnapshotSchema, z.object({ notConnected: z.literal(true) })])
             .nullable(),
           z.string()
         )
@@ -1164,7 +1164,8 @@ export const mcp = {
     },
     update: {
       input: MCPSettingsUpdateParamsSchema,
-      output: ResultSchema(MCPSettingsSnapshotSchema.shape.values, z.string()),
+      /** The snapshot the server shows after the update (its schema can change). */
+      output: ResultSchema(MCPSettingsReadSnapshotSchema, z.string()),
     },
   },
   configureDesign: {
@@ -1569,6 +1570,11 @@ export const mcpApps = {
   listEntrypoints: {
     input: z.object({ workspaceId: z.string().min(1) }),
     output: z.array(McpAppEntrypointSchema),
+  },
+  /** Ticks when a server of the workspace sends tools/list_changed: re-list entry points. */
+  onEntrypointsChanged: {
+    input: z.object({ workspaceId: z.string().min(1) }),
+    output: eventIterator(z.void()),
   },
   /** Call an entry point's tool with `{}` and store its view record (no chat row). */
   openEntrypoint: {

@@ -1,4 +1,4 @@
-import { updatePersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
+import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { getAppViewTabKey, makeAppViewTabType, type TabType } from "@/browser/types/rightSidebar";
 import {
   addTabToFocusedTabset,
@@ -7,6 +7,7 @@ import {
   selectOrAddTab,
   type RightSidebarLayoutState,
 } from "@/browser/utils/rightSidebarLayout";
+import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
 import { getRightSidebarLayoutKey } from "@/common/constants/storage";
 import {
   mcpAppSelectionKey,
@@ -44,11 +45,12 @@ export function withAppViewTab(
  * Works whether or not the workspace's sidebar is mounted (it follows the saved layout).
  */
 export function saveAppViewTab(workspaceId: string, toolCallId: string): void {
-  updatePersistedState<unknown>(getRightSidebarLayoutKey(workspaceId), (raw: unknown) => {
-    const layout = parseRightSidebarLayoutState(raw);
+  // With the sidebar's start-tab fallback: a workspace without a saved layout starts the same
+  // way as when its sidebar creates the layout.
+  updateRightSidebarLayout(workspaceId, (layout) => {
     const tab = appViewTabFor(toolCallId);
     return collectAllTabs(layout.root).includes(tab)
-      ? raw
+      ? layout
       : addTabToFocusedTabset(layout, tab, false);
   });
 }

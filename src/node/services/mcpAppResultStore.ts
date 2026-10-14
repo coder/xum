@@ -46,6 +46,12 @@ const McpAppResultRecordSchema = z.object({
    * call. A restored tab whose entry point is gone is then unavailable, not a tool call's view.
    */
   entrypoint: z.literal(true).optional(),
+  /**
+   * How a call without a result ended: "interrupted" when it was aborted, "failed" when it threw
+   * or hit its deadline. A restored view outside the loaded transcript gets tool-cancelled from it
+   * (#6181). Absent on a completed call and on records written before this field.
+   */
+  outcome: z.enum(["failed", "interrupted"]).optional(),
 });
 export type McpAppResultRecord = z.infer<typeof McpAppResultRecordSchema>;
 
