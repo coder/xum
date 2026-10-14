@@ -1233,7 +1233,7 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    const dispatchPendingCompactionFollowUp = mock(() => Promise.resolve(Ok(true)));
+    const dispatchPendingCompactionFollowUp = mock((_id: string) => Promise.resolve(Ok(true)));
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
       getStartupRecoveryState: mock((id: string) =>
         Promise.resolve(id === followUpId ? "follow-up" : "idle")
