@@ -29,6 +29,7 @@ import {
   type AgentPluginInfo,
 } from "./discovery";
 import { isPlainObject } from "./manifest";
+import { MAX_HOOK_POINTER_ENTRIES } from "./openaiExtension";
 
 /** Codex events Xum maps to its own hook points. */
 export const MAPPED_CODEX_HOOK_EVENTS = {
@@ -59,9 +60,9 @@ const MAX_HOOKS_FILE_BYTES = 256 * 1024;
 /**
  * Bounds for one plugin. Install Preview loads the hooks of an untrusted repository, and a
  * 256 KiB manifest can repeat one path tens of thousands of times: without them one Preview
- * could reread the same file each time and exhaust the backend's memory.
+ * could reread the same file each time and exhaust the backend's memory. The pointer entry cap
+ * (MAX_HOOK_POINTER_ENTRIES) is shared with discovery's readOpenAIExtension.
  */
-const MAX_HOOK_POINTER_ENTRIES = 32;
 const MAX_PLUGIN_HOOKS = 256;
 /** Warnings kept per plugin: each file can hold ~100k invalid groups, each one a warning. */
 const MAX_HOOK_WARNINGS = 50;
@@ -90,7 +91,7 @@ export async function loadPluginCodexHooks(
   const warnings: string[] = [];
   const hooks: PluginHookDefinition[] = [];
   const pointer = plugin.openai?.hooks;
-  // Discovery keeps every valid entry; a manifest can repeat one path tens of thousands of times.
+  // Discovery already caps the entries; this guards any other caller of the loader.
   if (pointer !== undefined && pointer.length > MAX_HOOK_POINTER_ENTRIES) {
     warnings.push(
       `'extensions["com.openai"].hooks' has ${pointer.length} entries; reading only the first ${MAX_HOOK_POINTER_ENTRIES}`

@@ -1,10 +1,11 @@
 import { tool } from "ai";
 
+import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import type { AgentSkillReadToolResult } from "@/common/types/tools";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS } from "@/common/constants/toolLimits";
-import { SkillNameSchema } from "@/common/orpc/schemas";
+import { parseSkillLookupName } from "@/common/utils/agentSkills/skillLookupName";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { Runtime } from "@/node/runtime/Runtime";
 import {
@@ -18,7 +19,7 @@ import {
 } from "@/node/services/agentSkills/skillDirectory";
 
 /** Single-line skill description for the index, cut with an ellipsis past the cap. */
-function formatSkillIndexDescription(description: string): string {
+export function formatSkillIndexDescription(description: string): string {
   const singleLine = description.replace(/\s+/g, " ").trim();
   if (singleLine.length <= AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS) {
     return singleLine;
@@ -31,16 +32,24 @@ function formatSkillIndexDescription(description: string): string {
 }
 
 /**
+ * Whether a skill belongs in the static index. Unadvertised skills (advertise: false or
+ * disable-model-invocation: true, normalized into descriptor.advertise) stay out and can
+ * still be invoked via /skill-name or agent_skill_read. Path-scoped skills (`paths`
+ * frontmatter) stay out too: like Cursor and Claude Code, they surface only once a file
+ * tool touches a matching file (pathSkillActivation.ts), and stay readable by name.
+ */
+function isIndexedSkill(skill: AgentSkillDescriptor): boolean {
+  return skill.advertise !== false && skill.paths === undefined;
+}
+
+/**
  * Build dynamic agent_skill_read tool description with available skills.
  * Injects the list of available skills directly into the tool description
  * so the model sees them adjacent to the tool call schema.
  */
 function buildSkillReadDescription(config: ToolConfiguration): string {
   const baseDescription = TOOL_DEFINITIONS.agent_skill_read.description;
-  // Filter out unadvertised skills (advertise: false or disable-model-invocation: true,
-  // normalized into descriptor.advertise) from the tool description.
-  // Unadvertised skills can still be invoked via /skill-name or agent_skill_read.
-  const skills = (config.availableSkills ?? []).filter((s) => s.advertise !== false);
+  const skills = (config.availableSkills ?? []).filter(isIndexedSkill);
 
   if (skills.length === 0) {
     return baseDescription;
@@ -103,11 +112,11 @@ export const createAgentSkillReadTool: ToolFactory = (config: ToolConfiguration)
       }
 
       // Defensive: validate again even though inputSchema should guarantee shape.
-      const parsedName = SkillNameSchema.safeParse(name);
-      if (!parsedName.success) {
+      // The schema regex cannot express the full plugin-name grammar.
+      if (parseSkillLookupName(name) == null) {
         return {
           success: false,
-          error: parsedName.error.message,
+          error: `Invalid skill name: ${name}`,
         };
       }
 
@@ -120,16 +129,11 @@ export const createAgentSkillReadTool: ToolFactory = (config: ToolConfiguration)
           xumScope: config.xumScope ?? null,
           includeClaudeSkills,
         });
-        const resolved = await readAgentSkill(
-          skillCtx.runtime,
-          skillCtx.workspacePath,
-          parsedName.data,
-          {
-            roots: skillCtx.roots,
-            containment: skillCtx.containment,
-            includeClaudeSkills,
-          }
-        );
+        const resolved = await readAgentSkill(skillCtx.runtime, skillCtx.workspacePath, name, {
+          roots: skillCtx.roots,
+          containment: skillCtx.containment,
+          includeClaudeSkills,
+        });
         // Judged against config.runtime: that is where the model's bash runs.
         return buildSkillReadSuccess(resolved, config.runtime);
       } catch (error) {

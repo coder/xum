@@ -17,7 +17,7 @@ function JsonScalar(props: { value: null | boolean | number | string }) {
   if (typeof props.value === "string") {
     return <span className="text-success break-words">{JSON.stringify(props.value)}</span>;
   }
-  return <span className="text-accent">{String(props.value)}</span>;
+  return <span className="text-accent-text">{String(props.value)}</span>;
 }
 
 /** JSON Pointer of a child (RFC 6901 escaping), so keys like "a/b" stay distinct. */

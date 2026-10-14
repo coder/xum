@@ -15,6 +15,19 @@ export const SkillNameSchema = z
   .max(64)
   .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
 
+/**
+ * Skill lookup name: a bare skill name, or `<plugin>:<skill>` for an Agent Plugin's
+ * skill (Claude Code's plugin namespace convention). Plugin names cannot contain `:`,
+ * so it is an unambiguous separator. Lookahead-free (no `.refine`) because tool input
+ * schemas go to OpenAI strict mode; parseSkillLookupName enforces the full plugin-name
+ * grammar (`--`, `..`, Windows reserved names, 64-char cap).
+ */
+export const SkillLookupNameSchema = z
+  .string()
+  .min(1)
+  .max(129)
+  .regex(/^(?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?:)?[a-z0-9]+(?:-[a-z0-9]+)*$/);
+
 export const AgentSkillFrontmatterSchema = z.object({
   name: SkillNameSchema,
   description: z.string().min(1).max(1024),
@@ -50,6 +63,12 @@ export const AgentSkillFrontmatterSchema = z.object({
   // Claude-Code-style keys above).
   when_to_use: z.string().min(1).max(1024).optional(),
   "when-to-use": z.string().min(1).max(1024).optional(),
+
+  // Ecosystem-standard (Cursor / Claude Code) path scope: workspace-root-relative globs,
+  // as a comma-separated string or a list. A path-scoped skill is left out of the
+  // agent_skill_read index and surfaces only after a file tool touches a matching file.
+  // parseSkillMarkdown validates the patterns (normalizeSkillPaths).
+  paths: z.union([z.string(), z.array(z.string())]).optional(),
 });
 
 /**
@@ -109,6 +128,8 @@ export const AgentSkillDescriptorSchema = z.object({
   argumentHint: z.string().min(1).max(200).optional(),
   /** Normalized `when_to_use`/`when-to-use` frontmatter (extra model-facing index guidance). */
   whenToUse: z.string().min(1).max(1024).optional(),
+  /** Normalized `paths` frontmatter (workspace-root-relative globs; see skillPaths.ts). */
+  paths: z.array(z.string().min(1)).min(1).optional(),
   /** Agent Plugins: contributing plugin name (absent for non-plugin skills). */
   pluginName: z.string().min(1).optional(),
 });
@@ -153,4 +174,9 @@ export const AgentSkillListResultSchema = z.object({
   skills: z.array(AgentSkillDescriptorSchema),
   invalidSkills: z.array(AgentSkillIssueSchema),
   unavailableSources: z.array(AgentSkillUnavailableSourceSchema),
+  /**
+   * Plugin skills whose bare name lost to a higher-precedence skill. Each stays
+   * reachable as `<pluginName>:<name>`. Omitted when empty.
+   */
+  shadowedPluginSkills: z.array(AgentSkillDescriptorSchema).optional(),
 });

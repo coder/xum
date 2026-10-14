@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
-import { normalizeCodexManifest, readOpenAIExtension } from "./openaiExtension";
+import {
+  MAX_HOOK_POINTER_ENTRIES,
+  normalizeCodexManifest,
+  readOpenAIExtension,
+} from "./openaiExtension";
 
 const validInterface = { displayName: "Figma", shortDescription: "Design", developerName: "Figma" };
 
@@ -131,12 +135,107 @@ describe("readOpenAIExtension", () => {
     );
   });
 
+  test("invisible format characters (\\p{Cf}) are refused like direction controls", () => {
+    const read = (iface: Record<string, unknown>) =>
+      readOpenAIExtension({ extensions: { "com.openai": { interface: iface } } });
+    // ZERO WIDTH SPACE: "Fig\u200bma" looks like "Figma" in Settings.
+    for (const bad of ["Fig\u200bma", "Fig\u2064ma", "Fig\ufeffma", "Fig\u00adma", "Fig\u2060ma"]) {
+      expect(read({ ...validInterface, developerName: bad }).extension).toEqual({});
+    }
+    const optional = read({ ...validInterface, longDescription: "Line one\nLine\u200b two" });
+    expect(optional.extension?.interface).toEqual(validInterface);
+    expect(optional.warnings).toHaveLength(1);
+  });
+
+  test("joiners and emoji tag characters stay allowed; other format characters do not", () => {
+    const read = (iface: Record<string, unknown>) =>
+      readOpenAIExtension({ extensions: { "com.openai": { interface: iface } } });
+    // ZWJ emoji sequence, a Persian name with ZWNJ, and a subdivision flag (tag characters).
+    const scotland = "\u{1f3f4}\u{e0067}\u{e0062}\u{e0073}\u{e0063}\u{e0074}\u{e007f}";
+    for (const good of [
+      "Dev \u{1f469}\u200d\u{1f4bb}",
+      "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645",
+      `Team ${scotland}`,
+      // An emoji with VS16, a keycap, and a Hindi conjunct broken with ZWNJ.
+      "Love \u2764\ufe0f",
+      "Room 1\ufe0f\u20e3",
+      "\u0915\u094d\u200c\u0937",
+    ]) {
+      const result = read({ ...validInterface, displayName: good, developerName: good });
+      expect(result.warnings).toEqual([]);
+      expect(result.extension?.interface?.displayName).toBe(good);
+    }
+    // Outside those sequences they are invisible spoofing tools (Codex PRRT_kwDOPxxmWM6sQExO).
+    for (const bad of [
+      "Fig\u200bma",
+      "Example\u202eelgooG",
+      "Fig\u200dma",
+      "Fig\u200cma",
+      "\u200c\u0645\u06cc",
+      "Fig\u{e0067}ma",
+      "\u{1f3f4}\u{e0067}\u{e0062}",
+      // Variation selectors outside an emoji or keycap, and ZWNJ in a script without shaping
+      // (Codex PRRT_kwDOPxxmWM6sQ79s, PRRT_kwDOPxxmWM6sQ79z).
+      "Fig\ufe0fma",
+      "Fig\u{e0100}ma",
+      "\u5f00\u53d1\u200c\u8005",
+      "\u0440\u0443\u200c\u0441",
+    ]) {
+      expect(read({ ...validInterface, developerName: bad }).extension).toEqual({});
+    }
+    for (const label of ["\u200d", "\ufe0f"]) {
+      const blank = read({ ...validInterface, capabilities: ["Search", label] });
+      expect(blank.extension?.interface).toEqual(validInterface);
+    }
+  });
+
+  test("a blank capability drops the capability list with a warning", () => {
+    const read = (capabilities: unknown) =>
+      readOpenAIExtension({
+        extensions: { "com.openai": { interface: { ...validInterface, capabilities } } },
+      });
+    for (const blank of ["", "   "]) {
+      const result = read(["Search", blank]);
+      expect(result.extension?.interface).toEqual(validInterface);
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings[0]).toContain("interface.capabilities'");
+    }
+    expect(read(["Search", "Read"]).extension?.interface?.capabilities).toEqual(["Search", "Read"]);
+  });
+
   test("an interface without its required names is dropped as a whole", () => {
     const { extension, warnings } = readOpenAIExtension({
       extensions: { "com.openai": { interface: { displayName: "Only a name" } } },
     });
     expect(extension).toEqual({});
     expect(warnings).toHaveLength(1);
+  });
+
+  test("reads at most the hook loader's entry cap and reports the rest once", () => {
+    const { extension, warnings } = readOpenAIExtension({
+      extensions: {
+        "com.openai": { hooks: [...Array<string>(100_000).fill("/bad"), "./hooks/late.json"] },
+      },
+    });
+
+    // The late valid entry is past the cap, so no entry is valid: the default file stays off.
+    expect(extension).toEqual({ hooks: [] });
+    expect(warnings).toHaveLength(MAX_HOOK_POINTER_ENTRIES + 1);
+    expect(warnings.filter((warning) => warning.includes("100001 entries"))).toHaveLength(1);
+  });
+
+  test("keeps review and publication as opaque objects; other shapes warn", () => {
+    const review = { tests: [{ prompt: "Hi" }] };
+    const kept = readOpenAIExtension({
+      extensions: { "com.openai": { review, publication: { countries: [] } } },
+    });
+    expect(kept).toEqual({ extension: { review, publication: { countries: [] } }, warnings: [] });
+
+    const dropped = readOpenAIExtension({
+      extensions: { "com.openai": { review: "yes", publication: [] } },
+    });
+    expect(dropped.extension).toEqual({});
+    expect(dropped.warnings).toHaveLength(2);
   });
 
   test("an absent namespace yields nothing; a non-object namespace warns", () => {
@@ -148,12 +247,24 @@ describe("readOpenAIExtension", () => {
 });
 
 describe("normalizeCodexManifest", () => {
-  test("maps a one-entry skills array; longer arrays stay unknown", () => {
+  test("maps a skills path or every entry of a skills array", () => {
     expect(normalizeCodexManifest({ name: "a", skills: ["./custom/"] }).manifest).toMatchObject({
-      contributes: { skills: "./custom" },
+      contributes: { skills: ["./custom"] },
     });
-    expect(normalizeCodexManifest({ name: "a", skills: ["./a", "./b"] }).manifest).toMatchObject({
-      skills: ["./a", "./b"],
+    const { manifest } = normalizeCodexManifest({ name: "a", skills: ["./a/", "./b", "../x", 3] });
+    // Unsafe entries pass through so the validator reports each one.
+    expect(manifest).toMatchObject({ contributes: { skills: ["./a", "./b", "../x", 3] } });
+    expect(manifest).not.toHaveProperty("skills");
+    // One MCP file only: a one-entry mcpServers array maps, a longer one stays unknown.
+    expect(
+      normalizeCodexManifest({ name: "a", mcpServers: ["./.mcp.json"] }).manifest
+    ).toMatchObject({ contributes: { mcp: "./.mcp.json" } });
+    expect(
+      normalizeCodexManifest({ name: "a", mcpServers: ["./a.json", "./b.json"] }).manifest
+    ).toMatchObject({ mcpServers: ["./a.json", "./b.json"] });
+    // Another shape stays top-level, and the validator reports it as unknown.
+    expect(normalizeCodexManifest({ name: "a", skills: { a: 1 } }).manifest).toMatchObject({
+      skills: { a: 1 },
     });
   });
 

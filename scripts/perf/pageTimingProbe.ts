@@ -53,6 +53,7 @@ export function probe(arg: ProbeArg) {
   const liveOne = <T extends HTMLElement>(sel: string) =>
     [...document.querySelectorAll<T>(sel)].find(live);
   // IR. P1: a click on the wizard's enabled Next reaches step 2. P2: typed text stays and Send is enabled.
+  // P1r: a click on the project page's enabled Open Provider Settings shows the provider settings.
   const act = (now: number) => {
     if (arg.page === "p1") {
       const dialog = liveOne("[role=dialog]");
@@ -64,6 +65,22 @@ export function probe(arg: ProbeArg) {
         next.click();
       }
       if (dialog?.querySelector('[role=img][aria-label^="Step 2 of"]')) rec.ir = now;
+      return;
+    }
+    if (arg.page === "p1r") {
+      const open = [...document.querySelectorAll("button")].find(
+        (b) => live(b) && b.textContent?.trim() === "Open Provider Settings" && !b.disabled
+      );
+      if (open && open.dataset.timingClicked !== "1") {
+        open.dataset.timingClicked = "1";
+        open.click();
+      }
+      const intro = "Configure API keys and endpoints for AI providers";
+      if (
+        [...document.querySelectorAll("p")].some((p) => live(p) && p.textContent?.startsWith(intro))
+      ) {
+        rec.ir = now;
+      }
       return;
     }
     const box = liveOne<HTMLTextAreaElement>('textarea[aria-label="Message"]');

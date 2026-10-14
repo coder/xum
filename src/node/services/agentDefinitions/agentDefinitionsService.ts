@@ -128,8 +128,10 @@ export function getDefaultAgentDefinitionsRoots(
       runtime.normalizePath(relativePath, workspacePath)
     ),
     globalRoot: GLOBAL_AGENTS_ROOT,
-    // Agent Plugins discovery is host-filesystem-only (v1), so remote runtimes
-    // never get plugin containers (mirrors agentSkillsService).
+    // Agent Plugins discovery reads the host filesystem only. Remote runtimes
+    // (SSH/Docker) get the GLOBAL host plugin containers (read through a host
+    // LocalRuntime) but no project plugin containers, because a remote
+    // checkout is not on the host filesystem (mirrors agentSkillsService).
     ...(!(runtime instanceof RemoteRuntime)
       ? {
           projectPluginRoots: [
@@ -140,7 +142,10 @@ export function getDefaultAgentDefinitionsRoots(
           ],
           globalPluginRoots: [`${runtime.getXumHome()}/plugins`, UNIVERSAL_AGENT_PLUGINS_CONTAINER],
         }
-      : {}),
+      : {
+          // Tilde form: the host LocalRuntime maps ~/.xum to the host Xum home.
+          globalPluginRoots: ["~/.xum/plugins", UNIVERSAL_AGENT_PLUGINS_CONTAINER],
+        }),
   };
 }
 

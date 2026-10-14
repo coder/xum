@@ -544,6 +544,39 @@ export function outer(items: number[]): number {
     assert suspects(capsys, tmp_path, literal_first, report)["outer"][1] is True
 
 
+
+def test_an_earlier_declarator_of_the_same_statement_must_not_skip_the_const(tmp_path, capsys):
+    source = """\
+export function outer(items: number[]): number {
+  const first = check(items),
+    STEP = 3;
+  let total = 0;
+  const later = () => {
+    return total + STEP;
+  };
+  return total + first;
+}
+"""
+    # check() threw: line 2 ran, and STEP (line 3) onward never did, so the
+    # zero run from STEP's literal through the closure is a correct report.
+    report = "DA:1,16\nDA:2,10\nDA:3,0\nDA:4,0\nDA:5,0\nDA:6,0\nDA:8,0\n"
+    assert suspects(capsys, tmp_path, source, report)["outer"][1] is False
+    # A literal earlier declarator cannot skip it.
+    literal_first = source.replace("check(items)", "1")
+    assert suspects(capsys, tmp_path, literal_first, report)["outer"][1] is True
+    # Neither can an alias of an earlier literal const.
+    alias_first = source.replace("const first = check(items),", "const raw = 1, first = raw,")
+    assert suspects(capsys, tmp_path, alias_first, report)["outer"][1] is True
+    # An outer const can be shadowed by a later local one: reading it there
+    # throws (temporal dead zone), so it is not safe.
+    shadowed = "const raw = 1;\n" + alias_first.replace("const raw = 1, first = raw,", "const first = raw,").replace(
+        "  return total + first;\n", "  const raw = check(items);\n  return total + first + raw;\n"
+    )
+    # The same report, one line down.
+    hits = ((1, 16), (2, 10), (3, 0), (4, 0), (5, 0), (6, 0), (8, 0))
+    shifted = "".join(f"DA:{line + 1},{count}\n" for line, count in hits)
+    assert suspects(capsys, tmp_path, shadowed, "DA:1,12\n" + shifted)["outer"][1] is False
+
 def test_javascript_sources_flag_too(tmp_path, capsys):
     # Bun 1.4.3 zeroes a .js module the same way (lines 2-9 at 0).
     relative = write(tmp_path, "src/demo/repro.js", REPRO.replace(": number", ""))

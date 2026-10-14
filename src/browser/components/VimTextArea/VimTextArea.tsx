@@ -235,9 +235,8 @@ export const VimTextArea = React.forwardRef<HTMLTextAreaElement, VimTextAreaProp
     const textareaStyle: React.CSSProperties = {
       // Mirror textarea defaults in inline styles so ghost hint overlay can reuse exact metrics.
       padding: "0.375rem 0.5rem",
-      // The minimum is set only on phone-width touch screens (globals.css, #5972), where iOS
-      // zooms into text fields below 16px. The ghost hint reuses this value, so both stay aligned.
-      fontSize: "max(13px, var(--min-text-entry-font-size, 0px))",
+      // Phones keep this size too: iOS focus zoom is stopped by installIosFocusZoomGuard.
+      fontSize: "13px",
       ...(rest.style ?? {}),
     };
 

@@ -100,7 +100,7 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
   if (!gitStatus) {
     return (
       <span
-        className="text-accent relative flex items-center gap-1 font-mono text-[11px]"
+        className="text-accent-text relative flex items-center gap-1 font-mono text-[11px]"
         aria-hidden="true"
       />
     );
@@ -118,7 +118,7 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
   if (isEmpty) {
     return (
       <span
-        className="text-accent relative flex items-center gap-1 font-mono text-[11px]"
+        className="text-accent-text relative flex items-center gap-1 font-mono text-[11px]"
         aria-hidden="true"
       />
     );
@@ -217,7 +217,7 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
             <div key={`${commit.hash}-${index}`} className="flex flex-col gap-0.5">
               <div className="flex gap-2 font-mono leading-snug">
                 {renderIndicators(commit.indicators)}
-                <span className="text-accent shrink-0 select-all">{commit.hash}</span>
+                <span className="text-accent-text shrink-0 select-all">{commit.hash}</span>
                 <span className="text-muted-light shrink-0">{commit.date}</span>
                 <span className="text-foreground flex-1 break-words">{commit.subject}</span>
               </div>
@@ -233,7 +233,7 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
 
   // Dynamic color based on working state
   // Idle: muted/grayscale, Working: original accent colors
-  const statusColor = isWorking ? "text-accent" : "text-muted";
+  const statusColor = isWorking ? "text-accent-text" : "text-muted";
   const dirtyColor = isWorking ? "text-git-dirty" : "text-muted";
   const additionsColor = isWorking ? "text-success-light" : "text-muted";
   const deletionsColor = isWorking ? "text-warning-light" : "text-muted";

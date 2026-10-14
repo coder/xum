@@ -5,8 +5,12 @@ import { getRightSidebarLayoutKey } from "@/common/constants/storage";
 import type { McpAppEntrypoint } from "@/common/orpc/schemas/mcpApps";
 import type { TabType } from "@/browser/types/rightSidebar";
 import { getErrorMessage } from "@/common/utils/errors";
-import { focusMcpAppViewTab, type McpAppViewRef } from "../ArtifactsTab/mcpAppViewsStore";
-import { appViewTabFor } from "./appViewTabs";
+import {
+  focusMcpAppViewTab,
+  reloadMcpAppView,
+  type McpAppViewRef,
+} from "../ArtifactsTab/mcpAppViewsStore";
+import { appViewTabFor, saveAppViewTab } from "./appViewTabs";
 import { entrypointViewRef, openedMcpAppEntrypoint } from "./mcpAppEntrypoints";
 
 /** What an entry point open reports without a backend connection (launcher and palette). */
@@ -25,12 +29,23 @@ export async function openMcpAppEntrypoint(
   workspaceId: string,
   entrypoint: McpAppEntrypoint,
   /** Where the tab goes; by default the focused pane (OPEN_MCP_APP_VIEW). */
-  show: (view: McpAppViewRef) => void = (view) => focusMcpAppViewTab(workspaceId, view.toolCallId)
+  show: (view: McpAppViewRef) => void = (view) => showInWorkspace(workspaceId, view.toolCallId)
 ): Promise<string | null> {
   const resolved = await resolveEntrypointView(api, workspaceId, entrypoint);
   if (typeof resolved === "string") return resolved;
   show(resolved);
   return null;
+}
+
+/**
+ * The palette's open: the tab goes into the workspace's saved layout first, since the user can
+ * switch workspace while the open runs and then no sidebar of this workspace listens for
+ * OPEN_MCP_APP_VIEW. The next pick then finds the tab instead of running the tool again. The
+ * event focuses the tab only where the workspace's sidebar is mounted.
+ */
+function showInWorkspace(workspaceId: string, toolCallId: string) {
+  saveAppViewTab(workspaceId, toolCallId);
+  focusMcpAppViewTab(workspaceId, toolCallId);
 }
 
 /**
@@ -73,6 +88,9 @@ async function resolveEntrypointViewOnce(
       type: entrypoint.type,
     });
     if (!result.success) return result.error;
+    // A tab already open for it keeps its earlier load (an evicted record, a moved view):
+    // remount its frame, so it shows the new record.
+    reloadMcpAppView(workspaceId, result.data.viewKey);
     // The backend's answer, not the listed entry point: its view (resourceUri) can have moved.
     return openedMcpAppEntrypoint(workspaceId, result.data);
   } catch (error) {

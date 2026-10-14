@@ -11,12 +11,27 @@ import {
   type Signal,
 } from "./pageTimingStats";
 
-export type Page = "p1" | "p2";
+export type Page = "p1" | "p2" | "p1r";
 /** Text-matched targets. P2's code line comes from scripts/perf/fixtures/neutralSeed/chat.jsonl. */
 export const TARGET: Record<Page, { selector: string; text: string }> = {
   p1: { selector: "p", text: "OSS contributors with GitHub accounts" },
   p2: { selector: ".code-line", text: "export function subtract(" },
+  p1r: {
+    selector: "p",
+    text: "To start a workspace, you'll need to configure at least one LLM provider",
+  },
 };
+
+/** Whether a run gets the neutral seed (scripts/perf/neutralSeed.ts), and the route it opens. */
+export const PAGE_SETUP: Record<Page, { seeded: boolean; route: (workspaceId: string) => string }> =
+  {
+    p1: { seeded: false, route: () => "/" },
+    p2: { seeded: true, route: (id) => `/workspace/${id}` },
+    // Gate 3's returning user (plan section 5.6, note 2): "/" on the onboarded seed with empty
+    // localStorage. It lands on the project page's provider prompt only because the seed has no
+    // provider.
+    p1r: { seeded: true, route: () => "/" },
+  };
 
 /** What the in-page probe records, in ms since navigation start. "Live" excludes a static first view. */
 export interface ProbeRecord {

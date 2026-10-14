@@ -102,6 +102,8 @@ import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
 import * as toolsModule from "@/common/utils/tools/tools";
+import type { ToolConfiguration } from "@/common/utils/tools/tools";
+import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import * as systemMessageModule from "./systemMessage";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { Ok } from "@/common/types/result";
@@ -2183,6 +2185,64 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     await startTestStream(harness, workspaceId);
 
     expect(getToolConfigFromHarness(harness).enableFamilyMessaging).toBe(true);
+  });
+
+  it("builds path-skill activation from the turn's skills and current context window", async () => {
+    using xumHome = new DisposableTempDir("ai-service-path-skills");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "workspace-path-skills";
+    const harness = createHarness(
+      xumHome.path,
+      createLocalWorkspaceMetadata(workspaceId, projectPath)
+    );
+    const buildSpy = spyOn(turnContextAssembler, "buildStreamSystemContext");
+    const stubbedBuild = buildSpy.getMockImplementation()!;
+    buildSpy.mockImplementation(async (contextArgs) => ({
+      ...(await stubbedBuild(contextArgs)),
+      availableSkills: ["before-reset", "after-reset"].map((name) => ({
+        name,
+        description: name,
+        scope: "project" as const,
+        paths: ["**/*.ts"],
+      })),
+    }));
+    const pointerRow = (id: string, skillName: string, historySequence: number) =>
+      createMuxMessage(id, "assistant", "", { historySequence }, [
+        {
+          type: "dynamic-tool",
+          toolCallId: `${id}-call`,
+          toolName: "file_read",
+          state: "output-available",
+          input: { path: "src/old.ts" },
+          output: { success: true, path_skills: { skills: [{ name: skillName }] } },
+        } as unknown as MuxMessage["parts"][number],
+      ]);
+
+    const result = await harness.service.streamMessage({
+      messages: [
+        pointerRow("old-pointer", "before-reset", 1),
+        createMuxMessage("reset", "assistant", "", {
+          historySequence: 2,
+          contextBoundaryKind: CONTEXT_BOUNDARY_KINDS.RESET,
+        }),
+        pointerRow("new-pointer", "after-reset", 3),
+        createMuxMessage("latest-user", "user", "continue", { historySequence: 4 }),
+      ],
+      workspaceId,
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "off",
+    });
+    expect(result.success).toBe(true);
+
+    // A pointer from before the reset no longer reaches the model, so that skill
+    // surfaces again; the one already surfaced in this window does not.
+    const activation = (getToolConfigFromHarness(harness) as Partial<ToolConfiguration>)
+      .pathSkillActivation;
+    expect(activation?.takeMatches("src/foo.ts").map((skill) => skill.name)).toEqual([
+      "before-reset",
+    ]);
   });
 
   it("reads experiments once per turn, so a mid-turn toggle cannot split token budget from memory", async () => {

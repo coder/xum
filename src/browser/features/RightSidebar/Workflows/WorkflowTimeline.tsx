@@ -269,7 +269,7 @@ const WorkflowStepRow: React.FC<WorkflowStepRowProps> = (props) => {
         </span>
       )}
       {step.status === "running" && (
-        <span className="text-accent shrink-0 text-[11px]">running…</span>
+        <span className="text-accent-text shrink-0 text-[11px]">running…</span>
       )}
       {step.status === "failed" && (
         <span className="shrink-0 text-[11px]" style={{ color }}>
