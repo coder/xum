@@ -2506,3 +2506,58 @@ test("two plugin installs with one server name keep their instance markers apart
     "solo",
   ]);
 });
+
+test("an MCP App entry point's palette entry shows its server label and opens it once", async () => {
+  const entrypoint = {
+    serverName: "plugin:0123456789abcdef:tray",
+    serverLabel: "bits-and-bolts · tray",
+    toolName: "cad.tray",
+    title: "Parts Tray",
+    resourceUri: "ui://tray/view",
+    type: "global" as const,
+    viewKey: "entrypoint:plugin:0123456789abcdef:tray:cad.tray:global",
+  };
+  const opened: unknown[] = [];
+  const actions = getActions({
+    artifactsEnabled: true,
+    mcpAppEntrypoints: [entrypoint],
+    api: createTestApiClient({
+      mcpApps: {
+        openEntrypoint: (input: unknown) => {
+          opened.push(input);
+          return Promise.resolve({ success: true as const, data: entrypoint });
+        },
+      },
+    }),
+  });
+  const entry = actions.find((a) => a.id === CommandIds.navOpenAppEntrypoint(entrypoint.viewKey));
+  // The label, never the internal plugin key; the key stays searchable.
+  expect([entry?.title, entry?.subtitle]).toEqual([
+    "Open Plugin View: Parts Tray",
+    entrypoint.serverLabel,
+  ]);
+  expect(entry?.keywords).toContain(entrypoint.serverName);
+  // Opening dispatches OPEN_MCP_APP_VIEW on window (the "Open in tab" path).
+  const testWindow = new GlobalWindow();
+  const originalWindow = globalThis.window;
+  globalThis.window = testWindow as unknown as Window & typeof globalThis;
+  const shown: unknown[] = [];
+  testWindow.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, (event) =>
+    shown.push((event as unknown as CustomEvent<{ toolCallId: string }>).detail.toolCallId)
+  );
+  try {
+    await entry?.run();
+  } finally {
+    globalThis.window = originalWindow;
+    testWindow.close();
+  }
+  expect(shown).toEqual([entrypoint.viewKey]);
+  expect(opened).toEqual([
+    {
+      workspaceId: expect.any(String),
+      serverName: entrypoint.serverName,
+      toolName: "cad.tray",
+      type: "global",
+    },
+  ]);
+});

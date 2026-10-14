@@ -1,9 +1,10 @@
 import React from "react";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider } from "@/browser/contexts/API";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { useWorkspaceStoreRaw, type WorkspaceState } from "@/browser/stores/WorkspaceStore";
 import { createTestApiClient } from "@/browser/testUtils";
 import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import {
@@ -107,21 +108,41 @@ describe("MCP App entry points", () => {
     const wrapper = (props: { children: React.ReactNode }) => (
       <APIProvider client={client}>{props.children}</APIProvider>
     );
-    const viewKey = entrypoint("Library").viewKey;
-    const { result } = renderHook(
-      () => {
-        useLoadMcpAppEntrypoints("ws-restore", true);
-        return useMcpAppView("ws-restore", viewKey);
-      },
-      { wrapper }
+    // The transcript is loaded, so only the entry point listing can keep the view loading.
+    const store = useWorkspaceStoreRaw();
+    const registered = spyOn(store, "hasRegisteredWorkspace").mockImplementation(() => true);
+    const state = spyOn(store, "getWorkspaceState").mockImplementation(
+      () =>
+        ({
+          messages: [],
+          loading: false,
+          isHydratingTranscript: false,
+        }) as unknown as WorkspaceState
     );
-    // No transcript row exists for it: "loading", never "no longer available".
-    expect(result.current).toBe("loading");
-    await waitFor(() => expect(release).not.toBeNull());
-    act(() => release?.([entrypoint("Library")]));
-    await waitFor(() =>
-      expect(result.current).toMatchObject({ toolCallId: viewKey, label: "Library", arguments: {} })
-    );
+    try {
+      const viewKey = entrypoint("Library").viewKey;
+      const { result } = renderHook(
+        () => {
+          useLoadMcpAppEntrypoints("ws-restore", true);
+          return useMcpAppView("ws-restore", viewKey);
+        },
+        { wrapper }
+      );
+      // No transcript row exists for it: "loading", never "no longer available".
+      expect(result.current).toBe("loading");
+      await waitFor(() => expect(release).not.toBeNull());
+      act(() => release?.([entrypoint("Library")]));
+      await waitFor(() =>
+        expect(result.current).toMatchObject({
+          toolCallId: viewKey,
+          label: "Library",
+          arguments: {},
+        })
+      );
+    } finally {
+      registered.mockRestore();
+      state.mockRestore();
+    }
   });
 
   test("opening calls the tool once; an open tab is only focused", async () => {
