@@ -21,12 +21,19 @@ interface Result {
   stderr: string;
 }
 
+const deadPid = () => spawnSync(process.execPath, ["-e", ""]).pid;
+
 describe("run_exclusive", () => {
   let lockDir: string;
   const lockPath = () => runExclusive.lockPathFor("test-lock", { XUM_LOCK_DIR: lockDir });
+  const writeLock = (owner: object) => {
+    fs.mkdirSync(lockPath());
+    fs.writeFileSync(path.join(lockPath(), "owner.json"), JSON.stringify(owner));
+  };
 
-  // Runs `node -e <script>` under the lock and resolves once it exits.
-  const runLocked = (script: string): Promise<Result> =>
+  // Runs `node -e <script>` under the lock. `onWaiting` fires once, when the wrapper reports that
+  // it is blocked on the lock, so tests release locks on that signal instead of after a delay.
+  const runLocked = (script: string, onWaiting?: () => void): Promise<Result> =>
     new Promise((resolve, reject) => {
       const child = spawn(
         process.execPath,
@@ -34,7 +41,13 @@ describe("run_exclusive", () => {
         { env: { ...process.env, XUM_LOCK_DIR: lockDir }, stdio: ["ignore", "ignore", "pipe"] }
       );
       let stderr = "";
-      child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
+      child.stderr.on("data", (chunk: Buffer) => {
+        const before = stderr;
+        stderr += chunk.toString();
+        if (!before.includes("Waiting for") && stderr.includes("Waiting for")) {
+          onWaiting?.();
+        }
+      });
       child.on("error", reject);
       child.on("exit", (code) => resolve({ code, stderr }));
     });
@@ -50,18 +63,31 @@ describe("run_exclusive", () => {
 
   it("runs one holder at a time and releases the lock afterwards", async () => {
     const log = path.join(lockDir, "log");
+    const gate = path.join(lockDir, "gate");
+    // Each holder stays inside the lock until the gate opens, and the gate opens only once the
+    // other run reports that it is waiting, so the runs must have overlapped in time.
     const script = (id: string) =>
       `const fs = require("fs");` +
       `fs.appendFileSync(${JSON.stringify(log)}, "start ${id}\\n");` +
-      `setTimeout(() => fs.appendFileSync(${JSON.stringify(log)}, "end ${id}\\n"), 400);`;
+      `const poll = setInterval(() => {` +
+      `  if (!fs.existsSync(${JSON.stringify(gate)})) return;` +
+      `  clearInterval(poll);` +
+      `  fs.appendFileSync(${JSON.stringify(log)}, "end ${id}\\n");` +
+      `}, 20);`;
+    const openGate = () => fs.writeFileSync(gate, "");
 
-    const results = await Promise.all([runLocked(script("a")), runLocked(script("b"))]);
+    const results = await Promise.all([
+      runLocked(script("a"), openGate),
+      runLocked(script("b"), openGate),
+    ]);
 
     expect(results.map((result) => result.code)).toEqual([0, 0]);
-    const events = fs.readFileSync(log, "utf8").trim().split("\n");
-    // Whoever starts first must end before the other starts.
-    expect(events[1]).toBe(events[0].replace("start", "end"));
-    expect(results.some((result) => result.stderr.includes("Waiting for pid"))).toBe(true);
+    const [firstStart, firstEnd, secondStart, secondEnd] = fs
+      .readFileSync(log, "utf8")
+      .trim()
+      .split("\n");
+    expect(firstEnd).toBe(firstStart.replace("start", "end"));
+    expect(secondEnd).toBe(secondStart.replace("start", "end"));
     expect(fs.existsSync(lockPath())).toBe(false);
   });
 
@@ -73,9 +99,7 @@ describe("run_exclusive", () => {
   });
 
   it("reclaims a lock whose holder has died", async () => {
-    const deadPid = spawnSync(process.execPath, ["-e", ""]).pid;
-    fs.mkdirSync(lockPath());
-    fs.writeFileSync(path.join(lockPath(), "owner.json"), JSON.stringify({ pid: deadPid }));
+    writeLock({ pid: deadPid() });
 
     const result = await runLocked("");
 
@@ -95,33 +119,38 @@ describe("run_exclusive", () => {
   });
 
   it("waits for a live holder instead of reclaiming its lock", async () => {
-    fs.mkdirSync(lockPath());
-    fs.writeFileSync(path.join(lockPath(), "owner.json"), JSON.stringify({ pid: process.pid }));
-    setTimeout(() => fs.rmSync(lockPath(), { recursive: true, force: true }), 800);
+    writeLock({ pid: process.pid });
 
-    const started = Date.now();
-    const result = await runLocked("");
+    const result = await runLocked("", () => fs.rmSync(lockPath(), { recursive: true }));
 
     expect(result.code).toBe(0);
     expect(result.stderr).toContain(`Waiting for pid ${process.pid}`);
-    expect(Date.now() - started).toBeGreaterThanOrEqual(700);
+  });
+
+  it("waits while the locked command outlives its killed wrapper", async () => {
+    // The wrapper died (e.g. SIGKILL) but its lint is still running.
+    const wrapperPid = deadPid();
+    writeLock({ pid: wrapperPid, childPid: process.pid });
+
+    const result = await runLocked("", () => fs.rmSync(lockPath(), { recursive: true }));
+
+    expect(result.code).toBe(0);
+    expect(result.stderr).toContain(`Waiting for pid ${wrapperPid}`);
   });
 
   itUnlessRoot("waits on a stale lock it cannot remove instead of spinning", async () => {
-    const deadPid = spawnSync(process.execPath, ["-e", ""]).pid;
-    fs.mkdirSync(lockPath());
-    fs.writeFileSync(path.join(lockPath(), "owner.json"), JSON.stringify({ pid: deadPid }));
+    const stalePid = deadPid();
+    writeLock({ pid: stalePid });
     // Without write access to the parent, the stale lock cannot be moved aside, as with another
     // user's lock under the sticky /tmp.
     fs.chmodSync(lockDir, 0o555);
-    setTimeout(() => {
-      fs.chmodSync(lockDir, 0o755);
-      fs.rmSync(lockPath(), { recursive: true, force: true });
-    }, 800);
 
-    const result = await runLocked("");
+    const result = await runLocked("", () => {
+      fs.chmodSync(lockDir, 0o755);
+      fs.rmSync(lockPath(), { recursive: true });
+    });
 
     expect(result.code).toBe(0);
-    expect(result.stderr).toContain(`Waiting for pid ${deadPid}`);
+    expect(result.stderr).toContain(`Waiting for pid ${stalePid}`);
   });
 });

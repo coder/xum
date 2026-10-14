@@ -149,6 +149,19 @@ describe("lint target git discovery", () => {
     expect(run({ XUM_LINT_BASE: base })).toEqual(["full eslint.config.mjs changed"]);
   });
 
+  it("lints everything when a config file changes type", () => {
+    write("tsconfig.base.json", "{}\n");
+    fs.symlinkSync("tsconfig.base.json", path.join(repo, "tsconfig.json"));
+    git("add", ".");
+    git("commit", "-q", "-m", "symlinked config");
+    const base = git("rev-parse", "HEAD");
+
+    fs.rmSync(path.join(repo, "tsconfig.json"));
+    write("tsconfig.json", "{}\n");
+
+    expect(run({ XUM_LINT_BASE: base })).toEqual(["full tsconfig.json changed"]);
+  });
+
   it("honors XUM_LINT_BASE", () => {
     write("src/committed.ts");
     git("add", ".");

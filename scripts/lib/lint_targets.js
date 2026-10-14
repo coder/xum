@@ -80,15 +80,16 @@ function resolveBase(cwd, env = process.env) {
 }
 
 /**
- * `changed`: files added, copied, modified or renamed since `base` (committed or not), plus
- * untracked files. `removed`: files deleted or renamed away since `base`; they cannot be linted,
- * but a deleted or moved config still changes what every other file is checked against.
+ * `changed`: files added, copied, modified, renamed or type-changed (e.g. symlink to file) since
+ * `base` (committed or not), plus untracked files. `removed`: files deleted or renamed away since
+ * `base`; they cannot be linted, but a deleted or moved config still changes what every other file
+ * is checked against.
  */
 function listChangedFiles(cwd, base) {
   const split = (output) => output.split("\0").filter((file) => file !== "");
   return {
     changed: [
-      ...split(git(["diff", "--name-only", "--diff-filter=ACMR", "-z", base], cwd)),
+      ...split(git(["diff", "--name-only", "--diff-filter=ACMRT", "-z", base], cwd)),
       ...split(git(["ls-files", "--others", "--exclude-standard", "-z"], cwd)),
     ],
     // --no-renames reports a rename as a deletion of the old path.

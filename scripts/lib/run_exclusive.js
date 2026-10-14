@@ -10,8 +10,10 @@
 // together can OOM-kill the whole workspace.
 //
 // The lock is a directory (mkdir is atomic on every platform we support, unlike flock, which macOS
-// lacks) holding owner.json with the holder's pid. A lock whose holder died is reclaimed. Two
-// waiters reclaiming the same stale lock can race and both run, which is no worse than no lock.
+// lacks) holding owner.json with the pids of this wrapper and of the command it runs. A lock is
+// reclaimed only once both have exited, so a wrapper killed with SIGKILL does not free the lock
+// while its lint keeps running. Two waiters reclaiming the same stale lock can race and both run,
+// which is no worse than no lock.
 
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
@@ -49,6 +51,13 @@ function isAlive(pid) {
   }
 }
 
+// Atomic (write then rename): a waiter reading a half-written file would see an ownerless lock.
+function writeOwner(lockPath, owner) {
+  const file = path.join(lockPath, "owner.json");
+  fs.writeFileSync(`${file}.tmp`, JSON.stringify(owner));
+  fs.renameSync(`${file}.tmp`, file);
+}
+
 function tryCreate(lockPath, owner) {
   try {
     fs.mkdirSync(lockPath);
@@ -58,13 +67,13 @@ function tryCreate(lockPath, owner) {
     }
     throw error;
   }
-  fs.writeFileSync(path.join(lockPath, "owner.json"), JSON.stringify(owner));
+  writeOwner(lockPath, owner);
   return true;
 }
 
 function isStale(lockPath, owner, now) {
   if (owner !== null) {
-    return !isAlive(owner.pid);
+    return !isAlive(owner.pid) && !(owner.childPid !== undefined && isAlive(owner.childPid));
   }
   try {
     return now - fs.statSync(lockPath).mtimeMs > OWNERLESS_STALE_MS;
@@ -96,7 +105,7 @@ async function acquire(lockPath, onWait) {
   let waited = false;
   for (;;) {
     if (tryCreate(lockPath, self)) {
-      return;
+      return self;
     }
     const owner = readOwner(lockPath);
     // A stale lock that cannot be removed is waited on like a live one rather than retried in a
@@ -128,12 +137,15 @@ async function main(argv = process.argv.slice(2)) {
   }
 
   const lockPath = lockPathFor(name);
-  await acquire(lockPath, (owner) => {
-    const holder = owner ? `pid ${owner.pid} in ${owner.cwd}` : "another process";
-    process.stderr.write(`Waiting for ${holder} to finish its ${name} (lock: ${lockPath})...\n`);
+  const owner = await acquire(lockPath, (holder) => {
+    const who = holder ? `pid ${holder.pid} in ${holder.cwd}` : "another process";
+    process.stderr.write(`Waiting for ${who} to finish its ${name} (lock: ${lockPath})...\n`);
   });
 
   const child = spawn(command[0], command.slice(1), { stdio: "inherit" });
+  if (child.pid !== undefined) {
+    writeOwner(lockPath, { ...owner, childPid: child.pid });
+  }
   // Keep the lock until the child exits: forward termination signals instead of dying first.
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
     process.on(signal, () => child.kill(signal));
