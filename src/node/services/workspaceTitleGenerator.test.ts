@@ -507,6 +507,34 @@ describe("generateWorkspaceIdentity candidate settings", () => {
     }
     expect(createModelWithPinnedOptions).toHaveBeenCalledTimes(2);
   });
+
+  test("reports a failed request over a later candidate skipped for missing credentials", async () => {
+    const createModelWithPinnedOptions = mock((modelString: string) =>
+      Promise.resolve(
+        modelString.startsWith("openai:")
+          ? Err({ type: "api_key_not_found" as const, provider: "openai" })
+          : pinnedOptionsFor(modelString, createTitleModel(modelString))
+      )
+    );
+    spyOn(aiSdk, "streamText").mockImplementation((() => {
+      throw createApiCallError(500, "naming model unavailable");
+    }) as unknown as typeof aiSdk.streamText);
+
+    const result = await generateWorkspaceIdentity(
+      "Add setting",
+      [{ model: "anthropic:claude-haiku-4-5" }, { model: "openai:gpt-5.6-luna" }],
+      titleAIService(createModelWithPinnedOptions)
+    );
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toEqual({
+        type: "service_unavailable",
+        raw: "naming model unavailable",
+      });
+    }
+    expect(createModelWithPinnedOptions).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("generateWorkspaceIdentity cleanup", () => {

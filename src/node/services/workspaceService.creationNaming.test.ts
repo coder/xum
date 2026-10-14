@@ -301,6 +301,38 @@ describe("create() with nameGeneration", () => {
     expect(branchExists(projectPath, "sidebar-k3m9")).toBe(false);
   }, 30_000);
 
+  test("a creation sent while the form's naming request runs takes that request over", async () => {
+    const naming = createDeferred<IdentityResult>();
+    generateIdentity.mockImplementation(() => naming.promise);
+
+    const formNaming = service.generateDraftIdentity(NAME_REQUEST);
+    await until(() => generateIdentity.mock.calls.length === 1);
+    const created = await createNamed();
+    await waitForNamingStep(created.id);
+    naming.resolve(GENERATED);
+    await harness.initStateManager.waitForInit(created.id);
+
+    expect(await readObserved(created.path)).toBe(`sidebar-k3m9 ${created.name}`);
+    expect(await formNaming).toEqual(GENERATED);
+    expect(generateIdentity).toHaveBeenCalledTimes(1);
+  }, 30_000);
+
+  test("a fork made while the backend names its source waits for the generated title", async () => {
+    const naming = createDeferred<IdentityResult>();
+    generateIdentity.mockImplementation(() => naming.promise);
+
+    const created = await createNamed();
+    await waitForNamingStep(created.id);
+    const forked = service.fork(created.id);
+    naming.resolve(GENERATED);
+    const result = await forked;
+    if (!result.success) throw new Error(result.error);
+    await harness.initStateManager.waitForInit(created.id);
+    await harness.initStateManager.waitForInit(result.data.metadata.id);
+
+    expect(result.data.metadata.title).toBe("Fix sidebar layout (1)");
+  }, 30_000);
+
   test.each([
     { label: "a branch name", branchName: "feature", title: undefined, type: "worktree" },
     { label: "a title", branchName: undefined, title: "Title", type: "worktree" },

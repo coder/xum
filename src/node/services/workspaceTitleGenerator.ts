@@ -219,8 +219,14 @@ export async function generateWorkspaceIdentity(
   // chat model so honoring naming settings does not displace the last fallback.
   const maxAttempts = Math.min(candidates.length, 4);
 
-  // Track the last classified error to return if all candidates fail
+  // The last classified error, returned if all candidates fail. A failed request explains the
+  // outcome better than a later candidate skipped before any request (often a provider the user
+  // never set up), so a skip is reported only when no request failed.
   let lastError: NameGenerationError | null = null;
+  let lastSkipError: NameGenerationError = {
+    type: "configuration",
+    raw: "No working model candidates were available for name generation.",
+  };
 
   for (let i = 0; i < maxAttempts; i++) {
     const candidate = candidates[i];
@@ -244,7 +250,7 @@ export async function generateWorkspaceIdentity(
       agentInitiated: true,
     });
     if (!modelResult.success) {
-      lastError = mapModelCreationError(modelResult.error, modelString);
+      lastSkipError = mapModelCreationError(modelResult.error, modelString);
       log.debug(`Name generation: skipping ${modelString} (${modelResult.error.type})`);
       continue;
     }
@@ -364,12 +370,7 @@ export async function generateWorkspaceIdentity(
     }
   }
 
-  return Err(
-    lastError ?? {
-      type: "configuration",
-      raw: "No working model candidates were available for name generation.",
-    }
-  );
+  return Err(lastError ?? lastSkipError);
 }
 
 /**
