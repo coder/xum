@@ -192,6 +192,17 @@ function resolveSliceEnd(
   return to > fromIndex ? to : nearestSafeCutAtOrAfter(fromIndex + 1, length, isSafeCut);
 }
 
+/**
+ * The budget counter after the render re-anchors the start, in the same update: a boundary pulled
+ * back to a bundle head charges the `pulled` rows it mounted (the next step starts from there). A
+ * vanished anchor fails closed: rows that moved under it cannot be counted, so the budget ends
+ * (Load older starts a new one; a pending navigation target still reveals).
+ */
+function chargedRevealedRows(state: RevealState, anchorIndex: number, pulled: number): number {
+  if (anchorIndex === -1) return Math.max(state.revealedRows, state.autoRowLimit);
+  return state.revealedRows + pulled;
+}
+
 /** `state` with its end fields set for a slice ending at `to` (null at the tail). */
 function withSliceEnd(state: RevealState, messages: readonly RevealRow[], to: number): RevealState {
   const endMessageId = to < messages.length ? messages[to].id : null;
@@ -441,9 +452,7 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
     }
     const boundary = anchorIndex === -1 ? current.anchorIndexHint : anchorIndex;
     fromIndex = nearestSafeCutAtOrBefore(boundary, length, args.isSafeCut);
-    // A boundary pulled back to a bundle head mounts rows outside any step: charge them to the
-    // budget in the same update that moves the anchor (the next step starts from fromIndex).
-    const revealedRows = current.revealedRows + boundary - fromIndex;
+    const revealedRows = chargedRevealedRows(current, anchorIndex, boundary - fromIndex);
     if (fromIndex === 0) {
       current = { ...current, anchorMessageId: null, anchorIndexHint: 0, revealedRows };
       setState(current);

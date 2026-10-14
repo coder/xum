@@ -810,5 +810,31 @@ describe("useBoundedTranscriptReveal", () => {
         cleanup();
       }
     });
+
+    test("a vanished start anchor with an older page in one update pauses the reveal", () => {
+      const { frames, reveal, runFrames, setProps, props } = renderSlice();
+      runFrames();
+      act(() => reveal().revealMore());
+      act(() => frames.flush());
+      const anchorId = props().messages[reveal().fromIndex].id; // the CURRENT anchor
+      const drop = (messages: Row[]) => messages.filter((row) => row.id !== anchorId);
+      setProps({ messages: drop([...rows(300, "old"), ...props().messages]) });
+      expect(reveal().isRevealPaused).toBe(true);
+      expect(frames.hasPending()).toBe(false);
+
+      // With a new budget and a pending navigation, the navigation still reveals down to its row.
+      act(() => reveal().revealMore());
+      act(() => reveal().revealThrough(100));
+      setProps({ messages: props().messages.filter((_, i) => i !== reveal().fromIndex) });
+      expect(frames.hasPending()).toBe(true);
+
+      // Attached to the start (no anchor): a deletion never pauses.
+      cleanup();
+      const attached = renderSlice();
+      attached.setProps({ messages: rows(TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + 20) }); // reveals fully
+      attached.runFrames();
+      attached.setProps({ messages: attached.props().messages.slice(1) });
+      expect(attached.reveal()).toMatchObject({ isFullyRevealed: true, isRevealPaused: false });
+    });
   });
 });
