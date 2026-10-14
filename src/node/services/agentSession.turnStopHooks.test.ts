@@ -486,6 +486,21 @@ describe("turn.stop", () => {
     expect(promptHookTexts).toEqual(["fix the tests"]);
   });
 
+  test("a send still in preflight when the turn ends does not skip the Stop hooks", async () => {
+    // Codex PRRT_kwDOPxxmWM6sT80F: the send can still fail before it starts a turn.
+    const calls: StopCall[] = [];
+    addConsumer(() => undefined, calls);
+    const { h, streams } = await setup({
+      session: { hasExternalManualSendPreflight: () => true },
+    });
+
+    await h.session.sendMessage("fix the tests", options);
+    await settle(h);
+
+    expect(streams()).toBe(1);
+    expect(calls.map((call) => call.messageId)).toEqual(["a1"]);
+  });
+
   test("input queued during the turn skips the Stop hooks (the queue continues the turn)", async () => {
     const calls: StopCall[] = [];
     addConsumer(() => undefined, calls);

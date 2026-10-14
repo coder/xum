@@ -10451,8 +10451,11 @@ export class AgentSession {
     // Input queued during the turn is its next turn: the turn has not stopped, so Stop does
     // not run (Codex PRRT_kwDOPxxmWM6rPrjz). The flush below dispatches it. A turn whose end an
     // outside client already received ran to its end for that client: its hooks still run
-    // (they only lose the continuation, below).
-    if (!provenance.externallyOwnedTurn && this.hasDispatchableFollowUp()) {
+    // (they only lose the continuation, below). Only committed queue entries count here: a manual
+    // reservation or a send in preflight can still fail without starting a turn, and this turn's
+    // Stop notices would then be lost (Codex PRRT_kwDOPxxmWM6sT80F). Those still cancel the
+    // continuation below.
+    if (!provenance.externallyOwnedTurn && this.messageQueue.hasDispatchableEntries()) {
       this.stopHookContinuations = 0;
       return;
     }
