@@ -282,7 +282,10 @@ async function main(): Promise<number> {
   const predict = new URLSearchParams(a.predict.replaceAll(",", "&")); // "p1.ucs=3.9,p2.ir=1.2"
   const predictKeys = [...predict.keys()];
   const twice = predictKeys.find((k, i) => predictKeys.indexOf(k) !== i);
-  const outUsed = a.out && fs.existsSync(a.out) && fs.readdirSync(a.out).length > 0;
+  const outUsed =
+    a.out &&
+    fs.existsSync(a.out) &&
+    (!fs.statSync(a.out).isDirectory() || fs.readdirSync(a.out).length);
   const html = (t?: string) =>
     t && fs.existsSync(path.join(t, "dist/index.html"))
       ? fs.readFileSync(path.join(t, "dist/index.html"))
@@ -298,7 +301,7 @@ async function main(): Promise<number> {
     missing.length > 0 ? `not a built tree, missing: ${missing.join(", ")}` : "",
     pages.some((p) => !Object.hasOwn(core.TARGET, p)) ? `unknown page in --pages ${a.pages}` : "",
     fs.existsSync(a.chrome) ? "" : `--chrome ${a.chrome} does not exist`,
-    outUsed ? `--out ${a.out} is not empty: use a new folder` : "",
+    outUsed ? `--out ${a.out} is not a new or empty folder` : "",
     twoCommits ? "--aa needs two builds of one commit: their dist/index.html differs" : "",
     a.aa && a.qualification ? "--aa and --qualification exclude each other" : "",
     a.qualification && pages.length !== 1 ? "a gated run takes one page (--pages p1)" : "",

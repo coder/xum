@@ -37,21 +37,22 @@ test("refuses inherited page names, a reused --out folder and --aa trees of two 
   const r = runner(["--base", a, "--head", b, "--aa", "--pages", "p1,constructor", "--out", out]);
   expect(r.status).toBe(2);
   expect(r.stderr).toContain("unknown page in --pages p1,constructor");
-  expect(r.stderr).toContain(`--out ${out} is not empty`);
+  expect(r.stderr).toContain(`--out ${out} is not a new or empty folder`);
   expect(r.stderr).toContain("--aa needs two builds of one commit");
 }, 60_000);
 
-test("refuses a --predict key given twice", () => {
+test("refuses a --predict key given twice, and a file as --out", () => {
   const a = tree("c", "<p>1</p>");
   const q = path.join(tmp, "q.json");
   fs.writeFileSync(
     q,
     JSON.stringify({ p1: { qualification: "qualified", mdi: { ucs: 0.1, ir: 0.1 } } })
   );
-  const predict = ["--predict", "p1.ucs=0.1,p1.ucs=5"];
+  const predict = ["--predict", "p1.ucs=0.1,p1.ucs=5", "--out", q]; // q: a file, not a folder
   const r = runner(["--base", a, "--head", a, "--qualification", q, "--pages", "p1", ...predict]);
   expect(r.status).toBe(2);
   expect(r.stderr).toContain("duplicate --predict key p1.ucs");
+  expect(r.stderr).toContain(`--out ${q} is not a new or empty folder`);
   expect(r.stderr).not.toContain("bad --predict keys");
 }, 60_000);
 
