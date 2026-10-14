@@ -283,6 +283,19 @@ describe("AgentPluginInstallService hook trust", () => {
     expect(await fsPromises.stat(root).catch(() => null)).toBeNull();
   });
 
+  test("a symlinked trust-store root is unlinked; its target is never written", async () => {
+    if (process.platform === "win32") return;
+    await install();
+    const elsewhere = path.join(xumRoot, "elsewhere");
+    await fsPromises.mkdir(elsewhere);
+    const root = path.join(xumRoot, "plugin-hook-trust");
+    await fsPromises.symlink(elsewhere, root);
+
+    expect(await trustFirstHook()).toBe("trusted");
+    expect((await fsPromises.lstat(root)).isDirectory()).toBe(true);
+    expect(await fsPromises.readdir(elsewhere)).toEqual([]);
+  });
+
   test("a trust file with mode 000 is repaired on the next decision", async () => {
     if (process.platform === "win32" || process.getuid?.() === 0) return;
     await install();

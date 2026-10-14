@@ -118,9 +118,7 @@ async function readBoundedTrustFile(file: string): Promise<string | undefined> {
     // The size from fstat can grow before the read: read at most one byte past the limit, so the
     // limit holds while reading too (Codex PRRT_kwDOPxxmWM6rPrVQ).
     const buffer = Buffer.alloc(MAX_TRUST_FILE_BYTES + 1);
-    const { bytesRead } = stat.isFile()
-      ? await handle.read(buffer, 0, buffer.length, 0)
-      : { bytesRead: Infinity };
+    const bytesRead = stat.isFile() ? await readUntilFull(handle, buffer) : Infinity;
     if (bytesRead > MAX_TRUST_FILE_BYTES) {
       log.warn("Plugin hook trust file is not a bounded regular file; trusting no hooks", { file });
       return undefined;
@@ -132,6 +130,21 @@ async function readBoundedTrustFile(file: string): Promise<string | undefined> {
     }
     return undefined;
   }
+}
+
+/**
+ * Read until EOF or until `buffer` is full. One read() can return fewer bytes than asked on some
+ * filesystems, and parsing that prefix would read a valid file as malformed (Codex
+ * PRRT_kwDOPxxmWM6sRsEs).
+ */
+async function readUntilFull(handle: fs.FileHandle, buffer: Buffer): Promise<number> {
+  let total = 0;
+  while (total < buffer.length) {
+    const { bytesRead } = await handle.read(buffer, total, buffer.length - total, total);
+    if (bytesRead === 0) break;
+    total += bytesRead;
+  }
+  return total;
 }
 
 /**
@@ -217,12 +230,13 @@ async function ensureTrustRoot(xumHome: string): Promise<void> {
 }
 
 /**
- * Remove the trust-store root when it is not a directory. `rm` without `recursive` removes a
- * symlink itself, never its target.
+ * Remove the trust-store root when it is not a real directory. `lstat`: a symlink, also one to a
+ * directory, is removed as a link, so no write or delete reaches outside the store (Codex
+ * PRRT_kwDOPxxmWM6sRsEy). `rm` without `recursive` never follows it to its target.
  */
 async function removeWrongKindRoot(xumHome: string): Promise<void> {
   const root = path.join(xumHome, TRUST_DIR);
-  const existing = await fs.stat(root).catch(() => null);
+  const existing = await fs.lstat(root).catch(() => null);
   if (existing !== null && !existing.isDirectory()) await fs.rm(root, { force: true });
 }
 
