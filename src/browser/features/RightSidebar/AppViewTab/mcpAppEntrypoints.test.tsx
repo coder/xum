@@ -529,4 +529,96 @@ describe("MCP App entry points", () => {
       restore();
     }
   });
+  test("after a restart, a tab whose entry point is gone shows unavailable, not its record", async () => {
+    // A fresh workspace ID stands in for a restarted renderer: no ref or retired key is held.
+    const target = entrypoint("Library");
+    const client = createTestApiClient({
+      mcpApps: {
+        // The server was disabled: the list lacks the entry point.
+        listEntrypoints: () => Promise.resolve([]),
+        // Its record outlives the server and says it belongs to an entry point.
+        getViewRecords: (input: { toolCallIds: string[] }) =>
+          Promise.resolve({
+            success: true as const,
+            data: input.toolCallIds.map((toolCallId) => ({
+              toolCallId,
+              view: {
+                serverName: "cad",
+                toolName: "cad.library",
+                resourceUri: "ui://cad/library",
+                arguments: {},
+                entrypoint: true,
+              },
+            })),
+          }),
+      },
+    });
+    const wrapper = (props: { children: React.ReactNode }) => (
+      <APIProvider client={client}>{props.children}</APIProvider>
+    );
+    const restore = loadedTranscripts(useWorkspaceStoreRaw());
+    try {
+      const { result } = renderHook(
+        () => {
+          useLoadMcpAppEntrypoints("ws-restarted", true);
+          return useMcpAppView("ws-restarted", target.viewKey);
+        },
+        { wrapper }
+      );
+      await waitFor(() => expect(result.current).toBeNull());
+      // It stays unavailable: the record never brings it back as a tool call's view, so the
+      // tab never takes the record's tool name as its label either.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(result.current).toBeNull();
+      const label = render(
+        <APIProvider client={client}>
+          <AppViewTabLabel workspaceId="ws-restarted" toolCallId={target.viewKey} />
+        </APIProvider>
+      );
+      expect(label.container.textContent).toBe("App view");
+    } finally {
+      restore();
+    }
+  });
+
+  test("a thread entry point's tab names its scope", async () => {
+    const thread = {
+      ...entrypoint("Library"),
+      type: "thread" as const,
+      viewKey: "entrypoint:cad:cad.library:thread",
+    };
+    const client = createTestApiClient({
+      mcpApps: { listEntrypoints: () => Promise.resolve([entrypoint("Library"), thread]) },
+    });
+    const restore = loadedTranscripts(useWorkspaceStoreRaw());
+    function Tabs() {
+      useLoadMcpAppEntrypoints("ws-scope", true);
+      return (
+        <>
+          <div data-testid="global">
+            <AppViewTabLabel workspaceId="ws-scope" toolCallId={entrypoint("Library").viewKey} />
+            <AppViewTabTooltip workspaceId="ws-scope" toolCallId={entrypoint("Library").viewKey} />
+          </div>
+          <div data-testid="thread">
+            <AppViewTabLabel workspaceId="ws-scope" toolCallId={thread.viewKey} />
+            <AppViewTabTooltip workspaceId="ws-scope" toolCallId={thread.viewKey} />
+          </div>
+        </>
+      );
+    }
+    try {
+      const view = render(
+        <APIProvider client={client}>
+          <Tabs />
+        </APIProvider>
+      );
+      await waitFor(() => expect(view.getByTestId("thread").textContent).toContain("Library"));
+      expect(view.getByTestId("thread").textContent).toBe(
+        "Librarycad · this chatLibrary · cad · this chat"
+      );
+      expect(view.getByTestId("global").textContent).toBe("LibrarycadLibrary · cad");
+    } finally {
+      restore();
+    }
+  });
 });

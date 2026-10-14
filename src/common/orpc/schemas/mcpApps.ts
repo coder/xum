@@ -81,6 +81,8 @@ export const McpAppViewRecordSchema = z
     toolName: z.string().min(1),
     resourceUri: z.string().refine(isMcpAppResourceUri, "resourceUri must be a ui:// URI"),
     arguments: z.unknown(),
+    /** The record is an entry point's view, not a tool call's (only an open writes it). */
+    entrypoint: z.literal(true).optional(),
   })
   .nullable();
 export type McpAppViewRecord = z.infer<typeof McpAppViewRecordSchema>;

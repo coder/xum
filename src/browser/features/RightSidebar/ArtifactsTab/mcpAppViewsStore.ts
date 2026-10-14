@@ -8,6 +8,7 @@ import { mcpToolDisplayName } from "@/common/utils/mcp/mcpToolDisplayName";
 import { mcpServerConsentName, mcpServerDisplayName } from "@/common/utils/mcp/pluginServerKey";
 import { MCP_APP_VIEW_RECORDS_MAX_IDS } from "@/common/utils/mcpApps";
 import { getNestedToolStatus } from "@/browser/features/Tools/Shared/toolStatus";
+import type { McpAppEntrypoint, McpAppViewRecord } from "@/common/orpc/schemas/mcpApps";
 import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
 import { mcpAppEntrypointViewOf, useMcpAppEntrypointView } from "../AppViewTab/mcpAppEntrypoints";
 
@@ -33,6 +34,8 @@ export interface McpAppViewRef {
   cancelled: boolean;
   /** The call returned an error (a subset of `cancelled`). */
   failed: boolean;
+  /** An entry point's view: its type, so a `thread` tab says so (withEntrypointScope). */
+  entrypointType?: McpAppEntrypoint["type"];
 }
 
 /** Longest argument summary shown next to a view's label. */
@@ -301,6 +304,28 @@ function flushViewRecordLookups() {
   }
 }
 
+/**
+ * The tool call view a result record describes, or null without one. An entry point's record
+ * outlives its entry point, and only the entry point list shows that view (the list lacked it,
+ * or it would not be looked up): its tab is unavailable, also after a restart, when no retired
+ * key remembers it.
+ */
+function toolCallViewOfRecord(toolCallId: string, view: McpAppViewRecord): McpAppViewRef | null {
+  if (view === null || view.entrypoint === true) return null;
+  return {
+    toolCallId,
+    serverName: view.serverName,
+    resourceUri: view.resourceUri,
+    toolName: view.toolName,
+    label: mcpToolDisplayName(view.toolName, { key: view.serverName }),
+    arguments: view.arguments ?? {},
+    // The record does not say how the call ended: a call without a result opens with
+    // "Result no longer available" instead of tool-cancelled.
+    cancelled: false,
+    failed: false,
+  };
+}
+
 function requestViewRecords(api: APIClient, workspaceId: string, toolCallIds: string[]) {
   const fail = () => {
     for (const id of toolCallIds) recordLookups.set(lookupKey(workspaceId, id), "failed");
@@ -314,23 +339,13 @@ function requestViewRecords(api: APIClient, workspaceId: string, toolCallIds: st
       const found: McpAppViewRef[] = [];
       for (const { toolCallId, view } of result.data) {
         if (!toolCallIds.includes(toolCallId)) continue;
-        if (view === null) {
+        const ref = toolCallViewOfRecord(toolCallId, view);
+        if (ref === null) {
           recordLookups.set(lookupKey(workspaceId, toolCallId), "missing");
           continue;
         }
         recordLookups.delete(lookupKey(workspaceId, toolCallId));
-        found.push({
-          toolCallId,
-          serverName: view.serverName,
-          resourceUri: view.resourceUri,
-          toolName: view.toolName,
-          label: mcpToolDisplayName(view.toolName, { key: view.serverName }),
-          arguments: view.arguments ?? {},
-          // The record does not say how the call ended: a call without a result opens with
-          // "Result no longer available" instead of tool-cancelled.
-          cancelled: false,
-          failed: false,
-        });
+        found.push(ref);
       }
       // An ID the answer left out was not looked up: it can be asked again.
       for (const id of toolCallIds) {

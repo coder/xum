@@ -499,14 +499,47 @@ describe("getMcpAppViewRecords", () => {
     });
     const own = await viewRecord(ctx, { workspaceId: "ws-a", toolCallId: "call-a" });
     if (!own.success || own.data === null) throw new Error("expected ws-a's record");
-    // Only the view's binding: never the tool result (content, structuredContent, _meta).
-    expect(Object.keys(own.data).sort()).toEqual([
+    // Only the view's binding: never the tool result (content, structuredContent, _meta). An
+    // unset key (a tool call's `entrypoint`) does not cross IPC.
+    const sent = Object.entries(own.data).filter(([, value]) => value !== undefined);
+    expect(sent.map(([key]) => key).sort()).toEqual([
       "arguments",
       "resourceUri",
       "serverName",
       "toolName",
     ]);
     expect(JSON.stringify(own.data)).not.toContain("secret");
+  });
+
+  test("marks an entry point's record, also after a backend restart", async () => {
+    using tmp = new DisposableTempDir("mcp-app-view-record-entrypoint");
+    const sessionDir = (id: string) => path.join(tmp.path, id);
+    await new McpAppResultStore(sessionDir).record("ws", {
+      toolCallId: "entrypoint:charts:show_chart:global",
+      serverName: "charts",
+      toolName: "show_chart",
+      resourceUri: "ui://charts/view",
+      arguments: {},
+      result: { content: [] },
+      entrypoint: true,
+    });
+    // A new store reads the record from disk, like a restarted backend.
+    const store = new McpAppResultStore(sessionDir);
+    const ctx = {
+      experimentsService: { isExperimentEnabled: () => true },
+      mcpServerManager: {
+        getMcpAppResult: (workspaceId: string, toolCallId: string) =>
+          store.get(workspaceId, toolCallId),
+      },
+    } as unknown as McpAppsContext;
+    const result = await getMcpAppViewRecords(ctx, {
+      workspaceId: "ws",
+      toolCallIds: ["entrypoint:charts:show_chart:global", "call-1"],
+    });
+    if (!result.success) throw new Error(result.error);
+    expect(result.data[0].view).toMatchObject({ entrypoint: true });
+    // A tool call's record (none here) never carries the marker.
+    expect(result.data[1].view).toBeNull();
   });
 
   test("refuses while the artifacts experiment is off", async () => {
