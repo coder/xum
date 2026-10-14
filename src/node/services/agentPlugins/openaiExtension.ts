@@ -128,24 +128,34 @@ const RULES: Record<FieldKind, string> = {
  * U+E0100-U+E01EF, category Mn). Cf holds the direction controls (LRM/RLM/ALM,
  * embeddings/overrides, isolates) and the zero-width characters (U+200B, U+2060, U+FEFF, soft
  * hyphen). All of them are invisible, so they can make a displayed plugin or developer name look
- * like another, or a label look blank (#6162). `longDescription` may break lines with \n only.
+ * like another, or a label look blank (#6162). The Hangul fillers (U+115F, U+1160, U+3164, U+FFA0)
+ * are letters (Lo) that render as nothing, so they spoof a name the same way (#6560).
+ * `longDescription` may break lines with \n only.
  */
 const UNSAFE_TEXT =
   // eslint-disable-next-line no-control-regex -- the control characters are the point
-  /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029\p{Cf}\ufe00-\ufe0f\u{e0100}-\u{e01ef}]/u;
-/** Scripts in which ZWNJ changes how letters join or form conjuncts (Persian, Indic). */
+  /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029\p{Cf}\ufe00-\ufe0f\u{e0100}-\u{e01ef}\u115f\u1160\u3164\uffa0]/u;
+/** Scripts in which ZWNJ and ZWJ change how letters join or form conjuncts (Persian, Indic). */
 const ZWNJ_SCRIPTS =
   "\\p{Script=Arabic}\\p{Script=Syriac}\\p{Script=Devanagari}\\p{Script=Bengali}\\p{Script=Gurmukhi}" +
   "\\p{Script=Gujarati}\\p{Script=Oriya}\\p{Script=Tamil}\\p{Script=Telugu}\\p{Script=Kannada}" +
   "\\p{Script=Malayalam}\\p{Script=Sinhala}";
+/**
+ * A letter of a shaping script. Letters only: a digit or a combining mark of the script does not
+ * join (#6560), and a mark at the start of the match let the old rule rescan the rest of the
+ * string from every mark in a run (quadratic).
+ */
+const SHAPING_LETTER = `(?=[${ZWNJ_SCRIPTS}])\\p{L}`;
 /**
  * The invisible characters normal text needs, removed before the UNSAFE_TEXT test, but only inside
  * the sequences that need them. Anywhere else they can spoof a name or fake a blank label (Codex
  * PRRT_kwDOPxxmWM6sQExO, PRRT_kwDOPxxmWM6sQ79s, PRRT_kwDOPxxmWM6sQ79z). OpenAI names no exact
  * list, but calls only "unsupported" formatting characters invalid.
  * - ZWJ (U+200D) between emoji (after an optional skin tone or VS16), as in 👩‍💻.
- * - ZWNJ (U+200C) between letters of a script that uses it (ZWNJ_SCRIPTS), as in Persian.
- * - Tag characters (U+E0020-U+E007F) in a subdivision flag: U+1F3F4, tags, then U+E007F.
+ * - ZWNJ or ZWJ (U+200C, U+200D) between letters of a shaping script (SHAPING_LETTER, marks after
+ *   the left letter), as in Persian words and Devanagari half-forms (क्‍ष).
+ * - Tag characters in a subdivision flag: U+1F3F4, 2 to 7 tag digits or lowercase tag letters,
+ *   then U+E007F (the Unicode tag sequence form for regions such as gbsct).
  * - VS15/VS16 (U+FE0E, U+FE0F) after an emoji, and VS16 in a keycap (digit, VS16, U+20E3).
  * The ZWJ rule runs first and keeps the emoji's VS16, which the selector rule then removes.
  */
@@ -156,8 +166,8 @@ const ALLOWED_FORMAT_SEQUENCES: ReadonlyArray<[RegExp, string]> = [
     /(\p{Extended_Pictographic}(?:[\u{1f3fb}-\u{1f3ff}]|\ufe0f)?)\u200d(?=\p{Extended_Pictographic})/gu,
     "$1",
   ],
-  [new RegExp(`([${ZWNJ_SCRIPTS}]\\p{M}*)\\u200c(?=[${ZWNJ_SCRIPTS}])`, "gu"), "$1"],
-  [/\u{1f3f4}[\u{e0020}-\u{e007e}]+\u{e007f}/gu, "\u{1f3f4}"],
+  [new RegExp(`(${SHAPING_LETTER}\\p{M}*)[\\u200c\\u200d](?=${SHAPING_LETTER})`, "gu"), "$1"],
+  [/\u{1f3f4}[\u{e0030}-\u{e0039}\u{e0061}-\u{e007a}]{2,7}\u{e007f}/gu, "\u{1f3f4}"],
   [/(\p{Extended_Pictographic})(?:\ufe0e|\ufe0f)/gu, "$1"],
   [/([0-9#*])\ufe0f(?=\u20e3)/gu, "$1"],
 ];

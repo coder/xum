@@ -189,6 +189,49 @@ describe("readOpenAIExtension", () => {
     }
   });
 
+  test("joiner and tag exceptions need their exact context; Hangul fillers are refused (#6560)", () => {
+    const read = (iface: Record<string, unknown>) =>
+      readOpenAIExtension({ extensions: { "com.openai": { interface: iface } } });
+    // A Devanagari half-form joined with ZWJ, as Indic shaping needs it.
+    const halfForm = "\u0915\u094d\u200d\u0937";
+    const good = read({ ...validInterface, displayName: halfForm, developerName: halfForm });
+    expect(good.warnings).toEqual([]);
+    expect(good.extension?.interface?.displayName).toBe(halfForm);
+    for (const bad of [
+      // ZWNJ between Arabic-Indic digits: digits are not letters.
+      "\u0661\u200c\u0662",
+      // A tag that is not a digit or lowercase letter, and a one-tag payload.
+      "\u{1f3f4}\u{e0021}\u{e0062}\u{e007f}",
+      "\u{1f3f4}\u{e0067}\u{e007f}",
+      // Hangul fillers are invisible letters.
+      "Fig\u3164ma",
+      "\u3164",
+      "Fig\uffa0ma",
+      "Fig\u115fma",
+      "Fig\u1160ma",
+    ]) {
+      expect(read({ ...validInterface, developerName: bad }).extension).toEqual({});
+    }
+  });
+
+  test("a long run of Arabic combining marks is checked in linear time (#6560)", () => {
+    // U+0610 is in an Arabic shaping script and is a mark. The old ZWNJ rule rescanned the rest of
+    // the string from each one: quadratic, about 50 ms per read on Bun and 200 ms on Node at the
+    // 4000-character longDescription cap. Twenty reads keep that far above the bound, and the
+    // linear rule far below it.
+    const marks = "\u0610".repeat(4000);
+    const extension = {
+      "com.openai": { interface: { ...validInterface, longDescription: marks } },
+    };
+    const started = performance.now();
+    for (let read = 0; read < 20; read++) {
+      expect(
+        readOpenAIExtension({ extensions: extension }).extension?.interface?.longDescription
+      ).toBe(marks);
+    }
+    expect(performance.now() - started).toBeLessThan(250);
+  });
+
   test("a blank capability drops the capability list with a warning", () => {
     const read = (capabilities: unknown) =>
       readOpenAIExtension({
