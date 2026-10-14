@@ -36,6 +36,8 @@ let approvalProjectPath: string | null = "/repo";
 // When set, each approve call waits for the test to resolve it with the list it returns and the
 // backend commit revision of that list.
 let approveDeferred: Array<(approvedDomains: string[], revision: number) => void> | null = null;
+// When set, getView waits for this promise.
+let getViewGate: Promise<void> | null = null;
 // Backend commit revisions. Never reset: the approval store outlives a test and keeps the list
 // with the newest revision.
 let revision = Date.now() * 1000;
@@ -49,7 +51,8 @@ let toolCalls: Array<{
 function serverApi(): TestApiOverrides<APIClient> {
   return {
     mcpApps: {
-      getView: () => {
+      getView: async () => {
+        await getViewGate;
         return Promise.resolve({
           success: true as const,
           data: {
@@ -252,6 +255,7 @@ describe("McpAppFrame", () => {
     approveFails = null;
     approvalProjectPath = "/repo";
     approveDeferred = null;
+    getViewGate = null;
     toolCalls = [];
     // Desktop mode by default: the preload bridge exists (isDesktopMode). Browser tests delete it.
     window.api = { getIsRosetta: () => Promise.resolve(false) } as unknown as typeof window.api;
@@ -943,6 +947,7 @@ describe("McpAppFrame host strips", () => {
     window.localStorage.clear();
     invocation = null;
     viewCsp = {};
+    getViewGate = null;
     toolCalls = [];
     // Desktop mode: the preload bridge exists (isDesktopMode).
     window.api = { getIsRosetta: () => Promise.resolve(false) } as unknown as typeof window.api;
@@ -1042,6 +1047,127 @@ describe("McpAppFrame host strips", () => {
       await Promise.resolve();
     });
     expect(view.getByTestId("mcp-app-frame").getAttribute("srcdoc")).toBe(srcdoc);
+  });
+
+  // The seed goes into the document when it is first built, not when the frame mounts.
+  test("a theme change while the view loads reaches the document's seed", async () => {
+    let release = () => undefined as void;
+    getViewGate = new Promise<void>((resolve) => (release = resolve));
+    const tree = (theme: "dark" | "light") => (
+      <ThemeProvider forcedTheme={theme}>
+        <APIProvider client={createTestApiClient(serverApi())}>
+          <McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />
+        </APIProvider>
+      </ThemeProvider>
+    );
+    const view = render(tree("dark"));
+    view.rerender(tree("light"));
+    await act(async () => {
+      release();
+      await Promise.resolve();
+    });
+    const frame = await view.findByTestId("mcp-app-frame");
+    expect(frame.getAttribute("srcdoc")).toContain('"theme":"light"');
+    getViewGate = null;
+  });
+
+  // The container mounts only once getView answered, after the first render's effects ran.
+  test("the view container is observed for size changes once it mounts", async () => {
+    const observed: Element[] = [];
+    const original = globalThis.ResizeObserver;
+    // The component reads the global (the test DOM's window is a separate object).
+    globalThis.ResizeObserver = class {
+      observe(target: Element) {
+        observed.push(target);
+      }
+      unobserve = () => undefined;
+      disconnect = () => undefined;
+    } as unknown as typeof ResizeObserver;
+    try {
+      const view = render(<McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />, {
+        wrapper: Wrapper,
+      });
+      const frame = await view.findByTestId("mcp-app-frame");
+      await waitFor(() => expect(observed.includes(frame.parentElement!)).toBe(true));
+    } finally {
+      globalThis.ResizeObserver = original;
+    }
+  });
+
+  test("a resize between the initialize reply and initialized still reaches the view", async () => {
+    Object.defineProperty(window, "innerHeight", { value: 800, configurable: true });
+    const view = render(<McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />, {
+      wrapper: Wrapper,
+    });
+    const frame = await findOpenFrame(view);
+    const posted = capturePosted(frame);
+    postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+    await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+    Object.defineProperty(window, "innerHeight", { value: 500, configurable: true });
+    act(() => {
+      window.dispatchEvent(new window.Event("resize"));
+    });
+    postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
+    await waitFor(() => {
+      const changed = posted.find((m) => m.method === "ui/notifications/host-context-changed");
+      const params = changed?.params as { containerDimensions?: { maxHeight?: number } };
+      expect(params?.containerDimensions?.maxHeight).toBe(400);
+    });
+    // The inline container's own cap follows the window too.
+    expect(frame.parentElement!.style.maxHeight).toBe("400px");
+  });
+
+  test("a resize tells the view its new maximum height", async () => {
+    Object.defineProperty(window, "innerHeight", { value: 800, configurable: true });
+    const view = render(<McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />, {
+      wrapper: Wrapper,
+    });
+    const frame = await findOpenFrame(view);
+    const posted = capturePosted(frame);
+    postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+    postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
+    await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+
+    Object.defineProperty(window, "innerHeight", { value: 500, configurable: true });
+    act(() => {
+      window.dispatchEvent(new window.Event("resize"));
+    });
+    await waitFor(() => {
+      const changed = posted.find((m) => m.method === "ui/notifications/host-context-changed");
+      const params = changed?.params as { containerDimensions?: { maxHeight?: number } };
+      expect(params?.containerDimensions?.maxHeight).toBe(400);
+    });
+  });
+
+  // Other host-context reads (a display-mode request) do not post the dimensions: only what the
+  // view was actually sent counts as sent.
+  test("a display-mode request before the resize callback does not swallow the size update", async () => {
+    Object.defineProperty(window, "innerHeight", { value: 800, configurable: true });
+    const view = render(<McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />, {
+      wrapper: Wrapper,
+    });
+    const frame = await findOpenFrame(view);
+    const posted = capturePosted(frame);
+    postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+    postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
+    await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+
+    Object.defineProperty(window, "innerHeight", { value: 500, configurable: true });
+    postFromView(frame, {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "ui/request-display-mode",
+      params: { mode: "inline" },
+    });
+    await waitFor(() => expect(posted.some((m) => m.id === 2)).toBe(true));
+    act(() => {
+      window.dispatchEvent(new window.Event("resize"));
+    });
+    await waitFor(() => {
+      const changed = posted.find((m) => m.method === "ui/notifications/host-context-changed");
+      const params = changed?.params as { containerDimensions?: { maxHeight?: number } };
+      expect(params?.containerDimensions?.maxHeight).toBe(400);
+    });
   });
 
   test("fullscreen from the card moves the view to its tab; inline from the tab closes it", async () => {

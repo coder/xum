@@ -5151,7 +5151,7 @@ export class MCPServerManager {
     assert(source !== undefined, "a settings snapshot comes from a server instance");
     this.cacheSettings(source.instance, workspaceId, source.requestId, snapshot.values);
     const instanceToken = this.settingsInstanceToken(source.instance);
-    this.rememberSettingsSchema(instanceToken, snapshot);
+    this.rememberSettingsSchema(workspaceId, serverName, instanceToken, snapshot);
     return { ...snapshot, instanceToken };
   }
 
@@ -5160,7 +5160,9 @@ export class MCPServerManager {
 
   /**
    * Resolves once this server's saves in flight settled. The dialog's reads wait for it: a
-   * dialog reopened during a save must not show the values from before the save.
+   * dialog reopened during a save must not show the values from before the save. Resolves to
+   * the part of `timeoutMs` left (at least 1 ms), so the read that follows shares one deadline
+   * with the wait instead of starting a second full one.
    */
   async settingsSavesSettled(
     workspaceId: string,
@@ -5170,31 +5172,38 @@ export class MCPServerManager {
      * not hold the dialog's bulk read. Past either, the read goes ahead without waiting.
      */
     options: { signal?: AbortSignal; timeoutMs: number }
-  ): Promise<void> {
+  ): Promise<number> {
     const saves = this.pendingSettingsSaves.get(settingsSaveKey(workspaceId, serverName));
-    if (saves === undefined) return;
-    const stop = AbortSignal.any([
+    if (saves === undefined) return options.timeoutMs;
+    const started = Date.now();
+    // A failed save is the save's own error; a read only waits for it.
+    await raceUntilAborted(Promise.allSettled([...saves]), [
       AbortSignal.timeout(options.timeoutMs),
       ...(options.signal !== undefined ? [options.signal] : []),
     ]);
-    const stopped = new Promise<void>((resolve) => {
-      if (stop.aborted) resolve();
-      stop.addEventListener("abort", () => resolve(), { once: true });
-    });
-    // A failed save is the save's own error; a read only waits for it.
-    await Promise.race([Promise.allSettled([...saves]), stopped]);
+    return Math.max(1, options.timeoutMs - (Date.now() - started));
   }
 
   /**
-   * The schema each recent instance token was read with, as a hash: a save whose token names a
-   * restarted instance (idle stop, crash restart) still lands when the new instance shows the
-   * same schema. Bounded: the oldest token is forgotten first, and its save is refused.
+   * The schema each recent instance token was read with, as a hash, per workspace and server: a
+   * save whose token names a restarted instance (idle stop, crash restart) still lands when the
+   * new instance shows the same schema. Keyed by server too, so a token read from one server
+   * never passes the check of a save to another. Bounded: the oldest entry is forgotten first,
+   * and its save is refused.
    */
   private readonly settingsSchemaHashes = new Map<string, string>();
 
-  private rememberSettingsSchema(instanceToken: string, snapshot: MCPSettingsSnapshot): void {
-    this.settingsSchemaHashes.delete(instanceToken);
-    this.settingsSchemaHashes.set(instanceToken, settingsSchemaHash(snapshot));
+  private rememberSettingsSchema(
+    workspaceId: string,
+    serverName: string,
+    instanceToken: string,
+    snapshot: MCPSettingsSnapshot
+  ): void {
+    const key = settingsSchemaKey(workspaceId, serverName, instanceToken);
+    // Each read overwrites its token's hash: the latest schema of an instance is the one a save
+    // validated against (the dialog shows that read).
+    this.settingsSchemaHashes.delete(key);
+    this.settingsSchemaHashes.set(key, settingsSchemaHash(snapshot));
     if (this.settingsSchemaHashes.size > MAX_REMEMBERED_SETTINGS_SCHEMAS) {
       const oldest = this.settingsSchemaHashes.keys().next().value;
       if (oldest !== undefined) this.settingsSchemaHashes.delete(oldest);
@@ -5241,7 +5250,8 @@ export class MCPServerManager {
     // it shows the schema the dialog validated against, else the user must reopen.
     if (
       prior.instanceToken !== instanceToken &&
-      this.settingsSchemaHashes.get(instanceToken) !== settingsSchemaHash(prior)
+      this.settingsSchemaHashes.get(settingsSchemaKey(workspaceId, serverName, instanceToken)) !==
+        settingsSchemaHash(prior)
     )
       throw staleSettingsInstanceError(serverName);
     const values = await this.updateSettings(
@@ -8052,6 +8062,24 @@ const MAX_REMEMBERED_SETTINGS_SCHEMAS = 256;
 
 function settingsSaveKey(workspaceId: string, serverName: string): string {
   return `${workspaceId}\0${serverName}`;
+}
+
+/** Wait for `work` or the first abort of `signals`, then drop the abort listener. */
+async function raceUntilAborted(work: Promise<unknown>, signals: AbortSignal[]): Promise<void> {
+  const stop = AbortSignal.any(signals);
+  const onStop = Promise.withResolvers<void>();
+  const resolve = () => onStop.resolve();
+  if (stop.aborted) resolve();
+  stop.addEventListener("abort", resolve, { once: true });
+  try {
+    await Promise.race([work, onStop.promise]);
+  } finally {
+    stop.removeEventListener("abort", resolve);
+  }
+}
+
+function settingsSchemaKey(workspaceId: string, serverName: string, token: string): string {
+  return `${settingsSaveKey(workspaceId, serverName)}\0${token}`;
 }
 
 /** What a save validates against: the schema and its layout, never the values. */
