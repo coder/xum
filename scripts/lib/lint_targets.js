@@ -1,8 +1,8 @@
 "use strict";
 
-// Chooses what the linters check. `--all` prints every lintable file for oxlint, which checks the
-// whole repo in seconds. Without it, chooses what type-aware ESLint checks: only the files this
-// branch changed, or everything.
+// Chooses what the linters check. `--oxlint-args` prints oxlint's arguments, one per line; oxlint
+// checks the whole repo in seconds. Without it, chooses what type-aware ESLint checks: only the files this branch
+// changed, or everything.
 //
 // A cold type-aware ESLint run over the whole repo peaks at ~7.6 GiB and takes minutes, and every
 // new worktree starts without an ESLint cache. Several agents doing that at once OOM-killed shared
@@ -105,16 +105,47 @@ function listChangedFiles(cwd, base) {
 }
 
 /**
- * Every lintable file in the working tree: tracked files that still exist plus untracked files
- * that are not ignored, sorted.
+ * oxlint walks these directories itself: a list of every file would exceed the Windows
+ * command-line limit (~32K characters). Every file under them that LINT_FILE_PATTERNS matches is
+ * inside one of them.
  */
-function listAllLintFiles(cwd) {
-  const files = git(["ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd)
+const OXLINT_ROOTS = ["src", "tests", "scripts/lib"];
+// The extensions oxlint lints when it walks a directory.
+const OXLINT_FILE_EXTENSIONS = /\.(?:[cm]?[jt]sx?|vue|svelte|astro)$/;
+
+/**
+ * Files that oxlint would find under OXLINT_ROOTS but ESLint does not lint (e.g. tests/__mocks__/*.js),
+ * sorted. They become oxlint ignore patterns, so both linters check the same files.
+ */
+function listOxlintExcludes(cwd) {
+  const files = git(
+    ["ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", ...OXLINT_ROOTS],
+    cwd
+  )
+    .split("\0")
+    .filter((file) => OXLINT_FILE_EXTENSIONS.test(file))
+    .filter((file) => !LINT_FILE_PATTERNS.some((re) => re.test(file)));
+  return [...new Set(files)].sort();
+}
+
+/**
+ * oxlint's path arguments: OXLINT_ROOTS, minus the files ESLint does not lint, plus tracked files
+ * that .gitignore matches (e.g. committed *.generated.ts), which oxlint's directory walk skips.
+ */
+function oxlintArgs(cwd) {
+  const trackedIgnored = git(
+    ["ls-files", "--cached", "--ignored", "--exclude-standard", "-z", "--", ...OXLINT_ROOTS],
+    cwd
+  )
     .split("\0")
     .filter((file) => LINT_FILE_PATTERNS.some((re) => re.test(file)))
-    // A tracked file deleted in the working tree is still listed by --cached.
+    // --cached still lists a tracked file that was deleted from the working tree.
     .filter((file) => fs.existsSync(path.join(cwd, file)));
-  return [...new Set(files)].sort();
+  return [
+    ...listOxlintExcludes(cwd).flatMap((file) => ["--ignore-pattern", file]),
+    ...OXLINT_ROOTS,
+    ...trackedIgnored.sort(),
+  ];
 }
 
 /**
@@ -139,15 +170,14 @@ module.exports = {
   FULL_LINT_TRIGGERS,
   selectLintTargets,
   resolveBase,
-  listAllLintFiles,
+  oxlintArgs,
   main,
 };
 
 if (require.main === module) {
   try {
-    if (process.argv.includes("--all")) {
-      const files = listAllLintFiles(process.cwd());
-      process.stdout.write(files.length > 0 ? files.join("\n") + "\n" : "");
+    if (process.argv.includes("--oxlint-args")) {
+      process.stdout.write(oxlintArgs(process.cwd()).join("\n") + "\n");
     } else {
       process.stdout.write(main());
     }

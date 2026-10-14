@@ -61,18 +61,14 @@ run_oxlint() {
   ensure_oxlint_config
   # A separate assignment so set -e stops on a listing error.
   local listing
-  listing="$(node "$SCRIPT_DIR/lib/lint_targets.js" --all)"
-  local files=()
-  while IFS= read -r file; do
-    [ -n "$file" ] && files+=("$file")
+  listing="$(node "$SCRIPT_DIR/lib/lint_targets.js" --oxlint-args)"
+  local oxlint_args=()
+  while IFS= read -r arg; do
+    [ -n "$arg" ] && oxlint_args+=("$arg")
   done <<<"$listing"
-  if [ "${#files[@]}" -eq 0 ]; then
-    echo "No lintable files; skipping oxlint."
-    return
-  fi
-  echo "Running oxlint on ${#files[@]} files (type-aware rules: make lint-eslint, or CI)..."
+  echo "Running oxlint (type-aware rules: make lint-eslint, or CI)..."
   # More threads barely help: the JS plugins (Tailwind, the local rules) dominate the run time.
-  bun x oxlint -c "$OXLINT_CONFIG" --threads 4 --deny-warnings "${files[@]}" "${FIX_ARGS[@]}"
+  bun x oxlint -c "$OXLINT_CONFIG" --threads 4 --deny-warnings "${oxlint_args[@]}" "${FIX_ARGS[@]}"
 }
 
 # Workflow runtime and packaged skill workflow sources are executable JS embedded

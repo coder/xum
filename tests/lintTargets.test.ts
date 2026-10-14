@@ -9,7 +9,7 @@ type Selection = { mode: "full"; reason: string } | { mode: "files"; files: stri
 interface LintTargetsModule {
   selectLintTargets(changedFiles: string[], removedFiles?: string[]): Selection;
   main(cwd: string, env: Record<string, string | undefined>): string;
-  listAllLintFiles(cwd: string): string[];
+  oxlintArgs(cwd: string): string[];
 }
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports -- plain CommonJS script helper with no ESM entry
@@ -182,18 +182,24 @@ describe("lint target git discovery", () => {
     expect(run()).toEqual(["full no merge base with origin/main or main"]);
   });
 
-  it("lists every lintable file in the working tree for oxlint", () => {
-    fs.rmSync(path.join(repo, "src/deleted.ts"));
-    write("tests/untracked.test.ts");
-    write("src/ignored.ts");
-    write(".gitignore", "src/ignored.ts\n");
+  it("points oxlint at the directories ESLint lints, minus its other files", () => {
+    write("tests/__mocks__/styleMock.js", "module.exports = {};\n");
+    write("src/node/workflowRuntime/runtime.js", "export {};\n");
+    write("src/committed.generated.ts");
+    write(".gitignore", "*.generated.ts\n");
+    git("add", "-f", ".");
+    git("commit", "-q", "-m", "more files");
+    write("src/untracked.generated.ts");
     write("docs/page.md", "# page\n");
 
-    expect(lintTargets.listAllLintFiles(repo)).toEqual([
-      "src/edited.ts",
-      "src/kept.ts",
-      "src/renamed.ts",
-      "tests/untracked.test.ts",
+    expect(lintTargets.oxlintArgs(repo)).toEqual([
+      "--ignore-pattern",
+      "tests/__mocks__/styleMock.js",
+      "src",
+      "tests",
+      "scripts/lib",
+      // oxlint's directory walk skips gitignored files, but ESLint lints committed ones.
+      "src/committed.generated.ts",
     ]);
   });
 });
