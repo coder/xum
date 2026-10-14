@@ -352,11 +352,12 @@ export class WorktreeManager {
     noHooksEnv: GitExecOptions;
   }): Promise<PendingMaterialization> {
     // Fast-forward existing branches to origin only when local trunk can fast-forward too
-    // (preserves unpushed work). A deferred sync decides this after its fetch.
-    const pending: PendingMaterialization = {
-      fastForwardFromOrigin: !args.deferOriginSync && args.shouldUseOrigin && args.branchExists,
-    };
-    if (!args.deferOriginSync) return pending;
+    // (preserves unpushed work).
+    if (!args.deferOriginSync) {
+      return { fastForwardFromOrigin: args.shouldUseOrigin && args.branchExists };
+    }
+    // A deferred sync decides the fast-forward after its fetch.
+    const pending: PendingMaterialization = { fastForwardFromOrigin: false };
     if (args.branchExists) {
       return { ...pending, deferredOriginSync: { existingBranch: true, createdFromOrigin: false } };
     }
