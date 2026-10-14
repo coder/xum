@@ -248,16 +248,18 @@ export const DraftResolveSendsOutputSchema = z.object({
 
 export const DraftRevisionOutputSchema = z.object({ revision: DraftRevisionSchema });
 
-export const DraftImportLegacyOutputSchema = z.object({
-  /**
-   * "applied": the backend had no draft and stored the legacy one. "present": the backend already
-   * had a draft and kept it (never clobbered). "orphaned": the scope has no owner (unregistered
-   * workspace, unconfigured project, invalid id), so nothing was stored. In every case the client
-   * may delete its legacy keys.
-   */
-  result: z.enum(["applied", "present", "orphaned"]),
-  revision: DraftRevisionSchema,
-});
+/**
+ * "applied": the backend stored the legacy body, name state or both where it had none, and answers
+ * with the stored draft's view like a write (a partial import keeps the stored part). "present":
+ * the backend already had a draft and kept it (never clobbered). "orphaned": the scope has no owner
+ * (unregistered workspace, unconfigured project, invalid id), so nothing was stored. In every case
+ * the client may delete its legacy keys.
+ */
+export const DraftImportLegacyOutputSchema = z.discriminatedUnion("result", [
+  DraftWriteOutputSchema.extend({ result: z.literal("applied") }),
+  z.object({ result: z.literal("present"), revision: DraftRevisionSchema }),
+  z.object({ result: z.literal("orphaned"), revision: DraftRevisionSchema }),
+]);
 
 /**
  * One listed creation draft (a row under its project in the sidebar). The list lives in
