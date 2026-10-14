@@ -2181,6 +2181,32 @@ describe("AgentPluginInstallService", () => {
       await oauth.dispose();
     });
 
+    test("also closes the default discovery gate of headless processes", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      // A process without the install service (`mux workflow`) uses the default gate.
+      const session = await discoveryModule.journalDerivedDiscoveryGate([
+        await fsPromises.realpath(pluginsDir()),
+      ]);
+      expect(session.suppressed).toHaveLength(1);
+      await failing.dispose();
+    });
+
+    test("a corrupt record keeps discovery closed", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await fsPromises.writeFile(path.join(muxRoot, "plugin-sign-outs-pending.json"), "{ not json");
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      restarted.setMcpOauthService(oauth);
+      await restarted.list();
+      expect(await pathExists(path.join(muxRoot, "plugin-sign-outs-pending.json"))).toBe(true);
+      expect(await discovered()).toBe(0);
+      await Promise.all([failing.dispose(), oauth.dispose()]);
+    });
+
     test("survives an uninstall of the plugin", async () => {
       const { updater, failing, result } = await updateWithFailingSignOut(stopStub);
       await result;

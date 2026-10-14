@@ -220,6 +220,26 @@ describe("McpOauthService store", () => {
     }
   });
 
+  test("a sign-out whose store write fails can be retried (#6122)", async () => {
+    if (process.getuid?.() === 0) return; // root ignores the read-only directory
+    await seedStoredCredentials({
+      clientInformation: { client_id: "client-id" },
+      tokens: { access_token: "access-token", token_type: "Bearer" },
+    });
+    expect(await service.hasAuthTokens({ serverUrl })).toBe(true);
+    await fs.chmod(xumHome, 0o500);
+    try {
+      expect((await service.logout({ serverUrl })).success).toBe(false);
+    } finally {
+      await fs.chmod(xumHome, 0o700);
+    }
+    // The failed write did not remove the credentials: they still read as stored, and the
+    // retry writes the sign-out.
+    expect(await service.hasAuthTokens({ serverUrl })).toBe(true);
+    expect((await service.logout({ serverUrl })).success).toBe(true);
+    expect(Object.keys((await readStoreFile()).entries)).toEqual([]);
+  });
+
   test("set/get/clear works via hasAuthTokens + logout", async () => {
     const populatedStore = {
       version: 2,

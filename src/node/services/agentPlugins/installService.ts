@@ -82,9 +82,11 @@ import {
   acquirePluginMutationLock,
   bumpContainerMutationEpoch,
   MUTATION_LOCK_FILE,
+  containerHasPendingSignOuts,
   isJournalName,
   JOURNAL_PREFIXES,
   MUTATION_EPOCH_FILE,
+  PENDING_SIGN_OUTS_FILE_NAME,
   PROMOTION_JOURNAL_PREFIX,
   STAGING_DIR_NAME,
   UNINSTALL_JOURNAL_PREFIX,
@@ -506,22 +508,22 @@ function createSecretReader(): SecretReader {
 }
 
 /**
- * Credential URLs that updates still have to sign out (#6122). Its own file, not a registry
- * field: an uninstall must not drop it, and the discovery gate checks it with one stat per scan.
+ * Throws on a corrupt record. SECURITY: it may name sign-outs that never ran, so it keeps the
+ * discovery fence until the user repairs or deletes it. Reading it as "nothing pending" would
+ * admit the plugin with its old sign-in's tokens.
  */
-const PENDING_SIGN_OUTS_FILE_NAME = "plugin-sign-outs-pending.json";
-
-function parsePendingSignOuts(raw: string): string[] {
+function parsePendingSignOuts(raw: string, file: string): string[] {
+  let value: unknown;
   try {
-    const value = (JSON.parse(raw) as { urls?: unknown }).urls;
-    return Array.isArray(value)
-      ? value.filter((url): url is string => typeof url === "string")
-      : [];
+    value = (JSON.parse(raw) as { urls?: unknown } | null)?.urls;
   } catch {
-    // A corrupt record lost its URLs: the next write replaces it (self-healing).
-    log.warn("Ignoring a corrupt pending plugin sign-out record");
-    return [];
+    value = undefined;
   }
+  if (!Array.isArray(value) || !value.every((url) => typeof url === "string"))
+    throw new Error(
+      `The pending plugin sign-out record (${shortenHome(file)}) is corrupt. Sign out of the plugin MCP servers in Settings, then delete the file.`
+    );
+  return value;
 }
 
 async function readSignIn(
@@ -794,15 +796,13 @@ export class AgentPluginInstallService {
       // would suppress the very scan whose recovery just succeeded.
       const unhealthySuppression = (await this.reconciliationState) ? [] : [this.containerDir];
       const bracket = await journalDerivedDiscoveryGate(containerPaths);
-      const pendingSuppression = await this.pendingSignOutSuppression();
+      // The bracket keeps the container closed while a sign-out is pending; start finishing it.
+      await this.startPendingSignOutPass();
       return {
-        suppressed: [
-          ...new Set([...bracket.suppressed, ...unhealthySuppression, ...pendingSuppression]),
-        ],
+        suppressed: [...new Set([...bracket.suppressed, ...unhealthySuppression])],
         confirm: async () => {
           const stillUnhealthy = (await this.reconciliationState) ? [] : [this.containerDir];
-          const stillPending = await this.pendingSignOutSuppression();
-          return [...new Set([...(await bracket.confirm()), ...stillUnhealthy, ...stillPending])];
+          return [...new Set([...(await bracket.confirm()), ...stillUnhealthy])];
         },
       };
     });
@@ -827,7 +827,7 @@ export class AgentPluginInstallService {
    */
   /**
    * Crash recovery, then the pending sign-outs. Pending sign-outs do not make recovery
-   * unhealthy: the discovery gate checks them itself (pendingSignOutSuppression).
+   * unhealthy: every discovery gate checks the record itself (containerHasPendingSignOuts).
    */
   private async recover(): Promise<boolean> {
     const allConsumed = await this.reconcileJournals();
@@ -3251,7 +3251,8 @@ export class AgentPluginInstallService {
 
   private async readPendingSignOuts(): Promise<string[]> {
     try {
-      return parsePendingSignOuts(await fsPromises.readFile(this.pendingSignOutsFile, "utf-8"));
+      const file = this.pendingSignOutsFile;
+      return parsePendingSignOuts(await fsPromises.readFile(file, "utf-8"), file);
     } catch (error) {
       if (hasErrorCode(error, "ENOENT")) return [];
       throw error;
@@ -3328,33 +3329,24 @@ export class AgentPluginInstallService {
     });
   }
 
-  /** One stat. Fails closed: a record Xum cannot stat counts as pending. */
-  private async hasPendingSignOuts(): Promise<boolean> {
-    try {
-      await fsPromises.stat(this.pendingSignOutsFile);
-      return true;
-    } catch (error) {
-      return !hasErrorCode(error, "ENOENT");
-    }
+  private hasPendingSignOuts(): Promise<boolean> {
+    return containerHasPendingSignOuts(this.containerDir);
   }
 
   /**
-   * The discovery gate's part: while a sign-out is pending, the managed container stays closed,
-   * so a plugin server never connects with its old sign-in's tokens. The record is checked on
-   * every scan, so a sibling process that shares the root sees another process's record too.
-   * A pass that finishes the sign-outs starts here when none runs; the gate never waits for it
-   * (it takes the plugin mutation lock, which an update holds while it stops MCP servers).
+   * Starts a pass that finishes the pending sign-outs, when one is pending and none runs. The
+   * discovery gate never waits for it: it takes the plugin mutation lock, which an update holds
+   * while it stops MCP servers. The journal bracket keeps the container closed meanwhile.
    */
-  private async pendingSignOutSuppression(): Promise<string[]> {
-    if (!(await this.hasPendingSignOuts())) return [];
-    this.pendingSignOutPass ??= this.completePendingSignOuts()
+  private async startPendingSignOutPass(): Promise<void> {
+    if (this.pendingSignOutPass !== undefined || !(await this.hasPendingSignOuts())) return;
+    this.pendingSignOutPass = this.completePendingSignOuts()
       .catch((error: unknown) => {
         log.warn("Could not finish pending plugin sign-outs", { error: getErrorMessage(error) });
       })
       .finally(() => {
         this.pendingSignOutPass = undefined;
       });
-    return [this.containerDir];
   }
 
   private pendingSignOutPass: Promise<void> | undefined;
@@ -3363,7 +3355,13 @@ export class AgentPluginInstallService {
   /** The OAuth service is built in a later DI layer than this service. */
   setMcpOauthService(service: Pick<McpOauthService, "logout" | "credentialKey">): void {
     this.mcpOauthService = service;
+    // The startup pass ran without this service: finish pending sign-outs now, before the
+    // first agent request scans the container.
+    this.pendingSignOutReady = this.startPendingSignOutPass();
   }
+
+  /** Started by setMcpOauthService. */
+  private pendingSignOutReady: Promise<void> = Promise.resolve();
 
   async list(): Promise<AgentPluginListItem[]> {
     // Section open re-runs crash recovery (the startup pass may have failed
@@ -3374,6 +3372,7 @@ export class AgentPluginInstallService {
     // wait on this fresh attempt (reconcileJournals serializes internally via
     // runExclusive); a success here re-opens a previously suppressed
     // container.
+    await this.pendingSignOutReady;
     await this.reconciliationState;
     this.reconciliationState = this.attemptReconcileJournals("section open");
     await this.reconciliationState;
