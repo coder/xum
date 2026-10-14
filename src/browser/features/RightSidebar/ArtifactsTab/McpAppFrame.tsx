@@ -171,6 +171,23 @@ function isAllowDisabled(armed: boolean, liveApi: unknown): boolean {
   return !armed || liveApi == null;
 }
 
+/** The domain prompt's text: the origins, and the project that keeps the approval. */
+function DomainsPromptText(props: { origins: readonly string[]; projectPath: string | null }) {
+  return (
+    <div className="text-foreground min-w-0 flex-1 break-words">
+      This view wants to reach: {props.origins.map((origin) => new URL(origin).host).join(", ")}
+      {/* For a task of a multi-project workspace this is the first project, not the task's own
+          (approvalProjectPathOf). */}
+      {props.projectPath != null && (
+        <span className="text-muted">
+          {" "}
+          (for project {PlatformPaths.getProjectName(props.projectPath)})
+        </span>
+      )}
+    </div>
+  );
+}
+
 export function McpAppFrame(props: {
   workspaceId: string;
   view: McpAppViewRef;
@@ -524,18 +541,7 @@ export function McpAppFrame(props: {
           role="alert"
           className="border-border-light bg-background-secondary flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-xs"
         >
-          <div className="text-foreground min-w-0 flex-1 break-words">
-            This view wants to reach:{" "}
-            {domainsPrompt.map((origin) => new URL(origin).host).join(", ")}
-            {/* The project that keeps the approval: for a task of a multi-project workspace it
-                is the first project, not the task's own (approvalProjectPathOf). */}
-            {approvalProjectPath != null && (
-              <span className="text-muted">
-                {" "}
-                (for project {PlatformPaths.getProjectName(approvalProjectPath)})
-              </span>
-            )}
-          </div>
+          <DomainsPromptText origins={domainsPrompt} projectPath={approvalProjectPath} />
           <button
             type="button"
             // Disabled briefly after the strip appears (confirmArming.ts), like the consent strip.
