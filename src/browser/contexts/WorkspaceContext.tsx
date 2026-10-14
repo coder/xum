@@ -1937,13 +1937,13 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       // Read like the composer reads its route: a blank or invalid id edits the default draft.
       const source = { ...move, draftId: listedCreationDraftId(move.draftId) };
       const listAgentIds = async (projectPath: string) => {
-        if (!api) throw new Error("Not connected to the server");
-        return (await api.agents.list({ projectPath })).map((agent) => agent.id);
+        if (!liveApi) throw new Error("Not connected to the server");
+        return (await liveApi.agents.list({ projectPath })).map((agent) => agent.id);
       };
       const draftId = applyWorkspaceDraftMove(source, dest, listAgentIds);
       navigateToProject(dest.projectPath, draftId, { replace: true });
     },
-    [api, userProjects, navigateToProject]
+    [liveApi, userProjects, navigateToProject]
   );
 
   // Split into two context values so metadata-Map churn doesn't re-render
