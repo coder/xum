@@ -450,30 +450,35 @@ export function useAnalyticsRawQuery() {
   // older query cannot overwrite the newest result.
   const executionIdRef = useRef(0);
 
-  const executeQuery = async (sql: string) => {
+  /**
+   * True when this run's answer is the shown result. False when it did not run (offline, no
+   * analytics), failed, or a newer run replaced it: the caller must not treat `sql` as shown.
+   */
+  const executeQuery = async (sql: string): Promise<boolean> => {
     if (!api) {
       // Offline, keep the shown result.
       setState((prev) => ({ ...prev, loading: false, error: "API client not initialized" }));
-      return;
+      return false;
     }
 
     const namespace = getAnalyticsNamespace(api);
     if (!namespace || typeof namespace.executeRawQuery !== "function") {
       setState({ data: null, loading: false, error: ANALYTICS_UNAVAILABLE_MESSAGE });
-      return;
+      return false;
     }
 
     const executionId = ++executionIdRef.current;
     setState((prev) => ({ ...prev, loading: true, error: null }));
     try {
       const result = await namespace.executeRawQuery({ sql });
-      if (executionId === executionIdRef.current) {
-        setState({ data: result, loading: false, error: null });
-      }
+      if (executionId !== executionIdRef.current) return false;
+      setState({ data: result, loading: false, error: null });
+      return true;
     } catch (err) {
       if (executionId === executionIdRef.current) {
         setState({ data: null, loading: false, error: getErrorMessage(err) });
       }
+      return false;
     }
   };
 

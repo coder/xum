@@ -94,9 +94,11 @@ export function SqlExplorer(props: SqlExplorerProps) {
     }
 
     const thisExecutionId = ++executionIdRef.current;
-    await executeQuery(substituteTimeFilter(normalizedSql, props.timeFilterSql));
+    const ran = await executeQuery(substituteTimeFilter(normalizedSql, props.timeFilterSql));
 
-    if (thisExecutionId === executionIdRef.current) {
+    // A run that did not answer (offline, failed) leaves the shown results with the SQL that
+    // produced them: recording this SQL would let "Save as Panel" save a query that never ran.
+    if (ran && thisExecutionId === executionIdRef.current) {
       // Keep the raw SQL (with placeholder) so "Save as Panel" stores a query
       // that keeps tracking the dashboard's date-range selection.
       setLastExecutedSql(normalizedSql);
