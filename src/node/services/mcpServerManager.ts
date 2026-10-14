@@ -34,6 +34,7 @@ import {
   parseMCPSettingsReadResult,
   validateMCPSettingValue,
   type MCPSettingValue,
+  type MCPSettingsReadSnapshot,
   type MCPSettingsSnapshot,
 } from "@/common/utils/mcpSettings";
 import type {
@@ -69,6 +70,7 @@ import type {
   WorkspaceMCPOverrides,
 } from "@/common/types/mcp";
 import assert from "@/common/utils/assert";
+import * as crypto from "crypto";
 import { isPngDataUrl } from "@/common/utils/mcp/pngDataUrl";
 import { shellQuote } from "@/common/utils/shell";
 import { requiredPropertyNames, schemaAcceptsNull } from "@/common/utils/tools/schemaSanitizer";
@@ -4997,12 +4999,24 @@ export class MCPServerManager {
     );
   }
 
+  /** Random per server instance; see MCPSettingsReadSnapshot. */
+  private readonly settingsInstanceTokens = new WeakMap<MCPServerInstance, string>();
+
+  private settingsInstanceToken(instance: MCPServerInstance): string {
+    let token = this.settingsInstanceTokens.get(instance);
+    if (token === undefined) {
+      token = crypto.randomUUID();
+      this.settingsInstanceTokens.set(instance, token);
+    }
+    return token;
+  }
+
   async readSettings(
     workspaceId: string,
     serverName: string,
     /** `noStart`: read only a running instance; never start or restart the server. */
     options?: { signal?: AbortSignal; timeoutMs?: number; noStart?: boolean }
-  ): Promise<MCPSettingsSnapshot | null> {
+  ): Promise<MCPSettingsReadSnapshot | null> {
     const noSettings = Symbol("no settings");
     let source: { instance: MCPServerInstance; requestId: number } | undefined;
     const snapshot = await this.invokeServerOperation(
@@ -5026,9 +5040,39 @@ export class MCPServerManager {
     if (snapshot === null) return null;
     for (const warning of snapshot.warnings)
       log.warn(`[MCP] Settings of '${serverName}': ${warning}`, { workspaceId });
-    if (source !== undefined)
-      this.cacheSettings(source.instance, workspaceId, source.requestId, snapshot.values);
-    return snapshot;
+    assert(source !== undefined, "a settings snapshot comes from a server instance");
+    this.cacheSettings(source.instance, workspaceId, source.requestId, snapshot.values);
+    return { ...snapshot, instanceToken: this.settingsInstanceToken(source.instance) };
+  }
+
+  /**
+   * The workspace MCP dialog's save: validate `set` against a fresh read, send it, and return
+   * the snapshot the server shows afterwards (its schema can change with the values). Refused
+   * when the server instance is not the one the dialog read (`instanceToken`).
+   */
+  async saveSettings(
+    workspaceId: string,
+    serverName: string,
+    set: Record<string, MCPSettingValue>,
+    instanceToken: string,
+    options?: { signal?: AbortSignal }
+  ): Promise<MCPSettingsReadSnapshot> {
+    // Validate against a fresh read: the renderer's schema can be stale.
+    const prior = await this.readSettings(workspaceId, serverName, options);
+    if (prior === null) throw new Error(`MCP server '${serverName}' has no settings`);
+    if (prior.instanceToken !== instanceToken) throw staleSettingsInstanceError(serverName);
+    const values = await this.updateSettings(workspaceId, serverName, set, prior, instanceToken);
+    try {
+      const after = await this.readSettings(workspaceId, serverName, options);
+      if (after !== null) return after;
+    } catch (error) {
+      // The update landed: report it as saved with the schema from before.
+      log.warn(`[MCP] Settings read after the update of '${serverName}' failed`, {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+    return { ...prior, values };
   }
 
   /**
@@ -5039,7 +5083,9 @@ export class MCPServerManager {
     workspaceId: string,
     serverName: string,
     set: Record<string, MCPSettingValue>,
-    prior: Pick<MCPSettingsSnapshot, "properties" | "values">
+    prior: Pick<MCPSettingsSnapshot, "properties" | "values">,
+    /** The instance `prior` came from (saveSettings): another instance refuses the update. */
+    expectedInstanceToken?: string
   ): Promise<Record<string, MCPSettingValue>> {
     const { properties } = prior;
     for (const [name, value] of Object.entries(set)) {
@@ -5056,7 +5102,12 @@ export class MCPServerManager {
       `MCP settings update for '${serverName}'`,
       (instance) => {
         source ??= { instance, requestId: this.takeSettingsRequestId(instance, workspaceId) };
-        return (dispatched ??= this.callSettingsTool(instance, workspaceId, "updateTool", { set }));
+        return (dispatched ??= this.sendSettingsUpdate(
+          instance,
+          workspaceId,
+          set,
+          expectedInstanceToken
+        ));
       },
       (content) => {
         const warnings: string[] = [];
@@ -5072,6 +5123,22 @@ export class MCPServerManager {
     if (source !== undefined)
       this.cacheSettings(source.instance, workspaceId, source.requestId, values);
     return values;
+  }
+
+  /** The update tool call; refused when `expectedInstanceToken` names another instance. */
+  private sendSettingsUpdate(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    set: Record<string, MCPSettingValue>,
+    expectedInstanceToken: string | undefined
+  ): Promise<unknown> {
+    // The caller validated `set` against the schema of the instance that sent it.
+    if (
+      expectedInstanceToken !== undefined &&
+      this.settingsInstanceToken(instance) !== expectedInstanceToken
+    )
+      return Promise.reject(staleSettingsInstanceError(instance.name));
+    return this.callSettingsTool(instance, workspaceId, "updateTool", { set });
   }
 
   /** Host-only MCP Apps record (raw tool result) for a tool call, or null when missing. */
@@ -7764,4 +7831,10 @@ export class MCPServerManager {
       signal.removeEventListener("abort", onAbort);
     }
   }
+}
+
+function staleSettingsInstanceError(serverName: string): Error {
+  return new Error(
+    `MCP server '${serverName}' was restarted or replaced since its settings were read. Reopen the dialog to see its current settings.`
+  );
 }

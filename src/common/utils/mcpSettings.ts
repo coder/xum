@@ -328,7 +328,7 @@ export function parseMCPSettingsReadResult(raw: unknown): MCPSettingsSnapshot | 
  * "__proto__" key, which would hide such a setting without counting it. So it is dropped
  * here, counted as a setting Xum cannot show. Hooks still get its value (they skip IPC).
  */
-export function mcpSettingsSnapshotForIpc(snapshot: MCPSettingsSnapshot): MCPSettingsSnapshot {
+export function mcpSettingsSnapshotForIpc<T extends MCPSettingsSnapshot>(snapshot: T): T {
   const reserved = "__proto__";
   if (!Object.hasOwn(snapshot.properties, reserved)) return snapshot;
   const properties = { ...snapshot.properties };
@@ -350,3 +350,10 @@ export function mcpSettingsSnapshotForIpc(snapshot: MCPSettingsSnapshot): MCPSet
     droppedSettingCount: snapshot.droppedSettingCount + 1,
   };
 }
+
+/**
+ * A settings read for the workspace MCP dialog: the snapshot plus a token for the server
+ * instance that sent it. A save names the token, so it never validates against one instance
+ * and sends its update to another (a server replaced while the dialog was open).
+ */
+export type MCPSettingsReadSnapshot = MCPSettingsSnapshot & { instanceToken: string };

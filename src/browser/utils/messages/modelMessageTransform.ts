@@ -3,7 +3,7 @@
  * This operates on already-converted ModelMessages from Vercel AI SDK.
  */
 
-import type { ModelMessage, AssistantModelMessage, ToolModelMessage } from "ai";
+import type { ModelMessage, AssistantModelMessage, ToolModelMessage, UserModelMessage } from "ai";
 import {
   isContextBudgetWarningMessage,
   type MuxMessage,
@@ -1004,55 +1004,43 @@ function coalesceConsecutiveParts(messages: ModelMessage[]): ModelMessage[] {
     };
   });
 }
+type UserContentParts = Exclude<UserModelMessage["content"], string>;
+
+/** A user message's parts; a string is one text part. */
+function userPartsOf(content: UserModelMessage["content"]): UserContentParts {
+  return typeof content === "string" ? [{ type: "text", text: content }] : content;
+}
+
 /**
  * Merge consecutive user messages with newline separators.
  * When filtering removes assistant messages, we can end up with consecutive user messages.
  * Anthropic requires alternating user/assistant, so we merge them.
+ *
+ * Each message keeps its parts in their order (text, a PNG, then an SVG inlined as text stays in
+ * that order). The separator goes only between the merged messages: where the earlier one ends
+ * in text and the later one starts with text, the two join with a newline. Next to a file there
+ * is nothing to join, so no separator is added.
  */
 function mergeConsecutiveUserMessages(messages: ModelMessage[]): ModelMessage[] {
   const merged: ModelMessage[] = [];
 
   for (const msg of messages) {
-    if (msg.role === "user" && merged.length > 0 && merged[merged.length - 1].role === "user") {
-      // Consecutive user message - merge with previous
-      const prevMsg = merged[merged.length - 1];
-
-      // Every text part of both messages, joined by newlines: a message can carry several (an
-      // SVG attachment becomes a second text part, inlineSvgAsTextForProvider), and keeping only
-      // the first silently dropped the rest from the provider request. A message without text
-      // counts as one empty text, so single-text merges keep their exact bytes.
-      const textsOf = (content: ModelMessage["content"]): string[] => {
-        const texts =
-          typeof content === "string"
-            ? [content]
-            : Array.isArray(content)
-              ? content.flatMap((c) => (c.type === "text" ? [c.text] : []))
-              : [];
-        return texts.length > 0 ? texts : [""];
-      };
-      const mergedText = [...textsOf(prevMsg.content), ...textsOf(msg.content)].join("\n");
-
-      // Collect file/image parts from both messages
-      const prevImageParts = Array.isArray(prevMsg.content)
-        ? prevMsg.content.filter((c) => c.type === "file")
-        : [];
-      const currentImageParts = Array.isArray(msg.content)
-        ? msg.content.filter((c) => c.type === "file")
-        : [];
-
-      // Update the previous message with merged text and all image parts
-      merged[merged.length - 1] = {
-        role: "user",
-        content: [
-          { type: "text" as const, text: mergedText },
-          ...prevImageParts,
-          ...currentImageParts,
-        ],
-      };
-    } else {
-      // Not consecutive user message, add as-is
+    const prevMsg = merged.at(-1);
+    if (msg.role !== "user" || prevMsg?.role !== "user") {
       merged.push(msg);
+      continue;
     }
+    const parts = [...userPartsOf(prevMsg.content)];
+    const next = userPartsOf(msg.content);
+    const last = parts.at(-1);
+    const first = next.at(0);
+    if (last?.type === "text" && first?.type === "text") {
+      parts[parts.length - 1] = { ...last, text: `${last.text}\n${first.text}` };
+      parts.push(...next.slice(1));
+    } else {
+      parts.push(...next);
+    }
+    merged[merged.length - 1] = { role: "user", content: parts };
   }
 
   return merged;

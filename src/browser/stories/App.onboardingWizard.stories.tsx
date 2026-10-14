@@ -1,8 +1,8 @@
 /**
  * First-run onboarding wizard (#5944): the step indicator has an accessible name, and the
  * wizard's text meets WCAG AA contrast in every theme. Lighthouse scored the light theme's
- * muted text at 3.6-3.8:1 before the fix. The dark themes also check the step's accent links,
- * which use the text-only accent token since #5946.
+ * muted text at 3.6-3.8:1 before the fix. Every theme also checks the step's accent links,
+ * which use the text-only accent token (#5946, #6449).
  */
 
 import { expect, waitFor, within } from "@storybook/test";
@@ -46,8 +46,8 @@ async function expectAccessibleWizard(canvasElement: HTMLElement) {
 }
 
 /**
- * The step's accent links reach 4.5:1 on the dialog. Dark themes only: the light accent text is a
- * separate token decision (#6449). Dark #0070cc was 3.36:1 here (#5946).
+ * The step's accent links reach 4.5:1 on the dialog in every theme. Dark #0070cc was 3.36:1 here
+ * (#5946). The light themes pass on this dialog; the check guards their accent text token (#6449).
  */
 async function expectReadableWizardLinks(canvasElement: HTMLElement) {
   const dialog = within(await within(canvasElement.ownerDocument.body).findByRole("dialog"));
@@ -70,8 +70,7 @@ const contractStory = (theme: ThemeMode): AppStory => ({
   render: renderFirstRun,
   play: async ({ canvasElement }) => {
     await expectAccessibleWizard(canvasElement);
-    if (theme === "dark" || theme === "flexoki-dark")
-      await expectReadableWizardLinks(canvasElement);
+    await expectReadableWizardLinks(canvasElement);
   },
 });
 

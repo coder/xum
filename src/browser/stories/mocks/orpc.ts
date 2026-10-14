@@ -341,6 +341,11 @@ export interface MockORPCClientOptions {
    * holds each update on its own gate, in call order.
    */
   mcpSettingsUpdateGate?: { promise: Promise<void> } | Array<{ promise: Promise<void> }>;
+  /**
+   * Per server: the snapshot the server shows after its next update (the update's values are
+   * merged in). Stories use it for a schema that changes with the values.
+   */
+  mcpSettingsAfterUpdate?: Map<string, MCPSettingsSnapshot>;
   /** When set, the first settings read takes its values, then waits for this promise. */
   mcpSettingsFirstReadGate?: { promise: Promise<void> };
   /** When set, mcp.test waits for this promise (stories hold a Fetch Tools in flight). */
@@ -492,6 +497,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     mcpSettingsReads,
     mcpSettingsReadErrors,
     mcpSettingsUpdateGate,
+    mcpSettingsAfterUpdate,
     mcpSettingsFirstReadGate,
     mcpTestGate,
     mcpIcons = new Map<string, string>(),
@@ -1397,21 +1403,40 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             const snapshot = mcpSettings?.get(serverName);
             return {
               success: true,
-              data: snapshot === undefined ? null : structuredClone(snapshot),
+              data:
+                snapshot === undefined
+                  ? null
+                  : { ...structuredClone(snapshot), instanceToken: mockSettingsToken(serverName) },
             };
           };
           const result = Object.fromEntries(input.serverNames.map((name) => [name, readOne(name)]));
           if (first) await mcpSettingsFirstReadGate?.promise;
           return result;
         },
-        update: async (input: { serverName: string; set: Record<string, MCPSettingValue> }) => {
+        update: async (input: {
+          serverName: string;
+          set: Record<string, MCPSettingValue>;
+          instanceToken: string;
+        }) => {
           await (Array.isArray(mcpSettingsUpdateGate)
             ? mcpSettingsUpdateGate.shift()?.promise
             : mcpSettingsUpdateGate?.promise);
-          const snapshot = mcpSettings?.get(input.serverName);
-          if (snapshot === undefined) return { success: false, error: "No settings mock" };
-          snapshot.values = { ...snapshot.values, ...input.set };
-          return { success: true, data: snapshot.values };
+          const stored = mcpSettings?.get(input.serverName);
+          if (stored === undefined) return { success: false, error: "No settings mock" };
+          if (input.instanceToken !== mockSettingsToken(input.serverName))
+            return { success: false, error: "The server was replaced. Reopen the dialog." };
+          const after = mcpSettingsAfterUpdate?.get(input.serverName);
+          mcpSettingsAfterUpdate?.delete(input.serverName);
+          const snapshot = after === undefined ? stored : structuredClone(after);
+          snapshot.values = { ...stored.values, ...snapshot.values, ...input.set };
+          mcpSettings?.set(input.serverName, snapshot);
+          return {
+            success: true,
+            data: {
+              ...structuredClone(snapshot),
+              instanceToken: mockSettingsToken(input.serverName),
+            },
+          };
         },
       },
       list: (input?: { projectPath?: string }) => {
@@ -2576,4 +2601,9 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
     },
   } as unknown as APIClient;
+}
+
+/** The mock's settings servers never restart: one instance token per server name. */
+function mockSettingsToken(serverName: string): string {
+  return `mock-instance:${serverName}`;
 }

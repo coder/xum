@@ -2,7 +2,16 @@ import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { annotation, coverageStatus, incompleteCoverageReason, lcovFiles, summary } from "./ci";
+import {
+  annotation,
+  coverageStatus,
+  crapMode,
+  exitCode,
+  expectedShards,
+  incompleteCoverageReason,
+  lcovFiles,
+  summary,
+} from "./ci";
 import type { Finding } from "./policy";
 
 test("coverage is partial when any expected shard report is missing", () => {
@@ -135,4 +144,26 @@ test("the summary lists Bun inlined-const suspects in their own group", () => {
   expect(text.indexOf("| violation | floor-cc | grew |")).toBeLessThan(group);
   expect(text.indexOf("| warning | new-function | hidden |")).toBeGreaterThan(group);
   expect(text).toContain("**1 violation(s), 1 warning(s).**");
+});
+
+test("only block mode with violations exits 1; warn mode and tool errors never block", () => {
+  expect(crapMode("block")).toBe("block");
+  for (const value of [undefined, "", "warn", "Block", "true"]) expect(crapMode(value)).toBe("warn");
+  const failing = { findings: [], debt: [], ok: false };
+  const passing = { findings: [], debt: [], ok: true };
+  expect(exitCode("block", failing)).toBe(1);
+  expect(exitCode("block", passing)).toBe(0);
+  expect(exitCode("block", null)).toBe(0);
+  expect(exitCode("warn", failing)).toBe(0);
+});
+
+test("a PR whose integration shards skip their tests expects no integration report", () => {
+  const env = { EXPECTED_UNIT: "6", EXPECTED_INTEGRATION: "3" };
+  expect(expectedShards({ ...env, INTEGRATION_RAN: "true" })).toEqual({ unit: 6, integration: 3 });
+  // Unknown (no changes output) keeps the full count: missing reports then only warn.
+  expect(expectedShards(env)).toEqual({ unit: 6, integration: 3 });
+  const skipped = expectedShards({ ...env, INTEGRATION_RAN: "false" });
+  expect(skipped).toEqual({ unit: 6, integration: 0 });
+  const units = ["1", "2", "3", "4", "5", "6"].map((shard) => `crap-lcov-unit-${shard}`);
+  expect(incompleteCoverageReason(coverageStatus(units, skipped), skipped)).toBeNull();
 });
