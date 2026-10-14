@@ -639,7 +639,7 @@ describe("PostToolUse", () => {
     expect(ctx.postBlocked).toBe(true);
   });
 
-  test("Bash hooks see Codex's shape: { command } in, the output text out, none while running", async () => {
+  test("Bash hooks see Codex's shape: { command } in, the output text out", async () => {
     // Codex PRRT_kwDOPxxmWM6rPqzP, PRRT_kwDOPxxmWM6rPqzQ (core/src/tools/context.rs).
     const { spine, calls } = setup(
       [
@@ -651,7 +651,7 @@ describe("PostToolUse", () => {
     const args = { script: "ls", display_name: "List", timeout_secs: 5 };
     const done = { success: true, output: "a.txt", exitCode: 0, wall_duration_ms: 1 };
     const failed = { success: false, exitCode: 1, error: "boom", wall_duration_ms: 1 };
-    const background = { ...done, output: "", taskId: "t", backgroundProcessId: "p" };
+    const background = { ...done, output: "started", taskId: "t", backgroundProcessId: "p" };
 
     await runTool(spine, "bash", args, undefined, undefined, { result: done });
     await runTool(spine, "bash", args, undefined, undefined, { result: failed });
@@ -663,8 +663,10 @@ describe("PostToolUse", () => {
       { post: command, out: "a.txt" },
       { pre: command },
       { post: command, out: "boom" },
-      // A command still running gets no PostToolUse.
+      // A background command gets its PostToolUse at once, with the output so far (Codex
+      // PRRT_kwDOPxxmWM6sXLUZ: audit hooks must still see it).
       { pre: command },
+      { post: command, out: "started" },
     ]);
   });
 

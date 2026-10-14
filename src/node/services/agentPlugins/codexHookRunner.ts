@@ -25,7 +25,7 @@ import { AjvJsonSchemaValidator } from "@modelcontextprotocol/client/validators/
 import { log } from "@/node/services/log";
 import { compileHookMatcher, type PluginHookDefinition } from "./codexHooks";
 import { isPlainObject } from "./manifest";
-import { codexToolView, NO_POST_TOOL_USE, type CodexToolView } from "./codexToolNames";
+import { codexToolView, type CodexToolView } from "./codexToolNames";
 import {
   parsePostToolUseOutput,
   parsePreToolUseOutput,
@@ -255,7 +255,6 @@ async function runPostToolHooks(
 ): Promise<void> {
   // Codex's response shape for an aliased built-in (Bash: the output text).
   const response = view.toCodexResponse(ctx.result);
-  if (response === NO_POST_TOOL_USE) return;
   const feedback: string[] = [];
   for (const hook of post.filter((candidate) => matches(candidate, ctx.toolName, view))) {
     const output = await invoke(

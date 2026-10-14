@@ -5,8 +5,7 @@
  * Mapped:
  * - `bash` → `Bash` ("Shell commands … Match as Bash"). Codex's hook contract for its shell
  *   (core/src/tools/context.rs, handlers/unified_exec.rs): `tool_input` is `{ command }` only,
- *   `tool_response` is the output text as a string, and a command still running (Xum
- *   `run_in_background`) gets no PostToolUse. A rewrite sets only the command: the call keeps
+ *   `tool_response` is the output text as a string. A rewrite sets only the command: the call keeps
  *   its other Xum arguments (Codex PRRT_kwDOPxxmWM6rPqzP, PRRT_kwDOPxxmWM6rPqzQ,
  *   PRRT_kwDOPxxmWM6rPqzS).
  * - MCP tools → `mcp__<server>__<tool>`, from the tool's origin (MCP_TOOL_ORIGIN), not from Xum's
@@ -47,9 +46,6 @@ export function readMcpToolOrigin(tool: unknown): McpToolOrigin | undefined {
     : undefined;
 }
 
-/** No PostToolUse for this result (Codex sends none for it). */
-export const NO_POST_TOOL_USE = Symbol("noPostToolUse");
-
 interface BuiltinAlias {
   codexName: string;
   /** The whole Codex `tool_input`: Codex's fields only, not Xum's arguments. */
@@ -59,7 +55,7 @@ interface BuiltinAlias {
     input: Record<string, unknown>,
     original: Record<string, unknown>
   ): Record<string, unknown> | undefined;
-  /** The Codex `tool_response` for a tool result, or NO_POST_TOOL_USE. */
+  /** The Codex `tool_response` for a tool result. */
   toCodexResponse(result: unknown): unknown;
 }
 
@@ -72,8 +68,10 @@ const BUILTIN_ALIASES: Record<string, BuiltinAlias> = {
       typeof input.command === "string" ? { ...original, script: input.command } : undefined,
     toCodexResponse: (result) => {
       if (!isPlainObject(result)) return result;
-      // A background command is still running (Codex: a live process_id).
-      if (typeof result.backgroundProcessId === "string") return NO_POST_TOOL_USE;
+      // A background command (run_in_background or auto-backgrounded) is still running. Codex
+      // sends its PostToolUse on completion, from its polling path; Xum sends it now, with the
+      // output so far, so audit and blocking hooks still see every Bash call (Codex
+      // PRRT_kwDOPxxmWM6sXLUZ). Sending it on completion instead is tracked in #6166.
       if (typeof result.output === "string") return result.output;
       return typeof result.error === "string" ? result.error : "";
     },
@@ -87,7 +85,7 @@ export interface CodexToolView {
   toCodexInput(args: unknown): unknown;
   /** The arguments after a hook's `updatedInput`; undefined when the rewrite is invalid. */
   fromCodexInput(input: unknown, original: unknown): unknown;
-  /** The `tool_response` hooks see, or NO_POST_TOOL_USE. */
+  /** The `tool_response` hooks see. */
   toCodexResponse(result: unknown): unknown;
 }
 
