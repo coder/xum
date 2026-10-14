@@ -9,7 +9,7 @@ import type { DraftEvent, DraftUpdateInput } from "@/common/orpc/schemas/drafts"
 import { toDraftAttachmentMetadata } from "@/common/utils/drafts";
 import { useWorkspaceName } from "./useWorkspaceName";
 
-const generateMock = mock(() =>
+const generateMock = mock((_input: { draftNamingId?: string }) =>
   Promise.resolve({
     success: true as const,
     data: { name: "quotes-a1b2", title: "Quote heavy message", modelUsed: "test:model" },
@@ -167,5 +167,86 @@ describe("useWorkspaceName draft state", () => {
       })
     );
     await waitFor(() => expect(view.result.current.name).toBe("other-window"));
+  });
+
+  describe("handOffGeneration", () => {
+    test("hands an in-flight generation to the caller and drops its late result", async () => {
+      const generation = Promise.withResolvers<Awaited<ReturnType<typeof generateMock>>>();
+      generateMock.mockImplementationOnce(() => generation.promise);
+      const view = renderWorkspaceName("fix the sidebar");
+      await waitFor(() => expect(generateMock).toHaveBeenCalledTimes(1));
+
+      const handedOff: Array<ReturnType<typeof view.result.current.handOffGeneration>> = [];
+      act(() => {
+        handedOff.push(view.result.current.handOffGeneration());
+      });
+      // Named so the backend can take the in-flight request's result over.
+      const inFlightId = generateMock.mock.calls[0]?.[0]?.draftNamingId;
+      expect(typeof inFlightId).toBe("string");
+      expect(handedOff[0]?.request).toEqual({
+        message: "fix the sidebar",
+        candidates: [],
+        draftNamingId: inFlightId,
+      });
+      expect(view.result.current.isGenerating).toBe(false);
+
+      await act(async () => {
+        generation.resolve({
+          success: true as const,
+          data: { name: "sidebar-a1b2", title: "Fix sidebar", modelUsed: "test:model" },
+        });
+        await generation.promise;
+      });
+      expect(view.result.current.name).toBe("");
+    });
+
+    test("a resume after a switch to another draft leaves that draft's naming alone", async () => {
+      const draftB = Promise.withResolvers<Awaited<ReturnType<typeof generateMock>>>();
+      // Draft A's request is handed off and never answers; draft B's answers below.
+      generateMock.mockImplementationOnce(() => new Promise(() => undefined));
+      generateMock.mockImplementationOnce(() => draftB.promise);
+      const view = renderHook(
+        (props: { message: string; draftId: string }) =>
+          useWorkspaceName({
+            message: props.message,
+            debounceMs: 1,
+            scope: { ...SCOPE, draftId: props.draftId },
+          }),
+        { wrapper: Wrapper, initialProps: { message: "fix the sidebar", draftId: "draft-a" } }
+      );
+      await waitFor(() => expect(generateMock).toHaveBeenCalledTimes(1));
+      const handedOff: Array<ReturnType<typeof view.result.current.handOffGeneration>> = [];
+      act(() => {
+        handedOff.push(view.result.current.handOffGeneration());
+      });
+
+      view.rerender({ message: "rework the layout", draftId: "draft-b" });
+      await waitFor(() => expect(generateMock).toHaveBeenCalledTimes(2));
+      // Draft A's create fails only now.
+      act(() => handedOff[0]?.resume());
+      await act(async () => {
+        draftB.resolve({
+          success: true as const,
+          data: { name: "layout-x2p4", title: "Rework layout", modelUsed: "test:model" },
+        });
+        await draftB.promise;
+      });
+
+      expect(view.result.current.name).toBe("layout-x2p4");
+      expect(generateMock).toHaveBeenCalledTimes(2);
+    });
+
+    test("returns null when a name was generated for the current message", async () => {
+      const view = renderWorkspaceName("fix the sidebar");
+      await waitFor(() => expect(view.result.current.name).toBe("quotes-a1b2"));
+      expect(view.result.current.handOffGeneration()).toBeNull();
+    });
+
+    test("returns null for a manual name", () => {
+      const view = renderWorkspaceName("fix the sidebar");
+      act(() => view.result.current.setAutoGenerate(false));
+      act(() => view.result.current.setName("my-feature"));
+      expect(view.result.current.handOffGeneration()).toBeNull();
+    });
   });
 });

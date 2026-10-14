@@ -14,7 +14,10 @@ import {
 } from "@/node/services/desktop/DesktopInputCoordinator";
 import * as path from "path";
 import { isDeepStrictEqual } from "util";
-import { TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS } from "@/constants/terminationTimeouts";
+import {
+  TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
+  WORKSPACE_NAME_GENERATION_TIMEOUT_MS,
+} from "@/constants/terminationTimeouts";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { SERVER_UPDATE_MONITOR_VERIFY_TIMEOUT_MS } from "@/constants/serverUpdate";
 import { EventEmitter } from "events";
@@ -50,7 +53,7 @@ import {
   workspacesSharingPlanDirectory,
   type Config,
 } from "@/node/config";
-import type { ProjectsConfig, Workspace } from "@/common/types/project";
+import type { ProjectConfig, ProjectsConfig, Workspace } from "@/common/types/project";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
 import { askUserQuestionManager } from "@/node/services/askUserQuestionManager";
@@ -220,6 +223,7 @@ import {
 } from "@/node/services/sideChat";
 import {
   generateWorkspaceIdentity,
+  type GenerateWorkspaceIdentityResult,
   type NameGenerationCandidate,
 } from "@/node/services/workspaceTitleGenerator";
 import { NAME_GEN_PREFERRED_MODELS } from "@/common/constants/nameGeneration";
@@ -269,7 +273,8 @@ import type {
 } from "@/common/orpc/types";
 
 import type { z } from "zod";
-import type { SendMessageError } from "@/common/types/errors";
+import type { NameGenerationError, SendMessageError } from "@/common/types/errors";
+import { formatNameGenerationError } from "@/common/utils/errors/formatNameGenerationError";
 // Aliased to avoid clashing with the private `formatSendMessageError` string formatter below.
 import {
   createStreamErrorMessage,
@@ -412,6 +417,7 @@ import type {
   ArchivePreflightResult,
   ArchiveWorkspaceResult,
   BackgroundProcessInfo,
+  WorkspaceNameGenerationRequest,
 } from "@/common/orpc/schemas/api";
 import type { SessionTimingService } from "@/node/services/sessionTimingService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
@@ -1107,6 +1113,32 @@ function logRegistrationRollbackFailure(workspaceId: string, error: unknown): vo
 interface CreationRollbackResult {
   entryGone: boolean;
   leftovers: string[];
+}
+
+/** The backend naming of a workspace created before its generated name existed. */
+interface CreationNaming {
+  /** The generated identity, or why there is none (failure, timeout, abort). Never rejects. */
+  readonly outcome: Promise<Result<GenerateWorkspaceIdentityResult, string>>;
+  /**
+   * Called once when create() settles: true when it returned the workspace, so the title may
+   * apply; false aborts the naming.
+   */
+  settleCreation(created: boolean): void;
+  /** Called once the branch is final: renamed, kept, or never to be renamed. Idempotent. */
+  settleBranch(): void;
+}
+
+/**
+ * How many creation-form naming requests stay available for a creation to take over. Most never
+ * are (the form shows the name, or the message changes); one per open creation form is enough.
+ */
+const MAX_RETAINED_DRAFT_NAMINGS = 16;
+
+/** Why a backend-generated branch name cannot replace the provisional one, if it cannot. */
+function refuseGeneratedBranchName(generated: string, provisional: string): string | undefined {
+  const validation = validateWorkspaceBranchName(generated);
+  if (!validation.valid) return validation.error ?? "invalid generated branch name";
+  return generated === provisional ? "the generated name is the same" : undefined;
 }
 
 function describeRollbackLeftovers(leftovers: readonly string[]): string {
@@ -2933,6 +2965,21 @@ export class WorkspaceService
   // Tracks in-flight fork auto-title generations so only the first accepted continue
   // message can claim the workspace title.
   private readonly autoTitlingWorkspaces = new Set<string>();
+  /**
+   * Workspaces create() opened before their generated name existed, until their title and
+   * branch are final (startCreationNaming). A fork of one waits for them.
+   */
+  private readonly pendingCreationNamings = new Map<string, Promise<void>>();
+  /**
+   * The creation form's naming requests by draftNamingId, oldest first, running or finished. The
+   * creation that hands one off takes it over instead of asking the model again. Kept after they
+   * finish: the form drops a result that arrives after its hand-off, and the creation request
+   * can reach the backend after that result.
+   */
+  private readonly draftNamings = new Map<
+    string,
+    Promise<Result<GenerateWorkspaceIdentityResult, NameGenerationError>>
+  >();
 
   // Monotonic per-workspace stream generations prevent delayed stop-side metadata writes
   // from older streams from clobbering a newer streaming=true snapshot after async awaits.
@@ -4004,6 +4051,8 @@ export class WorkspaceService
     initAbortController: AbortController;
     /** Whether the creation made the branch; a sanitize abort keeps one it merely reused. */
     createdBranch: boolean;
+    /** Backend naming whose branch rename runs once the checkout is complete. */
+    naming?: CreationNaming;
   }): Promise<void> {
     const { workspaceId, runtime, initParams } = args;
     assert(
@@ -4094,14 +4143,57 @@ export class WorkspaceService
     // Checkout populated and sanitized: only now may other task trees discover and message
     // this workspace. Granting at registration would rely on waitForInit, which a second
     // backend sharing this root does not observe.
-    await this.grantPendingDefaultUnrelatedWorkspaceConsent(workspaceId);
-    await runBackgroundInit(
+    await this.runCreatedWorkspaceInit(
       runtime,
       initParams,
       workspaceId,
-      workspaceUseLeasesFor(this.config),
-      log
+      args.workspaceName,
+      args.naming,
+      args.createdBranch,
+      () => this.grantPendingDefaultUnrelatedWorkspaceConsent(workspaceId)
     );
+  }
+
+  /**
+   * The init of a new workspace's populated checkout: a backend-named workspace's branch rename
+   * first, then `beforeInit`, then the init hook. A backend-named workspace holds the init use
+   * lease (#4857) from before its naming wait, not only while the hook runs: a structural rename
+   * meanwhile, by this backend or another, would move the checkout and the provisional branch
+   * under the branch rename and the hook. runBackgroundInit's own hold nests inside it.
+   */
+  private async runCreatedWorkspaceInit(
+    runtime: Runtime,
+    initParams: WorkspaceInitParams,
+    workspaceId: string,
+    workspaceName: string,
+    naming: CreationNaming | undefined,
+    createdBranch: boolean,
+    beforeInit?: () => Promise<void>
+  ): Promise<void> {
+    const useLeases = workspaceUseLeasesFor(this.config);
+    const init = async () => {
+      if (naming) {
+        await this.renameBranchAfterCreationNaming(
+          runtime,
+          initParams,
+          workspaceName,
+          naming,
+          createdBranch
+        );
+        // Removal may have started during the naming wait; it now owns the checkout.
+        if (this.removingWorkspaces.has(workspaceId)) return;
+      }
+      await beforeInit?.();
+      await runBackgroundInit(runtime, initParams, workspaceId, useLeases, log);
+    };
+    if (!naming) return init();
+    await withInitUseLease(useLeases, workspaceId, init).catch((error: unknown) => {
+      // The hold refuses while another backend mutates the workspace: neither the rename nor the
+      // hook ran.
+      naming.settleBranch();
+      initParams.initLogger.logStderr(`Initialization failed: ${getErrorMessage(error)}`);
+      initParams.initLogger.logComplete(-1);
+    });
   }
 
   setWorkspaceGoalService(service: WorkspaceGoalService): void {
@@ -6306,6 +6398,31 @@ export class WorkspaceService
     }
   }
 
+  /** The next free "workspace-N" name, as /new and backend-named creations use. */
+  private async nextAutoWorkspaceBranchName(
+    owningProjectPath: string,
+    projectConfig: ProjectConfig,
+    planDirectoryNames: ReadonlySet<string>
+  ): Promise<string> {
+    const existingNamesSet = new Set<string>(planDirectoryNames);
+    for (const entry of projectConfig.workspaces ?? []) {
+      if (typeof entry.name === "string") {
+        existingNamesSet.add(entry.name);
+      }
+    }
+    try {
+      for (const localBranch of await listLocalBranches(owningProjectPath)) {
+        existingNamesSet.add(localBranch);
+      }
+    } catch (error) {
+      log.debug("Failed to list local branches for /new auto-name preflight", {
+        projectPath: owningProjectPath,
+        error: getErrorMessage(error),
+      });
+    }
+    return generateForkBranchName(AUTO_NEW_WORKSPACE_BASE_NAME, [...existingNamesSet]);
+  }
+
   async create(
     projectPath: string,
     branchName: string | undefined,
@@ -6335,10 +6452,16 @@ export class WorkspaceService
        * startup resolver can bind to that handle and owner. Internal only; never from the API.
        */
       delegatedCreation?: { handleId: string; ownerWorkspaceId: string };
+      /**
+       * Name the workspace after announcing it (see startCreationNaming): it opens under the
+       * provisional "workspace-N" name, and its branch is renamed before the init hook runs.
+       */
+      nameGeneration?: WorkspaceNameGenerationRequest;
     }
   ): Promise<Result<{ metadata: FrontendWorkspaceMetadata; createdBranch?: boolean }>> {
     const defaultConsent = options?.defaultUnrelatedConsent ?? "after-setup";
     const delegatedCreation = options?.delegatedCreation;
+    const nameGeneration = options?.nameGeneration;
     assert(
       delegatedCreation == null ||
         (delegatedCreation.handleId.length > 0 && delegatedCreation.ownerWorkspaceId.length > 0),
@@ -6387,6 +6510,15 @@ export class WorkspaceService
       type: "worktree",
       srcBaseDir: this.config.srcDir,
     };
+    const namingRefusal = this.refuseCreationNaming(
+      nameGeneration,
+      branchName,
+      title,
+      finalRuntimeConfig
+    );
+    if (namingRefusal) {
+      return Err(namingRefusal);
+    }
 
     // Names whose plan file another workspace already uses: plans live at
     // plans/<projectName>/<name>.md, and same-basename projects on the same plan storage share that
@@ -6409,30 +6541,13 @@ export class WorkspaceService
     // existing workspace names AND local git branches so numbering is stable.
     // Branches/worktrees are owned by the parent project, so always read from
     // owningProjectPath even when a sub-project initiated creation.
-    let resolvedBranchName: string;
-    if (branchName == null) {
-      const existingNamesSet = new Set<string>(planDirectoryNames);
-      for (const entry of projectConfig.workspaces ?? []) {
-        if (typeof entry.name === "string") {
-          existingNamesSet.add(entry.name);
-        }
-      }
-      try {
-        for (const localBranch of await listLocalBranches(owningProjectPath)) {
-          existingNamesSet.add(localBranch);
-        }
-      } catch (error) {
-        log.debug("Failed to list local branches for /new auto-name preflight", {
-          projectPath: owningProjectPath,
-          error: getErrorMessage(error),
-        });
-      }
-      resolvedBranchName = generateForkBranchName(AUTO_NEW_WORKSPACE_BASE_NAME, [
-        ...existingNamesSet,
-      ]);
-    } else {
-      resolvedBranchName = branchName;
-    }
+    const resolvedBranchName =
+      branchName ??
+      (await this.nextAutoWorkspaceBranchName(
+        owningProjectPath,
+        projectConfig,
+        planDirectoryNames
+      ));
 
     const validation = validateWorkspaceBranchName(resolvedBranchName);
     if (!validation.valid) {
@@ -6491,6 +6606,13 @@ export class WorkspaceService
     // can reliably interrupt init even if the UI deletes the workspace during create().
     const initAbortController = new AbortController();
     this.initAbortControllers.set(workspaceId, initAbortController);
+    // Settled in the finally below; started now so naming overlaps the checkout.
+    const naming = this.startCreationNaming(
+      workspaceId,
+      nameGeneration,
+      initAbortController.signal
+    );
+    let namingCreated = false;
 
     const initLogger = this.createInitLogger(workspaceId);
     // True once a retained owner (the deferred checkout's settlement) finalizes the pending
@@ -6504,6 +6626,9 @@ export class WorkspaceService
       let finalWorkspaceName = initialWorkspaceName;
       const hasSanitizedWorkspaceName = finalBranchName !== finalWorkspaceName;
       let createResult: WorkspaceCreationResult;
+      // Whether this creation made its branch: undoing the creation deletes only such a branch,
+      // and a backend-named workspace renames only such a branch.
+      let createdBranch = false;
 
       // A name another workspace's plan file uses (#5139) is occupied on every runtime, like a
       // taken checkout directory: it gets the same collision suffix (or, for a sanitized branch
@@ -6554,6 +6679,7 @@ export class WorkspaceService
           deferMaterialization:
             options?.awaitMaterialization !== true && runtime.materializeWorkspace !== undefined,
         });
+        createdBranch = createResult.createdBranch === true;
 
         if (createResult.success) break;
 
@@ -6650,9 +6776,7 @@ export class WorkspaceService
             initAbortController,
             // Force is what removes an unpopulated or hook-dirtied checkout, and its `branch -D`
             // is safe only on a branch this creation made.
-            checkout:
-              // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-              createResult!.createdBranch === true ? "force-delete" : "force-delete-keep-branch",
+            checkout: createdBranch ? "force-delete" : "force-delete-keep-branch",
           });
         // #4745: nothing references this checkout before the registration write lands; undo the
         // creation, then fail with the failed step's own error.
@@ -6712,7 +6836,9 @@ export class WorkspaceService
             ...(tags != null && Object.keys(tags).length > 0 ? { tags } : {}),
             // Mirror /fork: when /new is invoked with a start message, defer title
             // selection until the first message can drive LLM-based generation.
-            ...(pendingAutoTitle === true ? { pendingAutoTitle: true } : {}),
+            ...(pendingAutoTitle === true || naming !== undefined
+              ? { pendingAutoTitle: true }
+              : {}),
             // Default consent is granted once setup completes; marked in this same write so a
             // toggle from any backend that sees the row cancels it (#4446).
             ...(defaultConsent === "none"
@@ -6839,16 +6965,21 @@ export class WorkspaceService
                 initParams,
                 pending: pendingMaterialization,
                 initAbortController,
-                // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-                createdBranch: createResult!.createdBranch === true,
-                // Removal, failed checkout or failed sanitization: the default never applies.
-              }).finally(() => this.clearPendingDefaultUnrelatedConsent(workspaceId))
-            : runBackgroundInit(
+                createdBranch,
+                naming,
+                // Removal, failed checkout or failed sanitization: the default never applies,
+                // and the branch is never renamed.
+              }).finally(() => {
+                naming?.settleBranch();
+                return this.clearPendingDefaultUnrelatedConsent(workspaceId);
+              })
+            : this.runCreatedWorkspaceInit(
                 runtime,
                 initParams,
                 workspaceId,
-                workspaceUseLeasesFor(this.config),
-                log
+                finalWorkspaceName,
+                naming,
+                createdBranch
               )
         );
       } else {
@@ -6865,11 +6996,11 @@ export class WorkspaceService
       eventSpine.emit("workspace.created", { workspaceId });
       // The caller now owns the pending default (see the option).
       if (defaultConsent === "caller-finalizes") pendingDefaultHandedOff = true;
+      namingCreated = true;
       return Ok({
         metadata: this.enrichFrontendMetadata(completeMetadata),
         // Lets a caller that undoes this creation keep a branch it merely reused (#4819).
-        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-        createdBranch: createResult!.createdBranch === true,
+        createdBranch,
       });
     } catch (error) {
       initLogger.logComplete(-1);
@@ -6887,6 +7018,8 @@ export class WorkspaceService
       if (!pendingDefaultHandedOff) {
         await this.clearPendingDefaultUnrelatedConsent(workspaceId);
       }
+      // Any exit but the success above aborts the naming.
+      naming?.settleCreation(namingCreated);
     }
   }
 
@@ -10595,6 +10728,279 @@ export class WorkspaceService
     return candidates.map((candidate) => candidate.model);
   }
 
+  /** create()'s preflight for nameGeneration; returns the refusal, if any. */
+  private refuseCreationNaming(
+    request: WorkspaceNameGenerationRequest | undefined,
+    branchName: string | undefined,
+    title: string | undefined,
+    runtimeConfig: RuntimeConfig
+  ): string | undefined {
+    if (request === undefined) {
+      return undefined;
+    }
+    if (branchName != null || title != null) {
+      return "nameGeneration cannot be combined with branchName or title";
+    }
+    // Only a local worktree's branch can be renamed under its checkout before the init hook runs.
+    if (runtimeConfig.type !== "worktree") {
+      return "nameGeneration requires the worktree runtime";
+    }
+    if (!request.message.trim()) {
+      return "nameGeneration requires a non-empty message";
+    }
+    return undefined;
+  }
+
+  /**
+   * Start naming a workspace that create() opens under its provisional "workspace-N" name, while
+   * its checkout runs. The title applies as soon as it arrives (unless the user titled the
+   * workspace meanwhile); a failure keeps pendingAutoTitle so a later message titles it. The
+   * auto-title claim, taken before the workspace is announced, keeps the first message from
+   * starting a second naming request, and is released once this naming settles.
+   */
+  private startCreationNaming(
+    workspaceId: string,
+    request: WorkspaceNameGenerationRequest | undefined,
+    initAbortSignal: AbortSignal
+  ): CreationNaming | undefined {
+    if (request === undefined) return undefined;
+    this.autoTitlingWorkspaces.add(workspaceId);
+    const namingAbort = new AbortController();
+    let settleCreation!: (created: boolean) => void;
+    const created = new Promise<boolean>((resolve) => {
+      settleCreation = resolve;
+    });
+    let settleBranch!: () => void;
+    const branchFinal = new Promise<void>((resolve) => {
+      settleBranch = resolve;
+    });
+    // An aborted init never reaches the rename (renameCreationBranch honours the abort).
+    initAbortSignal.addEventListener("abort", () => settleBranch(), { once: true });
+    const outcome = this.generateCreationIdentity(
+      request,
+      AbortSignal.any([namingAbort.signal, initAbortSignal]),
+      namingAbort
+    );
+    const titleFinal = outcome
+      .then(async (result) => {
+        if (!result.success) {
+          log.warn("Failed to name a new workspace", { workspaceId, error: result.error });
+          return;
+        }
+        if (!(await created)) return;
+        const persistResult = await this.updateWorkspaceTitleState(workspaceId, {
+          title: result.data.title,
+          clearPendingAutoTitle: true,
+          requirePendingAutoTitle: true,
+        });
+        if (!persistResult.success) {
+          log.warn("Failed to persist a new workspace's generated title", {
+            workspaceId,
+            error: persistResult.error,
+          });
+        }
+      })
+      .catch((error: unknown) => {
+        log.error("Unexpected error naming a new workspace", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      })
+      .finally(() => {
+        this.autoTitlingWorkspaces.delete(workspaceId);
+      });
+    // Neither part rejects: the title chain catches, and the branch only ever resolves.
+    const namingFinal = Promise.all([titleFinal, branchFinal]).then(() => {
+      this.pendingCreationNamings.delete(workspaceId);
+    });
+    this.pendingCreationNamings.set(workspaceId, namingFinal);
+    return {
+      outcome,
+      settleCreation: (wasCreated) => {
+        if (!wasCreated) {
+          namingAbort.abort();
+          settleBranch();
+        }
+        settleCreation(wasCreated);
+      },
+      settleBranch: () => settleBranch(),
+    };
+  }
+
+  /**
+   * A fork's source metadata, read once the backend has named a source create() opened under its
+   * provisional name, so the fork copies its generated title and forks from its final branch. The
+   * wait is bounded by the naming deadline. A source whose branch is still provisional then (a
+   * long checkout holds the rename) refuses the fork: forking from that branch would race its
+   * rename.
+   */
+  private async readNamedForkSource(
+    sourceWorkspaceId: string
+  ): Promise<Result<WorkspaceMetadata, string>> {
+    const pending = this.pendingCreationNamings.get(sourceWorkspaceId);
+    if (pending !== undefined) {
+      const waited = await raceWithAbortAndTimeout(pending, {
+        timeoutMs: WORKSPACE_NAME_GENERATION_TIMEOUT_MS,
+      });
+      if (waited.kind !== "ok") {
+        return Err(
+          "The workspace is still being set up. Fork it again once its checkout finishes."
+        );
+      }
+    }
+    const result = await this.aiService.getWorkspaceMetadata(sourceWorkspaceId);
+    if (!result.success) {
+      return Err(`Failed to get source workspace metadata: ${result.error}`);
+    }
+    return result;
+  }
+
+  /**
+   * nameGeneration.generate: names a creation draft's message before its workspace exists. With
+   * a draftNamingId, the creation that hands this request off takes it over
+   * (generateCreationIdentity) instead of asking the model a second time.
+   */
+  generateDraftIdentity(
+    request: WorkspaceNameGenerationRequest
+  ): Promise<Result<GenerateWorkspaceIdentityResult, NameGenerationError>> {
+    const generation = this.generatePreCreationIdentity(request.message, request.candidates);
+    if (request.draftNamingId !== undefined) {
+      this.draftNamings.set(request.draftNamingId, generation);
+      if (this.draftNamings.size > MAX_RETAINED_DRAFT_NAMINGS) {
+        const [oldest] = this.draftNamings.keys();
+        this.draftNamings.delete(oldest);
+      }
+    }
+    return generation;
+  }
+
+  /** The creation form's naming request a creation hands off, once: see draftNamings. */
+  private takeDraftNaming(
+    draftNamingId: string | undefined
+  ): Promise<Result<GenerateWorkspaceIdentityResult, NameGenerationError>> | undefined {
+    if (draftNamingId === undefined) return undefined;
+    const draftNaming = this.draftNamings.get(draftNamingId);
+    this.draftNamings.delete(draftNamingId);
+    return draftNaming;
+  }
+
+  private async generatePreCreationIdentity(
+    message: string,
+    callerModels: string[],
+    abortSignal?: AbortSignal
+  ): Promise<Result<GenerateWorkspaceIdentityResult, NameGenerationError>> {
+    // Pre-creation naming has no workspace yet: the configured naming agent (model + thinking)
+    // still leads; the caller's models only fill in after the built-in fallbacks.
+    const candidates = await this.getWorkspaceNamingCandidates(undefined, callerModels);
+    return generateWorkspaceIdentity(
+      message,
+      candidates,
+      this.aiService,
+      undefined,
+      undefined,
+      abortSignal
+    );
+  }
+
+  private async generateCreationIdentity(
+    request: WorkspaceNameGenerationRequest,
+    signal: AbortSignal,
+    namingAbort: AbortController
+  ): Promise<Result<GenerateWorkspaceIdentityResult, string>> {
+    try {
+      // The form's request this creation hands off, running or finished, answers sooner and
+      // spares a second model call. One creation takes it: two workspaces given one generated
+      // name would collide on the branch.
+      const draftNaming = this.takeDraftNaming(request.draftNamingId);
+      const generated = await raceWithAbortAndTimeout(
+        draftNaming ??
+          this.generatePreCreationIdentity(request.message.trim(), request.candidates, signal),
+        { signal, timeoutMs: WORKSPACE_NAME_GENERATION_TIMEOUT_MS }
+      );
+      if (generated.kind === "timeout") {
+        // Stop the request instead of leaving it running past the deadline. A form request taken
+        // over carries no signal of this creation's and runs to its end.
+        namingAbort.abort();
+        return Err("naming timed out");
+      }
+      if (generated.kind === "aborted") return Err("naming was cancelled");
+      if (!generated.value.success) {
+        return Err(formatNameGenerationError(generated.value.error).message);
+      }
+      return Ok(generated.value.data);
+    } catch (error) {
+      return Err(getErrorMessage(error));
+    }
+  }
+
+  /**
+   * The branch rename of a workspace create() named in the backend, at the one safe point: its
+   * checkout is complete (a running `git checkout` would write HEAD back to the old branch name)
+   * and its init hook has not started. Waits for the naming, honouring the init abort at once,
+   * then renames only the branch: the workspace name, directory and XUM_WORKSPACE_NAME stay the
+   * provisional name. Any failure keeps the provisional branch; the init continues either way.
+   */
+  private async renameBranchAfterCreationNaming(
+    runtime: Runtime,
+    initParams: WorkspaceInitParams,
+    workspaceName: string,
+    naming: CreationNaming,
+    createdBranch: boolean
+  ): Promise<void> {
+    initParams.initLogger.logStep("Naming branch...");
+    // Never throws: the init must run whatever happens to the rename.
+    const renamed = await this.renameCreationBranch(
+      runtime,
+      initParams,
+      workspaceName,
+      naming,
+      createdBranch
+    ).catch((error: unknown) => Err(getErrorMessage(error)));
+    naming.settleBranch();
+    if (renamed.success) {
+      initParams.initLogger.logStdout(`Renamed branch ${initParams.branchName} to ${renamed.data}`);
+      return;
+    }
+    log.warn("Keeping the provisional branch of a new workspace", {
+      workspaceName,
+      branchName: initParams.branchName,
+      reason: renamed.error,
+    });
+    initParams.initLogger.logStdout(`Keeping branch ${initParams.branchName}: ${renamed.error}`);
+  }
+
+  private async renameCreationBranch(
+    runtime: Runtime,
+    initParams: WorkspaceInitParams,
+    workspaceName: string,
+    naming: CreationNaming,
+    createdBranch: boolean
+  ): Promise<Result<string, string>> {
+    // The creation attached to a branch that already existed (another process made it after the
+    // provisional name was picked): that branch is not this workspace's to rename.
+    if (!createdBranch) return Err("the branch existed before this workspace");
+    const waited = await raceWithAbortAndTimeout(naming.outcome, {
+      signal: initParams.abortSignal,
+    });
+    if (waited.kind !== "ok") return Err("workspace setup was cancelled");
+    if (!waited.value.success) return Err(waited.value.error);
+    const generatedBranch = waited.value.data.name;
+    const refusal = refuseGeneratedBranchName(generatedBranch, initParams.branchName);
+    if (refusal !== undefined) return Err(refusal);
+    if (runtime.renameWorkspaceBranch === undefined) {
+      return Err("this runtime cannot rename branches");
+    }
+    const result = await runtime.renameWorkspaceBranch(
+      initParams.projectPath,
+      workspaceName,
+      initParams.branchName,
+      generatedBranch,
+      initParams.trusted
+    );
+    if (!result.success) return Err(result.error.split(/\r?\n/)[0] ?? result.error);
+    return Ok(generatedBranch);
+  }
+
   private async maybeRunPendingAutoTitleFromMessage(
     workspaceId: string,
     message: string
@@ -13846,9 +14252,10 @@ export class WorkspaceService
     // Set while a failure must undo this fork's registration (#4818).
     let rollBackForkRegistration: (() => Promise<CreationRollbackResult>) | undefined;
     try {
-      const sourceMetadataResult = await this.aiService.getWorkspaceMetadata(sourceWorkspaceId);
+      // Admitted first: archiving the source refuses meanwhile, as for any fork in progress.
+      const sourceMetadataResult = await this.readNamedForkSource(sourceWorkspaceId);
       if (!sourceMetadataResult.success) {
-        return Err(`Failed to get source workspace metadata: ${sourceMetadataResult.error}`);
+        return Err(sourceMetadataResult.error);
       }
       const sourceMetadata = sourceMetadataResult.data;
       if (sourceMetadata.kind === "scratch") {

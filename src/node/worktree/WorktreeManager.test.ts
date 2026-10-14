@@ -2087,6 +2087,133 @@ describe("WorktreeManager.renameWorkspace undo (#4779)", () => {
   });
 });
 
+describe("WorktreeManager.renameWorkspaceBranch", () => {
+  const git = (cwd: string, ...args: string[]) =>
+    execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+  const branchExists = (projectPath: string, branch: string) =>
+    git(projectPath, "branch", "--list", branch) !== "";
+
+  async function createProvisionalWorkspace(deferMaterialization: boolean) {
+    const fixture = await createWorktreeManagerFixture();
+    const created = await fixture.manager.createWorkspace({
+      projectPath: fixture.projectPath,
+      branchName: "workspace-3",
+      trunkBranch: "main",
+      skipRemoteSync: true,
+      trusted: true,
+      initLogger: fixture.initLogger,
+      deferMaterialization,
+    });
+    if (!created.success || !created.workspacePath) throw new Error(created.error);
+    git(fixture.projectPath, "config", "branch.workspace-3.remote", "origin");
+    git(fixture.projectPath, "config", "branch.workspace-3.merge", "refs/heads/main");
+    return { ...fixture, workspacePath: created.workspacePath };
+  }
+
+  it.each([
+    { label: "populated", deferMaterialization: false },
+    { label: "reserved with --no-checkout", deferMaterialization: true },
+  ])(
+    "$label: moves the worktree HEAD, the upstream config and the branch deletion uses",
+    async (c) => {
+      const fixture = await createProvisionalWorkspace(c.deferMaterialization);
+      try {
+        const { manager, projectPath, workspacePath } = fixture;
+        const renamed = await manager.renameWorkspaceBranch(
+          projectPath,
+          "workspace-3",
+          "workspace-3",
+          "sidebar-k3m9",
+          true
+        );
+        expect(renamed).toEqual({ success: true });
+        expect(git(workspacePath, "symbolic-ref", "HEAD")).toBe("refs/heads/sidebar-k3m9");
+        expect(git(projectPath, "config", "branch.sidebar-k3m9.remote")).toBe("origin");
+        expect(branchExists(projectPath, "workspace-3")).toBe(false);
+
+        const deleted = await manager.deleteWorkspace(projectPath, "workspace-3", true, true);
+        expect(deleted.success).toBe(true);
+        expect(branchExists(projectPath, "sidebar-k3m9")).toBe(false);
+      } finally {
+        await fixture.cleanup();
+      }
+    },
+    20_000
+  );
+
+  // Each runtime has its own manager, and git moves every renamed branch's reflog through one
+  // temporary file per repository.
+  it("renames the branches of several workspaces at once from separate managers", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    try {
+      const { projectPath } = fixture;
+      const names = Array.from({ length: 6 }, (_, i) => `workspace-${i + 1}`);
+      for (const branchName of names) {
+        const created = await fixture.manager.createWorkspace({
+          projectPath,
+          branchName,
+          trunkBranch: "main",
+          skipRemoteSync: true,
+          trusted: true,
+          initLogger: fixture.initLogger,
+          deferMaterialization: true,
+        });
+        if (!created.success) throw new Error(created.error);
+      }
+      const srcBaseDir = path.join(fixture.rootDir, "src");
+
+      const renamed = await Promise.all(
+        names.map((name) =>
+          new WorktreeManager(srcBaseDir).renameWorkspaceBranch(
+            projectPath,
+            name,
+            name,
+            `${name}-named`,
+            true
+          )
+        )
+      );
+      expect(renamed).toEqual(names.map(() => ({ success: true })));
+
+      // Every rename kept its mapping: deletion finds and removes each renamed branch.
+      for (const name of names) {
+        expect((await fixture.manager.deleteWorkspace(projectPath, name, true, true)).success).toBe(
+          true
+        );
+      }
+      expect(names.filter((name) => branchExists(projectPath, `${name}-named`))).toEqual([]);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 30_000);
+
+  it("refuses an existing target branch and leaves the branch and its record alone", async () => {
+    const fixture = await createProvisionalWorkspace(false);
+    try {
+      const { manager, projectPath, workspacePath } = fixture;
+      git(projectPath, "branch", "sidebar-k3m9");
+
+      const renamed = await manager.renameWorkspaceBranch(
+        projectPath,
+        "workspace-3",
+        "workspace-3",
+        "sidebar-k3m9",
+        true
+      );
+      expect(renamed.success).toBe(false);
+      expect(git(workspacePath, "symbolic-ref", "HEAD")).toBe("refs/heads/workspace-3");
+
+      // Deletion still removes the provisional branch, not the user's branch of the target name.
+      const deleted = await manager.deleteWorkspace(projectPath, "workspace-3", true, true);
+      expect(deleted.success).toBe(true);
+      expect(branchExists(projectPath, "workspace-3")).toBe(false);
+      expect(branchExists(projectPath, "sidebar-k3m9")).toBe(true);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+});
+
 describe("WorktreeManager.deleteWorkspace", () => {
   it("keeps returning declared results and force-deletes when the main checkout is gone", async () => {
     const fixture = await createWorktreeManagerFixture({

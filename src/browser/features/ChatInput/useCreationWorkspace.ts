@@ -69,8 +69,10 @@ import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import {
   getNameFromPersistedState,
   useWorkspaceName,
+  type UseWorkspaceNameReturn,
   type WorkspaceNameState,
 } from "@/browser/hooks/useWorkspaceName";
+import type { WorkspaceNameGenerationRequest } from "@/common/orpc/schemas/api";
 import type { WorkspaceNamePersistedState } from "@/common/orpc/schemas/drafts";
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
@@ -217,6 +219,47 @@ export type RuntimeAvailabilityState =
   | { status: "failed" }
   | { status: "loaded"; data: RuntimeAvailabilityMap };
 
+/** How workspace.create names the workspace, and the name the form showed for it. */
+interface CreationName {
+  branchName?: string;
+  title?: string;
+  nameGeneration?: WorkspaceNameGenerationRequest;
+  submittedName: string;
+  /** Call it when no workspace was created: a handed-off naming goes back to the form. */
+  resumeNaming: () => void;
+}
+
+/**
+ * A worktree workspace opens without waiting for its name (`canHandOff`): the backend names it,
+ * and renames its branch before the init hook runs. Other runtimes create the checkout under the
+ * final name, so they wait for it. Null when there is no name to create under (the hook has set
+ * the error).
+ */
+async function resolveCreationName(
+  canHandOff: boolean,
+  nameState: Pick<UseWorkspaceNameReturn, "handOffGeneration" | "waitForGeneration" | "name">
+): Promise<CreationName | null> {
+  const handOff = canHandOff ? nameState.handOffGeneration() : null;
+  if (handOff) {
+    // The form still shows an older message's name (or none); it is dropped with the draft.
+    return {
+      nameGeneration: handOff.request,
+      submittedName: nameState.name,
+      resumeNaming: handOff.resume,
+    };
+  }
+  const identity = await nameState.waitForGeneration();
+  if (!identity) return null;
+  const normalizedTitle = typeof identity.title === "string" ? identity.title.trim() : "";
+  return {
+    branchName: identity.name,
+    title: normalizedTitle || undefined,
+    submittedName: identity.name,
+    // The form kept its name: nothing to resume.
+    resumeNaming: () => undefined,
+  };
+}
+
 /** True for a real (non-blank) creation draft ID. */
 function isDraftId(draftId: string | null | undefined): draftId is string {
   return typeof draftId === "string" && draftId.trim().length > 0;
@@ -346,7 +389,7 @@ export function useCreationWorkspace({
   });
 
   // Destructure name state functions for use in callbacks
-  const { waitForGeneration } = workspaceNameState;
+  const { waitForGeneration, handOffGeneration, name: shownWorkspaceName } = workspaceNameState;
 
   // The project whose runtimes are shown. Only a new project shows the runtimes as "loading"
   // again: a new client (reconnect) reloads the same project behind the shown values.
@@ -483,19 +526,10 @@ export function useCreationWorkspace({
       setToast(null);
 
       let createdWorkspaceId: string | null = null;
+      // Until the name is resolved, nothing has been handed off.
+      let resumeNaming: CreationName["resumeNaming"] = () => undefined;
 
       try {
-        // Wait for identity generation to complete (blocks if still in progress)
-        // Returns null if generation failed or manual name is empty (error already set in hook)
-        const identity = await waitForGeneration();
-        if (!identity) {
-          setIsSending(false);
-          return { success: false };
-        }
-
-        const normalizedTitle = typeof identity.title === "string" ? identity.title.trim() : "";
-        const createTitle = normalizedTitle || undefined;
-
         // Read send options at send time: render state can lag a pick made just
         // before sending.
         // Override agentId from current draft settings so first-send uses the same
@@ -573,19 +607,36 @@ export function useCreationWorkspace({
           // Trust was confirmed and set, continue with creation
         }
 
+        // Wait for identity generation to complete (blocks if still in progress), unless a
+        // worktree creation hands it to the backend. After the preflights, so that a hand-off
+        // reaches a create request.
+        // Returns null if generation failed or manual name is empty (error already set in hook)
+        const creationName = await resolveCreationName(
+          kind !== "scratch" && runtimeSelection.mode === RUNTIME_MODE.WORKTREE,
+          { handOffGeneration, waitForGeneration, name: shownWorkspaceName }
+        );
+        if (!creationName) {
+          setIsSending(false);
+          return { success: false };
+        }
+        resumeNaming = creationName.resumeNaming;
+        const createTitle = creationName.title;
+
         const createResult =
           kind === "scratch"
             ? await liveApi.workspace.createScratch({ title: createTitle })
             : await liveApi.workspace.create({
                 projectPath,
-                branchName: identity.name,
+                branchName: creationName.branchName,
                 trunkBranch: settings.trunkBranch,
                 title: createTitle,
                 runtimeConfig,
                 subProjectPath: subProjectPath ?? undefined,
+                nameGeneration: creationName.nameGeneration,
               });
 
         if (!createResult.success) {
+          resumeNaming();
           setToast({
             id: Date.now().toString(),
             type: "error",
@@ -598,7 +649,7 @@ export function useCreationWorkspace({
         const { metadata } = createResult;
         createdWorkspaceId = metadata.id;
         // Captured now: the form's name state can change while the rest of this send runs.
-        const submittedName = identity.name;
+        const { submittedName } = creationName;
 
         // Best-effort: persist the initial AI settings to the backend immediately so this workspace
         // is portable across devices even before the first stream starts. Initial /goal commands do
@@ -939,6 +990,8 @@ export function useCreationWorkspace({
       } catch (err) {
         if (createdWorkspaceId) {
           workspaceStore.clearPendingInitialSendState(createdWorkspaceId);
+        } else {
+          resumeNaming();
         }
         const errorMessage = getErrorMessage(err);
         setToast({
@@ -972,6 +1025,8 @@ export function useCreationWorkspace({
       settings.reasoningMode,
       settings.trunkBranch,
       waitForGeneration,
+      handOffGeneration,
+      shownWorkspaceName,
       workspaceNameState.autoGenerate,
       message,
       subProjectPath,
