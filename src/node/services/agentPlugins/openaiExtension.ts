@@ -121,15 +121,31 @@ const UNSAFE_TEXT =
   // eslint-disable-next-line no-control-regex -- the control characters are the point
   /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029\p{Cf}]/u;
 /**
- * The Cf characters normal text needs, removed before the UNSAFE_TEXT test: ZWNJ (U+200C) and
- * ZWJ (U+200D) shape Persian and Indic spelling and join emoji sequences, and the tag characters
- * (U+E0020-U+E007F) spell subdivision flag emoji. OpenAI names no exact list, but calls only
- * "unsupported" formatting characters invalid. A class subtraction (`v` flag) needs ES2024, and
- * the build targets ES2020.
+ * The Cf characters normal text needs, removed before the UNSAFE_TEXT test, but only inside the
+ * sequences that need them. Anywhere else they are invisible and can spoof a name or fake a blank
+ * label (Codex PRRT_kwDOPxxmWM6sQExO). OpenAI names no exact list, but calls only "unsupported"
+ * formatting characters invalid.
+ * - ZWJ (U+200D) between emoji (after an optional skin tone or VS16), as in 👩‍💻.
+ * - ZWNJ (U+200C) after a non-Latin letter and before a letter, as in Persian and Indic spelling.
+ * - Tag characters (U+E0020-U+E007F) in a subdivision flag: U+1F3F4, tags, then U+E007F.
  */
-const ALLOWED_FORMAT = /\u200c|\u200d|[\u{e0020}-\u{e007f}]/gu;
+// Capture groups, not lookbehind: Bun's engine (JavaScriptCore) fails a lookbehind that holds a
+// `\p{...}` escape, so the tests would not match the Node/Electron runtime.
+const ALLOWED_FORMAT_SEQUENCES: ReadonlyArray<[RegExp, string]> = [
+  [
+    /(\p{Extended_Pictographic}(?:[\u{1f3fb}-\u{1f3ff}]|\ufe0f)?)\u200d(?=\p{Extended_Pictographic})/gu,
+    "$1",
+  ],
+  [/([^\P{L}\p{Script=Latin}]\p{M}*)\u200c(?=\p{L})/gu, "$1"],
+  [/\u{1f3f4}[\u{e0020}-\u{e007e}]+\u{e007f}/gu, "\u{1f3f4}"],
+];
 const hasUnsafeText = (value: string): boolean =>
-  UNSAFE_TEXT.test(value.replace(ALLOWED_FORMAT, ""));
+  UNSAFE_TEXT.test(
+    ALLOWED_FORMAT_SEQUENCES.reduce(
+      (text, [sequence, replacement]) => text.replace(sequence, replacement),
+      value
+    )
+  );
 const isText = (value: unknown, max: number, multiline = false): value is string =>
   typeof value === "string" &&
   value.length <= max &&

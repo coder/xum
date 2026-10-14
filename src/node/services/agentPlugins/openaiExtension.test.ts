@@ -157,9 +157,20 @@ describe("readOpenAIExtension", () => {
       expect(result.warnings).toEqual([]);
       expect(result.extension?.interface?.displayName).toBe(good);
     }
-    for (const bad of ["Fig\u200bma", "Example\u202eelgooG"]) {
+    // Outside those sequences they are invisible spoofing tools (Codex PRRT_kwDOPxxmWM6sQExO).
+    for (const bad of [
+      "Fig\u200bma",
+      "Example\u202eelgooG",
+      "Fig\u200dma",
+      "Fig\u200cma",
+      "\u200c\u0645\u06cc",
+      "Fig\u{e0067}ma",
+      "\u{1f3f4}\u{e0067}\u{e0062}",
+    ]) {
       expect(read({ ...validInterface, developerName: bad }).extension).toEqual({});
     }
+    const blank = read({ ...validInterface, capabilities: ["Search", "\u200d"] });
+    expect(blank.extension?.interface).toEqual(validInterface);
   });
 
   test("a blank capability drops the capability list with a warning", () => {
