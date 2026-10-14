@@ -54,7 +54,10 @@ import {
   resolveWorkspaceCreationScope,
   type WorkspaceCreationScope,
 } from "@/common/utils/subProjects";
-import { carryCreationAiSettings, handOffCreationRuntime } from "@/browser/utils/creationDraftCarry";
+import {
+  carryCreationAiSettings,
+  handOffCreationRuntime,
+} from "@/browser/utils/creationDraftCarry";
 import {
   defaultCreationDraftScope,
   getDraftStore,
@@ -278,7 +281,7 @@ export interface WorkspaceDraftMove {
   /** The source's owning project. */
   projectPath: string;
   /** The source's listed draft, or null for the project's default creation draft. */
-  draftId: string | null;
+  draftId?: string | null;
   /** The project selector's value: a project, a sub-project, or SCRATCH_PROJECT_CONFIG_KEY. */
   destination: string;
   /** Carried only between projects (Scratch has no runtime). */
@@ -298,6 +301,74 @@ function moveCreationDraftBody(
     .moveDraft(from.scope, { kind: "creation", projectPath: to.projectPath, draftId: to.draftId })
     .catch(() => undefined);
   migrateWorkspaceStorage(from.storageScopeId, getDraftScopeId(to.projectPath, to.draftId));
+}
+
+/** The DraftStore scope and the name storage scope of a creation composer's draft. */
+function creationDraftSource(projectPath: string, draftId: string | null | undefined) {
+  return draftId != null
+    ? {
+        scope: { kind: "creation", projectPath, draftId } satisfies DraftStoreScope,
+        storageScopeId: getDraftScopeId(projectPath, draftId),
+      }
+    : {
+        scope: defaultCreationDraftScope(projectPath),
+        storageScopeId: getPendingScopeId(projectPath),
+      };
+}
+
+function findListedDraft(
+  projectPath: string,
+  draftId: string | null | undefined
+): WorkspaceDraft | undefined {
+  if (draftId == null) return undefined;
+  const drafts = getDraftStore().getCreationDraftsByProject()[projectPath] ?? [];
+  return drafts.find((draft) => draft.draftId === draftId);
+}
+
+function setListedDraftSubProject(
+  projectPath: string,
+  draftId: string,
+  listed: WorkspaceDraft | undefined,
+  subProjectPath: string | null
+): void {
+  if (listed?.subProjectPath === subProjectPath) return;
+  getDraftStore().putCreationDraft(projectPath, {
+    draftId,
+    subProjectPath,
+    createdAt: listed?.createdAt ?? Date.now(),
+  });
+}
+
+/** Lists the moved draft (or, within its owning project, changes its sub-project) and moves it. */
+function applyWorkspaceDraftMove(
+  move: WorkspaceDraftMove,
+  dest: WorkspaceCreationScope
+): { draftId: string; sourceEmpty: boolean } {
+  const listed = findListedDraft(move.projectPath, move.draftId);
+  // A sub-project switch inside the owning project keeps the same draft: the composer is keyed
+  // by the owner and draft, so it stays mounted with everything it shows.
+  if (move.draftId != null && dest.projectPath === move.projectPath) {
+    setListedDraftSubProject(move.projectPath, move.draftId, listed, dest.subProjectPath);
+    return { draftId: move.draftId, sourceEmpty: false };
+  }
+
+  const draftId = createDraftId();
+  getDraftStore().putCreationDraft(dest.projectPath, {
+    draftId,
+    subProjectPath: dest.subProjectPath,
+    createdAt: listed?.createdAt ?? Date.now(),
+  });
+  const source = creationDraftSource(move.projectPath, move.draftId);
+  const sourceView = getDraftStore().getView(source.scope);
+  moveCreationDraftBody(source, { projectPath: dest.projectPath, draftId });
+  carryCreationAiSettings(move.projectPath, dest.projectPath);
+  handOffCreationRuntime({
+    sourceProjectPath: move.projectPath,
+    destProjectPath: dest.projectPath,
+    draftScopeId: getDraftScopeId(dest.projectPath, draftId),
+    runtime: move.runtimePick,
+  });
+  return { draftId, sourceEmpty: sourceView.text.length === 0 && sourceView.attachmentCount === 0 };
 }
 
 const WorkspaceActionsContext = createContext<
@@ -1849,67 +1920,13 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
 
   const moveWorkspaceDraft = useCallback(
     (move: WorkspaceDraftMove) => {
-      const source = move.projectPath;
       const dest = resolveWorkspaceCreationScope(move.destination, userProjects);
-      const listed =
-        move.draftId != null
-          ? (getDraftStore().getCreationDraftsByProject()[source] ?? []).find(
-              (draft) => draft.draftId === move.draftId
-            )
-          : undefined;
-
-      // A sub-project switch inside the owning project keeps the same draft: the composer is
-      // keyed by the owner and draft, so it stays mounted with everything it shows.
-      if (move.draftId != null && dest.projectPath === source) {
-        if (listed?.subProjectPath !== dest.subProjectPath) {
-          getDraftStore().putCreationDraft(source, {
-            draftId: move.draftId,
-            subProjectPath: dest.subProjectPath,
-            createdAt: listed?.createdAt ?? Date.now(),
-          });
-        }
-        navigateToProject(source, move.draftId, { replace: true });
-        return;
-      }
-
-      const draftId = createDraftId();
-      getDraftStore().putCreationDraft(dest.projectPath, {
-        draftId,
-        subProjectPath: dest.subProjectPath,
-        createdAt: listed?.createdAt ?? Date.now(),
-      });
-      const sourceScope: DraftStoreScope =
-        move.draftId != null
-          ? { kind: "creation", projectPath: source, draftId: move.draftId }
-          : defaultCreationDraftScope(source);
-      const sourceView = getDraftStore().getView(sourceScope);
-      moveCreationDraftBody(
-        {
-          scope: sourceScope,
-          storageScopeId:
-            move.draftId != null
-              ? getDraftScopeId(source, move.draftId)
-              : getPendingScopeId(source),
-        },
-        { projectPath: dest.projectPath, draftId }
-      );
+      const moved = applyWorkspaceDraftMove(move, dest);
       // moveDraft leaves an empty source alone, but its list entry must not stay behind.
-      if (
-        move.draftId != null &&
-        sourceView.text.length === 0 &&
-        sourceView.attachmentCount === 0
-      ) {
-        deleteWorkspaceDraft(source, move.draftId);
+      if (moved.sourceEmpty && move.draftId != null) {
+        deleteWorkspaceDraft(move.projectPath, move.draftId);
       }
-      carryCreationAiSettings(source, dest.projectPath);
-      if (
-        move.runtimePick != null &&
-        source !== SCRATCH_PROJECT_CONFIG_KEY &&
-        dest.projectPath !== SCRATCH_PROJECT_CONFIG_KEY
-      ) {
-        handOffCreationRuntime(getDraftScopeId(dest.projectPath, draftId), move.runtimePick);
-      }
-      navigateToProject(dest.projectPath, draftId, { replace: true });
+      navigateToProject(dest.projectPath, moved.draftId, { replace: true });
     },
     [userProjects, navigateToProject, deleteWorkspaceDraft]
   );

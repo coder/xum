@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useEffect, useRef, useCallback } from "react";
 import { useReasoningMode } from "./useReasoningMode";
 import { useThinkingLevel } from "./useThinkingLevel";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
@@ -12,10 +12,7 @@ import {
   CODER_RUNTIME_PLACEHOLDER,
 } from "@/common/types/runtime";
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
-import {
-  clearCreationRuntimeHandOff,
-  peekCreationRuntimeHandOff,
-} from "@/browser/utils/creationDraftCarry";
+import { useCreationRuntimePick } from "./useCreationRuntimePick";
 import {
   readOptionField,
   readSshOptionDefaults,
@@ -214,7 +211,7 @@ export function useDraftWorkspaceSettings(
   branches: string[],
   recommendedTrunk: string | null,
   /** The draft's storage scope: a moved draft's runtime pick is handed off under it. */
-  draftScopeId: string | null = null
+  draftScopeId?: string | null
 ): {
   settings: DraftWorkspaceSettings;
   /** The runtime the user picked in this composer, or null while it follows the defaults. */
@@ -411,19 +408,12 @@ export function useDraftWorkspaceSettings(
 
   // Currently selected runtime for this session. Until the user or a Settings change picks
   // one it follows the defaults (derived below), so options that load after mount apply.
-  // `explicit` marks a user pick (not a Settings default change), the only kind a moved draft
-  // carries to another project.
-  const [runtimePick, setSelectedRuntimeState] = useState<{
-    runtime: ParsedRuntime;
-    explicit: boolean;
-  } | null>(() => {
-    const handedOff = peekCreationRuntimeHandOff(draftScopeId);
-    return handedOff != null ? { runtime: handedOff, explicit: true } : null;
-  });
-  // Cleared after mount, not in the initializer: StrictMode runs initializers twice.
-  useEffect(() => {
-    if (draftScopeId != null) clearCreationRuntimeHandOff(draftScopeId);
-  }, [draftScopeId]);
+  const {
+    runtime: runtimePick,
+    explicitRuntime: explicitRuntimePick,
+    setRuntime: setRuntimePickState,
+    setExplicit: setRuntimePickExplicit,
+  } = useCreationRuntimePick(draftScopeId);
 
   // Project changes remount ChatInput (key includes projectPath), so this effect only handles
   // live Settings updates to the default runtime while staying on the same project.
@@ -434,18 +424,20 @@ export function useDraftWorkspaceSettings(
     }
 
     appliedDefaultRuntimeChoiceRef.current = settingsDefaultRuntime;
-    setSelectedRuntimeState({
-      runtime: buildRuntimeForMode(
+    setRuntimePickState(
+      buildRuntimeForMode(
         defaultRuntimeMode,
         { host: defaultSshHost, coder: defaultSshCoder },
         defaultDockerImage,
         lastShareCredentials,
         defaultDevcontainerConfigPath,
         lastDevcontainerShareCredentials
-      ),
-      explicit: false,
-    });
+      )
+    );
+    setRuntimePickExplicit(false);
   }, [
+    setRuntimePickState,
+    setRuntimePickExplicit,
     settingsDefaultRuntime,
     defaultRuntimeMode,
     defaultSshHost,
@@ -469,7 +461,7 @@ export function useDraftWorkspaceSettings(
     defaultDevcontainerConfigPath,
     lastDevcontainerShareCredentials
   );
-  const selectedRuntime = runtimePick?.runtime ?? defaultRuntime;
+  const selectedRuntime = runtimePick ?? defaultRuntime;
 
   const lastSshHost = lastSsh.host;
   const lastSshCoder = lastSsh.coder;
@@ -487,7 +479,8 @@ export function useDraftWorkspaceSettings(
       devcontainerShareCredentials: lastDevcontainerShareCredentials,
     });
 
-    setSelectedRuntimeState({ runtime: mergedRuntime, explicit: true });
+    setRuntimePickState(mergedRuntime);
+    setRuntimePickExplicit(true);
 
     // Persist host/image/coder so they're remembered when switching modes.
     // Avoid wiping the remembered value when the UI switches modes with an empty field.
@@ -534,7 +527,7 @@ export function useDraftWorkspaceSettings(
       defaultRuntimeMode: defaultRuntimeChoice,
       trunkBranch,
     },
-    explicitRuntimePick: runtimePick?.explicit === true ? runtimePick.runtime : null,
+    explicitRuntimePick,
     coderConfigFallback,
     sshHostFallback,
     setSelectedRuntime,

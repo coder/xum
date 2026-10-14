@@ -456,6 +456,17 @@ export function dropPendingModelPicks(shouldDrop: (model: string) => boolean): v
   notify();
 }
 
+/** Forgets a scope's unsent picks, of every agent. */
+function dropPendingPicks(scopeId: string): void {
+  const prefix = `${scopeId}\u0000`;
+  for (const picks of [pendingByScope, pendingAutoRoutingByScope]) {
+    for (const key of [...picks.keys()]) {
+      if (key.startsWith(prefix)) picks.delete(key);
+    }
+  }
+  pendingAgentByWorkspace.delete(scopeId);
+}
+
 /**
  * A fork starts from what the source composer shows, including its unsent picks. Taken before
  * the fork runs: a source send meanwhile ends the picks the user forked with. The source's picks
@@ -474,13 +485,7 @@ export function snapshotPendingAiSelection(
   const autoPicks = bySourceAgent(pendingAutoRoutingByScope);
   const agentPick = pendingAgentByWorkspace.get(sourceWorkspaceId);
   return (destWorkspaceId) => {
-    const destPrefix = `${destWorkspaceId}\u0000`;
-    for (const picks of [pendingByScope, pendingAutoRoutingByScope]) {
-      for (const key of [...picks.keys()]) {
-        if (key.startsWith(destPrefix)) picks.delete(key);
-      }
-    }
-    pendingAgentByWorkspace.delete(destWorkspaceId);
+    dropPendingPicks(destWorkspaceId);
     for (const [agentId, pending] of fieldPicks) {
       pendingByScope.set(scopeKey(destWorkspaceId, agentId), pending);
     }

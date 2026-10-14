@@ -200,6 +200,24 @@ export function getDisplayTitleFromPersistedState(state: unknown): string {
  * but allows manual override. If the user clears the manual name,
  * auto-generation resumes.
  */
+/**
+ * A request that settles after unmount must not write its scope's state: a draft moved to another
+ * project migrates that state away, and the write would leave a name behind there.
+ */
+function storeGeneratedIdentity(
+  mountedRef: { current: boolean },
+  setStored: (update: (prev: WorkspaceNamePersistedState) => WorkspaceNamePersistedState) => void,
+  identity: WorkspaceIdentity,
+  forMessage: string
+): void {
+  if (!mountedRef.current) return;
+  setStored((prev) => ({
+    ...prev,
+    generatedIdentity: identity,
+    lastGeneratedFor: toStoredMessage(forMessage),
+  }));
+}
+
 export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspaceNameReturn {
   const { message, debounceMs = 500, userModel, scopeId } = options;
   const { api } = useAPI();
@@ -279,8 +297,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     setError(null);
   }, [persistedKey, cancelPendingGeneration]);
 
-  // A request that settles after unmount must not write its scope's state: a draft moved to
-  // another project migrates that state away, and the write would leave a name behind there.
+  // Read by storeGeneratedIdentity.
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -296,14 +313,8 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
       }
 
       const requestId = ++requestIdRef.current;
-      const storeIdentity = (identity: WorkspaceIdentity) => {
-        if (!mountedRef.current) return;
-        setStored((prev) => ({
-          ...prev,
-          generatedIdentity: identity,
-          lastGeneratedFor: toStoredMessage(forMessage),
-        }));
-      };
+      const storeIdentity = (identity: WorkspaceIdentity) =>
+        storeGeneratedIdentity(mountedRef, setStored, identity, forMessage);
       setIsGenerating(true);
       setError(null);
 

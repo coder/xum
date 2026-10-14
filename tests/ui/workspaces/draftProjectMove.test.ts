@@ -26,11 +26,7 @@ import {
   setupTestDom,
 } from "../helpers";
 import { renderApp, type RenderedApp } from "../renderReviewPanel";
-import {
-  defaultCreationDraftScope,
-  getDraftStore,
-  type DraftStoreScope,
-} from "@/browser/stores/DraftStore";
+import { defaultCreationDraftScope, getDraftStore } from "@/browser/stores/DraftStore";
 import { setAutoRoutingPick } from "@/browser/utils/aiSelectionIntent";
 import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import { getAutoRouting, getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
@@ -55,8 +51,8 @@ const ATTACHMENT = {
   filename: "moved.txt",
 };
 
-function creationScope(projectPath: string, draftId: string): DraftStoreScope {
-  return { kind: "creation", projectPath, draftId };
+function creationScope(projectPath: string, draftId: string) {
+  return { kind: "creation" as const, projectPath, draftId };
 }
 
 function textareaValue(container: HTMLElement): string | undefined {
@@ -227,7 +223,7 @@ describeIntegration("Creation project selector moves the draft", () => {
     const namingReleased = new Promise<void>((resolve) => {
       releaseNaming = resolve;
     });
-    const namingCalls: Array<Promise<unknown>> = [];
+    const namingCalls: Promise<unknown>[] = [];
     const namingSpy = jest
       .spyOn(workspaceService, "getWorkspaceNamingCandidates")
       .mockImplementation((...args) => {

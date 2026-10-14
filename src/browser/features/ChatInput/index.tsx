@@ -505,11 +505,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     setToast(null);
   };
 
+  const creationPendingDraftId =
+    variant === "creation" ? (props.pendingDraftId ?? undefined) : undefined;
   const draft = useComposerDraft({
     variant,
     workspaceId,
     creationProjectPath: creationParentProjectPath,
-    pendingDraftId: variant === "creation" ? (props.pendingDraftId ?? undefined) : undefined,
+    pendingDraftId: creationPendingDraftId,
     attachedReviews: variant === "workspace" ? (props.attachedReviews ?? []) : [],
     pushToast,
   });
@@ -895,15 +897,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   });
 
   // The project selector moves the draft being edited instead of opening the destination's own.
-  const moveCreationDraft = (destination: string) => {
-    if (props.variant !== "creation") return;
+  const moveCreationDraft = (destination: string) =>
     moveWorkspaceDraft({
       projectPath: creationParentProjectPath,
-      draftId: props.pendingDraftId ?? null,
+      draftId: creationPendingDraftId,
       destination,
       runtimePick: creationState.explicitRuntimePick,
     });
-  };
 
   const creationRuntimeError =
     variant === "creation" && props.kind !== "scratch"
