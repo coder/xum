@@ -2141,6 +2141,52 @@ describe("WorktreeManager.renameWorkspaceBranch", () => {
     20_000
   );
 
+  // Each runtime has its own manager, and git moves every renamed branch's reflog through one
+  // temporary file per repository.
+  it("renames the branches of several workspaces at once from separate managers", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    try {
+      const { projectPath } = fixture;
+      const names = Array.from({ length: 6 }, (_, i) => `workspace-${i + 1}`);
+      for (const branchName of names) {
+        const created = await fixture.manager.createWorkspace({
+          projectPath,
+          branchName,
+          trunkBranch: "main",
+          skipRemoteSync: true,
+          trusted: true,
+          initLogger: fixture.initLogger,
+          deferMaterialization: true,
+        });
+        if (!created.success) throw new Error(created.error);
+      }
+      const srcBaseDir = path.join(fixture.rootDir, "src");
+
+      const renamed = await Promise.all(
+        names.map((name) =>
+          new WorktreeManager(srcBaseDir).renameWorkspaceBranch(
+            projectPath,
+            name,
+            name,
+            `${name}-named`,
+            true
+          )
+        )
+      );
+      expect(renamed).toEqual(names.map(() => ({ success: true })));
+
+      // Every rename kept its mapping: deletion finds and removes each renamed branch.
+      for (const name of names) {
+        expect((await fixture.manager.deleteWorkspace(projectPath, name, true, true)).success).toBe(
+          true
+        );
+      }
+      expect(names.filter((name) => branchExists(projectPath, `${name}-named`))).toEqual([]);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 30_000);
+
   it("refuses an existing target branch and leaves the branch and its record alone", async () => {
     const fixture = await createProvisionalWorkspace(false);
     try {

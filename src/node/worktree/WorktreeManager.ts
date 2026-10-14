@@ -9,6 +9,7 @@ import type {
   InitLogger,
 } from "@/node/runtime/Runtime";
 import { listLocalBranches, cleanStaleLock, getCurrentBranch } from "@/node/git";
+import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { execAsync, execFileAsync, type ExecFileAsyncOptions } from "@/node/utils/disposableExec";
 import { getBashPath } from "@/node/utils/main/bashPath";
 import { getProjectName } from "@/node/utils/runtime/helpers";
@@ -51,6 +52,15 @@ const UNSET_PATH_KEY = "\u0000unset";
 
 /** What a deferred origin sync's notes report when it leaves the reserved branch alone. */
 const DEFERRED_SYNC_FALLBACK = "keeping the branch at its current commit";
+
+/**
+ * Per repository; module-level because each runtime constructs its own manager. Serializes
+ * rewrites of the workspace branch map, which is written whole, and `git branch -m`, which moves
+ * a branch's reflog through one fixed temporary file (logs/refs/.tmp-renamed-log): two at once
+ * drop a mapping or fail one rename. Worktree creations named in the backend rename their branch
+ * as soon as their checkout is done, so their renames can meet.
+ */
+const branchRefLocks = new MutexMap<string>();
 
 interface OriginSyncParams {
   projectPath: string;
@@ -902,12 +912,14 @@ export class WorktreeManager {
       let renamedBranchName = originalBranchName;
       if (options?.renameBranch ?? originalBranchName === oldName) {
         try {
-          using branchProc = execFileAsync(
-            "git",
-            ["-C", newPath, "branch", "-m", oldName, newName],
-            noHooksEnv
-          );
-          await branchProc.result;
+          await branchRefLocks.withLock(projectPath, async () => {
+            using branchProc = execFileAsync(
+              "git",
+              ["-C", newPath, "branch", "-m", oldName, newName],
+              noHooksEnv
+            );
+            await branchProc.result;
+          });
           renamedBranchName = newName;
         } catch {
           // Branch rename failed - this is fine, the directory was still moved.
@@ -930,7 +942,10 @@ export class WorktreeManager {
    * Rename only the branch of a workspace, leaving its directory and name alone. `git branch -m`
    * also moves the HEAD of the linked worktree that has the branch checked out and its
    * `branch.<name>.*` config. It refuses an existing target branch. Deletion finds the branch
-   * through the persisted mapping, so a failed mapping write renames the branch back.
+   * through the persisted mapping, so the mapping moves first and moves back if the rename
+   * fails. A crash between the two then leaves the mapping on the new name, which no branch has,
+   * rather than on the provisional one, which a later branch could take and deletion would
+   * then remove.
    */
   async renameWorkspaceBranch(
     projectPath: string,
@@ -946,33 +961,32 @@ export class WorktreeManager {
     } catch (error) {
       return { success: false, error: getErrorMessage(error) };
     }
-    const renameBranch = async (from: string, to: string) => {
-      using branchProc = execFileAsync(
-        "git",
-        ["-C", projectPath, "branch", "-m", from, to],
-        noHooksEnv
-      );
-      await branchProc.result;
-    };
     try {
-      await renameBranch(oldBranchName, newBranchName);
+      await this.persistWorkspaceBranchMapping(projectPath, workspaceName, newBranchName);
     } catch (error) {
       return { success: false, error: getErrorMessage(error) };
     }
     try {
-      await this.persistWorkspaceBranchMapping(projectPath, workspaceName, newBranchName);
+      await branchRefLocks.withLock(projectPath, async () => {
+        using branchProc = execFileAsync(
+          "git",
+          ["-C", projectPath, "branch", "-m", oldBranchName, newBranchName],
+          noHooksEnv
+        );
+        await branchProc.result;
+      });
       return { success: true };
     } catch (error) {
-      const mappingError = getErrorMessage(error);
+      const renameError = getErrorMessage(error);
       try {
-        await renameBranch(newBranchName, oldBranchName);
+        await this.persistWorkspaceBranchMapping(projectPath, workspaceName, oldBranchName);
       } catch (revertError) {
         return {
           success: false,
-          error: `${mappingError} (renaming the branch back to ${oldBranchName} failed: ${getErrorMessage(revertError)})`,
+          error: `${renameError} (restoring the branch mapping to ${oldBranchName} failed: ${getErrorMessage(revertError)})`,
         };
       }
-      return { success: false, error: mappingError };
+      return { success: false, error: renameError };
     }
   }
 
@@ -1257,9 +1271,11 @@ export class WorktreeManager {
   ): Promise<void> {
     // Divergent workspace and branch names rely on this mapping for safe stale-worktree
     // cleanup, so callers must see persistence failures instead of silently proceeding.
-    const branchMap = await this.readWorkspaceBranchMap(projectPath);
-    branchMap[workspaceName] = branchName;
-    await this.writeWorkspaceBranchMap(projectPath, branchMap);
+    await branchRefLocks.withLock(projectPath, async () => {
+      const branchMap = await this.readWorkspaceBranchMap(projectPath);
+      branchMap[workspaceName] = branchName;
+      await this.writeWorkspaceBranchMap(projectPath, branchMap);
+    });
   }
 
   private async updateWorkspaceBranchMapping(
@@ -1270,13 +1286,15 @@ export class WorktreeManager {
   ): Promise<void> {
     // Rename can leave the branch name different from the workspace directory, so keep the
     // mapping update on the main control path rather than silently ignoring write failures.
-    const branchMap = await this.readWorkspaceBranchMap(projectPath);
-    const resolvedBranchName = branchName?.trim() ?? branchMap[oldWorkspaceName]?.trim();
-    delete branchMap[oldWorkspaceName];
-    if (resolvedBranchName) {
-      branchMap[newWorkspaceName] = resolvedBranchName;
-    }
-    await this.writeWorkspaceBranchMap(projectPath, branchMap);
+    await branchRefLocks.withLock(projectPath, async () => {
+      const branchMap = await this.readWorkspaceBranchMap(projectPath);
+      const resolvedBranchName = branchName?.trim() ?? branchMap[oldWorkspaceName]?.trim();
+      delete branchMap[oldWorkspaceName];
+      if (resolvedBranchName) {
+        branchMap[newWorkspaceName] = resolvedBranchName;
+      }
+      await this.writeWorkspaceBranchMap(projectPath, branchMap);
+    });
   }
 
   private async getPersistedWorkspaceBranchName(
@@ -1292,12 +1310,14 @@ export class WorktreeManager {
     workspaceName: string
   ): Promise<void> {
     try {
-      const branchMap = await this.readWorkspaceBranchMap(projectPath);
-      if (!(workspaceName in branchMap)) {
-        return;
-      }
-      delete branchMap[workspaceName];
-      await this.writeWorkspaceBranchMap(projectPath, branchMap);
+      await branchRefLocks.withLock(projectPath, async () => {
+        const branchMap = await this.readWorkspaceBranchMap(projectPath);
+        if (!(workspaceName in branchMap)) {
+          return;
+        }
+        delete branchMap[workspaceName];
+        await this.writeWorkspaceBranchMap(projectPath, branchMap);
+      });
     } catch (error) {
       log.debug("Failed to delete workspace branch mapping", {
         projectPath,
