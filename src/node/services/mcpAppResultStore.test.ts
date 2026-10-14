@@ -379,6 +379,19 @@ describe("McpAppResultStore widget state", () => {
     expect(after.widgetState).toEqual({ n: 1 });
   });
 
+  test("a write keeps the record's age, so pruning still drops the oldest record", async () => {
+    using tmp = new DisposableTempDir("mcp-app-widget-state");
+    const store = new McpAppResultStore(sessionDirIn(tmp));
+    await store.record("ws", entry("c1"));
+    const record = await store.get("ws", "c1");
+    if (!record) throw new Error("expected the record");
+    const dir = path.join(tmp.path, "ws", MCP_APP_RESULT_DIR);
+    const [name] = await fs.readdir(dir);
+    await fs.utimes(path.join(dir, name), 1, 1);
+    await store.setWidgetState("ws", "c1", mcpAppWidgetStateBindingOf(record), { n: 1 });
+    expect((await fs.stat(path.join(dir, name))).mtimeMs).toBe(1000);
+  });
+
   test("refuses state over the cap, and a missing record", async () => {
     using tmp = new DisposableTempDir("mcp-app-widget-state");
     const store = new McpAppResultStore(sessionDirIn(tmp));

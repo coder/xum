@@ -247,7 +247,11 @@ export class McpAppResultStore {
       const { widgetState: _previous, ...rest } = read.raw;
       const file =
         stateJson === null ? rest : { ...rest, widgetState: JSON.parse(stateJson) as unknown };
+      // The record keeps its age: prune() drops the oldest file first, and a view in use must
+      // not push a newer view's record out.
+      const { atime, mtime } = await fs.stat(filePath);
       await writeFileAtomic(filePath, JSON.stringify(file));
+      await fs.utimes(filePath, atime, mtime);
       const { widgetState: _old, ...known } = read.record;
       // Parsed back from its JSON, so memory holds exactly what the file holds.
       return stateJson === null ? known : { ...known, widgetState: file.widgetState };

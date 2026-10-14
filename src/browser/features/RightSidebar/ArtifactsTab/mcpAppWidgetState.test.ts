@@ -106,6 +106,20 @@ describe("MCP App widget state", () => {
     expect(writes).toHaveLength(1);
   });
 
+  test("a write lost to a dropped connection is sent again with the next client", async () => {
+    const target = mcpAppWidgetStateTarget("ws-dropped", "c1", loadedView("r10"));
+    const dropped = createTestApiClient({
+      mcpApps: { setWidgetState: () => Promise.reject(new Error("connection lost")) },
+    });
+    saveMcpAppWidgetState(dropped, target, { n: 7 });
+    await flush();
+    const { api, writes } = deferredApi();
+    flushOfflineMcpAppWidgetStates(api);
+    await flush();
+    expect(writes.map((w) => w.state)).toEqual([{ n: 7 }]);
+    writes[0].settle(true);
+  });
+
   test("a view without a result record has no state to keep", () => {
     const { api, writes } = deferredApi();
     const target = mcpAppWidgetStateTarget("ws-none", "c1", loadedView(null));

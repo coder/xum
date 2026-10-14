@@ -124,7 +124,11 @@ async function writeQueued(
       });
       if (!result.success) console.debug("[MCP Apps] widget state not stored:", result.error);
     } catch (error) {
+      // The connection dropped (a refusal above is final): keep the state for the next client,
+      // unless a newer state is already waiting or kept.
       console.debug("[MCP Apps] widget state not stored:", getErrorMessage(error));
+      if (queue.next === null && !offline.has(key))
+        offline.set(key, { target, state: write.state });
     }
     write = queue.next;
     queue.next = null;
