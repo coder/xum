@@ -4,6 +4,8 @@
  * nor keeps any `_meta.ui`.
  */
 
+import { sanitizeText } from "@/common/utils/mcp/displayText";
+
 export const MCP_APPS_EXTENSION_ID = "io.modelcontextprotocol/ui";
 export const MCP_APP_MIME_TYPE = "text/html;profile=mcp-app";
 /**
@@ -158,6 +160,28 @@ export function parseMCPAppEntrypoints(meta: unknown): {
     else if (type === "file") skippedFile = true;
   }
   return { types: [...types], skippedFile };
+}
+
+/** Longest entry point title shown (launcher row, palette command, tab label). */
+export const MCP_APP_ENTRYPOINT_TITLE_MAX_CHARS = 120;
+
+/**
+ * An entry point's display title from a server-controlled candidate list (the spec's order:
+ * `title`, then `annotations.title`), else the tool name: each cleaned like server identity
+ * text (bidi and control characters, which could visually reorder the command the user is
+ * about to run, become spaces; whitespace collapses; a bounded prefix is kept). The first
+ * candidate that is not empty after cleaning wins; undefined when even the name cleans to
+ * nothing (the entry point is then skipped).
+ */
+export function mcpAppEntrypointTitle(
+  candidates: readonly unknown[],
+  toolName: string
+): string | undefined {
+  for (const candidate of [...candidates, toolName]) {
+    const title = sanitizeText(candidate, MCP_APP_ENTRYPOINT_TITLE_MAX_CHARS);
+    if (title !== undefined) return title;
+  }
+  return undefined;
 }
 
 /**
