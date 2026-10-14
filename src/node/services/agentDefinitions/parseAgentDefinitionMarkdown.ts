@@ -24,6 +24,18 @@ function assertObject(value: unknown, message: string): asserts value is Record<
   }
 }
 
+function mapFrontmatterForSource(
+  raw: Record<string, unknown>,
+  source: "plugin" | undefined
+): Record<string, unknown> {
+  if (source !== "plugin") return raw;
+  try {
+    return mapForeignPluginAgentFrontmatter(raw);
+  } catch (err) {
+    throw new AgentDefinitionParseError(getErrorMessage(err));
+  }
+}
+
 /**
  * Parse an agent definition markdown file into validated YAML frontmatter + markdown body.
  *
@@ -83,15 +95,9 @@ export function parseAgentDefinitionMarkdown(input: {
 
   assertObject(raw, "Agent definition YAML frontmatter must be a mapping/object.");
 
-  if (input.source === "plugin") {
-    try {
-      raw = mapForeignPluginAgentFrontmatter(raw);
-    } catch (err) {
-      throw new AgentDefinitionParseError(getErrorMessage(err));
-    }
-  }
-
-  const parsed = AgentDefinitionFrontmatterSchema.safeParse(raw);
+  const parsed = AgentDefinitionFrontmatterSchema.safeParse(
+    mapFrontmatterForSource(raw, input.source)
+  );
   if (!parsed.success) {
     throw new AgentDefinitionParseError(
       `Invalid agent definition frontmatter: ${formatZodIssues(parsed.error.issues)}`
