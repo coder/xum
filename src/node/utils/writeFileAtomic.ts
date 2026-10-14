@@ -36,6 +36,11 @@ export interface Options {
   chown?: { uid: number; gid: number };
   /** Set to false to skip fsync before the rename (default true). */
   fsync?: boolean;
+  /**
+   * Runs right before the rename, with the resolved target path. Throw to abort: the temp file is
+   * removed and the target stays untouched. Lets a caller refuse to replace bytes it did not read.
+   */
+  beforeRename?: (target: string) => void;
 }
 
 type ResolvedOptions = Options & { encoding: BufferEncoding };
@@ -192,6 +197,16 @@ async function renameWithRetry(tempFile: string, target: string): Promise<void> 
 // fsync directory handles. Best effort: the new contents are already visible, so a failed
 // flush is logged instead of failing a write that did replace the file. Exported for other
 // rename-based publishers (publishCompactionFile, #5344).
+/** The caller's last check, then the rename that publishes the temp file. */
+async function commitTempFile(
+  tempFile: string,
+  target: string,
+  options: ResolvedOptions
+): Promise<void> {
+  options.beforeRename?.(target);
+  await renameWithRetry(tempFile, target);
+}
+
 export async function fsyncParentDirectory(target: string): Promise<void> {
   if (process.platform === "win32") return;
   let fd: number | undefined;
@@ -230,7 +245,7 @@ async function writeFileAtomicUnserialized(
     await promisify(fs.close)(fd);
     fd = undefined;
     await applyOwnership(tempFile, options);
-    await renameWithRetry(tempFile, target);
+    await commitTempFile(tempFile, target, options);
     if (options.fsync !== false) {
       await fsyncParentDirectory(target);
     }

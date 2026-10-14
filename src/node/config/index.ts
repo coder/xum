@@ -1350,6 +1350,9 @@ function writeConfigBytesSidecar(
   return { path: backupPath, reused: false };
 }
 
+/** The stat key an edit records when config.json does not exist (#5929). */
+const CONFIG_FILE_ABSENT = "absent";
+
 /** Location of config.json under a Xum root (also used by callers that must stat it without a Config). */
 export function configFilePath(rootDir: string): string {
   return path.join(rootDir, "config.json");
@@ -1954,6 +1957,37 @@ export class Config {
       );
     }
     aliasConflictBackupFailures.set(this.configFile, { message });
+  }
+
+  /** The stat key an edit records before its fresh read: CONFIG_FILE_ABSENT when there is no file. */
+  private readEditStatKey(): string {
+    return this.readConfigStatKey() ?? CONFIG_FILE_ABSENT;
+  }
+
+  /** The beforeRename check for a save, or undefined when the save has no read to compare. */
+  private unchangedConfigCheck(expectedStatKey: string | undefined) {
+    if (expectedStatKey === undefined) return undefined;
+    return (target: string) => this.assertConfigFileUnchanged(target, expectedStatKey);
+  }
+
+  /**
+   * Throw when config.json changed since the edit read it (#5929): a writer that skips the
+   * registration lock (a manual editor, an older build) replaced it, and this save would drop
+   * that write. One stat, right before the rename. An in-place rewrite with the same inode,
+   * size and mtime still passes; a content hash would cost a read per save.
+   */
+  private assertConfigFileUnchanged(target: string, expectedStatKey: string): void {
+    let currentKey = CONFIG_FILE_ABSENT;
+    try {
+      currentKey = this.configStatKey(fs.statSync(target));
+    } catch (error) {
+      if (!isEnoentError(error)) throw error;
+    }
+    if (currentKey !== expectedStatKey) {
+      throw new Error(
+        `config.json changed on disk while Xum was saving it (${this.configFile}). Your change was not saved. Retry the change.`
+      );
+    }
   }
 
   /** Failure state this instance's last failed load wrote; see getConfigLoadError. */
@@ -2732,8 +2766,12 @@ export class Config {
    * Kept as a Promise facade (tests spy on it with Promise mocks to simulate a write
    * that did not land); saveConfigEffect below holds the actual pipeline.
    */
-  private saveConfig(config: ProjectsConfig): Promise<void> {
-    return Effect.runPromise(this.saveConfigEffect(config));
+  /**
+   * `expectedStatKey`: the stat key of the bytes the edit read. The save then fails without
+   * writing when config.json no longer has it. Undefined skips the check.
+   */
+  private saveConfig(config: ProjectsConfig, expectedStatKey?: string): Promise<void> {
+    return Effect.runPromise(this.saveConfigEffect(config, expectedStatKey));
   }
 
   /**
@@ -2741,7 +2779,10 @@ export class Config {
    * atomic write) happens before the rename, so a failure means the previous bytes are
    * still on disk; nothing after the write can fail.
    */
-  private saveConfigEffect(config: LegacyAdvisorProjectsConfig): Effect.Effect<void, unknown> {
+  private saveConfigEffect(
+    config: LegacyAdvisorProjectsConfig,
+    expectedStatKey?: string
+  ): Effect.Effect<void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
@@ -3042,7 +3083,11 @@ export class Config {
       // and the npm write-file-atomic package renamed that truncated file over
       // config.json, which then loaded as an empty registry (coder/xum#4197).
       yield* Effect.tryPromise({
-        try: async () => writeFileAtomic(self.configFile, text, "utf-8"),
+        try: async () =>
+          writeFileAtomic(self.configFile, text, {
+            encoding: "utf-8",
+            beforeRename: self.unchangedConfigCheck(expectedStatKey),
+          }),
         catch: (error) => error,
       });
       // A competing rename may already have replaced our write; only a fresh read can publish it.
@@ -3554,7 +3599,14 @@ export class Config {
      * pure (callers run their own updaters and record results inside it): only after the
      * edit holds the lock it will write under, so no invocation's result is discarded.
      */
-    const transform = (): ProjectsConfig => fn(self.readConfigOrDefault({ keepSnapshot: true }));
+    // The stat key of config.json just before the edit's fresh read: the save refuses to replace
+    // bytes this edit did not read (#5929). A rename between this stat and the read only makes
+    // the save refuse (fail closed), never overwrite.
+    let readStatKey: string | undefined;
+    const transform = (): ProjectsConfig => {
+      readStatKey = self.readEditStatKey();
+      return fn(self.readConfigOrDefault({ keepSnapshot: true }));
+    };
     const write = Effect.fn(function* (
       newConfig: ProjectsConfig,
       lock: ProjectRegistrationLockHandle
@@ -3573,7 +3625,10 @@ export class Config {
       // Route through the saveConfig Promise facade (not saveConfigEffect) so test
       // spies on saveConfig keep intercepting the serialized write. A failed save rejects
       // the edit and skips the change notification below (#4444).
-      yield* Effect.tryPromise({ try: () => self.saveConfig(newConfig), catch: (error) => error });
+      yield* Effect.tryPromise({
+        try: () => self.saveConfig(newConfig, readStatKey),
+        catch: (error) => error,
+      });
       // Backend-initiated config edits (for example gateway auth changes) use this signal
       // so frontend subscribers can refresh derived state without polling.
       self.notifyConfigChanged();
