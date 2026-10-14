@@ -420,8 +420,8 @@ export function focusMcpAppViewTab(workspaceId: string, toolCallId: string) {
  * view once per tool call). Used after an entry point ran again for a tab that is open.
  */
 // Never pruned on purpose: an entry holds one number, and only a user's pick that ran an entry
-// point again adds one, so the map stays small for a session. Dropping an entry
-// when its tab closes would also be safe (a missing count reads as 0), but it needs no hook.
+// point again adds one, so the map stays small for a session. Dropping an entry when its tab
+// closes would need a close hook and gain nothing (a missing count reads as 0).
 const reloadCounts = new Map<string, number>();
 
 /** Remount every frame that shows the view, so it loads the view again. */
