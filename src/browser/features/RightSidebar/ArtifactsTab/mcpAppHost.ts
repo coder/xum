@@ -203,6 +203,46 @@ export function clampMcpAppHeight(height: number): number {
   return Math.min(MCP_APP_MAX_HEIGHT, Math.max(MCP_APP_MIN_HEIGHT, Math.round(height)));
 }
 
+/** Whether a view hosted inline declared fullscreen but not inline (and the host offers it). */
+function isFullscreenOnly(
+  declared: readonly string[] | undefined,
+  context: Pick<McpAppHostContext, "displayMode" | "availableDisplayModes">
+): boolean {
+  if (declared === undefined || context.displayMode !== "inline") return false;
+  if (declared.includes("inline")) return false;
+  return declared.includes("fullscreen") && context.availableDisplayModes.includes("fullscreen");
+}
+
+/**
+ * The mode a view starts in (its ui/initialize reply). A view that declared fullscreen but not
+ * inline is not hosted inline: its instance in a tool card moves to fullscreen (its tab), and it
+ * is told that mode from the start. `move` is that accepted move, null for none.
+ */
+function startDisplayMode(input: {
+  declared: readonly string[] | undefined;
+  context: McpAppHostContext;
+  pending: McpAppDisplayMode | undefined;
+  setDisplayMode: McpAppHostOptions["setDisplayMode"];
+  viewMode: (mode: McpAppDisplayMode) => McpAppDisplayMode;
+}) {
+  const move =
+    input.pending === undefined && isFullscreenOnly(input.declared, input.context)
+      ? input.setDisplayMode("fullscreen")
+      : null;
+  const pending = move != null ? "fullscreen" : input.pending;
+  return { move, pending, displayMode: pending ?? input.viewMode(input.context.displayMode) };
+}
+
+/** As for an accepted request: the view gets its teardown before the move replaces it. */
+async function runMoveAfterTeardown(
+  move: (() => void) | null,
+  teardown: (reason: string) => Promise<void>
+): Promise<void> {
+  if (move == null) return;
+  await teardown("display-mode");
+  move();
+}
+
 export function createMcpAppHost(options: McpAppHostOptions) {
   const allowServerRequest = createBridgeRateLimiter(
     MCP_APP_TOOL_CALLS_PER_WINDOW,
@@ -286,7 +326,15 @@ export function createMcpAppHost(options: McpAppHostOptions) {
           (declared.success ? declared.data.appCapabilities?.availableDisplayModes : undefined) ??
           viewDisplayModes;
         const context = options.getHostContext();
-        const hostContext = { ...context, displayMode: viewMode(context.displayMode) };
+        const start = startDisplayMode({
+          declared: viewDisplayModes,
+          context,
+          pending: pendingDisplayMode,
+          setDisplayMode: options.setDisplayMode,
+          viewMode,
+        });
+        pendingDisplayMode = start.pending;
+        const hostContext = { ...context, displayMode: start.displayMode };
         notifiedDisplayMode = hostContext.displayMode;
         respond(id, {
           protocolVersion: MCP_APP_PROTOCOL_VERSION,
@@ -304,6 +352,7 @@ export function createMcpAppHost(options: McpAppHostOptions) {
           },
           hostContext,
         });
+        await runMoveAfterTeardown(start.move, teardown);
         return;
       }
       case "ping":

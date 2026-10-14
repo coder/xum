@@ -30,7 +30,12 @@ import {
   type McpAppHost,
   type McpAppHostContext,
 } from "./mcpAppHost";
-import { isMcpAppViewHosted, openMcpAppViewTab, type McpAppViewRef } from "./mcpAppViewsStore";
+import {
+  isMcpAppViewHosted,
+  openMcpAppViewTab,
+  reloadMcpAppView,
+  type McpAppViewRef,
+} from "./mcpAppViewsStore";
 import {
   newestMcpAppViewDomains,
   publishMcpAppViewDomains,
@@ -643,6 +648,12 @@ export function McpAppFrame(props: {
           if (hostRef.current !== host) return;
           if (mode === "fullscreen") {
             openMcpAppViewTab(workspaceId, latest.current.view);
+            return;
+          }
+          // The user collapsed the card during the teardown wait: closing the tab would leave the
+          // view without a frame. It stays in its tab and loads again (it was torn down).
+          if (!isMcpAppViewHosted(workspaceId, toolCallId, "card")) {
+            reloadMcpAppView(workspaceId, toolCallId);
             return;
           }
           latest.current.onClose?.();

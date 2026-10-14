@@ -14,7 +14,11 @@ import assert from "@/common/utils/assert";
 import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
 import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
 import { McpAppFrame } from "./McpAppFrame";
-import { markMcpAppViewHosted, type McpAppViewRef } from "./mcpAppViewsStore";
+import {
+  markMcpAppViewHosted,
+  useMcpAppViewReloadKey,
+  type McpAppViewRef,
+} from "./mcpAppViewsStore";
 
 // The card's display values: the aggregated tool name and the pre-sanitization arguments.
 const VIEW: McpAppViewRef = {
@@ -1137,6 +1141,88 @@ describe("McpAppFrame host strips", () => {
       const params = changed?.params as { containerDimensions?: { maxHeight?: number } };
       expect(params?.containerDimensions?.maxHeight).toBe(400);
     });
+  });
+
+  // A view that declared only fullscreen is not hosted in its tool card: it moves to its tab.
+  test("a fullscreen-only view in its card moves to its tab once it initializes", async () => {
+    const opened: string[] = [];
+    const onOpen = (e: Event) =>
+      opened.push((e as CustomEvent<{ toolCallId: string }>).detail.toolCallId);
+    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onOpen);
+    try {
+      const view = render(<McpAppFrame workspaceId="ws" view={VIEW} variant="inline" />, {
+        wrapper: Wrapper,
+      });
+      const frame = await findOpenFrame(view);
+      const posted = capturePosted(frame);
+      postFromView(frame, {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "ui/initialize",
+        params: { appCapabilities: { availableDisplayModes: ["fullscreen"] } },
+      });
+      await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+      const init = posted.find((m) => m.id === 1)?.result as {
+        hostContext: { displayMode: string };
+      };
+      // It is told the mode it ends up in, never inline, which it did not declare.
+      expect(init.hostContext.displayMode).toBe("fullscreen");
+      const teardown = await waitFor(() => {
+        const message = posted.find((m) => m.method === "ui/resource-teardown");
+        if (message === undefined) throw new Error("no teardown yet");
+        return message;
+      });
+      expect(opened).toEqual([]);
+      postFromView(frame, { jsonrpc: "2.0", id: teardown.id, result: {} });
+      await waitFor(() => expect(opened).toEqual(["call-1"]));
+    } finally {
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onOpen);
+    }
+  });
+
+  // The user can collapse the card during the teardown wait: the tab must not close then.
+  test("an inline move whose card is gone by the move keeps the view in its tab", async () => {
+    let closed = 0;
+    let reloads: number[] = [];
+    function ReloadProbe() {
+      reloads = [...reloads, useMcpAppViewReloadKey("ws", "call-1")];
+      return null;
+    }
+    const unmarkCard = markMcpAppViewHosted("ws", "call-1", "card");
+    let cardMarked = true;
+    try {
+      const view = render(
+        <>
+          <McpAppFrame workspaceId="ws" view={VIEW} onClose={() => closed++} />
+          <ReloadProbe />
+        </>,
+        { wrapper: Wrapper }
+      );
+      const frame = await findOpenFrame(view);
+      const posted = capturePosted(frame);
+      postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+      postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
+      postFromView(frame, {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "ui/request-display-mode",
+        params: { mode: "inline" },
+      });
+      const teardown = await waitFor(() => {
+        const message = posted.find((m) => m.method === "ui/resource-teardown");
+        if (message === undefined) throw new Error("no teardown yet");
+        return message;
+      });
+      unmarkCard();
+      cardMarked = false;
+      const before = reloads.at(-1) ?? 0;
+      postFromView(frame, { jsonrpc: "2.0", id: teardown.id, result: {} });
+      // The torn-down view loads again in its tab instead.
+      await waitFor(() => expect(reloads.at(-1)).toBe(before + 1));
+      expect(closed).toBe(0);
+    } finally {
+      if (cardMarked) unmarkCard();
+    }
   });
 
   test("fullscreen from the card moves the view to its tab; inline from the tab closes it", async () => {
