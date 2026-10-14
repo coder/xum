@@ -1410,6 +1410,47 @@ describe("MCPServerManager", () => {
     expect(calls).toHaveLength(1);
   });
 
+  test("overlapping opens of one entry point keep the newest open's result", async () => {
+    using tmp = new DisposableTempDir("mcp-apps-entry-order");
+    const store = new McpAppResultStore((id) => path.join(tmp.path, id));
+    manager.setMcpApps({ isEnabled: () => true, store });
+    configService.listServers.mockResolvedValue({ apps: stdioConfig("apps-entry-order") });
+    const pending: Array<(text: string) => void> = [];
+    servers.serve("apps-entry-order", {
+      tools: { show: testTool() },
+      apps: {
+        hasTool: () => true,
+        toolUi: () => undefined,
+        appEntrypoints: () => [
+          { toolName: "board", title: "Board", resourceUri: "ui://x/view", types: ["global"] },
+        ],
+        callToolForApp: () =>
+          new Promise((resolve) => {
+            pending.push((text) => resolve({ content: [{ type: "text", text }] }));
+          }),
+      },
+    });
+    const request = workspaceRequest("apps-entry-order");
+    await manager.getToolsForWorkspace(request);
+
+    // Two windows open the same entry point at once; the call made second finishes first.
+    const opens = [0, 1].map(() =>
+      manager.openMcpAppEntrypoint(request.workspaceId, "apps", "board", "global")
+    );
+    for (let turn = 0; turn < 50 && pending.length < 2; turn++) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect(pending).toHaveLength(2);
+    pending[1]("newer");
+    for (let turn = 0; turn < 50; turn++) await new Promise((resolve) => setImmediate(resolve));
+    pending[0]("older");
+    const [opened] = await Promise.all(opens);
+
+    expect(await store.get(request.workspaceId, opened.viewKey)).toMatchObject({
+      result: { content: [{ type: "text", text: "newer" }] },
+    });
+  });
+
   test("a plugin server's label is cleaned of bidi and control characters", async () => {
     using tmp = new DisposableTempDir("mcp-apps-entry-label");
     manager.setMcpApps({

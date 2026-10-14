@@ -5275,15 +5275,23 @@ export class MCPServerManager {
         }
         log.info("[MCP Apps] Opening an entry point", { workspaceId, serverName, toolName, type });
         const viewKey = mcpAppEntrypointKey(serverName, toolName, type);
+        const openKey = `${workspaceId}\0${viewKey}`;
+        const order = ++this.entrypointOpenCount;
         dispatched = apps.callToolForApp(toolName, {}, options).then(async (result) => {
-          await store.record(workspaceId, {
-            toolCallId: viewKey,
-            serverName,
-            toolName,
-            resourceUri: tool.resourceUri,
-            arguments: {},
-            result,
-          });
+          // Two windows can open one entry point at once. A call that finishes after a newer
+          // call's result was stored must not overwrite it: the tab shows the latest open.
+          // Stored results are written in this order (the store's writes are queued).
+          if ((this.entrypointStoredOpens.get(openKey) ?? 0) < order) {
+            this.entrypointStoredOpens.set(openKey, order);
+            await store.record(workspaceId, {
+              toolCallId: viewKey,
+              serverName,
+              toolName,
+              resourceUri: tool.resourceUri,
+              arguments: {},
+              result,
+            });
+          }
           return {
             serverName,
             serverLabel: this.appServerLabel(workspaceId, serverName),
@@ -5329,11 +5337,17 @@ export class MCPServerManager {
   }
 
   private readonly entrypointCallWindows = new Map<string, { start: number; count: number }>();
+  /** Entry point opens dispatched so far: orders overlapping opens of one entry point. */
+  private entrypointOpenCount = 0;
+  /** The newest open whose result was stored, by workspace and entry point view key. */
+  private readonly entrypointStoredOpens = new Map<string, number>();
 
   /** Entry point budgets of a stopped workspace would otherwise outlive it. */
   private dropEntrypointBudgets(workspaceId: string): void {
-    for (const key of this.entrypointCallWindows.keys()) {
-      if (key.startsWith(`${workspaceId}\0`)) this.entrypointCallWindows.delete(key);
+    for (const map of [this.entrypointCallWindows, this.entrypointStoredOpens]) {
+      for (const key of map.keys()) {
+        if (key.startsWith(`${workspaceId}\0`)) map.delete(key);
+      }
     }
   }
 

@@ -1,7 +1,11 @@
 import { describe, expect, mock, test } from "bun:test";
 import type { ORPCContext } from "@/node/orpc/context";
 import { Ok } from "@/common/types/result";
-import { getWorkspaceMcpOverrides, listWorkspaceMcpPrompts } from "./workspacePluginOperations";
+import {
+  getWorkspaceMcpOverrides,
+  listWorkspaceMcpPrompts,
+  warmWorkspaceMcpServers,
+} from "./workspacePluginOperations";
 
 const workspaceId = "ws-mcp-prompts";
 const metadata = {
@@ -19,6 +23,9 @@ function createContext(options: {
   const waitForInit = mock(() => Promise.resolve());
   const ensureReady = mock(() => Promise.resolve({ ready: true as const }));
   const getPromptsForWorkspace = mock(options.getPromptsForWorkspace);
+  const getToolsForWorkspace = mock((_options: unknown, _callOptions?: unknown) =>
+    Promise.resolve({ tools: {} })
+  );
   const context = {
     workspaceService: {
       acquireMcpPromptDiscoveryAdmission: mock(() => options.admission),
@@ -35,9 +42,9 @@ function createContext(options: {
     },
     secretsStore: { getEffectiveSecrets: mock(() => []) },
     config: { loadConfigOrDefault: mock(() => ({ projects: new Map() })) },
-    mcpServerManager: { getPromptsForWorkspace },
+    mcpServerManager: { getPromptsForWorkspace, getToolsForWorkspace },
   } as unknown as ORPCContext;
-  return { context, waitForInit, ensureReady, getPromptsForWorkspace };
+  return { context, waitForInit, ensureReady, getPromptsForWorkspace, getToolsForWorkspace };
 }
 
 describe("getWorkspaceMcpOverrides", () => {
@@ -196,5 +203,39 @@ describe("listWorkspaceMcpPrompts archive admission", () => {
     expect(typeof readOptions.timeoutMs).toBe("number");
     expect(fixture.getPromptsForWorkspace).not.toHaveBeenCalled();
     expect(dispose).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("warmWorkspaceMcpServers", () => {
+  test("starts the workspace's servers without waiting for prompts/list", async () => {
+    // MCP App entry points warm servers before they list: a server that stalls prompts/list
+    // must not hold the launcher for the prompt-list timeout.
+    const dispose = mock(() => undefined);
+    const fixture = createContext({
+      admission: { [Symbol.dispose]: dispose, signal: new AbortController().signal },
+      getPromptsForWorkspace: () => new Promise<never[]>(() => undefined),
+    });
+
+    await warmWorkspaceMcpServers(fixture.context, workspaceId);
+
+    expect(fixture.getToolsForWorkspace).toHaveBeenCalledTimes(1);
+    expect(fixture.getToolsForWorkspace.mock.calls[0]?.[0]).toMatchObject({
+      workspaceId,
+      projectPath: metadata.projectPath,
+      workspacePath: "/tmp/proj/ws",
+    });
+    expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  test("a refused admission starts no servers", async () => {
+    const fixture = createContext({
+      admission: undefined,
+      getPromptsForWorkspace: () => Promise.reject(new Error("should not start servers")),
+    });
+
+    await warmWorkspaceMcpServers(fixture.context, workspaceId);
+
+    expect(fixture.ensureReady).not.toHaveBeenCalled();
+    expect(fixture.getToolsForWorkspace).not.toHaveBeenCalled();
   });
 });

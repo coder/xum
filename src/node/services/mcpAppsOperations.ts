@@ -235,8 +235,8 @@ export async function callMcpAppTool(
 }
 
 /**
- * Entry points of the workspace's enabled servers. Starts them first, the way prompt
- * discovery does, so a server just enabled (or a cold backend) is listed.
+ * Entry points of the workspace's enabled servers. Starts them first (without prompt
+ * discovery), so a server just enabled (or a cold backend) is listed.
  */
 export async function listMcpAppEntrypoints(
   context: McpAppsContext,
