@@ -168,6 +168,11 @@ export interface MockORPCClientOptions {
     updateReview?: AgentPluginUpdateReview;
     /** agentPlugins.getHooks data by plugin name; setHookTrust updates it in memory. */
     hooks?: Record<string, AgentPluginHooks>;
+    /**
+     * Returned by agentPlugins.previewComponentReview for the named plugin. Confirming clears the
+     * plugin's reviewRequiredCount in `items`, like the backend does.
+     */
+    componentReview?: AgentPluginUpdateReview;
   };
   projects?: Map<string, ProjectConfig>;
   workspaces?: FrontendWorkspaceMetadata[];
@@ -1387,6 +1392,37 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           : Promise.resolve({ success: false, error: `No update review mock for '${input.name}'` }),
       update: (input: { name: string }) =>
         Promise.resolve({ success: false, error: `No update mock for '${input.name}'` }),
+      previewComponentReview: (input: { name: string }) =>
+        agentPluginsMock?.componentReview?.name === input.name
+          ? Promise.resolve({ success: true, data: agentPluginsMock.componentReview })
+          : Promise.resolve({
+              success: false,
+              error: `No component review mock for '${input.name}'`,
+            }),
+      confirmComponentReview: (input: { name: string; expectedLockedSha: string }) => {
+        const item = agentPluginsMock?.items?.find((entry) => entry.name === input.name);
+        if (item === undefined) {
+          return Promise.resolve({ success: false, error: `No plugin '${input.name}'` });
+        }
+        item.reviewRequiredCount = 0;
+        return Promise.resolve({
+          success: true,
+          data: {
+            entry: {
+              name: item.name,
+              scope: "global" as const,
+              source: item.source ?? {
+                type: "git" as const,
+                url: "",
+                ref: "main",
+                refType: "branch" as const,
+              },
+              lockedSha: input.expectedLockedSha,
+              installedAt: item.installedAt ?? new Date().toISOString(),
+            },
+          },
+        });
+      },
     },
     mcp: {
       settings: {

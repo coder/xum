@@ -28,6 +28,7 @@ import {
   acquirePluginMutationLock,
   MUTATION_EPOCH_UNREADABLE_TOKEN,
 } from "@/node/services/agentPlugins/journals";
+import { serverConsentFingerprint } from "./agentPlugins/componentConsent";
 import { readPluginMcpPolicy } from "./agentPlugins/registry";
 import { createTestPluginInstallEntry } from "./agentPlugins/testFixtures";
 import type { MCPServerInfo } from "@/common/types/mcp";
@@ -277,13 +278,26 @@ describe("MCPServerManager", () => {
   async function componentFixture(home: string) {
     await fs.mkdir(path.join(home, "plugins"), { recursive: true });
     const registryPath = path.join(home, "plugins.json");
+    // No plugin directory here: each server's provenance carries the fingerprint of the stdio
+    // config it starts as, and `write` records it as reviewed (#6498), as an install would.
+    const consentFingerprint = (name: string) =>
+      serverConsentFingerprint(
+        { ...stdioConfig(name), env: { PLUGIN_DATA: path.join(home, "data", name) } },
+        { rootPaths: [], dataPaths: [path.join(home, "data", name)] }
+      );
     const write = async (names: string[]) => {
       const release = await acquirePluginMutationLock(home, { timeoutMs: 5000 });
       try {
+        const consent = {
+          skills: {},
+          mcpServers: Object.fromEntries(names.map((name) => [name, consentFingerprint(name)])),
+        };
         await fs.writeFile(
           `${registryPath}.tmp`,
           JSON.stringify({
-            plugins: [createTestPluginInstallEntry("demo", { skills: [], mcpServers: names })],
+            plugins: [
+              createTestPluginInstallEntry("demo", { skills: [], mcpServers: names }, consent),
+            ],
           })
         );
         await fs.rename(`${registryPath}.tmp`, registryPath);
@@ -303,6 +317,7 @@ describe("MCPServerManager", () => {
           sourceScope: "global",
           sourceLocation: "plugins/demo",
           componentPolicy: { registryPath, name: "demo" },
+          consentFingerprint: consentFingerprint(name),
         },
       };
     }
@@ -368,6 +383,7 @@ describe("MCPServerManager", () => {
       ...local,
       registryPath,
       write,
+      consentFingerprint,
       configs,
       read,
       makeManager,
@@ -2926,7 +2942,11 @@ describe("MCPServerManager", () => {
       f.configs[`plugin:many:${name}`] = {
         ...stdioConfig(name),
         env: { PLUGIN_DATA: path.join(tmp.path, "data", name) },
-        plugin: { ...f.configs["plugin:instance:keep"].plugin!, serverName: name },
+        plugin: {
+          ...f.configs["plugin:instance:keep"].plugin!,
+          serverName: name,
+          consentFingerprint: f.consentFingerprint(name),
+        },
       };
       f.serve(name);
     }
@@ -2953,6 +2973,7 @@ describe("MCPServerManager", () => {
       Promise.resolve({
         registryPath: f.registryPath,
         imports: { demo: [String(reads++)] },
+        consent: { demo: {} },
       })
     );
     const error: unknown = await manager
@@ -5671,7 +5692,7 @@ describe("MCPServerManager", () => {
                 stopOnPolicyRead = false;
                 stopped = manager.stopServers(request.workspaceId);
               }
-              return Promise.resolve({ registryPath: "", imports: null });
+              return Promise.resolve({ registryPath: "", imports: null, consent: null });
             },
           },
         });

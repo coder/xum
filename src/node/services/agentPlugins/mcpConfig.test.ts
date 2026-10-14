@@ -12,7 +12,8 @@ import { MCPConfigService } from "@/node/services/mcpConfigService";
 import { MCPServerManager } from "@/node/services/mcpServerManager";
 import { log } from "@/node/services/log";
 import { readPluginMcpPolicy } from "./registry";
-import { createTestPluginInstallEntry } from "./testFixtures";
+import type { ComponentConsent } from "./componentConsent";
+import { createTestPluginInstallEntry, reviewedComponentConsent } from "./testFixtures";
 import type { AgentPluginInfo } from "./discovery";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import {
@@ -97,7 +98,9 @@ describe("loadPluginMcpServers", () => {
     // Reserved variables are appended last so configured env cannot shadow them.
     expect(Object.keys(info.env ?? {}).slice(-2)).toEqual(["PLUGIN_ROOT", "PLUGIN_DATA"]);
     expect(info.cwd).toBe(plugin.rootPath);
-    expect(info.plugin).toEqual({
+    const { consentFingerprint, ...provenance } = info.plugin ?? {};
+    expect(consentFingerprint).toMatch(/^[0-9a-f]{64}$/);
+    expect(provenance).toEqual({
       pluginName: "demo",
       serverName: "everything",
       sourceScope: "global",
@@ -227,6 +230,19 @@ describe("loadPluginMcpServers", () => {
     } finally {
       warn.mockRestore();
     }
+  });
+
+  test("a server named __proto__ is skipped: its consent could not be stored (#6534)", async () => {
+    using tmp = new DisposableTempDir("plugin-mcp");
+    // JSON.parse makes `__proto__` an own key, as reading the file does.
+    const config = JSON.parse(
+      '{"__proto__": {"command": "node"}, "local": {"command": "node"}}'
+    ) as Record<string, unknown>;
+    const plugin = await makePlugin(tmp.path, "proto", config, { fileName: ".mcp.json" });
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
+    expect(Object.values(servers).map((s) => s.plugin?.serverName)).toEqual(["local"]);
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0].message).toContain("server '__proto__'");
   });
 
   test("the Codex dialect infers stdio from a command and accepts a flat server map", async () => {
@@ -886,7 +902,13 @@ describe("createAgentPluginsMcpProvider", () => {
           registryPath,
           JSON.stringify({
             plugins: [
-              createTestPluginInstallEntry("managed", { skills: [], mcpServers: ["allowed"] }),
+              createTestPluginInstallEntry(
+                "managed",
+                { skills: [], mcpServers: ["allowed"] },
+                await reviewedComponentConsent({
+                  pluginDir: path.join(xumHome, "plugins", "managed"),
+                })
+              ),
             ],
           })
         );
@@ -948,6 +970,59 @@ describe("createAgentPluginsMcpProvider", () => {
     }
   );
 
+  test("a managed server loads only as the definition the user reviewed (#6498)", async () => {
+    using home = new DisposableTempDir("plugin-mcp-consent");
+    await withHomeDir(home.path, async () => {
+      const xumHome = path.join(home.path, ".xum");
+      const container = path.join(xumHome, "plugins");
+      await writeDiscoverablePlugin(container, "managed", mcpDoc({ srv: STDIO_ENTRY }));
+      await writeDiscoverablePlugin(
+        path.join(home.path, ".agents", "plugins"),
+        "unmanaged",
+        mcpDoc({ free: STDIO_ENTRY })
+      );
+      const registryPath = path.join(xumHome, "plugins.json");
+      const saveConsent = (componentConsent?: ComponentConsent) =>
+        fs.writeFile(
+          registryPath,
+          JSON.stringify({
+            plugins: [
+              createTestPluginInstallEntry(
+                "managed",
+                { skills: [], mcpServers: ["srv"] },
+                componentConsent
+              ),
+            ],
+          })
+        );
+      const provider = createAgentPluginsMcpProvider({ xumHome });
+      // The provider drops a managed server whose registration the policy does not allow.
+      const loaded = async () =>
+        Object.values(await provider({ trusted: false }))
+          .map((info) => info.plugin?.serverName)
+          .sort();
+      await saveConsent();
+      const reviewed = await reviewedComponentConsent({
+        pluginDir: path.join(container, "managed"),
+      });
+
+      // An install from before #6498 has no records: its imported server does not start.
+      expect(await loaded()).toEqual(["free"]);
+      // A record for another definition under the same name is no consent either.
+      await saveConsent({ skills: {}, mcpServers: { srv: "0".repeat(64) } });
+      expect(await loaded()).toEqual(["free"]);
+      await saveConsent(reviewed);
+      expect(await loaded()).toEqual(["free", "srv"]);
+      // A change the parser sees (here: args) under the reviewed name needs a new review.
+      await writeDiscoverablePlugin(
+        container,
+        "managed",
+        mcpDoc({ srv: { ...STDIO_ENTRY, args: ["-y", "another-server"] } })
+      );
+      expect(await loaded()).toEqual(["free"]);
+    });
+  });
+
   test("an escaped project alias does not discard its distinct valid global MCP registration", async () => {
     using home = new DisposableTempDir("plugin-provider-outward-home");
     using project = new DisposableTempDir("plugin-provider-outward-project");
@@ -963,7 +1038,11 @@ describe("createAgentPluginsMcpProvider", () => {
         path.join(xumHome, "plugins.json"),
         JSON.stringify({
           plugins: [
-            createTestPluginInstallEntry("managed", { skills: [], mcpServers: ["allowed"] }),
+            createTestPluginInstallEntry(
+              "managed",
+              { skills: [], mcpServers: ["allowed"] },
+              await reviewedComponentConsent({ pluginDir: path.join(owner, "managed") })
+            ),
           ],
         })
       );

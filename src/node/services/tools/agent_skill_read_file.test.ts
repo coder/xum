@@ -2,7 +2,10 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { describe, it, expect } from "bun:test";
-import { createTestPluginInstallEntry } from "@/node/services/agentPlugins/testFixtures";
+import {
+  createTestPluginInstallEntry,
+  reviewedComponentConsent,
+} from "@/node/services/agentPlugins/testFixtures";
 import { AgentSkillReadFileToolResultSchema } from "@/common/utils/tools/toolDefinitions";
 import { createAgentSkillReadFileTool } from "./agent_skill_read_file";
 import { listInvocableSkills } from "@/common/utils/agentSkills/skillLookupName";
@@ -86,7 +89,11 @@ describe("agent_skill_read_file", () => {
       path.join(tmp.path, "plugins.json"),
       JSON.stringify({
         plugins: [
-          createTestPluginInstallEntry("a-managed", { skills: ["allowed"], mcpServers: [] }),
+          createTestPluginInstallEntry(
+            "a-managed",
+            { skills: ["allowed"], mcpServers: [] },
+            await reviewedComponentConsent({ pluginDir: path.join(container, "a-managed") })
+          ),
         ],
       })
     );
@@ -148,7 +155,11 @@ describe("agent_skill_read_file", () => {
         registryPath,
         JSON.stringify({
           plugins: [
-            createTestPluginInstallEntry("managed", { skills: ["allowed"], mcpServers: [] }),
+            createTestPluginInstallEntry(
+              "managed",
+              { skills: ["allowed"], mcpServers: [] },
+              await reviewedComponentConsent({ pluginDir: pluginRoot })
+            ),
           ],
         })
       );
