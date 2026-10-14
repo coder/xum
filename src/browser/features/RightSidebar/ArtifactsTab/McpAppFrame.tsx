@@ -179,11 +179,18 @@ function DomainsPrompt(props: {
   const [error, setError] = useState<string | null>(null);
   const [promptId] = useState(newConfirmPromptId);
   const arming = useConfirmArmed(promptId);
+  // Never rejects: an unexpected throw still ends the pending state and shows its error.
   const allow = async () => {
     setPending(true);
     setError(null);
-    const failure = await props.allow();
-    setPending(false);
+    let failure: string | null;
+    try {
+      failure = await props.allow();
+    } catch (error) {
+      failure = getErrorMessage(error);
+    } finally {
+      setPending(false);
+    }
     setError(failure);
   };
   return (
