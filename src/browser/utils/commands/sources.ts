@@ -2386,7 +2386,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       {
         id: CommandIds.pluginsReviewComponents(),
         title: "Review Plugin Components…",
-        subtitle: "Approve skills and MCP servers you have not reviewed on this install",
+        subtitle: "Approve skills and MCP servers that do not load until you review them",
         section: section.settings,
         keywords: ["plugin", "components", "review", "approve", "skills", "mcp", "consent"],
         run: () => undefined,
