@@ -5841,10 +5841,33 @@ describe("describeSignInChanges", () => {
       )
     ).toEqual([
       "Sign-in client removed",
-      "Sign-in server changed",
+      "Sign-in server changed (https://mcp.example.com/tenant → https://mcp.example.com/tenant-b)",
       "Scopes changed: - x",
       "Client secret changed",
     ]);
     expect(describeSignInChanges(signIn({}, "d1"), signIn({}))).toEqual(["Client secret removed"]);
+  });
+
+  test("names a path change next to a host change of another discovery URL (#6164)", () => {
+    expect(
+      describeSignInChanges(
+        signIn({
+          discovery: {
+            authorizationServerBase: "https://old.example.com/tenant-a",
+            registrationUrl: "https://reg.example.com/tenant-a/register",
+          },
+        }),
+        signIn({
+          discovery: {
+            authorizationServerBase: "https://new.example.com/tenant-a",
+            registrationUrl: "https://reg.example.com/tenant-b/register",
+          },
+        })
+      )
+    ).toEqual([
+      "Sign-in at new.example.com (new)",
+      "Sign-in at old.example.com (removed)",
+      "Client registration changed (https://reg.example.com/tenant-a/register → https://reg.example.com/tenant-b/register)",
+    ]);
   });
 });
