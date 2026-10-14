@@ -332,8 +332,11 @@ export interface MockORPCClientOptions {
   mcpSettingsReads?: string[][];
   /** Servers whose settings read fails with this message. */
   mcpSettingsReadErrors?: Map<string, string>;
-  /** When set, settings updates wait for this promise (stories hold a save in flight). */
-  mcpSettingsUpdateGate?: { promise: Promise<void> };
+  /**
+   * When set, settings updates wait for this promise (stories hold a save in flight). A list
+   * holds each update on its own gate, in call order.
+   */
+  mcpSettingsUpdateGate?: { promise: Promise<void> } | Array<{ promise: Promise<void> }>;
   /** When set, the first settings read takes its values, then waits for this promise. */
   mcpSettingsFirstReadGate?: { promise: Promise<void> };
   /** When set, mcp.test waits for this promise (stories hold a Fetch Tools in flight). */
@@ -422,6 +425,11 @@ interface MockMcpOverrides {
 type MockMcpTestResult =
   | { success: true; tools: string[]; serverInfo?: MCPServerIdentity; icon?: string }
   | { success: false; error: string };
+
+// Backend commit revisions of the mock's view-domain approvals, shared by every mock client: the
+// renderer's approval store outlives a story and keeps the list with the newest revision
+// (mcpAppViewDomainsStore.ts). Not time-based, since .storybook/preview.tsx freezes Date.
+let mockViewDomainsRevision = 0;
 
 /**
  * Creates a mock ORPC client for Storybook.
@@ -1393,7 +1401,9 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           return result;
         },
         update: async (input: { serverName: string; set: Record<string, MCPSettingValue> }) => {
-          await mcpSettingsUpdateGate?.promise;
+          await (Array.isArray(mcpSettingsUpdateGate)
+            ? mcpSettingsUpdateGate.shift()?.promise
+            : mcpSettingsUpdateGate?.promise);
           const snapshot = mcpSettings?.get(input.serverName);
           if (snapshot === undefined) return { success: false, error: "No settings mock" };
           snapshot.values = { ...snapshot.values, ...input.set };
@@ -2434,7 +2444,15 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         const view = mcpApps?.views[input.toolCallId];
         return Promise.resolve(
           view
-            ? { success: true as const, data: view }
+            ? {
+                success: true as const,
+                // Read now, like the backend: newer than every approval published so far.
+                data: {
+                  ...view,
+                  approvedDomainsRevision:
+                    view.approvedDomainsRevision ?? ++mockViewDomainsRevision,
+                },
+              }
             : { success: false as const, error: `No view for ${input.toolCallId}` }
         );
       },
@@ -2458,13 +2476,13 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         mockViewDomains.set(key, entry);
         return Promise.resolve({
           success: true as const,
-          data: { approvedDomains: entry.origins },
+          data: { approvedDomains: entry.origins, revision: ++mockViewDomainsRevision },
         });
       },
       listViewDomains: () => Promise.resolve([...mockViewDomains.values()]),
       revokeViewDomains: (input: { projectPath: string; serverName: string }) => {
         mockViewDomains.delete(JSON.stringify([input.projectPath, input.serverName]));
-        return Promise.resolve();
+        return Promise.resolve({ revision: ++mockViewDomainsRevision });
       },
       // Story views are always in the story transcript, so no record lookup finds one.
       getViewRecords: (input: { toolCallIds: string[] }) =>

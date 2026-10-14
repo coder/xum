@@ -169,7 +169,7 @@ export const WorkflowEmptyState: React.FC<WorkflowEmptyStateProps> = (props) => 
     <div className="flex flex-col gap-4">
       <div className="flex flex-col items-center gap-2 px-4 pt-5 pb-2 text-center">
         <span
-          className="text-accent grid h-12 w-12 place-items-center rounded-xl border"
+          className="text-accent-text grid h-12 w-12 place-items-center rounded-xl border"
           style={{
             background: "color-mix(in srgb, var(--color-accent) 12%, transparent)",
             borderColor: "color-mix(in srgb, var(--color-accent) 30%, transparent)",

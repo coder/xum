@@ -381,6 +381,38 @@ describe("hooks", () => {
       }
     });
 
+    test("pre- and post-hooks still run when a tool value contains NUL bytes", async () => {
+      const writeHook = async (name: string) => {
+        const hookPath = path.join(tempDir, ".xum", name);
+        await fs.mkdir(path.dirname(hookPath), { recursive: true });
+        await fs.writeFile(
+          hookPath,
+          '#!/bin/bash\necho "ok=$XUM_TOOL_INPUT_OK nul=${XUM_TOOL_INPUT_NUL-unset}"'
+        );
+        await fs.chmod(hookPath, 0o755);
+        return hookPath;
+      };
+      // Binary bash output (or file content) can carry NUL; spawn rejects such env values.
+      const toolInputValue = { nul: "a\0b", ok: "x" };
+      const context = {
+        tool: "bash",
+        toolInput: JSON.stringify(toolInputValue),
+        toolInputValue,
+        workspaceId: "test-workspace",
+        projectDir: tempDir,
+      };
+
+      const pre = await runPreHook(runtime, await writeHook("tool_pre"), context);
+      expect(pre.allowed).toBe(true);
+      expect(pre.output).toBe("ok=x nul=unset");
+
+      const post = await runPostHook(runtime, await writeHook("tool_post"), context, {
+        output: "binary\0output",
+      });
+      expect(post.success).toBe(true);
+      expect(post.output).toBe("ok=x nul=unset");
+    });
+
     test("receives MUX_TOOL_RESULT env var", async () => {
       const hookDir = path.join(tempDir, ".mux");
       const hookPath = path.join(hookDir, "tool_post");

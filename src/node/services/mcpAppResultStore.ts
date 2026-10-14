@@ -41,6 +41,11 @@ const McpAppResultRecordSchema = z.object({
   /** Raw CallToolResult, or null when it was too large to keep. */
   result: z.unknown().nullable(),
   createdAt: z.number(),
+  /**
+   * Written by an entry point open (MCPServerManager.openMcpAppEntrypoint), never by a tool
+   * call. A restored tab whose entry point is gone is then unavailable, not a tool call's view.
+   */
+  entrypoint: z.literal(true).optional(),
 });
 export type McpAppResultRecord = z.infer<typeof McpAppResultRecordSchema>;
 

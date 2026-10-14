@@ -4,7 +4,7 @@
 // Runs in CI's unit lane (scripts/test-unit-ci.sh); locally:
 // bun test ./scripts/test-unit-ci.test.ts
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 
@@ -122,4 +122,9 @@ test("runs the last crash retry of a covered isolated file without coverage", as
   const attempts = (await readFile(argsFile, "utf8")).trim().split("\n");
   expect(attempts.map((args) => args.includes(coverageDir))).toEqual([true, true, false]);
   expect(result.stdout).toContain("::warning::bun crashed twice under coverage");
+  // Quality / CRAP reads this marker to treat the shard's coverage as incomplete.
+  const isolated = path.join(fakeBinDir, "coverage", "isolated");
+  const [index] = await readdir(isolated);
+  const marker = await readFile(path.join(isolated, index, "ran-without-coverage.txt"), "utf8");
+  expect(marker.trim()).toBe(COVERED_ISOLATED_FILE);
 }, 60_000);

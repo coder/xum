@@ -34,14 +34,14 @@ export const Toggle1MContext: React.FC<Toggle1MContextProps> = (props) => {
       onClick={() => toggle1MContext(props.model)}
       className={cn(
         "flex cursor-pointer items-center gap-1.5 text-[11px] transition-colors",
-        enabled ? "text-accent" : "text-muted hover:text-foreground"
+        enabled ? "text-accent-text" : "text-muted hover:text-foreground"
       )}
       aria-label={enabled ? `Disable ${label}` : `Enable ${label}`}
     >
       <span
         className={cn(
           "flex h-4 w-6 items-center justify-center rounded-sm font-mono text-[9px] font-bold",
-          enabled ? "bg-accent/15 text-accent" : "bg-background-tertiary text-muted"
+          enabled ? "bg-accent/15 text-accent-text" : "bg-background-tertiary text-muted"
         )}
       >
         1M

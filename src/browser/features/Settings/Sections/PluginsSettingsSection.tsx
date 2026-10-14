@@ -72,7 +72,7 @@ const Badge: React.FC<{
       "rounded px-1.5 py-0.5 text-[10px] font-medium",
       props.wrap === true ? "max-w-full wrap-anywhere" : "whitespace-nowrap",
       props.tone === "muted" && "bg-foreground/10 text-muted",
-      props.tone === "accent" && "bg-accent/15 text-accent",
+      props.tone === "accent" && "bg-accent/15 text-accent-text",
       props.tone === "warning" && "bg-warning/15 text-warning",
       props.tone === "error" && "bg-destructive/15 text-destructive"
     )}
@@ -422,7 +422,7 @@ const ManageComponentsPanel: React.FC<{
         </p>
       )}
       {saved && (
-        <p role="status" className="text-accent text-xs">
+        <p role="status" className="text-accent-text text-xs">
           Component selection saved.
         </p>
       )}
@@ -635,7 +635,7 @@ const AddPluginPanel: React.FC<{
                 phone widths. */}
             <p className="text-muted text-[11px] break-all">
               {preview.source.url} @ {preview.source.ref} →{" "}
-              <code className="text-accent">{preview.targetPath}</code>
+              <code className="text-accent-text">{preview.targetPath}</code>
               {preview.manifest.authorName ? ` · by ${preview.manifest.authorName}` : ""}
               {preview.manifest.license ? ` · ${preview.manifest.license}` : ""}
             </p>
@@ -1152,7 +1152,7 @@ export const PluginsSettingsSection: React.FC = () => {
         <p className="text-muted mb-4 text-xs">
           Install Agent Plugins from git repositories into{" "}
           {containerLocation !== null ? (
-            <code className="text-accent">{containerLocation}</code>
+            <code className="text-accent-text">{containerLocation}</code>
           ) : (
             "the managed plugins directory"
           )}
@@ -1203,7 +1203,7 @@ export const PluginsSettingsSection: React.FC = () => {
         )}
 
         {installSucceeded && (
-          <p role="status" className="text-accent mb-3 text-xs">
+          <p role="status" className="text-accent-text mb-3 text-xs">
             Plugin installed.
           </p>
         )}

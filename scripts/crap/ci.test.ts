@@ -2,20 +2,35 @@ import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { annotation, coverageStatus, lcovFiles, summary } from "./ci";
+import { annotation, coverageStatus, incompleteCoverageReason, lcovFiles, summary } from "./ci";
 import type { Finding } from "./policy";
 
 test("coverage is partial when any expected shard report is missing", () => {
   const expected = { unit: 2, integration: 1 };
   const all = ["crap-lcov-unit-1", "crap-lcov-unit-2", "crap-lcov-integration-1"];
-  expect(coverageStatus(all, expected)).toEqual({ unit: 2, integration: 1, partial: false });
+  expect(coverageStatus(all, expected)).toEqual({
+    unit: 2,
+    integration: 1,
+    partial: false,
+    withoutCoverage: [],
+  });
+  expect(incompleteCoverageReason(coverageStatus(all, expected), expected)).toBeNull();
   // Integration shards skip themselves when no backend or browser file changed.
   expect(coverageStatus(all.slice(0, 2), expected)).toEqual({
     unit: 2,
     integration: 0,
     partial: true,
+    withoutCoverage: [],
   });
   expect(coverageStatus([], expected).partial).toBe(true);
+  expect(incompleteCoverageReason(coverageStatus(all.slice(0, 2), expected), expected)).toBe(
+    "shard reports missing (2/2 unit, 0/1 integration)"
+  );
+  // A run that fell back to no coverage makes a complete set incomplete too.
+  const fellBack = coverageStatus(all, expected, ["crap-lcov-unit-1: src/a.test.ts"]);
+  expect(incompleteCoverageReason(fellBack, expected)).toBe(
+    "ran without coverage: crap-lcov-unit-1: src/a.test.ts"
+  );
 });
 
 test("annotations escape workflow-command syntax in paths and messages", () => {
@@ -44,15 +59,17 @@ test("annotations escape workflow-command syntax in paths and messages", () => {
 test("reads every nested lcov.info, but counts only artifacts with a top-level report", () => {
   const dir = mkdtempSync(join(tmpdir(), "crap-ci-"));
   try {
-    const write = (path: string) => {
+    const write = (path: string, text = "") => {
       mkdirSync(join(dir, path, ".."), { recursive: true });
-      writeFileSync(join(dir, path), "");
+      writeFileSync(join(dir, path), text);
     };
     // A unit shard: shared process, two isolated files and the tooling run.
     write("crap-lcov-unit-1/lcov.info");
     write("crap-lcov-unit-1/isolated/12/lcov.info");
     write("crap-lcov-unit-1/isolated/3/lcov.info");
     write("crap-lcov-unit-1/tooling/lcov.info");
+    // An isolated run that fell back to no coverage leaves only its marker.
+    write("crap-lcov-unit-1/isolated/7/ran-without-coverage.txt", "src/b.test.ts\n");
     write("crap-lcov-integration-1/lcov.info");
     // A shard whose shared process ran its last retry without coverage: its isolated
     // reports still count as coverage, but the shard is not a complete report.
@@ -61,7 +78,8 @@ test("reads every nested lcov.info, but counts only artifacts with a top-level r
     write("crap-lcov-unit-3/other.txt");
     write("stray.info");
 
-    const { artifacts, files } = lcovFiles(dir);
+    const { artifacts, files, withoutCoverage } = lcovFiles(dir);
+    expect(withoutCoverage).toEqual(["crap-lcov-unit-1: src/b.test.ts"]);
     expect(artifacts).toEqual(["crap-lcov-integration-1", "crap-lcov-unit-1"]);
     expect(files.map((file) => file.slice(dir.length + 1))).toEqual([
       "crap-lcov-integration-1/lcov.info",
@@ -75,8 +93,13 @@ test("reads every nested lcov.info, but counts only artifacts with a top-level r
       unit: 1,
       integration: 1,
       partial: true,
+      withoutCoverage: [],
     });
-    expect(lcovFiles(join(dir, "missing"))).toEqual({ artifacts: [], files: [] });
+    expect(lcovFiles(join(dir, "missing"))).toEqual({
+      artifacts: [],
+      files: [],
+      withoutCoverage: [],
+    });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

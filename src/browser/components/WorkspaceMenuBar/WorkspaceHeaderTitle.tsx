@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
+import { showFeedbackToast } from "@/browser/utils/feedbackToast";
 import { isEditableElement, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { isWorkspaceRowRendered } from "@/browser/utils/ui/workspaceDomNav";
 import { PopoverError } from "../PopoverError/PopoverError";
@@ -132,6 +133,45 @@ interface WorkspaceHeaderTitleInputProps {
  * Enter or leaving the field saves, Escape cancels. A failed save keeps the edit open and shows
  * the error under the field.
  */
+/**
+ * A save whose field is gone reports in the shared toast: its error popover unmounted with the
+ * field, and the workspace keeps its old title (#6434).
+ */
+function reportSaveError(
+  fieldMounted: boolean,
+  reported: string | undefined,
+  showError: (error: string) => void
+) {
+  const error = reported ?? "Failed to update title";
+  if (fieldMounted) showError(error);
+  else
+    showFeedbackToast({ type: "error", title: "Could not rename the workspace", message: error });
+}
+
+/**
+ * The field unmounts with the edit still open when the selected workspace changes under it: the
+ * header is reused across workspaces. Save the typed text then, as leaving the field does
+ * (#6434). The save's phase guard skips it when the field's blur already saved.
+ */
+function useSaveOnUnmount(
+  mountedRef: React.MutableRefObject<boolean>,
+  save: () => Promise<void>,
+  dirty: boolean
+) {
+  const latestRef = useRef({ save, dirty });
+  useEffect(() => {
+    latestRef.current = { save, dirty };
+  });
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      // StrictMode's dev remount runs this with an unchanged draft: nothing to save then.
+      if (latestRef.current.dirty) void latestRef.current.save();
+    };
+  }, [mountedRef]);
+}
+
 /** The draft, its save and its cancel. The field below only maps keys and renders. */
 function useTitleDraft(props: WorkspaceHeaderTitleInputProps) {
   const { updateWorkspaceTitle } = useWorkspaceContext();
@@ -141,10 +181,13 @@ function useTitleDraft(props: WorkspaceHeaderTitleInputProps) {
   // Enter saves, and so does the blur that follows when focus moves: save once. After onDone,
   // which moves focus away, the blur must not save a cancelled draft.
   const phaseRef = useRef<"editing" | "saving" | "done">("editing");
+  const mountedRef = useRef(false);
 
   const finish = () => {
     phaseRef.current = "done";
-    props.onDone(document.activeElement === inputRef.current);
+    // A field that is gone ended its edit when it unmounted. Its late save must not end a newer
+    // edit, even one for the same workspace (Codex on #6461).
+    if (mountedRef.current) props.onDone(document.activeElement === inputRef.current);
   };
   const showError = (error: string) =>
     titleError.showError(props.workspaceId, error, getErrorAnchorBelow(inputRef.current));
@@ -153,13 +196,15 @@ function useTitleDraft(props: WorkspaceHeaderTitleInputProps) {
     if (phaseRef.current !== "editing") return;
     const title = draft.trim();
     if (title === props.initialTitle.trim()) return finish();
-    if (!title) return showError("Title cannot be empty");
+    // After a workspace switch this runs with the field gone: the toast must say why (Codex on #6461).
+    if (!title) return reportSaveError(mountedRef.current, "Title cannot be empty", showError);
     phaseRef.current = "saving";
     const result = await updateWorkspaceTitle(props.workspaceId, title);
     if (result.success) return finish();
     phaseRef.current = "editing";
-    showError(result.error ?? "Failed to update title");
+    reportSaveError(mountedRef.current, result.error, showError);
   };
+  useSaveOnUnmount(mountedRef, save, draft.trim() !== props.initialTitle.trim());
   // A pending save still renames the workspace: Escape then must not look like a cancel
   // (Codex on #6431). The field closes when the save settles.
   const cancel = () => {

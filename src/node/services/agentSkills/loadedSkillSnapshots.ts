@@ -13,6 +13,7 @@ import {
   normalizeAgentSkillSnapshotBody,
   renderAgentSkillSnapshotText,
 } from "@/common/utils/agentSkills/skillSnapshot";
+import { resolveSkillReadIdentity } from "@/common/utils/agentSkills/skillLookupName";
 
 interface CreateLoadedSkillSnapshotArgs {
   name: string;
@@ -104,7 +105,10 @@ function getMessageTextContent(message: MuxMessage): string {
     .join("");
 }
 
-function extractLoadedSkillSnapshotFromToolOutput(output: unknown): LoadedSkillSnapshot | null {
+function extractLoadedSkillSnapshotFromToolOutput(
+  output: unknown,
+  input?: unknown
+): LoadedSkillSnapshot | null {
   if (typeof output !== "object" || output == null || Array.isArray(output)) {
     return null;
   }
@@ -121,7 +125,7 @@ function extractLoadedSkillSnapshotFromToolOutput(output: unknown): LoadedSkillS
 
   const skill = parsedSkill.data;
   return createLoadedSkillSnapshot({
-    name: skill.frontmatter.name,
+    name: resolveSkillReadIdentity(input, skill.frontmatter.name),
     scope: skill.scope,
     body: skill.body,
     frontmatterYaml: stringifyAgentSkillFrontmatter(skill.frontmatter),
@@ -183,7 +187,7 @@ function extractLoadedSkillSnapshotsFromCodeExecutionOutput(
     // extractors treat ok:false as authoritative failure — do the same here so
     // contradictory rows cannot inject a skill snapshot into later requests.
     if (record.ok === false) continue;
-    const snapshot = extractLoadedSkillSnapshotFromToolOutput(record.result);
+    const snapshot = extractLoadedSkillSnapshotFromToolOutput(record.result, record.args);
     if (snapshot) {
       snapshots.push(snapshot);
     }
@@ -208,7 +212,7 @@ function extractLoadedSkillSnapshotsFromMessage(message: MuxMessage): LoadedSkil
       continue;
     }
 
-    const snapshot = extractLoadedSkillSnapshotFromToolOutput(part.output);
+    const snapshot = extractLoadedSkillSnapshotFromToolOutput(part.output, part.input);
     if (snapshot) {
       snapshots.push(snapshot);
     }

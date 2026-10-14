@@ -1619,6 +1619,13 @@ export interface MCPServerManagerOptions {
   };
 }
 
+/** Drop a workspace's entries from a map keyed `<workspaceId>\0<key>`. */
+function deleteWorkspaceKeys(map: Map<string, unknown>, workspaceId: string): void {
+  for (const key of map.keys()) {
+    if (key.startsWith(`${workspaceId}\0`)) map.delete(key);
+  }
+}
+
 function categorizeMcpTestError(error: string): "timeout" | "connect" | "http_status" | "unknown" {
   const lower = error.toLowerCase();
   if (lower.includes("timed out")) return "timeout";
@@ -4096,6 +4103,22 @@ export class MCPServerManager {
     return this.ensureWorkspaceServers(options, refreshToolCatalogs, readSignal);
   }
 
+  /**
+   * Start (or reuse) the workspace's servers and record its request options, without awaiting
+   * a prompts/list or tools/list refresh. MCP App entry points list and refresh the catalogs
+   * they need themselves, so one server that stalls prompts/list must not hold them.
+   */
+  async warmWorkspaceServers(
+    options: MCPWorkspaceRequestOptions,
+    callOptions?: { signal?: AbortSignal }
+  ): Promise<void> {
+    // `false`: no awaited catalog refresh (getToolsForWorkspace awaits prompts/list on a cold
+    // start). Inside the epoch bracket like every other serve.
+    await this.runWithStablePluginEpoch(() =>
+      this.ensureWorkspaceServers(options, false, callOptions?.signal)
+    );
+  }
+
   async getPromptsForWorkspace(
     options: MCPWorkspaceRequestOptions,
     callOptions?: { signal?: AbortSignal }
@@ -5275,14 +5298,16 @@ export class MCPServerManager {
         }
         log.info("[MCP Apps] Opening an entry point", { workspaceId, serverName, toolName, type });
         const viewKey = mcpAppEntrypointKey(serverName, toolName, type);
+        const order = ++this.entrypointOpenCount;
         dispatched = apps.callToolForApp(toolName, {}, options).then(async (result) => {
-          await store.record(workspaceId, {
+          await this.storeEntrypointResult(store, workspaceId, order, {
             toolCallId: viewKey,
             serverName,
             toolName,
             resourceUri: tool.resourceUri,
             arguments: {},
             result,
+            entrypoint: true,
           });
           return {
             serverName,
@@ -5329,12 +5354,33 @@ export class MCPServerManager {
   }
 
   private readonly entrypointCallWindows = new Map<string, { start: number; count: number }>();
+  /** Entry point opens dispatched so far: orders overlapping opens of one entry point. */
+  private entrypointOpenCount = 0;
+  /** The newest open whose result was stored, by workspace and entry point view key. */
+  private readonly entrypointStoredOpens = new Map<string, number>();
 
   /** Entry point budgets of a stopped workspace would otherwise outlive it. */
   private dropEntrypointBudgets(workspaceId: string): void {
-    for (const key of this.entrypointCallWindows.keys()) {
-      if (key.startsWith(`${workspaceId}\0`)) this.entrypointCallWindows.delete(key);
-    }
+    deleteWorkspaceKeys(this.entrypointCallWindows, workspaceId);
+    deleteWorkspaceKeys(this.entrypointStoredOpens, workspaceId);
+  }
+
+  /**
+   * Store an entry point open's result as its view record. Two windows can open one entry point
+   * at once: a call that finishes after a newer call's result was stored must not overwrite it,
+   * so the tab shows the latest open. Records are written in the order of this check (the
+   * store queues its writes).
+   */
+  private async storeEntrypointResult(
+    store: McpAppResultStore,
+    workspaceId: string,
+    order: number,
+    record: Parameters<McpAppResultStore["record"]>[1]
+  ): Promise<void> {
+    const key = `${workspaceId}\0${record.toolCallId}`;
+    if ((this.entrypointStoredOpens.get(key) ?? 0) > order) return;
+    this.entrypointStoredOpens.set(key, order);
+    await store.record(workspaceId, record);
   }
 
   /** The view tool-call budget (mcpAppHost), applied per workspace and server. */
