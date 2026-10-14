@@ -607,13 +607,13 @@ async function runGit(
 
 /**
  * Extra `git clone` flags for a monorepo subpath install: a partial clone
- * (no blobs up front) that starts with a sparse checkout, so only the
- * subpath's files (plus the few files directly on its parent levels) are
- * ever downloaded. `--no-checkout` + `sparse-checkout set` would leave an
- * EMPTY tree, hence `--sparse`.
+ * (no blobs up front) with no initial checkout. `--sparse` would check out
+ * the repository-root files first, and those count toward the clone quota,
+ * so a small plugin in a monorepo with large root files could not install.
+ * cloneRef checks out after narrowToSubpath has set the sparse pattern.
  */
 function sparseCloneFlags(subpath: string | undefined): string[] {
-  return subpath === undefined ? [] : ["--filter=blob:none", "--sparse"];
+  return subpath === undefined ? [] : ["--filter=blob:none", "--no-checkout"];
 }
 
 /** `git fetch` counterpart of sparseCloneFlags (the sparse checkout is set before checkout). */
@@ -1804,6 +1804,12 @@ export class AgentPluginInstallService {
       { diskQuota: this.cloneDiskQuota(dir) }
     );
     await this.narrowToSubpath(dir, "HEAD", subpath, url);
+    if (subpath !== undefined) {
+      // The clone ran with --no-checkout: materialize only the sparse folder.
+      await runGit(["-C", dir, "checkout", "--quiet", "HEAD"], {
+        diskQuota: this.cloneDiskQuota(dir),
+      });
+    }
   }
 
   private async fetchExactSha(
@@ -1832,7 +1838,7 @@ export class AgentPluginInstallService {
 
   /**
    * Check that every level of `subpath` is a real folder in `rev`, then
-   * narrow the staging clone's sparse checkout (cone mode) to it.
+   * narrow the staging clone's sparse checkout to exactly that folder.
    *
    * SECURITY: each level must be a git tree object (mode 040000), checked
    * BEFORE any subpath blob is fetched. `ls-tree` compares exact names, which
@@ -1875,8 +1881,11 @@ export class AgentPluginInstallService {
         throw subpathNotAFolder(subpath, url, prefix, NON_FOLDER_GIT_MODE_KINDS[mode] ?? "a file");
       }
     }
-    // Lazy-fetches the subpath's blobs, so it carries the clone quota.
-    await runGit(["-C", dir, "sparse-checkout", "set", "--cone", "--", subpath], {
+    // Non-cone pattern `/<subpath>/`: cone mode would also check out every
+    // file at the repository root and in each parent folder, and those count
+    // toward the clone quota. The pattern is literal: normalization rejects
+    // every gitignore special (`* ? [ ] \ ! #`, outer whitespace).
+    await runGit(["-C", dir, "sparse-checkout", "set", "--no-cone", "--", `/${subpath}/`], {
       diskQuota: this.cloneDiskQuota(dir),
     });
   }

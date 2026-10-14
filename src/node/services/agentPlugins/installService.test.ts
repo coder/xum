@@ -4860,8 +4860,8 @@ describe("AgentPluginInstallService", () => {
 
       // A relative link inside the subtree that leaves it (while staying
       // inside the repo) would read different content after install. The
-      // target is a repo-root file, which the cone-mode sparse checkout DOES
-      // materialize, so only the check on the extracted folder rejects it.
+      // check runs on the extracted folder after the clone is gone, so the
+      // link is rejected whether or not its target was checked out.
       await fsPromises.symlink("../../README.md", path.join(monoDir, subpath, "shared"));
       await commitAll(monoDir, "link out of the plugin folder");
       await expect(service.preview({ input: monoUrl, subpath })).rejects.toThrow(
