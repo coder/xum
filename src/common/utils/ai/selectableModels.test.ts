@@ -26,7 +26,7 @@ import {
 const ids = (...keys: KnownModelKey[]): string[] => keys.map((key) => KNOWN_MODELS[key].id);
 const ANTHROPIC = ids("FABLE", "MYTHOS", "OPUS", "SONNET", "HAIKU");
 const OPENAI = ids("GPT", "GPT_6_LUNA", "GPT_6_ASTRA");
-const GOOGLE = ids("GEMINI_31_PRO", "GEMINI_FLASH");
+const GOOGLE = ids("GEMINI_31_PRO", "GEMINI_FLASH", "GEMINI_4_ARGON");
 const XAI = ids("GROK_47");
 const DEEPSEEK = ids("DEEPSEEK_V4_PRO", "DEEPSEEK_V4_FLASH");
 const MOONSHOT = ids("KIMI_K3");
