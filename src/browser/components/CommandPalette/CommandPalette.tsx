@@ -3,7 +3,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { Command } from "cmdk";
 import { useCommandRegistry } from "@/browser/contexts/CommandRegistryContext";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
-import { getAgentSkillsStore, useAgentSkills } from "@/browser/stores/AgentSkillsStore";
+import { getAgentSkillsStore, useInvocableSkills } from "@/browser/stores/AgentSkillsStore";
 import type { CommandAction } from "@/browser/contexts/CommandRegistryContext";
 import {
   formatKeybind,
@@ -98,11 +98,11 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
   const commandPanelRef = useRef<HTMLDivElement | null>(null);
   const paletteOpenOriginRef = useRef<HTMLElement | null>(null);
   const { isOpen, initialQuery, close, getActions, addRecent, recent } = useCommandRegistry();
-  const agentSkills = useAgentSkills(
+  const agentSkills = useInvocableSkills(
     isOpen && slashWorkspaceId
       ? { workspaceId: slashWorkspaceId, disableWorkspaceAgents: false }
       : null
-  ).skills;
+  );
   const [query, setQuery] = useState("");
   const [activePrompt, setActivePrompt] = useState<null | {
     title?: string;

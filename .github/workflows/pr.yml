@@ -285,7 +285,11 @@ jobs:
         continue-on-error: true
         with:
           name: crap-lcov-unit-${{ matrix.shard }}
-          path: coverage/**/lcov.info
+          # ran-without-coverage.txt marks a run that fell back to no coverage
+          # (scripts/test-unit-ci.sh); Quality / CRAP then only warns on coverage.
+          path: |
+            coverage/**/lcov.info
+            coverage/**/ran-without-coverage.txt
           if-no-files-found: ignore
           retention-days: 3
       - uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de # v5.5.2

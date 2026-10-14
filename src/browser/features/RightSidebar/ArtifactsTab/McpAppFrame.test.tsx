@@ -253,6 +253,15 @@ describe("McpAppFrame", () => {
     expect(again.view.queryByText(/wants to reach/)).toBeNull();
   });
 
+  test("the prompt names the project that keeps the approval", async () => {
+    // A task of a multi-project workspace stores approvals on its first project, not its own.
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = { connectDomains: ["https://api.example.com"] };
+    approvalProjectPath = "/work/alpha";
+    const { view } = await renderFrame();
+    expect(view.getByRole("alert").textContent).toContain("alpha");
+  });
+
   test("an approval applies at once to every mounted view of the same server", async () => {
     invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
     viewCsp = { connectDomains: ["https://api.example.com"] };

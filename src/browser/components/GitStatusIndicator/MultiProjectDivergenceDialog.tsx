@@ -48,7 +48,7 @@ function getHeaderSummary(summary: MultiProjectGitSummary | null): React.ReactNo
     fragments.push({
       key: "diverged",
       text: `${summary.divergedProjectCount} diverged`,
-      className: "text-accent",
+      className: "text-accent-text",
     });
   }
   if (summary.dirtyProjectCount > 0) {

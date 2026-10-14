@@ -36,6 +36,15 @@ describe("getInlineSkillSuggestions", () => {
     ]);
   });
 
+  test("suggests qualified names, which the inline parser reads", () => {
+    expect(
+      getInlineSkillSuggestions({
+        partial: "tdd",
+        descriptors: [descriptor("tdd"), descriptor("pstack:tdd")],
+      }).map((suggestion) => suggestion.display)
+    ).toEqual(["$tdd", "$pstack:tdd"]);
+  });
+
   test("suggests only MCP prompts without required arguments", () => {
     expect(
       getInlineSkillSuggestions({

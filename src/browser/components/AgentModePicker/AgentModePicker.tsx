@@ -485,7 +485,7 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
                     />
                     <span
                       data-testid="agent-name"
-                      className={cn("min-w-0 flex-1 truncate", isSelected && "text-accent")}
+                      className={cn("min-w-0 flex-1 truncate", isSelected && "text-accent-text")}
                     >
                       {opt.name}
                     </span>

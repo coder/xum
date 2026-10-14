@@ -176,6 +176,43 @@ describe("agent_skill_read_file", () => {
     }
   );
 
+  it("reads a file from the plugin named by <plugin>:<skill>", async () => {
+    using tmp = new TestTempDir("plugin-read-file-namespace");
+    for (const plugin of ["alpha", "beta"]) {
+      const root = path.join(tmp.path, "plugins", plugin);
+      const dir = path.join(root, "skills", "ns-fixture");
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(
+        path.join(root, "plugin.json"),
+        JSON.stringify({
+          $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+          name: plugin,
+        })
+      );
+      await fs.writeFile(
+        path.join(dir, "SKILL.md"),
+        "---\nname: ns-fixture\ndescription: x\n---\nBody\n"
+      );
+      await fs.writeFile(path.join(dir, "data.txt"), plugin);
+    }
+    // A global skill of the same name wins the bare lookup over both plugins.
+    const globalDir = path.join(tmp.path, "skills", "ns-fixture");
+    await fs.mkdir(globalDir, { recursive: true });
+    await fs.writeFile(
+      path.join(globalDir, "SKILL.md"),
+      "---\nname: ns-fixture\ndescription: x\n---\nBody\n"
+    );
+    await fs.writeFile(path.join(globalDir, "data.txt"), "global");
+    // Not `tdd`: keeps the fixture name unlikely to collide with host skills.
+    const tool = createAgentSkillReadFileTool(createTestToolConfig(tmp.path));
+    const read = (name: string) => executeReadFile(tool, { name, filePath: "data.txt" });
+
+    expect(await read("ns-fixture")).toMatchObject({ success: true, content: "1\tglobal" });
+    expect(await read("alpha:ns-fixture")).toMatchObject({ success: true, content: "1\talpha" });
+    expect(await read("beta:ns-fixture")).toMatchObject({ success: true, content: "1\tbeta" });
+    expect(await read("gamma:ns-fixture")).toMatchObject({ success: false });
+  });
+
   it("allows reading built-in skill files", async () => {
     using tempDir = new TestTempDir("test-agent-skill-read-file-global-scope");
     const baseConfig = createTestToolConfig(tempDir.path, {
