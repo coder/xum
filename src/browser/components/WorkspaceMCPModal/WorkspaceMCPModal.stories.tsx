@@ -749,9 +749,8 @@ export const WorkspaceMCPServerSettingsSaveInFlight: Story = {
   render: () =>
     renderWorkspaceMCPModal({ ...settingsStoryOptions(), settingsUpdateGate: saveGate }),
   play: async ({ canvasElement }) => {
-    const section = within(
-      await within(await findWorkspaceMCPDialog(canvasElement)).findByTestId("mcp-server-settings")
-    );
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    const section = within(await modal.findByTestId("mcp-server-settings"));
     const zoom = section.getByLabelText("Default zoom setting");
     await userEvent.clear(zoom);
     await userEvent.type(zoom, "3");
@@ -759,8 +758,9 @@ export const WorkspaceMCPServerSettingsSaveInFlight: Story = {
     await waitFor(() => expect(zoom).toBeDisabled());
     await expect(section.getByLabelText("Show grid setting")).toBeDisabled();
     saveGate.open();
-    await waitFor(() => expect(zoom).toBeEnabled());
-    await expect(zoom).toHaveValue(3);
+    // The saved snapshot replaces the section (a new mount), so query the controls again.
+    await waitFor(() => expect(modal.getByLabelText("Default zoom setting")).toBeEnabled());
+    await expect(modal.getByLabelText("Default zoom setting")).toHaveValue(3);
   },
 };
 
@@ -1000,7 +1000,7 @@ export const WorkspaceMCPServerSettingsRefreshDuringSave: Story = {
     await expect(refresh).toBeDisabled();
     refreshDuringSaveGate.open();
     await waitFor(() => expect(refresh).toBeEnabled());
-    await expect(section.getByLabelText("Default zoom setting")).toHaveValue(3);
+    await expect(modal.getByLabelText("Default zoom setting")).toHaveValue(3);
   },
 };
 
