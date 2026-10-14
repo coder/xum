@@ -1,4 +1,10 @@
-import { useEffect, useState, useSyncExternalStore } from "react";
+import {
+  useEffect,
+  useState,
+  useSyncExternalStore,
+  type Dispatch,
+  type SetStateAction,
+} from "react";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
 import { subscribeAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import { subscribeWorkspaceMcpOverridesSaved } from "@/browser/utils/workspaceMcpMutations";
@@ -174,18 +180,29 @@ export function useLoadMcpAppEntrypoints(workspaceId: string | null, enabled: bo
     [workspaceId]
   );
 
-  // A server's tools/list_changed can add, remove or rebind entry points: re-list. The stream
-  // dies with its socket. A reconnect brings a new `api`, which opens it again.
-  useEffect(() => {
-    if (api == null || workspaceId == null || !enabled) return;
-    return followCatalogChanges(api, workspaceId, () => setMutationTick((tick) => tick + 1));
-  }, [api, workspaceId, enabled]);
+  useFollowCatalogChanges(api, workspaceId, enabled, setMutationTick);
 
   // Syncs an external store with the backend (not derived React state).
   useEffect(() => {
     if (workspaceId == null) return;
     return loadMcpAppEntrypoints(api, workspaceId, enabled);
   }, [api, workspaceId, enabled, mutationTick]);
+}
+
+/**
+ * A server's tools/list_changed can add, remove or rebind entry points: `bump` re-lists.
+ * The stream dies with its socket. A reconnect brings a new `api`, which opens it again.
+ */
+function useFollowCatalogChanges(
+  api: APIClient | null,
+  workspaceId: string | null,
+  enabled: boolean,
+  bump: Dispatch<SetStateAction<number>>
+): void {
+  useEffect(() => {
+    if (api == null || workspaceId == null || !enabled) return;
+    return followCatalogChanges(api, workspaceId, () => bump((tick) => tick + 1));
+  }, [api, workspaceId, enabled, bump]);
 }
 
 /** Call `onChange` per tools/list_changed tick of the workspace; returns the stop. */

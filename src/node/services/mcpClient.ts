@@ -316,6 +316,12 @@ function mcpToModelOutput({
  * to a pre-2026 client — on anything but definitive modern evidence. A
  * `prior` verdict skips the probe entirely.
  */
+/** Hand the server's tools/list_changed notifications to `onChanged` (MCPClientConfig). */
+function reportToolsListChanged(client: Client, onChanged: (() => void) | undefined): void {
+  if (onChanged === undefined) return;
+  client.setNotificationHandler("notifications/tools/list_changed", () => onChanged());
+}
+
 export async function createMCPClient(config: MCPClientConfig): Promise<MCPClientHandle> {
   const mcpApps = config.mcpApps === true;
   const client = new Client(CLIENT_INFO, {
@@ -340,10 +346,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
     const onUncaughtError = config.onUncaughtError;
     client.onerror = (error) => onUncaughtError(error);
   }
-  if (config.onToolsListChanged) {
-    const onToolsListChanged = config.onToolsListChanged;
-    client.setNotificationHandler("notifications/tools/list_changed", () => onToolsListChanged());
-  }
+  reportToolsListChanged(client, config.onToolsListChanged);
 
   const transport = isHttpTransportConfig(config.transport)
     ? createHttpTransport(config.transport)
