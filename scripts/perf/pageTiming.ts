@@ -24,6 +24,7 @@ import { chromium } from "playwright";
 import { diffSeed, snapshotSeed, writeNeutralSeed } from "./neutralSeed";
 import * as core from "./pageTimingCore";
 import { probe, STATIC_VIEW_ID } from "./pageTimingProbe";
+import * as stats from "./pageTimingStats";
 import { BLOCK_PAIRS, gate, kthLargest, launchPlan, median, type Signal } from "./pageTimingStats";
 
 /** Lighthouse's mobile values, applied as DevTools throttling: real timings, not the simulator's. */
@@ -213,11 +214,15 @@ async function block(o: Common & { base: string; head: string; label: string }) 
   return { ucs: d("ucs"), ucsLive: d("ucsLive"), ir: d("ir") };
 }
 
-/** The file's entry for the page if it can gate a run: qualified, with finite MDIs. Else null. */
+const signals = ["ucs", "ir"] as const;
+/** The file's entry for the page if it can gate a run: qualified, with MDIs within the limits. Else null. */
 function qualifiedEntry(file: string, page: core.Page) {
   try {
     const q = JSON.parse(fs.readFileSync(file, "utf8"))[page] as Host;
-    const ok = [q.mdi.ucs, q.mdi.ir].every((v) => typeof v === "number" && v >= 0 && v < Infinity);
+    // Within the limits, not only finite: an older runner's file can call a noisier host qualified (#6204).
+    const ok = signals.every(
+      (k) => typeof q.mdi[k] === "number" && q.mdi[k] >= 0 && q.mdi[k] <= stats.QUALIFY_MDI_LIMIT[k]
+    );
     return q.qualification === "qualified" && ok ? q : null;
   } catch {
     return null; // unreadable, not JSON, or no entry or MDIs for the page

@@ -54,3 +54,12 @@ test("refuses a --predict key given twice, and a file as --out", () => {
   expect(r.stderr).toContain(`--out ${q} is not a new or empty folder`);
   expect(r.stderr).not.toContain("bad --predict keys");
 }, 60_000);
+
+test("refuses a qualification whose MDI misses the limits (an older runner's file)", () => {
+  const [a, q] = [tree("e", "<p>1</p>"), path.join(tmp, "old-q.json")];
+  const entry = { qualification: "qualified", mdi: { ucs: 0.5, ir: 0.1 } };
+  fs.writeFileSync(q, JSON.stringify({ p1: entry }));
+  const r = runner(["--base", a, "--head", a, "--qualification", q, "--pages", "p1"]);
+  expect(r.status).toBe(2);
+  expect(r.stderr).toContain(`${q} has no qualified p1 entry`);
+}, 60_000);
