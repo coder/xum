@@ -825,7 +825,7 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   workspaceKey(getAutoExpandPrefsKey, "ui", true, AUTO_EXPAND_PREFS_MAX_CHARS),
   // Legacy creation-draft name state, now in the draft body on the backend (imported once by
   // DraftStore.migrateLegacyDrafts, then removed). Never written again, so no budget (0). Still
-  // copied: the legacy pending-draft import moves it to the imported draft's scope first.
+  // copied, so a key not imported yet follows its draft's settings.
   workspaceKey(getWorkspaceNameStateKey, "draft", true, 0, "draft"),
   // The VS Code webview composer's unsent text. Longer drafts still work for the session (kept in
   // memory); the webview then persists only the last text that fit.
