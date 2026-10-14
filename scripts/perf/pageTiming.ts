@@ -63,16 +63,29 @@ async function withLock<T>(fn: () => Promise<T>): Promise<T> {
   const lockArgs = ["-w", "3600", file, "sh", "-c", "echo held; exec cat >/dev/null"];
   const holder = spawn("flock", lockArgs, { detached: true });
   const exited = once(holder, "exit").then(() => null);
+  // Registered while flock still waits too: an interrupt ends its group (flock, sh, cat), so no waiter
+  // outlives the runner and takes the lock later.
+  const cancel = () => (signalIfAlive(-holder.pid!, "SIGTERM"), exited);
+  active.add(cancel);
   if ((await Promise.race([once(holder.stdout, "data"), exited])) === null) {
+    active.delete(cancel);
     throw new Error(`could not take the lock ${file}`);
   }
-  const release = () => (holder.stdin.end(), exited);
-  active.add(release);
   try {
     return await fn();
   } finally {
-    await release();
-    active.delete(release);
+    holder.stdin.end();
+    await exited;
+    active.delete(cancel);
+  }
+}
+
+/** process.kill that ignores ESRCH: the process or group already exited. */
+function signalIfAlive(pid: number, signal: NodeJS.Signals) {
+  try {
+    process.kill(pid, signal);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
   }
 }
 
@@ -111,7 +124,6 @@ async function startServer(tree: string, root: string, home: string, logFile: st
     fetch(`${origin}/health`)
       .then((r) => r.ok)
       .catch(() => false);
-  for (let i = 0; i < 120 && !(await up()); i++) await sleep(500);
   const stopOnce = async () => {
     try {
       process.kill(-server.pid!, "SIGTERM");
@@ -121,13 +133,7 @@ async function startServer(tree: string, root: string, home: string, logFile: st
     if (server.exitCode === null && server.signalCode === null) await once(server, "exit");
     // Workspace commands run in their own process groups, so the group kill misses them, and they can
     // still write into the seed after the server exits. All inherit HOME: wait until no process has it.
-    const kill = (pid: number) => {
-      try {
-        process.kill(pid, "SIGKILL");
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-      }
-    };
+    const kill = (pid: number) => signalIfAlive(pid, "SIGKILL");
     fs.closeSync(log);
     await core
       .reapRun(() => withEnv(`HOME=${home}`), kill, sleep)
@@ -137,6 +143,8 @@ async function startServer(tree: string, root: string, home: string, logFile: st
   };
   let stopping: Promise<void> | undefined; // the interrupt and the run's own finally both stop it
   const stop = () => (stopping ??= stopOnce());
+  active.add(stop); // before the health wait: an interrupt during it must stop the server too
+  for (let i = 0; i < 120 && !(await up()); i++) await sleep(500);
   return { origin, stop };
 }
 
@@ -163,7 +171,6 @@ async function measure(o: Common & { tree: string; mode: Signal; name: string })
       const before = seed && snapshotSeed(seedDir);
       for (const dir of [root, home]) fs.mkdirSync(dir, { recursive: true });
       const server = await startServer(o.tree, root, home, log);
-      active.add(server.stop);
       const run = await browse(o, `${server.origin}${route}`).finally(async () => {
         await server.stop();
         active.delete(server.stop);
@@ -171,13 +178,7 @@ async function measure(o: Common & { tree: string; mode: Signal; name: string })
       const now = (rel: string) => fs.readFileSync(path.join(seedDir, rel));
       const diff = before && diffSeed(before, seedDir);
       const rewrites = diff ? core.seedRewrites(diff, before, now) : [];
-      const record = {
-        ...o,
-        ...run,
-        host,
-        seedAdded: diff ? diff.added : [],
-        seedRewrites: rewrites,
-      };
+      const record = { ...o, ...run, host, seedAdded: diff?.added ?? [], seedRewrites: rewrites };
       fs.writeFileSync(path.join(o.out, `${o.name}.json`), JSON.stringify(record));
       if (rewrites.length > 0) throw new Error(`${o.name}: a build rewrote the seed: ${rewrites}`);
       return run.values;
