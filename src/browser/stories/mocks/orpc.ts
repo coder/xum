@@ -1459,7 +1459,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             data: {
               viewKey: `settings:${input.serverName}:${input.toolName}`,
               serverName: input.serverName,
-              serverLabel: input.serverName,
+              // A plugin server's label, as the backend gives one (it differs from the key).
+              serverLabel: `cad-plugin · ${input.serverName}`,
               toolName: input.toolName,
               title: (action?.kind === "tool" ? action.action?.title : undefined) ?? input.toolName,
               resourceUri: `ui://${input.serverName}/${input.toolName}`,

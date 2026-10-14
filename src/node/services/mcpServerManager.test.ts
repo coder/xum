@@ -1601,12 +1601,17 @@ describe("MCPServerManager", () => {
       resourceUri: "ui://cad/payment",
     });
     expect(calls).toEqual([`payment {"xum/workspaceId":"${workspaceId}"}`]);
+    // A result Xum cannot store fails the open: the stable key still holds the previous
+    // open's result, which the view must not get.
+    const recordSpy = spyOn(store, "record").mockResolvedValueOnce(false);
+    expect(await open("payment", true)).toContain("could not keep");
+    recordSpy.mockRestore();
     // getMcpAppView mounts the modal's view from this record; it is never a tool call's view.
     // With the experiment switched off, nothing opens: the open is refused (the server restarts
     // without MCP Apps), and a fresh read gives the app tool no action.
     appsEnabled = false;
     expect(await open("payment", true)).toContain("Reopen");
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(2);
     const reread = await manager.readSettings(workspaceId, "cad");
     expect(snapshot.layout[0]?.items).toEqual([
       { kind: "tool", tool: "payment", action: actions.payment },

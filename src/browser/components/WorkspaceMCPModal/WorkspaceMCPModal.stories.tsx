@@ -786,6 +786,8 @@ export const WorkspaceMCPServerSettingsToolActions: Story = {
     const appDialog = await page.findByRole("dialog", { name: "Payment method" });
     await expect(toolActionRuns[2]).toEqual({ toolName: "cad.payment", confirmed: true });
     await waitFor(() => expect(appDialog.querySelector("iframe")).not.toBeNull());
+    // The header names the server by the label the backend sent, not the bare key.
+    await expect(within(appDialog).getByText("cad-plugin · cad")).toBeInTheDocument();
     // One Close control: the panel's own header (the dialog's corner button is hidden).
     await expect(within(appDialog).getAllByRole("button", { name: /close/i })).toHaveLength(1);
     // Escape closes the app modal and leaves the settings dialog open.

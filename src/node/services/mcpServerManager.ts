@@ -5253,7 +5253,7 @@ export class MCPServerManager {
           options
         );
         dispatched = call.then(async (result) => {
-          await this.storeEntrypointResult(store, workspaceId, order, {
+          const stored = await this.storeEntrypointResult(store, workspaceId, order, {
             toolCallId: viewKey,
             serverName,
             toolName,
@@ -5263,6 +5263,9 @@ export class MCPServerManager {
             // Not a tool call's view: a chat card or restored tab never resolves to it.
             entrypoint: true,
           });
+          // The key is stable per server and tool: an unstored result would open the view
+          // with the previous open's result, so the open fails instead.
+          assertSettingsAppStored(stored, title);
           const serverLabel = this.appServerLabel(workspaceId, serverName);
           return { viewKey, serverName, serverLabel, toolName, title, resourceUri };
         });
@@ -5671,11 +5674,12 @@ export class MCPServerManager {
     workspaceId: string,
     order: number,
     record: Parameters<McpAppResultStore["record"]>[1]
-  ): Promise<void> {
+  ): Promise<boolean> {
     const key = `${workspaceId}\0${record.toolCallId}`;
-    if ((this.entrypointStoredOpens.get(key) ?? 0) > order) return;
+    // A newer open's result is stored: this view shows it, which counts as stored.
+    if ((this.entrypointStoredOpens.get(key) ?? 0) > order) return true;
     this.entrypointStoredOpens.set(key, order);
-    await store.record(workspaceId, record);
+    return store.record(workspaceId, record);
   }
 
   /** The view tool-call budget (mcpAppHost), applied per workspace and server. */
@@ -8059,6 +8063,10 @@ export class MCPServerManager {
       signal.removeEventListener("abort", onAbort);
     }
   }
+}
+
+function assertSettingsAppStored(stored: boolean, title: string): void {
+  if (!stored) throw new Error(`Xum could not keep the result of '${title}'. Try again.`);
 }
 
 /** A CallToolResult content part's text; "" for any other part. */

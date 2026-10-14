@@ -112,13 +112,18 @@ function consentText(request: McpAppConsentRequest): [string, string, string] {
   }
 }
 
-function McpAppViewHeader(props: { serverName: string; onClose: () => void }) {
+/** The server as the user sees it: a plugin server's "<plugin> · <server>" label, when known. */
+function viewServerLabel(view: McpAppViewRef): string {
+  return view.serverLabel ?? mcpServerDisplayName(view.serverName);
+}
+
+function McpAppViewHeader(props: { serverName: string; serverLabel: string; onClose: () => void }) {
   return (
     <div className="border-border-light flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-[11px]">
       <span className="text-muted min-w-0 flex-1 truncate">
         App view from{" "}
         <TooltipIfPresent tooltip={props.serverName}>
-          <span className="text-foreground">{mcpServerDisplayName(props.serverName)}</span>
+          <span className="text-foreground">{props.serverLabel}</span>
         </TooltipIfPresent>
       </span>
       <TooltipIfPresent tooltip="Close view">
@@ -571,7 +576,11 @@ export function McpAppFrame(props: {
   useExposedClose(props.closeRef, () => void close());
 
   const header = inline ? null : (
-    <McpAppViewHeader serverName={serverName} onClose={() => void close()} />
+    <McpAppViewHeader
+      serverName={serverName}
+      serverLabel={viewServerLabel(view)}
+      onClose={() => void close()}
+    />
   );
 
   // A panel keeps its Close header while it loads: a hung load must stay closable.
