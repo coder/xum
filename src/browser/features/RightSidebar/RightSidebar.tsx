@@ -2550,7 +2550,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
             </Button>
           </div>
         )}
-        {!collapsed && (
+        {!collapsed ? (
           <div className="flex min-h-0 min-w-0 flex-1 flex-row">
             {/* Resize handle (left edge); full-screen mode has nothing to resize. */}
             {onStartResize && !fullscreen && (
@@ -2568,8 +2568,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
               {renderLayoutNode(layout.root)}
             </div>
           </div>
-        )}
-        {collapsed && (
+        ) : (
           <RightSidebarOverview
             workspaceId={workspaceId}
             onExpand={handleExpandFromOverview}
