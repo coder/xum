@@ -12,7 +12,7 @@ import { MCPConfigService } from "@/node/services/mcpConfigService";
 import { MCPServerManager } from "@/node/services/mcpServerManager";
 import { log } from "@/node/services/log";
 import { readPluginMcpPolicy } from "./registry";
-import { createTestPluginInstallEntry } from "./testFixtures";
+import { createTestPluginInstallEntry, reviewedComponentConsent } from "./testFixtures";
 import type { AgentPluginInfo } from "./discovery";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import {
@@ -107,6 +107,7 @@ describe("loadPluginMcpServers", () => {
         path.basename(tmp.path),
         "demo"
       ),
+      consentFingerprint: expect.any(String),
     });
   });
 
@@ -899,7 +900,13 @@ describe("createAgentPluginsMcpProvider", () => {
           registryPath,
           JSON.stringify({
             plugins: [
-              createTestPluginInstallEntry("managed", { skills: [], mcpServers: ["allowed"] }),
+              createTestPluginInstallEntry(
+                "managed",
+                { skills: [], mcpServers: ["allowed"] },
+                await reviewedComponentConsent({
+                  pluginDir: path.join(xumHome, "plugins", "managed"),
+                })
+              ),
             ],
           })
         );
@@ -976,7 +983,11 @@ describe("createAgentPluginsMcpProvider", () => {
         path.join(xumHome, "plugins.json"),
         JSON.stringify({
           plugins: [
-            createTestPluginInstallEntry("managed", { skills: [], mcpServers: ["allowed"] }),
+            createTestPluginInstallEntry(
+              "managed",
+              { skills: [], mcpServers: ["allowed"] },
+              await reviewedComponentConsent({ pluginDir: path.join(owner, "managed") })
+            ),
           ],
         })
       );

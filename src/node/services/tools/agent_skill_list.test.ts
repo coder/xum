@@ -4,7 +4,10 @@ import * as path from "node:path";
 
 import { describe, expect, it, spyOn } from "bun:test";
 
-import { createTestPluginInstallEntry } from "@/node/services/agentPlugins/testFixtures";
+import {
+  createTestPluginInstallEntry,
+  reviewedComponentConsent,
+} from "@/node/services/agentPlugins/testFixtures";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import type { XumToolScope } from "@/common/types/toolScope";
 import type { AgentSkillListToolResult } from "@/common/types/tools";
@@ -62,7 +65,7 @@ async function writePlugin(
   containerPath: string,
   pluginName: string,
   skills: Array<{ name: string; description: string }>
-): Promise<void> {
+): Promise<string> {
   const pluginDir = path.join(containerPath, pluginName);
   await fs.mkdir(pluginDir, { recursive: true });
   await fs.writeFile(
@@ -78,6 +81,7 @@ async function writePlugin(
       description: skill.description,
     });
   }
+  return pluginDir;
 }
 
 describe("agent_skill_list", () => {
@@ -381,7 +385,7 @@ describe("agent_skill_list", () => {
     await withHomeDir(homeDir.path, async () => {
       await withMuxRoot(xumHomeDir.path, async () => {
         const container = path.join(xumHomeDir.path, "plugins");
-        await writePlugin(container, "a-managed", [
+        const pluginDir = await writePlugin(container, "a-managed", [
           { name: "selected", description: "selected plugin skill" },
           { name: "skipped", description: "managed skill" },
           { name: "hidden", description: "not imported" },
@@ -389,13 +393,14 @@ describe("agent_skill_list", () => {
         await writePlugin(container, "z-unmanaged", [
           { name: "skipped", description: "fallback skill" },
         ]);
+        const consent = await reviewedComponentConsent({ pluginDir });
         const saveSelection = (skills: string[] | null) =>
           fs.writeFile(
             path.join(xumHomeDir.path, "plugins.json"),
             JSON.stringify({
               plugins: [
                 {
-                  ...createTestPluginInstallEntry("a-managed"),
+                  ...createTestPluginInstallEntry("a-managed", undefined, consent),
                   importedComponents: { skills, mcpServers: [] },
                 },
               ],
@@ -448,7 +453,7 @@ describe("agent_skill_list", () => {
       if (aliasHome) await fs.symlink(physicalHome, xumHome, "dir");
       await withHomeDir(home.path, async () => {
         await withMuxRoot(xumHome, async () => {
-          await writePlugin(path.join(xumHome, "plugins"), "managed", [
+          const pluginDir = await writePlugin(path.join(xumHome, "plugins"), "managed", [
             { name: "allowed", description: "imported" },
             { name: "blocked", description: "not imported" },
           ]);
@@ -460,7 +465,11 @@ describe("agent_skill_list", () => {
             registryPath,
             JSON.stringify({
               plugins: [
-                createTestPluginInstallEntry("managed", { skills: ["allowed"], mcpServers: [] }),
+                createTestPluginInstallEntry(
+                  "managed",
+                  { skills: ["allowed"], mcpServers: [] },
+                  await reviewedComponentConsent({ pluginDir })
+                ),
               ],
             })
           );
