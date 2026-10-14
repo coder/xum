@@ -490,15 +490,48 @@ async function readSignIn(
   };
 }
 
-/** Reports `x → y` when both URLs are on one host and differ (a host move has its own line). */
-function pathChanged(
+type SignInDiscovery = MCPServerOAuthConfig["discovery"];
+
+function discoveryHosts(discovery: SignInDiscovery): Set<string> {
+  return new Set(
+    [discovery?.authorizationServerBase, discovery?.registrationUrl]
+      .filter((url) => url !== undefined)
+      .map((url) => new URL(url).host)
+  );
+}
+
+/** `name changed (x → y)` for a URL that moved on its host (a host move has its own line). */
+function pathMoveLine(
   name: string,
-  x: string | undefined,
-  y: string | undefined,
-  changed: (name: string, x?: string, y?: string) => void
-): void {
-  if (x !== undefined && y !== undefined && new URL(x).host === new URL(y).host)
-    changed(name, x, y);
+  key: "authorizationServerBase" | "registrationUrl",
+  a: SignInDiscovery,
+  b: SignInDiscovery
+): string[] {
+  const [x, y] = [a?.[key], b?.[key]];
+  if (x === undefined || y === undefined || x === y) return [];
+  return new URL(x).host === new URL(y).host ? [`${name} changed (${x} → ${y})`] : [];
+}
+
+/**
+ * Review lines for the sign-in discovery URLs: one per added or removed host, and one per URL
+ * that moved on its host. Tenants share a host (`/tenant-a` → `/tenant-b`), so a path move gets
+ * its own line, also when another discovery URL changed host (#6164).
+ */
+function describeDiscoveryChanges(a: SignInDiscovery, b: SignInDiscovery): string[] {
+  const [oldHosts, newHosts] = [discoveryHosts(a), discoveryHosts(b)];
+  const lines = [
+    ...[...newHosts]
+      .filter((host) => !oldHosts.has(host))
+      .map((host) => `Sign-in at ${host} (new)`),
+    ...[...oldHosts]
+      .filter((host) => !newHosts.has(host))
+      .map((host) => `Sign-in at ${host} (removed)`),
+    ...pathMoveLine("Sign-in server", "authorizationServerBase", a, b),
+    ...pathMoveLine("Client registration", "registrationUrl", a, b),
+  ];
+  if (lines.length === 0 && stableStringify(a ?? null) !== stableStringify(b ?? null))
+    lines.push("Sign-in server changed");
+  return lines;
 }
 
 /** One review line per changed sign-in field. Secrets are named, never shown. */
@@ -518,35 +551,7 @@ export function describeSignInChanges(before?: SurfaceSignIn, after?: SurfaceSig
   };
   changed("Sign-in client", a?.clientId, b?.clientId);
   changed("Token auth method", a?.tokenEndpointAuthMethod, b?.tokenEndpointAuthMethod);
-  const hosts = (oauth?: MCPServerOAuthConfig): Set<string> =>
-    new Set(
-      [oauth?.discovery?.authorizationServerBase, oauth?.discovery?.registrationUrl]
-        .filter((url) => url !== undefined)
-        .map((url) => new URL(url).host)
-    );
-  const [oldHosts, newHosts] = [hosts(a), hosts(b)];
-  const linesBeforeDiscovery = lines.length;
-  for (const host of newHosts) if (!oldHosts.has(host)) lines.push(`Sign-in at ${host} (new)`);
-  for (const host of oldHosts) if (!newHosts.has(host)) lines.push(`Sign-in at ${host} (removed)`);
-  // Tenants share a host (`/tenant-a` → `/tenant-b`): a URL that moves on its host gets its
-  // own line, also when another discovery URL changed host (#6164).
-  pathChanged(
-    "Sign-in server",
-    a?.discovery?.authorizationServerBase,
-    b?.discovery?.authorizationServerBase,
-    changed
-  );
-  pathChanged(
-    "Client registration",
-    a?.discovery?.registrationUrl,
-    b?.discovery?.registrationUrl,
-    changed
-  );
-  if (
-    lines.length === linesBeforeDiscovery &&
-    stableStringify(a?.discovery ?? null) !== stableStringify(b?.discovery ?? null)
-  )
-    lines.push("Sign-in server changed");
+  lines.push(...describeDiscoveryChanges(a?.discovery, b?.discovery));
   const scopes = (oauth?: MCPServerOAuthConfig): string[] => [
     ...(oauth?.baseScopes ?? []),
     ...(oauth?.defaultScopes ?? []),
