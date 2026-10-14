@@ -137,7 +137,12 @@ interface WorkspaceHeaderTitleInputProps {
  * A save whose field is gone reports in the shared toast: its error popover unmounted with the
  * field, and the workspace keeps its old title (#6434).
  */
-function reportSaveError(fieldMounted: boolean, error: string, showError: (error: string) => void) {
+function reportSaveError(
+  fieldMounted: boolean,
+  reported: string | undefined,
+  showError: (error: string) => void
+) {
+  const error = reported ?? "Failed to update title";
   if (fieldMounted) showError(error);
   else
     showFeedbackToast({ type: "error", title: "Could not rename the workspace", message: error });
@@ -197,7 +202,7 @@ function useTitleDraft(props: WorkspaceHeaderTitleInputProps) {
     const result = await updateWorkspaceTitle(props.workspaceId, title);
     if (result.success) return finish();
     phaseRef.current = "editing";
-    reportSaveError(mountedRef.current, result.error ?? "Failed to update title", showError);
+    reportSaveError(mountedRef.current, result.error, showError);
   };
   useSaveOnUnmount(mountedRef, save, draft.trim() !== props.initialTitle.trim());
   // A pending save still renames the workspace: Escape then must not look like a cancel
