@@ -302,8 +302,9 @@ export function createMcpAppHost(options: McpAppHostOptions) {
   let pendingDisplayMode: McpAppDisplayMode | undefined;
   /**
    * The move of a view that cannot stay in its mode (a fullscreen-only view in its tool card),
-   * accepted at ui/initialize. It runs once the view sent initialized: the host must not send
-   * requests (its teardown) before that.
+   * accepted at ui/initialize. It runs at the next initialized: the host must not send requests
+   * (its teardown) before that. A hybrid view's own client can initialize after the
+   * window.openai shim's handshake (mcpAppOpenAiShim.ts), so that later initialized runs it too.
    */
   let startMove: (() => void) | null = null;
 
@@ -536,9 +537,10 @@ export function createMcpAppHost(options: McpAppHostOptions) {
   async function handleNotification(method: string, params: unknown) {
     switch (method) {
       case "ui/notifications/initialized": {
-        if (initialized) return;
-        initialized = true;
-        options.onInitialized();
+        if (!initialized) {
+          initialized = true;
+          options.onInitialized();
+        }
         const move = startMove;
         startMove = null;
         await runMoveAfterTeardown(move, teardown);

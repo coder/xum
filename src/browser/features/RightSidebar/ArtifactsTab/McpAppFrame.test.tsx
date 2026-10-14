@@ -1198,6 +1198,44 @@ describe("McpAppFrame host strips", () => {
     }
   });
 
+  // A hybrid view: the window.openai shim's handshake comes first (no modes), then the view's own
+  // client declares fullscreen only. Its initialized must still start the move.
+  test("a fullscreen-only declaration after the first handshake still moves the view", async () => {
+    const opened: string[] = [];
+    const onOpen = (e: Event) =>
+      opened.push((e as CustomEvent<{ toolCallId: string }>).detail.toolCallId);
+    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onOpen);
+    try {
+      const view = render(<McpAppFrame workspaceId="ws-late" view={VIEW} variant="inline" />, {
+        wrapper: Wrapper,
+      });
+      const frame = await findOpenFrame(view);
+      const posted = capturePosted(frame);
+      postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+      postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
+      await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+      postFromView(frame, {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "ui/initialize",
+        params: { appCapabilities: { availableDisplayModes: ["fullscreen"] } },
+      });
+      await waitFor(() => expect(posted.some((m) => m.id === 2)).toBe(true));
+      await tick();
+      expect(posted.some((m) => m.method === "ui/resource-teardown")).toBe(false);
+      postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
+      const teardown = await waitFor(() => {
+        const message = posted.find((m) => m.method === "ui/resource-teardown");
+        if (message === undefined) throw new Error("no teardown yet");
+        return message;
+      });
+      postFromView(frame, { jsonrpc: "2.0", id: teardown.id, result: {} });
+      await waitFor(() => expect(opened).toEqual(["call-1"]));
+    } finally {
+      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onOpen);
+    }
+  });
+
   // E.g. "Open in tab" on a collapsed card: the view first initializes in its tab. Its card must
   // not host it inline later either, until a newer document declares inline.
   test("a tab instance marks a fullscreen-only view at once; a declaration with inline clears it", async () => {
