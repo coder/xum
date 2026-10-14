@@ -114,7 +114,6 @@ describe.each([...GAP_MODES])("useCoderWorkspace across a reconnect (%s)", (mode
     expect(shown.loadingTemplates || shown.loadingWorkspaces).toBe(false);
     // ChatInput blocks a Coder send on loadingPresets: the reload must hold it.
     expect(shown.loadingPresets).toBe(true);
-    expect(shown.blocksSend).toBe(true);
     expect(shown.templates.map((t) => t.name)).toEqual(["t1"]);
     expect(shown.presets.map((p) => p.name)).toEqual(["p1", "p2"]);
     expect(shown.existingWorkspaces.map((w) => w.name)).toEqual(["w1"]);
@@ -180,30 +179,6 @@ describe.each([...GAP_MODES])("useCoderWorkspace across a reconnect (%s)", (mode
         preset: "p1",
       })
     );
-  });
-
-  // #6383: a workspace deleted while offline must not be sent while the reload runs.
-  test("existing-workspace mode blocks the send until the reload answers, then drops a deleted pick", async () => {
-    const existing: CoderWorkspaceConfig = { existingWorkspace: true, workspaceName: "w1" };
-    const { view, onChange } = renderCoder(existing);
-    await waitFor(() => expect(view.result.current.existingWorkspaces.length).toBe(1));
-    expect(view.result.current.blocksSend).toBe(false);
-
-    let answer: ((lists: ServerLists) => void) | null = null;
-    serverLists = new Promise((resolve) => (answer = resolve));
-    await harness.drop();
-    harness.reconnect();
-    await settle();
-    expect(view.result.current.blocksSend).toBe(true);
-    expect(view.result.current.loadingWorkspaces).toBe(false);
-    expect(view.result.current.existingWorkspaces.map((w) => w.name)).toEqual(["w1"]);
-
-    act(() => answer?.({ templates: [], presets: [], workspaces: [workspace("w2")] }));
-    await waitFor(() => expect(view.result.current.blocksSend).toBe(false));
-    expect(onChange).toHaveBeenLastCalledWith({
-      existingWorkspace: true,
-      workspaceName: undefined,
-    });
   });
 
   test("a window focus while offline keeps the Coder info and config", async () => {

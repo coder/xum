@@ -35,7 +35,6 @@ import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext
 import { useRouter } from "@/browser/contexts/RouterContext";
 import type { Toast } from "@/browser/features/ChatInput/ChatInputToast";
 import { useAPI, useLiveAPI } from "@/browser/contexts/API";
-import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { ConfirmationModal } from "@/browser/components/ConfirmationModal/ConfirmationModal";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
@@ -208,11 +207,6 @@ interface UseCreationWorkspaceReturn {
   nameState: WorkspaceNameState;
   /** Runtime availability state for each mode (loading/failed/loaded) */
   runtimeAvailabilityState: RuntimeAvailabilityState;
-  /**
-   * True once the current client's runtime probe answered. A reconnect keeps the shown
-   * `runtimeAvailabilityState` while it probes again, so a Dev Container send waits for this.
-   */
-  runtimeAvailabilityFresh: boolean;
   /** Trust confirmation dialog element — render in parent component tree */
   trustDialog: React.ReactNode;
 }
@@ -224,20 +218,6 @@ export type RuntimeAvailabilityState =
   | { status: "loading" }
   | { status: "failed" }
   | { status: "loaded"; data: RuntimeAvailabilityMap };
-
-/**
- * Probes the runtimes once. A lost connection returns null: it says nothing about the runtimes,
- * so the shown ones stay, and the next client probes again.
- */
-async function probeRuntimeAvailability(
-  probe: () => Promise<RuntimeAvailabilityMap>
-): Promise<RuntimeAvailabilityState | null> {
-  try {
-    return { status: "loaded", data: await probe() };
-  } catch (error) {
-    return isConnectionLostError(error) ? null : { status: "failed" };
-  }
-}
 
 /** True for a real (non-blank) creation draft ID. */
 function isDraftId(draftId: string | null | undefined): draftId is string {
@@ -328,11 +308,6 @@ export function useCreationWorkspace({
   } | null>(null);
   const [runtimeAvailabilityState, setRuntimeAvailabilityState] =
     useState<RuntimeAvailabilityState>({ status: "loading" });
-  // What the current client's probe answered: "loading" until then, a reconnect too (#6383). The
-  // shown state above keeps the last answer, but a Dev Container config can be gone since then,
-  // so the send preflight reads this one.
-  const [probedRuntimeAvailability, setProbedRuntimeAvailability] =
-    useState<RuntimeAvailabilityState>({ status: "loading" });
 
   // Centralized draft workspace settings with automatic persistence
   const { settings, coderConfigFallback, sshHostFallback, setSelectedRuntime, setTrunkBranch } =
@@ -382,7 +357,6 @@ export function useCreationWorkspace({
       shownProjectPathRef.current = projectPath;
       setRuntimeAvailabilityState({ status: "loading" });
     }
-    setProbedRuntimeAvailability({ status: "loading" });
     // Both requests run at once and settle independently. Send waits for the branch list (#6033),
     // so it must not also wait for the runtime probe (Docker, Podman, devcontainer CLI), which can
     // take several seconds after the branches are ready.
@@ -398,12 +372,12 @@ export function useCreationWorkspace({
       }
     );
     const loadRuntimeAvailability = async () => {
-      const state = await probeRuntimeAvailability(() =>
-        api.projects.runtimeAvailability({ projectPath })
-      );
-      if (!mounted || state == null) return;
-      setRuntimeAvailabilityState(state);
-      setProbedRuntimeAvailability(state);
+      try {
+        const data = await api.projects.runtimeAvailability({ projectPath });
+        if (mounted) setRuntimeAvailabilityState({ status: "loaded", data });
+      } catch {
+        if (mounted) setRuntimeAvailabilityState({ status: "failed" });
+      }
     };
     void loadRuntimeAvailability();
     return () => {
@@ -448,7 +422,7 @@ export function useCreationWorkspace({
       if (kind !== "scratch" && runtimeSelection.mode === RUNTIME_MODE.DEVCONTAINER) {
         const devcontainerSelection = resolveDevcontainerSelection({
           selectedRuntime: runtimeSelection,
-          availabilityState: probedRuntimeAvailability,
+          availabilityState: runtimeAvailabilityState,
         });
 
         if (!devcontainerSelection.isCreatable) {
@@ -981,7 +955,7 @@ export function useCreationWorkspace({
       projectsLoading,
       onWorkspaceCreated,
       settings.selectedRuntime,
-      probedRuntimeAvailability,
+      runtimeAvailabilityState,
       setSelectedRuntime,
       creationAgentId,
       settings.model,
@@ -1060,7 +1034,6 @@ export function useCreationWorkspace({
     nameState: workspaceNameState,
     // Runtime availability state for each mode
     runtimeAvailabilityState,
-    runtimeAvailabilityFresh: probedRuntimeAvailability.status !== "loading",
     trustDialog,
   };
 }
