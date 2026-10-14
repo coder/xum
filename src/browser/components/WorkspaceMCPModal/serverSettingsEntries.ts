@@ -1,13 +1,16 @@
 import { getOwn } from "@/common/utils/getOwn";
 import {
   validateMCPSettingValue,
+  type MCPSettingsReadSnapshot,
   type MCPSettingsSnapshot,
-  type MCPSettingValue,
 } from "@/common/utils/mcpSettings";
 
-/** One server's settings in the workspace MCP dialog. `fetchId` is the read's request ID. */
+/**
+ * One server's settings in the workspace MCP dialog. `fetchId` is the ID of the request (read
+ * or save) that returned the snapshot; the section remounts when it changes.
+ */
 export type ServerSettingsEntry =
-  | { fetchId: number; snapshot: MCPSettingsSnapshot }
+  | { fetchId: number; snapshot: MCPSettingsReadSnapshot }
   | { error: string }
   | { notConnected: true };
 
@@ -41,15 +44,20 @@ export class SettingsRequests {
   }
 }
 
-/** Keep a save's returned values as the snapshot's values (the caller checked it is latest). */
+/**
+ * Show the snapshot a save returned, under the save's request ID (the caller checked it is
+ * latest), so a later stale result still cannot replace it. A server whose section is gone
+ * (an error or "not connected" entry) keeps its entry.
+ */
 export function applySavedSettings(
   entries: Record<string, ServerSettingsEntry>,
   serverName: string,
-  values: Record<string, MCPSettingValue>
+  fetchId: number,
+  snapshot: MCPSettingsReadSnapshot
 ): Record<string, ServerSettingsEntry> {
   const current = getOwn(entries, serverName);
   if (current === undefined || !("snapshot" in current)) return entries;
-  return { ...entries, [serverName]: { ...current, snapshot: { ...current.snapshot, values } } };
+  return { ...entries, [serverName]: { fetchId, snapshot } };
 }
 
 /** Validation errors of a settings draft, by setting name. */

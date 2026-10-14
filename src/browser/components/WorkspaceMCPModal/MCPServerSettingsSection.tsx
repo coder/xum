@@ -10,21 +10,21 @@ import { getOwn } from "@/common/utils/getOwn";
 import {
   type MCPSettingSchema,
   type MCPSettingValue,
-  type MCPSettingsSnapshot,
+  type MCPSettingsReadSnapshot,
 } from "@/common/utils/mcpSettings";
 import { settingsErrors } from "./serverSettingsEntries";
 
 interface MCPServerSettingsSectionProps {
   workspaceId: string;
   serverName: string;
-  snapshot: MCPSettingsSnapshot;
+  snapshot: MCPSettingsReadSnapshot;
   /**
    * Called when a save starts (it takes the save's settings request); the returned callback
-   * runs when the save ends, with the values a successful save returned (null on failure).
-   * The dialog keeps them as the snapshot's values, so a remount starts from what the server
-   * stored, and keeps Refresh Tools disabled until the save ends.
+   * runs when the save ends, with the snapshot a successful save returned (null on failure).
+   * The dialog shows that snapshot (the server's schema can change with its values), and
+   * keeps Refresh Tools disabled until the save ends.
    */
-  beginSave: () => (values: MCPSettingsSnapshot["values"] | null) => void;
+  beginSave: () => (snapshot: MCPSettingsReadSnapshot | null) => void;
   /**
    * Refresh Tools runs for this server. Its settings read would take a newer request ID than
    * a save started now, and the save's result would be dropped, so Save waits for it.
@@ -76,17 +76,18 @@ export const MCPServerSettingsSection = React.forwardRef<
     setSaving(true);
     setError(null);
     const onSettled = props.beginSave();
-    let savedValues: MCPSettingsSnapshot["values"] | null = null;
+    let savedSnapshot: MCPSettingsReadSnapshot | null = null;
     try {
       const result = await api.mcp.settings.update({
         workspaceId: props.workspaceId,
         serverName: props.serverName,
         set: changed,
+        instanceToken: props.snapshot.instanceToken,
       });
       if (result.success) {
-        setSaved(result.data);
-        setDraft(result.data);
-        savedValues = result.data;
+        setSaved(result.data.values);
+        setDraft(result.data.values);
+        savedSnapshot = result.data;
       } else {
         setError(result.error);
         setDraft(saved);
@@ -97,7 +98,7 @@ export const MCPServerSettingsSection = React.forwardRef<
     } finally {
       setNumberText({});
       setSaving(false);
-      onSettled(savedValues);
+      onSettled(savedSnapshot);
     }
   };
 
