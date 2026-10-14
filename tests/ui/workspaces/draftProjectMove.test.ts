@@ -102,6 +102,44 @@ async function onlyDraftId(projectPath: string): Promise<string> {
   }, WAIT);
 }
 
+type OrpcClient = ReturnType<typeof getSharedEnv>["orpc"];
+
+/**
+ * The app's API client, with nameGeneration.generate held until release(). Holding the client
+ * call (not a backend service) lets allAnswered() resolve only after the composer that made a
+ * request has handled its answer: its await runs before the test's.
+ */
+function holdNameGeneration(orpc: OrpcClient) {
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const answered: Promise<unknown>[] = [];
+  const nameGeneration = new Proxy(orpc.nameGeneration, {
+    get(target, key, receiver) {
+      if (key !== "generate") return Reflect.get(target, key, receiver) as unknown;
+      return (...args: Parameters<typeof target.generate>) => {
+        const call = released.then(() => target.generate(...args));
+        answered.push(call);
+        return call;
+      };
+    },
+  });
+  const client = new Proxy(orpc, {
+    get(target, key, receiver) {
+      return key === "nameGeneration"
+        ? nameGeneration
+        : (Reflect.get(target, key, receiver) as unknown);
+    },
+  });
+  return {
+    client,
+    release,
+    calls: () => answered.length,
+    allAnswered: () => Promise.allSettled(answered),
+  };
+}
+
 describeIntegration("Creation project selector moves the draft", () => {
   let projectBDir = "";
   let projectB = "";
@@ -122,14 +160,14 @@ describeIntegration("Creation project selector moves the draft", () => {
     await cleanupSharedRepo();
   });
 
-  async function openTwoProjects(): Promise<{
+  async function openTwoProjects(apiClient: OrpcClient = getSharedEnv().orpc): Promise<{
     view: RenderedApp;
     cleanupDom: () => void;
     a: string;
     b: string;
   }> {
     const cleanupDom = setupTestDom();
-    const view = renderApp({ apiClient: getSharedEnv().orpc });
+    const view = renderApp({ apiClient });
     await view.waitForReady();
     // The shared repo is registered by createSharedRepo (trusting it adds it).
     const a = getSharedRepoPath();
@@ -214,37 +252,24 @@ describeIntegration("Creation project selector moves the draft", () => {
   }, 90_000);
 
   test("the bare project page's default draft moves and leaves that page empty", async () => {
-    const { view, cleanupDom, a, b } = await openTwoProjects();
+    // The source composer's name request settles after the move.
+    const naming = holdNameGeneration(getSharedEnv().orpc);
+    const { view, cleanupDom, a, b } = await openTwoProjects(naming.client);
     const { container } = view;
-    // Holds workspace name generation, so the source composer's request settles after the move.
-    const workspaceService = getSharedEnv().services.workspaceService;
-    const realCandidates = workspaceService.getWorkspaceNamingCandidates.bind(workspaceService);
-    let releaseNaming!: () => void;
-    const namingReleased = new Promise<void>((resolve) => {
-      releaseNaming = resolve;
-    });
-    const namingCalls: Promise<unknown>[] = [];
-    const namingSpy = jest
-      .spyOn(workspaceService, "getWorkspaceNamingCandidates")
-      .mockImplementation((...args) => {
-        const call = namingReleased.then(() => realCandidates(...args));
-        namingCalls.push(call.catch(() => undefined));
-        return call;
-      });
     try {
       // The project row opens a non-empty default draft (the bare project page).
       getDraftStore().setText(defaultCreationDraftScope(a), "default text");
       await getDraftStore().flush(defaultCreationDraftScope(a));
       await openProjectCreationView(view, a);
       await waitFor(() => expect(textareaValue(container)).toBe("default text"), WAIT);
-      await waitFor(() => expect(namingSpy).toHaveBeenCalled(), WAIT);
+      await waitFor(() => expect(naming.calls()).toBeGreaterThan(0), WAIT);
 
       await moveDraftTo(container, path.basename(b));
 
       await onlyDraftId(b);
       await waitFor(() => expect(textareaValue(container)).toBe("default text"), WAIT);
-      releaseNaming();
-      await Promise.all(namingCalls);
+      naming.release();
+      await naming.allAnswered();
       await waitFor(
         () => expect(getDraftStore().getView(defaultCreationDraftScope(a)).text).toBe(""),
         WAIT
@@ -253,8 +278,25 @@ describeIntegration("Creation project selector moves the draft", () => {
       // No workspace name is left behind either: it would keep A's bare page non-empty.
       expect(readPersistedState(getWorkspaceNameStateKey(getPendingScopeId(a)), null)).toBeNull();
     } finally {
-      releaseNaming();
-      namingSpy.mockRestore();
+      naming.release();
+      await cleanupView(view, cleanupDom);
+    }
+  }, 90_000);
+
+  test("an empty listed draft moves with its settings and leaves no row behind", async () => {
+    const { view, cleanupDom, a, b } = await openTwoProjects();
+    try {
+      await openProjectCreationView(view, a);
+      await onlyDraftId(a);
+      setWorkspaceModelWithOrigin(getProjectScopeId(a), KNOWN_MODELS.HAIKU.id, "user");
+
+      await moveDraftTo(view.container, path.basename(b));
+
+      await onlyDraftId(b);
+      // The DraftStore leaves an empty source alone, so the move deletes its list entry itself.
+      await waitForDraftIds(a, []);
+      expect(getWorkspaceAiSelection(getProjectScopeId(b)).model).toBe(KNOWN_MODELS.HAIKU.id);
+    } finally {
       await cleanupView(view, cleanupDom);
     }
   }, 90_000);
@@ -322,6 +364,29 @@ describeIntegration("Creation project selector moves the draft", () => {
         WAIT
       );
       expect(textareaValue(container)).toBe("same draft");
+    } finally {
+      await cleanupView(view, cleanupDom);
+    }
+  }, 90_000);
+
+  test("the project selector is disabled while a creation send is in flight", async () => {
+    // A send first waits for the workspace name, so a held name request keeps it in flight.
+    // Never released: the send must not go on to create a workspace.
+    const naming = holdNameGeneration(getSharedEnv().orpc);
+    const { view, cleanupDom, a } = await openTwoProjects(naming.client);
+    const { container } = view;
+    const selector = () =>
+      container.querySelector<HTMLButtonElement>('[data-testid="project-selector"]');
+    try {
+      await openProjectCreationView(view, a);
+      const draftId = await onlyDraftId(a);
+      getDraftStore().setText(creationScope(a, draftId), "send me");
+      await waitFor(() => expect(naming.calls()).toBeGreaterThan(0), WAIT);
+      expect(selector()?.disabled).toBe(false);
+
+      fireEvent.click(container.querySelector<HTMLElement>('button[aria-label="Send message"]')!);
+
+      await waitFor(() => expect(selector()?.disabled).toBe(true), WAIT);
     } finally {
       await cleanupView(view, cleanupDom);
     }
