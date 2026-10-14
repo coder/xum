@@ -69,7 +69,7 @@ interface WorkspaceMCPStoryOptions {
   settingsConnected?: string[];
   settingsReads?: string[][];
   settingsReadErrors?: Record<string, string>;
-  settingsUpdateGate?: { promise: Promise<void> };
+  settingsUpdateGate?: { promise: Promise<void> } | Array<{ promise: Promise<void> }>;
   settingsFirstReadGate?: { promise: Promise<void> };
   testGate?: { promise: Promise<void> };
 }
@@ -1020,6 +1020,66 @@ export const WorkspaceMCPServerSettingsSaveDuringRefresh: Story = {
     await waitFor(() => expect(save).toBeDisabled());
     saveDuringRefreshGate.open();
     await expect(modal.findByRole("button", { name: "Refresh Tools" })).resolves.toBeEnabled();
+  },
+};
+
+const overlapFirstSave = storyGate();
+const overlapSecondSave = storyGate();
+
+/**
+ * A save started after a close and reopen overlaps one from before it: Refresh Tools stays
+ * disabled until both settle, not only the first.
+ */
+export const WorkspaceMCPServerSettingsOverlappingSaves: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <WorkspaceMCPModalStoryShell
+      setup={() =>
+        setupWorkspaceMCPModalStory({
+          ...settingsStoryOptions(),
+          settingsUpdateGate: [overlapFirstSave, overlapSecondSave],
+        })
+      }
+    >
+      <ReopenableWorkspaceMCPModal />
+    </WorkspaceMCPModalStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const saveZoom = async (zoom: string) => {
+      const section = within(
+        await within(await findWorkspaceMCPDialog(canvasElement)).findByTestId(
+          "mcp-server-settings"
+        )
+      );
+      const input = section.getByLabelText("Default zoom setting");
+      await userEvent.clear(input);
+      await userEvent.type(input, zoom);
+      await userEvent.click(section.getByRole("button", { name: "Save settings" }));
+      await waitFor(() => expect(input).toBeDisabled());
+    };
+    await saveZoom("3");
+    await userEvent.click(
+      within(await findWorkspaceMCPDialog(canvasElement)).getByRole("button", { name: "Cancel" })
+    );
+    await waitFor(() =>
+      expect(queryWorkspaceMCPDialog(canvasElement.ownerDocument)).not.toBeInTheDocument()
+    );
+    await userEvent.click(
+      within(canvasElement).getByRole("button", { name: "Open workspace MCP" })
+    );
+    await saveZoom("4");
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    const fetchTools = modal.getByRole("button", { name: "Fetch Tools" });
+    await expect(fetchTools).toBeDisabled();
+    overlapFirstSave.open();
+    await overlapFirstSave.promise;
+    // The first save's result reaches the dialog in microtasks, and React commits its state
+    // update before the next frame paints. Two frames: the settle and its commit.
+    for (let frame = 0; frame < 2; frame++)
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+    await expect(fetchTools).toBeDisabled();
+    overlapSecondSave.open();
+    await waitFor(() => expect(fetchTools).toBeEnabled());
   },
 };
 

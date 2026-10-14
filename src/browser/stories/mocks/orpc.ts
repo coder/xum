@@ -332,8 +332,11 @@ export interface MockORPCClientOptions {
   mcpSettingsReads?: string[][];
   /** Servers whose settings read fails with this message. */
   mcpSettingsReadErrors?: Map<string, string>;
-  /** When set, settings updates wait for this promise (stories hold a save in flight). */
-  mcpSettingsUpdateGate?: { promise: Promise<void> };
+  /**
+   * When set, settings updates wait for this promise (stories hold a save in flight). A list
+   * holds each update on its own gate, in call order.
+   */
+  mcpSettingsUpdateGate?: { promise: Promise<void> } | Array<{ promise: Promise<void> }>;
   /** When set, the first settings read takes its values, then waits for this promise. */
   mcpSettingsFirstReadGate?: { promise: Promise<void> };
   /** When set, mcp.test waits for this promise (stories hold a Fetch Tools in flight). */
@@ -1393,7 +1396,9 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           return result;
         },
         update: async (input: { serverName: string; set: Record<string, MCPSettingValue> }) => {
-          await mcpSettingsUpdateGate?.promise;
+          await (Array.isArray(mcpSettingsUpdateGate)
+            ? mcpSettingsUpdateGate.shift()?.promise
+            : mcpSettingsUpdateGate?.promise);
           const snapshot = mcpSettings?.get(input.serverName);
           if (snapshot === undefined) return { success: false, error: "No settings mock" };
           snapshot.values = { ...snapshot.values, ...input.set };

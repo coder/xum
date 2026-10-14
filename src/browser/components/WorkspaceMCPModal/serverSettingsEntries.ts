@@ -67,3 +67,14 @@ export function settingsErrors(
   }
   return errors;
 }
+
+/** Saves in flight per server, after one starts (+1) or settles (-1). A server at 0 has no key. */
+export function countSettingsSave(
+  counts: Record<string, number>,
+  serverName: string,
+  delta: 1 | -1
+): Record<string, number> {
+  const next = (getOwn(counts, serverName) ?? 0) + delta;
+  const { [serverName]: _previous, ...rest } = counts;
+  return next > 0 ? { ...rest, [serverName]: next } : rest;
+}

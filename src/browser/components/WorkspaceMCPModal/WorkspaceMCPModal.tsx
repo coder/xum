@@ -18,6 +18,7 @@ import {
 import { useMCPTestCache } from "@/browser/hooks/useMCPTestCache";
 import {
   applySavedSettings,
+  countSettingsSave,
   SettingsRequests,
   type ServerSettingsEntry,
   type SettingsRequestScope,
@@ -91,7 +92,8 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
   const [settingsRequests] = useState(() => new SettingsRequests());
   // Servers whose settings save is in flight. Refresh Tools waits for it: its settings read
   // would take a newer request ID, could show the pre-save values, and drop the save's result.
-  const [savingSettings, setSavingSettings] = useState<Record<string, boolean>>({});
+  // A count, not a flag: a save started after a reopen can overlap one from before it.
+  const [savingSettings, setSavingSettings] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   // Mounted settings sections by server name (ref callbacks drop unmounted ones).
@@ -368,10 +370,10 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
 
   /** A settings save of `serverName` starts; the returned callback settles it. */
   const beginSettingsSave = (serverName: string) => {
-    setSavingSettings((prev) => ({ ...prev, [serverName]: true }));
+    setSavingSettings((prev) => countSettingsSave(prev, serverName, 1));
     const request = settingsRequests.take(settingsRequests.current(), serverName);
     return (values: MCPSettingsSnapshot["values"] | null) => {
-      setSavingSettings((prev) => ({ ...prev, [serverName]: false }));
+      setSavingSettings((prev) => countSettingsSave(prev, serverName, -1));
       if (values !== null && request.isLatest())
         setServerSettings((prev) => applySavedSettings(prev, serverName, values));
     };
@@ -554,7 +556,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                           className="shrink-0"
                           onClick={() => void fetchTools(name)}
                           disabled={
-                            isLoadingTools === true || getOwn(savingSettings, name) === true
+                            isLoadingTools === true || getOwn(savingSettings, name) !== undefined
                           }
                         >
                           {isLoadingTools ? (

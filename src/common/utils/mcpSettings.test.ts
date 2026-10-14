@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import { MCPSettingsSnapshotSchema } from "@/common/orpc/schemas/mcp";
 import {
   advertisedMCPSettingsToolNames,
   boundMCPSettingsError,
+  mcpSettingsSnapshotForIpc,
   MAX_MCP_SETTING_ENUM_OPTIONS,
   MAX_MCP_SETTING_NAME,
   MAX_MCP_SETTINGS,
@@ -180,6 +182,23 @@ describe("parseMCPSettingsReadResult", () => {
     expect(Object.hasOwn(result.values, "__proto__")).toBe(true);
     expect(result.layout).toEqual([
       { title: "Other settings", items: [{ kind: "property", property: "__proto__" }] },
+    ]);
+  });
+
+  test("the IPC snapshot counts a __proto__ setting as dropped instead of losing it", () => {
+    const result = parseMCPSettingsReadResult(
+      JSON.parse(
+        '{"schema":{"type":"object","properties":{"__proto__":{"type":"boolean","title":"P"},"ok":{"type":"boolean","title":"Ok"}}},"values":{"__proto__":true,"ok":false}}'
+      )
+    );
+    if ("error" in result) throw new Error(result.error);
+    const forIpc = mcpSettingsSnapshotForIpc(result);
+    // What the renderer gets after IPC output validation: nothing is lost silently.
+    expect(MCPSettingsSnapshotSchema.parse(forIpc)).toEqual(forIpc);
+    expect(Object.keys(forIpc.properties)).toEqual(["ok"]);
+    expect(forIpc.droppedSettingCount).toBe(result.droppedSettingCount + 1);
+    expect(forIpc.layout).toEqual([
+      { title: "Other settings", items: [{ kind: "property", property: "ok" }] },
     ]);
   });
 
