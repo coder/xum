@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react";
 import { useWorkspaceActions } from "@/browser/contexts/WorkspaceContext";
 import { useDraftStoreHydrated } from "@/browser/stores/DraftStore";
 import type { CreationDraftAgent } from "@/browser/utils/creationDraftCarry";
@@ -22,24 +23,46 @@ interface CreationDraftMoveSource {
 export function useCreationDraftMove(source: CreationDraftMoveSource) {
   const { moveWorkspaceDraft } = useWorkspaceActions();
   const hydrated = useDraftStoreHydrated();
+  // A move may wait for the destination's agents before it opens the destination.
+  const [moving, setMoving] = useState(false);
+  // The move waits for whatever is still on its way into the draft: the drafts themselves
+  // (composers may render before they load, and an unloaded draft would move as an empty one),
+  // a send in flight takes it, a file being read is added to the draft it was attached to, and
+  // loading attachments would reach the moved copy only once loaded (lost if the user moved it
+  // on meanwhile).
+  const blocked =
+    !hydrated ||
+    source.sendInFlight ||
+    source.processingAttachmentCount > 0 ||
+    !source.payloadsLoaded;
+  // Read when the move is done waiting: a send or a file read may have begun meanwhile, or the
+  // user left the draft (its composer is keyed by project and draft), and a move then would open
+  // the destination in place of the page they went to.
+  const blockedRef = useRef(blocked);
+  blockedRef.current = blocked;
+  const isMountedRef = useRef(true);
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
   return {
-    // The move waits for whatever is still on its way into the draft: the drafts themselves
-    // (composers may render before they load, and an unloaded draft would move as an empty one),
-    // a send in flight takes it, a file being read is added to the draft it was attached to, and
-    // loading attachments would reach the moved copy only once loaded (lost if the user moved it
-    // on meanwhile).
-    locked:
-      !hydrated ||
-      source.sendInFlight ||
-      source.processingAttachmentCount > 0 ||
-      !source.payloadsLoaded,
-    move: (destination: string) =>
+    locked: moving || blocked,
+    move: (destination: string) => {
+      setMoving(true);
       moveWorkspaceDraft({
         projectPath: source.projectPath,
         draftId: source.draftId,
         destination,
         runtimePick: source.runtimePick,
         agent: source.agent,
-      }),
+        isLocked: () => blockedRef.current || !isMountedRef.current,
+      })
+        .catch((error: unknown) => {
+          console.warn("Failed to move the draft:", error);
+        })
+        .finally(() => setMoving(false));
+    },
   };
 }

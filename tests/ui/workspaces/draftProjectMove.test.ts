@@ -35,6 +35,7 @@ import { readScopeAgentId, writeScopedAiDefault } from "@/browser/utils/scopedAi
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import {
+  getDraftScopeId,
   getPendingScopeId,
   getProjectScopeId,
   getWorkspaceNameStateKey,
@@ -207,6 +208,24 @@ function trackAgentLists(orpc: OrpcClient) {
   };
 }
 
+/**
+ * Picks A's own agent in-both and starts moving A's draft to B, whose agent differs (exec), with
+ * the move's agents.list request for B held until agentLists.release().
+ */
+async function startHeldAgentMove(
+  container: HTMLElement,
+  agentLists: ReturnType<typeof trackAgentLists>,
+  a: string,
+  b: string
+): Promise<void> {
+  writeScopedAiDefault(getProjectScopeId(b), "agentId", "exec");
+  await pickAgent(container, a, "in-both");
+  agentLists.holdNext();
+  await pickOption(projectSelector(container)!, path.basename(b));
+  // The selector stays locked while the move waits.
+  await waitFor(() => expect(projectSelector(container)?.disabled).toBe(true), WAIT);
+}
+
 async function writeAgent(projectPath: string, agentId: string): Promise<string> {
   const file = path.join(projectPath, ".xum", "agents", `${agentId}.md`);
   await fs.mkdir(path.dirname(file), { recursive: true });
@@ -341,7 +360,13 @@ describeIntegration("Creation project selector moves the draft", () => {
       );
       expect(getWorkspaceDraftIds(a)).toEqual([]);
       // No workspace name is left behind either: it would keep A's bare page non-empty.
-      expect(readPersistedState(getWorkspaceNameStateKey(getPendingScopeId(a)), null)).toBeNull();
+      await waitFor(
+        () =>
+          expect(
+            readPersistedState(getWorkspaceNameStateKey(getPendingScopeId(a)), null)
+          ).toBeNull(),
+        WAIT
+      );
     } finally {
       naming.release();
       await cleanupView(view, cleanupDom);
@@ -593,50 +618,127 @@ describeIntegration("Creation project selector moves the draft", () => {
     }
   }, 90_000);
 
-  test("an agent picked in the destination while the move loads its agents stays", async () => {
+  test("the move opens the destination only once its agents loaded", async () => {
     const a = getSharedRepoPath();
     const agentFiles = [await writeAgent(a, "in-both"), await writeAgent(projectB, "in-both")];
     const agentLists = trackAgentLists(getSharedEnv().orpc);
     const { view, cleanupDom, b } = await openTwoProjects(agentLists.client);
     const { container } = view;
     try {
-      writeScopedAiDefault(getProjectScopeId(b), "agentId", "exec");
       await openProjectCreationView(view, a);
-      await pickAgent(container, a, "in-both");
-      agentLists.holdNext();
-      await moveDraftTo(container, path.basename(b));
-      await pickAgent(container, b, "plan");
-      agentLists.release();
-      await agentLists.allHandled();
+      await startHeldAgentMove(container, agentLists, a, b);
 
-      expect(readScopeAgentId(getProjectScopeId(b))).toBe("plan");
+      // B open before its agents arrived would show its own agent, and a send there would run it.
+      expect(projectSelectorLabel(container)).toBe(path.basename(a));
+      agentLists.release();
+      await waitFor(() => expect(projectSelectorLabel(container)).toBe(path.basename(b)), WAIT);
+      expect(readScopeAgentId(getProjectScopeId(b))).toBe("in-both");
     } finally {
+      agentLists.release();
       await cleanupView(view, cleanupDom);
       await Promise.all(agentFiles.map((file) => fs.rm(file, { force: true })));
     }
   }, 90_000);
 
-  test("a draft moved on before its project agent arrived takes the agent along", async () => {
+  test("a send while the move waits for the agents keeps the draft in its project", async () => {
+    const a = getSharedRepoPath();
+    const agentFiles = [await writeAgent(a, "in-both"), await writeAgent(projectB, "in-both")];
+    // A send first waits for the workspace name, so a held name request keeps it in flight.
+    // Never released: the send must not go on to create a workspace.
+    const naming = holdNameGeneration(getSharedEnv().orpc);
+    const agentLists = trackAgentLists(naming.client);
+    const { view, cleanupDom, b } = await openTwoProjects(agentLists.client);
+    const { container } = view;
+    try {
+      await openProjectCreationView(view, a);
+      const draftId = await onlyDraftId(a);
+      getDraftStore().setText(creationScope(a, draftId), "send me");
+      await waitFor(() => expect(naming.calls()).toBeGreaterThan(0), WAIT);
+      await startHeldAgentMove(container, agentLists, a, b);
+      expect(runtimeSelector(container)?.hasAttribute("disabled")).toBe(false);
+
+      fireEvent.click(container.querySelector<HTMLElement>('button[aria-label="Send message"]')!);
+      // The creation controls lock once the send is in flight.
+      await waitFor(
+        () => expect(runtimeSelector(container)?.hasAttribute("disabled")).toBe(true),
+        WAIT
+      );
+      agentLists.release();
+      await agentLists.allHandled();
+
+      expect(projectSelectorLabel(container)).toBe(path.basename(a));
+      expect(getWorkspaceDraftIds(b)).toEqual([]);
+    } finally {
+      agentLists.release();
+      await cleanupView(view, cleanupDom);
+      await Promise.all(agentFiles.map((file) => fs.rm(file, { force: true })));
+    }
+  }, 90_000);
+
+  test("a move that waits for the agents stays put once the user left the draft", async () => {
     const a = getSharedRepoPath();
     const agentFiles = [await writeAgent(a, "in-both"), await writeAgent(projectB, "in-both")];
     const agentLists = trackAgentLists(getSharedEnv().orpc);
     const { view, cleanupDom, b } = await openTwoProjects(agentLists.client);
     const { container } = view;
     try {
-      writeScopedAiDefault(getProjectScopeId(b), "agentId", "exec");
       await openProjectCreationView(view, a);
-      await pickAgent(container, a, "in-both");
-      agentLists.holdNext();
-      await moveDraftTo(container, path.basename(b));
-      // Back before B's agents arrived: B still shows its own agent.
-      await moveDraftTo(container, path.basename(a));
+      const draftId = await onlyDraftId(a);
+      getDraftStore().setText(creationScope(a, draftId), "left behind");
+      await startHeldAgentMove(container, agentLists, a, b);
+
+      // The user opens B's own new draft: the move must not open its copy in place of it.
+      await openProjectCreationView(view, b);
+      const ownDraftId = await onlyDraftId(b);
       agentLists.release();
       await agentLists.allHandled();
 
-      expect(readScopeAgentId(getProjectScopeId(a))).toBe("in-both");
+      expect(textareaValue(container)).toBe("");
+      expect(getWorkspaceDraftIds(b)).toEqual([ownDraftId]);
+      expect(getWorkspaceDraftIds(a)).toEqual([draftId]);
     } finally {
+      agentLists.release();
       await cleanupView(view, cleanupDom);
       await Promise.all(agentFiles.map((file) => fs.rm(file, { force: true })));
+    }
+  }, 90_000);
+
+  test("a move that keeps its source keeps the source's workspace name", async () => {
+    const { view, cleanupDom, a, b } = await openTwoProjects();
+    const { container } = view;
+    const draftService = getSharedEnv().services.draftService;
+    const realUpdate = draftService.update.bind(draftService);
+    // The destination's save fails, so the move keeps the source draft.
+    const updateSpy = jest
+      .spyOn(draftService, "update")
+      .mockImplementation((input, acceptance) =>
+        input.scope.kind === "creation" && input.scope.projectPath === b
+          ? Promise.reject(new Error("destination save failed"))
+          : realUpdate(input, acceptance)
+      );
+    const moveSpy = jest.spyOn(getDraftStore(), "moveDraft");
+    try {
+      await openProjectCreationView(view, a);
+      const sourceDraftId = await onlyDraftId(a);
+      getDraftStore().setText(creationScope(a, sourceDraftId), "kept");
+      const nameInput = container.querySelector<HTMLInputElement>("#workspace-name")!;
+      fireEvent.focus(nameInput);
+      fireEvent.change(nameInput, { target: { value: "kept-name" } });
+      await waitFor(() => expect(nameInput.value).toBe("kept-name"), WAIT);
+
+      await moveDraftTo(container, path.basename(b));
+
+      expect(await moveSpy.mock.results[0]?.value).toBe(false);
+      expect(getWorkspaceDraftIds(a)).toEqual([sourceDraftId]);
+      expect(
+        readPersistedState(getWorkspaceNameStateKey(getDraftScopeId(a, sourceDraftId)), null)
+      ).toMatchObject({ manualName: "kept-name" });
+    } finally {
+      moveSpy.mockRestore();
+      updateSpy.mockRestore();
+      // Stops the destination's save retries.
+      await clearWorkspaceDrafts(b);
+      await cleanupView(view, cleanupDom);
     }
   }, 90_000);
 

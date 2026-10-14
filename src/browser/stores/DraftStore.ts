@@ -1390,33 +1390,41 @@ export class DraftStore {
    * draft to another project). The source is deleted only once the backend confirmed the
    * destination, and only while it still holds what was copied: if that write fails or the source
    * changed meanwhile, both stay (the destination keeps retrying) rather than risking the only
-   * persisted copy. Never rejects.
+   * persisted copy. Resolves to whether the source was deleted. Never rejects.
    */
-  async moveDraft(from: DraftStoreScope, to: DraftStoreScope): Promise<void> {
+  async moveDraft(from: DraftStoreScope, to: DraftStoreScope): Promise<boolean> {
     const key = draftStoreScopeKey(from);
     const source = this.entries.get(key);
     if (!source || (source.view.text.length === 0 && source.view.attachmentCount === 0)) {
       // Nothing to move, so a listed source would stay behind empty. Before the drafts load, a
       // draft with content has no entry yet and only looks empty: keep it.
-      if (this.hydrated) await this.deleteDraft(from);
-      return;
+      if (!this.hydrated) return false;
+      return await this.deleteMovedSource(from, key);
     }
     // Copied before the payload load below, so an edit during it keeps the source.
     const text = source.text;
     this.setText(to, text);
-    if (!(await this.loadPayloadsToMove(from, source))) return;
+    if (!(await this.loadPayloadsToMove(from, source))) return false;
     const attachments = source.attachments;
     if (attachments.length > 0) this.setAttachments(to, attachments);
     try {
       await this.flush(to);
     } catch (error) {
       console.warn("Failed to save the moved draft; keeping the source draft:", error);
-      return;
+      return false;
     }
     // An edit of the source meanwhile makes it a different draft: keep it. Compared by content,
     // since another window's edit arrives as a server push, which bumps no local version.
-    if (this.entries.get(key) !== source || !holdsMovedContent(source, text, attachments)) return;
+    if (this.entries.get(key) !== source || !holdsMovedContent(source, text, attachments)) {
+      return false;
+    }
+    return await this.deleteMovedSource(from, key);
+  }
+
+  /** False when the source was edited again meanwhile, which keeps it (see deleteDraft). */
+  private async deleteMovedSource(from: DraftStoreScope, key: string): Promise<boolean> {
     await this.deleteDraft(from);
+    return !this.entries.has(key);
   }
 
   /**

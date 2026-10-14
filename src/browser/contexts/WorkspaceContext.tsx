@@ -24,7 +24,7 @@ import {
   getWorkspaceNameStateKey,
   SELECTED_WORKSPACE_KEY,
 } from "@/common/constants/storage";
-import { deleteWorkspaceStorage, migrateWorkspaceStorage } from "@/browser/utils/workspaceStorage";
+import { copyWorkspaceStorage, deleteWorkspaceStorage } from "@/browser/utils/workspaceStorage";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { useAPI, useLiveAPI } from "@/browser/contexts/API";
@@ -57,6 +57,7 @@ import {
 import {
   carryCreationAiSettings,
   handOffCreationRuntime,
+  needsDestinationAgentIds,
   type CreationDraftAgent,
 } from "@/browser/utils/creationDraftCarry";
 import {
@@ -271,7 +272,7 @@ export interface WorkspaceContext extends WorkspaceMetadataContextValue {
    * Move the creation draft being edited (text, attachments, workspace name, AI settings, and a
    * runtime the user picked) to another project, sub-project, or Scratch, and open it there.
    */
-  moveWorkspaceDraft: (move: WorkspaceDraftMove) => void;
+  moveWorkspaceDraft: (move: WorkspaceDraftMove) => Promise<void>;
   openWorkspaceDraft: (projectPath: string, draftId: string) => void;
   deleteWorkspaceDraft: (projectPath: string, draftId: string) => void;
 
@@ -290,6 +291,8 @@ export interface WorkspaceDraftMove {
   runtimePick: ParsedRuntime | null;
   /** The source composer's agent: an agent moves only to a project that has it. */
   agent: CreationDraftAgent | undefined;
+  /** Whether the draft cannot move now (read again after the move waited for the server). */
+  isLocked: () => boolean;
 }
 
 /**
@@ -300,11 +303,20 @@ function moveCreationDraftBody(
   from: { scope: DraftStoreScope; storageScopeId: string },
   to: { projectPath: string; draftId: string }
 ): void {
-  // Never rejects.
+  // Copied now for the destination composer, and deleted with the source draft only: a move that
+  // keeps the source (its save failed, another window edited it) keeps it whole.
+  const copied = copyWorkspaceStorage(
+    from.storageScopeId,
+    getDraftScopeId(to.projectPath, to.draftId)
+  );
   getDraftStore()
     .moveDraft(from.scope, { kind: "creation", projectPath: to.projectPath, draftId: to.draftId })
-    .catch(() => undefined);
-  migrateWorkspaceStorage(from.storageScopeId, getDraftScopeId(to.projectPath, to.draftId));
+    .then((sourceDeleted) => {
+      if (sourceDeleted && copied) deleteWorkspaceStorage(from.storageScopeId);
+    })
+    .catch((error: unknown) => {
+      console.warn("Failed to finish moving the draft's workspace name:", error);
+    });
 }
 
 /** The DraftStore scope and the name storage scope of a creation composer's draft. */
@@ -343,11 +355,25 @@ function setListedDraftSubProject(
   });
 }
 
+/** A project's agent ids, or null offline or when they fail to load (the agent stays behind). */
+async function listAgentIds(
+  api: APIClient | null,
+  projectPath: string
+): Promise<readonly string[] | null> {
+  if (!api) return null;
+  try {
+    return (await api.agents.list({ projectPath })).map((agent) => agent.id);
+  } catch (error) {
+    console.warn("Failed to load the destination's agents; the draft's agent stays behind:", error);
+    return null;
+  }
+}
+
 /** Lists the moved draft (or, within its owning project, changes its sub-project) and moves it. */
 function applyWorkspaceDraftMove(
   move: WorkspaceDraftMove,
   dest: WorkspaceCreationScope,
-  listAgentIds: (projectPath: string) => Promise<readonly string[]>
+  destAgentIds: readonly string[] | null
 ) {
   const listed = findListedDraft(move.projectPath, move.draftId);
   // A sub-project switch inside the owning project keeps the same draft: the composer is keyed
@@ -371,9 +397,7 @@ function applyWorkspaceDraftMove(
     sourceProjectPath: move.projectPath,
     destProjectPath: dest.projectPath,
     agent: move.agent,
-    listAgentIds,
-  }).catch((error: unknown) => {
-    console.warn("Failed to load the destination's agents; the draft's agent stays behind:", error);
+    destAgentIds,
   });
   handOffCreationRuntime({
     sourceProjectPath: move.projectPath,
@@ -1932,15 +1956,21 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   );
 
   const moveWorkspaceDraft = useCallback(
-    (move: WorkspaceDraftMove) => {
+    async (move: WorkspaceDraftMove) => {
       const dest = resolveWorkspaceCreationScope(move.destination, userProjects);
       // Read like the composer reads its route: a blank or invalid id edits the default draft.
       const source = { ...move, draftId: listedCreationDraftId(move.draftId) };
-      const listAgentIds = async (projectPath: string) => {
-        if (!liveApi) throw new Error("Not connected to the server");
-        return (await liveApi.agents.list({ projectPath })).map((agent) => agent.id);
-      };
-      const draftId = applyWorkspaceDraftMove(source, dest, listAgentIds);
+      // Before the destination opens: a send there must already have the moved agent.
+      const destAgentIds = needsDestinationAgentIds(
+        source.projectPath,
+        dest.projectPath,
+        move.agent
+      )
+        ? await listAgentIds(liveApi, dest.projectPath)
+        : null;
+      // A send or a file read that began meanwhile keeps the draft where it is.
+      if (move.isLocked()) return;
+      const draftId = applyWorkspaceDraftMove(source, dest, destAgentIds);
       navigateToProject(dest.projectPath, draftId, { replace: true });
     },
     [liveApi, userProjects, navigateToProject]

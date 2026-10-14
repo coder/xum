@@ -582,13 +582,13 @@ describe("DraftStore", () => {
     await store.whenReady();
 
     control.failUpdates = 100;
-    await store.moveDraft(source, WS_SCOPE);
+    expect(await store.moveDraft(source, WS_SCOPE)).toBe(false);
     // A delete issued before the destination was saved would have landed by now.
     await new Promise((resolve) => setTimeout(resolve, 100));
     expect((await service.get(source)).text).toBe("moving");
 
     control.failUpdates = 0;
-    await store.moveDraft(source, WS_SCOPE);
+    expect(await store.moveDraft(source, WS_SCOPE)).toBe(true);
     expect((await service.get(WS_SCOPE)).text).toBe("moving");
     expect((await service.get(source)).text).toBe("");
   });
@@ -604,7 +604,8 @@ describe("DraftStore", () => {
     });
     const store = createStore(client);
 
-    await store.moveDraft(source, { kind: "creation", projectPath, draftId: "draft-b" });
+    const moved = store.moveDraft(source, { kind: "creation", projectPath, draftId: "draft-b" });
+    expect(await moved).toBe(false);
     releaseSubscribe();
     await store.whenReady();
     expect((await service.get(source)).text).toBe("not loaded yet");
@@ -890,7 +891,7 @@ describe("DraftStore", () => {
     const moved = store.moveDraft(source, WS_SCOPE);
     store.setText(source, "moving, edited");
     release();
-    await moved;
+    expect(await moved).toBe(false);
 
     expect(store.getText(source)).toBe("moving, edited");
     await store.flush(source);
@@ -922,7 +923,7 @@ describe("DraftStore", () => {
         return view.text !== "moving" || view.attachmentCount > 0;
       });
       release();
-      await moved;
+      expect(await moved).toBe(false);
 
       expect((await service.get(WS_SCOPE)).text).toBe("moving");
       expect(await service.get(source)).toMatchObject(edit);
@@ -957,7 +958,7 @@ describe("DraftStore", () => {
     });
 
     const listed: DraftScope = { kind: "creation", projectPath, draftId: "first-listed" };
-    await store.moveDraft(scope, listed);
+    expect(await store.moveDraft(scope, listed)).toBe(true);
     expect(await service.get(listed)).toMatchObject({
       text: "typed before reload",
       attachments: [image],
