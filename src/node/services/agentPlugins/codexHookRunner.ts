@@ -22,14 +22,12 @@ import assert from "node:assert";
 import type { EventSpine, ToolExecuteContext } from "@/node/services/events/eventSpine";
 import { getErrorMessage } from "@/common/utils/errors";
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/client/validators/ajv";
+import { effectiveHookTimeoutSeconds } from "@/constants/pluginHooks";
 import { log } from "@/node/services/log";
 import { compileHookMatcher, type PluginHookDefinition } from "./codexHooks";
 import { isPlainObject } from "./manifest";
 import { codexToolView, type CodexToolView } from "./codexToolNames";
 
-/** Xum's limits for one hook call, in seconds (Codex's default is 600). */
-export const HOOK_DEFAULT_TIMEOUT_SECONDS = 10;
-export const HOOK_MAX_TIMEOUT_SECONDS = 30;
 /** Spine order of discovery index 0; below the default order 0 of the shell hook middleware. */
 const CODEX_HOOK_ORDER_BASE = -1_000_000;
 /** Expanded `input` larger than this (as JSON) is not sent (PreToolUse then denies the call). */
@@ -359,10 +357,7 @@ async function invoke(
   const handler = hook.handler;
   if (handler.type !== "mcp_tool") return null;
   if (call.abortSignal?.aborted) return null;
-  const seconds = Math.min(
-    handler.timeoutSeconds ?? HOOK_DEFAULT_TIMEOUT_SECONDS,
-    HOOK_MAX_TIMEOUT_SECONDS
-  );
+  const seconds = effectiveHookTimeoutSeconds(handler.timeoutSeconds);
   const timeout = new AbortController();
   const timer = setTimeout(() => timeout.abort(), seconds * 1000);
   // The hook call ends at the hook timeout or when the user cancels the tool, whichever is first.

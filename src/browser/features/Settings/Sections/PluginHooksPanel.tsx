@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { useAPI } from "@/browser/contexts/API";
 import { Button } from "@/browser/components/Button/Button";
 import { cn } from "@/common/lib/utils";
+import { effectiveHookTimeoutSeconds } from "@/constants/pluginHooks";
 import type {
   AgentPluginHook,
   AgentPluginHooks,
@@ -14,14 +15,21 @@ import { getErrorMessage } from "@/common/utils/errors";
 /** One-line handler summary, shared by the consent preview and the review panel. */
 export function describePluginHookHandler(handler: PluginHookHandler): string {
   return handler.type === "mcp_tool"
-    ? // The timeout is part of what the user trusts (and of the hash): a changed hook may differ
-      // only there.
-      `MCP tool ${handler.server} / ${handler.tool}, ${
-        handler.timeoutSeconds === undefined
-          ? "default timeout"
-          : `timeout ${handler.timeoutSeconds}s`
-      }`
+    ? `MCP tool ${handler.server} / ${handler.tool}, ${describeHookTimeout(handler.timeoutSeconds)}`
     : `${handler.type}: ${handler.summary}`;
+}
+
+/**
+ * The timeout the call runs with (the runner caps it), not the parsed value: 2^64 must not show
+ * as a 20-digit timeout. The declared value is part of what the user trusts (and of the hash),
+ * so a changed hook may differ only there: a capped one also names what it declares.
+ */
+function describeHookTimeout(declaredSeconds: number | undefined): string {
+  const seconds = effectiveHookTimeoutSeconds(declaredSeconds);
+  if (declaredSeconds === undefined) return `default timeout ${seconds}s`;
+  return declaredSeconds === seconds
+    ? `timeout ${seconds}s`
+    : `timeout ${seconds}s (declares ${declaredSeconds > 1e9 ? "over 10^9" : declaredSeconds}s, capped)`;
 }
 
 /** Shown characters of a hook's input: the review renders before the user trusts anything. */

@@ -17,6 +17,7 @@
  */
 import * as path from "node:path";
 import { getErrorMessage } from "@/common/utils/errors";
+import { effectiveHookTimeoutSeconds } from "@/constants/pluginHooks";
 import { log } from "@/node/services/log";
 import { eventSpine, type EventSpine } from "@/node/services/events/eventSpine";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
@@ -24,12 +25,7 @@ import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { isAgentToolsDisabled } from "@/node/utils/agentToolsDisabled";
 import { discoverAgentPluginAt, discoverAgentPlugins, type AgentPluginInfo } from "./discovery";
 import { loadPluginCodexHooks, type PluginHookDefinition } from "./codexHooks";
-import {
-  HOOK_DEFAULT_TIMEOUT_SECONDS,
-  HOOK_MAX_TIMEOUT_SECONDS,
-  registerCodexPluginHooks,
-  type CodexHookRunnerDeps,
-} from "./codexHookRunner";
+import { registerCodexPluginHooks, type CodexHookRunnerDeps } from "./codexHookRunner";
 import { buildPluginServerKey, computePluginInstanceId } from "./mcpConfig";
 import { isPluginHookTrusted, readPluginHookTrust } from "./pluginHookTrust";
 import { PLUGIN_REGISTRY_FILE_NAME } from "./registry";
@@ -124,8 +120,7 @@ export class CodexPluginHookService {
     const promptTimeouts: number[] = [];
     for (const hook of runnable.flatMap((entry) => entry.hooks)) {
       if (hook.event !== "UserPromptSubmit" || hook.handler.type !== "mcp_tool") continue;
-      const seconds = hook.handler.timeoutSeconds ?? HOOK_DEFAULT_TIMEOUT_SECONDS;
-      promptTimeouts.push(Math.min(seconds, HOOK_MAX_TIMEOUT_SECONDS));
+      promptTimeouts.push(effectiveHookTimeoutSeconds(hook.handler.timeoutSeconds));
     }
     this.registrations.set(args.workspaceId, {
       fingerprint,

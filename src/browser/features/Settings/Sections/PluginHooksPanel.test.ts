@@ -14,6 +14,14 @@ describe("describePluginHookHandler", () => {
     );
   });
 
+  test("shows the timeout that applies, not a huge parsed value", () => {
+    const handler = { type: "mcp_tool" as const, server: "s", tool: "t", input: {} };
+    const capped = describePluginHookHandler({ ...handler, timeoutSeconds: 2 ** 64 });
+    expect(capped).toContain("timeout 30s");
+    expect(capped).not.toContain("18446744073709552000");
+    expect(describePluginHookHandler({ ...handler, timeoutSeconds: 5 })).toContain("timeout 5s");
+  });
+
   test("an omitted timeout reads as the runner default, not a number", () => {
     const handler = { type: "mcp_tool" as const, server: "s", tool: "t", input: {} };
     const summary = describePluginHookHandler(handler);
