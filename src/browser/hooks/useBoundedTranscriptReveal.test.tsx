@@ -737,17 +737,38 @@ describe("useBoundedTranscriptReveal", () => {
       expect(props().messages[reveal().toIndex - 1].id).toBe(keptId);
     });
 
-    test("the budget base keeps counting after an older page, even once the base row is gone", () => {
-      const { frames, reveal, runFrames, setProps, props } = renderSlice(MAX);
+    // Rows a revealMore() budget mounted, measured from a row that was mounted before it.
+    const revealedSince = (ids: Row[], refId: string, fromIndex: number) =>
+      ids.findIndex((row) => row.id === refId) - fromIndex;
+
+    test("an older page plus a deleted request-start row in one update stays within the budget", () => {
+      const { reveal, runFrames, setProps, props, frames } = renderSlice(MAX);
       runFrames();
-      const baseId = props().messages[reveal().fromIndex].id;
+      const start = reveal().fromIndex;
+      const [startId, refId] = [start, start + 1].map((i) => props().messages[i].id);
       act(() => reveal().revealMore());
+      act(() => frames.flush());
+      const withPage = [...rows(300, "old"), ...props().messages];
+      setProps({ messages: withPage.filter((row) => row.id !== startId) });
       runFrames();
-      const fromId = props().messages[reveal().fromIndex].id;
-      setProps({ messages: [...rows(300, "old"), ...props().messages] });
-      setProps({ messages: props().messages.filter((row) => row.id !== baseId) });
-      expect(frames.hasPending()).toBe(false);
-      expect(props().messages[reveal().fromIndex].id).toBe(fromId);
+      const revealed = revealedSince(props().messages, refId, reveal().fromIndex);
+      expect(revealed).toBeLessThanOrEqual(
+        TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + TRANSCRIPT_REVEAL_CHUNK_ROWS
+      );
+    });
+
+    test("deleting mounted rows never lets the reveal run past its budget", () => {
+      const { reveal, runFrames, setProps, props, frames } = renderSlice(MAX);
+      runFrames();
+      const refId = props().messages[reveal().fromIndex].id;
+      act(() => reveal().revealMore());
+      act(() => frames.flush());
+      setProps({ messages: props().messages.filter((_, i) => i < LONG - 140 || i >= LONG - 40) });
+      runFrames();
+      const revealed = revealedSince(props().messages, refId, reveal().fromIndex);
+      expect(revealed).toBeLessThanOrEqual(
+        TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + TRANSCRIPT_REVEAL_CHUNK_ROWS
+      );
     });
 
     test("rows replaced inside the slice stay mounted when the end row goes later", () => {
