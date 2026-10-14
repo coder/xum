@@ -1200,6 +1200,26 @@ describe("DraftStore", () => {
     expect(store.getView(defaultScope).nameState?.manualName).toBe("default-name");
   });
 
+  // Older builds read these keys with a partial schema, and wrote keys holding only some fields.
+  test("imports a legacy name key that holds only some fields", async () => {
+    using tempDir = new TestTempDir("draft-store-legacy-partial-name");
+    const { projectPath, service, client } = await createHarness(tempDir);
+    const scope: DraftScope = { kind: "creation", projectPath, draftId: "draft-a" };
+    const key = getWorkspaceNameStateKey(getDraftScopeId(projectPath, "draft-a"));
+    seedLegacyKey(key, { autoGenerate: false, manualName: "typed-name" });
+
+    const store = createStore(client);
+    await store.whenReady();
+    expect((await service.get(scope)).nameState).toEqual({
+      generatedIdentity: null,
+      manualName: "typed-name",
+      autoGenerate: false,
+      lastGeneratedFor: "",
+    });
+    expect(store.getView(scope).nameState?.manualName).toBe("typed-name");
+    expect(listPersistedKeys("workspaceNameState:")).toEqual([]);
+  });
+
   test("moves the workspace name with the draft body", async () => {
     using tempDir = new TestTempDir("draft-store-move-name");
     const { projectPath, service, client } = await createHarness(tempDir);

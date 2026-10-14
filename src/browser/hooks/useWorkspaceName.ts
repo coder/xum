@@ -9,7 +9,7 @@ import {
 } from "@/browser/stores/DraftStore";
 import type { WorkspaceIdentity, WorkspaceNamePersistedState } from "@/common/orpc/schemas/drafts";
 import type { NameGenerationError } from "@/common/types/errors";
-import { toStoredMessage } from "@/common/utils/workspaceNameState";
+import { DEFAULT_WORKSPACE_NAME_STATE, toStoredMessage } from "@/common/utils/workspaceNameState";
 import {
   validateWorkspaceBranchName,
   validateWorkspaceName,
@@ -84,13 +84,6 @@ export interface UseWorkspaceNameReturn extends WorkspaceNameState {
 /** Subscribed (never read) when the hook has no draft scope. */
 const NO_DRAFT_SCOPE: DraftStoreScope = { kind: "pending", projectPath: "" };
 
-const DEFAULT_PERSISTED_STATE: WorkspaceNamePersistedState = {
-  generatedIdentity: null,
-  manualName: "",
-  autoGenerate: true,
-  lastGeneratedFor: "",
-};
-
 /** The workspace name the creation form shows for persisted name state ("" when none). */
 export function getNameFromPersistedState(state: WorkspaceNamePersistedState | null): string {
   if (state === null) return "";
@@ -135,8 +128,9 @@ function useWorkspaceNameStorage(scope: DraftStoreScope | null) {
   // Always subscribe, but only *use* the draft when a scope is provided.
   const draft = useDraft(scope ?? NO_DRAFT_SCOPE);
   const hydrated = useDraftStoreHydrated();
-  const [localState, setLocalState] =
-    useState<WorkspaceNamePersistedState>(DEFAULT_PERSISTED_STATE);
+  const [localState, setLocalState] = useState<WorkspaceNamePersistedState>(
+    DEFAULT_WORKSPACE_NAME_STATE
+  );
   // Callers build the scope inline: the setters read the latest one, so they stay stable.
   const scopeRef = useRef(scope);
   scopeRef.current = scope;
@@ -149,7 +143,7 @@ function useWorkspaceNameStorage(scope: DraftStoreScope | null) {
         setLocalState(update);
         return;
       }
-      getDraftStore().setNameState(target, (prev) => update(prev ?? DEFAULT_PERSISTED_STATE));
+      getDraftStore().setNameState(target, (prev) => update(prev ?? DEFAULT_WORKSPACE_NAME_STATE));
     },
     []
   );
@@ -162,7 +156,7 @@ function useWorkspaceNameStorage(scope: DraftStoreScope | null) {
   // before its effect cancels the request, so the latest scope may already be another draft.
   const currentScope = useCallback(() => scopeRef.current, []);
   return {
-    stored: scope ? (draft.nameState ?? DEFAULT_PERSISTED_STATE) : localState,
+    stored: scope ? (draft.nameState ?? DEFAULT_WORKSPACE_NAME_STATE) : localState,
     setStored,
     setStoredIn,
     currentScope,

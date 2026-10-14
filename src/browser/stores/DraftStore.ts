@@ -53,7 +53,10 @@ import {
   toDraftAttachmentMetadata,
 } from "@/common/utils/drafts";
 import { getErrorMessage } from "@/common/utils/errors";
-import { boundWorkspaceNamePersistedState } from "@/common/utils/workspaceNameState";
+import {
+  boundWorkspaceNamePersistedState,
+  DEFAULT_WORKSPACE_NAME_STATE,
+} from "@/common/utils/workspaceNameState";
 import {
   DEFAULT_CREATION_DRAFT_ID,
   DRAFT_ID_PATTERN,
@@ -542,7 +545,13 @@ function parseLegacyNameState(
     legacyScope?.kind === "pending"
       ? defaultCreationDraftScope(legacyScope.projectPath)
       : legacyScope;
-  const nameState = boundWorkspaceNamePersistedState(readLegacyJson(key));
+  const raw = readLegacyJson(key);
+  // Older builds read the key with a partial schema (and wrote keys holding only some fields), so
+  // a missing field takes its default instead of dropping the typed name.
+  const nameState =
+    typeof raw === "object" && raw !== null && !Array.isArray(raw)
+      ? boundWorkspaceNamePersistedState({ ...DEFAULT_WORKSPACE_NAME_STATE, ...raw })
+      : null;
   return scope?.kind === "creation" && nameState !== null ? { scope, nameState } : null;
 }
 

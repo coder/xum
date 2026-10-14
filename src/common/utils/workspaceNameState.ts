@@ -8,6 +8,14 @@ import {
 } from "@/common/constants/storage";
 import { truncateStringToChars } from "@/common/utils/truncateStringToChars";
 
+/** Name state of a draft that has none yet. */
+export const DEFAULT_WORKSPACE_NAME_STATE: WorkspaceNamePersistedState = {
+  generatedIdentity: null,
+  manualName: "",
+  autoGenerate: true,
+  lastGeneratedFor: "",
+};
+
 /** FNV-1a (32-bit). Only detects changes past the stored prefix; not a security hash. */
 function hashMessage(message: string): string {
   let hash = 0x811c9dc5;
