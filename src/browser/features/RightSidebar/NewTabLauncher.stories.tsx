@@ -98,7 +98,8 @@ async function expectPluginViews(canvasElement: HTMLElement, onOpen: unknown) {
   await userEvent.keyboard("{ArrowDown}");
   await expect(tray).toHaveFocus();
   await userEvent.click(library);
-  await expect(onOpen).toHaveBeenCalledWith(ENTRYPOINTS[0]);
+  // The second argument says whether the pick is still current (see onOpenEntrypoint).
+  await expect(onOpen).toHaveBeenCalledWith(ENTRYPOINTS[0], expect.any(Function));
   const container = canvasElement.firstElementChild!;
   await expect(container.scrollWidth).toBeLessThanOrEqual(container.clientWidth);
   await expect(canvasElement.textContent).not.toContain("plugin:0123456789abcdef");
