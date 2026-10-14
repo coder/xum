@@ -76,9 +76,11 @@ describe.each([...GAP_MODES])("SqlExplorer while offline (%s)", (mode) => {
     await harness.drop();
     typeInto(editor, "SELECT 'never ran'");
     fireEvent.click(view.getByRole("button", { name: /Run Query/ }));
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 30));
-    });
+    // The offline run settles with an error: no client (null-gap), or the kept client's call
+    // failing with the connection-lost error (kept-gap).
+    await waitFor(() =>
+      expect(view.queryByText(/API client not initialized|Not connected/) != null).toBe(true)
+    );
 
     const saveAsPanel = view.queryByRole("button", { name: /Save as Panel/ });
     if (saveAsPanel != null) {
