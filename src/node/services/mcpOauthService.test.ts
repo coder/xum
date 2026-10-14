@@ -1398,9 +1398,42 @@ describe("McpOauthService OAuth flows", () => {
     // Scope is a space-separated set: order and extra spaces do not matter.
     await seed(" write  read admin");
     expect(await usable({ clientId: "c", baseScopes: ["read", "write"] })).toBe(true);
-    // A token response without scope means the requested scope was granted (RFC 6749 §5.1).
+    // A stored token without scope proves nothing about this plugin's scopes: an earlier
+    // sign-in at this URL can have requested less. Only a plugin without baseScopes uses it.
     await seed(undefined);
-    expect(await usable({ clientId: "c", baseScopes: ["read", "write"] })).toBe(true);
+    expect(await usable({ clientId: "c", baseScopes: ["read", "write"] })).toBe(false);
+    expect(await usable({ clientId: "c" })).toBe(true);
+  });
+
+  test("a grant without scope records the requested scope, and a refresh keeps it (#6141)", async () => {
+    await withAuthServer(async (base) => {
+      // withAuthServer's token endpoint omits scope.
+      const serverUrl = `${base}/mcp`;
+      const oauth: MCPServerOAuthConfig = { clientId: "c", baseScopes: ["read", "write"] };
+      spyOn(mcpConfigService, "listServers").mockResolvedValue({
+        docs: { transport: "http", url: serverUrl, disabled: true, oauth },
+      });
+      const start = await service.startServerFlow({
+        projectPath,
+        serverName: "docs",
+        redirectUri: "https://x/cb",
+      });
+      if (!start.success) throw new Error(start.error);
+      const result = await service.handleServerCallbackAndExchange({
+        state: start.data.flowId,
+        code: "code",
+        iss: null,
+        error: null,
+      });
+      expect(result.success).toBe(true);
+      expect(await service.hasAuthTokens({ serverUrl, oauth })).toBe(true);
+      // A refresh response without scope keeps the original grant (RFC 6749 §6).
+      const provider = await service.getAuthProviderForServer({ serverUrl, oauth });
+      if (provider === undefined) throw new Error("expected a provider");
+      await provider.clientInformation();
+      await provider.saveTokens({ access_token: "refreshed", token_type: "Bearer" } as never);
+      expect(await service.hasAuthTokens({ serverUrl, oauth })).toBe(true);
+    });
   });
 
   test("a sign-in granted less than the plugin's base scopes fails and stores no token (#6141)", async () => {
