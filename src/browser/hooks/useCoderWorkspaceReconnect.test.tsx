@@ -4,7 +4,7 @@ import "../../../tests/ui/dom";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { installDom } from "../../../tests/ui/dom";
-import type { APIClient } from "@/browser/contexts/API";
+import { useAPI, type APIClient } from "@/browser/contexts/API";
 import {
   createConnectionHarness,
   GAP_MODES,
@@ -37,6 +37,8 @@ interface ServerLists {
 let harness: ConnectionHarness;
 /** What the next server lists, or a promise that answers later. */
 let serverLists: ServerLists | Promise<ServerLists>;
+/** When true, the next server's workspace list fails. */
+let workspacesFail = false;
 
 function serverOverrides(): TestApiOverrides<APIClient> {
   const lists = Promise.resolve(serverLists);
@@ -45,7 +47,10 @@ function serverOverrides(): TestApiOverrides<APIClient> {
       getInfo: () => Promise.resolve({ state: "available" as const, version: "2.0.0" }),
       listTemplates: () => lists.then((l) => ({ ok: true as const, templates: l.templates })),
       listPresets: () => lists.then((l) => ({ ok: true as const, presets: l.presets })),
-      listWorkspaces: () => lists.then((l) => ({ ok: true as const, workspaces: l.workspaces })),
+      listWorkspaces: () =>
+        workspacesFail
+          ? Promise.resolve({ ok: false as const, error: "coder list failed" })
+          : lists.then((l) => ({ ok: true as const, workspaces: l.workspaces })),
     },
   };
 }
@@ -87,6 +92,7 @@ describe.each([...GAP_MODES])("useCoderWorkspace across a reconnect (%s)", (mode
       presets: [preset("p1"), preset("p2")],
       workspaces: [workspace("w1")],
     };
+    workspacesFail = false;
     harness = createConnectionHarness(mode, serverOverrides);
   });
 
@@ -114,6 +120,7 @@ describe.each([...GAP_MODES])("useCoderWorkspace across a reconnect (%s)", (mode
     expect(shown.loadingTemplates || shown.loadingWorkspaces).toBe(false);
     // ChatInput blocks a Coder send on loadingPresets: the reload must hold it.
     expect(shown.loadingPresets).toBe(true);
+    expect(shown.blocksSend).toBe(true);
     expect(shown.templates.map((t) => t.name)).toEqual(["t1"]);
     expect(shown.presets.map((p) => p.name)).toEqual(["p1", "p2"]);
     expect(shown.existingWorkspaces.map((w) => w.name)).toEqual(["w1"]);
@@ -179,6 +186,70 @@ describe.each([...GAP_MODES])("useCoderWorkspace across a reconnect (%s)", (mode
         preset: "p1",
       })
     );
+  });
+
+  // #6383: a workspace deleted while offline must not be sent while the reload runs.
+  test("existing-workspace mode blocks the send until the reload answers, then drops a deleted pick", async () => {
+    const existing: CoderWorkspaceConfig = { existingWorkspace: true, workspaceName: "w1" };
+    const { view, onChange } = renderCoder(existing);
+    await waitFor(() => expect(view.result.current.existingWorkspaces.length).toBe(1));
+    expect(view.result.current.blocksSend).toBe(false);
+
+    let answer: ((lists: ServerLists) => void) | null = null;
+    serverLists = new Promise((resolve) => (answer = resolve));
+    await harness.drop();
+    harness.reconnect();
+    await settle();
+    expect(view.result.current.blocksSend).toBe(true);
+    expect(view.result.current.loadingWorkspaces).toBe(false);
+    expect(view.result.current.existingWorkspaces.map((w) => w.name)).toEqual(["w1"]);
+
+    act(() => answer?.({ templates: [], presets: [], workspaces: [workspace("w2")] }));
+    await waitFor(() => expect(view.result.current.blocksSend).toBe(false));
+    expect(onChange).toHaveBeenLastCalledWith({
+      existingWorkspace: true,
+      workspaceName: undefined,
+    });
+  });
+
+  // No render with the new client may show the previous client's list as fresh: a click before
+  // the reload effect runs would still send it.
+  test("no render with the new client lets an existing-workspace send through before the reload", async () => {
+    const renders: Array<{ api: APIClient | null; blocksSend: boolean }> = [];
+    renderHook(
+      () => {
+        const coder = useCoderWorkspace({
+          coderConfig: { existingWorkspace: true, workspaceName: "w1" },
+          onCoderConfigChange: () => undefined,
+          coderInfoRefreshPolicy: "mount-only",
+        });
+        renders.push({ api: useAPI().api, blocksSend: coder.blocksSend });
+        return coder;
+      },
+      { wrapper: harness.Wrapper }
+    );
+    await waitFor(() => expect(renders.at(-1)?.blocksSend).toBe(false));
+
+    serverLists = new Promise(() => undefined);
+    await harness.drop();
+    harness.reconnect();
+    await settle();
+    const newClient = harness.client;
+    const withNewClient = renders.filter((render) => render.api === newClient);
+    expect(withNewClient.length).toBeGreaterThan(0);
+    expect(withNewClient.every((render) => render.blocksSend)).toBe(true);
+  });
+
+  // A failed reload cannot tell whether the picked workspace still exists.
+  test("a failed workspace reload keeps the existing-workspace send blocked", async () => {
+    const { view } = renderCoder({ existingWorkspace: true, workspaceName: "w1" });
+    await waitFor(() => expect(view.result.current.blocksSend).toBe(false));
+
+    workspacesFail = true;
+    await harness.drop();
+    harness.reconnect();
+    await waitFor(() => expect(view.result.current.workspacesError).toBe("coder list failed"));
+    expect(view.result.current.blocksSend).toBe(true);
   });
 
   test("a window focus while offline keeps the Coder info and config", async () => {

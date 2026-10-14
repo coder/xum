@@ -17,7 +17,8 @@ import {
   buildMcpPromptBaseKey,
   isMcpPromptCommandKey,
 } from "@/common/utils/tools/mcpPromptCommandKey";
-import type { ParsedRuntime } from "@/common/types/runtime";
+import { RUNTIME_MODE, type ParsedRuntime } from "@/common/types/runtime";
+import type { BranchLoadStatus } from "@/browser/features/ChatInput/branchListLoad";
 import {
   buildAgentSkillMetadata,
   dedupeAgentSkillRefs,
@@ -445,6 +446,22 @@ export async function resolveMcpPromptRefsForSend(options: {
 /** Returns true when any ref's scope is "project" (used by creation flow to force disableWorkspaceAgents). */
 export function hasProjectScopedSkillRef(refs: AgentSkillReference[]): boolean {
   return refs.some((ref) => ref.scope === "project");
+}
+
+/**
+ * True while a creation send must wait for its runtime's data. #6033: the trunk branch stays empty
+ * until the branch list loads, and the backend refuses every runtime except local without one. A
+ * failed list keeps it closed too (#6055). #6383: a reconnect keeps the shown Dev Container
+ * configs while it probes again, and one can be gone, so a Dev Container send waits for the probe.
+ */
+export function creationRuntimeBlocksSend(
+  runtime: ParsedRuntime,
+  branchLoad: BranchLoadStatus,
+  runtimeAvailabilityFresh: boolean
+): boolean {
+  if (runtime.mode === RUNTIME_MODE.LOCAL) return false;
+  if (branchLoad !== "loaded") return true;
+  return runtime.mode === RUNTIME_MODE.DEVCONTAINER && !runtimeAvailabilityFresh;
 }
 
 export function validateCreationRuntime(
