@@ -11,6 +11,7 @@ let currentClientMock: TestApiOverrides<APIClient> = {};
 let originalWindow: typeof globalThis.window;
 let originalDocument: typeof globalThis.document;
 let originalHTMLElement: unknown;
+let originalElement: unknown;
 function renderUseAIViewKeybinds(props: Parameters<typeof useAIViewKeybinds>[0]) {
   const wrapper = ({ children }: { children: ReactNode }) => (
     <APIProvider client={createTestApiClient(currentClientMock)}>{children}</APIProvider>
@@ -26,13 +27,15 @@ describe("useAIViewKeybinds", () => {
     originalWindow = globalThis.window;
     originalDocument = globalThis.document;
     originalHTMLElement = (globalThis as unknown as { HTMLElement: unknown }).HTMLElement;
+    originalElement = (globalThis as unknown as { Element: unknown }).Element;
 
     const domWindow = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.window = domWindow;
     globalThis.document = domWindow.document;
-    // happy-dom doesn't define HTMLElement on globalThis by default.
-    // Our keybind helpers use `target instanceof HTMLElement`, so polyfill it for tests.
+    // happy-dom doesn't define HTMLElement or Element on globalThis by default.
+    // Our keybind helpers use `instanceof HTMLElement`/`Element`, so polyfill them for tests.
     (globalThis as unknown as { HTMLElement: unknown }).HTMLElement = domWindow.HTMLElement;
+    (globalThis as unknown as { Element: unknown }).Element = domWindow.Element;
   });
 
   afterEach(() => {
@@ -40,6 +43,7 @@ describe("useAIViewKeybinds", () => {
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
     (globalThis as unknown as { HTMLElement: unknown }).HTMLElement = originalHTMLElement;
+    (globalThis as unknown as { Element: unknown }).Element = originalElement;
     currentClientMock = {};
   });
 

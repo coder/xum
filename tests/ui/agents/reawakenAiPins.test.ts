@@ -10,19 +10,26 @@ import "../dom";
 import { waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
-import { getModelKey, getThinkingLevelKey } from "@/common/constants/storage";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { KNOWN_MODELS, MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
 import type { Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { shouldRunIntegrationTests } from "../../testUtils";
 import { createWorkspace, generateBranchName } from "../../ipc/helpers";
+import { trackApiCalls, type ApiCallTracker } from "../apiCallTracker";
 import { createAppHarness, type AppHarness } from "../harness";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 const SPAWN_MODEL = KNOWN_MODELS.HAIKU.id;
 const BACKEND_MODEL = KNOWN_MODELS.OPUS.id;
 
-async function selectAgent(container: HTMLElement, agentId: string): Promise<void> {
+async function selectAgent(
+  container: HTMLElement,
+  agentId: string,
+  agentList: ApiCallTracker
+): Promise<void> {
+  // The picker shows "Loading agents…" until the app's agents.list answers, and that call waits
+  // for workspace init. Await it rather than race it with waitFor's 1 s default (#6143).
+  await agentList.settled();
   const user = userEvent.setup({ document: container.ownerDocument });
   await user.click(within(container).getByRole("button", { name: "Select agent" }));
   const option = await waitFor(() => {
@@ -68,11 +75,15 @@ async function sendAndSettle(app: AppHarness, text: string): Promise<void> {
 
 describeIntegration("Reawakened sub-agent pins from the renderer", () => {
   test("only a sent deliberate pick pins; plain sends and backend reseeds never do", async () => {
-    const app = await createAppHarness({ branchPrefix: "reawaken-pins" });
+    const agentList = trackApiCalls("agents", "list");
+    const app = await createAppHarness({
+      branchPrefix: "reawaken-pins",
+      wrapApiClient: agentList.wrap,
+    });
     try {
       // Pick Exec while the workspace is still a plain chat, then turn it into a
       // new-style Exec child of a fresh parent.
-      await selectAgent(app.view.container, "exec");
+      await selectAgent(app.view.container, "exec", agentList);
       const parent = await createWorkspace(
         app.env,
         app.repoPath,
@@ -89,19 +100,18 @@ describeIntegration("Reawakened sub-agent pins from the renderer", () => {
         workspace.aiSettingsByAgent = { exec: { model: SPAWN_MODEL, thinkingLevel: "high" } };
         workspace.taskAiPins = {};
       });
-      const modelKey = getModelKey(app.workspaceId);
-      const thinkingKey = getThinkingLevelKey(app.workspaceId);
+      const selection = () => getWorkspaceAiSelection(app.workspaceId);
 
       // 1. A plain send records no pins.
       await sendAndSettle(app, "plain follow-up");
       expect(readChild(app).taskAiPins).toEqual({});
 
       // 2. A backend bucket change reseeds the renderer (not a user pick): no pin.
-      expect(readPersistedState(modelKey, "")).not.toBe(BACKEND_MODEL);
+      expect(selection().model).not.toBe(BACKEND_MODEL);
       await editChild(app, (workspace) => {
         workspace.aiSettingsByAgent = { exec: { model: BACKEND_MODEL, thinkingLevel: "high" } };
       });
-      await waitFor(() => expect(readPersistedState(modelKey, "")).toBe(BACKEND_MODEL), {
+      await waitFor(() => expect(selection().model).toBe(BACKEND_MODEL), {
         timeout: 10_000,
       });
       await sendAndSettle(app, "after backend reseed");
@@ -114,16 +124,16 @@ describeIntegration("Reawakened sub-agent pins from the renderer", () => {
       const picked = MODEL_ABBREVIATIONS.sonnet;
       if (!picked) throw new Error("Missing sonnet abbreviation");
       await app.chat.send("/model sonnet");
-      await waitFor(() => expect(readPersistedState(modelKey, "")).toBe(picked), {
+      await waitFor(() => expect(selection().model).toBe(picked), {
         timeout: 10_000,
       });
       await editChild(app, (workspace) => {
         workspace.aiSettingsByAgent = { exec: { model: BACKEND_MODEL, thinkingLevel: "low" } };
       });
-      await waitFor(() => expect(readPersistedState(thinkingKey, "")).toBe("low"), {
+      await waitFor(() => expect(selection().thinkingLevel).toBe("low"), {
         timeout: 10_000,
       });
-      expect(readPersistedState(modelKey, "")).toBe(picked);
+      expect(selection().model).toBe(picked);
       await sendAndSettle(app, "send the pick");
       expect(readChild(app).taskAiPins).toEqual({ model: picked });
 
@@ -132,7 +142,7 @@ describeIntegration("Reawakened sub-agent pins from the renderer", () => {
       await editChild(app, (workspace) => {
         workspace.aiSettingsByAgent = { exec: { model: BACKEND_MODEL, thinkingLevel: "high" } };
       });
-      await waitFor(() => expect(readPersistedState(modelKey, "")).toBe(BACKEND_MODEL), {
+      await waitFor(() => expect(selection().model).toBe(BACKEND_MODEL), {
         timeout: 10_000,
       });
       await sendAndSettle(app, "plain after the pin");

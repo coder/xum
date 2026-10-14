@@ -23,25 +23,14 @@ import { createErrorToast } from "@/browser/features/ChatInput/ChatInputToasts";
 import { ConfirmationModal } from "@/browser/components/ConfirmationModal/ConfirmationModal";
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
 import { parseCommand } from "@/browser/utils/slashCommands/parser";
-import {
-  readPersistedState,
-  usePersistedState,
-  updatePersistedState,
-} from "@/browser/hooks/usePersistedState";
+import { usePersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useAgent } from "@/browser/contexts/AgentContext";
 import { ThinkingSelector } from "@/browser/components/ThinkingSelector/ThinkingSelector";
-import {
-  getAllowedRuntimeModesForUi,
-  isParsedRuntimeAllowedByPolicy,
-} from "@/browser/utils/policyUi";
-import { usePolicy } from "@/browser/contexts/PolicyContext";
-import { useAPI, type APIClient } from "@/browser/contexts/API";
-import { useUserPreferencePersistence } from "@/browser/contexts/UserPreferencesContext";
-import { useReasoningMode } from "@/browser/hooks/useReasoningMode";
-import { useThinkingLevel } from "@/browser/hooks/useThinkingLevel";
+import { useAPI, type APIClient, useLiveAPI } from "@/browser/contexts/API";
+import { CONNECTION_LOST_MESSAGE } from "@/browser/contexts/connectionLink";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
 import {
@@ -52,23 +41,11 @@ import {
   useAutoRoutingSelection,
   useSendMessageOptions,
 } from "@/browser/hooks/useSendMessageOptions";
+import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
+import { readScopedAiDefault, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
+import { resolveWorkspaceAiSettingsForAgent } from "@/browser/utils/workspaceModeAi";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import {
-  applyAutoRoutingOutcome,
-  setWorkspaceModelWithOrigin,
-  setWorkspaceThinkingLevelWithOrigin,
-} from "@/browser/utils/modelChange";
-import {
-  resolveAutoRoutingForAgent,
-  resolveWorkspaceAiSettingsForAgent,
-} from "@/browser/utils/workspaceModeAi";
-import {
-  getModelKey,
-  getReasoningModeKey,
-  getThinkingLevelKey,
-  getWorkspaceAISettingsByAgentKey,
-  AGENT_AI_DEFAULTS_KEY,
-  VIM_ENABLED_KEY,
-  RUNTIME_ENABLEMENT_KEY,
   getProjectScopeId,
   getPendingDraftSkillDiscoveryKey,
   getPendingWorkspaceSendErrorKey,
@@ -85,7 +62,11 @@ import {
   getWorkflowRunCardProjection,
 } from "@/browser/utils/workflowRunMessages";
 import { Button } from "@/browser/components/Button/Button";
-import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
+import {
+  CUSTOM_EVENTS,
+  createCustomEvent,
+  type CustomEventPayloads,
+} from "@/common/constants/events";
 import { useChatErrorToasts } from "@/browser/utils/chatErrorToasts";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { extractInlineSkillReferenceCandidates } from "@/browser/utils/agentSkills/inlineSkillReferences";
@@ -97,6 +78,7 @@ import { resolveWorkspaceCreationScope } from "@/common/utils/subProjects";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { CreationProjectSelect } from "./CreationProjectSelect";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
+import { useComputerUse } from "@/browser/hooks/useComputerUse";
 import { AgentModePicker } from "@/browser/components/AgentModePicker/AgentModePicker";
 import { ContextUsageIndicatorButton } from "@/browser/components/ContextUsageIndicatorButton/ContextUsageIndicatorButton";
 import {
@@ -104,6 +86,14 @@ import {
   useWorkspaceStoreRaw,
   useWorkspaceUsage,
 } from "@/browser/stores/WorkspaceStore";
+import {
+  flushUserPreferences,
+  getUserPreferences,
+  updateUserPreferences,
+  useAgentAiDefaults,
+  useAppConfig,
+  useUserPreferences,
+} from "@/browser/stores/AppConfigStore";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
 import { getPlaceholderTip } from "./placeholderTips";
 import { useProviderOptions } from "@/browser/hooks/useProviderOptions";
@@ -115,8 +105,13 @@ import {
   matchesKeybind,
   formatKeybind,
   KEYBINDS,
+  isDesktopViewportFocused,
+  isCommandPaletteTarget,
+  isDialogOpen,
   isEditableElement,
+  paneHandlesKeyEvent,
 } from "@/browser/utils/ui/keybinds";
+import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import {
   hasBudgetedResumableGoal,
   modelHasPricingData,
@@ -140,9 +135,8 @@ import {
   type PendingUserMessage,
 } from "@/browser/utils/chatEditing";
 
-import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
-import { type OpenAIReasoningMode, type ThinkingLevel } from "@/common/types/thinking";
-import { DEFAULT_RUNTIME_ENABLEMENT, normalizeRuntimeEnablement } from "@/common/types/runtime";
+import { type ThinkingLevel } from "@/common/types/thinking";
+import { normalizeRuntimeEnablement, RUNTIME_MODE } from "@/common/types/runtime";
 import {
   type MuxMessageMetadata,
   type ReviewNoteDataForDisplay,
@@ -156,7 +150,7 @@ import {
 import { KNOWN_MODELS, MODEL_ABBREVIATION_EXAMPLES } from "@/common/constants/knownModels";
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { trackCommandUsed } from "@/common/telemetry";
-import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
+import type { SendMessageOptions } from "@/common/orpc/types";
 
 import type { PendingInitialUserMessage } from "@/browser/utils/messages/pendingInitialUserMessage";
 import { cn } from "@/common/lib/utils";
@@ -198,7 +192,7 @@ import { normalizeAgentId } from "@/common/utils/agentIds";
 import { isGoalRunning } from "@/common/types/goal";
 import { appendStagedAttachmentNotice, getStagedAttachments } from "./stagedAttachments";
 import type { ChatAttachment } from "./ChatAttachments";
-import { joinDraftText, removeSentText } from "./composerDraftText";
+import { hasDraftBlock, joinDraftText, takeSentText } from "@/common/utils/composerDraftText";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import {
   consumeAiSelectionIntent,
@@ -220,7 +214,12 @@ import {
   useComposerAttachments,
 } from "./useComposerAttachments";
 import { useComposerDraft } from "./useComposerDraft";
-import { getDraftStore } from "@/browser/stores/DraftStore";
+import { getDraftStore, type SendOutcome } from "@/browser/stores/DraftStore";
+import { useComposerTypingLock } from "./useComposerTypingLock";
+import { useReportCreationSendBlocked } from "./useReportCreationSendBlocked";
+import { assert } from "@/common/utils/assert";
+import { acceptedSendIds, isEditSendAccepted } from "./sendAcceptance";
+import { createSendId } from "@/common/utils/drafts";
 import { useComposerSuggestions } from "./useComposerSuggestions";
 import { isRestoredDraftDurable } from "./restoredDraftDurability";
 import {
@@ -290,6 +289,14 @@ async function forEachProviderConfigChange(
   }
 }
 
+/**
+ * Why a send waits for the transcript. Offline the transcript cannot catch up until the
+ * reconnect, so the toast says that instead of "still loading".
+ */
+function transcriptBarrierMessage(offline: boolean): string {
+  return offline ? CONNECTION_LOST_MESSAGE : TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE;
+}
+
 /** Composer attachments for a restored or edited message (provider files, then staged files). */
 function pendingChatAttachments(
   pending: PendingUserMessage,
@@ -315,15 +322,17 @@ interface EditSession {
 
 const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const { api } = useAPI();
-  const { waitForPreferencePersisted } = useUserPreferencePersistence();
-  const policyState = usePolicy();
-  const effectivePolicy =
-    policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
-  const runtimePolicy = useMemo(
-    () => getAllowedRuntimeModesForUi(effectivePolicy),
-    [effectivePolicy]
-  );
+  const liveApi = useLiveAPI();
+  // For refusals after an await: the send's closure holds the client from when it started.
+  const liveApiRef = useRef(liveApi);
+  useEffect(() => {
+    liveApiRef.current = liveApi;
+  }, [liveApi]);
   const { variant } = props;
+  // A /side chat composer is mounted next to the main one. Window shortcuts act only in the pane
+  // that owns the focused element, and unscoped palette events (open model selector, voice, toasts)
+  // belong to the main composer so they fire once.
+  const paneScope = useChatPaneScope();
   const { userProjects } = useProjectContext();
   const creationScope =
     variant === "creation"
@@ -333,9 +342,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const creationSubProjectPath = creationScope?.subProjectPath ?? undefined;
   const creationProject =
     variant === "creation" ? userProjects.get(creationParentProjectPath) : undefined;
-  const [thinkingLevel] = useThinkingLevel();
-  const [reasoningMode] = useReasoningMode();
-  const dynamicWorkflowsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS);
   const atMentionProjectPath =
     variant === "creation" && props.kind !== "scratch" ? props.projectPath : null;
   const asyncCommandScopeRef = useRef<{ variant: typeof variant; workspaceId: string | null }>({
@@ -428,28 +434,27 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   }, [editingMessage?.id, optimisticallyDismissedEditId]);
   // runtimeType for telemetry - defaults to "worktree" if not provided
   const runtimeType = variant === "workspace" ? (props.runtimeType ?? "worktree") : "worktree";
+  const computerUse = useComputerUse(workspaceId);
 
   // Callback for model changes (both variants support this)
   const onModelChange = props.onModelChange;
 
   // User request: keep creation runtime controls synced with Settings enablement toggles.
-  const [rawRuntimeEnablement] = usePersistedState(
-    RUNTIME_ENABLEMENT_KEY,
-    DEFAULT_RUNTIME_ENABLEMENT,
-    { listener: true }
-  );
+  const rawRuntimeEnablement = useAppConfig((config) => config.runtimeEnablement);
   const runtimeEnablement = normalizeRuntimeEnablement(rawRuntimeEnablement);
 
   // Track concurrent sends with a counter (not boolean) to handle queued follow-ups correctly.
   // When a follow-up is queued during stream-start, it resolves immediately but shouldn't
   // clear the "in flight" state until all sends complete.
   const [sendingCount, setSendingCount] = useState(0);
-  const isSending = sendingCount > 0;
   const sendModeMenuContainerRef = useRef<HTMLDivElement>(null);
   const [hideReviewsDuringSend, setHideReviewsDuringSend] = useState(false);
   const projectedWorkflowRunCardKeysRef = useRef(new Set<string>());
   const workflowsRequestIdRef = useRef(0);
   const [toast, setToast] = useState<Toast | null>(null);
+  // The alert an edit's `history-changed` refusal raised. That edit's successful re-send clears
+  // it (only while it is still the shown toast), as a successful refresh retry clears its own.
+  const editConflictToastRef = useRef<{ editMessageId: string; toast: Toast } | null>(null);
   // State for destructive command confirmation modal (currently only /clear).
   const [pendingDestructiveCommand, setPendingDestructiveCommand] = useState(false);
   const pushToast = useCallback(
@@ -608,7 +613,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   );
 
   const { open } = useSettings();
-  const { selectedWorkspace, beginWorkspaceCreation } = useWorkspaceContext();
+  const { selectedWorkspace, beginWorkspaceCreation, workspaceMetadata } = useWorkspaceContext();
   const { agentId, currentAgent, agents } = useAgent();
 
   // Use current agent's uiColor, or neutral border until agents load
@@ -619,17 +624,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const { models, hiddenModelsForSelector, ensureModelInSettings, defaultModel, setDefaultModel } =
     useModelsFromSettings();
 
-  const [agentAiDefaults] = usePersistedState<AgentAiDefaults>(
-    AGENT_AI_DEFAULTS_KEY,
-    {},
-    {
-      listener: true,
-    }
-  );
+  const agentAiDefaults = useAgentAiDefaults();
   const telemetry = useTelemetry();
-  const [vimEnabled, setVimEnabled] = usePersistedState<boolean>(VIM_ENABLED_KEY, false, {
-    listener: true,
-  });
+  const vimEnabled = useUserPreferences(
+    (preferences) => preferences.appearance?.vimEnabled === true
+  );
   const { startSequence: startTutorial } = useTutorial();
 
   // Track transcription provider prerequisites from Settings → Providers.
@@ -654,7 +653,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     onSend: () => void handleSend(),
     isTranscriptionAvailable,
     useRecordingKeybinds: true,
-    api,
+    api: liveApi,
   });
 
   const voiceInputUnavailableMessage =
@@ -692,7 +691,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     variant,
     workspaceId,
     projectPath: atMentionProjectPath,
-    disableWorkspaceAgents: sendMessageOptions.disableWorkspaceAgents === true,
   });
   const { agentSkillDescriptors, handleInputCaretChange, mcpPromptDescriptors } =
     composerSuggestions;
@@ -750,13 +748,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   };
 
   const setPreferredModel = (model: string) => {
-    type WorkspaceAISettingsByAgentCache = Partial<
-      Record<
-        string,
-        { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
-      >
-    >;
-
     const selectedModel = normalizeSelectedModel(model);
     if (
       variant === "workspace" &&
@@ -774,10 +765,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     ensureModelInSettings(selectedModel); // Ensure model exists in Settings
     // A concrete pick (selector, /model, or the cycle shortcut) always leaves Auto.
     setAutoModelRoutingActive(false);
-    // Deliberate pick: pins the model on a sub-agent once a message sends it.
-    if (variant === "workspace" && workspaceId) {
-      markAiSelectionIntent(workspaceId, "model", selectedModel);
-    }
 
     if (onModelChange) {
       // Notify parent of model change (for context switch warning + persisted model metadata).
@@ -791,24 +778,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       }
     }
 
-    if (variant !== "workspace" || !workspaceId) {
-      return;
+    // Marked after onModelChange so its explicit-switch record still sees the previous model;
+    // this also pins a same-model pick on a sub-agent once a message sends it.
+    if (variant === "workspace" && workspaceId) {
+      markAiSelectionIntent(workspaceId, "model", selectedModel);
     }
-
-    const normalizedAgentId = normalizeAgentId(agentId, "exec");
-
-    updatePersistedState<WorkspaceAISettingsByAgentCache>(
-      getWorkspaceAISettingsByAgentKey(workspaceId),
-      (prev) => {
-        const record: WorkspaceAISettingsByAgentCache =
-          prev && typeof prev === "object" ? prev : {};
-        return {
-          ...record,
-          [normalizedAgentId]: { model: selectedModel, thinkingLevel, reasoningMode },
-        };
-      },
-      {}
-    );
   };
 
   // Model cycling candidates: all visible models (custom + built-in, minus hidden).
@@ -874,11 +848,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           subProjectPath: creationSubProjectPath,
           onWorkspaceCreated: props.onWorkspaceCreated,
           message: creationNameMessage,
-          dynamicWorkflowsEnabled: dynamicWorkflowsExperimentEnabled,
           draftId: props.pendingDraftId,
           userModel: preferredModel,
           agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
-          autoRoutingEnabled: autoModelRoutingEnabled,
         }
       : {
           // Dummy values for workspace variant (never used)
@@ -891,9 +863,21 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   // Creation sends also pass through the async resolution phase guarded by
   // sendingCount, so include it alongside the creation-specific flag.
+  // A send whose acceptance is unresolved (the receiver answered unknown, or the lookup failed)
+  // keeps the composer in this same sending state while DraftStore retries it (idempotent sends).
+  const isSending = sendingCount > 0 || draft.unresolvedSendCount > 0;
   const isSendInFlight = variant === "creation" ? creationState.isSending || isSending : isSending;
   const sendInFlightBlocksInput =
     variant === "workspace" ? isSendInFlight && !isStreamStarting : isSendInFlight;
+  // #6259: typing stays on once a send has taken its draft; submission waits for it to settle.
+  const typingLock = useComposerTypingLock({
+    variant,
+    sendingCount,
+    isStreamStarting,
+    creationLocksTyping: sendInFlightBlocksInput,
+    inputRef,
+  });
+  const sendLocksTyping = typingLock.locksTyping;
 
   // Coder workspace state - config is owned by selectedRuntime.coder, this hook manages async data
   const currentRuntime = creationState.selectedRuntime;
@@ -915,19 +899,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       ? validateCreationRuntime(creationState.selectedRuntime, coderState.presets.length)
       : null;
 
-  const creationRuntimePolicyError =
-    variant === "creation" &&
-    props.kind !== "scratch" &&
-    effectivePolicy?.runtimes != null &&
-    !isParsedRuntimeAllowedByPolicy(effectivePolicy, creationState.selectedRuntime)
-      ? creationState.selectedRuntime.mode === "ssh" &&
-        !creationState.selectedRuntime.coder &&
-        runtimePolicy.allowSshHost === false &&
-        runtimePolicy.allowSshCoder
-        ? "Host SSH runtimes are disabled by policy. Select the Coder runtime instead."
-        : "Selected runtime is disabled by policy."
-      : null;
-
   const runtimeFieldError =
     variant === "creation" && hasAttemptedCreateSend ? (creationRuntimeError?.mode ?? null) : null;
 
@@ -935,7 +906,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     variant === "creation" && props.kind !== "scratch"
       ? ({
           branches: creationState.branches,
-          branchesLoaded: creationState.branchesLoaded,
+          branchLoad: creationState.branchLoad,
           trunkBranch: creationState.trunkBranch,
           onTrunkBranchChange: creationState.setTrunkBranch,
           selectedRuntime: creationState.selectedRuntime,
@@ -943,7 +914,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           sshHostFallback: creationState.sshHostFallback,
           defaultRuntimeMode: creationState.defaultRuntimeMode,
           onSelectedRuntimeChange: creationState.setSelectedRuntime,
-          onSetDefaultRuntime: creationState.setDefaultRuntimeChoice,
           disabled: isSendInFlight,
           projectPath: creationParentProjectPath,
           // Surface the actually-targeted project (possibly a sub-project) to
@@ -960,10 +930,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           nameState: creationState.nameState,
           runtimeAvailabilityState: creationState.runtimeAvailabilityState,
           runtimeEnablement: creationRuntimeEnablement,
-          allowedRuntimeModes: runtimePolicy.allowedModes,
-          allowSshHost: runtimePolicy.allowSshHost,
-          allowSshCoder: runtimePolicy.allowSshCoder,
-          runtimePolicyError: creationRuntimePolicyError,
           coderInfo: coderState.coderInfo,
           runtimeFieldError,
           // Pass coderProps when CLI is available/outdated, Coder is enabled, or still checking (so "Checking…" UI renders)
@@ -994,10 +960,28 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const hasImages = attachments.length > 0;
   const hasReviews = reviewData !== undefined;
   // Disable send while Coder presets are loading (user could bypass preset validation)
-  const policyBlocksCreateSend = variant === "creation" && creationRuntimePolicyError != null;
   const coderPresetsLoading =
     coderState.enabled && !coderState.coderConfig?.existingWorkspace && coderState.loadingPresets;
+  // #6033: the trunk branch stays empty until the branch list loads, and the backend refuses
+  // every runtime except local without one, so a creation send must wait for the list. A failed
+  // list keeps it closed too (#6055).
+  const creationBranchesLoading =
+    variant === "creation" &&
+    props.kind !== "scratch" &&
+    creationState.branchLoad !== "loaded" &&
+    creationState.selectedRuntime.mode !== RUNTIME_MODE.LOCAL;
   const isProcessingAttachments = processingAttachmentCount > 0;
+  // #6423: the same blockers as canSend below, so "Run /init" is off whenever Send is.
+  useReportCreationSendBlocked(
+    {
+      disabled,
+      sendInFlight: sendInFlightBlocksInput,
+      processingAttachments: isProcessingAttachments,
+      coderPresetsLoading,
+      branchesNotLoaded: creationBranchesLoading,
+    },
+    props
+  );
   const hasSendableDraft = hasTypedText || hasImages || hasReviews;
   // Workspace sends/edits mutate history relative to the visible transcript, so they wait for
   // the onChat replay to finish; the creation composer has no transcript to catch up with.
@@ -1019,7 +1003,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     !sendInFlightBlocksInput &&
     !isProcessingAttachments &&
     !coderPresetsLoading &&
-    !policyBlocksCreateSend &&
+    !creationBranchesLoading &&
     !transcriptBlocksSend &&
     !editPreconditionInvalidated;
   const runningGoalActive =
@@ -1095,8 +1079,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     }
 
     const scopeId = getProjectScopeId(creationParentProjectPath);
-    const modelKey = getModelKey(scopeId);
-    const thinkingKey = getThinkingLevelKey(scopeId);
 
     const fallbackModel = defaultModel;
 
@@ -1111,15 +1093,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     prevCreationAgentIdRef.current = normalizedAgentId;
     prevCreationScopeIdRef.current = scopeId;
 
-    const existingModel = readPersistedState<string>(modelKey, fallbackModel);
-    const existingThinking = readPersistedState<ThinkingLevel>(thinkingKey, "off");
+    const existingModel = readScopedAiDefault(scopeId, "model") ?? fallbackModel;
+    const existingThinking = readScopedAiDefault(scopeId, "thinkingLevel") ?? "off";
     // Configured defaults (direct or base-chain, field-wise) must reach the
     // first turn of a new workspace too, not just post-creation agent syncs:
     // a custom agent inheriting model/thinking/pro from its base would
     // otherwise send the first prompt with the ambient model and Pro gated off
     // until WorkspaceModeAISync corrects the workspace.
-    const reasoningKey = getReasoningModeKey(scopeId);
-    const existingReasoning = readPersistedState<OpenAIReasoningMode>(reasoningKey, "standard");
+    const existingReasoning = getWorkspaceAiSelection(scopeId).reasoningMode;
     const agentBaseById = new Map(agents.map((agent) => [agent.id, agent.base]));
     const {
       resolvedModel,
@@ -1134,41 +1115,18 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       existingReasoningMode: existingReasoning,
       agentBaseById,
     });
-    // Agent resolution in creation scopes uses configured defaults because they keep no
-    // per-agent routing choices or settings buckets.
-    const autoRoutingOutcome = resolveAutoRoutingForAgent({
-      agentId: normalizedAgentId,
-      agentAiDefaults,
-      agentBaseById,
-      explicitSwitch: isExplicitAgentSwitch,
-      experimentEnabled: autoModelRoutingEnabled,
-    });
     if (existingModel !== resolvedModel) {
       setWorkspaceModelWithOrigin(scopeId, resolvedModel, isExplicitAgentSwitch ? "agent" : "sync");
     }
 
     if (existingThinking !== resolvedThinking) {
-      setWorkspaceThinkingLevelWithOrigin(
-        scopeId,
-        resolvedThinking,
-        isExplicitAgentSwitch ? "agent" : "sync"
-      );
+      writeScopedAiDefault(scopeId, "thinkingLevel", resolvedThinking);
     }
 
     if (existingReasoning !== resolvedReasoning) {
-      updatePersistedState(reasoningKey, resolvedReasoning);
+      markAiSelectionIntent(scopeId, "reasoningMode", resolvedReasoning);
     }
-
-    applyAutoRoutingOutcome(scopeId, autoRoutingOutcome);
-  }, [
-    agentAiDefaults,
-    agentId,
-    agents,
-    autoModelRoutingEnabled,
-    creationParentProjectPath,
-    defaultModel,
-    variant,
-  ]);
+  }, [agentAiDefaults, agentId, agents, creationParentProjectPath, defaultModel, variant]);
 
   const chatDockColumnWidthClass = useChatDockColumnWidthClass();
 
@@ -1214,12 +1172,48 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   // Restore a full pending draft (text + attachments + reviews), e.g. queued message edits.
   const restoreDraft = useCallback(
-    (pending: PendingUserMessage) => {
-      applyDraftFromPending(pending, `restored-${Date.now()}`);
+    (pending: PendingUserMessage, options?: { retainedSendIds?: string[] }) => {
+      const retained = getDraftStore().getPendingSendIds(draftScope);
+      const sendIds = options?.retainedSendIds ?? [];
+      const retainedSendIds = sendIds.filter((id) => retained.has(id));
+      if (retainedSendIds.length === 0) {
+        applyDraftFromPending(pending, `restored-${Date.now()}`);
+      } else {
+        // The draft still retains these sends: they come back as not accepted (prepended to the
+        // composer text) once the backend no longer holds them. Inserting them here too would
+        // show them twice, so only the rest of the queued input (sends the draft does not
+        // retain, e.g. a backend-minted one) is inserted now.
+        if (draftScope.kind === "workspace") {
+          getDraftStore().triggerSendResolution(draftScope.workspaceId);
+        }
+        if (retainedSendIds.length < sendIds.length) {
+          const { text: restText, ...rest } = getDraftStore().withoutRetainedSends(
+            draftScope,
+            retainedSendIds,
+            { ...pending, text: pending.content }
+          );
+          // Merged in front, never replacing: the composer may already show a resolved send.
+          setInput((current) => joinDraftText(restText, current));
+          const restAttachments = pendingChatAttachments(
+            { ...rest, content: restText },
+            `restored-${Date.now()}`
+          );
+          if (restAttachments.length > 0) {
+            setAttachments((current) => [...restAttachments, ...current]);
+          }
+        }
+      }
       setDraftReviews(pending.reviews);
       focusMessageInput();
     },
-    [applyDraftFromPending, focusMessageInput, setDraftReviews]
+    [
+      applyDraftFromPending,
+      draftScope,
+      focusMessageInput,
+      setAttachments,
+      setDraftReviews,
+      setInput,
+    ]
   );
 
   // The latest edit's session. Settled explicitly: the edit target also leaves the live
@@ -1323,16 +1317,32 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         focus: focusMessageInput,
         send,
         restoreText: (text) => composerApiRef.current.restoreText(text),
-        restoreDraft: (pending) => composerApiRef.current.restoreDraft(pending),
+        restoreDraft: (pending, options) => composerApiRef.current.restoreDraft(pending, options),
         appendText: (text) => composerApiRef.current.appendText(text),
         prependText: (text) => composerApiRef.current.prependText(text),
       });
     }
   }, [onReady, focusMessageInput, send]);
 
+  // The creation composer shows the focus-chat hint too, but the only handler lived in the
+  // workspace view (useAIViewKeybinds), so the shortcut did nothing here (#5687). Same rules as
+  // there: capture phase, works from inputs, yields to remote desktops and open dialogs.
+  useEffect(() => {
+    if (variant !== "creation") return;
+    const handleFocusChat = (event: KeyboardEvent) => {
+      if (!matchesKeybind(event, KEYBINDS.FOCUS_CHAT) || isDesktopViewportFocused(event.target)) {
+        return;
+      }
+      event.preventDefault();
+      if (!isDialogOpen() && !isCommandPaletteTarget(event.target)) focusMessageInput();
+    };
+    window.addEventListener("keydown", handleFocusChat, { capture: true });
+    return () => window.removeEventListener("keydown", handleFocusChat, { capture: true });
+  }, [variant, focusMessageInput]);
+
   useEffect(() => {
     const handleGlobalKeyDown = (event: KeyboardEvent) => {
-      if (isEditableElement(event.target)) {
+      if (isEditableElement(event.target) || !paneHandlesKeyEvent(paneScope, event.target)) {
         return;
       }
 
@@ -1359,7 +1369,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     return () => {
       window.removeEventListener("keydown", handleGlobalKeyDown);
     };
-  }, [focusMessageInput, openModelSelector]);
+  }, [focusMessageInput, openModelSelector, paneScope]);
 
   // When entering editing mode, save current draft and populate with message content.
   // Runs once per edit target: the draft callbacks change identity as the user types, and
@@ -1416,7 +1426,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     const requestId = ++workflowsRequestIdRef.current;
 
     const loadWorkflows = async () => {
-      if (!api || !dynamicWorkflowsExperimentEnabled) {
+      if (!api) {
         return;
       }
 
@@ -1460,15 +1470,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     return () => {
       isMounted = false;
     };
-  }, [
-    api,
-    variant,
-    workspaceId,
-    atMentionProjectPath,
-    dynamicWorkflowsExperimentEnabled,
-    isTranscriptCaughtUp,
-    store,
-  ]);
+  }, [api, variant, workspaceId, atMentionProjectPath, isTranscriptCaughtUp, store]);
 
   // Voice input: track transcription provider availability (subscribe to provider config changes)
   useEffect(() => {
@@ -1517,24 +1519,85 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   // Allow external components (e.g., CommandPalette, Queued message edits) to insert text
   useEffect(() => {
+    type UpdateDetail = CustomEventPayloads[typeof CUSTOM_EVENTS.UPDATE_CHAT_INPUT];
     const handler = (e: Event) => {
-      const customEvent = e as CustomEvent<{
-        text: string;
-        mode?: "append" | "replace" | "restore";
-        fileParts?: FilePart[];
-        reviews?: ReviewNoteDataForDisplay[];
-        workspaceId?: string;
-        heldInputIds?: string[];
-      }>;
-
-      if (
-        customEvent.detail.workspaceId != null &&
-        workspaceIdForComposerClear !== customEvent.detail.workspaceId
-      ) {
+      const detail = (e as CustomEvent<UpdateDetail>).detail;
+      if (detail.workspaceId != null && workspaceIdForComposerClear !== detail.workspaceId) {
         return;
       }
-
-      const { text, mode = "append", fileParts, reviews } = customEvent.detail;
+      // Unscoped updates come from the palette / main UI; the side composer only takes updates
+      // addressed to its own workspace so text is never inserted into both composers.
+      if (detail.workspaceId == null && paneScope !== "main") {
+        return;
+      }
+      const { inputs } = detail;
+      if (detail.mode !== "restore" || inputs == null) {
+        applyUpdate(detail);
+        return;
+      }
+      // Idempotent sends: a restored send whose id the draft still retains (pendingSends) is not
+      // inserted again: once its held input is released, its entry resolves as not accepted and
+      // its text becomes visible from the draft. An id-less (foreign) input is inserted once, as
+      // before.
+      const retained = getDraftStore().getPendingSendIds(draftScope);
+      const parts = inputs.map((restored) => {
+        const retainedIds = restored.sendIds.filter((id) => retained.has(id));
+        if (retainedIds.length === 0) return { restored, insert: restored, hasRetained: false };
+        if (retainedIds.length === restored.sendIds.length) {
+          return { restored, insert: null, hasRetained: true };
+        }
+        // One input can join a retained send with one the draft does not retain (e.g. a
+        // backend-minted one): insert only the latter's part.
+        const rest = getDraftStore().withoutRetainedSends(draftScope, retainedIds, {
+          text: restored.text,
+          fileParts: restored.fileParts ?? [],
+        });
+        const insert = {
+          text: rest.text,
+          fileParts: rest.fileParts,
+          sendIds: restored.sendIds.filter((id) => !retained.has(id)),
+        };
+        return { restored, insert, hasRetained: true };
+      });
+      // An input with ids the draft no longer retains may be a late copy of a send the backend
+      // already accepted (e.g. two windows re-sent it after a restart): ask before inserting it,
+      // so accepted text never comes back to be sent again. A failed lookup inserts it (a
+      // visible duplicate beats a loss).
+      const restoreParts = (accepted: ReadonlySet<string>) => {
+        const isAcceptedCopy = (insert: { sendIds: string[] }) =>
+          insert.sendIds.length > 0 && insert.sendIds.every((id) => accepted.has(id));
+        const inserted = parts.flatMap(({ insert }) =>
+          insert && !isAcceptedCopy(insert) ? [insert] : []
+        );
+        // Notes come back per input: none for an input dropped as an accepted copy (they were
+        // sent). A retained send's notes do come back here: its draft entry keeps only its text
+        // and attachments.
+        const reviews = parts.flatMap(({ restored, insert, hasRetained }) =>
+          !hasRetained && insert && isAcceptedCopy(insert) ? [] : (restored.reviews ?? [])
+        );
+        applyUpdate({
+          ...detail,
+          inputs: undefined,
+          text: inserted
+            .map((restored) => restored.text)
+            .filter((part) => part.length > 0)
+            .join("\n"),
+          fileParts: inserted.flatMap((restored) => restored.fileParts ?? []),
+          reviews: reviews.length > 0 ? reviews : undefined,
+        });
+      };
+      const askIds = parts.flatMap(({ insert }) => insert?.sendIds ?? []);
+      if (askIds.length === 0 || workspaceIdForComposerClear == null || api == null) {
+        restoreParts(new Set());
+        return;
+      }
+      acceptedSendIds(api, workspaceIdForComposerClear, askIds)
+        .catch(() => new Set<string>())
+        .then(restoreParts)
+        .catch((error: unknown) => console.error("Failed to restore queued input:", error));
+    };
+    const applyUpdate = (detail: UpdateDetail) => {
+      const { text, mode = "append", fileParts, reviews } = detail;
       const restoredIdPrefix = `restored-${Date.now()}`;
       const restoredPending = buildPendingFromRestoredInput({
         content: text,
@@ -1588,7 +1651,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // that copy only once every restored part is durable; otherwise the "Not sent" banner
         // stays next to the composer's copy: a visible duplicate beats a loss. Edit mode (above)
         // takes nothing.
-        const heldInputIds = customEvent.detail.heldInputIds ?? [];
+        const heldInputIds = detail.heldInputIds ?? [];
         if (heldInputIds.length > 0 && workspaceIdForComposerClear != null) {
           // The backend copy is released only after the backend confirmed the restored draft
           // write; a failed write keeps (and shows) the held input.
@@ -1655,6 +1718,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     onAcceptRestoredHeldInputs,
     draftScope,
     focusMessageInput,
+    api,
+    paneScope,
   ]);
 
   useEffect(() => {
@@ -1685,6 +1750,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   // Allow external components to open the Model Selector
   useEffect(() => {
+    // Unscoped palette event: the main composer owns it (see paneScope).
+    if (paneScope !== "main") return;
     const handler = () => {
       // Open the inline ModelSelector and let it take focus itself
       modelSelectorRef.current?.open();
@@ -1692,7 +1759,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     window.addEventListener(CUSTOM_EVENTS.OPEN_MODEL_SELECTOR, handler as EventListener);
     return () =>
       window.removeEventListener(CUSTOM_EVENTS.OPEN_MODEL_SELECTOR, handler as EventListener);
-  }, []);
+  }, [paneScope]);
 
   // Show toast when thinking level is changed via command palette (workspace only)
   useEffect(() => {
@@ -1729,9 +1796,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   // Show toast feedback for analytics rebuild command palette action.
   useEffect(() => {
+    // Unscoped palette event: the main composer owns it so the toast shows once.
+    if (paneScope !== "main") return;
     const handler = (event: Event) => {
       const detail = (
-        event as CustomEvent<{ type: "success" | "error"; message: string; title?: string }>
+        event as CustomEvent<CustomEventPayloads[typeof CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST]>
       ).detail;
 
       if (!detail || (detail.type !== "success" && detail.type !== "error")) {
@@ -1742,17 +1811,20 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         type: detail.type,
         title: detail.title,
         message: detail.message,
+        copyText: detail.copyText,
+        duration: detail.duration,
       });
     };
 
     window.addEventListener(CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST, handler as EventListener);
     return () =>
       window.removeEventListener(CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST, handler as EventListener);
-  }, [pushToast]);
+  }, [pushToast, paneScope]);
 
   // Voice input: command palette toggle + global recording keybinds
   useEffect(() => {
-    if (!voiceInput.shouldShowUI) return;
+    // Unscoped palette event: only the main composer starts recording (see paneScope).
+    if (!voiceInput.shouldShowUI || paneScope !== "main") return;
 
     const handleToggle = () => {
       if (!voiceInput.isAvailable) {
@@ -1769,7 +1841,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     return () => {
       window.removeEventListener(CUSTOM_EVENTS.TOGGLE_VOICE_INPUT, handleToggle as EventListener);
     };
-  }, [voiceInput, pushToast, voiceInputUnavailableMessage]);
+  }, [voiceInput, pushToast, voiceInputUnavailableMessage, paneScope]);
 
   // Auto-focus chat input when workspace changes (workspace only).
   const workspaceIdForFocus = variant === "workspace" ? props.workspaceId : null;
@@ -1851,7 +1923,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     // Without an API client (backend reconnecting) hydration cannot finish, and waiting would
     // hold this send in flight and fire it after reconnect; let the send path report
     // "Not connected to server" instead.
-    if (!api || reviewStateStore.isHydrated(workspaceId)) return renderTime;
+    if (!liveApi || reviewStateStore.isHydrated(workspaceId)) return renderTime;
     const attached = await reviewStateStore.readAttachedReviewsForSend(workspaceId);
     if (attached === null) {
       // The render-time notes may be a stale cache; send none rather than a possibly wrong set.
@@ -1939,12 +2011,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     const commandFileParts = chatAttachmentsToFileParts(attachments, { validate: true });
     const asyncCommandToken = ++asyncCommandTokenRef.current;
     const commandEnv: SlashCommandEnv = {
-      api,
+      // Commands report "Not connected to server" themselves when there is no live client.
+      api: liveApi,
+      aiScopeId: sendOptionsScopeId,
       variant,
       workspaceId: commandWorkspaceId,
       projectPath: commandProjectPath,
       rawInput: restoreInput,
-      dynamicWorkflowsEnabled: dynamicWorkflowsExperimentEnabled,
       currentModel: workspaceSidebarState?.currentModel ?? null,
       sendMessageOptions: commandSendMessageOptions,
       resetContext: variant === "workspace" ? props.onResetContext : undefined,
@@ -1957,6 +2030,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       attachments,
       fileParts: commandFileParts.length > 0 ? commandFileParts : undefined,
       attachedReviewIds: options?.reviews ? options.reviews.ids : reviewIdsForCheck,
+      isSideChat:
+        commandWorkspaceId != null &&
+        workspaceMetadata.get(commandWorkspaceId)?.sideChatParentWorkspaceId != null,
       isCurrent: () => {
         const scope = asyncCommandScopeRef.current;
         return (
@@ -1995,7 +2071,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             setPreferredModel(action.model);
             break;
           case "toggle-vim":
-            setVimEnabled((enabled) => !enabled);
+            updateUserPreferences({
+              appearance: { vimEnabled: getUserPreferences().appearance?.vimEnabled !== true },
+            });
             break;
           case "set-sending":
             setSendingCount((count) => count + (action.sending ? 1 : -1));
@@ -2147,7 +2225,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     if (!isSameEdit()) return;
                     startEditTranscriptRefresh(editMessageId, precondition);
                   }}
-                  className="text-muted hover:text-accent cursor-pointer border-0 bg-transparent p-0 text-[10px] underline transition-colors"
+                  className="text-muted hover:text-accent-text cursor-pointer border-0 bg-transparent p-0 text-[10px] underline transition-colors"
                 >
                   {EDIT_RETRY_REFRESH_LABEL}
                 </button>
@@ -2177,9 +2255,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     const onEditSendPendingChange =
       variant === "workspace" && editingMessageForUi ? props.onEditSendPendingChange : undefined;
     onEditSendPendingChange?.(true);
+    // #6405: the composer stays on from Enter for a plain message.
+    const releaseTyping = typingLock.keepTypingOn(input);
     await runWithFinally(
       () => sendComposerInput(overrides),
-      () => onEditSendPendingChange?.(false)
+      () => {
+        releaseTyping();
+        onEditSendPendingChange?.(false);
+      }
     );
   };
   const sendComposerInput = async (overrides?: InternalSendOverrides) => {
@@ -2193,7 +2276,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       !draftBypassesTranscriptBarrier &&
       !isTranscriptMutationAllowed(props.workspaceId)
     ) {
-      pushToast({ type: "error", message: TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE });
+      pushToast({ type: "error", message: transcriptBarrierMessage(liveApiRef.current == null) });
       return;
     }
     if (!canSend) {
@@ -2209,8 +2292,16 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     }
 
     closeSendModeMenu();
+    // #6405: past the send gate only, so a refused Enter never moves the mark of a send in flight.
+    getDraftStore().markSendStart(draftScope, input);
 
-    const messageText = input.trim();
+    const trimmedInput = input.trim();
+    // #5695: a plain message keeps its first line's indentation (pasted code). Only leading
+    // blank lines and trailing whitespace go. Slash commands keep the fully trimmed text, so
+    // their parsing and stored rawCommand do not change.
+    const messageText = trimmedInput.startsWith("/")
+      ? trimmedInput
+      : input.replace(/^(?:[^\S\r\n]*\r?\n)+/, "").trimEnd();
     const skillDiscovery: SkillResolutionTarget | null =
       variant === "creation"
         ? atMentionProjectPath
@@ -2220,9 +2311,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           ? {
               kind: "workspace",
               workspaceId,
-              disableWorkspaceAgents:
-                sendMessageOptions.disableWorkspaceAgents === true ||
-                transferredDraftProjectDiscovery,
+              disableWorkspaceAgents: transferredDraftProjectDiscovery,
             }
           : null;
     // Captured before command resolution so the row the new workspace opens with shows what was
@@ -2256,7 +2345,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           messageText,
           agentSkillDescriptors,
           mcpPromptDescriptors,
-          api,
+          api: liveApi,
           discovery: skillDiscovery,
           signal: resolutionSignal,
         });
@@ -2271,7 +2360,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             messageText,
             slashInvocation: resolution.skillInvocation,
             agentSkillDescriptors,
-            api,
+            api: liveApi,
             discovery: skillDiscovery,
             candidates: inlineReferenceCandidates,
           }),
@@ -2279,7 +2368,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             messageText,
             slashInvocation: resolution.mcpPromptInvocation,
             descriptors: mcpPromptDescriptors,
-            api,
+            api: liveApi,
             discovery: skillDiscovery,
             candidates: inlineReferenceCandidates,
             signal: resolutionSignal,
@@ -2324,7 +2413,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       !commandBypassesTranscriptBarrier(parsed) &&
       !isTranscriptMutationAllowed(props.workspaceId)
     ) {
-      pushToast({ type: "error", message: TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE });
+      pushToast({ type: "error", message: transcriptBarrierMessage(liveApiRef.current == null) });
       return;
     }
 
@@ -2336,7 +2425,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       const goalCommandBypassedForAttachments =
         parsed?.type === "goal-set" && attachments.length > 0;
       const initialSlashCommand =
-        parsed?.type === "goal-set" && !goalCommandBypassedForAttachments ? parsed : undefined;
+        parsed?.type === "goal-set" && !goalCommandBypassedForAttachments
+          ? { ...parsed, typedText: messageText }
+          : undefined;
       if (
         !initialSlashCommand &&
         !goalCommandBypassedForAttachments &&
@@ -2353,7 +2444,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       let creationOptionsOverride: Partial<SendMessageOptions> | undefined;
 
       if (skillInvocation) {
-        if (!api) {
+        if (!liveApi) {
           pushToast({ type: "error", message: "Not connected to server" });
           return;
         }
@@ -2471,7 +2562,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         mcpPromptInvocation?.userText ??
         messageText;
 
-      if (!api) {
+      if (!liveApi) {
         pushToast({ type: "error", message: "Not connected to server" });
         return;
       }
@@ -2482,7 +2573,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       let sendAttachments = attachments;
       const pendingFilesForSend = getPendingFileAttachments(attachments);
       if (pendingFilesForSend.length > 0) {
-        const stagingOutcome = await stagePendingFiles(api, props.workspaceId, pendingFilesForSend);
+        const stagingOutcome = await stagePendingFiles(
+          liveApi,
+          props.workspaceId,
+          pendingFilesForSend
+        );
         if (stagingOutcome.staged.length > 0) {
           sendAttachments = replacePendingFilesWithStaged(attachments, stagingOutcome.staged);
           // Swap staged chips into the composer so a later failure or retry
@@ -2562,8 +2657,37 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           }
         }
       }
-      // Save current draft state for restoration on error
-      const preSendDraft = { ...getDraft(), attachments: sendAttachments };
+      // What this send took out of the composer, until it settles. A failed send puts it back
+      // merged with what the composer holds by then, never replacing it: text another window
+      // typed or a restore put in meanwhile stays (#5226 item 12).
+      // Null when the send failed before taking anything (nothing to put back) or succeeded.
+      let taken: { text: string } | null = null;
+      let releaseTakenDraft: () => void = () => undefined;
+      const putBackTaken = () => {
+        if (taken === null) return;
+        const { text } = taken;
+        taken = null;
+        // Put the text back unless the composer holds it again as a whole block: the clear can
+        // miss (the draft was replaced while the send was prepared), or the text can come back
+        // after it (another window that still held it saved it, #5501). A match inside a longer
+        // line is the user's own text, so the sent text comes back beside it: a duplicate
+        // beats a loss.
+        setInput((current) =>
+          hasDraftBlock(current, text) ? current : joinDraftText(text, current)
+        );
+        // On an id match the sent copy wins: it may be the staged version of a file that
+        // another window saved again as pending (#5501), and a retry must not stage it twice.
+        setAttachments((current) => {
+          const sentById = new Map(
+            sendAttachments.map((attachment) => [attachment.id, attachment])
+          );
+          const currentIds = new Set(current.map(({ id }) => id));
+          const missing = sendAttachments.filter(({ id }) => !currentIds.has(id));
+          const merged = current.map((attachment) => sentById.get(attachment.id) ?? attachment);
+          const changed = merged.some((attachment, index) => attachment !== current[index]);
+          return missing.length > 0 || changed ? [...missing, ...merged] : current;
+        });
+      };
       const preSendReviews = draftReviews;
       const editMessageForSend = editingMessageForUi;
       const editSessionForSend =
@@ -2605,7 +2729,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               metadata,
               sendOptions,
             } = prepareCompactionMessage({
-              api,
+              api: liveApi,
               workspaceId: props.workspaceId,
               maxOutputTokens: parsed.maxOutputTokens,
               // Include current attachments + reviews in followUpContent so they're queued
@@ -2687,10 +2811,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // acceptance also means the preference landed.)
         const preferencePersisted = await runWithCatch(
           async () => {
-            await waitForPreferencePersisted(
-              { kind: "autoCompactionThreshold", model: effectiveModel },
-              resolutionSignal
-            );
+            await flushUserPreferences();
             return true;
           },
           (error) => {
@@ -2712,8 +2833,52 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // the meantime (switch, reconnect). Draft, attachments and edit state stay intact; the
         // outer `finally` releases sendingCount.
         if (!isTranscriptMutationAllowed(props.workspaceId)) {
-          pushToast({ type: "error", message: TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE });
+          pushToast({
+            type: "error",
+            message: transcriptBarrierMessage(liveApiRef.current == null),
+          });
           return;
+        }
+
+        // Idempotent sends: every send carries an id minted here; a retry reuses it with the same
+        // request, so the backend never appends it twice. Not covered (they carry no client id; the
+        // backend mints one): chatCommands.ts sends (/compact and friends) and the creation flow.
+        const sendId = createSendId();
+        // An edit keeps today's put-back: its pre-edit draft lives only in memory, so it gets no
+        // pending-send entry. Every other send keeps its text and attachments in the durable
+        // draft until the backend answers for its id.
+        const tracksSend = editMessageForSend == null;
+        const sendScope = { kind: "workspace" as const, workspaceId: props.workspaceId };
+        if (tracksSend) {
+          // The exact request, for retries (also after a reload); file parts are rebuilt from
+          // the retained attachments, so they are not stored twice.
+          const {
+            fileParts: _fileParts,
+            editMessageId: _editMessageId,
+            historyEditPrecondition: _historyEditPrecondition,
+            unfencedEdit: _unfencedEdit,
+            sendId: _sendId,
+            ...requestOptions
+          } = sendOptions;
+          try {
+            // The one durable draft write before the send: the composer hides what it took,
+            // and the draft keeps it until the backend answers for the id.
+            await getDraftStore().beginSend(sendScope, {
+              sendId,
+              text: input,
+              attachments: sendAttachments,
+              request: { message: finalMessageText, options: requestOptions },
+            });
+          } catch (error) {
+            // Nothing was taken or sent: the draft is as it was.
+            setToast(
+              createErrorToast({
+                type: "unknown",
+                raw: error instanceof Error ? error.message : "The draft could not be saved",
+              })
+            );
+            return;
+          }
         }
 
         if (editMessageForSend) {
@@ -2726,7 +2891,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // Clear only what this send took: a draft restored meanwhile (an edit completing while
         // this send resolved its options) stays in the composer (#5226).
         const sentAttachmentIds = new Set([...attachments, ...sendAttachments].map(({ id }) => id));
-        setInput((current) => removeSentText(current, input));
+        // Read before the update below: takeSendMark ends the mark.
+        const typedAfterSend = getDraftStore().takeSendMark(draftScope, input);
+        if (!tracksSend) {
+          setInput((current) => takeSentText(current, input, typedAfterSend));
+          taken = { text: input };
+        }
         // Likewise for notes: drop the override this send captured, keeping notes an edit's
         // completion put into it meanwhile.
         setDraftReviews((current) => {
@@ -2734,29 +2904,61 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           const remaining = current.filter((review) => !preSendReviews?.includes(review));
           return remaining.length > 0 ? remaining : null;
         });
-        setAttachments((current) => current.filter(({ id }) => !sentAttachmentIds.has(id)));
+        if (!tracksSend) {
+          setAttachments((current) => current.filter(({ id }) => !sentAttachmentIds.has(id)));
+        }
         setHideReviewsDuringSend(true);
         // Clear inline height style - VimTextArea's useLayoutEffect will handle sizing
         if (inputRef.current) {
           inputRef.current.style.height = "";
         }
+        // The draft is out of the composer: typing can resume (#6259).
+        releaseTakenDraft = typingLock.markDraftTaken(input);
 
         props.onMessageSendStarted?.(overrides?.queueDispatchMode ?? "tool-end");
 
-        const result = await api.workspace.sendMessage({
-          workspaceId: props.workspaceId,
-          message: finalMessageText,
-          options: sendOptions,
-        });
+        let result: Awaited<ReturnType<typeof liveApi.workspace.sendMessage>> | undefined;
+        let thrown: unknown;
+        try {
+          result = await liveApi.workspace.sendMessage({
+            workspaceId: props.workspaceId,
+            message: finalMessageText,
+            options: { ...sendOptions, sendId },
+          });
+        } catch (error) {
+          thrown = error;
+        }
+        // A failed reply does not mean the backend did not take the message: only the
+        // backend's answer for the id decides. Never inferred from the transcript text.
+        let accepted = result?.success === true;
+        if (tracksSend) {
+          // Resolves the draft entry too: accepted drops the retained text, not accepted makes it
+          // visible again, pending (queued or held) keeps it until its row.
+          const outcome = await getDraftStore()
+            .settleSend(sendScope, sendId)
+            .catch((): SendOutcome => "unresolved");
+          // A lost reply of a send the backend queued or runs is its send all the same. (An Ok
+          // reply stays a sent message even when the queue was cleared before the lookup: the
+          // clear restored it with its notes, a queue edit or Stop restore, so the notes this
+          // send took are checked off as for any queued send; its text comes back through its
+          // draft entry.)
+          if (outcome === "accepted" || outcome === "pending") accepted = true;
+        } else if (!accepted) {
+          accepted = await isEditSendAccepted(liveApi, props.workspaceId, sendId);
+        }
 
-        if (!result.success) {
+        if (!accepted) {
+          if (result === undefined) throw thrown;
+          assert(!result.success, "a successful send counts as accepted");
           // Log error for debugging
           console.error("Failed to send message:", result.error);
           // Show error using enhanced toast
-          setToast(createErrorToast(result.error));
-          // Restore draft on error so user can try again
+          const failureToast = createErrorToast(result.error);
+          setToast(failureToast);
+          // Restore draft on error so user can try again (a tracked send's text comes back
+          // through its draft entry instead)
           setOptimisticallyDismissedEditId(null);
-          setDraft(preSendDraft);
+          putBackTaken();
           setDraftReviews(preSendReviews);
           // The rows this edit would delete changed after its evidence was captured. Stay in
           // edit mode with the draft, block Send, and re-read the transcript so the user can
@@ -2766,12 +2968,21 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             editMessageForSend &&
             sendOptions.historyEditPrecondition
           ) {
+            editConflictToastRef.current = {
+              editMessageId: editMessageForSend.id,
+              toast: failureToast,
+            };
             startEditTranscriptRefresh(editMessageForSend.id, sendOptions.historyEditPrecondition);
           }
         } else {
-          if (aiSelection.intent) {
-            consumeAiSelectionIntent(props.workspaceId, intentAgentId, aiSelection.attachedTokens);
+          // The backend took the text: nothing to put back.
+          taken = null;
+          const conflictToast = editConflictToastRef.current;
+          if (editMessageForSend && conflictToast?.editMessageId === editMessageForSend.id) {
+            editConflictToastRef.current = null;
+            setToast((current) => (current === conflictToast.toast ? null : current));
           }
+          consumeAiSelectionIntent(props.workspaceId, intentAgentId, aiSelection);
           // Track telemetry for successful message send
           telemetry.messageSent(
             props.workspaceId,
@@ -2825,18 +3036,20 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         );
         // Restore draft on error
         setOptimisticallyDismissedEditId(null);
-        setDraft(preSendDraft);
+        putBackTaken();
         setDraftReviews(preSendReviews);
       };
       await runWithCatchFinally(sendPreparedMessage, restoreDraftOnError, () => {
         setSendingCount((c) => c - 1);
+        releaseTakenDraft();
         setHideReviewsDuringSend(false);
       });
     };
     await runWithFinally(runWorkspaceSend, () => {
-      // Always restore focus at the end
+      // /side may have handed focus to another composer while this command completed.
+      // Keep that handoff instead of pulling typing back into the main chat.
       setTimeout(() => {
-        inputRef.current?.focus();
+        if (paneHandlesKeyEvent(paneScope, document.activeElement)) inputRef.current?.focus();
       }, 0);
     });
   };
@@ -3070,7 +3283,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     if (isMobileTouch || props.kind === "scratch") {
       return "Type a message...";
     }
-    return getPlaceholderTip({ dynamicWorkflows: dynamicWorkflowsExperimentEnabled });
+    return getPlaceholderTip();
   })();
 
   const activeToast = toast ?? (variant === "creation" ? creationState.toast : null);
@@ -3208,13 +3421,15 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                       composerSuggestions.isVisible ? COMMAND_SUGGESTION_KEYS : undefined
                     }
                     placeholder={placeholder}
-                    disabled={!editingMessageForUi && (disabled || sendInFlightBlocksInput)}
-                    aria-label={editingMessageForUi ? "Edit your last message" : "Message Claude"}
+                    disabled={!editingMessageForUi && (disabled || sendLocksTyping)}
+                    aria-label={editingMessageForUi ? "Edit message" : "Message"}
+                    // No aria-expanded: the textbox role does not allow it (#5951), and a
+                    // textarea cannot take role="combobox" without screen readers treating
+                    // the multi-line composer as a single-line field.
                     aria-autocomplete="list"
                     aria-controls={
                       composerSuggestions.isVisible ? composerSuggestions.listId : undefined
                     }
-                    aria-expanded={composerSuggestions.isVisible}
                     // Creation favors prompt space; workspaces preserve transcript space. Mobile
                     // hides the shortcut hints the workspace floor exists for, so that room is
                     // dead space on a screen that has none to spare.
@@ -3273,6 +3488,20 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                         {EDIT_RETRY_REFRESH_LABEL}
                       </button>
                     )}{" "}
+                  {/* Escape is the only other way out, and touch screens have no Escape key (its
+                      hint is hidden there): keep a visible Cancel on every viewport. */}
+                  {props.onCancelEdit && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        restorePreEditDraft();
+                        props.onCancelEdit?.();
+                      }}
+                      className="cursor-pointer border-0 bg-transparent p-0 underline"
+                    >
+                      Cancel
+                    </button>
+                  )}{" "}
                   <span className="mobile-hide-shortcut-hints">
                     ({formatKeybind(KEYBINDS.CANCEL_EDIT)}
                     {vimEnabled ? "×2" : ""} to cancel)
@@ -3299,6 +3528,15 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                           : COMPOSER_ICON_ONLY_HIDE_CLASS
                       }
                       onComplete={() => inputRef.current?.focus()}
+                      computerUse={
+                        workspaceId == null
+                          ? undefined
+                          : {
+                              ...computerUse,
+                              runtimeEligible:
+                                runtimeType === "local" || runtimeType === "worktree",
+                            }
+                      }
                     />
                   </div>
 
@@ -3384,6 +3622,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                       autoCompaction={autoCompactionProps}
                       idleCompaction={idleCompactionProps}
                       model={contextDisplayModel}
+                      historyLoaded={isTranscriptCaughtUp}
                     />
                   )}
                 </div>
@@ -3400,7 +3639,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                   >
                     <AttachFileButton
                       onFiles={handleAttachFiles}
-                      disabled={disabled || sendInFlightBlocksInput || !!editingMessageForUi}
+                      disabled={disabled || sendLocksTyping || !!editingMessageForUi}
                     />
                     <VoiceInputButton
                       state={voiceInput.state}
@@ -3408,7 +3647,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                       shouldShowUI={voiceInput.shouldShowUI}
                       requiresSecureContext={voiceInput.requiresSecureContext}
                       onToggle={voiceInput.toggle}
-                      disabled={disabled || sendInFlightBlocksInput}
+                      disabled={disabled || sendLocksTyping}
                       agentColor={agentColor}
                     />
                   </div>

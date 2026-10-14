@@ -5,6 +5,7 @@ import {
   isRuntimeReadFailure,
   isRuntimeTransportError,
   type Runtime,
+  type RuntimeError,
 } from "@/node/runtime/Runtime";
 import type { ORPCContext } from "@/node/orpc/context";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -34,18 +35,30 @@ import {
   resolveSkillUserInvocable,
   resolveSkillWhenToUse,
 } from "@/common/orpc/schemas";
+import { resolveSkillPaths } from "@/common/utils/skills/skillPaths";
 import type {
   AgentSkillDescriptor,
   AgentSkillIssue,
+  AgentSkillListResult,
   AgentSkillPackage,
   AgentSkillScope,
+  AgentSkillUnavailableSource,
+  SkillLookupName,
   SkillName,
 } from "@/common/types/agentSkill";
+import {
+  formatQualifiedSkillName,
+  parseSkillLookupName,
+} from "@/common/utils/agentSkills/skillLookupName";
 import { log } from "@/node/services/log";
 import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
 import { ensureRuntimePathWithinWorkspace } from "@/node/services/tools/runtimeSkillPathUtils";
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
-import { AgentSkillParseError, parseSkillMarkdown } from "./parseSkillMarkdown";
+import {
+  AgentSkillParseError,
+  parseSkillMarkdown,
+  skillConsentFrontmatter,
+} from "./parseSkillMarkdown";
 import { getBuiltInSkillByName, getBuiltInSkillDescriptors } from "./builtInSkillDefinitions";
 import type { ProjectSkillContainment } from "./skillStorageContext";
 import {
@@ -54,6 +67,11 @@ import {
   readPluginFileWithinRootCapped,
   UNIVERSAL_AGENT_PLUGINS_CONTAINER,
 } from "@/node/services/agentPlugins/discovery";
+import {
+  isPluginSkillConsented,
+  pluginSkillConsentGate,
+  type PluginSkillConsentGate,
+} from "@/node/services/agentPlugins/componentConsent";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import {
   getCanonicalProjectMetadataRelativePath,
@@ -64,9 +82,12 @@ const UNIVERSAL_SKILLS_ROOT = "~/.agents/skills";
 // Claude Code compatibility roots (claude-skills-compat experiment): discovery-only,
 // lowest precedence within each scope. Write tools never target these roots.
 const CLAUDE_SKILLS_ROOT = "~/.claude/skills";
-// Agent Plugins containers (agent-plugins experiment): discovery-only, host-local,
-// lowest precedence within each scope. Write tools never target plugin roots.
+// Agent Plugins containers: discovery-only, host-local, lowest precedence
+// within each scope. Write tools never target plugin roots.
 const UNIVERSAL_PLUGINS_ROOT = UNIVERSAL_AGENT_PLUGINS_CONTAINER;
+// Host Xum home in tilde form: the host LocalRuntime maps it to the configured
+// home (XUM_ROOT, dev suffix) when plugin containers are resolved.
+const HOST_XUM_HOME = "~/.xum";
 
 export interface AgentSkillsRoots {
   projectRoot: string;
@@ -82,10 +103,16 @@ export interface AgentSkillsRoots {
   universalRoot?: string;
   /** ~/.claude/skills (claude-skills-compat experiment; read-only). */
   globalClaudeRoot?: string;
-  /** Agent Plugins container dirs, e.g. <projectRoot>/.xum/plugins (agent-plugins experiment; read-only). */
+  /** Agent Plugins container dirs, e.g. <projectRoot>/.xum/plugins (read-only). */
   projectPluginRoots?: string[];
-  /** Agent Plugins container dirs, e.g. ~/.xum/plugins (agent-plugins experiment; read-only). */
+  /** Agent Plugins container dirs, e.g. ~/.xum/plugins (read-only). */
   globalPluginRoots?: string[];
+  /**
+   * Host Xum home that owns the plugin registry (import receipts). When absent,
+   * it is derived from globalRoot, which is only valid when globalRoot is a host
+   * path. Remote runtimes set it because their globalRoot can be a remote path.
+   */
+  pluginManagedHome?: string;
 }
 
 function getProjectDirectories(
@@ -148,7 +175,6 @@ export function getDefaultAgentSkillsRoots(
   workspacePath: string,
   options?: {
     includeClaudeSkills?: boolean;
-    includeAgentPlugins?: boolean;
     /** Inclusive checkout/repository root for subproject ancestor discovery. */
     projectSearchRoot?: string;
   }
@@ -172,9 +198,13 @@ export function getDefaultAgentSkillsRoots(
     // Claude roots are added only when the experiment is enabled so the default
     // (off) behavior stays byte-identical to the pre-experiment scan order.
     ...(options?.includeClaudeSkills ? { globalClaudeRoot: CLAUDE_SKILLS_ROOT } : {}),
-    // Agent Plugins discovery is host-filesystem-only (v1), so remote runtimes
-    // never get plugin containers.
-    ...(options?.includeAgentPlugins && !(runtime instanceof RemoteRuntime)
+    // Agent Plugins discovery reads the host filesystem only. Remote runtimes
+    // (SSH/Docker) get the GLOBAL host plugin containers, read through a host
+    // LocalRuntime, so a plugin installed on the Xum host works in every
+    // workspace. They get no project plugin containers: a remote checkout is
+    // not on the host filesystem. The registry owner is the host Xum home,
+    // never a path derived from the remote globalRoot (Docker: /var/mux).
+    ...(!(runtime instanceof RemoteRuntime)
       ? {
           projectPluginRoots: [
             ...listProjectMetadataRelativePaths("plugins").map((relativePath) =>
@@ -184,7 +214,10 @@ export function getDefaultAgentSkillsRoots(
           ],
           globalPluginRoots: [`${runtime.getXumHome()}/plugins`, UNIVERSAL_PLUGINS_ROOT],
         }
-      : {}),
+      : {
+          globalPluginRoots: [`${HOST_XUM_HOME}/plugins`, UNIVERSAL_PLUGINS_ROOT],
+          pluginManagedHome: HOST_XUM_HOME,
+        }),
   };
 }
 
@@ -214,11 +247,13 @@ interface AgentSkillScanCandidate {
   /** Agent Plugins only: contributing plugin name for descriptor attribution. */
   pluginName?: string;
   importedSkills?: string[];
+  /** Managed plugins only: the reviewed skill fingerprints (#6498). */
+  skillConsent?: PluginSkillConsentGate;
 }
 
 /**
- * Agent Plugins (agent-plugins experiment): expand plugin container dirs into
- * per-plugin `skills/` scan candidates. Host-local filesystem only (v1).
+ * Agent Plugins: expand plugin container dirs into per-plugin `skills/` scan
+ * candidates. Host-local filesystem only (v1).
  */
 async function buildPluginScanCandidates(args: {
   containers: string[];
@@ -257,7 +292,7 @@ async function buildPluginScanCandidates(args: {
 
   const candidates: AgentSkillScanCandidate[] = [];
   for (const plugin of plugins) {
-    if (plugin.skillsDir == null) {
+    if (plugin.skillsDirs == null) {
       continue;
     }
 
@@ -272,17 +307,28 @@ async function buildPluginScanCandidates(args: {
       }
     }
 
-    candidates.push({
-      scope: args.scope,
-      root: plugin.skillsDir,
-      runtime: localRuntime,
-      pluginRoot: plugin.rootPath,
-      pluginName: plugin.name,
-      importedSkills: plugin.importedComponents?.skills,
-    });
+    // One candidate per root, in declared order: the scan keeps the first skill of a name.
+    const importedSkills = plugin.importedComponents?.skills;
+    const skillConsent = pluginSkillConsentGate(plugin);
+    candidates.push(
+      ...plugin.skillsDirs.map((root) => ({
+        scope: args.scope,
+        root,
+        runtime: localRuntime,
+        pluginRoot: plugin.rootPath,
+        pluginName: plugin.name,
+        importedSkills,
+        skillConsent,
+      }))
+    );
   }
 
   return candidates;
+}
+
+/** Host Xum home that owns the plugin registry; see AgentSkillsRoots.pluginManagedHome. */
+function getPluginManagedHome(roots: AgentSkillsRoots): string | undefined {
+  return roots.pluginManagedHome ?? (roots.globalRoot ? path.dirname(roots.globalRoot) : undefined);
 }
 
 async function buildScanCandidates(
@@ -293,7 +339,7 @@ async function buildScanCandidates(
 ): Promise<AgentSkillScanCandidate[]> {
   const globalRuntime = resolveGlobalRuntime(runtime, workspacePath);
   // Both scans can encounter the configured home, e.g. a project rooted at the user's home.
-  const managedHome = roots.globalRoot ? path.dirname(roots.globalRoot) : undefined;
+  const managedHome = getPluginManagedHome(roots);
 
   // Plugin skills sit at the lowest precedence within each scope, after the
   // standard (and .claude compat) roots of that scope.
@@ -418,6 +464,99 @@ async function isPluginSkillContained(args: {
   }
 }
 
+/**
+ * Containment gate shared by discovery and reads. Returns false when the
+ * candidate's skill must be skipped. Plugin candidates use plugin-root
+ * containment (the plugin root itself was already validated against the
+ * project containment root); project candidates use project containment.
+ */
+async function isCandidateSkillContained(args: {
+  candidate: AgentSkillScanCandidate;
+  containment: ProjectSkillContainment;
+  skillDir: string;
+  skillFilePath: string;
+  directoryName: SkillName;
+  /** Discovery only: report an escape as an invalid skill. */
+  pushInvalidSkill?: (message: string, hint: string) => void;
+}): Promise<boolean> {
+  const { candidate, containment, skillDir, skillFilePath, directoryName } = args;
+  if (candidate.pluginRoot != null) {
+    return isPluginSkillContained({
+      pluginRoot: candidate.pluginRoot,
+      skillDir,
+      skillFilePath,
+      directoryName,
+      onEscape: (message) =>
+        args.pushInvalidSkill?.(
+          message,
+          "Remove the symlink escaping the plugin root or move the skill inside the plugin."
+        ),
+    });
+  }
+  if (candidate.scope !== "project") return true;
+
+  try {
+    await assertProjectSkillContained({
+      runtime: candidate.runtime,
+      containment,
+      skillDir,
+      skillFilePath,
+    });
+    return true;
+  } catch (error) {
+    if (isRuntimeTransportError(error)) throw error;
+    if (hasErrorCode(error, "ENOENT")) return false;
+
+    log.warn(
+      `Skipping escaped project skill '${directoryName}' at '${skillFilePath}' for containment kind '${containment.kind}': ${getErrorMessage(error)}`
+    );
+    args.pushInvalidSkill?.(
+      `Project skill path escapes containment root: ${getErrorMessage(error)}`,
+      "Move the skill directory back under the workspace root or remove the escaping symlink."
+    );
+    return false;
+  }
+}
+
+/**
+ * Plugin skills whose bare name lost to a higher-precedence skill but stay
+ * reachable as `<plugin>:<skill>`. Qualified names resolved by an earlier
+ * plugin candidate (winners included) are not reachable again: a later plugin
+ * with the same plugin name is not listed.
+ */
+class ShadowedPluginSkills {
+  private readonly qualifiedNames = new Set<SkillLookupName>();
+  private readonly skills: AgentSkillDescriptor[] = [];
+
+  /** Whether a candidate that lost its bare name is still worth reading. */
+  isReachable(pluginName: string | undefined, skillName: SkillName): boolean {
+    return (
+      pluginName != null &&
+      !this.qualifiedNames.has(formatQualifiedSkillName(pluginName, skillName))
+    );
+  }
+
+  /** Record a loaded descriptor; returns true when it was consumed as shadowed. */
+  record(descriptor: AgentSkillDescriptor, shadowed: boolean): boolean {
+    if (descriptor.pluginName == null) return false;
+    this.qualifiedNames.add(formatQualifiedSkillName(descriptor.pluginName, descriptor.name));
+    if (shadowed) this.skills.push(descriptor);
+    return shadowed;
+  }
+
+  /** Omitted when empty so payloads stay identical for users without collisions. */
+  toResult(): Pick<AgentSkillDiscoveryResult, "shadowedPluginSkills"> {
+    if (this.skills.length === 0) return {};
+    const qualified = (skill: AgentSkillDescriptor) =>
+      formatQualifiedSkillName(skill.pluginName ?? "", skill.name);
+    return {
+      shadowedPluginSkills: [...this.skills].sort((a, b) =>
+        qualified(a).localeCompare(qualified(b))
+      ),
+    };
+  }
+}
+
 async function listSkillDirectoriesFromLocalFs(root: string): Promise<string[]> {
   try {
     const entries = await fs.readdir(root, { withFileTypes: true });
@@ -459,12 +598,87 @@ async function listSkillDirectoriesFromRuntime(
     .filter(Boolean);
 }
 
+/** A loaded skill whose SKILL.md `name` is only a display name gets a non-fatal warning. */
+function pushDisplayNameWarning(
+  options: { skillWarnings?: AgentSkillIssue[] } | undefined,
+  skill: Omit<AgentSkillIssue, "message" | "hint"> & { displayName?: string }
+): void {
+  if (options?.skillWarnings == null || skill.displayName === undefined) return;
+  const { displayName, ...identity } = skill;
+  const id = identity.directoryName;
+  log.debug(`Skill '${id}' (${identity.scope}) uses display name '${displayName}'`);
+  options.skillWarnings.push({
+    ...identity,
+    message: `SKILL.md name '${displayName}' is not the directory name, so Xum loads the skill as '${id}'.`,
+    hint: `Invoke it as /${id}. Set name: ${id} to remove this warning.`,
+  });
+}
+
+/**
+ * Read a non-plugin SKILL.md for the skill index. Each failure becomes a diagnostic and null, so
+ * the scan skips the skill. A transport failure throws: an unreachable host is not a bad skill.
+ */
+async function readRuntimeSkillFileForScan(
+  runtime: Runtime,
+  skillFilePath: string,
+  directoryName: SkillName,
+  scope: AgentSkillScope,
+  pushInvalidSkill: (message: string, hint: string) => void
+): Promise<{ content: string; byteSize: number } | null> {
+  let stat;
+  try {
+    stat = await runtime.stat(skillFilePath);
+  } catch (error) {
+    if (isRuntimeTransportError(error)) throw error;
+    pushInvalidSkill(
+      "SKILL.md is missing or unreadable.",
+      "Create a SKILL.md file with YAML frontmatter (--- ... ---)."
+    );
+    return null;
+  }
+
+  if (stat.isDirectory) {
+    pushInvalidSkill(
+      "SKILL.md is a directory (expected a file).",
+      "Replace SKILL.md with a regular file."
+    );
+    return null;
+  }
+
+  // Avoid reading very large files into memory (parseSkillMarkdown enforces the same limit).
+  const sizeValidation = validateFileSize(stat);
+  if (sizeValidation) {
+    log.warn(`Skipping skill '${directoryName}' (${scope}): ${sizeValidation.error}`);
+    pushInvalidSkill(sizeValidation.error, "Reduce SKILL.md size below 1MB.");
+    return null;
+  }
+
+  try {
+    return { content: await readFileString(runtime, skillFilePath), byteSize: stat.size };
+  } catch (err) {
+    if (isRuntimeTransportError(err)) throw err;
+    const message = getErrorMessage(err);
+    log.warn(`Failed to read SKILL.md for ${directoryName}: ${message}`);
+    pushInvalidSkill(
+      `Failed to read SKILL.md: ${message}`,
+      "Check file permissions and ensure the file is UTF-8 text."
+    );
+    return null;
+  }
+}
+
 async function readSkillDescriptorFromDir(
   runtime: Runtime,
   skillDir: string,
   directoryName: SkillName,
   scope: AgentSkillScope,
-  options?: { invalidSkills?: AgentSkillIssue[]; pluginName?: string; pluginRoot?: string }
+  options?: {
+    invalidSkills?: AgentSkillIssue[];
+    skillWarnings?: AgentSkillIssue[];
+    pluginName?: string;
+    pluginRoot?: string;
+    skillConsent?: PluginSkillConsentGate;
+  }
 ): Promise<AgentSkillDescriptor | null> {
   const skillFilePath = runtime.normalizePath("SKILL.md", skillDir);
 
@@ -507,47 +721,15 @@ async function readSkillDescriptorFromDir(
       return null;
     }
   } else {
-    let stat;
-    try {
-      stat = await runtime.stat(skillFilePath);
-    } catch (error) {
-      if (isRuntimeTransportError(error)) throw error;
-      pushInvalidSkill(
-        "SKILL.md is missing or unreadable.",
-        "Create a SKILL.md file with YAML frontmatter (--- ... ---)."
-      );
-      return null;
-    }
-
-    if (stat.isDirectory) {
-      pushInvalidSkill(
-        "SKILL.md is a directory (expected a file).",
-        "Replace SKILL.md with a regular file."
-      );
-      return null;
-    }
-
-    // Avoid reading very large files into memory (parseSkillMarkdown enforces the same limit).
-    const sizeValidation = validateFileSize(stat);
-    if (sizeValidation) {
-      log.warn(`Skipping skill '${directoryName}' (${scope}): ${sizeValidation.error}`);
-      pushInvalidSkill(sizeValidation.error, "Reduce SKILL.md size below 1MB.");
-      return null;
-    }
-
-    try {
-      content = await readFileString(runtime, skillFilePath);
-    } catch (err) {
-      if (isRuntimeTransportError(err)) throw err;
-      const message = getErrorMessage(err);
-      log.warn(`Failed to read SKILL.md for ${directoryName}: ${message}`);
-      pushInvalidSkill(
-        `Failed to read SKILL.md: ${message}`,
-        "Check file permissions and ensure the file is UTF-8 text."
-      );
-      return null;
-    }
-    byteSize = stat.size;
+    const read = await readRuntimeSkillFileForScan(
+      runtime,
+      skillFilePath,
+      directoryName,
+      scope,
+      pushInvalidSkill
+    );
+    if (read === null) return null;
+    ({ content, byteSize } = read);
   }
 
   try {
@@ -555,7 +737,15 @@ async function readSkillDescriptorFromDir(
       content,
       byteSize,
       directoryName,
+      allowDisplayName: true,
     });
+    if (!isPluginSkillConsented(options?.skillConsent, skillDir, skillConsentFrontmatter(parsed))) {
+      pushInvalidSkill(
+        "This plugin skill has not been reviewed on this install, so it does not load.",
+        "Open Settings → Plugins and select Review on the plugin."
+      );
+      return null;
+    }
 
     const descriptor: AgentSkillDescriptor = {
       name: parsed.frontmatter.name,
@@ -565,7 +755,9 @@ async function readSkillDescriptorFromDir(
       userInvocable: resolveSkillUserInvocable(parsed.frontmatter),
       argumentHint: parsed.frontmatter["argument-hint"],
       whenToUse: resolveSkillWhenToUse(parsed.frontmatter),
+      paths: resolveSkillPaths(parsed.frontmatter),
       ...(options?.pluginName !== undefined ? { pluginName: options.pluginName } : {}),
+      displayName: parsed.displayName,
     };
 
     const validated = AgentSkillDescriptorSchema.safeParse(descriptor);
@@ -578,6 +770,12 @@ async function readSkillDescriptorFromDir(
       return null;
     }
 
+    pushDisplayNameWarning(options, {
+      directoryName,
+      scope,
+      displayPath: skillFilePath,
+      displayName: parsed.displayName,
+    });
     return validated.data;
   } catch (err) {
     const message = err instanceof AgentSkillParseError ? err.message : getErrorMessage(err);
@@ -590,6 +788,46 @@ async function readSkillDescriptorFromDir(
   }
 }
 
+const SKILL_ISSUE_SCOPE_ORDER: Readonly<Record<AgentSkillScope, number>> = {
+  project: 0,
+  global: 1,
+  "built-in": 2,
+};
+
+function compareSkillIssues(a: AgentSkillIssue, b: AgentSkillIssue): number {
+  const scopeDiff = SKILL_ISSUE_SCOPE_ORDER[a.scope] - SKILL_ISSUE_SCOPE_ORDER[b.scope];
+  if (scopeDiff !== 0) return scopeDiff;
+  return a.directoryName.localeCompare(b.directoryName);
+}
+
+/** Omitted when empty so payloads for valid skills stay identical. */
+function skillWarningsResult(
+  skillWarnings: AgentSkillIssue[]
+): Pick<AgentSkillDiscoveryResult, "skillWarnings"> {
+  if (skillWarnings.length === 0) return {};
+  return { skillWarnings: [...skillWarnings].sort(compareSkillIssues) };
+}
+
+export interface AgentSkillDiscoveryResult {
+  skills: AgentSkillDescriptor[];
+  invalidSkills: AgentSkillIssue[];
+  /** Each entry keeps the original error so strict callers can rethrow it. */
+  unavailableSources: Array<AgentSkillUnavailableSource & { error: unknown }>;
+  /**
+   * Dedupe mode only: plugin skills whose bare name lost to a higher-precedence
+   * skill, reachable as `<pluginName>:<name>`. Omitted when empty so payloads
+   * stay identical for users without collisions.
+   */
+  shadowedPluginSkills?: AgentSkillDescriptor[];
+  /** Loaded skills with a non-fatal problem (e.g. a display name). Omitted when empty. */
+  skillWarnings?: AgentSkillIssue[];
+}
+
+/**
+ * Discover skills from every root. A list is partial by design: a root that
+ * cannot be read (e.g. a project root on an unreachable SSH host) becomes an
+ * unavailable source, and the other roots and the built-ins still load.
+ */
 export async function discoverAgentSkills(
   runtime: Runtime,
   workspacePath: string,
@@ -600,12 +838,10 @@ export async function discoverAgentSkills(
     dedupeByName?: boolean;
     /** claude-skills-compat experiment: also scan .claude/skills roots (used only when `roots` is absent). */
     includeClaudeSkills?: boolean;
-    /** agent-plugins experiment: also scan Agent Plugins skills (used only when `roots` is absent). */
-    includeAgentPlugins?: boolean;
     /** Inclusive checkout/repository root for subproject ancestor discovery. */
     projectSearchRoot?: string;
   }
-): Promise<AgentSkillDescriptor[]> {
+): Promise<AgentSkillDiscoveryResult> {
   if (!workspacePath) {
     throw new Error("discoverAgentSkills: workspacePath is required");
   }
@@ -614,7 +850,6 @@ export async function discoverAgentSkills(
     options?.roots ??
     getDefaultAgentSkillsRoots(runtime, workspacePath, {
       includeClaudeSkills: options?.includeClaudeSkills,
-      includeAgentPlugins: options?.includeAgentPlugins,
       projectSearchRoot: options?.projectSearchRoot,
     });
 
@@ -623,159 +858,13 @@ export async function discoverAgentSkills(
 
   const byName = new Map<SkillName, AgentSkillDescriptor>();
   const discoveredSkills: AgentSkillDescriptor[] = [];
-
-  // Scan order encodes precedence: earlier roots win when names collide.
-  const scans = await buildScanCandidates(runtime, workspacePath, roots, containment);
-
-  for (const scan of scans) {
-    let resolvedRoot: string;
-    try {
-      resolvedRoot = await scan.runtime.resolvePath(scan.root);
-    } catch (err) {
-      if (isRuntimeTransportError(err)) throw err;
-      log.warn(`Failed to resolve skills root ${scan.root}: ${getErrorMessage(err)}`);
-      continue;
-    }
-
-    const directoryNames =
-      scan.runtime instanceof RemoteRuntime
-        ? await listSkillDirectoriesFromRuntime(scan.runtime, resolvedRoot, { cwd: workspacePath })
-        : await listSkillDirectoriesFromLocalFs(resolvedRoot);
-
-    for (const directoryNameRaw of directoryNames) {
-      const nameParsed = SkillNameSchema.safeParse(directoryNameRaw);
-      if (!nameParsed.success) {
-        log.warn(`Skipping invalid skill directory name '${directoryNameRaw}' in ${resolvedRoot}`);
-        continue;
-      }
-
-      const directoryName = nameParsed.data;
-      if (scan.importedSkills != null && !scan.importedSkills.includes(directoryName)) continue;
-
-      if (dedupeByName && byName.has(directoryName)) {
-        continue;
-      }
-
-      const skillDir = scan.runtime.normalizePath(directoryName, resolvedRoot);
-      const skillFilePath = scan.runtime.normalizePath("SKILL.md", skillDir);
-
-      if (scan.pluginRoot != null) {
-        // Plugin candidates use plugin-root containment; the plugin root itself
-        // was already validated against the project containment root.
-        const contained = await isPluginSkillContained({
-          pluginRoot: scan.pluginRoot,
-          skillDir,
-          skillFilePath,
-          directoryName,
-        });
-        if (!contained) continue;
-      } else if (scan.scope === "project") {
-        try {
-          await assertProjectSkillContained({
-            runtime: scan.runtime,
-            containment,
-            skillDir,
-            skillFilePath,
-          });
-        } catch (error) {
-          if (isRuntimeTransportError(error)) throw error;
-          if (hasErrorCode(error, "ENOENT")) {
-            continue;
-          }
-
-          log.warn(
-            `Skipping escaped project skill '${directoryName}' at '${skillFilePath}' for containment kind '${containment.kind}': ${getErrorMessage(error)}`
-          );
-          continue;
-        }
-      }
-
-      const descriptor = await readSkillDescriptorFromDir(
-        scan.runtime,
-        skillDir,
-        directoryName,
-        scan.scope,
-        {
-          ...(scan.pluginName !== undefined ? { pluginName: scan.pluginName } : {}),
-          ...(scan.pluginRoot !== undefined ? { pluginRoot: scan.pluginRoot } : {}),
-        }
-      );
-      if (!descriptor) continue;
-
-      if (dedupeByName) {
-        // First discovered descriptor wins because duplicates are skipped above.
-        byName.set(descriptor.name, descriptor);
-      } else {
-        discoveredSkills.push(descriptor);
-      }
-    }
-  }
-
-  for (const builtIn of getBuiltInSkillDescriptors()) {
-    if (dedupeByName) {
-      // Built-ins are lowest precedence and are omitted when overridden by project/global skills.
-      if (!byName.has(builtIn.name)) {
-        byName.set(builtIn.name, builtIn);
-      }
-      continue;
-    }
-
-    discoveredSkills.push(builtIn);
-  }
-
-  const skills = dedupeByName ? Array.from(byName.values()) : discoveredSkills;
-  return skills.sort((a, b) => a.name.localeCompare(b.name));
-}
-
-export interface DiscoverAgentSkillsDiagnosticsResult {
-  skills: AgentSkillDescriptor[];
-  invalidSkills: AgentSkillIssue[];
-}
-
-export async function discoverAgentSkillsDiagnostics(
-  runtime: Runtime,
-  workspacePath: string,
-  options?: {
-    roots?: AgentSkillsRoots;
-    containment?: ProjectSkillContainment;
-    projectContainmentRoot?: string | null;
-    /** claude-skills-compat experiment: also scan .claude/skills roots (used only when `roots` is absent). */
-    includeClaudeSkills?: boolean;
-    /** agent-plugins experiment: also scan Agent Plugins skills (used only when `roots` is absent). */
-    includeAgentPlugins?: boolean;
-    /** Inclusive checkout/repository root for subproject ancestor discovery. */
-    projectSearchRoot?: string;
-  }
-): Promise<DiscoverAgentSkillsDiagnosticsResult> {
-  if (!workspacePath) {
-    throw new Error("discoverAgentSkillsDiagnostics: workspacePath is required");
-  }
-
-  const roots =
-    options?.roots ??
-    getDefaultAgentSkillsRoots(runtime, workspacePath, {
-      includeClaudeSkills: options?.includeClaudeSkills,
-      includeAgentPlugins: options?.includeAgentPlugins,
-      projectSearchRoot: options?.projectSearchRoot,
-    });
-
-  const containment = resolveProjectSkillContainment(options);
-
-  const byName = new Map<SkillName, AgentSkillDescriptor>();
   const invalidSkills: AgentSkillIssue[] = [];
+  const skillWarnings: AgentSkillIssue[] = [];
+  const unavailableSources: AgentSkillDiscoveryResult["unavailableSources"] = [];
+  const shadowedPluginSkills = new ShadowedPluginSkills();
 
-  // Scan order encodes precedence: earlier roots win when names collide.
-  const scans = await buildScanCandidates(runtime, workspacePath, roots, containment);
-
-  for (const scan of scans) {
-    let resolvedRoot: string;
-    try {
-      resolvedRoot = await scan.runtime.resolvePath(scan.root);
-    } catch (err) {
-      log.warn(`Failed to resolve skills root ${scan.root}: ${getErrorMessage(err)}`);
-      continue;
-    }
-
+  const scanRoot = async (scan: AgentSkillScanCandidate): Promise<void> => {
+    const resolvedRoot = await scan.runtime.resolvePath(scan.root);
     const directoryNames =
       scan.runtime instanceof RemoteRuntime
         ? await listSkillDirectoriesFromRuntime(scan.runtime, resolvedRoot, { cwd: workspacePath })
@@ -798,55 +887,35 @@ export async function discoverAgentSkillsDiagnostics(
       const directoryName = nameParsed.data;
       if (scan.importedSkills != null && !scan.importedSkills.includes(directoryName)) continue;
 
-      if (byName.has(directoryName)) {
-        continue;
-      }
+      // A plugin skill that loses its bare name stays reachable qualified.
+      const shadowed = dedupeByName && byName.has(directoryName);
+      if (shadowed && !shadowedPluginSkills.isReachable(scan.pluginName, directoryName)) continue;
+      // Shadowed reads must not change invalidSkills, so bare-name users see
+      // identical diagnostics.
+      const diagnostics: { invalidSkills: AgentSkillIssue[]; skillWarnings: AgentSkillIssue[] } =
+        shadowed ? { invalidSkills: [], skillWarnings: [] } : { invalidSkills, skillWarnings };
 
       const skillDir = scan.runtime.normalizePath(directoryName, resolvedRoot);
       const skillFilePath = scan.runtime.normalizePath("SKILL.md", skillDir);
-
-      if (scan.pluginRoot != null) {
-        // Plugin candidates use plugin-root containment; the plugin root itself
-        // was already validated against the project containment root.
-        const contained = await isPluginSkillContained({
-          pluginRoot: scan.pluginRoot,
-          skillDir,
-          skillFilePath,
+      const pushInvalidSkill = (message: string, hint: string): void => {
+        diagnostics.invalidSkills.push({
           directoryName,
-          onEscape: (message) => {
-            invalidSkills.push({
-              directoryName,
-              scope: scan.scope,
-              displayPath: skillFilePath,
-              message,
-              hint: "Remove the symlink escaping the plugin root or move the skill inside the plugin.",
-            });
-          },
+          scope: scan.scope,
+          displayPath: skillFilePath,
+          message,
+          hint,
         });
-        if (!contained) continue;
-      } else if (scan.scope === "project") {
-        try {
-          await assertProjectSkillContained({
-            runtime: scan.runtime,
-            containment,
-            skillDir,
-            skillFilePath,
-          });
-        } catch (error) {
-          if (hasErrorCode(error, "ENOENT")) {
-            continue;
-          }
+      };
 
-          invalidSkills.push({
-            directoryName,
-            scope: scan.scope,
-            displayPath: skillFilePath,
-            message: `Project skill path escapes containment root: ${getErrorMessage(error)}`,
-            hint: "Move the skill directory back under the workspace root or remove the escaping symlink.",
-          });
-          continue;
-        }
-      }
+      const contained = await isCandidateSkillContained({
+        candidate: scan,
+        containment,
+        skillDir,
+        skillFilePath,
+        directoryName,
+        pushInvalidSkill,
+      });
+      if (!contained) continue;
 
       const descriptor = await readSkillDescriptorFromDir(
         scan.runtime,
@@ -854,43 +923,80 @@ export async function discoverAgentSkillsDiagnostics(
         directoryName,
         scan.scope,
         {
-          invalidSkills,
+          ...diagnostics,
           ...(scan.pluginName !== undefined ? { pluginName: scan.pluginName } : {}),
           ...(scan.pluginRoot !== undefined ? { pluginRoot: scan.pluginRoot } : {}),
+          skillConsent: scan.skillConsent,
         }
       );
       if (!descriptor) continue;
 
-      // First discovered descriptor wins because duplicates are skipped above.
-      byName.set(descriptor.name, descriptor);
+      if (shadowedPluginSkills.record(descriptor, shadowed)) continue;
+
+      if (dedupeByName) {
+        // First discovered descriptor wins because duplicates are skipped above.
+        byName.set(descriptor.name, descriptor);
+      } else {
+        discoveredSkills.push(descriptor);
+      }
     }
-  }
-
-  // Add built-in skills (lowest precedence - only if not overridden by project/global)
-  for (const builtIn of getBuiltInSkillDescriptors()) {
-    if (!byName.has(builtIn.name)) {
-      byName.set(builtIn.name, builtIn);
-    }
-  }
-
-  const skills = Array.from(byName.values()).sort((a, b) => a.name.localeCompare(b.name));
-
-  const scopeOrder: Readonly<Record<AgentSkillScope, number>> = {
-    project: 0,
-    global: 1,
-    "built-in": 2,
   };
 
-  invalidSkills.sort((a, b) => {
-    const scopeDiff = (scopeOrder[a.scope] ?? 0) - (scopeOrder[b.scope] ?? 0);
-    if (scopeDiff !== 0) return scopeDiff;
-    return a.directoryName.localeCompare(b.directoryName);
-  });
+  // Scan order encodes precedence: earlier roots win when names collide.
+  const scans = await buildScanCandidates(runtime, workspacePath, roots, containment);
+  // After one transport failure, the host's other roots fail at once instead
+  // of each waiting out the same connection timeout.
+  const transportFailures = new Map<Runtime, RuntimeError>();
+  for (const scan of scans) {
+    try {
+      const transportFailure = transportFailures.get(scan.runtime);
+      if (transportFailure) throw transportFailure;
+      await scanRoot(scan);
+    } catch (error) {
+      if (isRuntimeTransportError(error)) transportFailures.set(scan.runtime, error);
+      const message = getErrorMessage(error) || "Unknown error";
+      log.warn(`Skills root ${scan.root} is unavailable: ${message}`);
+      unavailableSources.push({ scope: scan.scope, displayPath: scan.root, message, error });
+    }
+  }
+
+  for (const builtIn of getBuiltInSkillDescriptors()) {
+    if (dedupeByName) {
+      // Built-ins are lowest precedence and are omitted when overridden by project/global skills.
+      if (!byName.has(builtIn.name)) {
+        byName.set(builtIn.name, builtIn);
+      }
+      continue;
+    }
+
+    discoveredSkills.push(builtIn);
+  }
+
+  const skills = dedupeByName ? Array.from(byName.values()) : discoveredSkills;
+  skills.sort((a, b) => a.name.localeCompare(b.name));
+
+  invalidSkills.sort(compareSkillIssues);
 
   return {
     skills,
     invalidSkills,
+    unavailableSources,
+    ...shadowedPluginSkills.toResult(),
+    ...skillWarningsResult(skillWarnings),
   };
+}
+
+/**
+ * Strict callers (the system-prompt skill index, agent_skill_list) must not
+ * act on a list that silently lost a project root to an unreachable host
+ * (#4438), so they rethrow the first transport failure.
+ */
+export function requireReachableSkills(result: AgentSkillDiscoveryResult): AgentSkillDescriptor[] {
+  const transportFailure = result.unavailableSources.find((source) =>
+    isRuntimeTransportError(source.error)
+  );
+  if (transportFailure) throw transportFailure.error;
+  return result.skills;
 }
 
 export interface ResolvedAgentSkill {
@@ -910,13 +1016,32 @@ export interface ResolvedAgentSkill {
   pluginRoot?: string;
 }
 
+/** Read a non-plugin SKILL.md for a direct skill read; every failure throws. */
+async function readRuntimeSkillFile(
+  runtime: Runtime,
+  skillFilePath: string
+): Promise<{ content: string; byteSize: number }> {
+  const stat = await runtime.stat(skillFilePath);
+  if (stat.isDirectory) {
+    throw new Error(`SKILL.md is not a file: ${skillFilePath}`);
+  }
+
+  const sizeValidation = validateFileSize(stat);
+  if (sizeValidation) {
+    throw new Error(sizeValidation.error);
+  }
+
+  return { content: await readFileString(runtime, skillFilePath), byteSize: stat.size };
+}
+
 async function readAgentSkillFromDir(
   runtime: Runtime,
   skillDir: string,
   directoryName: SkillName,
   scope: AgentSkillScope,
-  pluginRoot?: string
-): Promise<ResolvedAgentSkill> {
+  pluginRoot?: string,
+  skillConsent?: PluginSkillConsentGate
+): Promise<ResolvedAgentSkill | null> {
   const skillFilePath = runtime.normalizePath("SKILL.md", skillDir);
 
   let content: string;
@@ -934,24 +1059,16 @@ async function readAgentSkillFromDir(
     content = result.content;
     byteSize = result.byteSize;
   } else {
-    const stat = await runtime.stat(skillFilePath);
-    if (stat.isDirectory) {
-      throw new Error(`SKILL.md is not a file: ${skillFilePath}`);
-    }
-
-    const sizeValidation = validateFileSize(stat);
-    if (sizeValidation) {
-      throw new Error(sizeValidation.error);
-    }
-
-    content = await readFileString(runtime, skillFilePath);
-    byteSize = stat.size;
+    ({ content, byteSize } = await readRuntimeSkillFile(runtime, skillFilePath));
   }
   const parsed = parseSkillMarkdown({
     content,
     byteSize,
     directoryName,
+    allowDisplayName: true,
   });
+  // An unreviewed plugin skill reads like a missing one, so a lower-scope skill can serve.
+  if (!isPluginSkillConsented(skillConsent, skillDir, skillConsentFrontmatter(parsed))) return null;
 
   const pkg: AgentSkillPackage = {
     scope,
@@ -975,18 +1092,98 @@ async function readAgentSkillFromDir(
   };
 }
 
+/**
+ * Split a lookup name for readAgentSkill. Bare names pass through unchanged.
+ * A bare skill name never contains `:`, so an unparsable qualified lookup can
+ * only miss.
+ */
+function resolveReadLookup(lookupName: SkillLookupName): {
+  pluginName?: string;
+  skillName: SkillName;
+} {
+  const lookup = parseSkillLookupName(lookupName);
+  if (lookup != null) return lookup;
+  if (lookupName.includes(":")) throw new Error(`Agent skill not found: ${lookupName}`);
+  return { skillName: lookupName };
+}
+
+/** Qualified lookups consider only the named plugin; import selection hides non-imported skills. */
+function isLookupCandidate(
+  candidate: AgentSkillScanCandidate,
+  pluginName: string | undefined,
+  skillName: SkillName
+): boolean {
+  if (pluginName != null && candidate.pluginName !== pluginName) return false;
+  return candidate.importedSkills == null || candidate.importedSkills.includes(skillName);
+}
+
+/**
+ * The skill `candidate` serves under `name`, or null when it has none (missing, not contained,
+ * invalid, or an unreviewed plugin skill), so the next candidate can serve.
+ */
+async function readCandidateSkill(
+  candidate: AgentSkillScanCandidate,
+  name: SkillName,
+  containment: ProjectSkillContainment
+): Promise<ResolvedAgentSkill | null> {
+  let resolvedRoot: string;
+  try {
+    resolvedRoot = await candidate.runtime.resolvePath(candidate.root);
+  } catch (error) {
+    // An unreachable host is not a missing skill root: never fall back to a
+    // lower-scope or built-in skill on a transport failure (#4438).
+    if (isRuntimeTransportError(error)) throw error;
+    return null;
+  }
+
+  const skillDir = candidate.runtime.normalizePath(name, resolvedRoot);
+  const skillFilePath = candidate.runtime.normalizePath("SKILL.md", skillDir);
+
+  const contained = await isCandidateSkillContained({
+    candidate,
+    containment,
+    skillDir,
+    skillFilePath,
+    directoryName: name,
+  });
+  if (!contained) return null;
+
+  try {
+    const stat = await candidate.runtime.stat(skillDir);
+    if (!stat.isDirectory) return null;
+
+    return await readAgentSkillFromDir(
+      candidate.runtime,
+      skillDir,
+      name,
+      candidate.scope,
+      candidate.pluginRoot,
+      candidate.skillConsent
+    );
+  } catch (error) {
+    // An unreadable skill (transport, permission) must not let a lower-scope
+    // skill with the same name win (#4438, #4827).
+    if (isRuntimeReadFailure(error)) throw error;
+    return null;
+  }
+}
+
+/**
+ * Resolve a skill by lookup name. A bare name follows scan precedence with the
+ * built-in fallback. `<plugin>:<skill>` considers only that plugin's candidates
+ * (project plugin before global plugin) and never falls back to non-plugin or
+ * built-in skills.
+ */
 export async function readAgentSkill(
   runtime: Runtime,
   workspacePath: string,
-  name: SkillName,
+  lookupName: SkillLookupName,
   options?: {
     roots?: AgentSkillsRoots;
     containment?: ProjectSkillContainment;
     projectContainmentRoot?: string | null;
     /** claude-skills-compat experiment: also scan .claude/skills roots (used only when `roots` is absent). */
     includeClaudeSkills?: boolean;
-    /** agent-plugins experiment: also scan Agent Plugins skills (used only when `roots` is absent). */
-    includeAgentPlugins?: boolean;
     /** Inclusive checkout/repository root for subproject ancestor discovery. */
     projectSearchRoot?: string;
   }
@@ -999,82 +1196,24 @@ export async function readAgentSkill(
     options?.roots ??
     getDefaultAgentSkillsRoots(runtime, workspacePath, {
       includeClaudeSkills: options?.includeClaudeSkills,
-      includeAgentPlugins: options?.includeAgentPlugins,
       projectSearchRoot: options?.projectSearchRoot,
     });
 
   const containment = resolveProjectSkillContainment(options);
 
+  const { pluginName, skillName: name } = resolveReadLookup(lookupName);
+
   // Scan order encodes precedence: earlier roots win when names collide.
   const candidates = await buildScanCandidates(runtime, workspacePath, roots, containment);
 
   for (const candidate of candidates) {
-    if (candidate.importedSkills != null && !candidate.importedSkills.includes(name)) continue;
-    let resolvedRoot: string;
-    try {
-      resolvedRoot = await candidate.runtime.resolvePath(candidate.root);
-    } catch (error) {
-      // An unreachable host is not a missing skill root: never fall back to a
-      // lower-scope or built-in skill on a transport failure (#4438).
-      if (isRuntimeTransportError(error)) throw error;
-      continue;
-    }
-
-    const skillDir = candidate.runtime.normalizePath(name, resolvedRoot);
-    const skillFilePath = candidate.runtime.normalizePath("SKILL.md", skillDir);
-
-    if (candidate.pluginRoot != null) {
-      // Plugin candidates use plugin-root containment; the plugin root itself
-      // was already validated against the project containment root.
-      const contained = await isPluginSkillContained({
-        pluginRoot: candidate.pluginRoot,
-        skillDir,
-        skillFilePath,
-        directoryName: name,
-      });
-      if (!contained) continue;
-    } else if (candidate.scope === "project") {
-      try {
-        await assertProjectSkillContained({
-          runtime: candidate.runtime,
-          containment,
-          skillDir,
-          skillFilePath,
-        });
-      } catch (error) {
-        if (isRuntimeTransportError(error)) throw error;
-        if (hasErrorCode(error, "ENOENT")) {
-          continue;
-        }
-
-        log.warn(
-          `Skipping escaped project skill '${name}' at '${skillFilePath}' for containment kind '${containment.kind}': ${getErrorMessage(error)}`
-        );
-        continue;
-      }
-    }
-
-    try {
-      const stat = await candidate.runtime.stat(skillDir);
-      if (!stat.isDirectory) continue;
-
-      return await readAgentSkillFromDir(
-        candidate.runtime,
-        skillDir,
-        name,
-        candidate.scope,
-        candidate.pluginRoot
-      );
-    } catch (error) {
-      // An unreadable skill (transport, permission) must not let a lower-scope
-      // skill with the same name win (#4438, #4827).
-      if (isRuntimeReadFailure(error)) throw error;
-      continue;
-    }
+    if (!isLookupCandidate(candidate, pluginName, name)) continue;
+    const resolved = await readCandidateSkill(candidate, name, containment);
+    if (resolved !== null) return resolved;
   }
 
-  // Check built-in skills as fallback
-  const builtIn = getBuiltInSkillByName(name);
+  // Check built-in skills as fallback (bare lookups only)
+  const builtIn = pluginName == null ? getBuiltInSkillByName(name) : undefined;
   if (builtIn) {
     return {
       package: builtIn,
@@ -1085,7 +1224,7 @@ export async function readAgentSkill(
     };
   }
 
-  throw new Error(`Agent skill not found: ${name}`);
+  throw new Error(`Agent skill not found: ${lookupName}`);
 }
 
 export type AgentSkillsContext = Pick<
@@ -1101,9 +1240,6 @@ async function resolveAgentSkillDiscoveryContext(
   const options = {
     includeClaudeSkills: context.experimentsService.isExperimentEnabled(
       EXPERIMENT_IDS.CLAUDE_SKILLS_COMPAT
-    ),
-    includeAgentPlugins: context.experimentsService.isExperimentEnabled(
-      EXPERIMENT_IDS.AGENT_PLUGINS
     ),
   };
   if (resolved.metadata == null) {
@@ -1159,23 +1295,22 @@ async function getAgentSkillContext(
 export async function listAgentSkills(
   context: AgentSkillsContext,
   input: { projectPath?: string; workspaceId?: string; disableWorkspaceAgents?: boolean }
-) {
+): Promise<AgentSkillListResult> {
   const skillContext = await getAgentSkillContext(context, input);
-  return discoverAgentSkills(skillContext.runtime, skillContext.workspacePath, {
+  const result = await discoverAgentSkills(skillContext.runtime, skillContext.workspacePath, {
     roots: skillContext.roots,
     containment: skillContext.containment,
   });
-}
-
-export async function listAgentSkillDiagnostics(
-  context: AgentSkillsContext,
-  input: { projectPath?: string; workspaceId?: string; disableWorkspaceAgents?: boolean }
-) {
-  const skillContext = await getAgentSkillContext(context, input);
-  return discoverAgentSkillsDiagnostics(skillContext.runtime, skillContext.workspacePath, {
-    roots: skillContext.roots,
-    containment: skillContext.containment,
-  });
+  // Passes shadowedPluginSkills and skillWarnings through only when discovery set them.
+  const { unavailableSources, ...rest } = result;
+  return {
+    ...rest,
+    unavailableSources: unavailableSources.map(({ scope, displayPath, message }) => ({
+      scope,
+      displayPath,
+      message,
+    })),
+  };
 }
 
 export async function getAgentSkill(

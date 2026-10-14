@@ -28,10 +28,11 @@ import {
   resolveProviderOptionsRoute,
   type OpenAIDirectProviderOptionsAvailability,
 } from "@/common/utils/ai/openaiProviderOptionsAvailability";
+import { resolveCoderRouteGatewayModelId } from "@/common/utils/providers/gatewayModelCatalog";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 
 export type ProModeAvailabilityOptions = OpenAIDirectProviderOptionsAvailability & {
-  /** Authoritative raw-selection route, including explicit gateways, policy and catalog fallback. */
+  /** Authoritative raw-selection route, including explicit gateways and catalog fallback. */
   effectiveRouteProvider?: string | null;
 };
 
@@ -39,8 +40,8 @@ export function openaiProModeAvailable(
   modelString: string,
   options?: ProModeAvailabilityOptions
 ): boolean {
-  // Policy-aware callers already resolved explicit gateway precedence. Do not
-  // resurrect a rejected Coder route from its persisted (policy-unfiltered) catalog.
+  // Callers already resolved explicit gateway precedence. Do not resurrect a
+  // rejected Coder route from its persisted catalog.
   const route =
     options?.effectiveRouteProvider ?? resolveProviderOptionsRoute(modelString, options);
   if (route === "coder") {
@@ -50,10 +51,14 @@ export function openaiProModeAvailable(
     // Coder forwards native Responses bodies, unlike mux-gateway's SDK proxy.
     // Resolve the actual instance type before name-based canonicalization; the
     // direct OpenAI wire format and Codex credentials do not govern this route.
-    const gatewayModelId = modelString.startsWith("coder:")
-      ? modelString.slice("coder:".length)
-      : normalizeToCanonical(modelString).replace(":", "/");
-    const wire = resolveCoderWireCanonicalModel(gatewayModelId, options?.providersConfig?.coder);
+    const gatewayModelId = resolveCoderRouteGatewayModelId(
+      modelString,
+      options?.providersConfig ?? null
+    );
+    const wire =
+      gatewayModelId == null
+        ? null
+        : resolveCoderWireCanonicalModel(gatewayModelId, options?.providersConfig?.coder);
     return (
       wire?.providerType === "openai" &&
       openaiSupportsProMode(

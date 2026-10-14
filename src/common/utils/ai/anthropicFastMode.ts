@@ -35,7 +35,7 @@ function isFirstPartyAnthropicBaseUrl(baseUrl: string): boolean {
 export interface AnthropicFastModeAvailability {
   /** Settings-resolved route for the canonical model ("direct" = no gateway). */
   resolvedRouteProvider?: string | null;
-  /** Providers config for explicit gateway, policy, and beta-feature detection. */
+  /** Providers config for explicit gateway and beta-feature detection. */
   providersConfig?: ProvidersConfigMap | null;
 }
 
@@ -49,8 +49,8 @@ export function anthropicFastModeAvailable(
   options?: AnthropicFastModeAvailability
 ): boolean {
   const providersConfig = options?.providersConfig;
-  // Policy-filtered configs omit denied providers, including this preference's
-  // write target. Do not expose Fast or inject a hidden saved speed.
+  // A config without this preference's write target must not expose Fast or
+  // inject a hidden saved speed.
   if (providersConfig != null && providersConfig.anthropic == null) return false;
   // Fast mode is a beta; ZDR setups disable Anthropic beta features entirely.
   if (providersConfig?.anthropic?.disableBetaFeatures === true) return false;

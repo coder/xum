@@ -1,21 +1,16 @@
 import { createContext, useContext, type ReactNode } from "react";
 import {
-  BASH_COLLAPSED_SUMMARY_MODE_KEY,
-  DEFAULT_BASH_COLLAPSED_SUMMARY_MODE,
   normalizeBashCollapsedSummaryMode,
   type BashCollapsedSummaryMode,
 } from "@/common/constants/storage";
-import { readPersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
+import { getUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 
 const BashCollapsedSummaryModeContext = createContext<BashCollapsedSummaryMode | null>(null);
 
 export function BashCollapsedSummaryModeProvider(props: { children: ReactNode }) {
-  const [rawMode] = usePersistedState<unknown>(
-    BASH_COLLAPSED_SUMMARY_MODE_KEY,
-    DEFAULT_BASH_COLLAPSED_SUMMARY_MODE,
-    { listener: true }
+  const mode = useUserPreferences((preferences) =>
+    normalizeBashCollapsedSummaryMode(preferences.appearance?.bashCollapsedSummaryMode)
   );
-  const mode = normalizeBashCollapsedSummaryMode(rawMode);
 
   return (
     <BashCollapsedSummaryModeContext.Provider value={mode}>
@@ -31,6 +26,6 @@ export function useBashCollapsedSummaryMode(): BashCollapsedSummaryMode {
   }
 
   return normalizeBashCollapsedSummaryMode(
-    readPersistedState(BASH_COLLAPSED_SUMMARY_MODE_KEY, DEFAULT_BASH_COLLAPSED_SUMMARY_MODE)
+    getUserPreferences().appearance?.bashCollapsedSummaryMode
   );
 }

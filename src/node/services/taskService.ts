@@ -1,3 +1,4 @@
+import { ServiceTierSchema, type ServiceTier } from "@/common/config/schemas/providersConfig";
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import { randomUUID } from "node:crypto";
 import {
@@ -15,9 +16,6 @@ import {
   TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
   TASK_TERMINATION_WORKSPACE_REMOVE_TIMEOUT_MS,
 } from "@/constants/terminationTimeouts";
-// Persisted task snapshots stamp the legacy exclusive mirror so downgraded
-// builds resume tasks in the exclusive posture (see withLegacyPtcExclusiveMirror).
-import { withLegacyPtcExclusiveMirror } from "@/common/constants/experiments";
 import { SLOW_STARTUP_WARN_THRESHOLD_MS } from "@/constants/startup";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
@@ -130,7 +128,12 @@ import {
 } from "@/node/runtime/runtimeHelpers";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
 import { runBackgroundInit } from "@/node/runtime/runtimeFactory";
-import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
+import {
+  WorkspaceMutationInProgressError,
+  workspaceUseLeasesFor,
+  type WorkspaceUseLease,
+  type WorkspaceUseLeases,
+} from "@/node/services/workspaceUseLeases";
 import {
   formatRuntimeUnreachableError,
   isRuntimeTransportError,
@@ -138,14 +141,17 @@ import {
   type Runtime,
 } from "@/node/runtime/Runtime";
 import { readPlanFile } from "@/node/utils/runtime/helpers";
+import { resolvePlanFileLocation } from "@/node/utils/runtime/planLocation";
 import {
   coerceNonEmptyString,
   tryReadGitHeadCommitSha,
   findWorkspaceEntry,
+  markChildGoalPauseOwed,
 } from "@/node/services/taskUtils";
 import { validateWorkspaceName } from "@/common/utils/validation/workspaceValidation";
 import { getTaskGroupCount } from "@/common/utils/tools/taskGroups";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
+import { isErrnoException } from "@/node/utils/fs";
 import { Ok, Err, type Result } from "@/common/types/result";
 import {
   DEFAULT_TASK_SETTINGS,
@@ -157,7 +163,12 @@ import {
   resolveBackgroundWorkAttentionPolicy,
   type BackgroundWorkAttentionPolicy,
 } from "@/common/types/backgroundWorkAttention";
-import { createMuxMessage, type MuxMessage, type MuxMessageMetadata } from "@/common/types/message";
+import {
+  createMuxMessage,
+  isContextBudgetWarningMessage,
+  type MuxMessage,
+  type MuxMessageMetadata,
+} from "@/common/types/message";
 import {
   createCompactionSummaryMessageId,
   createTaskFailureMessageId,
@@ -183,7 +194,12 @@ import type {
 import { getRuntimeType } from "@/node/runtime/initHook";
 import { AgentIdSchema } from "@/common/orpc/schemas";
 import type { AgentId } from "@/common/types/agentDefinition";
-import { SendMessageOptionsSchema, ToolPolicySchema } from "@/common/orpc/schemas/stream";
+import {
+  MINTED_SEND_ID_PREFIX,
+  SendMessageOptionsSchema,
+  ToolPolicySchema,
+} from "@/common/orpc/schemas/stream";
+import { computeSendDigest, type SendIdentity } from "@/node/services/sendIds";
 import {
   normalizeAgentId,
   resolvePersistedAgentId,
@@ -198,6 +214,18 @@ import { findUnpreservedSubagentWork } from "@/node/services/subagentRemovalWork
 import { getWorkspaceProjectRepos } from "@/node/services/workspaceProjectRepos";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
+import type { GoalRecordV1 } from "@/common/types/goal";
+import {
+  canAgentDriveGoal,
+  GOAL_BUDGET_LIMIT_KIND,
+  GOAL_CONTINUATION_KIND,
+  type GoalSyntheticMessageKind,
+} from "@/constants/goals";
+import {
+  buildGoalBudgetLimitMessage,
+  buildGoalContinuationMessage,
+  synthesizeSilentContinuationSummary,
+} from "@/constants/goalPrompts";
 import { subagentReportSourceKey } from "@/common/orpc/schemas/timeline";
 import { NOOP_TIMELINE_RECORDER, type TimelineRecorder } from "@/node/services/timelineRecorder";
 import { getTotalCost, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
@@ -278,6 +306,8 @@ import { isNonRetryableStreamError } from "@/common/utils/messages/retryEligibil
 import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
 import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import type { StartupRecoveryState } from "@/node/services/startupRecovery";
+import { judgeLifecycleMarkerOwner } from "@/node/services/lifecycleMarkerOwners";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
@@ -532,7 +562,31 @@ export interface TaskCreateResult {
   thinkingLevel?: ThinkingLevel;
 }
 
-type TaskLaunchStart = { kind: "sendMessage"; prompt: string } | { kind: "resumeStream" };
+/**
+ * `sendId`: the brief send's id (idempotent sends, see sendIds.ts), persisted on the row as
+ * taskPromptSendId before the send. The row that accepts the brief carries it, so a reawakening
+ * prepends a kept taskPrompt only while no history row does.
+ */
+type TaskLaunchStart =
+  | { kind: "sendMessage"; prompt: string; sendId: string }
+  | { kind: "resumeStream" };
+
+/**
+ * A launch's brief send id: minted for one launch (the reservation that writes it next to
+ * taskPrompt), so no publication has seen it before that launch's send. A relaunch mints anew.
+ */
+function mintTaskBriefSendId(): string {
+  return `${MINTED_SEND_ID_PREFIX}${randomUUID()}`;
+}
+
+/**
+ * The brief's send identity: the launch stamps it, and a lookup checks the same id. The digest is
+ * the brief's also when the row carries the brief followed by guidance (a reactivation that
+ * prepends a kept brief, #5544): the id stands for the brief that row delivers.
+ */
+function taskBriefSendIdentity(prompt: string, sendId: string): SendIdentity {
+  return { id: sendId, digest: computeSendDigest({ message: prompt.trim() }) };
+}
 
 /** The report a settled child delivers (waitForAgentReport, readAttemptOutcome). */
 export interface AgentTaskReport {
@@ -676,7 +730,6 @@ interface TaskLaunchPlan {
   preferredTrunkBranch?: string;
   workflowTask?: TaskCreateArgs["workflowTask"];
   bestOf?: TaskCreateArgs["bestOf"];
-  experiments?: TaskCreateArgs["experiments"];
   onRefusal?: TaskCreateArgs["onRefusal"];
   attentionPolicy?: TaskCreateArgs["attentionPolicy"];
   taskDesktopOwnerWorkspaceId?: string;
@@ -700,6 +753,51 @@ interface TaskLaunchPlan {
    * observes it false has positive evidence that no execution was ever admitted for the attempt.
    */
   sendAdmitted?: boolean;
+  /**
+   * The "launch" use lease the reservation took before the row became `starting`, handed to the
+   * launch (startReservedAgentTask), which takes it over and releases it when it settles.
+   */
+  launchLease?: WorkspaceUseLease;
+}
+
+/** Release a launch lease; a failed release is logged (the lock dies with the process anyway). */
+async function releaseLaunchLease(taskId: string, lease: WorkspaceUseLease): Promise<void> {
+  await lease.release().catch((error: unknown) => {
+    log.warn("Task launch: failed to release the launch lease", {
+      taskId,
+      error: getErrorMessage(error),
+    });
+  });
+}
+
+/**
+ * The launch leases createMany takes for its `starting` reservations before committing them (see
+ * startReservedAgentTask). Each is handed to its launch with take(); scope exit releases the rest,
+ * on every path where a reservation is not launched.
+ */
+async function holdLaunchLeases(
+  leases: WorkspaceUseLeases,
+  taskIds: readonly string[]
+): Promise<{ take(taskId: string): WorkspaceUseLease | undefined } & AsyncDisposable> {
+  const held = new Map<string, WorkspaceUseLease>();
+  const releaseAll = async () => {
+    for (const [taskId, lease] of held) await releaseLaunchLease(taskId, lease);
+    held.clear();
+  };
+  try {
+    for (const taskId of taskIds) held.set(taskId, await leases.hold(taskId, "launch"));
+  } catch (error) {
+    await releaseAll();
+    throw error;
+  }
+  return {
+    take(taskId) {
+      const lease = held.get(taskId);
+      held.delete(taskId);
+      return lease;
+    },
+    [Symbol.asyncDispose]: releaseAll,
+  };
 }
 
 interface TaskCreateManyOptions {
@@ -769,6 +867,32 @@ function assertParentAdmitsChild(
     throw new Error(
       `Task.create: parent workspace ${parentWorkspaceId} is being removed (by Xum process ${parent.pendingRemoval.pid})`
     );
+  }
+  // #4928: another backend's archive checked for (active) sub-agents before its archivedAt commit
+  // and cannot see this creation, so the creation sees that archive instead. Its pendingArchive
+  // marker is written before it lists the sub-agents it cascades over, and this check runs inside
+  // the same cross-process config lock: either this write sees the marker (or the archived row),
+  // or the archive's listing sees this child. The marker of an ancestor fences this parent too,
+  // since that archive cascades over it. The walk follows ids only: an archive never marks an
+  // id-less (#4914) row (WorkspaceService.claimPendingArchive refuses to archive one), and every
+  // row between the parent and a marked ancestor is one of its sub-agents, which task creation
+  // always writes with an id. A marker whose owner process died does not refuse.
+  if (isWorkspaceArchived(parent.archivedAt, parent.unarchivedAt)) {
+    throw new Error(`Task.create: parent workspace ${parentWorkspaceId} is archived`);
+  }
+  const visited = new Set<string>();
+  let row: typeof parent | undefined = parent;
+  while (row != null) {
+    const marker = row.pendingArchive;
+    if (marker != null && !judgeLifecycleMarkerOwner(marker).dead) {
+      throw new Error(
+        `Task.create: parent workspace ${parentWorkspaceId} is being archived (by Xum process ${marker.pid})`
+      );
+    }
+    const nextId: string | undefined = row.parentWorkspaceId;
+    if (nextId == null || visited.has(nextId)) break;
+    visited.add(nextId);
+    row = findWorkspaceEntry(config, nextId)?.workspace;
   }
 }
 
@@ -919,6 +1043,8 @@ export type AgentTreeTargetRelation =
   | "target_descendant"
   | "target_ancestor"
   | "peer"
+  | "target_main_chat"
+  | "target_side_chat"
   | "target_unrelated";
 
 export type SendAgentTreeMessageError = SendAgentTaskMessageError | AgentPeerMessageAdmissionError;
@@ -942,7 +1068,7 @@ type TreeMessageSpec =
       senderWorkspaceId: string;
       targetId: string;
       message: string;
-      targetRelation: "peer" | "target_ancestor" | "target_unrelated";
+      targetRelation: Exclude<AgentTreeTargetRelation, "target_descendant">;
       queueDispatchMode?: TaskMessageQueueDispatchMode;
       /** Set on the retry of a message that waited for a delegated turn (#4997). */
       awaitedDelegatedTurn?: PeerDelegatedTurnWait;
@@ -1018,6 +1144,12 @@ export interface TaskTreeAgentsResult {
    */
   callerPeerMessagingRestricted?: true;
   tasks: TreeAgentTaskInfo[];
+  /** Direct chat links only; these grant no task ancestry or lifecycle authority. */
+  relatedChats?: Array<{
+    workspaceId: string;
+    title?: string;
+    relationship: "main_chat" | "side_chat";
+  }>;
 }
 
 export interface InstanceWorkspacesResult {
@@ -1066,6 +1198,57 @@ const WORKSPACE_BUSY_IDLE_ONLY_SEND_MESSAGE = "Workspace is busy; idle-only send
 const MULTI_PROJECT_SHARED_ISOLATION_ERROR =
   'isolation: "none" is not supported for multi-project workspaces; omit isolation or pass isolation: "fork" to run the sub-agent in forked checkouts.';
 
+/**
+ * Whether startup recovery acts on this row: a `running` or `awaiting_report` task (a legacy row
+ * without a taskStatus reads as running) that no other live backend holds a use lease on.
+ */
+function isActiveStartupTask(
+  task: AgentTaskWorkspaceEntry,
+  inUseElsewhere: ReadonlySet<string>
+): boolean {
+  if (!task.id || inUseElsewhere.has(task.id)) return false;
+  return ["running", "awaiting_report"].includes(task.taskStatus ?? "running");
+}
+
+/**
+ * Whether startup recovery re-drives this row. Archived rows are not re-driven. Archiving stops a
+ * task's stream but keeps its taskStatus (see isActiveAgentTaskEntry), and every send to an
+ * archived workspace is refused, so a re-drive failed on every restart. An unarchive makes the row
+ * an ordinary one again, and a task_send_message to it unarchives and reactivates it.
+ */
+function isStartupRedriveCandidate(
+  task: AgentTaskWorkspaceEntry,
+  inUseElsewhere: ReadonlySet<string>
+): boolean {
+  return (
+    isActiveStartupTask(task, inUseElsewhere) &&
+    !isWorkspaceArchived(task.archivedAt, task.unarchivedAt)
+  );
+}
+
+/**
+ * A legacy task row (no taskStatus) has no durable evidence that it was running: startup recovery
+ * sends it the restart nudge only for an interrupted history tail.
+ */
+function lacksLegacyRestartEvidence(
+  task: AgentTaskWorkspaceEntry,
+  state: StartupRecoveryState | undefined
+): boolean {
+  return task.taskStatus == null && state !== "interrupted";
+}
+
+/**
+ * A legacy task row that startup recovery has no work for: no restart evidence, no pending
+ * guidance, and an `idle` probe, which proves no compaction follow-up is pending either.
+ */
+function isIdleLegacyStartupTask(
+  task: AgentTaskWorkspaceEntry,
+  state: StartupRecoveryState | undefined,
+  pendingGuidanceCount: number
+): boolean {
+  return state === "idle" && pendingGuidanceCount === 0 && lacksLegacyRestartEvidence(task, state);
+}
+
 function isWorkspaceBusyIdleOnlySend(error: unknown): boolean {
   return (
     error != null &&
@@ -1101,6 +1284,33 @@ const MAX_CONSECUTIVE_PARENT_AUTO_RESUMES = 3;
  * that never call their completion tool.
  */
 const MAX_TASK_RECOVERY_ATTEMPTS = 5;
+
+/**
+ * Upper bound a child's stream-end arbitration waits for the session's goal accounting of the
+ * same stream (see WorkspaceGoalService.waitForStreamAccountingReceipt).
+ */
+const CHILD_GOAL_ACCOUNTING_WAIT_MS = 10_000;
+/**
+ * Backoff before the queue drain retries a task it left queued because the task's launch lease
+ * was refused (a rename, archive or removal held its mutation gate, here or in another backend,
+ * or the lease file could not be written). Nothing signals the release of another backend's
+ * gate, so the drain retries; each retry reads fresh state and takes the lease normally.
+ */
+const QUEUED_LAUNCH_LEASE_RETRY_MS = 1_000;
+
+/** See TaskService.arbitrateChildGoalAtStreamEnd. */
+type ChildGoalTurnOutcome = "none" | "handled" | "failed" | "deferred";
+
+/** The ended stream's task origin, captured in the stream-end event's own tick. */
+interface StreamEndTaskOrigin {
+  executionId: string | null;
+  stopEpoch: number;
+  ownedAttempt: OwnedTaskAttempt | undefined;
+  unownedAttemptId?: string;
+}
+
+/** Ended streams per task the goal arbitration remembers, so a duplicate delivery is a no-op. */
+const CHILD_GOAL_ARBITRATED_STREAMS_MAX = 32;
 
 /**
  * Bound on waiting for an owned predecessor's in-flight settlement write before deciding a
@@ -1171,6 +1381,30 @@ function rowSupersedes(
   expectedAttemptId: string | null | undefined
 ): boolean {
   return expectedAttemptId != null && row?.taskAttemptId !== expectedAttemptId;
+}
+
+/**
+ * Task-pinned send options for an automatic TaskService turn (required-report prompt today;
+ * child goal turns later). A whitelist on purpose: per-send payload (attachments, muxMetadata,
+ * ACP correlation, system instructions), the required-report require-policy and queue dedupe
+ * keys belong to the individual caller, never to every automatic turn.
+ */
+function buildTaskTurnSendOptions(
+  workspace: WorkspaceConfigEntry
+): Pick<
+  SendMessageOptions,
+  "model" | "agentId" | "thinkingLevel" | "reasoningMode" | "serviceTier"
+> {
+  return {
+    model: workspace.taskModelString ?? defaultModel,
+    agentId: resolveTaskAgentIdForResume(workspace),
+    thinkingLevel: workspace.taskThinkingLevel,
+    reasoningMode: coerceOpenAIReasoningMode(workspace.aiSettings?.reasoningMode),
+    // A chat send updates the agent bucket, not the task's creation-time root settings.
+    serviceTier: ServiceTierSchema.safeParse(
+      resolveWorkspaceAISettings(workspace, resolveTaskAgentIdForResume(workspace))?.serviceTier
+    ).data,
+  };
 }
 
 /**
@@ -1526,15 +1760,41 @@ function collectReferencedTaskIdsFromTaskToolOutput(output: unknown, into: Set<s
   }
 }
 
-type CompletedTaskReportReceipt =
-  | { kind: "initial"; taskId: string; reportMarkdown: string }
-  | {
-      kind: "continuation";
-      taskId: string;
-      handleId?: string;
-      messageId: string;
-      reportMarkdown: string;
-    };
+type CompletedTaskReportReceipt = (
+  | { kind: "initial"; taskId: string }
+  | { kind: "continuation"; taskId: string; handleId?: string; messageId: string }
+) & {
+  reportMarkdown: string;
+  /** Where reportMarkdown starts in the full report, when the row is one paged page. */
+  pageOffset?: number;
+};
+
+/**
+ * A paged row (task_await, or a foreground task since #6427) holds one page of a long report:
+ * its pageOffset is its startCharOffset, 0 for a first page that only carries nextCharOffset.
+ * Undefined for a whole report.
+ */
+function readReportPageOffset(row: Record<string, unknown>): number | undefined {
+  if (typeof row.startCharOffset === "number") return row.startCharOffset;
+  return typeof row.nextCharOffset === "number" ? 0 : undefined;
+}
+
+/**
+ * Whether a continuation receipt shows the owner this exact report: the whole text, or any
+ * non-empty page of it at the page's own offset. Reading one page (with its continuation note)
+ * delivers the result, so its terminal notification must not wake the owner again.
+ */
+function receiptMatchesReport(
+  receipt: Extract<CompletedTaskReportReceipt, { kind: "continuation" }>,
+  reportMarkdown: string | undefined
+): boolean {
+  if (receipt.reportMarkdown === reportMarkdown) return true;
+  if (reportMarkdown == null || receipt.pageOffset == null) return false;
+  return (
+    receipt.reportMarkdown.length > 0 &&
+    reportMarkdown.startsWith(receipt.reportMarkdown, receipt.pageOffset)
+  );
+}
 
 /** Read only canonical task-result containers, never arbitrary JSON or prose. */
 function completedTaskReports(toolName: unknown, output: unknown): CompletedTaskReportReceipt[] {
@@ -1565,13 +1825,36 @@ function completedTaskReports(toolName: unknown, output: unknown): CompletedTask
     if (taskId == null) return [];
     if (typeof messageId === "string") {
       return [
-        { kind: "continuation", taskId, handleId, messageId, reportMarkdown: row.reportMarkdown },
+        {
+          kind: "continuation",
+          taskId,
+          handleId,
+          messageId,
+          reportMarkdown: row.reportMarkdown,
+          pageOffset: readReportPageOffset(row),
+        },
       ];
     }
     return handleId == null
-      ? [{ kind: "initial", taskId, reportMarkdown: row.reportMarkdown }]
+      ? [
+          {
+            kind: "initial",
+            taskId,
+            reportMarkdown: row.reportMarkdown,
+            pageOffset: readReportPageOffset(row),
+          },
+        ]
       : [];
   });
+}
+
+/**
+ * Same text and same page position. A visible projection that drops a page's offset fields
+ * (nextCharOffset/startCharOffset) hides that more text exists and where to read it, so it does
+ * not prove delivery of the genuine paged row.
+ */
+function sameReportPage(a: CompletedTaskReportReceipt, b: CompletedTaskReportReceipt): boolean {
+  return a.reportMarkdown === b.reportMarkdown && a.pageOffset === b.pageOffset;
 }
 
 function sameTaskReportReceipt(
@@ -1581,7 +1864,7 @@ function sameTaskReportReceipt(
   return (
     a.kind === b.kind &&
     a.taskId === b.taskId &&
-    a.reportMarkdown === b.reportMarkdown &&
+    sameReportPage(a, b) &&
     (a.kind === "initial" ||
       (b.kind === "continuation" && a.messageId === b.messageId && a.handleId === b.handleId))
   );
@@ -1993,6 +2276,14 @@ export class TaskService implements AgentTaskIntegration {
   private readonly mutex = new AsyncMutex();
   private maybeStartQueuedTasksInFlight: Promise<void> | undefined;
   private maybeStartQueuedTasksRerunRequested = false;
+  // A queue drain with no queued task skips the global workspace-turn count: it reads every turn
+  // file of every session, hundreds of ms on real installs, and runs on every task settle. That
+  // count also settles stale active turn records (settleStaleWorkspaceTurn), which wakes their
+  // owners; at startup it is the only automatic settle for a stale turn that targets a non-task
+  // workspace. So startup recovery requests one forced sweep from the next drain. Generations,
+  // not a flag: a drain that captured an older request cannot clear one armed during its count.
+  private staleTurnSweepRequestedGeneration = 0;
+  private staleTurnSweepDoneGeneration = 0;
   // Git worktree creation touches per-repository metadata; serialize that narrow phase per project
   // while allowing post-fork init/send startup work for sibling tasks to overlap.
   private readonly reservedTaskLaunchByProjectPath = new Map<string, Promise<void>>();
@@ -2025,6 +2316,8 @@ export class TaskService implements AgentTaskIntegration {
   // and entries expire on read.
   private readonly workflowWakeGroupSendBackoffUntilMs = new Map<string, Map<string, number>>();
   private workflowAttentionSweepTimer: ReturnType<typeof setInterval> | null = null;
+  /** The pending drain retry after a refused launch lease (QUEUED_LAUNCH_LEASE_RETRY_MS). */
+  private queuedLaunchLeaseRetryTimer: ReturnType<typeof setTimeout> | undefined;
   private readonly pendingWaitersByTaskId = new Map<string, PendingTaskWaiter[]>();
   private readonly pendingStartWaitersByTaskId = new Map<string, PendingTaskStartWaiter[]>();
   // Tasks whose launch failed, or whose reservation was canceled or failed, but whose write
@@ -2161,6 +2454,16 @@ export class TaskService implements AgentTaskIntegration {
   private readonly currentAttemptIdByTaskId = new Map<string, string>();
   /** Outstanding send obligations per task (see AdmittedSend); discharged entries are removed. */
   private readonly admittedSendsByTaskId = new Map<string, Set<AdmittedSend>>();
+  /**
+   * Reawakenings (parent reactivation or manual resume) that published a fresh attempt and have
+   * not yet handed it a send obligation (reactivation: until createWorkspaceTurn returns; manual
+   * resume: until reawakenInterruptedTask returns to the send that admits it; a reactivation in
+   * the remaining hand-off tick only makes that send, which names its attempt, read stale). With
+   * pending admissions and the live turn it is the "another reawakening is live" evidence each
+   * path rechecks under the mutex (see hasLiveReawakening): neither path holds the other's locks,
+   * and rotating an attempt a live continuation runs under drops that continuation's report.
+   */
+  private readonly reawakeningsInFlight = new Map<string, string>();
   /** Per task, the stream-end decisions of this process's owned attempts (see StreamEndDecision). */
   private readonly streamEndDecisionsByTaskId = new Map<string, StreamEndDecision[]>();
   /** Stop latches retained past their cascade because the stop could not be confirmed; released on authoritative terminal settlement. */
@@ -3326,6 +3629,88 @@ export class TaskService implements AgentTaskIntegration {
   // ---------------------------------------------------------------------------------------------
 
   /**
+   * Run handleStreamEnd under the workspace event lock, owning the stream's decision: resolved
+   * `nonreport` on every return that neither published nor failed, `indeterminate` on a throw —
+   * unless the handler deferred the stream (child goal arbitration waiting on its accounting),
+   * which transfers the still-pending decision to deferChildStreamEnd.
+   */
+  private runStreamEndHandler(
+    event: StreamEndEvent,
+    queueCutSnapshot: QueueCutAttributionSnapshot,
+    taskOrigin: StreamEndTaskOrigin,
+    decision: StreamEndDecision | undefined
+  ): void {
+    void this.workspaceEventLocks
+      .withLock(event.workspaceId, async () => {
+        let deferred = false;
+        try {
+          deferred =
+            (await this.handleStreamEnd(event, queueCutSnapshot, taskOrigin)) === "deferred";
+        } catch (error: unknown) {
+          // Unknown outcome: never let held follow-ups run as if the attempt continued.
+          this.resolveStreamEndDecision(event.workspaceId, decision, "indeterminate");
+          throw error;
+        } finally {
+          // Every return path that neither published nor failed left the attempt continuing.
+          if (!deferred) this.resolveStreamEndDecision(event.workspaceId, decision, "nonreport");
+        }
+        if (deferred) this.deferChildStreamEnd(event, queueCutSnapshot, taskOrigin, decision);
+      })
+      .catch((error: unknown) => {
+        log.error("TaskService.handleStreamEnd failed", { error });
+      });
+  }
+
+  /**
+   * A child stream whose goal accounting had not settled when arbitration needed it (see
+   * arbitrateChildGoalAtStreamEnd): accounting completion is authoritative, so nothing is decided
+   * from unsettled state and the task is not finalized. The stream's pending decision (held
+   * follow-ups keep waiting) moves here; outside the event lock this waits — unbounded — for the
+   * retained receipt to settle, or for the attempt to close / be superseded / be stopped, then
+   * re-runs the original stream end (same event, attempt, turn and stop fences) under the lock.
+   */
+  private deferChildStreamEnd(
+    event: StreamEndEvent,
+    queueCutSnapshot: QueueCutAttributionSnapshot,
+    taskOrigin: StreamEndTaskOrigin,
+    decision: StreamEndDecision | undefined
+  ): void {
+    const goalService = this.workspaceGoalService;
+    assert(goalService != null, "deferChildStreamEnd requires the goal service");
+    const taskId = event.workspaceId;
+    const attemptId = taskOrigin.ownedAttempt?.attemptId ?? taskOrigin.unownedAttemptId;
+    const cancelled = Promise.withResolvers<void>();
+    const listener = () => {
+      if (
+        attemptId == null ||
+        !this.attemptAdmissionOpen(taskId, attemptId) ||
+        taskOrigin.stopEpoch !== this.getWorkspaceStopEpoch(taskId) ||
+        taskOrigin.executionId !== this.getAgentTaskExecutionId(taskId)
+      ) {
+        cancelled.resolve();
+      }
+    };
+    const listeners = this.attemptSettlementListenersByTaskId.get(taskId) ?? new Set();
+    listeners.add(listener);
+    this.attemptSettlementListenersByTaskId.set(taskId, listeners);
+    listener();
+    log.info("[task-goal] stream accounting unsettled; deferring the child stream end", {
+      taskId,
+      messageId: event.messageId,
+    });
+    void Promise.race([
+      goalService.streamAccountingReceiptOutcome(taskId, event.messageId),
+      cancelled.promise,
+    ])
+      .finally(() => this.removeAttemptSettlementListener(taskId, listener))
+      .then(() => this.runStreamEndHandler(event, queueCutSnapshot, taskOrigin, decision))
+      .catch((error: unknown) => {
+        log.error("TaskService: deferred child stream end failed", { taskId, error });
+        this.resolveStreamEndDecision(taskId, decision, "indeterminate");
+      });
+  }
+
+  /**
    * Register the pending decision for the ended stream of `attempt` (owned) or, when this process
    * owns none, of the persisted `unownedAttemptId`. Synchronous, event tick only.
    */
@@ -3570,6 +3955,60 @@ export class TaskService implements AgentTaskIntegration {
     for (const send of this.admittedSendsByTaskId.get(taskId) ?? []) {
       if (send.attemptId !== current) continue;
       if (send.state === "pending" || send.state === "enqueued") return true;
+    }
+    return false;
+  }
+
+  /**
+   * Another reawakening's attempt is live in this process: published and still launching, or
+   * handed to work that has not ended (a pending/enqueued admission, the live turn, a stream).
+   * Synchronous; both reawakening paths evaluate it under the mutex BEFORE their own publish, so
+   * their own work is never counted. Evidence, not ownership: an owned attempt that nothing runs
+   * (a reactivation whose launch was refused, a follow-up turn that ended) stays reawakenable.
+   */
+  private hasLiveReawakening(taskId: string): boolean {
+    if (
+      this.reawakeningsInFlight.has(taskId) ||
+      this.workspaceService.getActiveTurnGeneration(taskId) != null ||
+      this.aiService.isStreaming(taskId)
+    ) {
+      return true;
+    }
+    // Only sends that can still start a turn: one bound to a closed, superseded or stopped
+    // attempt reads stale at every later gate and is no continuation to protect.
+    for (const send of this.admittedSendsByTaskId.get(taskId) ?? []) {
+      if ((send.state === "pending" || send.state === "enqueued") && !send.token.admissionStale()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Stop epochs of `taskId` and its ancestors, captured when a reawakening decision begins (before
+   * its first await). See reawakeningOvertakenByStop.
+   */
+  private captureReawakeningStopFence(taskId: string): ReadonlyMap<string, number> {
+    const index = this.buildAgentTaskIndex(this.config.loadConfigOrDefault());
+    const chain = [
+      taskId,
+      ...this.listAncestorWorkspaceIdsUsingParentById(index.parentById, taskId),
+    ];
+    return new Map(chain.map((id) => [id, this.getWorkspaceStopEpoch(id)]));
+  }
+
+  /**
+   * A Stop of the task or any ancestor that latched or ran since `fence` was captured overtakes
+   * the reawakening. With R > P > C, the user's Stop of R latches C, but an idle C releases its
+   * latch at once while P's tool call (the reawakening) is still suspended, so the task's own
+   * latch alone cannot see a Stop that already completed. Mirrors reawakenInterruptedTask's
+   * stop-epoch recheck; a Stop is a later user decision than the reawakening it overtakes.
+   */
+  private reawakeningOvertakenByStop(fence: ReadonlyMap<string, number>): boolean {
+    for (const [id, epoch] of fence) {
+      if (this.isWorkspaceStopInProgress(id) || this.getWorkspaceStopEpoch(id) !== epoch) {
+        return true;
+      }
     }
     return false;
   }
@@ -3840,6 +4279,38 @@ export class TaskService implements AgentTaskIntegration {
     };
   }
 
+  /**
+   * Resolve once none of `workspaceIds` holds a Stop latch, or at `deadlineMs`. A Stop releases
+   * its latch only after its settlement receipt is durable or failed (recheckWorkspaceStopRelease),
+   * and the release notifies the attempt settlement listeners.
+   */
+  private async waitForWorkspaceStopsToRelease(
+    workspaceIds: readonly string[],
+    deadlineMs: number
+  ): Promise<void> {
+    for (const id of workspaceIds) {
+      while (this.isWorkspaceStopInProgress(id)) {
+        const remainingMs = deadlineMs - Date.now();
+        if (remainingMs <= 0) {
+          log.warn("Stop latch still held at the cleanup deadline; its receipt may be missing", {
+            taskId: id,
+          });
+          return;
+        }
+        const released = Promise.withResolvers<void>();
+        const listener = () => released.resolve();
+        const listeners = this.attemptSettlementListenersByTaskId.get(id) ?? new Set();
+        listeners.add(listener);
+        this.attemptSettlementListenersByTaskId.set(id, listeners);
+        try {
+          await raceWithAbortAndTimeout(released.promise, { timeoutMs: remainingMs });
+        } finally {
+          this.removeAttemptSettlementListener(id, listener);
+        }
+      }
+    }
+  }
+
   /** Resolve once the task's settlement entry leaves `closing` (or the bound elapses). */
   private async waitForAttemptClosureToSettle(taskId: string, timeoutMs: number): Promise<void> {
     const isClosing = () => this.attemptSettlementByTaskId.get(taskId)?.phase === "closing";
@@ -4087,6 +4558,7 @@ export class TaskService implements AgentTaskIntegration {
           (ws) => {
             refusal = retiredAttemptClaimRefusal(ws, attemptId, claimant);
             if (refusal != null) return;
+            markChildGoalPauseOwed(ws);
             ws.taskAttemptRetiredBy = {
               runId: claimant.runId,
               stepId: claimant.stepId,
@@ -4116,7 +4588,74 @@ export class TaskService implements AgentTaskIntegration {
       if (row?.taskAttemptId !== attemptId || row.taskAttemptRetiredBy?.nonce !== nonce) {
         return Err("claim lost");
       }
+      await this.settleChildGoalPause(taskId);
       return Ok({ nonce });
+    });
+  }
+
+  /**
+   * A workflow step's started checkpoint is written in createMany's onTaskReserved, BEFORE
+   * commitReservations publishes the child's row. A crash in between leaves a checkpoint naming a
+   * task that never existed. Replacing it outright is unsafe: the reserving backend may only be
+   * stalled (lease expired, process alive), and its late commit would then publish a second child
+   * for the step, or re-run a step the replacement already recorded. So the replacing runner first
+   * tombstones the ID on the parent's row; commitReservations checks the tombstone inside its own
+   * config write and refuses, which makes "replace" and "late commit" mutually exclusive.
+   *
+   * Granted only while a strict read shows no row for the task (checked inside the same write) and
+   * this process owns no attempt for it (an own reservation may still be before its commit).
+   * Idempotent. Confirmed by a strict re-read, since a config edit that fails to write is not
+   * always surfaced to its caller.
+   */
+  async tombstoneUnpublishedReservation(
+    parentWorkspaceId: string,
+    taskId: string
+  ): Promise<Result<void, string>> {
+    assert(parentWorkspaceId.length > 0, "tombstoneUnpublishedReservation: parentWorkspaceId");
+    assert(taskId.length > 0, "tombstoneUnpublishedReservation: taskId");
+    return await this.workspaceEventLocks.withLock(taskId, async () => {
+      if (this.ownedAttemptByTaskId.has(taskId)) {
+        return Err("this process owns an attempt for the task");
+      }
+      let refusal: string | undefined;
+      try {
+        await this.config.editConfig((config) => {
+          refusal = undefined;
+          if (findWorkspaceEntry(config, taskId) != null) {
+            refusal = "the task was published";
+            return config;
+          }
+          const parent = findWorkspaceEntry(config, parentWorkspaceId)?.workspace;
+          if (parent == null) {
+            refusal = "parent record not found";
+            return config;
+          }
+          const tombstones = parent.taskReservationTombstones ?? [];
+          if (!tombstones.includes(taskId)) {
+            parent.taskReservationTombstones = [...tombstones, taskId];
+          }
+          return config;
+        });
+      } catch (error: unknown) {
+        return Err(`tombstone write failed: ${getErrorMessage(error)}`);
+      }
+      if (refusal != null) return Err(refusal);
+      let config: ProjectsConfig;
+      try {
+        config = this.config.loadConfigOrDefault({ throwOnError: true });
+      } catch (error: unknown) {
+        return Err(`tombstone unconfirmed: config unreadable: ${getErrorMessage(error)}`);
+      }
+      if (
+        findWorkspaceEntry(config, taskId) != null ||
+        findWorkspaceEntry(
+          config,
+          parentWorkspaceId
+        )?.workspace.taskReservationTombstones?.includes(taskId) !== true
+      ) {
+        return Err("tombstone lost");
+      }
+      return Ok(undefined);
     });
   }
 
@@ -4495,11 +5034,14 @@ export class TaskService implements AgentTaskIntegration {
     const persistedQueuedPrompt = coerceNonEmptyString(workspace.taskPrompt);
     workspace.taskStatus = "interrupted";
     workspace.reportedAt = undefined;
+    markChildGoalPauseOwed(workspace);
 
     // Queued tasks persist their initial prompt in config until first start. Preserve that
     // intent across interrupts, including repeated interrupts after the status is no longer queued.
     if (previousStatus !== "queued" && !persistedQueuedPrompt) {
       workspace.taskPrompt = undefined;
+      // The brief's send id means nothing without the brief (#5544).
+      workspace.taskPromptSendId = undefined;
     }
     return "interrupted";
   }
@@ -4534,6 +5076,7 @@ export class TaskService implements AgentTaskIntegration {
     if (transitionedToInterrupted) {
       this.recordTaskInterrupted(taskId, parentWorkspaceId);
     }
+    if (interrupted) await this.settleChildGoalPause(taskId);
 
     log.debug("Skipping workflow-owned task recovery after inactive workflow owner", {
       taskId,
@@ -4578,6 +5121,8 @@ export class TaskService implements AgentTaskIntegration {
 
   private readonly agentPeerMessageBroker: AgentPeerMessageBroker;
   private workspaceTurnManager: WorkspaceTurnManager | undefined;
+  /** Stream message ids whose child-goal arbitration already ran, per task (bounded). */
+  private readonly childGoalArbitratedStreams = new Map<string, string[]>();
 
   constructor(
     private readonly config: Config,
@@ -4627,22 +5172,7 @@ export class TaskService implements AgentTaskIntegration {
         taskOrigin.ownedAttempt,
         taskOrigin.unownedAttemptId
       );
-      void this.workspaceEventLocks
-        .withLock(payload.workspaceId, async () => {
-          try {
-            await this.handleStreamEnd(payload, queueCutSnapshot, taskOrigin);
-          } catch (error: unknown) {
-            // Unknown outcome: never let held follow-ups run as if the attempt continued.
-            this.resolveStreamEndDecision(payload.workspaceId, decision, "indeterminate");
-            throw error;
-          } finally {
-            // Every return path that neither published nor failed left the attempt continuing.
-            this.resolveStreamEndDecision(payload.workspaceId, decision, "nonreport");
-          }
-        })
-        .catch((error: unknown) => {
-          log.error("TaskService.handleStreamEnd failed", { error });
-        });
+      this.runStreamEndHandler(payload, queueCutSnapshot, taskOrigin, decision);
     });
 
     this.aiService.on("stream-abort", (payload: unknown) => {
@@ -4834,6 +5364,7 @@ export class TaskService implements AgentTaskIntegration {
     agentId: string;
     thinkingLevel?: ThinkingLevel;
     reasoningMode?: OpenAIReasoningMode;
+    serviceTier?: ServiceTier;
   }> {
     // 1) Try stream-end hint metadata (available in handleStreamEnd path)
     // Compaction is internal bookkeeping, not an identity for resuming user work.
@@ -4889,6 +5420,7 @@ export class TaskService implements AgentTaskIntegration {
               model: workspace.aiSettings.model,
               thinkingLevel: workspace.aiSettings.thinkingLevel,
               reasoningMode: coerceOpenAIReasoningMode(workspace.aiSettings.reasoningMode),
+              serviceTier: ServiceTierSchema.safeParse(workspace.aiSettings.serviceTier).data,
             },
           ]
         : undefined,
@@ -4898,6 +5430,9 @@ export class TaskService implements AgentTaskIntegration {
       model: resolved.selected.model,
       agentId,
       thinkingLevel: resolved.selected.thinkingLevel,
+      ...(resolved.selected.serviceTier != null
+        ? { serviceTier: resolved.selected.serviceTier }
+        : {}),
       ...(resolved.selected.reasoningMode != null
         ? { reasoningMode: resolved.selected.reasoningMode }
         : {}),
@@ -5005,8 +5540,7 @@ export class TaskService implements AgentTaskIntegration {
   async emitWorkspaceMetadata(workspaceId: string): Promise<void> {
     assert(workspaceId.length > 0, "emitWorkspaceMetadata: workspaceId must be non-empty");
 
-    const allMetadata = await this.config.getAllWorkspaceMetadata();
-    const metadata = allMetadata.find((m) => m.id === workspaceId) ?? null;
+    const metadata = await this.config.findWorkspaceMetadata(workspaceId);
     this.workspaceService.emit("metadata", { workspaceId, metadata });
   }
 
@@ -5158,10 +5692,12 @@ export class TaskService implements AgentTaskIntegration {
 
     // A task that another live backend is still running holds a use lease on its workspace there
     // (a turn, init hook, MCP server, command, terminal or editor). Leave it to that backend in
-    // every pass below: re-driving it here would start a duplicate execution (#4801). Idle windows
-    // (reservation, between turns, waiting on descendants) hold no lease, so this backend can
-    // still take such a task over by rotation; the attempt-bound CAS fencing treats the other
-    // backend's execution as superseded.
+    // every pass below: re-driving it here would start a duplicate execution (#4801). A launch
+    // holds a "launch" lease from before its row becomes `starting`, so
+    // a `starting` row in startupConfig whose launch still runs is skipped too: its lease was
+    // published before this scan. Idle windows (between turns, waiting on descendants) hold no
+    // lease, so this backend can still take such a task over by rotation; the attempt-bound CAS
+    // fencing treats the other backend's execution as superseded.
     const inUseElsewhere = await this.findTasksInUseByOtherBackends(startupConfig);
 
     const staleStartingTasks = this.listAgentTaskWorkspaces(startupConfig).filter(
@@ -5175,13 +5711,16 @@ export class TaskService implements AgentTaskIntegration {
       for (const task of staleStartingTasks) {
         assert(task.id != null && task.id.length > 0, "stale starting task id is required");
         const isStreaming = this.aiService.isStreaming(task.id);
-        const acceptedPrompt = !isStreaming && (await this.hasAcceptedInitialTaskPrompt(task.id));
+        const acceptedPrompt = !isStreaming && (await this.hasAcceptedInitialTaskPrompt(task));
         if (acceptedPrompt) acceptedPromptCount += 1;
         try {
           await this.editActiveWorkspaceEntry(
             task.id,
             (workspace) => {
               if (workspace.taskStatus !== "starting") return;
+              // Only the reservation the lease scan judged: a row re-admitted under a new attempt
+              // since is that launch's, and its lease was published after the scan.
+              if (workspace.taskAttemptId !== task.taskAttemptId) return;
               workspace.taskStatus = isStreaming ? "running" : "queued";
               // A `starting` entry found at startup may already have an admitted execution in
               // another process. The relaunch would otherwise look exactly like a never-launched
@@ -5189,7 +5728,10 @@ export class TaskService implements AgentTaskIntegration {
               // but can never vouch for it across processes.
               workspace.taskAttemptUnproven = true;
               // History already owns accepted prompts; do not duplicate them on restart.
-              if (acceptedPrompt) workspace.taskPrompt = undefined;
+              if (acceptedPrompt) {
+                workspace.taskPrompt = undefined;
+                workspace.taskPromptSendId = undefined;
+              }
             },
             { allowMissing: true }
           );
@@ -5206,16 +5748,18 @@ export class TaskService implements AgentTaskIntegration {
     let config = this.config.loadConfigOrDefault();
     let taskIndex = this.buildAgentTaskIndex(config);
     const startupTasks = () =>
-      this.listAgentTaskWorkspaces(config).filter(
-        (task) =>
-          task.id &&
-          !inUseElsewhere.has(task.id) &&
-          ["running", "awaiting_report"].includes(task.taskStatus ?? "running")
+      this.listAgentTaskWorkspaces(config).filter((task) =>
+        isStartupRedriveCandidate(task, inUseElsewhere)
       );
 
-    // Workflow cancellation is authoritative even when a child has its own Stop or question.
-    for (const task of startupTasks()) {
+    // Workflow cancellation is authoritative even when a child has its own Stop or question, and
+    // for archived rows too: a cancelled run's archived child must not stay active until unarchive.
+    const activeTasks = this.listAgentTaskWorkspaces(config).filter((task) =>
+      isActiveStartupTask(task, inUseElsewhere)
+    );
+    for (const task of activeTasks) {
       await this.interruptTaskRecoveryForInactiveWorkflowOwner(
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         task.id!,
         config,
         "startup-inactive-workflow-owner-prepass",
@@ -5229,16 +5773,19 @@ export class TaskService implements AgentTaskIntegration {
       await Promise.all(
         candidates.map(
           async (task) =>
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
             [task.id, await this.workspaceService.getStartupRecoveryState(task.id!)] as const
         )
       )
     );
     for (const task of candidates) {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const id = task.id!;
       if (states.get(id) !== "stopped") continue;
       await this.withTaskTreeLifecycleLock(id, async () => {
         if (this.aiService.isStreaming(id) || this.workspaceService.isBusyForMessage(id)) return;
         const stopped = await this.stopDescendantAgentTaskUnderLifecycleLock(
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           task.parentWorkspaceId!,
           id,
           false
@@ -5254,12 +5801,15 @@ export class TaskService implements AgentTaskIntegration {
     // Scheduled, not awaited: launches are ordinary runtime work that already races clients
     // (reservation is a CAS on `queued`), and the re-drives below only touch snapshot candidates.
     if (cancelled("queue-drain")) return;
+    // The drain sweeps stale workspace turns even with an empty queue (see the field's comment).
+    this.staleTurnSweepRequestedGeneration += 1;
     this.scheduleMaybeStartQueuedTasks();
 
     // Recovery awaits and queue draining can change task status: re-read before replaying intent.
     config = this.config.loadConfigOrDefault();
     taskIndex = this.buildAgentTaskIndex(config);
     const eligible = startupTasks().filter(
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       (task) => states.has(task.id) && !["blocked", "stopped"].includes(states.get(task.id)!)
     );
     const awaitingReportTasks = eligible.filter(
@@ -5271,8 +5821,10 @@ export class TaskService implements AgentTaskIntegration {
 
     const admitRecovery = async (task: (typeof eligible)[number], reason: string) => {
       if (
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         !(await this.admitTaskDesktopRecovery(task.id!)) ||
         (await this.interruptTaskRecoveryForInactiveWorkflowOwner(
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           task.id!,
           config,
           reason,
@@ -5281,6 +5833,7 @@ export class TaskService implements AgentTaskIntegration {
       )
         return false;
       // Earlier recovery awaits can finish other candidates; verify live status at each dispatch.
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const latest = findWorkspaceEntry(this.config.loadConfigOrDefault(), task.id!)?.workspace;
       return latest != null && latest.taskStatus === task.taskStatus;
     };
@@ -5314,6 +5867,8 @@ export class TaskService implements AgentTaskIntegration {
       // the first send below; the sends are then fenced against the fresh id at the handoff.
       // Guarded by the recovery snapshot (`task`), not a re-read: a row that moved meanwhile was
       // admitted or stopped by another writer and must not be re-driven.
+      // Retry a goal pause the previous process owed before re-driving the task.
+      await this.settleChildGoalPause(task.id);
       const rotatedAttemptId = await this.rotateAttemptForStartupRedrive(task.id, task);
       if (rotatedAttemptId == null) {
         failedAwaitingReportCount += 1;
@@ -5380,10 +5935,15 @@ export class TaskService implements AgentTaskIntegration {
         skippedRunningDueToActiveDescendants += 1;
         continue;
       }
+      // Decided before the attempt rotation below: that rotation writes the whole config file,
+      // and a large config with many legacy rows outlived the startup step bound (#6511).
+      if (isIdleLegacyStartupTask(task, states.get(task.id), pendingGuidance.length)) continue;
 
       // Admission classification: startup re-drive (compaction follow-up, guidance replay or the
       // restart nudge) = new UNOWNED attempt; rotate + mark once before the first send, guarded
       // by the recovery snapshot (`task`) like the awaiting-report re-drive above.
+      // Retry a goal pause the previous process owed before re-driving the task.
+      await this.settleChildGoalPause(task.id);
       const rotatedAttemptId = await this.rotateAttemptForStartupRedrive(task.id, task);
       if (rotatedAttemptId == null) {
         failedRunningCount += 1;
@@ -5417,7 +5977,9 @@ export class TaskService implements AgentTaskIntegration {
         agentId,
         thinkingLevel: task.taskThinkingLevel,
         reasoningMode: coerceOpenAIReasoningMode(task.aiSettings?.reasoningMode),
-        experiments: task.taskExperiments,
+        serviceTier: ServiceTierSchema.safeParse(
+          resolveWorkspaceAISettings(task, agentId)?.serviceTier
+        ).data,
       };
       if (pendingGuidance.length > 0) {
         let sendResult: Result<void, SendMessageError> = Ok(undefined);
@@ -5453,7 +6015,7 @@ export class TaskService implements AgentTaskIntegration {
       }
 
       // Legacy tasks lack active-status evidence. Durable compaction/guidance above still wins.
-      if (task.taskStatus == null && states.get(task.id) !== "interrupted") continue;
+      if (lacksLegacyRestartEvidence(task, states.get(task.id))) continue;
       const isPlanLike = await this.isPlanLikeTaskWorkspace({
         projectPath: task.projectPath,
         workspace: task,
@@ -5485,6 +6047,7 @@ export class TaskService implements AgentTaskIntegration {
                 acceptanceOrigin: "automatic",
                 synthetic: true,
                 agentInitiated: true,
+                taskTurnKind: "recovery",
                 // Accepted is enough; stream startup must not gate the listener (see method doc).
                 startStreamInBackground: true,
                 turnAdmission: nudgeToken,
@@ -5555,6 +6118,7 @@ export class TaskService implements AgentTaskIntegration {
       if (isWorkspaceArchived(task.archivedAt, task.unarchivedAt)) continue;
       // A reported task that is streaming again (a client reactivated it) may be committing;
       // the continuation refresh that runs when that turn ends generates its artifact.
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       if (this.aiService.isStreaming(task.id!)) continue;
       try {
         let artifacts = patchArtifactsByParent.get(task.parentWorkspaceId);
@@ -5564,6 +6128,7 @@ export class TaskService implements AgentTaskIntegration {
           );
           patchArtifactsByParent.set(task.parentWorkspaceId, artifacts);
         }
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const artifact = artifacts.artifactsByChildTaskId[task.id!];
         if (artifact != null && artifact.status !== "pending") continue;
 
@@ -5571,6 +6136,7 @@ export class TaskService implements AgentTaskIntegration {
         // with (reported tasks x config size) on large deployments.
         await this.gitPatchArtifactService.maybeStartGeneration(
           task.parentWorkspaceId,
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           task.id!,
           (wsId) => this.requestReportedTaskCleanupRecheck(wsId),
           { config }
@@ -5700,6 +6266,7 @@ export class TaskService implements AgentTaskIntegration {
     );
     await Promise.all(
       candidates.map(async (task) => {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const taskId = task.id!;
         const use = await leases.findForeignUse(taskId);
         if (use == null) return;
@@ -5714,8 +6281,21 @@ export class TaskService implements AgentTaskIntegration {
     return inUse;
   }
 
-  private async hasAcceptedInitialTaskPrompt(workspaceId: string): Promise<boolean> {
-    assert(workspaceId.length > 0, "hasAcceptedInitialTaskPrompt: workspaceId must be non-empty");
+  /**
+   * Whether history already holds the task's initial brief. A row with a brief send id
+   * (taskPromptSendId) is decided by that id alone. Rows written before brief send ids keep the
+   * older test: any user row since the latest boundary.
+   */
+  private async hasAcceptedInitialTaskPrompt(task: WorkspaceConfigEntry): Promise<boolean> {
+    const workspaceId = task.id;
+    assert(
+      workspaceId != null && workspaceId.length > 0,
+      "hasAcceptedInitialTaskPrompt: workspaceId must be non-empty"
+    );
+    const prompt = coerceNonEmptyString(task.taskPrompt);
+    if (prompt != null && task.taskPromptSendId != null) {
+      return this.isTaskBriefInHistory(workspaceId, prompt, task.taskPromptSendId);
+    }
 
     const historyResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
     if (!historyResult.success) {
@@ -5727,6 +6307,82 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     return historyResult.data.some((message) => message.role === "user");
+  }
+
+  /**
+   * Whether a readable history row (archive included) carries the brief's send id with the
+   * brief's payload, read under the history write lock. The row is the
+   * only acceptance evidence: a send's result and its onAccepted callback both miss a send whose
+   * rows became durable before it failed. Only that proof drops the kept prompt. A line that names
+   * the id but cannot be read back (providers never see it), a row with another payload, or a
+   * failed lookup count as absent: the brief is sent again rather than lost (the behavior before
+   * brief send ids).
+   */
+  private async isTaskBriefInHistory(
+    workspaceId: string,
+    prompt: string,
+    sendId: string
+  ): Promise<boolean> {
+    const decision = await this.historyService.decideSendIds(workspaceId, [
+      taskBriefSendIdentity(prompt, sendId),
+    ]);
+    if (!decision.success) {
+      log.warn("Failed to look up a task brief's send id; treating the brief as unsent", {
+        workspaceId,
+        error: decision.error,
+      });
+      return false;
+    }
+    if (decision.data.kind === "refused") {
+      log.warn(
+        "Task brief send id found on a row that does not prove the brief; sending it again",
+        {
+          workspaceId,
+          reason: decision.data.reason,
+        }
+      );
+    }
+    return decision.data.kind === "already-accepted";
+  }
+
+  /**
+   * Before a reawakening prepends a kept taskPrompt: drop it when a history row already carries
+   * its brief's send id (the launch's send accepted it, then failed or was stopped before
+   * `running`). Rows without a brief send id keep the older behavior: the kept prompt is sent.
+   * Only while no launch or turn of the task is in flight on any backend (its "launch" or "turn"
+   * use lease) and no Stop is in progress here: a send in flight can roll its row back after this
+   * lookup saw it (a Stop on the backend that runs it), which would lose the brief. With a lease
+   * held, the kept prompt stays and is sent again, as before brief send ids.
+   */
+  private async dropKeptTaskPromptAlreadyInHistory(taskId: string): Promise<void> {
+    const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace;
+    const prompt = coerceNonEmptyString(workspace?.taskPrompt);
+    const sendId = workspace?.taskPromptSendId;
+    if (prompt == null || sendId == null) return;
+    if (workspace?.taskStatus !== "interrupted" && workspace?.taskStatus !== "reported") return;
+    if (this.isWorkspaceStopInProgress(taskId) || this.aiService.isStreaming(taskId)) return;
+    // Cross-process: the launching backend holds this lease until its send (and any rollback of
+    // the send's rows) has returned. No launch starts for an inactive row, so none can begin
+    // after this check.
+    if (await workspaceUseLeasesFor(this.config).isHeld(taskId, "launch")) return;
+    if (!(await this.isTaskBriefInHistory(taskId, prompt, sendId))) return;
+    // A reawakening's send carries a brief id too (#5544), and it can run on another backend, where
+    // a Stop can still roll its row back. Its session publishes its "turn" lease before the row
+    // is written and releases it once the send has settled, so: the row was seen, then no turn is
+    // live, then the row is still there. Only then is it permanent. A turn started after the
+    // config read above carries a newer id, which the edit below refuses.
+    if (await workspaceUseLeasesFor(this.config).isHeld(taskId, "turn")) return;
+    if (!(await this.isTaskBriefInHistory(taskId, prompt, sendId))) return;
+    await this.editWorkspaceEntry(
+      taskId,
+      (ws) => {
+        // Only the prompt this lookup decided on: a rewrite since then belongs to its writer.
+        if (ws.taskPromptSendId !== sendId || ws.taskPrompt !== workspace?.taskPrompt) return;
+        ws.taskPrompt = undefined;
+        ws.taskPromptSendId = undefined;
+      },
+      { allowMissing: true }
+    );
   }
 
   private startWorkspaceInit(workspaceId: string, projectPath: string): InitLogger {
@@ -6374,7 +7030,7 @@ export class TaskService implements AgentTaskIntegration {
         parentMeta: plan.parentMeta,
         agentId: plan.agentId,
         agentType: plan.agentId,
-        start: { kind: "sendMessage", prompt: plan.prompt },
+        start: { kind: "sendMessage", prompt: plan.prompt, sendId: mintTaskBriefSendId() },
         title: plan.args.title,
         workspaceName,
         createdAt,
@@ -6390,7 +7046,6 @@ export class TaskService implements AgentTaskIntegration {
         skipInitHook: plan.skipInitHook,
         workflowTask: plan.args.workflowTask,
         bestOf: plan.normalizedBestOf,
-        experiments: plan.args.experiments,
         onRefusal: plan.args.onRefusal,
         attentionPolicy: plan.args.attentionPolicy,
         taskDesktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId,
@@ -6416,6 +7071,18 @@ export class TaskService implements AgentTaskIntegration {
         desktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId ?? taskId,
       });
     }
+
+    // Before the commit publishes any `starting` row: its launch lease (see startReservedAgentTask).
+    let heldLaunchLeases: Awaited<ReturnType<typeof holdLaunchLeases>>;
+    try {
+      heldLaunchLeases = await holdLaunchLeases(
+        workspaceUseLeasesFor(this.config),
+        plans.filter((plan) => plan.status === "starting").map((plan) => plan.taskId)
+      );
+    } catch (error) {
+      return Err(`Task.createMany: ${getErrorMessage(error)}`);
+    }
+    await using launchLeases = heldLaunchLeases;
 
     // Stage: desktop gate (cancellable acquisition), then the owned checkpoint + commit.
     progress.enter("desktop-gate");
@@ -6450,9 +7117,10 @@ export class TaskService implements AgentTaskIntegration {
       try {
         for (const [index, result] of results.entries()) {
           // Workflow callers durably checkpoint returned task IDs before task records are
-          // persisted. If config persistence fails afterward, replay sees a started step whose
-          // task is not found and restarts it instead of duplicating an already-launched child
-          // after a crash.
+          // persisted. If this backend dies before the commit, the checkpoint names a task that
+          // never existed: a resuming runner tombstones the ID (tombstoneUnpublishedReservation)
+          // and only then replaces it, and the commit below refuses a tombstoned ID, so a stalled
+          // (not dead) backend's late commit can never publish a second child for the step.
           await options.onTaskReserved?.(index, result);
         }
         progress.enter("config-commit");
@@ -6525,6 +7193,7 @@ export class TaskService implements AgentTaskIntegration {
                   return;
                 }
                 ws.taskStatus = "interrupted";
+                markChildGoalPauseOwed(ws);
                 ws.taskLaunchError = TASK_RESERVATION_CANCELED_MESSAGE;
                 transitioned = true;
               },
@@ -6539,6 +7208,7 @@ export class TaskService implements AgentTaskIntegration {
           }
         }
         if (transitioned) this.recordTaskInterrupted(plan.taskId, plan.parentWorkspaceId);
+        if (transitioned) await this.settleChildGoalPause(plan.taskId);
         // Waiters are keyed by the stable task id: once another writer re-admitted the row under
         // its own attempt they are that attempt's (its task_await must not read this cancel).
         // Rejected BEFORE the receipt write's await, which a successor's new waiter could
@@ -6561,6 +7231,7 @@ export class TaskService implements AgentTaskIntegration {
 
     for (const plan of plans) {
       if (plan.status === "starting") {
+        plan.launchLease = launchLeases.take(plan.taskId);
         this.scheduleReservedTaskLaunch(plan);
       }
     }
@@ -6606,6 +7277,17 @@ export class TaskService implements AgentTaskIntegration {
       }
       // Fence inside the mutator: an abort that landed while waiting for the config lock (or
       // during the checkpoint) persists the plans interrupted instead of live reservations.
+      // A resuming workflow runner abandoned this reservation (tombstoneUnpublishedReservation)
+      // and replaces it: refuse in the same write, before anything of this batch is published.
+      for (const plan of plans) {
+        const tombstones = findWorkspaceEntry(config, plan.parentWorkspaceId)?.workspace
+          .taskReservationTombstones;
+        if (Array.isArray(tombstones) && tombstones.includes(plan.taskId)) {
+          throw new Error(
+            `Task.createMany: reservation ${plan.taskId} was abandoned by a resumed workflow runner (tombstoned); not publishing`
+          );
+        }
+      }
       const canceledInsideCommit = signal?.aborted === true;
       if (canceledInsideCommit) onCanceledInsideCommit();
       for (const plan of plans) {
@@ -6640,6 +7322,8 @@ export class TaskService implements AgentTaskIntegration {
           title: plan.title,
           createdAt: plan.createdAt,
           runtimeConfig: plan.taskRuntimeConfig,
+          // New rows have no legacy plan to migrate (#5174).
+          remotePlanMigrated: true,
           aiSettings:
             plan.effectiveThinkingLevel !== undefined
               ? {
@@ -6659,12 +7343,13 @@ export class TaskService implements AgentTaskIntegration {
           taskLaunchError: canceledInsideCommit ? TASK_RESERVATION_CANCELED_MESSAGE : undefined,
           taskAttemptId: plan.attemptId,
           taskPrompt: plan.start.kind === "sendMessage" ? plan.start.prompt : undefined,
+          // A queued row's id is replaced by its launch's own (maybeStartQueuedTasks).
+          taskPromptSendId: plan.start.kind === "sendMessage" ? plan.start.sendId : undefined,
           taskTrunkBranch: trunkBranch,
           taskModelString: plan.taskModelString,
           taskThinkingLevel: plan.effectiveThinkingLevel,
           taskAiPins: plan.taskAiPins ?? {},
           taskOnRefusal: plan.onRefusal,
-          taskExperiments: withLegacyPtcExclusiveMirror(plan.experiments),
           taskIsolation: plan.sharedWorkspacePath != null ? "none" : undefined,
           taskAttentionPolicy: plan.attentionPolicy,
           taskDesktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId,
@@ -6743,12 +7428,14 @@ export class TaskService implements AgentTaskIntegration {
                 return;
               }
               ws.taskStatus = "interrupted";
+              markChildGoalPauseOwed(ws);
               ws.taskLaunchError = message;
               transitioned = true;
             },
             { allowMissing: true }
           );
           if (transitioned) this.recordTaskInterrupted(plan.taskId, plan.parentWorkspaceId);
+          if (transitioned) await this.settleChildGoalPause(plan.taskId);
           // A row another writer re-admitted: its waiters belong to that attempt (see above).
           if (!superseded) this.rejectWaiters(plan.taskId, new Error(message));
           await this.emitWorkspaceMetadata(plan.taskId);
@@ -6839,8 +7526,30 @@ export class TaskService implements AgentTaskIntegration {
     assert(projectPath.length > 0, "cleanupMaterializedTaskWorkspace requires projectPath");
     assert(workspaceName.length > 0, "cleanupMaterializedTaskWorkspace requires workspaceName");
     assert(taskId.length > 0, "cleanupMaterializedTaskWorkspace requires taskId");
-    const row = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace;
-    if (this.ownedAttemptSuperseded(taskId, row)) {
+    let row: WorkspaceConfigEntry | undefined;
+    try {
+      // Strict: a lenient read of an unreadable or invalid config.json is empty, and the missing
+      // row below would delete a registered task's checkout. Unprovable absence retains.
+      row = findWorkspaceEntry(
+        this.config.loadConfigOrDefault({ throwOnError: true }),
+        taskId
+      )?.workspace;
+    } catch (error) {
+      log.error("Task launch cleanup: config unreadable; retaining the checkout and session", {
+        taskId,
+        error: getErrorMessage(error),
+      });
+      return;
+    }
+    // Only a published row can name a successor attempt. A missing row was unpublished by a
+    // removal and no writer re-admits a row that no longer exists, so its checkout is the
+    // removal's: delete it. Counting a missing row as superseded leaked the checkout a fork made
+    // while the removal ran. A row a removal only marked
+    // (pendingRemoval) is still retained below: a removal can abort and release its marker while
+    // the delete runs, and another backend could then reawaken the row. No live removal can mark
+    // the row while a launch prepares it (the launch lease, see startReservedAgentTask), so such
+    // a marker is a leftover the next removal retakes, and that removal deletes the checkout.
+    if (row != null && this.ownedAttemptSuperseded(taskId, row)) {
       log.info("Task launch cleanup skipped: the record was re-admitted by another writer", {
         taskId,
       });
@@ -6855,6 +7564,25 @@ export class TaskService implements AgentTaskIntegration {
     // checkout is reclaimed only after its row is unpublished: reclaimUnsanitizedTaskCheckout.)
     if (row != null) {
       log.info("Task launch cleanup: retaining the published task's checkout and session", {
+        taskId,
+      });
+      return;
+    }
+    // The normalized view is lossy (buckets that normalize to one path collapse, invalid entries
+    // vanish), so absence from it alone never authorizes the delete: the raw persisted ids must
+    // lack the task too, and an unreadable raw config retains.
+    let persistedIds: Set<string>;
+    try {
+      persistedIds = this.config.readPersistedWorkspaceIdSuperset();
+    } catch (error: unknown) {
+      log.error("Task launch cleanup: raw config unreadable; retaining the checkout and session", {
+        taskId,
+        error: getErrorMessage(error),
+      });
+      return;
+    }
+    if (persistedIds.has(taskId)) {
+      log.info("Task launch cleanup: the raw config still lists the task; retaining its checkout", {
         taskId,
       });
       return;
@@ -6968,6 +7696,9 @@ export class TaskService implements AgentTaskIntegration {
 
     const forkedRuntimeConfig = workspace.runtimeConfig ?? plan.taskRuntimeConfig;
     const runtimeForTaskWorkspace = createRuntimeForWorkspace({
+      // The task's id, as on the fork paths: a devcontainer recreated after a crash gets the
+      // workspace's scratch mount only when the runtime knows whose workspace it is.
+      id: plan.taskId,
       runtimeConfig: forkedRuntimeConfig,
       projectPath: plan.parentMeta.projectPath,
       name: plan.workspaceName,
@@ -7009,13 +7740,42 @@ export class TaskService implements AgentTaskIntegration {
     return await run;
   }
 
+  /**
+   * The gate before reusing or forking the task's checkout: only this plan's own `starting` row.
+   * A row another writer re-admitted under a new attempt is that writer's to prepare (the
+   * gate used to check only the status, so two launches could prepare one checkout). A row a
+   * removal marked is refused (throws, as the admission would): with the launch lease held no
+   * live removal can have marked it, so this is a marker a crashed or failed removal left behind,
+   * and the launch must not fork a checkout under it.
+   */
+  private mayMaterializeTaskWorkspace(
+    plan: TaskLaunchPlan,
+    row: WorkspaceConfigEntry | undefined
+  ): boolean {
+    if (row?.taskStatus !== "starting" || this.launchSuperseded(plan, row)) return false;
+    if (row.pendingRemoval != null) {
+      throw new Error(pendingRemovalAdmissionMessage(row.pendingRemoval));
+    }
+    return true;
+  }
+
+  /**
+   * The launch's own row, read strictly (#5527). A lenient read of an unreadable config.json is
+   * empty, which reads as a removed row: the launch would return without settling and leave the
+   * row `starting` (holding its task slot) until a restart. The throw reaches
+   * scheduleReservedTaskLaunch, which marks the launch failed.
+   */
+  private readLaunchRow(taskId: string): ReturnType<typeof findWorkspaceEntry> {
+    return findWorkspaceEntry(this.config.loadConfigOrDefault({ throwOnError: true }), taskId);
+  }
+
   private async materializeReservedTaskWorkspace(
     plan: TaskLaunchPlan,
     sourceRuntime: Runtime,
     initLogger: InitLogger
   ): Promise<MaterializedTaskLaunch | null> {
-    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId);
-    if (entry?.workspace.taskStatus !== "starting") {
+    const entry = this.readLaunchRow(plan.taskId);
+    if (entry == null || !this.mayMaterializeTaskWorkspace(plan, entry.workspace)) {
       return null;
     }
 
@@ -7034,8 +7794,8 @@ export class TaskService implements AgentTaskIntegration {
 
     const projectPath = stripTrailingSlashes(plan.parentMeta.projectPath);
     return await this.runProjectForkExclusive(projectPath, async () => {
-      const entryBeforeFork = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId);
-      if (entryBeforeFork?.workspace.taskStatus !== "starting") {
+      const entryBeforeFork = this.readLaunchRow(plan.taskId);
+      if (!this.mayMaterializeTaskWorkspace(plan, entryBeforeFork?.workspace)) {
         return null;
       }
 
@@ -7044,6 +7804,7 @@ export class TaskService implements AgentTaskIntegration {
         projectPath: plan.parentMeta.projectPath,
         sourceWorkspaceName: plan.parentMeta.name,
         newWorkspaceName: plan.workspaceName,
+        newWorkspaceId: plan.taskId,
         initLogger,
         config: this.config,
         sourceWorkspaceId: plan.parentWorkspaceId,
@@ -7165,6 +7926,7 @@ export class TaskService implements AgentTaskIntegration {
           transitionedToInterrupted = ws.taskStatus !== "interrupted";
           parentWorkspaceId = ws.parentWorkspaceId;
           ws.taskStatus = "interrupted";
+          markChildGoalPauseOwed(ws);
           ws.taskLaunchError = message;
           // Survives a restart: the in-memory record alone is lost with the process (#4674).
           if (this.initStateManager.getUnsanitizedCheckoutError(taskId)) {
@@ -7193,6 +7955,7 @@ export class TaskService implements AgentTaskIntegration {
     if (transitionedToInterrupted) {
       this.recordTaskInterrupted(taskId, parentWorkspaceId);
     }
+    await this.settleChildGoalPause(taskId);
     // Launch evidence on top of the shared boundary (attemptCannotStillReport): this launch's own
     // fence never admitted its send, which the boundary alone cannot see once a send's obligation
     // was discharged.
@@ -7218,14 +7981,50 @@ export class TaskService implements AgentTaskIntegration {
     this.scheduleMaybeStartQueuedTasks();
   }
 
+  /**
+   * The launch holds a "launch" use lease on the task's workspace until it settles.
+   * The reservation (createMany, or the queue drain's CAS) takes
+   * it before the row becomes `starting` and hands it over in the plan; a plan without one
+   * takes it here. Each side publishes, then checks the other (see WorkspaceUseLeases): a removal
+   * (or another structural mutator) publishes its gate, then refuses this lease, in this process
+   * or another; the launch publishes the lease, then refuses a live gate. So a removal never
+   * marks the row and deletes the checkout while the launch can still fork it back, and the
+   * launch never needs to delete under another process's marker (the removal can abort and
+   * release it mid-delete). Since a `starting` row's lease is published before the row is, another
+   * backend's startup recovery, which reads the rows and then skips any with a live foreign
+   * lease, never requeues (and relaunches) a task being prepared.
+   */
   private async startReservedAgentTask(plan: TaskLaunchPlan): Promise<void> {
     assert(plan.taskId.length > 0, "startReservedAgentTask requires taskId");
+    let lease = plan.launchLease;
+    plan.launchLease = undefined;
+    if (lease == null) {
+      try {
+        lease = await workspaceUseLeasesFor(this.config).hold(plan.taskId, "launch");
+      } catch (error) {
+        if (!(error instanceof WorkspaceMutationInProgressError)) throw error;
+        // A removal, archive or rename of the task is running: the launch refuses before it
+        // touches anything, and fails its reservation as the admission would (a row it no longer
+        // owns as `starting` is left alone).
+        const row = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId)?.workspace;
+        if (row?.taskStatus === "starting" && !this.launchSuperseded(plan, row)) throw error;
+        return;
+      }
+    }
+    try {
+      await this.startReservedAgentTaskLeased(plan);
+    } finally {
+      await releaseLaunchLease(plan.taskId, lease);
+    }
+  }
+
+  private async startReservedAgentTaskLeased(plan: TaskLaunchPlan): Promise<void> {
     assert(plan.parentWorkspaceId.length > 0, "startReservedAgentTask requires parentWorkspaceId");
     if (plan.start.kind === "sendMessage") {
       assert(plan.start.prompt.length > 0, "startReservedAgentTask requires prompt");
     }
 
-    const entryAtStart = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId);
+    const entryAtStart = this.readLaunchRow(plan.taskId);
     if (entryAtStart?.workspace.taskStatus !== "starting") {
       return;
     }
@@ -7351,6 +8150,18 @@ export class TaskService implements AgentTaskIntegration {
 
     // Track reuse explicitly: owner-derived paths can change during launch, so equality is unsafe.
     const sharesParentCheckout = taskWasShared && materialized.reusedExistingCheckout;
+    // The row reads between the fork and the sanitize step. A throw fails the launch, which
+    // leaves the task resumable: first quarantine a checkout the sanitize step has not run in
+    // (#4674: sends and MCP refuse it), then end the init so init waiters don't hang.
+    const readLaunchRowBeforeSanitize = () => {
+      try {
+        return this.readLaunchRow(plan.taskId);
+      } catch (error) {
+        if (!sharesParentCheckout) this.initStateManager.markCheckoutUnsanitized(plan.taskId);
+        initLogger.logComplete(-1);
+        throw error;
+      }
+    };
     const cancelMaterializedLaunch = () =>
       this.cancelReservedLaunch(plan, initLogger, {
         runtime: materialized.runtimeForTaskWorkspace,
@@ -7361,10 +8172,7 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
-    const entryAfterMaterialize = findWorkspaceEntry(
-      this.config.loadConfigOrDefault(),
-      plan.taskId
-    );
+    const entryAfterMaterialize = readLaunchRowBeforeSanitize();
     if (!entryAfterMaterialize) {
       initLogger.logComplete(-1);
       await this.cleanupMaterializedTaskWorkspace(
@@ -7435,7 +8243,7 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
-    const entryBeforeSend = findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId);
+    const entryBeforeSend = readLaunchRowBeforeSanitize();
     if (!entryBeforeSend) {
       initLogger.logComplete(-1);
       await this.cleanupMaterializedTaskWorkspace(
@@ -7510,6 +8318,58 @@ export class TaskService implements AgentTaskIntegration {
       const secrets = await secretsToRecord(
         this.secretsStore.getEffectiveSecrets(plan.parentMeta.projectPath)
       );
+      // The sanitize and secrets awaits above leave a window in which the parent can cancel this
+      // launch, the user can Stop the task, or a removal can mark it. Nothing aborts an init
+      // started after that: a cancel and a Stop never do, and a removal aborts only the init
+      // already running at its mark. So recheck all four right before starting the init (the
+      // abort signal alone misses the Stop and the removal).
+      if (plan.abortSignal?.aborted) {
+        await cancelMaterializedLaunch();
+        return;
+      }
+      let entryBeforeInit: ReturnType<typeof findWorkspaceEntry>;
+      try {
+        // Strict: an unreadable config.json must not read as a removed row, or the launch would
+        // return without settling and leave the row `starting`. The throw reaches
+        // scheduleReservedTaskLaunch, which marks the launch failed.
+        entryBeforeInit = findWorkspaceEntry(
+          this.config.loadConfigOrDefault({ throwOnError: true }),
+          plan.taskId
+        );
+      } catch (error) {
+        initLogger.logComplete(-1);
+        throw error;
+      }
+      if (!entryBeforeInit) {
+        initLogger.logComplete(-1);
+        await this.cleanupMaterializedTaskWorkspace(
+          runtimeForTaskWorkspace,
+          plan.parentMeta.projectPath,
+          plan.workspaceName,
+          plan.taskId,
+          { preservePhysicalWorkspace: sharesParentCheckout }
+        );
+        return;
+      }
+      if (
+        entryBeforeInit.workspace.taskStatus !== "starting" ||
+        this.launchSuperseded(plan, entryBeforeInit.workspace)
+      ) {
+        initLogger.logComplete(-1);
+        return;
+      }
+      if (entryBeforeInit.workspace.pendingRemoval != null) {
+        // As the admission below would refuse it: the removal owns the row and its checkout.
+        initLogger.logComplete(-1);
+        await this.cleanupMaterializedTaskWorkspace(
+          runtimeForTaskWorkspace,
+          plan.parentMeta.projectPath,
+          plan.workspaceName,
+          plan.taskId,
+          { preservePhysicalWorkspace: sharesParentCheckout }
+        );
+        throw new Error(pendingRemovalAdmissionMessage(entryBeforeInit.workspace.pendingRemoval));
+      }
       // Registered (not just fired) with the host's abort-and-settlement mechanism:
       // a model-driven archive of this task workspace must be able to cancel the init and
       // must wait for the hook process's actual exit before snapshot capture, checkout
@@ -7546,7 +8406,6 @@ export class TaskService implements AgentTaskIntegration {
       // Inherited pro mode: the send path re-gates per model/route, so this is
       // inert for non-GPT-5.6 task models.
       reasoningMode: plan.effectiveReasoningMode,
-      experiments: plan.experiments,
     };
     // Linearization point: cancellation observed here guarantees "never launched"; past the
     // admission below only a Stop (Layer 2) ends the execution.
@@ -7588,6 +8447,22 @@ export class TaskService implements AgentTaskIntegration {
             agentInitiated: true,
             turnAdmission: admission.token,
             admissionStale: () => admission.token.admissionStale(),
+            // The row that accepts the brief carries its id: only that row, never this
+            // send's result or callbacks, proves the brief reached history. A send can make its
+            // rows durable and still return Err (a Stop makes its admission stale), and a Stop can
+            // land after an Ok before `running`; both keep taskPrompt. Minted for this launch
+            // and never offered before, so the publication skips the history read.
+            sendIdentities: [
+              {
+                ...taskBriefSendIdentity(plan.start.prompt, plan.start.sendId),
+                unpublished: true,
+              },
+            ],
+            // On-send compaction would publish a compaction row, not the brief: the brief would
+            // become a follow-up dispatched later without its id, so a durable-then-Err follow-up
+            // could not be recognized and the brief would be sent twice. The brief runs as its
+            // own turn instead; mid-stream compaction still protects the context limit.
+            skipOnSendCompaction: true,
           })
         : await this.workspaceService.resumeStream(plan.taskId, startOptions, {
             acceptanceOrigin: "automatic",
@@ -7938,9 +8813,6 @@ export class TaskService implements AgentTaskIntegration {
           runtime,
           workspacePath: parentWorkspacePath,
           workspaceId: parentWorkspaceId,
-          includeAgentPlugins: this.workspaceService.isExperimentEnabled(
-            EXPERIMENT_IDS.AGENT_PLUGINS
-          ),
         },
       }));
     } catch (error) {
@@ -8016,6 +8888,8 @@ export class TaskService implements AgentTaskIntegration {
               title: args.title,
               createdAt,
               runtimeConfig: taskRuntimeConfig,
+              // New rows have no legacy plan to migrate (#5174).
+              remotePlanMigrated: true,
               aiSettings: {
                 model: canonicalModel,
                 thinkingLevel: effectiveThinkingLevel,
@@ -8037,7 +8911,6 @@ export class TaskService implements AgentTaskIntegration {
               taskThinkingLevel: effectiveThinkingLevel,
               taskAiPins,
               taskOnRefusal: args.onRefusal,
-              taskExperiments: withLegacyPtcExclusiveMirror(args.experiments),
               taskIsolation: useSharedWorkspace ? "none" : undefined,
               taskAttentionPolicy: args.attentionPolicy,
               taskDesktopOwnerWorkspaceId,
@@ -8160,6 +9033,7 @@ export class TaskService implements AgentTaskIntegration {
             transitionedToInterrupted = ws.taskStatus !== "interrupted";
             parentWorkspaceId = ws.parentWorkspaceId;
             ws.taskStatus = "interrupted";
+            markChildGoalPauseOwed(ws);
             ws.taskLaunchError = message;
             // Survives a restart, like markTaskLaunchFailed (#4674).
             if (this.initStateManager.getUnsanitizedCheckoutError(taskId)) {
@@ -8236,6 +9110,7 @@ export class TaskService implements AgentTaskIntegration {
       if (transitionedToInterrupted) {
         this.recordTaskInterrupted(taskId, parentWorkspaceId);
       }
+      if (!superseded) await this.settleChildGoalPause(taskId);
       await this.emitWorkspaceMetadata(taskId);
     };
     const materialize = async () => {
@@ -8285,6 +9160,7 @@ export class TaskService implements AgentTaskIntegration {
           projectPath: parentMeta.projectPath,
           sourceWorkspaceName: parentMeta.name,
           newWorkspaceName: workspaceName,
+          newWorkspaceId: taskId,
           initLogger,
           config: this.config,
           sourceWorkspaceId: parentWorkspaceId,
@@ -8372,6 +9248,8 @@ export class TaskService implements AgentTaskIntegration {
           title: args.title,
           createdAt,
           runtimeConfig: forkedRuntimeConfig,
+          // New rows have no legacy plan to migrate (#5174).
+          remotePlanMigrated: true,
           aiSettings: {
             model: canonicalModel,
             thinkingLevel: effectiveThinkingLevel,
@@ -8393,7 +9271,6 @@ export class TaskService implements AgentTaskIntegration {
           taskThinkingLevel: effectiveThinkingLevel,
           taskAiPins,
           taskOnRefusal: args.onRefusal,
-          taskExperiments: withLegacyPtcExclusiveMirror(args.experiments),
           taskIsolation: useSharedWorkspace ? "none" : undefined,
           taskAttentionPolicy: args.attentionPolicy,
           taskDesktopOwnerWorkspaceId,
@@ -8529,7 +9406,6 @@ export class TaskService implements AgentTaskIntegration {
                 agentId,
                 thinkingLevel: effectiveThinkingLevel,
                 reasoningMode: effectiveReasoningMode,
-                experiments: args.experiments,
               },
               {
                 acceptanceOrigin: "automatic",
@@ -8631,7 +9507,12 @@ export class TaskService implements AgentTaskIntegration {
   private async reactivateInactiveAgentTask(params: {
     ancestorWorkspaceId: string;
     taskId: string;
-    buildPrompt: (refreshed: { workspace: WorkspaceConfigEntry }) => string;
+    message: string;
+    /**
+     * A stopped queued child keeps its only copy of the initial brief in taskPrompt: the message
+     * follows that brief in the reactivation prompt.
+     */
+    prependKeptBrief?: true;
     queueDispatchMode: TaskMessageQueueDispatchMode;
     preTurnMessages?: MuxMessage[];
     sendMessage?: WorkspaceTurnHost["sendMessage"];
@@ -8640,11 +9521,27 @@ export class TaskService implements AgentTaskIntegration {
      * and pins (new-style children). Absent (bash-monitor wakes) keeps the frozen path.
      */
     aiRefresh?: { prepared: PreparedReawakenAi | undefined };
+    /**
+     * captureReawakeningStopFence(taskId), taken when the caller's decision began; null when a
+     * Stop overlapping the reawakening does not invalidate it (bash-monitor wakes).
+     */
+    stopFence: ReadonlyMap<string, number> | null;
   }): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
     const { ancestorWorkspaceId, taskId } = params;
+    assert(
+      params.stopFence?.has(taskId) ?? true,
+      "reactivateInactiveAgentTask: stopFence must cover the task"
+    );
+    // Read in the caller's decision tick (no await since its inactive check, for ancestor sends).
+    const entryAtDecision = findWorkspaceEntry(
+      this.config.loadConfigOrDefault(),
+      taskId
+    )?.workspace;
+    // The status this reawakening decided on; the identity CAS below refuses a resume's flip of
+    // it to `running`.
+    const statusAtDecision = entryAtDecision?.taskStatus;
     // Before the unarchive, which can restore a checkout the removing backend is deleting (#4478).
-    const marker = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace
-      .pendingRemoval;
+    const marker = entryAtDecision?.pendingRemoval;
     if (marker != null) {
       return Err({ code: "send_failed" as const, message: pendingRemovalAdmissionMessage(marker) });
     }
@@ -8673,10 +9570,7 @@ export class TaskService implements AgentTaskIntegration {
       if (planEntry == null) {
         return Err({ code: "not_found" as const });
       }
-      const contextKey = buildReawakenContextKey(
-        planEntry,
-        this.workspaceService.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS)
-      );
+      const contextKey = buildReawakenContextKey(planEntry);
       const plan = planReawakenAi({
         config: planConfig,
         taskId,
@@ -8720,6 +9614,18 @@ export class TaskService implements AgentTaskIntegration {
     // whatever createWorkspaceTurn returns or throws (P3: never roll an id back) — a refused
     // reactivation leaves an owned, unsettled attempt that a later Stop settles.
     const previousAttemptId = refreshedEntry.workspace.taskAttemptId;
+    // A prepended brief gets a fresh brief send id, stored with the attempt commit before the
+    // send (#5544). The send can make its row durable and still return Err, which keeps
+    // taskPrompt; the launch's id is on no row, so only this id lets the next reawakening's
+    // lookup (dropKeptTaskPromptAlreadyInHistory) recognize the row and not prepend it again.
+    const keptBrief =
+      params.prependKeptBrief === true
+        ? coerceNonEmptyString(refreshedEntry.workspace.taskPrompt)
+        : undefined;
+    const briefSendId = keptBrief != null ? mintTaskBriefSendId() : undefined;
+    // The terminated attempt's goal stays paused across reactivation (also covers a set_goal that
+    // raced the termination); a failed pause leaves taskGoalPauseOwed fencing goal turns.
+    await this.settleChildGoalPause(taskId, { force: true });
     const lineage = await this.evaluateAttemptLineage(taskId, refreshedEntry.workspace);
     const reactivationAttemptId = newTaskAttemptId();
     let committedProven = false;
@@ -8738,17 +9644,41 @@ export class TaskService implements AgentTaskIntegration {
           message: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
         });
       }
+      // A Stop of the task or an ancestor that ran to completion during the awaits above: the
+      // cascade found nothing live on the idle child and already released its latch, so only the
+      // epochs show it. The reawakening must lose.
+      if (params.stopFence != null && this.reawakeningOvertakenByStop(params.stopFence)) {
+        log.debug("Sub-agent reactivation refused: overtaken by a stop", { taskId });
+        return Err({ code: "send_failed" as const, message: SEND_ADMISSION_STALE_MESSAGE });
+      }
+      // A manual resume (reawakenInterruptedTask, which holds neither the event nor the tree
+      // lock) may have published and started its own attempt since the caller found the child
+      // inactive: rotating it would supersede that live turn and drop its report.
+      if (this.hasLiveReawakening(taskId)) {
+        return Err({
+          code: "send_failed" as const,
+          message: TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE,
+        });
+      }
       await this.editWorkspaceEntry(
         taskId,
         (ws) => {
           if (
             ws.taskAttemptRetiredBy != null ||
             ws.pendingRemoval != null ||
-            ws.taskAttemptId !== previousAttemptId
+            ws.taskAttemptId !== previousAttemptId ||
+            // A manual resume flips `interrupted` to `running` with its own fresh id, possibly
+            // before the refresh above read the id. Only that flip refuses: the unarchive above
+            // may itself settle a legacy shared-desktop child's stale `running` to `interrupted`.
+            (ws.taskStatus === "running" && statusAtDecision !== "running")
           ) {
             return;
           }
           ws.taskAttemptId = reactivationAttemptId;
+          // Only the brief this reactivation prepends: a rewrite since the read is its writer's.
+          if (briefSendId != null && ws.taskPrompt === refreshedEntry.workspace.taskPrompt) {
+            ws.taskPromptSendId = briefSendId;
+          }
           committedProven = lineage.proven && ws.taskAttemptUnproven !== true;
           if (!committedProven) ws.taskAttemptUnproven = true;
           published = true;
@@ -8794,24 +9724,40 @@ export class TaskService implements AgentTaskIntegration {
         attemptId: reactivationAttemptId,
         receiptEligible: committedProven,
       });
+      // Live until createWorkspaceTurn returns; its send's admission is the evidence after that.
+      this.reawakeningsInFlight.set(taskId, reactivationAttemptId);
     }
-    const execution = await this.getWorkspaceTurnManager().createWorkspaceTurn({
-      ownerWorkspaceId: ancestorWorkspaceId,
-      prompt: params.buildPrompt(refreshedEntry),
-      title:
-        coerceNonEmptyString(refreshedEntry.workspace.title) ??
-        coerceNonEmptyString(refreshedEntry.workspace.name) ??
-        "Sub-agent",
-      workspace: {
-        mode: "existing",
-        workspaceId: taskId,
-        queueDispatchMode: params.queueDispatchMode,
-      },
-      allowAgentWorkspace: true,
-      attentionPolicy: "notify_on_terminal",
-      ...(params.sendMessage != null ? { sendMessage: params.sendMessage } : {}),
-      ...(agentTaskAi != null ? { agentTaskAi } : {}),
-    });
+    let execution: Awaited<ReturnType<WorkspaceTurnManager["createWorkspaceTurn"]>>;
+    try {
+      execution = await this.getWorkspaceTurnManager().createWorkspaceTurn({
+        ownerWorkspaceId: ancestorWorkspaceId,
+        prompt: keptBrief != null ? `${keptBrief}\n\n${params.message}` : params.message,
+        title:
+          coerceNonEmptyString(refreshedEntry.workspace.title) ??
+          coerceNonEmptyString(refreshedEntry.workspace.name) ??
+          "Sub-agent",
+        workspace: {
+          mode: "existing",
+          workspaceId: taskId,
+          queueDispatchMode: params.queueDispatchMode,
+        },
+        allowAgentWorkspace: true,
+        attentionPolicy: "notify_on_terminal",
+        ...(params.sendMessage != null ? { sendMessage: params.sendMessage } : {}),
+        ...(agentTaskAi != null ? { agentTaskAi } : {}),
+        ...(keptBrief != null && briefSendId != null
+          ? {
+              sendIdentities: [
+                { ...taskBriefSendIdentity(keptBrief, briefSendId), unpublished: true },
+              ],
+            }
+          : {}),
+      });
+    } finally {
+      if (this.reawakeningsInFlight.get(taskId) === reactivationAttemptId) {
+        this.reawakeningsInFlight.delete(taskId);
+      }
+    }
     if (!execution.success) {
       // The fresh attempt is already published (config and memory) and stays: it reads as an
       // owned, unsettled attempt (indeterminate) until a Stop settles it. Restoring the retired
@@ -8853,11 +9799,8 @@ export class TaskService implements AgentTaskIntegration {
     if (workspace.runtimeConfig == null || workspaceName == null) {
       return undefined;
     }
-    const includeAgentPlugins = this.workspaceService.isExperimentEnabled(
-      EXPERIMENT_IDS.AGENT_PLUGINS
-    );
     const agentId = resolveTaskAgentIdForResume(workspace);
-    const contextKey = buildReawakenContextKey(entry, includeAgentPlugins);
+    const contextKey = buildReawakenContextKey(entry);
     let context: ReturnType<typeof buildWorkspaceAgentContext>;
     try {
       context = buildWorkspaceAgentContext({
@@ -8866,7 +9809,6 @@ export class TaskService implements AgentTaskIntegration {
         workspaceName,
         persistedWorkspacePath: workspace.path,
         subProjectPath: workspace.subProjectPath,
-        includeAgentPlugins,
       });
     } catch (error) {
       log.debug("prepareReawakenAi: definition context unavailable", {
@@ -8881,7 +9823,6 @@ export class TaskService implements AgentTaskIntegration {
         runtime: context.runtime,
         workspacePath: context.workspacePath,
         workspaceId: taskId,
-        includeAgentPlugins,
       },
       { abortSignal: AbortSignal.timeout(REAWAKEN_DEFINITION_READ_TIMEOUT_MS) }
     );
@@ -8930,9 +9871,16 @@ export class TaskService implements AgentTaskIntegration {
       const result = await this.reactivateInactiveAgentTask({
         ancestorWorkspaceId: parentWorkspaceId,
         taskId: workspaceId,
-        buildPrompt: () => prompt,
+        message: prompt,
         queueDispatchMode: "tool-end",
         sendMessage: send,
+        // No Stop fence (unlike task_send_message): the wake is the child's own monitor
+        // output, not a turn of the stopped tree. A user's tree Stop retires the attention a
+        // descendant owed when the cascade latched it (#5377), and new monitor input stays
+        // automatic after a Stop (AgentSession.isAutomaticSendBlocked), so a wake overlapping a
+        // Stop is the wake-after-Stop order. The wake dispatcher retries a wake refused during
+        // a Stop instead of sending it plainly.
+        stopFence: null,
       });
       if (result.success) {
         return Ok(undefined);
@@ -8962,6 +9910,9 @@ export class TaskService implements AgentTaskIntegration {
     sender: "ancestor" | "sibling",
     options?: TrustedDescendantMessageOptions
   ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
+    // Before the first await: a Stop of the child or any ancestor (the sender's included) that
+    // lands while this send is suspended overtakes a reawakening it decides on.
+    const stopFence = this.captureReawakeningStopFence(taskId);
     const messageLabel = options?.messageLabel ?? "Updated guidance from parent";
     // Keep the labeled message explicit in the child transcript so it cannot be confused
     // with the original brief, whoever the sender is.
@@ -9017,6 +9968,8 @@ export class TaskService implements AgentTaskIntegration {
       }
       await this.editWorkspaceEntry(taskId, (workspace) => {
         workspace.taskPrompt = `${initialPrompt}\n\n${labeledMessage}`;
+        // No send carried this prompt; its launch mints its own id.
+        workspace.taskPromptSendId = undefined;
       });
       return Ok({ delivery: "queued" as const });
     })();
@@ -9046,6 +9999,10 @@ export class TaskService implements AgentTaskIntegration {
     // workspaceEventLocks). The reverse nesting deadlocked against reported-task cleanup.
     return this.workspaceEventLocks.withLock(taskId, async () =>
       this.withTaskTreeLifecycleLock(taskId, async () => {
+        // A brief history already holds is not prepended again on reawakening; the
+        // reactivation reads the kept brief from the row after this. Awaited before the row read
+        // below, so the inactive decision and reactivateInactiveAgentTask see the same row.
+        await this.dropKeptTaskPromptAlreadyInHistory(taskId);
         const cfg = this.config.loadConfigOrDefault();
         const entry = findWorkspaceEntry(cfg, taskId);
         if (!entry) {
@@ -9082,17 +10039,12 @@ export class TaskService implements AgentTaskIntegration {
           return this.reactivateInactiveAgentTask({
             ancestorWorkspaceId,
             taskId,
-            // A stopped queued child keeps its only copy of the initial brief in taskPrompt;
-            // the guidance follows that brief in the reactivation prompt.
-            buildPrompt: (refreshed) => {
-              const preservedQueuedPrompt = coerceNonEmptyString(refreshed.workspace.taskPrompt);
-              return preservedQueuedPrompt
-                ? `${preservedQueuedPrompt}\n\n${labeledMessage}`
-                : labeledMessage;
-            },
+            message: labeledMessage,
+            prependKeptBrief: true,
             queueDispatchMode,
             preTurnMessages: options?.preTurnMessages,
             ...(sender === "ancestor" ? { aiRefresh: { prepared: preparedReawakenAi } } : {}),
+            stopFence,
           });
         }
 
@@ -9185,7 +10137,7 @@ export class TaskService implements AgentTaskIntegration {
             agentId: activeAgentId,
             thinkingLevel: activeAiSettings?.thinkingLevel ?? entry.workspace.taskThinkingLevel,
             reasoningMode: coerceOpenAIReasoningMode(activeAiSettings?.reasoningMode),
-            experiments: entry.workspace.taskExperiments,
+            serviceTier: ServiceTierSchema.safeParse(activeAiSettings?.serviceTier).data,
             queueDispatchMode,
             ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
           },
@@ -9297,7 +10249,7 @@ export class TaskService implements AgentTaskIntegration {
     senderWorkspaceId: string,
     targetId: string,
     message: string,
-    queueDispatchMode?: TaskMessageQueueDispatchMode
+    queueDispatchMode: TaskMessageQueueDispatchMode = "tool-end"
   ): Promise<
     Result<
       SendAgentTaskMessageResult & { relation: AgentTreeTargetRelation },
@@ -9314,13 +10266,15 @@ export class TaskService implements AgentTaskIntegration {
 
     const cfg = this.config.loadConfigOrDefault();
     const relation = this.resolveAgentTreeTargetRelation(
+      cfg,
       this.buildAgentTaskIndex(cfg).parentById,
       senderWorkspaceId,
       targetId
     );
     if (relation == null) {
-      // Self-sends are out of scope; cross-tree targets take the untrusted peer path.
-      return Err({ code: "invalid_scope" as const });
+      // Private side chats must look like unknown IDs to anyone outside their direct link.
+      // Only self-sends reveal an invalid scope; discovery does not advertise private chats.
+      return Err({ code: senderWorkspaceId === targetId ? "invalid_scope" : "not_found" });
     }
 
     if (relation === "target_descendant") {
@@ -9329,7 +10283,7 @@ export class TaskService implements AgentTaskIntegration {
         senderWorkspaceId,
         targetId,
         message,
-        queueDispatchMode: queueDispatchMode ?? "tool-end",
+        queueDispatchMode,
       });
       return result.success ? Ok({ ...result.data, relation }) : result;
     }
@@ -9532,14 +10486,14 @@ export class TaskService implements AgentTaskIntegration {
    * throttles, so both routes must also hold one lock from admission through dispatch: with
    * separate locks a family
    * send admitted while a peer send was in flight passed the same rate slot, duplicate check and
-   * queue position (formal/peer-limits, MC_cross_route). The broker's delivery lock is the one
+   * queue position. The broker's delivery lock is the one
    * the family route holds; it is taken before the event lock, the family route's nesting (its
    * sibling dispatch takes the event lock inside it).
    * The resulting per-target FIFO is intended (#5334): a family send to a target, including
    * task_message_parent, waits behind an in-flight task_send_message to that target, and the
    * reverse, for as long as that send's admission and dispatch take. The wait is what lets the
    * later send see the earlier one's rate slot, duplicate entry and queue position. The
-   * cross-route tests in taskService.peerLimitsFormalRepro.test.ts pin it for
+   * cross-route tests in taskService.peerLimitsRepro.test.ts pin it for
    * task_message_sibling behind task_send_message: the family send must not be admitted before
    * the peer send's delivery is recorded. task_message_parent takes the same lock.
    */
@@ -9626,7 +10580,7 @@ export class TaskService implements AgentTaskIntegration {
 
       // Re-verify under the target's event lock: tree membership may have changed since routing.
       if (
-        this.resolveAgentTreeTargetRelation(index.parentById, senderWorkspaceId, targetId) !==
+        this.resolveAgentTreeTargetRelation(cfg, index.parentById, senderWorkspaceId, targetId) !==
         relation
       ) {
         return Err({ code: "invalid_scope" as const });
@@ -9655,8 +10609,8 @@ export class TaskService implements AgentTaskIntegration {
       // Preserve remote/container isolation without changing the existing same-tree policy.
       if (
         relation === "target_unrelated" &&
-        (!this.isLocalUnrelatedMessagingEndpoint(senderEntry.workspace) ||
-          !this.isLocalUnrelatedMessagingEndpoint(targetEntry.workspace))
+        (!this.isUnrelatedMessagingEndpoint(senderEntry.workspace) ||
+          !this.isUnrelatedMessagingEndpoint(targetEntry.workspace))
       ) {
         return Err(unrelatedRuntimeRefusal);
       }
@@ -9668,21 +10622,7 @@ export class TaskService implements AgentTaskIntegration {
         code: "refused" as const,
         reason: "Sender is no longer active; terminal or archived tasks cannot send peer messages.",
       };
-      const isInactivePeerSender = (workspace: WorkspaceConfigEntry): boolean => {
-        // Unrelated roots can send here too; archive must win before the root lifecycle shortcut.
-        if (isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) return true;
-        if (coerceNonEmptyString(workspace.parentWorkspaceId) == null) {
-          // Root workspaces have no task lifecycle to go terminal.
-          return false;
-        }
-        const status = workspace.taskStatus ?? "running";
-        return (
-          !this.hasLiveRunningExecution(workspace, senderWorkspaceId) &&
-          status !== "running" &&
-          status !== "awaiting_report"
-        );
-      };
-      if (isInactivePeerSender(senderEntry.workspace)) {
+      if (this.isInactivePeerMessagingEndpoint(senderEntry.workspace, senderWorkspaceId)) {
         return Err(senderInactiveRefusal);
       }
 
@@ -9711,15 +10651,15 @@ export class TaskService implements AgentTaskIntegration {
         });
       }
 
-      const legacyArchived = isWorkspaceArchived(
-        targetEntry.workspace.archivedAt,
-        targetEntry.workspace.unarchivedAt
-      );
-      if (legacyArchived) {
+      const targetUnavailable =
+        targetEntry.workspace.pendingRemoval != null ||
+        isWorkspaceArchived(targetEntry.workspace.archivedAt, targetEntry.workspace.unarchivedAt);
+      if (targetUnavailable) {
         return Err({
           code: "not_active" as const,
           taskStatus: targetEntry.workspace.taskStatus ?? "unknown",
-          message: "Target workspace is archived; only its parent can restore and reawaken it.",
+          message:
+            "Target workspace is archived or being removed; it cannot receive peer messages.",
         });
       }
 
@@ -9727,7 +10667,6 @@ export class TaskService implements AgentTaskIntegration {
       // queued prompts or reactivate terminal tasks without rerouting their report ownership.
       const targetIsAgentTask =
         coerceNonEmptyString(targetEntry.workspace.parentWorkspaceId) != null;
-      const unrelatedRoot = relation === "target_unrelated" && !targetIsAgentTask;
       // A root running a delegated workspace turn stays owner-only (#4997). Only the turn's OWNER
       // may CONTINUE it (correlation resolved below): the owner already steers the turn through
       // follow-ups. Any other sender, an opted-in unrelated root or a same-tree descendant, waits
@@ -9775,7 +10714,7 @@ export class TaskService implements AgentTaskIntegration {
         const live = this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId);
         // A send that resolved a correlation continues that turn only while it is registered:
         // once it settled (for example by a read of its handle, which does not take this lock),
-        // the correlation is stale and must not reach the session (finding F3).
+        // the correlation is stale and must not reach the session.
         if (live == null) {
           return delegatedTurnCorrelation != null && delegatedTurnCorrelation !== "unresolved"
             ? delegatedRootStartingRefusal
@@ -9991,7 +10930,7 @@ export class TaskService implements AgentTaskIntegration {
           : undefined;
       // Only its owner continues a root's delegated turn (#4997): a non-owner's message waits for
       // it, so it never needs the correlation, and must not carry it if the turn settles before
-      // the admission gates look again (finding F3). Reawakened agent-task children are continued
+      // the admission gates look again. Reawakened agent-task children are continued
       // by any peer.
       const workspaceTurnMuxMetadata =
         targetIsAgentTask || resolvedTurnMuxMetadata?.ownerWorkspaceId === senderWorkspaceId
@@ -10018,9 +10957,10 @@ export class TaskService implements AgentTaskIntegration {
           agentId: resumeOptions.agentId,
           thinkingLevel: resumeOptions.thinkingLevel,
           reasoningMode: resumeOptions.reasoningMode,
+          serviceTier: resumeOptions.serviceTier,
           muxMetadata: triggerMuxMetadata,
         };
-      } else if (unrelatedRoot || awaitedDelegatedTurn != null) {
+      } else if (!targetIsAgentTask || awaitedDelegatedTurn != null) {
         assert(!targetIsAgentTask);
         // Honor the recipient's selected identity (including plan), not the sender's or an
         // older history row. Without a selection, the shared history → exec fallback applies.
@@ -10056,7 +10996,7 @@ export class TaskService implements AgentTaskIntegration {
           agentId: activeAgentId,
           thinkingLevel: activeAiSettings?.thinkingLevel ?? targetEntry.workspace.taskThinkingLevel,
           reasoningMode: coerceOpenAIReasoningMode(activeAiSettings?.reasoningMode),
-          experiments: targetEntry.workspace.taskExperiments,
+          serviceTier: ServiceTierSchema.safeParse(activeAiSettings?.serviceTier).data,
           muxMetadata: triggerMuxMetadata,
         };
       }
@@ -10121,7 +11061,7 @@ export class TaskService implements AgentTaskIntegration {
         if (
           freshSender == null ||
           senderChainInterrupted() ||
-          isInactivePeerSender(freshSender.workspace)
+          this.isInactivePeerMessagingEndpoint(freshSender.workspace, senderWorkspaceId)
         ) {
           admissionRefusal = senderInactiveRefusal;
           return true;
@@ -10129,6 +11069,19 @@ export class TaskService implements AgentTaskIntegration {
         const freshEntry = findWorkspaceEntry(freshCfg, targetId);
         if (freshEntry == null) {
           admissionRefusal = { code: "not_found" as const };
+          return true;
+        }
+        // A side-chat link authorizes only its own main chat, not a permanent cross-runtime
+        // grant. Recheck after preparation and again when queued input dispatches.
+        if (
+          this.resolveAgentTreeTargetRelation(
+            freshCfg,
+            this.buildAgentTaskIndex(freshCfg).parentById,
+            senderWorkspaceId,
+            targetId
+          ) !== relation
+        ) {
+          admissionRefusal = { code: "invalid_scope" as const };
           return true;
         }
         // An off/on cycle is a new grant, not permission to revive previously queued input.
@@ -10144,22 +11097,23 @@ export class TaskService implements AgentTaskIntegration {
         // Runtime can change during preparation or while queued; recheck both ends at dispatch.
         if (
           relation === "target_unrelated" &&
-          (!this.isLocalUnrelatedMessagingEndpoint(freshSender.workspace) ||
-            !this.isLocalUnrelatedMessagingEndpoint(freshEntry.workspace))
+          (!this.isUnrelatedMessagingEndpoint(freshSender.workspace) ||
+            !this.isUnrelatedMessagingEndpoint(freshEntry.workspace))
         ) {
           admissionRefusal = unrelatedRuntimeRefusal;
           return true;
         }
-        // Archive is reversible-only but stops delivery: a target archived after the initial
-        // check (archive does not synchronize with in-flight guarded sends) must refuse here
-        // rather than accept or queue a peer turn behind the archive boundary.
+        // Closing a side chat claims removal before tearing down its session; neither an
+        // in-flight reply nor queued input may wake it behind that discard/archive boundary.
         if (
+          freshEntry.workspace.pendingRemoval != null ||
           isWorkspaceArchived(freshEntry.workspace.archivedAt, freshEntry.workspace.unarchivedAt)
         ) {
           admissionRefusal = {
             code: "not_active" as const,
             taskStatus: freshEntry.workspace.taskStatus ?? "unknown",
-            message: "Target workspace is archived; only its parent can restore and reawaken it.",
+            message:
+              "Target workspace is archived or being removed; it cannot receive peer messages.",
           };
           return true;
         }
@@ -10199,7 +11153,7 @@ export class TaskService implements AgentTaskIntegration {
         // A user Stop since this attempt was admitted refuses it, even when the stop landed after
         // the refusing gate (the final gate awaits its rollback before onCanceled parks). The
         // Stop already dropped the parked list, and the flush takes a new target stop baseline,
-        // so a message parked now would run after the Stop once the user resumes (finding F1).
+        // so a message parked now would run after the Stop once the user resumes.
         if ((this.workspaceUserStopEpochs.get(targetId) ?? 0) !== capturedUserStopEpoch) {
           admissionRefusal = interruptedRefusal;
           return;
@@ -10337,6 +11291,7 @@ export class TaskService implements AgentTaskIntegration {
       Array<{ ownerWorkspaceId: string; handleId: string }>
     >();
     const latched: string[] = [];
+    const goalPausesOwed: string[] = [];
 
     // Phase A (global mutex, no stream/network awaits): see terminateAllDescendantAgentTasks.
     try {
@@ -10404,6 +11359,7 @@ export class TaskService implements AgentTaskIntegration {
           current.workspace.taskPendingGuidance?.map((entry) => entry.id)
         );
         let transitioned = false;
+        let interrupted = false;
         let parentWorkspaceId: string | undefined;
         await this.editWorkspaceEntry(
           id,
@@ -10415,7 +11371,8 @@ export class TaskService implements AgentTaskIntegration {
             );
             if (workspace.taskPendingGuidance?.length === 0) delete workspace.taskPendingGuidance;
             const mutation = this.applyInterruptedTaskStatus(workspace);
-            transitioned = mutation === "interrupted" && previousStatus !== "interrupted";
+            interrupted = mutation === "interrupted";
+            transitioned = interrupted && previousStatus !== "interrupted";
           },
           { allowMissing: true }
         );
@@ -10427,6 +11384,7 @@ export class TaskService implements AgentTaskIntegration {
             sourceId: id,
           });
         }
+        if (interrupted) goalPausesOwed.push(id);
         if (transitioned) {
           this.recordTaskInterrupted(id, parentWorkspaceId);
           this.rejectWaiters(id, new Error("Task stopped"));
@@ -10439,6 +11397,8 @@ export class TaskService implements AgentTaskIntegration {
         await this.finishSubtreeStopCleanup(latched, activeHandlesById);
       }
     }
+    // Unlocked: the explicit pause appends the child's goal-pause boundary row.
+    await this.settleChildGoalPauses(goalPausesOwed);
 
     for (const id of metadataToEmit) {
       await this.emitWorkspaceMetadata(id);
@@ -10563,6 +11523,8 @@ export class TaskService implements AgentTaskIntegration {
         });
       }
     }
+    // A workspace whose removal below fails or is skipped keeps a paused goal.
+    await this.settleChildGoalPauses(latched);
 
     // When a descendant workspace could not be removed, keep every ancestor of it
     // so the surviving child never points at removed parent metadata.
@@ -10693,6 +11655,15 @@ export class TaskService implements AgentTaskIntegration {
   private async sweepEndedWorkflowRunTasks(workflowRunId: string): Promise<void> {
     assert(workflowRunId.length > 0, "sweepEndedWorkflowRunTasks: workflowRunId must be non-empty");
 
+    // Confirm the run ended before pruning (#5398): the run-end hook also fires when the runner
+    // throws while the journal still says running (WorkflowRunner.run), and a pipeline's
+    // fail-fast interruptRun reaches this sweep mid-run. A later run end, or the startup sweep,
+    // prunes these children once the run is inactive.
+    if (await this.isWorkflowRunStillActive(workflowRunId)) {
+      log.debug("Skipping workflow task sweep: the run is still active", { workflowRunId });
+      return;
+    }
+
     // Phase 1: archive interrupted-without-report descendants of the run. Descendants of
     // run children (spawned by workflow-owned agents) are included via ancestry.
     {
@@ -10757,6 +11728,45 @@ export class TaskService implements AgentTaskIntegration {
         await this.archiveWorkflowTaskWorkspacesDeepestFirst([taskId], freshIndex);
       }
     }
+  }
+
+  /**
+   * False only when every parent workspace holding a task of the run shows the run ended: a
+   * terminal status, or no resumable run record (gone, another workspace's, or corrupt). One
+   * status-snapshot read per parent; an I/O error proves nothing, so the run counts as active.
+   */
+  private async isWorkflowRunStillActive(workflowRunId: string): Promise<boolean> {
+    const index = this.buildAgentTaskIndex(this.config.loadConfigOrDefault());
+    const parentWorkspaceIds = new Set<string>();
+    for (const workspace of index.byId.values()) {
+      const parentWorkspaceId = coerceNonEmptyString(workspace.parentWorkspaceId);
+      if (workspace.workflowTask?.runId === workflowRunId && parentWorkspaceId != null) {
+        parentWorkspaceIds.add(parentWorkspaceId);
+      }
+    }
+    for (const parentWorkspaceId of parentWorkspaceIds) {
+      const runStore = new WorkflowRunStore({
+        sessionDir: path.join(this.config.sessionsDir, parentWorkspaceId),
+      });
+      try {
+        const status = await runStore.getRunStatusForLiveness({
+          workspaceId: parentWorkspaceId,
+          runId: workflowRunId,
+        });
+        if (status != null && isActiveWorkflowRunStatus(status)) return true;
+      } catch (error: unknown) {
+        // A corrupt record (JSON/schema) can never be resumed, so it counts as ended
+        // (self-heal); an I/O error (EIO, EACCES) may hide an active run.
+        if (!isErrnoException(error)) continue;
+        log.warn("Workflow run status unreadable; leaving its tasks for a later sweep", {
+          workflowRunId,
+          parentWorkspaceId,
+          error: getErrorMessage(error),
+        });
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -10867,15 +11877,27 @@ export class TaskService implements AgentTaskIntegration {
    *
    * Legacy naming note: this method retains the original "terminate" name for
    * compatibility with existing call sites.
+   *
+   * `onStopsReleased`: once every latched descendant's Stop released (its settlement receipt is
+   * durable or failed) or the cleanup deadline passed, and before the archival and queue work
+   * below (which has no deadline). A workflow interrupt writes the run's "interrupted" status
+   * there (WorkflowService.interruptRunTree): a receipt still being written when the
+   * backend dies would leave the child indeterminate on every resume. Its error is rethrown
+   * after that work.
    */
   async terminateAllDescendantAgentTasks(
     workspaceId: string,
-    options?: { workflowRunId?: string }
+    options?: {
+      workflowRunId?: string;
+      onStopsReleased?: () => Promise<void>;
+      retireBashMonitorAttention?: (taskId: string) => void;
+    }
   ): Promise<string[]> {
     assert(
       workspaceId.length > 0,
       "terminateAllDescendantAgentTasks: workspaceId must be non-empty"
     );
+    const stopReleaseDeadlineMs = Date.now() + TASK_TERMINATION_STOP_STREAM_AGGREGATE_TIMEOUT_MS;
 
     const interruptedTaskIds: string[] = [];
     const latched: string[] = [];
@@ -10921,6 +11943,10 @@ export class TaskService implements AgentTaskIntegration {
       for (const id of descendants) {
         const record = this.beginWorkspaceStop(id);
         latched.push(id);
+        // Every latched descendant, a preserved completed report included (its continuation can
+        // be executing): synchronously here, so the retirement withdraws an in-flight wake and
+        // snapshots the attention owed now, while the latch already refuses new admissions.
+        options?.retireBashMonitorAttention?.(id);
         // A reawakened child's live continuation handle is an owner this record waits on; Phase B
         // must settle it explicitly (interruptCapturedExecution). Captured here, in the same
         // synchronous block as the record, so Phase B targets exactly the registration captured.
@@ -11001,6 +12027,15 @@ export class TaskService implements AgentTaskIntegration {
         });
       }
     }
+    let stopsReleasedError: { error: unknown } | undefined;
+    if (options?.onStopsReleased != null) {
+      await this.waitForWorkspaceStopsToRelease(latched, stopReleaseDeadlineMs);
+      await options.onStopsReleased().catch((error: unknown) => {
+        stopsReleasedError = { error };
+      });
+    }
+    // After Phase B (streams stopped, locks released): the explicit pause appends boundary rows.
+    await this.settleChildGoalPauses(interruptedTaskIds);
 
     for (const taskId of interruptedTaskIds) {
       await this.emitWorkspaceMetadata(taskId);
@@ -11008,9 +12043,9 @@ export class TaskService implements AgentTaskIntegration {
 
     if (options?.workflowRunId != null) {
       // Run-scoped interrupts arrive after the owning run's terminal status write
-      // (WorkflowService.interruptRun aborts the runner, persists "interrupted", THEN
-      // terminates descendants), so the children just interrupted above can be archived
-      // right away. markWorkflowRunEnded also sweeps, but the runner-abort path can fire
+      // (WorkflowService.interruptRun aborts the runner, persists "interrupted" before this
+      // point, via onStopsReleased or before terminating descendants), so the children just
+      // interrupted above can be archived right away. markWorkflowRunEnded also sweeps, but the runner-abort path can fire
       // onRunEnded before this termination completes — sweeping here closes that
       // ordering race (the sweep is idempotent).
       await this.sweepEndedWorkflowRunTasks(options.workflowRunId);
@@ -11019,6 +12054,7 @@ export class TaskService implements AgentTaskIntegration {
     // Free slots and start any queued tasks (best-effort).
     await this.maybeStartQueuedTasks();
 
+    if (stopsReleasedError != null) throw stopsReleasedError.error;
     return interruptedTaskIds;
   }
 
@@ -12280,7 +13316,7 @@ export class TaskService implements AgentTaskIntegration {
                   report.kind === "continuation" &&
                   (report.handleId == null || report.handleId === record.handleId) &&
                   report.messageId === record.messageId &&
-                  report.reportMarkdown === record.reportMarkdown
+                  receiptMatchesReport(report, record.reportMarkdown)
               );
           }
         }
@@ -12868,6 +13904,7 @@ export class TaskService implements AgentTaskIntegration {
       agentId: resumeOptions.agentId,
       thinkingLevel: resumeOptions.thinkingLevel,
       reasoningMode: resumeOptions.reasoningMode,
+      serviceTier: resumeOptions.serviceTier,
       ...(wakeRestrictions.toolPolicy != null ? { toolPolicy: wakeRestrictions.toolPolicy } : {}),
       ...(wakeRestrictions.disableWorkspaceAgents === true ? { disableWorkspaceAgents: true } : {}),
       ...(effectiveStrictPin != null ? { strictAgentResolution: effectiveStrictPin } : {}),
@@ -12881,6 +13918,9 @@ export class TaskService implements AgentTaskIntegration {
       const resumeResult = await this.workspaceService.resumeStream(ownerWorkspaceId, sendOptions, {
         acceptanceOrigin: "automatic",
         agentInitiated: true,
+        // A nested task owner resumed for a descendant's report runs an automatic task turn:
+        // it must not be able to create or replace that child's goal.
+        ...(entry.workspace.parentWorkspaceId ? { taskTurnKind: "recovery" as const } : {}),
       });
       if (!resumeResult.success) {
         // Persistent failures (for example a budget/model gate) are not made retryable by waiting for
@@ -13295,6 +14335,7 @@ export class TaskService implements AgentTaskIntegration {
         agentId: resumeOptions.agentId,
         thinkingLevel: resumeOptions.thinkingLevel,
         reasoningMode: resumeOptions.reasoningMode,
+        serviceTier: resumeOptions.serviceTier,
         ...(queueDispatchMode != null ? { queueDispatchMode } : {}),
         ...(params.sendRestrictions?.toolPolicy != null
           ? { toolPolicy: params.sendRestrictions.toolPolicy }
@@ -13524,7 +14565,9 @@ export class TaskService implements AgentTaskIntegration {
         agentId,
         thinkingLevel: freshEntry.workspace.taskThinkingLevel,
         reasoningMode: coerceOpenAIReasoningMode(freshEntry.workspace.aiSettings?.reasoningMode),
-        experiments: freshEntry.workspace.taskExperiments,
+        serviceTier: ServiceTierSchema.safeParse(
+          resolveWorkspaceAISettings(freshEntry.workspace, agentId)?.serviceTier
+        ).data,
         ...(completionKind === "propose_plan"
           ? { toolPolicy: [{ regex_match: "^propose_plan$", action: "require" as const }] }
           : {}),
@@ -13535,6 +14578,8 @@ export class TaskService implements AgentTaskIntegration {
         acceptanceOrigin: "automatic",
         synthetic: true,
         agentInitiated: true,
+        // An automatic report prompt: it must not be able to create or replace a child goal.
+        taskTurnKind: "required_report",
         startStreamInBackground: true,
         queueDedupeKey: taskRecoveryPromptDedupeKey(taskId, "timeout-finalization"),
         removableQueueDedupeKey: true,
@@ -13681,12 +14726,14 @@ export class TaskService implements AgentTaskIntegration {
           (workspace) => {
             workspace.taskStatus = "reported";
             workspace.reportedAt = getIsoNow();
+            markChildGoalPauseOwed(workspace);
             delete workspace.taskRecoveryAttempts;
           },
           { allowMissing: true }
         );
         // Adopting an already-persisted report owns the same terminal cleanup as publication.
         this.clearTaskRecovery(taskId);
+        await this.settleChildGoalPause(taskId);
         eventSpine.emit("task.reported", { workspaceId: taskId, taskId });
         await this.maybeStartPatchGenerationForReportedTask(taskId);
         await this.emitWorkspaceMetadata(taskId);
@@ -14144,6 +15191,7 @@ export class TaskService implements AgentTaskIntegration {
       })),
     ];
     while (stack.length > 0) {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const next = stack.pop()!;
       const entry = index.byId.get(next.taskId);
       const workflowOwned = next.workflowOwned || entry?.workflowTask != null;
@@ -14569,6 +15617,7 @@ export class TaskService implements AgentTaskIntegration {
         this.getTaskDepthFromParentById(index.parentById, a)
     );
     return taskIds.map((taskId) => {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const entry = index.byId.get(taskId)!;
       return {
         workspaceId: taskId,
@@ -14725,6 +15774,7 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     while (stack.length > 0) {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const next = stack.pop()!;
       const entry = index.byId.get(next.taskId);
       if (!entry) continue;
@@ -14846,6 +15896,7 @@ export class TaskService implements AgentTaskIntegration {
     const visited = new Set([workspaceId]);
     const stack: string[] = [...(index.childrenByParent.get(workspaceId) ?? [])];
     while (stack.length > 0) {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const next = stack.pop()!;
       if (visited.has(next)) {
         continue;
@@ -15033,6 +16084,13 @@ export class TaskService implements AgentTaskIntegration {
     );
   }
 
+  private isUnrelatedMessagingEndpoint(workspace: WorkspaceConfigEntry): boolean {
+    return (
+      workspace.sideChatParentWorkspaceId == null &&
+      this.isLocalUnrelatedMessagingEndpoint(workspace)
+    );
+  }
+
   private isLocalUnrelatedMessagingEndpoint(workspace: WorkspaceConfigEntry): boolean {
     let runtimeConfig = workspace.runtimeConfig;
     if (runtimeConfig === undefined) {
@@ -15050,11 +16108,54 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * Relation of `targetId` to `senderWorkspaceId`, or null for self-sends. Different trees
-   * route as unrelated peers. Only parentWorkspaceId chains define ancestry;
-   * workspace-turn ownership tags are a separate, unchanged graph.
+   * Side chats share their owner's runtime, but are not task children. Keep this direct-link
+   * permission separate from ancestry so neither chat gains lifecycle or trusted-guidance power,
+   * and a side chat cannot bridge isolated top-level workspaces (even with unrelated consent).
    */
+  private resolveDirectChatRelation(
+    sender: WorkspaceConfigEntry,
+    target: WorkspaceConfigEntry
+  ): "target_main_chat" | "target_side_chat" | null {
+    if (
+      sender.sideChatParentWorkspaceId != null &&
+      target.sideChatParentWorkspaceId == null &&
+      sender.sideChatParentWorkspaceId === target.id
+    ) {
+      return "target_main_chat";
+    }
+    if (
+      target.sideChatParentWorkspaceId != null &&
+      sender.sideChatParentWorkspaceId == null &&
+      target.sideChatParentWorkspaceId === sender.id
+    ) {
+      return "target_side_chat";
+    }
+    return null;
+  }
+
+  /** Relation for messaging only; side-chat links never enter the task ownership graph. */
   private resolveAgentTreeTargetRelation(
+    cfg: ProjectsConfig,
+    parentById: Map<string, string>,
+    senderWorkspaceId: string,
+    targetId: string
+  ): AgentTreeTargetRelation | null {
+    const sender = findWorkspaceEntry(cfg, senderWorkspaceId);
+    const target = findWorkspaceEntry(cfg, targetId);
+    if (sender == null || target == null) {
+      return this.resolveTaskAncestryRelation(parentById, senderWorkspaceId, targetId);
+    }
+    if (
+      sender.workspace.sideChatParentWorkspaceId == null &&
+      target.workspace.sideChatParentWorkspaceId == null
+    ) {
+      return this.resolveTaskAncestryRelation(parentById, senderWorkspaceId, targetId);
+    }
+    return this.resolveDirectChatRelation(sender.workspace, target.workspace);
+  }
+
+  /** Only task parent chains grant ancestry; chat links and workspace-turn ownership do not. */
+  private resolveTaskAncestryRelation(
     parentById: Map<string, string>,
     senderWorkspaceId: string,
     targetId: string
@@ -15124,7 +16225,7 @@ export class TaskService implements AgentTaskIntegration {
     const cfg = this.config.loadConfigOrDefault();
     const caller = findWorkspaceEntry(cfg, callerWorkspaceId);
     // Instance discovery must not bridge the runtime boundary closed by unrelated messaging.
-    if (caller == null || !this.isLocalUnrelatedMessagingEndpoint(caller.workspace)) {
+    if (caller == null || !this.isUnrelatedMessagingEndpoint(caller.workspace)) {
       return { rows: [], totalMatching: 0, callerPeerMessagingRestricted: true };
     }
     const index = this.buildAgentTaskIndex(cfg);
@@ -15152,7 +16253,7 @@ export class TaskService implements AgentTaskIntegration {
           // Same-tree visibility is unchanged; hide unrelated roots before matching or probing them.
           (id !== callerRoot &&
             getValidUnrelatedWorkspaceConsent(workspace.unrelatedWorkspaceConsent) == null) ||
-          !this.isLocalUnrelatedMessagingEndpoint(workspace) ||
+          !this.isUnrelatedMessagingEndpoint(workspace) ||
           isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt) ||
           this.interruptedParentWorkspaceIds.has(id) ||
           this.isWorkspaceStopInProgress(id) ||
@@ -15226,8 +16327,7 @@ export class TaskService implements AgentTaskIntegration {
     // chain — advertising root/sibling/ancestor rows to such a caller would direct it at
     // targets it can never message. Descendant guidance stays valid, so those rows survive.
     const callerWorkflowOwned = this.isWorkflowOwnedTaskUsingIndex(index, workspaceId);
-    const callerRestricted =
-      this.isBestOfChainUsingIndex(index, workspaceId) || callerWorkflowOwned;
+    const callerRestricted = this.isPeerMessagingRestricted(index, workspaceId);
     const rootWorkspaceId = this.resolveRootWorkspaceIdUsingParentById(
       index.parentById,
       workspaceId
@@ -15318,8 +16418,11 @@ export class TaskService implements AgentTaskIntegration {
       rootEntry != null &&
       isWorkspaceArchived(rootEntry.workspace.archivedAt, rootEntry.workspace.unarchivedAt);
 
+    const relatedChats = this.listRelatedChats(cfg, index, workspaceId);
+
     return {
       rootWorkspaceId,
+      ...(relatedChats.length > 0 ? { relatedChats } : {}),
       ...(rootTitle != null ? { rootTitle } : {}),
       rootRelationship: rootWorkspaceId === workspaceId ? "self" : "ancestor",
       ...(rootArchived ? { rootArchived: true as const } : {}),
@@ -15330,6 +16433,74 @@ export class TaskService implements AgentTaskIntegration {
       ...(callerRestricted ? { callerPeerMessagingRestricted: true as const } : {}),
       tasks,
     };
+  }
+
+  /** Shared by peer admission and linked-chat discovery so discarded/inactive chats never wake peers. */
+  private isInactivePeerMessagingEndpoint(
+    workspace: WorkspaceConfigEntry,
+    workspaceId: string
+  ): boolean {
+    // Removal claims the row before stopping its session. A winding-down side-chat tool call
+    // must not wake the main chat while that row still exists, including at final admission.
+    if (
+      workspace.pendingRemoval != null ||
+      isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
+    )
+      return true;
+    if (coerceNonEmptyString(workspace.parentWorkspaceId) == null) return false;
+    const status = workspace.taskStatus ?? "running";
+    return (
+      !this.hasLiveRunningExecution(workspace, workspaceId) &&
+      status !== "running" &&
+      status !== "awaiting_report"
+    );
+  }
+
+  private isPeerMessagingRestricted(index: AgentTaskIndex, workspaceId: string): boolean {
+    return (
+      this.isBestOfChainUsingIndex(index, workspaceId) ||
+      this.isWorkflowOwnedTaskUsingIndex(index, workspaceId)
+    );
+  }
+
+  private getRelatedChatInfo(
+    caller: WorkspaceConfigEntry,
+    candidate: WorkspaceConfigEntry
+  ): NonNullable<TaskTreeAgentsResult["relatedChats"]>[number] | undefined {
+    const relation = this.resolveDirectChatRelation(caller, candidate);
+    if (relation == null || candidate.id == null) return undefined;
+    return {
+      workspaceId: candidate.id,
+      title: coerceNonEmptyString(candidate.title) ?? coerceNonEmptyString(candidate.name),
+      relationship: relation === "target_main_chat" ? "main_chat" : "side_chat",
+    };
+  }
+
+  /** Discover direct chat links only, without joining task ownership or instance discovery. */
+  private listRelatedChats(
+    cfg: ProjectsConfig,
+    index: AgentTaskIndex,
+    workspaceId: string
+  ): NonNullable<TaskTreeAgentsResult["relatedChats"]> {
+    const caller = findWorkspaceEntry(cfg, workspaceId)?.workspace;
+    if (caller == null) return [];
+    if (
+      this.isInactivePeerMessagingEndpoint(caller, workspaceId) ||
+      this.isPeerMessagingRestricted(index, workspaceId)
+    )
+      return [];
+    const candidates = Array.from(cfg.projects.values()).flatMap((project) => project.workspaces);
+    return candidates.flatMap((candidate) => {
+      const info = this.getRelatedChatInfo(caller, candidate);
+      if (
+        info == null ||
+        this.isInactivePeerMessagingEndpoint(candidate, info.workspaceId) ||
+        this.isPeerMessagingRestricted(index, info.workspaceId)
+      ) {
+        return [];
+      }
+      return [info];
+    });
   }
 
   // --- Internal orchestration ---
@@ -15373,7 +16544,7 @@ export class TaskService implements AgentTaskIntegration {
 
   listAgentTaskExecutionEntries(
     config: ReturnType<Config["loadConfigOrDefault"]>
-  ): Array<{ id?: string; taskExecutionId?: string }> {
+  ): Array<Pick<WorkspaceConfigEntry, "id" | "taskExecutionId" | "taskExecutionStatus">> {
     return this.listAgentTaskWorkspaces(config);
   }
 
@@ -15418,6 +16589,9 @@ export class TaskService implements AgentTaskIntegration {
     // queue and the sweep skips archived workspaces), so without this unarchive-time
     // reconciliation an idle owner would stay silent until the interval sweep.
     await this.sweepWorkflowRunTerminalAttention(workspaceId);
+    // Unarchive interrupts a legacy shared-desktop child archived while active (see
+    // settleArchivedSharedDesktopTask), which owes its goal pause like any termination.
+    await this.settleChildGoalPause(workspaceId);
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
     if (
       entry &&
@@ -15585,6 +16759,7 @@ export class TaskService implements AgentTaskIntegration {
       })),
     ];
     while (stack.length > 0) {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const next = stack.pop()!;
       const entry = index.byId.get(next.taskId);
       const workflowOwned = next.workflowOwned || entry?.workflowTask != null;
@@ -15683,8 +16858,35 @@ export class TaskService implements AgentTaskIntegration {
     await run;
   }
 
+  /**
+   * One coalesced drain retry after a refused launch lease. A drain already in flight when it
+   * fires reruns (maybeStartQueuedTasksRerunRequested), so the wake is never lost; a retry that is
+   * refused again rearms it.
+   */
+  private armQueuedLaunchLeaseRetry(): void {
+    if (this.queuedLaunchLeaseRetryTimer != null || this.workspaceService.isShuttingDown()) return;
+    this.queuedLaunchLeaseRetryTimer = setTimeout(() => {
+      this.queuedLaunchLeaseRetryTimer = undefined;
+      if (this.workspaceService.isShuttingDown()) return;
+      this.scheduleMaybeStartQueuedTasks();
+    }, QUEUED_LAUNCH_LEASE_RETRY_MS);
+    this.queuedLaunchLeaseRetryTimer.unref?.();
+  }
+
   private async maybeStartQueuedTasksFromReservations(): Promise<void> {
     const plans: TaskLaunchPlan[] = [];
+    // Each launch takes its plan's lease over (startReservedAgentTask). A throw before the
+    // launches below must not leave the leases of the plans collected so far held: their removal
+    // would refuse until this process exits.
+    await using _unlaunchedLeases = {
+      [Symbol.asyncDispose]: async () => {
+        for (const plan of plans) {
+          const lease = plan.launchLease;
+          plan.launchLease = undefined;
+          if (lease != null) await releaseLaunchLease(plan.taskId, lease);
+        }
+      },
+    };
 
     {
       await using _lock = await this.mutex.acquire();
@@ -15724,11 +16926,30 @@ export class TaskService implements AgentTaskIntegration {
         queuedTasks = listQueuedTasks(config);
       }
 
+      // Captured before the count reads any turn file: only requests armed before then are swept.
+      const staleTurnSweepGeneration = this.staleTurnSweepRequestedGeneration;
+      if (
+        queuedTasks.length === 0 &&
+        staleTurnSweepGeneration === this.staleTurnSweepDoneGeneration
+      ) {
+        taskQueueDebug("TaskService.maybeStartQueuedTasks no queued tasks", {});
+        return;
+      }
+      const activeAgentTasks = this.countActiveAgentTasks(config);
+      const { count: activeWorkspaceTurns, complete: sweptEveryOwner } =
+        await this.getWorkspaceTurnManager().countActiveWorkspaceTurnsInGlobalScan();
+      // A count that throws, or a scan that skipped an unreadable owner directory, leaves the
+      // request pending so a later drain retries the sweep (empty-queue drains included).
+      if (sweptEveryOwner) {
+        this.staleTurnSweepDoneGeneration = Math.max(
+          this.staleTurnSweepDoneGeneration,
+          staleTurnSweepGeneration
+        );
+      }
+      if (queuedTasks.length === 0) return;
       const availableSlots = Math.max(
         0,
-        taskSettings.maxParallelAgentTasks -
-          (this.countActiveAgentTasks(config) +
-            (await this.getWorkspaceTurnManager().countActiveWorkspaceTurns()))
+        taskSettings.maxParallelAgentTasks - (activeAgentTasks + activeWorkspaceTurns)
       );
       taskQueueDebug("TaskService.maybeStartQueuedTasks reservation summary", {
         maxParallelAgentTasks: taskSettings.maxParallelAgentTasks,
@@ -15771,7 +16992,7 @@ export class TaskService implements AgentTaskIntegration {
 
         const queuedPrompt = coerceNonEmptyString(task.taskPrompt);
         const start: TaskLaunchStart = queuedPrompt
-          ? { kind: "sendMessage", prompt: queuedPrompt }
+          ? { kind: "sendMessage", prompt: queuedPrompt, sendId: mintTaskBriefSendId() }
           : { kind: "resumeStream" };
         if (start.kind === "resumeStream") {
           // Older queued task records stored the initial prompt only in chat history.
@@ -15900,6 +17121,23 @@ export class TaskService implements AgentTaskIntegration {
         // stale-starting revert can add the marker without changing the id).
         let launch: { attemptId: string; receiptEligible: boolean } | undefined;
         let shuttingDown = false;
+        // The launch lease before the CAS publishes `starting` (see startReservedAgentTask). A
+        // removal, archive or rename of the task in progress refuses it: the task stays queued
+        // and the drain retries it after a backoff.
+        let launchLease: WorkspaceUseLease;
+        try {
+          launchLease = await workspaceUseLeasesFor(this.config).hold(taskId, "launch");
+        } catch (error) {
+          // A lease that cannot be written (lock I/O) leaves the task queued too: launching it
+          // unleased would let another backend's startup recovery requeue it mid-launch.
+          log[error instanceof WorkspaceMutationInProgressError ? "debug" : "warn"](
+            "TaskService.maybeStartQueuedTasks: no launch lease; task left queued",
+            { taskId, error: getErrorMessage(error) }
+          );
+          // The gate's release (another backend's above all) schedules no drain: retry.
+          this.armQueuedLaunchLeaseRetry();
+          continue;
+        }
         try {
           await this.editActiveWorkspaceEntry(taskId, (workspace) => {
             // Once shutdown latched the sessions the launch would only fail against them: the
@@ -15923,17 +17161,22 @@ export class TaskService implements AgentTaskIntegration {
                 : newTaskAttemptId();
             workspace.taskAttemptId = attemptId;
             workspace.taskStatus = "starting";
+            // This launch's brief id, durable before its send (see TaskLaunchStart).
+            if (start.kind === "sendMessage") workspace.taskPromptSendId = start.sendId;
             launch = { attemptId, receiptEligible: workspace.taskAttemptUnproven !== true };
           });
         } catch (error) {
+          await releaseLaunchLease(taskId, launchLease);
           await this.markTaskLaunchFailed(taskId, getErrorMessage(error));
           continue;
         }
         if (shuttingDown) {
+          await releaseLaunchLease(taskId, launchLease);
           log.info("TaskService.maybeStartQueuedTasks: shutdown began; leaving tasks queued");
           break;
         }
         if (launch == null) {
+          await releaseLaunchLease(taskId, launchLease);
           log.debug("TaskService.maybeStartQueuedTasks: launch CAS lost or attempt retired", {
             taskId,
           });
@@ -15969,8 +17212,8 @@ export class TaskService implements AgentTaskIntegration {
           preferredTrunkBranch: task.taskTrunkBranch,
           workflowTask: task.workflowTask,
           bestOf: this.getEffectiveTaskGroup(taskId, task),
-          experiments: task.taskExperiments,
           attemptId: launch.attemptId,
+          launchLease,
           // A reservation this process owns keeps its cancellation across the queue.
           ...(() => {
             const abortSignal = this.ownedAttemptByTaskId.get(taskId)?.abortSignal;
@@ -16024,7 +17267,9 @@ export class TaskService implements AgentTaskIntegration {
       workspace.taskStatus = status;
       if (status === "running") {
         workspace.taskPrompt = undefined;
+        workspace.taskPromptSendId = undefined;
       }
+      if (status === "interrupted" || status === "reported") markChildGoalPauseOwed(workspace);
     };
     if (ACTIVE_AGENT_TASK_STATUSES.has(status)) {
       await this.editActiveWorkspaceEntry(workspaceId, update);
@@ -16032,6 +17277,8 @@ export class TaskService implements AgentTaskIntegration {
       await this.editWorkspaceEntry(workspaceId, update);
     }
     if (!written) return false;
+    if (status === "interrupted" || status === "reported")
+      await this.settleChildGoalPause(workspaceId);
 
     await this.emitWorkspaceMetadata(workspaceId);
 
@@ -16063,6 +17310,10 @@ export class TaskService implements AgentTaskIntegration {
     // leave an entry behind.
     this.workspaceStopEpochs.delete(workspaceId);
     this.workspaceUserStopEpochs.delete(workspaceId);
+    // Per-task goal arbitration history (bounded per task, but not across removed tasks).
+    this.childGoalArbitratedStreams.delete(workspaceId);
+    // Likewise the goal service's per-workspace stream-accounting receipts.
+    this.workspaceGoalService?.forgetStreamAccountingReceipts(workspaceId);
   }
 
   /** Arms the report timeout of every waiter that attached while the task was queued/starting. */
@@ -16222,6 +17473,8 @@ export class TaskService implements AgentTaskIntegration {
     const stopEpochAtStart = this.getWorkspaceStopEpoch(workspaceId);
     // Lineage evaluation (receipt read, bounded wait for a closing producer) stays outside the
     // mutex below: it must never hold up task creation or a cascade's Phase A.
+    // As in reactivation: the interrupted attempt's goal stays paused (see settleChildGoalPause).
+    await this.settleChildGoalPause(workspaceId, { force: true });
     const lineage = await this.evaluateAttemptLineage(workspaceId, entryAtStart.workspace);
     const attemptId = newTaskAttemptId();
     let published = false;
@@ -16251,6 +17504,16 @@ export class TaskService implements AgentTaskIntegration {
       ) {
         log.debug("markInterruptedTaskRunning refused: overtaken by a stop", { workspaceId });
         return lost(SEND_ADMISSION_STALE_MESSAGE);
+      }
+      // A parent's reactivation leaves the status `interrupted` while its fresh attempt launches
+      // and runs, so the row alone reads resumable: rotating that live attempt would supersede the
+      // continuation and drop its report. The user's send loses and
+      // can retry; once the continuation streams, sends queue behind it instead of reaching here.
+      if (this.hasLiveReawakening(workspaceId)) {
+        log.debug("markInterruptedTaskRunning refused: another reawakening is live", {
+          workspaceId,
+        });
+        return lost(TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE);
       }
       await this.editActiveWorkspaceEntry(
         workspaceId,
@@ -16321,9 +17584,17 @@ export class TaskService implements AgentTaskIntegration {
         attemptId,
         receiptEligible: committedProven,
       });
+      // Live until the caller's send binds to it (its admission is the evidence after that).
+      this.reawakeningsInFlight.set(workspaceId, attemptId);
     }
 
-    await this.emitWorkspaceMetadata(workspaceId);
+    try {
+      await this.emitWorkspaceMetadata(workspaceId);
+    } finally {
+      if (this.reawakeningsInFlight.get(workspaceId) === attemptId) {
+        this.reawakeningsInFlight.delete(workspaceId);
+      }
+    }
     return { kind: "reawakened", attemptId, statusChanged: !resumeSettledReportedTask };
   }
 
@@ -16368,6 +17639,7 @@ export class TaskService implements AgentTaskIntegration {
 
         parentWorkspaceId = ws.parentWorkspaceId;
         ws.taskStatus = previousStatus === "reported" ? "reported" : "interrupted";
+        markChildGoalPauseOwed(ws);
         if (previousStatus !== "reported") ws.reportedAt = undefined;
         revertedToInterrupted = true;
         revertedOwnedAttempt =
@@ -16401,6 +17673,7 @@ export class TaskService implements AgentTaskIntegration {
       this.resumeFailureSettlementByTaskId.set(workspaceId, closedAttempt);
       this.recheckResumeFailureSettlement(workspaceId);
     }
+    if (revertedToInterrupted) await this.settleChildGoalPause(workspaceId);
     await this.emitWorkspaceMetadata(workspaceId);
   }
 
@@ -16614,8 +17887,8 @@ export class TaskService implements AgentTaskIntegration {
         return withoutSend(false);
       }
 
-      const model = entry.workspace.taskModelString ?? defaultModel;
-      const agentId = resolveTaskAgentIdForResume(entry.workspace);
+      const taskTurnSendOptions = buildTaskTurnSendOptions(entry.workspace);
+      const { model, agentId } = taskTurnSendOptions;
       const startedAt = Date.now();
       const recoveryMessage = this.buildTaskCompletionRecoveryMessage(
         completionKind,
@@ -16644,11 +17917,7 @@ export class TaskService implements AgentTaskIntegration {
         workspaceId,
         recoveryMessage,
         {
-          model,
-          agentId,
-          thinkingLevel: entry.workspace.taskThinkingLevel,
-          reasoningMode: coerceOpenAIReasoningMode(entry.workspace.aiSettings?.reasoningMode),
-          experiments: entry.workspace.taskExperiments,
+          ...taskTurnSendOptions,
           ...(completionKind === "propose_plan"
             ? { toolPolicy: [{ regex_match: "^propose_plan$", action: "require" as const }] }
             : {}),
@@ -16660,6 +17929,7 @@ export class TaskService implements AgentTaskIntegration {
           acceptanceOrigin: "automatic",
           synthetic: true,
           agentInitiated: true,
+          taskTurnKind: "required_report",
           queueDedupeKey: taskRecoveryPromptDedupeKey(workspaceId, "completion"),
           removableQueueDedupeKey: true,
           // Startup recovery gates the server listener: return once the prompt is accepted and
@@ -16734,12 +18004,15 @@ export class TaskService implements AgentTaskIntegration {
         agentId,
         thinkingLevel: entry.workspace.taskThinkingLevel,
         reasoningMode: coerceOpenAIReasoningMode(entry.workspace.aiSettings?.reasoningMode),
-        experiments: entry.workspace.taskExperiments,
+        serviceTier: ServiceTierSchema.safeParse(
+          resolveWorkspaceAISettings(entry.workspace, agentId)?.serviceTier
+        ).data,
       },
       {
         acceptanceOrigin: "automatic",
         synthetic: true,
         agentInitiated: true,
+        taskTurnKind: "recovery",
       }
     );
     if (!sendResult.success) {
@@ -16764,13 +18037,8 @@ export class TaskService implements AgentTaskIntegration {
     // ended stream's own event, not whatever input engaged while the lock wait or the awaits
     // below ran (see QueueCutAttributionSnapshot).
     queueCutSnapshot: QueueCutAttributionSnapshot,
-    taskOrigin: {
-      executionId: string | null;
-      stopEpoch: number;
-      ownedAttempt: OwnedTaskAttempt | undefined;
-      unownedAttemptId?: string;
-    }
-  ): Promise<void> {
+    taskOrigin: StreamEndTaskOrigin
+  ): Promise<"deferred" | undefined> {
     const cutSourceIsObsolete = () =>
       taskOrigin.executionId !== this.getAgentTaskExecutionId(event.workspaceId) ||
       taskOrigin.stopEpoch !== this.getWorkspaceStopEpoch(event.workspaceId);
@@ -17018,6 +18286,7 @@ export class TaskService implements AgentTaskIntegration {
         agentId: resumeOptions.agentId,
         thinkingLevel: resumeOptions.thinkingLevel,
         reasoningMode: resumeOptions.reasoningMode,
+        serviceTier: resumeOptions.serviceTier,
         ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
       };
       // Admission classification: in-owner auto-resume continues the same attempt (no rotation).
@@ -17255,6 +18524,32 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     if (reportArgs) {
+      // A child pursuing a live goal decides report vs. goal turn BEFORE publishing: its final prose
+      // stays in history, and only publication to the parent waits for the goal to finish.
+      const goalOutcome = await this.arbitrateChildGoalAtStreamEnd(
+        workspaceId,
+        event,
+        status,
+        streamAttemptId,
+        () =>
+          this.resolveStreamEndDecision(
+            workspaceId,
+            this.findPendingStreamEndDecision(
+              workspaceId,
+              taskOrigin.ownedAttempt,
+              taskOrigin.unownedAttemptId
+            ),
+            "nonreport"
+          )
+      );
+      if (goalOutcome === "handled") return;
+      if (goalOutcome === "deferred") return "deferred";
+      if (goalOutcome === "failed") {
+        // Decided nonreport, then the goal turn was refused: ask for the report rather than
+        // leave the task idle with an unpublished report.
+        await this.recoverTaskFromIncompleteStreamEnd(workspaceId, status, streamAttemptId);
+        return;
+      }
       const finalization = await this.finalizeAgentTaskReport(
         workspaceId,
         entry,
@@ -17351,7 +18646,564 @@ export class TaskService implements AgentTaskIntegration {
       }
     }
 
+    // The decision already resolved nonreport above (no final report in this stream).
+    const goalOutcome = await this.arbitrateChildGoalAtStreamEnd(
+      workspaceId,
+      event,
+      status,
+      streamAttemptId,
+      () => undefined
+    );
+    if (goalOutcome === "handled") return;
+    if (goalOutcome === "deferred") return "deferred";
     await this.recoverTaskFromIncompleteStreamEnd(workspaceId, status, streamAttemptId);
+  }
+
+  /**
+   * Sub-agent goals: TaskService alone owns a child's turns, so the goal loop runs here, after every
+   * deferring early return in handleStreamEnd, for both a stream with a final report (called before
+   * publication) and one without. Mirrors the top-level loop (AgentSession): eligible only while the
+   * task is running (no pending required report), no termination pause is owed and the goal needs
+   * no acknowledgment; agent_report stays a progress update. First match wins:
+   * - active goal, the ended turn was a tool-free goal_continuation for it that stopped -> implicit
+   *   complete_goal, then the normal path (its final text is the report);
+   * - active goal otherwise -> one continuation turn (any final prose is not published);
+   * - budget_limited with its one wrap-up unused -> the wrap-up turn;
+   * - anything else (no goal, paused, complete: live state after this stream's accounting; wrap-up
+   *   used) -> the normal path: publish the report, or prompt for one.
+   * Returns "none" for the normal path, "handled" when a goal turn was handed off or another turn
+   * (or a duplicate delivery) owns the outcome, and "failed" when a goal turn was decided (stream
+   * decided nonreport) but refused, and "deferred" when this stream's goal accounting has not
+   * settled yet (see deferChildStreamEnd). `decideNonreport` runs once a turn is certain, before
+   * the send.
+   */
+  private async arbitrateChildGoalAtStreamEnd(
+    workspaceId: string,
+    event: StreamEndEvent,
+    status: WorkspaceConfigEntry["taskStatus"],
+    streamAttemptId: AttemptFence,
+    decideNonreport: () => void
+  ): Promise<ChildGoalTurnOutcome> {
+    const goalService = this.workspaceGoalService;
+    if (goalService == null) return "none";
+    // Ineligible without reading goal state: a report obligation, an owed termination pause, or
+    // an attempt whose admission closed (stop, settlement, retirement) takes the normal path.
+    if (
+      status !== "running" ||
+      this.isChildGoalPauseOwed(workspaceId) ||
+      (streamAttemptId != null && !this.attemptAdmissionOpen(workspaceId, streamAttemptId))
+    ) {
+      return "none";
+    }
+    // The goal's status must include this stream's accounting (a budget it just exhausted) and
+    // any set_goal / complete_goal it made; both commit in the session's handling of the event.
+    // Accounting completion is authoritative: until it is known, nothing is decided (deferred).
+    const accounting = await goalService.waitForStreamAccountingReceipt(
+      workspaceId,
+      event.messageId,
+      CHILD_GOAL_ACCOUNTING_WAIT_MS
+    );
+    if (accounting === "timeout") return "deferred";
+    if (accounting === "evicted") {
+      // Released without accounting (see beginStreamAccountingReceipt): no goal turn from it.
+      log.warn("[task-goal] stream accounting receipt evicted; no goal turn for this stream", {
+        workspaceId,
+        messageId: event.messageId,
+      });
+      return "none";
+    }
+    const goal = await goalService.getGoal(workspaceId);
+    if (goal == null) return "none";
+    // A duplicate delivery of an already-arbitrated stream is a no-op: one outcome per stream.
+    const arbitrated = this.childGoalArbitratedStreams.get(workspaceId) ?? [];
+    if (arbitrated.includes(event.messageId)) return "handled";
+    this.childGoalArbitratedStreams.set(
+      workspaceId,
+      [...arbitrated, event.messageId].slice(-CHILD_GOAL_ARBITRATED_STREAMS_MAX)
+    );
+    if (this.isChildGoalPauseOwed(workspaceId) || goal.requireUserAcknowledgmentSinceMs != null) {
+      return "none";
+    }
+    if (goal.status === "active") {
+      if (
+        event.metadata.finishReason === "stop" &&
+        !event.parts.some((part) => isDynamicToolPart(part)) &&
+        (await this.endedTurnContinuedGoal(workspaceId, goal.goalId))
+      ) {
+        await goalService.completeGoalFromSilentContinuation({
+          workspaceId,
+          completionSummary: synthesizeSilentContinuationSummary(event.parts),
+        });
+        return "none";
+      }
+      return this.sendChildGoalTurn(
+        workspaceId,
+        goal,
+        GOAL_CONTINUATION_KIND,
+        streamAttemptId,
+        decideNonreport
+      );
+    }
+    if (
+      goal.status === "budget_limited" &&
+      goal.budgetLimitInjectedForGoalId == null &&
+      goal.budgetLimitOriginKind !== "user"
+    ) {
+      return this.sendChildGoalTurn(
+        workspaceId,
+        goal,
+        GOAL_BUDGET_LIMIT_KIND,
+        streamAttemptId,
+        decideNonreport
+      );
+    }
+    return "none";
+  }
+
+  /**
+   * Whether the agent a child's goal turns run on (its task-pinned agent) can drive a goal: the
+   * same capability the set_goal tool gate applies (canAgentDriveGoal, and not plan-like).
+   */
+  private async canChildAgentDriveGoal(workspaceId: string): Promise<boolean> {
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    if (entry == null) return false;
+    if (!canAgentDriveGoal(resolveTaskAgentIdForResume(entry.workspace))) return false;
+    return !(await this.isPlanLikeTaskWorkspace(entry));
+  }
+
+  /** Whether the child's latest user row is a goal_continuation turn for `goalId`. */
+  private async endedTurnContinuedGoal(workspaceId: string, goalId: string): Promise<boolean> {
+    const tail = await this.historyService.getLastMessages(workspaceId, 20);
+    if (!tail.success) return false;
+    const userRow = tail.data.findLast(
+      (message) => message.role === "user" && !isContextBudgetWarningMessage(message)
+    );
+    return userRow?.metadata?.kind === GOAL_CONTINUATION_KIND && userRow.metadata.goalId === goalId;
+  }
+
+  private isChildGoalPauseOwed(workspaceId: string): boolean {
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    return entry?.workspace.taskGoalPauseOwed != null;
+  }
+
+  /**
+   * One automatic goal turn (continuation or budget wrap-up) for a child, modeled on
+   * promptTaskForRequiredCompletionTool: bound to the decided attempt, queued turn-end behind any
+   * live turn, with task-pinned options and no tool policy. Every admission gate re-checks the
+   * attempt token, the goal (pause, replacement, user stop, terminal transition) and an owed
+   * termination pause. Outcomes: "none" = the goal no longer wants the turn (checked synchronously
+   * just before `decideNonreport`, so the caller's normal path still applies); "handled" = handed
+   * off, or another turn is pending (its stream end decides), or the attempt refused (terminal);
+   * "failed" = refused after `decideNonreport` ran.
+   */
+  private async sendChildGoalTurn(
+    workspaceId: string,
+    goal: GoalRecordV1,
+    kind: GoalSyntheticMessageKind,
+    expectedAttemptId: AttemptFence,
+    decideNonreport: () => void
+  ): Promise<ChildGoalTurnOutcome> {
+    const goalService = this.workspaceGoalService;
+    assert(goalService != null, "sendChildGoalTurn requires the goal service");
+    if (expectedAttemptId == null) return "none";
+    if (
+      this.aiService.isStreaming(workspaceId) ||
+      this.workspaceService.hasPendingQueuedOrPreparingTurn(workspaceId)
+    ) {
+      return "handled";
+    }
+    // A workflow-owned child whose owning run is no longer active must not keep working for its
+    // goal: the caller's normal path applies (the report publishes; a stream without one already
+    // took the no-report path's inactive-owner interrupt before arbitration).
+    if (
+      (await this.getInactiveWorkflowTaskOwnerForRecovery(
+        workspaceId,
+        this.config.loadConfigOrDefault()
+      )) != null
+    ) {
+      return "none";
+    }
+    // Defense in depth (set_goal is already refused there): a child pinned to plan, compact or a
+    // plan-like agent never gets a goal turn; the caller's normal report / plan handoff applies.
+    if (!(await this.canChildAgentDriveGoal(workspaceId))) return "none";
+    // Fail closed when the pinned agent is unavailable (#5402): pause; the normal path applies.
+    const childEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    // The check awaits (#5452): a dispatch that went stale meanwhile (its attempt replaced, or
+    // its goal replaced, settled or paused and resumed) shows no chat error and pauses nothing,
+    // since that goal may now belong to a newer turn. Its stream end then takes the normal path.
+    // Synchronous, so the pause can evaluate it under the goal file lock right before its write.
+    const stillCurrent = (live: GoalRecordV1 | null) =>
+      this.currentTaskAttemptId(workspaceId) === expectedAttemptId &&
+      live?.goalId === goal.goalId &&
+      live.status === goal.status &&
+      (live.lastUserActivationAtMs ?? null) === (goal.lastUserActivationAtMs ?? null);
+    // An unreadable goal counts as current while the attempt is: the refusal stands (fail
+    // closed) and the pause write, fenced again under its lock, owns any error.
+    const isCurrent = async () => {
+      try {
+        return stillCurrent(await goalService.readGoalSerialized(workspaceId));
+      } catch {
+        return this.currentTaskAttemptId(workspaceId) === expectedAttemptId;
+      }
+    };
+    const refusal =
+      childEntry == null
+        ? null
+        : await this.workspaceService.refuseUnavailableGoalTurnAgent(
+            workspaceId,
+            buildTaskTurnSendOptions(childEntry.workspace),
+            isCurrent
+          );
+    if (refusal != null) {
+      // A failed write is safe to ignore: "none" leads to the report (or a report prompt, whose
+      // stream end re-arbitrates here), and the reported transition marks the pause owed
+      // (taskGoalPauseOwed fences goal turns) and settles it.
+      await goalService.pauseForUnavailableAgent(workspaceId, goal, refusal, stillCurrent);
+      return "none";
+    }
+    const goalAdmission = await goalService.buildGoalRedispatchAdmission(
+      workspaceId,
+      goal.goalId,
+      kind
+    );
+    if (!goalAdmission.admissible) return "none";
+    const admission = this.admitTaskWorkspaceTurn(workspaceId, {
+      acceptanceOrigin: "automatic",
+      expectedAttemptId,
+    });
+    // Refused before decideNonreport (e.g. a transiently unreadable registry, a stop or a
+    // superseded attempt): no goal turn was queued, so the caller's normal report path — with its
+    // own attempt fences and report recovery — owns the outcome, exactly as for a goal-less child.
+    if (admission.kind !== "admitted") return "none";
+    const token = admission.token;
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    let goalStale = goalAdmission.admissionStale;
+    const goalUnwanted = () => goalStale() || this.isChildGoalPauseOwed(workspaceId);
+    // Synchronous with decideNonreport: a pause or stop that landed during the awaits above still
+    // takes the normal path (the report publishes), never a goal turn.
+    if (entry == null || goalUnwanted()) {
+      token.onDisposed("refused");
+      return "none";
+    }
+    // The attempt's stream end must be decided before the send: a still-pending decision makes
+    // the send's own admission stale.
+    decideNonreport();
+    const isStale = () => token.admissionStale() || goalUnwanted();
+    if (isStale()) {
+      token.onDisposed("refused");
+      return "failed";
+    }
+    // The report was suppressed for this turn (decideNonreport ran): a queued turn cancelled later
+    // (the user paused or cleared the goal, an owed pause landed) must still lead to the report.
+    let sendReturned = false;
+    let canceledBeforeReturn = false;
+    const attemptId = expectedAttemptId;
+    const sendResult = await this.workspaceService.sendMessage(
+      workspaceId,
+      kind === GOAL_BUDGET_LIMIT_KIND
+        ? buildGoalBudgetLimitMessage(goal)
+        : buildGoalContinuationMessage(goal),
+      { ...buildTaskTurnSendOptions(entry.workspace), queueDispatchMode: "turn-end" },
+      {
+        onCanceled: (reason) => {
+          if (!sendReturned) {
+            canceledBeforeReturn = true;
+            return;
+          }
+          this.recoverCanceledChildGoalTurn(workspaceId, attemptId, reason);
+        },
+        acceptanceOrigin: "automatic",
+        synthetic: true,
+        agentInitiated: true,
+        goalKind: kind,
+        goalId: goal.goalId,
+        taskTurnKind: kind,
+        queueDedupeKey: taskRecoveryPromptDedupeKey(workspaceId, "goal"),
+        removableQueueDedupeKey: true,
+        turnAdmission: token,
+        admissionStale: isStale,
+        // The one wrap-up is consumed only by an accepted send (a canceled or refused one leaves
+        // it available). Reserving writes the goal, which bumps its terminal generation, so the
+        // probe is rebuilt over the reserved record instead of refusing this very send.
+        ...(kind === GOAL_BUDGET_LIMIT_KIND
+          ? {
+              onAccepted: async () => {
+                await goalService.reserveBudgetWrapupForRedispatch(workspaceId, goal.goalId);
+                const reserved = await goalService.buildGoalRedispatchAdmission(
+                  workspaceId,
+                  goal.goalId,
+                  kind
+                );
+                goalStale = reserved.admissible ? reserved.admissionStale : () => true;
+              },
+            }
+          : {}),
+      }
+    );
+    sendReturned = true;
+    if (!sendResult.success) {
+      log.info("[task-goal] child goal turn not sent", {
+        workspaceId,
+        kind,
+        error: sendResult.error,
+      });
+      return "failed";
+    }
+    if (canceledBeforeReturn) {
+      this.recoverCanceledChildGoalTurn(workspaceId, attemptId, "canceled before admission");
+    }
+    return "handled";
+  }
+
+  /**
+   * A queued child goal turn was cancelled after its stream end had decided nonreport, so nothing
+   * would publish or ask for the report: take the normal no-report path (ask for the report),
+   * unless the attempt itself closed (its termination owns the outcome) or another turn now owns
+   * the task (its stream end decides). Serialized on the task's event lock; scheduled, not
+   * awaited, because a canceler may hold that lock.
+   */
+  private recoverCanceledChildGoalTurn(
+    workspaceId: string,
+    attemptId: string,
+    reason: string
+  ): void {
+    void this.workspaceEventLocks
+      .withLock(workspaceId, async () => {
+        const status = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
+          .taskStatus;
+        if (status !== "running" || !this.attemptAdmissionOpen(workspaceId, attemptId)) return;
+        if (
+          this.aiService.isStreaming(workspaceId) ||
+          this.workspaceService.hasPendingQueuedOrPreparingTurn(workspaceId)
+        ) {
+          return;
+        }
+        log.info("[task-goal] child goal turn canceled; asking for the report", {
+          workspaceId,
+          reason,
+        });
+        await this.recoverTaskFromIncompleteStreamEnd(workspaceId, status, attemptId);
+      })
+      .catch((error: unknown) => {
+        log.error("TaskService: recovery after a canceled child goal turn failed", {
+          workspaceId,
+          error,
+        });
+      });
+  }
+
+  /**
+   * Settle the goal pause a terminated child attempt owes (taskGoalPauseOwed, see
+   * markChildGoalPauseOwed) or, with `force`, any runnable goal a terminated attempt left behind
+   * (legacy rows without the marker). Pauses an active goal through the real pause path (boundary
+   * row + explicit pause generation, so chat-tail reconciliation cannot re-activate it) and
+   * consumes a budget-limited goal's one wrap-up (budget_limited has no pause transition; with its
+   * wrap-up used no automatic turn can run it). Never completes the goal.
+   *
+   * Ordering: the owed marker is durable before this runs, so every later activation is refused
+   * by the goal service's childActivationGate; the goal is read under the goal file lock, so an
+   * activation that passed its gate earlier has finished writing and is seen here. The marker is
+   * cleared only once the pause is durable, and only if it still names the same closing attempt
+   * (a later termination's marker is never cleared by this settle).
+   */
+  private async settleChildGoalPause(
+    workspaceId: string,
+    options: { force?: boolean } = {}
+  ): Promise<void> {
+    const goalService = this.workspaceGoalService;
+    if (goalService == null) return;
+    const owed = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
+      .taskGoalPauseOwed;
+    if (owed == null && options.force !== true) return;
+    try {
+      const goal = await goalService.readGoalSerialized(workspaceId);
+      if (goal?.status === "active") {
+        const paused = await goalService.setGoal({
+          workspaceId,
+          status: "paused",
+          initiator: "auto",
+          expectedGoalId: goal.goalId,
+        });
+        if (!paused.success) throw new Error(`pause refused: ${paused.error.type}`);
+      } else if (goal?.status === "budget_limited") {
+        await goalService.reserveBudgetWrapupForRedispatch(workspaceId, goal.goalId);
+      }
+      const settled = await goalService.readGoalSerialized(workspaceId);
+      if (
+        settled?.status === "active" ||
+        (settled?.status === "budget_limited" &&
+          settled.budgetLimitInjectedForGoalId == null &&
+          settled.budgetLimitOriginKind !== "user")
+      ) {
+        throw new Error("goal still runnable after pause");
+      }
+    } catch (error) {
+      log.warn("[task-goal] child goal pause failed; goal activation stays fenced", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+      if (owed == null) {
+        await this.editChildGoalPauseMarker(workspaceId, (ws) => {
+          ws.taskGoalPauseOwed ??= ws.taskAttemptId ?? "*";
+        });
+      }
+      return;
+    }
+    if (owed != null) {
+      await this.editChildGoalPauseMarker(workspaceId, (ws) => {
+        if (ws.taskGoalPauseOwed === owed) delete ws.taskGoalPauseOwed;
+      });
+    }
+  }
+
+  /**
+   * Marker bookkeeping for settleChildGoalPause, which callers (startup recovery loops, stop
+   * paths) treat as non-throwing: a failed config write is logged and leaves the marker as it
+   * was, so the pause is retried at the next settle point instead of aborting the caller.
+   */
+  private async editChildGoalPauseMarker(
+    workspaceId: string,
+    edit: (ws: WorkspaceConfigEntry) => void
+  ): Promise<void> {
+    try {
+      await this.editWorkspaceEntry(workspaceId, edit, { allowMissing: true });
+    } catch (error) {
+      log.warn("[task-goal] child goal pause marker update failed; retried at the next settle", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  /**
+   * ChildGoalResumeHooks.captureActivationAttempt: the attempt a goal mutation accepted now acts
+   * for (undefined: not a sub-agent task; null: no attempt that may run goal work right now).
+   */
+  captureChildGoalActivationAttempt(workspaceId: string): string | null | undefined {
+    const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
+    if (workspace?.parentWorkspaceId == null) return undefined;
+    const attemptId = this.currentTaskAttemptId(workspaceId, workspace);
+    return attemptId != null && this.isChildGoalActivationAllowed(workspaceId, attemptId)
+      ? attemptId
+      : null;
+  }
+
+  /**
+   * ChildGoalResumeHooks.isActivationAllowed, the sub-agent activation invariant: a child goal may
+   * become active / budget_limited only for this exact attempt while it is running (no report
+   * obligation), its admission is open (not closed, stopping, retired or being removed) and no
+   * termination pause is owed. Synchronous: the goal service calls it under its file lock right
+   * before the write.
+   */
+  isChildGoalActivationAllowed(workspaceId: string, attemptId: string | null): boolean {
+    if (attemptId == null) return false;
+    const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
+    return (
+      workspace?.taskStatus === "running" &&
+      workspace.taskGoalPauseOwed == null &&
+      this.attemptAdmissionOpen(workspaceId, attemptId)
+    );
+  }
+
+  /**
+   * ChildGoalResumeHooks.getTurnModel: the model a child goal turn is dispatched on — the same
+   * task-pinned resolution (fallback included) sendChildGoalTurn sends with.
+   */
+  getChildGoalTurnModel(workspaceId: string): string | null {
+    const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
+    return workspace == null ? null : (buildTaskTurnSendOptions(workspace).model ?? null);
+  }
+
+  /** AgentTaskIntegration.settleOwedChildGoalPause: see settleChildGoalPause. */
+  async settleOwedChildGoalPause(workspaceId: string): Promise<void> {
+    await this.settleChildGoalPause(workspaceId);
+  }
+
+  /** Settle each owed child goal pause in turn (see settleChildGoalPause; never throws). */
+  private async settleChildGoalPauses(taskIds: Iterable<string>): Promise<void> {
+    for (const taskId of taskIds) await this.settleChildGoalPause(taskId);
+  }
+
+  /**
+   * WorkspaceGoalService resume gate (see ChildGoalResumeHooks): why a user may not resume this
+   * child's goal now, or null. Goal work needs a live attempt in its ordinary running phase: an
+   * attempt owing its required report belongs to that report (which then ends the task and
+   * re-pauses the goal), so a resume there would report success without resuming anything.
+   */
+  getChildGoalResumeRefusal(workspaceId: string): string | null {
+    const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
+    if (workspace?.taskStatus === "awaiting_report" && this.isChildAttemptOpen(workspace)) {
+      return "This sub-agent task is finishing its required report, so its goal cannot resume now. Reactivate the task after it reports, then resume its goal.";
+    }
+    // A reactivated reported child stays reported (its new execution never runs goal turns), so
+    // "reactivate it first" is a dead end there (#5411 item (c), not yet supported).
+    if (workspace?.taskStatus === "reported") {
+      return "This sub-agent task has already reported, and resuming a reported sub-agent's goal is not supported yet. Start a new sub-agent task for the remaining work instead.";
+    }
+    if (!this.isChildTaskRunning(workspaceId)) {
+      return "This sub-agent task is not running. Reactivate the task first, then resume its goal.";
+    }
+    return null;
+  }
+
+  private isChildAttemptOpen(workspace: WorkspaceConfigEntry): boolean {
+    return (
+      workspace.parentWorkspaceId != null &&
+      workspace.taskAttemptRetiredBy == null &&
+      workspace.pendingRemoval == null
+    );
+  }
+
+  /** A live child attempt in its ordinary running phase (where goal turns may run). */
+  private isChildTaskRunning(workspaceId: string): boolean {
+    const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
+    return workspace?.taskStatus === "running" && this.isChildAttemptOpen(workspace);
+  }
+
+  /**
+   * After a user resumed a live child's goal: continue an idle child with one fenced goal turn
+   * bound to its current attempt. A busy child needs nothing; its next stream end decides.
+   */
+  async continueResumedChildGoal(workspaceId: string): Promise<void> {
+    await this.workspaceEventLocks.withLock(workspaceId, async () => {
+      const goalService = this.workspaceGoalService;
+      if (goalService == null) return;
+      const goal = await goalService.getGoal(workspaceId);
+      const running = this.isChildTaskRunning(workspaceId);
+      if (goal?.status === "active" && running) {
+        const outcome = await this.sendChildGoalTurn(
+          workspaceId,
+          goal,
+          GOAL_CONTINUATION_KIND,
+          this.currentTaskAttemptId(workspaceId) ?? null,
+          () => undefined
+        );
+        if (outcome === "handled") return;
+      }
+      // Nothing will run the resumed goal (the task stopped, reported or owes its report since
+      // the resume was admitted, or the send was refused): restore the pause durably and refuse
+      // the resume — never report success for a goal no turn will drive.
+      const live = await goalService.getGoal(workspaceId);
+      if (live?.status === "active") {
+        const paused = await goalService.setGoal({
+          workspaceId,
+          status: "paused",
+          initiator: "auto",
+          expectedGoalId: live.goalId,
+        });
+        if (!paused.success) {
+          log.warn("[task-goal] failed to restore a child goal pause after a refused resume", {
+            workspaceId,
+            error: paused.error,
+          });
+        }
+      }
+      throw new Error(
+        running
+          ? "The sub-agent could not continue its goal, so the goal stays paused. Try again once the task is idle."
+          : "The sub-agent task stopped or owes its report, so its goal stays paused. Reactivate the task, then resume its goal."
+      );
+    });
   }
 
   private async recoverTaskFromIncompleteStreamEnd(
@@ -17511,6 +19363,7 @@ export class TaskService implements AgentTaskIntegration {
     if (!transitionedToInterrupted) {
       return;
     }
+    await this.settleChildGoalPause(workspaceId);
     // No deferred dispatch may outlive the closure (the queue was empty when the idleness was
     // decided; this only guards entries added while the write was awaited). Only while this
     // process still owns the attempt it decided for: a send during the write may have begun a
@@ -17767,6 +19620,7 @@ export class TaskService implements AgentTaskIntegration {
         parentWorkspaceId = ws.parentWorkspaceId;
         ws.taskStatus = "interrupted";
         ws.taskLaunchError = failure.errorMessage;
+        markChildGoalPauseOwed(ws);
         // #4579: binds the failure to the attempt this CAS matched. The artifacts below are
         // log-only on I/O errors, and taskLaunchError is not attempt-bound or failure-only.
         if (ws.taskAttemptId != null) {
@@ -17783,6 +19637,7 @@ export class TaskService implements AgentTaskIntegration {
       },
       { allowMissing: true }
     );
+    if (found && !superseded) await this.settleChildGoalPause(workspaceId);
     if (expectedAttemptId != null) {
       if (superseded || !found) {
         logSuperseded();
@@ -18094,6 +19949,7 @@ export class TaskService implements AgentTaskIntegration {
           transitionedToInterrupted = workspace.taskStatus !== "interrupted";
           parentWorkspaceId = workspace.parentWorkspaceId;
           workspace.taskStatus = "interrupted";
+          markChildGoalPauseOwed(workspace);
           workspace.taskLaunchError = error.message;
         },
         { allowMissing: true }
@@ -18101,6 +19957,7 @@ export class TaskService implements AgentTaskIntegration {
       if (transitionedToInterrupted) {
         this.recordTaskInterrupted(args.workspaceId, parentWorkspaceId);
       }
+      if (!planFailureSuperseded) await this.settleChildGoalPause(args.workspaceId);
       // Waiters of a row another writer re-admitted belong to that attempt, not this failure.
       if (!planFailureSuperseded) this.rejectWaiters(args.workspaceId, error);
       await this.emitWorkspaceMetadata(args.workspaceId);
@@ -18118,9 +19975,7 @@ export class TaskService implements AgentTaskIntegration {
         const runtime = createRuntimeForWorkspace(info);
         const planResult = await readPlanFile(
           runtime,
-          info.name,
-          info.projectName,
-          args.workspaceId
+          await resolvePlanFileLocation(this.config, runtime, info)
         );
         if (planResult.exists && planResult.content.trim().length > 0) {
           if (planResult.path !== args.proposePlanResult.planPath) {
@@ -18233,9 +20088,7 @@ export class TaskService implements AgentTaskIntegration {
           const runtime = createRuntimeForWorkspace(info);
           const planResult = await readPlanFile(
             runtime,
-            info.name,
-            info.projectName,
-            args.workspaceId
+            await resolvePlanFileLocation(this.config, runtime, info)
           );
           if (planResult.exists) {
             planSummary = { content: planResult.content, path: planResult.path };
@@ -18398,7 +20251,6 @@ export class TaskService implements AgentTaskIntegration {
             agentId: targetAgentId,
             thinkingLevel: effectiveThinkingLevel,
             ...(effectiveReasoningMode != null ? { reasoningMode: effectiveReasoningMode } : {}),
-            experiments: args.entry.workspace.taskExperiments,
           },
           {
             acceptanceOrigin: "automatic",
@@ -18808,6 +20660,8 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
+    // Rolled up once, at report time, and inclusive of the child's own goal turns: the parent's
+    // budget is not a strict ceiling on a child pursuing its own goal (the child's goal caps that).
     const childCostCents = await this.getChildReportCostCents(childWorkspaceId);
     const attribution = await this.workspaceGoalService.attributeChildReport({
       parentWorkspaceId,
@@ -19173,6 +21027,8 @@ export class TaskService implements AgentTaskIntegration {
         : undefined;
     let superseded = false;
     let retired = false;
+    // A report ends the attempt, never the goal: the child's goal pause is owed in the same write
+    // that publishes the report (never completed), and settled below.
     // Notify clients immediately even if we can't delete the workspace yet.
     await this.editWorkspaceEntry(
       childWorkspaceId,
@@ -19185,6 +21041,7 @@ export class TaskService implements AgentTaskIntegration {
         if (superseded) return;
         ws.taskStatus = "reported";
         ws.reportedAt = getIsoNow();
+        markChildGoalPauseOwed(ws);
         // Successful completion resets the persisted recovery circuit breaker.
         delete ws.taskRecoveryAttempts;
       },
@@ -19214,6 +21071,7 @@ export class TaskService implements AgentTaskIntegration {
       return retired ? "retired" : "superseded";
     }
     this.clearTaskRecovery(childWorkspaceId);
+    await this.settleChildGoalPause(childWorkspaceId);
     // Drop queued incremental updates synchronously with the terminal commit: while they sit at
     // the parent's queue head as tool-end entries, the parent's stream stops at its next step
     // boundary for them, and a dispatch refused as superseded cannot restore that cut turn.

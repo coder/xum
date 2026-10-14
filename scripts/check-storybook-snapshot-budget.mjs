@@ -27,10 +27,32 @@ import * as pixelUtils from "../node_modules/@coder/pixel-storybook/build/utils.
 
 // Exact counts on main when this check replaced the regex estimator (same 115 files,
 // no new stories; 608 → 655 is a unit change from estimated to actual captures).
-// Keep this no-headroom guardrail tight: future growth should exclude, consolidate,
-// or intentionally rebalance snapshots rather than silently increasing Pixel load.
-const MAX_SNAPSHOTS = 655;
-const MAX_SNAPSHOT_ENABLED_FILES = 115;
+// Agents must first consolidate equivalent snapshot coverage or remove redundant/excess
+// variants. Increasing the cap is a last resort, only when existing snapshots cannot cover
+// the new behavior; explain that need rather than silently increasing Pixel load.
+// +4 snapshots / +1 file: the Artifacts tab gallery (ArtifactsPanel.stories.tsx), consolidated
+// from 24 per-renderer variants to one phone and one laptop story in dark + light.
+// +6 snapshots / +1 file: Artifacts M4 chat cards (ArtifactToolCall.stories.tsx, phone + laptop
+// in dark + light) and the open version menu (ArtifactsPanel.stories.tsx, laptop dark + light).
+// +4 snapshots: Artifacts M5c Shelf group in the picker (ArtifactsPanel.stories.tsx, phone +
+// laptop in dark + light).
+// +4 snapshots / +1 file: Artifacts M5b messages sent from an artifact
+// (App.artifactInteraction.stories.tsx, phone + laptop in dark + light).
+// +4 snapshots: the Artifacts canvas gallery (ArtifactsPanel.stories.tsx, phone + laptop in
+// dark + light; the file was already counted).
+// +4 snapshots: the Artifacts confirm strip + annotate story (ArtifactsPanel.stories.tsx, phone +
+// laptop in dark + light; the file was already counted).
+// +4 snapshots / +1 file: the skills hat with unreachable SSH skill sources
+// (SkillIndicator.stories.tsx, phone + laptop in dark + light).
+// +1 snapshot / +1 file: the phone-width Providers layout (ProvidersSection.stories.tsx,
+// phone in dark; the rest of the file stays excluded).
+// +1 snapshot: the Ultrafast closed-state indicator (ChatInput.stories.tsx ThinkingSelectorUltrafast,
+// phone in dark; the file was already counted).
+// No growth for the sidebar launcher: NewTabLauncherNarrow shares its scene with empty
+// Output, replacing the separate OutputTabEmpty captures. Launcher keyboard/mobile
+// contracts and additional strip-overflow stories remain play-only.
+const MAX_SNAPSHOTS = 687;
+const MAX_SNAPSHOT_ENABLED_FILES = 120;
 
 const { values } = parseArgs({
   options: {

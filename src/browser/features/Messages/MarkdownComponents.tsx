@@ -1,17 +1,25 @@
 import type { ReactNode } from "react";
 import React, { useContext, useEffect, useRef, useState } from "react";
 import { Play } from "lucide-react";
-import { Mermaid } from "./Mermaid";
+import { MermaidPendingFrame } from "./MermaidPendingFrame";
 import { useOptionalMessageListContext } from "./MessageListContext";
 import { StreamingContext } from "./StreamingContext";
-import { highlightCode } from "@/browser/utils/highlighting/highlightWorkerClient";
+import {
+  highlightCode,
+  isAbortedHighlight,
+} from "@/browser/utils/highlighting/highlightWorkerClient";
 import { extractShikiLines, isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
 import { useTheme } from "@/browser/contexts/ThemeContext";
 import { CopyButton } from "@/browser/components/CopyButton/CopyButton";
 import { resolveBrowserLocalhostProxyTemplate } from "@/browser/utils/browserLocalhostProxyTemplate";
 import { normalizeLocalhostProxyUrl } from "@/common/utils/localhostProxyUrl";
 import { InlineSkillPreviewContext } from "./InlineSkillPreviewContext";
-import { INTERNAL_INLINE_SKILL_HREF_PREFIX } from "./inlineSkillMarkdown";
+import { decodeInlineSkillHref, INTERNAL_INLINE_SKILL_HREF_PREFIX } from "./inlineSkillMarkdown";
+import { LazyFeature } from "@/browser/components/LazyFeature/LazyFeature";
+
+// Lazy so the `mermaid` package stays off the first load (T3, #5971): diagrams render only
+// when a message contains one.
+const Mermaid = React.lazy(() => import("./Mermaid").then((m) => ({ default: m.Mermaid })));
 
 interface CodeProps {
   node?: unknown;
@@ -274,10 +282,13 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
     }
 
     let cancelled = false;
+    // A streaming block re-runs this effect on every commit. Aborting in cleanup drops the
+    // superseded request from the worker queue instead of running it for a stale result.
+    const abortController = new AbortController();
 
     async function highlight() {
       try {
-        const html = await highlightCode(code, shikiLanguage, theme);
+        const html = await highlightCode(code, shikiLanguage, theme, abortController.signal);
 
         if (!cancelled) {
           const lines = extractShikiLines(html);
@@ -302,6 +313,7 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
           }
         }
       } catch (error) {
+        if (isAbortedHighlight(error, abortController.signal)) return;
         console.warn(`Failed to highlight code block (${shikiLanguage}):`, error);
         if (!cancelled) setHighlighted(null);
       }
@@ -310,6 +322,7 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
     void highlight();
     return () => {
       cancelled = true;
+      abortController.abort();
       releaseHighlightCacheWriter(lastWrittenCacheKeyRef, cacheWriter);
     };
   }, [cacheKey, code, isStreaming, shikiLanguage, theme]);
@@ -390,28 +403,19 @@ function getTextFromReactNode(node: ReactNode): string {
   return text;
 }
 
-function decodeInlineSkillHref(href: string): string | null {
-  const encodedSkillName = href.slice(INTERNAL_INLINE_SKILL_HREF_PREFIX.length);
-  if (encodedSkillName.length === 0) {
-    return null;
-  }
-
-  try {
-    return decodeURIComponent(encodedSkillName);
-  } catch {
-    return null;
-  }
-}
-
 function InlineSkillAnchor(props: { href: string; children?: ReactNode }): ReactNode {
   const inlineSkillPreview = useContext(InlineSkillPreviewContext);
   const label = getTextFromReactNode(props.children);
-  const skillName = decodeInlineSkillHref(props.href);
-  if (!skillName) {
+  const decoded = decodeInlineSkillHref(props.href);
+  if (!decoded) {
     return label;
   }
 
-  return inlineSkillPreview.renderInlineSkillPreview(skillName, label);
+  return inlineSkillPreview.renderInlineSkillPreview(
+    decoded.skillName,
+    label,
+    decoded.fallbackSkillName
+  );
 }
 
 function MarkdownAnchor(props: AnchorProps): ReactNode {
@@ -486,7 +490,11 @@ export const markdownComponents = {
 
     // Handle mermaid diagrams specially
     if (!isInline && language === "mermaid") {
-      return <Mermaid chart={childString} />;
+      return (
+        <LazyFeature name="Diagram" fallback={<MermaidPendingFrame />}>
+          <Mermaid chart={childString} />
+        </LazyFeature>
+      );
     }
 
     // Code blocks with language - use async Shiki highlighting

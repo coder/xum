@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { waitFor } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "@storybook/test";
 import type { ReactNode } from "react";
 import { BackgroundBashProvider } from "@/browser/contexts/BackgroundBashContext";
 import { BashBackgroundListToolCall } from "@/browser/features/Tools/BashBackgroundListToolCall";
@@ -370,4 +370,54 @@ export const OverflowNotice: Story = {
       />
     </ToolStoryShell>
   ),
+};
+
+/**
+ * A tool_pre or plugin tool.execute.before hook blocked the call: the result is `{ error }`
+ * without `success` (#6044). The expanded card shows the hook's reason, at phone width too.
+ */
+/** A long unbroken token (no spaces or hyphens): it must wrap inside the error box at phone width. */
+const LONG_POLICY_PATH =
+  "/home/runner/work/acme_monorepo/acme_monorepo/.xum/hooks/policies/protected_branches/force_push_guard/main_branch_protection_policy.sh";
+
+export const HookBlockedPhone: Story = {
+  parameters: { pixel: { matrix: { themes: ["dark"], viewports: ["phone"] } } },
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  render: () => (
+    <ToolStoryShell>
+      {/* Fixed phone width: the test runner ignores viewport globals (AGENTS.md). */}
+      <div style={{ width: 390, maxWidth: "100%" }} data-testid="phone-frame">
+        <BashToolCall
+          workspaceId={STORYBOOK_WORKSPACE_ID}
+          toolCallId="hook-blocked"
+          args={{
+            script: "rm -rf ./build && git push --force origin main",
+            run_in_background: false,
+            timeout_secs: 30,
+            display_name: "Force push",
+          }}
+          // The runtime shape a blocking hook returns; the static result type omits it.
+          result={
+            {
+              error: `Blocked by hook: force-pushing to main is not allowed in this repository. Open a pull request instead. Policy: ${LONG_POLICY_PATH}`,
+            } as unknown as NonNullable<Parameters<typeof BashToolCall>[0]["result"]>
+          }
+          status="failed"
+        />
+      </div>
+    </ToolStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(canvas.getByText("rm -rf ./build && git push --force origin main"));
+    await expect(await canvas.findByText(/^Blocked by hook: force-pushing/)).toBeVisible();
+    // No horizontal overflow, the long unbroken path included.
+    const frame = canvas.getByTestId("phone-frame");
+    await expect(frame.scrollWidth).toBeLessThanOrEqual(frame.clientWidth + 1);
+    const reason = canvas.getByText(/^Blocked by hook: force-pushing/);
+    await expect(reason.scrollWidth).toBeLessThanOrEqual(reason.clientWidth + 1);
+    await expect(reason.getBoundingClientRect().right).toBeLessThanOrEqual(
+      frame.getBoundingClientRect().right + 1
+    );
+  },
 };

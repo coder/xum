@@ -2,19 +2,20 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
 
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  getAutoRoutingPick,
+  getPendingAiSelection,
+  markAiSelectionIntent,
+  setWorkspaceAgentPick,
+} from "@/browser/utils/aiSelectionIntent";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import {
   consumeWorkspaceModelChange,
-  recordAutoRoutingChoiceForAgent,
   setAutoRoutingChoice,
   setWorkspaceModelWithOrigin,
 } from "@/browser/utils/modelChange";
-import {
-  AUTO_ROUTING_CHOICE_BY_AGENT_MAX_CHARS,
-  getAgentIdKey,
-  getAutoModelRoutingKey,
-  getAutoRoutingChoiceByAgentKey,
-} from "@/common/constants/storage";
+import { getProjectScopeId } from "@/common/constants/storage";
+import { getAutoRouting } from "@/browser/utils/workspaceAiSettingsSync";
 
 let workspaceCounter = 0;
 
@@ -36,32 +37,44 @@ describe("modelChange", () => {
     restoreDomGlobals();
   });
 
-  test("explicit user and agent picks turn Auto off; sync keeps it", () => {
+  test("an explicit user pick turns Auto off; sync keeps it", () => {
     const workspaceId = nextWorkspaceId();
-    const autoKey = getAutoModelRoutingKey(workspaceId);
 
-    updatePersistedState(autoKey, true);
+    setAutoRoutingChoice(workspaceId, "model", true);
     setWorkspaceModelWithOrigin(workspaceId, "openai:gpt-5.2-codex", "sync");
-    expect(readPersistedState(autoKey, false)).toBe(true);
+    expect(getAutoRouting(workspaceId, "model")).toBe(true);
 
-    setWorkspaceModelWithOrigin(workspaceId, "anthropic:claude-sonnet-4-5", "agent");
-    expect(readPersistedState(autoKey, false)).toBe(false);
-
-    updatePersistedState(autoKey, true);
-    setWorkspaceModelWithOrigin(workspaceId, "openai:gpt-5.2-codex", "user");
-    expect(readPersistedState(autoKey, false)).toBe(false);
+    setWorkspaceModelWithOrigin(workspaceId, "anthropic:claude-sonnet-4-5", "user");
+    expect(getAutoRouting(workspaceId, "model")).toBe(false);
   });
 
-  test("records workspace routing picks per agent without a local experiment override", () => {
+  test("a legacy workspace id that starts with __ records the pick as unsent", () => {
+    const legacyId = "__proj-main";
+    setWorkspaceModelWithOrigin(legacyId, "openai:gpt-5.2-codex", "user");
+    expect(getPendingAiSelection(legacyId, "exec", "model")).toBe("openai:gpt-5.2-codex");
+  });
+
+  test("a project without its own agent records Auto picks for the inherited global agent", () => {
+    getAppConfigStore().updateOptimistically({
+      userPreferences: { ai: { globalDefaults: { agentId: "plan" } } },
+    });
+    const scopeId = getProjectScopeId("/model-change-project");
+    setAutoRoutingChoice(scopeId, "model", true);
+    getAppConfigStore().updateOptimistically({ userPreferences: undefined });
+    expect(getAutoRoutingPick(scopeId, "plan", "model")).toBe(true);
+  });
+
+  test("records routing picks for the selected agent only", () => {
     const workspaceId = nextWorkspaceId();
-    updatePersistedState(getAgentIdKey(workspaceId), "plan");
+    setWorkspaceAgentPick(workspaceId, "plan");
 
     setAutoRoutingChoice(workspaceId, "thinkingLevel", true);
+    setAutoRoutingChoice(workspaceId, "model", true);
     setWorkspaceModelWithOrigin(workspaceId, "openai:gpt-5.2-codex", "user");
 
-    expect(readPersistedState(getAutoRoutingChoiceByAgentKey(workspaceId), {})).toEqual({
-      plan: { thinkingLevel: true, model: false },
-    });
+    expect(getAutoRouting(workspaceId, "thinkingLevel", "plan")).toBe(true);
+    expect(getAutoRouting(workspaceId, "model", "plan")).toBe(false);
+    expect(getAutoRouting(workspaceId, "thinkingLevel", "exec")).toBe(false);
   });
 
   test("does not record explicit entries for no-op model changes", () => {
@@ -69,7 +82,7 @@ describe("modelChange", () => {
     const model = "openai:gpt-5.2-codex";
     const otherModel = "anthropic:claude-sonnet-4-5";
 
-    setWorkspaceModelWithOrigin(workspaceId, model, "sync");
+    markAiSelectionIntent(workspaceId, "model", model);
 
     // Simulate user selecting the already-active model.
     setWorkspaceModelWithOrigin(workspaceId, model, "user");
@@ -141,23 +154,5 @@ describe("modelChange", () => {
 
     // A persisted rewrite to the passthrough alias must still consume the entry.
     expect(consumeWorkspaceModelChange(workspaceId, gatewayAlias)).toBe("user");
-  });
-
-  // Choices accumulate one entry per agent. Past the key budget the value would only live in
-  // memory, so after a reload the newest explicit choices would be lost.
-  test("keeps the newest per-agent routing choices on disk as agents accumulate", () => {
-    const workspaceId = nextWorkspaceId();
-    const agentIds = Array.from({ length: 12 }, (_, index) =>
-      `custom-agent-${index}`.padEnd(64, "x")
-    );
-    for (const agentId of agentIds) {
-      recordAutoRoutingChoiceForAgent(workspaceId, agentId, { model: true, thinkingLevel: false });
-    }
-
-    const stored = localStorage.getItem(getAutoRoutingChoiceByAgentKey(workspaceId))!;
-    expect(stored.length).toBeLessThanOrEqual(AUTO_ROUTING_CHOICE_BY_AGENT_MAX_CHARS);
-    expect(JSON.parse(stored)).toMatchObject({
-      [agentIds[agentIds.length - 1]]: { model: true, thinkingLevel: false },
-    });
   });
 });

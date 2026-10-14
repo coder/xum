@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { EXPERIMENTS, EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { WorkflowTaskMetadataSchema } from "./workspace";
 import {
   StructuredTaskOutputSchema,
@@ -227,6 +226,18 @@ describe("workflow domain schemas", () => {
     expect(record.evaluation).toEqual(admission);
     expect(record.taskId).toBeUndefined();
 
+    // A minute-precision deadline (zod 4.4 accepted it) stays readable in persisted records.
+    const minuteDeadline = { ...admission, attemptDeadlineAt: "2026-05-29T00:01Z" };
+    expect(
+      WorkflowStepRecordSchema.safeParse({
+        stepId: "screen-issue",
+        inputHash: "sha256:screen-issue",
+        status: "started",
+        startedAt: "2026-05-29T00:00Z",
+        evaluation: minuteDeadline,
+      }).success
+    ).toBe(true);
+
     // Agent/patch records never carry the field and must keep parsing.
     const agentRecord = WorkflowStepRecordSchema.parse({
       stepId: "reserve-child",
@@ -313,14 +324,5 @@ describe("workflow task metadata schema", () => {
       stepId: "claims",
       outputSchema: { type: "object" },
     });
-  });
-});
-
-describe("workflow experiment gate", () => {
-  test("keeps dynamic workflows opt-in during rollout", () => {
-    const experiment = EXPERIMENTS[EXPERIMENT_IDS.DYNAMIC_WORKFLOWS];
-
-    expect(experiment.enabledByDefault).toBe(false);
-    expect(experiment.showInSettings).toBe(true);
   });
 });

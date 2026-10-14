@@ -66,7 +66,7 @@ test.describe("chat typing performance profiling", () => {
       timeout: 20_000,
     });
 
-    const input = page.getByRole("textbox", { name: "Message Claude" });
+    const input = page.getByRole("textbox", { name: "Message", exact: true });
     await input.fill("");
 
     const { chromeProfile, reactProfile } = await profileChatInputTyping({
@@ -89,7 +89,7 @@ test.describe("chat typing performance profiling", () => {
     const projectName = path.basename(workspace.demoProject.projectPath);
     await page.getByRole("button", { name: `Create workspace in ${projectName}` }).click();
 
-    const input = page.getByRole("textbox", { name: "Message Claude" });
+    const input = page.getByRole("textbox", { name: "Message", exact: true });
     await expect(input).toBeVisible({ timeout: 20_000 });
 
     // Creation initializes branches, runtime availability, Coder status, and auto-naming

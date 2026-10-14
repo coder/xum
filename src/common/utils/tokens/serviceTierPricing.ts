@@ -118,10 +118,10 @@ const DOUBLE_BOTH_BANDS: TierFactor = { factor: 2, longContext: true };
 const fastShortOnly = (factor: number): TierFactor => ({ factor, longContext: false });
 /**
  * OpenAI prices Ultrafast at 6x the model's Standard rate in both context bands
- * (gpt-6-astra: $60/$6/$75/$300 short, $120/$12/$150/$450 long). Only Astra has a
- * published card, so this factor also prices models whose Ultrafast rate is not
- * published yet instead of the lower highest-published fallback, keeping the
- * budget rule's "never under-count" promise.
+ * (gpt-6-astra: $60/$6/$75/$300 short, $120/$12/$150/$450 long; gpt-6.1-sol was
+ * announced 2026-10-08 at $12 input / $60 output, also 6x). This factor also
+ * prices models whose Ultrafast rate is not published instead of the lower
+ * highest-published fallback, keeping the budget rule's "never under-count" promise.
  */
 const ULTRAFAST_SIX_BOTH_BANDS: TierFactor = { factor: 6, longContext: true };
 
@@ -142,7 +142,11 @@ const SERVICE_TIER_FACTORS: Readonly<
     fast: DOUBLE_BOTH_BANDS,
     ultrafast: ULTRAFAST_SIX_BOTH_BANDS,
   },
-  "gpt-6.1-sol": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
+  "gpt-6.1-sol": {
+    flex: HALF_BOTH_BANDS,
+    fast: DOUBLE_BOTH_BANDS,
+    ultrafast: ULTRAFAST_SIX_BOTH_BANDS,
+  },
   "gpt-6-luna": { flex: HALF_BOTH_BANDS, fast: DOUBLE_BOTH_BANDS },
   // Unsupported older models stay here: they remain routable as custom/persisted
   // strings and LiteLLM still prices their Standard rates, so dropping the factor

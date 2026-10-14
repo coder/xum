@@ -58,7 +58,9 @@ Use this index to find a page's:
   - **Workspaces**
     - Workspaces (`/workspaces`) → `references/docs/workspaces/index.mdx`: Isolated development environments for parallel agent work
     - Scratch chats (`/workspaces/scratch-chats`) → `references/docs/workspaces/scratch-chats.mdx`: Start a durable chat with an app-managed folder and no project or Git repository.
+    - Artifacts (`/workspaces/artifacts`) → `references/docs/workspaces/artifacts.mdx`: View the HTML, Markdown, JSON and other files an agent writes, in a tab beside the chat.
     - Forking Workspaces (`/workspaces/fork`) → `references/docs/workspaces/fork.mdx`: Clone workspaces with conversation history to explore alternatives
+    - Side Chats (`/workspaces/side-chats`) → `references/docs/workspaces/side-chats.mdx`: Ask a quick side question without derailing the main chat
     - .xumignore (`/workspaces/xumignore`) → `references/docs/workspaces/xumignore.mdx`: Sync gitignored files to worktree workspaces
     - **Compaction**
       - Compaction (`/workspaces/compaction`) → `references/docs/workspaces/compaction/index.mdx`: Managing conversation context size with compaction
@@ -87,9 +89,9 @@ Use this index to find a page's:
     - System Prompt (`/agents/system-prompt`) → `references/docs/agents/system-prompt.mdx`: How Xum constructs the system prompt for AI models
     - Prompting Tips (`/agents/prompting-tips`) → `references/docs/agents/prompting-tips.mdx`: Tips and tricks for getting the most out of your AI agents
     - Best of N (`/agents/best-of-n`) → `references/docs/agents/best-of-n.mdx`: Improve plans, analysis, and reviews by asking Xum to explore multiple candidate answers in parallel
+    - Computer Use (`/agents/computer-use`) → `references/docs/agents/computer-use.mdx`: Let agents see your screen and use the mouse and keyboard of the machine running Xum
   - **Configuration**
     - MCP Servers (`/config/mcp-servers`) → `references/docs/config/mcp-servers.mdx`: Extend agent capabilities with Model Context Protocol servers
-    - Policy File (`/config/policy-file`) → `references/docs/config/policy-file.mdx`: Admin-enforced restrictions for providers, models, MCP, and runtimes
     - Project Secrets (`/config/project-secrets`) → `references/docs/config/project-secrets.mdx`: Manage environment variables and API keys for your projects
     - Agentic Git Identity (`/config/agentic-git-identity`) → `references/docs/config/agentic-git-identity.mdx`: Configure a separate Git identity for AI-generated commits
     - Keyboard Shortcuts (`/config/keybinds`) → `references/docs/config/keybinds.mdx`: Complete keyboard shortcut reference for Xum
@@ -107,6 +109,8 @@ Use this index to find a page's:
   - **Reference**
     - Mux compatibility (`/reference/mux-compatibility`) → `references/docs/reference/mux-compatibility.mdx`: Upgrade, downgrade, storage, command, environment, and deep-link compatibility during the Xum rename
     - Debugging (`/reference/debugging`) → `references/docs/reference/debugging.mdx`: View live backend logs and diagnose issues
+    - Profiling Xum (`/reference/profiling`) → `references/docs/reference/profiling.mdx`: Record performance samples, CPU profiles and hang stacks to find out why Xum is slow
+    - Code benchmarks (`/reference/code-benchmarks`) → `references/docs/reference/code-benchmarks.mdx`: Measure TypeScript functions with mitata microbenchmarks and compare two revisions with confidence intervals
     - Telemetry (`/reference/telemetry`) → `references/docs/reference/telemetry.mdx`: What Xum collects, what it doesn’t, and how to disable it
     - Storybook (`/reference/storybook`) → `references/docs/reference/storybook.mdx`: Develop and test Xum UI states in isolation
     - Terminal Benchmarking (`/reference/benchmarking`) → `references/docs/reference/benchmarking.mdx`: Run Terminal-Bench benchmarks with the Xum adapter

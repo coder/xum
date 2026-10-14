@@ -6,8 +6,8 @@
 #   make help          - Show all available targets
 #   make dev           - Start development server with hot reload
 #   make build         - Build all targets (parallel when possible)
-#   make static-check  - Run fast local static checks (lint + typecheck + fmt-check)
-#   make static-check-full - Run the full CI static check suite
+#   make static-check  - Run fast local static checks (oxlint + typecheck + fmt-check)
+#   make static-check-full - Run the full CI static check suite (adds type-aware ESLint on all files)
 #   make test          - Run tests
 #
 # Parallelism:
@@ -81,19 +81,24 @@ TOKENIZER_ENCODINGS := claude o200k_base cl100k_base p50k_base
 TOKENIZER_ENCODING_BUNDLES := $(foreach e,$(TOKENIZER_ENCODINGS),dist/runtime/tokenizer-encoding-$(e).js)
 ESBUILD_TOKENIZER_WORKER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/tokenizer.worker.js --minify $(foreach e,$(TOKENIZER_ENCODINGS),--alias:ai-tokenizer/encoding/$(e)=./tokenizer-encoding-$(e).js) --external:./tokenizer-encoding-*
 ESBUILD_MCP_ICON_WORKER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/mcpIconDecode.js --external:sharp --minify
+# The analytics worker loads DuckDB's native bindings, which esbuild cannot bundle; the
+# Docker runtime stage copies node_modules/@duckdb next to the other externalized modules.
+ESBUILD_ANALYTICS_WORKER_FLAGS := --bundle --platform=node --target=node22 --format=cjs --outfile=dist/runtime/analyticsWorker.js --external:@duckdb/* --external:electron --minify
 
 # Include formatting rules
 include fmt.mk
 
 .PHONY: all build dev start clean help
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
-.PHONY: lint lint-fix typecheck static-check static-check-full
-.PHONY: test test-unit test-unit-ci test-integration test-watch test-coverage test-e2e test-e2e-perf smoke-test
+.PHONY: lint lint-eslint lint-full lint-fix check-oxlint-config typecheck static-check static-check-full
+.PHONY: crap crap-check test-crap-scripts
+.PHONY: test-bugbash-repros test-bugbash-known-failures bugbash-sandbox-key bugbash-sandbox-image bugbash-sandbox-publish bug-bash-sandbox-recover bug-bash-sandbox-check test-bugbash-repros-sandbox
+.PHONY: test test-unit test-unit-ci test-integration test-watch test-coverage test-e2e test-e2e-perf perf-tape-replay smoke-test
 .PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
 .PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook storybook-budget
-.PHONY: benchmark-terminal
+.PHONY: benchmark-terminal bench bench-compare first-load-js page-timing first-run-view-parity bug-bash mcp-apps-e2e
 .PHONY: ensure-deps mux
 .PHONY: check-startup-imports check-startup-imports-runtime check-react-compiler check-test-routing check-test-seam-comments test-bench-scripts
 
@@ -215,6 +220,81 @@ dev-desktop-sandbox: ## Start an isolated Electron dev instance (fresh XUM_ROOT 
 dev-server-sandbox: ## Start an isolated dev-server instance (fresh XUM_ROOT + free ports)
 	@bun scripts/dev-server-sandbox.ts $(DEV_SERVER_SANDBOX_ARGS)
 
+# bug-bash runs each e2e explore charter in its own bug-bash sandbox container (tests/bugbash/run.ts,
+# #5714): a model picks its actions, so it never runs on the host. The explorers reach their models
+# through a provider proxy per job, so the host needs BUGBASH_BUDGET_USD (one list-price cap for
+# the run) and ANTHROPIC_API_KEY plus ANTHROPIC_BASE_URL. The app AI is BUGBASH_AI (default auto:
+# run.ts probes BUGBASH_APP_MODEL through the run's budget, and falls back to the mock when the
+# upstream is unavailable). The containers mount dist/. The checks (env, Docker, the image) run
+# before the build, so a missing one refuses in about a second once the image is cached, not
+# after the build. The first run pulls the image (about 1.4 GB), which takes minutes.
+# Do not name a build goal (build-main, build-renderer, build-static) on the same make command line
+# as bug-bash or mcp-apps-e2e: under -j the top-level make and the inner $(MAKE) build it twice at once.
+bug-bash: ## Agent bug bash in the bug-bash sandbox: e2e explore charters x models (needs BUGBASH_BUDGET_USD)
+	@bun tests/bugbash/run.ts --preflight $(BUGBASH_ARGS)
+	@$(MAKE) --no-print-directory build-main build-renderer build-static
+	@bun tests/bugbash/run.ts $(BUGBASH_ARGS)
+
+# The bug-bash sandbox image (tests/bugbash/sandbox/build.sh, #5714). Each prints one value on
+# stdout. Publishing runs only in the manual "Bug-bash sandbox image" workflow on main.
+bugbash-sandbox-key: ## Print the inputs key of the bug-bash sandbox image for this checkout
+	@./tests/bugbash/sandbox/build.sh --key
+
+bugbash-sandbox-image: ## Build the bug-bash sandbox image locally (linux/amd64) and print its image ID
+	@./tests/bugbash/sandbox/build.sh
+
+bugbash-sandbox-publish: ## Workflow only: build and push the bug-bash sandbox image, print its image.json record
+	@./tests/bugbash/sandbox/build.sh --push
+
+# The sandbox self-check (tests/bugbash/sandbox/selfCheckRun.ts, #5714): three jobs through the real
+# launcher against a fake upstream, so it costs nothing and needs no key. CI runs it (bugbash-sandbox).
+bug-bash-sandbox-check: build-main build-renderer build-static ## Check the bug-bash sandbox's isolation, proxy and export on this host ($$0, fake upstream)
+	@cd tests/bugbash && bun sandbox/selfCheckRun.ts
+
+# The repros of fixed bugs through the sandbox launcher, all on the mock app AI (the launcher gives
+# exact-step runs no model). CI's bugbash-sandbox job runs this.
+test-bugbash-repros-sandbox: build-main build-renderer build-static ## Bug-bash repros of fixed bugs in the bug-bash sandbox, mock app AI (no key, no model)
+	@cd tests/bugbash && BUGBASH_AI=mock BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="sandbox repros" bun sandbox/launch.ts -- run --config e2e.config.ts --exclude-tag known-failure --output .e2e/repros-sandbox-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ $(BUGBASH_REPRO_ARGS)
+
+# Every sandbox launch lists the job containers that crashed launches of this checkout left
+# (#5882). This removes the ones whose launcher is gone, by ID, and lists the rest.
+bug-bash-sandbox-recover: ## Remove bug-bash sandbox containers of this checkout whose launcher is gone
+	@cd tests/bugbash && bun sandbox/launch.ts --recover
+
+# Bug-bash repro tests (tests/bugbash/repros/*.e2e.ts): exact UI steps, no model calls, against a
+# seeded `xum server` (tests/bugbash/startApp.ts). e2e needs Node.js 22.22.3+ or 24.8+ (E2E_NODE)
+# and its own Chromium: `node_modules/.bin/e2e-web install chromium`.
+E2E_NODE ?= node
+BUGBASH_REPRO_RUN = cd tests/bugbash && E2E_TELEMETRY_DISABLED=1 PATH="$$(dirname "$$(command -v $(E2E_NODE))"):$$PATH" $(E2E_NODE) ../../node_modules/.bin/e2e run --config e2e.config.ts
+
+test-bugbash-repros: build-main build-renderer build-static ## Bug-bash repro tests of fixed bugs (tag known-failure excluded; BUGBASH_REPRO_ARGS)
+	@# A BUGBASH_REPRO_ARGS filter can select tests of one phase only, so each phase may select nothing
+	@# (--pass-with-no-tests). The last step fails when the whole run selected no test. Old reports go first,
+	@# so that step never counts a previous run.
+	@rm -rf tests/bugbash/.e2e/repros-mock tests/bugbash/.e2e/repros
+	@# [mock:...] prompts and terminals only work against the mock AI, so repros tagged mock-only pin it. Export
+	@# it: a `VAR=x cd ... && e2e` prefix would set it for `cd` only.
+	@export BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="mock-only repros"; $(BUGBASH_REPRO_RUN) --tag mock-only --exclude-tag known-failure --pass-with-no-tests --output .e2e/repros-mock $(BUGBASH_REPRO_ARGS)
+	@# The other repros run on the app AI that BUGBASH_AI picks (default auto: real with a working key).
+	@ai="$$(bun tests/bugbash/aiMode.ts)" || exit 2; eval "$$ai"; $(BUGBASH_REPRO_RUN) --exclude-tag mock-only --exclude-tag known-failure --pass-with-no-tests --output .e2e/repros $(BUGBASH_REPRO_ARGS)
+	@bun tests/bugbash/reproSelection.ts tests/bugbash/.e2e/repros-mock/report.json tests/bugbash/.e2e/repros/report.json
+
+test-bugbash-known-failures: build-main build-renderer build-static ## Bug-bash repros of open bugs: each fails until its issue is fixed
+	@export BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="known-failure repros"; $(BUGBASH_REPRO_RUN) --tag known-failure --output .e2e/repros-known $(BUGBASH_REPRO_ARGS)
+
+# The MCP Apps suite runs only in the bug-bash sandbox (tests/bugbash/sandbox/launch.ts, #5714).
+# agent.act steps reach BUGBASH_MODEL through a provider proxy for the job, so the host needs
+# BUGBASH_BUDGET_USD (a list-price cap) and ANTHROPIC_API_KEY plus ANTHROPIC_BASE_URL. Its seed
+# writes the MCP chat directly, so the app AI stays the mock. The container mounts dist/. As in
+# bug-bash, the checks run before the build, and no build goal may share its make command line.
+MCP_APPS_LAUNCH = cd tests/bugbash && BUGBASH_AI=mock BUGBASH_AI_RESOLVED=mock BUGBASH_AI_REASON="MCP Apps suite" bun sandbox/launch.ts
+mcp-apps-e2e: ## MCP Apps e2e suite in the bug-bash sandbox (needs BUGBASH_BUDGET_USD)
+	@$(MCP_APPS_LAUNCH) --preflight -- run --config e2e.mcpapps.config.ts --output .e2e/mcp-apps-preflight $(MCP_APPS_E2E_ARGS)
+	@$(MAKE) --no-print-directory build-main build-renderer build-static
+	@# The app AI is pinned to the mock, also over an exported BUGBASH_AI_RESOLVED. The shell PID
+	@# keeps two runs that start in the same second apart (their output and proxy record).
+	@$(MCP_APPS_LAUNCH) -- run --config e2e.mcpapps.config.ts --output .e2e/mcp-apps-$$(date -u +%Y%m%dT%H%M%SZ)-$$$$ $(MCP_APPS_E2E_ARGS)
+
 rlm-eval: ## Run the RLM lever eval against a running dev-server sandbox (see scripts/rlm-eval/run.ts header)
 	@bun run scripts/rlm-eval/run.ts $(RLM_EVAL_ARGS)
 
@@ -285,6 +365,7 @@ dist/preload.js: src/desktop/preload.ts $(TS_SOURCES)
 build-renderer: node_modules/.installed src/version.ts ## Build renderer process
 	@echo "Building renderer..."
 	@bun x vite build
+	@bun scripts/precompress-static.ts dist
 
 build-static: ## Copy static assets to dist
 	@echo "Copying static assets..."
@@ -309,7 +390,7 @@ build-static: ## Copy static assets to dist
 		cp "$$f" "dist/typescript-lib/$$(basename $$f).txt"; \
 	done
 
-build-docker-runtime: build-main build-renderer build-static dist/runtime/server-bundle.js dist/runtime/tokenizer.worker.js dist/runtime/mcpIconDecode.js dist/static/.copied ## Build Docker runtime artifacts
+build-docker-runtime: build-main build-renderer build-static dist/runtime/server-bundle.js dist/runtime/tokenizer.worker.js dist/runtime/mcpIconDecode.js dist/runtime/analyticsWorker.js dist/static/.copied ## Build Docker runtime artifacts
 
 verify-docker-runtime-artifacts: build-docker-runtime ## Verify required Docker runtime artifacts exist
 	@test -f dist/runtime/server-bundle.js
@@ -319,6 +400,7 @@ verify-docker-runtime-artifacts: build-docker-runtime ## Verify required Docker 
 		grep -qF "./tokenizer-encoding-$$e.js" dist/runtime/tokenizer.worker.js || exit 1; \
 	done
 	@test -f dist/runtime/mcpIconDecode.js
+	@test -f dist/runtime/analyticsWorker.js
 	@test -f dist/static/splash.html
 	@test -f dist/typescript-lib/lib.es2023.d.ts.txt
 
@@ -349,10 +431,19 @@ dist/runtime/mcpIconDecode.js: build-main
 	@mkdir -p dist/runtime
 	@$(ESBUILD_BIN) dist/node/workers/mcpIconDecode.js $(ESBUILD_MCP_ICON_WORKER_FLAGS)
 
+# AnalyticsService starts analyticsWorker.js from the directory of the running server
+# bundle, so the server image must ship it next to server-bundle.js (#5603).
+dist/runtime/analyticsWorker.js: build-main
+	@echo "Bundling analytics worker for Docker..."
+	@test -f dist/node/services/analytics/analyticsWorker.js
+	@mkdir -p dist/runtime
+	@$(ESBUILD_BIN) dist/node/services/analytics/analyticsWorker.js $(ESBUILD_ANALYTICS_WORKER_FLAGS)
+
 .PHONY: test-mcp-icon-electron
 test-mcp-icon-electron: dist/runtime/mcpIconDecode.js ## Verify emitted and bundled icon workers with Electron's executable
-	@MCP_ICON_TEST_EXEC_PATH="$$(bun -p 'require("electron")')" MCP_ICON_TEST_WORKER_PATH="$(CURDIR)/dist/node/workers/mcpIconDecode.js" bun test src/node/services/mcpIconDecodeClient.test.ts
-	@MCP_ICON_TEST_EXEC_PATH="$$(bun -p 'require("electron")')" MCP_ICON_TEST_WORKER_PATH="$(CURDIR)/dist/runtime/mcpIconDecode.js" bun test src/node/services/mcpIconDecodeClient.test.ts
+	@# Electron 42+ downloads its binary on first require and logs that to stdout; keep only the path.
+	@MCP_ICON_TEST_EXEC_PATH="$$(bun -p 'require("electron")' | tail -n 1)" MCP_ICON_TEST_WORKER_PATH="$(CURDIR)/dist/node/workers/mcpIconDecode.js" bun test src/node/services/mcpIconDecodeClient.test.ts
+	@MCP_ICON_TEST_EXEC_PATH="$$(bun -p 'require("electron")' | tail -n 1)" MCP_ICON_TEST_WORKER_PATH="$(CURDIR)/dist/runtime/mcpIconDecode.js" bun test src/node/services/mcpIconDecodeClient.test.ts
 
 # Docker runtime keeps static assets under dist/static/ for compatibility with existing image layout.
 dist/static/.copied: static/splash.html
@@ -388,9 +479,15 @@ build/icon.png: docs/img/logo-white.svg scripts/generate-icons.ts
 ## Quality checks (can run in parallel)
 # Keep the default local path fast. Docs link crawling and lockfile-free bench-agent
 # verification stay in static-check-full so local validation remains responsive.
-static-check: lint typecheck fmt-check check-startup-imports check-react-compiler check-code-docs-links check-test-routing check-test-seam-comments lint-shellcheck lint-hadolint ## Run fast local static checks
+# static-check lints with oxlint, which runs the eslint.config.mjs rules it supports in seconds
+# (.oxlintrc.json, kept in step by check-oxlint-config); static-check-full also runs type-aware
+# ESLint on all files, so CI still catches what oxlint cannot check, including type-aware
+# findings that a change surfaces in files it did not touch.
+STATIC_CHECKS := typecheck fmt-check check-startup-imports check-react-compiler check-code-docs-links check-test-routing check-test-seam-comments check-oxlint-config lint-shellcheck lint-hadolint
 
-static-check-full: static-check check-bench-agent test-bench-scripts check-docs-links ## Run the full CI static check suite
+static-check: lint $(STATIC_CHECKS) ## Run fast local static checks
+
+static-check-full: lint-full $(STATIC_CHECKS) check-bench-agent test-bench-scripts test-crap-scripts check-docs-links ## Run the full CI static check suite
 
 # Harbor version for benchmark-terminal and the adapter tests below, so CI tests the
 # adapter against the same Harbor API the scheduled benchmark runs.
@@ -402,8 +499,41 @@ test-bench-scripts: ## Test the Terminal-Bench result checker and agent adapter 
 	@# Harbor requires Python >=3.12 and CI's system python is older; uv fetches a managed 3.12 if needed.
 	@uv run --no-project --python 3.12 --with 'harbor==$(TB_HARBOR_VERSION)' --with pytest python -m pytest -q benchmarks/terminal_bench/mux_agent_test.py
 
+# CRAP scores (scripts/crap/). uv reads the Crapper and grammar pins from the
+# adapter's inline script header, so no virtualenv is committed or reused.
+CRAP_REPORT := uv run --quiet --script scripts/crap/crapper_report.py
+
+crap: ## Score every production src/ function with Crapper into .metrics/crap.json [COVERAGE="<lcov>..."]
+	@mkdir -p .metrics
+	@# Replace the last snapshot only after the report succeeds.
+	@$(CRAP_REPORT) --top 20 $(foreach lcov,$(COVERAGE),--lcov $(lcov)) > .metrics/crap.json.tmp
+	@mv .metrics/crap.json.tmp .metrics/crap.json
+	@echo "Wrote .metrics/crap.json"
+
+# The script exits 0 pass, 1 violations, 2 tool error; make reports any failure
+# as 2, so hooks and CI call the script directly.
+crap-check: ## CRAP gate on files changed since BASE (default: merge-base with origin/main) [COVERAGE="<lcov>..."] [CRAP_CHECK_ARGS=--json]
+	@bun scripts/crap/check.ts --base "$(or $(BASE),$$(git merge-base origin/main HEAD))" \
+		$(foreach lcov,$(COVERAGE),--coverage $(lcov)) $(CRAP_CHECK_ARGS)
+
+CRAP_PYTHON := PYTHONDONTWRITEBYTECODE=1 uv run --quiet --no-project --with pytest --with-requirements scripts/crap/crapper_report.py python
+
+test-crap-scripts: ## Test the Crapper adapter (hand-counted fixtures) and crap-check end to end (needs uv)
+	@# tree-sitter-language-pack downloads its grammars from GitHub releases on
+	@# first use. This target is in static-check-full (Required), so retry a
+	@# transient failure there (seen: HTTP 504) before the tests use them.
+	@for attempt in 1 2 3; do \
+		$(CRAP_PYTHON) -c 'from tree_sitter_language_pack import download; download(["typescript", "tsx", "javascript"])' && break; \
+		[ $$attempt -lt 3 ] || exit 1; echo "grammar download failed, retrying ($$attempt/3)" >&2; sleep 10; \
+	done
+	@$(CRAP_PYTHON) -m pytest -q -p no:cacheprovider scripts/crap/crapper_report_test.py
+	@bun test ./scripts/crap/check.test.ts ./scripts/crap/agentGate.test.ts
+
 check-test-routing: node_modules/.installed ## Fail when a *.test.ts(x) file is run by no CI lane (or by two)
 	@./scripts/check-test-routing.sh
+
+check-oxlint-config: node_modules/.installed ## Fail when .oxlintrc.json applies different rules than eslint.config.mjs to any lint file
+	@node scripts/check-oxlint-config.mjs
 
 # <1 s: the matcher's tests run first so a broken guard cannot pass vacuously.
 check-test-seam-comments: node_modules/.installed ## Fail when production code gains an unlisted "Exported for tests"-style comment
@@ -413,11 +543,19 @@ check-test-seam-comments: node_modules/.installed ## Fail when production code g
 check-bench-agent: node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Verify terminal-bench agent configuration and imports
 	@./scripts/check-bench-agent.sh
 
-lint: node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Run ESLint (typecheck runs in separate target)
+LINT_PREREQS := node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED)
+
+lint: $(LINT_PREREQS) ## Run oxlint on all files (the eslint.config.mjs rules it supports; no type-aware rules)
 	@./scripts/lint.sh
 
-lint-fix: node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Run linter with --fix
-	@./scripts/lint.sh --fix
+lint-eslint: $(LINT_PREREQS) ## Run oxlint, then type-aware ESLint on files changed since the merge base with origin/main [XUM_LINT_BASE=<ref>]
+	@./scripts/lint.sh --eslint
+
+lint-full: $(LINT_PREREQS) ## Run oxlint, then ESLint on all files, one ESLint run per machine at a time (as CI does)
+	@./scripts/lint.sh --full
+
+lint-fix: $(LINT_PREREQS) ## Run oxlint --fix, then ESLint --fix on changed files (scripts/lint.sh --full --fix for all files)
+	@./scripts/lint.sh --eslint --fix
 
 lint-actions: lint-actionlint lint-zizmor ## Lint GitHub Actions workflows
 
@@ -479,6 +617,14 @@ perf-workspace-scale: build-main ## Benchmark workspace-scale startup, RPCs, and
 		bun scripts/perf/workspace-scale/run-server-bench.ts --root "$$root" --label "$$label" --repetitions $(PERF_REPETITIONS) --launches "$$launches"; \
 	done
 
+.PHONY: perf-analyze
+perf-analyze: node_modules/.installed ## Rank CPU-profile hotspots: PROFILES="<paths>" [BASELINE="<paths>"] [PERF_ANALYZE_ARGS="--top 40"]
+	@if [ -z "$(strip $(PROFILES))" ]; then \
+		echo 'Usage: make perf-analyze PROFILES="<paths>" [BASELINE="<paths>"] [PERF_ANALYZE_ARGS="--top 40 --map-dir dist"]' >&2; \
+		exit 2; \
+	fi
+	@bun scripts/perf/analyzeProfiles.ts $(foreach path,$(BASELINE),--baseline $(path)) $(PERF_ANALYZE_ARGS) $(PROFILES)
+
 check-deadcode: node_modules/.installed ## Check for potential dead code (manual only, not in static-check)
 	@echo "Checking for potential dead code with ts-prune..."
 	@echo "(Note: Some unused exports are legitimate - types, public APIs, entry points, etc.)"
@@ -532,14 +678,20 @@ smoke-test: build ## Run smoke test on npm package
 	rm -f "$$TARBALL"; \
 	exit $$EXIT_CODE
 
-test-e2e: ## Run end-to-end tests
+BUGBASH_REPROS ?= 1
+test-e2e: ## Run end-to-end tests (Playwright, then the bug-bash repros unless BUGBASH_REPROS=0)
 	@$(MAKE) build
 	@XUM_E2E_LOAD_DIST=1 XUM_E2E_SKIP_BUILD=1 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 bun x playwright test --project=electron $(PLAYWRIGHT_ARGS)
+	@if [ "$(BUGBASH_REPROS)" != "0" ]; then $(MAKE) test-bugbash-repros; fi
 
 test-e2e-perf: ## Run automated performance profiling scenarios
 	@$(MAKE) build
 	@# One worker: parallel Electron apps contend on CPU, so a scenario measures its neighbours' startup (#5209).
 	@XUM_E2E_RUN_PERF=1 XUM_PROFILE_REACT=1 XUM_E2E_LOAD_DIST=1 XUM_E2E_SKIP_BUILD=1 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 bun x playwright test --project=electron tests/e2e/scenarios/perf*.spec.ts --workers 1 $(PLAYWRIGHT_ARGS)
+
+perf-tape-replay: ## Replay a synthetic session tape through the desktop app (perf.tapeReplay)
+	@$(MAKE) build
+	@XUM_E2E_RUN_PERF=1 XUM_PROFILE_REACT=1 XUM_E2E_LOAD_DIST=1 XUM_E2E_SKIP_BUILD=1 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 bun x playwright test --project=electron tests/e2e/scenarios/perf.tapeReplay.spec.ts --workers 1 $(PLAYWRIGHT_ARGS)
 
 ## Distribution
 dist: build ## Build distributable packages
@@ -575,13 +727,14 @@ dist-mac: build ## Build macOS distributables (x64 + arm64)
 		bun x electron-builder --mac --arm64 --publish never & pid2=$$! ; \
 		wait $$pid1 && wait $$pid2; \
 	fi
+	@# electron-updater skips an update when os.release() (the Darwin version) is below the
+	@# yml's minimumSystemVersion. Electron 44 needs macOS 13 (Darwin 22), so macOS 12 users
+	@# stay on the last release that still runs there instead of updating to one that won't start.
+	@for f in release/*-mac.yml; do \
+		[ -f "$$f" ] || continue; \
+		grep -q '^minimumSystemVersion:' "$$f" || echo 'minimumSystemVersion: 22.0.0' >> "$$f"; \
+	done
 	@echo "✅ Both architectures built successfully"
-
-dist-mac-release: build ## Build and publish macOS distributables (x64 + arm64)
-	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
-	@echo "🔐 Building macOS x64 + arm64 (unified for correct yml)..."
-	@bun x electron-builder --mac --x64 --arm64 --publish always
-	@echo "✅ Both architectures built and published successfully"
 
 # MAC_TARGETS narrows electron-builder's mac targets (e.g. MAC_TARGETS=dmg); empty keeps
 # package.json's full list. PR CI builds only the DMG it uploads; the auto-update zip
@@ -678,6 +831,21 @@ storybook-budget: node_modules/.installed ## Enforce the Pixel snapshot budget (
 	@node scripts/check-storybook-snapshot-budget.mjs --url $(or $(STORYBOOK_URL),http://127.0.0.1:6006)
 
 ## Benchmarks
+bench: node_modules/.installed src/version.ts ## Run *.bench.ts microbenchmarks (BENCH=<substring|glob>, RUNTIME=node|bun, JSON=<path>)
+	@bun scripts/perf/bench.ts --runtime $(or $(RUNTIME),node) $(if $(JSON),--json '$(JSON)') $(if $(BENCH),'$(BENCH)')
+
+bench-compare: node_modules/.installed src/version.ts ## Compare *.bench.ts results, base vs working tree (BENCH=<filter>, BASE=<ref>, ROUNDS=10, RUNTIME=node|bun)
+	@bun scripts/perf/benchCompare.ts --bench '$(BENCH)' --runtime $(or $(RUNTIME),node) --rounds $(or $(ROUNDS),10) $(if $(BASE),--base '$(BASE)')
+
+first-load-js: ## Report first-load JS bytes of dist/ (run make build-renderer first)
+	@bun scripts/perf/firstLoadJs.ts dist
+
+page-timing: node_modules/.installed ## Paired mobile UCS/IR timing of two built trees (PAGE_TIMING_ARGS; see scripts/perf/pageTiming.ts)
+	@node --import tsx scripts/perf/pageTiming.ts $(PAGE_TIMING_ARGS)
+
+first-run-view-parity: node_modules/.installed ## Static vs live first-run view boxes and screenshots, 4 widths x 2 themes (FIRST_RUN_VIEW_PARITY_ARGS; see scripts/perf/firstRunViewParity.ts)
+	@node --import tsx scripts/perf/firstRunViewParity.ts $(FIRST_RUN_VIEW_PARITY_ARGS)
+
 benchmark-terminal: ## Run Terminal-Bench 2.0 with Harbor (use TB_HARBOR_PACKAGE/TB_HARBOR_DAYTONA_PACKAGE/TB_DATASET/TB_CONCURRENCY/TB_TIMEOUT/TB_ENV/TB_MODEL/TB_ARGS to customize)
 	@# Pin Harbor with the Daytona extra so scheduled ingestion does not break on future CLI or adapter API drift.
 	@# Force the Daytona SDK to the cursor-pagination API while keeping Harbor stable.

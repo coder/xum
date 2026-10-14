@@ -10,8 +10,8 @@
  * ## Architecture
  *
  * Titlebar insets are centralized via CSS custom properties:
- * - `--titlebar-left-inset`: Space for macOS traffic lights (80px on darwin, 0 elsewhere)
- * - `--titlebar-right-inset`: Space for Windows/Linux overlay (138px on win32/linux, 0 elsewhere)
+ * - `--titlebar-left-inset`: Space for macOS traffic lights, or for overlay controls on the left
+ * - `--titlebar-right-inset`: Space for overlay controls on the right (win32/linux)
  *
  * Call `initTitlebarInsets()` once at app startup to set these properties on :root.
  * Components then use `var(--titlebar-left-inset)` in CSS/styles without needing
@@ -43,12 +43,16 @@ export function getDesktopPlatform(): NodeJS.Platform | undefined {
 export const MAC_TRAFFIC_LIGHTS_INSET = 80;
 
 /**
- * Right inset (in pixels) to reserve for Windows/Linux titlebar overlay buttons.
- * Only applies in Electron + Windows/Linux.
- *
- * The value accounts for min/max/close buttons (~138px on Windows).
+ * Fallback right inset (in pixels) for Windows/Linux overlay buttons when the
+ * overlay reports no geometry. The value accounts for min/max/close on Windows.
  */
-export const WIN_LINUX_OVERLAY_INSET = 138;
+const WIN_LINUX_OVERLAY_INSET = 138;
+
+// Windows/Linux draw native controls in a Window Controls Overlay. Electron 43+ puts the
+// Linux controls where the desktop does (left, right, or only a close button on GNOME),
+// so reserve the space the overlay reports instead of a fixed right inset.
+const OVERLAY_LEFT_INSET = "env(titlebar-area-x, 0px)";
+const OVERLAY_RIGHT_INSET = `calc(100vw - env(titlebar-area-x, 0px) - env(titlebar-area-width, calc(100vw - ${WIN_LINUX_OVERLAY_INSET}px)))`;
 
 /**
  * Desktop titlebar height in pixels. Keep in sync with the Tailwind classes below.
@@ -73,21 +77,7 @@ export function getTitlebarLeftInset(): number {
 }
 
 /**
- * Returns the right inset needed for Windows/Linux titlebar overlay.
- * Returns 0 if not in desktop mode or on macOS.
- */
-export function getTitlebarRightInset(): number {
-  if (!isDesktopMode()) return 0;
-  const platform = getDesktopPlatform();
-  if (platform === "win32" || platform === "linux") return WIN_LINUX_OVERLAY_INSET;
-  return 0;
-}
-
-/**
- * Initialize CSS custom properties for titlebar insets.
- * Call once at app startup. Sets:
- * - `--titlebar-left-inset`: macOS traffic lights (80px) or 0
- * - `--titlebar-right-inset`: Windows/Linux overlay (138px) or 0
+ * Initialize CSS custom properties for titlebar insets. Call once at app startup.
  *
  * Components can then use these variables without importing platform logic:
  * ```css
@@ -97,7 +87,12 @@ export function getTitlebarRightInset(): number {
 export function initTitlebarInsets(): void {
   if (typeof document === "undefined") return;
 
+  const platform = isDesktopMode() ? getDesktopPlatform() : undefined;
+  const overlay = platform === "win32" || platform === "linux";
   const root = document.documentElement;
-  root.style.setProperty("--titlebar-left-inset", `${getTitlebarLeftInset()}px`);
-  root.style.setProperty("--titlebar-right-inset", `${getTitlebarRightInset()}px`);
+  root.style.setProperty(
+    "--titlebar-left-inset",
+    overlay ? OVERLAY_LEFT_INSET : `${getTitlebarLeftInset()}px`
+  );
+  root.style.setProperty("--titlebar-right-inset", overlay ? OVERLAY_RIGHT_INSET : "0px");
 }

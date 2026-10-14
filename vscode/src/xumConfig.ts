@@ -37,7 +37,7 @@ export interface WorkspaceWithContext extends FrontendWorkspaceMetadata {
   extensionMetadata?: ExtensionMetadata;
 }
 
-function enrichAndSort(
+export function enrichAndSort(
   workspaces: FrontendWorkspaceMetadata[],
   extensionMeta: Map<string, ExtensionMetadata>
 ): WorkspaceWithContext[] {

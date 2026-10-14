@@ -1,5 +1,6 @@
 import type { CompactionHandler } from "../../compactionHandler";
 import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
+import { providerVisibleUserText } from "@/common/utils/messages/pluginHookContext";
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
 import { isSyntheticSnapshotUserMessage } from "@/common/types/message";
 import { createUserMessageId } from "../../utils/messageIds";
@@ -22,7 +23,6 @@ import type { AiSdkUsageLike } from "@/common/utils/tokens/usageHelpers";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { isAnthropic1MEffectivelyEnabled } from "@/common/utils/ai/providerOptions";
 import { createRuntimeContextForWorkspace } from "@/node/runtime/runtimeHelpers";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { isSessionHistoryDisabled } from "@/common/utils/tools/toolPolicy";
 import {
   CONTEXT_CONTINUE_DEDUPE_KEY,
@@ -168,10 +168,6 @@ export class TokenBudgetStrategy {
         callerToolPolicy: options?.toolPolicy,
         cfg: this.deps.config.loadConfigOrDefault(),
         emitError: () => undefined,
-        isAdvisorExperimentEnabled:
-          options?.experiments?.advisorTool ??
-          this.deps.aiService.isExperimentEnabled(EXPERIMENT_IDS.ADVISOR_TOOL),
-        includeAgentPlugins: this.deps.aiService.isAgentPluginsEnabled?.() ?? false,
       });
       return resolved.success ? Ok(resolved.data) : Err(resolved.error);
     } catch (error) {
@@ -222,9 +218,7 @@ export class TokenBudgetStrategy {
     // overhead. Keep the model-scaled floor; final assembly checks the actual prompt.
     const estimate = await estimateFreshRequestTokensForModel(
       {
-        userText: userMessage.parts
-          .flatMap((part) => (part.type === "text" ? [part.text] : []))
-          .join("\n"),
+        userText: providerVisibleUserText(userMessage),
         attachments: userMessage.parts.filter((part) => part.type === "file"),
         prelude: prelude.map((row) => row.parts),
         modelContextLimit: maxTokens,
@@ -327,10 +321,8 @@ export class TokenBudgetStrategy {
       (tokenCount(usage?.input.tokens) ?? 0) +
       (tokenCount(usage?.cached.tokens) ?? 0) +
       (tokenCount(usage?.cacheCreate.tokens) ?? 0);
-    const userText = userMessage.parts
-      .filter((part) => part.type === "text")
-      .map((part) => part.text)
-      .join("\n");
+    // Includes the hook context the request renders into this row.
+    const userText = providerVisibleUserText(userMessage);
     const attachments = userMessage.parts.filter((part) => part.type === "file");
     const budgetModel = {
       model: options.model,
@@ -576,6 +568,7 @@ export class TokenBudgetStrategy {
         autoModelRouting: context.autoModelRouting,
         goalKind: context.goalKind,
         goalId: context.goalId,
+        taskTurnKind: context.taskTurnKind,
       };
       continuationEntryId = this.host.continuations.enqueue([entry], true);
     }

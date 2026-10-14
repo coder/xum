@@ -56,6 +56,8 @@ export const OpenAIProviderConfigSchema = BaseProviderConfigSchema.extend({
   defaultModel: z.string().optional(),
   apiVersion: z.string().optional(),
   webSocketTransportEnabled: z.boolean().optional(),
+  /** Offer Cyber (OpenAI Daybreak access program) in the thinking menu. Absent = off. */
+  cyberModelEnabled: z.boolean().optional(),
 });
 
 export const BedrockProviderConfigSchema = BaseProviderConfigSchema.extend({
@@ -142,6 +144,13 @@ export const CoderProviderConfigSchema = BaseProviderConfigSchema.extend({
    */
   additionalProviders: z.array(z.object({ name: z.string(), type: z.string() })).optional(),
   /**
+   * User preference mapping a canonical provider (anthropic/openai/google) to
+   * the same-type gateway instance that serves its native models when routing
+   * picks Coder (see resolveCoderCanonicalRouteInstance). Login, refresh, and
+   * disconnect never touch it.
+   */
+  canonicalRoutes: z.record(z.string(), z.string()).optional(),
+  /**
    * Cross-process disconnect generation (monotonic counter, incremented by
    * coderOauthService.disconnect). Each login flow snapshots the persisted
    * value at start; a flow whose snapshot no longer matches at commit time —
@@ -168,6 +177,7 @@ export const CoderProviderConfigSchema = BaseProviderConfigSchema.extend({
 export const GoogleProviderConfigSchema = BaseProviderConfigSchema;
 export const DeepSeekProviderConfigSchema = BaseProviderConfigSchema;
 export const MoonshotAIProviderConfigSchema = BaseProviderConfigSchema;
+export const MetaProviderConfigSchema = BaseProviderConfigSchema;
 export const ZaiProviderConfigSchema = BaseProviderConfigSchema;
 export const OllamaProviderConfigSchema = BaseProviderConfigSchema;
 export const GitHubCopilotProviderConfigSchema = BaseProviderConfigSchema;
@@ -179,6 +189,7 @@ export const ProvidersConfigSchema = z
     bedrock: BedrockProviderConfigSchema.optional(),
     openrouter: OpenRouterProviderConfigSchema.optional(),
     xai: XAIProviderConfigSchema.optional(),
+    meta: MetaProviderConfigSchema.optional(),
     "mux-gateway": MuxGatewayProviderConfigSchema.optional(),
     google: GoogleProviderConfigSchema.optional(),
     deepseek: DeepSeekProviderConfigSchema.optional(),

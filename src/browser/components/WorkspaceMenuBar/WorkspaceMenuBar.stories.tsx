@@ -172,7 +172,7 @@ export const ArchivingPhone: AppStory = {
     const canvas = within(canvasElement);
     await userEvent.click(await canvas.findByTestId("workspace-more-actions"));
     await userEvent.click(
-      await waitFor(() => within(document.body).getByRole("button", { name: /Archive chat/ }))
+      await waitFor(() => within(document.body).getByRole("button", { name: /Archive workspace/ }))
     );
 
     await waitFor(() => {

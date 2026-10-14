@@ -234,6 +234,45 @@ describe("gatewayModelCatalog", () => {
     ).toBe(false);
   });
 
+  test("accepts bare Gemini ids listed as models/<id> in a Coder catalog; removals stay exact", () => {
+    const catalog = ["agents-google/models/gemini-3.8-flash"];
+    expect(
+      isProviderModelAccessibleFromAuthoritativeCatalog(
+        "coder",
+        "agents-google/gemini-3.8-flash",
+        undefined,
+        catalog
+      )
+    ).toBe(true);
+    expect(
+      isProviderModelAccessibleFromAuthoritativeCatalog(
+        "coder",
+        "agents-google/gemini-3.8-pro",
+        undefined,
+        catalog
+      )
+    ).toBe(false);
+    expect(
+      isProviderModelAccessibleFromAuthoritativeCatalog(
+        "coder",
+        "agents-google/gemini-3.8-flash",
+        undefined,
+        catalog,
+        ["agents-google/gemini-3.8-flash"]
+      )
+    ).toBe(false);
+    // Tombstones are exact: removing the models/ form does not hide the bare id.
+    expect(
+      isProviderModelAccessibleFromAuthoritativeCatalog(
+        "coder",
+        "agents-google/gemini-3.8-flash",
+        undefined,
+        catalog,
+        ["agents-google/models/gemini-3.8-flash"]
+      )
+    ).toBe(true);
+  });
+
   test("gates Coder routing on the catalog whether models is missing, empty, or manual-only", () => {
     // The catalog verdict must not depend on the shape of `models`: missing
     // (hand-edited config), empty, or holding only unrelated manual entries.

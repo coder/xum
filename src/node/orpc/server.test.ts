@@ -1,8 +1,10 @@
 import { describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "fs/promises";
+import * as http from "http";
 import * as net from "net";
 import * as os from "os";
 import * as path from "path";
+import * as zlib from "zlib";
 import { WebSocket, WebSocketServer } from "ws";
 import { RPCLink as HTTPRPCLink } from "@orpc/client/fetch";
 import { createORPCClient } from "@orpc/client";
@@ -303,6 +305,413 @@ async function expectWebSocketOriginCase(input: {
   );
 }
 
+interface RawResponse {
+  status: number;
+  headers: http.IncomingHttpHeaders;
+  body: string;
+}
+
+// node:http instead of fetch: fetch decodes Content-Encoding transparently, which would hide
+// which file (identity, .br or .gz) the server actually sent.
+function rawRequest(
+  baseUrl: string,
+  urlPath: string,
+  options: { method?: string; headers?: Record<string, string> } = {}
+): Promise<RawResponse> {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      new URL(urlPath, baseUrl),
+      { method: options.method ?? "GET", headers: options.headers },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("end", () =>
+          resolve({
+            status: res.statusCode ?? 0,
+            headers: res.headers,
+            body: Buffer.concat(chunks).toString("utf-8"),
+          })
+        );
+        res.on("error", reject);
+      }
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+interface RawBuffer {
+  status: number;
+  headers: http.IncomingHttpHeaders;
+  body: Buffer;
+}
+
+// As rawRequest, but keeps the body as bytes so a compressed response can be decoded.
+function rawRequestBuffer(
+  baseUrl: string,
+  urlPath: string,
+  options: { headers?: Record<string, string> } = {}
+): Promise<RawBuffer> {
+  return new Promise((resolve, reject) => {
+    const req = http.request(new URL(urlPath, baseUrl), { headers: options.headers }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (chunk: Buffer) => chunks.push(chunk));
+      res.on("end", () =>
+        resolve({ status: res.statusCode ?? 0, headers: res.headers, body: Buffer.concat(chunks) })
+      );
+      res.on("error", reject);
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+function varyIncludesAcceptEncoding(headers: http.IncomingHttpHeaders): boolean {
+  const vary = headers.vary;
+  return (
+    vary
+      ?.split(",")
+      .map((value) => value.trim().toLowerCase())
+      .includes("accept-encoding") ?? false
+  );
+}
+
+describe("createOrpcServer hashed static asset compression", () => {
+  const HASHED_JS = "main-AbCd1234.js";
+  const IDENTITY_BODY = "console.log('identity body');";
+  // Distinct bytes and lengths per file so each assertion proves which file the server sent.
+  const BROTLI_BODY = "fake brotli payload";
+  const GZIP_BODY = "fake gzip payload, longer";
+  const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
+  const staticFiles = {
+    [HASHED_JS]: IDENTITY_BODY,
+    [`${HASHED_JS}.br`]: BROTLI_BODY,
+    [`${HASHED_JS}.gz`]: GZIP_BODY,
+    "plain-ZyXw9876.js": "console.log('no precompressed siblings');",
+    "manifest.json": '{"name":"xum"}',
+    "manifest.json.br": "unhashed brotli must never be sent",
+    "terminal.html": "<!doctype html><title>terminal</title>",
+  };
+
+  test("negotiates the precompressed file by Accept-Encoding and caches it as immutable", async () => {
+    const { server, close } = await createStaticTestServer({ files: staticFiles });
+
+    try {
+      const identity = await rawRequest(server.baseUrl, `/${HASHED_JS}`);
+      expect(identity.headers["content-type"]).toContain("javascript");
+
+      const cases: Array<{
+        urlPath: string;
+        acceptEncoding: string | undefined;
+        encoding: string | undefined;
+        body: string;
+      }> = [
+        // Browsers list gzip before br; brotli must still win.
+        {
+          urlPath: `/${HASHED_JS}`,
+          acceptEncoding: "gzip, deflate, br, zstd",
+          encoding: "br",
+          body: BROTLI_BODY,
+        },
+        { urlPath: `/${HASHED_JS}?v=1`, acceptEncoding: "br", encoding: "br", body: BROTLI_BODY },
+        { urlPath: `/${HASHED_JS}`, acceptEncoding: "gzip", encoding: "gzip", body: GZIP_BODY },
+        // A higher client q-value beats the server's brotli preference.
+        {
+          urlPath: `/${HASHED_JS}`,
+          acceptEncoding: "gzip;q=1, br;q=0.1",
+          encoding: "gzip",
+          body: GZIP_BODY,
+        },
+        {
+          urlPath: `/${HASHED_JS}`,
+          acceptEncoding: "identity;q=1, br;q=0.5",
+          encoding: undefined,
+          body: IDENTITY_BODY,
+        },
+        {
+          urlPath: `/${HASHED_JS}`,
+          acceptEncoding: undefined,
+          encoding: undefined,
+          body: IDENTITY_BODY,
+        },
+        {
+          urlPath: `/${HASHED_JS}`,
+          acceptEncoding: "identity",
+          encoding: undefined,
+          body: IDENTITY_BODY,
+        },
+        {
+          urlPath: `/${HASHED_JS}`,
+          acceptEncoding: "br;q=0, gzip;q=0",
+          encoding: undefined,
+          body: IDENTITY_BODY,
+        },
+        // No .br/.gz on disk: fall back to the identity file, not an error or the SPA HTML.
+        {
+          urlPath: "/plain-ZyXw9876.js",
+          acceptEncoding: "br, gzip",
+          encoding: undefined,
+          body: staticFiles["plain-ZyXw9876.js"],
+        },
+      ];
+
+      for (const testCase of cases) {
+        const label = `${testCase.urlPath} with Accept-Encoding ${testCase.acceptEncoding ?? "(none)"}`;
+        const res = await rawRequest(server.baseUrl, testCase.urlPath, {
+          headers: testCase.acceptEncoding ? { "Accept-Encoding": testCase.acceptEncoding } : {},
+        });
+        expect(res.status, label).toBe(200);
+        expect(res.headers["content-encoding"], label).toBe(testCase.encoding);
+        expect(res.body, label).toBe(testCase.body);
+        expect(res.headers["content-type"], label).toBe(identity.headers["content-type"]);
+        expect(varyIncludesAcceptEncoding(res.headers), label).toBe(true);
+        expect(res.headers["cache-control"], label).toBe(IMMUTABLE_CACHE_CONTROL);
+      }
+    } finally {
+      await close();
+    }
+  });
+
+  test("keeps existing headers for unhashed files", async () => {
+    const { server, close } = await createStaticTestServer({ files: staticFiles });
+
+    try {
+      const cases = [
+        {
+          urlPath: "/manifest.json",
+          cacheControl: "public, max-age=0",
+          body: staticFiles["manifest.json"],
+        },
+        {
+          urlPath: "/terminal.html",
+          cacheControl: "public, max-age=0",
+          body: staticFiles["terminal.html"],
+        },
+      ];
+
+      for (const testCase of cases) {
+        const res = await rawRequest(server.baseUrl, testCase.urlPath, {
+          headers: { "Accept-Encoding": "br, gzip" },
+        });
+        expect(res.status, testCase.urlPath).toBe(200);
+        expect(res.body, testCase.urlPath).toContain(testCase.body);
+        expect(res.headers["content-encoding"], testCase.urlPath).toBeUndefined();
+        expect(res.headers["cache-control"], testCase.urlPath).toBe(testCase.cacheControl);
+        expect(varyIncludesAcceptEncoding(res.headers), testCase.urlPath).toBe(false);
+      }
+    } finally {
+      await close();
+    }
+  });
+
+  test("answers HEAD on an encoded hashed asset with the GET headers and no body", async () => {
+    const { server, close } = await createStaticTestServer({ files: staticFiles });
+
+    try {
+      const headers = { "Accept-Encoding": "br" };
+      const get = await rawRequest(server.baseUrl, `/${HASHED_JS}`, { headers });
+      const head = await rawRequest(server.baseUrl, `/${HASHED_JS}`, { method: "HEAD", headers });
+      expect(head.status).toBe(200);
+      expect(head.body).toBe("");
+      expect(head.headers["content-encoding"]).toBe("br");
+      expect(head.headers["content-length"]).toBe(String(BROTLI_BODY.length));
+      for (const name of ["content-type", "content-length", "cache-control", "vary", "etag"]) {
+        expect(head.headers[name], name).toBe(get.headers[name]);
+      }
+    } finally {
+      await close();
+    }
+  });
+
+  test("ignores Range on encoded hashed assets but honors it on identity responses", async () => {
+    const { server, close } = await createStaticTestServer({ files: staticFiles });
+
+    try {
+      // A byte range of the brotli stream is not a range of the identity resource: send it whole.
+      const encoded = await rawRequest(server.baseUrl, `/${HASHED_JS}`, {
+        headers: { "Accept-Encoding": "br", Range: "bytes=0-3" },
+      });
+      expect(encoded.status).toBe(200);
+      expect(encoded.body).toBe(BROTLI_BODY);
+      expect(encoded.headers["content-range"]).toBeUndefined();
+      expect(encoded.headers["accept-ranges"]).toBeUndefined();
+
+      const identity = await rawRequest(server.baseUrl, `/${HASHED_JS}`, {
+        headers: { Range: "bytes=0-3" },
+      });
+      expect(identity.status).toBe(206);
+      expect(identity.headers["content-range"]).toBe(`bytes 0-3/${IDENTITY_BODY.length}`);
+      expect(identity.body).toBe(IDENTITY_BODY.slice(0, 4));
+    } finally {
+      await close();
+    }
+  });
+});
+
+// T3 Option C step 1: the SPA page is compressed per response (its HTML is rewritten per request) and
+// preloads the fonts its first view paints with, named by the built CSS. dist/index.html is untouched:
+// Electron loads it from file://.
+describe("createOrpcServer SPA fallback compression and font preloads", () => {
+  const css =
+    '@font-face{font-family:Geist;src:url(./Geist-Variable-C_ya05Eu.woff2)format("woff2")}' +
+    '@font-face{font-family:Nerd Font Symbols;src:url(./nerd-font-symbols-CoUzE12l.woff2)format("woff2")}' +
+    '@font-face{font-family:Geist Mono;src:url(./GeistMono-Variable-BJ0bRpLQ.woff2)format("woff2")}';
+  const indexHtml =
+    '<!doctype html><html><head><title>mux</title><link rel="stylesheet" crossorigin href="./API-CCITiHZd.css"></head><body><div>ok</div></body></html>';
+  const files = { "index.html": indexHtml, "API-CCITiHZd.css": css };
+
+  function decode(res: RawBuffer): string {
+    const encoding = res.headers["content-encoding"];
+    if (encoding === "br") return zlib.brotliDecompressSync(res.body).toString("utf-8");
+    if (encoding === "gzip") return zlib.gunzipSync(res.body).toString("utf-8");
+    expect(encoding).toBeUndefined();
+    return res.body.toString("utf-8");
+  }
+
+  test("negotiates br, gzip and identity with Vary, and keeps no-store", async () => {
+    const { server, close } = await createStaticTestServer({ files });
+    try {
+      const cases: Array<[string | undefined, string | undefined]> = [
+        ["br", "br"],
+        ["gzip", "gzip"],
+        [undefined, undefined],
+        ["identity", undefined],
+        // A browser lists gzip first: on equal q-values the server prefers brotli.
+        ["gzip, deflate, br, zstd", "br"],
+        ["br;q=0.5, gzip", "gzip"],
+      ];
+      for (const [acceptEncoding, expected] of cases) {
+        for (const urlPath of ["/", "/workspace/a1b2c3d4e5"]) {
+          const res = await rawRequestBuffer(server.baseUrl, urlPath, {
+            headers: acceptEncoding === undefined ? {} : { "Accept-Encoding": acceptEncoding },
+          });
+          const label = `${urlPath} ${acceptEncoding ?? "(none)"}`;
+          expect(res.status, label).toBe(200);
+          expect(res.headers["content-encoding"], label).toBe(expected);
+          expect(varyIncludesAcceptEncoding(res.headers), label).toBe(true);
+          expect(res.headers["cache-control"], label).toBe("no-store");
+          expect(decode(res), label).toContain("<title>mux</title>");
+        }
+      }
+    } finally {
+      await close();
+    }
+  });
+
+  test("preloads only Geist in the response, on every route, never in dist/index.html", async () => {
+    const { server, tempDir, close } = await createStaticTestServer({ files });
+    try {
+      const preload = (file: string) =>
+        `<link rel="preload" as="font" type="font/woff2" crossorigin href="./${file}" />`;
+      const root = decode(await rawRequestBuffer(server.baseUrl, "/"));
+      const workspace = decode(await rawRequestBuffer(server.baseUrl, "/workspace/a1b2c3d4e5"));
+      for (const html of [root, workspace]) {
+        expect(html).toContain(preload("Geist-Variable-C_ya05Eu.woff2"));
+        expect(html.match(/rel="preload" as="font"/g)).toHaveLength(1);
+        // Not even on /workspace, where code shows: on a throttled phone the Geist Mono preload
+        // competed with the app JS and made the page's content 0.28 s later (page-timing, #6216).
+        expect(html).not.toContain("GeistMono-Variable");
+        // Not a first-view font, though it is a woff2 in the same CSS.
+        expect(html).not.toContain("nerd-font-symbols");
+        // After the injected <base>, so the relative font URLs resolve under a proxy base path.
+        expect(html.indexOf("<base ")).toBeLessThan(html.indexOf('rel="preload"'));
+      }
+      expect(await fs.readFile(path.join(tempDir, "index.html"), "utf-8")).toBe(indexHtml);
+    } finally {
+      await close();
+    }
+  });
+});
+
+// #5945: crawlers and agents probe /robots.txt, /llms.txt and /.well-known/*. Answering them with
+// the SPA page (status 200, text/html) makes Lighthouse report invalid files instead of absent ones.
+describe("createOrpcServer SPA fallback for file and well-known paths", () => {
+  const SPA_TITLE = "<title>mux</title>";
+
+  test("answers missing file paths and /.well-known/ with 404 instead of the SPA page", async () => {
+    const { server, close } = await createStaticTestServer();
+
+    try {
+      const urlPaths = [
+        // No robots.txt on purpose: a 4xx makes Lighthouse skip its robots audit, while
+        // `Disallow: /` failed is-crawlable and dropped SEO from 91 to 63.
+        "/robots.txt",
+        `${APP_PROXY_BASE_PATH}/robots.txt`,
+        "/llms.txt",
+        "/.well-known/ai-catalog.json",
+        "/.well-known/security",
+        "/.well-known",
+        "/.env",
+        "/.git/config",
+        "/assets/.env",
+        // Express keeps percent escapes in req.path; serve-static decodes them before its lookup.
+        "/%2Eenv",
+        "/%2ewell-known/ai-catalog.json",
+        "/missing%2Ejs",
+        "/assets/x.js",
+        "/other/missing.js",
+        "/workspace/abc/missing.js",
+        "/favicon.png?v=1",
+        `${APP_PROXY_BASE_PATH}/llms.txt`,
+      ];
+      for (const urlPath of urlPaths) {
+        const res = await rawRequest(server.baseUrl, urlPath);
+        expect(res.status, urlPath).toBe(404);
+        expect(res.body, urlPath).not.toContain(SPA_TITLE);
+        expect(res.headers["cache-control"], urlPath).not.toBe("no-store");
+      }
+
+      // Hashed-looking but absent (#5953): no immutable cache or encoding headers either.
+      const missingHashed = await rawRequest(server.baseUrl, "/missing-AbCd1234.js", {
+        headers: { "Accept-Encoding": "br, gzip" },
+      });
+      expect(missingHashed.status).toBe(404);
+      expect(missingHashed.body).not.toContain(SPA_TITLE);
+      expect(missingHashed.headers["content-encoding"]).toBeUndefined();
+      expect(missingHashed.headers["cache-control"]).toBeUndefined();
+      expect(varyIncludesAcceptEncoding(missingHashed.headers)).toBe(false);
+    } finally {
+      await close();
+    }
+  });
+
+  test("keeps serving the no-store SPA page for client routes and API files", async () => {
+    const { server, close } = await createStaticTestServer();
+
+    try {
+      const spaPaths = [
+        "/",
+        "/index.html",
+        "/workspace/abc",
+        // Legacy workspace IDs are `${project}-${branch}` and can contain dots.
+        "/workspace/next.js-main",
+        "/workspace/proj-release-1.2",
+        "/workspace/proj-fix.js",
+        "/workspace/next%2Ejs-main",
+        // A malformed escape must not throw; the path has no dot, so it stays a client route.
+        "/settings%E0",
+        "/settings",
+        "/settings/providers",
+        "/project?path=%2Fhome%2Fdev%2Frepo.git",
+        `${APP_PROXY_BASE_PATH}/workspace/abc`,
+      ];
+      for (const urlPath of spaPaths) {
+        const res = await rawRequest(server.baseUrl, urlPath);
+        expect(res.status, urlPath).toBe(200);
+        expect(res.body, urlPath).toContain(SPA_TITLE);
+        expect(res.headers["cache-control"], urlPath).toBe("no-store");
+      }
+
+      // API paths that end in a file extension stay with their own handlers.
+      const spec = await rawRequest(server.baseUrl, "/api/spec.json");
+      expect(spec.status).toBe(200);
+      expect(spec.headers["content-type"]).toContain("application/json");
+    } finally {
+      await close();
+    }
+  });
+});
+
 describe("createOrpcServer", () => {
   test("serveStatic fallback does not swallow /api routes", async () => {
     // Minimal context stub - router won't be exercised by this test.
@@ -350,10 +759,17 @@ describe("createOrpcServer", () => {
       expect(countOccurrences(rootHtml, '<base href="./" />')).toBe(1);
       expectSlashlessRootRedirectBeforeBase(rootHtml, "./");
 
-      const doubleSlashRes = await fetch(`${server.baseUrl}//attacker.example`);
-      expect(doubleSlashRes.status).toBe(200);
-      const doubleSlashHtml = await doubleSlashRes.text();
-      expect(doubleSlashHtml).not.toContain("location.replace(location.origin+pathname");
+      // A dotted host looks like a file name and gets a 404 (#5945). The dotless host keeps the
+      // redirect guard covered on an SPA response.
+      for (const [urlPath, status] of [
+        ["//attacker.example", 404],
+        ["//attacker", 200],
+      ] as const) {
+        const doubleSlashRes = await fetch(`${server.baseUrl}${urlPath}`);
+        expect(doubleSlashRes.status, urlPath).toBe(status);
+        const doubleSlashHtml = await doubleSlashRes.text();
+        expect(doubleSlashHtml, urlPath).not.toContain("location.replace(location.origin+pathname");
+      }
 
       const deepRouteRes = await fetch(`${server.baseUrl}/some/spa/route`);
       expect(deepRouteRes.status).toBe(200);
@@ -786,7 +1202,6 @@ describe("createOrpcServer", () => {
 
   test("uses HTTPS redirect URIs for OAuth start routes when allowHttpOrigin is enabled", async () => {
     let muxGatewayRedirectUri = "";
-    let muxGovernorRedirectUri = "";
 
     const stubContext: Partial<ORPCContext> = {
       muxGatewayOauthService: {
@@ -795,15 +1210,6 @@ describe("createOrpcServer", () => {
           return { authorizeUrl: "https://gateway.example.com/auth", state: "state-gateway" };
         },
       } as unknown as ORPCContext["muxGatewayOauthService"],
-      muxGovernorOauthService: {
-        startServerFlow: (input: { governorOrigin: string; redirectUri: string }) => {
-          muxGovernorRedirectUri = input.redirectUri;
-          return {
-            success: true,
-            data: { authorizeUrl: "https://governor.example.com/auth", state: "state-governor" },
-          };
-        },
-      } as unknown as ORPCContext["muxGovernorOauthService"],
     };
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -829,19 +1235,8 @@ describe("createOrpcServer", () => {
       });
       expect(muxGatewayResponse.status).toBe(200);
 
-      const muxGovernorResponse = await fetch(
-        `${server.baseUrl}/auth/mux-governor/start?governorUrl=${encodeURIComponent("https://governor.example.com")}`,
-        {
-          headers: sharedHeaders,
-        }
-      );
-      expect(muxGovernorResponse.status).toBe(200);
-
       expect(muxGatewayRedirectUri).toBe(
         "https://mux-public.example.com/auth/mux-gateway/callback"
-      );
-      expect(muxGovernorRedirectUri).toBe(
-        "https://mux-public.example.com/auth/mux-governor/callback"
       );
     } finally {
       await server?.close();
@@ -1122,9 +1517,9 @@ describe("createOrpcServer", () => {
 
   test("OAuth callback routes accept POST redirects (query + form_post)", async () => {
     const stubContext: Partial<ORPCContext> = {
-      muxGovernorOauthService: {
+      muxGatewayOauthService: {
         handleServerCallbackAndExchange: () => Promise.resolve({ success: true, data: undefined }),
-      } as unknown as ORPCContext["muxGovernorOauthService"],
+      } as unknown as ORPCContext["muxGatewayOauthService"],
     };
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -1138,22 +1533,22 @@ describe("createOrpcServer", () => {
 
       // Some OAuth providers issue 307/308 redirects which preserve POST.
       const queryRes = await fetch(
-        `${server.baseUrl}/auth/mux-governor/callback?state=test-state&code=test-code`,
+        `${server.baseUrl}/auth/mux-gateway/callback?state=test-state&code=test-code`,
         { method: "POST" }
       );
       expect(queryRes.status).toBe(200);
       const queryText = await queryRes.text();
-      expect(queryText).toContain("Enrollment complete");
+      expect(queryText).toContain("Login complete");
 
       // response_mode=form_post delivers params in the request body.
-      const formRes = await fetch(`${server.baseUrl}/auth/mux-governor/callback`, {
+      const formRes = await fetch(`${server.baseUrl}/auth/mux-gateway/callback`, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: "state=test-state&code=test-code",
       });
       expect(formRes.status).toBe(200);
       const formText = await formRes.text();
-      expect(formText).toContain("Enrollment complete");
+      expect(formText).toContain("Login complete");
     } finally {
       await server?.close();
     }
@@ -1213,9 +1608,6 @@ describe("createOrpcServer", () => {
       muxGatewayOauthService: {
         handleServerCallbackAndExchange: handleSuccessfulCallback,
       } as unknown as ORPCContext["muxGatewayOauthService"],
-      muxGovernorOauthService: {
-        handleServerCallbackAndExchange: handleSuccessfulCallback,
-      } as unknown as ORPCContext["muxGovernorOauthService"],
       mcpOauthService: {
         handleServerCallbackAndExchange: handleSuccessfulCallback,
       } as unknown as ORPCContext["mcpOauthService"],
@@ -1253,14 +1645,6 @@ describe("createOrpcServer", () => {
       });
       expect(muxGatewayResponse.status).toBe(200);
       expect(muxGatewayResponse.headers.get("access-control-allow-origin")).toBeNull();
-
-      const muxGovernorResponse = await fetch(`${server.baseUrl}/auth/mux-governor/callback`, {
-        method: "POST",
-        headers: callbackHeaders,
-        body: "state=test-state&code=test-code",
-      });
-      expect(muxGovernorResponse.status).toBe(200);
-      expect(muxGovernorResponse.headers.get("access-control-allow-origin")).toBeNull();
 
       const mcpOauthResponse = await fetch(`${server.baseUrl}/auth/mcp-oauth/callback`, {
         method: "POST",

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { draftJsonBytes, sanitizeDraftAttachments } from "./drafts";
+import { SendIdSchema } from "@/common/orpc/schemas/stream";
+import { createSendId, draftJsonBytes, sanitizeDraftAttachments } from "./drafts";
 
 // Draft files and legacy localStorage values are untrusted input (hand-edited, truncated, or
 // written by an older build): each malformed attachment is dropped on its own so the rest of the
@@ -72,5 +73,24 @@ describe("draftJsonBytes", () => {
     expect(draftJsonBytes(draft)).toBe(
       Buffer.byteLength(JSON.stringify({ text: draft.text, attachments: draft.attachments }))
     );
+  });
+});
+
+describe("createSendId", () => {
+  test("mints valid send ids without crypto.randomUUID (insecure contexts)", () => {
+    // Shadow the method with an own property; restore whatever own property was there.
+    const own = Object.getOwnPropertyDescriptor(globalThis.crypto, "randomUUID");
+    Object.defineProperty(globalThis.crypto, "randomUUID", {
+      value: undefined,
+      configurable: true,
+    });
+    try {
+      const ids = [createSendId(), createSendId()];
+      expect(ids.every((id) => SendIdSchema.safeParse(id).success)).toBe(true);
+      expect(ids[0]).not.toBe(ids[1]);
+    } finally {
+      if (own) Object.defineProperty(globalThis.crypto, "randomUUID", own);
+      else Reflect.deleteProperty(globalThis.crypto, "randomUUID");
+    }
   });
 });

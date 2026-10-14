@@ -1,7 +1,7 @@
 /**
  * Startup garbage collection of orphaned creation-draft settings keys (#5053).
  *
- * Creation drafts keep scope-bound settings in localStorage (`model:__draft__/<project>/<id>`,
+ * Creation drafts keep scope-bound settings in localStorage (`<key>:__draft__/<project>/<id>`,
  * `workspaceNameState:…`); their text and attachments live on the backend. Only a local delete
  * or project removal cleans those keys, but the draft list is backend-owned and shared by every
  * origin (#5225): a draft deleted or turned into a workspace in another window, or a project

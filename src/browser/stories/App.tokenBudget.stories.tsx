@@ -1,9 +1,7 @@
 import { expect, userEvent, waitFor, within } from "@storybook/test";
 import { createMuxMessage } from "@/common/types/message";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
-import { getAutoCompactionThresholdKey, getModelKey } from "@/common/constants/storage";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
@@ -27,12 +25,6 @@ const LEAD_IN = "Model-only instructions for retrieving earlier context windows.
 
 function setupTokenBudgetStory(inputTokens = 2400) {
   collapseLeftSidebar();
-  updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TOKEN_BUDGET), true);
-  updatePersistedState(getExperimentKey(EXPERIMENT_IDS.MEMORY), true);
-  updatePersistedState(getExperimentKey(EXPERIMENT_IDS.CONTINUOUS_COMPACTION), false);
-  updatePersistedState(getExperimentKey(EXPERIMENT_IDS.RLM), false);
-  updatePersistedState(getModelKey(WORKSPACE_ID), MODEL);
-  updatePersistedState(getAutoCompactionThresholdKey(MODEL), 70);
   const history = [
     createMuxMessage("earlier", "user", "Keep the migration reversible.", {
       historySequence: 1,
@@ -114,6 +106,9 @@ function setupTokenBudgetStory(inputTokens = 2400) {
   return setupSimpleChatStory({
     workspaceId: WORKSPACE_ID,
     workspaceName: "token-budget",
+    aiSettings: { model: MODEL, thinkingLevel: "off" },
+    experiments: { [EXPERIMENT_IDS.TOKEN_BUDGET]: true, [EXPERIMENT_IDS.MEMORY]: true },
+    userPreferences: { ai: { autoCompactionThresholdByModel: { [MODEL]: 70 } } },
     messages: [
       ...history.map((message) => ({ ...message, type: "message" as const })),
       createAssistantMessage("retrieval", "I'll retrieve the earlier decision before continuing.", {
@@ -304,7 +299,8 @@ export const ContextSettings: AppStory = {
     const page = within(canvasElement.ownerDocument.body);
     const dialog = await page.findByRole("dialog");
     // The slider is the handoff target itself; no force buffer is advertised.
-    await expect(within(dialog).getByText(/Handoff target: 70%/)).toBeVisible();
+    // The label switches to the handoff wording once the experiment flags arrive.
+    await expect(await within(dialog).findByText(/Handoff target: 70%/)).toBeVisible();
     await expect(within(dialog).queryByText(/Rolls over by/)).not.toBeInTheDocument();
     await expect(within(dialog).getByText("Idle compaction", { exact: true })).toBeVisible();
     await expect(within(dialog).getByText("/compact", { exact: true })).toBeVisible();

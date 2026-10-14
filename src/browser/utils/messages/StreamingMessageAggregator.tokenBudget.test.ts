@@ -117,6 +117,37 @@ describe("token-budget replay", () => {
     expect(aggregator.getActiveStreamMessageId()).toBeUndefined();
   });
 
+  test("a live warning after the user row keeps the user row's pending turn", () => {
+    const aggregator = new StreamingMessageAggregator(CREATED_AT);
+    const live = (message: ReturnType<typeof createMuxMessage>) =>
+      aggregator.handleMessage({ type: "message", ...MuxMessageSchema.parse(message) });
+    live(
+      createMuxMessage("user", "user", "Investigate the failing test", {
+        historySequence: 1,
+        muxMetadata: { type: "normal", requestedModel: "anthropic:claude-sonnet-4-5" },
+      })
+    );
+    live(
+      createMuxMessage("warning", "user", "Write the next steps to workspace notes.", {
+        historySequence: 2,
+        synthetic: true,
+        uiVisible: true,
+        muxMetadata: {
+          type: "context-budget-warning",
+          contextTokens: 800,
+          maxTokens: 1000,
+          budgetTokens: 991,
+          handoff: true,
+        },
+      })
+    );
+    expect(aggregator.getPendingStreamModel()).toBe("anthropic:claude-sonnet-4-5");
+    expect(aggregator.getDisplayedMessages().at(-1)).toMatchObject({
+      type: "user",
+      contextBudgetWarning: { contextTokens: 800 },
+    });
+  });
+
   test("legacy warnings without a rollover budget still collapse on replay", () => {
     const warning = MuxMessageSchema.parse({
       id: "legacy-warning",

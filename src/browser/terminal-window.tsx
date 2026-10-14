@@ -27,9 +27,12 @@ function TerminalWindowContent(props: {
       initialTitle={props.initialTitle}
       visible={true}
       onExit={() => {
-        api?.terminal.closeWindow({ workspaceId: props.workspaceId }).catch((err) => {
-          console.warn("[TerminalWindow] Failed to close terminal window:", err);
-        });
+        // Only this window: sibling pop-outs of the workspace keep running (#5739).
+        api?.terminal
+          .closeWindow({ workspaceId: props.workspaceId, sessionId: props.sessionId })
+          .catch((err) => {
+            console.warn("[TerminalWindow] Failed to close terminal window:", err);
+          });
       }}
     />
   );
@@ -61,9 +64,10 @@ if (!workspaceId || !sessionId) {
   // Don't use StrictMode for terminal windows to avoid double-mounting issues
   // StrictMode intentionally double-mounts components in dev, which causes
   // race conditions with WebSocket connections and terminal lifecycle
+  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
   ReactDOM.createRoot(document.getElementById("root")!).render(
     <APIProvider>
-      <TerminalRouterProvider>
+      <TerminalRouterProvider popout>
         <TerminalWindowContent
           workspaceId={workspaceId}
           sessionId={sessionId}

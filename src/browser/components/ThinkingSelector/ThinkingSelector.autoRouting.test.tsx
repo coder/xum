@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render } from "@testing-library/react";
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 
 import { APIContext } from "@/browser/contexts/API";
+import { ThinkingProvider } from "@/browser/contexts/ThinkingContext";
 import * as ActualRoutingModule from "@/browser/hooks/useRouting";
 import * as ActualProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
 import * as ActualThinkingLevelModule from "@/browser/hooks/useThinkingLevel";
@@ -64,7 +65,7 @@ function NoBackendAPIWrapper(props: { children: React.ReactNode }) {
         retry: () => undefined,
       }}
     >
-      {props.children}
+      <ThinkingProvider workspaceId="auto-routing-test">{props.children}</ThinkingProvider>
     </APIContext.Provider>
   );
 }

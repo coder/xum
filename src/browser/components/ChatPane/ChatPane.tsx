@@ -8,6 +8,7 @@ import React, {
   useMemo,
 } from "react";
 import { Lightbulb } from "lucide-react";
+import { SideChatBanner } from "@/browser/components/SideChatBanner/SideChatBanner";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import { MessageListProvider } from "@/browser/features/Messages/MessageListContext";
 import { cn } from "@/common/lib/utils";
@@ -39,7 +40,6 @@ import {
   type TranscriptTailStackItem,
 } from "./layoutStack";
 import { getRetryBarrierDerivation } from "./retryBarrierDerivation";
-import { VIM_ENABLED_KEY } from "@/common/constants/storage";
 import { ChatInput, type ChatInputAPI } from "@/browser/features/ChatInput/index";
 import type { QueueDispatchMode } from "@/browser/features/ChatInput/types";
 import {
@@ -54,7 +54,7 @@ import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { useAutoScroll } from "@/browser/hooks/useAutoScroll";
 import { useBoundedTranscriptReveal } from "@/browser/hooks/useBoundedTranscriptReveal";
 import { useOpenInEditor } from "@/browser/hooks/useOpenInEditor";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { useUserPreferences } from "@/browser/stores/AppConfigStore";
 import {
   useWorkspaceAggregator,
   useWorkspaceState,
@@ -71,6 +71,7 @@ import { useAIViewKeybinds } from "@/browser/hooks/useAIViewKeybinds";
 import { QueuedMessage } from "@/browser/features/Messages/QueuedMessage";
 import { HeldInput } from "@/browser/features/Messages/HeldInput";
 import { DelegatedCreationInterruptedBanner } from "@/browser/components/DelegatedCreationInterruptedBanner/DelegatedCreationInterruptedBanner";
+import { LegacyPlanImportBanner } from "@/browser/components/LegacyPlanImportBanner/LegacyPlanImportBanner";
 import { CompactionWarning } from "../CompactionWarning/CompactionWarning";
 import { ContextSwitchWarning as ContextSwitchWarningBanner } from "../ContextSwitchWarning/ContextSwitchWarning";
 import { SubAgentTasksDecoration } from "../SubAgentTasksDecoration/SubAgentTasksDecoration";
@@ -86,7 +87,7 @@ import { useContextSwitchWarning } from "@/browser/hooks/useContextSwitchWarning
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
 import type { TerminalSessionCreateOptions } from "@/browser/utils/terminal";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useChatTranscriptFullWidth } from "@/browser/hooks/useChatTranscriptFullWidth";
 import { CHAT_DOCK_GUTTER_CLASS } from "@/constants/layout";
 import { isTranscriptMutationAllowed } from "@/browser/utils/transcriptBarrier";
@@ -160,12 +161,27 @@ interface ChatPaneProps {
   onOpenTerminal: (options?: TerminalSessionCreateOptions) => void;
   /** Hide + inactivate chat pane while immersive review overlay is active. */
   immersiveHidden?: boolean;
+  /** Phones: show the hidden right sidebar full-screen (see WorkspaceShell). */
+  onOpenSidebar?: (returnFocusTo: HTMLElement | null) => void;
+  sidebarFullscreen?: boolean;
 }
 
-type ChatPaneContentProps = Omit<
+export type ChatPaneContentProps = Omit<
   ChatPaneProps,
-  "leftSidebarCollapsed" | "onToggleLeftSidebarCollapsed" | "immersiveHidden"
->;
+  | "leftSidebarCollapsed"
+  | "onToggleLeftSidebarCollapsed"
+  | "immersiveHidden"
+  | "onOpenSidebar"
+  | "sidebarFullscreen"
+> & {
+  /**
+   * Rendered inside another surface (the /side chat tab in the right sidebar) rather than as
+   * the page's main chat, so the touch-device header spacer does not apply.
+   */
+  embedded?: boolean;
+  /** Let an explicitly opened embedded chat claim focus when its composer mounts. */
+  onChatInputReady?: (api: ChatInputAPI) => void;
+};
 
 type ReviewsState = ReturnType<typeof useReviews>;
 
@@ -260,10 +276,6 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
       <div
         ref={chatAreaRef}
         aria-hidden={immersiveHidden || undefined}
-        // Tells the app root that this column ends in a row (WorkspaceFooterBar) which reserves the
-        // bottom safe-area inset itself. Dropped while hidden so the inset stays with the root for
-        // whatever replaces the column.
-        data-bottom-inset-owner={immersiveHidden ? undefined : true}
         className={cn(
           "bg-surface-primary relative flex min-w-96 flex-1 flex-col",
           // Immersive review overlays the entire workspace, so hiding the chat pane removes
@@ -273,30 +285,46 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
           "[@media(max-width:768px)]:min-w-0"
         )}
       >
-        <PerfRenderMarker id="chat-pane.header">
-          <WorkspaceMenuBar
+        {/* The chat is the page's primary content, so it is the one `main` landmark in every
+            layout (landmark-one-main, #5956). The footer stays outside it so it remains the page's
+            contentinfo landmark, and the project and right sidebars stay outside too. The wrapper
+            keeps the column flex layout and adds no positioning context. */}
+        <main className="flex min-h-0 flex-1 flex-col">
+          <PerfRenderMarker id="chat-pane.header">
+            <WorkspaceMenuBar
+              workspaceId={workspaceId}
+              projectName={props.projectName}
+              projectPath={props.projectPath}
+              workspaceName={props.workspaceName}
+              workspaceTitle={workspaceTitle}
+              leftSidebarCollapsed={props.leftSidebarCollapsed}
+              onToggleLeftSidebarCollapsed={props.onToggleLeftSidebarCollapsed}
+              namedWorkspacePath={props.namedWorkspacePath}
+              runtimeConfig={props.runtimeConfig}
+              onOpenTerminal={props.onOpenTerminal}
+              onOpenSidebar={props.onOpenSidebar}
+              sidebarFullscreen={props.sidebarFullscreen}
+            />
+          </PerfRenderMarker>
+
+          {meta?.sideChatParentWorkspaceId != null && (
+            <SideChatBanner
+              key={workspaceId}
+              workspaceId={workspaceId}
+              parentWorkspaceId={meta.sideChatParentWorkspaceId}
+            />
+          )}
+
+          <ChatPaneContent
             workspaceId={workspaceId}
-            projectName={props.projectName}
             projectPath={props.projectPath}
+            projectName={props.projectName}
             workspaceName={props.workspaceName}
-            workspaceTitle={workspaceTitle}
-            leftSidebarCollapsed={props.leftSidebarCollapsed}
-            onToggleLeftSidebarCollapsed={props.onToggleLeftSidebarCollapsed}
             namedWorkspacePath={props.namedWorkspacePath}
             runtimeConfig={props.runtimeConfig}
             onOpenTerminal={props.onOpenTerminal}
           />
-        </PerfRenderMarker>
-
-        <ChatPaneContent
-          workspaceId={workspaceId}
-          projectPath={props.projectPath}
-          projectName={props.projectName}
-          workspaceName={props.workspaceName}
-          namedWorkspacePath={props.namedWorkspacePath}
-          runtimeConfig={props.runtimeConfig}
-          onOpenTerminal={props.onOpenTerminal}
-        />
+        </main>
 
         {/* Reset the footer's scroll and popover state because ChatPane remains mounted across
             workspace switches. */}
@@ -314,7 +342,7 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
   );
 };
 
-const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
+export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const {
     workspaceId,
     projectName,
@@ -327,6 +355,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const chatTranscriptFullWidth = useChatTranscriptFullWidth();
   const [transcriptDensity] = useTranscriptDensity();
   const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const { workspaceMetadata } = useWorkspaceContext();
   const storeRaw = useWorkspaceStoreRaw();
   const aggregator = useWorkspaceAggregator(workspaceId);
@@ -652,7 +681,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     !isCompacting && autoCompactionResult.shouldShowWarning && !contextSwitchWarning;
 
   // Vim mode state - needed for keybind selection (Ctrl+C in vim, Esc otherwise)
-  const [vimEnabled] = usePersistedState<boolean>(VIM_ENABLED_KEY, false, { listener: true });
+  const vimEnabled = useUserPreferences(
+    (preferences) => preferences.appearance?.vimEnabled === true
+  );
 
   // Use auto-scroll hook for scroll management
   const {
@@ -898,9 +929,10 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     setPendingTimelineReveal(null);
   }, [workspaceId]);
 
-  const handleChatInputReady = useCallback((api: ChatInputAPI) => {
+  const handleChatInputReady = (api: ChatInputAPI) => {
     chatInputAPI.current = api;
-  }, []);
+    props.onChatInputReady?.(api);
+  };
 
   // Handler for review notes from Code Review tab - adds review (starts attached)
   // Depend only on addReview (not whole reviews object) to keep callback stable
@@ -944,7 +976,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       if (!inputApi) return;
 
       await api?.workspace.clearQueue({ workspaceId });
-      inputApi.restoreDraft(normalizeQueuedMessage(queuedMessage));
+      inputApi.restoreDraft(normalizeQueuedMessage(queuedMessage), {
+        retainedSendIds: queuedMessage.sendIds,
+      });
     },
     [api, workspaceId]
   );
@@ -1022,10 +1056,10 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
 
   const handleQueuedDispatchModeChange = async (queueDispatchMode: QueueDispatchMode) => {
     clearQueuedActionError();
-    if (!api) {
+    if (!liveApi) {
       throw new Error("Workspace API is unavailable.");
     }
-    const result = await api.workspace.setQueuedMessageDispatchMode({
+    const result = await liveApi.workspace.setQueuedMessageDispatchMode({
       workspaceId,
       queueDispatchMode,
     });
@@ -1052,6 +1086,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     if (!current) return;
 
     if (current.queuedMessage) {
+      // A queued artifact send is the artifact's message, not a draft (its card has no Edit):
+      // restoring it would cancel the send and put its model-facing payload in the composer.
+      if (current.queuedMessage.artifactInteraction != null) return;
       await restoreQueuedDraft(current.queuedMessage);
       return;
     }
@@ -1184,7 +1221,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // Compute retry/interrupted chrome once for both keybinds and UI. Interruption and the retry
   // candidate come from the latest rows; dividers are placed on the rendered (deferred) rows.
   const {
-    showRetryBarrier,
     lastRetryCandidateMessage,
     shouldMountRetryBarrier,
     showRetryBarrierUI,
@@ -1334,7 +1370,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     // Allow interrupt keybind even while waiting for stream-start ("starting...").
     canInterrupt:
       (workspaceState?.canInterrupt ?? false) || (workspaceState?.isStreamStarting ?? false),
-    showRetryBarrier,
+    // The visible barrier, not the raw interruption: a context_exceeded error hides the barrier,
+    // and Esc must not send a Stop (persisting an auto-retry opt-out) for nothing visible (#5111).
+    showRetryBarrier: showRetryBarrierUI,
     chatInputAPI,
     jumpToBottom: handleJumpToBottom,
     loadOlderHistory: shouldRenderLoadOlderMessagesButton ? handleLoadOlderHistory : null,
@@ -1481,7 +1519,12 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             The composer dock is IN-FLOW scroll content (sticky to the scrollport
             bottom), so this region — and therefore the scrollport's clientHeight —
             never resizes when the composer grows or shrinks. */}
-        <div className="mobile-header-spacer relative flex-1 overflow-hidden">
+        <div
+          className={cn(
+            "relative flex-1 overflow-hidden",
+            props.embedded !== true && "mobile-header-spacer"
+          )}
+        >
           <div
             ref={contentRef}
             onWheel={handleTranscriptWheel}
@@ -1511,7 +1554,12 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             // for visibility — using a container query rather than a viewport media
             // query means sidebars opening/closing correctly hide the TOC even when
             // the viewport width is unchanged. See `.plan-toc-aside` in globals.css.
-            className="@container/transcript flex h-full flex-col overflow-x-hidden overflow-y-auto px-[15px] pt-[15px] leading-[1.5] break-words whitespace-pre-wrap"
+            // `--chat-reserved-inline-end`: room a layout floats over the chat's right edge (the
+            // collapsed right sidebar's overview card, see globals.css). Padding by it centers the
+            // column, and the composer under it, in the space left of the overlay, so the column
+            // sits as far from the overlay as from the left edge. The transcript container query
+            // measures the content box, so the plan TOC sees the narrower gutters too.
+            className="@container/transcript flex h-full flex-col overflow-x-hidden overflow-y-auto pt-[15px] pr-[calc(15px+var(--chat-reserved-inline-end,0px))] pl-[15px] leading-[1.5] break-words whitespace-pre-wrap"
           >
             <div
               // While locked, opt the whole transcript subtree out of scroll
@@ -1531,7 +1579,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                 // overlap content or get clipped by `overflow-x-hidden`.
                 // `w-full` is required in the centered mode because auto cross-axis
                 // margins disable flex-item stretch.
-                chatTranscriptFullWidth ? "w-full" : "plan-toc-aware max-w-4xl mx-auto w-full",
+                chatTranscriptFullWidth ? "w-full" : "plan-toc-aware max-w-chat mx-auto w-full",
                 // Push the dock to the bottom for short transcripts without reserving
                 // loading space: cached replay overlays the dock edge, not transcript rows.
                 "flex-1",
@@ -1620,7 +1668,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                   --composer-h channel to lag a frame behind and tear), while
                   `sticky` keeps the composer visually pinned over the transcript
                   when the user scrolls up. `mx-[-15px]` cancels the scrollport's
-                  horizontal padding so the dock stays full-bleed; `whitespace-normal
+                  gutter so the dock reaches the edges (short of any reserved overlay
+                  room on the right); `whitespace-normal
                   break-normal` reset the transcript text inheritance. clientHeight
                   of the scrollport never changes with dock height (send-flash
                   invariant). `bg-surface-primary` keeps transcript content from
@@ -1933,7 +1982,9 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
   if (props.shouldShowPinnedTodoList) {
     addDecorationEntry({
       key: "pinned-todo-list",
-      node: <PinnedTodoList workspaceId={props.workspaceId} />,
+      // Keyed by workspace: ChatPane stays mounted across workspace switches, and the panel's
+      // scroll position (set to the current item on open) must not carry over to another chat.
+      node: <PinnedTodoList key={props.workspaceId} workspaceId={props.workspaceId} />,
     });
   }
   addDecorationEntry({
@@ -1947,6 +1998,12 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
   addDecorationEntry({
     key: "background-processes",
     node: <BackgroundProcessesBanner workspaceId={props.workspaceId} />,
+  });
+  // Self-gating: only an SSH workspace from before #5174 with a plan to import shows it. Keyed by
+  // workspace so one workspace's offer, error or pending import never carries over to another.
+  addDecorationEntry({
+    key: "legacy-plan-import",
+    node: <LegacyPlanImportBanner key={props.workspaceId} workspaceId={props.workspaceId} />,
   });
   // The Chat Instructions decoration is intentionally self-gating: it renders
   // nothing when the scratchpad is empty or disabled, so it can always be in

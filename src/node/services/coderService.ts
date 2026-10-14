@@ -231,6 +231,7 @@ async function* streamCoderCommand(
     // Yield lines as they arrive
     while (!streamsDone || lineQueue.length > 0) {
       if (lineQueue.length > 0) {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         yield lineQueue.shift()!;
       } else if (!streamsDone) {
         await new Promise<void>((resolve) => {

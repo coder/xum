@@ -31,8 +31,6 @@ interface ResolveAgentInheritanceChainOptions {
   agentDefinition: AgentDefinitionPackage;
   workspaceId: string;
   maxDepth?: number;
-  /** agent-plugins experiment: also resolve base agents contributed by Agent Plugins. */
-  includeAgentPlugins?: boolean;
   /** Per-request definition reuse (see AgentDefinitionRequestCache). */
   cache?: AgentDefinitionRequestCache;
   /** Cancels base-definition reads; traversal then rejects instead of issuing further reads. */
@@ -94,7 +92,6 @@ export async function resolveAgentInheritanceChain(
     options.abortSignal?.throwIfAborted();
     try {
       currentDefinition = await readAgentDefinition(runtime, workspacePath, baseId, {
-        includeAgentPlugins: options.includeAgentPlugins,
         skipScopesAbove,
         cache: options.cache,
         ...(options.abortSignal != null ? { abortSignal: options.abortSignal } : {}),

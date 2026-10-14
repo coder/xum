@@ -1,6 +1,15 @@
 import { ProvidersConfigStore, type ProvidersConfig } from "@/node/config";
-import { describe, expect, it, spyOn } from "bun:test";
-import { generateText, jsonSchema, streamText, tool, type LanguageModel, type Tool } from "ai";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import {
+  generateText,
+  jsonSchema,
+  stepCountIs,
+  streamText,
+  tool,
+  type LanguageModel,
+  type ModelMessage,
+  type Tool,
+} from "ai";
 import type { Experimental_EvaluationModelV4 } from "@ai-sdk/provider";
 import { xai } from "@ai-sdk/xai";
 import { z } from "zod";
@@ -11,6 +20,8 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { Config } from "@/node/config";
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
+import type { ThinkingLevel } from "@/common/types/thinking";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { CODEX_ENDPOINT, CODEX_OAUTH_ROUTED_HEADER } from "@/common/constants/codexOAuth";
@@ -22,6 +33,7 @@ import {
 } from "@/common/utils/ai/providerOptions";
 import { Ok } from "@/common/types/result";
 import { TOOL_PAYLOAD_DEPTH_REJECTION } from "@/common/utils/tools/toolPayloadDepth";
+import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import {
   ProviderModelFactory,
   buildAIProviderRequestHeaders,
@@ -31,6 +43,8 @@ import {
   markCodexOauthRoutedResponse,
   normalizeOpenAICompatibleBaseURL,
   resolveAIProviderHeaderSource,
+  muxGatewayPromptCacheRoute,
+  requestEndpoint,
   resolveOpenAIWebSocketResponsesUrl,
   wrapFetchWithAnthropicCacheControl,
   wrapFetchWithXAIServiceTier,
@@ -42,8 +56,8 @@ import * as openAIWebSocketTransport from "./openAIWebSocketTransportFetch";
 import type { DevToolsService } from "./devToolsService";
 import { CodexOauthService } from "./codexOauthService";
 import type { CoderOauthService } from "./coderOauthService";
-import { PolicyService } from "./policyService";
 import { ProviderService } from "./providerService";
+import type { TimelineEventDraft } from "@/common/orpc/schemas/timeline";
 
 const LOCAL_VLLM_BASE_URL = "http://localhost:8000/v1";
 const LOCAL_VLLM_MODEL = "qwen3-coder";
@@ -117,12 +131,11 @@ async function withTempConfig(
   try {
     const config = new Config(tmpDir);
     const providersConfigStore = new ProvidersConfigStore(config.rootDir);
-    const providerService = new ProviderService(config, undefined, providersConfigStore);
+    const providerService = new ProviderService(config, providersConfigStore);
     const oauth: OauthServiceBindings = {};
     const factory = new ProviderModelFactory(
       config,
       providerService,
-      undefined,
       oauth,
       undefined,
       providersConfigStore
@@ -154,40 +167,26 @@ async function withOpenAIBaseUrlEnvUnset(run: () => Promise<void>): Promise<void
   }
 }
 
-async function withTempPolicyProviderFactory(
-  policy: unknown,
-  run: (
-    config: Config,
-    factory: ProviderModelFactory,
-    policyService: PolicyService,
-    oauth: OauthServiceBindings
-  ) => Promise<void> | void
-): Promise<void> {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-provider-model-factory-"));
-  const policyPath = path.join(tmpDir, "policy.json");
-  const prevPolicyFileEnv = process.env.MUX_POLICY_FILE;
-  let policyService: PolicyService | null = null;
-
-  try {
-    const config = new Config(tmpDir);
-    await writeFile(policyPath, JSON.stringify(policy), "utf-8");
-    process.env.MUX_POLICY_FILE = policyPath;
-
-    policyService = new PolicyService(config);
-    await policyService.initialize();
-    const providerService = new ProviderService(config, policyService);
-    const oauth: OauthServiceBindings = {};
-    const factory = new ProviderModelFactory(config, providerService, policyService, oauth);
-    await run(config, factory, policyService, oauth);
-  } finally {
-    policyService?.dispose();
-    if (prevPolicyFileEnv === undefined) {
-      delete process.env.MUX_POLICY_FILE;
-    } else {
-      process.env.MUX_POLICY_FILE = prevPolicyFileEnv;
+/**
+ * Unsets `names` for every test in the calling describe block and restores them afterwards.
+ * Coder workspaces export gateway base URLs (ANTHROPIC_BASE_URL, OPENAI_BASE_URL) that would
+ * silently move these cases off the first-party route they test (#5414).
+ */
+function unsetEnvForEachTest(...names: string[]): void {
+  const saved = new Map<string, string | undefined>();
+  beforeEach(() => {
+    for (const name of names) {
+      saved.set(name, process.env[name]);
+      delete process.env[name];
     }
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-  }
+  });
+  afterEach(() => {
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    saved.clear();
+  });
 }
 
 describe("resolveOpenAIWebSocketResponsesUrl", () => {
@@ -511,56 +510,6 @@ describe("ProviderModelFactory.createModel", () => {
       expect(result.success).toBe(true);
       expect(muxOptions.anthropic?.disableBetaFeatures).toBe(true);
     });
-  });
-
-  it("allows policy-allowed custom OpenAI-compatible providers when policy is enforced", async () => {
-    await withTempPolicyProviderFactory(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "local-vllm" }],
-      },
-      async (config, factory) => {
-        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-          "local-vllm": {
-            providerType: "openai-compatible",
-            baseUrl: "http://localhost:8000/v1",
-            models: ["qwen3-coder"],
-          },
-        });
-
-        const result = await factory.createModel("local-vllm:qwen3-coder");
-
-        expect(result.success).toBe(true);
-        if (!result.success) {
-          expect(result.error.type).not.toBe("policy_denied");
-        }
-      }
-    );
-  });
-
-  it("denies policy-denied custom OpenAI-compatible providers when policy is enforced", async () => {
-    await withTempPolicyProviderFactory(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "openai" }],
-      },
-      async (config, factory) => {
-        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-          "local-vllm": {
-            providerType: "openai-compatible",
-            baseUrl: "http://localhost:8000/v1",
-            models: ["qwen3-coder"],
-          },
-        });
-
-        const result = await factory.createModel("local-vllm:qwen3-coder");
-
-        expect(result.success).toBe(false);
-        if (!result.success) {
-          expect(result.error.type).toBe("policy_denied");
-        }
-      }
-    );
   });
 
   it("returns provider_disabled for disabled custom OpenAI-compatible providers", async () => {
@@ -1405,6 +1354,163 @@ describe("ProviderModelFactory GitHub Copilot", () => {
   });
 });
 
+describe("ProviderModelFactory Meta", () => {
+  const metaOptions = (thinking: ThinkingLevel) => {
+    const options = buildProviderOptions("meta:muse-wonder-1.0", thinking);
+    if (!("openai" in options)) throw new Error("Meta must use the OpenAI SDK namespace");
+    return { openai: options.openai };
+  };
+
+  unsetEnvForEachTest(
+    "META_MODEL_API_KEY",
+    "MODEL_API_KEY",
+    "META_BASE_URL",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL"
+  );
+
+  it("never uses ambient OpenAI credentials for Meta", async () => {
+    process.env.OPENAI_API_KEY = "openai-only-key";
+    await withTempConfig(async (_config, factory) => {
+      expect(await factory.createModel("meta:muse-wonder-1.0")).toEqual({
+        success: false,
+        error: { type: "api_key_not_found", provider: "meta" },
+      });
+    });
+  });
+
+  it.each([
+    [undefined, "https://api.meta.ai/v1/responses"],
+    ["https://meta-proxy.example.com", "https://meta-proxy.example.com/v1/responses"],
+    [
+      "https://meta-proxy.example.com/custom/v1/",
+      "https://meta-proxy.example.com/custom/v1/responses",
+    ],
+  ])("uses Meta credentials and the configured endpoint %s", async (baseUrl, expectedUrl) => {
+    process.env.OPENAI_API_KEY = "wrong-key";
+    process.env.OPENAI_BASE_URL = "https://wrong.example.com/v1";
+    process.env.META_MODEL_API_KEY = "env-meta-key";
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({
+        meta: { apiKey: "config-meta-key", baseUrl, headers: { "x-meta-test": "value" } },
+      });
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel("meta:muse-wonder-1.0");
+        if (!result.success) throw new Error(result.error.type);
+        await generateText({
+          model: result.data,
+          prompt: "hello",
+          providerOptions: metaOptions("max"),
+          maxRetries: 0,
+        }).catch(() => undefined);
+        expect(calls).toHaveLength(1);
+        expect(calls[0].url).toBe(expectedUrl);
+        const headers = new Headers(calls[0].init.headers);
+        expect(headers.get("authorization")).toBe("Bearer config-meta-key");
+        expect(headers.get("x-meta-test")).toBe("value");
+        expect(parseSentBody(calls[0])).toMatchObject({
+          model: "muse-wonder-1.0",
+          store: false,
+          include: ["reasoning.encrypted_content"],
+          reasoning: { effort: "max", summary: "auto" },
+        });
+        expect(parseSentBody(calls[0])).not.toHaveProperty("service_tier");
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
+
+  it("replays encrypted reasoning and tool results across Responses steps", async () => {
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({ meta: { apiKey: "meta-key" } });
+      const calls: CapturedFetchCall[] = [];
+      const fakeFetch = Object.assign((input: RequestInfo | URL, init?: RequestInit) => {
+        calls.push({
+          url: input instanceof Request ? input.url : input.toString(),
+          init: init ?? {},
+        });
+        const output =
+          calls.length === 1
+            ? [
+                {
+                  type: "reasoning",
+                  id: "rs_meta",
+                  summary: [],
+                  encrypted_content: "encrypted-meta-reasoning",
+                },
+                {
+                  type: "function_call",
+                  id: "fc_meta",
+                  call_id: "call_meta",
+                  name: "multiply",
+                  arguments: '{"a":17,"b":19}',
+                },
+              ]
+            : [
+                {
+                  type: "message",
+                  id: "msg_meta",
+                  role: "assistant",
+                  content: [{ type: "output_text", text: "323", annotations: [] }],
+                },
+              ];
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              id: `resp_meta_${calls.length}`,
+              created_at: 0,
+              status: "completed",
+              model: "muse-wonder-1.0",
+              output,
+              usage: { input_tokens: 10, output_tokens: 5 },
+            }),
+            { headers: { "content-type": "application/json" } }
+          )
+        );
+      }, fetch) as typeof fetch;
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const model = await factory.createModel("meta:muse-wonder-1.0");
+        if (!model.success) throw new Error(model.error.type);
+        const result = await generateText({
+          model: model.data,
+          prompt: "Multiply 17 by 19 using the tool.",
+          providerOptions: metaOptions("high"),
+          tools: {
+            multiply: tool({
+              inputSchema: z.object({ a: z.number(), b: z.number() }),
+              execute: ({ a, b }) => Promise.resolve(a * b),
+            }),
+          },
+          stopWhen: stepCountIs(2),
+          maxRetries: 0,
+        });
+        expect(result.text).toBe("323");
+        expect(calls).toHaveLength(2);
+        expect(parseSentBody(calls[1]).input).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              type: "reasoning",
+              encrypted_content: "encrypted-meta-reasoning",
+            }),
+            expect.objectContaining({
+              type: "function_call_output",
+              call_id: "call_meta",
+              output: "323",
+            }),
+          ])
+        );
+        expect(parseSentBody(calls[1])).not.toHaveProperty("previous_response_id");
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
+});
+
 describe("ProviderModelFactory native OpenAI alias tiers", () => {
   it.each(["responses", "chatCompletions"] as const)(
     "retains SDK tier gating for unmapped native models over %s",
@@ -1547,20 +1653,24 @@ describe("ProviderModelFactory native OpenAI alias tiers", () => {
   );
 
   it.each([
-    ["gpt-6-astra", "ultrafast"],
+    ["gpt-6-astra", "responses", "ultrafast"],
+    ["gpt-6.1-sol", "responses", "ultrafast"],
     // Ultrafast is model-gated: other models drop the tier instead of sending one
     // OpenAI rejects (and never fall back to the separately billed Fast tier).
-    ["gpt-6.1-sol", undefined],
-    ["gpt-6-sol", undefined],
+    ["gpt-6-luna", "responses", undefined],
+    ["gpt-6-sol", "responses", undefined],
+    // Chat Completions' service_tier enum has no "ultrafast", so the stored wire drops it.
+    ["gpt-6.1-sol", "chatCompletions", undefined],
   ] as const)(
-    "sends the configured Ultrafast tier for %s only when supported",
-    async (model, tier) => {
+    "sends the configured Ultrafast tier for %s over %s only when supported",
+    async (model, wireFormat, tier) => {
       await withTempConfig(async (_config, factory, _oauth, store) => {
         store.saveProvidersConfig({
           openai: {
             apiKey: "native-key",
             baseUrl: "https://native.example.com/v1",
             serviceTier: "ultrafast",
+            wireFormat,
           },
         });
         const { calls, fakeFetch } = createCapturingFetch();
@@ -1579,6 +1689,99 @@ describe("ProviderModelFactory native OpenAI alias tiers", () => {
       });
     }
   );
+});
+
+async function sendWithCyberKey(
+  model: LanguageModel,
+  stream: boolean,
+  cyberAccessProgram: string | null = "daybreak_blue"
+): Promise<void> {
+  const request = {
+    model,
+    prompt: "hello",
+    maxRetries: 0,
+    providerOptions: cyberAccessProgram == null ? undefined : { openai: { cyberAccessProgram } },
+  };
+  if (stream) {
+    await streamText(request).consumeStream({ onError: () => undefined });
+  } else {
+    await generateText(request).catch(() => undefined);
+  }
+}
+
+describe("ProviderModelFactory Cyber access program", () => {
+  unsetEnvForEachTest("OPENAI_BASE_URL", "OPENAI_API_BASE");
+  it.each(["responses", "chatCompletions"] as const)(
+    "serializes the private Cyber key only into direct OpenAI %s bodies",
+    async (wireFormat) => {
+      await withTempConfig(async (_config, factory, _oauth, store) => {
+        store.saveProvidersConfig({
+          openai: {
+            apiKey: "native-key",
+            baseUrl: "https://native.example.com/v1",
+            wireFormat,
+            webSocketTransportEnabled: false,
+          },
+        });
+        const { calls, fakeFetch } = createCapturingFetch();
+        const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+        try {
+          const result = await factory.createModel("openai:gpt-6.1-sol");
+          if (!result.success) throw new Error(result.error.type);
+          for (const stream of [false, true]) {
+            await sendWithCyberKey(result.data, stream);
+            await sendWithCyberKey(result.data, stream, null);
+          }
+          expect(calls.map((call) => parseSentBody(call).access_programs)).toEqual(
+            wireFormat === "responses"
+              ? [{ cyber: "daybreak_blue" }, undefined, { cyber: "daybreak_blue" }, undefined]
+              : [undefined, undefined, undefined, undefined]
+          );
+        } finally {
+          fetchSpy.mockRestore();
+        }
+      });
+    }
+  );
+
+  it("never sends access programs through Codex OAuth or custom Responses providers", async () => {
+    await withTempConfig(async (_config, factory, oauth, store) => {
+      const auth = {
+        type: "oauth" as const,
+        access: "test-access",
+        refresh: "test-refresh",
+        expires: Date.now() + 3_600_000,
+      };
+      store.saveProvidersConfig({
+        openai: { codexOauth: auth },
+        "responses-proxy": {
+          providerType: "openai-responses",
+          baseUrl: "https://proxy.example.com/v1",
+          apiKey: "custom-key",
+        },
+      });
+      oauth.codexOauthService = Object.create(CodexOauthService.prototype) as CodexOauthService;
+      oauth.codexOauthService.getValidAuth = () => Promise.resolve(Ok(auth));
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        for (const model of ["openai:gpt-6.1-sol", "responses-proxy:gpt-6.1-sol"]) {
+          const result = await factory.createModel(model);
+          if (!result.success) throw new Error(result.error.type);
+          await sendWithCyberKey(result.data, false);
+        }
+        expect(calls.map((call) => call.url)).toEqual([
+          CODEX_ENDPOINT,
+          "https://proxy.example.com/v1/responses",
+        ]);
+        for (const call of calls) {
+          expect(parseSentBody(call)).not.toHaveProperty("access_programs");
+        }
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
 });
 
 describe("ProviderModelFactory GPT-6 Chat Completions tool reasoning", () => {
@@ -1805,7 +2008,6 @@ describe("ProviderModelFactory OpenAI WebSocket transport", () => {
         const factory = new ProviderModelFactory(
           config,
           providerService,
-          undefined,
           undefined,
           devToolsService
         );
@@ -2687,6 +2889,7 @@ function parseSentBody(call: CapturedFetchCall): Record<string, unknown> {
 }
 
 describe("ProviderModelFactory Anthropic Fast mode", () => {
+  unsetEnvForEachTest("ANTHROPIC_BASE_URL");
   const sendOnce = async (
     anthropicConfig: Record<string, unknown>,
     modelString: string
@@ -2843,9 +3046,8 @@ describe("wrapFetchWithAnthropicCacheControl — ZDR stripping", () => {
       injectCacheControl: false,
     });
 
-    // Markers the request pipeline can serialize before the wrapper runs:
-    // eligibility checks read a policy-filtered view that can hide the
-    // global disableBetaFeatures flag, so the wire must strip them.
+    // Markers the request pipeline can serialize before the wrapper runs; the
+    // wire strips them whatever upstream eligibility checks decided.
     await wrapped("https://proxy.example/v1/messages", {
       method: "POST",
       body: JSON.stringify({
@@ -2881,6 +3083,35 @@ describe("wrapFetchWithAnthropicCacheControl — ZDR stripping", () => {
 
     expect(calls).toHaveLength(1);
     expect(JSON.stringify(parseSentBody(calls[0]))).toContain("cache_control");
+  });
+});
+
+describe("wrapFetchWithAnthropicCacheControl — deferred tools (#5262)", () => {
+  it("marks the last non-deferred tool and never leaves cache_control on a deferred one", async () => {
+    const { calls, fakeFetch } = createCapturingFetch();
+    const wrapped = wrapFetchWithAnthropicCacheControl(fakeFetch, "1h");
+
+    await wrapped("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+        tools: [
+          { name: "bash" },
+          { name: "tool_catalog_search" },
+          { name: "zulip_list", defer_loading: true, cache_control: { type: "ephemeral" } },
+          // Gateway prompt format carries the marker in providerOptions.
+          { name: "zulip_send", providerOptions: { anthropic: { deferLoading: true } } },
+        ],
+      }),
+    });
+
+    const tools = (parseSentBody(calls[0]) as { tools: Array<Record<string, unknown>> }).tools;
+    expect(tools.map((tool) => [tool.name, tool.cache_control])).toEqual([
+      ["bash", undefined],
+      ["tool_catalog_search", { type: "ephemeral", ttl: "1h" }],
+      ["zulip_list", undefined],
+      ["zulip_send", undefined],
+    ]);
   });
 });
 
@@ -2946,6 +3177,7 @@ describe("wrapFetchWithAnthropicCacheControl — reasoning fields pass through u
 });
 
 describe("ProviderModelFactory Coder", () => {
+  unsetEnvForEachTest("OPENAI_BASE_URL", "OPENAI_API_BASE");
   const CODER_DEPLOYMENT_URL = "https://coder.example.com";
 
   function saveCoderConfig(config: Config, overrides: Record<string, unknown> = {}): void {
@@ -2999,12 +3231,14 @@ describe("ProviderModelFactory Coder", () => {
     "github-copilot:gpt-6-astra",
     "github-copilot:gpt-5.4",
     "openai:gpt-6-astra",
+    "openai:gpt-6.1-sol",
+    "openai:gpt-6-luna",
     "openai:team-astra",
     "responses-proxy:team-astra",
     "openrouter:openai/team-astra",
     "mux-gateway:openai/team-astra",
     "responses-proxy:gpt-6-astra",
-  ])("pins and serializes the shared Fast tier through %s", async (modelString) => {
+  ])("pins Fast tiers and isolates live per-chat speed changes through %s", async (modelString) => {
     await withTempConfig(async (config, factory, oauth, store) => {
       saveCoderConfig(config, {
         models: [
@@ -3150,6 +3384,107 @@ describe("ProviderModelFactory Coder", () => {
             }
           }
         }
+
+        for (const pinnedTier of [undefined, "priority"] as const) {
+          store.saveProvidersConfig({
+            ...providersConfig,
+            openai: { ...providersConfig.openai, serviceTier: pinnedTier },
+          });
+          // Models can be prepared before a chat has selected a speed. Each
+          // callback must stay attached to its own holder, even when unset.
+          const chatA: { serviceTier?: ServiceTier } = {};
+          const chatB: { serviceTier?: ServiceTier } = {};
+          const modelA = await factory.createModel(modelString, undefined, {
+            getServiceTierOverride: () => chatA.serviceTier,
+          });
+          const modelB = await factory.resolveAndCreateModel(modelString, "off", undefined, {
+            getServiceTierOverride: () => chatB.serviceTier,
+          });
+          if (!modelA.success) throw new Error(modelA.error.type);
+          if (!modelB.success) throw new Error(modelB.error.type);
+
+          // Preference, credentials, aliases, instance types and wire edits
+          // must not be reloaded by existing chats when only A changes speed.
+          store.saveProvidersConfig({
+            openai: {
+              apiKey: "edited-key",
+              baseUrl: "https://edited.example.com/v1",
+              serviceTier: "flex",
+              wireFormat: "chatCompletions",
+            },
+          });
+          const staleOptions: Record<string, Record<string, string>> = modelString.startsWith(
+            "openrouter:"
+          )
+            ? { openrouter: { service_tier: "auto" } }
+            : modelString.startsWith("github-copilot:")
+              ? { "github-copilot": { serviceTier: "auto" } }
+              : { openai: { serviceTier: "auto" } };
+          const staleOptionsSnapshot = structuredClone(staleOptions);
+          const supportsUltrafast =
+            (modelString.startsWith("openai:") && !modelString.endsWith("gpt-6-luna")) ||
+            modelString.startsWith("responses-proxy:") ||
+            modelString.startsWith("coder:openai/") ||
+            modelString.startsWith("coder:prod-ai/");
+          let originalCall: CapturedFetchCall | undefined;
+          for (const tier of [
+            undefined,
+            "default",
+            "priority",
+            "ultrafast",
+            "default",
+            undefined,
+          ] as const) {
+            chatA.serviceTier = tier;
+            for (const stream of [false, true]) {
+              for (const { expected, ...request } of [
+                {
+                  model: modelA.data,
+                  expected:
+                    tier === "ultrafast" && !supportsUltrafast ? undefined : (tier ?? pinnedTier),
+                },
+                {
+                  model: modelA.data,
+                  providerOptions: staleOptions,
+                  expected:
+                    tier === "ultrafast" && !supportsUltrafast
+                      ? undefined
+                      : (tier ?? ("auto" as const)),
+                },
+                { model: modelB.data.model, expected: pinnedTier },
+              ]) {
+                const before = calls.length;
+                if (stream) {
+                  await streamText({ ...request, prompt: "hello", maxRetries: 0 }).consumeStream({
+                    onError: () => undefined,
+                  });
+                } else {
+                  await generateText({ ...request, prompt: "hello", maxRetries: 0 }).catch(
+                    () => undefined
+                  );
+                }
+                expect(calls.length).toBe(before + 1);
+                const call = calls[before];
+                const body = parseSentBody(call);
+                originalCall ??= call;
+                expect(call.url).toBe(originalCall.url);
+                expect(body.model).toBe(parseSentBody(originalCall).model);
+                expect(new Headers(call.init.headers).get("authorization")).toBe(
+                  new Headers(originalCall.init.headers).get("authorization")
+                );
+                if (modelString.startsWith("mux-gateway:")) {
+                  expect((body.providerOptions as MuxProviderOptions)?.openai?.serviceTier).toBe(
+                    expected
+                  );
+                } else {
+                  expect(body.service_tier).toBe(expected);
+                }
+              }
+            }
+          }
+          expect(chatB.serviceTier).toBeUndefined();
+          expect(staleOptions).toEqual(staleOptionsSnapshot);
+        }
       } finally {
         fetchSpy.mockRestore();
       }
@@ -3255,37 +3590,6 @@ describe("ProviderModelFactory Coder", () => {
       });
     }
   );
-
-  it("does not serialize a retained OpenAI tier under a Coder-only enforced policy", async () => {
-    await withTempPolicyProviderFactory(
-      { policy_format_version: "0.1", provider_access: [{ id: "coder" }] },
-      async (config, factory, _policyService, oauth) => {
-        saveCoderConfig(config);
-        const store = new ProvidersConfigStore(config.rootDir);
-        store.saveProvidersConfig({
-          ...store.loadProvidersConfig(),
-          openai: { serviceTier: "priority" },
-        });
-        oauth.coderOauthService = stubCoderOauthService();
-        const { calls, fakeFetch } = createCapturingFetch();
-        const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
-        try {
-          for (const options of [undefined, { openai: { serviceTier: "priority" as const } }]) {
-            const created = await factory.createModel("coder:openai/gpt-6-astra", options);
-            if (!created.success) throw new Error(created.error.type);
-            const before = calls.length;
-            await generateText({ model: created.data, prompt: "hello", maxRetries: 0 }).catch(
-              () => undefined
-            );
-            expect(calls.length).toBe(before + 1);
-            expect(parseSentBody(calls[before])).not.toHaveProperty("service_tier");
-          }
-        } finally {
-          fetchSpy.mockRestore();
-        }
-      }
-    );
-  });
 
   // The gateway's openai-compat instances speak Chat Completions, so the same
   // tool-reasoning clamp applies there. A Coder-scoped "Treat as" mapping is
@@ -3438,6 +3742,25 @@ describe("ProviderModelFactory Coder", () => {
     }
   );
 
+  it("never sends access programs through Coder's OpenAI Responses route", async () => {
+    await withTempConfig(async (config, factory, oauth) => {
+      saveCoderConfig(config);
+      oauth.coderOauthService = stubCoderOauthService();
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel("coder:openai/gpt-6.1-sol");
+        if (!result.success) throw new Error(result.error.type);
+        await sendWithCyberKey(result.data, false);
+        expect(calls).toHaveLength(1);
+        expect(calls[0].url).toEndWith("/responses");
+        expect(parseSentBody(calls[0])).not.toHaveProperty("access_programs");
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
+
   it("does not pin OpenAI tiers on OAuth or non-OpenAI Coder upstreams", async () => {
     await withTempConfig(async (config, factory, oauth, store) => {
       saveCoderConfig(config, { additionalProviders: [{ name: "openai", type: "anthropic" }] });
@@ -3485,6 +3808,30 @@ describe("ProviderModelFactory Coder", () => {
             expect(hasLanguageModelCleanup(result.data.model)).toBe(false);
           }
           expect(parseSentBody(calls[before])).not.toHaveProperty("service_tier");
+
+          const chat: { serviceTier?: ServiceTier } = {};
+          const live = await factory.createModel(model, undefined, {
+            getServiceTierOverride: () => chat.serviceTier,
+          });
+          if (!live.success) throw new Error(live.error.type);
+          for (const tier of ["priority", "ultrafast", "default"] as const) {
+            chat.serviceTier = tier;
+            for (const stream of [false, true]) {
+              const liveBefore = calls.length;
+              const request = { model: live.data, prompt: "hello", maxRetries: 0 };
+              if (stream) {
+                await streamText(request).consumeStream({ onError: () => undefined });
+              } else {
+                await generateText(request).catch(() => undefined);
+              }
+              expect(calls.length).toBe(liveBefore + 1);
+              expect(calls[liveBefore].url).toBe(calls[before].url);
+              expect(parseSentBody(calls[liveBefore]).model).toBe(
+                parseSentBody(calls[before]).model
+              );
+              expect(parseSentBody(calls[liveBefore])).not.toHaveProperty("service_tier");
+            }
+          }
         }
       } finally {
         fetchSpy.mockRestore();
@@ -3806,6 +4153,293 @@ describe("ProviderModelFactory Coder", () => {
       } finally {
         PROVIDER_REGISTRY.openai = originalOpenAIRegistry;
       }
+    });
+  });
+
+  it("routes canonical models to the canonicalRoutes-mapped instance with native identity", async () => {
+    await withTempConfig(async (config, factory, oauth) => {
+      saveCoderConfig(config, {
+        discoveredProviders: [
+          { name: "anthropic", type: "anthropic" },
+          { name: "claude-aws-us-east-2", type: "anthropic" },
+          { name: "agents-google", type: "google" },
+        ],
+        canonicalRoutes: { anthropic: "claude-aws-us-east-2", google: "agents-google" },
+      });
+      await saveRoutePriority(config, ["coder"]);
+      oauth.coderOauthService = stubCoderOauthService();
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      const sendAndGetUrl = async (model: LanguageModel): Promise<string | undefined> => {
+        await generateText({ model, prompt: "hello", maxRetries: 0 }).catch(() => undefined);
+        return calls.at(-1)?.url;
+      };
+      try {
+        const routed = await factory.resolveAndCreateModel("anthropic:claude-opus-5-5", "off");
+        if (!routed.success) throw new Error(routed.error.type);
+        expect(routed.data.effectiveModelString).toBe("coder:claude-aws-us-east-2/claude-opus-5-5");
+        expect(routed.data.canonicalModelString).toBe("anthropic:claude-opus-5-5");
+        expect(routed.data.wireProviderName).toBe("anthropic");
+        expect(factory.resolveEffectiveModelString("anthropic:claude-opus-5-5")).toBe(
+          "coder:claude-aws-us-east-2/claude-opus-5-5"
+        );
+        expect(await sendAndGetUrl(routed.data.model)).toBe(
+          `${CODER_DEPLOYMENT_URL}/api/v2/aibridge/claude-aws-us-east-2/v1/messages`
+        );
+
+        // An explicit selection keeps addressing the instance literally named in it.
+        const explicit = await factory.resolveAndCreateModel(
+          "coder:anthropic/claude-opus-5-5",
+          "off"
+        );
+        if (!explicit.success) throw new Error(explicit.error.type);
+        expect(explicit.data.effectiveModelString).toBe("coder:anthropic/claude-opus-5-5");
+        expect(factory.resolveEffectiveModelString("coder:anthropic/claude-opus-5-5")).toBe(
+          "coder:anthropic/claude-opus-5-5"
+        );
+        expect(await sendAndGetUrl(explicit.data.model)).toBe(
+          `${CODER_DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/messages`
+        );
+
+        const gemini = await factory.resolveAndCreateModel("google:gemini-3.8-flash", "off");
+        if (!gemini.success) throw new Error(gemini.error.type);
+        expect(gemini.data.effectiveModelString).toBe("coder:agents-google/gemini-3.8-flash");
+        expect(gemini.data.canonicalModelString).toBe("google:gemini-3.8-flash");
+        expect(await sendAndGetUrl(gemini.data.model)).toBe(
+          `${CODER_DEPLOYMENT_URL}/api/v2/aibridge/agents-google/v1/chat/completions`
+        );
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
+
+  it("samples live per-chat speed between SDK tool steps without changing an active request", async () => {
+    await withTempConfig(async (config, factory, oauth, store) => {
+      saveCoderConfig(config, {
+        additionalProviders: [{ name: "chat-proxy", type: "openai-compat" }],
+        models: [{ id: "chat-proxy/team-astra", mappedToModel: "openai:gpt-6-astra" }],
+      });
+      store.saveProvidersConfig({
+        ...store.loadProvidersConfig(),
+        openai: { serviceTier: "priority" },
+      });
+      await saveRoutePriority(config, ["direct"]);
+      oauth.coderOauthService = stubCoderOauthService();
+      const chat: { serviceTier: ServiceTier } = { serviceTier: "default" };
+      const requestStarted = Promise.withResolvers<void>();
+      const releaseFirstRequest = Promise.withResolvers<void>();
+      const sse = (chunks: unknown[]) =>
+        new Response(
+          `${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("")}data: [DONE]\n\n`,
+          {
+            headers: { "content-type": "text/event-stream" },
+          }
+        );
+      const responses = [
+        sse([
+          {
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  role: "assistant",
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: "call_echo",
+                      type: "function",
+                      function: { name: "echo", arguments: '{"text":"hello"}' },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+          { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+        ]),
+        sse([{ choices: [{ index: 0, delta: { content: "done" }, finish_reason: "stop" }] }]),
+      ];
+      const { calls, fakeFetch: capture } = createCapturingFetch();
+      const fakeFetch = Object.assign(async (...args: Parameters<typeof capture>) => {
+        await capture(...args);
+        const response = responses.shift();
+        if (!response) throw new Error("Unexpected extra model request");
+        if (calls.length === 1) {
+          requestStarted.resolve();
+          await releaseFirstRequest.promise;
+        }
+        return response;
+      }, capture);
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const model = await factory.resolveAndCreateModel(
+          "coder:chat-proxy/team-astra",
+          "off",
+          undefined,
+          {
+            getServiceTierOverride: () => chat.serviceTier,
+          }
+        );
+        if (!model.success) throw new Error(model.error.type);
+        const echoed: string[] = [];
+        const result = streamText({
+          model: model.data.model,
+          prompt: "echo hello",
+          providerOptions: { openai: { serviceTier: "flex" } },
+          maxRetries: 0,
+          tools: {
+            echo: tool({
+              inputSchema: z.object({ text: z.string() }),
+              execute: ({ text }) => {
+                echoed.push(text);
+                return Promise.resolve(text);
+              },
+            }),
+          },
+          stopWhen: stepCountIs(2),
+        });
+        const text = result.text;
+        await requestStarted.promise;
+        const firstBody = calls[0].init.body;
+        // The selector changes while the first request is still awaiting its
+        // response. Only the next SDK step may observe the new chat value.
+        chat.serviceTier = "priority";
+        store.saveProvidersConfig({ openai: { serviceTier: "auto" } });
+        releaseFirstRequest.resolve();
+
+        expect(await text).toBe("done");
+        expect(echoed).toEqual(["hello"]);
+        expect(calls).toHaveLength(2);
+        expect(calls[0].init.body).toBe(firstBody);
+        expect(calls.map((call) => parseSentBody(call).service_tier)).toEqual([
+          "default",
+          "priority",
+        ]);
+        for (const call of calls) {
+          expect(call.url).toBe(
+            `${CODER_DEPLOYMENT_URL}/api/v2/aibridge/chat-proxy/v1/chat/completions`
+          );
+          expect(parseSentBody(call).model).toBe("team-astra");
+        }
+        const second = parseSentBody(calls[1]) as { messages: Array<Record<string, unknown>> };
+        expect(
+          second.messages
+            .filter((message) => message.role === "tool")
+            .map((message) => message.tool_call_id)
+        ).toEqual(["call_echo"]);
+      } finally {
+        releaseFirstRequest.resolve();
+        fetchSpy.mockRestore();
+      }
+    });
+  });
+
+  it("runs Gemini tool calls streamed without an index through a Coder chat instance", async () => {
+    await withTempConfig(async (config, factory, oauth) => {
+      saveCoderConfig(config, {
+        discoveredProviders: [{ name: "agents-google", type: "google" }],
+        canonicalRoutes: { google: "agents-google" },
+      });
+      await saveRoutePriority(config, ["coder"]);
+      oauth.coderOauthService = stubCoderOauthService();
+      const sse = (chunks: unknown[]) => {
+        const body = `${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("")}data: [DONE]\n\n`;
+        // Split the first tool_calls line across network reads.
+        const cut = body.indexOf('"tool_calls"') + '"tool'.length;
+        const parts = cut < '"tool'.length ? [body] : [body.slice(0, cut), body.slice(cut)];
+        const encoder = new TextEncoder();
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              for (const part of parts) controller.enqueue(encoder.encode(part));
+              controller.close();
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } }
+        );
+      };
+      // Gemini's OpenAI-compatible shape: each call whole in its own chunk, no index.
+      const toolCallChunk = (id: string, text: string) => ({
+        choices: [
+          {
+            index: 0,
+            delta: {
+              role: "assistant",
+              tool_calls: [
+                {
+                  id,
+                  type: "function",
+                  function: { name: "echo", arguments: JSON.stringify({ text }) },
+                },
+              ],
+            },
+          },
+        ],
+      });
+      const responses = [
+        sse([
+          toolCallChunk("call_a", "a"),
+          toolCallChunk("call_b", "b"),
+          { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+        ]),
+        sse([{ choices: [{ index: 0, delta: { content: "done" }, finish_reason: "stop" }] }]),
+      ];
+      const requestBodies: Array<{ messages?: Array<Record<string, unknown>> }> = [];
+      const fakeFetch = Object.assign((_input: RequestInfo | URL, init?: RequestInit) => {
+        requestBodies.push(JSON.parse(init?.body as string) as (typeof requestBodies)[number]);
+        const response = responses.shift();
+        return response ? Promise.resolve(response) : Promise.reject(new Error("unexpected"));
+      }, fetch) as typeof fetch;
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const routed = await factory.resolveAndCreateModel("google:gemini-3.8-flash", "off");
+        if (!routed.success) throw new Error(routed.error.type);
+        const echoed: string[] = [];
+        const result = streamText({
+          model: routed.data.model,
+          prompt: "echo a and b",
+          tools: {
+            echo: tool({
+              inputSchema: jsonSchema<{ text: string }>({
+                type: "object",
+                properties: { text: { type: "string" } },
+                required: ["text"],
+              }),
+              execute: ({ text }) => {
+                echoed.push(text);
+                return Promise.resolve(text);
+              },
+            }),
+          },
+          stopWhen: stepCountIs(2),
+        });
+
+        expect(await result.text).toBe("done");
+        expect(echoed).toEqual(["a", "b"]);
+        expect(
+          requestBodies[1]?.messages
+            ?.filter((message) => message.role === "tool")
+            .map((message) => message.tool_call_id)
+        ).toEqual(["call_a", "call_b"]);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
+
+  it("does not route a canonical model through Coder when its mapped instance is unknown", async () => {
+    await withTempConfig(async (config, factory, oauth) => {
+      saveCoderConfig(config, {
+        discoveredProviders: [{ name: "anthropic", type: "anthropic" }],
+        canonicalRoutes: { anthropic: "deleted-instance" },
+      });
+      await saveRoutePriority(config, ["coder", "direct"]);
+      oauth.coderOauthService = stubCoderOauthService();
+
+      expect(factory.resolveEffectiveModelString("anthropic:claude-opus-5-5")).toBe(
+        "anthropic:claude-opus-5-5"
+      );
     });
   });
 
@@ -4357,246 +4991,6 @@ describe("ProviderModelFactory Coder", () => {
     });
   });
 
-  it("rechecks policy per request, not only at model creation", async () => {
-    // Regression: an enforced policy can refresh mid-stream (or during the
-    // awaited setup between resolveAndCreateModel and the first fetch) to
-    // deny Coder or the specific model. getValidAuth() only validates the
-    // credential/issuer, so without a per-request policy gate the wrapper
-    // would keep attaching the OAuth token for the remainder of a long
-    // multi-step stream.
-    await withTempPolicyProviderFactory(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "coder" }],
-      },
-      async (config, factory, policyService, oauth) => {
-        const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
-        const originalFetch = globalThis.fetch;
-        let capturedFetch: typeof fetch | undefined;
-        let upstreamCalls = 0;
-
-        saveCoderConfig(config);
-        oauth.coderOauthService = stubCoderOauthService();
-
-        PROVIDER_REGISTRY.anthropic = async () => {
-          const module = await originalAnthropicRegistry();
-          return {
-            ...module,
-            createAnthropic: (options) => {
-              capturedFetch = options?.fetch;
-              return module.createAnthropic(options);
-            },
-          };
-        };
-
-        globalThis.fetch = Object.assign(
-          (_input: Parameters<typeof fetch>[0], _init?: Parameters<typeof fetch>[1]) => {
-            upstreamCalls++;
-            return Promise.resolve(new Response("{}", { status: 200 }));
-          },
-          { preconnect: () => undefined }
-        ) as typeof fetch;
-
-        try {
-          // Model creation succeeds under the permissive policy.
-          const result = await factory.createModel("coder:anthropic/claude-sonnet-4-5");
-          expect(result.success).toBe(true);
-          expect(capturedFetch).toBeDefined();
-
-          // First request under the permissive policy goes through.
-          await capturedFetch!(`${CODER_DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/messages`, {
-            method: "POST",
-            headers: { "x-api-key": "coder" },
-            body: "{}",
-          });
-          expect(upstreamCalls).toBe(1);
-
-          // The policy refreshes mid-session: coder allows only another model.
-          await writeFile(
-            process.env.MUX_POLICY_FILE!,
-            JSON.stringify({
-              policy_format_version: "0.1",
-              provider_access: [{ id: "coder", model_access: ["openai/gpt-5.2"] }],
-            }),
-            "utf-8"
-          );
-          const refresh = await policyService.refreshNow();
-          expect(refresh.success).toBe(true);
-
-          // The SAME created model's next request must fail closed without
-          // hitting the upstream (no token attached, no bypass).
-          // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-          await expect(
-            capturedFetch!(`${CODER_DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/messages`, {
-              method: "POST",
-              headers: { "x-api-key": "coder" },
-              body: "{}",
-            })
-          ).rejects.toThrow("not allowed by policy");
-          expect(upstreamCalls).toBe(1);
-
-          // A refresh that denies the provider entirely fails the same way.
-          await writeFile(
-            process.env.MUX_POLICY_FILE!,
-            JSON.stringify({
-              policy_format_version: "0.1",
-              provider_access: [{ id: "openai" }],
-            }),
-            "utf-8"
-          );
-          expect((await policyService.refreshNow()).success).toBe(true);
-          // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-          await expect(
-            capturedFetch!(`${CODER_DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/messages`, {
-              method: "POST",
-              headers: { "x-api-key": "coder" },
-              body: "{}",
-            })
-          ).rejects.toThrow("not allowed by policy");
-          expect(upstreamCalls).toBe(1);
-        } finally {
-          globalThis.fetch = originalFetch;
-          PROVIDER_REGISTRY.anthropic = originalAnthropicRegistry;
-        }
-      }
-    );
-  });
-
-  it("rechecks policy after the awaited token refresh, before attaching credentials", async () => {
-    // Regression: getValidAuth() can spend tens of seconds refreshing an
-    // expired token and waiting for cross-process file locks AFTER the
-    // wrapper's pre-await policy check passed. A policy refresh landing in
-    // that window (denying Coder or this model) must not be bypassed — the
-    // wrapper must recheck immediately before adding the Authorization
-    // header. Deterministically simulated by flipping the policy inside the
-    // stubbed getValidAuth.
-    await withTempPolicyProviderFactory(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "coder" }],
-      },
-      async (config, factory, policyService, oauth) => {
-        const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
-        const originalFetch = globalThis.fetch;
-        let capturedFetch: typeof fetch | undefined;
-        let upstreamCalls = 0;
-
-        saveCoderConfig(config);
-        const stub = stubCoderOauthService();
-        const stubbedGetValidAuth = stub.getValidAuth.bind(stub);
-        stub.getValidAuth = async () => {
-          // The policy refreshes to deny coder WHILE the token refresh is in
-          // flight — after the wrapper's pre-await check already passed.
-          await writeFile(
-            process.env.MUX_POLICY_FILE!,
-            JSON.stringify({
-              policy_format_version: "0.1",
-              provider_access: [{ id: "openai" }],
-            }),
-            "utf-8"
-          );
-          const refresh = await policyService.refreshNow();
-          expect(refresh.success).toBe(true);
-          return stubbedGetValidAuth();
-        };
-        oauth.coderOauthService = stub;
-
-        PROVIDER_REGISTRY.anthropic = async () => {
-          const module = await originalAnthropicRegistry();
-          return {
-            ...module,
-            createAnthropic: (options) => {
-              capturedFetch = options?.fetch;
-              return module.createAnthropic(options);
-            },
-          };
-        };
-
-        globalThis.fetch = Object.assign(
-          (_input: Parameters<typeof fetch>[0], _init?: Parameters<typeof fetch>[1]) => {
-            upstreamCalls++;
-            return Promise.resolve(new Response("{}", { status: 200 }));
-          },
-          { preconnect: () => undefined }
-        ) as typeof fetch;
-
-        try {
-          const result = await factory.createModel("coder:anthropic/claude-sonnet-4-5");
-          expect(result.success).toBe(true);
-          expect(capturedFetch).toBeDefined();
-
-          // The pre-await check passes (policy still allows coder), the
-          // awaited getValidAuth flips the policy, and the post-await
-          // recheck must fail closed without attaching the token.
-          // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-          await expect(
-            capturedFetch!(`${CODER_DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/messages`, {
-              method: "POST",
-              headers: { "x-api-key": "coder" },
-              body: "{}",
-            })
-          ).rejects.toThrow("not allowed by policy");
-          expect(upstreamCalls).toBe(0);
-        } finally {
-          globalThis.fetch = originalFetch;
-          PROVIDER_REGISTRY.anthropic = originalAnthropicRegistry;
-        }
-      }
-    );
-  });
-
-  it("routes through the policy-forced base URL when the login matches it", async () => {
-    const LOCKED_URL = "https://locked.coder.example.com";
-    await withTempPolicyProviderFactory(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "coder", base_url: LOCKED_URL }],
-      },
-      async (config, factory, _policyService, oauth) => {
-        const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
-        let capturedBaseURL: string | undefined;
-
-        // Login performed against the policy-locked deployment (the
-        // policy-aware CoderOauthService logs in to the forced URL).
-        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-          coder: {
-            deploymentUrl: LOCKED_URL,
-            coderOauth: {
-              type: "oauth",
-              sessionId: "session_factory",
-              deploymentUrl: LOCKED_URL,
-              access: "at_factory",
-              refresh: "rt_factory",
-              expires: Date.now() + 3_600_000,
-              clientId: "c",
-              clientSecret: "s",
-            },
-          },
-        } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
-        oauth.coderOauthService = stubCoderOauthService("at_factory", LOCKED_URL);
-
-        PROVIDER_REGISTRY.anthropic = async () => {
-          const module = await originalAnthropicRegistry();
-          return {
-            ...module,
-            createAnthropic: (options) => {
-              capturedBaseURL = options?.baseURL;
-              return module.createAnthropic(options);
-            },
-          };
-        };
-
-        try {
-          const result = await factory.createModel("coder:anthropic/claude-sonnet-4-5");
-          expect(result.success).toBe(true);
-          expect(capturedBaseURL).toBe(`${LOCKED_URL}/api/v2/aibridge/anthropic/v1`);
-        } finally {
-          PROVIDER_REGISTRY.anthropic = originalAnthropicRegistry;
-        }
-      }
-    );
-  });
-
   it("only routes models from the discovered bridge catalog through Coder", async () => {
     await withTempConfig(async (config, factory, oauth) => {
       // Coder is logged in and preferred over direct, but its discovered
@@ -4730,131 +5124,6 @@ describe("ProviderModelFactory Coder", () => {
         )
       ).toBe("anthropic:claude-sonnet-4-5");
     });
-  });
-
-  it("routes policy-disallowed models away from Coder at routing time", async () => {
-    await withTempPolicyProviderFactory(
-      {
-        policy_format_version: "0.1",
-        provider_access: [
-          { id: "coder", model_access: ["anthropic/claude-sonnet-4-5"] },
-          { id: "anthropic" },
-        ],
-      },
-      async (config, factory, _policyService, oauth) => {
-        // The persisted catalog is deliberately policy-unfiltered (both
-        // models present); the CURRENT policy must gate routing so the
-        // disallowed model falls back to direct instead of being rewritten
-        // to coder: and dying at model creation with policy_denied.
-        saveCoderConfig(config, {
-          models: ["anthropic/claude-sonnet-4-5", "anthropic/claude-opus-4-1"],
-          discoveredModels: ["anthropic/claude-sonnet-4-5", "anthropic/claude-opus-4-1"],
-        });
-        const providersConfig =
-          new ProvidersConfigStore(config.rootDir).loadProvidersConfig() ?? {};
-        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-          ...providersConfig,
-          anthropic: { apiKey: "sk-ant-test" },
-        } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
-        oauth.coderOauthService = stubCoderOauthService();
-
-        await saveRoutePriority(config, ["coder", "direct"]);
-
-        // Allowed by policy: routed through Coder.
-        expect(
-          factory.resolveGatewayModelString(
-            "anthropic:claude-sonnet-4-5",
-            "anthropic:claude-sonnet-4-5"
-          )
-        ).toBe("coder:anthropic/claude-sonnet-4-5");
-
-        // In the catalog but disallowed by the current policy: direct.
-        expect(
-          factory.resolveGatewayModelString(
-            "anthropic:claude-opus-4-1",
-            "anthropic:claude-opus-4-1"
-          )
-        ).toBe("anthropic:claude-opus-4-1");
-      }
-    );
-  });
-
-  it("accepts policy-bound credentials even when the editable deploymentUrl was changed", async () => {
-    const LOCKED_URL = "https://locked.coder.example.com";
-    await withTempPolicyProviderFactory(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "coder", base_url: LOCKED_URL }],
-      },
-      async (config, factory, _policyService, oauth) => {
-        const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
-        let capturedBaseURL: string | undefined;
-
-        // Tokens were minted by the forced deployment, but the user has since
-        // edited the (unlocked) deploymentUrl field to point elsewhere. The
-        // forced URL must be resolved FIRST so the valid policy-bound
-        // credentials are not rejected as issuer-mismatched.
-        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-          coder: {
-            deploymentUrl: "https://user-edited.example.com",
-            coderOauth: {
-              type: "oauth",
-              sessionId: "session_factory",
-              deploymentUrl: LOCKED_URL,
-              access: "at_factory",
-              refresh: "rt_factory",
-              expires: Date.now() + 3_600_000,
-              clientId: "c",
-              clientSecret: "s",
-            },
-          },
-        } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
-        oauth.coderOauthService = stubCoderOauthService("at_factory", LOCKED_URL);
-
-        PROVIDER_REGISTRY.anthropic = async () => {
-          const module = await originalAnthropicRegistry();
-          return {
-            ...module,
-            createAnthropic: (options) => {
-              capturedBaseURL = options?.baseURL;
-              return module.createAnthropic(options);
-            },
-          };
-        };
-
-        try {
-          const result = await factory.createModel("coder:anthropic/claude-sonnet-4-5");
-          expect(result.success).toBe(true);
-          expect(capturedBaseURL).toBe(`${LOCKED_URL}/api/v2/aibridge/anthropic/v1`);
-        } finally {
-          PROVIDER_REGISTRY.anthropic = originalAnthropicRegistry;
-        }
-      }
-    );
-  });
-
-  it("fails closed when tokens were not minted by the policy-forced deployment", async () => {
-    await withTempPolicyProviderFactory(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "coder", base_url: "https://locked.coder.example.com" }],
-      },
-      async (config, factory, _policyService, oauth) => {
-        // Logged in to a different (user-chosen) deployment: those tokens must
-        // not be used for the policy-locked endpoint, nor may traffic flow to
-        // the user-chosen deployment while policy is enforced. The coder route
-        // is unavailable (issuer mismatch with the forced URL), so the model
-        // falls back to the direct origin — which the policy also denies.
-        saveCoderConfig(config);
-        oauth.coderOauthService = stubCoderOauthService();
-
-        const result = await factory.createModel("coder:anthropic/claude-sonnet-4-5");
-        expect(result.success).toBe(false);
-        if (!result.success) {
-          expect(["api_key_not_found", "policy_denied"]).toContain(result.error.type);
-        }
-      }
-    );
   });
 
   it("refuses to attach credentials minted by a different deployment than the model's", async () => {
@@ -5530,6 +5799,342 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
           routeKind: "custom",
         });
       }
+    );
+  });
+});
+
+describe("ProviderModelFactory Ollama tool schemas", () => {
+  // Ollama servers before v0.6.6 parse a tool schema `type` only as a string, so one `type`
+  // array fails the whole tool request. zod >= 4.5 emits nullable fields as type arrays, and
+  // MCP servers can send them in raw JSON Schema, so the request must carry `anyOf` instead.
+  const sendTools = async (tools: Record<string, Tool>): Promise<Record<string, unknown>> => {
+    let body: Record<string, unknown> | undefined;
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({ ollama: { baseUrl: "http://127.0.0.1:11434/api" } });
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel("ollama:qwen3:8b");
+        if (!result.success) throw new Error(result.error.type);
+        await generateText({ model: result.data, prompt: "hello", tools, maxRetries: 0 }).catch(
+          () => undefined
+        );
+        expect(calls).toHaveLength(1);
+        body = parseSentBody(calls[0]);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+    const sent = body?.tools as Array<{ function: { name: string; parameters: unknown } }>;
+    return Object.fromEntries(
+      sent.map((entry) => [entry.function.name, entry.function.parameters])
+    );
+  };
+  const rawTool = (schema: Record<string, unknown>) =>
+    tool({ inputSchema: jsonSchema<Record<string, unknown>>(schema) });
+  const typeArrayPaths = (node: unknown, at = "$"): string[] => {
+    if (Array.isArray(node))
+      return node.flatMap((item, index) => typeArrayPaths(item, `${at}[${index}]`));
+    if (node === null || typeof node !== "object") return [];
+    const own = Array.isArray((node as { type?: unknown }).type) ? [at] : [];
+    return own.concat(
+      Object.entries(node).flatMap(([key, value]) => typeArrayPaths(value, `${at}.${key}`))
+    );
+  };
+
+  it("rewrites nested nullable type arrays to anyOf", async () => {
+    const sent = await sendTools({
+      mcp_tool: rawTool({
+        type: "object",
+        properties: {
+          outer: { type: "object", properties: { inner: { type: ["string", "null"] } } },
+          list: { type: "array", items: { type: ["integer", "null"], minimum: 0 } },
+          single: { type: ["boolean"] },
+          both: { type: ["string", "null"], anyOf: [{ minLength: 1 }, { const: null }] },
+        },
+      }),
+    });
+
+    expect(sent.mcp_tool).toEqual({
+      type: "object",
+      properties: {
+        outer: {
+          type: "object",
+          properties: { inner: { anyOf: [{ type: "string" }, { type: "null" }] } },
+        },
+        list: {
+          type: "array",
+          items: { anyOf: [{ type: "integer" }, { type: "null" }], minimum: 0 },
+        },
+        single: { type: "boolean" },
+        both: {
+          anyOf: [{ minLength: 1 }, { const: null }],
+          allOf: [{ anyOf: [{ type: "string" }, { type: "null" }] }],
+        },
+      },
+    });
+  });
+
+  // Old Ollama's OpenAI-compatible /v1 endpoint decodes tools into the same Go structs, so a
+  // custom openai-compatible provider pointed at it needs the same rewrite.
+  it("rewrites type arrays for custom openai-compatible providers", async () => {
+    let body: Record<string, unknown> | undefined;
+    await withTempConfig(async (config, factory) => {
+      saveLocalVllmConfig(config, { models: [LOCAL_VLLM_MODEL] });
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel(`local-vllm:${LOCAL_VLLM_MODEL}`);
+        if (!result.success) throw new Error(result.error.type);
+        const tools = {
+          mcp_tool: rawTool({
+            type: "object",
+            properties: {
+              outer: { type: "object", properties: { inner: { type: ["string", "null"] } } },
+              list: { type: "array", items: { type: ["integer", "null"] } },
+            },
+          }),
+        };
+        await generateText({ model: result.data, prompt: "hello", tools, maxRetries: 0 }).catch(
+          () => undefined
+        );
+        expect(calls).toHaveLength(1);
+        body = parseSentBody(calls[0]);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+    const sent = body?.tools as Array<{ function: { parameters: unknown } }>;
+    expect(sent).toHaveLength(1);
+    expect(typeArrayPaths(sent[0].function.parameters)).toEqual([]);
+    expect(sent[0].function.parameters).toMatchObject({
+      properties: {
+        outer: { properties: { inner: { anyOf: [{ type: "string" }, { type: "null" }] } } },
+        list: { items: { anyOf: [{ type: "integer" }, { type: "null" }] } },
+      },
+    });
+  });
+
+  it("sends real tool definitions without type arrays", async () => {
+    const sent = await sendTools({
+      session_history: tool({ inputSchema: TOOL_DEFINITIONS.session_history.schema }),
+    });
+
+    expect(typeArrayPaths(sent.session_history)).toEqual([]);
+    expect(
+      (sent.session_history as { properties: Record<string, unknown> }).properties.recent_first
+    ).toMatchObject({ anyOf: [{ type: "boolean" }, { type: "null" }] });
+  });
+
+  it("leaves schemas without type arrays unchanged", async () => {
+    const schema = {
+      type: "object",
+      properties: {
+        name: { type: "string", minLength: 1 },
+        count: { type: "integer" },
+        mode: { enum: ["a", "b"] },
+        maybe: { anyOf: [{ type: "string" }, { type: "null" }] },
+        // Data under these keywords can look like a schema but must arrive as sent.
+        literal: { const: { type: ["a", "b"] } },
+        choice: { enum: [{ type: ["a", "b"] }] },
+        defaulted: { type: "object", default: { type: ["x", "null"] } },
+        sample: { type: "object", examples: [{ type: ["y", "z"] }] },
+      },
+      required: ["name"],
+    };
+    const sent = await sendTools({ plain: rawTool(structuredClone(schema)) });
+
+    expect(sent.plain).toEqual(schema);
+  });
+});
+
+describe("ProviderModelFactory prompt-cache prefix observation", () => {
+  const recorded: TimelineEventDraft[] = [];
+  const recorder = {
+    record: (_workspaceId: string, draft: TimelineEventDraft) => void recorded.push(draft),
+    closeWorkspace: () => Promise.resolve(),
+    reopenWorkspace: () => undefined,
+  };
+  beforeEach(() => {
+    recorded.length = 0;
+  });
+
+  /** A base fetch that records each sent body and answers with a status the observer accepts. */
+  function capturingFetch(sent: Array<Record<string, unknown>>): typeof fetch {
+    return Object.assign((_input: RequestInfo | URL, init?: RequestInit) => {
+      if (typeof init?.body === "string") {
+        sent.push(JSON.parse(init.body) as Record<string, unknown>);
+      }
+      return Promise.resolve(new Response("{}", { status: 200 }));
+    }, fetch) as typeof fetch;
+  }
+
+  /** One generateText call; the canned response does not parse, which is fine after dispatch. */
+  async function send(model: LanguageModel, messages: ModelMessage[]) {
+    await generateText({ model, messages, maxRetries: 0 }).catch(() => undefined);
+  }
+
+  it("observes mux-gateway requests after file-part normalization", async () => {
+    await withTempConfig(async (_config, factory) => {
+      const sent: Array<Record<string, unknown>> = [];
+      const providersConfig = {
+        "mux-gateway": { couponCode: "test-coupon", fetch: capturingFetch(sent) },
+      } as unknown as ProvidersConfig;
+      const messages = (image: string) => [
+        {
+          role: "user" as const,
+          content: [
+            { type: "text" as const, text: "What is in this image?" },
+            { type: "file" as const, mediaType: "image/png", data: image },
+          ],
+        },
+      ];
+      for (const image of ["AAAA", "BBBB"]) {
+        const scope = factory.createPromptCacheTurnScope("ws-gateway", recorder);
+        const result = await factory.createModel(
+          "mux-gateway:anthropic/claude-sonnet-4-5",
+          {},
+          {
+            promptCacheScope: scope,
+            providersConfig,
+          }
+        );
+        if (!result.success) throw new Error("expected a gateway model");
+        await send(result.data, messages(image));
+      }
+
+      // The changed image breaks the prefix, and the event describes the part as the gateway
+      // received it (the v3 data-URL string), not the SDK's v4 tagged object.
+      const sentFile = (sent[1].prompt as Array<{ content: Array<Record<string, unknown>> }>)
+        .flatMap((message) => message.content)
+        .find((part) => part.type === "file");
+      expect(sentFile?.data).toBe("data:image/png;base64,BBBB");
+      const { cache_control: _marker, ...unmarkedFile } = sentFile ?? {};
+      expect(recorded).toMatchObject([
+        {
+          kind: "cache.prefix_break",
+          data: {
+            promptCacheBreak: {
+              section: "messages",
+              next: { type: "file", length: JSON.stringify(unmarkedFile).length },
+            },
+          },
+        },
+      ]);
+    });
+  });
+
+  it("does not compare requests sent to another Anthropic base URL", async () => {
+    await withTempConfig(async (_config, factory) => {
+      const sent: Array<Record<string, unknown>> = [];
+      const sendTo = async (baseURL: string, text: string) => {
+        const scope = factory.createPromptCacheTurnScope("ws-base-url", recorder);
+        const result = await factory.createModel(
+          "anthropic:claude-sonnet-4-5",
+          {},
+          {
+            promptCacheScope: scope,
+            providersConfig: {
+              anthropic: { apiKey: "test-key", baseURL, fetch: capturingFetch(sent) },
+            } as unknown as ProvidersConfig,
+          }
+        );
+        if (!result.success) throw new Error("expected an Anthropic model");
+        await send(result.data, [{ role: "user", content: text }]);
+      };
+      await sendTo("https://proxy-a.example.com/v1", "first");
+      // Another endpoint holds another cache: its first request is a new baseline.
+      await sendTo("https://proxy-b.example.com/v1", "second");
+      expect(sent).toHaveLength(2);
+      expect(recorded).toEqual([]);
+      // On the same endpoint a rewritten prompt is still reported.
+      await sendTo("https://proxy-b.example.com/v1", "third");
+      expect(recorded).toHaveLength(1);
+    });
+  });
+
+  it("keys a base-URL query by its hash: another tenant is another baseline", async () => {
+    await withTempConfig(async (_config, factory) => {
+      const sent: Array<Record<string, unknown>> = [];
+      const sendTo = async (baseURL: string, text: string) => {
+        const scope = factory.createPromptCacheTurnScope("ws-query", recorder);
+        const result = await factory.createModel(
+          "anthropic:claude-sonnet-4-5",
+          {},
+          {
+            promptCacheScope: scope,
+            providersConfig: {
+              anthropic: { apiKey: "test-key", baseURL, fetch: capturingFetch(sent) },
+            } as unknown as ProvidersConfig,
+          }
+        );
+        if (!result.success) throw new Error("expected an Anthropic model");
+        await send(result.data, [{ role: "user", content: text }]);
+      };
+      // The proxy picks the account by the query: tenant B's first request is a new baseline.
+      await sendTo("https://proxy.example.com/v1?token=tenant-a-secret", "first");
+      await sendTo("https://proxy.example.com/v1?token=tenant-b-secret", "second");
+      expect(sent).toHaveLength(2);
+      expect(recorded).toEqual([]);
+      // The same query is the same cache, so a rewritten prompt is reported.
+      await sendTo("https://proxy.example.com/v1?token=tenant-b-secret", "third");
+      expect(recorded).toHaveLength(1);
+      expect(JSON.stringify(recorded)).not.toContain("secret");
+    });
+  });
+
+  it("keys mux-gateway baselines by account: another sign-in is another baseline", async () => {
+    await withTempConfig(async (_config, factory) => {
+      const sent: Array<Record<string, unknown>> = [];
+      const sendAs = async (couponCode: string, text: string) => {
+        const scope = factory.createPromptCacheTurnScope("ws-gateway-account", recorder);
+        const result = await factory.createModel(
+          "mux-gateway:anthropic/claude-sonnet-4-5",
+          {},
+          {
+            promptCacheScope: scope,
+            providersConfig: {
+              "mux-gateway": { couponCode, fetch: capturingFetch(sent) },
+            } as unknown as ProvidersConfig,
+          }
+        );
+        if (!result.success) throw new Error("expected a gateway model");
+        await send(result.data, [{ role: "user", content: text }]);
+      };
+      // Same base URL, another account: its first request is a new baseline.
+      await sendAs("account-a-secret", "first");
+      await sendAs("account-b-secret", "second");
+      expect(sent).toHaveLength(2);
+      expect(recorded).toEqual([]);
+      // The same account is the same cache, so a rewritten prompt is reported.
+      await sendAs("account-b-secret", "third");
+      expect(recorded).toHaveLength(1);
+      expect(JSON.stringify(recorded)).not.toContain("secret");
+    });
+  });
+
+  it("the mux-gateway route holds a stable hash of the account, not its credential", () => {
+    const accountA = muxGatewayPromptCacheRoute("account-a-secret");
+    expect(accountA).toMatch(/^mux-gateway:[0-9a-f]{16}$/);
+    expect(accountA).toBe(muxGatewayPromptCacheRoute("account-a-secret"));
+    expect(accountA).not.toBe(muxGatewayPromptCacheRoute("account-b-secret"));
+    expect(accountA).not.toContain("secret");
+  });
+
+  it("requestEndpoint keeps no query text, only a stable hash of it", () => {
+    const tenantA = requestEndpoint("https://proxy.example.com/v1?token=tenant-a-secret/messages");
+    const tenantB = requestEndpoint("https://proxy.example.com/v1?token=tenant-b-secret/messages");
+    expect(tenantA).toMatch(/^https:\/\/proxy\.example\.com\/v1\?sha256:[0-9a-f]{16}$/);
+    expect(tenantA).not.toBe(tenantB);
+    expect(requestEndpoint("https://proxy.example.com/v1?token=tenant-a-secret/messages")).toBe(
+      tenantA
+    );
+    for (const endpoint of [tenantA, tenantB, requestEndpoint("not a url ?token=secret")]) {
+      expect(endpoint).not.toContain("token");
+      expect(endpoint).not.toContain("secret");
+    }
+    expect(requestEndpoint("https://api.anthropic.com/v1/messages")).toBe(
+      "https://api.anthropic.com/v1/messages"
     );
   });
 });

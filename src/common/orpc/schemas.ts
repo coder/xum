@@ -43,8 +43,10 @@ export {
   AgentSkillDescriptorSchema,
   AgentSkillFrontmatterSchema,
   AgentSkillIssueSchema,
+  AgentSkillListResultSchema,
   AgentSkillPackageSchema,
   AgentSkillScopeSchema,
+  AgentSkillUnavailableSourceSchema,
   SkillNameSchema,
   resolveSkillAdvertise,
   resolveSkillUserInvocable,
@@ -96,14 +98,6 @@ export {
 // Secrets schemas
 export { SecretSchema } from "./schemas/secrets";
 
-// Policy schemas
-export {
-  PolicySourceSchema,
-  PolicyStatusSchema,
-  EffectivePolicySchema,
-  PolicyGetResponseSchema,
-  PolicyRuntimeIdSchema,
-} from "./schemas/policy";
 // Provider options schemas
 export { MuxProviderOptionsSchema } from "./schemas/providerOptions";
 
@@ -135,6 +129,7 @@ export {
   DeleteMessageSchema,
   ErrorEventSchema,
   GoalBudgetLimitedEventSchema,
+  PluginHookNoticeEventSchema,
   OnChatDowngradeReasonSchema,
   ReasoningDeltaEventSchema,
   ReasoningEndEventSchema,
@@ -157,9 +152,6 @@ export {
   BashOutputEventSchema,
   TaskCreatedEventSchema,
   WorkflowRunAttachedEventSchema,
-  AdvisorOutputEventSchema,
-  AdvisorReasoningOutputEventSchema,
-  AdvisorPhaseEventSchema,
   RestartBlockerSchema,
   UpdateStatusSchema,
   UsageDeltaEventSchema,
@@ -190,6 +182,8 @@ export {
   mcpOauth,
   mcp,
   memory,
+  artifacts,
+  mcpApps,
   refinements,
   secrets,
   CustomProviderMutationErrorSchema,
@@ -202,10 +196,8 @@ export {
   muxGateway,
   muxGatewayOauth,
   copilotOauth,
-  muxGovernorOauth,
   codexOauth,
   coderOauth,
-  policy,
   providers,
   ProvidersConfigMapSchema,
   server,
@@ -214,7 +206,12 @@ export {
   splashScreens,
   tasks,
   experiments,
+  computerUse,
   telemetry,
+  perf,
+  perfCaptures,
+  perfReports,
+  sessionTapes,
   ssh,
   terminal,
   tokenizer,

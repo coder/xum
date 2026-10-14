@@ -2,7 +2,13 @@ import { describe, expect, test } from "bun:test";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { resolveContextStrategy, type ContextStrategySelection } from "./selection";
 
-type Flags = NonNullable<Parameters<typeof resolveContextStrategy>[0]["experiments"]>;
+interface Flags {
+  continuousCompaction?: boolean;
+  tokenBudget?: boolean;
+  rlm?: boolean;
+  programmaticToolCalling?: boolean;
+  memory?: boolean;
+}
 
 const cases: Array<{
   name: string;
@@ -90,64 +96,14 @@ function backendFlags(flags: Flags): (id: ExperimentId) => boolean {
 }
 
 describe("context strategy selection", () => {
-  for (const source of ["request", "backend"] as const) {
-    test.each(cases)(`${source}: $name`, ({ flags: caseFlags, compact, expected }) => {
-      // Token budget requires Agent Memory; cases enable it unless they test its absence.
-      const flags = { memory: true, ...caseFlags };
-      expect(
-        resolveContextStrategy({
-          experiments: source === "request" ? flags : undefined,
-          isEnabled: backendFlags(source === "backend" ? flags : {}),
-          isCompactionRequest: compact ?? false,
-        })
-      ).toEqual(expected);
-    });
-  }
-
-  test.each([
-    {
-      flags: { continuousCompaction: false },
-      expected: { configured: "token-budget", tokenBudgetSuppressedBy: "rlm" },
-    },
-    {
-      flags: { continuousCompaction: false, rlm: false },
-      expected: { configured: "token-budget" },
-    },
-    {
-      flags: { continuousCompaction: false, programmaticToolCalling: false },
-      expected: { configured: "token-budget" },
-    },
-    {
-      flags: { continuousCompaction: false, tokenBudget: false },
-      expected: { configured: "summarize" },
-    },
-    { flags: { tokenBudget: false }, expected: { configured: "continuous" } },
-  ])("request overrides resolve per field: $flags", ({ flags, expected }) => {
+  test.each(cases)("$name", ({ flags: caseFlags, compact, expected }) => {
+    // Token budget requires Agent Memory; cases enable it unless they test its absence.
+    const flags = { memory: true, ...caseFlags };
     expect(
       resolveContextStrategy({
-        experiments: flags,
-        isEnabled: backendFlags({
-          tokenBudget: true,
-          continuousCompaction: true,
-          rlm: true,
-          programmaticToolCalling: true,
-          memory: true,
-        }),
-        isCompactionRequest: false,
+        isEnabled: backendFlags(flags),
+        isCompactionRequest: compact ?? false,
       })
     ).toEqual(expected);
-  });
-
-  test("an empty request override preserves backend selection and later calls remain dynamic", () => {
-    let tokenBudget = true;
-    const input = {
-      experiments: {},
-      isEnabled: (id: ExperimentId) =>
-        id === EXPERIMENT_IDS.MEMORY || (id === EXPERIMENT_IDS.TOKEN_BUDGET && tokenBudget),
-      isCompactionRequest: false,
-    };
-    expect(resolveContextStrategy(input)).toEqual({ configured: "token-budget" });
-    tokenBudget = false;
-    expect(resolveContextStrategy(input)).toEqual({ configured: "summarize" });
   });
 });

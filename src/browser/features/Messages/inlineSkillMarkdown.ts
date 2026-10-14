@@ -1,7 +1,10 @@
 import type { Link, Parent, PhrasingContent, Root, Text } from "mdast";
 import type { Plugin } from "unified";
 import { SKIP, visit } from "unist-util-visit";
-import { extractInlineSkillReferenceCandidates } from "@/browser/utils/agentSkills/inlineSkillReferences";
+import {
+  extractInlineSkillReferenceCandidates,
+  type InlineSkillCandidate,
+} from "@/browser/utils/agentSkills/inlineSkillReferences";
 
 export const INTERNAL_INLINE_SKILL_HREF_PREFIX = "mux-inline-skill:";
 
@@ -15,10 +18,48 @@ function createTextNode(value: string): Text {
   return { type: "text", value };
 }
 
-function createInlineSkillLink(skillName: string, visibleText: string): Link {
+/** Where an inline skill link points: the referenced skill, plus the bare fallback of a qualified candidate. */
+export interface InlineSkillHrefTarget {
+  skillName: string;
+  /** The bare `$tdd` of a qualified `$tdd:notes`: the send path loads it when no `tdd:notes` exists. */
+  fallbackSkillName?: string;
+}
+
+// encodeURIComponent always escapes `/`, so it cannot appear inside either name.
+const INLINE_SKILL_HREF_FALLBACK_SEPARATOR = "/";
+
+export function encodeInlineSkillHref(candidate: InlineSkillCandidate): string {
+  const names = [
+    candidate.skillName,
+    ...(candidate.fallback ? [candidate.fallback.skillName] : []),
+  ];
+  return `${INTERNAL_INLINE_SKILL_HREF_PREFIX}${names
+    .map((name) => encodeURIComponent(name))
+    .join(INLINE_SKILL_HREF_FALLBACK_SEPARATOR)}`;
+}
+
+export function decodeInlineSkillHref(href: string): InlineSkillHrefTarget | null {
+  const [encodedSkillName = "", encodedFallback] = href
+    .slice(INTERNAL_INLINE_SKILL_HREF_PREFIX.length)
+    .split(INLINE_SKILL_HREF_FALLBACK_SEPARATOR);
+  if (encodedSkillName.length === 0) {
+    return null;
+  }
+
+  try {
+    const skillName = decodeURIComponent(encodedSkillName);
+    return encodedFallback
+      ? { skillName, fallbackSkillName: decodeURIComponent(encodedFallback) }
+      : { skillName };
+  } catch {
+    return null;
+  }
+}
+
+function createInlineSkillLink(candidate: InlineSkillCandidate, visibleText: string): Link {
   return {
     type: "link",
-    url: `${INTERNAL_INLINE_SKILL_HREF_PREFIX}${encodeURIComponent(skillName)}`,
+    url: encodeInlineSkillHref(candidate),
     children: [createTextNode(visibleText)],
   };
 }
@@ -59,7 +100,7 @@ function buildInlineSkillReplacementNodes(textNode: Text): PhrasingContent[] | n
       replacements.push(createTextNode(text.slice(previousEnd, candidate.startIndex)));
     }
 
-    replacements.push(createInlineSkillLink(candidate.skillName, visibleText));
+    replacements.push(createInlineSkillLink(candidate, visibleText));
     previousEnd = candidate.endIndex;
   }
 

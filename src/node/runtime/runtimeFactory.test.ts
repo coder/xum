@@ -1,6 +1,15 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
+import { execFileSync } from "child_process";
+import * as fs from "fs/promises";
+import * as os from "os";
+import * as path from "path";
+import * as devcontainerCli from "./devcontainerCli";
 import { isIncompatibleRuntimeConfig } from "@/common/utils/runtimeCompatibility";
-import { createRuntime, IncompatibleRuntimeError } from "./runtimeFactory";
+import {
+  createRuntime,
+  IncompatibleRuntimeError,
+  setDevcontainerScratchMountGate,
+} from "./runtimeFactory";
 import {
   isLocalProjectRuntime,
   isWorktreeRuntime,
@@ -108,6 +117,58 @@ describe("createRuntime", () => {
         config,
         projectDir: runtime instanceof LocalRuntime,
       });
+    }
+  });
+});
+
+describe("createRuntime - devcontainer scratch mount", () => {
+  const savedDockerHost = process.env.DOCKER_HOST;
+  const savedXumRoot = process.env.XUM_ROOT;
+
+  afterEach(() => {
+    mock.restore();
+    setDevcontainerScratchMountGate(() => false);
+    if (savedDockerHost === undefined) delete process.env.DOCKER_HOST;
+    else process.env.DOCKER_HOST = savedDockerHost;
+    if (savedXumRoot === undefined) delete process.env.XUM_ROOT;
+    else process.env.XUM_ROOT = savedXumRoot;
+  });
+
+  it("bind-mounts the scratch dir only with the Artifacts experiment on", async () => {
+    // Users who never enable Artifacts must not have `devcontainer up` depend on the daemon
+    // accepting the scratch mount source (Docker Desktop / Colima file sharing).
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "runtime-factory-scratch-"));
+    try {
+      process.env.XUM_ROOT = tempDir;
+      process.env.DOCKER_HOST = "unix:///var/run/docker.sock";
+      const workspacePath = path.join(tempDir, "ws");
+      await fs.mkdir(workspacePath, { recursive: true });
+      execFileSync("git", ["init", "-q"], { cwd: workspacePath });
+      const up = spyOn(devcontainerCli, "devcontainerUp").mockResolvedValue({
+        containerId: "c1",
+        remoteUser: "root",
+        remoteWorkspaceFolder: "/workspaces/ws",
+      });
+      const upMounts = async () => {
+        up.mockClear();
+        const runtime = createRuntime(
+          { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" },
+          { projectPath: workspacePath, workspaceId: "ws1", workspacePath }
+        );
+        // $HOME lookup after `up` is best-effort; keep it off the real CLI.
+        spyOn(runtime, "exec").mockRejectedValue(new Error("no devcontainer CLI in tests"));
+        expect((await runtime.ensureReady()).ready).toBe(true);
+        return (up.mock.calls[0]?.[0].additionalMounts ?? []).filter((mount) =>
+          mount.target.endsWith(path.join("ws1", "scratch"))
+        );
+      };
+
+      setDevcontainerScratchMountGate(() => false);
+      expect(await upMounts()).toEqual([]);
+      setDevcontainerScratchMountGate(() => true);
+      expect(await upMounts()).toHaveLength(1);
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
     }
   });
 });

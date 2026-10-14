@@ -168,6 +168,7 @@ export class BrowserControlService {
       }
 
       if (params.action === "open") {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const trimmedUrl = params.url!.trim();
         if (isExplicitFileUrl(trimmedUrl)) {
           const daemonResult = await this.navigateFileUrlViaDaemon(
@@ -416,6 +417,7 @@ export class BrowserControlService {
   private buildControlArgs(params: BrowserControlParams): string[] {
     switch (params.action) {
       case "open":
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         return ["--session", params.sessionName, "open", params.url!.trim()];
       case "back":
       case "forward":

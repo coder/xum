@@ -52,6 +52,11 @@ export async function summarizeContinuousCompaction(args: {
   aiService: AgentSessionAIService;
   sessionUsageService?: Pick<SessionUsageService, "recordHeadlessUsage">;
   head: MuxMessage[];
+  /**
+   * Rows searched for the thinking-repair receipt: the whole segment, head included. Required
+   * so a caller cannot silently fall back to the head alone (#5996).
+   */
+  receiptRows: MuxMessage[];
   signal: AbortSignal;
   context: ContinuousCompactionContext;
   baseOptions: SendMessageOptions;
@@ -92,9 +97,9 @@ export async function summarizeContinuousCompaction(args: {
     workspaceId: args.workspaceId,
     sessionDir,
     journal: sharedDurableEventJournal(sessionDir),
-    enabled: args.aiService.isAgentPluginsEnabled?.() === true,
     xumHome: args.config.rootDir,
     projectRoot: pluginContext?.projectRoot,
+    projectKey: pluginContext?.projectKey,
     projectTrusted: isWorkspaceProjectTrusted(args.config, metadata.data),
   });
   args.signal.throwIfAborted();
@@ -108,7 +113,6 @@ export async function summarizeContinuousCompaction(args: {
     callerToolPolicy: [{ regex_match: ".*", action: "disable" }],
     cfg: args.config.loadConfigOrDefault(),
     emitError: () => undefined,
-    includeAgentPlugins: args.aiService.isAgentPluginsEnabled?.(),
   });
   if (!agent.success) throw new Error(`Cannot resolve compact agent: ${agent.error.type}`);
   const system = await resolveAgentBody(
@@ -116,7 +120,6 @@ export async function summarizeContinuousCompaction(args: {
     agent.data.agentDiscoveryPath,
     agent.data.agentDefinition.id,
     {
-      includeAgentPlugins: args.aiService.isAgentPluginsEnabled?.(),
       skipScopesAbove: getSkipScopesAboveForKnownScope(agent.data.agentDefinition.scope),
     }
   );
@@ -157,6 +160,7 @@ export async function summarizeContinuousCompaction(args: {
     );
     const messages = await prepareMessagesForProvider({
       messagesWithSentinel: addInterruptedSentinel(prepared.providerRequestMessages),
+      replayReceiptMessages: args.receiptRows,
       effectiveAgentId: "compact",
       toolNamesForSentinel: [],
       postCompactionAttachments: null,

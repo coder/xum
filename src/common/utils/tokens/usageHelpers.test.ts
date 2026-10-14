@@ -3,6 +3,7 @@ import {
   addUsage,
   accumulateProviderMetadata,
   accumulateStepsProviderMetadata,
+  getAnthropicCacheWrite1hTokens,
   normalizeUsage,
   withCacheWriteMetadata,
 } from "./usageHelpers";
@@ -354,6 +355,60 @@ describe("accumulateProviderMetadata", () => {
       someOtherProvider: { field: "value" },
       anthropic: { cacheCreationInputTokens: 100 },
     });
+  });
+});
+
+describe("Anthropic 1h-TTL cache-write share", () => {
+  const step = (fiveMinute: number, oneHour: number) => ({
+    anthropic: {
+      cacheCreationInputTokens: fiveMinute + oneHour,
+      usage: {
+        cache_creation: {
+          ephemeral_5m_input_tokens: fiveMinute,
+          ephemeral_1h_input_tokens: oneHour,
+        },
+      },
+    },
+  });
+
+  test("sums each step's 1h share across a multi-step turn", () => {
+    // The raw usage of the last step replaces the earlier one, so the sum must be carried.
+    const turn = accumulateProviderMetadata(step(1_000, 3_000), step(500, 1_500));
+    expect(getAnthropicCacheWrite1hTokens(turn, 6_000)).toBe(4_500);
+    const threeSteps = accumulateProviderMetadata(turn, step(2_000, 0));
+    expect(getAnthropicCacheWrite1hTokens(threeSteps, 8_000)).toBe(4_500);
+  });
+
+  test("keeps an old multi-step row at the 5m price instead of extrapolating its last step", () => {
+    // Pre-fix multi-step rows kept the summed total but only the last step's raw split,
+    // and earlier steps can have a different 5m/1h mix.
+    const oldRow = { anthropic: { ...step(0, 2_000).anthropic, cacheCreationInputTokens: 9_000 } };
+    expect(getAnthropicCacheWrite1hTokens(oldRow, 9_000)).toBe(0);
+    // A split that covers the whole total is exact and still priced.
+    expect(getAnthropicCacheWrite1hTokens(step(1_000, 1_000), 2_000)).toBe(1_000);
+  });
+
+  test("a malformed 5m share keeps the 5m price instead of scaling the 1h share", () => {
+    const malformed = (fiveMinute: unknown) => ({
+      anthropic: {
+        cacheCreationInputTokens: 100,
+        usage: {
+          cache_creation: { ephemeral_5m_input_tokens: fiveMinute, ephemeral_1h_input_tokens: 10 },
+        },
+      },
+    });
+    expect(getAnthropicCacheWrite1hTokens(malformed(-1), 100)).toBe(0);
+    expect(getAnthropicCacheWrite1hTokens(malformed("90"), 100)).toBe(0);
+    // An absent 5m share still means the whole reported split is 1h.
+    expect(getAnthropicCacheWrite1hTokens(malformed(undefined), 10)).toBe(10);
+  });
+
+  test("reports no 1h share without a split", () => {
+    expect(
+      getAnthropicCacheWrite1hTokens({ anthropic: { cacheCreationInputTokens: 900 } }, 900)
+    ).toBe(0);
+    expect(getAnthropicCacheWrite1hTokens(undefined, 900)).toBe(0);
+    expect(getAnthropicCacheWrite1hTokens(step(0, 900), 0)).toBe(0);
   });
 });
 

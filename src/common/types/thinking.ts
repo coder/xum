@@ -7,6 +7,11 @@
 
 import { z } from "zod";
 
+/** Match the versioned Wonder family without treating similarly named custom models as Wonder. */
+export function isMuseWonderModel(modelString: string): boolean {
+  return /^muse-wonder-\d+(?:\.\d+)*$/.test(stripModelProviderPrefixes(modelString));
+}
+
 export const THINKING_LEVELS = ["off", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 export const ThinkingLevelSchema = z.enum(THINKING_LEVELS);
@@ -46,11 +51,14 @@ export function getThinkingDisplayLabel(level: ThinkingLevel, modelString?: stri
       return "XHIGH";
     }
 
-    // Anthropic Opus 4.7+: xhigh is a distinct effort level from max
-    if (level === "xhigh" && anthropicSupportsNativeXhigh(modelString)) return "XHIGH";
-
-    // Grok 4.6/4.7: xhigh is a distinct native reasoning effort (their policies have no max).
-    if (level === "xhigh" && grokSupportsNativeXhigh(modelString)) return "XHIGH";
+    // These models expose native xhigh, distinct from max where max is supported.
+    if (
+      level === "xhigh" &&
+      [anthropicSupportsNativeXhigh, grokSupportsNativeXhigh, isMuseWonderModel].some(
+        (supportsNativeXhigh) => supportsNativeXhigh(modelString)
+      )
+    )
+      return "XHIGH";
   }
   return THINKING_DISPLAY_LABELS[level];
 }
@@ -181,7 +189,7 @@ export type AnthropicEffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
  * The effort parameter controls how much computational work the model applies.
  * - Opus 4.5 supports: low, medium, high (policy clamps xhigh → high)
  * - Opus 4.6 supports: low, medium, high, max (xhigh maps to "max" effort)
- * - Opus 4.7+ and Sonnet 5+ support: low, medium, high, xhigh, max (native xhigh)
+ * - Opus 4.7+, Sonnet 5+ and Haiku 5+ support: low, medium, high, xhigh, max (native xhigh)
  *
  * The table keeps `xhigh: "max"` as the non-native fallback; `getAnthropicEffort`
  * upgrades it to the native "xhigh" wire value on models that support it.
@@ -242,6 +250,8 @@ export function stripModelProviderPrefixes(modelString: string): string {
  * - `claude-sonnet-5` and any future Sonnet 5+ (Sonnet 5 introduced native xhigh effort for
  *   the Sonnet tier; Sonnet 4.6 and earlier did not).
  * - Mythos-class models (`claude-fable-*`, `claude-mythos-*`), the tier above Opus.
+ * - `claude-haiku-5-5` and any future Haiku 5+ (Haiku 5.5 supports all five effort levels
+ *   with adaptive thinking only; Haiku 4.5 uses `budget_tokens` and has no effort).
  */
 export function anthropicSupportsNativeXhigh(modelString: string): boolean {
   const withoutPrefix = stripModelProviderPrefixes(modelString);
@@ -250,6 +260,7 @@ export function anthropicSupportsNativeXhigh(modelString: string): boolean {
   return (
     /claude-opus-(?:4-(?:[7-9]|\d{2,})|[5-9]|\d{2,})/.test(withoutPrefix) ||
     /claude-sonnet-(?:[5-9]|\d{2,})/.test(withoutPrefix) ||
+    /claude-haiku-(?:[5-9]|\d{2,})/.test(withoutPrefix) ||
     /claude-(?:fable|mythos)-/.test(withoutPrefix)
   );
 }
@@ -325,9 +336,11 @@ export function openaiRejectsDisabledReasoning(modelString: string): boolean {
 /**
  * OpenAI Responses API reasoning mode (orthogonal to reasoning effort).
  * Absent/"standard" is the API default; "pro" enables the slower, more
- * thorough pro-mode serving (see openaiSupportsProMode).
+ * thorough pro-mode serving (see openaiSupportsProMode). "cyber" instead sends
+ * the model's documented Daybreak access program (see openaiCyberAccessProgram);
+ * one mode value keeps Pro and Cyber mutually exclusive.
  */
-export const OPENAI_REASONING_MODES = ["standard", "pro"] as const;
+export const OPENAI_REASONING_MODES = ["standard", "pro", "cyber"] as const;
 export type OpenAIReasoningMode = (typeof OPENAI_REASONING_MODES)[number];
 export const OpenAIReasoningModeSchema = z.enum(OPENAI_REASONING_MODES);
 
@@ -414,6 +427,18 @@ export function anthropicRejectsDisabledThinking(modelString: string): boolean {
 }
 
 /**
+ * Whether the given Anthropic model thinks (adaptively) when the request omits
+ * `thinking`, while still accepting `{ type: "disabled" }`. Callers that want a
+ * thinking-free request must send `disabled` explicitly for these models.
+ *
+ * Claude Haiku 5.5 (and any future Haiku 5+) does this; Haiku 4.5 does not think
+ * unless asked. See https://platform.claude.com/docs/en/models/haiku-5-5/migration-guide
+ */
+export function anthropicThinksUnlessDisabled(modelString: string): boolean {
+  return /(?:^|\.)claude-haiku-(?:[5-9]|\d{2,})/.test(stripModelProviderPrefixes(modelString));
+}
+
+/**
  * Whether the given Anthropic model accepts `thinking: { type: "between_tools" }`,
  * which turns off up-front thinking; the model still writes short progress notes
  * between tool calls. Xum maps the "off" level to it (#5086). Only Claude Sonnet
@@ -433,13 +458,15 @@ export function anthropicSupportsBetweenToolsThinking(modelString: string): bool
  * Whether the given Anthropic model binds each replayed thinking block to the
  * conversation prefix (system prompt, tools, and earlier messages) that produced it.
  *
- * On enforced accounts, Claude Opus 5.5, Claude Sonnet 5.5, and Claude Fable 5.1
- * (Mythos 5.1 is the same model) reject a request that replays a block whose prefix
- * has since changed.
+ * On enforced accounts, Claude Opus 5.5, Claude Sonnet 5.5, Claude Haiku 5.5, and
+ * Claude Fable 5.1 reject a request that replays a block whose prefix has since changed.
+ * Mythos 5.1 is not on the list: "Claude Mythos 5.1 and models before Claude Fable 5.1
+ * don't run the prefix check" (#5889). Listing it stripped its history thinking at "off".
+ * See https://platform.claude.com/docs/en/build-with-claude/preserved-thinking
  */
 export function anthropicBindsThinkingToPrefix(modelString: string): boolean {
   const withoutPrefix = stripModelProviderPrefixes(modelString);
-  return /claude-(?:opus-5-5|sonnet-5-5|fable-5-1|mythos-5-1)(?:-(?:\d{8}|\d{4}-\d{2}-\d{2}))?(?![\w-])/.test(
+  return /claude-(?:opus-5-5|sonnet-5-5|haiku-5-5|fable-5-1)(?:-(?:\d{8}|\d{4}-\d{2}-\d{2}))?(?![\w-])/.test(
     withoutPrefix
   );
 }

@@ -37,7 +37,7 @@ function sendButton(container: HTMLElement): HTMLButtonElement {
 
 function activeTextarea(container: HTMLElement): HTMLTextAreaElement {
   const textareas = Array.from(
-    container.querySelectorAll<HTMLTextAreaElement>('textarea[aria-label="Message Claude"]')
+    container.querySelectorAll<HTMLTextAreaElement>('textarea[aria-label="Message"]')
   );
   const textarea = textareas.at(-1);
   if (!textarea) throw new Error("Chat textarea not found");

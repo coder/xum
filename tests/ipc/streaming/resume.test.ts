@@ -21,6 +21,12 @@ if (shouldRunIntegrationTests()) {
 const RESUME_STREAM_MODEL = HAIKU_MODEL;
 // Resume behavior is model-agnostic, so keep this coverage on fast Haiku.
 
+// Resume publishes its persisted hidden [CONTINUE] sentinel (a synthetic user row the UI never
+// shows), so edit fences count the same rows on client and server. Count only visible user rows.
+function isVisibleUserMessage(e: WorkspaceChatMessage): boolean {
+  return "role" in e && e.role === "user" && !("metadata" in e && e.metadata?.synthetic === true);
+}
+
 describeIntegration("resumeStream", () => {
   // Enable retries in CI for flaky API tests
   configureTestRetries(3);
@@ -73,9 +79,7 @@ describeIntegration("resumeStream", () => {
         expect(abortOrEnd).toBeDefined();
 
         // Count user messages before resume (should be 1)
-        const userMessagesBefore = collector1
-          .getEvents()
-          .filter((e: WorkspaceChatMessage) => "role" in e && e.role === "user");
+        const userMessagesBefore = collector1.getEvents().filter(isVisibleUserMessage);
         expect(userMessagesBefore.length).toBe(1);
         collector1.stop();
 
@@ -87,9 +91,7 @@ describeIntegration("resumeStream", () => {
         await collector2.waitForEvent("caught-up", 5000);
 
         // Count user messages from history replay (should be 1 - the original message)
-        const userMessagesFromReplay = collector2
-          .getEvents()
-          .filter((e: WorkspaceChatMessage) => "role" in e && e.role === "user");
+        const userMessagesFromReplay = collector2.getEvents().filter(isVisibleUserMessage);
         expect(userMessagesFromReplay.length).toBe(1);
 
         // Resume the stream (no new user message)
@@ -108,9 +110,7 @@ describeIntegration("resumeStream", () => {
         expect(streamEnd).toBeDefined();
 
         // Verify no NEW user message was created after resume (total should still be 1)
-        const userMessagesAfter = collector2
-          .getEvents()
-          .filter((e: WorkspaceChatMessage) => "role" in e && e.role === "user");
+        const userMessagesAfter = collector2.getEvents().filter(isVisibleUserMessage);
         expect(userMessagesAfter.length).toBe(1); // Still only the original user message
 
         // Verify stream completed successfully (without errors)
@@ -190,10 +190,8 @@ describeIntegration("resumeStream", () => {
         const streamEnd = await collector.waitForEvent("stream-end", 30000);
         expect(streamEnd).toBeDefined();
 
-        // Verify no user message was created (resumeStream should not add one)
-        const userMessages = collector
-          .getEvents()
-          .filter((e: WorkspaceChatMessage) => "role" in e && e.role === "user");
+        // Verify no visible user message was created (resumeStream should not add one)
+        const userMessages = collector.getEvents().filter(isVisibleUserMessage);
         expect(userMessages.length).toBe(0);
 
         // Verify we received content deltas (the actual assistant response during streaming)

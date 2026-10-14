@@ -6,9 +6,15 @@ import {
 } from "@/browser/utils/rightSidebarLayout";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { isTabType, type TabType } from "@/browser/types/rightSidebar";
-import { getRightSidebarLayoutKey, RIGHT_SIDEBAR_TAB_KEY } from "@/common/constants/storage";
+import {
+  getRightSidebarLayoutKey,
+  RIGHT_SIDEBAR_COLLAPSED_KEY,
+  RIGHT_SIDEBAR_TAB_KEY,
+} from "@/common/constants/storage";
 
 export function focusRightSidebarTab(workspaceId: string, tab: TabType): void {
+  // Explicit navigation must reveal the requested tool even though chats start collapsed.
+  updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
   updateRightSidebarLayout(workspaceId, (state) => selectOrAddTab(state, tab));
 }
 
@@ -35,7 +41,11 @@ export function updateRightSidebarLayout(
   );
 }
 
-export function getRightSidebarTabFallback(): TabType {
-  const raw = readPersistedState<string>(RIGHT_SIDEBAR_TAB_KEY, "costs");
-  return isTabType(raw) ? raw : "costs";
+/**
+ * A tool explicitly requested for new layouts, if any. Without one a new layout holds just the
+ * New tab (see getDefaultRightSidebarLayoutState).
+ */
+export function getRightSidebarTabFallback(): TabType | undefined {
+  const raw = readPersistedState<string | null>(RIGHT_SIDEBAR_TAB_KEY, null);
+  return isTabType(raw) ? raw : undefined;
 }

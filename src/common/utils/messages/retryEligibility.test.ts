@@ -147,6 +147,43 @@ describe("terminal budget rejection barriers", () => {
   });
 });
 
+describe("plugin-blocked queued sends", () => {
+  it("offers no Retry: the blocked message was never saved, so a resume replays the last turn", () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6rNISc).
+    const messages = [
+      userMessage(),
+      assistantMessage(),
+      streamErrorMessage({ errorType: "plugin_blocked" }),
+    ];
+    expect(getInterruptionContext(messages).hasInterruptedStream).toBe(false);
+  });
+});
+
+describe("Token Budget warning rows", () => {
+  const warning = userMessage({
+    id: "warning-1",
+    historyId: "warning-1",
+    content: "Token budget warning",
+    historySequence: 3,
+    isSynthetic: true,
+    isUiVisible: true,
+    contextBudgetWarning: { contextTokens: 80, maxTokens: 100, final: false, handoff: false },
+  });
+
+  it("defer to the user row they follow, but not to an older assistant", () => {
+    // The warning is a notice, not a request: it must not revive a Retry barrier.
+    expect(
+      getInterruptionContext([userMessage({ contextBudgetRejected: true }), warning])
+        .hasInterruptedStream
+    ).toBe(false);
+    // Mid-stream stage: the hidden Continue after the warning is not displayed, so the
+    // interrupted-stream barrier must still show.
+    expect(
+      getInterruptionContext([userMessage(), assistantMessage(), warning]).hasInterruptedStream
+    ).toBe(true);
+  });
+});
+
 describe("hasInterruptedStream", () => {
   it("returns false for empty messages", () => {
     expect(getInterruptionContext([]).hasInterruptedStream).toBe(false);

@@ -289,9 +289,9 @@ export abstract class RemoteRuntime implements Runtime {
 
     // Convert Node.js streams to Web Streams
     // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-    const stdout = Readable.toWeb(childProcess.stdout!) as unknown as ReadableStream<Uint8Array>;
+    const stdout = Readable.toWeb(childProcess.stdout!) as unknown as ReadableStream<Uint8Array>; // eslint-disable-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-    const stderr = Readable.toWeb(childProcess.stderr!) as unknown as ReadableStream<Uint8Array>;
+    const stderr = Readable.toWeb(childProcess.stderr!) as unknown as ReadableStream<Uint8Array>; // eslint-disable-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
 
     // Capture stderr for error reporting (e.g., SSH exit code 255 failures).
     // Must be AFTER Readable.toWeb() to avoid putting the stream in flowing mode prematurely.

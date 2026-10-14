@@ -1,3 +1,4 @@
+import { MUX_GATEWAY_AI_BASE_URL } from "@/common/constants/muxGatewayOAuth";
 import type { ProviderName } from "@/common/constants/providers";
 
 // Discovery is interactive and read-only; bound the entire catalog, not each page.
@@ -9,19 +10,22 @@ export const MODEL_DISCOVERY_LIMITS = {
   bytes: 2 * 1024 * 1024,
 } as const;
 
+export const META_API_BASE_URL = "https://api.meta.ai/v1";
+
 // Match the inference adapters; compatible APIs do not share a universal /v1 prefix.
 export const MODEL_DISCOVERY_BASE_URLS: Partial<Record<ProviderName, string>> = {
   anthropic: "https://api.anthropic.com/v1",
   openai: "https://api.openai.com/v1",
   google: "https://generativelanguage.googleapis.com/v1beta",
   xai: "https://api.x.ai/v1",
+  meta: META_API_BASE_URL,
   deepseek: "https://api.deepseek.com",
   moonshotai: "https://api.moonshot.ai/v1",
   openrouter: "https://openrouter.ai/api/v1",
   ollama: "http://127.0.0.1:11434/api",
   zai: "https://api.z.ai/api/paas/v4",
   "github-copilot": "https://api.githubcopilot.com",
-  "mux-gateway": "https://gateway.mux.coder.com/api/v1/ai-gateway/v1/ai",
+  "mux-gateway": MUX_GATEWAY_AI_BASE_URL,
 };
 
 export const COPILOT_MODEL_DISCOVERY_INTENT = "conversation-edits";

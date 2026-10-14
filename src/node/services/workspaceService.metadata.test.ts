@@ -1,7 +1,8 @@
-import { describe, expect, test, mock, beforeEach, afterEach, spyOn } from "bun:test";
+import { describe, expect, test, mock, beforeEach, afterEach, spyOn, jest } from "bun:test";
 import type { WorkspaceService } from "./workspaceService";
 import { EventEmitter } from "events";
 import path from "path";
+import * as fs from "fs";
 import type { Workspace } from "@/common/types/project";
 import type { Config } from "@/node/config";
 import type { AIService } from "./aiService";
@@ -17,6 +18,9 @@ import { saveWorkspaces } from "./taskService.testHarness";
 import { waitForCondition } from "./testDispatchHelpers";
 import { Effect, Exit, Scope } from "effect";
 import { defaultEffectRunner as runner } from "./di/effectRunner";
+import { WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS } from "@/common/constants/workspace";
+
+const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
 
 describe("WorkspaceService metadata listeners", () => {
   let harness: WorkspaceServiceHarness;
@@ -303,6 +307,47 @@ describe("WorkspaceService setPinned", () => {
     expect(getEntry(rootId)?.pinnedAt).toBeUndefined();
     expect(emittedMetadata).toHaveLength(2);
     expect(emittedMetadata[1].metadata?.pinnedAt).toBeUndefined();
+  });
+
+  test("pin resolves and emits while another workspace's checkout probe is stalled", async () => {
+    const stalledPath = `${projectPath}/ws-stalled-mount`;
+    await harness.config.editConfig((cfg) => {
+      cfg.projects.get(projectPath)!.workspaces.push(
+        workspaceEntry(projectPath, "ws-stalled-mount", {
+          runtimeConfig: { type: "worktree", srcBaseDir: "/tmp" },
+        })
+      );
+      return cfg;
+    });
+    const realAccess = fs.promises.access.bind(fs.promises);
+    let signalStalledProbe!: () => void;
+    const stalledProbeStarted = new Promise<void>((resolve) => (signalStalledProbe = resolve));
+    const accessSpy = spyOn(fs.promises, "access").mockImplementation((probedPath, mode) => {
+      if (probedPath !== stalledPath) return realAccess(probedPath, mode);
+      signalStalledProbe();
+      return new Promise<void>(() => undefined);
+    });
+
+    try {
+      let pin: ReturnType<WorkspaceService["setPinned"]>;
+      fakeTimers.useFakeTimers();
+      try {
+        pin = workspaceService.setPinned(rootId, true);
+        await stalledProbeStarted;
+        fakeTimers.advanceTimersByTime(WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS);
+      } finally {
+        // Bun's per-test timeout cannot fire under fake timers, so restore before awaiting.
+        fakeTimers.useRealTimers();
+      }
+
+      expect((await pin).success).toBe(true);
+      const pinnedAt = getEntry(rootId)?.pinnedAt;
+      expect(pinnedAt).toBeDefined();
+      expect(emittedMetadata.at(-1)?.workspaceId).toBe(rootId);
+      expect(emittedMetadata.at(-1)?.metadata?.pinnedAt).toBe(pinnedAt);
+    } finally {
+      accessSpy.mockRestore();
+    }
   });
 
   test("corrupted boundary pinnedAt on another chat cannot block pinning", async () => {

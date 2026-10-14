@@ -29,6 +29,8 @@ export interface WorkspaceFixture {
   pinnedAt?: string;
   /** Recipient consent generation; present means cross-tree discovery/messaging is on. */
   unrelatedWorkspaceConsent?: string;
+  aiSettings?: FrontendWorkspaceMetadata["aiSettings"];
+  agentId?: string;
 }
 
 /** Create a workspace with sensible defaults */
@@ -54,6 +56,8 @@ export function createWorkspace(
     transcriptOnly: opts.transcriptOnly,
     pinnedAt: opts.pinnedAt,
     unrelatedWorkspaceConsent: opts.unrelatedWorkspaceConsent,
+    aiSettings: opts.aiSettings,
+    agentId: opts.agentId,
   };
 }
 

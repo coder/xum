@@ -1,6 +1,6 @@
 import { PIXEL_DISABLED, lightweightMeta } from "@/browser/stories/meta.js";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "@storybook/test";
 import { ProvidersSection } from "./ProvidersSection.js";
 import { SettingsSectionStory, setupSettingsStory } from "./settingsStoryUtils.js";
 
@@ -103,6 +103,76 @@ export const ProvidersEnvSourced: Story = {
   },
 };
 
+/**
+ * Pinned phone viewport for the rows that overflowed at narrow widths: the OpenAI
+ * default-auth toggle must wrap inside the card, and the custom-provider "Add provider"
+ * button must keep its label width (AGENTS.md Storybook responsive rule).
+ */
+export const ProvidersPhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    layout: "fullscreen",
+    // The meta disables Pixel; parameters deep-merge, so re-enable explicitly.
+    pixel: { exclude: false, matrix: { themes: ["dark"], viewports: ["phone"] } },
+  },
+  render: () => (
+    <SettingsSectionStory
+      setup={() =>
+        setupSettingsStory({
+          providersConfig: {
+            meta: { apiKeySet: false, isEnabled: true, isConfigured: false },
+            openai: {
+              apiKeySet: false,
+              apiKeySource: "env",
+              isEnabled: true,
+              isConfigured: true,
+              baseUrlSource: "env",
+              baseUrlResolved: "https://env.openai.test/v1",
+            },
+          },
+        })
+      }
+    >
+      {/* Fixed phone width so the play's overflow assertions hold in the CI
+          test-runner too, which ignores viewport globals (AGENTS.md). 375px matches
+          the `mobile1` viewport global; maxWidth keeps the frame inside narrower views. */}
+      <div data-testid="phone-frame" style={{ width: 375, maxWidth: "100%" }}>
+        <ProvidersSection />
+      </div>
+    </SettingsSectionStory>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const frame = canvas.getByTestId("phone-frame").getBoundingClientRect();
+
+    await userEvent.click(await canvas.findByRole("button", { name: /openai/i }));
+    const apiKeyOption = await canvas.findByText("Use OpenAI API key by default");
+    const toggle = apiKeyOption.closest("[role='group']");
+    if (!(toggle instanceof HTMLElement)) {
+      throw new Error("Expected the default-auth toggle group");
+    }
+    await expect(toggle.getBoundingClientRect().right).toBeLessThanOrEqual(frame.right);
+
+    const addProvider = await canvas.findByRole("button", { name: "Add provider" });
+    await expect(addProvider.getBoundingClientRect().right).toBeLessThanOrEqual(frame.right);
+    await expect(addProvider.scrollWidth).toBeLessThanOrEqual(addProvider.clientWidth);
+    // Chromium never shrinks a nowrap button below its label, but iOS Safari did:
+    // the button must opt out of flex shrinking for the label to stay inside it.
+    await expect(getComputedStyle(addProvider).flexShrink).toBe("0");
+
+    // First-class Meta uses the same credential form and stays inside the phone card.
+    const metaButton = await canvas.findByRole("button", { name: /^Meta/ });
+    await expect(metaButton.getBoundingClientRect().right).toBeLessThanOrEqual(frame.right);
+    await expect(metaButton.querySelector("svg path")).not.toBeNull();
+    await userEvent.click(metaButton);
+    const keyLink = await canvas.findByRole("link", { name: /Get API Key/ });
+    await expect(keyLink.getBoundingClientRect().right).toBeLessThanOrEqual(frame.right);
+    await expect(keyLink).toHaveAttribute("href", "https://dev.meta.ai/docs");
+  },
+};
+
 export const XAIProcessingMode: Story = {
   render: () => (
     <SettingsSectionStory
@@ -130,6 +200,35 @@ export const XAIProcessingMode: Story = {
   },
 };
 
+export const OpenAICyberModelEnabled: Story = {
+  render: () => (
+    <SettingsSectionStory
+      setup={() =>
+        setupSettingsStory({
+          providersConfig: {
+            openai: {
+              apiKeySet: true,
+              isEnabled: true,
+              isConfigured: true,
+              cyberModelEnabled: true,
+            },
+          },
+        })
+      }
+    >
+      <ProvidersSection />
+    </SettingsSectionStory>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(await canvas.findByRole("button", { name: /openai/i }));
+    await expect(await canvas.findByRole("switch", { name: "Enable cyber model" })).toHaveAttribute(
+      "aria-checked",
+      "true"
+    );
+  },
+};
+
 export const ProvidersExpanded: Story = {
   render: () => (
     <SettingsSectionStory
@@ -153,5 +252,60 @@ export const ProvidersExpanded: Story = {
     await userEvent.click(openaiButton);
 
     await canvas.findByRole("link", { name: /get api key/i });
+  },
+};
+
+export const CoderModelRouting: Story = {
+  render: () => (
+    <SettingsSectionStory
+      setup={() =>
+        setupSettingsStory({
+          providersConfig: {
+            coder: {
+              apiKeySet: false,
+              isEnabled: true,
+              isConfigured: true,
+              deploymentUrl: "https://coder.example.com",
+              coderOauthSet: true,
+              discoveredProviders: [
+                { name: "anthropic", type: "anthropic" },
+                { name: "anthropic-bedrock", type: "anthropic" },
+                { name: "openai", type: "openai" },
+              ],
+              canonicalRoutes: { anthropic: "anthropic-bedrock", openai: "openai-removed" },
+            },
+          },
+        })
+      }
+    >
+      <ProvidersSection />
+    </SettingsSectionStory>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(await canvas.findByRole("button", { name: /^Coder/ }));
+    await canvas.findByText("Model routing");
+    await canvas.findByText(/openai-removed is not a known OpenAI provider/);
+  },
+};
+
+/** The Bash commands switch saves through the API and stays on. */
+export const BashCommandsSwitch: Story = {
+  render: () => (
+    <SettingsSectionStory setup={() => setupSettingsStory({ providersConfig: {} })}>
+      <ProvidersSection />
+    </SettingsSectionStory>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const toggle = await canvas.findByRole(
+      "switch",
+      { name: "Count AI calls from bash commands" },
+      { timeout: 5000 }
+    );
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "false"));
+    await userEvent.click(toggle);
+    // A failed save rolls the switch back.
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "true"));
   },
 };

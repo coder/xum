@@ -1,15 +1,20 @@
 import { describe, expect, test } from "bun:test";
 
 import { pumpWorkspaceActivity, type WorkspaceActivityPumpClient } from "./workspaceActivityPump";
+import type { UiWorkspaceActivity } from "./webview/protocol";
 
+interface Activity {
+  activeBashMonitorCount?: number;
+  streaming?: boolean;
+  activeWorkflowRunIds?: string[];
+  transientGoalOnly?: boolean;
+}
 type ActivityEvent =
-  | { type: "activity"; workspaceId: string; activity: { activeBashMonitorCount?: number } | null }
+  | { type: "activity"; workspaceId: string; activity: Activity | null }
   | { type: "heartbeat" };
 
 /** A subscription the test drives: events are delivered in order, then end or fail. */
-function createFakeActivityClient(
-  snapshot: Record<string, { activeBashMonitorCount?: number }> | null
-) {
+function createFakeActivityClient(snapshot: Record<string, Activity> | null) {
   const calls: string[] = [];
   const queue: Array<{ event: ActivityEvent } | { end: true } | { error: unknown }> = [];
   let wake: (() => void) | null = null;
@@ -54,6 +59,8 @@ function createFakeActivityClient(
     calls,
     emit: (workspaceId: string, activeBashMonitorCount: number) =>
       enqueue({ event: { type: "activity", workspaceId, activity: { activeBashMonitorCount } } }),
+    emitActivity: (workspaceId: string, activity: Activity | null) =>
+      enqueue({ event: { type: "activity", workspaceId, activity } }),
     heartbeat: () => enqueue({ event: { type: "heartbeat" } }),
     end: () => enqueue({ end: true }),
     fail: (error: unknown) => enqueue({ error }),
@@ -65,23 +72,27 @@ function startPump(
   options: {
     isSelected?: (posted: readonly number[]) => boolean;
     onPost?: (controller: AbortController) => void;
+    workspaceIds?: string[];
   } = {}
 ) {
+  // The selected workspace's monitor count per post, and every posted map.
   const posted: number[] = [];
+  const maps: Array<Record<string, UiWorkspaceActivity>> = [];
   const errors: unknown[] = [];
   const controller = new AbortController();
   const done = pumpWorkspaceActivity({
     client: fake.client,
-    workspaceId: "ws-1",
+    workspaceIds: options.workspaceIds ?? ["ws-1"],
     signal: controller.signal,
     isSelected: () => options.isSelected?.(posted) ?? true,
-    post: (count) => {
-      posted.push(count);
+    post: (activity) => {
+      posted.push(activity["ws-1"]?.activeBashMonitorCount ?? -1);
+      maps.push(activity);
       options.onPost?.(controller);
     },
     onError: (error) => errors.push(error),
   });
-  return { posted, errors, controller, done };
+  return { posted, maps, errors, controller, done };
 }
 
 describe("pumpWorkspaceActivity", () => {
@@ -101,6 +112,32 @@ describe("pumpWorkspaceActivity", () => {
     expect(fake.calls).toEqual(["subscribe", "list"]);
     expect(pump.posted).toEqual([1, 2, 0]);
     expect(pump.errors).toEqual([]);
+  });
+
+  test("tracks descendants too, posting each workspace's monitors, stream and workflow runs (#5109)", async () => {
+    const fake = createFakeActivityClient({
+      "ws-1": { activeBashMonitorCount: 1 },
+      "ws-child": { streaming: true, activeWorkflowRunIds: ["run-1"] },
+      "ws-other": { streaming: true },
+    });
+    fake.emitActivity("ws-child", { streaming: false, activeWorkflowRunIds: ["run-1"] });
+    // Goal-only events carry stale baseline fields and must not overwrite the child's state.
+    fake.emitActivity("ws-child", { streaming: true, transientGoalOnly: true });
+    fake.emitActivity("ws-other", { streaming: false });
+    // A removed or idle workspace reports null.
+    fake.emitActivity("ws-child", null);
+    fake.end();
+
+    const pump = startPump(fake, { workspaceIds: ["ws-1", "ws-child"] });
+    await pump.done;
+
+    const idle = { activeBashMonitorCount: 0, streaming: false, activeWorkflowRunIds: [] };
+    const selected = { ...idle, activeBashMonitorCount: 1 };
+    expect(pump.maps).toEqual([
+      { "ws-1": selected, "ws-child": { ...idle, streaming: true, activeWorkflowRunIds: ["run-1"] } },
+      { "ws-1": selected, "ws-child": { ...idle, activeWorkflowRunIds: ["run-1"] } },
+      { "ws-1": selected, "ws-child": idle },
+    ]);
   });
 
   test("a null snapshot keeps the current value until an event arrives", async () => {

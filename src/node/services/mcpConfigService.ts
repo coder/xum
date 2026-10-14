@@ -1,4 +1,5 @@
 import { ClaudeDesignService } from "./claudeDesignService";
+import { getOwn } from "@/common/utils/getOwn";
 import { CLAUDE_DESIGN_SERVER_NAME } from "@/common/constants/claudeDesign";
 import * as fs from "fs";
 import * as path from "path";
@@ -32,13 +33,13 @@ import { log } from "@/node/services/log";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { AIService } from "@/node/services/aiService";
-import type { PolicyService } from "@/node/services/policyService";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import { createRuntimeForWorkspace, resolveWorkspaceRootPath } from "@/node/runtime/runtimeHelpers";
 import { resolveAgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
 import { isProjectTrusted } from "@/node/utils/projectTrust";
 import { roundToBase2 } from "@/common/telemetry/utils";
 import { isSecretReferenceValue } from "@/common/types/secrets";
+import { getMcpServerUrlError } from "@/common/utils/mcp/serverUrl";
 
 /**
  * Canonical `plugin:<16-hex>:<server>` keys are RESERVED for Agent Plugin
@@ -115,10 +116,6 @@ export class MCPConfigService {
    * enablement keys are saved; workspace overrides still take precedence.
    */
   private readonly agentPluginsMcpProvider: AgentPluginsMcpProvider | null;
-  private readonly policyService: Pick<
-    PolicyService,
-    "isEnforced" | "isMcpTransportAllowed"
-  > | null;
   private readonly telemetryService: Pick<TelemetryService, "capture"> | null;
   private readonly workspaceMetadataProvider: Pick<AIService, "getWorkspaceMetadata"> | null;
 
@@ -127,7 +124,6 @@ export class MCPConfigService {
     options?: {
       agentPluginsMcpProvider?: AgentPluginsMcpProvider;
       claudeDesign?: ClaudeDesignService;
-      policyService?: Pick<PolicyService, "isEnforced" | "isMcpTransportAllowed">;
       telemetryService?: Pick<TelemetryService, "capture">;
       workspaceMetadataProvider?: Pick<AIService, "getWorkspaceMetadata">;
     }
@@ -142,7 +138,6 @@ export class MCPConfigService {
       options?.claudeDesign ??
       new ClaudeDesignService({ rootDir: config.rootDir, isEnabled: () => false });
     this.agentPluginsMcpProvider = options?.agentPluginsMcpProvider ?? null;
-    this.policyService = options?.policyService ?? null;
     this.telemetryService = options?.telemetryService ?? null;
     this.workspaceMetadataProvider = options?.workspaceMetadataProvider ?? null;
   }
@@ -164,7 +159,7 @@ export class MCPConfigService {
     );
     // Tag the owning user layer (#4297) so the UI can attribute `disabled`
     // without re-deriving precedence. Plugin and managed entries stay untagged.
-    const servers = Object.fromEntries(
+    return Object.fromEntries(
       Object.entries(await this.mergeServerLayers(layers)).map(([name, info]) => {
         const configLayer: MCPServerInfo["configLayer"] = Object.hasOwn(layers.project, name)
           ? "project"
@@ -173,14 +168,6 @@ export class MCPConfigService {
             : undefined;
         return [name, configLayer ? { ...info, configLayer } : info];
       })
-    );
-    if (this.policyService?.isEnforced() !== true) {
-      return servers;
-    }
-    return Object.fromEntries(
-      Object.entries(servers).filter(([, info]) =>
-        this.policyService?.isMcpTransportAllowed(info.transport)
-      )
     );
   }
 
@@ -195,9 +182,6 @@ export class MCPConfigService {
     if (existingServer?.transport !== "stdio" && existingServer?.managed)
       return Err("Claude Design is managed in its settings card");
     const transport = input.transport ?? "stdio";
-    if (this.transportDisabledByPolicy(transport)) {
-      return Err("MCP transport is disabled by policy");
-    }
 
     const result = await this.addServer(input.name, {
       transport,
@@ -221,10 +205,7 @@ export class MCPConfigService {
   }
 
   async removeForApi(name: string): Promise<Result<void>> {
-    const server = (await this.listServers())[name];
-    if (server && this.transportDisabledByPolicy(server.transport)) {
-      return Err("MCP transport is disabled by policy");
-    }
+    const server = getOwn(await this.listServers(), name);
     const result = await this.removeServer(name);
     if (result.success && server) {
       this.captureConfigChange(
@@ -237,10 +218,7 @@ export class MCPConfigService {
   }
 
   async setEnabledForApi(name: string, enabled: boolean): Promise<Result<void>> {
-    const server = (await this.listServers())[name];
-    if (server && this.transportDisabledByPolicy(server.transport)) {
-      return Err("MCP transport is disabled by policy");
-    }
+    const server = getOwn(await this.listServers(), name);
     const result = await this.setServerEnabled(name, enabled);
     if (result.success && server) {
       this.captureConfigChange(
@@ -253,10 +231,7 @@ export class MCPConfigService {
   }
 
   async setToolAllowlistForApi(name: string, toolAllowlist: string[]): Promise<Result<void>> {
-    const server = (await this.listServers())[name];
-    if (server && this.transportDisabledByPolicy(server.transport)) {
-      return Err("MCP transport is disabled by policy");
-    }
+    const server = getOwn(await this.listServers(), name);
     const result = await this.setToolAllowlist(name, toolAllowlist);
     if (result.success && server) {
       this.captureConfigChange(
@@ -303,13 +278,6 @@ export class MCPConfigService {
       });
       return undefined;
     }
-  }
-
-  private transportDisabledByPolicy(transport: MCPServerTransport | "auto"): boolean {
-    return (
-      this.policyService?.isEnforced() === true &&
-      !this.policyService.isMcpTransportAllowed(transport)
-    );
   }
 
   private captureConfigChange(
@@ -777,6 +745,8 @@ export class MCPConfigService {
     try {
       return await this.runExclusive(async () => {
         if (!name.trim()) return Err("Server name is required");
+        // A plain-object key cannot hold "__proto__": the entry would vanish on save (#5740).
+        if (name.trim() === "__proto__") return Err('"__proto__" cannot be used as a server name');
         if (isCanonicalPluginServerKey(name.trim())) {
           // See omitReservedPluginKeys: user definitions must not occupy plugin keys.
           return Err(
@@ -786,20 +756,24 @@ export class MCPConfigService {
         const transport: MCPServerTransport = input.transport ?? "stdio";
         if (transport === "stdio") {
           if (!input.command?.trim()) return Err("Command is required");
-        } else if (!input.url?.trim()) {
-          return Err("URL is required");
+        } else {
+          if (!input.url?.trim()) return Err("URL is required");
+          const urlError = getMcpServerUrlError(input.url);
+          if (urlError !== null) return Err(urlError);
         }
 
         const cfg = await this.getGlobalConfig();
-        const existing = cfg.servers[name];
+        const existing = getOwn(cfg.servers, name);
         const base = {
           disabled: existing?.disabled ?? false,
           toolAllowlist: existing?.toolAllowlist,
         };
         cfg.servers[name] =
           transport === "stdio"
-            ? { transport: "stdio", command: input.command!, ...base }
-            : { transport, url: input.url!, headers: input.headers, ...base };
+            ? // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+              { transport: "stdio", command: input.command!, ...base }
+            : // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+              { transport, url: input.url!, headers: input.headers, ...base };
         await this.saveGlobalConfig(cfg);
         return Ok(undefined);
       });
@@ -812,7 +786,7 @@ export class MCPConfigService {
   async setServerEnabled(name: string, enabled: boolean): Promise<Result<void>> {
     try {
       return await this.runExclusive(async () => {
-        const managed = (await this.listServers())[name];
+        const managed = getOwn(await this.listServers(), name);
         if (managed?.plugin) {
           assert(isCanonicalPluginServerKey(name), "Plugin server must have a canonical key");
           if (managed.plugin.sourceScope !== "global") {
@@ -828,7 +802,7 @@ export class MCPConfigService {
           return Ok(undefined);
         }
         const cfg = await this.getGlobalConfig();
-        const entry = cfg.servers[name];
+        const entry = getOwn(cfg.servers, name);
         if (!entry || isCanonicalPluginServerKey(name)) return Err(`Server ${name} not found`);
         cfg.servers[name] = { ...entry, disabled: !enabled };
         await this.saveGlobalConfig(cfg);
@@ -845,7 +819,7 @@ export class MCPConfigService {
       return await this.runExclusive(async () => {
         if (isCanonicalPluginServerKey(name)) return Err("Agent Plugin definitions are read-only");
         const cfg = await this.getGlobalConfig();
-        if (!cfg.servers[name]) return Err(`Server ${name} not found`);
+        if (!getOwn(cfg.servers, name)) return Err(`Server ${name} not found`);
         delete cfg.servers[name];
         await this.saveGlobalConfig(cfg);
         return Ok(undefined);
@@ -860,13 +834,13 @@ export class MCPConfigService {
     try {
       return await this.runExclusive(async () => {
         if (isCanonicalPluginServerKey(name)) return Err("Agent Plugin definitions are read-only");
-        const managed = (await this.listServers())[name];
+        const managed = getOwn(await this.listServers(), name);
         if (managed?.transport !== "stdio" && managed?.managed === "claude-design") {
           await this.claudeDesign.configure({ toolAllowlist });
           return Ok(undefined);
         }
         const cfg = await this.getGlobalConfig();
-        const entry = cfg.servers[name];
+        const entry = getOwn(cfg.servers, name);
         if (!entry) return Err(`Server ${name} not found`);
         // [] = no tools allowed, [...tools] = those tools allowed
         cfg.servers[name] = { ...entry, toolAllowlist };

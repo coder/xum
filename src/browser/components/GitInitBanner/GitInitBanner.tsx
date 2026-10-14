@@ -84,7 +84,7 @@ export function GitInitBanner(props: GitInitBannerProps) {
         type="button"
         onClick={() => void handleGitInit()}
         disabled={isLoading}
-        className="bg-accent hover:bg-accent/80 text-accent-foreground inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:opacity-50"
+        className="bg-accent hover:bg-accent-button-hover text-accent-foreground inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:opacity-50"
         data-testid="git-init-button"
       >
         {isLoading ? (

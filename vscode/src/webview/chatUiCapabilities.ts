@@ -12,17 +12,17 @@ export const VSCODE_CHAT_UI_SUPPORT = {
   // workspace.replaceChatHistory is a destructive write the bridge does not allow (#4942).
   chatHistoryReplacement: "unsupported",
   // Composer dock decorations the webview does not share (#5092). The reviews banner is covered by
-  // reviewAnnotations; the background processes strip and held inputs are shared.
-  // Needs host forwarding of descendant task metadata and activity plus workflows.* (#5109).
-  subAgentTasks: "planned",
+  // reviewAnnotations; the background processes strip, held inputs and sub-agent tasks (#5109) are
+  // shared.
+  subAgentTasks: "supported",
   // Needs whole-workspace usage metrics and the compaction procedure, which the bridge does not allow.
   contextSwitchWarning: "unsupported",
   // Targets the desktop Instructions sidebar; workspace.getAdditionalSystemContext is not bridged.
   chatInstructions: "unsupported",
   // Needs the queue procedures (edit, dispatch mode, send now), which the bridge does not allow.
   queuedMessage: "unsupported",
-  // The output dialog polls workspace.backgroundBashes.getOutput every 500 ms, and the host
-  // re-validates the server connection on every bridged call (#5196), so it is not offered until
-  // the host reuses its connection.
-  backgroundBashOutput: "unsupported",
+  backgroundBashOutput: "supported",
+  // The webview mounts no right sidebar or Artifacts dialog, and its page CSP (nonce-only scripts,
+  // no frame-src) would block sandboxed artifact frames; artifact cards render without opening.
+  artifactsPanel: "unsupported",
 } as const satisfies Record<ChatUiFeatureId, ChatUiSupport>;

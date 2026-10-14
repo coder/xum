@@ -1,5 +1,6 @@
 import { restoreContextBudgetRejectedMessageForDisplay } from "@/common/utils/messages/contextBudgetRejection";
 import type {
+  ArtifactInteractionMetadata,
   BashMonitorWakeDisplayRecord,
   CompactionRequestData,
   DisplayedMessage,
@@ -327,6 +328,37 @@ function getRawCommand(muxMetadata: unknown): string | undefined {
   }
 }
 
+/**
+ * The "from artifact" pill and its rendering come only from this metadata, which the backend alone
+ * can write (generic sends refuse it), never from the model-facing tag text. Malformed metadata is
+ * dropped so the row renders as an ordinary message.
+ */
+function toArtifactInteractionDisplay(value: unknown): ArtifactInteractionMetadata | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const meta = value as Partial<Record<keyof ArtifactInteractionMetadata, unknown>>;
+  if (
+    typeof meta.id !== "string" ||
+    typeof meta.artifactPath !== "string" ||
+    typeof meta.title !== "string" ||
+    typeof meta.text !== "string" ||
+    meta.action !== "send" ||
+    typeof meta.version !== "number" ||
+    !Number.isInteger(meta.version) ||
+    meta.version < 0
+  ) {
+    return undefined;
+  }
+  return {
+    id: meta.id,
+    artifactPath: meta.artifactPath,
+    title: meta.title,
+    version: meta.version,
+    action: "send",
+    text: meta.text,
+    ...(meta.data !== undefined ? { data: meta.data } : {}),
+  };
+}
+
 function buildUserDisplayedMessages(options: {
   message: MuxMessage;
   agentSkillSnapshot?: { frontmatterYaml?: string; body?: string };
@@ -415,6 +447,7 @@ function buildUserDisplayedMessages(options: {
       inlineSkillSnapshots,
       compactionRequest,
       reviews: muxMeta?.reviews,
+      artifactInteraction: toArtifactInteractionDisplay(muxMeta?.artifactInteraction),
       bashMonitorWake: bashMonitorWakeRecords ? { records: bashMonitorWakeRecords } : undefined,
       // Only genuine machine rows get collapsed; corrupted metadata must not hide human input.
       contextBudgetWarning:

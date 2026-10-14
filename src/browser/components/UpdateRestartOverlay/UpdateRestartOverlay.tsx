@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { useAPI } from "@/browser/contexts/API";
 import { LoadingScreen } from "@/browser/components/LoadingScreen/LoadingScreen";
+import { isStreamFailure } from "@/browser/contexts/connectionLink";
 
 /**
  * Full-viewport cover shown from the moment an update install is confirmed (status
@@ -33,7 +34,8 @@ export function UpdateRestartOverlay() {
           setRestarting(status.type === "restarting");
         }
       } catch (error) {
-        if (!signal.aborted) {
+        // A lost connection is not a stream error: the next client opens the stream again.
+        if (isStreamFailure(error, signal)) {
           console.error("Update status stream error:", error);
         }
       }
@@ -55,7 +57,7 @@ export function UpdateRestartOverlay() {
   // old UI peeks through.
   return createPortal(
     <div
-      className="bg-surface-primary pointer-events-auto fixed inset-0 z-[10002]"
+      className="bg-surface-primary ios-standalone:top-px pointer-events-auto fixed inset-0 z-[10002]"
       data-testid="update-restart-overlay"
     >
       <LoadingScreen statusText="Restarting Xum…" />

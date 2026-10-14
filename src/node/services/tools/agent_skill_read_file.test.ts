@@ -2,7 +2,10 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { describe, it, expect } from "bun:test";
-import { createTestPluginInstallEntry } from "@/node/services/agentPlugins/testFixtures";
+import {
+  createTestPluginInstallEntry,
+  reviewedComponentConsent,
+} from "@/node/services/agentPlugins/testFixtures";
 import { AgentSkillReadFileToolResultSchema } from "@/common/utils/tools/toolDefinitions";
 import { createAgentSkillReadFileTool } from "./agent_skill_read_file";
 import {
@@ -83,7 +86,11 @@ describe("agent_skill_read_file", () => {
       path.join(tmp.path, "plugins.json"),
       JSON.stringify({
         plugins: [
-          createTestPluginInstallEntry("a-managed", { skills: ["allowed"], mcpServers: [] }),
+          createTestPluginInstallEntry(
+            "a-managed",
+            { skills: ["allowed"], mcpServers: [] },
+            await reviewedComponentConsent({ pluginDir: path.join(container, "a-managed") })
+          ),
         ],
       })
     );
@@ -92,7 +99,6 @@ describe("agent_skill_read_file", () => {
         workspaceId: GLOBAL_WORKSPACE_ID,
         xumScope: { type: "global", xumHome: tmp.path },
       }),
-      experiments: { agentPlugins: true },
     });
     expect(await executeReadFile(tool, { name: "blocked", filePath: "data.txt" })).toMatchObject({
       success: false,
@@ -146,7 +152,11 @@ describe("agent_skill_read_file", () => {
         registryPath,
         JSON.stringify({
           plugins: [
-            createTestPluginInstallEntry("managed", { skills: ["allowed"], mcpServers: [] }),
+            createTestPluginInstallEntry(
+              "managed",
+              { skills: ["allowed"], mcpServers: [] },
+              await reviewedComponentConsent({ pluginDir: pluginRoot })
+            ),
           ],
         })
       );
@@ -159,7 +169,6 @@ describe("agent_skill_read_file", () => {
             projectStorageAuthority: "host-local",
           },
         }),
-        experiments: { agentPlugins: true },
       });
       expect(await executeReadFile(tool, { name: "blocked", filePath: "data.txt" })).toMatchObject({
         success: false,
@@ -177,6 +186,43 @@ describe("agent_skill_read_file", () => {
       });
     }
   );
+
+  it("reads a file from the plugin named by <plugin>:<skill>", async () => {
+    using tmp = new TestTempDir("plugin-read-file-namespace");
+    for (const plugin of ["alpha", "beta"]) {
+      const root = path.join(tmp.path, "plugins", plugin);
+      const dir = path.join(root, "skills", "ns-fixture");
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(
+        path.join(root, "plugin.json"),
+        JSON.stringify({
+          $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+          name: plugin,
+        })
+      );
+      await fs.writeFile(
+        path.join(dir, "SKILL.md"),
+        "---\nname: ns-fixture\ndescription: x\n---\nBody\n"
+      );
+      await fs.writeFile(path.join(dir, "data.txt"), plugin);
+    }
+    // A global skill of the same name wins the bare lookup over both plugins.
+    const globalDir = path.join(tmp.path, "skills", "ns-fixture");
+    await fs.mkdir(globalDir, { recursive: true });
+    await fs.writeFile(
+      path.join(globalDir, "SKILL.md"),
+      "---\nname: ns-fixture\ndescription: x\n---\nBody\n"
+    );
+    await fs.writeFile(path.join(globalDir, "data.txt"), "global");
+    // Not `tdd`: keeps the fixture name unlikely to collide with host skills.
+    const tool = createAgentSkillReadFileTool(createTestToolConfig(tmp.path));
+    const read = (name: string) => executeReadFile(tool, { name, filePath: "data.txt" });
+
+    expect(await read("ns-fixture")).toMatchObject({ success: true, content: "1\tglobal" });
+    expect(await read("alpha:ns-fixture")).toMatchObject({ success: true, content: "1\talpha" });
+    expect(await read("beta:ns-fixture")).toMatchObject({ success: true, content: "1\tbeta" });
+    expect(await read("gamma:ns-fixture")).toMatchObject({ success: false });
+  });
 
   it("allows reading built-in skill files", async () => {
     using tempDir = new TestTempDir("test-agent-skill-read-file-global-scope");
@@ -282,6 +328,87 @@ describe("agent_skill_read_file", () => {
     if (result.success) {
       expect(result.content).toMatch(/name:\s*project-skill/i);
     }
+  });
+
+  describe("long lines", () => {
+    async function createLongLineTool(tempDir: TestTempDir, content: string) {
+      await writeProjectSkill(tempDir.path, "long-lines", {
+        files: { "playbook.md": content },
+      });
+      return createAgentSkillReadFileTool(
+        createTestToolConfig(tempDir.path, {
+          workspaceId: "regular-workspace",
+          xumScope: {
+            type: "project",
+            xumHome: tempDir.path,
+            projectRoot: tempDir.path,
+            projectStorageAuthority: "host-local",
+          },
+        })
+      );
+    }
+
+    it("returns every byte of long lines across offset/limit pages", async () => {
+      using tempDir = new TestTempDir("test-agent-skill-read-file-long-lines");
+      // Skill markdown often keeps a whole paragraph on one line; 8 x 3,000
+      // bytes is too big for one 16 KB page but fits in two.
+      const lines = Array.from({ length: 8 }, (_, i) =>
+        `line ${i + 1} é `.padEnd(2999, "x").concat(`${i + 1}`)
+      );
+      const tool = await createLongLineTool(tempDir, lines.join("\n"));
+
+      const whole = await executeReadFile(tool, { name: "long-lines", filePath: "playbook.md" });
+      expect(whole.success).toBe(false);
+      if (!whole.success) {
+        expect(whole.error).toContain("offset and limit");
+      }
+
+      const pages = [];
+      for (const offset of [1, 5]) {
+        const page = await executeReadFile(tool, {
+          name: "long-lines",
+          filePath: "playbook.md",
+          offset,
+          limit: 4,
+        });
+        expect(page.success).toBe(true);
+        if (page.success) {
+          pages.push(page.content);
+        }
+      }
+      const rows = pages.join("\n").split("\n");
+      expect(rows.map((row) => row.slice(0, row.indexOf("\t")))).toEqual(
+        lines.map((_, i) => String(i + 1))
+      );
+      expect(rows.map((row) => row.slice(row.indexOf("\t") + 1))).toEqual(lines);
+    });
+
+    it("fails loudly, naming the line, when one line alone exceeds a page", async () => {
+      using tempDir = new TestTempDir("test-agent-skill-read-file-huge-line");
+      const tool = await createLongLineTool(tempDir, `short\n${"y".repeat(20_000)}\nlast`);
+
+      // The oversized line is the second row of the whole-file window and the
+      // first (only) row of the window that pages straight to it.
+      for (const window of [{}, { offset: 2, limit: 1 }]) {
+        const huge = await executeReadFile(tool, {
+          name: "long-lines",
+          filePath: "playbook.md",
+          ...window,
+        });
+        expect(huge.success).toBe(false);
+        if (!huge.success) {
+          expect(huge.error).toContain("Line 2");
+        }
+      }
+
+      // The lines around it stay readable.
+      const last = await executeReadFile(tool, {
+        name: "long-lines",
+        filePath: "playbook.md",
+        offset: 3,
+      });
+      expect(last).toMatchObject({ success: true, content: "3\tlast" });
+    });
   });
 
   it("rejects project skill file read when skill directory symlink escapes project root", async () => {

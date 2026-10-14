@@ -1,9 +1,10 @@
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import { SUBAGENT_FAILURE_FOOTER } from "@/common/utils/subagentFailureEnvelope";
 import type { StartupRecoveryState } from "./startupRecovery";
 import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
 import type { ExperimentId } from "@/common/constants/experiments";
-import type { GoalSyntheticMessageKind } from "@/constants/goals";
+import type { GoalSyntheticMessageKind, TaskTurnKind } from "@/constants/goals";
 import type { ArchivePreflightResult, ArchiveWorkspaceResult } from "@/common/orpc/schemas/api";
 import type { FilePart, SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
 import type { SendMessageError } from "@/common/types/errors";
@@ -15,6 +16,7 @@ import type {
 import type { Result } from "@/common/types/result";
 import type { StreamErrorRecoveryOutcome } from "@/node/services/agentSession";
 import type { TurnId } from "@/node/services/turnCoordinator";
+import type { SendIdentity } from "@/node/services/sendIds";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type {
   FrontendWorkspaceMetadata,
@@ -71,6 +73,7 @@ export interface ResolvedWorkspaceAiSettings {
   thinkingLevel?: ThinkingLevel;
   /** OpenAI pro reasoning mode; per-workspace choice inherited by spawned tasks. */
   reasoningMode?: OpenAIReasoningMode;
+  serviceTier?: ServiceTier;
 }
 
 export type WorkspaceLifecycleResult = z.infer<typeof TaskWorkspaceLifecycleToolTargetResultSchema>;
@@ -126,14 +129,6 @@ export interface TaskCreateArgs {
    * Defaults to blocking when omitted.
    */
   attentionPolicy?: BackgroundWorkAttentionPolicy;
-  /** Experiments to inherit to subagent */
-  experiments?: {
-    programmaticToolCalling?: boolean;
-    /** RLM mode: persisted on the task record so RLM-gated child features survive restarts. */
-    rlm?: boolean;
-    advisorTool?: boolean;
-    dynamicWorkflows?: boolean;
-  };
 }
 
 export function formatSubagentReportUserMessage(params: {
@@ -362,6 +357,19 @@ export interface WorkspaceLiveActivity {
 export type TurnAcceptanceOrigin = "manual" | "automatic";
 
 export interface SendMessageInternalOptions {
+  /**
+   * Set only by the artifact-interaction sender (Artifacts M5b). Generic sends refuse
+   * `muxMetadata.artifactInteraction`, so the "from artifact" label cannot be spoofed.
+   */
+  artifactInteraction?: true;
+  /**
+   * Idempotent sends: the ids a re-send carries (a held Retry reuses its original ids). Absent on
+   * a new manual send: WorkspaceService assigns its id at entry. An automatic send carries only
+   * the ids set here (a task launch's brief id); nothing is minted for it.
+   */
+  sendIdentities?: SendIdentity[];
+  /** This send re-sends a held input: queued, it is never batched with other input. */
+  resendsHeldInput?: true;
   acceptanceOrigin?: TurnAcceptanceOrigin;
   allowQueuedAgentTask?: boolean;
   skipAutoResumeReset?: boolean;
@@ -372,6 +380,11 @@ export interface SendMessageInternalOptions {
   goalKind?: GoalSyntheticMessageKind;
   /** Goal identity persisted alongside goalKind so reconciliation can scope the row. */
   goalId?: string;
+  /**
+   * Provenance of an automatic TaskService turn in a sub-agent workspace, persisted on the
+   * user row and every replay path; gates set_goal (see TaskTurnKind).
+   */
+  taskTurnKind?: TaskTurnKind;
   /** Force Copilot billing classification to "agent" for internal sends. */
   agentInitiated?: boolean;
   onAccepted?: () => Promise<void> | void;
@@ -474,6 +487,8 @@ export interface WorkspaceTurnHost {
       agentInitiated?: boolean;
       /** See SendMessageInternalOptions.turnAdmission. */
       turnAdmission?: TurnAdmissionToken;
+      /** See SendMessageInternalOptions.taskTurnKind. */
+      taskTurnKind?: TaskTurnKind;
     }
   ): Promise<Result<{ started: boolean }, SendMessageError>>;
   /**
@@ -495,6 +510,12 @@ export interface WorkspaceTurnHost {
     }
   ): Promise<Result<void>>;
   waitForIdleAndNoQueuedMessages(workspaceId: string): Promise<void>;
+  /** See WorkspaceService.refuseUnavailableGoalTurnAgent (#5402). */
+  refuseUnavailableGoalTurnAgent(
+    workspaceId: string,
+    options: Pick<SendMessageOptions, "agentId" | "disableWorkspaceAgents">,
+    isCurrent?: () => boolean | Promise<boolean>
+  ): Promise<string | null>;
   waitForPendingCompactionCompletionDecision(
     workspaceId: string,
     messageId: string
@@ -880,9 +901,21 @@ export interface AgentTaskIntegration {
   latchHardInterruptCascade(workspaceId: string): (() => void) | undefined;
   terminateAllDescendantAgentTasks(
     workspaceId: string,
-    options?: { workflowRunId?: string }
+    options?: {
+      workflowRunId?: string;
+      /**
+       * A user Stop's retirement of each stopped descendant's owed bash-monitor attention (#5377),
+       * called synchronously as the cascade latches the descendant, before any await.
+       */
+      retireBashMonitorAttention?: (taskId: string) => void;
+    }
   ): Promise<string[]>;
   noteWorkspaceUnarchived(workspaceId: string): Promise<void>;
+  /**
+   * Settle a child goal pause owed by a closing write made outside TaskService (the archive of a
+   * shared-desktop child, #5411). A no-op when nothing is owed; never throws.
+   */
+  settleOwedChildGoalPause(workspaceId: string): Promise<void>;
   /**
    * Admission barrier: true while a stop cascade holds this workspace's latch (from its epoch
    * bump until the stopped execution has authoritatively settled and cleanup finished). Every
@@ -975,7 +1008,7 @@ export interface WorkspaceTurnTaskHost {
   ): Promise<string[]>;
   listAgentTaskExecutionEntries(
     config: ReturnType<Config["loadConfigOrDefault"]>
-  ): Array<{ id?: string; taskExecutionId?: string }>;
+  ): Array<Pick<WorkspaceConfigEntry, "id" | "taskExecutionId" | "taskExecutionStatus">>;
   markTaskForegroundRelevant(taskId: string): void;
   maybeStartPatchGenerationForReportedTask(
     workspaceId: string,

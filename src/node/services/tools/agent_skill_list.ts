@@ -11,6 +11,7 @@ import {
   resolveSkillUserInvocable,
   resolveSkillWhenToUse,
 } from "@/common/orpc/schemas";
+import { resolveSkillPaths } from "@/common/utils/skills/skillPaths";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import type { AgentSkillListToolResult } from "@/common/types/tools";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -19,11 +20,20 @@ import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools"
 import { PLUGIN_REGISTRY_FILE_NAME } from "@/node/services/agentPlugins/registry";
 import { discoverAgentPlugins } from "@/node/services/agentPlugins/discovery";
 import {
+  isPluginSkillConsented,
+  pluginSkillConsentGate,
+  type PluginSkillConsentGate,
+} from "@/node/services/agentPlugins/componentConsent";
+import {
   discoverAgentSkills,
+  requireReachableSkills,
   getDefaultAgentSkillsRoots,
   getProjectSkillRoots,
 } from "@/node/services/agentSkills/agentSkillsService";
-import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
+import {
+  parseSkillMarkdown,
+  skillConsentFrontmatter,
+} from "@/node/services/agentSkills/parseSkillMarkdown";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { log } from "@/node/services/log";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
@@ -50,22 +60,13 @@ async function listSkillDirectories(skillsRoot: string): Promise<string[]> {
   }
 }
 
-async function readSkillDescriptor(
-  skillsRoot: string,
-  directoryNameRaw: string,
+/** Read `skillDir`'s SKILL.md when it is a contained regular file of allowed size; else log and null. */
+async function readContainedSkillFile(
+  skillDir: string,
+  directoryName: string,
   scope: "global" | "project",
   containmentRoot: string
-): Promise<AgentSkillDescriptor | null> {
-  const parsedDirectoryName = SkillNameSchema.safeParse(directoryNameRaw);
-  if (!parsedDirectoryName.success) {
-    log.warn(
-      `Skipping invalid ${scope} skill directory name '${directoryNameRaw}' in ${skillsRoot}`
-    );
-    return null;
-  }
-
-  const directoryName = parsedDirectoryName.data;
-  const skillDir = path.join(skillsRoot, directoryName);
+): Promise<{ content: string; byteSize: number } | null> {
   const skillFilePath = path.join(skillDir, "SKILL.md");
 
   // SECURITY: validate that BOTH the skill directory and SKILL.md canonical
@@ -112,22 +113,48 @@ async function readSkillDescriptor(
     return null;
   }
 
-  let content: string;
   try {
-    content = await fsPromises.readFile(containedPath, "utf-8");
+    return { content: await fsPromises.readFile(containedPath, "utf-8"), byteSize: stat.size };
   } catch (error) {
     log.warn(
       `Skipping ${scope} skill '${directoryName}' because SKILL.md could not be read: ${getErrorMessage(error)}`
     );
     return null;
   }
+}
+
+async function readSkillDescriptor(
+  skillsRoot: string,
+  directoryNameRaw: string,
+  scope: "global" | "project",
+  containmentRoot: string,
+  skillConsent?: PluginSkillConsentGate
+): Promise<AgentSkillDescriptor | null> {
+  const parsedDirectoryName = SkillNameSchema.safeParse(directoryNameRaw);
+  if (!parsedDirectoryName.success) {
+    log.warn(
+      `Skipping invalid ${scope} skill directory name '${directoryNameRaw}' in ${skillsRoot}`
+    );
+    return null;
+  }
+
+  const directoryName = parsedDirectoryName.data;
+  const skillDir = path.join(skillsRoot, directoryName);
+  const file = await readContainedSkillFile(skillDir, directoryName, scope, containmentRoot);
+  if (file === null) return null;
 
   try {
     const parsed = parseSkillMarkdown({
-      content,
-      byteSize: stat.size,
+      content: file.content,
+      byteSize: file.byteSize,
       directoryName,
+      // Agree with discovery; the display name stays out of this model-facing output.
+      allowDisplayName: true,
     });
+    if (!isPluginSkillConsented(skillConsent, skillDir, skillConsentFrontmatter(parsed))) {
+      log.warn(`Skipping ${scope} plugin skill '${directoryName}': not reviewed on this install`);
+      return null;
+    }
 
     const descriptorResult = AgentSkillDescriptorSchema.safeParse({
       name: parsed.frontmatter.name,
@@ -137,6 +164,7 @@ async function readSkillDescriptor(
       userInvocable: resolveSkillUserInvocable(parsed.frontmatter),
       argumentHint: parsed.frontmatter["argument-hint"],
       whenToUse: resolveSkillWhenToUse(parsed.frontmatter),
+      paths: resolveSkillPaths(parsed.frontmatter),
     });
 
     if (!descriptorResult.success) {
@@ -171,8 +199,6 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
 
       // claude-skills-compat experiment: also list read-only .claude/skills roots.
       const includeClaudeSkills = config.experiments?.claudeSkillsCompat === true;
-      // agent-plugins experiment: also list read-only Agent Plugins skill roots.
-      const includeAgentPlugins = config.experiments?.agentPlugins === true;
 
       try {
         const skillCtx = resolveSkillStorageContext({
@@ -180,7 +206,6 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           workspacePath: config.cwd,
           xumScope: config.xumScope ?? null,
           includeClaudeSkills,
-          includeAgentPlugins,
         });
 
         if (skillCtx.kind === "project-runtime") {
@@ -190,14 +215,15 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
             skillCtx.roots ??
             getDefaultAgentSkillsRoots(skillCtx.runtime, skillCtx.workspacePath, {
               includeClaudeSkills,
-              includeAgentPlugins,
             });
 
-          const discovered = await discoverAgentSkills(skillCtx.runtime, skillCtx.workspacePath, {
-            roots,
-            containment: skillCtx.containment,
-            dedupeByName: false,
-          });
+          const discovered = requireReachableSkills(
+            await discoverAgentSkills(skillCtx.runtime, skillCtx.workspacePath, {
+              roots,
+              containment: skillCtx.containment,
+              dedupeByName: false,
+            })
+          );
           const seenByScope = new Set<string>();
           const skills = discovered
             .filter((skill) => skill.scope !== "built-in")
@@ -210,6 +236,9 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
               return true;
             })
             .filter((skill) => includeUnadvertised === true || skill.advertise !== false)
+            // The display name is user-facing only: plugin model-visible fields are
+            // consent-fingerprinted (installService describeSkillAdvertisement).
+            .map(({ displayName: _displayName, ...skill }) => skill)
             .sort((a, b) => a.name.localeCompare(b.name));
 
           return {
@@ -231,6 +260,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           containmentRoot: string;
           scope: "global" | "project";
           importedSkills?: readonly string[];
+          skillConsent?: PluginSkillConsentGate;
         }> = [
           {
             skillsRoot: path.join(xumScope.xumHome, "skills"),
@@ -267,63 +297,65 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           );
         }
 
-        if (includeAgentPlugins) {
-          // agent-plugins experiment: expand plugin containers into per-plugin skills/ roots.
-          // Containers anchor at the CHECKOUT root (matching buildProjectLocalRoots):
-          // for subProjectPath workspaces `projectRoot` is the execution
-          // subdirectory, but plugins live at the checkout level.
-          const pluginAnchor =
-            xumScope.type === "project" ? (xumScope.checkoutRoot ?? xumScope.projectRoot) : null;
-          const pluginContainers = [
-            ...(pluginAnchor != null
-              ? [
-                  ...listProjectMetadataRelativePaths("plugins").map((relativePath) => ({
-                    path: path.join(pluginAnchor, relativePath),
-                    scope: "project" as const,
-                  })),
-                  {
-                    path: path.join(pluginAnchor, ".agents", "plugins"),
-                    scope: "project" as const,
-                  },
-                ]
-              : []),
-            {
-              path: path.join(xumScope.xumHome, "plugins"),
-              scope: "global" as const,
-              registryPath: path.join(xumScope.xumHome, PLUGIN_REGISTRY_FILE_NAME),
-            },
-            { path: path.join(userHome, ".agents", "plugins"), scope: "global" as const },
-          ];
-          const { plugins } = await discoverAgentPlugins(pluginContainers);
-          for (const plugin of plugins) {
-            if (plugin.skillsDir == null) {
+        // Expand Agent Plugins containers into per-plugin skills/ roots.
+        // Containers anchor at the CHECKOUT root (matching buildProjectLocalRoots):
+        // for subProjectPath workspaces `projectRoot` is the execution
+        // subdirectory, but plugins live at the checkout level.
+        const pluginAnchor =
+          xumScope.type === "project" ? (xumScope.checkoutRoot ?? xumScope.projectRoot) : null;
+        const pluginContainers = [
+          ...(pluginAnchor != null
+            ? [
+                ...listProjectMetadataRelativePaths("plugins").map((relativePath) => ({
+                  path: path.join(pluginAnchor, relativePath),
+                  scope: "project" as const,
+                })),
+                {
+                  path: path.join(pluginAnchor, ".agents", "plugins"),
+                  scope: "project" as const,
+                },
+              ]
+            : []),
+          {
+            path: path.join(xumScope.xumHome, "plugins"),
+            scope: "global" as const,
+            registryPath: path.join(xumScope.xumHome, PLUGIN_REGISTRY_FILE_NAME),
+          },
+          { path: path.join(userHome, ".agents", "plugins"), scope: "global" as const },
+        ];
+        const { plugins } = await discoverAgentPlugins(pluginContainers);
+        for (const plugin of plugins) {
+          if (plugin.skillsDirs == null) {
+            continue;
+          }
+          // Project plugin roots keep the repo-symlink posture of other project
+          // roots: the plugin root itself must stay inside the checkout root.
+          if (plugin.scope === "project" && pluginAnchor != null) {
+            try {
+              await ensurePathContained(pluginAnchor, plugin.rootPath);
+            } catch {
+              log.warn(
+                `Skipping project plugin '${plugin.name}': plugin root resolves outside the project root`
+              );
               continue;
             }
-            // Project plugin roots keep the repo-symlink posture of other project
-            // roots: the plugin root itself must stay inside the checkout root.
-            if (plugin.scope === "project" && pluginAnchor != null) {
-              try {
-                await ensurePathContained(pluginAnchor, plugin.rootPath);
-              } catch {
-                log.warn(
-                  `Skipping project plugin '${plugin.name}': plugin root resolves outside the project root`
-                );
-                continue;
-              }
-            }
-            // Per-skill containment anchors at the plugin root (§4.1).
-            roots.push({
-              skillsRoot: plugin.skillsDir,
+          }
+          // Per-skill containment anchors at the plugin root (§4.1).
+          const importedSkills = plugin.importedComponents?.skills;
+          roots.push(
+            ...plugin.skillsDirs.map((skillsRoot) => ({
+              skillsRoot,
               containmentRoot: plugin.rootPath,
               scope: plugin.scope,
-              importedSkills: plugin.importedComponents?.skills,
-            });
-          }
+              importedSkills,
+              skillConsent: pluginSkillConsentGate(plugin),
+            }))
+          );
         }
 
         const skills: AgentSkillDescriptor[] = [];
         const seenByScope = new Set<string>();
-        for (const { skillsRoot, containmentRoot, scope, importedSkills } of roots) {
+        for (const { skillsRoot, containmentRoot, scope, importedSkills, skillConsent } of roots) {
           let skillsRootReal: string;
           try {
             skillsRootReal = await fsPromises.realpath(skillsRoot);
@@ -355,7 +387,8 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
               skillsRootReal,
               directoryName,
               scope,
-              containmentRoot
+              containmentRoot,
+              skillConsent
             );
             if (!descriptor) {
               continue;

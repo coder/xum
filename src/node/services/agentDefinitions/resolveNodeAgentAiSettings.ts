@@ -5,6 +5,7 @@
  * and cycle logging so the pure layer stays side-effect free.
  */
 
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type {
@@ -33,8 +34,6 @@ export interface NodeAgentDefinitionContext {
   runtime: Runtime;
   workspacePath: string;
   workspaceId: string;
-  /** agent-plugins experiment: also resolve definitions contributed by Agent Plugins. */
-  includeAgentPlugins?: boolean;
 }
 
 export interface ResolveNodeAgentAiSettingsParams {
@@ -49,6 +48,7 @@ export interface ResolveNodeAgentAiSettingsParams {
     model?: string;
     thinkingLevel?: ParsedThinkingInput;
     reasoningMode?: OpenAIReasoningMode;
+    serviceTier?: ServiceTier;
   };
   targetWorkspaceSettings?: AgentAiSettingsLayerValues;
   parentWorkspaceExecSettings?: AgentAiSettingsLayerValues;
@@ -151,10 +151,7 @@ export async function loadAgentDefinitionAiLayers(
       context.runtime,
       context.workspacePath,
       agentId,
-      {
-        includeAgentPlugins: context.includeAgentPlugins,
-        ...(abortSignal != null ? { abortSignal } : {}),
-      }
+      abortSignal != null ? { abortSignal } : undefined
     );
     const chain = await resolveAgentInheritanceChain({
       runtime: context.runtime,
@@ -162,7 +159,6 @@ export async function loadAgentDefinitionAiLayers(
       agentId: agentDefinition.id,
       agentDefinition,
       workspaceId: context.workspaceId,
-      includeAgentPlugins: context.includeAgentPlugins,
       ...(abortSignal != null ? { abortSignal } : {}),
     });
     return collectDefinitionLayers(agentId, chain);

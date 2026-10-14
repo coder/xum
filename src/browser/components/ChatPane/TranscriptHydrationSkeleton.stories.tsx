@@ -13,7 +13,7 @@ const meta = {
     // Mirror the transcript's centered max-width column so the skeleton's line
     // widths read the same as real messages will.
     <div className="bg-background min-h-screen overflow-y-auto p-6">
-      <div className="mx-auto max-w-4xl">
+      <div className="max-w-chat mx-auto">
         <TranscriptHydrationSkeleton workspaceId="story-workspace" />
       </div>
     </div>

@@ -8,6 +8,7 @@ import {
   X,
   FlaskConical,
   Bot,
+  HeartPulse,
   Keyboard,
   Layout,
   Container,
@@ -23,13 +24,13 @@ import { Dialog, DialogContent, DialogTitle } from "@/browser/components/Dialog/
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useOnboardingPause } from "@/browser/features/SplashScreens/SplashScreenProvider";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
-import { useModalFocusReturn } from "@/browser/hooks/useModalFocusReturn";
+import type { useModalFocusReturn } from "@/browser/hooks/useModalFocusReturn";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { GeneralSection } from "./Sections/GeneralSection";
 import { TasksSection } from "./Sections/TasksSection";
+import { HeartbeatSection } from "./Sections/HeartbeatSection";
 import { ProvidersSection } from "./Sections/ProvidersSection";
 import { ModelsSection } from "./Sections/ModelsSection";
-import { GovernorSection } from "./Sections/GovernorSection";
 import { MemorySection } from "./Sections/MemorySection";
 import { Button } from "@/browser/components/Button/Button";
 import { MCPSettingsSection } from "./Sections/MCPSettingsSection";
@@ -46,7 +47,7 @@ import { SecuritySection } from "./Sections/SecuritySection";
 import { BackupSection } from "./Sections/BackupSection";
 import type { SettingsSection } from "./types";
 
-const LEGACY_EXPERIMENT_SETTINGS_SECTION_IDS = new Set(["goals", "heartbeat"]);
+const LEGACY_EXPERIMENT_SETTINGS_SECTION_IDS = new Set(["goals"]);
 
 const BASE_SECTIONS: SettingsSection[] = [
   {
@@ -60,6 +61,12 @@ const BASE_SECTIONS: SettingsSection[] = [
     label: "Agents",
     icon: <Bot className="h-4 w-4" />,
     component: TasksSection,
+  },
+  {
+    id: "heartbeat",
+    label: "Heartbeats",
+    icon: <HeartPulse className="h-4 w-4" />,
+    component: HeartbeatSection,
   },
   {
     id: "instructions",
@@ -84,6 +91,12 @@ const BASE_SECTIONS: SettingsSection[] = [
     label: "MCP",
     icon: <Server className="h-4 w-4" />,
     component: MCPSettingsSection,
+  },
+  {
+    id: "plugins",
+    label: "Plugins",
+    icon: <Blocks className="h-4 w-4" />,
+    component: PluginsSettingsSection,
   },
   {
     id: "secrets",
@@ -135,9 +148,7 @@ interface SettingsSectionRedirect {
 }
 
 export function getSettingsSections(
-  governorEnabled: boolean,
   memoryEnabled: boolean,
-  agentPluginsEnabled: boolean,
   remoteConnectionAvailable = false
 ): SettingsSection[] {
   const sections = [...BASE_SECTIONS];
@@ -148,17 +159,6 @@ export function getSettingsSections(
       label: "Remote Connection",
       icon: <Monitor className="h-4 w-4 shrink-0" />,
       component: RemoteConnectionSection,
-    });
-  }
-  if (agentPluginsEnabled) {
-    // Next to MCP: plugins contribute skills + MCP servers.
-    const mcpIndex = sections.findIndex((section) => section.id === "mcp");
-    sections.splice(mcpIndex + 1, 0, {
-      id: "plugins",
-      label: "Plugins",
-      icon: <Blocks className="h-4 w-4" />,
-      component: PluginsSettingsSection,
-      experimental: true,
     });
   }
   if (memoryEnabled) {
@@ -176,37 +176,24 @@ export function getSettingsSections(
     component: BackupSection,
     experimental: true,
   });
-  if (governorEnabled) {
-    sections.push({
-      id: "governor",
-      label: "Governor",
-      icon: <ShieldCheck className="h-4 w-4" />,
-      component: GovernorSection,
-    });
-  }
   return sections;
 }
 
 export function getSettingsSectionRedirect(
   activeSection: string,
-  governorEnabled: boolean,
   memoryEnabled: boolean,
-  agentPluginsEnabled: boolean,
   remoteConnectionAvailable = false
 ): SettingsSectionRedirect | null {
   if (LEGACY_EXPERIMENT_SETTINGS_SECTION_IDS.has(activeSection)) {
     return { section: "experiments", replace: true };
   }
 
-  if (!governorEnabled && activeSection === "governor") {
-    return { section: BASE_SECTIONS[0]?.id ?? "general" };
+  // Removed section: replace so the restored URL and back stack drop the dead route.
+  if (activeSection === "governor") {
+    return { section: BASE_SECTIONS[0]?.id ?? "general", replace: true };
   }
 
   if (!memoryEnabled && activeSection === "memory") {
-    return { section: BASE_SECTIONS[0]?.id ?? "general" };
-  }
-
-  if (!agentPluginsEnabled && activeSection === "plugins") {
     return { section: BASE_SECTIONS[0]?.id ?? "general" };
   }
 
@@ -217,14 +204,13 @@ export function getSettingsSectionRedirect(
   return null;
 }
 
-export function SettingsPage() {
+// The caller owns the focus-return hook: this page is lazy-loaded and first mounts already open,
+// so it cannot record the opener itself (see LazySettingsPage).
+export function SettingsPage(props: { focusReturn: ReturnType<typeof useModalFocusReturn> }) {
   const { isOpen, close, activeSection, setActiveSection } = useSettings();
   const onboardingPause = useOnboardingPause();
-  const governorEnabled = useExperimentValue(EXPERIMENT_IDS.MUX_GOVERNOR);
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
-  const agentPluginsEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_PLUGINS);
   const remoteConnectionAvailable = window.api?.remoteConnection != null;
-  const focusReturn = useModalFocusReturn(isOpen);
 
   // Redirect restored links when an experiment or desktop bridge is unavailable.
   useEffect(() => {
@@ -233,9 +219,7 @@ export function SettingsPage() {
     }
     const redirect = getSettingsSectionRedirect(
       activeSection,
-      governorEnabled,
       memoryEnabled,
-      agentPluginsEnabled,
       remoteConnectionAvailable
     );
     if (!redirect) {
@@ -248,22 +232,9 @@ export function SettingsPage() {
     }
 
     setActiveSection(redirect.section);
-  }, [
-    isOpen,
-    activeSection,
-    setActiveSection,
-    governorEnabled,
-    memoryEnabled,
-    agentPluginsEnabled,
-    remoteConnectionAvailable,
-  ]);
+  }, [isOpen, activeSection, setActiveSection, memoryEnabled, remoteConnectionAvailable]);
 
-  const sections = getSettingsSections(
-    governorEnabled,
-    memoryEnabled,
-    agentPluginsEnabled,
-    remoteConnectionAvailable
-  );
+  const sections = getSettingsSections(memoryEnabled, remoteConnectionAvailable);
   const currentSection = sections.find((section) => section.id === activeSection) ?? sections[0];
   const SectionComponent = currentSection.component;
 
@@ -274,9 +245,9 @@ export function SettingsPage() {
         showCloseButton={false}
         allowEditableEscape
         aria-describedby={undefined}
-        onOpenAutoFocus={focusReturn.onOpenAutoFocus}
-        onCloseAutoFocus={focusReturn.onCloseAutoFocus}
-        className="top-0 left-0 flex h-full w-full max-w-none translate-x-0 translate-y-0 flex-col gap-0 overflow-hidden rounded-none border-0 p-0 pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] md:top-[50%] md:left-[50%] md:h-[min(880px,88vh)] md:w-[min(1100px,92vw)] md:translate-x-[-50%] md:translate-y-[-50%] md:flex-row md:rounded-lg md:border"
+        onOpenAutoFocus={props.focusReturn.onOpenAutoFocus}
+        onCloseAutoFocus={props.focusReturn.onCloseAutoFocus}
+        className="max-md:ios-standalone:top-px max-md:ios-standalone:h-[calc(100%-1px)] top-0 left-0 flex h-full w-full max-w-none translate-x-0 translate-y-0 flex-col gap-0 overflow-hidden rounded-none border-0 p-0 pt-[env(safe-area-inset-top)] md:top-[50%] md:left-[50%] md:h-[min(880px,88vh)] md:w-[min(1100px,92vw)] md:translate-x-[-50%] md:translate-y-[-50%] md:flex-row md:rounded-lg md:border"
       >
         <div className="border-border-medium flex min-w-0 shrink-0 flex-col border-b md:w-48 md:border-r md:border-b-0">
           <div className="border-border-medium flex h-12 shrink-0 items-center border-b px-4">
@@ -290,7 +261,7 @@ export function SettingsPage() {
                 onClick={() => setActiveSection(section.id)}
                 className={`flex h-auto shrink-0 items-center justify-start gap-2 rounded-md px-3 py-2 text-left text-sm whitespace-nowrap md:w-full ${
                   activeSection === section.id
-                    ? "bg-accent/20 text-accent hover:bg-accent/20 hover:text-accent"
+                    ? "bg-accent/20 text-accent-text hover:bg-accent/20 hover:text-accent-text"
                     : "text-muted hover:bg-hover hover:text-foreground"
                 }`}
               >
@@ -326,12 +297,17 @@ export function SettingsPage() {
           </div>
         </div>
 
-        {/* One close button for both layouts: it sits in the top-right header row either way. */}
+        {/* One close button for both layouts: it sits in the top-right header row either way.
+            Touch screens force buttons to a 44px minimum (globals.css), so a 24px box offset by
+            0.75rem grew downward and sat below the "Settings" title. The button is therefore
+            placed by its center (the translate classes), at the 48px header row's middle, so any
+            box size stays aligned. That matters at exactly 768px on touch, where the md: size
+            and the 44px minimum both apply. Phones get a 44px box. */}
         <Button
           variant="ghost"
           size="icon"
           onClick={close}
-          className="absolute top-[calc(env(safe-area-inset-top)+0.75rem)] right-4 h-6 w-6 md:right-6"
+          className="absolute top-[calc(env(safe-area-inset-top)+1.5rem)] right-[1.625rem] h-11 w-11 translate-x-1/2 -translate-y-1/2 md:right-9 md:h-6 md:w-6"
           aria-label="Close settings"
         >
           <X className="h-4 w-4" />

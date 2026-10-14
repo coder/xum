@@ -7,6 +7,7 @@ import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { installDom } from "../../../../tests/ui/dom";
+import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
 let cleanupDom: (() => void) | null = null;
 let currentClientMock: TestApiOverrides<APIClient> = {};
 
@@ -126,4 +127,43 @@ describe("ProjectAddForm", () => {
     await waitFor(() => expect(receivedSignal?.aborted).toBe(true));
     await waitFor(() => expect(onIsCreatingChange).toHaveBeenCalledWith(false));
   });
+
+  test.each([...GAP_MODES])(
+    "adding the existing clone while offline says it is not connected (%s)",
+    async (mode) => {
+      const createProject = mock(() => Promise.resolve({ success: false as const, error: "x" }));
+      const harness = createConnectionHarness(mode, () => ({
+        projects: {
+          getDefaultProjectDir: () => Promise.resolve("/tmp"),
+          create: createProject,
+          clone: () =>
+            Promise.resolve(
+              (async function* () {
+                await Promise.resolve();
+                yield {
+                  type: "error" as const,
+                  code: "destination_exists" as const,
+                  error: "Destination already exists",
+                  normalizedPath: "/tmp/repo",
+                };
+              })()
+            ),
+        },
+      }));
+      const view = render(<ProjectAddForm isOpen onSuccess={() => undefined} />, {
+        wrapper: harness.Wrapper,
+      });
+      fireEvent.click(view.getByText("Clone repo"));
+      const repoInput = view.getByPlaceholderText("owner/repo or https://github.com/...");
+      const user = userEvent.setup({ document: repoInput.ownerDocument });
+      await user.type(repoInput, "owner/repo");
+      fireEvent.click(view.getByText("Clone Project"));
+      const addButton = await view.findByText("Add this project instead");
+
+      await harness.drop();
+      fireEvent.click(addButton);
+      await view.findByText("Not connected to server");
+      expect(createProject).not.toHaveBeenCalled();
+    }
+  );
 });

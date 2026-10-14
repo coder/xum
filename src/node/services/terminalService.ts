@@ -1,5 +1,10 @@
 import * as path from "path";
-import { ensureWorkspaceScratchDir } from "@/node/runtime/workspaceScratchDir";
+import {
+  buildScratchShellPrelude,
+  ensureScratchDirForSpec,
+  resolveScratchDirSpec,
+} from "@/node/runtime/runtimeScratchDir";
+import { isMultiProject } from "@/common/utils/multiProject";
 import { EventEmitter } from "events";
 import * as fs from "fs";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
@@ -55,6 +60,17 @@ type NativeTerminalConfig =
       command?: string;
     };
 
+/**
+ * XUM_DISABLE_TERMINALS=1 refuses every terminal: no PTY or native terminal starts and no input
+ * reaches one. The bug-bash app's real-AI mode (tests/bugbash/startApp.ts) sets it, because an
+ * explorer model that follows injected text from an AI reply could otherwise type host commands.
+ */
+function assertTerminalsEnabled(): void {
+  if (process.env.XUM_DISABLE_TERMINALS === "1") {
+    throw new Error("Terminals are disabled on this server (XUM_DISABLE_TERMINALS=1)");
+  }
+}
+
 export class TerminalService {
   private readonly config: Config;
   private readonly ptyService: PTYService;
@@ -81,6 +97,13 @@ export class TerminalService {
   // Per-session activity tracking for sidebar indicator.
   // Maps sessionId -> { workspaceId, isRunning (derived from terminal title) }.
   private readonly sessionActivity = new Map<string, { workspaceId: string; isRunning: boolean }>();
+  /**
+   * Live pop-out window attach streams per session (#5673). listSessions skips these sessions so
+   * a main-window reload does not adopt a pop-out's terminal as a right-sidebar tab. In memory
+   * only: each count drops when its attach stream ends (pop-out closed, crashed or reloaded), and
+   * a backend restart starts with none.
+   */
+  private readonly popoutAttachCounts = new Map<string, number>();
   // In-flight create() reservations per workspace (see create): counted before any await so
   // archive admission gates observe startups that have not yet registered a session.
   private readonly pendingSessionCreations = new Map<string, number>();
@@ -211,7 +234,12 @@ export class TerminalService {
     ptyService: PTYService,
     private readonly secretsStore: Pick<SecretsStore, "getEffectiveSecrets"> = new SecretsStore(
       config.rootDir
-    )
+    ),
+    /**
+     * Remote runtimes get a scratch dir only with the Artifacts experiment (same rule as agent
+     * turns in turnRequestBuilder); local/worktree always get theirs.
+     */
+    private readonly isArtifactsExperimentEnabled: () => boolean = () => false
   ) {
     this.config = config;
     this.ptyService = ptyService;
@@ -219,6 +247,29 @@ export class TerminalService {
 
   setTerminalWindowManager(manager: TerminalWindowManager) {
     this.terminalWindowManager = manager;
+    // A user closing a desktop pop-out window ends its session, like closing a sidebar terminal
+    // tab (which does not ask first either). Its reload and a crash do not close the window.
+    // Windows the app closes (closeWindow, after a pop-out's shell exited, or a close-all from a
+    // caller without a session) keep their sessions, so no running command is killed by them.
+    manager.setSessionWindowClosedHandler((sessionId, closedBy) => {
+      if (closedBy === "user") this.close(sessionId);
+    });
+  }
+
+  /** Mark a session as shown in a pop-out window; call the returned function when it detaches. */
+  markPopoutAttached(sessionId: string): () => void {
+    this.popoutAttachCounts.set(sessionId, (this.popoutAttachCounts.get(sessionId) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const remaining = (this.popoutAttachCounts.get(sessionId) ?? 1) - 1;
+      if (remaining > 0) {
+        this.popoutAttachCounts.set(sessionId, remaining);
+      } else {
+        this.popoutAttachCounts.delete(sessionId);
+      }
+    };
   }
 
   /**
@@ -253,6 +304,7 @@ export class TerminalService {
 
   async create(params: TerminalCreateParams): Promise<TerminalSession> {
     if (this.shuttingDown) throw new Error("Server is shutting down");
+    assertTerminalsEnabled();
     // Reserve the startup synchronously: a creation that has passed its archived check but is
     // still awaiting metadata/secrets/PTY spawn is not yet in sessionActivity, so without this
     // reservation an archive's live-activity gate could pass and the pending creation would
@@ -342,13 +394,23 @@ export class TerminalService {
       // We intentionally skip dynamic values (like cost/model) because long-lived shells would go stale.
       const runtimeType = getRuntimeType(workspaceMetadata.runtimeConfig);
       const shouldInjectLocalEnv = runtimeType === "local" || runtimeType === "worktree";
+      // Same scratch dir as the agent's bash tool (turnRequestBuilder), on every runtime. Host
+      // dirs travel as process env; remote shells create and export theirs in a shell prelude
+      // (no extra exec before the PTY opens).
+      const scratchSpec = await resolveScratchDirSpec({
+        runtimeConfig: workspaceMetadata.runtimeConfig,
+        workspaceId: workspaceMetadata.id,
+        sessionsDir: this.config.sessionsDir,
+        runtime,
+        multiProject: isMultiProject(workspaceMetadata),
+      });
+      const scratchDir = shouldInjectLocalEnv
+        ? await ensureScratchDirForSpec(runtime, scratchSpec)
+        : undefined;
       const xumEnv = shouldInjectLocalEnv
         ? getXumEnv(workspaceMetadata.projectPath, runtimeType, workspaceMetadata.name, {
             workspaceId: workspaceMetadata.id,
-            scratchDir: await ensureWorkspaceScratchDir(
-              this.config.sessionsDir,
-              workspaceMetadata.id
-            ),
+            scratchDir,
           })
         : undefined;
 
@@ -424,7 +486,14 @@ export class TerminalService {
         onData,
         onExit,
         workspaceMetadata.runtimeConfig,
-        { env: terminalEnv, defaultShell: projectsConfig.terminalDefaultShell }
+        {
+          env: terminalEnv,
+          defaultShell: projectsConfig.terminalDefaultShell,
+          remoteShellPrelude:
+            shouldInjectLocalEnv || !this.isArtifactsExperimentEnabled()
+              ? undefined
+              : buildScratchShellPrelude(scratchSpec),
+        }
       );
 
       tempSessionId = session.sessionId;
@@ -568,6 +637,7 @@ export class TerminalService {
   }
 
   sendInput(sessionId: string, data: string): void {
+    assertTerminalsEnabled();
     try {
       this.ptyService.sendInput(sessionId, data);
 
@@ -606,6 +676,7 @@ export class TerminalService {
         log.info(
           `Opening terminal window for workspace: ${workspaceId}${sessionId ? ` (session: ${sessionId})` : ""}`
         );
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         await this.terminalWindowManager!.openTerminalWindow(workspaceId, sessionId, initialTitle);
       } else {
         log.info(
@@ -618,13 +689,13 @@ export class TerminalService {
     }
   }
 
-  closeWindow(workspaceId: string): void {
+  closeWindow(workspaceId: string, sessionId?: string): void {
     try {
       if (!this.terminalWindowManager) {
         // Not an error in server mode, just no-op
         return;
       }
-      this.terminalWindowManager.closeTerminalWindow(workspaceId);
+      this.terminalWindowManager.closeTerminalWindow(workspaceId, sessionId);
     } catch (err) {
       log.error("Error closing terminal window:", err);
       throw err;
@@ -639,6 +710,7 @@ export class TerminalService {
    * For SSH workspaces, opens a terminal that SSHs into the remote host.
    */
   async openNative(workspaceId: string): Promise<void> {
+    assertTerminalsEnabled();
     // Pending-open admission pairing (same synchronous block as the archive guard check
     // below, mirroring create()): the count is registered before any await so archive gates
     // observe the intent immediately, and it keeps hasOpenedNativeTerminal true for the
@@ -1170,10 +1242,16 @@ export class TerminalService {
 
   onExit(sessionId: string, callback: (code: number) => void): () => void {
     const emitter = this.exitEmitters.get(sessionId);
-    if (!emitter)
+    if (!emitter) {
+      // #6029: the emitter exists from before create() returns the ID until the PTY exits,
+      // so a missing one means the session already ended (or never existed). Report it now,
+      // or a late subscriber (the renderer subscribes from a mount effect) waits forever.
+      // 0 matches the renderer's "ended before the listener attached" fallback.
+      callback(0);
       return () => {
         /* no-op */
       };
+    }
 
     const handler = (code: number) => callback(code);
     emitter.on("exit", handler);
@@ -1338,11 +1416,13 @@ export class TerminalService {
   }
 
   /**
-   * Get all session IDs for a workspace.
-   * Used by frontend to discover existing sessions to reattach to after reload.
+   * Session IDs the main window may reattach to as sidebar tabs after a reload: those without a
+   * live pop-out window.
    */
   getWorkspaceSessionIds(workspaceId: string): string[] {
-    return this.ptyService.getWorkspaceSessionIds(workspaceId);
+    return this.ptyService
+      .getWorkspaceSessionIds(workspaceId)
+      .filter((sessionId) => !this.popoutAttachCounts.has(sessionId));
   }
 
   private getTrackedSessionIdsForWorkspace(workspaceId: string): string[] {

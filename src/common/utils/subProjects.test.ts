@@ -21,6 +21,82 @@ describe("subProjects", () => {
     expect(isPathDescendant("/repo", "/repo")).toBe(false);
   });
 
+  // #5917: a root project restored from an older config must not adopt every project.
+  test("never treats the filesystem root as a parent project", () => {
+    expect(isPathDescendant("/", "/repo")).toBe(false);
+    expect(isPathDescendant("//", "/repo/packages/api")).toBe(false);
+    expect(
+      deriveProjectHierarchy(
+        new Map<string, ProjectConfig>([
+          ["/", project()],
+          ["/repo", project()],
+        ])
+      ).get("/repo")?.parentProjectPath
+    ).toBeUndefined();
+  });
+
+  // #5919: a drive-root or UNC share-root project from an older config must not adopt every
+  // project on that drive or share.
+  test("never treats a Windows drive root as a parent project", () => {
+    for (const driveRoot of ["C:\\", "C:/", "C:", "c:\\\\"]) {
+      expect(isPathDescendant(driveRoot, "C:\\repo")).toBe(false);
+    }
+    const derived = deriveProjectHierarchy(
+      new Map<string, ProjectConfig>([
+        ["C:\\", project()],
+        ["C:\\repo", project()],
+      ])
+    );
+    expect(derived.get("C:\\repo")?.parentProjectPath).toBeUndefined();
+  });
+
+  test("never treats a UNC share root as a parent project", () => {
+    for (const shareRoot of ["\\\\srv\\share\\", "\\\\srv\\share", "//srv/share/"]) {
+      expect(isPathDescendant(shareRoot, "\\\\srv\\share\\repo")).toBe(false);
+    }
+    const derived = deriveProjectHierarchy(
+      new Map<string, ProjectConfig>([
+        ["\\\\srv\\share", project()],
+        ["\\\\srv\\share\\repo", project()],
+      ])
+    );
+    expect(derived.get("\\\\srv\\share\\repo")?.parentProjectPath).toBeUndefined();
+  });
+
+  // #5924: the namespaced forms of a share root are roots too.
+  test("never treats a namespaced UNC share root as a parent project", () => {
+    for (const shareRoot of [
+      "\\\\?\\UNC\\srv\\share",
+      "\\\\?\\UNC\\srv\\share\\",
+      "\\\\.\\UNC\\srv\\share",
+    ]) {
+      expect(isPathDescendant(shareRoot, `${shareRoot.replace(/\\$/, "")}\\repo`)).toBe(false);
+    }
+    expect(isPathDescendant("\\\\?\\UNC\\srv", "\\\\?\\UNC\\srv\\share")).toBe(false);
+    const derived = deriveProjectHierarchy(
+      new Map<string, ProjectConfig>([
+        ["\\\\?\\UNC\\srv\\share", project()],
+        ["\\\\?\\UNC\\srv\\share\\repo", project()],
+      ])
+    );
+    expect(derived.get("\\\\?\\UNC\\srv\\share\\repo")?.parentProjectPath).toBeUndefined();
+  });
+
+  test("still nests projects under a namespaced folder below the root", () => {
+    expect(isPathDescendant("\\\\?\\UNC\\srv\\share\\a", "\\\\?\\UNC\\srv\\share\\a\\b")).toBe(
+      true
+    );
+    expect(isPathDescendant("\\\\?\\C:\\repo", "\\\\?\\C:\\repo\\pkg")).toBe(true);
+    expect(isPathDescendant("", "/repo")).toBe(false);
+  });
+
+  test("still nests Windows projects under a non-root Windows parent", () => {
+    expect(isPathDescendant("C:\\a", "C:\\a\\b")).toBe(true);
+    // "/:" is a POSIX directory, not a drive root.
+    expect(isPathDescendant("/:", "/:/repo")).toBe(true);
+    expect(isPathDescendant("\\\\srv\\share\\a", "\\\\srv\\share\\a\\b")).toBe(true);
+  });
+
   test("treats Windows drive-letter paths as case-insensitive", () => {
     expect(isPathDescendant("C:\\Repo", "c:\\repo\\packages\\api")).toBe(true);
   });

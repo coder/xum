@@ -74,7 +74,8 @@ describe("GoalTab", () => {
     rerender(<GoalTab goal={goal({ status: "paused" })} onSetStatus={mock()} onClear={mock()} />);
     expect(getByLabelText("Resume goal")).toBeTruthy();
     expect(queryByLabelText("Pause goal")).toBeNull();
-    expect(queryByLabelText("Mark goal complete")).toBeNull();
+    // A paused goal's work can finish without a resume, so it stays completable.
+    expect(getByLabelText("Mark goal complete")).toBeTruthy();
 
     rerender(
       <GoalTab
@@ -518,6 +519,20 @@ describe("GoalTab", () => {
     expect(reopenButton.className).not.toContain("bg-accent");
     expect(getByText("Reopen")).toBeTruthy();
     expect(queryByText("Clear goal")).toBeNull();
+  });
+
+  test("a sub-agent's completed goal hides Archive (board is parent-only) but keeps Reopen", () => {
+    const { getByLabelText, queryByLabelText } = render(
+      <GoalTab
+        isChildWorkspace
+        goal={goal({ status: "complete", completionSummary: "Wrapped up." })}
+        onSetStatus={mock()}
+        onClear={mock()}
+      />
+    );
+
+    expect(queryByLabelText("Archive goal")).toBeNull();
+    expect(getByLabelText("Reopen goal")).toBeTruthy();
   });
 
   test("empty state shows the create form when onCreate is provided", () => {

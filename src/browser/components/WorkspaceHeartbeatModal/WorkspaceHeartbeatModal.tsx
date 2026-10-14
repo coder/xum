@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { HeartPulse, Loader2 } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
+import { Checkbox } from "@/browser/components/Checkbox/Checkbox";
 import {
   Dialog,
   DialogContent,
@@ -14,7 +15,6 @@ import assert from "@/common/utils/assert";
 import {
   clampIntervalMinutes,
   formatIntervalMinutes,
-  HEARTBEAT_DEFAULT_INTERVAL_MINUTES,
   HEARTBEAT_MAX_INTERVAL_MINUTES,
   HEARTBEAT_MIN_INTERVAL_MINUTES,
   intervalMinutesToMs,
@@ -131,18 +131,37 @@ function getDraftMessageForSave(value: string): string {
   return normalizeDraftMessage(value) ?? "";
 }
 
+/** A save waits for loads (a reconnect's read too: it would overwrite offline changes). */
+function isSaveBlocked(state: {
+  isLoading: boolean;
+  isReloading: boolean;
+  isSaving: boolean;
+  hasValidationError: boolean;
+}): boolean {
+  return state.isLoading || state.isReloading || state.isSaving || state.hasValidationError;
+}
+
 export function WorkspaceHeartbeatModal(props: WorkspaceHeartbeatModalProps) {
-  const { settings, isLoading, isSaving, error, save, globalDefaultPrompt } = useWorkspaceHeartbeat(
-    {
-      workspaceId: props.open ? props.workspaceId : null,
-    }
-  );
+  const {
+    settings,
+    isLoading,
+    isReloading,
+    isSaving,
+    error,
+    save,
+    globalDefaultPrompt,
+    globalDefaultIntervalMs,
+  } = useWorkspaceHeartbeat({
+    workspaceId: props.open ? props.workspaceId : null,
+  });
   const settingsContextMode = settings.contextMode ?? HEARTBEAT_DEFAULT_CONTEXT_MODE;
   // Trigger draft: unset and "idle" are semantically identical, so the modal never writes
   // "idle" explicitly — the idle option saves `trigger: null` (clear) to keep configs sparse.
   const settingsTrigger = settings.trigger ?? HEARTBEAT_DEFAULT_TRIGGER;
   const settingsWhenBusy: HeartbeatWhenBusyDraft = settings.whenBusy ?? "";
   const [draftEnabled, setDraftEnabled] = useState(false);
+  // No saved interval means the workspace follows the global default (#5692).
+  const [draftUseDefaultInterval, setDraftUseDefaultInterval] = useState(true);
   const [draftIntervalMinutes, setDraftIntervalMinutes] = useState(
     formatIntervalMinutes(HEARTBEAT_DEFAULT_INTERVAL_MS)
   );
@@ -187,7 +206,10 @@ export function WorkspaceHeartbeatModal(props: WorkspaceHeartbeatModalProps) {
     // Re-sync untouched drafts when freshly loaded settings arrive, but preserve in-progress edits.
     if (didOpen || workspaceChanged || (!draftDirty && settingsChanged)) {
       setDraftEnabled(settings.enabled);
-      setDraftIntervalMinutes(formatIntervalMinutes(settings.intervalMs));
+      setDraftUseDefaultInterval(settings.intervalMs == null);
+      setDraftIntervalMinutes(
+        formatIntervalMinutes(settings.intervalMs ?? globalDefaultIntervalMs)
+      );
       setDraftContextMode(settingsContextMode);
       setDraftTrigger(settingsTrigger);
       setDraftWhenBusy(settingsWhenBusy);
@@ -204,6 +226,7 @@ export function WorkspaceHeartbeatModal(props: WorkspaceHeartbeatModalProps) {
     }
   }, [
     draftDirty,
+    globalDefaultIntervalMs,
     isLoading,
     props.open,
     props.workspaceId,
@@ -215,7 +238,10 @@ export function WorkspaceHeartbeatModal(props: WorkspaceHeartbeatModalProps) {
     settingsWhenBusy,
   ]);
 
-  const validationError = getValidationErrorMessage(draftIntervalMinutes);
+  // The global default was validated when it was saved; only an override needs checking.
+  const validationError = draftUseDefaultInterval
+    ? null
+    : getValidationErrorMessage(draftIntervalMinutes);
   // Effective whenBusy when left unset — follows the draft trigger live so switching to a
   // fixed schedule immediately shows "Default (Send after turn)".
   const effectiveDefaultWhenBusy = resolveHeartbeatSchedulePolicy({
@@ -224,7 +250,12 @@ export function WorkspaceHeartbeatModal(props: WorkspaceHeartbeatModalProps) {
   const errorMessages = [validationError, error].filter(
     (message): message is string => message != null
   );
-  const hasBlockingError = isLoading || isSaving || validationError != null;
+  const hasBlockingError = isSaveBlocked({
+    isLoading,
+    isReloading,
+    isSaving,
+    hasValidationError: validationError != null,
+  });
 
   const handleIntervalBlur = () => {
     const parsedMinutes = parseIntervalMinutes(draftIntervalMinutes);
@@ -240,7 +271,10 @@ export function WorkspaceHeartbeatModal(props: WorkspaceHeartbeatModalProps) {
     }
   };
 
-  const handleSave = async () => {
+  const getDraftIntervalMsForSave = (): number | undefined => {
+    if (draftUseDefaultInterval) {
+      return undefined;
+    }
     const parsedMinutes = parseIntervalMinutes(draftIntervalMinutes);
     assert(parsedMinutes != null, "Save should only run with a valid heartbeat interval");
     assert(
@@ -248,10 +282,15 @@ export function WorkspaceHeartbeatModal(props: WorkspaceHeartbeatModalProps) {
         parsedMinutes <= HEARTBEAT_MAX_INTERVAL_MINUTES,
       "Save should only run with a heartbeat interval inside the supported range"
     );
+    return intervalMinutesToMs(parsedMinutes);
+  };
 
+  const handleSave = async () => {
+    const intervalMs = getDraftIntervalMsForSave();
     const didSave = await save({
       enabled: draftEnabled,
-      intervalMs: intervalMinutesToMs(parsedMinutes),
+      // Absent means "use the global default" and clears a saved override.
+      ...(intervalMs != null ? { intervalMs } : {}),
       contextMode: draftContextMode,
       // Always send both keys: an explicit value persists, null clears back to unset so the
       // effective value keeps following the read-time defaults (see
@@ -286,9 +325,16 @@ export function WorkspaceHeartbeatModal(props: WorkspaceHeartbeatModalProps) {
             <div className="min-h-0 space-y-4 overflow-y-auto px-6 py-5">
               <p className="text-muted max-w-3xl text-sm">
                 Schedule future background follow-ups for this workspace. Valid range:{" "}
-                {HEARTBEAT_MIN_INTERVAL_MINUTES}–{HEARTBEAT_MAX_INTERVAL_MINUTES} minutes. New
-                workspaces default to {HEARTBEAT_DEFAULT_INTERVAL_MINUTES} minutes unless you change
-                them.
+                {HEARTBEAT_MIN_INTERVAL_MINUTES}–{HEARTBEAT_MAX_INTERVAL_MINUTES} minutes.{" "}
+                {/* The global default applies to every workspace without its own saved interval,
+                    not only to new ones (loop round-2 triage). Left out when the config could
+                    not load: the built-in default may not be the configured one (#5704). */}
+                {globalDefaultIntervalMs != null && (
+                  <>
+                    Workspaces without their own interval use{" "}
+                    {formatIntervalMinutes(globalDefaultIntervalMs)} minutes.
+                  </>
+                )}
               </p>
 
               {/* Keep custom heartbeat instructions visible even when disabled so prompts can be edited before scheduling resumes. */}
@@ -331,12 +377,36 @@ export function WorkspaceHeartbeatModal(props: WorkspaceHeartbeatModalProps) {
                           setDraftDirty(true);
                         }}
                         onBlur={handleIntervalBlur}
-                        disabled={isSaving}
+                        disabled={isSaving || draftUseDefaultInterval}
                         className="border-border-medium bg-background-secondary h-9 w-24 text-right"
                         aria-label="Heartbeat interval in minutes"
                       />
                       <span className="text-muted text-sm">min</span>
                     </div>
+                  </div>
+                  <div className="mt-2 flex items-center gap-2">
+                    <Checkbox
+                      id="workspace-heartbeat-use-default-interval"
+                      checked={draftUseDefaultInterval}
+                      onCheckedChange={(checked) => {
+                        const useDefault = checked === true;
+                        setDraftUseDefaultInterval(useDefault);
+                        if (useDefault) {
+                          setDraftIntervalMinutes(formatIntervalMinutes(globalDefaultIntervalMs));
+                        }
+                        setDraftDirty(true);
+                      }}
+                      disabled={isSaving}
+                    />
+                    <label
+                      htmlFor="workspace-heartbeat-use-default-interval"
+                      className="text-muted text-xs"
+                    >
+                      Use the global default
+                      {/* Like the intro sentence: name the value only when the config loaded (#5704). */}
+                      {globalDefaultIntervalMs != null &&
+                        ` (${formatIntervalMinutes(globalDefaultIntervalMs)} min)`}
+                    </label>
                   </div>
 
                   <div className="mt-4 space-y-2">

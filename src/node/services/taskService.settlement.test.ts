@@ -1,5 +1,6 @@
 import * as path from "path";
 import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import * as fsPromises from "fs/promises";
 import {
   TASK_CREATE_WAIT_WARNING_MS,
@@ -20,6 +21,7 @@ import {
 } from "@/node/services/subagentReportArtifacts";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import {
+  TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE,
   taskRecoveryPromptDedupeKey,
   taskRecoveryPromptDedupePrefix,
 } from "@/constants/agentMessaging";
@@ -721,6 +723,8 @@ describe("TaskService", () => {
       expect(internal).toMatchObject({
         queueDedupeKey: taskRecoveryPromptDedupeKey(t.childId, "timeout-finalization"),
         removableQueueDedupeKey: true,
+        // An automatic report prompt: it cannot create or replace the child's goal.
+        taskTurnKind: "required_report",
       });
     });
 
@@ -851,6 +855,9 @@ describe("TaskService", () => {
             );
           }),
           buildMemorySessionContext: mock(() => Promise.resolve(null)),
+          isExperimentEnabled: mock(
+            (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET || id === EXPERIMENT_IDS.MEMORY
+          ),
         },
       });
       const { session } = sessionHarness;
@@ -906,7 +913,6 @@ describe("TaskService", () => {
             await session.sendMessage("Research the topic and report.", {
               model: childModel,
               agentId: "exec",
-              experiments: { tokenBudget: true, memory: true },
             })
           ).success
         ).toBe(true);
@@ -1922,7 +1928,7 @@ describe("TaskService", () => {
       }
     });
 
-    test("failed reactivation leaves a concurrently reawakened attempt owned", async () => {
+    test("a resume racing a reactivation loses; one after the failed reactivation stays owned", async () => {
       const taskId = "task-outcome-reactivation-superseded";
       const { config } = await setupTree([
         {
@@ -1938,12 +1944,12 @@ describe("TaskService", () => {
       expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
         kind: "terminal-no-report",
       });
-      let reawaken: Promise<boolean> | undefined;
+      let racing: ReturnType<TaskService["reawakenInterruptedTask"]> | undefined;
       const metadata = spyOn(aiService, "getWorkspaceMetadata").mockImplementationOnce(() => {
-        // Direct input can reawaken while the rejected task send is awaiting metadata. Its
-        // identity CAS serializes on the task-creation lock createWorkspaceTurn holds here, so
-        // it completes right after the rejected send releases it.
-        reawaken = taskService.markInterruptedTaskRunning(taskId);
+        // Direct input arrives while the reactivation's send is awaiting metadata: its attempt
+        // is published but not yet handed to a send, so the resume must not rotate it (it
+        // cannot know the launch will fail).
+        racing = taskService.reawakenInterruptedTask(taskId);
         return Promise.resolve(Err("owner metadata unavailable"));
       });
       try {
@@ -1955,7 +1961,12 @@ describe("TaskService", () => {
             "tool-end"
           )
         ).toMatchObject({ success: false, error: { code: "send_failed" } });
-        expect(await reawaken).toBe(true);
+        expect(await racing).toEqual({
+          kind: "refused",
+          message: TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE,
+        });
+        // The failed reactivation leaves nothing live: the user's retry reawakens and owns.
+        expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
         expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
           kind: "live",
           executionId: taskId,

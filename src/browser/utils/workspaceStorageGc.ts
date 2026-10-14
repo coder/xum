@@ -19,8 +19,8 @@
  * - Only keys of stable-format workspace ids are ever collected (see
  *   findOrphanedWorkspaceStorageKeys). Creation-draft scopes are never collected here; the
  *   creation-draft pass (creationDraftStorageGc.ts) checks them against the backend draft list.
- * - Keys are removed through removePersistedStateKeys so mounted usePersistedState consumers and
- *   write listeners observe the removal instead of writing a stale value back.
+ * - Keys are removed through removePersistedStateKeys so mounted usePersistedState consumers
+ *   observe the removal instead of writing a stale value back.
  *
  * Known limitation: localStorage is per origin. Two XUM roots served on the same origin over time
  * (e.g. dev servers reusing a port) share it, so GC under one root removes the other root's

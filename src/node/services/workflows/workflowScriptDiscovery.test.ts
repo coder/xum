@@ -28,7 +28,7 @@ async function writePluginWithWorkflow(workspacePath: string, pluginName: string
 describe("discoverWorkflowScripts (agent plugins)", () => {
   // Generous timeout: discovery probes every built-in/global skill for a
   // workflow.js entry, which is slow on machines with many installed skills.
-  test("enumerates plugin workflows/ contributions only when the experiment is enabled", async () => {
+  test("enumerates plugin workflows/ contributions", async () => {
     using tempDir = new TestTempDir("workflow-discovery-plugin");
     await writePluginWithWorkflow(tempDir.path, "my-unique-fixture-plugin");
 
@@ -38,17 +38,12 @@ describe("discoverWorkflowScripts (agent plugins)", () => {
       projectTrusted: true,
     };
 
-    const withPlugins = await discoverWorkflowScripts({ ...input, includeAgentPlugins: true });
-    const pluginEntry = withPlugins.find(
+    const discovered = await discoverWorkflowScripts(input);
+    const pluginEntry = discovered.find(
       (workflow) => workflow.scriptPath === "plugin://my-unique-fixture-plugin/release.js"
     );
     expect(pluginEntry).toBeDefined();
     expect(pluginEntry?.descriptor.sourceKind).toBe("plugin");
     expect(pluginEntry?.descriptor.scope).toBe("project");
-
-    const withoutPlugins = await discoverWorkflowScripts(input);
-    expect(withoutPlugins.some((workflow) => workflow.scriptPath.startsWith("plugin://"))).toBe(
-      false
-    );
   }, 60_000);
 });

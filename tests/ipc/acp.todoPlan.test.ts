@@ -140,43 +140,6 @@ function getUserTextChunks(sessionUpdates: SessionNotification[]): string[] {
   });
 }
 
-function makeAdvisorOutput(toolCallId: string, text: string): WorkspaceChatMessage {
-  return {
-    type: "advisor-output",
-    workspaceId: "workspace-1",
-    toolCallId,
-    text,
-    timestamp: 3,
-  } as WorkspaceChatMessage;
-}
-
-function getToolUpdateContent(sessionUpdates: SessionNotification[]): string[] {
-  return sessionUpdates.flatMap((notification) => {
-    if (notification.update.sessionUpdate !== "tool_call_update") {
-      return [];
-    }
-
-    const content = notification.update.content ?? [];
-    return content.flatMap((block) => {
-      if (block.type !== "content" || block.content.type !== "text") {
-        return [];
-      }
-      return [block.content.text];
-    });
-  });
-}
-
-describe("ACP advisor output translation", () => {
-  it("forwards live advisor output as tool updates", async () => {
-    const { translator, sessionUpdates } = createHarness();
-
-    await forwardEvents(translator, [makeAdvisorOutput("advisor-call-1", "partial advice")]);
-
-    expect(getUpdateKinds(sessionUpdates)).toEqual(["tool_call_update"]);
-    expect(getToolUpdateContent(sessionUpdates)).toEqual(["partial advice"]);
-  });
-});
-
 describe("ACP todo_write plan translation", () => {
   it("emits ACP plan updates from todo_write tool input", async () => {
     const { translator, sessionUpdates } = createHarness();

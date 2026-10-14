@@ -1,7 +1,7 @@
 import React from "react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
@@ -15,6 +15,7 @@ import type { MuxMessage } from "@/common/types/message";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { useResumeStream } from "./useResumeStream";
 import { createTestApiClient } from "@/browser/testUtils";
+import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
 
 const DEFAULT_WORKSPACE_ID = "ws-1";
 
@@ -150,4 +151,19 @@ describe("useResumeStream", () => {
 
     expect(view.queryByTestId("resume-error")).toBeNull();
   });
+
+  // useAPI() keeps the last client while reconnecting (kept-gap): resume must still see "offline".
+  test.each([...GAP_MODES])(
+    "while the connection is down (%s), resume shows the offline error",
+    async (mode) => {
+      const harness = createConnectionHarness(mode, () => ({ workspace: { resumeStream } }));
+      const { result } = renderHook(() => useResumeStream(DEFAULT_WORKSPACE_ID, "turn-1", []), {
+        wrapper: harness.Wrapper,
+      });
+      await harness.drop();
+      await act(() => result.current.resume());
+      expect(result.current.error).toBe("Not connected to server");
+      expect(resumeStream).not.toHaveBeenCalled();
+    }
+  );
 });

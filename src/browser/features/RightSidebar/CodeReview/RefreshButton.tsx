@@ -119,7 +119,7 @@ export const RefreshButton: React.FC<RefreshButtonProps> = (props) => {
             disabled
               ? "text-muted/40 cursor-not-allowed"
               : animationState === "spinning"
-                ? "text-accent cursor-default hover:text-accent"
+                ? "text-accent-text cursor-default hover:text-accent-text"
                 : refreshStatus === "error"
                   ? "text-danger-soft cursor-pointer hover:text-foreground"
                   : "text-muted cursor-pointer hover:text-foreground",

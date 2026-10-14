@@ -4,6 +4,7 @@ import { beforeEach, afterEach, describe, expect, mock, test } from "bun:test";
 import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
 import { QuotaLimitedStorage, restartLocalStorage } from "../../../tests/ui/quotaLimitedStorage";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import type { WorkspaceContext } from "./WorkspaceContext";
 import { WorkspaceProvider, useWorkspaceContext } from "./WorkspaceContext";
@@ -11,38 +12,30 @@ import { ProjectProvider, useProjectContext } from "@/browser/contexts/ProjectCo
 import { RouterProvider } from "@/browser/contexts/RouterContext";
 import { useWorkspaceStoreRaw as getWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import {
-  DEFAULT_MODEL_KEY,
-  HIDDEN_MODELS_KEY,
-  RUNTIME_ENABLEMENT_KEY,
   LAST_VISITED_ROUTE_KEY,
-  LAUNCH_BEHAVIOR_KEY,
   SELECTED_WORKSPACE_KEY,
-  getAgentIdKey,
   getDraftScopeId,
-  getModelKey,
+  getAutoExpandPrefsKey,
   getRightSidebarLayoutKey,
   getTerminalTitlesKey,
-  getThinkingLevelKey,
+  type LaunchBehavior,
 } from "@/common/constants/storage";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
-import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
-import {
-  readPersistedState,
-  syncPersistedStateFromBackend,
-  updatePersistedState,
-} from "@/browser/hooks/usePersistedState";
+import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
 import {
-  markAiSelectionIntent,
-  resetAiSelectionIntentForTests,
+  getWorkspaceAgentId,
+  getWorkspaceAiMetadata,
+  setWorkspaceAgentPick,
 } from "@/browser/utils/aiSelectionIntent";
 import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 import { resetWorkspaceStorageGcForTests } from "@/browser/utils/workspaceStorageGc";
 import { resetCreationDraftStorageGcForTests } from "@/browser/utils/creationDraftStorageGc";
 
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { createConnectionHarness, GAP_MODES, type GapMode } from "./connection.testHarness";
 import * as path from "path";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: drafts run against the real backend service
 import { Config } from "@/node/config";
@@ -95,147 +88,8 @@ describe("WorkspaceContext", () => {
     restoreDomGlobals();
 
     currentClientMock = {};
+    getAppConfigStore().updateOptimistically({ userPreferences: undefined });
   });
-
-  test.each(["resolves", "rejects", "stalls"])(
-    "hydrates preferences when migration persistence %s",
-    async (writeState) => {
-      const seeded = ["openai:daybreak-blue-latest", "openai:daybreak-red-latest"];
-      const legacyHidden = "openrouter:openai/gpt-5";
-      const defaultModel = "openai:gpt-5.6-terra";
-      createMockAPI({
-        localStorage: {
-          [HIDDEN_MODELS_KEY]: JSON.stringify([legacyHidden]),
-          [DEFAULT_MODEL_KEY]: JSON.stringify(defaultModel),
-          [RUNTIME_ENABLEMENT_KEY]: JSON.stringify({ ssh: true }),
-        },
-      });
-      const updateModelPreferences = mock(() => {
-        if (writeState === "stalls") return new Promise<void>(() => undefined);
-        if (writeState === "rejects") return Promise.reject(new Error("config write failed"));
-        return Promise.resolve();
-      });
-      const cfg = await createMockORPCClient().config.getConfig();
-      currentClientMock.config = {
-        getConfig: () =>
-          Promise.resolve({
-            ...cfg,
-            hiddenModels: seeded,
-            hiddenModelsInitialized: false,
-            runtimeEnablement: { ssh: false },
-          }),
-        updateModelPreferences,
-      };
-      await setup();
-      await waitFor(() => {
-        expect(readPersistedState<string[]>(HIDDEN_MODELS_KEY, [])).toEqual([
-          ...seeded,
-          legacyHidden,
-        ]);
-      });
-      expect(updateModelPreferences).toHaveBeenCalledWith({
-        defaultModel,
-        hiddenModels: [...seeded, legacyHidden],
-      });
-      expect(readPersistedState(DEFAULT_MODEL_KEY, "")).toBe(defaultModel);
-      expect(readPersistedState(RUNTIME_ENABLEMENT_KEY, {})).toEqual({ ssh: false });
-    }
-  );
-
-  test.each(
-    ["local", "cross-tab", "cross-tab-delayed"].flatMap((source) =>
-      (source === "cross-tab-delayed"
-        ? ["hidden", "default"]
-        : ["hidden", "default", "hidden-aba", "default-aba"]
-      ).map((changed) => [source, changed])
-    )
-  )(
-    "keeps %s %s preference edits ahead of stale startup config until reconnect",
-    async (source, changed) => {
-      const blue = "openai:daybreak-blue-latest";
-      const red = "openai:daybreak-red-latest";
-      const legacyHidden = "openrouter:openai/gpt-5";
-      const legacyDefault = "openai:gpt-5.6-terra";
-      const chosenDefault = "anthropic:claude-opus-4-6";
-      createMockAPI({
-        localStorage: {
-          [HIDDEN_MODELS_KEY]: JSON.stringify([legacyHidden]),
-          [DEFAULT_MODEL_KEY]: JSON.stringify(legacyDefault),
-        },
-      });
-      const cfg = await createMockORPCClient().config.getConfig();
-      let resolveConfig!: (value: typeof cfg) => void;
-      const pendingConfig = new Promise<typeof cfg>((resolve) => {
-        resolveConfig = resolve;
-      });
-      const updateModelPreferences = mock(() => Promise.resolve());
-      currentClientMock.config = { getConfig: () => pendingConfig, updateModelPreferences };
-      await setup();
-      const writePreference = (key: string, value: unknown) => {
-        if (source === "local") {
-          updatePersistedState(key, value);
-          return;
-        }
-        // Seed the shared value without emitting a local write in this tab.
-        syncPersistedStateFromBackend(key, value);
-        if (source === "cross-tab-delayed") return;
-        window.dispatchEvent(
-          new window.StorageEvent("storage", { key, storageArea: window.localStorage })
-        );
-      };
-      act(() => {
-        if (changed.startsWith("default")) {
-          writePreference(DEFAULT_MODEL_KEY, chosenDefault);
-          if (changed === "default-aba") writePreference(DEFAULT_MODEL_KEY, legacyDefault);
-        } else {
-          writePreference(HIDDEN_MODELS_KEY, [red, legacyHidden]);
-          if (changed === "hidden-aba") writePreference(HIDDEN_MODELS_KEY, [legacyHidden]);
-        }
-      });
-      resolveConfig({
-        ...cfg,
-        hiddenModels: [blue, red],
-        hiddenModelsInitialized: false,
-        runtimeEnablement: { ssh: false },
-      });
-      await waitFor(() =>
-        expect(readPersistedState(RUNTIME_ENABLEMENT_KEY, {})).toEqual({ ssh: false })
-      );
-      expect(readPersistedState(DEFAULT_MODEL_KEY, "")).toBe(
-        changed === "default" ? chosenDefault : legacyDefault
-      );
-      expect(readPersistedState<string[]>(HIDDEN_MODELS_KEY, [])).toEqual(
-        changed.startsWith("default")
-          ? [blue, red, legacyHidden]
-          : changed === "hidden"
-            ? [red, legacyHidden]
-            : [legacyHidden]
-      );
-      expect(updateModelPreferences).toHaveBeenCalledWith(
-        changed.startsWith("default")
-          ? { hiddenModels: [blue, red, legacyHidden] }
-          : { defaultModel: legacyDefault }
-      );
-
-      cleanup();
-      getWorkspaceStoreRaw().dispose();
-      currentClientMock.config = {
-        getConfig: () =>
-          Promise.resolve({
-            ...cfg,
-            defaultModel: legacyDefault,
-            hiddenModels: [],
-            hiddenModelsInitialized: true,
-          }),
-        updateModelPreferences,
-      };
-      await setup();
-      await waitFor(() =>
-        expect(readPersistedState<string[] | null>(HIDDEN_MODELS_KEY, null)).toEqual([])
-      );
-      expect(readPersistedState(DEFAULT_MODEL_KEY, "")).toBe(legacyDefault);
-    }
-  );
 
   test("syncs workspace store subscriptions when metadata loads", async () => {
     const initialWorkspaces: FrontendWorkspaceMetadata[] = [
@@ -278,6 +132,24 @@ describe("WorkspaceContext", () => {
     expect(ctx().loaded).toBe(false);
     expect(ctx().loadError).toContain("workspace metadata unavailable");
     expect(ctx().workspaceMetadata.size).toBe(0);
+  });
+
+  test("a metadata stream that ends before its snapshot still ends startup loading", async () => {
+    const { workspace: workspaceApi } = createMockAPI();
+    workspaceApi.onMetadata.mockImplementation(() =>
+      Promise.resolve(
+        // eslint-disable-next-line require-yield
+        (async function* () {
+          await Promise.resolve();
+        })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+      )
+    );
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().loading).toBe(false));
+    expect(ctx().loaded).toBe(false);
+    expect(ctx().loadError).toBeTruthy();
   });
 
   test("subscribes to new workspace immediately when metadata event fires", async () => {
@@ -381,9 +253,7 @@ describe("WorkspaceContext", () => {
       projects: {
         list: () => Promise.resolve([]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: `/workspace/${childId}`,
     });
 
@@ -432,9 +302,7 @@ describe("WorkspaceContext", () => {
       projects: {
         list: () => Promise.resolve([]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: `/workspace/${workspaceId}`,
     });
 
@@ -490,9 +358,7 @@ describe("WorkspaceContext", () => {
       projects: {
         list: () => Promise.resolve([]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: `/workspace/${workspaceId}`,
     });
 
@@ -547,9 +413,7 @@ describe("WorkspaceContext", () => {
       projects: {
         list: () => Promise.resolve([]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: `/workspace/${archivedId}`,
     });
 
@@ -626,9 +490,7 @@ describe("WorkspaceContext", () => {
       projects: {
         list: () => Promise.resolve([]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       // Parent is selected, not the child
       locationPath: `/workspace/${parentId}`,
     });
@@ -676,49 +538,16 @@ describe("WorkspaceContext", () => {
       });
       await setup();
       await waitFor(() => expect(processed).toBe(true));
-      expect(readPersistedState<string | null>(getModelKey(workspaceId), null)).toBe(
-        archived ? null : "openai:gpt-5.2"
-      );
-      expect(readPersistedState<string | null>(getThinkingLevelKey(workspaceId), null)).toBe(
-        archived ? null : "xhigh"
+      expect(getWorkspaceAiMetadata(workspaceId)?.aiSettings?.model).toBe(
+        archived ? undefined : "openai:gpt-5.2"
       );
     }
   );
 
-  test("seeds model + thinking localStorage from backend metadata", async () => {
-    const initialWorkspaces: FrontendWorkspaceMetadata[] = [
-      createWorkspaceMetadata({
-        id: "ws-ai",
-        aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "xhigh" },
-      }),
-    ];
-
-    createMockAPI({
-      workspace: {
-        list: () => Promise.resolve(initialWorkspaces),
-      },
-      localStorage: {
-        // Seed with different values; backend should win.
-        [getModelKey("ws-ai")]: JSON.stringify("anthropic:claude-3.5"),
-        [getThinkingLevelKey("ws-ai")]: JSON.stringify("low"),
-      },
-    });
-
-    const ctx = await setup();
-
-    await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
-
-    expect(JSON.parse(globalThis.localStorage.getItem(getModelKey("ws-ai"))!)).toBe(
-      "openai:gpt-5.2"
-    );
-    expect(JSON.parse(globalThis.localStorage.getItem(getThinkingLevelKey("ws-ai"))!)).toBe(
-      "xhigh"
-    );
-  });
-  test.each(["unchanged", "mode", "model"])("keeps local choices: %s", async (change) => {
+  test.each(["unchanged", "mode", "model"])("keeps an unsent agent pick: %s", async (change) => {
     const changed = change !== "unchanged";
     const nextAgentId = change === "mode" ? "auto" : "plan";
-    const workspaceId = "ws-agent-main";
+    const workspaceId = `ws-agent-main-${change}`;
     const saved = createWorkspaceMetadata({
       id: workspaceId,
       agentId: "plan",
@@ -744,21 +573,16 @@ describe("WorkspaceContext", () => {
             })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
           ),
       },
-      localStorage: {
-        [getAgentIdKey(workspaceId)]: JSON.stringify("exec"),
-      },
     });
 
     const ctx = await setup();
 
     await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
     await waitFor(() => expect(emitMetadata).toBeTruthy());
-    expect(readPersistedState(getAgentIdKey(workspaceId), "")).toBe("plan");
-    expect(readPersistedState(getModelKey(workspaceId), "")).toBe("openai:gpt-5.2");
+    expect(getWorkspaceAgentId(workspaceId)).toBe("plan");
 
     act(() => {
-      updatePersistedState(getAgentIdKey(workspaceId), "exec");
-      updatePersistedState(getModelKey(workspaceId), "anthropic:claude-opus-4-6");
+      setWorkspaceAgentPick(workspaceId, "exec");
       emitMetadata?.({
         workspaceId,
         metadata: {
@@ -779,11 +603,10 @@ describe("WorkspaceContext", () => {
     await waitFor(() =>
       expect(ctx().workspaceMetadata.get(workspaceId)?.title).toBe("Updated title")
     );
-    expect(readPersistedState(getAgentIdKey(workspaceId), "")).toBe("exec");
-    expect(readPersistedState(getModelKey(workspaceId), "")).toBe("anthropic:claude-opus-4-6");
+    expect(getWorkspaceAgentId(workspaceId)).toBe("exec");
   });
 
-  test("child workspace metadata still seeds the locked backend agent", async () => {
+  test("child workspace metadata resolves the locked backend agent", async () => {
     const workspaceId = "ws-agent-child";
 
     createMockAPI({
@@ -793,64 +616,18 @@ describe("WorkspaceContext", () => {
             createWorkspaceMetadata({
               id: workspaceId,
               parentWorkspaceId: "ws-parent",
+              agentId: "exec",
               agentType: "plan",
             }),
           ]),
       },
-      localStorage: {
-        [getAgentIdKey(workspaceId)]: JSON.stringify("exec"),
-      },
     });
 
     const ctx = await setup();
 
     await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
 
-    expect(readPersistedState<string | undefined>(getAgentIdKey(workspaceId), undefined)).toBe(
-      "plan"
-    );
-  });
-
-  test.each([
-    { name: "keeps a pending Exec pick", pickAgent: "exec", expectedModel: "openai:gpt-5.2" },
-    {
-      name: "reseeds over a Plan-scoped pick",
-      pickAgent: "plan",
-      expectedModel: "anthropic:claude-opus-4-6",
-    },
-  ])("child metadata reseed $name", async (row) => {
-    const workspaceId = "ws-pick-child";
-    createMockAPI({
-      workspace: {
-        list: () =>
-          Promise.resolve([
-            createWorkspaceMetadata({
-              id: workspaceId,
-              parentWorkspaceId: "ws-parent",
-              agentId: "exec",
-              aiSettingsByAgent: {
-                exec: { model: "anthropic:claude-opus-4-6", thinkingLevel: "high" },
-              },
-            }),
-          ]),
-      },
-      localStorage: {
-        [getAgentIdKey(workspaceId)]: JSON.stringify(row.pickAgent),
-        [getModelKey(workspaceId)]: JSON.stringify("openai:gpt-5.2"),
-        [getThinkingLevelKey(workspaceId)]: JSON.stringify("low"),
-      },
-    });
-    // A deliberate, not yet sent pick made while the child's active agent was row.pickAgent.
-    resetAiSelectionIntentForTests();
-    markAiSelectionIntent(workspaceId, "model", "openai:gpt-5.2");
-
-    const ctx = await setup();
-    await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
-
-    expect(readPersistedState(getModelKey(workspaceId), "")).toBe(row.expectedModel);
-    // Fields without a pending pick always follow the backend.
-    expect(readPersistedState(getThinkingLevelKey(workspaceId), "")).toBe("high");
-    resetAiSelectionIntentForTests();
+    expect(getWorkspaceAgentId(workspaceId)).toBe("plan");
   });
 
   test("loads workspace metadata on mount", async () => {
@@ -883,6 +660,135 @@ describe("WorkspaceContext", () => {
 
     await waitFor(() => expect(ctx().loading).toBe(false));
     expect(ctx().workspaceMetadata.size).toBe(0);
+  });
+
+  test("startup state comes from the metadata stream, not a separate stale list", async () => {
+    const staleList = Promise.withResolvers<FrontendWorkspaceMetadata[]>();
+    createMockAPI({
+      // A list() requested before a change answers without it, even if it resolves late.
+      metadataSnapshot: () =>
+        Promise.resolve([createWorkspaceMetadata({ id: "ws-1", title: "renamed" })]),
+      workspace: {
+        list: () => staleList.promise,
+        onMetadata: () =>
+          Promise.resolve(
+            (async function* () {
+              await Promise.resolve();
+              yield {
+                workspaceId: "ws-1",
+                metadata: createWorkspaceMetadata({ id: "ws-1", title: "renamed again" }),
+              };
+            })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+          ),
+      },
+    });
+
+    const ctx = await setup();
+    await waitFor(() => expect(ctx().workspaceMetadata.get("ws-1")?.title).toBe("renamed again"));
+    await act(async () => {
+      staleList.resolve([createWorkspaceMetadata({ id: "ws-1", title: "original" })]);
+      await staleList.promise;
+    });
+    expect(ctx().workspaceMetadata.get("ws-1")?.title).toBe("renamed again");
+  });
+
+  test("metadata updates keep applying while the post-snapshot projects refresh is pending", async () => {
+    const projectsList =
+      Promise.withResolvers<Awaited<ReturnType<APIClient["projects"]["list"]>>>();
+    createMockAPI({
+      metadataSnapshot: () =>
+        Promise.resolve([createWorkspaceMetadata({ id: "ws-1", title: "original" })]),
+      workspace: {
+        onMetadata: () =>
+          Promise.resolve(
+            (async function* () {
+              await Promise.resolve();
+              yield {
+                workspaceId: "ws-1",
+                metadata: createWorkspaceMetadata({ id: "ws-1", title: "renamed" }),
+              };
+            })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+          ),
+      },
+      projects: { list: () => projectsList.promise },
+    });
+
+    const ctx = await setup();
+    await waitFor(() => expect(ctx().workspaceMetadata.get("ws-1")?.title).toBe("renamed"));
+    expect(ctx().loading).toBe(true);
+    await act(async () => {
+      projectsList.resolve([]);
+      await projectsList.promise;
+    });
+    await waitFor(() => expect(ctx().loading).toBe(false));
+  });
+
+  test("refreshWorkspaceMetadata keeps rows a later update changed or deleted", async () => {
+    const releaseUpdates = Promise.withResolvers<void>();
+    const refreshList = Promise.withResolvers<FrontendWorkspaceMetadata[]>();
+    createMockAPI({
+      metadataSnapshot: () =>
+        Promise.resolve([
+          createWorkspaceMetadata({ id: "ws-1", title: "original" }),
+          createWorkspaceMetadata({ id: "ws-2" }),
+        ]),
+      workspace: {
+        list: () => refreshList.promise,
+        onMetadata: () =>
+          Promise.resolve(
+            (async function* () {
+              await releaseUpdates.promise;
+              yield {
+                workspaceId: "ws-1",
+                metadata: createWorkspaceMetadata({ id: "ws-1", title: "renamed" }),
+              };
+              yield { workspaceId: "ws-2", metadata: null };
+            })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+          ),
+      },
+    });
+
+    const ctx = await setup();
+    await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(2));
+    let refresh: Promise<void> | undefined;
+    act(() => {
+      refresh = ctx().refreshWorkspaceMetadata();
+    });
+    releaseUpdates.resolve();
+    await waitFor(() => expect(ctx().workspaceMetadata.has("ws-2")).toBe(false));
+    await act(async () => {
+      refreshList.resolve([
+        createWorkspaceMetadata({ id: "ws-1", title: "original" }),
+        createWorkspaceMetadata({ id: "ws-2" }),
+        createWorkspaceMetadata({ id: "ws-3" }),
+      ]);
+      await refresh;
+    });
+    expect(ctx().workspaceMetadata.get("ws-1")?.title).toBe("renamed");
+    expect(ctx().workspaceMetadata.has("ws-2")).toBe(false);
+    expect(ctx().workspaceMetadata.has("ws-3")).toBe(true);
+  });
+
+  test("refreshWorkspaceMetadata drops a list that a later snapshot superseded", async () => {
+    const snapshot = Promise.withResolvers<FrontendWorkspaceMetadata[]>();
+    const refreshList = Promise.withResolvers<FrontendWorkspaceMetadata[]>();
+    createMockAPI({
+      metadataSnapshot: () => snapshot.promise,
+      workspace: { list: () => refreshList.promise },
+    });
+
+    const ctx = await setup();
+    let refresh: Promise<void> | undefined;
+    act(() => {
+      refresh = ctx().refreshWorkspaceMetadata();
+    });
+    snapshot.resolve([createWorkspaceMetadata({ id: "ws-1", title: "current" })]);
+    await waitFor(() => expect(ctx().workspaceMetadata.get("ws-1")?.title).toBe("current"));
+    await act(async () => {
+      refreshList.resolve([createWorkspaceMetadata({ id: "ws-1", title: "stale" })]);
+      await refresh;
+    });
+    expect(ctx().workspaceMetadata.get("ws-1")?.title).toBe("current");
   });
 
   test("refreshWorkspaceMetadata reloads workspace data", async () => {
@@ -945,9 +851,7 @@ describe("WorkspaceContext", () => {
       workspace: {
         list: () => Promise.resolve(initialWorkspaces),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: "/workspace/ws-remove",
     });
 
@@ -959,6 +863,45 @@ describe("WorkspaceContext", () => {
     await ctx().removeWorkspace("ws-remove");
 
     await waitFor(() => expect(ctx().selectedWorkspace).toBeNull());
+    expect(ctx().pendingNewWorkspaceProject).toBe("/remove");
+  });
+
+  // #5190: removing the selected sub-agent returns to its parent, not the project page.
+  test.each([
+    { name: "returns to the parent when the removed sub-agent was selected", selected: "ws-child" },
+    { name: "keeps the selection when another workspace is selected", selected: "ws-other" },
+  ])("removeSubagent $name", async ({ selected }) => {
+    createMockAPI({
+      workspace: {
+        list: () =>
+          Promise.resolve([
+            createProjectWorkspaceMetadata("ws-parent", "/alpha"),
+            createProjectWorkspaceMetadata("ws-child", "/alpha", {
+              namedWorkspacePath: "/alpha-agent",
+              parentWorkspaceId: "ws-parent",
+            }),
+            createProjectWorkspaceMetadata("ws-other", "/alpha", {
+              namedWorkspacePath: "/alpha-other",
+            }),
+          ]),
+      },
+      launchBehavior: "last-workspace",
+      locationPath: `/workspace/${selected}`,
+    });
+    currentClientMock.tasks = {
+      remove: () => Promise.resolve({ success: true as const, data: {} }),
+    };
+
+    const ctx = await setup();
+    await waitFor(() => expect(ctx().selectedWorkspace?.workspaceId).toBe(selected));
+
+    const result = await ctx().removeSubagent("ws-child", { summary: null, paths: [] });
+
+    expect(result.success).toBe(true);
+    await waitFor(() => expect(ctx().workspaceMetadata.has("ws-child")).toBe(false));
+    const expected = selected === "ws-child" ? "ws-parent" : selected;
+    await waitFor(() => expect(ctx().selectedWorkspace?.workspaceId).toBe(expected));
+    expect(ctx().pendingNewWorkspaceProject).toBeNull();
   });
 
   test("removeWorkspace returns selected scratch workspace to scratch creation", async () => {
@@ -976,9 +919,7 @@ describe("WorkspaceContext", () => {
             }),
           ]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: `/workspace/${workspaceId}`,
     });
 
@@ -1023,6 +964,172 @@ describe("WorkspaceContext", () => {
     expect(result).toEqual(failure);
   });
 
+  // useAPI() keeps the last client while reconnecting (kept-gap). The handlers must still see
+  // "offline": they return their result and do not call the lost connection.
+  describe.each([...GAP_MODES])("handlers while the connection is down (%s)", (mode) => {
+    test("return their offline result without calling the server", async () => {
+      const { workspace: workspaceApi } = createMockAPI();
+      const contexts = await setupWithConnection(mode);
+      await contexts.harness.drop();
+
+      const notConnected = { success: false as const, error: "API not connected" };
+      await act(async () => {
+        expect(await contexts.workspace().archiveWorkspace("ws-1")).toEqual(notConnected);
+        expect(await contexts.workspace().unarchiveWorkspace("ws-1")).toEqual(notConnected);
+        expect(await contexts.workspace().updateWorkspaceTitle("ws-1", "next")).toEqual(
+          notConnected
+        );
+        expect(await contexts.workspace().setWorkspacePinned("ws-1", true)).toEqual(notConnected);
+        expect(await contexts.workspace().removeWorkspace("ws-1")).toEqual(notConnected);
+        expect(await contexts.workspace().getWorkspaceInfo("ws-1")).toBeNull();
+        expect(
+          await contexts.project().assignWorkspaceToSubProject("/alpha", "ws-1", null)
+        ).toEqual(notConnected);
+        expect(await contexts.project().updateDisplayName("/alpha", "A")).toEqual(notConnected);
+        expect(await contexts.project().getSecrets("/alpha")).toEqual([]);
+        const created: unknown = await contexts
+          .workspace()
+          .createWorkspace("/alpha", "branch", "main")
+          .catch((error: unknown) => error);
+        expect(created).toEqual(new Error("API not connected"));
+      });
+      expect(workspaceApi.archive).not.toHaveBeenCalled();
+      expect(workspaceApi.unarchive).not.toHaveBeenCalled();
+      expect(workspaceApi.updateTitle).not.toHaveBeenCalled();
+      expect(workspaceApi.setPinned).not.toHaveBeenCalled();
+      expect(workspaceApi.remove).not.toHaveBeenCalled();
+      expect(workspaceApi.getInfo).not.toHaveBeenCalled();
+      expect(workspaceApi.create).not.toHaveBeenCalled();
+    });
+  });
+
+  // A reconnect reloads projects and metadata through the new client. Until the reload answers,
+  // both contexts keep what they show and do not report "loading" again (stale-while-revalidate).
+  describe.each([...GAP_MODES])("reload after a reconnect (%s)", (mode) => {
+    test("keeps the loaded projects and metadata until the reload answers", async () => {
+      createMockAPI({
+        workspace: { list: () => Promise.resolve([createWorkspaceMetadata({ id: "ws-old" })]) },
+        projects: { list: () => Promise.resolve([["/old", { workspaces: [] }]]) },
+      });
+      const contexts = await setupWithConnection(mode);
+      await waitFor(() => expect(contexts.project().userProjects.has("/old")).toBe(true));
+      expect(contexts.workspace().workspaceMetadata.has("ws-old")).toBe(true);
+
+      // The next server answers only when the test lets it.
+      let answerProjects: (() => void) | null = null;
+      let answerSnapshot: (() => void) | null = null;
+      const projectsAnswered = new Promise<void>((resolve) => (answerProjects = resolve));
+      const snapshotAnswered = new Promise<void>((resolve) => (answerSnapshot = resolve));
+      currentClientMock = {
+        ...currentClientMock,
+        projects: {
+          ...currentClientMock.projects,
+          list: () => projectsAnswered.then(() => [["/new", { workspaces: [] }]]),
+        },
+        workspace: {
+          ...currentClientMock.workspace,
+          onMetadata: () =>
+            Promise.resolve(
+              (async function* () {
+                await snapshotAnswered;
+                yield {
+                  type: "snapshot" as const,
+                  workspaces: [createWorkspaceMetadata({ id: "ws-new" })],
+                };
+                await new Promise(() => undefined);
+              })()
+            ),
+        },
+      };
+
+      await contexts.harness.drop();
+      contexts.harness.reconnect();
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      });
+
+      expect(contexts.project().loading).toBe(false);
+      expect(contexts.project().loaded).toBe(true);
+      expect(contexts.project().userProjects.has("/old")).toBe(true);
+      expect(contexts.workspace().loading).toBe(false);
+      expect(contexts.workspace().loaded).toBe(true);
+      expect(contexts.workspace().workspaceMetadata.has("ws-old")).toBe(true);
+
+      act(() => {
+        answerSnapshot?.();
+        answerProjects?.();
+      });
+      await waitFor(() => expect(contexts.workspace().workspaceMetadata.has("ws-new")).toBe(true));
+      await waitFor(() => expect(contexts.project().userProjects.has("/new")).toBe(true));
+      expect(contexts.workspace().workspaceMetadata.has("ws-old")).toBe(false);
+      expect(contexts.project().userProjects.has("/old")).toBe(false);
+    });
+  });
+
+  // Only a loaded snapshot makes later reloads non-blocking. Without one the app must keep its
+  // loader for the new client, not leave it with an empty metadata map.
+  describe.each([...GAP_MODES])("reconnect before a first snapshot (%s)", (mode) => {
+    test("shows loading again for the new client", async () => {
+      const { workspace: workspaceApi } = createMockAPI();
+      workspaceApi.onMetadata.mockImplementation(() =>
+        Promise.resolve(
+          // eslint-disable-next-line require-yield
+          (async function* () {
+            await Promise.resolve();
+          })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+        )
+      );
+      const contexts = await setupWithConnection(mode);
+      await waitFor(() => expect(contexts.workspace().loading).toBe(false));
+      expect(contexts.workspace().loaded).toBe(false);
+
+      // The next server never sends its snapshot.
+      currentClientMock = {
+        ...currentClientMock,
+        workspace: {
+          ...currentClientMock.workspace,
+          onMetadata: () =>
+            Promise.resolve(
+              // eslint-disable-next-line require-yield
+              (async function* () {
+                await new Promise(() => undefined);
+              })()
+            ),
+        },
+      };
+      await contexts.harness.drop();
+      contexts.harness.reconnect();
+      await waitFor(() => expect(contexts.workspace().loading).toBe(true));
+      expect(contexts.workspace().loaded).toBe(false);
+    });
+
+    // A stream lost with the connection rejects with ConnectionLostError: no load failure, so
+    // the startup loader stays for the whole outage, not only once the new client arrives.
+    test("a drop before the first snapshot keeps loading during the outage", async () => {
+      const { workspace: workspaceApi } = createMockAPI();
+      workspaceApi.onMetadata.mockImplementation(() =>
+        Promise.resolve(
+          // eslint-disable-next-line require-yield
+          (async function* () {
+            await new Promise(() => undefined);
+          })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+        )
+      );
+      const contexts = await setupWithConnection(mode, { awaitLoad: false });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      });
+      expect(contexts.workspace().loading).toBe(true);
+
+      await contexts.harness.drop();
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      });
+      expect(contexts.workspace().loading).toBe(true);
+      expect(contexts.workspace().loaded).toBe(false);
+    });
+  });
+
   describe("archiveWorkspace", () => {
     test("succeeds even when persisted layout is invalid JSON shape", async () => {
       const workspaceId = "ws-archive-invalid-layout";
@@ -1051,6 +1158,7 @@ describe("WorkspaceContext", () => {
       const terminalTitlesKey = getTerminalTitlesKey(workspaceId);
       const persistedLayout: RightSidebarLayoutState = {
         version: 1,
+        openTabsOnly: true,
         nextId: 2,
         focusedTabsetId: "tabset-1",
         root: {
@@ -1082,10 +1190,8 @@ describe("WorkspaceContext", () => {
         throw new Error("Expected cleaned right sidebar layout to be a tabset");
       }
 
-      // Default-layout tabs such as Instructions are restored by the
-      // right-sidebar layout migration, but the archived terminal tab and title
-      // must be stripped.
-      expect(cleanedLayout.root.tabs).toEqual(["costs", "review", "instructions"]);
+      // The archived terminal tab and title are stripped; the other open tabs stay.
+      expect(cleanedLayout.root.tabs).toEqual(["costs", "review"]);
       expect(cleanedLayout.root.activeTab).not.toBe("terminal:t1");
       expect(cleanedLayout.root.tabs).toContain(cleanedLayout.root.activeTab);
       expect(
@@ -1099,6 +1205,7 @@ describe("WorkspaceContext", () => {
       const terminalTitlesKey = getTerminalTitlesKey(workspaceId);
       const persistedLayout: RightSidebarLayoutState = {
         version: 1,
+        openTabsOnly: true,
         nextId: 2,
         focusedTabsetId: "tabset-1",
         root: {
@@ -1248,6 +1355,7 @@ describe("WorkspaceContext", () => {
     const terminalTitlesKey = getTerminalTitlesKey(workspaceId);
     const persistedLayout: RightSidebarLayoutState = {
       version: 1,
+      openTabsOnly: true,
       nextId: 2,
       focusedTabsetId: "tabset-1",
       root: {
@@ -1369,9 +1477,7 @@ describe("WorkspaceContext", () => {
       workspace: {
         list: () => Promise.resolve([createProjectWorkspaceMetadata("ws-existing", "/existing")]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: "/workspace/ws-existing",
     });
 
@@ -1394,9 +1500,7 @@ describe("WorkspaceContext", () => {
       workspace: {
         list: () => Promise.resolve([createProjectWorkspaceMetadata("ws-existing", "/existing")]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: "/workspace/ws-existing",
     });
 
@@ -1454,7 +1558,7 @@ describe("WorkspaceContext", () => {
     createMockAPI({
       workspace: { list: () => Promise.resolve([workspace]) },
       projects: { list: () => Promise.resolve([[projectPath, { workspaces: [] }]]) },
-      localStorage: { [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace") },
+      launchBehavior: "last-workspace",
     });
     const first = await setup();
     await waitFor(() => expect(first().loading).toBe(false));
@@ -1508,9 +1612,7 @@ describe("WorkspaceContext", () => {
       workspace: {
         list: () => Promise.resolve([createProjectWorkspaceMetadata("ws-open-chat", "/existing")]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
-      },
+      launchBehavior: "dashboard",
       locationPath: "/workspace/ws-open-chat",
       navigationType: "reload",
     });
@@ -1539,9 +1641,7 @@ describe("WorkspaceContext", () => {
             }),
           ]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
-      },
+      launchBehavior: "dashboard",
       locationPath: `/workspace/${workspaceId}`,
       navigationType: "navigate",
     });
@@ -1561,9 +1661,7 @@ describe("WorkspaceContext", () => {
       projects: {
         list: () => Promise.resolve([["/existing", { workspaces: [] }]]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
-      },
+      launchBehavior: "dashboard",
       locationPath: "/workspace/ws-missing",
       navigationType: "navigate",
     });
@@ -1593,8 +1691,8 @@ describe("WorkspaceContext", () => {
       projects: {
         list: () => Promise.resolve([["/existing", { workspaces: [] }]]),
       },
+      launchBehavior: "dashboard",
       localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
         [SELECTED_WORKSPACE_KEY]: JSON.stringify(persistedSelection),
       },
       locationPath: "/workspace/ws-maybe-alive",
@@ -1655,9 +1753,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve("/launch-project"),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
-      },
+      launchBehavior: "dashboard",
     });
 
     const ctx = await setup();
@@ -1680,9 +1776,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve("/launch-project"),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
-      },
+      launchBehavior: "dashboard",
       desktopMode: true,
     });
 
@@ -1739,9 +1833,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve("/launch-project"),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
-      },
+      launchBehavior: "dashboard",
     });
 
     const ctx = await setup();
@@ -1765,9 +1857,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve("/launch-project"),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("new-chat"),
-      },
+      launchBehavior: "new-chat",
     });
 
     const ctx = await setup();
@@ -1791,9 +1881,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve(null),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("new-chat"),
-      },
+      launchBehavior: "new-chat",
       desktopMode: true,
     });
 
@@ -1818,9 +1906,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve(null),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("new-chat"),
-      },
+      launchBehavior: "new-chat",
       desktopMode: true,
     });
 
@@ -1845,9 +1931,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve(null),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("new-chat"),
-      },
+      launchBehavior: "new-chat",
       desktopMode: true,
     });
 
@@ -1888,9 +1972,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve(null),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("new-chat"),
-      },
+      launchBehavior: "new-chat",
       desktopMode: true,
     });
 
@@ -1924,9 +2006,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve(null),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("new-chat"),
-      },
+      launchBehavior: "new-chat",
       desktopMode: true,
     });
 
@@ -1951,9 +2031,7 @@ describe("WorkspaceContext", () => {
       projects: {
         list: () => Promise.resolve([]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: "/workspace/ws-existing",
       server: {
         getLaunchProject: () => Promise.resolve("/launch-project"),
@@ -2096,9 +2174,9 @@ describe("WorkspaceContext", () => {
       subProjectPath: null,
       createdAt: 1,
     });
-    const listedKey = getModelKey(getDraftScopeId(projectPath, "listed"));
+    const listedKey = getAutoExpandPrefsKey(getDraftScopeId(projectPath, "listed"));
     // Deleted in another window: only its settings are left in this origin.
-    const orphanKey = getModelKey(getDraftScopeId(projectPath, "deleted-elsewhere"));
+    const orphanKey = getAutoExpandPrefsKey(getDraftScopeId(projectPath, "deleted-elsewhere"));
     resetCreationDraftStorageGcForTests();
     createMockAPI({
       projects: {
@@ -2131,7 +2209,7 @@ describe("WorkspaceContext", () => {
       return current;
     });
     // Routed but unlisted (e.g. its list write never landed).
-    const routedKey = getModelKey(getDraftScopeId(projectPath, "routed"));
+    const routedKey = getAutoExpandPrefsKey(getDraftScopeId(projectPath, "routed"));
     resetCreationDraftStorageGcForTests();
     createMockAPI({
       projects: {
@@ -2365,15 +2443,17 @@ describe("WorkspaceContext", () => {
         },
         // Drafts live on the backend now; any registered workspace-scoped key shows the GC.
         localStorage: {
-          [getModelKey(ACTIVE_ID)]: JSON.stringify("live model"),
-          [getModelKey(ORPHAN_ID)]: JSON.stringify("orphan model"),
+          [getAutoExpandPrefsKey(ACTIVE_ID)]: JSON.stringify("live model"),
+          [getAutoExpandPrefsKey(ORPHAN_ID)]: JSON.stringify("orphan model"),
         },
       });
 
       await setup();
 
-      await waitFor(() => expect(localStorage.getItem(getModelKey(ORPHAN_ID))).toBeNull());
-      expect(localStorage.getItem(getModelKey(ACTIVE_ID))).not.toBeNull();
+      await waitFor(() =>
+        expect(localStorage.getItem(getAutoExpandPrefsKey(ORPHAN_ID))).toBeNull()
+      );
+      expect(localStorage.getItem(getAutoExpandPrefsKey(ACTIVE_ID))).not.toBeNull();
     });
 
     test("never runs after a failed startup load, even when a later refresh succeeds", async () => {
@@ -2387,7 +2467,7 @@ describe("WorkspaceContext", () => {
               : Promise.resolve([createProjectWorkspaceMetadata(ACTIVE_ID, "/alpha")]),
           listKnownIdsForStorageGc: () => Promise.resolve({ workspaceIds: [ACTIVE_ID] }),
         },
-        localStorage: { [getModelKey(ORPHAN_ID)]: JSON.stringify("draft") },
+        localStorage: { [getAutoExpandPrefsKey(ORPHAN_ID)]: JSON.stringify("draft") },
       });
 
       const ctx = await setup();
@@ -2397,7 +2477,7 @@ describe("WorkspaceContext", () => {
       await waitFor(() => expect(ctx().workspaceMetadata.has(ACTIVE_ID)).toBe(true));
 
       expect(workspaceApi.listKnownIdsForStorageGc).not.toHaveBeenCalled();
-      expect(localStorage.getItem(getModelKey(ORPHAN_ID))).not.toBeNull();
+      expect(localStorage.getItem(getAutoExpandPrefsKey(ORPHAN_ID))).not.toBeNull();
     });
   });
 });
@@ -2443,6 +2523,34 @@ function createDraftServiceClient(service: DraftService): TestApiOverrides<APICl
   };
 }
 
+/** Like setupWithProjectContext(), over a connection the test drops (connection.testHarness). */
+async function setupWithConnection(mode: GapMode, options?: { awaitLoad?: boolean }) {
+  const harness = createConnectionHarness(mode, () => currentClientMock);
+  const workspaceRef = { current: null as WorkspaceContext | null };
+  const projectRef = { current: null as ReturnType<typeof useProjectContext> | null };
+  function ContextCapture() {
+    workspaceRef.current = useWorkspaceContext();
+    projectRef.current = useProjectContext();
+    return null;
+  }
+  render(
+    <harness.Wrapper>
+      <RouterProvider>
+        <ProjectProvider>
+          <WorkspaceProvider>
+            <ContextCapture />
+          </WorkspaceProvider>
+        </ProjectProvider>
+      </RouterProvider>
+    </harness.Wrapper>
+  );
+  getWorkspaceStoreRaw().setClient(harness.client);
+  if (options?.awaitLoad !== false) {
+    await waitFor(() => expect(workspaceRef.current?.loading).toBe(false));
+  }
+  return { harness, workspace: () => workspaceRef.current!, project: () => projectRef.current! };
+}
+
 async function setup() {
   const contexts = await setupWithProjectContext();
   return contexts.workspace;
@@ -2480,9 +2588,12 @@ async function setupWithProjectContext() {
 
 interface MockAPIOptions {
   workspace?: TestApiOverrides<APIClient["workspace"]>;
+  /** The metadata stream's opening snapshot; defaults to workspace.list(input). */
+  metadataSnapshot?: () => Promise<FrontendWorkspaceMetadata[]>;
   projects?: TestApiOverrides<APIClient["projects"]>;
   server?: TestApiOverrides<APIClient["server"]>;
   localStorage?: Record<string, string>;
+  launchBehavior?: LaunchBehavior;
   locationHash?: string;
   locationPath?: string;
   desktopMode?: boolean;
@@ -2501,6 +2612,12 @@ function createMockAPI(options: MockAPIOptions = {}) {
     for (const [key, value] of Object.entries(options.localStorage)) {
       globalThis.localStorage.setItem(key, value);
     }
+  }
+
+  if (options.launchBehavior) {
+    getAppConfigStore().updateOptimistically({
+      userPreferences: { navigation: { launchBehavior: options.launchBehavior } },
+    });
   }
 
   if (options.desktopMode) {
@@ -2580,18 +2697,27 @@ function createMockAPI(options: MockAPIOptions = {}) {
       options.workspace?.listKnownIdsForStorageGc ??
         (() => new Promise<{ workspaceIds: string[] }>(() => undefined))
     ),
-    // Async generators for subscriptions
+    // Async generators for subscriptions. Like the server, the metadata stream opens with a
+    // snapshot equal to workspace.list(input); overrides supply only the updates after it.
     onMetadata: mock(
-      options.workspace?.onMetadata ??
-        (async () => {
-          await Promise.resolve();
-          return (
-            // eslint-disable-next-line require-yield
+      async (
+        input?: Parameters<APIClient["workspace"]["onMetadata"]>[0],
+        clientOptions?: Parameters<APIClient["workspace"]["onMetadata"]>[1]
+      ) => {
+        const updates = options.workspace?.onMetadata
+          ? await options.workspace.onMetadata(input, clientOptions)
+          : // eslint-disable-next-line require-yield
             (async function* () {
               await Promise.resolve();
-            })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
-          );
-        })
+            })();
+        return (async function* () {
+          yield {
+            type: "snapshot" as const,
+            workspaces: await (options.metadataSnapshot?.() ?? workspace.list(input)),
+          };
+          yield* updates;
+        })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>;
+      }
     ),
     getSessionUsage: mock(options.workspace?.getSessionUsage ?? (() => Promise.resolve(undefined))),
     onChat: mock(

@@ -8,9 +8,8 @@ import type {
   ContextBoundaryKind,
   PersistedContextBoundaryKind,
 } from "@/common/constants/contextBoundary";
-import type { GoalSyntheticMessageKind } from "@/constants/goals";
+import type { GoalSyntheticMessageKind, TaskTurnKind } from "@/constants/goals";
 import type { SendMessageOptions } from "@/common/orpc/types";
-import { withLegacyPtcExclusiveMirror } from "@/common/constants/experiments";
 import type { z } from "zod";
 import type { AgentMode } from "./mode";
 import type { AgentSkillScope } from "./agentSkill";
@@ -63,13 +62,12 @@ type PreservedSendOptions = Pick<
   SendMessageOptions,
   | "thinkingLevel"
   | "reasoningMode"
+  | "serviceTier"
   | "additionalSystemInstructions"
   | "providerOptions"
-  | "experiments"
   | "disableWorkspaceAgents"
   | "toolPolicy"
   | "strictAgentResolution"
-  | "allowAgentSetGoal"
   | "skipAiSettingsPersistence"
 >;
 
@@ -84,15 +82,11 @@ export function pickPreservedSendOptions(options: SendMessageOptions): Preserved
   return {
     ...(options.thinkingLevel !== undefined ? { thinkingLevel: options.thinkingLevel } : {}),
     ...(options.reasoningMode !== undefined ? { reasoningMode: options.reasoningMode } : {}),
+    ...(options.serviceTier !== undefined ? { serviceTier: options.serviceTier } : {}),
     ...(options.additionalSystemInstructions !== undefined
       ? { additionalSystemInstructions: options.additionalSystemInstructions }
       : {}),
     ...(options.providerOptions !== undefined ? { providerOptions: options.providerOptions } : {}),
-    // Downgrade-compat (see withLegacyPtcExclusiveMirror): preserved options
-    // can persist across restarts and build versions.
-    ...(options.experiments !== undefined
-      ? { experiments: withLegacyPtcExclusiveMirror(options.experiments) }
-      : {}),
     ...(options.disableWorkspaceAgents !== undefined
       ? { disableWorkspaceAgents: options.disableWorkspaceAgents }
       : {}),
@@ -104,9 +98,6 @@ export function pickPreservedSendOptions(options: SendMessageOptions): Preserved
     // fall back to exec if the agent vanished in the meantime.
     ...(options.strictAgentResolution !== undefined
       ? { strictAgentResolution: options.strictAgentResolution }
-      : {}),
-    ...(options.allowAgentSetGoal !== undefined
-      ? { allowAgentSetGoal: options.allowAgentSetGoal }
       : {}),
     ...(options.skipAiSettingsPersistence !== undefined
       ? { skipAiSettingsPersistence: options.skipAiSettingsPersistence }
@@ -120,14 +111,13 @@ export type StartupRetrySendOptions = Pick<
   | "agentId"
   | "thinkingLevel"
   | "reasoningMode"
+  | "serviceTier"
   | "toolPolicy"
   | "additionalSystemInstructions"
   | "maxOutputTokens"
   | "providerOptions"
-  | "experiments"
   | "disableWorkspaceAgents"
   | "strictAgentResolution"
-  | "allowAgentSetGoal"
 > & {
   /**
    * Correlation metadata that must survive restart recovery: delegated
@@ -150,6 +140,8 @@ export type StartupRetrySendOptions = Pick<
    * goal-scoped compaction follow-ups (Codex P2 PRRT_kwDOPxxmWM6cIv2E).
    */
   goalId?: string;
+  /** Automatic sub-agent turn provenance (see TaskTurnKind); resumed turns keep it. */
+  taskTurnKind?: TaskTurnKind;
 };
 
 /**
@@ -159,7 +151,8 @@ export type StartupRetrySendOptions = Pick<
 export function pickStartupRetrySendOptions(
   options: SendMessageOptions,
   agentInitiated?: boolean,
-  goalKind?: GoalSyntheticMessageKind
+  goalKind?: GoalSyntheticMessageKind,
+  taskTurnKind?: TaskTurnKind
 ): StartupRetrySendOptions {
   const typedMuxMetadata = options.muxMetadata as MuxMessageMetadata | undefined;
   const workspaceTurnMuxMetadata =
@@ -169,20 +162,18 @@ export function pickStartupRetrySendOptions(
     agentId: options.agentId,
     thinkingLevel: options.thinkingLevel,
     reasoningMode: options.reasoningMode,
+    serviceTier: options.serviceTier,
     toolPolicy: options.toolPolicy,
     additionalSystemInstructions: options.additionalSystemInstructions,
     maxOutputTokens: options.maxOutputTokens,
     providerOptions: options.providerOptions,
-    // Downgrade-compat: retry snapshots persist to chat.jsonl and cross build
-    // versions, so an enabled merged PTC also stamps the legacy exclusive key.
-    experiments: withLegacyPtcExclusiveMirror(options.experiments),
     disableWorkspaceAgents: options.disableWorkspaceAgents,
     // Keep explicit-agent turns loud across restart recovery (see pickPreservedSendOptions).
     strictAgentResolution: options.strictAgentResolution,
-    allowAgentSetGoal: options.allowAgentSetGoal,
     ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
     ...(agentInitiated === true ? { agentInitiated: true } : {}),
     ...(goalKind != null ? { goalKind } : {}),
+    ...(taskTurnKind != null ? { taskTurnKind } : {}),
   };
 }
 
@@ -222,6 +213,11 @@ export interface CompactionFollowUpRequest extends CompactionFollowUpInput, Pres
    * PRRT_kwDOPxxmWM6cIv2E).
    */
   goalId?: string;
+  /**
+   * Automatic sub-agent turn provenance (see TaskTurnKind). Preserved through compaction so
+   * the re-dispatched follow-up is still classified (and set_goal-gated) as that task turn.
+   */
+  taskTurnKind?: TaskTurnKind;
   /** Internal dispatch guardrails for crash-safe follow-up recovery. */
   dispatchOptions?: CompactionFollowUpDispatchOptions;
   /**
@@ -238,6 +234,13 @@ export interface CompactionFollowUpRequest extends CompactionFollowUpInput, Pres
    * persists it instead of classifying (and billing) again.
    */
   autoModelRouting?: AutoModelRoutingRecord;
+  /**
+   * The diverted send already ran the message.send prompt hooks: the redispatch must not run them
+   * a second time. Only Xum sets it (stripClientPluginSendHookFields drops a client's).
+   */
+  pluginSendHooksApplied?: true;
+  /** The diverted send's prompt-hook context, restored on the redispatched user row. */
+  pluginHookContext?: PluginHookContextEntry[];
 }
 
 /**
@@ -547,12 +550,33 @@ export interface TranscriptAnchor {
   partIndex: number;
 }
 
+/**
+ * A message sent from an agent-written artifact (Artifacts M5b): `window.xum.send` or a canvas
+ * button, confirmed by the user in the host-owned strip. Only the backend sets it (generic sends
+ * refuse it), so the "from artifact" label cannot be faked by typing the model-facing tag.
+ */
+export interface ArtifactInteractionMetadata {
+  /** Pending-record id; replay skips ids already in history. */
+  id: string;
+  /** POSIX path relative to $XUM_SCRATCH_DIR/artifacts. */
+  artifactPath: string;
+  title: string;
+  /** Artifact version the user interacted with (0 when the file had no stored version). */
+  version: number;
+  action: "send";
+  text: string;
+  /** Optional JSON payload from the artifact. */
+  data?: unknown;
+}
+
 /** Base fields common to all metadata types */
 interface MuxMessageMetadataBase {
   /** Correlates a rollover continuation without replacing its original attribution. */
   rolloverId?: string;
   /** Structured review data for rich UI display (orthogonal to message type) */
   reviews?: ReviewNoteDataForDisplay[];
+  /** Set by the backend only: this user message came from an artifact (Artifacts M5b). */
+  artifactInteraction?: ArtifactInteractionMetadata;
   /** Command prefix to highlight in UI (e.g., "/compact -m sonnet" or "/react-effects") */
   commandPrefix?: string;
   /**
@@ -856,6 +880,11 @@ export function isTokenBudgetInternalMessage(message: MuxMessage): boolean {
   );
 }
 
+/** Token Budget warning rows are advisory notices, never a turn's trigger or request. */
+export function isContextBudgetWarningMessage(message: MuxMessage): boolean {
+  return message.metadata?.muxMetadata?.type === "context-budget-warning";
+}
+
 export function isRolloverBoundary(message: MuxMessage): boolean {
   return (
     message.metadata?.contextBoundaryKind === "reset" &&
@@ -981,6 +1010,12 @@ export function hasTokenUsage(
   );
 }
 
+/** One plugin's message.send context for a user row (see MuxMetadata.pluginHookContext). */
+export interface PluginHookContextEntry {
+  pluginId: string;
+  text: string;
+}
+
 /**
  * Record of a model-fallback chain application. `requestedModel` is the model
  * originally asked for; `refusedModels` lists every model that refused, in
@@ -1044,6 +1079,23 @@ export interface MuxMetadata {
   modelFallback?: ModelFallbackRecord;
   /** Present when the composer's Auto entry classified this turn's difficulty. */
   autoModelRouting?: AutoModelRoutingRecord;
+  /**
+   * Receipt of an Anthropic thinking strip: a request of this turn sent earlier thinking
+   * without its blocks (signature repair, in-turn prefix change, or server-tool containment).
+   * Preserved thinking binds each block to its prefix, and putting removed blocks back
+   * invalidates every later block, so request building keeps the removed blocks out until the
+   * next compaction or reset boundary. Where the strip ends: anthropicThinkingReplayFromStep.
+   */
+  anthropicThinkingReplay?: "off";
+  /**
+   * Where the receipt's strip ends, so later requests keep the thinking the turn kept sending
+   * (prompt-cache prefix, mechanism 11). A number is a step of THIS row (an index into
+   * stepStartPartIndices): earlier rows and this row's earlier steps lose their Anthropic
+   * thinking, this step and later keep it. "end": this row loses all of it (#5887 server
+   * tool). Rows after this one keep theirs. Absent (older builds): every row of the segment
+   * loses it.
+   */
+  anthropicThinkingReplayFromStep?: number | "end";
   // Last step's provider metadata (for context window cache display)
   contextProviderMetadata?: Record<string, unknown>;
   systemMessageTokens?: number; // Token count for system message sent with this request (calculated by AIService)
@@ -1062,6 +1114,18 @@ export interface MuxMetadata {
    * mid-turn goal existed from genuine interventions against a visible goal.
    */
   enqueuedAtMs?: number;
+  /**
+   * Ids of the sends this row accepted (idempotent sends): one per send, several for a queued
+   * batch. A row on disk is the only evidence that a send was accepted, so the history write
+   * path refuses to append a second row for an id listed here (see sendIds.ts).
+   */
+  sendIds?: string[];
+  /**
+   * Per send id: a digest of the submitted payload, fixed when the id was first assigned. A
+   * retry under a known id with a different digest is a conflict, not a duplicate. A joined
+   * batch row cannot recover each payload, hence one digest per id.
+   */
+  sendDigests?: Record<string, string>;
   /**
    * UI hint: show in the chat UI even when synthetic.
    *
@@ -1118,6 +1182,19 @@ export interface MuxMetadata {
    * without a goalId keep the old any-goal semantics.
    */
   goalId?: string;
+  /**
+   * Automatic sub-agent turn provenance (see TaskTurnKind), stamped by TaskService sends.
+   * Separate from `kind` because a task turn is not a goal-loop row for chat-tail
+   * reconciliation.
+   */
+  taskTurnKind?: TaskTurnKind;
+  /**
+   * Context that message.send prompt hooks (Codex UserPromptSubmit `additionalContext`) added
+   * for this user row. Request building renders it into this message's content
+   * (renderPluginHookContextForProvider), never into the system prompt, so the cached prefix
+   * stays stable and later turns keep it. Not shown in the user's bubble.
+   */
+  pluginHookContext?: PluginHookContextEntry[];
 
   /**
    * ACP-only correlation id propagated through stream events so prompt() can
@@ -1201,6 +1278,11 @@ export interface MuxReasoningPart {
   providerOptions?: {
     anthropic?: {
       signature?: string;
+      /**
+       * Anthropic `redacted_thinking` data. The SDK replays the part as a
+       * redacted_thinking block when there is no signature.
+       */
+      redactedData?: string;
     };
     openai?: {
       itemId?: string;
@@ -1306,6 +1388,8 @@ export type DisplayedMessage =
       };
       /** Structured review data for rich UI display (from muxMetadata) */
       reviews?: ReviewNoteDataForDisplay[];
+      /** Message sent from an artifact (from muxMetadata); drives the "from artifact" pill. */
+      artifactInteraction?: ArtifactInteractionMetadata;
       /** Present when this synthetic turn is a background bash monitor wake-up. */
       bashMonitorWake?: {
         records: BashMonitorWakeDisplayRecord[];
@@ -1502,6 +1586,10 @@ export interface QueuedMessage {
   queueDispatchMode?: QueueDispatchMode;
   /** True when the queued message is a compaction request (/compact) */
   hasCompactionRequest?: boolean;
+  /** The queued message was sent from an artifact (Artifacts M5b): shown as such, not editable. */
+  artifactInteraction?: ArtifactInteractionMetadata;
+  /** Send ids of the queued sends (idempotent sends; see ChatPane's queue edit). */
+  sendIds?: string[];
 }
 
 /** Keep every snapshot kind here so history scans and edits retain it with its user message. */

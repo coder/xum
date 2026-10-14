@@ -69,9 +69,21 @@ export const WorkspaceHeartbeatSettingsSchema = z.object({
   enabled: z.boolean().meta({
     description: "Whether scheduled workspace heartbeats are enabled for this workspace.",
   }),
-  intervalMs: z.number().int().min(HEARTBEAT_MIN_INTERVAL_MS).max(HEARTBEAT_MAX_INTERVAL_MS).meta({
-    description: "Heartbeat interval in milliseconds for this workspace.",
-  }),
+  // Optional (#5692): an absent interval follows the global default
+  // (`heartbeatDefaultIntervalMs`) at read time, so "Use default" is a real default
+  // that tracks later global changes. Older builds read an absent or invalid value as
+  // the global default too (normalizeWorkspaceMetadataHeartbeat), so this is
+  // downgrade-safe.
+  intervalMs: z
+    .number()
+    .int()
+    .min(HEARTBEAT_MIN_INTERVAL_MS)
+    .max(HEARTBEAT_MAX_INTERVAL_MS)
+    .optional()
+    .meta({
+      description:
+        "Heartbeat interval override in milliseconds for this workspace. Absent means the global default interval.",
+    }),
   message: z.string().optional().meta({
     description:
       "Optional custom instruction body appended after the fixed workspace heartbeat lead-in.",
@@ -227,6 +239,10 @@ export const WorkspaceMetadataSchema = z.object({
     description:
       "If set, this workspace is a child workspace spawned from the parent workspaceId (enables nesting in UI and backend orchestration).",
   }),
+  sideChatParentWorkspaceId: z.string().optional().meta({
+    description:
+      "If set, this workspace is an ephemeral /side chat forked from the given workspace: it shares that workspace's checkout, is hidden from the sidebar, and is discarded when the user leaves it.",
+  }),
   agentType: z.string().optional().meta({
     description: 'If set, selects an agent preset for this workspace (e.g., "explore" or "exec").',
   }),
@@ -347,9 +363,6 @@ export const WorkspaceMetadataSchema = z.object({
 });
 
 export const FrontendWorkspaceMetadataSchema = WorkspaceMetadataSchema.extend({
-  rootWorkspaceId: z.string().optional().meta({
-    description: "Task-family root derived from complete metadata, including archived ancestors.",
-  }),
   namedWorkspacePath: z
     .string()
     .meta({ description: "Worktree path (uses workspace name as directory)" }),

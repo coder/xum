@@ -151,6 +151,27 @@ describe("IdleCompactionService", () => {
       }
     );
 
+    test("does not inspect or automatically compact a side chat's inherited idle history", async () => {
+      const config = loadConfigMock();
+      const workspace = config.projects.get(testProjectPath)?.workspaces[0];
+      if (!workspace) throw new Error("Missing fixture workspace");
+      workspace.sideChatParentWorkspaceId = "parent";
+      loadConfigMock.mockReturnValue(config);
+      const historySpy = spyOn(historyService, "getLastMessages");
+
+      expect((await service.checkEligibility(testWorkspaceId, threshold24h, now)).eligible).toBe(
+        false
+      );
+      await service.checkAllWorkspaces();
+      expect(historySpy).not.toHaveBeenCalled();
+      expect(executeIdleCompactionMock).not.toHaveBeenCalled();
+
+      delete workspace.sideChatParentWorkspaceId;
+      expect((await service.checkEligibility(testWorkspaceId, threshold24h, now)).eligible).toBe(
+        true
+      );
+    });
+
     test("returns eligible for idle workspace with messages", async () => {
       const result = await service.checkEligibility(testWorkspaceId, threshold24h, now);
       expect(result.eligible).toBe(true);

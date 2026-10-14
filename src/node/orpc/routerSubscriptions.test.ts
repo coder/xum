@@ -14,8 +14,10 @@ import { SUBSCRIPTION_HEARTBEAT_INTERVAL_MS } from "@/constants/orpcSubscription
 import { disposeAppRuntime, makeAppRuntime } from "@/node/services/di/appRuntime";
 import type { ORPCContext } from "./context";
 import {
+  attachTerminal,
   subscribeWorkspaceActivity,
   subscribeDesignExperiment,
+  subscribeMetadata,
   subscribeMemoryChanges,
   subscribeWorkspaceChat,
 } from "./routerSubscriptions";
@@ -40,6 +42,36 @@ test("subscription handlers forward the oRPC runtime Clock", async () => {
     await disposeAppRuntime(app.managed);
   }
   expect(workspaceService.listenerCount("activity")).toBe(0);
+});
+
+test("onMetadata opens with a snapshot and delivers events emitted while it is built", async () => {
+  // #5189: a change published while the snapshot's list is pending must follow the snapshot.
+  const app = makeAppRuntime(TestClock.layer());
+  const controller = new AbortController();
+  const list = Promise.withResolvers<unknown[]>();
+  const listCalled = Promise.withResolvers<boolean>();
+  const workspaceService = Object.assign(new EventEmitter(), {
+    listByArchivedStatus: (archived: boolean) => {
+      listCalled.resolve(archived);
+      return list.promise;
+    },
+  });
+  const context = { "effect/context": app.context, workspaceService } as unknown as ORPCContext;
+  const iterator = subscribeMetadata(context, true, controller.signal);
+  try {
+    const first = iterator.next();
+    expect(await listCalled.promise).toBe(true);
+    const update = { workspaceId: "ws-1", metadata: null };
+    workspaceService.emit("metadata", update);
+    list.resolve([{ id: "ws-2" }]);
+    expect((await first).value).toEqual({ type: "snapshot", workspaces: [{ id: "ws-2" }] });
+    expect((await iterator.next()).value).toEqual(update);
+  } finally {
+    controller.abort();
+    await iterator.return(undefined);
+    await disposeAppRuntime(app.managed);
+  }
+  expect(workspaceService.listenerCount("metadata")).toBe(0);
 });
 
 test("onChat streams replay rows and heartbeats while replayHistory is still running", async () => {
@@ -213,5 +245,45 @@ test("Design subscriptions publish sibling changes only after client shutdown", 
     unsubscribe();
     controller.abort();
     await stream.return(undefined);
+  }
+});
+
+test("a pop-out attach hides its session from listSessions until the stream ends (#5673)", async () => {
+  const app = makeAppRuntime(TestClock.layer());
+  const sessions = ["popped"];
+  let popoutAttaches = 0;
+  const terminalService = {
+    onOutput: () => () => undefined,
+    getScreenState: () => "",
+    markPopoutAttached: () => {
+      popoutAttaches++;
+      return () => {
+        popoutAttaches--;
+      };
+    },
+  };
+  // What listSessions returns, given TerminalService's filter.
+  const listed = () => (popoutAttaches > 0 ? [] : sessions);
+  const context = { "effect/context": app.context, terminalService } as unknown as ORPCContext;
+
+  const sidebar = new AbortController();
+  const sidebarStream = attachTerminal(context, "popped", sidebar.signal);
+  const popout = new AbortController();
+  const popoutStream = attachTerminal(context, "popped", popout.signal, true);
+  try {
+    expect((await sidebarStream.next()).value).toEqual({ type: "screenState", data: "" });
+    expect((await popoutStream.next()).value).toEqual({ type: "screenState", data: "" });
+    // A main-window reload now finds nothing to adopt as a sidebar tab.
+    expect(listed()).toEqual([]);
+
+    // The pop-out crashed or reloaded: its connection drops and the session can come back.
+    popout.abort();
+    await popoutStream.return(undefined);
+    expect(listed()).toEqual(["popped"]);
+  } finally {
+    sidebar.abort();
+    popout.abort();
+    await sidebarStream.return(undefined);
+    await disposeAppRuntime(app.managed);
   }
 });

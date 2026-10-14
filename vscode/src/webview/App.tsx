@@ -6,6 +6,7 @@ import {
   useReducer,
   useRef,
   useState,
+  useSyncExternalStore,
   type ReactNode,
 } from "react";
 
@@ -21,7 +22,6 @@ import { APIProvider, type APIClient } from "xum/browser/contexts/API";
 import { ThemeProvider } from "xum/browser/contexts/ThemeContext";
 import { ChatHostContextProvider } from "xum/browser/contexts/ChatHostContext";
 import { RouterProvider } from "xum/browser/contexts/RouterContext";
-import { PolicyProvider } from "xum/browser/contexts/PolicyContext";
 import { AgentProvider } from "xum/browser/contexts/AgentContext";
 import { BashCollapsedSummaryModeProvider } from "xum/browser/features/Tools/BashCollapsedSummaryModeContext";
 import {
@@ -29,10 +29,15 @@ import {
   useBackgroundBashError,
 } from "xum/browser/contexts/BackgroundBashContext";
 import { BackgroundProcessesBanner } from "xum/browser/components/BackgroundProcessesBanner/BackgroundProcessesBanner";
+import { SubAgentTasksDock } from "./SubAgentTasksDock";
 import { PopoverError } from "xum/browser/components/PopoverError/PopoverError";
-import { useBackgroundBashStoreRaw } from "xum/browser/stores/BackgroundBashStore";
+import {
+  useBackgroundBashStateKnown,
+  useBackgroundBashStoreRaw,
+} from "xum/browser/stores/BackgroundBashStore";
+import { useChatViewDataReadyDeadline } from "xum/browser/components/ChatPane/useChatViewDataReady";
 import { mergeConsecutiveStreamErrors } from "xum/browser/utils/messages/messageUtils";
-import { seedWorkspaceLocalStorageFromBackend } from "xum/browser/contexts/WorkspaceContext";
+import { clearAiSelectionState, setWorkspaceAiMetadata } from "xum/browser/utils/aiSelectionIntent";
 import { WorkspaceModeAISync } from "xum/browser/components/WorkspaceModeAISync/WorkspaceModeAISync";
 import { resolvePersistedAgentId } from "xum/common/utils/agentIds";
 import {
@@ -50,10 +55,8 @@ import {
   matchesKeybind,
   KEYBINDS,
 } from "xum/browser/utils/ui/keybinds";
-import { readPersistedState } from "xum/browser/hooks/usePersistedState";
-import { getAppConfigStore } from "xum/browser/stores/AppConfigStore";
+import { getAppConfigStore, getUserPreferences } from "xum/browser/stores/AppConfigStore";
 import { getProvidersConfigStore } from "xum/browser/stores/ProvidersConfigStore";
-import { VIM_ENABLED_KEY } from "xum/common/constants/storage";
 import { useAutoScroll } from "xum/browser/hooks/useAutoScroll";
 import { useTranscriptDensity } from "xum/browser/hooks/useTranscriptDensity";
 import {
@@ -87,6 +90,7 @@ import type {
   ExtensionToWebviewMessage,
   UiConnectionStatus,
   UiWorkspace,
+  UiWorkspaceActivity,
   UiWorkspaceAiState,
 } from "./protocol";
 import { WorkspacePicker } from "./WorkspacePicker";
@@ -98,13 +102,11 @@ import { CHAT_BUFFER_LIMITS } from "./config";
 import { createVscodeOrpcLink } from "./createVscodeOrpcLink";
 import { WebviewLiveBashOutput } from "./liveBashOutput";
 import { WebviewTranscriptBarrier } from "./transcriptBarrier";
-import { seedWebviewPreferences } from "./seedPreferences";
 import type { VscodeBridge } from "./vscodeBridge";
 
 // Shared chat components need these providers; the webview has no desktop shell to supply them
-// (#4711). PolicyProvider falls back to "no policy" because the bridge rejects policy.* calls (the
-// backend still enforces policy on send). A single AgentProvider covers both the transcript
-// (ProposePlanToolCall) and the composer.
+// (#4711). A single AgentProvider covers both the transcript (ProposePlanToolCall) and the
+// composer.
 /** Identifies the server connection: switching servers keeps mode "api" but changes the URL. */
 function getApiConnectionKey(status: UiConnectionStatus | null): string | null {
   return status?.mode === "api" ? (status.baseUrl ?? "api") : null;
@@ -119,47 +121,45 @@ function WebviewChatProviders(props: {
   children: ReactNode;
 }) {
   return (
-    <PolicyProvider>
-      <AgentProvider
-        workspaceId={props.workspaceId}
-        workspaceMetaFallback={
-          props.workspaceAi
-            ? {
-                parentWorkspaceId: props.workspaceAi.parentWorkspaceId,
-                // Same identity resolution as the seeding: a child task's creation-time agentType
-                // wins over an agentId restamped by a recovery send.
-                agentId: resolvePersistedAgentId(props.workspaceAi, "") || undefined,
-              }
-            : undefined
-        }
-      >
-        {/* Desktop's per-agent settings sync: switching agents restores that agent's cached
-            model/thinking/reasoning (seeded from the workspace), exactly as in AIView. */}
-        {props.workspaceId ? <WorkspaceModeAISync workspaceId={props.workspaceId} /> : null}
-        {/* Re-renders bash tool headers when the seeded collapsed-summary mode arrives (#4972). */}
-        <BashCollapsedSummaryModeProvider>
-          <TooltipProvider>
-            {/* Covers the transcript's bash cards and the dock's background processes strip
-                (#5092). Without a selection nothing reads it: both render only for a selected
-                workspace. */}
-            {/* Never key this by the server connection: it wraps the whole layout, and a remount
-                replaces the transcript scrollport that useAutoScroll observes, leaving a fresh
-                open unpinned from the bottom (#5231). connectionKey, the error popover's scope,
-                and the strip's key scope late failures and rows to the connection instead. */}
-            <BackgroundBashProvider
-              workspaceId={props.selectedWorkspaceId ?? ""}
+    <AgentProvider
+      workspaceId={props.workspaceId}
+      workspaceMetaFallback={
+        props.workspaceAi
+          ? {
+              parentWorkspaceId: props.workspaceAi.parentWorkspaceId,
+              // Same identity resolution as the composer: a child task's creation-time agentType
+              // wins over an agentId restamped by a recovery send.
+              agentId: resolvePersistedAgentId(props.workspaceAi, "") || undefined,
+            }
+          : undefined
+      }
+    >
+      {/* Desktop's per-agent settings sync: switching agents restores that agent's cached
+          model/thinking/reasoning (seeded from the workspace), exactly as in AIView. */}
+      {props.workspaceId ? <WorkspaceModeAISync workspaceId={props.workspaceId} /> : null}
+      {/* Re-renders bash tool headers when the seeded collapsed-summary mode arrives (#4972). */}
+      <BashCollapsedSummaryModeProvider>
+        <TooltipProvider>
+          {/* Covers the transcript's bash cards and the dock's background processes strip
+              (#5092). Without a selection nothing reads it: both render only for a selected
+              workspace. */}
+          {/* Never key this by the server connection: it wraps the whole layout, and a remount
+              replaces the transcript scrollport that useAutoScroll observes, leaving a fresh
+              open unpinned from the bottom (#5231). connectionKey, the error popover's scope,
+              and the strip's key scope late failures and rows to the connection instead. */}
+          <BackgroundBashProvider
+            workspaceId={props.selectedWorkspaceId ?? ""}
+            connectionKey={props.apiConnectionKey}
+          >
+            {props.children}
+            <BackgroundBashErrorPopover
+              workspaceId={props.selectedWorkspaceId}
               connectionKey={props.apiConnectionKey}
-            >
-              {props.children}
-              <BackgroundBashErrorPopover
-                workspaceId={props.selectedWorkspaceId}
-                connectionKey={props.apiConnectionKey}
-              />
-            </BackgroundBashProvider>
-          </TooltipProvider>
-        </BashCollapsedSummaryModeProvider>
-      </AgentProvider>
-    </PolicyProvider>
+            />
+          </BackgroundBashProvider>
+        </TooltipProvider>
+      </BashCollapsedSummaryModeProvider>
+    </AgentProvider>
   );
 }
 
@@ -282,7 +282,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
   // The API context wraps the whole webview app: its body calls shared hooks that read it
   // (useResumeStream for the interrupted divider and its keybind).
   return (
-    <APIProvider client={apiClient}>
+    <APIProvider client={apiClient} skipAppConfigStore>
       <WebviewApp bridge={bridge} apiClient={apiClient} />
     </APIProvider>
   );
@@ -295,12 +295,13 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
   const [connectionStatus, setConnectionStatus] = useState<UiConnectionStatus | null>(null);
   const [workspaces, setWorkspaces] = useState<UiWorkspace[]>([]);
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string | null>(null);
-  // Mirrors the replay's caught-up flag for rendering: the composer stays disabled until the
-  // history replay completes, so a send never acts on a partial transcript.
+  // Mirrors the replay's caught-up flag for rendering: the transcript and the composer wait for
+  // the history replay to complete, so a send never acts on a partial transcript.
   const [transcriptCaughtUp, setTranscriptCaughtUp] = useState(false);
 
   const activeWorkspaceIdRef = useRef<string | null>(null);
   const connectionKeyRef = useRef<string | null>(null);
+  const lastApiConnectionKeyRef = useRef<string | null>(null);
   activeWorkspaceIdRef.current = selectedWorkspaceId;
 
   const chatReplayStateRef = useRef<ChatReplayState | null>(null);
@@ -332,8 +333,13 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
     );
   const displayedMessages = displayedRows.messages;
   const renderedMessages = displayedRows.rendered;
-  // Armed background bash monitors of the selected workspace, forwarded by the host (#4971).
-  const [activeBashMonitorCount, setActiveBashMonitorCount] = useState(0);
+  // Activity of the selected workspace and its descendants, forwarded by the host (#4971, #5109).
+  const [workspaceActivity, setWorkspaceActivity] = useState<Record<string, UiWorkspaceActivity>>(
+    {}
+  );
+  const activeBashMonitorCount = selectedWorkspaceId
+    ? (workspaceActivity[selectedWorkspaceId]?.activeBashMonitorCount ?? 0)
+    : 0;
   // The backend's auto-retry status, read-only (the webview never toggles or stops auto-retry):
   // tracked from the same auto-retry-* chat events WorkspaceStore uses, and cleared by
   // stream-start/stream-end and by every reset (new selection, chatReset, new replay). While a
@@ -463,33 +469,40 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
   const canChat = Boolean(connectionStatus?.mode === "api" && selectedWorkspaceId);
   const apiConnectionKey = getApiConnectionKey(connectionStatus);
 
+  // #5202: like desktop ChatPane's first-paint barrier, hold the transcript and the dock
+  // decorations until the replay caught up and the workspace's background bash state is known
+  // (or the shared deadline passed), so the processes strip, held inputs and turn status reveal
+  // with the transcript instead of growing the dock under it.
+  const backgroundBashStateKnown = useBackgroundBashStateKnown(
+    canChat && selectedWorkspaceId ? selectedWorkspaceId : undefined
+  );
+  const chatViewDataReady = useChatViewDataReadyDeadline(
+    selectedWorkspaceId ?? "",
+    !canChat || backgroundBashStateKnown
+  );
+  const chatRevealed = transcriptCaughtUp && chatViewDataReady;
+
   // #4766: the model list, model routing and thinking floors read the shared providers and app
   // config stores, which the desktop connects in AppLoader. Connect them while the host has a
   // server connection (it rejects calls in file mode), and reconnect them for each server, so a
   // recovery or a switch to another server fetches them again. The host
   // redacts both results (see redactWebviewOrpcResult).
-  // The app config snapshot also seeds the backend preferences shared components read from
-  // localStorage (#4972, #4962), on connect and on every config change.
   useEffect(() => {
     if (apiConnectionKey === null) {
       return;
     }
     const providersConfigStore = getProvidersConfigStore();
     const appConfigStore = getAppConfigStore();
-    // Until this server's config loads, the seeded keys may hold another server's values: the
-    // store keeps the previous server's snapshot, and localStorage can outlive the previous webview
-    // session. Clear them first so a send in that window never uses another server's agent defaults.
-    seedWebviewPreferences(null);
-    const unsubscribeSeed = appConfigStore.subscribe(() => {
-      seedWebviewPreferences(appConfigStore.getSnapshot());
-    });
+    // Until this server's config loads, the store still holds the previous server's config. Clear
+    // it first so nothing in that window, a send included, uses another server's preferences or
+    // agent defaults.
+    appConfigStore.clearCachedState();
     providersConfigStore.setClient(apiClient);
     appConfigStore.setClient(apiClient);
     // The background processes strip and the bash tool cards' live process status (#5092). A
     // server switch already dropped the previous server's cached rows (connectionStatus handler).
     backgroundBashStore.setClient(apiClient);
     return () => {
-      unsubscribeSeed();
       providersConfigStore.setClient(null);
       appConfigStore.setClient(null);
       backgroundBashStore.setClient(null);
@@ -521,20 +534,26 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
             backgroundBashStore.setClient(null);
             backgroundBashStore.clearCachedState();
           }
+          // AI picks and metadata belong to one server: a switch to another server drops them
+          // before its workspaces arrive, a reconnect to the same server keeps them.
+          if (nextConnectionKey !== null) {
+            const lastApiConnectionKey = lastApiConnectionKeyRef.current;
+            if (lastApiConnectionKey !== null && lastApiConnectionKey !== nextConnectionKey) {
+              clearAiSelectionState();
+            }
+            lastApiConnectionKeyRef.current = nextConnectionKey;
+          }
           setConnectionStatus(msg.status);
           return;
         }
         case "workspaces":
-          // Seed each workspace's persisted agent/AI settings into the composer's storage, with the
-          // desktop's own rules (#4738): a main workspace is snapshotted once per webview load, a
-          // sub-agent workspace follows its backend settings.
+          // The composer resolves each workspace's agent and AI settings from them (#4738).
           for (const workspace of msg.workspaces) {
             if (!workspace.ai) continue;
-            const previousAi = workspacesRef.current.find((w) => w.id === workspace.id)?.ai;
-            seedWorkspaceLocalStorageFromBackend(
-              { id: workspace.id, ...workspace.ai },
-              previousAi ? { id: workspace.id, ...previousAi } : undefined
-            );
+            setWorkspaceAiMetadata(workspace.id, {
+              projectPath: workspace.projectPath,
+              ...workspace.ai,
+            });
           }
           workspacesRef.current = msg.workspaces;
           setWorkspaces(msg.workspaces);
@@ -557,7 +576,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
           liveBashOutput.reset(msg.workspaceId);
           setHeldInputs([]);
           setAutoRetryState(null);
-          setActiveBashMonitorCount(0);
+          setWorkspaceActivity({});
           chatReplayStateRef.current = msg.workspaceId
             ? createChatReplayState(msg.workspaceId)
             : null;
@@ -747,8 +766,9 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
           return;
         }
         case "workspaceActivity":
+          // Merged: a workspace missing from a post (activity unreadable) keeps its last value.
           if (msg.workspaceId === activeWorkspaceIdRef.current) {
-            setActiveBashMonitorCount(msg.activeBashMonitorCount);
+            setWorkspaceActivity((previous) => ({ ...previous, ...msg.activity }));
           }
           return;
         case "uiNotice": {
@@ -825,7 +845,9 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (!canChat || !selectedWorkspaceId) {
+      // Until the first reveal the turn status is hidden, so Esc must not stop a turn the user
+      // cannot see.
+      if (!canChat || !selectedWorkspaceId || !chatRevealed) {
         return;
       }
 
@@ -834,7 +856,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
         return;
       }
 
-      const vimEnabled = readPersistedState(VIM_ENABLED_KEY, false);
+      const vimEnabled = getUserPreferences().appearance?.vimEnabled === true;
       const interruptKeybind = vimEnabled
         ? KEYBINDS.INTERRUPT_STREAM_VIM
         : KEYBINDS.INTERRUPT_STREAM_NORMAL;
@@ -873,7 +895,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [canChat, selectedWorkspaceId]);
+  }, [canChat, selectedWorkspaceId, chatRevealed]);
 
   // Transcript-scoped Shift+G and Shift+R, as in desktop useAIViewKeybinds: capture phase, and
   // never while typing (the composer still receives a capital G/R) or while a modal owns the
@@ -888,6 +910,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
       }
       if (
         matchesKeybind(e, KEYBINDS.RESUME_STREAM) &&
+        chatRevealed &&
         retryBarrierRef.current?.interruptedTailResumable
       ) {
         e.preventDefault();
@@ -902,7 +925,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
     };
     window.addEventListener("keydown", handleKeyDownCapture, { capture: true });
     return () => window.removeEventListener("keydown", handleKeyDownCapture, { capture: true });
-  }, [selectedWorkspaceId]);
+  }, [selectedWorkspaceId, chatRevealed]);
 
   const requestRefreshWorkspaces = () => {
     bridge.postMessage({ type: "refreshWorkspaces" });
@@ -951,6 +974,17 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
   // webview's aggregator. Its rows are never deferred, so renderedMessages are the merged rows on
   // screen and messages the raw ones, as in ChatPane.
   const aggregator = aggregatorRef.current;
+  // Retry and resume act on the transcript's tail, so they need the same complete replay as the
+  // transcript barrier (#5116): after a forced catch-up (replay buffer overflow) the partial tail
+  // may not be the backend's latest turn. The barrier also requires the server connection.
+  const subscribeTranscriptBarrier = useCallback(
+    (listener: () => void) => transcriptBarrier.subscribe(selectedWorkspaceId ?? "", listener),
+    [transcriptBarrier, selectedWorkspaceId]
+  );
+  const retryActionsAllowed = useSyncExternalStore(
+    subscribeTranscriptBarrier,
+    () => selectedWorkspaceId != null && transcriptBarrier.isAllowed(selectedWorkspaceId)
+  );
   const autoRetryStatus =
     autoRetryState?.workspaceId === selectedWorkspaceId ? autoRetryState.status : null;
   const retryBarrier =
@@ -965,10 +999,10 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
           autoRetryStatus,
           isHydratingTranscript: !transcriptCaughtUp,
           isTurnActive: streamState.isStreamStarting || streamState.canInterrupt,
-          // Without a server connection (file mode) every bridged action is refused, so the
-          // interrupted divider offers no resume (as a read-only desktop transcript) and the
-          // retry barrier is not mounted below.
-          transcriptOnly: !canChat,
+          // Without a server connection (file mode) every bridged action is refused, and a partial
+          // replay may not show the latest turn, so the interrupted divider offers no resume (as a
+          // read-only desktop transcript) and the retry barrier is not mounted below.
+          transcriptOnly: !retryActionsAllowed,
         })
       : null;
   // Retry and resume send as the composer does: a sub-agent's locked agent, not a stored pick
@@ -1091,7 +1125,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                     onTouchMove={markUserScrollIntent}
                   >
                     <div style={autoScroll ? TRANSCRIPT_CONTENT_NO_ANCHOR_STYLE : undefined}>
-                      {selectedWorkspaceId ? (
+                      {selectedWorkspaceId && chatRevealed ? (
                         <LiveBashOutputSourceContext.Provider value={liveBashOutput}>
                           <TranscriptBundleRows
                             workspaceId={selectedWorkspaceId}
@@ -1155,7 +1189,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                             }}
                           />
                           {/* Transcript tail, after the rows, as in desktop ChatPane. */}
-                          {canChat && retryBarrier?.shouldMountRetryBarrier && streamState ? (
+                          {retryActionsAllowed && retryBarrier?.shouldMountRetryBarrier && streamState ? (
                             <RetryBarrierContent
                               workspaceId={selectedWorkspaceId}
                               visible={retryBarrier.showRetryBarrierUI}
@@ -1221,7 +1255,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                         </span>
                       </button>
                     ) : null}
-                    {selectedWorkspaceId && heldInputs.length > 0 ? (
+                    {selectedWorkspaceId && chatRevealed && heldInputs.length > 0 ? (
                       // Bounded scroll lane: many or long held inputs must not push the composer
                       // below the fixed-height layout or collapse the transcript.
                       <div className="max-h-[40vh] overflow-y-auto">
@@ -1240,7 +1274,21 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                         desktop dock. Keyed so the expanded list and an open output dialog never
                         carry over to another workspace or server. Without a server connection the
                         store has no client, so its last-known processes are not offered. */}
-                    {selectedWorkspaceId && canChat ? (
+                    {selectedWorkspaceId && canChat && chatRevealed ? (
+                      // Above the background bashes, as in the desktop dock. Same gutter fix.
+                      <div className="-mx-[15px]">
+                        <SubAgentTasksDock
+                          key={`sub-agent-tasks-${apiConnectionKey ?? ""}-${selectedWorkspaceId}`}
+                          workspaces={workspaces}
+                          workspaceId={selectedWorkspaceId}
+                          activity={workspaceActivity}
+                          onSelect={(workspaceId) =>
+                            bridge.postMessage({ type: "selectWorkspace", workspaceId })
+                          }
+                        />
+                      </div>
+                    ) : null}
+                    {selectedWorkspaceId && canChat && chatRevealed ? (
                       // The shared banner brings its own dock gutter (desktop's composer has the
                       // same one); cancel this dock's padding so it lines up with the composer.
                       <div className="-mx-[15px]">
@@ -1253,7 +1301,7 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                       </div>
                     ) : null}
                     {/* Live turn status sits beside the input, below held inputs, as in desktop. */}
-                    {selectedWorkspaceId ? (
+                    {selectedWorkspaceId && chatRevealed ? (
                       <VscodeStreamingBarrier
                         workspaceId={selectedWorkspaceId}
                         aggregator={aggregatorRef.current}
@@ -1267,11 +1315,11 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                       <ChatComposer
                         key={selectedWorkspaceId}
                         workspaceId={selectedWorkspaceId}
-                        disabled={!canChat || !transcriptCaughtUp}
+                        disabled={!canChat || !chatRevealed}
                         disabledReason={
                           !canChat
                             ? "Chat requires Xum server connection."
-                            : !transcriptCaughtUp
+                            : !chatRevealed
                               ? "Loading chat history..."
                               : undefined
                         }

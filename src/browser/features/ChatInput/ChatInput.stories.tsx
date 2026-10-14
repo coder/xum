@@ -2,13 +2,8 @@ import type { AppStory } from "@/browser/stories/meta.js";
 import { appMeta, AppWithMocks, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
 import { collapseLeftSidebar, setWorkspaceInput } from "@/browser/stories/helpers/uiState";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import {
-  getAutoModelRoutingKey,
-  getModelKey,
-  getReasoningModeKey,
-} from "@/common/constants/storage";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { setAutoRoutingPick } from "@/browser/utils/aiSelectionIntent";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
 import { createFileReadTool } from "@/browser/stories/mocks/tools";
 import { STABLE_TIMESTAMP } from "@/browser/stories/mocks/workspaces";
@@ -16,11 +11,13 @@ import {
   blurActiveElement,
   waitForChatInputAutofocusDone,
 } from "@/browser/stories/storyPlayHelpers.js";
-import { within, userEvent, waitFor } from "@storybook/test";
+import { expect, within, userEvent, waitFor } from "@storybook/test";
 import { MOBILE_TOUCH_TARGET_PX, NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
+import type { ThemeMode } from "@/browser/contexts/ThemeContext";
+import { textContrasts } from "@/browser/stories/helpers/contrast";
 
-// Tailwind's `max-w-4xl` in px, the cap the centered transcript and composer columns share.
-const CENTERED_COLUMN_MAX_WIDTH_PX = 896;
+// `max-w-chat` (--container-chat: 48rem) in px, the cap the centered transcript and composer columns share.
+const CENTERED_COLUMN_MAX_WIDTH_PX = 768;
 
 const meta = { ...appMeta, title: "App/Chat/Input" };
 export default meta;
@@ -390,6 +387,41 @@ export const QueuedFollowUp: AppStory = {
   },
 };
 
+/**
+ * The tinted (`bg-muted/10`) action buttons on queued and held inputs reach WCAG AA (4.5:1).
+ * They used `--color-secondary`, which was 4.49:1 on the light dock (#6453).
+ */
+const queuedButtonContrastStory = (theme: ThemeMode): AppStory => ({
+  globals: { theme },
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  render: QueuedFollowUp.render,
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    const buttons = await waitFor(() => {
+      const status = [
+        ...storyRoot.querySelectorAll<HTMLElement>('[data-component="QueuedMessageStatus"]'),
+      ];
+      const sends = [
+        ...storyRoot.querySelectorAll<HTMLElement>('[data-component="HeldInputBanner"]'),
+      ].flatMap((banner) => within(banner).queryAllByRole("button", { name: /^Send/ }));
+      const found = [...status, ...sends];
+      // One queued status button and the three held inputs' Send buttons, at least.
+      if (found.length < 4) throw new Error(`expected 4+ action buttons, found ${found.length}`);
+      return found;
+    });
+    const failing = buttons
+      .flatMap((button) => textContrasts(button))
+      // Shortcut hints are their own `text-muted` chips, not the tinted button's label.
+      .filter((entry) => !entry.element.closest("kbd"))
+      .filter((entry) => entry.ratio < 4.5)
+      .map((entry) => `${entry.ratio.toFixed(2)}:1 "${entry.text}"`);
+    await expect(failing.join("\n")).toBe("");
+  },
+});
+
+export const QueuedButtonsContrastLight = queuedButtonContrastStory("light");
+export const QueuedButtonsContrastDark = queuedButtonContrastStory("dark");
+
 export const FocusedComposer: AppStory = {
   render: () => (
     <AppWithMocks
@@ -411,7 +443,7 @@ export const FocusedComposer: AppStory = {
 
     await waitForChatInputAutofocusDone(storyRoot);
 
-    const textarea = await canvas.findByLabelText("Message Claude");
+    const textarea = await canvas.findByLabelText("Message");
     const surface = storyRoot.querySelector('[data-component="ChatInputSurface"]');
     if (!surface) throw new Error("Composer surface not rendered");
 
@@ -436,16 +468,16 @@ export const ThinkingSelectorOpen: AppStory = {
     <AppWithMocks
       setup={() => {
         collapseLeftSidebar();
-        updatePersistedState(getModelKey("ws-thinking-selector"), "openai:gpt-6.1-sol");
-        updatePersistedState(getReasoningModeKey("ws-thinking-selector"), "pro");
         return setupSimpleChatStory({
           workspaceId: "ws-thinking-selector",
+          aiSettings: { model: "openai:gpt-6.1-sol", thinkingLevel: "off", reasoningMode: "pro" },
           providersConfig: {
             openai: {
               apiKeySet: true,
               isEnabled: true,
               isConfigured: true,
               serviceTier: "priority",
+              cyberModelEnabled: true,
             },
           },
           messages: [],
@@ -461,7 +493,7 @@ export const ThinkingSelectorOpen: AppStory = {
     docs: {
       description: {
         story:
-          "Opens the chat-input thinking selector with Pro and fast mode active, including the phone-width layout.",
+          "Opens the chat-input thinking selector with Pro and fast mode active and the Cyber row offered, including the phone-width layout.",
       },
     },
   },
@@ -477,10 +509,156 @@ export const ThinkingSelectorOpen: AppStory = {
       if (!within(menu).getByRole("button", { name: /Pro mode/i })) {
         throw new Error("Pro mode row missing");
       }
-      if (!within(menu).getByRole("button", { name: /Fast mode/i })) {
+      if (!within(menu).getByRole("button", { name: /^Fast mode/i })) {
         throw new Error("Fast mode row missing");
       }
+      if (!within(menu).getByRole("button", { name: /Cyber/ })) {
+        throw new Error("Cyber row missing");
+      }
     });
+  },
+};
+
+export const ThinkingSelectorCyberOpen: AppStory = {
+  tags: ["thinking-selector"],
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        collapseLeftSidebar();
+        return setupSimpleChatStory({
+          workspaceId: "ws-thinking-selector-cyber",
+          aiSettings: { model: "openai:gpt-6.1-sol", thinkingLevel: "off", reasoningMode: "cyber" },
+          providersConfig: {
+            openai: {
+              apiKeySet: true,
+              isEnabled: true,
+              isConfigured: true,
+              cyberModelEnabled: true,
+            },
+          },
+          messages: [],
+        });
+      }}
+    />
+  ),
+  parameters: {
+    ...appMeta.parameters,
+    // ThinkingSelectorOpen snapshots the Cyber row; this story checks the active-Cyber state.
+    pixel: PIXEL_DISABLED,
+    docs: {
+      description: {
+        story:
+          "Opens the chat-input thinking selector with the OpenAI cyber model setting on and Cyber mode active.",
+      },
+    },
+  },
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    await waitForChatInputAutofocusDone(storyRoot);
+    blurActiveElement();
+
+    const trigger = within(storyRoot).getByRole("button", { name: /Thinking:/i });
+    await expect(trigger).toHaveAccessibleName(/cyber mode/);
+    await userEvent.click(trigger);
+    const menu = await waitFor(() => {
+      const match = storyRoot.querySelector<HTMLElement>('[data-component="ThinkingSelectorMenu"]');
+      if (!match) throw new Error("Thinking selector menu did not open");
+      return match;
+    });
+    await expect(within(menu).getByRole("button", { name: /Cyber/ })).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    );
+    await expect(within(menu).getByRole("button", { name: /Pro mode/i })).toHaveAttribute(
+      "aria-pressed",
+      "false"
+    );
+  },
+};
+
+/**
+ * Ultrafast's closed-state indicator is Fast's bolt plus speed trails, so it is wider than the
+ * Fast bolt. The fixed-width wrapper pins the tightest composer row (the test-runner ignores
+ * viewport globals) to prove the wider indicator stays visible without overflowing the row.
+ */
+export const ThinkingSelectorUltrafast: AppStory = {
+  tags: ["thinking-selector"],
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  render: () => (
+    // min() keeps the test-runner's desktop window at the tightest row while Pixel's
+    // phone viewport (narrower than 400px) still sets the real width.
+    <div data-testid="composer-width-wrapper" style={{ width: "min(400px, 100%)", height: 700 }}>
+      <AppWithMocks
+        setup={() => {
+          collapseLeftSidebar();
+          return setupSimpleChatStory({
+            workspaceId: "ws-thinking-selector-ultrafast",
+            aiSettings: { model: "openai:gpt-6.1-sol", thinkingLevel: "off" },
+            providersConfig: {
+              openai: {
+                apiKeySet: true,
+                isEnabled: true,
+                isConfigured: true,
+                serviceTier: "ultrafast",
+                fastModePreviousServiceTier: "unset",
+              },
+            },
+            messages: [],
+          });
+        }}
+      />
+    </div>
+  ),
+  parameters: {
+    ...appMeta.parameters,
+    // One snapshot pins the new indicator glyph; the play covers fit and state on every run.
+    pixel: {
+      matrix: { themes: ["dark"], viewports: ["phone"] },
+    },
+    docs: {
+      description: {
+        story:
+          "Ultrafast mode active on GPT-6.1 Sol: the closed selector shows the bolt-with-trails indicator and the open menu marks Ultrafast, not Fast.",
+      },
+    },
+  },
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    await waitForChatInputAutofocusDone(storyRoot);
+    blurActiveElement();
+
+    const trigger = within(storyRoot).getByRole("button", { name: /Thinking:/i });
+    await expect(trigger).toHaveAccessibleName(/ultrafast mode/);
+    const indicator = storyRoot.querySelector<HTMLElement>("[data-ultrafast-mode-indicator]");
+    if (!indicator || indicator.getBoundingClientRect().width === 0) {
+      throw new Error("Ultrafast indicator should be visible on the tightest composer row");
+    }
+    if (storyRoot.querySelector("[data-fast-mode-indicator]")) {
+      throw new Error("Fast indicator must not render while Ultrafast is the active tier");
+    }
+    assertComposerPillGeometry(storyRoot);
+    const row = storyRoot.querySelector<HTMLElement>('[data-component="ComposerControlRow"]');
+    if (!row) throw new Error("Composer control row not rendered");
+    if (row.scrollWidth > row.clientWidth) {
+      throw new Error(`Row overflows by ${row.scrollWidth - row.clientWidth}px with Ultrafast`);
+    }
+
+    await userEvent.click(trigger);
+    const menu = await waitFor(() => {
+      const match = storyRoot.querySelector<HTMLElement>('[data-component="ThinkingSelectorMenu"]');
+      if (!match) throw new Error("Thinking selector menu did not open");
+      return match;
+    });
+    await expect(within(menu).getByRole("button", { name: /^Ultrafast mode/i })).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    );
+    await expect(within(menu).getByRole("button", { name: /^Fast mode/i })).toHaveAttribute(
+      "aria-pressed",
+      "false"
+    );
   },
 };
 
@@ -499,10 +677,9 @@ export const NarrowControlRowCollapse: AppStory = {
           collapseLeftSidebar();
           // Active Pro and fast modes exercise both compact selector status indicators while the
           // narrow-width assertions prove the row still sheds optional detail before overflowing.
-          updatePersistedState(getModelKey("ws-composer-breakpoints"), "openai:gpt-6.1-sol");
-          updatePersistedState(getReasoningModeKey("ws-composer-breakpoints"), "pro");
           return setupSimpleChatStory({
             workspaceId: "ws-composer-breakpoints",
+            aiSettings: { model: "openai:gpt-6.1-sol", thinkingLevel: "off", reasoningMode: "pro" },
             providersConfig: {
               openai: {
                 apiKeySet: true,
@@ -839,7 +1016,7 @@ export const EditingMessage: AppStory = {
 
     // Wait for the editing state to be applied
     await waitFor(() => {
-      canvas.getByLabelText("Edit your last message");
+      canvas.getByLabelText("Edit message");
       const surface = storyRoot.querySelector('[data-component="ChatInputSurface"]');
       if (!surface?.classList.contains("border-editing-mode")) {
         throw new Error("Composer surface not in editing state");
@@ -913,7 +1090,10 @@ async function assertDockSurfacesMatchTranscript(
     surfaces.push([label, element]);
   };
   addSurface("composer", '[data-component="ChatInputSurface"]');
-  addSurface("decoration", '[data-component="ChatInputDecorationStack"] button');
+  // The background-process decoration can mount after the composer autofocuses.
+  await waitFor(() =>
+    addSurface("decoration", '[data-component="ChatInputDecorationStack"] button')
+  );
   const wrapped = storyRoot.querySelectorAll<HTMLElement>('[data-component="ChatDockSurface"]');
   if (wrapped.length === 0) throw new Error("No ChatDockSurface-wrapped entry rendered");
   wrapped.forEach((element, index) => surfaces.push([`wrapped surface ${index}`, element]));
@@ -922,7 +1102,7 @@ async function assertDockSurfacesMatchTranscript(
     const column = transcript.getBoundingClientRect();
     const available = scrollport.clientWidth;
     if (expectation === "full-width") {
-      // Docked surfaces used to hardcode the same 4xl cap the centered column uses, so below that
+      // Docked surfaces used to hardcode the same cap the centered column uses, so below that
       // width they line up regardless and the regression would pass unnoticed.
       if (column.width <= CENTERED_COLUMN_MAX_WIDTH_PX) {
         throw new Error(
@@ -993,11 +1173,11 @@ export const AutoModelRoutingActive: AppStory = {
     <AppWithMocks
       setup={() => {
         collapseLeftSidebar();
-        updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING), true);
-        updatePersistedState(getModelKey("ws-auto-routing"), "openai:gpt-5.6-sol");
-        updatePersistedState(getAutoModelRoutingKey("ws-auto-routing"), true);
+        setAutoRoutingPick("ws-auto-routing", "exec", "model", true);
         return setupSimpleChatStory({
           workspaceId: "ws-auto-routing",
+          aiSettings: { model: "openai:gpt-5.6-sol", thinkingLevel: "off" },
+          experiments: { [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: true },
           providersConfig: {
             openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
           },
@@ -1043,10 +1223,10 @@ export const AutoModelRoutingKeyboard: AppStory = {
     <AppWithMocks
       setup={() => {
         collapseLeftSidebar();
-        updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING), true);
-        updatePersistedState(getModelKey("ws-auto-routing-keyboard"), "openai:gpt-5.6-sol");
         return setupSimpleChatStory({
           workspaceId: "ws-auto-routing-keyboard",
+          aiSettings: { model: "openai:gpt-5.6-sol", thinkingLevel: "off" },
+          experiments: { [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: true },
           providersConfig: {
             openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
           },

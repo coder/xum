@@ -105,7 +105,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   beforeEach(async () => {
     mockStreamManager = { ...createStreamLifecycleMocks(), getStreamInfo: mock(() => undefined) };
     harness = await createWorkspaceServiceHarness({
-      streamManager: mockStreamManager as unknown as WorkspaceServiceArgs[12],
+      streamManager: mockStreamManager as unknown as WorkspaceServiceArgs[11],
     });
     ({ config, service: workspaceService, aiService } = harness);
     externalEditorMarkerPath = path.join(config.sessionsDir, workspaceId, "external-editor-opened");
@@ -132,7 +132,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   });
 
   test("archive refuses to hide a parent while descendant sub-agents remain active", async () => {
-    const editConfigCalls = spyOn(config, "editConfig");
+    const entryBefore = readEntry();
     const hasActiveDescendantAgentTasksForWorkspace = mock(() => true);
     workspaceService.setAgentTaskIntegration(
       makeAgentTaskIntegrationFake({
@@ -148,7 +148,8 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(preflight).toEqual(Err(expectedError));
     expect(archive).toEqual(Err(expectedError));
     expect(hasActiveDescendantAgentTasksForWorkspace).toHaveBeenCalledWith(workspaceId);
-    expect(editConfigCalls).not.toHaveBeenCalled();
+    // Refused before any commit: the row is as it was (its #4928 archive marker was cleared).
+    expect(readEntry()).toEqual(entryBefore);
     expect(readEntry()?.archivedAt).toBeUndefined();
   });
 
@@ -187,11 +188,61 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     }
   );
 
+  // #5411: the archive's interruption of a shared-desktop child owes its goal pause; it is
+  // settled once the archive is durable (not left owed until a later reactivation).
+  test("archiving a running shared-desktop child settles the goal pause it owes", async () => {
+    await config.editConfig((cfg) => {
+      cfg.projects.get(projectPath)?.workspaces.unshift({
+        path: "/tmp/project/owner",
+        id: "owner",
+        name: "owner",
+        createdAt: "2020-01-01T00:00:00.000Z",
+      });
+      return cfg;
+    });
+    await editEntry((entry) =>
+      Object.assign(entry, {
+        parentWorkspaceId: "owner",
+        taskStatus: "running",
+        taskAttemptId: "att_00000000000000a1",
+        taskDesktopOwnerWorkspaceId: "owner",
+      })
+    );
+    const settledRows: Array<ReturnType<typeof readEntry>> = [];
+    const order: string[] = [];
+    const settleOwedChildGoalPause = mock((_workspaceId: string) => {
+      settledRows.push(readEntry());
+      order.push("settle");
+      return Promise.resolve();
+    });
+    // The pause appends a boundary row, so it must follow the stop of live activity.
+    const internal = workspaceService as unknown as {
+      stopLiveWorkspaceActivityForArchive(workspaceId: string): Promise<void>;
+    };
+    const realStop = internal.stopLiveWorkspaceActivityForArchive.bind(workspaceService);
+    spyOn(internal, "stopLiveWorkspaceActivityForArchive").mockImplementation(async (id) => {
+      order.push("stop");
+      await realStop(id);
+    });
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({ settleOwedChildGoalPause })
+    );
+
+    expect(await workspaceService.archive(workspaceId)).toEqual(Ok({ kind: "archived" }));
+
+    expect(settleOwedChildGoalPause).toHaveBeenCalledWith(workspaceId);
+    // Settled after the archive write that recorded the owed pause.
+    expect(settledRows[0]?.archivedAt).toBeTruthy();
+    expect(settledRows[0]?.taskStatus).toBe("interrupted");
+    expect(settledRows[0]?.taskGoalPauseOwed).toBe("att_00000000000000a1");
+    expect(order).toEqual(["stop", "settle"]);
+  });
+
   test("returns Err and does not persist archivedAt when beforeArchive hook fails", async () => {
     const hooks = new WorkspaceLifecycleHooks();
     hooks.registerBeforeArchive(() => Promise.resolve(Err("hook failed")));
     workspaceService.setWorkspaceLifecycleHooks(hooks);
-    const editConfigCalls = spyOn(config, "editConfig");
+    const entryBefore = readEntry();
 
     const result = await workspaceService.archive(workspaceId);
 
@@ -200,10 +251,138 @@ describe("WorkspaceService archive lifecycle hooks", () => {
       expect(result.error).toBe("hook failed");
     }
 
-    expect(editConfigCalls).toHaveBeenCalledTimes(0);
+    expect(readEntry()).toEqual(entryBefore);
 
     const entry = readEntry();
     expect(entry?.archivedAt).toBeUndefined();
+  });
+
+  // Archive stops this backend's background processes before its hooks stop the runtime or
+  // delete the checkout, and keeps new spawns and fg->bg migrations refused until it settles.
+  test("stops background processes before its hooks and refuses spawns until it settles", async () => {
+    const manager = harness.backgroundProcessManager;
+    const calls: string[] = [];
+    const cleanup = manager.cleanup.bind(manager);
+    spyOn(manager, "cleanup").mockImplementation(async (id: string) => {
+      calls.push(`cleanup:${id}`);
+      await cleanup(id);
+    });
+    const spawnDuringArchive = async (hook: string) => {
+      const spawned = await manager.spawn(new LocalRuntime(process.cwd()), workspaceId, "true", {
+        cwd: process.cwd(),
+        displayName: "during-archive",
+      });
+      calls.push(`${hook}:spawn ${spawned.success ? "started" : "refused"}`);
+    };
+    const hooks = new WorkspaceLifecycleHooks();
+    hooks.registerBeforeArchive(async () => {
+      await spawnDuringArchive("beforeArchive");
+      return Ok(undefined);
+    });
+    hooks.registerAfterArchive(async () => {
+      await spawnDuringArchive("afterArchive");
+      return Ok(undefined);
+    });
+    workspaceService.setWorkspaceLifecycleHooks(hooks);
+
+    expect(await workspaceService.archive(workspaceId)).toEqual(Ok({ kind: "archived" }));
+
+    // Once before the hooks, once after the (post-persistence) stream stop.
+    expect(calls).toEqual([
+      `cleanup:${workspaceId}`,
+      "beforeArchive:spawn refused",
+      `cleanup:${workspaceId}`,
+      "afterArchive:spawn refused",
+    ]);
+    // The seal lifts once the archive settled.
+    using migration = manager.beginMigration(workspaceId);
+    expect(migration.admitted).toBe(true);
+  });
+
+  // A foreground command of the still-running stream
+  // whose migration the archive's seal refused is being killed when the stream stops; the cleanup
+  // after the stream stop waits for it, so the checkout deletion cannot run under it.
+  test("waits for a migration refused during the archive before deleting the checkout", async () => {
+    const manager = harness.backgroundProcessManager;
+    const events: string[] = [];
+    let refused: Disposable | undefined;
+    const cleanup = manager.cleanup.bind(manager);
+    let cleanups = 0;
+    spyOn(manager, "cleanup").mockImplementation(async (id: string) => {
+      if (++cleanups === 1 || refused === undefined) return cleanup(id);
+      let settled = false;
+      const cleaning = cleanup(id).then(() => (settled = true));
+      // Pending I/O callbacks have run: a cleanup that did not wait would have returned.
+      await new Promise((resolve) => setImmediate(resolve));
+      events.push(`cleanup settled before the refused command stopped: ${settled}`);
+      refused[Symbol.dispose]();
+      events.push("refused command stopped");
+      await cleaning;
+    });
+    const hooks = new WorkspaceLifecycleHooks();
+    hooks.registerBeforeArchive(() => {
+      const migration = manager.beginMigration(workspaceId);
+      events.push(`migration admitted: ${migration.admitted}`);
+      refused = migration;
+      return Promise.resolve(Ok(undefined));
+    });
+    hooks.registerAfterArchive(() => {
+      events.push("afterArchive");
+      return Promise.resolve(Ok(undefined));
+    });
+    workspaceService.setWorkspaceLifecycleHooks(hooks);
+
+    expect(await workspaceService.archive(workspaceId)).toEqual(Ok({ kind: "archived" }));
+
+    expect(events).toEqual([
+      "migration admitted: false",
+      "cleanup settled before the refused command stopped: false",
+      "refused command stopped",
+      "afterArchive",
+    ]);
+  });
+
+  // Once archivedAt is durable the archive stays successful, but it keeps the checkout (skips
+  // the afterArchive hooks that delete it) when it could not stop the workspace's activity.
+  test("keeps the checkout when stopping activity fails after persistence", async () => {
+    const manager = harness.backgroundProcessManager;
+    const cleanup = manager.cleanup.bind(manager);
+    spyOn(manager, "cleanup")
+      .mockImplementationOnce((id: string) => cleanup(id))
+      .mockRejectedValueOnce(new Error("terminate failed"));
+    const afterArchive = mock(() => Promise.resolve(Ok(undefined)));
+    const hooks = new WorkspaceLifecycleHooks();
+    hooks.registerAfterArchive(afterArchive);
+    workspaceService.setWorkspaceLifecycleHooks(hooks);
+
+    expect(await workspaceService.archive(workspaceId)).toEqual(Ok({ kind: "archived" }));
+
+    expect(readEntry()?.archivedAt).toBeTruthy();
+    expect(afterArchive).toHaveBeenCalledTimes(0);
+  });
+
+  // Fail-safe: if this backend cannot stop its background processes, the archive fails before
+  // its hooks run and before anything is persisted or deleted, rather than strand them.
+  test("fails before its hooks and persistence when stopping background processes throws", async () => {
+    const manager = harness.backgroundProcessManager;
+    spyOn(manager, "cleanup").mockRejectedValueOnce(new Error("terminate failed"));
+    const beforeArchive = mock(() => Promise.resolve(Ok(undefined)));
+    const afterArchive = mock(() => Promise.resolve(Ok(undefined)));
+    const hooks = new WorkspaceLifecycleHooks();
+    hooks.registerBeforeArchive(beforeArchive);
+    hooks.registerAfterArchive(afterArchive);
+    workspaceService.setWorkspaceLifecycleHooks(hooks);
+    const entryBefore = readEntry();
+
+    const result = await workspaceService.archive(workspaceId);
+
+    expect(result).toEqual(Err("Failed to archive workspace: terminate failed"));
+    expect(beforeArchive).toHaveBeenCalledTimes(0);
+    expect(afterArchive).toHaveBeenCalledTimes(0);
+    expect(readEntry()).toEqual(entryBefore);
+    // The failed archive keeps the workspace, which can background commands again.
+    using migration = manager.beginMigration(workspaceId);
+    expect(migration.admitted).toBe(true);
   });
 
   test("does not interrupt an active stream when beforeArchive hook fails", async () => {
@@ -342,12 +521,11 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     const hooks = new WorkspaceLifecycleHooks();
     hooks.registerBeforeArchive(() => Promise.resolve(Ok(undefined)));
     workspaceService.setWorkspaceLifecycleHooks(hooks);
-    const editConfigCalls = spyOn(config, "editConfig");
 
     const result = await workspaceService.archive(workspaceId);
 
     expect(result.success).toBe(true);
-    expect(editConfigCalls).toHaveBeenCalledTimes(1);
+    expect(readEntry()?.pendingArchive).toBeUndefined();
 
     const entry = readEntry();
     expect(entry?.archivedAt).toBeTruthy();
@@ -1220,7 +1398,7 @@ describe("WorkspaceService archive init cancellation", () => {
     ]);
     initStateManager.startInit(workspaceId, projectPath);
     const clearInMemoryStateSpy = spyOn(initStateManager, "clearInMemoryState");
-    const editConfigSpy = spyOn(config, "editConfig");
+    const entryBefore = config.loadConfigOrDefault().projects.get(projectPath)?.workspaces[0];
 
     // Seed abort controller so archive() can cancel init.
     const abortController = new AbortController();
@@ -1252,7 +1430,9 @@ describe("WorkspaceService archive init cancellation", () => {
     }
 
     // Ensure we didn't persist archivedAt on hook failure.
-    expect(editConfigSpy).toHaveBeenCalledTimes(0);
+    expect(config.loadConfigOrDefault().projects.get(projectPath)?.workspaces[0]).toEqual(
+      entryBefore
+    );
     const entry = config.loadConfigOrDefault().projects.get(projectPath)?.workspaces[0];
     expect(entry?.archivedAt).toBeUndefined();
 
@@ -1398,7 +1578,6 @@ describe("WorkspaceService archive snapshots", () => {
   const workspacePath = "/tmp/project/ws-archive-snapshot";
 
   let harness: WorkspaceServiceHarness;
-  let editConfigSpy: ReturnType<typeof spyOn<Config, "editConfig">>;
   let workspaceService: WorkspaceService;
 
   const workspaceMetadata: WorkspaceMetadata = {
@@ -1432,7 +1611,6 @@ describe("WorkspaceService archive snapshots", () => {
     await saveWorkspaces(harness.config, projectPath, [workspaceEntry], {
       worktreeArchiveBehavior: "snapshot",
     });
-    editConfigSpy = spyOn(harness.config, "editConfig");
   });
 
   afterEach(async () => {
@@ -1636,7 +1814,7 @@ describe("WorkspaceService archive snapshots", () => {
     const entry = readEntry();
     expect(entry?.archivedAt).toBeUndefined();
     expect(entry?.worktreeArchiveSnapshot).toBeUndefined();
-    expect(editConfigSpy).toHaveBeenCalledTimes(0);
+    expect(entry?.pendingArchive).toBeUndefined();
   });
 
   test("unarchive reconciles workflow attention only after snapshot restoration", async () => {

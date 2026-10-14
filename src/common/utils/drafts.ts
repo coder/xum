@@ -5,7 +5,9 @@ import {
   type DraftAttachmentMetadata,
   type DraftScope,
   type DraftSummary,
+  type PendingSend,
 } from "@/common/orpc/schemas/drafts";
+import { joinDraftText } from "@/common/utils/composerDraftText";
 import { MAX_DRAFT_JSON_BYTES } from "@/constants/drafts";
 
 /** Stable map key for a draft scope (creation keys are unambiguous for any project path). */
@@ -26,6 +28,18 @@ export function createDraftId(): string {
   }
 
   return `draft_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+/**
+ * A new composer send id (idempotent sends; matches SendIdSchema). crypto.randomUUID is missing
+ * in insecure contexts (a plain-HTTP remote browser), where getRandomValues still works.
+ */
+export function createSendId(): string {
+  const maybeCrypto = globalThis.crypto;
+  if (typeof maybeCrypto?.randomUUID === "function") return maybeCrypto.randomUUID();
+  const bytes = new Uint8Array(16);
+  maybeCrypto.getRandomValues(bytes);
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 export function createEmptyDraft(): Draft {
@@ -63,8 +77,51 @@ function utf8ByteLength(value: string): number {
  * JSON size of a draft in UTF-8 bytes, compared against MAX_DRAFT_JSON_BYTES. Bytes, because the
  * transport limits count bytes: UTF-16 code units undercount non-ASCII text up to 3x.
  */
-export function draftJsonBytes(draft: Draft): number {
-  return utf8ByteLength(JSON.stringify({ text: draft.text, attachments: draft.attachments }));
+export function draftJsonBytes(draft: Draft & { pendingSends?: readonly PendingSend[] }): number {
+  return utf8ByteLength(
+    JSON.stringify({
+      text: draft.text,
+      attachments: draft.attachments,
+      // Replay bookkeeping counts too: the file holds it.
+      ...(draft.pendingSends != null && draft.pendingSends.length > 0
+        ? { pendingSends: draft.pendingSends }
+        : {}),
+    })
+  );
+}
+
+/**
+ * Idempotent sends: the draft file keeps the text of pending sends in the legacy `text` field,
+ * before the composer's visible text, joined as a restore merges drafts (retained texts in entry
+ * order, then the visible text). An older build reads it all as ordinary draft text.
+ */
+export function buildLegacyDraftText(
+  pendingSends: readonly PendingSend[],
+  visibleText: string
+): string {
+  return joinDraftText(...pendingSends.map((send) => send.text), visibleText);
+}
+
+/**
+ * The visible text of a legacy `text` written by buildLegacyDraftText, or null when the text does
+ * not start with the retained texts (an older build or another writer rewrote it).
+ */
+export function splitLegacyDraftText(
+  text: string,
+  pendingSends: readonly PendingSend[]
+): string | null {
+  const retained = joinDraftText(...pendingSends.map((send) => send.text));
+  if (retained.length === 0) return text;
+  if (text === retained) return "";
+  const separator = "\n\n";
+  return text.startsWith(retained + separator)
+    ? text.slice(retained.length + separator.length)
+    : null;
+}
+
+/** Ids of the attachments pending sends retain (hidden from the composer). */
+export function retainedAttachmentIds(pendingSends: readonly PendingSend[]): Set<string> {
+  return new Set(pendingSends.flatMap((send) => send.attachmentIds));
 }
 
 const DRAFT_TOO_LARGE_PREFIX = "Draft is too large to save";
@@ -154,11 +211,17 @@ export function toDraftAttachmentMetadata(attachment: DraftAttachment): DraftAtt
   }
 }
 
-export function summarizeDraft(scope: DraftScope, draft: Draft, revision: number): DraftSummary {
+export function summarizeDraft(
+  scope: DraftScope,
+  draft: Draft,
+  revision: number,
+  pendingSends: readonly PendingSend[] = []
+): DraftSummary {
   return {
     scope,
     text: draft.text,
     attachments: draft.attachments.map(toDraftAttachmentMetadata),
+    ...(pendingSends.length > 0 ? { pendingSends: [...pendingSends] } : {}),
     revision,
   };
 }

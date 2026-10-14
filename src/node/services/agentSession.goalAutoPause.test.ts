@@ -1,6 +1,7 @@
 import type { TurnStreamHandle } from "./streamManager";
 import type { StreamEndEvent } from "@/common/types/stream";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { EventEmitter } from "events";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
@@ -17,6 +18,7 @@ import {
   GOAL_BUDGET_LIMIT_KIND,
   GOAL_CONTINUATION_IDLE_CONSUMER_NAME,
   GOAL_CONTINUATION_KIND,
+  type TaskTurnKind,
 } from "@/constants/goals";
 import { waitForCondition } from "./testDispatchHelpers";
 import { IdleDispatcher } from "./idleDispatcher";
@@ -140,6 +142,9 @@ describe("AgentSession goal safety hooks", () => {
       const workspaceId = `budget-rejection-goal-${synthetic}`;
       const { session, goalService, aiService, cleanup } = await createSessionHarness(workspaceId);
       cleanups.push(cleanup);
+      spyOn(aiService, "isExperimentEnabled").mockImplementation(
+        (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET || id === EXPERIMENT_IDS.MEMORY
+      );
       const stream = spyOn(aiService, "streamMessage");
       const candidates = registerBusyKickoffConsumer(goalService);
       await setGoalOk(goalService, { workspaceId, objective: "Keep working until interrupted" });
@@ -147,10 +152,7 @@ describe("AgentSession goal safety hooks", () => {
       expect(candidates.has(workspaceId)).toBe(true);
       const result = await session.sendMessage(
         "Oversized intervention ".repeat(40_000),
-        {
-          ...SEND_OPTIONS,
-          experiments: { tokenBudget: true, memory: true },
-        },
+        SEND_OPTIONS,
         synthetic ? { synthetic: true, agentInitiated: true } : undefined
       );
       expect(result).toMatchObject({ success: false, error: { type: "context_budget_blocked" } });
@@ -166,18 +168,14 @@ describe("AgentSession goal safety hooks", () => {
 
   test("blank token-budget sends do not acknowledge or pause an active goal", async () => {
     const workspaceId = "blank-budget-rejection-goal";
-    const { session, goalService, cleanup } = await createSessionHarness(workspaceId);
+    const { session, goalService, aiService, cleanup } = await createSessionHarness(workspaceId);
     cleanups.push(cleanup);
+    spyOn(aiService, "isExperimentEnabled").mockImplementation(
+      (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET || id === EXPERIMENT_IDS.MEMORY
+    );
     await setGoalOk(goalService, { workspaceId, objective: "Continue working" });
     await goalService.requireUserAcknowledgment(workspaceId, 55_000);
-    expect(
-      (
-        await session.sendMessage(" ", {
-          ...SEND_OPTIONS,
-          experiments: { tokenBudget: true, memory: true },
-        })
-      ).success
-    ).toBe(false);
+    expect((await session.sendMessage(" ", SEND_OPTIONS)).success).toBe(false);
     expect(await goalService.getGoal(workspaceId)).toMatchObject({
       status: "active",
       requireUserAcknowledgmentSinceMs: 55_000,
@@ -519,6 +517,70 @@ describe("AgentSession goal safety hooks", () => {
     const dispatched = await session.dispatchPendingCompactionFollowUpIfNeeded();
     buildSpy.mockRestore();
 
+    expect(dispatched).toBe(false);
+    const history = await historyService.getLastMessages(workspaceId, 10);
+    expect(history.success).toBe(true);
+    if (history.success) {
+      expect(
+        history.data.some((message) =>
+          message.parts.some(
+            (part) => part.type === "text" && part.text === "Continue working on the goal."
+          )
+        )
+      ).toBe(false);
+    }
+    await session.dispose();
+  });
+
+  test("a direct session send in its preflight defers redispatched follow-ups (#5506)", async () => {
+    // A user send made on the session itself (`xum run`) arms no WorkspaceService ticket, so the
+    // idle probes must count the session's own preflight too. Before the fix the follow-up was
+    // admitted, moved the turn, and the user's send was refused as a context mutation.
+    const workspaceId = "compaction-followup-direct-send-preflight";
+    const { session, goalService, historyService, cleanup } =
+      await createSessionHarness(workspaceId);
+    cleanups.push(cleanup);
+    const created = await setGoalOk(goalService, { workspaceId, objective: "Direct send race" });
+    const summary = createMuxMessage(
+      `summary-${crypto.randomUUID()}`,
+      "assistant",
+      "Compacted conversation.",
+      {
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: {
+            text: "Continue working on the goal.",
+            agentId: "exec",
+            model: "openai:gpt-4o",
+            goalKind: GOAL_CONTINUATION_KIND,
+            goalId: created.goalId,
+          },
+        },
+      }
+    );
+    expect((await historyService.appendToHistory(workspaceId, summary)).success).toBe(true);
+
+    // Hold the user's send in prepareMessage's preflight (its turn-lease confirmation).
+    const internal = session as unknown as { confirmTurnUseLease(): Promise<unknown> };
+    const confirm = internal.confirmTurnUseLease.bind(session);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    spyOn(internal, "confirmTurnUseLease").mockImplementationOnce(async () => {
+      entered.resolve();
+      await release.promise;
+      return confirm();
+    });
+    const sending = session.sendMessage("user sends directly", SEND_OPTIONS);
+    let dispatched: boolean | undefined;
+    try {
+      await entered.promise;
+      dispatched = await session.dispatchPendingCompactionFollowUpIfNeeded();
+    } finally {
+      release.resolve();
+    }
+    // Target assertion: the user's send is not refused by the follow-up...
+    expect((await sending).success).toBe(true);
+    // ...because the follow-up yielded to it.
     expect(dispatched).toBe(false);
     const history = await historyService.getLastMessages(workspaceId, 10);
     expect(history.success).toBe(true);
@@ -996,6 +1058,142 @@ describe("AgentSession goal safety hooks", () => {
     });
     await session.dispose();
   });
+
+  // set_goal is refused on turns the goal loop starts itself (budget-reset
+  // escape), so the backend-owned goal kind must reach request assembly, while
+  // user and other synthetic sends keep it unset. The goal id the turn was dispatched for rides
+  // along: complete_goal without a goalId targets it (#5461).
+  test("threads the goal turn kind and goal id into stream requests", async () => {
+    const workspaceId = "goal-turn-kind-threaded";
+    const { session, aiService, cleanup } = await createSessionHarness(workspaceId);
+    cleanups.push(cleanup);
+    const goalTurnKinds: Array<string | undefined> = [];
+    const goalTurnGoalIds: Array<string | undefined> = [];
+    aiService.streamMessage = mock<AgentSessionAIService["streamMessage"]>((options) => {
+      goalTurnKinds.push(options.goalTurnKind);
+      goalTurnGoalIds.push(options.goalTurnGoalId);
+      return Promise.resolve(
+        Ok(createFailedTurnHandle("assistant-turn-kind", { error: "boom", errorType: "unknown" }))
+      );
+    });
+
+    await session.sendMessage("Manual", SEND_OPTIONS);
+    await session.sendMessage("Synthetic continuation", SEND_OPTIONS, {
+      synthetic: true,
+      goalContinuation: true,
+      goalId: "goal-threaded",
+    });
+    await session.sendMessage("Heartbeat-like synthetic", SEND_OPTIONS, { synthetic: true });
+
+    expect(goalTurnKinds).toEqual([undefined, GOAL_CONTINUATION_KIND, undefined]);
+    expect(goalTurnGoalIds).toEqual([undefined, "goal-threaded", undefined]);
+    await session.dispose();
+  });
+
+  // set_goal will be refused on automatic sub-agent turns TaskService drives (report prompts,
+  // recovery, child goal turns), so their backend-owned provenance must reach request assembly
+  // and the durable user row that startup retry replays; other sends keep it unset.
+  test("threads task turn provenance into stream requests and the user row", async () => {
+    const workspaceId = "task-turn-kind-threaded";
+    const { session, aiService, historyService, cleanup } = await createSessionHarness(workspaceId);
+    cleanups.push(cleanup);
+    const taskTurnKinds: Array<string | undefined> = [];
+    aiService.streamMessage = mock<AgentSessionAIService["streamMessage"]>((options) => {
+      taskTurnKinds.push(options.taskTurnKind);
+      return Promise.resolve(
+        Ok(createFailedTurnHandle("assistant-task-turn", { error: "boom", errorType: "unknown" }))
+      );
+    });
+
+    await session.sendMessage("Manual", SEND_OPTIONS);
+    await session.sendMessage("Report prompt", SEND_OPTIONS, {
+      synthetic: true,
+      agentInitiated: true,
+      taskTurnKind: "required_report",
+    });
+    await session.sendMessage("Plain synthetic", SEND_OPTIONS, { synthetic: true });
+
+    expect(taskTurnKinds).toEqual([undefined, "required_report", undefined]);
+    const history = await historyService.getLastMessages(workspaceId, 20);
+    expect(history.success).toBe(true);
+    if (history.success) {
+      const userRows = history.data.filter((message) => message.role === "user");
+      expect(userRows.map((row) => row.metadata?.taskTurnKind)).toEqual([
+        undefined,
+        "required_report",
+        undefined,
+      ]);
+      expect(userRows.map((row) => row.metadata?.retrySendOptions?.taskTurnKind)).toEqual([
+        undefined,
+        "required_report",
+        undefined,
+      ]);
+    }
+    await session.dispose();
+  });
+
+  // A turn compacted on send (or mid-stream) re-dispatches from the summary's pending
+  // follow-up: its task-turn provenance must survive that replay. A malformed persisted value
+  // (chat.jsonl is unchecked JSON) fails closed to "recovery" and the follow-up still replays.
+  test.each([
+    ["required_report", "required_report"],
+    ["not-a-task-turn", "recovery"],
+    [null, "recovery"],
+  ] as const)(
+    "replays task turn provenance through a compaction follow-up (%s)",
+    async (persisted, expected) => {
+      const workspaceId = `task-turn-kind-follow-up-${String(persisted)}`;
+      const { session, aiService, historyService, cleanup } =
+        await createSessionHarness(workspaceId);
+      cleanups.push(cleanup);
+      const taskTurnKinds: Array<string | undefined> = [];
+      aiService.streamMessage = mock<AgentSessionAIService["streamMessage"]>((options) => {
+        taskTurnKinds.push(options.taskTurnKind);
+        return Promise.resolve(
+          Ok(createFailedTurnHandle("assistant-follow-up", { error: "boom", errorType: "unknown" }))
+        );
+      });
+      const summary = createMuxMessage(
+        `summary-${crypto.randomUUID()}`,
+        "assistant",
+        "Compacted conversation.",
+        {
+          timestamp: Date.now(),
+          muxMetadata: {
+            type: "compaction-summary",
+            pendingFollowUp: {
+              text: "Report your result.",
+              agentId: "exec",
+              model: "openai:gpt-4o",
+              agentInitiated: true,
+              // Written as raw JSON on purpose: the malformed case is what disk can hold.
+              taskTurnKind: persisted as TaskTurnKind,
+            },
+          },
+        }
+      );
+      expect((await historyService.appendToHistory(workspaceId, summary)).success).toBe(true);
+
+      expect(await session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);
+
+      expect(taskTurnKinds).toEqual([expected]);
+      const history = await historyService.getLastMessages(workspaceId, 10);
+      expect(history.success).toBe(true);
+      if (history.success) {
+        const followUpRow = history.data.find(
+          (message) =>
+            message.role === "user" &&
+            message.parts.some(
+              (part) => part.type === "text" && part.text === "Report your result."
+            )
+        );
+        expect(followUpRow).toBeDefined();
+        expect(followUpRow?.metadata?.taskTurnKind).toBe(expected);
+        expect(followUpRow?.metadata?.retrySendOptions?.taskTurnKind).toBe(expected);
+      }
+      await session.dispose();
+    }
+  );
 
   test("stream errors restore durable goal snapshot after live cost preview", async () => {
     const workspaceId = "stream-error-restores-goal-preview";

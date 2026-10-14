@@ -907,7 +907,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
         ...record,
         model: COMPOSER_MODEL,
         status: "fallback",
-        reason: "Provider is blocked by policy.",
+        reason: "Provider is disabled.",
       }),
       streamedModel: COMPOSER_MODEL,
       status: "fallback",

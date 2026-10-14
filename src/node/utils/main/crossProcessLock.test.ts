@@ -482,23 +482,35 @@ describe("Linux identity judgment", () => {
   // Formerly refused: under the single-PID-domain deployment contract a
   // POSITIVELY different domain is retired, so its record is dead even when a
   // process with that pid number is running here (the pid means nothing).
+  // Each record carries the running pid's real start time, so only the domain
+  // fields can make it dead.
   test.skipIf(linuxOnly)(
-    "positively foreign PID domain (namespace, boot, machine-id) is retired: reclaimed",
+    "positively foreign PID domain (namespace, boot) is retired: reclaimed",
     async () => {
       const lockPath = await tempLockPath();
       const identity = await ownIdentity();
       const unrelated = liveProcess();
       try {
+        const birth = probeProcessBirth(unrelated.pid);
         const foreign: Array<[string, Record<string, unknown>]> = [
           ["other-namespace-same-boot", { pidNs: "pid:[1]" }],
           ["other-boot-no-machine-id", { bootId: "earlier-boot", machineId: null }],
           ["other-boot-same-machine", { bootId: "earlier-boot" }],
-          ["other-machine", { machineId: "0".repeat(32) }],
         ];
         for (const [token, fields] of foreign) {
-          await writeRecord(lockPath, { ...identity, pid: unrelated.pid, token, ...fields });
+          await writeRecord(lockPath, { ...identity, pid: unrelated.pid, birth, token, ...fields });
           await expectAcquired(lockPath);
         }
+        // Machine id is diagnostic only: equal boot id and namespace prove the same domain (a
+        // `--pid=host` container has its own /etc/machine-id), so the running holder is refused.
+        await writeRecord(lockPath, {
+          ...identity,
+          pid: unrelated.pid,
+          birth,
+          machineId: "0".repeat(32),
+          token: "other-machine-same-domain",
+        });
+        expect((await expectRefused(lockPath)).message).toContain("that process is running");
         // Hostname is diagnostic only: a renamed host alone changes nothing.
         await writeRecord(lockPath, {
           ...identity,

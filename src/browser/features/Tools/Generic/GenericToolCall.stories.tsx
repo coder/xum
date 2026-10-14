@@ -1,6 +1,18 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import { expect, userEvent, waitFor, within } from "@storybook/test";
+import type { ReactNode } from "react";
+import { APIProvider } from "@/browser/contexts/API";
 import { GenericToolCall } from "@/browser/features/Tools/GenericToolCall";
-import { lightweightMeta } from "@/browser/stories/meta.js";
+import { lightweightMeta, PIXEL_DISABLED } from "@/browser/stories/meta.js";
+import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import {
+  AppViewTabLabel,
+  AppViewTabPanel,
+} from "@/browser/features/RightSidebar/AppViewTab/AppViewTab";
+import { withAppViewTab } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
+import { openMcpAppViewTab } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
+import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
 
 const meta = {
   ...lightweightMeta,
@@ -41,4 +53,235 @@ export const GenericTool: Story = {
       },
     },
   },
+};
+
+// MCP Apps (artifacts experiment): an expanded call with a ui:// view shows the view inline.
+// The view is opaque-origin, so the play test reads progress from the height it reports
+// (184px once tool-result arrived).
+const DICE_VIEW_HTML = `<!doctype html>
+<html>
+<head>
+<style>
+  body { font: 13px system-ui, sans-serif; margin: 0; padding: 12px; color: #e6e6e6; background: #1e1e1e; }
+  .dice { display: flex; gap: 6px; margin-top: 8px; }
+  .die { width: 32px; height: 32px; display: grid; place-items: center; border: 1px solid #444; border-radius: 6px; font-weight: 600; }
+</style>
+</head>
+<body>
+  <strong id="title">Dice board</strong>
+  <div class="dice" id="dice"></div>
+  <script>
+    const send = (message) => window.parent.postMessage(message, "*");
+    window.addEventListener("message", (event) => {
+      const message = event.data;
+      if (message.id === 1 && message.result) {
+        send({ jsonrpc: "2.0", method: "ui/notifications/initialized", params: {} });
+      } else if (message.method === "ui/notifications/tool-result") {
+        const data = message.params.structuredContent;
+        document.getElementById("title").textContent = data.count + "d" + data.sides + " = " + data.total;
+        document.getElementById("dice").replaceChildren(...data.rolls.map((n) => {
+          const die = document.createElement("div");
+          die.className = "die";
+          die.textContent = String(n);
+          return die;
+        }));
+        send({ jsonrpc: "2.0", method: "ui/notifications/size-changed", params: { height: 184 } });
+      } else if (message.method === "ui/resource-teardown") {
+        send({ jsonrpc: "2.0", id: message.id, result: {} });
+      }
+    });
+    send({ jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {
+      protocolVersion: "2026-01-26", appInfo: { name: "dice", version: "1.0.0" }, appCapabilities: {},
+    } });
+  </script>
+</body>
+</html>`;
+
+const DICE_RESULT = {
+  content: [{ type: "text", text: "Rolled 4d6: 4, 6, 4, 1 (total 15)." }],
+  structuredContent: { count: 4, sides: 6, rolls: [4, 6, 4, 1], total: 15 },
+};
+
+function renderMcpAppCall() {
+  return (
+    <APIProvider
+      client={createMockORPCClient({
+        experiments: { [EXPERIMENT_IDS.ARTIFACTS]: true },
+        mcpApps: {
+          views: {
+            "call-dice-1": {
+              html: DICE_VIEW_HTML,
+              csp: {},
+              prefersBorder: true,
+              resultAvailable: true,
+              result: DICE_RESULT,
+              invocation: null,
+            },
+          },
+        },
+      })}
+    >
+      <GenericToolCall
+        toolName="demo_app_show_dice_board"
+        args={{ count: 4, sides: 6, label: "4d6 roll" }}
+        result={DICE_RESULT}
+        status="completed"
+        workspaceId="ws-generic-mcp-app"
+        toolCallId="call-dice-1"
+        mcpServer={{
+          connection: { key: "demo-app", transport: "stdio" },
+          identity: { name: "mcp-app-prototype", version: "0.1.0" },
+          source: "connection",
+          app: { resourceUri: "ui://prototype/board.html" },
+        }}
+      />
+    </APIProvider>
+  );
+}
+
+const playMcpAppCall = async (canvasElement: HTMLElement) => {
+  const canvas = within(canvasElement);
+  await userEvent.click(canvas.getByText("demo_app_show_dice_board"));
+  const frame = await canvas.findByTestId("mcp-app-frame");
+  await waitFor(() => expect(frame.style.height).toBe("184px"), { timeout: 5000 });
+  await expect(canvas.queryByText("Arguments")).toBeNull();
+  await userEvent.click(canvas.getByRole("button", { name: "Show input/output" }));
+  await canvas.findByText("Arguments");
+  // The JSON opens below the view without reloading it.
+  await expect(canvas.getByTestId("mcp-app-frame")).toBe(frame);
+};
+
+/** Expanded MCP Apps call: the view inline, the raw JSON behind a toggle. */
+export const McpAppInline: Story = {
+  args: { toolName: "demo_app_show_dice_board" },
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => renderMcpAppCall(),
+  play: ({ canvasElement }) => playMcpAppCall(canvasElement),
+};
+
+/**
+ * Phone width. The test runner plays at desktop size and ignores `globals.viewport`, so the
+ * story pins the width itself (AGENTS.md, Storybook responsive validation).
+ */
+export const McpAppInlinePhone: Story = {
+  args: { toolName: "demo_app_show_dice_board" },
+  globals: { viewport: { value: "phone390", isRotated: false } },
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <div data-testid="phone-width" style={{ width: 358 }}>
+      {renderMcpAppCall()}
+    </div>
+  ),
+  play: async ({ canvasElement }) => {
+    await playMcpAppCall(canvasElement);
+    // The header action stays inside the card instead of pushing past its right edge.
+    const canvas = within(canvasElement);
+    const card = canvas.getByTestId("phone-width").getBoundingClientRect();
+    const action = canvas.getByRole("button", { name: "Open in tab" }).getBoundingClientRect();
+    await expect(action.right).toBeLessThanOrEqual(card.right);
+  },
+};
+
+/** The view lives in its app tab: the card shows a placeholder instead of a second frame. */
+function renderInTab() {
+  updateRightSidebarLayout("ws-generic-mcp-app", (state) => withAppViewTab(state, "call-dice-1"));
+  return renderMcpAppCall();
+}
+const playInTab = async (canvasElement: HTMLElement) => {
+  const canvas = within(canvasElement);
+  await userEvent.click(canvas.getByText("demo_app_show_dice_board"));
+  await canvas.findByRole("button", { name: "Go to tab" });
+  await expect(canvas.queryByTestId("mcp-app-frame")).toBeNull();
+};
+export const McpAppInTab: Story = {
+  args: { toolName: "demo_app_show_dice_board" },
+  // Play only: the stack adds no Pixel snapshots (shared cap).
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => renderInTab(),
+  play: ({ canvasElement }) => playInTab(canvasElement),
+};
+export const McpAppInTabPhone: Story = {
+  args: { toolName: "demo_app_show_dice_board" },
+  globals: { viewport: { value: "phone390", isRotated: false } },
+  // Play only: the stack adds no Pixel snapshots (shared cap).
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => <div style={{ width: 358 }}>{renderInTab()}</div>,
+  play: ({ canvasElement }) => playInTab(canvasElement),
+};
+
+// MCP App views get their own right-sidebar tab ("Open in tab").
+const APP_TAB_WORKSPACE_ID = "ws-app-tab";
+const APP_TAB_TOOL_CALL_ID = "call-dice-tab";
+
+function withView(children: ReactNode) {
+  // The ref the tab resolves (a view opened from its card this session).
+  openMcpAppViewTab(APP_TAB_WORKSPACE_ID, {
+    toolCallId: APP_TAB_TOOL_CALL_ID,
+    serverName: "demo-app",
+    resourceUri: "ui://prototype/board.html",
+    toolName: "demo_app_show_dice_board",
+    label: "Show dice board",
+    arguments: { count: 4, sides: 6 },
+    cancelled: false,
+    failed: false,
+  });
+  return (
+    <APIProvider
+      client={createMockORPCClient({
+        experiments: { [EXPERIMENT_IDS.ARTIFACTS]: true },
+        mcpApps: {
+          views: {
+            [APP_TAB_TOOL_CALL_ID]: {
+              html: DICE_VIEW_HTML,
+              csp: {},
+              prefersBorder: true,
+              resultAvailable: true,
+              result: DICE_RESULT,
+              invocation: null,
+            },
+          },
+        },
+      })}
+    >
+      {children}
+    </APIProvider>
+  );
+}
+
+const playTab = async (canvasElement: HTMLElement) => {
+  const canvas = within(canvasElement.ownerDocument.body);
+  const frame = await canvas.findByTestId("mcp-app-frame");
+  await waitFor(() => expect(frame.style.height).toBe("184px"), { timeout: 5000 });
+  await expect(canvas.getAllByText("Show dice board").length).toBeGreaterThan(0);
+};
+
+/** An app tab in the right sidebar: the strip label (tool title, server) above the view. */
+export const McpAppTabLaptop: Story = {
+  args: { toolName: "demo_app_show_dice_board" },
+  globals: { viewport: { value: "laptop1200", isRotated: false } },
+  // Play only: the stack adds no Pixel snapshots (shared cap).
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () =>
+    withView(
+      <div className="bg-background flex h-screen justify-end">
+        <div className="bg-sidebar border-border-light flex h-full w-full max-w-[400px] flex-col border-l">
+          <div className="border-border-light flex h-8 items-center border-b px-3 text-xs">
+            <span className="bg-background-secondary rounded px-2 py-0.5">
+              <AppViewTabLabel
+                workspaceId={APP_TAB_WORKSPACE_ID}
+                toolCallId={APP_TAB_TOOL_CALL_ID}
+              />
+            </span>
+          </div>
+          <div className="min-h-0 flex-1">
+            <AppViewTabPanel
+              workspaceId={APP_TAB_WORKSPACE_ID}
+              toolCallId={APP_TAB_TOOL_CALL_ID}
+              onClose={() => undefined}
+            />
+          </div>
+        </div>
+      </div>
+    ),
+  play: ({ canvasElement }) => playTab(canvasElement),
 };

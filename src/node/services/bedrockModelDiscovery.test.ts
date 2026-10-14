@@ -10,11 +10,10 @@ import { Pool, EnvHttpProxyAgent } from "undici/index.js";
 import type { BaseProviderConfig } from "@/common/config/schemas/providersConfig";
 import { MODEL_DISCOVERY_LIMITS } from "@/constants/modelDiscovery";
 import { Config } from "@/node/config";
-import { PolicyService } from "./policyService";
 import { ProviderService } from "./providerService";
 import { discoverBedrockModels } from "./bedrockModelDiscovery";
 
-let root: string, config: Config, service: ProviderService, policy: PolicyService;
+let root: string, config: Config, service: ProviderService;
 let server: ReturnType<typeof Bun.serve>, agent: Pool;
 let respond: (request: Request) => Response | Promise<Response>;
 let requests: Request[], origins: string[], cleanups: Array<() => void>;
@@ -41,8 +40,7 @@ beforeEach(() => {
   for (const key of Object.keys(process.env)) if (key.startsWith("AWS_")) delete process.env[key];
   root = mkdtempSync(join(tmpdir(), "bedrock-discovery-"));
   config = new Config(root);
-  policy = new PolicyService(config);
-  service = new ProviderService(config, policy);
+  service = new ProviderService(config);
   requests = [];
   origins = [];
   respond = () => Response.json({});
@@ -67,7 +65,6 @@ afterEach(async () => {
   await agent.destroy();
   await server.stop(true);
   service.dispose();
-  policy.dispose();
   rmSync(root, { recursive: true, force: true });
   for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
   Object.assign(process.env, savedEnv);
@@ -351,9 +348,9 @@ it.each([
 });
 
 it.each(["request", "teardown"])(
-  "fences edits, policy, expiration and cancellation during %s",
+  "fences edits, expiration and cancellation during %s",
   async (phase) => {
-    for (const change of ["key", "policy", "expiry", "abort"]) {
+    for (const change of ["key", "expiry", "abort"]) {
       const previousRequests = requests.length;
       save(pair);
       const abort = new AbortController();
@@ -395,7 +392,6 @@ it.each(["request", "teardown"])(
       try {
         await entered.promise;
         if (change === "key") save({ ...pair, secretAccessKey: "changed" });
-        if (change === "policy") watch(policy, "isEnforced").mockReturnValue(true);
         if (change === "expiry")
           watch(Date, "now").mockReturnValue(new Date("3000-01-01").getTime());
         if (change === "abort") abort.abort("private");
@@ -455,31 +451,8 @@ it.each(["fetch", "credentialProvider", "credentials"])(
       await discoverBedrockModels(() => ({
         config: { ...pair, region: "us-east-1", [field]: callback },
         enabled: true,
-        policy: { enforced: false },
       }))
     ).toEqual({ status: "unsupported" });
     expect(origins).toHaveLength(0);
   }
 );
-
-it("filters policy only at publication and rejects forced endpoints", async () => {
-  save(pair);
-  watch(policy, "isEnforced").mockReturnValue(true);
-  watch(policy, "isProviderAllowed").mockReturnValue(true);
-  const effective = watch(policy, "getEffectivePolicy").mockReturnValue({
-    policyFormatVersion: "0.1",
-    mcp: { allowUserDefined: { remote: true, stdio: true } },
-    runtimes: null,
-    providerAccess: [{ id: "bedrock", allowedModels: ["keep"] }],
-  });
-  respond = () => Response.json({ modelSummaries: [{ modelId: "drop" }, { modelId: "keep" }] });
-  expect(await service.discoverModels("bedrock")).toEqual({ status: "ok", modelIds: ["keep"] });
-  effective.mockReturnValue({
-    policyFormatVersion: "0.1",
-    mcp: { allowUserDefined: { remote: true, stdio: true } },
-    runtimes: null,
-    providerAccess: [{ id: "bedrock", forcedBaseUrl: "https://runtime.invalid" }],
-  });
-  expect(await service.discoverModels("bedrock")).toEqual({ status: "unsupported" });
-  expect(requests).toHaveLength(2);
-});

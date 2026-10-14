@@ -432,6 +432,24 @@ describe("resolveAgentAiSettings normalization and clamping", () => {
     expect(result.effective.reasoningMode).toBeUndefined();
   });
 
+  it("keeps selected cyber but drops it from effective settings where Cyber is unavailable", () => {
+    const resolve = (model: string, cyberModelEnabled = true) =>
+      resolveAgentAiSettings(
+        base({
+          targetWorkspaceSettings: { model, reasoningMode: "cyber" },
+          providersConfig: {
+            openai: { apiKeySet: true, isEnabled: true, isConfigured: true, cyberModelEnabled },
+          },
+        })
+      );
+
+    expect(resolve(PRO_MODEL).effective.reasoningMode).toBe("cyber");
+    for (const result of [resolve(PRO_MODEL, false), resolve("openai:gpt-6-luna")]) {
+      expect(result.selected.reasoningMode).toBe("cyber");
+      expect(result.effective.reasoningMode).toBeUndefined();
+    }
+  });
+
   it("invalid persisted candidates fall through with diagnostics", () => {
     const result = resolveAgentAiSettings(
       base({

@@ -176,6 +176,12 @@ describe("Anthropic 1M context classification", () => {
     expect(supports1MContext("anthropic:claude-sonnet-5-5")).toBe(false);
   });
 
+  it("treats Haiku 5.5 as a native 1M model", () => {
+    expect(getAnthropic1MContextMode("anthropic:claude-haiku-5-5")).toBe("native");
+    expect(getAnthropic1MContextMode("mux-gateway:anthropic/claude-haiku-5-5")).toBe("native");
+    expect(supports1MContext("anthropic:claude-haiku-5-5")).toBe(false);
+  });
+
   it("treats Mythos-class Fable 5 / Fable 5.1 / Mythos 5 / Mythos 5.1 as native 1M models", () => {
     expect(getAnthropic1MContextMode("anthropic:claude-fable-5")).toBe("native");
     expect(getAnthropic1MContextMode("anthropic:claude-fable-5-1")).toBe("native");

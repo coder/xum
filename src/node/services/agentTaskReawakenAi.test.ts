@@ -56,7 +56,7 @@ function makeConfig(overrides?: {
 function contextKeyFor(config: LoadedConfig): string {
   const child = config.projects.get(PROJECT)?.workspaces.find((w) => w.id === "child");
   if (child == null) throw new Error("child missing");
-  return buildReawakenContextKey({ projectPath: PROJECT, workspace: child }, false);
+  return buildReawakenContextKey({ projectPath: PROJECT, workspace: child });
 }
 
 function plan(config: LoadedConfig, prepared?: PreparedReawakenAi) {
@@ -95,6 +95,16 @@ describe("computeReawakenInputsKey", () => {
       expect(key(variant)).not.toBe(base);
     }
     expect(key(makeConfig(), "other-context")).not.toBe(base);
+  });
+
+  it("ignores Auto flags, which planning does not read", () => {
+    const bucket = { model: MODEL_A, thinkingLevel: "medium" as const };
+    const flagged = { ...bucket, autoModelRouting: true, autoThinkingLevel: true };
+    for (const side of ["child", "parent"] as const) {
+      expect(key(makeConfig({ [side]: { aiSettingsByAgent: { exec: flagged } } }))).toBe(
+        key(makeConfig({ [side]: { aiSettingsByAgent: { exec: bucket } } }))
+      );
+    }
   });
 });
 
@@ -193,6 +203,27 @@ describe("planReawakenAi", () => {
   });
 });
 
+it("reawakens with the child's pinned speed and commits it without changing its parent", () => {
+  const config = makeConfig({
+    child: { taskAiPins: { serviceTier: "priority" } },
+    parent: {
+      agentId: "exec",
+      aiSettingsByAgent: {
+        exec: { model: "openai:gpt-5.2", thinkingLevel: "high", serviceTier: "flex" },
+      },
+    },
+  });
+  const entries = config.projects.get(PROJECT)!.workspaces;
+  const parentBefore = structuredClone(entries[0]);
+  const result = plan(config);
+  if (result.kind !== "resolved") throw new Error(`unexpected ${result.kind}`);
+  expect(result.snapshot.serviceTier).toBe("priority");
+  applyAgentTaskTurnAiSnapshot(entries[1], result.snapshot);
+  expect(entries[1].aiSettings?.serviceTier).toBe("priority");
+  expect(entries[1].aiSettingsByAgent?.exec.serviceTier).toBe("priority");
+  expect(entries[0]).toEqual(parentBefore);
+});
+
 describe("applyAgentTaskTurnAiSnapshot", () => {
   it("writes aiSettings, the active bucket, and the task fields", () => {
     const workspace: Workspace = {
@@ -219,5 +250,29 @@ describe("applyAgentTaskTurnAiSnapshot", () => {
     });
     expect(workspace.taskModelString).toBe(MODEL_B);
     expect(workspace.taskThinkingLevel).toBe("high");
+  });
+
+  it("keeps the child's saved Auto choices", () => {
+    const workspace: Workspace = {
+      id: "child",
+      name: "child",
+      path: "/repo/child",
+      aiSettingsByAgent: {
+        exec: { model: MODEL_C, thinkingLevel: "low", autoModelRouting: true },
+      },
+    };
+    applyAgentTaskTurnAiSnapshot(workspace, {
+      agentId: "exec",
+      taskModelString: MODEL_B,
+      canonicalModel: MODEL_B,
+      thinkingLevel: "high",
+      reasoningMode: "standard",
+    });
+    expect(workspace.aiSettingsByAgent?.exec).toEqual({
+      model: MODEL_B,
+      thinkingLevel: "high",
+      reasoningMode: "standard",
+      autoModelRouting: true,
+    });
   });
 });

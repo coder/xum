@@ -48,11 +48,81 @@ export const AgentPluginPreviewHookSchema = z.object({
   toolGrants: z.array(z.string()),
 });
 
+/**
+ * One Codex-format plugin hook handler (hooks.json). Only `mcp_tool` can run; `command`,
+ * `prompt` and `agent` are parsed and shown, never run.
+ */
+export const PluginHookHandlerSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("mcp_tool"),
+    server: z.string(),
+    tool: z.string(),
+    /** Argument templates (`${tool_input.x}`); `{}` when omitted. */
+    input: z.record(z.string(), z.unknown()),
+    /** Declared `timeout` in seconds; absent means the runner default. */
+    timeoutSeconds: z.number().optional(),
+    statusMessage: z.string().optional(),
+  }),
+  z.object({ type: z.enum(["command", "prompt", "agent"]), summary: z.string() }),
+]);
+
+/**
+ * `runnable`: an mcp_tool handler on a mapped event. `unsupported-handler`: a command, prompt or
+ * agent handler. `ignored-event`: a Codex event Xum does not map.
+ */
+export const PluginHookStatusSchema = z.enum(["runnable", "unsupported-handler", "ignored-event"]);
+
+/**
+ * Trust review state, keyed by the hook's location and checked against its hash (Codex trust):
+ * `new` and `changed` hooks never run until the user trusts them; `disabled` is turned off.
+ */
+export const PluginHookReviewStateSchema = z.enum(["trusted", "disabled", "new", "changed"]);
+
+export const AgentPluginHookSchema = z.object({
+  /** Stable location (file, event, group, handler index): the trust record's key. */
+  key: z.string(),
+  /** sha256 of the canonical definition; trust applies only to this exact hash. */
+  hash: z.string(),
+  event: z.string(),
+  matcher: z.string().optional(),
+  handler: PluginHookHandlerSchema,
+  status: PluginHookStatusSchema,
+  /** Where it was declared, e.g. `hooks/hooks.json` or `plugin.json#hooks[0]`. */
+  source: z.string(),
+  review: PluginHookReviewStateSchema,
+});
+
+export const AgentPluginHooksSchema = z.object({
+  hooks: z.array(AgentPluginHookSchema),
+  warnings: z.array(z.string()),
+});
+
 /** Composer slash command declared by the manifest (data-driven expansion). */
 export const AgentPluginPreviewSlashCommandSchema = z.object({
   name: z.string(),
   description: z.string().optional(),
 });
+
+/**
+ * OpenAI `interface` presentation metadata (validated in openaiExtension.ts).
+ * Plain text: render as React text, never as HTML or markdown.
+ */
+export const AgentPluginInterfaceSummarySchema = z.object({
+  displayName: z.string(),
+  developerName: z.string(),
+  shortDescription: z.string(),
+  capabilities: z.array(z.string()).optional(),
+  /** https only. */
+  websiteURL: z.string().optional(),
+  privacyPolicyURL: z.string().optional(),
+  termsOfServiceURL: z.string().optional(),
+  supportURL: z.string().optional(),
+  /** `data:image/...;base64,` read through the contained capped reader; never a path. */
+  logoDataUrl: z.string().optional(),
+  /** Dark-theme variant (OpenAI `logoDark`/`composerIconDark`), read the same way. */
+  logoDarkDataUrl: z.string().optional(),
+});
+export type AgentPluginInterfaceSummary = z.infer<typeof AgentPluginInterfaceSummarySchema>;
 
 /** Manifest metadata surfaced in the consent preview (UI-safe projection of plugin.json). */
 export const AgentPluginManifestSummarySchema = z.object({
@@ -63,6 +133,7 @@ export const AgentPluginManifestSummarySchema = z.object({
   homepage: z.string().optional(),
   repository: z.string().optional(),
   license: z.string().optional(),
+  interface: AgentPluginInterfaceSummarySchema.optional(),
 });
 
 /**
@@ -78,6 +149,11 @@ export const AgentPluginInstallPreviewSchema = z.object({
   mcpServers: z.array(AgentPluginPreviewMcpServerSchema),
   /** Present when the plugin ships an executable hooks.js (absent = no hooks). */
   hook: AgentPluginPreviewHookSchema.optional(),
+  /**
+   * Codex-format hooks (hooks.json). Install trusts none of them: each runs only after the user
+   * trusts it in Settings (Codex trust per hash).
+   */
+  codexHooks: z.array(AgentPluginHookSchema.omit({ review: true })),
   /** Agent definition files (agents/*.md) that become selectable agents. */
   agents: z.array(z.string()),
   /** Executable workflow scripts (workflows/*.js) invokable after install. */
@@ -107,6 +183,12 @@ export const AgentPluginListItemSchema = z.object({
   importedComponents: AgentPluginImportedComponentsSchema.optional(),
   importedSkillCount: z.number().int().nonnegative().optional(),
   importedMcpServerCount: z.number().int().nonnegative().optional(),
+  /**
+   * Managed rows: imported skills and MCP servers whose current fingerprint the user has not
+   * reviewed (#6498). They do not load until a component review confirms them.
+   */
+  reviewRequiredCount: z.number().int().nonnegative().optional(),
+  interface: AgentPluginInterfaceSummarySchema.optional(),
   /** Available counts include components not yet imported. */
   skillCount: z.number().int().nonnegative(),
   mcpServerCount: z.number().int().nonnegative(),
@@ -127,10 +209,23 @@ export const AgentPluginUpdateCheckSchema = z.object({
  * human-readable value on each side so the user can judge the change instead
  * of only being told that something changed; additions have no `before`.
  */
+/**
+ * One imported skill or MCP server at the consent fingerprint a review showed (#6498). The
+ * renderer sends the shown refs back on confirm, and the backend records only refs that still
+ * match, so a component that changed after the review never gets consent.
+ */
+export const AgentPluginComponentRefSchema = z.object({
+  kind: z.enum(["skills", "mcpServers"]),
+  name: z.string(),
+  fingerprint: z.string(),
+});
+
 export const AgentPluginCapabilityChangeSchema = z.object({
   summary: z.string(),
   before: z.string().optional(),
   after: z.string().optional(),
+  /** Set for a skill or MCP server change: what confirming the review approves. */
+  component: AgentPluginComponentRefSchema.optional(),
 });
 
 /** Ties an update confirmation to the exact trees the user reviewed. */
@@ -139,6 +234,11 @@ export const AgentPluginUpdateConsentSchema = z.object({
   fromSha: z.string(),
   /** Commit the review staged; update installs exactly this commit. */
   toSha: z.string(),
+  /**
+   * The component changes the review showed. Only these get consent records. Without it, every
+   * changed component needs a component review after the update (fails closed).
+   */
+  reviewed: z.array(AgentPluginComponentRefSchema).optional(),
 });
 
 /**
@@ -158,11 +258,17 @@ export const AgentPluginUpdateReviewSchema = z.object({
 });
 
 export type AgentPluginCapabilityChange = z.infer<typeof AgentPluginCapabilityChangeSchema>;
+export type AgentPluginComponentRef = z.infer<typeof AgentPluginComponentRefSchema>;
 export type AgentPluginUpdateConsent = z.infer<typeof AgentPluginUpdateConsentSchema>;
 export type AgentPluginUpdateReview = z.infer<typeof AgentPluginUpdateReviewSchema>;
 export type AgentPluginPreviewSkill = z.infer<typeof AgentPluginPreviewSkillSchema>;
 export type AgentPluginPreviewMcpServer = z.infer<typeof AgentPluginPreviewMcpServerSchema>;
 export type AgentPluginPreviewHook = z.infer<typeof AgentPluginPreviewHookSchema>;
+export type PluginHookHandler = z.infer<typeof PluginHookHandlerSchema>;
+export type PluginHookStatus = z.infer<typeof PluginHookStatusSchema>;
+export type PluginHookReviewState = z.infer<typeof PluginHookReviewStateSchema>;
+export type AgentPluginHook = z.infer<typeof AgentPluginHookSchema>;
+export type AgentPluginHooks = z.infer<typeof AgentPluginHooksSchema>;
 export type AgentPluginManifestSummary = z.infer<typeof AgentPluginManifestSummarySchema>;
 export type AgentPluginInstallPreview = z.infer<typeof AgentPluginInstallPreviewSchema>;
 export type AgentPluginListItem = z.infer<typeof AgentPluginListItemSchema>;
@@ -217,8 +323,6 @@ export const WorkspaceCompositionDiagnosticSchema = z.object({
  * analog. One bulk structure so the inspector needs a single oRPC call.
  */
 export const WorkspaceCompositionSchema = z.object({
-  agentPluginsEnabled: z.boolean(),
-  /** Discovered plugins (manifest parsing/validation is NOT experiment-gated). */
   plugins: z.array(WorkspaceCompositionPluginSchema),
   diagnostics: z.array(WorkspaceCompositionDiagnosticSchema),
   skills: z.array(WorkspaceCompositionEntrySchema),

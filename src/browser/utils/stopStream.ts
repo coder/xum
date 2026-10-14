@@ -1,4 +1,5 @@
 import type { APIClient } from "@/browser/contexts/API";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import { publishChatError } from "@/browser/utils/chatErrorToasts";
 import { getErrorMessage } from "@/common/utils/errors";
 
@@ -16,6 +17,15 @@ export async function stopStream(
   workspaceId: string,
   options?: { abandonPartial?: boolean; disableAutoRetry?: boolean }
 ): Promise<void> {
+  // Stop also ends the composer's automatic re-sends of unresolved sends (idempotent sends):
+  // the user asked the workspace to stop; a later trigger (reload, reconnect, a new send)
+  // starts them again. A re-send already on its way is fenced at its receiver first, so it
+  // cannot start work after this interrupt.
+  try {
+    await getDraftStore().abortSendRetries(workspaceId);
+  } catch (error) {
+    console.warn("Fencing in-flight re-sends before Stop failed:", error);
+  }
   try {
     const result = await api.workspace.interruptStream({
       workspaceId,

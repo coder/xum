@@ -7,7 +7,8 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import assert from "@/common/utils/assert";
 import {
   DEFAULT_LAYOUT_PRESETS_CONFIG,
@@ -26,6 +27,7 @@ import {
   updateSlotPreset,
 } from "@/browser/utils/uiLayouts";
 import type { Keybind } from "@/common/types/keybind";
+import type { Result } from "@/common/types/result";
 
 interface UILayoutsContextValue {
   layoutPresets: LayoutPresetsConfig;
@@ -36,12 +38,15 @@ interface UILayoutsContextValue {
 
   applySlotToWorkspace: (workspaceId: string, slot: LayoutSlotNumber) => Promise<void>;
 
-  /** Capture the currently-selected workspace's layout into the given slot. */
+  /**
+   * Capture the currently-selected workspace's layout into the given slot. Errs (without saving)
+   * with a user-facing message when the layout holds no tab a preset can store.
+   */
   saveCurrentWorkspaceToSlot: (
     workspaceId: string,
     slot: LayoutSlotNumber,
     name?: string | null
-  ) => Promise<LayoutPreset>;
+  ) => Promise<Result<LayoutPreset>>;
 
   renameSlot: (slot: LayoutSlotNumber, newName: string) => Promise<void>;
   deleteSlot: (slot: LayoutSlotNumber) => Promise<void>;
@@ -58,8 +63,19 @@ export function useUILayouts(): UILayoutsContextValue {
   return ctx;
 }
 
+/** The typed name, else the slot's current name, else "Slot N". */
+function resolveSlotName(
+  name: string | null | undefined,
+  existingName: string | undefined,
+  slot: LayoutSlotNumber
+): string {
+  const trimmedName = name?.trim();
+  return trimmedName && trimmedName.length > 0 ? trimmedName : (existingName ?? `Slot ${slot}`);
+}
+
 export function UILayoutsProvider(props: { children: ReactNode }) {
   const { api } = useAPI();
+  const liveApi = useLiveAPI();
 
   const [layoutPresets, setLayoutPresets] = useState<LayoutPresetsConfig>(
     DEFAULT_LAYOUT_PRESETS_CONFIG
@@ -69,7 +85,8 @@ export function UILayoutsProvider(props: { children: ReactNode }) {
 
   const refresh = useCallback(async (): Promise<void> => {
     if (!api) {
-      setLayoutPresets(DEFAULT_LAYOUT_PRESETS_CONFIG);
+      // Keep the shown presets offline (the defaults before the first load): the reconnect
+      // reloads them.
       setLoaded(true);
       setLoadFailed(false);
       return;
@@ -80,7 +97,9 @@ export function UILayoutsProvider(props: { children: ReactNode }) {
       setLayoutPresets(getLayoutsConfigOrDefault(remote));
       setLoaded(true);
       setLoadFailed(false);
-    } catch {
+    } catch (error) {
+      // A lost connection is no load failure: keep the shown presets for the reconnect.
+      if (isConnectionLostError(error)) return;
       setLayoutPresets(DEFAULT_LAYOUT_PRESETS_CONFIG);
       setLoaded(true);
       setLoadFailed(true);
@@ -115,14 +134,14 @@ export function UILayoutsProvider(props: { children: ReactNode }) {
     async (next: LayoutPresetsConfig): Promise<void> => {
       const normalized = normalizeLayoutPresetsConfig(next);
 
-      if (!api) {
+      if (!liveApi) {
         throw new Error("ORPC client not initialized");
       }
 
-      await api.uiLayouts.saveAll({ layoutPresets: normalized });
+      await liveApi.uiLayouts.saveAll({ layoutPresets: normalized });
       setLayoutPresets(normalized);
     },
-    [api]
+    [liveApi]
   );
 
   useEffect(() => {
@@ -136,9 +155,11 @@ export function UILayoutsProvider(props: { children: ReactNode }) {
         return;
       }
 
-      await applyLayoutPresetToWorkspace(api ?? null, workspaceId, preset);
+      // Offline, the preset is not applied: a terminal list cut off by the lost connection would
+      // look empty and drop the layout's terminal tabs.
+      await applyLayoutPresetToWorkspace(liveApi, workspaceId, preset);
     },
-    [api, layoutPresets]
+    [liveApi, layoutPresets]
   );
 
   const saveCurrentWorkspaceToSlot = useCallback(
@@ -146,7 +167,7 @@ export function UILayoutsProvider(props: { children: ReactNode }) {
       workspaceId: string,
       slot: LayoutSlotNumber,
       name?: string | null
-    ): Promise<LayoutPreset> => {
+    ): Promise<Result<LayoutPreset>> => {
       assert(
         typeof workspaceId === "string" && workspaceId.length > 0,
         "workspaceId must be non-empty"
@@ -155,19 +176,18 @@ export function UILayoutsProvider(props: { children: ReactNode }) {
       const base = await getConfigForWrite();
       const existingPreset = getPresetForSlot(base, slot);
 
-      const trimmedName = name?.trim();
-      const resolvedName =
-        trimmedName && trimmedName.length > 0
-          ? trimmedName
-          : (existingPreset?.name ?? `Slot ${slot}`);
+      const resolvedName = resolveSlotName(name, existingPreset?.name, slot);
 
-      const preset = createPresetFromCurrentWorkspace(
+      const result = createPresetFromCurrentWorkspace(
         workspaceId,
         resolvedName,
         existingPreset?.id
       );
-      await saveAll(updateSlotPreset(base, slot, preset));
-      return preset;
+      if (!result.success) {
+        return result;
+      }
+      await saveAll(updateSlotPreset(base, slot, result.data));
+      return result;
     },
     [getConfigForWrite, saveAll]
   );

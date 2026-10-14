@@ -3,10 +3,8 @@ import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals"
 import { GlobalWindow } from "happy-dom";
 import {
   MAC_TRAFFIC_LIGHTS_INSET,
-  WIN_LINUX_OVERLAY_INSET,
   getDesktopPlatform,
   getTitlebarLeftInset,
-  getTitlebarRightInset,
   initTitlebarInsets,
   isDesktopMode,
 } from "./useDesktopTitlebar";
@@ -100,52 +98,34 @@ describe("getTitlebarLeftInset", () => {
   });
 });
 
-describe("getTitlebarRightInset", () => {
-  test("returns 0 in browser mode (no window.api)", () => {
-    clearDesktopApi();
-
-    expect(getTitlebarRightInset()).toBe(0);
-  });
-
-  test("returns 0 on darwin in desktop mode", () => {
-    enableDesktopApi("darwin");
-
-    expect(getTitlebarRightInset()).toBe(0);
-  });
-
-  test("returns 138 on linux in desktop mode", () => {
-    enableDesktopApi("linux");
-
-    expect(getTitlebarRightInset()).toBe(WIN_LINUX_OVERLAY_INSET);
-  });
-
-  test("returns 138 on win32 in desktop mode", () => {
-    enableDesktopApi("win32");
-
-    expect(getTitlebarRightInset()).toBe(WIN_LINUX_OVERLAY_INSET);
-  });
-});
-
 describe("initTitlebarInsets", () => {
-  test("sets CSS custom properties on document.documentElement", () => {
+  function insets() {
+    const style = document.documentElement.style;
+    return {
+      left: style.getPropertyValue("--titlebar-left-inset"),
+      right: style.getPropertyValue("--titlebar-right-inset"),
+    };
+  }
+
+  test("reserves the traffic lights on darwin", () => {
     enableDesktopApi("darwin");
-
     initTitlebarInsets();
-
-    expect(document.documentElement.style.getPropertyValue("--titlebar-left-inset")).toBe("80px");
-    expect(document.documentElement.style.getPropertyValue("--titlebar-right-inset")).toBe("0px");
+    expect(insets()).toEqual({ left: "80px", right: "0px" });
   });
 
-  test("values match getTitlebarLeftInset/getTitlebarRightInset for current mock", () => {
-    enableDesktopApi("linux");
-
+  test("reserves nothing in browser mode", () => {
+    clearDesktopApi();
     initTitlebarInsets();
-
-    expect(document.documentElement.style.getPropertyValue("--titlebar-left-inset")).toBe(
-      `${getTitlebarLeftInset()}px`
-    );
-    expect(document.documentElement.style.getPropertyValue("--titlebar-right-inset")).toBe(
-      `${getTitlebarRightInset()}px`
-    );
+    expect(insets()).toEqual({ left: "0px", right: "0px" });
   });
+
+  for (const platform of ["linux", "win32"] as const) {
+    test(`follows the window controls overlay on ${platform}`, () => {
+      enableDesktopApi(platform);
+      initTitlebarInsets();
+      const { left, right } = insets();
+      expect(left).toContain("env(titlebar-area-x");
+      expect(right).toContain("env(titlebar-area-width");
+    });
+  }
 });

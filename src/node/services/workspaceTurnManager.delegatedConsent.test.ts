@@ -1,15 +1,18 @@
 import { execFileSync } from "child_process";
 import * as path from "path";
 import { describe, test, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
+import * as fs from "fs";
 import * as fsPromises from "fs/promises";
 import * as os from "os";
 import type { Config } from "@/node/config";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
 import type { WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import { workspace as workspaceApi } from "@/common/orpc/schemas/api";
 import { createMuxMessage } from "@/common/types/message";
 import { HistoryService } from "@/node/services/historyService";
+import { InitStateManager } from "@/node/services/initStateManager";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import {
   workspaceTurnOwnerLockPath,
@@ -50,8 +53,9 @@ describe("delegated target default consent (#4453)", () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, options.stableIds ?? ["handle", "turn", TARGET, "handle2", "turn2"]);
     const { aiService } = createAIServiceMocks(config);
+    const initStateManager = new InitStateManager(config);
     // Shared so removal resolves the target's metadata (and so its runtime) from config.
-    const real = createWorkspaceServiceForTest({ config, aiService });
+    const real = createWorkspaceServiceForTest({ config, aiService, initStateManager });
     const host = createWorkspaceServiceMocks({
       create: mock(async (...args: Parameters<WorkspaceHost["create"]>) => {
         const result = await real.create(...args);
@@ -84,7 +88,7 @@ describe("delegated target default consent (#4453)", () => {
       aiService,
       workspaceService: host.workspaceService,
     });
-    return { config, real, manager, aiService };
+    return { config, real, manager, aiService, initStateManager };
   }
 
   async function setUp(options: Parameters<typeof backend>[0] = {}) {
@@ -672,16 +676,70 @@ describe("delegated target default consent (#4453)", () => {
     await a.finish();
   });
 
-  test("the startup pass never builds probed metadata (#4983)", async () => {
+  test("the startup pass publishes the flag without probing a stalled checkout (#4983, #5189)", async () => {
     const a = await crashBeforeRecord();
+    // The creator backend's own background init can still be running in this process. When it
+    // ends, its init-end metadata refresh probes the checkout (#5435). That probe comes from the
+    // creator, not from the startup pass under test, so let it start before the access spy goes in:
+    // endInit emits init-end before it wakes waiters, and with no config migration pending (as
+    // here) the refresh reaches the probe within that emit.
+    await a.initStateManager.waitForInit(TARGET);
     const b = await backend();
+    const checkoutPath = (
+      await b.config.getWorkspaceMetadataById(TARGET, { probeCheckouts: false })
+    )?.namedWorkspacePath;
+    expect(checkoutPath).toBeString();
     // Building metadata probes every checkout, which a stalled mount blocks indefinitely.
     const build = spyOn(b.config, "getAllWorkspaceMetadata");
+    const realAccess = fs.promises.access.bind(fs.promises);
+    const access = spyOn(fs.promises, "access").mockImplementation((target, mode) =>
+      target === checkoutPath ? new Promise<void>(() => undefined) : realAccess(target, mode)
+    );
+    // A renderer that loaded before the flag still needs it.
+    const published: unknown[] = [];
+    b.real.on(
+      "metadata",
+      (event: { workspaceId: string; metadata: FrontendWorkspaceMetadata | null }) => {
+        if (event.workspaceId !== TARGET) return;
+        published.push(event.metadata?.delegatedCreationInterrupted);
+      }
+    );
+
+    try {
+      await b.manager.resolveOrphanedDelegatedTargets();
+      expect(access.mock.calls.some(([target]) => target === checkoutPath)).toBe(false);
+    } finally {
+      access.mockRestore();
+    }
+
+    expect(mark(a.config)?.interruptedAt).toBeString();
+    expect(published).toEqual([true]);
+    expect(build).not.toHaveBeenCalled();
+    await a.finish();
+  });
+
+  test("the startup pass does not publish a flagged workspace that list snapshots hide", async () => {
+    const a = await crashBeforeRecord();
+    // Multi-project workspaces stay hidden while that experiment is off.
+    await a.config.editConfig((config) => {
+      const entry = findWorkspaceEntry(config, TARGET)?.workspace;
+      if (entry == null) throw new Error("target row missing");
+      entry.projects = [
+        { projectPath: a.projectPath, projectName: "one" },
+        { projectPath: path.join(rootDir, "other"), projectName: "other" },
+      ];
+      return config;
+    });
+    const b = await backend();
+    const published: string[] = [];
+    b.real.on("metadata", (event: { workspaceId: string }) => {
+      published.push(event.workspaceId);
+    });
 
     await b.manager.resolveOrphanedDelegatedTargets();
 
     expect(mark(a.config)?.interruptedAt).toBeString();
-    expect(build).not.toHaveBeenCalled();
+    expect(published).not.toContain(TARGET);
     await a.finish();
   });
 

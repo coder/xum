@@ -52,6 +52,13 @@ export const APP_FIBER_SCOPE_CLOSE_TIMEOUT_MS = 2 * 1000;
 export const STARTUP_HOUSEKEEPING_JOIN_TIMEOUT_MS = 500;
 
 /**
+ * Bounds how long `ServiceContainer.dispose()` waits to write open session tapes (experiment
+ * `sessionTapes`, off by default) so a normal quit keeps them. Resolves at once when nothing is
+ * being recorded. Sized to fit the same 5 s quit budgets with the bounds above.
+ */
+export const SESSION_TAPE_FLUSH_TIMEOUT_MS = 1000;
+
+/**
  * Outer budget the `xum server` and ACP roots give the whole
  * `ServiceContainer.dispose()` — the SIGTERM cleanup and the dispose after a
  * failed startup; `desktop/main.ts` races its before-quit dispose against the

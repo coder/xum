@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
 import {
   Dialog,
   DialogContent,
@@ -16,7 +16,9 @@ import { Input } from "@/browser/components/Input/Input";
 import type { SshPromptEvent, SshPromptRequest } from "@/common/orpc/schemas/ssh";
 
 export function SshPromptDialog() {
-  const { api } = useAPI();
+  // The live client only: a drop must end the subscription and clear the prompts (their
+  // responder can be gone). The reconnect delivers a fresh snapshot.
+  const api = useLiveAPI();
   const [pendingQueue, setPendingQueue] = useState<SshPromptRequest[]>([]);
   const pending = pendingQueue[0] ?? null;
   const [responding, setResponding] = useState(false);

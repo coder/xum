@@ -1,5 +1,6 @@
 import { ContextManagementService } from "./contextManagement/contextManagementService";
 import { eventSpine } from "./events/eventSpine";
+import { runMessageSendHooks, runTurnStopHooks } from "./agentPlugins/promptHooks";
 import { mock } from "bun:test";
 import { EventEmitter } from "events";
 
@@ -38,7 +39,7 @@ export function createStartedTurnHandle(
 
 export function createFailedTurnHandle(
   messageId: string,
-  failure: { error: string; errorType: StreamErrorType }
+  failure: { error: string; errorType: StreamErrorType; model?: string }
 ): TurnStreamHandle {
   return {
     messageId,
@@ -128,11 +129,6 @@ export function createAgentSessionAIServiceFake(
   const getClosingSignal = options.getClosingSignal;
   const aiService: AgentSessionAIService & EventEmitter = Object.assign(aiEmitter, {
     // Real implementations report failures as Err results, never rejections.
-    createModelWithPinnedMetadata: mock(() =>
-      Promise.resolve(
-        Err({ type: "unknown" as const, raw: "Test AI service cannot create models" })
-      )
-    ),
     createModelWithPinnedOptions: mock(() =>
       Promise.resolve(
         Err({ type: "unknown" as const, raw: "Test AI service cannot create models" })
@@ -163,6 +159,17 @@ export function createAgentSessionAIServiceFake(
     captureRequestAssemblySnapshot: mock((workspaceId: string) =>
       Promise.resolve(Ok(eventSpine.captureRequestAssembly(workspaceId)))
     ),
+    // The real chain on the real spine: tests register fake prompt-hook consumers on it.
+    prepareMessageSendHooks: mock((workspaceId: string) =>
+      Promise.resolve(eventSpine.hasMiddlewareFor("message.send", workspaceId))
+    ),
+    runMessageSendHooks: mock(
+      (workspaceId: string, input: Parameters<typeof runMessageSendHooks>[2]) =>
+        runMessageSendHooks(eventSpine, workspaceId, input)
+    ),
+    runTurnStopHooks: mock((workspaceId: string, input: Parameters<typeof runTurnStopHooks>[2]) =>
+      runTurnStopHooks(eventSpine, workspaceId, input)
+    ),
     ...createStreamLifecycleMocks(),
     streamMessage: mock<AgentSessionAIService["streamMessage"]>(() =>
       Promise.resolve(
@@ -190,6 +197,8 @@ export interface AgentSessionHarnessOptions extends Pick<
   | "sessionUsageService"
   | "autoModelRouter"
   | "hasExternalSendPreflight"
+  | "hasExternalManualSendPreflight"
+  | "callerOwnsTurnEnd"
 > {
   workspaceId: string;
   contextManagement?: ContextManagementService;
@@ -233,19 +242,9 @@ export async function seedAutoCompactionThreshold(
   model: string,
   percent: number
 ): Promise<void> {
-  const current = config.loadConfigOrDefault().userPreferences;
-  await config.saveUserConfig({
-    userPreferences: {
-      ...current,
-      ai: {
-        ...current?.ai,
-        autoCompactionThresholdByModel: {
-          ...current?.ai?.autoCompactionThresholdByModel,
-          [model]: percent,
-        },
-      },
-    },
-  });
+  await config.updateUserPreferences([
+    { ai: { autoCompactionThresholdByModel: { [model]: percent } } },
+  ]);
 }
 
 export async function createAgentSessionHarness(
@@ -310,6 +309,8 @@ export async function createAgentSessionHarness(
     sessionUsageService: options.sessionUsageService,
     autoModelRouter: options.autoModelRouter,
     hasExternalSendPreflight: options.hasExternalSendPreflight,
+    hasExternalManualSendPreflight: options.hasExternalManualSendPreflight,
+    callerOwnsTurnEnd: options.callerOwnsTurnEnd,
   });
 
   const events: WorkspaceChatMessage[] = [];

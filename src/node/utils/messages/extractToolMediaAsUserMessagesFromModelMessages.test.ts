@@ -458,6 +458,90 @@ describe("extractToolMediaAsUserMessagesFromModelMessages", () => {
     expect(rewrittenJson).not.toContain("fresh-shot");
   });
 
+  describe("after a provider-executed tool call", () => {
+    const shotOutput = {
+      type: "content",
+      value: [
+        { type: "text", text: "shot" },
+        {
+          type: "media",
+          mediaType: "application/pdf",
+          data: Buffer.from("shot").toString("base64"),
+        },
+      ],
+    } as unknown as ToolResultPart["output"];
+
+    function stepMessages(serverToolResolved: boolean): ModelMessage[] {
+      return [
+        { role: "user", content: "search and screenshot" },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool-call",
+              toolCallId: "srvtoolu_1",
+              toolName: "web_search",
+              input: { query: "xum" },
+              providerExecuted: true,
+            },
+            ...(serverToolResolved
+              ? [
+                  {
+                    type: "tool-result" as const,
+                    toolCallId: "srvtoolu_1",
+                    toolName: "web_search",
+                    output: { type: "json" as const, value: [] },
+                  },
+                ]
+              : []),
+            { type: "tool-call", toolCallId: "call1", toolName: "attach_file", input: {} },
+          ],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "call1",
+              toolName: "attach_file",
+              output: shotOutput,
+            },
+          ],
+        },
+      ];
+    }
+
+    it("keeps the media inside the tool result while the server tool's result is deferred", async () => {
+      // Anthropic runs a server tool called alongside a client tool only after the client
+      // results arrive; anything after the tool_result blocks ends the turn and the request
+      // fails with "`web_search` tool use ... without a corresponding web_search_tool_result".
+      const rewritten = await extractToolMediaAsUserMessagesFromModelMessages(stepMessages(false));
+      expect(rewritten.map((message) => message.role)).toEqual(["user", "assistant", "tool"]);
+      const toolMessage = rewritten[2] as Extract<ModelMessage, { role: "tool" }>;
+      const result = toolMessage.content[0];
+      if (result.type !== "tool-result" || result.output.type !== "content") {
+        throw new Error("Expected a content tool result");
+      }
+      const files = result.output.value.filter((item) => item.type === "file");
+      expect(files).toHaveLength(1);
+      expect(JSON.stringify(files[0])).toContain(Buffer.from("shot").toString("base64"));
+      expect(JSON.stringify(result.output)).toContain("[Attachment attached:");
+
+      // Later steps rerun the transform on this prefix: it must not change.
+      expect(await extractToolMediaAsUserMessagesFromModelMessages(rewritten)).toEqual(rewritten);
+    });
+
+    it("still moves the media to a user message once the server tool has its result", async () => {
+      const rewritten = await extractToolMediaAsUserMessagesFromModelMessages(stepMessages(true));
+      expect(rewritten.map((message) => message.role)).toEqual([
+        "user",
+        "assistant",
+        "tool",
+        "user",
+      ]);
+    });
+  });
+
   it("is a no-op when there is no media", async () => {
     const input: ModelMessage[] = [
       {

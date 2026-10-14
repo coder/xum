@@ -15,9 +15,6 @@ import type {
   ToolCallExecutionStartEvent,
   ToolCallDeltaEvent,
   ToolCallEndEvent,
-  AdvisorOutputEvent,
-  AdvisorReasoningOutputEvent,
-  AdvisorPhaseEvent,
   BashOutputEvent,
   TaskCreatedEvent,
   WorkflowRunAttachedEvent,
@@ -61,6 +58,7 @@ export type OnChatDowngradeReason = z.infer<typeof schemas.OnChatDowngradeReason
 export type StreamErrorMessage = z.infer<typeof schemas.StreamErrorMessageSchema>;
 export type DeleteMessage = z.infer<typeof schemas.DeleteMessageSchema>;
 export type GoalBudgetLimitedEvent = z.infer<typeof schemas.GoalBudgetLimitedEventSchema>;
+export type PluginHookNoticeEvent = z.infer<typeof schemas.PluginHookNoticeEventSchema>;
 export type WorkspaceInitEvent = z.infer<typeof schemas.WorkspaceInitEventSchema>;
 export type UpdateStatus = z.infer<typeof schemas.UpdateStatusSchema>;
 export type RestartBlocker = z.infer<typeof schemas.RestartBlockerSchema>;
@@ -76,13 +74,6 @@ export type FrontendWorkspaceMetadataSchemaType = z.infer<
 export type ApiServerStatus = z.infer<typeof schemas.ApiServerStatusSchema>;
 export type ServerAuthSession = z.infer<typeof schemas.ServerAuthSessionSchema>;
 // Experiment types (single source of truth - derived from schemas)
-
-// Policy types (single source of truth - derived from schemas)
-export type PolicyGetResponse = z.infer<typeof schemas.PolicyGetResponseSchema>;
-export type PolicyStatus = z.infer<typeof schemas.PolicyStatusSchema>;
-export type PolicySource = z.infer<typeof schemas.PolicySourceSchema>;
-export type EffectivePolicy = z.infer<typeof schemas.EffectivePolicySchema>;
-export type PolicyRuntimeId = z.infer<typeof schemas.PolicyRuntimeIdSchema>;
 // Type guards for common chat message variants
 export function isCaughtUpMessage(msg: WorkspaceChatMessage): msg is CaughtUpMessage {
   return (msg as { type?: string }).type === "caught-up";
@@ -130,16 +121,6 @@ export function isBashOutputEvent(msg: WorkspaceChatMessage): msg is BashOutputE
   return (msg as { type?: string }).type === "bash-output";
 }
 
-export function isAdvisorOutputEvent(msg: WorkspaceChatMessage): msg is AdvisorOutputEvent {
-  return (msg as { type?: string }).type === "advisor-output";
-}
-
-export function isAdvisorReasoningOutputEvent(
-  msg: WorkspaceChatMessage
-): msg is AdvisorReasoningOutputEvent {
-  return (msg as { type?: string }).type === "advisor-reasoning-output";
-}
-
 export function isTaskCreatedEvent(msg: WorkspaceChatMessage): msg is TaskCreatedEvent {
   return (msg as { type?: string }).type === "task-created";
 }
@@ -150,9 +131,6 @@ export function isWorkflowRunAttachedEvent(
   return (msg as { type?: string }).type === "workflow-run-attached";
 }
 
-export function isAdvisorPhaseEvent(msg: WorkspaceChatMessage): msg is AdvisorPhaseEvent {
-  return (msg as { type?: string }).type === "advisor-phase";
-}
 export function isToolCallEnd(msg: WorkspaceChatMessage): msg is ToolCallEndEvent {
   return (msg as { type?: string }).type === "tool-call-end";
 }
@@ -199,6 +177,10 @@ export function isInitEnd(
 
 export function isGoalBudgetLimitedEvent(msg: WorkspaceChatMessage): msg is GoalBudgetLimitedEvent {
   return (msg as { type?: string }).type === "goal-budget-limited";
+}
+
+export function isPluginHookNoticeEvent(msg: WorkspaceChatMessage): msg is PluginHookNoticeEvent {
+  return (msg as { type?: string }).type === "plugin-hook-notice";
 }
 
 export function isQueuedMessageChanged(

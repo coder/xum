@@ -245,6 +245,29 @@ describe("cacheStrategy", () => {
       }); // Last part has cache control
     });
 
+    it("merges cache options into existing part providerOptions", () => {
+      // The tool-search dedupe projection stashes restoration data on the last
+      // part's providerOptions; adding cache control must not delete it.
+      const raw: unknown = {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-1",
+            toolName: "tool_catalog_search",
+            output: { type: "text", value: "repeat status" },
+            providerOptions: { mux: { rawToolSearchOutput: "{}" } },
+          },
+        ],
+      };
+      const result = applyCacheControl([raw as ModelMessage], "anthropic:claude-3-5-sonnet");
+      const content = result[0].content as Array<{ providerOptions?: unknown }>;
+      expect(content[0].providerOptions).toEqual({
+        mux: { rawToolSearchOutput: "{}" },
+        anthropic: { cacheControl: { type: "ephemeral" } },
+      });
+    });
+
     it("should include cache TTL when provided", () => {
       const messages: ModelMessage[] = [{ role: "user", content: "Hello" }];
       const result = applyCacheControl(messages, "anthropic:claude-3-5-sonnet", "1h");
@@ -687,9 +710,40 @@ describe("cacheStrategy", () => {
       expect(result.readFile).toEqual(toolsWithDynamicTool.readFile);
     });
 
-    it("preserves the built-in task marker when recreating the last function tool", () => {
-      // Cache control recreates the last function tool via createTool(). Built-in explore-task
-      // parallelism depends on a symbol marker surviving that recreation; if it were dropped the
+    it("puts the breakpoint on the last non-deferred tool and keeps its hooks and options", () => {
+      // Anthropic rejects cache_control on a defer_loading tool (#5262).
+      const toModelOutput = () => ({ type: "text" as const, value: "ok" });
+      const searchTool: Tool = {
+        ...tool({
+          description: "search",
+          inputSchema: z.object({ query: z.string() }),
+          execute: () => Promise.resolve("ok"),
+        }),
+        toModelOutput,
+        providerOptions: { anthropic: { eagerInputStreaming: true } },
+      };
+      const deferredTool: Tool = {
+        ...mockTools.writeFile,
+        providerOptions: { anthropic: { deferLoading: true } },
+      };
+      const result = applyCacheControlToTools(
+        { readFile: mockTools.readFile, tool_catalog_search: searchTool, zulip_send: deferredTool },
+        "anthropic:claude-3-5-sonnet",
+        "1h"
+      );
+
+      expect(result.zulip_send).toBe(deferredTool);
+      expect(result.readFile).toBe(mockTools.readFile);
+      expect(result.tool_catalog_search.providerOptions).toEqual({
+        anthropic: { eagerInputStreaming: true, cacheControl: { type: "ephemeral", ttl: "1h" } },
+      });
+      expect(result.tool_catalog_search.toModelOutput).toBe(toModelOutput);
+      expect(result.tool_catalog_search.execute).toBe(searchTool.execute);
+    });
+
+    it("preserves the built-in task marker when cloning the last function tool", () => {
+      // Cache control clones the last function tool. Built-in explore-task
+      // parallelism depends on a symbol marker surviving that copy; if it were dropped the
       // task tool would silently fall back to serialized execution.
       const taskTool = markBuiltInTaskTool(
         tool({

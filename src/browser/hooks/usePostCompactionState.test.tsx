@@ -4,7 +4,7 @@ import { cleanup, render, waitFor } from "@testing-library/react";
 import { installDom } from "../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { createTestApiClient } from "@/browser/testUtils";
-import { usePostCompactionState } from "./usePostCompactionState";
+import { refetchPostCompactionState, usePostCompactionState } from "./usePostCompactionState";
 
 type PostCompactionResult = Awaited<ReturnType<APIClient["workspace"]["getPostCompactionState"]>>;
 
@@ -70,5 +70,27 @@ describe("usePostCompactionState", () => {
       fakeClient(() => new Promise<PostCompactionResult>(() => undefined))
     );
     expect(JSON.parse(secondView.getByTestId("state").textContent ?? "")).toEqual(BACKEND_STATE);
+  });
+
+  test("a refetch request from outside the hook shows the new backend state (#5174 import)", async () => {
+    const workspaceId = "ws-post-compaction-refetch";
+    let backend: PostCompactionResult = { ...BACKEND_STATE, planPath: null };
+    const view = render(
+      <APIProvider client={fakeClient(() => Promise.resolve(backend))}>
+        <Probe workspaceId={workspaceId} />
+      </APIProvider>
+    );
+    const shown = () =>
+      JSON.parse(view.getByTestId("state").textContent ?? "") as {
+        planPath: string | null;
+        trackedFilePaths: string[];
+      };
+    await waitFor(() => expect(shown().trackedFilePaths).toEqual(BACKEND_STATE.trackedFilePaths));
+
+    backend = BACKEND_STATE;
+    refetchPostCompactionState("another-workspace");
+    refetchPostCompactionState(workspaceId);
+
+    await waitFor(() => expect(shown().planPath).toBe(BACKEND_STATE.planPath));
   });
 });

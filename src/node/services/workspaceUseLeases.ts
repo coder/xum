@@ -33,6 +33,10 @@ import {
  * record schema. The path is unique to this instance, so acquiring it never contends.
  */
 // "unarchive" is held by a keep-mode unarchive from before its commit until it finishes (#4871).
+// "launch" is held by a sub-agent task's launch from before its row becomes `starting` until the
+// launch settles: no structural mutator ignores it, so a removal never
+// deletes a checkout a launch is preparing, and another backend's startup recovery leaves the
+// preparing task alone.
 export type WorkspaceUseKind =
   | "turn"
   | "terminal"
@@ -40,7 +44,8 @@ export type WorkspaceUseKind =
   | "mcp"
   | "exec"
   | "editor"
-  | "unarchive";
+  | "unarchive"
+  | "launch";
 
 /** Thrown by hold() while a structural mutation of the workspace is in progress. */
 export class WorkspaceMutationInProgressError extends Error {}
@@ -82,6 +87,16 @@ const safeName = (workspaceId: string) =>
 export function workspaceUseLockDir(rootDir: string, workspaceId: string): string {
   assert(workspaceId.length > 0, "workspaceUseLockDir requires a workspace id");
   return path.join(rootDir, "locks", "workspace-use", safeName(workspaceId));
+}
+
+/**
+ * Directory holding every backend's init-record locks for one workspace (#4918; see
+ * InitStateManager). Apart from the use leases on purpose: they say a backend may still write
+ * the workspace's init record, which only init replay weighs, never a mutation gate.
+ */
+export function initRecordLockDir(rootDir: string, workspaceId: string): string {
+  assert(workspaceId.length > 0, "initRecordLockDir requires a workspace id");
+  return path.join(rootDir, "locks", "init-record", safeName(workspaceId));
 }
 
 /** The per-workspace mutation gate a structural mutator holds while it runs. */

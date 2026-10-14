@@ -79,7 +79,7 @@ describeIntegration("Workspace Fork (UI)", () => {
     }
   }, 60_000);
 
-  test("context menu Fork chat action adds the new workspace to the sidebar immediately", async () => {
+  test("context menu Fork workspace action adds the new workspace to the sidebar immediately", async () => {
     const app = await createAppHarness({ branchPrefix: "ui-fork-menu" });
 
     let forkedWorkspaceId: string | null = null;
@@ -107,7 +107,7 @@ describeIntegration("Workspace Fork (UI)", () => {
       const forkButton = await waitFor(
         () => {
           const buttons = Array.from(document.querySelectorAll("button"));
-          const forkBtn = buttons.find((b) => b.textContent?.includes("Fork chat"));
+          const forkBtn = buttons.find((b) => b.textContent?.includes("Fork workspace"));
           if (!forkBtn) throw new Error("Fork button not found in menu");
           return forkBtn as HTMLElement;
         },

@@ -10,7 +10,7 @@ import { Config, type SecretsStore } from "@/node/config";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
-import type { WorkspaceServiceArgs, WorkspaceServiceHarness } from "./workspaceService.testHarness";
+import type { WorkspaceServiceHarness } from "./workspaceService.testHarness";
 import {
   createCompactionAdmissionMocks,
   createWorkspaceServiceHarness,
@@ -147,24 +147,6 @@ describe("WorkspaceService init cancellation", () => {
     expect(await workspaceService.remove(malformedId, true)).toEqual(Ok(undefined));
     // Config cleanup proceeded, but the victim's dir must survive.
     expect(await fsPromises.stat(victimPath).then(() => true)).toBe(true);
-  });
-
-  test("createScratch rejects when policy disallows the local runtime", async () => {
-    const policyService = {
-      isEnforced: mock(() => true),
-      isRuntimeAllowed: mock(() => false),
-    } as unknown as WorkspaceServiceArgs[8];
-    await using harness = await createWorkspaceServiceHarness({ policyService });
-    const { config, service: workspaceService } = harness;
-
-    const result = await workspaceService.createScratch("Blocked scratch");
-
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error).toContain("not allowed by policy");
-    }
-    // No config entry or workdir may be left behind by the rejected create.
-    expect((await config.getAllWorkspaceMetadata()).length).toBe(0);
   });
 
   test("create() rejects untrusted projects", async () => {

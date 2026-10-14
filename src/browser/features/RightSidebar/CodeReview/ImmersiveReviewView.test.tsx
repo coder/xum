@@ -2,7 +2,8 @@ import "../../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import { APIContext, APIProvider, type APIClient } from "@/browser/contexts/API";
 import * as RealClipboardModule from "@/browser/utils/clipboard";
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import * as highlightWorkerClient from "@/browser/utils/highlighting/highlightWorkerClient";
+import { afterEach, beforeEach, describe, expect, jest, mock, spyOn, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import { useEffect, useState, type ComponentProps, type ReactElement, type ReactNode } from "react";
@@ -592,6 +593,60 @@ describe("ImmersiveReviewView", () => {
     );
   });
 
+  // #6303 item 2: the full-file read finished, but its highlight preload waited on a cold
+  // highlight worker (a 5-20 s start). The 5 s reveal timer, or the preload's start failure,
+  // then dropped the file that was read, and the overlay fell back to the compact hunks.
+  describe("keeps full-file context while the highlighter is not ready", () => {
+    // Content no other test reads: DiffRenderer caches highlighted diffs per content for the
+    // module's life, and a cache hit would skip the slow highlighter this test needs.
+    const contextLine = "context kept while the highlighter starts";
+    const fileContent = `new line\n${contextLine}\n`;
+    const readFile = () =>
+      Promise.resolve(createTestBashResult({ output: encodeFileReadOutput(fileContent) }));
+
+    test("when the highlight preload fails because no worker started", async () => {
+      const highlightSpy = spyOn(highlightWorkerClient, "highlightCode").mockImplementation(() =>
+        Promise.reject(new Error("HIGHLIGHT_WORKER_START_TIMEOUT"))
+      );
+      mockApi.workspace.executeBash = mock(readFile);
+      try {
+        const view = renderImmersiveReview();
+        await waitFor(() => expect(mockApi.workspace.executeBash).toHaveBeenCalledTimes(1));
+        await waitFor(() => expect(view.container.textContent ?? "").toContain(contextLine));
+        expect(highlightSpy).toHaveBeenCalled();
+      } finally {
+        highlightSpy.mockRestore();
+      }
+    });
+
+    test("when the highlight preload outlasts the reveal timer", async () => {
+      // Pending: the worker is still starting.
+      const highlightSpy = spyOn(highlightWorkerClient, "highlightCode").mockImplementation(
+        () => new Promise<string>(() => undefined)
+      );
+      mockApi.workspace.executeBash = mock(readFile);
+      // bun-types lacks advanceTimersByTime; bun implements it.
+      const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
+      jest.useFakeTimers();
+      try {
+        const view = renderImmersiveReview();
+        await act(async () => {
+          for (let i = 0; i < 10; i++) await Promise.resolve();
+        });
+        expect(mockApi.workspace.executeBash).toHaveBeenCalledTimes(1);
+        await act(async () => {
+          fakeTimers.advanceTimersByTime(6_000);
+          for (let i = 0; i < 10; i++) await Promise.resolve();
+        });
+        expect(view.container.textContent ?? "").toContain(contextLine);
+        expect(highlightSpy).toHaveBeenCalled();
+      } finally {
+        jest.useRealTimers();
+        highlightSpy.mockRestore();
+      }
+    });
+  });
+
   test("retries full-file context after a transient read failure", async () => {
     const firstHunk = createHunk({ id: "hunk-first", filePath: "src/first.ts" });
     const secondHunk = createHunk({ id: "hunk-second", filePath: "src/second.ts" });
@@ -695,6 +750,158 @@ describe("ImmersiveReviewView", () => {
 
     expect(view.queryByTestId("immersive-review-complete")).toBeNull();
     expect(view.getByText("No hunks for this file")).toBeTruthy();
+  });
+
+  // Bug bash (#5674): a failed diff (for example a missing base ref) read "No files to review".
+  test("shows the diff load error instead of the empty state", () => {
+    const view = renderImmersiveReview({
+      fileTree: null,
+      hunks: [],
+      allHunks: [],
+      selectedHunkId: null,
+      loadError: "fatal: bad revision 'origin/main...HEAD'",
+    });
+
+    expect(view.getByRole("alert").textContent).toContain(
+      "fatal: bad revision 'origin/main...HEAD'"
+    );
+    expect(view.queryByText("No files to review")).toBeNull();
+  });
+
+  test("offers the add-note shortcut only when the diff has lines to note", async () => {
+    // Without diff lines the composer cannot open, so the empty Notes panel must not
+    // advertise a shortcut that does nothing.
+    const emptyView = renderImmersiveReview({
+      hunks: [],
+      allHunks: [],
+      selectedHunkId: null,
+      isTouchImmersive: false,
+    });
+    expect(emptyView.getByText("No notes yet")).toBeTruthy();
+    expect(emptyView.queryByText(/to add one/)).toBeNull();
+    cleanup();
+
+    mockApi.workspace.executeBash = mock(() =>
+      Promise.resolve(createTestBashResult({ output: encodeFileReadOutput("new line\n") }))
+    );
+    const view = renderImmersiveReview({ isTouchImmersive: false });
+    expect(view.getByText("No notes yet")).toBeTruthy();
+    expect(await view.findByText("Press Shift+C to add one")).toBeTruthy();
+  });
+
+  test("Tab does not enter notes mode while the notes sidebar is hidden", () => {
+    const hunk = createHunk();
+    const review: Review = {
+      id: "review-1",
+      data: {
+        filePath: hunk.filePath,
+        lineRange: "+1",
+        selectedCode: "new line",
+        userNote: "Check this",
+      },
+      status: "pending",
+      createdAt: 1000,
+    };
+    const onDelete = mock((_reviewId: string) => undefined);
+    const renderWithReview = () =>
+      renderImmersiveReview({
+        isTouchImmersive: false,
+        reviewsByFilePath: new Map([[hunk.filePath, [review]]]),
+        reviewActions: { onDelete },
+      });
+    const pressTabThenDelete = () => {
+      fireEvent.keyDown(globalThis.window as unknown as Element, { key: "Tab" });
+      fireEvent.keyDown(globalThis.window as unknown as Element, { key: "Delete" });
+    };
+
+    // Control: with the sidebar shown, Tab enters notes mode and Delete removes the note.
+    renderWithReview();
+    pressTabThenDelete();
+    expect(onDelete.mock.calls).toEqual([[review.id]]);
+    cleanup();
+    onDelete.mockClear();
+
+    // Narrow windows hide the sidebar with CSS; browsers then report no client rects.
+    const elementPrototype = (globalThis.window as unknown as { Element: typeof Element }).Element
+      .prototype;
+    const getClientRectsSpy = spyOn(elementPrototype, "getClientRects").mockImplementation(
+      () => [] as unknown as DOMRectList
+    );
+    try {
+      renderWithReview();
+      pressTabThenDelete();
+      expect(onDelete).not.toHaveBeenCalled();
+    } finally {
+      getClientRectsSpy.mockRestore();
+    }
+  });
+
+  test("keys act on the diff after the notes sidebar hides while notes mode is active", async () => {
+    const firstHunk = createHunk({
+      id: "hunk-first",
+      filePath: "src/example.ts",
+      newStart: 1,
+      oldStart: 1,
+      header: "@@ -1 +1 @@",
+      content: "-old first\n+new first",
+    });
+    const secondHunk = createHunk({
+      id: "hunk-second",
+      filePath: "src/example.ts",
+      newStart: 3,
+      oldStart: 3,
+      header: "@@ -3 +3 @@",
+      content: "-old second\n+new second",
+    });
+    // The note sits in another file so the diff renders no inline note card.
+    const review: Review = {
+      id: "review-1",
+      data: {
+        filePath: "src/other.ts",
+        lineRange: "+1",
+        selectedCode: "other line",
+        userNote: "Check this",
+      },
+      status: "pending",
+      createdAt: 1000,
+    };
+    const onDelete = mock((_reviewId: string) => undefined);
+    const view = renderImmersiveReview({
+      fileTree: createFileTree(firstHunk.filePath),
+      hunks: [firstHunk, secondHunk],
+      allHunks: [firstHunk, secondHunk],
+      selectedHunkId: firstHunk.id,
+      isTouchImmersive: false,
+      reviewsByFilePath: new Map([[review.data.filePath, [review]]]),
+      reviewActions: { onDelete },
+    });
+    const press = (key: string) =>
+      fireEvent.keyDown(globalThis.window as unknown as Element, { key });
+    const selectedHunkPosition = () =>
+      view.getByTestId("immersive-review-view").getAttribute("data-selected-hunk-position");
+
+    // Enter notes mode while the window is wide enough to show the sidebar.
+    press("Tab");
+
+    // The window then shrinks below the breakpoint: CSS hides the sidebar, and
+    // browsers report no client rects for hidden elements.
+    const elementPrototype = (globalThis.window as unknown as { Element: typeof Element }).Element
+      .prototype;
+    const getClientRectsSpy = spyOn(elementPrototype, "getClientRects").mockImplementation(
+      () => [] as unknown as DOMRectList
+    );
+    try {
+      press("Delete");
+      expect(onDelete).not.toHaveBeenCalled();
+
+      expect(selectedHunkPosition()).toBe("1");
+      press("j");
+      await waitFor(() => expect(selectedHunkPosition()).toBe("2"));
+      press("k");
+      await waitFor(() => expect(selectedHunkPosition()).toBe("1"));
+    } finally {
+      getClientRectsSpy.mockRestore();
+    }
   });
 
   test("marking an unread hunk as read advances to the next hunk even when read hunks stay visible", async () => {

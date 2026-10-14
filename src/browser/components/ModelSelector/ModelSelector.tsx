@@ -14,13 +14,12 @@ import React, {
   forwardRef,
 } from "react";
 import { cn } from "@/common/lib/utils";
-import { ChevronDown, Eye, Route, Settings, ShieldCheck, Star } from "lucide-react";
+import { ChevronDown, Eye, Route, Settings, Star } from "lucide-react";
 
 import { COMPOSER_PICKER_PANEL_CLASS, composerPickerOptionClass } from "../composerPickerStyles";
 import { ProviderIcon } from "../ProviderIcon/ProviderIcon";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { useSettings } from "@/browser/contexts/SettingsContext";
-import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useRouting } from "@/browser/hooks/useRouting";
 
@@ -101,8 +100,6 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
     ref
   ) => {
     useSettings(); // Context must be available for nested components
-    const policyState = usePolicy();
-    const policyEnforced = policyState.status.state === "enforced";
     const routing = useRouting();
     const { config: providersConfig } = useProvidersConfig();
     const [isOpen, setIsOpen] = useState(false);
@@ -371,7 +368,9 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
               )}
               role="combobox"
               aria-expanded={isOpen}
-              aria-label={triggerAriaLabel}
+              // A combobox takes no name from its content, so fall back to a name that
+              // includes the visible model (button-name, #5951).
+              aria-label={triggerAriaLabel ?? (displayValue ? `Model: ${displayValue}` : "Model")}
               variant="ghost"
               size="xs"
               onClick={() => setIsOpen((prev) => !prev)}
@@ -484,10 +483,12 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
               >
                 <Route
                   aria-hidden="true"
-                  className={cn("h-3 w-3 shrink-0", autoActive ? "text-accent" : "text-muted")}
+                  className={cn("h-3 w-3 shrink-0", autoActive ? "text-accent-text" : "text-muted")}
                 />
                 <span className="flex min-w-0 flex-1 items-baseline gap-1">
-                  <span className={cn("min-w-0 truncate", autoActive && "text-accent")}>Auto</span>
+                  <span className={cn("min-w-0 truncate", autoActive && "text-accent-text")}>
+                    Auto
+                  </span>
                   <span className="text-muted shrink-0 text-[10px]">Route by difficulty</span>
                 </span>
               </button>
@@ -525,14 +526,14 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
                         provider={modelProvider}
                         className={cn(
                           "h-3 w-3 shrink-0",
-                          isModelSelected(model) ? "text-accent" : "text-muted"
+                          isModelSelected(model) ? "text-accent-text" : "text-muted"
                         )}
                       />
                       <span className="flex min-w-0 flex-1 items-baseline gap-1">
                         <span
                           className={cn(
                             "min-w-0 truncate",
-                            isModelSelected(model) && "text-accent"
+                            isModelSelected(model) && "text-accent-text"
                           )}
                         >
                           {formatModelDisplayName(modelName)}
@@ -658,13 +659,6 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
                   >
                     {showAllModels ? "Show fewer models" : "Show all models…"}
                   </button>
-                )}
-
-                {policyEnforced && (
-                  <div className="text-muted flex items-center gap-1 px-2.5 text-[10px]">
-                    <ShieldCheck className="h-3 w-3" aria-hidden />
-                    <span>Your settings are controlled by a policy.</span>
-                  </div>
                 )}
 
                 {onOpenSettings && (

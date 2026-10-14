@@ -7,6 +7,7 @@ import { createMockORPCClient } from "./mocks/orpc";
 import { createAssistantMessage } from "./mocks/messages";
 import type { ProjectConfig } from "@/common/types/project";
 import { createWorkspace, groupWorkspacesByProject, STABLE_TIMESTAMP } from "./mocks/workspaces";
+import { waitForAppFadeInDone } from "./storyPlayHelpers";
 import {
   clearWorkspaceSelection,
   collapseLeftSidebar,
@@ -584,6 +585,7 @@ function createStreamingHydrationStory(workspaceId: string): AppStory {
       const canvas = within(canvasElement);
       await waitFor(() => expect(typeof emitChat).toBe("function"));
       await checkTranscriptLayout(canvasElement);
+      await waitForAppFadeInDone(canvas.getByRole("log"));
       await expect(canvas.getByTestId("transcript-hydration-placeholder")).toBeVisible();
       emitChat({ type: "stream-lifecycle", workspaceId, phase: "preparing", hadAnyOutput: false });
       const stop = await canvas.findByRole("button", { name: "Stop streaming" });

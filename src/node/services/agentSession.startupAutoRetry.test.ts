@@ -3,6 +3,7 @@ import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import type { TurnCoordinator } from "./turnCoordinator";
 import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { EventEmitter } from "events";
 import * as fsPromises from "fs/promises";
 import path from "path";
@@ -22,6 +23,7 @@ import {
 import { makeTestEffectRunner, type TestEffectRunner } from "./di/testEffectRunner";
 import { Duration } from "effect";
 import { createTestHistoryService } from "./testHistoryService";
+import { createContextBudgetWarning } from "./contextWindowRollover";
 import { waitForCondition } from "./testDispatchHelpers";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { HistoryService } from "./historyService";
@@ -37,7 +39,7 @@ import {
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { Err, Ok } from "@/common/types/result";
-import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
+import { GOAL_CONTINUATION_KIND, type TaskTurnKind } from "@/constants/goals";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import type { StreamErrorType } from "@/common/types/errors";
@@ -179,6 +181,22 @@ function autoRetryPreferencePath(config: Config, workspaceId: string): string {
   return path.join(config.sessionsDir, workspaceId, "auto-retry-preference.json");
 }
 
+/**
+ * A Token Budget warning row as the token-budget strategy publishes it. #5286 appends it after
+ * the turn's user row; it is a notice, never the request that recovery must replay or match.
+ */
+function tokenBudgetWarning(): MuxMessage {
+  return createContextBudgetWarning({
+    contextTokens: 90_000,
+    maxTokens: 128_000,
+    budgetTokens: 119_808,
+    sessionHistoryAvailable: true,
+    handoff: true,
+    handoffTokens: 89_600,
+    newContextAvailable: true,
+  });
+}
+
 describe("AgentSession startup auto-retry recovery", () => {
   const cleanups: Array<() => Promise<void>> = [];
 
@@ -190,6 +208,108 @@ describe("AgentSession startup auto-retry recovery", () => {
       }
     }
   });
+
+  test.each(["user tail", "assistant partial", "compaction follow-up"] as const)(
+    "side chats do not automatically recover an inherited %s",
+    async (tail) => {
+      const workspaceId = "side-startup-recovery";
+      const metadata: WorkspaceMetadata = {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath: "/tmp/project",
+        runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+        sideChatParentWorkspaceId: "main",
+      };
+      const clock = makeTestEffectRunner();
+      const { session, historyService, events, aiService, cleanup } = await createSessionBundle(
+        workspaceId,
+        { getWorkspaceMetadata: mock(() => Promise.resolve(Ok(metadata))) },
+        { clock }
+      );
+      const stream = spyOn(aiService, "streamMessage");
+      cleanups.push(
+        () => clock.dispose(),
+        async () => {
+          await cleanup();
+          stream.mockRestore();
+        }
+      );
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("inherited-user", "user", "Continue main work")
+      );
+      if (tail === "assistant partial") {
+        await historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("partial", "assistant", "Working", { partial: true })
+        );
+      } else if (tail === "compaction follow-up") {
+        await historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("summary", "assistant", "Summary", {
+            muxMetadata: {
+              type: "compaction-summary",
+              pendingFollowUp: {
+                text: "Continue main work",
+                model: "openai:gpt-4o",
+                agentId: "exec",
+              },
+            },
+          })
+        );
+      }
+      const before = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      await session.runStartupRecovery(metadata);
+      await session.ensureStartupAutoRetryCheck();
+
+      expect(events.filter((event) => event.type === "auto-retry-scheduled")).toHaveLength(0);
+      expect(stream).not.toHaveBeenCalled();
+      expect(await historyService.getHistoryFromLatestBoundary(workspaceId)).toEqual(before);
+    }
+  );
+
+  test.each(["send", "retry"] as const)(
+    "a side chat still accepts an explicit user %s",
+    async (action) => {
+      const workspaceId = "explicit-side-turn";
+      const { session, historyService, aiService, cleanup } = await createSessionBundle(
+        workspaceId,
+        {
+          getWorkspaceMetadata: mock(() =>
+            Promise.resolve(
+              Ok({
+                id: workspaceId,
+                name: workspaceId,
+                projectName: "project",
+                projectPath: "/tmp/project",
+                runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+                sideChatParentWorkspaceId: "main",
+              })
+            )
+          ),
+        }
+      );
+      const stream = spyOn(aiService, "streamMessage");
+      cleanups.push(async () => {
+        await cleanup();
+        stream.mockRestore();
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("side-user", "user", "Explain this")
+      );
+      await session.ensureStartupAutoRetryCheck();
+      expect(stream).not.toHaveBeenCalled();
+      const options = { model: "anthropic:claude-sonnet-4-5", agentId: "exec" };
+      const result =
+        action === "send"
+          ? await session.sendMessage("Explain another thing", options)
+          : await session.resumeStream(options);
+      expect(result.success).toBe(true);
+      expect(stream).toHaveBeenCalledTimes(1);
+    }
+  );
 
   test("schedules startup auto-retry for interrupted user tail", async () => {
     const workspaceId = "startup-retry-user-tail";
@@ -281,6 +401,44 @@ describe("AgentSession startup auto-retry recovery", () => {
 
     await session.dispose();
   });
+
+  test.each(["preparing", "streaming"] as const)(
+    "auto-retry retains a chat speed pick made while %s",
+    async (phase) => {
+      const clock = makeTestEffectRunner();
+      const { session, aiService, events, cleanup } = await createSessionBundle(
+        `speed-retry-${phase}`,
+        undefined,
+        { clock }
+      );
+      cleanups.push(() => clock.dispose(), cleanup);
+      spyOn(aiService, "streamMessage").mockImplementation(() => {
+        if (phase === "streaming") {
+          expect(session.setActiveTurnServiceTier("priority")).toEqual({ accepted: true });
+        }
+        return Promise.resolve(
+          Err({ type: "runtime_start_failed", message: "retry this request" })
+        );
+      });
+      const result = await session.sendMessage(
+        "continue",
+        { model: "openai:gpt-6-astra", agentId: "exec", serviceTier: "default" },
+        {
+          onAccepted: () => {
+            if (phase === "preparing") {
+              expect(session.setActiveTurnServiceTier("priority")).toEqual({ accepted: true });
+            }
+          },
+        }
+      );
+      expect(result.success).toBe(false);
+      const resume = spyOn(session, "resumeStream").mockResolvedValue(Ok({ started: true }));
+      await fireScheduledRetry(clock, events);
+      expect(resume).toHaveBeenCalledTimes(1);
+      expect(resume.mock.calls[0][0].serviceTier).toBe("priority");
+      await session.dispose();
+    }
+  );
 
   test("auto-retry abandons instead of resuming once the workspace is archived on disk", async () => {
     const workspaceId = "startup-retry-archived-before-timer";
@@ -778,6 +936,9 @@ describe("AgentSession startup auto-retry recovery", () => {
       const { session, config, historyService, aiService, events, cleanup } =
         await createSessionBundle(workspaceId, undefined, { clock });
       cleanups.push(() => clock.dispose(), cleanup);
+      spyOn(aiService, "isExperimentEnabled").mockImplementation(
+        (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET || id === EXPERIMENT_IDS.MEMORY
+      );
       const model = "openai:gpt-4o";
       if ("seed" in fixture) {
         await seedAutoCompactionThreshold(config, model, fixture.seed);
@@ -805,7 +966,6 @@ describe("AgentSession startup auto-retry recovery", () => {
           retrySendOptions: pickStartupRetrySendOptions({
             model,
             agentId: "exec",
-            experiments: { tokenBudget: true, memory: true },
           }),
         })
       );
@@ -876,70 +1036,132 @@ describe("AgentSession startup auto-retry recovery", () => {
     await session.dispose();
   });
 
-  test("restores persisted retry send options for startup auto-retry", async () => {
-    const workspaceId = "startup-retry-preserve-options";
-    const clock = makeTestEffectRunner();
-    const { session, historyService, events, cleanup } = await createSessionBundle(
-      workspaceId,
-      undefined,
-      { clock }
-    );
-    cleanups.push(() => clock.dispose(), cleanup);
+  test.each([false, true])(
+    "restores persisted retry send options for startup auto-retry (Token Budget warning after the user row: %p)",
+    async (warningAfterUser) => {
+      const workspaceId = `startup-retry-preserve-options-${warningAfterUser}`;
+      const clock = makeTestEffectRunner();
+      const { session, historyService, events, cleanup } = await createSessionBundle(
+        workspaceId,
+        undefined,
+        { clock }
+      );
+      cleanups.push(() => clock.dispose(), cleanup);
 
-    const appendResult = await historyService.appendToHistory(
-      workspaceId,
-      createMuxMessage("user-1", "user", "Interrupted with custom send options", {
-        timestamp: Date.now(),
-        kind: GOAL_CONTINUATION_KIND,
-        retrySendOptions: {
-          model: "anthropic:claude-sonnet-4-5",
-          agentId: "exec",
-          thinkingLevel: "high",
-          toolPolicy: [{ regex_match: "bash", action: "disable" }],
-          additionalSystemInstructions: "Use one sentence.",
-          maxOutputTokens: 2048,
-          providerOptions: {
-            anthropic: {
-              use1MContext: true,
-              use1MContextModels: ["anthropic:claude-sonnet-4-5"],
+      const appendResult = await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("user-1", "user", "Interrupted with custom send options", {
+          timestamp: Date.now(),
+          kind: GOAL_CONTINUATION_KIND,
+          retrySendOptions: {
+            model: "anthropic:claude-sonnet-4-5",
+            agentId: "exec",
+            thinkingLevel: "high",
+            toolPolicy: [{ regex_match: "bash", action: "disable" }],
+            additionalSystemInstructions: "Use one sentence.",
+            maxOutputTokens: 2048,
+            providerOptions: {
+              anthropic: {
+                use1MContext: true,
+                use1MContextModels: ["anthropic:claude-sonnet-4-5"],
+              },
             },
+            disableWorkspaceAgents: true,
           },
-          allowAgentSetGoal: true,
-          disableWorkspaceAgents: true,
-        },
-      })
-    );
-    expect(appendResult.success).toBe(true);
+        })
+      );
+      expect(appendResult.success).toBe(true);
+      if (warningAfterUser) {
+        expect(
+          (await historyService.appendToHistory(workspaceId, tokenBudgetWarning())).success
+        ).toBe(true);
+      }
 
-    await session.ensureStartupAutoRetryCheck();
+      await session.ensureStartupAutoRetryCheck();
 
-    // The scheduled retry resumes with every persisted option and the goal attribution.
-    const resumeStream = spyOn(session, "resumeStream").mockResolvedValue(Ok({ started: true }));
-    await fireScheduledRetry(clock, events);
-    expect(resumeStream).toHaveBeenCalledTimes(1);
-    const [options, internal] = resumeStream.mock.calls[0];
-    const retryOptions = { options, goalKind: internal?.goalKind };
+      // The scheduled retry resumes with every persisted option and the goal attribution.
+      const resumeStream = spyOn(session, "resumeStream").mockResolvedValue(Ok({ started: true }));
+      await fireScheduledRetry(clock, events);
+      expect(resumeStream).toHaveBeenCalledTimes(1);
+      const [options, internal] = resumeStream.mock.calls[0];
+      const retryOptions = { options, goalKind: internal?.goalKind };
 
-    expect(retryOptions.options.model).toBe("anthropic:claude-sonnet-4-5");
-    expect(retryOptions.options.agentId).toBe("exec");
-    expect(retryOptions.options.thinkingLevel).toBe("high");
-    expect(retryOptions.options.additionalSystemInstructions).toBe("Use one sentence.");
-    expect(retryOptions.options.maxOutputTokens).toBe(2048);
-    expect(retryOptions.options.toolPolicy).toEqual([{ regex_match: "bash", action: "disable" }]);
-    expect(retryOptions.options.allowAgentSetGoal).toBe(true);
-    expect(retryOptions.options.disableWorkspaceAgents).toBe(true);
-    expect(retryOptions.goalKind).toBe(GOAL_CONTINUATION_KIND);
+      expect(retryOptions.options.model).toBe("anthropic:claude-sonnet-4-5");
+      expect(retryOptions.options.agentId).toBe("exec");
+      expect(retryOptions.options.thinkingLevel).toBe("high");
+      expect(retryOptions.options.additionalSystemInstructions).toBe("Use one sentence.");
+      expect(retryOptions.options.maxOutputTokens).toBe(2048);
+      expect(retryOptions.options.toolPolicy).toEqual([{ regex_match: "bash", action: "disable" }]);
+      expect(retryOptions.options.disableWorkspaceAgents).toBe(true);
+      expect(retryOptions.goalKind).toBe(GOAL_CONTINUATION_KIND);
 
-    expect(retryOptions.options.providerOptions?.anthropic?.use1MContext).toBe(true);
+      expect(retryOptions.options.providerOptions?.anthropic?.use1MContext).toBe(true);
 
-    await session.dispose();
-  });
+      await session.dispose();
+    }
+  );
 
-  test("startup auto-retry discards goal attribution when the persisted goal ID is malformed", async () => {
+  // Startup auto-retry replays the interrupted turn through resumeStream; an automatic task
+  // turn must stream again as that task turn (set_goal stays gated). Both durable copies are
+  // read (retry snapshot first, user-row metadata as fallback); an unknown value fails closed
+  // to "recovery" and the turn still retries.
+  test.each([
+    ["retry snapshot", { retrySendOptions: "required_report" }, "required_report"],
+    ["user row", { row: "recovery" }, "recovery"],
+    ["malformed", { retrySendOptions: "bogus", row: "bogus" }, "recovery"],
+  ] as const)(
+    "restores persisted task turn provenance for startup auto-retry (%s)",
+    async (_label, persisted, expected) => {
+      const workspaceId = `startup-retry-task-turn-${_label.replace(" ", "-")}`;
+      const clock = makeTestEffectRunner();
+      const { session, historyService, aiService, events, cleanup } = await createSessionBundle(
+        workspaceId,
+        undefined,
+        { clock }
+      );
+      cleanups.push(() => clock.dispose(), cleanup);
+      const rowKind: unknown = "row" in persisted ? persisted.row : undefined;
+      const snapshotKind: unknown =
+        "retrySendOptions" in persisted ? persisted.retrySendOptions : undefined;
+      const appendResult = await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("user-1", "user", "Interrupted task turn", {
+          timestamp: Date.now(),
+          // Raw JSON on purpose: chat.jsonl can hold values outside the type.
+          ...(rowKind !== undefined ? { taskTurnKind: rowKind as TaskTurnKind } : {}),
+          retrySendOptions: {
+            model: "openai:gpt-4o",
+            agentId: "exec",
+            ...(snapshotKind !== undefined ? { taskTurnKind: snapshotKind as TaskTurnKind } : {}),
+          },
+        })
+      );
+      expect(appendResult.success).toBe(true);
+      const streamed = Promise.withResolvers<void>();
+      const streamMessageMock = mock<AgentSessionAIService["streamMessage"]>(() => {
+        streamed.resolve();
+        return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
+      });
+      aiService.streamMessage = streamMessageMock;
+
+      await session.ensureStartupAutoRetryCheck();
+      await fireScheduledRetry(clock, events);
+      await streamed.promise;
+
+      expect(streamMessageMock).toHaveBeenCalledTimes(1);
+      expect(streamMessageMock.mock.calls[0]?.[0].taskTurnKind).toBe(expected);
+
+      await session.dispose();
+    }
+  );
+
+  test("startup auto-retry fails closed when a goal row's persisted goal ID is malformed", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM6cQt3o): chat.jsonl is unchecked JSON. A
     // present-but-invalid goalId must not resume the turn as goal-driven with
     // untrustworthy identity — a later compaction would persist a missing-ID
-    // follow-up that bypasses buildGoalRedispatchAdmission entirely.
+    // follow-up that bypasses buildGoalRedispatchAdmission entirely. It must not
+    // resume as an ordinary turn either: the goal kind is what refuses set_goal
+    // on automatic goal turns, so the row is not auto-retried at all.
     const workspaceId = "startup-retry-malformed-goal-id";
     const clock = makeTestEffectRunner();
     const { session, historyService, events, cleanup } = await createSessionBundle(
@@ -964,15 +1186,18 @@ describe("AgentSession startup auto-retry recovery", () => {
     );
     expect(appendResult.success).toBe(true);
 
+    const resumeStream = spyOn(session, "resumeStream").mockResolvedValue(Ok({ started: true }));
     await session.ensureStartupAutoRetryCheck();
 
-    // The retry still resumes the turn, but not as goal-driven.
-    const resumeStream = spyOn(session, "resumeStream").mockResolvedValue(Ok({ started: true }));
-    await fireScheduledRetry(clock, events);
-    expect(resumeStream).toHaveBeenCalledTimes(1);
-    const internal = resumeStream.mock.calls[0][1];
-    expect(internal?.goalKind).toBeUndefined();
-    expect(internal?.goalId).toBeUndefined();
+    expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+    expect(resumeStream).not.toHaveBeenCalled();
+    const abandonedReasons = events
+      .filter(
+        (event): event is Extract<WorkspaceChatMessage, { type: "auto-retry-abandoned" }> =>
+          event.type === "auto-retry-abandoned"
+      )
+      .map((event) => event.reason);
+    expect(abandonedReasons).toEqual(["missing_retry_options"]);
 
     await session.dispose();
   });
@@ -1026,14 +1251,17 @@ describe("AgentSession startup auto-retry recovery", () => {
     { reason: "aborted", userMessageId: undefined, stopped: true },
     { reason: "aborted", userMessageId: "older-user", stopped: false },
     { reason: "context_exceeded", userMessageId: "user-1", stopped: false },
+    // A Token Budget warning after the stopped row is a notice, not newer user intent.
+    { reason: "aborted", userMessageId: "user-1", stopped: true, warningAfterUser: true },
   ])("reads applicable durable user-stop evidence: %j", async (marker) => {
     const workspaceId = "startup-task-stop";
     const { session, config, historyService, cleanup } = await createSessionBundle(workspaceId);
     cleanups.push(cleanup);
-    await historyService.appendToHistory(
-      workspaceId,
-      createMuxMessage("user-1", "user", "Current intent")
-    );
+    const seeded = [
+      createMuxMessage("user-1", "user", "Current intent"),
+      ...(marker.warningAfterUser ? [tokenBudgetWarning()] : []),
+    ];
+    expect((await historyService.appendManyToHistory(workspaceId, seeded)).success).toBe(true);
     await fsPromises.writeFile(
       path.join(config.sessionsDir, workspaceId, "auto-retry-preference.json"),
       JSON.stringify({
@@ -1045,10 +1273,52 @@ describe("AgentSession startup auto-retry recovery", () => {
         marker.stopped ? "stopped" : "interrupted"
       );
       const history = await historyService.getLastMessages(workspaceId, 20);
-      expect(history.success && history.data.map((message) => message.id)).toEqual(["user-1"]);
+      expect(history.success && history.data.map((message) => message.id)).toEqual(
+        seeded.map((message) => message.id)
+      );
     } finally {
       await session.dispose();
     }
+  });
+
+  test("startup auto-retry honors a Stop of the user row that a Token Budget warning follows", async () => {
+    const workspaceId = "startup-retry-stop-before-budget-warning";
+    const clock = makeTestEffectRunner();
+    const { session, config, historyService, events, cleanup } = await createSessionBundle(
+      workspaceId,
+      undefined,
+      { clock }
+    );
+    cleanups.push(() => clock.dispose(), cleanup);
+    expect(
+      (
+        await historyService.appendManyToHistory(workspaceId, [
+          createMuxMessage("user-1", "user", "Stopped request"),
+          tokenBudgetWarning(),
+        ])
+      ).success
+    ).toBe(true);
+    // The user pressed Stop on user-1 before the restart.
+    await fsPromises.writeFile(
+      autoRetryPreferencePath(config, workspaceId),
+      JSON.stringify({ startupAutoRetryAbandon: { reason: "aborted", userMessageId: "user-1" } })
+    );
+    const resumeStream = spyOn(session, "resumeStream").mockResolvedValue(Ok({ started: true }));
+
+    await session.ensureStartupAutoRetryCheck();
+
+    expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+    expect(resumeStream).not.toHaveBeenCalled();
+    expect(
+      events
+        .filter(
+          (event): event is Extract<WorkspaceChatMessage, { type: "auto-retry-abandoned" }> =>
+            event.type === "auto-retry-abandoned"
+        )
+        .map((event) => event.reason)
+    ).toEqual(["aborted"]);
+
+    await session.dispose();
   });
 
   test("preserves a scoped Stop until history proves a newer user intent", async () => {
@@ -1210,6 +1480,48 @@ describe("AgentSession startup auto-retry recovery", () => {
       }
     }
   );
+
+  // Startup recovery skips an idle legacy task row without rewriting config, so the probe must
+  // report every tail the follow-up dispatch could still act on.
+  test.each([
+    { tail: "pending summary", expected: "follow-up" },
+    { tail: "pending summary + preserved tail copy", expected: "follow-up" },
+    { tail: "settled summary", expected: "idle" },
+  ] as const)("classifies a compaction summary tail ($tail)", async ({ tail, expected }) => {
+    const workspaceId = "startup-compaction-tail-state";
+    const { session, historyService, cleanup } = await createSessionBundle(workspaceId);
+    cleanups.push(cleanup);
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("summary", "assistant", "Summary", {
+        muxMetadata: {
+          type: "compaction-summary",
+          ...(tail === "settled summary"
+            ? {}
+            : {
+                pendingFollowUp: {
+                  text: "Continue original work",
+                  model: "openai:gpt-4o",
+                  agentId: "exec",
+                },
+              }),
+        },
+      })
+    );
+    if (tail === "pending summary + preserved tail copy") {
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("tail-copy", "assistant", "Earlier answer", {
+          rlmPreservedTailCopy: true,
+        })
+      );
+    }
+    try {
+      expect(await session.getStartupRecoveryState()).toBe(expected);
+    } finally {
+      await session.dispose();
+    }
+  });
 
   test.each([false, true])(
     "classifies completed versus interrupted assistant tails (%s)",

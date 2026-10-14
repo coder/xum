@@ -177,6 +177,27 @@ describe("CLI via HTTP", () => {
   });
 
   describe("object input schemas", () => {
+    test("perf-captures capture-now parses --duration-ms and rejects out-of-range values", async () => {
+      const captureNow = (durationMs: string) =>
+        runCli([
+          "perf-captures",
+          "capture-now",
+          "--process",
+          "backend",
+          "--duration-ms",
+          durationMs,
+        ]).then(
+          () => null,
+          (rejection: unknown) => rejection
+        );
+      // A valid integer reaches the server, which refuses it: the experiment is off in a
+      // fresh root, so CLI parsing accepted the option.
+      expect(await captureNow("2000")).toMatchObject({ code: "PRECONDITION_FAILED" });
+      for (const value of ["500", "abc"]) {
+        expect(await captureNow(value)).toMatchObject({ code: "BAD_REQUEST" });
+      }
+    });
+
     test("workspace get-info with workspace-id option", async () => {
       const result = await runCli(["workspace", "get-info", "--workspace-id", "nonexistent"]);
       expect(result).toBeNull(); // Non-existent workspace returns null

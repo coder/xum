@@ -2,10 +2,17 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 
 import { ErrorBoundary } from "xum/browser/components/ErrorBoundary/ErrorBoundary";
+import { removeDroppedCacheKeys } from "xum/browser/utils/legacyLocalStorageCleanup";
 import { App } from "./App";
 import { getVscodeBridge } from "./vscodeBridge";
 
 const bridge = getVscodeBridge();
+
+try {
+  removeDroppedCacheKeys();
+} catch {
+  // Reclaiming localStorage quota is best-effort and must never block webview startup.
+}
 
 const rootEl = document.getElementById("root");
 if (!rootEl) {

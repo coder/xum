@@ -9,7 +9,7 @@ import {
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { LEFT_SIDEBAR_COLLAPSED_KEY, SIDEBAR_FLAT_MODE_KEY } from "@/common/constants/storage";
+import { LEFT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
 
 const PROJECT_PATH = "/home/user/projects/my-app";
 
@@ -317,7 +317,6 @@ export const FlatChatList: AppStory = {
   render: () => (
     <AppWithMocks
       setup={() => {
-        updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
         // Keep the sidebar visible at the phone width: no selected workspace
         // (mobile shows the chat over the sidebar) and the sidebar expanded.
         clearWorkspaceSelection();
@@ -362,7 +361,11 @@ export const FlatChatList: AppStory = {
         const betaConfig = projects.get(betaPath);
         if (alphaConfig) projects.set(alphaPath, { ...alphaConfig, color: "Blue" });
         if (betaConfig) projects.set(betaPath, { ...betaConfig, color: "Green" });
-        return createMockORPCClient({ projects, workspaces });
+        return createMockORPCClient({
+          projects,
+          workspaces,
+          userPreferences: { ui: { sidebarFlatMode: true } },
+        });
       }}
     />
   ),

@@ -2,7 +2,46 @@ import assert from "@/common/utils/assert";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import { formatGoalCents } from "@/common/utils/goals/budgetPricing";
 import { escapeXml } from "@/common/utils/xml";
-import { GOAL_OBJECTIVE_CLOSE_TAG, GOAL_OBJECTIVE_OPEN_TAG } from "./goals";
+import type { StreamEndEvent } from "@/common/types/stream";
+import {
+  GOAL_OBJECTIVE_CLOSE_TAG,
+  GOAL_OBJECTIVE_OPEN_TAG,
+  SILENT_CONTINUATION_COMPLETION_SUMMARY_FALLBACK,
+  SILENT_CONTINUATION_COMPLETION_SUMMARY_MAX_LENGTH,
+} from "./goals";
+
+/**
+ * Completion summary for a text-only goal_continuation turn treated as implicit completion: the
+ * final text block (the last run of consecutive text parts), trimmed and length-capped; falls
+ * back to a constant. Shared by the top-level goal loop (AgentSession) and sub-agent arbitration
+ * (TaskService).
+ *
+ * StreamManager stores each streamed text delta as its own part (merged only at display time), so
+ * the last text part alone is just the final chunk ("?", "iku."): join the whole block.
+ */
+export function synthesizeSilentContinuationSummary(parts: StreamEndEvent["parts"]): string {
+  let end = parts.length - 1;
+  for (;;) {
+    while (end >= 0 && parts[end].type !== "text") end -= 1;
+    if (end < 0) return SILENT_CONTINUATION_COMPLETION_SUMMARY_FALLBACK;
+    let start = end;
+    while (start > 0 && parts[start - 1].type === "text") start -= 1;
+    const trimmed = parts
+      .slice(start, end + 1)
+      .map((part) => (part.type === "text" ? part.text : ""))
+      .join("")
+      .trim();
+    if (trimmed.length > 0) {
+      if (trimmed.length <= SILENT_CONTINUATION_COMPLETION_SUMMARY_MAX_LENGTH) {
+        return trimmed;
+      }
+      // Reserve one character for the ellipsis so the persisted summary
+      // stays under the configured cap.
+      return `${trimmed.slice(0, SILENT_CONTINUATION_COMPLETION_SUMMARY_MAX_LENGTH - 1)}…`;
+    }
+    end = start - 1;
+  }
+}
 
 function formatElapsedDuration(elapsedMs: number): string {
   assert(Number.isFinite(elapsedMs) && elapsedMs >= 0, "elapsed duration must be non-negative");

@@ -7,6 +7,11 @@ import type { RuntimeConfig } from "@/common/types/runtime";
 import type { ProjectRef } from "@/common/types/workspace";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
 import { readPlanFile } from "@/node/utils/runtime/helpers";
+import {
+  RemotePlanMigrationError,
+  resolvePlanFileLocation,
+} from "@/node/utils/runtime/planLocation";
+import { InstallationIdentityError } from "@/node/config/installationIdentity";
 import { isRuntimeTransportError } from "@/node/runtime/Runtime";
 import {
   WorkspaceGoalChildWorkspaceError,
@@ -47,15 +52,19 @@ export async function getWorkspacePlanContent(context: ORPCContext, workspaceId:
     return { success: false as const, error: "Workspace not found: " + (workspaceId ?? "<none>") };
   let result: Awaited<ReturnType<typeof readPlanFile>>;
   try {
+    const runtime = createRuntimeForWorkspace(metadata);
     result = await readPlanFile(
-      createRuntimeForWorkspace(metadata),
-      metadata.name,
-      metadata.projectName,
-      workspaceId
+      runtime,
+      await resolvePlanFileLocation(context.config, runtime, metadata)
     );
   } catch (error) {
     // An unreachable runtime is not a missing plan (#4826); report it through the same
     // error channel so every plan viewer shows why, instead of "Plan file not found".
+    // Without this installation's identity, or with a migration that failed, there is no SSH plan
+    // path (#5174): say why.
+    if (error instanceof InstallationIdentityError || error instanceof RemotePlanMigrationError) {
+      return { success: false as const, error: error.message };
+    }
     if (!isRuntimeTransportError(error)) throw error;
     return {
       success: false as const,
@@ -241,6 +250,16 @@ export async function forkWorkspace(context: ORPCContext, input: ForkWorkspaceIn
     : { success: false as const, error: result.error };
 }
 
+export async function createSideChat(
+  context: ORPCContext,
+  input: z.infer<typeof schemas.workspace.createSideChat.input>
+) {
+  const result = await context.workspaceService.createSideChat(input.parentWorkspaceId);
+  return result.success
+    ? { success: true as const, metadata: result.data.metadata }
+    : { success: false as const, error: result.error };
+}
+
 export async function sendWorkspaceMessage(
   context: ORPCContext,
   input: z.infer<typeof schemas.workspace.sendMessage.input>
@@ -303,8 +322,9 @@ export async function setWorkspaceHeartbeat(
 ) {
   const settings: Parameters<ORPCContext["workspaceService"]["setHeartbeatSettings"]>[1] = {
     enabled: input.enabled,
-    intervalMs: input.intervalMs,
   };
+  // Presence with null clears the interval override (#5692); absence preserves it.
+  if ("intervalMs" in input) settings.intervalMs = input.intervalMs ?? null;
   if (input.message != null) settings.message = input.message;
   if (input.contextMode != null) settings.contextMode = input.contextMode;
   // Presence with null clears these values; absence preserves them.

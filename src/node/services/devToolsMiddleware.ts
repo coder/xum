@@ -21,12 +21,14 @@ import {
   DEVTOOLS_RUN_METADATA_ID_HEADER,
   DEVTOOLS_STEP_ID_HEADER,
   consumeCapturedRequestHeaders,
+  consumePromptCacheWire,
   closeCapturedRequestBody,
   consumeRedactedRequestBody,
   discardCapturedRequestBody,
   redactHeaders,
 } from "./devToolsHeaderCapture";
 import type { DevToolsService } from "./devToolsService";
+import { readInputTransformations } from "@/node/utils/messages/anthropicInputTransformations";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -145,6 +147,7 @@ function createEmptyStep(
     responseHeaders: null,
     rawResponse: null,
     rawChunks: null,
+    inputTransformations: null,
   };
 }
 
@@ -239,6 +242,20 @@ export function extractUsage(
   }
 
   return normalizedUsage;
+}
+
+/**
+ * A step's finalization update, with the cache wrapper's facts for its last fetch (route,
+ * markers, observation time) for the replay audit. Consumes them: they are absent when no
+ * Anthropic cache wrapper saw the step.
+ */
+function finalizationUpdate(
+  stepId: string,
+  durationMs: number,
+  update: Partial<DevToolsStep>
+): Partial<DevToolsStep> {
+  const promptCacheWire = consumePromptCacheWire(stepId);
+  return { durationMs, ...update, ...(promptCacheWire != null ? { promptCacheWire } : {}) };
 }
 
 export function createDevToolsMiddleware(
@@ -378,10 +395,11 @@ export function createDevToolsMiddleware(
         }
 
         try {
-          await service.updateStep(workspaceId, stepId, {
-            durationMs: Date.now() - startedAtMs,
-            ...update,
-          });
+          await service.updateStep(
+            workspaceId,
+            stepId,
+            finalizationUpdate(stepId, Date.now() - startedAtMs, update)
+          );
         } catch (error) {
           // DevTools persistence is best-effort; never let observability failures
           // reject the model call that already succeeded.
@@ -405,6 +423,7 @@ export function createDevToolsMiddleware(
           responseHeaders: null,
           rawResponse: null,
           rawChunks: null,
+          inputTransformations: null,
         });
       };
 
@@ -435,6 +454,7 @@ export function createDevToolsMiddleware(
               : null,
           rawResponse: result.response?.body ?? null,
           rawChunks: null,
+          inputTransformations: readInputTransformations([result.response?.body]),
           error: null,
         });
 
@@ -451,6 +471,7 @@ export function createDevToolsMiddleware(
           responseHeaders: null,
           rawResponse: null,
           rawChunks: null,
+          inputTransformations: null,
         });
         throw error;
       }
@@ -521,6 +542,7 @@ export function createDevToolsMiddleware(
           | "responseHeaders"
           | "rawResponse"
           | "rawChunks"
+          | "inputTransformations"
         >
       ): Promise<void> => {
         if (finalized) {
@@ -533,10 +555,11 @@ export function createDevToolsMiddleware(
         }
 
         try {
-          await service.updateStep(workspaceId, stepId, {
-            durationMs: Date.now() - startedAtMs,
-            ...update,
-          });
+          await service.updateStep(
+            workspaceId,
+            stepId,
+            finalizationUpdate(stepId, Date.now() - startedAtMs, update)
+          );
         } catch (error) {
           // DevTools persistence is best-effort; never let observability failures
           // reject the model call that already succeeded.
@@ -566,6 +589,7 @@ export function createDevToolsMiddleware(
           responseHeaders,
           rawResponse: fullStreamChunks,
           rawChunks,
+          inputTransformations: readInputTransformations(rawChunks),
         });
       };
 
@@ -596,6 +620,7 @@ export function createDevToolsMiddleware(
           responseHeaders: null,
           rawResponse: null,
           rawChunks: null,
+          inputTransformations: null,
         });
         throw error;
       }
@@ -690,6 +715,7 @@ export function createDevToolsMiddleware(
                   responseHeaders,
                   rawResponse: fullStreamChunks,
                   rawChunks,
+                  inputTransformations: readInputTransformations(rawChunks),
                 });
                 controller.close();
                 return;
@@ -714,6 +740,7 @@ export function createDevToolsMiddleware(
               responseHeaders,
               rawResponse: fullStreamChunks,
               rawChunks,
+              inputTransformations: readInputTransformations(rawChunks),
             });
             controller.error(error);
           }
@@ -732,6 +759,7 @@ export function createDevToolsMiddleware(
               responseHeaders,
               rawResponse: fullStreamChunks,
               rawChunks,
+              inputTransformations: readInputTransformations(rawChunks),
             });
           }
         },

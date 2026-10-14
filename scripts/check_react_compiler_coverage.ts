@@ -42,6 +42,10 @@ const HOT_COMPONENTS: Record<string, readonly string[]> = {
   "src/browser/features/Messages/ReasoningMessage.tsx": ["ReasoningMessage"],
   "src/browser/features/Messages/MarkdownCore.tsx": ["MarkdownCore"],
   "src/browser/features/Messages/ChatBarrier/RetryBarrier.tsx": ["RetryBarrierContent"],
+  // Shared with the VS Code webview dock, which is not compiled itself (#5109).
+  "src/browser/components/SubAgentTasksDecoration/SubAgentTasksDecoration.tsx": [
+    "SubAgentTasksContent",
+  ],
   "src/browser/components/ProjectSidebar/ProjectSidebar.tsx": ["ProjectSidebarInner"],
   "src/browser/components/AgentListItem/AgentListItem.tsx": ["AgentListItemInner"],
   "src/browser/components/AppLoader/AppLoader.tsx": [

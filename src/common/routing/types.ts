@@ -18,3 +18,14 @@ export interface AvailableRoute {
   displayName: string;
   isConfigured: boolean;
 }
+
+/**
+ * Gateway model ID for a routed (non-explicit) canonical model, or null when
+ * the gateway cannot serve that origin. Lets config-dependent gateways (Coder's
+ * canonicalRoutes) replace the static PROVIDER_DEFINITIONS route table.
+ */
+export type GatewayModelIdResolver = (
+  gateway: string,
+  origin: string,
+  originModelId: string
+) => string | null;

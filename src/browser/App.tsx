@@ -1,6 +1,6 @@
-import { useEffect, useCallback, useRef, useState } from "react";
+import React, { useEffect, useCallback, useRef, useState } from "react";
 import { useRouter } from "./contexts/RouterContext";
-import { useLocation, useNavigate } from "react-router-dom";
+import { useLocation } from "react-router-dom";
 import "./styles/globals.css";
 import { useWorkspaceContext, toWorkspaceSelection } from "./contexts/WorkspaceContext";
 import { useProjectContext } from "./contexts/ProjectContext";
@@ -8,20 +8,26 @@ import type { WorkspaceSelection } from "./components/ProjectSidebar/ProjectSide
 import { LeftSidebar } from "./components/LeftSidebar/LeftSidebar";
 import { ProjectCreateModal } from "./components/ProjectCreateModal/ProjectCreateModal";
 import { MultiProjectWorkspaceCreateModal } from "./components/MultiProjectWorkspaceCreateModal/MultiProjectWorkspaceCreateModal";
-import { AIView } from "./components/AIView/AIView";
+import type * as AIViewModule from "./components/AIView/AIView";
 import { ErrorBoundary } from "./components/ErrorBoundary/ErrorBoundary";
 import {
+  readPersistedState,
   usePersistedState,
   updatePersistedState,
-  readPersistedState,
 } from "./hooks/usePersistedState";
 import { useResizableSidebar } from "./hooks/useResizableSidebar";
+import { useComputerUse } from "./hooks/useComputerUse";
 import { isDialogOpen, matchesKeybind, KEYBINDS } from "./utils/ui/keybinds";
 import { openServerWindow } from "./utils/openServerWindow";
 import {
   applyFastModeToggle,
   getFastModeProvider,
+  getFastModeUnavailableReason,
   isFastModeActive,
+  setWorkspaceServiceTier,
+  toggleServiceTier,
+  type PremiumServiceTier,
+  ultrafastModeAvailable,
 } from "./utils/fastModeServiceTier";
 import { handleLayoutSlotHotkeys } from "./utils/ui/layoutSlotHotkeys";
 import { buildSortedWorkspacesByProject } from "./utils/ui/workspaceFiltering";
@@ -32,6 +38,7 @@ import {
 import { getVisibleWorkspaceIds } from "./utils/ui/workspaceDomNav";
 import { useUnreadTracking } from "./hooks/useUnreadTracking";
 import { useWorkspaceStoreRaw, useWorkspaceRecency } from "./stores/WorkspaceStore";
+import { getAppConfigStore, getUserPreferences } from "./stores/AppConfigStore";
 import {
   getResponseCompleteNotificationBody,
   shouldNotifyOnResponseComplete,
@@ -41,6 +48,7 @@ import { showBrowserNotification } from "./utils/ui/showBrowserNotification";
 
 import { useStableReference, compareMaps } from "./hooks/useStableReference";
 import { CommandRegistryProvider, useCommandRegistry } from "./contexts/CommandRegistryContext";
+import { CommandIds } from "./utils/commandIds";
 import { useOpenTerminal } from "./hooks/useOpenTerminal";
 import { useMinThinkingLevels } from "./hooks/useMinThinkingLevels";
 import type { CommandAction } from "./contexts/CommandRegistryContext";
@@ -53,6 +61,10 @@ import {
 } from "@/constants/layout";
 import { XUM_PRODUCT_SLUG } from "@/common/constants/product";
 import { buildCoreSources, type BuildSourcesParams } from "./utils/commands/sources";
+import {
+  useLoadMcpAppEntrypoints,
+  useMcpAppEntrypoints,
+} from "./features/RightSidebar/AppViewTab/mcpAppEntrypoints";
 
 import {
   getTopLevelProjectEntries,
@@ -60,68 +72,59 @@ import {
 } from "@/common/utils/subProjects";
 import {
   THINKING_LEVELS,
-  coerceOpenAIReasoningMode,
   type OpenAIReasoningMode,
   type ThinkingLevel,
 } from "@/common/types/thinking";
-import { CUSTOM_EVENTS } from "@/common/constants/events";
+import { createCustomEvent, CUSTOM_EVENTS } from "@/common/constants/events";
 import { isWorkspaceForkSwitchEvent } from "./utils/workspaceEvents";
 import {
-  getAgentIdKey,
   getAgentsInitNudgeKey,
-  getModelKey,
-  getNotifyOnResponseKey,
   getProjectScopeId,
-  getThinkingLevelByModelKey,
-  getReasoningModeKey,
-  getThinkingLevelKey,
-  getWorkspaceAISettingsByAgentKey,
   getWorkspaceLastReadKey,
   EXPANDED_PROJECTS_KEY,
+  LAST_VISITED_ROUTE_KEY,
   LEFT_SIDEBAR_COLLAPSED_KEY,
   LEFT_SIDEBAR_WIDTH_KEY,
-  SIDEBAR_FLAT_MODE_KEY,
 } from "@/common/constants/storage";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
-import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import type { BranchListResult } from "@/common/orpc/types";
 import type { UpdateChannel } from "@/common/types/project";
 import { useTelemetry } from "./hooks/useTelemetry";
 import { getRuntimeTypeForTelemetry } from "@/common/telemetry";
 import { useStartWorkspaceCreation } from "./hooks/useStartWorkspaceCreation";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { requestActiveTurnThinkingLevel } from "@/browser/utils/activeTurnThinking";
-import { resolveEffectiveComposerModel } from "@/browser/utils/workspaceAiSettingsSync";
+import { getAutoRouting, getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { AuthTokenModal } from "@/browser/components/AuthTokenModal/AuthTokenModal";
 
-import { ScratchPage } from "@/browser/components/ScratchPage/ScratchPage";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import { isLocalProjectRuntime, isWorktreeRuntime } from "@/common/types/runtime";
 import type { WorkspaceCreatedOptions } from "@/browser/features/ChatInput/types";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
-import { ProjectPage } from "@/browser/components/ProjectPage/ProjectPage";
 
 import { SettingsProvider, useSettings } from "./contexts/SettingsContext";
 import { AboutDialogProvider, useAboutDialog } from "./contexts/AboutDialogContext";
 import { ConfirmDialogProvider, useConfirmDialog } from "./contexts/ConfirmDialogContext";
 import { confirmAndRemoveSubagent } from "@/browser/utils/subagentRemoval";
 import { AboutDialog } from "./features/About/AboutDialog";
-import { SettingsPage } from "@/browser/features/Settings/SettingsPage";
-import { AnalyticsDashboard } from "@/browser/features/Analytics/AnalyticsDashboard";
+import { LazySettingsPage } from "@/browser/features/Settings/LazySettingsPage";
+import { LazyAnalyticsDashboard } from "@/browser/features/Analytics/LazyAnalyticsDashboard";
 import { MuxGatewaySessionExpiredDialog } from "./components/MuxGatewaySessionExpiredDialog/MuxGatewaySessionExpiredDialog";
 import { SshPromptDialog } from "./components/SshPromptDialog/SshPromptDialog";
+import { TerminalDialog } from "./components/TerminalView/TerminalDialog";
 import { SplashScreenProvider } from "./features/SplashScreens/SplashScreenProvider";
 import { TutorialProvider } from "./contexts/TutorialContext";
 import { PowerModeProvider } from "./contexts/PowerModeContext";
 import { TooltipProvider } from "./components/Tooltip/Tooltip";
 import { UILayoutsProvider, useUILayouts } from "@/browser/contexts/UILayoutsContext";
-import { ExperimentsProvider } from "./contexts/ExperimentsContext";
+import { PerfFlightRecorder } from "./components/PerfFlightRecorder/PerfFlightRecorder";
 import { ProviderOptionsProvider } from "./contexts/ProviderOptionsContext";
 import { getWorkspaceSidebarKey } from "./utils/workspace";
 import { WindowsToolchainBanner } from "./components/WindowsToolchainBanner/WindowsToolchainBanner";
 import { RosettaBanner } from "./components/RosettaBanner/RosettaBanner";
 
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
-import { getAutoRoutingKey, setAutoRoutingChoice } from "@/browser/utils/modelChange";
+import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useRouting } from "@/browser/hooks/useRouting";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -129,21 +132,103 @@ import { getErrorMessage } from "@/common/utils/errors";
 import assert from "@/common/utils/assert";
 import { createProjectRefs } from "@/common/utils/multiProject";
 import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
-import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
-import { prependInitialAppProxyBasePath } from "@/browser/utils/frontendBasePath";
+import {
+  prependInitialAppProxyBasePath,
+  stripInitialAppProxyBasePathFromPathname,
+} from "@/browser/utils/frontendBasePath";
+import { LazyFeature } from "@/browser/components/LazyFeature/LazyFeature";
 import { WorkspaceActiveGoalsWarningToast } from "@/browser/components/ActiveGoalsWarningToast/ActiveGoalsWarningToast";
 import { LoadingScreen } from "@/browser/components/LoadingScreen/LoadingScreen";
 import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
+import { markAppShellReady } from "@/browser/utils/perf/appShellReady";
+import { Err, Ok } from "@/common/types/result";
+
+// T3 #5971 (route split): each page is its own chunk. The workspace page's ErrorBoundary sits inside
+// its chunk, so a failed chunk load reaches PageArea's LazyFeature (Reload, which can recover).
+let aiViewChunk: Promise<typeof AIViewModule> | undefined;
+export const loadAIView = () => (aiViewChunk ??= import("./components/AIView/AIView"));
+const AIView = React.lazy(async () => {
+  const { AIView: View } = await loadAIView();
+  return {
+    default: (props: React.ComponentProps<typeof View> & { errorScope: string }) => (
+      <ErrorBoundary workspaceInfo={props.errorScope}>
+        <View {...props} />
+      </ErrorBoundary>
+    ),
+  };
+});
+const ProjectPage = React.lazy(async () => ({
+  default: (await import("@/browser/components/ProjectPage/ProjectPage")).ProjectPage,
+}));
+const ScratchPage = React.lazy(async () => ({
+  default: (await import("@/browser/components/ScratchPage/ScratchPage")).ScratchPage,
+}));
+// AppLoader renders App only after the workspace metadata loads, so on a workspace route start the
+// page chunk now, while the entry still boots. A dynamic import: `/` (first run) loads nothing more.
+const startupRoute =
+  window.location.protocol === "file:"
+    ? readPersistedState<string | null>(LAST_VISITED_ROUTE_KEY, null)
+    : stripInitialAppProxyBasePathFromPathname(window.location.pathname);
+// `typeof`: a corrupted or legacy persisted route can parse to a non-string (RouterContext checks it
+// the same way), and this runs during module evaluation, where a throw would stop the app.
+if (typeof startupRoute === "string" && startupRoute.startsWith("/workspace/")) {
+  loadAIView().catch(() => undefined); // React.lazy reports it
+}
+
+/**
+ * The app shell's ref: marks the shell ready, then (#6255) on desktop starts the workspace page chunk
+ * once the renderer is idle. Desktop often starts off a workspace route, and its first workspace
+ * click then waited for the chunk (+50-100 ms in the nightly workspace-open scenarios). Not in the
+ * browser: there it would add page-code evaluation to the first-run page's Lighthouse window. A
+ * module function, so React calls it only on attach and detach (see markAppShellReady).
+ */
+export function appShellRef(element: HTMLElement | null): void {
+  markAppShellReady(element);
+  if (element == null || window.location.protocol !== "file:") return;
+  if (typeof requestIdleCallback !== "function") return;
+  requestIdleCallback(
+    () => {
+      loadAIView().catch(() => undefined); // React.lazy reports it
+    },
+    { timeout: 2_000 } // load it even if the renderer stays busy
+  );
+}
+
+/**
+ * The page column. While a page chunk loads or after it fails, it holds the page's one `main`.
+ * `pageKey` names the kind of page: a new kind gets a fresh boundary, so a page that failed to load
+ * or render does not keep its failure state over the next page.
+ */
+function PageArea(props: { pageKey: string; children: React.ReactNode }) {
+  const frame = (state: React.ReactNode) => (
+    <main className="mobile-layout flex min-w-0 flex-1 items-center justify-center overflow-hidden">
+      {state}
+    </main>
+  );
+  return (
+    <div className="mobile-layout flex flex-1 overflow-hidden">
+      <LazyFeature
+        key={props.pageKey}
+        name="Page"
+        frame={frame}
+        fallback={<LoadingScreen statusText="Opening page..." />}
+      >
+        {props.children}
+      </LazyFeature>
+    </div>
+  );
+}
 
 function RootRouteShell(props: {
   leftSidebarCollapsed: boolean;
   onToggleLeftSidebarCollapsed: () => void;
 }) {
   return (
-    <div className="bg-surface-primary flex flex-1 flex-col overflow-hidden">
+    // The page has no chat pane here, so the shell is its one `main` landmark (#5969).
+    <main className="bg-surface-primary flex flex-1 flex-col overflow-hidden">
       {props.leftSidebarCollapsed ? (
         <div
           className={`bg-sidebar border-border-light flex shrink-0 items-center border-b px-4 py-2 ${isDesktopMode() ? "titlebar-drag" : ""}`}
@@ -159,9 +244,11 @@ function RootRouteShell(props: {
         </div>
       ) : null}
       <div className="flex flex-1 items-center justify-center px-6">
-        <p className="text-muted text-sm">Select or add a project to get started.</p>
+        {/* text-content-secondary, not text-muted: the light theme's muted token is 3.8:1 on this
+            surface, below WCAG AA for text-sm (#5948). */}
+        <p className="text-content-secondary text-sm">Select or add a project to get started.</p>
       </div>
-    </div>
+    </main>
   );
 }
 
@@ -183,8 +270,15 @@ function AppInner() {
     createWorkspaceDraft,
     beginWorkspaceCreation,
   } = useWorkspaceContext();
-  const { currentWorkspaceId, isAnalyticsOpen, navigateToAnalytics, navigateFromAnalytics } =
-    useRouter();
+  const {
+    currentWorkspaceId,
+    isAnalyticsOpen,
+    navigateToAnalytics,
+    navigateFromAnalytics,
+    navigateBack,
+    navigateForward,
+    usesBrowserHistory,
+  } = useRouter();
   const { themePreference, setTheme, toggleTheme } = useTheme();
   const { open: openSettings, isOpen: isSettingsOpen } = useSettings();
   const { open: openAboutDialog } = useAboutDialog();
@@ -198,10 +292,17 @@ function AppInner() {
   const { layoutPresets, applySlotToWorkspace, saveCurrentWorkspaceToSlot } = useUILayouts();
   const { getMinOverride: getMinThinkingOverride } = useMinThinkingLevels();
   const { api, status, error, authenticate, retry } = useAPI();
+  // Handlers and command sources see null offline, even while useAPI() keeps the last client.
+  const liveApi = useLiveAPI();
+  // Read after a confirmation dialog: the connection can drop while it is open.
+  const liveApiRef = useRef(liveApi);
+  useEffect(() => {
+    liveApiRef.current = liveApi;
+  }, [liveApi]);
   const [supportedUpdateChannels, setSupportedUpdateChannels] = useState<UpdateChannel[]>([]);
 
   useEffect(() => {
-    setSupportedUpdateChannels([]);
+    // No reset here: a reconnect (new client) keeps the listed channels until the reload answers.
     if (!api) return;
 
     let active = true;
@@ -239,8 +340,13 @@ function AppInner() {
 
   const [isMultiProjectWorkspaceModalOpen, setMultiProjectWorkspaceModalOpen] = useState(false);
   const multiProjectWorkspacesEnabled = useExperimentValue(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES);
-  const agentPluginsEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_PLUGINS);
+  const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  // MCP App entry points open as app tabs, so the Artifacts experiment gates them too.
+  useLoadMcpAppEntrypoints(selectedWorkspace?.workspaceId ?? null, artifactsEnabled);
+  const mcpAppEntrypoints = useMcpAppEntrypoints(selectedWorkspace?.workspaceId ?? "");
+  const sessionTapesEnabled = useExperimentValue(EXPERIMENT_IDS.SESSION_TAPES);
   const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
+  const perfFlightRecorderEnabled = useExperimentValue(EXPERIMENT_IDS.PERF_FLIGHT_RECORDER);
 
   // Left sidebar is drag-resizable (mirrors RightSidebar). Width is persisted globally;
   // collapse remains a separate toggle and the drag handle is hidden in mobile-touch overlay mode.
@@ -287,7 +393,6 @@ function AppInner() {
   const creationScopeId = creationScope ? getProjectScopeId(creationScope.projectPath) : null;
 
   // History navigation (back/forward)
-  const navigate = useNavigate();
   const location = useLocation();
   const locationRef = useRef(location);
   locationRef.current = location;
@@ -479,71 +584,34 @@ function AppInner() {
   // Register command sources with registry
   const {
     registerSource,
+    getActions: getCommandActions,
     isOpen: isCommandPaletteOpen,
     open: openCommandPalette,
     close: closeCommandPalette,
   } = useCommandRegistry();
 
   /**
-   * Get the selected model for a workspace, preserving explicit gateway prefixes.
+   * The workspace's effective AI selection, preserving explicit gateway prefixes. A sub-agent
+   * resolves for its own agent.
    */
-  const getModelForWorkspace = useCallback(
-    (workspaceId: string): string => {
-      const defaultModel = getDefaultModel();
-      const preferredModel = readPersistedState<string | null>(getModelKey(workspaceId), null);
+  const getAiSelectionForWorkspace = useCallback(
+    (workspaceId: string) => {
       const metadata = workspaceMetadata.get(workspaceId);
-      const persistedAgentId =
-        readPersistedState<string>(getAgentIdKey(workspaceId), WORKSPACE_DEFAULTS.agentId)
-          .trim()
-          .toLowerCase() || WORKSPACE_DEFAULTS.agentId;
-      const agentId =
-        metadata?.parentWorkspaceId != null && metadata.agentId
-          ? metadata.agentId
-          : persistedAgentId;
-      return resolveEffectiveComposerModel(preferredModel, metadata, agentId, defaultModel);
+      return getWorkspaceAiSelection(
+        workspaceId,
+        metadata?.parentWorkspaceId != null && metadata.agentId ? metadata.agentId : undefined
+      );
     },
     [workspaceMetadata]
   );
-
-  const getThinkingLevelForWorkspace = useCallback(
-    (workspaceId: string): ThinkingLevel => {
-      if (!workspaceId) {
-        return "off";
-      }
-
-      const scopedKey = getThinkingLevelKey(workspaceId);
-      const scoped = readPersistedState<ThinkingLevel | undefined>(scopedKey, undefined);
-      if (scoped !== undefined) {
-        return THINKING_LEVELS.includes(scoped) ? scoped : "off";
-      }
-
-      // Keep this render-time palette lookup pure. ThinkingProvider owns migration to the
-      // workspace-scoped key, while the palette can read legacy values as a fallback.
-      const model = getModelForWorkspace(workspaceId);
-      const legacy = readPersistedState<ThinkingLevel | undefined>(
-        getThinkingLevelByModelKey(model),
-        undefined
-      );
-      if (legacy !== undefined && THINKING_LEVELS.includes(legacy)) {
-        return legacy;
-      }
-
-      // Fallback: check canonical key for legacy entries stored before gateway-aware normalization.
-      const canonicalModel = normalizeToCanonical(model);
-      if (canonicalModel !== model) {
-        const canonicalLegacy = readPersistedState<ThinkingLevel | undefined>(
-          getThinkingLevelByModelKey(canonicalModel),
-          undefined
-        );
-        if (canonicalLegacy !== undefined && THINKING_LEVELS.includes(canonicalLegacy)) {
-          return canonicalLegacy;
-        }
-      }
-
-      return "off";
-    },
-    [getModelForWorkspace]
+  const getModelForWorkspace = useCallback(
+    (workspaceId: string): string => getAiSelectionForWorkspace(workspaceId).model,
+    [getAiSelectionForWorkspace]
   );
+  const getThinkingLevelForWorkspace = (workspaceId: string): ThinkingLevel =>
+    workspaceId ? getAiSelectionForWorkspace(workspaceId).thinkingLevel : "off";
+  const getReasoningModeForWorkspace = (workspaceId: string): OpenAIReasoningMode =>
+    workspaceId ? getAiSelectionForWorkspace(workspaceId).reasoningMode : "standard";
 
   // Pro mode is Responses-only; the palette command hides under chatCompletions
   // and on non-passthrough routes (mirroring the send path's header gating).
@@ -558,18 +626,7 @@ function AppInner() {
     [routing]
   );
 
-  const getReasoningModeForWorkspace = useCallback((workspaceId: string): OpenAIReasoningMode => {
-    if (!workspaceId) {
-      return "standard";
-    }
-    const stored = readPersistedState<OpenAIReasoningMode | null>(
-      getReasoningModeKey(workspaceId),
-      null
-    );
-    // Coerce untrusted persisted values so corrupt entries self-heal to "standard".
-    return coerceOpenAIReasoningMode(stored) ?? "standard";
-  }, []);
-
+  // Palette picks stay in memory until a user message sends them.
   const setThinkingLevelFromPalette = useCallback(
     (workspaceId: string, level: ThinkingLevel) => {
       if (!workspaceId) {
@@ -577,41 +634,9 @@ function AppInner() {
       }
 
       const normalized = THINKING_LEVELS.includes(level) ? level : "off";
-      const model = getModelForWorkspace(workspaceId);
-      const key = getThinkingLevelKey(workspaceId);
-      const reasoningMode = getReasoningModeForWorkspace(workspaceId);
-
-      // Use the utility function which handles localStorage and event dispatch
-      // ThinkingProvider will pick this up via its listener
-      updatePersistedState(key, normalized);
       markAiSelectionIntent(workspaceId, "thinkingLevel", normalized);
       // The palette bypasses ThinkingProvider.setThinkingLevel, so leave Auto here too.
       setAutoRoutingChoice(workspaceId, "thinkingLevel", false);
-
-      type WorkspaceAISettingsByAgentCache = Partial<
-        Record<
-          string,
-          { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
-        >
-      >;
-
-      const normalizedAgentId =
-        readPersistedState<string>(getAgentIdKey(workspaceId), WORKSPACE_DEFAULTS.agentId)
-          .trim()
-          .toLowerCase() || WORKSPACE_DEFAULTS.agentId;
-
-      updatePersistedState<WorkspaceAISettingsByAgentCache>(
-        getWorkspaceAISettingsByAgentKey(workspaceId),
-        (prev) => {
-          const record: WorkspaceAISettingsByAgentCache =
-            prev && typeof prev === "object" ? prev : {};
-          return {
-            ...record,
-            [normalizedAgentId]: { model, thinkingLevel: normalized, reasoningMode },
-          };
-        },
-        {}
-      );
 
       if (api) {
         // Mid-turn change: also apply to the active turn's next model step so
@@ -628,51 +653,20 @@ function AppInner() {
         );
       }
     },
-    [api, getModelForWorkspace, getReasoningModeForWorkspace]
+    [api]
   );
 
-  // Keep palette choices local until a user message sends the full settings.
-  const toggleReasoningModeFromPalette = useCallback(
-    (workspaceId: string) => {
-      if (!workspaceId) {
-        return;
-      }
-
-      const next: OpenAIReasoningMode =
-        getReasoningModeForWorkspace(workspaceId) === "pro" ? "standard" : "pro";
-      const model = getModelForWorkspace(workspaceId);
-      const thinkingLevel = getThinkingLevelForWorkspace(workspaceId);
-
-      updatePersistedState(getReasoningModeKey(workspaceId), next);
-      markAiSelectionIntent(workspaceId, "reasoningMode", next);
-
-      type WorkspaceAISettingsByAgentCache = Partial<
-        Record<
-          string,
-          { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
-        >
-      >;
-
-      const normalizedAgentId =
-        readPersistedState<string>(getAgentIdKey(workspaceId), WORKSPACE_DEFAULTS.agentId)
-          .trim()
-          .toLowerCase() || WORKSPACE_DEFAULTS.agentId;
-
-      updatePersistedState<WorkspaceAISettingsByAgentCache>(
-        getWorkspaceAISettingsByAgentKey(workspaceId),
-        (prev) => {
-          const record: WorkspaceAISettingsByAgentCache =
-            prev && typeof prev === "object" ? prev : {};
-          return {
-            ...record,
-            [normalizedAgentId]: { model, thinkingLevel, reasoningMode: next },
-          };
-        },
-        {}
-      );
-    },
-    [getModelForWorkspace, getReasoningModeForWorkspace, getThinkingLevelForWorkspace]
-  );
+  const toggleReasoningModeFromPalette = (
+    workspaceId: string,
+    mode: Exclude<OpenAIReasoningMode, "standard">
+  ) => {
+    if (!workspaceId) {
+      return;
+    }
+    const next: OpenAIReasoningMode =
+      getReasoningModeForWorkspace(workspaceId) === mode ? "standard" : mode;
+    markAiSelectionIntent(workspaceId, "reasoningMode", next);
+  };
 
   const getFastModeActive = useCallback(() => {
     const scopeId = selectedWorkspace?.workspaceId ?? creationScopeId;
@@ -683,50 +677,122 @@ function AppInner() {
       providersConfig,
       resolvedRouteProvider: getRouteForModel(normalizeToCanonical(model)),
     });
-    return provider != null && isFastModeActive(provider, providersConfig[provider]);
+    return provider === "openai"
+      ? (getWorkspaceAiSelection(scopeId).serviceTier ?? providersConfig.openai?.serviceTier) ===
+          "priority"
+      : provider != null && isFastModeActive(provider, providersConfig[provider]);
   }, [creationScopeId, getModelForWorkspace, getRouteForModel, providersConfig, selectedWorkspace]);
 
-  const fastModeToggleInFlightRef = useRef(false);
-  const toggleFastMode = useCallback(async () => {
+  // Plain function: React Compiler handles memoization.
+  const getUltrafastModeActive = () => {
     const scopeId = selectedWorkspace?.workspaceId ?? creationScopeId;
-    if (!api || !scopeId || providersConfig == null || fastModeToggleInFlightRef.current) return;
+    if (!scopeId || providersConfig == null) return false;
 
-    // Creation composers use the same project-scoped model preference as their selector,
-    // so the global shortcut remains available before the first workspace exists.
-    // Serialize requests so a quick double press cannot compute two writes from stale config.
-    fastModeToggleInFlightRef.current = true;
     const model = getModelForWorkspace(scopeId);
-    const provider = getFastModeProvider(model, {
-      providersConfig,
-      resolvedRouteProvider: getRouteForModel(normalizeToCanonical(model)),
-    });
-    if (provider == null) {
-      fastModeToggleInFlightRef.current = false;
-      return;
-    }
+    return (
+      ultrafastModeAvailable(model, {
+        providersConfig,
+        resolvedRouteProvider: getRouteForModel(normalizeToCanonical(model)),
+      }) &&
+      (getWorkspaceAiSelection(scopeId).serviceTier ?? providersConfig.openai?.serviceTier) ===
+        "ultrafast"
+    );
+  };
 
-    try {
-      const patch = await applyFastModeToggle(api.providers, provider, providersConfig[provider]);
-      if (patch) {
-        updateOptimistically(provider, patch);
-      } else {
-        await refreshProvidersConfig();
+  const fastModeToggleInFlightRef = useRef(false);
+  // Native host computer use belongs to the selected workspace. Offer it only where the backend
+  // accepts it: in the desktop app, for workspaces that run on this machine.
+  const computerUse = useComputerUse(selectedWorkspace?.workspaceId ?? null);
+  const selectedRuntimeConfig =
+    selectedWorkspace == null
+      ? undefined
+      : workspaceMetadata.get(selectedWorkspace.workspaceId)?.runtimeConfig;
+  const computerUseAvailable =
+    computerUse.status?.supported === true &&
+    (isWorktreeRuntime(selectedRuntimeConfig) || isLocalProjectRuntime(selectedRuntimeConfig));
+
+  // OpenAI speed is scoped to the chat; other providers retain their existing Fast preferences.
+  const togglePremiumServiceTier = useCallback(
+    async (targetServiceTier: PremiumServiceTier) => {
+      const scopeId = selectedWorkspace?.workspaceId ?? creationScopeId;
+      if (!liveApi || !scopeId || providersConfig == null || fastModeToggleInFlightRef.current)
+        return;
+
+      // Creation composers use the same project-scoped model preference as their selector,
+      // so the global shortcut remains available before the first workspace exists.
+      // Serialize requests so a quick double press cannot compute two writes from stale config.
+      fastModeToggleInFlightRef.current = true;
+      const model = getModelForWorkspace(scopeId);
+      const availabilityOptions = {
+        providersConfig,
+        resolvedRouteProvider: getRouteForModel(normalizeToCanonical(model)),
+      };
+      const provider = getFastModeProvider(model, availabilityOptions);
+      if (
+        targetServiceTier === "ultrafast" &&
+        !ultrafastModeAvailable(model, availabilityOptions)
+      ) {
+        fastModeToggleInFlightRef.current = false;
+        window.dispatchEvent(
+          createCustomEvent(CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST, {
+            type: "error",
+            title: "Ultrafast mode",
+            message: `Ultrafast mode is not available for ${model} on its current provider route and wire format.`,
+          })
+        );
+        return;
       }
-    } catch {
-      await refreshProvidersConfig();
-    } finally {
-      fastModeToggleInFlightRef.current = false;
-    }
-  }, [
-    api,
-    creationScopeId,
-    getModelForWorkspace,
-    getRouteForModel,
-    providersConfig,
-    refreshProvidersConfig,
-    selectedWorkspace,
-    updateOptimistically,
-  ]);
+      if (provider == null) {
+        fastModeToggleInFlightRef.current = false;
+        // The shortcut used to do nothing here, so it looked broken (#5693). Say why instead.
+        window.dispatchEvent(
+          createCustomEvent(CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST, {
+            type: "error",
+            title: "Fast mode",
+            message:
+              getFastModeUnavailableReason(model, providersConfig) === "model"
+                ? `Fast mode is not available for ${model}: this model has no fast mode.`
+                : `Fast mode is not available for ${model} on its current provider route, for example through a gateway or a custom base URL.`,
+          })
+        );
+        return;
+      }
+
+      try {
+        if (provider === "openai") {
+          const current =
+            getWorkspaceAiSelection(scopeId).serviceTier ?? providersConfig.openai?.serviceTier;
+          setWorkspaceServiceTier(liveApi, scopeId, toggleServiceTier(current, targetServiceTier));
+          return;
+        }
+        const patch = await applyFastModeToggle(
+          liveApi.providers,
+          provider,
+          providersConfig[provider],
+          targetServiceTier
+        );
+        if (patch) {
+          updateOptimistically(provider, patch);
+        } else {
+          await refreshProvidersConfig();
+        }
+      } catch {
+        await refreshProvidersConfig();
+      } finally {
+        fastModeToggleInFlightRef.current = false;
+      }
+    },
+    [
+      liveApi,
+      creationScopeId,
+      getModelForWorkspace,
+      getRouteForModel,
+      providersConfig,
+      refreshProvidersConfig,
+      selectedWorkspace,
+      updateOptimistically,
+    ]
+  );
 
   const registerParamsRef = useRef<BuildSourcesParams | null>(null);
 
@@ -762,14 +828,14 @@ function AppInner() {
         projectPaths.length >= 2,
         "createMultiProjectWorkspace requires at least two projects"
       );
-      if (!api) {
+      if (!liveApi) {
         throw new Error("Not connected to server");
       }
 
       const [primaryProjectPath] = projectPaths;
       assert(primaryProjectPath, "createMultiProjectWorkspace requires a primary project");
 
-      const branchResult = await api.projects.listBranches({ projectPath: primaryProjectPath });
+      const branchResult = await liveApi.projects.listBranches({ projectPath: primaryProjectPath });
       const candidateBranches = branchResult.branches.filter(
         (branch): branch is string => typeof branch === "string"
       );
@@ -790,7 +856,7 @@ function AppInner() {
       // Multi-project container names must stay unique and path-separator-free.
       const projects = createProjectRefs(projectPaths);
 
-      const metadata = await api.workspace.createMultiProject({
+      const metadata = await liveApi.workspace.createMultiProject({
         projects,
         branchName: `multi-${Date.now().toString(36)}`,
         trunkBranch,
@@ -815,7 +881,7 @@ function AppInner() {
       setSelectedWorkspace(toWorkspaceSelection(metadata));
       setMultiProjectWorkspaceModalOpen(false);
     },
-    [api, setSelectedWorkspace, setWorkspaceMetadata, telemetry, workspaceStore]
+    [liveApi, setSelectedWorkspace, setWorkspaceMetadata, telemetry, workspaceStore]
   );
 
   const archiveMergedWorkspacesInProjectFromPalette = useCallback(
@@ -823,7 +889,7 @@ function AppInner() {
       const trimmedProjectPath = projectPath.trim();
       if (!trimmedProjectPath) return;
 
-      if (!api) {
+      if (!liveApi) {
         if (typeof window !== "undefined") {
           window.alert("Cannot archive merged workspaces: API not connected");
         }
@@ -831,7 +897,7 @@ function AppInner() {
       }
 
       try {
-        const result = await api.workspace.archiveMergedInProject({
+        const result = await liveApi.workspace.archiveMergedInProject({
           projectPath: trimmedProjectPath,
         });
 
@@ -868,15 +934,15 @@ function AppInner() {
         }
       }
     },
-    [api]
+    [liveApi]
   );
 
   const getBranchesForProject = useCallback(
     async (projectPath: string): Promise<BranchListResult> => {
-      if (!api) {
+      if (!liveApi) {
         return { branches: [], recommendedTrunk: null };
       }
-      const branchResult = await api.projects.listBranches({ projectPath });
+      const branchResult = await liveApi.projects.listBranches({ projectPath });
       const sanitizedBranches = branchResult.branches.filter(
         (branch): branch is string => typeof branch === "string"
       );
@@ -891,7 +957,7 @@ function AppInner() {
         recommendedTrunk: recommended,
       };
     },
-    [api]
+    [liveApi]
   );
 
   const selectWorkspaceFromPalette = useCallback(
@@ -904,6 +970,9 @@ function AppInner() {
   // The palette has no anchor element, so refusals (e.g. the cross-backend structural-mutation
   // gate, #4865) use the anchorless popover error; otherwise they only reach the renderer log.
   const paletteRemoveError = usePopoverError();
+  // The removed sub-agent's row is gone, so an auto-dismissing popover would leave no way to
+  // reread what its removal left behind (#5143, #5190).
+  const paletteRemoveWarning = usePopoverError(null);
   const removeWorkspaceFromPalette = useCallback(
     async (workspaceId: string) => {
       const result = await removeWorkspace(workspaceId);
@@ -915,14 +984,16 @@ function AppInner() {
     [removeWorkspace, paletteRemoveError]
   );
   const removeSubagentFromPalette = async (workspaceId: string, title: string) => {
-    const error = await confirmAndRemoveSubagent({
-      api,
+    const notice = await confirmAndRemoveSubagent({
+      getApi: () => liveApiRef.current,
       confirm: confirmDialog,
       removeSubagent,
       workspaceId,
       title,
     });
-    if (error != null) paletteRemoveError.showError(workspaceId, error);
+    if (notice == null) return;
+    const popover = notice.kind === "error" ? paletteRemoveError : paletteRemoveWarning;
+    popover.showError(workspaceId, notice.message);
   };
 
   const updateTitleFromPalette = useCallback(
@@ -965,7 +1036,7 @@ function AppInner() {
         direction,
         sortedWorkspacesByProject,
         userProjects,
-        readPersistedState(SIDEBAR_FLAT_MODE_KEY, false)
+        getUserPreferences().ui?.sidebarFlatMode
           ? { multiProjectEnabled: multiProjectWorkspacesEnabled }
           : false
       );
@@ -992,12 +1063,19 @@ function AppInner() {
     getReasoningMode: getReasoningModeForWorkspace,
     onToggleReasoningMode: toggleReasoningModeFromPalette,
     getFastMode: getFastModeActive,
-    onToggleFastMode: toggleFastMode,
+    onToggleFastMode: () => togglePremiumServiceTier("priority"),
+    getUltrafastMode: getUltrafastModeActive,
+    onToggleUltrafastMode: () => togglePremiumServiceTier("ultrafast"),
+    // Read when the palette opens, from the shared cache (one fetch + one config subscription
+    // per session), so showing the state costs no IPC call (#5791).
+    getKeepScreenAwake: () => getAppConfigStore().getSnapshot()?.keepScreenAwake,
+    computerUse: computerUseAvailable
+      ? { enabled: computerUse.enabledHere, onToggle: computerUse.toggle }
+      : null,
     autoModelRoutingEnabled,
-    // The composer's useAutoRoutingSelection listens on the same keys, so a palette write lands
+    // The composer's useAutoRoutingSelection reads the same picks, so a palette write lands
     // in the picker rows the way a row click does.
-    getAutoRouting: (scopeId, dimension) =>
-      readPersistedState<boolean>(getAutoRoutingKey(scopeId, dimension), false) === true,
+    getAutoRouting: (scopeId, dimension) => getAutoRouting(scopeId, dimension),
     onSetAutoRouting: (scopeId, dimension, active) =>
       setAutoRoutingChoice(scopeId, dimension, active),
     getEffectiveComposerModel: getModelForWorkspace,
@@ -1009,7 +1087,10 @@ function AppInner() {
     onStartWorkspaceCreation: openNewWorkspaceFromPalette,
     onStartMultiProjectWorkspaceCreation: openNewMultiProjectWorkspaceFromPalette,
     multiProjectWorkspacesEnabled,
-    agentPluginsEnabled,
+    artifactsEnabled,
+    mcpAppEntrypoints,
+    perfFlightRecorderEnabled,
+    sessionTapesEnabled,
     onArchiveMergedWorkspacesInProject: archiveMergedWorkspacesInProjectFromPalette,
     getBranchesForProject,
     onSelectWorkspace: selectWorkspaceFromPalette,
@@ -1041,13 +1122,15 @@ function AppInner() {
     },
     onCaptureLayoutSlot: async (workspaceId, slot, name) => {
       try {
-        await saveCurrentWorkspaceToSlot(workspaceId, slot, name);
+        const result = await saveCurrentWorkspaceToSlot(workspaceId, slot, name);
+        // A refused capture (nothing saveable open) reaches the palette, which shows it.
+        return result.success ? Ok(undefined) : Err(result.error);
       } catch {
-        // Best-effort only.
+        return Err("Failed to save layout.");
       }
     },
     onClearTimingStats: (workspaceId: string) => workspaceStore.clearTimingStats(workspaceId),
-    api,
+    api: liveApi,
     confirmDialog,
   };
 
@@ -1116,7 +1199,17 @@ function AppInner() {
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_FAST_MODE)) {
         e.preventDefault();
         // Modals trap focus and hide the page behind them; don't change hidden page UI.
-        if (!isDialogOpen()) toggleFastMode().catch(() => undefined);
+        if (!isDialogOpen()) togglePremiumServiceTier("priority").catch(() => undefined);
+      } else if (matchesKeybind(e, KEYBINDS.TOGGLE_ULTRAFAST_MODE)) {
+        e.preventDefault();
+        // A held chord would re-toggle once each write settles, leaving the tier timing-dependent.
+        if (!isDialogOpen() && !e.repeat) {
+          togglePremiumServiceTier("ultrafast").catch(() => undefined);
+        }
+      } else if (matchesKeybind(e, KEYBINDS.TOGGLE_COMPUTER_USE) && computerUseAvailable) {
+        e.preventDefault();
+        // A held shortcut would race enable and disable requests and leave either state behind.
+        if (!e.repeat && !isDialogOpen()) computerUse.toggle().catch(() => undefined);
       } else if (matchesKeybind(e, KEYBINDS.TOGGLE_SIDEBAR)) {
         e.preventDefault();
         if (!isDialogOpen()) setSidebarCollapsed((prev) => !prev);
@@ -1140,12 +1233,37 @@ function AppInner() {
           closeCommandPalette();
           navigateToAnalytics();
         }
+      } else if (matchesKeybind(e, KEYBINDS.REPORT_SLOWNESS)) {
+        e.preventDefault();
+        // Runs the palette action, so the experiment gating lives in one place: while the
+        // experiment is off the action is absent and the shortcut does nothing.
+        // Holding the chord must not write one bundle per key auto-repeat.
+        if (!e.repeat && !isDialogOpen()) {
+          const action = getCommandActions().find(
+            (candidate) => candidate.id === CommandIds.perfReportSlowness()
+          );
+          // The action reports its own outcome in a toast and never throws.
+          if (action) Promise.resolve(action.run()).catch(() => undefined);
+        }
+      } else if (
+        matchesKeybind(e, KEYBINDS.SAVE_SESSION_TAPES) ||
+        matchesKeybind(e, KEYBINDS.REVEAL_SESSION_TAPES)
+      ) {
+        e.preventDefault();
+        if (e.repeat || isDialogOpen()) return;
+        // Run the registered palette action so the sessionTapes experiment gate lives in one
+        // place: with the experiment off there is no action and the shortcut does nothing.
+        const actionId = matchesKeybind(e, KEYBINDS.SAVE_SESSION_TAPES)
+          ? CommandIds.sessionTapesSave()
+          : CommandIds.sessionTapesReveal();
+        const action = getCommandActions().find((candidate) => candidate.id === actionId);
+        if (action) Promise.resolve(action.run()).catch(() => undefined);
       } else if (matchesKeybind(e, KEYBINDS.NAVIGATE_BACK)) {
         e.preventDefault();
-        void navigate(-1);
+        navigateBack();
       } else if (matchesKeybind(e, KEYBINDS.NAVIGATE_FORWARD)) {
         e.preventDefault();
-        void navigate(1);
+        navigateForward();
       }
     };
 
@@ -1158,13 +1276,17 @@ function AppInner() {
     isCommandPaletteOpen,
     closeCommandPalette,
     openCommandPalette,
-    toggleFastMode,
+    togglePremiumServiceTier,
+    computerUseAvailable,
+    computerUse,
     openSettings,
     isSettingsOpen,
     isAnalyticsOpen,
     navigateToAnalytics,
     navigateFromAnalytics,
-    navigate,
+    navigateBack,
+    navigateForward,
+    getCommandActions,
   ]);
   // The native menu's Open Server Window item forwards here, so it shares the shortcut's flow.
   useEffect(() => {
@@ -1177,20 +1299,24 @@ function AppInner() {
 
   // Mouse back/forward buttons (buttons 3 and 4)
   useEffect(() => {
+    // In a browser tab these buttons are the browser's own Back and Forward, which now move
+    // through app history. Handling them here too could step twice where the browser ignores
+    // preventDefault on mousedown.
+    if (usesBrowserHistory) return;
     const handleMouseNavigation = (e: MouseEvent) => {
       if (e.button === 3) {
         e.preventDefault();
-        void navigate(-1);
+        navigateBack();
       } else if (e.button === 4) {
         e.preventDefault();
-        void navigate(1);
+        navigateForward();
       }
     };
 
     // Capture phase fires before Chrome's default back/forward handling
     window.addEventListener("mousedown", handleMouseNavigation, true);
     return () => window.removeEventListener("mousedown", handleMouseNavigation, true);
-  }, [navigate]);
+  }, [usesBrowserHistory, navigateBack, navigateForward]);
 
   useEffect(() => {
     // Only needed in standalone PWA mode — normal browser tabs should have standard back/forward behavior
@@ -1354,9 +1480,17 @@ function AppInner() {
       if (isWorkspaceFocused) {
         return;
       }
+      // /side chats are short-lived questions answered next to (or in place of) their main chat,
+      // which already has the user's attention; they never notify (they inherit the main chat's
+      // notify setting through copied storage, and a click would open the side chat full-screen).
+      if (workspaceMetadataRef.current.get(event.workspaceId)?.sideChatParentWorkspaceId != null) {
+        return;
+      }
 
       // Check if notifications are enabled for this workspace.
-      const notifyEnabled = readPersistedState(getNotifyOnResponseKey(event.workspaceId), false);
+      const notifyEnabled =
+        getUserPreferences().notifications?.notifyOnResponseByWorkspace?.[event.workspaceId] ===
+        true;
       if (!notifyEnabled) {
         return;
       }
@@ -1399,10 +1533,10 @@ function AppInner() {
 
   return (
     <>
-      {/* mobile-bottom-inset-host: narrow layouts give this box's bottom inset up to a column that
-          reserves its own clearance, keyed off the column rather than the route so surfaces without
-          one still get it here. The sidebar is position: fixed with its own inset at these widths. */}
-      <div className="bg-surface-primary mobile-layout mobile-bottom-inset-host flex h-full overflow-hidden pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pb-[min(env(safe-area-inset-bottom,0px),40px)] pl-[env(safe-area-inset-left)]">
+      <div
+        className="bg-surface-primary mobile-layout flex h-full overflow-hidden pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]"
+        ref={appShellRef}
+      >
         <LeftSidebar
           collapsed={sidebarCollapsed}
           onToggleCollapsed={handleToggleSidebar}
@@ -1415,7 +1549,17 @@ function AppInner() {
         <div className="mobile-main-content flex min-w-0 flex-1 flex-col overflow-hidden">
           <WindowsToolchainBanner />
           <RosettaBanner />
-          <div className="mobile-layout flex flex-1 overflow-hidden">
+          <PageArea
+            pageKey={
+              selectedWorkspace || currentWorkspaceId
+                ? "workspace"
+                : creationProjectPath === SCRATCH_PROJECT_CONFIG_KEY
+                  ? "scratch"
+                  : creationProjectPath
+                    ? "project"
+                    : "root"
+            }
+          >
             {/* Settings and analytics are modals over whatever page they were opened from, so the
                 page stays mounted underneath them. */}
             {selectedWorkspace ? (
@@ -1438,22 +1582,19 @@ function AppInner() {
                 const workspacePath =
                   currentMetadata.namedWorkspacePath ?? selectedWorkspace.namedWorkspacePath ?? "";
                 return (
-                  <ErrorBoundary
-                    workspaceInfo={`${selectedWorkspace.projectName}/${workspaceName}`}
-                  >
-                    <AIView
-                      workspaceId={selectedWorkspace.workspaceId}
-                      projectPath={selectedWorkspace.projectPath}
-                      projectName={selectedWorkspace.projectName}
-                      leftSidebarCollapsed={sidebarCollapsed}
-                      onToggleLeftSidebarCollapsed={handleToggleSidebar}
-                      workspaceName={workspaceName}
-                      namedWorkspacePath={workspacePath}
-                      runtimeConfig={currentMetadata.runtimeConfig}
-                      incompatibleRuntime={currentMetadata.incompatibleRuntime}
-                      isInitializing={currentMetadata.isInitializing === true}
-                    />
-                  </ErrorBoundary>
+                  <AIView
+                    errorScope={`${selectedWorkspace.projectName}/${workspaceName}`}
+                    workspaceId={selectedWorkspace.workspaceId}
+                    projectPath={selectedWorkspace.projectPath}
+                    projectName={selectedWorkspace.projectName}
+                    leftSidebarCollapsed={sidebarCollapsed}
+                    onToggleLeftSidebarCollapsed={handleToggleSidebar}
+                    workspaceName={workspaceName}
+                    namedWorkspacePath={workspacePath}
+                    runtimeConfig={currentMetadata.runtimeConfig}
+                    incompatibleRuntime={currentMetadata.incompatibleRuntime}
+                    isInitializing={currentMetadata.isInitializing === true}
+                  />
                 );
               })()
             ) : currentWorkspaceId ? (
@@ -1461,7 +1602,14 @@ function AppInner() {
                 // Keep a lightweight loading shell while WorkspaceContext validates or
                 // self-heals stale `/workspace/:id` routes. Restoring a path alone is not
                 // enough; we only render AIView once metadata hydration confirms it exists.
-                <LoadingScreen statusText="Opening workspace..." />
+                // `main`: this screen replaces the workspace page, so it carries the page's one
+                // `main` landmark (Lighthouse landmark-one-main, #5998). LoadingScreen itself stays
+                // landmark-free, because the boot path in AppLoader shares it. The same direction
+                // rule as the parent (`mobile-layout`: a row on desktop, a column on phones), so
+                // the 100vw/100dvh loader shrinks to the same space it had without the wrapper.
+                <main className="mobile-layout flex min-w-0 flex-1 overflow-hidden">
+                  <LoadingScreen statusText="Opening workspace..." />
+                </main>
               ) : (
                 // If metadata never hydrated for the routed workspace, avoid trapping the user
                 // on a permanent spinner. Show the same non-blocking root shell while the route
@@ -1501,17 +1649,24 @@ function AppInner() {
                 onToggleLeftSidebarCollapsed={handleToggleSidebar}
               />
             )}
-          </div>
+          </PageArea>
         </div>
         <WorkspaceActiveGoalsWarningToast />
         <CommandPalette getSlashContext={() => ({ workspaceId: selectedWorkspace?.workspaceId })} />
         {/* Before SettingsPage so settings opened from analytics stacks above it. */}
-        <AnalyticsDashboard />
-        <SettingsPage />
+        <LazyAnalyticsDashboard />
+        <LazySettingsPage />
         <PopoverError
           error={paletteRemoveError.error}
           prefix="Failed to remove workspace"
           onDismiss={paletteRemoveError.clearError}
+        />
+        {/* Same anchor as the error popover: the warning stays hidden while an error shows and
+            returns when it closes, so they never overlap and the warning is not lost (#5190). */}
+        <PopoverError
+          error={paletteRemoveError.error ? null : paletteRemoveWarning.error}
+          prefix="Sub-agent removed, but something was left behind"
+          onDismiss={paletteRemoveWarning.clearError}
         />
         <ProjectCreateModal
           initialPath={projectCreateInitialPath}
@@ -1544,6 +1699,7 @@ function AppInner() {
         <AboutDialog />
         <MuxGatewaySessionExpiredDialog />
         <SshPromptDialog />
+        <TerminalDialog />
       </div>
     </>
   );
@@ -1551,7 +1707,8 @@ function AppInner() {
 
 function App() {
   return (
-    <ExperimentsProvider>
+    <>
+      <PerfFlightRecorder />
       <UILayoutsProvider>
         <TooltipProvider delayDuration={200}>
           <SettingsProvider>
@@ -1573,7 +1730,7 @@ function App() {
           </SettingsProvider>
         </TooltipProvider>
       </UILayoutsProvider>
-    </ExperimentsProvider>
+    </>
   );
 }
 

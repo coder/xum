@@ -23,7 +23,7 @@ import { MCP_STARTUP_TIMEOUT_MS } from "@/constants/mcp";
 // The manager's per-server startup deadline (a real timer), shared so the harness cannot drift.
 export { MCP_STARTUP_TIMEOUT_MS };
 
-// bun-types (^1.2.23) lags the pinned runtime (bun@1.3.12), which implements this.
+// bun-types (^1.2.23) lags the pinned runtime (bun@1.4.3), which implements this.
 const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
 
 type MCPClientHandle = Awaited<ReturnType<typeof mcpSdk.createMCPClient>>;
@@ -47,6 +47,26 @@ export interface FakeServerBehavior {
   connect?: () => Promise<void>;
   /** Never finish connecting, so only the manager's startup deadline ends the attempt. */
   hang?: boolean;
+  /** MCP Apps client methods, used when the manager connects with MCP Apps enabled. */
+  apps?: Partial<
+    Pick<
+      MCPClientHandle,
+      "toolUi" | "hasTool" | "callToolForApp" | "readResource" | "appEntrypoints"
+    >
+  >;
+  /** Raw tools/call for plugin hooks (MCPServerManager.callToolForPluginHook). */
+  callToolForHook?: MCPClientHandle["callToolForHook"];
+  /** OpenAI structured settings client methods. */
+  settings?: Partial<
+    Pick<
+      MCPClientHandle,
+      | "settingsCapability"
+      | "callSettingsTool"
+      | "settingsToolAction"
+      | "callSettingsActionTool"
+      | "relistTools"
+    >
+  >;
 }
 
 type BehaviorSource =
@@ -266,6 +286,13 @@ export class FakeMcpServers {
       priorDiscovery: () =>
         modern ? { kind: "modern" as const, discover: {} } : { kind: "legacy" as const },
       close: behavior.close ?? (() => Promise.resolve()),
+      callToolForHook:
+        behavior.callToolForHook ?? (() => Promise.reject(new Error("no hook tool in this fake"))),
+      ...behavior.apps,
+      settingsCapability: () => undefined,
+      settingsToolAction: () => undefined,
+      relistTools: () => Promise.resolve(),
+      ...behavior.settings,
     };
     // Tests supply loosely typed prompt/result fixtures; the manager validates them itself.
     return handle as unknown as MCPClientHandle;

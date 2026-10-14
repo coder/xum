@@ -234,7 +234,7 @@ function matchResetLiteral(text: string, start: number, literal: string): number
  * a caller visiting only these positions misses no match, while the regex engine skips the plain
  * text in between natively.
  */
-function resetCandidatePattern(literals: readonly string[]): RegExp {
+function resetCandidatePattern(literals: readonly string[]) {
   const byte = (c: number) => `\\x${c.toString(16).padStart(2, "0")}`;
   let notPlain = byte(0x5c);
   for (let c = 0; c < 256; c++)
@@ -247,13 +247,23 @@ function resetCandidatePattern(literals: readonly string[]): RegExp {
       literal.length === 1 ? first : `${first}[${byte(literal.charCodeAt(1))}${notPlain}]`
     );
   }
-  return new RegExp([...alternatives].join("|"), "g");
+  return {
+    pattern: new RegExp([...alternatives].join("|"), "g"),
+    /**
+     * The bytes a match can start with (latin1 decoding keeps each byte's char code), the common
+     * literal starts first so text segments stop the search early.
+     */
+    anchors: [...new Set([...literals.map((literal) => literal.charCodeAt(0)), 0x5c])],
+  };
 }
 const RAW_PROBE_CANDIDATES = resetCandidatePattern([
   SESSION_HISTORY_RESET_NEEDLE,
   SESSION_HISTORY_COMPACTION_BOUNDARY_NEEDLE,
 ]);
 const TOKEN_PROBE_CANDIDATES = resetCandidatePattern(RESET_PROBE_TOKENS);
+/** Byte search (memchr) is far cheaper than the candidate regex over anchor-free payload. */
+const hasCandidateAnchor = (segment: Buffer, anchors: readonly number[]) =>
+  anchors.some((anchor) => segment.includes(anchor));
 
 /**
  * `text` from `start` with every separator run shortened to a form the matcher reads alike, until
@@ -342,10 +352,13 @@ function createReverseRawHistoryProbe() {
       if (reset) return;
       const raw = bytes.toString("latin1");
       const text = raw + head;
-      // Anchors in `head` were tried when their segment arrived, with all text to their right.
-      const candidates = RAW_PROBE_CANDIDATES;
+      // Anchors in `head` were tried when their segment arrived, with all text to their right, so
+      // a segment without anchors starts no match; its text still joins `head`, where a needle
+      // starting further left can end.
+      const starts = hasCandidateAnchor(bytes, RAW_PROBE_CANDIDATES.anchors) ? text : "";
+      const candidates = RAW_PROBE_CANDIDATES.pattern;
       candidates.lastIndex = 0;
-      for (let found = candidates.exec(text); found !== null; found = candidates.exec(text)) {
+      for (let found = candidates.exec(starts); found !== null; found = candidates.exec(starts)) {
         const i = found.index;
         if (i >= raw.length) break;
         candidates.lastIndex = i + 1;
@@ -423,9 +436,9 @@ function addHistoryResetProbe(state: HistoryResetProbe, segment: Buffer, reverse
   // (F2): rows join without their LF, so a CR or space before it, or a separator anywhere inside a
   // token, must not hide the token. Tokens are matched at every `"`, `:` and backslash, so they may
   // overlap. Retained overlap is canonical (canonicalizeSeparators): long separator runs never
-  // push a token half out of it. #5212 plans to skip matching for segments with no byte a token
-  // can start with; anchors are exactly those bytes, but a segment without them can still finish a
-  // token that starts in the retained overlap (forward) or supply its tail (reverse).
+  // push a token half out of it. Every candidate starts with an anchor byte, so a segment without
+  // one starts no token: reverse skips matching (the segment can still supply a later token's
+  // tail via the overlap), forward matches only starts in the overlap, which can end in `raw`.
   const raw = segment.toString("latin1");
   const window = reverse ? raw + state.resetProbe : state.resetProbe + raw;
   // Tokens starting at or after `edge` (reverse) or ending at or before it (forward) lie in the
@@ -433,9 +446,12 @@ function addHistoryResetProbe(state: HistoryResetProbe, segment: Buffer, reverse
   // token ordering.
   const edge = reverse ? raw.length : state.resetProbe.length;
   const tokens: string[] = [];
-  const candidates = TOKEN_PROBE_CANDIDATES;
+  const anchored = hasCandidateAnchor(segment, TOKEN_PROBE_CANDIDATES.anchors);
+  // Forward keeps raw's first character, which a two-character candidate at edge - 1 reads.
+  const starts = anchored ? window : reverse ? "" : window.slice(0, edge + 1);
+  const candidates = TOKEN_PROBE_CANDIDATES.pattern;
   candidates.lastIndex = 0;
-  for (let found = candidates.exec(window); found !== null; found = candidates.exec(window)) {
+  for (let found = candidates.exec(starts); found !== null; found = candidates.exec(starts)) {
     const i = found.index;
     if (reverse && i >= edge) break;
     candidates.lastIndex = i + 1;
@@ -981,6 +997,7 @@ async function readHistoryProjectionFromLatestBoundary<Row>(
     } else {
       const archive = await locate("archive", skip - chat.boundaryCount);
       if (archive.kind === "start" || (clampToOldest && archive.oldestBoundary !== null)) {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const location = archive.kind === "start" ? archive : archive.oldestBoundary!;
         boundary = location.boundary;
         boundaryPublicationId = location.boundaryPublicationId;
@@ -1501,7 +1518,8 @@ export async function scanHistoryFilesBounded(
       assert(length >= 0 && result.bytesRead + length <= maxBytes);
       const buffer = Buffer.alloc(length);
       const bytesRead = handles.has(artifact)
-        ? (await handles.get(artifact)!.read(buffer, 0, length, start)).bytesRead
+        ? // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+          (await handles.get(artifact)!.read(buffer, 0, length, start)).bytesRead
         : 0;
       result.bytesRead += bytesRead;
       options.abortSignal?.throwIfAborted();
@@ -1545,7 +1563,9 @@ export async function scanHistoryFilesBounded(
       ? structuredClone(options.cursor)
       : {
           provenanceEpoch,
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           snapshots: { chat: initialChat!, archive: await snapshot("archive") },
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           validatedChatSnapshot: initialChat!,
           phase: "floor",
           recentFirst: options.recentFirst === true,
@@ -1806,7 +1826,9 @@ export async function scanHistoryFilesBounded(
     // boundary row (or the floor), retaining only locations. Returns false when
     // the page budget ran out.
     const probePage = async (): Promise<boolean> => {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const probe = state.probe!;
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const floor = state.floor!;
       assert(probe && floor, "newest-first probe requires floor and probe state");
       const lower = probe.artifact === floor.artifact ? floor.byteOffset : 0;
@@ -1862,7 +1884,9 @@ export async function scanHistoryFilesBounded(
     // Reverse delivery of one discovered span, from its end (state position) down
     // to its boundary row, crossing the chat -> archive seam when the span does.
     const deliverPage = async (): Promise<boolean> => {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const span = state.span!;
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const floor = state.floor!;
       assert(span && floor, "newest-first delivery requires span and floor state");
       const artifact = state.artifact;
@@ -1951,6 +1975,7 @@ export async function scanHistoryFilesBounded(
             // Keep the legacy cursor field, but sequence coverage is not replay proof.
             const sequence = message?.metadata?.historySequence;
             if (artifact === "archive" && Number.isSafeInteger(sequence))
+              // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
               state.archiveWatermark = Math.max(state.archiveWatermark, sequence!);
             if (isManualHistoryReset(message, possibleReset)) {
               // Corrupt reset rows are privacy floors even when they parse or
@@ -1968,6 +1993,7 @@ export async function scanHistoryFilesBounded(
           assert(raw, "readable browse rows retain their bounded raw bytes");
           const sequence = message.metadata?.historySequence;
           const anchorSequence =
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
             Number.isSafeInteger(sequence) && sequence! >= 0 ? sequence! : null;
           // Repaired/imported rows may reuse archived sequences with different
           // identities or payloads. Retain possible replays without exact proof.

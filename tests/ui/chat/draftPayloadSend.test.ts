@@ -148,7 +148,7 @@ describe("Sending a draft whose attachment payloads are still loading", () => {
       releasePayloads();
       const editTextarea = await waitFor(() => {
         const textarea = app.view.container.querySelector<HTMLTextAreaElement>(
-          'textarea[aria-label="Edit your last message"]'
+          'textarea[aria-label="Edit message"]'
         );
         if (!textarea) throw new Error("Edit textarea not found");
         expect(textarea.value).toBe("first message");

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { isCopilotModelAccessible } from "../utils/copilot/modelRouting";
+import { createGatewayRouting } from "../utils/providers/gatewayModelCatalog";
 
 import { availableRoutes, isModelAvailable, resolveRoute } from "./resolve";
 
@@ -639,5 +640,119 @@ describe("availableRoutes", () => {
         isConfigured: false,
       },
     ]);
+  });
+});
+
+describe("Coder canonicalRoutes resolver", () => {
+  const coderOnly = createIsConfigured(["coder"]);
+  const mappedCoder = createGatewayRouting({
+    coder: {
+      canonicalRoutes: { anthropic: "claude-aws-us-east-2", google: "agents-google" },
+      discoveredProviders: [
+        { name: "claude-aws-us-east-2", type: "anthropic" },
+        { name: "agents-google", type: "google" },
+      ],
+    },
+  });
+
+  test("routes canonical models to the mapped instance; explicit selections stay literal", () => {
+    const route = resolveRoute(
+      MODEL,
+      ["coder"],
+      {},
+      coderOnly,
+      mappedCoder.isGatewayModelAccessible,
+      mappedCoder.resolveGatewayModelId
+    );
+    expect(route.routeProvider).toBe("coder");
+    expect(route.routeModelId).toBe("claude-aws-us-east-2/claude-opus-4-6");
+    expect(route.canonical).toBe(MODEL);
+
+    const explicit = resolveRoute(
+      "coder:anthropic/claude-opus-4-6",
+      ["coder"],
+      {},
+      coderOnly,
+      mappedCoder.isGatewayModelAccessible,
+      mappedCoder.resolveGatewayModelId
+    );
+    expect(explicit.routeModelId).toBe("anthropic/claude-opus-4-6");
+  });
+
+  test("a direct override still wins over the mapped instance", () => {
+    const route = resolveRoute(
+      MODEL,
+      ["coder"],
+      { [MODEL]: "direct" },
+      createIsConfigured(["coder", "anthropic"]),
+      mappedCoder.isGatewayModelAccessible,
+      mappedCoder.resolveGatewayModelId
+    );
+    expect(route.routeProvider).toBe("anthropic");
+  });
+
+  test("google is routable through Coder only when mapped to a known google instance", () => {
+    const geminiModel = "google:gemini-3.8-flash";
+    const unmapped = createGatewayRouting({ coder: {} });
+    const mismatched = createGatewayRouting({
+      coder: {
+        canonicalRoutes: { google: "claude-aws-us-east-2" },
+        discoveredProviders: [{ name: "claude-aws-us-east-2", type: "anthropic" }],
+      },
+    });
+    const availableVia = (routing: typeof unmapped) => ({
+      available: isModelAvailable(
+        geminiModel,
+        ["coder"],
+        {},
+        coderOnly,
+        routing.isGatewayModelAccessible,
+        routing.resolveGatewayModelId
+      ),
+      routes: availableRoutes(
+        geminiModel,
+        coderOnly,
+        routing.isGatewayModelAccessible,
+        routing.resolveGatewayModelId
+      ).map((route) => route.route),
+    });
+
+    expect(availableVia(mappedCoder).available).toBe(true);
+    expect(availableVia(mappedCoder).routes).toContain("coder");
+    expect(availableVia(unmapped).available).toBe(false);
+    expect(availableVia(unmapped).routes).not.toContain("coder");
+    expect(availableVia(mismatched).available).toBe(false);
+  });
+
+  test("a mapping to an unknown instance makes the origin unroutable through Coder", () => {
+    const stale = createGatewayRouting({
+      coder: {
+        canonicalRoutes: { anthropic: "deleted-instance" },
+        discoveredProviders: [{ name: "anthropic", type: "anthropic" }],
+      },
+    });
+    expect(
+      isModelAvailable(
+        MODEL,
+        ["coder"],
+        {},
+        coderOnly,
+        stale.isGatewayModelAccessible,
+        stale.resolveGatewayModelId
+      )
+    ).toBe(false);
+  });
+
+  test("without a mapping anthropic keeps the default-named instance", () => {
+    const unmapped = createGatewayRouting({ coder: {} });
+    const route = resolveRoute(
+      MODEL,
+      ["coder"],
+      {},
+      coderOnly,
+      unmapped.isGatewayModelAccessible,
+      unmapped.resolveGatewayModelId
+    );
+    expect(route.routeModelId).toBe("anthropic/claude-opus-4-6");
   });
 });

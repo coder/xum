@@ -1,4 +1,4 @@
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { getUserPreferences } from "@/browser/stores/AppConfigStore";
 import { REMOTE_CONNECTION_EDITOR_FRAME_NAME_PREFIX } from "@/common/constants/remoteConnection";
 import {
   getEditorDeepLink,
@@ -7,12 +7,7 @@ import {
   isLocalhost,
   type DeepLinkEditor,
 } from "@/browser/utils/editorDeepLinks";
-import {
-  DEFAULT_EDITOR_CONFIG,
-  EDITOR_CONFIG_KEY,
-  normalizeEditorConfig,
-  type EditorConfig,
-} from "@/common/constants/storage";
+import { normalizeEditorConfig, type EditorConfig } from "@/common/constants/storage";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { isSSHRuntime, isDockerRuntime, isDevcontainerRuntime } from "@/common/types/runtime";
 import type { APIClient } from "@/browser/contexts/API";
@@ -116,9 +111,7 @@ interface OpenInEditorArgs {
 }
 
 export async function openInEditor(args: OpenInEditorArgs): Promise<OpenInEditorResult> {
-  const editorConfig = normalizeEditorConfig(
-    readPersistedState<EditorConfig>(EDITOR_CONFIG_KEY, DEFAULT_EDITOR_CONFIG)
-  );
+  const editorConfig = normalizeEditorConfig(getUserPreferences().appearance?.editorConfig);
 
   // Browser mode: window.open must run while the click's transient user activation is still
   // valid — the awaited backend lookups and the open-recording RPC below can outlast that

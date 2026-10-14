@@ -39,6 +39,7 @@ import {
   equalHistoryReplacementRows,
   type HistoryReplacementRow,
 } from "./historyReplacementRows";
+import { projectStatusHistoryRow } from "./historyStatusProjection";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import type { HistoryEditPrecondition } from "@/common/orpc/types";
 import {
@@ -88,6 +89,13 @@ import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import { unlockedHistoryScans } from "./unlockedHistoryScans";
+import {
+  decideSendIdsFromHistory,
+  readSendIdEvidence,
+  type SendIdDecision,
+  type SendIdEvidence,
+  type SendIdentity,
+} from "./sendIds";
 import { log } from "./log";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
@@ -231,7 +239,7 @@ function tailCutChangesProviderContext(removedMessages: MuxMessage[]): boolean {
  * consumed (see leavesCompactionFollowUpPending). A cut that removes that proof and exposes the
  * summary again must retire the handoff in the same locked write, or startup recovery (or a
  * sibling backend) re-sends an already-dispatched follow-up, e.g. after the user edits it and
- * the edited row never lands (formal/compaction, TLC case C1). Returns the retained-row sanitizer.
+ * the edited row never lands. Returns the retained-row sanitizer.
  */
 function retireReexposedCompactionFollowUp(
   retained: readonly MuxMessage[],
@@ -285,6 +293,37 @@ function deletionCreatesRawReset(
     }
   }
   return createdReset();
+}
+
+/**
+ * #5886: the Anthropic thinking-replay receipt (MuxMetadata.anthropicThinkingReplay) must
+ * outlive a turn that produced no output, or the next turn replays the removed thinking and
+ * pays one more 400. Returns the stored row with only the partial's receipt added (its parts
+ * stay as they are, and an empty row never reaches the provider or shows as a reply), or
+ * undefined when there is nothing to add. A later strip of the same turn moves the receipt's
+ * point, so a changed point is copied too.
+ */
+function withPartialReplayReceipt(
+  existing: MuxMessage,
+  partial: MuxMessage
+): MuxMessage | undefined {
+  const receipt = partial.metadata;
+  if (receipt?.anthropicThinkingReplay !== "off") return undefined;
+  const stored = existing.metadata;
+  if (
+    stored?.anthropicThinkingReplay === "off" &&
+    stored.anthropicThinkingReplayFromStep === receipt.anthropicThinkingReplayFromStep
+  ) {
+    return undefined;
+  }
+  return {
+    ...existing,
+    metadata: {
+      ...stored,
+      anthropicThinkingReplay: "off",
+      anthropicThinkingReplayFromStep: receipt.anthropicThinkingReplayFromStep,
+    },
+  };
 }
 
 function stripContextUsage(message: MuxMessage): MuxMessage {
@@ -817,6 +856,29 @@ export class HistoryService {
 
   constructor(config: HistorySessionLocation) {
     this.config = config;
+  }
+
+  private readonly emptyErroredReplyDeletedListeners = new Set<
+    (workspaceId: string, historySequences: number[]) => void
+  >();
+
+  /**
+   * Called after commitPartial deleted the history rows of a reply that failed with no output
+   * (one row, or every duplicate of its id in corrupted history).
+   * No caller asked for that delete, so no caller tells the client. A client that keeps the row
+   * sends it as evidence with its next edit, and the edit is refused (#6116).
+   * Returns the unsubscribe function.
+   */
+  onEmptyErroredReplyDeleted(
+    listener: (workspaceId: string, historySequences: number[]) => void
+  ): () => void {
+    this.emptyErroredReplyDeletedListeners.add(listener);
+    return () => this.emptyErroredReplyDeletedListeners.delete(listener);
+  }
+
+  /** Test-visible: how many onEmptyErroredReplyDeleted listeners are subscribed. */
+  get emptyErroredReplyDeletedListenerCount(): number {
+    return this.emptyErroredReplyDeletedListeners.size;
   }
 
   private readonly continuousJournals = new Map<string, ContinuousCompactionJournalStore>();
@@ -1769,10 +1831,13 @@ export class HistoryService {
       try {
         // Preserve the existing recovery hashes and tombstone protocol, but leave no await
         // between the final ownership check and the complete destructive transaction.
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         renameSync(staged.get(markerPath)!, markerPath);
         renameSync(archivePath, `${archivePath}.truncate`);
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         if (archive !== null) renameSync(staged.get(archivePath)!, archivePath);
         if (chat === null) rmSync(chatPath, { force: true });
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         else renameSync(staged.get(chatPath)!, chatPath);
         committed = true;
       } catch (error) {
@@ -3025,9 +3090,9 @@ export class HistoryService {
     // The lazy read path recovers under an earlier hold of the lock and then re-acquires
     // it to rotate; a foreign backend can truncate and crash in that gap (marker +
     // tombstone, no archive). Appending would then create an archive that the next
-    // recovery cannot match to the marker, so recovery deletes it with the rotated rows
-    // (TLA+ formal/history-crash ArchiveSwap A2 vs A3). Rolling back first restores the
-    // tombstoned archive, and rotation appends to it. Two stats when there is nothing to do.
+    // recovery cannot match to the marker, so recovery deletes it with the rotated rows.
+    // Rolling back first restores the tombstoned archive, and rotation appends to it. Two
+    // stats when there is nothing to do.
     // The artifact probe is part of recovery: a failed stat must not pass as a rotation error.
     try {
       if (await this.truncateRecoveryArtifactsPresent(workspaceId)) {
@@ -3182,9 +3247,34 @@ export class HistoryService {
     workspaceId: string,
     options?: { throwOnError?: boolean }
   ): Promise<MuxMessage | null> {
+    return this.readPartialFile(workspaceId, {
+      throwOnError: options?.throwOnError,
+      status: false,
+    });
+  }
+
+  /**
+   * Status-grade partial read for the sidebar status transcript (#5213). A partial over
+   * SESSION_HISTORY_MAX_LINE_BYTES is projected like an oversized row (#4790): tool payloads
+   * null, file URLs "", fields the status formatter never reads. Like such a row, a partial
+   * corrupt only inside a cut value stays readable here while readPartial drops it. Never use it
+   * for provider requests.
+   */
+  async readStatusPartial(workspaceId: string): Promise<MuxMessage | null> {
+    return this.readPartialFile(workspaceId, { status: true });
+  }
+
+  private async readPartialFile(
+    workspaceId: string,
+    options: { throwOnError?: boolean; status: boolean }
+  ): Promise<MuxMessage | null> {
     try {
       const partialPath = this.getPartialPath(workspaceId);
-      const data = await fs.readFile(partialPath, "utf-8");
+      const bytes = await fs.readFile(partialPath);
+      const data =
+        options.status && bytes.length > SESSION_HISTORY_MAX_LINE_BYTES
+          ? (projectStatusHistoryRow(bytes) ?? bytes.toString("utf8"))
+          : bytes.toString("utf8");
       const message: unknown = JSON.parse(data);
       return isReadableHistoryMessage(message) ? normalizePersistedMessage(message) : null;
     } catch (error) {
@@ -3193,7 +3283,7 @@ export class HistoryService {
       }
 
       // Parse corruption cannot heal on retry; discard it instead of bricking task recovery.
-      if (options?.throwOnError && !(error instanceof SyntaxError)) throw error;
+      if (options.throwOnError && !(error instanceof SyntaxError)) throw error;
       log.error("Error reading partial:", error);
       return null;
     }
@@ -3404,18 +3494,42 @@ export class HistoryService {
     if ((await this.readPartial(workspaceId)) == null) {
       return Ok(undefined);
     }
-    return this.withRecoveredHistoryWriteResultLock(
+    let deletedSequences: number[] = [];
+    const committed = await this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to commit partial",
       (assertStillOwned) =>
-        this.commitPartialUnderWriteLock(workspaceId, expectedMessageId, assertStillOwned)
+        this.commitPartialUnderWriteLock(
+          workspaceId,
+          expectedMessageId,
+          assertStillOwned,
+          (sequences) => (deletedSequences = sequences)
+        )
     );
+    // Notify after the locks are released (listeners publish to clients), and also when a later
+    // step failed: the rows are gone, and a retry finds the partial orphaned and reports nothing.
+    if (deletedSequences.length > 0) {
+      for (const listener of this.emptyErroredReplyDeletedListeners) {
+        // One failing session must neither skip the others nor fail this commit.
+        try {
+          listener(workspaceId, deletedSequences);
+        } catch (error) {
+          log.warn("Empty errored reply delete listener failed", {
+            workspaceId,
+            error: getErrorMessage(error),
+          });
+        }
+      }
+    }
+    return committed;
   }
 
+  /** `recordDeleted` receives the sequences of the empty errored reply rows it deleted. */
   private async commitPartialUnderWriteLock(
     workspaceId: string,
-    expectedMessageId?: string,
-    assertStillOwned?: () => Promise<void>
+    expectedMessageId: string | undefined,
+    assertStillOwned: (() => Promise<void>) | undefined,
+    recordDeleted: (historySequences: number[]) => void
   ): Promise<Result<void>> {
     try {
       let partial = await this.readPartial(workspaceId);
@@ -3510,10 +3624,24 @@ export class HistoryService {
         hadErrorMetadata &&
         !commitWorthy &&
         !hasDurableRefusalMetadata &&
-        (existingMessage.parts?.length ?? 0) === 0;
+        (existingMessage.parts?.length ?? 0) === 0 &&
+        // A row that already holds the replay receipt keeps it (a crash after the receipt
+        // write, before this partial was deleted, #5886).
+        existingMessage.metadata?.anthropicThinkingReplay !== "off";
+
+      // #5886: the receipt must outlive a turn that produced no output (see
+      // withPartialReplayReceipt).
+      const receiptRow = shouldCommit
+        ? undefined
+        : withPartialReplayReceipt(existingMessage, partial);
 
       if (shouldCommit) {
         const updateResult = await this.updateHistoryUnderWriteLock(workspaceId, partial);
+        if (!updateResult.success) {
+          return updateResult;
+        }
+      } else if (receiptRow) {
+        const updateResult = await this.updateHistoryUnderWriteLock(workspaceId, receiptRow);
         if (!updateResult.success) {
           return updateResult;
         }
@@ -3524,6 +3652,15 @@ export class HistoryService {
           !deleteMessageResult.error.includes("not found in history")
         ) {
           return deleteMessageResult;
+        }
+        if (deleteMessageResult.success) {
+          // The delete is by id: corrupted history can hold duplicates at other sequences,
+          // including before the latest boundary, so report what the delete removed.
+          assert(
+            deleteMessageResult.data.length > 0,
+            "the deleted rows include the partial's own row"
+          );
+          recordDeleted(deleteMessageResult.data);
         }
       }
 
@@ -4098,6 +4235,16 @@ export class HistoryService {
        * (plan-review feedback, compaction follow-up dispatch).
        */
       admitsFullHistory?: (messages: MuxMessage[]) => boolean;
+      /**
+       * Idempotent sends (append only): the ids the trigger row accepts. Checked against every
+       * row (archive included) under this write lock, right before the write, and stamped on the
+       * trigger: an id a row already carries is never appended twice. `onDecision` reports the
+       * decision synchronously; any decision but "append" skips the publication.
+       */
+      sendIds?: {
+        identities: readonly SendIdentity[];
+        onDecision: (decision: SendIdDecision) => void;
+      };
     }
   ): Promise<Result<CompactionReplacementOutcome>> {
     const expected = { ...capture };
@@ -4208,6 +4355,7 @@ export class HistoryService {
               "summary"
           )
             return Ok({ kind: "skipped" });
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           const trigger = messages.at(-1)!;
           if (
             new Set(messages.map((message) => message.id)).size !== messages.length ||
@@ -4274,12 +4422,15 @@ export class HistoryService {
             matches.length !== 1 ||
             !row ||
             !this.isCompactionReplacementRow(row) ||
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
             !matchesTarget(row.message!)
           )
             return Ok({ kind: "skipped" });
           // Stamp the verified disk row so normalization never erases persisted fields.
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           messages = [row.message!];
         }
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const trigger = messages.at(-1)!;
         // Ordinary input records the rejection without gaining authority to replace a Stop.
         if (
@@ -4297,6 +4448,7 @@ export class HistoryService {
           return Ok(accepted);
         }
         if (replacementNonce !== null) {
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           if (!(await verifyIdentities!())) return Ok({ kind: "skipped" });
           if (verifyExistingWitness) {
             // A failed sidecar retirement must not make explicit Retry inert. Reuse the
@@ -4311,6 +4463,22 @@ export class HistoryService {
             return Ok(accepted);
           }
           trigger.metadata = { ...trigger.metadata, compactionReplacementNonce: replacementNonce };
+        }
+        if (prepared.kind === "append" && observer.sendIds != null) {
+          const { identities, onDecision } = observer.sendIds;
+          const decision = await decideSendIdsFromHistory(
+            [this.getChatArchivePath(workspaceId), this.getChatHistoryPath(workspaceId)],
+            identities
+          );
+          onDecision(decision);
+          if (decision.kind !== "append") return Ok({ kind: "skipped" });
+          trigger.metadata = {
+            ...trigger.metadata,
+            sendIds: identities.map((identity) => identity.id),
+            sendDigests: Object.fromEntries(
+              identities.map((identity) => [identity.id, identity.digest])
+            ),
+          };
         }
         // Last check before the write, so a `false` here is the only reason for this skip.
         if (prepared.kind === "append" && observer.admitsFullHistory) {
@@ -4386,6 +4554,51 @@ export class HistoryService {
       }
     );
     return accepted ? Ok(accepted) : result;
+  }
+
+  /**
+   * What history says about a send's ids, read under the history write lock (no append lands
+   * during the read). Advisory: a held Retry uses it to drop an entry whose row already exists;
+   * the publication's own in-lock check (acceptCompactionReplacement) stays the authority.
+   */
+  async decideSendIds(
+    workspaceId: string,
+    identities: readonly SendIdentity[]
+  ): Promise<Result<SendIdDecision>> {
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to look up send ids",
+      async () =>
+        Ok(
+          await decideSendIdsFromHistory(
+            [this.getChatArchivePath(workspaceId), this.getChatHistoryPath(workspaceId)],
+            identities
+          )
+        )
+    );
+  }
+
+  /**
+   * Answer what history says about send ids atomically with the caller's own bookkeeping: `decide`
+   * runs synchronously under the history write lock after a fresh read, so no append (this
+   * backend's or another's) lands between the read and the decision.
+   */
+  async resolveSendIds<T>(
+    workspaceId: string,
+    ids: readonly string[],
+    decide: (evidenceOf: (id: string) => readonly SendIdEvidence[]) => T
+  ): Promise<Result<T>> {
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to resolve send ids",
+      async () => {
+        const evidence = await readSendIdEvidence(
+          [this.getChatArchivePath(workspaceId), this.getChatHistoryPath(workspaceId)],
+          ids
+        );
+        return Ok(decide((id) => evidence.get(id) ?? []));
+      }
+    );
   }
 
   private isCompactionReplacementRow(row: HistoryRewriteRow): boolean {
@@ -5373,7 +5586,9 @@ export class HistoryService {
    */
   async deleteMessage(workspaceId: string, messageId: string): Promise<Result<void>> {
     return this.withRecoveredHistoryWriteResultLock(workspaceId, "Failed to delete message", () =>
-      this.deleteMessageUnderWriteLock(workspaceId, messageId)
+      this.deleteMessageUnderWriteLock(workspaceId, messageId).then((result) =>
+        result.success ? Ok(undefined) : result
+      )
     );
   }
 
@@ -5415,8 +5630,14 @@ export class HistoryService {
   private async deleteMessageUnderWriteLock(
     workspaceId: string,
     messageId: string
-  ): Promise<Result<void>> {
+  ): Promise<Result<number[]>> {
     invalidateHistoryAppendProvenance();
+    // The sequences of the removed rows (every row with this id), for callers that publish them.
+    const sequencesOf = (removed: readonly MuxMessage[]) =>
+      removed.flatMap((msg) => {
+        const seq = msg.id === messageId ? msg.metadata?.historySequence : undefined;
+        return isNonNegativeInteger(seq) ? [seq] : [];
+      });
     try {
       // Structural rewrite requires full file content
       const { rows, messages } = await this.readHistoryForRewrite(
@@ -5450,7 +5671,7 @@ export class HistoryService {
           messages.length
         );
         await writeFileAtomic(this.getChatArchivePath(workspaceId), archiveEntries);
-        return Ok(undefined);
+        return Ok(sequencesOf(archiveMessages));
       }
 
       const historyPath = this.getChatHistoryPath(workspaceId);
@@ -5499,7 +5720,7 @@ export class HistoryService {
         this.sequenceCounters.set(workspaceId, nextSeq);
       }
 
-      return Ok(undefined);
+      return Ok(sequencesOf(messages));
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to delete message: ${message}`);

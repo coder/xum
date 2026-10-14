@@ -3,7 +3,12 @@ import { execFileSync } from "child_process";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { getLegacyPlanFilePath, sharesPlanStorage } from "@/common/utils/planStorage";
+import {
+  getInstallationScopedPlanFilePath,
+  getLegacyPlanFilePath,
+  sharesPlanStorage,
+} from "@/common/utils/planStorage";
+import { createRemoteProjectId } from "@/node/runtime/remoteProjectLayout";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
@@ -168,6 +173,62 @@ describe("WorkspaceService removal deletes plan files (#5019)", () => {
     });
   });
 
+  // A history clear uses the removal's sharing guard: it keeps the shared plan path, which may be
+  // the other workspace's live plan, and still deletes its own legacy path (keyed by its ID).
+  test("a full clear keeps a shared plan path and deletes its own legacy plan", async () => {
+    await withTempMuxRoot(async (root) => {
+      const twinProjectPath = path.join(harness.rootDir, "elsewhere", "project");
+      await harness.config.editConfig((cfg) => {
+        cfg.projects.set(twinProjectPath, { workspaces: [], trusted: true });
+        return cfg;
+      });
+      await addLocalWorkspace("ffffffff12", "twin");
+      await addLocalWorkspace("ffffffff13", "twin", twinProjectPath);
+      const [sharedPlan, legacy] = await writePlans(root, "ffffffff12", "twin");
+
+      const result = await service.truncateHistory("ffffffff12", 1.0);
+
+      expect(result.success ? "" : result.error).toBe("");
+      expect([await exists(sharedPlan), await exists(legacy)]).toEqual([true, false]);
+    });
+  });
+
+  // An unreadable registry leaves the sharing unknown: a local clear is refused with its plan
+  // kept, but a Docker plan is never shared, so its clear does not depend on the registry.
+  test.each([
+    { label: "a local clear is refused", runtimeConfig: { type: "local" }, cleared: false },
+    {
+      label: "a Docker clear still succeeds",
+      runtimeConfig: { type: "docker", image: "node:22" },
+      cleared: true,
+    },
+  ] satisfies Array<{ label: string; runtimeConfig: RuntimeConfig; cleared: boolean }>)(
+    "with an unreadable registry, $label",
+    async ({ runtimeConfig, cleared }) => {
+      await withTempMuxRoot(async (root) => {
+        await addWorkspaceIn(projectPath, {
+          id: "ffffffff14",
+          name: "unread",
+          path: projectPath,
+          runtimeConfig,
+        });
+        const plan = await writePlanFile(root, "project", "unread");
+        spyRemotePlanDeletion();
+        const realGetAll = harness.config.getAllWorkspaceMetadata.bind(harness.config);
+        spyOn(harness.config, "getAllWorkspaceMetadata").mockImplementation((options) =>
+          options?.throwOnError === true
+            ? Promise.reject(new Error("config unreadable"))
+            : realGetAll(options)
+        );
+
+        const result = await service.truncateHistory("ffffffff14", 1.0);
+
+        expect(result.success).toBe(cleared);
+        expect(await exists(plan)).toBe(true);
+      });
+    }
+  );
+
   test("a same-named workspace on another host does not keep the local plan", async () => {
     await withTempMuxRoot(async (root) => {
       const twinProjectPath = path.join(harness.rootDir, "remote", "project");
@@ -204,8 +265,11 @@ describe("WorkspaceService removal deletes plan files (#5019)", () => {
       duration: 0,
     });
     return () =>
-      exec.mock.calls.flatMap(([, , options]) =>
-        options.pathEnv?.XUM_PLAN != null ? [options.pathEnv.XUM_PLAN] : []
+      // Deletions only: an older row's removal also copies its legacy plan first (#5174).
+      exec.mock.calls.flatMap(([, command, options]) =>
+        command.startsWith("rm") && options.pathEnv?.XUM_PLAN != null
+          ? [options.pathEnv.XUM_PLAN]
+          : []
       );
   };
 
@@ -245,7 +309,8 @@ describe("WorkspaceService removal deletes plan files (#5019)", () => {
           path: "~/xum/project/hosted",
           runtimeConfig: ssh(2222),
         });
-        await addWorkspaceIn(path.join(harness.rootDir, "remote", "project"), {
+        // The same local project: SSH plan directories are keyed by the project path (#5174).
+        await addWorkspaceIn(projectPath, {
           id: "ffffffff11",
           name: "hosted",
           path: "~/xum/project/hosted",
@@ -260,7 +325,14 @@ describe("WorkspaceService removal deletes plan files (#5019)", () => {
         const result = await service.remove("ffffffff10");
 
         expect(result.success ? "" : result.error).toBe("");
-        expect(deletedPlans()).toEqual(deleted ? ["~/.mux/plans/project/hosted.md"] : []);
+        // This installation's scoped plan path (#5174), never the shared legacy one.
+        const scopedPlanPath = getInstallationScopedPlanFilePath(
+          "hosted",
+          createRemoteProjectId(projectPath),
+          await harness.config.getInstallationId(),
+          "~/.mux"
+        );
+        expect(deletedPlans()).toEqual(deleted ? [scopedPlanPath] : []);
       });
     }
   );

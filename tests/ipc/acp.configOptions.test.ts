@@ -1,5 +1,5 @@
 import type { SessionConfigOption, SessionConfigSelectOption } from "@agentclientprotocol/sdk";
-import { DEFAULT_HIDDEN_MODELS, KNOWN_MODELS } from "../../src/common/constants/knownModels";
+import { KNOWN_MODELS } from "../../src/common/constants/knownModels";
 import {
   AGENT_MODE_CONFIG_ID,
   buildConfigOptions,
@@ -10,7 +10,7 @@ import type { ORPCClient } from "../../src/node/acp/serverConnection";
 interface WorkspaceAiSettings {
   model: string;
   thinkingLevel: "off" | "low" | "medium" | "high" | "xhigh" | "max";
-  reasoningMode?: "standard" | "pro";
+  reasoningMode?: "standard" | "pro" | "cyber";
 }
 
 interface WorkspaceState {
@@ -156,33 +156,15 @@ function flattenSelectOptions(
 }
 
 describe("ACP config options", () => {
+  const luna = KNOWN_MODELS.GPT_6_LUNA.id;
+  const astra = KNOWN_MODELS.GPT_6_ASTRA.id;
+
   it.each([
-    { hiddenModels: undefined, current: KNOWN_MODELS.GPT.id, blue: false, red: false },
-    {
-      hiddenModels: [...DEFAULT_HIDDEN_MODELS],
-      current: KNOWN_MODELS.GPT.id,
-      blue: false,
-      red: false,
-    },
-    { hiddenModels: [], current: KNOWN_MODELS.GPT.id, blue: true, red: true },
-    {
-      hiddenModels: [KNOWN_MODELS.DAYBREAK_BLUE.id],
-      current: KNOWN_MODELS.GPT.id,
-      blue: false,
-      red: true,
-    },
-    {
-      hiddenModels: [KNOWN_MODELS.DAYBREAK_RED.id],
-      current: KNOWN_MODELS.GPT.id,
-      blue: true,
-      red: false,
-    },
-    {
-      hiddenModels: [...DEFAULT_HIDDEN_MODELS],
-      current: KNOWN_MODELS.DAYBREAK_BLUE.id,
-      blue: true,
-      red: false,
-    },
+    { hiddenModels: undefined, current: KNOWN_MODELS.GPT.id, luna: true, astra: true },
+    { hiddenModels: [], current: KNOWN_MODELS.GPT.id, luna: true, astra: true },
+    { hiddenModels: [luna], current: KNOWN_MODELS.GPT.id, luna: false, astra: true },
+    { hiddenModels: [astra], current: KNOWN_MODELS.GPT.id, luna: true, astra: false },
+    { hiddenModels: [luna, astra], current: luna, luna: true, astra: false },
   ])("respects model visibility while retaining the current selection: %j", async (scenario) => {
     const harness = createHarness(
       {
@@ -194,8 +176,8 @@ describe("ACP config options", () => {
     );
     const option = getSelectConfigOption(await buildConfigOptions(harness.client, "ws-1"), "model");
     const values = flattenSelectOptions(option).map((entry) => entry.value);
-    expect(values.includes(KNOWN_MODELS.DAYBREAK_BLUE.id)).toBe(scenario.blue);
-    expect(values.includes(KNOWN_MODELS.DAYBREAK_RED.id)).toBe(scenario.red);
+    expect(values.includes(luna)).toBe(scenario.luna);
+    expect(values.includes(astra)).toBe(scenario.astra);
     expect(values).toContain(scenario.current);
     expect(new Set(values).size).toBe(values.length);
     expect(option.currentValue).toBe(scenario.current);

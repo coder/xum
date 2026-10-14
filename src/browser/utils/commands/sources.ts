@@ -4,9 +4,10 @@ import type { CommandAction } from "@/browser/contexts/CommandRegistryContext";
 import type { APIClient } from "@/browser/contexts/API";
 import type { ConfirmDialogOptions } from "@/browser/contexts/ConfirmDialogContext";
 import { getContextResetSuccessMessage } from "@/browser/utils/contextResetFeedback";
+import { showFeedbackToast as showCommandFeedbackToast } from "@/browser/utils/feedbackToast";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import type { PinnedMoveDirection } from "@/browser/utils/ui/pinnedReorder";
-import type { AutoRoutingDimension } from "@/browser/utils/modelChange";
+import type { AutoRoutingDimension } from "@/browser/utils/aiSelectionIntent";
 import {
   THINKING_LEVELS,
   type OpenAIReasoningMode,
@@ -14,7 +15,8 @@ import {
 } from "@/common/types/thinking";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
-import { getFastModeProvider } from "@/browser/utils/fastModeServiceTier";
+import { getFastModeProvider, ultrafastModeAvailable } from "@/browser/utils/fastModeServiceTier";
+import { openaiCyberModeAvailable } from "@/common/utils/ai/cyberMode";
 import { openaiProModeAvailable } from "@/common/utils/ai/proMode";
 import {
   enforceThinkingPolicy,
@@ -25,25 +27,170 @@ import assert from "@/common/utils/assert";
 import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import {
-  DEFAULT_TERMINAL_BADGE_CONFIG,
   RIGHT_SIDEBAR_COLLAPSED_KEY,
-  SIDEBAR_HIDE_SUBAGENTS_KEY,
-  SIDEBAR_FLAT_MODE_KEY,
-  TERMINAL_BADGE_CONFIG_KEY,
   normalizeTerminalBadgeConfig,
-  type TerminalBadgeConfig,
 } from "@/common/constants/storage";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { getUserPreferences, updateUserPreferences } from "@/browser/stores/AppConfigStore";
 import { CommandIds } from "@/browser/utils/commandIds";
 import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import { stopStream } from "@/browser/utils/stopStream";
 import { publishPluginsSectionIntent } from "@/browser/features/Settings/Sections/pluginsSectionIntents";
+import {
+  openArtifactsTab,
+  pinAndOpenArtifact,
+} from "@/browser/features/RightSidebar/ArtifactsTab/openArtifact";
+import {
+  appViewDetails,
+  appViewServerNames,
+  focusMcpAppViewTab,
+  getMcpAppViews,
+  openMcpAppViewTab,
+  reloadMcpAppView,
+  transcriptViews,
+  type McpAppViewRef,
+} from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
+import {
+  MCP_APP_ENTRYPOINT_NOT_CONNECTED,
+  openMcpAppEntrypoint,
+} from "@/browser/features/RightSidebar/AppViewTab/openMcpAppEntrypoint";
+import { mcpAppEntrypointDescription } from "@/browser/features/RightSidebar/AppViewTab/mcpAppEntrypoints";
+import { appViewTabFor } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
+import type { McpAppEntrypoint } from "@/common/orpc/schemas/mcpApps";
+import { revokeMcpAppViewDomains } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewDomainsStore";
+
+/**
+ * One palette action per MCP App entry point: opens its app tab (calling the tool with {}) or
+ * focuses the one it has. The palette has closed by then, so a failure shows as a toast.
+ */
+function entrypointActions(
+  api: APIClient | null,
+  workspaceId: string,
+  entrypoints: readonly McpAppEntrypoint[],
+  navigation: string
+): CommandAction[] {
+  return entrypoints.flatMap((entrypoint) => {
+    const subtitle = mcpAppEntrypointDescription(entrypoint);
+    const open: CommandAction = {
+      id: CommandIds.navOpenAppEntrypoint(entrypoint.viewKey),
+      title: `Open Plugin View: ${entrypoint.title}`,
+      subtitle,
+      section: navigation,
+      keywords: ["plugin", "view", "app", "mcp", entrypoint.serverName],
+      run: async () => {
+        const error = api
+          ? await openMcpAppEntrypoint(api, workspaceId, entrypoint)
+          : MCP_APP_ENTRYPOINT_NOT_CONNECTED;
+        if (error !== null) showCommandFeedbackToast({ type: "error", message: error });
+      },
+    };
+    // An entry point's tab is keyed by its view key. Open only focuses that tab while its
+    // record is current, so a failed load needs this action to retry from the keyboard.
+    const reload = reloadAppViewActions(workspaceId, entrypoint.viewKey, {
+      title: `Reload Plugin View: ${entrypoint.title}`,
+      subtitle,
+      section: navigation,
+      keywords: ["plugin", "view", "app", "mcp", "reload", "retry", entrypoint.serverName],
+    });
+    return [open, ...reload];
+  });
+}
+
+/**
+ * "Reload" for an app tab that is open (after a failed load, or a stuck view): remounts the
+ * tab's frame, which loads the view again, and focuses the tab. Empty when no tab is open.
+ */
+function reloadAppViewActions(
+  workspaceId: string,
+  toolCallId: string,
+  action: Pick<CommandAction, "title" | "subtitle" | "section" | "keywords">
+): CommandAction[] {
+  if (!hasTab(readRightSidebarLayout(workspaceId), appViewTabFor(toolCallId))) return [];
+  return [
+    {
+      ...action,
+      id: CommandIds.navReloadAppView(toolCallId),
+      run: () => {
+        reloadMcpAppView(workspaceId, toolCallId);
+        focusMcpAppViewTab(workspaceId, toolCallId);
+      },
+    },
+  ];
+}
+
+/**
+ * "Revoke MCP App View Domains…": the keyboard path to Revoke under "Allowed view domains" in
+ * Settings (#6181). Picks one stored approval (server and project) and revokes it. The palette
+ * has closed by the time the call settles, so the outcome shows as a toast.
+ */
+function revokeViewDomainsAction(api: APIClient | null, settings: string): CommandAction {
+  return {
+    id: CommandIds.mcpAppsRevokeViewDomains(),
+    title: "Revoke MCP App View Domains…",
+    subtitle: "Stop a server's views from reaching the domains you allowed",
+    section: settings,
+    keywords: ["mcp", "app", "view", "domains", "csp", "allowed", "revoke", "network"],
+    run: () => undefined,
+    prompt: {
+      title: "Revoke MCP App View Domains",
+      fields: [
+        {
+          type: "select",
+          name: "approval",
+          label: "Allowed view domains",
+          placeholder: "Choose a server and project…",
+          // A failed list rejects: the open palette shows the error (CommandPalette).
+          getOptions: async () => {
+            if (!api) throw new Error(MCP_APP_ENTRYPOINT_NOT_CONNECTED);
+            const approvals = await api.mcpApps.listViewDomains();
+            return approvals.map((approval) => ({
+              id: JSON.stringify([approval.projectPath, approval.serverName]),
+              label: `${approval.serverName} in ${approval.projectPath}: ${approval.origins.join(", ")}`,
+              keywords: [approval.serverName, approval.projectPath, ...approval.origins],
+            }));
+          },
+        },
+      ],
+      onSubmit: async (values) => {
+        const [projectPath, serverName] = JSON.parse(values.approval) as [string, string];
+        const error = api
+          ? await revokeMcpAppViewDomains(api, { projectPath, serverName })
+          : MCP_APP_ENTRYPOINT_NOT_CONNECTED;
+        showCommandFeedbackToast(
+          error == null
+            ? { type: "success", message: `Revoked the view domains of ${serverName}` }
+            : { type: "error", message: `Could not revoke: ${error}` }
+        );
+      },
+    },
+  };
+}
+
+/**
+ * The workspace's MCP App views (the loaded transcript's, then ones opened this session), each
+ * with its detail (appViewDetails).
+ */
+function appViewEntries(
+  workspaceId: string,
+  messages: Parameters<typeof transcriptViews>[1]
+): Array<{ view: McpAppViewRef; server: string; detail: string }> {
+  const fromTranscript = transcriptViews(workspaceId, messages);
+  const known = new Set(fromTranscript.map((view) => view.toolCallId));
+  const views = [
+    ...fromTranscript,
+    ...getMcpAppViews(workspaceId).filter((view) => !known.has(view.toolCallId)),
+  ];
+  const details = appViewDetails(views);
+  const servers = appViewServerNames(views);
+  return views.map((view, i) => ({ view, server: servers[i], detail: details[i] }));
+}
 import { isTabType, type TabType } from "@/browser/types/rightSidebar";
 import {
   getOrderedBaseTabIds,
   getTabConfig,
   type BaseTabType,
 } from "@/browser/features/RightSidebar/Tabs/tabConfig";
+import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import {
   getEffectiveSlotKeybind,
   getLayoutsConfigOrDefault,
@@ -52,15 +199,14 @@ import {
 import { formatProjectHierarchyLabel, getTopLevelProjectEntries } from "@/common/utils/subProjects";
 import type { LayoutPresetsConfig, LayoutSlotNumber } from "@/common/types/uiLayouts";
 import {
-  addToolToFocusedTabset,
   hasTab,
-  selectTabInTabset,
-  setFocusedTabset,
+  openToolFromNewTab,
   splitFocusedTabset,
   toggleTab,
   type RightSidebarLayoutState,
 } from "@/browser/utils/rightSidebarLayout";
 import {
+  focusRightSidebarTab,
   readRightSidebarLayout,
   updateRightSidebarLayout,
 } from "@/browser/utils/rightSidebarTabFocus";
@@ -69,6 +215,7 @@ import type { ProjectConfig } from "@/node/config";
 import { removeWorkspaceConfirmOptions } from "@/browser/utils/commands/removeWorkspaceConfirm";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { BranchListResult } from "@/common/orpc/types";
+import type { Result } from "@/common/types/result";
 import type { WorkspaceState } from "@/browser/stores/WorkspaceStore";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type { UpdateChannel } from "@/common/types/project";
@@ -78,7 +225,10 @@ import { UPDATE_CHANNEL_LABELS } from "@/constants/updateChannels";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { getErrorMessage } from "@/common/utils/errors";
 import { parseGoalBudgetCents } from "@/browser/utils/slashCommands/registry";
-import { setGoalWithConflictRetry } from "@/browser/utils/goals/setGoalWithConflictRetry";
+import {
+  intendedGoalIdOf,
+  setGoalForIntendedGoal,
+} from "@/browser/utils/goals/setGoalForIntendedGoal";
 import { loadGoalDefaults, resolveGoalSetIntent } from "@/browser/utils/goals/resolveGoalSetIntent";
 import {
   hasGoalBudgetLimit,
@@ -114,9 +264,19 @@ export interface BuildSourcesParams {
   getThinkingLevel: (workspaceId: string) => ThinkingLevel;
   onSetThinkingLevel: (workspaceId: string, level: ThinkingLevel) => void;
   getReasoningMode: (workspaceId: string) => OpenAIReasoningMode;
-  onToggleReasoningMode: (workspaceId: string) => void;
+  /** Toggles between `mode` and "standard"; Pro and Cyber share one mode value. */
+  onToggleReasoningMode: (
+    workspaceId: string,
+    mode: Exclude<OpenAIReasoningMode, "standard">
+  ) => void;
   getFastMode: () => boolean;
   onToggleFastMode: () => void | Promise<void>;
+  getUltrafastMode: () => boolean;
+  onToggleUltrafastMode: () => void | Promise<void>;
+  /** config.json keepScreenAwake from the shared app config cache; undefined until it loads. */
+  getKeepScreenAwake?: () => boolean | undefined;
+  /** Native host computer use for the selected workspace; null when unsupported or no workspace. */
+  computerUse?: { enabled: boolean; onToggle: () => void | Promise<void> } | null;
   /** auto-model-routing experiment: gates the composer's Auto toggles in the palette. */
   autoModelRoutingEnabled?: boolean;
   /** Composer Auto flag for one dimension, keyed by workspace or creation scope. */
@@ -139,8 +299,14 @@ export interface BuildSourcesParams {
   onStartWorkspaceCreation: (projectPath: string) => void;
   onStartMultiProjectWorkspaceCreation: () => void;
   multiProjectWorkspacesEnabled: boolean;
-  /** agent-plugins experiment: gates the Settings → Plugins palette entry. */
-  agentPluginsEnabled: boolean;
+  /** artifacts experiment: gates "Open Artifacts", "Open File as Artifact…" and entry points. */
+  artifactsEnabled?: boolean;
+  /** The selected workspace's MCP App entry points; undefined until listed. */
+  mcpAppEntrypoints?: readonly McpAppEntrypoint[];
+  /** perfFlightRecorder experiment: gates "Report slowness". */
+  perfFlightRecorderEnabled?: boolean;
+  /** sessionTapes experiment: gates "Save open session tapes" and "Reveal session tapes folder". */
+  sessionTapesEnabled?: boolean;
   onArchiveMergedWorkspacesInProject: (projectPath: string) => Promise<void>;
   getBranchesForProject: (projectPath: string) => Promise<BranchListResult>;
   onSelectWorkspace: (sel: {
@@ -172,11 +338,12 @@ export interface BuildSourcesParams {
   // Layout slots
   layoutPresets?: LayoutPresetsConfig | null;
   onApplyLayoutSlot?: (workspaceId: string, slot: LayoutSlotNumber) => void;
+  /** Errs with a user-facing message when the layout cannot be saved. */
   onCaptureLayoutSlot?: (
     workspaceId: string,
     slot: LayoutSlotNumber,
     name: string
-  ) => Promise<void>;
+  ) => Promise<Result<void>>;
   onClearTimingStats?: (workspaceId: string) => void;
 }
 
@@ -245,36 +412,26 @@ const getAnalyticsRebuildDatabase = (
   return typeof rebuildDatabase === "function" ? rebuildDatabase : null;
 };
 
+/**
+ * Palette sources rebuild on every render, so re-entry is tracked at module level: a second
+ * "Save open session tapes" while one runs is ignored.
+ */
+let sessionTapesSaveRunning = false;
+
+/**
+ * Toasts that show the session tapes folder path stay up longer than the 3 s success default:
+ * in server mode the toast is the only place the path appears, so users need time to read or
+ * select it.
+ */
+const SESSION_TAPES_PATH_TOAST_MS = 15_000;
+
+const NO_BACKGROUND_PROCESSES_MESSAGE = "No background processes are running in this workspace.";
+
 const NO_RUNNABLE_PLAN_MESSAGE =
   "No plan to implement: the latest plan's Implement / Continue in Auto is missing or disabled.";
 
-const showCommandFeedbackToast = (feedback: {
-  type: "success" | "error";
-  message: string;
-  title?: string;
-}) => {
-  if (typeof window === "undefined") {
-    return;
-  }
-
-  // Analytics view does not mount ChatInput, so keep a basic alert fallback
-  // for command palette actions that need user feedback.
-  const hasChatInputToastHost =
-    typeof document !== "undefined" &&
-    document.querySelector('[data-component="ChatInputSection"]') !== null;
-
-  if (hasChatInputToastHost) {
-    window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST, feedback));
-    return;
-  }
-
-  const alertMessage = feedback.title
-    ? `${feedback.title}\n\n${feedback.message}`
-    : feedback.message;
-  if (typeof window.alert === "function") {
-    window.alert(alertMessage);
-  }
-};
+// Module-level: palette sources are rebuilt on every render, so a closure flag would reset.
+let reportSlownessRunning = false;
 
 const findFirstTerminalSessionTab = (
   node: RightSidebarLayoutState["root"]
@@ -289,14 +446,29 @@ const findFirstTerminalSessionTab = (
   );
 };
 
+function focusExistingTerminalTab(workspaceId: string): void {
+  const found = findFirstTerminalSessionTab(readRightSidebarLayout(workspaceId).root);
+  if (found) focusRightSidebarTab(workspaceId, found.tab);
+}
+
+/**
+ * Whether right-sidebar commands have a visible sidebar to act on. Narrow layouts hide the
+ * sidebar entirely, so opening tabs there would produce no visible result (the keyboard
+ * shortcuts refuse for the same reason). Without a DOM (command-source unit tests) there is no
+ * layout to check.
+ */
+function isRightSidebarShown(): boolean {
+  return typeof HTMLElement === "undefined" || !isWorkspaceRightSidebarHidden(document.body);
+}
+
 /**
  * Build a "Hide/Show <Name>" command for a config-defined tab.
  *
  * Each command-source factory is re-invoked per palette render, so the
  * Hide/Show title is up-to-date without any explicit subscription wiring.
  *
- * This is secondary discoverability only; default visibility is controlled by
- * `inDefaultLayout` in `tabConfig.ts` and enforced by the layout migration.
+ * This is secondary discoverability only; the New tab launcher is the primary way to open
+ * tools, and every tab can be closed from the strip.
  */
 function buildToggleTabCommand(
   workspaceId: string,
@@ -310,6 +482,7 @@ function buildToggleTabCommand(
     title: `${visible ? "Hide" : "Show"} ${reg.name}`,
     section: navigationSection,
     keywords: reg.paletteKeywords ?? [tabId],
+    visible: isRightSidebarShown,
     run: () => {
       updateRightSidebarLayout(workspaceId, (s) => toggleTab(s, tabId as TabType));
       if (!visible) {
@@ -363,11 +536,11 @@ function showUnpricedCurrentModelGoalFeedback(): void {
 async function requireGoalSetSuccess(
   api: APIClient,
   workspaceId: string,
-  input: GoalPaletteSetGoalInput
+  input: GoalPaletteSetGoalInput,
+  // The goal the palette listed this command for. See setGoalForIntendedGoal.
+  intendedGoalId: string | null | undefined
 ): Promise<boolean> {
-  // Shared retry helper centralized in `@/browser/utils/goals/` to avoid the
-  // three-way drift Coder-agents-review P3 DEREM-25 flagged.
-  const result = await setGoalWithConflictRetry(api, workspaceId, input);
+  const result = await setGoalForIntendedGoal(api, workspaceId, input, intendedGoalId);
   if (!result.success) {
     showCommandFeedbackToast({ type: "error", message: getGoalSetErrorMessage(result.error) });
     return false;
@@ -383,6 +556,52 @@ function openGoalPanel(workspaceId: string, openCompleteInput = false): void {
     createCustomEvent(CUSTOM_EVENTS.OPEN_GOAL_TAB, { workspaceId, openCompleteInput })
   );
 }
+
+/** Subtitle for an On/Off toggle backed by config.json; `fallback` until the value is known. */
+function describeConfigToggle(value: boolean | undefined, fallback: string): string {
+  return value === undefined ? fallback : `Current: ${value ? "On" : "Off"}`;
+}
+
+/**
+ * The palette actions of the workspace's MCP App views: one "Open App View" per view (its tab,
+ * or the tab it has), and one "Reload App View" per view whose tab is open. The subtitle carries
+ * each call's detail, so several calls of one tool differ.
+ */
+function appViewActions(
+  wsId: string,
+  messages: Parameters<typeof appViewEntries>[1],
+  navigationSection: CommandAction["section"]
+): CommandAction[] {
+  return appViewEntries(wsId, messages).flatMap(({ view, server, detail }) => {
+    const subtitle = detail === "" ? server : `${server} · ${detail}`;
+    const open: CommandAction = {
+      id: CommandIds.navOpenAppView(view.toolCallId),
+      title: `Open App View: ${view.label}`,
+      subtitle,
+      section: navigationSection,
+      keywords: ["app", "view", "mcp", "tab", view.serverName],
+      run: () => openMcpAppViewTab(wsId, view),
+    };
+    // The keyboard path to an open tab's Reload.
+    const reload = reloadAppViewActions(wsId, view.toolCallId, {
+      title: `Reload App View: ${view.label}`,
+      subtitle,
+      section: navigationSection,
+      keywords: ["app", "view", "mcp", "reload", "retry", view.serverName],
+    });
+    return [open, ...reload];
+  });
+}
+
+/** Palette options: managed plugins with components not reviewed on this install (#6498). */
+async function pluginsNeedingReviewOptions(api: BuildSourcesParams["api"]) {
+  const result = await api?.agentPlugins.list();
+  if (!result?.success) return [];
+  return result.data
+    .filter((item) => item.managed && (item.reviewRequiredCount ?? 0) > 0)
+    .map((item) => ({ id: item.name, label: item.name, keywords: [item.name, item.location] }));
+}
+
 export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandAction[]> {
   const actions: Array<() => CommandAction[]> = [];
 
@@ -404,6 +623,13 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       run: () => p.onStartWorkspaceCreation(targetProjectPath),
     };
   };
+
+  // Side chats live in their parent's pane, not as selectable workspaces. Read lazily so all
+  // palette lists (and their submit handlers) see the same current membership.
+  const selectableWorkspaces = () =>
+    Array.from(p.workspaceMetadata.values()).filter(
+      (meta) => meta.sideChatParentWorkspaceId == null
+    );
 
   // Workspaces
   actions.push(() => {
@@ -428,7 +654,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
 
     // Switch to workspace
     // Iterate through all workspace metadata (now keyed by workspace ID)
-    for (const meta of p.workspaceMetadata.values()) {
+    for (const meta of selectableWorkspaces()) {
       const isCurrent = selected?.workspaceId === meta.id;
       const isStreaming = p.streamingModels?.has(meta.id) ?? false;
       // Title is primary (if set), name is secondary identifier
@@ -457,71 +683,73 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     if (selected?.namedWorkspacePath) {
       const workspaceDisplayName = `${selected.projectName}/${selected.namedWorkspacePath.split("/").pop() ?? selected.namedWorkspacePath}`;
       const selectedMeta = p.workspaceMetadata.get(selected.workspaceId);
-      list.push({
-        id: CommandIds.workspaceOpenTerminalCurrent(),
-        title: "New Terminal Window",
-        subtitle: workspaceDisplayName,
-        section: section.workspaces,
-        // Note: Cmd/Ctrl+T opens integrated terminal in sidebar (not shown here since this opens a popout)
-        run: () => {
-          p.onOpenWorkspaceInTerminal(selected.workspaceId, selectedMeta?.runtimeConfig);
-        },
-      });
-      // A sub-agent gets the user-confirmed removal that lists its unpreserved work (#5106); the
-      // plain remove below refuses a dirty checkout, and a model's task_remove refuses it too.
-      if (selectedMeta?.parentWorkspaceId != null) {
+      if (selectedMeta?.sideChatParentWorkspaceId == null) {
         list.push({
-          id: CommandIds.workspaceRemoveSubagent(),
-          title: "Remove Current Sub-agent…",
+          id: CommandIds.workspaceOpenTerminalCurrent(),
+          title: "New Terminal Window",
           subtitle: workspaceDisplayName,
           section: section.workspaces,
-          run: () =>
-            p.onRemoveSubagent(selected.workspaceId, selectedMeta.title ?? selectedMeta.name),
-        });
-      } else {
-        list.push({
-          id: CommandIds.workspaceRemove(),
-          title: "Remove Current Workspace…",
-          subtitle: workspaceDisplayName,
-          section: section.workspaces,
-          run: async () => {
-            const branchName =
-              selectedMeta?.name ??
-              selected.namedWorkspacePath.split("/").pop() ??
-              selected.namedWorkspacePath;
-            const ok = await p.confirmDialog(
-              removeWorkspaceConfirmOptions("Remove current workspace?", {
-                name: branchName,
-                runtimeConfig: selectedMeta?.runtimeConfig,
-                projects: selectedMeta?.projects,
-                kind: selectedMeta?.kind,
-              })
-            );
-            if (ok) await p.onRemoveWorkspace(selected.workspaceId);
+          // Note: Cmd/Ctrl+T opens integrated terminal in sidebar (not shown here since this opens a popout)
+          run: () => {
+            p.onOpenWorkspaceInTerminal(selected.workspaceId, selectedMeta?.runtimeConfig);
           },
         });
-      }
-      // #4983: the keyboard path for the interrupted-delegated-setup banner's Keep button.
-      if (selectedMeta?.delegatedCreationInterrupted === true) {
-        list.push({
-          id: CommandIds.workspaceKeepInterruptedDelegated(),
-          title: "Keep Workspace After Interrupted Setup",
-          subtitle: workspaceDisplayName,
-          section: section.workspaces,
-          run: async () => {
-            if (!p.api) return;
-            const result = await p.api.workspace.keepInterruptedDelegatedWorkspace({
-              workspaceId: selected.workspaceId,
-            });
-            if (!result.success) {
-              showCommandFeedbackToast({
-                type: "error",
-                title: "Could not keep the workspace",
-                message: result.error,
+        // A sub-agent gets the user-confirmed removal that lists its unpreserved work (#5106); the
+        // plain remove below refuses a dirty checkout, and a model's task_remove refuses it too.
+        if (selectedMeta?.parentWorkspaceId != null) {
+          list.push({
+            id: CommandIds.workspaceRemoveSubagent(),
+            title: "Remove Current Sub-agent…",
+            subtitle: workspaceDisplayName,
+            section: section.workspaces,
+            run: () =>
+              p.onRemoveSubagent(selected.workspaceId, selectedMeta.title ?? selectedMeta.name),
+          });
+        } else {
+          list.push({
+            id: CommandIds.workspaceRemove(),
+            title: "Remove Current Workspace…",
+            subtitle: workspaceDisplayName,
+            section: section.workspaces,
+            run: async () => {
+              const branchName =
+                selectedMeta?.name ??
+                selected.namedWorkspacePath.split("/").pop() ??
+                selected.namedWorkspacePath;
+              const ok = await p.confirmDialog(
+                removeWorkspaceConfirmOptions("Remove current workspace?", {
+                  name: branchName,
+                  runtimeConfig: selectedMeta?.runtimeConfig,
+                  projects: selectedMeta?.projects,
+                  kind: selectedMeta?.kind,
+                })
+              );
+              if (ok) await p.onRemoveWorkspace(selected.workspaceId);
+            },
+          });
+        }
+        // #4983: the keyboard path for the interrupted-delegated-setup banner's Keep button.
+        if (selectedMeta?.delegatedCreationInterrupted === true) {
+          list.push({
+            id: CommandIds.workspaceKeepInterruptedDelegated(),
+            title: "Keep Workspace After Interrupted Setup",
+            subtitle: workspaceDisplayName,
+            section: section.workspaces,
+            run: async () => {
+              if (!p.api) return;
+              const result = await p.api.workspace.keepInterruptedDelegatedWorkspace({
+                workspaceId: selected.workspaceId,
               });
-            }
-          },
-        });
+              if (!result.success) {
+                showCommandFeedbackToast({
+                  type: "error",
+                  title: "Could not keep the workspace",
+                  message: result.error,
+                });
+              }
+            },
+          });
+        }
       }
       list.push({
         id: CommandIds.workspaceEditTitle(),
@@ -573,7 +801,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         const pinned = isWorkspacePinned(selectedMeta);
         list.push({
           id: CommandIds.workspaceTogglePinned(),
-          title: pinned ? "Unpin Current Chat" : "Pin Current Chat",
+          title: pinned ? "Unpin Current Workspace" : "Pin Current Workspace",
           subtitle: workspaceDisplayName,
           shortcutHint: formatKeybind(KEYBINDS.PIN_WORKSPACE),
           section: section.workspaces,
@@ -590,7 +818,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           // commands stay listed whenever the chat is pinned.
           list.push({
             id: CommandIds.workspaceMovePinnedUp(),
-            title: "Move Pinned Chat Up",
+            title: "Move Pinned Workspace Up",
             subtitle: workspaceDisplayName,
             shortcutHint: formatKeybind(KEYBINDS.MOVE_PINNED_UP),
             section: section.workspaces,
@@ -598,7 +826,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           });
           list.push({
             id: CommandIds.workspaceMovePinnedDown(),
-            title: "Move Pinned Chat Down",
+            title: "Move Pinned Workspace Down",
             subtitle: workspaceDisplayName,
             shortcutHint: formatKeybind(KEYBINDS.MOVE_PINNED_DOWN),
             section: section.workspaces,
@@ -608,7 +836,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       }
     }
 
-    if (p.workspaceMetadata.size > 0) {
+    if (selectableWorkspaces().length > 0) {
       list.push({
         id: CommandIds.workspaceOpenTerminal(),
         title: "Open Terminal Window for Workspace…",
@@ -623,7 +851,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               label: "Workspace",
               placeholder: "Search workspaces…",
               getOptions: () =>
-                Array.from(p.workspaceMetadata.values()).map((meta) => {
+                selectableWorkspaces().map((meta) => {
                   // Use workspace name instead of extracting from path
                   const label = `${meta.projectName} / ${meta.name}`;
                   return {
@@ -641,7 +869,8 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             },
           ],
           onSubmit: (vals) => {
-            const meta = p.workspaceMetadata.get(vals.workspaceId);
+            const meta = selectableWorkspaces().find((entry) => entry.id === vals.workspaceId);
+            if (!meta) return;
             p.onOpenWorkspaceInTerminal(vals.workspaceId, meta?.runtimeConfig);
           },
         },
@@ -660,7 +889,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               label: "Select workspace",
               placeholder: "Search workspaces…",
               getOptions: () =>
-                Array.from(p.workspaceMetadata.values()).map((meta) => {
+                selectableWorkspaces().map((meta) => {
                   const label = `${meta.projectName} / ${meta.name}`;
                   return {
                     id: meta.id,
@@ -681,9 +910,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               label: "New title",
               placeholder: "Enter new workspace title",
               getInitialValue: (values) => {
-                const meta = Array.from(p.workspaceMetadata.values()).find(
-                  (m) => m.id === values.workspaceId
-                );
+                const meta = selectableWorkspaces().find((m) => m.id === values.workspaceId);
                 return meta?.title ?? meta?.name ?? "";
               },
               validate: (v) => (!v.trim() ? "Title is required" : null),
@@ -708,7 +935,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               label: "Select workspace",
               placeholder: "Search workspaces…",
               getOptions: () =>
-                Array.from(p.workspaceMetadata.values()).map((meta) => {
+                selectableWorkspaces().map((meta) => {
                   const label = `${meta.projectName}/${meta.name}`;
                   return {
                     id: meta.id,
@@ -725,10 +952,9 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             },
           ],
           onSubmit: async (vals) => {
-            const meta = Array.from(p.workspaceMetadata.values()).find(
-              (m) => m.id === vals.workspaceId
-            );
-            if (meta?.parentWorkspaceId != null) {
+            const meta = selectableWorkspaces().find((m) => m.id === vals.workspaceId);
+            if (!meta) return;
+            if (meta.parentWorkspaceId != null) {
               // Sub-agents get the confirmation that lists their unpreserved work (#5106).
               await p.onRemoveSubagent(meta.id, meta.title ?? meta.name);
               return;
@@ -781,44 +1007,42 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       {
         id: CommandIds.navToggleHideSubAgents(),
         title: "Toggle Hide Sub-Agents in Sidebar",
-        subtitle: `Current: ${readPersistedState(SIDEBAR_HIDE_SUBAGENTS_KEY, false) ? "Hidden" : "Shown"}`,
+        subtitle: `Current: ${getUserPreferences().ui?.sidebarHideSubAgents ? "Hidden" : "Shown"}`,
         section: section.navigation,
         keywords: ["sub-agents", "subagents", "hide", "show", "sidebar"],
         run: () => {
-          updatePersistedState<boolean>(SIDEBAR_HIDE_SUBAGENTS_KEY, (prev) => !prev, false);
+          const hidden = getUserPreferences().ui?.sidebarHideSubAgents ?? false;
+          updateUserPreferences({ ui: { sidebarHideSubAgents: !hidden } });
         },
       },
       {
         id: CommandIds.navToggleFlatChatList(),
         title: "Toggle Flat Chat List",
-        subtitle: `Current: ${readPersistedState(SIDEBAR_FLAT_MODE_KEY, false) ? "Flat" : "Grouped"}`,
+        subtitle: `Current: ${getUserPreferences().ui?.sidebarFlatMode ? "Flat" : "Grouped"}`,
         section: section.navigation,
         keywords: ["flat", "chat", "list", "projects", "folders", "sidebar"],
         run: () => {
-          updatePersistedState<boolean>(SIDEBAR_FLAT_MODE_KEY, (prev) => !prev, false);
+          const flat = getUserPreferences().ui?.sidebarFlatMode ?? false;
+          updateUserPreferences({ ui: { sidebarFlatMode: !flat } });
         },
       },
       {
         id: CommandIds.navToggleTerminalBadge(),
         title: "Toggle Terminal Badge",
         subtitle: `Current: ${
-          normalizeTerminalBadgeConfig(
-            readPersistedState(TERMINAL_BADGE_CONFIG_KEY, DEFAULT_TERMINAL_BADGE_CONFIG)
-          ).enabled
+          normalizeTerminalBadgeConfig(getUserPreferences().appearance?.terminalBadgeConfig).enabled
             ? "Shown"
             : "Hidden"
         }`,
         section: section.navigation,
         keywords: ["terminal", "badge", "watermark", "overlay", "workspace", "tab"],
         run: () => {
-          updatePersistedState<TerminalBadgeConfig>(
-            TERMINAL_BADGE_CONFIG_KEY,
-            (prev) => {
-              const config = normalizeTerminalBadgeConfig(prev);
-              return { ...config, enabled: !config.enabled };
-            },
-            DEFAULT_TERMINAL_BADGE_CONFIG
+          const config = normalizeTerminalBadgeConfig(
+            getUserPreferences().appearance?.terminalBadgeConfig
           );
+          updateUserPreferences({
+            appearance: { terminalBadgeConfig: { ...config, enabled: !config.enabled } },
+          });
         },
       },
     ];
@@ -828,15 +1052,14 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     if (wsId) {
       const canReviewDiffs = hasWorkspaceRepository(p.workspaceMetadata.get(wsId));
       list.push(
-        // Generic per-tab "Hide/Show <Name>" commands are only for optional tabs.
-        // Default-layout tabs (Stats/Review/Instructions) are auto-restored by
-        // the layout migration, so exposing hide commands for them would be a
-        // no-op and obscure the fact that they are meant to be visible by default.
+        // "Hide/Show <Name>" for every tool: no tab is re-added automatically anymore, so
+        // hiding any of them sticks. Experiment-gated tabs are left out (their panel only
+        // exists while the experiment is on), as is Review without a repository.
         ...getOrderedBaseTabIds()
-          .filter((tabId) => {
-            const config = getTabConfig(tabId);
-            return config.inDefaultLayout !== true && config.featureFlag == null;
-          })
+          .filter(
+            (tabId) =>
+              getTabConfig(tabId).featureFlag == null && (canReviewDiffs || tabId !== "review")
+          )
           .map((tabId) => buildToggleTabCommand(wsId, tabId, section.navigation)),
         {
           id: CommandIds.navOpenLogFile(),
@@ -851,32 +1074,87 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             window.open(toFileUrl(logPath), "_blank", "noopener");
           },
         },
+        ...(p.artifactsEnabled === true
+          ? [
+              {
+                id: CommandIds.navOpenArtifacts(),
+                title: "Open Artifacts",
+                section: section.navigation,
+                shortcutHint: formatKeybind(KEYBINDS.OPEN_ARTIFACTS_TAB),
+                keywords: ["artifacts", "preview", "versions"],
+                run: () => openArtifactsTab(wsId),
+              },
+              // One per MCP App view of the workspace (transcript or opened this session): opens
+              // its tab or focuses the one it has, the keyboard path to "Open in tab".
+              // The subtitle carries each call's detail, so several calls of one tool differ.
+              ...appViewActions(wsId, p.selectedWorkspaceState?.messages ?? [], section.navigation),
+              // One per MCP App entry point of an enabled server: opens its app tab (calling
+              // the tool with {}) or focuses the one it has.
+              ...entrypointActions(p.api, wsId, p.mcpAppEntrypoints ?? [], section.navigation),
+              {
+                id: CommandIds.navOpenFileAsArtifact(),
+                title: "Open File as Artifact…",
+                section: section.navigation,
+                keywords: ["artifacts", "pin", "file", "preview"],
+                run: () => undefined,
+                prompt: {
+                  title: "Open File as Artifact",
+                  fields: [
+                    {
+                      type: "text" as const,
+                      name: "path",
+                      label: "File path",
+                      placeholder: "Path inside the workspace, e.g. docs/report.md",
+                      validate: (v: string) => (!v.trim() ? "Path is required" : null),
+                    },
+                  ],
+                  onSubmit: async (vals: Record<string, string>) => {
+                    if (!p.api) return;
+                    // Not trimmed: edge whitespace is part of the file name (validate only
+                    // refuses blank input).
+                    await pinAndOpenArtifact(p.api, wsId, vals.path);
+                  },
+                },
+              },
+            ]
+          : []),
         {
           id: CommandIds.navRightSidebarFocusTerminal(),
           title: "Right Sidebar: Focus Terminal",
           section: section.navigation,
-          run: () =>
-            updateRightSidebarLayout(wsId, (s) => {
-              const found = findFirstTerminalSessionTab(s.root);
-              if (!found) return s;
-              return selectTabInTabset(
-                setFocusedTabset(s, found.tabsetId),
-                found.tabsetId,
-                found.tab
-              );
-            }),
+          run: () => focusExistingTerminalTab(wsId),
         },
         {
           id: CommandIds.navRightSidebarSplitHorizontal(),
           title: "Right Sidebar: Split Horizontally",
           section: section.navigation,
-          run: () => updateRightSidebarLayout(wsId, (s) => splitFocusedTabset(s, "horizontal")),
+          run: () => {
+            updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+            updateRightSidebarLayout(wsId, (s) => splitFocusedTabset(s, "horizontal"));
+          },
         },
         {
           id: CommandIds.navRightSidebarSplitVertical(),
           title: "Right Sidebar: Split Vertically",
           section: section.navigation,
-          run: () => updateRightSidebarLayout(wsId, (s) => splitFocusedTabset(s, "vertical")),
+          run: () => {
+            updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+            updateRightSidebarLayout(wsId, (s) => splitFocusedTabset(s, "vertical"));
+          },
+        },
+        {
+          id: CommandIds.navRightSidebarNewTab(),
+          title: "Right Sidebar: New Tab",
+          section: section.navigation,
+          shortcutHint: formatKeybind(KEYBINDS.NEW_SIDEBAR_TAB),
+          keywords: ["new tab", "launcher", "tools", "open"],
+          visible: isRightSidebarShown,
+          // The sidebar opens it, as for "+" and the shortcut, so the launcher also takes focus.
+          run: () => {
+            window.dispatchEvent(
+              createCustomEvent(CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB, { workspaceId: wsId })
+            );
+          },
         },
         {
           id: CommandIds.navRightSidebarAddTool(),
@@ -921,19 +1199,22 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               // "terminal" is now an alias for "focus an existing terminal session tab".
               // Creating new terminal sessions is handled in the main UI ("+" button).
               if (tool === "terminal") {
-                updateRightSidebarLayout(wsId, (s) => {
-                  const found = findFirstTerminalSessionTab(s.root);
-                  if (!found) return s;
-                  return selectTabInTabset(
-                    setFocusedTabset(s, found.tabsetId),
-                    found.tabsetId,
-                    found.tab
-                  );
-                });
+                focusExistingTerminalTab(wsId);
                 return;
               }
 
-              updateRightSidebarLayout(wsId, (s) => addToolToFocusedTabset(s, tool));
+              // Same as picking the tool in the focused pane's New tab: it takes the New tab's
+              // place, or is selected where it is already open.
+              updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+              updateRightSidebarLayout(wsId, (s) => openToolFromNewTab(s, s.focusedTabsetId, tool));
+              // While the sidebar is hidden (phones) that tab cannot be seen, so WorkspaceMenuBar
+              // shows it in the full-screen sidebar; with the sidebar visible it ignores the event.
+              // "costs" is the Stats tab's id.
+              if (tool === "costs") {
+                window.dispatchEvent(
+                  createCustomEvent(CUSTOM_EVENTS.OPEN_STATS_DIALOG, { workspaceId: wsId })
+                );
+              }
             },
           },
         }
@@ -993,7 +1274,16 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               },
             ],
             onSubmit: async (vals) => {
-              await p.onCaptureLayoutSlot?.(selected.workspaceId, slot, vals.name.trim());
+              const result = await p.onCaptureLayoutSlot?.(
+                selected.workspaceId,
+                slot,
+                vals.name.trim()
+              );
+              // The palette has already closed and ignores the submit promise, so a toast is the
+              // only way the user learns the capture was refused.
+              if (result && !result.success) {
+                showCommandFeedbackToast({ type: "error", message: result.error });
+              }
             },
           },
         });
@@ -1047,6 +1337,8 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
 
     const api = p.api;
     const goal = p.selectedWorkspaceState?.goal ?? null;
+    // Without loaded workspace state the displayed goal is unknown (not "no goal"): read it.
+    const intendedGoalId = p.selectedWorkspaceState == null ? undefined : intendedGoalIdOf(goal);
     const list: CommandAction[] = [
       {
         id: CommandIds.goalSetObjective(),
@@ -1118,11 +1410,16 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               showUnpricedCurrentModelGoalFeedback();
               return;
             }
-            const ok = await requireGoalSetSuccess(api, workspaceId, {
-              objective: intent.objective,
-              budgetCents: intent.budgetCents,
-              ...(intent.turnCap != null ? { turnCap: intent.turnCap } : {}),
-            });
+            const ok = await requireGoalSetSuccess(
+              api,
+              workspaceId,
+              {
+                objective: intent.objective,
+                budgetCents: intent.budgetCents,
+                ...(intent.turnCap != null ? { turnCap: intent.turnCap } : {}),
+              },
+              intendedGoalId
+            );
             if (!ok) return;
             openGoalPanel(workspaceId);
           },
@@ -1140,7 +1437,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         keywords: ["target", "objective"],
         run: async () => {
           assert(api, "Goal palette actions require a connected backend");
-          await requireGoalSetSuccess(api, workspaceId, { status: "paused" });
+          await requireGoalSetSuccess(api, workspaceId, { status: "paused" }, intendedGoalId);
         },
       });
     }
@@ -1153,14 +1450,14 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         keywords: ["target", "objective"],
         run: async () => {
           assert(api, "Goal palette actions require a connected backend");
-          await requireGoalSetSuccess(api, workspaceId, { status: "active" });
+          await requireGoalSetSuccess(api, workspaceId, { status: "active" }, intendedGoalId);
         },
       });
     }
 
     if (
       !isPendingGoalPersistence &&
-      (goal?.status === "active" || goal?.status === "budget_limited")
+      (goal?.status === "active" || goal?.status === "paused" || goal?.status === "budget_limited")
     ) {
       list.push({
         id: CommandIds.goalMarkComplete(),
@@ -1183,10 +1480,12 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             assert(api, "Goal palette actions require a connected backend");
             const completionSummary = values.summary.trim();
             assert(completionSummary.length > 0, "Completion summary is required");
-            const ok = await requireGoalSetSuccess(api, workspaceId, {
-              status: "complete",
-              completionSummary,
-            });
+            const ok = await requireGoalSetSuccess(
+              api,
+              workspaceId,
+              { status: "complete", completionSummary },
+              intendedGoalId
+            );
             if (!ok) return;
             openGoalPanel(workspaceId);
           },
@@ -1343,6 +1642,23 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         },
       });
       list.push({
+        id: CommandIds.chatFocusBackgroundProcesses(),
+        title: "Focus Background Processes",
+        subtitle: "Arrows select, Enter shows output, Backspace terminates",
+        section: section.chat,
+        shortcutHint: formatKeybind(KEYBINDS.FOCUS_BACKGROUND_PROCESSES),
+        run: () => {
+          const request = createCustomEvent(CUSTOM_EVENTS.FOCUS_BACKGROUND_PROCESSES, {
+            workspaceId: id,
+            handled: false,
+          });
+          window.dispatchEvent(request);
+          if (!request.detail.handled) {
+            showCommandFeedbackToast({ type: "error", message: NO_BACKGROUND_PROCESSES_MESSAGE });
+          }
+        },
+      });
+      list.push({
         id: CommandIds.chatClearTimingStats(),
         title: "Clear Timing Stats",
         subtitle: "Reset session timing data for this workspace",
@@ -1398,6 +1714,13 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     const providerOptionRoute = providerOptionGateModel
       ? p.getRouteForModel?.(normalizeToCanonical(providerOptionGateModel))
       : undefined;
+    // Fast and Ultrafast are one mutually exclusive tier preference, so both actions report the
+    // same current tier instead of each calling the other's active tier "Standard".
+    const premiumTierLabel = p.getFastMode()
+      ? "Fast — faster responses at higher cost"
+      : p.getUltrafastMode()
+        ? "Ultrafast — fastest responses, highest cost"
+        : "Standard";
     const fastModeAction: CommandAction | null =
       p.providersConfig != null &&
       getFastModeProvider(providerOptionGateModel ?? "", {
@@ -1407,10 +1730,25 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         ? {
             id: CommandIds.toggleFastMode(),
             title: "Toggle Fast Mode",
-            subtitle: `Current: ${p.getFastMode() ? "Fast — faster responses at higher cost" : "Standard"}`,
+            subtitle: `Current: ${premiumTierLabel}`,
             section: section.mode,
             shortcutHint: formatKeybind(KEYBINDS.TOGGLE_FAST_MODE),
             run: p.onToggleFastMode,
+          }
+        : null;
+    const ultrafastModeAction: CommandAction | null =
+      p.providersConfig != null &&
+      ultrafastModeAvailable(providerOptionGateModel ?? "", {
+        providersConfig: p.providersConfig,
+        resolvedRouteProvider: providerOptionRoute,
+      })
+        ? {
+            id: CommandIds.toggleUltrafastMode(),
+            title: "Toggle Ultrafast Mode",
+            subtitle: `Current: ${premiumTierLabel}`,
+            section: section.mode,
+            shortcutHint: formatKeybind(KEYBINDS.TOGGLE_ULTRAFAST_MODE),
+            run: p.onToggleUltrafastMode,
           }
         : null;
     // The picker rows are the only pointer path to Auto; the model-cycle and thinking-step
@@ -1533,10 +1871,22 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       if (fastModeAction) {
         list.push(fastModeAction);
       }
+      if (ultrafastModeAction) list.push(ultrafastModeAction);
+      const computerUse = p.computerUse;
+      if (computerUse != null) {
+        list.push({
+          id: CommandIds.toggleComputerUse(),
+          title: computerUse.enabled ? "Turn Off Computer Use" : "Turn On Computer Use",
+          subtitle: "Let agents in this workspace see the screen and use the mouse and keyboard",
+          section: section.mode,
+          shortcutHint: formatKeybind(KEYBINDS.TOGGLE_COMPUTER_USE),
+          run: computerUse.onToggle,
+        });
+      }
 
-      // Pro reasoning mode is only meaningful for models that support it
-      // on routes that deliver the native provider option (direct OpenAI or
-      // Coder OpenAI instances) with the Responses wire format; hide the action
+      // Pro and Cyber reasoning modes are only meaningful for models that support them
+      // on routes that deliver the native provider option (direct OpenAI, plus
+      // Coder OpenAI instances for Pro) with the Responses wire format; hide the actions
       // elsewhere to avoid inert toggles. Gate on the chat input's persisted selection —
       // that is the model the NEXT send will use — and only fall back to the
       // activity snapshot's currentModel (last streamed model, stale after a
@@ -1544,24 +1894,45 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       // Pro row and relies on this palette action being reachable before the
       // first send with the newly selected model.
       const proGateModelString = providerOptionGateModel;
-      const currentModelRoute = providerOptionRoute;
-      if (
-        openaiProModeAvailable(proGateModelString ?? "", {
-          providersConfig: p.providersConfig,
-          resolvedRouteProvider: currentModelRoute,
-          effectiveRouteProvider: proGateModelString
-            ? p.getEffectiveRouteForModel?.(proGateModelString)
-            : undefined,
-        })
-      ) {
-        const proActive = p.getReasoningMode(workspaceId) === "pro";
+      const reasoningModeGate = {
+        providersConfig: p.providersConfig,
+        resolvedRouteProvider: providerOptionRoute,
+        effectiveRouteProvider: proGateModelString
+          ? p.getEffectiveRouteForModel?.(proGateModelString)
+          : undefined,
+      };
+      const proModeAvailable = openaiProModeAvailable(proGateModelString ?? "", reasoningModeGate);
+      const cyberModeAvailable = openaiCyberModeAvailable(
+        proGateModelString ?? "",
+        reasoningModeGate
+      );
+      const currentReasoningMode = p.getReasoningMode(workspaceId);
+      // Pro and Cyber share one mode value, so each command reports whichever is in effect.
+      const currentReasoningLabel =
+        currentReasoningMode === "pro"
+          ? "Pro — slower, more thorough"
+          : currentReasoningMode === "cyber" && cyberModeAvailable
+            ? "Cyber (OpenAI Daybreak access program)"
+            : "Standard";
+      if (proModeAvailable) {
         list.push({
           id: CommandIds.toggleProReasoning(),
           title: "Toggle Pro Reasoning Mode",
-          subtitle: `Current: ${proActive ? "Pro — slower, more thorough" : "Standard"}`,
+          subtitle: `Current: ${currentReasoningLabel}`,
           section: section.mode,
           run: () => {
-            p.onToggleReasoningMode(workspaceId);
+            p.onToggleReasoningMode(workspaceId, "pro");
+          },
+        });
+      }
+      if (cyberModeAvailable) {
+        list.push({
+          id: CommandIds.toggleCyberReasoning(),
+          title: "Toggle Cyber Mode",
+          subtitle: `Current: ${currentReasoningLabel}`,
+          section: section.mode,
+          run: () => {
+            p.onToggleReasoningMode(workspaceId, "cyber");
           },
         });
       }
@@ -1569,6 +1940,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       // Creation composers use their project-scoped preferences before a workspace exists.
       list.push(...autoRoutingActions);
       if (fastModeAction) list.push(fastModeAction);
+      if (ultrafastModeAction) list.push(ultrafastModeAction);
     }
 
     return list;
@@ -1589,6 +1961,123 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       },
     },
   ]);
+
+  // Report slowness (experiment perfFlightRecorder). App.tsx runs this same action for
+  // the keyboard shortcut, so hiding it here also turns the shortcut off.
+  if (p.perfFlightRecorderEnabled) {
+    actions.push(() => [
+      {
+        id: CommandIds.perfReportSlowness(),
+        title: "Report slowness",
+        subtitle: "Save a local performance report folder",
+        section: section.help,
+        keywords: ["perf", "performance", "slow", "lag", "report", "profile"],
+        shortcutHint: formatKeybind(KEYBINDS.REPORT_SLOWNESS),
+        run: async () => {
+          if (!p.api) {
+            showCommandFeedbackToast({
+              type: "error",
+              title: "Report slowness failed",
+              message: "Not connected to the Xum backend.",
+            });
+            return;
+          }
+          // A repeat press while a report is being written does nothing: the toast host
+          // shows one toast, so the backend's "in progress" refusal would be replaced by
+          // the pending report's result a moment later anyway.
+          if (reportSlownessRunning) return;
+          reportSlownessRunning = true;
+          try {
+            const report = await p.api.perfReports.create();
+            showCommandFeedbackToast({
+              type: "success",
+              message: report.revealed
+                ? `Saved slowness report to ${report.dir} and opened it in your file manager.`
+                : `Saved slowness report to ${report.dir}`,
+              // In `xum server` the toast is the only place the path appears.
+              copyText: report.dir,
+            });
+          } catch (error) {
+            showCommandFeedbackToast({
+              type: "error",
+              title: "Report slowness failed",
+              message: getErrorMessage(error),
+            });
+          } finally {
+            reportSlownessRunning = false;
+          }
+        },
+      },
+    ]);
+  }
+
+  // Session tapes (experiment): only counts and the folder path are shown, never tape content.
+  if (p.sessionTapesEnabled === true) {
+    const api = p.api;
+    const notConnected = () =>
+      showCommandFeedbackToast({ type: "error", message: "Not connected to the Xum backend." });
+    actions.push(() => [
+      {
+        id: CommandIds.sessionTapesSave(),
+        title: "Save open session tapes",
+        section: section.help,
+        keywords: ["session tapes", "perf", "record", "finalize"],
+        shortcutHint: formatKeybind(KEYBINDS.SAVE_SESSION_TAPES),
+        run: async () => {
+          if (!api) return notConnected();
+          if (sessionTapesSaveRunning) return;
+          sessionTapesSaveRunning = true;
+          try {
+            const { written, failed, dir } = await api.sessionTapes.saveOpen();
+            const saved = `Saved ${written} session ${written === 1 ? "tape" : "tapes"} to ${dir}`;
+            if (failed.length > 0) {
+              // Name each failed tape and why, so "nothing was open" is never confused with
+              // "the write failed" (#5609). Error toasts stay until dismissed.
+              const failures = failed.map((f) => `${f.tape} (${f.error})`).join(", ");
+              showCommandFeedbackToast({
+                type: "error",
+                message: `${saved}. Could not write ${failed.length}: ${failures}`,
+              });
+              return;
+            }
+            showCommandFeedbackToast({
+              type: "success",
+              message: written === 0 ? `No open session tapes to save. Folder: ${dir}` : saved,
+              duration: SESSION_TAPES_PATH_TOAST_MS,
+            });
+          } catch (error) {
+            showCommandFeedbackToast({
+              type: "error",
+              message: `Could not save session tapes: ${getErrorMessage(error)}`,
+            });
+          } finally {
+            sessionTapesSaveRunning = false;
+          }
+        },
+      },
+      {
+        id: CommandIds.sessionTapesReveal(),
+        title: "Reveal session tapes folder",
+        section: section.help,
+        keywords: ["session tapes", "perf", "folder", "open"],
+        shortcutHint: formatKeybind(KEYBINDS.REVEAL_SESSION_TAPES),
+        run: async () => {
+          if (!api) return notConnected();
+          try {
+            const { dir, revealed } = await api.sessionTapes.revealFolder();
+            showCommandFeedbackToast({
+              type: "success",
+              // Server mode cannot open a folder on the user's machine: show where it is.
+              message: revealed ? `Opened ${dir}` : `Session tapes folder: ${dir}`,
+              duration: revealed ? undefined : SESSION_TAPES_PATH_TOAST_MS,
+            });
+          } catch (error) {
+            showCommandFeedbackToast({ type: "error", message: getErrorMessage(error) });
+          }
+        },
+      },
+    ]);
+  }
 
   // Updates: the About dialog owns the controls and shows status, blockers, and errors, so each
   // command starts the operation and opens the dialog.
@@ -1808,7 +2297,12 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           {
             id: CommandIds.settingsToggleKeepScreenAwake(),
             title: "Toggle Keep Screen Awake",
-            subtitle: "Prevent display sleep while agents are working",
+            // Show the current state like the local-state toggles do (#5791). Until the config
+            // has loaded, describe the toggle instead of guessing a state.
+            subtitle: describeConfigToggle(
+              p.getKeepScreenAwake?.(),
+              "Prevent display sleep while agents are working"
+            ),
             section: section.settings,
             keywords: ["awake", "sleep", "screen", "display", "lock", "power", "caffeinate"],
             run: async () => {
@@ -1820,6 +2314,28 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           },
         ]
   );
+
+  // Keyboard route for the Settings → Providers → Bash commands switch.
+  actions.push(() => [
+    {
+      id: CommandIds.settingsToggleBashAiProxy(),
+      title: "Toggle Count AI Calls from Bash Commands",
+      subtitle: "Route bash commands' Anthropic and OpenAI calls through Xum to count their cost",
+      section: section.settings,
+      keywords: ["bash", "proxy", "cost", "usage", "anthropic", "openai", "billing"],
+      run: async () => {
+        if (!p.api) return;
+        // The flag lives in config.json (not localStorage), so read the current value first.
+        const cfg = await p.api.config.getConfig();
+        await p.api.config.updateBashAiProxyEnabled({ enabled: !cfg.bashAiProxyEnabled });
+      },
+    },
+  ]);
+
+  // MCP App view-domain approvals: the palette path to Settings' Revoke.
+  // Not behind the artifacts experiment: Settings lists stored approvals with Revoke either way,
+  // so the palette keeps the keyboard path to them.
+  actions.push(() => [revokeViewDomainsAction(p.api, section.settings)]);
 
   // Settings
   if (p.onOpenSettings) {
@@ -1881,332 +2397,399 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             },
           ]
         : []),
-      ...(p.agentPluginsEnabled
-        ? ([
+      {
+        id: CommandIds.settingsOpenSection("plugins"),
+        title: "Settings: Plugins",
+        subtitle: "Install and manage Agent Plugins",
+        section: section.settings,
+        keywords: ["plugin", "install", "agent", "skill", "mcp", "update"],
+        run: () => openSettings("plugins"),
+      },
+      {
+        id: CommandIds.pluginsInstall(),
+        title: "Install Agent Plugin…",
+        subtitle: "Paste a git URL or owner/repo",
+        section: section.settings,
+        keywords: ["plugin", "install", "add", "git", "clone"],
+        run: () => {
+          // Open the section with the add-plugin form already expanded.
+          publishPluginsSectionIntent({ type: "open-add-panel" });
+          openSettings("plugins");
+        },
+      },
+      {
+        id: CommandIds.pluginsManageComponents(),
+        title: "Manage Plugin Components…",
+        subtitle: "Choose which installed skills and MCP servers are imported",
+        section: section.settings,
+        keywords: ["plugin", "manage", "add", "remove", "import", "skill", "mcp", "components"],
+        run: () => undefined,
+        prompt: {
+          title: "Manage Plugin Components",
+          fields: [
             {
-              id: CommandIds.settingsOpenSection("plugins"),
-              title: "Settings: Plugins",
-              subtitle: "Install and manage Agent Plugins",
-              section: section.settings,
-              keywords: ["plugin", "install", "agent", "skill", "mcp", "update"],
-              run: () => openSettings("plugins"),
-            },
-            {
-              id: CommandIds.pluginsInstall(),
-              title: "Install Agent Plugin…",
-              subtitle: "Paste a git URL or owner/repo",
-              section: section.settings,
-              keywords: ["plugin", "install", "add", "git", "clone"],
-              run: () => {
-                // Open the section with the add-plugin form already expanded.
-                publishPluginsSectionIntent({ type: "open-add-panel" });
-                openSettings("plugins");
+              type: "select",
+              name: "pluginName",
+              label: "Installed managed plugin",
+              placeholder: "Search installed plugins…",
+              getOptions: async () => {
+                const result = await p.api?.agentPlugins.list();
+                return result?.success
+                  ? result.data
+                      .filter((item) => item.managed && item.present)
+                      .map((item) => ({
+                        id: item.name,
+                        label: item.name,
+                        keywords: [item.name, item.location],
+                      }))
+                  : [];
               },
             },
+          ],
+          onSubmit: (values) => {
+            publishPluginsSectionIntent({
+              type: "manage-components",
+              name: values.pluginName,
+            });
+            openSettings("plugins");
+          },
+        },
+      },
+      {
+        id: CommandIds.pluginsReviewHooks(),
+        title: "Review Plugin Hooks…",
+        subtitle: "Trust or turn off a plugin's hooks.json hooks",
+        section: section.settings,
+        keywords: ["plugin", "hooks", "trust", "review", "turn off", "codex"],
+        run: () => undefined,
+        prompt: {
+          title: "Review Plugin Hooks",
+          fields: [
             {
-              id: CommandIds.pluginsManageComponents(),
-              title: "Manage Plugin Components…",
-              subtitle: "Choose which installed skills and MCP servers are imported",
-              section: section.settings,
-              keywords: [
-                "plugin",
-                "manage",
-                "add",
-                "remove",
-                "import",
-                "skill",
-                "mcp",
-                "components",
-              ],
-              run: () => undefined,
-              prompt: {
-                title: "Manage Plugin Components",
-                fields: [
-                  {
-                    type: "select",
-                    name: "pluginName",
-                    label: "Installed managed plugin",
-                    placeholder: "Search installed plugins…",
-                    getOptions: async () => {
-                      const result = await p.api?.agentPlugins.list();
-                      return result?.success
-                        ? result.data
-                            .filter((item) => item.managed && item.present)
-                            .map((item) => ({
-                              id: item.name,
-                              label: item.name,
-                              keywords: [item.name, item.location],
-                            }))
-                        : [];
-                    },
-                  },
-                ],
-                onSubmit: (values) => {
-                  publishPluginsSectionIntent({
-                    type: "manage-components",
-                    name: values.pluginName,
-                  });
-                  openSettings("plugins");
-                },
+              type: "select",
+              name: "pluginName",
+              label: "Installed managed plugin",
+              placeholder: "Search installed plugins…",
+              getOptions: async () => {
+                const result = await p.api?.agentPlugins.list();
+                return result?.success
+                  ? result.data
+                      .filter((item) => item.managed && item.present)
+                      .map((item) => ({
+                        id: item.name,
+                        label: item.name,
+                        keywords: [item.name, item.location],
+                      }))
+                  : [];
               },
             },
+          ],
+          onSubmit: (values) => {
+            publishPluginsSectionIntent({ type: "review-hooks", name: values.pluginName });
+            openSettings("plugins");
+          },
+        },
+      },
+      {
+        id: CommandIds.pluginsReviewComponents(),
+        title: "Review Plugin Components…",
+        subtitle: "Approve skills and MCP servers that do not load until you review them",
+        section: section.settings,
+        keywords: ["plugin", "components", "review", "approve", "skills", "mcp", "consent"],
+        run: () => undefined,
+        prompt: {
+          title: "Review Plugin Components",
+          fields: [
             {
-              id: CommandIds.pluginsUninstall(),
-              title: "Uninstall Agent Plugin…",
-              section: section.settings,
-              keywords: ["plugin", "uninstall", "remove", "delete"],
-              run: () => undefined,
-              prompt: {
-                title: "Uninstall Agent Plugin",
-                fields: [
-                  {
-                    type: "select",
-                    name: "pluginName",
-                    label: "Managed plugin",
-                    placeholder: "Search installed plugins…",
-                    getOptions: async () => {
-                      const result = await p.api?.agentPlugins.list();
-                      if (!result?.success) {
-                        return [];
-                      }
-                      return result.data
-                        .filter((item) => item.managed)
-                        .map((item) => ({
-                          id: item.name,
-                          label: item.version ? `${item.name} (v${item.version})` : item.name,
-                          keywords: [item.name, item.location],
-                        }));
-                    },
-                  },
-                ],
-                onSubmit: (values) => {
-                  // Route through the section's confirmation flow (plugin-data
-                  // checkbox, explicit destructive button) — the palette never
-                  // uninstalls directly.
-                  publishPluginsSectionIntent({
-                    type: "confirm-uninstall",
-                    name: values.pluginName,
-                  });
-                  openSettings("plugins");
-                },
+              type: "select",
+              name: "pluginName",
+              label: "Plugin that needs review",
+              placeholder: "Search plugins that need review…",
+              getOptions: () => pluginsNeedingReviewOptions(p.api),
+            },
+          ],
+          onSubmit: (values) => {
+            publishPluginsSectionIntent({ type: "review-components", name: values.pluginName });
+            openSettings("plugins");
+          },
+        },
+      },
+      {
+        id: CommandIds.pluginsUninstall(),
+        title: "Uninstall Agent Plugin…",
+        section: section.settings,
+        keywords: ["plugin", "uninstall", "remove", "delete"],
+        run: () => undefined,
+        prompt: {
+          title: "Uninstall Agent Plugin",
+          fields: [
+            {
+              type: "select",
+              name: "pluginName",
+              label: "Managed plugin",
+              placeholder: "Search installed plugins…",
+              getOptions: async () => {
+                const result = await p.api?.agentPlugins.list();
+                if (!result?.success) {
+                  return [];
+                }
+                return result.data
+                  .filter((item) => item.managed)
+                  .map((item) => ({
+                    id: item.name,
+                    label: item.version ? `${item.name} (v${item.version})` : item.name,
+                    keywords: [item.name, item.location],
+                  }));
               },
             },
-            {
-              id: CommandIds.pluginsCheckUpdates(),
-              title: "Check for Plugin Updates",
-              section: section.settings,
-              keywords: ["plugin", "update", "check", "outdated"],
-              run: async () => {
-                const result = await p.api?.agentPlugins.checkUpdates();
-                if (!result) return;
-                if (!result.success) {
-                  showCommandFeedbackToast({ type: "error", message: result.error });
-                  return;
-                }
-                const updatable = result.data.filter(
-                  (check) => check.status === "update-available" || check.status === "tag-moved"
-                );
-                // Per-plugin failures ride inside a successful result; an
-                // unreachable remote is an unknown state, not "up to date" —
-                // and it stays in the summary even when updates were found.
-                const failed = result.data.filter((check) => check.status === "error");
-                const summary: string[] = [];
-                if (updatable.length > 0) {
-                  summary.push(
-                    `Updates available: ${updatable.map((check) => check.name).join(", ")}`
-                  );
-                }
-                if (failed.length > 0) {
-                  summary.push(
-                    `Update check failed for ${failed.map((check) => check.name).join(", ")}`
-                  );
-                }
-                // A mounted section keeps its own stale updateChecks map;
-                // tell it to re-query so badges match the toast.
-                publishPluginsSectionIntent({ type: "refresh" });
-                if (summary.length === 0) {
-                  showCommandFeedbackToast({
-                    type: "success",
-                    message: "All plugins are up to date.",
-                  });
-                  return;
-                }
-                showCommandFeedbackToast({
-                  type: failed.length > 0 ? "error" : "success",
-                  message: summary.join(". "),
-                });
-                openSettings("plugins");
-              },
-            },
-            {
-              id: CommandIds.pluginsUpdateAll(),
-              title: "Update All Plugins",
-              subtitle: "Apply pending plugin updates",
-              section: section.settings,
-              keywords: ["plugin", "update", "upgrade", "all"],
-              run: async () => {
-                const api = p.api;
-                if (!api) return;
-                const checks = await api.agentPlugins.checkUpdates();
-                if (!checks.success) {
-                  showCommandFeedbackToast({ type: "error", message: checks.error });
-                  return;
-                }
-                // Moved tags are excluded from the bulk apply: tags are
-                // supposed to be immutable, so a moved tag warrants the
-                // section's per-plugin review — but it must never read as
-                // "up to date", so it stays in the summary below.
-                const updatable = checks.data.filter(
-                  (check) => check.status === "update-available"
-                );
-                const tagMoved = checks.data
-                  .filter((check) => check.status === "tag-moved")
-                  .map((check) => check.name);
-                // Unreachable remotes are an unknown state, never "up to date" —
-                // and they must stay visible even when other updates succeed.
-                const checkFailures = checks.data
-                  .filter((check) => check.status === "error")
-                  .map((check) => check.name);
+          ],
+          onSubmit: (values) => {
+            // Route through the section's confirmation flow (plugin-data
+            // checkbox, explicit destructive button) — the palette never
+            // uninstalls directly.
+            publishPluginsSectionIntent({
+              type: "confirm-uninstall",
+              name: values.pluginName,
+            });
+            openSettings("plugins");
+          },
+        },
+      },
+      {
+        id: CommandIds.pluginsCheckUpdates(),
+        title: "Check for Plugin Updates",
+        section: section.settings,
+        keywords: ["plugin", "update", "check", "outdated"],
+        run: async () => {
+          const result = await p.api?.agentPlugins.checkUpdates();
+          if (!result) return;
+          if (!result.success) {
+            showCommandFeedbackToast({ type: "error", message: result.error });
+            return;
+          }
+          const updatable = result.data.filter(
+            (check) => check.status === "update-available" || check.status === "tag-moved"
+          );
+          // Per-plugin failures ride inside a successful result; an
+          // unreachable remote is an unknown state, not "up to date" —
+          // and it stays in the summary even when updates were found.
+          const failed = result.data.filter((check) => check.status === "error");
+          const summary: string[] = [];
+          if (updatable.length > 0) {
+            summary.push(`Updates available: ${updatable.map((check) => check.name).join(", ")}`);
+          }
+          if (failed.length > 0) {
+            summary.push(`Update check failed for ${failed.map((check) => check.name).join(", ")}`);
+          }
+          // A mounted section keeps its own stale updateChecks map;
+          // tell it to re-query so badges match the toast.
+          publishPluginsSectionIntent({ type: "refresh" });
+          if (summary.length === 0) {
+            showCommandFeedbackToast({
+              type: "success",
+              message: "All plugins are up to date.",
+            });
+            return;
+          }
+          showCommandFeedbackToast({
+            type: failed.length > 0 ? "error" : "success",
+            message: summary.join(". "),
+          });
+          openSettings("plugins");
+        },
+      },
+      {
+        id: CommandIds.pluginsUpdateAll(),
+        title: "Update All Plugins",
+        subtitle: "Apply pending plugin updates",
+        section: section.settings,
+        keywords: ["plugin", "update", "upgrade", "all"],
+        run: async () => {
+          const api = p.api;
+          if (!api) return;
+          const checks = await api.agentPlugins.checkUpdates();
+          if (!checks.success) {
+            showCommandFeedbackToast({ type: "error", message: checks.error });
+            return;
+          }
+          // Moved tags are excluded from the bulk apply: tags are
+          // supposed to be immutable, so a moved tag warrants the
+          // section's per-plugin review — but it must never read as
+          // "up to date", so it stays in the summary below.
+          const updatable = checks.data.filter((check) => check.status === "update-available");
+          const tagMoved = checks.data
+            .filter((check) => check.status === "tag-moved")
+            .map((check) => check.name);
+          // Unreachable remotes are an unknown state, never "up to date" —
+          // and they must stay visible even when other updates succeed.
+          const checkFailures = checks.data
+            .filter((check) => check.status === "error")
+            .map((check) => check.name);
 
-                const updateFailures: string[] = [];
-                const updatedNames: string[] = [];
-                for (const check of updatable) {
-                  const result = await api.agentPlugins.update({ name: check.name });
-                  if (result.success) {
-                    updatedNames.push(check.name);
-                  } else {
-                    updateFailures.push(`${check.name}: ${result.error}`);
-                  }
-                }
-                // A mounted section only re-queries from its own handlers, so
-                // tell it the state changed under it. This runs even when no
-                // branch update applied: the fresh check may have discovered
-                // moved tags or per-plugin errors the section should show.
-                publishPluginsSectionIntent({ type: "refresh" });
-                if (updatedNames.length > 0) {
-                  // Mounted composers cache contributed slash-command/skill
-                  // descriptors; an update can change them without a remount.
-                  publishAgentPluginsMutated();
-                }
+          const updateFailures: string[] = [];
+          const updatedNames: string[] = [];
+          for (const check of updatable) {
+            const result = await api.agentPlugins.update({ name: check.name });
+            if (result.success) {
+              updatedNames.push(check.name);
+            } else {
+              updateFailures.push(`${check.name}: ${result.error}`);
+            }
+          }
+          // A mounted section only re-queries from its own handlers, so
+          // tell it the state changed under it. This runs even when no
+          // branch update applied: the fresh check may have discovered
+          // moved tags or per-plugin errors the section should show.
+          publishPluginsSectionIntent({ type: "refresh" });
+          if (updatedNames.length > 0) {
+            // Mounted composers cache contributed slash-command/skill
+            // descriptors; an update can change them without a remount.
+            publishAgentPluginsMutated();
+          }
 
-                const summary: string[] = [];
-                if (updatedNames.length > 0) {
-                  summary.push(`Updated ${updatedNames.join(", ")}`);
-                }
-                if (updateFailures.length > 0) {
-                  summary.push(`Update failed — ${updateFailures.join("; ")}`);
-                }
-                if (tagMoved.length > 0) {
-                  summary.push(
-                    `Tag moved for ${tagMoved.join(", ")} — review in Settings → Plugins`
-                  );
-                }
-                if (checkFailures.length > 0) {
-                  summary.push(`Update check failed for ${checkFailures.join(", ")}`);
-                }
-                if (summary.length === 0) {
-                  showCommandFeedbackToast({
-                    type: "success",
-                    message: "All plugins are up to date.",
-                  });
-                  return;
-                }
-                showCommandFeedbackToast({
-                  // Anything unexpected taints the toast: a partial success or
-                  // a moved tag must not read as a verified all-clear.
-                  type:
-                    updateFailures.length > 0 || checkFailures.length > 0 || tagMoved.length > 0
-                      ? "error"
-                      : "success",
-                  message: summary.join(". "),
-                });
-                if (tagMoved.length > 0 || checkFailures.length > 0) {
-                  openSettings("plugins");
-                }
-              },
-            },
+          const summary: string[] = [];
+          if (updatedNames.length > 0) {
+            summary.push(`Updated ${updatedNames.join(", ")}`);
+          }
+          if (updateFailures.length > 0) {
+            summary.push(`Update failed — ${updateFailures.join("; ")}`);
+          }
+          if (tagMoved.length > 0) {
+            summary.push(`Tag moved for ${tagMoved.join(", ")} — review in Settings → Plugins`);
+          }
+          if (checkFailures.length > 0) {
+            summary.push(`Update check failed for ${checkFailures.join(", ")}`);
+          }
+          if (summary.length === 0) {
+            showCommandFeedbackToast({
+              type: "success",
+              message: "All plugins are up to date.",
+            });
+            return;
+          }
+          showCommandFeedbackToast({
+            // Anything unexpected taints the toast: a partial success or
+            // a moved tag must not read as a verified all-clear.
+            type:
+              updateFailures.length > 0 || checkFailures.length > 0 || tagMoved.length > 0
+                ? "error"
+                : "success",
+            message: summary.join(". "),
+          });
+          if (tagMoved.length > 0 || checkFailures.length > 0) {
+            openSettings("plugins");
+          }
+        },
+      },
+      {
+        id: CommandIds.pluginsUpdateOne(),
+        title: "Update Agent Plugin…",
+        subtitle: "Apply one plugin's pending update",
+        section: section.settings,
+        keywords: ["plugin", "update", "upgrade", "single", "one"],
+        run: () => undefined,
+        prompt: {
+          title: "Update Agent Plugin",
+          fields: [
             {
-              id: CommandIds.pluginsUpdateOne(),
-              title: "Update Agent Plugin…",
-              subtitle: "Apply one plugin's pending update",
-              section: section.settings,
-              keywords: ["plugin", "update", "upgrade", "single", "one"],
-              run: () => undefined,
-              prompt: {
-                title: "Update Agent Plugin",
-                fields: [
-                  {
-                    type: "select",
-                    name: "pluginName",
-                    label: "Plugin with a pending update",
-                    placeholder: "Search updatable plugins…",
-                    getOptions: async () => {
-                      const checks = await p.api?.agentPlugins.checkUpdates();
-                      if (!checks?.success) {
-                        return [];
-                      }
-                      // Moved tags are updatable here BY DESIGN: bulk update
-                      // excludes them so they get per-plugin review, and this
-                      // selector (with its warning label) is that reviewed,
-                      // keyboard-accessible path.
-                      return checks.data
-                        .filter(
-                          (check) =>
-                            check.status === "update-available" || check.status === "tag-moved"
-                        )
-                        .map((check) => ({
-                          id: check.name,
-                          label:
-                            check.status === "tag-moved"
-                              ? `${check.name} — tag moved (review: tags should be immutable)`
-                              : `${check.name} — update available`,
-                          keywords: [check.name, check.status],
-                        }));
-                    },
-                  },
-                ],
-                onSubmit: async (values) => {
-                  const api = p.api;
-                  if (!api) return;
-                  // Review before applying: an update that changes the
-                  // plugin's capability surface needs the user's consent,
-                  // which only the section's inline review can collect.
-                  const preview = await api.agentPlugins.previewUpdate({
-                    name: values.pluginName,
-                  });
-                  if (!preview.success) {
-                    showCommandFeedbackToast({ type: "error", message: preview.error });
-                    return;
-                  }
-                  if (preview.data.changes.length > 0) {
-                    publishPluginsSectionIntent({ type: "review-update", review: preview.data });
-                    openSettings("plugins");
-                    return;
-                  }
-                  const result = await api.agentPlugins.update({ name: values.pluginName });
-                  // A mounted section keeps its own stale updateChecks map;
-                  // tell it to re-query so badges match the toast.
-                  publishPluginsSectionIntent({ type: "refresh" });
-                  if (result.success) {
-                    // Mounted composers cache contributed slash-command/skill
-                    // descriptors; an update can change them without a remount.
-                    publishAgentPluginsMutated();
-                  }
-                  showCommandFeedbackToast(
-                    result.success
-                      ? { type: "success", message: `Updated ${values.pluginName}.` }
-                      : { type: "error", message: result.error }
-                  );
-                },
+              type: "select",
+              name: "pluginName",
+              label: "Plugin with a pending update",
+              placeholder: "Search updatable plugins…",
+              getOptions: async () => {
+                const checks = await p.api?.agentPlugins.checkUpdates();
+                if (!checks?.success) {
+                  return [];
+                }
+                // Moved tags are updatable here BY DESIGN: bulk update
+                // excludes them so they get per-plugin review, and this
+                // selector (with its warning label) is that reviewed,
+                // keyboard-accessible path.
+                return checks.data
+                  .filter(
+                    (check) => check.status === "update-available" || check.status === "tag-moved"
+                  )
+                  .map((check) => ({
+                    id: check.name,
+                    label:
+                      check.status === "tag-moved"
+                        ? `${check.name} — tag moved (review: tags should be immutable)`
+                        : `${check.name} — update available`,
+                    keywords: [check.name, check.status],
+                  }));
               },
             },
-          ] satisfies CommandAction[])
-        : []),
+          ],
+          onSubmit: async (values) => {
+            const api = p.api;
+            if (!api) return;
+            // Review before applying: an update that changes the
+            // plugin's capability surface needs the user's consent,
+            // which only the section's inline review can collect.
+            const preview = await api.agentPlugins.previewUpdate({
+              name: values.pluginName,
+            });
+            if (!preview.success) {
+              showCommandFeedbackToast({ type: "error", message: preview.error });
+              return;
+            }
+            if (preview.data.changes.length > 0) {
+              publishPluginsSectionIntent({ type: "review-update", review: preview.data });
+              openSettings("plugins");
+              return;
+            }
+            const result = await api.agentPlugins.update({ name: values.pluginName });
+            // A mounted section keeps its own stale updateChecks map;
+            // tell it to re-query so badges match the toast.
+            publishPluginsSectionIntent({ type: "refresh" });
+            if (result.success) {
+              // Mounted composers cache contributed slash-command/skill
+              // descriptors; an update can change them without a remount.
+              publishAgentPluginsMutated();
+            }
+            showCommandFeedbackToast(
+              result.success
+                ? { type: "success", message: `Updated ${values.pluginName}.` }
+                : { type: "error", message: result.error }
+            );
+          },
+        },
+      },
     ]);
   }
 
-  // Coder disconnect: calls the RPC directly (no settings UI needed), so it is
-  // not gated on onOpenSettings like the section-opening commands above.
+  // Coder commands call their RPCs directly (no settings UI needed), so they
+  // are not gated on onOpenSettings like the section-opening commands above.
+  const coderCommand =
+    (
+      failureTitle: string,
+      successMessage: string,
+      operation: (api: APIClient) => Promise<Result<void, string>>
+    ) =>
+    async () => {
+      if (!p.api) {
+        showCommandFeedbackToast({
+          type: "error",
+          title: failureTitle,
+          message: "Xum API not connected.",
+        });
+        return;
+      }
+      try {
+        const result = await operation(p.api);
+        if (!result.success) {
+          showCommandFeedbackToast({ type: "error", title: failureTitle, message: result.error });
+          return;
+        }
+        showCommandFeedbackToast({ type: "success", message: successMessage });
+      } catch (error) {
+        showCommandFeedbackToast({
+          type: "error",
+          title: failureTitle,
+          message: getErrorMessage(error),
+        });
+      }
+    };
   actions.push(() => [
     {
       id: CommandIds.coderDisconnect(),
@@ -2218,78 +2801,35 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       // previously configured deployment URL must stay revocable — the
       // backend revokes against the blob's own issuer.
       visible: () => p.providersConfig?.coder?.coderOauthCredentialStored === true,
-      run: async () => {
-        if (!p.api) {
-          showCommandFeedbackToast({
-            type: "error",
-            title: "Coder Disconnect Failed",
-            message: "Xum API not connected.",
-          });
-          return;
-        }
-        try {
-          const result = await p.api.coderOauth.disconnect();
-          if (!result.success) {
-            showCommandFeedbackToast({
-              type: "error",
-              title: "Coder Disconnect Failed",
-              message: result.error,
-            });
-            return;
-          }
-          showCommandFeedbackToast({
-            type: "success",
-            message: "Coder account disconnected.",
-          });
-        } catch (error) {
-          showCommandFeedbackToast({
-            type: "error",
-            title: "Coder Disconnect Failed",
-            message: getErrorMessage(error),
-          });
-        }
-      },
+      run: coderCommand("Coder Disconnect Failed", "Coder account disconnected.", (api) =>
+        api.coderOauth.disconnect()
+      ),
     },
     {
       id: CommandIds.coderRefreshModels(),
-      title: "Settings: Refresh Coder Models",
-      subtitle: "Re-discover the deployment's AI Gateway providers and models",
+      title: "Settings: Load Coder model catalog",
+      subtitle: "Load or refresh the deployment's AI Gateway providers and model catalogs",
       section: section.settings,
       keywords: ["coder", "models", "refresh", "discover", "gateway", "aibridge"],
       // Gated on routability (not mere credential presence): discovery needs a
       // credential that is valid for the currently effective deployment.
       visible: () => p.providersConfig?.coder?.coderOauthSet === true,
-      run: async () => {
-        if (!p.api) {
-          showCommandFeedbackToast({
-            type: "error",
-            title: "Coder Model Refresh Failed",
-            message: "Xum API not connected.",
-          });
-          return;
-        }
-        try {
-          const result = await p.api.coderOauth.refreshModels();
-          if (!result.success) {
-            showCommandFeedbackToast({
-              type: "error",
-              title: "Coder Model Refresh Failed",
-              message: result.error,
-            });
-            return;
-          }
-          showCommandFeedbackToast({
-            type: "success",
-            message: "Coder model catalog refreshed.",
-          });
-        } catch (error) {
-          showCommandFeedbackToast({
-            type: "error",
-            title: "Coder Model Refresh Failed",
-            message: getErrorMessage(error),
-          });
-        }
-      },
+      run: coderCommand(
+        "Coder Model Catalog Refresh Failed",
+        "Coder model catalog refreshed.",
+        (api) => api.coderOauth.refreshModels()
+      ),
+    },
+    {
+      id: CommandIds.coderRefreshProviders(),
+      title: "Settings: Refresh Coder providers",
+      subtitle: "Re-list the deployment's AI Gateway providers without loading model catalogs",
+      section: section.settings,
+      keywords: ["coder", "providers", "instances", "refresh", "gateway", "routing"],
+      visible: () => p.providersConfig?.coder?.coderOauthSet === true,
+      run: coderCommand("Coder Provider Refresh Failed", "Coder providers refreshed.", (api) =>
+        api.coderOauth.refreshProviders()
+      ),
     },
   ]);
 

@@ -21,6 +21,9 @@ export interface ChatUsageDisplay {
   input: ChatUsageComponent;
   cached: ChatUsageComponent;
   cacheCreate: ChatUsageComponent; // Cache creation tokens (separate billing concept)
+  // Share of cacheCreate.tokens Anthropic wrote at the 1h TTL (billed 2x input instead
+  // of 1.25x). Absent when no response reported a 1h split.
+  cacheCreate1hTokens?: number;
 
   // Output is the part of the output excluding reasoning, so
   // totalOutput = output + reasoning
@@ -60,6 +63,7 @@ export function sumUsageHistory(usageHistory: ChatUsageDisplay[]): ChatUsageDisp
   // by the gateway vs. which were priced from model metadata.
   let anyCostsIncluded = false;
   const serviceTiers = new Set<ChatUsageServiceTier | "standard">();
+  let cacheCreate1hTokens = 0;
 
   const sum: ChatUsageDisplay = {
     input: { tokens: 0, cost_usd: 0 },
@@ -73,6 +77,12 @@ export function sumUsageHistory(usageHistory: ChatUsageDisplay[]): ChatUsageDisp
     if (usage.costsIncluded) anyCostsIncluded = true;
     if (usage.hasUnknownCosts) hasIncompleteCosts = true;
     serviceTiers.add(usage.serviceTier ?? "standard");
+    // Clamp each entry's share to its own writes: a malformed persisted share must not claim
+    // later 5m writes of the same aggregate (the backend sums rows without repricing them first).
+    const share = usage.cacheCreate1hTokens ?? 0;
+    cacheCreate1hTokens += Number.isFinite(share)
+      ? Math.min(usage.cacheCreate.tokens, Math.max(0, share))
+      : 0;
     // Iterate over each component and sum tokens and costs
     const componentKeys: Array<"input" | "cached" | "cacheCreate" | "output" | "reasoning"> = [
       "input",
@@ -91,6 +101,9 @@ export function sumUsageHistory(usageHistory: ChatUsageDisplay[]): ChatUsageDisp
     }
   }
 
+  if (cacheCreate1hTokens > 0) {
+    sum.cacheCreate1hTokens = cacheCreate1hTokens;
+  }
   // Flag if any costs were incomplete/unknown (partial/inaccurate total)
   if (hasIncompleteCosts) {
     sum.hasUnknownCosts = true;

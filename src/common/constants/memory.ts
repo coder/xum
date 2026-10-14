@@ -81,14 +81,17 @@ export const MEMORY_VIEW_MAX_DEPTH = 2;
  * prompt-cache-stable bytes.
  */
 /** Maximum bytes of a single preloaded memory file (longer files are truncated). */
-export const MEMORY_HOT_SET_MAX_ITEM_BYTES = 16 * 1024;
-/** Maximum total bytes of selected hot-memory file content. */
-export const MEMORY_HOT_SET_MAX_TOTAL_BYTES = 48 * 1024;
-/** Maximum tokens consumed by the rendered <hot_memories> block. */
-export const MEMORY_HOT_SET_MAX_TOTAL_TOKENS = 12_000;
+export const MEMORY_HOT_SET_MAX_ITEM_BYTES = 4 * 1024;
+/**
+ * Maximum UTF-8 bytes of the rendered <hot_memories> block. Bytes, not a
+ * stand-in tokenizer count: the densest current tokenizers (Opus/Haiku 5.5)
+ * bill ~2.5 bytes per token on memory text (44,805 chars billed 17,802
+ * tokens), so 10 KiB stays within ~4k billed tokens on every supported model.
+ */
+export const MEMORY_HOT_SET_MAX_BLOCK_BYTES = 10 * 1024;
 /** Maximum number of memory files preloaded into the system prompt. */
 export const MEMORY_HOT_SET_MAX_ITEMS = 8;
-/** Maximum ranked candidates to read/tokenize while filling the hot set. */
+/** Maximum ranked candidates to read while filling the hot set. */
 export const MEMORY_HOT_SET_MAX_SELECTION_ATTEMPTS = 64;
 /** Half-life of the recency decay applied to access counts when ranking auto-hot files. */
 export const MEMORY_HOT_SET_DECAY_HALF_LIFE_MS = 7 * 24 * 60 * 60 * 1000;

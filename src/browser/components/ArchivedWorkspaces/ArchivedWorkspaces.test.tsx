@@ -57,20 +57,22 @@ function stubPageChrome() {
   }));
 }
 
+// Like the server, the metadata stream opens with a snapshot equal to workspace.list(input).
 function stubPageApi(
   list: APIClient["workspace"]["list"],
-  getSessionUsageBatch: TestApiOverrides<APIClient["workspace"]>["getSessionUsageBatch"]
+  getSessionUsageBatch: TestApiOverrides<APIClient["workspace"]>["getSessionUsageBatch"],
+  onMetadata: TestApiOverrides<APIClient["workspace"]>["onMetadata"] = (input) =>
+    Promise.resolve(
+      (async function* () {
+        yield { type: "snapshot" as const, workspaces: await list(input) };
+      })()
+    )
 ) {
   const api = createTestApiClient({
     workspace: {
       list,
       getSessionUsageBatch,
-      onMetadata: () =>
-        Promise.resolve(
-          (async function* () {
-            yield* await Promise.resolve([]);
-          })()
-        ),
+      onMetadata,
     },
     projects: {
       listBranches: () => Promise.resolve({ branches: ["main"], recommendedTrunk: "main" }),
@@ -319,6 +321,61 @@ describe("ArchivedWorkspaces", () => {
         undefined
       )
     ).toEqual([]);
+  });
+
+  test("keeps an archive event that follows the snapshot over a stale archived list", async () => {
+    stubPageChrome();
+    const workspace = createWorkspace({ id: "archived-late", name: "archived-late" });
+    const staleList = Promise.withResolvers<FrontendWorkspaceMetadata[]>();
+    // A separate list() requested before the archive would answer without it.
+    const list = mock(() => staleList.promise);
+    stubPageApi(list, getSessionUsageBatchMock, () =>
+      Promise.resolve(
+        (async function* () {
+          yield { type: "snapshot" as const, workspaces: await Promise.resolve([]) };
+          yield { workspaceId: workspace.id, metadata: workspace };
+        })()
+      )
+    );
+    updatePersistedState(getArchivedWorkspacesExpandedKey(workspace.projectPath), true);
+    const view = render(
+      <ProjectPage
+        {...pageProps}
+        projectPath={workspace.projectPath}
+        projectName={workspace.projectName}
+      />
+    );
+    await waitFor(() => view.getByLabelText("Restore workspace archived-late"));
+    await act(async () => {
+      staleList.resolve([]);
+      await staleList.promise;
+    });
+    expect(view.getByLabelText("Restore workspace archived-late")).toBeTruthy();
+  });
+
+  test.each([
+    { when: "before", snapshot: false, shows: "Failed to load archived workspaces" },
+    { when: "after", snapshot: true, shows: "No archived workspaces" },
+  ])("an archived stream that ends $when its snapshot shows $shows", async (row) => {
+    stubPageChrome();
+    stubPageApi(
+      mock(() => Promise.resolve([])),
+      getSessionUsageBatchMock,
+      () =>
+        Promise.resolve(
+          (async function* () {
+            await Promise.resolve();
+            if (row.snapshot) yield { type: "snapshot" as const, workspaces: [] };
+          })()
+        )
+    );
+    updatePersistedState(getArchivedWorkspacesExpandedKey("/tmp/project"), true);
+    const view = render(
+      <ProjectPage {...pageProps} projectPath="/tmp/project" projectName="project" />
+    );
+    const regionText = () => view.getByRole("region", { name: "Archived workspaces" }).textContent;
+    await waitFor(() => expect(regionText()).toContain(row.shows));
+    expect(regionText()).not.toContain(row.snapshot ? "Failed to load" : "No archived workspaces");
   });
 
   test("distinguishes a pending archive load from an empty archive", () => {

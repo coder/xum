@@ -6,6 +6,7 @@ import { ExperimentsService } from "./experimentsService";
 import { TelemetryService } from "./telemetryService";
 import { MemoryService } from "./memoryService";
 import { MemoryMetaService } from "./memoryMeta";
+import { MEMORY_CONTEXT_FILE_NAME } from "./memoryContextPersistence";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import * as fs from "node:fs/promises";
 import { attachLanguageModelCleanup, runLanguageModelCleanup } from "./languageModelCleanup";
@@ -52,12 +53,13 @@ async function setup(
     telemetryService: new TelemetryService(config.rootDir),
     xumHome: config.rootDir,
   });
+  await experimentsService.setOverride(EXPERIMENT_IDS.TOKEN_BUDGET, true);
+  await experimentsService.setOverride(EXPERIMENT_IDS.MEMORY, true);
   const service = new AIService(
     config,
     historyService,
     init,
     new ProviderService(config),
-    undefined,
     undefined,
     undefined,
     undefined,
@@ -247,10 +249,12 @@ describe("pinned full-payload rollover admission", () => {
       const { h, historyService, before, start, assembleTools, assembly, applyReset, oldCache } =
         fixture;
       try {
+        if (kind === "advertised-schema") {
+          await fixture.config.editConfig((cfg) => ({ ...cfg, toolSearchEnabled: false }));
+        }
         const result = await h.session.sendMessage("Small follow-up", {
           model,
           agentId: "exec",
-          experiments: { tokenBudget: true, memory: true, toolSearch: kind === "deferred-schema" },
         });
         const fits = kind === "deferred-schema";
         expect(result.success).toBe(fits);
@@ -308,7 +312,7 @@ describe("pinned full-payload rollover admission", () => {
         });
       const sending = h.session.sendMessage(
         "Canceled candidate",
-        { model, agentId: "exec", experiments: { tokenBudget: true, memory: true } },
+        { model, agentId: "exec" },
         {
           onAccepted:
             phase === "after-preparation"
@@ -364,7 +368,7 @@ describe("pinned full-payload rollover admission", () => {
           (
             await h.session.sendMessage(
               "Manual intervention",
-              { model, agentId: "exec", experiments: { tokenBudget: true, memory: true } },
+              { model, agentId: "exec" },
               {
                 enqueuedAtMs: consent ? goal!.lastUserActivationAtMs! - 1000 : undefined,
               }
@@ -399,7 +403,6 @@ describe("pinned full-payload rollover admission", () => {
       const result = await fixture.h.session.sendMessage("Manual intervention", {
         model,
         agentId: "exec",
-        experiments: { tokenBudget: true, memory: true },
       });
       expect(result).toMatchObject({ success: false, error: { type: "context_budget_blocked" } });
       expect((await fixture.goalService.getGoal(workspaceId))?.status).toBe("paused");
@@ -422,10 +425,11 @@ describe("pinned full-payload rollover admission", () => {
         new MemoryMetaService(config.rootDir)
       );
       spyOn(fixture.experimentsService, "isExperimentEnabled").mockImplementation(
-        (id) => id === EXPERIMENT_IDS.MEMORY || id === EXPERIMENT_IDS.MEMORY_HOT_SET
+        (id) =>
+          id === EXPERIMENT_IDS.MEMORY ||
+          id === EXPERIMENT_IDS.MEMORY_HOT_SET ||
+          id === EXPERIMENT_IDS.TOKEN_BUDGET
       );
-      // The real builder gates hot-memory injection on its experiment service, independently of the session cache.
-      const experiments = { memory: true, tokenBudget: true };
       const previous = {
         context: { indexEntries: [], hotMemoriesBlock: "Obsolete notes" },
         includesHotMemories: true,
@@ -448,7 +452,6 @@ describe("pinned full-payload rollover admission", () => {
             await h.session.sendMessage("Use current notes", {
               model,
               agentId: "exec",
-              experiments,
             })
           ).success
         ).toBe(!overflow);
@@ -468,6 +471,14 @@ describe("pinned full-payload rollover admission", () => {
             context: { hotMemoriesBlock: fresh },
             includesHotMemories: true,
           });
+          // The new window's context is saved before its first stream, so a server restart
+          // during that turn restores these bytes instead of rebuilding them.
+          const saved = await fs.readFile(
+            path.join(fixture.config.sessionsDir, workspaceId, MEMORY_CONTEXT_FILE_NAME),
+            "utf-8"
+          );
+          expect(saved).toContain(fresh);
+          expect(saved).not.toContain("Obsolete notes");
         }
       } finally {
         await fixture.cleanup();
@@ -481,7 +492,6 @@ describe("pinned full-payload rollover admission", () => {
       const result = await h.session.sendMessage("Small follow-up", {
         model,
         agentId: "exec",
-        experiments: { tokenBudget: true, memory: true },
       });
       expect(result.success).toBe(true);
       const after = await historyService.getHistoryFromLatestBoundary(workspaceId);
@@ -536,7 +546,7 @@ describe("pinned full-payload rollover admission", () => {
       let revoked = false;
       const sending = h.session.sendMessage(
         "Revocable candidate",
-        { model, agentId: "exec", experiments: { tokenBudget: true, memory: true } },
+        { model, agentId: "exec" },
         {
           cancelSignal: controller.signal,
           admissionStale: () => revoked,
@@ -599,7 +609,7 @@ describe("pinned full-payload rollover admission", () => {
       expect(
         await h.session.sendMessage(
           "Prepared but not committed",
-          { model, agentId: "exec", experiments: { tokenBudget: true, memory: true } },
+          { model, agentId: "exec" },
           { onAccepted: accepted }
         )
       ).toMatchObject({ success: false, error: { type: "unknown" } });
@@ -660,7 +670,6 @@ describe("pinned full-payload rollover admission", () => {
           await h.session.sendMessage("Start a fresh window", {
             model,
             agentId: "exec",
-            experiments: { tokenBudget: true, memory: true },
           })
         ).success
       ).toBe(true);
@@ -695,6 +704,7 @@ describe("pinned full-payload rollover admission", () => {
     const startServers = spyOn(mcpServerManager, "getToolsForWorkspace");
     // No on-send auto-compaction: the persisted trigger must be the request's last user row.
     await seedAutoCompactionThreshold(h.config, model, 100);
+    await fixture.experimentsService.setOverride(EXPERIMENT_IDS.TOKEN_BUDGET, false);
     try {
       // Builds from #4156 persisted this hidden trigger for a one-step, memory-only flush turn.
       // Nothing executes that turn specially any more: it resumes with the normal toolset.
@@ -720,7 +730,6 @@ describe("pinned full-payload rollover admission", () => {
           await h.session.resumeStream({
             model,
             agentId: "exec",
-            experiments: { tokenBudget: false },
           })
         ).success
       ).toBe(true);
@@ -735,7 +744,6 @@ describe("pinned full-payload rollover admission", () => {
           await h.session.sendMessage("Ordinary turn", {
             model,
             agentId: "exec",
-            experiments: { tokenBudget: false },
           })
         ).success
       ).toBe(true);
@@ -768,7 +776,6 @@ describe("pinned full-payload rollover admission", () => {
           await h.session.sendMessage("Use a prepared primary", {
             model,
             agentId: "exec",
-            experiments: { tokenBudget: true, memory: true },
           })
         ).success
       ).toBe(true);
@@ -816,7 +823,7 @@ describe("pinned full-payload rollover admission", () => {
       }
       const sending = h.session.sendMessage(
         "Durable prepared monitor wake",
-        { model, agentId: "exec", experiments: { tokenBudget: true, memory: true } },
+        { model, agentId: "exec" },
         {
           synthetic: true,
           agentInitiated: true,
@@ -874,7 +881,7 @@ describe("pinned full-payload rollover admission", () => {
       const controller = new AbortController();
       const sending = h.session.sendMessage(
         "Accepted prepared wake",
-        { model, agentId: "exec", experiments: { tokenBudget: true, memory: true } },
+        { model, agentId: "exec" },
         {
           synthetic: true,
           agentInitiated: true,
@@ -933,7 +940,7 @@ describe("pinned full-payload rollover admission", () => {
       const cancelState = { canceledBeforeAcceptance: false };
       const sending = h.session.sendMessage(
         "Wake retained when rollback fails",
-        { model, agentId: "exec", experiments: { tokenBudget: true, memory: true } },
+        { model, agentId: "exec" },
         {
           acceptanceOrigin: "automatic",
           synthetic: true,

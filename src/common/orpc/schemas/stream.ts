@@ -1,5 +1,7 @@
 import { StreamStopCauseSchema } from "@/common/types/streamStopCause";
 import { z } from "zod";
+import { stripClientPluginSendHookFields } from "@/common/utils/messages/pluginSendHookFields";
+import { ServiceTierSchema } from "../../config/schemas/providersConfig";
 import { MCPToolCallDisplaySchema } from "./mcp";
 import { AgentDefinitionScopeSchema, AgentIdSchema } from "./agentDefinition";
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
@@ -14,6 +16,7 @@ import {
   MuxReasoningPartSchema,
   MuxTextPartSchema,
   MuxToolPartSchema,
+  PersistedToolModelUsagesSchema,
 } from "./message";
 import type { MuxMessageMetadata } from "../../types/message";
 import type { AssistedReviewHunk } from "../../types/review";
@@ -333,6 +336,8 @@ export const StreamEndEventSchema = z.object({
       providerMetadata: z.record(z.string(), z.unknown()).optional(),
       // Last step's provider metadata (for context window cache display)
       contextProviderMetadata: z.record(z.string(), z.unknown()).optional(),
+      // Model-backed tool and refused-attempt usage, as persisted on the history row.
+      toolModelUsages: PersistedToolModelUsagesSchema.optional(),
       finishReason: z.string().optional(),
       stopCause: StreamStopCauseSchema.optional(),
       duration: z.number().optional(),
@@ -400,6 +405,8 @@ export const StreamAbortEventSchema = z.object({
       duration: z.number().optional(),
       model: z.string().optional(),
       metadataModel: z.string().optional(),
+      // Model-backed tool and refused-attempt usage, as persisted on the committed partial.
+      toolModelUsages: PersistedToolModelUsagesSchema.optional(),
     })
     .optional()
     .meta({
@@ -475,48 +482,6 @@ export const BashOutputEventSchema = z.object({
   text: z.string(),
   isError: z.boolean().meta({ description: "True if this chunk is from stderr" }),
   timestamp: z.number().meta({ description: "When output was flushed (Date.now())" }),
-});
-
-/**
- * UI-only advisor progress update for live phase display.
- *
- * This is intentionally NOT part of the tool result returned to the model.
- * It is streamed over workspace.onChat so the UI can show honest advisor progress.
- */
-export const AdvisorPhaseEventSchema = z.object({
-  type: z.literal("advisor-phase"),
-  workspaceId: z.string(),
-  toolCallId: z.string(),
-  phase: z.enum(["preparing_context", "waiting_for_response", "finalizing_result"]),
-  timestamp: z.number().meta({ description: "When the phase changed (Date.now())" }),
-});
-
-/**
- * UI-only incremental output from the advisor tool.
- *
- * This is intentionally NOT part of the tool result returned to the model.
- * It is streamed over workspace.onChat so users can read advice while it is generated.
- */
-export const AdvisorOutputEventSchema = z.object({
-  type: z.literal("advisor-output"),
-  workspaceId: z.string(),
-  toolCallId: z.string(),
-  text: z.string(),
-  timestamp: z.number().meta({ description: "When output was received (Date.now())" }),
-});
-
-/**
- * UI-only incremental reasoning from the advisor tool.
- *
- * This is intentionally NOT part of the tool result returned to the model.
- * It is streamed over workspace.onChat so users can see advisor thinking while it is generated.
- */
-export const AdvisorReasoningOutputEventSchema = z.object({
-  type: z.literal("advisor-reasoning-output"),
-  workspaceId: z.string(),
-  toolCallId: z.string(),
-  text: z.string(),
-  timestamp: z.number().meta({ description: "When reasoning output was received (Date.now())" }),
 });
 
 /**
@@ -728,6 +693,28 @@ export const GoalBudgetLimitedEventSchema = z.object({
   message: z.string(),
 });
 
+/**
+ * A plugin hook's `systemMessage` (Codex: "surfaced as a warning in the UI"). Live only: it is never
+ * saved to chat.jsonl and never sent to the model.
+ */
+export const PluginHookNoticeEventSchema = z.object({
+  type: z.literal("plugin-hook-notice"),
+  workspaceId: z.string(),
+  plugin: z.string(),
+  message: z.string(),
+});
+
+/** Wire shape of ArtifactInteractionMetadata (Artifacts M5b), for queued-message projections. */
+export const ArtifactInteractionMetadataSchema = z.object({
+  id: z.string(),
+  artifactPath: z.string(),
+  title: z.string(),
+  version: z.number().int().nonnegative(),
+  action: z.literal("send"),
+  text: z.string(),
+  data: z.unknown().optional(),
+});
+
 export const QueuedMessageChangedEventSchema = z.object({
   type: z.literal("queued-message-changed"),
   workspaceId: z.string(),
@@ -735,8 +722,18 @@ export const QueuedMessageChangedEventSchema = z.object({
   hasQueuedMessages: z.boolean().optional(),
   queuedMessages: z.array(z.string()),
   displayText: z.string(),
+  /**
+   * Send ids of the visible queued entries (idempotent sends): the composer knows these reached
+   * the receiver, and a queue edit of sends its draft still retains does not insert them again.
+   */
+  sendIds: z.array(z.string()).optional(),
   fileParts: z.array(FilePartSchema).optional(),
   reviews: z.array(ReviewNoteDataSchema).optional(),
+  /**
+   * Set when the only visible queued entry is a message sent from an artifact: the renderer
+   * shows it like the sent message (label, confirmed text) instead of the model-facing tag.
+   */
+  artifactInteraction: ArtifactInteractionMetadataSchema.optional(),
   queueDispatchMode: z.enum(["tool-end", "turn-end"]).optional(),
   /** True when the queued message is a compaction request (/compact) */
   hasCompactionRequest: z.boolean().optional(),
@@ -760,6 +757,21 @@ export const RestoreToInputEventSchema = z.object({
    * them held, so the input is never lost with this one-shot event.
    */
   heldInputIds: z.array(z.string()).optional(),
+  /**
+   * The same input split per restored send (the fields above join them): each input's own
+   * authored text, file parts and send ids. A composer that still retains a send's draft under
+   * those ids (pendingSends) does not insert it again: its draft resolves instead.
+   */
+  inputs: z
+    .array(
+      z.object({
+        text: z.string(),
+        fileParts: z.array(FilePartSchema).optional(),
+        reviews: z.array(ReviewNoteDataSchema).optional(),
+        sendIds: z.array(z.string()),
+      })
+    )
+    .optional(),
 });
 
 /**
@@ -806,6 +818,29 @@ export const PrefixSwapInvalidatedEventSchema = z.object({
   messageId: z.string(),
 });
 
+// Inert legacy wire shapes: version 3 session tapes can contain advisor progress.
+// Keep validating those recordings without restoring a producer or dedicated UI.
+const legacyAdvisorEventFields = {
+  workspaceId: z.string(),
+  toolCallId: z.string(),
+  timestamp: z.number(),
+};
+const LegacyAdvisorOutputEventSchema = z.object({
+  ...legacyAdvisorEventFields,
+  type: z.literal("advisor-output"),
+  text: z.string(),
+});
+const LegacyAdvisorReasoningOutputEventSchema = z.object({
+  ...legacyAdvisorEventFields,
+  type: z.literal("advisor-reasoning-output"),
+  text: z.string(),
+});
+const LegacyAdvisorPhaseEventSchema = z.object({
+  ...legacyAdvisorEventFields,
+  type: z.literal("advisor-phase"),
+  phase: z.enum(["preparing_context", "waiting_for_response", "finalizing_result"]),
+});
+
 export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
   PrefixSwapInvalidatedEventSchema,
   // Stream lifecycle events
@@ -824,17 +859,18 @@ export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
   ToolCallDeltaEventSchema,
   ToolCallEndEventSchema,
   BashOutputEventSchema,
-  AdvisorOutputEventSchema,
-  AdvisorReasoningOutputEventSchema,
+  LegacyAdvisorOutputEventSchema,
+  LegacyAdvisorReasoningOutputEventSchema,
+  LegacyAdvisorPhaseEventSchema,
   TaskCreatedEventSchema,
   WorkflowRunAttachedEventSchema,
-  AdvisorPhaseEventSchema,
   // Reasoning events
   ReasoningDeltaEventSchema,
   ReasoningEndEventSchema,
   // Error events
   ErrorEventSchema,
   GoalBudgetLimitedEventSchema,
+  PluginHookNoticeEventSchema,
   // Usage and queue events
   UsageDeltaEventSchema,
   SessionUsageDeltaEventSchema,
@@ -921,48 +957,6 @@ export const ToolPolicySchema = z.array(ToolPolicyFilterSchema).meta({
     "Tool policy - array of filters applied in order. Default behavior is allow all tools.",
 });
 
-// Experiments schema for feature gating.
-//
-// Unknown keys (e.g. `goals` from older persisted send-options written
-// before the Goals experiment graduated to GA) are stripped by Zod's
-// default behavior, so we do not need to retain a deprecated field.
-export const ExperimentsSchema = z.preprocess(
-  // Legacy alias: startup-retry snapshots persisted by builds where "PTC
-  // Exclusive Mode" was a separate experiment may carry only the exclusive
-  // flag; the merged PTC experiment activates exactly that posture (`true`
-  // wins over an explicit programmaticToolCalling: false).
-  (value) =>
-    typeof value === "object" &&
-    value !== null &&
-    (value as Record<string, unknown>).programmaticToolCallingExclusive === true
-      ? { ...value, programmaticToolCalling: true }
-      : value,
-  z.object({
-    programmaticToolCalling: z.boolean().optional(),
-    /**
-     * Downgrade-compat mirror (see withLegacyPtcExclusiveMirror): retained
-     * through parsing and stamped alongside programmaticToolCalling in
-     * persisted startup-retry snapshots so a downgraded build resumes in the
-     * exclusive posture instead of supplement mode.
-     */
-    programmaticToolCallingExclusive: z.boolean().optional(),
-    /**
-     * RLM mode (sub-experiment of Programmatic Tool Calling): persistent
-     * sandbox kernel for code_execution. Inert unless a PTC flag is also on.
-     */
-    rlm: z.boolean().optional(),
-    advisorTool: z.boolean().optional(),
-    dynamicWorkflows: z.boolean().optional(),
-    memory: z.boolean().optional(),
-    memoryIntuition: z.boolean().optional(),
-    timeline: z.boolean().optional(),
-    workspaceHeartbeats: z.boolean().optional(),
-    toolSearch: z.boolean().optional(),
-    continuousCompaction: z.boolean().optional(),
-    tokenBudget: z.boolean().optional(),
-  })
-);
-
 /**
  * `steer` is accepted for older clients, but the backend treats every manual
  * user message as a pause because active goal mode is derived from the latest
@@ -1008,6 +1002,24 @@ export function hasExactlyOneEditFence(options: {
 export const EDIT_FENCE_REQUIRED_MESSAGE =
   "editMessageId requires exactly one of historyEditPrecondition or unfencedEdit";
 
+/** Prefix of backend-minted send ids, reserved: a client id may not start with it. */
+export const MINTED_SEND_ID_PREFIX = "srv-";
+
+/** Any send id, a backend-minted one included (lookups; see SendIdSchema for sends). */
+export const SendIdLookupSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(/^[A-Za-z0-9_-]+$/);
+
+/** A send id: opaque, URL-safe, bounded (the backend matches it as a raw string in history). */
+export const SendIdSchema = SendIdLookupSchema.refine(
+  (id) => !id.startsWith(MINTED_SEND_ID_PREFIX),
+  {
+    message: `send ids starting with "${MINTED_SEND_ID_PREFIX}" are reserved for the backend`,
+  }
+);
+
 // SendMessage options
 export const SendMessageOptionsSchema = z.object({
   editMessageId: z.string().optional(),
@@ -1018,6 +1030,7 @@ export const SendMessageOptionsSchema = z.object({
   thinkingLevel: ThinkingLevelSchema.optional(),
   /** OpenAI reasoning mode (pro toggle); inert for models without pro-mode support. */
   reasoningMode: OpenAIReasoningModeSchema.optional(),
+  serviceTier: ServiceTierSchema.optional(),
   model: z.string("No model specified"),
   toolPolicy: ToolPolicySchema.optional(),
   additionalSystemInstructions: z.string().optional(),
@@ -1039,7 +1052,9 @@ export const SendMessageOptionsSchema = z.object({
     .array(z.string())
     .optional()
     .meta({ description: "Tool names delegated back to ACP clients for this request" }),
-  muxMetadata: z.any().optional(), // Black box
+  // Black box, except one prompt-hook field only Xum may set: a client-supplied "hooks already
+  // ran" flag on a compaction follow-up would skip message.send.
+  muxMetadata: z.any().transform(stripClientPluginSendHookFields).optional(),
   /**
    * When true, skip persisting AI settings (e.g., for one-shot or compaction sends).
    */
@@ -1054,9 +1069,9 @@ export const SendMessageOptionsSchema = z.object({
       model: z.literal(true).optional(),
       thinkingLevel: z.literal(true).optional(),
       reasoningMode: z.literal(true).optional(),
+      serviceTier: z.literal(true).optional(),
     })
     .optional(),
-  experiments: ExperimentsSchema.optional(),
   /**
    * Composer model set to "Auto" (auto-model-routing experiment): classify the prompt's
    * difficulty and run on the matching tier's model. `model` stays the concrete
@@ -1070,6 +1085,11 @@ export const SendMessageOptionsSchema = z.object({
    * composer's concrete level and doubles as the fallback.
    */
   autoThinkingLevel: z.boolean().optional(),
+  /**
+   * Auto choices to save for the agent instead of this send's own flags: a plan handoff sends
+   * with routing off but keeps the target agent's Auto choices for its later sends.
+   */
+  savedAutoRouting: z.object({ model: z.boolean(), thinkingLevel: z.boolean() }).optional(),
   /**
    * When true, workspace-specific agent definitions are disabled.
    * Only built-in and global agents are loaded. Useful for "unbricking" when
@@ -1119,12 +1139,6 @@ export const SendMessageOptionsSchema = z.object({
       }),
     ])
     .optional(),
-  /**
-   * Desktop/app-only capability: expose set_goal so an agent can create a
-   * continuation-backed goal for its current parent workspace. Headless callers
-   * omit this, so plain one-shot mux run stays one-shot.
-   */
-  allowAgentSetGoal: z.boolean().optional(),
   goalInterventionPolicy: GoalInterventionPolicySchema.nullish(),
   queueDispatchMode: z.enum(["tool-end", "turn-end"]).nullish(),
   /**
@@ -1135,6 +1149,13 @@ export const SendMessageOptionsSchema = z.object({
    * add and never forwards it to the turn.
    */
   authoredText: z.string().optional(),
+  /**
+   * Stable id of this send (idempotent sends): a retry of the same send reuses it with the same
+   * payload. The user row that accepts the send carries it (metadata.sendIds), and the backend
+   * never appends a second row for an id that a row already carries. When absent, the backend
+   * mints one at entry, so a held Retry still reuses the id of its original send.
+   */
+  sendId: SendIdSchema.optional(),
 });
 
 /**

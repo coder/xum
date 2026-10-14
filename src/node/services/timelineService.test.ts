@@ -37,21 +37,17 @@ function message(
 }
 
 describe("TimelineService", () => {
-  let enabled: boolean;
   let service: TimelineService;
   let historyService: Awaited<ReturnType<typeof createTestHistoryService>>["historyService"];
   let config: Awaited<ReturnType<typeof createTestHistoryService>>["config"];
   let cleanup: () => Promise<void>;
 
   beforeEach(async () => {
-    enabled = true;
     const testHistory = await createTestHistoryService();
     historyService = testHistory.historyService;
     config = testHistory.config;
     cleanup = testHistory.cleanup;
-    service = new TimelineService(config, historyService, {
-      isExperimentEnabled: () => enabled,
-    });
+    service = new TimelineService(config, historyService);
   });
 
   afterEach(async () => {
@@ -68,9 +64,7 @@ describe("TimelineService", () => {
     service.record(WORKSPACE_ID, draft("second"));
     await service.flush();
 
-    service = new TimelineService(config, historyService, {
-      isExperimentEnabled: () => enabled,
-    });
+    service = new TimelineService(config, historyService);
     service.record(WORKSPACE_ID, draft("third"));
     await service.flush();
 
@@ -256,20 +250,6 @@ describe("TimelineService", () => {
 
     const preview = await service.previewAnchor(WORKSPACE_ID, { toolCallId: "call-1" });
     expect(preview).toEqual({ role: "assistant", textExcerpt: "Investigate retry backoff" });
-  });
-
-  test("does not create a file when the experiment is off", async () => {
-    enabled = false;
-    service.record(WORKSPACE_ID, draft("disabled"));
-    await service.flush();
-
-    let error: unknown;
-    try {
-      await fs.stat(timelinePath());
-    } catch (caught) {
-      error = caught;
-    }
-    expect(error).toMatchObject({ code: "ENOENT" });
   });
 
   test("rejects an invalid draft without consuming a sequence number", async () => {

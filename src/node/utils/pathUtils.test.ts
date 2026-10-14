@@ -1,7 +1,14 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { expandTilde, validateProjectPath, isGitRepository } from "./pathUtils";
+import {
+  expandTilde,
+  validateProjectPath,
+  isFilesystemRoot,
+  isGitRepository,
+  resolvesToFilesystemRoot,
+  stripTrailingSlashes,
+} from "./pathUtils";
 
 describe("pathUtils", () => {
   describe("expandTilde", () => {
@@ -40,7 +47,55 @@ describe("pathUtils", () => {
     });
   });
 
+  describe("stripTrailingSlashes", () => {
+    it("strips trailing separators from ordinary paths as before", () => {
+      expect(stripTrailingSlashes("/home/user/project/")).toBe("/home/user/project");
+      expect(stripTrailingSlashes("/home/user/project//")).toBe("/home/user/project");
+      expect(stripTrailingSlashes("/home/user/project")).toBe("/home/user/project");
+      expect(stripTrailingSlashes("C:\\Users\\project\\")).toBe("C:\\Users\\project");
+      expect(stripTrailingSlashes("")).toBe("");
+    });
+
+    // #5917: "/" normalized to "", an invalid project key that the next config load dropped.
+    it("keeps the filesystem root, which has no trailing slash to strip", () => {
+      expect(stripTrailingSlashes("/")).toBe("/");
+      expect(stripTrailingSlashes("//")).toBe("/");
+      expect(stripTrailingSlashes("\\")).toBe("\\");
+    });
+  });
+
   describe("validateProjectPath", () => {
+    // #5917: "/" used to fail only by accident ("" did not exist). Refuse it explicitly.
+    it("refuses the filesystem root", async () => {
+      // path.parse(cwd).root is "/" on POSIX and a drive root such as "C:\\" on Windows.
+      for (const root of ["/", "//", "/tmp/..", path.parse(process.cwd()).root]) {
+        expect(await validateProjectPath(root)).toEqual({
+          valid: false,
+          error: "A project cannot be the filesystem root",
+        });
+      }
+    });
+
+    // #5924: path.win32.parse reports the root of "\\\\?\\UNC\\srv\\share\\" as "\\\\?\\UNC\\", so
+    // the share root used to pass. The "Test / Windows" CI job runs this test.
+    const itOnWindows = process.platform === "win32" ? it : it.skip;
+    itOnWindows("refuses Windows namespaced roots", async () => {
+      for (const root of [
+        "\\\\?\\UNC\\srv\\share\\",
+        "\\\\?\\UNC\\srv\\share",
+        "\\\\.\\UNC\\srv\\share",
+        "\\\\?\\C:\\",
+        "\\\\srv\\share\\",
+      ]) {
+        expect(await resolvesToFilesystemRoot(root)).toBe(true);
+        expect(await validateProjectPath(root)).toEqual({
+          valid: false,
+          error: "A project cannot be the filesystem root",
+        });
+      }
+      expect(isFilesystemRoot("\\\\?\\UNC\\srv\\share\\repo")).toBe(false);
+    });
+
     let tempDir: string;
 
     beforeEach(() => {

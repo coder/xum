@@ -9,16 +9,14 @@ import {
   migrateWorkspaceStorage,
 } from "@/browser/utils/workspaceStorage";
 import {
+  getAutoExpandPrefsKey,
   getDraftScopeId,
-  getModelKey,
   getReviewsKey,
   getPersistedKeyRegistration,
   getWorkspaceNameStateKey,
   getDesktopPopoutKey,
-  getDisableWorkspaceAgentsKey,
   getMCPTestResultsKey,
   getPinnedTodoExpandedKey,
-  getReasoningModeKey,
   getReviewFileFilterKey,
   getRightSidebarLayoutKey,
   getSubAgentTasksExpandedKey,
@@ -42,10 +40,8 @@ describe("deleteWorkspaceStorage", () => {
   // left them behind until they filled the origin quota.
   test("removes per-workspace keys the old lists missed", () => {
     const workspaceId = "ws-delete-missing";
-    const otherWorkspaceKey = getReasoningModeKey("ws-other");
+    const otherWorkspaceKey = getPinnedTodoExpandedKey("ws-other");
     const keys = [
-      getReasoningModeKey,
-      getDisableWorkspaceAgentsKey,
       getPinnedTodoExpandedKey,
       getSubAgentTasksExpandedKey,
       getRightSidebarLayoutKey,
@@ -102,7 +98,7 @@ describe("migrateWorkspaceStorage", () => {
     globalThis.window = domWindow;
     globalThis.document = domWindow.document;
     globalThis.localStorage = storage;
-    const sourceKey = getModelKey("__pending__/repo");
+    const sourceKey = getAutoExpandPrefsKey("__pending__/repo");
     storage.setItem(sourceKey, JSON.stringify("anthropic:claude-opus"));
 
     migrateWorkspaceStorage("__pending__/repo", "ws-destination");
@@ -117,7 +113,7 @@ describe("migrateWorkspaceStorage", () => {
     globalThis.window = domWindow;
     globalThis.document = domWindow.document;
     globalThis.localStorage = domWindow.localStorage;
-    const sourceKey = getModelKey("__pending__/repo2");
+    const sourceKey = getAutoExpandPrefsKey("__pending__/repo2");
     const budget = getPersistedKeyRegistration(sourceKey)!.maxValueChars;
     const legacyValue = JSON.stringify("m".repeat(budget));
     localStorage.setItem(sourceKey, legacyValue);

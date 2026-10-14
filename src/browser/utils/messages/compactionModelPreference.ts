@@ -7,9 +7,7 @@
  *   3) undefined → caller falls back to workspace model
  */
 
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
-import { AGENT_AI_DEFAULTS_KEY } from "@/common/constants/storage";
-import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 
 function trimmedOrUndefined(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
@@ -18,8 +16,9 @@ function trimmedOrUndefined(value: unknown): string | undefined {
 }
 
 export function getPreferredCompactionModel(): string | undefined {
-  const defaults = readPersistedState<AgentAiDefaults>(AGENT_AI_DEFAULTS_KEY, {});
-  return trimmedOrUndefined(defaults.compact?.modelString);
+  return trimmedOrUndefined(
+    getAppConfigStore().getSnapshot()?.agentAiDefaults?.compact?.modelString
+  );
 }
 
 export function resolveCompactionModel(requestedModel: string | undefined): string | undefined {

@@ -1,0 +1,95 @@
+import type { Meta, StoryObj } from "@storybook/react-vite";
+import { expect, fn, userEvent, within } from "storybook/test";
+import { APIProvider } from "@/browser/contexts/API";
+import type { ThemeMode } from "@/browser/contexts/ThemeContext";
+import { textContrasts } from "@/browser/stories/helpers/contrast";
+import { PIXEL_DISABLED, lightweightMeta } from "@/browser/stories/meta.js";
+import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { LegacyPlanImportNotice } from "./LegacyPlanImportBanner";
+
+const client = createMockORPCClient();
+
+const meta = {
+  ...lightweightMeta,
+  title: "App/Chat/Components/LegacyPlanImportBanner",
+  component: LegacyPlanImportNotice,
+  // Kept out of Pixel snapshots (the repo's snapshot budget is full); the Phone play below checks
+  // the narrow layout, and the PR carries screenshots of the real app.
+  parameters: { ...lightweightMeta.parameters, pixel: PIXEL_DISABLED },
+  args: {
+    workspaceId: "older-ssh-row",
+    legacyPlanPath: "/home/dev/.mux/plans/checkout-service/feature-login-x7k2.md",
+    onSettled: fn(),
+  },
+  render: (args) => (
+    <APIProvider client={client}>
+      <div className="bg-background flex min-h-[160px] items-start p-4">
+        <div className="w-full max-w-3xl">
+          <LegacyPlanImportNotice {...args} />
+        </div>
+      </div>
+    </APIProvider>
+  ),
+} satisfies Meta<typeof LegacyPlanImportNotice>;
+
+export default meta;
+type Story = StoryObj<typeof meta>;
+
+/** An SSH workspace from before #5174 whose only plan is at the shared pre-#5174 path. */
+export const Default: Story = {};
+
+/** The long host path wraps instead of overflowing on a phone. */
+export const Phone: Story = {
+  globals: { viewport: { value: "phone390", isRotated: false } },
+  render: (args) => (
+    <APIProvider client={client}>
+      {/* The test-runner applies no viewport: force the phone width here. */}
+      <div className="bg-background w-[375px] p-2">
+        <LegacyPlanImportNotice {...args} />
+      </div>
+    </APIProvider>
+  ),
+  play: async ({ canvasElement }) => {
+    const row = canvasElement.querySelector<HTMLElement>(
+      '[data-component="LegacyPlanImportBanner"]'
+    );
+    await expect(row).not.toBeNull();
+    await expect(row!.scrollWidth).toBeLessThanOrEqual(row!.clientWidth);
+    await expect(within(canvasElement).getByRole("button", { name: "Import plan" })).toBeVisible();
+  },
+};
+
+/**
+ * The shared file vanished after it was offered (#5620): the import finds nothing, so the notice
+ * keeps the reason and drops the button (and its palette action).
+ */
+export const NothingToImport: Story = {
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(canvas.getByRole("button", { name: "Import plan" }));
+    await expect(await canvas.findByRole("alert")).toHaveTextContent(
+      "The plan from an older Xum is no longer there."
+    );
+    await expect(canvas.queryByRole("button", { name: "Import plan" })).toBeNull();
+  },
+};
+
+/**
+ * The notice's tinted (`bg-muted/10`) action button label reaches WCAG AA (4.5:1) in each theme.
+ * With `--color-secondary` it was 4.40:1 in dark and 4.02:1 in light (#6453).
+ */
+const contrastStory = (theme: ThemeMode): Story => ({
+  globals: { theme },
+  play: async ({ canvasElement }) => {
+    const button = await within(canvasElement).findByRole("button", { name: "Import plan" });
+    const failing = textContrasts(button)
+      .filter((entry) => entry.ratio < 4.5)
+      .map((entry) => `${entry.ratio.toFixed(2)}:1 "${entry.text}"`);
+    await expect(failing.join("\n")).toBe("");
+  },
+});
+
+export const ContrastLight = contrastStory("light");
+export const ContrastDark = contrastStory("dark");
+export const ContrastFlexokiLight = contrastStory("flexoki-light");
+export const ContrastFlexokiDark = contrastStory("flexoki-dark");

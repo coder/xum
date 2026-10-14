@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { createTestPlanStorage } from "@/node/utils/runtime/planLocation.testHarness";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
@@ -476,6 +477,7 @@ describe("AgentSession plan-review snapshot capture", () => {
         {
           workspaceId,
           metadata: metadataFor(workspaceId),
+          planStorage: createTestPlanStorage(),
           proposalToolCallId: "call-plan",
           signal: controller.signal,
         }
@@ -667,7 +669,11 @@ describe("AgentSession plan-review snapshot: an admitted append outlives Stop/fa
               emitChatEvent: (_id, message) =>
                 h.session.emitChatEvent({ ...message, type: "message" }),
             },
-            { workspaceId, metadata: metadataFor(workspaceId) }
+            {
+              workspaceId,
+              metadata: metadataFor(workspaceId),
+              planStorage: createTestPlanStorage(),
+            }
           );
           successorProgress = successorCall;
         } else {

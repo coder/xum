@@ -34,6 +34,7 @@ export type GoalContinuationSkipReason =
   | "requires_ack"
   | "budget_wrapup_already_fired"
   | "budget_wrapup_suppressed"
+  | "error_backoff"
   | "cooldown";
 export type GoalStreamOriginKind = "goal_continuation" | "goal_budget_limit" | "user" | "other";
 export type GoalContinuationDecision =
@@ -46,8 +47,9 @@ export interface GoalContinuationPolicyState {
   bridgeRegistered: boolean;
   candidate: {
     goalId: string;
-    source: "stream_end" | "kickoff" | "budget_wrapup";
+    source: "stream_end" | "kickoff" | "budget_wrapup" | "stream_error";
     sendOptions: { agentId?: string | null; mode?: string | null };
+    notBeforeMs?: number;
   } | null;
   workspace: { found: boolean; archived: boolean; hasPath: boolean; isChild: boolean };
   hasActiveDescendantTasks: boolean;
@@ -162,7 +164,15 @@ export function evaluateGoalContinuationGoal(
   ) {
     return stop("goal_not_active", true);
   }
+  // A resume after a terminal stream error (G4) is only for an active goal: a budget or turn
+  // limit reached meanwhile wins (the owed wrap-up is armed by its own path).
+  if (candidate.source === "stream_error" && goal.status !== "active") {
+    return stop("goal_not_active", true);
+  }
   if (goal.requireUserAcknowledgmentSinceMs != null) return stop("requires_ack", false);
+  if (candidate.notBeforeMs != null && state.nowMs < candidate.notBeforeMs) {
+    return defer("error_backoff", candidate.notBeforeMs);
+  }
   if (goal.status === "budget_limited") {
     if (goal.budgetLimitInjectedForGoalId === goal.goalId) {
       return stop("budget_wrapup_already_fired", true);

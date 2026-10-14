@@ -1,15 +1,20 @@
 import { describe, expect, mock, test } from "bun:test";
 
 import type { APIClient } from "@/browser/contexts/API";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import {
   applyFastModeServiceTierChange,
   applyFastModeToggle,
   getFastModeProvider,
   getFastModeServiceTierChange,
+  getFastModeUnavailableReason,
   isFastModeActive,
+  ultrafastModeAvailable,
 } from "./fastModeServiceTier";
 
 type ProviderConfigWriter = Pick<APIClient["providers"], "setProviderConfig">;
+
+const OPENAI_CONFIG = { apiKeySet: true, isEnabled: true, isConfigured: true };
 
 function createWriter() {
   const setProviderConfig = mock((_input: unknown) =>
@@ -22,6 +27,46 @@ function createWriter() {
 }
 
 describe("fast mode service tier", () => {
+  test("says whether the model or its route lacks fast mode (#5753)", () => {
+    // No route gives these models fast mode.
+    expect(getFastModeUnavailableReason("google:gemini-3-pro", null)).toBe("model");
+    expect(getFastModeUnavailableReason("anthropic:claude-haiku-4-5", null)).toBe("model");
+    expect(getFastModeUnavailableReason("xai:grok-code-fast-1", null)).toBe("model");
+    // These models have fast mode, so a null provider means the route cannot send it.
+    expect(getFastModeUnavailableReason("mux-gateway:anthropic/claude-opus-5-5", null)).toBe(
+      "route"
+    );
+    expect(getFastModeUnavailableReason("openrouter:openai/gpt-6-astra", null)).toBe("route");
+    expect(getFastModeUnavailableReason("xai:grok-4.7", null)).toBe("route");
+
+    // The capability comes from the provider config, whatever the route.
+    const anthropic = { apiKeySet: true, isEnabled: true, isConfigured: true };
+    const mapped = {
+      anthropic: {
+        ...anthropic,
+        models: [
+          { id: "team-opus", mappedToModel: "anthropic:claude-opus-5-5" },
+          { id: "team-haiku", mappedToModel: "anthropic:claude-haiku-4-5" },
+        ],
+      },
+    } as unknown as ProvidersConfigMap;
+    expect(getFastModeUnavailableReason("anthropic:team-opus", mapped)).toBe("route");
+    expect(getFastModeUnavailableReason("anthropic:team-haiku", mapped)).toBe("model");
+    const custom = {
+      anthropic,
+      "team-claude": { ...anthropic, providerType: "anthropic-messages" },
+      "team-compat": { ...anthropic, providerType: "openai-compatible" },
+    } as unknown as ProvidersConfigMap;
+    // getFastModeProvider refuses custom providers, so the route is the reason for Opus.
+    expect(getFastModeProvider("team-claude:claude-opus-5-5", { providersConfig: custom })).toBe(
+      null
+    );
+    expect(getFastModeUnavailableReason("team-claude:claude-opus-5-5", custom)).toBe("route");
+    expect(getFastModeUnavailableReason("team-claude:claude-haiku-4-5", custom)).toBe("model");
+    // A generic OpenAI-compatible dialect gives the model no known identity.
+    expect(getFastModeUnavailableReason("team-compat:claude-opus-5-5", custom)).toBe("model");
+  });
+
   test("resolves direct native providers and rejects gateway routes", () => {
     expect(getFastModeProvider("openai:gpt-5.6-sol", { resolvedRouteProvider: "direct" })).toBe(
       "openai"
@@ -216,6 +261,127 @@ describe("fast mode service tier", () => {
     expect(getFastModeServiceTierChange("xai", "priority").serviceTier).toBe("default");
   });
 
+  test("offers Ultrafast only where the request path would send it", () => {
+    const openai = { apiKeySet: true, isEnabled: true, isConfigured: true };
+    const config = (extra: object = {}): ProvidersConfigMap => ({
+      openai: { ...openai, ...extra },
+    });
+    expect(ultrafastModeAvailable("openai:gpt-6.1-sol", { providersConfig: config() })).toBe(true);
+    expect(ultrafastModeAvailable("openai:gpt-6-astra", { providersConfig: config() })).toBe(true);
+    // Fast-capable but not Ultrafast-capable model.
+    expect(ultrafastModeAvailable("openai:gpt-6-luna", { providersConfig: config() })).toBe(false);
+    // Chat Completions rejects the tier.
+    expect(
+      ultrafastModeAvailable("openai:gpt-6.1-sol", {
+        providersConfig: config({ wireFormat: "chatCompletions" }),
+      })
+    ).toBe(false);
+    // Coder pins each instance's wire; the direct OpenAI wire setting must not override it.
+    const viaCoder = (type: string) =>
+      ultrafastModeAvailable("coder:prod/gpt-6.1-sol", {
+        resolvedRouteProvider: "coder",
+        providersConfig: {
+          openai: { ...openai, wireFormat: "responses" },
+          coder: {
+            apiKeySet: false,
+            isEnabled: true,
+            isConfigured: true,
+            discoveredProviders: [{ name: "prod", type }],
+            models: [{ id: "prod/gpt-6.1-sol", mappedToModel: "openai:gpt-6.1-sol" }],
+          },
+        },
+      });
+    expect(viaCoder("openai")).toBe(true);
+    expect(viaCoder("openai-compat")).toBe(false);
+    // Gateways with their own adapters forward Fast but not Ultrafast: the gate fails closed.
+    for (const route of ["github-copilot", "openrouter", "mux-gateway"]) {
+      const gatewayOptions = { resolvedRouteProvider: route, providersConfig: config({}) };
+      gatewayOptions.providersConfig[route] = {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+      };
+      expect(getFastModeProvider("openai:gpt-6.1-sol", gatewayOptions)).toBe("openai");
+      expect(ultrafastModeAvailable("openai:gpt-6.1-sol", gatewayOptions)).toBe(false);
+    }
+    // Non-OpenAI Fast modes have no Ultrafast tier.
+    expect(ultrafastModeAvailable("xai:grok-4.7", { providersConfig: null })).toBe(false);
+  });
+
+  test.each([
+    // [current, stored restore target, toggled tier] -> [new tier, new restore target]
+    [
+      "enables Ultrafast and remembers the base tier",
+      "flex",
+      undefined,
+      "ultrafast",
+      "ultrafast",
+      "flex",
+    ],
+    [
+      "turns Ultrafast off back to the base tier",
+      "ultrafast",
+      "flex",
+      "ultrafast",
+      "flex",
+      undefined,
+    ],
+    [
+      "switches Fast to Ultrafast keeping the base tier",
+      "priority",
+      "flex",
+      "ultrafast",
+      "ultrafast",
+      "flex",
+    ],
+    [
+      "switches Ultrafast to Fast keeping the base tier",
+      "ultrafast",
+      "unset",
+      "priority",
+      "priority",
+      "unset",
+    ],
+    // Ultrafast chosen in Settings is itself the base tier Fast mode returns to.
+    [
+      "keeps a Settings Ultrafast as Fast mode's restore target",
+      "ultrafast",
+      undefined,
+      "priority",
+      "priority",
+      "ultrafast",
+    ],
+    [
+      "returns to a Settings Ultrafast from Fast",
+      "priority",
+      "ultrafast",
+      "ultrafast",
+      "ultrafast",
+      undefined,
+    ],
+  ] as const)("%s", (_name, current, previous, target, serviceTier, previousServiceTier) => {
+    const change = getFastModeServiceTierChange("openai", current, previous, target);
+    expect(change.serviceTier).toBe(serviceTier);
+    expect(change.previousServiceTier).toBe(previousServiceTier);
+  });
+
+  test("persists Ultrafast's restore target before raising the tier", async () => {
+    const { providers, setProviderConfig } = createWriter();
+
+    const patch = await applyFastModeToggle(
+      providers,
+      "openai",
+      { ...OPENAI_CONFIG, serviceTier: "auto" },
+      "ultrafast"
+    );
+
+    expect(patch).toEqual({ serviceTier: "ultrafast", fastModePreviousServiceTier: "auto" });
+    expect(setProviderConfig.mock.calls.map(([input]) => input)).toEqual([
+      { provider: "openai", keyPath: ["fastModePreviousServiceTier"], value: "auto" },
+      { provider: "openai", keyPath: ["serviceTier"], value: "ultrafast" },
+    ]);
+  });
+
   test("writes xAI fast mode to the xAI provider config", async () => {
     const { providers, setProviderConfig } = createWriter();
 
@@ -269,7 +435,7 @@ describe("fast mode service tier", () => {
     ).toBe("anthropic");
   });
 
-  test("hides Anthropic Fast mode on gateways, ZDR configs, and policy-denied providers", () => {
+  test("hides Anthropic Fast mode on gateways, ZDR configs, and configs without Anthropic", () => {
     const anthropic = { apiKeySet: true, isEnabled: true, isConfigured: true };
     const gateway = { apiKeySet: true, isEnabled: true, isConfigured: true };
     for (const route of ["mux-gateway", "openrouter", "bedrock", "coder"]) {

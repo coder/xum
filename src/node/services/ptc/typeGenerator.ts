@@ -202,14 +202,17 @@ function getInputJsonSchema(tool: Tool): Record<string, unknown> {
 async function getResultTypeString(toolName: string): Promise<string | null> {
   // Check cache first
   if (cache.resultTypes.has(toolName)) {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     return cache.resultTypes.get(toolName)!;
   }
 
   const schema = getToolResultSchema(toolName);
   if (!schema) return null;
 
-  // Convert Zod → JSON Schema → TypeScript
-  const jsonSchema = z.toJSONSchema(schema);
+  // Convert Zod → JSON Schema → TypeScript. json-schema-to-typescript understands
+  // draft-7 tuples (`items: [...]`) but not draft-2020-12 `prefixItems`, which
+  // zod >= 4.5 emits by default; without draft-7, tuple results type as `never[]`.
+  const jsonSchema = z.toJSONSchema(schema, { target: "draft-7" });
   const tsOutput = await compile(
     jsonSchema as Parameters<typeof compile>[0],
     `${pascalCase(toolName)}Result`,

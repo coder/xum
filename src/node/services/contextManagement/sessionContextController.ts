@@ -239,7 +239,6 @@ export class SessionContextController {
 
   isTokenBudgetActive(options?: SendMessageOptions): boolean {
     const selection = resolveContextStrategy({
-      experiments: options?.experiments,
       isEnabled: (id) => this.deps.aiService.isExperimentEnabled(id),
       isCompactionRequest: isCompactionRequestMetadata(options?.muxMetadata),
     });
@@ -501,9 +500,12 @@ export class SessionContextController {
         agentInitiated: input.agentInitiated,
         goalKind: input.goalKind,
         goalId: input.goalId,
+        taskTurnKind: input.taskTurnKind,
         muxMetadata: input.muxMetadata,
         workspaceTurnMetadata: inheritedWorkspaceTurnMetadata,
         autoModelRouting: input.autoModelRouting,
+        pluginSendHooksApplied: input.pluginSendHooksApplied,
+        pluginHookContext: input.pluginHookContext,
       });
 
       // Waterfall hook point: lets registered middleware (e.g. refinement
@@ -522,9 +524,7 @@ export class SessionContextController {
       // RLM keep-recent floor: stamp on-send auto-compaction requests with
       // the durable tail-start sequence. No-op when RLM is off.
       if (autoCompactionRequest.metadata.type === "compaction-request") {
-        const enabled = isRlmModeEnabled(optionsForStream.experiments, (id) =>
-          this.deps.aiService.isExperimentEnabled(id)
-        );
+        const enabled = isRlmModeEnabled((id) => this.deps.aiService.isExperimentEnabled(id));
         const stamp = await computeKeepRecentTailStamp(
           this.deps.historyService,
           this.host.workspaceId,

@@ -4,13 +4,10 @@
  * Handles app startup events
  */
 
-import {
-  readPersistedRawString,
-  readPersistedState,
-  updatePersistedState,
-} from "@/browser/hooks/usePersistedState";
+import { readPersistedRawString, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { getUserPreferences } from "@/browser/stores/AppConfigStore";
 import { trackEvent } from "@/common/telemetry/client";
-import { FIRST_LAUNCH_KEY, VIM_ENABLED_KEY } from "@/common/constants/storage";
+import { FIRST_LAUNCH_KEY } from "@/common/constants/storage";
 
 /**
  * Check if this is the first app launch
@@ -30,12 +27,12 @@ function checkFirstLaunch(): boolean {
  * Check if vim mode is enabled
  */
 function checkVimModeEnabled(): boolean {
-  return readPersistedState<unknown>(VIM_ENABLED_KEY, false) === true;
+  return getUserPreferences().appearance?.vimEnabled === true;
 }
 
 /**
  * Track app startup
- * Should be called once when the app initializes
+ * Should be called once, after the app config store's first snapshot
  */
 export function trackAppStarted(): void {
   const isFirstLaunch = checkFirstLaunch();

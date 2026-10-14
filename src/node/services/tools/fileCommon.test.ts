@@ -8,13 +8,9 @@ import {
   resolvePathWithinCwd,
   MAX_FILE_SIZE,
 } from "./fileCommon";
-import type { createRuntime as CreateRuntimeFn } from "@/node/runtime/runtimeFactory";
-
-/* eslint-disable @typescript-eslint/no-require-imports, @typescript-eslint/no-unsafe-assignment */
-const {
-  createRuntime,
-}: { createRuntime: typeof CreateRuntimeFn } = require("@/node/runtime/runtimeFactory?real=1");
-/* eslint-enable @typescript-eslint/no-require-imports, @typescript-eslint/no-unsafe-assignment */
+// A static import, not a require("...?real=1") copy: Bun's LCOV keeps only the last-loaded copy of
+// a file, so a copy would replace runtimeFactory.test.ts's coverage of runtimeFactory.ts.
+import { createRuntime } from "@/node/runtime/runtimeFactory";
 
 describe("fileCommon", () => {
   describe("validateFileSize", () => {

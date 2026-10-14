@@ -20,6 +20,7 @@ import type * as aiSdk from "ai";
 import { tool, type ModelMessage, type Tool, type ToolResultPart } from "ai";
 import { z } from "zod";
 import * as modelStatsModule from "@/common/utils/tokens/modelStats";
+import { createAmazonBedrock } from "@ai-sdk/amazon-bedrock";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
 import {
@@ -67,6 +68,33 @@ async function startStreamCapturingStreamTextForTests(
   if (!result.success) throw new Error("Expected stream to start");
   await result.data.completion;
   return { streamText, streamManager };
+}
+
+/** One in-turn assistant step: a reasoning part (replay data in `replayOptions`) and a tool call. */
+function inTurnReasoningStep(
+  replayOptions: Record<string, Record<string, string>>
+): ModelMessage[] {
+  return [
+    { role: "user", content: "hello" },
+    {
+      role: "assistant",
+      content: [
+        { type: "reasoning", text: "note", providerOptions: replayOptions },
+        { type: "tool-call", toolCallId: "c1", toolName: "bash", input: {} },
+      ],
+    },
+    {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "c1",
+          toolName: "bash",
+          output: { type: "text", value: "ok" },
+        },
+      ],
+    },
+  ];
 }
 
 describe("StreamManager - sequential tool execution", () => {
@@ -163,6 +191,44 @@ describe("StreamManager - sequential tool execution", () => {
 
     expect(results).toEqual([{ tool: "A" }, { tool: "B" }]);
     expect(executionLog).toEqual(["start A", "end A", "start B", "end B"]);
+  });
+});
+
+describe("StreamManager - XUM_DISABLE_AGENT_TOOLS", () => {
+  const model = createAnthropic({ apiKey: "test" })("claude-sonnet-4-5");
+
+  afterEach(() => {
+    delete process.env.XUM_DISABLE_AGENT_TOOLS;
+  });
+
+  async function captureToolRequest() {
+    const tools = {
+      a: tool({ description: "Tool A", inputSchema: z.object({}), execute: () => ({ ok: true }) }),
+    };
+    const { streamText } = await startStreamCapturingStreamTextForTests({
+      model,
+      modelString: KNOWN_MODELS.SONNET.id,
+      tools,
+      forcedFirstStepToolNames: ["a"],
+    });
+    const options = streamText.mock.calls[0]?.[0];
+    if (options == null) throw new Error("Expected streamText to be called");
+    const firstStep = await prepareStepForTests(options, [{ role: "user", content: "hi" }], 0);
+    return { tools: options.tools, firstStep };
+  }
+
+  test("sends tools and forces a first-step tool by default", async () => {
+    const { tools, firstStep } = await captureToolRequest();
+    expect(Object.keys(tools ?? {})).toEqual(["a"]);
+    expect(firstStep).toMatchObject({ toolChoice: "required", activeTools: ["a"] });
+  });
+
+  test("sends no tools and forces none when set to 1", async () => {
+    process.env.XUM_DISABLE_AGENT_TOOLS = "1";
+    const { tools, firstStep } = await captureToolRequest();
+    expect(tools).toBeUndefined();
+    expect(firstStep?.toolChoice).toBeUndefined();
+    expect(firstStep?.activeTools).toBeUndefined();
   });
 });
 
@@ -279,6 +345,7 @@ describe("StreamManager - tool search activeTools scoping", () => {
       deferredToolNames: new Set(["slack_send_message", "slack_list_channels"]),
       allToolNames: ["bash", "tool_catalog_search", "slack_send_message", "slack_list_channels"],
       activatedToolNames: new Set(),
+      native: false,
     };
 
     const { streamText: streamTextSpy } = await startStreamCapturingStreamTextForTests({
@@ -302,9 +369,175 @@ describe("StreamManager - tool search activeTools scoping", () => {
     expect(nextStep?.activeTools).toEqual(["bash", "tool_catalog_search", "slack_send_message"]);
   });
 
-  test("a tool-set change ends in-turn reasoning replay on between_tools requests (#5086)", async () => {
-    // between_tools cannot carry blockBinding: a thinking block replayed after the
-    // advertised tools changed would fail the prefix check on enforced accounts.
+  test("native tool search never scopes activeTools, before or after an activation (#5262)", async () => {
+    const toolSearchState: ToolSearchStreamState = {
+      catalog: [{ name: "slack_send_message", description: "Send a message", paramText: "" }],
+      deferredToolNames: new Set(["slack_send_message"]),
+      allToolNames: ["bash", "tool_catalog_search", "slack_send_message"],
+      activatedToolNames: new Set(),
+      native: true,
+    };
+    const { streamText: streamTextSpy } = await startStreamCapturingStreamTextForTests({
+      model,
+      messages,
+      toolSearchState,
+    });
+    const prepareStep = capturePrepareStep(streamTextSpy);
+
+    // Every step sends the request's full tools record: a scoped list would
+    // rewrite the cached tools block after each search.
+    expect(await prepareStep({ messages })).toBeUndefined();
+    toolSearchState.activatedToolNames.add("slack_send_message");
+    expect(await prepareStep({ messages })).toBeUndefined();
+  });
+
+  test("per-step transform drops a native tool_reference an earlier result already sent", async () => {
+    const referencesOutput = (referencedTools: string[]): unknown => ({
+      type: "content",
+      value: referencedTools.map((toolName) => ({
+        type: "custom",
+        providerOptions: { anthropic: { type: "tool-reference", toolName } },
+      })),
+    });
+    const searchResult = (toolCallId: string, referencedTools: string[]): ModelMessage => {
+      const raw: unknown = {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId,
+            toolName: "tool_catalog_search",
+            output: referencesOutput(referencedTools),
+          },
+        ],
+      };
+      return raw as ModelMessage;
+    };
+    const inTurn: ModelMessage[] = [
+      { role: "user", content: "hello" },
+      searchResult("call-1", ["slack_send_message"]),
+      searchResult("call-2", ["slack_send_message", "slack_list_channels"]),
+    ];
+    const { streamText: streamTextSpy } = await startStreamCapturingStreamTextForTests({
+      model,
+      messages,
+    });
+    const prepareStep = capturePrepareStep(streamTextSpy);
+
+    const step = await prepareStep({ messages: inTurn });
+    const stepMessages = step?.messages;
+    if (stepMessages == null) throw new Error("Expected prepareStep to rewrite the messages");
+    // The first reference is untouched; the repeat is dropped from the second
+    // result, whose raw output moves to the restoration stash.
+    expect(stepMessages[1]).toBe(inTurn[1]);
+    const projected: unknown = {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "call-2",
+          toolName: "tool_catalog_search",
+          output: referencesOutput(["slack_list_channels"]),
+          providerOptions: {
+            mux: {
+              rawToolSearchOutput: JSON.stringify(
+                referencesOutput(["slack_send_message", "slack_list_channels"])
+              ),
+            },
+          },
+        },
+      ],
+    };
+    expect(JSON.stringify(stepMessages[2])).toBe(JSON.stringify(projected));
+  });
+
+  test("a tool-set change ends in-turn reasoning replay on Anthropic requests (#5086)", async () => {
+    // Preserved thinking: a thinking block replayed after the advertised tools changed
+    // would fail the prefix check on enforced accounts. between_tools cannot carry
+    // blockBinding, and only the direct API route sends drop_block for adaptive.
+    const inTurn = inTurnReasoningStep({ anthropic: { signature: "s" } });
+    const replaysReasoning = (step: PreparedStepForTests) =>
+      (step?.messages ?? inTurn).some(
+        (message) =>
+          message.role === "assistant" &&
+          typeof message.content !== "string" &&
+          message.content.some((part) => part.type === "reasoning")
+      );
+    const run = async (thinking: Record<string, unknown>, native = false) => {
+      const toolSearchState: ToolSearchStreamState = {
+        catalog: [{ name: "slack_send_message", description: "Send a message", paramText: "" }],
+        deferredToolNames: new Set(["slack_send_message"]),
+        allToolNames: ["bash", "tool_catalog_search", "slack_send_message"],
+        activatedToolNames: new Set(),
+        native,
+      };
+      const { streamText: streamTextSpy } = await startStreamCapturingStreamTextForTests({
+        model,
+        messages,
+        toolSearchState,
+        providerOptions: { anthropic: { thinking, effort: "low" } },
+      });
+      const prepareStep = capturePrepareStep(streamTextSpy);
+      const replayed = [replaysReasoning(await prepareStep({ messages: inTurn }))];
+      toolSearchState.activatedToolNames.add("slack_send_message");
+      replayed.push(replaysReasoning(await prepareStep({ messages: inTurn })));
+      // Sticky: the blocks stay invalid on later steps with an unchanged tool set.
+      replayed.push(replaysReasoning(await prepareStep({ messages: inTurn })));
+      return replayed;
+    };
+
+    expect(await run({ type: "between_tools" })).toEqual([true, false, false]);
+    expect(await run({ type: "adaptive" })).toEqual([true, false, false]);
+    // Native tool search (#5262) keeps the tool set, so the blocks stay valid.
+    expect(await run({ type: "between_tools" }, true)).toEqual([true, true, true]);
+  });
+
+  test("a tool-set change ends in-turn reasoning replay for Claude on Bedrock (#5841)", async () => {
+    // Bedrock Converse replays in-turn Claude thinking from the `bedrock` namespace, and
+    // Bedrock cannot take drop_block, so a changed tool set must strip it as on the
+    // other non-direct Claude routes. Other Bedrock models keep their reasoning.
+    const bedrock = createAmazonBedrock({
+      region: "us-east-1",
+      accessKeyId: "test",
+      secretAccessKey: "test",
+    });
+    const run = async (modelId: string) => {
+      const inTurn = inTurnReasoningStep({ bedrock: { signature: "s" } });
+      const toolSearchState: ToolSearchStreamState = {
+        catalog: [{ name: "slack_send_message", description: "Send a message", paramText: "" }],
+        deferredToolNames: new Set(["slack_send_message"]),
+        allToolNames: ["bash", "tool_catalog_search", "slack_send_message"],
+        activatedToolNames: new Set(),
+        native: false,
+      };
+      const { streamText: streamTextSpy } = await startStreamCapturingStreamTextForTests({
+        model: bedrock(modelId),
+        modelString: `bedrock:${modelId}`,
+        messages,
+        toolSearchState,
+      });
+      const prepareStep = capturePrepareStep(streamTextSpy);
+      const reasoningCount = (step: PreparedStepForTests) =>
+        (step?.messages ?? inTurn).filter(
+          (message) =>
+            message.role === "assistant" &&
+            typeof message.content !== "string" &&
+            message.content.some((part) => part.type === "reasoning")
+        ).length;
+      const counts = [reasoningCount(await prepareStep({ messages: inTurn }))];
+      toolSearchState.activatedToolNames.add("slack_send_message");
+      counts.push(reasoningCount(await prepareStep({ messages: inTurn })));
+      return counts;
+    };
+
+    expect(await run("us.anthropic.claude-sonnet-5-5")).toEqual([1, 0]);
+    expect(await run("deepseek.r1-v1:0")).toEqual([1, 1]);
+  });
+
+  test("an in-turn Anthropic thinking strip leaves a replay receipt on the turn's row", async () => {
+    // Preserved thinking: once prepareStep stripped earlier blocks, the next turn must not
+    // put them back. The row carries the same receipt the signature repair writes, with the
+    // point at the step whose request first stripped: that step's thinking keeps replaying.
     const inTurn: ModelMessage[] = [
       { role: "user", content: "hello" },
       {
@@ -326,38 +559,68 @@ describe("StreamManager - tool search activeTools scoping", () => {
         ],
       },
     ];
-    const replaysReasoning = (step: PreparedStepForTests) =>
-      (step?.messages ?? inTurn).some(
-        (message) =>
-          message.role === "assistant" &&
-          typeof message.content !== "string" &&
-          message.content.some((part) => part.type === "reasoning")
-      );
-    const run = async (thinking: Record<string, unknown>) => {
+    const run = async (changeToolSet: boolean, prepareAhead = false) => {
       const toolSearchState: ToolSearchStreamState = {
         catalog: [{ name: "slack_send_message", description: "Send a message", paramText: "" }],
         deferredToolNames: new Set(["slack_send_message"]),
         allToolNames: ["bash", "tool_catalog_search", "slack_send_message"],
         activatedToolNames: new Set(),
+        native: false,
       };
-      const { streamText: streamTextSpy } = await startStreamCapturingStreamTextForTests({
-        model,
-        messages,
-        toolSearchState,
-        providerOptions: { anthropic: { thinking, effort: "low" } },
+      const step = (text: string) => [
+        { type: "start-step" },
+        { type: "text-delta", text },
+        { type: "finish-step", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } },
+      ];
+      // Drive prepareStep from inside the stream, as the SDK does between steps. The SDK
+      // can prepare a step before the consumer read the previous step (prepareAhead).
+      const streamText = mock((options: Parameters<typeof aiSdk.streamText>[0]) =>
+        createStreamResultForTests(
+          (async function* () {
+            await prepareStepForTests(options, inTurn, 0);
+            if (prepareAhead) {
+              if (changeToolSet) toolSearchState.activatedToolNames.add("slack_send_message");
+              await prepareStepForTests(options, inTurn, 1);
+            }
+            yield* step("first");
+            if (!prepareAhead) {
+              if (changeToolSet) toolSearchState.activatedToolNames.add("slack_send_message");
+              await prepareStepForTests(options, inTurn, 1);
+            }
+            yield* step("second");
+            yield { type: "finish", finishReason: "stop" };
+          })()
+        )
+      );
+      const streamManager = createStreamManagerForTests(historyService, {
+        streamText: fakeStreamText(streamText),
       });
-      const prepareStep = capturePrepareStep(streamTextSpy);
-      const replayed = [replaysReasoning(await prepareStep({ messages: inTurn }))];
-      toolSearchState.activatedToolNames.add("slack_send_message");
-      replayed.push(replaysReasoning(await prepareStep({ messages: inTurn })));
-      // Sticky: the blocks stay invalid on later steps with an unchanged tool set.
-      replayed.push(replaysReasoning(await prepareStep({ messages: inTurn })));
-      return replayed;
+      capturedStreamCounter += 1;
+      const workspaceId = `receipt-stream-${capturedStreamCounter}`;
+      const messageId = `${workspaceId}-message`;
+      await appendPartialAssistantForTests(workspaceId, messageId, 1);
+      const result = await streamManager.startStream(
+        testStartOptions({
+          workspaceId,
+          messageId,
+          providedRuntimeTempDir: "",
+          model,
+          messages,
+          toolSearchState,
+          providerOptions: { anthropic: { thinking: { type: "adaptive" }, effort: "low" } },
+        })
+      );
+      if (!result.success) throw new Error("Expected stream to start");
+      await result.data.completion;
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      const metadata = history.data.find((message) => message.id === messageId)?.metadata;
+      return [metadata?.anthropicThinkingReplay, metadata?.anthropicThinkingReplayFromStep];
     };
 
-    expect(await run({ type: "between_tools" })).toEqual([true, false, false]);
-    // Adaptive requests carry blockBinding (drop_block), so they keep replaying.
-    expect(await run({ type: "adaptive" })).toEqual([true, true, true]);
+    expect(await run(true)).toEqual(["off", 1]);
+    expect(await run(true, true)).toEqual(["off", 1]);
+    expect(await run(false)).toEqual([undefined, undefined]);
   });
 
   test("after a tool-set change, between_tools still replays reasoning created after it (#5279)", async () => {
@@ -392,6 +655,7 @@ describe("StreamManager - tool search activeTools scoping", () => {
       deferredToolNames: new Set(["slack_send_message"]),
       allToolNames: ["bash", "tool_catalog_search", "slack_send_message"],
       activatedToolNames: new Set(),
+      native: false,
     };
     const { streamText: streamTextSpy } = await startStreamCapturingStreamTextForTests({
       model,

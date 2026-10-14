@@ -14,7 +14,8 @@ export interface AutoCompactionConfig {
   rolloverEnabled?: boolean;
   /** Context limit the usage meter uses; unknown keeps the stored slider value. */
   modelContextLimit?: number | null;
-  setThreshold: (threshold: number) => void;
+  /** Absent where the threshold cannot be saved (the VS Code webview): the slider is read-only. */
+  setThreshold?: (threshold: number) => void;
   /**
    * Warning if the compaction model context window is smaller than the
    * auto-compact threshold, which could make compaction fail.
@@ -112,18 +113,19 @@ export function getAutoCompactionLabel(config: AutoCompactionConfig): string {
  */
 export const ThresholdSlider: React.FC<{ config: AutoCompactionConfig }> = ({ config }) => {
   const containerRef = useRef<HTMLDivElement>(null);
+  const setThreshold = config.setThreshold;
 
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     e.preventDefault();
 
     const rect = containerRef.current?.getBoundingClientRect();
-    if (!rect) return;
+    if (!rect || !setThreshold) return;
 
     const pointerId = e.pointerId;
     const calcPercent = (clientX: number) =>
       snapPercent(((clientX - rect.left) / rect.width) * 100);
 
-    const apply = (pct: number) => applyThreshold(pct, config.setThreshold);
+    const apply = (pct: number) => applyThreshold(pct, setThreshold);
 
     // The handle sits at the effective (possibly clamped) threshold, not the stored one, so a
     // press alone must not persist: a stored 90% shown at 85.6% would otherwise save 85%.
@@ -199,14 +201,16 @@ export const ThresholdSlider: React.FC<{ config: AutoCompactionConfig }> = ({ co
 
   return (
     <div ref={containerRef} style={containerStyle}>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <div style={handleStyle} onPointerDown={handlePointerDown} />
-        </TooltipTrigger>
-        <TooltipContent side="top" showArrow={false}>
-          {tooltipText}
-        </TooltipContent>
-      </Tooltip>
+      {setThreshold && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <div style={handleStyle} onPointerDown={handlePointerDown} />
+          </TooltipTrigger>
+          <TooltipContent side="top" showArrow={false}>
+            {tooltipText}
+          </TooltipContent>
+        </Tooltip>
+      )}
 
       {/* Visual indicator - pointer events disabled */}
       <div style={indicatorStyle}>

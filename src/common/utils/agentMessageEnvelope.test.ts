@@ -33,6 +33,23 @@ describe("agentMessageEnvelope", () => {
     expect(parseAgentMessageEnvelope(formatAgentMessageEnvelope(envelope))).toEqual(envelope);
   });
 
+  test.each(["main_chat", "side_chat"] as const)(
+    "round-trips %s envelopes and validates persisted attribution",
+    (relationship) => {
+      const envelope: AgentMessageEnvelope = {
+        from: "linked-chat",
+        relationship,
+        message: "Can you explain this decision?",
+      };
+      expect(parseAgentMessageEnvelope(formatAgentMessageEnvelope(envelope))).toEqual(envelope);
+      const attribution = { fromWorkspaceId: envelope.from, relationship };
+      expect(getValidAgentPeerTriggerMeta(attribution)).toEqual(attribution);
+      expect(getValidAgentPeerMessageMeta({ type: "agent-peer-message", ...attribution })).toEqual(
+        attribution
+      );
+    }
+  );
+
   test("trigger and payload metadata validators accept unrelated but reject unknown relationships", () => {
     const unrelated = { fromWorkspaceId: "ws-other-root", relationship: "unrelated" };
     expect(getValidAgentPeerTriggerMeta(unrelated)).toEqual({

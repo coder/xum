@@ -72,9 +72,11 @@ export function buildHistoryEditPrecondition(
   assert(isNonNegativeInteger(rangeStart.metadata?.historySequence), "range start is committed");
   let newest = rangeStart;
   for (const message of committed) {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     if (message.metadata!.historySequence! > newest.metadata!.historySequence!) newest = message;
   }
   const rangeStartHistorySequence = rangeStart.metadata.historySequence;
+  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
   const newestHistorySequence = newest.metadata!.historySequence!;
   const range = computeHistoryRangeFingerprint(
     committed,

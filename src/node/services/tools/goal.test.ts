@@ -7,12 +7,14 @@ import type { Config } from "@/node/config";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
+import { IdleDispatcher } from "@/node/services/idleDispatcher";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import type { GoalToolContext } from "@/common/utils/tools/toolAvailability";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { createCompleteGoalTool } from "./complete_goal";
 import { createGetGoalTool } from "./get_goal";
 import { createSetGoalTool } from "./set_goal";
+import { GOAL_BUDGET_LIMIT_KIND, GOAL_CONTINUATION_KIND } from "@/constants/goals";
 
 // Goal tools do not touch runtime; ToolFactory config still requires one.
 // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
@@ -26,31 +28,28 @@ const mockToolCallOptions: ToolExecutionOptions<unknown> = {
 
 // Per-turn goal tool contexts (#5247). The goal tools are always registered, so
 // these contexts, not tool presence, decide what each call may do.
-const execAgent = { id: "exec" as const, tools: { add: [".*"], remove: ["propose_plan"] } };
-const exploreAgent = {
-  id: "explore" as const,
-  tools: { remove: ["file_edit_.*", "task_apply_git_patch"] },
-};
-const USER_TURN_EXEC_CONTEXT = {
+// User sends, delegated workspace turns and heartbeats all get this context:
+// any top-level workspace may set a goal without a per-send opt-in.
+const TOP_LEVEL_EXEC_CONTEXT = {
   parentWorkspaceId: null,
-  allowAgentSetGoal: true,
-  agentInheritanceChain: [execAgent],
+  agentId: "exec",
 };
-// Goal-continuation turns drop allowAgentSetGoal (continuationSendOptions).
-const CONTINUATION_TURN_EXEC_CONTEXT = {
+// Turns the goal loop starts itself (agentSession's backend-owned goalKind).
+const CONTINUATION_TURN_EXEC_CONTEXT: GoalToolContext = {
   parentWorkspaceId: null,
-  allowAgentSetGoal: undefined,
-  agentInheritanceChain: [execAgent],
+  goalTurnKind: GOAL_CONTINUATION_KIND,
+  agentId: "exec",
 };
-const SUB_AGENT_EXEC_CONTEXT = {
+const BUDGET_WRAPUP_TURN_EXEC_CONTEXT: GoalToolContext = {
+  parentWorkspaceId: null,
+  goalTurnKind: GOAL_BUDGET_LIMIT_KIND,
+  agentId: "exec",
+};
+/** An automatic sub-agent turn TaskService drove (here: a required-report prompt). */
+const SUB_AGENT_EXEC_CONTEXT: GoalToolContext = {
   parentWorkspaceId: "parent-workspace",
-  allowAgentSetGoal: true,
-  agentInheritanceChain: [execAgent],
-};
-const USER_TURN_READ_ONLY_CONTEXT = {
-  parentWorkspaceId: null,
-  allowAgentSetGoal: true,
-  agentInheritanceChain: [exploreAgent, execAgent],
+  agentId: "exec",
+  taskTurnKind: "required_report",
 };
 
 async function setGoalOk(
@@ -120,7 +119,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     const result: unknown = await Promise.resolve(tool.execute!({}, mockToolCallOptions));
@@ -135,7 +134,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
       goalDefaults: {
         defaultBudgetCents: 300,
         defaultTurnCap: 5,
@@ -175,7 +174,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
       goalDefaults: {
         defaultBudgetCents: 450,
         defaultTurnCap: 3,
@@ -200,7 +199,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
       goalDefaults: {
         defaultBudgetCents: 650,
         defaultTurnCap: null,
@@ -222,7 +221,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
       goalDefaults: {
         defaultBudgetCents: 300,
         defaultTurnCap: 5,
@@ -247,7 +246,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
       goalDefaults: {
         defaultBudgetCents: 0,
         defaultTurnCap: null,
@@ -270,7 +269,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     const error = await expectToolError(() =>
@@ -288,7 +287,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     const error = await expectToolError(() =>
@@ -315,7 +314,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     const error = await expectToolError(() =>
@@ -342,7 +341,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     try {
@@ -366,7 +365,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     const result: unknown = await Promise.resolve(
@@ -394,7 +393,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     const result: unknown = await Promise.resolve(
@@ -429,7 +428,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     const result: unknown = await Promise.resolve(
@@ -456,7 +455,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     const result: unknown = await Promise.resolve(
@@ -466,7 +465,8 @@ describe("goal tools", () => {
     expect(result).toMatchObject({ goal: { objective: "Follow-on", status: "active" } });
   });
 
-  test("set_goal surfaces child workspace errors clearly", async () => {
+  // Sub-agents own goals: the child's own (user or delegated) turn may set one.
+  test("set_goal creates a goal on a sub-agent's own turn", async () => {
     const childWorkspaceId = "goal-tool-child";
     await config.addWorkspace("/tmp/mux-goal-tool-test-project", {
       id: childWorkspaceId,
@@ -482,15 +482,64 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId: childWorkspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: { parentWorkspaceId: workspaceId, agentId: "exec" },
     });
 
-    const error = await expectToolError(() =>
-      Promise.resolve(tool.execute!({ objective: "Child goal" }, mockToolCallOptions))
-    );
+    await Promise.resolve(tool.execute!({ objective: "Child goal" }, mockToolCallOptions));
 
-    expect(error.message).toContain("child_workspace");
+    expect(await goalService.getGoal(childWorkspaceId)).toMatchObject({
+      objective: "Child goal",
+      status: "active",
+    });
   });
+
+  // A child's goal turns run on the agent TaskService resumes it with, where the creation-time
+  // agentType wins over a restamped agentId; the selected-agent gate must compare against it.
+  test.each([
+    { turnAgentId: "explore", created: true },
+    { turnAgentId: "exec", created: false },
+  ])(
+    "set_goal on a sub-agent gates on its resume agent (turn $turnAgentId)",
+    async ({ turnAgentId, created }) => {
+      const childWorkspaceId = `goal-tool-child-${turnAgentId}`;
+      await config.addWorkspace("/tmp/mux-goal-tool-test-project", {
+        id: childWorkspaceId,
+        name: childWorkspaceId,
+        projectName: "mux-goal-tool-test-project",
+        projectPath: "/tmp/mux-goal-tool-test-project",
+        runtimeConfig: { type: "local" },
+        parentWorkspaceId: workspaceId,
+        agentType: "explore",
+        agentId: "exec",
+      });
+      const tool = createSetGoalTool({
+        cwd: "/tmp",
+        runtimeTempDir: "/tmp",
+        runtime: inertRuntime,
+        workspaceId: childWorkspaceId,
+        goalService,
+        goalToolContext: { parentWorkspaceId: workspaceId, agentId: turnAgentId },
+      });
+
+      const run = Promise.resolve(
+        tool.execute!({ objective: "Child research" }, mockToolCallOptions)
+      );
+      if (created) {
+        await run;
+        expect(await goalService.getGoal(childWorkspaceId)).toMatchObject({
+          objective: "Child research",
+          status: "active",
+        });
+      } else {
+        const error = await run.then(
+          () => null,
+          (rejection: unknown) => rejection
+        );
+        expect(String(error)).toContain("selected agent (explore)");
+        expect(await goalService.getGoal(childWorkspaceId)).toBeNull();
+      }
+    }
+  );
 
   test("set_goal queues mid-stream goals with a durable returned goalId", async () => {
     interface StreamingOverride {
@@ -505,7 +554,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
       goalDefaults: {
         defaultBudgetCents: 300,
         defaultTurnCap: 2,
@@ -533,7 +582,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
     const completed: unknown = await Promise.resolve(
       completeTool.execute!(
@@ -563,7 +612,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     let returnedGoalId = "";
@@ -609,7 +658,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
       goalDefaults: {
         defaultBudgetCents: 300,
         defaultTurnCap: 2,
@@ -642,7 +691,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     const result: unknown = await Promise.resolve(
@@ -683,8 +732,8 @@ describe("goal tools", () => {
   //
   // complete_goal is registered on every turn (#5247), so a call without an
   // active goal must come back as a typed result the model can act on, not an
-  // unknown tool or a confusing validation error. Covered below: no goal, a
-  // goal cleared mid-stream, and a paused goal. A forwarded `goalId` mismatch
+  // unknown tool or a confusing validation error. Covered below: no goal and a
+  // goal cleared mid-stream. A forwarded `goalId` mismatch
   // still surfaces as a typed `goal_conflict` from the service.
   // ---------------------------------------------------------------------------
   test.each([
@@ -696,13 +745,6 @@ describe("goal tools", () => {
         await goalService.clearGoal(workspaceId);
       },
     },
-    {
-      label: "the goal is paused",
-      arrange: async () => {
-        await setGoalOk(goalService, { workspaceId, objective: "Will be paused" });
-        await setGoalOk(goalService, { workspaceId, status: "paused" });
-      },
-    },
   ])("complete_goal returns a typed no_active_goal result when $label", async ({ arrange }) => {
     await arrange();
     const before = await goalService.getGoal(workspaceId);
@@ -712,7 +754,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     const result: unknown = await Promise.resolve(
@@ -723,6 +765,34 @@ describe("goal tools", () => {
     expect(await goalService.getGoal(workspaceId)).toEqual(before);
   });
 
+  // The work can finish while the goal loop is paused: complete_goal must not
+  // force a resume first.
+  test("complete_goal completes a paused goal", async () => {
+    const created = await setGoalOk(goalService, { workspaceId, objective: "Paused but done" });
+    await setGoalOk(goalService, { workspaceId, status: "paused" });
+    const tool = createCompleteGoalTool({
+      cwd: "/tmp",
+      runtimeTempDir: "/tmp",
+      runtime: inertRuntime,
+      workspaceId,
+      goalService,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
+    });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!(
+        { summary: "Finished while paused.", goalId: created.goalId },
+        mockToolCallOptions
+      )
+    );
+
+    expect(result).toMatchObject({ goal: { goalId: created.goalId, status: "complete" } });
+    expect(await goalService.getGoal(workspaceId)).toMatchObject({
+      status: "complete",
+      completionSummary: "Finished while paused.",
+    });
+  });
+
   test("complete_goal surfaces goal_conflict when expected goalId is stale", async () => {
     await setGoalOk(goalService, { workspaceId, objective: "Compete with a stale goalId" });
     const tool = createCompleteGoalTool({
@@ -731,7 +801,7 @@ describe("goal tools", () => {
       runtime: inertRuntime,
       workspaceId,
       goalService,
-      goalToolContext: USER_TURN_EXEC_CONTEXT,
+      goalToolContext: TOP_LEVEL_EXEC_CONTEXT,
     });
 
     // Forwarded `goalId` does not match the actual goal — setGoal returns
@@ -772,16 +842,22 @@ describe("goal tools", () => {
     }
 
     test.each([
-      { label: "a sub-agent", context: SUB_AGENT_EXEC_CONTEXT, reason: "sub_agent" },
+      ...(["required_report", "recovery", "goal_continuation", "goal_budget_limit"] as const).map(
+        (taskTurnKind) => ({
+          label: `a sub-agent's ${taskTurnKind} turn`,
+          context: { parentWorkspaceId: "parent-workspace", agentId: "exec", taskTurnKind },
+          reason: "automatic_task_turn",
+        })
+      ),
       {
-        label: "a turn without allowAgentSetGoal",
+        label: "a goal-continuation turn",
         context: CONTINUATION_TURN_EXEC_CONTEXT,
-        reason: "agent_set_goal_disabled",
+        reason: "automatic_goal_turn",
       },
       {
-        label: "a read-only agent",
-        context: USER_TURN_READ_ONLY_CONTEXT,
-        reason: "read_only_agent",
+        label: "a budget wrap-up turn",
+        context: BUDGET_WRAPUP_TURN_EXEC_CONTEXT,
+        reason: "automatic_goal_turn",
       },
     ])("set_goal refuses $label with a typed not-allowed result", async ({ context, reason }) => {
       const setGoalSpy = spyOn(goalService, "setGoal");
@@ -796,28 +872,46 @@ describe("goal tools", () => {
       expect(await goalService.getGoal(workspaceId)).toBeNull();
     });
 
-    test("set_goal names the allowAgentSetGoal setting when goal-setting is off for the turn", async () => {
-      const tool = createSetGoalTool(toolConfig(CONTINUATION_TURN_EXEC_CONTEXT));
-
-      const result = (await Promise.resolve(
-        tool.execute!({ objective: "Not allowed here" }, mockToolCallOptions)
-      )) as { error: string };
-
-      expect(result.error).toContain("allowAgentSetGoal");
-    });
-
-    test("complete_goal refuses a read-only agent and leaves the active goal untouched", async () => {
-      const created = await setGoalOk(goalService, { workspaceId, objective: "Keep going" });
-      const tool = createCompleteGoalTool(toolConfig(USER_TURN_READ_ONLY_CONTEXT));
+    // Replacing the goal from a turn the goal loop started would reset its spend
+    // and turn counters and re-arm continuations, so the caps could never stop it.
+    test.each([
+      { label: "goal-continuation", context: CONTINUATION_TURN_EXEC_CONTEXT },
+      { label: "budget wrap-up", context: BUDGET_WRAPUP_TURN_EXEC_CONTEXT },
+    ])("a $label turn cannot replace the current goal", async ({ context }) => {
+      const created = await setGoalOk(goalService, { workspaceId, objective: "Bounded work" });
+      const tool = createSetGoalTool(toolConfig(context));
 
       const result: unknown = await Promise.resolve(
-        tool.execute!({ summary: "Done.", goalId: created.goalId }, mockToolCallOptions)
+        tool.execute!(
+          {
+            objective: "Fresh budget",
+            replaceExistingGoal: true,
+            expectedGoalId: created.goalId,
+          },
+          mockToolCallOptions
+        )
       );
 
-      expect(result).toMatchObject({ success: false, code: "complete_goal_not_allowed" });
+      expect(result).toMatchObject({ success: false, reason: "automatic_goal_turn" });
+      expect(await goalService.getGoal(workspaceId)).toEqual(created);
+    });
+
+    test("a goal-continuation turn cannot start a new goal after completing the current one", async () => {
+      const created = await setGoalOk(goalService, { workspaceId, objective: "First goal" });
+      const completeTool = createCompleteGoalTool(toolConfig(CONTINUATION_TURN_EXEC_CONTEXT));
+      const setTool = createSetGoalTool(toolConfig(CONTINUATION_TURN_EXEC_CONTEXT));
+
+      await Promise.resolve(
+        completeTool.execute!({ summary: "Done.", goalId: created.goalId }, mockToolCallOptions)
+      );
+      const result: unknown = await Promise.resolve(
+        setTool.execute!({ objective: "Chained goal" }, mockToolCallOptions)
+      );
+
+      expect(result).toMatchObject({ success: false, reason: "automatic_goal_turn" });
       expect(await goalService.getGoal(workspaceId)).toMatchObject({
         goalId: created.goalId,
-        status: "active",
+        status: "complete",
       });
     });
 
@@ -838,8 +932,34 @@ describe("goal tools", () => {
       expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "complete" });
     });
 
-    test("set_goal still creates a goal on an allowed user turn", async () => {
-      const tool = createSetGoalTool(toolConfig(USER_TURN_EXEC_CONTEXT));
+    // #5461: until a turn's streaming=true metadata write lands, a goal the user replaces in the
+    // UI persists at once instead of queueing. An automatic goal turn still works on the goal it
+    // was dispatched for, so complete_goal without a goalId must not complete the replacement.
+    test("complete_goal without goalId on a goal turn refuses a goal replaced after dispatch", async () => {
+      const dispatched = await setGoalOk(goalService, { workspaceId, objective: "Dispatched" });
+      const tool = createCompleteGoalTool(
+        toolConfig({ ...CONTINUATION_TURN_EXEC_CONTEXT, goalId: dispatched.goalId })
+      );
+      const replacement = await setGoalOk(goalService, {
+        workspaceId,
+        objective: "Replacement",
+        expectedGoalId: dispatched.goalId,
+      });
+      expect(replacement.goalId).not.toBe(dispatched.goalId);
+
+      const error = await expectToolError(() =>
+        Promise.resolve(tool.execute!({ summary: "Verified." }, mockToolCallOptions))
+      );
+
+      expect(error.message).toContain("goal_conflict");
+      expect(await goalService.getGoal(workspaceId)).toMatchObject({
+        goalId: replacement.goalId,
+        status: "active",
+      });
+    });
+
+    test("set_goal creates a goal on a top-level workspace turn", async () => {
+      const tool = createSetGoalTool(toolConfig(TOP_LEVEL_EXEC_CONTEXT));
 
       const result: unknown = await Promise.resolve(
         tool.execute!({ objective: "Allowed goal" }, mockToolCallOptions)
@@ -849,40 +969,232 @@ describe("goal tools", () => {
     });
 
     test("get_goal returns a null goal when no goal exists", async () => {
-      const tool = createGetGoalTool(toolConfig(CONTINUATION_TURN_EXEC_CONTEXT));
+      const tool = createGetGoalTool(toolConfig(TOP_LEVEL_EXEC_CONTEXT));
 
       const result: unknown = await Promise.resolve(tool.execute!({}, mockToolCallOptions));
 
       expect(result).toEqual({ goal: null });
     });
 
-    test("get_goal hides a paused goal unless the turn may replace it with set_goal", async () => {
+    // A paused goal is completable on every turn, so every turn can read its goalId.
+    test("get_goal returns a paused goal even when the turn cannot replace it", async () => {
       const created = await setGoalOk(goalService, { workspaceId, objective: "Paused work" });
       await setGoalOk(goalService, { workspaceId, status: "paused" });
 
       const withoutSetGoal: unknown = await Promise.resolve(
-        createGetGoalTool(toolConfig(CONTINUATION_TURN_EXEC_CONTEXT)).execute!(
-          {},
-          mockToolCallOptions
-        )
-      );
-      const withSetGoal: unknown = await Promise.resolve(
-        createGetGoalTool(toolConfig(USER_TURN_EXEC_CONTEXT)).execute!({}, mockToolCallOptions)
+        createGetGoalTool(toolConfig(SUB_AGENT_EXEC_CONTEXT)).execute!({}, mockToolCallOptions)
       );
 
-      expect(withoutSetGoal).toEqual({ goal: null });
-      expect(withSetGoal).toMatchObject({ goal: { goalId: created.goalId, status: "paused" } });
+      expect(withoutSetGoal).toMatchObject({ goal: { goalId: created.goalId, status: "paused" } });
     });
 
-    test("get_goal returns an active goal to read-only agents and sub-agents", async () => {
+    test("get_goal returns an active goal to sub-agents", async () => {
       const created = await setGoalOk(goalService, { workspaceId, objective: "Active work" });
 
-      for (const context of [USER_TURN_READ_ONLY_CONTEXT, SUB_AGENT_EXEC_CONTEXT]) {
-        const result: unknown = await Promise.resolve(
-          createGetGoalTool(toolConfig(context)).execute!({}, mockToolCallOptions)
-        );
-        expect(result).toMatchObject({ goal: { goalId: created.goalId, status: "active" } });
-      }
+      const result: unknown = await Promise.resolve(
+        createGetGoalTool(toolConfig(SUB_AGENT_EXEC_CONTEXT)).execute!({}, mockToolCallOptions)
+      );
+      expect(result).toMatchObject({ goal: { goalId: created.goalId, status: "active" } });
     });
   });
+});
+
+// Automatic goal turns run on the workspace's persisted agent selection, so a
+// model-created goal is accepted only while the setting turn's resolved agent is
+// still that selection, compared live where the mutation is installed/written.
+describe("set_goal workspace agent selection gate", () => {
+  let config: Config;
+  let cleanup: () => Promise<void>;
+  let goalService: WorkspaceGoalService;
+  let extensionMetadata: ExtensionMetadataService;
+  const workspaceId = "goal-selection-gate-workspace";
+  const projectPath = "/tmp/mux-goal-selection-gate-project";
+  // A selectable agent other than exec.
+  const reviewerContext: GoalToolContext = { parentWorkspaceId: null, agentId: "reviewer" };
+
+  async function selectAgent(agentId: string): Promise<void> {
+    await config.editConfig((cfg) => {
+      const workspace = cfg.projects
+        .get(projectPath)
+        ?.workspaces.find((entry) => entry.id === workspaceId);
+      if (workspace == null) throw new Error("test workspace missing");
+      workspace.agentId = agentId;
+      return cfg;
+    });
+  }
+
+  function setGoalTool(goalToolContext: GoalToolContext) {
+    return createSetGoalTool({
+      cwd: "/tmp",
+      runtimeTempDir: "/tmp",
+      runtime: inertRuntime,
+      workspaceId,
+      goalService,
+      goalToolContext,
+      goalDefaults: {
+        defaultBudgetCents: 300,
+        defaultTurnCap: 5,
+        alwaysRequireExplicitBudget: true,
+      },
+    });
+  }
+
+  const setGoalArgs = {
+    objective: "Review the module",
+    budgetCents: 200,
+    turnCap: null,
+    replaceExistingGoal: true,
+    expectedGoalId: null,
+  };
+
+  beforeEach(async () => {
+    const testServices = await createTestHistoryService();
+    ({ config, cleanup } = testServices);
+    await config.addWorkspace(projectPath, {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "mux-goal-selection-gate-project",
+      projectPath,
+      runtimeConfig: { type: "local" },
+    });
+    extensionMetadata = new ExtensionMetadataService(
+      path.join(config.rootDir, "extensionMetadata.json")
+    );
+    goalService = new WorkspaceGoalService(
+      config,
+      testServices.historyService,
+      extensionMetadata,
+      analyticsMock()
+    );
+  });
+
+  afterEach(async () => {
+    await cleanup();
+  });
+
+  test("creates the goal when the turn's agent is the workspace's selected agent", async () => {
+    await selectAgent("reviewer");
+    const result: unknown = await setGoalTool(reviewerContext).execute!(
+      setGoalArgs,
+      mockToolCallOptions
+    );
+    expect(result).toMatchObject({ goal: { objective: "Review the module", status: "active" } });
+    expect(await goalService.getGoal(workspaceId)).toMatchObject({
+      objective: "Review the module",
+    });
+  });
+
+  // A malformed persisted selection streams as the default agent (resolution validates the
+  // id), so the gate must treat it as that agent rather than refusing every turn.
+  test("treats a malformed persisted selection as the default agent", async () => {
+    await selectAgent("../not-an-agent");
+    const execContext: GoalToolContext = { parentWorkspaceId: null, agentId: "exec" };
+    const result: unknown = await setGoalTool(execContext).execute!(
+      setGoalArgs,
+      mockToolCallOptions
+    );
+    expect(result).toMatchObject({ goal: { objective: "Review the module", status: "active" } });
+  });
+
+  // complete_goal is open to read-only agents, so a one-shot override (not the selected
+  // agent) must not complete the selected agent's goal; the goal loop's own turns still may.
+  test.each([
+    { label: "a one-shot override's own turn", goalTurnKind: undefined, completed: false },
+    { label: "an automatic goal turn", goalTurnKind: GOAL_CONTINUATION_KIND, completed: true },
+  ])("complete_goal by a non-selected agent on $label", async ({ goalTurnKind, completed }) => {
+    await selectAgent("exec");
+    await setGoalOk(goalService, { workspaceId, objective: "Exec goal", budgetCents: 500 });
+    const tool = createCompleteGoalTool({
+      cwd: "/tmp",
+      runtimeTempDir: "/tmp",
+      runtime: inertRuntime,
+      workspaceId,
+      goalService,
+      goalToolContext: {
+        parentWorkspaceId: null,
+        agentId: "explore",
+        ...(goalTurnKind != null ? { goalTurnKind } : {}),
+      },
+    });
+    const run = Promise.resolve(
+      tool.execute!({ summary: "Done researching" }, mockToolCallOptions)
+    );
+    if (completed) {
+      await run;
+      expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "complete" });
+    } else {
+      const error = await run.then(
+        () => null,
+        (rejection: unknown) => rejection
+      );
+      expect(String(error)).toContain("selected agent (exec)");
+      expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "active" });
+    }
+  });
+
+  test("refuses a one-shot agent override and leaves the existing goal unchanged", async () => {
+    await selectAgent("exec");
+    const existing = await setGoalOk(goalService, {
+      workspaceId,
+      objective: "Existing goal",
+      budgetCents: 500,
+    });
+
+    const error = await expectToolError(() =>
+      Promise.resolve(setGoalTool(reviewerContext).execute!(setGoalArgs, mockToolCallOptions))
+    );
+    expect(error.message).toContain("selected agent (exec)");
+    expect(await goalService.getGoal(workspaceId)).toEqual(existing);
+  });
+
+  // The bridge's kickoff probe runs inside the mutation (budget pricing), after the
+  // tool started executing: a selection flipped there must still refuse, on both the
+  // direct-persistence path and the mid-stream (queued mutation) path.
+  test.each([
+    { streaming: false, flip: false },
+    { streaming: false, flip: true },
+    { streaming: true, flip: false },
+    { streaming: true, flip: true },
+  ])(
+    "re-checks the selection at the mutation boundary (streaming=$streaming, selection changed=$flip)",
+    async ({ streaming, flip }) => {
+      await selectAgent("reviewer");
+      if (streaming) await extensionMetadata.setStreaming(workspaceId, true);
+      let flipped = false;
+      goalService.registerGoalContinuationConsumer(new IdleDispatcher(), {
+        hasActiveDescendantTasks: () => false,
+        getRuntimeState: () => ({ isRuntimeCompatible: true }),
+        executeGoalContinuation: () => Promise.resolve(false),
+        getKickoffSendOptions: async () => {
+          if (flip && !flipped) {
+            flipped = true;
+            await selectAgent("exec");
+          }
+          return { model: "openai:gpt-4o", agentId: "exec" };
+        },
+      });
+
+      const execute = () =>
+        Promise.resolve(setGoalTool(reviewerContext).execute!(setGoalArgs, mockToolCallOptions));
+      if (flip) {
+        const error = await expectToolError(execute);
+        expect(flipped).toBe(true);
+        expect(error.message).toContain("selected agent (exec)");
+        expect(await goalService.getGoal(workspaceId)).toBeNull();
+        expect(goalService.getPendingGoalSnapshot(workspaceId)).toBeNull();
+      } else {
+        expect(await execute()).toMatchObject({ goal: { objective: "Review the module" } });
+        if (streaming) {
+          // Mid-stream the goal is queued until stream end, published optimistically.
+          expect(goalService.getPendingGoalSnapshot(workspaceId)).toMatchObject({
+            objective: "Review the module",
+          });
+        } else {
+          expect(await goalService.getGoal(workspaceId)).toMatchObject({
+            objective: "Review the module",
+          });
+        }
+      }
+    }
+  );
 });

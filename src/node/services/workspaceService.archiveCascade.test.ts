@@ -145,6 +145,46 @@ describe("parent archive cascades over its sub-agent tree across two backends", 
     }
   });
 
+  test.each([null, childId, rootId])(
+    "archiving a tree discards only archived owners' side chats (refused owner: %s)",
+    async (refusedId) => {
+      await setArchiveBehavior("keep");
+      const sideChatIds = new Map<string, string>();
+      for (const ownerId of allIds) {
+        const side = await a.workspaceService.createSideChat(ownerId);
+        if (!side.success) throw new Error(side.error);
+        sideChatIds.set(ownerId, side.data.metadata.id);
+      }
+      if (refusedId != null) {
+        const hooks = new WorkspaceLifecycleHooks();
+        hooks.registerBeforeArchive(({ workspaceId }) =>
+          Promise.resolve(workspaceId === refusedId ? Err("archive refused") : Ok(undefined))
+        );
+        a.workspaceService.setWorkspaceLifecycleHooks(hooks);
+      }
+
+      const result = await a.workspaceService.archive(rootId);
+      expect(result.success).toBe(refusedId == null);
+
+      // The cascade is deepest-first. A later refusal must still clean up the successful
+      // descendants, while keeping the failed/skipped owners' side chats available.
+      const archivedIds =
+        refusedId === childId
+          ? [grandchildId]
+          : refusedId === rootId
+            ? [childId, grandchildId]
+            : allIds;
+      for (const ownerId of allIds) {
+        const archived = archivedIds.includes(ownerId);
+        expect(findWorkspaceInConfig(b.config, ownerId)?.archivedAt != null).toBe(archived);
+        expect(await exists(checkouts.get(ownerId)!)).toBe(true);
+        const sideId = sideChatIds.get(ownerId)!;
+        expect(b.config.findWorkspace(sideId) == null).toBe(archived);
+        expect(await exists(path.join(b.config.sessionsDir, sideId))).toBe(!archived);
+      }
+    }
+  );
+
   test("a delete-mode archive refuses while the other backend uses a descendant, archiving nothing", async () => {
     await setArchiveBehavior("delete");
     leases.push(await workspaceUseLeasesFor(b.config).hold(childId, "terminal"));

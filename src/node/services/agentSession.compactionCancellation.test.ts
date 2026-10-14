@@ -24,6 +24,7 @@ import {
   CompactionCancellationReadRefusedError,
 } from "./compactionCancellation";
 import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSession.testHarness";
+import { createContextBudgetWarning } from "./contextWindowRollover";
 
 const workspaceId = "cancellation-runtime";
 const options = { model: "openai:gpt-4o", agentId: "exec" };
@@ -2279,7 +2280,7 @@ describe("compaction cancellation runtime", () => {
     }
   );
 
-  test.each(["user", "assistant", "partial"] as const)(
+  test.each(["user", "assistant", "partial", "user-then-budget-warning"] as const)(
     "explicit resume stamps the actual %s tail before notices",
     async (kind) => {
       const h = await fixture();
@@ -2287,6 +2288,21 @@ describe("compaction cancellation runtime", () => {
         workspaceId,
         createMuxMessage("user", "user", "prior")
       );
+      // #5286 appends the Token Budget warning after the turn's user row. The warning is a
+      // notice, so the resume target stays the user row it follows.
+      const warning = createContextBudgetWarning({
+        contextTokens: 90_000,
+        maxTokens: 128_000,
+        budgetTokens: 119_808,
+        sessionHistoryAvailable: true,
+        handoff: true,
+        handoffTokens: 89_600,
+        newContextAvailable: true,
+      });
+      if (kind === "user-then-budget-warning")
+        await h.historyService.appendToHistory(workspaceId, warning);
+      const targetId = kind === "user-then-budget-warning" ? "user" : kind;
+      const tailId = kind === "user-then-budget-warning" ? warning.id : kind;
       if (kind === "assistant")
         await h.historyService.appendToHistory(
           workspaceId,
@@ -2310,10 +2326,14 @@ describe("compaction cancellation runtime", () => {
       );
       const notice = spyOn(h.state.fileChangeTracker, "getChangedAttachments").mockImplementation(
         async () => {
-          expect((await h.rows()).at(-1)).toMatchObject({
-            id: kind,
-            metadata: { compactionReplacementNonce: stop?.nonce },
-          });
+          const rows = await h.rows();
+          // No notice row lands before the stamp: the tail is still the resumed history.
+          expect(rows.at(-1)?.id).toBe(tailId);
+          const stamped = rows.filter(
+            (row) => row.metadata?.compactionReplacementNonce === stop?.nonce
+          );
+          expect(stop?.nonce).toBeDefined();
+          expect(stamped.map((row) => row.id)).toEqual([targetId]);
           expect(await h.storage.read()).toBeNull();
           return detect();
         }

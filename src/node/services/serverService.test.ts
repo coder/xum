@@ -84,6 +84,32 @@ describe("ServerService.startServer", () => {
     });
   }
 
+  test("refuses to start in session tape replay mode, which serves only desktop windows", async () => {
+    const service = new ServerService();
+    const saved = process.env.XUM_REPLAY_TAPES;
+    process.env.XUM_REPLAY_TAPES = JSON.stringify({ ws: "/tapes/ws.jsonl" });
+    try {
+      let thrownError: unknown = null;
+      try {
+        await service.startServer({
+          xumHome: tempDir,
+          context: stubContext,
+          authToken: "test-token",
+          port: 0,
+        });
+      } catch (err) {
+        thrownError = err;
+      }
+      expect((thrownError as Error | null)?.message).toMatch(/replay mode/);
+      expect(service.isServerRunning()).toBe(false);
+      // No lockfile either: nothing may advertise a server that does not exist.
+      expect(await fs.stat(path.join(tempDir, "server.lock")).catch(() => null)).toBeNull();
+    } finally {
+      if (saved === undefined) delete process.env.XUM_REPLAY_TAPES;
+      else process.env.XUM_REPLAY_TAPES = saved;
+    }
+  });
+
   test("cleans up server when lockfile acquisition fails", async () => {
     const service = new ServerService();
 

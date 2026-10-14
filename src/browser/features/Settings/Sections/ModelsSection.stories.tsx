@@ -78,13 +78,15 @@ export const ModelsEmpty: Story = {
 export const ModelsConfigured: Story = {
   render: () => (
     <SettingsSectionStory
-      setup={() => {
-        window.localStorage.setItem(
-          "provider_options_anthropic",
-          JSON.stringify({ use1MContextModels: ["anthropic:claude-sonnet-4-20250514"] })
-        );
-
-        return setupSettingsStory({
+      setup={() =>
+        setupSettingsStory({
+          userPreferences: {
+            ai: {
+              providerOptions: {
+                anthropic: { use1MContextModels: ["anthropic:claude-sonnet-4-20250514"] },
+              },
+            },
+          },
           providersConfig: {
             anthropic: {
               apiKeySet: true,
@@ -108,8 +110,8 @@ export const ModelsConfigured: Story = {
               models: ["grok-beta"],
             },
           },
-        });
-      }}
+        })
+      }
     >
       <ModelsSection />
     </SettingsSectionStory>

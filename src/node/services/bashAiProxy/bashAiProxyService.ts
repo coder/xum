@@ -1,0 +1,912 @@
+/**
+ * Bash AI proxy: a loopback HTTP proxy for Anthropic and OpenAI calls made by processes that the
+ * bash tool starts (test harnesses, `make bug-bash`, scripts that call the SDKs).
+ *
+ * Why: those calls bypass the chat stream, so their spend never reached the workspace's Costs
+ * tab or Analytics. Xum now gives each bash command a base URL that points here plus a key that
+ * names its workspace. The proxy swaps that key for the provider key in the Xum settings,
+ * forwards the request, streams the answer back, and records the usage in that workspace.
+ *
+ * Contract:
+ * - Local and Worktree commands reach the listener on 127.0.0.1. SSH and Coder commands reach
+ *   it through a reverse forward per host (reverseForwards.ts). Docker and devcontainer get no
+ *   env pair: they have no route to the backend.
+ * - A proxy key authorizes only these provider endpoints for one workspace. It is not a Xum API
+ *   token. The port and the keys survive a Xum restart (stableIdentity.ts), so a background
+ *   process keeps working, and a key stops working when its workspace is removed.
+ * - The upstream host comes from the Xum provider config only, never from the request, and the
+ *   proxy never follows redirects, so the real key cannot reach another host.
+ * - A refused request (unknown key, path not allowed, no Xum key) fails with an error. The proxy
+ *   never falls back to a direct call.
+ */
+import assert from "node:assert/strict";
+import * as http from "node:http";
+import type { AddressInfo } from "node:net";
+
+import { EnvHttpProxyAgent, type Dispatcher } from "undici";
+
+import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
+import {
+  normalizeAnthropicBaseURL,
+  normalizeOpenAICompatibleBaseURL,
+} from "@/common/utils/providers/baseUrl";
+import type { RuntimeMode } from "@/common/types/runtime";
+import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
+import type { AiSdkUsageLike } from "@/common/utils/tokens/usageHelpers";
+import { log } from "@/node/services/log";
+import {
+  resolveProviderCredentials,
+  type ProviderConfigRaw,
+} from "@/node/utils/providerRequirements";
+
+import { ProxyStateStore, type PersistedForward } from "./proxyState";
+import { ReverseForwardManager, type ForwardTarget } from "./reverseForwards";
+import {
+  BASH_AI_PROXY_HEALTH_PATH,
+  BASH_AI_PROXY_KEY_PREFIX,
+  candidatePorts,
+  deriveProxyKey,
+  healthAnswer,
+  isHealthNonce,
+  verifyProxyKey,
+} from "./stableIdentity";
+import { UsageTap, type BashAiProxyProvider } from "./usageExtract";
+
+export { BASH_AI_PROXY_KEY_PREFIX };
+
+/** Deterministic port candidates tried before a random port (see stableIdentity.ts). */
+const LISTEN_PORT_CANDIDATES = 16;
+/** How long a turn waits for a new SSH reverse forward before it runs without the vars. */
+const SSH_FORWARD_WAIT_MS = 10_000;
+/** Persisted forwards older than this are not restored at startup. */
+const RESTORE_MAX_AGE_MS = 7 * 24 * 60 * 60_000;
+/** Refresh a forward's `usedAt` at most this often (it only gates restore). */
+const USED_AT_REFRESH_MS = 60 * 60_000;
+/** Workspaces kept per SSH host for restore (it needs one that still exists). */
+const MAX_SAVED_WORKSPACES_PER_HOST = 8;
+
+/** Analytics source: rows land as `tool_name = headless:bash_proxy`. */
+export const BASH_AI_PROXY_ANALYTICS_SOURCE = "bash_proxy";
+
+const MAX_REQUEST_BODY_BYTES = 100 * 1024 * 1024;
+
+interface ProxyRoute {
+  provider: BashAiProxyProvider;
+  /** Path prefix on the proxy listener. */
+  prefix: string;
+  defaultUpstream: string;
+  /** Env names a project secret can set; any one of them turns the pair off for this provider. */
+  envNames: readonly string[];
+  /**
+   * A secret that sets `secretKeyName` mixes with the `hostRouteNames` that bash still inherits
+   * from the Xum process (secrets replace only the names they set): a direct-API key next to a
+   * gateway URL or token gets a 403 from the gateway (#6356).
+   */
+  secretKeyName: string;
+  hostRouteNames: readonly string[];
+  /** Paths that bill tokens: a 2xx answer without usage is logged as uncounted. */
+  billable: readonly string[];
+  allowed: ReadonlyArray<{ method: string; path: string | RegExp }>;
+  env: (origin: string, key: string) => Record<string, string>;
+}
+
+const ROUTES: readonly ProxyRoute[] = [
+  {
+    provider: "anthropic",
+    prefix: "/anthropic",
+    defaultUpstream: "https://api.anthropic.com/v1",
+    envNames: ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"],
+    secretKeyName: "ANTHROPIC_API_KEY",
+    hostRouteNames: ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"],
+    billable: ["/v1/messages"],
+    allowed: [
+      { method: "POST", path: "/v1/messages" },
+      { method: "POST", path: "/v1/messages/count_tokens" },
+      { method: "GET", path: /^\/v1\/models(\/[^/]+)?$/ },
+    ],
+    // No /v1: the official SDK and Claude Code append /v1/..., the AI SDK appends /messages.
+    // handle() adds a missing /v1, so both conventions reach the same endpoint.
+    env: (origin, key) => ({
+      ANTHROPIC_BASE_URL: `${origin}/anthropic`,
+      ANTHROPIC_API_KEY: key,
+      ANTHROPIC_AUTH_TOKEN: key,
+    }),
+  },
+  {
+    provider: "openai",
+    prefix: "/openai",
+    defaultUpstream: "https://api.openai.com/v1",
+    // The OpenAI SDKs also read OPENAI_ORG_ID and OPENAI_PROJECT_ID into headers that the proxy
+    // replaces with the Xum account's, so a secret that sets one keeps the direct call.
+    envNames: [
+      "OPENAI_API_KEY",
+      "OPENAI_BASE_URL",
+      "OPENAI_API_BASE",
+      "OPENAI_ORG_ID",
+      "OPENAI_PROJECT_ID",
+    ],
+    secretKeyName: "OPENAI_API_KEY",
+    hostRouteNames: ["OPENAI_BASE_URL", "OPENAI_API_BASE"],
+    billable: ["/v1/responses", "/v1/chat/completions"],
+    allowed: [
+      { method: "POST", path: "/v1/responses" },
+      { method: "POST", path: "/v1/chat/completions" },
+      { method: "GET", path: /^\/v1\/models(\/[^/]+)?$/ },
+    ],
+    env: (origin, key) => ({ OPENAI_BASE_URL: `${origin}/openai/v1`, OPENAI_API_KEY: key }),
+  },
+];
+
+// Account headers: a command must not pick the account it bills, but providers.jsonc `headers`
+// may set them, as chat requests send them.
+const ACCOUNT_HEADERS = ["cookie", "openai-organization", "openai-project"];
+
+// Request headers that never go upstream: hop-by-hop headers, the proxy key, and headers that
+// the proxy sets itself from the Xum config.
+const DROPPED_REQUEST_HEADERS = new Set([
+  "host",
+  "connection",
+  "keep-alive",
+  "proxy-authorization",
+  "proxy-connection",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+  // Clients such as curl can send `Expect: 100-continue` for large bodies. Node already
+  // answered it, and undici's fetch rejects the header.
+  "expect",
+  "content-length",
+  "accept-encoding",
+  "authorization",
+  "x-api-key",
+  ...ACCOUNT_HEADERS,
+]);
+
+// fetch() decodes compressed bodies, so length and encoding headers no longer describe the bytes.
+const DROPPED_RESPONSE_HEADERS = new Set([
+  "connection",
+  "keep-alive",
+  "transfer-encoding",
+  "content-length",
+  "content-encoding",
+]);
+
+export interface RecordedUsage {
+  model: string;
+  usage: ChatUsageDisplay;
+}
+
+export interface BashAiProxyServiceOptions {
+  /** Xum root dir: seeds the listener port and holds the key secret. */
+  rootDir: string;
+  /** The Settings switch (config bashAiProxyEnabled; absent = off). */
+  isEnabled: () => boolean;
+  /** A key verifies only while its workspace exists, so removal revokes it. */
+  workspaceExists: (workspaceId: string) => boolean;
+  /**
+   * Whether the workspace may run repo code with provider credentials (shared-execution trust,
+   * project automation allowed). Checked per request, so revoking trust also stops commands
+   * that already hold a key, like turning the switch off.
+   */
+  isWorkspaceTrusted: (workspaceId: string) => Promise<boolean>;
+  /** The SSH host of a workspace, for a reverse forward; undefined for other runtimes. */
+  forwardTargetFor: (workspaceId: string) => Promise<ForwardTarget | undefined>;
+  /**
+   * Whether another backend may use this Xum root at the same time. SSH and Coder forwards are
+   * then off (no variables, no restore, no saved forward state): each host has one saved remote
+   * port per root, and two backends would each pick and save their own.
+   */
+  isRootShared: () => Promise<boolean>;
+  /** Raw providers.jsonc entry for one provider. */
+  loadProviderConfig: (provider: BashAiProxyProvider) => ProviderConfigRaw;
+  /** Writes priced usage to the workspace ledger and analytics sidecar; undefined = not written. */
+  recordUsage: (
+    workspaceId: string,
+    modelString: string,
+    usage: AiSdkUsageLike,
+    providerMetadata: Record<string, unknown> | undefined
+  ) => Promise<RecordedUsage | undefined>;
+  /** Live update for the Costs tab after a successful write. */
+  onUsageRecorded: (workspaceId: string, recorded: RecordedUsage) => void;
+}
+
+/** Why the caller adds no proxy variables in a workspace (turnRequestBuilder decides). */
+export type BashAiProxyBlockReason = "untrusted" | "kill_switch";
+
+const BLOCK_REASON_TEXT: Record<BashAiProxyBlockReason, string> = {
+  untrusted: "the project is not trusted",
+  kill_switch: "XUM_DISABLE_PROJECT_AUTOMATION=1 is set",
+};
+
+/**
+ * The host vars of `route` that a bash command gets next to a provider key from secrets: the
+ * ones the Xum process env sets and the secrets do not replace.
+ */
+function hostNamesMixedWithSecretKey(
+  route: ProxyRoute,
+  runtime: RuntimeMode,
+  secretKeys: readonly string[]
+): string[] {
+  // SSH, Coder, Docker and devcontainer commands get the env of another machine or container.
+  if (runtime !== "local" && runtime !== "worktree") return [];
+  if (!secretKeys.includes(route.secretKeyName)) return [];
+  return route.hostRouteNames.filter(
+    (name) => !secretKeys.includes(name) && (process.env[name]?.trim() ?? "") !== ""
+  );
+}
+
+/** Key of the per-workspace, per-provider log dedupe maps (loggedSkips, warnedMixes). */
+function skipLogKey(workspaceId: string, provider: BashAiProxyProvider): string {
+  return `${workspaceId}\0${provider}`;
+}
+
+type RequestInitWithDispatcher = RequestInit & { dispatcher?: Dispatcher };
+
+// Same outbound behavior as chat requests (providerModelFactory): honor HTTP(S)_PROXY and never
+// time out a long stream. One process-wide agent, like the chat path's.
+const outboundDispatcher = new EnvHttpProxyAgent({ bodyTimeout: 0, headersTimeout: 0 });
+
+class ProxyRefusal extends Error {
+  constructor(
+    readonly status: number,
+    message: string
+  ) {
+    super(message);
+  }
+}
+
+export class BashAiProxyService {
+  private server: http.Server | undefined;
+  private secret: string | undefined;
+  private startPromise: Promise<number | undefined> | undefined;
+  private stopped = false;
+  private readonly state: ProxyStateStore;
+  private readonly forwards: ReverseForwardManager;
+  /** The forward last saved per SSH host, to skip redundant writes. */
+  private readonly savedForwards = new Map<string, PersistedForward>();
+  private restoring: Promise<unknown> | undefined;
+  /** Last skip reason logged per workspace and provider (noteSkip). */
+  private readonly loggedSkips = new Map<string, string>();
+  /** Last host env mix warned per workspace and provider (warnOnHostEnvMix). */
+  private readonly warnedMixes = new Map<string, string>();
+
+  constructor(private readonly options: BashAiProxyServiceOptions) {
+    this.state = new ProxyStateStore(options.rootDir);
+    this.forwards = new ReverseForwardManager({
+      seed: options.rootDir,
+      expectedHealth: (nonce) => {
+        assert(this.secret !== undefined, "forward probe before the proxy started");
+        return healthAnswer(this.secret, nonce);
+      },
+      savedRemotePort: (hostKey) => this.savedForwards.get(hostKey)?.remotePort,
+      onEstablished: () => undefined, // envFor() records the workspace that uses it
+    });
+  }
+
+  /**
+   * Env vars for one bash command in this workspace: {} when the switch is off, the runtime
+   * cannot reach loopback, the listener failed, or Xum has no key for a provider. A provider
+   * whose env names appear in `secretKeys` is skipped as a whole, so a command never gets a
+   * proxy URL paired with a real key (project secrets override xumEnv in the bash tool).
+   * A skipped provider is logged with its reason (noteSkip).
+   */
+  async envFor(
+    workspaceId: string,
+    runtime: RuntimeMode,
+    secretKeys: readonly string[]
+  ): Promise<Record<string, string>> {
+    assert(workspaceId.length > 0, "envFor requires a workspaceId");
+    // Independent of the switch: the mix happens with the proxy on or off.
+    this.warnOnHostEnvMix(workspaceId, runtime, secretKeys);
+    if (!this.options.isEnabled()) {
+      this.forwards.closeOwned();
+      return {};
+    }
+    // Decide the routes first: an SSH forward costs a connection and up to 10 s on a first turn,
+    // so a workspace that would get no variables never opens one.
+    const routes = ROUTES.filter(
+      (route) => !this.noteSkip(workspaceId, route.provider, this.skipReasonFor(route, secretKeys))
+    );
+    if (routes.length === 0) return {};
+    const port = await this.ensureStarted();
+    if (port === undefined) return {};
+    const origin = await this.originFor(workspaceId, runtime, port);
+    if (origin === undefined) return this.noteUnreachable(workspaceId, runtime, routes);
+    const env: Record<string, string> = {};
+    for (const route of routes) {
+      // The provider gets its variables: its next skip logs again.
+      this.loggedSkips.delete(skipLogKey(workspaceId, route.provider));
+      Object.assign(env, route.env(origin, this.keyFor(workspaceId)));
+    }
+    return env;
+  }
+
+  /**
+   * The caller adds no proxy variables in this workspace (untrusted project, or the project
+   * automation kill switch). Only logs why, so a user who turned the switch on can find out.
+   */
+  noteBlocked(workspaceId: string, reason: BashAiProxyBlockReason): void {
+    assert(workspaceId.length > 0, "noteBlocked requires a workspaceId");
+    if (!this.options.isEnabled()) return;
+    for (const route of ROUTES) {
+      this.noteSkip(workspaceId, route.provider, BLOCK_REASON_TEXT[reason]);
+    }
+  }
+
+  /** Logs why commands of this runtime cannot reach the proxy; returns envFor()'s empty env. */
+  private noteUnreachable(
+    workspaceId: string,
+    runtime: RuntimeMode,
+    routes: readonly ProxyRoute[]
+  ): Record<string, string> {
+    // originFor() gives no origin for Docker and devcontainer at all, and for SSH and Coder when
+    // another backend may share the Xum home or the reverse forward is not up.
+    const reason =
+      runtime === "docker" || runtime === "devcontainer"
+        ? `${runtime} commands have no route to Xum`
+        : "no SSH reverse forward to this host (a shared Xum home, or the forward failed)";
+    for (const route of routes) this.noteSkip(workspaceId, route.provider, reason);
+    return {};
+  }
+
+  /** Why envFor() gives a provider no variables, or undefined when it gets them. */
+  private skipReasonFor(route: ProxyRoute, secretKeys: readonly string[]): string | undefined {
+    // A secret comes first: it is the reason to fix even when Xum also has no key.
+    const secretName = route.envNames.find((name) => secretKeys.includes(name));
+    if (secretName !== undefined) return `a secret sets ${secretName}`;
+    if (this.upstreamFor(route) === undefined)
+      return "Xum has no API key for it, or it is disabled";
+    return undefined;
+  }
+
+  /**
+   * Logs a skipped provider (#6357) once per workspace and provider, not on every turn. A new
+   * reason logs again, and so does the next skip after the provider got its variables (envFor
+   * clears the entry then). Returns whether the provider is skipped (a reason is given).
+   */
+  private noteSkip(
+    workspaceId: string,
+    provider: BashAiProxyProvider,
+    reason: string | undefined
+  ): boolean {
+    if (reason === undefined) return false;
+    const key = skipLogKey(workspaceId, provider);
+    if (this.loggedSkips.get(key) === reason) return true;
+    this.loggedSkips.set(key, reason);
+    log.info(`[bash-ai-proxy] skipped ${provider}: ${reason}; its bash AI calls stay uncounted`, {
+      workspaceId,
+    });
+    return true;
+  }
+
+  /**
+   * Warns (#6356) when a secret sets a provider key while the Xum process env, which Local and
+   * Worktree commands inherit (LocalBaseRuntime.exec), routes that provider elsewhere. Logs
+   * names only, never values. Once per workspace and provider, like noteSkip().
+   */
+  private warnOnHostEnvMix(
+    workspaceId: string,
+    runtime: RuntimeMode,
+    secretKeys: readonly string[]
+  ): void {
+    for (const route of ROUTES) {
+      const key = skipLogKey(workspaceId, route.provider);
+      const hostNames = hostNamesMixedWithSecretKey(route, runtime, secretKeys);
+      if (hostNames.length === 0) {
+        this.warnedMixes.delete(key);
+        continue;
+      }
+      const detail = hostNames.join(", ");
+      if (this.warnedMixes.get(key) === detail) continue;
+      this.warnedMixes.set(key, detail);
+      log.warn(
+        `[bash] a secret sets ${route.secretKeyName}, but bash also inherits ${detail} from the Xum process; a gateway can reject that key`,
+        { workspaceId }
+      );
+    }
+  }
+
+  /**
+   * Startup: if the switch is on, bind the saved port again and restore the SSH forwards that
+   * running remote commands use, so processes that outlived a restart keep working. The
+   * forwards restore in the background; this resolves once the listener is up.
+   */
+  async restore(): Promise<void> {
+    if (!this.options.isEnabled()) return;
+    const port = await this.ensureStarted();
+    if (port === undefined) return;
+    if (await this.options.isRootShared()) return;
+    const { forwards } = await this.state.load();
+    const now = Date.now();
+    const jobs = Object.entries(forwards)
+      .filter(([, forward]) => now - forward.usedAt < RESTORE_MAX_AGE_MS)
+      .map(async ([hostKey, forward]) => {
+        for (const workspaceId of forward.workspaceIds) {
+          const target = await this.options.forwardTargetFor(workspaceId);
+          if (target?.hostKey !== hostKey) continue; // removed, or on another host
+          if (!target.restoreAtStartup) return;
+          const remotePort = await this.forwards.ensure(target, port, Infinity);
+          // A restored forward is in use: keep it eligible for the next restart too.
+          if (remotePort !== undefined)
+            await this.rememberForward(hostKey, remotePort, workspaceId);
+          return;
+        }
+      });
+    this.restoring = Promise.allSettled(jobs);
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true;
+    const forwardsClosed = this.forwards.closeAll();
+    const server = this.server;
+    this.server = undefined;
+    if (server) {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+    // Setups in flight close the forward they open once they see closeAll(). Wait for them, but
+    // briefly: an SSH connect that hangs must not hold up shutdown.
+    await Promise.race([Promise.allSettled([forwardsClosed, this.restoring]), sleep(1000)]);
+    await this.state.flush();
+  }
+
+  /** Where commands of this workspace reach the proxy, or undefined when they cannot. */
+  private async originFor(
+    workspaceId: string,
+    runtime: RuntimeMode,
+    port: number
+  ): Promise<string | undefined> {
+    if (runtime === "local" || runtime === "worktree") return `http://127.0.0.1:${port}`;
+    if (await this.options.isRootShared()) return undefined;
+    // Docker and devcontainer have no route to the backend: forwardTargetFor() returns undefined.
+    const target = await this.options.forwardTargetFor(workspaceId);
+    if (!target) return undefined;
+    const remotePort = await this.forwards.ensure(target, port, SSH_FORWARD_WAIT_MS);
+    if (remotePort === undefined) return undefined;
+    await this.rememberForward(target.hostKey, remotePort, workspaceId);
+    return `http://127.0.0.1:${remotePort}`;
+  }
+
+  /**
+   * Saves a host's forward for restore(): its port, the workspaces that use it (restore needs
+   * one that still exists), and `usedAt`, refreshed at most hourly. The workspace list is built
+   * inside the locked update from the file, so saves that overlap keep every workspace. The
+   * cache that skips redundant writes changes only after a write succeeded, so a failed write
+   * is tried again.
+   */
+  private async rememberForward(
+    hostKey: string,
+    remotePort: number,
+    workspaceId: string
+  ): Promise<void> {
+    if (this.stopped) return;
+    const saved = this.savedForwards.get(hostKey);
+    const now = Date.now();
+    if (
+      saved?.remotePort === remotePort &&
+      saved.workspaceIds.includes(workspaceId) &&
+      now - saved.usedAt < USED_AT_REFRESH_MS
+    ) {
+      return;
+    }
+    if (await this.options.isRootShared()) return;
+    const result: { forward?: PersistedForward } = {};
+    const written = await this.state.update((state) => {
+      const others = (state.forwards[hostKey]?.workspaceIds ?? []).filter(
+        (id) => id !== workspaceId && this.options.workspaceExists(id)
+      );
+      result.forward = {
+        remotePort,
+        workspaceIds: [workspaceId, ...others].slice(0, MAX_SAVED_WORKSPACES_PER_HOST),
+        usedAt: now,
+      };
+      state.forwards[hostKey] = result.forward;
+    });
+    if (written && result.forward) this.savedForwards.set(hostKey, result.forward);
+  }
+
+  /**
+   * Authenticated traffic from an SSH workspace keeps its host's forward eligible for restore,
+   * so a long-running job outlives the age limit as long as it makes calls.
+   */
+  private async noteForwardTraffic(workspaceId: string): Promise<void> {
+    for (const [hostKey, saved] of this.savedForwards) {
+      if (!saved.workspaceIds.includes(workspaceId)) continue;
+      await this.rememberForward(hostKey, saved.remotePort, workspaceId);
+      return;
+    }
+  }
+
+  private keyFor(workspaceId: string): string {
+    assert(this.secret !== undefined, "keyFor before the proxy started");
+    return deriveProxyKey(this.secret, workspaceId);
+  }
+
+  /** The workspace a request's key names, if the key verifies and the workspace still exists. */
+  private workspaceForKey(key: string | undefined): string | undefined {
+    if (key === undefined || this.secret === undefined) return undefined;
+    const workspaceId = verifyProxyKey(this.secret, key);
+    return workspaceId !== undefined && this.options.workspaceExists(workspaceId)
+      ? workspaceId
+      : undefined;
+  }
+
+  /**
+   * Starts the listener on the first envFor() call (the first agent turn in a Local or Worktree
+   * workspace), so a backend without such turns binds no port.
+   * A failed start logs and returns undefined (bash then runs without the pair); the next call
+   * tries again.
+   */
+  private ensureStarted(): Promise<number | undefined> {
+    if (this.stopped) return Promise.resolve(undefined);
+    this.startPromise ??= this.listen().catch((error: unknown) => {
+      log.warn("[bash-ai-proxy] listener failed to start; bash AI calls stay uncounted", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      this.startPromise = undefined;
+      return undefined;
+    });
+    return this.startPromise;
+  }
+
+  private async listen(): Promise<number> {
+    const persisted = await this.state.load();
+    this.secret ??= persisted.secret;
+    for (const [hostKey, forward] of Object.entries(persisted.forwards)) {
+      this.savedForwards.set(hostKey, forward);
+    }
+    const server = http.createServer((req, res) => {
+      this.handle(req, res).catch((error: unknown) => {
+        // A client that hangs up aborts the upstream fetch: that is not a proxy failure.
+        (res.destroyed ? log.debug : log.warn)("[bash-ai-proxy] request failed", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        if (!res.headersSent) sendError(res, 502, "Xum bash AI proxy: upstream request failed.");
+        else res.destroy();
+      });
+    });
+    // The saved port first: commands started before a restart have it in their env. Then the
+    // seeded candidates, and a random port as the last resort (it still serves new commands).
+    const candidates = [
+      ...new Set([
+        ...(persisted.port !== undefined ? [persisted.port] : []),
+        ...candidatePorts(this.options.rootDir, LISTEN_PORT_CANDIDATES),
+        0,
+      ]),
+    ];
+    let bound = false;
+    for (const candidate of candidates) {
+      try {
+        await listenOn(server, candidate);
+        bound = true;
+        break;
+      } catch (error) {
+        // Any bind error makes a candidate unavailable, not only EADDRINUSE: Windows answers
+        // EACCES for an excluded port, and a saved port can be privileged. Port 0 is the last
+        // resort, so only its failure stops the listener.
+        if (candidate === 0) throw error;
+        if (candidate === persisted.port) {
+          log.warn(
+            "[bash-ai-proxy] saved port is unavailable; bash commands started before the restart cannot reach the proxy",
+            { port: candidate, code: (error as NodeJS.ErrnoException).code }
+          );
+        }
+      }
+    }
+    assert(bound, "the loop throws when port 0 fails");
+    if (this.stopped) {
+      server.close();
+      throw new Error("stopped while starting");
+    }
+    this.server = server;
+    const port = (server.address() as AddressInfo).port;
+    assert(port > 0, "bash AI proxy listener must have a port");
+    log.info("[bash-ai-proxy] listening", { port });
+    // Save only a first port. When the saved port was busy (a second backend on this root, a
+    // process left behind), keep it: the next restart tries it again, and old env vars use it.
+    if (persisted.port === undefined) await this.state.claimPort(port);
+    return port;
+  }
+
+  /** Upstream base URL (with /v1) and key from the Xum provider config, or undefined. */
+  private upstreamFor(
+    route: ProxyRoute
+  ):
+    | { baseUrl: string; apiKey: string; organization?: string; headers: Record<string, string> }
+    | undefined {
+    const config = this.options.loadProviderConfig(route.provider);
+    if (isProviderDisabledInConfig(config)) return undefined;
+    const creds = resolveProviderCredentials(route.provider, config);
+    if (!creds.isConfigured || !creds.apiKey) return undefined;
+    const configured = creds.baseUrl?.trim();
+    const baseUrl =
+      route.provider === "anthropic"
+        ? normalizeAnthropicBaseURL(configured ?? route.defaultUpstream)
+        : normalizeOpenAICompatibleBaseURL(configured ?? route.defaultUpstream);
+    return {
+      baseUrl,
+      apiKey: creds.apiKey,
+      ...(creds.organization ? { organization: creds.organization } : {}),
+      // Custom headers from providers.jsonc (gateways can need them), as chat requests send them.
+      headers: readStringRecord((config as { headers?: unknown }).headers),
+    };
+  }
+
+  private async handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    try {
+      await this.forward(req, res);
+    } catch (error) {
+      if (!(error instanceof ProxyRefusal)) throw error;
+      // Drain the unread body so the client sees the answer instead of a reset socket.
+      req.resume();
+      sendError(res, error.status, error.message);
+    }
+  }
+
+  private async forward(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    // Turning the switch off cuts access at once, for processes that already hold a key too.
+    if (!this.options.isEnabled()) {
+      this.forwards.closeOwned();
+      throw new ProxyRefusal(503, "Xum bash AI proxy is turned off in Settings → Providers.");
+    }
+    // No key needed: the answer proves "a proxy of this Xum root" for this challenge only.
+    if (req.method === "GET" && url.pathname === BASH_AI_PROXY_HEALTH_PATH) {
+      assert(this.secret !== undefined, "the listener starts after the secret loads");
+      const nonce = url.searchParams.get("nonce");
+      if (!isHealthNonce(nonce)) throw new ProxyRefusal(400, "Xum bash AI proxy: bad nonce.");
+      req.resume();
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end(healthAnswer(this.secret, nonce));
+      return;
+    }
+    const route = ROUTES.find(
+      (r) => url.pathname === r.prefix || url.pathname.startsWith(`${r.prefix}/`)
+    );
+    if (!route) throw new ProxyRefusal(404, "Xum bash AI proxy: unknown route.");
+
+    const workspaceId = this.workspaceForKey(readProxyKey(req.headers));
+    if (workspaceId === undefined) {
+      throw new ProxyRefusal(
+        401,
+        "Xum bash AI proxy: unknown key. The workspace was removed, or the variable holds another key (do not put a real provider key in it)."
+      );
+    }
+    if (!(await this.options.isWorkspaceTrusted(workspaceId))) {
+      throw new ProxyRefusal(
+        403,
+        "Xum bash AI proxy: the workspace's project is not trusted, so its commands cannot call providers through Xum."
+      );
+    }
+    await this.noteForwardTraffic(workspaceId);
+
+    let path = url.pathname.slice(route.prefix.length) || "/";
+    if (path !== "/v1" && !path.startsWith("/v1/")) path = `/v1${path}`;
+    const method = (req.method ?? "GET").toUpperCase();
+    const allowed = route.allowed.some(
+      (a) =>
+        a.method === method && (typeof a.path === "string" ? a.path === path : a.path.test(path))
+    );
+    if (!allowed) {
+      throw new ProxyRefusal(404, `Xum bash AI proxy: ${method} ${path} is not allowed.`);
+    }
+
+    const upstream = this.upstreamFor(route);
+    if (!upstream) {
+      throw new ProxyRefusal(
+        503,
+        `Xum bash AI proxy: Xum has no ${route.provider} API key. Add one in Settings → Providers.`
+      );
+    }
+
+    let body = method === "GET" ? undefined : await readBody(req);
+    if (body && route.provider === "openai" && path === "/v1/chat/completions") {
+      body = withStreamUsage(body);
+    }
+
+    const headers = new Headers();
+    for (const [name, value] of Object.entries(req.headers)) {
+      if (value === undefined || DROPPED_REQUEST_HEADERS.has(name)) continue;
+      headers.set(name, Array.isArray(value) ? value.join(", ") : value);
+    }
+    if (route.provider === "anthropic") {
+      headers.set("x-api-key", upstream.apiKey);
+    } else {
+      headers.set("authorization", `Bearer ${upstream.apiKey}`);
+      if (upstream.organization) headers.set("openai-organization", upstream.organization);
+    }
+    for (const [name, value] of Object.entries(upstream.headers)) headers.set(name, value);
+    headers.set("accept-encoding", "identity");
+
+    // A client that hangs up stops the upstream request too.
+    const abort = new AbortController();
+    res.once("close", () => abort.abort());
+
+    const init: RequestInitWithDispatcher = {
+      method,
+      headers,
+      body: body ? new Uint8Array(body) : undefined,
+      redirect: "manual",
+      signal: abort.signal,
+      dispatcher: outboundDispatcher,
+    };
+    const response = await fetch(upstreamUrl(upstream.baseUrl, path, url.searchParams), init);
+    if (response.status >= 300 && response.status < 400) {
+      await response.body?.cancel();
+      throw new ProxyRefusal(
+        502,
+        "Xum bash AI proxy: the provider sent a redirect. Xum does not follow it."
+      );
+    }
+
+    const responseHeaders: Record<string, string> = {};
+    response.headers.forEach((value, name) => {
+      if (!DROPPED_RESPONSE_HEADERS.has(name)) responseHeaders[name] = value;
+    });
+    res.writeHead(response.status, responseHeaders);
+
+    const billable = response.ok && route.billable.includes(path);
+    const tap = billable
+      ? new UsageTap(route.provider, response.headers.get("content-type") ?? undefined)
+      : undefined;
+    try {
+      if (response.body) {
+        const reader = response.body.getReader();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          tap?.push(value);
+          if (!res.write(value)) await waitForDrain(res);
+        }
+      }
+      res.end();
+    } finally {
+      // Record what the response carried even if the client hung up mid-stream: the provider
+      // bills the tokens it already produced.
+      if (tap) await this.record(workspaceId, route.provider, path, tap);
+    }
+  }
+
+  private async record(
+    workspaceId: string,
+    provider: BashAiProxyProvider,
+    path: string,
+    tap: UsageTap
+  ): Promise<void> {
+    const extracted = tap.finish();
+    if (!extracted) {
+      log.warn("[bash-ai-proxy] response had no usage; not counted", { workspaceId, path });
+      return;
+    }
+    const recorded = await this.options.recordUsage(
+      workspaceId,
+      `${provider}:${extracted.model ?? "unknown"}`,
+      extracted.usage,
+      extracted.providerMetadata
+    );
+    if (recorded) this.options.onUsageRecorded(workspaceId, recorded);
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms).unref?.());
+}
+
+function listenOn(server: http.Server, port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onError = (error: Error) => {
+      server.off("listening", onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      server.off("error", onError);
+      resolve();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(port, "127.0.0.1");
+  });
+}
+
+/**
+ * The upstream URL for `path` (starts with /v1, which the base URL already ends with). The
+ * endpoint goes into the base URL's path and the queries merge: a base URL can carry its own
+ * query (a gateway token), and string concatenation would put the endpoint inside it.
+ */
+function upstreamUrl(baseUrl: string, path: string, search: URLSearchParams): URL {
+  assert(path.startsWith("/v1"), "proxy paths are normalized to /v1");
+  const target = new URL(baseUrl);
+  target.pathname = `${target.pathname.replace(/\/+$/, "")}${path.slice(3)}`;
+  for (const [name, value] of search) target.searchParams.append(name, value);
+  target.hash = "";
+  return target;
+}
+
+function readStringRecord(value: unknown): Record<string, string> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return {};
+  const out: Record<string, string> = {};
+  for (const [name, v] of Object.entries(value)) {
+    // Never let config headers replace the auth header that the proxy sets.
+    const lower = name.toLowerCase();
+    const dropped = DROPPED_REQUEST_HEADERS.has(lower) && !ACCOUNT_HEADERS.includes(lower);
+    if (typeof v === "string" && !dropped) out[name] = v;
+  }
+  return out;
+}
+
+function readProxyKey(headers: http.IncomingHttpHeaders): string | undefined {
+  const apiKey = headers["x-api-key"];
+  if (typeof apiKey === "string" && apiKey.startsWith(BASH_AI_PROXY_KEY_PREFIX)) return apiKey;
+  const auth = headers.authorization;
+  if (typeof auth === "string") {
+    const match = /^Bearer\s+(\S+)$/i.exec(auth);
+    if (match?.[1]?.startsWith(BASH_AI_PROXY_KEY_PREFIX)) return match[1];
+  }
+  return undefined;
+}
+
+async function readBody(req: http.IncomingMessage): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req as AsyncIterable<Buffer>) {
+    size += chunk.byteLength;
+    if (size > MAX_REQUEST_BODY_BYTES) {
+      throw new ProxyRefusal(413, "Xum bash AI proxy: request body is too large.");
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+/**
+ * Streamed Chat Completions carry usage only with stream_options.include_usage. Xum sets it only
+ * when the client left it unset: the usage chunk has `choices: []`, and a client that turned it
+ * off on purpose may not handle that chunk. Such a stream stays uncounted (logged).
+ */
+function withStreamUsage(body: Buffer): Buffer {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body.toString("utf8"));
+  } catch {
+    return body;
+  }
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    (parsed as { stream?: unknown }).stream !== true
+  ) {
+    return body;
+  }
+  const request = parsed as { stream_options?: Record<string, unknown> };
+  if (request.stream_options?.include_usage !== undefined) return body;
+  request.stream_options = { ...(request.stream_options ?? {}), include_usage: true };
+  return Buffer.from(JSON.stringify(request));
+}
+
+function waitForDrain(res: http.ServerResponse): Promise<void> {
+  return new Promise((resolve) => {
+    const done = () => {
+      res.off("drain", done);
+      res.off("close", done);
+      resolve();
+    };
+    res.once("drain", done);
+    res.once("close", done);
+  });
+}
+
+function sendError(res: http.ServerResponse, status: number, message: string): void {
+  if (res.headersSent) {
+    res.destroy();
+    return;
+  }
+  // Anthropic's error envelope; OpenAI SDKs also read `error.message` from it.
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(
+    JSON.stringify({
+      type: "error",
+      error: { type: status === 401 ? "authentication_error" : "xum_proxy_error", message },
+    })
+  );
+}

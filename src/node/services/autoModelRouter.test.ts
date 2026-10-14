@@ -70,7 +70,6 @@ function createRouter(options: {
   doEvaluate?: DoEvaluate;
   /** A real provider evaluation model instead of the fake; `doEvaluate` is then unused. */
   model?: Experimental_EvaluationModelV4;
-  policyService?: EvaluationModelFactoryDeps["policyService"];
 }) {
   const doEvaluate = mock<DoEvaluate>(options.doEvaluate ?? (() => Promise.resolve(verdict())));
   const buildModel = spyOn(evaluationModelFactory, "createEvaluationModel").mockImplementation(() =>
@@ -78,7 +77,6 @@ function createRouter(options: {
   );
   const router = new AutoModelRouter({
     providersConfigStore: providersStore({}),
-    policyService: options.policyService,
     env: {},
   });
   return { router, doEvaluate, buildModel };
@@ -443,63 +441,13 @@ describe("evaluation model factory", () => {
     }
   });
 
-  it("honors provider enablement and enforced policy, including the forced base URL", () => {
+  it("honors provider enablement", () => {
     expect(
       resolveEvaluationModelTarget(
         "openai:gpt-5-nano",
         deps({ openai: { apiKey: "k", enabled: false } })
       )
     ).toMatchObject({ success: false, error: { code: "provider_disabled" } });
-
-    const denyProvider = deps(
-      { typesafe: { apiKey: "k" } },
-      {
-        policyService: {
-          isEnforced: () => true,
-          isProviderAllowed: (provider) => provider !== TYPESAFE_PROVIDER_KEY,
-          isModelAllowed: () => true,
-          getForcedBaseUrl: () => undefined,
-        },
-      }
-    );
-    expect(resolveEvaluationModelTarget(EVALUATION_MODEL, denyProvider)).toMatchObject({
-      success: false,
-      error: { code: "policy_denied" },
-    });
-
-    const denyModel = deps(
-      { typesafe: { apiKey: "k" } },
-      {
-        policyService: {
-          isEnforced: () => true,
-          isProviderAllowed: () => true,
-          isModelAllowed: (provider, modelId) =>
-            !(provider === TYPESAFE_PROVIDER_KEY && modelId === "jev-latest"),
-          getForcedBaseUrl: () => undefined,
-        },
-      }
-    );
-    expect(resolveEvaluationModelTarget(EVALUATION_MODEL, denyModel)).toMatchObject({
-      success: false,
-      error: { code: "policy_denied" },
-    });
-
-    const forced = deps(
-      { typesafe: { apiKey: "k", baseUrl: "https://user.example.test/v1" } },
-      {
-        policyService: {
-          isEnforced: () => true,
-          isProviderAllowed: () => true,
-          isModelAllowed: () => true,
-          getForcedBaseUrl: (provider) =>
-            provider === TYPESAFE_PROVIDER_KEY ? "https://proxy.example.test/typesafe/" : undefined,
-        },
-      }
-    );
-    expect(resolveEvaluationModelTarget(EVALUATION_MODEL, forced)).toMatchObject({
-      success: true,
-      data: { settings: { baseURL: "https://proxy.example.test/typesafe/" } },
-    });
   });
 
   it("refuses an id shadowed by a custom chat provider instead of using env credentials", () => {

@@ -180,7 +180,7 @@ export function SqlExplorer(props: SqlExplorerProps) {
       </div>
 
       <div className="flex flex-col gap-2">
-        <div className="relative">
+        <div>
           <textarea
             value={sql}
             onChange={(event) => setSql(event.target.value)}
@@ -196,8 +196,11 @@ export function SqlExplorer(props: SqlExplorerProps) {
               }
             }}
           />
-          <div className="absolute right-2 bottom-2 flex items-center gap-2">
-            <span className="text-muted text-[10px]">Ctrl/Cmd+Enter to run</span>
+          {/* Below the editor, not over it: on a phone the overlay hid the last lines of SQL. */}
+          <div className="mt-2 flex items-center justify-end gap-2">
+            <span className="text-muted mobile-hide-shortcut-hints text-[10px]">
+              Ctrl/Cmd+Enter to run
+            </span>
             <Button
               size="sm"
               onClick={() => {

@@ -407,4 +407,26 @@ describe("QueuedMessage banner", () => {
     expect(view.queryByText(/\d+ file/)).toBeNull();
     expect(view.queryByText(/\d+ image/)).toBeNull();
   });
+
+  test("an artifact send shows its label and confirmed text, and offers no Edit", () => {
+    const view = render(
+      <QueuedMessage
+        message={createQueuedMessage({
+          content: "Ship it",
+          artifactInteraction: {
+            id: "i-1",
+            artifactPath: "form.html",
+            title: "Form",
+            version: 2,
+            action: "send",
+            text: "Ship it",
+          },
+        })}
+        onEdit={mock(() => undefined)}
+      />
+    );
+    expect(view.getByText("from artifact")).toBeTruthy();
+    expect(view.getByText("Ship it")).toBeTruthy();
+    expect(view.queryByRole("button", { name: "Edit" })).toBeNull();
+  });
 });

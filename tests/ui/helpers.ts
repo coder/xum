@@ -5,8 +5,6 @@
 import { cleanup, fireEvent, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { FrontendWorkspaceMetadata, GitStatus } from "@/common/types/workspace";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { TUTORIAL_STATE_KEY } from "@/common/constants/storage";
 import { getDraftStore } from "@/browser/stores/DraftStore";
 import type { RenderedApp } from "./renderReviewPanel";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
@@ -94,6 +92,26 @@ export function simulateFileModifyingToolEnd(workspaceId: string): void {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
+ * Wait until a page navigation has settled. Pages are lazy chunks (T3 #5971): while a chunk loads,
+ * React keeps the previous page mounted with `display: none` next to the "Opening page..."
+ * fallback, so a query can match a control (an agent picker, a textarea) on the hidden old page.
+ */
+async function waitForPageSettled(container: HTMLElement): Promise<void> {
+  await waitFor(
+    () => {
+      const mains = [...container.querySelectorAll("main")];
+      if (
+        mains.some((main) => main.closest('[style*="display: none"]')) ||
+        mains.some((main) => main.textContent?.includes("Opening page"))
+      ) {
+        throw new Error("Page chunk still loading");
+      }
+    },
+    { timeout: 10_000 }
+  );
+}
+
+/**
  * Set up the full App UI and navigate to a workspace.
  * Expands project tree and selects the workspace.
  */
@@ -135,6 +153,7 @@ export async function setupWorkspaceView(
     { timeout: 10_000 }
   );
   fireEvent.click(workspaceElement);
+  await waitForPageSettled(view.container);
 
   // Ensure the workspace is registered and activated in the store so that
   // runOnChatSubscription starts. In the real app, WorkspaceContext handles
@@ -168,6 +187,7 @@ export async function openProjectCreationView(
   );
 
   fireEvent.click(projectRow);
+  await waitForPageSettled(view.container);
 
   await waitFor(
     () => {
@@ -177,6 +197,17 @@ export async function openProjectCreationView(
       }
     },
     { timeout: 10_000 }
+  );
+  // The page renders its composer before the branch list loads, and until then the trunk branch
+  // is empty, so a send that fast is refused for a worktree runtime ("Trunk branch is required").
+  // A slow host reaches that state (#6016): wait for the branch selector, as a user would.
+  await waitFor(
+    () => {
+      if (!view.container.querySelector('[aria-label="Select source branch"]')) {
+        throw new Error("Source branches not loaded");
+      }
+    },
+    { timeout: 30_000 }
   );
 }
 
@@ -311,7 +342,8 @@ export async function cleanupView(view: RenderedApp, cleanupDom: () => void): Pr
  * Called automatically by setupTestDom().
  */
 export function disableTutorial(): void {
-  updatePersistedState(TUTORIAL_STATE_KEY, { disabled: true, completed: {} });
+  // Runtime-only, like a sandbox launch: the tutorial preference lives in the backend config.
+  globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__ = false;
 }
 
 /**

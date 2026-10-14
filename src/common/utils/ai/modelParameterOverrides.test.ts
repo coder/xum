@@ -549,6 +549,33 @@ describe("resolveModelParameterOverrides", () => {
     });
   });
 
+  it("strips sampling parameters for Haiku 5.5 on Bedrock but keeps them for Haiku 4.5", () => {
+    const providersConfig = asProvidersConfig({
+      bedrock: {
+        modelParameters: {
+          "*": { temperature: 0.7, top_p: 0.9, top_k: 40, max_output_tokens: 4096 },
+        },
+      },
+    });
+    for (const model of [
+      "bedrock:anthropic.claude-haiku-5-5",
+      "bedrock:us.anthropic.claude-haiku-5-5",
+      "anthropic:claude-haiku-5-5",
+    ]) {
+      expect({
+        model,
+        result: resolveModelParameterOverrides(providersConfig, "bedrock", model),
+      }).toEqual({ model, result: { standard: { maxOutputTokens: 4096 } } });
+    }
+    expect(
+      resolveModelParameterOverrides(
+        providersConfig,
+        "bedrock",
+        "bedrock:anthropic.claude-haiku-4-5"
+      )
+    ).toEqual({ standard: { temperature: 0.7, topP: 0.9, topK: 40, maxOutputTokens: 4096 } });
+  });
+
   it("keeps sampling parameters for Gemini models that still support them", () => {
     const providersConfig = withGoogleModelParameters({
       "*": {

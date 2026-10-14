@@ -16,7 +16,12 @@ export interface ChatInputAPI {
   focus: () => void;
   send: () => Promise<void>;
   restoreText: (text: string) => void;
-  restoreDraft: (pending: PendingUserMessage) => void;
+  /**
+   * `retainedSendIds`: the restored input is sends whose text and attachments the draft still
+   * retains under these ids (idempotent sends). Only the reviews are restored here; the rest
+   * becomes visible when the sends resolve as not accepted, so nothing is inserted twice.
+   */
+  restoreDraft: (pending: PendingUserMessage, options?: { retainedSendIds?: string[] }) => void;
   appendText: (text: string) => void;
   prependText: (text: string) => void;
 }
@@ -113,6 +118,8 @@ export interface ChatInputCreationVariant {
   onModelChange?: (model: string) => void;
   disabled?: boolean;
   onReady?: (api: ChatInputAPI) => void;
+  /** #6038: whether this composer cannot send yet (its branch list is loading or failed). */
+  onCreationSendBlockedChange?: (blocked: boolean) => void;
 }
 
 export type ChatInputProps = ChatInputWorkspaceVariant | ChatInputCreationVariant;

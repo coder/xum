@@ -1,5 +1,7 @@
 @import "tailwindcss";
 
+@import "./ios-standalone.css";
+
 /* Disable the default browser focus outline (the blue ring).
    Components can still use intentional focus styles like border-color changes.
    Kept in the base layer (#4718) so component utilities such as
@@ -105,7 +107,8 @@
   --color-content-tertiary: hsl(240, 4%, 46%);
   --color-content-disabled: hsl(240, 5%, 65%);
   --color-muted-foreground: hsl(210 14% 48%);
-  --color-secondary: hsl(210 18% 60%);
+  /* Darkened to reach WCAG AA (4.5:1) on #fff, #f5f5f5 and #f8fafc (#5950, #5951). */
+  --color-secondary: hsl(210 18% 44%);
   --color-surface-primary: hsla(0, 0%, 100%, 1);
   --color-surface-secondary: hsla(240, 5%, 96%, 1);
   --color-content-destructive: hsla(0, 84%, 60%, 1);
@@ -119,6 +122,8 @@
   --color-surface-sky: hsla(191, 67%, 89%, 1);
 
   --color-code-bg: hsl(210 40% 96%);
+  /* The dark #d19a66 is 2.5:1 on white; same hue, darker, for WCAG AA (#5980). */
+  --color-code-inline: hsl(29 54% 36%);
 
   --color-button-bg: hsl(210 35% 94%);
   --color-button-text: hsl(210 20% 20%);
@@ -189,7 +194,9 @@
 
   --color-interrupted: hsl(0 0% 50%);
   --color-backgrounded: hsl(200 70% 50%);
-  --color-review-accent: hsl(212 85% 48%); /* saturated blue — distinct from amber/yellow warning states */
+  --color-review-accent: hsl(
+    212 85% 48%
+  ); /* saturated blue — distinct from amber/yellow warning states */
   --color-git-dirty: hsl(38 92% 50%);
   --color-error: hsl(0 68% 46%);
   --color-error-bg: hsl(0 82% 94%);
@@ -199,8 +206,11 @@
   --color-input-border: hsl(207 75% 52%);
   --color-input-border-focus: hsl(193 85% 56%);
 
-  --color-muted: hsl(210 14% 52%);
-  --color-muted-light: hsl(210 20% 60%);
+  /* Darkened to reach WCAG AA (4.5:1) on #fff, #f5f5f5 and #f8fafc (#5950, #5951). */
+  --color-muted: hsl(210 14% 44%);
+  /* Same as --color-muted: hsl(210 20% 60%) was 2.7:1 on the sidebar, and a passing value of
+     its own would be darker than --color-muted (#5984). */
+  --color-muted-light: var(--color-muted);
   --color-muted-dark: hsl(210 12% 42%);
   --color-placeholder: hsl(210 16% 52%);
   --color-subtle: hsl(210 20% 64%);
@@ -236,6 +246,10 @@
   --color-accent-dark: hsl(207 90% 38%);
   --color-accent-darker: hsl(204 92% 30%);
   --color-accent-light: hsl(198 100% 70%);
+  /* The accent's hue and saturation, darker: WCAG AA (4.5:1) on every light surface, down to the
+     selected-row tint #c8dff3 (4.64:1), where the accent itself was 3.46:1 (#6449).
+     --color-accent stays the button fill and focus ring. */
+  --color-accent-text: hsl(207 90% 35%);
   --color-accent-foreground: hsl(0 0% 100%); /* preserve contrast on blue buttons in light mode */
 
   --color-success: hsl(122 39% 45%);
@@ -311,7 +325,11 @@
   --color-plan-mode-light: color-mix(in srgb, var(--color-plan-mode), white 42%);
   --color-plan-mode-alpha: hsl(from var(--color-plan-mode) h s l / 0.08);
 
-  --color-ask-mode: color-mix(in srgb, var(--color-exec-mode) 62%, var(--color-plan-mode)); /* Blend between plan and exec */
+  --color-ask-mode: color-mix(
+    in srgb,
+    var(--color-exec-mode) 62%,
+    var(--color-plan-mode)
+  ); /* Blend between plan and exec */
   --color-ask-mode-hover: color-mix(in srgb, var(--color-ask-mode), white 18%);
   --color-ask-mode-light: color-mix(in srgb, var(--color-ask-mode), white 42%);
   --color-ask-mode-alpha: hsl(from var(--color-ask-mode) h s l / 0.08);
@@ -358,12 +376,16 @@
   --color-content-secondary: #575653;
   --color-content-tertiary: #6f6e69;
   --color-content-disabled: #b7b5ac;
-  --color-muted-foreground: #6f6e69;
-  --color-secondary: #6f6e69;
+  --color-muted-foreground: #575653;
+  --color-secondary: #575653;
   --color-surface-primary: #fffcf0;
   --color-surface-secondary: #f8f5e8;
   --color-content-destructive: #af3029;
-  --color-surface-destructive: color-mix(in srgb, var(--color-danger) 12%, var(--color-background) 88%);
+  --color-surface-destructive: color-mix(
+    in srgb,
+    var(--color-danger) 12%,
+    var(--color-background) 88%
+  );
   --color-surface-invert-secondary: #403e3c;
   --color-surface-tertiary: #f2f0e5;
   --color-surface-quaternary: #dad8ce;
@@ -373,6 +395,8 @@
   --color-surface-sky: color-mix(in srgb, var(--color-info) 16%, var(--color-background) 84%);
 
   --color-code-bg: #f2f0e5;
+  /* The dark #d19a66 is 2.4:1 on #fffcf0; same hue, darker, for WCAG AA (#5980). */
+  --color-code-inline: hsl(29 54% 36%);
 
   --color-button-bg: #e6e4d9;
   --color-button-text: #100f0f;
@@ -441,9 +465,12 @@
   --color-input-border: #205ea6;
   --color-input-border-focus: color-mix(in srgb, var(--color-input-border), white 30%);
 
-  --color-muted: #6f6e69;
-  --color-muted-light: #6f6e69;
-  --color-muted-dark: #6f6e69;
+  /* Flexoki base-700: WCAG AA (4.5:1) on the sidebar (#f2f0e5, 6.42:1) and on hover
+     (#e6e4d9, 5.75:1). base-600 was 4.47:1 on the sidebar (#5984). The muted, muted-light,
+     muted-dark, muted-foreground and secondary text tokens share it. */
+  --color-muted: #575653;
+  --color-muted-light: #575653;
+  --color-muted-dark: #575653;
   --color-placeholder: #6f6e69;
   --color-subtle: #6f6e69;
   --color-dim: #6f6e69;
@@ -478,6 +505,8 @@
   --color-accent-dark: color-mix(in srgb, var(--color-accent), black 14%);
   --color-accent-darker: color-mix(in srgb, var(--color-accent), black 24%);
   --color-accent-light: color-mix(in srgb, var(--color-accent), white 42%);
+  /* Flexoki blue-600 already reaches WCAG AA on every flexoki-light surface (#5946, #6449). */
+  --color-accent-text: var(--color-accent);
   --color-accent-foreground: #fffcf0; /* high-contrast text on accent buttons */
 
   --color-success: #66800b;
@@ -495,7 +524,11 @@
   --color-code-type: #24837b;
   --color-code-keyword: #205ea6;
 
-  --color-toast-success-bg: color-mix(in srgb, var(--color-accent) 18%, var(--color-background) 82%);
+  --color-toast-success-bg: color-mix(
+    in srgb,
+    var(--color-accent) 18%,
+    var(--color-background) 82%
+  );
   --color-toast-success-text: color-mix(in srgb, var(--color-accent), black 28%);
   --color-toast-error-bg: color-mix(in srgb, var(--color-danger) 18%, var(--color-background) 82%);
   --color-toast-error-text: color-mix(in srgb, var(--color-danger), black 22%);
@@ -545,7 +578,11 @@
   --color-plan-mode-light: color-mix(in srgb, var(--color-plan-mode), white 22%);
   --color-plan-mode-alpha: hsl(from var(--color-plan-mode) h s l / 0.12);
 
-  --color-ask-mode: color-mix(in srgb, var(--color-exec-mode) 62%, var(--color-plan-mode)); /* Blend between plan and exec */
+  --color-ask-mode: color-mix(
+    in srgb,
+    var(--color-exec-mode) 62%,
+    var(--color-plan-mode)
+  ); /* Blend between plan and exec */
   --color-ask-mode-hover: color-mix(in srgb, var(--color-ask-mode), white 10%);
   --color-ask-mode-light: color-mix(in srgb, var(--color-ask-mode), white 22%);
   --color-ask-mode-alpha: hsl(from var(--color-ask-mode) h s l / 0.12);
@@ -588,11 +625,17 @@
   --color-content-tertiary: #575653;
   --color-content-disabled: #403e3c;
   --color-muted-foreground: #878580;
-  --color-secondary: #575653;
+  /* Flexoki base-400: WCAG AA (4.5:1) on every flexoki-dark surface, down to the slash command
+     rows (#343331, 4.65:1). base-700 was 2.61:1 on the main surface (#6021). */
+  --color-secondary: #9f9d96;
   --color-surface-primary: #100f0f;
   --color-surface-secondary: #1c1b1a;
   --color-content-destructive: #d14d41;
-  --color-surface-destructive: color-mix(in srgb, var(--color-danger) 16%, var(--color-background) 84%);
+  --color-surface-destructive: color-mix(
+    in srgb,
+    var(--color-danger) 16%,
+    var(--color-background) 84%
+  );
   --color-surface-invert-secondary: #b7b5ac;
   --color-surface-tertiary: #282726;
   --color-surface-quaternary: #343331;
@@ -705,8 +748,14 @@
   --color-accent: #4385be;
   --color-accent-hover: color-mix(in srgb, var(--color-accent), white 12%);
   --color-accent-dark: color-mix(in srgb, var(--color-accent), black 18%);
+  /* This theme's accent text is near-black, so a darker hover would lower contrast (3.49:1).
+     The primary-button hover goes lighter instead: 5.9:1 with --color-accent-foreground (#6022). */
+  --color-accent-button-hover: color-mix(in srgb, var(--color-accent), white 12%);
   --color-accent-darker: color-mix(in srgb, var(--color-accent), black 28%);
   --color-accent-light: color-mix(in srgb, var(--color-accent), white 22%);
+  /* Flexoki blue-300: WCAG AA (4.5:1) on every flexoki-dark surface, down to hover #282726
+     (5.27:1); blue-400 was 3.79:1 there (#5946). */
+  --color-accent-text: #66a0c8;
   --color-accent-foreground: #100f0f; /* maintain WCAG contrast against lighter Flexoki dark accent */
 
   --color-success: #879a39;
@@ -727,7 +776,11 @@
   --color-terminal-bg: #100f0f;
   --color-terminal-fg: #cecdc3;
 
-  --color-toast-success-bg: color-mix(in srgb, var(--color-accent) 13%, var(--color-background) 87%);
+  --color-toast-success-bg: color-mix(
+    in srgb,
+    var(--color-accent) 13%,
+    var(--color-background) 87%
+  );
   --color-toast-success-text: color-mix(in srgb, var(--color-accent), white 22%);
   --color-toast-error-bg: color-mix(in srgb, var(--color-danger) 15%, var(--color-background) 85%);
   --color-toast-error-text: var(--color-danger);
@@ -800,11 +853,8 @@ body,
   background-color: var(--color-surface-primary);
 }
 
-/* iOS standalone status-bar band (element lives in index.html). iOS 26 WebKit blurs the band
-   into the header unless a fixed, viewport-wide element with a solid background-color sits at
-   the top edge; pseudo-elements do not count. Glyphs stay white in every theme, so light themes
-   keep a constant dark band. The @supports gate excludes Android, whose dark glyphs would
-   vanish on it. */
+/* iOS 26 standalone colors the status bar from an opaque, near-full-width fixed element at the
+   top edge (element lives in index.html); keep it at least 1px tall when there is no inset. */
 .ios-status-bar-band {
   display: none;
 }
@@ -817,15 +867,11 @@ body,
       top: 0;
       left: 0;
       right: 0;
-      height: env(safe-area-inset-top, 0px);
+      height: max(1px, env(safe-area-inset-top, 0px));
       background-color: var(--color-sidebar);
-      /* Above the off-canvas drawer (z-index 1000); layout pads interactive content out of
-         the band. */
+      /* Above the off-canvas drawer (z-index 1000). */
       z-index: 1001;
-    }
-
-    :root[data-theme$="light"] .ios-status-bar-band {
-      background-color: var(--color-ios-status-bar-backdrop);
+      pointer-events: none;
     }
   }
 }
@@ -868,6 +914,20 @@ body,
     /* Keep in sync with MOBILE_TOUCH_TARGET_PX, which tests use to reproduce this rule. */
     min-height: 44px;
     min-width: 44px;
+  }
+
+  /* A checkbox in a label or a clickable row: the row is the touch target, so the row gets the
+     44px minimum and the checkbox keeps its drawn size. A 44px checkbox there sat off its label's
+     line in top-aligned rows (#5835). A checkbox with a sibling label keeps its own 44px hit
+     area; the Checkbox component centers its drawn box inside it. */
+  :is(label, [role="button"]) button[role="checkbox"] {
+    min-height: 0;
+    min-width: 0;
+  }
+
+  label:has(button[role="checkbox"]) {
+    /* Keep in sync with MOBILE_TOUCH_TARGET_PX, which tests use to reproduce this rule. */
+    min-height: 44px;
   }
 
   /* Full-width rows above the composer (TODO, sub-agents, background bash) read as a list;
@@ -920,14 +980,6 @@ body,
     padding-left: 0.5rem !important;
   }
 
-  /* Hand the bottom inset to a column that reserves its own clearance (see ChatPane and
-     WorkspaceFooterBar). This box clips overflow, so a child can never paint into its padding, and
-     the reserved band reads as dead space under the footer bar. Surfaces without such a column
-     (immersive review, settings, creation, loading shells) keep the inset here. */
-  .mobile-bottom-inset-host:has([data-bottom-inset-owner]) {
-    padding-bottom: 0 !important;
-  }
-
   .mobile-overlay {
     display: block !important;
   }
@@ -938,18 +990,28 @@ body,
     top: 0 !important;
     width: 18rem !important;
     z-index: 1000 !important;
-    transition: transform 0.3s !important;
+    /* Visibility flips at once on open and after the slide on close (see the collapsed rule). */
+    transition:
+      transform 0.3s,
+      visibility 0s linear 0s !important;
     box-shadow: 2px 0 8px rgba(0, 0, 0, 0.5) !important;
 
     /* Account for iOS safe areas (the sidebar is position: fixed) */
     padding-top: env(safe-area-inset-top, 0px) !important;
-    padding-bottom: env(safe-area-inset-bottom, 0px) !important;
     padding-left: env(safe-area-inset-left, 0px) !important;
   }
 
+  /* The closed drawer is off-screen, and "Open sidebar menu" reopens it. Hidden, its controls
+     ("Expand sidebar") take no Tab stop (#6102). visibility, not `inert`: the artifact fullscreen
+     manages `inert` on this element's ancestors and siblings, and two owners of one attribute
+     clear each other's state. The delay keeps the drawer visible while it slides out. */
   .mobile-sidebar-collapsed {
     transform: translateX(-100%) !important;
     box-shadow: none !important;
+    visibility: hidden !important;
+    transition:
+      transform 0.3s,
+      visibility 0s linear 0.3s !important;
   }
 
   /* Stack vertically so main content gets the full viewport width */
@@ -964,6 +1026,26 @@ body,
   /* Hide right sidebar on small screens so it never stacks below the chat pane. */
   .mobile-hide-right-sidebar {
     display: none !important;
+  }
+
+  /* Phones open the hidden sidebar's tools from the workspace menu, which shows the sidebar
+     itself full-screen (WorkspaceShell owns the state). Inside the hide rules only: once the
+     layout widens, the sidebar is back in its column. Below dialogs (z-1500) and popovers
+     (z-1600), so menus and dialogs opened from its panels still show above it. */
+  .mobile-hide-right-sidebar.right-sidebar-fullscreen {
+    display: flex !important;
+    position: fixed !important;
+    inset: 0 !important;
+    width: 100% !important;
+    max-width: none !important;
+    z-index: 1100 !important;
+    border-left: 0 !important;
+    padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
+      env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px) !important;
+  }
+
+  .right-sidebar-fullscreen .right-sidebar-fullscreen-header {
+    display: flex;
   }
 }
 
@@ -988,7 +1070,102 @@ body,
   .mobile-hide-right-sidebar {
     display: none !important;
   }
+
+  /* Same full-screen sidebar as in the narrow-viewport block above. */
+  .mobile-hide-right-sidebar.right-sidebar-fullscreen {
+    display: flex !important;
+    position: fixed !important;
+    inset: 0 !important;
+    width: 100% !important;
+    max-width: none !important;
+    z-index: 1100 !important;
+    border-left: 0 !important;
+    padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
+      env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px) !important;
+  }
+
+  .right-sidebar-fullscreen .right-sidebar-fullscreen-header {
+    display: flex;
+  }
 }
+
+/* The full-screen sidebar's header exists only while that mode is on, and shows only inside
+   the hide rules above. RightSidebar reads display:none here as "the layout widened". */
+.right-sidebar-fullscreen-header {
+  display: none;
+}
+
+/* -----------------------------------------------------------------------------
+ * Collapsed right sidebar: overview card vs. header stand-in
+ *
+ * The collapsed right sidebar is a card floating in the chat's top-right corner (RightSidebar).
+ * It never covers the transcript: where it shows, the chat reserves its width
+ * (--chat-reserved-inline-end, read by ChatPane's scrollport), so the transcript column, and
+ * the composer under it, center in the space left of the card, as far from the card as from the
+ * left edge. It shows only where the column keeps its full width beside it:
+ *
+ *   48rem column (--container-chat) + 2 × 15px chat gutter (1.875rem)
+ *   + 16rem card + 0.75rem inset = 66.625rem of workspace shell.
+ *
+ * Container queries take no var(), so that sum is spelled out below; keep it in step with the
+ * tokens. A full-width transcript has no column to make room beside, so it never shows the card.
+ * Everywhere else the header's expand button (WorkspaceMenuBar) stands in for it, except in the
+ * narrow layouts, which hide the sidebar itself (the workspace menu opens it there).
+ *
+ * visibility, not display: the card's display tells shortcuts whether the layout hides the sidebar
+ * (isRightSidebarResponsivelyHidden), and a collapsed sidebar is not hidden by the layout: its
+ * shortcuts still expand it.
+ * --------------------------------------------------------------------------- */
+
+[data-workspace-shell] {
+  --overview-card-width: 16rem;
+  --overview-card-inset: 0.75rem;
+}
+
+.right-sidebar-overview-card {
+  right: var(--overview-card-inset);
+  width: var(--overview-card-width);
+  visibility: hidden;
+}
+
+.right-sidebar-overview-expand {
+  display: none;
+}
+
+@media (min-width: 769px) {
+  @container workspace-shell (width > 684px) {
+    .right-sidebar-overview-expand {
+      display: inline-flex;
+    }
+  }
+}
+
+/* At any width: a sidebar whose chunk failed to load shows docked with its Reload button and never
+   listens for the stand-in's event, so the stand-in would do nothing. */
+[data-workspace-shell]:has(> [data-right-sidebar-load-failed]) .right-sidebar-overview-expand {
+  display: none;
+}
+
+@container workspace-shell (width >= 66.625rem) {
+  [data-workspace-shell]:not([data-transcript-full-width]) > .right-sidebar-overview-card {
+    visibility: visible;
+  }
+
+  [data-workspace-shell]:not([data-transcript-full-width]) .right-sidebar-overview-expand {
+    display: none;
+  }
+
+  /* Keyed on the collapsed state (WorkspaceShell), not on the card element, which mounts only
+     once the lazy sidebar chunk loads: the transcript must not shift when it does. A chunk that
+     failed to load shows docked instead, with no card, so nothing is reserved then. */
+  [data-workspace-shell][data-right-sidebar-collapsed]:not([data-transcript-full-width]):not(
+      :has(> [data-right-sidebar-load-failed])
+    )
+    > :not(.right-sidebar-overview-card) {
+    --chat-reserved-inline-end: calc(var(--overview-card-width) + var(--overview-card-inset));
+  }
+}
+
 /*
  * iPadOS/iOS keyboard accessory bar fix
  *
@@ -1029,13 +1206,13 @@ body,
 }
 
 /* Safe areas for notched devices handled via Tailwind arbitrary values:
-   pt-[env(safe-area-inset-top)] and pb-[env(safe-area-inset-bottom)] */
+   pt-[env(safe-area-inset-top)]. The bottom inset is intentionally omitted: iOS PWAs
+   reserve far too much space for it. */
 
 /* For PWA mode, ensure the viewport meta tag handles the keyboard properly
    Note: This is a CSS-only solution; the actual fix requires the viewport
    meta tag to include 'interactive-widget=resizes-content' which is handled
    in index.html */
-
 
 @import "./tool-surfaces.css";
 code {
@@ -1201,7 +1378,6 @@ html[data-renderer-inactive] *::after {
   animation: connector-dash-scroll 0.4s linear infinite;
 }
 
-
 @keyframes connector-elbow-dash-scroll {
   from {
     stroke-dashoffset: 6;
@@ -1287,12 +1463,16 @@ html[data-renderer-inactive] *::after {
   padding-right: max(var(--titlebar-right-inset, 0px), var(--titlebar-safe-right-gutter, 0px));
 }
 
-/* Right inset minus the 20px collapsed right-sidebar rail. Used by headers
- * that stretch under the overlay only when the sidebar is collapsed. */
-.titlebar-safe-right-minus-sidebar {
+/* titlebar-safe-right that never takes more than the element's width minus 10rem, for rows
+ * whose content would otherwise be squeezed to nothing (the right-sidebar tab strip scrolls in
+ * one row, so a full inset on a narrow pane left no visible, clickable tab). Below that width
+ * content may sit under the overlay controls, which beats being unreachable. 10rem keeps the
+ * full 138px Windows/Linux fallback inset at the sidebar's 300px minimum width. Percentage
+ * padding resolves against the parent's width, which matches a full-width row. */
+.titlebar-safe-right-capped {
   padding-right: max(
     var(--titlebar-safe-right-gutter, 0px),
-    calc(var(--titlebar-right-inset, 0px) - 20px)
+    min(var(--titlebar-right-inset, 0px), calc(100% - 10rem))
   );
 }
 
@@ -1300,7 +1480,12 @@ html[data-renderer-inactive] *::after {
  * the component's built-in horizontal spacing as a CSS custom property.
  * The titlebar-safe utilities read these to ensure padding never drops
  * below the component's natural gutter. */
-.titlebar-safe-left-gutter-4 { --titlebar-safe-left-gutter: 1rem; }      /* px-4 */
-.titlebar-safe-right-gutter-3 { --titlebar-safe-right-gutter: 0.75rem; } /* px-3 */
-.titlebar-safe-right-gutter-2 { --titlebar-safe-right-gutter: 0.5rem; }  /* px-2 */
-
+.titlebar-safe-left-gutter-4 {
+  --titlebar-safe-left-gutter: 1rem;
+} /* px-4 */
+.titlebar-safe-right-gutter-3 {
+  --titlebar-safe-right-gutter: 0.75rem;
+} /* px-3 */
+.titlebar-safe-right-gutter-2 {
+  --titlebar-safe-right-gutter: 0.5rem;
+} /* px-2 */

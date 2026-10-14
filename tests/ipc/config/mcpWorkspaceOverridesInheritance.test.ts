@@ -35,7 +35,6 @@ async function captureMcpToolSurface(
   try {
     await sendMessageWithModel(env, workspaceId, "hello", HAIKU_MODEL, {
       agentId: "exec",
-      experiments: { toolSearch: true },
     });
   } finally {
     streamManager.startStream = original;
@@ -83,8 +82,8 @@ describeIntegration("workspace MCP overrides in derived workspaces", () => {
           })
         ).success
       ).toBe(true);
-      // Haiku gets Anthropic prompt caching, so tool search leaves the MCP tool
-      // advertised instead of deferring it (#5250).
+      // Haiku gets Anthropic prompt caching, and a one-tool catalog is below the
+      // native tool-search size threshold, so the tool is advertised in full (#5405).
       const expectedSurface = {
         tools: [`${SERVER_NAME}_take_screenshot`],
         deferred: [],

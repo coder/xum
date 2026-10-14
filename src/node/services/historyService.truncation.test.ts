@@ -441,7 +441,7 @@ describe("HistoryService truncation marker compatibility", () => {
 });
 
 /**
- * Two-backend race (TLA+ formal/history-crash ArchiveSwap A2): backend A's read path probes
+ * Two-backend race: backend A's read path probes
  * for truncation artifacts, releases the lock, then re-acquires it for the lazy sealed-history
  * rotation. Backend B truncates in that gap and is SIGKILLed after renaming the archive to its
  * tombstone. Rotation must recover B's transaction first; appending to a fresh archive would

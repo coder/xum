@@ -2,7 +2,7 @@
 // differential oracle), together with every historyScanner.ts helper it reaches: the reset token
 // recognizer, the raw-marker and ambiguous-key checks, the readability check and the row
 // classifier. Do not edit to follow production; delete together with the locator fast path.
-// Re-frozen once, deliberately, with the F1-F3 privacy fixes (historyScanner.formal.test.ts):
+// Re-frozen once, deliberately, with the F1-F3 privacy fixes (historyScanner.reference.test.ts):
 // the reset token window strips separators, and oversized rows stream through the raw probe for
 // their own reset evidence and for any JSON spelling of the compaction boundary. Those rules
 // changed on both sides; the fast-path comparison is unchanged.

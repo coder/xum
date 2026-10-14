@@ -10,6 +10,7 @@ import {
   createMuxMessage,
   getMcpPromptReferenceKey,
   isCompactionSummaryMetadata,
+  isContextBudgetWarningMessage,
   sanitizeAgentSkillRefs,
   sanitizeMcpPromptRefs,
 } from "@/common/types/message";
@@ -80,6 +81,7 @@ import {
 import { showBrowserNotification } from "@/browser/utils/ui/showBrowserNotification";
 import type { DynamicToolPart, DynamicToolPartPending } from "@/common/types/toolParts";
 import type { AgentSkillDescriptor, AgentSkillScope } from "@/common/types/agentSkill";
+import { resolveSkillReadIdentity } from "@/common/utils/agentSkills/skillLookupName";
 import { INIT_HOOK_MAX_LINES } from "@/common/constants/toolLimits";
 import { isDynamicToolPart } from "@/common/types/toolParts";
 import { z } from "zod";
@@ -113,6 +115,34 @@ import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewE
 // row; only a transcript-visible user row replaces it.
 function isTranscriptVisibleUserRow(message: MuxMessage): boolean {
   return message.metadata?.synthetic !== true || message.metadata.uiVisible === true;
+}
+
+/**
+ * Hidden notices AgentSession.streamWithHistory persists INSIDE a turn that already started: the
+ * `<system-file-update>` row (createFileChangeNotificationMessage, `file-change-` id) and the
+ * `[CONTINUE]` sentinel for a trailing completed assistant. The backend publishes them so the
+ * client holds the same rows as history (an edit fences its range with them), but they arrive
+ * after the turn's real user row and must not restart that turn's pending state. Matched by the
+ * exact markers the backend writes, not by `synthetic` alone: hidden synthetic rows such as
+ * context-budget continuations do start turns.
+ */
+function isInTurnHiddenNoticeRow(message: MuxMessage): boolean {
+  const metadata = message.metadata;
+  if (
+    message.role !== "user" ||
+    metadata?.synthetic !== true ||
+    metadata.uiVisible === true ||
+    metadata.muxMetadata !== undefined ||
+    message.parts.length !== 1
+  ) {
+    return false;
+  }
+  const part = message.parts[0];
+  if (part.type !== "text") return false;
+  return (
+    part.text === "[CONTINUE]" ||
+    (message.id.startsWith("file-change-") && part.text.startsWith("<system-file-update>"))
+  );
 }
 
 function isDisplayOnlyCompletedSubagentReport(message: MuxMessage): boolean {
@@ -1266,7 +1296,7 @@ export class StreamingMessageAggregator {
 
         if (message.role === "user") {
           // Plan-review record rows are hidden UI state, not user turns (see handleMuxMessage).
-          if (isPlanReviewRecordMessage(message)) continue;
+          if (isPlanReviewRecordMessage(message) || isInTurnHiddenNoticeRow(message)) continue;
           // Mirror live behavior for status: clear transient status on new user turn
           // but keep persisted status for fallback on reload.
           this.agentStatus = undefined;
@@ -1758,7 +1788,7 @@ export class StreamingMessageAggregator {
       if (message.role !== "user") continue;
       // Hidden plan-review records (snapshot/resolve/reopen) appended after the request are
       // state, not user turns; they must not hide the request on reconnect recovery.
-      if (isPlanReviewRecordMessage(message)) continue;
+      if (isPlanReviewRecordMessage(message) || isInTurnHiddenNoticeRow(message)) continue;
       const muxMetadata = message.metadata?.muxMetadata;
       if (muxMetadata?.type === "compaction-request") {
         return sawCompletedCompaction
@@ -2776,7 +2806,7 @@ export class StreamingMessageAggregator {
     if (result.success) {
       const skill = result.skill;
       this.trackLoadedSkill({
-        name: skill.frontmatter.name,
+        name: resolveSkillReadIdentity(input, skill.frontmatter.name),
         description: skill.frontmatter.description,
         scope: skill.scope,
       });
@@ -3295,6 +3325,16 @@ export class StreamingMessageAggregator {
       // Plan-review snapshot/resolve/reopen rows are hidden UI state appended without starting
       // a model turn (e.g. resolving a thread while idle). Keep the row for review-state replay
       // but leave the lifecycle, agent status, compaction and pending-stream state untouched.
+      return;
+    }
+
+    if (isInTurnHiddenNoticeRow(incomingMessage)) {
+      // Kept above as edit evidence; the turn it belongs to is already pending.
+      return;
+    }
+
+    if (isContextBudgetWarningMessage(incomingMessage)) {
+      // A Token Budget warning is a notice, not a request: keep the turn state of its user row.
       return;
     }
 

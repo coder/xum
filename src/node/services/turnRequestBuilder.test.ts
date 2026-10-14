@@ -3,6 +3,7 @@ import { tool } from "ai";
 import { z } from "zod";
 import { getContextBudgetHardCeiling } from "@/common/utils/compaction/contextBudget";
 import { ContextBudgetExceededError } from "./contextBudgetError";
+import { estimateAssembledRequestTokensForModel } from "./contextBudgetCounting";
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
@@ -65,7 +66,6 @@ async function createPreparationHarness() {
       throw new Error("not used by request preparation tests");
     },
     isClaudeSkillsCompatEnabled: () => false,
-    isAgentPluginsEnabled: () => false,
     wrapToolsForDelegation: (_workspaceId, tools) => tools,
     durableEventJournalFor: () => {
       throw new Error("not used by request preparation tests");
@@ -419,6 +419,36 @@ describe("TurnRequestBuilder assembled preflight", () => {
     const payload = await assembleBudgetCheckedPromptPayload(options(), { enabled: false });
     expect(payload.messages.length).toBeGreaterThan(0);
   });
+
+  // #5286: turn-start stage decisions read E from the payload instead of counting it again.
+  it("keeps the enforced estimate on the payload", async () => {
+    const request = options("openai:large-context-model");
+    const payload = await assembleBudgetCheckedPromptPayload(request, { enabled: true });
+    expect(payload.contextBudgetEstimate).toBe(
+      (await estimateAssembledRequestTokensForModel(payload, {
+        model: request.modelString,
+        modelContextLimit: payload.contextBudgetLimit,
+      }))!.estimate
+    );
+    const off = await assembleBudgetCheckedPromptPayload(request, { enabled: false });
+    expect(off.contextBudgetEstimate).toBeUndefined();
+  });
+
+  it("measure-only mode returns the over-ceiling estimate instead of refusing", async () => {
+    const refused = await assembleBudgetCheckedPromptPayload(options(), { enabled: true }).catch(
+      (error: unknown) => error
+    );
+    if (!(refused instanceof ContextBudgetExceededError)) throw new Error("Expected refusal");
+    const measured = await assembleBudgetCheckedPromptPayload(options(), {
+      enabled: true,
+      measureOnly: true,
+    });
+    expect(measured.contextBudgetEstimate).toBe(refused.details.estimate);
+    const unchecked = await assembleBudgetCheckedPromptPayload(options(), { enabled: false });
+    expect(measured.messages).toEqual(unchecked.messages);
+    expect(measured.system).toEqual(unchecked.system);
+    expect(Object.keys(measured.tools ?? {})).toEqual(Object.keys(unchecked.tools ?? {}));
+  });
 });
 
 describe("TurnRequestBuilder tool scope", () => {
@@ -447,6 +477,33 @@ describe("TurnRequestBuilder tool scope", () => {
 });
 
 describe("TurnRequestBuilder model attempt preparation", () => {
+  it("merges saved Meta extras into the Responses SDK namespace", async () => {
+    const harness = await createPreparationHarness();
+    try {
+      harness.providersConfigStore.saveProvidersConfig({
+        meta: { modelParameters: { "*": { parallelToolCalls: false } } },
+      });
+      const prepared = harness.builder.prepareModelAttempt(
+        preparationOptions(harness.providerService.getConfig() ?? {}, {
+          rawModelString: "meta:muse-wonder-1.0",
+          canonicalModelString: "meta:muse-wonder-1.0",
+          canonicalProviderName: "meta",
+          effectiveModelString: "meta:muse-wonder-1.0",
+          optionsModelString: "meta:muse-wonder-1.0",
+          wireProviderName: "meta",
+          routeProvider: "meta",
+          effectiveThinkingLevel: "high",
+        })
+      );
+      expect(prepared.providerOptions).toMatchObject({
+        openai: { parallelToolCalls: false, reasoningEffort: "high", store: false },
+      });
+      expect(prepared.providerOptions).not.toHaveProperty("meta");
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
   it("merges call settings and provider extras at the resolved namespace", async () => {
     const harness = await createPreparationHarness();
     try {

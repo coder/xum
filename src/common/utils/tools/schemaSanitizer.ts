@@ -440,6 +440,19 @@ export function sanitizeToolSchemaForOpenAI(tool: Tool): Tool {
 }
 
 /**
+ * The tool a sanitized copy came from. Hook rewrites are checked against its full schema: the
+ * sanitized one drops constraints (minLength, pattern, bounds) the MCP server still enforces.
+ * Enumerable, so descriptor clones and object spreads keep it.
+ */
+export const UNSANITIZED_TOOL = Symbol.for("xum.unsanitizedTool");
+
+/** The tool before sanitizeToolSchemaForOpenAI, or the tool itself. */
+export function unsanitizedTool(tool: unknown): unknown {
+  if (tool === null || typeof tool !== "object" || !(UNSANITIZED_TOOL in tool)) return tool;
+  return (tool as Record<symbol, unknown>)[UNSANITIZED_TOOL];
+}
+
+/**
  * Sanitize all MCP tools for OpenAI compatibility.
  *
  * @param mcpTools - Record of MCP tools to sanitize
@@ -448,7 +461,14 @@ export function sanitizeToolSchemaForOpenAI(tool: Tool): Tool {
 export function sanitizeMCPToolsForOpenAI(mcpTools: Record<string, Tool>): Record<string, Tool> {
   const sanitized: Record<string, Tool> = {};
   for (const [name, tool] of Object.entries(mcpTools)) {
-    sanitized[name] = sanitizeToolSchemaForOpenAI(tool);
+    const copy = sanitizeToolSchemaForOpenAI(tool);
+    if (copy !== tool) {
+      Object.defineProperty(copy, UNSANITIZED_TOOL, {
+        value: unsanitizedTool(tool),
+        enumerable: true,
+      });
+    }
+    sanitized[name] = copy;
   }
   return sanitized;
 }

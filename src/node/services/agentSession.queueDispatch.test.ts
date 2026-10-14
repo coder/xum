@@ -521,6 +521,16 @@ describe("AgentSession queued message tool-call dispatch", () => {
             fileParts: [...fileParts, ...laterFileParts],
             reviews,
             heldInputIds: h.session.getHeldInputs().map((held) => held.id),
+            // Per send (idempotent sends): these sends were queued without send ids.
+            inputs: [
+              {
+                text: restoreAt === "raw command" ? "/init" : "first\nsecond",
+                fileParts,
+                reviews,
+                sendIds: [],
+              },
+              { text: "later input", fileParts: laterFileParts, sendIds: [] },
+            ],
           },
         ]);
         // The dequeued send and the later entry are each held with their own send (#4448).
@@ -656,6 +666,40 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(lastQueueEvent()).toMatchObject({
         queuedMessages: ["plain follow-up"],
         acpPromptIds: [],
+      });
+    } finally {
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
+  // Artifacts M5b: a queued artifact send carries its metadata to the renderer, which shows it
+  // like the sent message instead of the model-facing <artifact_interaction> payload.
+  test("queue events carry a queued artifact send's metadata and confirmed text", async () => {
+    const h = await createAgentSessionHarness({
+      workspaceId: "queue-artifact-interaction",
+      captureEvents: true,
+    });
+    const interaction = {
+      id: "i-1",
+      artifactPath: "form.html",
+      title: "Form",
+      version: 2,
+      action: "send" as const,
+      text: "Ship it",
+    };
+    try {
+      h.session.queueMessage(
+        '<artifact_interaction path="form.html">Ship it</artifact_interaction>',
+        {
+          model: TEST_MODEL,
+          agentId: "exec",
+          muxMetadata: { type: "normal", artifactInteraction: interaction },
+        }
+      );
+      expect(h.events.findLast((event) => event.type === "queued-message-changed")).toMatchObject({
+        displayText: "Ship it",
+        artifactInteraction: interaction,
       });
     } finally {
       await h.session.dispose();

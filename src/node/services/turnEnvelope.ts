@@ -121,6 +121,11 @@ export async function emitTurnEnvelope(params: {
    * (model-visible but never persisted to chat.jsonl at this sequence).
    */
   partialContinuationMessage?: MuxMessage | null;
+  /**
+   * MCP Apps model context message inserted before the newest user row
+   * (model-visible, request-only: never persisted to chat.jsonl).
+   */
+  mcpAppModelContextMessage?: MuxMessage | null;
 }): Promise<void> {
   try {
     // Blob puts and the append referencing them run under the journal blob
@@ -168,6 +173,12 @@ export async function emitTurnEnvelope(params: {
             JSON.stringify(params.partialContinuationMessage)
           );
         }
+        let mcpAppModelContextHash: BlobRef | undefined;
+        if (params.mcpAppModelContextMessage != null) {
+          mcpAppModelContextHash = await putTracked(
+            JSON.stringify(params.mcpAppModelContextMessage)
+          );
+        }
 
         // Ownership re-check between put and append (publishWithBlob parity):
         // if this holder was wrongfully displaced, a reclaimer may have
@@ -212,6 +223,7 @@ export async function emitTurnEnvelope(params: {
               ? { postCompactionAttachmentsHash }
               : {}),
             ...(partialContinuationHash !== undefined ? { partialContinuationHash } : {}),
+            ...(mcpAppModelContextHash !== undefined ? { mcpAppModelContextHash } : {}),
           },
         });
       } catch (error) {

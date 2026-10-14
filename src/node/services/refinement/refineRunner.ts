@@ -206,7 +206,7 @@ export async function runRefinePass(args: {
   ctx: MemoryScopeContext;
   /** Pre-built, bounded, thinking-stripped trajectory transcript. */
   transcript: string;
-  /** Optional timeline digest (Timeline experiment on). */
+  /** Optional timeline digest. */
   timelineText?: string;
   /**
    * Whether skill writes can be staged for this workspace (host-local

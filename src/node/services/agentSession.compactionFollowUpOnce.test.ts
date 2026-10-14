@@ -1,6 +1,6 @@
 /**
- * A compaction's pending follow-up runs at most once. Regression tests for the TLC findings in
- * formal/compaction/ (cases C1-* and C2-* in check.sh; the fixed model is F2).
+ * A compaction's pending follow-up runs at most once. Regression tests for the races where an
+ * edit, delete, crash or second backend could re-dispatch a consumed handoff.
  *
  * Crash = the session is disposed after a chosen durable step and a fresh AgentSession +
  * HistoryService is created on the same root. A second backend = a second AgentSession +
@@ -97,7 +97,7 @@ const textOf = (row: MuxMessage) =>
 const followUpRows = (rows: MuxMessage[]) =>
   rows.filter((row) => row.role === "user" && textOf(row) === FOLLOW_UP);
 
-describe("C1: editing the dispatched follow-up retires the consumed handoff", () => {
+describe("editing the dispatched follow-up retires the consumed handoff", () => {
   test("a crash between the edit's cut and its new user row does not re-dispatch", async () => {
     const h = await backend();
     await seedHandoff(h);
@@ -208,7 +208,7 @@ describe("deleteMessage paths keep a consumed handoff consumed", () => {
   });
 });
 
-describe("C2: a second backend's startup dispatch races the first backend", () => {
+describe("a second backend's startup dispatch races the first backend", () => {
   test("only one backend dispatches the follow-up", async () => {
     const a = await backend();
     await seedHandoff(a);
@@ -256,7 +256,7 @@ describe("C2: a second backend's startup dispatch races the first backend", () =
     expect(followUpRows(await allRows(h))).toHaveLength(0);
   });
 
-  // TLC also reported a Stop bypass in this race; automatic send admission re-reads the
+  // This race can also bypass a Stop; automatic send admission re-reads the
   // cancellation record and refuses.
   test("the other backend's Stop still blocks the racing dispatch", async () => {
     const a = await backend();

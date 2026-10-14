@@ -3,7 +3,6 @@ import { expect, userEvent, waitFor, within } from "@storybook/test";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getDefaultRightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 import {
   LEFT_SIDEBAR_COLLAPSED_KEY,
   RIGHT_SIDEBAR_COLLAPSED_KEY,
@@ -22,9 +21,6 @@ import { waitForChatInputAutofocusDone } from "./storyPlayHelpers.js";
 export default {
   ...appMeta,
   title: "App/Workflows",
-  beforeEach: () => () => {
-    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS), undefined);
-  },
   parameters: {
     ...appMeta.parameters,
     viewport: {
@@ -148,7 +144,6 @@ function createWorkflowFixture(initialRun: WorkflowRunRecord, sidebarWidth = 480
           ),
         ],
       });
-      updatePersistedState(getExperimentKey(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS), true);
       updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, true);
       updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
       updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, "workflows");
@@ -517,8 +512,12 @@ export const PlannedStagesPhone: AppStory = {
     await waitFor(() =>
       expect(canvas.getByRole("log", { name: "Conversation transcript" })).toBeVisible()
     );
-    const sidebar = canvasElement.querySelector('[aria-label="Workspace insights"]');
-    await expect(sidebar).toBeInTheDocument();
+    // The right sidebar is a lazy chunk (T3 #5971), so it can mount after the transcript.
+    const sidebar = await waitFor(() => {
+      const element = canvasElement.querySelector('[aria-label="Workspace insights"]');
+      if (element == null) throw new Error("right sidebar missing");
+      return element;
+    });
     // The real app hides this whole panel on phones. The test-runner does not
     // apply viewport globals, so only assert hidden at an actual phone width.
     if (window.innerWidth <= 390 || canvasElement.getBoundingClientRect().width <= 390) {

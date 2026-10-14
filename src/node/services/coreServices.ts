@@ -41,7 +41,6 @@ import type { ExtensionMetadataService } from "@/node/services/ExtensionMetadata
 import type { WorkspaceService } from "@/node/services/workspaceService";
 import type { TaskService } from "@/node/services/taskService";
 import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
-import type { PolicyService } from "@/node/services/policyService";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import type { EvaluationService } from "@/node/services/evaluation/evaluationService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
@@ -62,7 +61,6 @@ export interface CoreServicesOptions {
   mcpConfig?: Config;
   mcpServerManagerOptions?: MCPServerManagerOptions;
   /** Optional cross-cutting services (desktop creates before core services). */
-  policyService?: PolicyService;
   telemetryService?: TelemetryService;
   analyticsService?: GoalLifecycleAnalyticsSink;
   goalServiceOptions?: WorkspaceGoalServiceOptions;

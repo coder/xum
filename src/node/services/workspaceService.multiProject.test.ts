@@ -103,7 +103,6 @@ function createWorkspaceServiceForTest(options: WorkspaceServiceTestOptions): Wo
     createTestBackgroundProcessManager(),
     undefined,
     undefined,
-    undefined,
     createMockExperimentsService(options.experimentsEnabled ?? true),
     undefined,
     undefined,
@@ -1021,13 +1020,15 @@ describe("WorkspaceService multi-project lifecycle", () => {
         }
         expect(result.error).toContain("already exists");
         expect(deleteWorkspaceAMock).toHaveBeenCalledTimes(1);
+        // Neither createWorkspace reported createdBranch, so the non-forced rollback must keep
+        // both branches: `git branch -d` would delete a merged user branch it merely reused.
         expect(deleteWorkspaceAMock).toHaveBeenCalledWith(
           projectAPath,
           branchName,
           false,
           expect.any(AbortSignal),
           true,
-          { keepBranch: false }
+          { keepBranch: true }
         );
         expect(deleteWorkspaceBMock).toHaveBeenCalledTimes(1);
         expect(deleteWorkspaceBMock).toHaveBeenCalledWith(
@@ -1036,7 +1037,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
           false,
           expect.any(AbortSignal),
           true,
-          { keepBranch: false }
+          { keepBranch: true }
         );
         expect(initWorkspaceMock).not.toHaveBeenCalled();
         expect(removeContainerSpy).not.toHaveBeenCalled();

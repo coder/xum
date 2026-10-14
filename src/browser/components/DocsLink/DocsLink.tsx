@@ -23,7 +23,7 @@ export function DocsLink({ path, children = "docs", className }: DocsLinkProps) 
       target="_blank"
       rel="noopener noreferrer"
       className={cn(
-        "text-muted hover:text-accent inline-flex items-center gap-1 text-[10px] transition-colors",
+        "text-muted hover:text-accent-text inline-flex items-center gap-1 text-[10px] transition-colors",
         className
       )}
     >

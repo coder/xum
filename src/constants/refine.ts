@@ -19,7 +19,7 @@ export const REFINE_TIMEOUT_MS = 3 * 60 * 1000;
 /** Newest chat messages considered by one pass (transcript is char-bounded on top). */
 export const REFINE_MAX_MESSAGES = 200;
 
-/** Newest timeline events included when the Timeline experiment is on. */
+/** Newest timeline events included in the refine trajectory. */
 export const REFINE_TIMELINE_EVENT_LIMIT = 50;
 
 /** Human-readable marker prefixed to the durable refine summary chat row. */

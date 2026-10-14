@@ -23,6 +23,8 @@ import {
   streamEnd,
   testTaskSettings,
   workspaceTurnManagerFor,
+  workspaceTurnManagerInternals,
+  workspaceTurnRecord,
   workspaceTurnSnapshot,
 } from "@/node/services/taskService.testHarness";
 import {
@@ -124,6 +126,53 @@ describe("TaskService", () => {
       expect(recovered).toEqual(["compaction", "guidance", "guidance"]);
     }
   );
+
+  // The restart nudge is an automatic recovery turn, not parent guidance or user input: its
+  // provenance must reach the send so the goal tools can refuse set_goal on it.
+  test("stamps the startup restart nudge as a recovery task turn", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-restart-nudge";
+    const childTaskId = "child-restart-nudge";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        projectWorkspace(projectPath, "child", childTaskId, {
+          parentWorkspaceId,
+          agentId: "exec",
+          agentType: "exec",
+          taskStatus: "running",
+          taskModelString: "openai:gpt-5.2",
+        }),
+      ],
+      testTaskSettings()
+    );
+    const sendMessage = mock(
+      async (
+        _workspaceId: string,
+        _message: string,
+        _options: unknown,
+        internal?: { onAccepted?: () => Promise<void> | void }
+      ): Promise<Result<void>> => {
+        await internal?.onAccepted?.();
+        return Ok(undefined);
+      }
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    await taskService.initialize();
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledWith(
+      childTaskId,
+      expect.stringContaining("Xum restarted while this task was running"),
+      expect.any(Object),
+      expect.objectContaining({ synthetic: true, taskTurnKind: "recovery" })
+    );
+  });
 
   const startupGuidanceStates = [
     "running",
@@ -589,7 +638,10 @@ describe("TaskService", () => {
               ? ("blocked" as const)
               : id === "crashed"
                 ? ("interrupted" as const)
-                : ("idle" as const)
+                : // The real probe reports a tail that can hold a follow-up.
+                  id === "compacted" || id === "failed-follow-up"
+                  ? ("follow-up" as const)
+                  : ("idle" as const)
           )
         ),
         dispatchPendingCompactionFollowUp,
@@ -854,6 +906,165 @@ describe("TaskService", () => {
     }
   );
 
+  // A stale active turn that targets a non-task workspace has no task row to recover it: the
+  // startup queue drain's global turn count is its only automatic settle, even with an empty
+  // queue. Later empty-queue drains (including the rerun the settlement itself requests) skip
+  // that scan, which reads every turn file of every session.
+  test("startup settles a stale non-task workspace turn and wakes its owner with one global scan", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    await config.editConfig((cfg) => {
+      cfg.projects
+        .get(projectPath)!
+        .workspaces.push(projectWorkspace(projectPath, "target", "target"));
+      return cfg;
+    });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    await workspaceTurnManagerInternals(taskService).taskHandleStore.upsertWorkspaceTurn(
+      workspaceTurnRecord(parentId, "target", "wst_stale_root", "running", {
+        attentionPolicy: "notify_on_terminal",
+      })
+    );
+    const countActiveWorkspaceTurns = spyOn(
+      workspaceTurnManagerFor(taskService),
+      "countActiveWorkspaceTurns"
+    );
+
+    await taskService.recoverInterruptedTasks();
+    // Joins the drain startup scheduled (and its reruns).
+    await taskService.maybeStartQueuedTasks();
+    await flushTerminalAttentionDrains(taskService);
+
+    expect(
+      await workspaceTurnManagerInternals(taskService).taskHandleStore.getWorkspaceTurn(
+        parentId,
+        "wst_stale_root"
+      )
+    ).toMatchObject({
+      status: "interrupted",
+      error: "Workspace turn interrupted after restart",
+    });
+    const wakes = sendMessage.mock.calls.filter(
+      (call) => call[0] === parentId && String(call[1]).includes("wst_stale_root")
+    );
+    expect(wakes).toHaveLength(1);
+    expect(countActiveWorkspaceTurns).toHaveBeenCalledTimes(1);
+
+    await taskService.maybeStartQueuedTasks();
+    expect(countActiveWorkspaceTurns).toHaveBeenCalledTimes(1);
+  });
+
+  // The sweep must see every owner: a startup pass that had to skip an unreadable owner directory
+  // stays pending, so a later empty-queue drain settles that owner's stale turn once it is readable.
+  test("a startup sweep that skipped an unreadable owner directory is retried by a later empty drain", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    await config.editConfig((cfg) => {
+      cfg.projects
+        .get(projectPath)!
+        .workspaces.push(projectWorkspace(projectPath, "target", "target"));
+      return cfg;
+    });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const store = workspaceTurnManagerInternals(taskService).taskHandleStore;
+    await store.upsertWorkspaceTurn(
+      workspaceTurnRecord(parentId, "target", "wst_stale_root", "running", {
+        attentionPolicy: "notify_on_terminal",
+      })
+    );
+    const listOwner = store.listWorkspaceTurns.bind(store);
+    let ownerReadable = false;
+    const listWorkspaceTurns = spyOn(store, "listWorkspaceTurns").mockImplementation(
+      (ownerWorkspaceId, options) =>
+        ownerWorkspaceId === parentId && !ownerReadable
+          ? Promise.reject(
+              Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" })
+            )
+          : listOwner(ownerWorkspaceId, options)
+    );
+
+    await taskService.recoverInterruptedTasks();
+    await taskService.maybeStartQueuedTasks();
+    expect(listWorkspaceTurns.mock.calls.some((call) => call[0] === parentId)).toBe(true);
+    expect(await store.getWorkspaceTurn(parentId, "wst_stale_root")).toMatchObject({
+      status: "running",
+    });
+
+    ownerReadable = true;
+    await taskService.maybeStartQueuedTasks();
+    await flushTerminalAttentionDrains(taskService);
+
+    expect(await store.getWorkspaceTurn(parentId, "wst_stale_root")).toMatchObject({
+      status: "interrupted",
+    });
+    const wakes = sendMessage.mock.calls.filter(
+      (call) => call[0] === parentId && String(call[1]).includes("wst_stale_root")
+    );
+    expect(wakes).toHaveLength(1);
+  });
+
+  test("a drain already counting when startup requests the stale-turn sweep leaves it pending", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    await config.editConfig((cfg) => {
+      cfg.projects
+        .get(projectPath)!
+        .workspaces.push(
+          projectWorkspace(projectPath, "owner", "owner"),
+          projectWorkspace(projectPath, "target", "target"),
+          {
+            path: projectPath,
+            id: "queued",
+            name: "queued",
+            parentWorkspaceId: parentId,
+            agentId: "explore",
+            agentType: "explore",
+            taskIsolation: "none",
+            runtimeConfig: { type: "local" },
+            taskStatus: "queued",
+            taskPrompt: "Inspect",
+            taskModelString: defaultModel,
+          }
+        );
+      return cfg;
+    });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const manager = workspaceTurnManagerFor(taskService);
+    const count = manager.countActiveWorkspaceTurns.bind(manager);
+    const scanned = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    spyOn(manager, "countActiveWorkspaceTurns").mockImplementationOnce(async (...args) => {
+      const active = await count(...args);
+      scanned.resolve();
+      await release.promise;
+      return active;
+    });
+
+    // The queued task's drain has finished its scan before the stale record is visible. The
+    // record's owner is unrelated to the queued task, so its launch never reads that owner's turns.
+    const drain = taskService.maybeStartQueuedTasks();
+    await scanned.promise;
+    await workspaceTurnManagerInternals(taskService).taskHandleStore.upsertWorkspaceTurn(
+      workspaceTurnRecord("owner", "target", "wst_stale_root", "running")
+    );
+    await taskService.recoverInterruptedTasks();
+    release.resolve();
+    await drain;
+
+    expect(sendMessage.mock.calls.some((call) => call[0] === "queued")).toBe(true);
+    expect(
+      await workspaceTurnManagerInternals(taskService).taskHandleStore.getWorkspaceTurn(
+        "owner",
+        "wst_stale_root"
+      )
+    ).toMatchObject({
+      status: "interrupted",
+    });
+  });
+
   test.each([false, true])(
     "stopping cancels captured durable guidance before reactivation (later=%s)",
     async (later) => {
@@ -991,6 +1202,112 @@ describe("TaskService", () => {
     ).mock.calls.map((call) => call[0]);
     expect(messagedWorkspaceIds).toContain(idleTaskId);
     expect(messagedWorkspaceIds).not.toContain(streamingTaskId);
+  });
+
+  // A legacy row (no taskStatus) is re-driven only for an interrupted tail, a pending compaction
+  // follow-up or pending guidance. Startup used to rotate the attempt of every such row (one full
+  // config.json write each) before it skipped the idle ones: on a large config that alone outlived
+  // the startup step bound (#6511).
+  test("startup skips idle legacy tasks without rotating their attempt", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-legacy-idle";
+    const idleId = "child-legacy-idle";
+    const followUpId = "child-legacy-follow-up";
+    const child = { parentWorkspaceId, agentId: "exec", agentType: "exec" };
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        projectWorkspace(projectPath, "idle", idleId, {
+          ...child,
+          taskAttemptId: "att_00000000000000b1",
+        }),
+        projectWorkspace(projectPath, "follow-up", followUpId, {
+          ...child,
+          taskAttemptId: "att_00000000000000b2",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const dispatchPendingCompactionFollowUp = mock((_id: string) => Promise.resolve(Ok(true)));
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+      getStartupRecoveryState: mock((id: string) =>
+        Promise.resolve(id === followUpId ? "follow-up" : "idle")
+      ),
+      dispatchPendingCompactionFollowUp,
+    });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    await taskService.initialize();
+
+    expect(dispatchPendingCompactionFollowUp.mock.calls.map((call) => call[0])).toEqual([
+      followUpId,
+    ]);
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(findWorkspaceInConfig(config, idleId)?.taskAttemptId).toBe("att_00000000000000b1");
+    expect(findWorkspaceInConfig(config, followUpId)?.taskAttemptId).not.toBe(
+      "att_00000000000000b2"
+    );
+  });
+
+  // Archiving stops a task's stream but keeps its taskStatus (see isActiveAgentTaskEntry), and
+  // legacy rows without a taskStatus count as running. Startup used to re-drive such archived rows
+  // on every restart, and the send failed with "Workspace is archived". They stay untouched until
+  // an unarchive or a task_send_message reactivation brings them back.
+  test("startup leaves archived running and legacy tasks untouched", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-archived-running";
+    const archivedRunningId = "child-archived-running";
+    const archivedLegacyId = "child-archived-legacy";
+    const activeRunningId = "child-active-running";
+    const archived = { archivedAt: "2026-08-10T00:00:00.000Z" };
+    const child = { parentWorkspaceId, agentId: "exec", agentType: "exec" };
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        projectWorkspace(projectPath, "archived-running", archivedRunningId, {
+          ...child,
+          ...archived,
+          taskStatus: "running",
+          taskAttemptId: "att_00000000000000a1",
+        }),
+        projectWorkspace(projectPath, "archived-legacy", archivedLegacyId, {
+          ...child,
+          ...archived,
+          taskAttemptId: "att_00000000000000a2",
+        }),
+        projectWorkspace(projectPath, "active-running", activeRunningId, {
+          ...child,
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    await taskService.initialize();
+
+    const messagedWorkspaceIds = (
+      sendMessage as unknown as { mock: { calls: unknown[][] } }
+    ).mock.calls.map((call) => call[0]);
+    expect(messagedWorkspaceIds).toEqual([activeRunningId]);
+    expect(findWorkspaceInConfig(config, archivedRunningId)).toMatchObject({
+      taskStatus: "running",
+      taskAttemptId: "att_00000000000000a1",
+    });
+    const legacy = findWorkspaceInConfig(config, archivedLegacyId);
+    expect(legacy?.taskStatus).toBeUndefined();
+    expect(legacy?.taskAttemptId).toBe("att_00000000000000a2");
   });
 
   test("recovery does not re-drive a running task whose accepted turn is still preparing", async () => {

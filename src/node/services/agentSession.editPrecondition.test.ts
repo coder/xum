@@ -804,6 +804,66 @@ describe("AgentSession edit precondition", () => {
     }
   });
 
+  /**
+   * The rows a live client holds after a resume: the replayed rows plus every row the session
+   * published while it ran. A row the session persists without publishing is missing here, so
+   * its sequence shows up only on the server side of the fence.
+   */
+  async function resumeAsLiveClient(h: AgentSessionHarness, replayed: readonly MuxMessage[]) {
+    const live: MuxMessage[] = [];
+    const unsubscribe = h.session.onChatEvent(({ message }) => {
+      if (isMuxMessage(message)) live.push(message);
+    });
+    try {
+      expect((await h.session.resumeStream(baseOptions)).success).toBe(true);
+      await h.session.waitForIdle();
+    } finally {
+      unsubscribe();
+    }
+    return [...replayed, ...live];
+  }
+
+  it("an edit after a resume that appended a [CONTINUE] sentinel is not refused as history-changed", async () => {
+    const h = await setup();
+    // A completed assistant tail makes the resume append the hidden [CONTINUE] sentinel.
+    const rows = await seed(h, [
+      createMuxMessage("u1", "user", "question"),
+      createMuxMessage("a1", "assistant", "answer"),
+    ]);
+    const clientRows = await resumeAsLiveClient(h, rows);
+    expect((await persisted(h)).length).toBe(3);
+
+    const result = await h.session.sendMessage("question, edited", {
+      ...baseOptions,
+      editMessageId: "u1",
+      historyEditPrecondition: fence(clientRows, "u1"),
+    });
+    expect(result).toEqual(Ok(undefined));
+  });
+
+  it("an edit after a resume that appended a file-change notification is not refused as history-changed", async () => {
+    const h = await setup();
+    const rows = await seed(h, [createMuxMessage("u1", "user", "question")]);
+    const tracker = (
+      h.session as unknown as {
+        fileChangeTracker: { getChangedAttachments(): Promise<unknown> };
+      }
+    ).fileChangeTracker;
+    spyOn(tracker, "getChangedAttachments").mockResolvedValueOnce({
+      attachments: [{ type: "edited_text_file", filename: "a.ts", snippet: "-old\n+new" }],
+      commit: () => undefined,
+    });
+    const clientRows = await resumeAsLiveClient(h, rows);
+    expect((await persisted(h)).length).toBe(2);
+
+    const result = await h.session.sendMessage("question, edited", {
+      ...baseOptions,
+      editMessageId: "u1",
+      historyEditPrecondition: fence(clientRows, "u1"),
+    });
+    expect(result).toEqual(Ok(undefined));
+  });
+
   it("verifies the precondition atomically with the truncation under the history lock", async () => {
     const h = await setup();
     const rows = await seed(h, threeTurns());

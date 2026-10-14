@@ -7,19 +7,15 @@ import {
   type UseStickyExpandOptions,
 } from "@/browser/features/Messages/useStickyExpand";
 import { LoadingDots } from "./ToolPrimitives";
+import type { ToolStatus } from "./toolStatus";
 
 /**
  * Shared utilities and hooks for tool components
  */
 
-export type ToolStatus =
-  | "pending"
-  | "executing"
-  | "completed"
-  | "failed"
-  | "interrupted"
-  | "backgrounded"
-  | "redacted";
+// Status helpers live in the leaf module so non-rendering code can import them
+// without React, icons or ToolPrimitives (#6349).
+export { type ToolStatus, getNestedToolStatus, isFailedToolOutput } from "./toolStatus";
 
 /**
  * Hook for managing tool expansion state.
@@ -190,41 +186,4 @@ export function isToolErrorResult(val: unknown): val is ToolErrorResult {
   if (!val || typeof val !== "object") return false;
   const record = val as Record<string, unknown>;
   return record.success === false && typeof record.error === "string";
-}
-
-/**
- * Determine if a tool output indicates failure.
- * Handles both `{ success: false }` and `{ error: "..." }` shapes.
- * Note: Use isToolErrorResult() when you need type narrowing.
- */
-export function isFailedToolOutput(output: unknown): boolean {
-  if (!output || typeof output !== "object") return false;
-  if ("success" in output && (output as { success: unknown }).success === false) return true;
-  if ("error" in output) return true;
-  return false;
-}
-
-/**
- * Determine the display status for a nested tool call.
- * - output-available + failure → "failed"
- * - output-available + success → "completed"
- * - input-available + parentInterrupted → "interrupted"
- * - input-available + running → "executing"
- *
- * An explicit `failed` flag wins over shape-derived detection: reload-time
- * reconstruction of RLM kernel-mode records persists no output to sniff, so
- * failure travels out-of-band (never as a synthetic output shape that a real
- * tool result could collide with).
- */
-export function getNestedToolStatus(
-  state: "input-available" | "output-available" | "output-redacted",
-  output: unknown,
-  parentInterrupted: boolean,
-  failed?: boolean
-): ToolStatus {
-  if (state === "output-available") {
-    return (failed ?? isFailedToolOutput(output)) ? "failed" : "completed";
-  }
-  if (state === "output-redacted") return failed ? "failed" : "redacted";
-  return parentInterrupted ? "interrupted" : "executing";
 }

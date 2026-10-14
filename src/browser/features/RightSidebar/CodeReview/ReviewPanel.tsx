@@ -46,6 +46,7 @@ import { InlineReviewNote, type ReviewActionCallbacks } from "../../Shared/Inlin
 import { ReviewControls } from "./ReviewControls";
 import { preloadHighlightedDiff } from "../../Shared/DiffRenderer";
 import { ImmersiveReviewView } from "./ImmersiveReviewView";
+import { listExistingRevisions } from "./reviewBaseRefs";
 import { FileTree } from "./FileTree";
 import { UntrackedStatus } from "./UntrackedStatus";
 import { shellQuote } from "@/common/utils/shell";
@@ -62,6 +63,8 @@ import {
   usePersistedState,
 } from "@/browser/hooks/usePersistedState";
 import { STORAGE_KEYS, WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import { useUserPreferences } from "@/browser/stores/AppConfigStore";
+import { useProjectReviewBase, useWorkspaceDiffBase } from "@/browser/utils/reviewDefaultBase";
 import { useReviewState } from "@/browser/hooks/useReviewState";
 import { useReviews } from "@/browser/hooks/useReviews";
 import { useHunkFirstSeen } from "@/browser/hooks/useHunkFirstSeen";
@@ -74,13 +77,9 @@ import { parseDiff, extractAllHunks, buildGitDiffCommand } from "@/common/utils/
 import {
   getReviewFileFilterKey,
   getReviewImmersiveKey,
-  getReviewDefaultBaseKey,
   getReviewSelectedHunkKey,
   getReviewSearchStateKey,
-  REVIEW_INCLUDE_UNCOMMITTED_KEY,
   REVIEW_SEARCH_STATE_MAX_CHARS,
-  REVIEW_SORT_ORDER_KEY,
-  REVIEW_SHOW_READ_KEY,
 } from "@/common/constants/storage";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 import { parseNumstat, buildFileTree, extractNewPath } from "@/common/utils/git/numstatParser";
@@ -91,7 +90,6 @@ import type {
   DiffHunk,
   ReviewFilters as ReviewFiltersType,
   ReviewNoteData,
-  ReviewSortOrder,
 } from "@/common/types/review";
 import type { FileTreeNode } from "@/common/utils/git/numstatParser";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -644,17 +642,9 @@ export const ReviewAssistedStatsReporter: React.FC<ReviewAssistedStatsReporterPr
     [assistedHunks, reviewPathContext]
   );
 
-  const projectDefaultBaseKey = getReviewDefaultBaseKey(projectPath);
-  const workspaceDiffBaseKey = STORAGE_KEYS.reviewDiffBase(workspaceId);
-  const [defaultBase] = usePersistedState<string>(
-    projectDefaultBaseKey,
-    WORKSPACE_DEFAULTS.reviewBase,
-    { listener: true }
-  );
-  const [diffBase] = usePersistedState(workspaceDiffBaseKey, defaultBase, { listener: true });
-  const [includeUncommitted] = usePersistedState(REVIEW_INCLUDE_UNCOMMITTED_KEY, false, {
-    listener: true,
-  });
+  const [diffBase] = useWorkspaceDiffBase(workspaceId, projectPath);
+  const includeUncommitted =
+    useUserPreferences((preferences) => preferences.review?.includeUncommitted) ?? false;
 
   useEffect(() => {
     if (normalizedAssistedHunks.length === 0) {
@@ -859,38 +849,20 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     selectedRepoRootProjectPath
   );
 
-  const projectDefaultBaseKey = getReviewDefaultBaseKey(projectPath);
   const workspaceDiffBaseKey = STORAGE_KEYS.reviewDiffBase(workspaceId);
 
-  // Per-project default base (shared across workspaces in the same project).
-  // Falls back to a static value only if trunk detection fails.
-  const [defaultBase, setDefaultBase] = usePersistedState<string>(
-    projectDefaultBaseKey,
-    WORKSPACE_DEFAULTS.reviewBase,
-    { listener: true }
-  );
+  // Per-project default base (shared across workspaces in the same project), set only by the user.
+  const projectReviewBase = useProjectReviewBase(projectPath);
 
-  // Persist diff base per workspace (falls back to project default)
-  // Uses listener: true to sync with GitStatusIndicator base selector
-  const [diffBase, setDiffBase] = usePersistedState(workspaceDiffBaseKey, defaultBase, {
-    listener: true,
-  });
+  // Persist diff base per workspace (falls back to project default); syncs with GitStatusIndicator.
+  const [diffBase, setDiffBase] = useWorkspaceDiffBase(workspaceId, projectPath);
 
-  // Persist includeUncommitted flag globally
-  const [includeUncommitted, setIncludeUncommitted] = usePersistedState(
-    REVIEW_INCLUDE_UNCOMMITTED_KEY,
-    false,
-    { listener: true }
-  );
-
-  // Persist showReadHunks flag globally
-  const [showReadHunks, setShowReadHunks] = usePersistedState(REVIEW_SHOW_READ_KEY, true);
-
-  // Persist sort order globally
-  const [sortOrder, setSortOrder] = usePersistedState<ReviewSortOrder>(
-    REVIEW_SORT_ORDER_KEY,
-    "last-edit"
-  );
+  // ReviewControls writes these global preferences; filters always show their current values.
+  const includeUncommitted =
+    useUserPreferences((preferences) => preferences.review?.includeUncommitted) ?? false;
+  const showReadHunks = useUserPreferences((preferences) => preferences.review?.showRead) ?? true;
+  const sortOrder =
+    useUserPreferences((preferences) => preferences.review?.sortOrder) ?? "last-edit";
 
   // Auto-detect trunk for new review base keys so repos using master/develop
   // don't start on the hard-coded fallback. Existing user selections are preserved.
@@ -899,20 +871,22 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
   // the repository's canonical trunk. So we only apply metadata trunk to the workspace-
   // scoped diff base, while the project default comes from listBranches().recommendedTrunk.
   useEffect(() => {
-    const projectBaseIsPersisted = readPersistedString(projectDefaultBaseKey) !== undefined;
-    const workspaceBaseIsPersisted = readPersistedString(workspaceDiffBaseKey) !== undefined;
-    const shouldInitializeWorkspaceBase = !workspaceBaseIsPersisted;
+    if (readPersistedString(workspaceDiffBaseKey) !== undefined) {
+      return;
+    }
 
     const metadataTrunkBase = toMetadataDiffBase(
       workspaceMetadata.get(workspaceId)?.taskTrunkBranch
     );
-    const initializedWorkspaceFromMetadata =
-      shouldInitializeWorkspaceBase && metadataTrunkBase != null;
-    if (initializedWorkspaceFromMetadata) {
+    if (metadataTrunkBase != null) {
       setDiffBase(metadataTrunkBase);
+      return;
     }
 
-    if (projectBaseIsPersisted || !api) {
+    // The detected trunk is repository data, not a preference: it seeds only this workspace's
+    // base, and an explicit project default makes detection unnecessary. Before the first config
+    // snapshot that default is unknown, and a detected base persisted then would mask it.
+    if (projectReviewBase !== null || !api) {
       return;
     }
 
@@ -920,27 +894,21 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     void runWithCatch(
       async () => {
         const branchResult = await api.projects.listBranches({ projectPath });
-        const detectedBase = toOriginDiffBase(branchResult.recommendedTrunk);
+        const originBase = toOriginDiffBase(branchResult.recommendedTrunk);
+        // The recommended trunk is a local branch, so it always exists. Prefer its origin copy,
+        // but only when that ref exists: a repo without an `origin` remote opened Review on a
+        // raw `git` error (#5682).
+        const localBase = toMetadataDiffBase(branchResult.recommendedTrunk);
+        const existing =
+          originBase == null ? null : await listExistingRevisions(api, workspaceId, [originBase]);
         if (cancelled) {
           return;
         }
-        if (!detectedBase) {
-          // Persist fallback once so repeated metadata updates don't keep re-trying
-          // trunk detection for repos that currently have no usable recommended trunk.
-          if (readPersistedString(projectDefaultBaseKey) === undefined) {
-            setDefaultBase(WORKSPACE_DEFAULTS.reviewBase);
-          }
-          return;
-        }
-
-        if (readPersistedString(projectDefaultBaseKey) === undefined) {
-          setDefaultBase(detectedBase);
-        }
-        if (shouldInitializeWorkspaceBase && !initializedWorkspaceFromMetadata) {
-          const currentWorkspaceBase = readPersistedString(workspaceDiffBaseKey);
-          if (currentWorkspaceBase === undefined) {
-            setDiffBase(detectedBase);
-          }
+        const detectedBase =
+          originBase != null && existing?.has(originBase) === false ? localBase : originBase;
+        // Persist the fallback too so metadata updates don't keep re-running detection.
+        if (readPersistedString(workspaceDiffBaseKey) === undefined) {
+          setDiffBase(detectedBase ?? WORKSPACE_DEFAULTS.reviewBase);
         }
       },
       () => {
@@ -953,9 +921,8 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     };
   }, [
     api,
-    projectDefaultBaseKey,
+    projectReviewBase,
     projectPath,
-    setDefaultBase,
     setDiffBase,
     workspaceDiffBaseKey,
     workspaceId,
@@ -1113,7 +1080,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
   // Defaulting to `false` makes the "Read:" toggle behave as the user expects
   // when Assisted is on — marking an assisted pin as read clears it from the
   // view. A user who wants to inspect already-read pins can flip it on.
-  const [filters, setFilters] = useState<ReviewFiltersType>({
+  const [filterState, setFilters] = useState<ReviewFiltersType>({
     showReadHunks: showReadHunks,
     assistedShowReadHunks: false,
     diffBase: diffBase,
@@ -1121,6 +1088,12 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     sortOrder: sortOrder,
     assistedOnly: false,
   });
+  const filters: ReviewFiltersType = {
+    ...filterState,
+    includeUncommitted,
+    showReadHunks,
+    sortOrder,
+  };
 
   // Subscribe to the agent's Assisted Review hunks for this workspace. The
   // aggregator returns a stable reference (only changes when review_pane_update
@@ -1713,21 +1686,6 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     isImmersive,
   ]);
 
-  // Persist includeUncommitted when it changes
-  useEffect(() => {
-    setIncludeUncommitted(filters.includeUncommitted);
-  }, [filters.includeUncommitted, setIncludeUncommitted]);
-
-  // Persist showReadHunks when it changes
-  useEffect(() => {
-    setShowReadHunks(filters.showReadHunks);
-  }, [filters.showReadHunks, setShowReadHunks]);
-
-  // Persist sortOrder when it changes
-  useEffect(() => {
-    setSortOrder(filters.sortOrder);
-  }, [filters.sortOrder, setSortOrder]);
-
   // Record first-seen timestamps for new hunks
   useEffect(() => {
     if (hunks.length > 0) {
@@ -2307,6 +2265,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
         isImmersive={isImmersive}
         onToggleImmersive={toggleImmersive}
         projectPath={projectPath}
+        workspaceId={workspaceId}
         lastRefreshInfo={lastRefreshInfo}
         lastRefreshFailure={lastRefreshFailure}
         assistedCount={assistedHunks.length}
@@ -2660,6 +2619,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
               hunks={reviewStateLoaded ? filteredHunks : NO_HUNKS}
               allHunks={reviewStateLoaded ? hunks : NO_HUNKS}
               isLoading={diffState.status === "loading" || isLoadingTree || !reviewStateLoaded}
+              loadError={diffState.status === "error" ? diffState.message : null}
               isRead={isRead}
               onToggleRead={handleToggleRead}
               onMarkFileAsRead={handleMarkFileAsRead}

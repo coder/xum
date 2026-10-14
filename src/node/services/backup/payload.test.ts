@@ -232,11 +232,16 @@ describe("backup payload", () => {
       sourceLabel: "test-host",
       exportedAt: "2026-07-30T00:00:00.000Z",
       preferences: {
-        appearance: { theme: "dark", vimEnabled: true },
+        appearance: {
+          theme: "dark",
+          vimEnabled: true,
+          powerModeEnabled: true,
+          gitStatusIndicatorMode: "line-delta",
+        },
         navigation: { launchBehavior: "dashboard", projectOrder: ["/private/project"] },
         ai: {
           globalDefaults: { agentId: "exec" },
-          projectDefaults: { "/private/project": { model: "secret/model" } },
+          projectDefaults: { "/private/project": { model: "openai:secret-model" } },
           autoCompactionThresholdByModel: { "openai/gpt": 75 },
         },
         workspaceCreation: { byProject: { "/private/project": { trunkBranch: "main" } } },
@@ -244,7 +249,11 @@ describe("backup payload", () => {
         review: {
           includeUncommitted: true,
           defaultBaseByProject: { "/private/project": "main" },
+          sortOrder: "file-order",
+          fileTreeViewMode: "flat",
+          showRead: false,
         },
+        ui: { tutorialState: { disabled: true } },
       },
     });
 
@@ -263,13 +272,24 @@ describe("backup payload", () => {
       unknown
     >;
     expect(preferences).toEqual({
-      appearance: { theme: "dark", vimEnabled: true },
+      appearance: {
+        theme: "dark",
+        vimEnabled: true,
+        powerModeEnabled: true,
+        gitStatusIndicatorMode: "line-delta",
+      },
       navigation: { launchBehavior: "dashboard" },
       ai: {
         globalDefaults: { agentId: "exec" },
         autoCompactionThresholdByModel: { "openai/gpt": 75 },
       },
-      review: { includeUncommitted: true },
+      review: {
+        includeUncommitted: true,
+        sortOrder: "file-order",
+        fileTreeViewMode: "flat",
+        showRead: false,
+      },
+      ui: { tutorialState: { disabled: true } },
     });
   });
 
@@ -863,6 +883,28 @@ describe("backup payload", () => {
     expect(merged.appearance?.theme).toBe("dark");
     expect(merged.appearance?.vimEnabled).toBe(true);
     expect(merged.appearance?.editorConfig).toEqual({ editor: "vscode" });
+  });
+
+  it("restores the backed-up ui fields and keeps the ones the backup lacks", () => {
+    const merged = mergeBackupPreferences(
+      { ui: { tutorialState: { completed: { creation: true } }, outputTabLevel: "debug" } },
+      { ui: { tutorialState: { disabled: true }, sidebarFlatMode: true } }
+    );
+    expect(merged.ui).toEqual({
+      tutorialState: { disabled: true },
+      outputTabLevel: "debug",
+      sidebarFlatMode: true,
+    });
+  });
+
+  it("keeps the artifact CDN choice out of both the backup and the restore", () => {
+    const local = { ui: { artifactsAllowCdnScripts: false } };
+    expect(serializeBackupPreferences(local).toString("utf-8")).not.toContain("Cdn");
+
+    const merged = mergeBackupPreferences(local, {
+      ui: { artifactsAllowCdnScripts: true, sidebarFlatMode: true },
+    });
+    expect(merged.ui).toEqual({ artifactsAllowCdnScripts: false, sidebarFlatMode: true });
   });
 
   it("refuses an oversized file and an oversized payload on both sides", async () => {

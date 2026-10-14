@@ -12,6 +12,7 @@ import {
 import { CopyButton } from "@/browser/components/CopyButton/CopyButton";
 import { cn } from "@/common/lib/utils";
 import type {
+  AnthropicInputTransformation,
   DevToolsInputTokenBreakdown,
   DevToolsOutputTokenBreakdown,
   DevToolsStep,
@@ -38,7 +39,7 @@ const POLICY_ACTION_STYLES: Record<ToolPolicy[number]["action"], string> = {
   enable: "bg-green-500/20 text-green-400",
 };
 
-type MetadataSection = "tools" | "options" | "usage" | "policy";
+type MetadataSection = "tools" | "options" | "usage" | "thinking" | "policy";
 type RawViewMode = "ai-sdk" | "provider";
 
 interface ParsedTool {
@@ -144,7 +145,18 @@ function MetadataBar(props: {
   const hasProviderOptions = props.step.input?.providerOptions != null;
   const hasUsage = props.step.usage != null;
   const hasToolPolicy = props.toolPolicy != null && props.toolPolicy.length > 0;
-  const hasPills = props.tools.length > 0 || hasProviderOptions || hasUsage || hasToolPolicy;
+  const inputTransformations = props.step.inputTransformations ?? [];
+  // The label counts only blocks the API dropped: `thinking_mismatch_allowed` blocks still
+  // reached the model. The section lists every entry, so the pill shows for any entry.
+  const droppedThinkingCount = inputTransformations.filter(
+    (entry) => entry.type === "thinking_dropped"
+  ).length;
+  const hasPills =
+    props.tools.length > 0 ||
+    hasProviderOptions ||
+    hasUsage ||
+    inputTransformations.length > 0 ||
+    hasToolPolicy;
 
   return (
     <div className="border-border-light bg-background-primary flex min-w-0 flex-wrap items-center gap-1 rounded border px-2 py-1">
@@ -191,6 +203,16 @@ function MetadataBar(props: {
               label="Usage"
               active={props.activeSection === "usage"}
               onClick={() => props.onToggleSection("usage")}
+            />
+          )}
+
+          {/* Anthropic preserved thinking: replayed blocks the API reported in input_transformations. */}
+          {inputTransformations.length > 0 && (
+            <MetadataPill
+              icon={Brain}
+              label={`Dropped thinking · ${droppedThinkingCount}`}
+              active={props.activeSection === "thinking"}
+              onClick={() => props.onToggleSection("thinking")}
             />
           )}
 
@@ -250,6 +272,8 @@ function MetadataSectionContent(props: {
       ) : (
         <p className="text-muted mt-1 text-[10px]">No usage recorded</p>
       );
+    case "thinking":
+      return <InputTransformationsSection entries={props.step.inputTransformations ?? []} />;
     case "policy":
       return props.toolPolicy != null && props.toolPolicy.length > 0 ? (
         <ToolPolicySection policy={props.toolPolicy} />
@@ -321,6 +345,34 @@ function ToolPolicySection(props: { policy: ToolPolicy }) {
       ))}
     </div>
   );
+}
+
+function InputTransformationsSection(props: { entries: AnthropicInputTransformation[] }) {
+  if (props.entries.length === 0) {
+    return <p className="text-muted mt-1 text-[10px]">No dropped thinking reported</p>;
+  }
+
+  return (
+    <div className="mt-1 flex min-w-0 flex-col gap-1">
+      {props.entries.map((entry, index) => (
+        <code
+          key={`${entry.path}-${index}`}
+          className="border-border-light bg-background-primary text-foreground font-monospace min-w-0 rounded border px-2 py-1 text-[10px] break-all"
+        >
+          {formatInputTransformation(entry)}
+        </code>
+      ))}
+    </div>
+  );
+}
+
+function formatInputTransformation(entry: AnthropicInputTransformation): string {
+  // thinking_dropped is what the pill counts; name any other type (for example
+  // thinking_mismatch_allowed, which still reached the model) so it is not misread.
+  const parts = [entry.path];
+  if (entry.type !== "thinking_dropped" || entry.reason == null) parts.push(entry.type);
+  if (entry.reason != null) parts.push(entry.reason);
+  return parts.join(" · ");
 }
 
 function sanitizeToolPolicy(value: unknown): ToolPolicy | null {

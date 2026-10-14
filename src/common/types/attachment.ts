@@ -75,13 +75,23 @@ export interface ReadFilesReferenceAttachment {
   paths: string[];
 }
 
+/**
+ * Published artifacts (Artifacts M4): handles only (path, latest version, label), so after
+ * compaction the model still knows which artifacts exist and can republish or reread them.
+ */
+export interface ArtifactsIndexAttachment {
+  type: "artifacts_index";
+  artifacts: Array<{ path: string; latestVersion: number; label: string | null }>;
+}
+
 export type PostCompactionAttachment =
   | PlanFileReferenceAttachment
   | TodoListAttachment
   | LoadedSkillsSnapshotAttachment
   | EditedFilesReferenceAttachment
   | CompletedReportsIndexAttachment
-  | ReadFilesReferenceAttachment;
+  | ReadFilesReferenceAttachment
+  | ArtifactsIndexAttachment;
 
 /**
  * Exclusion state for post-compaction context items.

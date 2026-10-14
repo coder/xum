@@ -5,6 +5,8 @@ import { spawn } from "child_process";
 import { createHash, randomBytes } from "crypto";
 import {
   validateProjectPath,
+  resolvesToFilesystemRoot,
+  PROJECT_AT_FILESYSTEM_ROOT_ERROR,
   isGitRepository,
   isInsideGitRepository,
   stripTrailingSlashes,
@@ -520,6 +522,11 @@ export class ProjectService {
         normalizedPath = path.resolve(expandTilde(projectPath));
       } else {
         normalizedPath = path.resolve(projectPath);
+      }
+      // File completions, git status and review scans would walk the whole disk (#5917). A
+      // symlink to the root counts as the root.
+      if (await resolvesToFilesystemRoot(normalizedPath)) {
+        return Err(PROJECT_AT_FILESYSTEM_ROOT_ERROR);
       }
 
       let existingStat: Stats | null = null;
@@ -1321,6 +1328,7 @@ export class ProjectService {
       try {
         while (!processEnded) {
           if (stderrChunks.length > 0) {
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
             yield { type: "progress", line: stderrChunks.shift()! };
             continue;
           }
@@ -1337,6 +1345,7 @@ export class ProjectService {
       }
 
       while (stderrChunks.length > 0) {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         yield { type: "progress", line: stderrChunks.shift()! };
       }
 
@@ -1729,6 +1738,7 @@ export class ProjectService {
       if (!validation.valid) {
         throw new Error(validation.error ?? "Invalid project path");
       }
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const normalizedPath = validation.expandedPath!;
 
       // Non-git repos return empty branches - they're restricted to local runtime only.
@@ -1836,6 +1846,7 @@ export class ProjectService {
       if (!validation.valid) {
         return Err(validation.error ?? "Invalid project path");
       }
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const normalizedPath = validation.expandedPath!;
       // Same exclusive claim as create(): concurrent initializations of one directory
       // could double-commit or let one call's failure rollback delete the other's .git.
@@ -1876,6 +1887,7 @@ export class ProjectService {
       return { paths: [] };
     }
 
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     const normalizedPath = validation.expandedPath!;
 
     let cacheEntry = this.fileCompletionsCache.get(normalizedPath);
@@ -2027,9 +2039,14 @@ export class ProjectService {
 
   async setTrust(projectPath: string, trusted: boolean): Promise<void> {
     const normalizedPath = stripTrailingSlashes(projectPath);
+    // Checked on the unstripped path: a Windows drive root strips to a drive-relative spelling.
+    const isRootPath = await resolvesToFilesystemRoot(projectPath);
     await this.config.editConfig((config) => {
       let project = config.projects.get(normalizedPath);
       if (!project) {
+        // Trust can create a project entry, but never a new one at the root (#5917). An existing
+        // root project (from an older config) can still change its trust.
+        if (isRootPath) throw new Error(PROJECT_AT_FILESYSTEM_ROOT_ERROR);
         project = { workspaces: [] };
         config.projects.set(normalizedPath, project);
       }

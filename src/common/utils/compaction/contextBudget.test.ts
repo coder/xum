@@ -424,4 +424,25 @@ describe("request estimates", () => {
       expect(estimate).toBeGreaterThanOrEqual(base + 4000);
     }
   });
+
+  test("the dedupe projection's restoration stash does not count toward the estimate", () => {
+    const searchResult = (providerOptions?: unknown) => ({
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "call-1",
+          toolName: "tool_catalog_search",
+          output: { type: "text", value: "repeat status" },
+          ...(providerOptions == null ? {} : { providerOptions }),
+        },
+      ],
+    });
+    const bare = estimateAssembledRequestTokens({ messages: [searchResult()] });
+    const stashed = estimateAssembledRequestTokens({
+      messages: [searchResult({ mux: { rawToolSearchOutput: "x".repeat(7000) } })],
+    });
+    // Only the wrapper keys may count: the stash never reaches the wire.
+    expect(stashed).toBeLessThan(bare + 50);
+  });
 });

@@ -53,7 +53,6 @@ describe("deriveWarmModels", () => {
       "agentAiDefaults subagent profile",
       configWith([], { agentAiDefaults: { exec: { subagent: { modelString: OPENAI } } } }),
     ],
-    ["advisorModelString", configWith([], { advisorModelString: OPENAI })],
     [
       "a project creation default",
       configWith([], {
@@ -117,7 +116,12 @@ describe("deriveWarmModels", () => {
           runtimeConfig: { model: "https://x.test/y" },
         },
       ],
-      { defaultModel: CLAUDE, hiddenModels: [OPENAI], taskModelString: [OPENAI] }
+      {
+        defaultModel: CLAUDE,
+        hiddenModels: [OPENAI],
+        taskModelString: [OPENAI],
+        advisorModelString: OPENAI,
+      }
     );
     expect(warmedEncodings(config)).toEqual(["claude"]);
   });

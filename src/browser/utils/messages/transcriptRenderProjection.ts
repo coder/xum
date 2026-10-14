@@ -517,6 +517,7 @@ function computeWorkBundleDurationMs(
 ): number | undefined {
   const startTimestamp = getMessageTimestamp(entries[0].message);
   const endTimestamp =
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     getMessageTimestamp(finalMessage) ?? getMessageTimestamp(entries.at(-1)!.message);
   if (
     startTimestamp === undefined ||

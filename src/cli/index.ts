@@ -169,7 +169,7 @@ function startCli(): void {
       program
         .command("workflow")
         .alias("wf")
-        .description("Run workflow scripts by explicit script path (experimental)");
+        .description("Run workflow scripts by explicit script path");
     }
     if (isCommandAvailable("trust", env)) {
       program.command("trust").description("Trust a project so repo-controlled automation can run");

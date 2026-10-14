@@ -81,6 +81,16 @@ export function prepareDemoProject(
 
   const configPayload = {
     projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
+    // Windows without the e2e preload (the perf server window) miss the fixture's tutorial
+    // opt-out; delayed tutorial backdrops race with Playwright clicks.
+    userPreferences: {
+      ui: {
+        tutorialState: {
+          disabled: true,
+          completed: { creation: true, workspace: true, review: true },
+        },
+      },
+    },
   } as const;
 
   fs.writeFileSync(configPath, JSON.stringify(configPayload, null, 2));

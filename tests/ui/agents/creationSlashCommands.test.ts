@@ -23,15 +23,11 @@ import {
 } from "../helpers";
 import { ChatHarness } from "../harness";
 
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import {
-  getAutoModelRoutingKey,
-  getAutoThinkingLevelKey,
-  getDraftScopeId,
-  getModelKey,
-  getProjectScopeId,
-} from "@/common/constants/storage";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { getUserPreferences } from "@/browser/stores/AppConfigStore";
+import { resetAiSelectionIntentForTests } from "@/browser/utils/aiSelectionIntent";
+import { getAutoRouting } from "@/browser/utils/workspaceAiSettingsSync";
+import { getDraftScopeId, getProjectScopeId } from "@/common/constants/storage";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
@@ -44,12 +40,11 @@ interface CreationView {
   chat: ChatHarness;
 }
 
-async function setupCreationView(options?: { beforeRender?: () => void }): Promise<CreationView> {
+async function setupCreationView(): Promise<CreationView> {
   const env = getSharedEnv();
   const projectPath = getSharedRepoPath();
 
   const cleanupDom = setupTestDom();
-  options?.beforeRender?.();
 
   const view = renderApp({ apiClient: env.orpc });
 
@@ -101,10 +96,11 @@ describeIntegration("Creation slash commands", () => {
         { timeout: 5_000 }
       );
 
-      const modelKey = getModelKey(getProjectScopeId(projectPath));
       await waitFor(
         () => {
-          expect(readPersistedState(modelKey, "")).toBe(expectedModel);
+          expect(getUserPreferences().ai?.projectDefaults?.[projectPath]?.model).toBe(
+            expectedModel
+          );
         },
         { timeout: 5_000 }
       );
@@ -138,27 +134,34 @@ describeIntegration("Creation slash commands", () => {
   }, 30_000);
 
   test("a configured Auto default turns Auto on in the creation composer", async () => {
+    // The /model test above left an unsent concrete pick for this shared project.
+    resetAiSelectionIntentForTests();
     const env = getSharedEnv();
     await env.orpc.config.updateAgentAiDefaults({
       agentAiDefaults: { exec: { autoModelRouting: true } },
     });
-    const { projectPath, view, cleanupDom } = await setupCreationView({
-      beforeRender: () =>
-        updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING), true),
+    await env.orpc.experiments.set({
+      experimentId: EXPERIMENT_IDS.AUTO_MODEL_ROUTING,
+      enabled: true,
     });
+    const { projectPath, view, cleanupDom } = await setupCreationView();
 
     try {
       const projectScopeId = getProjectScopeId(projectPath);
       await waitFor(
         () => {
-          expect(readPersistedState(getAutoModelRoutingKey(projectScopeId), false)).toBe(true);
+          expect(getAutoRouting(projectScopeId, "model")).toBe(true);
         },
         { timeout: 5_000 }
       );
-      expect(readPersistedState(getAutoThinkingLevelKey(projectScopeId), false)).toBe(false);
+      expect(getAutoRouting(projectScopeId, "thinkingLevel")).toBe(false);
     } finally {
       await cleanupView(view, cleanupDom);
       await env.orpc.config.updateAgentAiDefaults({ agentAiDefaults: {} });
+      await env.orpc.experiments.set({
+        experimentId: EXPERIMENT_IDS.AUTO_MODEL_ROUTING,
+        enabled: null,
+      });
     }
   }, 30_000);
 });

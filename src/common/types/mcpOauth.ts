@@ -59,6 +59,12 @@ export interface MCPOAuthTokens {
    * first use.
    */
   issuer?: string;
+  /**
+   * The scope Xum requested in the sign-in that issued these tokens (refreshes keep it). The
+   * base-scope check reads it before the granted `scope`: some servers rename granted scopes
+   * (Entra `.default`, Google URL forms), so only the request uses the plugin's names (#6564).
+   */
+  requested_scope?: string;
 }
 
 /**
@@ -71,6 +77,8 @@ export interface MCPOAuthTokens {
 export interface MCPOAuthClientInformation {
   client_id: string;
   client_secret?: string;
+  /** Stored for registered clients; a plugin-provided client's comes from its plugin config. */
+  token_endpoint_auth_method?: string;
   client_id_issued_at?: number;
   client_secret_expires_at?: number;
   /** See MCPOAuthTokens.authorization_server. */
@@ -79,6 +87,11 @@ export interface MCPOAuthClientInformation {
   token_endpoint?: string;
   /** See MCPOAuthTokens.issuer. */
   issuer?: string;
+  /**
+   * Set on a client a plugin provided (not registered by Xum): a server config without a
+   * provided client must not use it or its tokens (#6159).
+   */
+  provided_by_plugin?: boolean;
 }
 
 /**

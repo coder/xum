@@ -16,6 +16,11 @@ export interface SessionFileWriteOptions {
    * If it returns false, the write is skipped.
    */
   shouldWrite?: () => boolean;
+  /**
+   * Optional step awaited after the workspace file lock is acquired, before `shouldWrite`: the
+   * write keeps its place in the per-workspace queue while it runs.
+   */
+  beforeWrite?: () => Promise<void>;
 }
 
 /**
@@ -72,6 +77,7 @@ export class SessionFileManager<T> {
   ): Promise<Result<void>> {
     return this.fileLocks.withLock(workspaceId, async () => {
       try {
+        await options?.beforeWrite?.();
         if (options?.shouldWrite && !options.shouldWrite()) {
           return Ok(undefined);
         }

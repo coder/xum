@@ -92,6 +92,54 @@ describe("MCPConfigService", () => {
     expect(raw).toContain('"test"');
   });
 
+  // Server names are keys of plain objects: names like "constructor" must not read
+  // Object.prototype members as configured servers (#5740).
+  test("servers named after Object.prototype keys behave like any other name (#5740)", async () => {
+    // A name that is not configured is not found, and nothing is written for it.
+    for (const name of ["toString", "constructor", "hasOwnProperty"]) {
+      expect((await configService.setServerEnabled(name, false)).success).toBe(false);
+      expect((await configService.setToolAllowlist(name, [])).success).toBe(false);
+      expect((await configService.removeServer(name)).success).toBe(false);
+    }
+    expect(Object.keys(await configService.listServers())).toEqual([]);
+
+    // A configured "constructor" server round-trips like any other.
+    const added = await configService.addServer("constructor", {
+      transport: "http",
+      url: "https://example.com/mcp",
+    });
+    expect(added).toEqual({ success: true, data: undefined });
+    expect((await configService.listServers()).constructor).toMatchObject({
+      transport: "http",
+      url: "https://example.com/mcp",
+      disabled: false,
+    });
+    expect((await configService.setServerEnabled("constructor", false)).success).toBe(true);
+    expect((await configService.listServers()).constructor).toMatchObject({ disabled: true });
+    expect((await configService.removeServer("constructor")).success).toBe(true);
+    expect(Object.keys(await configService.listServers())).toEqual([]);
+
+    // "__proto__" cannot be stored as a plain-object key, so it is refused.
+    expect(
+      (await configService.addServer("__proto__", { transport: "stdio", command: "x" })).success
+    ).toBe(false);
+    expect(Object.keys(await configService.listServers())).toEqual([]);
+  });
+
+  test("addServer refuses remote servers whose URL is not absolute http(s)", async () => {
+    for (const url of ["not a url", "example.com/mcp", "ftp://example.com/mcp", "file:///tmp/x"]) {
+      const result = await configService.addServer("remote", { transport: "http", url });
+      expect(result.success).toBe(false);
+    }
+    expect(await configService.listServers()).not.toHaveProperty("remote");
+
+    const ok = await configService.addServer("remote", {
+      transport: "http",
+      url: "https://example.com/mcp",
+    });
+    expect(ok).toEqual({ success: true, data: undefined });
+  });
+
   test("listServers merges repo overrides on top of global (override wins by name)", async () => {
     await configService.addServer("shared", {
       transport: "stdio",
@@ -245,18 +293,9 @@ describe("MCPConfigService", () => {
       }
     }
   });
-  test("API mutations enforce policy and emit telemetry", async () => {
+  test("API mutations emit telemetry", async () => {
     const capture = mock(() => undefined);
-    const apiService = new MCPConfigService(config, {
-      policyService: {
-        isEnforced: () => true,
-        isMcpTransportAllowed: (transport: string) => transport === "stdio",
-      },
-      telemetryService: { capture },
-    });
-    expect(
-      await apiService.addForApi({ name: "remote", transport: "http", url: "https://x" })
-    ).toEqual({ success: false, error: "MCP transport is disabled by policy" });
+    const apiService = new MCPConfigService(config, { telemetryService: { capture } });
     await apiService.addForApi({ name: "local", command: "node server.js" });
     expect(capture).toHaveBeenCalledWith(
       expect.objectContaining({ event: "mcp_server_config_changed" })
@@ -311,7 +350,7 @@ describe("MCP server disable filtering", () => {
     });
   });
 
-  // --- Agent Plugins provider (agent-plugins experiment) ---
+  // --- Agent Plugins provider ---
 
   const PLUGIN_SERVER = {
     transport: "stdio" as const,

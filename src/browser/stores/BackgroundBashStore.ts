@@ -568,10 +568,14 @@ export function useBackgroundBashTerminatingIds(workspaceId: string | undefined)
  * Subscribing also keeps the live backend subscription alive — see
  * subscribeStateKnown.
  */
-export function useBackgroundBashStateKnown(workspaceId: string): boolean {
+export function useBackgroundBashStateKnown(workspaceId: string | undefined): boolean {
   const store = getStoreInstance();
-  return useSyncExternalStore(
-    (listener) => store.subscribeStateKnown(workspaceId, listener),
-    () => store.isStateKnown(workspaceId)
+  const subscribe = useCallback(
+    (listener: () => void) =>
+      workspaceId ? store.subscribeStateKnown(workspaceId, listener) : () => undefined,
+    [store, workspaceId]
+  );
+  return useSyncExternalStore(subscribe, () =>
+    workspaceId ? store.isStateKnown(workspaceId) : false
   );
 }

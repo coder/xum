@@ -21,11 +21,13 @@ import * as forkOrchestrator from "@/node/services/utils/forkOrchestrator";
 import { Ok, Err, type Result } from "@/common/types/result";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { TASK_SETTINGS_LIMITS } from "@/common/config/schemas/taskSettings";
 import { defaultModel } from "@/common/utils/ai/models";
 import { createMuxMessage, parseWorkspaceTurnTaskCorrelation } from "@/common/types/message";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import { InitStateManager as RealInitStateManager } from "@/node/services/initStateManager";
 import assert from "node:assert";
+import { computeSendDigest } from "@/node/services/sendIds";
 import {
   createAIServiceMocks,
   createTestConfig,
@@ -38,12 +40,14 @@ import {
   stubStableIds,
   testTaskSettings,
   workspaceTurnManagerFor,
+  workspaceTurnManagerInternals,
 } from "@/node/services/taskService.testHarness";
 import {
   createAgentTask,
   createNullInitLogger,
   createTaskServiceHarness,
   createTaskServiceTestRoot,
+  registerLiveWorkspaceTurnHandle,
   removeTaskServiceTestRoot,
   waitForWorkspaceTaskStatus,
 } from "@/node/services/taskService.shared.testHarness";
@@ -111,6 +115,60 @@ describe("TaskService", () => {
       expect(third.error).toContain("maxTaskNestingDepth");
     }
   }, 20_000);
+
+  test("default task settings admit 5 nested levels below the root and refuse a 6th", async () => {
+    // pstack-style orchestration nests 4 levels below the root (track coordinator -> worker ->
+    // verifier -> helper); the default keeps one level of headroom and still stops runaway
+    // recursion past it.
+    const config = await createTestConfig(rootDir);
+    stubStableIds(
+      config,
+      ["aaaaaaaaa1", "aaaaaaaaa2", "aaaaaaaaa3", "aaaaaaaaa4", "aaaaaaaaa5"],
+      "aaaaaaaaa6"
+    );
+
+    const projectPath = await createTestProject(rootDir);
+    const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
+    const runtime = createRuntime(runtimeConfig, { projectPath });
+    const parentCreate = await runtime.createWorkspace({
+      projectPath,
+      branchName: "parent",
+      trunkBranch: "main",
+      directoryName: "parent",
+      initLogger: createNullInitLogger(),
+    });
+    expect(parentCreate.success).toBe(true);
+
+    const parentId = "1111111111";
+    // No saved taskSettings: the limits come from the defaults, as on a fresh install.
+    await saveWorkspaces(config, projectPath, [
+      {
+        path: runtime.getWorkspacePath(projectPath, "parent"),
+        id: parentId,
+        name: "parent",
+        createdAt: new Date().toISOString(),
+        runtimeConfig,
+      },
+    ]);
+    expect(config.loadConfigOrDefault().taskSettings?.maxTaskNestingDepth).toBe(
+      TASK_SETTINGS_LIMITS.maxTaskNestingDepth.default
+    );
+    const { taskService } = createTaskServiceHarness(config);
+
+    let ownerId = parentId;
+    for (let depth = 1; depth <= 5; depth++) {
+      const created = await createAgentTask(taskService, ownerId, `level ${depth}`);
+      expect(created.success).toBe(true);
+      if (!created.success) return;
+      ownerId = created.data.taskId;
+    }
+
+    const tooDeep = await createAgentTask(taskService, ownerId, "level 6");
+    expect(tooDeep.success).toBe(false);
+    if (!tooDeep.success) {
+      expect(tooDeep.error).toContain("maxTaskNestingDepth");
+    }
+  }, 60_000);
 
   test("plan is only runnable for workflow-owned task creation", async () => {
     const config = await createTestConfig(rootDir);
@@ -796,43 +854,6 @@ describe("TaskService", () => {
     expect(tasks.map((task) => task.taskSticky)).toEqual([undefined, undefined]);
   });
 
-  test("createMany stamps the rlm experiment on admitted and queued task records", async () => {
-    const config = await createTestConfig(rootDir);
-    stubStableIds(config, ["rlma000001", "rlmq000002"], "rlmfb00003");
-
-    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
-    await config.editConfig((cfg) => {
-      cfg.taskSettings = { maxParallelAgentTasks: 1, maxTaskNestingDepth: 3 };
-      return cfg;
-    });
-
-    const sendMessage = mock(() => new Promise<Result<void>>(() => undefined));
-    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
-
-    const result = await taskService.createMany(
-      ["one", "two"].map((prompt, index) => ({
-        parentWorkspaceId: parentId,
-        kind: "agent" as const,
-        agentId: "explore",
-        prompt,
-        title: `Task ${index + 1}`,
-        // RLM children must keep family messaging across restarts even when the
-        // frontend experiment toggles off, so the spawn stamp is the durable gate.
-        experiments: { rlm: true, programmaticToolCalling: true },
-      }))
-    );
-
-    expect(result.success).toBe(true);
-    if (!result.success) return;
-    expect(result.data.map((task) => task.status)).toEqual(["starting", "queued"]);
-
-    const tasks = Array.from(config.loadConfigOrDefault().projects.values())
-      .flatMap((project) => project.workspaces)
-      .filter((workspace) => workspace.parentWorkspaceId === parentId);
-    expect(tasks.map((task) => task.taskExperiments?.rlm)).toEqual([true, true]);
-  });
-
   test("resolveWorkspaceModelFallbackChain honors taskOnRefusal opt-out", async () => {
     const config = await createTestConfig(rootDir);
 
@@ -1313,6 +1334,96 @@ describe("TaskService", () => {
     const acceptedStarting = findWorkspaceInConfig(config, acceptedStartingTaskId);
     expect(acceptedStarting?.taskStatus).toBe("running");
     expect(acceptedStarting?.taskPrompt).toBeUndefined();
+  }, 20_000);
+
+  // A row with a brief send id is recovered by that id alone. A user row
+  // without it (a manual message) does not prove the brief; the brief's own row does.
+  test("startup recovery decides a stale starting brief by its send id", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = await createTestProject(rootDir);
+    const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
+    const runtime = createRuntime(runtimeConfig, { projectPath });
+    const parentName = "parent";
+    await runtime.createWorkspace({
+      projectPath,
+      branchName: parentName,
+      trunkBranch: "main",
+      directoryName: parentName,
+      initLogger: createNullInitLogger(),
+    });
+    const parentId = "1111111111";
+    const startingRow = (id: string, prompt: string, sendId: string): WorkspaceConfigEntry => ({
+      path: runtime.getWorkspacePath(projectPath, `agent_explore_${id}`),
+      id,
+      name: `agent_explore_${id}`,
+      title: id,
+      createdAt: new Date().toISOString(),
+      runtimeConfig,
+      parentWorkspaceId: parentId,
+      agentId: "explore",
+      agentType: "explore",
+      taskStatus: "starting",
+      taskPrompt: prompt,
+      taskPromptSendId: sendId,
+      taskModelString: defaultModel,
+      taskTrunkBranch: parentName,
+    });
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        {
+          path: runtime.getWorkspacePath(projectPath, parentName),
+          id: parentId,
+          name: parentName,
+          createdAt: new Date().toISOString(),
+          runtimeConfig,
+        },
+        startingRow("task-brief-unsent", "unsent brief", "srv-unsent"),
+        startingRow("task-brief-accepted", "accepted brief", "srv-accepted"),
+      ],
+      testTaskSettings(2, 3)
+    );
+    const { workspaceService, sendMessage, resumeStream } = createWorkspaceServiceMocks();
+    const { historyService, taskService } = createTaskServiceHarness(config, { workspaceService });
+    for (const [taskId, row] of [
+      // A manual message, not the brief: the older test (any user row) took it for the brief.
+      ["task-brief-unsent", createMuxMessage("manual", "user", "a manual message")],
+      [
+        "task-brief-accepted",
+        // As the launch's publication stamps it: the id and the digest of the brief it sent.
+        createMuxMessage("brief", "user", "accepted brief", {
+          sendIds: ["srv-accepted"],
+          sendDigests: { "srv-accepted": computeSendDigest({ message: "accepted brief" }) },
+        }),
+      ],
+    ] as const) {
+      expect((await historyService.appendToHistory(taskId, row)).success).toBe(true);
+    }
+
+    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
+      Promise.resolve(undefined)
+    );
+    try {
+      await taskService.initialize();
+      await taskService.maybeStartQueuedTasks();
+      await Promise.all([
+        waitForWorkspaceTaskStatus(config, "task-brief-unsent", "running"),
+        waitForWorkspaceTaskStatus(config, "task-brief-accepted", "running"),
+      ]);
+    } finally {
+      runBackgroundInitSpy.mockRestore();
+    }
+
+    const sentPrompts = (sendMessage as unknown as { mock: { calls: unknown[][] } }).mock.calls
+      .filter((call) => call[0] === "task-brief-unsent" || call[0] === "task-brief-accepted")
+      .map((call) => [call[0], call[1]]);
+    expect(sentPrompts).toEqual([["task-brief-unsent", "unsent brief"]]);
+    expect(resumeStream).toHaveBeenCalledWith(
+      "task-brief-accepted",
+      expect.anything(),
+      expect.anything()
+    );
   }, 20_000);
 
   // #4473: shutdown latches every session before its bounded join of the queue drain, so a launch
@@ -2928,6 +3039,62 @@ describe("TaskService", () => {
       .flatMap((p) => p.workspaces)
       .find((w) => w.id === queuedTaskId);
     expect(queued?.taskStatus).toBe("queued");
+  });
+
+  // The global turn count reads every workspace-turn file of every session; a drain with nothing
+  // queued has no slot to compute and must not pay for it on every task settle.
+  test("a queue drain with no queued task skips the global workspace-turn scan", async () => {
+    const config = await createTestConfig(rootDir);
+    await saveLocalParentWorkspace(config, rootDir);
+    const { taskService } = createTaskServiceHarness(config);
+    // Every global listing (listAllWorkspaceTurns included) goes through this scan.
+    const scanAllWorkspaceTurns = spyOn(
+      workspaceTurnManagerInternals(taskService).taskHandleStore,
+      "scanAllWorkspaceTurns"
+    );
+
+    await taskService.maybeStartQueuedTasks();
+
+    expect(scanAllWorkspaceTurns).not.toHaveBeenCalled();
+  });
+
+  test("a live workspace turn holds the last task slot at creation and in the drain until it goes stale", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    await config.editConfig((cfg) => {
+      cfg.taskSettings = testTaskSettings(1, 3);
+      cfg.projects
+        .get(projectPath)!
+        .workspaces.push(projectWorkspace(projectPath, "target", "target"));
+      return cfg;
+    });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    await registerLiveWorkspaceTurnHandle(taskService, "target", "wst_live", parentId);
+
+    const created = await createAgentTask(taskService, parentId, "Inspect", { isolation: "none" });
+    assert(created.success);
+    const taskId = created.data.taskId;
+    expect(created.data.status).toBe("queued");
+    await taskService.maybeStartQueuedTasks();
+    expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("queued");
+    expect(sendMessage).not.toHaveBeenCalled();
+
+    // The turn's runtime is gone (as after its backend exited): the next drain settles the stale
+    // record and the freed slot launches the queued task.
+    workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.delete(
+      "target"
+    );
+    await taskService.maybeStartQueuedTasks();
+    expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("running");
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0]?.[0]).toBe(taskId);
+    expect(
+      await workspaceTurnManagerInternals(taskService).taskHandleStore.getWorkspaceTurn(
+        parentId,
+        "wst_live"
+      )
+    ).toMatchObject({ status: "interrupted" });
   });
 
   test("allows multiple agent tasks under the same parent up to maxParallelAgentTasks", async () => {

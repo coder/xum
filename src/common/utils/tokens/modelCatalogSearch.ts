@@ -134,20 +134,16 @@ function rankEntry(indexed: IndexedCatalogEntry, tokens: string[]): number {
 }
 
 /**
- * Filters the catalogue by query/provider/`isAllowed` (the effective policy),
- * ranks it, then pages it. `total` counts every match before paging.
+ * Filters the catalogue by query/provider, ranks it, then pages it.
+ * `total` counts every match before paging.
  */
-export function searchModelCatalog(
-  input: ModelCatalogSearchInput,
-  isAllowed: (provider: string, providerModelId: string) => boolean = () => true
-): ModelCatalogSearchResult {
+export function searchModelCatalog(input: ModelCatalogSearchInput): ModelCatalogSearchResult {
   const tokens = tokenizeModelQuery(input.query);
   const matches: Array<{ entry: ModelCatalogEntry; rank: number }> = [];
   for (const indexed of getCatalogIndex()) {
     const { entry } = indexed;
     if (input.provider != null && entry.provider !== input.provider) continue;
     if (!matchesModelQueryTokens(tokens, indexed.fields)) continue;
-    if (!isAllowed(entry.provider, entry.providerModelId)) continue;
     matches.push({ entry, rank: rankEntry(indexed, tokens) });
   }
   // Within a tier, newer-looking versions come first (numeric chunks compare as

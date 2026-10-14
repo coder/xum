@@ -1,11 +1,19 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, RefreshCw } from "lucide-react";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { useAPI } from "@/browser/contexts/API";
+import { useUserPreferences } from "@/browser/stores/AppConfigStore";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useWorkspaceState } from "@/browser/stores/WorkspaceStore";
 import { getLastMainRetryCandidateMessage } from "@/common/utils/messages/retryEligibility";
-import { KEYBINDS, formatKeybind } from "@/browser/utils/ui/keybinds";
-import { VIM_ENABLED_KEY } from "@/common/constants/storage";
+import {
+  KEYBINDS,
+  formatKeybind,
+  isDesktopViewportFocused,
+  isDialogOpen,
+  isEditableElement,
+  matchesKeybind,
+  paneHandlesKeyEvent,
+} from "@/browser/utils/ui/keybinds";
+import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyCompactionOverrides } from "@/browser/utils/messages/compactionOptions";
 import { stopStream } from "@/browser/utils/stopStream";
@@ -14,11 +22,51 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { runWithCatchFinally } from "@/browser/utils/compilerSafeControlFlow";
 import type { AutoRetryStatus } from "@/browser/utils/messages/autoRetryStatus";
 import type { DisplayedMessage } from "@/common/types/message";
+import type { StreamErrorType } from "@/common/types/errors";
 
 interface RetryBarrierProps {
   workspaceId: string;
   visible?: boolean;
 }
+
+// RetryManager.abandon reasons that are not stream error types. Error types (rate_limit,
+// api_error, ...) still show as sent: they name the failure the user can look up.
+const ABANDON_REASON_LABELS: Record<string, string> = {
+  user_interrupt: "you stopped it",
+  disabled_by_user: "auto-retry is turned off",
+  context_changed: "the conversation changed",
+};
+
+function formatAbandonReason(reason: string): string {
+  return ABANDON_REASON_LABELS[reason] ?? reason;
+}
+
+// Barrier title for a failed stream, by error kind. A Record so a new StreamErrorType must pick
+// a title here. `null` keeps the generic "Stream interrupted": only a real user abort is one.
+const STREAM_ERROR_TITLES: Record<StreamErrorType, string | null> = {
+  authentication: "Authentication failed",
+  rate_limit: "Rate limited",
+  server_error: "Server error",
+  api: "API error",
+  retry_failed: "Retries exhausted",
+  aborted: null,
+  network: "Network error",
+  context_exceeded: "Context limit exceeded",
+  context_budget_blocked: "Request too large",
+  quota: "Quota exceeded",
+  model_not_found: "Model not found",
+  runtime_not_ready: "Runtime not ready",
+  runtime_start_failed: "Runtime failed to start",
+  empty_output: "Empty response",
+  stream_truncated: "Response cut off",
+  max_output_tokens: "Output limit reached",
+  model_refusal: "Model refused",
+  agent_resolution: "Agent unavailable",
+  reasoning_rejected: "Reasoning rejected",
+  session_tape_replay: "Session replay refused",
+  plugin_blocked: "Blocked by plugin",
+  unknown: "Stream error",
+};
 
 /** Desktop entry point: feeds {@link RetryBarrierContent} from WorkspaceStore. */
 export const RetryBarrier: React.FC<RetryBarrierProps> = (props) => {
@@ -54,13 +102,62 @@ interface RetryBarrierContentProps extends RetryBarrierProps {
   showStopAutoRetry?: boolean;
 }
 
+/**
+ * The barrier's Retry with its Shift+R shortcut (#5111). Mounted only while Retry is offered (barrier
+ * visible, no automatic retry running), so the always-mounted barrier keeps no key listener. The
+ * interrupted divider's resume shares the key and is never offered while this barrier shows. Same
+ * guards as that transcript key: never while typing, in a dialog, or in a remote desktop viewport.
+ */
+const RetryButton: React.FC<{ disabled: boolean; onRetry: () => void }> = (props) => {
+  const onRetryRef = useRef(props.onRetry);
+  useEffect(() => {
+    onRetryRef.current = props.onRetry;
+  });
+  // The main chat and the /side chat tab can both show Retry; only the pane owning the focused
+  // element retries, so one Shift+R never retries both chats.
+  const paneScope = useChatPaneScope();
+  useEffect(() => {
+    const handleKeyDownCapture = (e: KeyboardEvent) => {
+      if (
+        !matchesKeybind(e, KEYBINDS.RESUME_STREAM) ||
+        !paneHandlesKeyEvent(paneScope, e.target) ||
+        isDesktopViewportFocused(e.target) ||
+        isDialogOpen() ||
+        isEditableElement(e.target)
+      ) {
+        return;
+      }
+      e.preventDefault();
+      onRetryRef.current();
+    };
+    window.addEventListener("keydown", handleKeyDownCapture, { capture: true });
+    return () => window.removeEventListener("keydown", handleKeyDownCapture, { capture: true });
+  }, [paneScope]);
+
+  return (
+    <button
+      className="bg-warning font-primary text-background cursor-pointer rounded border-none px-4 py-2 text-xs font-semibold whitespace-nowrap transition-all duration-200 hover:-translate-y-px hover:brightness-120 active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-50"
+      disabled={props.disabled}
+      onClick={props.onRetry}
+    >
+      Retry{" "}
+      <span aria-hidden="true" className="mobile-hide-shortcut-hints">
+        ({formatKeybind(KEYBINDS.RESUME_STREAM)})
+      </span>
+    </button>
+  );
+};
+
 export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) => {
   const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const [countdown, setCountdown] = useState(0);
   const [manualRetryError, setManualRetryError] = useState<string | null>(null);
   const [isManualRetrying, setIsManualRetrying] = useState(false);
 
-  const [vimEnabled] = usePersistedState<boolean>(VIM_ENABLED_KEY, false, { listener: true });
+  const vimEnabled = useUserPreferences(
+    (preferences) => preferences.appearance?.vimEnabled === true
+  );
   const stopKeybind = formatKeybind(
     vimEnabled ? KEYBINDS.INTERRUPT_STREAM_VIM : KEYBINDS.INTERRUPT_STREAM_NORMAL
   );
@@ -75,11 +172,12 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
   const manualRetryRollbackPendingRef = useRef(false);
   const manualRetryRollbackArmedRef = useRef(false);
   const manualRetryRollbackBaselineMessageCountRef = useRef<number | null>(null);
-  const apiRef = useRef(api);
+  // The rollback skips while offline, as it did when useAPI() went null in the gap.
+  const apiRef = useRef(liveApi);
 
   useEffect(() => {
-    apiRef.current = api;
-  }, [api]);
+    apiRef.current = liveApi;
+  }, [liveApi]);
 
   const rollbackManualRetryAutoRetryIfNeeded = useCallback(
     async (options?: { suppressErrors?: boolean }): Promise<void> => {
@@ -195,7 +293,7 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
     }
   }, [isAutoRetryActive]);
   const handleManualRetry = async () => {
-    if (!api) {
+    if (!liveApi) {
       setManualRetryError("Not connected to server");
       return;
     }
@@ -232,7 +330,7 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
           options = applyCompactionOverrides(options, lastUserMessage.compactionRequest.parsed);
         }
 
-        const enableResult = await api.workspace.setAutoRetryEnabled?.({
+        const enableResult = await liveApi.workspace.setAutoRetryEnabled?.({
           workspaceId: props.workspaceId,
           enabled: true,
           persist: false,
@@ -251,7 +349,7 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
           manualRetryRollbackBaselineMessageCountRef.current = props.messages.length;
         }
 
-        const resumeResult = await api.workspace.resumeStream({
+        const resumeResult = await liveApi.workspace.resumeStream({
           workspaceId: props.workspaceId,
           options,
         });
@@ -293,7 +391,9 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
 
   const lastMessage = getLastMainRetryCandidateMessage(props.messages);
   const lastStreamError = lastMessage?.type === "stream-error" ? lastMessage : null;
-  const interruptionReason = lastStreamError?.errorType === "rate_limit" ? "Rate limited" : null;
+  const interruptionReason = lastStreamError
+    ? STREAM_ERROR_TITLES[lastStreamError.errorType]
+    : null;
   const isWaitingForInitialResponse = lastMessage?.type === "user" && props.isStreamStarting;
 
   let statusIcon: React.ReactNode = (
@@ -311,15 +411,12 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
     </>
   );
   let actionButton: React.ReactNode = (
-    <button
-      className="bg-warning font-primary text-background cursor-pointer rounded border-none px-4 py-2 text-xs font-semibold whitespace-nowrap transition-all duration-200 hover:-translate-y-px hover:brightness-120 active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-50"
+    <RetryButton
       disabled={isManualRetrying}
-      onClick={() => {
+      onRetry={() => {
         void handleManualRetry();
       }}
-    >
-      Retry
-    </button>
+    />
   );
 
   if (isAutoRetryActive) {
@@ -371,7 +468,7 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
   ) : autoRetryStatus?.type === "auto-retry-abandoned" ? (
     <div className="font-primary text-foreground/80 pl-8 text-[12px]">
       <span className="text-warning font-semibold">Auto-retry stopped:</span>{" "}
-      {autoRetryStatus.reason}
+      {formatAbandonReason(autoRetryStatus.reason)}
     </div>
   ) : null;
 
@@ -381,8 +478,10 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
 
   return (
     <div className="border-warning my-5 flex flex-col gap-3 rounded border-l-4 bg-gradient-to-br from-[rgba(255,165,0,0.1)] to-[rgba(255,140,0,0.1)] px-5 py-4">
-      <div className="flex items-center justify-between gap-4">
-        <div className="flex flex-1 items-center gap-3">
+      {/* Wraps so Retry moves under the status in a narrow pane (VS Code sidebar, #5151) instead of
+          overflowing the card; the status keeps its content width before it wraps. */}
+      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+        <div className="flex min-w-0 flex-auto items-center gap-3">
           <span className="shrink-0">{statusIcon}</span>
           <div className="font-primary text-foreground text-[13px] font-medium">{statusText}</div>
         </div>

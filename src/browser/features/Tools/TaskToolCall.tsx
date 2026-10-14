@@ -573,6 +573,25 @@ const TaskAiSettingsDisplay: React.FC<TaskAiSettingsInfo & { className?: string 
 interface TaskToolOwnReport {
   reportMarkdown: string;
   title?: string;
+  /** The result holds only the first page of a longer report (it carries nextCharOffset). */
+  isFirstPage?: boolean;
+}
+
+/**
+ * The report a task card shows: its own result's report, unless that is only the first page of
+ * a longer report. Then the report joined from the task_await pages (which starts from that
+ * first page) wins, so the pages the agent read stay on the card.
+ */
+function pickTaskReportMarkdown(
+  ownReport: TaskToolOwnReport | undefined,
+  linkedReport: { reportMarkdown: string } | undefined
+): string | undefined {
+  if (ownReport?.isFirstPage === true && hasNonEmptyText(linkedReport?.reportMarkdown)) {
+    return linkedReport.reportMarkdown;
+  }
+  return hasNonEmptyText(ownReport?.reportMarkdown)
+    ? ownReport.reportMarkdown
+    : linkedReport?.reportMarkdown;
 }
 
 function hasNonEmptyText(value: unknown): value is string {
@@ -757,6 +776,14 @@ function recoverTaskGroupTaskIdsFromWorkspaceMetadata(params: {
   );
 }
 
+/**
+ * The entries of a persisted list that are objects. A partly corrupted chat.jsonl can hold a
+ * null entry, and skipping it keeps the card rendering (self-healing).
+ */
+function objectEntries<T>(entries: readonly T[]): T[] {
+  return entries.filter((entry) => typeof entry === "object" && entry !== null);
+}
+
 function collectTaskToolResultDisplayData(result: TaskToolSuccessResult | null): {
   taskIds: string[];
   statusByTaskId: Map<string, string>;
@@ -816,6 +843,7 @@ function collectTaskToolResultDisplayData(result: TaskToolSuccessResult | null):
     ownReportsByTaskId.set(singleTaskId, {
       reportMarkdown: result.reportMarkdown,
       title: result.title,
+      isFirstPage: result.nextCharOffset != null,
     });
   }
 
@@ -837,12 +865,13 @@ function collectTaskToolResultDisplayData(result: TaskToolSuccessResult | null):
   }
 
   if ("reports" in result && Array.isArray(result.reports)) {
-    for (const report of result.reports) {
+    for (const report of objectEntries(result.reports)) {
       const taskId = rememberTaskId(report.taskId);
       if (taskId) {
         ownReportsByTaskId.set(taskId, {
           reportMarkdown: report.reportMarkdown,
           title: report.title,
+          isFirstPage: report.nextCharOffset != null,
         });
         rememberWorkspace(taskId, report.workspaceId);
         rememberAiSettings(taskId, report);
@@ -1010,9 +1039,7 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
     const linkedReport = taskReportLinking?.reportByTaskId.get(taskId);
     const openWorkspaceId = workspaceIdByTaskId.get(taskId);
     const metadata = findWorkspaceForTaskTarget(workspaceMetadata, taskId, openWorkspaceId);
-    const reportMarkdown = hasNonEmptyText(ownReport?.reportMarkdown)
-      ? ownReport.reportMarkdown
-      : linkedReport?.reportMarkdown;
+    const reportMarkdown = pickTaskReportMarkdown(ownReport, linkedReport);
     const reportTitle = ownReport?.title ?? linkedReport?.title;
     const derivedStatus =
       (ownReport ?? linkedReport)

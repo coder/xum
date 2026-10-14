@@ -486,3 +486,11 @@ export function payloadRow(id: string, shape: number, payload: string): MuxMessa
   return message;
 }
 export const PAYLOAD_ROW_SHAPES = 4;
+
+/** An in-flight assistant partial carrying every payloadRow shape: the giant partial of #5213. */
+export function payloadPartial(id: string, payload: string): MuxMessage {
+  const parts = Array.from({ length: PAYLOAD_ROW_SHAPES }, (_, shape) =>
+    payloadRow(`${id}-${shape}`, shape, payload).parts.slice(1)
+  ).flat();
+  return createMuxMessage(id, "assistant", `payload partial ${id}`, undefined, parts);
+}

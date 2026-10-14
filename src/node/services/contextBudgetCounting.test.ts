@@ -16,6 +16,7 @@ import {
   estimateAssembledRequestTokensForModel,
   estimateFreshRequestTokensForModel,
   estimateToolResultTokensForModel,
+  measureAssembledRequestBudgetForModel,
 } from "./contextBudgetCounting";
 
 const model = "openai:gpt-4o";
@@ -694,6 +695,7 @@ describe("anchored request estimate (#4858)", () => {
     expect(anchored).toEqual({
       estimate: 1000 + deltaOnly,
       hardCeiling: getContextBudgetHardCeiling(200_000),
+      delta: deltaOnly,
     });
     expect(anchored!.estimate).toBeLessThan(full);
   });
@@ -772,5 +774,124 @@ describe("anchored request estimate (#4858)", () => {
       "context_budget_exceeded"
     );
     expect(await checkAssembledRequestBudgetForModel(payload, options, anchor)).toBeUndefined();
+  });
+
+  // #5286: turn-start stage decisions read this measure, so it must be the count the check enforces.
+  test.each([
+    ["a fitting request", 200_000],
+    ["an over-ceiling request", 4_000],
+  ])("%s measures the estimate the turn-start check enforces", async (_name, limit) => {
+    const opts = { ...options, modelContextLimit: limit };
+    const measured = await measureAssembledRequestBudgetForModel(payload, opts);
+    const full = (await estimateAssembledRequestTokensForModel(payload, opts))!;
+    expect(measured).toMatchObject(full);
+    expect(measured!.exceeded).toEqual(await checkAssembledRequestBudgetForModel(payload, opts));
+    expect(measured!.exceeded != null).toBe(limit < 200_000);
+  });
+
+  // The refusal is serialized to the frontend as a SendMessageError: the anchored path's
+  // `delta` must not leak into it.
+  test("an anchored over-ceiling refusal carries only the refusal fields", async () => {
+    const opts = { ...options, modelContextLimit: 4_000 };
+    const heavyAnchor = createContextBudgetAnchor(
+      { model, system, tools, activeTools, messages: prefix },
+      { usage: { ...usage, inputTokens: 5_000 } }
+    )!;
+    const measured = (await measureAssembledRequestBudgetForModel(payload, opts, heavyAnchor))!;
+    expect(measured.delta).toBeDefined();
+    expect(measured.exceeded).toStrictEqual({
+      type: "context_budget_exceeded",
+      model,
+      estimate: measured.estimate,
+      hardCeiling: getContextBudgetHardCeiling(4_000),
+    });
+  });
+
+  test("an exact append reports the counted delta; a rewritten prefix reports none", async () => {
+    const appended = (await measureAssembledRequestBudgetForModel(payload, options, anchor))!;
+    expect(appended.delta).toBeDefined();
+    expect(anchor.providerTokens + appended.delta!).toBe(appended.estimate);
+    const rewritten = { ...payload, messages: [{ ...prefix[0] }, prefix[1], ...delta] };
+    const full = (await measureAssembledRequestBudgetForModel(rewritten, options, anchor))!;
+    expect(full.delta).toBeUndefined();
+    expect(full.estimate).toBe(
+      (await estimateAssembledRequestTokensForModel(rewritten, options))!.estimate
+    );
+  });
+});
+
+describe("repeated native tool references (#5413)", () => {
+  // Anthropic expands every tool_reference into the full definition, repeats included.
+  const claude = "anthropic:claude-opus-5-5";
+  const tools = {
+    read: tool({ description: "Read a file", inputSchema: jsonSchema({}) }),
+    mcp_big: tool({
+      description: "Deploy the selected release to the target environment. ".repeat(60),
+      inputSchema: jsonSchema({
+        type: "object",
+        properties: { release: { type: "string", description: "Release id. ".repeat(40) } },
+      }),
+    }),
+  };
+  const loaded = ["read", "mcp_big"];
+  const user = { role: "user", content: [{ type: "text", text: "Deploy the release." }] };
+  const search = (id: string) => [
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "tool-call",
+          toolCallId: id,
+          toolName: "tool_catalog_search",
+          input: { query: "x" },
+        },
+      ],
+    },
+    {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: id,
+          toolName: "tool_catalog_search",
+          output: {
+            type: "content",
+            value: [
+              {
+                type: "custom",
+                providerOptions: { anthropic: { type: "tool-reference", toolName: "mcp_big" } },
+              },
+            ],
+          },
+        },
+      ],
+    },
+  ];
+  const once = [user, ...search("s1")];
+  const twice = [...once, ...search("s2")];
+  const options = { model: claude, modelContextLimit: 200_000, activeTools: loaded };
+  const estimate = async (messages: unknown[], activeTools: string[]) =>
+    (await estimateAssembledRequestTokensForModel(
+      { tools, messages },
+      { ...options, activeTools }
+    ))!.estimate;
+
+  test("each repeated reference charges the expanded schema again", async () => {
+    const schemaCost = (await estimate([user], loaded)) - (await estimate([user], ["read"]));
+    expect((await estimate(twice, loaded)) - (await estimate(once, loaded))).toBeGreaterThanOrEqual(
+      schemaCost
+    );
+  });
+
+  test("an appended repeat reference falls back to the full estimate", async () => {
+    const anchor = createContextBudgetAnchor(
+      { model: claude, system: undefined, tools, activeTools: loaded, messages: once },
+      { usage: { inputTokens: 1000, outputTokens: 10 } }
+    );
+    expect(anchor).toBeDefined();
+    const payload = { tools, messages: twice };
+    expect(await estimateAnchoredRequestTokensForModel(payload, options, anchor)).toEqual(
+      await estimateAssembledRequestTokensForModel(payload, options)
+    );
   });
 });

@@ -31,8 +31,10 @@ restoreModulesAfterSuite([
 
 let cleanupDom: (() => void) | null = null;
 
-let apiStatus: "auth_required" | "connecting" | "error" = "auth_required";
+let apiStatus: "auth_required" | "connecting" | "reconnecting" | "error" = "auth_required";
 let apiError: string | null = "Authentication required";
+/** While reconnecting, `useAPI().api` is the last client (as after the switch), not null. */
+let keptClient: object | null = null;
 
 void mock.module("@/browser/assets/logos/xum-logo-dark.svg?react", () => ({
   __esModule: true,
@@ -58,6 +60,8 @@ void mock.module("lottie-react", () => ({
 // option.
 void mock.module("@/browser/contexts/API", () => ({
   APIProvider: (props: { children: React.ReactNode }) => props.children,
+  // No state of this mock is connected, so no live client.
+  useLiveAPI: () => null,
   useAPI: () => {
     if (apiStatus === "auth_required") {
       return {
@@ -79,6 +83,17 @@ void mock.module("@/browser/contexts/API", () => ({
       };
     }
 
+    if (apiStatus === "reconnecting") {
+      return {
+        api: keptClient,
+        status: "reconnecting" as const,
+        attempt: 2,
+        error: null,
+        authenticate: () => undefined,
+        retry: () => undefined,
+      };
+    }
+
     return {
       api: null,
       status: "connecting" as const,
@@ -90,9 +105,13 @@ void mock.module("@/browser/contexts/API", () => ({
 }));
 
 void mock.module("@/browser/components/LoadingScreen/LoadingScreen", () => ({
-  LoadingScreen: () => {
+  LoadingScreen: (props: { statusText?: string }) => {
     const { theme } = useTheme();
-    return <div data-testid="LoadingScreenMock">{theme}</div>;
+    return (
+      <div data-testid="LoadingScreenMock">
+        {props.statusText} {theme}
+      </div>
+    );
   },
 }));
 
@@ -130,6 +149,7 @@ describe("AppLoader", () => {
   });
 
   afterEach(() => {
+    keptClient = null;
     cleanup();
     mock.restore();
     cleanupDom?.();
@@ -165,5 +185,53 @@ describe("AppLoader", () => {
 
     // If ThemeProvider is missing, useTheme() will throw.
     expect(getByTestId("LoadingScreenMock").textContent).toBeTruthy();
+  });
+
+  // Leaving the gate mounts RouterProvider, which picks the launch route once.
+  test("keeps the preferences screen past the bound until the backend connects", async () => {
+    apiStatus = "connecting";
+    apiError = null;
+
+    const { getByText, queryByText } = render(<AppLoader />);
+
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    expect(getByText(/Loading preferences/)).toBeTruthy();
+    expect(queryByText(/Loading Xum/)).toBeNull();
+  });
+
+  // Reconnecting keeps the last client. The bound must still wait for a live connection, or the
+  // timeout mounts the app with the launch route picked from code defaults while offline.
+  test("keeps the preferences screen past the bound while reconnecting with a kept client", async () => {
+    apiStatus = "reconnecting";
+    apiError = null;
+    keptClient = {};
+
+    const { getAllByRole } = render(<AppLoader />);
+
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    // The gate's own screen (a bare main), not the app loader behind it (its main has a class).
+    const mains = getAllByRole("main");
+    expect(mains).toHaveLength(1);
+    expect(mains[0].className).toBe("");
+    expect(mains[0].textContent).toMatch(/Reconnecting to backend/);
+  });
+
+  // #6017: each startup screen the gate shows is the whole page, so it must sit in the page's
+  // one main landmark (axe "landmark-one-main").
+  test.each([
+    ["connecting", "LoadingScreenMock", /Loading preferences/],
+    ["reconnecting", "LoadingScreenMock", /Reconnecting to backend/],
+    ["error", "StartupConnectionErrorMock", /Connection error/],
+  ] as const)("puts the gate's %s screen in exactly one main landmark", (status, testId, text) => {
+    apiStatus = status;
+    apiError = status === "error" ? "Connection error" : null;
+
+    const { getAllByRole, getByTestId } = render(<AppLoader />);
+
+    const mains = getAllByRole("main");
+    expect(mains).toHaveLength(1);
+    const screen = getByTestId(testId);
+    expect(screen.textContent).toMatch(text);
+    expect(mains[0].contains(screen)).toBe(true);
   });
 });

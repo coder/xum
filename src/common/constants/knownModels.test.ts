@@ -42,6 +42,8 @@ describe("Known Models Integration", () => {
     ["argon", /^google:gemini-4-argon/],
     ["gemini-flash", /^google:gemini-.*flash/],
     ["grok", /^xai:grok-/],
+    ["muse", /^meta:muse-wonder-/],
+    ["wonder", /^meta:muse-wonder-/],
     ["deepseek", /^deepseek:deepseek-.*pro/],
     ["kimi", /^moonshotai:kimi-/],
     ["glm", /^zai:glm-/],
@@ -61,6 +63,7 @@ describe("Known Models Integration", () => {
   test.each([
     ["anthropic:claude-opus-5", "anthropic/claude-opus-4.5"],
     ["anthropic:claude-sonnet-5", "anthropic/claude-sonnet-4.5"],
+    ["anthropic:claude-haiku-4-5", "anthropic/claude-3.5-haiku"],
   ])("retired id %s keeps its tokenizer override", (modelId, tokenizer) => {
     expect(TOKENIZER_MODEL_OVERRIDES[modelId]).toBe(tokenizer);
   });

@@ -1,14 +1,17 @@
 import { useRef } from "react";
 import { useAPI } from "@/browser/contexts/API";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { DEFAULT_RUNTIME_KEY, RUNTIME_ENABLEMENT_KEY } from "@/common/constants/storage";
+import { saveConfigOptimistically, useAppConfig } from "@/browser/stores/AppConfigStore";
 import {
-  DEFAULT_RUNTIME_ENABLEMENT,
   RUNTIME_ENABLEMENT_IDS,
   normalizeRuntimeEnablement,
   type RuntimeEnablement,
   type RuntimeEnablementId,
 } from "@/common/types/runtime";
+
+interface RuntimeEnablementPatch {
+  runtimeEnablement?: RuntimeEnablement;
+  defaultRuntime?: RuntimeEnablementId | null;
+}
 
 interface RuntimeEnablementState {
   enablement: RuntimeEnablement;
@@ -33,16 +36,8 @@ function normalizeDefaultRuntime(value: unknown): RuntimeEnablementId | null {
 
 export function useRuntimeEnablement(): RuntimeEnablementState {
   const { api } = useAPI();
-  const [rawEnablement, setRawEnablement] = usePersistedState<unknown>(
-    RUNTIME_ENABLEMENT_KEY,
-    DEFAULT_RUNTIME_ENABLEMENT,
-    { listener: true }
-  );
-  const [rawDefaultRuntime, setRawDefaultRuntime] = usePersistedState<unknown>(
-    DEFAULT_RUNTIME_KEY,
-    null,
-    { listener: true }
-  );
+  const rawEnablement = useAppConfig((config) => config.runtimeEnablement);
+  const rawDefaultRuntime = useAppConfig((config) => config.defaultRuntime);
 
   // Normalize persisted values so corrupted/legacy payloads don't break toggles.
   // Stabilize the reference: normalizeRuntimeEnablement returns a fresh object every call,
@@ -59,6 +54,12 @@ export function useRuntimeEnablement(): RuntimeEnablementState {
   const enablement = enablementRef.current;
   const defaultRuntime = normalizeDefaultRuntime(rawDefaultRuntime);
 
+  const persist = (payload: RuntimeEnablementPatch) => {
+    saveConfigOptimistically(api, payload, (client) =>
+      client.config.updateRuntimeEnablement(payload)
+    );
+  };
+
   const setRuntimeEnabled = (
     id: RuntimeEnablementId,
     enabled: boolean,
@@ -69,34 +70,17 @@ export function useRuntimeEnablement(): RuntimeEnablementState {
       [id]: enabled,
     };
 
-    // Persist locally first so Settings reflects changes immediately and stays in sync.
-    setRawEnablement(nextMap);
-    if (nextDefaultRuntime !== undefined) {
-      setRawDefaultRuntime(nextDefaultRuntime);
-    }
-
-    // Best-effort backend write keeps ~/.xum/config.json aligned across devices.
-    const payload: {
-      runtimeEnablement: RuntimeEnablement;
-      defaultRuntime?: RuntimeEnablementId | null;
-    } = { runtimeEnablement: nextMap };
+    const payload: RuntimeEnablementPatch = { runtimeEnablement: nextMap };
 
     if (nextDefaultRuntime !== undefined) {
       payload.defaultRuntime = nextDefaultRuntime;
     }
 
-    api?.config?.updateRuntimeEnablement(payload).catch(() => {
-      // Best-effort only.
-    });
+    persist(payload);
   };
 
   const setDefaultRuntime = (id: RuntimeEnablementId | null) => {
-    // Keep the local cache and config.json aligned for the global default runtime.
-    setRawDefaultRuntime(id);
-
-    api?.config?.updateRuntimeEnablement({ defaultRuntime: id }).catch(() => {
-      // Best-effort only.
-    });
+    persist({ defaultRuntime: id });
   };
 
   return { enablement, setRuntimeEnabled, defaultRuntime, setDefaultRuntime };

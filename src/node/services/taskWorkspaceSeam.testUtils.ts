@@ -15,6 +15,7 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     clearQueue: () => Ok(undefined),
     replaceHistory: () => Promise.resolve(Ok(undefined)),
     waitForIdleAndNoQueuedMessages: () => Promise.resolve(),
+    refuseUnavailableGoalTurnAgent: () => Promise.resolve(null),
     // No session behind the fake, so no compaction decision (WorkspaceService without a session).
     // Tests that model a compaction handing completion to its durable follow-up override this.
     waitForPendingCompactionCompletionDecision: () => Promise.resolve(undefined),
@@ -113,6 +114,7 @@ export function makeAgentTaskIntegrationFake(
     latchHardInterruptCascade: () => undefined,
     terminateAllDescendantAgentTasks: () => Promise.resolve([]),
     noteWorkspaceUnarchived: () => Promise.resolve(),
+    settleOwedChildGoalPause: () => Promise.resolve(),
     isWorkspaceStopInProgress: () => false,
     getWorkspaceStopEpoch: () => 0,
     reactivateInactiveAgentTaskFromBashMonitorWake: () => Promise.resolve(null),

@@ -4,7 +4,7 @@ import type {
   AgentAiSubagentProfile,
   SubagentAiDefaults,
 } from "@/common/config/schemas/appConfigOnDisk";
-import { AgentIdSchema } from "@/common/orpc/schemas";
+import { AgentIdSchema } from "@/common/schemas/ids";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import { coerceOpenAIReasoningMode, coerceThinkingLevel, type ThinkingLevel } from "./thinking";
 
@@ -64,8 +64,6 @@ export function normalizeAgentAiDefaults(raw: unknown): AgentAiDefaults {
     const base = normalizeProfileFields(entry);
 
     const enabled = typeof entry.enabled === "boolean" ? entry.enabled : undefined;
-    const advisorEnabled =
-      typeof entry.advisorEnabled === "boolean" ? entry.advisorEnabled : undefined;
 
     const autoModelRouting = entry.autoModelRouting === true ? true : undefined;
     const autoThinkingLevel = entry.autoThinkingLevel === true ? true : undefined;
@@ -75,7 +73,6 @@ export function normalizeAgentAiDefaults(raw: unknown): AgentAiDefaults {
       autoModelRouting,
       autoThinkingLevel,
       enabled,
-      advisorEnabled,
     };
 
     if (entry.subagent && typeof entry.subagent === "object" && !Array.isArray(entry.subagent)) {
@@ -95,7 +92,6 @@ export function normalizeAgentAiDefaults(raw: unknown): AgentAiDefaults {
       autoModelRouting === undefined &&
       autoThinkingLevel === undefined &&
       enabled === undefined &&
-      advisorEnabled === undefined &&
       normalized.subagent === undefined
     ) {
       continue;

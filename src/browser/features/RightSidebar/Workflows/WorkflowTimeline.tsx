@@ -269,7 +269,7 @@ const WorkflowStepRow: React.FC<WorkflowStepRowProps> = (props) => {
         </span>
       )}
       {step.status === "running" && (
-        <span className="text-accent shrink-0 text-[11px]">running…</span>
+        <span className="text-accent-text shrink-0 text-[11px]">running…</span>
       )}
       {step.status === "failed" && (
         <span className="shrink-0 text-[11px]" style={{ color }}>
@@ -367,6 +367,7 @@ const WorkflowStepRow: React.FC<WorkflowStepRowProps> = (props) => {
                     <div className="text-content-secondary text-[12.5px]">
                       <WorkflowLongText
                         markdown
+                        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
                         text={step.result!.reportMarkdown}
                         title={`${step.title} — report`}
                       />

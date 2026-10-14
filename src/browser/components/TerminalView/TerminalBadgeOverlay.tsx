@@ -1,10 +1,7 @@
 import React from "react";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { useUserPreferences } from "@/browser/stores/AppConfigStore";
 import {
-  DEFAULT_TERMINAL_BADGE_CONFIG,
-  TERMINAL_BADGE_CONFIG_KEY,
   normalizeTerminalBadgeConfig,
-  type TerminalBadgeConfig,
   type TerminalBadgePosition,
 } from "@/common/constants/storage";
 import { formatTerminalBadge } from "@/browser/utils/terminalBadgeTemplate";
@@ -32,10 +29,8 @@ interface TerminalBadgeOverlayProps {
  * disabled so clicks, drags, and text selection behave as if it were absent.
  */
 export const TerminalBadgeOverlay: React.FC<TerminalBadgeOverlayProps> = (props) => {
-  const [rawConfig] = usePersistedState<TerminalBadgeConfig>(
-    TERMINAL_BADGE_CONFIG_KEY,
-    DEFAULT_TERMINAL_BADGE_CONFIG,
-    { listener: true }
+  const rawConfig = useUserPreferences(
+    (preferences) => preferences.appearance?.terminalBadgeConfig
   );
   const config = normalizeTerminalBadgeConfig(rawConfig);
 

@@ -1,4 +1,5 @@
 import * as fs from "fs/promises";
+import { getWorkspaceScratchDir } from "./workspaceScratchDir";
 import * as path from "path";
 import type { Runtime, WorkspaceInitParams, WorkspaceInitResult } from "./Runtime";
 import { LocalRuntime } from "./LocalRuntime";
@@ -107,6 +108,18 @@ export async function withInitUseLease<T>(
   }
 }
 
+/**
+ * Whether new devcontainer runtimes bind-mount the workspace scratch dir. Only with the Artifacts
+ * experiment, like remote scratch dirs in agent turns and terminals (turnRequestBuilder,
+ * TerminalService): a daemon that refuses the mount source must never break `devcontainer up` for
+ * users who did not opt in. Registered by the layer that owns ExperimentsService; off until then.
+ */
+let isDevcontainerScratchMountEnabled: () => boolean = () => false;
+
+export function setDevcontainerScratchMountGate(gate: () => boolean): void {
+  isDevcontainerScratchMountEnabled = gate;
+}
+
 function shouldUseSSH2Runtime(): boolean {
   // Windows always uses SSH2 (no native OpenSSH)
   if (process.platform === "win32") {
@@ -148,6 +161,11 @@ export interface CreateRuntimeOptions {
    * Used by devcontainer runtimes to preserve the exact host path from startup.
    */
   workspacePath?: string;
+  /**
+   * Workspace id, when known. Devcontainers use it to bind-mount the workspace's host scratch
+   * dir (see DevcontainerRuntimeOptions.scratchMountDir).
+   */
+  workspaceId?: string;
   /**
    * Coder service - required for SSH runtimes with Coder configuration.
    * When provided and config has coder field, returns a Coder SSH runtime (SSH/SSH2).
@@ -248,10 +266,15 @@ export function createRuntime(config: RuntimeConfig, options?: CreateRuntimeOpti
     case "devcontainer": {
       // Devcontainer uses worktrees on host + container exec
       // srcBaseDir sourced from config to honor MUX_ROOT and dev-mode suffixes
+      const xumConfig = new Config();
       const runtime = new DevcontainerRuntime({
-        srcBaseDir: new Config().srcDir,
+        srcBaseDir: xumConfig.srcDir,
         configPath: config.configPath,
         shareCredentials: config.shareCredentials,
+        scratchMountDir:
+          options?.workspaceId != null && isDevcontainerScratchMountEnabled()
+            ? getWorkspaceScratchDir(xumConfig.sessionsDir, options.workspaceId)
+            : undefined,
       });
       // Set workspace path for existing workspaces
       // For existing workspaces, prefer the persisted workspacePath — Docker labels

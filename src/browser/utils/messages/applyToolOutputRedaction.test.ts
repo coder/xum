@@ -284,4 +284,41 @@ describe("applyToolOutputRedaction", () => {
     expect(nestedOutput?.error).not.toBe("Nested bad body \u0000");
     expect(nestedOutput?.error).toEqual(expect.stringContaining("nul=1"));
   });
+
+  it("replays long tool output strings in full for top-level and nested tools", () => {
+    // In-turn steps send the tool's full string, so the rebuild must not cut it either.
+    const longText = "line\n".repeat(5_000);
+    const messages: MuxMessage[] = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "tool-1",
+            toolName: "code_execution",
+            input: {},
+            state: "output-available",
+            output: { success: true, content: longText },
+            nestedCalls: [
+              {
+                toolCallId: "nested-tool-1",
+                toolName: "file_read",
+                input: {},
+                state: "output-available",
+                output: { success: true, content: longText },
+              },
+            ],
+          },
+        ],
+      },
+    ];
+
+    const part = applyToolOutputRedaction(messages)[0]?.parts[0];
+    if (part?.type !== "dynamic-tool" || part.state !== "output-available") {
+      throw new Error("Expected dynamic tool output");
+    }
+    expect(part.output).toEqual({ success: true, content: longText });
+    expect(part.nestedCalls?.[0]?.output).toEqual({ success: true, content: longText });
+  });
 });

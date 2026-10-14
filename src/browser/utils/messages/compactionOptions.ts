@@ -5,8 +5,7 @@
  * Used by both ChatInput (initial send) and RetryBarrier manual resume actions.
  */
 
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
-import { AGENT_AI_DEFAULTS_KEY } from "@/common/constants/storage";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { CompactionRequestData } from "@/common/types/message";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
@@ -23,7 +22,7 @@ import {
  * transforms workspace defaults. Both initial sends and stream resumption
  * use this function to ensure consistent behavior.
  *
- * @param baseOptions - Workspace default options (from localStorage or useSendMessageOptions)
+ * @param baseOptions - Workspace default options (from getSendOptionsFromStorage or useSendMessageOptions)
  * @param compactData - Compaction request metadata from /compact command
  * @returns Final SendMessageOptions with compaction overrides applied
  */
@@ -32,7 +31,7 @@ export function applyCompactionOverrides(
   compactData: CompactionRequestData
 ): SendMessageOptions {
   const compactionModelOverride = compactData.model?.trim();
-  const agentAiDefaults = readPersistedState<AgentAiDefaults>(AGENT_AI_DEFAULTS_KEY, {});
+  const agentAiDefaults: AgentAiDefaults = getAppConfigStore().getSnapshot()?.agentAiDefaults ?? {};
 
   // Unified resolution as agent "compact": the /compact -m flag is the
   // explicit tier, configured compact defaults (and their base chain, so a

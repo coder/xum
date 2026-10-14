@@ -11,12 +11,8 @@ import {
   TooltipTrigger,
 } from "@/browser/components/Tooltip/Tooltip";
 import { useAPI } from "@/browser/contexts/API";
-import { useAutoModelRouting } from "@/browser/hooks/useAutoModelRouting";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
-import {
-  splitAutoModelRoutingEvaluationModel,
-  type AutoModelRoutingEvaluationStatus,
-} from "@/common/types/autoModelRouting";
+import type { AutoModelRoutingEvaluationStatus } from "@/common/types/autoModelRouting";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL,
@@ -37,7 +33,6 @@ interface TypeSafeProviderCardProps {
 export function TypeSafeProviderCard(props: TypeSafeProviderCardProps) {
   const { api } = useAPI();
   const { config: providersConfig } = useProvidersConfig();
-  const { config: routingConfig } = useAutoModelRouting();
   const [status, setStatus] = useState<AutoModelRoutingEvaluationStatus | null>(null);
   // Bumped after a key write so the status re-checks without waiting for a config event.
   const [statusRefresh, setStatusRefresh] = useState(0);
@@ -70,21 +65,15 @@ export function TypeSafeProviderCard(props: TypeSafeProviderCardProps) {
     }
   };
 
-  // Probe the TypeSafe evaluator the user actually saved: an enforced policy can allow that
-  // model while denying the default one, and the credential is usable either way.
-  const probeModel =
-    splitAutoModelRoutingEvaluationModel(routingConfig.evaluationModel).provider ===
-    TYPESAFE_PROVIDER_KEY
-      ? routingConfig.evaluationModel
-      : DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL;
-
   // The backend resolves the key from providers.jsonc, the key file, or env vars, so the
   // evaluator status is the one source of truth for "configured".
   useEffect(() => {
     if (!api) return;
     let cancelled = false;
     api.config
-      .getAutoModelRoutingEvaluationStatus({ evaluationModel: probeModel })
+      .getAutoModelRoutingEvaluationStatus({
+        evaluationModel: DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL,
+      })
       .then((next) => {
         if (!cancelled) setStatus(next);
       })
@@ -92,7 +81,7 @@ export function TypeSafeProviderCard(props: TypeSafeProviderCardProps) {
     return () => {
       cancelled = true;
     };
-  }, [api, probeModel, statusRefresh, providersConfig]);
+  }, [api, statusRefresh, providersConfig]);
 
   const configured = status?.available === true;
   const statusTitle = status == null ? "Checking" : configured ? "Configured" : "Not configured";

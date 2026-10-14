@@ -2,7 +2,7 @@ import React from "react";
 import { ChevronRight, EyeOff } from "lucide-react";
 import { z } from "zod";
 import { cn } from "@/common/lib/utils";
-import { AgentSkillDescriptorSchema } from "@/common/orpc/schemas";
+import { AgentSkillDescriptorSchema } from "@/common/orpc/schemas/agentSkill";
 import type { AgentSkillDescriptor, AgentSkillScope } from "@/common/types/agentSkill";
 import type { AgentSkillListToolArgs } from "@/common/types/tools";
 import {

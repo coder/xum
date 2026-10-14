@@ -14,8 +14,7 @@ import { collapseLeftSidebar } from "./helpers/uiState";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
 import { createMockORPCClient } from "./mocks/orpc";
 import { FALLBACK_AGENTS } from "@/browser/features/Settings/Sections/TasksSection.agents";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 
 export default {
   ...appMeta,
@@ -164,16 +163,16 @@ export const ReasoningSettings: AppStory = {
   render: () => (
     <AppWithMocks
       setup={() => {
-        updatePersistedState(getExperimentKey(EXPERIMENT_IDS.MEMORY), true);
-        updatePersistedState(getExperimentKey(EXPERIMENT_IDS.MEMORY_INTUITION), true);
-        updatePersistedState(getExperimentKey(EXPERIMENT_IDS.ADVISOR_TOOL), true);
         return createMockORPCClient({
+          experiments: {
+            [EXPERIMENT_IDS.MEMORY]: true,
+            [EXPERIMENT_IDS.MEMORY_INTUITION]: true,
+          },
           agentDefinitions: FALLBACK_AGENTS,
           agentAiDefaults: {
             intuition: {
               modelString: "openai:gpt-6.1-sol",
               thinkingLevel: "high",
-              advisorEnabled: true,
             },
           },
         });
@@ -199,8 +198,6 @@ export const ReasoningSettings: AppStory = {
     card.scrollIntoView({ block: "center" });
     await expect(within(card).getByRole("combobox")).toBeVisible();
     await expect(within(card).getAllByRole("switch")).toHaveLength(1);
-    await expect(within(card).queryByLabelText("Toggle intuition advisor")).toBeNull();
-    await expect(settings.getByLabelText("Toggle name_workspace advisor")).toBeInTheDocument();
     const reasoning = within(card).getByRole("button", { name: "Reasoning" });
     await expect(reasoning).toHaveTextContent("High");
     await userEvent.click(reasoning);

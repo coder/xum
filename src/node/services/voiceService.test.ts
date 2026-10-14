@@ -4,25 +4,18 @@ import * as os from "os";
 import * as path from "path";
 import { MUX_GATEWAY_ORIGIN } from "@/common/constants/muxGatewayOAuth";
 import { Config, ProvidersConfigStore } from "@/node/config";
-import { PolicyService } from "@/node/services/policyService";
 import { ProviderService } from "./providerService";
 import { VoiceService } from "./voiceService";
 
 async function withTempConfig(
-  run: (
-    config: Config,
-    service: VoiceService,
-    providerService: ProviderService,
-    policyService: PolicyService
-  ) => Promise<void>
+  run: (config: Config, service: VoiceService, providerService: ProviderService) => Promise<void>
 ): Promise<void> {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-voice-service-"));
   try {
     const config = new Config(tmpDir);
     const providerService = new ProviderService(config);
-    const policyService = new PolicyService(config);
-    const service = new VoiceService(config, providerService, policyService);
-    await run(config, service, providerService, policyService);
+    const service = new VoiceService(config, providerService);
+    await run(config, service, providerService);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -272,77 +265,6 @@ describe("VoiceService.transcribe", () => {
         });
         expect(fetchSpy).not.toHaveBeenCalled();
       } finally {
-        fetchSpy.mockRestore();
-      }
-    });
-  });
-
-  it("falls back to OpenAI when policy disallows mux-gateway", async () => {
-    await withTempConfig(async (config, service, _providerService, policyService) => {
-      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-        "mux-gateway": {
-          couponCode: "gateway-token",
-        },
-        openai: {
-          apiKey: "sk-test",
-        },
-      });
-
-      const allowSpy = spyOn(policyService, "isProviderAllowed");
-      allowSpy.mockImplementation((provider) => provider !== "mux-gateway");
-      const fetchSpy = spyOn(globalThis, "fetch");
-      fetchSpy.mockResolvedValue(new Response("transcribed text"));
-
-      try {
-        const result = await service.transcribe("Zm9v");
-
-        expect(result).toEqual({ success: true, data: "transcribed text" });
-        expect(fetchSpy).toHaveBeenCalledTimes(1);
-
-        const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit | undefined];
-        expect(url).toBe("https://api.openai.com/v1/audio/transcriptions");
-        expect(init?.headers).toEqual({
-          Authorization: "Bearer sk-test",
-        });
-      } finally {
-        allowSpy.mockRestore();
-        fetchSpy.mockRestore();
-      }
-    });
-  });
-
-  it("uses policy forced base URL for gateway transcription", async () => {
-    await withTempConfig(async (config, service, _providerService, policyService) => {
-      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-        "mux-gateway": {
-          couponCode: "gateway-token",
-          baseURL: "https://config.example.com/config-prefix/api/v1/ai-gateway/v1/ai",
-        },
-      });
-
-      const forcedBaseUrlSpy = spyOn(policyService, "getForcedBaseUrl");
-      forcedBaseUrlSpy.mockReturnValue(
-        "https://policy.example.com/policy-prefix/api/v1/ai-gateway/v1/ai"
-      );
-      const fetchSpy = spyOn(globalThis, "fetch");
-      fetchSpy.mockResolvedValue(new Response("transcribed text"));
-
-      try {
-        const result = await service.transcribe("Zm9v");
-
-        expect(result).toEqual({ success: true, data: "transcribed text" });
-        expect(forcedBaseUrlSpy).toHaveBeenCalledWith("mux-gateway");
-        expect(fetchSpy).toHaveBeenCalledTimes(1);
-
-        const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit | undefined];
-        expect(url).toBe(
-          "https://policy.example.com/policy-prefix/api/v1/openai/v1/audio/transcriptions"
-        );
-        expect(init?.headers).toEqual({
-          Authorization: "Bearer gateway-token",
-        });
-      } finally {
-        forcedBaseUrlSpy.mockRestore();
         fetchSpy.mockRestore();
       }
     });

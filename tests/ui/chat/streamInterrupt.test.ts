@@ -18,7 +18,7 @@ jest.mock("lottie-react", () => ({
   __esModule: true,
   default: () => null,
 }));
-import { waitFor } from "@testing-library/react";
+import { fireEvent, waitFor } from "@testing-library/react";
 
 import { preloadTestModules } from "../../ipc/setup";
 import { createStreamCollector } from "../../ipc/streamCollector";
@@ -128,6 +128,31 @@ describe("Stream Interrupt UI (mock AI router)", () => {
       expect(hydrationRetryButton).toBeUndefined();
     } finally {
       collector.stop();
+      await app.dispose();
+    }
+  }, 60_000);
+
+  // #5111: a context_exceeded error keeps the turn interrupted but shows no retry barrier, so Esc
+  // has nothing visible to stop. It must not send a Stop, which would persist an auto-retry opt-out.
+  test("Esc after a context_exceeded error sends no Stop", async () => {
+    const app = await createAppHarness({ branchPrefix: "stream-interrupt-context" });
+    const workspaceService = app.env.services.toORPCContext().workspaceService;
+    const interruptSpy = jest.spyOn(workspaceService, "interruptStream");
+
+    try {
+      await app.chat.send("trigger context error");
+      await app.chat.expectTranscriptContains("Context length exceeded in mock stream.", 30_000);
+      await app.chat.expectStreamComplete();
+      expect(app.view.container.textContent ?? "").not.toContain("Stream interrupted");
+
+      interruptSpy.mockClear();
+      fireEvent.keyDown(document.body, { key: "Escape" });
+      // The Stop is dispatched synchronously from the key handler; give its request a turn.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      expect(interruptSpy).not.toHaveBeenCalled();
+    } finally {
+      interruptSpy.mockRestore();
       await app.dispose();
     }
   }, 60_000);

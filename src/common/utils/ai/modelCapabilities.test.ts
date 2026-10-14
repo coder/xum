@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { extractModelCapabilities, getModelCapabilities } from "./modelCapabilities";
 
 describe("getModelCapabilities", () => {
@@ -21,6 +22,15 @@ describe("getModelCapabilities", () => {
     const caps = getModelCapabilities("anthropic:claude-opus-4-6");
     expect(caps).not.toBeNull();
     expect(caps?.supportsPdfInput).toBe(true);
+  });
+
+  it("keeps PDF and image input for the haiku alias after it moved off a models.json entry", () => {
+    // Haiku 4.5 got supports_pdf_input from models.json; Haiku 5.5 exists only in
+    // models-extra, so a missing flag there rejects PDF attachments on the alias.
+    const caps = getModelCapabilities(KNOWN_MODELS.HAIKU.id);
+    expect(caps).not.toBeNull();
+    expect(caps?.supportsPdfInput).toBe(true);
+    expect(caps?.supportsVision).toBe(true);
   });
 
   it("resolves provider key aliases (github-copilot -> github_copilot)", () => {

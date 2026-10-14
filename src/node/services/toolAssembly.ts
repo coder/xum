@@ -14,16 +14,6 @@ import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPr
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
-  EXPERIMENT_IDS,
-  isTokenBudgetActive,
-  type ExperimentId,
-} from "@/common/constants/experiments";
-import type { SendMessageOptions } from "@/common/orpc/types";
-
-/** Renderer-sent experiment flags (SendMessageOptions.experiments). */
-type SendMessageExperiments = SendMessageOptions["experiments"];
-
-import {
   applyToolPolicy,
   applyToolPolicyToNames,
   buildRequiredToolPatterns,
@@ -141,32 +131,6 @@ export interface ApplyToolPolicyAndExperimentsOptions {
 /** Env opt-in for persistent code_execution mounts (dogfooding/Track 2). */
 export function persistentSandboxMountsEnabled(): boolean {
   return resolveXumEnvironmentValue("SANDBOX_PERSISTENT_MOUNTS", process.env) === "1";
-}
-
-/**
- * Backfill the PTC/RLM experiment pair from the backend's persisted overrides
- * (same `?? isExperimentEnabled` pattern as other backend-gated experiments in
- * streamMessage). A renderer with no origin-local override sends `undefined`
- * for these flags while the effective UI and /refine gate resolve against the
- * backend override — tool assembly must agree or a persisted-RLM workspace
- * silently streams with the non-persistent flat/PTC toolset. Explicit
- * renderer values (true or false) always win over the backend fallback.
- */
-export function resolveBackendGatedPtcExperiments(
-  experiments: SendMessageExperiments | undefined,
-  isExperimentEnabled: (experimentId: ExperimentId) => boolean
-): NonNullable<SendMessageExperiments> {
-  return {
-    ...experiments,
-    programmaticToolCalling:
-      experiments?.programmaticToolCalling ??
-      isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
-    rlm: experiments?.rlm ?? isExperimentEnabled(EXPERIMENT_IDS.RLM),
-    tokenBudget: isTokenBudgetActive(experiments, isExperimentEnabled),
-    continuousCompaction:
-      experiments?.continuousCompaction ??
-      isExperimentEnabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION),
-  };
 }
 
 /** Same name, description and schema; execute refuses before any side effect (#5253). */

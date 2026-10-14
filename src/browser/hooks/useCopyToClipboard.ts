@@ -1,6 +1,8 @@
 import { useState, useCallback } from "react";
 import { COPY_FEEDBACK_DURATION_MS } from "@/common/constants/ui";
 import { copyToClipboard as copyToClipboardUtil } from "@/browser/utils/clipboard";
+import { showFeedbackToast } from "@/browser/utils/feedbackToast";
+import { getErrorMessage } from "@/common/utils/errors";
 
 /**
  * Hook for copy-to-clipboard functionality with temporary "copied" feedback state.
@@ -23,6 +25,12 @@ export function useCopyToClipboard(
         setTimeout(() => setCopied(false), COPY_FEEDBACK_DURATION_MS);
       } catch (err) {
         console.error("Failed to copy:", err);
+        // Without this the button just does nothing, and the user pastes stale clipboard text.
+        showFeedbackToast({
+          type: "error",
+          title: "Could not copy",
+          message: `The clipboard rejected the copy: ${getErrorMessage(err)}`,
+        });
       }
     },
     [clipboardWriteText]

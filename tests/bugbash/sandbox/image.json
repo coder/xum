@@ -1,0 +1,7 @@
+{
+  "image": "ghcr.io/coder/xum-bugbash-sandbox",
+  "digest": "sha256:e292cecf2a92b3ff75e38cc18d934de115b9079a328effbcd328eb5461057da2",
+  "inputsKey": "a4857a86e1f6eb70d9cc767a49b8cacdd11dbbfdb262e39a74e437ebccdd5da1",
+  "playwrightCore": "1.63.0",
+  "publishedFrom": "460a5179f82ba80536b0b96257bafa75e973ab8c"
+}

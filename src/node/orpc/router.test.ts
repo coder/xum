@@ -1,11 +1,17 @@
 /* eslint-disable @typescript-eslint/await-thenable, @typescript-eslint/no-unsafe-argument, @typescript-eslint/require-await, local/no-sync-fs-methods */
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { createRouterClient, ORPCError } from "@orpc/server";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { Context, Effect } from "effect";
 import { Config } from "@/node/config";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import {
+  EXPERIMENT_OVERRIDES_FILE_NAME,
+  ExperimentsService,
+} from "@/node/services/experimentsService";
+import type { TelemetryService } from "@/node/services/telemetryService";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { draftTooLargeMessage, isDraftTooLargeError } from "@/common/utils/drafts";
 import type { AutoModelRoutingDecision } from "@/common/types/autoModelRouting";
@@ -158,22 +164,6 @@ describe("router drafts.update", () => {
   });
 });
 
-describe("router providers.searchModelCatalog", () => {
-  test("filters by the effective policy before counting and paging", async () => {
-    const context = {
-      policyService: {
-        isModelAllowed: (provider: string, modelId: string) =>
-          provider === "anthropic" && modelId === "claude-fable-5",
-      },
-    } as unknown as ORPCContext;
-    const client = createRouterClient(router(), { context });
-
-    const result = await client.providers.searchModelCatalog({ query: "fable", limit: 1 });
-    expect(result.models.map((model) => model.id)).toEqual(["anthropic:claude-fable-5"]);
-    expect([result.total, result.nextOffset]).toEqual([1, null]);
-  });
-});
-
 describe("router terminal.create", () => {
   test("a structural mutation's refusal reaches the client with its message (#4476)", async () => {
     const message = "Workspace ws-1 is being renamed, removed or archived by pid 42";
@@ -267,7 +257,7 @@ describe("router agent skill routes", () => {
       } as unknown as ORPCContext;
       const client = createRouterClient(router(), { context });
 
-      const skills = await client.agentSkills.list({ workspaceId: "workspace-1" });
+      const { skills } = await client.agentSkills.list({ workspaceId: "workspace-1" });
       expect(skills.find((skill) => skill.name === "parent-only")).toMatchObject({
         description: "from checkout",
         scope: "project",
@@ -338,7 +328,9 @@ describe("router agent skill routes", () => {
       } as unknown as ORPCContext;
       const client = createRouterClient(router(), { context });
 
-      await expect(client.agentSkills.list({ workspaceId: "workspace-1" })).resolves.toContainEqual(
+      await expect(
+        client.agentSkills.list({ workspaceId: "workspace-1" }).then((result) => result.skills)
+      ).resolves.toContainEqual(
         expect.objectContaining({
           name: "parent-only",
           description: "Parent skill",
@@ -384,7 +376,7 @@ describe("router agent skill routes", () => {
       const client = createRouterClient(router(), { context });
 
       await expect(
-        client.agentSkills.list({ projectPath: subProjectPath })
+        client.agentSkills.list({ projectPath: subProjectPath }).then((result) => result.skills)
       ).resolves.toContainEqual(
         expect.objectContaining({
           name: "parent-only",
@@ -412,9 +404,155 @@ describe("router config transcript mutation", () => {
   });
 
   function createContext(): ORPCContext {
-    // eslint-disable-next-line @typescript-eslint/consistent-type-assertions -- Only Config is used by this route.
-    return { config } as ORPCContext;
+    const telemetryService = {
+      setFeatureFlagVariant: () => undefined,
+    } as unknown as TelemetryService;
+    return {
+      config,
+      experimentsService: new ExperimentsService({ telemetryService, xumHome: tempDir }),
+      taskService: { maybeStartQueuedTasks: () => Promise.resolve() },
+      perfFlightRecorder: {
+        beginRpcCall: () => null,
+        openRpcSubscription: () => null,
+        setEnabled: () => undefined,
+      },
+      perfCaptures: { setEnabled: () => undefined },
+    } as unknown as ORPCContext;
   }
+
+  test("experiments.set signals onConfigChanged and the next getConfig carries the value", async () => {
+    const client = createRouterClient(router(), { context: createContext() });
+    const ptc = EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING;
+    expect((await client.config.getConfig()).experiments[ptc]).toBe(false);
+
+    const controller = new AbortController();
+    const changes = await client.config.onConfigChanged(undefined, { signal: controller.signal });
+    const changed = changes.next();
+    await client.experiments.set({ experimentId: ptc, enabled: true });
+    expect((await changed).done).toBe(false);
+    controller.abort();
+
+    expect((await client.config.getConfig()).experiments[ptc]).toBe(true);
+  });
+
+  test("getConfig adopts experiment writes another backend made on disk", async () => {
+    const context = createContext();
+    const recorderEnabled = spyOn(context.perfFlightRecorder, "setEnabled");
+    const client = createRouterClient(router(), { context });
+    const ptc = EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING;
+    const perf = EXPERIMENT_IDS.PERF_FLIGHT_RECORDER;
+    expect((await client.config.getConfig()).experiments[ptc]).toBe(false);
+
+    fs.writeFileSync(
+      path.join(tempDir, EXPERIMENT_OVERRIDES_FILE_NAME),
+      JSON.stringify({ version: 1, experiments: {}, overrides: { [ptc]: true, [perf]: true } })
+    );
+
+    expect((await client.config.getConfig()).experiments[ptc]).toBe(true);
+    expect(recorderEnabled).toHaveBeenLastCalledWith(true);
+  });
+
+  test("updateUserPreferences refuses an invalid value and keeps the stored one", async () => {
+    const client = createRouterClient(router(), { context: createContext() });
+    await client.config.updateUserPreferences({
+      patches: [{ appearance: { transcriptDensity: "hyper" } }],
+    });
+
+    const outcome = await client.config
+      .updateUserPreferences({ patches: [{ appearance: { transcriptDensity: "bogus" } }] })
+      .then(
+        () => "resolved",
+        (error: ORPCError<string, unknown>) => error.code
+      );
+
+    expect(outcome).toBe("BAD_REQUEST");
+    expect(new Config(tempDir).loadConfigOrDefault().userPreferences).toEqual({
+      appearance: { transcriptDensity: "hyper" },
+    });
+  });
+
+  test("updateUserPreferences refuses values that loading would discard", async () => {
+    const client = createRouterClient(router(), { context: createContext() });
+    const stored = {
+      navigation: { projectOrder: ["/repo/a"] },
+      ai: { projectDefaults: { "/repo/a": { model: "openai:gpt-4.1" } } },
+    };
+    await client.config.updateUserPreferences({ patches: [stored] });
+
+    const badge = { enabled: true, template: "", position: "top-left", fontSize: 20, opacity: 0 };
+    for (const patch of [
+      { ai: { projectDefaults: { "/repo/a": { model: "nonsense" } } } },
+      { ai: { projectDefaults: { "/repo/a": { agentId: " " } } } },
+      { ai: { globalDefaults: { agentId: " " } } },
+      { navigation: { projectOrder: ["/repo/a", " "] } },
+      { appearance: { terminalBadgeConfig: badge } },
+      { appearance: { terminalFontConfig: { fontFamily: " " } } },
+      { appearance: { editorConfig: { editor: "custom", customCommand: " " } } },
+      { workspaceCreation: { byProject: { "/repo/a": { trunkBranch: " " } } } },
+      { review: { defaultBaseByProject: { "/repo/a": " " } } },
+    ]) {
+      const outcome = await client.config.updateUserPreferences({ patches: [patch] }).then(
+        () => "resolved",
+        (error: ORPCError<string, unknown>) => error.code
+      );
+      expect(outcome).toBe("BAD_REQUEST");
+    }
+    expect(new Config(tempDir).loadConfigOrDefault().userPreferences).toEqual(stored);
+  });
+
+  test("terminal font family and size are patched and cleared independently", async () => {
+    const clientA = createRouterClient(router(), { context: createContext() });
+    const clientB = createRouterClient(router(), { context: createContext() });
+
+    await clientA.config.updateUserPreferences({
+      patches: [{ appearance: { terminalFontConfig: { fontSize: 16 } } }],
+    });
+    await clientB.config.updateUserPreferences({
+      patches: [{ appearance: { terminalFontConfig: { fontFamily: "Menlo" } } }],
+    });
+    await clientB.config.updateUserPreferences({
+      patches: [{ appearance: { terminalFontConfig: { fontFamily: null } } }],
+    });
+
+    expect(new Config(tempDir).loadConfigOrDefault().userPreferences).toEqual({
+      appearance: { terminalFontConfig: { fontSize: 16 } },
+    });
+  });
+
+  test("updateUserPreferences merges patches from separate clients and null deletes a key", async () => {
+    const clientA = createRouterClient(router(), { context: createContext() });
+    const clientB = createRouterClient(router(), { context: createContext() });
+
+    await clientA.config.updateUserPreferences({
+      patches: [{ appearance: { vimEnabled: true } }],
+    });
+    await clientB.config.updateUserPreferences({
+      patches: [{ appearance: { theme: "dark" } }, { navigation: { launchBehavior: "new-chat" } }],
+    });
+    expect(new Config(tempDir).loadConfigOrDefault().userPreferences).toEqual({
+      appearance: { vimEnabled: true, theme: "dark" },
+      navigation: { launchBehavior: "new-chat" },
+    });
+
+    await clientA.config.updateUserPreferences({ patches: [{ appearance: { vimEnabled: null } }] });
+    expect((await clientB.config.getConfig()).userPreferences).toEqual({
+      appearance: { theme: "dark" },
+      navigation: { launchBehavior: "new-chat" },
+    });
+  });
+
+  test("saveConfig ignores a full userPreferences snapshot from an old bundle", async () => {
+    const client = createRouterClient(router(), { context: createContext() });
+    await client.config.updateUserPreferences({ patches: [{ appearance: { theme: "dark" } }] });
+
+    await client.config.saveConfig({
+      userPreferences: { appearance: { theme: "light" } },
+    } as Parameters<typeof client.config.saveConfig>[0]);
+
+    expect(new Config(tempDir).loadConfigOrDefault().userPreferences).toEqual({
+      appearance: { theme: "dark" },
+    });
+  });
 
   test("persists the full-width chat transcript config flag", async () => {
     const client = createRouterClient(router(), { context: createContext() });
@@ -444,6 +582,19 @@ describe("router config transcript mutation", () => {
     expect((await client.config.getConfig()).keepScreenAwake).toBe(false);
     expect(config.loadConfigOrDefault().keepScreenAwake).toBeUndefined();
     expect(config.getKeepScreenAwakeEnabled()).toBe(false);
+  });
+
+  test("persists the tool-search opt-out and treats an absent key as enabled", async () => {
+    const client = createRouterClient(router(), { context: createContext() });
+
+    expect((await client.config.getConfig()).toolSearchEnabled).toBe(true);
+    await client.config.updateToolSearchEnabled({ enabled: false });
+    expect((await client.config.getConfig()).toolSearchEnabled).toBe(false);
+    expect(new Config(config.rootDir).loadConfigOrDefault().toolSearchEnabled).toBe(false);
+
+    await client.config.updateToolSearchEnabled({ enabled: true });
+    expect((await client.config.getConfig()).toolSearchEnabled).toBe(true);
+    expect(new Config(config.rootDir).loadConfigOrDefault().toolSearchEnabled).toBeUndefined();
   });
 
   test("refuses procedure calls once the server has begun shutting down", async () => {

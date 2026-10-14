@@ -7,12 +7,10 @@ import * as ReactDndModule from "react-dnd";
 import * as ReactDndHtml5BackendModule from "react-dnd-html5-backend";
 import * as ReactColorfulModule from "react-colorful";
 import { installDom } from "../../../../tests/ui/dom";
-import {
-  EXPANDED_PROJECTS_KEY,
-  SIDEBAR_FLAT_MODE_KEY,
-  SIDEBAR_HIDE_SUBAGENTS_KEY,
-} from "@/common/constants/storage";
+import { EXPANDED_PROJECTS_KEY } from "@/common/constants/storage";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { getDraftStore } from "@/browser/stores/DraftStore";
+import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_SIDEBAR_SECTION_ID } from "@/common/constants/scratch";
 import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
@@ -218,8 +216,13 @@ function setupProjectSidebarDom(projectPath = "/projects/demo-project") {
   installProjectSidebarTestDoubles();
 }
 
+function setSidebarPreferences(ui: NonNullable<UserPreferences["ui"]>) {
+  getAppConfigStore().updateOptimistically({ userPreferences: { ui } });
+}
+
 function cleanupProjectSidebarDom() {
   cleanup();
+  getAppConfigStore().updateOptimistically({ userPreferences: undefined });
   cleanupDom?.();
   cleanupDom = null;
   mock.restore();
@@ -539,6 +542,9 @@ function installProjectSidebarTestDoubles() {
     navigateFromSettings: () => undefined,
     navigateToAnalytics: () => undefined,
     navigateFromAnalytics: () => undefined,
+    navigateBack: () => undefined,
+    navigateForward: () => undefined,
+    usesBrowserHistory: false,
     currentWorkspaceId: null,
     currentSettingsSection: null,
     currentProjectId: null,
@@ -822,7 +828,7 @@ describe("ProjectSidebar scratch chats", () => {
         ["/projects/beta", { displayName: "Beta Project", color: "Green", workspaces: [] }],
       ]),
     });
-    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+    setSidebarPreferences({ sidebarFlatMode: true });
 
     const view = render(
       <ProjectSidebar
@@ -856,7 +862,7 @@ describe("ProjectSidebar scratch chats", () => {
     ]);
 
     act(() => {
-      updatePersistedState(SIDEBAR_FLAT_MODE_KEY, false);
+      setSidebarPreferences({ sidebarFlatMode: false });
     });
     await waitFor(() => {
       expect(view.getByLabelText("Expand project alpha")).toBeTruthy();
@@ -935,6 +941,53 @@ describe("ProjectSidebar scratch chats", () => {
   });
 });
 
+describe("ProjectSidebar title keys", () => {
+  // setupProjectSidebarDom loads ProjectSidebar behind the shared test doubles.
+  beforeEach(() => setupProjectSidebarDom());
+
+  afterEach(cleanupProjectSidebarDom);
+
+  // The collapsed sidebar renders no rows, but Shift+F2 needs none (#6328).
+  test("Shift+F2 generates the selected workspace's title with the sidebar collapsed", async () => {
+    const workspace = createWorkspace("title-target");
+    mockWorkspaceActions({
+      selectedWorkspace: {
+        workspaceId: workspace.id,
+        projectPath: workspace.projectPath,
+        projectName: workspace.projectName,
+        namedWorkspacePath: workspace.namedWorkspacePath,
+      },
+    });
+    const regenerateTitle = mock((_input: { workspaceId: string }) =>
+      Promise.resolve({ success: true as const, data: { title: "Generated" } })
+    );
+    const api = { workspace: { regenerateTitle } } as unknown as NonNullable<
+      ReturnType<typeof APIModule.useAPI>["api"]
+    >;
+    spyOn(APIModule, "useAPI").mockImplementation(() => ({
+      api,
+      status: "connected",
+      error: null,
+      authenticate: () => undefined,
+      retry: () => undefined,
+    }));
+
+    render(
+      <ProjectSidebar
+        collapsed={true}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([[workspace.projectPath, [workspace]]])}
+        workspaceRecency={{ [workspace.id]: Date.now() }}
+      />
+    );
+    fireEvent.keyDown(window, { key: "F2", shiftKey: true });
+
+    await waitFor(() =>
+      expect(regenerateTitle).toHaveBeenCalledWith({ workspaceId: workspace.id })
+    );
+  });
+});
+
 describe("ProjectSidebar flat chat list", () => {
   beforeEach(() => {
     setupProjectSidebarDom();
@@ -943,7 +996,7 @@ describe("ProjectSidebar flat chat list", () => {
       default: typeof ProjectSidebarComponent;
     });
     /* eslint-enable @typescript-eslint/no-require-imports */
-    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+    setSidebarPreferences({ sidebarFlatMode: true });
   });
 
   afterEach(cleanupProjectSidebarDom);
@@ -1146,7 +1199,7 @@ describe("ProjectSidebar flat chat list", () => {
       { kind: "creation", projectPath: "/projects/demo-project", draftId: "draft-single" },
       "Single draft"
     );
-    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+    setSidebarPreferences({ sidebarFlatMode: true });
 
     const view = render(
       <ProjectSidebar
@@ -1195,7 +1248,7 @@ describe("ProjectSidebar flat chat list", () => {
       { kind: "creation", projectPath: "_multi", draftId: "draft-multi-badge" },
       "Multi draft"
     );
-    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+    setSidebarPreferences({ sidebarFlatMode: true });
 
     const view = render(
       <ProjectSidebar
@@ -1218,7 +1271,7 @@ describe("ProjectSidebar flat chat list", () => {
       ...createWorkspace("solo", { title: "Solo chat" }),
       projects: singleProjectRefs,
     };
-    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+    setSidebarPreferences({ sidebarFlatMode: true });
     // Grouped-mode expansion state must not nest chats under flat headers.
     updatePersistedState(EXPANDED_PROJECTS_KEY, ["/projects/demo-project"]);
 
@@ -1288,7 +1341,7 @@ describe("ProjectSidebar flat chat list", () => {
           deleteWorkspaceDraft: () => undefined,
         }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
     );
-    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+    setSidebarPreferences({ sidebarFlatMode: true });
 
     const view = render(
       <ProjectSidebar
@@ -1363,7 +1416,7 @@ describe("ProjectSidebar flat chat list", () => {
         ],
       ]),
     });
-    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+    setSidebarPreferences({ sidebarFlatMode: true });
 
     const view = render(
       <ProjectSidebar
@@ -1468,7 +1521,7 @@ describe("ProjectSidebar flat chat list", () => {
       { kind: "creation", projectPath: "/projects/demo-project", draftId: "draft-order" },
       "Draft prompt"
     );
-    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+    setSidebarPreferences({ sidebarFlatMode: true });
 
     const view = render(
       <ProjectSidebar
@@ -1556,12 +1609,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
     installProjectSidebarTestDoubles();
   });
 
-  afterEach(() => {
-    cleanup();
-    cleanupDom?.();
-    cleanupDom = null;
-    mock.restore();
-  });
+  afterEach(cleanupProjectSidebarDom);
 
   test("filters multi-project rows out entirely when the experiment is disabled", () => {
     spyOn(ExperimentsModule, "useExperimentValue").mockImplementation(() => false);
@@ -1672,7 +1720,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
   });
 
   test("hides sub-agent rows behind a parent summary when the setting is on", () => {
-    window.localStorage.setItem(SIDEBAR_HIDE_SUBAGENTS_KEY, JSON.stringify(true));
+    setSidebarPreferences({ sidebarHideSubAgents: true });
     const parentWorkspace = createWorkspace("parent", { title: "Parent workspace" });
     const runningChild = createWorkspace("running-child", {
       parentWorkspaceId: "parent",
@@ -1714,7 +1762,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
   });
 
   test("summarizes a hidden workflow run on the parent row instead of a group header", () => {
-    window.localStorage.setItem(SIDEBAR_HIDE_SUBAGENTS_KEY, JSON.stringify(true));
+    setSidebarPreferences({ sidebarHideSubAgents: true });
     window.localStorage.setItem(EXPANDED_PROJECTS_KEY, JSON.stringify(["/projects/demo-project"]));
     projectContextValue = createProjectContextValue({
       userProjects: new Map([["/projects/demo-project", { workspaces: [] }]]),
@@ -1783,7 +1831,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
   });
 
   test("retains a hidden run's workflow name across workerless step gaps", () => {
-    window.localStorage.setItem(SIDEBAR_HIDE_SUBAGENTS_KEY, JSON.stringify(true));
+    setSidebarPreferences({ sidebarHideSubAgents: true });
     window.localStorage.setItem(EXPANDED_PROJECTS_KEY, JSON.stringify(["/projects/demo-project"]));
     projectContextValue = createProjectContextValue({
       userProjects: new Map([["/projects/demo-project", { workspaces: [] }]]),

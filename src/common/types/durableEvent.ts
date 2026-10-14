@@ -79,6 +79,14 @@ export const TurnEnvelopeDataSchema = z.object({
    * recover this message from chat.jsonl alone.
    */
   partialContinuationHash: BlobRefSchema.optional(),
+  /**
+   * JSON-serialized MuxMessage: the request-only user-role MCP Apps model
+   * context message (ui/update-model-context) inserted before the newest user
+   * row, which the provider transform merges into it (blob-stored). It is
+   * built at request time from the MCP Apps store and
+   * never reaches chat.jsonl, so replay cannot recover it from history.
+   */
+  mcpAppModelContextHash: BlobRefSchema.optional(),
 });
 
 /**

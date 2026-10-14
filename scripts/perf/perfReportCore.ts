@@ -131,7 +131,7 @@ export function sanitizeLabel(label: string): string {
   return cleaned.length > 0 ? cleaned : "invalid-label";
 }
 
-function code(text: string): string {
+export function code(text: string): string {
   return `\`${sanitizeInline(text)}\``;
 }
 
@@ -630,7 +630,7 @@ function outcome(test: TestOutcome): string {
   }
 }
 
-function formatValue(value: number | undefined, decimals: number): string {
+export function formatValue(value: number | undefined, decimals: number): string {
   return value === undefined ? "—" : value.toFixed(decimals);
 }
 
@@ -638,7 +638,7 @@ function unavailable(row: ReportRow): string {
   return `unavailable: ${sanitizeInline(row.unavailable ?? "no data")}`;
 }
 
-function tableHeader(columns: readonly string[], leftColumns: number): string[] {
+export function tableHeader(columns: readonly string[], leftColumns: number): string[] {
   return [
     `| ${columns.join(" | ")} |`,
     `|${columns.map((_, index) => (index < leftColumns ? "---" : "---:")).join("|")}|`,

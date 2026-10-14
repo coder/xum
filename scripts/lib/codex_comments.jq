@@ -94,6 +94,19 @@ def codex_summary_status($bot; $head; $resolved):
 def codex_review_in_progress($bot; $head; $resolved):
   codex_summary_status($bot; $head; $resolved) == "running";
 
+# Quota exhaustion is not a code finding. Recognize only the bot's known notices
+# so CI can pass when review credits run out, without hiding appended findings.
+def codex_usage_limit($bot):
+  .author.login == $bot and (
+    (.body | gsub("\r\n"; "\n") | sub("[[:space:]]+$"; "")) as $body
+    | "You have reached your Codex usage limits for code reviews." as $notice
+    | $body == "Codex usage limits have been reached."
+      or $body == $notice
+      or $body == ($notice
+        + " You can see your limits in the [Codex usage dashboard](https://chatgpt.com/codex/cloud/settings/usage).\n"
+        + "To continue using code reviews, add credits to your account and enable them for code reviews in your [settings](https://chatgpt.com/codex/cloud/settings/code-review).")
+  );
+
 def codex_comment_is_informational($bot; $head; $resolved):
   if .author.login != $bot then false
   else
@@ -101,7 +114,8 @@ def codex_comment_is_informational($bot; $head; $resolved):
     | if $body | startswith(codex_summary_marker) then
         codex_summary_status($bot; $head; $resolved) == "completed"
       else
-        ($body | test("Didn.t find any major issues|usage limits have been reached|create a Codex account"))
+        codex_usage_limit($bot)
+        or ($body | test("Didn.t find any major issues|create a Codex account"))
         # codex_without_help removed at most one known heading; a second or
         # unknown heading must not hide finding-bearing text.
         or ($body | test("^Security review completed\\. No security issues were found in this pull request\\."

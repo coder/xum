@@ -296,6 +296,9 @@ jobs:
 
       - name: Build chat-components package
         working-directory: packages/chat-components
+        # Vite chunk rendering exceeds Node's default heap on ubuntu-latest.
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
         run: bun run build
 
       - name: Check if chat-components version exists

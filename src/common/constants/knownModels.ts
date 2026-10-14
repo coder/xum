@@ -2,9 +2,18 @@
  * Centralized model metadata. Update model versions here and everywhere else will follow.
  */
 
+import type { OpenAICyberAccessProgram } from "../types/openaiAccessPrograms";
 import { formatModelDisplayName } from "../utils/ai/modelDisplay";
 
-type ModelProvider = "anthropic" | "openai" | "google" | "xai" | "deepseek" | "moonshotai" | "zai";
+type ModelProvider =
+  | "anthropic"
+  | "openai"
+  | "google"
+  | "xai"
+  | "meta"
+  | "deepseek"
+  | "moonshotai"
+  | "zai";
 
 interface KnownModelDefinition {
   /** Provider identifier used by SDK factories */
@@ -21,6 +30,16 @@ interface KnownModelDefinition {
   warm?: boolean;
   /** Optional tokenizer override for ai-tokenizer */
   tokenizerOverride?: string;
+  /**
+   * OpenAI `access_programs.cyber` value sent in Cyber mode. Set only for the
+   * exact request model ids OpenAI's Daybreak guide maps to a program
+   * (https://developers.openai.com/api/docs/guides/daybreak, retrieved
+   * 2026-09-30). The value follows the model, not the organization's approval
+   * level. GPT-6 Luna is not listed, and GPT-6 Sol is listed but no longer a
+   * Xum model. Daybreak aliases and gpt-5.6-cyber accept only one program,
+   * which the API already selects when the field is omitted.
+   */
+  cyberAccessProgram?: OpenAICyberAccessProgram;
 }
 
 interface KnownModel extends KnownModelDefinition {
@@ -92,11 +111,20 @@ const MODEL_DEFINITIONS = {
     // estimate depending on content type.
     tokenizerOverride: "anthropic/claude-sonnet-4.5",
   },
+  // Claude Haiku 5.5 - released October 7, 2026, successor to Haiku 4.5. Tiered pricing:
+  // $0.10/M input, $0.50/M output up to 100K prompt tokens, 5x above. API id
+  // `claude-haiku-5-5`; Haiku 4.5 stays usable as the custom model string
+  // `anthropic:claude-haiku-4-5`. Unlike Haiku 4.5 it uses adaptive thinking only
+  // (`budget_tokens` returns 400), but it still accepts `disabled` at effort high or
+  // below, so "off" stays available.
   HAIKU: {
     provider: "anthropic",
-    providerModelId: "claude-haiku-4-5",
+    providerModelId: "claude-haiku-5-5",
     aliases: ["haiku"],
-    tokenizerOverride: "anthropic/claude-3.5-haiku",
+    // Haiku 5.5 uses the newer Claude 4.7+ tokenizer (~30% more tokens than Haiku 4.5 for
+    // the same text), which isn't published upstream; reuse Opus 4.5 for approximate
+    // counting (same situation as OPUS above).
+    tokenizerOverride: "anthropic/claude-opus-4.5",
   },
   // GPT-6.1 Sol - released September 29, 2026, successor to GPT-6 Sol at the same
   // Standard pricing ($2/M input, $10/M output) with cheaper cache reads ($0.10/M).
@@ -111,6 +139,9 @@ const MODEL_DEFINITIONS = {
     warm: true,
     // GPT-6's tokenizer is not published upstream; reuse gpt-5 for approximate counting.
     tokenizerOverride: "openai/gpt-5",
+    // OpenAI requires Daybreak Red approval for reduced refusals, yet the model
+    // rejects daybreak_red.
+    cyberAccessProgram: "daybreak_blue",
   },
   // GPT-6 Luna - the latest cost-efficient tier, released September 22, 2026.
   GPT_6_LUNA: {
@@ -127,16 +158,8 @@ const MODEL_DEFINITIONS = {
     aliases: ["astra", "gpt-6-astra"],
     // GPT-6 tokenizer not published upstream; reuse gpt-5 for approximate counting.
     tokenizerOverride: "openai/gpt-5",
-  },
-  DAYBREAK_BLUE: {
-    provider: "openai",
-    providerModelId: "daybreak-blue-latest",
-    tokenizerOverride: "openai/gpt-5",
-  },
-  DAYBREAK_RED: {
-    provider: "openai",
-    providerModelId: "daybreak-red-latest",
-    tokenizerOverride: "openai/gpt-5",
+    // Same Daybreak constraint as GPT (see its cyberAccessProgram).
+    cyberAccessProgram: "daybreak_blue",
   },
   // Gemini 3.1 Pro supersedes Gemini 3 Pro; keep bare aliases pointed at the latest Pro tier.
   GEMINI_31_PRO: {
@@ -209,6 +232,12 @@ const MODEL_DEFINITIONS = {
     // Moonshot tokenizer available) for approximate counting.
     tokenizerOverride: "moonshotai/kimi-k2",
   },
+  // Only the public Muse Wonder API model, not Muse Code's Wonder Full variant.
+  MUSE_WONDER: {
+    provider: "meta",
+    providerModelId: "muse-wonder-1.0",
+    aliases: ["muse", "wonder", "muse-wonder"],
+  },
   GLM_53_FLASH: {
     provider: "zai",
     providerModelId: "glm-5.3-flash",
@@ -256,8 +285,6 @@ const DEFAULT_KNOWN_MODEL_KEY: KnownModelKey = "OPUS";
 
 export const DEFAULT_MODEL = KNOWN_MODELS[DEFAULT_KNOWN_MODEL_KEY].id;
 
-export const DEFAULT_HIDDEN_MODELS = [KNOWN_MODELS.DAYBREAK_BLUE.id, KNOWN_MODELS.DAYBREAK_RED.id];
-
 export const DEFAULT_WARM_MODELS = Object.values(KNOWN_MODELS)
   .filter((model) => model.warm)
   .map((model) => model.id);
@@ -276,7 +303,10 @@ const LEGACY_TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
   "anthropic:claude-mythos-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-opus-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-sonnet-5": "anthropic/claude-sonnet-4.5",
+  "anthropic:claude-haiku-4-5": "anthropic/claude-3.5-haiku",
   "anthropic:claude-opus-4-8": "anthropic/claude-opus-4.5",
+  "openai:daybreak-blue-latest": "openai/gpt-5",
+  "openai:daybreak-red-latest": "openai/gpt-5",
 };
 
 export const TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
@@ -285,6 +315,7 @@ export const TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
   ...Object.fromEntries(
     Object.values(KNOWN_MODELS)
       .filter((model) => Boolean(model.tokenizerOverride))
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       .map((model) => [model.id, model.tokenizerOverride!])
   ),
 };

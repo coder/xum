@@ -24,6 +24,15 @@ describe("getToolComponent", () => {
     expect(getToolComponent("unknown_tool", {}, undefined)).toBe(GenericToolCall);
   });
 
+  test("renders saved advisor calls through the generic fallback", () => {
+    // Removing a tool must not make existing transcripts depend on its deleted renderer/schema.
+    for (const args of [{ question: "Review this approach" }, null, "legacy input"]) {
+      expect(getToolComponent("advisor", args, { advice: "Keep the change small" })).toBe(
+        GenericToolCall
+      );
+    }
+  });
+
   test("renders legacy file-backed agent_report transcripts", () => {
     expect(
       getToolComponent(

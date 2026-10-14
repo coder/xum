@@ -136,7 +136,7 @@ describe("StreamManager - TTFT metadata persistence", () => {
     overrides: Partial<ToolModelUsageEventForTests> = {}
   ): ToolModelUsageEventForTests {
     return {
-      toolName: overrides.toolName ?? "advisor",
+      toolName: overrides.toolName ?? "intuition",
       toolCallId: overrides.toolCallId ?? "tool-call-1",
       timestamp: overrides.timestamp ?? Date.now(),
       model: overrides.model ?? "anthropic:claude-sonnet-4-20250514",
@@ -278,7 +278,7 @@ describe("StreamManager - TTFT metadata persistence", () => {
   test("persists per-invocation tool model usages on the final assistant message", async () => {
     const startTime = Date.now() - 1000;
     const firstToolUsage = createToolModelUsageEvent({
-      toolName: "advisor",
+      toolName: "intuition",
       toolCallId: "tool-call-1",
       timestamp: startTime + 50,
       model: "openai:gpt-4",
@@ -290,7 +290,7 @@ describe("StreamManager - TTFT metadata persistence", () => {
       providerMetadata: { openai: { reasoningTokens: 4 } },
     });
     const secondToolUsage = createToolModelUsageEvent({
-      toolName: "advisor",
+      toolName: "intuition",
       toolCallId: "tool-call-2",
       timestamp: startTime + 90,
       model: "openai:gpt-4",
@@ -351,7 +351,7 @@ describe("StreamManager - TTFT metadata persistence", () => {
                 workspaceId,
                 firstMessageId,
                 createToolModelUsageEvent({
-                  toolName: "advisor",
+                  toolName: "intuition",
                   toolCallId: "tool-call-first",
                   usage: { inputTokens: 24, outputTokens: 6, totalTokens: 30 },
                 })
@@ -368,7 +368,7 @@ describe("StreamManager - TTFT metadata persistence", () => {
                 workspaceId,
                 firstMessageId,
                 createToolModelUsageEvent({
-                  toolName: "advisor",
+                  toolName: "intuition",
                   toolCallId: "tool-call-stale",
                   usage: { inputTokens: 12, outputTokens: 3, totalTokens: 15 },
                 })
@@ -388,7 +388,7 @@ describe("StreamManager - TTFT metadata persistence", () => {
     });
     expect(readToolModelUsages(firstMessage)).toMatchObject([
       {
-        toolName: "advisor",
+        toolName: "intuition",
         toolCallId: "tool-call-first",
       },
     ]);
@@ -617,6 +617,34 @@ describe("StreamManager - aborted stream usage persistence", () => {
     expect(event.metadata?.model).toBe(effectiveModel);
     expect(event.metadata?.metadataModel).toBe(pinnedMetadataModel);
     expect(event.metadata?.usage?.inputTokens).toBe(120);
+  });
+
+  test("carries tool-model usage on the wire abort event, as on the committed partial", async () => {
+    const workspaceId = "abort-tool-usage-event";
+    const messageId = "abort-tool-usage-message";
+    const events: TurnEngineEvent[] = [];
+    const { streamManager } = await startHeldTurnForTests({
+      workspaceId,
+      messageId,
+      events,
+      chunks: (activeManager) => [
+        partialText,
+        finishStep(ABORT_STEP_USAGE),
+        () =>
+          activeManager().recordToolModelUsage(workspaceId, messageId, {
+            toolName: "task",
+            timestamp: 1,
+            model: KNOWN_MODELS.SONNET.id,
+            usage: { inputTokens: 70, outputTokens: 7, totalTokens: 77 },
+          }),
+      ],
+    });
+
+    await streamManager.stopStream(workspaceId, { abortReason: "user" });
+
+    // Parsed by the onChat wire schema, which strips fields it does not declare.
+    const event = StreamAbortEventSchema.parse(events.find((e) => e.type === "stream-abort"));
+    expect(event.metadata?.toolModelUsages?.map((usage) => usage.usage.inputTokens)).toEqual([70]);
   });
 
   test.each(["commit-err", "commit-throw", "delete-err", "delete-throw"] as const)(

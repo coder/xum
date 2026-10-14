@@ -1,0 +1,65 @@
+import { expect, test } from "bun:test";
+import { getOwn } from "@/common/utils/getOwn";
+import type { MCPSettingsReadSnapshot, MCPSettingsSnapshot } from "@/common/utils/mcpSettings";
+import {
+  applySavedSettings,
+  settingsErrors,
+  SettingsRequests,
+  type ServerSettingsEntry,
+} from "./serverSettingsEntries";
+
+const snapshot = (units: string): MCPSettingsReadSnapshot => ({
+  properties: { units: { type: "string", title: "Units" } },
+  values: { units },
+  layout: [],
+  warnings: [],
+  droppedSettingCount: 0,
+  instanceToken: "instance-1",
+});
+
+test("settings requests: only a server's latest request in the current open applies", () => {
+  const requests = new SettingsRequests();
+  const open = requests.startOpen();
+  const slowRead = requests.take(open, "cad");
+  const newerRead = requests.take(open, "cad");
+  const other = requests.take(open, "other");
+  // The slow first read settles last: it is not the latest, so it cannot replace the newer one.
+  expect(slowRead.isLatest()).toBe(false);
+  expect(newerRead.isLatest()).toBe(true);
+  expect(other.isLatest()).toBe(true);
+  // A save taken later wins over both reads.
+  const save = requests.take(requests.current(), "cad");
+  expect(newerRead.isLatest()).toBe(false);
+  expect(save.isLatest()).toBe(true);
+  // A reopen: every earlier request, and one taken in the old open's scope, is stale.
+  requests.startOpen();
+  expect(save.isLatest()).toBe(false);
+  expect(requests.take(open, "cad").isLatest()).toBe(false);
+});
+
+test("a save's snapshot replaces the shown one under the save's request ID", () => {
+  const entries: Record<string, ServerSettingsEntry> = {
+    cad: { fetchId: 2, snapshot: snapshot("in") },
+    lathe: { notConnected: true },
+  };
+  expect(applySavedSettings(entries, "cad", 5, snapshot("mm")).cad).toEqual({
+    fetchId: 5,
+    snapshot: snapshot("mm"),
+  });
+  // No section to update: an unread or unavailable server keeps its entry.
+  expect(applySavedSettings(entries, "lathe", 5, snapshot("mm")).lathe).toEqual({
+    notConnected: true,
+  });
+  expect(applySavedSettings({}, "cad", 5, snapshot("mm"))).toEqual({});
+});
+
+test("validation errors keep a setting named __proto__", () => {
+  // JSON.parse keeps "__proto__" as an own key, as the IPC payload does.
+  const properties = JSON.parse(
+    '{"__proto__": {"type": "string", "title": "Proto", "maxLength": 1}}'
+  ) as MCPSettingsSnapshot["properties"];
+  const draft = JSON.parse('{"__proto__": "too long"}') as MCPSettingsSnapshot["values"];
+  const errors = settingsErrors(properties, draft);
+  expect(Object.keys(errors)).toEqual(["__proto__"]);
+  expect(getOwn(errors, "__proto__")).toBe("Proto must be at most 1 characters");
+});

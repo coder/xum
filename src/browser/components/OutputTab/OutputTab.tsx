@@ -1,12 +1,10 @@
 import { type UIEvent, useEffect, useReducer, useRef, useState } from "react";
 import { Trash2 } from "lucide-react";
 import { useAPI } from "@/browser/contexts/API";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import { MAX_LOG_ENTRIES } from "@/common/constants/ui";
-import { OUTPUT_TAB_LEVEL_KEY } from "@/common/constants/storage";
-
-type LogLevel = "error" | "warn" | "info" | "debug";
+import type { OutputLogLevel as LogLevel } from "@/common/config/schemas/userPreferences";
 
 interface LogEntry {
   timestamp: number;
@@ -64,7 +62,7 @@ export function OutputTab(_props: OutputTabProps) {
     epoch: 0,
     entries: [],
   });
-  const [levelFilter, setLevelFilter] = usePersistedState<LogLevel>(OUTPUT_TAB_LEVEL_KEY, "info");
+  const levelFilter = useUserPreferences((preferences) => preferences.ui?.outputTabLevel) ?? "info";
   const [autoScroll, setAutoScroll] = useState(true);
 
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -142,7 +140,10 @@ export function OutputTab(_props: OutputTabProps) {
   return (
     <div className="flex h-full flex-col">
       <div className="border-border flex items-center gap-2 border-b px-3 py-1.5">
-        <LevelFilterDropdown value={levelFilter} onChange={setLevelFilter} />
+        <LevelFilterDropdown
+          value={levelFilter}
+          onChange={(outputTabLevel) => updateUserPreferences({ ui: { outputTabLevel } })}
+        />
         <button
           type="button"
           className="text-muted hover:text-foreground hover:bg-hover flex h-6 w-6 items-center justify-center rounded border-none bg-transparent p-0 transition-colors"

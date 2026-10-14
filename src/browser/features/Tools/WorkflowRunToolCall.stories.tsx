@@ -497,9 +497,8 @@ export const LiveRunningTimeline: Story = {
 /**
  * Narrow-container regression: a long workflow name must truncate instead of
  * starving the collapsed header's progress summary. No API provider, so the
- * static run record renders without polling. The dynamic-workflows experiment
- * is off in this lightweight story and the run is still running, so the card
- * mounts expanded — the play collapses it via the header toggle so the
+ * static run record renders without polling. The run is still running, so the
+ * card mounts expanded; the play collapses it via the header toggle so the
  * snapshot pins the collapsed narrow header this story exists to cover.
  */
 export const RunningNarrowLongName: Story = {

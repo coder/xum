@@ -19,6 +19,14 @@ describe("commandParser", () => {
       expect(parseCommand(" ")).toBeNull();
     });
 
+    it.each(["fast", "ultrafast"] as const)("parses /%s as a speed toggle, not a model", (mode) => {
+      expectParse(`/${mode}`, { type: "speed-mode-toggle", mode });
+      expectParse(`  /${mode}  `, { type: "speed-mode-toggle", mode });
+      for (const suffix of [" on", " --off", "\nexplain this code"]) {
+        expect(parseCommand(`/${mode}${suffix}`)?.type).toBe("command-invalid-args");
+      }
+    });
+
     it("should parse /clear command", () => {
       expectParse("/clear", { type: "clear", mode: "hard" });
     });

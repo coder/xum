@@ -4,8 +4,9 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/To
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { useDroppable, useDndContext } from "@dnd-kit/core";
-import { Plus } from "lucide-react";
+import { PanelRightClose, Plus, X } from "lucide-react";
 import type { TabType } from "@/browser/types/rightSidebar";
+import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import {
   isDesktopMode,
   DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS,
@@ -31,8 +32,13 @@ export interface RightSidebarTabStripItem {
   disabled?: boolean;
   /** The tab type (used for drag identification) */
   tab: TabType;
-  /** Optional callback to close this tab (for closeable tabs like terminals) */
+  /** Closes this tab (X button, middle-click). Absent when closing would do nothing. */
   onClose?: () => void;
+  /**
+   * Accessible name of the strip-rendered X button. Unset for labels that render their own
+   * close button (terminal, side chat), so the tab never shows two.
+   */
+  closeLabel?: string;
 }
 
 interface RightSidebarTabStripProps {
@@ -40,8 +46,10 @@ interface RightSidebarTabStripProps {
   ariaLabel?: string;
   /** Unique ID of this tabset (for drag/drop) */
   tabsetId: string;
-  /** Called when user clicks the "+" button to add a new terminal */
-  onAddTerminal?: () => void;
+  /** Called when user clicks the "+" button to open (or show) this tabset's New tab */
+  onAddNewTab?: () => void;
+  /** Collapses the sidebar. Only the strip at the sidebar's top-right corner gets it. */
+  onCollapseSidebar?: () => void;
 }
 
 /**
@@ -82,8 +90,16 @@ const SortableTab: React.FC<{
             {...attributes}
             {...(listeners ?? {})}
             className={cn(
-              "flex min-w-0 max-w-[240px] items-baseline gap-1.5 whitespace-nowrap rounded-md px-3 py-1 text-xs font-medium transition-all duration-150",
-              "cursor-grab touch-none active:cursor-grabbing",
+              "group relative flex min-w-0 max-w-[240px] items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 py-1 text-xs font-medium transition-colors duration-150",
+              // Let touch users pan the overflowing strip; mouse pointers still drag/reorder.
+              "cursor-grab touch-pan-x active:cursor-grabbing",
+              // Reserve the X's space even while hidden: hovering/focusing/selecting a tab must
+              // neither cover its text nor change its label width (especially for long titles).
+              // Coarse pointers need the larger target even on tablets wide enough to show
+              // the sidebar; reserve matching row height/padding so it never clips or covers text.
+              item.closeLabel != null &&
+                item.onClose &&
+                "pr-6 [@media(pointer:coarse)]:min-h-11 [@media(pointer:coarse)]:pr-12",
               item.selected
                 ? "bg-hover text-foreground"
                 : "bg-transparent text-muted hover:bg-hover/50 hover:text-foreground",
@@ -122,22 +138,134 @@ const SortableTab: React.FC<{
             aria-disabled={item.disabled ? true : undefined}
             tabIndex={item.disabled ? -1 : (attributes.tabIndex ?? 0)}
           >
-            {item.label}
+            {/* Long labels truncate inside the tab instead of stretching the strip. */}
+            <span className="flex min-w-0 items-center gap-1.5 truncate">{item.label}</span>
+            {item.onClose && item.closeLabel != null && (
+              <TabCloseButton
+                label={item.closeLabel}
+                selected={item.selected}
+                onClose={item.onClose}
+              />
+            )}
           </div>
         </TooltipTrigger>
-        <TooltipContent side="bottom" align="center">
-          {item.tooltip}
-        </TooltipContent>
+        {/* No tooltip, no empty bubble: tabs without a shortcut (or with shortcuts hidden). */}
+        {item.tooltip != null && (
+          <TooltipContent side="bottom" align="center">
+            {item.tooltip}
+          </TooltipContent>
+        )}
       </Tooltip>
     </div>
   );
 };
 
+/**
+ * X button for tabs whose label has no close button of its own. Absolutely positioned so it
+ * takes no room: all closeable tabs reserve the same padding for it, whether it is visible or
+ * not. Keyboard focus on the tab reveals the X before Tab reaches it. Touch shows it always,
+ * since touch users cannot hover. `invisible` keeps a hidden X from catching label clicks.
+ */
+const TabCloseButton: React.FC<{
+  label: string;
+  selected: boolean;
+  onClose: () => void;
+}> = (props) => (
+  <button
+    type="button"
+    className={cn(
+      // Touch grows the X to a 44px target. Its fill would then paint a 44px grey square beside
+      // every unselected tab label, so touch keeps the larger target but drops the fill.
+      "text-muted hover:text-foreground absolute right-1 top-1/2 flex -translate-y-1/2 items-center justify-center rounded p-0.5 [@media(pointer:coarse)]:min-h-11 [@media(pointer:coarse)]:min-w-11 [@media(pointer:coarse)]:bg-transparent",
+      props.selected
+        ? "bg-hover"
+        : "bg-hover invisible group-focus-within:visible group-hover:visible [@media(pointer:coarse)]:visible"
+    )}
+    onClick={(e) => {
+      e.stopPropagation();
+      props.onClose();
+    }}
+    aria-label={props.label}
+  >
+    <X className="h-3 w-3" />
+  </button>
+);
+
+/** True inside a strip control that acts on the whole sidebar: using it must not focus its pane. */
+export function isSidebarControlTarget(target: EventTarget): boolean {
+  return target instanceof Element && target.closest("[data-sidebar-control]") != null;
+}
+
+/** Icon button after the tabs ("+", collapse). */
+const StripIconButton: React.FC<{
+  label: string;
+  shortcut?: string;
+  isDesktop: boolean;
+  sidebarControl?: boolean;
+  className?: string;
+  onClick: () => void;
+  children: React.ReactNode;
+}> = (props) => (
+  <Tooltip>
+    <TooltipTrigger asChild>
+      <button
+        type="button"
+        data-sidebar-control={props.sidebarControl ? "" : undefined}
+        className={cn(
+          "text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent flex shrink-0 items-center justify-center rounded-md p-1 transition-colors focus-visible:ring-1",
+          props.isDesktop && "titlebar-no-drag",
+          props.className
+        )}
+        onClick={props.onClick}
+        aria-label={props.label}
+      >
+        {props.children}
+      </button>
+    </TooltipTrigger>
+    <TooltipContent side="bottom">
+      {props.label}
+      {props.shortcut != null && (
+        <span className="mobile-hide-shortcut-hints"> ({props.shortcut})</span>
+      )}
+    </TooltipContent>
+  </Tooltip>
+);
+
+/** Width of the `.scroll-fade-x` edge fade (scrollbar-none.css): a tab under it looks cut off. */
+const SCROLL_FADE_PX = 24;
+
+/**
+ * Scroll the row (only as far as needed) so its selected tab is fully visible and clear of the
+ * edge fades. Computed against the row instead of `scrollIntoView`, which also scrolls
+ * overflow-hidden ancestors and ignores the fades.
+ */
+function revealSelectedTab(row: HTMLElement): void {
+  const tab = row.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]');
+  if (tab == null) return;
+  const rowRect = row.getBoundingClientRect();
+  const tabRect = tab.getBoundingClientRect();
+  const tabStart = tabRect.left - rowRect.left + row.scrollLeft;
+  const tabEnd = tabStart + tabRect.width;
+  const maxScroll = row.scrollWidth - row.clientWidth;
+  let next = row.scrollLeft;
+  // A fade only shows on a side with more content past it, so the first and last tabs need
+  // no margin (the clamp below lets them reach the very edge).
+  if (tabEnd + SCROLL_FADE_PX > row.scrollLeft + row.clientWidth) {
+    next = tabEnd + SCROLL_FADE_PX - row.clientWidth;
+  }
+  if (tabStart - SCROLL_FADE_PX < next) {
+    next = tabStart - SCROLL_FADE_PX;
+  }
+  next = Math.max(0, Math.min(maxScroll, next));
+  if (Math.abs(next - row.scrollLeft) >= 1) row.scrollLeft = next;
+}
+
 export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
   items,
   ariaLabel = "Sidebar views",
   tabsetId,
-  onAddTerminal,
+  onAddNewTab,
+  onCollapseSidebar,
 }) => {
   const { active } = useDndContext();
   const activeData = active?.data.current as TabDragData | undefined;
@@ -157,21 +285,54 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
   // In desktop mode, add right padding for Windows/Linux titlebar overlay buttons
   const isDesktop = isDesktopMode();
 
+  // The strip is a single scrolling row, so the selected tab can sit past the visible edge:
+  // selected by a shortcut, the launcher, or an event, or pushed out when tabs before it grow
+  // (Stats gains its cost badge, counts load) or the pane narrows. Keep it fully visible,
+  // clear of the edge fades, whenever the selection or any size in the row changes. An effect
+  // because it syncs with layout; the ResizeObserver supplies the size changes.
+  const scrollRowRef = React.useRef<HTMLDivElement>(null);
+  const selectedItemId = items.find((item) => item.selected)?.id;
+  const itemIdsKey = items.map((item) => item.id).join("|");
+  React.useEffect(() => {
+    const row = scrollRowRef.current;
+    if (row == null || selectedItemId == null) return;
+    const reveal = () => revealSelectedTab(row);
+    reveal();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(reveal);
+    observer.observe(row);
+    for (const child of Array.from(row.children)) observer.observe(child);
+    return () => observer.disconnect();
+  }, [selectedItemId, itemIdsKey]);
+
   return (
     <div
       ref={setNodeRef}
       className={cn(
-        "border-border-light titlebar-safe-right titlebar-safe-right-gutter-2 flex min-w-0 items-center border-b px-2 py-1.5 transition-colors",
+        // Capped inset: the tabs live in one scrolling row, so the full overlay inset on a
+        // narrow pane would shrink that row to zero and hide every tab.
+        "border-border-light titlebar-safe-right-capped titlebar-safe-right-gutter-2 flex min-w-0 items-center gap-1 border-b px-2 py-1.5 transition-colors",
+        // With the collapse button, a pane at its minimum width cannot fit both buttons: overflow
+        // on the left (the Panel clips it) so the collapse button stays visible. With room to
+        // spare, the collapse button's ml-auto takes the free space and this has no effect.
+        "has-[[data-sidebar-control]]:justify-end",
         isDesktop && DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS,
         showDropHighlight && "bg-accent/30",
         isDraggingFromHere && "bg-accent/10",
         // In desktop mode, make header draggable for window movement
         isDesktop && "titlebar-drag"
       )}
-      role="tablist"
-      aria-label={ariaLabel}
     >
-      <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1">
+      {/* One row that never wraps: extra tabs scroll sideways (hidden scrollbar, faded edges).
+          It is only as wide as its tabs, so "+" follows the last tab; once they overflow, the
+          row shrinks and scrolls while "+", outside it, stays in view. */}
+      <div
+        ref={scrollRowRef}
+        data-tab-scroll-row
+        role="tablist"
+        aria-label={ariaLabel}
+        className="scrollbar-none scroll-fade-x flex min-w-0 flex-initial flex-nowrap items-center gap-1 overflow-x-auto"
+      >
         {items.map((item, index) => (
           <SortableTab
             key={item.id}
@@ -181,25 +342,29 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
             isDesktop={isDesktop}
           />
         ))}
-        {onAddTerminal && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                className={cn(
-                  "text-muted hover:bg-hover hover:text-foreground shrink-0 rounded-md p-1 transition-colors",
-                  isDesktop && "titlebar-no-drag"
-                )}
-                onClick={onAddTerminal}
-                aria-label="New terminal"
-              >
-                <Plus className="h-3.5 w-3.5" />
-              </button>
-            </TooltipTrigger>
-            <TooltipContent side="bottom">New terminal</TooltipContent>
-          </Tooltip>
-        )}
       </div>
+      {onAddNewTab && (
+        <StripIconButton
+          label="New tab"
+          shortcut={formatKeybind(KEYBINDS.NEW_SIDEBAR_TAB)}
+          isDesktop={isDesktop}
+          onClick={onAddNewTab}
+        >
+          <Plus className="h-3.5 w-3.5" />
+        </StripIconButton>
+      )}
+      {onCollapseSidebar && (
+        <StripIconButton
+          label="Collapse sidebar"
+          isDesktop={isDesktop}
+          sidebarControl
+          // Above the phone breakpoint the global 44px touch floor does not apply.
+          className="ml-auto [@media(pointer:coarse)]:min-h-11 [@media(pointer:coarse)]:min-w-11"
+          onClick={onCollapseSidebar}
+        >
+          <PanelRightClose className="h-3.5 w-3.5" />
+        </StripIconButton>
+      )}
     </div>
   );
 };

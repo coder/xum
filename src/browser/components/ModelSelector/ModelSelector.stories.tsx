@@ -2,8 +2,6 @@ import type { AppStory } from "@/browser/stories/meta.js";
 import { appMeta, AppWithMocks } from "@/browser/stories/meta.js";
 import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
 import { within, userEvent, waitFor } from "@storybook/test";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getModelKey } from "@/common/constants/storage";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
 const meta = {
@@ -30,11 +28,9 @@ export const ModelSelectorPrettyWithGateway: AppStory = {
         const workspaceId = "ws-gateway-model";
         const baseModel = "openai:gpt-4o";
 
-        // Ensure the gateway indicator is active (so the regression would reproduce).
-        updatePersistedState(getModelKey(workspaceId), baseModel);
-
         return setupSimpleChatStory({
           workspaceId,
+          aiSettings: { model: baseModel, thinkingLevel: "off" },
           messages: [],
           routePriority: ["mux-gateway", "direct"],
           providersConfig: {
@@ -116,11 +112,9 @@ export const ModelSelectorDropdownOpen: AppStory = {
         const workspaceId = "ws-model-dropdown";
         const baseModel = "openai:gpt-4o";
 
-        // Set the selected model for this workspace
-        updatePersistedState(getModelKey(workspaceId), baseModel);
-
         return setupSimpleChatStory({
           workspaceId,
+          aiSettings: { model: baseModel, thinkingLevel: "off" },
           messages: [],
           providersConfig: {
             openai: { apiKeySet: true, isEnabled: true, couponCodeSet: false, isConfigured: true },

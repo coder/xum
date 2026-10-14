@@ -12,6 +12,7 @@
  * Uses posthog-node which batches events and flushes asynchronously.
  */
 
+import { isSessionTapeReplayConfigured } from "@/common/utils/sessionTapes/sessionTapeReplay";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import assert from "@/common/utils/assert";
 import { PostHog } from "posthog-node";
@@ -76,6 +77,9 @@ function isTelemetryDisabledByEnv(env: NodeJS.ProcessEnv): boolean {
   return (
     resolveXumEnvironmentValue("DISABLE_TELEMETRY", env) === "1" ||
     resolveXumEnvironmentValue("E2E", env) === "1" ||
+    // Session tape replay (perf harness): replayed activity is not real usage, and the PostHog
+    // client would be network egress from a replay run.
+    isSessionTapeReplayConfigured(env) ||
     env.NODE_ENV === "test" ||
     env.JEST_WORKER_ID !== undefined ||
     env.VITEST !== undefined ||

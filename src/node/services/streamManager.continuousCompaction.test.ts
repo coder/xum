@@ -13,11 +13,12 @@ import { historyWriteLockPath, removeSessionDirUnderMemoryLocks } from "./worksp
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { readFile, writeFile } from "node:fs/promises";
 import assert from "@/common/utils/assert";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import {
   ContinuousCompactionJournalSchema,
   type ContinuousCompactionJournal,
 } from "@/common/orpc/schemas/continuousCompaction";
+import { countToolReferences } from "@/common/utils/tools/toolCatalog";
 import type { StreamManager, TurnEngineEvent, TurnExecutionOptions } from "./streamManager";
 import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
 import { prepareStepForTests, type PreparedStepForTests } from "./streamManager.suite.testHarness";
@@ -559,14 +560,89 @@ describe("continuous prefix prepareStep and journal", () => {
     expect(latestMessages()).toEqual(result.messages);
   });
 
+  const searchResult = (toolCallId: string): ai.ModelMessage => {
+    const raw: unknown = {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId,
+          toolName: "tool_catalog_search",
+          output: {
+            type: "content",
+            value: [
+              {
+                type: "custom",
+                providerOptions: {
+                  anthropic: { type: "tool-reference", toolName: "zulip_send_message" },
+                },
+              },
+            ],
+          },
+        },
+      ],
+    };
+    return raw as ai.ModelMessage;
+  };
+  const withRepeatedReference = (): ai.ModelMessage[] => [
+    ...originalMessages.slice(0, 3),
+    {
+      role: "assistant",
+      content: [{ type: "tool-call", toolCallId: "old-search", toolName: "bash", input: {} }],
+    },
+    searchResult("old-search"),
+    ...originalMessages.slice(3),
+    searchResult("keep"),
+  ];
+
+  it("dedupes native tool_references against the swapped prefix, not the dropped one", async () => {
+    // The only earlier reference to the tool lives in the dropped prefix; the
+    // retained tail repeats it. Deduping before the swap would project the tail
+    // against the dropped prefix and lose the turn's only surviving reference.
+    const { run, swapState } = await setupLiveSwap();
+    const result = await run(withRepeatedReference());
+    assert(result?.messages, "Expected swapped messages");
+    expect(swapState()).toBe("consumed");
+    const references = JSON.stringify(result.messages).match(/"tool-reference"/g);
+    expect(references).toHaveLength(1);
+    expect(JSON.stringify(result.messages)).not.toContain("old-search");
+  });
+
+  it("restores a reference projected on an earlier step when the swap drops its anchor", async () => {
+    // The dedupe projection is request-only, but the SDK accumulates the next
+    // step's input from the returned (projected) messages. A later swap that
+    // drops the first occurrence must fall back to the retained result's raw
+    // reference, not the carried projection that already removed it.
+    const fixture = await setup();
+    const turn = await startLiveTurn();
+    const first = await turn.run(withRepeatedReference());
+    assert(first?.messages, "Expected deduped messages");
+    // Count wire references via outputs: the projected result's stash keeps
+    // the raw reference bytes in providerOptions, off the wire.
+    expect([...countToolReferences(first.messages).values()]).toEqual([1]);
+    expect(turn.manager.setPrefixSwap(workspaceId, fixture.swap)).toBe(true);
+    // The SDK carries the projected first-step messages into the next step.
+    const second = await turn.run(first.messages, 2);
+    assert(second?.messages, "Expected swapped messages");
+    expect(turn.swapState()).toBe("consumed");
+    const references = JSON.stringify(second.messages).match(/"tool-reference"/g) ?? [];
+    expect(references).toHaveLength(1);
+    expect(JSON.stringify(second.messages)).not.toContain("old-search");
+    // The retained bash result reuses the search result's toolCallId ("keep");
+    // restoration must match the projected occurrence, not the reusable ID.
+    expect(JSON.stringify(second.messages)).toContain("kept output");
+  });
+
   it.each([
     [{ type: "between_tools" }, false],
-    [{ type: "adaptive" }, true],
+    [{ type: "adaptive" }, false],
   ] as const)(
     "after a prefix swap, thinking=%o replays in-turn reasoning: %p (#5086)",
     async (thinking, replayed) => {
-      // between_tools cannot carry blockBinding: a thinking block replayed after the
-      // swap edited everything before it would fail the prefix check on enforced accounts.
+      // Preserved thinking: a thinking block replayed after the swap edited everything
+      // before it would fail the prefix check on enforced accounts, for every thinking
+      // mode (between_tools cannot carry blockBinding; only the direct route sends
+      // drop_block for adaptive).
       const withReasoning = originalMessages.map((message, index) =>
         index === 3 && Array.isArray(message.content)
           ? {
@@ -649,9 +725,9 @@ describe("continuous prefix prepareStep and journal", () => {
 
   it("rebuilds a flattened committed step cut in the prefix and swaps at the live anchor", async () => {
     const { run, swapState, store, swap } = await setupLiveSwap();
-    const committed = createMuxMessage("committed", "assistant", "", {
-      stepStartPartIndices: [0, 2],
-    });
+    // No stepStartPartIndices: a row from before they were persisted, the case where the
+    // rebuild still folds the tool-first step into the previous one (flattened cut).
+    const committed = createMuxMessage("committed", "assistant", "", {});
     committed.parts = [
       { type: "text", text: "summarized head must not return" },
       {
@@ -697,8 +773,9 @@ describe("continuous prefix prepareStep and journal", () => {
     ];
     swap.journal.prefixSourceRows = [swap.journal.boundary, ...swap.journal.staticCopies];
     swap.prefix = await rebuildContinuousPrefix(swap.journal, workspaceId);
+    const { deferLoadingToolNames: _deferred, ...preparation } = swap.journal.preparation;
     const messages = await prepareMessagesForProvider({
-      ...swap.journal.preparation,
+      ...preparation,
       workspaceId,
       messagesWithSentinel: [
         createMuxMessage("user", "user", "request"),
@@ -840,8 +917,9 @@ describe("continuous prefix prepareStep and journal", () => {
         reasoning,
         createMuxMessage("next-assistant", "assistant", "Later answer"),
       ];
+      const { deferLoadingToolNames: _deferred, ...preparation } = journal.preparation;
       const expected = await assemblePromptPayload({
-        ...journal.preparation,
+        ...preparation,
         workspaceId,
         history: journal.prefixSourceRows,
         systemMessage: "",
@@ -854,6 +932,224 @@ describe("continuous prefix prepareStep and journal", () => {
       expect(JSON.stringify(actual)).not.toContain("UI-only workflow content");
     }
   );
+
+  it("prefix replay honors a thinking-repair receipt on an empty kept row (#5886)", async () => {
+    const journal = journalFixture();
+    journal.preparation.modelString = "anthropic:claude-opus-5-5";
+    journal.preparation.effectiveThinkingLevel = "high";
+    const signed = createMuxMessage("signed", "assistant", "", undefined, [
+      {
+        type: "reasoning",
+        text: "removed thinking",
+        providerOptions: { anthropic: { signature: "sig-removed" } },
+      },
+      { type: "text", text: "kept answer" },
+    ]);
+    // A repaired turn that failed before output: commitPartial kept only its receipt.
+    const receiptOnly: MuxMessage = {
+      id: "repaired-no-output",
+      role: "assistant",
+      metadata: { anthropicThinkingReplay: "off" },
+      parts: [],
+    };
+    journal.prefixSourceRows = [
+      journal.boundary,
+      createMuxMessage("user-1", "user", "first"),
+      signed,
+      createMuxMessage("user-2", "user", "second"),
+      receiptOnly,
+      createMuxMessage("user-3", "user", "third"),
+    ];
+    const { deferLoadingToolNames: _deferred, ...preparation } = journal.preparation;
+    const expected = await assemblePromptPayload({
+      ...preparation,
+      workspaceId,
+      history: journal.prefixSourceRows,
+      systemMessage: "",
+      postCompactionAttachments: journal.postCompactionAttachments,
+    });
+    const actual = (await rebuildContinuousPrefix(journal, workspaceId)).filter(
+      (message) => message.role !== "system"
+    );
+    expect(actual).toEqual(expected.messages.filter((message) => message.role !== "system"));
+    const serialized = JSON.stringify(actual);
+    expect(serialized).toContain("kept answer");
+    expect(serialized).not.toContain("removed thinking");
+  });
+
+  it("prefix replay keeps the thinking after a server tool out, tool pairs intact (#5887)", async () => {
+    const journal = journalFixture();
+    journal.preparation.modelString = "anthropic:claude-opus-5-5";
+    journal.preparation.effectiveThinkingLevel = "high";
+    // The row a server-tool turn commits (streamManager.preservedThinking.test.ts): the
+    // server tool stored as a client tool call, thinking after it, and the receipt.
+    const serverToolRow = createMuxMessage(
+      "server-tool-turn",
+      "assistant",
+      "",
+      { anthropicThinkingReplay: "off" },
+      [
+        {
+          type: "reasoning",
+          text: "plan",
+          providerOptions: { anthropic: { signature: "sig-plan" } },
+        },
+        {
+          type: "dynamic-tool",
+          toolCallId: "srvtoolu_1",
+          toolName: "web_search",
+          state: "output-available",
+          input: { query: "xum" },
+          output: [
+            {
+              url: "https://example.com/xum",
+              title: "Xum",
+              pageAge: null,
+              type: "web_search_result",
+            },
+          ],
+        },
+        {
+          type: "reasoning",
+          text: "read",
+          providerOptions: { anthropic: { signature: "sig-read" } },
+        },
+        {
+          type: "dynamic-tool",
+          toolCallId: "toolu_2",
+          toolName: "bash",
+          state: "output-available",
+          input: { script: "pwd" },
+          output: "/tmp",
+        },
+        { type: "text", text: "kept answer" },
+      ]
+    );
+    journal.prefixSourceRows = [
+      journal.boundary,
+      createMuxMessage("user-1", "user", "search"),
+      serverToolRow,
+      createMuxMessage("user-2", "user", "next"),
+    ];
+    const { deferLoadingToolNames: _deferred, ...preparation } = journal.preparation;
+    const expected = await assemblePromptPayload({
+      ...preparation,
+      workspaceId,
+      history: journal.prefixSourceRows,
+      systemMessage: "",
+      postCompactionAttachments: journal.postCompactionAttachments,
+    });
+    const actual = (await rebuildContinuousPrefix(journal, workspaceId)).filter(
+      (message) => message.role !== "system"
+    );
+    expect(actual).toEqual(expected.messages.filter((message) => message.role !== "system"));
+    const parts = actual.flatMap((message) =>
+      Array.isArray(message.content) ? (message.content as Array<{ type: string }>) : []
+    );
+    // No signed thinking is left (an unsigned placeholder never reaches the wire).
+    expect(JSON.stringify(actual)).not.toContain("sig-");
+    expect(parts.filter((part) => part.type === "tool-call")).toHaveLength(2);
+    expect(parts.filter((part) => part.type === "tool-result")).toHaveLength(2);
+    expect(JSON.stringify(actual)).toContain("kept answer");
+  });
+
+  it("prefix replay keeps native tool search results as tool references (#5262)", async () => {
+    const journal = journalFixture();
+    journal.preparation.deferLoadingToolNames = ["slack_send_message"];
+    journal.prefixSourceRows = [
+      journal.boundary,
+      createMuxMessage("search", "assistant", "", undefined, [
+        {
+          type: "dynamic-tool",
+          toolCallId: "call-1",
+          toolName: "tool_catalog_search",
+          state: "output-available",
+          input: { query: "slack" },
+          output: {
+            query: "slack",
+            matches: [{ name: "slack_send_message", description: "Send a message" }],
+            totalDeferred: 1,
+          },
+        },
+      ]),
+      createMuxMessage("next", "user", "continue"),
+    ];
+    const outputs = (await rebuildContinuousPrefix(journal, workspaceId)).flatMap((message) =>
+      message.role === "tool"
+        ? message.content.flatMap((part) => (part.type === "tool-result" ? [part.output] : []))
+        : []
+    );
+    expect(outputs).toEqual([
+      {
+        type: "content",
+        value: [
+          {
+            type: "custom",
+            providerOptions: {
+              anthropic: { type: "tool-reference", toolName: "slack_send_message" },
+            },
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("a swapped prefix lists only deferred tools a retained search still loads (#5262)", async () => {
+    const journal = journalFixture();
+    journal.preparation.deferLoadingToolNames = ["jira_create_issue", "slack_send_message"];
+    // jira_create_issue was loaded by a search that the summary replaced.
+    journal.preparation.toolNamesForSentinel = ["bash", "jira_create_issue", "slack_send_message"];
+    journal.prefixSourceRows = [
+      journal.boundary,
+      createMuxMessage("search", "assistant", "", { agentId: "plan" }, [
+        {
+          type: "dynamic-tool",
+          toolCallId: "call-1",
+          toolName: "tool_catalog_search",
+          state: "output-available",
+          input: { query: "slack" },
+          output: {
+            query: "slack",
+            matches: [{ name: "slack_send_message", description: "Send a message" }],
+            totalDeferred: 2,
+          },
+        },
+      ]),
+      createMuxMessage("next", "user", "continue"),
+    ];
+    const prefix = JSON.stringify(await rebuildContinuousPrefix(journal, workspaceId));
+    expect(prefix).toContain("Available tools: bash, slack_send_message.");
+  });
+
+  it("swap preparation carries native deferred tools and lists only loaded ones (#5262)", async () => {
+    const execute = () => Promise.resolve("ok");
+    const tools = {
+      bash: ai.tool({ description: "bash", inputSchema: z.object({}), execute }),
+      slack_send_message: ai.tool({
+        description: "Send a message",
+        inputSchema: z.object({}),
+        execute,
+        providerOptions: { anthropic: { deferLoading: true } },
+      }),
+      tool_catalog_search: ai.tool({ description: "search", inputSchema: z.object({}), execute }),
+    };
+    const toolSearchState = {
+      catalog: [{ name: "slack_send_message", description: "Send a message", paramText: "" }],
+      deferredToolNames: new Set(["slack_send_message"]),
+      allToolNames: Object.keys(tools),
+      activatedToolNames: new Set<string>(),
+      native: true,
+    };
+    const { manager } = await startLiveTurn({ requestOptions: { tools, toolSearchState } });
+
+    const before = manager.getPrefixSwapPreparation(workspaceId)?.preparation;
+    expect(before?.toolNamesForSentinel).toEqual(["bash", "tool_catalog_search"]);
+    expect(before?.deferLoadingToolNames).toEqual(["slack_send_message"]);
+    toolSearchState.activatedToolNames.add("slack_send_message");
+    expect(manager.getPrefixSwapPreparation(workspaceId)?.preparation.toolNamesForSentinel).toEqual(
+      ["bash", "slack_send_message", "tool_catalog_search"]
+    );
+  });
 
   it("does not return a swap when atomic journal persistence fails", async () => {
     const { run, latestMessages, swapState, swap, store } = await setupLiveSwap();
@@ -1004,6 +1300,98 @@ describe("continuous prefix prepareStep and journal", () => {
     });
   }
 
+  it("a fallback over a consumed prefix sends none of that prefix's thinking (#5886)", async () => {
+    const { swap } = await setup();
+    swap.journal.liveTailCopySpec.partIndex = 0;
+    // The swapped prefix predates the turn's thinking-repair receipt.
+    const systemCount = swap.prefix.filter((message) => message.role === "system").length;
+    swap.prefix = [
+      ...swap.prefix.slice(0, systemCount),
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "reasoning",
+            text: "removed prefix thinking",
+            providerOptions: { anthropic: { signature: "sig-removed" } },
+          },
+          { type: "text", text: "kept prefix answer" },
+        ],
+      },
+      ...swap.prefix.slice(systemCount),
+    ];
+    const nextModel = "anthropic:fallback-model";
+    const rebuilt = createMuxMessage("live", "assistant", "", { stepStartPartIndices: [0] });
+    rebuilt.parts = [
+      { type: "text", text: "retained step" },
+      {
+        type: "dynamic-tool",
+        toolCallId: "keep",
+        toolName: "bash",
+        state: "output-available",
+        input: {},
+        output: { success: true },
+      },
+      { type: "text", text: "refused response after swap" },
+    ];
+    const { deferLoadingToolNames: _deferred, ...preparation } = swap.journal.preparation;
+    const payload = await assemblePromptPayload({
+      ...preparation,
+      modelString: nextModel,
+      systemMessage: "Fresh fallback system",
+      workspaceId,
+      history: [createMuxMessage("prompt", "user", "original request"), rebuilt],
+    });
+    let firstFallbackStep: ai.ModelMessage[] | undefined;
+    const turn = await startLiveTurn({
+      requestOptions: {
+        initialMetadata: { anthropicThinkingReplay: "off" },
+        modelFallback: {
+          chain: [nextModel],
+          prepare: () =>
+            Promise.resolve({
+              success: true as const,
+              data: {
+                model,
+                modelString: nextModel,
+                messages: payload.messages,
+                system: payload.system,
+                tools: payload.tools,
+                thinkingLevel: "off" as const,
+              },
+            }),
+        },
+      },
+      attempts: [
+        async function* (options, manager) {
+          expect(manager.setPrefixSwap(workspaceId, swap)).toBe(true);
+          await prepareStepForTests(options, originalMessages);
+          yield { type: "start-step" };
+          yield { type: "text-delta", text: "retained step" };
+          yield { type: "finish-step", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } };
+          yield { type: "finish", finishReason: "content-filter" };
+        },
+        async function* (options) {
+          // The messages the fallback's first provider request actually carries.
+          const step = await prepareStepForTests(options, options.messages ?? [], 0);
+          firstFallbackStep = step?.messages ?? options.messages;
+          yield* answer();
+        },
+      ],
+    });
+    await turn.completion;
+
+    expect(turn.calls).toHaveLength(2);
+    // The fallback request carries the swapped prefix as recorded (thinking included):
+    // prepareStep's prefix-swap guard (#5086) removes it before the provider call.
+    const requested = JSON.stringify(turn.calls[1]?.messages);
+    expect(requested).toContain("kept prefix answer");
+    expect(requested).toContain("removed prefix thinking");
+    const sent = JSON.stringify(firstFallbackStep);
+    expect(sent).toContain("kept prefix answer");
+    expect(sent).not.toContain("removed prefix thinking");
+  });
+
   for (const family of ["anthropic", "openai"]) {
     for (const mode of [
       "pending",
@@ -1012,11 +1400,16 @@ describe("continuous prefix prepareStep and journal", () => {
       "sliced-row",
       "journal-failure",
       "ambiguous-anchor",
+      "native-mismatch",
     ] as const) {
       const consumed = mode !== "pending";
       const sliced = mode === "sliced-row";
       it(`${family} fallback ${mode} preserves the correct view and emits only after the hop commits`, async () => {
         const { swap, store } = await setup();
+        // The parent deferred a tool natively; the fallback's tools do not.
+        if (mode === "native-mismatch") {
+          swap.journal.preparation.deferLoadingToolNames = ["slack_send_message"];
+        }
         if (sliced) {
           swap.journal.headEnd = { id: "live", sequence: 1 };
           swap.journal.headPartIndex = 2;
@@ -1063,9 +1456,14 @@ describe("continuous prefix prepareStep and journal", () => {
           swap.prefix = await rebuildContinuousPrefix(swap.journal, workspaceId);
         }
         const nextModel = `${family}:fallback-model`;
-        const rebuilt = createMuxMessage("live", "assistant", "", {
-          stepStartPartIndices: sliced ? [0, 2] : [0],
-        });
+        // Sliced: no stepStartPartIndices, so the rebuild folds the tool-first step into the
+        // head step (a row from before the indices were persisted).
+        const rebuilt = createMuxMessage(
+          "live",
+          "assistant",
+          "",
+          sliced ? {} : { stepStartPartIndices: [0] }
+        );
         rebuilt.parts = [
           ...(sliced
             ? [
@@ -1102,8 +1500,9 @@ describe("continuous prefix prepareStep and journal", () => {
             output: { result: "obsolete result" },
           },
         ];
+        const { deferLoadingToolNames: _deferred, ...preparation } = swap.journal.preparation;
         const payload = await assemblePromptPayload({
-          ...swap.journal.preparation,
+          ...preparation,
           modelString: nextModel,
           providerForMessages: family,
           systemMessage: `Fresh fallback system for ${nextModel} with nextTool`,
@@ -1141,7 +1540,8 @@ describe("continuous prefix prepareStep and journal", () => {
           (family === "openai" ||
             sliced ||
             mode === "journal-failure" ||
-            mode === "ambiguous-anchor");
+            mode === "ambiguous-anchor" ||
+            mode === "native-mismatch");
         const originalAtomicWrite = atomicWrite.default;
         let failJournalWrites = false;
         if (mode === "journal-failure" && family === "anthropic") {

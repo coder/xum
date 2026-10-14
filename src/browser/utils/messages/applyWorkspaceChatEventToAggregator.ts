@@ -8,6 +8,7 @@ import {
   isCaughtUpMessage,
   isDeleteMessage,
   isGoalBudgetLimitedEvent,
+  isPluginHookNoticeEvent,
   isInitEnd,
   isInitOutput,
   isInitProgress,
@@ -91,6 +92,15 @@ export interface WorkspaceChatEventAggregator {
   clearTokenState(messageId: string): void;
 }
 
+/**
+ * Desktop perf harness (XUM_REPLAY_TAPES, exposed by preload): chat events come from a recorded
+ * session tape, so they must not trigger app side effects (gateway dialogs, skill refreshes,
+ * child-goal toasts, git/review refreshes).
+ */
+export function isSessionTapeReplayRenderer(): boolean {
+  return typeof window !== "undefined" && window.api?.isSessionTapeReplay === true;
+}
+
 function dispatchSkillsRefreshRequested(): void {
   if (typeof window === "undefined") return;
   window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.SKILLS_REFRESH_REQUESTED));
@@ -109,6 +119,19 @@ function dispatchMuxGatewaySessionExpired(): void {
  * - "immediate": state changed and callers should update UI immediately
  * - "ignored": event does not affect the aggregator
  */
+/**
+ * A hook's systemMessage can be up to 16 KiB, but the chat-input toast has no height limit or
+ * scrolling and an error toast stays until dismissed: a long one covers the chat and pushes its
+ * dismiss control off screen. Show only the start of it.
+ */
+const PLUGIN_HOOK_NOTICE_MAX_CHARS = 500;
+
+function boundPluginHookNotice(message: string): string {
+  if (message.length <= PLUGIN_HOOK_NOTICE_MAX_CHARS) return message;
+  // Cut by code point so the cut never splits a surrogate pair.
+  return `${Array.from(message).slice(0, PLUGIN_HOOK_NOTICE_MAX_CHARS).join("").trimEnd()}…`;
+}
+
 export function applyWorkspaceChatEventToAggregator(
   aggregator: WorkspaceChatEventAggregator,
   event: WorkspaceChatMessage,
@@ -120,7 +143,7 @@ export function applyWorkspaceChatEventToAggregator(
     "applyWorkspaceChatEventToAggregator requires event object"
   );
 
-  const allowSideEffects = options?.allowSideEffects !== false;
+  const allowSideEffects = options?.allowSideEffects !== false && !isSessionTapeReplayRenderer();
 
   if (isStreamStart(event)) {
     aggregator.handleStreamStart(event);
@@ -181,7 +204,10 @@ export function applyWorkspaceChatEventToAggregator(
     if (
       allowSideEffects &&
       event.replay !== true &&
-      (event.toolName === "agent_skill_read" || event.toolName === "agent_skill_list")
+      (event.toolName === "agent_skill_read" ||
+        event.toolName === "agent_skill_list" ||
+        event.toolName === "agent_skill_write" ||
+        event.toolName === "agent_skill_delete")
     ) {
       dispatchSkillsRefreshRequested();
     }
@@ -197,6 +223,16 @@ export function applyWorkspaceChatEventToAggregator(
   if (isReasoningEnd(event)) {
     aggregator.handleReasoningEnd(event);
     return "immediate";
+  }
+
+  if (isPluginHookNoticeEvent(event)) {
+    // A plugin hook's systemMessage: a toast for the user, never a transcript row.
+    if (allowSideEffects)
+      publishChatError(
+        event.workspaceId,
+        `Plugin ${event.plugin}: ${boundPluginHookNotice(event.message)}`
+      );
+    return "ignored";
   }
 
   if (isGoalBudgetLimitedEvent(event)) {

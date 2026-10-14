@@ -16,7 +16,7 @@ import type {
   // Chat options alias does not include store; Responses options do (frontier Grok / ZDR).
   XaiResponsesProviderOptions,
 } from "@ai-sdk/xai";
-import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
+import type { ProviderName } from "@/common/constants/providers";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
@@ -36,6 +36,7 @@ import {
   isKimiK3Model,
   openaiSupportsProMode,
   OPENROUTER_REASONING_EFFORT,
+  anthropicThinksUnlessDisabled,
 } from "@/common/types/thinking";
 import {
   isGeminiFlashMinimalRejectingModelName,
@@ -51,8 +52,10 @@ import {
   openaiModelSupportsServiceTier,
   openaiServiceTierAvailable,
 } from "./openaiProviderOptionsAvailability";
+import { openaiCyberAccessProgram } from "./cyberMode";
 import { openaiProModeAvailable } from "./proMode";
 import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
+import { resolveCoderRouteGatewayModelId } from "@/common/utils/providers/gatewayModelCatalog";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { log } from "@/node/services/log";
 import type { MuxMessage } from "@/common/types/message";
@@ -96,10 +99,15 @@ export { openaiProModeAvailable } from "./proMode";
  * for unknown instances). Mirrors resolveAndCreateModel's raw-prefix shadow
  * check: a custom provider named "coder" owns the prefix,
  * and its model IDs must not get gateway wire treatment.
+ *
+ * A canonical model routed onto Coder sends the bytes of the instance
+ * canonicalRoutes selects (a google-typed instance speaks OpenAI chat), so
+ * it resolves like the explicit gateway string the factory builds for it.
  */
 function resolveOptionsCanonicalModel(
   modelString: string,
-  providersConfig?: ProvidersConfigMap | null
+  providersConfig?: ProvidersConfigMap | null,
+  routeProvider?: ProviderName
 ): string {
   const colonIndex = modelString.indexOf(":");
   if (colonIndex === -1) {
@@ -115,13 +123,14 @@ function resolveOptionsCanonicalModel(
     const wireOrigin = customProviderWireOrigin(prefixEntry.providerType);
     return wireOrigin ? `${wireOrigin}:${modelString.slice(colonIndex + 1)}` : modelString;
   }
-  if (prefix !== "coder") {
+  if (prefix !== "coder" && routeProvider !== "coder") {
     return normalizeToCanonical(modelString);
   }
-  const wire = resolveCoderWireCanonicalModel(
-    modelString.slice(colonIndex + 1),
-    providersConfig?.coder
-  );
+  const gatewayModelId = resolveCoderRouteGatewayModelId(modelString, providersConfig ?? null);
+  const wire =
+    gatewayModelId == null
+      ? null
+      : resolveCoderWireCanonicalModel(gatewayModelId, providersConfig?.coder);
   return wire ? `${wire.origin}:${wire.modelId}` : normalizeToCanonical(modelString);
 }
 
@@ -137,7 +146,7 @@ interface OpenRouterReasoningOptions {
     exclude?: boolean;
     // "max" is not in OpenRouter's generic low/medium/high set; it is the only
     // effort Kimi K3 accepts (model metadata supported_efforts: ["max"]).
-    effort?: "low" | "medium" | "high" | "max";
+    effort?: "none" | "low" | "medium" | "high" | "max";
   };
 }
 
@@ -173,7 +182,45 @@ type ProviderOptions =
   | { zai: ZaiLanguageModelChatOptions }
   | { xai: XaiBuiltProviderOptions }
   | { "github-copilot": OpenAICompatibleGatewayProviderOptions }
+  | { bedrock: BedrockProviderOptions }
   | Record<string, never>; // Empty object for unsupported providers
+
+// Simple direct providers have self-contained reasoning controls. Keep these
+// separate from the gateway/OpenAI branches so vendor-only settings cannot leak.
+const DIRECT_REASONING_BUILDERS: Record<
+  string,
+  ((model: string, thinking: ThinkingLevel) => ProviderOptions) | undefined
+> = {
+  meta: (_model, thinking) => ({
+    // Meta uses the OpenAI Responses wire format. Stateless encrypted replay
+    // preserves reasoning across agent tool turns under the existing SDK namespace.
+    openai: {
+      forceReasoning: true, // The OpenAI SDK does not recognize Meta's model IDs.
+      store: false,
+      include: ["reasoning.encrypted_content"],
+      reasoningEffort: thinking === "off" ? "low" : thinking,
+      reasoningSummary: "auto",
+    },
+  }),
+  moonshotai: (model): ProviderOptions => {
+    // Kimi K3 always reasons and supports only max; do not rely on the API default.
+    return isKimiK3Model(model) ? { moonshotai: { reasoningEffort: "max" } } : {};
+  },
+  zai: (model, thinking): ProviderOptions => {
+    if (!isGlm53Model(model)) return {};
+    const reasoningEffort: ZaiLanguageModelChatOptions["reasoningEffort"] =
+      thinking === "max" ? "max" : thinking === "high" || thinking === "xhigh" ? "high" : "low";
+    return {
+      zai: { thinking: { type: "enabled" }, reasoningEffort, toolStream: true },
+    };
+  },
+};
+
+/** The subset of @ai-sdk/amazon-bedrock options Xum sends. */
+interface BedrockProviderOptions {
+  [key: string]: JSONValue | undefined;
+  additionalModelRequestFields?: Record<string, JSONValue>;
+}
 
 function resolveAnthropic1MCapabilityModel(
   modelString: string,
@@ -252,6 +299,44 @@ export function isAnthropic1MEffectivelyEnabled(
   return hasAnthropic1MIntentForModel(modelString, capabilityModel, muxProviderOptions);
 }
 
+/** The provider options with Anthropic 1M context turned on for `modelString`. */
+export function withAnthropic1MContextIntent(
+  modelString: string,
+  muxProviderOptions: MuxProviderOptions | undefined
+): MuxProviderOptions {
+  const existingModels = muxProviderOptions?.anthropic?.use1MContextModels ?? [];
+  return {
+    ...muxProviderOptions,
+    anthropic: {
+      ...muxProviderOptions?.anthropic,
+      use1MContext: true,
+      use1MContextModels: existingModels.includes(modelString)
+        ? existingModels
+        : [...existingModels, modelString],
+    },
+  };
+}
+
+/**
+ * True when 1M context is off for `modelString` and turning it on would take effect. This is
+ * the case in which AgentSession.resolveCompactionRetryPlan retries a compaction request with
+ * 1M context, so resolveCompactionInputBudgetTokens leaves its first attempt untrimmed.
+ */
+export function canSwitchToAnthropic1MContext(
+  modelString: string,
+  muxProviderOptions: MuxProviderOptions | undefined,
+  providersConfig: ProvidersConfigMap | null | undefined
+): boolean {
+  return (
+    !isAnthropic1MEffectivelyEnabled(modelString, muxProviderOptions, providersConfig) &&
+    isAnthropic1MEffectivelyEnabled(
+      modelString,
+      withAnthropic1MContextIntent(modelString, muxProviderOptions),
+      providersConfig
+    )
+  );
+}
+
 /**
  * Route-aware eligibility for Anthropic's thinking block-binding control.
  *
@@ -318,20 +403,12 @@ export function anthropicBetweenToolsRouteAvailable(
     return false;
   }
   // A model routed onto Coder from its canonical id (anthropic:x) goes to the
-  // instance the route table names (anthropic/x), the same id the factory builds.
-  const colonIndex = modelString.indexOf(":");
-  if (colonIndex <= 0) {
-    return false;
-  }
-  const gatewayModelId = modelString.startsWith("coder:")
-    ? modelString.slice("coder:".length)
-    : PROVIDER_DEFINITIONS.coder.toGatewayModelId(
-        modelString.slice(0, colonIndex),
-        modelString.slice(colonIndex + 1)
-      );
+  // instance canonicalRoutes selects, the same id the factory builds.
+  const gatewayModelId = resolveCoderRouteGatewayModelId(modelString, providersConfig ?? null);
   return (
+    gatewayModelId != null &&
     resolveCoderWireCanonicalModel(gatewayModelId, providersConfig?.coder)?.providerType ===
-    "anthropic"
+      "anthropic"
   );
 }
 
@@ -373,7 +450,7 @@ export function buildProviderOptions(
   // Caller is responsible for enforcing thinking policy before calling this function.
   // agentSession.ts is the canonical enforcement point.
   // Parse origin from normalized model string
-  const normalizedModel = resolveOptionsCanonicalModel(modelString, providersConfig);
+  const normalizedModel = resolveOptionsCanonicalModel(modelString, providersConfig, routeProvider);
   const [origin, modelName] = normalizedModel.split(":", 2);
 
   if (!origin || !modelName) {
@@ -386,19 +463,22 @@ export function buildProviderOptions(
   // SDK payload-family selection: passthrough gateways use origin payloads,
   // while transforming gateways use the route provider's payload schema.
   const formatProvider =
-    providerOptionsNamespaceKey === origin ? origin : (routeProvider ?? origin);
+    providerOptionsNamespaceKey === resolveProviderOptionsNamespaceKey(origin)
+      ? origin
+      : (routeProvider ?? origin);
 
   // Fast mode follows the actual route/wire, not capability aliases or thinking.
   // Ultrafast is additionally model-gated; unsupported models drop the tier.
   const requestedServiceTier = muxProviderOptions?.openai?.serviceTier;
+  const serviceTierRouteOptions = {
+    providersConfig,
+    resolvedRouteProvider: routeProvider === origin ? "direct" : routeProvider,
+    openaiWireFormat: muxProviderOptions?.openai?.wireFormat,
+  };
   const serviceTier =
     requestedServiceTier != null &&
-    openaiServiceTierAvailable(modelString, {
-      providersConfig,
-      resolvedRouteProvider: routeProvider === origin ? "direct" : routeProvider,
-      openaiWireFormat: muxProviderOptions?.openai?.wireFormat,
-    }) &&
-    openaiModelSupportsServiceTier(modelString, requestedServiceTier, providersConfig)
+    openaiServiceTierAvailable(modelString, serviceTierRouteOptions) &&
+    openaiModelSupportsServiceTier(modelString, requestedServiceTier, serviceTierRouteOptions)
       ? requestedServiceTier
       : undefined;
 
@@ -409,13 +489,14 @@ export function buildProviderOptions(
   // payload-format selection, so metadata must resolve from the raw identity.
   // Coder strings likewise resolve from the raw identity whenever the instance
   // type maps them to an upstream model: the wire identity keeps Bedrock's
-  // openai.<model> namespace, which the GPT-6 effort matchers miss.
+  // openai.<model> namespace, which the GPT-6 effort matchers miss. A canonical
+  // model routed onto Coder keeps its own identity, not the instance's wire.
   const rawPrefixForMetadata = modelString.slice(0, Math.max(modelString.indexOf(":"), 0));
   const metadataModel =
     isCustomProviderConfig(providersConfig?.[rawPrefixForMetadata]) ||
     resolveCoderGatewayMetadataModel(modelString, providersConfig) != null
       ? modelString
-      : normalizedModel;
+      : resolveOptionsCanonicalModel(modelString, providersConfig);
   const capabilityModel = resolveModelForMetadata(metadataModel, providersConfig ?? null);
   const [, resolvedCapabilityModelName] = capabilityModel.split(":", 2);
   const capModelName = resolvedCapabilityModelName || modelName;
@@ -455,7 +536,8 @@ export function buildProviderOptions(
     // Opus 4.5 uses enabled thinking with a budgetTokens ceiling.
     const isOpus45 = capModelName?.includes("opus-4-5") ?? false;
     const isOpus46 = capModelName?.includes("opus-4-6") ?? false;
-    // Opus 4.7+ and Sonnet 5+ — the native-xhigh tier, which also uses adaptive thinking.
+    // Opus 4.7+, Sonnet 5+ and Haiku 5+ — the native-xhigh tier, which also uses adaptive
+    // thinking. Haiku 5.5 must land here: it rejects `budget_tokens` (400).
     const supportsNativeXhigh = anthropicSupportsNativeXhigh(capabilityModel);
     const isSonnet46 = capModelName?.includes("sonnet-4-6") ?? false;
     const usesAdaptiveThinking = isOpus46 || supportsNativeXhigh || isSonnet46;
@@ -595,6 +677,14 @@ export function buildProviderOptions(
             providersConfig,
             resolvedRouteProvider: routeProvider,
           }));
+    const cyberAccessProgram =
+      isResponses && reasoningMode === "cyber"
+        ? openaiCyberAccessProgram(modelString, {
+            providersConfig,
+            resolvedRouteProvider: routeProvider === origin ? "direct" : routeProvider,
+            openaiWireFormat: muxProviderOptions?.openai?.wireFormat,
+          })
+        : undefined;
     const truncationMode = openaiTruncationMode ?? "disabled";
     // Bedrock Mantle keeps openai.<model> on the wire, which @ai-sdk/openai
     // does not classify as a reasoning model (it anchors on gpt-*/o* IDs) and
@@ -621,6 +711,7 @@ export function buildProviderOptions(
       historyMessages: messages?.length ?? 0,
       promptCacheKey,
       reasoningMode: shouldUseProMode ? "pro" : undefined,
+      cyberAccessProgram,
       truncation: truncationMode,
       wireFormat,
     });
@@ -638,6 +729,9 @@ export function buildProviderOptions(
           // Direct OpenAI and Coder Responses forward it; mux-gateway drops
           // this provider option and Codex OAuth strips it.
           ...(shouldUseProMode && { reasoningMode: "pro" as const }),
+          // Private per-call key the SDK ignores; providerModelFactory serializes
+          // it as access_programs.cyber on direct OpenAI only.
+          ...(cyberAccessProgram != null && { cyberAccessProgram }),
           // Stable prompt cache key to improve OpenAI cache hit rates
           // See: https://sdk.vercel.ai/providers/ai-sdk-providers/openai#responses-models
           ...(promptCacheKey && { promptCacheKey }),
@@ -718,40 +812,13 @@ export function buildProviderOptions(
     return options;
   }
 
-  // Build Moonshot-specific options
-  if (formatProvider === "moonshotai") {
-    // Kimi K3 always reasons and supports only the max reasoning effort. Send it
-    // explicitly rather than relying on the API default.
-    if (isKimiK3Model(capabilityModel)) {
-      const options = {
-        moonshotai: { reasoningEffort: "max" },
-      } satisfies { moonshotai: MoonshotAIProviderOptions };
-      log.debug("buildProviderOptions: Returning Moonshot options", options);
-      return options;
-    }
-    return {};
-  }
-
-  // Build Z.ai-specific options
-  if (formatProvider === "zai") {
-    if (!isGlm53Model(capabilityModel)) {
-      return {};
-    }
-
-    const reasoningEffort: ZaiLanguageModelChatOptions["reasoningEffort"] =
-      effectiveThinking === "max"
-        ? "max"
-        : effectiveThinking === "high" || effectiveThinking === "xhigh"
-          ? "high"
-          : "low";
-    const options = {
-      zai: {
-        thinking: { type: "enabled" },
-        reasoningEffort,
-        toolStream: true,
-      },
-    } satisfies { zai: ZaiLanguageModelChatOptions };
-    log.debug("buildProviderOptions: Returning Z.ai options", options);
+  const directReasoningBuilder = DIRECT_REASONING_BUILDERS[formatProvider];
+  if (Object.hasOwn(DIRECT_REASONING_BUILDERS, formatProvider) && directReasoningBuilder) {
+    const options = directReasoningBuilder(capabilityModel, effectiveThinking);
+    log.debug("buildProviderOptions: Returning direct provider options", {
+      formatProvider,
+      options,
+    });
     return options;
   }
 
@@ -763,14 +830,22 @@ export function buildProviderOptions(
     const reasoningEffort = isKimiK3Model(capabilityModel)
       ? "max"
       : OPENROUTER_REASONING_EFFORT[effectiveThinking];
+    // Haiku 5.5 reasons adaptively when `reasoning` is omitted, so "off" must
+    // disable it explicitly, as on the direct and Bedrock routes. OpenRouter
+    // documents effort "none" as disabling reasoning entirely.
+    const disableReasoning =
+      !reasoningEffort &&
+      effectiveThinking === "off" &&
+      anthropicThinksUnlessDisabled(capabilityModel);
 
     log.debug("buildProviderOptions: OpenRouter config", {
       reasoningEffort,
+      disableReasoning,
       thinkingLevel: effectiveThinking,
     });
 
     // OpenRouter spreads this namespace directly into the HTTP body.
-    if (reasoningEffort || serviceTier != null) {
+    if (reasoningEffort || disableReasoning || serviceTier != null) {
       const options = {
         openrouter: {
           ...(serviceTier != null && { service_tier: serviceTier }),
@@ -782,6 +857,7 @@ export function buildProviderOptions(
               exclude: false,
             },
           }),
+          ...(disableReasoning && { reasoning: { effort: "none" } }),
         },
       } satisfies { openrouter: OpenRouterReasoningOptions };
       log.debug("buildProviderOptions: Returning OpenRouter options", options);
@@ -885,6 +961,33 @@ export function buildProviderOptions(
     return options;
   }
 
+  // Bedrock gets no thinking options yet, so Claude runs with the model's own
+  // default there (#5839). For Haiku 4.5 that default is no thinking, so the
+  // `haiku` alias kept "off" on Bedrock. Haiku 5.5 thinks adaptively when
+  // `thinking` is omitted, so "off" must be sent explicitly: otherwise Bedrock users
+  // silently pay for reasoning, and the workspace-naming fallback (which runs at "off")
+  // loses its forced tool choice. Mirror the direct route: disabled thinking at low
+  // effort (Haiku 5.5 accepts disabled thinking at high effort or below). The SDK
+  // serializes `reasoningConfig: { type: "disabled" }` as nothing for Claude, so the
+  // fields go through additionalModelRequestFields verbatim.
+  if (
+    formatProvider === "bedrock" &&
+    origin === "anthropic" &&
+    effectiveThinking === "off" &&
+    anthropicThinksUnlessDisabled(capabilityModel)
+  ) {
+    const options = {
+      bedrock: {
+        additionalModelRequestFields: {
+          thinking: { type: "disabled" },
+          output_config: { effort: getAnthropicEffort(effectiveThinking, capabilityModel) },
+        },
+      },
+    } satisfies { bedrock: BedrockProviderOptions };
+    log.debug("buildProviderOptions: Returning Bedrock options", options);
+    return options;
+  }
+
   // No provider-specific options for unsupported providers
   log.debug("buildProviderOptions: Unsupported format provider", {
     formatProvider,
@@ -948,7 +1051,7 @@ export function buildRequestHeaders(
     headers[MUX_WORKSPACE_ID_HEADER] = toWorkspaceHeaderValue(workspaceId);
   }
 
-  const normalized = resolveOptionsCanonicalModel(modelString, providersConfig);
+  const normalized = resolveOptionsCanonicalModel(modelString, providersConfig, routeProvider);
   const [origin] = normalized.split(":", 2);
 
   // 1M context header — only when origin supports it AND route is passthrough (or direct)

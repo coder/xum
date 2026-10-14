@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 
 import { installDom } from "../../../../tests/ui/dom";
@@ -138,6 +138,56 @@ describe("PRStackBadge", () => {
     fireEvent.click(trigger);
     expect(view.queryByRole("menu")).not.toBeNull();
     fireEvent.mouseDown(document.body);
+    expect(view.queryByRole("menu")).toBeNull();
+  });
+
+  it("stays open while a row is pressed so its link click can land", () => {
+    const view = render(<PRStackBadge stack={STACK} />);
+    fireEvent.click(view.getByRole("button", { name: "View stack with 3 branches" }));
+
+    fireEvent.mouseDown(view.getAllByTestId("stack-branch-row")[0]);
+    expect(view.queryByRole("menu")).not.toBeNull();
+  });
+
+  it("focuses the first linked row when it opens", () => {
+    const stack: WorkspaceStackInfo = {
+      ...STACK,
+      branches: [
+        ...STACK.branches,
+        { branch: "mike/feat-d", isCurrent: false, needsRebase: false },
+      ],
+    };
+    const view = render(<PRStackBadge stack={stack} />);
+    fireEvent.click(view.getByRole("button", { name: "View stack with 4 branches" }));
+
+    // The top row has no PR to open, so focus skips it.
+    expect(document.activeElement?.getAttribute("data-branch")).toBe("mike/feat-c");
+  });
+
+  it("returns focus to the trigger when Escape closes it from a row", () => {
+    const view = render(<PRStackBadge stack={STACK} />);
+    const trigger = view.getByRole("button", { name: "View stack with 3 branches" });
+    fireEvent.click(trigger);
+
+    fireEvent.keyDown(view.getAllByTestId("stack-branch-row")[0], { key: "Escape" });
+    expect(view.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it("closes on resize once CSS hides its trigger", () => {
+    const view = render(<PRStackBadge stack={STACK} />);
+    const trigger = view.getByRole("button", { name: "View stack with 3 branches" });
+    fireEvent.click(trigger);
+    // happy-dom has no layout: stub what a rendered and then a display:none trigger report.
+    const rects = spyOn(trigger, "getClientRects").mockReturnValue([
+      trigger.getBoundingClientRect(),
+    ] as unknown as DOMRectList);
+
+    fireEvent(window, new Event("resize"));
+    expect(view.queryByRole("menu")).not.toBeNull();
+
+    rects.mockReturnValue([] as unknown as DOMRectList);
+    fireEvent(window, new Event("resize"));
     expect(view.queryByRole("menu")).toBeNull();
   });
 });

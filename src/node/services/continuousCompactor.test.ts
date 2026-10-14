@@ -278,6 +278,42 @@ describe("ContinuousCompactor", () => {
     expect(full.map((row) => row.id)).toContain("plan-snapshot");
   });
 
+  it("hands the summarizer the segment's rows, so a tail receipt reaches it (#5996)", async () => {
+    // The Anthropic thinking-repair receipt sits in the retained tail; the head it summarizes
+    // holds none. The summarizer must still see it to keep the head's thinking out.
+    const receiptAnswer = createMuxMessage("recent-answer", "assistant", "The fix is ready.", {
+      anthropicThinkingReplay: "off",
+    });
+    await seed(
+      createMuxMessage("old-user", "user", "Investigate the regression"),
+      createMuxMessage("old-answer", "assistant", "earlier investigation ".repeat(4_000)),
+      createMuxMessage("recent-user", "user", "Implement the fix"),
+      receiptAnswer
+    );
+    await stage();
+    const [head, , , receiptRows] = summarize.mock.calls[0];
+    expect(head.map((row) => row.id)).toEqual(["old-user", "old-answer"]);
+    expect(
+      receiptRows?.find((row) => row.id === "recent-answer")?.metadata?.anthropicThinkingReplay
+    ).toBe("off");
+  });
+
+  it("carries the live turn's in-memory receipt to the summarizer (#5996)", async () => {
+    const answer = await seedLiveTurn(true);
+    assert(live, "Expected an active stream snapshot");
+    // Set on the running turn only: no partial with the receipt has reached disk yet.
+    live.initialMetadata = { anthropicThinkingReplay: "off" };
+    expect(answer.metadata?.anthropicThinkingReplay).toBeUndefined();
+    await (
+      await start(eagerPercent, { ...context, phase: "mid-stream" })
+    ).job;
+    expect(summarize).toHaveBeenCalledTimes(1);
+    const receiptRows = summarize.mock.calls[0][3];
+    expect(
+      receiptRows?.find((row) => row.id === answer.id)?.metadata?.anthropicThinkingReplay
+    ).toBe("off");
+  });
+
   it("awaits compaction.prepare listener persistence before taking the head snapshot", async () => {
     await seedConversation();
     const listenerEntered = deferred();

@@ -275,12 +275,13 @@ describe("AutoModelRoutingExperimentConfig", () => {
   });
 
   test("a label committed on blur spreads the config another window replaced while typing", async () => {
-    const configChange = { signal: null as (() => void) | null };
+    // The shared AppConfigStore subscribes too, so signal every subscriber.
+    const configChangeSignals: Array<() => void> = [];
     mockApi.config.onConfigChanged = mock(() =>
       Promise.resolve({
         next: () =>
           new Promise<IteratorResult<void>>((resolve) => {
-            configChange.signal = () => resolve({ done: false, value: undefined });
+            configChangeSignals.push(() => resolve({ done: false, value: undefined }));
           }),
         return: () => Promise.resolve({ done: true, value: undefined }),
         [Symbol.asyncIterator]() {
@@ -290,7 +291,7 @@ describe("AutoModelRoutingExperimentConfig", () => {
     );
     const { container, getByLabelText } = renderConfig();
     await waitFor(() => expect(tierRows(container)).toHaveLength(4));
-    await waitFor(() => expect(configChange.signal).not.toBeNull());
+    await waitFor(() => expect(configChangeSignals.length).toBeGreaterThan(0));
 
     const label = getByLabelText("Tier 1 label") as HTMLInputElement;
     await userEvent.type(label, "Fast", {
@@ -310,7 +311,7 @@ describe("AutoModelRoutingExperimentConfig", () => {
         })
       )
     );
-    configChange.signal?.();
+    for (const signal of configChangeSignals.splice(0)) signal();
     const field = getByLabelText("Evaluation model") as HTMLInputElement;
     await waitFor(() => expect(field.value).toBe("openai:gpt-5.5"));
 

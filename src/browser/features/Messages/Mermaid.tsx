@@ -7,8 +7,13 @@ import { isDesktopViewportFocused } from "@/browser/utils/ui/keybinds";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { transcriptMermaidSources } from "@/browser/utils/messages/transcriptQuoteAttributes";
 import { MERMAID_DIAGRAM_ZOOM_KEY } from "@/common/constants/storage";
+import {
+  MERMAID_CONTAINER_STYLE,
+  MERMAID_FRAME_STYLE,
+  MERMAID_PENDING_STYLE,
+  MERMAID_PENDING_TEXT,
+} from "./MermaidPendingFrame";
 
-const MIN_HEIGHT = 300;
 const DEFAULT_ZOOM = 1;
 const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 3;
@@ -395,15 +400,7 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
 
   return (
     <>
-      <div
-        style={{
-          position: "relative",
-          margin: "1em 0",
-          background: "var(--color-code-bg)",
-          borderRadius: "4px",
-          padding: "16px",
-        }}
-      >
+      <div style={MERMAID_FRAME_STYLE}>
         <div
           style={{
             position: "absolute",
@@ -437,26 +434,16 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
             else transcriptMermaidSources.delete(element);
           }}
           style={{
-            maxWidth: "70%",
-            margin: "0 auto",
+            ...MERMAID_CONTAINER_STYLE,
             ["--diagram-zoom" as string]: `${diagramZoom}`,
-            minHeight: `${MIN_HEIGHT}px`,
-            ...(showPendingPlaceholder
-              ? {
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  color: "var(--color-text-secondary)",
-                  fontStyle: "italic",
-                }
-              : {}),
+            ...(showPendingPlaceholder ? MERMAID_PENDING_STYLE : {}),
           }}
           // SECURITY AUDIT: displaySvg is produced by sanitizeMermaidSvg(), which strips
           // active SVG/HTML content before insertion. React children are used for the
           // pending placeholder so untrusted chart text is never rendered as HTML.
           {...(!showPendingPlaceholder ? { dangerouslySetInnerHTML: { __html: displaySvg } } : {})}
         >
-          {showPendingPlaceholder ? "Rendering diagram..." : null}
+          {showPendingPlaceholder ? MERMAID_PENDING_TEXT : null}
         </div>
       </div>
       {isModalOpen && (

@@ -25,11 +25,6 @@ export interface ModelDiscoveryRequest {
   readonly apiKey?: string;
   readonly organization?: string;
   readonly headers?: Readonly<Record<string, string>>;
-  readonly policy: Readonly<{
-    enforced: boolean;
-    forcedBaseUrl?: string;
-    allowedModels?: readonly string[] | null;
-  }>;
 }
 const ModelId = z
   .string()
@@ -128,7 +123,7 @@ export async function discoverProviderModels(
     const anthropic = request.format === "anthropic";
     const base = anthropic
       ? normalizeAnthropicBaseURL(request.baseUrl)
-      : request.provider === "openai" || request.providerType
+      : ["openai", "meta"].includes(request.provider) || request.providerType
         ? normalizeOpenAICompatibleBaseURL(request.baseUrl)
         : request.baseUrl;
     let url = new URL(base);
@@ -233,11 +228,7 @@ export async function discoverProviderModels(
         await agent.destroy().catch(() => undefined);
         agent = undefined;
         current();
-        const allowed = request.policy.allowedModels;
-        return {
-          status: "ok",
-          modelIds: [...ids].filter((id) => !allowed || allowed.includes(id)),
-        };
+        return { status: "ok", modelIds: [...ids] };
       }
       if (!data.count) throw new Error();
       let cursor = data.cursor;

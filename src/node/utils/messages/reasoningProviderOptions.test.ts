@@ -8,6 +8,7 @@ import {
   mergeReasoningProviderOptions,
   reasoningProviderOptionsFromMetadata,
   stripReasoningReplay,
+  type ReasoningProviderMetadata,
 } from "./reasoningProviderOptions";
 
 describe("reasoningProviderOptionsFromMetadata", () => {
@@ -15,6 +16,21 @@ describe("reasoningProviderOptionsFromMetadata", () => {
     expect(reasoningProviderOptionsFromMetadata({ anthropic: { signature: "sig_abc" } })).toEqual({
       anthropic: { signature: "sig_abc" },
     });
+  });
+
+  test("keeps Anthropic redacted_thinking data, which replays only without a signature", () => {
+    expect(reasoningProviderOptionsFromMetadata({ anthropic: { redactedData: "opaque" } })).toEqual(
+      {
+        anthropic: { redactedData: "opaque" },
+      }
+    );
+    // The SDK replays a part as `thinking` whenever a signature is present, so a
+    // part carrying both must not turn into a malformed mix of the two blocks.
+    expect(
+      reasoningProviderOptionsFromMetadata({
+        anthropic: { signature: "sig_abc", redactedData: "opaque" },
+      })
+    ).toEqual({ anthropic: { signature: "sig_abc" } });
   });
 
   test("maps xAI encrypted reasoning used for ZDR multi-turn quality", () => {
@@ -109,6 +125,20 @@ describe("attachReasoningReplayMetadata", () => {
     // Request-only: the persisted part keeps its itemId for debugging/downgrade.
     expect(part.providerOptions).toEqual({
       openai: { itemId: "rs_1", reasoningEncryptedContent: "enc" },
+    });
+  });
+
+  test("forwards Anthropic redacted_thinking data so the SDK replays the block", () => {
+    const redacted: ReasoningProviderMetadata = { anthropic: { redactedData: "opaque" } };
+    const input = assistantMessage([
+      { type: "reasoning", text: "", providerOptions: redacted },
+      { type: "text", text: "answer" },
+    ]);
+
+    const [output] = attachReasoningReplayMetadata([input]);
+
+    expect(reasoningParts(output)[0].providerMetadata).toEqual({
+      anthropic: { redactedData: "opaque" },
     });
   });
 

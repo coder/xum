@@ -9,11 +9,15 @@ import {
   isDesktopViewportFocused,
   isTerminalFocused,
   isDialogOpen,
+  isCommandPaletteTarget,
+  paneHandlesKeyEvent,
 } from "@/browser/utils/ui/keybinds";
+import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import type { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
 import { isCompactingStream, cancelCompaction } from "@/browser/utils/compaction/handler";
 import { stopStream } from "@/browser/utils/stopStream";
 import { useAPI } from "@/browser/contexts/API";
+import { isEscapeDismissOverlayOpen } from "@/browser/hooks/useEscapeToDismiss";
 import type { EditingMessageState } from "@/browser/utils/chatEditing";
 
 interface UseAIViewKeybindsParams {
@@ -64,9 +68,13 @@ export function useAIViewKeybinds({
   resumeInterruptedStream,
 }: UseAIViewKeybindsParams): void {
   const { api } = useAPI();
+  // The main chat and the /side chat tab both mount these window listeners; only the pane that
+  // owns the event's target acts, so Esc/Ctrl+I/Shift+G never hit both chats at once.
+  const paneScope = useChatPaneScope();
 
   useEffect(() => {
     const handleInterruptKeyDown = (e: KeyboardEvent) => {
+      if (!paneHandlesKeyEvent(paneScope, e.target)) return;
       // Check vim-aware interrupt keybind
       const interruptKeybind = vimEnabled
         ? KEYBINDS.INTERRUPT_STREAM_VIM
@@ -88,6 +96,11 @@ export function useAIViewKeybinds({
       ) {
         // If something else already claimed this key event, skip.
         if (e.defaultPrevented) {
+          return;
+        }
+
+        // An open overlay (tutorial, narrow-screen drawer) takes this Escape to close itself.
+        if (interruptKeybind === KEYBINDS.INTERRUPT_STREAM_NORMAL && isEscapeDismissOverlayOpen()) {
           return;
         }
 
@@ -130,6 +143,7 @@ export function useAIViewKeybinds({
     };
 
     const handleKeyDownCapture = (e: KeyboardEvent) => {
+      if (!paneHandlesKeyEvent(paneScope, e.target)) return;
       // Remote desktops own their keyboard, including chat/editor shortcuts.
       if (isDesktopViewportFocused(e.target)) return;
       const dialogOpen = isDialogOpen();
@@ -137,7 +151,8 @@ export function useAIViewKeybinds({
       // Focus chat input works anywhere (even in input fields)
       if (matchesKeybind(e, KEYBINDS.FOCUS_CHAT)) {
         e.preventDefault();
-        if (!dialogOpen) chatInputAPI.current?.focus();
+        // Same rule as the creation screen: focus must not move behind the command palette (#5752).
+        if (!dialogOpen && !isCommandPaletteTarget(e.target)) chatInputAPI.current?.focus();
         return;
       }
 
@@ -209,5 +224,6 @@ export function useAIViewKeybinds({
     canResumeInterruptedStream,
     resumeInterruptedStream,
     api,
+    paneScope,
   ]);
 }

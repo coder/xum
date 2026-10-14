@@ -117,14 +117,13 @@ export interface WorkspaceServiceForTestOptions {
   extensionMetadata?: ExtensionMetadataService;
   backgroundProcessManager?: BackgroundProcessManager;
   sessionUsageService?: WorkspaceServiceArgs[7];
-  policyService?: WorkspaceServiceArgs[8];
-  telemetryService?: WorkspaceServiceArgs[9];
-  experimentsService?: WorkspaceServiceArgs[10];
-  sessionTimingService?: WorkspaceServiceArgs[11];
-  streamManager?: WorkspaceServiceArgs[12];
-  secretsStore?: WorkspaceServiceArgs[13];
+  telemetryService?: WorkspaceServiceArgs[8];
+  experimentsService?: WorkspaceServiceArgs[9];
+  sessionTimingService?: WorkspaceServiceArgs[10];
+  streamManager?: WorkspaceServiceArgs[11];
+  secretsStore?: WorkspaceServiceArgs[12];
   /** App fiber scope whose close runs the service's shutdown join. */
-  appFiberScope?: WorkspaceServiceArgs[17];
+  appFiberScope?: WorkspaceServiceArgs[16];
 }
 
 /**
@@ -154,7 +153,6 @@ export function createWorkspaceServiceForTest(
       new ExtensionMetadataService(path.join(config.rootDir, "extensionMetadata.json")),
     options.backgroundProcessManager ?? createTestBackgroundProcessManager(),
     options.sessionUsageService,
-    options.policyService,
     options.telemetryService,
     options.experimentsService,
     options.sessionTimingService,

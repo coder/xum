@@ -25,6 +25,7 @@ import {
   isGrokFrontierModel,
   isGlm53Model,
   isKimiK3Model,
+  isMuseWonderModel,
   openaiRejectsDisabledReasoning,
   openaiSupportsNativeMaxEffort,
   stripModelProviderPrefixes,
@@ -112,6 +113,14 @@ export function getThinkingPolicyForModel(
  * Shared by both standard reasoning models and non-reasoning models, so it is NOT a
  * reliable "supports reasoning" signal on its own (see getDefaultMinimumThinkingLevel).
  */
+// These families share the same always-on, five-level ladder. Reuse the matchers
+// when resolving an unset level so tracked thinking matches the request's effort.
+const ALWAYS_ON_FIVE_LEVEL_MODELS = [
+  anthropicRejectsDisabledThinking,
+  openaiRejectsDisabledReasoning,
+  isMuseWonderModel,
+];
+
 const DEFAULT_THINKING_POLICY: ThinkingPolicy = ["off", "low", "medium", "high"];
 
 /**
@@ -136,7 +145,7 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
   // Mythos-class models (Fable/Mythos) and Opus 5.5 cannot disable thinking — the
   // API rejects `thinking: { type: "disabled" }` and always thinks (adaptive by
   // default) — so "off" is not offered and requests for it clamp up to "low".
-  if (anthropicRejectsDisabledThinking(modelString)) {
+  if (ALWAYS_ON_FIVE_LEVEL_MODELS.some((matches) => matches(modelString))) {
     return ["low", "medium", "high", "xhigh", "max"];
   }
 
@@ -151,12 +160,6 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
     withoutProviderNamespace.includes("sonnet-4-6")
   ) {
     return ["off", "low", "medium", "high", "xhigh"];
-  }
-
-  // GPT-6 Astra and GPT-6.1 Sol cannot disable reasoning: the API rejects effort "none"
-  // with a 400 and lists no "minimal", so "off" is not offered and clamps up to "low".
-  if (openaiRejectsDisabledReasoning(withoutProviderNamespace)) {
-    return ["low", "medium", "high", "xhigh", "max"];
   }
 
   // GPT-6 Luna supports both disabled reasoning and native max.
@@ -220,6 +223,11 @@ function thinkingLevelIndex(level: ThinkingLevel): number {
   return THINKING_LEVELS.indexOf(level);
 }
 
+/** Claude Haiku of any generation, tolerating provider prefixes and Bedrock's `anthropic.` prefix. */
+function isClaudeHaikuModel(modelString: string): boolean {
+  return /(?:^|\.)claude-haiku-/.test(stripModelProviderPrefixes(modelString));
+}
+
 /**
  * Default *minimum* thinking level (floor) for a model.
  *
@@ -242,6 +250,15 @@ export function getDefaultMinimumThinkingLevel(
   // A binary model must retain its off option unless the user explicitly raises the floor.
   const policy = getThinkingPolicyForModel(modelString, providersConfig);
   if (policy.length === 2 && policy[0] === "off") return THINKING_LEVEL_OFF;
+  // Haiku is the cheap, fast tier: `/haiku+0` and stored "off" must keep thinking off.
+  // Haiku 4.5 got that from the default policy; Haiku 5.5 matches an explicit policy
+  // (native xhigh), which would otherwise raise the default floor to medium.
+  if (
+    policy[0] === "off" &&
+    isClaudeHaikuModel(resolveModelForMetadata(modelString, providersConfig ?? null))
+  ) {
+    return THINKING_LEVEL_OFF;
+  }
   return hasExplicitThinkingPolicy(modelString, providersConfig)
     ? DEFAULT_THINKING_LEVEL
     : THINKING_LEVEL_OFF;
@@ -329,9 +346,8 @@ export function resolveEffectiveThinkingLevel(
   // Gemini 3.8 Flash rejects "minimal" and GPT-6 Astra rejects "none", so an
   // unset/"off" level must clamp here too; otherwise the tracked level would say
   // "off" while the adapter sends "low".
-  return anthropicRejectsDisabledThinking(capabilityModel) ||
+  return ALWAYS_ON_FIVE_LEVEL_MODELS.some((matches) => matches(capabilityModel)) ||
     isGlm53Model(capabilityModel) ||
-    openaiRejectsDisabledReasoning(capabilityModel) ||
     isGeminiFlashMinimalRejectingModelName(stripModelProviderPrefixes(capabilityModel))
     ? enforceThinkingPolicy(capabilityModel, level)
     : level;

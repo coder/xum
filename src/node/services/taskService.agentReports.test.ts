@@ -332,7 +332,12 @@ describe("TaskService", () => {
       childId,
       expect.stringContaining("Your stream ended without a final assistant response"),
       expect.any(Object),
-      expect.objectContaining({ synthetic: true, agentInitiated: true })
+      // Provenance lets the goal tools tell this automatic report prompt from user turns.
+      expect.objectContaining({
+        synthetic: true,
+        agentInitiated: true,
+        taskTurnKind: "required_report",
+      })
     );
     expect(sendMessage).not.toHaveBeenCalledWith(
       childId,
@@ -2810,6 +2815,100 @@ describe("TaskService", () => {
     expect(resumeStream).toHaveBeenCalledWith(parentId, expect.any(Object), {
       acceptanceOrigin: "automatic",
       agentInitiated: true,
+    });
+  });
+
+  // A nested task owner resumed (prompt-free) for its own child's report runs an automatic
+  // task turn, so the resume carries provenance that keeps set_goal refused there.
+  test("a nested task owner's prompt-free report wake is a recovery task turn", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const rootId = "root-000";
+    const parentId = "parent-111";
+    const childId = "child-222";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", rootId),
+        projectWorkspace(projectPath, "parent", parentId, {
+          name: "agent_exec_parent",
+          parentWorkspaceId: rootId,
+          agentType: "exec",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "child", childId, {
+          name: "agent_explore_child",
+          parentWorkspaceId: parentId,
+          agentType: "explore",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { aiService } = createAIServiceMocks(config);
+    const { workspaceService, resumeStream } = createWorkspaceServiceMocks();
+    const { historyService, partialService, taskService } = createTaskServiceHarness(config, {
+      aiService,
+      workspaceService,
+    });
+
+    const appendParentHistory = await historyService.appendToHistory(
+      parentId,
+      createMuxMessage(
+        "assistant-parent-history",
+        "assistant",
+        "Spawned subagent",
+        { timestamp: Date.now() },
+        [
+          {
+            type: "dynamic-tool",
+            toolCallId: "task-call-1",
+            toolName: "task",
+            input: { subagent_type: "explore", prompt: "do the thing", run_in_background: true },
+            state: "output-available",
+            output: { status: "running", taskId: childId },
+          },
+        ]
+      )
+    );
+    expect(appendParentHistory.success).toBe(true);
+
+    const childPartial = createMuxMessage(
+      "assistant-child-partial",
+      "assistant",
+      "",
+      { timestamp: Date.now(), historySequence: 0 },
+      [
+        {
+          type: "dynamic-tool",
+          toolCallId: "agent-report-call-1",
+          toolName: "agent_report",
+          input: { reportMarkdown: "Hello from child", title: "Result" },
+          state: "output-available",
+          output: { success: true },
+        },
+        { type: "text", text: "Hello from child" },
+      ]
+    );
+    expect((await partialService.writePartial(childId, childPartial)).success).toBe(true);
+
+    await streamEnd(taskService, {
+      type: "stream-end",
+      workspaceId: childId,
+      messageId: "assistant-child-partial",
+      metadata: { model: "test-model", finishReason: "stop" },
+      parts: childPartial.parts as StreamEndEvent["parts"],
+    });
+    await flushTerminalAttentionDrains(taskService);
+
+    expect(resumeStream).toHaveBeenCalledWith(parentId, expect.any(Object), {
+      acceptanceOrigin: "automatic",
+      agentInitiated: true,
+      taskTurnKind: "recovery",
     });
   });
 

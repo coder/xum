@@ -19,6 +19,20 @@ describe("getModelStats", () => {
     expect(expectStats(KNOWN_MODELS.GPT.id).max_input_tokens).toBeGreaterThan(0);
   });
 
+  test("resolves Muse Wonder's extra metadata without advertising Wonder Full", () => {
+    const stats = expectStats(KNOWN_MODELS.MUSE_WONDER.id);
+    expect(stats).toMatchObject({
+      max_input_tokens: 1048576,
+      max_output_tokens: 131072,
+      input_cost_per_token: 0.000004,
+      cache_read_input_token_cost: 0.0000002,
+      output_cost_per_token: 0.00002,
+    });
+    expect(stats.tiered_pricing_threshold_tokens).toBeUndefined();
+    expect(listModelCatalogIds()).toContain("meta:muse-wonder-1.0");
+    expect(getModelStats("meta:muse-wonder-full")).toBeNull();
+  });
+
   test("prefers models-extra overrides over models.json when both sources define a model", () => {
     // claude-sonnet-4-6 exists in both sources; the 64k max output proves the override won.
     expect(expectStats("anthropic:claude-sonnet-4-6").max_output_tokens).toBe(64000);

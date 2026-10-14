@@ -130,6 +130,26 @@ describe("WorkspaceService heartbeat settings", () => {
     expect(updateRecencyTimestamp).toHaveBeenCalledTimes(1);
   });
 
+  test("rejects enabling a sub-agent workspace heartbeat but still lets it be turned off", async () => {
+    await saveWorkspaces(harness.config, TEST_PROJECT_PATH, [
+      {
+        ...createWorkspace({ enabled: true, intervalMs: 30 * 60 * 1000 }),
+        parentWorkspaceId: "parent-ws",
+      },
+    ]);
+
+    const enable = await service.setHeartbeatSettings(TEST_WORKSPACE_ID, {
+      enabled: true,
+      intervalMs: 45 * 60 * 1000,
+    });
+    expect(enable.success).toBe(false);
+    expect(persistedWorkspaceHeartbeat()?.intervalMs).toBe(30 * 60 * 1000);
+
+    const disable = await service.setHeartbeatSettings(TEST_WORKSPACE_ID, { enabled: false });
+    expect(disable.success).toBe(true);
+    expect(persistedWorkspaceHeartbeat()?.enabled).toBe(false);
+  });
+
   test("preserves the existing message when a write omits the message field", async () => {
     const result = await service.setHeartbeatSettings(TEST_WORKSPACE_ID, {
       enabled: true,
@@ -218,6 +238,36 @@ describe("WorkspaceService heartbeat settings", () => {
       message: "Keep this custom heartbeat message.",
       contextMode: HEARTBEAT_DEFAULT_CONTEXT_MODE,
     });
+  });
+
+  test("null clears the interval override so the workspace follows the global default (#5692)", async () => {
+    const cleared = await service.setHeartbeatSettings(TEST_WORKSPACE_ID, { intervalMs: null });
+    expect(cleared.success).toBe(true);
+    // The persisted record carries no interval, and the dialog sees it as "use default".
+    expect(persistedWorkspaceHeartbeat()).not.toHaveProperty("intervalMs");
+    expect(
+      service.getHeartbeatSettings(TEST_WORKSPACE_ID, { resolveDefaultInterval: false })
+    ).not.toHaveProperty("intervalMs");
+
+    // Writes that omit the key keep following the default instead of pinning it.
+    await service.setHeartbeatSettings(TEST_WORKSPACE_ID, { enabled: false });
+    await service.setHeartbeatSettings(TEST_WORKSPACE_ID, { enabled: true });
+    expect(persistedWorkspaceHeartbeat()).not.toHaveProperty("intervalMs");
+
+    // A later global change applies. Metadata is what older builds read too, so a downgrade
+    // also follows the global default.
+    await editPersistedConfig((config) => {
+      config.heartbeatDefaultIntervalMs = 60 * 60 * 1000;
+    });
+    expect(service.getHeartbeatSettings(TEST_WORKSPACE_ID)?.intervalMs).toBe(60 * 60 * 1000);
+    const metadata = await harness.config.getAllWorkspaceMetadata();
+    expect(metadata.find((entry) => entry.id === TEST_WORKSPACE_ID)?.heartbeat?.intervalMs).toBe(
+      60 * 60 * 1000
+    );
+
+    // Saving a value again makes it an override.
+    await service.setHeartbeatSettings(TEST_WORKSPACE_ID, { intervalMs: 20 * 60 * 1000 });
+    expect(persistedWorkspaceHeartbeat()?.intervalMs).toBe(20 * 60 * 1000);
   });
 
   test("round-trips trigger and whenBusy and preserves them when a write omits the keys", async () => {

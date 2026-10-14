@@ -21,6 +21,7 @@ interface EventSeed {
   timestamp: number | bigint;
   model: string;
   toolName?: string | null;
+  agentId?: string | null;
   inputTokens: number;
   outputTokens: number;
   reasoningTokens?: number;
@@ -51,6 +52,7 @@ async function insertEvent(conn: DuckDBConnection, seed: EventSeed): Promise<voi
       timestamp,
       model,
       tool_name,
+      agent_id,
       input_tokens,
       output_tokens,
       reasoning_tokens,
@@ -62,7 +64,7 @@ async function insertEvent(conn: DuckDBConnection, seed: EventSeed): Promise<voi
       output_tps,
       is_sub_agent
     ) VALUES (
-      ?, CAST(? AS DATE), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      ?, CAST(? AS DATE), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
     )`,
     [
       seed.workspaceId,
@@ -70,6 +72,7 @@ async function insertEvent(conn: DuckDBConnection, seed: EventSeed): Promise<voi
       seed.timestamp,
       seed.model,
       seed.toolName ?? null,
+      seed.agentId ?? null,
       seed.inputTokens,
       seed.outputTokens,
       seed.reasoningTokens ?? 0,
@@ -212,6 +215,74 @@ describe("analytics queries", () => {
     }, 0);
     assert(Number.isInteger(histogramCount), "histogramCount should remain integral");
     expect(histogramCount).toBe(2);
+  });
+});
+
+// #5766: headless rows (status, memory, dropped streams) have no agent, so the breakdown filed
+// their spend under "unknown" next to chat rows that really lack one.
+describe("agent cost breakdown", () => {
+  test("groups agentless headless rows by their source and keeps unknown for chat rows", async () => {
+    const conn = await createTestConn();
+    const base = {
+      workspaceId: "ws-agent-breakdown",
+      date: "2026-10-06",
+      model: "anthropic:claude-haiku-4-5",
+      inputTokens: 10,
+      outputTokens: 5,
+    };
+    await insertEvent(conn, { ...base, timestamp: 1, agentId: "exec", totalCostUsd: 1 });
+    await insertEvent(conn, { ...base, timestamp: 2, agentId: null, totalCostUsd: 0.5 });
+    await insertEvent(conn, {
+      ...base,
+      timestamp: 3,
+      toolName: "headless:workspace_status",
+      totalCostUsd: 0.25,
+    });
+    await insertEvent(conn, {
+      ...base,
+      timestamp: 4,
+      toolName: "headless:workspace_status",
+      totalCostUsd: 0.25,
+    });
+    await insertEvent(conn, {
+      ...base,
+      timestamp: 5,
+      toolName: "headless:memory_harvest",
+      totalCostUsd: 0.125,
+    });
+    // An in-turn tool row belongs to its turn's agent, not to a source.
+    await insertEvent(conn, {
+      ...base,
+      timestamp: 6,
+      agentId: "exec",
+      toolName: "advisor",
+      totalCostUsd: 2,
+    });
+
+    const rows = z
+      .array(
+        z.object({
+          agent_id: z.string(),
+          cost_usd: z.number(),
+          response_count: z.number(),
+        })
+      )
+      .parse(await executeNamedQuery(conn, "getAgentCostBreakdown", {}));
+    const byAgent = new Map(rows.map((row) => [row.agent_id, row]));
+
+    expect([...byAgent.keys()].sort()).toEqual([
+      "exec",
+      "headless:memory_harvest",
+      "headless:workspace_status",
+      "unknown",
+    ]);
+    expect(byAgent.get("exec")).toMatchObject({ cost_usd: 3, response_count: 1 });
+    expect(byAgent.get("unknown")).toMatchObject({ cost_usd: 0.5, response_count: 1 });
+    expect(byAgent.get("headless:workspace_status")).toMatchObject({
+      cost_usd: 0.5,
+      response_count: 0,
+    });
+    expect(byAgent.get("headless:memory_harvest")).toMatchObject({ cost_usd: 0.125 });
   });
 });
 

@@ -297,6 +297,11 @@ const BackupContentFlagsSchema = z.object({
    * notes and the project list reveals local paths.
    */
   includeProjects: z.boolean().optional(),
+  /**
+   * The global artifact shelf (`artifacts/global/`) in its own sidecar. Off by default:
+   * artifacts are agent output, not settings. Project shelves travel only with includeProjects.
+   */
+  includeGlobalArtifacts: z.boolean().optional(),
 });
 
 export type BackupContentFlag = keyof z.infer<typeof BackupContentFlagsSchema>;
@@ -312,6 +317,7 @@ export const BACKUP_CONTENT_DEFAULTS: BackupContents = {
   includeMcpCommands: true,
   includePreferences: true,
   includeProjects: false,
+  includeGlobalArtifacts: false,
 };
 
 export const BACKUP_CONTENT_FLAGS: readonly BackupContentFlag[] =

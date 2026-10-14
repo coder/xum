@@ -145,6 +145,7 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
     input,
     setInput,
     payloadsLoaded: draft.payloadsLoaded,
+    unresolvedSendCount: draft.unresolvedSendCount,
     latestInputValueRef,
     attachments,
     setAttachments,

@@ -69,9 +69,9 @@ describe("xum workflow CLI helpers", () => {
     });
   });
 
-  // Invoking the subcommand implies the dynamic-workflows experiment; no persisted
-  // override is needed. Routed through index.ts to cover the `wf` alias.
-  test("CLI run works without the dynamic-workflows experiment", async () => {
+  // Promoted experiment IDs stay accepted so existing automation keeps working.
+  // Routed through index.ts to cover the `wf` alias.
+  test("CLI run accepts promoted experiment IDs as no-ops", async () => {
     using tmp = new DisposableTempDir("workflow-cli-experiment");
     const repo = path.join(tmp.path, "repo");
     const muxRoot = path.join(tmp.path, "mux-root");
@@ -86,7 +86,7 @@ describe("xum workflow CLI helpers", () => {
     await trustProject(muxRoot, repo);
 
     const result =
-      await Bun.$`${BUN_EXECUTABLE} ${INDEX_ENTRY} wf run ./workflows/echo-review.js --dir ${repo}`
+      await Bun.$`${BUN_EXECUTABLE} ${INDEX_ENTRY} wf run ./workflows/echo-review.js --dir ${repo} -e dynamic-workflows -e agent-plugins -e advisor-tool`
         .env({ ...process.env, MUX_ROOT: muxRoot })
         .nothrow()
         .quiet();
@@ -127,48 +127,6 @@ describe("xum workflow CLI helpers", () => {
     expect(scopeClosedAt).toBeGreaterThan(output.indexOf("[startup] AppRuntime built"));
     expect(terminateAllAt).toBeGreaterThan(scopeClosedAt);
     expect(runtimeDisposedAt).toBeGreaterThan(terminateAllAt);
-  });
-
-  // Regression: headless `xum workflow` must initialize PolicyService and thread
-  // it through the core service graph like the desktop wiring. Without it, a
-  // stored credential for a provider that MUX_POLICY_FILE / Xum Governor now
-  // denies would remain usable from workflow-owned agents. The agent task must
-  // fail closed before any provider network call (the configured API key is fake).
-  test("CLI run enforces MUX_POLICY_FILE provider denials", async () => {
-    using tmp = new DisposableTempDir("workflow-cli-policy");
-    const repo = path.join(tmp.path, "repo");
-    const muxRoot = path.join(tmp.path, "mux-root");
-    await fs.mkdir(path.join(repo, "workflows"), { recursive: true });
-    await fs.mkdir(muxRoot, { recursive: true });
-    await fs.writeFile(
-      path.join(muxRoot, "providers.jsonc"),
-      JSON.stringify({ anthropic: { apiKey: "fake-key-policy-test" } }),
-      "utf-8"
-    );
-    const policyPath = path.join(muxRoot, "policy.json");
-    await fs.writeFile(
-      policyPath,
-      JSON.stringify({ policy_format_version: "0.1", provider_access: [{ id: "openai" }] }),
-      "utf-8"
-    );
-    await fs.writeFile(
-      path.join(repo, "workflows", "policy-denied.js"),
-      `export default async function workflow({ agent }) { return await agent("say hi", { id: "hello" }); }
-`,
-      "utf-8"
-    );
-    await trustProject(muxRoot, repo);
-
-    const result =
-      await Bun.$`${BUN_EXECUTABLE} ${INDEX_ENTRY} wf run ./workflows/policy-denied.js --model anthropic:claude-opus-5 --dir ${repo}`
-        .env({ ...process.env, MUX_ROOT: muxRoot, MUX_POLICY_FILE: policyPath })
-        .nothrow()
-        .quiet();
-
-    expect(result.exitCode).not.toBe(0);
-    expect(result.stdout.toString() + result.stderr.toString()).toContain(
-      "Provider anthropic is not allowed by policy"
-    );
   });
 
   test("CLI run reports an actionable trust error for untrusted project workflows", async () => {

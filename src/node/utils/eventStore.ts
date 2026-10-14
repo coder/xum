@@ -103,17 +103,19 @@ export class EventStore<TState, TEvent> {
 
   /**
    * Write state to disk.
-   * Logs errors but doesn't throw (fire-and-forget pattern).
+   * Logs errors but doesn't throw (fire-and-forget pattern). Resolves false when the write failed
+   * (a write skipped by `shouldWrite` did not fail).
    */
   async persist(
     workspaceId: string,
     state: TState,
     options?: SessionFileWriteOptions
-  ): Promise<void> {
+  ): Promise<boolean> {
     const result = await this.fileManager.write(workspaceId, state, options);
     if (!result.success) {
       log.error(`[${this.storeName}] Failed to persist state for ${workspaceId}: ${result.error}`);
     }
+    return result.success;
   }
 
   /**

@@ -47,10 +47,12 @@ description: Agent instructions for AI assistants working on the Xum codebase
 
 - Package manager: bun only. Use `bun install`, `bun add`, `bun run` (which proxies to Make when relevant). Run `bun install` if modules/types go missing.
 - Makefile is source of truth (new commands land there, not `package.json`).
-- Primary targets: `make dev|start|build|lint|lint-fix|fmt|fmt-check|typecheck|test|test-integration|clean|help`.
-- CI runs `make static-check-full`, which adds the targets in its Makefile prerequisites (including docs link checking via `mintlify broken-links`) to `static-check`.
+- Primary targets: `make dev|start|build|lint|lint-eslint|lint-fix|fmt|fmt-check|typecheck|test|test-integration|clean|help`.
+- `make lint` and `make static-check` run oxlint with `.oxlintrc.json`, which mirrors the `eslint.config.mjs` rules oxlint supports (seconds, under 1 GiB). When you change lint rules, change both configs; `make check-oxlint-config` (part of `static-check`) fails when they apply different rules to any file. Type-aware ESLint rules fail only in CI; to check them before pushing, run `make lint-eslint` (oxlint plus ESLint on the files changed since the merge base with origin/main, about 3 GiB). `make lint-full` lints all files with both and waits while another full ESLint run is active on the machine; use it only when you need full coverage, since one run takes minutes and ~8 GiB.
+- CI runs `make static-check-full`, which lints all files with oxlint and ESLint (`lint-full`) and adds the targets in its Makefile prerequisites (including docs link checking via `mintlify broken-links`) to the rest of `static-check`.
 - Xum sources `.xum/tool_env` before every `bash` tool call; in other harnesses, `source .xum/tool_env` first. Use `run_and_report <step_name> <command...>` when running multiple validation steps in one call.
 - Do not pipe/redirect/wrap `run_and_report` output; keep helper markers intact so Xum can show clean step status.
+- CRAP gate: `make crap-check` scores the functions you changed. When it (or the report after an agent `git commit`/`git push`) names a function, read the `crap-gate` skill (`.xum/skills/crap-gate/SKILL.md`) before fixing it.
 - `./scripts/wait_pr_ready.sh <pr_number>` is the preferred tail-end helper after local validation and after you've exhausted useful local work.
 - `./scripts/wait_pr_checks.sh <pr_number>` is the checks watcher; `wait_pr_ready.sh` must execute `wait_pr_checks.sh --once` on each loop iteration.
 - `./scripts/wait_pr_codex.sh <pr_number>` is the Codex gate used by `wait_pr_ready.sh`.
@@ -188,6 +190,7 @@ HistoryService is pure local disk I/O with a single dependency (`getSessionDir`)
 ## Module Imports
 
 - Use static `import` statements at the top; resolve circular dependencies by extracting shared modules, inverting dependencies, or using DI. Dynamic `await import()` is not an acceptable workaround.
+- Exception: code-split a feature boundary with a module-top-level `React.lazy(() => import(...))` wrapped in `LazyFeature`, and keep the open condition outside the lazy module. This is not a circular-dependency workaround.
 
 ## Workspace Identity
 
@@ -243,6 +246,17 @@ Freely make breaking changes, and reorganize / cleanup IPC as needed.
 - E2E tests (tests/e2e) work with Radix but are slow (~2min startup); reserve for scenarios that truly need real Electron.
 - **Storybook responsive/Pixel validation:** Do not prove responsive snapshots by only resizing `iframe.html`; that bypasses the Pixel viewport matrix configuration. If a story depends on a breakpoint (wide gutters, mobile), pin an explicit `parameters.pixel.matrix.viewports` variant (named widths: phone 390, tablet 744, laptop 1200, desktop 1900), mirror it with story `globals.viewport` for local viewing, and validate through the Storybook manager or an equivalent viewport-pinned check. Pixel does not emulate touch, so `pointer: coarse` media queries never match in snapshots; touch-only affordances need play/static contracts instead. Add a play/static contract when a missing variant would silently snapshot the wrong UI. Caveat: the Storybook test-runner (CI `Test / Storybook`) applies neither `globals.viewport` nor Pixel matrix variants, plays execute at desktop window size, so breakpoint-dependent play assertions must force the narrow width themselves (fixed-width wrapper/decorator, as in `App.phoneViewports.stories.tsx`) or guard on the rendered width before asserting.
 - Only use `validateApiKeys()` in tests that actually make AI API calls.
+
+## Bug Bash and Repro Tests (tests/bugbash)
+
+- To run a bug bash, the MCP Apps suite or the sandbox checks, read the `bug-bash` skill (`.xum/skills/bug-bash/SKILL.md`). It covers the host needs, the env, costs, options, results, exit codes and leftovers.
+- Host pause (#5714): model-driven runs (`make bug-bash`, `make mcp-apps-e2e`, any `e2e explore` and every e2e command with `e2e.mcpapps.config.ts`) run only inside the bug-bash sandbox, one Docker container per job. A model-driven e2e process on the host refuses with exit 2 (`tests/bugbash/hostPause.ts`), and outside the sandbox an `agent.*` step fails with `MODEL_UNAVAILABLE`. No override exists.
+- The sandbox image is pinned by digest in `tests/bugbash/sandbox/image.json`. A change to `tests/bugbash/sandbox/Dockerfile`, `tests/bugbash/sandbox/build.sh` or the playwright-core version of `@e2e-dev/web` in `bun.lock` changes the inputs key (`make bugbash-sandbox-key`), and the runner then refuses the image until the manual "Bug-bash sandbox image" workflow publishes a new one and a PR updates `image.json`. One exception: with `BUGBASH_SANDBOX_BUILD_STALE=1`, which only CI's `Test / Bug-bash sandbox` job sets, the self-check and the exact-step repros build the image locally with `build.sh` and warn. So an image change lands in three steps: the Dockerfile PR passes CI on a local build, a maintainer runs the publish workflow on main, and an `image.json` PR pins the new digest. `make bug-bash`, `make mcp-apps-e2e` and their preflight always refuse a stale key.
+- Every model-driven job and every real-AI app run with `XUM_DISABLE_AGENT_TOOLS=1`, `XUM_DISABLE_TERMINALS=1` and `XUM_DISABLE_PROJECT_AUTOMATION=1`, because AI replies are untrusted input for the explorer. Do not turn them off for a bug bash without a security review. Callers with their own `streamText` tools (refinement, memory harvest and intuition, continuous compaction) do not check `XUM_DISABLE_AGENT_TOOLS`. None of them runs shell commands in the seeded app, so a new caller of that kind needs the same check. Settings can still add stdio MCP servers and custom editor commands, so charters must keep explorers out of them.
+- A finding is a bug only once a repro fails for the reported reason. Put it in `tests/bugbash/repros/<slug>.e2e.ts` (tracked) with exact `screen`/`browser`/`expect` steps, never `agent.*` (`tests/bugbash/reproRules.test.ts` enforces this). Prove it: restore the bug in a scratch edit, rebuild, see `ASSERTION_FAILED` on the bug's own assertion, then restore and see it pass.
+- Tags: `bugbash` plus the bug ID. Add `mock-only` when the test needs a `[mock:...]` prompt or a terminal. Add `known-failure` plus the issue number for an open bug, and remove that tag in the PR that fixes it.
+- `make test-bugbash-repros` runs the repros (known failures excluded), and `make test-bugbash-known-failures` runs the open-bug repros. `make test-e2e` runs the repros after Playwright unless `BUGBASH_REPROS=0`. CI runs them once, on linux shard 1, with the mock. Locally they need Node 22.22.3+ or 24.8+ (`E2E_NODE`) and `node_modules/.bin/e2e-web install chromium`. With a provider key set, `BUGBASH_AI=auto` makes paid app-model calls (Haiku 5.5): use `BUGBASH_AI=mock` for none.
+- CI's `Test / Bug-bash sandbox` job runs `make bug-bash-sandbox-check` and `make test-bugbash-repros-sandbox` without secrets, and `Required` needs it.
 
 ## Tool: todo_write
 

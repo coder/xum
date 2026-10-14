@@ -36,6 +36,19 @@ function isAbortError(_error: unknown, signal?: AbortSignal): boolean {
   return signal?.aborted ?? false;
 }
 
+/**
+ * `git --version` capability results keyed by the PATH the probe inherits. Every sub-agent fork
+ * creates a workspace, and each probe is a process spawn that blocks the event loop on a large
+ * backend. WorktreeManager is constructed per runtime instance, so the cache is module-level.
+ * `git` resolves through PATH, so the same PATH means the same binary for the backend's
+ * lifetime; replacing git in place at the same path needs a backend restart to re-probe (an
+ * upgrade just keeps the safe eager-creation path until then). Probe errors and cancellations
+ * are not cached, so a missing git is probed again next time.
+ */
+const nativeHookRunnerSupportByPath = new Map<string, boolean>();
+// Distinguish an unset PATH from an empty one; NUL cannot appear in an environment value.
+const UNSET_PATH_KEY = "\u0000unset";
+
 const PROTECTED_BRANCH_NAMES = ["main", "master", "trunk", "develop", "default"];
 const MISSING_WORKTREE_ERROR_PATTERNS = ["not a working tree", "does not exist", "no such file"];
 
@@ -67,15 +80,19 @@ export class WorktreeManager {
 
   private async supportsNativeHookRunner(signal?: AbortSignal): Promise<boolean> {
     signal?.throwIfAborted();
+    const cacheKey = process.env.PATH ?? UNSET_PATH_KEY;
+    const cached = nativeHookRunnerSupportByPath.get(cacheKey);
+    if (cached !== undefined) return cached;
     try {
       using proc = execFileAsync("git", ["--version"], { signal });
       const { stdout } = await proc.result;
       signal?.throwIfAborted();
       const version = /^git version (\d+)\.(\d+)/.exec(stdout.trim());
-      return (
+      const supported =
         version !== null &&
-        (Number(version[1]) > 2 || (Number(version[1]) === 2 && Number(version[2]) >= 36))
-      );
+        (Number(version[1]) > 2 || (Number(version[1]) === 2 && Number(version[2]) >= 36));
+      nativeHookRunnerSupportByPath.set(cacheKey, supported);
+      return supported;
     } catch (error) {
       // Unknown/older Git retains eager creation; cancellation must still stop creation.
       if (signal?.aborted) throw error;
@@ -831,10 +848,22 @@ export class WorktreeManager {
     const branchName = isInPlace
       ? null
       : await this.getPersistedWorkspaceBranchName(projectPath, workspaceName);
-    // Preserve legacy cleanup semantics for workspaces that predate branch-map persistence.
-    // Those older workspaces always used workspaceName === branchName, so if this specific
-    // workspace has no stored mapping we can safely fall back to the workspace name.
-    const allowWorkspaceNameFallback = !branchName && !isInPlace;
+    // Preserve legacy cleanup semantics for workspaces that predate branch-map persistence:
+    // those always used workspaceName === branchName. Fall back to the workspace name only while
+    // git still registers this workspace's checkout on that branch, which proves the branch is
+    // ours. Without a map entry or a checkout nothing does: a removal retry is exactly that state
+    // (the first attempt removed the checkout and dropped the entry, then deregistration or a
+    // later runtime step failed), and `git branch -D <name>` would delete an unrelated user
+    // branch named like the workspace directory.
+    const allowWorkspaceNameFallback =
+      !branchName &&
+      !isInPlace &&
+      (await this.isWorkspaceCheckoutOnBranch(
+        projectPath,
+        deletedPath,
+        workspaceName.trim(),
+        noHooksEnv
+      ));
     const branchDeleteArgs = {
       projectPath,
       workspaceName,
@@ -938,6 +967,29 @@ export class WorktreeManager {
         return path.resolve(line.slice("worktree ".length).trim()) === resolvedWorkspacePath;
       });
     });
+  }
+
+  /** Whether git registers a worktree at workspacePath with branchName checked out. */
+  private async isWorkspaceCheckoutOnBranch(
+    projectPath: string,
+    workspacePath: string,
+    branchName: string,
+    noHooksEnv: GitExecOptions
+  ): Promise<boolean> {
+    try {
+      const block = this.findWorktreeBlockByPath(
+        await this.listWorktreeBlocks(projectPath, noHooksEnv),
+        workspacePath
+      );
+      return block !== undefined && this.getWorktreeBranchName(block) === branchName;
+    } catch (error) {
+      // Unproven ownership keeps the branch.
+      log.debug("Failed to list worktrees; skipping the workspace-name branch fallback", {
+        projectPath,
+        error: getErrorMessage(error),
+      });
+      return false;
+    }
   }
 
   private getWorktreeBranchName(worktreeBlock: string): string | null {

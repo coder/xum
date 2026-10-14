@@ -1,3 +1,4 @@
+import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import * as path from "path";
 import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
 import * as fsPromises from "fs/promises";
@@ -824,7 +825,7 @@ describe("TaskService", () => {
       created.data.taskId,
       "run task with alias model",
       {
-        model: "anthropic:claude-haiku-4-5",
+        model: KNOWN_MODELS.HAIKU.id,
         agentId: "custom",
         thinkingLevel: "high",
         experiments: undefined,

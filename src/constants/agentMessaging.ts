@@ -61,7 +61,7 @@ export const TASK_RECOVERY_PROMPT_DEDUPE_PREFIX = "task-recovery-prompt:";
 /** Longest structured-output validator excerpt echoed into a task recovery prompt. */
 export const TASK_RECOVERY_DIAGNOSTIC_MAX_CHARS = 400;
 
-export type TaskRecoveryPromptKind = "completion" | "timeout-finalization";
+export type TaskRecoveryPromptKind = "completion" | "timeout-finalization" | "goal";
 
 /** Prefix matching every queued recovery prompt for one child task. */
 export function taskRecoveryPromptDedupePrefix(taskId: string): string {

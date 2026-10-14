@@ -1,5 +1,4 @@
 import { userEvent, waitFor } from "@storybook/test";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import type { AppStory } from "@/browser/stories/meta.js";
 import { appMeta, AppWithMocks, PIXEL_DUAL_THEME } from "@/browser/stories/meta.js";
 import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
@@ -16,19 +15,15 @@ import {
   createWebSearchTool,
 } from "@/browser/stories/mocks/tools";
 import { STABLE_TIMESTAMP } from "@/browser/stories/mocks/workspaces";
-import { TRANSCRIPT_DENSITY_KEY, type TranscriptDensity } from "@/common/constants/storage";
+import type { TranscriptDensity } from "@/common/constants/storage";
 
 const meta = { ...appMeta, title: "App/Chat/Transcript Density" };
 export default meta;
 
-function setDensity(density: TranscriptDensity): void {
-  updatePersistedState<TranscriptDensity>(TRANSCRIPT_DENSITY_KEY, density);
-}
-
 function setupTranscriptDensityStory(density: TranscriptDensity) {
   collapseLeftSidebar();
-  setDensity(density);
   return setupSimpleChatStory({
+    userPreferences: { appearance: { transcriptDensity: density } },
     messages: [
       createUserMessage("density-user-1", "Audit the auth module and make the smallest safe fix", {
         historySequence: 1,
@@ -126,8 +121,8 @@ export const HyperTailProposePlanExpanded: AppStory = {
     <AppWithMocks
       setup={() => {
         collapseLeftSidebar();
-        setDensity("hyper");
         return setupSimpleChatStory({
+          userPreferences: { appearance: { transcriptDensity: "hyper" } },
           messages: [
             createUserMessage("tail-plan-user-1", "Plan the transcript density fix", {
               historySequence: 1,
@@ -201,9 +196,9 @@ export const HyperEdgeCaseGallery: AppStory = {
     <AppWithMocks
       setup={() => {
         collapseLeftSidebar();
-        setDensity("hyper");
         const activeStartedAt = Date.now() - 39_000;
         return setupSimpleChatStory({
+          userPreferences: { appearance: { transcriptDensity: "hyper" } },
           messages: [
             // Scenario 1: critical events remain visible in hyper density.
             createUserMessage("gallery-critical-user", "Make the change and validate it", {

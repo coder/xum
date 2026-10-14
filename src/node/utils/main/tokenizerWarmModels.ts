@@ -15,7 +15,7 @@ import { encodingForModel, loadTokenizerModules } from "./tokenizer";
 
 // Keys whose string values (or string arrays, for `models`) select a model anywhere in the config:
 // workspace aiSettings/aiSettingsByAgent/taskAiPins, agent defaults, project creation defaults,
-// auto-routing tiers, refusal fallbacks, advisor and evaluation models. Walking by key instead of
+// auto-routing tiers, refusal fallbacks, evaluation models. Walking by key instead of
 // listing sources keeps new model settings covered; catalog-like fields (hiddenModels, gateway
 // model lists) use other keys, so they cannot widen the set.
 const MODEL_KEYS = new Set([
@@ -23,7 +23,6 @@ const MODEL_KEYS = new Set([
   "models",
   "modelString",
   "defaultModel",
-  "advisorModelString",
   "taskModelString",
   "evaluationModel",
 ]);
@@ -55,6 +54,7 @@ function collectConfiguredModels(config: ProjectsConfig): string[] {
   // The config can hold junk, so nothing here trusts the types.
   const stack: Array<{ value: unknown; depth: number }> = [{ value: config, depth: 0 }];
   while (stack.length > 0) {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     const { value, depth } = stack.pop()!;
     if (depth > MAX_WALK_DEPTH || !isRecord(value)) {
       continue;

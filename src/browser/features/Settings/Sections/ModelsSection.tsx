@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useId, useRef, useState } from "react";
-import { ArrowRight, ChevronDown, Info, Loader2, Plus, Search, ShieldCheck } from "lucide-react";
+import { ArrowRight, ChevronDown, Info, Loader2, Plus, Search } from "lucide-react";
 import { useProviderOptions } from "@/browser/hooks/useProviderOptions";
 import { Button } from "@/browser/components/Button/Button";
 import { ModelFallbacksEditor } from "./ModelFallbacksEditor";
@@ -11,7 +11,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
 import { useRouting } from "@/browser/hooks/useRouting";
@@ -20,12 +20,9 @@ import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { listModelCatalogIds } from "@/common/utils/tokens/modelCatalog";
-import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { getExplicitGatewayPrefix, supports1MContext } from "@/common/utils/ai/models";
-import { getAllowedProvidersForUi } from "@/browser/utils/policyUi";
 import { LAST_CUSTOM_MODEL_PROVIDER_KEY } from "@/common/constants/storage";
 import type {
-  EffectivePolicy,
   ModelCatalogEntry,
   ModelCatalogSearchResult,
   ProviderModelDiscoveryResult,
@@ -37,7 +34,10 @@ import {
   getProviderModelEntryId,
   getProviderModelEntryMappedTo,
 } from "@/common/utils/providers/modelEntries";
-import { formatProviderDisplayName } from "@/common/utils/providers/customProviders";
+import {
+  formatProviderDisplayName,
+  getProviderIdsForUi,
+} from "@/common/utils/providers/customProviders";
 import {
   CUSTOM_MODELS_PAGE_SIZE,
   MAX_RENDERED_MODELS,
@@ -126,11 +126,8 @@ export function shouldAllowRouteOverrideInSettings(modelId: string): boolean {
 }
 
 export function ModelsSection() {
-  const policyState = usePolicy();
-  const effectivePolicy =
-    policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
-
   const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const { open: openSettings, close: closeSettings } = useSettings();
   const { config, loading, updateModelsOptimistically } = useProvidersConfig();
   const [lastProvider, setLastProvider] = usePersistedState(LAST_CUSTOM_MODEL_PROVIDER_KEY, "");
@@ -142,15 +139,13 @@ export function ModelsSection() {
     api: object;
     provider: string;
     config: ProvidersConfigMap;
-    policy: EffectivePolicy | null;
     result: ProviderModelDiscoveryResult;
   } | null>(null);
-  // Catalogue matches across providers, fenced by session, client, and policy.
+  // Catalogue matches across providers, fenced by session and client.
   const [catalog, setCatalog] = useState<{
     session: object;
     api: object;
     query: string;
-    policy: EffectivePolicy | null;
     result: ModelCatalogSearchResult;
   } | null>(null);
   const [highlightedModel, setHighlightedModel] = useState<{
@@ -158,7 +153,6 @@ export function ModelsSection() {
     api: object | null;
     provider: string;
     config: ProvidersConfigMap | null;
-    policy: EffectivePolicy | null;
   } | null>(null);
   const modelInputRef = useRef<HTMLInputElement>(null);
   const suggestionsId = useId();
@@ -170,10 +164,10 @@ export function ModelsSection() {
 
   const allowedProviders = useMemo(
     () =>
-      getAllowedProvidersForUi(effectivePolicy, config).filter(
+      getProviderIdsForUi(config).filter(
         (provider) => !CUSTOM_MODEL_HIDDEN_PROVIDERS.has(provider)
       ),
-    [effectivePolicy, config]
+    [config]
   );
 
   useEffect(() => {
@@ -185,14 +179,8 @@ export function ModelsSection() {
     setLastProvider(allowedProviders[0] ?? "");
   }, [config, allowedProviders, lastProvider, setLastProvider]);
 
-  const {
-    defaultModel,
-    setDefaultModel,
-    hiddenModels,
-    hideModel,
-    unhideModel,
-    isAllowedByPolicyOnActiveRoute,
-  } = useModelsFromSettings();
+  const { defaultModel, setDefaultModel, hiddenModels, hideModel, unhideModel } =
+    useModelsFromSettings();
   const routing = useRouting();
   const minThinking = useMinThinkingLevels();
   const { has1MContext, toggle1MContext } = useProviderOptions();
@@ -239,14 +227,14 @@ export function ModelsSection() {
       return false;
     }
 
-    if (!api) return false;
+    if (!liveApi) return false;
     setError(null);
 
     // Optimistic update - returns new models array for API call
     const updatedModels = updateModelsOptimistically(provider, (models) => [...models, modelId]);
 
     // Save in background
-    void api.providers.setModels({ provider, models: updatedModels });
+    void liveApi.providers.setModels({ provider, models: updatedModels });
     return true;
   };
 
@@ -300,7 +288,6 @@ export function ModelsSection() {
               session: suggestionsSession,
               api,
               query: catalogQuery,
-              policy: effectivePolicy,
               result,
             });
           }
@@ -314,15 +301,12 @@ export function ModelsSection() {
         }
       );
     return () => controller.abort();
-  }, [api, suggestionsSession, catalogQuery, effectivePolicy]);
+  }, [api, suggestionsSession, catalogQuery]);
 
   // Previous-query matches stay visible until the new search settles to avoid
-  // flicker while typing; a new session, client, or policy revokes them.
+  // flicker while typing; a new session or client revokes them.
   const activeCatalog =
-    catalogQueryActive &&
-    catalog?.session === suggestionsSession &&
-    catalog?.api === api &&
-    catalog?.policy === effectivePolicy
+    catalogQueryActive && catalog?.session === suggestionsSession && catalog?.api === api
       ? catalog
       : null;
 
@@ -339,7 +323,6 @@ export function ModelsSection() {
           api,
           provider: lastProvider,
           config,
-          policy: effectivePolicy,
           result,
         });
       }
@@ -348,18 +331,16 @@ export function ModelsSection() {
       .discoverModels({ provider: lastProvider }, { signal: controller.signal })
       .then(publish, () => publish({ status: "error", reason: "request-failed" }));
     return () => controller.abort();
-  }, [api, suggestionsSession, lastProvider, config, effectivePolicy]);
+  }, [api, suggestionsSession, lastProvider, config]);
 
   // Key rotation can leave every sanitized field equal. Fence rendered suggestions as
   // well as replies by the config object itself, before effect cleanup gets to run.
-  // Policy events are independent of config refreshes and also revoke completed catalogs.
   // A disconnect or reconnect replaces the API client, which revokes them too.
   const discoveryResult =
     discovery?.session === suggestionsSession &&
     discovery?.api === api &&
     discovery?.provider === lastProvider &&
-    discovery?.config === config &&
-    discovery?.policy === effectivePolicy
+    discovery?.config === config
       ? discovery.result
       : null;
   const discoveredModels =
@@ -368,7 +349,7 @@ export function ModelsSection() {
       : discoveryResult?.status === "ok"
         ? discoveryResult.modelIds
         : [];
-  // One editable field handles both manual IDs and policy-filtered discovery.
+  // One editable field handles both manual IDs and discovery.
   // Suggestions never replace a typed ID unless the user explicitly chooses one.
   const discoveredUnconfigured = discoveredModels.filter(
     (modelId) => !modelExists(lastProvider, modelId)
@@ -405,6 +386,13 @@ export function ModelsSection() {
   const noMatchesMessage = lastProvider
     ? "No matching catalogue models to add."
     : "No matching catalogue models. Choose a provider to add this ID manually.";
+  // Login loads no catalog; say so instead of an empty suggestion list. Like the
+  // other statuses it yields to visible (other-provider) catalogue matches.
+  const coderCatalogNotLoaded =
+    lastProvider === "coder" &&
+    config != null &&
+    config.coder?.discoveredModels == null &&
+    options.length === 0;
   const statusMessage = !suggestionsSession
     ? null
     : lastProvider && lastProvider !== "coder" && api && config
@@ -419,16 +407,17 @@ export function ModelsSection() {
               : catalogueHasNoMatches
                 ? noMatchesMessage
                 : null
-      : catalogueHasNoMatches
-        ? noMatchesMessage
-        : null;
+      : coderCatalogNotLoaded
+        ? "Coder model catalog not loaded. Load it from Settings → Providers → Coder, or enter a model ID."
+        : catalogueHasNoMatches
+          ? noMatchesMessage
+          : null;
   const showSuggestions = suggestionsSession !== null && options.length > 0;
   const highlightedIndex =
     showSuggestions &&
     highlightedModel?.api === api &&
     highlightedModel?.config === config &&
-    highlightedModel?.provider === lastProvider &&
-    highlightedModel?.policy === effectivePolicy
+    highlightedModel?.provider === lastProvider
       ? options.findIndex((option) => option.key === highlightedModel.key)
       : -1;
 
@@ -443,7 +432,6 @@ export function ModelsSection() {
       api,
       provider: lastProvider,
       config,
-      policy: effectivePolicy,
     });
     api.providers
       .searchModelCatalog({
@@ -527,7 +515,7 @@ export function ModelsSection() {
 
   const handleRemoveModel = useCallback(
     (provider: string, modelId: string) => {
-      if (!config || !api) return;
+      if (!config || !liveApi) return;
 
       // Optimistic update - returns new models array for API call
       const updatedModels = updateModelsOptimistically(provider, (models) =>
@@ -535,9 +523,9 @@ export function ModelsSection() {
       );
 
       // Save in background
-      void api.providers.setModels({ provider, models: updatedModels });
+      void liveApi.providers.setModels({ provider, models: updatedModels });
     },
-    [api, config, updateModelsOptimistically]
+    [liveApi, config, updateModelsOptimistically]
   );
 
   const handleStartEdit = useCallback(
@@ -586,7 +574,7 @@ export function ModelsSection() {
   }, []);
 
   const handleSaveEdit = useCallback(() => {
-    if (!config || !editing || !api) return;
+    if (!config || !editing || !liveApi) return;
 
     const trimmedModelId = editing.newModelId.trim();
     if (!trimmedModelId) {
@@ -647,8 +635,8 @@ export function ModelsSection() {
     setEditing(null);
 
     // Save in background
-    void api.providers.setModels({ provider: editing.provider, models: updatedModels });
-  }, [api, editing, config, modelExists, updateModelsOptimistically]);
+    void liveApi.providers.setModels({ provider: editing.provider, models: updatedModels });
+  }, [liveApi, editing, config, modelExists, updateModelsOptimistically]);
 
   // Show loading state while config is being fetched
   if (loading || !config) {
@@ -697,17 +685,12 @@ export function ModelsSection() {
   };
 
   // Get built-in models from KNOWN_MODELS.
-  // Filter by policy so the settings table doesn't list models users can't ever select.
-  // The policy applies to the active route's identity (like the backend), so a
-  // gateway-only policy keeps rows whose route is that gateway.
-  const builtInModels = Object.values(KNOWN_MODELS)
-    .map((model) => ({
-      provider: model.provider,
-      modelId: model.providerModelId,
-      fullId: model.id,
-      aliases: model.aliases,
-    }))
-    .filter((model) => isAllowedByPolicyOnActiveRoute(model.fullId));
+  const builtInModels = Object.values(KNOWN_MODELS).map((model) => ({
+    provider: model.provider,
+    modelId: model.providerModelId,
+    fullId: model.id,
+    aliases: model.aliases,
+  }));
 
   const customModels = getCustomModels();
 
@@ -747,13 +730,6 @@ export function ModelsSection() {
 
   return (
     <div className="space-y-4">
-      {policyState.status.state === "enforced" && (
-        <div className="border-border-medium bg-background-secondary/50 text-muted flex items-center gap-2 rounded-md border px-3 py-2 text-xs">
-          <ShieldCheck className="h-4 w-4" aria-hidden />
-          <span>Your settings are controlled by a policy.</span>
-        </div>
-      )}
-
       <div className="relative">
         <Search
           aria-hidden
@@ -874,7 +850,6 @@ export function ModelsSection() {
                               api,
                               provider: lastProvider,
                               config,
-                              policy: effectivePolicy,
                             }
                           : null
                       );
@@ -1147,7 +1122,7 @@ export function ModelsSection() {
 
       <div className="border-border-medium bg-background-secondary/40 text-muted rounded-md border px-3 py-2.5 text-xs">
         <div className="flex items-start gap-2">
-          <Info className="text-accent mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+          <Info className="text-accent-text mt-0.5 h-4 w-4 shrink-0" aria-hidden />
           <div className="space-y-1">
             <p>
               Agent-specific model defaults and thinking levels (Compact and others) are configured
@@ -1158,7 +1133,7 @@ export function ModelsSection() {
               variant="link"
               size="sm"
               onClick={() => openSettings("tasks")}
-              className="text-accent h-auto px-0 py-0 text-xs"
+              className="text-accent-text h-auto px-0 py-0 text-xs"
             >
               Open Agents settings
               <ArrowRight className="h-3.5 w-3.5" />
@@ -1178,19 +1153,19 @@ export function ModelsSection() {
           </p>
           <div className="text-muted space-y-0.5 font-mono">
             <div>
-              <span className="text-accent">/sonnet</span> explain this code
+              <span className="text-accent-text">/sonnet</span> explain this code
               <span className="text-muted/60 ml-2">— send one message with Sonnet</span>
             </div>
             <div>
-              <span className="text-accent">/opus+high</span> deep review
+              <span className="text-accent-text">/opus+high</span> deep review
               <span className="text-muted/60 ml-2">— Opus with high thinking</span>
             </div>
             <div>
-              <span className="text-accent">/haiku+0</span> quick answer
+              <span className="text-accent-text">/haiku+0</span> quick answer
               <span className="text-muted/60 ml-2">— Haiku with thinking off</span>
             </div>
             <div>
-              <span className="text-accent">/+2</span> analyze this
+              <span className="text-accent-text">/+2</span> analyze this
               <span className="text-muted/60 ml-2">— current model, thinking level 2</span>
             </div>
           </div>

@@ -1915,6 +1915,84 @@ describe("CompactionHandler", () => {
       expect(metadata?.preservedTailMessageCount).toBe(2);
     });
 
+    it("removes Anthropic replay data from tail copies and keeps other providers' reasoning", async () => {
+      // Preserved thinking: the tail's signed thinking is bound to the pre-summary
+      // prefix, so replaying it after the boundary would be rejected or dropped.
+      handler = new CompactionHandler({
+        workspaceId,
+        historyService,
+        sessionDir,
+        telemetryService,
+        emitter: mockEmitter,
+      });
+
+      const signed = (text: string) => ({
+        type: "reasoning" as const,
+        text,
+        providerOptions: { anthropic: { signature: `sig-${text}` } },
+      });
+      const anthropicAnswer = createMuxMessage("a1", "assistant", "", {
+        model: "anthropic:claude-x",
+        stepStartPartIndices: [0, 2],
+      });
+      anthropicAnswer.parts = [
+        signed("plan"),
+        {
+          type: "dynamic-tool",
+          toolCallId: "call-1",
+          toolName: "bash",
+          state: "output-available",
+          input: { script: "ls" },
+          output: { success: true },
+        },
+        signed("review"),
+        { type: "text", text: "tail answer" },
+      ];
+      const thinkingOnly = createMuxMessage("a2", "assistant", "", { partial: true });
+      thinkingOnly.parts = [signed("interrupted")];
+      const openaiAnswer = createMuxMessage("a3", "assistant", "openai answer", {
+        model: "openai:gpt-x",
+      });
+      openaiAnswer.parts.unshift({
+        type: "reasoning",
+        text: "openai thoughts",
+        providerOptions: { openai: { itemId: "rs_1", reasoningEncryptedContent: "enc" } },
+      });
+      await seedHistory(
+        createMuxMessage("u0", "user", "old head question"),
+        createMuxMessage("a0", "assistant", "old head answer"),
+        createMuxMessage("u1", "user", "tail question"),
+        anthropicAnswer,
+        thinkingOnly,
+        createMuxMessage("u2", "user", "follow-up"),
+        openaiAnswer,
+        createStampedCompactionRequest("compact-req", 2)
+      );
+
+      expect(await handler.handleCompletion(createStreamEndEvent("Summary"))).toBe(true);
+
+      const epochResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!epochResult.success) throw new Error(epochResult.error);
+      const copies = epochResult.data.slice(1);
+      // Every tail row gets a copy with all its parts, so step indices still match.
+      expect(copies.map((copy) => copy.parts.length)).toEqual([1, 4, 1, 1, 2]);
+      expect(copies[1].metadata?.stepStartPartIndices).toEqual([0, 2]);
+      expect(copies[1].parts[2]).toEqual({ type: "reasoning", text: "review" });
+      expect(copies[2].parts).toEqual([{ type: "reasoning", text: "interrupted" }]);
+      expect(JSON.stringify(copies)).not.toContain("sig-");
+      expect(copies[4].parts[0]).toMatchObject({
+        type: "reasoning",
+        providerOptions: { openai: { itemId: "rs_1", reasoningEncryptedContent: "enc" } },
+      });
+      // The originals above the boundary keep their signatures.
+      const full = await historyService.getLastMessages(workspaceId, 20);
+      if (!full.success) throw new Error(full.error);
+      const original = full.data.find((row) => row.id === "a1");
+      expect(original?.parts[0]).toMatchObject({
+        providerOptions: { anthropic: { signature: "sig-plan" } },
+      });
+    });
+
     it("never copies model-hidden plan-review record rows into the preserved tail", async () => {
       // Record rows are UI state that no provider request ever contains; a copy behind the
       // boundary would only duplicate hidden state (and the projection ignores copies anyway).
@@ -1947,6 +2025,41 @@ describe("CompactionHandler", () => {
       const copies = epochResult.data.filter((row) => row.metadata?.rlmPreservedTailCopy === true);
       expect(copies.map((copy) => copy.role)).toEqual(["user", "assistant"]);
       expect(copies.some((copy) => copy.metadata?.muxMetadata?.type === "plan-review")).toBe(false);
+    });
+
+    it("keeps a tail user row's prompt-hook context on its copy", async () => {
+      // Codex PRRT_kwDOPxxmWM6rPqxI: the copy is what later requests send, and the context
+      // renders from its metadata.
+      handler = new CompactionHandler({
+        workspaceId,
+        historyService,
+        sessionDir,
+        telemetryService,
+        emitter: mockEmitter,
+      });
+      const pluginHookContext = [{ pluginId: "guard", text: "Ask for a repro first." }];
+      const tailUser = createMuxMessage("u1", "user", "tail question", { pluginHookContext });
+      // chat.jsonl is untrusted: a corrupted extra entry is not copied (PRRT_kwDOPxxmWM6sTcvx).
+      Reflect.set(tailUser.metadata ?? {}, "pluginHookContext", [
+        ...pluginHookContext,
+        { pluginId: 1, text: "x" },
+      ]);
+      await seedHistory(
+        createMuxMessage("u0", "user", "old head question"),
+        createMuxMessage("a0", "assistant", "old head answer"),
+        tailUser,
+        createMuxMessage("a1", "assistant", "tail answer"),
+        createStampedCompactionRequest("compact-req", 2)
+      );
+
+      expect(await handler.handleCompletion(createStreamEndEvent("Summary"))).toBe(true);
+
+      const epochResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!epochResult.success) throw new Error(epochResult.error);
+      const userCopy = epochResult.data.find(
+        (row) => row.metadata?.rlmPreservedTailCopy === true && row.role === "user"
+      );
+      expect(userCopy?.metadata?.pluginHookContext).toEqual(pluginHookContext);
     });
 
     it("rewrites MCP snapshot invoking IDs to the copy IDs of LATER tail rows", async () => {

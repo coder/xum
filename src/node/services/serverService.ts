@@ -10,6 +10,7 @@ import * as childProcess from "node:child_process";
 import { VERSION } from "@/version";
 import { buildMuxMdnsServiceOptions, MdnsAdvertiserService } from "./mdnsAdvertiserService";
 import type { AppRouter } from "@/node/orpc/router";
+import { isSessionTapeReplayMode } from "@/node/services/sessionTapes/sessionTapeReplaySource";
 
 export interface ServerInfo {
   /** Base URL that is always connectable from the local machine (loopback for wildcard binds). */
@@ -362,6 +363,12 @@ export class ServerService {
   async startServer(options: StartServerOptions): Promise<ServerInfo> {
     if (this.server) {
       throw new Error("Server already running in this process");
+    }
+    // Session tape replay mode (perf harness) serves tapes only to desktop windows, whose
+    // network egress desktop main blocks. A browser or CLI client of this server would render
+    // recorded content (remote images) outside that block, so replay mode runs no API server.
+    if (isSessionTapeReplayMode()) {
+      throw new Error("The API server is disabled in session tape replay mode (XUM_REPLAY_TAPES)");
     }
 
     // Create lockfile instance for checking - don't store yet

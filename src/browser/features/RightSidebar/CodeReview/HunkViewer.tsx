@@ -24,6 +24,7 @@ import { formatRelativeTime } from "@/browser/utils/ui/dateTime";
 import { cn } from "@/common/lib/utils";
 import { ContextCollapseIndicator } from "./ContextCollapseIndicator";
 import { useReadMore } from "./useReadMore";
+import { OpenAsArtifactButton } from "../ArtifactsTab/OpenAsArtifactButton";
 import { sliceHunkByNewLineRange } from "@/browser/utils/review/sliceHunkContent";
 
 interface HunkViewerProps {
@@ -417,6 +418,7 @@ export const HunkViewer = React.memo<HunkViewerProps>(
             <div className="text-foreground min-w-0 truncate">{highlightedFilePath}</div>
           </TooltipIfPresent>
           <div className="text-muted ml-auto flex shrink-0 items-center gap-1.5 whitespace-nowrap">
+            <OpenAsArtifactButton workspaceId={workspaceId} path={hunk.filePath} />
             {!isPureRename && (
               <>
                 {additions > 0 && <span className="text-success-light">+{additions}</span>}

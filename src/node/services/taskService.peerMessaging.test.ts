@@ -172,7 +172,6 @@ describe("TaskService", () => {
           taskStatus: "running",
           taskModelString: "openai:gpt-5.2",
           taskThinkingLevel: "medium",
-          taskExperiments: { advisorTool: true },
           aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
         }),
       ],
@@ -210,7 +209,6 @@ describe("TaskService", () => {
         agentId: "explore",
         thinkingLevel: "medium",
         reasoningMode: undefined,
-        experiments: { advisorTool: true },
         queueDispatchMode: "turn-end",
       },
       expect.objectContaining({
@@ -455,7 +453,6 @@ describe("TaskService", () => {
           agentType: "explore",
           taskStatus: "running",
           taskModelString: "openai:gpt-5.2",
-          taskExperiments: { advisorTool: true },
           aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
         }),
       ],
@@ -2126,12 +2123,11 @@ describe("TaskService", () => {
     const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "still around?")).toEqual(
-      Err({
-        code: "not_active",
-        taskStatus: "running",
-        message: "Target workspace is archived; only its parent can restore and reawaken it.",
-      })
+    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "still around?")).toMatchObject(
+      {
+        success: false,
+        error: { code: "not_active", taskStatus: "running" },
+      }
     );
   });
 

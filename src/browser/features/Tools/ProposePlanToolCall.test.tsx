@@ -1,13 +1,10 @@
 import type { ComponentProps, ReactNode } from "react";
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { installDom } from "../../../../tests/ui/dom";
-import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 
 import { APIContext, APIProvider, type APIClient } from "@/browser/contexts/API";
-import { PolicyProvider } from "@/browser/contexts/PolicyContext";
-import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
-import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import * as UseOpenInEditorModule from "@/browser/hooks/useOpenInEditor";
 import * as UseReviewsModule from "@/browser/hooks/useReviews";
@@ -16,19 +13,26 @@ import * as DiffRendererModule from "@/browser/features/Shared/DiffRenderer";
 import * as ReviewTypesModule from "@/common/types/review";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { AgentProvider } from "@/browser/contexts/AgentContext";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
 import {
-  AGENT_AI_DEFAULTS_KEY,
-  getAgentIdKey,
-  getAutoModelRoutingKey,
-  getAutoThinkingLevelKey,
-  getModelKey,
-  getThinkingLevelKey,
-  getWorkspaceAISettingsByAgentKey,
-} from "@/common/constants/storage";
+  getPendingAiSelection,
+  getWorkspaceAgentId,
+  markAiSelectionIntent,
+  resetAiSelectionIntentForTests,
+  setWorkspaceAiMetadata,
+} from "@/browser/utils/aiSelectionIntent";
+import type { ThinkingLevel } from "@/common/types/thinking";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
-import { createTestApiClient, createTestConfig, type TestClientConfig } from "@/browser/testUtils";
+import {
+  createTestApiClient,
+  createTestConfig,
+  type TestClientConfig,
+  resetTestExperiments,
+  setTestAgentAiDefaults,
+  setTestExperiment,
+} from "@/browser/testUtils";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 
@@ -58,7 +62,6 @@ interface MockApi {
     }) => Promise<ResultVoid>;
     sendMessage: (args: SendMessageArgs) => ReturnType<APIClient["workspace"]["sendMessage"]>;
   };
-  policy?: { get: () => ReturnType<APIClient["policy"]["get"]> };
 }
 
 let mockApi: MockApi | null = null;
@@ -229,8 +232,6 @@ function wrapToolCall(content: JSX.Element, agentId = "plan") {
         loadFailed: false,
         refresh: () => Promise.resolve(),
         refreshing: false,
-        disableWorkspaceAgents: false,
-        setDisableWorkspaceAgents: noop,
       }}
     >
       <TooltipProvider>{content}</TooltipProvider>
@@ -241,7 +242,6 @@ function wrapToolCall(content: JSX.Element, agentId = "plan") {
 // Inject the client through the real provider: a module mock of contexts/API is process-wide
 // and leaks into later-evaluated suites. The wrapper reads mockApi at render time (tests assign
 // it after beforeEach) and view.rerender() keeps it. A null mockApi means no backend client.
-// PolicyProvider answers "no policy" unless the mock supplies policy.get.
 function ApiWrapper(props: { children: ReactNode }) {
   if (mockApi === null) {
     return (
@@ -254,15 +254,11 @@ function ApiWrapper(props: { children: ReactNode }) {
           retry: () => undefined,
         }}
       >
-        <PolicyProvider>{props.children}</PolicyProvider>
+        {props.children}
       </APIContext.Provider>
     );
   }
-  return (
-    <APIProvider client={createTestApiClient(mockApi)}>
-      <PolicyProvider>{props.children}</PolicyProvider>
-    </APIProvider>
-  );
+  return <APIProvider client={createTestApiClient(mockApi)}>{props.children}</APIProvider>;
 }
 
 function renderToolCall(content: JSX.Element, agentId = "plan") {
@@ -280,7 +276,18 @@ function createMockApi(
   } = {}
 ): MockApi {
   return {
-    config: { getConfig: () => Promise.resolve(overrides.config ?? DEFAULT_CONFIG) },
+    // APIProvider connects AppConfigStore, whose fetch must keep the agent defaults and
+    // experiments a test seeded.
+    config: {
+      getConfig: () =>
+        Promise.resolve(
+          overrides.config ?? {
+            ...DEFAULT_CONFIG,
+            agentAiDefaults: getAppConfigStore().getSnapshot()?.agentAiDefaults ?? {},
+            experiments: getAppConfigStore().getSnapshot()?.experiments ?? {},
+          }
+        ),
+    },
     workspace: {
       getPlanContent:
         overrides.getPlanContent ??
@@ -312,10 +319,15 @@ function renderCompletedPlan(props: Partial<ProposePlanProps> = {}) {
   });
 }
 
-function startInPlanMode(workspaceId = WORKSPACE_ID, model?: string, thinkingLevel?: string) {
-  window.localStorage.setItem(getAgentIdKey(workspaceId), JSON.stringify("plan"));
-  if (model) updatePersistedState(getModelKey(workspaceId), model);
-  if (thinkingLevel) updatePersistedState(getThinkingLevelKey(workspaceId), thinkingLevel);
+function startInPlanMode(
+  workspaceId = WORKSPACE_ID,
+  model?: string,
+  thinkingLevel: ThinkingLevel = "off"
+) {
+  setWorkspaceAiMetadata(workspaceId, {
+    agentId: "plan",
+    ...(model ? { aiSettingsByAgent: { plan: { model, thinkingLevel } } } : {}),
+  });
 }
 
 function recordSendMessage(calls: SendMessageArgs[]): MockApi["workspace"]["sendMessage"] {
@@ -362,6 +374,9 @@ describe("ProposePlanToolCall", () => {
   });
 
   afterEach(async () => {
+    resetTestExperiments();
+    resetAiSelectionIntentForTests();
+    setTestAgentAiDefaults(undefined);
     cleanup();
     await restoreProposePlanModuleMocks();
     barrierSpy?.mockRestore();
@@ -374,7 +389,6 @@ describe("ProposePlanToolCall", () => {
   test("does not claim plan is in chat when Start Here content is a placeholder", () => {
     renderPlanToolCall({ result: { success: true, planPath: PLAN_PATH } });
 
-    // PolicyProvider's first answer re-renders the card; check the latest render's input.
     const startHere = startHereCalls.at(-1);
     expect(startHere?.content).toContain("*Plan saved to");
     expect(startHere?.content).not.toContain("Note: This chat already contains the full plan");
@@ -559,7 +573,7 @@ describe("ProposePlanToolCall", () => {
     const execThinking = "low";
 
     startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {
+    setTestAgentAiDefaults({
       exec: { modelString: execModel, thinkingLevel: execThinking },
     });
 
@@ -580,24 +594,32 @@ describe("ProposePlanToolCall", () => {
     expect(sendMessageCalls[0]?.options.autoThinkingLevel).toBe(false);
 
     // Clicking Implement should switch the workspace agent to exec.
-    //
-    // Note: some tests in this repo mock the `usePersistedState` module globally. In that case,
-    // `updatePersistedState` won't actually write to localStorage here, so we assert the call.
-    const agentKey = getAgentIdKey(WORKSPACE_ID);
-    const modelKey = getModelKey(WORKSPACE_ID);
-    const thinkingKey = getThinkingLevelKey(WORKSPACE_ID);
-    const updatePersistedStateMaybeMock = updatePersistedState as unknown as {
-      mock?: { calls: unknown[][] };
-    };
-    if (updatePersistedStateMaybeMock.mock) {
-      expect(updatePersistedState).toHaveBeenCalledWith(agentKey, "exec");
-      expect(updatePersistedState).toHaveBeenCalledWith(modelKey, execModel);
-      expect(updatePersistedState).toHaveBeenCalledWith(thinkingKey, execThinking);
-    } else {
-      expect(JSON.parse(window.localStorage.getItem(agentKey)!)).toBe("exec");
-      expect(JSON.parse(window.localStorage.getItem(modelKey)!)).toBe(execModel);
-      expect(JSON.parse(window.localStorage.getItem(thinkingKey)!)).toBe(execThinking);
-    }
+    expect(getWorkspaceAgentId(WORKSPACE_ID)).toBe("exec");
+  });
+
+  test("Implement sends the unsent Exec pick and ends it once it is saved", async () => {
+    const pickedModel = "openai:gpt-5.2-pro";
+    // Picked while Exec was the agent, then the workspace switched to Plan.
+    markAiSelectionIntent(WORKSPACE_ID, "model", pickedModel);
+    startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
+
+    const sendMessageCalls: SendMessageArgs[] = [];
+    mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+    const view = renderCompletedPlan();
+    fireEvent.click(view.getByRole("button", { name: "Implement" }));
+
+    await waitFor(() => expect(sendMessageCalls.length).toBe(1));
+    expect(sendMessageCalls[0]?.options.model).toBe(pickedModel);
+    setWorkspaceAiMetadata(WORKSPACE_ID, {
+      agentId: "exec",
+      aiSettingsByAgent: { exec: { model: pickedModel, thinkingLevel: "high" } },
+    });
+    await waitFor(() =>
+      expect(getPendingAiSelection(WORKSPACE_ID, "exec", "model")).toBeUndefined()
+    );
+    // The handoff's agent pick ended with the save too, so a later agent change applies.
+    setWorkspaceAiMetadata(WORKSPACE_ID, { agentId: "plan" });
+    expect(getWorkspaceAgentId(WORKSPACE_ID)).toBe("plan");
   });
 
   test("Implement keeps the exec model when the composer has Auto routing selected", async () => {
@@ -605,9 +627,9 @@ describe("ProposePlanToolCall", () => {
     // drop the Auto flag.
     const execModel = "openai:gpt-5.2";
     startInPlanMode(WORKSPACE_ID, execModel, "high");
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, { exec: { modelString: execModel } });
-    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING), true);
-    updatePersistedState(getAutoModelRoutingKey(WORKSPACE_ID), true);
+    setTestAgentAiDefaults({ exec: { modelString: execModel } });
+    setTestExperiment(EXPERIMENT_IDS.AUTO_MODEL_ROUTING, true);
+    setAutoRoutingChoice(WORKSPACE_ID, "model", true);
 
     const sendMessageCalls: SendMessageArgs[] = [];
     mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
@@ -620,13 +642,13 @@ describe("ProposePlanToolCall", () => {
     expect(sendMessageCalls[0]?.options.autoModelRouting).not.toBe(true);
   });
 
-  test("Implement sends unrouted, then leaves the composer on exec's Auto default", async () => {
+  test("Implement sends unrouted but saves exec's Auto default for its later sends", async () => {
     const execModel = "openai:gpt-5.2";
     startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {
+    setTestAgentAiDefaults({
       exec: { modelString: execModel, autoModelRouting: true, autoThinkingLevel: true },
     });
-    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING), true);
+    setTestExperiment(EXPERIMENT_IDS.AUTO_MODEL_ROUTING, true);
 
     const sendMessageCalls: SendMessageArgs[] = [];
     mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
@@ -638,18 +660,23 @@ describe("ProposePlanToolCall", () => {
     expect(sendMessageCalls[0]?.options.model).toBe(execModel);
     expect(sendMessageCalls[0]?.options.autoModelRouting).toBe(false);
     expect(sendMessageCalls[0]?.options.autoThinkingLevel).toBe(false);
-    expect(readPersistedState(getAutoModelRoutingKey(WORKSPACE_ID), false)).toBe(true);
-    expect(readPersistedState(getAutoThinkingLevelKey(WORKSPACE_ID), false)).toBe(true);
+    expect(sendMessageCalls[0]?.options.savedAutoRouting).toEqual({
+      model: true,
+      thinkingLevel: true,
+    });
   });
 
   test("uses workspace-by-agent override for Implement when exec defaults inherit", async () => {
     const execWorkspaceModel = "openai:gpt-5.2-pro";
     const execWorkspaceThinking = "medium";
 
-    startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {});
-    updatePersistedState(getWorkspaceAISettingsByAgentKey(WORKSPACE_ID), {
-      exec: { model: execWorkspaceModel, thinkingLevel: execWorkspaceThinking },
+    setTestAgentAiDefaults({});
+    setWorkspaceAiMetadata(WORKSPACE_ID, {
+      agentId: "plan",
+      aiSettingsByAgent: {
+        plan: { model: "anthropic:claude-sonnet-4-5", thinkingLevel: "high" },
+        exec: { model: execWorkspaceModel, thinkingLevel: execWorkspaceThinking },
+      },
     });
 
     const sendMessageCalls: SendMessageArgs[] = [];
@@ -785,91 +812,6 @@ describe("ProposePlanToolCall", () => {
     expect(sendMessageCalls[0]?.message).toBe("Implement the plan");
   });
 
-  describe("admin policy excludes the target agent's model (#4980)", () => {
-    const EXEC_MODEL = "openai:gpt-5.2";
-    const PLAN_MODEL = "anthropic:claude-sonnet-4-5";
-    const ONLY_ANTHROPIC_POLICY = {
-      source: "governor" as const,
-      status: { state: "enforced" as const },
-      policy: {
-        policyFormatVersion: "0.1" as const,
-        providerAccess: [{ id: "anthropic" as const, allowedModels: null }],
-        mcp: { allowUserDefined: { stdio: true, remote: true } },
-        runtimes: null,
-      },
-    };
-
-    const PROVIDERS_CONFIG = {
-      openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
-      anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true },
-    };
-
-    // Both providers have credentials and routing is loaded (default priority), so the exec
-    // model routes directly to openai.
-    function withProvidersConfig() {
-      spyOn(getProvidersConfigStore(), "getConfig").mockReturnValue(PROVIDERS_CONFIG);
-      spyOn(getAppConfigStore(), "getSnapshot").mockReturnValue({});
-    }
-
-    async function renderWithEnforcedPolicy(sendMessageCalls: SendMessageArgs[]) {
-      startInPlanMode(WORKSPACE_ID, PLAN_MODEL, "high");
-      updatePersistedState(AGENT_AI_DEFAULTS_KEY, { exec: { modelString: EXEC_MODEL } });
-      let policyAnswer: Promise<typeof ONLY_ANTHROPIC_POLICY> | null = null;
-      mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
-      mockApi.policy = {
-        get: () => {
-          policyAnswer = Promise.resolve(ONLY_ANTHROPIC_POLICY);
-          return policyAnswer;
-        },
-      };
-      const view = renderCompletedPlan();
-      await waitFor(() => expect(policyAnswer).not.toBeNull());
-      // Flush PolicyProvider's state update for the answer before the click reads it.
-      await act(async () => {
-        await policyAnswer;
-      });
-      return view;
-    }
-
-    test("refuses Implement before switching agents and says why", async () => {
-      withProvidersConfig();
-      const sendMessageCalls: SendMessageArgs[] = [];
-      const view = await renderWithEnforcedPolicy(sendMessageCalls);
-
-      fireEvent.click(view.getByRole("button", { name: "Implement" }));
-
-      await waitFor(() => expect(view.getByRole("alert").textContent).toContain(EXEC_MODEL));
-      expect(sendMessageCalls).toHaveLength(0);
-      // Nothing was switched: the composer stays on the plan agent and its model.
-      expect(readPersistedState(getAgentIdKey(WORKSPACE_ID), "")).toBe("plan");
-      expect(readPersistedState(getModelKey(WORKSPACE_ID), "")).toBe(PLAN_MODEL);
-      expect((view.getByRole("button", { name: "Implement" }) as HTMLButtonElement).disabled).toBe(
-        false
-      );
-    });
-
-    // Without the providers config or the routing config, the active route is unknown (a
-    // gateway route may be allowed).
-    test.each([
-      ["providers", null, {}],
-      ["routing", PROVIDERS_CONFIG, null],
-    ] as const)(
-      "leaves the decision to the backend until the %s config is known",
-      async (_name, providersConfig, appConfig) => {
-        spyOn(getProvidersConfigStore(), "getConfig").mockReturnValue(providersConfig);
-        spyOn(getAppConfigStore(), "getSnapshot").mockReturnValue(appConfig);
-        const sendMessageCalls: SendMessageArgs[] = [];
-        const view = await renderWithEnforcedPolicy(sendMessageCalls);
-
-        fireEvent.click(view.getByRole("button", { name: "Implement" }));
-
-        await waitFor(() => expect(sendMessageCalls).toHaveLength(1));
-        expect(sendMessageCalls[0]?.options.model).toBe(EXEC_MODEL);
-        expect(view.queryByRole("alert")).toBeNull();
-      }
-    );
-  });
-
   test("shows a rejected Implement send in the card", async () => {
     startInPlanMode();
     let sends = 0;
@@ -878,7 +820,7 @@ describe("ProposePlanToolCall", () => {
         sends += 1;
         return Promise.resolve({
           success: false,
-          error: { type: "policy_denied", message: "Model openai:gpt-5.2 is not allowed" },
+          error: { type: "invalid_model_string", message: "Model openai:gpt-5.2 is not allowed" },
         });
       },
     });

@@ -35,7 +35,7 @@ function errorMessage(error: unknown): string {
 }
 
 /** Works for both layouts: actions/download-artifact and `gh run download -n`. */
-function readRunDir(dir: string): {
+export function readRunDir(dir: string): {
   artifactFound: boolean;
   reads: ScenarioRead[];
   results?: PlaywrightResults;

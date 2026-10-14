@@ -30,7 +30,7 @@ export class AsyncMutex {
     if (lock !== null) {
       return lock;
     }
-    // release() hands the lock straight to the first waiter (formal/primitives/AsyncMutex.tla):
+    // release() hands the lock straight to the first waiter:
     // a woken waiter that re-checked `locked` in a later microtask could lose the lock to a
     // caller in between and re-queue at the tail, breaking FIFO order.
     return await new Promise<AsyncMutexLock>((resolve) => this.queue.push(resolve));

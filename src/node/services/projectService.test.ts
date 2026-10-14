@@ -170,6 +170,30 @@ describe("ProjectService", () => {
   });
 
   describe("create", () => {
+    // #5917: a root project would make file completions, git status and review scans walk the
+    // whole disk.
+    it("refuses to register the filesystem root", async () => {
+      expect(await service.create("/")).toEqual({
+        success: false,
+        error: "A project cannot be the filesystem root",
+      });
+      expect(config.loadConfigOrDefault().projects.size).toBe(0);
+    });
+
+    // Windows needs extra privileges for symlinks.
+    it.skipIf(process.platform === "win32")(
+      "refuses a symlink that resolves to the filesystem root",
+      async () => {
+        const link = path.join(tempDir, "root-link");
+        await fs.symlink("/", link);
+        expect(await service.create(link)).toEqual({
+          success: false,
+          error: "A project cannot be the filesystem root",
+        });
+        expect(config.loadConfigOrDefault().projects.size).toBe(0);
+      }
+    );
+
     it("creates and registers a git project at a new path", async () => {
       const projectPath = path.join(tempDir, "new-git-project");
 
@@ -2334,6 +2358,26 @@ exit 1
   });
 
   describe("project settings mutations", () => {
+    it("setTrust never creates a project at the filesystem root, but updates an existing one", async () => {
+      let refusal: unknown;
+      try {
+        await service.setTrust("/", true);
+      } catch (error) {
+        refusal = error;
+      }
+      expect(refusal).toBeInstanceOf(Error);
+      expect((refusal as Error).message).toBe("A project cannot be the filesystem root");
+      expect(config.loadConfigOrDefault().projects.size).toBe(0);
+
+      // An older config can already hold the root project (#5917): its trust still changes.
+      await config.editConfig((current) => {
+        current.projects.set("/", { workspaces: [] });
+        return current;
+      });
+      await service.setTrust("/", true);
+      expect(new Config(tempDir).loadConfigOrDefault().projects.get("/")?.trusted).toBe(true);
+    });
+
     it("propagates parent trust to MCP state", async () => {
       const parentPath = path.join(tempDir, "project");
       const childPath = path.join(parentPath, "packages", "api");
@@ -2727,6 +2771,58 @@ exit 1
         activeCount: 0,
         archivedCount: 0,
       });
+    });
+  });
+
+  // #5926: stored keys that normalize to the same path ("/fake/merged" and "/fake/merged/") load
+  // as one project. Trust and remove must act on that one project and leave no alias behind.
+  describe("aliased project keys", () => {
+    async function writeAliasedProject(): Promise<void> {
+      const rows = ["ws-a", "ws-b"].map((id) => ({ id, name: id, path: path.join(tempDir, id) }));
+      for (const row of rows) await fs.mkdir(row.path, { recursive: true });
+      await fs.writeFile(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            ["/fake/merged/", { workspaces: [rows[0]] }],
+            ["/fake/merged", { workspaces: [rows[1]] }],
+          ],
+        })
+      );
+    }
+
+    async function storedProjectKeys(): Promise<string[]> {
+      const saved = JSON.parse(await fs.readFile(path.join(tempDir, "config.json"), "utf-8")) as {
+        projects: Array<[string, unknown]>;
+      };
+      return saved.projects.map(([key]) => key);
+    }
+
+    it("keeps a trust change on a merged project through a reload", async () => {
+      await writeAliasedProject();
+
+      await service.setTrust("/fake/merged/", true);
+
+      expect(await storedProjectKeys()).toEqual(["/fake/merged"]);
+      const reloaded = new Config(tempDir).loadConfigOrDefault().projects.get("/fake/merged");
+      expect(reloaded?.trusted).toBe(true);
+      expect(reloaded?.workspaces.map((workspace) => workspace.id)).toEqual(["ws-a", "ws-b"]);
+    });
+
+    it("removes a merged project with no alias left behind", async () => {
+      await writeAliasedProject();
+      service.setWorkspaceService({
+        remove: async (workspaceId) => {
+          await config.removeWorkspace(workspaceId);
+          return Ok(undefined);
+        },
+      });
+
+      const result = await service.remove("/fake/merged/", true);
+
+      expect(result.success).toBe(true);
+      expect(await storedProjectKeys()).toEqual([]);
+      expect([...new Config(tempDir).loadConfigOrDefault().projects.keys()]).toEqual([]);
     });
   });
 

@@ -5,7 +5,6 @@ import {
   EXPERIMENTS_WRITE_TIMEOUT_MS,
   EXPERIMENTS,
   isExperimentSupportedOnPlatform,
-  LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID,
   type ExperimentId,
 } from "@/common/constants/experiments";
 import { getXumHome } from "@/common/constants/paths";
@@ -34,48 +33,30 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /** Parse the persisted overrides file contents (shared by the service and CLI reads). */
-async function readOverridesFile(filePath: string): Promise<{
-  overrides: Map<ExperimentId, boolean>;
-  /** True when the persisted file already carries the enabled legacy
-   * exclusive mirror (see LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID). */
-  hasLegacyPtcMirror: boolean;
-}> {
+async function readOverridesFile(filePath: string): Promise<Map<ExperimentId, boolean>> {
   const overrides = new Map<ExperimentId, boolean>();
-  let hasLegacyPtcMirror = false;
   try {
     const raw = await fs.readFile(filePath, "utf-8");
     const parsed = JSON.parse(raw) as unknown;
 
     if (!isRecord(parsed) || parsed.version !== OVERRIDES_FILE_VERSION) {
-      return { overrides, hasLegacyPtcMirror };
+      return overrides;
     }
 
     const persisted = parsed.overrides;
     if (!isRecord(persisted)) {
-      return { overrides, hasLegacyPtcMirror };
+      return overrides;
     }
 
     for (const [key, value] of Object.entries(persisted)) {
-      if (!(key in EXPERIMENTS) || typeof value !== "boolean") {
-        continue;
+      if (typeof value === "boolean" && key in EXPERIMENTS) {
+        overrides.set(key as ExperimentId, value);
       }
-
-      overrides.set(key as ExperimentId, value);
-    }
-
-    // Legacy alias (see LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID): an enabled exclusive toggle
-    // must keep PTC on after upgrade — filtering it like an ordinary unknown
-    // key would silently turn the user's PTC posture off. `true` wins over an
-    // explicit ptc:false because the old build's exclusive flag activated the
-    // exclusive posture regardless of the supplement flag.
-    if (persisted[LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID] === true) {
-      overrides.set(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING, true);
-      hasLegacyPtcMirror = true;
     }
   } catch {
     // Ignore missing/corrupt overrides
   }
-  return { overrides, hasLegacyPtcMirror };
+  return overrides;
 }
 
 /**
@@ -94,7 +75,7 @@ export async function readPersistedExperimentEnabled(
   }
 
   const xumHome = options?.xumHome ?? getXumHome();
-  const { overrides } = await readOverridesFile(path.join(xumHome, EXPERIMENT_OVERRIDES_FILE_NAME));
+  const overrides = await readOverridesFile(path.join(xumHome, EXPERIMENT_OVERRIDES_FILE_NAME));
   return overrides.get(experimentId) === true;
 }
 
@@ -115,6 +96,7 @@ export class ExperimentsService {
 
   private initialized = false;
   private initialization: Promise<void> | undefined;
+  private readonly changeListeners = new Set<() => void>();
 
   constructor(options: {
     telemetryService: TelemetryService;
@@ -137,13 +119,8 @@ export class ExperimentsService {
 
   private async initializeOnce(): Promise<void> {
     try {
-      await this.withOverridesLock(async (lease) => {
-        const needsLegacyPtcMirrorRewrite = await this.loadOverridesFromDisk();
-        if (needsLegacyPtcMirrorRewrite) {
-          await lease.assertStillOwned();
-          await this.writeOverridesToDisk();
-        }
-      });
+      // Adopt under the lock so a sibling's newer write cannot land between read and adopt.
+      await this.withOverridesLock(() => this.loadOverridesFromDisk());
     } catch {
       // Startup is best effort; explicit mutations below must report failed persistence.
     }
@@ -151,27 +128,8 @@ export class ExperimentsService {
   }
 
   /**
-   * Overrides persisted for this machine. Renderers read these so a client whose
-   * origin-scoped localStorage is empty still shows the state its backend gates use.
-   */
-  async getOverrides(): Promise<Partial<Record<ExperimentId, boolean>>> {
-    await this.ensureInitialized();
-    await this.withOverridesLock(() => this.loadOverridesFromDisk());
-
-    const result: Partial<Record<ExperimentId, boolean>> = {};
-    for (const [experimentId, enabled] of this.overrides) {
-      if (this.isExperimentSupported(experimentId)) {
-        result[experimentId] = enabled;
-      }
-    }
-
-    return result;
-  }
-
-  /**
-   * Update a single override. Writes are per-experiment so a client cannot clear
-   * overrides it never knew about: localStorage is origin-scoped, and a second
-   * renderer starting empty must not wipe state persisted for this machine.
+   * Update a single override. Writes are per-experiment and merge into current
+   * disk state, so a writer never clears overrides it did not change.
    */
   async setOverride(
     experimentId: ExperimentId,
@@ -183,7 +141,7 @@ export class ExperimentsService {
     await this.withOverridesLock(async (lease) => {
       // Merge the individual mutation into current disk state. A stale sibling
       // changing an unrelated flag must never restore withdrawn Design consent.
-      const { overrides: next } = await readOverridesFile(this.overridesFilePath);
+      const next = await readOverridesFile(this.overridesFilePath);
       const value = this.isExperimentSupported(experimentId) ? enabled : null;
       if (value == null) next.delete(experimentId);
       else next.set(experimentId, value);
@@ -192,6 +150,18 @@ export class ExperimentsService {
       // A successful acknowledgement means the change survives a restart.
       this.adoptOverrides(next);
     });
+    this.notifyChange();
+  }
+
+  onChange(listener: () => void): () => void {
+    this.changeListeners.add(listener);
+    return () => {
+      this.changeListeners.delete(listener);
+    };
+  }
+
+  private notifyChange(): void {
+    for (const listener of this.changeListeners) listener();
   }
 
   private async withOverridesLock<T>(
@@ -221,6 +191,24 @@ export class ExperimentsService {
     return this.overrides.get(experimentId) === true;
   }
 
+  /**
+   * Re-reads disk first so this backend adopts writes a sibling backend made to the
+   * shared file. A busy lock keeps the last adopted state.
+   */
+  async getEnabledStates(): Promise<Partial<Record<ExperimentId, boolean>>> {
+    await this.ensureInitialized();
+    try {
+      await this.withOverridesLock(() => this.loadOverridesFromDisk());
+    } catch {
+      // The next read retries.
+    }
+    const states: Partial<Record<ExperimentId, boolean>> = {};
+    for (const experimentId of Object.values(EXPERIMENT_IDS)) {
+      states[experimentId] = this.isExperimentEnabled(experimentId);
+    }
+    return states;
+  }
+
   private async ensureInitialized(): Promise<void> {
     if (this.initialized) {
       return;
@@ -230,43 +218,32 @@ export class ExperimentsService {
     assert(this.initialized, "ExperimentsService failed to initialize");
   }
 
-  /** Returns true when the persisted file enables PTC without the legacy
-   * downgrade mirror and needs a rewrite (see initialize). */
-  private async loadOverridesFromDisk(): Promise<boolean> {
-    const { overrides, hasLegacyPtcMirror } = await readOverridesFile(this.overridesFilePath);
-    this.adoptOverrides(overrides);
-    return overrides.get(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING) === true && !hasLegacyPtcMirror;
+  private async loadOverridesFromDisk(): Promise<void> {
+    // Other clients refetch only on a change signal. Without one they keep showing the old
+    // value while turns already use the adopted one.
+    if (this.adoptOverrides(await readOverridesFile(this.overridesFilePath))) this.notifyChange();
   }
 
-  private adoptOverrides(next: Map<ExperimentId, boolean>): void {
+  /** Returns whether an experiment's effective value changed. */
+  private adoptOverrides(next: Map<ExperimentId, boolean>): boolean {
+    let changed = false;
     // Disk reconciliation also changes telemetry, including removed overrides.
     for (const id of new Set([...this.overrides.keys(), ...next.keys()])) {
       if (this.overrides.get(id) !== next.get(id)) {
-        this.telemetryService.setFeatureFlagVariant(
-          id,
-          this.isExperimentSupported(id) ? (next.get(id) ?? null) : null
-        );
+        const supported = this.isExperimentSupported(id);
+        this.telemetryService.setFeatureFlagVariant(id, supported ? (next.get(id) ?? null) : null);
+        changed ||= supported && (this.overrides.get(id) === true) !== (next.get(id) === true);
       }
     }
     this.overrides = next;
+    return changed;
   }
 
-  private async writeOverridesToDisk(state = this.overrides): Promise<void> {
-    const overrides: NonNullable<ExperimentsFile["overrides"]> = {};
-    for (const [experimentId, enabled] of state) {
-      overrides[experimentId] = enabled;
-    }
-    // Downgrade sync (see LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID): mirror an enabled PTC
-    // onto the pre-merge exclusive key so an older build keeps the exclusive
-    // posture instead of interpreting a bare ptc:true as supplement mode.
-    if (overrides[EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING] === true) {
-      overrides[LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID] = true;
-    }
-
+  private async writeOverridesToDisk(state: Map<ExperimentId, boolean>): Promise<void> {
     const payload: ExperimentsFile = {
       version: OVERRIDES_FILE_VERSION,
       experiments: {},
-      overrides,
+      overrides: Object.fromEntries(state),
     };
 
     await fs.mkdir(this.xumHome, { recursive: true });

@@ -121,6 +121,7 @@ const closeTerminalWindowMock = mock(() => {
 const mockWindowManager = {
   openTerminalWindow: openTerminalWindowMock,
   closeTerminalWindow: closeTerminalWindowMock,
+  setSessionWindowClosedHandler: () => undefined,
 } as unknown as TerminalWindowManager;
 
 describe("TerminalService", () => {
@@ -211,6 +212,39 @@ describe("TerminalService", () => {
       }
     }
   }
+
+  describe("XUM_DISABLE_TERMINALS", () => {
+    afterEach(() => {
+      delete process.env.XUM_DISABLE_TERMINALS;
+    });
+
+    it("refuses create, input and native terminals without starting a shell", async () => {
+      const session = await service.create({ workspaceId: "ws-1", cols: 80, rows: 24 });
+      createSessionMock.mockClear();
+      process.env.XUM_DISABLE_TERMINALS = "1";
+
+      let createError: unknown;
+      try {
+        await service.create({ workspaceId: "ws-1", cols: 80, rows: 24 });
+      } catch (error) {
+        createError = error;
+      }
+      expect(String(createError)).toContain("XUM_DISABLE_TERMINALS");
+      expect(createSessionMock).not.toHaveBeenCalled();
+
+      // A session opened before the switch takes no input either.
+      expect(() => service.sendInput(session.sessionId, "ls\n")).toThrow("XUM_DISABLE_TERMINALS");
+      expect(sendInputMock).not.toHaveBeenCalled();
+
+      let nativeError: unknown;
+      try {
+        await service.openNative("ws-1");
+      } catch (error) {
+        nativeError = error;
+      }
+      expect(String(nativeError)).toContain("XUM_DISABLE_TERMINALS");
+    });
+  });
 
   it("should create a session", async () => {
     const session = await service.create({
@@ -380,28 +414,48 @@ describe("TerminalService", () => {
     ) as unknown as typeof configRef.getAllWorkspaceMetadata;
 
     try {
-      await withProxyEnv(
-        {
-          vscodeProxyUri: "https://coder.example/proxy/{{port}}/",
-          muxProxyUri: "https://mux.example/proxy/{{port}}/",
-        },
-        async () => {
-          await service.create({
-            workspaceId: "ws-ssh",
-            cols: 80,
-            rows: 24,
-          });
+      for (const artifactsEnabled of [true, false]) {
+        service = new TerminalService(
+          mockConfig,
+          mockPTYService,
+          mockSecretsStore,
+          () => artifactsEnabled
+        );
+        createSessionMock.mockClear();
+        await withProxyEnv(
+          {
+            vscodeProxyUri: "https://coder.example/proxy/{{port}}/",
+            muxProxyUri: "https://mux.example/proxy/{{port}}/",
+          },
+          async () => {
+            await service.create({
+              workspaceId: "ws-ssh",
+              cols: 80,
+              rows: 24,
+            });
+          }
+        );
+
+        const call = createSessionMock.mock.calls[0];
+        if (!call) {
+          throw new Error("Expected createSession to be called");
         }
-      );
 
-      const call = createSessionMock.mock.calls[0];
-      if (!call) {
-        throw new Error("Expected createSession to be called");
+        const options = call[6] as
+          | { env?: NodeJS.ProcessEnv; remoteShellPrelude?: string }
+          | undefined;
+        expect(options?.env).toBeUndefined();
+        expect(getEffectiveSecretsMock).not.toHaveBeenCalled();
+        if (artifactsEnabled) {
+          // The remote shell creates and exports its own scratch dir (no exec before the PTY).
+          expect(options?.remoteShellPrelude).toContain(
+            'export XUM_SCRATCH_DIR="$HOME/.mux/workspace-scratch/ws-ssh"'
+          );
+        } else {
+          // Remote scratch dirs need the Artifacts experiment.
+          expect(options?.remoteShellPrelude).toBeUndefined();
+        }
       }
-
-      const options = call[6] as { env?: NodeJS.ProcessEnv } | undefined;
-      expect(options?.env).toBeUndefined();
-      expect(getEffectiveSecretsMock).not.toHaveBeenCalled();
     } finally {
       configRef.getAllWorkspaceMetadata = originalGetAllWorkspaceMetadata;
     }
@@ -601,6 +655,102 @@ describe("TerminalService", () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (mockPTYService.createSession as any) = createSessionMock;
   });
+
+  it("completes an exit subscription that attaches after the shell exited (#6029)", async () => {
+    let capturedOnExit: ((code: number) => void) | undefined;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockPTYService.createSession as any) = mock(
+      (
+        params: TerminalCreateParams,
+        _runtime: unknown,
+        _path: string,
+        _onData: unknown,
+        onExit: (code: number) => void
+      ) => {
+        capturedOnExit = onExit;
+        return Promise.resolve({
+          sessionId: "session-late",
+          workspaceId: params.workspaceId,
+          cols: 80,
+          rows: 24,
+        });
+      }
+    );
+
+    try {
+      await service.create({ workspaceId: "ws-1", cols: 80, rows: 24 });
+
+      const early: number[] = [];
+      service.onExit("session-late", (code) => early.push(code));
+      if (!capturedOnExit) throw new Error("Expected createSession to capture onExit callback");
+      capturedOnExit(7);
+
+      // The renderer subscribes from a mount effect, so the shell can already be gone.
+      const late: number[] = [];
+      service.onExit("session-late", (code) => late.push(code));
+      const unknown: number[] = [];
+      service.onExit("never-existed", (code) => unknown.push(code));
+
+      expect(early).toEqual([7]);
+      // 0 is the renderer's convention for "ended before the listener attached".
+      expect(late).toEqual([0]);
+      expect(unknown).toEqual([0]);
+    } finally {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (mockPTYService.createSession as any) = createSessionMock;
+    }
+  });
+
+  describe("pop-out attachments (#5673)", () => {
+    it("a session with a live pop-out is not listed, so the sidebar does not adopt it", () => {
+      getWorkspaceSessionIdsMock.mockImplementation(
+        () => ["popped", "sidebar"] as unknown as never[]
+      );
+
+      const release = service.markPopoutAttached("popped");
+      expect(service.getWorkspaceSessionIds("ws-1")).toEqual(["sidebar"]);
+
+      // The pop-out's attach stream ended (window closed, crashed or reloaded): the session can
+      // come back, for example as a sidebar tab on the next load.
+      release();
+      expect(service.getWorkspaceSessionIds("ws-1")).toEqual(["popped", "sidebar"]);
+    });
+
+    it("the session stays hidden until every pop-out attach for it has ended", () => {
+      getWorkspaceSessionIdsMock.mockImplementation(() => ["popped"] as unknown as never[]);
+
+      const releaseFirst = service.markPopoutAttached("popped");
+      const releaseSecond = service.markPopoutAttached("popped");
+      releaseFirst();
+      releaseFirst();
+      expect(service.getWorkspaceSessionIds("ws-1")).toEqual([]);
+
+      releaseSecond();
+      expect(service.getWorkspaceSessionIds("ws-1")).toEqual(["popped"]);
+    });
+
+    it("closing a desktop pop-out window ends its session; app-closed sibling windows do not", () => {
+      let onClosed: ((sessionId: string, closedBy: "user" | "app") => void) | undefined;
+      const windowManager = {
+        ...mockWindowManager,
+        setSessionWindowClosedHandler: (
+          handler: (sessionId: string, closedBy: "user" | "app") => void
+        ) => {
+          onClosed = handler;
+        },
+      } as unknown as TerminalWindowManager;
+      service.setTerminalWindowManager(windowManager);
+      const closeSpy = spyOn(service, "close");
+
+      // One pop-out's shell exited, so the app closed every pop-out of the workspace: the
+      // siblings' shells keep running.
+      onClosed?.("sibling", "app");
+      onClosed?.("popped", "user");
+
+      expect(closeSpy.mock.calls).toEqual([["popped"]]);
+    });
+  });
+
   describe("terminal activity tracking", () => {
     let capturedOnData: ((data: string) => void) | undefined;
     let capturedOnExit: ((code: number) => void) | undefined;

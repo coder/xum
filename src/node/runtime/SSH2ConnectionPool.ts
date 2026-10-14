@@ -470,24 +470,49 @@ export class SSH2ConnectionPool {
   }
 
   /**
-   * Keep `entry`'s connection open while `channel` runs. The idle timer only
-   * counts acquires, so without this a command or terminal that outlived the
-   * idle window was cut off mid-run (#4876). The idle window restarts when the
-   * last open channel closes.
+   * Keep `entry`'s connection open from the moment a channel is requested until it
+   * closes. The idle timer only counts acquires, so without this a command or
+   * terminal that outlived the idle window was cut off mid-run (#4876). ssh2 hands
+   * over the channel only in its exec/shell callback, and a channel open can take
+   * longer than the idle window, so the slot is taken before the request: counting
+   * from the callback let the idle timer end the client under a pending open.
+   *
+   * The caller must end the slot exactly once: `attach(channel)` when the channel
+   * arrives (the slot ends when it closes), or `release()` when the open fails,
+   * times out or is aborted. The idle window restarts when the last slot ends.
    */
-  trackChannel(
+  reserveChannel(
     config: SSHConnectionConfig,
-    entry: SSH2ConnectionEntry,
-    channel: Pick<NodeJS.EventEmitter, "once">
-  ): void {
+    entry: SSH2ConnectionEntry
+  ): {
+    attach: (channel: Pick<NodeJS.EventEmitter, "once">) => void;
+    release: () => void;
+  } {
     entry.openChannels++;
-    channel.once("close", () => {
+    let state: "pending" | "attached" | "released" = "pending";
+    const end = () => {
+      assert(state !== "released", "SSH2 channel slot ended twice");
+      state = "released";
       entry.openChannels--;
       assert(entry.openChannels >= 0, "SSH2 open channel count went negative");
-      if (entry.openChannels === 0) {
-        this.touchConnection(entry, makeConnectionKey(config));
+      const key = makeConnectionKey(config);
+      // A dropped entry (closed, errored or idle-closed) needs no idle timer: arming one on the
+      // dead client only held the event loop open until it fired as a no-op (#5507).
+      if (entry.openChannels === 0 && this.connections.get(key) === entry) {
+        this.touchConnection(entry, key);
       }
-    });
+    };
+    return {
+      attach: (channel) => {
+        assert(state === "pending", "SSH2 channel slot attached after it ended");
+        state = "attached";
+        channel.once("close", end);
+      },
+      release: () => {
+        assert(state === "pending", "SSH2 channel slot released after it was attached or released");
+        end();
+      },
+    };
   }
 
   /**
@@ -522,9 +547,24 @@ export class SSH2ConnectionPool {
     }
   }
 
+  /**
+   * A connection outside the pool: never shared and never idle-closed, for a long-lived
+   * reverse forward (bash AI proxy). It must not be the pooled one: forwarded traffic plus exec
+   * output on one ssh2 connection stalled it against OpenSSH's sshd until the keepalive timeout,
+   * which would also stall every exec that shares it. The caller ends it with `client.destroy()`,
+   * and its ProxyCommand ends with it.
+   */
+  async openDedicatedConnection(
+    config: SSHConnectionConfig,
+    timeoutMs: number = DEFAULT_CONNECT_TIMEOUT_MS
+  ): Promise<Client> {
+    return (await this.connect(config, timeoutMs, "dedicated")).client;
+  }
+
   private async connect(
     config: SSHConnectionConfig,
-    timeoutMs: number
+    timeoutMs: number,
+    mode: "pooled" | "dedicated" = "pooled"
   ): Promise<SSH2ConnectionEntry> {
     const key = makeConnectionKey(config);
     try {
@@ -639,12 +679,23 @@ export class SSH2ConnectionPool {
             }
           }
 
+          // This client's events may arrive after the pool already dropped its entry: an idle
+          // close deletes the entry and calls end(), but "end"/"close"/"error" can come later
+          // (a dead TCP path, a ProxyCommand slow to exit). By then a newer connection can own
+          // connections[key]. Deleting that entry leaked the newer client (and its proxy): no
+          // idle close ever found it again. So a handler touches the map and the host's health
+          // only for its own entry, or, before registration, for its own failed handshake.
+          let registered = false;
+          const isOwnEntry = () => this.connections.get(key) === entry;
+
           const onClose = () => {
             if (entry.idleTimer) {
               clearTimeout(entry.idleTimer);
             }
             cleanupProxy();
-            this.connections.delete(key);
+            if (isOwnEntry()) {
+              this.connections.delete(key);
+            }
           };
 
           client.on("close", onClose);
@@ -653,10 +704,14 @@ export class SSH2ConnectionPool {
             if (entry.idleTimer) {
               clearTimeout(entry.idleTimer);
             }
-            if (!isAuthFailure(err) || reportAuthFailure) {
+            const ownEntry = isOwnEntry();
+            // A retired client's error says nothing about the host's current connection.
+            if ((ownEntry || !registered) && (!isAuthFailure(err) || reportAuthFailure)) {
               this.reportFailure(config, getErrorMessage(withProxyExitContext(err)));
             }
-            this.connections.delete(key);
+            if (ownEntry) {
+              this.connections.delete(key);
+            }
             cleanupProxy();
           });
 
@@ -716,6 +771,9 @@ export class SSH2ConnectionPool {
           });
 
           this.markHealthy(config);
+          // `registered` also keeps a dedicated client's later errors out of the host health.
+          registered = true;
+          if (mode === "dedicated") return entry;
           this.connections.set(key, entry);
           entry.idleTimer = setTimeout(() => {
             this.closeIdleConnection(key, entry);

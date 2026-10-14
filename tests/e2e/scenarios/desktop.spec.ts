@@ -71,7 +71,7 @@ async function enableRealDesktop(page: Page, workspaceId: string) {
   const capability = await page.evaluate(async (id) => {
     const api = window.__ORPC_CLIENT__;
     if (!api) throw new Error("E2E API client not initialized");
-    await api.experiments.setOverride({ experimentId: "portable-desktop", enabled: true });
+    await api.experiments.set({ experimentId: "portable-desktop", enabled: true });
     return api.desktop.getCapability({ workspaceId: id });
   }, workspaceId);
   if (!capability.available) {

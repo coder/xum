@@ -1,10 +1,17 @@
 import type { TurnCompletion } from "./streamManager";
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn, jest } from "bun:test";
+import { NESTED_COMPACTION_FOLLOW_UP_MESSAGE } from "@/common/utils/messages/pluginSendHookFields";
 import type { WorkspaceService } from "./workspaceService";
 import type { IdleCompactionOutcome } from "./idleCompactionService";
 import type { AgentSession } from "./agentSession";
 import type { SendMessageInternalOptions } from "./taskWorkspaceSeam";
-import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
+import {
+  createAgentSessionHarness,
+  createStartedTurnHandle,
+  createStreamLifecycleMocks,
+} from "./agentSession.testHarness";
+import { makeTestEffectRunner } from "./di/testEffectRunner";
+import { calculateBackoffDelay } from "@/common/utils/messages/retryState";
 import { askUserQuestionManager } from "./askUserQuestionManager";
 import { EventEmitter } from "events";
 import { Err, Ok, type Result } from "@/common/types/result";
@@ -37,6 +44,11 @@ import {
   type WorkspaceServiceHarness,
 } from "./workspaceService.testHarness";
 import { saveWorkspaces } from "./taskService.testHarness";
+import {
+  createArtifactInteractionDeps,
+  readPendingArtifactInteractions,
+  sendArtifactInteraction,
+} from "./artifactInteractions";
 
 // bun:test's jest shim implements advanceTimersByTime; its published types omit it.
 const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
@@ -238,6 +250,85 @@ describe("WorkspaceService sendMessage status clearing", () => {
     expect(fakeSession.queueMessage.mock.calls[0]?.[1]).toMatchObject({
       queueDispatchMode: queued,
     });
+  });
+
+  test("generic sends cannot carry artifact interaction metadata (no spoofed pill)", async () => {
+    const result = await workspaceService.sendMessage("test-workspace", "<artifact_interaction>", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+      muxMetadata: {
+        type: "normal",
+        artifactInteraction: {
+          id: "x",
+          artifactPath: "a.html",
+          title: "a",
+          version: 1,
+          action: "send",
+          text: "hi",
+        },
+      },
+    });
+    expect(result.success).toBe(false);
+    expect(fakeSession.queueMessage).not.toHaveBeenCalled();
+  });
+
+  test("a /compact whose follow-up is itself a compaction request is refused", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6rPrJh): no Xum path builds this shape, and the nested request's
+    // own follow-up would later dispatch as an automatic send no message.send hook may block.
+    const compaction = (followUpContent: Record<string, unknown>) => ({
+      type: "compaction-request" as const,
+      rawCommand: "/compact",
+      parsed: { followUpContent },
+    });
+    const result = await workspaceService.sendMessage("test-workspace", "Summarize.", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+      muxMetadata: compaction({
+        text: "/compact",
+        model: "openai:gpt-4o-mini",
+        agentId: "exec",
+        muxMetadata: compaction({ text: "deploy to prod", model: "openai:gpt-4o-mini" }),
+      }),
+    });
+
+    expect(result).toEqual({
+      success: false,
+      error: { type: "unknown", raw: NESTED_COMPACTION_FOLLOW_UP_MESSAGE },
+    });
+    expect(fakeSession.queueMessage).not.toHaveBeenCalled();
+    expect(fakeSession.sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("an artifact interaction sent while streaming queues tool-end with its dedupe key", async () => {
+    const sessionsDir = harness.config.sessionsDir;
+    const deps = createArtifactInteractionDeps({
+      config: harness.config,
+      workspaceService,
+      historyService: harness.historyService,
+    });
+    // Busy session (the default here): the interaction must land at the next tool boundary.
+    const sent = await sendArtifactInteraction(
+      {
+        ...deps,
+        getDefaultSendOptions: () =>
+          Promise.resolve({ model: "openai:gpt-4o-mini", agentId: "exec" }),
+      },
+      { workspaceId: "test-workspace", path: "form.html", version: null, text: "Ship it" }
+    );
+    expect(sent.success).toBe(true);
+    expect(fakeSession.queueMessage).toHaveBeenCalledTimes(1);
+    const [, options, internal] = fakeSession.queueMessage.mock.calls[0] as [
+      string,
+      { queueDispatchMode?: string; muxMetadata?: { artifactInteraction?: { id: string } } },
+      { dedupeKey?: string },
+    ];
+    expect(options.queueDispatchMode).toBe("tool-end");
+    const id = options.muxMetadata?.artifactInteraction?.id ?? "";
+    expect(id).not.toBe("");
+    expect(internal.dedupeKey).toBe(`artifact-interaction:${id}`);
+    // Queued, not yet accepted: the pending record survives a restart.
+    const pending = await readPendingArtifactInteractions(path.join(sessionsDir, "test-workspace"));
+    expect(pending.map((record) => record.id)).toEqual([id]);
   });
 
   test("a send arriving during an earlier send's preflight queues instead of starting a second turn", async () => {
@@ -2114,6 +2205,55 @@ describe("WorkspaceService post-compaction metadata refresh", () => {
 });
 
 describe("WorkspaceService interruptStream", () => {
+  test("Stop that disables auto-retry during a retry countdown tells the client the retry ended", async () => {
+    const workspaceId = "stop-during-retry-countdown";
+    const clock = makeTestEffectRunner();
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      captureEvents: true,
+      backgroundProcessManager: createTestBackgroundProcessManager(),
+      streamManager: { ...createStreamLifecycleMocks(), effectRunner: clock.runner },
+    });
+    const service = createWorkspaceServiceForTest({
+      config: h.config,
+      historyService: h.historyService,
+      aiService: h.aiService as AIService,
+      initStateManager: h.initStateManager,
+      extensionMetadata: new ExtensionMetadataService(
+        path.join(h.config.rootDir, "extensionMetadata.json")
+      ),
+      backgroundProcessManager: h.backgroundProcessManager,
+    });
+    service.registerSession(workspaceId, h.session);
+    const stream = spyOn(h.aiService, "streamMessage");
+    const retryEvents = () => h.events.filter((event) => event.type.startsWith("auto-retry-"));
+    try {
+      await h.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("user", "user", "resume", {
+          retrySendOptions: { model: "openai:gpt-4o", agentId: "exec" },
+        })
+      );
+      await h.session.runStartupRecovery();
+      expect(h.session.hasPendingAutoRetry()).toBe(true);
+      expect(retryEvents().at(-1)?.type).toBe("auto-retry-scheduled");
+
+      expect(await service.interruptStream(workspaceId, { disableAutoRetry: true })).toEqual(
+        Ok(undefined)
+      );
+
+      // The renderer keeps showing the countdown until it receives a terminal retry event.
+      expect(retryEvents().at(-1)?.type).toBe("auto-retry-abandoned");
+      expect(h.session.hasPendingAutoRetry()).toBe(false);
+      await clock.adjust(calculateBackoffDelay(1));
+      expect(stream).not.toHaveBeenCalled();
+    } finally {
+      await h.session.dispose();
+      await h.cleanup();
+      await clock.dispose();
+    }
+  });
+
   test("soft Send Now dispatches without requiring a hard Stop receipt", async () => {
     const workspaceId = "soft-send-now-receipt";
     const h = await createAgentSessionHarness({

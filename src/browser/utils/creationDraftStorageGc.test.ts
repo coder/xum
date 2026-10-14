@@ -7,12 +7,12 @@ import {
   resetCreationDraftStorageGcForTests,
 } from "@/browser/utils/creationDraftStorageGc";
 import {
+  getAutoExpandPrefsKey,
   getDraftScopeId,
   getInputKey,
-  getModelKey,
   getPendingScopeId,
+  getPinnedTodoExpandedKey,
   getProjectScopeId,
-  getThinkingLevelKey,
   getWorkspaceNameStateKey,
 } from "@/common/constants/storage";
 import type { DraftList } from "@/common/orpc/schemas/drafts";
@@ -49,23 +49,23 @@ describe("collectOrphanedCreationDraftStorage", () => {
   test("removes the settings keys of creation drafts the backend no longer lists", async () => {
     // Deleted (or turned into a workspace) by another origin, or its project was removed.
     const orphans = [
-      getModelKey(getDraftScopeId(PROJECT, "gone")),
-      getThinkingLevelKey(getDraftScopeId("/removed/project", "old")),
+      getAutoExpandPrefsKey(getDraftScopeId(PROJECT, "gone")),
+      getPinnedTodoExpandedKey(getDraftScopeId("/removed/project", "old")),
     ];
     const kept = [
       // Typed input is never collected: a typed workspace name, and legacy draft text that its
       // migration keeps until the backend confirms the import.
       getWorkspaceNameStateKey(getDraftScopeId(PROJECT, "gone")),
       getInputKey(getDraftScopeId(PROJECT, "gone")),
-      getModelKey(getDraftScopeId(PROJECT, "listed")),
+      getAutoExpandPrefsKey(getDraftScopeId(PROJECT, "listed")),
       // Not confirmed by the backend yet (an optimistic row) or the routed draft.
-      getModelKey(getDraftScopeId(PROJECT, "live")),
+      getAutoExpandPrefsKey(getDraftScopeId(PROJECT, "live")),
       // Scopes that are not listed creation drafts.
-      getModelKey(getDraftScopeId(PROJECT, "default")),
-      getModelKey(getPendingScopeId(PROJECT)),
-      getModelKey(getProjectScopeId(PROJECT)),
-      getModelKey("0123456789"),
-      getModelKey(getDraftScopeId(PROJECT, "bad id!")),
+      getAutoExpandPrefsKey(getDraftScopeId(PROJECT, "default")),
+      getAutoExpandPrefsKey(getPendingScopeId(PROJECT)),
+      getAutoExpandPrefsKey(getProjectScopeId(PROJECT)),
+      getAutoExpandPrefsKey("0123456789"),
+      getAutoExpandPrefsKey(getDraftScopeId(PROJECT, "bad id!")),
     ];
     seed([...orphans, ...kept]);
 
@@ -80,7 +80,7 @@ describe("collectOrphanedCreationDraftStorage", () => {
   });
 
   test("removes nothing when the backend list cannot be read, and runs once per session", async () => {
-    const key = getModelKey(getDraftScopeId(PROJECT, "gone"));
+    const key = getAutoExpandPrefsKey(getDraftScopeId(PROJECT, "gone"));
     seed([key]);
     let error: unknown;
     try {
@@ -103,8 +103,8 @@ describe("collectOrphanedCreationDraftStorage", () => {
   });
 
   test("keeps keys written for a draft created after the key snapshot", async () => {
-    seed([getModelKey(getDraftScopeId(PROJECT, "gone"))]);
-    const late = getModelKey(getDraftScopeId(PROJECT, "late"));
+    seed([getAutoExpandPrefsKey(getDraftScopeId(PROJECT, "gone"))]);
+    const late = getAutoExpandPrefsKey(getDraftScopeId(PROJECT, "late"));
     await collectOrphanedCreationDraftStorage({
       listCreationDrafts: () => {
         // A draft created while the list request is in flight.

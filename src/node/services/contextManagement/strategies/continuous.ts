@@ -93,7 +93,7 @@ export class ContinuousStrategy {
         const attachments = await this.buildContinuousCompactionAttachments(head);
         return { ...prepared, attachments };
       },
-      summarize: (head, signal, context: SessionCompactionContext) => {
+      summarize: (head, signal, context: SessionCompactionContext, receiptRows) => {
         const baseOptions = context.sendOptions ?? { model: context.model, agentId: "exec" };
         const request = this.host.buildAutoCompactionRequest({
           baseOptions,
@@ -106,6 +106,7 @@ export class ContinuousStrategy {
           aiService: this.deps.aiService,
           sessionUsageService: this.deps.sessionUsageService,
           head,
+          receiptRows,
           signal,
           context,
           baseOptions,
@@ -148,7 +149,6 @@ export class ContinuousStrategy {
     this.lastThreshold = { model, threshold };
     const providersConfig = this.host.state.providersConfig;
     const selection = resolveContextStrategy({
-      experiments: options?.experiments,
       isEnabled: (id) => this.deps.aiService.isExperimentEnabled(id),
       isCompactionRequest: isCompactionRequestMetadata(options?.muxMetadata),
     });
@@ -334,6 +334,7 @@ export class ContinuousStrategy {
       agentInitiated: context.agentInitiated,
       goalKind: context.goalKind,
       goalId: context.goalId,
+      taskTurnKind: context.taskTurnKind,
       muxMetadata: context.workspaceTurnMetadata,
       autoModelRouting: context.autoModelRouting,
     });
@@ -410,6 +411,7 @@ export class ContinuousStrategy {
           agentInitiated: fallback?.agentInitiated ?? context.agentInitiated,
           goalKind: fallback ? undefined : context.goalKind,
           goalId: fallback ? undefined : context.goalId,
+          taskTurnKind: fallback ? undefined : context.taskTurnKind,
         },
         {
           stream: context,

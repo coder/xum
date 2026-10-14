@@ -73,11 +73,7 @@ describe("UserMessageContent inline skill rendering", () => {
 
       if (editingMessage) {
         return (
-          <textarea
-            aria-label="Edit your last message"
-            readOnly
-            value={editingMessage.pending.content}
-          />
+          <textarea aria-label="Edit message" readOnly value={editingMessage.pending.content} />
         );
       }
 
@@ -92,7 +88,7 @@ describe("UserMessageContent inline skill rendering", () => {
 
     fireEvent.click(view.getByRole("button", { name: "Edit" }));
 
-    const textarea = view.getByLabelText("Edit your last message");
+    const textarea = view.getByLabelText("Edit message");
     if (!(textarea instanceof window.HTMLTextAreaElement)) {
       throw new Error("Expected edit control to be a textarea");
     }

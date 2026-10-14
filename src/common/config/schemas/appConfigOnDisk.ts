@@ -52,7 +52,6 @@ export const AgentAiDefaultsEntrySchema = z.object({
   autoModelRouting: z.boolean().optional(),
   autoThinkingLevel: z.boolean().optional(),
   enabled: z.boolean().optional(),
-  advisorEnabled: z.boolean().optional(),
   subagent: AgentAiSubagentProfileSchema.optional(),
 });
 
@@ -132,8 +131,6 @@ export const AppConfigMigrationsSchema = z
      * not re-run their exec split migration.
      */
     execSubagentDefaultsSplit: z.boolean().optional(),
-    userPreferencesInitialized: z.boolean().optional(),
-    daybreakModelsHidden: z.boolean().optional(),
     // Default seeding must not claim legacy local-only hidden preferences.
     hiddenModelsInitialized: z.boolean().optional(),
     /** One-time seed of SEEDED_MODEL_FALLBACKS; not re-applied while true. */
@@ -146,6 +143,10 @@ export const AppConfigMigrationsSchema = z
     defaultModelFallbacksSeededFable51: z.boolean().optional(),
     /** One-time migration from the legacy auto-delete default to persistent sub-agents. */
     persistentSubagentsDefaulted: z.boolean().optional(),
+    /** One-time move of task limits still at PREVIOUS_TASK_SETTINGS_DEFAULTS to the new defaults. */
+    taskSettingsDefaultsRaised: z.boolean().optional(),
+    /** One-time carry-over of the former workspace-heartbeats experiment into agentHeartbeatsEnabled. */
+    agentHeartbeatsSeeded: z.boolean().optional(),
   })
   // Preserve flags introduced by newer app versions: without the catchall a
   // downgrade to this version would strip unknown flags on save, re-running
@@ -174,6 +175,12 @@ export const AppConfigOnDiskSchema = z
     llmDebugLogs: z.boolean().optional(),
     /** Desktop only: hold a display-sleep blocker while any local agent is working. */
     keepScreenAwake: z.boolean().optional(),
+    /** Defer MCP tool definitions behind tool_catalog_search. Absent = on. */
+    toolSearchEnabled: z.boolean().optional(),
+    /** Route AI calls from bash tool commands through Xum's cost-tracking proxy. Absent = off. */
+    bashAiProxyEnabled: z.boolean().optional(),
+    /** Expose the `heartbeat` tool so agents can schedule their own recurring turns. Absent = off. */
+    agentHeartbeatsEnabled: z.boolean().optional(),
     heartbeatDefaultPrompt: z.string().optional(),
     heartbeatDefaultIntervalMs: z
       .number()
@@ -213,11 +220,6 @@ export const AppConfigOnDiskSchema = z
       .optional()
       .catch(undefined),
     defaultModel: z.string().optional(),
-    advisorModelString: z.string().optional(),
-    advisorThinkingLevel: ThinkingLevelSchema.optional(),
-    advisorReasoningMode: OpenAIReasoningModeSchema.optional(),
-    advisorMaxUsesPerTurn: z.number().int().positive().nullable().optional(),
-    advisorMaxOutputTokens: z.number().int().positive().nullable().optional(),
     hiddenModels: z.array(z.string()).optional(),
     preferredCompactionModel: z.string().optional(),
     agentAiDefaults: AgentAiDefaultsSchema.optional(),
@@ -230,8 +232,6 @@ export const AppConfigOnDiskSchema = z
     subagentAiDefaults: SubagentAiDefaultsSchema.optional(),
     migrations: AppConfigMigrationsSchema.optional(),
     useSSH2Transport: z.boolean().optional(),
-    muxGovernorUrl: z.string().optional(),
-    muxGovernorToken: z.string().optional(),
     coderWorkspaceArchiveBehavior: z.enum(CODER_ARCHIVE_BEHAVIORS).optional(),
     worktreeArchiveBehavior: z.enum(WORKTREE_ARCHIVE_BEHAVIORS).optional(),
     deleteWorktreeOnArchive: z.boolean().optional(),

@@ -226,9 +226,9 @@ describe("reasoning replay in built provider requests", () => {
     expect(JSON.stringify(result)).not.toContain("orphan thoughts");
   });
 
-  it("strips replayed Anthropic reasoning for Sonnet 5.5 between_tools (edited history)", async () => {
-    // #5086: between_tools cannot carry block_binding, so a history block whose prefix
-    // changed (an edit, or a system/tools change) must not be replayed.
+  it("strips replayed Anthropic reasoning at off for prefix-bound models (edited history)", async () => {
+    // #5086: between_tools and disabled thinking cannot carry block_binding, so a history
+    // block whose prefix changed (an edit, or a system/tools change) must not be replayed.
     const history = historyWith([
       {
         type: "reasoning",
@@ -244,9 +244,233 @@ describe("reasoning replay in built provider requests", () => {
     expect(
       JSON.stringify(await buildRequest("anthropic", "off", history, "anthropic:claude-sonnet-5-5"))
     ).toContain("earlier answer");
-    // Adaptive Sonnet 5.5 and Sonnet 5 "off" (disabled) keep replaying it.
+    expect(await replayed("anthropic:claude-haiku-5-5", "off")).toBe(0);
+    // Adaptive thinking and models that do not bind blocks (Sonnet 5 "off") keep replaying it.
     expect(await replayed("anthropic:claude-sonnet-5-5", "low")).toBe(1);
+    expect(await replayed("anthropic:claude-haiku-5-5", "low")).toBe(1);
     expect(await replayed("anthropic:claude-sonnet-5", "off")).toBe(1);
+    // Mythos 5.1 does not run the prefix check (#5889), so "off" keeps its history thinking.
+    expect(await replayed("anthropic:claude-mythos-5-1", "off")).toBe(1);
+  });
+
+  describe("Anthropic thinking-repair receipt", () => {
+    const signedTurn = (id: string, metadata: MuxMessage["metadata"] = {}): MuxMessage => ({
+      id,
+      role: "assistant",
+      metadata: { timestamp: 1001, ...metadata },
+      parts: [
+        {
+          type: "reasoning",
+          text: `${id} thinking`,
+          providerOptions: { anthropic: { signature: `sig_${id}` } },
+        },
+        { type: "text", text: `${id} answer` },
+      ],
+    });
+    const replayedCount = async (history: MuxMessage[]) =>
+      reasoningRequestParts(
+        await buildRequest("anthropic", "medium", history, "anthropic:claude-opus-5-5")
+      ).length;
+
+    it("strips Anthropic thinking from every row once the segment holds a receipt", async () => {
+      // Preserved thinking: the repaired turn sent no thinking, so putting the earlier
+      // blocks back would invalidate the blocks produced since.
+      const history = (receipt: boolean): MuxMessage[] => [
+        createMuxMessage("user-1", "user", "first", { timestamp: 1000 }),
+        signedTurn("assistant-1"),
+        createMuxMessage("user-2", "user", "second", { timestamp: 1002 }),
+        signedTurn("assistant-2", receipt ? { anthropicThinkingReplay: "off" } : {}),
+        createMuxMessage("user-3", "user", "third", { timestamp: 1004 }),
+      ];
+
+      expect(await replayedCount(history(false))).toBe(2);
+      expect(await replayedCount(history(true))).toBe(0);
+      const serialized = JSON.stringify(
+        await buildRequest("anthropic", "medium", history(true), "anthropic:claude-opus-5-5")
+      );
+      expect(serialized).toContain("assistant-1 answer");
+      expect(serialized).toContain("assistant-2 answer");
+    });
+
+    // Two steps (each thinks, then acts), as StreamManager persists them.
+    const twoStepTurn = (id: string, metadata: MuxMessage["metadata"] = {}): MuxMessage => ({
+      id,
+      role: "assistant",
+      metadata: { timestamp: 1001, stepStartPartIndices: [0, 3], ...metadata },
+      parts: [
+        {
+          type: "reasoning",
+          text: `${id} step-0 thinking`,
+          providerOptions: { anthropic: { signature: `sig_${id}_0` } },
+        },
+        {
+          type: "dynamic-tool",
+          toolCallId: `${id}-call`,
+          toolName: "bash",
+          state: "output-available",
+          input: { script: "ls" },
+          output: { success: true, output: "ok" },
+        },
+        { type: "text", text: `${id} step-0 text` },
+        {
+          type: "reasoning",
+          text: `${id} step-1 thinking`,
+          providerOptions: { anthropic: { signature: `sig_${id}_1` } },
+        },
+        { type: "text", text: `${id} answer` },
+      ],
+    });
+    const replayedTexts = async (history: MuxMessage[], receiptRows?: MuxMessage[]) =>
+      reasoningRequestParts(
+        await prepareMessagesForProvider({
+          messagesWithSentinel: history,
+          replayReceiptMessages: receiptRows,
+          effectiveAgentId: "exec",
+          toolNamesForSentinel: [],
+          providerForMessages: "anthropic",
+          effectiveThinkingLevel: "medium",
+          modelString: "anthropic:claude-opus-5-5",
+          workspaceId: "test-ws",
+        })
+      ).map((part) => part.text);
+    const withReceiptOn = (receipt: MuxMessage): MuxMessage[] => [
+      createMuxMessage("user-1", "user", "first", { timestamp: 1000 }),
+      signedTurn("assistant-1"),
+      createMuxMessage("user-2", "user", "second", { timestamp: 1002 }),
+      receipt,
+      createMuxMessage("user-3", "user", "third", { timestamp: 1004 }),
+      signedTurn("assistant-3"),
+      createMuxMessage("user-4", "user", "fourth", { timestamp: 1006 }),
+    ];
+
+    it("keeps the thinking the receipt's turn sent after its strip, and every later row's", async () => {
+      // Mechanism 11: the turn stripped earlier thinking from step 1 on, and kept sending
+      // step 1's block. Stripping it on the next turn rewrote the previous turn's tail.
+      const receipt = {
+        anthropicThinkingReplay: "off" as const,
+        anthropicThinkingReplayFromStep: 1,
+      };
+      expect(await replayedTexts(withReceiptOn(twoStepTurn("assistant-2", receipt)))).toEqual([
+        "assistant-2 step-1 thinking",
+        "assistant-3 thinking",
+      ]);
+      // A repair at the turn start (step 0) keeps the whole receipt row.
+      expect(
+        await replayedTexts(
+          withReceiptOn(
+            twoStepTurn("assistant-2", { ...receipt, anthropicThinkingReplayFromStep: 0 })
+          )
+        )
+      ).toEqual([
+        "assistant-2 step-0 thinking",
+        "assistant-2 step-1 thinking",
+        "assistant-3 thinking",
+      ]);
+    });
+
+    it("an old receipt without a point still strips the whole segment", async () => {
+      expect(
+        await replayedTexts(
+          withReceiptOn(twoStepTurn("assistant-2", { anthropicThinkingReplay: "off" }))
+        )
+      ).toEqual([]);
+    });
+
+    it("a step point on a row without step boundaries strips the whole segment", async () => {
+      const row = twoStepTurn("assistant-2", {
+        anthropicThinkingReplay: "off",
+        anthropicThinkingReplayFromStep: 1,
+      });
+      // Missing or corrupted (not ascending from 0) boundaries cannot place the point.
+      for (const stepStartPartIndices of [undefined, [3, 0]]) {
+        const history = withReceiptOn({
+          ...row,
+          metadata: { ...row.metadata, stepStartPartIndices },
+        });
+        expect(await replayedTexts(history)).toEqual([]);
+      }
+    });
+
+    it("a server-tool receipt strips its whole row and never puts a block back", async () => {
+      // #5887: "end" covers every step of the row, and a later step point never undoes it.
+      const ended = twoStepTurn("assistant-2", {
+        anthropicThinkingReplay: "off",
+        anthropicThinkingReplayFromStep: "end",
+      });
+      expect(await replayedTexts(withReceiptOn(ended))).toEqual(["assistant-3 thinking"]);
+      // The latest receipt decides: a later repair keeps only what came after it.
+      const history = withReceiptOn(ended);
+      history[5] = {
+        ...twoStepTurn("assistant-3"),
+        metadata: {
+          ...twoStepTurn("assistant-3").metadata,
+          anthropicThinkingReplay: "off",
+          anthropicThinkingReplayFromStep: 1,
+        },
+      };
+      expect(await replayedTexts(history)).toEqual(["assistant-3 step-1 thinking"]);
+    });
+
+    it("an empty receipt row the request leaves out still keeps the rows after it", async () => {
+      // #5886: a repair whose turn produced no output leaves an empty receipt row, which
+      // request building filters (callers pass the unfiltered rows as replayReceiptMessages).
+      const emptyReceipt: MuxMessage = {
+        id: "assistant-2",
+        role: "assistant",
+        metadata: {
+          timestamp: 1003,
+          anthropicThinkingReplay: "off",
+          anthropicThinkingReplayFromStep: 0,
+        },
+        parts: [],
+      };
+      const rows = withReceiptOn(emptyReceipt);
+      const sent = rows.filter((row) => row.id !== "assistant-2");
+      expect(await replayedTexts(sent, rows)).toEqual(["assistant-3 thinking"]);
+    });
+
+    const boundaries: Array<{ kind: string; row: MuxMessage }> = [
+      {
+        kind: "compaction",
+        row: {
+          id: "summary",
+          role: "assistant",
+          metadata: { compactionBoundary: true, compacted: "user", compactionEpoch: 1 },
+          parts: [{ type: "text", text: "summary of earlier turns" }],
+        },
+      },
+      {
+        kind: "reset",
+        row: {
+          id: "reset",
+          role: "assistant",
+          metadata: { contextBoundaryKind: "reset" },
+          parts: [],
+        },
+      },
+    ];
+    for (const boundary of boundaries) {
+      it(`replays again after a ${boundary.kind} boundary that follows the receipt`, async () => {
+        const history: MuxMessage[] = [
+          createMuxMessage("user-1", "user", "first", { timestamp: 1000 }),
+          signedTurn("assistant-1a", {
+            anthropicThinkingReplay: "off",
+            anthropicThinkingReplayFromStep: "end",
+          }),
+          signedTurn("assistant-1", { anthropicThinkingReplay: "off" }),
+          boundary.row,
+          createMuxMessage("user-2", "user", "second", { timestamp: 1002 }),
+          signedTurn("assistant-2"),
+          createMuxMessage("user-3", "user", "third", { timestamp: 1004 }),
+        ];
+
+        // assistant-2 was produced in the new segment, so its thinking replays.
+        const parts = reasoningRequestParts(
+          await buildRequest("anthropic", "medium", history, "anthropic:claude-opus-5-5")
+        );
+        expect(parts.map((part) => part.text)).toContain("assistant-2 thinking");
+      });
+    }
   });
 
   it("includes OpenAI reasoning encrypted content but not the server-side itemId", async () => {
@@ -619,5 +843,133 @@ describe("reasoning replay in built provider requests", () => {
       expect(input.some((item) => item.type === "item_reference")).toBe(false);
       expect(raw).not.toContain("rs_stale");
     });
+  });
+});
+
+describe("step boundaries in built provider requests", () => {
+  function bashPart(toolCallId: string): MuxMessage["parts"][number] {
+    return {
+      type: "dynamic-tool",
+      toolCallId,
+      toolName: "bash",
+      state: "output-available",
+      input: { script: toolCallId },
+      output: { success: true, output: toolCallId },
+    };
+  }
+
+  function history(parts: MuxMessage["parts"], stepStartPartIndices?: unknown): MuxMessage[] {
+    return [
+      createMuxMessage("user-1", "user", "go", { timestamp: 1000 }),
+      {
+        id: "assistant-1",
+        role: "assistant",
+        // Parsed like a chat.jsonl row (unchecked), so the self-healing cases can carry corrupted
+        // persisted values.
+        metadata: JSON.parse(
+          JSON.stringify({ timestamp: 1001, stepStartPartIndices })
+        ) as MuxMessage["metadata"],
+        parts,
+      },
+      createMuxMessage("user-2", "user", "continue", { timestamp: 1002 }),
+    ];
+  }
+
+  function build(messages: MuxMessage[], provider = "anthropic"): Promise<ModelMessage[]> {
+    return prepareMessagesForProvider({
+      messagesWithSentinel: messages,
+      effectiveAgentId: "exec",
+      toolNamesForSentinel: [],
+      providerForMessages: provider,
+      effectiveThinkingLevel: "off",
+      modelString: `${provider}:model`,
+      workspaceId: "test-ws",
+    });
+  }
+
+  /** Message roles with the tool-call / tool-result IDs and texts each one carries. */
+  function shape(messages: ModelMessage[]): string[] {
+    return messages.map((message) => {
+      const content = typeof message.content === "string" ? [] : message.content;
+      const items = content.map((part) =>
+        part.type === "tool-call" || part.type === "tool-result"
+          ? part.toolCallId
+          : part.type === "text"
+            ? JSON.stringify(part.text)
+            : part.type
+      );
+      return `${message.role}(${items.join(",")})`;
+    });
+  }
+
+  // Step 1: text + call-1. Step 2 opens with call-2. Step 3: the final text.
+  const twoSequentialCalls: MuxMessage["parts"] = [
+    { type: "text", text: "First." },
+    bashPart("call-1"),
+    bashPart("call-2"),
+    { type: "text", text: "Done." },
+  ];
+  const folded = [
+    'user("go")',
+    'assistant("First.",call-1,call-2)',
+    "tool(call-1,call-2)",
+    'assistant("Done.")',
+    'user("continue")',
+  ];
+
+  for (const provider of ["anthropic", "openai"]) {
+    it(`keeps a step that opens with a tool call in its own messages (${provider})`, async () => {
+      const result = await build(history(twoSequentialCalls, [0, 2, 3]), provider);
+      expect(shape(result)).toEqual([
+        'user("go")',
+        'assistant("First.",call-1)',
+        "tool(call-1)",
+        "assistant(call-2)",
+        "tool(call-2)",
+        'assistant("Done.")',
+        'user("continue")',
+      ]);
+    });
+  }
+
+  it("rebuilds rows without step indices as before (older history)", async () => {
+    expect(shape(await build(history(twoSequentialCalls)))).toEqual(folded);
+  });
+
+  it("ignores step indices that are unsorted, negative, fractional, not numbers or miss 0", async () => {
+    for (const corrupted of [[0, 3, 2], [0, -1, 2], [0, 1.5], [0, "2"], "0,2", { 0: 2 }, [2], []]) {
+      expect(shape(await build(history(twoSequentialCalls, corrupted)))).toEqual(folded);
+    }
+  });
+
+  it("skips step indices outside the row's parts and keeps the valid ones", async () => {
+    expect(shape(await build(history(twoSequentialCalls, [0, 99])))).toEqual(folded);
+    expect(shape(await build(history(twoSequentialCalls, [0, 2, 99])))).toEqual([
+      'user("go")',
+      'assistant("First.",call-1)',
+      "tool(call-1)",
+      "assistant(call-2)",
+      "tool(call-2)",
+      'assistant("Done.")',
+      'user("continue")',
+    ]);
+  });
+
+  it("leaves steps that open with text or reasoning as they were", async () => {
+    const parts: MuxMessage["parts"] = [
+      { type: "text", text: "Looking." },
+      bashPart("call-1"),
+      { type: "reasoning", text: "next" },
+      { type: "text", text: "Again." },
+      bashPart("call-2"),
+      { type: "text", text: "Done." },
+    ];
+    const withSteps = await build(history(parts, [0, 2, 5]), "openai");
+    expect(withSteps).toEqual(await build(history(parts), "openai"));
+  });
+
+  it("keeps parallel tool calls of one step in one assistant message", async () => {
+    const parallel = await build(history(twoSequentialCalls, [0, 3]));
+    expect(shape(parallel)).toEqual(folded);
   });
 });

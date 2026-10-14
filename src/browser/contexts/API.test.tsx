@@ -120,10 +120,11 @@ import type { UseAPIResult as _UseAPIResult, APIProvider as APIProviderType } fr
 const RealAPIModule: {
   APIProvider: typeof APIProviderType;
   useAPI: () => _UseAPIResult;
+  useLiveAPI: () => _UseAPIResult["api"];
   useConnectionLatencyMs: () => number | null;
 } = require("./API?real=1");
 /* eslint-enable @typescript-eslint/no-require-imports, @typescript-eslint/no-unsafe-assignment */
-const { APIProvider, useAPI, useConnectionLatencyMs } = RealAPIModule;
+const { APIProvider, useAPI, useLiveAPI, useConnectionLatencyMs } = RealAPIModule;
 type UseAPIResult = _UseAPIResult;
 
 // Each observation carries the API context value by reference (apiState) plus the latency
@@ -363,6 +364,39 @@ describe("API reconnection", () => {
     await waitFor(() => {
       expect(MockWebSocket.instances.length).toBeGreaterThan(1);
     });
+  });
+
+  // The stores, deferred writes and offline gates read useLiveAPI(): it must be null whenever the
+  // connection is down, even while useAPI().api keeps the last client.
+  test("useLiveAPI() is the client only while connected; useAPI().api keeps it in the gap", async () => {
+    const renders: Array<{ status: string; api: unknown; live: unknown }> = [];
+    function Probe() {
+      const state = useAPI();
+      renders.push({ status: state.status, api: state.api, live: useLiveAPI() });
+      return null;
+    }
+    render(
+      <APIProvider createWebSocket={createMockWebSocket}>
+        <Probe />
+      </APIProvider>
+    );
+    for (let cycle = 0; cycle < 3; cycle++) {
+      const ws = MockWebSocket.lastInstance();
+      await act(async () => {
+        ws!.simulateOpen();
+        await new Promise((r) => setTimeout(r, 10));
+      });
+      act(() => {
+        ws!.simulateClose(1006);
+      });
+      await waitFor(() => expect(MockWebSocket.instances.length).toBeGreaterThan(cycle + 1));
+    }
+    const connected = renders.filter((r) => r.status === "connected");
+    const offline = renders.filter((r) => r.status === "reconnecting" && r.api != null);
+    expect(connected).not.toHaveLength(0);
+    expect(offline).not.toHaveLength(0);
+    expect(connected.filter((r) => r.live !== r.api)).toEqual([]);
+    expect(offline.filter((r) => r.live !== null)).toEqual([]);
   });
 
   test("shows auth_required on close with auth error codes (4401)", async () => {

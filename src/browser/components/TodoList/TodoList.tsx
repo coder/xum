@@ -134,6 +134,7 @@ export const TodoList: React.FC<TodoListProps> = ({ todos, layout = "vertical" }
         return (
           <div
             key={index}
+            data-todo-row
             className={cn(
               "font-monospace flex gap-1.5 rounded border-l-2 px-2 py-1 text-[11px] leading-[1.35]",
               isHorizontal ? "max-w-[220px] shrink-0 items-center" : "items-start"

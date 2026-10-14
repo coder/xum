@@ -16,6 +16,7 @@ import {
 } from "@/common/constants/contextBudget";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { normalizeUsage, type AiSdkUsageLike } from "@/common/utils/tokens/usageHelpers";
+import { countToolReferences } from "@/common/utils/tools/toolCatalog";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import {
   CLAUDE_ENCODING_BUDGET_FACTOR,
@@ -120,10 +121,26 @@ export async function estimateAssembledRequestTokensForModel(
             payload.tools && name in payload.tools ? [[name, payload.tools[name]]] : []
           )
         );
-  const toolCount = Object.keys(tools ?? {}).length;
+  // Anthropic expands every tool_reference into the full definition, repeats included (#5413).
+  // The loaded tool list holds each referenced tool once, so each further reference (or a
+  // reference to a tool the list omits) pays its schema again, one single-tool record each.
+  const repeats = [...countToolReferences(payload.messages)].flatMap(([name, count]) => {
+    const tool = payload.tools && Object.hasOwn(payload.tools, name) ? payload.tools[name] : null;
+    const charged = tools != null && Object.hasOwn(tools, name) ? 1 : 0;
+    return tool == null ? [] : Array.from({ length: count - charged }, () => ({ [name]: tool }));
+  });
+  const parts = [
+    prepareAssembledRequestTokenCount({ ...payload, tools }),
+    ...repeats.map((repeat) => prepareAssembledRequestTokenCount({ messages: [], tools: repeat })),
+  ];
+  const toolCount = Object.keys(tools ?? {}).length + repeats.length;
   const framing = REQUEST_FRAMING_TOKENS * (1 + payload.messages.length + toolCount);
   const estimate = await countBudgetInput(
-    prepareAssembledRequestTokenCount({ ...payload, tools }),
+    {
+      text: parts.map((part) => part.text).join("\n"),
+      fixedTokens: parts.reduce((sum, part) => sum + part.fixedTokens, 0),
+      heuristicTokens: parts.reduce((sum, part) => sum + part.heuristicTokens, 0),
+    },
     options,
     framing,
     hardCeiling,
@@ -179,7 +196,7 @@ export function createContextBudgetAnchor(
     : undefined;
 }
 
-function isExactAppend(
+export function isExactAppend(
   payload: AssembledRequestBudgetInput,
   options: BudgetModel & { activeTools?: readonly string[] },
   anchor: ContextBudgetAnchor
@@ -193,7 +210,10 @@ function isExactAppend(
     anchor.activeTools?.length === tools?.length &&
     (anchor.activeTools ?? []).every((name, i) => tools?.[i] === name) &&
     payload.messages.length >= anchor.messages.length &&
-    anchor.messages.every((message, i) => payload.messages[i] === message)
+    anchor.messages.every((message, i) => payload.messages[i] === message) &&
+    // A repeated tool_reference leaves the loaded tools unchanged, yet the provider expands it
+    // into the full definition the delta estimate never charges (#5413). Use the full estimate.
+    countToolReferences(payload.messages.slice(anchor.messages.length)).size === 0
   );
 }
 
@@ -204,7 +224,8 @@ function isExactAppend(
  * messages (element identity, so any rewrite of the prefix fails), and a positive integer
  * provider input total plus a reasoning count whenever the step emitted reasoning. The estimate is then the provider's count plus the existing estimator applied to the
  * appended messages only. ANY doubt means the full estimate; edge cases get a new full-estimate
- * condition here, never new mechanism.
+ * condition here, never new mechanism. On an exact append, `delta` is the counted estimate of
+ * the appended messages (`anchor.providerTokens + delta === estimate`); a full count omits it.
  */
 export async function estimateAnchoredRequestTokensForModel(
   payload: AssembledRequestBudgetInput,
@@ -213,7 +234,7 @@ export async function estimateAnchoredRequestTokensForModel(
     activeTools?: readonly string[];
   },
   anchor: ContextBudgetAnchor | undefined
-): Promise<{ estimate: number; hardCeiling: number } | undefined> {
+): Promise<{ estimate: number; hardCeiling: number; delta?: number } | undefined> {
   if (anchor == null || !isExactAppend(payload, options, anchor)) {
     return estimateAssembledRequestTokensForModel(payload, options);
   }
@@ -228,7 +249,34 @@ export async function estimateAnchoredRequestTokensForModel(
     REQUEST_FRAMING_TOKENS * (1 + delta.length),
     Math.max(0, hardCeiling - anchor.providerTokens)
   );
-  return { estimate: anchor.providerTokens + deltaEstimate, hardCeiling };
+  return { estimate: anchor.providerTokens + deltaEstimate, hardCeiling, delta: deltaEstimate };
+}
+
+/**
+ * The budget check's single count, with its estimate and exact-append delta (#5286). `exceeded`
+ * is set iff the estimate is above the hard ceiling, where it is the early-exit lower bound.
+ */
+export async function measureAssembledRequestBudgetForModel(
+  payload: AssembledRequestBudgetInput,
+  options: BudgetModel & {
+    modelContextLimit: number | null | undefined;
+    activeTools?: readonly string[];
+  },
+  anchor?: ContextBudgetAnchor
+): Promise<
+  | { estimate: number; hardCeiling: number; delta?: number; exceeded?: ContextBudgetExceeded }
+  | undefined
+> {
+  const counted = await estimateAnchoredRequestTokensForModel(payload, options, anchor);
+  if (counted == null || counted.estimate <= counted.hardCeiling) return counted;
+  // Built field by field: the error is serialized to the frontend and must not carry `delta`.
+  const exceeded: ContextBudgetExceeded = {
+    type: "context_budget_exceeded",
+    model: options.model,
+    estimate: counted.estimate,
+    hardCeiling: counted.hardCeiling,
+  };
+  return { ...counted, exceeded };
 }
 
 export async function checkAssembledRequestBudgetForModel(
@@ -239,8 +287,5 @@ export async function checkAssembledRequestBudgetForModel(
   },
   anchor?: ContextBudgetAnchor
 ): Promise<ContextBudgetExceeded | undefined> {
-  const counted = await estimateAnchoredRequestTokensForModel(payload, options, anchor);
-  return counted != null && counted.estimate > counted.hardCeiling
-    ? { type: "context_budget_exceeded", model: options.model, ...counted }
-    : undefined;
+  return (await measureAssembledRequestBudgetForModel(payload, options, anchor))?.exceeded;
 }

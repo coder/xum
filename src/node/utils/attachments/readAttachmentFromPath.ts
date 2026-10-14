@@ -13,10 +13,9 @@ import {
   isRasterAttachmentMediaType,
   resizeRasterImageAttachmentBufferIfNeeded,
 } from "@/node/utils/attachments/resizeRasterImageAttachment";
+import { MAX_ATTACH_FILE_SIZE_BYTES } from "@/node/utils/attachments/attachmentLimits";
 
-// This cap applies to both model attachments and display-only fallback files so
-// chat history never persists unexpectedly large base64 payloads.
-export const MAX_ATTACH_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10MB
+export { MAX_ATTACH_FILE_SIZE_BYTES };
 
 export interface ReadAttachmentFromPathArgs {
   path: string;

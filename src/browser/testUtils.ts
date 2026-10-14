@@ -1,10 +1,15 @@
 import { createRequire } from "node:module";
 import type { APIClient } from "@/browser/contexts/API";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import type { ExperimentId } from "@/common/constants/experiments";
+import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
+import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
 import { getDefaultAutoModelRoutingConfig } from "@/common/types/autoModelRouting";
 import { DEFAULT_RUNTIME_ENABLEMENT } from "@/common/types/runtime";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
+import { applyMergePatch } from "@/common/utils/applyMergePatch";
 import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
 
 // Shared test utilities for browser tests
@@ -19,6 +24,19 @@ const requireForTest = createRequire(import.meta.url);
  */
 export function requireTestModule<T>(modulePath: string): T {
   return requireForTest(modulePath) as T;
+}
+
+/**
+ * The text of a queried element, or null when the query found nothing.
+ *
+ * Assert "element is gone" as `expect(textOf(view.queryBy...(...))).toBeNull()`, never
+ * `expect(element).toBeNull()`. A failing Bun matcher formats a happy-dom element with its
+ * whole window graph (about 1M lines, 0.5-13 s per failure). Inside `waitFor` the early
+ * checks are expected to fail, so two such checks used up the 1 s waitFor budget and made
+ * the OutputTab and UpdateRestartOverlay tests flaky (#6443). A string fails in microseconds.
+ */
+export function textOf(element: Element | null): string | null {
+  return element === null ? null : (element.textContent ?? "");
 }
 
 /**
@@ -146,24 +164,34 @@ export type TestClientConfig = Awaited<ReturnType<APIClient["config"]["getConfig
  */
 export function createTestConfig(overrides: Partial<TestClientConfig> = {}): TestClientConfig {
   return {
-    userPreferencesInitialized: false,
     taskSettings: DEFAULT_TASK_SETTINGS,
     autoModelRouting: getDefaultAutoModelRoutingConfig(),
-    advisorModelString: null,
-    advisorThinkingLevel: null,
-    advisorReasoningMode: null,
     coderWorkspaceArchiveBehavior: DEFAULT_CODER_ARCHIVE_BEHAVIOR,
     worktreeArchiveBehavior: DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
     runtimeEnablement: { ...DEFAULT_RUNTIME_ENABLEMENT },
     defaultRuntime: null,
     agentAiDefaults: {},
-    muxGovernorUrl: null,
-    muxGovernorEnrolled: false,
     chatTranscriptFullWidth: false,
     llmDebugLogs: false,
     keepScreenAwake: false,
+    toolSearchEnabled: true,
+    bashAiProxyEnabled: false,
+    agentHeartbeatsEnabled: false,
     goalDefaults: DEFAULT_GOAL_DEFAULTS,
+    experiments: {},
     ...overrides,
+  };
+}
+
+/** `config` procedures whose user preferences live in memory and take merge-patch writes. */
+export function createTestPreferencesConfig(initial: UserPreferences = {}) {
+  let userPreferences = initial;
+  return {
+    getConfig: () => Promise.resolve(createTestConfig({ userPreferences })),
+    updateUserPreferences: (input: { patches: unknown[] }) => {
+      userPreferences = input.patches.reduce(applyMergePatch, userPreferences) as UserPreferences;
+      return Promise.resolve();
+    },
   };
 }
 
@@ -204,4 +232,22 @@ export function createTestBashResult(options: {
       ...truncated,
     },
   };
+}
+
+/** Sets one experiment in the shared AppConfigStore snapshot, as a backend config fetch would. */
+export function setTestExperiment(experimentId: ExperimentId, enabled: boolean | null): void {
+  const store = getAppConfigStore();
+  store.updateOptimistically({
+    experiments: { ...store.getSnapshot()?.experiments, [experimentId]: enabled === true },
+  });
+}
+
+/** Sets agentAiDefaults in the shared AppConfigStore snapshot; undefined clears it. */
+export function setTestAgentAiDefaults(agentAiDefaults: AgentAiDefaults | undefined): void {
+  getAppConfigStore().updateOptimistically({ agentAiDefaults });
+}
+
+/** Clears the experiments snapshot so the store singleton does not leak flags between tests. */
+export function resetTestExperiments(): void {
+  getAppConfigStore().updateOptimistically({ experiments: undefined });
 }

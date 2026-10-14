@@ -3,15 +3,14 @@ import { isPixel } from "@coder/pixel-storybook/storyapi";
 import { ThemeProvider, type ThemeMode } from "../src/browser/contexts/ThemeContext";
 import "../src/browser/styles/globals.css";
 import {
-  TUTORIAL_STATE_KEY,
   RIGHT_SIDEBAR_COLLAPSED_KEY,
   LEFT_SIDEBAR_COLLAPSED_KEY,
   EXPANDED_PROJECTS_KEY,
   WORKSPACE_DRAFTS_BY_PROJECT_KEY,
-  type TutorialState,
 } from "../src/common/constants/storage";
 import { NOW } from "../src/browser/stories/storyTime";
 import { updatePersistedState } from "../src/browser/hooks/usePersistedState";
+import { configure as configureLegacyStorybookTest } from "@storybook/test";
 import { configure } from "storybook/test";
 
 // Signal Storybook runtime to modules that need to stabilize for visual snapshots
@@ -26,7 +25,12 @@ import { configure } from "storybook/test";
 // explicit `{ timeout }` unless they intentionally want a longer budget.
 // Prevents flakes on CPU-constrained CI runners where React re-renders
 // after userEvent.click can exceed the 1 s default.
-configure({ asyncUtilTimeout: 5000 });
+const STORY_ASYNC_UTIL_TIMEOUT_MS = 5000;
+configure({ asyncUtilTimeout: STORY_ASYNC_UTIL_TIMEOUT_MS });
+// Most story files import the older `@storybook/test`, which bundles its own Testing Library with
+// its own config: without this, their waits kept the 1 s default and timed out on a loaded runner
+// while a lazy chunk or the highlight worker loaded (#6389).
+configureLegacyStorybookTest({ asyncUtilTimeout: STORY_ASYNC_UTIL_TIMEOUT_MS });
 
 const PIXEL_STABILITY_CSS = `
   *, *::before, *::after {
@@ -89,18 +93,6 @@ globalThis.Date = new Proxy(RealDate, {
   get: (target, property, receiver) =>
     property === "now" ? () => NOW : Reflect.get(target, property, receiver),
 });
-
-// Disable tutorials by default in Storybook to prevent them from interfering with stories
-// Individual stories can override this by setting localStorage before rendering
-function disableTutorials() {
-  if (typeof localStorage !== "undefined") {
-    const disabledState: TutorialState = {
-      disabled: true,
-      completed: { creation: true, workspace: true },
-    };
-    localStorage.setItem(TUTORIAL_STATE_KEY, JSON.stringify(disabledState));
-  }
-}
 
 // Collapse right sidebar by default to ensure deterministic snapshots
 // Stories that need expanded sidebar call expandRightSidebar() in their setup
@@ -170,11 +162,6 @@ const preview: Preview = {
       if (typeof document !== "undefined") {
         document.documentElement.dataset.theme = mode;
         document.documentElement.style.colorScheme = mode;
-      }
-
-      // Disable tutorials by default unless explicitly enabled for this story
-      if (!context.parameters?.tutorialEnabled) {
-        disableTutorials();
       }
 
       // Reset the left sidebar to the app's viewport-dependent default.

@@ -91,6 +91,24 @@ describe("MessageQueue", () => {
       expect(queue.isEmpty()).toBe(true);
     });
 
+    // A turn-end required-report prompt queues behind the live turn: its task-turn provenance
+    // must reach exactly the dispatch it was queued for, never batch onto a neighbor.
+    it("keeps task turn provenance on its own dispatch", () => {
+      const automatic = { acceptanceOrigin: "automatic" as const, synthetic: true };
+      queue.add("plain automatic", undefined, automatic);
+      queue.add("report prompt", undefined, { ...automatic, taskTurnKind: "required_report" });
+      queue.add("later automatic", undefined, automatic);
+
+      expect(queue.dequeueNext()).toMatchObject({ message: "plain automatic" });
+      const prompt = queue.dequeueNext();
+      expect(prompt.message).toBe("report prompt");
+      expect(prompt.internal?.taskTurnKind).toBe("required_report");
+      const later = queue.dequeueNext();
+      expect(later.message).toBe("later automatic");
+      expect(later.internal?.taskTurnKind).toBeUndefined();
+      expect(queue.isEmpty()).toBe(true);
+    });
+
     it("removing a keyed manual add restores the remaining automatic origin", () => {
       const automatic = { acceptanceOrigin: "automatic" as const };
       queue.addOnce("automatic", undefined, "auto:1", automatic);
@@ -1049,7 +1067,7 @@ describe("MessageQueue", () => {
       expect(ahead()).toBe(true);
 
       // An uncorrelated tool-end entry behind the heartbeat cuts nothing, so the report overtakes
-      // it too (formal/message-queue, PromotedNotBlockedByHidden).
+      // it too.
       queue.add("unrelated tool-end", { ...validOptions, queueDispatchMode: "tool-end" }, hidden);
       expect(ahead()).toBe(true);
     });
@@ -1626,6 +1644,39 @@ describe("MessageQueue", () => {
         "<review>note</review>\n\nFirst authored\n<review>only</review>\nPlain follow-up"
       );
       expect(dispatched.options != null && "authoredText" in dispatched.options).toBe(false);
+    });
+
+    it("restores a /compact follow-up's attachments and review notes from its compaction metadata", () => {
+      // Codex P1 (PRRT_kwDOPxxmWM6r_ubq): prepareCompactionMessage keeps them only under
+      // parsed.followUpContent; a message.send block that restores the entry must give them back.
+      const review = { filePath: "src/a.ts", lineRange: "1", selectedCode: "a()", userNote: "n" };
+      const fileParts = [{ url: "data:image/png;base64,aGVsbG8=", mediaType: "image/png" }];
+      queue.add("Summarize the conversation.", {
+        model: "claude-3-5-sonnet-20241022",
+        agentId: "compact",
+        muxMetadata: {
+          type: "compaction-request",
+          rawCommand: "/compact\nfix the bug",
+          parsed: {
+            followUpContent: {
+              text: "fix the bug",
+              fileParts,
+              reviews: [review],
+              model: "claude-3-5-sonnet-20241022",
+              agentId: "exec",
+            },
+          },
+        },
+      });
+
+      expect(queue.getInputForRestore()).toEqual({
+        text: "/compact\nfix the bug",
+        fileParts,
+        reviews: [review],
+      });
+      const [perSend] = queue.getInputsForRestore();
+      expect(perSend?.fileParts).toEqual(fileParts);
+      expect(perSend?.reviews).toEqual([review]);
     });
 
     it("captures a refused task-attempt entry's full original send only for manual user input", () => {
@@ -2225,6 +2276,40 @@ describe("MessageQueue", () => {
 
       expect(queue.getRestorableManualSends().map((send) => send.displayText)).toEqual(["kept"]);
       expect(queue.getInputForRestore()?.text).toBe("kept");
+    });
+  });
+
+  describe("artifact sends (Artifacts M5b)", () => {
+    const interaction = {
+      id: "i-1",
+      artifactPath: "form.html",
+      title: "Form",
+      version: 2,
+      action: "send" as const,
+      text: "Ship it",
+    };
+    const queueArtifactSend = () =>
+      queue.add(
+        '<artifact_interaction path="form.html">Ship it</artifact_interaction>',
+        {
+          model: "anthropic:claude-sonnet-4-5",
+          agentId: "exec",
+          muxMetadata: { type: "normal", artifactInteraction: interaction },
+        } as SendMessageOptions,
+        { onAccepted: () => undefined }
+      );
+
+    it("projects a lone artifact send with its metadata and confirmed text", () => {
+      queueArtifactSend();
+      expect(queue.getVisibleArtifactInteraction()).toEqual(interaction);
+      expect(queue.getVisibleDisplayText()).toBe("Ship it");
+    });
+
+    it("drops the metadata once a typed message queues behind it, but keeps the friendly text", () => {
+      queueArtifactSend();
+      queue.add("and also this");
+      expect(queue.getVisibleArtifactInteraction()).toBeUndefined();
+      expect(queue.getVisibleDisplayText()).toBe("Ship it\nand also this");
     });
   });
 });

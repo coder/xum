@@ -21,7 +21,7 @@ import assert from "@/common/utils/assert";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, userEvent, waitFor, within } from "@storybook/test";
 import React from "react";
-import { AnalyticsDashboard } from "./AnalyticsDashboard.js";
+import { LazyAnalyticsDashboard } from "./LazyAnalyticsDashboard.js";
 
 const meta = {
   ...lightweightMeta,
@@ -947,7 +947,7 @@ function AnalyticsDashboardStory() {
       <RouterProvider>
         <ProjectProvider>
           <OpenAnalyticsRoute />
-          <AnalyticsDashboard />
+          <LazyAnalyticsDashboard />
         </ProjectProvider>
       </RouterProvider>
     </APIProvider>

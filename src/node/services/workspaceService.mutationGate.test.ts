@@ -6,6 +6,7 @@ import * as readline from "node:readline";
 
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { Err, Ok } from "@/common/types/result";
+import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { Runtime, WorkspaceInitParams } from "@/node/runtime/Runtime";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { HistoryService } from "@/node/services/historyService";
@@ -802,8 +803,11 @@ describe("structural workspace mutations across two backends on one root", () =>
       srcBaseDir: "/home/coder/src",
       coder: { workspaceName: "xum-root", existingWorkspace: false },
     };
+    // A fixed past archive time: comparing it with the unarchive's wall-clock stamp must not
+    // depend on the two landing in different milliseconds (#5380).
+    const archivedAt = "2020-01-01T00:00:00.000Z";
     await editRow(rootId, (row) => {
-      row.archivedAt = new Date().toISOString();
+      row.archivedAt = archivedAt;
       row.runtimeConfig = coderRuntime;
     });
     let archiveDuringStart: Awaited<ReturnType<WorkspaceService["archive"]>> | undefined;
@@ -819,7 +823,10 @@ describe("structural workspace mutations across two backends on one root", () =>
     expect(await a.workspaceService.unarchive(rootId)).toMatchObject({ success: true });
     expect(errorOf(archiveDuringStart!)).toContain(inUseElsewhere);
     const row = rowOf(a.config, rootId)!;
-    expect(row.unarchivedAt! > row.archivedAt!).toBe(true);
+    // The refused archive wrote nothing, and the unarchive stuck.
+    expect(row.archivedAt).toBe(archivedAt);
+    expect(row.unarchivedAt).toBeDefined();
+    expect(isWorkspaceArchived(row.archivedAt, row.unarchivedAt)).toBe(false);
   });
 
   // #4871: stopping or deleting a dedicated Coder workspace ends the other backend's turn in it.

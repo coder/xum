@@ -398,6 +398,7 @@ export function mergeResults(
       toolDefinitions.has(toolNameForDefinition) &&
       !toolsWithDefinitions.has(toolNameForDefinition)
     ) {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       fixedTokens += toolDefinitions.get(toolNameForDefinition)!;
       toolsWithDefinitions.add(toolNameForDefinition);
     }

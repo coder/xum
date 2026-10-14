@@ -6,10 +6,12 @@
  * The CLI entry point (server.ts) uses this to start the server.
  */
 import express, { type Express } from "express";
+import Negotiator from "negotiator";
 import * as fs from "fs/promises";
 import * as http from "http";
 import type * as net from "net";
 import * as path from "path";
+import * as zlib from "zlib";
 import { WebSocketServer, type WebSocket } from "ws";
 import { RPCHandler } from "@orpc/server/node";
 import { RPCHandler as ORPCWebSocketServerHandler } from "@orpc/server/websocket";
@@ -36,7 +38,8 @@ import { extractCookieValues, extractWsHeaders, safeEq } from "@/node/orpc/authM
 import { VERSION } from "@/version";
 import { formatOrpcError } from "@/node/orpc/formatOrpcError";
 import { BROWSER_BRIDGE_WS_PATH, DESKTOP_WS_PATH, ORPC_WS_PATH } from "@/node/orpc/wsPaths";
-import { createFlowControlledWebSocket } from "@/node/orpc/wsFlowControl";
+import { createFlowControlledWebSocket, type FlowControlObserver } from "@/node/orpc/wsFlowControl";
+import { perfEpochNowMs } from "@/common/utils/perf/clock";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { log } from "@/node/services/log";
 import {
@@ -53,7 +56,14 @@ import {
   CODER_OAUTH_SERVER_CALLBACK_PATH,
   CODER_OAUTH_SERVER_START_PATH,
 } from "@/common/constants/coderOAuth";
+import { MUX_GATEWAY_ORIGIN } from "@/common/constants/muxGatewayOAuth";
 import { assert } from "@/common/utils/assert";
+import {
+  findFirstViewFont,
+  firstViewFontPreload,
+  isHashedStaticAssetName,
+  PRECOMPRESSED_ENCODINGS,
+} from "@/node/orpc/staticAssets";
 import { getAppProxyBasePathFromPathname, stripAppProxyBasePath } from "@/common/appProxyBasePath";
 
 type AliveWebSocket = WebSocket & { isAlive?: boolean };
@@ -148,6 +158,20 @@ function escapeHtmlAttribute(value: string): string {
 
 const SLASHLESS_ROOT_REDIRECT_SCRIPT =
   '<script>(()=>{const pathname=location.pathname;if(pathname.startsWith("//")||pathname.endsWith("/"))return;location.replace(location.origin+pathname+"/"+location.search+location.hash);})();</script>';
+
+const NEGOTIATED_ENCODINGS = [...PRECOMPRESSED_ENCODINGS.map((e) => e.encoding), "identity"];
+
+/**
+ * The encoding to send, or undefined for identity. Client q-values decide first. On ties the server
+ * order wins (brotli, then gzip): req.acceptsEncodings breaks ties by header order and would pick
+ * gzip for every browser ("gzip, deflate, br, zstd").
+ */
+function negotiateEncoding(req: express.Request) {
+  const [encoding] = new Negotiator(req).encodings(NEGOTIATED_ENCODINGS, {
+    preferred: NEGOTIATED_ENCODINGS,
+  });
+  return PRECOMPRESSED_ENCODINGS.find((e) => e.encoding === encoding);
+}
 
 function injectBaseHref(
   indexHtml: string,
@@ -731,7 +755,6 @@ function buildPublicAbsoluteUrl(
 
 const OAUTH_CALLBACK_ORIGIN_BYPASS_PATHS = new Set<string>([
   "/auth/mux-gateway/callback",
-  "/auth/mux-governor/callback",
   "/auth/mcp-oauth/callback",
   CODER_OAUTH_SERVER_CALLBACK_PATH,
 ]);
@@ -1012,12 +1035,21 @@ export async function createOrpcServer({
   });
 
   let rawSpaIndexHtml: string | null = null;
+  let firstViewFont: string | undefined;
 
   // Static file serving (optional)
   if (serveStatic) {
     try {
       const indexHtmlPath = path.join(staticDir, "index.html");
       rawSpaIndexHtml = await fs.readFile(indexHtmlPath, "utf8");
+      // The font file comes from the stylesheets index.html links, so a rebuild with new hashes needs
+      // no code change. A stylesheet that cannot be read only costs the preload.
+      for (const [, href] of rawSpaIndexHtml.matchAll(
+        /<link[^>]*rel="stylesheet"[^>]*href="\.?\/?([^"]+\.css)"/g
+      )) {
+        const css = await fs.readFile(path.join(staticDir, href), "utf8").catch(() => "");
+        firstViewFont ??= findFirstViewFont(css);
+      }
     } catch (error) {
       log.error("Failed to read index.html for SPA fallback:", error);
     }
@@ -1025,9 +1057,46 @@ export async function createOrpcServer({
     // Serve JS/CSS/assets from disk, but never serve index.html — the SPA fallback
     // (below all API routes) serves the injected version with base href + proxy template.
     const serveStaticAssets = express.static(staticDir, { index: false });
+    // Content-hashed files (#5943) are cached for a year and sent as the build-time .br/.gz
+    // sibling when the client accepts it. These headers are set only when a file is actually
+    // sent, so a missing hashed-looking path still reaches the SPA fallback untouched.
+    const hashedOptions = { index: false, maxAge: "1y", immutable: true } as const;
+    const serveHashedIdentity = express.static(staticDir, {
+      ...hashedOptions,
+      setHeaders: (res) => res.vary("Accept-Encoding"),
+    });
+    const serveHashedEncoded = express.static(staticDir, {
+      ...hashedOptions,
+      // A byte range of the compressed stream is not a range of the resource: send it whole.
+      acceptRanges: false,
+      setHeaders: (res, filePath) => {
+        const precompressed = PRECOMPRESSED_ENCODINGS.find((e) => filePath.endsWith(e.extension));
+        assert(precompressed, `unexpected precompressed asset path: ${filePath}`);
+        res.vary("Accept-Encoding");
+        res.setHeader("Content-Encoding", precompressed.encoding);
+        res.type(path.extname(filePath.slice(0, -precompressed.extension.length)));
+      },
+    });
     app.use((req, res, next) => {
       if (req.path === "/index.html") return next();
-      serveStaticAssets(req, res, next);
+      if (!isHashedStaticAssetName(req.path.slice(1))) {
+        serveStaticAssets(req, res, next);
+        return;
+      }
+      const precompressed = negotiateEncoding(req);
+      const requestPath = splitRequestUrlPathAndQuery(req.url);
+      if (!precompressed || !requestPath) {
+        serveHashedIdentity(req, res, next);
+        return;
+      }
+      const originalUrl = req.url;
+      req.url = `${requestPath.pathname}${precompressed.extension}${requestPath.querySuffix}`;
+      serveHashedEncoded(req, res, (error?: unknown) => {
+        req.url = originalUrl;
+        if (error) return next(error);
+        // No precompressed sibling on disk: serve the identity file.
+        serveHashedIdentity(req, res, next);
+      });
     });
   }
 
@@ -1227,7 +1296,7 @@ export async function createOrpcServer({
     <meta name="color-scheme" content="dark light" />
     <meta name="theme-color" content="#0e0e0e" />
     <title>${title}</title>
-    <link rel="stylesheet" href="https://gateway.mux.coder.com/static/css/site.css" />
+    <link rel="stylesheet" href="${MUX_GATEWAY_ORIGIN}/static/css/site.css" />
   </head>
   <body>
     <div class="page">
@@ -1343,159 +1412,6 @@ export async function createOrpcServer({
     });
 
     sendOAuthCallbackPage(req, res, { type: "mux-gateway-oauth", state, result });
-  });
-
-  // --- Xum Governor OAuth (unauthenticated bootstrap routes) ---
-  // Similar to Xum Gateway OAuth but accepts user-provided governorUrl.
-  app.get("/auth/mux-governor/start", async (req, res) => {
-    if (!(await isHttpRequestAuthenticated(req))) {
-      res.status(401).json({ error: "Invalid or missing auth token/session" });
-      return;
-    }
-
-    const governorUrl = typeof req.query.governorUrl === "string" ? req.query.governorUrl : null;
-    if (!governorUrl) {
-      res.status(400).json({ error: "Missing governorUrl query parameter" });
-      return;
-    }
-
-    const redirectUri = buildPublicAbsoluteUrl(req, "/auth/mux-governor/callback", allowHttpOrigin);
-    if (!redirectUri) {
-      res.status(400).json({ error: "Missing or invalid Host header" });
-      return;
-    }
-    const result = context.muxGovernorOauthService.startServerFlow({
-      governorOrigin: governorUrl,
-      redirectUri,
-    });
-
-    if (!result.success) {
-      res.status(400).json({ error: result.error });
-      return;
-    }
-
-    res.json({ authorizeUrl: result.data.authorizeUrl, state: result.data.state });
-  });
-
-  app.all("/auth/mux-governor/callback", async (req, res) => {
-    // Some providers use 307/308 redirects that preserve POST, or response_mode=form_post.
-    if (req.method !== "GET" && req.method !== "POST") {
-      res.sendStatus(405);
-      return;
-    }
-
-    const state = getStringParamFromQueryOrBody(req, "state");
-    const code = getStringParamFromQueryOrBody(req, "code");
-    const error = getStringParamFromQueryOrBody(req, "error");
-    const errorDescription = getStringParamFromQueryOrBody(req, "error_description") ?? undefined;
-
-    log.debug("Governor OAuth callback received", {
-      method: req.method,
-      state,
-      hasCode: typeof code === "string" && code.length > 0,
-      hasError: typeof error === "string" && error.length > 0,
-    });
-
-    const result = await context.muxGovernorOauthService.handleServerCallbackAndExchange({
-      state,
-      code,
-      error,
-      errorDescription,
-    });
-
-    const payload = {
-      type: "mux-governor-oauth",
-      state,
-      ok: result.success,
-      error: result.success ? null : result.error,
-    };
-
-    const payloadJson = escapeJsonForHtmlScript(payload);
-
-    const title = result.success ? "Enrollment complete" : "Enrollment failed";
-    const description = result.success
-      ? "You can return to Xum. You may now close this tab."
-      : payload.error
-        ? escapeHtml(payload.error)
-        : "An unknown error occurred.";
-    const returnPath = getPublicAppRootPath(req, res);
-    const returnPathJson = escapeJsonForHtmlScript(returnPath);
-    const returnPathHref = escapeHtmlAttribute(returnPath);
-
-    const html = `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="color-scheme" content="dark light" />
-    <title>${title}</title>
-    <style>
-      body { font-family: system-ui, sans-serif; max-width: 600px; margin: 4rem auto; padding: 1rem; }
-      h1 { margin-bottom: 1rem; }
-      .muted { color: #666; }
-      .btn { display: inline-block; padding: 0.5rem 1rem; background: #333; color: #fff; text-decoration: none; border-radius: 4px; }
-    </style>
-  </head>
-  <body>
-    <h1>${title}</h1>
-    <p>${description}</p>
-    ${result.success ? '<p class="muted">This tab should close automatically.</p>' : ""}
-    <p><a class="btn" href="${returnPathHref}">Return to Xum</a></p>
-
-    <script>
-      (() => {
-        const payload = ${payloadJson};
-        const ok = payload.ok === true;
-
-        try {
-          if (window.opener && typeof window.opener.postMessage === "function") {
-            window.opener.postMessage(payload, "*");
-          }
-        } catch {
-          // Ignore postMessage failures.
-        }
-
-        if (!ok) {
-          return;
-        }
-
-        try {
-          if (window.opener && typeof window.opener.focus === "function") {
-            window.opener.focus();
-          }
-        } catch {
-          // Ignore focus failures.
-        }
-
-        try {
-          window.close();
-        } catch {
-          // Ignore close failures.
-        }
-
-        setTimeout(() => {
-          try {
-            window.close();
-          } catch {
-            // Ignore close failures.
-          }
-        }, 50);
-
-        setTimeout(() => {
-          try {
-            window.location.replace(${returnPathJson});
-          } catch {
-            // Ignore navigation failures.
-          }
-        }, 150);
-      })();
-    </script>
-  </body>
-</html>`;
-
-    res.status(result.success ? 200 : 400);
-    res.setHeader("Content-Type", "text/html");
-    res.send(html);
   });
 
   // --- MCP OAuth (unauthenticated redirect callback) ---
@@ -1703,6 +1619,31 @@ export async function createOrpcServer({
         return next();
       }
 
+      // #5945: a missing file (/llms.txt, /assets/x.js) or a dot segment probe (/.well-known/*,
+      // /.env, /.git/config) gets a 404 instead of the SPA page. The check reads only the pathname
+      // string (a fixed number of prefix and extension checks, no filesystem call).
+      // `/workspace/<id>` is a client route whatever its ID: legacy IDs are `${project}-${branch}`
+      // and can contain dots (next.js-main).
+      const isWorkspaceRoute =
+        req.path.startsWith("/workspace/") && !req.path.includes("/", "/workspace/".length);
+      // Express keeps percent escapes in req.path (/%2Eenv), but serve-static decodes them before
+      // its lookup, so classify the decoded path. A malformed escape keeps the raw path.
+      let filePath = req.path;
+      if (filePath.includes("%")) {
+        try {
+          filePath = decodeURIComponent(filePath);
+        } catch {
+          // Not decodable: classify the raw path.
+        }
+      }
+      if (
+        req.path !== "/index.html" &&
+        !isWorkspaceRoute &&
+        (filePath.includes("/.") || path.posix.extname(filePath) !== "")
+      ) {
+        return next();
+      }
+
       if (rawSpaIndexHtml !== null) {
         const spaIndexHtml = injectProxyUriTemplate(
           injectBaseHref(rawSpaIndexHtml, getPublicBaseHref(req, res), {
@@ -1711,9 +1652,27 @@ export async function createOrpcServer({
           getBrowserProxyUriTemplate()
         );
         varyPublicBasePathHeaders(res);
-        res.setHeader("Content-Type", "text/html");
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
         res.setHeader("Cache-Control", "no-store");
-        res.send(spaIndexHtml);
+        // After the injected <base>, so the relative font URLs resolve under a proxy base path.
+        const html = spaIndexHtml.replace(
+          /<\/head>/i,
+          `${firstViewFontPreload(firstViewFont)}</head>`
+        );
+        // Compressed per response, because the HTML is rewritten per request (base href, redirect).
+        // br quality 5 takes about 0.15 ms for this page. Quality 11 blocks for about 10 ms.
+        res.vary("Accept-Encoding");
+        const encoding = negotiateEncoding(req)?.encoding;
+        if (encoding) res.setHeader("Content-Encoding", encoding);
+        res.send(
+          encoding === "br"
+            ? zlib.brotliCompressSync(html, {
+                params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 5 },
+              })
+            : encoding === "gzip"
+              ? zlib.gzipSync(html)
+              : html
+        );
         return;
       }
 
@@ -1839,6 +1798,18 @@ export async function createOrpcServer({
   const orpcWsHandler = new ORPCWebSocketServerHandler(orpcRouter, {
     interceptors: [onError(onOrpcError)],
   });
+  // Flow-control waits go to the perf flight recorder (a no-op unless it is collecting). The
+  // Electron MessagePort transport has no send buffer or flow control, so it records none.
+  // Partial test contexts can lack the recorder, hence the widened type.
+  const perfRecorder: ORPCContext["perfFlightRecorder"] | undefined = context.perfFlightRecorder;
+  const wsFlowControlObserver: FlowControlObserver | undefined =
+    perfRecorder === undefined
+      ? undefined
+      : {
+          waitStarted: () => perfRecorder.beginRpcCall(),
+          waitEnded: (wait) =>
+            perfRecorder.recordWsFlowControlWait({ ...wait, endMs: perfEpochNowMs() }),
+        };
 
   wsServer.on("connection", (ws, req) => {
     const terminate = () => {
@@ -1876,7 +1847,9 @@ export async function createOrpcServer({
     // Flow control bounds the socket's send backlog so a large replay cannot
     // starve heartbeats or the keepalive pong (#4655). The keepalive above
     // keeps using the raw ws; oRPC keys peers by this one wrapper instance.
-    void orpcWsHandler.upgrade(createFlowControlledWebSocket(ws), { context: wsContext });
+    void orpcWsHandler.upgrade(createFlowControlledWebSocket(ws, wsFlowControlObserver), {
+      context: wsContext,
+    });
   });
 
   // Start listening
