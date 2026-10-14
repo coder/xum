@@ -203,6 +203,9 @@ describe("readOpenAIExtension", () => {
       "\u0915\u200d\u0937",
       "\u0627\u200d\u0915",
       "\u0915\u094d\u200d\u0627",
+      // After the virama ZWJ must come a letter, not a digit or a vowel sign.
+      "\u0915\u094d\u200d\u0967",
+      "\u0915\u094d\u200d\u093e",
       // ZWNJ between Arabic-Indic digits: digits are not letters.
       "\u0661\u200c\u0662",
       // A tag that is not a digit or lowercase letter, and a one-tag payload.

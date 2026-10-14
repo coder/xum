@@ -186,7 +186,7 @@ const ALLOWED_FORMAT_SEQUENCES: ReadonlyArray<[RegExp, string]> = [
   ],
   [new RegExp(`(${SHAPING_LETTER}\\p{M}*)\\u200c(?=\\p{M}*${SHAPING_LETTER})`, "gu"), "$1"],
   ...VIRAMA_SCRIPTS.map(([script, virama]): [RegExp, string] => [
-    new RegExp(`(${virama})\\u200d(?=\\p{Script=${script}})`, "gu"),
+    new RegExp(`(${virama})\\u200d(?=(?=\\p{Script=${script}})\\p{L})`, "gu"),
     "$1",
   ]),
   [/\u{1f3f4}[\u{e0030}-\u{e0039}\u{e0061}-\u{e007a}]{2,7}\u{e007f}/gu, "\u{1f3f4}"],
