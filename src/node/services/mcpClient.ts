@@ -301,6 +301,26 @@ function mcpToModelOutput({
   return { type: "content", value: convertedContent };
 }
 
+/** List a connected server's prompts; a server without the prompts capability has none. */
+async function listServerPrompts(
+  client: Client,
+  signal: AbortSignal | undefined
+): Promise<MCPPrompt[]> {
+  // The SDK also returns [] for such a server, but prints a console.debug line
+  // on each call. Xum lists prompts often (composer, tool descriptions), so that
+  // line flooded the server log.
+  if (!client.getServerCapabilities()?.prompts) return [];
+  // Cursorless listPrompts() aggregates pages up to ClientOptions.listMaxPages
+  // and forwards these options to each request; the integration test covers
+  // page two.
+  const result = await client.listPrompts(undefined, {
+    timeout: PROMPT_LIST_TIMEOUT_MS,
+    ...(signal !== undefined ? { signal } : {}),
+  });
+  assert(Array.isArray(result.prompts), "MCP prompts/list result must carry a prompts array");
+  return result.prompts;
+}
+
 /**
  * Connect to an MCP server and return a handle for tools and prompts.
  *
@@ -429,21 +449,7 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
       listedEntrypoints = entrypoints;
       return tools;
     },
-    prompts: async (options) => {
-      // The SDK also returns [] for a server without the prompts capability, but
-      // prints a console.debug line on each call. Xum lists prompts often
-      // (composer, tool descriptions), so that line flooded the server log.
-      if (!client.getServerCapabilities()?.prompts) return [];
-      // Cursorless listPrompts() aggregates pages up to ClientOptions.listMaxPages
-      // and forwards these options to each request; the integration test covers
-      // page two.
-      const result = await client.listPrompts(undefined, {
-        timeout: PROMPT_LIST_TIMEOUT_MS,
-        ...(options?.signal !== undefined ? { signal: options.signal } : {}),
-      });
-      assert(Array.isArray(result.prompts), "MCP prompts/list result must carry a prompts array");
-      return result.prompts;
-    },
+    prompts: (options) => listServerPrompts(client, options?.signal),
     getPrompt: (name, args, options) =>
       client.getPrompt(
         { name, arguments: args },
