@@ -103,13 +103,14 @@ describe("live follow of view-domain approvals", () => {
     expect(reads.length).toBe(2);
   });
 
-  // A read publishes only the keys followed when it started: a view that mounts during it has
-  // its own getView list, and the next change event covers it.
-  test("a read publishes only to the views that followed when it started", async () => {
+  // A read publishes only the keys followed when it started. A view that mounts during it gets
+  // one more read right after: its getView list can predate the change that read covers.
+  test("a view that mounts during a read gets a read of its own right after", async () => {
     const changes = changeStream();
     let release = () => undefined as void;
     let revision = 2_000;
     let hold = false;
+    const published: string[][] = [];
     const client: APIClient = createTestApiClient({
       config: { onConfigChanged: changes.open },
       mcpApps: {
@@ -133,13 +134,50 @@ describe("live follow of view-domain approvals", () => {
     act(() => changes.push());
     await waitFor(() => expect(revision).toBe(2_002));
     view.rerender(tree(true));
+    published.push([shown("late") ?? ""]);
+    hold = false;
     await act(async () => {
       release();
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
-    expect(shown("late")).toBe("none");
-    hold = false;
-    act(() => changes.push());
+    // No change event came, yet the late view got the next read.
     await waitFor(() => expect(shown("late")).toBe("empty"));
+    expect(revision).toBe(2_003);
+    expect(published).toEqual([["none"]]);
+  });
+
+  // A failed read must not end the follow: a later Revoke elsewhere still has to reach the view.
+  test("a failed read opens a new stream after a backoff", async () => {
+    const changes = changeStream();
+    let failNext = true;
+    let revision = 3_000;
+    const client: APIClient = createTestApiClient({
+      config: { onConfigChanged: changes.open },
+      mcpApps: {
+        readViewDomains: () => {
+          if (failNext) {
+            failNext = false;
+            return Promise.reject(new Error("backend busy"));
+          }
+          return Promise.resolve({
+            revision: ++revision,
+            approvals: [
+              { projectPath: "/retry", serverName: "charts", origins: ["https://b.example.com"] },
+            ],
+          });
+        },
+      },
+    });
+    const view = render(
+      <APIProvider client={client}>
+        <Follower projectPath="/retry" serverName="charts" />
+      </APIProvider>
+    );
+    await waitFor(
+      () => expect(view.getByTestId("/retry:charts").textContent).toBe("https://b.example.com"),
+      {
+        timeout: 3_000,
+      }
+    );
   });
 });

@@ -114,12 +114,20 @@ export async function revokeMcpAppViewDomains(
  * counted by project and server key. After the stream opens, and after each change, the
  * follow re-reads every approval (readViewDomains: one call, with a revision newer than every
  * list committed before it) and publishes the lists of the keys followed when that read
- * started. A view that mounts later has its own getView list, and the revisions order the two.
+ * started. A key that joins during a read gets one more read right after it: its view's getView
+ * list can predate the change that read covers, and no later change event is certain.
+ *
+ * A failed stream or read does not end the follow while views follow: it opens a new stream
+ * after a capped backoff. A new client (a reconnect) replaces the follow instead.
  */
 interface ViewDomainsFollow {
   keys: Map<string, number>;
+  /** A key joined since the current read started. */
+  keysJoined: boolean;
   stop: () => void;
 }
+const FOLLOW_RETRY_FIRST_MS = 500;
+const FOLLOW_RETRY_MAX_MS = 30_000;
 const follows = new Map<APIClient, ViewDomainsFollow>();
 
 /** Follow the approvals of a mounted view's server in its project while it stays mounted. */
@@ -134,6 +142,7 @@ export function useFollowMcpAppViewDomains(projectPath: string | null, serverNam
 
 function followViewDomains(api: APIClient, key: string): () => void {
   const follow = follows.get(api) ?? startViewDomainsFollow(api);
+  if (!follow.keys.has(key)) follow.keysJoined = true;
   follow.keys.set(key, (follow.keys.get(key) ?? 0) + 1);
   return () => {
     const left = (follow.keys.get(key) ?? 1) - 1;
@@ -147,7 +156,11 @@ function followViewDomains(api: APIClient, key: string): () => void {
 
 function startViewDomainsFollow(api: APIClient): ViewDomainsFollow {
   const controller = new AbortController();
-  const follow: ViewDomainsFollow = { keys: new Map(), stop: () => controller.abort() };
+  const follow: ViewDomainsFollow = {
+    keys: new Map(),
+    keysJoined: false,
+    stop: () => controller.abort(),
+  };
   follows.set(api, follow);
   void runViewDomainsFollow(api, follow, controller.signal);
   return follow;
@@ -158,21 +171,52 @@ async function runViewDomainsFollow(
   follow: ViewDomainsFollow,
   signal: AbortSignal
 ): Promise<void> {
+  let retryMs = FOLLOW_RETRY_FIRST_MS;
+  while (!signal.aborted) {
+    if (await followChanges(api, follow, signal)) retryMs = FOLLOW_RETRY_FIRST_MS;
+    // Stopped, or the stream failed or ended while views still follow: open a new one.
+    await abortableDelay(retryMs, signal);
+    retryMs = Math.min(retryMs * 2, FOLLOW_RETRY_MAX_MS);
+  }
+}
+
+/** One stream: read now, then after each change. Returns whether a read succeeded. */
+async function followChanges(
+  api: APIClient,
+  follow: ViewDomainsFollow,
+  signal: AbortSignal
+): Promise<boolean> {
   let changes: AsyncIterator<unknown> | null = null;
+  let read = false;
   try {
     const stream = await api.config.onConfigChanged(undefined, { signal });
     changes = stream[Symbol.asyncIterator]();
     // A change can land between a view's getView and the stream start, or fire while the
     // backend starts its watch (before onConfigChanged returns there): read once now.
     await rereadViewDomains(api, follow, signal);
+    read = true;
     while (!signal.aborted && !(await changes.next()).done) {
       await rereadViewDomains(api, follow, signal);
     }
   } catch {
-    // The stream ends with its client (a reconnect gives a new client) or on stop.
+    // A failed stream or read: the caller retries after a backoff, unless stopped.
   } finally {
     void changes?.return?.();
   }
+  return read;
+}
+
+function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) return resolve();
+    const timer = setTimeout(done, ms);
+    signal.addEventListener("abort", done, { once: true });
+    function done() {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      resolve();
+    }
+  });
 }
 
 async function rereadViewDomains(
@@ -180,9 +224,12 @@ async function rereadViewDomains(
   follow: ViewDomainsFollow,
   signal: AbortSignal
 ): Promise<void> {
-  const keys = [...follow.keys.keys()];
-  const { revision, approvals } = await api.mcpApps.readViewDomains();
-  if (signal.aborted) return;
-  const read = new Map(approvals.map((a) => [keyOf(a.projectPath, a.serverName), a.origins]));
-  for (const key of keys) publishByKey(key, read.get(key) ?? [], revision);
+  do {
+    follow.keysJoined = false;
+    const keys = [...follow.keys.keys()];
+    const { revision, approvals } = await api.mcpApps.readViewDomains();
+    if (signal.aborted) return;
+    const read = new Map(approvals.map((a) => [keyOf(a.projectPath, a.serverName), a.origins]));
+    for (const key of keys) publishByKey(key, read.get(key) ?? [], revision);
+  } while (follow.keysJoined);
 }
