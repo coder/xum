@@ -152,6 +152,10 @@ describe("readOpenAIExtension", () => {
       "Dev \u{1f469}\u200d\u{1f4bb}",
       "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645",
       `Team ${scotland}`,
+      // An emoji with VS16, a keycap, and a Hindi conjunct broken with ZWNJ.
+      "Love \u2764\ufe0f",
+      "Room 1\ufe0f\u20e3",
+      "\u0915\u094d\u200c\u0937",
     ]) {
       const result = read({ ...validInterface, displayName: good, developerName: good });
       expect(result.warnings).toEqual([]);
@@ -166,11 +170,19 @@ describe("readOpenAIExtension", () => {
       "\u200c\u0645\u06cc",
       "Fig\u{e0067}ma",
       "\u{1f3f4}\u{e0067}\u{e0062}",
+      // Variation selectors outside an emoji or keycap, and ZWNJ in a script without shaping
+      // (Codex PRRT_kwDOPxxmWM6sQ79s, PRRT_kwDOPxxmWM6sQ79z).
+      "Fig\ufe0fma",
+      "Fig\u{e0100}ma",
+      "\u5f00\u53d1\u200c\u8005",
+      "\u0440\u0443\u200c\u0441",
     ]) {
       expect(read({ ...validInterface, developerName: bad }).extension).toEqual({});
     }
-    const blank = read({ ...validInterface, capabilities: ["Search", "\u200d"] });
-    expect(blank.extension?.interface).toEqual(validInterface);
+    for (const label of ["\u200d", "\ufe0f"]) {
+      const blank = read({ ...validInterface, capabilities: ["Search", label] });
+      expect(blank.extension?.interface).toEqual(validInterface);
+    }
   });
 
   test("a blank capability drops the capability list with a warning", () => {
