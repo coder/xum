@@ -114,8 +114,9 @@ export async function revokeMcpAppViewDomains(
  * counted by project and server key. After the stream opens, and after each change, the
  * follow re-reads every approval (readViewDomains: one call, with a revision newer than every
  * list committed before it) and publishes the lists of the keys followed when that read
- * started. A key that joins during a read gets one more read right after it: its view's getView
- * list can predate the change that read covers, and no later change event is certain.
+ * started. A key that joins gets a read after it joined: one more read right after a read in
+ * flight, or one at once while the follow waits for a change. Its view's getView list can
+ * predate a change the follow already read, and no later change event is certain.
  *
  * A failed stream or read does not end the follow while views follow: it opens a new stream
  * after a capped backoff. A new client (a reconnect) replaces the follow instead.
@@ -124,6 +125,8 @@ interface ViewDomainsFollow {
   keys: Map<string, number>;
   /** A key joined since the current read started. */
   keysJoined: boolean;
+  /** Wakes a follow that waits for a change: a key joined, so it reads now. */
+  wake: () => void;
   stop: () => void;
 }
 const FOLLOW_RETRY_FIRST_MS = 500;
@@ -142,7 +145,10 @@ export function useFollowMcpAppViewDomains(projectPath: string | null, serverNam
 
 function followViewDomains(api: APIClient, key: string): () => void {
   const follow = follows.get(api) ?? startViewDomainsFollow(api);
-  if (!follow.keys.has(key)) follow.keysJoined = true;
+  if (!follow.keys.has(key)) {
+    follow.keysJoined = true;
+    follow.wake();
+  }
   follow.keys.set(key, (follow.keys.get(key) ?? 0) + 1);
   return () => {
     const left = (follow.keys.get(key) ?? 1) - 1;
@@ -159,6 +165,7 @@ function startViewDomainsFollow(api: APIClient): ViewDomainsFollow {
   const follow: ViewDomainsFollow = {
     keys: new Map(),
     keysJoined: false,
+    wake: () => undefined,
     stop: () => controller.abort(),
   };
   follows.set(api, follow);
@@ -195,7 +202,17 @@ async function followChanges(
     // backend starts its watch (before onConfigChanged returns there): read once now.
     await rereadViewDomains(api, follow, signal);
     read = true;
-    while (!signal.aborted && !(await changes.next()).done) {
+    let change = changes.next();
+    while (!signal.aborted) {
+      // A key that joins while no read runs wakes this wait: its view's getView list can
+      // predate a change already read here, and no later change is certain.
+      const joined = new Promise<"joined">((resolve) => (follow.wake = () => resolve("joined")));
+      const woke = await Promise.race([change, joined]);
+      follow.wake = () => undefined;
+      if (woke !== "joined") {
+        if (woke.done === true) break;
+        change = changes.next();
+      }
       await rereadViewDomains(api, follow, signal);
     }
   } catch {

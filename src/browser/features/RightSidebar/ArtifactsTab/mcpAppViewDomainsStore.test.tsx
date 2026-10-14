@@ -146,6 +146,33 @@ describe("live follow of view-domain approvals", () => {
     expect(published).toEqual([["none"]]);
   });
 
+  // The follow waits for a change when a second server's view mounts: that view's getView list
+  // can predate a change the follow already read.
+  test("a view that mounts while the follow waits gets a read at once", async () => {
+    const changes = changeStream();
+    let revision = 4_000;
+    const client: APIClient = createTestApiClient({
+      config: { onConfigChanged: changes.open },
+      mcpApps: {
+        readViewDomains: () => Promise.resolve({ revision: ++revision, approvals: [] }),
+      },
+    });
+    const tree = (late: boolean) => (
+      <APIProvider client={client}>
+        <Follower projectPath="/idle" serverName="early" />
+        {late && <Follower projectPath="/idle" serverName="late" />}
+      </APIProvider>
+    );
+    const view = render(tree(false));
+    const shown = (server: string) => view.getByTestId(`/idle:${server}`).textContent;
+    await waitFor(() => expect(shown("early")).toBe("empty"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    view.rerender(tree(true));
+    // No change event: the join alone starts the read.
+    await waitFor(() => expect(shown("late")).toBe("empty"));
+    expect(revision).toBe(4_002);
+  });
+
   // A failed read must not end the follow: a later Revoke elsewhere still has to reach the view.
   test("a failed read opens a new stream after a backoff", async () => {
     const changes = changeStream();
