@@ -283,6 +283,17 @@ test("the project hooks run the user's own hooks and pass their exit codes throu
     out: "user tool_pre: git commit -am x\n",
   });
 
+  // Leftover homes, as Xum's getXumHome() picks them: a leftover ~/.mux, and
+  // the home an empty ~/.xum's .legacy-fallback marker names.
+  const legacy = join(dir, "legacy");
+  userHook(join(legacy, ".mux"), "tool_pre", 5);
+  expect(runHook(pre, "ls", { HOME: legacy, XUM_ROOT: "" }).status).toBe(5);
+  const marked = join(dir, "marked");
+  mkdirSync(join(marked, ".xum"), { recursive: true });
+  writeFileSync(join(marked, ".xum.legacy-fallback"), ".cmux\n");
+  userHook(join(marked, ".cmux"), "tool_pre", 6);
+  expect(runHook(pre, "ls", { HOME: marked, XUM_ROOT: "" }).status).toBe(6);
+
   // XUM_ROOT moves the user's home, and a home that is the project's own .xum
   // does not run the project hook again.
   userHook(join(dir, "root"), "tool_pre", 4);
