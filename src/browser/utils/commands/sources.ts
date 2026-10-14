@@ -164,13 +164,12 @@ import type { LayoutPresetsConfig, LayoutSlotNumber } from "@/common/types/uiLay
 import {
   hasTab,
   openToolFromNewTab,
-  selectTabInTabset,
-  setFocusedTabset,
   splitFocusedTabset,
   toggleTab,
   type RightSidebarLayoutState,
 } from "@/browser/utils/rightSidebarLayout";
 import {
+  focusRightSidebarTab,
   readRightSidebarLayout,
   updateRightSidebarLayout,
 } from "@/browser/utils/rightSidebarTabFocus";
@@ -409,6 +408,11 @@ const findFirstTerminalSessionTab = (
     findFirstTerminalSessionTab(node.children[0]) ?? findFirstTerminalSessionTab(node.children[1])
   );
 };
+
+function focusExistingTerminalTab(workspaceId: string): void {
+  const found = findFirstTerminalSessionTab(readRightSidebarLayout(workspaceId).root);
+  if (found) focusRightSidebarTab(workspaceId, found.tab);
+}
 
 /**
  * Whether right-sidebar commands have a visible sidebar to act on. Narrow layouts hide the
@@ -1059,28 +1063,25 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           id: CommandIds.navRightSidebarFocusTerminal(),
           title: "Right Sidebar: Focus Terminal",
           section: section.navigation,
-          run: () =>
-            updateRightSidebarLayout(wsId, (s) => {
-              const found = findFirstTerminalSessionTab(s.root);
-              if (!found) return s;
-              return selectTabInTabset(
-                setFocusedTabset(s, found.tabsetId),
-                found.tabsetId,
-                found.tab
-              );
-            }),
+          run: () => focusExistingTerminalTab(wsId),
         },
         {
           id: CommandIds.navRightSidebarSplitHorizontal(),
           title: "Right Sidebar: Split Horizontally",
           section: section.navigation,
-          run: () => updateRightSidebarLayout(wsId, (s) => splitFocusedTabset(s, "horizontal")),
+          run: () => {
+            updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+            updateRightSidebarLayout(wsId, (s) => splitFocusedTabset(s, "horizontal"));
+          },
         },
         {
           id: CommandIds.navRightSidebarSplitVertical(),
           title: "Right Sidebar: Split Vertically",
           section: section.navigation,
-          run: () => updateRightSidebarLayout(wsId, (s) => splitFocusedTabset(s, "vertical")),
+          run: () => {
+            updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+            updateRightSidebarLayout(wsId, (s) => splitFocusedTabset(s, "vertical"));
+          },
         },
         {
           id: CommandIds.navRightSidebarNewTab(),
@@ -1139,20 +1140,13 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               // "terminal" is now an alias for "focus an existing terminal session tab".
               // Creating new terminal sessions is handled in the main UI ("+" button).
               if (tool === "terminal") {
-                updateRightSidebarLayout(wsId, (s) => {
-                  const found = findFirstTerminalSessionTab(s.root);
-                  if (!found) return s;
-                  return selectTabInTabset(
-                    setFocusedTabset(s, found.tabsetId),
-                    found.tabsetId,
-                    found.tab
-                  );
-                });
+                focusExistingTerminalTab(wsId);
                 return;
               }
 
               // Same as picking the tool in the focused pane's New tab: it takes the New tab's
               // place, or is selected where it is already open.
+              updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
               updateRightSidebarLayout(wsId, (s) => openToolFromNewTab(s, s.focusedTabsetId, tool));
               // While the sidebar is hidden (phones) that tab cannot be seen, so WorkspaceMenuBar
               // shows it in the full-screen sidebar; with the sidebar visible it ignores the event.
