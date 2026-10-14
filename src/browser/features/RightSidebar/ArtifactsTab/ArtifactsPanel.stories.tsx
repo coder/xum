@@ -1225,8 +1225,12 @@ export const McpAppViewDomainsAllow: Story = {
 export const McpAppViewDomainsAllowFailsPhone: Story = {
   globals: { viewport: { value: "phone390", isRotated: false } },
   parameters: { pixel: PIXEL_DISABLED },
-  render: () =>
-    renderMcpAppView(MCP_APP_VIEW_HTML, DOMAINS_CSP, "Could not write the project config"),
+  // The test-runner ignores viewport globals, so the wrapper keeps the play at phone width.
+  render: () => (
+    <div style={{ width: 375, maxWidth: "100%", height: "100%" }}>
+      {renderMcpAppView(MCP_APP_VIEW_HTML, DOMAINS_CSP, "Could not write the project config")}
+    </div>
+  ),
   play: async ({ canvasElement }) => {
     const strip = await findDomainsStrip(canvasElement);
     const allow = within(strip).getByRole("button", { name: "Allow" });
@@ -1237,6 +1241,10 @@ export const McpAppViewDomainsAllowFailsPhone: Story = {
     await expect(within(strip).getByRole("button", { name: "Not now" })).toBeEnabled();
     const csp = within(canvasElement).getByTestId("mcp-app-frame").getAttribute("srcdoc") ?? "";
     await expect(csp).not.toContain("https://api.example.com");
+    // The strip and its buttons fit the phone width.
+    await expect(strip.getBoundingClientRect().right).toBeLessThanOrEqual(375);
+    await expect(strip.scrollWidth).toBeLessThanOrEqual(strip.clientWidth);
+    await expect(allow.getBoundingClientRect().right).toBeLessThanOrEqual(375);
   },
 };
 
