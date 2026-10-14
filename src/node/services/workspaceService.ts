@@ -10811,15 +10811,31 @@ export class WorkspaceService
   }
 
   /**
-   * Waits while the backend still names a workspace create() opened under its provisional name,
-   * so a fork copies its generated title and forks from its final branch instead of racing the
-   * rename. Bounded by the naming deadline: a checkout that stalls the rename does not hold the
-   * fork beyond it.
+   * A fork's source metadata, read once the backend has named a source create() opened under its
+   * provisional name, so the fork copies its generated title and forks from its final branch. The
+   * wait is bounded by the naming deadline. A source whose branch is still provisional then (a
+   * long checkout holds the rename) refuses the fork: forking from that branch would race its
+   * rename.
    */
-  private async waitForPendingCreationNaming(workspaceId: string): Promise<void> {
-    const pending = this.pendingCreationNamings.get(workspaceId);
-    if (pending === undefined) return;
-    await raceWithAbortAndTimeout(pending, { timeoutMs: WORKSPACE_NAME_GENERATION_TIMEOUT_MS });
+  private async readNamedForkSource(
+    sourceWorkspaceId: string
+  ): Promise<Result<WorkspaceMetadata, string>> {
+    const pending = this.pendingCreationNamings.get(sourceWorkspaceId);
+    if (pending !== undefined) {
+      const waited = await raceWithAbortAndTimeout(pending, {
+        timeoutMs: WORKSPACE_NAME_GENERATION_TIMEOUT_MS,
+      });
+      if (waited.kind !== "ok") {
+        return Err(
+          "The workspace is still being set up. Fork it again once its checkout finishes."
+        );
+      }
+    }
+    const result = await this.aiService.getWorkspaceMetadata(sourceWorkspaceId);
+    if (!result.success) {
+      return Err(`Failed to get source workspace metadata: ${result.error}`);
+    }
+    return result;
   }
 
   /**
@@ -14214,10 +14230,9 @@ export class WorkspaceService
     let rollBackForkRegistration: (() => Promise<CreationRollbackResult>) | undefined;
     try {
       // Admitted first: archiving the source refuses meanwhile, as for any fork in progress.
-      await this.waitForPendingCreationNaming(sourceWorkspaceId);
-      const sourceMetadataResult = await this.aiService.getWorkspaceMetadata(sourceWorkspaceId);
+      const sourceMetadataResult = await this.readNamedForkSource(sourceWorkspaceId);
       if (!sourceMetadataResult.success) {
-        return Err(`Failed to get source workspace metadata: ${sourceMetadataResult.error}`);
+        return Err(sourceMetadataResult.error);
       }
       const sourceMetadata = sourceMetadataResult.data;
       if (sourceMetadata.kind === "scratch") {

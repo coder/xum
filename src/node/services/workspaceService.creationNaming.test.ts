@@ -14,6 +14,7 @@ import { Err, Ok, type Result } from "@/common/types/result";
 import type { NameGenerationError } from "@/common/types/errors";
 import type { WorkspaceNameGenerationRequest } from "@/common/orpc/schemas/api";
 import { formatNameGenerationError } from "@/common/utils/errors/formatNameGenerationError";
+import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
 import type { WorkspaceService } from "./workspaceService";
 import * as workspaceTitleGenerator from "./workspaceTitleGenerator";
 import {
@@ -436,6 +437,41 @@ describe("create() with nameGeneration", () => {
     },
     30_000
   );
+
+  test("a fork is refused while its source's checkout holds the rename past the deadline", async () => {
+    generateIdentity.mockResolvedValue(GENERATED);
+    const checkoutHeld = createDeferred<void>();
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- called with the original receiver
+    const realMaterialize = WorktreeRuntime.prototype.materializeWorkspace;
+    spyOn(WorktreeRuntime.prototype, "materializeWorkspace").mockImplementation(async function (
+      this: WorktreeRuntime,
+      ...args: Parameters<WorktreeRuntime["materializeWorkspace"]>
+    ) {
+      await checkoutHeld.promise;
+      return realMaterialize.apply(this, args);
+    });
+
+    const created = await createNamed();
+    // The title applies at once; only the branch rename waits for the checkout.
+    await until(() => entry(created.id)?.title === "Fix sidebar layout");
+    let forked: ReturnType<WorkspaceService["fork"]>;
+    fakeTimers.useFakeTimers();
+    try {
+      forked = service.fork(created.id);
+      fakeTimers.advanceTimersByTime(WORKSPACE_NAME_GENERATION_TIMEOUT_MS);
+    } finally {
+      fakeTimers.useRealTimers();
+    }
+    // Forking from the provisional branch would race its rename once the checkout ends.
+    expect((await forked).success).toBe(false);
+    expect(harness.config.loadConfigOrDefault().projects.get(projectPath)?.workspaces).toHaveLength(
+      1
+    );
+
+    checkoutHeld.resolve();
+    await harness.initStateManager.waitForInit(created.id);
+    expect(await readObserved(created.path)).toBe(`sidebar-k3m9 ${created.name}`);
+  }, 30_000);
 
   test.each([
     { label: "a branch name", branchName: "feature", title: undefined, type: "worktree" },
