@@ -22,6 +22,12 @@ export interface FunctionRow {
   /** Fraction 0..1, or null when the snapshot has no coverage data. */
   coverage: number | null;
   crap: number | null;
+  /**
+   * True when the Bun inlined-const coverage bug probably hid some of this
+   * function's coverage (crapper_report.py, inlined_const_suspect). Absent in
+   * rows scored before the field existed.
+   */
+  bunInlinedConstSuspect?: boolean;
 }
 
 export type Rule = "floor-cc" | "floor-crap" | "new-function" | "crap-tax";
@@ -33,6 +39,8 @@ export interface Finding {
   head: FunctionRow;
   base: FunctionRow | null;
   message: string;
+  /** Set when bunInlinedConstRelief turned the finding into a warning. */
+  bunInlinedConstSuspect?: boolean;
 }
 
 /** Head-side line spans of `git diff -U0` hunks, per path. */
@@ -195,6 +203,28 @@ function judgeNew(
   };
 }
 
+/**
+ * Coverage-based findings on a function whose coverage the Bun inlined-const
+ * bug may hide become warnings: the head score may be too high, so it must
+ * not block. Only the head counts: the bug only hides hits, so a suspect base
+ * score is no lower than the real one and a head above it still regressed.
+ * The relief applies only when the same rules pass the head at full coverage
+ * (CRAP = CC), so a finding that CC alone proves, and floor-cc, stay
+ * violations. Remove with the detector (see the REMOVAL TRIGGER in
+ * crapper_report.py).
+ */
+function bunInlinedConstRelief(finding: Finding, judge: (head: FunctionRow) => Finding | null): Finding {
+  const { head } = finding;
+  if (head.bunInlinedConstSuspect !== true || head.crap === null) return finding;
+  if (judge({ ...head, coverage: 1, crap: head.complexity }) !== null) return finding;
+  return {
+    ...finding,
+    severity: "warning",
+    bunInlinedConstSuspect: true,
+    message: `${finding.message} [warning only: Bun's coverage may hide this function's tests (inlined-const bug, bunInlinedConstSuspect)]`,
+  };
+}
+
 function totalComplexity(rows: readonly FunctionRow[]): number {
   return rows.reduce((sum, row) => sum + row.complexity, 0);
 }
@@ -221,10 +251,10 @@ export function evaluate(
   const findings: Finding[] = [];
   for (const [key, head] of heads) {
     const before = base.get(key);
-    const finding = before
-      ? compare(key, before, head, changed)
-      : judgeNew(key, head, totals, moves);
-    if (finding) findings.push(finding);
+    const judge = (row: FunctionRow) =>
+      before ? compare(key, before, row, changed) : judgeNew(key, row, totals, moves);
+    const finding = judge(head);
+    if (finding) findings.push(bunInlinedConstRelief(finding, judge));
   }
   findings.sort((a, b) => a.key.localeCompare(b.key));
   return { findings, totalComplexity: totals };

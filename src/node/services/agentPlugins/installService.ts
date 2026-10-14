@@ -18,6 +18,7 @@ import { getOwn } from "@/common/utils/getOwn";
 import type {
   AgentPluginInstallPreview,
   AgentPluginComponents,
+  AgentPluginHooks,
   AgentPluginInterfaceSummary,
   AgentPluginListItem,
   AgentPluginManifestSummary,
@@ -97,6 +98,14 @@ import {
   isCanonicalPluginServerKeyPrefix,
   loadPluginMcpServers,
 } from "./mcpConfig";
+import { loadPluginCodexHooks } from "./codexHooks";
+import {
+  readPluginHookTrust,
+  removePluginHookTrust,
+  reviewStateOf,
+  setPluginHookTrust,
+  type PluginHookTrustState,
+} from "./pluginHookTrust";
 import {
   assertNoAgentPluginUrlCredentials,
   isFullCommitSha,
@@ -2023,6 +2032,14 @@ export class AgentPluginInstallService {
     return this.captureResult(() => this.install(args));
   }
 
+  getHooksResult(args: { name: string }) {
+    return this.captureResult(() => this.getHooks(args));
+  }
+
+  setHookTrustResult(args: Parameters<AgentPluginInstallService["setHookTrust"]>[0]) {
+    return this.captureResult(() => this.setHookTrust(args));
+  }
+
   getComponentsResult(args: { name: string }) {
     return this.captureResult(() => this.getComponents(args));
   }
@@ -2088,6 +2105,8 @@ export class AgentPluginInstallService {
         warnings
       );
       const hook = this.collectHook(plugin);
+      const codexHooks = await loadPluginCodexHooks(plugin);
+      warnings.push(...codexHooks.warnings);
       const openaiInterface = await interfaceSummary(plugin, warnings);
       const agents = (await this.collectAgentFiles(plugin.agentsDir)).map((agent) => agent.name);
       const workflows = await this.collectComponentFiles(plugin.workflowsDir, ".js");
@@ -2118,6 +2137,7 @@ export class AgentPluginInstallService {
         skills,
         mcpServers,
         ...(hook !== undefined ? { hook } : {}),
+        codexHooks: codexHooks.hooks,
         agents,
         workflows,
         slashCommands,
@@ -2968,6 +2988,56 @@ export class AgentPluginInstallService {
     };
   }
 
+  /**
+   * The managed plugin's Codex-format hooks (hooks.json) with their trust review state. Read
+   * fresh on each call: the review must show what would run now.
+   */
+  async getHooks(args: { name: string }): Promise<AgentPluginHooks> {
+    const { hooks, warnings } = await this.loadManagedPluginHooks(args.name);
+    const trust = await readPluginHookTrust(this.config.rootDir, this.instanceIdFor(args.name));
+    return {
+      hooks: hooks.map((hook) => ({ ...hook, review: reviewStateOf(trust, hook) })),
+      warnings,
+    };
+  }
+
+  /**
+   * Trust or turn off one hook definition (or clear the decision with `state: null`). The caller
+   * passes the hash it reviewed: if the hook changed since, nothing is recorded, so a trust can
+   * never apply to a definition the user did not see.
+   */
+  async setHookTrust(args: {
+    name: string;
+    key: string;
+    hash: string;
+    state: PluginHookTrustState | null;
+  }): Promise<void> {
+    // Under the plugin mutation lock: an overlapping uninstall (in any process) must not delete
+    // the trust file between this check and the write, which would recreate it.
+    return this.runExclusive(async () => {
+      const { hooks } = await this.loadManagedPluginHooks(args.name);
+      const hook = hooks.find((candidate) => candidate.key === args.key);
+      if (hook?.hash !== args.hash) {
+        throw new Error("This hook changed since you reviewed it. Review it again.");
+      }
+      if (args.state === "trusted" && hook.status !== "runnable") {
+        throw new Error("Xum does not run this hook, so it cannot be trusted.");
+      }
+      await setPluginHookTrust(this.config.rootDir, this.instanceIdFor(args.name), args);
+    });
+  }
+
+  private async loadManagedPluginHooks(name: string) {
+    const entry = (await this.readRegistry("strict")).find((candidate) => candidate.name === name);
+    if (entry === undefined) throw new Error(`No managed plugin named '${name}'.`);
+    const { plugin } = await discoverAgentPluginAt({
+      pluginDir: this.targetPathFor(name),
+      scope: "global",
+    });
+    if (plugin === null) throw new Error(`Plugin '${name}' is not readable.`);
+    return loadPluginCodexHooks(plugin);
+  }
+
   async getComponents(args: { name: string }): Promise<AgentPluginComponents> {
     // Inventory must not hold the writer lock over full-tree hashes and deny
     // live MCP admission. Reuse discovery's journal/epoch bracket to reject
@@ -3351,6 +3421,9 @@ export class AgentPluginInstallService {
         delete commitEnvelope.pendingOverridePrunes;
       }
       try {
+        // Before the commit, so a failure leaves trust cleared (fail closed) rather than kept
+        // for a later install under this name.
+        await removePluginHookTrust(this.config.rootDir, this.instanceIdFor(entry.name));
         await this.writeRegistry(
           commitEnvelope,
           rawRegistry.filter((rawEntry) => this.rawEntryName(rawEntry) !== entry.name)

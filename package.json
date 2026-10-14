@@ -111,7 +111,7 @@
     "express": "^5.1.0",
     "fix-path": "5.0.0",
     "ghostty-web": "^0.4.0-next.7.g03ead6e",
-    "happy-dom": "^20.0.10",
+    "happy-dom": "20.0.11",
     "ignore": "^7.0.5",
     "json-schema-to-typescript": "^15.0.4",
     "jsonc-parser": "^3.3.1",

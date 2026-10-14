@@ -36,6 +36,8 @@ interface RemoteLikeRuntimeOptions {
   throwOnSpawn?: { value: boolean };
   outputProbeFailure?: ProbeFailureControl;
   exitProbeFailure?: ProbeFailureControl;
+  /** Counts the output.log reads (`tail -c` execs) and the bytes they send back. */
+  tailReads?: { calls: number; bytes: number };
 }
 
 /**
@@ -72,6 +74,21 @@ function createRemoteLikeRuntime(base: LocalRuntime, options?: RemoteLikeRuntime
               return base.exec(`exit ${options.exitProbeFailure.exitCode}`, opts);
             }
             throw new Error("SSH exit probe failed");
+          }
+          const tailReads = options?.tailReads;
+          if (tailReads != null && command.includes("tail -c +")) {
+            tailReads.calls += 1;
+            return base.exec(command, opts).then((stream) => ({
+              ...stream,
+              stdout: stream.stdout.pipeThrough(
+                new TransformStream<Uint8Array, Uint8Array>({
+                  transform(chunk, controller) {
+                    tailReads.bytes += chunk.byteLength;
+                    controller.enqueue(chunk);
+                  },
+                })
+              ),
+            }));
           }
           return base.exec(command, opts);
         };
@@ -3524,7 +3541,7 @@ describe("BackgroundProcessManager", () => {
           expect(pages.join("\n")).toBe(expected.join("\n"));
         });
 
-        it("still rewinds over valid text after an invalid byte", async () => {
+        it("keeps memory bounded after an invalid byte", async () => {
           const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
             cwd: process.cwd(),
             displayName: "test",
@@ -3548,7 +3565,7 @@ describe("BackgroundProcessManager", () => {
           expect(pages.join("\n")).toBe(["\uFFFD", ...lines].join("\n"));
         });
 
-        it("keeps a character cut at a read boundary once, with the lines around it", async () => {
+        it("holds a character cut at the end of the log until its second half arrives", async () => {
           const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
             cwd: process.cwd(),
             displayName: "test",
@@ -3556,21 +3573,298 @@ describe("BackgroundProcessManager", () => {
           expect(result.success).toBe(true);
           if (!result.success) return;
           const outputPath = path.join(result.outputDir, "output.log");
+          // Many pages, so the reads go through the window before they reach the cut.
           const lines = Array.from({ length: 4_000 }, (_, i) => `line ${i} ${"z".repeat(50)}`);
-          // The first read ends inside "é" (0xC3 0xA9): its two halves decode separately.
+          // The log ends inside "é" (0xC3 0xA9) while the process runs: the read that reaches
+          // the end holds the first half back until the second one arrives.
           const head = Buffer.concat([
             Buffer.from(`${lines.join("\n")}\ncut-`),
             Buffer.from([0xc3]),
           ]);
           await fs.appendFile(outputPath, head);
-          const first = await manager.getOutput(result.processId, undefined, undefined, 0);
-          expect(first.success).toBe(true);
+          const first = await readEverything(result.processId, head.length);
+          expect(first.length).toBeGreaterThan(4);
           const tail = Buffer.concat([Buffer.from([0xa9]), Buffer.from("-end\nafter\n")]);
           await fs.appendFile(outputPath, tail);
 
           const rest = await readEverything(result.processId, head.length + tail.length);
-          const all = [first.success ? first.output : "", ...rest].join("\n");
-          expect(all).toBe([...lines, "cut-\uFFFD\uFFFD-end", "after"].join("\n"));
+          const all = [...first, ...rest].join("\n");
+          expect(all).toBe([...lines, "cut-é-end", "after"].join("\n"));
+        });
+      });
+
+      // Reads every page and joins them as the notes say: a capped read whose next part
+      // continues the current line joins directly, every other read ends a line.
+      async function drainAndRebuild(processId: string, filter?: string, exclude?: boolean) {
+        let text = "";
+        const notes: Array<string | undefined> = [];
+        for (let attempt = 0; attempt < 1_000; attempt++) {
+          const read = await manager.getOutput(processId, filter, exclude, 0);
+          if (!read.success) throw new Error(read.error);
+          expect(Buffer.byteLength(read.output, "utf8")).toBeLessThanOrEqual(BASH_MAX_TOTAL_BYTES);
+          notes.push(read.note);
+          text += read.output;
+          if (!read.note?.includes("continues the current line")) text += "\n";
+          // At most the read window of raw bytes stays in memory (decoded: no more UTF-16 units).
+          const retained = (await manager.getProcess(processId))?.incompleteLineBuffer ?? "";
+          expect(retained.length).toBeLessThanOrEqual(4 * BASH_MAX_TOTAL_BYTES + 3);
+          if (read.note?.includes("more bytes are unread")) continue;
+          // Paging is not polling: the last read gets no polling advice.
+          expect(read.note ?? "").not.toMatch(/polling/i);
+          return { text, notes };
+        }
+        throw new Error("output never drained");
+      }
+
+      it("says whether the next part continues the current line", async () => {
+        const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
+          cwd: process.cwd(),
+          displayName: "test",
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        // JSONL with a record over the cap: the pages must rebuild every record.
+        const records = Array.from({ length: 400 }, (_, i) => ({
+          i,
+          s: "z".repeat(i === 7 ? BASH_MAX_TOTAL_BYTES * 2 : 60),
+        }));
+        const jsonl = `${records.map((r) => JSON.stringify(r)).join("\n")}\n`;
+        await fs.appendFile(path.join(result.outputDir, "output.log"), jsonl);
+
+        const { text } = await drainAndRebuild(result.processId);
+        expect(text).toBe(jsonl);
+      });
+
+      describe("bounded log reads", () => {
+        // A log of lines that cut multi-byte characters at many read edges, with invalid bytes, a
+        // truncated sequence, lines that start with a byte-order mark, empty lines, a line over
+        // one page and a line longer than the read window.
+        function mixedLog(targetBytes: number): Buffer {
+          const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+          const lines: Buffer[] = [];
+          let size = 0;
+          for (let i = 0; size < targetBytes; i++) {
+            const line = [
+              Buffer.from(`{"i":${i},"s":"${"é€😀".repeat(i % 40)}"}`),
+              Buffer.concat([
+                Buffer.from(`${i} bad `),
+                Buffer.from([0xff, 0xe2, 0x82]),
+                Buffer.from("x"),
+              ]),
+              Buffer.concat([bom, Buffer.from(`bom ${i} ${"€".repeat(i % 9)}`)]),
+              Buffer.from(""),
+              Buffer.from(i % 50 === 4 ? "😀".repeat(BASH_MAX_TOTAL_BYTES / 2 + i) : `${i}`),
+              Buffer.from(i === 5 ? `${"é".repeat(BASH_MAX_TOTAL_BYTES * 3)}` : "short"),
+            ][i % 6];
+            lines.push(line, Buffer.from("\n"));
+            size += line.length + 1;
+          }
+          return Buffer.concat(lines);
+        }
+
+        // The maxBytes of each handle read the manager makes, from now on.
+        async function recordHandleReads(processId: string): Promise<Array<number | undefined>> {
+          const proc = await manager.getProcess(processId);
+          if (proc == null) throw new Error("process missing");
+          const limits: Array<number | undefined> = [];
+          const realReadOutput = proc.handle.readOutput.bind(proc.handle);
+          spyOn(proc.handle, "readOutput").mockImplementation((offset, maxBytes) => {
+            limits.push(maxBytes);
+            return realReadOutput(offset, maxBytes);
+          });
+          return limits;
+        }
+
+        async function spawnWithLog(raw: Buffer | string, runtimeToUse: Runtime = runtime) {
+          const result = await manager.spawn(runtimeToUse, testWorkspaceId, "sleep 60", {
+            cwd: process.cwd(),
+            displayName: "test",
+          });
+          if (!result.success) throw new Error(result.error);
+          const outputPath = path.join(result.outputDir, "output.log");
+          await fs.appendFile(outputPath, raw);
+          return { processId: result.processId, outputPath };
+        }
+
+        const decode = (raw: Buffer) => new TextDecoder("utf-8", { ignoreBOM: true }).decode(raw);
+        const FILTERED_SCAN_CHUNK_BYTES = 1024 * 1024;
+        const headNote = "was filtered on its first";
+
+        it("reads a large log one page at a time, and its pages rebuild it exactly", async () => {
+          const raw = mixedLog(2 * 1024 * 1024);
+          const { processId } = await spawnWithLog(raw);
+          const limits = await recordHandleReads(processId);
+
+          expect((await drainAndRebuild(processId)).text).toBe(decode(raw));
+          // Every read is bounded by one page: reading to the end of the file each time read the
+          // log about 64 times.
+          expect(limits.length).toBeGreaterThan(raw.length / BASH_MAX_TOTAL_BYTES);
+          for (const limit of limits) {
+            expect(limit).toBeDefined();
+            expect(limit).toBeLessThanOrEqual(BASH_MAX_TOTAL_BYTES);
+          }
+        });
+
+        it("reads a large remote log once, and its pages rebuild it exactly", async () => {
+          const tailReads = { calls: 0, bytes: 0 };
+          const remote = createRemoteLikeRuntime(new LocalRuntime(process.cwd()), { tailReads });
+          const raw = mixedLog(512 * 1024);
+          const { processId } = await spawnWithLog(raw, remote);
+
+          expect((await drainAndRebuild(processId)).text).toBe(decode(raw));
+          // What tail sent back: each byte about once (plus a few to finish a character per read).
+          expect(tailReads.bytes).toBeGreaterThanOrEqual(raw.length);
+          expect(tailReads.bytes).toBeLessThan(raw.length * 1.05);
+        });
+
+        // A line longer than the read window is decided on its head, and its tail, which
+        // matches differently, follows that decision; the note says so. A line that fits in the
+        // window is decided whole, though it spans pages. The other lines go past many page edges.
+        it.each([
+          { name: "filter", filter: "^M|keep", exclude: false },
+          { name: "filter_exclude", filter: "^D|drop", exclude: true },
+        ])("keeps each line's $name decision across read windows", async (testCase) => {
+          const kept = `M${"x".repeat(BASH_MAX_TOTAL_BYTES * 5)}`;
+          const dropped = `D${"x".repeat(BASH_MAX_TOTAL_BYTES * 5)}keep`;
+          const keptWhole = `${"w".repeat(BASH_MAX_TOTAL_BYTES * 2)} keep`;
+          const droppedWhole = `${"w".repeat(BASH_MAX_TOTAL_BYTES * 2)} drop`;
+          const lines: string[] = [];
+          for (let i = 0; i < 3_000; i++)
+            lines.push(`keep ${i} ${"y".repeat(i % 90)}`, `drop ${i}`);
+          lines.splice(1_000, 0, kept);
+          // After dropped lines, so the window holds little else when each one starts.
+          const dropRun = Array.from({ length: 500 }, () => "drop run");
+          lines.splice(2_000, 0, ...dropRun, keptWhole, ...dropRun, droppedWhole);
+          lines.splice(3_000, 0, dropped);
+          const { processId } = await spawnWithLog(`${lines.join("\n")}\n`);
+          const limits = await recordHandleReads(processId);
+
+          const { text, notes } = await drainAndRebuild(
+            processId,
+            testCase.filter,
+            testCase.exclude
+          );
+          const expected = lines.filter(
+            (line) => line.startsWith("keep") || line === kept || line === keptWhole
+          );
+          expect(text).toBe(`${expected.join("\n")}\n`);
+          // The two lines over the window, each named once in the read that decided it.
+          expect(notes.filter((note) => note?.includes(headNote))).toHaveLength(2);
+          for (const limit of limits) expect(limit).toBeLessThanOrEqual(FILTERED_SCAN_CHUNK_BYTES);
+        });
+
+        // A sparse filter over a remote log far larger than the window: one call scans it all
+        // in a few large reads, instead of returning one empty window per call.
+        it("scans a large remote log for a sparse filter in one call", async () => {
+          const tailReads = { calls: 0, bytes: 0 };
+          const remote = createRemoteLikeRuntime(new LocalRuntime(process.cwd()), { tailReads });
+          const lines = Array.from({ length: 80_000 }, (_, i) =>
+            i % 4_000 === 0 ? `MATCH ${i}` : `noise ${i} ${"n".repeat(40)}`
+          );
+          const raw = Buffer.from(`${lines.join("\n")}\n`);
+          expect(raw.length).toBeGreaterThan(60 * 4 * BASH_MAX_TOTAL_BYTES);
+          const { processId } = await spawnWithLog(raw, remote);
+
+          const read = await manager.getOutput(processId, "^MATCH", false, 0);
+          if (!read.success) throw new Error(read.error);
+          expect(read.output).toBe(lines.filter((line) => line.startsWith("MATCH")).join("\n"));
+          expect(read.note ?? "").not.toContain("more bytes are unread");
+          // Chunks double from one page to 1 MB: about 10 reads for 4 MB, not about 250 pages.
+          expect(tailReads.calls).toBeLessThanOrEqual(12);
+          // Each byte once, plus at most 3 per read to finish a character.
+          expect(tailReads.bytes).toBeGreaterThanOrEqual(raw.length);
+          expect(tailReads.bytes).toBeLessThanOrEqual(raw.length + 3 * tailReads.calls);
+        });
+
+        // Blank lines are kept by filter_exclude: while it waits for a line that is not blank,
+        // they stay in the window and come back with that line, as when a read held the whole log.
+        it("returns the blank lines filter_exclude keeps while it waits", async () => {
+          const drops = Array.from({ length: 6_000 }, (_, i) => `drop ${i} ${"d".repeat(20)}`);
+          const { processId, outputPath } = await spawnWithLog([...drops, "", "", ""].join("\n"));
+          const proc = await manager.getProcess(processId);
+          if (proc == null) throw new Error("process missing");
+          const realReadOutput = proc.handle.readOutput.bind(proc.handle);
+          let appended = false;
+          spyOn(proc.handle, "readOutput").mockImplementation(async (offset, maxBytes) => {
+            // The first read at the end of the log (the wait's next poll) finds the kept line.
+            if (!appended && offset >= (await fs.stat(outputPath)).size) {
+              appended = true;
+              await fs.appendFile(outputPath, "keep\n");
+            }
+            return realReadOutput(offset, maxBytes);
+          });
+
+          const read = await manager.getOutput(processId, "^drop", true, 5);
+          expect(appended).toBe(true);
+          expect(read.success && read.output).toBe("\n\nkeep");
+        });
+
+        // A split line's decision belongs to the filter that made it: an unfiltered read after
+        // a filtered one returns the tail of a line that filter dropped.
+        it("does not carry a split line's decision over to another filter", async () => {
+          const head = `D${"x".repeat(BASH_MAX_TOTAL_BYTES * 6)}`;
+          const { processId, outputPath } = await spawnWithLog(head);
+          const filtered = await manager.getOutput(processId, "^ok", false, 0);
+          expect(filtered.success && filtered.output).toBe("");
+          expect(filtered.success && filtered.note).toContain(headNote);
+          await fs.appendFile(outputPath, "TAIL\nok\n");
+
+          const { text } = await drainAndRebuild(processId);
+          expect(text).toEndWith("xTAIL\nok\n");
+        });
+
+        // A bounded read holds back a character the process may still be writing. Output that
+        // really ends in a truncated character must still settle once the process has exited.
+        it.each([
+          { name: "unfiltered", filter: undefined },
+          { name: "filtered", filter: "^a" },
+        ])("settles $name reads of output that end in a truncated character", async (testCase) => {
+          const result = await manager.spawn(runtime, testWorkspaceId, "printf 'ab\\342\\202'", {
+            cwd: process.cwd(),
+            displayName: "test",
+          });
+          if (!result.success) throw new Error(result.error);
+          for (let attempt = 0; attempt < 100; attempt++) {
+            if ((await manager.getProcess(result.processId))?.status !== "running") break;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+
+          const read = await manager.getOutput(result.processId, testCase.filter, false, 0);
+          if (!read.success) throw new Error(read.error);
+          expect(read.status).toBe("exited");
+          expect(read.output).toBe("ab\uFFFD");
+          expect(read.note ?? "").not.toContain("more bytes are unread");
+          const proc = await manager.getProcess(result.processId);
+          expect(proc?.outputBytesRead).toBe(4);
+        });
+
+        // A filtered call scans to the file size its first read saw; output that arrives
+        // meanwhile is left for the next call, so a fast writer cannot keep one call scanning.
+        it("leaves output that arrives during a filtered scan for the next call", async () => {
+          const lines = Array.from({ length: 30_000 }, (_, i) =>
+            i % 1_000 === 0 ? `keep ${i}` : `drop ${i} ${"d".repeat(30)}`
+          );
+          const { processId, outputPath } = await spawnWithLog(`${lines.join("\n")}\n`);
+          const proc = await manager.getProcess(processId);
+          if (proc == null) throw new Error("process missing");
+          const realReadOutput = proc.handle.readOutput.bind(proc.handle);
+          let appended = 0;
+          let growing = true;
+          spyOn(proc.handle, "readOutput").mockImplementation(async (offset, maxBytes) => {
+            const read = await realReadOutput(offset, maxBytes);
+            if (growing) await fs.appendFile(outputPath, `keep late ${appended++}\n`);
+            return read;
+          });
+
+          const first = await manager.getOutput(processId, "^keep", false, 0);
+          growing = false;
+          if (!first.success) throw new Error(first.error);
+          expect(appended).toBeGreaterThan(1);
+          expect(first.output).toBe(lines.filter((line) => line.startsWith("keep")).join("\n"));
+          expect(first.note).toContain("more bytes are unread");
+          const { text } = await drainAndRebuild(processId, "^keep", false);
+          const late = Array.from({ length: appended }, (_, i) => `keep late ${i}`);
+          expect(text).toBe(`${late.join("\n")}\n`);
         });
       });
 
@@ -4244,7 +4538,7 @@ describe("BackgroundProcessManager", () => {
         dispose: () => Promise.resolve(),
         writeMeta: () => Promise.resolve(),
         getOutputFileSize: () => Promise.resolve(0),
-        readOutput: () => Promise.resolve({ content: "", newOffset: 0 }),
+        readOutput: () => Promise.resolve({ content: "", newOffset: 0, fileSize: 0 }),
       };
       manager.registerMigratedProcess(
         stubHandle,

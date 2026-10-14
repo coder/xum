@@ -26,6 +26,7 @@ import {
   type PluginsSectionIntent,
 } from "@/browser/features/Settings/Sections/pluginsSectionIntents";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { MCP_APP_ENTRYPOINT_NOT_CONNECTED } from "@/browser/features/RightSidebar/AppViewTab/openMcpAppEntrypoint";
 import { CommandIds } from "@/browser/utils/commandIds";
 import type { OpenLocalServerResult, RemoteConnectionApi } from "@/common/types/remoteConnection";
 
@@ -2001,6 +2002,31 @@ test("plugin component action only targets present managed installs without muta
   }
 });
 
+test("plugin hook review action opens the hooks panel of a present managed install", async () => {
+  const openSettings = mock(() => undefined);
+  const plugin = (name: string, present: boolean) => ({
+    name,
+    location: `/plugins/${name}`,
+    managed: true,
+    present,
+    skillCount: 0,
+    mcpServerCount: 0,
+  });
+  const api = createMockORPCClient({
+    agentPlugins: { items: [plugin("managed", true), plugin("missing", false)] },
+  });
+  const action = mk({ api, onOpenSettings: openSettings })
+    .flatMap((source) => source())
+    .find((action) => action.id === CommandIds.pluginsReviewHooks());
+  const field = action?.prompt?.fields[0];
+  if (field?.type !== "select" || !action?.prompt) throw new Error("Expected hook review picker");
+  expect((await field.getOptions({})).map((option) => option.id)).toEqual(["managed"]);
+  consumePendingPluginsSectionIntent();
+  await action.prompt.onSubmit({ pluginName: "managed" });
+  expect(consumePendingPluginsSectionIntent()).toEqual({ type: "review-hooks", name: "managed" });
+  expect(openSettings).toHaveBeenCalledWith("plugins");
+});
+
 describe("Open Server Window palette action", () => {
   const makeBridge = (result: OpenLocalServerResult) =>
     ({
@@ -2480,4 +2506,136 @@ test("two plugin installs with one server name keep their instance markers apart
     "tray (plugin fedcba98)",
     "solo",
   ]);
+});
+
+test("an MCP App entry point's palette entry shows its server label and opens it once", async () => {
+  const entrypoint = {
+    serverName: "plugin:0123456789abcdef:tray",
+    serverLabel: "bits-and-bolts · tray",
+    toolName: "cad.tray",
+    title: "Parts Tray",
+    resourceUri: "ui://tray/view",
+    type: "global" as const,
+    viewKey: "entrypoint:plugin:0123456789abcdef:tray:cad.tray:global",
+  };
+  const opened: unknown[] = [];
+  const actions = getActions({
+    artifactsEnabled: true,
+    mcpAppEntrypoints: [entrypoint],
+    api: createTestApiClient({
+      mcpApps: {
+        openEntrypoint: (input: unknown) => {
+          opened.push(input);
+          return Promise.resolve({ success: true as const, data: entrypoint });
+        },
+      },
+    }),
+  });
+  const entry = actions.find((a) => a.id === CommandIds.navOpenAppEntrypoint(entrypoint.viewKey));
+  // The label, never the internal plugin key; the key stays searchable.
+  expect([entry?.title, entry?.subtitle]).toEqual([
+    "Open Plugin View: Parts Tray",
+    entrypoint.serverLabel,
+  ]);
+  expect(entry?.keywords).toContain(entrypoint.serverName);
+  // Opening dispatches OPEN_MCP_APP_VIEW on window (the "Open in tab" path).
+  const testWindow = new GlobalWindow();
+  const originalWindow = globalThis.window;
+  globalThis.window = testWindow as unknown as Window & typeof globalThis;
+  const shown: unknown[] = [];
+  testWindow.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, (event) =>
+    shown.push((event as unknown as CustomEvent<{ toolCallId: string }>).detail.toolCallId)
+  );
+  try {
+    await entry?.run();
+  } finally {
+    globalThis.window = originalWindow;
+    testWindow.close();
+  }
+  expect(shown).toEqual([entrypoint.viewKey]);
+  expect(opened).toMatchObject([
+    { serverName: entrypoint.serverName, toolName: "cad.tray", type: "global" },
+  ]);
+});
+
+test("a failed entry point open from the palette shows its error in a toast", async () => {
+  const entrypoint = {
+    serverName: "cad",
+    serverLabel: "cad",
+    toolName: "cad.tray",
+    title: "Parts Tray",
+    resourceUri: "ui://tray/view",
+    type: "global" as const,
+    viewKey: "entrypoint:cad:cad.tray:global",
+  };
+  const actions = getActions({
+    artifactsEnabled: true,
+    mcpAppEntrypoints: [entrypoint],
+    api: createTestApiClient({
+      mcpApps: {
+        openEntrypoint: () =>
+          Promise.resolve({ success: false as const, error: "Too many entry point opens" }),
+      },
+    }),
+  });
+  const entry = actions.find((a) => a.id === CommandIds.navOpenAppEntrypoint(entrypoint.viewKey));
+  await withTestWindow(async () => {
+    const events = collectCommandEvents();
+    try {
+      await entry?.run();
+      expect(events.receivedToasts).toEqual([
+        { type: "error", message: "Too many entry point opens" },
+      ]);
+    } finally {
+      events.dispose();
+    }
+  });
+});
+
+test("an entry point picked from the palette while disconnected says so in a toast", async () => {
+  const entrypoint = {
+    serverName: "cad",
+    serverLabel: "cad",
+    toolName: "cad.tray",
+    title: "Parts Tray",
+    resourceUri: "ui://tray/view",
+    type: "global" as const,
+    viewKey: "entrypoint:cad:cad.tray:global",
+  };
+  const actions = getActions({
+    artifactsEnabled: true,
+    mcpAppEntrypoints: [entrypoint],
+    api: null,
+  });
+  const entry = actions.find((a) => a.id === CommandIds.navOpenAppEntrypoint(entrypoint.viewKey));
+  await withTestWindow(async () => {
+    const events = collectCommandEvents();
+    try {
+      await entry?.run();
+      expect(events.receivedToasts).toEqual([
+        { type: "error", message: MCP_APP_ENTRYPOINT_NOT_CONNECTED },
+      ]);
+    } finally {
+      events.dispose();
+    }
+  });
+});
+
+test("a tool's global and thread entry points get palette commands that read differently", () => {
+  const entrypoint = (type: "global" | "thread") => ({
+    serverName: "cad",
+    serverLabel: "cad",
+    toolName: "cad.board",
+    title: "Board",
+    resourceUri: "ui://cad/board",
+    type,
+    viewKey: `entrypoint:cad:cad.board:${type}`,
+  });
+  const entrypoints = [entrypoint("global"), entrypoint("thread")];
+  const actions = getActions({ artifactsEnabled: true, mcpAppEntrypoints: entrypoints });
+  const shown = entrypoints.map((e) => {
+    const action = actions.find((a) => a.id === CommandIds.navOpenAppEntrypoint(e.viewKey));
+    return [action?.title, action?.subtitle].join(" ");
+  });
+  expect(shown[0]).not.toBe(shown[1]);
 });

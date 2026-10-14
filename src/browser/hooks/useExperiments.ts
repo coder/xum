@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from "react";
 import type { ExperimentId } from "@/common/constants/experiments";
-import { useAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 
 /** The backend value of one experiment from the AppConfigStore snapshot (off until it loads). */
@@ -17,12 +17,12 @@ export function useExperiment(
   experimentId: ExperimentId
 ): [boolean, (enabled: boolean) => Promise<void>] {
   const enabled = useExperimentValue(experimentId);
-  const { api } = useAPI();
+  const liveApi = useLiveAPI();
   // No optimistic state: the toggle shows the snapshot refetched after the backend write. Do not
   // rely on onConfigChanged alone: a dropped subscription never delivers it.
   const setEnabled = async (value: boolean) => {
-    if (!api) throw new Error("Not connected to the backend");
-    await api.experiments.set({ experimentId, enabled: value });
+    if (!liveApi) throw new Error("Not connected to the backend");
+    await liveApi.experiments.set({ experimentId, enabled: value });
     await getAppConfigStore().refresh();
   };
   return [enabled, setEnabled];

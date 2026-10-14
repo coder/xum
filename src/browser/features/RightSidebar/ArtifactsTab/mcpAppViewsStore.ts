@@ -9,6 +9,7 @@ import { mcpServerConsentName, mcpServerDisplayName } from "@/common/utils/mcp/p
 import { MCP_APP_VIEW_RECORDS_MAX_IDS } from "@/common/utils/mcpApps";
 import { getNestedToolStatus } from "@/browser/features/Tools/Shared/toolStatus";
 import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
+import { mcpAppEntrypointViewOf, useMcpAppEntrypointView } from "../AppViewTab/mcpAppEntrypoints";
 
 /**
  * MCP Apps views (artifacts experiment), per workspace, for app tabs and the command palette:
@@ -20,6 +21,9 @@ import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
 export interface McpAppViewRef {
   toolCallId: string;
   serverName: string;
+  /** What the tab shows for the server when it differs from serverName's display form (an
+   * entry point's "<plugin> · <server>"); serverName itself can be an internal plugin key. */
+  serverLabel?: string;
   resourceUri: string;
   toolName: string;
   /** Tool title (or name) shown in the tab label. */
@@ -272,11 +276,25 @@ function lookUpViewRecord(api: APIClient, workspaceId: string, toolCallId: strin
   queuedLookups.set(workspaceId, queued);
 }
 
+/**
+ * A tab mounts before App's entry point loader marks its workspace as listing (child effects run
+ * first): a key that turned out to be an entry point (or may be one, while the list is pending)
+ * is not a tool call, so it is not looked up. It is asked again if a settled list lacks it.
+ */
+function withoutEntrypointKeys(workspaceId: string, toolCallIds: Iterable<string>): string[] {
+  return [...toolCallIds].filter((id) => {
+    if (mcpAppEntrypointViewOf(workspaceId, id) === undefined) return true;
+    recordLookups.delete(lookupKey(workspaceId, id));
+    emit();
+    return false;
+  });
+}
+
 function flushViewRecordLookups() {
   const batches = [...queuedLookups];
   queuedLookups.clear();
   for (const [workspaceId, { api, toolCallIds }] of batches) {
-    const ids = [...toolCallIds];
+    const ids = withoutEntrypointKeys(workspaceId, toolCallIds);
     for (let i = 0; i < ids.length; i += MCP_APP_VIEW_RECORDS_MAX_IDS) {
       requestViewRecords(api, workspaceId, ids.slice(i, i + MCP_APP_VIEW_RECORDS_MAX_IDS));
     }
@@ -350,16 +368,25 @@ export function useMcpAppView(
       store.getWorkspaceState(workspaceId).loading ||
       store.getWorkspaceState(workspaceId).isHydratingTranscript
   );
-  const view = views.find((v) => v.toolCallId === toolCallId) ?? null;
+  // An entry point's view has no transcript row: only the current entry point list resolves it
+  // (so its tab remounts after a reload, and goes unavailable once its server is disabled),
+  // never the session list or a stored record. Undefined: the key is not an entry point.
+  const entrypoint = useMcpAppEntrypointView(workspaceId, toolCallId);
+  const view =
+    entrypoint === undefined || entrypoint === "loading"
+      ? (views.find((v) => v.toolCallId === toolCallId) ?? null)
+      : entrypoint;
   const lookup = useSyncExternalStore(subscribe, () =>
     recordLookups.get(lookupKey(workspaceId, toolCallId))
   );
-  const lookUp = view === null && !loading && toolCallId !== "" && api != null;
+  const lookUp = view === null && entrypoint === undefined && !loading && toolCallId !== "";
   // Fetching from the backend is an external side effect, so an effect, not render.
   useEffect(() => {
-    if (lookUp) lookUpViewRecord(api, workspaceId, toolCallId);
+    if (lookUp && api != null) lookUpViewRecord(api, workspaceId, toolCallId);
   }, [lookUp, api, workspaceId, toolCallId]);
   if (view !== null) return view;
+  // Retired (null) or still being listed ("loading").
+  if (entrypoint !== undefined) return entrypoint;
   // A failed lookup shows as unavailable until it is retried.
   return loading || (lookUp && lookup !== "missing" && lookup !== "failed") ? "loading" : null;
 }
@@ -374,8 +401,16 @@ export function openMcpAppViewTab(workspaceId: string, view: McpAppViewRef) {
   const current = getMcpAppViews(workspaceId).filter((v) => v.toolCallId !== view.toolCallId);
   viewsByWorkspace.set(workspaceId, [view, ...current]);
   emit();
+  focusMcpAppViewTab(workspaceId, view.toolCallId);
+}
+
+/**
+ * Open or focus a tab whose view resolves without the session list (an entry point's resolves
+ * from the entry point list only, so it must not linger in the session list).
+ */
+export function focusMcpAppViewTab(workspaceId: string, toolCallId: string) {
   window.dispatchEvent(
-    createCustomEvent(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, { workspaceId, toolCallId: view.toolCallId })
+    createCustomEvent(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, { workspaceId, toolCallId })
   );
 }
 

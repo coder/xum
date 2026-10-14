@@ -374,6 +374,12 @@ export interface StreamMessageOptions {
    */
   compactionInputBudgetScale?: number;
   /**
+   * Compaction requests only: AgentSession still holds the one context_exceeded retry of this
+   * request (resolveCompactionRetryPlan). Without it, a model that could switch to 1M context is
+   * trimmed on this attempt too, since nothing would retry it at 1M.
+   */
+  compactionContextRetryAvailable?: boolean;
+  /**
    * Model floor already resolved by AgentSession (config.json
    * minThinkingLevelByModel → resolveMinimumThinkingLevel). Passed down so
    * mid-turn overrides clamp against the same floor as the send-time level;
@@ -470,17 +476,19 @@ function pinCoderInstanceRawProvidersConfig(
  * SUMMARIZER_INPUT_FRACTION of the model's effective window, the share continuous compaction's
  * summarizer uses, so the system prompt and the summary fit beside it. Per attempt, because a
  * fallback model has its own window. Undefined, so nothing is trimmed, when the window is
- * unknown, or when the model can still switch to 1M context: its context_exceeded retry does
- * that and trims to the 1M window, which keeps more history than a trim to 200k would.
+ * unknown, or when the model can still switch to 1M context and a retry is left
+ * (`contextRetryAvailable`): its context_exceeded retry does that and trims to the 1M window,
+ * which keeps more history than a trim to 200k would.
  */
 export function resolveCompactionInputBudgetTokens(
   modelString: string,
   providerOptions: MuxProviderOptions | undefined,
   providersConfig: ProvidersConfigMap | null | undefined,
-  scale = 1
+  scale = 1,
+  contextRetryAvailable = true
 ): number | undefined {
   assert(scale > 0 && scale <= 1, "compaction input budget scale must be in (0, 1]");
-  if (canSwitchToAnthropic1MContext(modelString, providerOptions, providersConfig)) {
+  if (retriesAt1MContext(modelString, providerOptions, providersConfig, contextRetryAvailable)) {
     return undefined;
   }
   const limit = getEffectiveContextLimit(
@@ -490,6 +498,19 @@ export function resolveCompactionInputBudgetTokens(
     { openaiWireFormat: providerOptions?.openai?.wireFormat }
   );
   return limit == null ? undefined : Math.floor(limit * SUMMARIZER_INPUT_FRACTION * scale);
+}
+
+/** The context_exceeded retry will switch this model to 1M context (see above). */
+function retriesAt1MContext(
+  modelString: string,
+  providerOptions: MuxProviderOptions | undefined,
+  providersConfig: ProvidersConfigMap | null | undefined,
+  contextRetryAvailable: boolean
+): boolean {
+  return (
+    contextRetryAvailable &&
+    canSwitchToAnthropic1MContext(modelString, providerOptions, providersConfig)
+  );
 }
 
 /**
@@ -506,7 +527,8 @@ async function compactionInputBudgetOption(
     providersConfig: ProvidersConfigMap | null | undefined;
   },
   history: MuxMessage[],
-  scale: number | undefined
+  scale: number | undefined,
+  contextRetryAvailable: boolean
 ): Promise<{ compactionInputBudgetTokens?: number }> {
   if (!isCompactionRequest) return {};
   const budget =
@@ -514,7 +536,8 @@ async function compactionInputBudgetOption(
       model.modelString,
       model.providerOptions,
       model.providersConfig,
-      scale
+      scale,
+      contextRetryAvailable
     ) ?? (scale == null ? undefined : await retryBudgetFromHistory(history, model, scale));
   return budget == null ? {} : { compactionInputBudgetTokens: budget };
 }
@@ -808,6 +831,58 @@ export class TurnRequestBuilder {
       modelString: canonical,
       coderDerived: false,
     };
+  }
+
+  /**
+   * Start this workspace's MCP servers exactly as a send's request build does (same inputs to
+   * MCPServerManager.getToolsForWorkspace), so the same servers start and no others. Codex plugin
+   * hooks on UserPromptSubmit run before request building and need their plugin's server, which
+   * after a restart is not running yet. Returns false when the workspace is not ready for MCP
+   * (init failed, unsanitized checkout, runtime not ready, no MCP manager) or is a side chat.
+   */
+  async startWorkspaceMcpServers(workspaceId: string, signal: AbortSignal): Promise<boolean> {
+    const mcpServerManager = this.dependencies.bindings.mcpServerManager;
+    if (mcpServerManager === undefined) return false;
+    const metadataResult = await this.dependencies.getWorkspaceMetadata(workspaceId);
+    if (!metadataResult.success) return false;
+    const metadata = metadataResult.data;
+    // Like request building: a side chat never starts MCP servers (its local-read-only ceiling),
+    // so its prompt hooks fail open instead of reaching a possibly mutating MCP tool.
+    if (sideChatCapabilityGrants(metadata) != null) return false;
+    const runtimeContext = this.dependencies.createWorkspaceRuntimeContext(workspaceId, metadata);
+    if (!runtimeContext.success) return false;
+    const { runtime, workspacePath, hostCheckoutRoot } = runtimeContext.data;
+    await this.dependencies.initStateManager.waitForInit(workspaceId, signal);
+    if (this.dependencies.initStateManager.getUnsanitizedCheckoutError(workspaceId)) return false;
+    const ready = await runtime.ensureReady({ signal });
+    if (!ready.ready || signal.aborted) return false;
+    const readStartedAt = Date.now();
+    const read = await this.dependencies.workspaceMcpOverridesService
+      .getOverridesForWorkspace(workspaceId, { timeoutMs: MCP_OVERRIDES_READ_TIMEOUT_MS, signal })
+      .catch(() => ({ overrides: undefined, authoritative: false }));
+    const projectSecrets = isMultiProject(metadata)
+      ? mergeMultiProjectSecrets(metadata, this.dependencies.secretsStore)
+      : this.dependencies.secretsStore.getEffectiveSecrets(metadata.projectPath);
+    await mcpServerManager.getToolsForWorkspace(
+      {
+        workspaceId,
+        projectPath: metadata.projectPath,
+        runtime,
+        workspacePath,
+        trusted: isWorkspaceProjectTrusted(this.dependencies.config, metadata),
+        overrides: read.overrides,
+        overridesAuthoritative: read.authoritative,
+        ...(read.authoritative
+          ? {}
+          : { overridesReadDeadlineAt: readStartedAt + MCP_OVERRIDES_READ_TIMEOUT_MS }),
+        projectSecrets: await secretsToRecord(projectSecrets),
+        agentPlugins: hostCheckoutRoot
+          ? resolveAgentPluginsMcpContext(metadata, hostCheckoutRoot)
+          : null,
+      },
+      { signal }
+    );
+    return true;
   }
 
   prepareModelAttempt(options: PrepareModelAttemptOptions): PreparedModelAttempt {
@@ -1116,6 +1191,7 @@ export class TurnRequestBuilder {
       requestAssemblySnapshot,
       openaiTruncationModeOverride,
       compactionInputBudgetScale,
+      compactionContextRetryAvailable,
       muxMetadata,
       minThinkingLevel: providedMinThinkingLevel,
     } = opts;
@@ -1831,6 +1907,7 @@ export class TurnRequestBuilder {
         metadata,
         hostCheckoutRoot,
         journal: this.dependencies.durableEventJournalFor(workspaceId),
+        mcpServerManager: this.dependencies.bindings.mcpServerManager,
       });
     }
 
@@ -3012,7 +3089,8 @@ export class TurnRequestBuilder {
             providersConfig: seed.providersConfig,
           },
           attemptProviderRequestMessages,
-          compactionInputBudgetScale
+          compactionInputBudgetScale,
+          compactionContextRetryAvailable === true
         );
         // Shared by the initial build and thinking rebuilds so their assembly
         // inputs cannot drift apart mid-turn. `measureOnly` assembles a candidate history and
@@ -3403,6 +3481,11 @@ export class TurnRequestBuilder {
       const toolsForStream = primaryRequest.engineTools;
 
       const devToolsService = this.dependencies.devToolsService;
+      // Queues this turn's run metadata with a request's compaction budget: the primary's
+      // below, each refusal fallback's own one (another window) in modelFallback.prepare, so
+      // replay rebuilds the request each run sent.
+      let queueRunMetadata: (compactionInputBudgetTokens: number | undefined) => void = () =>
+        undefined;
       const canQueueDevToolsRunMetadata =
         devToolsService?.enabled === true &&
         typeof modelResult.data.model !== "string" &&
@@ -3414,7 +3497,8 @@ export class TurnRequestBuilder {
         // when middleware is guaranteed to run (LanguageModelV3).
         pendingRunMetadataId = String(streamToken);
         context.startupState.pendingRunMetadataId = pendingRunMetadataId;
-        devToolsService.setPendingRunMetadata(workspaceId, pendingRunMetadataId, {
+        const metadataId = pendingRunMetadataId;
+        const runMetadata = {
           toolPolicy:
             effectiveToolPolicy != null && effectiveToolPolicy.length > 0
               ? effectiveToolPolicy
@@ -3426,9 +3510,14 @@ export class TurnRequestBuilder {
           ...(promptCacheScope.contextEpoch != null
             ? { contextEpoch: promptCacheScope.contextEpoch }
             : {}),
-          // Undefined unless this is a budgeted compaction request (JSON drops the key).
-          compactionInputBudgetTokens: primaryRequest.compactionInputBudgetTokens,
-        });
+        };
+        queueRunMetadata = (compactionInputBudgetTokens) =>
+          devToolsService.setPendingRunMetadata(workspaceId, metadataId, {
+            ...runMetadata,
+            // Undefined unless this is a budgeted compaction request (JSON drops the key).
+            compactionInputBudgetTokens,
+          });
+        queueRunMetadata(primaryRequest.compactionInputBudgetTokens);
         this.dependencies.trackPendingDevToolsRunMetadata(
           assistantMessageId,
           workspaceId,
@@ -3500,6 +3589,8 @@ export class TurnRequestBuilder {
                 }
                 let nextHeaders = nextRequest.headers;
                 if (pendingRunMetadataId != null) {
+                  // The fallback's run is created after this, under the same metadata ID.
+                  queueRunMetadata(nextRequest.compactionInputBudgetTokens);
                   nextHeaders = {
                     ...nextHeaders,
                     [DEVTOOLS_RUN_METADATA_ID_HEADER]: pendingRunMetadataId,

@@ -5698,7 +5698,7 @@ export class StreamManager {
     // serialized prompt in their message (AI_TypeValidationError via the
     // cause walk); unbounded, that would be persisted to history metadata,
     // shipped over IPC, and rendered in the chat.
-    payload = { ...payload, error: clampErrorMessage(payload.error) };
+    payload = { ...payload, error: clampErrorMessage(payload.error), model: streamInfo.model };
     const refusalFinishReason =
       payload.errorType === "model_refusal"
         ? ([streamInfo.terminalFinishReason, streamInfo.terminalRawFinishReason].find(

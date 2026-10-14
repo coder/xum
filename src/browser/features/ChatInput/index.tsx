@@ -29,7 +29,8 @@ import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useAgent } from "@/browser/contexts/AgentContext";
 import { ThinkingSelector } from "@/browser/components/ThinkingSelector/ThinkingSelector";
-import { useAPI, type APIClient } from "@/browser/contexts/API";
+import { useAPI, type APIClient, useLiveAPI } from "@/browser/contexts/API";
+import { CONNECTION_LOST_MESSAGE } from "@/browser/contexts/connectionLink";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
 import {
@@ -214,6 +215,8 @@ import {
 } from "./useComposerAttachments";
 import { useComposerDraft } from "./useComposerDraft";
 import { getDraftStore, type SendOutcome } from "@/browser/stores/DraftStore";
+import { useComposerTypingLock } from "./useComposerTypingLock";
+import { useReportCreationSendBlocked } from "./useReportCreationSendBlocked";
 import { assert } from "@/common/utils/assert";
 import { acceptedSendIds, isEditSendAccepted } from "./sendAcceptance";
 import { createSendId } from "@/common/utils/drafts";
@@ -286,6 +289,14 @@ async function forEachProviderConfigChange(
   }
 }
 
+/**
+ * Why a send waits for the transcript. Offline the transcript cannot catch up until the
+ * reconnect, so the toast says that instead of "still loading".
+ */
+function transcriptBarrierMessage(offline: boolean): string {
+  return offline ? CONNECTION_LOST_MESSAGE : TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE;
+}
+
 /** Composer attachments for a restored or edited message (provider files, then staged files). */
 function pendingChatAttachments(
   pending: PendingUserMessage,
@@ -311,6 +322,12 @@ interface EditSession {
 
 const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const { api } = useAPI();
+  const liveApi = useLiveAPI();
+  // For refusals after an await: the send's closure holds the client from when it started.
+  const liveApiRef = useRef(liveApi);
+  useEffect(() => {
+    liveApiRef.current = liveApi;
+  }, [liveApi]);
   const { variant } = props;
   // A /side chat composer is mounted next to the main one. Window shortcuts act only in the pane
   // that owns the focused element, and unscoped palette events (open model selector, voice, toasts)
@@ -636,7 +653,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     onSend: () => void handleSend(),
     isTranscriptionAvailable,
     useRecordingKeybinds: true,
-    api,
+    api: liveApi,
   });
 
   const voiceInputUnavailableMessage =
@@ -852,6 +869,15 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const isSendInFlight = variant === "creation" ? creationState.isSending || isSending : isSending;
   const sendInFlightBlocksInput =
     variant === "workspace" ? isSendInFlight && !isStreamStarting : isSendInFlight;
+  // #6259: typing stays on once a send has taken its draft; submission waits for it to settle.
+  const typingLock = useComposerTypingLock({
+    variant,
+    sendingCount,
+    isStreamStarting,
+    creationLocksTyping: sendInFlightBlocksInput,
+    inputRef,
+  });
+  const sendLocksTyping = typingLock.locksTyping;
 
   // Coder workspace state - config is owned by selectedRuntime.coder, this hook manages async data
   const currentRuntime = creationState.selectedRuntime;
@@ -880,7 +906,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     variant === "creation" && props.kind !== "scratch"
       ? ({
           branches: creationState.branches,
-          branchesLoaded: creationState.branchesLoaded,
+          branchLoad: creationState.branchLoad,
           trunkBranch: creationState.trunkBranch,
           onTrunkBranchChange: creationState.setTrunkBranch,
           selectedRuntime: creationState.selectedRuntime,
@@ -937,12 +963,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const coderPresetsLoading =
     coderState.enabled && !coderState.coderConfig?.existingWorkspace && coderState.loadingPresets;
   // #6033: the trunk branch stays empty until the branch list loads, and the backend refuses
-  // every runtime except local without one, so a creation send must wait for the list.
+  // every runtime except local without one, so a creation send must wait for the list. A failed
+  // list keeps it closed too (#6055).
   const creationBranchesLoading =
     variant === "creation" &&
     props.kind !== "scratch" &&
-    !creationState.branchesLoaded &&
+    creationState.branchLoad !== "loaded" &&
     creationState.selectedRuntime.mode !== RUNTIME_MODE.LOCAL;
+  useReportCreationSendBlocked(creationBranchesLoading, props);
   const isProcessingAttachments = processingAttachmentCount > 0;
   const hasSendableDraft = hasTypedText || hasImages || hasReviews;
   // Workspace sends/edits mutate history relative to the visible transcript, so they wait for
@@ -1885,7 +1913,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     // Without an API client (backend reconnecting) hydration cannot finish, and waiting would
     // hold this send in flight and fire it after reconnect; let the send path report
     // "Not connected to server" instead.
-    if (!api || reviewStateStore.isHydrated(workspaceId)) return renderTime;
+    if (!liveApi || reviewStateStore.isHydrated(workspaceId)) return renderTime;
     const attached = await reviewStateStore.readAttachedReviewsForSend(workspaceId);
     if (attached === null) {
       // The render-time notes may be a stale cache; send none rather than a possibly wrong set.
@@ -1973,7 +2001,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     const commandFileParts = chatAttachmentsToFileParts(attachments, { validate: true });
     const asyncCommandToken = ++asyncCommandTokenRef.current;
     const commandEnv: SlashCommandEnv = {
-      api,
+      // Commands report "Not connected to server" themselves when there is no live client.
+      api: liveApi,
       aiScopeId: sendOptionsScopeId,
       variant,
       workspaceId: commandWorkspaceId,
@@ -2232,7 +2261,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       !draftBypassesTranscriptBarrier &&
       !isTranscriptMutationAllowed(props.workspaceId)
     ) {
-      pushToast({ type: "error", message: TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE });
+      pushToast({ type: "error", message: transcriptBarrierMessage(liveApiRef.current == null) });
       return;
     }
     if (!canSend) {
@@ -2299,7 +2328,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           messageText,
           agentSkillDescriptors,
           mcpPromptDescriptors,
-          api,
+          api: liveApi,
           discovery: skillDiscovery,
           signal: resolutionSignal,
         });
@@ -2314,7 +2343,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             messageText,
             slashInvocation: resolution.skillInvocation,
             agentSkillDescriptors,
-            api,
+            api: liveApi,
             discovery: skillDiscovery,
             candidates: inlineReferenceCandidates,
           }),
@@ -2322,7 +2351,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             messageText,
             slashInvocation: resolution.mcpPromptInvocation,
             descriptors: mcpPromptDescriptors,
-            api,
+            api: liveApi,
             discovery: skillDiscovery,
             candidates: inlineReferenceCandidates,
             signal: resolutionSignal,
@@ -2367,7 +2396,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       !commandBypassesTranscriptBarrier(parsed) &&
       !isTranscriptMutationAllowed(props.workspaceId)
     ) {
-      pushToast({ type: "error", message: TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE });
+      pushToast({ type: "error", message: transcriptBarrierMessage(liveApiRef.current == null) });
       return;
     }
 
@@ -2398,7 +2427,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       let creationOptionsOverride: Partial<SendMessageOptions> | undefined;
 
       if (skillInvocation) {
-        if (!api) {
+        if (!liveApi) {
           pushToast({ type: "error", message: "Not connected to server" });
           return;
         }
@@ -2516,7 +2545,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         mcpPromptInvocation?.userText ??
         messageText;
 
-      if (!api) {
+      if (!liveApi) {
         pushToast({ type: "error", message: "Not connected to server" });
         return;
       }
@@ -2527,7 +2556,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       let sendAttachments = attachments;
       const pendingFilesForSend = getPendingFileAttachments(attachments);
       if (pendingFilesForSend.length > 0) {
-        const stagingOutcome = await stagePendingFiles(api, props.workspaceId, pendingFilesForSend);
+        const stagingOutcome = await stagePendingFiles(
+          liveApi,
+          props.workspaceId,
+          pendingFilesForSend
+        );
         if (stagingOutcome.staged.length > 0) {
           sendAttachments = replacePendingFilesWithStaged(attachments, stagingOutcome.staged);
           // Swap staged chips into the composer so a later failure or retry
@@ -2612,6 +2645,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       // typed or a restore put in meanwhile stays (#5226 item 12).
       // Null when the send failed before taking anything (nothing to put back) or succeeded.
       let taken: { text: string } | null = null;
+      let releaseTakenDraft: () => void = () => undefined;
       const putBackTaken = () => {
         if (taken === null) return;
         const { text } = taken;
@@ -2678,7 +2712,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               metadata,
               sendOptions,
             } = prepareCompactionMessage({
-              api,
+              api: liveApi,
               workspaceId: props.workspaceId,
               maxOutputTokens: parsed.maxOutputTokens,
               // Include current attachments + reviews in followUpContent so they're queued
@@ -2782,7 +2816,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // the meantime (switch, reconnect). Draft, attachments and edit state stay intact; the
         // outer `finally` releases sendingCount.
         if (!isTranscriptMutationAllowed(props.workspaceId)) {
-          pushToast({ type: "error", message: TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE });
+          pushToast({
+            type: "error",
+            message: transcriptBarrierMessage(liveApiRef.current == null),
+          });
           return;
         }
 
@@ -2856,13 +2893,15 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         if (inputRef.current) {
           inputRef.current.style.height = "";
         }
+        // The draft is out of the composer: typing can resume (#6259).
+        releaseTakenDraft = typingLock.markDraftTaken();
 
         props.onMessageSendStarted?.(overrides?.queueDispatchMode ?? "tool-end");
 
-        let result: Awaited<ReturnType<typeof api.workspace.sendMessage>> | undefined;
+        let result: Awaited<ReturnType<typeof liveApi.workspace.sendMessage>> | undefined;
         let thrown: unknown;
         try {
-          result = await api.workspace.sendMessage({
+          result = await liveApi.workspace.sendMessage({
             workspaceId: props.workspaceId,
             message: finalMessageText,
             options: { ...sendOptions, sendId },
@@ -2886,7 +2925,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           // draft entry.)
           if (outcome === "accepted" || outcome === "pending") accepted = true;
         } else if (!accepted) {
-          accepted = await isEditSendAccepted(api, props.workspaceId, sendId);
+          accepted = await isEditSendAccepted(liveApi, props.workspaceId, sendId);
         }
 
         if (!accepted) {
@@ -2983,6 +3022,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       };
       await runWithCatchFinally(sendPreparedMessage, restoreDraftOnError, () => {
         setSendingCount((c) => c - 1);
+        releaseTakenDraft();
         setHideReviewsDuringSend(false);
       });
     };
@@ -3362,7 +3402,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                       composerSuggestions.isVisible ? COMMAND_SUGGESTION_KEYS : undefined
                     }
                     placeholder={placeholder}
-                    disabled={!editingMessageForUi && (disabled || sendInFlightBlocksInput)}
+                    disabled={!editingMessageForUi && (disabled || sendLocksTyping)}
                     aria-label={editingMessageForUi ? "Edit message" : "Message"}
                     // No aria-expanded: the textbox role does not allow it (#5951), and a
                     // textarea cannot take role="combobox" without screen readers treating
@@ -3579,7 +3619,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                   >
                     <AttachFileButton
                       onFiles={handleAttachFiles}
-                      disabled={disabled || sendInFlightBlocksInput || !!editingMessageForUi}
+                      disabled={disabled || sendLocksTyping || !!editingMessageForUi}
                     />
                     <VoiceInputButton
                       state={voiceInput.state}
@@ -3587,7 +3627,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                       shouldShowUI={voiceInput.shouldShowUI}
                       requiresSecureContext={voiceInput.requiresSecureContext}
                       onToggle={voiceInput.toggle}
-                      disabled={disabled || sendInFlightBlocksInput}
+                      disabled={disabled || sendLocksTyping}
                       agentColor={agentColor}
                     />
                   </div>

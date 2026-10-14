@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { useAPI, type APIClient } from "@/browser/contexts/API";
+import { useAPI, type APIClient, useLiveAPI } from "@/browser/contexts/API";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import { KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -60,6 +60,7 @@ export function useArtifactInteractions(
   handleKeyDown: (e: React.KeyboardEvent) => boolean;
 } {
   const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const [pendingByPath, setPendingByPath] = useState<ReadonlyMap<string, PendingArtifactSend>>(
     () => new Map()
   );
@@ -210,12 +211,12 @@ export function useArtifactInteractions(
   const send = () => {
     if (pending == null) return;
     const forPath = target.path;
-    if (!api) {
+    if (!liveApi) {
       setSendState({ path: forPath, sending: false, error: OFFLINE_SEND_ERROR });
       return;
     }
     setSendState({ path: forPath, sending: true, error: null });
-    api.artifacts
+    liveApi.artifacts
       .sendInteraction({
         workspaceId,
         path: forPath,

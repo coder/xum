@@ -5,6 +5,7 @@ import { tool } from "ai";
 import { z } from "zod";
 
 import { createTaskTool, markBuiltInTaskTool, isBuiltInTaskTool } from "./task";
+import { createTaskAwaitTool } from "./task_await";
 import {
   createFakeWorkspaceTurnManager,
   createTestToolConfig,
@@ -13,6 +14,7 @@ import {
 } from "./testHelpers";
 import { Ok, Err } from "@/common/types/result";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { TOOL_TEXT_PAGE_MAX_CHARS } from "@/common/constants/toolLimits";
 import { ForegroundWaitBackgroundedError, type TaskService } from "@/node/services/taskService";
 
 function expectQueuedOrRunningTaskToolResult(
@@ -47,6 +49,12 @@ function expectGroupedQueuedOrRunningTaskToolResult(
     }))
   );
   expect(typeof obj.note).toBe("string");
+}
+
+interface ReportPage {
+  reportMarkdown: string;
+  nextCharOffset?: number;
+  note?: string;
 }
 
 // The task tool requires a TaskService up front, but workspace-turn launches never call it.
@@ -376,8 +384,9 @@ describe("task tool", () => {
     using tempDir = new TestTempDir("test-task-tool-workspace-turn-supersede-completed");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
     const executeForegroundFollowUp = async (
-      maySupersedeTaskId?: string
-    ): Promise<{ status?: string; note?: string }> => {
+      maySupersedeTaskId?: string,
+      reportMarkdown = "done"
+    ): Promise<ReportPage & { status?: string }> => {
       const createWorkspaceTurn = mock(() =>
         Promise.resolve(
           Ok({
@@ -394,7 +403,7 @@ describe("task tool", () => {
           taskId: "wst_follow_up",
           workspaceId: "child-workspace",
           updatedAt: "2026-08-11T00:00:00.000Z",
-          reportMarkdown: "done",
+          reportMarkdown,
         })
       );
       const workspaceTurnManager = createFakeWorkspaceTurnManager({
@@ -417,7 +426,7 @@ describe("task tool", () => {
           },
           mockToolCallOptions
         )
-      )) as { status?: string; note?: string };
+      )) as ReportPage & { status?: string };
     };
 
     const announced = await executeForegroundFollowUp("wst_previous_turn");
@@ -427,6 +436,15 @@ describe("task tool", () => {
     const silent = await executeForegroundFollowUp();
     expect(silent.status).toBe("completed");
     expect(silent.note ?? "").not.toContain("wst_previous_turn");
+
+    // A long report comes as its first page; the note keeps the supersede text too.
+    const paged = await executeForegroundFollowUp("wst_previous_turn", "x".repeat(60_000));
+    expect(paged.reportMarkdown).toHaveLength(TOOL_TEXT_PAGE_MAX_CHARS);
+    expect(paged.nextCharOffset).toBe(TOOL_TEXT_PAGE_MAX_CHARS);
+    expect(paged.note).toContain("wst_previous_turn");
+    expect(paged.note).toContain(
+      `task_await(task_ids: ["wst_follow_up"], timeout_secs: 0, offset_chars: ${TOOL_TEXT_PAGE_MAX_CHARS})`
+    );
   });
 
   it.each([
@@ -1068,6 +1086,64 @@ describe("task tool", () => {
         },
       ],
     });
+  });
+
+  it("returns the first page of a long foreground report and a task_await continuation", async () => {
+    using tempDir = new TestTempDir("test-task-tool-foreground-report-pages");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const longReport = `${"a".repeat(TOOL_TEXT_PAGE_MAX_CHARS)}${"b".repeat(1_000)}`;
+    const reports = new Map<string, string>();
+    let createCount = 0;
+    const taskService = {
+      create: mock(() => {
+        createCount += 1;
+        const taskId = `child-task-${createCount}`;
+        // The single task and the first best-of candidate write a long report.
+        reports.set(taskId, createCount <= 2 ? longReport : "short report");
+        return Ok({ taskId, kind: "agent" as const, status: "running" as const });
+      }),
+      waitForAgentReport: mock((taskId: string) =>
+        Promise.resolve({ reportMarkdown: reports.get(taskId) ?? "" })
+      ),
+      listActiveDescendantAgentTaskIds: () => [],
+      isDescendantAgentTask: () => Promise.resolve(true),
+      getAgentTaskStatuses: () => new Map(),
+      getAgentTaskStatus: () => "reported" as const,
+    } as unknown as TaskService;
+    const config = { ...baseConfig, taskService };
+    const runTask = async (n: number) =>
+      (await Promise.resolve(
+        createTaskTool(config).execute!(
+          { subagent_type: "explore", prompt: "p", title: "t", run_in_background: false, n },
+          mockToolCallOptions
+        )
+      )) as ReportPage & { taskId?: string; reports?: Array<ReportPage & { taskId: string }> };
+    const expectFirstPage = (page: ReportPage) => {
+      expect(page.reportMarkdown).toBe("a".repeat(TOOL_TEXT_PAGE_MAX_CHARS));
+      expect(page.nextCharOffset).toBe(TOOL_TEXT_PAGE_MAX_CHARS);
+      expect(page.note).toContain(`timeout_secs: 0, offset_chars: ${TOOL_TEXT_PAGE_MAX_CHARS})`);
+    };
+
+    const single = await runTask(1);
+    expectFirstPage(single);
+    expect(single.note).toContain('task_await(task_ids: ["child-task-1"]');
+
+    const group = await runTask(2);
+    const [longCandidate, shortCandidate] = group.reports ?? [];
+    expectFirstPage(longCandidate);
+    expect(longCandidate.note).toContain('task_await(task_ids: ["child-task-2"]');
+    expect(shortCandidate).toMatchObject({ reportMarkdown: "short report" });
+    expect(shortCandidate.nextCharOffset).toBeUndefined();
+
+    // The continuation the note names reads the rest of the report.
+    const awaitResult = (await Promise.resolve(
+      createTaskAwaitTool({ ...config, workspaceTurnManager: createFakeWorkspaceTurnManager() })
+        .execute!(
+        { task_ids: ["child-task-1"], timeout_secs: 0, offset_chars: single.nextCharOffset },
+        mockToolCallOptions
+      )
+    )) as { results: ReportPage[] };
+    expect(single.reportMarkdown + awaitResult.results[0].reportMarkdown).toBe(longReport);
   });
 
   it("prefers report-time AI settings over the launch snapshot in completed results", async () => {

@@ -61,6 +61,7 @@ import {
   SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
 } from "@/node/services/sessionTapes/sessionTapeReplaySource";
 import { eventSpine } from "@/node/services/events/eventSpine";
+import { codexPluginHookService } from "@/node/services/agentPlugins/codexHookService";
 import { agentPluginHookService } from "@/node/services/agentPlugins/hookService";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
@@ -92,9 +93,16 @@ import {
   statusSetResultStatus,
 } from "@/node/services/aiServiceEventGuards";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
+import { normalizeLegacyMuxMetadata } from "@/node/utils/messages/legacy";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import { ARTIFACT_INTERACTION_METADATA_RESERVED_MESSAGE } from "@/common/constants/artifactInteractions";
+import {
+  isNestedCompactionFollowUp,
+  isNestedCompactionPendingFollowUp,
+  NESTED_COMPACTION_FOLLOW_UP_MESSAGE,
+  stripClientPluginSendHookFields,
+} from "@/common/utils/messages/pluginSendHookFields";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import {
@@ -8378,6 +8386,7 @@ export class WorkspaceService
       // Plugin hook mounts live under their own scope keys; unregister their
       // spine middleware and drop their runtimes too. Never throws.
       await agentPluginHookService.disposeWorkspace(workspaceId);
+      await codexPluginHookService.disposeWorkspace(workspaceId);
       try {
         await this.timelineRecorder.closeWorkspace(workspaceId);
         timelineClosed = true;
@@ -12678,6 +12687,7 @@ export class WorkspaceService
       // Plugin hooks re-register lazily on the next send after un-archive, so
       // disposal here only frees runtimes and spine middleware. Never throws.
       await agentPluginHookService.disposeWorkspace(workspaceId);
+      await codexPluginHookService.disposeWorkspace(workspaceId);
 
       await this.syncCodeWorkspaceFiles({
         projectPath,
@@ -15918,6 +15928,9 @@ export class WorkspaceService
     ) {
       return Err({ type: "unknown", raw: ARTIFACT_INTERACTION_METADATA_RESERVED_MESSAGE });
     }
+    if (isNestedCompactionFollowUp(options.muxMetadata)) {
+      return Err({ type: "unknown", raw: NESTED_COMPACTION_FOLLOW_UP_MESSAGE });
+    }
 
     let resumedInterruptedTask = false;
     // The attempt this call's own reawaken won: its failure rollback is CAS'd on it.
@@ -18826,12 +18839,32 @@ export class WorkspaceService
     if (isSessionTapeReplayMode()) {
       return Err(SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE);
     }
+    // History reads promote a legacy `cmuxMetadata` to `muxMetadata` (normalizeLegacyMuxMetadata),
+    // so every check below must see the row as recovery will read it: otherwise a forged receipt
+    // or plan-review envelope under `cmuxMetadata` passes them (Codex PRRT_kwDOPxxmWM6r2iIo).
+    summaryMessage = normalizeLegacyMuxMetadata(summaryMessage);
     // The row is client-supplied (workspace.replaceChatHistory). Plan-review rows may only come
     // from the dedicated endpoints; with a matching envelope this row would otherwise persist an
     // authentic record that skipped their validation, directly or as a compaction summary's
     // pending follow-up that recovery dispatches. Refused before anything is cleared.
     if (carriesPlanReviewMetadata(summaryMessage.metadata?.muxMetadata)) {
       return Err(PLAN_REVIEW_METADATA_RESERVED_MESSAGE);
+    }
+    // A pending follow-up that is itself a compaction request is refused, as sendMessage refuses
+    // it (isNestedCompactionFollowUp): the strip below covers one level only.
+    if (isNestedCompactionPendingFollowUp(summaryMessage.metadata?.muxMetadata)) {
+      return Err(NESTED_COMPACTION_FOLLOW_UP_MESSAGE);
+    }
+    // Hook markers on a summary's pending follow-up say its message.send hooks already ran.
+    // Only Xum's own compaction may set them: a client-supplied row would make recovery skip
+    // the hooks (or forge their context) after a restart. Copy-on-write.
+    const clientMuxMetadata = summaryMessage.metadata?.muxMetadata;
+    const sanitizedMuxMetadata = stripClientPluginSendHookFields(clientMuxMetadata);
+    if (sanitizedMuxMetadata !== clientMuxMetadata) {
+      summaryMessage = {
+        ...summaryMessage,
+        metadata: { ...summaryMessage.metadata, muxMetadata: sanitizedMuxMetadata },
+      };
     }
     // Support both new enum ("user"|"idle") and legacy boolean (true)
     const isCompaction = !!summaryMessage.metadata?.compacted;

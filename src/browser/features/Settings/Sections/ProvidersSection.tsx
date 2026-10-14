@@ -32,7 +32,7 @@ import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/prov
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { ProviderIcon, ProviderWithIcon } from "@/browser/components/ProviderIcon/ProviderIcon";
 import { getStoredAuthToken } from "@/browser/components/AuthTokenModal/AuthTokenModal";
-import { useAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
 import { DocsLink } from "@/browser/components/DocsLink/DocsLink";
 import { ConfigSwitchSetting, type SettingsApi } from "./ConfigSwitchSetting";
 import { useSettings } from "@/browser/contexts/SettingsContext";
@@ -479,7 +479,11 @@ export function ProvidersSection() {
     setProvidersStartCoderLogin,
   } = useSettings();
 
-  const { api } = useAPI();
+  // The live client only, for gates, disabled states and writes: offline (the last client kept
+  // while reconnecting) a write would fail, and the optimistic value would look saved until the
+  // reconnect puts the server value back. Loads go through useProvidersConfig.
+  const liveApi = useLiveAPI();
+  const api = liveApi;
   const { config, loading: configLoading, refresh, updateOptimistically } = useProvidersConfig();
   const { refreshWorkspaceMetadata } = useWorkspaceContext();
   const visibleProviders = useMemo(() => getProviderIdsForUi(config), [config]);
@@ -596,7 +600,7 @@ export function ProvidersSection() {
   const startCodexOauthBrowserConnect = async () => {
     const attempt = ++codexOauthAttemptRef.current;
 
-    if (!api) {
+    if (!liveApi) {
       setCodexOauthStatus("error");
       setCodexOauthError("Xum API not connected.");
       return;
@@ -604,10 +608,10 @@ export function ProvidersSection() {
 
     // Best-effort: cancel any in-progress flow before starting a new one.
     if (codexOauthDesktopFlowId) {
-      void api.codexOauth.cancelDesktopFlow({ flowId: codexOauthDesktopFlowId });
+      void liveApi.codexOauth.cancelDesktopFlow({ flowId: codexOauthDesktopFlowId });
     }
     if (codexOauthDeviceFlow) {
-      void api.codexOauth.cancelDeviceFlow({ flowId: codexOauthDeviceFlow.flowId });
+      void liveApi.codexOauth.cancelDeviceFlow({ flowId: codexOauthDeviceFlow.flowId });
     }
 
     setCodexOauthError(null);
@@ -619,11 +623,11 @@ export function ProvidersSection() {
       setCodexOauthStatus("starting");
 
       if (!isDesktop) {
-        const startResult = await api.codexOauth.startDeviceFlow();
+        const startResult = await liveApi.codexOauth.startDeviceFlow();
 
         if (attempt !== codexOauthAttemptRef.current) {
           if (startResult.success) {
-            void api.codexOauth.cancelDeviceFlow({ flowId: startResult.data.flowId });
+            void liveApi.codexOauth.cancelDeviceFlow({ flowId: startResult.data.flowId });
           }
           return;
         }
@@ -643,7 +647,7 @@ export function ProvidersSection() {
 
         // Keep device-code login manual per user request: we only open the
         // verification page from the explicit "Copy & Open" action.
-        const waitResult = await api.codexOauth.waitForDeviceFlow({
+        const waitResult = await liveApi.codexOauth.waitForDeviceFlow({
           flowId: startResult.data.flowId,
         });
 
@@ -664,11 +668,11 @@ export function ProvidersSection() {
         return;
       }
 
-      const startResult = await api.codexOauth.startDesktopFlow();
+      const startResult = await liveApi.codexOauth.startDesktopFlow();
 
       if (attempt !== codexOauthAttemptRef.current) {
         if (startResult.success) {
-          void api.codexOauth.cancelDesktopFlow({ flowId: startResult.data.flowId });
+          void liveApi.codexOauth.cancelDesktopFlow({ flowId: startResult.data.flowId });
         }
         return;
       }
@@ -684,7 +688,7 @@ export function ProvidersSection() {
       setCodexOauthAuthorizeUrl(authorizeUrl);
       setCodexOauthStatus("waiting");
 
-      const waitResult = await api.codexOauth.waitForDesktopFlow({ flowId });
+      const waitResult = await liveApi.codexOauth.waitForDesktopFlow({ flowId });
 
       if (attempt !== codexOauthAttemptRef.current) {
         return;
@@ -712,7 +716,7 @@ export function ProvidersSection() {
   const startCodexOauthDeviceConnect = async () => {
     const attempt = ++codexOauthAttemptRef.current;
 
-    if (!api) {
+    if (!liveApi) {
       setCodexOauthStatus("error");
       setCodexOauthError("Xum API not connected.");
       return;
@@ -720,10 +724,10 @@ export function ProvidersSection() {
 
     // Best-effort: cancel any in-progress flow before starting a new one.
     if (codexOauthDesktopFlowId) {
-      void api.codexOauth.cancelDesktopFlow({ flowId: codexOauthDesktopFlowId });
+      void liveApi.codexOauth.cancelDesktopFlow({ flowId: codexOauthDesktopFlowId });
     }
     if (codexOauthDeviceFlow) {
-      void api.codexOauth.cancelDeviceFlow({ flowId: codexOauthDeviceFlow.flowId });
+      void liveApi.codexOauth.cancelDeviceFlow({ flowId: codexOauthDeviceFlow.flowId });
     }
 
     setCodexOauthError(null);
@@ -733,11 +737,11 @@ export function ProvidersSection() {
 
     try {
       setCodexOauthStatus("starting");
-      const startResult = await api.codexOauth.startDeviceFlow();
+      const startResult = await liveApi.codexOauth.startDeviceFlow();
 
       if (attempt !== codexOauthAttemptRef.current) {
         if (startResult.success) {
-          void api.codexOauth.cancelDeviceFlow({ flowId: startResult.data.flowId });
+          void liveApi.codexOauth.cancelDeviceFlow({ flowId: startResult.data.flowId });
         }
         return;
       }
@@ -755,7 +759,7 @@ export function ProvidersSection() {
       });
       setCodexOauthStatus("waiting");
 
-      const waitResult = await api.codexOauth.waitForDeviceFlow({
+      const waitResult = await liveApi.codexOauth.waitForDeviceFlow({
         flowId: startResult.data.flowId,
       });
 
@@ -786,7 +790,7 @@ export function ProvidersSection() {
   const disconnectCodexOauth = async () => {
     const attempt = ++codexOauthAttemptRef.current;
 
-    if (!api) {
+    if (!liveApi) {
       setCodexOauthStatus("error");
       setCodexOauthError("Xum API not connected.");
       return;
@@ -794,10 +798,10 @@ export function ProvidersSection() {
 
     // Best-effort: cancel any in-progress flow.
     if (codexOauthDesktopFlowId) {
-      void api.codexOauth.cancelDesktopFlow({ flowId: codexOauthDesktopFlowId });
+      void liveApi.codexOauth.cancelDesktopFlow({ flowId: codexOauthDesktopFlowId });
     }
     if (codexOauthDeviceFlow) {
-      void api.codexOauth.cancelDeviceFlow({ flowId: codexOauthDeviceFlow.flowId });
+      void liveApi.codexOauth.cancelDeviceFlow({ flowId: codexOauthDeviceFlow.flowId });
     }
 
     setCodexOauthError(null);
@@ -807,7 +811,7 @@ export function ProvidersSection() {
 
     try {
       setCodexOauthStatus("starting");
-      const result = await api.codexOauth.disconnect();
+      const result = await liveApi.codexOauth.disconnect();
 
       if (attempt !== codexOauthAttemptRef.current) {
         return;
@@ -904,18 +908,18 @@ export function ProvidersSection() {
       setMuxGatewayAuthorizeUrl(null);
 
       if (isDesktop) {
-        if (!api) {
+        if (!liveApi) {
           setMuxGatewayLoginStatus("error");
           setMuxGatewayLoginError("Xum API not connected.");
           return;
         }
 
         setMuxGatewayLoginStatus("starting");
-        const startResult = await api.muxGatewayOauth.startDesktopFlow();
+        const startResult = await liveApi.muxGatewayOauth.startDesktopFlow();
 
         if (attempt !== muxGatewayLoginAttemptRef.current) {
           if (startResult.success) {
-            void api.muxGatewayOauth.cancelDesktopFlow({ flowId: startResult.data.flowId });
+            void liveApi.muxGatewayOauth.cancelDesktopFlow({ flowId: startResult.data.flowId });
           }
           return;
         }
@@ -935,7 +939,7 @@ export function ProvidersSection() {
           return;
         }
 
-        const waitResult = await api.muxGatewayOauth.waitForDesktopFlow({ flowId });
+        const waitResult = await liveApi.muxGatewayOauth.waitForDesktopFlow({ flowId });
 
         if (attempt !== muxGatewayLoginAttemptRef.current) {
           return;
@@ -1123,7 +1127,7 @@ export function ProvidersSection() {
       setCopilotLoginError(null);
       setCopilotLoginStatus("starting");
 
-      if (!api) {
+      if (!liveApi) {
         setCopilotLoginStatus("error");
         setCopilotLoginError("API not connected.");
         return;
@@ -1131,16 +1135,16 @@ export function ProvidersSection() {
 
       // Best-effort: cancel any in-progress flow before starting a new one.
       if (copilotFlowIdRef.current) {
-        void api.copilotOauth.cancelDeviceFlow({ flowId: copilotFlowIdRef.current });
+        void liveApi.copilotOauth.cancelDeviceFlow({ flowId: copilotFlowIdRef.current });
         copilotFlowIdRef.current = null;
         setCopilotFlowId(null);
       }
 
-      const startResult = await api.copilotOauth.startDeviceFlow();
+      const startResult = await liveApi.copilotOauth.startDeviceFlow();
 
       if (attempt !== copilotLoginAttemptRef.current) {
         if (startResult.success) {
-          void api.copilotOauth.cancelDeviceFlow({ flowId: startResult.data.flowId });
+          void liveApi.copilotOauth.cancelDeviceFlow({ flowId: startResult.data.flowId });
         }
         return;
       }
@@ -1162,7 +1166,7 @@ export function ProvidersSection() {
       // verification page from the explicit "Copy & Open" action.
 
       // Wait for flow to complete (polling happens on backend)
-      const waitResult = await api.copilotOauth.waitForDeviceFlow({ flowId });
+      const waitResult = await liveApi.copilotOauth.waitForDeviceFlow({ flowId });
 
       if (attempt !== copilotLoginAttemptRef.current) return;
 
@@ -1257,7 +1261,7 @@ export function ProvidersSection() {
   const startCoderLogin = useCallback(async () => {
     const attempt = ++coderLoginAttemptRef.current;
 
-    if (!api) {
+    if (!liveApi) {
       setCoderLoginStatus("error");
       setCoderLoginError("Xum API not connected.");
       return;
@@ -1267,7 +1271,7 @@ export function ProvidersSection() {
     // old flow cannot commit a login after this replacement attempt begins.
     if (coderFlowId) {
       try {
-        await api.coderOauth.cancelDesktopFlow({ flowId: coderFlowId });
+        await liveApi.coderOauth.cancelDesktopFlow({ flowId: coderFlowId });
       } catch {
         // Proceed anyway; the backend's last-committed-login-wins semantics
         // still bound the damage if the old flow survives.
@@ -1298,7 +1302,7 @@ export function ProvidersSection() {
       // Desktop: loopback listener on this machine. Browser (local or remote
       // server): the redirect lands on the Xum server's own callback route.
       const startResult = isDesktop
-        ? await api.coderOauth.startDesktopFlow({ deploymentUrl, flowId })
+        ? await liveApi.coderOauth.startDesktopFlow({ deploymentUrl, flowId })
         : await startCoderServerFlow(backendBaseUrl, deploymentUrl, flowId);
 
       if (attempt !== coderLoginAttemptRef.current) {
@@ -1317,7 +1321,7 @@ export function ProvidersSection() {
       setCoderAuthorizeUrl(authorizeUrl);
       setCoderLoginStatus("waiting");
 
-      const waitResult = await api.coderOauth.waitForDesktopFlow({ flowId });
+      const waitResult = await liveApi.coderOauth.waitForDesktopFlow({ flowId });
 
       if (attempt !== coderLoginAttemptRef.current) return;
 
@@ -1336,17 +1340,21 @@ export function ProvidersSection() {
       setCoderLoginStatus("error");
       setCoderLoginError(getErrorMessage(err));
     }
-  }, [api, coderFlowId, coderDeploymentUrl, refresh, isDesktop, backendBaseUrl]);
+  }, [liveApi, coderFlowId, coderDeploymentUrl, refresh, isDesktop, backendBaseUrl]);
 
   const disconnectCoderOauth = async () => {
     const attempt = ++coderLoginAttemptRef.current;
-    if (!api) return;
+    if (!liveApi) {
+      setCoderLoginStatus("error");
+      setCoderLoginError("Xum API not connected.");
+      return;
+    }
 
     // Awaited: an unsettled flow could otherwise commit a login AFTER the
     // disconnect below cleared credentials, silently reconnecting the account.
     if (coderFlowId) {
       try {
-        await api.coderOauth.cancelDesktopFlow({ flowId: coderFlowId });
+        await liveApi.coderOauth.cancelDesktopFlow({ flowId: coderFlowId });
       } catch {
         // Proceed with disconnect regardless.
       }
@@ -1358,7 +1366,7 @@ export function ProvidersSection() {
     setCoderLoginStatus("idle");
 
     try {
-      const result = await api.coderOauth.disconnect();
+      const result = await liveApi.coderOauth.disconnect();
 
       if (attempt !== coderLoginAttemptRef.current) return;
 
@@ -1745,7 +1753,7 @@ export function ProvidersSection() {
   const handleAddCustomProvider = useCallback(async () => {
     setCustomProviderSubmitAttempted(true);
 
-    if (!api) {
+    if (!liveApi) {
       setCustomProviderSubmitError("Xum API not connected.");
       return;
     }
@@ -1781,7 +1789,7 @@ export function ProvidersSection() {
     setCustomProviderSubmitError(null);
     setCustomProviderNotice(null);
     try {
-      const result = await api.providers.addCustomProvider(input);
+      const result = await liveApi.providers.addCustomProvider(input);
       if (!result.success) {
         setCustomProviderSubmitError(result.error.message);
         return;
@@ -1808,7 +1816,7 @@ export function ProvidersSection() {
     setExpandedProvider(provider);
     setProvidersExpandedProvider(provider);
   }, [
-    api,
+    liveApi,
     customProviderApiKey,
     customProviderApiKeyFile,
     customProviderBaseUrl,
@@ -1831,7 +1839,7 @@ export function ProvidersSection() {
 
   const handleRemoveCustomProvider = useCallback(
     async (provider: string) => {
-      if (!api) {
+      if (!liveApi) {
         setCustomProviderRemoveErrors((prev) => ({
           ...prev,
           [provider]: "Xum API not connected.",
@@ -1854,7 +1862,7 @@ export function ProvidersSection() {
       setCustomProviderNotice(null);
       setCustomProviderRemoving(provider);
       try {
-        const result = await api.providers.removeCustomProvider({ provider });
+        const result = await liveApi.providers.removeCustomProvider({ provider });
         if (!result.success && result.error.code !== "config_repair_failed") {
           setCustomProviderRemoveErrors((prev) => ({
             ...prev,
@@ -1902,7 +1910,7 @@ export function ProvidersSection() {
       }
     },
     [
-      api,
+      liveApi,
       clearCustomProviderRemoveError,
       refresh,
       refreshWorkspaceMetadata,

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { useRouting } from "@/browser/hooks/useRouting";
 import { useWorkspaceState, workspaceStore } from "@/browser/stores/WorkspaceStore";
@@ -123,6 +123,7 @@ export function buildFollowUpFromSource(
 export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRetryState {
   const workspaceState = useWorkspaceState(props.workspaceId);
   const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const [providersConfig, setProvidersConfig] = useState<ProvidersConfigMap | null>(null);
   const { routePriority, routeOverrides } = useRouting();
   const [isRetryingWithCompaction, setIsRetryingWithCompaction] = useState(false);
@@ -256,7 +257,7 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
       model: compactionSuggestion.modelArg,
     });
 
-    if (!api) {
+    if (!liveApi) {
       insertIntoChatInput(suggestedCommandLine + "\n");
       return;
     }
@@ -287,7 +288,7 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
         const maxOutputTokens = parsedCompaction.maxOutputTokens;
         const nestedFollowUp = parsedCompaction.followUpContent;
         const result = await executeCompaction({
-          api,
+          api: liveApi,
           workspaceId: props.workspaceId,
           sendMessageOptions,
           model: compactionSuggestion.modelId,
@@ -321,7 +322,7 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
       // For normal messages (not /compact), build follow-up content directly.
       const followUpContent = buildFollowUpFromSource(source);
       const result = await executeCompaction({
-        api,
+        api: liveApi,
         workspaceId: props.workspaceId,
         sendMessageOptions,
         model: compactionSuggestion.modelId,
@@ -342,14 +343,14 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
         setIsRetryingWithCompaction(false);
       }
     }
-  }, [api, compactionSuggestion, props.workspaceId, triggerUserMessage]);
+  }, [liveApi, compactionSuggestion, props.workspaceId, triggerUserMessage]);
 
   /**
    * Auto-compact on context_exceeded. Runs silently - never touches chat input.
    * Returns true if compaction was attempted, false if preconditions not met.
    */
   const autoCompact = useCallback(async (): Promise<boolean> => {
-    if (!api || !triggerUserMessage || triggerUserMessage.compactionRequest) {
+    if (!liveApi || !triggerUserMessage || triggerUserMessage.compactionRequest) {
       return false;
     }
 
@@ -362,7 +363,7 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
       const followUpContent = buildFollowUpFromSource(triggerUserMessage);
 
       const result = await executeCompaction({
-        api,
+        api: liveApi,
         workspaceId: props.workspaceId,
         sendMessageOptions,
         model: compactionSuggestion?.modelId,
@@ -387,12 +388,12 @@ export function useCompactAndRetry(props: { workspaceId: string }): CompactAndRe
         setIsRetryingWithCompaction(false);
       }
     }
-  }, [api, compactionSuggestion?.modelId, props.workspaceId, triggerUserMessage]);
+  }, [liveApi, compactionSuggestion?.modelId, props.workspaceId, triggerUserMessage]);
 
   // Auto-trigger compaction on context_exceeded for seamless recovery.
   // Only auto-compact if we have a compaction suggestion; otherwise show manual UI.
   const shouldAutoCompact =
-    api &&
+    liveApi &&
     isContextExceeded &&
     providersConfig !== undefined &&
     compactionSuggestion &&

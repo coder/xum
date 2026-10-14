@@ -366,14 +366,13 @@ describe("API reconnection", () => {
     });
   });
 
-  // The stores and deferred writes read useLiveAPI(). Until the provider keeps the last client
-  // in the gap, it must equal useAPI().api in every render, so they see exactly what they saw.
-  test("useLiveAPI() equals useAPI().api in every render across drops and reconnects", async () => {
-    const renders: Array<{ status: string; same: boolean; api: unknown }> = [];
+  // The stores, deferred writes and offline gates read useLiveAPI(): it must be null whenever the
+  // connection is down, even while useAPI().api keeps the last client.
+  test("useLiveAPI() is the client only while connected; useAPI().api keeps it in the gap", async () => {
+    const renders: Array<{ status: string; api: unknown; live: unknown }> = [];
     function Probe() {
       const state = useAPI();
-      const live = useLiveAPI();
-      renders.push({ status: state.status, same: live === state.api, api: state.api });
+      renders.push({ status: state.status, api: state.api, live: useLiveAPI() });
       return null;
     }
     render(
@@ -392,9 +391,12 @@ describe("API reconnection", () => {
       });
       await waitFor(() => expect(MockWebSocket.instances.length).toBeGreaterThan(cycle + 1));
     }
-    expect(renders.filter((r) => r.status === "connected")).not.toHaveLength(0);
-    expect(renders.filter((r) => r.status === "reconnecting")).not.toHaveLength(0);
-    expect(renders.filter((r) => !r.same)).toEqual([]);
+    const connected = renders.filter((r) => r.status === "connected");
+    const offline = renders.filter((r) => r.status === "reconnecting" && r.api != null);
+    expect(connected).not.toHaveLength(0);
+    expect(offline).not.toHaveLength(0);
+    expect(connected.filter((r) => r.live !== r.api)).toEqual([]);
+    expect(offline.filter((r) => r.live !== null)).toEqual([]);
   });
 
   test("shows auth_required on close with auth error codes (4401)", async () => {

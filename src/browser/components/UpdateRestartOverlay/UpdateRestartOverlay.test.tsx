@@ -1,6 +1,6 @@
 import "../../../../tests/ui/dom";
 
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import type { UpdateStatus } from "@/common/orpc/types";
 import { APIContext, type APIClient } from "@/browser/contexts/API";
@@ -9,6 +9,7 @@ import { ThemeProvider } from "../../contexts/ThemeContext";
 import * as RealDarkLogoModule from "@/browser/assets/logos/xum-logo-dark.svg?react";
 import * as RealLightLogoModule from "@/browser/assets/logos/xum-logo-light.svg?react";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
 
 // Restore the real logo modules after this suite so the stubs cannot leak into later files.
 restoreModulesAfterSuite([
@@ -24,6 +25,23 @@ void mock.module("@/browser/assets/logos/xum-logo-light.svg?react", () => ({
   __esModule: true,
   default: () => <svg data-testid="xum-logo-mock" />,
 }));
+
+/** A status stream that stays open until its consumer aborts. */
+function createStatusStreamOverrides() {
+  return {
+    update: {
+      onStatus: (_input: unknown, options?: { signal?: AbortSignal }) =>
+        Promise.resolve(
+          (async function* (): AsyncGenerator<UpdateStatus, void, unknown> {
+            await new Promise<void>((resolve) =>
+              options?.signal?.addEventListener("abort", () => resolve(), { once: true })
+            );
+            yield* [];
+          })()
+        ),
+    },
+  };
+}
 
 /** Push-driven stand-in for the update.onStatus subscription. */
 function createStatusStream() {
@@ -169,5 +187,26 @@ describe("UpdateRestartOverlay", () => {
 
     stream.push({ type: "error", phase: "install", message: "activation failed" });
     await waitFor(() => expect(view.queryByTestId(OVERLAY)).toBeNull());
+  });
+
+  // The App keeps the last client while Xum reconnects (kept-gap), so a drop ends the stream
+  // with ConnectionLostError instead of an effect cleanup: that is not a stream error.
+  test.each([...GAP_MODES])("a lost connection logs no stream error (%s)", async (mode) => {
+    const harness = createConnectionHarness(mode, () => createStatusStreamOverrides());
+    const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      render(
+        <ThemeProvider>
+          <UpdateRestartOverlay />
+        </ThemeProvider>,
+        { wrapper: harness.Wrapper }
+      );
+      await flushStream();
+      await harness.drop();
+      await flushStream();
+      expect(consoleError.mock.calls).toEqual([]);
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 });

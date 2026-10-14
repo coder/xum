@@ -4,6 +4,8 @@
  * nor keeps any `_meta.ui`.
  */
 
+import { sanitizeText } from "@/common/utils/mcp/displayText";
+
 export const MCP_APPS_EXTENSION_ID = "io.modelcontextprotocol/ui";
 export const MCP_APP_MIME_TYPE = "text/html;profile=mcp-app";
 /**
@@ -119,4 +121,98 @@ export function isModelVisibleTool(ui: MCPToolUi | undefined): boolean {
  */
 export function isAppCallableTool(ui: MCPToolUi | undefined): boolean {
   return (ui?.visibility ?? DEFAULT_VISIBILITY).includes("app");
+}
+
+/**
+ * View-initiated tools/call + resources/read budget per view (both reach the server). Opening an
+ * entry point calls its tool, so the backend applies the same budget per workspace and server.
+ */
+export const MCP_APP_TOOL_CALLS_PER_WINDOW = 5;
+export const MCP_APP_TOOL_CALL_WINDOW_MS = 10_000;
+
+/** An entry point type Xum opens (see parseMCPAppEntrypoints for the skipped `file` type). */
+export type MCPAppEntrypointType = "global" | "thread";
+
+/** The spec's limit on entry points per tool. */
+export const MCP_APP_ENTRYPOINTS_MAX = 3;
+
+/**
+ * Read `_meta["openai/ui"].entrypoints` (OpenAI MCP extensions, "MCP App Entrypoints"): at most
+ * three `{type: "global"}`, `{type: "thread"}` or `{type: "file", extensions}` entries. Xum skips
+ * `file` entry points: they open with a FileInput argument and read the file through the
+ * extended `openai/resource` APIs, which Xum does not implement. Unknown types are ignored;
+ * duplicates collapse. `_meta.ui.visibility` does not apply to entry points (the spec ignores it
+ * when a view opens as one), so a `visibility: ["app"]` tool still has its entry points.
+ */
+export function parseMCPAppEntrypoints(meta: unknown): {
+  types: MCPAppEntrypointType[];
+  skippedFile: boolean;
+} {
+  const openaiUi = isRecord(meta) && isRecord(meta["openai/ui"]) ? meta["openai/ui"] : undefined;
+  const raw = Array.isArray(openaiUi?.entrypoints)
+    ? openaiUi.entrypoints.slice(0, MCP_APP_ENTRYPOINTS_MAX)
+    : [];
+  const types = new Set<MCPAppEntrypointType>();
+  let skippedFile = false;
+  for (const entry of raw) {
+    const type = isRecord(entry) ? entry.type : undefined;
+    if (type === "global" || type === "thread") types.add(type);
+    else if (type === "file") skippedFile = true;
+  }
+  return { types: [...types], skippedFile };
+}
+
+/**
+ * Longest tool name the MCP Apps routes accept (a view's tools/call, an entry point listing and
+ * open). An entry point whose tool name does not fit is not listed: one bad name would fail the
+ * listing's output schema for every server.
+ */
+export const MCP_APP_TOOL_NAME_MAX_CHARS = 256;
+
+/** Longest entry point title shown (launcher row, palette command, tab label). */
+export const MCP_APP_ENTRYPOINT_TITLE_MAX_CHARS = 120;
+
+/**
+ * An entry point's display title from a server-controlled candidate list (the spec's order:
+ * `title`, then `annotations.title`), else the tool name: each cleaned like server identity
+ * text (bidi and control characters, which could visually reorder the command the user is
+ * about to run, become spaces; whitespace collapses; a bounded prefix is kept). The first
+ * candidate that is not empty after cleaning wins; undefined when even the name cleans to
+ * nothing (the entry point is then skipped).
+ */
+export function mcpAppEntrypointTitle(
+  candidates: readonly unknown[],
+  toolName: string
+): string | undefined {
+  for (const candidate of [...candidates, toolName]) {
+    const title = sanitizeText(candidate, MCP_APP_ENTRYPOINT_TITLE_MAX_CHARS);
+    if (title !== undefined) return title;
+  }
+  return undefined;
+}
+
+/**
+ * The result-store key of an opened entry point (one view record per server, tool and type).
+ * Names are encoded: server keys contain colons (`plugin:<hex>:<server>`), and a raw join would
+ * give `a` + `b:c` and `a:b` + `c` the same key.
+ */
+export function mcpAppEntrypointKey(
+  serverName: string,
+  toolName: string,
+  type: MCPAppEntrypointType
+): string {
+  return `entrypoint:${encodeKeyPart(serverName)}:${encodeKeyPart(toolName)}:${type}`;
+}
+
+/**
+ * Escape every UTF-16 code unit outside `[A-Za-z0-9._-]` as `%` + four hex digits. Total (unlike
+ * encodeURIComponent, which throws on a lone surrogate: one bad name would fail the whole
+ * listing) and injective (fixed width, `%` itself is escaped). The regex has no `u` flag, so it
+ * matches code units, not code points.
+ */
+function encodeKeyPart(part: string): string {
+  return part.replace(
+    /[^A-Za-z0-9._-]/g,
+    (unit) => `%${unit.charCodeAt(0).toString(16).padStart(4, "0")}`
+  );
 }

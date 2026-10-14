@@ -48,6 +48,11 @@ export const SKILL_DYNAMIC_OUTPUT_CAP_BYTES = 16 * 1024;
  */
 const SKILL_DYNAMIC_DIRECTIVE_RE = /^\s*!`([^`]+)`\s*$/;
 
+/** Whether `line` is a whole-line !`command` directive (it would run when injection is on). */
+export function isSkillDynamicDirectiveLine(line: string): boolean {
+  return SKILL_DYNAMIC_DIRECTIVE_RE.test(line);
+}
+
 export interface SkillDynamicExecResult {
   stdout: string;
   stderr: string;

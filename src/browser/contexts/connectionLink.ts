@@ -12,12 +12,15 @@ const CONNECTION_LOST_CODE = "XUM_CONNECTION_LOST";
  * keeps that behavior. Use isConnectionLostError() to tell it apart from a caller abort or a
  * server-side cancel, which carry the same name.
  */
+/** The message of ConnectionLostError, also for UI that refuses an action while offline. */
+export const CONNECTION_LOST_MESSAGE = "Not connected to the Xum server. Reconnecting…";
+
 export class ConnectionLostError extends Error {
   override readonly name = "AbortError" as const;
   readonly code = CONNECTION_LOST_CODE;
 
   constructor(options?: { cause?: unknown }) {
-    super("Not connected to the Xum server. Reconnecting…", options);
+    super(CONNECTION_LOST_MESSAGE, options);
   }
 }
 
@@ -27,6 +30,14 @@ export function isConnectionLostError(error: unknown): error is ConnectionLostEr
     (error as { code?: unknown }).code === CONNECTION_LOST_CODE &&
     error.name === "AbortError"
   );
+}
+
+/**
+ * Whether a stream or call failure is a real error: not the caller's own abort, and not a lost
+ * connection (the next client starts the work again).
+ */
+export function isStreamFailure(error: unknown, signal: AbortSignal): boolean {
+  return !signal.aborted && !isConnectionLostError(error);
 }
 
 type Link = ClientLink<ClientContext>;
@@ -274,11 +285,20 @@ class GenerationIterator implements AsyncIteratorObject<unknown, unknown, unknow
   }
 
   async throw(error?: unknown): Promise<IteratorResult<unknown, unknown>> {
-    if (this.inner.throw == null) {
+    // A finished or lost stream has no inner cleanup left to wait for, and after detach() nothing
+    // would settle it: throw the error at once, as a finished generator does.
+    const innerThrow = this.innerThrow();
+    if (innerThrow == null) {
       this.finish();
       throw error;
     }
-    return this.cleanUp(this.inner.throw(error));
+    return this.cleanUp(innerThrow(error));
+  }
+
+  /** The inner stream's throw(), unless this stream is finished or lost. */
+  private innerThrow(): ((error?: unknown) => Promise<IteratorResult<unknown, unknown>>) | null {
+    if (this.finished || this.inner.throw == null) return null;
+    return this.inner.throw.bind(this.inner);
   }
 
   [Symbol.asyncIterator](): this {

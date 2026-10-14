@@ -8,6 +8,9 @@ import { AgentProvider } from "@/browser/contexts/AgentContext";
 import { BackgroundBashProvider } from "@/browser/contexts/BackgroundBashContext";
 import { WorkspaceShell } from "../WorkspaceShell/WorkspaceShell";
 
+// For MemoryFileEditor's lazy preview: keeps the Markdown stack in this page's chunk (see there).
+export { MarkdownFilePreview } from "@/browser/features/Messages/MarkdownFilePreview";
+
 interface AIViewProps {
   workspaceId: string;
   projectPath: string;

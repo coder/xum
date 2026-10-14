@@ -39,7 +39,12 @@ describe("AgentSession: compaction request over the context window", () => {
    */
   async function runOverWindowCompaction(
     model: string,
-    options: { resumeAfterFailedRetry?: boolean } = {}
+    options: {
+      resumeAfterFailedRetry?: boolean;
+      withoutRequestMetadata?: boolean;
+      /** The refusal fallback the first stream swapped to before it overflowed. */
+      overflowedOn?: string;
+    } = {}
   ) {
     const workspaceId = `ws-compaction-overflow-${model.replace(/\W/g, "-")}`;
     const { historyService, config, cleanup } = await createTestHistoryService();
@@ -50,12 +55,16 @@ describe("AgentSession: compaction request over the context window", () => {
       parts: [{ type: "text", text: "Summarize the conversation." }],
       metadata: {
         timestamp: 1_000,
-        muxMetadata: {
-          type: "compaction-request",
-          rawCommand: "/compact",
-          parsed: {},
-          source: "auto-compaction",
-        },
+        ...(options.withoutRequestMetadata
+          ? {}
+          : {
+              muxMetadata: {
+                type: "compaction-request",
+                rawCommand: "/compact",
+                parsed: {},
+                source: "auto-compaction",
+              },
+            }),
       },
     } as Parameters<typeof historyService.appendToHistory>[1]);
 
@@ -73,6 +82,8 @@ describe("AgentSession: compaction request over the context window", () => {
         data: createFailedTurnHandle(messageId, {
           error: "prompt is too long",
           errorType: "context_exceeded",
+          // The engine names the model the stream ran on (StreamErrorPayload.model).
+          model: options.overflowedOn ?? model,
         }),
       });
     };
@@ -107,14 +118,20 @@ describe("AgentSession: compaction request over the context window", () => {
         (call) =>
           (call as unknown[])[0] as {
             compactionInputBudgetScale?: number;
+            compactionContextRetryAvailable?: boolean;
             muxProviderOptions?: unknown;
+            modelString?: string;
+            openaiTruncationModeOverride?: string;
           }
       );
       return {
         decision,
         streams: calls,
         budgetScales: requests.map((options) => options.compactionInputBudgetScale),
+        retryAvailable: requests.map((options) => options.compactionContextRetryAvailable),
         retryProviderOptions: requests[1]?.muxProviderOptions,
+        retryModel: requests[1]?.modelString,
+        retryTruncation: requests[1]?.openaiTruncationModeOverride,
       };
     } finally {
       await session.dispose();
@@ -130,14 +147,50 @@ describe("AgentSession: compaction request over the context window", () => {
   });
 
   test("a model that can switch to 1M retries at 1M without the half budget", async () => {
-    const { decision, streams, budgetScales, retryProviderOptions } = await runOverWindowCompaction(
-      "anthropic:claude-sonnet-4-5"
-    );
+    const { decision, streams, budgetScales, retryProviderOptions, retryAvailable } =
+      await runOverWindowCompaction("anthropic:claude-sonnet-4-5");
     expect(decision).toBe("retry-started");
     expect(streams).toBe(2);
     // The retry trims to 70% of the 1M window (turnRequestBuilder), not to half of 200k.
     expect(budgetScales).toEqual([undefined, undefined]);
     expect(retryProviderOptions).toMatchObject({ anthropic: { use1MContext: true } });
+    // The first attempt skips its trim only because this retry follows it.
+    expect(retryAvailable).toEqual([true, false]);
+  });
+
+  test("a compact-agent resume without compaction metadata is told it has no retry", async () => {
+    // No compaction-request row, so no retry is registered: TurnRequestBuilder must trim the
+    // first attempt, or a model that could switch to 1M overflows with nothing to recover it.
+    const { decision, streams, retryAvailable } = await runOverWindowCompaction(
+      "anthropic:claude-sonnet-4-5",
+      { withoutRequestMetadata: true }
+    );
+    expect(decision).toBe("terminal");
+    expect(streams).toBe(1);
+    expect(retryAvailable).toEqual([false]);
+  });
+
+  // A refusal fallback overflowed: its own window decides the plan. The retry starts on the
+  // requested model again, and the builder's fallback rebuild uses the same options and scale.
+  test("a GPT-class fallback that overflowed gets the GPT-class retry", async () => {
+    const { budgetScales, retryModel, retryTruncation } = await runOverWindowCompaction(
+      "anthropic:claude-sonnet-4-5",
+      { overflowedOn: "openai:gpt-4o" }
+    );
+    expect(retryModel).toBe("anthropic:claude-sonnet-4-5");
+    expect(retryTruncation).toBe("auto");
+    expect(budgetScales).toEqual([undefined, COMPACTION_RETRY_INPUT_BUDGET_SCALE]);
+  });
+
+  test("a fallback that can switch to 1M retries with 1M on for that fallback", async () => {
+    const fallback = "anthropic:claude-sonnet-4-5";
+    const { budgetScales, retryModel, retryProviderOptions } = await runOverWindowCompaction(
+      "openai:gpt-4o",
+      { overflowedOn: fallback }
+    );
+    expect(retryModel).toBe("openai:gpt-4o");
+    expect(retryProviderOptions).toMatchObject({ anthropic: { use1MContextModels: [fallback] } });
+    expect(budgetScales).toEqual([undefined, undefined]);
   });
 
   test("a compaction request on a model without a 1M retry recovers", async () => {

@@ -319,6 +319,87 @@ describe("agent_skill_read_file", () => {
     }
   });
 
+  describe("long lines", () => {
+    async function createLongLineTool(tempDir: TestTempDir, content: string) {
+      await writeProjectSkill(tempDir.path, "long-lines", {
+        files: { "playbook.md": content },
+      });
+      return createAgentSkillReadFileTool(
+        createTestToolConfig(tempDir.path, {
+          workspaceId: "regular-workspace",
+          xumScope: {
+            type: "project",
+            xumHome: tempDir.path,
+            projectRoot: tempDir.path,
+            projectStorageAuthority: "host-local",
+          },
+        })
+      );
+    }
+
+    it("returns every byte of long lines across offset/limit pages", async () => {
+      using tempDir = new TestTempDir("test-agent-skill-read-file-long-lines");
+      // Skill markdown often keeps a whole paragraph on one line; 8 x 3,000
+      // bytes is too big for one 16 KB page but fits in two.
+      const lines = Array.from({ length: 8 }, (_, i) =>
+        `line ${i + 1} é `.padEnd(2999, "x").concat(`${i + 1}`)
+      );
+      const tool = await createLongLineTool(tempDir, lines.join("\n"));
+
+      const whole = await executeReadFile(tool, { name: "long-lines", filePath: "playbook.md" });
+      expect(whole.success).toBe(false);
+      if (!whole.success) {
+        expect(whole.error).toContain("offset and limit");
+      }
+
+      const pages = [];
+      for (const offset of [1, 5]) {
+        const page = await executeReadFile(tool, {
+          name: "long-lines",
+          filePath: "playbook.md",
+          offset,
+          limit: 4,
+        });
+        expect(page.success).toBe(true);
+        if (page.success) {
+          pages.push(page.content);
+        }
+      }
+      const rows = pages.join("\n").split("\n");
+      expect(rows.map((row) => row.slice(0, row.indexOf("\t")))).toEqual(
+        lines.map((_, i) => String(i + 1))
+      );
+      expect(rows.map((row) => row.slice(row.indexOf("\t") + 1))).toEqual(lines);
+    });
+
+    it("fails loudly, naming the line, when one line alone exceeds a page", async () => {
+      using tempDir = new TestTempDir("test-agent-skill-read-file-huge-line");
+      const tool = await createLongLineTool(tempDir, `short\n${"y".repeat(20_000)}\nlast`);
+
+      // The oversized line is the second row of the whole-file window and the
+      // first (only) row of the window that pages straight to it.
+      for (const window of [{}, { offset: 2, limit: 1 }]) {
+        const huge = await executeReadFile(tool, {
+          name: "long-lines",
+          filePath: "playbook.md",
+          ...window,
+        });
+        expect(huge.success).toBe(false);
+        if (!huge.success) {
+          expect(huge.error).toContain("Line 2");
+        }
+      }
+
+      // The lines around it stay readable.
+      const last = await executeReadFile(tool, {
+        name: "long-lines",
+        filePath: "playbook.md",
+        offset: 3,
+      });
+      expect(last).toMatchObject({ success: true, content: "3\tlast" });
+    });
+  });
+
   it("rejects project skill file read when skill directory symlink escapes project root", async () => {
     using tempDir = new TestTempDir("test-agent-skill-read-file-project-escape");
 
