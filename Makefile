@@ -6,8 +6,8 @@
 #   make help          - Show all available targets
 #   make dev           - Start development server with hot reload
 #   make build         - Build all targets (parallel when possible)
-#   make static-check  - Run fast local static checks (lint + typecheck + fmt-check)
-#   make static-check-full - Run the full CI static check suite
+#   make static-check  - Run fast local static checks (lint of changed files + typecheck + fmt-check)
+#   make static-check-full - Run the full CI static check suite (lints all files)
 #   make test          - Run tests
 #
 # Parallelism:
@@ -90,7 +90,7 @@ include fmt.mk
 
 .PHONY: all build dev start clean help
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
-.PHONY: lint lint-fix typecheck static-check static-check-full
+.PHONY: lint lint-full lint-fix typecheck static-check static-check-full
 .PHONY: crap crap-check test-crap-scripts
 .PHONY: test-bugbash-repros test-bugbash-known-failures bugbash-sandbox-key bugbash-sandbox-image bugbash-sandbox-publish bug-bash-sandbox-recover bug-bash-sandbox-check test-bugbash-repros-sandbox
 .PHONY: test test-unit test-unit-ci test-integration test-watch test-coverage test-e2e test-e2e-perf perf-tape-replay smoke-test
@@ -479,9 +479,14 @@ build/icon.png: docs/img/logo-white.svg scripts/generate-icons.ts
 ## Quality checks (can run in parallel)
 # Keep the default local path fast. Docs link crawling and lockfile-free bench-agent
 # verification stay in static-check-full so local validation remains responsive.
-static-check: lint typecheck fmt-check check-startup-imports check-react-compiler check-code-docs-links check-test-routing check-test-seam-comments lint-shellcheck lint-hadolint ## Run fast local static checks
+# static-check lints only the files the branch changed (see scripts/lib/lint_targets.js);
+# static-check-full lints all files instead, so CI still catches type-aware findings that a
+# change surfaces in files it did not touch.
+STATIC_CHECKS := typecheck fmt-check check-startup-imports check-react-compiler check-code-docs-links check-test-routing check-test-seam-comments lint-shellcheck lint-hadolint
 
-static-check-full: static-check check-bench-agent test-bench-scripts test-crap-scripts check-docs-links ## Run the full CI static check suite
+static-check: lint $(STATIC_CHECKS) ## Run fast local static checks
+
+static-check-full: lint-full $(STATIC_CHECKS) check-bench-agent test-bench-scripts test-crap-scripts check-docs-links ## Run the full CI static check suite
 
 # Harbor version for benchmark-terminal and the adapter tests below, so CI tests the
 # adapter against the same Harbor API the scheduled benchmark runs.
@@ -534,10 +539,13 @@ check-test-seam-comments: node_modules/.installed ## Fail when production code g
 check-bench-agent: node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Verify terminal-bench agent configuration and imports
 	@./scripts/check-bench-agent.sh
 
-lint: node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Run ESLint (typecheck runs in separate target)
+lint: node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Run ESLint on files changed since the merge base with origin/main [XUM_LINT_BASE=<ref>]
 	@./scripts/lint.sh
 
-lint-fix: node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Run linter with --fix
+lint-full: node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Run ESLint on all files, one run per machine at a time (as CI does)
+	@./scripts/lint.sh --full
+
+lint-fix: node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Run ESLint --fix on changed files (scripts/lint.sh --full --fix for all files)
 	@./scripts/lint.sh --fix
 
 lint-actions: lint-actionlint lint-zizmor ## Lint GitHub Actions workflows

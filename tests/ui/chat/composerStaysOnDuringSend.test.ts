@@ -64,6 +64,30 @@ function sendButton(app: AppHarness): HTMLButtonElement {
   return button;
 }
 
+/**
+ * Holds every DraftStore.beginSend (the send's take of its draft) until `release()`: the window
+ * from Enter until the take that #6405 is about.
+ */
+function holdTakes() {
+  const store = getDraftStore();
+  const realBeginSend = store.beginSend.bind(store);
+  let gates: (() => void)[] = [];
+  const spy = jest
+    .spyOn(store, "beginSend")
+    .mockImplementation(async (...args: Parameters<typeof store.beginSend>) => {
+      await new Promise<void>((resolve) => gates.push(resolve));
+      return realBeginSend(...args);
+    });
+  return {
+    spy,
+    release: () => {
+      const pending = gates;
+      gates = [];
+      for (const open of pending) open();
+    },
+  };
+}
+
 describe("composer during an unsettled send (#6259)", () => {
   beforeAll(async () => {
     await preloadTestModules();
@@ -101,6 +125,80 @@ describe("composer during an unsettled send (#6259)", () => {
     } finally {
       await held.settle();
       held.spy.mockRestore();
+      await app.dispose();
+    }
+  }, 120_000);
+
+  // #6405: the composer stays on from Enter. Keys typed before the send takes its draft follow the
+  // sent text directly ("message 0message 1"); the take removes exactly the sent text.
+  test("typing straight through 10 sends keeps every key and leaves no sent text", async () => {
+    const app = await createAppHarness({ branchPrefix: "composer-on-through-take" });
+    const takes = holdTakes();
+    const scope = { kind: "workspace" as const, workspaceId: app.workspaceId };
+    try {
+      for (let i = 0; i < 10; i++) {
+        const sent = `message ${i}`;
+        const typed = `message ${i + 1}`;
+        await app.chat.send(sent);
+        // Enter was pressed; the send has not taken its draft yet.
+        await waitFor(() => expect(takes.spy).toHaveBeenCalledTimes(i + 1), WAIT);
+        expect(composer(app).disabled).toBe(false);
+        act(() => {
+          getDraftStore().setText(scope, sent + typed);
+        });
+        takes.release();
+        await app.chat.expectTranscriptContains(`Mock response: ${sent}`, WAIT.timeout);
+        await app.chat.expectStreamComplete();
+        await waitFor(() => expect(sendButton(app).disabled).toBe(false), WAIT);
+        expect(composer(app).value).toBe(typed);
+      }
+    } finally {
+      takes.release();
+      takes.spy.mockRestore();
+      await app.dispose();
+    }
+  }, 240_000);
+
+  test("a refused second Enter before the take keeps the first send's take exact", async () => {
+    const app = await createAppHarness({ branchPrefix: "composer-second-enter" });
+    const takes = holdTakes();
+    const scope = { kind: "workspace" as const, workspaceId: app.workspaceId };
+    try {
+      await app.chat.send("first message");
+      await waitFor(() => expect(takes.spy).toHaveBeenCalledTimes(1), WAIT);
+      act(() => {
+        getDraftStore().setText(scope, "first messagex");
+      });
+      // Send waits for the first send to settle: this Enter is refused.
+      fireEvent.keyDown(composer(app), { key: "Enter" });
+      takes.release();
+      await app.chat.expectTranscriptContains("Mock response: first message", WAIT.timeout);
+      await app.chat.expectStreamComplete();
+      await waitFor(() => expect(sendButton(app).disabled).toBe(false), WAIT);
+      expect(composer(app).value).toBe("x");
+      expect(takes.spy).toHaveBeenCalledTimes(1);
+    } finally {
+      takes.release();
+      takes.spy.mockRestore();
+      await app.dispose();
+    }
+  }, 120_000);
+
+  // Commands clear or replace the composer text themselves, so a slash send keeps the lock until
+  // it took its draft.
+  test("a slash command send still locks typing until it took its draft", async () => {
+    const app = await createAppHarness({ branchPrefix: "composer-command-lock" });
+    const takes = holdTakes();
+    try {
+      await app.chat.send("/+0 command message");
+      await waitFor(() => expect(takes.spy).toHaveBeenCalledTimes(1), WAIT);
+      expect(composer(app).disabled).toBe(true);
+      takes.release();
+      await waitFor(() => expect(composer(app).disabled).toBe(false), WAIT);
+      await app.chat.expectStreamComplete();
+    } finally {
+      takes.release();
+      takes.spy.mockRestore();
       await app.dispose();
     }
   }, 120_000);

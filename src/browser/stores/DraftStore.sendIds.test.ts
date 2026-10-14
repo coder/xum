@@ -345,6 +345,48 @@ describe("DraftStore idempotent sends", () => {
     expect((await service.get(SCOPE)).text).toBe("hello\n\nvisible");
   });
 
+  // #6405: the composer stays on from Enter until the send takes its draft.
+  describe("keys typed between Enter and the take", () => {
+    async function takeAfter(edits: string[], options?: { flushFirst: boolean }) {
+      using tempDir = new TestTempDir("draft-sends-typed-after");
+      const { service, client } = await createHarness(tempDir);
+      const store = createStore(client);
+      await store.whenReady();
+      store.setText(SCOPE, "yes");
+      store.markSendStart(SCOPE, "yes");
+      for (const edit of edits) store.setText(SCOPE, edit);
+      if (options?.flushFirst) await store.flush(SCOPE);
+      const send = pendingSend("s1", "yes", RECEIVER);
+      await store.beginSend(SCOPE, {
+        sendId: send.sendId,
+        text: send.text,
+        attachments: [],
+        request: send.request,
+      });
+      await store.flush(SCOPE);
+      return { composer: store.getText(SCOPE), stored: (await service.get(SCOPE)).text };
+    }
+
+    test("keys typed after the sent text stay, without it", async () => {
+      expect(await takeAfter(["yesx", "yesx  y"])).toEqual({ composer: "x  y", stored: "x  y" });
+    });
+
+    test("keys typed after the sent text and saved before the take stay, without it", async () => {
+      const taken = { composer: "x", stored: "x" };
+      expect(await takeAfter(["yesx"], { flushFirst: true })).toEqual(taken);
+    });
+
+    test("a text edited other than by appending since Enter stays whole", async () => {
+      const kept = { composer: "yesterday", stored: "yesterday" };
+      expect(await takeAfter(["yesx", "yes", "yesterday"])).toEqual(kept);
+    });
+
+    test("a text retyped since Enter that starts with the sent text stays whole", async () => {
+      const kept = { composer: "yesterday", stored: "yesterday" };
+      expect(await takeAfter(["y", "yesterday"])).toEqual(kept);
+    });
+  });
+
   test("a window with unsaved text puts a not-accepted send back into it once", async () => {
     using tempDir = new TestTempDir("draft-sends-dirty");
     const { service, client } = await createHarness(tempDir);
@@ -532,6 +574,26 @@ describe("DraftStore idempotent sends", () => {
     await sender.flush(SCOPE);
     expect((await service.get(SCOPE)).text).toBe("hello");
     await waitFor(() => sender.getText(SCOPE) === "hello");
+  });
+
+  // #6405: the composer stays on during the request, so keys typed then follow the take.
+  test("a lost beginSend reply puts the text back beside text typed meanwhile", async () => {
+    using tempDir = new TestTempDir("draft-sends-begin-lost-typed");
+    const { client, hooks } = await createHarness(tempDir);
+    const sender = createStore(client);
+    await sender.whenReady();
+    sender.setText(SCOPE, "ok");
+    sender.markSendStart(SCOPE, "ok");
+    hooks.beforeBeginSend = () => {
+      sender.setText(SCOPE, "okay");
+      return Promise.resolve();
+    };
+    hooks.loseBeginSendReply = true;
+    const request = pendingSend("s1", "ok", RECEIVER).request;
+    await sender
+      .beginSend(SCOPE, { sendId: "s1", text: "ok", attachments: [], request })
+      .catch(() => undefined);
+    expect(sender.getText(SCOPE)).toBe("ok\n\nokay");
   });
 
   test("a lost beginSend reply: while the backend holds the send, a save does not show it twice", async () => {
