@@ -49,7 +49,9 @@ type ResolvedOptions = Options & {
 };
 
 /** The beforeRename default: replace the target without a check. */
-function noCheck(): void {}
+function noCheck(): void {
+  // Intentionally empty: callers without a check replace the target unconditionally.
+}
 
 let invocations = 0;
 const pendingTempFiles = new Set<string>();
