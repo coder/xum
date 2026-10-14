@@ -47,9 +47,8 @@ export interface BoundedTranscriptReveal {
    * row is already inside the mounted range.
    */
   revealThrough: (index: number) => void;
-  /** Rows below toIndex may mount; it is the length unless detached (newest rows unmounted). */
+  /** Rows below toIndex may mount; below the length when detached (newest rows unmounted). */
   toIndex: number;
-  isDetached: boolean;
   /** Mounts up to one budget of newer rows; resetToLatest restarts tail-first, like a switch. */
   revealNewer: () => void;
   resetToLatest: () => void;
@@ -57,6 +56,7 @@ export interface BoundedTranscriptReveal {
 
 interface RevealState {
   workspaceId: string;
+  maxMountedRows: number | undefined;
   /**
    * Bumped on every reset (new workspace, bulk arrival, replaced tail). A step scheduled by an
    * older generation is discarded even when the reset happens to pick the same anchor row,
@@ -136,8 +136,8 @@ function storedSliceEnd(state: RevealState, rows: readonly RevealRow[], isSafeCu
 
 /**
  * Where a slice starting at `fromIndex` ends. Order of operations (#4961 F20): the start is settled
- * first, then a slice over the cap gives up its newest rows in the same render. A first bundle over
- * the cap keeps the end (it mounts whole).
+ * first, then a slice over the cap gives up its newest rows in the same render (a first bundle over
+ * the cap keeps the end: it mounts whole).
  */
 function resolveSliceEnd(
   state: RevealState,
@@ -147,11 +147,10 @@ function resolveSliceEnd(
   isSafeCut: IsSafeCut
 ): number {
   const length = messages.length;
-  // An uncapped slice always ends at the tail, even if a cap was dropped while detached.
   if (max === undefined) return length;
   assert(
-    max >= TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + TRANSCRIPT_REVEAL_CHUNK_ROWS,
-    "maxMountedRows must hold an automatic reveal budget plus a chunk"
+    Number.isInteger(max) && max >= TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + TRANSCRIPT_REVEAL_CHUNK_ROWS,
+    "maxMountedRows must be an integer holding an automatic reveal budget plus a chunk"
   );
   let to = storedSliceEnd(state, messages, isSafeCut);
   const fitted = nearestSafeCutAtOrBefore(fromIndex + max, length, isSafeCut);
@@ -177,7 +176,7 @@ interface RevealSnapshot {
 
 /**
  * The slice moved to start at or before `desired`, end at most `max` rows later and keep row
- * `include`. The budget becomes what is mounted, so the automatic reveal never walks it back.
+ * `include`; the budget becomes what is mounted, so the automatic reveal never walks it back.
  */
 function sliceStateAt(
   previous: RevealState,
@@ -206,7 +205,6 @@ function sliceStateAt(
   return withSliceEnd(moved, messages, endFrom(start));
 }
 
-/** revealNewer: mount up to one budget of newer rows, unmounting the oldest past the cap. */
 function revealNewerState(
   previous: RevealState,
   snapshot: RevealSnapshot,
@@ -220,10 +218,7 @@ function revealNewerState(
   return sliceStateAt(previous, snapshot, Math.max(fromIndex, to - max), toIndex, max, isSafeCut);
 }
 
-/**
- * revealThrough: a target the slice cannot reach while keeping its end centers the slice on it;
- * an older target within reach becomes the navigation target; a mounted one changes nothing.
- */
+/** revealThrough: center the slice on a target out of reach; else step down to an older one. */
 function revealThroughState(
   previous: RevealState,
   snapshot: RevealSnapshot,
@@ -251,6 +246,7 @@ function nearestSafeCutAtOrBefore(
 }
 
 interface StepInputs {
+  maxMountedRows?: number;
   isSafeCut: (index: number) => boolean;
   rowWeight: (index: number) => number;
 }
@@ -304,6 +300,7 @@ function startState<Row extends RevealRow>(
   const length = messages.length;
   const base: Omit<RevealState, "anchorMessageId" | "anchorIndexHint"> = {
     workspaceId,
+    maxMountedRows: inputs.maxMountedRows,
     generation,
     newestMessageId: length > 0 ? messages[length - 1].id : null,
     autoRowLimit: TRANSCRIPT_REVEAL_AUTO_MAX_ROWS,
@@ -317,6 +314,10 @@ function startState<Row extends RevealRow>(
 }
 
 const unitRowWeight = (): number => 1;
+
+/** What identifies one reveal: a new workspace or a changed cap restarts it. */
+const transcriptKey = (reveal: { workspaceId: string; maxMountedRows?: number }) =>
+  `${reveal.workspaceId}\u0000${reveal.maxMountedRows}`;
 
 /**
  * Bundle-granular tail-first reveal for the transcript (progressive RENDERING only; the data
@@ -343,6 +344,7 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
 ): BoundedTranscriptReveal {
   assert(args.workspaceId.length > 0, "useBoundedTranscriptReveal requires a workspaceId");
   const stepInputs: StepInputs = {
+    maxMountedRows: args.maxMountedRows,
     isSafeCut: args.isSafeCut,
     rowWeight: args.rowWeight ?? unitRowWeight,
   };
@@ -355,7 +357,7 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
   let current = state;
   const length = args.messages.length;
   const newestMessageId = length > 0 ? args.messages[length - 1].id : null;
-  let restart = current.workspaceId !== args.workspaceId;
+  let restart = transcriptKey(current) !== transcriptKey(args);
   if (!restart && newestMessageId !== current.newestMessageId) {
     // The tail moved. Rows after the previous newest row are the appended suffix; a previous
     // newest row that is gone means the tail was replaced. An empty transcript that filled
@@ -529,7 +531,6 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
     revealMore,
     revealThrough,
     toIndex,
-    isDetached: toIndex < length,
     revealNewer,
     resetToLatest,
   };
