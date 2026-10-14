@@ -1623,6 +1623,32 @@ describe("McpOauthService OAuth flows", () => {
     });
   });
 
+  test("the stored client stays usable for a refresh after its tokens were invalidated (#6141)", async () => {
+    const serverUrl = "https://example.com/mcp";
+    const oauth: MCPServerOAuthConfig = { clientId: "c", baseScopes: ["read"] };
+    await fs.writeFile(
+      getStoreFilePath(xumHome),
+      JSON.stringify({
+        version: 2,
+        entries: {
+          [serverUrl]: {
+            serverUrl,
+            updatedAtMs: Date.now(),
+            clientInformation: { client_id: "c" },
+            tokens: { access_token: "at", token_type: "Bearer", scope: "read" },
+          },
+        },
+      })
+    );
+    const provider = await service.getAuthProviderForServer({ serverUrl, oauth });
+    if (provider === undefined) throw new Error("expected a provider");
+    // invalid_grant: the SDK drops the tokens, then retries with the stored client. Without it
+    // the SDK would register a new client instead of reaching the sign-in-required path.
+    await provider.invalidateCredentials?.("tokens");
+    expect((await provider.clientInformation())?.client_id).toBe("c");
+    expect(await provider.tokens()).toBeUndefined();
+  });
+
   test("a sign-in granted less than the plugin's base scopes fails and stores no token (#6141)", async () => {
     const server = createServer((req, res) => {
       const pathname = (req.url ?? "/").split("?")[0];
