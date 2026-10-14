@@ -1,6 +1,8 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, fn, userEvent, within } from "storybook/test";
 import { APIProvider } from "@/browser/contexts/API";
+import type { ThemeMode } from "@/browser/contexts/ThemeContext";
+import { textContrasts } from "@/browser/stories/helpers/contrast";
 import { PIXEL_DISABLED, lightweightMeta } from "@/browser/stories/meta.js";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { LegacyPlanImportNotice } from "./LegacyPlanImportBanner";
@@ -71,3 +73,23 @@ export const NothingToImport: Story = {
     await expect(canvas.queryByRole("button", { name: "Import plan" })).toBeNull();
   },
 };
+
+/**
+ * The notice's tinted (`bg-muted/10`) action button label reaches WCAG AA (4.5:1) in each theme.
+ * With `--color-secondary` it was 4.40:1 in dark and 4.02:1 in light (#6453).
+ */
+const contrastStory = (theme: ThemeMode): Story => ({
+  globals: { theme },
+  play: async ({ canvasElement }) => {
+    const button = await within(canvasElement).findByRole("button", { name: "Import plan" });
+    const failing = textContrasts(button)
+      .filter((entry) => entry.ratio < 4.5)
+      .map((entry) => `${entry.ratio.toFixed(2)}:1 "${entry.text}"`);
+    await expect(failing.join("\n")).toBe("");
+  },
+});
+
+export const ContrastLight = contrastStory("light");
+export const ContrastDark = contrastStory("dark");
+export const ContrastFlexokiLight = contrastStory("flexoki-light");
+export const ContrastFlexokiDark = contrastStory("flexoki-dark");

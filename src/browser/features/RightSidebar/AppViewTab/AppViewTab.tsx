@@ -14,6 +14,7 @@ import {
   type McpAppViewRef,
 } from "../ArtifactsTab/mcpAppViewsStore";
 import { Notice } from "../ArtifactsTab/SourceText";
+import { withEntrypointScope } from "./mcpAppEntrypoints";
 
 /**
  * Shown where a view would otherwise mount a second live instance (its tool card, a tab the
@@ -77,7 +78,11 @@ export function AppViewTabLabel(props: { workspaceId: string; toolCallId: string
     <span className="inline-flex min-w-0 items-center gap-1">
       <AppWindow className="h-3 w-3 shrink-0" />
       <span className="min-w-0 truncate">{ref?.label ?? "App view"}</span>
-      {ref != null && <span className="text-muted shrink-0 text-[10px]">{server}</span>}
+      {ref != null && (
+        <span className="text-muted shrink-0 text-[10px]">
+          {withEntrypointScope(server, ref.entrypointType)}
+        </span>
+      )}
       {detail !== "" && <span className="text-muted min-w-0 truncate text-[10px]">{detail}</span>}
     </span>
   );
@@ -91,7 +96,7 @@ export function AppViewTabTooltip(props: { workspaceId: string; toolCallId: stri
   const { ref, detail } = useAppViewTabText(props.workspaceId, props.toolCallId);
   return ref == null ? null : (
     <span className="wrap-anywhere">
-      {ref.label} · {ref.serverLabel ?? ref.serverName}
+      {ref.label} · {withEntrypointScope(ref.serverLabel ?? ref.serverName, ref.entrypointType)}
       {detail !== "" && ` · ${detail}`}
     </span>
   );

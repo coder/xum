@@ -6843,7 +6843,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "- Nested objects become `XUM_TOOL_INPUT_<PARENT>_<CHILD>`",
       "- Arrays also include `..._COUNT` and per-index variables like `..._<INDEX>`",
       "",
-      "If a value is too large for the environment, it may be omitted (not set). Xum also caps the number of flattened env vars and array elements to keep hook execution reliable.",
+      "If a value is too large for the environment or contains a NUL byte, Xum omits it (not set). Xum also caps the number of flattened env vars and array elements to keep hook execution reliable.",
       "",
       "{/* BEGIN TOOL_HOOK_ENV_VARS */}",
       "",

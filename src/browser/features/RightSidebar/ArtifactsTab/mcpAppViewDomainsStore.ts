@@ -1,5 +1,7 @@
 import { useSyncExternalStore } from "react";
-import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
+import type { APIClient } from "@/browser/contexts/API";
+import type { McpAppView, McpAppViewDomains } from "@/common/orpc/schemas/mcpApps";
+import { getErrorMessage } from "@/common/utils/errors";
 
 /**
  * MCP Apps view-domain approvals this renderer changed (artifacts experiment), per project and
@@ -21,6 +23,8 @@ export interface McpAppViewDomainsEntry {
 }
 
 const entries = new Map<string, McpAppViewDomainsEntry>();
+// Counts published changes, so Settings re-lists approvals after any Allow or Revoke.
+let version = 0;
 const listeners = new Set<() => void>();
 
 const keyOf = (projectPath: string, serverName: string) =>
@@ -35,6 +39,7 @@ export function publishMcpAppViewDomains(
   const key = keyOf(projectPath, serverName);
   if ((entries.get(key)?.revision ?? -Infinity) >= revision) return;
   entries.set(key, { revision, origins });
+  version++;
   for (const listener of listeners) listener();
 }
 
@@ -63,4 +68,32 @@ export function newestMcpAppViewDomains(
   return published != null && published.revision > (view?.approvedDomainsRevision ?? 0)
     ? published.origins
     : (view?.approvedDomains ?? []);
+}
+
+/** Changes when an approval list is published: Settings re-lists the stored approvals then. */
+export function useMcpAppViewDomainsVersion(): number {
+  return useSyncExternalStore(subscribe, () => version);
+}
+
+/**
+ * Revokes a server's approvals in a project (Settings and the command palette), and narrows the
+ * server's mounted views at once: they reload under the base policy and ask again. An approval
+ * committed after the revoke has a newer revision, so it still applies. Resolves with the error
+ * of a failed revoke, or null.
+ */
+export async function revokeMcpAppViewDomains(
+  api: APIClient,
+  entry: Pick<McpAppViewDomains, "projectPath" | "serverName">
+): Promise<string | null> {
+  let revision: number;
+  try {
+    ({ revision } = await api.mcpApps.revokeViewDomains({
+      projectPath: entry.projectPath,
+      serverName: entry.serverName,
+    }));
+  } catch (error) {
+    return getErrorMessage(error);
+  }
+  publishMcpAppViewDomains(entry.projectPath, entry.serverName, [], revision);
+  return null;
 }
