@@ -534,9 +534,11 @@ export class AIService extends EventEmitter {
   async runMessageSendHooks(
     workspaceId: string,
     input: MessageSendHookInput,
-    cancelSignal?: AbortSignal
+    cancelSignal?: AbortSignal,
+    /** prepareMessageSendHooks already ran the lazy load for this send. */
+    hooksLoaded = false
   ): Promise<MessageSendHookOutcome> {
-    await this.loadRequestHooksForPrompt(workspaceId);
+    if (!hooksLoaded) await this.loadRequestHooksForPrompt(workspaceId);
     // Codex UserPromptSubmit hooks call their plugin's MCP server, which the turn only starts
     // after this chain: start it first (the turn's own startup, bounded), or the first prompt
     // after a restart misses the hooks. A canceled send ends this wait and its hook calls (see

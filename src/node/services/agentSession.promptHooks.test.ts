@@ -186,6 +186,34 @@ describe("message.send outcomes", () => {
     expect(calls).toEqual([]);
   });
 
+  test("a send with send ids loads the lazy hooks once", async () => {
+    // Codex PRRT_kwDOPxxmWM6sVlZG: the accepted-send check's load must not repeat in the chain.
+    const { h, calls } = await setup(addContext);
+    const prepare = h.aiService.prepareMessageSendHooks?.bind(h.aiService);
+    const run = h.aiService.runMessageSendHooks?.bind(h.aiService);
+    assert(prepare != null && run != null);
+    let loads = 0;
+    const hooksLoaded: Array<boolean | undefined> = [];
+    h.aiService.prepareMessageSendHooks = (id) => {
+      loads++;
+      return prepare(id);
+    };
+    h.aiService.runMessageSendHooks = (id, input, signal, loaded) => {
+      hooksLoaded.push(loaded);
+      return run(id, input, signal, loaded);
+    };
+    const digest = computeSendDigest({ message: "fix the tests" });
+
+    const result = await h.session.sendMessage("fix the tests", options, {
+      sendIdentities: [{ id: "client-send-2", digest }],
+    });
+
+    expect(result.success).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(loads).toBe(1);
+    expect(hooksLoaded).toEqual([true]);
+  });
+
   test("an automatic send ignores a block, so its sender cannot loop on it", async () => {
     const { h } = await setup(blockAll);
     setOnSendCompaction(h, false);

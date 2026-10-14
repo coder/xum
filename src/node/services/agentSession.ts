@@ -997,7 +997,9 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   runMessageSendHooks?(
     workspaceId: string,
     input: MessageSendHookInput,
-    cancelSignal?: AbortSignal
+    cancelSignal?: AbortSignal,
+    /** prepareMessageSendHooks already loaded the lazy hooks for this send: skip the reload. */
+    hooksLoaded?: boolean
   ): Promise<MessageSendHookOutcome>;
   /** The turn.stop prompt-hook chain (see agentPlugins/promptHooks.ts). Absent: no hooks. */
   runTurnStopHooks?(
@@ -4634,8 +4636,12 @@ export class AgentSession {
   }
 
   /** The message.send runner, or undefined when the session has none or a load found no hook. */
-  private sendHookRunner(noHooks: boolean): AgentSessionAIService["runMessageSendHooks"] {
-    return noHooks ? undefined : this.aiService.runMessageSendHooks?.bind(this.aiService);
+  private sendHookRunner(
+    hooksPresent: boolean | undefined
+  ): AgentSessionAIService["runMessageSendHooks"] {
+    return hooksPresent === false
+      ? undefined
+      : this.aiService.runMessageSendHooks?.bind(this.aiService);
   }
 
   /**
@@ -4652,8 +4658,11 @@ export class AgentSession {
     muxMetadata: unknown,
     internal: SendMessageInternalOptions | undefined,
     acceptanceOrigin: TurnAcceptanceOrigin,
-    /** A fresh load found no message.send hook for this workspace. */
-    noHooks = false
+    /**
+     * readSendHooksPresent's result: false skips the chain, true skips its reload (Codex
+     * PRRT_kwDOPxxmWM6sVlZG: a broken hooks.js must not cost its evaluation timeout twice).
+     */
+    hooksPresent?: boolean
   ): Promise<
     MessageSendHookOutcome & {
       /** The hooks checked the request's follow-up; its outcome travels with the follow-up. */
@@ -4666,7 +4675,7 @@ export class AgentSession {
         ? { kind: "context", entries: applied.context }
         : { kind: "none" };
     }
-    const runMessageSendHooks = this.sendHookRunner(noHooks);
+    const runMessageSendHooks = this.sendHookRunner(hooksPresent);
     if (runMessageSendHooks == null) return { kind: "none" };
     const canBlock = internal?.synthetic !== true && acceptanceOrigin === "manual";
     // A turn.stop continuation never reaches the hooks (see skipPromptHooks).
@@ -4679,7 +4688,8 @@ export class AgentSession {
           origin: resolveMessageSendOrigin(muxMetadata, internal, acceptanceOrigin),
           canBlock,
         },
-        internal?.cancelSignal
+        internal?.cancelSignal,
+        hooksPresent === true
       );
     if (!isCompactionRequestMetadata(muxMetadata))
       return this.assertSendHookOutcome(await run(message), canBlock);
@@ -5044,8 +5054,8 @@ export class AgentSession {
       options?.muxMetadata,
       internal,
       attempt.acceptanceOrigin,
-      // The load above found no hook: skip the chain and its second load.
-      sendHooksPresent === false
+      // The load above ran once for this send: the chain does not repeat it.
+      sendHooksPresent
     );
     if (await cancelBeforeAcceptance()) {
       return Ok(undefined);
