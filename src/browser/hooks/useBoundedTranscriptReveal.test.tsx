@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { installDom } from "../../../tests/ui/dom";
 
 import {
+  TRANSCRIPT_MAX_MOUNTED_ROWS,
   TRANSCRIPT_REVEAL_AUTO_MAX_ROWS,
   TRANSCRIPT_REVEAL_CHUNK_ROWS,
   TRANSCRIPT_REVEAL_STEP_CHARS,
@@ -582,6 +583,134 @@ describe("useBoundedTranscriptReveal", () => {
       expect(mounted(result.current.fromIndex)).toBeLessThan(
         TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + TRANSCRIPT_REVEAL_CHUNK_ROWS
       );
+    });
+  });
+
+  // #4961 F20: an opt-in cap on mounted rows. Reading back mounts older rows and unmounts the
+  // newest, so the transcript holds at most `maxMountedRows` rows however far back the reader goes.
+  describe("two-sided slice (maxMountedRows)", () => {
+    const LONG = TRANSCRIPT_MAX_MOUNTED_ROWS * 4;
+    const MAX = TRANSCRIPT_MAX_MOUNTED_ROWS;
+    // Bundles of 10 rows: a slice edge must land on a multiple of 10 (or the transcript end).
+    const bundled = (index: number) => index % 10 === 0;
+
+    function renderSlice(frames: ReturnType<typeof manualFrames>, maxMountedRows?: number) {
+      let props = { workspaceId: "ws", messages: rows(LONG) };
+      const renders: Array<{ from: number; to: number }> = [];
+      const view = renderHook(() => {
+        const reveal = useBoundedTranscriptReveal({ ...props, isSafeCut: bundled, maxMountedRows });
+        renders.push({ from: reveal.fromIndex, to: reveal.toIndex });
+        return reveal;
+      });
+      const runFrames = () => {
+        while (frames.hasPending()) act(() => frames.flush());
+      };
+      const setMessages = (messages: Row[]) => {
+        props = { ...props, messages };
+        view.rerender();
+      };
+      // Detach the slice: Load older until the start passes the cap and the newest rows unmount.
+      const readBack = () => {
+        runFrames();
+        for (let request = 0; request < 10 && !view.result.current.isDetached; request += 1) {
+          act(() => view.result.current.revealMore());
+          runFrames();
+        }
+        expect(view.result.current.isDetached).toBe(true);
+      };
+      return { ...view, renders, runFrames, setMessages, readBack, messages: () => props.messages };
+    }
+
+    test("without maxMountedRows the slice always ends at the tail, as before", () => {
+      const frames = manualFrames();
+      const { result, renders, runFrames } = renderSlice(frames);
+      for (let request = 0; request < LONG / TRANSCRIPT_REVEAL_AUTO_MAX_ROWS; request += 1) {
+        act(() => result.current.revealMore());
+        runFrames();
+      }
+      act(() => result.current.revealNewer());
+      expect(result.current.fromIndex).toBe(0);
+      expect(renders.every((render) => render.to === LONG)).toBe(true);
+      expect(result.current.isDetached).toBe(false);
+    });
+
+    test("older rows mount first, and the newest rows unmount in that same render", () => {
+      const frames = manualFrames();
+      const { result, renders, readBack } = renderSlice(frames, MAX);
+      readBack();
+      // Start priority: the start kept moving down (older rows are what the reader asked for),
+      // and no render ever held more than the cap or cut inside a bundle.
+      expect(result.current.fromIndex).toBeLessThan(LONG - MAX);
+      expect(result.current.toIndex).toBeLessThan(LONG);
+      for (const render of renders) {
+        expect(render.to - render.from).toBeLessThanOrEqual(MAX);
+        expect(render.to === LONG || bundled(render.to)).toBe(true);
+      }
+    });
+
+    test("a detached slice keeps its rows across an older page and new appended rows", () => {
+      const frames = manualFrames();
+      const { result, readBack, setMessages, messages } = renderSlice(frames, MAX);
+      readBack();
+      const before = { from: result.current.fromIndex, to: result.current.toIndex };
+      const oldestId = messages()[before.from].id;
+      const newestId = messages()[before.to - 1].id;
+      setMessages([...rows(30, "old"), ...messages(), ...rows(3, "new")]);
+      expect(result.current.fromIndex).toBe(before.from + 30);
+      expect(result.current.toIndex).toBe(before.to + 30);
+      expect(messages()[result.current.fromIndex].id).toBe(oldestId);
+      expect(messages()[result.current.toIndex - 1].id).toBe(newestId);
+    });
+
+    test("a deleted slice-end row falls back to the nearest kept older row (an edit)", () => {
+      const frames = manualFrames();
+      const { result, readBack, setMessages, messages } = renderSlice(frames, MAX);
+      readBack();
+      const to = result.current.toIndex;
+      const keptId = messages()[to - 2].id;
+      setMessages(messages().filter((_, index) => index !== to - 1));
+      // The slice ends at the bundle edge at or before the kept row just above it, not the tail.
+      expect(result.current.isDetached).toBe(true);
+      expect(bundled(result.current.toIndex)).toBe(true);
+      const keptIndex = messages().findIndex((row) => row.id === keptId);
+      expect(keptIndex - result.current.toIndex).toBeLessThan(10);
+      expect(keptIndex).toBeGreaterThanOrEqual(result.current.toIndex - 1);
+    });
+
+    test("revealNewer walks the slice back to the tail; resetToLatest restarts tail-first", () => {
+      const frames = manualFrames();
+      const { result, readBack } = renderSlice(frames, MAX);
+      readBack();
+      let previousTo = result.current.toIndex;
+      for (let request = 0; request < 20 && result.current.isDetached; request += 1) {
+        act(() => result.current.revealNewer());
+        expect(result.current.toIndex).toBeGreaterThan(previousTo);
+        expect(result.current.toIndex - result.current.fromIndex).toBeLessThanOrEqual(MAX);
+        // The start moved up; the automatic reveal must not walk it back down.
+        expect(frames.hasPending()).toBe(false);
+        previousTo = result.current.toIndex;
+      }
+      expect(result.current.toIndex).toBe(LONG);
+
+      readBack();
+      act(() => result.current.resetToLatest());
+      expect(result.current.toIndex).toBe(LONG);
+      expect(result.current.fromIndex).toBe(LONG - TRANSCRIPT_REVEAL_TAIL_ROWS);
+    });
+
+    test("revealThrough a row beyond the cap centers the slice on it, without stepping", () => {
+      const frames = manualFrames();
+      const { result, runFrames, readBack } = renderSlice(frames, MAX);
+      runFrames();
+      for (const target of [MAX + 300, LONG - MAX / 4]) {
+        if (target > LONG / 2) readBack();
+        act(() => result.current.revealThrough(target));
+        const { fromIndex, toIndex } = result.current;
+        expect(fromIndex).toBeLessThanOrEqual(target);
+        expect(toIndex).toBeGreaterThan(target);
+        expect(Math.abs(target - fromIndex - MAX / 2)).toBeLessThanOrEqual(10);
+        expect(frames.hasPending()).toBe(false);
+      }
     });
   });
 });
