@@ -37,6 +37,7 @@ import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { closeServer, createDeferred, renderOAuthCallbackHtml } from "@/node/utils/oauthUtils";
 import { getErrorMessage } from "@/common/utils/errors";
+import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 
 const DEFAULT_DESKTOP_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_SERVER_TIMEOUT_MS = 10 * 60 * 1000;
@@ -396,9 +397,24 @@ function storedClientUsable(
   stored: MCPOAuthStoredCredentials | null | undefined,
   config: MCPServerOAuthConfig | undefined
 ): boolean {
-  if (config?.clientId !== undefined && stored?.clientInformation?.client_id !== config.clientId)
-    return false;
-  return storedIssuerMatches(stored, config);
+  return (
+    storedClientIdMatches(stored?.clientInformation, config) && storedIssuerMatches(stored, config)
+  );
+}
+
+/**
+ * The client part of storedClientMatches. A config with a provided client needs that client.
+ * A config without one (dynamic registration, or a server the user configured) refuses a
+ * plugin's provided client: two servers at one URL share one record, and the record holds the
+ * other plugin's account (#6159). Known limit: a provided client stored before the mark existed
+ * reads as a registered one.
+ */
+function storedClientIdMatches(
+  stored: MCPOAuthClientInformation | undefined,
+  config: MCPServerOAuthConfig | undefined
+): boolean {
+  if (config?.clientId === undefined) return stored?.provided_by_plugin !== true;
+  return stored?.client_id === config.clientId;
 }
 
 /** The pinned-issuer part of storedClientMatches. */
@@ -503,13 +519,17 @@ function rejectDroppedFlowSave(saved: boolean, flowGeneration: number | undefine
   if (!saved && flowGeneration !== undefined) throw new Error(DROPPED_SIGN_IN_ERROR);
 }
 
-/** SECURITY AUDIT: the store (mcp-oauth.json) never receives a plugin client secret. */
-function withoutPluginSecret(
+/**
+ * The client record the store receives. SECURITY AUDIT: the store (mcp-oauth.json) never
+ * receives a plugin client secret. A provided client is marked, so a config without one does
+ * not use it (storedClientIdMatches).
+ */
+function persistedClientInfo(
   info: MCPOAuthClientInformation,
   config: MCPServerOAuthConfig | undefined
 ): MCPOAuthClientInformation {
   if (config?.clientId === undefined) return info;
-  const persisted = { ...info };
+  const persisted: MCPOAuthClientInformation = { ...info, provided_by_plugin: true };
   delete persisted.client_secret;
   return persisted;
 }
@@ -808,6 +828,11 @@ function deriveAuthorizationServerBinding(
   };
 }
 
+/** The provided-client mark (MCPOAuthClientInformation.provided_by_plugin). */
+function parseProvidedMark(value: Record<string, unknown>): { provided_by_plugin?: true } {
+  return value.provided_by_plugin === true ? { provided_by_plugin: true } : {};
+}
+
 /**
  * Parses the official SDK v2 issuer stamp (SEP-2352 credential/issuer binding)
  * from a stored credentials object. Must survive the store round-trip:
@@ -869,6 +894,7 @@ function parseStoredCredentials(value: unknown): MCPOAuthStoredCredentials | nul
             : undefined,
         ...parseAuthorizationServerBinding(clientInformationRaw),
         ...parseIssuerStamp(clientInformationRaw),
+        ...parseProvidedMark(clientInformationRaw),
       }
     : undefined;
 
@@ -1829,7 +1855,7 @@ export class McpOauthService {
 
         await this.saveClientInformation({
           serverUrl: flow.serverUrlForStoreKey,
-          clientInformation: withoutPluginSecret(next, flow.plugin?.config),
+          clientInformation: persistedClientInfo(next, flow.plugin?.config),
           legacyBinding: deriveAuthorizationServerBinding(flow.discoveryState),
           flowGeneration: flow.signOutGeneration,
         });
@@ -1936,7 +1962,7 @@ export class McpOauthService {
       saveClientInformation: async (clientInformation) => {
         await this.saveClientInformation({
           serverUrl: input.serverUrl,
-          clientInformation: withoutPluginSecret(
+          clientInformation: persistedClientInfo(
             // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
             clientInformation as unknown as MCPOAuthClientInformation,
             input.oauth
@@ -2330,8 +2356,34 @@ export class McpOauthService {
     rejectDroppedFlowSave(saved, input.flowGeneration);
   }
 
+  /**
+   * The identity of the store file the cache was read from (or last written). Another Xum
+   * backend can share mcp-oauth.json (XUM_ALLOW_MULTIPLE_INSTANCES) and sign a server out or in
+   * there: every use and every write first compares the file's identity and rereads it when it
+   * changed (#6123); after its own write it rereads once. Known limit: there is no
+   * cross-process lock, so two writes that interleave can still lose one update.
+   */
+  private storeStamp: string | null = null;
+
+  /** Inode, size and times of the store file ("missing" without one). */
+  private async readStoreStamp(): Promise<string | null> {
+    try {
+      const stat = await fsPromises.stat(this.storeFilePath, { bigint: true });
+      return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) return "missing";
+      // Keep the cache on another stat error: a reread that fails resets the store on disk.
+      log.debug("[MCP OAuth] Could not stat the store file", { error });
+      return this.storeStamp;
+    }
+  }
+
+  private async cacheIsCurrent(): Promise<boolean> {
+    return this.store !== null && (await this.readStoreStamp()) === this.storeStamp;
+  }
+
   private async ensureStoreLoaded(): Promise<void> {
-    if (this.store) {
+    if (await this.cacheIsCurrent()) {
       return;
     }
 
@@ -2341,9 +2393,13 @@ export class McpOauthService {
   }
 
   private async ensureStoreLoadedLocked(): Promise<McpOauthStoreFile> {
-    if (this.store) {
+    // Stat before the read: a write in between only causes one more reread.
+    const stamp = await this.readStoreStamp();
+    if (this.store && stamp === this.storeStamp) {
       return this.store;
     }
+    this.store = null;
+    this.storeStamp = stamp;
 
     try {
       const raw = await fsPromises.readFile(this.storeFilePath, "utf-8");
@@ -2365,7 +2421,7 @@ export class McpOauthService {
       this.store = parsed;
       return parsed;
     } catch (error) {
-      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      if (hasErrorCode(error, "ENOENT")) {
         this.store = createEmptyStore();
         return this.store;
       }
@@ -2396,5 +2452,8 @@ export class McpOauthService {
       encoding: "utf-8",
       mode: 0o600,
     });
+    // Another process can replace the file right after this write, so a stat here can name
+    // its file: reread on the next use instead (the cache is this process's own content).
+    this.storeStamp = null;
   }
 }

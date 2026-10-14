@@ -173,6 +173,18 @@ describe("writeFileAtomic", () => {
     expect((await fs.promises.stat(fresh)).mode & 0o777).toBe(0o640);
   });
 
+  it("the sync writer runs beforeRename and keeps the target when it throws", async () => {
+    expect(() =>
+      writeFileAtomicSync(target, payload, {
+        beforeRename: () => {
+          throw new Error("target changed");
+        },
+      })
+    ).toThrow("target changed");
+    expect(await contents(target)).toBe(previous);
+    expect(await siblings()).toEqual(["config.json"]);
+  });
+
   describe("rename retry", () => {
     const budgetMs = 2000;
     const maxDelayMs = 100;
@@ -223,6 +235,23 @@ describe("writeFileAtomic", () => {
       expect(attempts()).toBe(4);
       expect(sleeps.length).toBe(3);
       expect(await contents(target)).toBe(payload);
+      expect(await siblings()).toEqual(["config.json"]);
+    });
+
+    it("runs beforeRename before every rename attempt, and stops when it throws", async () => {
+      failRenames(errno("EPERM"), 1);
+      let checks = 0;
+      const failure = await writeFileAtomic(target, payload, {
+        // The first check passes. The target then changes during the retry sleep, so the second
+        // check must refuse before the retry renames over it.
+        beforeRename: () => {
+          checks += 1;
+          if (checks > 1) throw new Error("target changed");
+        },
+      }).catch((error: unknown) => error);
+      expect(String(failure)).toContain("target changed");
+      expect(checks).toBe(2);
+      expect(await contents(target)).toBe(previous);
       expect(await siblings()).toEqual(["config.json"]);
     });
 
