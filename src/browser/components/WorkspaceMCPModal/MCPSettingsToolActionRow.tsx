@@ -5,7 +5,7 @@ import { useAPI } from "@/browser/contexts/API";
 import { useConfirmDialog } from "@/browser/contexts/ConfirmDialogContext";
 import { cn } from "@/common/lib/utils";
 import { getErrorMessage } from "@/common/utils/errors";
-import type { MCPSettingsLayoutItem } from "@/common/utils/mcpSettings";
+import type { MCPSettingsLayoutItem, MCPSettingsToolAction } from "@/common/utils/mcpSettings";
 
 interface MCPSettingsToolActionRowProps {
   workspaceId: string;
@@ -22,56 +22,30 @@ interface MCPSettingsToolActionRowProps {
  * user first. A tool Xum cannot run (unlisted, not allowed, or an MCP App) stays a disabled row.
  */
 export function MCPSettingsToolActionRow(props: MCPSettingsToolActionRowProps) {
-  const { api } = useAPI();
-  const { confirm } = useConfirmDialog();
-  const [running, setRunning] = useState(false);
-  const [result, setResult] = useState<{ text: string; isError: boolean } | null>(null);
   const action = props.item.action;
-  const label = action?.title ?? props.item.tool;
-
   if (action === undefined || action.opensApp)
     return (
       <div
         className="text-content-secondary flex items-center justify-between gap-3 text-xs opacity-60"
         aria-disabled="true"
       >
-        <span className="min-w-0 wrap-anywhere">{label}</span>
+        <span className="min-w-0 wrap-anywhere">{action?.title ?? props.item.tool}</span>
         <span className="shrink-0">
           {action === undefined ? "Not available" : "Opens in a later version"}
         </span>
       </div>
     );
+  return <RunnableToolRow {...props} action={action} />;
+}
 
-  const run = async () => {
-    if (!api) return;
-    // Server text is untrusted: the dialog names the tool and server, nothing the tool claims.
-    if (
-      !action.readOnly &&
-      !(await confirm({
-        title: `Run ${label}?`,
-        description: `This tool of ${props.serverName} can change data. Run it only if you trust the server.`,
-        confirmLabel: "Run",
-      }))
-    )
-      return;
-    setRunning(true);
-    setResult(null);
-    try {
-      const response = await api.mcp.settings.runTool({
-        workspaceId: props.workspaceId,
-        serverName: props.serverName,
-        toolName: props.item.tool,
-        instanceToken: props.instanceToken,
-        confirmed: !action.readOnly,
-      });
-      setResult(response.success ? response.data : { text: response.error, isError: true });
-    } catch (caught) {
-      setResult({ text: getErrorMessage(caught), isError: true });
-    } finally {
-      setRunning(false);
-    }
-  };
+interface ToolRunResult {
+  text: string;
+  isError: boolean;
+}
 
+function RunnableToolRow(props: MCPSettingsToolActionRowProps & { action: MCPSettingsToolAction }) {
+  const { running, result, run } = useToolActionRun(props);
+  const label = props.action.title;
   return (
     <div className="space-y-1">
       <div className="flex items-start justify-between gap-3">
@@ -108,4 +82,45 @@ export function MCPSettingsToolActionRow(props: MCPSettingsToolActionRowProps) {
       )}
     </div>
   );
+}
+
+/** Confirm (a tool that can write), run, and keep the latest result. */
+function useToolActionRun(
+  props: MCPSettingsToolActionRowProps & { action: MCPSettingsToolAction }
+) {
+  const { api } = useAPI();
+  const { confirm } = useConfirmDialog();
+  const [running, setRunning] = useState(false);
+  const [result, setResult] = useState<ToolRunResult | null>(null);
+  const { readOnly, title } = props.action;
+
+  const run = async () => {
+    if (!api) return;
+    // Server text is untrusted: the dialog names the tool and server, nothing the tool claims.
+    const confirmed =
+      readOnly ||
+      (await confirm({
+        title: `Run ${title}?`,
+        description: `This tool of ${props.serverName} can change data. Run it only if you trust the server.`,
+        confirmLabel: "Run",
+      }));
+    if (!confirmed) return;
+    setRunning(true);
+    setResult(null);
+    try {
+      const response = await api.mcp.settings.runTool({
+        workspaceId: props.workspaceId,
+        serverName: props.serverName,
+        toolName: props.item.tool,
+        instanceToken: props.instanceToken,
+        confirmed: !readOnly,
+      });
+      setResult(response.success ? response.data : { text: response.error, isError: true });
+    } catch (caught) {
+      setResult({ text: getErrorMessage(caught), isError: true });
+    } finally {
+      setRunning(false);
+    }
+  };
+  return { running, result, run };
 }
