@@ -3,7 +3,10 @@ import ReactDOM from "react-dom/client";
 import { installBrowserLogCapture } from "@/browser/utils/browserLog";
 import { installWindowOpenLocalhostProxyNormalization } from "@/browser/utils/windowOpenLocalhostProxy";
 import { installInactiveAnimationPause } from "@/browser/utils/inactiveAnimations";
-import { installViewportHeightSync } from "@/browser/utils/viewportHeight";
+import {
+  installIosFocusZoomGuard,
+  installViewportHeightSync,
+} from "@/browser/utils/viewportHeight";
 import { removeDroppedCacheKeys } from "@/browser/utils/legacyLocalStorageCleanup";
 import { AppLoader } from "@/browser/components/AppLoader/AppLoader";
 import { initTelemetry } from "@/common/telemetry";
@@ -34,6 +37,12 @@ try {
 
 installWindowOpenLocalhostProxyNormalization();
 installViewportHeightSync();
+
+try {
+  installIosFocusZoomGuard();
+} catch {
+  // Stopping iOS focus zoom is cosmetic and must never block renderer startup.
+}
 
 initTelemetry();
 // vimEnabled lives in config.json, so the startup event waits for the first config snapshot.

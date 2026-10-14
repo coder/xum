@@ -208,7 +208,9 @@
 
   /* Darkened to reach WCAG AA (4.5:1) on #fff, #f5f5f5 and #f8fafc (#5950, #5951). */
   --color-muted: hsl(210 14% 44%);
-  --color-muted-light: hsl(210 20% 60%);
+  /* Same as --color-muted: hsl(210 20% 60%) was 2.7:1 on the sidebar, and a passing value of
+     its own would be darker than --color-muted (#5984). */
+  --color-muted-light: var(--color-muted);
   --color-muted-dark: hsl(210 12% 42%);
   --color-placeholder: hsl(210 16% 52%);
   --color-subtle: hsl(210 20% 64%);
@@ -370,8 +372,8 @@
   --color-content-secondary: #575653;
   --color-content-tertiary: #6f6e69;
   --color-content-disabled: #b7b5ac;
-  --color-muted-foreground: #6f6e69;
-  --color-secondary: #6f6e69;
+  --color-muted-foreground: #575653;
+  --color-secondary: #575653;
   --color-surface-primary: #fffcf0;
   --color-surface-secondary: #f8f5e8;
   --color-content-destructive: #af3029;
@@ -459,9 +461,12 @@
   --color-input-border: #205ea6;
   --color-input-border-focus: color-mix(in srgb, var(--color-input-border), white 30%);
 
-  --color-muted: #6f6e69;
-  --color-muted-light: #6f6e69;
-  --color-muted-dark: #6f6e69;
+  /* Flexoki base-700: WCAG AA (4.5:1) on the sidebar (#f2f0e5, 6.42:1) and on hover
+     (#e6e4d9, 5.75:1). base-600 was 4.47:1 on the sidebar (#5984). The muted, muted-light,
+     muted-dark, muted-foreground and secondary text tokens share it. */
+  --color-muted: #575653;
+  --color-muted-light: #575653;
+  --color-muted-dark: #575653;
   --color-placeholder: #6f6e69;
   --color-subtle: #6f6e69;
   --color-dim: #6f6e69;
@@ -614,7 +619,9 @@
   --color-content-tertiary: #575653;
   --color-content-disabled: #403e3c;
   --color-muted-foreground: #878580;
-  --color-secondary: #575653;
+  /* Flexoki base-400: WCAG AA (4.5:1) on every flexoki-dark surface, down to the slash command
+     rows (#343331, 4.65:1). base-700 was 2.61:1 on the main surface (#6021). */
+  --color-secondary: #9f9d96;
   --color-surface-primary: #100f0f;
   --color-surface-secondary: #1c1b1a;
   --color-content-destructive: #d14d41;
@@ -875,39 +882,6 @@ body,
   [contenteditable="plaintext-only"] {
     -webkit-user-select: text;
     user-select: text;
-  }
-}
-
-/* iOS Safari zooms the page when a text field below 16px gets focus (documented WebKit behavior),
-   and the viewport meta no longer blocks zoom (#5972). Phones in portrait match the width branch.
-   Phones in landscape are wider than 768px, so the height branch covers them; short touch windows
-   and tablet split views below 500px tall match it too. Components with inline font sizes read the
-   variable, which exists only here, so desktop sizes do not change. */
-@media (pointer: coarse) and (max-width: 768px),
-  (pointer: coarse) and (orientation: landscape) and (max-height: 500px) {
-  :root {
-    --min-text-entry-font-size: 16px;
-  }
-
-  /* Raise text-entry fields to the minimum. This rule is outside Tailwind's layers, so it beats
-     `text-xs`/`text-sm` utilities. CSS cannot compare a field's own size with the minimum
-     (`max(16px, 1em)` reads the parent's size), so fields with a larger size class are skipped
-     instead of shrunk. */
-  :is(
-    input:not([type]),
-    input[type="text"],
-    input[type="search"],
-    input[type="email"],
-    input[type="url"],
-    input[type="tel"],
-    input[type="password"],
-    input[type="number"],
-    textarea,
-    select,
-    [contenteditable="true"],
-    [contenteditable="plaintext-only"]
-  ):not(.text-lg, .text-xl, .text-2xl, .text-3xl) {
-    font-size: var(--min-text-entry-font-size);
   }
 }
 
