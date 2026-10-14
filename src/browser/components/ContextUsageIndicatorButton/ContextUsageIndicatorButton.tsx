@@ -12,6 +12,7 @@ import { Switch } from "../Switch/Switch";
 import { formatTokens, type TokenMeterData } from "@/common/utils/tokens/tokenMeterUtils";
 import { cn } from "@/common/lib/utils";
 import { Toggle1MContext } from "../Toggle1MContext/Toggle1MContext";
+import { Skeleton } from "../Skeleton/Skeleton";
 import { COMPOSER_COMPACT_HIDE_CLASS, COMPOSER_CONTROL_HEIGHT_CLASS } from "@/constants/layout";
 
 /** Compact threshold tick mark for the button view */
@@ -39,6 +40,11 @@ interface ContextUsageIndicatorButtonProps {
   idleCompaction?: IdleCompactionConfig;
   /** Current model ID — used to show 1M context toggle for supported models */
   model?: string;
+  /**
+   * False while the workspace's chat history still replays. Usage comes from that history, so
+   * empty `data` then means "not loaded yet", not "no usage" (#6101). Omitted means loaded.
+   */
+  historyLoaded?: boolean;
 }
 
 /** Tick marks with vertical lines attached to the meter */
@@ -193,11 +199,31 @@ const AutoCompactSettings: React.FC<{
   );
 };
 
+/** Button labels; a null `compactLabel` means usage is not loaded yet, so no number shows. */
+function getContextUsageLabels(
+  data: TokenMeterData,
+  historyLoaded: boolean | undefined
+): { ariaLabel: string; compactLabel: string | null } {
+  // Cached rows or the pre-replay snapshot already carry usage and show it at once.
+  if (historyLoaded === false && data.totalTokens === 0) {
+    return { ariaLabel: "Context usage: loading", compactLabel: null };
+  }
+  if (!data.maxTokens) {
+    const total = formatTokens(data.totalTokens);
+    return { ariaLabel: `Context usage: ${total} (unknown limit)`, compactLabel: total };
+  }
+  return {
+    ariaLabel: `Context usage: ${formatTokens(data.totalTokens)} / ${formatTokens(data.maxTokens)} (${data.totalPercentage.toFixed(1)}%)`,
+    compactLabel: `${Math.round(data.totalPercentage)}%`,
+  };
+}
+
 export const ContextUsageIndicatorButton: React.FC<ContextUsageIndicatorButtonProps> = ({
   data,
   autoCompaction,
   idleCompaction,
   model,
+  historyLoaded,
 }) => {
   const isAutoCompactionEnabled = autoCompaction && autoCompaction.threshold < 100;
   const idleHours = idleCompaction?.hours;
@@ -207,15 +233,7 @@ export const ContextUsageIndicatorButton: React.FC<ContextUsageIndicatorButtonPr
   // (idle compaction settings should always be accessible when the prop is passed)
   if (data.totalTokens === 0 && !idleCompaction) return null;
 
-  const ariaLabel = data.maxTokens
-    ? `Context usage: ${formatTokens(data.totalTokens)} / ${formatTokens(data.maxTokens)} (${data.totalPercentage.toFixed(
-        1
-      )}%)`
-    : `Context usage: ${formatTokens(data.totalTokens)} (unknown limit)`;
-
-  const compactLabel = data.maxTokens
-    ? `${Math.round(data.totalPercentage)}%`
-    : formatTokens(data.totalTokens);
+  const { ariaLabel, compactLabel } = getContextUsageLabels(data, historyLoaded);
 
   return (
     <Dialog>
@@ -269,7 +287,7 @@ export const ContextUsageIndicatorButton: React.FC<ContextUsageIndicatorButtonPr
             data-context-usage-percent
             className="text-muted counter-nums text-[10px] font-medium"
           >
-            {compactLabel}
+            {compactLabel ?? <Skeleton className="bg-surface-quaternary h-2 w-[3ch]" />}
           </span>
         </button>
       </DialogTrigger>

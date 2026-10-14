@@ -3613,6 +3613,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                       autoCompaction={autoCompactionProps}
                       idleCompaction={idleCompactionProps}
                       model={contextDisplayModel}
+                      historyLoaded={isTranscriptCaughtUp}
                     />
                   )}
                 </div>
