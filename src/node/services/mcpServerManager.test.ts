@@ -1220,7 +1220,7 @@ describe("MCPServerManager", () => {
       }
     });
 
-    test("the repair wait is charged to the settings deadline", async () => {
+    test("after a repair wait a hook gets cached values only; the next hook reads the misses", async () => {
       const t = await setup("hooks-budget-ws");
       using _tmp = t.tmp;
       const repairGate = Promise.withResolvers<void>();
@@ -1228,26 +1228,21 @@ describe("MCPServerManager", () => {
         await repairGate.promise;
         return t.all;
       });
-      let now = 1_000_000;
-      const clock = spyOn(Date, "now").mockImplementation(() => now);
-      try {
-        const publication = manager.applyWorkspaceOverrides("hooks-budget-ws", {});
-        const hookSettings = manager.getSettingsForPluginHooks(
-          "hooks-budget-ws",
-          "plugin:abc:",
-          1000
-        );
-        // The repair takes 900 ms of the 1000 ms window.
-        now += 900;
-        repairGate.resolve();
-        await publication;
-        while (t.reads.length === 0) await new Promise<void>((resolve) => setImmediate(resolve));
-        expect(t.reads.map((read) => [read.server, read.timeoutMs])).toEqual([["b", 100]]);
-        t.reads.splice(0).forEach((read) => read.settle("cm"));
-        expect(await hookSettings).toEqual({ a: { units: "mm" }, b: { units: "cm" } });
-      } finally {
-        clock.mockRestore();
-      }
+      const publication = manager.applyWorkspaceOverrides("hooks-budget-ws", {});
+      const hookSettings = manager.getSettingsForPluginHooks(
+        "hooks-budget-ws",
+        "plugin:abc:",
+        1000
+      );
+      repairGate.resolve();
+      await publication;
+      // The wait spent this hook's budget: b is not read with what is left.
+      expect(await hookSettings).toEqual({ a: { units: "mm" }, b: {} });
+      expect(t.reads).toEqual([]);
+      const next = manager.getSettingsForPluginHooks("hooks-budget-ws", "plugin:abc:", 1000);
+      expect(t.reads.map((read) => [read.server, read.timeoutMs])).toEqual([["b", 1000]]);
+      t.reads.splice(0).forEach((read) => read.settle("cm"));
+      expect(await next).toEqual({ a: { units: "mm" }, b: { units: "cm" } });
     });
 
     test("a cached server disabled while a sibling's read is in flight is left out", async () => {

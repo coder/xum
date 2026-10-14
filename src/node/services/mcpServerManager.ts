@@ -4814,13 +4814,14 @@ export class MCPServerManager {
   ): Promise<Record<string, Record<string, MCPSettingValue>>> {
     // Null prototype: a plugin server named "__proto__" stays an own key (JSON keeps it).
     const settings = Object.create(null) as Record<string, Record<string, MCPSettingValue>>;
-    // One deadline for the repair wait and the reads (#6186): the reads get what is left.
-    const deadline = Date.now() + timeoutMs;
     // Only awaits when a repair is pending: without one, the reads start synchronously.
     const pendingRepair = this.pendingEnablementRepairs.get(workspaceId);
     if (pendingRepair !== undefined && !(await this.awaitRepairForHooks(pendingRepair, timeoutMs)))
       return settings;
-    const readTimeoutMs = Math.max(0, deadline - Date.now());
+    // After a repair wait, cached values only (#6186): the wait already spent the hook's budget,
+    // and a read given only the rest could time out and stay memoized as failed for the instance.
+    // The next hook call reads the misses with the full timeout.
+    const mayRead = pendingRepair === undefined;
     const entry = this.workspaceServers.get(workspaceId);
     if (entry === undefined) return settings;
     const sources: Array<{
@@ -4839,8 +4840,8 @@ export class MCPServerManager {
         name,
         instance,
         pluginServerName,
-        ...(cached === undefined
-          ? { read: this.readSettingsForHooks(instance, workspaceId, readTimeoutMs) }
+        ...(cached === undefined && mayRead
+          ? { read: this.readSettingsForHooks(instance, workspaceId, timeoutMs) }
           : {}),
       });
     }
