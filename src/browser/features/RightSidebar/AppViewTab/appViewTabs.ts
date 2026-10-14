@@ -1,6 +1,7 @@
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { updatePersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
 import { getAppViewTabKey, makeAppViewTabType, type TabType } from "@/browser/types/rightSidebar";
 import {
+  addTabToFocusedTabset,
   collectAllTabs,
   parseRightSidebarLayoutState,
   selectOrAddTab,
@@ -36,6 +37,20 @@ export function withAppViewTab(
   toolCallId: string
 ): RightSidebarLayoutState {
   return selectOrAddTab(state, appViewTabFor(toolCallId));
+}
+
+/**
+ * Add a view's tab to the workspace's saved layout without making it active, unless it has one.
+ * Works whether or not the workspace's sidebar is mounted (it follows the saved layout).
+ */
+export function saveAppViewTab(workspaceId: string, toolCallId: string): void {
+  updatePersistedState<unknown>(getRightSidebarLayoutKey(workspaceId), (raw) => {
+    const layout = parseRightSidebarLayoutState(raw);
+    const tab = appViewTabFor(toolCallId);
+    return collectAllTabs(layout.root).includes(tab)
+      ? raw
+      : addTabToFocusedTabset(layout, tab, false);
+  });
 }
 
 /**
