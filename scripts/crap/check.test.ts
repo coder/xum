@@ -4,11 +4,12 @@
 // and scripts/test-unit-ci.sh skips it.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 const CHECK = join(import.meta.dir, "check.ts");
+const CI = join(import.meta.dir, "ci.ts");
 // Hermetic git: CI has no identity, and host config (hooks, signing) must not leak in.
 const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
 
@@ -142,3 +143,37 @@ test("a tool error exits 2, not 1", () => {
   expect(result.status).toBe(2);
   expect(result.err).toContain("crap-check: tool error");
 });
+
+// ci.ts as pr.yml's CRAP report step runs it. The Verdict step fails the job
+// only on verdict=violations, so ci.ts must write it exactly when it exits 1.
+function ci(mode: string, base: string) {
+  const output = join(repo, ".git", "github-output");
+  writeFileSync(output, "");
+  const env = {
+    ...GIT_ENV,
+    CRAP_MODE: mode,
+    BASE_REF: base,
+    LCOV_DIR: join(repo, "no-shards"),
+    // Override the runner's own files when this test runs in GitHub Actions.
+    GITHUB_OUTPUT: output,
+    GITHUB_STEP_SUMMARY: "",
+  };
+  const result = spawnSync(process.execPath, [CI], { cwd: repo, env, encoding: "utf8" });
+  return { status: result.status, output: readFileSync(output, "utf8") };
+}
+
+test("ci.ts writes verdict=violations only when block mode exits 1", () => {
+  // Nothing changed: block mode passes.
+  expect(ci("block", "HEAD")).toEqual({ status: 0, output: "" });
+  write(
+    "src/demo/route.ts",
+    BRANCHY.replace("  return 0;", "  if (b > a && a > 0) return a;\n  return 0;")
+  );
+  git("commit", "-q", "-am", "grow");
+
+  expect(ci("block", "HEAD~1")).toEqual({ status: 1, output: "verdict=violations\n" });
+  expect(ci("warn", "HEAD~1")).toEqual({ status: 0, output: "" });
+  // A tool error never blocks.
+  expect(ci("block", "no-such-ref")).toEqual({ status: 0, output: "" });
+  // Four scorer runs: more than bun's default 5 s.
+}, 30_000);
