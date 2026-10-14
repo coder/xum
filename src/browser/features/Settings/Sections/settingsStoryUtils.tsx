@@ -2,8 +2,6 @@ import type { ReactNode } from "react";
 import { useRef } from "react";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ConfirmDialogProvider } from "@/browser/contexts/ConfirmDialogContext";
-import { ExperimentsProvider } from "@/browser/contexts/ExperimentsContext";
-import { PolicyProvider } from "@/browser/contexts/PolicyContext";
 import { ProjectProvider } from "@/browser/contexts/ProjectContext";
 import { ProviderOptionsProvider } from "@/browser/contexts/ProviderOptionsContext";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
@@ -15,19 +13,10 @@ import { createWorkspace, groupWorkspacesByProject } from "@/browser/stories/moc
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
-import {
-  getExperimentKey,
-  getExperimentList,
-  type ExperimentId,
-} from "@/common/constants/experiments";
-import {
-  SELECTED_WORKSPACE_KEY,
-  SIDEBAR_AGE_GROUPING_KEY,
-  TERMINAL_BADGE_CONFIG_KEY,
-  UI_THEME_KEY,
-} from "@/common/constants/storage";
-import type { ServiceTier } from "@/common/config/schemas/providersConfig";
-import type { ServerAuthSession } from "@/common/orpc/types";
+import type { ExperimentId } from "@/common/constants/experiments";
+import { LAST_CUSTOM_MODEL_PROVIDER_KEY, SELECTED_WORKSPACE_KEY } from "@/common/constants/storage";
+import type { UserPreferences } from "@/common/config/schemas/userPreferences";
+import type { ProvidersConfigMap, ServerAuthSession } from "@/common/orpc/types";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { ProjectConfig } from "@/common/types/project";
 import type { TaskSettings } from "@/common/types/tasks";
@@ -43,22 +32,10 @@ interface SettingsSectionStoryProps {
 export function resetStorybookPersistedStateForStory(): void {
   if (typeof localStorage !== "undefined") {
     localStorage.removeItem(SELECTED_WORKSPACE_KEY);
-    localStorage.setItem(UI_THEME_KEY, JSON.stringify("dark"));
 
-    // Storybook reuses one browser origin across stories, so experiment
-    // localStorage overrides from one story must not decide another story's
-    // switch positions. Each story can opt back in through setupSettingsStory().
-    for (const experiment of getExperimentList()) {
-      localStorage.removeItem(getExperimentKey(experiment.id));
-    }
-
-    // Sidebar stories can write sidebarAgeGrouping=false into the shared
-    // origin; clear it so the GeneralSection switch snapshots its default.
-    localStorage.removeItem(SIDEBAR_AGE_GROUPING_KEY);
-
-    // Terminal badge stories seed an enabled badge config; clear it so the
-    // default GeneralSection story snapshots the disabled (collapsed) rows.
-    localStorage.removeItem(TERMINAL_BADGE_CONFIG_KEY);
+    // The Coder catalog ModelsSection stories seed the add row's provider;
+    // clear it so the other ModelsSection stories snapshot their default.
+    localStorage.removeItem(LAST_CUSTOM_MODEL_PROVIDER_KEY);
   }
 }
 
@@ -109,43 +86,26 @@ export function SettingsSectionStory(props: SettingsSectionStoryProps) {
 
   return (
     <APIProvider key={renderKey ?? "settings-section-story"} client={clientRef.current}>
-      <PolicyProvider>
-        <RouterProvider>
-          <ProjectProvider>
-            <WorkspaceProvider>
-              <ExperimentsProvider>
-                <UILayoutsProvider>
-                  <SettingsProvider>
-                    <ProviderOptionsProvider>
-                      <ConfirmDialogProvider>{props.children}</ConfirmDialogProvider>
-                    </ProviderOptionsProvider>
-                  </SettingsProvider>
-                </UILayoutsProvider>
-              </ExperimentsProvider>
-            </WorkspaceProvider>
-          </ProjectProvider>
-        </RouterProvider>
-      </PolicyProvider>
+      <RouterProvider>
+        <ProjectProvider>
+          <WorkspaceProvider>
+            <UILayoutsProvider>
+              <SettingsProvider>
+                <ProviderOptionsProvider>
+                  <ConfirmDialogProvider>{props.children}</ConfirmDialogProvider>
+                </ProviderOptionsProvider>
+              </SettingsProvider>
+            </UILayoutsProvider>
+          </WorkspaceProvider>
+        </ProjectProvider>
+      </RouterProvider>
     </APIProvider>
   );
 }
 
 interface SetupSettingsStoryOptions {
   layoutPresets?: LayoutPresetsConfig;
-  providersConfig?: Record<
-    string,
-    {
-      apiKeySet: boolean;
-      apiKeySource?: "config" | "file" | "env";
-      isEnabled: boolean;
-      isConfigured: boolean;
-      baseUrl?: string;
-      baseUrlSource?: "config" | "env";
-      baseUrlResolved?: string;
-      serviceTier?: ServiceTier;
-      models?: string[];
-    }
-  >;
+  providersConfig?: ProvidersConfigMap;
   providersList?: string[];
   agentAiDefaults?: AgentAiDefaults;
   taskSettings?: Partial<TaskSettings>;
@@ -157,8 +117,9 @@ interface SetupSettingsStoryOptions {
   goalDefaults?: GoalDefaults;
   /** Sessions shown in Settings → Server Access. */
   serverAuthSessions?: ServerAuthSession[];
-  /** Pre-set experiment states in localStorage before render */
-  experiments?: Partial<Record<string, boolean>>;
+  /** Initial backend experiment values for config.getConfig */
+  experiments?: Partial<Record<ExperimentId, boolean>>;
+  userPreferences?: UserPreferences;
 }
 
 /** Setup basic workspace for settings stories. */
@@ -166,13 +127,6 @@ export function setupSettingsStory(options: SetupSettingsStoryOptions): APIClien
   const workspaces = [createWorkspace({ id: "ws-1", name: "main", projectName: "my-app" })];
 
   selectWorkspace(workspaces[0]);
-
-  if (options.experiments) {
-    for (const [experimentId, enabled] of Object.entries(options.experiments)) {
-      const key = getExperimentKey(experimentId as ExperimentId);
-      window.localStorage.setItem(key, JSON.stringify(enabled));
-    }
-  }
 
   return createMockORPCClient({
     projects: groupWorkspacesByProject(workspaces),
@@ -185,7 +139,9 @@ export function setupSettingsStory(options: SetupSettingsStoryOptions): APIClien
     goalDefaults: options.goalDefaults,
     taskSettings: options.taskSettings,
     serverAuthSessions: options.serverAuthSessions,
+    experiments: options.experiments,
     layoutPresets: options.layoutPresets,
+    userPreferences: options.userPreferences,
   });
 }
 

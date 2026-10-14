@@ -10,12 +10,13 @@
  */
 import { describe, test, expect, afterEach, beforeEach } from "bun:test";
 import { Scope } from "effect";
-import { StreamManager, type TurnEngineEvent } from "./streamManager";
+import type { TurnEngineEvent } from "./streamManager";
+import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
 import { closeScopeBounded } from "./di/appRuntime";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
-import type { LanguageModel } from "ai";
+import { createTestLanguageModel } from "./streamManager.suite.testHarness";
 import {
   mulberry32,
   randomHostileValue,
@@ -39,17 +40,6 @@ beforeEach(async () => {
 afterEach(async () => {
   await historyCleanup();
 });
-
-function createTestLanguageModel(): LanguageModel {
-  return {
-    specificationVersion: "v3",
-    provider: "test",
-    modelId: "chaos-model",
-    supportedUrls: {},
-    doGenerate: () => Promise.reject(new Error("doGenerate unused in chaos tests")),
-    doStream: () => Promise.reject(new Error("doStream unused in chaos tests")),
-  };
-}
 
 /** One random provider chunk. Mirrors the shapes a broken upstream can emit. */
 function randomChunk(rng: Rng): unknown {
@@ -126,20 +116,18 @@ describe("StreamManager chaos", () => {
       for (let iter = 0; iter < ITERATIONS; iter++) {
         const workspaceId = `chaos-ws-${iter}`;
         const events: TurnEngineEvent[] = [];
-        const streamManager = new StreamManager(historyService, undefined, undefined, (event) => {
-          events.push(event);
+        const streamManager = createStreamManagerForTests(historyService, {
+          eventSink: (event) => {
+            events.push(event);
+          },
+          streamText: fakeStreamText(() => ({
+            fullStream: randomFullStream(rng),
+            totalUsage: Promise.resolve(rng() < 0.7 ? undefined : randomHostileValue(rng)),
+            usage: Promise.resolve(undefined),
+            providerMetadata: Promise.resolve(rng() < 0.8 ? undefined : randomHostileValue(rng)),
+            steps: Promise.resolve([]),
+          })),
         });
-        Reflect.set(streamManager, "tokenTracker", {
-          setModel: () => Promise.resolve(),
-          countTokens: () => Promise.resolve(0),
-        });
-        Reflect.set(streamManager, "createStreamResult", () => ({
-          fullStream: randomFullStream(rng),
-          totalUsage: Promise.resolve(rng() < 0.7 ? undefined : randomHostileValue(rng)),
-          usage: Promise.resolve(undefined),
-          providerMetadata: Promise.resolve(rng() < 0.8 ? undefined : randomHostileValue(rng)),
-          steps: Promise.resolve([]),
-        }));
 
         const messageId = `chaos-msg-${iter}`;
         const appendResult = await historyService.appendToHistory(workspaceId, {
@@ -153,7 +141,7 @@ describe("StreamManager chaos", () => {
         const result = await streamManager.startStream({
           workspaceId,
           messageId,
-          model: createTestLanguageModel(),
+          model: createTestLanguageModel("chaos-model"),
           messages: [{ role: "user", content: "hello" }],
           modelString: "openai:gpt-4.1-mini",
           historySequence: 1,
@@ -197,7 +185,7 @@ describe("StreamManager chaos", () => {
         const reuse = await streamManager.startStream({
           workspaceId,
           messageId: reuseMessageId,
-          model: createTestLanguageModel(),
+          model: createTestLanguageModel("chaos-model"),
           messages: [{ role: "user", content: "again" }],
           modelString: "openai:gpt-4.1-mini",
           historySequence: 2,
@@ -243,33 +231,21 @@ describe("StreamManager chaos", () => {
       const stopRacesClose = rng() < 0.5;
       const engineScope = Scope.makeUnsafe("parallel");
       const events: TurnEngineEvent[] = [];
-      const streamManager = new StreamManager(
-        historyService,
-        undefined,
-        undefined,
-        (event) => {
-          events.push(event);
-        },
-        undefined,
-        engineScope
-      );
-      Reflect.set(streamManager, "tokenTracker", {
-        setModel: () => Promise.resolve(),
-        countTokens: () => Promise.resolve(0),
-      });
       let nextFullStream: (signal: AbortSignal) => AsyncGenerator<unknown, void, unknown> = () =>
         randomFullStream(rng);
-      Reflect.set(
-        streamManager,
-        "createStreamResult",
-        (_request: unknown, abortController: AbortController) => ({
-          fullStream: nextFullStream(abortController.signal),
+      const streamManager = createStreamManagerForTests(historyService, {
+        eventSink: (event) => {
+          events.push(event);
+        },
+        engineScope,
+        streamText: fakeStreamText((request) => ({
+          fullStream: nextFullStream(request.abortSignal!),
           totalUsage: Promise.resolve(rng() < 0.7 ? undefined : randomHostileValue(rng)),
           usage: Promise.resolve(undefined),
           providerMetadata: Promise.resolve(rng() < 0.8 ? undefined : randomHostileValue(rng)),
           steps: Promise.resolve([]),
-        })
-      );
+        })),
+      });
 
       const started: Array<{ messageId: string; completion: Promise<{ status: string }> }> = [];
       for (let iter = 0; iter < ITERATIONS; iter++) {
@@ -298,7 +274,7 @@ describe("StreamManager chaos", () => {
         const result = await streamManager.startStream({
           workspaceId,
           messageId,
-          model: createTestLanguageModel(),
+          model: createTestLanguageModel("chaos-model"),
           messages: [{ role: "user", content: "hello" }],
           modelString: "openai:gpt-4.1-mini",
           historySequence: 1,
@@ -353,23 +329,21 @@ describe("StreamManager chaos", () => {
     cyclic.self = cyclic;
 
     const events: TurnEngineEvent[] = [];
-    const streamManager = new StreamManager(historyService, undefined, undefined, (event) => {
-      events.push(event);
+    const streamManager = createStreamManagerForTests(historyService, {
+      eventSink: (event) => {
+        events.push(event);
+      },
+      streamText: fakeStreamText(() => ({
+        fullStream: (async function* () {
+          await Promise.resolve();
+          yield { type: "error", error: cyclic };
+        })(),
+        totalUsage: Promise.resolve(undefined),
+        usage: Promise.resolve(undefined),
+        providerMetadata: Promise.resolve(undefined),
+        steps: Promise.resolve([]),
+      })),
     });
-    Reflect.set(streamManager, "tokenTracker", {
-      setModel: () => Promise.resolve(),
-      countTokens: () => Promise.resolve(0),
-    });
-    Reflect.set(streamManager, "createStreamResult", () => ({
-      fullStream: (async function* () {
-        await Promise.resolve();
-        yield { type: "error", error: cyclic };
-      })(),
-      totalUsage: Promise.resolve(undefined),
-      usage: Promise.resolve(undefined),
-      providerMetadata: Promise.resolve(undefined),
-      steps: Promise.resolve([]),
-    }));
 
     const appendResult = await historyService.appendToHistory("cyclic-error-ws", {
       id: "cyclic-error-msg",
@@ -382,7 +356,7 @@ describe("StreamManager chaos", () => {
     const result = await streamManager.startStream({
       workspaceId: "cyclic-error-ws",
       messageId: "cyclic-error-msg",
-      model: createTestLanguageModel(),
+      model: createTestLanguageModel("chaos-model"),
       messages: [{ role: "user", content: "hello" }],
       modelString: "openai:gpt-4.1-mini",
       historySequence: 1,

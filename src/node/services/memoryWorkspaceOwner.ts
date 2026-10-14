@@ -77,7 +77,10 @@ export function workspaceMemoryOwnerResolver(cfg: ProjectsConfig): (workspaceId:
       // redirecting the child into an unrelated tree's notebook. With the
       // parent gone, a live pin decides; a pin whose owner is gone too leaves
       // the child on its own store.
-      const parentWorkspaceId = entry.parentWorkspaceId;
+      // A /side chat reads its main chat's notebook like a sub-agent does (it is a temporary
+      // view of that chat), through its own marker: sharing parentWorkspaceId would make it a
+      // sub-agent everywhere else.
+      const parentWorkspaceId = entry.parentWorkspaceId ?? entry.sideChatParentWorkspaceId;
       const parentLive =
         parentWorkspaceId !== undefined && parentWorkspaceId !== "" && byId.has(parentWorkspaceId);
       if (!parentLive) {

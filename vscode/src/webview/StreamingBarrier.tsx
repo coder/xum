@@ -1,115 +1,79 @@
 import React from "react";
 
 import type { StreamingMessageAggregator } from "xum/browser/utils/messages/StreamingMessageAggregator";
-import { StreamingBarrierView } from "xum/browser/features/Messages/ChatBarrier/StreamingBarrierView";
-import { getModelName } from "xum/common/utils/ai/models";
-import { formatKeybind, KEYBINDS } from "xum/browser/utils/ui/keybinds";
-import { VIM_ENABLED_KEY, getModelKey } from "xum/common/constants/storage";
-import { readPersistedState } from "xum/browser/hooks/usePersistedState";
-import { getDefaultModel } from "xum/browser/hooks/useModelsFromSettings";
-
-type StreamingPhase =
-  | "starting" // Message sent, waiting for stream-start
-  | "interrupting" // User triggered interrupt, waiting for stream-abort
-  | "streaming" // Normal streaming
-  | "compacting" // Compaction in progress
-  | "awaiting-input"; // ask_user_question waiting for response
+import {
+  StreamingBarrierContent,
+  type StreamingBarrierCancelPhase,
+} from "xum/browser/features/Messages/ChatBarrier/StreamingBarrier";
 
 export interface VscodeStreamingBarrierProps {
   workspaceId: string;
   aggregator: StreamingMessageAggregator | null;
+  /** Armed background bash monitors for this workspace, forwarded by the extension host. */
+  activeBashMonitorCount: number;
+  /** Interrupts the stream through the webview's single interrupt path (also used by Esc). */
+  onCancel: (phase: StreamingBarrierCancelPhase) => void;
   className?: string;
 }
 
+/**
+ * The desktop WorkspaceStore's canInterrupt / isStreamStarting, derived from the webview's
+ * aggregator. Also feeds the transcript's turn-active bundle state (#4979).
+ */
+export function getAggregatorStreamState(aggregator: StreamingMessageAggregator): {
+  canInterrupt: boolean;
+  isStreamStarting: boolean;
+} {
+  const canInterrupt = aggregator.hasInterruptibleActiveStream();
+  return {
+    canInterrupt,
+    isStreamStarting:
+      !canInterrupt &&
+      (aggregator.getStreamLifecycle()?.phase === "preparing" ||
+        aggregator.getPendingStreamStartTime() !== null),
+  };
+}
+
+/**
+ * Feeds the desktop barrier from the webview's aggregator (#4971). The webview does not feed
+ * WorkspaceStore, so this mirrors its active-workspace derivation for a caught-up transcript. The
+ * App re-renders on every transcript flush, so the live stats are re-read on each one.
+ */
 export const VscodeStreamingBarrier: React.FC<VscodeStreamingBarrierProps> = (props) => {
   const aggregator = props.aggregator;
   if (!aggregator) {
     return null;
   }
 
-  const canInterrupt = Boolean(aggregator.getActiveStreamMessageId());
-  const isCompacting = aggregator.isCompacting();
-  const awaitingUserQuestion = aggregator.hasAwaitingUserQuestion();
-  const currentModel = aggregator.getCurrentModel() ?? null;
-  const pendingStreamStartTime = aggregator.getPendingStreamStartTime();
-  const pendingCompactionModel = aggregator.getPendingCompactionModel();
-
-  // Determine if we're in "starting" phase (message sent, waiting for stream-start)
-  const isStarting = pendingStreamStartTime !== null && !canInterrupt;
-
-  // Compute streaming phase
-  const phase: StreamingPhase | null = (() => {
-    if (isStarting) return "starting";
-    if (!canInterrupt) return null;
-    if (aggregator.hasInterruptingStream()) return "interrupting";
-    if (awaitingUserQuestion) return "awaiting-input";
-    if (isCompacting) return "compacting";
-    return "streaming";
-  })();
-
-  // Only show token count during active streaming/compacting
-  const showTokenCount = phase === "streaming" || phase === "compacting";
-
-  const timingStats = showTokenCount ? aggregator.getActiveStreamTimingStats() : null;
-  const tokenCount = showTokenCount ? timingStats?.liveTokenCount : undefined;
-  const tps = showTokenCount ? timingStats?.liveTPS : undefined;
-
-  if (!phase) {
-    return null;
-  }
-
-  // Model to display:
-  // - "starting" phase with pending compaction: use the compaction model from the request
-  // - "starting" phase without compaction: read chat model from localStorage
-  // - Otherwise: use currentModel from active stream
-  const model =
-    phase === "starting"
-      ? (pendingCompactionModel ??
-        readPersistedState<string | null>(getModelKey(props.workspaceId), null) ??
-        getDefaultModel())
-      : currentModel;
-  const modelName = model ? getModelName(model) : null;
-
-  // Vim mode affects cancel keybind hint (read once per render, no subscription needed)
-  const vimEnabled = readPersistedState(VIM_ENABLED_KEY, false);
-
-  // Compute status text based on phase
-  const statusText = (() => {
-    switch (phase) {
-      case "starting":
-        return modelName ? `${modelName} starting...` : "starting...";
-      case "interrupting":
-        return "interrupting...";
-      case "awaiting-input":
-        return "Awaiting your input...";
-      case "compacting":
-        return modelName ? `${modelName} compacting...` : "compacting...";
-      case "streaming":
-        return modelName ? `${modelName} streaming...` : "streaming...";
-    }
-  })();
-
-  // Compute cancel hint based on phase
-  const cancelText = (() => {
-    switch (phase) {
-      case "starting":
-      case "interrupting":
-        return "";
-      case "awaiting-input":
-        return "type a message to respond";
-      case "compacting":
-      case "streaming":
-        return `hit ${formatKeybind(vimEnabled ? KEYBINDS.INTERRUPT_STREAM_VIM : KEYBINDS.INTERRUPT_STREAM_NORMAL)} to cancel`;
-    }
-  })();
+  const { canInterrupt, isStreamStarting } = getAggregatorStreamState(aggregator);
+  const messageId = aggregator.getActiveStreamMessageId();
 
   return (
-    <StreamingBarrierView
-      statusText={statusText}
-      tokenCount={tokenCount}
-      tps={tps}
-      cancelText={cancelText}
+    <StreamingBarrierContent
+      workspaceId={props.workspaceId}
+      state={{
+        canInterrupt,
+        isCompacting: aggregator.isCompacting(),
+        isStreamStarting,
+        isInterrupting: aggregator.hasInterruptingStream(),
+        awaitingUserQuestion: aggregator.hasAwaitingUserQuestion(),
+        currentModel: aggregator.getCurrentModel() ?? null,
+        pendingStreamModel: aggregator.getPendingStreamModel(),
+        runtimeStatus: aggregator.getRuntimeStatus(),
+        activeBashMonitorCount: props.activeBashMonitorCount,
+      }}
+      streamingStats={
+        messageId
+          ? {
+              tokenCount: aggregator.getStreamingTokenCount(messageId),
+              tps: aggregator.getStreamingTPS(messageId),
+            }
+          : null
+      }
       className={props.className}
+      onCancel={props.onCancel}
+      // No onConfigureCompaction: the webview has no Settings surface, so the compaction
+      // "configure" hint is intentionally not shown.
     />
   );
 };

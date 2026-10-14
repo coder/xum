@@ -8,6 +8,7 @@ import assert from "@/common/utils/assert";
 import type { WorkspaceSessionLocator } from "@/node/config";
 import { log } from "@/node/services/log";
 import { AsyncSemaphore } from "@/node/utils/concurrency/asyncSemaphore";
+import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { isErrnoWithCode } from "@/node/utils/fs";
 
 /**
@@ -16,6 +17,11 @@ import { isErrnoWithCode } from "@/node/utils/fs";
  * accepted-delivery dedupe and crash recovery.
  */
 export const TERMINAL_ATTENTION_DIR = "terminal-attention";
+
+// Serializes delete() with the status updates' read-then-write per notification file, so an
+// update cannot re-create a record a concurrent delete removed (#5056). Module-level so every
+// store instance over the same sessions dir shares it. In-process only.
+const notificationFileLocks = new MutexMap<string>();
 
 // Enough to keep the disk queue busy on the all-ENOENT fast path without opening thousands of
 // directory handles at once on network or large session dirs.
@@ -279,16 +285,19 @@ export class TerminalAttentionStore {
   }
 
   async delete(ownerWorkspaceId: string, id: string): Promise<void> {
-    await fsPromises.rm(this.file(ownerWorkspaceId, id), { force: true });
+    const file = this.file(ownerWorkspaceId, id);
+    await notificationFileLocks.withLock(file, () => fsPromises.rm(file, { force: true }));
   }
 
   async markPending(ownerWorkspaceId: string, id: string): Promise<void> {
-    const record = await this.get(ownerWorkspaceId, id);
-    if (record?.status !== "delivered") {
-      return;
-    }
-    const { deliveredAt: _deliveredAt, ...pendingRecord } = record;
-    await this.write({ ...pendingRecord, status: "pending" });
+    await notificationFileLocks.withLock(this.file(ownerWorkspaceId, id), async () => {
+      const record = await this.get(ownerWorkspaceId, id);
+      if (record?.status !== "delivered") {
+        return;
+      }
+      const { deliveredAt: _deliveredAt, ...pendingRecord } = record;
+      await this.write({ ...pendingRecord, status: "pending" });
+    });
   }
 
   async markDelivered(ownerWorkspaceId: string, id: string): Promise<void> {
@@ -304,14 +313,16 @@ export class TerminalAttentionStore {
     id: string,
     status: "delivered" | "superseded"
   ): Promise<void> {
-    const record = await this.get(ownerWorkspaceId, id);
-    if (record?.status !== "pending") {
-      return;
-    }
-    await this.write({
-      ...record,
-      status,
-      ...(status === "delivered" ? { deliveredAt: new Date().toISOString() } : {}),
+    await notificationFileLocks.withLock(this.file(ownerWorkspaceId, id), async () => {
+      const record = await this.get(ownerWorkspaceId, id);
+      if (record?.status !== "pending") {
+        return;
+      }
+      await this.write({
+        ...record,
+        status,
+        ...(status === "delivered" ? { deliveredAt: new Date().toISOString() } : {}),
+      });
     });
   }
 

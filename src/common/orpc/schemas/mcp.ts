@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { isMcpAppResourceUri } from "@/common/utils/mcpApps";
 import { MCP_IDENTITY_LIMITS } from "@/common/constants/mcpIdentity";
 import { MCP_ICON_LIMITS } from "@/common/constants/mcpIcon";
 import { isPngDataUrl } from "@/common/utils/mcp/pngDataUrl";
@@ -44,6 +45,8 @@ export const MCPServerPluginProvenanceSchema = z.object({
   componentPolicy: z.object({ registryPath: z.string(), name: z.string() }).optional(),
 });
 
+const MCPConfigLayerSchema = z.enum(["global", "project"]);
+
 export const MCPServerInfoSchema = z.discriminatedUnion("transport", [
   z.object({
     transport: z.literal("stdio"),
@@ -54,6 +57,7 @@ export const MCPServerInfoSchema = z.discriminatedUnion("transport", [
     disabled: z.boolean(),
     toolAllowlist: z.array(z.string()).optional(),
     plugin: MCPServerPluginProvenanceSchema.optional(),
+    configLayer: MCPConfigLayerSchema.optional(),
   }),
   z.object({
     transport: z.literal("http"),
@@ -63,6 +67,7 @@ export const MCPServerInfoSchema = z.discriminatedUnion("transport", [
     disabled: z.boolean(),
     toolAllowlist: z.array(z.string()).optional(),
     plugin: MCPServerPluginProvenanceSchema.optional(),
+    configLayer: MCPConfigLayerSchema.optional(),
   }),
   z.object({
     transport: z.literal("sse"),
@@ -71,6 +76,7 @@ export const MCPServerInfoSchema = z.discriminatedUnion("transport", [
     disabled: z.boolean(),
     toolAllowlist: z.array(z.string()).optional(),
     plugin: MCPServerPluginProvenanceSchema.optional(),
+    configLayer: MCPConfigLayerSchema.optional(),
   }),
   z.object({
     transport: z.literal("auto"),
@@ -79,6 +85,7 @@ export const MCPServerInfoSchema = z.discriminatedUnion("transport", [
     disabled: z.boolean(),
     toolAllowlist: z.array(z.string()).optional(),
     plugin: MCPServerPluginProvenanceSchema.optional(),
+    configLayer: MCPConfigLayerSchema.optional(),
   }),
 ]);
 
@@ -315,6 +322,14 @@ export const MCPToolCallDisplaySchema = z
     source: z.enum(["response", "connection"]),
     /** Immutable session-local ref, never an icon URL or persisted image bytes. */
     iconRef: MCPIconRefSchema.optional().catch(undefined),
+    /**
+     * MCP Apps (artifacts experiment): the tool declares a ui:// view. The server is
+     * `connection.key`; the card offers "Open in Artifacts".
+     */
+    app: z
+      .object({ resourceUri: z.string().refine(isMcpAppResourceUri) })
+      .optional()
+      .catch(undefined),
   })
   .superRefine(enforceUtf8ByteBudget(MCP_IDENTITY_LIMITS.displaySnapshotMaxBytes));
 
@@ -333,3 +348,57 @@ export const MCPTestResultSchema = z.discriminatedUnion("success", [
     oauthChallenge: BearerChallengeSchema.optional(),
   }),
 ]);
+
+/** OpenAI structured settings (validated by common/utils/mcpSettings before it crosses IPC). */
+const MCPSettingValueSchema = z.union([z.string(), z.number(), z.boolean()]);
+const MCPSettingSchemaSchema = z.object({
+  title: z.string(),
+  description: z.string().optional(),
+  type: z.enum(["boolean", "string", "number", "integer"]),
+  enum: z.array(z.string()).optional(),
+  minLength: z.number().optional(),
+  maxLength: z.number().optional(),
+  minimum: z.number().optional(),
+  maximum: z.number().optional(),
+  multipleOf: z.number().optional(),
+});
+export const MCPSettingsSnapshotSchema = z.object({
+  properties: z.record(z.string(), MCPSettingSchemaSchema),
+  values: z.record(z.string(), MCPSettingValueSchema),
+  layout: z.array(
+    z.object({
+      title: z.string(),
+      items: z.array(
+        z.discriminatedUnion("kind", [
+          z.object({ kind: z.literal("property"), property: z.string() }),
+          z.object({
+            kind: z.literal("tool"),
+            tool: z.string(),
+            description: z.string().optional(),
+          }),
+        ])
+      ),
+    })
+  ),
+  warnings: z.array(z.string()),
+  droppedSettingCount: z.number().int().nonnegative(),
+});
+export const MCPSettingsReadParamsSchema = z.object({
+  workspaceId: z.string(),
+  serverName: z.string(),
+});
+/** One call for every server the dialog shows (bulk data in one IPC call). */
+export const MCPSettingsReadInputSchema = z.object({
+  workspaceId: z.string(),
+  // No count limit: the dialog sends every enabled server, and each read has its own timeout.
+  serverNames: z.array(z.string()),
+  /**
+   * Read only servers the workspace already runs; never start or restart one
+   * (the workspace MCP dialog reads on open). Otherwise `{ notConnected: true }`.
+   */
+  ifConnected: z.boolean().optional(),
+});
+export const MCPSettingsUpdateParamsSchema = MCPSettingsReadParamsSchema.extend({
+  /** Changed values only. */
+  set: z.record(z.string(), MCPSettingValueSchema),
+});

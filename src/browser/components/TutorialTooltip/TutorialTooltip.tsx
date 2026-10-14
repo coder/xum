@@ -2,6 +2,13 @@ import React, { useState, useRef, useLayoutEffect } from "react";
 import { createPortal } from "react-dom";
 import { cn } from "@/common/lib/utils";
 
+// The bubble's secondary texts (step counter, body, Skip, opt-out). Plain text-muted on the modal
+// background is below WCAG AA in dark (3.78) and flexoki-light (4.47); 30% of the text color
+// clears it in all four themes (#6010). A class, not an inline style, so hover:text-foreground
+// still wins on the buttons.
+const TUTORIAL_MUTED_TEXT =
+  "text-[color:color-mix(in_srgb,var(--color-muted),var(--color-text)_30%)]";
+
 export interface TutorialStep {
   target: string; // data-tutorial attribute value
   title: string;
@@ -35,7 +42,6 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
 }) => {
   const tooltipRef = useRef<HTMLDivElement>(null);
   const [position, setPosition] = useState<TooltipPosition | null>(null);
-  const [showDisableOption, setShowDisableOption] = useState(false);
 
   useLayoutEffect(() => {
     const targetEl = document.querySelector(`[data-tutorial="${step.target}"]`);
@@ -45,6 +51,7 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
 
     const calculatePosition = () => {
       const target = targetEl.getBoundingClientRect();
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const tooltip = tooltipRef.current!.getBoundingClientRect();
       const viewportWidth = window.innerWidth;
       const viewportHeight = window.innerHeight;
@@ -147,14 +154,6 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
 
   const isLastStep = currentStep === totalSteps;
 
-  const handleDismissClick = () => {
-    if (showDisableOption) {
-      onDismiss();
-    } else {
-      setShowDisableOption(true);
-    }
-  };
-
   return createPortal(
     <>
       {/* Backdrop - subtle overlay */}
@@ -185,36 +184,38 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
         {/* Header */}
         <div className="mb-2 flex items-start justify-between">
           <h3 className="text-sm font-semibold">{step.title}</h3>
-          <span className="text-muted text-xs">
+          <span className={cn(TUTORIAL_MUTED_TEXT, "text-xs")}>
             {currentStep}/{totalSteps}
           </span>
         </div>
 
         {/* Content */}
-        <p className="text-muted mb-4 text-xs leading-relaxed">{step.content}</p>
+        <p className={cn(TUTORIAL_MUTED_TEXT, "mb-4 text-xs leading-relaxed")}>{step.content}</p>
 
         {/* Actions */}
         <div className="flex items-center justify-between">
-          <div>
-            {showDisableOption ? (
-              <button
-                onClick={onDisableTutorial}
-                className="text-muted hover:text-foreground text-[10px] underline transition-colors"
-              >
-                Don&apos;t show tutorials again
-              </button>
-            ) : (
-              <button
-                onClick={handleDismissClick}
-                className="text-muted hover:text-foreground text-xs transition-colors"
-              >
-                Skip
-              </button>
-            )}
+          {/* Skip ends this tutorial only. The opt-out is its own control so a second tap on
+              Skip can never turn off every tutorial. */}
+          <div className="flex items-center gap-3">
+            <button
+              onClick={onDismiss}
+              className={cn(TUTORIAL_MUTED_TEXT, "hover:text-foreground text-xs transition-colors")}
+            >
+              Skip
+            </button>
+            <button
+              onClick={onDisableTutorial}
+              className={cn(
+                TUTORIAL_MUTED_TEXT,
+                "hover:text-foreground text-[10px] underline transition-colors"
+              )}
+            >
+              Don&apos;t show tutorials again
+            </button>
           </div>
           <button
             onClick={isLastStep ? onDismiss : onNext}
-            className="bg-accent rounded px-3 py-1.5 text-xs font-medium text-white transition-colors hover:opacity-90"
+            className="bg-accent text-accent-foreground hover:bg-accent-button-hover rounded px-3 py-1.5 text-xs font-medium transition-colors"
           >
             {isLastStep ? "Done" : "Next"}
           </button>

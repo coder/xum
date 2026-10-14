@@ -9,6 +9,7 @@ import type {
   AgentReportToolResultSchema,
   AgentSkillReadFileToolResultSchema,
   MCPPromptGetToolResultSchema,
+  ModelsListToolResultSchema,
   AgentSkillReadToolResultSchema,
   AskUserQuestionQuestionSchema,
   AskUserQuestionToolResultSchema,
@@ -75,6 +76,11 @@ export type AgentSkillListToolResult =
   | { success: true; skills: AgentSkillDescriptor[] }
   | { success: false; error: string };
 
+// models_list args + result (entries are the shared AvailableModel domain type)
+export type { AvailableModel } from "@/common/utils/ai/selectableModels";
+export type ModelsListToolArgs = z.infer<typeof TOOL_DEFINITIONS.models_list.schema>;
+export type ModelsListToolResult = z.infer<typeof ModelsListToolResultSchema>;
+
 // agent_skill_write result
 export type AgentSkillWriteToolResult =
   | { success: true; diff: string; ui_only?: { file_edit?: { diff: string } } }
@@ -130,9 +136,16 @@ export type SkillsCatalogReadToolResult =
       owner: string;
       repo: string;
       path: string;
-      frontmatter: AgentSkillFrontmatter;
+      /** On the first page only (no offset_chars). */
+      frontmatter?: AgentSkillFrontmatter;
       body: string;
       url: string;
+      /** Set when body is one page of a longer body (see offset_chars). */
+      nextCharOffset?: number;
+      startCharOffset?: number;
+      /** Content hash of the copy the pages come from; pass it back with offset_chars. */
+      snapshot?: string;
+      note?: string;
     }
   | { success: false; error: string };
 
@@ -170,6 +183,12 @@ export type HeartbeatToolResult = z.infer<typeof HeartbeatToolResultSchema>;
 // Timeline-event tool types, derived from schema (avoid drift)
 export type TimelineEventToolArgs = z.infer<typeof TOOL_DEFINITIONS.timeline_event.schema>;
 export type TimelineEventToolResult = z.infer<typeof TimelineEventToolResultSchema>;
+
+// Session-history tool types, derived from schema (avoid drift)
+export type SessionHistoryToolArgs = z.infer<typeof TOOL_DEFINITIONS.session_history.schema>;
+export type SessionHistoryToolResult = z.infer<
+  typeof TOOL_DEFINITIONS.session_history.resultSchema
+>;
 
 // Memory tool types, derived from schema (avoid drift)
 export type MemoryToolArgs = z.infer<typeof TOOL_DEFINITIONS.memory.schema>;
@@ -267,7 +286,6 @@ export const EDIT_FAILED_NOTE_PREFIX = "EDIT FAILED - file was NOT modified.";
 export const NOTE_READ_FILE_RETRY = "Read the file to get current content, then retry.";
 export const NOTE_READ_FILE_FIRST_RETRY =
   "Read the file first to get the exact current content, then retry.";
-export const NOTE_READ_FILE_AGAIN_RETRY = "Read the file again and retry.";
 
 /**
  * Tool description warning for file edit tools
@@ -499,6 +517,23 @@ export interface ToolSearchToolResult {
   matches: Array<{ name: string; description: string; serverName?: string }>;
   /** Total deferred-catalog size, so the model/UI can see there are more undiscovered tools. */
   totalDeferred: number;
+  /**
+   * Present when an oversized definition kept a keyword search from
+   * auto-loading. Nothing was loaded (`matches` is empty, so activation and
+   * replay seeding skip the result by construction); the ranked candidates are
+   * listed, with approximate wire-token sizes, for an explicit exact-name
+   * re-search. Inline type literals (like `matches`) keep the result
+   * JSONValue-assignable for scoped-mode toModelOutput.
+   */
+  discovery?: {
+    candidates: Array<{
+      name: string;
+      serverName?: string;
+      approxTokens: number;
+      oversized?: true;
+    }>;
+    note: string;
+  };
 }
 
 // Notify Tool Types

@@ -1,6 +1,7 @@
 import { Duration, Effect, Exit, Schedule, Scope, type Fiber } from "effect";
 import assert from "@/common/utils/assert";
 import type { MuxMessage } from "@/common/types/message";
+import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
 import type { ProjectsConfig, Workspace } from "@/common/types/project";
 import type { WorkspaceActivitySnapshot, WorkspaceMetadata } from "@/common/types/workspace";
 import { isWorkspaceArchived } from "@/common/utils/archive";
@@ -92,6 +93,14 @@ export class HeartbeatService {
   private readonly trackedTriggerByWorkspaceId = new Map<string, HeartbeatTrigger>();
   private readonly activeWorkspaceIds = new Set<string>();
   private readonly queuedWorkspaceIds = new Set<string>();
+  /**
+   * The persisted schedule version (`heartbeat.scheduleUpdatedAt`) each queued slot was queued
+   * under (#5519). setHeartbeatSettings stamps a new version on every cadence edit, enable and
+   * disable, before any await, so a slot whose version no longer matches config is stale.
+   */
+  private readonly queuedSlotScheduleVersions = new Map<string, number | undefined>();
+  /** The stale probe of each active slot, read by its dispatch payload. */
+  private readonly activeSlotStaleProbes = new Map<string, () => boolean>();
   private isProcessingQueue = false;
   private tickInFlight = false;
   private lifecycleVersion = 0;
@@ -258,6 +267,8 @@ export class HeartbeatService {
     this.trackedTriggerByWorkspaceId.clear();
     this.activeWorkspaceIds.clear();
     this.queuedWorkspaceIds.clear();
+    this.queuedSlotScheduleVersions.clear();
+    this.activeSlotStaleProbes.clear();
     this.isProcessingQueue = false;
     this.tickInFlight = false;
 
@@ -526,6 +537,11 @@ export class HeartbeatService {
     this.nextEligibleAtByWorkspaceId.set(workspaceId, nextEligibleAt);
     this.trackedIntervalMsByWorkspaceId.set(workspaceId, trackingIntervalMs);
     this.trackedTriggerByWorkspaceId.set(workspaceId, trigger);
+    // A slot still waiting in this queue has not fired yet: the edit's deadline replaces it (#5519).
+    if (this.queuedWorkspaceIds.delete(workspaceId)) {
+      this.queuedSlotScheduleVersions.delete(workspaceId);
+      log.debug("HeartbeatService: dropped a queued slot after a cadence edit", { workspaceId });
+    }
     log.debug(
       previousNextEligibleAt == null
         ? "HeartbeatService: tracking workspace"
@@ -551,6 +567,7 @@ export class HeartbeatService {
     this.trackedTriggerByWorkspaceId.delete(workspaceId);
     const removedActive = this.activeWorkspaceIds.delete(workspaceId);
     const removedQueued = this.queuedWorkspaceIds.delete(workspaceId);
+    this.queuedSlotScheduleVersions.delete(workspaceId);
     if (!removedDeadline && !removedInterval && !removedActive && !removedQueued) {
       return;
     }
@@ -574,7 +591,9 @@ export class HeartbeatService {
     }
 
     const { workspaceId, activity } = event;
-    if (!activity || activity.streaming) {
+    // A transientGoalOnly snapshot republishes the last baseline with a live goal overlay: it is no
+    // new activity, and its stale streaming=false must not push back the deadline (#5461).
+    if (!activity || activity.streaming || activity.transientGoalOnly === true) {
       return;
     }
     if (!this.nextEligibleAtByWorkspaceId.has(workspaceId)) {
@@ -684,6 +703,7 @@ export class HeartbeatService {
     }
 
     this.queuedWorkspaceIds.add(workspaceId);
+    this.queuedSlotScheduleVersions.set(workspaceId, this.readScheduleVersion(workspaceId));
     log.info("HeartbeatService: queued heartbeat", {
       workspaceId,
       queueSize: this.queuedWorkspaceIds.size,
@@ -719,6 +739,10 @@ export class HeartbeatService {
 
         this.queuedWorkspaceIds.delete(workspaceId);
         this.activeWorkspaceIds.add(workspaceId);
+        const scheduleVersion = this.queuedSlotScheduleVersions.get(workspaceId);
+        this.queuedSlotScheduleVersions.delete(workspaceId);
+        const slotStale = () => this.readScheduleVersion(workspaceId) !== scheduleVersion;
+        this.activeSlotStaleProbes.set(workspaceId, slotStale);
 
         // Capture the fire time before dispatching so fixed-interval cadences exclude
         // dispatch duration (see advanceAnchoredDeadline).
@@ -729,7 +753,14 @@ export class HeartbeatService {
           log.error("HeartbeatService: heartbeat dispatch request failed", { workspaceId, error });
         } finally {
           this.activeWorkspaceIds.delete(workspaceId);
-          if (!this.stopped) {
+          // Only this slot's probe: a replacement slot may be active by now.
+          if (this.activeSlotStaleProbes.get(workspaceId) === slotStale) {
+            this.activeSlotStaleProbes.delete(workspaceId);
+          }
+          // A cadence edit during the slot re-anchors the schedule itself (#5519): its metadata
+          // event, or for an edit seen only in config the next resync, sets the new deadline.
+          // Re-anchoring here at this slot's fire time or end would overwrite it.
+          if (!this.stopped && !slotStale()) {
             const config = this.config.loadConfigOrDefault();
             const workspace = this.findWorkspaceConfigEntry(workspaceId, config);
             const trackingIntervalMs = workspace
@@ -779,17 +810,24 @@ export class HeartbeatService {
       return null;
     }
 
+    // A dispatch without an active slot (none in production) is never stale.
+    const slotStale = this.activeSlotStaleProbes.get(workspaceId) ?? (() => false);
     return {
       dispatch: async () => {
         log.info("HeartbeatService: executing heartbeat", { workspaceId });
-        this.timelineRecorder.record(workspaceId, {
-          kind: "heartbeat.dispatched",
-          source: { system: "heartbeat" },
-          status: "started",
-        });
-        await this.workspaceService.executeHeartbeat(workspaceId);
+        // executeHeartbeat records heartbeat.dispatched once the heartbeat's send is accepted,
+        // or heartbeat.skipped when it was turned off or its cadence was edited after it fired.
+        await this.workspaceService.executeHeartbeat(workspaceId, { slotStale });
       },
     };
+  }
+
+  /** The workspace's persisted schedule version: see queuedSlotScheduleVersions. */
+  private readScheduleVersion(workspaceId: string): number | undefined {
+    const config = this.config.loadConfigOrDefault();
+    return (
+      this.findWorkspaceConfigEntry(workspaceId, config)?.heartbeat?.scheduleUpdatedAt ?? undefined
+    );
   }
 
   async checkEligibility(workspaceId: string, now: number): Promise<HeartbeatEligibilityResult> {
@@ -839,7 +877,10 @@ export class HeartbeatService {
       return { eligible: false, reason: "no_completed_turn" };
     }
 
-    const lastMessage = history[history.length - 1];
+    // Judge the tail by the last row the model would see: hidden plan-review records
+    // (resolve/reopen or an on-demand snapshot appended while idle) are user-role rows but never
+    // a prompt awaiting a response, and must not disable scheduled heartbeats.
+    const lastMessage = history.findLast((message) => !isPlanReviewRecordMessage(message));
     // An idle unanswered user message stays a hard gate for every whenBusy policy: injecting a
     // scheduled message into that abnormal state risks clobbering a failed/interrupted user
     // turn. During an active stream, however, the in-progress assistant output lives only in

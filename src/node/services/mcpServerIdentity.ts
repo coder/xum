@@ -8,6 +8,7 @@ import type {
   MCPToolCallDisplaySource,
 } from "@/common/types/mcp";
 import { isPlainObject } from "@/common/utils/isPlainObject";
+import { sanitizeText } from "@/common/utils/mcp/displayText";
 import { httpsOriginOf, isHttpsUrlWithoutUserinfo } from "@/common/utils/mcp/httpsUrl";
 
 /**
@@ -37,42 +38,9 @@ export interface NormalizedServerIdentity {
   iconCandidates: IconCandidate[];
 }
 
-/**
- * Characters that can hide, reorder, or terminate display text: C0/C1
- * controls, line/paragraph separators, and the Unicode bidi controls.
- */
-const UNSAFE_TEXT = /[\p{Cc}\u2028\u2029\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]+/gu;
-
 const ICON_MIME_TYPE_MAX_CHARS = 64;
 const ICON_SIZES_MAX = 8;
 const ICON_SIZE_MAX_CHARS = 16;
-
-/**
- * Display-text sanitizer over a bounded raw prefix. `maxChars` is the raw
- * UTF-16 inspection budget (the unit zod's string `max` counts): the value is
- * clipped to it first, never splitting a surrogate pair (a pair straddling
- * the boundary is dropped, not halved), and only that prefix is sanitized:
- * unsafe characters become a space, whitespace runs collapse, the result is
- * trimmed. Nothing beyond the prefix is ever read, so a field whose in-budget
- * prefix normalizes to nothing yields undefined even if valid text follows,
- * and normalized text can be shorter than the budget. Replacements never
- * lengthen text, so the result always fits the limit. Returns undefined for
- * non-strings and empty results. This bounds work per field; it is not a
- * latency guarantee for MCP parsing as a whole.
- */
-function sanitizeText(value: unknown, maxChars: number): string | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
-  let prefix = value;
-  if (value.length > maxChars) {
-    const lastUnit = value.charCodeAt(maxChars - 1);
-    const cut = lastUnit >= 0xd800 && lastUnit <= 0xdbff ? maxChars - 1 : maxChars;
-    prefix = value.slice(0, cut);
-  }
-  const cleaned = prefix.replace(UNSAFE_TEXT, " ").replace(/\s+/gu, " ").trim();
-  return cleaned.length > 0 ? cleaned : undefined;
-}
 
 function normalizeWebsiteUrl(value: unknown): string | undefined {
   // URLs are never truncated (that would change their meaning). The raw length
@@ -175,6 +143,14 @@ export function normalizeServerIdentity(raw: unknown): NormalizedServerIdentity 
 }
 
 /**
+ * Display form of a configured server key, as carried by tool-card snapshots (`connection.key`).
+ * Keys longer than the limit or with whitespace runs/control characters differ from it.
+ */
+export function displayConnectionKey(key: string): string {
+  return sanitizeText(key, MCP_IDENTITY_LIMITS.connectionKeyMaxChars) ?? "";
+}
+
+/**
  * Credential-free description of a configured connection for display beside
  * an identity. stdio servers contribute only their key (command and args can
  * carry tokens); url servers contribute the https origin of their URL —
@@ -194,7 +170,7 @@ export function describeConnection(
   actualTransport?: "stdio" | "http" | "sse"
 ): MCPConnectionRef {
   const ref: MCPConnectionRef = {
-    key: sanitizeText(key, MCP_IDENTITY_LIMITS.connectionKeyMaxChars) ?? "",
+    key: displayConnectionKey(key),
     transport: "stdio",
   };
   if (config.transport === "stdio") {
@@ -224,7 +200,8 @@ function withoutUndefinedValues<T extends object>(value: T): T {
  * undefined when there is no identity or the connection ref is invalid;
  * otherwise drops optional identity fields (description, then websiteUrl,
  * then title) until the snapshot passes `MCPToolCallDisplaySchema`,
- * including its aggregate byte budget. The result carries no
+ * including its aggregate byte budget; if it still does not fit, it starts
+ * over without the MCP Apps `app` link. The result carries no
  * undefined-valued keys.
  */
 export function buildToolCallDisplay(input: {
@@ -232,16 +209,24 @@ export function buildToolCallDisplay(input: {
   identity: MCPServerIdentity | undefined;
   source: MCPToolCallDisplaySource;
   iconRef?: string;
+  /** MCP Apps view of the tool (artifacts experiment). */
+  app?: { resourceUri: string };
 }): MCPToolCallDisplay | undefined {
   if (!input.identity) {
     return undefined;
   }
-  const identity: MCPServerIdentity = { ...input.identity };
-  const candidate = {
+  const candidate: {
+    connection: MCPConnectionRef;
+    identity: MCPServerIdentity;
+    source: MCPToolCallDisplaySource;
+    iconRef: string | undefined;
+    app: { resourceUri: string } | undefined;
+  } = {
     connection: input.connection,
-    identity,
+    identity: { ...input.identity },
     source: input.source,
     iconRef: input.iconRef,
+    app: input.app,
   };
   for (let attempt = 0; ; attempt++) {
     const parsed = MCPToolCallDisplaySchema.safeParse(candidate);
@@ -251,13 +236,23 @@ export function buildToolCallDisplay(input: {
         identity: withoutUndefinedValues(parsed.data.identity),
         source: parsed.data.source,
         ...(parsed.data.iconRef ? { iconRef: parsed.data.iconRef } : {}),
+        ...(parsed.data.app ? { app: parsed.data.app } : {}),
       };
     }
     const field = DISPLAY_TRIM_ORDER[attempt];
     if (field === undefined) {
+      // Last resort before dropping the whole snapshot (identity and badge): start over
+      // without the app view link, which can be large (a long non-ASCII ui:// URI), so the
+      // identity keeps every field that fits without it.
+      if (candidate.app !== undefined) {
+        candidate.app = undefined;
+        candidate.identity = { ...input.identity };
+        attempt = -1;
+        continue;
+      }
       return undefined;
     }
-    delete identity[field];
+    delete candidate.identity[field];
   }
 }
 

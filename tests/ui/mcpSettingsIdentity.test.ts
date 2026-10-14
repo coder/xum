@@ -1,9 +1,11 @@
 import "./dom";
 import { fireEvent, waitFor, within } from "@testing-library/react";
+import type { BoundFunctions, queries } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { shouldRunIntegrationTests } from "../testUtils";
 import { preloadTestModules } from "../ipc/setup";
 import { createAppHarness, type AppHarness } from "./harness";
+import { openSettingsDialog } from "./helpers";
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { getMCPTestResultsKey } from "@/common/constants/storage";
 import type { CachedMCPTestResult, MCPTestResult } from "@/common/types/mcp";
@@ -27,7 +29,7 @@ const BRANDED: MCPTestResult = {
   },
 };
 
-type Canvas = ReturnType<typeof within>;
+type Canvas = BoundFunctions<typeof queries>;
 
 /** The Settings row card for one configured server (contains its switch and actions). */
 function serverRow(canvas: Canvas, name: string): HTMLElement {
@@ -40,9 +42,8 @@ function serverRow(canvas: Canvas, name: string): HTMLElement {
 }
 
 async function openMcpSettings(app: AppHarness) {
-  const canvas = within(app.view.container);
-  fireEvent.click(await canvas.findByTestId("settings-button"));
-  fireEvent.click((await canvas.findAllByRole("button", { name: "MCP" }))[0]);
+  const canvas = await openSettingsDialog(app.view.container);
+  fireEvent.click(await canvas.findByRole("button", { name: "MCP" }));
   await canvas.findByRole("switch", { name: `Toggle ${SERVER} enabled` }, { timeout: 10000 });
   return canvas;
 }

@@ -7,23 +7,13 @@ import { ProviderIcon } from "../ProviderIcon/ProviderIcon";
 import { Button } from "../Button/Button";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import type { UpdateStatus } from "@/common/orpc/types";
-import {
-  AlertTriangle,
-  BarChart3,
-  Download,
-  Loader2,
-  RefreshCw,
-  ShieldCheck,
-  X,
-} from "lucide-react";
+import { AlertTriangle, BarChart3, Download, Loader2, RefreshCw, X } from "lucide-react";
 
 import { useAPI } from "@/browser/contexts/API";
 import { useAboutDialog } from "@/browser/contexts/AboutDialogContext";
-import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { useRouter } from "@/browser/contexts/RouterContext";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useRouting } from "@/browser/hooks/useRouting";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import {
   formatMuxGatewayBalance,
@@ -35,7 +25,8 @@ import {
   DESKTOP_TITLEBAR_HEIGHT_CLASS,
 } from "@/browser/hooks/useDesktopTitlebar";
 
-import { DEFAULT_MODEL_KEY, getModelKey } from "@/common/constants/storage";
+import { useWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
+import { useAppConfig } from "@/browser/stores/AppConfigStore";
 import { PROVIDER_DISPLAY_NAMES } from "@/common/constants/providers";
 import {
   getExplicitGatewayPrefix,
@@ -43,6 +34,7 @@ import {
   normalizeToCanonical,
 } from "@/common/utils/ai/models";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import { isConnectionLostError, isStreamFailure } from "@/browser/contexts/connectionLink";
 
 const UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
 
@@ -77,29 +69,21 @@ interface TitleBarProps {
   onBeforeOpenSettings?: () => void;
 }
 
+/** An offline update check fails fast; the next one after the reconnect runs as usual. */
+function logCheckError(error: unknown): void {
+  if (!isConnectionLostError(error)) console.error(error);
+}
+
 export function TitleBar(props: TitleBarProps) {
   const { api } = useAPI();
   const { open: openAboutDialog } = useAboutDialog();
-  const policyState = usePolicy();
-  const policyEnforced = policyState.status.state === "enforced";
   const { open: openSettings } = useSettings();
   const { isAnalyticsOpen, navigateToAnalytics, navigateFromAnalytics, currentWorkspaceId } =
     useRouter();
   const routing = useRouting();
-  const [defaultModel] = usePersistedState<string>(DEFAULT_MODEL_KEY, WORKSPACE_DEFAULTS.model, {
-    listener: true,
-  });
-  const workspaceModelKey = getModelKey(currentWorkspaceId ?? "__titlebar__");
-  const [workspaceModelOverride] = usePersistedState<string | null>(workspaceModelKey, null, {
-    listener: true,
-  });
-  const rawActiveModel =
-    currentWorkspaceId &&
-    typeof workspaceModelOverride === "string" &&
-    workspaceModelOverride.trim().length > 0
-      ? workspaceModelOverride.trim()
-      : defaultModel;
-  const activeModel = normalizeSelectedModel(rawActiveModel);
+  const defaultModel = useAppConfig((config) => config.defaultModel) ?? WORKSPACE_DEFAULTS.model;
+  const workspaceModel = useWorkspaceAiSelection(currentWorkspaceId ?? "").model;
+  const activeModel = normalizeSelectedModel(currentWorkspaceId ? workspaceModel : defaultModel);
   const explicitGateway = getExplicitGatewayPrefix(activeModel);
   const canonicalActiveModel = normalizeToCanonical(activeModel);
   // Explicit gateway selections short-circuit route resolution: the user
@@ -158,18 +142,18 @@ export function TitleBar(props: TitleBarProps) {
           setUpdateStatus(status);
         }
       } catch (error) {
-        if (!signal.aborted) {
+        // A lost connection is not a stream error: the next client opens the stream again.
+        if (isStreamFailure(error, signal)) {
           console.error("Update status stream error:", error);
         }
       }
     })();
-
     // Check for updates on mount
-    api.update.check({ source: "auto" }).catch(console.error);
+    api.update.check({ source: "auto" }).catch(logCheckError);
 
     // Check periodically
     const checkInterval = setInterval(() => {
-      api.update.check({ source: "auto" }).catch(console.error);
+      api.update.check({ source: "auto" }).catch(logCheckError);
     }, UPDATE_CHECK_INTERVAL_MS);
 
     return () => {
@@ -231,14 +215,16 @@ export function TitleBar(props: TitleBarProps) {
               className={cn(
                 // Keep the version row shrinkable so long git-describe values ellipsize
                 // instead of overlapping the gateway/settings controls.
-                "flex min-w-0 max-w-full cursor-pointer items-center gap-1.5 border-0 bg-transparent p-0 text-left text-inherit transition-opacity hover:opacity-70",
+                "flex min-w-0 max-w-full cursor-pointer items-center gap-1.5 border-0 bg-transparent p-0 text-left text-inherit transition-opacity",
                 isDesktop && "titlebar-no-drag"
               )}
               onClick={handleOpenAboutDialog}
             >
+              {/* text-content-secondary, not the bar's text-muted: the light theme's muted token is
+                  3.5:1 on the sidebar color, below WCAG AA (#5950). */}
               <div
                 className={cn(
-                  "min-w-0 flex-1 truncate font-normal tracking-wider",
+                  "text-content-secondary min-w-0 flex-1 truncate font-normal tracking-wider",
                   leftInset > 0 ? "text-[10px]" : "text-xs"
                 )}
               >
@@ -325,20 +311,6 @@ export function TitleBar(props: TitleBarProps) {
             </TooltipContent>
           </Tooltip>
         )}
-        {policyEnforced && (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <div
-                role="img"
-                aria-label="Settings controlled by policy"
-                className="border-border-light text-muted-foreground hover:border-border-medium/80 hover:bg-toggle-bg/70 flex h-5 w-5 items-center justify-center rounded border"
-              >
-                <ShieldCheck className="h-3.5 w-3.5" aria-hidden />
-              </div>
-            </TooltipTrigger>
-            <TooltipContent align="end">Your settings are controlled by a policy.</TooltipContent>
-          </Tooltip>
-        )}
         <Tooltip>
           <TooltipTrigger asChild>
             <Button
@@ -370,7 +342,7 @@ export function TitleBar(props: TitleBarProps) {
         </Tooltip>
         <SettingsButton
           // On touch/mobile, opening settings from the sidebar should also dismiss the
-          // off-canvas sidebar so users are not stuck with it covering the settings page.
+          // off-canvas sidebar so it is not left covering the page behind settings.
           onBeforeOpenSettings={props.onBeforeOpenSettings}
         />
       </div>

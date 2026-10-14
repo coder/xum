@@ -84,3 +84,30 @@ describe("normalizeAgentAiDefaults nested subagent profiles", () => {
     expect(result.exec).toEqual({ enabled: true });
   });
 });
+
+describe("normalizeAgentAiDefaults Auto routing flags", () => {
+  test("keeps an entry that only sets Auto flags", () => {
+    const result = normalizeAgentAiDefaults({
+      exec: { autoModelRouting: true, autoThinkingLevel: true },
+    });
+    expect(result.exec).toEqual({ autoModelRouting: true, autoThinkingLevel: true });
+  });
+
+  test("drops non-true flags and the then-empty entry", () => {
+    const result = normalizeAgentAiDefaults({
+      exec: { autoModelRouting: false, autoThinkingLevel: "yes" },
+    });
+    expect(result.exec).toBeUndefined();
+  });
+
+  test("never copies flags into the delegated profile", () => {
+    const result = normalizeAgentAiDefaults({
+      exec: {
+        autoModelRouting: true,
+        subagent: { modelString: "openai:gpt-5.6-sol", autoModelRouting: true },
+      },
+    });
+    expect(result.exec?.autoModelRouting).toBe(true);
+    expect(result.exec?.subagent).toEqual({ modelString: "openai:gpt-5.6-sol" });
+  });
+});

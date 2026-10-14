@@ -4,19 +4,25 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { installDom } from "../../../tests/ui/dom";
 
 import {
+  TRANSCRIPT_REVEAL_AUTO_MAX_ROWS,
   TRANSCRIPT_REVEAL_CHUNK_ROWS,
   TRANSCRIPT_REVEAL_STEP_CHARS,
   TRANSCRIPT_REVEAL_TAIL_ROWS,
 } from "@/common/constants/ui";
 
-import { useBoundedTranscriptReveal } from "./useBoundedTranscriptReveal";
+import {
+  transcriptRevealFrameScheduler,
+  useBoundedTranscriptReveal,
+} from "./useBoundedTranscriptReveal";
 
+const defaultSchedule = transcriptRevealFrameScheduler.schedule;
 let cleanupDom: (() => void) | null = null;
 beforeEach(() => {
   cleanupDom = installDom();
 });
 afterEach(() => {
   cleanup();
+  transcriptRevealFrameScheduler.schedule = defaultSchedule;
   cleanupDom?.();
   cleanupDom = null;
 });
@@ -28,7 +34,10 @@ interface Row {
 const rows = (count: number, prefix = "m"): Row[] =>
   Array.from({ length: count }, (_, index) => ({ id: `${prefix}-${index}` }));
 
-/** Manual frame scheduler: `flush()` runs the pending callback, `cancelled` counts cancels. */
+/**
+ * Installs a manual frame scheduler for the hook (restored after each test): `flush()` runs the
+ * pending callback, `cancelled` counts cancels.
+ */
 function manualFrames() {
   let pending: (() => void) | null = null;
   let cancelled = 0;
@@ -39,8 +48,8 @@ function manualFrames() {
       cancelled += 1;
     };
   };
+  transcriptRevealFrameScheduler.schedule = scheduleFrame;
   return {
-    scheduleFrame,
     hasPending: () => pending !== null,
     flush: () => {
       const callback = pending;
@@ -56,17 +65,18 @@ const alwaysSafe = () => true;
 describe("useBoundedTranscriptReveal", () => {
   test("(a,b) mounts a tail first, then reveals in chunks until fully revealed", () => {
     const frames = manualFrames();
-    const messages = rows(540);
+    // About the size of the largest perf fixture (xl, ~340 displayed rows): it must reveal fully
+    // without any request, or the nightly perf baselines would shift with the budget.
+    const messages = rows(340);
     const { result } = renderHook(() =>
       useBoundedTranscriptReveal({
         workspaceId: "ws",
         messages,
         isSafeCut: alwaysSafe,
-        scheduleFrame: frames.scheduleFrame,
       })
     );
     expect(result.current.isFullyRevealed).toBe(false);
-    expect(result.current.fromIndex).toBe(540 - TRANSCRIPT_REVEAL_TAIL_ROWS);
+    expect(result.current.fromIndex).toBe(340 - TRANSCRIPT_REVEAL_TAIL_ROWS);
     let previous = result.current.fromIndex;
     let steps = 0;
     while (!result.current.isFullyRevealed) {
@@ -79,7 +89,7 @@ describe("useBoundedTranscriptReveal", () => {
     }
     expect(result.current.fromIndex).toBe(0);
     expect(steps).toBe(
-      Math.ceil((540 - TRANSCRIPT_REVEAL_TAIL_ROWS) / TRANSCRIPT_REVEAL_CHUNK_ROWS)
+      Math.ceil((340 - TRANSCRIPT_REVEAL_TAIL_ROWS) / TRANSCRIPT_REVEAL_CHUNK_ROWS)
     );
     expect(frames.hasPending()).toBe(false);
   });
@@ -91,10 +101,9 @@ describe("useBoundedTranscriptReveal", () => {
         workspaceId: "ws",
         messages: rows(TRANSCRIPT_REVEAL_TAIL_ROWS),
         isSafeCut: alwaysSafe,
-        scheduleFrame: frames.scheduleFrame,
       })
     );
-    expect(result.current).toEqual({ fromIndex: 0, isFullyRevealed: true });
+    expect(result.current).toMatchObject({ fromIndex: 0, isFullyRevealed: true });
     expect(frames.hasPending()).toBe(false);
   });
 
@@ -105,7 +114,6 @@ describe("useBoundedTranscriptReveal", () => {
       useBoundedTranscriptReveal({
         ...props,
         isSafeCut: alwaysSafe,
-        scheduleFrame: frames.scheduleFrame,
       })
     );
     const initialFrom = result.current.fromIndex;
@@ -157,7 +165,6 @@ describe("useBoundedTranscriptReveal", () => {
         ...props,
         isSafeCut: alwaysSafe,
         rowWeight,
-        scheduleFrame: frames.scheduleFrame,
       })
     );
     while (frames.hasPending()) act(() => frames.flush());
@@ -179,24 +186,23 @@ describe("useBoundedTranscriptReveal", () => {
       useBoundedTranscriptReveal({
         ...props,
         isSafeCut: alwaysSafe,
-        scheduleFrame: frames.scheduleFrame,
       })
     );
     expect(result.current.isFullyRevealed).toBe(true);
     props = { ...props, messages: [...rows(200, "old"), ...props.messages] };
     rerender();
-    expect(result.current).toEqual({ fromIndex: 0, isFullyRevealed: true });
+    expect(result.current).toMatchObject({ fromIndex: 0, isFullyRevealed: true });
     expect(frames.hasPending()).toBe(false);
   });
 
   test("(f) a vanished anchor falls back to a safe cut at or before its index hint, never 0", () => {
-    const frames = manualFrames();
+    // Hold every step so only the boundary logic under test moves fromIndex.
+    manualFrames();
     let props = { workspaceId: "ws", messages: rows(300) };
     const { result, rerender } = renderHook(() =>
       useBoundedTranscriptReveal({
         ...props,
         isSafeCut: alwaysSafe,
-        scheduleFrame: frames.scheduleFrame,
       })
     );
     const anchorIndex = result.current.fromIndex;
@@ -205,6 +211,30 @@ describe("useBoundedTranscriptReveal", () => {
     rerender();
     expect(result.current.isFullyRevealed).toBe(false);
     expect(result.current.fromIndex).toBe(anchorIndex);
+  });
+
+  test("(f') after a prepend, a vanished anchor falls back to where it was last seen", () => {
+    manualFrames();
+    let props = { workspaceId: "ws", messages: rows(300) };
+    const { result, rerender } = renderHook(() =>
+      useBoundedTranscriptReveal({
+        ...props,
+        isSafeCut: alwaysSafe,
+      })
+    );
+    // An older page arrives above the anchor, then the anchor row itself goes away. The fallback
+    // must use the shifted index, not the pre-prepend one (which would mount the page at once).
+    const prepended = 50;
+    props = { ...props, messages: [...rows(prepended, "old"), ...props.messages] };
+    rerender();
+    const shiftedAnchorIndex = result.current.fromIndex;
+    expect(shiftedAnchorIndex).toBe(300 - TRANSCRIPT_REVEAL_TAIL_ROWS + prepended);
+    props = {
+      ...props,
+      messages: props.messages.filter((_, index) => index !== shiftedAnchorIndex),
+    };
+    rerender();
+    expect(result.current.fromIndex).toBe(shiftedAnchorIndex);
   });
 
   test("(i,k) never cuts inside a bundle and computes each cut from the grouping current at execution", () => {
@@ -222,7 +252,6 @@ describe("useBoundedTranscriptReveal", () => {
         workspaceId: "ws",
         messages,
         isSafeCut,
-        scheduleFrame: frames.scheduleFrame,
       })
     );
     // 200 - 40 = 160 lies inside bundle A → the cut moves to its head.
@@ -258,7 +287,6 @@ describe("useBoundedTranscriptReveal", () => {
         workspaceId: "ws",
         messages,
         isSafeCut,
-        scheduleFrame: frames.scheduleFrame,
       })
     );
     expect(result.current.fromIndex).toBe(160);
@@ -280,13 +308,13 @@ describe("useBoundedTranscriptReveal", () => {
     // A scheduler whose cancel is a no-op, so an already-cancelled (stale) callback can still be
     // invoked — the way a frame that slipped past cancellation would fire.
     const scheduled: Array<() => void> = [];
-    const scheduleFrame = (callback: () => void) => {
+    transcriptRevealFrameScheduler.schedule = (callback) => {
       scheduled.push(callback);
       return () => undefined;
     };
     let props = { workspaceId: "ws", messages: rows(300) };
     const { result, rerender } = renderHook(() =>
-      useBoundedTranscriptReveal({ ...props, isSafeCut: alwaysSafe, scheduleFrame })
+      useBoundedTranscriptReveal({ ...props, isSafeCut: alwaysSafe })
     );
     const initialFrom = result.current.fromIndex;
     expect(scheduled).toHaveLength(1);
@@ -308,13 +336,13 @@ describe("useBoundedTranscriptReveal", () => {
   });
 
   test("an empty transcript that fills starts tail-first, judged by the initial-tail limits", () => {
-    const frames = manualFrames();
+    // Hold every step so only the boundary logic under test moves fromIndex.
+    manualFrames();
     let props = { workspaceId: "ws", messages: rows(0) };
     const { result, rerender } = renderHook(() =>
       useBoundedTranscriptReveal({
         ...props,
         isSafeCut: alwaysSafe,
-        scheduleFrame: frames.scheduleFrame,
       })
     );
     expect(result.current.fromIndex).toBe(0);
@@ -346,7 +374,6 @@ describe("useBoundedTranscriptReveal", () => {
         workspaceId: "ws",
         messages,
         isSafeCut,
-        scheduleFrame: frames.scheduleFrame,
       })
     );
     const eligible = () => new Set(messages.slice(result.current.fromIndex).map((row) => row.id));
@@ -388,7 +415,6 @@ describe("useBoundedTranscriptReveal", () => {
         messages,
         isSafeCut: alwaysSafe,
         rowWeight,
-        scheduleFrame: frames.scheduleFrame,
       })
     );
     const stepWeight = (from: number, to: number) => {
@@ -421,7 +447,6 @@ describe("useBoundedTranscriptReveal", () => {
         messages,
         isSafeCut: alwaysSafe,
         rowWeight: () => TRANSCRIPT_REVEAL_STEP_CHARS * 10,
-        scheduleFrame: frames.scheduleFrame,
       })
     );
     expect(result.current.fromIndex).toBe(2);
@@ -443,7 +468,6 @@ describe("useBoundedTranscriptReveal", () => {
         messages,
         isSafeCut,
         rowWeight: () => TRANSCRIPT_REVEAL_STEP_CHARS * 0.4,
-        scheduleFrame: frames.scheduleFrame,
       })
     );
     // Weight allows rows 48, 49 only (a third row would exceed the ceiling) → cut 48 is safe.
@@ -454,5 +478,110 @@ describe("useBoundedTranscriptReveal", () => {
     act(() => frames.flush());
     // Next step: 44, 45 by weight → 44 is inside the bundle → the cut moves to its head, 40.
     expect(result.current.fromIndex).toBe(40);
+  });
+
+  describe("automatic reveal budget", () => {
+    const LONG = TRANSCRIPT_REVEAL_AUTO_MAX_ROWS * 3;
+    const mounted = (fromIndex: number) => LONG - fromIndex;
+
+    function renderLong(frames: ReturnType<typeof manualFrames>) {
+      let props = { workspaceId: "ws", messages: rows(LONG) };
+      const view = renderHook(() =>
+        useBoundedTranscriptReveal({ ...props, isSafeCut: alwaysSafe })
+      );
+      const runFrames = () => {
+        while (frames.hasPending()) act(() => frames.flush());
+      };
+      const setProps = (next: Partial<typeof props>) => {
+        props = { ...props, ...next };
+        view.rerender();
+      };
+      return { ...view, runFrames, setProps, messages: () => props.messages };
+    }
+
+    test("pauses once the budget is mounted, and Load older resumes it by one budget", () => {
+      const frames = manualFrames();
+      const { result, runFrames } = renderLong(frames);
+      runFrames();
+      expect(result.current.isRevealPaused).toBe(true);
+      expect(result.current.isFullyRevealed).toBe(false);
+      expect(frames.hasPending()).toBe(false);
+      const firstPause = mounted(result.current.fromIndex);
+      expect(firstPause).toBeGreaterThanOrEqual(TRANSCRIPT_REVEAL_AUTO_MAX_ROWS);
+      expect(firstPause).toBeLessThan(
+        TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + TRANSCRIPT_REVEAL_CHUNK_ROWS
+      );
+
+      act(() => result.current.revealMore());
+      expect(result.current.isRevealPaused).toBe(false);
+      runFrames();
+      expect(result.current.isRevealPaused).toBe(true);
+      const secondPause = mounted(result.current.fromIndex);
+      expect(secondPause).toBeGreaterThanOrEqual(firstPause + TRANSCRIPT_REVEAL_AUTO_MAX_ROWS);
+      expect(secondPause).toBeLessThan(
+        firstPause + TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + TRANSCRIPT_REVEAL_CHUNK_ROWS
+      );
+
+      // Fewer rows than a budget remain: the next request reveals the rest.
+      act(() => result.current.revealMore());
+      runFrames();
+      expect(result.current).toMatchObject({
+        fromIndex: 0,
+        isFullyRevealed: true,
+        isRevealPaused: false,
+      });
+    });
+
+    test("a navigation to a row far above a paused boundary reveals down to it, then stops", () => {
+      const frames = manualFrames();
+      const { result, runFrames } = renderLong(frames);
+      runFrames();
+      expect(result.current.isRevealPaused).toBe(true);
+      const target = Math.floor(result.current.fromIndex / 4);
+
+      act(() => result.current.revealThrough(target));
+      expect(result.current.isRevealPaused).toBe(false);
+      runFrames();
+      // The target row is mounted, at most one chunk past it, and the reveal paused again.
+      expect(result.current.fromIndex).toBeLessThanOrEqual(target);
+      expect(target - result.current.fromIndex).toBeLessThan(TRANSCRIPT_REVEAL_CHUNK_ROWS);
+      expect(result.current.isRevealPaused).toBe(true);
+      expect(frames.hasPending()).toBe(false);
+
+      // A row already mounted is a no-op.
+      act(() => result.current.revealThrough(result.current.fromIndex));
+      expect(frames.hasPending()).toBe(false);
+    });
+
+    test("a navigation target that disappears stops the reveal it started", () => {
+      const frames = manualFrames();
+      const { result, runFrames, setProps, messages } = renderLong(frames);
+      runFrames();
+      const target = 10;
+      const targetId = messages()[target].id;
+      act(() => result.current.revealThrough(target));
+      act(() => frames.flush());
+      expect(frames.hasPending()).toBe(true);
+      setProps({ messages: messages().filter((row) => row.id !== targetId) });
+      expect(result.current.isRevealPaused).toBe(true);
+      expect(frames.hasPending()).toBe(false);
+    });
+
+    test("a restart resets the budget and drops a pending navigation target", () => {
+      const frames = manualFrames();
+      const { result, runFrames, setProps } = renderLong(frames);
+      runFrames();
+      act(() => result.current.revealMore());
+      act(() => result.current.revealThrough(0));
+      // Switch to another long workspace before either request finished. Its row ids match the
+      // old ones, so a target carried across the restart would still be found (not dropped as
+      // vanished) and would reveal every row.
+      setProps({ workspaceId: "ws-2", messages: rows(LONG) });
+      runFrames();
+      expect(result.current.isRevealPaused).toBe(true);
+      expect(mounted(result.current.fromIndex)).toBeLessThan(
+        TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + TRANSCRIPT_REVEAL_CHUNK_ROWS
+      );
+    });
   });
 });

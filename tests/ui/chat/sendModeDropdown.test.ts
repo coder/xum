@@ -11,6 +11,7 @@ import { preloadTestModules, type TestEnvironment } from "../../ipc/setup";
 
 import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
+import type { StreamStartEvent } from "@/common/types/stream";
 
 import { createAppHarness, type AppHarness } from "../harness";
 
@@ -55,8 +56,8 @@ async function getActiveTextarea(container: HTMLElement): Promise<HTMLTextAreaEl
   return waitFor(
     () => {
       const textareas = Array.from(
-        container.querySelectorAll('textarea[aria-label="Message Claude"]')
-      ) as HTMLTextAreaElement[];
+        container.querySelectorAll<HTMLTextAreaElement>('textarea[aria-label="Message"]')
+      );
       if (textareas.length === 0) {
         throw new Error("Chat textarea not found");
       }
@@ -80,9 +81,7 @@ async function getComposerDockTextarea(container: HTMLElement): Promise<HTMLText
         throw new Error("Chat composer dock not found");
       }
 
-      const textarea = dock.querySelector(
-        'textarea[aria-label="Message Claude"]'
-      ) as HTMLTextAreaElement | null;
+      const textarea = dock.querySelector<HTMLTextAreaElement>('textarea[aria-label="Message"]');
       if (!textarea) {
         throw new Error("Composer textarea not found");
       }
@@ -107,8 +106,8 @@ async function waitForSendModeMenuTrigger(container: HTMLElement): Promise<HTMLB
   return waitFor(
     () => {
       const buttons = Array.from(
-        container.querySelectorAll('button[aria-label="Send message"]')
-      ) as HTMLButtonElement[];
+        container.querySelectorAll<HTMLButtonElement>('button[aria-label="Send message"]')
+      );
       const trigger = [...buttons]
         .reverse()
         .find((button) => button.getAttribute("aria-haspopup") === "menu" && !button.disabled);
@@ -188,10 +187,14 @@ describe("Send dispatch modes (mock AI router)", () => {
       fireEvent.click(sendAfterTurnRow);
       await app.chat.expectStreamComplete();
 
-      await waitFor(async () => {
-        const { goal } = await app.env.orpc.workspace.getGoal({ workspaceId: app.workspaceId });
-        expect(goal?.status).toBe("paused");
-      });
+      // Backend round trip per poll: waitFor's default 1 s is too short under CI load (#5029).
+      await waitFor(
+        async () => {
+          const { goal } = await app.env.orpc.workspace.getGoal({ workspaceId: app.workspaceId });
+          expect(goal?.status).toBe("paused");
+        },
+        { timeout: 10_000 }
+      );
     } finally {
       await app.dispose();
     }
@@ -201,7 +204,18 @@ describe("Send dispatch modes (mock AI router)", () => {
     const app = await createAppHarness({ branchPrefix: "queued-parallel-tool-step" });
 
     try {
+      // The send waits for workspace init, so the stream can start more than 1 s after the
+      // click: await its stream-start instead of racing it with waitFor's default (#6143).
+      const sourceStarted = new Promise<void>((resolve) => {
+        const onStart = (event: StreamStartEvent) => {
+          if (event.workspaceId !== app.workspaceId) return;
+          app.env.services.aiService.off("stream-start", onStart);
+          resolve();
+        };
+        app.env.services.aiService.on("stream-start", onStart);
+      });
       await app.chat.send("[mock:tool:parallel-step] Run both sibling tool calls");
+      await sourceStarted;
       await waitFor(() => {
         const state = workspaceStore.getWorkspaceSidebarState(app.workspaceId);
         if (!state.canInterrupt) {
@@ -217,6 +231,8 @@ describe("Send dispatch modes (mock AI router)", () => {
         expect(app.view.container.textContent).toContain("Queued");
         expect(app.view.container.textContent).toContain("Sends after this step");
       });
+      // The mock turn holds its tool calls until now, so the follow-up was queued mid-step.
+      app.env.services.aiService.releaseMockToolCalls(app.workspaceId);
 
       await app.chat.expectTranscriptContains("parallel-step-a.txt");
       await app.chat.expectTranscriptContains("parallel-step-b.txt");

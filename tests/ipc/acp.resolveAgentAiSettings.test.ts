@@ -6,14 +6,14 @@ function createClient(overrides: {
     string,
     { modelString?: string; thinkingLevel?: "off" | "low" | "medium" | "high" | "xhigh" | "max" }
   >;
-  agents: Array<{
+  agents: {
     id: string;
     base?: string;
     aiDefaults?: {
       model?: string;
       thinkingLevel?: "off" | "low" | "medium" | "high" | "xhigh" | "max";
     };
-  }>;
+  }[];
 }): ORPCClient {
   return {
     config: {

@@ -1,10 +1,8 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Command } from "cmdk";
 import { useCommandRegistry } from "@/browser/contexts/CommandRegistryContext";
-import { useAPI } from "@/browser/contexts/API";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
+import { getAgentSkillsStore, useAgentSkills } from "@/browser/stores/AgentSkillsStore";
 import type { CommandAction } from "@/browser/contexts/CommandRegistryContext";
 import {
   formatKeybind,
@@ -18,7 +16,6 @@ import { resolveSlashCommandExperimentValue } from "@/browser/utils/slashCommand
 import { getSlashCommandSuggestions } from "@/browser/utils/slashCommands/suggestions";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { getDisableWorkspaceAgentsKey, GLOBAL_SCOPE_ID } from "@/common/constants/storage";
 import { filterCommandsByPrefix } from "@/browser/utils/commandPaletteFiltering";
 import { rankByPaletteQuery } from "@/browser/utils/commandPaletteRanking";
 
@@ -59,11 +56,6 @@ interface PaletteGroup {
 }
 
 export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext }) => {
-  const { api } = useAPI();
-
-  const workspaceHeartbeatsExperimentEnabled = useExperimentValue(
-    EXPERIMENT_IDS.WORKSPACE_HEARTBEATS
-  );
   const memoryExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const memoryConsolidationExperimentEnabled = useExperimentValue(
     EXPERIMENT_IDS.MEMORY_CONSOLIDATION
@@ -73,17 +65,14 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
   const slashContext = getSlashContext?.();
   const slashWorkspaceId = slashContext?.workspaceId;
 
-  const [disableWorkspaceAgents] = usePersistedState<boolean>(
-    getDisableWorkspaceAgentsKey(slashWorkspaceId ?? GLOBAL_SCOPE_ID),
-    false,
-    { listener: true }
-  );
-
-  const [agentSkills, setAgentSkills] = useState<AgentSkillDescriptor[]>([]);
-  const agentSkillsCacheRef = useRef<Map<string, AgentSkillDescriptor[]>>(new Map());
   const commandPanelRef = useRef<HTMLDivElement | null>(null);
   const paletteOpenOriginRef = useRef<HTMLElement | null>(null);
   const { isOpen, initialQuery, close, getActions, addRecent, recent } = useCommandRegistry();
+  const agentSkills = useAgentSkills(
+    isOpen && slashWorkspaceId
+      ? { workspaceId: slashWorkspaceId, disableWorkspaceAgents: false }
+      : null
+  ).skills;
   const [query, setQuery] = useState("");
   const [activePrompt, setActivePrompt] = useState<null | {
     title?: string;
@@ -138,55 +127,6 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
       paletteOpenOriginRef.current = null;
     }
   }, [isOpen, initialQuery, resetPaletteState]);
-
-  useEffect(() => {
-    const clearAgentSkillsCache = () => {
-      agentSkillsCacheRef.current.clear();
-    };
-
-    window.addEventListener("focus", clearAgentSkillsCache);
-    window.addEventListener(CUSTOM_EVENTS.SKILLS_REFRESH_REQUESTED, clearAgentSkillsCache);
-
-    return () => {
-      window.removeEventListener("focus", clearAgentSkillsCache);
-      window.removeEventListener(CUSTOM_EVENTS.SKILLS_REFRESH_REQUESTED, clearAgentSkillsCache);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!isOpen || !api || !slashWorkspaceId) {
-      setAgentSkills([]);
-      return;
-    }
-
-    const cacheKey = `${slashWorkspaceId}:${disableWorkspaceAgents ? "project" : "worktree"}`;
-
-    const cached = agentSkillsCacheRef.current.get(cacheKey);
-    if (cached) {
-      setAgentSkills(cached);
-      return;
-    }
-
-    let cancelled = false;
-    api.agentSkills
-      .list({
-        workspaceId: slashWorkspaceId,
-        disableWorkspaceAgents: disableWorkspaceAgents || undefined,
-      })
-      .then((skills) => {
-        if (cancelled) return;
-        agentSkillsCacheRef.current.set(cacheKey, skills);
-        setAgentSkills(skills);
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setAgentSkills([]);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [api, isOpen, slashWorkspaceId, disableWorkspaceAgents]);
 
   const rawActions = getActions();
 
@@ -282,12 +222,20 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
 
   const handleQueryChange = useCallback(
     (value: string) => {
+      // The list may be shared with the skills hat; entering slash mode asks
+      // again if it missed a source, as typing `/` in the composer does.
+      if (slashWorkspaceId && value.trim().startsWith("/") && !query.trim().startsWith("/")) {
+        getAgentSkillsStore().ensureFresh({
+          workspaceId: slashWorkspaceId,
+          disableWorkspaceAgents: false,
+        });
+      }
       setQuery(value);
       if (activePrompt) {
         setPromptError(null);
       }
     },
-    [activePrompt]
+    [activePrompt, query, slashWorkspaceId]
   );
 
   const generalResults = useMemo(() => {
@@ -300,7 +248,6 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
         variant: ctx.workspaceId ? "workspace" : "creation",
         isExperimentEnabled: (experimentId) =>
           resolveSlashCommandExperimentValue(experimentId, {
-            workspaceHeartbeats: workspaceHeartbeatsExperimentEnabled,
             memory: memoryExperimentEnabled,
             memoryConsolidation: memoryConsolidationExperimentEnabled,
             rlm: rlmExperimentEnabled,
@@ -378,7 +325,6 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
     recentIndex,
     getSlashContext,
     agentSkills,
-    workspaceHeartbeatsExperimentEnabled,
     memoryExperimentEnabled,
     memoryConsolidationExperimentEnabled,
     rlmExperimentEnabled,

@@ -305,6 +305,33 @@ describe("buildSortedWorkspacesByProject", () => {
     expect(result.get("/project/a")?.[0].id).toBe("ws1");
   });
 
+  it("never lists /side chats, whether or not config has their row yet", () => {
+    const sideChat = (id: string): FrontendWorkspaceMetadata => ({
+      ...createWorkspace(id, "/project/a"),
+      sideChatParentWorkspaceId: "ws1",
+    });
+    const projects = new Map<string, ProjectConfig>([
+      [
+        "/project/a",
+        {
+          workspaces: [
+            { path: "/a/ws1", id: "ws1" },
+            { path: "/a/ws1", id: "side-registered" },
+          ],
+        },
+      ],
+    ]);
+    const metadata = new Map<string, FrontendWorkspaceMetadata>([
+      ["ws1", createWorkspace("ws1", "/project/a")],
+      ["side-registered", sideChat("side-registered")],
+      ["side-pending", sideChat("side-pending")],
+    ]);
+
+    const result = buildSortedWorkspacesByProject(projects, metadata, {});
+
+    expect(result.get("/project/a")?.map((w) => w.id)).toEqual(["ws1"]);
+  });
+
   it("should include pending workspaces not yet in config", () => {
     const projects = new Map<string, ProjectConfig>([
       ["/project/a", { workspaces: [{ path: "/a/ws1", id: "ws1" }] }],

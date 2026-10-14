@@ -2,11 +2,12 @@ import "./dom";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { fireEvent, waitFor, within } from "@testing-library/react";
+import type { BoundFunctions, queries } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { shouldRunIntegrationTests } from "../testUtils";
 import { preloadTestModules } from "../ipc/setup";
 import { createAppHarness, type AppHarness } from "./harness";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { openSettingsDialog } from "./helpers";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "@/node/services/agentPlugins/manifest";
 import { AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0 } from "@/node/services/agentPlugins/mcpConfig";
 import type { MCPTestResult } from "@/common/types/mcp";
@@ -22,7 +23,7 @@ const LONG_TOOL = "fetch_page_property_item_with_pagination_and_rich_text_expans
 const PLUGIN_TOOLS = ["search_docs", LONG_TOOL, "read_doc"];
 const REGULAR_TOOLS = ["search", "read"];
 
-type Canvas = ReturnType<typeof within>;
+type Canvas = BoundFunctions<typeof queries>;
 
 /**
  * The Settings card for one configured server: the header grid (switch, name,
@@ -39,9 +40,8 @@ function serverRow(canvas: Canvas, label: string): HTMLElement {
 }
 
 async function openMcpSettings(app: AppHarness) {
-  const canvas = within(app.view.container);
-  fireEvent.click(await canvas.findByTestId("settings-button"));
-  fireEvent.click((await canvas.findAllByRole("button", { name: "MCP" }))[0]);
+  const canvas = await openSettingsDialog(app.view.container);
+  fireEvent.click(await canvas.findByRole("button", { name: "MCP" }));
   await canvas.findByRole("switch", { name: `Toggle ${PLUGIN_LABEL} enabled` }, { timeout: 10000 });
   await canvas.findByRole("switch", { name: `Toggle ${REGULAR} enabled` });
   return canvas;
@@ -80,10 +80,6 @@ describeIntegration("MCP settings plugin tool inspection", () => {
       aiMode: "none",
       branchPrefix: "mcp-plugin-tools",
       beforeRenderEnvironment: async (env) => {
-        await env.orpc.experiments.setOverride({
-          experimentId: EXPERIMENT_IDS.AGENT_PLUGINS,
-          enabled: true,
-        });
         const pluginDir = path.join(env.config.rootDir, "plugins", PLUGIN);
         await fs.mkdir(pluginDir, { recursive: true });
         await fs.writeFile(

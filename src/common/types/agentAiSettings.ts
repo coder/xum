@@ -8,10 +8,13 @@
  * environment; the pure resolver only chooses values.
  */
 
+import { ServiceTierSchema, type ServiceTier } from "@/common/config/schemas/providersConfig";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
+import assert from "@/common/utils/assert";
 import type { AgentAiDefaults } from "./agentAiDefaults";
 import {
   coerceOpenAIReasoningMode,
+  coerceThinkingLevel,
   type OpenAIReasoningMode,
   type ParsedThinkingInput,
   type ThinkingLevel,
@@ -29,6 +32,7 @@ export interface AgentAiSettingsLayerValues {
   model?: string;
   thinkingLevel?: ThinkingLevel;
   reasoningMode?: OpenAIReasoningMode;
+  serviceTier?: ServiceTier;
 }
 
 /** Agent-definition frontmatter `ai` block defaults. */
@@ -50,12 +54,96 @@ export function targetWorkspaceBucketToLayer(bucket: {
   model?: string;
   thinkingLevel?: ThinkingLevel;
   reasoningMode?: OpenAIReasoningMode;
+  serviceTier?: ServiceTier;
 }): AgentAiSettingsLayerValues {
   return {
     model: bucket.model,
     thinkingLevel: bucket.thinkingLevel,
     reasoningMode: coerceOpenAIReasoningMode(bucket.reasoningMode) ?? "standard",
+    ...(bucket.serviceTier != null ? { serviceTier: bucket.serviceTier } : {}),
   };
+}
+
+/**
+ * Agent-task AI fields pinned by explicit `task` arguments or by deliberate user
+ * picks sent from the task's chat (persisted as `taskAiPins`). Unpinned fields
+ * re-resolve from current defaults when an ancestor reawakens the task.
+ */
+export interface TaskAiPins {
+  model?: string;
+  thinkingLevel?: ThinkingLevel;
+  reasoningMode?: OpenAIReasoningMode;
+  serviceTier?: ServiceTier;
+}
+
+/** Per-field flags marking which AI fields a user deliberately picked before a send. */
+export interface AiSelectionIntent {
+  model?: true;
+  thinkingLevel?: true;
+  reasoningMode?: true;
+  serviceTier?: true;
+}
+
+/**
+ * Maps persisted `taskAiPins` into a tier-2 layer. Config entries are not
+ * schema-parsed on load, so each field is coerced and malformed fields are
+ * dropped. Unlike targetWorkspaceBucketToLayer, an omitted reasoning mode stays
+ * undefined: it is unpinned, not "standard".
+ */
+export function taskAiPinsToLayer(raw: unknown): AgentAiSettingsLayerValues {
+  if (raw == null || typeof raw !== "object") return {};
+  const record = raw as Record<string, unknown>;
+  const model =
+    typeof record.model === "string" && record.model.trim().length > 0
+      ? record.model.trim()
+      : undefined;
+  const serviceTier = ServiceTierSchema.safeParse(record.serviceTier).data;
+  const layer: AgentAiSettingsLayerValues = {
+    ...(serviceTier != null ? { serviceTier } : {}),
+    ...(model != null ? { model } : {}),
+    ...(coerceThinkingLevel(record.thinkingLevel) != null
+      ? { thinkingLevel: coerceThinkingLevel(record.thinkingLevel) }
+      : {}),
+    ...(coerceOpenAIReasoningMode(record.reasoningMode) != null
+      ? { reasoningMode: coerceOpenAIReasoningMode(record.reasoningMode) }
+      : {}),
+  };
+  assert(
+    Object.values(layer).every((value) => value !== undefined),
+    "taskAiPinsToLayer: layer must not carry undefined fields"
+  );
+  return layer;
+}
+
+/**
+ * Pins each intended field to the value that was actually sent. A deliberate
+ * same-value pick still pins. Idempotent: returns the same reference when
+ * nothing changes, so callers can detect "no write needed" by identity.
+ */
+export function applyAiSelectionIntentToPins(
+  pins: TaskAiPins,
+  intent: AiSelectionIntent,
+  sent: {
+    model: string;
+    thinkingLevel: ThinkingLevel;
+    reasoningMode?: OpenAIReasoningMode;
+    serviceTier?: ServiceTier;
+  }
+): TaskAiPins {
+  assert(pins != null && typeof pins === "object", "applyAiSelectionIntentToPins: pins required");
+  assert(sent.model.trim().length > 0, "applyAiSelectionIntentToPins: sent model required");
+  const next: TaskAiPins = { ...pins };
+  if (intent.model === true) next.model = sent.model;
+  if (intent.thinkingLevel === true) next.thinkingLevel = sent.thinkingLevel;
+  // A saved bucket's absent reasoning mode means standard, so pin that choice explicitly.
+  if (intent.reasoningMode === true) next.reasoningMode = sent.reasoningMode ?? "standard";
+  if (intent.serviceTier === true && sent.serviceTier != null) next.serviceTier = sent.serviceTier;
+  const changed =
+    next.serviceTier !== pins.serviceTier ||
+    next.model !== pins.model ||
+    next.thinkingLevel !== pins.thinkingLevel ||
+    next.reasoningMode !== pins.reasoningMode;
+  return changed ? next : pins;
 }
 
 export type AiSettingTier =
@@ -93,6 +181,7 @@ export interface ResolveAgentAiSettingsInput {
     model?: string;
     thinkingLevel?: ParsedThinkingInput;
     reasoningMode?: OpenAIReasoningMode;
+    serviceTier?: ServiceTier;
   };
   /** Tier 2: the target workspace's per-agent bucket (existing target workspaces only). */
   targetWorkspaceSettings?: AgentAiSettingsLayerValues;
@@ -130,17 +219,20 @@ export interface ResolvedAgentAiSettings {
     model: string;
     thinkingLevel: ThinkingLevel;
     reasoningMode?: OpenAIReasoningMode;
+    serviceTier?: ServiceTier;
   };
   /** Provider-safe values after normalization, clamping, and capability gating. */
   effective: {
     model: string;
     thinkingLevel: ThinkingLevel;
     reasoningMode?: OpenAIReasoningMode;
+    serviceTier?: ServiceTier;
   };
   sources: {
     model: AiSettingSource;
     thinkingLevel: AiSettingSource;
     reasoningMode?: AiSettingSource;
+    serviceTier?: AiSettingSource;
   };
   /** Skipped-candidate notes for adapters to log; never logged here. */
   diagnostics: string[];

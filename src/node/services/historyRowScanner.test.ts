@@ -4,8 +4,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SESSION_HISTORY_SCAN_CHUNK_BYTES } from "@/common/constants/contextBudget";
+import { scanHistoryRows } from "./historyRowScanner.testHarness";
 import {
-  scanHistoryRows,
   scanHistoryRowsFromHandle,
   type HistoryRowDescriptor,
   type HistoryRowToken,
@@ -573,40 +573,6 @@ describe("raw history row scanner", () => {
       ).catch((error: unknown) => error);
       expect(result).toBe(reason);
       expect(starts).toEqual([0]);
-    }
-  );
-
-  it.each([true, false])(
-    "observes cancellation during file disposal (continue=%s)",
-    async (keepGoing) => {
-      await fs.writeFile(filePath, "true\n");
-      const controller = new AbortController();
-      const reason = { canceled: "while disposing file" };
-      const open = fs.open;
-      let opened: fs.FileHandle | undefined;
-      spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof open>) => {
-        const handle = await open(...args);
-        if (args[0] !== filePath) return handle;
-        opened = handle;
-        const dispose = handle[Symbol.asyncDispose].bind(handle);
-        spyOn(handle, Symbol.asyncDispose).mockImplementation(async () => {
-          await dispose();
-          controller.abort(reason);
-        });
-        return handle;
-      });
-      const result = await scanHistoryRows(
-        filePath,
-        () => ({
-          token() {
-            /* Resource cleanup is under test. */
-          },
-          finish: () => keepGoing,
-        }),
-        { signal: controller.signal }
-      ).catch((error: unknown) => error);
-      expect(result).toBe(reason);
-      expect(opened?.fd).toBe(-1);
     }
   );
 

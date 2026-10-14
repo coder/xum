@@ -1,10 +1,16 @@
 import { useEffect, useId, useRef, useState } from "react";
 import type { RefObject } from "react";
 import { useAPI } from "@/browser/contexts/API";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { getPendingDraftSkillDiscoveryKey } from "@/common/constants/storage";
+import {
+  getAgentSkillsStore,
+  useAgentSkills,
+  type AgentSkillsDiscovery,
+} from "@/browser/stores/AgentSkillsStore";
 import { subscribeAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import { findAtMentionAtCursor } from "@/common/utils/atMentions";
 import { findInlineSkillReferenceAtCursor } from "@/browser/utils/agentSkills/inlineSkillReferences";
@@ -31,8 +37,6 @@ type ComposerSuggestionToken =
   | { kind: "slash"; startIndex: 0; endIndex: number; query: string };
 
 interface SuggestionExperiments {
-  workspaceHeartbeats: boolean;
-  dynamicWorkflows: boolean;
   memory: boolean;
   memoryConsolidation: boolean;
   rlm: boolean;
@@ -154,23 +158,20 @@ interface UseComposerSuggestionsOptions {
   variant: "creation" | "workspace";
   workspaceId: string | null;
   projectPath: string | null;
-  disableWorkspaceAgents: boolean;
 }
 
+const NO_PLUGIN_COMMANDS: PluginSlashCommandDescriptor[] = [];
+
 export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
-  const { disableWorkspaceAgents, input, inputRef, projectPath, setInput, variant, workspaceId } =
-    options;
+  const { input, inputRef, projectPath, setInput, variant, workspaceId } = options;
   const { api } = useAPI();
-  const agentPluginsEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_PLUGINS);
-  const workspaceHeartbeatsEnabled = useExperimentValue(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
-  const dynamicWorkflowsEnabled = useExperimentValue(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS);
+  // The chat workspace the composer belongs to (none for the creation composer).
+  const chatWorkspaceId = variant === "workspace" ? workspaceId : undefined;
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const memoryConsolidationEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY_CONSOLIDATION);
   const rlmEnabled = useExperimentValue(EXPERIMENT_IDS.RLM);
   const ptcEnabled = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
   const experiments: SuggestionExperiments = {
-    workspaceHeartbeats: workspaceHeartbeatsEnabled,
-    dynamicWorkflows: dynamicWorkflowsEnabled,
     memory: memoryEnabled,
     memoryConsolidation: memoryConsolidationEnabled,
     rlm: rlmEnabled,
@@ -181,9 +182,7 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
   // listener keeps the descriptor reload in sync when the transfer lands
   // after mount and when a successful send clears the key.
   const [transferredDraftProjectDiscovery] = usePersistedState<boolean>(
-    variant === "workspace" && workspaceId
-      ? getPendingDraftSkillDiscoveryKey(workspaceId)
-      : "__unused__",
+    chatWorkspaceId ? getPendingDraftSkillDiscoveryKey(chatWorkspaceId) : "__unused__",
     false,
     { listener: true }
   );
@@ -202,18 +201,33 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
     tokenKey: string;
     suggestions: SlashSuggestion[];
   }>({ tokenKey: "", suggestions: [] });
-  const [agentSkills, setAgentSkills] = useState<AgentSkillDescriptor[]>([]);
   const [mcpPrompts, setMcpPrompts] = useState<MCPPromptDescriptor[]>([]);
-  const [pluginCommands, setPluginCommands] = useState<PluginSlashCommandDescriptor[]>([]);
+  // Tagged with their workspace: commands listed for another workspace never show here (they
+  // stay on screen across a reconnect, and a workspace switch while offline must not show them).
+  const [pluginCommandsState, setPluginCommandsState] = useState<{
+    workspaceId: string | undefined;
+    commands: PluginSlashCommandDescriptor[];
+  }>({ workspaceId: undefined, commands: NO_PLUGIN_COMMANDS });
+  const pluginCommands =
+    pluginCommandsState.workspaceId === chatWorkspaceId
+      ? pluginCommandsState.commands
+      : NO_PLUGIN_COMMANDS;
   const [pluginMutationTick, setPluginMutationTick] = useState(0);
   const fileRequestId = useRef(0);
-  const skillRequestId = useRef(0);
   const mcpRequestId = useRef(0);
   const mcpRequest = useRef<Promise<void> | null>(null);
   const mcpLoadedAt = useRef(0);
+  // The client the prompts were listed with: a new one (reconnect) lists them again.
+  const mcpClient = useRef<typeof api>(null);
   const mcpWorkspace = useRef<string | null>(null);
   const mcpAbort = useRef<AbortController | null>(null);
   const listId = useId();
+  const skillDiscovery: AgentSkillsDiscovery | null = chatWorkspaceId
+    ? { workspaceId: chatWorkspaceId, disableWorkspaceAgents: transferredDraftProjectDiscovery }
+    : variant === "creation" && projectPath
+      ? { projectPath }
+      : null;
+  const agentSkills = useAgentSkills(skillDiscovery).skills;
 
   const activeToken = detectActiveComposerToken(input, cursor);
   const activeTokenKey = tokenKey(activeToken) ?? "";
@@ -247,81 +261,52 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
 
   useEffect(() => {
     let mounted = true;
-    const requestId = ++skillRequestId.current;
-    const discovery =
-      variant === "workspace" && workspaceId
-        ? {
-            workspaceId,
-            disableWorkspaceAgents: disableWorkspaceAgents || transferredDraftProjectDiscovery,
-          }
-        : variant === "creation" && projectPath
-          ? { projectPath }
-          : null;
-    if (!api || !discovery) {
-      setAgentSkills([]);
-      return;
-    }
-    api.agentSkills
-      .list(discovery)
-      .then((skills) => {
-        if (mounted && skillRequestId.current === requestId) setAgentSkills(skills);
+    // Offline, keep the shown commands: the reconnect lists them again.
+    if (!api || !chatWorkspaceId) return;
+    api.workspace.plugins.slashCommands
+      .list({ workspaceId: chatWorkspaceId })
+      .then((commands) => {
+        if (mounted) setPluginCommandsState({ workspaceId: chatWorkspaceId, commands });
       })
       .catch((error: unknown) => {
-        console.error("Failed to load agent skills:", error);
-        if (mounted && skillRequestId.current === requestId) setAgentSkills([]);
+        if (mounted && !isConnectionLostError(error)) {
+          setPluginCommandsState({ workspaceId: chatWorkspaceId, commands: NO_PLUGIN_COMMANDS });
+        }
       });
     return () => {
       mounted = false;
     };
-  }, [
-    api,
-    variant,
-    workspaceId,
-    projectPath,
-    disableWorkspaceAgents,
-    transferredDraftProjectDiscovery,
-    agentPluginsEnabled,
-    pluginMutationTick,
-  ]);
+  }, [api, chatWorkspaceId, pluginMutationTick]);
 
   useEffect(() => {
-    let mounted = true;
-    if (!api || variant !== "workspace" || !workspaceId || !agentPluginsEnabled) {
-      setPluginCommands([]);
-      return;
-    }
-    api.workspace.plugins.slashCommands
-      .list({ workspaceId })
-      .then((commands) => {
-        if (mounted) setPluginCommands(commands);
-      })
-      .catch(() => {
-        if (mounted) setPluginCommands([]);
-      });
-    return () => {
-      mounted = false;
+    const dropMcpRequest = () => {
+      mcpRequestId.current++;
+      mcpRequest.current = null;
+      mcpAbort.current?.abort();
+      mcpAbort.current = null;
     };
-  }, [api, variant, workspaceId, agentPluginsEnabled, pluginMutationTick]);
-
-  useEffect(() => {
-    if (!api || variant !== "workspace" || !workspaceId) {
+    if (!chatWorkspaceId) {
       mcpWorkspace.current = null;
       mcpLoadedAt.current = 0;
-      mcpRequestId.current++;
-      mcpRequest.current = null;
-      mcpAbort.current?.abort();
-      mcpAbort.current = null;
+      dropMcpRequest();
       setMcpPrompts([]);
       return;
     }
-    if (mcpWorkspace.current !== workspaceId) {
-      mcpWorkspace.current = workspaceId;
+    if (mcpWorkspace.current !== chatWorkspaceId) {
+      mcpWorkspace.current = chatWorkspaceId;
       mcpLoadedAt.current = 0;
-      mcpRequestId.current++;
-      mcpRequest.current = null;
-      mcpAbort.current?.abort();
-      mcpAbort.current = null;
+      dropMcpRequest();
       setMcpPrompts([]);
+    }
+    if (mcpClient.current !== api) {
+      // Prompts can change while offline: the shown ones stay, but the next client lists again.
+      mcpClient.current = api;
+      mcpLoadedAt.current = 0;
+    }
+    if (!api) {
+      // Offline: drop the lost client's request, keep the shown prompts for the reconnect.
+      dropMcpRequest();
+      return;
     }
     if (activeToken?.kind !== "slash" && activeToken?.kind !== "inline") return;
     if (Date.now() - mcpLoadedAt.current < 30_000 || mcpRequest.current) return;
@@ -330,15 +315,17 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
     const controller = new AbortController();
     mcpAbort.current = controller;
     const request = api.workspace.mcp.prompts
-      .list({ workspaceId }, { signal: controller.signal })
+      .list({ workspaceId: chatWorkspaceId }, { signal: controller.signal })
       .then((prompts) => {
-        if (mcpWorkspace.current === workspaceId && mcpRequestId.current === requestId) {
+        if (mcpWorkspace.current === chatWorkspaceId && mcpRequestId.current === requestId) {
           setMcpPrompts(prompts);
           mcpLoadedAt.current = Date.now();
         }
       })
-      .catch(() => {
-        if (mcpWorkspace.current === workspaceId && mcpRequestId.current === requestId) {
+      .catch((error: unknown) => {
+        // A lost connection is no answer: leave the prompts unloaded so the reconnect asks again.
+        if (isConnectionLostError(error)) return;
+        if (mcpWorkspace.current === chatWorkspaceId && mcpRequestId.current === requestId) {
           mcpLoadedAt.current = Date.now();
         }
       })
@@ -347,7 +334,7 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
         if (mcpAbort.current === controller) mcpAbort.current = null;
       });
     mcpRequest.current = request;
-  }, [api, activeToken?.kind, activeTokenKey, variant, workspaceId]);
+  }, [api, activeToken?.kind, activeTokenKey, chatWorkspaceId]);
 
   useEffect(() => {
     const scope = variant === "workspace" ? workspaceId : projectPath;
@@ -476,13 +463,26 @@ export function useComposerSuggestions(options: UseComposerSuggestionsOptions) {
 
   useEffect(() => () => mcpAbort.current?.abort(), []);
 
+  const updateCaret = (nextInput: string, nextCursor: number) => {
+    setCaretState({ input: nextInput, cursor: nextCursor });
+    // While the caret is in a `$` or `/` token, ask again for a skill list that
+    // missed a source, e.g. an SSH host that was still connecting. This keeps
+    // no per-token memory, so draft restores, sends and clears cannot leave it
+    // stale. The store makes this a no-op for a complete list and keeps at most
+    // one request per list in flight.
+    const nextToken = detectActiveComposerToken(nextInput, nextCursor);
+    if (skillDiscovery && (nextToken?.kind === "slash" || nextToken?.kind === "inline")) {
+      getAgentSkillsStore().ensureFresh(skillDiscovery);
+    }
+  };
+
   const handleCursorActivity = () => {
     const element = inputRef.current;
-    if (element) setCaretState({ input, cursor: element.selectionStart ?? input.length });
+    if (element) updateCaret(input, element.selectionStart ?? input.length);
   };
 
   const handleInputCaretChange = (caret: number | undefined, nextInput: string) => {
-    setCaretState({ input: nextInput, cursor: caret ?? nextInput.length });
+    updateCaret(nextInput, caret ?? nextInput.length);
   };
 
   const ghostHint = getCommandGhostHint(input, isVisible && activeToken?.kind === "slash", {

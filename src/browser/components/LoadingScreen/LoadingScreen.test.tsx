@@ -4,11 +4,19 @@ import React from "react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, render } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
+import * as RealDarkLogoModule from "@/browser/assets/logos/xum-logo-dark.svg?react";
+import * as RealLightLogoModule from "@/browser/assets/logos/xum-logo-light.svg?react";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 
 // SVG ?react imports don't work in happy-dom; stub them as simple divs.
 const SvgStub = (props: Record<string, unknown>) =>
   React.createElement("svg", { "data-testid": "xum-logo-mock", ...props });
 
+// Restore the real logo modules after this suite so the stubs cannot leak into later files.
+restoreModulesAfterSuite([
+  ["@/browser/assets/logos/xum-logo-dark.svg?react", { ...RealDarkLogoModule }],
+  ["@/browser/assets/logos/xum-logo-light.svg?react", { ...RealLightLogoModule }],
+]);
 void mock.module("@/browser/assets/logos/xum-logo-dark.svg?react", () => ({
   __esModule: true,
   default: SvgStub,

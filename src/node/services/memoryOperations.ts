@@ -2,9 +2,7 @@
  * Memory route operations (Memory tab + Settings → Memory).
  *
  * Internals are Effect-native: each operation is an `Effect.gen` pipeline
- * (the `*Effect` exports) that the router runs via `handlerGen`; a thin
- * `Effect.runPromise` facade keeps the Promise signatures for pre-Effect
- * callers. Failures the client renders (workspace not found, scope
+ * (the `*Effect` exports) that the router runs via `handlerGen`. Failures the client renders (workspace not found, scope
  * unavailable, path errors) stay in the success channel as the wire
  * `{ success: false }` unions. The Effect error channel carries only typed
  * domain errors a caller can branch on (`MemoryWorkspaceNotFoundError`,
@@ -14,6 +12,7 @@
 import { ORPCError } from "@orpc/server";
 import { Effect, Result, Schema } from "effect";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { MEMORY_SCOPES } from "@/common/constants/memory";
 import type * as schemas from "@/common/orpc/schemas";
 import { getErrorMessage } from "@/common/utils/errors";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
@@ -86,6 +85,8 @@ function resolveMemoryScope(
       checkoutCwd: "",
       workspaceId,
       projectPath,
+      // The Memory tab shows the workspace's own session checkpoint too.
+      scopes: MEMORY_SCOPES,
     };
     return {
       projectPath,
@@ -110,11 +111,19 @@ export function listMemoryEffect(context: MemoryContext, input: Input<typeof sch
     );
     const meta = yield* context.memoryMetaService.effects.getEntries();
     const ids = { projectPath: resolved.projectPath, workspaceId: resolved.ownerWorkspaceId };
+    // Session sidecar keys follow the acting workspace, not the owner (logicalKeyFor).
+    const sessionIds = { ...ids, workspaceId: resolved.scopeCtx.workspaceId };
     return {
       success: true as const,
       data: {
         files: entries.map((entry) => {
-          const stats = meta.get(memoryLogicalKey(entry.scope, entry.relPath, ids));
+          const stats = meta.get(
+            memoryLogicalKey(
+              entry.scope,
+              entry.relPath,
+              entry.scope === "session" ? sessionIds : ids
+            )
+          );
           return {
             path: entry.path,
             scope: entry.scope,
@@ -129,11 +138,6 @@ export function listMemoryEffect(context: MemoryContext, input: Input<typeof sch
   }).pipe(Effect.catchTag("MemoryWorkspaceNotFoundError", workspaceNotFoundAsStringError));
 }
 
-/** Promise facade over {@link listMemoryEffect} for pre-Effect callers. */
-export async function listMemory(context: MemoryContext, input: Input<typeof schemas.memory.list>) {
-  return Effect.runPromise(listMemoryEffect(context, input));
-}
-
 export function readMemoryEffect(context: MemoryContext, input: Input<typeof schemas.memory.read>) {
   return Effect.gen(function* () {
     assertMemoryEnabled(context);
@@ -142,11 +146,6 @@ export function readMemoryEffect(context: MemoryContext, input: Input<typeof sch
       context.memoryService.readFileWithSha(resolved.scopeCtx, input.path)
     );
   }).pipe(Effect.catchTag("MemoryWorkspaceNotFoundError", workspaceNotFoundAsStringError));
-}
-
-/** Promise facade over {@link readMemoryEffect} for pre-Effect callers. */
-export async function readMemory(context: MemoryContext, input: Input<typeof schemas.memory.read>) {
-  return Effect.runPromise(readMemoryEffect(context, input));
 }
 
 export function saveMemoryEffect(context: MemoryContext, input: Input<typeof schemas.memory.save>) {
@@ -173,11 +172,6 @@ export function saveMemoryEffect(context: MemoryContext, input: Input<typeof sch
   );
 }
 
-/** Promise facade over {@link saveMemoryEffect} for pre-Effect callers. */
-export async function saveMemory(context: MemoryContext, input: Input<typeof schemas.memory.save>) {
-  return Effect.runPromise(saveMemoryEffect(context, input));
-}
-
 export function deleteMemoryEffect(
   context: MemoryContext,
   input: Input<typeof schemas.memory.delete>
@@ -192,14 +186,6 @@ export function deleteMemoryEffect(
       ? { success: true as const, data: undefined }
       : { success: false as const, error: result.error };
   }).pipe(Effect.catchTag("MemoryWorkspaceNotFoundError", workspaceNotFoundAsStringError));
-}
-
-/** Promise facade over {@link deleteMemoryEffect} for pre-Effect callers. */
-export async function deleteMemory(
-  context: MemoryContext,
-  input: Input<typeof schemas.memory.delete>
-) {
-  return Effect.runPromise(deleteMemoryEffect(context, input));
 }
 
 export function setMemoryPinnedEffect(
@@ -258,14 +244,6 @@ export function setMemoryPinnedEffect(
   }).pipe(Effect.catchTag("MemoryWorkspaceNotFoundError", workspaceNotFoundAsStringError));
 }
 
-/** Promise facade over {@link setMemoryPinnedEffect} for pre-Effect callers. */
-export async function setMemoryPinned(
-  context: MemoryContext,
-  input: Input<typeof schemas.memory.setPinned>
-) {
-  return Effect.runPromise(setMemoryPinnedEffect(context, input));
-}
-
 export function getMemoryConsolidationStatusEffect(
   context: MemoryContext,
   input: Input<typeof schemas.memory.consolidationStatus>
@@ -277,14 +255,6 @@ export function getMemoryConsolidationStatusEffect(
     );
     return { success: true as const, data };
   });
-}
-
-/** Promise facade over {@link getMemoryConsolidationStatusEffect} for pre-Effect callers. */
-export async function getMemoryConsolidationStatus(
-  context: MemoryContext,
-  input: Input<typeof schemas.memory.consolidationStatus>
-) {
-  return Effect.runPromise(getMemoryConsolidationStatusEffect(context, input));
 }
 
 export function consolidateMemoryEffect(
@@ -300,12 +270,4 @@ export function consolidateMemoryEffect(
       ? { success: true as const, data: result.data }
       : { success: false as const, error: result.error };
   });
-}
-
-/** Promise facade over {@link consolidateMemoryEffect} for pre-Effect callers. */
-export async function consolidateMemory(
-  context: MemoryContext,
-  input: Input<typeof schemas.memory.consolidate>
-) {
-  return Effect.runPromise(consolidateMemoryEffect(context, input));
 }

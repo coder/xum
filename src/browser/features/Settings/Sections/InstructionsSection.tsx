@@ -93,7 +93,7 @@ export const InstructionsSection: React.FC = () => {
       <div>
         <p className="text-muted text-xs">
           Custom instructions are appended to the system prompt of every workspace in the selected
-          project. They are stored in <code className="text-accent">~/.mux/config.json</code> (kept
+          project. They are stored in <code className="text-accent">~/.xum/config.json</code> (kept
           out of source control).
         </p>
         <p className="text-muted mt-1 text-xs">

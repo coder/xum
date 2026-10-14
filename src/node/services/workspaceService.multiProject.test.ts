@@ -5,25 +5,37 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
+import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
 import { Config, type SecretsStore } from "@/node/config";
 import { ContainerManager } from "@/node/multiProject/containerManager";
-import { createStreamLifecycleMocks } from "@/node/services/agentSession.testHarness";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as gitModule from "@/node/git";
 import type { AIService } from "@/node/services/aiService";
-import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import * as bashToolModule from "@/node/services/tools/bash";
-import type { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
+import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import type { HistoryService } from "@/node/services/historyService";
-import type { InitStateManager } from "@/node/services/initStateManager";
+import { InitStateManager } from "@/node/services/initStateManager";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import { ContextManagementService } from "@/node/services/contextManagement/contextManagementService";
 import { WorkspaceService } from "@/node/services/workspaceService";
+import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
+import {
+  createMockAIService,
+  createTestBackgroundProcessManager,
+  createWorkspaceServiceHarness,
+} from "@/node/services/workspaceService.testHarness";
 import { Ok } from "@/common/types/result";
 import type { ProjectsConfig } from "@/common/types/project";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
+/** Background init starts after this backend records its init use lease (file I/O), not in one tick. */
+async function waitForCall(fn: { mock: { calls: unknown[] } }): Promise<void> {
+  for (let turn = 0; fn.mock.calls.length === 0; turn++) {
+    assert(turn < 2000, "waitForCall: never called");
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+}
 async function withTempMuxRoot<T>(fn: (root: string) => Promise<T>): Promise<T> {
   const originalMuxRoot = process.env.MUX_ROOT;
   const tempRoot = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-multi-project-"));
@@ -47,21 +59,23 @@ async function pathExists(targetPath: string): Promise<boolean> {
     return false;
   }
 }
-function createMockInitStateManager(): InitStateManager {
-  return {
-    on: mock(() => undefined as unknown as InitStateManager),
-    getInitState: mock(() => undefined),
-    startInit: mock(() => undefined),
-    endInit: mock(() => Promise.resolve()),
-    appendOutput: mock(() => undefined),
-    enterHookPhase: mock(() => undefined),
-    clearInMemoryState: mock(() => undefined),
-  } as unknown as InitStateManager;
+// Real ExtensionMetadataService per service; its file lives in a per-test temp dir removed below.
+const extensionMetadataDirs: string[] = [];
+function createTestExtensionMetadataService(): ExtensionMetadataService {
+  const dir = path.join(
+    tmpdir(),
+    `xum-test-ext-metadata-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  );
+  extensionMetadataDirs.push(dir);
+  return new ExtensionMetadataService(path.join(dir, "extensionMetadata.json"));
 }
-const mockExtensionMetadataService: Partial<ExtensionMetadataService> = {};
-const mockBackgroundProcessManager: Partial<BackgroundProcessManager> = {
-  cleanup: mock(() => Promise.resolve()),
-};
+afterEach(async () => {
+  await Promise.all(
+    extensionMetadataDirs
+      .splice(0)
+      .map((dir) => fsPromises.rm(dir, { recursive: true, force: true }))
+  );
+});
 function createMockExperimentsService(enabled: boolean): ExperimentsService {
   return {
     isExperimentEnabled: mock(() => enabled),
@@ -69,33 +83,24 @@ function createMockExperimentsService(enabled: boolean): ExperimentsService {
 }
 type BashToolConfig = Parameters<typeof bashToolModule.createBashTool>[0];
 interface WorkspaceServiceTestOptions {
-  config: Partial<Config>;
+  config: Config;
   historyService: HistoryService;
   aiService?: AIService;
   initStateManager?: InitStateManager;
   experimentsEnabled?: boolean;
   secretsStore?: Pick<SecretsStore, "getEffectiveSecrets">;
 }
-function createMockAIService(metadata?: WorkspaceMetadata): AIService {
-  return {
-    ...createStreamLifecycleMocks(),
-    getWorkspaceMetadata: mock(() => Promise.resolve(metadata ? Ok(metadata) : Ok(undefined))),
-    on: mock(() => undefined),
-    off: mock(() => undefined),
-  } as unknown as AIService;
-}
 function createWorkspaceServiceForTest(options: WorkspaceServiceTestOptions): WorkspaceService {
-  const config = options.config as Config;
+  const config = options.config;
   const aiService = options.aiService ?? createMockAIService();
   return new WorkspaceService(
     config,
     options.historyService,
     aiService,
     new ContextManagementService({ config, historyService: options.historyService, aiService }),
-    options.initStateManager ?? createMockInitStateManager(),
-    mockExtensionMetadataService as ExtensionMetadataService,
-    mockBackgroundProcessManager as BackgroundProcessManager,
-    undefined,
+    options.initStateManager ?? new InitStateManager(config),
+    createTestExtensionMetadataService(),
+    createTestBackgroundProcessManager(),
     undefined,
     undefined,
     createMockExperimentsService(options.experimentsEnabled ?? true),
@@ -105,10 +110,8 @@ function createWorkspaceServiceForTest(options: WorkspaceServiceTestOptions): Wo
   );
 }
 interface ExecuteBashHarnessOptions {
-  historyService: HistoryService;
   workspaceId: string;
   workspaceName: string;
-  srcDir?: string;
   projectAPath?: string;
   projectBPath?: string;
   primaryWorkspacePath?: string;
@@ -116,16 +119,13 @@ interface ExecuteBashHarnessOptions {
   projects?: WorkspaceMetadata["projects"];
   trustedProjects?: Array<[string, boolean]>;
   runtimeWorkspacePaths?: Record<string, string>;
-  findWorkspaceProjectPath?: string;
-  getEffectiveSecrets?: SecretsStore["getEffectiveSecrets"];
   secretsStore?: Pick<SecretsStore, "getEffectiveSecrets">;
   onCreateRuntime?: (
     projectPath: string,
     options: Parameters<typeof runtimeFactory.createRuntime>[1]
   ) => void;
 }
-function createExecuteBashHarness(options: ExecuteBashHarnessOptions) {
-  const srcDir = options.srcDir ?? "/tmp/src";
+async function createExecuteBashHarness(options: ExecuteBashHarnessOptions) {
   const projectAPath = options.projectAPath ?? "/tmp/project-a";
   const projectBPath = options.projectBPath ?? "/tmp/project-b";
   const projects = options.projects ?? [
@@ -138,15 +138,36 @@ function createExecuteBashHarness(options: ExecuteBashHarnessOptions) {
     [projectAPath]: `/tmp/workspaces/project-a/${options.workspaceName}`,
     [projectBPath]: `/tmp/workspaces/project-b/${options.workspaceName}`,
   };
-  const metadata: WorkspaceMetadata = {
-    id: options.workspaceId,
-    name: options.workspaceName,
-    projectPath: projects[0]?.projectPath ?? projectAPath,
-    projectName: projects[0]?.projectName ?? "project-a",
-    projects,
-    runtimeConfig: options.runtimeConfig ?? { type: "local" },
-  };
-  const waitForInitMock = mock(() => Promise.resolve());
+  const runtimeConfig = options.runtimeConfig ?? { type: "local" as const };
+  const serviceHarness = await createWorkspaceServiceHarness({
+    experimentsService: createMockExperimentsService(true),
+    secretsStore: options.secretsStore,
+  });
+  const { config } = serviceHarness;
+  const trustedProjects =
+    options.trustedProjects ??
+    projects.map((project) => [project.projectPath, true] as [string, boolean]);
+  // Multi-project workspaces persist under the shared key; each repo's trust lives on its own
+  // project entry.
+  await config.editConfig((cfg) => {
+    for (const [projectPath, trusted] of trustedProjects) {
+      cfg.projects.set(projectPath, { workspaces: [], trusted });
+    }
+    cfg.projects.set(MULTI_PROJECT_CONFIG_KEY, {
+      workspaces: [
+        {
+          id: options.workspaceId,
+          name: options.workspaceName,
+          path: primaryWorkspacePath,
+          createdAt: "2020-01-01T00:00:00.000Z",
+          runtimeConfig,
+          projects,
+        },
+      ],
+    });
+    return cfg;
+  });
+  const waitForInitSpy = spyOn(serviceHarness.initStateManager, "waitForInit");
   const ensureReadyMocks = new Map(
     projects.map((project) => [
       project.projectPath,
@@ -180,101 +201,63 @@ function createExecuteBashHarness(options: ExecuteBashHarnessOptions) {
       typeof bashToolModule.createBashTool
     >;
   });
-  const trustedProjects =
-    options.trustedProjects ??
-    projects.map((project) => [project.projectPath, true] as [string, boolean]);
-  const workspaceService = createWorkspaceServiceForTest({
-    historyService: options.historyService,
-    aiService: createMockAIService(metadata),
-    initStateManager: {
-      on: mock(() => undefined as unknown as InitStateManager),
-      getInitState: mock(() => undefined),
-      waitForInit: waitForInitMock,
-    } as unknown as InitStateManager,
-    secretsStore:
-      options.secretsStore ??
-      ({ getEffectiveSecrets: options.getEffectiveSecrets ?? mock(() => []) } satisfies Pick<
-        SecretsStore,
-        "getEffectiveSecrets"
-      >),
-    config: {
-      srcDir,
-      sessionsDir: "/tmp/test/sessions",
-      findWorkspace: mock(() => ({
-        projectPath: options.findWorkspaceProjectPath ?? projectAPath,
-        workspacePath: primaryWorkspacePath,
-      })),
-      loadConfigOrDefault: mock(() => ({
-        projects: new Map(
-          trustedProjects.map(([projectPath, trusted]) => [
-            projectPath,
-            { workspaces: [], trusted },
-          ])
-        ),
-      })),
-    },
-  });
   return {
     bashExecuteMock,
     capturedToolConfig: () => {
       assert(capturedToolConfig);
       return capturedToolConfig;
     },
+    config,
     createRuntimeSpy,
-    dispose: () => {
+    dispose: async () => {
       createBashToolSpy.mockRestore();
       createRuntimeSpy.mockRestore();
+      await serviceHarness.cleanup();
     },
     ensureReadyMock: (projectPath: string) => ensureReadyMocks.get(projectPath),
-    metadata,
-    waitForInitMock,
-    workspaceService,
+    runtimeConfig,
+    waitForInitMock: waitForInitSpy,
+    workspaceService: serviceHarness.service,
   };
 }
 describe("WorkspaceService executeBash runtime selection", () => {
-  let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
-  beforeEach(async () => {
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
-  });
-  afterEach(async () => {
-    await cleanupHistory();
-  });
   test("uses the shared container-root cwd for multi-project script mode even when the persisted workspace path points at the primary checkout", async () => {
     const workspaceId = "ws-multi-bash";
     const workspaceName = "feature-multi-bash";
-    const harness = createExecuteBashHarness({ historyService, workspaceId, workspaceName });
+    const harness = await createExecuteBashHarness({ workspaceId, workspaceName });
     try {
       const result = await harness.workspaceService.executeBash(workspaceId, "pwd");
       expect(result.success).toBe(true);
       expect(harness.waitForInitMock).toHaveBeenCalledWith(workspaceId);
       expect(harness.createRuntimeSpy).toHaveBeenCalledTimes(2);
-      expect(harness.createRuntimeSpy).toHaveBeenNthCalledWith(1, harness.metadata.runtimeConfig, {
+      expect(harness.createRuntimeSpy).toHaveBeenNthCalledWith(1, harness.runtimeConfig, {
         projectPath: "/tmp/project-a",
         workspaceName,
         workspacePath: undefined,
       });
-      expect(harness.createRuntimeSpy).toHaveBeenNthCalledWith(2, harness.metadata.runtimeConfig, {
+      expect(harness.createRuntimeSpy).toHaveBeenNthCalledWith(2, harness.runtimeConfig, {
         projectPath: "/tmp/project-b",
         workspaceName,
         workspacePath: undefined,
       });
       const toolConfig = harness.capturedToolConfig();
       expect(toolConfig.runtime).toBeInstanceOf(MultiProjectRuntime);
-      expect(toolConfig.cwd).toBe(new ContainerManager("/tmp/src").getContainerPath(workspaceName));
+      // A local runtime has no srcBaseDir, so the container root comes from the config's srcDir.
+      expect(toolConfig.cwd).toBe(
+        new ContainerManager(harness.config.srcDir).getContainerPath(workspaceName)
+      );
       expect(toolConfig.trusted).toBe(true);
       expect(harness.ensureReadyMock("/tmp/project-a")).toHaveBeenCalledTimes(1);
       expect(harness.ensureReadyMock("/tmp/project-b")).toHaveBeenCalledTimes(1);
       expect(harness.bashExecuteMock).toHaveBeenCalledTimes(1);
     } finally {
-      harness.dispose();
+      await harness.dispose();
     }
   });
   test("preserves the current SSH repo root and derives sibling legacy repo roots for multi-project repo-root bash mode when the persisted root matches that layout", async () => {
     const workspaceId = "ws-multi-bash-ssh";
     const workspaceName = "feature-multi-bash-ssh";
-    const harness = createExecuteBashHarness({
-      historyService,
+    const harness = await createExecuteBashHarness({
       workspaceId,
       workspaceName,
       primaryWorkspacePath: `/tmp/src/project-a/${workspaceName}`,
@@ -301,13 +284,13 @@ describe("WorkspaceService executeBash runtime selection", () => {
       expect(harness.ensureReadyMock("/tmp/project-b")).toHaveBeenCalledTimes(1);
       expect(harness.bashExecuteMock).toHaveBeenCalledTimes(1);
     } finally {
-      harness.dispose();
+      await harness.dispose();
     }
   });
   test("lets multi-project script mode target a secondary repo checkout explicitly", async () => {
     const workspaceId = "ws-multi-bash-repo-root";
     const workspaceName = "feature-multi-bash-repo-root";
-    const harness = createExecuteBashHarness({ historyService, workspaceId, workspaceName });
+    const harness = await createExecuteBashHarness({ workspaceId, workspaceName });
     try {
       const result = await harness.workspaceService.executeBash(workspaceId, "git status --short", {
         cwdMode: "repo-root",
@@ -324,7 +307,7 @@ describe("WorkspaceService executeBash runtime selection", () => {
       expect(harness.ensureReadyMock("/tmp/project-b")).toHaveBeenCalledTimes(1);
       expect(harness.bashExecuteMock).toHaveBeenCalledTimes(1);
     } finally {
-      harness.dispose();
+      await harness.dispose();
     }
   });
   test("normalizes repo-root project paths before matching secondary runtimes", async () => {
@@ -332,8 +315,7 @@ describe("WorkspaceService executeBash runtime selection", () => {
     const workspaceName = "feature-multi-bash-repo-root-windows";
     const projectAPath = "C:\\tmp\\project-a\\";
     const projectBPath = "C:\\tmp\\project-b\\";
-    const harness = createExecuteBashHarness({
-      historyService,
+    const harness = await createExecuteBashHarness({
       workspaceId,
       workspaceName,
       projectAPath,
@@ -359,13 +341,12 @@ describe("WorkspaceService executeBash runtime selection", () => {
       expect(harness.ensureReadyMock(projectBPath)).toHaveBeenCalledTimes(1);
       expect(harness.bashExecuteMock).toHaveBeenCalledTimes(1);
     } finally {
-      harness.dispose();
+      await harness.dispose();
     }
   });
   test("marks multi-project executeBash untrusted when any secondary project is untrusted", async () => {
     const workspaceId = "ws-multi-bash-untrusted";
-    const harness = createExecuteBashHarness({
-      historyService,
+    const harness = await createExecuteBashHarness({
       workspaceId,
       workspaceName: "feature-multi-bash-untrusted",
       trustedProjects: [
@@ -379,7 +360,7 @@ describe("WorkspaceService executeBash runtime selection", () => {
       expect(harness.capturedToolConfig().trusted).toBe(false);
       expect(harness.bashExecuteMock).toHaveBeenCalledTimes(1);
     } finally {
-      harness.dispose();
+      await harness.dispose();
     }
   });
   test("merges multi-project executeBash secrets across all repos with primary-project precedence", async () => {
@@ -400,8 +381,7 @@ describe("WorkspaceService executeBash runtime selection", () => {
       }
       throw new Error(`Unexpected secrets lookup: ${projectPath}`);
     });
-    const harness = createExecuteBashHarness({
-      historyService,
+    const harness = await createExecuteBashHarness({
       workspaceId,
       workspaceName,
       secretsStore: {
@@ -419,14 +399,13 @@ describe("WorkspaceService executeBash runtime selection", () => {
       expect(getEffectiveSecretsMock.mock.calls).toEqual([["/tmp/project-a"], ["/tmp/project-b"]]);
       expect(harness.bashExecuteMock).toHaveBeenCalledTimes(1);
     } finally {
-      harness.dispose();
+      await harness.dispose();
     }
   });
   test("keeps multi-project git command mode on the primary repo checkout even when the persisted workspace path points at that checkout", async () => {
     const workspaceId = "ws-multi-git";
     const workspaceName = "feature-multi-git";
-    const harness = createExecuteBashHarness({
-      historyService,
+    const harness = await createExecuteBashHarness({
       workspaceId,
       workspaceName,
       trustedProjects: [["/tmp/project-a", true]],
@@ -444,14 +423,13 @@ describe("WorkspaceService executeBash runtime selection", () => {
       expect(toolConfig.cwd).toBe(`/tmp/workspaces/project-a/${workspaceName}`);
       expect(harness.bashExecuteMock).toHaveBeenCalledTimes(1);
     } finally {
-      harness.dispose();
+      await harness.dispose();
     }
   });
   test("uses the primary project runtime workspace path for _multi git command mode", async () => {
     const workspaceId = "ws-multi-git-container";
     const workspaceName = "feature-multi-git-container";
-    const harness = createExecuteBashHarness({
-      historyService,
+    const harness = await createExecuteBashHarness({
       workspaceId,
       workspaceName,
       trustedProjects: [["/tmp/project-a", true]],
@@ -470,7 +448,7 @@ describe("WorkspaceService executeBash runtime selection", () => {
       expect(toolConfig.cwd).toBe(`/tmp/workspaces/project-a/${workspaceName}`);
       expect(harness.bashExecuteMock).toHaveBeenCalledTimes(1);
     } finally {
-      harness.dispose();
+      await harness.dispose();
     }
   });
   test("keeps single-project executeBash on the workspace runtime path", async () => {
@@ -478,14 +456,6 @@ describe("WorkspaceService executeBash runtime selection", () => {
     const workspaceName = "feature-single-bash";
     const projectPath = "/tmp/project-a";
     const workspacePath = `/tmp/workspaces/project-a/${workspaceName}`;
-    const metadata: WorkspaceMetadata = {
-      id: workspaceId,
-      name: workspaceName,
-      projectPath,
-      projectName: "project-a",
-      runtimeConfig: { type: "local" },
-    };
-    const waitForInitMock = mock(() => Promise.resolve());
     const singleRuntime = {
       ensureReady: mock(() => Promise.resolve({ ready: true as const })),
       getWorkspacePath: mock(() => workspacePath),
@@ -503,24 +473,26 @@ describe("WorkspaceService executeBash runtime selection", () => {
         >;
       }
     );
-    const workspaceService = createWorkspaceServiceForTest({
-      historyService,
-      aiService: createMockAIService(metadata),
-      initStateManager: {
-        on: mock(() => undefined as unknown as InitStateManager),
-        getInitState: mock(() => undefined),
-        waitForInit: waitForInitMock,
-      } as unknown as InitStateManager,
-      config: {
-        srcDir: "/tmp/src",
-        sessionsDir: "/tmp/test/sessions",
-        findWorkspace: mock(() => ({ projectPath, workspacePath })),
-        loadConfigOrDefault: mock(() => ({
-          projects: new Map([[projectPath, { workspaces: [], trusted: true }]]),
-        })),
-      },
-      secretsStore: { getEffectiveSecrets: mock(() => []) } as unknown as SecretsStore,
+    await using serviceHarness = await createWorkspaceServiceHarness({
+      experimentsService: createMockExperimentsService(true),
     });
+    const { config, service: workspaceService } = serviceHarness;
+    await config.editConfig((cfg) => {
+      cfg.projects.set(projectPath, {
+        trusted: true,
+        workspaces: [
+          {
+            id: workspaceId,
+            name: workspaceName,
+            path: workspacePath,
+            createdAt: "2020-01-01T00:00:00.000Z",
+            runtimeConfig: { type: "local" },
+          },
+        ],
+      });
+      return cfg;
+    });
+    const waitForInitMock = spyOn(serviceHarness.initStateManager, "waitForInit");
     try {
       const result = await workspaceService.executeBash(workspaceId, "pwd");
       expect(result.success).toBe(true);
@@ -580,155 +552,135 @@ describe("WorkspaceService multi-project lifecycle", () => {
     });
   });
 
+  /** Real Config holding one single-project and one multi-project workspace. */
+  async function seedListingConfig(root: string) {
+    const projectAPath = path.join(root, "project-a");
+    const projectBPath = path.join(root, "project-b");
+    const multiProjects = [
+      { projectPath: projectAPath, projectName: "project-a" },
+      { projectPath: projectBPath, projectName: "project-b" },
+    ];
+    const config = new Config(root);
+    await config.editConfig((snapshot) => {
+      snapshot.projects.set(projectAPath, {
+        workspaces: [
+          {
+            id: "ws-single",
+            name: "feature-single",
+            path: path.join(projectAPath, "feature-single"),
+            runtimeConfig: { type: "local" },
+          },
+        ],
+      });
+      snapshot.projects.set(MULTI_PROJECT_CONFIG_KEY, {
+        workspaces: [
+          {
+            id: "ws-multi",
+            name: "feature-multi",
+            path: path.join(projectAPath, "feature-multi"),
+            runtimeConfig: { type: "local" },
+            projects: multiProjects,
+          },
+        ],
+      });
+      return snapshot;
+    });
+    return { config, multiProjects };
+  }
   test("list() and getInfo() hide persisted multi-project metadata when experiment is disabled", async () => {
-    const singleProjectMetadata: FrontendWorkspaceMetadata = {
-      id: "ws-single",
-      name: "feature-single",
-      projectPath: "/tmp/project-a",
-      projectName: "project-a",
-      runtimeConfig: { type: "local" },
-      namedWorkspacePath: "/tmp/project-a/feature-single",
-    };
-    const multiProjectMetadata: FrontendWorkspaceMetadata = {
-      id: "ws-multi",
-      name: "feature-multi",
-      projectPath: "/tmp/project-a",
-      projectName: "project-a+project-b",
-      projects: [
-        { projectPath: "/tmp/project-a", projectName: "project-a" },
-        { projectPath: "/tmp/project-b", projectName: "project-b" },
-      ],
-      runtimeConfig: { type: "local" },
-      namedWorkspacePath: "/tmp/project-a/feature-multi",
-    };
-    const mockConfig: Partial<Config> = {
-      getAllWorkspaceMetadata: mock(() =>
-        Promise.resolve([singleProjectMetadata, multiProjectMetadata])
-      ),
-    };
-    const mockAIService = {
-      on: mock(() => undefined),
-      off: mock(() => undefined),
-    } as unknown as AIService;
-    const workspaceService = new WorkspaceService(
-      mockConfig as Config,
-      historyService,
-      mockAIService,
-      new ContextManagementService({
-        config: mockConfig as Config,
+    await withTempMuxRoot(async (root) => {
+      const { config } = await seedListingConfig(root);
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
         historyService,
-        aiService: mockAIService,
-      }),
-      createMockInitStateManager(),
-      mockExtensionMetadataService as ExtensionMetadataService,
-      mockBackgroundProcessManager as BackgroundProcessManager,
-      undefined,
-      undefined,
-      undefined,
-      createMockExperimentsService(false)
-    );
-    expect((await workspaceService.list()).map((metadata) => metadata.id)).toEqual(["ws-single"]);
-    const singleProjectInfo = await workspaceService.getInfo(singleProjectMetadata.id);
-    assert(singleProjectInfo, "Expected single-project metadata when the experiment is disabled");
-    expect(singleProjectInfo.id).toBe(singleProjectMetadata.id);
-    expect(await workspaceService.getInfo(multiProjectMetadata.id)).toBeNull();
+        experimentsEnabled: false,
+      });
+      expect((await workspaceService.list()).map((metadata) => metadata.id)).toEqual(["ws-single"]);
+      const singleProjectInfo = await workspaceService.getInfo("ws-single");
+      assert(singleProjectInfo, "Expected single-project metadata when the experiment is disabled");
+      expect(singleProjectInfo.id).toBe("ws-single");
+      expect(await workspaceService.getInfo("ws-multi")).toBeNull();
+    });
   });
   test("list() and getInfo() expose multi-project metadata when experiment is enabled", async () => {
-    const singleProjectMetadata: FrontendWorkspaceMetadata = {
-      id: "ws-single",
-      name: "feature-single",
-      projectPath: "/tmp/project-a",
-      projectName: "project-a",
-      runtimeConfig: { type: "local" },
-      namedWorkspacePath: "/tmp/project-a/feature-single",
-    };
-    const multiProjectMetadata: FrontendWorkspaceMetadata = {
-      id: "ws-multi",
-      name: "feature-multi",
-      projectPath: "/tmp/project-a",
-      projectName: "project-a+project-b",
-      projects: [
-        { projectPath: "/tmp/project-a", projectName: "project-a" },
-        { projectPath: "/tmp/project-b", projectName: "project-b" },
-      ],
-      runtimeConfig: { type: "local" },
-      namedWorkspacePath: "/tmp/project-a/feature-multi",
-    };
-    const mockConfig: Partial<Config> = {
-      getAllWorkspaceMetadata: mock(() =>
-        Promise.resolve([singleProjectMetadata, multiProjectMetadata])
-      ),
-    };
-    const mockAIService = {
-      on: mock(() => undefined),
-      off: mock(() => undefined),
-    } as unknown as AIService;
-    const workspaceService = new WorkspaceService(
-      mockConfig as Config,
-      historyService,
-      mockAIService,
-      new ContextManagementService({
-        config: mockConfig as Config,
+    await withTempMuxRoot(async (root) => {
+      const { config, multiProjects } = await seedListingConfig(root);
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
         historyService,
-        aiService: mockAIService,
-      }),
-      createMockInitStateManager(),
-      mockExtensionMetadataService as ExtensionMetadataService,
-      mockBackgroundProcessManager as BackgroundProcessManager,
-      undefined,
-      undefined,
-      undefined,
-      createMockExperimentsService(true)
-    );
-    expect((await workspaceService.list()).map((metadata) => metadata.id)).toEqual([
-      "ws-single",
-      "ws-multi",
-    ]);
-    const multiProjectInfo = await workspaceService.getInfo(multiProjectMetadata.id);
-    assert(multiProjectInfo, "Expected multi-project metadata when the experiment is enabled");
-    expect(multiProjectInfo.id).toBe(multiProjectMetadata.id);
-    expect(multiProjectInfo.projects).toEqual(multiProjectMetadata.projects);
+        experimentsEnabled: true,
+      });
+      expect((await workspaceService.list()).map((metadata) => metadata.id)).toEqual([
+        "ws-single",
+        "ws-multi",
+      ]);
+      const multiProjectInfo = await workspaceService.getInfo("ws-multi");
+      assert(multiProjectInfo, "Expected multi-project metadata when the experiment is enabled");
+      expect(multiProjectInfo.id).toBe("ws-multi");
+      expect(multiProjectInfo.projects).toEqual(multiProjects);
+    });
   });
   test("createMultiProject rejects when the experiment is disabled", async () => {
-    const generateStableIdMock = mock(() => "ws-disabled");
-    const loadConfigOrDefaultMock = mock(() => ({ projects: new Map() }));
-    const config = {
-      generateStableId: generateStableIdMock,
-      loadConfigOrDefault: loadConfigOrDefaultMock,
-    } as unknown as Config;
-    const aiService = {
-      on: mock(() => undefined),
-      off: mock(() => undefined),
-    } as unknown as AIService;
-    const workspaceService = new WorkspaceService(
-      config,
-      historyService,
-      aiService,
-      new ContextManagementService({ config, historyService, aiService }),
-      createMockInitStateManager(),
-      mockExtensionMetadataService as ExtensionMetadataService,
-      mockBackgroundProcessManager as BackgroundProcessManager,
-      undefined,
-      undefined,
-      undefined,
-      createMockExperimentsService(false)
-    );
-    const result = await workspaceService.createMultiProject(
-      [
-        { projectPath: "/tmp/project-a", projectName: "project-a" },
-        { projectPath: "/tmp/project-b", projectName: "project-b" },
-      ],
-      "feature-disabled",
-      "main"
-    );
-    expect(result.success).toBe(false);
-    if (result.success) {
-      return;
-    }
-    expect(result.error).toBe("Multi-project workspaces experiment is disabled");
-    expect(generateStableIdMock).not.toHaveBeenCalled();
-    expect(loadConfigOrDefaultMock).not.toHaveBeenCalled();
+    await withTempMuxRoot(async (root) => {
+      const config = new Config(root);
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        experimentsEnabled: false,
+      });
+      // Spies record calls on the real Config; the gate must refuse before touching it.
+      const generateStableIdSpy = spyOn(config, "generateStableId");
+      const loadConfigOrDefaultSpy = spyOn(config, "loadConfigOrDefault");
+      const result = await workspaceService.createMultiProject(
+        [
+          { projectPath: path.join(root, "project-a"), projectName: "project-a" },
+          { projectPath: path.join(root, "project-b"), projectName: "project-b" },
+        ],
+        "feature-disabled",
+        "main"
+      );
+      expect(result.success).toBe(false);
+      if (result.success) {
+        return;
+      }
+      expect(result.error).toBe("Multi-project workspaces experiment is disabled");
+      expect(generateStableIdSpy).not.toHaveBeenCalled();
+      expect(loadConfigOrDefaultSpy).not.toHaveBeenCalled();
+    });
   });
+  /**
+   * Real Config in `rootDir` seeded with `seed`'s project entries (round-tripped through disk).
+   * Seed current-format entries (createdAt, runtimeConfig): metadata reads otherwise queue a
+   * legacy-migration editConfig write that tests asserting "no config write" would count.
+   */
+  async function createSeededConfig(rootDir: string, seed: ProjectsConfig): Promise<Config> {
+    const config = new Config(rootDir);
+    await config.editConfig((snapshot) => {
+      for (const [projectPath, project] of seed.projects) {
+        snapshot.projects.set(projectPath, project);
+      }
+      return snapshot;
+    });
+    return config;
+  }
+  /** Real Config in `rootDir` with trusted, empty project entries and an optional pinned stable id. */
+  async function createTrustedProjectsConfig(
+    rootDir: string,
+    projectPaths: string[],
+    workspaceId?: string
+  ): Promise<Config> {
+    const config = new Config(rootDir);
+    await config.editConfig((snapshot) => {
+      for (const projectPath of projectPaths) {
+        snapshot.projects.set(projectPath, { workspaces: [], trusted: true });
+      }
+      return snapshot;
+    });
+    if (workspaceId !== undefined) {
+      spyOn(config, "generateStableId").mockReturnValue(workspaceId);
+    }
+    return config;
+  }
   test("createMultiProject creates per-project workspaces and persists metadata", async () => {
     await withTempMuxRoot(async (rootDir) => {
       const workspaceId = "ws-multi-create";
@@ -737,52 +689,12 @@ describe("WorkspaceService multi-project lifecycle", () => {
       const projectBPath = path.join(rootDir, "project-b");
       const srcDir = path.join(rootDir, "src");
       const containerPath = path.join(srcDir, "_workspaces", branchName);
-      const configState: ProjectsConfig = {
-        projects: new Map([
-          [projectAPath, { workspaces: [], trusted: true }],
-          [projectBPath, { workspaces: [], trusted: true }],
-        ]),
-      };
-      const mockConfig: Partial<Config> = {
+      const config = await createTrustedProjectsConfig(
         rootDir,
-        srcDir,
-        generateStableId: mock(() => workspaceId),
-        loadConfigOrDefault: mock(() => configState),
-        editConfig: mock((fn: (config: ProjectsConfig) => ProjectsConfig) => {
-          fn(configState);
-          return Promise.resolve();
-        }),
-        getAllWorkspaceMetadata: mock(() => {
-          const workspaces = configState.projects.get(MULTI_PROJECT_CONFIG_KEY)?.workspaces ?? [];
-          return Promise.resolve(
-            workspaces.map((workspace) => {
-              const metadata: FrontendWorkspaceMetadata = {
-                id: workspace.id ?? "",
-                name: workspace.name ?? "",
-                title: workspace.title,
-                projectPath: workspace.projects?.[0]?.projectPath ?? "",
-                projectName:
-                  workspace.projects?.map((project) => project.projectName).join("+") ?? "",
-                projects: workspace.projects,
-                createdAt: workspace.createdAt,
-                runtimeConfig: workspace.runtimeConfig ?? {
-                  type: "worktree",
-                  srcBaseDir: srcDir,
-                },
-                namedWorkspacePath: workspace.path,
-              };
-              return metadata;
-            })
-          );
-        }),
-        sessionsDir: path.join(rootDir, "sessions"),
-        findWorkspace: mock(() => null),
-      };
-      const mockAIService = {
-        ...createStreamLifecycleMocks(),
-        on: mock(() => undefined),
-        off: mock(() => undefined),
-      } as unknown as AIService;
+        [projectAPath, projectBPath],
+        workspaceId
+      );
+      const mockAIService = createMockAIService();
       const createWorkspaceAMock = mock(() =>
         Promise.resolve({
           success: true as const,
@@ -795,7 +707,12 @@ describe("WorkspaceService multi-project lifecycle", () => {
           workspacePath: path.join(srcDir, "project-b", branchName),
         })
       );
-      const initWorkspaceAMock = mock(() => Promise.resolve({ success: true as const }));
+      // #4857: the per-project inits run under this backend's "init" use lease.
+      const initLeasesHeld: number[] = [];
+      const initWorkspaceAMock = mock(() => {
+        initLeasesHeld.push(workspaceUseLeasesFor(config).heldCount(workspaceId, "init"));
+        return Promise.resolve({ success: true as const });
+      });
       const initWorkspaceBMock = mock(() => Promise.resolve({ success: true as const }));
       const deleteWorkspaceMock = mock(() =>
         Promise.resolve({ success: true as const, deletedPath: "/tmp/deleted" })
@@ -827,7 +744,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
       ).mockResolvedValue(containerPath);
       try {
         const workspaceService = createWorkspaceServiceForTest({
-          config: mockConfig,
+          config,
           historyService,
           aiService: mockAIService,
         });
@@ -867,7 +784,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
             workspacePath: path.join(srcDir, "project-b", branchName),
           },
         ]);
-        await new Promise((resolve) => setTimeout(resolve, 0));
+        await waitForCall(initWorkspaceBMock);
         expect(initWorkspaceAMock).toHaveBeenCalledWith(
           expect.objectContaining({
             projectPath: projectAPath,
@@ -884,14 +801,25 @@ describe("WorkspaceService multi-project lifecycle", () => {
             workspacePath: path.join(srcDir, "project-b", branchName),
           })
         );
+        expect(initLeasesHeld).toEqual([1]);
+        for (let turn = 0; workspaceUseLeasesFor(config).heldCount(workspaceId) > 0; turn++) {
+          assert(turn < 1000, "the init use lease was never released");
+          await new Promise((resolve) => setTimeout(resolve, 1));
+        }
         const storedMultiWorkspaces =
-          configState.projects.get(MULTI_PROJECT_CONFIG_KEY)?.workspaces ?? [];
+          config.loadConfigOrDefault().projects.get(MULTI_PROJECT_CONFIG_KEY)?.workspaces ?? [];
         expect(storedMultiWorkspaces).toHaveLength(1);
-        expect(configState.projects.get(MULTI_PROJECT_CONFIG_KEY)?.projectKind).toBe("system");
+        expect(
+          config.loadConfigOrDefault().projects.get(MULTI_PROJECT_CONFIG_KEY)?.projectKind
+        ).toBe("system");
         expect(storedMultiWorkspaces[0]?.projects).toEqual([
           { projectPath: projectAPath, projectName: "project-a" },
           { projectPath: projectBPath, projectName: "project-b" },
         ]);
+        // New root workspaces are opted in to unrelated messaging at creation.
+        const multiConsent = storedMultiWorkspaces[0]?.unrelatedWorkspaceConsent;
+        expect(multiConsent).toBeDefined();
+        expect(getValidUnrelatedWorkspaceConsent(multiConsent)).toBe(multiConsent);
       } finally {
         createContainerSpy.mockRestore();
         createRuntimeSpy.mockRestore();
@@ -906,49 +834,12 @@ describe("WorkspaceService multi-project lifecycle", () => {
       const projectBPath = path.join(rootDir, "project-b");
       const srcDir = path.join(rootDir, "src");
       const containerPath = path.join(srcDir, "_workspaces", branchName);
-      const configState: ProjectsConfig = {
-        projects: new Map([
-          [projectAPath, { workspaces: [], trusted: true }],
-          [projectBPath, { workspaces: [], trusted: true }],
-        ]),
-      };
-      const mockConfig: Partial<Config> = {
+      const config = await createTrustedProjectsConfig(
         rootDir,
-        srcDir,
-        generateStableId: mock(() => workspaceId),
-        loadConfigOrDefault: mock(() => configState),
-        editConfig: mock((fn: (config: ProjectsConfig) => ProjectsConfig) => {
-          fn(configState);
-          return Promise.resolve();
-        }),
-        getAllWorkspaceMetadata: mock(() => {
-          const workspaces = configState.projects.get(MULTI_PROJECT_CONFIG_KEY)?.workspaces ?? [];
-          return Promise.resolve(
-            workspaces.map((workspace) => ({
-              id: workspace.id ?? "",
-              name: workspace.name ?? "",
-              title: workspace.title,
-              projectPath: workspace.projects?.[0]?.projectPath ?? "",
-              projectName:
-                workspace.projects?.map((project) => project.projectName).join("+") ?? "",
-              projects: workspace.projects,
-              createdAt: workspace.createdAt,
-              runtimeConfig: workspace.runtimeConfig ?? {
-                type: "worktree",
-                srcBaseDir: srcDir,
-              },
-              namedWorkspacePath: workspace.path,
-            }))
-          );
-        }),
-        sessionsDir: path.join(rootDir, "sessions"),
-        findWorkspace: mock(() => null),
-      };
-      const mockAIService = {
-        ...createStreamLifecycleMocks(),
-        on: mock(() => undefined),
-        off: mock(() => undefined),
-      } as unknown as AIService;
+        [projectAPath, projectBPath],
+        workspaceId
+      );
+      const mockAIService = createMockAIService();
       const createWorkspaceAMock = mock(() =>
         Promise.resolve({
           success: true as const,
@@ -998,39 +889,17 @@ describe("WorkspaceService multi-project lifecycle", () => {
         ContainerManager.prototype,
         "createContainer"
       ).mockResolvedValue(containerPath);
-      let initStateCleared = false;
-      const clearInMemoryStateMock = mock(() => {
-        initStateCleared = true;
-      });
-      const getInitStateMock = mock(() =>
-        initStateCleared ? undefined : ({ status: "running" } as const)
-      );
+      // Real init state: createMultiProject starts it, and the abort path must clear it.
+      const initStateManager = new InitStateManager(config);
+      const clearInMemoryStateMock = spyOn(initStateManager, "clearInMemoryState");
+      const getInitStateMock = spyOn(initStateManager, "getInitState");
       try {
-        workspaceService = new WorkspaceService(
-          mockConfig as Config,
+        workspaceService = createWorkspaceServiceForTest({
+          config,
           historyService,
-          mockAIService,
-          new ContextManagementService({
-            config: mockConfig as Config,
-            historyService,
-            aiService: mockAIService,
-          }),
-          {
-            on: mock(() => undefined as unknown as InitStateManager),
-            getInitState: getInitStateMock,
-            startInit: mock(() => undefined),
-            endInit: mock(() => Promise.resolve()),
-            appendOutput: mock(() => undefined),
-            enterHookPhase: mock(() => undefined),
-            clearInMemoryState: clearInMemoryStateMock,
-          } as unknown as InitStateManager,
-          mockExtensionMetadataService as ExtensionMetadataService,
-          mockBackgroundProcessManager as BackgroundProcessManager,
-          undefined,
-          undefined,
-          undefined,
-          createMockExperimentsService(true)
-        );
+          aiService: mockAIService,
+          initStateManager,
+        });
         const metadataEvents: FrontendWorkspaceMetadata[] = [];
         workspaceService.on("metadata", (event) => {
           metadataEvents.push((event as { metadata: FrontendWorkspaceMetadata }).metadata);
@@ -1044,12 +913,11 @@ describe("WorkspaceService multi-project lifecycle", () => {
           "main"
         );
         expect(result.success).toBe(true);
-        await new Promise((resolve) => setTimeout(resolve, 0));
+        await waitForCall(initWorkspaceAMock);
         expect(initWorkspaceAMock).toHaveBeenCalledTimes(1);
         expect(metadataEvents[0]?.isInitializing).toBe(true);
         initWorkspaceADeferred.resolve({ success: true });
-        await new Promise((resolve) => setTimeout(resolve, 0));
-        await new Promise((resolve) => setTimeout(resolve, 0));
+        await waitForCall(clearInMemoryStateMock);
         expect(clearInMemoryStateMock).toHaveBeenCalledWith(workspaceId);
         expect(getInitStateMock.mock.calls.length).toBeGreaterThanOrEqual(2);
         expect(initWorkspaceBMock).not.toHaveBeenCalled();
@@ -1085,25 +953,12 @@ describe("WorkspaceService multi-project lifecycle", () => {
           workspacePath: originalProjectAWorkspacePath,
         },
       ]);
-      const configState: ProjectsConfig = {
-        projects: new Map([
-          [projectAPath, { workspaces: [], trusted: true }],
-          [projectBPath, { workspaces: [], trusted: true }],
-        ]),
-      };
-      const mockConfig: Partial<Config> = {
+      const config = await createTrustedProjectsConfig(
         rootDir,
-        srcDir,
-        generateStableId: mock(() => workspaceId),
-        loadConfigOrDefault: mock(() => configState),
-        sessionsDir: path.join(rootDir, "sessions"),
-        findWorkspace: mock(() => null),
-      };
-      const mockAIService = {
-        ...createStreamLifecycleMocks(),
-        on: mock(() => undefined),
-        off: mock(() => undefined),
-      } as unknown as AIService;
+        [projectAPath, projectBPath],
+        workspaceId
+      );
+      const mockAIService = createMockAIService();
       const createWorkspaceAMock = mock(() =>
         Promise.resolve({
           success: true as const,
@@ -1147,7 +1002,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
       const removeContainerSpy = spyOn(ContainerManager.prototype, "removeContainer");
       try {
         const workspaceService = createWorkspaceServiceForTest({
-          config: mockConfig,
+          config,
           historyService,
           aiService: mockAIService,
         });
@@ -1165,12 +1020,15 @@ describe("WorkspaceService multi-project lifecycle", () => {
         }
         expect(result.error).toContain("already exists");
         expect(deleteWorkspaceAMock).toHaveBeenCalledTimes(1);
+        // Neither createWorkspace reported createdBranch, so the non-forced rollback must keep
+        // both branches: `git branch -d` would delete a merged user branch it merely reused.
         expect(deleteWorkspaceAMock).toHaveBeenCalledWith(
           projectAPath,
           branchName,
           false,
           expect.any(AbortSignal),
-          true
+          true,
+          { keepBranch: true }
         );
         expect(deleteWorkspaceBMock).toHaveBeenCalledTimes(1);
         expect(deleteWorkspaceBMock).toHaveBeenCalledWith(
@@ -1178,7 +1036,8 @@ describe("WorkspaceService multi-project lifecycle", () => {
           branchName,
           false,
           expect.any(AbortSignal),
-          true
+          true,
+          { keepBranch: true }
         );
         expect(initWorkspaceMock).not.toHaveBeenCalled();
         expect(removeContainerSpy).not.toHaveBeenCalled();
@@ -1206,49 +1065,12 @@ describe("WorkspaceService multi-project lifecycle", () => {
       const projectBPath = path.join(rootDir, "project-b");
       const srcDir = path.join(rootDir, "src");
       const containerPath = path.join(srcDir, "_workspaces", branchName);
-      const configState: ProjectsConfig = {
-        projects: new Map([
-          [projectAPath, { workspaces: [], trusted: true }],
-          [projectBPath, { workspaces: [], trusted: true }],
-        ]),
-      };
-      const mockConfig: Partial<Config> = {
+      const config = await createTrustedProjectsConfig(
         rootDir,
-        srcDir,
-        generateStableId: mock(() => workspaceId),
-        loadConfigOrDefault: mock(() => configState),
-        editConfig: mock((fn: (config: ProjectsConfig) => ProjectsConfig) => {
-          fn(configState);
-          return Promise.resolve();
-        }),
-        getAllWorkspaceMetadata: mock(() => {
-          const workspaces = configState.projects.get(MULTI_PROJECT_CONFIG_KEY)?.workspaces ?? [];
-          return Promise.resolve(
-            workspaces.map((workspace) => ({
-              id: workspace.id ?? "",
-              name: workspace.name ?? "",
-              title: workspace.title,
-              projectPath: workspace.projects?.[0]?.projectPath ?? "",
-              projectName:
-                workspace.projects?.map((project) => project.projectName).join("+") ?? "",
-              projects: workspace.projects,
-              createdAt: workspace.createdAt,
-              runtimeConfig: workspace.runtimeConfig ?? {
-                type: "worktree",
-                srcBaseDir: srcDir,
-              },
-              namedWorkspacePath: workspace.path,
-            }))
-          );
-        }),
-        sessionsDir: path.join(rootDir, "sessions"),
-        findWorkspace: mock(() => null),
-      };
-      const mockAIService = {
-        ...createStreamLifecycleMocks(),
-        on: mock(() => undefined),
-        off: mock(() => undefined),
-      } as unknown as AIService;
+        [projectAPath, projectBPath],
+        workspaceId
+      );
+      const mockAIService = createMockAIService();
       const createWorkspaceAMock = mock(() =>
         Promise.resolve({
           success: true as const,
@@ -1311,7 +1133,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
       ).mockResolvedValue(containerPath);
       try {
         const workspaceService = createWorkspaceServiceForTest({
-          config: mockConfig,
+          config,
           historyService,
           aiService: mockAIService,
         });
@@ -1330,7 +1152,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
         expect(createWorkspaceBMock).toHaveBeenCalledWith(
           expect.objectContaining({ projectPath: projectBPath, trunkBranch: "master" })
         );
-        await new Promise((resolve) => setTimeout(resolve, 0));
+        await waitForCall(initWorkspaceBMock);
         expect(initWorkspaceAMock).toHaveBeenCalledWith(
           expect.objectContaining({ projectPath: projectAPath, trunkBranch: "main" })
         );
@@ -1351,35 +1173,10 @@ describe("WorkspaceService multi-project lifecycle", () => {
   });
   test("createMultiProject rejects fewer than two projects", async () => {
     await withTempMuxRoot(async (rootDir) => {
-      const mockConfig: Partial<Config> = {
-        rootDir,
-        srcDir: path.join(rootDir, "src"),
-        loadConfigOrDefault: mock(() => ({ projects: new Map() })),
-        sessionsDir: path.join(rootDir, "sessions"),
-        findWorkspace: mock(() => null),
-      };
-      const mockAIService = {
-        ...createStreamLifecycleMocks(),
-        on: mock(() => undefined),
-        off: mock(() => undefined),
-      } as unknown as AIService;
-      const workspaceService = new WorkspaceService(
-        mockConfig as Config,
+      const workspaceService = createWorkspaceServiceForTest({
+        config: new Config(rootDir),
         historyService,
-        mockAIService,
-        new ContextManagementService({
-          config: mockConfig as Config,
-          historyService,
-          aiService: mockAIService,
-        }),
-        createMockInitStateManager(),
-        mockExtensionMetadataService as ExtensionMetadataService,
-        mockBackgroundProcessManager as BackgroundProcessManager,
-        undefined,
-        undefined,
-        undefined,
-        createMockExperimentsService(true)
-      );
+      });
       await assert.rejects(
         workspaceService.createMultiProject(
           [{ projectPath: path.join(rootDir, "project-a"), projectName: "project-a" }],
@@ -1394,30 +1191,15 @@ describe("WorkspaceService multi-project lifecycle", () => {
     await withTempMuxRoot(async (rootDir) => {
       const projectAPath = path.join(rootDir, "project-a");
       const projectBPath = path.join(rootDir, "project-b");
-      const mockConfig: Partial<Config> = {
-        rootDir,
-        srcDir: path.join(rootDir, "src"),
-        generateStableId: mock(() => "ws-unsupported-runtime"),
-        loadConfigOrDefault: mock(() => ({
-          projects: new Map([
-            [projectAPath, { workspaces: [], trusted: true }],
-            [projectBPath, { workspaces: [], trusted: true }],
-          ]),
-        })),
-        sessionsDir: path.join(rootDir, "sessions"),
-      };
-      const mockAIService = {
-        ...createStreamLifecycleMocks(),
-        on: mock(() => undefined),
-        off: mock(() => undefined),
-      } as unknown as AIService;
+      const config = new Config(rootDir);
+      await config.editConfig((snapshot) => {
+        snapshot.projects.set(projectAPath, { workspaces: [], trusted: true });
+        snapshot.projects.set(projectBPath, { workspaces: [], trusted: true });
+        return snapshot;
+      });
       const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime");
       try {
-        const workspaceService = createWorkspaceServiceForTest({
-          config: mockConfig,
-          historyService,
-          aiService: mockAIService,
-        });
+        const workspaceService = createWorkspaceServiceForTest({ config, historyService });
         const result = await workspaceService.createMultiProject(
           [
             { projectPath: projectAPath, projectName: "project-a" },
@@ -1444,32 +1226,58 @@ describe("WorkspaceService multi-project lifecycle", () => {
       }
     });
   });
+  // Case-insensitive volumes and Windows name trimming alias these to .mux/.xum as well.
+  test.each([".mux", ".XUM", ".Mux."])(
+    "createMultiProject refuses a project named like the workspace metadata directory (%s, #4455)",
+    async (projectName) => {
+      await withTempMuxRoot(async (rootDir) => {
+        // Its container link would alias the container's own overrides file into its checkout.
+        const dotfilesPath = path.join(rootDir, projectName);
+        const projectBPath = path.join(rootDir, "project-b");
+        const config = new Config(rootDir);
+        await config.editConfig((snapshot) => {
+          snapshot.projects.set(dotfilesPath, { workspaces: [], trusted: true });
+          snapshot.projects.set(projectBPath, { workspaces: [], trusted: true });
+          return snapshot;
+        });
+        const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime");
+        try {
+          const workspaceService = createWorkspaceServiceForTest({ config, historyService });
+          const result = await workspaceService.createMultiProject(
+            [
+              { projectPath: dotfilesPath, projectName },
+              { projectPath: projectBPath, projectName: "project-b" },
+            ],
+            "feature-metadata-alias",
+            "main"
+          );
+          expect(result.success).toBe(false);
+          if (result.success) {
+            return;
+          }
+          expect(result.error).toContain("collides with the workspace metadata directory");
+          expect(createRuntimeSpy).not.toHaveBeenCalled();
+        } finally {
+          createRuntimeSpy.mockRestore();
+        }
+      });
+    }
+  );
   test("remove() deletes all project workspaces and the shared container for multi-project workspaces", async () => {
     await withTempMuxRoot(async (rootDir) => {
       const workspaceId = "ws-multi-remove";
       const workspaceName = "feature-remove";
       const projectAPath = path.join(rootDir, "project-a");
       const projectBPath = path.join(rootDir, "project-b");
-      const removeWorkspaceMock = mock(() => Promise.resolve());
-      const mockConfig: Partial<Config> = {
-        rootDir,
-        srcDir: path.join(rootDir, "src"),
-        loadConfigOrDefault: mock(() => ({
-          projects: new Map([
-            [projectAPath, { workspaces: [], trusted: true }],
-            [projectBPath, { workspaces: [], trusted: true }],
-          ]),
-        })),
-        sessionsDir: path.join(rootDir, "sessions"),
-        removeWorkspace: removeWorkspaceMock,
-        findWorkspace: mock(() => null),
-      };
-      const mockAIService = {
+      const config = await createTrustedProjectsConfig(rootDir, [projectAPath, projectBPath]);
+      // Records deregistration on the real Config (metadata comes from the AI fake below).
+      const removeWorkspaceMock = spyOn(config, "removeWorkspace");
+      const mockAIService = createMockAIService({
         isStreaming: mock(() => false),
         stopStream: mock(() => Promise.resolve(Ok(undefined))),
         getWorkspaceMetadata: mock(() =>
           Promise.resolve(
-            Ok({
+            Ok<WorkspaceMetadata>({
               id: workspaceId,
               name: workspaceName,
               projectPath: projectAPath,
@@ -1482,9 +1290,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
             })
           )
         ),
-        on: mock(() => undefined),
-        off: mock(() => undefined),
-      } as unknown as AIService;
+      });
       const deleteWorkspaceAMock = mock(() =>
         Promise.resolve({ success: true as const, deletedPath: "/tmp/deleted-a" })
       );
@@ -1512,7 +1318,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
       ).mockResolvedValue();
       try {
         const workspaceService = createWorkspaceServiceForTest({
-          config: mockConfig,
+          config,
           historyService,
           aiService: mockAIService,
         });
@@ -1523,14 +1329,16 @@ describe("WorkspaceService multi-project lifecycle", () => {
           workspaceName,
           true,
           undefined,
-          true
+          true,
+          undefined
         );
         expect(deleteWorkspaceBMock).toHaveBeenCalledWith(
           projectBPath,
           workspaceName,
           true,
           undefined,
-          true
+          true,
+          undefined
         );
         expect(removeContainerSpy).toHaveBeenCalledWith(workspaceName);
         expect(removeWorkspaceMock).toHaveBeenCalledWith(workspaceId);
@@ -1546,26 +1354,15 @@ describe("WorkspaceService multi-project lifecycle", () => {
       const workspaceName = "feature-remove-preflight";
       const projectAPath = path.join(rootDir, "project-a");
       const projectBPath = path.join(rootDir, "project-b");
-      const removeWorkspaceMock = mock(() => Promise.resolve());
-      const mockConfig: Partial<Config> = {
-        rootDir,
-        srcDir: path.join(rootDir, "src"),
-        loadConfigOrDefault: mock(() => ({
-          projects: new Map([
-            [projectAPath, { workspaces: [], trusted: true }],
-            [projectBPath, { workspaces: [], trusted: true }],
-          ]),
-        })),
-        sessionsDir: path.join(rootDir, "sessions"),
-        removeWorkspace: removeWorkspaceMock,
-        findWorkspace: mock(() => null),
-      };
-      const mockAIService = {
+      const config = await createTrustedProjectsConfig(rootDir, [projectAPath, projectBPath]);
+      // Records deregistration on the real Config (metadata comes from the AI fake below).
+      const removeWorkspaceMock = spyOn(config, "removeWorkspace");
+      const mockAIService = createMockAIService({
         isStreaming: mock(() => false),
         stopStream: mock(() => Promise.resolve(Ok(undefined))),
         getWorkspaceMetadata: mock(() =>
           Promise.resolve(
-            Ok({
+            Ok<WorkspaceMetadata>({
               id: workspaceId,
               name: workspaceName,
               projectPath: projectAPath,
@@ -1578,9 +1375,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
             })
           )
         ),
-        on: mock(() => undefined),
-        off: mock(() => undefined),
-      } as unknown as AIService;
+      });
       const preflightWorkspaceAMock = mock(() => Promise.resolve({ success: true as const }));
       const preflightWorkspaceBMock = mock(() =>
         Promise.resolve({ success: false as const, error: "Workspace has uncommitted changes" })
@@ -1614,7 +1409,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
       ).mockResolvedValue();
       try {
         const workspaceService = createWorkspaceServiceForTest({
-          config: mockConfig,
+          config,
           historyService,
           aiService: mockAIService,
         });
@@ -1648,7 +1443,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
       const srcDir = path.join(rootDir, "src");
       const oldContainerPath = path.join(srcDir, "_workspaces", oldName);
       const newContainerPath = path.join(srcDir, "_workspaces", newName);
-      const configState: ProjectsConfig = {
+      const seed: ProjectsConfig = {
         projects: new Map([
           [projectAPath, { workspaces: [], trusted: true }],
           [projectBPath, { workspaces: [], trusted: true }],
@@ -1661,6 +1456,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
                   name: oldName,
                   path: oldContainerPath,
                   runtimeConfig: { type: "worktree", srcBaseDir: srcDir },
+                  createdAt: "2026-01-01T00:00:00.000Z",
                   projects: [
                     { projectPath: projectAPath, projectName: "project-a" },
                     { projectPath: projectBPath, projectName: "project-b" },
@@ -1671,47 +1467,12 @@ describe("WorkspaceService multi-project lifecycle", () => {
           ],
         ]),
       };
-      const mockConfig: Partial<Config> = {
-        srcDir,
-        loadConfigOrDefault: mock(() => configState),
-        findWorkspace: mock(() => ({
-          workspacePath: oldContainerPath,
-          projectPath: MULTI_PROJECT_CONFIG_KEY,
-          workspaceName: oldName,
-        })),
-        editConfig: mock((fn: (config: ProjectsConfig) => ProjectsConfig) => {
-          fn(configState);
-          return Promise.resolve();
-        }),
-        getAllWorkspaceMetadata: mock(() => {
-          const workspace = configState.projects.get(MULTI_PROJECT_CONFIG_KEY)?.workspaces[0];
-          return Promise.resolve(
-            workspace
-              ? [
-                  {
-                    id: workspace.id ?? workspaceId,
-                    name: workspace.name ?? oldName,
-                    projectPath: workspace.projects?.[0]?.projectPath ?? projectAPath,
-                    projectName:
-                      workspace.projects?.map((project) => project.projectName).join("+") ?? "",
-                    projects: workspace.projects,
-                    runtimeConfig: workspace.runtimeConfig ?? {
-                      type: "worktree",
-                      srcBaseDir: srcDir,
-                    },
-                    namedWorkspacePath: workspace.path,
-                  } satisfies FrontendWorkspaceMetadata,
-                ]
-              : []
-          );
-        }),
-        sessionsDir: path.join(rootDir, "sessions"),
-      };
-      const mockAIService = {
+      const config = await createSeededConfig(rootDir, seed);
+      const mockAIService = createMockAIService({
         isStreaming: mock(() => false),
         getWorkspaceMetadata: mock(() =>
           Promise.resolve(
-            Ok({
+            Ok<WorkspaceMetadata>({
               id: workspaceId,
               name: oldName,
               projectPath: projectAPath,
@@ -1724,9 +1485,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
             })
           )
         ),
-        on: mock(() => undefined),
-        off: mock(() => undefined),
-      } as unknown as AIService;
+      });
       const renameWorkspaceAMock = mock(() =>
         Promise.resolve({
           success: true as const,
@@ -1768,7 +1527,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
       ).mockResolvedValue(newContainerPath);
       try {
         const workspaceService = createWorkspaceServiceForTest({
-          config: mockConfig,
+          config,
           historyService,
           aiService: mockAIService,
         });
@@ -1799,7 +1558,8 @@ describe("WorkspaceService multi-project lifecycle", () => {
             workspacePath: path.join(srcDir, "project-b", newName),
           },
         ]);
-        const renamedWorkspace = configState.projects.get(MULTI_PROJECT_CONFIG_KEY)?.workspaces[0];
+        const renamedWorkspace = config.loadConfigOrDefault().projects.get(MULTI_PROJECT_CONFIG_KEY)
+          ?.workspaces[0];
         expect(renamedWorkspace?.name).toBe(newName);
         expect(renamedWorkspace?.path).toBe(newContainerPath);
       } finally {
@@ -1821,7 +1581,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
       const newContainerPath = path.join(srcDir, "_workspaces", newName);
       const oldWorkspaceAPath = path.join(srcDir, "project-a", oldName);
       const newWorkspaceAPath = path.join(srcDir, "project-a", newName);
-      const configState: ProjectsConfig = {
+      const seed: ProjectsConfig = {
         projects: new Map([
           [
             projectAPath,
@@ -1833,6 +1593,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
                   name: oldName,
                   path: oldWorkspaceAPath,
                   runtimeConfig: { type: "worktree", srcBaseDir: srcDir },
+                  createdAt: "2026-01-01T00:00:00.000Z",
                   projects: [
                     { projectPath: projectAPath, projectName: "project-a" },
                     { projectPath: projectBPath, projectName: "project-b" },
@@ -1844,47 +1605,12 @@ describe("WorkspaceService multi-project lifecycle", () => {
           [projectBPath, { workspaces: [], trusted: true }],
         ]),
       };
-      const mockConfig: Partial<Config> = {
-        srcDir,
-        loadConfigOrDefault: mock(() => configState),
-        findWorkspace: mock(() => ({
-          workspacePath: oldWorkspaceAPath,
-          projectPath: projectAPath,
-          workspaceName: oldName,
-        })),
-        editConfig: mock((fn: (config: ProjectsConfig) => ProjectsConfig) => {
-          fn(configState);
-          return Promise.resolve();
-        }),
-        getAllWorkspaceMetadata: mock(() => {
-          const workspace = configState.projects.get(projectAPath)?.workspaces[0];
-          return Promise.resolve(
-            workspace
-              ? [
-                  {
-                    id: workspace.id ?? workspaceId,
-                    name: workspace.name ?? oldName,
-                    projectPath: projectAPath,
-                    projectName:
-                      workspace.projects?.map((project) => project.projectName).join("+") ?? "",
-                    projects: workspace.projects,
-                    runtimeConfig: workspace.runtimeConfig ?? {
-                      type: "worktree",
-                      srcBaseDir: srcDir,
-                    },
-                    namedWorkspacePath: workspace.path,
-                  } satisfies FrontendWorkspaceMetadata,
-                ]
-              : []
-          );
-        }),
-        sessionsDir: path.join(rootDir, "sessions"),
-      };
-      const mockAIService = {
+      const config = await createSeededConfig(rootDir, seed);
+      const mockAIService = createMockAIService({
         isStreaming: mock(() => false),
         getWorkspaceMetadata: mock(() =>
           Promise.resolve(
-            Ok({
+            Ok<WorkspaceMetadata>({
               id: workspaceId,
               name: oldName,
               projectPath: projectAPath,
@@ -1897,9 +1623,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
             })
           )
         ),
-        on: mock(() => undefined),
-        off: mock(() => undefined),
-      } as unknown as AIService;
+      });
       const renameWorkspaceAMock = mock(() =>
         Promise.resolve({
           success: true as const,
@@ -1941,7 +1665,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
       ).mockResolvedValue(newContainerPath);
       try {
         const workspaceService = createWorkspaceServiceForTest({
-          config: mockConfig,
+          config,
           historyService,
           aiService: mockAIService,
         });
@@ -1958,7 +1682,8 @@ describe("WorkspaceService multi-project lifecycle", () => {
             workspacePath: path.join(srcDir, "project-b", newName),
           },
         ]);
-        const renamedWorkspace = configState.projects.get(projectAPath)?.workspaces[0];
+        const renamedWorkspace = config.loadConfigOrDefault().projects.get(projectAPath)
+          ?.workspaces[0];
         expect(renamedWorkspace?.name).toBe(newName);
         expect(renamedWorkspace?.path).toBe(newWorkspaceAPath);
         expect(renamedWorkspace?.path).not.toBe(newContainerPath);
@@ -1979,7 +1704,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
       const projectBPath = path.join(rootDir, "project-b");
       const srcDir = path.join(rootDir, "src");
       const oldContainerPath = path.join(srcDir, "_workspaces", oldName);
-      const configState: ProjectsConfig = {
+      const seed: ProjectsConfig = {
         projects: new Map([
           [projectAPath, { workspaces: [], trusted: true }],
           [projectBPath, { workspaces: [], trusted: true }],
@@ -1992,6 +1717,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
                   name: oldName,
                   path: oldContainerPath,
                   runtimeConfig: { type: "worktree", srcBaseDir: srcDir },
+                  createdAt: "2026-01-01T00:00:00.000Z",
                   projects: [
                     { projectPath: projectAPath, projectName: "project-a" },
                     { projectPath: projectBPath, projectName: "project-b" },
@@ -2002,42 +1728,13 @@ describe("WorkspaceService multi-project lifecycle", () => {
           ],
         ]),
       };
-      const editConfigMock = mock((fn: (config: ProjectsConfig) => ProjectsConfig) => {
-        fn(configState);
-        return Promise.resolve();
-      });
-      const mockConfig: Partial<Config> = {
-        srcDir,
-        loadConfigOrDefault: mock(() => configState),
-        findWorkspace: mock(() => ({
-          workspacePath: oldContainerPath,
-          projectPath: MULTI_PROJECT_CONFIG_KEY,
-          workspaceName: oldName,
-        })),
-        editConfig: editConfigMock,
-        getAllWorkspaceMetadata: mock(() =>
-          Promise.resolve([
-            {
-              id: workspaceId,
-              name: oldName,
-              projectPath: projectAPath,
-              projectName: "project-a+project-b",
-              projects: [
-                { projectPath: projectAPath, projectName: "project-a" },
-                { projectPath: projectBPath, projectName: "project-b" },
-              ],
-              runtimeConfig: { type: "worktree", srcBaseDir: srcDir },
-              namedWorkspacePath: oldContainerPath,
-            } satisfies FrontendWorkspaceMetadata,
-          ])
-        ),
-        sessionsDir: path.join(rootDir, "sessions"),
-      };
-      const mockAIService = {
+      const config = await createSeededConfig(rootDir, seed);
+      const editConfigMock = spyOn(config, "editConfig");
+      const mockAIService = createMockAIService({
         isStreaming: mock(() => false),
         getWorkspaceMetadata: mock(() =>
           Promise.resolve(
-            Ok({
+            Ok<WorkspaceMetadata>({
               id: workspaceId,
               name: oldName,
               projectPath: projectAPath,
@@ -2050,9 +1747,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
             })
           )
         ),
-        on: mock(() => undefined),
-        off: mock(() => undefined),
-      } as unknown as AIService;
+      });
       const renameWorkspaceAMock = mock(
         (
           _projectPath: string,
@@ -2112,7 +1807,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
       ).mockResolvedValue(path.join(srcDir, "_workspaces", newName));
       try {
         const workspaceService = createWorkspaceServiceForTest({
-          config: mockConfig,
+          config,
           historyService,
           aiService: mockAIService,
         });
@@ -2137,13 +1832,15 @@ describe("WorkspaceService multi-project lifecycle", () => {
           newName,
           oldName,
           undefined,
-          true
+          true,
+          { renameBranch: false }
         );
         expect(renameWorkspaceBMock).toHaveBeenCalledTimes(1);
         expect(removeContainerSpy).not.toHaveBeenCalled();
         expect(createContainerSpy).not.toHaveBeenCalled();
         expect(editConfigMock).not.toHaveBeenCalled();
-        const storedWorkspace = configState.projects.get(MULTI_PROJECT_CONFIG_KEY)?.workspaces[0];
+        const storedWorkspace = config.loadConfigOrDefault().projects.get(MULTI_PROJECT_CONFIG_KEY)
+          ?.workspaces[0];
         expect(storedWorkspace?.name).toBe(oldName);
         expect(storedWorkspace?.path).toBe(oldContainerPath);
       } finally {
@@ -2172,7 +1869,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
       await fsPromises.mkdir(oldContainerPath, { recursive: true });
       await fsPromises.symlink(oldWorkspaceAPath, path.join(oldContainerPath, "project-a"));
       await fsPromises.symlink(oldWorkspaceBPath, path.join(oldContainerPath, "project-b"));
-      const configState: ProjectsConfig = {
+      const seed: ProjectsConfig = {
         projects: new Map([
           [projectAPath, { workspaces: [], trusted: true }],
           [projectBPath, { workspaces: [], trusted: true }],
@@ -2185,6 +1882,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
                   name: oldName,
                   path: oldContainerPath,
                   runtimeConfig: { type: "worktree", srcBaseDir: srcDir },
+                  createdAt: "2026-01-01T00:00:00.000Z",
                   projects: [
                     { projectPath: projectAPath, projectName: "project-a" },
                     { projectPath: projectBPath, projectName: "project-b" },
@@ -2195,42 +1893,13 @@ describe("WorkspaceService multi-project lifecycle", () => {
           ],
         ]),
       };
-      const editConfigMock = mock((fn: (config: ProjectsConfig) => ProjectsConfig) => {
-        fn(configState);
-        return Promise.resolve();
-      });
-      const mockConfig: Partial<Config> = {
-        srcDir,
-        loadConfigOrDefault: mock(() => configState),
-        findWorkspace: mock(() => ({
-          workspacePath: oldContainerPath,
-          projectPath: MULTI_PROJECT_CONFIG_KEY,
-          workspaceName: oldName,
-        })),
-        editConfig: editConfigMock,
-        getAllWorkspaceMetadata: mock(() =>
-          Promise.resolve([
-            {
-              id: workspaceId,
-              name: oldName,
-              projectPath: projectAPath,
-              projectName: "project-a+project-b",
-              projects: [
-                { projectPath: projectAPath, projectName: "project-a" },
-                { projectPath: projectBPath, projectName: "project-b" },
-              ],
-              runtimeConfig: { type: "worktree", srcBaseDir: srcDir },
-              namedWorkspacePath: oldContainerPath,
-            } satisfies FrontendWorkspaceMetadata,
-          ])
-        ),
-        sessionsDir: path.join(rootDir, "sessions"),
-      };
-      const mockAIService = {
+      const config = await createSeededConfig(rootDir, seed);
+      const editConfigMock = spyOn(config, "editConfig");
+      const mockAIService = createMockAIService({
         isStreaming: mock(() => false),
         getWorkspaceMetadata: mock(() =>
           Promise.resolve(
-            Ok({
+            Ok<WorkspaceMetadata>({
               id: workspaceId,
               name: oldName,
               projectPath: projectAPath,
@@ -2243,9 +1912,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
             })
           )
         ),
-        on: mock(() => undefined),
-        off: mock(() => undefined),
-      } as unknown as AIService;
+      });
       const renameWorkspaceAMock = mock(
         (
           _projectPath: string,
@@ -2330,7 +1997,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
       });
       try {
         const workspaceService = createWorkspaceServiceForTest({
-          config: mockConfig,
+          config,
           historyService,
           aiService: mockAIService,
         });
@@ -2355,7 +2022,8 @@ describe("WorkspaceService multi-project lifecycle", () => {
           newName,
           oldName,
           undefined,
-          true
+          true,
+          { renameBranch: false }
         );
         expect(renameWorkspaceBMock).toHaveBeenCalledTimes(2);
         expect(renameWorkspaceBMock).toHaveBeenNthCalledWith(
@@ -2372,12 +2040,14 @@ describe("WorkspaceService multi-project lifecycle", () => {
           newName,
           oldName,
           undefined,
-          true
+          true,
+          { renameBranch: false }
         );
         expect(removeContainerSpy).toHaveBeenCalledWith(oldName);
         expect(createContainerSpy).toHaveBeenCalledTimes(1);
         expect(editConfigMock).not.toHaveBeenCalled();
-        const storedWorkspace = configState.projects.get(MULTI_PROJECT_CONFIG_KEY)?.workspaces[0];
+        const storedWorkspace = config.loadConfigOrDefault().projects.get(MULTI_PROJECT_CONFIG_KEY)
+          ?.workspaces[0];
         expect(storedWorkspace?.name).toBe(oldName);
         expect(storedWorkspace?.path).toBe(oldContainerPath);
         expect(await pathExists(newContainerPath)).toBe(false);
@@ -2419,7 +2089,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
       await fsPromises.symlink(oldWorkspaceBPath, path.join(oldContainerPath, "project-b"));
       await fsPromises.mkdir(newContainerPath, { recursive: true });
       await fsPromises.writeFile(preexistingMarkerPath, "keep me", "utf8");
-      const configState: ProjectsConfig = {
+      const seed: ProjectsConfig = {
         projects: new Map([
           [projectAPath, { workspaces: [], trusted: true }],
           [projectBPath, { workspaces: [], trusted: true }],
@@ -2432,6 +2102,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
                   name: oldName,
                   path: oldContainerPath,
                   runtimeConfig: { type: "worktree", srcBaseDir: srcDir },
+                  createdAt: "2026-01-01T00:00:00.000Z",
                   projects: [
                     { projectPath: projectAPath, projectName: "project-a" },
                     { projectPath: projectBPath, projectName: "project-b" },
@@ -2442,42 +2113,13 @@ describe("WorkspaceService multi-project lifecycle", () => {
           ],
         ]),
       };
-      const editConfigMock = mock((fn: (config: ProjectsConfig) => ProjectsConfig) => {
-        fn(configState);
-        return Promise.resolve();
-      });
-      const mockConfig: Partial<Config> = {
-        srcDir,
-        loadConfigOrDefault: mock(() => configState),
-        findWorkspace: mock(() => ({
-          workspacePath: oldContainerPath,
-          projectPath: MULTI_PROJECT_CONFIG_KEY,
-          workspaceName: oldName,
-        })),
-        editConfig: editConfigMock,
-        getAllWorkspaceMetadata: mock(() =>
-          Promise.resolve([
-            {
-              id: workspaceId,
-              name: oldName,
-              projectPath: projectAPath,
-              projectName: "project-a+project-b",
-              projects: [
-                { projectPath: projectAPath, projectName: "project-a" },
-                { projectPath: projectBPath, projectName: "project-b" },
-              ],
-              runtimeConfig: { type: "worktree", srcBaseDir: srcDir },
-              namedWorkspacePath: oldContainerPath,
-            } satisfies FrontendWorkspaceMetadata,
-          ])
-        ),
-        sessionsDir: path.join(rootDir, "sessions"),
-      };
-      const mockAIService = {
+      const config = await createSeededConfig(rootDir, seed);
+      const editConfigMock = spyOn(config, "editConfig");
+      const mockAIService = createMockAIService({
         isStreaming: mock(() => false),
         getWorkspaceMetadata: mock(() =>
           Promise.resolve(
-            Ok({
+            Ok<WorkspaceMetadata>({
               id: workspaceId,
               name: oldName,
               projectPath: projectAPath,
@@ -2490,9 +2132,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
             })
           )
         ),
-        on: mock(() => undefined),
-        off: mock(() => undefined),
-      } as unknown as AIService;
+      });
       const renameWorkspaceAMock = mock(
         (
           _projectPath: string,
@@ -2571,7 +2211,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
       ).mockImplementation(() => Promise.reject(new Error("container create failed")));
       try {
         const workspaceService = createWorkspaceServiceForTest({
-          config: mockConfig,
+          config,
           historyService,
           aiService: mockAIService,
         });
@@ -2584,7 +2224,8 @@ describe("WorkspaceService multi-project lifecycle", () => {
         expect(removeContainerSpy).toHaveBeenCalledWith(oldName);
         expect(createContainerSpy).toHaveBeenCalledTimes(1);
         expect(editConfigMock).not.toHaveBeenCalled();
-        const storedWorkspace = configState.projects.get(MULTI_PROJECT_CONFIG_KEY)?.workspaces[0];
+        const storedWorkspace = config.loadConfigOrDefault().projects.get(MULTI_PROJECT_CONFIG_KEY)
+          ?.workspaces[0];
         expect(storedWorkspace?.name).toBe(oldName);
         expect(storedWorkspace?.path).toBe(oldContainerPath);
         expect(await pathExists(newContainerPath)).toBe(true);

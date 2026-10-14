@@ -3,10 +3,32 @@ import { tool } from "ai";
 import type { AgentSkillReadToolResult } from "@/common/types/tools";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
+import { AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS } from "@/common/constants/toolLimits";
 import { SkillNameSchema } from "@/common/orpc/schemas";
 import { getErrorMessage } from "@/common/utils/errors";
-import { readAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
+import type { Runtime } from "@/node/runtime/Runtime";
+import {
+  readAgentSkill,
+  type ResolvedAgentSkill,
+} from "@/node/services/agentSkills/agentSkillsService";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
+import {
+  resolveSkillDirectory,
+  substituteSkillDirectoryPlaceholders,
+} from "@/node/services/agentSkills/skillDirectory";
+
+/** Single-line skill description for the index, cut with an ellipsis past the cap. */
+function formatSkillIndexDescription(description: string): string {
+  const singleLine = description.replace(/\s+/g, " ").trim();
+  if (singleLine.length <= AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS) {
+    return singleLine;
+  }
+  let end = AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS - 1;
+  // A lone high surrogate would make providers reject every request carrying this tool block.
+  const last = singleLine.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return `${singleLine.slice(0, end).trimEnd()}…`;
+}
 
 /**
  * Build dynamic agent_skill_read tool description with available skills.
@@ -29,7 +51,7 @@ function buildSkillReadDescription(config: ToolConfiguration): string {
   const omitted = skills.length - shown.length;
 
   const skillLines = shown.map((skill) => {
-    const line = `- ${skill.name}: ${skill.description} (scope: ${skill.scope})`;
+    const line = `- ${skill.name}: ${formatSkillIndexDescription(skill.description)} (scope: ${skill.scope})`;
     // whenToUse (when_to_use/when-to-use frontmatter) is extra model-facing guidance;
     // keep it on the same index line to stay token-lean.
     return skill.whenToUse == null ? line : `${line} When to use: ${skill.whenToUse}`;
@@ -38,9 +60,29 @@ function buildSkillReadDescription(config: ToolConfiguration): string {
     skillLines.push(`(+${omitted} more not shown)`);
   }
 
-  const usageHint = `\nTo read referenced files inside a skill directory:\n- agent_skill_read_file({ name: "<skill-name>", filePath: "references/whatever.txt" })`;
+  return `${baseDescription}\n\nAvailable skills:\n${skillLines.join("\n")}`;
+}
 
-  return `${baseDescription}\n\nAvailable skills:\n${skillLines.join("\n")}${usageHint}`;
+/**
+ * Skills that ship scripts locate themselves through skillDir (or the
+ * ${CLAUDE_SKILL_DIR} placeholder) instead of a hard-coded install path.
+ */
+function buildSkillReadSuccess(
+  resolved: ResolvedAgentSkill,
+  workspaceRuntime: Runtime
+): AgentSkillReadToolResult {
+  const dir = resolveSkillDirectory(resolved, workspaceRuntime);
+  const location = dir.available
+    ? { skillDir: dir.skillDir, ...(dir.pluginRoot != null ? { pluginRoot: dir.pluginRoot } : {}) }
+    : { skillDirUnavailable: dir.reason };
+  return {
+    success: true,
+    skill: {
+      ...resolved.package,
+      body: substituteSkillDirectoryPlaceholders(resolved.package.body, dir),
+    },
+    ...location,
+  };
 }
 
 /**
@@ -72,14 +114,11 @@ export const createAgentSkillReadTool: ToolFactory = (config: ToolConfiguration)
       try {
         // claude-skills-compat experiment: allow reading skills discovered from .claude roots.
         const includeClaudeSkills = config.experiments?.claudeSkillsCompat === true;
-        // agent-plugins experiment: allow reading skills discovered from Agent Plugins.
-        const includeAgentPlugins = config.experiments?.agentPlugins === true;
         const skillCtx = resolveSkillStorageContext({
           runtime: config.runtime,
           workspacePath,
           xumScope: config.xumScope ?? null,
           includeClaudeSkills,
-          includeAgentPlugins,
         });
         const resolved = await readAgentSkill(
           skillCtx.runtime,
@@ -89,13 +128,10 @@ export const createAgentSkillReadTool: ToolFactory = (config: ToolConfiguration)
             roots: skillCtx.roots,
             containment: skillCtx.containment,
             includeClaudeSkills,
-            includeAgentPlugins,
           }
         );
-        return {
-          success: true,
-          skill: resolved.package,
-        };
+        // Judged against config.runtime: that is where the model's bash runs.
+        return buildSkillReadSuccess(resolved, config.runtime);
       } catch (error) {
         return {
           success: false,

@@ -26,10 +26,17 @@ const SAMPLING_CALL_SETTINGS = ["temperature", "topP", "topK"] as const;
  * rejects temperature/top_p/logprobs: @ai-sdk/openai already drops those from
  * both wire formats for any GPT-5+ id unless the effort is "none", and Astra
  * never receives "none" (see openaiRejectsDisabledReasoning).
+ *
+ * Claude Haiku 5+ rejects every non-default temperature/top_p/top_k. @ai-sdk/anthropic
+ * already drops them, but @ai-sdk/amazon-bedrock only does while thinking is enabled, so
+ * a sampling override on Bedrock with thinking off would 400 after the `haiku` alias moved
+ * off Haiku 4.5 (which accepted them). Other sampling-rejecting Claude tiers: #5838.
  */
 export function modelRejectsSamplingParameters(modelString: string): boolean {
   const bareModelId = stripModelProviderPrefixes(modelString);
   return (
+    // Bedrock ids keep an `anthropic.` (and optional region) prefix after stripping.
+    /(?:^|\.)claude-haiku-(?:[5-9]|\d{2,})/.test(bareModelId) ||
     bareModelId.startsWith("gemini-3.8-flash") ||
     bareModelId.startsWith("gemini-3.7-flash") ||
     bareModelId.startsWith("gemini-3.6-flash") ||

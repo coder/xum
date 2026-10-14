@@ -35,7 +35,7 @@ export const ToolSelector: React.FC<ToolSelectorProps> = ({
   return (
     <div>
       <div className="mb-2 flex items-center justify-between">
-        <span className="text-muted-foreground text-xs">Select tools to expose:</span>
+        <span className="text-content-secondary text-xs">Select tools to expose:</span>
         <div className="flex gap-1">
           <Button
             variant="ghost"

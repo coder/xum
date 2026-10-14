@@ -1,6 +1,28 @@
-import { describe, it, expect, test } from "bun:test";
-import { isMac, matchesKeybind, isKeybindDeprecated, KEYBINDS } from "./keybinds";
+import { afterEach, beforeEach, describe, it, expect, test } from "bun:test";
+import { GlobalWindow } from "happy-dom";
+import {
+  formatKeybindForAria,
+  isMac,
+  matchesKeybind,
+  matchesNewSidebarTabKeybind,
+  isKeybindDeprecated,
+  KEYBINDS,
+  paneHandlesKeyEvent,
+  SIDE_CHAT_PANE_ATTR,
+  type ChatPaneScope,
+} from "./keybinds";
 import type { Keybind } from "@/common/types/keybind";
+
+// Many tests below swap in a stub `window` ({ api: { platform } }) without restoring it.
+// Bun shares globals across test files in a process, so the stub leaked into later files:
+// mermaid's module init saw `document` defined but a window without addEventListener,
+// threw, and every later importer of MarkdownComponents hit a TDZ ReferenceError.
+const originalWindow = globalThis.window;
+const originalNavigator = globalThis.navigator;
+afterEach(() => {
+  globalThis.window = originalWindow;
+  globalThis.navigator = originalNavigator;
+});
 
 // Helper to create a minimal keyboard event
 function createEvent(overrides: Partial<KeyboardEvent> = {}): KeyboardEvent {
@@ -14,6 +36,57 @@ function createEvent(overrides: Partial<KeyboardEvent> = {}): KeyboardEvent {
     ...overrides,
   } as KeyboardEvent;
 }
+
+describe("NEW_SIDEBAR_TAB keybind", () => {
+  test("matches Ctrl+Alt+N but not the same chord produced by AltGr", () => {
+    globalThis.window = { api: { platform: "linux" } } as unknown as Window & typeof globalThis;
+    const chord = { key: "n", code: "KeyN", ctrlKey: true, altKey: true };
+
+    expect(matchesNewSidebarTabKeybind(createEvent(chord))).toBe(true);
+    // AltGr reports Ctrl+Alt on Windows/Linux layouts, where AltGr+N types a character.
+    expect(
+      matchesNewSidebarTabKeybind(
+        createEvent({ ...chord, getModifierState: (key: string) => key === "AltGraph" })
+      )
+    ).toBe(false);
+  });
+});
+
+describe("workspace actions menu keybinds (#6328)", () => {
+  const keys = [
+    ["FORK_WORKSPACE", "KeyB", "\u222b"],
+    ["STOP_WORKSPACE_RUNTIME", "KeyX", "\u02db"],
+    ["MARK_WORKSPACE_UNREAD", "KeyM", "\u00c2"],
+    ["TOGGLE_COMPLETED_SUB_AGENTS", "KeyA", "\u00c5"],
+  ] as const;
+
+  test("macOS: Cmd+Option+Shift on the physical key, whatever character Option makes", () => {
+    globalThis.window = { api: { platform: "darwin" } } as unknown as Window & typeof globalThis;
+    for (const [id, code, optionCharacter] of keys) {
+      const chord = { key: optionCharacter, code, altKey: true, shiftKey: true };
+      expect(matchesKeybind(createEvent({ ...chord, metaKey: true }), KEYBINDS[id])).toBe(true);
+      // Option+Shift alone types that character; it must stay text, not a shortcut.
+      expect(matchesKeybind(createEvent(chord), KEYBINDS[id])).toBe(false);
+    }
+  });
+
+  test("Windows/Linux: Ctrl+Alt+Shift, and no chord another keybind uses", () => {
+    globalThis.window = { api: { platform: "linux" } } as unknown as Window & typeof globalThis;
+    for (const [id, code] of keys) {
+      const event = createEvent({
+        key: code.slice(3).toLowerCase(),
+        code,
+        ctrlKey: true,
+        altKey: true,
+        shiftKey: true,
+      });
+      const matching = (Object.keys(KEYBINDS) as Array<keyof typeof KEYBINDS>).filter((other) =>
+        matchesKeybind(event, KEYBINDS[other])
+      );
+      expect(matching).toEqual([id]);
+    }
+  });
+});
 
 describe("COPY_MARKDOWN keybind", () => {
   test("accepts M without modifiers and rejects modified keys", () => {
@@ -140,6 +213,37 @@ describe("isKeybindDeprecated", () => {
 test("removed auto agent toggle keybind", () => {
   const removedKey = ["TOGGLE", "AUTO", "AGENT"].join("_");
   expect(KEYBINDS).not.toHaveProperty(removedKey);
+});
+
+describe("TOGGLE_MARKDOWN_PREVIEW keybind", () => {
+  test("uses Cmd+E on macOS so Ctrl+E keeps moving to the end of the line", () => {
+    globalThis.window = { api: { platform: "darwin" } } as unknown as Window & typeof globalThis;
+    expect(
+      matchesKeybind(createEvent({ key: "e", metaKey: true }), KEYBINDS.TOGGLE_MARKDOWN_PREVIEW)
+    ).toBe(true);
+    expect(
+      matchesKeybind(createEvent({ key: "e", ctrlKey: true }), KEYBINDS.TOGGLE_MARKDOWN_PREVIEW)
+    ).toBe(false);
+  });
+});
+
+describe("formatKeybindForAria", () => {
+  // aria-keyshortcuts must name the modifier the matcher accepts on each platform.
+  test("names Meta for a Ctrl keybind on macOS unless it keeps the Control key", () => {
+    globalThis.window = { api: { platform: "darwin" } } as unknown as Window & typeof globalThis;
+    expect(formatKeybindForAria(KEYBINDS.TOGGLE_MARKDOWN_PREVIEW)).toBe("Meta+E");
+    expect(formatKeybindForAria(KEYBINDS.INTERRUPT_STREAM_VIM)).toBe("Control+C");
+    expect(formatKeybindForAria({ key: "k", ctrl: true, meta: true })).toBe("Control+Meta+K");
+  });
+
+  test("names Control elsewhere and keeps the formatKeybind order and key names", () => {
+    globalThis.window = { api: { platform: "linux" } } as unknown as Window & typeof globalThis;
+    expect(formatKeybindForAria(KEYBINDS.TOGGLE_MARKDOWN_PREVIEW)).toBe("Control+E");
+    expect(formatKeybindForAria({ key: "Enter", ctrl: true, alt: true, shift: true })).toBe(
+      "Control+Alt+Shift+Enter"
+    );
+    expect(formatKeybindForAria({ key: " ", shift: true })).toBe("Shift+Space");
+  });
 });
 
 describe("SEND_MESSAGE_AFTER_TURN keybind (Ctrl/Cmd+Enter)", () => {
@@ -279,5 +383,262 @@ describe("matchesKeybind", () => {
     const keybind: Keybind = { key: "P", ctrl: true, shift: true };
 
     expect(matchesKeybind(event, keybind)).toBe(true);
+  });
+});
+
+describe("TOGGLE_NOTIFICATIONS keybind (Ctrl/Cmd+Shift+Comma)", () => {
+  test("matches the physical comma key when Shift turns it into <", () => {
+    const event = createEvent({ key: "<", code: "Comma", ctrlKey: true, shiftKey: true });
+    expect(matchesKeybind(event, KEYBINDS.TOGGLE_NOTIFICATIONS)).toBe(true);
+    // Ctrl/Cmd+Comma without Shift stays Open Settings.
+    expect(
+      matchesKeybind(
+        createEvent({ key: ",", code: "Comma", ctrlKey: true }),
+        KEYBINDS.TOGGLE_NOTIFICATIONS
+      )
+    ).toBe(false);
+  });
+});
+
+describe("global keybind collisions", () => {
+  // Bindings handled by window-level listeners that are live at the same time while a
+  // workspace is open. Two of these matching the same keystroke makes the winner depend on
+  // listener order (Ctrl/Cmd+Shift+N was once both "New scratch chat" and
+  // "Toggle notifications"). Add new window-level bindings here. Scoped bindings are left out on purpose because they only fire
+  // while their surface has focus and may reuse global keys: Review panel / immersive review,
+  // Artifacts panel, background-process rows, composer-only send/edit keys, dialogs, image
+  // lightbox, plan annotation, Settings → Backup, and vim interrupt.
+  const GLOBAL_KEYBIND_NAMES = [
+    "TOGGLE_AGENT",
+    "CYCLE_AGENT",
+    "RESUME_STREAM",
+    "NEW_WORKSPACE",
+    "NEW_SCRATCH_CHAT",
+    "EDIT_WORKSPACE_TITLE",
+    "GENERATE_WORKSPACE_TITLE",
+    "ARCHIVE_WORKSPACE",
+    "PIN_WORKSPACE",
+    "MOVE_PINNED_UP",
+    "MOVE_PINNED_DOWN",
+    "JUMP_TO_BOTTOM",
+    "LOAD_OLDER_MESSAGES",
+    "NEXT_WORKSPACE",
+    "PREV_WORKSPACE",
+    "TOGGLE_SIDEBAR",
+    "CYCLE_MODEL",
+    "OPEN_TERMINAL",
+    "OPEN_IN_EDITOR",
+    "CONFIGURE_MCP",
+    "CONFIGURE_HEARTBEAT",
+    "CONFIGURE_UNRELATED_MESSAGING",
+    "OPEN_COMMAND_PALETTE",
+    "OPEN_COMMAND_PALETTE_ACTIONS",
+    "TOGGLE_THINKING",
+    "INCREASE_THINKING",
+    "DECREASE_THINKING",
+    "TOGGLE_FAST_MODE",
+    "FOCUS_BACKGROUND_PROCESSES",
+    "FOCUS_CHAT",
+    "CLOSE_TAB",
+    "NEW_SIDEBAR_TAB",
+    "OPEN_TIMELINE_DIALOG",
+    "OPEN_STATS_DIALOG",
+    "OPEN_ARTIFACTS_TAB",
+    "SIDEBAR_TAB_1",
+    "SIDEBAR_TAB_2",
+    "SIDEBAR_TAB_3",
+    "SIDEBAR_TAB_4",
+    "SIDEBAR_TAB_5",
+    "SIDEBAR_TAB_6",
+    "SIDEBAR_TAB_7",
+    "SIDEBAR_TAB_8",
+    "SIDEBAR_TAB_9",
+    "OPEN_SETTINGS",
+    "OPEN_SERVER_WINDOW",
+    "OPEN_ANALYTICS",
+    "REPORT_SLOWNESS",
+    "SAVE_SESSION_TAPES",
+    "REVEAL_SESSION_TAPES",
+    "TOGGLE_VOICE_INPUT",
+    "NAVIGATE_BACK",
+    "NAVIGATE_FORWARD",
+    "TOGGLE_NOTIFICATIONS",
+    "TOGGLE_DRIFT_MODE",
+    "SHOW_WORKSPACE_DETAILS",
+    "SHOW_LAST_PROMPT",
+    "TOGGLE_POWER_MODE",
+  ] as const satisfies ReadonlyArray<keyof typeof KEYBINDS>;
+
+  const PUNCTUATION_CODES: Record<string, string> = {
+    ",": "Comma",
+    ".": "Period",
+    "/": "Slash",
+    "[": "BracketLeft",
+    "]": "BracketRight",
+    "=": "Equal",
+    "-": "Minus",
+    " ": "Space",
+  };
+
+  // Physical key for a binding, so a key-matched binding and a code-matched binding on the
+  // same physical key are compared on equal terms.
+  function codeFor(keybind: Keybind): string {
+    if (keybind.code) return keybind.code;
+    if (/^[a-z]$/i.test(keybind.key)) return `Key${keybind.key.toUpperCase()}`;
+    if (/^[0-9]$/.test(keybind.key)) return `Digit${keybind.key}`;
+    return PUNCTUATION_CODES[keybind.key] ?? keybind.key;
+  }
+
+  // Every keystroke (both key cases, all 16 modifier combinations) that `keybind` accepts on
+  // the current platform. Comparing through matchesKeybind keeps macCtrlBehavior, allowShift
+  // and code-vs-key matching in one place instead of re-deriving them here.
+  function acceptedEvents(keybind: Keybind): KeyboardEvent[] {
+    const events: KeyboardEvent[] = [];
+    const keys = new Set([keybind.key, keybind.key.toLowerCase(), keybind.key.toUpperCase()]);
+    for (const key of keys) {
+      for (let mask = 0; mask < 16; mask++) {
+        const event = createEvent({
+          key,
+          code: codeFor(keybind),
+          ctrlKey: (mask & 1) !== 0,
+          shiftKey: (mask & 2) !== 0,
+          altKey: (mask & 4) !== 0,
+          metaKey: (mask & 8) !== 0,
+        });
+        if (matchesKeybind(event, keybind)) events.push(event);
+      }
+    }
+    return events;
+  }
+
+  function findCollisions(bindings: ReadonlyArray<readonly [string, Keybind]>): string[] {
+    const collisions: string[] = [];
+    for (let i = 0; i < bindings.length; i++) {
+      const [nameA, a] = bindings[i];
+      const events = acceptedEvents(a);
+      expect(events.length).toBeGreaterThan(0);
+      for (let j = i + 1; j < bindings.length; j++) {
+        const [nameB, b] = bindings[j];
+        if (events.some((event) => matchesKeybind(event, b))) {
+          collisions.push(`${nameA} <-> ${nameB}`);
+        }
+      }
+    }
+    return collisions;
+  }
+
+  const platforms = [
+    ["macOS", "darwin"],
+    ["Linux/Windows", "linux"],
+  ] as const;
+
+  for (const [label, platform] of platforms) {
+    test(`no two global bindings accept the same keystroke on ${label}`, () => {
+      globalThis.window = { api: { platform } } as unknown as Window & typeof globalThis;
+      expect(isMac()).toBe(platform === "darwin");
+
+      const bindings = GLOBAL_KEYBIND_NAMES.map((name) => [name, KEYBINDS[name]] as const);
+      expect(findCollisions(bindings)).toEqual([]);
+    });
+
+    test(`collision check catches keys that differ only by case on ${label}`, () => {
+      globalThis.window = { api: { platform } } as unknown as Window & typeof globalThis;
+
+      expect(
+        findCollisions([
+          ["lower", { key: "n", ctrl: true, shift: true }],
+          ["upper", { key: "N", ctrl: true, shift: true }],
+        ])
+      ).toEqual(["lower <-> upper"]);
+    });
+  }
+});
+
+describe("paneHandlesKeyEvent", () => {
+  // Preserve DOM globals for other files sharing this bun process.
+  const globals = globalThis as unknown as Record<
+    "window" | "document" | "HTMLElement" | "Node",
+    unknown
+  >;
+  let previous: typeof globals;
+  const scopes: ChatPaneScope[] = ["main", "side:alpha", "side:beta"];
+
+  beforeEach(() => {
+    previous = {
+      window: globals.window,
+      document: globals.document,
+      HTMLElement: globals.HTMLElement,
+      Node: globals.Node,
+    };
+    const happyWindow = new GlobalWindow();
+    globals.window = happyWindow;
+    globals.document = happyWindow.document;
+    globals.HTMLElement = happyWindow.HTMLElement;
+    globals.Node = happyWindow.Node;
+  });
+
+  afterEach(() => {
+    globals.window = previous.window;
+    globals.document = previous.document;
+    globals.HTMLElement = previous.HTMLElement;
+    globals.Node = previous.Node;
+  });
+
+  test("exactly one of main and two visible side panes handles each target", () => {
+    const mainInput = document.createElement("textarea");
+    document.body.appendChild(mainInput);
+    const mainText = document.createTextNode("Main transcript");
+    document.body.appendChild(mainText);
+    const targets: Array<[EventTarget | null, ChatPaneScope]> = [
+      [mainInput, "main"],
+      [mainText, "main"],
+      [document.body, "main"],
+      [document, "main"],
+      [null, "main"],
+    ];
+    const focusTargets: Array<[HTMLElement, ChatPaneScope]> = [[mainInput, "main"]];
+    for (const workspaceId of ["alpha", "beta"]) {
+      const sidePane = document.createElement("div");
+      sidePane.setAttribute(SIDE_CHAT_PANE_ATTR, workspaceId);
+      sidePane.tabIndex = -1;
+      const sideInput = document.createElement("textarea");
+      const child = document.createElement("span");
+      const text = document.createTextNode("Side transcript");
+      child.appendChild(text);
+      sidePane.append(sideInput, child);
+      document.body.appendChild(sidePane);
+      const scope: ChatPaneScope = `side:${workspaceId}`;
+      targets.push([sideInput, scope], [sidePane, scope], [child, scope], [text, scope]);
+      focusTargets.push([sideInput, scope], [sidePane, scope]);
+    }
+
+    for (const [target, owner] of targets) {
+      expect(scopes.filter((scope) => paneHandlesKeyEvent(scope, target))).toEqual([owner]);
+    }
+    // Agent-picker events route by activeElement, not by the original keyboard event target.
+    for (const [target, owner] of focusTargets) {
+      target.focus();
+      expect(document.activeElement).toBe(target);
+      expect(scopes.filter((scope) => paneHandlesKeyEvent(scope, document.activeElement))).toEqual([
+        owner,
+      ]);
+    }
+  });
+
+  test("the nearest pane marker owns nested descendants", () => {
+    const outerPane = document.createElement("div");
+    outerPane.setAttribute(SIDE_CHAT_PANE_ATTR, "alpha");
+    const innerPane = document.createElement("div");
+    innerPane.setAttribute(SIDE_CHAT_PANE_ATTR, "beta");
+    const text = document.createTextNode("Nested transcript");
+    innerPane.appendChild(text);
+    outerPane.appendChild(innerPane);
+    document.body.appendChild(outerPane);
+
+    expect(scopes.filter((scope) => paneHandlesKeyEvent(scope, text))).toEqual(["side:beta"]);
+    innerPane.removeAttribute(SIDE_CHAT_PANE_ATTR);
+    expect(scopes.filter((scope) => paneHandlesKeyEvent(scope, text))).toEqual(["side:alpha"]);
+    outerPane.removeAttribute(SIDE_CHAT_PANE_ATTR);
+    expect(scopes.filter((scope) => paneHandlesKeyEvent(scope, text))).toEqual(["main"]);
   });
 });

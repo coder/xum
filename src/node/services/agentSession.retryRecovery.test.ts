@@ -169,7 +169,8 @@ test("closing joins a held history read even when its sibling read rejects", asy
   const entered = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
   const read = h.historyService.getLastMessages.bind(h.historyService);
-  spyOn(h.historyService, "readPartial").mockRejectedValueOnce(new Error("partial read failed"));
+  // Every partial read rejects: startup also reads the partial before the recovery's tail read.
+  spyOn(h.historyService, "readPartial").mockRejectedValue(new Error("partial read failed"));
   spyOn(h.historyService, "getLastMessages").mockImplementation(async (id, count) => {
     if (count === 20) {
       entered.resolve();
@@ -448,6 +449,8 @@ test("disabling a retry held on pricing prevents admission without abandoning th
         return Ok(undefined);
       },
       recoverPendingDispatchAfterRestart: () => Promise.resolve(),
+      cancelStreamErrorResume: () => undefined,
+      wakeContinuationBlockedByUserInput: () => undefined,
     } as unknown as WorkspaceGoalService,
   });
   await h.historyService.appendToHistory(
@@ -476,6 +479,61 @@ test("disabling a retry held on pricing prevents admission without abandoning th
     expect(stream).not.toHaveBeenCalled();
   } finally {
     release.resolve();
+    await h.session.dispose();
+    await h.cleanup();
+    await clock.dispose();
+  }
+});
+
+test("discarding a scheduled retry for a context mutation tells the client the retry ended", async () => {
+  const h = await recoveryHarness("retry-context-mutation-abandon");
+  const stream = spyOn(h.aiService, "streamMessage");
+  try {
+    await h.session.runStartupRecovery();
+    expect(h.session.hasPendingAutoRetry()).toBe(true);
+    // A partial truncation keeps the interrupted tail, so the renderer keeps its retry banner
+    // until it receives a terminal retry event.
+    expect(await h.session.discardAutoRetryForContextMutation()).toEqual(Ok(undefined));
+    const retryEvents = h.events.filter((event) => event.type.startsWith("auto-retry-"));
+    expect(retryEvents.at(-1)?.type).toBe("auto-retry-abandoned");
+    await h.clock.adjust(calculateBackoffDelay(1));
+    expect(stream).not.toHaveBeenCalled();
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("a rate-limited turn schedules its auto-retry after the provider's Retry-After", async () => {
+  const clock = makeTestEffectRunner();
+  const workspaceId = "retry-after-rate-limit";
+  const h = await createAgentSessionHarness({
+    workspaceId,
+    captureEvents: true,
+    streamManager: { ...createStreamLifecycleMocks(), effectRunner: clock.runner },
+    aiServiceOverrides: {
+      streamMessage: () =>
+        Promise.resolve(
+          Ok({
+            messageId: "rate-limited",
+            completion: Promise.resolve({
+              status: "failed" as const,
+              streamError: {
+                messageId: "rate-limited",
+                error: "Too many requests",
+                errorType: "rate_limit" as const,
+                retryAfterMs: 45_000,
+              },
+            }),
+          })
+        ),
+    },
+  });
+  try {
+    expect((await h.session.sendMessage("hello", options)).success).toBe(true);
+    await h.session.waitForIdle();
+    const scheduled = h.events.find((event) => event.type === "auto-retry-scheduled");
+    expect(scheduled).toMatchObject({ attempt: 1, delayMs: 45_000 });
+  } finally {
     await h.session.dispose();
     await h.cleanup();
     await clock.dispose();

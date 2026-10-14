@@ -11,8 +11,15 @@ import type {
   LanguageModelV4Usage,
 } from "@ai-sdk/provider";
 import { Config } from "@/node/config";
+import {
+  DEVTOOLS_STEP_ID_HEADER,
+  captureAndStripDevToolsHeader,
+  consumeRedactedRequestBody,
+} from "@/node/services/devToolsHeaderCapture";
 import { createDevToolsMiddleware, extractUsage } from "@/node/services/devToolsMiddleware";
 import { DevToolsService } from "@/node/services/devToolsService";
+import { wrapFetchWithAnthropicCacheControl } from "@/node/services/providerModelFactory";
+import { waitForCondition } from "@/node/services/testDispatchHelpers";
 
 function createTestConfig(opts: { sessionsDir: string; enabled?: boolean }): Config {
   const config = new Config(path.dirname(opts.sessionsDir));
@@ -119,6 +126,58 @@ async function collectStream(
   }
 
   return chunks;
+}
+
+const SECRET_API_KEY = "sk-live-body-secret-123";
+const SECRET_ENCRYPTED_REASONING = "gAAAAABencrypted-reasoning-blob-xyz";
+const SECRET_SIGNATURE = "EqQBCkYIBRgCKkAthinking-signature";
+
+// Provider-shaped body as the SDK serializes it, with a credential and encrypted reasoning.
+const FAILED_REQUEST_BODY = JSON.stringify({
+  model: "gpt-test",
+  api_key: SECRET_API_KEY,
+  max_output_tokens: 128,
+  input: [
+    { type: "reasoning", id: "rs_1", encrypted_content: SECRET_ENCRYPTED_REASONING, summary: [] },
+    {
+      role: "assistant",
+      content: [{ type: "thinking", thinking: "plan", signature: SECRET_SIGNATURE }],
+    },
+    { role: "user", content: [{ type: "input_text", text: "Hello middleware" }] },
+  ],
+});
+
+/** Mimics Xum's fetch wrapper: the request goes out, then the provider rejects it (e.g. HTTP 400). */
+function rejectAfterFetch(params: LanguageModelV4CallOptions, failure: Error): Promise<never> {
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(params.headers ?? {})) {
+    if (typeof value === "string") headers.set(key, value);
+  }
+  captureAndStripDevToolsHeader(headers, FAILED_REQUEST_BODY);
+  return Promise.reject(failure);
+}
+
+async function expectRedactedFailedRequest(service: DevToolsService): Promise<void> {
+  const runs = await service.getRuns("ws-1");
+  const step = (await service.getRunWithSteps("ws-1", runs[0].id))?.steps[0];
+  expect(step?.error).toBe("400 invalid_encrypted_content");
+  expect(step?.rawRequest).toMatchObject({
+    model: "gpt-test",
+    api_key: "[REDACTED]",
+    max_output_tokens: 128,
+    input: [
+      {
+        type: "reasoning",
+        encrypted_content: `[REDACTED ${SECRET_ENCRYPTED_REASONING.length} chars]`,
+      },
+      { content: [{ thinking: "plan", signature: `[REDACTED ${SECRET_SIGNATURE.length} chars]` }] },
+      { content: [{ text: "Hello middleware" }] },
+    ],
+  });
+  const persisted = JSON.stringify(step);
+  for (const secret of [SECRET_API_KEY, SECRET_ENCRYPTED_REASONING, SECRET_SIGNATURE]) {
+    expect(persisted).not.toContain(secret);
+  }
 }
 
 describe("extractUsage", () => {
@@ -235,6 +294,7 @@ describe("createDevToolsMiddleware", () => {
       responseHeaders: null,
       rawResponse: null,
       rawChunks: null,
+      inputTransformations: null,
     });
 
     createDevToolsMiddleware("ws-1", service);
@@ -321,7 +381,33 @@ describe("createDevToolsMiddleware", () => {
       expect(step?.responseHeaders).toEqual(expectedResult.response?.headers);
       expect(step?.rawResponse).toEqual(expectedResult.response?.body);
       expect(step?.rawChunks).toBeNull();
+      expect(step?.inputTransformations).toBeNull();
       expect(step?.error).toBeNull();
+    });
+
+    it("records Anthropic input_transformations from the response body", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+      const wrapGenerate = getWrapGenerate(createDevToolsMiddleware("ws-1", service));
+      const dropped = {
+        type: "thinking_dropped",
+        path: "messages.1.content.0",
+        reason: "model_binding_mismatch",
+      };
+      await wrapGenerate({
+        doGenerate: () =>
+          Promise.resolve(
+            createGenerateResult({
+              response: { body: { type: "message", input_transformations: [dropped] } },
+            })
+          ),
+        doStream: () => Promise.reject(new Error("doStream should not be called")),
+        params: createMockParams(),
+        model: createMockModel(),
+      });
+
+      const runs = await service.getRuns("ws-1");
+      const step = (await service.getRunWithSteps("ws-1", runs[0].id))?.steps[0];
+      expect(step?.inputTransformations).toEqual([dropped]);
     });
 
     it("records error when doGenerate throws and rethrows", async () => {
@@ -355,6 +441,29 @@ describe("createDevToolsMiddleware", () => {
       expect(step?.error).toBe("generate failed");
       expect(step?.durationMs).not.toBeNull();
       expect(step?.durationMs).toBeGreaterThanOrEqual(0);
+    });
+
+    it("records the redacted request body when the provider rejects before responding", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+      const middleware = createDevToolsMiddleware("ws-1", service);
+      const wrapGenerate = getWrapGenerate(middleware);
+      const params = createMockParams();
+      const failure = new Error("400 invalid_encrypted_content");
+
+      let thrownError: unknown;
+      try {
+        await wrapGenerate({
+          doGenerate: () => rejectAfterFetch(params, failure),
+          doStream: () => Promise.reject(new Error("doStream should not be called")),
+          params,
+          model: createMockModel(),
+        });
+      } catch (error) {
+        thrownError = error;
+      }
+      expect(thrownError).toBe(failure);
+
+      await expectRedactedFailedRequest(service);
     });
 
     it("passes through result unmodified", async () => {
@@ -478,7 +587,154 @@ describe("createDevToolsMiddleware", () => {
       expect(step?.responseHeaders).toEqual({ "content-type": "text/event-stream" });
       expect(step?.rawResponse).toEqual(expectedForwardedChunks);
       expect(step?.rawChunks).toEqual([rawChunkValue]);
+      expect(step?.inputTransformations).toBeNull();
       expect(step?.error).toBeNull();
+    });
+
+    it("records the latest Anthropic input_transformations from raw stream events", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+      const wrapStream = getWrapStream(createDevToolsMiddleware("ws-1", service));
+      const entry = (path: string, reason: string) => ({ type: "thinking_dropped", path, reason });
+      const chunks: LanguageModelV4StreamPart[] = [
+        {
+          type: "raw",
+          rawValue: {
+            type: "message_start",
+            message: {
+              input_transformations: [entry("messages.1.content.0", "prefix_binding_mismatch")],
+            },
+          },
+        },
+        { type: "text-start", id: "t1" },
+        { type: "text-delta", id: "t1", delta: "Hi" },
+        { type: "text-end", id: "t1" },
+        // A server-side fallback re-reports with the serving model's entries.
+        {
+          type: "raw",
+          rawValue: {
+            type: "message_delta",
+            input_transformations: [entry("messages.3.content.0", "model_binding_mismatch")],
+          },
+        },
+        {
+          type: "finish",
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: createUsage(5, 2),
+        },
+      ];
+      const stream = new ReadableStream<LanguageModelV4StreamPart>({
+        start(controller) {
+          for (const chunk of chunks) controller.enqueue(chunk);
+          controller.close();
+        },
+      });
+
+      const result = await wrapStream({
+        doGenerate: () => Promise.reject(new Error("doGenerate should not be called")),
+        doStream: () => Promise.resolve({ stream }),
+        params: createMockParams(),
+        model: createMockModel(),
+      });
+      await collectStream(result.stream);
+
+      const runs = await service.getRuns("ws-1");
+      const step = (await service.getRunWithSteps("ws-1", runs[0].id))?.steps[0];
+      expect(step?.inputTransformations).toEqual([
+        entry("messages.3.content.0", "model_binding_mismatch"),
+      ]);
+    });
+
+    it("records the cache wrapper's wire facts on the step, through a reload", async () => {
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const service = new DevToolsService(config);
+      const wrapStream = getWrapStream(createDevToolsMiddleware("ws-1", service));
+      const route = { route: "anthropic", modelString: "anthropic:claude-opus-5-5" };
+      // The provider's fetch goes through Xum's cache wrapper with the step's headers.
+      const cachingFetch = wrapFetchWithAnthropicCacheControl(
+        (() => Promise.resolve(new Response("{}"))) as unknown as typeof fetch,
+        "1h",
+        { routeIdentity: route }
+      );
+      const params = createMockParams();
+      const result = await wrapStream({
+        doGenerate: () => Promise.reject(new Error("doGenerate should not be called")),
+        doStream: async () => {
+          await cachingFetch("https://api.anthropic.com/v1/messages", {
+            method: "POST",
+            headers: params.headers as Record<string, string>,
+            body: JSON.stringify({ messages: [] }),
+          });
+          return {
+            stream: new ReadableStream<LanguageModelV4StreamPart>({
+              start(controller) {
+                controller.enqueue({
+                  type: "finish",
+                  finishReason: { unified: "stop", raw: "stop" },
+                  usage: createUsage(5, 2),
+                });
+                controller.close();
+              },
+            }),
+          };
+        },
+        params,
+        model: createMockModel(),
+      });
+      await collectStream(result.stream);
+
+      const reloaded = new DevToolsService(config);
+      const runs = await reloaded.getRuns("ws-1");
+      const step = (await reloaded.getRunWithSteps("ws-1", runs[0].id))?.steps[0];
+      expect(step?.promptCacheWire).toMatchObject({
+        ...route,
+        cacheMarkersInjected: true,
+        dispatched: true,
+      });
+      expect(step?.promptCacheWire?.observedAt).toBeString();
+    });
+
+    it("keeps the wire facts of an OK response when the step aborts before doStream settles", async () => {
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const service = new DevToolsService(config);
+      const wrapStream = getWrapStream(createDevToolsMiddleware("ws-1", service));
+      const route = { route: "anthropic", modelString: "anthropic:claude-opus-5-5" };
+      const cachingFetch = wrapFetchWithAnthropicCacheControl(
+        (() => Promise.resolve(new Response("{}"))) as unknown as typeof fetch,
+        "1h",
+        { routeIdentity: route }
+      );
+      const abort = new AbortController();
+      const params = { ...createMockParams(), abortSignal: abort.signal };
+      const send = () =>
+        cachingFetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: params.headers as Record<string, string>,
+          body: JSON.stringify({ messages: [] }),
+        });
+      const streaming = wrapStream({
+        doGenerate: () => Promise.reject(new Error("doGenerate should not be called")),
+        doStream: async () => {
+          // Anthropic answered OK (the monitor observed it), then the user stopped the turn
+          // while the provider was still setting up the stream.
+          await send();
+          abort.abort();
+          throw new Error("aborted");
+        },
+        params,
+        model: createMockModel(),
+      });
+      // The provider call rejects after the abort; only the recorded step matters here.
+      await Promise.resolve(streaming).catch(() => undefined);
+
+      // The abort handler finalizes in the background; wait for that update.
+      const readStep = async () => {
+        const runs = await service.getRuns("ws-1");
+        return (await service.getRunWithSteps("ws-1", runs[0].id))?.steps[0];
+      };
+      await waitForCondition(async () => (await readStep())?.error === "Request aborted");
+      const step = await readStep();
+      expect(step?.promptCacheWire).toMatchObject({ ...route, dispatched: true });
+      expect(step?.promptCacheWire?.observedAt).toBeString();
     });
 
     it("does not forward raw chunks when includeRawChunks was not requested", async () => {
@@ -621,6 +877,99 @@ describe("createDevToolsMiddleware", () => {
       });
     });
 
+    it("records the redacted request body when the stream is rejected before it starts", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+      const middleware = createDevToolsMiddleware("ws-1", service);
+      const wrapStream = getWrapStream(middleware);
+      const params = createMockParams();
+      const failure = new Error("400 invalid_encrypted_content");
+
+      let thrownError: unknown;
+      try {
+        await wrapStream({
+          doGenerate: () => Promise.reject(new Error("doGenerate should not be called")),
+          doStream: () => rejectAfterFetch(params, failure),
+          params,
+          model: createMockModel(),
+        });
+      } catch (error) {
+        thrownError = error;
+      }
+      expect(thrownError).toBe(failure);
+
+      await expectRedactedFailedRequest(service);
+    });
+
+    it("drops the captured body on abort even when the fetch never settles", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+      const middleware = createDevToolsMiddleware("ws-1", service);
+      const wrapStream = getWrapStream(middleware);
+      const controller = new AbortController();
+      const params = { ...createMockParams(), abortSignal: controller.signal };
+      let captured!: () => void;
+      const fetched = new Promise<void>((resolve) => {
+        captured = resolve;
+      });
+
+      void wrapStream({
+        doGenerate: () => Promise.reject(new Error("doGenerate should not be called")),
+        doStream: () => {
+          const headers = new Headers();
+          for (const [key, value] of Object.entries(params.headers ?? {})) {
+            if (typeof value === "string") headers.set(key, value);
+          }
+          captureAndStripDevToolsHeader(headers, FAILED_REQUEST_BODY);
+          captured();
+          // A custom fetch that ignores the abort signal and never settles.
+          return new Promise<never>(() => undefined);
+        },
+        params,
+        model: createMockModel(),
+      });
+      await fetched;
+      const stepId = params.headers?.[DEVTOOLS_STEP_ID_HEADER];
+      if (typeof stepId !== "string") throw new Error("Expected an injected step id");
+
+      controller.abort();
+
+      expect(consumeRedactedRequestBody(stepId)).toBeNull();
+    });
+
+    it("keeps no body when the provider reaches fetch only after the abort", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+      const middleware = createDevToolsMiddleware("ws-1", service);
+      const wrapStream = getWrapStream(middleware);
+      const controller = new AbortController();
+      controller.abort();
+      const params = { ...createMockParams(), abortSignal: controller.signal };
+      let captured!: () => void;
+      const fetched = new Promise<void>((resolve) => {
+        captured = resolve;
+      });
+
+      void wrapStream({
+        doGenerate: () => Promise.reject(new Error("doGenerate should not be called")),
+        doStream: async () => {
+          // An asynchronous provider that only reaches its (abort-ignoring) fetch now.
+          await Promise.resolve();
+          const headers = new Headers();
+          for (const [key, value] of Object.entries(params.headers ?? {})) {
+            if (typeof value === "string") headers.set(key, value);
+          }
+          captureAndStripDevToolsHeader(headers, FAILED_REQUEST_BODY);
+          captured();
+          return new Promise<never>(() => undefined);
+        },
+        params,
+        model: createMockModel(),
+      });
+      await fetched;
+      const stepId = params.headers?.[DEVTOOLS_STEP_ID_HEADER];
+      if (typeof stepId !== "string") throw new Error("Expected an injected step id");
+
+      expect(consumeRedactedRequestBody(stepId)).toBeNull();
+    });
+
     it("records 'Request aborted' on stream cancel", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
       const middleware = createDevToolsMiddleware("ws-1", service);
@@ -698,6 +1047,32 @@ describe("createDevToolsMiddleware", () => {
       expect(step?.durationMs).not.toBeNull();
 
       await reader.cancel();
+    });
+
+    it("leaves no closed-step mark behind when a started stream is aborted", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+      const middleware = createDevToolsMiddleware("ws-1", service);
+      const wrapStream = getWrapStream(middleware);
+      const abortController = new AbortController();
+      const params = { ...createMockParams(), abortSignal: abortController.signal };
+
+      const result = await wrapStream({
+        doGenerate: () => Promise.reject(new Error("doGenerate should not be called")),
+        doStream: () =>
+          Promise.resolve({ stream: new ReadableStream<LanguageModelV4StreamPart>() }),
+        params,
+        model: createMockModel(),
+      });
+      const stepId = params.headers?.[DEVTOOLS_STEP_ID_HEADER];
+      if (typeof stepId !== "string") throw new Error("Expected an injected step id");
+
+      abortController.abort();
+
+      // The fetch already settled, so the abort must not mark the id closed for good: a
+      // capture under that id is accepted again (a leaked mark would drop it).
+      captureAndStripDevToolsHeader(new Headers({ [DEVTOOLS_STEP_ID_HEADER]: stepId }), "{}");
+      expect(consumeRedactedRequestBody(stepId)).toEqual({});
+      await result.stream.cancel();
     });
 
     it("does not double-finalize when abort fires after normal completion", async () => {

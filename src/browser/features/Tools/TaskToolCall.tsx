@@ -573,6 +573,25 @@ const TaskAiSettingsDisplay: React.FC<TaskAiSettingsInfo & { className?: string 
 interface TaskToolOwnReport {
   reportMarkdown: string;
   title?: string;
+  /** The result holds only the first page of a longer report (it carries nextCharOffset). */
+  isFirstPage?: boolean;
+}
+
+/**
+ * The report a task card shows: its own result's report, unless that is only the first page of
+ * a longer report. Then the report joined from the task_await pages (which starts from that
+ * first page) wins, so the pages the agent read stay on the card.
+ */
+function pickTaskReportMarkdown(
+  ownReport: TaskToolOwnReport | undefined,
+  linkedReport: { reportMarkdown: string } | undefined
+): string | undefined {
+  if (ownReport?.isFirstPage === true && hasNonEmptyText(linkedReport?.reportMarkdown)) {
+    return linkedReport.reportMarkdown;
+  }
+  return hasNonEmptyText(ownReport?.reportMarkdown)
+    ? ownReport.reportMarkdown
+    : linkedReport?.reportMarkdown;
 }
 
 function hasNonEmptyText(value: unknown): value is string {
@@ -757,6 +776,14 @@ function recoverTaskGroupTaskIdsFromWorkspaceMetadata(params: {
   );
 }
 
+/**
+ * The entries of a persisted list that are objects. A partly corrupted chat.jsonl can hold a
+ * null entry, and skipping it keeps the card rendering (self-healing).
+ */
+function objectEntries<T>(entries: readonly T[]): T[] {
+  return entries.filter((entry) => typeof entry === "object" && entry !== null);
+}
+
 function collectTaskToolResultDisplayData(result: TaskToolSuccessResult | null): {
   taskIds: string[];
   statusByTaskId: Map<string, string>;
@@ -816,6 +843,7 @@ function collectTaskToolResultDisplayData(result: TaskToolSuccessResult | null):
     ownReportsByTaskId.set(singleTaskId, {
       reportMarkdown: result.reportMarkdown,
       title: result.title,
+      isFirstPage: result.nextCharOffset != null,
     });
   }
 
@@ -837,12 +865,13 @@ function collectTaskToolResultDisplayData(result: TaskToolSuccessResult | null):
   }
 
   if ("reports" in result && Array.isArray(result.reports)) {
-    for (const report of result.reports) {
+    for (const report of objectEntries(result.reports)) {
       const taskId = rememberTaskId(report.taskId);
       if (taskId) {
         ownReportsByTaskId.set(taskId, {
           reportMarkdown: report.reportMarkdown,
           title: report.title,
+          isFirstPage: report.nextCharOffset != null,
         });
         rememberWorkspace(taskId, report.workspaceId);
         rememberAiSettings(taskId, report);
@@ -1010,9 +1039,7 @@ export const TaskToolCall: React.FC<TaskToolCallProps> = ({
     const linkedReport = taskReportLinking?.reportByTaskId.get(taskId);
     const openWorkspaceId = workspaceIdByTaskId.get(taskId);
     const metadata = findWorkspaceForTaskTarget(workspaceMetadata, taskId, openWorkspaceId);
-    const reportMarkdown = hasNonEmptyText(ownReport?.reportMarkdown)
-      ? ownReport.reportMarkdown
-      : linkedReport?.reportMarkdown;
+    const reportMarkdown = pickTaskReportMarkdown(ownReport, linkedReport);
     const reportTitle = ownReport?.title ?? linkedReport?.title;
     const derivedStatus =
       (ownReport ?? linkedReport)
@@ -1708,7 +1735,9 @@ const TaskListItem: React.FC<{
     taskId={task.taskId}
     status={task.status}
     agentType={task.handleKind === "workspace_turn" ? "workspace" : task.agentType}
-    title={task.title}
+    // Untitled instance rows (the only rows carrying projectPath) would otherwise show just an
+    // opaque ID; their workspace name is the recognizable label. Other rows keep the title only.
+    title={task.title ?? (task.projectPath != null ? task.workspaceName : undefined)}
     depth={task.depth}
     // Tree-scope rows carry the sender-relative relationship (ancestor/sibling/descendant/
     // self) — the key context for interpreting the tree view and addressing peer messages.
@@ -1746,6 +1775,16 @@ const MESSAGE_DELIVERY: Record<
   rate_limited: { status: "failed", label: "Rate limited" },
 };
 
+// Results persisted before the dispatch mode was recorded have no mode ("unknown").
+type QueuedDispatchMode = NonNullable<
+  Extract<TaskSendMessageToolSuccessResult, { status: "queued" }>["queueDispatchMode"]
+>;
+const QUEUED_LABEL: Record<QueuedDispatchMode | "unknown", string> = {
+  "tool-end": "Queued for next step",
+  "turn-end": "Queued until turn end",
+  unknown: "Queued for delivery",
+};
+
 export const TaskSendMessageToolCall: React.FC<TaskSendMessageToolCallProps> = (props) => {
   const workspaceContext = useOptionalWorkspaceContext();
   const workspace = findWorkspaceForTaskTarget(
@@ -1760,7 +1799,13 @@ export const TaskSendMessageToolCall: React.FC<TaskSendMessageToolCallProps> = (
   const invalidResult =
     (props.result != null || props.status === "completed") && result == null && toolError == null;
   // A finished tool call can still mean delivery was refused or queued, not sent.
-  const delivery = result ? MESSAGE_DELIVERY[result.status] : undefined;
+  const baseDelivery = result ? MESSAGE_DELIVERY[result.status] : undefined;
+  // The card shows only the send-time result and never learns when the queue entry dispatches,
+  // so a bare "Queued" read as never delivered (#4736). Name when it dispatches instead.
+  const delivery =
+    result?.status === "queued" && baseDelivery != null
+      ? { ...baseDelivery, label: QUEUED_LABEL[result.queueDispatchMode ?? "unknown"] }
+      : baseDelivery;
   const relation = result && "targetRelation" in result ? result.targetRelation : undefined;
   const error = toolError?.error ?? (result && "error" in result ? result.error : undefined);
 
@@ -1912,8 +1957,12 @@ interface TaskRemoveToolCallProps {
 export const TaskRemoveToolCall: React.FC<TaskRemoveToolCallProps> = (props) => {
   const { expanded, toggleExpanded } = useToolExpansion(false);
   const results = props.result?.results ?? [];
-  const displayResults: Array<{ taskId: string; status?: string; error?: string }> =
-    results.length > 0 ? results : props.args.task_ids.map((taskId) => ({ taskId }));
+  const displayResults: Array<{
+    taskId: string;
+    status?: string;
+    error?: string;
+    paths?: string[];
+  }> = results.length > 0 ? results : props.args.task_ids.map((taskId) => ({ taskId }));
   const removed = results.filter((result) => result.status === "removed").length;
   return (
     <ToolContainer expanded={expanded}>
@@ -1938,6 +1987,11 @@ export const TaskRemoveToolCall: React.FC<TaskRemoveToolCallProps> = (props) => 
                 {result.error != null && (
                   <div className="text-danger mt-1 text-[11px]">{result.error}</div>
                 )}
+                {result.paths?.map((filePath) => (
+                  <div key={filePath} className="text-secondary font-mono text-[11px] break-all">
+                    {filePath}
+                  </div>
+                ))}
               </div>
             ))}
           </div>

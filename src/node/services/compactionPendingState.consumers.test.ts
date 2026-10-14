@@ -5,6 +5,7 @@ import * as path from "node:path";
 import * as atomicWrite from "@/node/utils/writeFileAtomic";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { markLockOwnerDead } from "@/node/utils/concurrency/fileLockTestHelpers";
 import { CompactionPendingState, type CompactionPendingReceipt } from "./compactionPendingState";
 import { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
@@ -483,9 +484,7 @@ describe("inactive pending consumer contracts", () => {
       try {
         await entered.promise;
         const lockPath = historyWriteLockPath(h.config.rootDir, workspaceId);
-        const token = await fs.readFile(lockPath, "utf8");
-        await fs.writeFile(lockPath, token.split(":").slice(0, 2).join(":"));
-        await fs.utimes(lockPath, new Date(0), new Date(0));
+        await markLockOwnerDead(lockPath);
         await using successor = await acquireProcessFileLock({
           lockPath,
           timeoutMs: 1000,
@@ -550,9 +549,7 @@ describe("inactive pending consumer contracts", () => {
             const result = await Reflect.apply(target, receiver, args);
             if (String(args[0]).startsWith(`${pendingPath}.continuous-`)) {
               const lockPath = historyWriteLockPath(h.config.rootDir, workspaceId);
-              const token = await fs.readFile(lockPath, "utf8");
-              await fs.writeFile(lockPath, token.split(":").slice(0, 2).join(":"));
-              await fs.utimes(lockPath, new Date(0), new Date(0));
+              await markLockOwnerDead(lockPath);
               successor = await acquireProcessFileLock({
                 lockPath,
                 timeoutMs: 1000,

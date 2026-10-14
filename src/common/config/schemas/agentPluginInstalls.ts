@@ -98,8 +98,6 @@ export const AgentPluginInstallEntrySchema = z.object({
   autoUpdate: z.boolean().optional(),
 });
 
-export const AgentPluginInstallsSchema = z.array(AgentPluginInstallEntrySchema);
-
 export type AgentPluginGitSource = z.infer<typeof AgentPluginGitSourceSchema>;
 export type AgentPluginInstallSource = z.infer<typeof AgentPluginInstallSourceSchema>;
 export type AgentPluginInstallEntry = z.infer<typeof AgentPluginInstallEntrySchema>;

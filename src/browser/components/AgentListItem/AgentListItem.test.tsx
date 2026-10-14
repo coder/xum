@@ -4,19 +4,32 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import { cleanup, render, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../tests/ui/dom";
+import { APIContext } from "@/browser/contexts/API";
+import * as RealProjectContextModule from "@/browser/contexts/ProjectContext";
 import type * as ReactDndModuleType from "react-dnd";
 import type * as ReactDndHtml5BackendModuleType from "react-dnd-html5-backend";
-import type * as APIModuleType from "@/browser/contexts/API";
-import type * as ProjectContextModuleType from "@/browser/contexts/ProjectContext";
-import type * as WorkspaceTitleEditContextModuleType from "@/browser/contexts/WorkspaceTitleEditContext";
-import type * as ContextMenuPositionModuleType from "@/browser/hooks/useContextMenuPosition";
-import type * as ExperimentsModuleType from "@/browser/hooks/useExperiments";
-import type * as WorkspaceFallbackModelModuleType from "@/browser/hooks/useWorkspaceFallbackModel";
 import type * as WorkspaceUnreadModule from "@/browser/hooks/useWorkspaceUnread";
-import type * as RuntimeStatusStoreModuleType from "@/browser/stores/RuntimeStatusStore";
 import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import * as TooltipModule from "../Tooltip/Tooltip";
 import * as WorkspaceStatusIndicatorModule from "../WorkspaceStatusIndicator/WorkspaceStatusIndicator";
+import * as RealWorkspaceHeartbeatModalModule from "@/browser/components/WorkspaceHeartbeatModal";
+import * as RealReactDndModule from "react-dnd";
+import * as RealReactDndHtml5BackendModule from "react-dnd-html5-backend";
+import * as RealWorkspaceTitleEditContextModule from "@/browser/contexts/WorkspaceTitleEditContext";
+import * as RealContextMenuPositionModule from "@/browser/hooks/useContextMenuPosition";
+import * as RealWorkspaceUnreadModule from "@/browser/hooks/useWorkspaceUnread";
+import * as RealRuntimeStatusStoreModule from "@/browser/stores/RuntimeStatusStore";
+import * as RealWorkspaceFallbackModelModule from "@/browser/hooks/useWorkspaceFallbackModel";
+import * as RealWorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+
+// The heartbeat modal stub below replaces the modal's index module for the whole process.
+// When an earlier suite has already linked that index (WorkspaceMenuBar renders the real
+// modal), bun patches the live re-export binding, which also empties the modal's own module
+// and blanks WorkspaceHeartbeatModal.test.tsx. Restore the real exports once this suite ends.
+restoreModulesAfterSuite([
+  ["@/browser/components/WorkspaceHeartbeatModal", { ...RealWorkspaceHeartbeatModalModule }],
+]);
 import type {
   AgentRowRenderMeta,
   WorkspaceDelegatedActivity,
@@ -26,6 +39,34 @@ import type { StreamAbortReasonSnapshot } from "@/common/types/stream";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { WorkspaceSelection } from "./AgentListItem";
 import type { AgentListItem as AgentListItemComponent } from "./AgentListItem";
+
+// Snapshot the real exports at file scope, before any test mocks the modules. Do not load second
+// copies with require("...?real=1"): Bun's LCOV keeps only the last-loaded copy of a file, so a
+// later second copy replaces the coverage that the module's own tests recorded in the shard.
+const realProjectContext = { ...RealProjectContextModule };
+const realWorkspaceTitleEditContext = { ...RealWorkspaceTitleEditContextModule };
+const realContextMenuPosition = { ...RealContextMenuPositionModule };
+const realWorkspaceUnread = { ...RealWorkspaceUnreadModule };
+const realRuntimeStatusStore = { ...RealRuntimeStatusStoreModule };
+const realWorkspaceFallbackModel = { ...RealWorkspaceFallbackModelModule };
+const realWorkspaceStore = { ...RealWorkspaceStoreModule };
+
+// Restore the provider contexts after the suite; partial row stubs must not
+// replace the real contexts used by later full Settings renders.
+restoreModulesAfterSuite([
+  ["@/browser/contexts/ProjectContext", realProjectContext],
+  // installAgentListItemTestDoubles() re-registers these from beforeEach with overridden
+  // exports, and `mock.restore()` does not undo mock.module, so the overrides otherwise leak
+  // into every later test file (#4639).
+  ["react-dnd", { ...RealReactDndModule }],
+  ["react-dnd-html5-backend", { ...RealReactDndHtml5BackendModule }],
+  ["@/browser/contexts/WorkspaceTitleEditContext", realWorkspaceTitleEditContext],
+  ["@/browser/hooks/useContextMenuPosition", realContextMenuPosition],
+  ["@/browser/hooks/useWorkspaceUnread", realWorkspaceUnread],
+  ["@/browser/stores/RuntimeStatusStore", realRuntimeStatusStore],
+  ["@/browser/hooks/useWorkspaceFallbackModel", realWorkspaceFallbackModel],
+  ["@/browser/stores/WorkspaceStore", realWorkspaceStore],
+]);
 
 let AgentListItem!: typeof AgentListItemComponent;
 
@@ -46,7 +87,6 @@ const SUBAGENT_ROW_META: AgentRowRenderMeta = {
 type MockWorkspaceUnreadState = ReturnType<typeof WorkspaceUnreadModule.useWorkspaceUnread>;
 type MockWorkspaceSidebarState = ReturnType<typeof WorkspaceStoreModule.useWorkspaceSidebarState>;
 
-let mockWorkspaceHeartbeatsEnabled = false;
 let mockEditingWorkspaceId: string | null = null;
 let latestUseDragSpec: (() => { item?: () => Record<string, unknown> }) | null = null;
 let mockWorkspaceUnreadState: MockWorkspaceUnreadState;
@@ -160,24 +200,14 @@ function installAgentListItemTestDoubles() {
   const actualReactDnd = require("react-dnd?real=1") as typeof ReactDndModuleType;
   const actualReactDndHtml5Backend =
     require("react-dnd-html5-backend?real=1") as typeof ReactDndHtml5BackendModuleType;
-  const actualApi = require("@/browser/contexts/API?real=1") as typeof APIModuleType;
-  const actualProjectContext =
-    require("@/browser/contexts/ProjectContext?real=1") as typeof ProjectContextModuleType;
-  const actualWorkspaceTitleEditContext =
-    require("@/browser/contexts/WorkspaceTitleEditContext?real=1") as typeof WorkspaceTitleEditContextModuleType;
-  const actualContextMenuPosition =
-    require("@/browser/hooks/useContextMenuPosition?real=1") as typeof ContextMenuPositionModuleType;
-  const actualExperiments =
-    require("@/browser/hooks/useExperiments?real=1") as typeof ExperimentsModuleType;
-  const actualWorkspaceUnread =
-    require("@/browser/hooks/useWorkspaceUnread?real=1") as typeof WorkspaceUnreadModule;
-  const actualRuntimeStatusStore =
-    require("@/browser/stores/RuntimeStatusStore?real=1") as typeof RuntimeStatusStoreModuleType;
-  const actualWorkspaceFallbackModel =
-    require("@/browser/hooks/useWorkspaceFallbackModel?real=1") as typeof WorkspaceFallbackModelModuleType;
-  const actualWorkspaceStore =
-    require("@/browser/stores/WorkspaceStore?real=1") as typeof WorkspaceStoreModule;
   /* eslint-enable @typescript-eslint/no-require-imports */
+  const actualProjectContext = realProjectContext;
+  const actualWorkspaceTitleEditContext = realWorkspaceTitleEditContext;
+  const actualContextMenuPosition = realContextMenuPosition;
+  const actualWorkspaceUnread = realWorkspaceUnread;
+  const actualRuntimeStatusStore = realRuntimeStatusStore;
+  const actualWorkspaceFallbackModel = realWorkspaceFallbackModel;
+  const actualWorkspaceStore = realWorkspaceStore;
 
   void mock.module("react-dnd", () => ({
     ...actualReactDnd,
@@ -191,17 +221,6 @@ function installAgentListItemTestDoubles() {
   void mock.module("react-dnd-html5-backend", () => ({
     ...actualReactDndHtml5Backend,
     getEmptyImage: () => new Image(),
-  }));
-
-  void mock.module("@/browser/contexts/API", () => ({
-    ...actualApi,
-    useAPI: () => ({
-      api: null,
-      status: "error" as const,
-      error: "API unavailable",
-      authenticate: () => undefined,
-      retry: () => undefined,
-    }),
   }));
 
   void mock.module("@/browser/contexts/ProjectContext", () => ({
@@ -224,7 +243,7 @@ function installAgentListItemTestDoubles() {
     }),
   }));
 
-  void mock.module("../WorkspaceHeartbeatModal", () => ({
+  void mock.module("@/browser/components/WorkspaceHeartbeatModal", () => ({
     WorkspaceHeartbeatModal: () => null,
   }));
 
@@ -243,11 +262,6 @@ function installAgentListItemTestDoubles() {
       suppressClickIfLongPress: () => false,
       close: () => undefined,
     }),
-  }));
-
-  void mock.module("@/browser/hooks/useExperiments", () => ({
-    ...actualExperiments,
-    useExperimentValue: () => mockWorkspaceHeartbeatsEnabled,
   }));
 
   void mock.module("@/browser/hooks/useWorkspaceUnread", () => ({
@@ -269,6 +283,24 @@ function installAgentListItemTestDoubles() {
     ...actualWorkspaceStore,
     useWorkspaceSidebarState: () => mockWorkspaceSidebarState,
   }));
+}
+
+// Rows render without a backend: inject an unavailable API through the real context
+// instead of mocking the API module (process-wide module mocks leak into later suites).
+function UnavailableAPIWrapper(props: { children: ReactNode }) {
+  return (
+    <APIContext.Provider
+      value={{
+        api: null,
+        status: "error",
+        error: "API unavailable",
+        authenticate: () => undefined,
+        retry: () => undefined,
+      }}
+    >
+      {props.children}
+    </APIContext.Provider>
+  );
 }
 
 function renderWorkspaceItem(
@@ -313,7 +345,8 @@ function renderWorkspaceItem(
       onForkWorkspace={() => Promise.resolve()}
       onArchiveWorkspace={() => Promise.resolve()}
       onCancelCreation={() => Promise.resolve()}
-    />
+    />,
+    { wrapper: UnavailableAPIWrapper }
   );
 
   return {
@@ -334,7 +367,6 @@ describe("AgentListItem", () => {
 
   beforeEach(() => {
     cleanupDom = installDom();
-    mockWorkspaceHeartbeatsEnabled = false;
     mockEditingWorkspaceId = null;
     mockWorkspaceUnreadState = createWorkspaceUnreadState();
     mockWorkspaceSidebarState = createWorkspaceSidebarState();
@@ -909,7 +941,6 @@ describe("AgentListItem", () => {
   });
 
   test("does not render a goal target pill in the workspace row", () => {
-    mockWorkspaceHeartbeatsEnabled = true;
     mockWorkspaceSidebarState = createWorkspaceSidebarState({
       goal: {
         goalId: "11111111-1111-4111-8111-111111111111",
@@ -928,9 +959,7 @@ describe("AgentListItem", () => {
     expect(within(row).queryByTestId(`workspace-goal-pill-${TEST_WORKSPACE_ID}`)).toBeNull();
   });
 
-  test("renders a heartbeat icon directly in the leading slot for seen rows when the heartbeat experiment is enabled", () => {
-    mockWorkspaceHeartbeatsEnabled = true;
-
+  test("renders a heartbeat icon directly in the leading slot for seen rows", () => {
     const { row } = renderWorkspaceItem({
       metadata: createHeartbeatMetadata(),
     });
@@ -997,8 +1026,6 @@ describe("AgentListItem", () => {
   });
 
   test("does not render a heartbeat icon fallback when completed children indicator is shown", () => {
-    mockWorkspaceHeartbeatsEnabled = true;
-
     const { row, metadata } = renderWorkspaceItem({
       metadata: createHeartbeatMetadata(),
       rowRenderMeta: {
@@ -1026,19 +1053,15 @@ describe("AgentListItem", () => {
   });
 
   test.each([
-    ["the heartbeat experiment is disabled", false, createHeartbeatMetadata()],
-    ["heartbeat is disabled", true, createHeartbeatMetadata({ enabled: false })],
-    ["heartbeat settings are missing", true, createMetadata()],
-  ])("does not render a heartbeat icon fallback when %s", (_name, experimentEnabled, metadata) => {
-    mockWorkspaceHeartbeatsEnabled = experimentEnabled;
-
+    ["heartbeat is disabled", createHeartbeatMetadata({ enabled: false })],
+    ["heartbeat settings are missing", createMetadata()],
+  ])("does not render a heartbeat icon fallback when %s", (_name, metadata) => {
     const { row } = renderWorkspaceItem({ metadata });
 
     expect(within(row).queryByTestId("heartbeat-icon")).toBeNull();
   });
 
   test("keeps the unread idle status dot when heartbeat is enabled", () => {
-    mockWorkspaceHeartbeatsEnabled = true;
     mockWorkspaceUnreadState = createWorkspaceUnreadState({ isUnread: true });
 
     const { row } = renderWorkspaceItem({
@@ -1092,7 +1115,7 @@ describe("AgentListItem", () => {
         onCancelCreation={() => Promise.resolve()}
       />
     );
-    const view = render(renderItem());
+    const view = render(renderItem(), { wrapper: UnavailableAPIWrapper });
     const getRow = () =>
       view.container.querySelector<HTMLElement>(
         `[data-workspace-id="${metadata.id}"][role="button"]`
@@ -1148,7 +1171,6 @@ describe("AgentListItem", () => {
   ])(
     "leaves $name unchanged when heartbeat is enabled",
     ({ sidebarState, expectedSelector, expectedText }) => {
-      mockWorkspaceHeartbeatsEnabled = true;
       mockWorkspaceSidebarState = sidebarState;
 
       const { row } = renderWorkspaceItem({

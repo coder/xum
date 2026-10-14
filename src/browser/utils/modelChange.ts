@@ -1,12 +1,16 @@
-import {
-  getAutoModelRoutingKey,
-  getAutoThinkingLevelKey,
-  getModelKey,
-  getThinkingLevelKey,
-} from "@/common/constants/storage";
+import { isNonWorkspaceScopeId } from "@/common/constants/storage";
 import { modelSelectionEqualityKey } from "@/common/utils/ai/models";
-import type { ThinkingLevel } from "@/common/types/thinking";
-import { readPersistedString, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  readScopeAgentId,
+  readScopedAiDefault,
+  writeScopedAiDefault,
+} from "@/browser/utils/scopedAiDefaults";
+import {
+  markAiSelectionIntent,
+  setAutoRoutingPick,
+  type AutoRoutingDimension,
+} from "@/browser/utils/aiSelectionIntent";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 
 export type ModelChangeOrigin = "user" | "agent" | "sync";
 
@@ -24,15 +28,19 @@ const pendingExplicitChanges = new Map<string, ExplicitModelChange>();
 // aliases (mux-gateway:openai/x) still collapse so persisted rewrites keep matching.
 const normalizeExplicitModel = (model: string): string => modelSelectionEqualityKey(model);
 
+const isWorkspaceScope = (scopeId: string): boolean => !isNonWorkspaceScopeId(scopeId);
+
 export function recordWorkspaceModelChange(
   workspaceId: string,
   model: string,
-  origin: ModelChangeOrigin
+  origin: ModelChangeOrigin,
+  current = isWorkspaceScope(workspaceId)
+    ? getWorkspaceAiSelection(workspaceId).model
+    : readScopedAiDefault(workspaceId, "model")
 ): void {
   if (origin === "sync") return;
 
   const normalized = normalizeExplicitModel(model);
-  const current = readPersistedString(getModelKey(workspaceId));
   const normalizedCurrent = current ? normalizeExplicitModel(current) : null;
 
   // Avoid leaving stale explicit-change entries when the effective model doesn't change
@@ -81,36 +89,22 @@ export function setWorkspaceModelWithOrigin(
   origin: ModelChangeOrigin
 ): void {
   recordWorkspaceModelChange(workspaceId, model, origin);
-  updatePersistedState(getModelKey(workspaceId), model);
-  // An explicit concrete pick (user or agent, e.g. an accepted plan's model) leaves Auto;
-  // sync-driven mode defaults keep the user's routing choice.
-  if (origin !== "sync") {
-    updatePersistedState(getAutoModelRoutingKey(workspaceId), false);
+  // A workspace pick stays in memory until a send persists it into workspace metadata.
+  if (!isWorkspaceScope(workspaceId)) {
+    writeScopedAiDefault(workspaceId, "model", model);
+  } else if (origin === "user") {
+    markAiSelectionIntent(workspaceId, "model", model);
+  }
+  if (origin === "user") {
+    setAutoRoutingChoice(workspaceId, "model", false);
   }
 }
 
-/**
- * An explicit agent switch applies the agent's concrete model and thinking level, so it leaves
- * both Auto dimensions even when the stored values already match and nothing is rewritten;
- * otherwise the next send would replace the agent's concrete settings with a tier's.
- */
-export function leaveAutoRoutingForAgentSwitch(workspaceId: string): void {
-  updatePersistedState(getAutoModelRoutingKey(workspaceId), false);
-  updatePersistedState(getAutoThinkingLevelKey(workspaceId), false);
-}
-
-/**
- * Thinking counterpart of setWorkspaceModelWithOrigin for agent-resolved levels: an explicit
- * agent switch leaves thinking Auto, otherwise the next send would replace the agent's concrete
- * level with a tier's; sync-driven defaults keep the user's routing choice.
- */
-export function setWorkspaceThinkingLevelWithOrigin(
-  workspaceId: string,
-  level: ThinkingLevel,
-  origin: ModelChangeOrigin
+/** Records an unsent Auto pick for the scope's selected agent. */
+export function setAutoRoutingChoice(
+  scopeId: string,
+  dimension: AutoRoutingDimension,
+  active: boolean
 ): void {
-  updatePersistedState(getThinkingLevelKey(workspaceId), level);
-  if (origin !== "sync") {
-    updatePersistedState(getAutoThinkingLevelKey(workspaceId), false);
-  }
+  setAutoRoutingPick(scopeId, readScopeAgentId(scopeId), dimension, active);
 }

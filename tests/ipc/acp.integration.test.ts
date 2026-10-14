@@ -37,7 +37,7 @@ type UserMessageChunkUpdate = Extract<
 
 interface AcpTestClient {
   client: ClientSideConnection;
-  sessionUpdates: Array<schema.SessionNotification>;
+  sessionUpdates: schema.SessionNotification[];
   getStderr: () => string;
   runRpc: <T>(label: string, operation: Promise<T>) => Promise<T>;
   close: () => Promise<void>;
@@ -120,15 +120,13 @@ async function runCommand(
 }
 
 async function ensureMainCliBuilt(): Promise<void> {
-  if (buildMainPromise == null) {
-    // Build the real CLI artifact once so this test catches missing tsconfig entries
-    // and runtime transport/framing regressions in dist output.
-    buildMainPromise = (async () => {
-      await runCommand("make", ["build-main"]);
-      await fs.access(path.join(process.cwd(), "dist/cli/index.js"));
-      await fs.access(path.join(process.cwd(), "dist/cli/acp.js"));
-    })();
-  }
+  // Build the real CLI artifact once so this test catches missing tsconfig entries
+  // and runtime transport/framing regressions in dist output.
+  buildMainPromise ??= (async () => {
+    await runCommand("make", ["build-main"]);
+    await fs.access(path.join(process.cwd(), "dist/cli/index.js"));
+    await fs.access(path.join(process.cwd(), "dist/cli/acp.js"));
+  })();
 
   await buildMainPromise;
 }
@@ -215,7 +213,7 @@ async function createAcpClient(options: CreateAcpClientOptions = {}): Promise<Ac
     );
   }
 
-  const sessionUpdates: Array<schema.SessionNotification> = [];
+  const sessionUpdates: schema.SessionNotification[] = [];
   const stream = ndJsonStream(
     Writable.toWeb(child.stdin) as unknown as WritableStream<Uint8Array>,
     Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>
@@ -314,7 +312,7 @@ function isUserMessageChunk(
   return notification.update.sessionUpdate === "user_message_chunk";
 }
 
-function extractTextChunks(notifications: Array<schema.SessionNotification>): string {
+function extractTextChunks(notifications: schema.SessionNotification[]): string {
   return notifications
     .filter(isAgentMessageChunk)
     .map((notification) => {
@@ -511,7 +509,7 @@ describeIntegration("ACP built CLI integration", () => {
         const responseText = extractTextChunks(updatesForSession).toLowerCase();
         if (!responseText.includes("test")) {
           throw new Error(
-            `Expected response to include README contents (\"test\"). Got: ${responseText}\n\nACP stderr:\n${acpClient.getStderr()}`
+            `Expected response to include README contents ("test"). Got: ${responseText}\n\nACP stderr:\n${acpClient.getStderr()}`
           );
         }
       } finally {

@@ -49,11 +49,6 @@ export class McpIconRefCache {
     assert(Number.isInteger(capacity) && capacity > 0, "icon cache capacity must be positive");
   }
 
-  /** Number of pending + resolved entries (test seam for the bound). */
-  get size(): number {
-    return this.entries.size;
-  }
-
   /** Cached answer without touching recency (safe to call while rendering). */
   peek(iconRef: string): string | null | undefined {
     const entry = this.entries.get(iconRef);

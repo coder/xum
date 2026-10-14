@@ -1,103 +1,37 @@
 import React from "react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
-import { copyFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 
 import { useWorkspaceStoreRaw as getWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
-import { GLOBAL_SCOPE_ID, getAgentIdKey, getProjectScopeId } from "@/common/constants/storage";
-import { requireTestModule } from "@/browser/testUtils";
+import { setWorkspaceAgentPick } from "@/browser/utils/aiSelectionIntent";
+import type { UserPreferences } from "@/common/config/schemas/userPreferences";
+import { getAppConfigStore, getUserPreferences } from "@/browser/stores/AppConfigStore";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import type { AgentContextValue } from "./AgentContext";
-import type * as AgentContextModule from "./AgentContext";
-import type * as APIModule from "./API";
-import type { APIClient } from "./API";
-import type * as ProjectContextModule from "./ProjectContext";
-import type * as RouterContextModule from "./RouterContext";
-import type * as WorkspaceContextModule from "./WorkspaceContext";
+import { AgentProvider, useAgent, type AgentContextValue } from "./AgentContext";
+import { APIProvider, type APIClient } from "./API";
+import {
+  createConnectionHarness,
+  GAP_MODES,
+  type ConnectionHarness,
+} from "./connection.testHarness";
+import { ProjectProvider } from "./ProjectContext";
+import { RouterProvider } from "./RouterContext";
+import { WorkspaceProvider } from "./WorkspaceContext";
+import {
+  createTestApiClient,
+  createTestConfig,
+  createTestPreferencesConfig,
+  type TestApiOverrides,
+} from "@/browser/testUtils";
+import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 
 let mockAgentDefinitions: AgentDefinitionDescriptor[] = [];
 let mockWorkspaceMetadata = new Map<string, { parentWorkspaceId?: string; agentId?: string }>();
-
-let APIProvider!: typeof APIModule.APIProvider;
-let RouterProvider!: typeof RouterContextModule.RouterProvider;
-let ProjectProvider!: typeof ProjectContextModule.ProjectProvider;
-let WorkspaceProvider!: typeof WorkspaceContextModule.WorkspaceProvider;
-let AgentProvider!: typeof AgentContextModule.AgentProvider;
-let useAgent!: typeof AgentContextModule.useAgent;
-let isolatedModuleDir: string | null = null;
-
-const contextsDir = dirname(fileURLToPath(import.meta.url));
-
-async function importIsolatedAgentModules() {
-  const tempDir = await mkdtemp(join(contextsDir, ".agent-context-test-"));
-  const isolatedApiPath = join(tempDir, "API.real.tsx");
-  const isolatedRouterPath = join(tempDir, "RouterContext.real.tsx");
-  const isolatedProjectPath = join(tempDir, "ProjectContext.real.tsx");
-  const isolatedWorkspacePath = join(tempDir, "WorkspaceContext.real.tsx");
-  const isolatedAgentPath = join(tempDir, "AgentContext.real.tsx");
-
-  await copyFile(join(contextsDir, "API.tsx"), isolatedApiPath);
-  await copyFile(join(contextsDir, "RouterContext.tsx"), isolatedRouterPath);
-
-  const projectContextSource = await readFile(join(contextsDir, "ProjectContext.tsx"), "utf8");
-  const isolatedProjectContextSource = projectContextSource.replace(
-    'from "@/browser/contexts/API";',
-    'from "./API.real.tsx";'
-  );
-
-  if (isolatedProjectContextSource === projectContextSource) {
-    throw new Error("Failed to rewrite ProjectContext API import for the isolated test copy");
-  }
-
-  await writeFile(isolatedProjectPath, isolatedProjectContextSource);
-
-  const workspaceContextSource = await readFile(join(contextsDir, "WorkspaceContext.tsx"), "utf8");
-  const isolatedWorkspaceContextSource = workspaceContextSource
-    .replaceAll('from "@/browser/contexts/API";', 'from "./API.real.tsx";')
-    .replace('from "@/browser/contexts/ProjectContext";', 'from "./ProjectContext.real.tsx";')
-    .replace('from "@/browser/contexts/RouterContext";', 'from "./RouterContext.real.tsx";');
-
-  if (isolatedWorkspaceContextSource === workspaceContextSource) {
-    throw new Error("Failed to rewrite WorkspaceContext imports for the isolated test copy");
-  }
-
-  await writeFile(isolatedWorkspacePath, isolatedWorkspaceContextSource);
-
-  const agentContextSource = await readFile(join(contextsDir, "AgentContext.tsx"), "utf8");
-  const isolatedAgentContextSource = agentContextSource
-    .replace('from "@/browser/contexts/API";', 'from "./API.real.tsx";')
-    .replace('from "@/browser/contexts/WorkspaceContext";', 'from "./WorkspaceContext.real.tsx";');
-
-  if (isolatedAgentContextSource === agentContextSource) {
-    throw new Error("Failed to rewrite AgentContext imports for the isolated test copy");
-  }
-
-  await writeFile(isolatedAgentPath, isolatedAgentContextSource);
-
-  ({ APIProvider } = requireTestModule<{ APIProvider: typeof APIModule.APIProvider }>(
-    isolatedApiPath
-  ));
-  ({ RouterProvider } = requireTestModule<{
-    RouterProvider: typeof RouterContextModule.RouterProvider;
-  }>(isolatedRouterPath));
-  ({ ProjectProvider } = requireTestModule<{
-    ProjectProvider: typeof ProjectContextModule.ProjectProvider;
-  }>(isolatedProjectPath));
-  ({ WorkspaceProvider } = requireTestModule<{
-    WorkspaceProvider: typeof WorkspaceContextModule.WorkspaceProvider;
-  }>(isolatedWorkspacePath));
-  ({ AgentProvider, useAgent } = requireTestModule<{
-    AgentProvider: typeof AgentContextModule.AgentProvider;
-    useAgent: typeof AgentContextModule.useAgent;
-  }>(isolatedAgentPath));
-
-  return tempDir;
-}
+let mockAgentListFails = false;
 
 const EXEC_AGENT: AgentDefinitionDescriptor = {
   id: "exec",
@@ -179,19 +113,44 @@ function createEmptyAsyncIterable<T>(): AsyncIterable<T> {
   };
 }
 
-function createApiClient(): APIClient {
+function createApiClient(
+  preferences?: UserPreferences,
+  agentAiDefaults?: AgentAiDefaults
+): APIClient {
   const workspaceMetadata = Array.from(
     mockWorkspaceMetadata.entries(),
     ([workspaceId, overrides]) => createWorkspaceMetadata(workspaceId, overrides)
   );
 
-  return {
+  return createTestApiClient({
+    config: {
+      ...createTestPreferencesConfig(preferences),
+      ...(agentAiDefaults != null
+        ? {
+            getConfig: () =>
+              Promise.resolve(
+                createTestConfig({ userPreferences: preferences ?? {}, agentAiDefaults })
+              ),
+          }
+        : {}),
+    },
     agents: {
-      list: () => Promise.resolve(mockAgentDefinitions),
+      list: () =>
+        mockAgentListFails
+          ? Promise.reject(new Error("agents unavailable"))
+          : Promise.resolve(mockAgentDefinitions),
     },
     workspace: {
       list: () => Promise.resolve(workspaceMetadata),
-      onMetadata: () => Promise.resolve(createEmptyAsyncIterable()),
+      onMetadata: () =>
+        Promise.resolve(
+          (async function* () {
+            yield {
+              type: "snapshot" as const,
+              workspaces: await Promise.resolve(workspaceMetadata),
+            };
+          })()
+        ),
       onChat: () => Promise.resolve(createEmptyAsyncIterable()),
       getSessionUsage: () => Promise.resolve(undefined),
       activity: {
@@ -214,16 +173,18 @@ function createApiClient(): APIClient {
     terminal: {
       openWindow: () => Promise.resolve(),
     },
-  } as unknown as APIClient;
+  });
 }
 
 function renderAgentHarness(props: {
   projectPath: string;
   workspaceId?: string;
+  preferences?: UserPreferences;
+  agentAiDefaults?: AgentAiDefaults;
   onChange: (value: AgentContextValue) => void;
 }) {
   return render(
-    <APIProvider client={createApiClient()}>
+    <APIProvider client={createApiClient(props.preferences, props.agentAiDefaults)}>
       <RouterProvider>
         <ProjectProvider>
           <WorkspaceProvider>
@@ -242,10 +203,10 @@ describe("AgentContext", () => {
   let originalDocument: typeof globalThis.document;
   let originalLocalStorage: typeof globalThis.localStorage;
 
-  beforeEach(async () => {
-    isolatedModuleDir = await importIsolatedAgentModules();
+  beforeEach(() => {
     mockAgentDefinitions = [];
     mockWorkspaceMetadata = new Map();
+    mockAgentListFails = false;
 
     originalWindow = globalThis.window;
     originalDocument = globalThis.document;
@@ -263,59 +224,136 @@ describe("AgentContext", () => {
     };
   });
 
-  afterEach(async () => {
+  afterEach(() => {
     cleanup();
+    getAppConfigStore().updateOptimistically({
+      userPreferences: undefined,
+      agentAiDefaults: undefined,
+    });
     getWorkspaceStoreRaw().dispose();
     mock.restore();
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
     globalThis.localStorage = originalLocalStorage;
-
-    if (isolatedModuleDir) {
-      await rm(isolatedModuleDir, { recursive: true, force: true });
-      isolatedModuleDir = null;
-    }
   });
 
   test("project-scoped agent falls back to global default when project preference is unset", async () => {
     const projectPath = "/tmp/project";
-    window.localStorage.setItem(getAgentIdKey(GLOBAL_SCOPE_ID), JSON.stringify("ask"));
 
     let contextValue: AgentContextValue | undefined;
 
-    renderAgentHarness({ projectPath, onChange: (value) => (contextValue = value) });
+    renderAgentHarness({
+      projectPath,
+      preferences: { ai: { globalDefaults: { agentId: "ask" } } },
+      onChange: (value) => (contextValue = value),
+    });
 
     await waitFor(() => {
       expect(contextValue?.agentId).toBe("exec");
     });
-    expect(window.localStorage.getItem(getAgentIdKey(getProjectScopeId(projectPath)))).toBeNull();
+    expect(getUserPreferences().ai?.projectDefaults).toBeUndefined();
+  });
+
+  test("readers outside the agent context resolve a custom agent's inherited defaults", async () => {
+    const workspaceId = "ws-custom-agent";
+    mockAgentDefinitions = [EXEC_AGENT, { ...REVIEW_PROJECT_AGENT, base: "exec" }];
+    mockWorkspaceMetadata = new Map([[workspaceId, { agentId: "review" }]]);
+
+    renderAgentHarness({
+      projectPath: "/tmp/project",
+      workspaceId,
+      agentAiDefaults: { exec: { modelString: "openai:gpt-5.2" } },
+      onChange: () => undefined,
+    });
+
+    await waitFor(() => {
+      expect(getWorkspaceAiSelection(workspaceId, "review").model).toBe("openai:gpt-5.2");
+    });
+  });
+
+  test("a failed agent refresh drops the inherited defaults it loaded before", async () => {
+    const workspaceId = "ws-custom-agent";
+    mockAgentDefinitions = [EXEC_AGENT, { ...REVIEW_PROJECT_AGENT, base: "exec" }];
+    mockWorkspaceMetadata = new Map([[workspaceId, { agentId: "review" }]]);
+    let contextValue: AgentContextValue | undefined;
+
+    renderAgentHarness({
+      projectPath: "/tmp/project",
+      workspaceId,
+      agentAiDefaults: { exec: { modelString: "openai:gpt-5.2" } },
+      onChange: (value) => (contextValue = value),
+    });
+    await waitFor(() => {
+      expect(getWorkspaceAiSelection(workspaceId, "review").model).toBe("openai:gpt-5.2");
+    });
+
+    mockAgentListFails = true;
+    await act(async () => {
+      await contextValue?.refresh();
+    });
+
+    expect(contextValue?.loadFailed).toBe(true);
+    expect(getWorkspaceAiSelection(workspaceId, "review").model).not.toBe("openai:gpt-5.2");
   });
 
   test("project-scoped preference takes precedence over global default", async () => {
     const projectPath = "/tmp/project";
-    window.localStorage.setItem(getAgentIdKey(GLOBAL_SCOPE_ID), JSON.stringify("ask"));
-    window.localStorage.setItem(
-      getAgentIdKey(getProjectScopeId(projectPath)),
-      JSON.stringify("plan")
-    );
 
     let contextValue: AgentContextValue | undefined;
 
-    renderAgentHarness({ projectPath, onChange: (value) => (contextValue = value) });
+    renderAgentHarness({
+      projectPath,
+      preferences: {
+        ai: {
+          globalDefaults: { agentId: "ask" },
+          projectDefaults: { [projectPath]: { agentId: "plan" } },
+        },
+      },
+      onChange: (value) => (contextValue = value),
+    });
 
     await waitFor(() => {
       expect(contextValue?.agentId).toBe("plan");
     });
   });
 
+  test("a workspace without a saved agent follows project default agent changes", async () => {
+    const workspaceId = "ws-project-default-agent";
+    mockAgentDefinitions = [EXEC_AGENT, PLAN_AGENT, REVIEW_PROJECT_AGENT];
+    mockWorkspaceMetadata = new Map([[workspaceId, {}]]);
+    let contextValue: AgentContextValue | undefined;
+
+    renderAgentHarness({
+      projectPath: "/tmp/project",
+      workspaceId,
+      preferences: { ai: { projectDefaults: { "/tmp/project": { agentId: "plan" } } } },
+      onChange: (value) => (contextValue = value),
+    });
+    await waitFor(() => {
+      expect(contextValue?.agentId).toBe("plan");
+    });
+
+    act(() => {
+      getAppConfigStore().updateOptimistically({
+        userPreferences: { ai: { projectDefaults: { "/tmp/project": { agentId: "review" } } } },
+      });
+    });
+    await waitFor(() => {
+      expect(contextValue?.agentId).toBe("review");
+    });
+  });
+
   test("cycle shortcut advances to next agent", async () => {
     const projectPath = "/tmp/project";
     mockAgentDefinitions = [EXEC_AGENT, PLAN_AGENT];
-    window.localStorage.setItem(getAgentIdKey(GLOBAL_SCOPE_ID), JSON.stringify("exec"));
 
     let contextValue: AgentContextValue | undefined;
 
-    renderAgentHarness({ projectPath, onChange: (value) => (contextValue = value) });
+    renderAgentHarness({
+      projectPath,
+      preferences: { ai: { globalDefaults: { agentId: "exec" } } },
+      onChange: (value) => (contextValue = value),
+    });
 
     await waitFor(() => {
       expect(contextValue?.agentId).toBe("exec");
@@ -338,11 +376,14 @@ describe("AgentContext", () => {
   test("cycle shortcut advances away from a custom auto agent", async () => {
     const projectPath = "/tmp/project";
     mockAgentDefinitions = [AUTO_PROJECT_AGENT, REVIEW_PROJECT_AGENT];
-    window.localStorage.setItem(getAgentIdKey(GLOBAL_SCOPE_ID), JSON.stringify("auto"));
 
     let contextValue: AgentContextValue | undefined;
 
-    renderAgentHarness({ projectPath, onChange: (value) => (contextValue = value) });
+    renderAgentHarness({
+      projectPath,
+      preferences: { ai: { globalDefaults: { agentId: "auto" } } },
+      onChange: (value) => (contextValue = value),
+    });
 
     await waitFor(() => {
       expect(contextValue?.agentId).toBe("auto");
@@ -370,7 +411,7 @@ describe("AgentContext", () => {
       parentWorkspaceId: "parent-workspace",
       agentId: "exec",
     });
-    window.localStorage.setItem(getAgentIdKey(lockedWorkspaceId), JSON.stringify("plan"));
+    setWorkspaceAgentPick(lockedWorkspaceId, "plan");
 
     let contextValue: AgentContextValue | undefined;
     let openPickerEvents = 0;
@@ -387,7 +428,7 @@ describe("AgentContext", () => {
       });
 
       await waitFor(() => {
-        // Backend-assigned agent overrides stale localStorage in locked workspaces.
+        // Backend-assigned agent overrides a stale agent pick in locked workspaces.
         expect(contextValue?.agentId).toBe("exec");
       });
 
@@ -428,9 +469,7 @@ describe("AgentContext", () => {
 
   test("removed non-selectable agent in mutable workspace remaps and does not block shortcut actions", async () => {
     const projectPath = "/tmp/project";
-    const scopeKey = getAgentIdKey(getProjectScopeId(projectPath));
     mockAgentDefinitions = [LOCKED_AGENT, EXEC_AGENT, PLAN_AGENT];
-    window.localStorage.setItem(scopeKey, JSON.stringify("mux"));
 
     let contextValue: AgentContextValue | undefined;
     let openPickerEvents = 0;
@@ -440,12 +479,17 @@ describe("AgentContext", () => {
     window.addEventListener(CUSTOM_EVENTS.OPEN_AGENT_PICKER, handleOpenPicker as EventListener);
 
     try {
-      renderAgentHarness({ projectPath, onChange: (value) => (contextValue = value) });
+      renderAgentHarness({
+        projectPath,
+        preferences: { ai: { projectDefaults: { [projectPath]: { agentId: "mux" } } } },
+        onChange: (value) => (contextValue = value),
+      });
 
       await waitFor(() => {
         expect(contextValue?.agentId).toBe("exec");
       });
-      expect(window.localStorage.getItem(scopeKey)).toBe(JSON.stringify("exec"));
+      // The removed agent resolves at read time; no repair write reaches config.json.
+      expect(getUserPreferences().ai?.projectDefaults?.[projectPath]?.agentId).toBe("mux");
 
       window.api = { platform: "darwin", versions: {} };
 
@@ -472,5 +516,84 @@ describe("AgentContext", () => {
         handleOpenPicker as EventListener
       );
     }
+  });
+});
+
+// A reconnect brings a new client, so the agents load again. The picker keeps the agents it shows
+// until that reload answers; only another workspace or project clears them.
+describe.each([...GAP_MODES])("AgentContext across a reconnect (%s)", (mode) => {
+  let originalWindow: typeof globalThis.window;
+  let originalDocument: typeof globalThis.document;
+  let harness: ConnectionHarness;
+  /** The agents the next server lists, or a promise that answers later. */
+  let serverAgents: AgentDefinitionDescriptor[] | Promise<AgentDefinitionDescriptor[]>;
+  let latest: AgentContextValue | undefined;
+
+  beforeEach(() => {
+    originalWindow = globalThis.window;
+    originalDocument = globalThis.document;
+    const dom = new GlobalWindow();
+    globalThis.window = dom as unknown as Window & typeof globalThis;
+    globalThis.document = dom.document as unknown as Document;
+    latest = undefined;
+    serverAgents = [EXEC_AGENT];
+    harness = createConnectionHarness(mode, (): TestApiOverrides<APIClient> => {
+      const answer = serverAgents;
+      return { agents: { list: () => Promise.resolve(answer) } };
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    globalThis.window = originalWindow;
+    globalThis.document = originalDocument;
+  });
+
+  function renderAgents(workspaceId: string) {
+    const tree = (id: string) => (
+      <harness.Wrapper>
+        <AgentProvider workspaceId={id} projectPath="/tmp/project">
+          <Harness onChange={(value) => (latest = value)} />
+        </AgentProvider>
+      </harness.Wrapper>
+    );
+    const view = render(tree(workspaceId));
+    return { rerender: (id: string) => view.rerender(tree(id)) };
+  }
+
+  test("keeps the shown agents until the reload answers", async () => {
+    renderAgents("ws-a");
+    await waitFor(() => expect(latest?.agents.map((agent) => agent.id)).toEqual(["exec"]));
+
+    let answer: ((agents: AgentDefinitionDescriptor[]) => void) | null = null;
+    serverAgents = new Promise((resolve) => (answer = resolve));
+    await harness.drop();
+    harness.reconnect();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    });
+
+    expect(latest?.loaded).toBe(true);
+    expect(latest?.loadFailed).toBe(false);
+    expect(latest?.agents.map((agent) => agent.id)).toEqual(["exec"]);
+
+    act(() => answer?.([EXEC_AGENT, PLAN_AGENT]));
+    await waitFor(() => expect(latest?.agents.map((agent) => agent.id)).toEqual(["exec", "plan"]));
+  });
+
+  test("a workspace switch while offline clears the shown agents", async () => {
+    const view = renderAgents("ws-a");
+    await waitFor(() => expect(latest?.agents.map((agent) => agent.id)).toEqual(["exec"]));
+
+    await harness.drop();
+    view.rerender("ws-b");
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    });
+    expect(latest?.agents).toEqual([]);
+
+    serverAgents = [PLAN_AGENT];
+    harness.reconnect();
+    await waitFor(() => expect(latest?.agents.map((agent) => agent.id)).toEqual(["plan"]));
   });
 });

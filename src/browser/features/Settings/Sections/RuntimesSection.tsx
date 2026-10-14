@@ -23,11 +23,12 @@ import { useAPI } from "@/browser/contexts/API";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useCoderWorkspace } from "@/browser/hooks/useCoderWorkspace";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useRuntimeEnablement } from "@/browser/hooks/useRuntimeEnablement";
 import {
   readSshOptionDefaults,
   type RuntimeOptionDefaults,
+  updateRuntimeOptionDefaults,
+  useRuntimeOptionDefaults,
   writeSshCoderDefaultsPreservingMode,
 } from "@/browser/utils/runtimeOptionDefaults";
 import {
@@ -37,7 +38,6 @@ import {
 } from "@/browser/utils/runtimeUi";
 import type { CoderWorkspaceConfig } from "@/common/orpc/schemas/coder";
 import { cn } from "@/common/lib/utils";
-import { getLastRuntimeConfigKey } from "@/common/constants/storage";
 import type { ProjectConfig } from "@/common/types/project";
 import { normalizeRuntimeEnablement, RUNTIME_MODE } from "@/common/types/runtime";
 import type {
@@ -257,20 +257,19 @@ export function RuntimesSection() {
   const selectedProjectPath = effectiveScope === ALL_SCOPE_VALUE ? null : effectiveScope;
   const isProjectScope = Boolean(selectedProjectPath);
 
-  // Per-project runtime option defaults (SSH host, Docker image, etc.).
-  // Same localStorage keys the creation flow reads, so edits here are reflected immediately.
-  const runtimeConfigKey = selectedProjectPath
-    ? getLastRuntimeConfigKey(selectedProjectPath)
-    : "__no_project_defaults__";
-  const [runtimeOptionConfigs, setRuntimeOptionConfigs] = usePersistedState<RuntimeOptionDefaults>(
-    runtimeConfigKey,
-    {},
-    { listener: true }
-  );
+  // Per-project runtime option defaults (SSH host, Docker image, etc.), shared with creation.
+  const runtimeOptionConfigs = useRuntimeOptionDefaults(selectedProjectPath);
+  const setRuntimeOptionConfigs = (
+    update: (prev: RuntimeOptionDefaults) => RuntimeOptionDefaults
+  ) => {
+    if (selectedProjectPath) {
+      updateRuntimeOptionDefaults(selectedProjectPath, update);
+    }
+  };
   const sshOptionDefaults = readSshOptionDefaults(runtimeOptionConfigs, "");
 
   // Settings-local Coder draft: absorbs hook auto-selection without persisting.
-  // Only written to localStorage after explicit user interaction.
+  // Only saved to the project defaults after explicit user interaction.
   const [coderDraftConfig, setCoderDraftConfig] = useState<CoderWorkspaceConfig | null>(null);
   const hasCoderUserInteractionRef = useRef(false);
   const selectedProjectPathRef = useRef(selectedProjectPath);
@@ -375,7 +374,7 @@ export function RuntimesSection() {
       // Always update local draft for UI responsiveness.
       setCoderDraftConfig(nextConfig);
 
-      // Only persist to localStorage after explicit user interaction.
+      // Only persist to the project defaults after explicit user interaction.
       if (!hasCoderUserInteractionRef.current) {
         return;
       }

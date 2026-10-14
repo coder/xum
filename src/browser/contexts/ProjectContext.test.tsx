@@ -1,73 +1,34 @@
 import type { ProjectConfig } from "@/node/config";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { copyFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { GlobalWindow } from "happy-dom";
-import { requireTestModule, type RecursivePartial } from "@/browser/testUtils";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
-import type * as APIModule from "./API";
-import type * as ProjectContextModule from "./ProjectContext";
-import type { APIClient } from "./API";
+import {
+  getDraftScopeId,
+  getAutoExpandPrefsKey,
+  getWorkspaceNameStateKey,
+} from "@/common/constants/storage";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { APIProvider, type APIClient } from "./API";
+import { ProjectProvider, useProjectContext, type ProjectContext } from "./ProjectContext";
 
 // Keep the client local to each test instead of using bun's process-global
 // mock.module registry for API, which leaks across context suites.
-let currentClientMock: RecursivePartial<APIClient> = {};
-
-let APIProvider!: typeof APIModule.APIProvider;
-let ProjectProvider!: typeof ProjectContextModule.ProjectProvider;
-let useProjectContext!: typeof ProjectContextModule.useProjectContext;
-let isolatedModuleDir: string | null = null;
-
-const contextsDir = dirname(fileURLToPath(import.meta.url));
-
-// Import unique temp copies of the real modules so leaked Bun mock.module registrations and
-// module cache entries from earlier suites cannot replace the API or ProjectContext implementations.
-async function importIsolatedProjectModules() {
-  const tempDir = await mkdtemp(join(contextsDir, ".project-context-test-"));
-  const isolatedApiPath = join(tempDir, "API.real.tsx");
-  const isolatedProjectContextPath = join(tempDir, "ProjectContext.real.tsx");
-
-  await copyFile(join(contextsDir, "API.tsx"), isolatedApiPath);
-
-  const projectContextSource = await readFile(join(contextsDir, "ProjectContext.tsx"), "utf8");
-  const isolatedProjectContextSource = projectContextSource.replace(
-    'from "@/browser/contexts/API";',
-    'from "./API.real.tsx";'
-  );
-
-  if (isolatedProjectContextSource === projectContextSource) {
-    throw new Error("Failed to rewrite ProjectContext API import for the isolated test copy");
-  }
-
-  await writeFile(isolatedProjectContextPath, isolatedProjectContextSource);
-
-  ({ APIProvider } = requireTestModule<{ APIProvider: typeof APIModule.APIProvider }>(
-    isolatedApiPath
-  ));
-  ({ ProjectProvider, useProjectContext } = requireTestModule<{
-    ProjectProvider: typeof ProjectContextModule.ProjectProvider;
-    useProjectContext: typeof ProjectContextModule.useProjectContext;
-  }>(isolatedProjectContextPath));
-
-  return tempDir;
-}
+let currentClientMock: TestApiOverrides<APIClient> = {};
 
 describe("ProjectContext", () => {
   let originalWindow: typeof globalThis.window;
   let originalDocument: typeof globalThis.document;
   let originalLocalStorage: typeof globalThis.localStorage;
 
-  beforeEach(async () => {
-    isolatedModuleDir = await importIsolatedProjectModules();
-
+  beforeEach(() => {
     originalWindow = globalThis.window;
     originalDocument = globalThis.document;
     originalLocalStorage = globalThis.localStorage;
   });
 
-  afterEach(async () => {
+  afterEach(() => {
     cleanup();
     mock.restore();
 
@@ -76,11 +37,6 @@ describe("ProjectContext", () => {
     globalThis.localStorage = originalLocalStorage;
 
     currentClientMock = {};
-
-    if (isolatedModuleDir) {
-      await rm(isolatedModuleDir, { recursive: true, force: true });
-      isolatedModuleDir = null;
-    }
   });
 
   test("loads projects on mount and supports add/remove mutations", async () => {
@@ -93,7 +49,7 @@ describe("ProjectContext", () => {
       list: () => Promise.resolve(projects),
       remove: ({ projectPath }: { projectPath: string }) => {
         projects = projects.filter(([path]) => path !== projectPath);
-        return Promise.resolve({ success: true as const, data: undefined });
+        return Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } });
       },
       listBranches: () => Promise.resolve({ branches: ["main"], recommendedTrunk: "main" }),
       secrets: {
@@ -124,17 +80,40 @@ describe("ProjectContext", () => {
     expect(ctx().userProjects.has("/alpha")).toBe(false);
   });
 
+  test("removing a project clears the localStorage keys of the drafts the backend deleted", async () => {
+    createMockAPI({
+      list: () => Promise.resolve([["/alpha", { workspaces: [] }]]),
+      remove: () =>
+        Promise.resolve({
+          success: true as const,
+          data: { removedCreationDrafts: [{ projectPath: "/alpha", draftId: "d1" }] },
+        }),
+    });
+    const ctx = await setup();
+    await waitFor(() => expect(ctx().userProjects.size).toBe(1));
+    // The draft list never hydrated in this renderer, so only the backend knows the draft ids.
+    const scopeId = getDraftScopeId("/alpha", "d1");
+    const keys = [getAutoExpandPrefsKey(scopeId), getWorkspaceNameStateKey(scopeId)];
+    for (const key of keys) updatePersistedState(key, "value");
+
+    await act(async () => {
+      await ctx().removeProject("/alpha");
+    });
+    expect(keys.map((key) => readPersistedState<string | null>(key, null))).toEqual([null, null]);
+  });
+
   test("refreshes projects when config changes", async () => {
     let projects: Array<[string, ProjectConfig]> = [["/alpha", { workspaces: [] }]];
     const projectsApi = createMockAPI({
       list: () => Promise.resolve(projects),
     });
-    let triggerConfigChange: (() => void) | null = null;
+    // The shared AppConfigStore subscribes too, so signal every subscriber.
+    const triggerConfigChange: Array<() => void> = [];
     const onConfigChanged = mock(() =>
       Promise.resolve(
         (async function* () {
           await new Promise<void>((resolve) => {
-            triggerConfigChange = resolve;
+            triggerConfigChange.push(resolve);
           });
           yield undefined;
         })()
@@ -143,21 +122,21 @@ describe("ProjectContext", () => {
     currentClientMock = {
       ...currentClientMock,
       config: {
-        onConfigChanged: onConfigChanged as unknown as APIClient["config"]["onConfigChanged"],
+        onConfigChanged,
       },
     };
 
     const ctx = await setup();
 
     await waitFor(() => expect(ctx().userProjects.size).toBe(1));
-    await waitFor(() => expect(triggerConfigChange).not.toBeNull());
+    await waitFor(() => expect(triggerConfigChange.length).toBeGreaterThan(0));
     projects = [
       ["/alpha", { workspaces: [] }],
       ["/beta", { workspaces: [] }],
     ];
 
     act(() => {
-      triggerConfigChange?.();
+      for (const trigger of triggerConfigChange) trigger();
     });
 
     await waitFor(() => expect(ctx().userProjects.size).toBe(2));
@@ -185,7 +164,8 @@ describe("ProjectContext", () => {
           ["/path/to/user-project", { workspaces: [] }],
           [systemProjectPath, { workspaces: [], projectKind: "system" }],
         ]),
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
+      remove: () =>
+        Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } }),
       listBranches: () => Promise.resolve({ branches: ["main"], recommendedTrunk: "main" }),
       secrets: {
         get: () => Promise.resolve([]),
@@ -217,7 +197,8 @@ describe("ProjectContext", () => {
   test("tracks modal and pending workspace creation state", async () => {
     createMockAPI({
       list: () => Promise.resolve([]),
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
+      remove: () =>
+        Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } }),
       listBranches: () => Promise.resolve({ branches: ["main"], recommendedTrunk: "main" }),
       secrets: {
         get: () => Promise.resolve([]),
@@ -245,7 +226,8 @@ describe("ProjectContext", () => {
   test("opens workspace modal and loads branches", async () => {
     createMockAPI({
       list: () => Promise.resolve([]),
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
+      remove: () =>
+        Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } }),
       listBranches: () => Promise.resolve({ branches: ["main", "feat"], recommendedTrunk: "main" }),
       secrets: {
         get: () => Promise.resolve([]),
@@ -277,7 +259,8 @@ describe("ProjectContext", () => {
   test("surfaces branch loading errors inside workspace modal", async () => {
     createMockAPI({
       list: () => Promise.resolve([]),
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
+      remove: () =>
+        Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } }),
       listBranches: () => Promise.reject(new Error("boom")),
       secrets: {
         get: () => Promise.resolve([]),
@@ -302,7 +285,8 @@ describe("ProjectContext", () => {
   test("exposes secrets helpers", async () => {
     const projectsApi = createMockAPI({
       list: () => Promise.resolve([]),
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
+      remove: () =>
+        Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } }),
       listBranches: () => Promise.resolve({ branches: ["main"], recommendedTrunk: "main" }),
       secrets: {
         get: () => Promise.resolve([{ key: "A", value: "1" }]),
@@ -326,7 +310,8 @@ describe("ProjectContext", () => {
   test("updateSecrets handles failure gracefully", async () => {
     const projectsApi = createMockAPI({
       list: () => Promise.resolve([]),
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
+      remove: () =>
+        Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } }),
       listBranches: () => Promise.resolve({ branches: ["main"], recommendedTrunk: "main" }),
       secrets: {
         get: () => Promise.resolve([]),
@@ -347,7 +332,8 @@ describe("ProjectContext", () => {
   test("updateDisplayName calls projects.setDisplayName and refreshes projects", async () => {
     const projectsApi = createMockAPI({
       list: () => Promise.resolve([["/alpha", { workspaces: [] }]]),
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
+      remove: () =>
+        Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } }),
       setDisplayName: () => Promise.resolve(),
       listBranches: () => Promise.resolve({ branches: ["main"], recommendedTrunk: "main" }),
       secrets: {
@@ -380,7 +366,8 @@ describe("ProjectContext", () => {
   test("updateDisplayName returns API errors without refreshing projects", async () => {
     const projectsApi = createMockAPI({
       list: () => Promise.resolve([["/alpha", { workspaces: [] }]]),
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
+      remove: () =>
+        Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } }),
       setDisplayName: () => Promise.reject(new Error("nope")),
       listBranches: () => Promise.resolve({ branches: ["main"], recommendedTrunk: "main" }),
       secrets: {
@@ -407,7 +394,8 @@ describe("ProjectContext", () => {
   test("refreshProjects sets empty map on API error", async () => {
     createMockAPI({
       list: () => Promise.reject(new Error("network failure")),
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
+      remove: () =>
+        Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } }),
       listBranches: () => Promise.resolve({ branches: ["main"], recommendedTrunk: "main" }),
       secrets: {
         get: () => Promise.resolve([]),
@@ -511,10 +499,10 @@ describe("ProjectContext", () => {
       const oldRequest = Promise.withResolvers<Array<[string, ProjectConfig]>>();
       const newRequest = Promise.withResolvers<Array<[string, ProjectConfig]>>();
       const oldApi = createMockAPI({ list: () => oldRequest.promise });
-      const oldClient = currentClientMock as APIClient;
+      const oldClient = createTestApiClient(currentClientMock);
       const newList = mock(() => newRequest.promise);
       const newClient = { ...oldClient, projects: { ...oldClient.projects, list: newList } };
-      let context: ProjectContextModule.ProjectContext | null = null;
+      let context: ProjectContext | null = null;
       function Capture() {
         context = useProjectContext();
         return null;
@@ -560,7 +548,8 @@ describe("ProjectContext", () => {
   test("getBranchesForProject sanitizes malformed branch data", async () => {
     createMockAPI({
       list: () => Promise.resolve([]),
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
+      remove: () =>
+        Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } }),
       listBranches: () =>
         Promise.resolve({
           branches: ["main", 123, null, "dev", undefined, { name: "feat" }] as unknown as string[],
@@ -583,7 +572,8 @@ describe("ProjectContext", () => {
   test("getBranchesForProject handles non-array branches", async () => {
     createMockAPI({
       list: () => Promise.resolve([]),
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
+      remove: () =>
+        Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } }),
       listBranches: () =>
         Promise.resolve({
           branches: null as unknown as string[],
@@ -605,7 +595,8 @@ describe("ProjectContext", () => {
   test("getBranchesForProject falls back when recommendedTrunk not in branches", async () => {
     createMockAPI({
       list: () => Promise.resolve([]),
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
+      remove: () =>
+        Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } }),
       listBranches: () =>
         Promise.resolve({
           branches: ["main", "dev"],
@@ -637,7 +628,8 @@ describe("ProjectContext", () => {
 
     createMockAPI({
       list: () => Promise.resolve([]),
-      remove: () => Promise.resolve({ success: true as const, data: undefined }),
+      remove: () =>
+        Promise.resolve({ success: true as const, data: { removedCreationDrafts: [] } }),
       listBranches: ({ projectPath }: { projectPath: string }) => {
         if (projectPath === "/project-a") {
           return projectAPromise;
@@ -749,13 +741,13 @@ describe("ProjectContext", () => {
 });
 
 async function setup() {
-  const contextRef = { current: null as ProjectContextModule.ProjectContext | null };
+  const contextRef = { current: null as ProjectContext | null };
   function ContextCapture() {
     contextRef.current = useProjectContext();
     return null;
   }
   render(
-    <APIProvider client={currentClientMock as APIClient}>
+    <APIProvider client={createTestApiClient(currentClientMock)}>
       <ProjectProvider>
         <ContextCapture />
       </ProjectProvider>
@@ -765,7 +757,7 @@ async function setup() {
   return () => contextRef.current!;
 }
 
-function createMockAPI(overrides: RecursivePartial<APIClient["projects"]>) {
+function createMockAPI(overrides: TestApiOverrides<APIClient["projects"]>) {
   const projects = {
     create: mock(
       overrides.create ??
@@ -784,7 +776,7 @@ function createMockAPI(overrides: RecursivePartial<APIClient["projects"]>) {
         (() =>
           Promise.resolve({
             success: true as const,
-            data: undefined,
+            data: { removedCreationDrafts: [] },
           }))
     ),
     setDisplayName: mock(overrides.setDisplayName ?? (() => Promise.resolve())),
@@ -804,8 +796,8 @@ function createMockAPI(overrides: RecursivePartial<APIClient["projects"]>) {
 
   // Update the global mock
   currentClientMock = {
-    projects: projects as unknown as RecursivePartial<APIClient["projects"]>,
-    secrets: projects.secrets as unknown as RecursivePartial<APIClient["secrets"]>,
+    projects: projects as unknown as TestApiOverrides<APIClient["projects"]>,
+    secrets: projects.secrets as unknown as TestApiOverrides<APIClient["secrets"]>,
   };
 
   globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;

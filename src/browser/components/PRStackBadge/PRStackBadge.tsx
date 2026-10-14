@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { createPortal } from "react-dom";
 import {
   AlertCircle,
   Check,
@@ -111,6 +112,8 @@ export function PRStackBadge(props: PRStackBadgeProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [menuStyle, setMenuStyle] = useState<CSSProperties>();
   const containerRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   const menuDirection = props.menuDirection ?? "down";
 
   const toggleMenu = () => {
@@ -145,14 +148,32 @@ export function PRStackBadge(props: PRStackBadgeProps) {
       return;
     }
 
+    // The portal puts the menu last in the Tab order instead of right after the trigger.
+    menuRef.current
+      ?.querySelector<HTMLElement>("a[role='menuitem']")
+      ?.focus({ preventScroll: true });
+
     const handleClickOutside = (event: MouseEvent) => {
-      if (!containerRef.current?.contains(event.target as Node)) {
+      const target = event.target as Node;
+      if (!containerRef.current?.contains(target) && !menuRef.current?.contains(target)) {
+        setIsOpen(false);
+      }
+    };
+
+    // The header and footer hide their trigger with CSS at some widths, and that no longer
+    // hides the portaled menu with it.
+    const handleResize = () => {
+      if (triggerRef.current?.getClientRects().length === 0) {
         setIsOpen(false);
       }
     };
 
     document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
+    window.addEventListener("resize", handleResize);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+      window.removeEventListener("resize", handleResize);
+    };
   }, [isOpen]);
 
   return (
@@ -164,10 +185,12 @@ export function PRStackBadge(props: PRStackBadgeProps) {
           event.preventDefault();
           stopKeyboardPropagation(event);
           setIsOpen(false);
+          triggerRef.current?.focus();
         }
       }}
     >
       <Button
+        ref={triggerRef}
         type="button"
         variant="ghost"
         size="sm"
@@ -182,33 +205,38 @@ export function PRStackBadge(props: PRStackBadgeProps) {
         {isOpen ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
       </Button>
 
-      {isOpen && (
-        <div
-          role="menu"
-          aria-label="Pull request stack"
-          className="bg-surface-primary border-border-light fixed z-[1020] max-w-[calc(100vw-1rem)] overflow-hidden rounded-md border shadow-lg"
-          style={menuStyle}
-        >
-          <div className="max-h-80 overflow-y-auto py-1">
-            {[...props.stack.branches].reverse().map((branch) => (
-              <StackBranchRow
-                key={branch.branch}
-                branch={branch}
-                onNavigate={() => setIsOpen(false)}
-              />
-            ))}
-            <div
-              role="menuitem"
-              aria-disabled="true"
-              data-testid="stack-trunk-row"
-              className="text-muted border-border-light flex items-center gap-2 border-t px-3 py-2 text-xs"
-            >
-              <GitBranch className="h-3.5 w-3.5 shrink-0" />
-              <span className="min-w-0 truncate">{props.stack.trunk}</span>
+      {isOpen &&
+        // Portaled because `fixed` does not escape the footer row's edge-fade mask, which hides
+        // and stops clicks on anything the row paints outside its own box.
+        createPortal(
+          <div
+            ref={menuRef}
+            role="menu"
+            aria-label="Pull request stack"
+            className="bg-surface-primary border-border-light fixed z-[1020] max-w-[calc(100vw-1rem)] overflow-hidden rounded-md border shadow-lg"
+            style={menuStyle}
+          >
+            <div className="max-h-80 overflow-y-auto py-1">
+              {[...props.stack.branches].reverse().map((branch) => (
+                <StackBranchRow
+                  key={branch.branch}
+                  branch={branch}
+                  onNavigate={() => setIsOpen(false)}
+                />
+              ))}
+              <div
+                role="menuitem"
+                aria-disabled="true"
+                data-testid="stack-trunk-row"
+                className="text-muted border-border-light flex items-center gap-2 border-t px-3 py-2 text-xs"
+              >
+                <GitBranch className="h-3.5 w-3.5 shrink-0" />
+                <span className="min-w-0 truncate">{props.stack.trunk}</span>
+              </div>
             </div>
-          </div>
-        </div>
-      )}
+          </div>,
+          document.body
+        )}
     </div>
   );
 }

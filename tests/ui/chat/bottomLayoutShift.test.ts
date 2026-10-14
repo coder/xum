@@ -28,7 +28,7 @@ async function waitForBashScriptSpan(
       );
       const span = matches[matches.length - 1];
       if (!span) throw new Error(`Bash script span "${script}" not found yet`);
-      return span as HTMLSpanElement;
+      return span;
     },
     { timeout: 10_000 }
   );
@@ -36,7 +36,7 @@ async function waitForBashScriptSpan(
 
 function getMessageWindow(container: HTMLElement): HTMLDivElement {
   const element = container.querySelector('[data-testid="message-window"]');
-  if (!element || element.tagName !== "DIV") {
+  if (element?.tagName !== "DIV") {
     throw new Error("Message window not found");
   }
   return element as HTMLDivElement;
@@ -97,9 +97,7 @@ describe("Chat bottom layout stability", () => {
 
       const idleRow = await waitFor(
         () => {
-          const row = app.view.container.querySelector(
-            `[data-workspace-id="${idleWorkspaceId}"]`
-          ) as HTMLElement | null;
+          const row = app.view.container.querySelector(`[data-workspace-id="${idleWorkspaceId}"]`);
           if (!row) {
             throw new Error("Idle workspace row not rendered");
           }
@@ -118,9 +116,7 @@ describe("Chat bottom layout stability", () => {
 
       const sourceRow = await waitFor(
         () => {
-          const row = app.view.container.querySelector(
-            `[data-workspace-id="${app.workspaceId}"]`
-          ) as HTMLElement | null;
+          const row = app.view.container.querySelector(`[data-workspace-id="${app.workspaceId}"]`);
           if (!row) {
             throw new Error("Source workspace row not rendered");
           }

@@ -3,6 +3,7 @@ import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import type { TurnCoordinator } from "./turnCoordinator";
 import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { EventEmitter } from "events";
 import * as fsPromises from "fs/promises";
 import path from "path";
@@ -12,14 +13,21 @@ import {
   type AgentSessionAIService,
 } from "./agentSession";
 import {
+  createAgentSessionAIServiceFake,
   createAgentSessionHarness,
+  createFailedTurnHandle,
   createStartedTurnHandle,
-  createTestAgentSession,
+  createStreamLifecycleMocks,
   seedAutoCompactionThreshold,
 } from "./agentSession.testHarness";
+import { makeTestEffectRunner, type TestEffectRunner } from "./di/testEffectRunner";
+import { Duration } from "effect";
 import { createTestHistoryService } from "./testHistoryService";
+import { createContextBudgetWarning } from "./contextWindowRollover";
+import { waitForCondition } from "./testDispatchHelpers";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { HistoryService } from "./historyService";
+import type { WorkspaceGoalService } from "./workspaceGoalService";
 import type { Config } from "@/node/config";
 import type { InitStateManager } from "./initStateManager";
 import type { WorkspaceChatMessage, SendMessageOptions } from "@/common/orpc/types";
@@ -31,9 +39,10 @@ import {
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { Err, Ok } from "@/common/types/result";
-import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
+import { GOAL_CONTINUATION_KIND, type TaskTurnKind } from "@/constants/goals";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import type { StreamErrorType } from "@/common/types/errors";
 
 interface AutoRetryResumeRequest {
   options: SendMessageOptions;
@@ -44,14 +53,6 @@ interface AutoRetryResumeRequest {
 interface RetryableSessionForTests {
   retryActiveStream: () => Promise<void>;
   lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
-  resumeStream: (options: SendMessageOptions) => Promise<
-    | { success: true; data: { started: boolean } }
-    | {
-        success: false;
-        error: { type: "runtime_start_failed"; message: string };
-        failureHandled?: true;
-      }
-  >;
 }
 
 interface SessionBundle {
@@ -67,7 +68,15 @@ interface SessionBundle {
 
 async function createSessionBundle(
   workspaceId: string,
-  aiServiceOverrides?: Partial<AgentSessionAIService>
+  aiServiceOverrides?: Partial<AgentSessionAIService>,
+  options?: {
+    /**
+     * Runs the retry backoff on virtual time: the session schedules its RetryManager on the
+     * stream manager's runner, so a test fires a scheduled retry with `fireScheduledRetry`.
+     */
+    clock?: TestEffectRunner;
+    workspaceGoalService?: WorkspaceGoalService;
+  }
 ): Promise<SessionBundle> {
   const workspaceMetadata: WorkspaceMetadata = {
     id: workspaceId,
@@ -92,7 +101,99 @@ async function createSessionBundle(
     initStateManagerOverrides: {
       replayInit: mock(() => Promise.resolve()),
     },
+    ...(options?.clock
+      ? { streamManager: { ...createStreamLifecycleMocks(), effectRunner: options.clock.runner } }
+      : {}),
     captureEvents: true,
+    workspaceGoalService: options?.workspaceGoalService,
+  });
+}
+
+/** Advances virtual time past the latest scheduled backoff, firing that retry. */
+async function fireScheduledRetry(
+  clock: TestEffectRunner,
+  events: WorkspaceChatMessage[]
+): Promise<void> {
+  const scheduled = events.findLast(
+    (event): event is Extract<WorkspaceChatMessage, { type: "auto-retry-scheduled" }> =>
+      event.type === "auto-retry-scheduled"
+  );
+  if (!scheduled) throw new Error("Expected a scheduled auto-retry to fire");
+  await clock.adjust(Duration.millis(scheduled.delayMs));
+}
+
+let failedTurnCount = 0;
+
+/**
+ * Runs one turn whose stream fails with `errorType`. A non-retryable failure persists the
+ * startup abandon marker for the turn's user row through the session's real writer.
+ */
+async function failTurnWith(
+  session: AgentSession,
+  aiService: AgentSessionAIService,
+  errorType: StreamErrorType
+): Promise<void> {
+  failedTurnCount += 1;
+  const messageId = `assistant-failed-${failedTurnCount}`;
+  const stream = spyOn(aiService, "streamMessage").mockResolvedValueOnce(
+    Ok(createFailedTurnHandle(messageId, { error: `${errorType} failure`, errorType }))
+  );
+  try {
+    const result = await session.sendMessage("Interrupted prompt", {
+      model: "anthropic:claude-sonnet-4-5",
+      agentId: "exec",
+    });
+    expect(result.success).toBe(true);
+    // The failed turn settles only after its terminal policy (including the marker write) ran.
+    await session.waitForIdle();
+  } finally {
+    stream.mockRestore();
+  }
+}
+
+/** Stream starts that fail as retryable runtime errors, the way a cold runtime refuses them. */
+function failingStreamStart(): Partial<AgentSessionAIService> {
+  return {
+    streamMessage: mock(() =>
+      Promise.resolve(Err({ type: "runtime_start_failed" as const, message: "startup failed" }))
+    ),
+  };
+}
+
+/**
+ * Sends a turn whose stream start fails, which arms the auto-retry of that send through the
+ * public path (retry envelope + scheduled backoff) instead of seeding private retry state.
+ */
+async function sendIntoScheduledRetry(
+  session: AgentSession,
+  events: WorkspaceChatMessage[]
+): Promise<void> {
+  const sendResult = await session.sendMessage("hello", {
+    model: "anthropic:claude-sonnet-4-5",
+    agentId: "exec",
+  });
+  expect(sendResult.success).toBe(false);
+  expect(events.filter((event) => event.type === "auto-retry-scheduled")).toHaveLength(1);
+}
+
+/** The durable auto-retry preference file that a restarted session reads. */
+function autoRetryPreferencePath(config: Config, workspaceId: string): string {
+  return path.join(config.sessionsDir, workspaceId, "auto-retry-preference.json");
+}
+
+/**
+ * A Token Budget warning row as the token-budget strategy publishes it. #5286 appends it after
+ * the turn's user row; it is a notice, never the request that recovery must replay or match.
+ */
+function tokenBudgetWarning(): MuxMessage {
+  return createContextBudgetWarning({
+    contextTokens: 90_000,
+    maxTokens: 128_000,
+    budgetTokens: 119_808,
+    sessionHistoryAvailable: true,
+    handoff: true,
+    handoffTokens: 89_600,
+    newContextAvailable: true,
   });
 }
 
@@ -108,10 +209,117 @@ describe("AgentSession startup auto-retry recovery", () => {
     }
   });
 
+  test.each(["user tail", "assistant partial", "compaction follow-up"] as const)(
+    "side chats do not automatically recover an inherited %s",
+    async (tail) => {
+      const workspaceId = "side-startup-recovery";
+      const metadata: WorkspaceMetadata = {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath: "/tmp/project",
+        runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+        sideChatParentWorkspaceId: "main",
+      };
+      const clock = makeTestEffectRunner();
+      const { session, historyService, events, aiService, cleanup } = await createSessionBundle(
+        workspaceId,
+        { getWorkspaceMetadata: mock(() => Promise.resolve(Ok(metadata))) },
+        { clock }
+      );
+      const stream = spyOn(aiService, "streamMessage");
+      cleanups.push(
+        () => clock.dispose(),
+        async () => {
+          await cleanup();
+          stream.mockRestore();
+        }
+      );
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("inherited-user", "user", "Continue main work")
+      );
+      if (tail === "assistant partial") {
+        await historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("partial", "assistant", "Working", { partial: true })
+        );
+      } else if (tail === "compaction follow-up") {
+        await historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("summary", "assistant", "Summary", {
+            muxMetadata: {
+              type: "compaction-summary",
+              pendingFollowUp: {
+                text: "Continue main work",
+                model: "openai:gpt-4o",
+                agentId: "exec",
+              },
+            },
+          })
+        );
+      }
+      const before = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      await session.runStartupRecovery(metadata);
+      await session.ensureStartupAutoRetryCheck();
+
+      expect(events.filter((event) => event.type === "auto-retry-scheduled")).toHaveLength(0);
+      expect(stream).not.toHaveBeenCalled();
+      expect(await historyService.getHistoryFromLatestBoundary(workspaceId)).toEqual(before);
+    }
+  );
+
+  test.each(["send", "retry"] as const)(
+    "a side chat still accepts an explicit user %s",
+    async (action) => {
+      const workspaceId = "explicit-side-turn";
+      const { session, historyService, aiService, cleanup } = await createSessionBundle(
+        workspaceId,
+        {
+          getWorkspaceMetadata: mock(() =>
+            Promise.resolve(
+              Ok({
+                id: workspaceId,
+                name: workspaceId,
+                projectName: "project",
+                projectPath: "/tmp/project",
+                runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+                sideChatParentWorkspaceId: "main",
+              })
+            )
+          ),
+        }
+      );
+      const stream = spyOn(aiService, "streamMessage");
+      cleanups.push(async () => {
+        await cleanup();
+        stream.mockRestore();
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("side-user", "user", "Explain this")
+      );
+      await session.ensureStartupAutoRetryCheck();
+      expect(stream).not.toHaveBeenCalled();
+      const options = { model: "anthropic:claude-sonnet-4-5", agentId: "exec" };
+      const result =
+        action === "send"
+          ? await session.sendMessage("Explain another thing", options)
+          : await session.resumeStream(options);
+      expect(result.success).toBe(true);
+      expect(stream).toHaveBeenCalledTimes(1);
+    }
+  );
+
   test("schedules startup auto-retry for interrupted user tail", async () => {
     const workspaceId = "startup-retry-user-tail";
-    const { session, historyService, events, cleanup } = await createSessionBundle(workspaceId);
-    cleanups.push(cleanup);
+    const clock = makeTestEffectRunner();
+    const { session, historyService, events, cleanup } = await createSessionBundle(
+      workspaceId,
+      undefined,
+      { clock }
+    );
+    cleanups.push(() => clock.dispose(), cleanup);
 
     const appendResult = await historyService.appendToHistory(
       workspaceId,
@@ -138,15 +346,11 @@ describe("AgentSession startup auto-retry recovery", () => {
     const scheduledEvent = events.find((event) => event.type === "auto-retry-scheduled");
     expect(scheduledEvent).toBeDefined();
 
-    const retryOptions = (
-      session as unknown as {
-        lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
-      }
-    ).lastAutoRetryResumeRequest;
-    expect(retryOptions).toBeDefined();
-    if (!retryOptions) {
-      throw new Error("Expected startup auto-retry options to be captured");
-    }
+    // The scheduled retry resumes with the options recovered from the interrupted user row.
+    const resumeStream = spyOn(session, "resumeStream").mockResolvedValue(Ok({ started: true }));
+    await fireScheduledRetry(clock, events);
+    expect(resumeStream).toHaveBeenCalledTimes(1);
+    const retryOptions = { options: resumeStream.mock.calls[0][0] };
     expect(retryOptions.options.model).toBe("anthropic:claude-sonnet-4-5");
     expect(retryOptions.options.agentId).toBe(WORKSPACE_DEFAULTS.agentId);
     expect(retryOptions.options.toolPolicy).toEqual([{ regex_match: ".*", action: "disable" }]);
@@ -198,19 +402,58 @@ describe("AgentSession startup auto-retry recovery", () => {
     await session.dispose();
   });
 
+  test.each(["preparing", "streaming"] as const)(
+    "auto-retry retains a chat speed pick made while %s",
+    async (phase) => {
+      const clock = makeTestEffectRunner();
+      const { session, aiService, events, cleanup } = await createSessionBundle(
+        `speed-retry-${phase}`,
+        undefined,
+        { clock }
+      );
+      cleanups.push(() => clock.dispose(), cleanup);
+      spyOn(aiService, "streamMessage").mockImplementation(() => {
+        if (phase === "streaming") {
+          expect(session.setActiveTurnServiceTier("priority")).toEqual({ accepted: true });
+        }
+        return Promise.resolve(
+          Err({ type: "runtime_start_failed", message: "retry this request" })
+        );
+      });
+      const result = await session.sendMessage(
+        "continue",
+        { model: "openai:gpt-6-astra", agentId: "exec", serviceTier: "default" },
+        {
+          onAccepted: () => {
+            if (phase === "preparing") {
+              expect(session.setActiveTurnServiceTier("priority")).toEqual({ accepted: true });
+            }
+          },
+        }
+      );
+      expect(result.success).toBe(false);
+      const resume = spyOn(session, "resumeStream").mockResolvedValue(Ok({ started: true }));
+      await fireScheduledRetry(clock, events);
+      expect(resume).toHaveBeenCalledTimes(1);
+      expect(resume.mock.calls[0][0].serviceTier).toBe("priority");
+      await session.dispose();
+    }
+  );
+
   test("auto-retry abandons instead of resuming once the workspace is archived on disk", async () => {
     const workspaceId = "startup-retry-archived-before-timer";
-    const { session, config, events, cleanup } = await createSessionBundle(workspaceId);
-    cleanups.push(cleanup);
-
-    const privateSession = session as unknown as RetryableSessionForTests;
-    privateSession.lastAutoRetryResumeRequest = {
-      options: { model: "anthropic:claude-sonnet-4-5", agentId: "exec" },
-    };
-    const resumeStreamMock = mock((_options: SendMessageOptions) =>
-      Promise.resolve({ success: true as const, data: { started: true } })
+    const clock = makeTestEffectRunner();
+    const { session, config, events, cleanup } = await createSessionBundle(
+      workspaceId,
+      failingStreamStart(),
+      { clock }
     );
-    privateSession.resumeStream = resumeStreamMock;
+    cleanups.push(() => clock.dispose(), cleanup);
+
+    await sendIntoScheduledRetry(session, events);
+    const resumeStreamMock = spyOn(session, "resumeStream").mockResolvedValue(
+      Ok({ started: true })
+    );
 
     // The archive lands during the backoff countdown; only the durable state can stop the timer.
     await config.editConfig((cfg) => {
@@ -227,7 +470,7 @@ describe("AgentSession startup auto-retry recovery", () => {
       return cfg;
     });
 
-    await privateSession.retryActiveStream();
+    await fireScheduledRetry(clock, events);
 
     expect(resumeStreamMock).not.toHaveBeenCalled();
     const abandonedReasons = events
@@ -243,11 +486,11 @@ describe("AgentSession startup auto-retry recovery", () => {
 
   test("beginShutdown cancels the pending retry and stops re-arming or streaming", async () => {
     const workspaceId = "startup-retry-shutdown";
-    const streamMessage = mock(() =>
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() =>
       Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal, "assistant-1")))
     );
     const { session, historyService, events, cleanup } = await createSessionBundle(workspaceId, {
-      streamMessage: streamMessage as unknown as AgentSessionAIService["streamMessage"],
+      streamMessage,
     });
     cleanups.push(cleanup);
 
@@ -284,11 +527,11 @@ describe("AgentSession startup auto-retry recovery", () => {
     "beginShutdown inside the %s await preserves only accepted user input",
     async (window) => {
       const workspaceId = `startup-retry-shutdown-mid-${window}`;
-      const streamMessage = mock(() =>
+      const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() =>
         Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal, "assistant-1")))
       );
       const { session, historyService, cleanup } = await createSessionBundle(workspaceId, {
-        streamMessage: streamMessage as unknown as AgentSessionAIService["streamMessage"],
+        streamMessage,
       });
       cleanups.push(cleanup);
       const seeded = [
@@ -344,11 +587,11 @@ describe("AgentSession startup auto-retry recovery", () => {
     "beginShutdown inside an edit's %s await keeps the replacement row after truncation",
     async (window) => {
       const workspaceId = `startup-retry-shutdown-edit-${window}`;
-      const streamMessage = mock(() =>
+      const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() =>
         Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal, "assistant-1")))
       );
       const { session, historyService, cleanup } = await createSessionBundle(workspaceId, {
-        streamMessage: streamMessage as unknown as AgentSessionAIService["streamMessage"],
+        streamMessage,
       });
       cleanups.push(cleanup);
       for (const [id, role, text] of [
@@ -402,11 +645,11 @@ describe("AgentSession startup auto-retry recovery", () => {
 
   test("beginShutdown during pre-stream awaits stops the stream before the provider", async () => {
     const workspaceId = "startup-retry-shutdown-mid-prepare";
-    const streamMessage = mock(() =>
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() =>
       Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal, "assistant-1")))
     );
     const { session, historyService, cleanup } = await createSessionBundle(workspaceId, {
-      streamMessage: streamMessage as unknown as AgentSessionAIService["streamMessage"],
+      streamMessage,
     });
     cleanups.push(cleanup);
 
@@ -496,6 +739,117 @@ describe("AgentSession startup auto-retry recovery", () => {
     await session.dispose();
   });
 
+  describe("partials of turns the provider finished (#5322)", () => {
+    /** User row plus the turn's assistant row (the empty placeholder unless `row` is given). */
+    async function seedTurn(
+      historyService: HistoryService,
+      workspaceId: string,
+      row?: MuxMessage["parts"]
+    ) {
+      const user = createMuxMessage("user-1", "user", "Question", { timestamp: Date.now() });
+      expect((await historyService.appendToHistory(workspaceId, user)).success).toBe(true);
+      const assistant = { ...createMuxMessage("assistant-1", "assistant", ""), parts: row ?? [] };
+      expect((await historyService.appendToHistory(workspaceId, assistant)).success).toBe(true);
+      return assistant.metadata?.historySequence;
+    }
+
+    async function writeKeptPartial(
+      historyService: HistoryService,
+      workspaceId: string,
+      historySequence: number | undefined,
+      metadata: Record<string, unknown> = {}
+    ) {
+      const partial = createMuxMessage("assistant-1", "assistant", "Final answer", {
+        historySequence,
+        ...metadata,
+      });
+      expect((await historyService.writePartial(workspaceId, partial)).success).toBe(true);
+    }
+
+    async function assistantRow(historyService: HistoryService, workspaceId: string) {
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      return history.data.find((message) => message.id === "assistant-1");
+    }
+
+    test("a finalized partial after a failed final write is committed, not retried", async () => {
+      const workspaceId = "startup-finalized-partial";
+      const { session, historyService, events, cleanup } = await createSessionBundle(workspaceId);
+      cleanups.push(cleanup);
+      const sequence = await seedTurn(historyService, workspaceId);
+      await writeKeptPartial(historyService, workspaceId, sequence, { streamFinalized: true });
+
+      await session.ensureStartupAutoRetryCheck();
+
+      expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+      expect(await historyService.readPartial(workspaceId)).toBeNull();
+      const row = await assistantRow(historyService, workspaceId);
+      expect(row?.parts).toMatchObject([{ type: "text", text: "Final answer" }]);
+      expect(row?.metadata?.partial).toBeUndefined();
+      await session.dispose();
+    });
+
+    test("a stale partial left after the final row was written is discarded, not retried", async () => {
+      const workspaceId = "startup-stale-partial";
+      const { session, historyService, events, cleanup } = await createSessionBundle(workspaceId);
+      cleanups.push(cleanup);
+      const sequence = await seedTurn(historyService, workspaceId, [
+        { type: "text", text: "Final answer" },
+      ]);
+      await writeKeptPartial(historyService, workspaceId, sequence);
+
+      await session.ensureStartupAutoRetryCheck();
+
+      expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+      expect(await historyService.readPartial(workspaceId)).toBeNull();
+      expect((await assistantRow(historyService, workspaceId))?.metadata?.partial).toBeUndefined();
+      await session.dispose();
+    });
+
+    // Settling can fail too (another lock timeout); the goal crash-recovery gate must still not
+    // pause an active goal for a reply the provider finished.
+    test.each([
+      { name: "a finalized partial whose settling failed", finalized: true, gated: false },
+      { name: "an interrupted partial", finalized: false, gated: true },
+    ])("goal crash-recovery gate: $name", async ({ finalized, gated }) => {
+      const workspaceId = `startup-goal-gate-${finalized}`;
+      const requireAck = mock(() => Promise.resolve());
+      const goals = {
+        requireUserAcknowledgmentForCrashRecovery: requireAck,
+        recoverPendingDispatchAfterRestart: mock(() => Promise.resolve()),
+      } as unknown as WorkspaceGoalService;
+      const { session, historyService, cleanup } = await createSessionBundle(
+        workspaceId,
+        undefined,
+        { workspaceGoalService: goals }
+      );
+      cleanups.push(cleanup);
+      const sequence = await seedTurn(historyService, workspaceId);
+      await writeKeptPartial(historyService, workspaceId, sequence, {
+        streamFinalized: finalized,
+      });
+      spyOn(historyService, "commitPartial").mockResolvedValueOnce(Err("history lock timeout"));
+
+      await session.ensureStartupAutoRetryCheck();
+
+      expect(requireAck).toHaveBeenCalledTimes(gated ? 1 : 0);
+      await session.dispose();
+    });
+
+    test("a malformed flag keeps the interrupted-turn retry", async () => {
+      const workspaceId = "startup-malformed-finalized-flag";
+      const { session, historyService, events, cleanup } = await createSessionBundle(workspaceId);
+      cleanups.push(cleanup);
+      const sequence = await seedTurn(historyService, workspaceId);
+      await writeKeptPartial(historyService, workspaceId, sequence, { streamFinalized: "yes" });
+
+      await session.ensureStartupAutoRetryCheck();
+
+      expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(true);
+      await session.dispose();
+    });
+  });
+
   test("hidden completed subagent reports preserve the existing startup retry fallback", async () => {
     const workspaceId = "startup-retry-hidden-subagent-report";
     const { session, historyService, events, cleanup } = await createSessionBundle(workspaceId);
@@ -531,8 +885,13 @@ describe("AgentSession startup auto-retry recovery", () => {
 
   test("startup auto-retry reuses workspace-turn metadata from the retry user message", async () => {
     const workspaceId = "startup-retry-workspace-turn-metadata";
-    const { session, historyService, aiService, cleanup } = await createSessionBundle(workspaceId);
-    cleanups.push(cleanup);
+    const clock = makeTestEffectRunner();
+    const { session, historyService, aiService, events, cleanup } = await createSessionBundle(
+      workspaceId,
+      undefined,
+      { clock }
+    );
+    cleanups.push(() => clock.dispose(), cleanup);
     const muxMetadata = {
       type: "workspace-turn-task" as const,
       taskHandleId: "wst_handle",
@@ -548,23 +907,18 @@ describe("AgentSession startup auto-retry recovery", () => {
       })
     );
     expect(appendResult.success).toBe(true);
-    const streamMessageMock = mock(
-      (_payload: Parameters<AgentSessionAIService["streamMessage"]>[0]) =>
-        Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
-    );
-    aiService.streamMessage =
-      streamMessageMock as unknown as AgentSessionAIService["streamMessage"];
-    const privateSession = session as unknown as {
-      retryActiveStream: () => Promise<void>;
-
-      lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
-    };
+    const streamed = Promise.withResolvers<void>();
+    const streamMessageMock = mock<AgentSessionAIService["streamMessage"]>(() => {
+      streamed.resolve();
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
+    });
+    aiService.streamMessage = streamMessageMock;
 
     await session.ensureStartupAutoRetryCheck();
-    expect(privateSession.lastAutoRetryResumeRequest?.options.muxMetadata).toEqual(muxMetadata);
+    await fireScheduledRetry(clock, events);
+    await streamed.promise;
 
-    await privateSession.retryActiveStream();
-
+    // The recovered envelope's metadata reaches the provider request itself.
     expect(streamMessageMock).toHaveBeenCalledTimes(1);
     expect(streamMessageMock.mock.calls[0]?.[0]).toMatchObject({ muxMetadata });
 
@@ -578,9 +932,13 @@ describe("AgentSession startup auto-retry recovery", () => {
     "startup recovery resumes with the %s and no frontend push",
     async (_label, fixture, rolloverAvailable) => {
       const workspaceId = "startup-retry-persisted-threshold";
-      const { session, config, historyService, aiService, cleanup } =
-        await createSessionBundle(workspaceId);
-      cleanups.push(cleanup);
+      const clock = makeTestEffectRunner();
+      const { session, config, historyService, aiService, events, cleanup } =
+        await createSessionBundle(workspaceId, undefined, { clock });
+      cleanups.push(() => clock.dispose(), cleanup);
+      spyOn(aiService, "isExperimentEnabled").mockImplementation(
+        (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET || id === EXPERIMENT_IDS.MEMORY
+      );
       const model = "openai:gpt-4o";
       if ("seed" in fixture) {
         await seedAutoCompactionThreshold(config, model, fixture.seed);
@@ -608,21 +966,20 @@ describe("AgentSession startup auto-retry recovery", () => {
           retrySendOptions: pickStartupRetrySendOptions({
             model,
             agentId: "exec",
-            experiments: { tokenBudget: true },
           }),
         })
       );
       expect(appendResult.success).toBe(true);
-      const streamMessageMock = mock(
-        (_payload: Parameters<AgentSessionAIService["streamMessage"]>[0]) =>
-          Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
-      );
-      aiService.streamMessage =
-        streamMessageMock as unknown as AgentSessionAIService["streamMessage"];
-      const privateSession = session as unknown as { retryActiveStream: () => Promise<void> };
+      const streamed = Promise.withResolvers<void>();
+      const streamMessageMock = mock<AgentSessionAIService["streamMessage"]>(() => {
+        streamed.resolve();
+        return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
+      });
+      aiService.streamMessage = streamMessageMock;
 
       await session.ensureStartupAutoRetryCheck();
-      await privateSession.retryActiveStream();
+      await fireScheduledRetry(clock, events);
+      await streamed.promise;
 
       // The resumed request's rollover gate reads the persisted per-model threshold directly;
       // no RPC could have pushed a slider value before recovery ran.
@@ -637,8 +994,13 @@ describe("AgentSession startup auto-retry recovery", () => {
 
   test("startup auto-retry does not stamp workflow-result metadata on assistant streams", async () => {
     const workspaceId = "startup-retry-workflow-result-metadata";
-    const { session, historyService, aiService, cleanup } = await createSessionBundle(workspaceId);
-    cleanups.push(cleanup);
+    const clock = makeTestEffectRunner();
+    const { session, historyService, aiService, events, cleanup } = await createSessionBundle(
+      workspaceId,
+      undefined,
+      { clock }
+    );
+    cleanups.push(() => clock.dispose(), cleanup);
     const workflowMetadata = {
       type: "workflow-result" as const,
       rawCommand: "/deep-research mux",
@@ -657,18 +1019,16 @@ describe("AgentSession startup auto-retry recovery", () => {
       })
     );
     expect(appendResult.success).toBe(true);
-    const streamMessageMock = mock(
-      (_payload: Parameters<AgentSessionAIService["streamMessage"]>[0]) =>
-        Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
-    );
-    aiService.streamMessage =
-      streamMessageMock as unknown as AgentSessionAIService["streamMessage"];
-    const privateSession = session as unknown as {
-      retryActiveStream: () => Promise<void>;
-    };
+    const streamed = Promise.withResolvers<void>();
+    const streamMessageMock = mock<AgentSessionAIService["streamMessage"]>(() => {
+      streamed.resolve();
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
+    });
+    aiService.streamMessage = streamMessageMock;
 
     await session.ensureStartupAutoRetryCheck();
-    await privateSession.retryActiveStream();
+    await fireScheduledRetry(clock, events);
+    await streamed.promise;
 
     expect(streamMessageMock).toHaveBeenCalledTimes(1);
     expect(streamMessageMock.mock.calls[0]?.[0].muxMetadata).toBeUndefined();
@@ -676,71 +1036,140 @@ describe("AgentSession startup auto-retry recovery", () => {
     await session.dispose();
   });
 
-  test("restores persisted retry send options for startup auto-retry", async () => {
-    const workspaceId = "startup-retry-preserve-options";
-    const { session, historyService, cleanup } = await createSessionBundle(workspaceId);
-    cleanups.push(cleanup);
+  test.each([false, true])(
+    "restores persisted retry send options for startup auto-retry (Token Budget warning after the user row: %p)",
+    async (warningAfterUser) => {
+      const workspaceId = `startup-retry-preserve-options-${warningAfterUser}`;
+      const clock = makeTestEffectRunner();
+      const { session, historyService, events, cleanup } = await createSessionBundle(
+        workspaceId,
+        undefined,
+        { clock }
+      );
+      cleanups.push(() => clock.dispose(), cleanup);
 
-    const appendResult = await historyService.appendToHistory(
-      workspaceId,
-      createMuxMessage("user-1", "user", "Interrupted with custom send options", {
-        timestamp: Date.now(),
-        kind: GOAL_CONTINUATION_KIND,
-        retrySendOptions: {
-          model: "anthropic:claude-sonnet-4-5",
-          agentId: "exec",
-          thinkingLevel: "high",
-          toolPolicy: [{ regex_match: "bash", action: "disable" }],
-          additionalSystemInstructions: "Use one sentence.",
-          maxOutputTokens: 2048,
-          providerOptions: {
-            anthropic: {
-              use1MContext: true,
-              use1MContextModels: ["anthropic:claude-sonnet-4-5"],
+      const appendResult = await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("user-1", "user", "Interrupted with custom send options", {
+          timestamp: Date.now(),
+          kind: GOAL_CONTINUATION_KIND,
+          retrySendOptions: {
+            model: "anthropic:claude-sonnet-4-5",
+            agentId: "exec",
+            thinkingLevel: "high",
+            toolPolicy: [{ regex_match: "bash", action: "disable" }],
+            additionalSystemInstructions: "Use one sentence.",
+            maxOutputTokens: 2048,
+            providerOptions: {
+              anthropic: {
+                use1MContext: true,
+                use1MContextModels: ["anthropic:claude-sonnet-4-5"],
+              },
             },
+            disableWorkspaceAgents: true,
           },
-          allowAgentSetGoal: true,
-          disableWorkspaceAgents: true,
-        },
-      })
-    );
-    expect(appendResult.success).toBe(true);
-
-    await session.ensureStartupAutoRetryCheck();
-
-    const retryOptions = (
-      session as unknown as {
-        lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
+        })
+      );
+      expect(appendResult.success).toBe(true);
+      if (warningAfterUser) {
+        expect(
+          (await historyService.appendToHistory(workspaceId, tokenBudgetWarning())).success
+        ).toBe(true);
       }
-    ).lastAutoRetryResumeRequest;
-    expect(retryOptions).toBeDefined();
-    if (!retryOptions) {
-      throw new Error("Expected startup retry options");
+
+      await session.ensureStartupAutoRetryCheck();
+
+      // The scheduled retry resumes with every persisted option and the goal attribution.
+      const resumeStream = spyOn(session, "resumeStream").mockResolvedValue(Ok({ started: true }));
+      await fireScheduledRetry(clock, events);
+      expect(resumeStream).toHaveBeenCalledTimes(1);
+      const [options, internal] = resumeStream.mock.calls[0];
+      const retryOptions = { options, goalKind: internal?.goalKind };
+
+      expect(retryOptions.options.model).toBe("anthropic:claude-sonnet-4-5");
+      expect(retryOptions.options.agentId).toBe("exec");
+      expect(retryOptions.options.thinkingLevel).toBe("high");
+      expect(retryOptions.options.additionalSystemInstructions).toBe("Use one sentence.");
+      expect(retryOptions.options.maxOutputTokens).toBe(2048);
+      expect(retryOptions.options.toolPolicy).toEqual([{ regex_match: "bash", action: "disable" }]);
+      expect(retryOptions.options.disableWorkspaceAgents).toBe(true);
+      expect(retryOptions.goalKind).toBe(GOAL_CONTINUATION_KIND);
+
+      expect(retryOptions.options.providerOptions?.anthropic?.use1MContext).toBe(true);
+
+      await session.dispose();
     }
+  );
 
-    expect(retryOptions.options.model).toBe("anthropic:claude-sonnet-4-5");
-    expect(retryOptions.options.agentId).toBe("exec");
-    expect(retryOptions.options.thinkingLevel).toBe("high");
-    expect(retryOptions.options.additionalSystemInstructions).toBe("Use one sentence.");
-    expect(retryOptions.options.maxOutputTokens).toBe(2048);
-    expect(retryOptions.options.toolPolicy).toEqual([{ regex_match: "bash", action: "disable" }]);
-    expect(retryOptions.options.allowAgentSetGoal).toBe(true);
-    expect(retryOptions.options.disableWorkspaceAgents).toBe(true);
-    expect(retryOptions.goalKind).toBe(GOAL_CONTINUATION_KIND);
+  // Startup auto-retry replays the interrupted turn through resumeStream; an automatic task
+  // turn must stream again as that task turn (set_goal stays gated). Both durable copies are
+  // read (retry snapshot first, user-row metadata as fallback); an unknown value fails closed
+  // to "recovery" and the turn still retries.
+  test.each([
+    ["retry snapshot", { retrySendOptions: "required_report" }, "required_report"],
+    ["user row", { row: "recovery" }, "recovery"],
+    ["malformed", { retrySendOptions: "bogus", row: "bogus" }, "recovery"],
+  ] as const)(
+    "restores persisted task turn provenance for startup auto-retry (%s)",
+    async (_label, persisted, expected) => {
+      const workspaceId = `startup-retry-task-turn-${_label.replace(" ", "-")}`;
+      const clock = makeTestEffectRunner();
+      const { session, historyService, aiService, events, cleanup } = await createSessionBundle(
+        workspaceId,
+        undefined,
+        { clock }
+      );
+      cleanups.push(() => clock.dispose(), cleanup);
+      const rowKind: unknown = "row" in persisted ? persisted.row : undefined;
+      const snapshotKind: unknown =
+        "retrySendOptions" in persisted ? persisted.retrySendOptions : undefined;
+      const appendResult = await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("user-1", "user", "Interrupted task turn", {
+          timestamp: Date.now(),
+          // Raw JSON on purpose: chat.jsonl can hold values outside the type.
+          ...(rowKind !== undefined ? { taskTurnKind: rowKind as TaskTurnKind } : {}),
+          retrySendOptions: {
+            model: "openai:gpt-4o",
+            agentId: "exec",
+            ...(snapshotKind !== undefined ? { taskTurnKind: snapshotKind as TaskTurnKind } : {}),
+          },
+        })
+      );
+      expect(appendResult.success).toBe(true);
+      const streamed = Promise.withResolvers<void>();
+      const streamMessageMock = mock<AgentSessionAIService["streamMessage"]>(() => {
+        streamed.resolve();
+        return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
+      });
+      aiService.streamMessage = streamMessageMock;
 
-    expect(retryOptions.options.providerOptions?.anthropic?.use1MContext).toBe(true);
+      await session.ensureStartupAutoRetryCheck();
+      await fireScheduledRetry(clock, events);
+      await streamed.promise;
 
-    await session.dispose();
-  });
+      expect(streamMessageMock).toHaveBeenCalledTimes(1);
+      expect(streamMessageMock.mock.calls[0]?.[0].taskTurnKind).toBe(expected);
 
-  test("startup auto-retry discards goal attribution when the persisted goal ID is malformed", async () => {
+      await session.dispose();
+    }
+  );
+
+  test("startup auto-retry fails closed when a goal row's persisted goal ID is malformed", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM6cQt3o): chat.jsonl is unchecked JSON. A
     // present-but-invalid goalId must not resume the turn as goal-driven with
     // untrustworthy identity — a later compaction would persist a missing-ID
-    // follow-up that bypasses buildGoalRedispatchAdmission entirely.
+    // follow-up that bypasses buildGoalRedispatchAdmission entirely. It must not
+    // resume as an ordinary turn either: the goal kind is what refuses set_goal
+    // on automatic goal turns, so the row is not auto-retried at all.
     const workspaceId = "startup-retry-malformed-goal-id";
-    const { session, historyService, cleanup } = await createSessionBundle(workspaceId);
-    cleanups.push(cleanup);
+    const clock = makeTestEffectRunner();
+    const { session, historyService, events, cleanup } = await createSessionBundle(
+      workspaceId,
+      undefined,
+      { clock }
+    );
+    cleanups.push(() => clock.dispose(), cleanup);
 
     const appendResult = await historyService.appendToHistory(
       workspaceId,
@@ -757,16 +1186,18 @@ describe("AgentSession startup auto-retry recovery", () => {
     );
     expect(appendResult.success).toBe(true);
 
+    const resumeStream = spyOn(session, "resumeStream").mockResolvedValue(Ok({ started: true }));
     await session.ensureStartupAutoRetryCheck();
 
-    const retryOptions = (
-      session as unknown as {
-        lastAutoRetryResumeRequest?: AutoRetryResumeRequest & { goalId?: string };
-      }
-    ).lastAutoRetryResumeRequest;
-    expect(retryOptions).toBeDefined();
-    expect(retryOptions?.goalKind).toBeUndefined();
-    expect(retryOptions?.goalId).toBeUndefined();
+    expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+    expect(resumeStream).not.toHaveBeenCalled();
+    const abandonedReasons = events
+      .filter(
+        (event): event is Extract<WorkspaceChatMessage, { type: "auto-retry-abandoned" }> =>
+          event.type === "auto-retry-abandoned"
+      )
+      .map((event) => event.reason);
+    expect(abandonedReasons).toEqual(["missing_retry_options"]);
 
     await session.dispose();
   });
@@ -820,14 +1251,17 @@ describe("AgentSession startup auto-retry recovery", () => {
     { reason: "aborted", userMessageId: undefined, stopped: true },
     { reason: "aborted", userMessageId: "older-user", stopped: false },
     { reason: "context_exceeded", userMessageId: "user-1", stopped: false },
+    // A Token Budget warning after the stopped row is a notice, not newer user intent.
+    { reason: "aborted", userMessageId: "user-1", stopped: true, warningAfterUser: true },
   ])("reads applicable durable user-stop evidence: %j", async (marker) => {
     const workspaceId = "startup-task-stop";
     const { session, config, historyService, cleanup } = await createSessionBundle(workspaceId);
     cleanups.push(cleanup);
-    await historyService.appendToHistory(
-      workspaceId,
-      createMuxMessage("user-1", "user", "Current intent")
-    );
+    const seeded = [
+      createMuxMessage("user-1", "user", "Current intent"),
+      ...(marker.warningAfterUser ? [tokenBudgetWarning()] : []),
+    ];
+    expect((await historyService.appendManyToHistory(workspaceId, seeded)).success).toBe(true);
     await fsPromises.writeFile(
       path.join(config.sessionsDir, workspaceId, "auto-retry-preference.json"),
       JSON.stringify({
@@ -839,10 +1273,52 @@ describe("AgentSession startup auto-retry recovery", () => {
         marker.stopped ? "stopped" : "interrupted"
       );
       const history = await historyService.getLastMessages(workspaceId, 20);
-      expect(history.success && history.data.map((message) => message.id)).toEqual(["user-1"]);
+      expect(history.success && history.data.map((message) => message.id)).toEqual(
+        seeded.map((message) => message.id)
+      );
     } finally {
       await session.dispose();
     }
+  });
+
+  test("startup auto-retry honors a Stop of the user row that a Token Budget warning follows", async () => {
+    const workspaceId = "startup-retry-stop-before-budget-warning";
+    const clock = makeTestEffectRunner();
+    const { session, config, historyService, events, cleanup } = await createSessionBundle(
+      workspaceId,
+      undefined,
+      { clock }
+    );
+    cleanups.push(() => clock.dispose(), cleanup);
+    expect(
+      (
+        await historyService.appendManyToHistory(workspaceId, [
+          createMuxMessage("user-1", "user", "Stopped request"),
+          tokenBudgetWarning(),
+        ])
+      ).success
+    ).toBe(true);
+    // The user pressed Stop on user-1 before the restart.
+    await fsPromises.writeFile(
+      autoRetryPreferencePath(config, workspaceId),
+      JSON.stringify({ startupAutoRetryAbandon: { reason: "aborted", userMessageId: "user-1" } })
+    );
+    const resumeStream = spyOn(session, "resumeStream").mockResolvedValue(Ok({ started: true }));
+
+    await session.ensureStartupAutoRetryCheck();
+
+    expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+    expect(resumeStream).not.toHaveBeenCalled();
+    expect(
+      events
+        .filter(
+          (event): event is Extract<WorkspaceChatMessage, { type: "auto-retry-abandoned" }> =>
+            event.type === "auto-retry-abandoned"
+        )
+        .map((event) => event.reason)
+    ).toEqual(["aborted"]);
+
+    await session.dispose();
   });
 
   test("preserves a scoped Stop until history proves a newer user intent", async () => {
@@ -926,15 +1402,13 @@ describe("AgentSession startup auto-retry recovery", () => {
         path.join(config.sessionsDir, workspaceId, "partial.json"),
         corrupt
       );
-      const wait = spyOn(
-        session as unknown as { waitForStartupReadRetry(delay: number): Promise<void> },
-        "waitForStartupReadRetry"
-      );
+      // One partial read per probe attempt: a single read means no backoff retry happened.
+      const readPartial = spyOn(historyService, "readPartial");
       try {
         expect(await session.getStartupRecoveryState()).toBe("interrupted");
-        expect(wait).not.toHaveBeenCalled();
+        expect(readPartial).toHaveBeenCalledTimes(1);
       } finally {
-        wait.mockRestore();
+        readPartial.mockRestore();
         await session.dispose();
       }
     }
@@ -943,14 +1417,15 @@ describe("AgentSession startup auto-retry recovery", () => {
   test.each(["preference", "partial", "history"] as const)(
     "bounds a hung %s read without releasing its physical lease",
     async (kind) => {
-      const { session, historyService, events, cleanup } = await createSessionBundle(
+      const { session, config, historyService, events, cleanup } = await createSessionBundle(
         `hung-${kind}`
       );
       cleanups.push(cleanup);
       const entered = Promise.withResolvers<void>();
       const gate = Promise.withResolvers<void>();
-      const preference = session as unknown as { readAutoRetryState(): Promise<void> };
-      const readPreference = preference.readAutoRetryState.bind(session);
+      const preferencePath = autoRetryPreferencePath(config, `hung-${kind}`);
+      const readFile = fsPromises.readFile.bind(fsPromises);
+      let preferenceReadHeld = false;
       const readPartial = historyService.readPartial.bind(historyService);
       const readHistory = historyService.getLastMessages.bind(historyService);
       const pause = async () => {
@@ -959,10 +1434,15 @@ describe("AgentSession startup auto-retry recovery", () => {
       };
       const preferenceSpy =
         kind === "preference"
-          ? spyOn(preference, "readAutoRetryState").mockImplementationOnce(async () => {
-              await pause();
-              await readPreference();
-            })
+          ? spyOn(fsPromises, "readFile").mockImplementation((async (
+              ...args: Parameters<typeof fsPromises.readFile>
+            ) => {
+              if (args[0] === preferencePath && !preferenceReadHeld) {
+                preferenceReadHeld = true;
+                await pause();
+              }
+              return readFile(...args);
+            }) as typeof fsPromises.readFile)
           : undefined;
       const partialSpy =
         kind === "partial"
@@ -1135,6 +1615,77 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(scheduledIndex).toBeLessThan(caughtUpIndex);
 
     await session.dispose();
+  });
+
+  test.each([
+    {
+      name: "replays the stop reason of an abandoned auto-retry",
+      errorType: "authentication",
+      after: "none",
+      expected: [{ type: "auto-retry-abandoned", reason: "authentication" }],
+    },
+    {
+      name: "drops a stop reason the provider config change may have fixed",
+      errorType: "authentication",
+      after: "provider-config",
+      expected: [],
+    },
+    {
+      name: "keeps a stop reason a provider config change cannot fix",
+      errorType: "model_not_found",
+      after: "provider-config",
+      expected: [{ type: "auto-retry-abandoned", reason: "model_not_found" }],
+    },
+    {
+      name: "drops the stop reason once a new turn is admitted",
+      errorType: "authentication",
+      after: "new-turn",
+      expected: [],
+    },
+    {
+      name: "replays only the pending schedule after a retryable failure",
+      errorType: "network",
+      after: "none",
+      expected: ["auto-retry-scheduled"],
+    },
+  ] as const)("$name for a late subscriber", async ({ errorType, after, expected }) => {
+    const workspaceId = `late-retry-status-${errorType}-${after}`;
+    // Virtual-time backoff: a scheduled retry stays pending instead of firing mid-test.
+    const clock = makeTestEffectRunner();
+    const { session, aiService, cleanup } = await createSessionBundle(workspaceId, undefined, {
+      clock,
+    });
+    cleanups.push(() => clock.dispose(), cleanup);
+
+    await failTurnWith(session, aiService, errorType);
+    if (after === "provider-config") {
+      await session.handleProviderConfigChanged();
+    } else if (after === "new-turn") {
+      spyOn(aiService, "streamMessage").mockImplementationOnce(() =>
+        Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal, "assistant-next")))
+      );
+      const next = await session.sendMessage("Next prompt", {
+        model: "anthropic:claude-sonnet-4-5",
+        agentId: "exec",
+      });
+      expect(next.success).toBe(true);
+    }
+
+    const replayEvents: WorkspaceChatMessage[] = [];
+    await session.replayHistory(({ message }) => {
+      replayEvents.push(message);
+    });
+
+    const caughtUpIndex = replayEvents.findIndex((event) => event.type === "caught-up");
+    expect(caughtUpIndex).toBeGreaterThanOrEqual(0);
+    const retryStatuses = replayEvents
+      .slice(0, caughtUpIndex)
+      .filter(
+        (event) => event.type === "auto-retry-abandoned" || event.type === "auto-retry-scheduled"
+      );
+    expect(
+      retryStatuses.map((event) => (event.type === "auto-retry-scheduled" ? event.type : event))
+    ).toEqual([...expected]);
   });
 
   test.each(
@@ -1382,7 +1933,8 @@ describe("AgentSession startup auto-retry recovery", () => {
 
   test("respects legacy auto-retry opt-out hint when backend preference is missing", async () => {
     const workspaceId = "startup-retry-legacy-opt-out";
-    const { session, historyService, events, cleanup } = await createSessionBundle(workspaceId);
+    const { session, config, historyService, events, cleanup } =
+      await createSessionBundle(workspaceId);
     cleanups.push(cleanup);
 
     const appendResult = await historyService.appendToHistory(
@@ -1398,11 +1950,7 @@ describe("AgentSession startup auto-retry recovery", () => {
 
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
 
-    const preferencePath = (
-      session as unknown as {
-        getAutoRetryPreferencePath: () => string;
-      }
-    ).getAutoRetryPreferencePath();
+    const preferencePath = autoRetryPreferencePath(config, workspaceId);
     expect(await Bun.file(preferencePath).exists()).toBe(true);
 
     const persisted = JSON.parse(await Bun.file(preferencePath).text()) as {
@@ -1465,22 +2013,21 @@ describe("AgentSession startup auto-retry recovery", () => {
       initStateManager,
       backgroundProcessManager,
       cleanup,
-    } = await createSessionBundle(workspaceId);
+    } = await createSessionBundle(workspaceId, {
+      streamMessage: mock(() =>
+        Promise.resolve(Err({ type: "runtime_not_ready" as const, message: "runtime not ready" }))
+      ),
+    });
     cleanups.push(cleanup);
 
-    const appendResult = await historyService.appendToHistory(
-      workspaceId,
-      createMuxMessage("user-1", "user", "Interrupted prompt", {
-        timestamp: Date.now(),
-      })
-    );
-    expect(appendResult.success).toBe(true);
-
-    await (
-      firstSession as unknown as {
-        persistStartupAutoRetryAbandon: (reason: string, userMessageId?: string) => Promise<void>;
-      }
-    ).persistStartupAutoRetryAbandon("runtime_not_ready", "user-1");
+    // A real non-retryable start failure persists the startup abandon marker for its user row.
+    const sendResult = await firstSession.sendMessage("Interrupted prompt", {
+      model: "anthropic:claude-sonnet-4-5",
+      agentId: "exec",
+    });
+    expect(sendResult.success).toBe(false);
+    const tail = await historyService.getLastMessages(workspaceId, 1);
+    expect(tail.success && tail.data[0]?.role).toBe("user");
 
     await firstSession.dispose();
 
@@ -1503,23 +2050,19 @@ describe("AgentSession startup auto-retry recovery", () => {
 
   test("clears persisted startup abandon state once retry resumes successfully", async () => {
     const workspaceId = "startup-retry-clear-abandon-on-resume";
-    const { session, cleanup } = await createSessionBundle(workspaceId);
+    const { session, config, cleanup } = await createSessionBundle(workspaceId);
     cleanups.push(cleanup);
 
     const privateSession = session as unknown as {
       persistStartupAutoRetryAbandon: (reason: string, userMessageId?: string) => Promise<void>;
       retryActiveStream: () => Promise<void>;
-      getAutoRetryPreferencePath: () => string;
       lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
-      resumeStream: (
-        options: SendMessageOptions
-      ) => Promise<{ success: true; data: { started: boolean } }>;
       startupAutoRetryAbandon: { reason: string; userMessageId?: string } | null;
     };
 
     await privateSession.persistStartupAutoRetryAbandon("runtime_not_ready", "user-1");
 
-    const preferencePath = privateSession.getAutoRetryPreferencePath();
+    const preferencePath = autoRetryPreferencePath(config, workspaceId);
     expect(await Bun.file(preferencePath).exists()).toBe(true);
 
     privateSession.lastAutoRetryResumeRequest = {
@@ -1529,10 +2072,9 @@ describe("AgentSession startup auto-retry recovery", () => {
       },
     };
 
-    const resumeStreamMock = mock((_options: SendMessageOptions) =>
-      Promise.resolve({ success: true as const, data: { started: true } })
+    const resumeStreamMock = spyOn(session, "resumeStream").mockResolvedValue(
+      Ok({ started: true })
     );
-    privateSession.resumeStream = resumeStreamMock;
 
     await privateSession.retryActiveStream();
 
@@ -1545,37 +2087,45 @@ describe("AgentSession startup auto-retry recovery", () => {
 
   test("provider config changes clear credential abandon state without starting a stream", async () => {
     const workspaceId = "startup-retry-clear-abandon-on-provider-config";
-    const { session, aiService, events, cleanup } = await createSessionBundle(workspaceId);
-    cleanups.push(cleanup);
+    // Virtual-time backoff: the retry the final recovery check schedules never fires here.
+    const clock = makeTestEffectRunner();
+    const { session, config, aiService, events, cleanup } = await createSessionBundle(
+      workspaceId,
+      undefined,
+      { clock }
+    );
+    cleanups.push(() => clock.dispose(), cleanup);
 
-    const privateSession = session as unknown as {
-      persistStartupAutoRetryAbandon: (reason: string, userMessageId?: string) => Promise<void>;
-      getAutoRetryPreferencePath: () => string;
-      startupAutoRetryAbandon: { reason: string; userMessageId?: string } | null;
-    };
-    await privateSession.persistStartupAutoRetryAbandon("authentication", "user-1");
-    const preferencePath = privateSession.getAutoRetryPreferencePath();
+    await failTurnWith(session, aiService, "authentication");
+    const preferencePath = autoRetryPreferencePath(config, workspaceId);
+    expect(await Bun.file(preferencePath).exists()).toBe(true);
     const streamMessageSpy = spyOn(aiService, "streamMessage");
 
     await session.handleProviderConfigChanged();
 
-    expect(privateSession.startupAutoRetryAbandon).toBeNull();
     expect(await Bun.file(preferencePath).exists()).toBe(false);
     expect(streamMessageSpy).not.toHaveBeenCalled();
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+    // The live session dropped the marker too: recovery of the failed turn is unblocked.
+    const abandonedBefore = events.filter((event) => event.type === "auto-retry-abandoned").length;
+    await session.ensureStartupAutoRetryCheck();
+    expect(events.filter((event) => event.type === "auto-retry-scheduled")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "auto-retry-abandoned")).toHaveLength(
+      abandonedBefore
+    );
+    expect(streamMessageSpy).not.toHaveBeenCalled();
   });
 
   test("a marker recorded while an older clear is still unlinking is written after it and acknowledged once written", async () => {
     const workspaceId = "startup-retry-serialized-abandon-writes";
-    const { session, cleanup } = await createSessionBundle(workspaceId);
+    const { session, config, cleanup } = await createSessionBundle(workspaceId);
     cleanups.push(cleanup);
 
     const privateSession = session as unknown as {
       persistStartupAutoRetryAbandon: (reason: string, userMessageId?: string) => Promise<void>;
       clearStartupAutoRetryAbandon: () => Promise<void>;
-      getAutoRetryPreferencePath: () => string;
     };
-    const preferencePath = privateSession.getAutoRetryPreferencePath();
+    const preferencePath = autoRetryPreferencePath(config, workspaceId);
 
     // An in-memory preference file whose unlink and marker write the test holds open, so the clear's
     // unlink and the Stop's marker write can be ordered exactly (real I/O would race them).
@@ -1748,16 +2298,15 @@ describe("AgentSession startup auto-retry recovery", () => {
 
   test("a marker recorded while the preference file is still loading survives the load and keeps the file's opt-out", async () => {
     const workspaceId = "startup-retry-marker-during-preference-load";
-    const { session, cleanup } = await createSessionBundle(workspaceId);
+    const { session, config, cleanup } = await createSessionBundle(workspaceId);
     cleanups.push(cleanup);
 
     const privateSession = session as unknown as {
       persistStartupAutoRetryAbandon: (reason: string, userMessageId?: string) => Promise<void>;
       loadAutoRetryEnabledPreference: () => Promise<boolean>;
-      getAutoRetryPreferencePath: () => string;
       startupAutoRetryAbandon: { reason: string; userMessageId?: string } | null;
     };
-    const preferencePath = privateSession.getAutoRetryPreferencePath();
+    const preferencePath = autoRetryPreferencePath(config, workspaceId);
     await fsPromises.mkdir(path.dirname(preferencePath), { recursive: true });
     await fsPromises.writeFile(preferencePath, JSON.stringify({ enabled: false }) + "\n", "utf-8");
 
@@ -1802,40 +2351,46 @@ describe("AgentSession startup auto-retry recovery", () => {
 
   test("provider config changes preserve non-fixable abandon state without starting a stream", async () => {
     const workspaceId = "startup-retry-keep-abandon-on-provider-config";
-    const { session, aiService, events, cleanup } = await createSessionBundle(workspaceId);
-    cleanups.push(cleanup);
+    const clock = makeTestEffectRunner();
+    const { session, config, aiService, events, cleanup } = await createSessionBundle(
+      workspaceId,
+      undefined,
+      { clock }
+    );
+    cleanups.push(() => clock.dispose(), cleanup);
 
-    const privateSession = session as unknown as {
-      persistStartupAutoRetryAbandon: (reason: string, userMessageId?: string) => Promise<void>;
-      getAutoRetryPreferencePath: () => string;
-      startupAutoRetryAbandon: { reason: string; userMessageId?: string } | null;
-    };
-    await privateSession.persistStartupAutoRetryAbandon("context_exceeded", "user-1");
-    const preferencePath = privateSession.getAutoRetryPreferencePath();
+    await failTurnWith(session, aiService, "context_exceeded");
+    const preferencePath = autoRetryPreferencePath(config, workspaceId);
     const streamMessageSpy = spyOn(aiService, "streamMessage");
 
     await session.handleProviderConfigChanged();
 
-    expect(privateSession.startupAutoRetryAbandon).toEqual({
-      reason: "context_exceeded",
-      userMessageId: "user-1",
-    });
     expect(await Bun.file(preferencePath).exists()).toBe(true);
     expect(streamMessageSpy).not.toHaveBeenCalled();
+    expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+    // The live session keeps the marker for the failed turn: recovery still abandons it.
+    const abandonedBefore = events.filter((event) => event.type === "auto-retry-abandoned").length;
+    await session.ensureStartupAutoRetryCheck();
+    expect(
+      events
+        .slice()
+        .filter(
+          (event): event is Extract<WorkspaceChatMessage, { type: "auto-retry-abandoned" }> =>
+            event.type === "auto-retry-abandoned"
+        )
+        .slice(abandonedBefore)
+        .map((event) => event.reason)
+    ).toEqual(["context_exceeded"]);
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
   });
 
   test("provider config sweep clears fixable markers for workspaces without live sessions", async () => {
     const workspaceId = "startup-retry-sweep-closed-workspace";
-    const { session, config, cleanup } = await createSessionBundle(workspaceId);
+    const { session, config, aiService, cleanup } = await createSessionBundle(workspaceId);
     cleanups.push(cleanup);
 
-    const privateSession = session as unknown as {
-      persistStartupAutoRetryAbandon: (reason: string, userMessageId?: string) => Promise<void>;
-      getAutoRetryPreferencePath: () => string;
-    };
-    await privateSession.persistStartupAutoRetryAbandon("authentication", "user-1");
-    const preferencePath = privateSession.getAutoRetryPreferencePath();
+    await failTurnWith(session, aiService, "authentication");
+    const preferencePath = autoRetryPreferencePath(config, workspaceId);
     expect(await Bun.file(preferencePath).exists()).toBe(true);
 
     // Not in the skip set = no live session for this workspace.
@@ -1846,31 +2401,33 @@ describe("AgentSession startup auto-retry recovery", () => {
 
   test("provider config sweep preserves non-fixable markers and skips live sessions", async () => {
     const workspaceId = "startup-retry-sweep-preserve";
-    const { session, config, cleanup } = await createSessionBundle(workspaceId);
+    const { session, config, aiService, cleanup } = await createSessionBundle(workspaceId);
     cleanups.push(cleanup);
 
-    const privateSession = session as unknown as {
-      persistStartupAutoRetryAbandon: (reason: string, userMessageId?: string) => Promise<void>;
-      getAutoRetryPreferencePath: () => string;
-    };
-    const preferencePath = privateSession.getAutoRetryPreferencePath();
+    const preferencePath = autoRetryPreferencePath(config, workspaceId);
 
-    await privateSession.persistStartupAutoRetryAbandon("context_exceeded", "user-1");
+    await failTurnWith(session, aiService, "context_exceeded");
     await clearProviderConfigFixableAbandonMarkers(config.sessionsDir, new Set());
     expect(await Bun.file(preferencePath).exists()).toBe(true);
 
-    await privateSession.persistStartupAutoRetryAbandon("authentication", "user-1");
+    await failTurnWith(session, aiService, "authentication");
+    const markerReason = async () =>
+      (
+        JSON.parse(await Bun.file(preferencePath).text()) as {
+          startupAutoRetryAbandon?: { reason?: string };
+        }
+      ).startupAutoRetryAbandon?.reason;
+    expect(await markerReason()).toBe("authentication");
     await clearProviderConfigFixableAbandonMarkers(config.sessionsDir, new Set([workspaceId]));
     expect(await Bun.file(preferencePath).exists()).toBe(true);
+    expect(await markerReason()).toBe("authentication");
   });
 
   test("an auto-retry opt-out whose write failed is not acknowledged as recorded until it is written", async () => {
     const workspaceId = "startup-retry-unrecorded-opt-out";
-    const { session, cleanup } = await createSessionBundle(workspaceId);
+    const { session, config, cleanup } = await createSessionBundle(workspaceId);
     cleanups.push(cleanup);
-    const preferencePath = (
-      session as unknown as { getAutoRetryPreferencePath: () => string }
-    ).getAutoRetryPreferencePath();
+    const preferencePath = autoRetryPreferencePath(config, workspaceId);
 
     let failWrites = true;
     const { writeFile } = fsPromises;
@@ -1896,17 +2453,17 @@ describe("AgentSession startup auto-retry recovery", () => {
 
   test("provider config sweep keeps a persisted auto-retry opt-out while clearing the marker", async () => {
     const workspaceId = "startup-retry-sweep-keep-opt-out";
-    const { session, config, cleanup } = await createSessionBundle(workspaceId);
+    const { session, config, aiService, cleanup } = await createSessionBundle(workspaceId);
     cleanups.push(cleanup);
 
-    const privateSession = session as unknown as {
-      persistAutoRetryEnabledPreference: (enabled: boolean) => Promise<void>;
-      persistStartupAutoRetryAbandon: (reason: string, userMessageId?: string) => Promise<void>;
-      getAutoRetryPreferencePath: () => string;
-    };
-    await privateSession.persistAutoRetryEnabledPreference(false);
-    await privateSession.persistStartupAutoRetryAbandon("quota", "user-1");
-    const preferencePath = privateSession.getAutoRetryPreferencePath();
+    // A user send re-enables auto-retry, so the opt-out follows the failed turn.
+    await failTurnWith(session, aiService, "quota");
+    await session.setAutoRetryEnabled(false);
+    const preferencePath = autoRetryPreferencePath(config, workspaceId);
+    expect(JSON.parse(await Bun.file(preferencePath).text())).toMatchObject({
+      enabled: false,
+      startupAutoRetryAbandon: { reason: "quota" },
+    });
 
     await clearProviderConfigFixableAbandonMarkers(config.sessionsDir, new Set());
 
@@ -1920,35 +2477,26 @@ describe("AgentSession startup auto-retry recovery", () => {
 
   test("reschedules retry when resumeStream defers without starting a stream", async () => {
     const workspaceId = "startup-retry-resume-deferred";
-    const { session, events, cleanup } = await createSessionBundle(workspaceId);
-    cleanups.push(cleanup);
-
-    const privateSession = session as unknown as {
-      retryActiveStream: () => Promise<void>;
-      lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
-      resumeStream: (
-        options: SendMessageOptions
-      ) => Promise<{ success: true; data: { started: boolean } }>;
-    };
-
-    privateSession.lastAutoRetryResumeRequest = {
-      options: {
-        model: "anthropic:claude-sonnet-4-5",
-        agentId: "exec",
-      },
-    };
-
-    const resumeStreamMock = mock((_options: SendMessageOptions) =>
-      Promise.resolve({
-        success: true as const,
-        data: { started: false },
-      })
+    const clock = makeTestEffectRunner();
+    const { session, events, cleanup } = await createSessionBundle(
+      workspaceId,
+      failingStreamStart(),
+      { clock }
     );
-    privateSession.resumeStream = resumeStreamMock;
+    cleanups.push(() => clock.dispose(), cleanup);
+
+    await sendIntoScheduledRetry(session, events);
+
+    const resumeStreamMock = spyOn(session, "resumeStream").mockResolvedValue(
+      Ok({ started: false })
+    );
 
     const scheduledBefore = events.filter((event) => event.type === "auto-retry-scheduled").length;
 
-    await privateSession.retryActiveStream();
+    await fireScheduledRetry(clock, events);
+    await waitForCondition(
+      () => events.filter((event) => event.type === "auto-retry-scheduled").length > scheduledBefore
+    );
 
     const scheduledAfter = events.filter((event) => event.type === "auto-retry-scheduled").length;
     expect(resumeStreamMock).toHaveBeenCalledTimes(1);
@@ -1959,33 +2507,27 @@ describe("AgentSession startup auto-retry recovery", () => {
 
   test("does not re-process retry failures already handled by resumeStream", async () => {
     const workspaceId = "startup-retry-no-double-process-failure";
-    const { session, events, cleanup } = await createSessionBundle(workspaceId);
-    cleanups.push(cleanup);
-
-    const privateSession = session as unknown as RetryableSessionForTests;
-
-    privateSession.lastAutoRetryResumeRequest = {
-      options: {
-        model: "anthropic:claude-sonnet-4-5",
-        agentId: "exec",
-      },
-    };
-
-    const resumeStreamMock = mock((_options: SendMessageOptions) =>
-      Promise.resolve({
-        success: false as const,
-        error: {
-          type: "runtime_start_failed" as const,
-          message: "runtime is still starting",
-        },
-        failureHandled: true as const,
-      })
+    const clock = makeTestEffectRunner();
+    const { session, events, cleanup } = await createSessionBundle(
+      workspaceId,
+      failingStreamStart(),
+      { clock }
     );
-    privateSession.resumeStream = resumeStreamMock;
+    cleanups.push(() => clock.dispose(), cleanup);
+
+    await sendIntoScheduledRetry(session, events);
+
+    const resumeStreamMock = spyOn(session, "resumeStream").mockResolvedValue({
+      success: false,
+      error: { type: "runtime_start_failed", message: "runtime is still starting" },
+      failureHandled: true,
+    });
 
     const scheduledBefore = events.filter((event) => event.type === "auto-retry-scheduled").length;
 
-    await privateSession.retryActiveStream();
+    await fireScheduledRetry(clock, events);
+    // The fired retry settles (no longer pending) without arming another one.
+    await waitForCondition(() => !session.hasPendingAutoRetry());
 
     const scheduledAfter = events.filter((event) => event.type === "auto-retry-scheduled").length;
     expect(resumeStreamMock).toHaveBeenCalledTimes(1);
@@ -1996,32 +2538,26 @@ describe("AgentSession startup auto-retry recovery", () => {
 
   test("handles unprocessed resume failures by scheduling the next retry", async () => {
     const workspaceId = "startup-retry-process-unhandled-failure";
-    const { session, events, cleanup } = await createSessionBundle(workspaceId);
-    cleanups.push(cleanup);
-
-    const privateSession = session as unknown as RetryableSessionForTests;
-
-    privateSession.lastAutoRetryResumeRequest = {
-      options: {
-        model: "anthropic:claude-sonnet-4-5",
-        agentId: "exec",
-      },
-    };
-
-    const resumeStreamMock = mock((_options: SendMessageOptions) =>
-      Promise.resolve({
-        success: false as const,
-        error: {
-          type: "runtime_start_failed" as const,
-          message: "runtime is still starting",
-        },
-      })
+    const clock = makeTestEffectRunner();
+    const { session, events, cleanup } = await createSessionBundle(
+      workspaceId,
+      failingStreamStart(),
+      { clock }
     );
-    privateSession.resumeStream = resumeStreamMock;
+    cleanups.push(() => clock.dispose(), cleanup);
+
+    await sendIntoScheduledRetry(session, events);
+
+    const resumeStreamMock = spyOn(session, "resumeStream").mockResolvedValue(
+      Err({ type: "runtime_start_failed", message: "runtime is still starting" })
+    );
 
     const scheduledBefore = events.filter((event) => event.type === "auto-retry-scheduled").length;
 
-    await privateSession.retryActiveStream();
+    await fireScheduledRetry(clock, events);
+    await waitForCondition(
+      () => events.filter((event) => event.type === "auto-retry-scheduled").length > scheduledBefore
+    );
 
     const scheduledAfter = events.filter((event) => event.type === "auto-retry-scheduled").length;
     expect(resumeStreamMock).toHaveBeenCalledTimes(1);
@@ -2032,7 +2568,7 @@ describe("AgentSession startup auto-retry recovery", () => {
 
   test("startup compaction dispatch returns after persistence while provider work remains pending", async () => {
     const workspaceId = "startup-background-compaction";
-    const { session, historyService, cleanup } = await createSessionBundle(workspaceId);
+    const { session, historyService, aiService, cleanup } = await createSessionBundle(workspaceId);
     cleanups.push(cleanup);
     await historyService.appendToHistory(
       workspaceId,
@@ -2050,14 +2586,12 @@ describe("AgentSession startup auto-retry recovery", () => {
     const started = Promise.withResolvers<void>();
     const finish = Promise.withResolvers<void>();
     let streamFinished = false;
-    const stream = spyOn(
-      session as unknown as { streamWithHistory(): Promise<ReturnType<typeof Ok<void>>> },
-      "streamWithHistory"
-    ).mockImplementation(async () => {
+    // Provider work is held open at the provider boundary itself.
+    const stream = spyOn(aiService, "streamMessage").mockImplementation(async () => {
       started.resolve();
       await finish.promise;
       streamFinished = true;
-      return Ok(undefined);
+      return Ok(createStartedTurnHandle(session.closingSignal));
     });
     const dispatch = session.dispatchPendingCompactionFollowUpIfNeeded(undefined, true);
     try {
@@ -2100,22 +2634,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     );
     expect(appendResult.success).toBe(true);
 
-    const privateSession = session as unknown as {
-      dispatchPendingFollowUp: () => Promise<boolean>;
-      retryActiveStream: () => Promise<void>;
-      lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
-      sendMessage: (
-        message: string,
-        options?: SendMessageOptions,
-        internal?: { synthetic?: boolean }
-      ) => Promise<
-        { success: true } | { success: false; error: { type: string; message?: string } }
-      >;
-      resumeStream: (
-        options: SendMessageOptions,
-        internal?: { agentInitiated?: boolean }
-      ) => Promise<{ success: true; data: { started: boolean } }>;
-    };
+    const privateSession = session as unknown as RetryableSessionForTests;
 
     privateSession.lastAutoRetryResumeRequest = {
       options: {
@@ -2125,37 +2644,29 @@ describe("AgentSession startup auto-retry recovery", () => {
       },
       agentInitiated: true,
     };
-    privateSession.sendMessage = mock(() =>
-      Promise.resolve({
-        success: false as const,
-        error: { type: "runtime_start_failed", message: "startup failed" },
-      })
+    spyOn(session, "sendMessage").mockResolvedValue(
+      Err({ type: "runtime_start_failed", message: "startup failed" })
     );
 
     let dispatchError: unknown;
     try {
-      await privateSession.dispatchPendingFollowUp();
+      await session.dispatchPendingCompactionFollowUpIfNeeded();
     } catch (error) {
       dispatchError = error;
     }
     expect(dispatchError).toBeInstanceOf(Error);
     expect((dispatchError as Error).message).toContain("Failed to dispatch pending follow-up");
 
-    const resumeStreamMock = mock(
-      (_options: SendMessageOptions, _internal?: { agentInitiated?: boolean }) =>
-        Promise.resolve({ success: true as const, data: { started: true } })
+    const resumeStreamMock = spyOn(session, "resumeStream").mockResolvedValue(
+      Ok({ started: true })
     );
-    privateSession.resumeStream = resumeStreamMock;
 
     await privateSession.retryActiveStream();
 
     expect(resumeStreamMock).toHaveBeenCalledTimes(1);
     const firstCall = resumeStreamMock.mock.calls[0];
     expect(firstCall).toBeDefined();
-    const [optionsArg, internalArg] = firstCall as unknown as [
-      SendMessageOptions,
-      { agentInitiated?: boolean } | undefined,
-    ];
+    const [optionsArg, internalArg] = firstCall;
     expect(optionsArg).toEqual(
       expect.objectContaining({
         model: "openai:gpt-4o",
@@ -2171,8 +2682,13 @@ describe("AgentSession startup auto-retry recovery", () => {
 
   test("same-session auto-retry preserves ACP correlation fields", async () => {
     const workspaceId = "startup-retry-preserves-acp-fields";
-    const { session, aiService, cleanup } = await createSessionBundle(workspaceId);
-    cleanups.push(cleanup);
+    const clock = makeTestEffectRunner();
+    const { session, aiService, events, cleanup } = await createSessionBundle(
+      workspaceId,
+      undefined,
+      { clock }
+    );
+    cleanups.push(() => clock.dispose(), cleanup);
 
     const acpPromptId = "acp-prompt-123";
     const delegatedToolNames = ["bash", "task"];
@@ -2183,7 +2699,8 @@ describe("AgentSession startup auto-retry recovery", () => {
     };
 
     let streamCallCount = 0;
-    const streamMessageMock = mock((_payload: Record<string, unknown>) => {
+    const retried = Promise.withResolvers<void>();
+    const streamMessageMock = mock<AgentSessionAIService["streamMessage"]>(() => {
       streamCallCount += 1;
       if (streamCallCount === 1) {
         return Promise.resolve({
@@ -2195,15 +2712,10 @@ describe("AgentSession startup auto-retry recovery", () => {
         });
       }
 
+      retried.resolve();
       return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
-    aiService.streamMessage =
-      streamMessageMock as unknown as AgentSessionAIService["streamMessage"];
-
-    const privateSession = session as unknown as {
-      retryActiveStream: () => Promise<void>;
-      lastAutoRetryResumeRequest?: AutoRetryResumeRequest;
-    };
+    aiService.streamMessage = streamMessageMock;
 
     const sendResult = await session.sendMessage("Retry the ACP request", {
       model: "openai:gpt-4o",
@@ -2214,14 +2726,17 @@ describe("AgentSession startup auto-retry recovery", () => {
     });
 
     expect(sendResult.success).toBe(false);
-    expect(privateSession.lastAutoRetryResumeRequest?.options.acpPromptId).toBe(acpPromptId);
-    expect(privateSession.lastAutoRetryResumeRequest?.options.delegatedToolNames).toEqual(
-      delegatedToolNames
-    );
-    expect(privateSession.lastAutoRetryResumeRequest?.options.muxMetadata).toEqual(muxMetadata);
 
-    await privateSession.retryActiveStream();
+    const resumeStream = spyOn(session, "resumeStream");
+    await fireScheduledRetry(clock, events);
+    await retried.promise;
 
+    // Provider requests carry only workspace-turn muxMetadata, so the resumed options are where
+    // the ACP metadata (the fallback source for the correlation fields) is observable.
+    expect(resumeStream).toHaveBeenCalledTimes(1);
+    expect(resumeStream.mock.calls[0][0].muxMetadata).toEqual(muxMetadata);
+
+    // The correlation fields captured at the failed send reach the retried provider request.
     expect(streamMessageMock).toHaveBeenCalledTimes(2);
     const retryPayload = streamMessageMock.mock.calls[1]?.[0] as {
       acpPromptId?: string;
@@ -2370,16 +2885,15 @@ describe("AgentSession startup auto-retry recovery", () => {
     };
 
     const aiEmitter = new EventEmitter();
-    const aiService = Object.assign(aiEmitter, {
-      stopStream: mock(() => Promise.resolve(Ok(undefined))),
-      isStreaming: mock(() => false),
-      getStreamInfo: mock(() => undefined),
-      replayStream: mock(() => Promise.resolve()),
-      streamMessage: mock(() =>
-        Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
-      ),
-      getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
-    }) as unknown as AgentSessionAIService;
+    const aiService = createAgentSessionAIServiceFake({
+      emitter: aiEmitter,
+      overrides: {
+        streamMessage: mock<AgentSessionAIService["streamMessage"]>(() =>
+          Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
+        ),
+        getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
+      },
+    });
 
     const initStateManager: InitStateManager = {
       on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
@@ -2395,7 +2909,7 @@ describe("AgentSession startup auto-retry recovery", () => {
       setMessageQueued: mock(() => undefined),
     } as unknown as BackgroundProcessManager;
 
-    const session = createTestAgentSession({
+    const { session } = await createAgentSessionHarness({
       workspaceId,
       config,
       historyService,
@@ -2404,11 +2918,11 @@ describe("AgentSession startup auto-retry recovery", () => {
       backgroundProcessManager,
     });
 
+    // Reproducing the pre-stream window (a prepared turn with no provider stream yet) needs the
+    // coordinator and the active user-message ID directly.
     const privateSession = session as unknown as {
       coordinator: TurnCoordinator;
       activeStreamUserMessageId?: string;
-      getAutoRetryPreferencePath: () => string;
-      startupAutoRetryAbandon: { reason: string; userMessageId?: string } | null;
     };
 
     privateSession.activeStreamUserMessageId = "user-1";
@@ -2426,26 +2940,7 @@ describe("AgentSession startup auto-retry recovery", () => {
       metadata: {},
     });
 
-    const waitUntil = async (condition: () => boolean, timeoutMs = 2000): Promise<boolean> => {
-      const start = Date.now();
-      while (Date.now() - start < timeoutMs) {
-        if (condition()) {
-          return true;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      return false;
-    };
-
-    const abandonPersisted = await waitUntil(() => privateSession.startupAutoRetryAbandon !== null);
-    expect(abandonPersisted).toBe(true);
-
-    expect(privateSession.startupAutoRetryAbandon).toEqual({
-      reason: "aborted",
-      userMessageId: "user-1",
-    });
-
-    const preferencePath = privateSession.getAutoRetryPreferencePath();
+    const preferencePath = autoRetryPreferencePath(config, workspaceId);
     const waitForPreferenceFile = async (timeoutMs = 2000): Promise<boolean> => {
       const start = Date.now();
       while (Date.now() - start < timeoutMs) {
@@ -2466,17 +2961,18 @@ describe("AgentSession startup auto-retry recovery", () => {
       reason: "aborted",
       userMessageId: "user-1",
     });
+    // The live session honors the marker too: startup recovery reads this Stop as applicable.
+    expect(await session.getStartupRecoveryState()).toBe("stopped");
 
     await session.dispose();
   });
 
   test("skips persisting startup abandon marker for non-user abort reasons", async () => {
     const workspaceId = "startup-retry-system-abort-skip";
-    const { session, cleanup } = await createSessionBundle(workspaceId);
+    const { session, config, cleanup } = await createSessionBundle(workspaceId);
     cleanups.push(cleanup);
 
     const privateSession = session as unknown as {
-      getAutoRetryPreferencePath: () => string;
       startupAutoRetryAbandon: { reason: string; userMessageId?: string } | null;
       updateStartupAutoRetryAbandonFromAbort: (
         abortReason: "user" | "startup" | "system" | undefined,
@@ -2484,7 +2980,7 @@ describe("AgentSession startup auto-retry recovery", () => {
       ) => Promise<void>;
     };
 
-    const preferencePath = privateSession.getAutoRetryPreferencePath();
+    const preferencePath = autoRetryPreferencePath(config, workspaceId);
 
     await privateSession.updateStartupAutoRetryAbandonFromAbort("system", "user-1");
 

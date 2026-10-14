@@ -21,7 +21,10 @@ import {
   SESSION_HISTORY_DEFAULT_READ_CHARS,
   SESSION_HISTORY_MAX_RESULT_BYTES,
 } from "@/common/constants/contextBudget";
-import { getHistoryItemId } from "@/common/utils/messages/contextWindows";
+import {
+  getHistoryItemId,
+  isHiddenFromSessionHistory,
+} from "@/common/utils/messages/contextWindows";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import type { HistoryScanState } from "@/node/services/historyCursor";
@@ -39,13 +42,7 @@ export type SessionHistoryResult = z.infer<typeof TOOL_DEFINITIONS.session_histo
  */
 function projectHistory(message: MuxMessage): { text: string; toolNames: Set<string> } {
   const toolNames = new Set<string>();
-  if (
-    message.metadata?.contextBudgetRejected ||
-    message.metadata?.muxMetadata?.type === "compaction-request" ||
-    (message.metadata?.synthetic && !message.metadata.uiVisible) ||
-    message.metadata?.rlmPreservedTailCopy
-  )
-    return { text: "", toolNames };
+  if (isHiddenFromSessionHistory(message)) return { text: "", toolNames };
   const sanitize = (
     value: unknown,
     depth: number,
@@ -255,7 +252,8 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
       // and shift snippet offsets. Escape the query so matching stays literal.
       const search =
         args.action === "search"
-          ? new RegExp(args.query!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "iu")
+          ? // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+            new RegExp(args.query!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "iu")
           : null;
       const timeout = (): SessionHistoryResult => ({
         success: false,
@@ -277,7 +275,9 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           items: [],
           windows: [],
         };
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const items = result.items!;
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const windows = result.windows!;
         const warnings = new Set<Warning>();
         // Any scan of this attempt (caller authorization or target) that had to skip rows
@@ -456,6 +456,10 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
                     itemId,
                     windowId,
                     role: message.role,
+                    // The actual start after clamping, pair rounding and lead-in: consumers
+                    // cannot derive it from offset_chars or the match position. Staged with
+                    // the row so the payload budget counts it; shrinking only moves `end`.
+                    startCharOffset: start,
                     text: text.slice(start, end),
                     nextCharOffset: undefined as number | undefined,
                   };
@@ -473,6 +477,10 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
                   assert(
                     end > start || start === text.length,
                     "history character pages must make progress"
+                  );
+                  assert(
+                    item.startCharOffset + item.text.length === end,
+                    "history character pages must report their exact start"
                   );
                   if (end < text.length) item.nextCharOffset = end;
                   if (args.action === "read_item") {

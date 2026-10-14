@@ -38,7 +38,7 @@ import {
 import { execFileAsync } from "@/node/utils/disposableExec";
 import { RuntimeConfigSchema } from "@/common/orpc/schemas";
 import type { OnChatMode, SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
-import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
+import type { AgentSkillDescriptor, AgentSkillListResult } from "@/common/types/agentSkill";
 import type { CompactionRequestData } from "@/common/types/message";
 import { buildAgentSkillMetadata } from "@/common/types/message";
 import { isWorktreeRuntime, type RuntimeConfig, type RuntimeMode } from "@/common/types/runtime";
@@ -73,6 +73,7 @@ import {
   type ParsedAcpSlashCommand,
 } from "./slashCommands";
 import { StreamTranslator } from "./streamTranslator";
+import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 import { ToolRouter } from "./toolRouter";
 
 const DEFAULT_AGENT_ID = "exec";
@@ -143,8 +144,15 @@ interface TurnCompletion {
    * Used to avoid binding fallback stream-start events emitted before prompt dispatch.
    */
   dispatchedAtMs?: number;
+  /**
+   * Bind only a stream-start that carries this turn's correlation id. A /send-held turn passes
+   * its id through the resend (#5170), so an uncorrelated start is another entry's stream.
+   */
+  requiresExactCorrelation?: boolean;
   /** Inactivity timer so idle prompt turns cannot hang forever. */
   timeoutHandle: ReturnType<typeof setTimeout>;
+  /** The backend lists this prompt's entry as queued (see syncTurnQueuedState). */
+  queued?: boolean;
   /** Set after stream-start; only this message id may resolve/reject the turn. */
   messageId?: string;
 }
@@ -187,6 +195,8 @@ export class MuxAgent implements Agent {
     NewSessionWorkspaceLifecycle
   >();
   private readonly sessionSkillsById = new Map<string, Map<string, AgentSkillDescriptor>>();
+  private readonly skillsReadGenerationById = new Map<string, number>();
+  private skillsReadCount = 0;
   /**
    * Persist each session's desired onChat mode so prompt() can recover dropped
    * subscriptions without changing replay semantics (full vs live).
@@ -716,24 +726,7 @@ export class MuxAgent implements Agent {
     );
     assert(args.message.trim().length > 0, "sendWorkspaceMessageAndAwaitTurn: message required");
 
-    this.markNewSessionWorkspacePromptActivity(args.workspaceId);
-
-    const promptCorrelationId = randomUUID();
-    const turnPromise = this.beginTurn(args.sessionId, promptCorrelationId);
-
-    // Attach a sink immediately so early stream failures cannot produce
-    // unhandled rejections before this method awaits turnPromise.
-    void turnPromise.catch(() => undefined);
-
-    try {
-      // Re-establish chat subscription if a prior one dropped (e.g., transient
-      // websocket interruption). Register the turn first so subscription
-      // failures can reject it instead of leaving prompt() hanging. Follow-on sessions
-      // (`/new`, `/fork`) reach this without passing through prompt()'s gate.
-      await this.assertTranscriptVerified(args.sessionId, args.workspaceId);
-
-      this.markTurnDispatched(args.sessionId, promptCorrelationId);
-
+    return this.dispatchAndAwaitTurn(args, async (promptCorrelationId) => {
       const delegatedToolNames = this.getDelegatedToolNames(args.sessionId);
       const optionsWithPromptCorrelation = this.attachPromptCorrelationToSendOptions(
         args.options,
@@ -756,6 +749,39 @@ export class MuxAgent implements Agent {
           `prompt: workspace.sendMessage failed: ${stringifyUnknown(sendResult.error)}`
         );
       }
+    });
+  }
+
+  /**
+   * Run one prompt turn: `dispatch` starts (or queues) the workspace message, and the returned
+   * response settles when that message's stream ends, aborts or fails.
+   */
+  private async dispatchAndAwaitTurn(
+    args: { sessionId: string; workspaceId: string; requiresExactCorrelation?: boolean },
+    dispatch: (promptCorrelationId: string) => Promise<void>
+  ): Promise<PromptResponse> {
+    this.markNewSessionWorkspacePromptActivity(args.workspaceId);
+
+    const promptCorrelationId = randomUUID();
+    const turnPromise = this.beginTurn(
+      args.sessionId,
+      promptCorrelationId,
+      args.requiresExactCorrelation
+    );
+
+    // Attach a sink immediately so early stream failures cannot produce
+    // unhandled rejections before this method awaits turnPromise.
+    void turnPromise.catch(() => undefined);
+
+    try {
+      // Re-establish chat subscription if a prior one dropped (e.g., transient
+      // websocket interruption). Register the turn first so subscription
+      // failures can reject it instead of leaving prompt() hanging. Follow-on sessions
+      // (`/new`, `/fork`) reach this without passing through prompt()'s gate.
+      await this.assertTranscriptVerified(args.sessionId, args.workspaceId);
+
+      this.markTurnDispatched(args.sessionId, promptCorrelationId);
+      await dispatch(promptCorrelationId);
 
       const turn = await turnPromise;
       const usage = turn.usage ?? this.latestUsageBySessionId.get(args.sessionId);
@@ -888,6 +914,69 @@ export class MuxAgent implements Agent {
     switch (parsedCommand.kind) {
       case "invalid":
         return this.respondToCommand(sessionId, parsedCommand.message);
+
+      case "send-held": {
+        const lookup = this.streamTranslator.resolveHeldInput(sessionId, parsedCommand.number);
+        if (lookup.kind === "refused") {
+          return this.respondToCommand(sessionId, lookup.message);
+        }
+        // The backend re-sends the held payload as THIS prompt (#5170): the correlation replaces
+        // the one it was queued with, so the turn binds only its own stream. A resend that is
+        // queued and then refused at dequeue is held again under this id and settles the turn
+        // (settleTurnHeldBeforeStart). A refused resend is reported with the backend's reason,
+        // which says whether the input is still held (it may have been sent or discarded
+        // elsewhere since the notice).
+        let refusal: string | undefined;
+        const response = await this.dispatchAndAwaitTurn(
+          { sessionId, workspaceId, requiresExactCorrelation: true },
+          async (promptCorrelationId) => {
+            const delegatedToolNames = this.getDelegatedToolNames(sessionId);
+            const sendResult = await this.server.client.workspace.sendHeldInput({
+              workspaceId,
+              heldInputId: lookup.heldInput.id,
+              acpCorrelation: {
+                acpPromptId: promptCorrelationId,
+                delegatedToolNames: delegatedToolNames.length > 0 ? delegatedToolNames : undefined,
+              },
+            });
+            if (!sendResult.success) {
+              refusal = formatSendMessageError(sendResult.error).message;
+              throw new Error(`send-held: workspace.sendHeldInput failed: ${refusal}`);
+            }
+          }
+        ).catch((error: unknown) => {
+          if (refusal == null) throw error;
+          return null;
+        });
+        if (response != null) {
+          return response;
+        }
+        assert(refusal != null, "send-held: a failed resend records its refusal");
+        return this.respondToCommand(
+          sessionId,
+          `Could not send unsent message ${lookup.number}: ${refusal}`
+        );
+      }
+
+      case "discard-held": {
+        // The ACP counterpart of the desktop banner's Discard (#4944). ACP cannot put text back
+        // into the client's prompt, so the held-input notice shows each message's full text;
+        // sending it is tracked in #5170.
+        const lookup = this.streamTranslator.resolveHeldInput(sessionId, parsedCommand.number);
+        if (lookup.kind === "refused") {
+          return this.respondToCommand(sessionId, lookup.message);
+        }
+        const discardResult = await this.server.client.workspace.discardHeldInput({
+          workspaceId,
+          heldInputId: lookup.heldInput.id,
+        });
+        return this.respondToCommand(
+          sessionId,
+          discardResult.success
+            ? `Discarded unsent message ${lookup.number}.`
+            : `Could not discard unsent message ${lookup.number}: ${discardResult.error}`
+        );
+      }
 
       case "clear": {
         const clearResult = await this.server.client.workspace.truncateHistory({
@@ -1304,27 +1393,48 @@ export class MuxAgent implements Agent {
   }
 
   private async refreshSessionCommands(sessionId: string, workspaceId: string): Promise<void> {
+    const isLatestRead = this.startSkillsRead(sessionId);
     let advertisedSkills: AgentSkillDescriptor[];
 
     try {
-      const skills = await this.server.client.agentSkills.list({ workspaceId });
-      const skillsByName = mapSkillsByName(skills);
-      this.sessionSkillsById.set(sessionId, skillsByName);
-      advertisedSkills = skills;
+      const result = await this.server.client.agentSkills.list({ workspaceId });
+      if (!isLatestRead()) return;
+      this.cacheSessionSkills(sessionId, result);
+      advertisedSkills = result.skills;
     } catch (error) {
       // Command advertisement should not block session creation/loading.
       console.error("[acp] Failed to load skills while publishing slash commands", error);
+      if (!isLatestRead()) return;
       // Always publish built-in commands even if skills are temporarily unavailable.
       const cachedSkillsByName = this.sessionSkillsById.get(sessionId);
       advertisedSkills = cachedSkillsByName ? Array.from(cachedSkillsByName.values()) : [];
     }
 
+    await this.publishSessionCommands(sessionId, advertisedSkills);
+  }
+
+  /**
+   * A read that waits out an SSH timeout can finish after a newer read. Only
+   * the newest read may change the cache or the client's command list, so a
+   * stale partial list never replaces a recovered one.
+   */
+  private startSkillsRead(sessionId: string): () => boolean {
+    // Global, so a read from before an eviction never matches a later session's read.
+    const generation = ++this.skillsReadCount;
+    this.skillsReadGenerationById.set(sessionId, generation);
+    return () => this.skillsReadGenerationById.get(sessionId) === generation;
+  }
+
+  private async publishSessionCommands(
+    sessionId: string,
+    skills: AgentSkillDescriptor[]
+  ): Promise<void> {
     try {
       await this.connection.sessionUpdate({
         sessionId,
         update: {
           sessionUpdate: "available_commands_update",
-          availableCommands: buildAcpAvailableCommands(advertisedSkills),
+          availableCommands: buildAcpAvailableCommands(skills),
         },
       });
     } catch (error) {
@@ -1342,9 +1452,31 @@ export class MuxAgent implements Agent {
       return cached;
     }
 
-    const skills = await this.server.client.agentSkills.list({ workspaceId });
-    const skillsByName = mapSkillsByName(skills);
-    this.sessionSkillsById.set(sessionId, skillsByName);
+    const isLatestRead = this.startSkillsRead(sessionId);
+    const result = await this.server.client.agentSkills.list({ workspaceId });
+    if (!isLatestRead()) {
+      return mapSkillsByName(result.skills);
+    }
+    const skillsByName = this.cacheSessionSkills(sessionId, result);
+    // No cache means the client was last sent a partial list (or none), so its
+    // command picker is stale too: send it the list just read.
+    await this.publishSessionCommands(sessionId, result.skills);
+    return skillsByName;
+  }
+
+  private cacheSessionSkills(
+    sessionId: string,
+    result: AgentSkillListResult
+  ): Map<string, AgentSkillDescriptor> {
+    const skillsByName = mapSkillsByName(result.skills);
+    // The cache holds only the latest complete list. After a partial list (e.g.
+    // SSH host unreachable) the next prompt asks again, and an older complete
+    // list cannot keep accepting commands the partial list no longer has.
+    if (result.unavailableSources.length === 0) {
+      this.sessionSkillsById.set(sessionId, skillsByName);
+    } else {
+      this.sessionSkillsById.delete(sessionId);
+    }
     return skillsByName;
   }
 
@@ -1420,6 +1552,7 @@ export class MuxAgent implements Agent {
     this.toolRouter.removeSession(sessionId);
     this.sessionStateById.delete(sessionId);
     this.sessionSkillsById.delete(sessionId);
+    this.skillsReadGenerationById.delete(sessionId);
     this.onChatModeBySessionId.delete(sessionId);
     this.chatSubscriptionModeBySessionId.delete(sessionId);
     this.historyReplayFailedSessionIds.delete(sessionId);
@@ -1684,8 +1817,6 @@ export class MuxAgent implements Agent {
         event.type === "tool-call-delta" ||
         event.type === "usage-delta" ||
         event.type === "session-usage-delta" ||
-        event.type === "advisor-output" ||
-        event.type === "advisor-reasoning-output" ||
         event.type === "bash-output" ||
         event.type === "init-output" ||
         event.type === "init-progress" ||
@@ -1834,6 +1965,16 @@ export class MuxAgent implements Agent {
 
     this.refreshTurnInactivityTimeoutFromEvent(sessionId, event);
 
+    if (event.type === "held-inputs-changed") {
+      this.settleTurnHeldBeforeStart(sessionId, event.heldInputs);
+      return;
+    }
+
+    if (event.type === "queued-message-changed") {
+      this.syncTurnQueuedState(sessionId, event.acpPromptIds ?? []);
+      return;
+    }
+
     if (event.type === "usage-delta") {
       if (!this.isActiveTurnMessage(sessionId, event.messageId)) {
         return;
@@ -1854,6 +1995,10 @@ export class MuxAgent implements Agent {
       const hasMatchingCorrelation = event.acpPromptId === completion.promptCorrelationId;
       const canFallbackToUncorrelatedStart =
         completion.messageId == null &&
+        completion.requiresExactCorrelation !== true &&
+        // The backend publishes a dequeue before that entry's stream starts, so an uncorrelated
+        // start while this prompt is still queued belongs to an entry ahead of it (#5198).
+        completion.queued !== true &&
         completion.dispatchedAtMs != null &&
         !isReplayEvent &&
         event.acpPromptId == null &&
@@ -1940,6 +2085,54 @@ export class MuxAgent implements Agent {
     }
   }
 
+  /**
+   * A queued prompt that the backend refused at dequeue (or a Stop returned from the queue) is
+   * kept as held input and never starts a stream, so no terminal event would settle its turn
+   * (#5171). The held list names that prompt by its correlation id: settle the turn from it.
+   */
+  private settleTurnHeldBeforeStart(
+    sessionId: string,
+    heldInputs: Extract<WorkspaceChatMessage, { type: "held-inputs-changed" }>["heldInputs"]
+  ): void {
+    const completion = this.turnCompletions.get(sessionId);
+    // A turn bound to its stream-start was dispatched: its input was sent, so it is not held.
+    if (completion == null || completion.messageId != null) {
+      return;
+    }
+    const held = heldInputs.find(
+      (heldInput) => heldInput.acpPromptId === completion.promptCorrelationId
+    );
+    if (held == null) {
+      return;
+    }
+    this.resolveTurn(sessionId, {
+      stopReason: held.reason === "interrupted" ? "cancelled" : "refusal",
+      usage: this.latestUsageBySessionId.get(sessionId),
+    });
+  }
+
+  /**
+   * A prompt queued behind another turn gets no correlated event until its own stream starts, so
+   * the pre-correlation timeout must not run while the backend lists its entry as queued (#5198).
+   * Leaving the queue starts a fresh window: dispatch, refusal or Stop each settle it from there.
+   */
+  private syncTurnQueuedState(sessionId: string, queuedAcpPromptIds: readonly string[]): void {
+    const completion = this.turnCompletions.get(sessionId);
+    if (completion == null || completion.messageId != null) {
+      return;
+    }
+    const queued = queuedAcpPromptIds.includes(completion.promptCorrelationId);
+    if (queued === (completion.queued === true)) {
+      return;
+    }
+    completion.queued = queued;
+    if (queued) {
+      clearTimeout(completion.timeoutHandle);
+    } else {
+      this.resetTurnInactivityTimeout(sessionId);
+    }
+  }
+
   private async maybeDelegateToolCallToEditor(
     sessionId: string,
     event: Extract<WorkspaceChatMessage, { type: "tool-call-start" }>
@@ -1995,7 +2188,7 @@ export class MuxAgent implements Agent {
       // Only guard the pre-correlation phase. Once stream-start binds a
       // messageId, long quiet stretches (e.g., tool execution) are valid and
       // must not be failed locally by a fixed inactivity watchdog.
-      if (completion.messageId != null) {
+      if (completion.messageId != null || completion.queued === true) {
         return;
       }
 
@@ -2054,7 +2247,11 @@ export class MuxAgent implements Agent {
     }
   }
 
-  private beginTurn(sessionId: string, promptCorrelationId: string): Promise<TurnResult> {
+  private beginTurn(
+    sessionId: string,
+    promptCorrelationId: string,
+    requiresExactCorrelation?: boolean
+  ): Promise<TurnResult> {
     assert(
       !this.turnCompletions.has(sessionId),
       `prompt: session '${sessionId}' already has a running turn`
@@ -2081,6 +2278,7 @@ export class MuxAgent implements Agent {
         promptCorrelationId,
         startedAtMs,
         timeoutHandle,
+        requiresExactCorrelation,
       });
     });
   }

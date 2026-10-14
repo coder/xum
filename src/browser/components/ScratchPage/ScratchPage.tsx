@@ -79,7 +79,8 @@ export function ScratchPage(props: ScratchPageProps) {
   return (
     <AgentProvider projectPath={SCRATCH_PROJECT_CONFIG_KEY}>
       <ThinkingProvider projectPath={SCRATCH_PROJECT_CONFIG_KEY}>
-        <div className="bg-surface-primary relative flex flex-1 flex-col overflow-hidden">
+        {/* No workspace is open, so this page is the one `main` landmark (#5969). */}
+        <main className="bg-surface-primary relative flex flex-1 flex-col overflow-hidden">
           <div
             className={cn(
               "bg-sidebar border-border-light mobile-sticky-header flex shrink-0 items-center border-b px-2 [@media(max-width:768px)]:h-auto [@media(max-width:768px)]:py-2",
@@ -146,7 +147,7 @@ export function ScratchPage(props: ScratchPageProps) {
               </div>
             </div>
           </div>
-        </div>
+        </main>
       </ThinkingProvider>
     </AgentProvider>
   );

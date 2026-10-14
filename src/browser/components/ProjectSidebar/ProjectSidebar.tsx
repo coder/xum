@@ -16,14 +16,13 @@ import { useWorkspaceStoreRaw, type WorkspaceStore } from "@/browser/stores/Work
 import {
   EXPANDED_PROJECTS_KEY,
   MOBILE_LEFT_SIDEBAR_SCROLL_TOP_KEY,
-  SIDEBAR_AGE_GROUPING_KEY,
-  SIDEBAR_FLAT_MODE_KEY,
-  SIDEBAR_HIDE_SUBAGENTS_KEY,
   getDraftScopeId,
-  getInputAttachmentsKey,
-  getInputKey,
   getWorkspaceLastReadKey,
   getWorkspaceNameStateKey,
+  EXPANDED_OLD_WORKSPACES_KEY,
+  EXPANDED_SECTIONS_KEY,
+  EXPANDED_COMPLETED_SUB_AGENTS_KEY,
+  EXPANDED_TASK_GROUPS_KEY,
 } from "@/common/constants/storage";
 import { getDisplayTitleFromPersistedState } from "@/browser/hooks/useWorkspaceName";
 import { DndProvider } from "react-dnd";
@@ -34,14 +33,16 @@ import {
   reorderProjects,
   normalizeOrder,
 } from "@/common/utils/projectOrdering";
-import { PROJECT_ORDER_KEY } from "@/common/constants/storage";
+import { SIDEBAR_EXPANSION_MAP_MAX_CHARS } from "@/common/constants/storage";
+import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
+import { withRecordEntry } from "@/browser/utils/boundedPersistedValue";
 import {
   matchesKeybind,
   formatKeybind,
   isEditableElement,
   KEYBINDS,
 } from "@/browser/utils/ui/keybinds";
-import { useAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
 import {
   CUSTOM_EVENTS,
   getStorageChangeEvent,
@@ -69,6 +70,7 @@ import {
   orderMultiProjectSectionRows,
   resolveEffectiveSectionId,
   isSidebarSubAgentRunning,
+  isWorkspaceSidebarStateWorking,
   computeRowMetaForVisibleNodes,
   type AgentRowRenderMeta,
   type SidebarVisibleRowNode,
@@ -80,13 +82,11 @@ import {
   type PinnedDropEdge,
   type PinnedMoveDirection,
 } from "@/browser/utils/ui/pinnedReorder";
+import { isWorkspaceRowRendered } from "@/browser/utils/ui/workspaceDomNav";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { SidebarCollapseButton } from "../SidebarCollapseButton/SidebarCollapseButton";
 import { ConfirmationModal } from "../ConfirmationModal/ConfirmationModal";
-import {
-  buildArchiveConfirmDescription,
-  buildArchiveConfirmWarning,
-} from "@/browser/utils/archiveConfirmation";
+import { useArchiveWorkspaceConfirmation } from "@/browser/hooks/useArchiveWorkspaceConfirmation";
 import { ProjectDeleteConfirmationModal } from "../ProjectDeleteConfirmationModal/ProjectDeleteConfirmationModal";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 
@@ -109,6 +109,7 @@ import { TitleEditProvider, useTitleEdit } from "@/browser/contexts/WorkspaceTit
 import { useConfirmDialog } from "@/browser/contexts/ConfirmDialogContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
+import { useWorkspaceActionKeybinds } from "./useWorkspaceActionKeybinds";
 import { useContextMenuPosition } from "@/browser/hooks/useContextMenuPosition";
 import {
   PositionedMenu,
@@ -119,17 +120,24 @@ import {
   EllipsisVertical,
   Folder,
   FolderOpen,
+  FolderPlus,
   KeyRound,
   Palette,
   Pencil,
   ScrollText,
+  SquarePen,
   Trash,
   Plus,
 } from "lucide-react";
 import { useWorkspaceActions } from "@/browser/contexts/WorkspaceContext";
 import { useRouter } from "@/browser/contexts/RouterContext";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
-import { forkWorkspace } from "@/browser/utils/chatCommands";
+import { formatWorkspaceRemoveWarnings } from "@/browser/utils/workspace";
+import {
+  forkWorkspaceFromMenu,
+  getErrorAnchor,
+  stopWorkspaceRuntime,
+} from "@/browser/components/WorkspaceActionsMenuContent/workspaceActionHandlers";
 import { PopoverError } from "../PopoverError/PopoverError";
 import { SectionHeader } from "../SectionHeader/SectionHeader";
 import { WorkspaceSectionDropZone } from "../WorkspaceSectionDropZone/WorkspaceSectionDropZone";
@@ -141,6 +149,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { isMultiProject } from "@/common/utils/multiProject";
 import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_SIDEBAR_SECTION_ID } from "@/common/constants/scratch";
+import { getDraftStore, useDraft } from "@/browser/stores/DraftStore";
 import {
   MULTI_PROJECT_CONFIG_KEY,
   MULTI_PROJECT_SIDEBAR_SECTION_ID,
@@ -211,16 +220,8 @@ function getWorkspaceAttentionSignal(
 ): WorkspaceAttentionSignal | null {
   try {
     const sidebarState = workspaceStore.getWorkspaceSidebarState(workspaceId);
-    const isWorking =
-      (sidebarState.canInterrupt ||
-        sidebarState.isStarting ||
-        sidebarState.activeWorkflowRunCount > 0 ||
-        // An armed background bash monitor keeps the workspace "working" so collapsed
-        // project/parent rows don't look idle while it waits to be woken.
-        sidebarState.activeBashMonitorCount > 0) &&
-      !sidebarState.awaitingUserQuestion;
     return {
-      isWorking,
+      isWorking: isWorkspaceSidebarStateWorking(sidebarState),
       hasActiveBashMonitor: sidebarState.activeBashMonitorCount > 0,
       awaitingUserQuestion: sidebarState.awaitingUserQuestion,
       activeWorkflowRunIdsKey: (sidebarState.activeWorkflowRunIds ?? []).join("\u0000"),
@@ -330,8 +331,12 @@ const PROJECT_ITEM_BASE_CLASS =
   "group sticky top-0 z-30 py-2 pl-2 pr-1 flex select-none items-center border-l-transparent bg-surface-primary transition-colors duration-150";
 
 // Shared classes for the chevron toggle buttons on project/section headers.
+// The hit area is 24x24 px (WCAG target-size, #5951), but the negative margins keep the layout
+// and the inner box keeps the 20x20 px look, so the visual design does not change.
 const PROJECT_TOGGLE_BUTTON_CLASSES =
-  "text-secondary hover:bg-hover hover:border-border-light mr-1.5 flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent p-0 transition-all duration-200";
+  "group/toggle text-secondary -my-0.5 -ml-0.5 mr-1 flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center bg-transparent p-0";
+const PROJECT_TOGGLE_BOX_CLASSES =
+  "group-hover/toggle:bg-hover group-hover/toggle:border-border-light flex h-5 w-5 items-center justify-center rounded border border-transparent transition-all duration-200";
 
 function getProjectFallbackLabel(projectPath: string): string {
   const abbreviatedPath = PlatformPaths.abbreviate(projectPath);
@@ -441,7 +446,6 @@ interface DraftAgentListItemWrapperProps {
   draftNumber: number;
   isSelected: boolean;
   sectionId?: string;
-  onVisibilityChange?: (isVisible: boolean) => void;
   projectBadgeName?: string;
   projectBadgeColor?: string;
   onOpen: () => void;
@@ -483,35 +487,67 @@ function isDraftVisible(
   values?: {
     draftPrompt?: string;
     workspaceNameState?: unknown;
-    draftAttachments?: unknown[];
+    draftAttachmentCount?: number;
   }
 ): boolean {
   const scopeId = getDraftScopeId(projectPath, draftId);
-  const draftPrompt = values?.draftPrompt ?? readPersistedState<string>(getInputKey(scopeId), "");
+  // Text and attachments come from the backend-backed draft store.
+  const draft = getDraftStore().getView({ kind: "creation", projectPath, draftId });
+  const draftPrompt = values?.draftPrompt ?? draft.text;
   const workspaceNameState =
     values?.workspaceNameState ??
     readPersistedState<unknown>(getWorkspaceNameStateKey(scopeId), null);
-  const draftAttachments =
-    values?.draftAttachments ?? readPersistedState<unknown[]>(getInputAttachmentsKey(scopeId), []);
+  const draftAttachmentCount = values?.draftAttachmentCount ?? draft.attachmentCount;
 
   const hasTextContent = typeof draftPrompt === "string" && draftPrompt.trim().length > 0;
-  const hasAttachments = Array.isArray(draftAttachments) && draftAttachments.length > 0;
+  const hasAttachments = draftAttachmentCount > 0;
   const hasNameState = workspaceNameState !== null;
   return hasTextContent || hasAttachments || hasNameState;
 }
 
+/**
+ * Reports one draft's sidebar visibility. Rendered for every listed draft, whether or not its
+ * row is mounted (a collapsed section unmounts rows), so the sidebar's count, placeholder and
+ * draft numbers never read a stale value (#5677).
+ */
+function DraftVisibilityWatcher(props: {
+  projectPath: string;
+  draftId: string;
+  onVisibilityChange: (projectPath: string, draftId: string, isVisible: boolean) => void;
+}) {
+  const draft = useDraft({
+    kind: "creation",
+    projectPath: props.projectPath,
+    draftId: props.draftId,
+  });
+  const [workspaceNameState] = usePersistedState<unknown>(
+    getWorkspaceNameStateKey(getDraftScopeId(props.projectPath, props.draftId)),
+    null,
+    { listener: true }
+  );
+  const isVisible = isDraftVisible(props.projectPath, props.draftId, {
+    draftPrompt: draft.text,
+    workspaceNameState,
+    draftAttachmentCount: draft.attachmentCount,
+  });
+  const { projectPath, draftId, onVisibilityChange } = props;
+  useEffect(() => {
+    onVisibilityChange(projectPath, draftId, isVisible);
+  }, [projectPath, draftId, isVisible, onVisibilityChange]);
+  return null;
+}
+
 function DraftAgentListItemWrapper(props: DraftAgentListItemWrapperProps) {
   const scopeId = getDraftScopeId(props.projectPath, props.draftId);
-  const onVisibilityChange = props.onVisibilityChange;
 
-  const [draftPrompt] = usePersistedState<string>(getInputKey(scopeId), "", {
-    listener: true,
+  const draft = useDraft({
+    kind: "creation",
+    projectPath: props.projectPath,
+    draftId: props.draftId,
   });
+  const draftPrompt = draft.text;
 
   const [workspaceNameState] = usePersistedState<unknown>(getWorkspaceNameStateKey(scopeId), null, {
-    listener: true,
-  });
-  const [draftAttachments] = usePersistedState<unknown[]>(getInputAttachmentsKey(scopeId), [], {
     listener: true,
   });
 
@@ -528,12 +564,8 @@ function DraftAgentListItemWrapper(props: DraftAgentListItemWrapperProps) {
   const isVisible = isDraftVisible(props.projectPath, props.draftId, {
     draftPrompt,
     workspaceNameState,
-    draftAttachments: Array.isArray(draftAttachments) ? draftAttachments : [],
+    draftAttachmentCount: draft.attachmentCount,
   });
-
-  useEffect(() => {
-    onVisibilityChange?.(isVisible);
-  }, [isVisible, onVisibilityChange]);
 
   if (!isVisible) {
     return null;
@@ -622,35 +654,37 @@ const ProjectDragLayer: React.FC = () => {
 /**
  * Handles F2 (edit title) and Shift+F2 (generate new title) keybinds.
  * Rendered inside TitleEditProvider so it can access useTitleEdit().
+ * Both keys also work with the sidebar collapsed (#6328): Shift+F2 needs no row, and F2 leaves a
+ * workspace whose row is not rendered to the workspace header (WorkspaceMenuBar).
  */
 function SidebarTitleEditKeybinds(props: {
   selectedWorkspace: WorkspaceSelection | undefined;
   sortedWorkspacesByProject: Map<string, FrontendWorkspaceMetadata[]>;
-  collapsed: boolean;
 }) {
   const { requestEdit, wrapGenerateTitle } = useTitleEdit();
-  const { api } = useAPI();
+  const liveApi = useLiveAPI();
 
   const regenerateTitleForWorkspace = useCallback(
     (workspaceId: string) => {
       wrapGenerateTitle(workspaceId, () => {
-        if (!api) {
+        if (!liveApi) {
           return Promise.resolve({ success: false, error: "Not connected to server" });
         }
-        return api.workspace.regenerateTitle({ workspaceId });
+        return liveApi.workspace.regenerateTitle({ workspaceId });
       });
     },
-    [wrapGenerateTitle, api]
+    [wrapGenerateTitle, liveApi]
   );
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (props.collapsed) return;
       if (!props.selectedWorkspace) return;
       if (isEditableElement(e.target)) return;
       const wsId = props.selectedWorkspace.workspaceId;
 
       if (matchesKeybind(e, KEYBINDS.EDIT_WORKSPACE_TITLE)) {
+        // No row to edit in: the workspace header takes the key.
+        if (!isWorkspaceRowRendered(wsId)) return;
         e.preventDefault();
         const meta = props.sortedWorkspacesByProject
           .get(props.selectedWorkspace.projectPath)
@@ -665,7 +699,6 @@ function SidebarTitleEditKeybinds(props: {
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [
-    props.collapsed,
     props.selectedWorkspace,
     props.sortedWorkspacesByProject,
     requestEdit,
@@ -702,18 +735,6 @@ interface ProjectSidebarProps {
   workspaceRecency: Record<string, number>;
 }
 
-function didUntrackedPathSetChange(
-  acknowledgedUntrackedPaths: string[],
-  latestUntrackedPaths: string[]
-): boolean {
-  if (acknowledgedUntrackedPaths.length !== latestUntrackedPaths.length) {
-    return true;
-  }
-
-  const acknowledgedSet = new Set(acknowledgedUntrackedPaths);
-  return latestUntrackedPaths.some((path) => !acknowledgedSet.has(path));
-}
-
 const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   collapsed,
   onToggleCollapsed,
@@ -745,10 +766,14 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const workspaceStore = useWorkspaceStoreRaw();
   useWorkspaceAttentionSubscription(sortedWorkspacesByProject, workspaceStore);
   const runtimeStatusStore = useRuntimeStatusStoreRaw();
-  const { navigateToProject } = useRouter();
-  const { api } = useAPI();
+  const { navigateToProject, isAnalyticsOpen } = useRouter();
+  const liveApi = useLiveAPI();
   const { confirm: confirmDialog } = useConfirmDialog();
   const settings = useSettings();
+  // The settings and analytics modals cover the chat without changing the route's workspace;
+  // treat the covered workspace as unselected so its unread state stays visible until they close.
+  const visibleSelectedWorkspaceId =
+    settings.isOpen || isAnalyticsOpen ? undefined : selectedWorkspace?.workspaceId;
 
   // Get project state and operations from context
   const {
@@ -884,39 +909,39 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   // Key format: getTierKey(projectPath, tierIndex) where tierIndex is 0, 1, 2 for 1/7/30 days
   const [expandedOldWorkspaces, setExpandedOldWorkspaces] = usePersistedState<
     Record<string, boolean>
-  >("expandedOldWorkspaces", {});
+  >(EXPANDED_OLD_WORKSPACES_KEY, {});
 
   // Whether workspaces are grouped under collapsible "Older than X days" tiers.
-  // Toggled from Settings → General; listener keeps the sidebar live-updated.
-  const [ageGroupingEnabled] = usePersistedState<boolean>(SIDEBAR_AGE_GROUPING_KEY, true, {
-    listener: true,
-  });
+  const ageGroupingEnabled =
+    useUserPreferences((preferences) => preferences.ui?.sidebarAgeGrouping) ?? true;
 
-  const [flatSidebarEnabled] = usePersistedState<boolean>(SIDEBAR_FLAT_MODE_KEY, false, {
-    listener: true,
-  });
+  const flatSidebarEnabled =
+    useUserPreferences((preferences) => preferences.ui?.sidebarFlatMode) ?? false;
 
   // Opt-in: hide sub-agent rows and summarize them on parent rows instead.
-  const [hideSubAgentRows] = usePersistedState<boolean>(SIDEBAR_HIDE_SUBAGENTS_KEY, false, {
-    listener: true,
-  });
+  const hideSubAgentRows =
+    useUserPreferences((preferences) => preferences.ui?.sidebarHideSubAgents) ?? false;
 
   // Track which sections are expanded
   const [expandedSections, setExpandedSections] = usePersistedState<Record<string, boolean>>(
-    "expandedSections",
+    EXPANDED_SECTIONS_KEY,
     {}
   );
 
   // Track parent workspaces whose reported child tasks are expanded.
   const [expandedCompletedSubAgents, setExpandedCompletedSubAgents] = usePersistedState<
     Record<string, boolean>
-  >("expandedCompletedSubAgents", {});
+  >(EXPANDED_COMPLETED_SUB_AGENTS_KEY, {});
   const toggleCompletedChildrenExpansion = useCallback(
     (workspaceId: string) => {
-      setExpandedCompletedSubAgents((prev) => ({
-        ...prev,
-        [workspaceId]: !(prev[workspaceId] ?? false),
-      }));
+      setExpandedCompletedSubAgents((prev) =>
+        withRecordEntry(
+          prev,
+          workspaceId,
+          !(prev[workspaceId] ?? false),
+          SIDEBAR_EXPANSION_MAP_MAX_CHARS
+        )
+      );
     },
     [setExpandedCompletedSubAgents]
   );
@@ -934,7 +959,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   // Task-group expansion survives reloads (D7). Keys are namespaced per group
   // kind: task:<parentWorkspaceId>:<groupId> / workflow:<parentWorkspaceId>:<runId>.
   const [expandedTaskGroups, setExpandedTaskGroups] = usePersistedState<Record<string, boolean>>(
-    "expandedTaskGroups",
+    EXPANDED_TASK_GROUPS_KEY,
     {}
   );
   // D6: a workflow group that is (or was, this session) active defaults to
@@ -952,10 +977,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     new Map()
   );
   const toggleTaskGroupExpansion = (storageKey: string, isCurrentlyExpanded: boolean) => {
-    setExpandedTaskGroups((prev) => ({
-      ...prev,
-      [storageKey]: !isCurrentlyExpanded,
-    }));
+    setExpandedTaskGroups((prev) =>
+      withRecordEntry(prev, storageKey, !isCurrentlyExpanded, SIDEBAR_EXPANSION_MAP_MAX_CHARS)
+    );
   };
 
   const [removingWorkspaceIds, setRemovingWorkspaceIds] = useState<Set<string>>(new Set());
@@ -966,15 +990,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const workspaceForkError = usePopoverError();
   const workspaceStopRuntimeError = usePopoverError();
   const workspaceRemoveError = usePopoverError();
-  const [archiveConfirmation, setArchiveConfirmation] = useState<{
-    workspaceId: string;
-    displayTitle: string;
-    buttonElement?: HTMLElement;
-    /** When set, the confirmation warns about permanent deletion of untracked files. */
-    untrackedPaths?: string[];
-    /** Whether the workspace has an active stream that will be interrupted. */
-    isStreaming?: boolean;
-  } | null>(null);
+  // Stays until dismissed: the cancelled row is gone, so the user could not reread it (#5143).
+  const workspaceRemoveWarning = usePopoverError(null);
   const [deleteConfirmation, setDeleteConfirmation] = useState<{
     projectPath: string;
     projectName: string;
@@ -1075,158 +1092,36 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
   const toggleSection = (projectPath: string, sectionId: string) => {
     const key = getSectionExpandedKey(projectPath, sectionId);
-    setExpandedSections((prev) => ({
-      ...prev,
-      [key]: !prev[key],
-    }));
+    setExpandedSections((prev) =>
+      withRecordEntry(prev, key, !prev[key], SIDEBAR_EXPANSION_MAP_MAX_CHARS)
+    );
   };
 
   const handleForkWorkspace = useCallback(
     async (workspaceId: string, buttonElement?: HTMLElement) => {
-      if (!api) {
-        workspaceForkError.showError(workspaceId, "Not connected to server");
-        return;
-      }
-
-      let anchor: { top: number; left: number } | undefined;
-      if (buttonElement) {
-        const rect = buttonElement.getBoundingClientRect();
-        anchor = {
-          top: rect.top + window.scrollY,
-          left: rect.right + 10,
-        };
-      }
-
-      try {
-        const result = await forkWorkspace({
-          client: api,
-          sourceWorkspaceId: workspaceId,
-        });
-        if (result.success) {
-          return;
-        }
-        workspaceForkError.showError(workspaceId, result.error ?? "Failed to fork chat", anchor);
-      } catch (error) {
-        // IPC/transport failures throw instead of returning { success: false }
-        const message = getErrorMessage(error);
-        workspaceForkError.showError(workspaceId, message, anchor);
-      }
+      const anchor = getErrorAnchor(buttonElement);
+      const error = await forkWorkspaceFromMenu(liveApi, workspaceId);
+      if (error) workspaceForkError.showError(workspaceId, error, anchor);
     },
-    [api, workspaceForkError]
+    [liveApi, workspaceForkError]
   );
 
   const handleStopRuntime = useCallback(
     async (workspaceId: string, buttonElement?: HTMLElement) => {
-      let anchor: { top: number; left: number } | undefined;
-      if (buttonElement) {
-        const rect = buttonElement.getBoundingClientRect();
-        anchor = {
-          top: rect.top + window.scrollY,
-          left: rect.right + 10,
-        };
-      }
-
-      if (!api) {
-        workspaceStopRuntimeError.showError(workspaceId, "Not connected to server", anchor);
-        return;
-      }
-
-      try {
-        const result = await api.workspace.stopRuntime({ workspaceId });
-        if (!result.success) {
-          workspaceStopRuntimeError.showError(
-            workspaceId,
-            result.error ?? "Failed to stop container",
-            anchor
-          );
-          return;
-        }
-
-        // A successful stop should hide the running indicator and menu action without
-        // forcing rows to own their own optimistic runtime state.
-        runtimeStatusStore.invalidateWorkspace(workspaceId);
-      } catch (error) {
-        workspaceStopRuntimeError.showError(workspaceId, getErrorMessage(error), anchor);
-      }
+      const anchor = getErrorAnchor(buttonElement);
+      const error = await stopWorkspaceRuntime(liveApi, runtimeStatusStore, workspaceId);
+      if (error) workspaceStopRuntimeError.showError(workspaceId, error, anchor);
     },
-    [api, runtimeStatusStore, workspaceStopRuntimeError]
+    [liveApi, runtimeStatusStore, workspaceStopRuntimeError]
   );
 
-  const performArchiveWorkspace = useCallback(
-    async (
-      workspaceId: string,
-      buttonElement?: HTMLElement,
-      acknowledgedUntrackedPaths?: string[]
-    ) => {
-      const result = await onArchiveWorkspace(
-        workspaceId,
-        acknowledgedUntrackedPaths ? { acknowledgedUntrackedPaths } : undefined
-      );
-      if (result.success && result.data?.kind === "confirm-lossy-untracked-files") {
-        const metadata = workspaceStore.getWorkspaceMetadata(workspaceId);
-        const displayTitle = metadata?.title ?? metadata?.name ?? workspaceId;
-        const aggregator = workspaceStore.getAggregator(workspaceId);
-        const hasActiveStreams = aggregator?.hasInterruptibleActiveStream() ?? false;
-        const pendingStreamStartTime = aggregator?.getPendingStreamStartTime();
-        const isStarting = pendingStreamStartTime != null && !hasActiveStreams;
-        const awaitingUserQuestion = aggregator?.hasAwaitingUserQuestion() ?? false;
-        const isStreaming = (hasActiveStreams || isStarting) && !awaitingUserQuestion;
-        setArchiveConfirmation({
-          workspaceId,
-          displayTitle,
-          buttonElement,
-          untrackedPaths: result.data.paths,
-          // The retry path already handled any earlier streaming warning. Only surface the
-          // interruption warning again when the archive attempt has not yet been confirmed.
-          isStreaming: acknowledgedUntrackedPaths == null ? isStreaming : false,
-        });
-        return false;
-      }
-      if (!result.success) {
-        if (acknowledgedUntrackedPaths != null) {
-          // Archive may fail if new untracked files appear between confirmation and capture.
-          // Re-run preflight so we can reopen the modal with the latest paths.
-          const preflight = await preflightArchiveWorkspace(workspaceId);
-          if (preflight.success && preflight.data?.kind === "confirm-lossy-untracked-files") {
-            const pathsChanged = didUntrackedPathSetChange(
-              acknowledgedUntrackedPaths,
-              preflight.data.paths
-            );
-            if (pathsChanged) {
-              const metadata = workspaceStore.getWorkspaceMetadata(workspaceId);
-              const displayTitle = metadata?.title ?? metadata?.name ?? workspaceId;
-              setArchiveConfirmation({
-                workspaceId,
-                displayTitle,
-                buttonElement,
-                untrackedPaths: preflight.data.paths,
-                isStreaming: (() => {
-                  const aggregator = workspaceStore.getAggregator(workspaceId);
-                  if (!aggregator) return false;
-                  const hasActiveStreams = aggregator.hasInterruptibleActiveStream();
-                  const isStarting =
-                    aggregator.getPendingStreamStartTime() !== null && !hasActiveStreams;
-                  const awaitingUserQuestion = aggregator.hasAwaitingUserQuestion();
-                  return (hasActiveStreams || isStarting) && !awaitingUserQuestion;
-                })(),
-              });
-              return false;
-            }
-          }
-        }
-
-        const error = result.error ?? "Failed to archive chat";
-        // Archive failures can be long-lived workflow errors (for example, untracked-file safety
-        // checks) that users should notice near the active workspace content, not pinned beside a
-        // left-sidebar row that may be far from their current focus. Use the shared toast fallback
-        // position so archive errors match other top-right UI error surfaces.
-        workspaceArchiveError.showError(workspaceId, error);
-        return false;
-      }
-      return true;
-    },
-    [onArchiveWorkspace, preflightArchiveWorkspace, workspaceArchiveError, workspaceStore]
-  );
+  useWorkspaceActionKeybinds({
+    selectedWorkspaceId: visibleSelectedWorkspaceId,
+    getWorkspaceMetadata: (workspaceId) => workspaceStore.getWorkspaceMetadata(workspaceId),
+    runtimeStatusStore,
+    onForkWorkspace: (workspaceId) => void handleForkWorkspace(workspaceId),
+    onStopRuntime: (workspaceId) => void handleStopRuntime(workspaceId),
+  });
 
   const hasActiveStream = useCallback(
     (workspaceId: string) => {
@@ -1250,7 +1145,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       const isRemoving = workspace.isRemoving === true;
       const isArchiving = archivingWorkspaceIds.has(workspaceId);
       const isInitializing = workspace.isInitializing === true;
-      const isSelected = selectedWorkspace?.workspaceId === workspaceId;
+      const isSelected = visibleSelectedWorkspaceId === workspaceId;
       const recencyTimestamp = workspaceRecency[workspaceId] ?? null;
       const lastReadTimestamp = readPersistedState<number | null>(
         getWorkspaceLastReadKey(workspaceId),
@@ -1272,71 +1167,25 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         isUnread
       );
     },
-    [archivingWorkspaceIds, selectedWorkspace?.workspaceId, workspaceRecency, workspaceStore]
+    [archivingWorkspaceIds, visibleSelectedWorkspaceId, workspaceRecency, workspaceStore]
   );
 
-  const handleArchiveWorkspace = useCallback(
-    async (workspaceId: string, buttonElement?: HTMLElement) => {
-      // The keyboard shortcut bypasses the row's disabled state, so guard here as well.
-      if (archivingWorkspaceIds.has(workspaceId)) return;
+  const archiveFlow = useArchiveWorkspaceConfirmation({
+    preflightArchiveWorkspace,
+    archiveWorkspace: onArchiveWorkspace,
+    isArchiving: (workspaceId) => archivingWorkspaceIds.has(workspaceId),
+    isStreaming: hasActiveStream,
+    getDisplayTitle: (workspaceId) => {
       const metadata = workspaceStore.getWorkspaceMetadata(workspaceId);
-      const displayTitle = metadata?.title ?? metadata?.name ?? workspaceId;
-      const isStreaming = hasActiveStream(workspaceId);
-
-      // Run preflight to check for untracked files that can't be preserved.
-      const preflight = await preflightArchiveWorkspace(workspaceId);
-      if (!preflight.success) {
-        workspaceArchiveError.showError(
-          workspaceId,
-          preflight.error ?? "Failed to check archive readiness"
-        );
-        return;
-      }
-
-      const untrackedPaths =
-        preflight.data?.kind === "confirm-lossy-untracked-files" ? preflight.data.paths : undefined;
-
-      if (isStreaming || untrackedPaths) {
-        // Show a single combined confirmation dialog for streaming + untracked-file warnings.
-        setArchiveConfirmation({
-          workspaceId,
-          displayTitle,
-          buttonElement,
-          untrackedPaths,
-          isStreaming,
-        });
-        return;
-      }
-
-      await performArchiveWorkspace(workspaceId, buttonElement);
+      return metadata?.title ?? metadata?.name ?? workspaceId;
     },
-    [
-      archivingWorkspaceIds,
-      hasActiveStream,
-      performArchiveWorkspace,
-      preflightArchiveWorkspace,
-      workspaceArchiveError,
-      workspaceStore,
-    ]
-  );
-
-  const handleArchiveWorkspaceConfirm = useCallback(async () => {
-    if (!archiveConfirmation) {
-      return;
-    }
-
-    const confirmation = archiveConfirmation;
-    setArchiveConfirmation(null);
-    await performArchiveWorkspace(
-      confirmation.workspaceId,
-      confirmation.buttonElement,
-      confirmation.untrackedPaths
-    );
-  }, [archiveConfirmation, performArchiveWorkspace]);
-
-  const handleArchiveWorkspaceCancel = useCallback(() => {
-    setArchiveConfirmation(null);
-  }, []);
+    // Archive failures can be long-lived workflow errors (for example, untracked-file safety
+    // checks) that users should notice near the active workspace content, not pinned beside a
+    // left-sidebar row that may be far from their current focus. Use the shared toast fallback
+    // position so archive errors match other top-right UI error surfaces.
+    showError: (workspaceId, error) => workspaceArchiveError.showError(workspaceId, error),
+  });
+  const handleArchiveWorkspace = archiveFlow.requestArchive;
 
   const showProjectRemoveError = useCallback(
     (
@@ -1418,6 +1267,13 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
             workspaceId,
             result.error ?? "Failed to cancel workspace creation"
           );
+        } else if (result.warnings?.length) {
+          // This forced removal skips the Force Delete dialog, so show what it left behind
+          // (#5143), e.g. a devcontainer that may still hold the plan.
+          workspaceRemoveWarning.showError(
+            workspaceId,
+            formatWorkspaceRemoveWarnings(result.warnings)
+          );
         }
       } finally {
         setRemovingWorkspaceIds((prev) => {
@@ -1427,7 +1283,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         });
       }
     },
-    [removeWorkspace, workspaceRemoveError]
+    [removeWorkspace, workspaceRemoveError, workspaceRemoveWarning]
   );
 
   const handleRemoveSection = async (
@@ -1477,8 +1333,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
   const handleOpenSecrets = useCallback(
     (projectPath: string) => {
-      // Collapse the off-canvas sidebar on mobile before navigating so the
-      // settings page is immediately accessible without a backdrop blocking it.
+      // Collapse the off-canvas sidebar on mobile before opening settings so its
+      // backdrop is not left blocking the page when settings closes.
       if (window.innerWidth <= MOBILE_BREAKPOINT && !collapsed) {
         persistMobileSidebarScrollTop(mobileScrollTopRef.current);
         onToggleCollapsed();
@@ -1738,8 +1594,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     showProjectColorPicker,
   ]);
 
-  // UI preference: project order persists in localStorage
-  const [projectOrder, setProjectOrder] = usePersistedState<string[]>(PROJECT_ORDER_KEY, []);
+  const storedProjectOrder = useUserPreferences(
+    (preferences) => preferences.navigation?.projectOrder
+  );
 
   // Build a stable signature of the project keys so effects don't fire on Map identity churn
   const projectPathsSignature = React.useMemo(() => {
@@ -1748,35 +1605,17 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     return keys.join("\u0001"); // use non-printable separator
   }, [userProjects]);
 
-  // Normalize order when the set of projects changes (not on every parent render)
-  useEffect(() => {
-    // Skip normalization if projects haven't loaded yet (empty Map on initial render)
-    // This prevents clearing projectOrder before projects load from backend
-    if (userProjects.size === 0) {
-      return;
-    }
-
-    const normalized = normalizeOrder(projectOrder, userProjects);
-    if (
-      normalized.length !== projectOrder.length ||
-      normalized.some((p, i) => p !== projectOrder[i])
-    ) {
-      setProjectOrder(normalized);
-    }
-    // Only re-run when project keys change (projectPathsSignature captures projects Map keys)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectPathsSignature]);
-
   // Memoize sorted project PATHS (not entries) to avoid capturing stale config objects.
   // Sorting depends only on keys + order; we read configs from the live Map during render.
   const sortedProjectPaths = React.useMemo(
     () =>
-      sortProjectsByOrder(userProjects, projectOrder)
+      // Normalized on read, never written back: new projects sort first until a drag saves.
+      sortProjectsByOrder(userProjects, normalizeOrder(storedProjectOrder ?? [], userProjects))
         .filter(([, config]) => !config.parentProjectPath)
         .map(([p]) => p),
     // projectPathsSignature captures projects Map keys
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [projectPathsSignature, projectOrder]
+    [projectPathsSignature, storedProjectOrder]
   );
 
   const isWorkspaceLiveActive = (workspaceId: string): boolean => {
@@ -1968,6 +1807,30 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const scratchDrafts = (workspaceDraftsByProject[SCRATCH_PROJECT_CONFIG_KEY] ?? [])
     .slice()
     .sort((a, b) => b.createdAt - a.createdAt);
+  // Empty drafts render no row (DraftAgentListItemWrapper), so counts, placeholders and draft
+  // numbers use only drafts that show one: a hidden draft must not count as a chat or renumber
+  // the visible drafts (#5677). DraftVisibilityWatcher keeps the reactive map current for every
+  // draft; the store read covers the render before its first report.
+  const isDraftShownInSidebar = (projectPath: string, draftId: string): boolean =>
+    draftVisibilityByProject[projectPath]?.[draftId] ?? isDraftVisible(projectPath, draftId);
+  const getVisibleDraftNumbers = (
+    drafts: ReadonlyArray<{ projectPath: string; draftId: string }>
+  ): Map<string, number> => {
+    const numbers = new Map<string, number>();
+    for (const draft of drafts) {
+      if (isDraftShownInSidebar(draft.projectPath, draft.draftId)) {
+        numbers.set(draft.draftId, numbers.size + 1);
+      }
+    }
+    return numbers;
+  };
+  const scratchDraftNumberById = getVisibleDraftNumbers(
+    scratchDrafts.map((draft) => ({
+      projectPath: SCRATCH_PROJECT_CONFIG_KEY,
+      draftId: draft.draftId,
+    }))
+  );
+  const visibleScratchDraftCount = scratchDraftNumberById.size;
 
   // Re-sort across primary-project buckets so pinned rows form one correctly
   // ordered block (cross-primary pinned reorders would otherwise snap back).
@@ -1998,6 +1861,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     .filter(([projectPath]) => !isGatedFlatDraftBucket(projectPath))
     .flatMap(([projectPath, drafts]) => drafts.map((draft) => ({ projectPath, draft })))
     .sort((a, b) => b.draft.createdAt - a.draft.createdAt);
+  const flatDraftNumberById = getVisibleDraftNumbers(
+    flatDrafts.map(({ projectPath, draft }) => ({ projectPath, draftId: draft.draftId }))
+  );
   // Project headers render in both modes: grouped mode nests each project's
   // chats under its header, while flat mode appends the headers below the
   // flat chat list as a compact management section (per-project new chat,
@@ -2056,10 +1922,11 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
   const handleReorder = useCallback(
     (draggedPath: string, targetPath: string) => {
-      const next = reorderProjects(projectOrder, userProjects, draggedPath, targetPath);
-      setProjectOrder(next);
+      const order = normalizeOrder(storedProjectOrder ?? [], userProjects);
+      const next = reorderProjects(order, userProjects, draggedPath, targetPath);
+      updateUserPreferences({ navigation: { projectOrder: next } });
     },
-    [projectOrder, userProjects, setProjectOrder]
+    [storedProjectOrder, userProjects]
   );
 
   // Pinned-chat reordering, shared by row drag-drop and the move keybinds.
@@ -2174,9 +2041,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     movePinnedWorkspace,
     workspaceStore,
   ]);
-
-  const archiveConfirmationUntrackedPaths = archiveConfirmation?.untrackedPaths;
-  const archiveConfirmationIsStreaming = archiveConfirmation?.isStreaming ?? false;
 
   // ── Shared coalesced list pipeline ──────────────────────────────────────
   // One rendering pipeline for every workspace list (grouped project sections
@@ -2390,7 +2254,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         (group.hasActiveMember || sessionActiveTaskGroupKeysRef.current.has(group.storageKey));
       const isExpanded = expandedTaskGroups[group.storageKey] ?? defaultExpanded;
       const isGroupSelected = group.allMembers.some(
-        (member) => member.id === selectedWorkspace?.workspaceId
+        (member) => member.id === visibleSelectedWorkspaceId
       );
 
       const headerRow = (
@@ -2519,10 +2383,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         <React.Fragment key={tierKey}>
           <button
             onClick={() => {
-              setExpandedOldWorkspaces((prev) => ({
-                ...prev,
-                [tierKey]: !prev[tierKey],
-              }));
+              setExpandedOldWorkspaces((prev) =>
+                withRecordEntry(prev, tierKey, !prev[tierKey], SIDEBAR_EXPANSION_MAP_MAX_CHARS)
+              );
             }}
             aria-label={
               isTierExpanded
@@ -2586,7 +2449,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         projectName={metadata.projectName}
         projectBadgeName={badge?.name}
         projectBadgeColor={badge?.color}
-        isSelected={selectedWorkspace?.workspaceId === metadata.id}
+        isSelected={visibleSelectedWorkspaceId === metadata.id}
         isArchiving={archivingWorkspaceIds.has(metadata.id)}
         isRemoving={removingWorkspaceIds.has(metadata.id) || metadata.isRemoving === true}
         onSelectWorkspace={handleSelectWorkspace}
@@ -2632,13 +2495,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
   const flatSidebarContent = (
     <div className="py-1">
-      <button
-        onClick={handleAddFlatWorkspace}
-        className="text-secondary hover:bg-hover mx-2 mb-1 flex w-[calc(100%-1rem)] cursor-pointer items-center gap-1.5 rounded px-2 py-1.5 text-left text-xs"
-      >
-        <Plus className="h-3.5 w-3.5" />
-        New chat
-      </button>
       {renderCoalescedWorkspaceList(visiblePinnedFlatWorkspaces, flatRowsForDisplay, {
         tierKeyPrefix: "flat",
         depthByWorkspaceId: flatDepthByWorkspaceId,
@@ -2664,13 +2520,10 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
             key={draft.draftId}
             projectPath={projectPath}
             draftId={draft.draftId}
-            draftNumber={index + 1}
+            draftNumber={flatDraftNumberById.get(draft.draftId) ?? 0}
             isSelected={isSelected}
             projectBadgeName={draftBadge?.name}
             projectBadgeColor={draftBadge?.color}
-            onVisibilityChange={(isVisible) => {
-              handleDraftVisibilityChange(projectPath, draft.draftId, isVisible);
-            }}
             onOpen={() => handleOpenWorkspaceDraft(projectPath, draft.draftId)}
             onDelete={() => {
               if (isSelected) {
@@ -2703,8 +2556,19 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       <SidebarTitleEditKeybinds
         selectedWorkspace={selectedWorkspace ?? undefined}
         sortedWorkspacesByProject={sortedWorkspacesByProject}
-        collapsed={collapsed}
       />
+      {/* Outside the collapsed-only UI: the watchers live exactly as long as the visibility map
+          they fill, so a collapsed sidebar or section never leaves a stale value in it. */}
+      {Object.entries(workspaceDraftsByProject).flatMap(([projectPath, drafts]) =>
+        drafts.map((draft) => (
+          <DraftVisibilityWatcher
+            key={`${projectPath}:${draft.draftId}`}
+            projectPath={projectPath}
+            draftId={draft.draftId}
+            onVisibilityChange={handleDraftVisibilityChange}
+          />
+        ))
+      )}
       <DndProvider backend={HTML5Backend}>
         <ProjectDragLayer />
         <WorkspaceDragLayer />
@@ -2731,14 +2595,44 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                     <XumLogo className="h-5 w-auto" aria-hidden="true" />
                   </button>
                 </div>
-                <button
-                  onClick={() => onAddProject()}
-                  aria-label="Add project"
-                  className="text-secondary hover:bg-hover hover:border-border-light flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded border border-transparent bg-transparent px-1.5 text-xs transition-all duration-200"
-                >
-                  <span className="text-base leading-none">+</span>
-                  <span>Add Project</span>
-                </button>
+                {flatSidebarEnabled ? (
+                  // Flat mode puts "New chat" (the frequent action) in the header and
+                  // shrinks "Add project" to a distinct folder icon so the two
+                  // header actions never show the same "+" glyph side by side.
+                  <div className="flex shrink-0 items-center gap-1">
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <button
+                          onClick={() => onAddProject()}
+                          aria-label="Add project"
+                          className="text-secondary hover:bg-hover hover:border-border-light flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent transition-all duration-200"
+                        >
+                          <FolderPlus className="h-4 w-4" strokeWidth={1.8} />
+                        </button>
+                      </TooltipTrigger>
+                      <TooltipContent>Add project</TooltipContent>
+                    </Tooltip>
+                    {/* text-muted at rest and the foreground on hover: text-secondary missed WCAG
+                        AA in the dark themes, and on the hover background in every theme (#6010). */}
+                    <button
+                      onClick={handleAddFlatWorkspace}
+                      className="text-muted hover:text-foreground hover:bg-hover hover:border-border-light flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded border border-transparent bg-transparent px-1.5 text-xs transition-all duration-200"
+                    >
+                      <SquarePen className="h-3.5 w-3.5" strokeWidth={1.8} />
+                      <span>New chat</span>
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => onAddProject()}
+                    aria-label="Add project"
+                    // text-content-secondary: the light theme's text-secondary is 2.9:1 (#5950).
+                    className="text-content-secondary hover:bg-hover hover:text-foreground hover:border-border-light flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded border border-transparent bg-transparent px-1.5 text-xs transition-all duration-200"
+                  >
+                    <span className="text-base leading-none">+</span>
+                    <span>Add Project</span>
+                  </button>
+                )}
               </div>
               <ScrollArea
                 className="flex-1"
@@ -2755,18 +2649,22 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                         aria-label={`${isScratchSectionExpanded ? "Collapse" : "Expand"} scratch chats`}
                         className={PROJECT_TOGGLE_BUTTON_CLASSES}
                       >
-                        <ChevronRight
-                          className="h-4 w-4 transition-transform duration-200"
-                          style={{
-                            transform: isScratchSectionExpanded ? "rotate(90deg)" : "rotate(0deg)",
-                          }}
-                        />
+                        <span className={PROJECT_TOGGLE_BOX_CLASSES}>
+                          <ChevronRight
+                            className="h-4 w-4 transition-transform duration-200"
+                            style={{
+                              transform: isScratchSectionExpanded
+                                ? "rotate(90deg)"
+                                : "rotate(0deg)",
+                            }}
+                          />
+                        </span>
                       </button>
                       <div className="flex min-w-0 flex-1 items-center pr-1">
                         <span className="text-foreground truncate text-sm font-medium">Chats</span>
-                        {(scratchWorkspaces.length > 0 || scratchDrafts.length > 0) && (
+                        {(scratchWorkspaces.length > 0 || visibleScratchDraftCount > 0) && (
                           <span className="text-muted ml-2 text-xs">
-                            ({topLevelScratchWorkspaces.length + scratchDrafts.length})
+                            ({topLevelScratchWorkspaces.length + visibleScratchDraftCount})
                           </span>
                         )}
                       </div>
@@ -2788,7 +2686,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                     </div>
                     {isScratchSectionExpanded && (
                       <div className="pt-1 pb-1">
-                        {scratchDrafts.map((draft, index) => {
+                        {scratchDrafts.map((draft) => {
                           const isSelected =
                             pendingNewWorkspaceProject === SCRATCH_PROJECT_CONFIG_KEY &&
                             pendingNewWorkspaceDraftId === draft.draftId;
@@ -2797,15 +2695,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                               key={draft.draftId}
                               projectPath={SCRATCH_PROJECT_CONFIG_KEY}
                               draftId={draft.draftId}
-                              draftNumber={index + 1}
+                              draftNumber={scratchDraftNumberById.get(draft.draftId) ?? 0}
                               isSelected={isSelected}
-                              onVisibilityChange={(isVisible) => {
-                                handleDraftVisibilityChange(
-                                  SCRATCH_PROJECT_CONFIG_KEY,
-                                  draft.draftId,
-                                  isVisible
-                                );
-                              }}
                               onOpen={() =>
                                 handleOpenWorkspaceDraft(SCRATCH_PROJECT_CONFIG_KEY, draft.draftId)
                               }
@@ -2826,7 +2717,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                               metadata={metadata}
                               projectPath={metadata.projectPath}
                               projectName={metadata.projectName}
-                              isSelected={selectedWorkspace?.workspaceId === metadata.id}
+                              isSelected={visibleSelectedWorkspaceId === metadata.id}
                               isArchiving={archivingWorkspaceIds.has(metadata.id)}
                               isRemoving={
                                 removingWorkspaceIds.has(metadata.id) ||
@@ -2853,7 +2744,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                             />
                           );
                         })}
-                        {scratchWorkspaces.length === 0 && scratchDrafts.length === 0 && (
+                        {scratchWorkspaces.length === 0 && visibleScratchDraftCount === 0 && (
                           <button
                             onClick={handleAddScratchWorkspace}
                             className="text-muted hover:bg-hover mx-2 w-[calc(100%-1rem)] rounded px-2 py-2 text-left text-xs"
@@ -2874,20 +2765,22 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                         aria-label={`${isMultiProjectSectionExpanded ? "Collapse" : "Expand"} multi-project workspaces`}
                         className={PROJECT_TOGGLE_BUTTON_CLASSES}
                       >
-                        <span className="relative flex h-4 w-4 items-center justify-center">
-                          <ChevronRight
-                            className="absolute inset-0 h-4 w-4 opacity-0 transition-[opacity,transform] duration-200 group-hover:opacity-100"
-                            style={{
-                              transform: isMultiProjectSectionExpanded
-                                ? "rotate(90deg)"
-                                : "rotate(0deg)",
-                            }}
-                          />
-                          {isMultiProjectSectionExpanded ? (
-                            <FolderOpen className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0" />
-                          ) : (
-                            <Folder className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0" />
-                          )}
+                        <span className={PROJECT_TOGGLE_BOX_CLASSES}>
+                          <span className="relative flex h-4 w-4 items-center justify-center">
+                            <ChevronRight
+                              className="absolute inset-0 h-4 w-4 opacity-0 transition-[opacity,transform] duration-200 group-hover:opacity-100"
+                              style={{
+                                transform: isMultiProjectSectionExpanded
+                                  ? "rotate(90deg)"
+                                  : "rotate(0deg)",
+                              }}
+                            />
+                            {isMultiProjectSectionExpanded ? (
+                              <FolderOpen className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0" />
+                            ) : (
+                              <Folder className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0" />
+                            )}
+                          </span>
                         </span>
                       </button>
                       <div className="flex min-w-0 flex-1 items-center pr-2">
@@ -2910,7 +2803,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                               metadata={metadata}
                               projectPath={metadata.projectPath}
                               projectName={metadata.projectName}
-                              isSelected={selectedWorkspace?.workspaceId === metadata.id}
+                              isSelected={visibleSelectedWorkspaceId === metadata.id}
                               isArchiving={archivingWorkspaceIds.has(metadata.id)}
                               isRemoving={
                                 removingWorkspaceIds.has(metadata.id) ||
@@ -2948,17 +2841,19 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                 projectHeaderPaths.length === 0 &&
                 multiProjectWorkspaces.length === 0 ? (
                   <div className="px-4 py-8 text-center">
-                    <p className="text-muted mb-4 text-[13px]">No projects</p>
+                    {/* text-content-secondary: text-muted and text-secondary are below WCAG AA in
+                        the light theme (#5950). */}
+                    <p className="text-content-secondary mb-4 text-[13px]">No projects</p>
                     <div className="flex flex-col gap-2">
                       <button
                         onClick={handleAddScratchWorkspace}
-                        className="bg-accent hover:bg-accent-dark cursor-pointer rounded border-none px-4 py-2 text-[13px] text-white transition-colors duration-200"
+                        className="bg-accent hover:bg-accent-button-hover text-accent-foreground cursor-pointer rounded border-none px-4 py-2 text-[13px] transition-colors duration-200"
                       >
                         Start a scratch chat
                       </button>
                       <button
                         onClick={() => onAddProject()}
-                        className="border-border-light text-secondary hover:bg-hover cursor-pointer rounded border px-4 py-2 text-[13px] transition-colors duration-200"
+                        className="border-border-light text-content-secondary hover:bg-hover hover:text-foreground cursor-pointer rounded border px-4 py-2 text-[13px] transition-colors duration-200"
                       >
                         Add Project
                       </button>
@@ -3071,28 +2966,34 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                               data-project-path={projectPath}
                               className={PROJECT_TOGGLE_BUTTON_CLASSES}
                             >
-                              <span className="relative flex h-4 w-4 items-center justify-center">
-                                <ChevronRight
-                                  className="absolute inset-0 h-4 w-4 opacity-0 transition-[opacity,transform] duration-200 group-hover:opacity-100"
-                                  style={{
-                                    transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)",
-                                  }}
-                                />
-                                {isExpanded ? (
-                                  <FolderOpen
-                                    className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0"
-                                    style={
-                                      projectFolderColor ? { color: projectFolderColor } : undefined
-                                    }
+                              <span className={PROJECT_TOGGLE_BOX_CLASSES}>
+                                <span className="relative flex h-4 w-4 items-center justify-center">
+                                  <ChevronRight
+                                    className="absolute inset-0 h-4 w-4 opacity-0 transition-[opacity,transform] duration-200 group-hover:opacity-100"
+                                    style={{
+                                      transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)",
+                                    }}
                                   />
-                                ) : (
-                                  <Folder
-                                    className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0"
-                                    style={
-                                      projectFolderColor ? { color: projectFolderColor } : undefined
-                                    }
-                                  />
-                                )}
+                                  {isExpanded ? (
+                                    <FolderOpen
+                                      className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0"
+                                      style={
+                                        projectFolderColor
+                                          ? { color: projectFolderColor }
+                                          : undefined
+                                      }
+                                    />
+                                  ) : (
+                                    <Folder
+                                      className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0"
+                                      style={
+                                        projectFolderColor
+                                          ? { color: projectFolderColor }
+                                          : undefined
+                                      }
+                                    />
+                                  )}
+                                </span>
                               </span>
                             </button>
                           )}
@@ -3382,22 +3283,14 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                 const sortedDrafts = draftsForProject
                                   .slice()
                                   .sort((a, b) => b.createdAt - a.createdAt);
-                                const draftVisibilityForProject =
-                                  draftVisibilityByProject[projectPath] ?? {};
-                                const hasVisibleDrafts = sortedDrafts.some((draft) => {
-                                  const reactiveVisibility =
-                                    draftVisibilityForProject[draft.draftId];
-                                  return (
-                                    reactiveVisibility ?? isDraftVisible(projectPath, draft.draftId)
-                                  );
-                                });
-                                const projectHasNoAgentsOrDrafts =
-                                  projectWorkspaces.length === 0 && !hasVisibleDrafts;
-                                const draftNumberById = new Map(
-                                  sortedDrafts.map(
-                                    (draft, index) => [draft.draftId, index + 1] as const
-                                  )
+                                const draftNumberById = getVisibleDraftNumbers(
+                                  sortedDrafts.map((draft) => ({
+                                    projectPath,
+                                    draftId: draft.draftId,
+                                  }))
                                 );
+                                const projectHasNoAgentsOrDrafts =
+                                  projectWorkspaces.length === 0 && draftNumberById.size === 0;
                                 const getDraftSectionId = (
                                   draft: (typeof sortedDrafts)[number]
                                 ): string | null =>
@@ -3446,7 +3339,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                       metadata={metadata}
                                       projectPath={projectPath}
                                       projectName={projectName}
-                                      isSelected={selectedWorkspace?.workspaceId === metadata.id}
+                                      isSelected={visibleSelectedWorkspaceId === metadata.id}
                                       isArchiving={archivingWorkspaceIds.has(metadata.id)}
                                       isRemoving={
                                         removingWorkspaceIds.has(metadata.id) ||
@@ -3515,13 +3408,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                       draftNumber={draftNumber}
                                       isSelected={isSelected}
                                       sectionId={sectionId ?? undefined}
-                                      onVisibilityChange={(isVisible) => {
-                                        handleDraftVisibilityChange(
-                                          projectPath,
-                                          draft.draftId,
-                                          isVisible
-                                        );
-                                      }}
                                       onOpen={() =>
                                         handleOpenWorkspaceDraft(projectPath, draft.draftId)
                                       }
@@ -3877,30 +3763,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
             />
           </PositionedMenu>
 
-          <ConfirmationModal
-            isOpen={archiveConfirmation !== null}
-            title={
-              archiveConfirmationUntrackedPaths
-                ? "Archive workspace with untracked files?"
-                : archiveConfirmation
-                  ? `Archive "${archiveConfirmation.displayTitle}" while streaming?`
-                  : "Archive chat?"
-            }
-            description={buildArchiveConfirmDescription(
-              archiveConfirmationIsStreaming,
-              archiveConfirmationUntrackedPaths
-            )}
-            warning={buildArchiveConfirmWarning(
-              archiveConfirmationIsStreaming,
-              archiveConfirmationUntrackedPaths
-            )}
-            confirmLabel={
-              archiveConfirmationUntrackedPaths ? "Archive and delete files" : "Archive"
-            }
-            confirmVariant="destructive"
-            onConfirm={handleArchiveWorkspaceConfirm}
-            onCancel={handleArchiveWorkspaceCancel}
-          />
+          <ConfirmationModal {...archiveFlow.modalProps} />
           <ProjectDeleteConfirmationModal
             isOpen={deleteConfirmation !== null}
             projectName={deleteConfirmation?.projectName ?? ""}
@@ -3911,7 +3774,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
           />
           <PopoverError
             error={workspaceArchiveError.error}
-            prefix="Failed to archive chat"
+            prefix="Failed to archive workspace"
             onDismiss={workspaceArchiveError.clearError}
           />
           <PopoverError
@@ -3921,13 +3784,18 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
           />
           <PopoverError
             error={workspaceForkError.error}
-            prefix="Failed to fork chat"
+            prefix="Failed to fork workspace"
             onDismiss={workspaceForkError.clearError}
           />
           <PopoverError
             error={workspaceRemoveError.error}
             prefix="Failed to cancel workspace creation"
             onDismiss={workspaceRemoveError.clearError}
+          />
+          <PopoverError
+            error={workspaceRemoveWarning.error}
+            prefix="Workspace creation cancelled, but something was left behind"
+            onDismiss={workspaceRemoveWarning.clearError}
           />
           <PopoverError
             error={projectRemoveError.error}

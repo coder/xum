@@ -54,7 +54,7 @@ async function waitForServerReady(url: string, timeoutMs = 20_000): Promise<void
       if (response.ok || response.status === 404) {
         return;
       }
-    } catch (error) {
+    } catch {
       // Server not ready yet
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
@@ -154,6 +154,7 @@ function buildTarget(target: string): void {
 }
 
 export const electronTest = base.extend<ElectronFixtures>({
+  // eslint-disable-next-line no-empty-pattern -- Playwright fixtures must destructure their first argument
   workspace: async ({}, use, testInfo) => {
     const originalXumRoot = process.env.XUM_ROOT;
     const originalMuxRoot = process.env.MUX_ROOT;
@@ -294,6 +295,9 @@ export const electronTest = base.extend<ElectronFixtures>({
       setXumE2EEnv(electronEnv, "E2E", "1");
       setXumE2EEnv(electronEnv, "PROFILE_REACT", shouldCaptureReactProfile ? "1" : "0");
       setXumE2EEnv(electronEnv, "E2E_LOAD_DIST", shouldLoadDist ? "1" : "0");
+      // Tutorials stay off in every scenario, including ones that rewrite config.json: their
+      // delayed backdrops race with Playwright clicks.
+      setXumE2EEnv(electronEnv, "ENABLE_TUTORIALS_IN_SANDBOX", "0");
       electronEnv.VITE_DISABLE_MERMAID = "1";
 
       if (shouldStartDevServer) {
@@ -359,13 +363,13 @@ export const electronTest = base.extend<ElectronFixtures>({
                 const destination = path.join(videosDir, `${baseName}${suffix}${ext}`);
                 await fsPromises.rm(destination, { force: true });
                 await fsPromises.rename(path.join(recordVideoDir, file), destination);
-                console.log(`[video] saved to ${destination}`); // eslint-disable-line no-console
+                console.log(`[video] saved to ${destination}`);
               }
             } else if (electronApp) {
-              console.warn(`[video] no video captured for "${displayName}" at ${recordVideoDir}`); // eslint-disable-line no-console
+              console.warn(`[video] no video captured for "${displayName}" at ${recordVideoDir}`);
             }
           } catch (error) {
-            console.error(`[video] failed to process video for "${displayName}":`, error); // eslint-disable-line no-console
+            console.error(`[video] failed to process video for "${displayName}":`, error);
           } finally {
             await fsPromises.rm(recordVideoDir, { recursive: true, force: true });
           }
@@ -381,23 +385,15 @@ export const electronTest = base.extend<ElectronFixtures>({
     const window = await app.firstWindow();
     await window.waitForLoadState("domcontentloaded");
     await window.setViewportSize({ width: 1600, height: 900 });
-
-    // Disable tutorials for e2e tests before React reads the state, then reload.
-    // Otherwise delayed tutorial backdrops can race with Playwright clicks and make
-    // unrelated UI scenarios flaky when a new tutorial sequence is added.
-    await window.evaluate(() => {
-      const tutorialState = {
-        disabled: true,
-        completed: { creation: true, workspace: true, review: true },
-      };
-      localStorage.setItem("tutorialState", JSON.stringify(tutorialState));
-    });
-    // Reload so React picks up the tutorial state on mount
-    await window.reload();
-    await window.waitForLoadState("domcontentloaded");
+    // Perf scenarios measure workspace operations after an app reload, as they did before #5916
+    // removed the tutorial reload. Without it they time the first page load and race startup work
+    // (nightly workspace-open first message doubled; chat typing saw transcript re-renders).
+    if (getXumE2EEnv("E2E_RUN_PERF") === "1") {
+      await window.reload();
+      await window.waitForLoadState("domcontentloaded");
+    }
 
     window.on("console", (msg) => {
-      // eslint-disable-next-line no-console
       console.log(`[renderer:${msg.type()}]`, msg.text());
     });
     window.on("pageerror", (error) => {

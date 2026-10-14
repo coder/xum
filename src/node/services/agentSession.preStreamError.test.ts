@@ -2,11 +2,9 @@ import type { TurnCoordinator } from "./turnCoordinator";
 import { describe, expect, it, mock, afterEach } from "bun:test";
 import { EventEmitter } from "events";
 import { PROVIDER_DISPLAY_NAMES } from "@/common/constants/providers";
-import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
-import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
-import type { InitStateManager } from "@/node/services/initStateManager";
+import type { AgentSessionAIService } from "@/node/services/agentSession";
 import type { SendMessageError } from "@/common/types/errors";
-import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { createMuxMessage } from "@/common/types/message";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
 import { computePriorHistoryFingerprint } from "@/common/orpc/onChatCursorFingerprint";
@@ -15,7 +13,7 @@ import {
   type StreamErrorMessage,
   type WorkspaceChatMessage,
 } from "@/common/orpc/types";
-import { createAgentSessionHarness, createTestAgentSession } from "./agentSession.testHarness";
+import { createAgentSessionHarness } from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 
 interface ReplayHarnessStreamInfo {
@@ -37,9 +35,9 @@ async function createReplaySessionHarness(
   const harness = await createAgentSessionHarness({
     workspaceId,
     aiServiceOverrides: {
-      streamMessage: mock((_history: MuxMessage[]) =>
+      streamMessage: mock<AgentSessionAIService["streamMessage"]>(() =>
         Promise.resolve(Err({ type: "unknown", raw: "unused" }))
-      ) as unknown as AIService["streamMessage"],
+      ),
       getStreamInfo: mock((_workspaceId: string) => streamInfo),
       replayStream,
     },
@@ -57,7 +55,7 @@ describe("AgentSession pre-stream errors", () => {
   it("emits stream-error when stream startup fails", async () => {
     const workspaceId = "ws-test";
 
-    const streamMessage = mock((_history: MuxMessage[]) => {
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() => {
       return Promise.resolve(
         Err({
           type: "api_key_not_found",
@@ -68,7 +66,7 @@ describe("AgentSession pre-stream errors", () => {
     const { session, cleanup, events } = await createAgentSessionHarness({
       workspaceId,
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage: streamMessage,
       },
       captureEvents: true,
     });
@@ -169,7 +167,7 @@ describe("AgentSession pre-stream errors", () => {
   it("acknowledges edited sends immediately and surfaces later startup failure via stream-error", async () => {
     const workspaceId = "ws-edit-startup-failed";
 
-    const streamMessage = mock((_history: MuxMessage[]) => {
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() => {
       return Promise.resolve(
         Err({
           type: "api_key_not_found",
@@ -180,7 +178,7 @@ describe("AgentSession pre-stream errors", () => {
     const { session, historyService, cleanup, events } = await createAgentSessionHarness({
       workspaceId,
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage: streamMessage,
       },
       captureEvents: true,
     });
@@ -223,9 +221,9 @@ describe("AgentSession pre-stream errors", () => {
     const { session, cleanup } = await createAgentSessionHarness({
       workspaceId,
       aiServiceOverrides: {
-        streamMessage: mock((_history: MuxMessage[]) =>
+        streamMessage: mock<AgentSessionAIService["streamMessage"]>(() =>
           Promise.resolve(Err({ type: "api_key_not_found", provider: "anthropic" }))
-        ) as unknown as AIService["streamMessage"],
+        ),
         getStreamInfo: mock((_workspaceId: string) => undefined),
         replayStream: mock((_workspaceId: string, _opts?: { afterTimestamp?: number }) =>
           Promise.resolve()
@@ -341,7 +339,7 @@ describe("AgentSession pre-stream errors", () => {
   it("schedules auto-retry when runtime startup fails before stream events", async () => {
     const workspaceId = "ws-runtime-start-failed";
 
-    const streamMessage = mock((_history: MuxMessage[]) => {
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() => {
       return Promise.resolve(
         Err({
           type: "runtime_start_failed",
@@ -352,7 +350,7 @@ describe("AgentSession pre-stream errors", () => {
     const { session, cleanup, events } = await createAgentSessionHarness({
       workspaceId,
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage: streamMessage,
       },
       captureEvents: true,
     });
@@ -379,8 +377,7 @@ describe("AgentSession pre-stream errors", () => {
     const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
 
-    const aiEmitter = new EventEmitter();
-    const streamMessage = mock((_history: MuxMessage[]) => {
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() => {
       return Promise.resolve(
         Err({
           type: "runtime_start_failed",
@@ -388,44 +385,24 @@ describe("AgentSession pre-stream errors", () => {
         })
       );
     });
-    const aiService = Object.assign(aiEmitter, {
-      isStreaming: mock((_workspaceId: string) => false),
-      stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
-      getStreamInfo: mock((_workspaceId: string) => undefined),
-      replayStream: mock((_workspaceId: string) => Promise.resolve()),
-      streamMessage: streamMessage as unknown as (
-        ...args: Parameters<AIService["streamMessage"]>
-      ) => Promise<Result<void, SendMessageError>>,
-    }) as unknown as AIService;
+    // Both sessions share one Config/HistoryService so the second reads the persisted opt-out.
+    const createSession = async () =>
+      (
+        await createAgentSessionHarness({
+          workspaceId,
+          config,
+          historyService,
+          aiServiceOverrides: {
+            streamMessage: streamMessage,
+          },
+        })
+      ).session;
 
-    const initStateManager = new EventEmitter() as unknown as InitStateManager;
-
-    const backgroundProcessManager = {
-      cleanup: mock((_workspaceId: string) => Promise.resolve()),
-      setMessageQueued: mock((_workspaceId: string, _queued: boolean) => {
-        void _queued;
-      }),
-    } as unknown as BackgroundProcessManager;
-
-    const sessionWithPersistedPreference = createTestAgentSession({
-      workspaceId,
-      config,
-      historyService,
-      aiService,
-      initStateManager,
-      backgroundProcessManager,
-    });
+    const sessionWithPersistedPreference = await createSession();
     await sessionWithPersistedPreference.setAutoRetryEnabled(false);
     await sessionWithPersistedPreference.dispose();
 
-    const session = createTestAgentSession({
-      workspaceId,
-      config,
-      historyService,
-      aiService,
-      initStateManager,
-      backgroundProcessManager,
-    });
+    const session = await createSession();
 
     const events: WorkspaceChatMessage[] = [];
     session.onChatEvent((event) => {
@@ -1133,7 +1110,7 @@ describe("AgentSession pre-stream errors", () => {
     // fire-and-forget senders (and the caller's onPreStartError collector),
     // then streamMessage returns Err with no handle.
     const aiEmitter = new EventEmitter();
-    const streamMessage = mock((opts: StreamMessageOptions) => {
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>((opts) => {
       const errorEvent = {
         type: "error" as const,
         workspaceId,
@@ -1150,7 +1127,7 @@ describe("AgentSession pre-stream errors", () => {
       workspaceId,
       aiEmitter,
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage: streamMessage,
       },
       captureEvents: true,
     });

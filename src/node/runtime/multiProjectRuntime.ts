@@ -1,4 +1,5 @@
 import assert from "node:assert";
+import path from "node:path";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type { Result } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -17,12 +18,19 @@ import type {
   WorkspaceForkResult,
   WorkspaceInitParams,
   WorkspaceInitResult,
+  ReadFileOptions,
 } from "./Runtime";
+import { LocalRuntime } from "./LocalRuntime";
 
 export interface MultiProjectRuntimeEntry {
   projectPath: string;
   projectName: string;
   runtime: Runtime;
+  /**
+   * The operation that built this runtime made this project's branch, so its rollback may
+   * delete it even when the caller keeps branches it cannot attribute (#4775).
+   */
+  createdBranch?: boolean;
 }
 
 export class MultiProjectRuntime implements Runtime {
@@ -194,27 +202,40 @@ export class MultiProjectRuntime implements Runtime {
     workspaceName: string,
     force: boolean,
     abortSignal?: AbortSignal,
-    trusted?: boolean
-  ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }> {
+    trusted?: boolean,
+    options?: { keepBranch?: boolean }
+  ): Promise<
+    | { success: true; deletedPath: string }
+    | { success: false; error: string; leftoverPaths: string[] }
+  > {
     const errors: string[] = [];
+    // What a rollback may tell the user to delete (#4936): the checkouts this workspace owns and the
+    // container. Never a local project's workspace path: that is the user's own repository.
+    const leftoverPaths: string[] = [];
 
     for (const projectRuntime of this.projectRuntimes) {
       try {
+        // A fork rollback must not delete branches it did not create, but should delete the
+        // ones it did, or a retry reuses their stale tips (#4775).
+        const keepBranch = options?.keepBranch === true && projectRuntime.createdBranch !== true;
         const deleteResult = await projectRuntime.runtime.deleteWorkspace(
           projectRuntime.projectPath,
           workspaceName,
           force,
           abortSignal,
-          trusted
+          trusted,
+          options ? { ...options, keepBranch } : undefined
         );
 
         if (!deleteResult.success) {
           errors.push(
             `[${projectRuntime.projectName}] ${deleteResult.error ?? "Unknown delete error"}`
           );
+          this.pushOwnedCheckout(leftoverPaths, projectRuntime, workspaceName);
         }
       } catch (error) {
         errors.push(`[${projectRuntime.projectName}] ${getErrorMessage(error)}`);
+        this.pushOwnedCheckout(leftoverPaths, projectRuntime, workspaceName);
       }
     }
 
@@ -222,12 +243,14 @@ export class MultiProjectRuntime implements Runtime {
       await this.containerManager.removeContainer(workspaceName);
     } catch (error) {
       errors.push(`[container] ${getErrorMessage(error)}`);
+      leftoverPaths.push(this.containerManager.getContainerPath(workspaceName));
     }
 
     if (errors.length > 0) {
       return {
         success: false,
         error: `Failed to delete multi-project workspace: ${errors.join("; ")}`,
+        leftoverPaths,
       };
     }
 
@@ -235,6 +258,22 @@ export class MultiProjectRuntime implements Runtime {
       success: true,
       deletedPath: this.containerManager.getContainerPath(workspaceName),
     };
+  }
+
+  /** Adds a project's checkout unless it is the project directory itself (LocalRuntime). */
+  private pushOwnedCheckout(
+    leftoverPaths: string[],
+    projectRuntime: MultiProjectRuntimeEntry,
+    workspaceName: string
+  ): void {
+    if (projectRuntime.runtime instanceof LocalRuntime) return;
+    const checkout = projectRuntime.runtime.getWorkspacePath(
+      projectRuntime.projectPath,
+      workspaceName
+    );
+    // Defense in depth: whatever the runtime, never list the user's repository for deletion.
+    if (path.resolve(checkout) === path.resolve(projectRuntime.projectPath)) return;
+    leftoverPaths.push(checkout);
   }
 
   async forkWorkspace(params: WorkspaceForkParams): Promise<WorkspaceForkResult> {
@@ -400,6 +439,10 @@ export class MultiProjectRuntime implements Runtime {
     return this.primaryRuntime.normalizePath(targetPath, basePath);
   }
 
+  isTransportFailureExit(exitCode: number, stderr: string): boolean {
+    return this.primaryRuntime.isTransportFailureExit?.(exitCode, stderr) ?? false;
+  }
+
   exec(command: string, options: ExecOptions): Promise<ExecStream> {
     return this.primaryRuntime.exec(command, {
       ...options,
@@ -407,8 +450,12 @@ export class MultiProjectRuntime implements Runtime {
     });
   }
 
-  readFile(filePath: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array> {
-    return this.primaryRuntime.readFile(filePath, abortSignal);
+  readFile(
+    filePath: string,
+    abortSignal?: AbortSignal,
+    options?: ReadFileOptions
+  ): ReadableStream<Uint8Array> {
+    return this.primaryRuntime.readFile(filePath, abortSignal, options);
   }
 
   writeFile(filePath: string, abortSignal?: AbortSignal): WritableStream<Uint8Array> {

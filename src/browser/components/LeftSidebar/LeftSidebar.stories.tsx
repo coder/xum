@@ -1,4 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import { useRef } from "react";
 import { LeftSidebar } from "./LeftSidebar";
 import { PIXEL_DUAL_THEME } from "@/browser/stories/meta.js";
@@ -20,13 +21,11 @@ import { within, userEvent, waitFor } from "storybook/test";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
-import { PolicyProvider } from "@/browser/contexts/PolicyContext";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
 import { ProjectProvider, useProjectContext } from "@/browser/contexts/ProjectContext";
 import { WorkspaceProvider, useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { SettingsProvider } from "@/browser/contexts/SettingsContext";
 import { ConfirmDialogProvider } from "@/browser/contexts/ConfirmDialogContext";
-import { ExperimentsProvider } from "@/browser/contexts/ExperimentsContext";
 import { AboutDialogProvider } from "@/browser/contexts/AboutDialogContext";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { useWorkspaceRecency } from "@/browser/stores/WorkspaceStore";
@@ -34,9 +33,8 @@ import { buildSortedWorkspacesByProject } from "@/browser/utils/ui/workspaceFilt
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   SELECTED_WORKSPACE_KEY,
-  SIDEBAR_AGE_GROUPING_KEY,
-  UI_THEME_KEY,
   getWorkspaceLastReadKey,
+  EXPANDED_OLD_WORKSPACES_KEY,
 } from "@/common/constants/storage";
 
 const meta: Meta<typeof LeftSidebar> = {
@@ -107,10 +105,6 @@ function LeftSidebarStoryScene(props: { leftSidebarProps?: LeftSidebarStoryOverr
 function resetStorybookPersistedStateForStory(): void {
   if (typeof localStorage !== "undefined") {
     localStorage.removeItem(SELECTED_WORKSPACE_KEY);
-    localStorage.setItem(UI_THEME_KEY, JSON.stringify("dark"));
-    // FlatListWhenAgeGroupingDisabled writes this key; clear it so later
-    // stories are not affected by story execution order.
-    localStorage.removeItem(SIDEBAR_AGE_GROUPING_KEY);
   }
 }
 
@@ -151,31 +145,32 @@ function LeftSidebarStoryShell(props: LeftSidebarStoryShellProps) {
     clientRef.current = null;
   }
 
-  clientRef.current ??= props.setup();
+  if (clientRef.current === null) {
+    clientRef.current = props.setup();
+    // No AppLoader here: connect the drafts store, which owns the creation draft list and imports
+    // the story's seeded legacy list from the mock backend.
+    getDraftStore().setClient(clientRef.current);
+  }
   const providerTreeKey = `${renderKey ?? "left-sidebar"}:${MODULE_RENDER_TOKEN}:${remountEpochRef.current}`;
 
   return (
     <ThemeProvider key={providerTreeKey}>
       <APIProvider client={clientRef.current}>
-        <PolicyProvider>
-          <RouterProvider>
-            <ExperimentsProvider>
-              <TooltipProvider delayDuration={200}>
-                <SettingsProvider>
-                  <AboutDialogProvider>
-                    <ConfirmDialogProvider>
-                      <ProjectProvider>
-                        <WorkspaceProvider>
-                          <LeftSidebarStoryScene leftSidebarProps={props.leftSidebarProps} />
-                        </WorkspaceProvider>
-                      </ProjectProvider>
-                    </ConfirmDialogProvider>
-                  </AboutDialogProvider>
-                </SettingsProvider>
-              </TooltipProvider>
-            </ExperimentsProvider>
-          </RouterProvider>
-        </PolicyProvider>
+        <RouterProvider>
+          <TooltipProvider delayDuration={200}>
+            <SettingsProvider>
+              <AboutDialogProvider>
+                <ConfirmDialogProvider>
+                  <ProjectProvider>
+                    <WorkspaceProvider>
+                      <LeftSidebarStoryScene leftSidebarProps={props.leftSidebarProps} />
+                    </WorkspaceProvider>
+                  </ProjectProvider>
+                </ConfirmDialogProvider>
+              </AboutDialogProvider>
+            </SettingsProvider>
+          </TooltipProvider>
+        </RouterProvider>
       </APIProvider>
     </ThemeProvider>
   );
@@ -651,7 +646,7 @@ export const SingleOldWorkspaceInOlderTier: AppStory = {
         expandProjects([projectPath]);
         // Keep this regression deterministic even when Storybook reuses localStorage
         // across stories/runs and a prior interaction expanded an old-age tier.
-        localStorage.setItem("expandedOldWorkspaces", JSON.stringify({}));
+        localStorage.setItem(EXPANDED_OLD_WORKSPACES_KEY, JSON.stringify({}));
         return createMockORPCClient({
           projects: groupWorkspacesByProject(workspaces),
           workspaces,
@@ -861,12 +856,12 @@ export const FlatListWhenAgeGroupingDisabled: AppStory = {
         const workspaces = [oldWorkspace, activeSubAgent, completedSubAgent];
 
         expandProjects([projectPath]);
-        updatePersistedState(SIDEBAR_AGE_GROUPING_KEY, false);
         // Grouping is off, so no tier should need expansion for rows to show.
-        localStorage.setItem("expandedOldWorkspaces", JSON.stringify({}));
+        localStorage.setItem(EXPANDED_OLD_WORKSPACES_KEY, JSON.stringify({}));
         return createMockORPCClient({
           projects: groupWorkspacesByProject(workspaces),
           workspaces,
+          userPreferences: { ui: { sidebarAgeGrouping: false } },
         });
       }}
     />
@@ -1447,7 +1442,7 @@ export const MixedAgentStatesAndAges: AppStory = {
         );
 
         // Expand age tiers so older-than-1-day and older-than-7-days rows are visible.
-        updatePersistedState("expandedOldWorkspaces", {
+        updatePersistedState(EXPANDED_OLD_WORKSPACES_KEY, {
           [`${projectPath}:0`]: true,
           [`${projectPath}:1`]: true,
         });
@@ -1597,7 +1592,7 @@ export const ArchivingWorkspaceAlignment: AppStory = {
     const menuButton = within(row).getByLabelText("Workspace actions for Old experiment workspace");
     await userEvent.click(menuButton);
 
-    // Wait for the popover to open, then click "Archive chat"
+    // Wait for the popover to open, then click "Archive workspace"
     await waitFor(() => {
       const archiveButton = document.body.querySelector<HTMLElement>(
         "[data-radix-popper-content-wrapper] button"
@@ -1605,11 +1600,11 @@ export const ArchivingWorkspaceAlignment: AppStory = {
       if (!archiveButton) throw new Error("popover not open yet");
     });
 
-    // Find and click the Archive chat button in the popover
+    // Find and click the Archive workspace button in the popover
     const popoverContent = document.body.querySelector<HTMLElement>(
       "[data-radix-popper-content-wrapper]"
     )!;
-    const archiveButton = within(popoverContent).getByText("Archive chat").closest("button")!;
+    const archiveButton = within(popoverContent).getByText("Archive workspace").closest("button")!;
     await userEvent.click(archiveButton);
 
     // Wait for the "Archiving..." text to appear (confirms the transient state is active)

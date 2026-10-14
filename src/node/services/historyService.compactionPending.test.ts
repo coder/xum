@@ -6,6 +6,7 @@ import * as path from "node:path";
 import * as atomicWrite from "@/node/utils/writeFileAtomic";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import * as fileLock from "@/node/utils/concurrency/fileLock";
+import { markLockOwnerDead } from "@/node/utils/concurrency/fileLockTestHelpers";
 import { CompactionPendingState } from "./compactionPendingState";
 import { HistoryService } from "./historyService";
 import { readCompactionPendingHistoryBoundary } from "./historyScanner";
@@ -38,10 +39,8 @@ describe("inactive compaction history transactions", () => {
 
   async function reclaimHistoryLock() {
     const lockPath = historyWriteLockPath(h.config.rootDir, workspaceId);
-    // Exercise real lease reclamation without waiting for a live holder to expire.
-    const token = await fs.readFile(lockPath, "utf8");
-    await fs.writeFile(lockPath, token.split(":").slice(0, 2).join(":"));
-    await fs.utimes(lockPath, new Date(0), new Date(0));
+    // Exercise real reclamation of a lost lock (dead recorded owner).
+    await markLockOwnerDead(lockPath);
     return fileLock.acquireProcessFileLock({ lockPath, timeoutMs: 1000, label: "successor" });
   }
 

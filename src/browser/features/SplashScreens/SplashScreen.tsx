@@ -25,6 +25,8 @@ interface SplashScreenProps {
   footer?: React.ReactNode;
   /** Optional class name for the DialogFooter container. */
   footerClassName?: string;
+  /** Open without the dialog's entry animation (the static first-run view shows this frame). */
+  skipEntryAnimation?: boolean;
 }
 
 export function SplashScreen(props: SplashScreenProps) {
@@ -47,6 +49,7 @@ export function SplashScreen(props: SplashScreenProps) {
       <DialogContent
         maxWidth="500px"
         aria-describedby={undefined}
+        skipEntryAnimation={props.skipEntryAnimation}
         className="max-h-[85vh] grid-rows-[auto_minmax(0,1fr)_auto]"
         onInteractOutside={(e) => e.preventDefault()}
       >

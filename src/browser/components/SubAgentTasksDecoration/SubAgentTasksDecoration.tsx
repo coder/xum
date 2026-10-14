@@ -5,6 +5,7 @@ import {
   CircleX,
   Clock3,
   LoaderCircle,
+  Radar,
   Workflow,
 } from "lucide-react";
 
@@ -12,7 +13,7 @@ import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 
 import { useAPI } from "@/browser/contexts/API";
 import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
-import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
+import { useWorkspaceStoreRaw, type WorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import { isActiveWorkflowRunStatus } from "@/common/types/workflow";
 import type { WorkflowRunLivenessEntry } from "@/common/orpc/schemas/api";
 import { shortenWorkflowRunId } from "@/browser/components/ProjectSidebar/sidebarTaskGroups";
@@ -22,11 +23,32 @@ import { ChatInputDecoration } from "@/browser/components/ChatPane/ChatInputDeco
 import { getSubAgentTasksExpandedKey } from "@/common/constants/storage";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { isWorkspaceArchived } from "@/common/utils/archive";
-import { isActionableTaskExecutionStatus } from "@/browser/utils/ui/workspaceFiltering";
+import {
+  isWorkspaceDelegatedActivityActive,
+  isWorkspaceSidebarStateWorking,
+} from "@/browser/utils/ui/workspaceFiltering";
 import { cn } from "@/common/lib/utils";
 
-interface DescendantSubAgent {
-  workspace: FrontendWorkspaceMetadata;
+/**
+ * The metadata the tray reads, so a host without full metadata (the VS Code webview, #5109) can
+ * feed it.
+ */
+export type SubAgentTaskWorkspace = Pick<
+  FrontendWorkspaceMetadata,
+  | "id"
+  | "name"
+  | "title"
+  | "parentWorkspaceId"
+  | "archivedAt"
+  | "unarchivedAt"
+  | "workflowTask"
+  | "taskStatus"
+  | "taskExecutionStatus"
+  | "reportedAt"
+>;
+
+export interface DescendantSubAgent {
+  workspace: SubAgentTaskWorkspace;
   depth: number;
 }
 
@@ -36,18 +58,75 @@ const NESTED_RUN_VERIFY_MAX_FAILURES = 3;
 const RUN_DISCOVERY_RETRY_BASE_MS = 1_000;
 const RUN_DISCOVERY_RETRY_MAX_MS = 30_000;
 
-const ACTIVE_SUBAGENT_STATUSES = new Set<FrontendWorkspaceMetadata["taskStatus"]>([
-  "queued",
-  "starting",
-  "running",
-  "awaiting_report",
-]);
+/**
+ * Live-store hints for one descendant. Task metadata alone cannot tell that a reported
+ * child is still waiting on an armed background bash monitor (#4327); these hints feed
+ * the same delegated-activity predicate the sidebar uses so both surfaces agree.
+ */
+export interface DescendantActivityHints {
+  hasActiveBashMonitor: boolean;
+  /** The sidebar's "working" signal (`isWorkspaceSidebarStateWorking`). */
+  isLiveActive: boolean;
+}
 
-export function isSubAgentActive(workspace: FrontendWorkspaceMetadata): boolean {
-  return (
-    isActionableTaskExecutionStatus(workspace.taskExecutionStatus) ||
-    ACTIVE_SUBAGENT_STATUSES.has(workspace.taskStatus)
-  );
+const NO_ACTIVITY_HINTS: DescendantActivityHints = {
+  hasActiveBashMonitor: false,
+  isLiveActive: false,
+};
+
+const HINT_ENTRY_SEPARATOR = "\u0000";
+const HINT_FLAGS_SEPARATOR = "\u0001";
+
+/**
+ * One primitive keeps the useSyncExternalStore snapshot Object.is-stable across
+ * recomputes, while per-child booleans still re-render when a monitor arms, retires,
+ * or moves between children. Counts are not encoded, so 2 -> 1 monitors is a no-op.
+ */
+export function encodeDescendantActivity(
+  workspaceIds: readonly string[],
+  getSidebarState: (workspaceId: string) => WorkspaceSidebarState | null
+): string {
+  return workspaceIds
+    .map((workspaceId) => {
+      const state = getSidebarState(workspaceId);
+      const monitor = state != null && state.activeBashMonitorCount > 0 ? "m" : "-";
+      const live = state != null && isWorkspaceSidebarStateWorking(state) ? "l" : "-";
+      return `${workspaceId}${HINT_FLAGS_SEPARATOR}${monitor}${live}`;
+    })
+    .join(HINT_ENTRY_SEPARATOR);
+}
+
+export function decodeDescendantActivity(key: string): Map<string, DescendantActivityHints> {
+  const hints = new Map<string, DescendantActivityHints>();
+  if (key.length === 0) {
+    return hints;
+  }
+  for (const entry of key.split(HINT_ENTRY_SEPARATOR)) {
+    const [workspaceId, flags] = entry.split(HINT_FLAGS_SEPARATOR);
+    hints.set(workspaceId, {
+      hasActiveBashMonitor: flags.startsWith("m"),
+      isLiveActive: flags.endsWith("l"),
+    });
+  }
+  return hints;
+}
+
+/**
+ * Active for the tray = the sidebar's delegated-activity reading (execution, task
+ * status, armed monitors, then the live hint fenced off by a completed report),
+ * plus the tray's own convention that queued work already counts as active.
+ */
+export function isSubAgentActive(
+  workspace: SubAgentTaskWorkspace,
+  hints: DescendantActivityHints = NO_ACTIVITY_HINTS
+): boolean {
+  if (workspace.taskExecutionStatus === "queued" || workspace.taskStatus === "queued") {
+    return true;
+  }
+  return isWorkspaceDelegatedActivityActive(workspace, {
+    hasActiveBashMonitor: () => hints.hasActiveBashMonitor,
+    isWorkspaceLiveActive: () => hints.isLiveActive,
+  });
 }
 
 /** Live workers of one workflow run, in traversal order (parents before children). */
@@ -77,10 +156,10 @@ export interface DescendantAgents {
  * User-owned tasks spawned by a worker stay inside that run's group.
  */
 export function collectDescendantAgents(
-  workspaces: Iterable<FrontendWorkspaceMetadata>,
+  workspaces: Iterable<SubAgentTaskWorkspace>,
   parentWorkspaceId: string
 ): DescendantAgents {
-  const childrenByParentId = new Map<string, FrontendWorkspaceMetadata[]>();
+  const childrenByParentId = new Map<string, SubAgentTaskWorkspace[]>();
   for (const workspace of workspaces) {
     if (
       workspace.parentWorkspaceId == null ||
@@ -221,11 +300,32 @@ export function mergeActiveWorkflowGroups(
   return merged;
 }
 
-export function getSubAgentStatusPresentation(workspace: FrontendWorkspaceMetadata): {
+interface SubAgentStatusPresentation {
   label: string;
   icon: typeof Clock3;
   iconClassName: string;
-} {
+}
+
+// Settled rows: no turn in progress. Only these may be overridden by an armed monitor.
+const COMPLETED_PRESENTATION: SubAgentStatusPresentation = {
+  label: "Completed",
+  icon: CheckCircle2,
+  iconClassName: "text-success",
+};
+const INACTIVE_PRESENTATION: SubAgentStatusPresentation = {
+  label: "Inactive",
+  icon: CheckCircle2,
+  iconClassName: "text-muted",
+};
+// The agent's turn ended but a background bash monitor is armed to wake it on match.
+// Normal foreground keeps the icon legible in both themes; waiting is not a warning.
+const MONITORING_PRESENTATION: SubAgentStatusPresentation = {
+  label: "Monitoring",
+  icon: Radar,
+  iconClassName: "text-foreground",
+};
+
+function getTaskStatusPresentation(workspace: SubAgentTaskWorkspace): SubAgentStatusPresentation {
   // No execution status (never-reawakened sub-agent) falls through to taskStatus.
   if (workspace.taskExecutionStatus !== undefined) {
     switch (workspace.taskExecutionStatus) {
@@ -239,7 +339,7 @@ export function getSubAgentStatusPresentation(workspace: FrontendWorkspaceMetada
           iconClassName: "text-success animate-spin",
         };
       case "completed":
-        return { label: "Completed", icon: CheckCircle2, iconClassName: "text-success" };
+        return COMPLETED_PRESENTATION;
       case "interrupted":
         return { label: "Interrupted", icon: CircleSlash2, iconClassName: "text-muted" };
       case "error":
@@ -256,20 +356,40 @@ export function getSubAgentStatusPresentation(workspace: FrontendWorkspaceMetada
     case "awaiting_report":
       return { label: "Finishing", icon: LoaderCircle, iconClassName: "text-warning animate-spin" };
     case "reported":
-      return { label: "Completed", icon: CheckCircle2, iconClassName: "text-success" };
+      return COMPLETED_PRESENTATION;
     case "interrupted":
       return { label: "Interrupted", icon: CircleSlash2, iconClassName: "text-muted" };
     default:
-      return { label: "Inactive", icon: CheckCircle2, iconClassName: "text-muted" };
+      return INACTIVE_PRESENTATION;
   }
 }
 
+/**
+ * Task-derived status, except that a settled row (Completed/Inactive) whose monitors
+ * are still armed presents as Monitoring so the row agrees with the active count.
+ * Running/queued/finishing and interrupted/failed outcomes keep their precedence.
+ */
+export function getSubAgentStatusPresentation(
+  workspace: SubAgentTaskWorkspace,
+  hints: DescendantActivityHints = NO_ACTIVITY_HINTS
+): SubAgentStatusPresentation {
+  const presentation = getTaskStatusPresentation(workspace);
+  if (
+    hints.hasActiveBashMonitor &&
+    (presentation === COMPLETED_PRESENTATION || presentation === INACTIVE_PRESENTATION)
+  ) {
+    return MONITORING_PRESENTATION;
+  }
+  return presentation;
+}
+
 function AgentRow(props: {
-  workspace: FrontendWorkspaceMetadata;
+  workspace: SubAgentTaskWorkspace;
+  hints: DescendantActivityHints | undefined;
   indentLevel: number;
   onNavigate: (workspaceId: string) => void;
 }) {
-  const status = getSubAgentStatusPresentation(props.workspace);
+  const status = getSubAgentStatusPresentation(props.workspace, props.hints);
   const StatusIcon = status.icon;
   return (
     <button
@@ -287,11 +407,17 @@ function AgentRow(props: {
   );
 }
 
-function formatWorkflowSummary(workflowGroups: readonly WorkflowAgentGroup[]): string {
+function formatWorkflowSummary(
+  workflowGroups: readonly WorkflowAgentGroup[],
+  activity: ReadonlyMap<string, DescendantActivityHints>
+): string {
   const workerCount = workflowGroups.reduce((count, group) => count + group.workers.length, 0);
   const activeWorkerCount = workflowGroups.reduce(
     (count, group) =>
-      count + group.workers.filter(({ workspace }) => isSubAgentActive(workspace)).length,
+      count +
+      group.workers.filter(({ workspace }) =>
+        isSubAgentActive(workspace, activity.get(workspace.id))
+      ).length,
     0
   );
   const label =
@@ -397,6 +523,17 @@ export function SubAgentTasksDecoration(props: { workspaceId: string }) {
     }
     return ids.join("\u0000");
   });
+  // Per-descendant live hints (armed monitors, sidebar "working" signal), subscribed and
+  // encoded for the same reasons as activeRunIdsKey above.
+  const descendantActivityKey = useSyncExternalStore(workspaceStore.subscribe, () =>
+    encodeDescendantActivity(descendantWorkspaceIds, (workspaceId) =>
+      // Metadata can lead or trail store registration; an unregistered descendant has no state.
+      workspaceStore.hasRegisteredWorkspace(workspaceId)
+        ? workspaceStore.getWorkspaceSidebarState(workspaceId)
+        : null
+    )
+  );
+  const descendantActivity = decodeDescendantActivity(descendantActivityKey);
   const workflowGroups = mergeActiveWorkflowGroups(
     liveWorkflowGroups,
     activeRunIdsKey.length > 0 ? activeRunIdsKey.split("\u0000") : [],
@@ -561,46 +698,74 @@ export function SubAgentTasksDecoration(props: { workspaceId: string }) {
     };
   }, [api, nestedGapKey]);
 
-  if (subAgents.length === 0 && workflowGroups.length === 0) {
+  return (
+    <SubAgentTasksContent
+      subAgents={subAgents}
+      workflowGroups={workflowGroups}
+      descendantActivity={descendantActivity}
+      expanded={expanded}
+      onToggle={() => setExpanded(!expanded)}
+      onNavigate={navigateToWorkspace}
+    />
+  );
+}
+
+/**
+ * The tray itself, driven by props so hosts without WorkspaceContext/WorkspaceStore (the VS Code
+ * webview, #5109) can feed it. SubAgentTasksDecoration is the desktop container.
+ */
+export function SubAgentTasksContent(props: {
+  subAgents: readonly DescendantSubAgent[];
+  workflowGroups: readonly WorkflowAgentGroup[];
+  descendantActivity: ReadonlyMap<string, DescendantActivityHints>;
+  expanded: boolean;
+  onToggle: () => void;
+  onNavigate: (workspaceId: string) => void;
+}) {
+  if (props.subAgents.length === 0 && props.workflowGroups.length === 0) {
     return null;
   }
 
-  const activeCount = subAgents.filter(({ workspace }) => isSubAgentActive(workspace)).length;
-  const SummaryIcon = subAgents.length === 0 ? Workflow : Bot;
+  const activeCount = props.subAgents.filter(({ workspace }) =>
+    isSubAgentActive(workspace, props.descendantActivity.get(workspace.id))
+  ).length;
+  const SummaryIcon = props.subAgents.length === 0 ? Workflow : Bot;
 
   return (
     <ChatInputDecoration
-      expanded={expanded}
-      onToggle={() => setExpanded(!expanded)}
+      expanded={props.expanded}
+      onToggle={props.onToggle}
       dataComponent="SubAgentTasksDecoration"
       contentClassName="max-h-52 space-y-1 overflow-y-auto py-2"
       summary={
         <>
           <SummaryIcon className="text-muted group-hover:text-secondary size-3.5 shrink-0 transition-colors" />
           <span className="text-muted group-hover:text-secondary min-w-0 truncate transition-colors">
-            {subAgents.length > 0 && (
+            {props.subAgents.length > 0 && (
               <>
-                <span className="font-medium">{subAgents.length}</span> sub-agent
-                {subAgents.length === 1 ? "" : "s"}
+                <span className="font-medium">{props.subAgents.length}</span> sub-agent
+                {props.subAgents.length === 1 ? "" : "s"}
                 {activeCount > 0 ? ` · ${activeCount} active` : " · inactive"}
               </>
             )}
-            {subAgents.length > 0 && workflowGroups.length > 0 && " · "}
-            {workflowGroups.length > 0 && formatWorkflowSummary(workflowGroups)}
+            {props.subAgents.length > 0 && props.workflowGroups.length > 0 && " · "}
+            {props.workflowGroups.length > 0 &&
+              formatWorkflowSummary(props.workflowGroups, props.descendantActivity)}
           </span>
         </>
       }
       renderExpanded={() => (
         <>
-          {subAgents.map(({ workspace, depth }) => (
+          {props.subAgents.map(({ workspace, depth }) => (
             <AgentRow
               key={workspace.id}
               workspace={workspace}
+              hints={props.descendantActivity.get(workspace.id)}
               indentLevel={depth - 1}
-              onNavigate={navigateToWorkspace}
+              onNavigate={props.onNavigate}
             />
           ))}
-          {workflowGroups.map((group) => (
+          {props.workflowGroups.map((group) => (
             <div key={group.runId} className="space-y-1">
               <div className="text-muted flex min-w-0 items-center gap-2 px-2 pt-1.5 pb-0.5 text-[10px]">
                 <Workflow className="size-3.5 shrink-0" />
@@ -612,10 +777,11 @@ export function SubAgentTasksDecoration(props: { workspaceId: string }) {
                 <AgentRow
                   key={workspace.id}
                   workspace={workspace}
+                  hints={props.descendantActivity.get(workspace.id)}
                   // Nest workers one level under their run header; nested runs keep
                   // their relative depth without inheriting the outer tree's offset.
                   indentLevel={Math.max(0, depth - group.workers[0].depth) + 1}
-                  onNavigate={navigateToWorkspace}
+                  onNavigate={props.onNavigate}
                 />
               ))}
             </div>

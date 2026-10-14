@@ -5,6 +5,10 @@ import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
 import type { StreamErrorMessage } from "@/common/orpc/types";
 import { PROVIDER_DISPLAY_NAMES, type ProviderName } from "@/common/constants/providers";
 import { createAssistantMessageId } from "./messageIds";
+import {
+  formatPluginBlockedMessage,
+  formatSendMessageError as formatSendMessageErrorForDisplay,
+} from "@/common/utils/errors/formatSendError";
 
 const getProviderDisplayName = (provider: string): string =>
   PROVIDER_DISPLAY_NAMES[provider as ProviderName] ?? provider;
@@ -111,23 +115,34 @@ export const formatSendMessageError = (
       };
     case "context_budget_blocked":
       return { message: error.message, errorType: "context_budget_blocked" };
-    case "context_budget_exceeded":
+    case "context_budget_exceeded": {
+      // Share the display formatter so early-stop counts never appear as exact request sizes.
+      const formatted = formatSendMessageErrorForDisplay(error);
       return {
-        message: `Request for ${error.model} is estimated at ${error.estimate} tokens, above the usable context budget of ${error.hardCeiling}. Shorten the request or choose a larger-context model.`,
+        message: [formatted.message, formatted.resolutionHint].filter(Boolean).join(" "),
         errorType: "context_budget_blocked",
       };
+    }
     case "unknown":
       return {
         message: error.raw,
         errorType: "unknown",
       };
-    case "policy_denied":
-      return {
-        message: error.message,
-        errorType: "unknown",
-      };
+    case "task_checkout_unsanitized":
+      // Permanent until the task is removed (#4674): a non-retryable stream type, so a turn
+      // refused after its init wait schedules no auto-resume.
+      return { message: error.message, errorType: "runtime_not_ready" };
     case "history-changed":
       return { message: EDIT_HISTORY_CHANGED_MESSAGE, errorType: "unknown" };
+    case "plan_review_feedback_edit_blocked":
+      return { message: error.message, errorType: "unknown" };
+    case "session_tape_replay":
+      return { message: error.message, errorType: "session_tape_replay" };
+    case "plugin_blocked":
+      return {
+        message: formatPluginBlockedMessage(error.plugin, error.reason),
+        errorType: "plugin_blocked",
+      };
   }
 };
 
@@ -141,6 +156,16 @@ export interface StreamErrorPayload {
   error: string;
   errorType?: StreamErrorType;
   acpPromptId?: string;
+  /**
+   * Internal: the provider's Retry-After for a `rate_limit` error, in ms. Feeds auto-retry
+   * scheduling only; not persisted and not part of the renderer wire payload.
+   */
+  retryAfterMs?: number;
+  /**
+   * Internal: the model the failed request ran on, which is a refusal fallback after a swap.
+   * The compaction context_exceeded retry plans from it. Not part of the renderer wire payload.
+   */
+  model?: string;
 }
 
 export const createErrorEvent = (workspaceId: string, payload: StreamErrorPayload): ErrorEvent => ({

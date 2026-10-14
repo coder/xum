@@ -1,37 +1,30 @@
 import { expect, userEvent, waitFor, within } from "@storybook/test";
 import { createMuxMessage } from "@/common/types/message";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
-import { getAutoCompactionThresholdKey, getModelKey } from "@/common/constants/storage";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { collapseLeftSidebar, expandLeftSidebar } from "./helpers/uiState";
 import { createAssistantMessage } from "./mocks/messages";
 import { STABLE_TIMESTAMP } from "./mocks/workspaces";
-import { waitForScrollStabilization } from "./storyPlayHelpers.js";
+import { openSettingsDialog, waitForScrollStabilization } from "./storyPlayHelpers.js";
 
 export default { ...appMeta, title: "App/TokenBudget" };
 
 const WORKSPACE_ID = "ws-token-budget";
 const MODEL = "google:gemini-3.1-flash-lite";
+// Legacy fixture: new windows no longer send an advance warning, but persisted rows still render.
 const WARNING =
   "Save the objective and next steps to workspace/context-notes.md (up to 8 KiB) if writable.";
 const HANDOFF =
-  "The context handoff target has been reached. Finish the current small unit of work, checkpoint notes, then call new_context.";
-// Legacy fixture: new windows no longer offer a final flush, but persisted rows still render.
-const FINAL_FLUSH =
-  "Last step in this context window: write workspace/context-notes.md in a single memory call.";
+  "The context handoff target has been reached. Save your checkpoint in /memories/session/, then call new_context.";
+const FINAL =
+  "The current context window is exhausted. Save your checkpoint with the memory tool now, then call new_context.";
 const LEAD_IN = "Model-only instructions for retrieving earlier context windows.";
 
 function setupTokenBudgetStory(inputTokens = 2400) {
   collapseLeftSidebar();
-  updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TOKEN_BUDGET), true);
-  updatePersistedState(getExperimentKey(EXPERIMENT_IDS.CONTINUOUS_COMPACTION), false);
-  updatePersistedState(getExperimentKey(EXPERIMENT_IDS.RLM), false);
-  updatePersistedState(getModelKey(WORKSPACE_ID), MODEL);
-  updatePersistedState(getAutoCompactionThresholdKey(MODEL), 70);
   const history = [
     createMuxMessage("earlier", "user", "Keep the migration reversible.", {
       historySequence: 1,
@@ -65,7 +58,7 @@ function setupTokenBudgetStory(inputTokens = 2400) {
         handoffTokens: 700_000,
       },
     }),
-    createMuxMessage("final-flush", "user", FINAL_FLUSH, {
+    createMuxMessage("final-handoff", "user", FINAL, {
       historySequence: 4,
       timestamp: STABLE_TIMESTAMP - 25_000,
       synthetic: true,
@@ -113,6 +106,9 @@ function setupTokenBudgetStory(inputTokens = 2400) {
   return setupSimpleChatStory({
     workspaceId: WORKSPACE_ID,
     workspaceName: "token-budget",
+    aiSettings: { model: MODEL, thinkingLevel: "off" },
+    experiments: { [EXPERIMENT_IDS.TOKEN_BUDGET]: true, [EXPERIMENT_IDS.MEMORY]: true },
+    userPreferences: { ai: { autoCompactionThresholdByModel: { [MODEL]: 70 } } },
     messages: [
       ...history.map((message) => ({ ...message, type: "message" as const })),
       createAssistantMessage("retrieval", "I'll retrieve the earlier decision before continuing.", {
@@ -185,20 +181,20 @@ export const Rollover: AppStory = {
     await userEvent.click(handoff);
     await waitFor(() => expect(canvas.getByText(HANDOFF)).toBeVisible());
     await userEvent.click(handoff);
-    await expect(canvas.queryByText(FINAL_FLUSH)).not.toBeInTheDocument();
-    const finalFlush = await canvas.findByRole("button", {
-      name: /Context window ending: notes flush/,
+    await expect(canvas.queryByText(FINAL)).not.toBeInTheDocument();
+    const finalHandoff = await canvas.findByRole("button", {
+      name: /Context window ending: final handoff/,
     });
     await expect(
-      finalFlush.compareDocumentPosition(boundary) & Node.DOCUMENT_POSITION_FOLLOWING
+      finalHandoff.compareDocumentPosition(boundary) & Node.DOCUMENT_POSITION_FOLLOWING
     ).not.toBe(0);
-    await userEvent.click(finalFlush);
-    await waitFor(() => expect(canvas.getByText(FINAL_FLUSH)).toBeVisible());
-    await userEvent.click(finalFlush);
-    const tool = await canvas.findByText("session_history", { exact: true });
+    await userEvent.click(finalHandoff);
+    await waitFor(() => expect(canvas.getByText(FINAL)).toBeVisible());
+    await userEvent.click(finalHandoff);
+    const tool = await canvas.findByText("List windows", { exact: true });
     await userEvent.click(tool);
-    await expect(await canvas.findByText("Arguments", { exact: true })).toBeVisible();
-    await expect(await canvas.findByText("Result", { exact: true })).toBeVisible();
+    await expect(await canvas.findByText("Context windows · oldest first")).toBeVisible();
+    await expect(await canvas.findByText("3 items", { exact: true })).toBeVisible();
     await userEvent.click(tool);
     await waitForScrollStabilization(canvasElement);
 
@@ -303,7 +299,8 @@ export const ContextSettings: AppStory = {
     const page = within(canvasElement.ownerDocument.body);
     const dialog = await page.findByRole("dialog");
     // The slider is the handoff target itself; no force buffer is advertised.
-    await expect(within(dialog).getByText(/Handoff target: 70%/)).toBeVisible();
+    // The label switches to the handoff wording once the experiment flags arrive.
+    await expect(await within(dialog).findByText(/Handoff target: 70%/)).toBeVisible();
     await expect(within(dialog).queryByText(/Rolls over by/)).not.toBeInTheDocument();
     await expect(within(dialog).getByText("Idle compaction", { exact: true })).toBeVisible();
     await expect(within(dialog).getByText("/compact", { exact: true })).toBeVisible();
@@ -337,8 +334,8 @@ export const ExperimentSettings: AppStory = {
     if (!canvas.queryByTestId("settings-button")) {
       await userEvent.click(canvas.getByRole("button", { name: "Open sidebar menu" }));
     }
-    await userEvent.click(await canvas.findByTestId("settings-button"));
-    const strategy = await canvas.findByRole("combobox", { name: "Compaction strategy" });
+    const settings = within(await openSettingsDialog(canvasElement));
+    const strategy = await settings.findByRole("combobox", { name: "Compaction strategy" });
     strategy.scrollIntoView({ block: "center" });
     await expect(strategy).toHaveTextContent("Token Budget");
     const page = within(canvasElement.ownerDocument.body);

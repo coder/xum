@@ -13,7 +13,6 @@ import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import type { AgentSession } from "./agentSession";
-import type { AIService } from "./aiService";
 import type { CompactionMonitor } from "./compactionMonitor";
 import type { TurnCompletion } from "./streamManager";
 import {
@@ -143,6 +142,16 @@ describe("AgentSession queued message tool-call dispatch", () => {
         expect(
           h.events.filter((event) => event.type === "restore-to-input").map((event) => event.text)
         ).toEqual([phase === "failed flush" ? "later input" : "first input\nlater input"]);
+        // #4448: exactly the restored input is held until a composer takes it. A send whose
+        // bytes survived the failed flush is not held: Send would deliver it twice.
+        expect(h.session.getHeldInputs().map((held) => [held.reason, held.send.message])).toEqual(
+          phase === "failed flush"
+            ? [["interrupted", "later input"]]
+            : [
+                ["interrupted", "first input"],
+                ["interrupted", "later input"],
+              ]
+        );
         const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
         expect(history.success && history.data.filter((row) => row.role === "user")).toHaveLength(
           phase === "failed flush" ? 1 : 0
@@ -511,7 +520,29 @@ describe("AgentSession queued message tool-call dispatch", () => {
             text: `${restoreAt === "raw command" ? "/init" : "first\nsecond"}\nlater input`,
             fileParts: [...fileParts, ...laterFileParts],
             reviews,
+            heldInputIds: h.session.getHeldInputs().map((held) => held.id),
+            // Per send (idempotent sends): these sends were queued without send ids.
+            inputs: [
+              {
+                text: restoreAt === "raw command" ? "/init" : "first\nsecond",
+                fileParts,
+                reviews,
+                sendIds: [],
+              },
+              { text: "later input", fileParts: laterFileParts, sendIds: [] },
+            ],
           },
+        ]);
+        // The dequeued send and the later entry are each held with their own send (#4448).
+        expect(
+          h.session.getHeldInputs().map((held) => ({
+            reason: held.reason,
+            message: held.send.message,
+            fileParts: held.send.options.fileParts,
+          }))
+        ).toEqual([
+          { reason: "interrupted", message: "first\nsecond", fileParts },
+          { reason: "interrupted", message: "later input", fileParts: laterFileParts },
         ]);
         expect(await h.historyService.getHistoryFromLatestBoundary(workspaceId)).toEqual(Ok([]));
         expect(stream).not.toHaveBeenCalled();
@@ -525,6 +556,219 @@ describe("AgentSession queued message tool-call dispatch", () => {
       }
     }
   );
+
+  // #4448: restore-to-input is a one-shot event the composer may not take (edit mode, not
+  // mounted, not subscribed), so the backend keeps the input until a composer acknowledges it.
+  test("a restore keeps the user's input as held input until a composer releases it", async () => {
+    const h = await createAgentSessionHarness({
+      workspaceId: "queue-restore-held",
+      captureEvents: true,
+    });
+    try {
+      h.session.queueMessage("queued follow-up", { model: TEST_MODEL, agentId: "exec" });
+      h.session.queueMessage(
+        "background wake",
+        { model: TEST_MODEL, agentId: "exec" },
+        { synthetic: true, acceptanceOrigin: "automatic" }
+      );
+      const firstNewEvent = h.events.length;
+
+      h.session.restoreQueueToInput();
+
+      const held = h.session.getHeldInputs();
+      expect(held.map((input) => [input.reason, input.send.displayText])).toEqual([
+        ["interrupted", "queued follow-up"],
+      ]);
+      expect(h.session.hasQueuedMessages()).toBe(false);
+      // The restore names the held input and precedes the held list, so a composer that takes it
+      // hides it before the renderer would show a banner; the queue clear comes first of all.
+      const events = h.events.slice(firstNewEvent);
+      expect(events.map((event) => event.type)).toEqual([
+        "queued-message-changed",
+        "restore-to-input",
+        "held-inputs-changed",
+      ]);
+      expect(events[1]).toMatchObject({ text: "queued follow-up", heldInputIds: [held[0].id] });
+      expect(events[2]).toMatchObject({
+        heldInputs: [{ id: held[0].id, reason: "interrupted", displayText: "queued follow-up" }],
+      });
+      expect(h.session.hasPendingUserInput()).toBe(true);
+
+      expect(h.session.discardHeldInput(held[0].id)).toBe("discarded");
+      expect(h.session.hasPendingUserInput()).toBe(false);
+    } finally {
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
+  // #5171: an ACP prompt that waits in the queue settles only on events carrying its correlation
+  // id. A dequeue refusal starts no stream, so the held list must name the refused prompt.
+  test("a queued send refused at dequeue is held with its ACP prompt correlation id", async () => {
+    const h = await createAgentSessionHarness({
+      workspaceId: "queue-refused-acp-held",
+      captureEvents: true,
+    });
+    const stream = spyOn(h.aiService, "streamMessage");
+    try {
+      h.session.queueMessage(
+        "acp prompt",
+        { model: TEST_MODEL, agentId: "exec", acpPromptId: "acp-prompt-1" },
+        {
+          acceptanceOrigin: "manual",
+          // A task attempt closed while the prompt waited: the dequeue gate refuses it.
+          turnAdmission: {
+            admissionStale: () => true,
+            onEnqueued: () => undefined,
+            onAdmitted: () => undefined,
+            onDisposed: () => undefined,
+          },
+        }
+      );
+      h.session.sendQueuedMessages();
+      await h.session.waitForIdle();
+
+      expect(stream).not.toHaveBeenCalled();
+      expect(h.events.findLast((event) => event.type === "held-inputs-changed")).toMatchObject({
+        heldInputs: [{ displayText: "acp prompt", acpPromptId: "acp-prompt-1" }],
+      });
+    } finally {
+      stream.mockRestore();
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
+  // #5198: a queued ACP prompt gets no correlated event while it waits, so the queue event must
+  // name it for the ACP agent to hold its correlation timeout until the entry leaves the queue.
+  test("queue events list the ACP prompts still queued", async () => {
+    const streamMessage = mock(() =>
+      Promise.resolve(Ok(createStartedTurnHandle(h.session.closingSignal)))
+    );
+    const h = await createAgentSessionHarness({
+      workspaceId: "queue-acp-prompt-ids",
+      captureEvents: true,
+      aiServiceOverrides: { streamMessage },
+    });
+    const lastQueueEvent = () =>
+      h.events.findLast((event) => event.type === "queued-message-changed");
+    try {
+      h.session.queueMessage("acp prompt", {
+        model: TEST_MODEL,
+        agentId: "exec",
+        acpPromptId: "acp-prompt-1",
+      });
+      h.session.queueMessage("plain follow-up", { model: TEST_MODEL, agentId: "exec" });
+      expect(lastQueueEvent()).toMatchObject({ acpPromptIds: ["acp-prompt-1"] });
+
+      h.session.sendQueuedMessages();
+      expect(await waitForCondition(() => streamMessage.mock.calls.length > 0)).toBe(true);
+      expect(lastQueueEvent()).toMatchObject({
+        queuedMessages: ["plain follow-up"],
+        acpPromptIds: [],
+      });
+    } finally {
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
+  // Artifacts M5b: a queued artifact send carries its metadata to the renderer, which shows it
+  // like the sent message instead of the model-facing <artifact_interaction> payload.
+  test("queue events carry a queued artifact send's metadata and confirmed text", async () => {
+    const h = await createAgentSessionHarness({
+      workspaceId: "queue-artifact-interaction",
+      captureEvents: true,
+    });
+    const interaction = {
+      id: "i-1",
+      artifactPath: "form.html",
+      title: "Form",
+      version: 2,
+      action: "send" as const,
+      text: "Ship it",
+    };
+    try {
+      h.session.queueMessage(
+        '<artifact_interaction path="form.html">Ship it</artifact_interaction>',
+        {
+          model: TEST_MODEL,
+          agentId: "exec",
+          muxMetadata: { type: "normal", artifactInteraction: interaction },
+        }
+      );
+      expect(h.events.findLast((event) => event.type === "queued-message-changed")).toMatchObject({
+        displayText: "Ship it",
+        artifactInteraction: interaction,
+      });
+    } finally {
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
+  // #5170: an ACP /send-held re-sends the held send as a NEW prompt, so the send must carry that
+  // prompt's correlation, not the one it was queued with, and the held copy must stay unchanged.
+  test("claiming a held send for an ACP prompt re-addresses it without touching the held copy", async () => {
+    const h = await createAgentSessionHarness({ workspaceId: "held-acp-correlation" });
+    try {
+      h.session.queueMessage(
+        "acp prompt",
+        {
+          model: TEST_MODEL,
+          agentId: "exec",
+          acpPromptId: "old-prompt",
+          delegatedToolNames: ["file_read"],
+          muxMetadata: { acpPromptId: "old-prompt", acpDelegatedTools: ["file_read"], keep: 1 },
+        },
+        {
+          acceptanceOrigin: "manual",
+          turnAdmission: {
+            admissionStale: () => true,
+            onEnqueued: () => undefined,
+            onAdmitted: () => undefined,
+            onDisposed: () => undefined,
+          },
+        }
+      );
+      h.session.sendQueuedMessages();
+      await h.session.waitForIdle();
+      const [held] = h.session.getHeldInputs();
+      const claimOptions = (correlation?: {
+        acpPromptId: string;
+        delegatedToolNames?: string[];
+      }) => {
+        const claim = h.session.claimHeldInputSend(held.id, correlation);
+        h.session.releaseHeldInputSend(held.id);
+        return claim.kind === "claimed" ? claim.send.options : undefined;
+      };
+
+      expect(claimOptions({ acpPromptId: "new-prompt" })).toMatchObject({
+        acpPromptId: "new-prompt",
+        delegatedToolNames: undefined,
+        muxMetadata: { acpPromptId: "new-prompt", keep: 1 },
+      });
+      expect(claimOptions({ acpPromptId: "new-prompt" })?.muxMetadata).not.toHaveProperty(
+        "acpDelegatedTools"
+      );
+      expect(
+        claimOptions({ acpPromptId: "new-prompt", delegatedToolNames: ["bash"] })
+      ).toMatchObject({
+        delegatedToolNames: ["bash"],
+        muxMetadata: { acpPromptId: "new-prompt", acpDelegatedTools: ["bash"] },
+      });
+      // Without a correlation (desktop Send) the send is exactly what was queued.
+      expect(claimOptions()).toMatchObject({ acpPromptId: "old-prompt" });
+      // The held copy itself is never rewritten: a failed re-send keeps the original.
+      expect(h.session.getHeldInputs()[0].send.options).toMatchObject({
+        acpPromptId: "old-prompt",
+        muxMetadata: { acpPromptId: "old-prompt", acpDelegatedTools: ["file_read"] },
+      });
+    } finally {
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
 
   test("a queued provider startup failure drains its successor after accepted-turn cleanup", async () => {
     const successor = Promise.withResolvers<void>();
@@ -746,7 +990,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
     const { session, cleanup } = await createAgentSessionHarness({
       workspaceId: "queue-dispatch-preparing-predecessor",
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
       },
     });
     sessionHolder.current = session;
@@ -1256,7 +1500,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       await session.waitForIdle();
 
       // Refused before acceptance: no turn, no payload or trigger row, and the queued-dispatch
-      // failure callback (the sender's budget refund) fires exactly once.
+      // failure callback fires exactly once.
       expect(streamMessage).not.toHaveBeenCalled();
       expect(accepted).toBe(0);
       expect(preStreamFailures).toBe(1);
@@ -2035,6 +2279,10 @@ describe("AgentSession queued message tool-call dispatch", () => {
       }),
       checkMidStream: () => false,
       resetForNewStream: () => undefined,
+      noteUserTurn: () => undefined,
+      noteAutoCompactionRequested: () => undefined,
+      noteAutoCompactionCompleted: () => undefined,
+      suppressRepeatedAutoCompaction: () => false,
     } as unknown as CompactionMonitor;
 
     try {
@@ -2236,9 +2484,9 @@ describe("AgentSession queued message tool-call dispatch", () => {
       const interruptResult = await session.interruptStream();
       expect(interruptResult.success).toBe(true);
       // The native soft-stop can still win the event race after the hard user interrupt.
-      void runSessionTerminalPolicy(session, aiEmitter, streamAbortEvent(workspaceId, "system"));
-
-      await new Promise((resolve) => setTimeout(resolve, 25));
+      // Await the policy itself: it decides the queued dispatch synchronously before resolving,
+      // and a detached run would keep holding the history write lock past cleanup (#4572).
+      await runSessionTerminalPolicy(session, aiEmitter, streamAbortEvent(workspaceId, "system"));
       expect(sendQueuedMessages).not.toHaveBeenCalled();
     } finally {
       sendQueuedMessages.mockRestore();
@@ -2260,9 +2508,8 @@ describe("AgentSession queued message tool-call dispatch", () => {
         {
           acceptanceOrigin: "automatic",
           synthetic: true,
-          // Peer sends refund their family-message reservation through this hook; a dispatch
-          // that REJECTS (throws) instead of returning Err must reach it just like the
-          // returned-error branch, or the reservation is stranded until restart.
+          // A dispatch that REJECTS (throws) instead of returning Err must reach this hook just
+          // like the returned-error branch, or the caller never learns the send failed.
           onAcceptedPreStreamFailure: (error) => {
             failures.push(error.type === "unknown" ? error.raw : error.type);
           },

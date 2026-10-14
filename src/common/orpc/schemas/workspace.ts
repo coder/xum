@@ -69,9 +69,21 @@ export const WorkspaceHeartbeatSettingsSchema = z.object({
   enabled: z.boolean().meta({
     description: "Whether scheduled workspace heartbeats are enabled for this workspace.",
   }),
-  intervalMs: z.number().int().min(HEARTBEAT_MIN_INTERVAL_MS).max(HEARTBEAT_MAX_INTERVAL_MS).meta({
-    description: "Heartbeat interval in milliseconds for this workspace.",
-  }),
+  // Optional (#5692): an absent interval follows the global default
+  // (`heartbeatDefaultIntervalMs`) at read time, so "Use default" is a real default
+  // that tracks later global changes. Older builds read an absent or invalid value as
+  // the global default too (normalizeWorkspaceMetadataHeartbeat), so this is
+  // downgrade-safe.
+  intervalMs: z
+    .number()
+    .int()
+    .min(HEARTBEAT_MIN_INTERVAL_MS)
+    .max(HEARTBEAT_MAX_INTERVAL_MS)
+    .optional()
+    .meta({
+      description:
+        "Heartbeat interval override in milliseconds for this workspace. Absent means the global default interval.",
+    }),
   message: z.string().optional().meta({
     description:
       "Optional custom instruction body appended after the fixed workspace heartbeat lead-in.",
@@ -121,12 +133,13 @@ export const WorkflowTaskMetadataSchema = z.object({
  * Shared description for the recipient-consent field on persisted config and published metadata.
  * The value is an opaque revocation GENERATION, not a bearer credential: the sender never supplies
  * it; the backend compares the generation captured at admission with the current one so an
- * off→on flip cannot revive work queued under the previous consent. Absent means off. Only the
- * app's settings surface writes it — same-UID processes with config access can too, so it is an
+ * off→on flip cannot revive work queued under the previous consent. Absent means off. New root
+ * workspaces get a fresh generation once their creation setup is complete (on by default; for
+ * task-delegated targets, once their creating turn settles); the app's settings surface writes it — same-UID processes with config access can too, so it is an
  * application-level opt-in, not an isolation boundary.
  */
 export const UNRELATED_WORKSPACE_CONSENT_DESCRIPTION =
-  "Opaque consent generation allowing unrelated local workspaces (other task trees in this Xum instance) to discover this workspace and send it untrusted agent messages. Absent means off; each off→on transition mints a new value, and an already-on workspace keeps its value. Never a bearer credential.";
+  "Opaque consent generation allowing unrelated local workspaces (other task trees in this Xum instance) to discover this workspace and send it untrusted agent messages. New root workspaces start with one (task-delegated targets once their first turn ends, disposable ones never); absent means off; each off→on transition mints a new value, and an already-on workspace keeps its value. Never a bearer credential.";
 
 /**
  * Fail-closed reader for the persisted consent generation. Config entries are loaded without
@@ -138,6 +151,31 @@ export function getValidUnrelatedWorkspaceConsent(value: unknown): string | unde
     return undefined;
   }
   return value.trim() === value ? value : undefined;
+}
+
+/**
+ * Recipient-side delivery preference for agent messages that arrive while this workspace is busy:
+ * messages from sub-agents (upward), sibling tasks, and unrelated workspaces. Parent guidance to
+ * a sub-agent is not affected; sub-agent reports follow this preference. Absent means "tool-end" (deliver after the next tool call), because
+ * prompt delivery is what lets agents coordinate quickly; "turn-end" holds every such message until
+ * the current turn ends, even if the sender asked for tool-end.
+ */
+export const AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION =
+  'When agent messages (from sub-agents, sibling tasks, or unrelated workspaces) reach this workspace while it is busy: "tool-end" delivers after the next tool call (default when absent); "turn-end" waits for the current turn to end and overrides a sender\'s tool-end request. Sub-agent reports follow the same setting.';
+
+export const AgentMessageDispatchModeSchema = z.enum(["tool-end", "turn-end"]);
+export type AgentMessageDispatchMode = z.infer<typeof AgentMessageDispatchModeSchema>;
+
+/**
+ * Lenient reader for the persisted delivery preference. Config entries are loaded without
+ * per-field validation, so anything other than a known mode reads as absent (the tool-end default)
+ * rather than making the workspace unloadable.
+ */
+export function getValidAgentMessageDispatchMode(
+  value: unknown
+): AgentMessageDispatchMode | undefined {
+  const parsed = AgentMessageDispatchModeSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
 }
 
 export const WorkspaceMetadataSchema = z.object({
@@ -194,9 +232,16 @@ export const WorkspaceMetadataSchema = z.object({
   unrelatedWorkspaceConsent: z.string().optional().meta({
     description: UNRELATED_WORKSPACE_CONSENT_DESCRIPTION,
   }),
+  agentMessageDispatchMode: AgentMessageDispatchModeSchema.optional().meta({
+    description: AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION,
+  }),
   parentWorkspaceId: z.string().optional().meta({
     description:
       "If set, this workspace is a child workspace spawned from the parent workspaceId (enables nesting in UI and backend orchestration).",
+  }),
+  sideChatParentWorkspaceId: z.string().optional().meta({
+    description:
+      "If set, this workspace is an ephemeral /side chat forked from the given workspace: it shares that workspace's checkout, is hidden from the sidebar, and is discarded when the user leaves it.",
   }),
   agentType: z.string().optional().meta({
     description: 'If set, selects an agent preset for this workspace (e.g., "explore" or "exec").',
@@ -241,6 +286,10 @@ export const WorkspaceMetadataSchema = z.object({
     }),
   taskLaunchError: z.string().optional().meta({
     description: "Startup failure recorded before an agent task could begin streaming.",
+  }),
+  delegatedCreationInterrupted: z.literal(true).optional().meta({
+    description:
+      "The delegated task that created this workspace died before its setup finished, so the task never started here and its owner cannot reach it (#4983). The user removes or keeps it.",
   }),
   reportedAt: z.string().optional().meta({
     description: "ISO 8601 timestamp for when an agent task reported completion (optional).",
@@ -314,9 +363,6 @@ export const WorkspaceMetadataSchema = z.object({
 });
 
 export const FrontendWorkspaceMetadataSchema = WorkspaceMetadataSchema.extend({
-  rootWorkspaceId: z.string().optional().meta({
-    description: "Task-family root derived from complete metadata, including archived ancestors.",
-  }),
   namedWorkspacePath: z
     .string()
     .meta({ description: "Worktree path (uses workspace name as directory)" }),
@@ -427,8 +473,20 @@ export const WorkspaceRemovalDescendantSchema = z.object({
   title: z.string(),
   active: z.boolean(),
 });
+/**
+ * Something a successful (forced) removal could not clean up (#5143). Forced paths that skip the
+ * Force Delete dialog (bulk delete, cancel-creation, shift-click) show these to the user.
+ */
+export const WorkspaceRemoveWarningSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("leftover"),
+    /** Names the leftover (a path, or a container by label) and what the user should do. */
+    description: z.string(),
+  }),
+]);
 export const WorkspaceRemoveResultSchema = z.object({
   success: z.boolean(),
   error: z.string().optional(),
   descendants: z.array(WorkspaceRemovalDescendantSchema).optional(),
+  warnings: z.array(WorkspaceRemoveWarningSchema).optional(),
 });

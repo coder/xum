@@ -1,13 +1,9 @@
 import { useRef, useEffect, useState, useCallback, useLayoutEffect } from "react";
 import { init, Terminal, FitAddon } from "ghostty-web";
 import { useAPI } from "@/browser/contexts/API";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import {
-  DEFAULT_TERMINAL_FONT_CONFIG,
-  TERMINAL_FONT_CONFIG_KEY,
-  normalizeTerminalFontConfig,
-  type TerminalFontConfig,
-} from "@/common/constants/storage";
+import { isStreamFailure } from "@/browser/contexts/connectionLink";
+import { useUserPreferences } from "@/browser/stores/AppConfigStore";
+import { normalizeTerminalFontConfig } from "@/common/constants/storage";
 import { useTerminalRouter } from "@/browser/terminal/TerminalRouterContext";
 import {
   appendTerminalIconFallback,
@@ -106,6 +102,34 @@ async function preloadTerminalWebfonts(
   }
 }
 
+/** RIS (full reset): clears the screen, the scrollback and the modes inside the VT itself. */
+const FULL_RESET = "\x1bc";
+
+/**
+ * Writes a full screen from the server (may be empty for new sessions).
+ *
+ * `replace` is set after a reconnect, when the router reattaches and sends the full screen again
+ * (TerminalSessionRouter). clear() keeps the scrollback, so writing on top would repeat it: the
+ * screen is written after a full reset instead, in one write, so no empty frame shows.
+ *
+ * Not Terminal.reset(): in ghostty-web it frees the WASM terminal and makes a new one, but the
+ * selection manager and input handler keep the freed one, and the next write after a second
+ * reconnect failed with "memory access out of bounds" and garbled the screen.
+ */
+export function writeScreenState(
+  term: Pick<Terminal, "write">,
+  state: string,
+  replace: boolean
+): void {
+  if (!replace && !state) return;
+  try {
+    term.write(replace ? FULL_RESET + state : state);
+  } catch (err) {
+    // xterm WASM can throw "memory access out of bounds" intermittently
+    console.warn("[TerminalView] Error writing screenState:", err);
+  }
+}
+
 interface TerminalViewProps {
   workspaceId: string;
   /** Session ID to connect to (required - must be created before mounting) */
@@ -179,10 +203,8 @@ export function TerminalView({
   // Track whether we've received the initial screen state from backend
   const [isLoading, setIsLoading] = useState(true);
 
-  const [rawTerminalFontConfig] = usePersistedState<TerminalFontConfig>(
-    TERMINAL_FONT_CONFIG_KEY,
-    DEFAULT_TERMINAL_FONT_CONFIG,
-    { listener: true }
+  const rawTerminalFontConfig = useUserPreferences(
+    (preferences) => preferences.appearance?.terminalFontConfig
   );
   const terminalFontConfig = normalizeTerminalFontConfig(rawTerminalFontConfig);
   const { api } = useAPI();
@@ -257,7 +279,9 @@ export function TerminalView({
   }, [autoFocus]);
 
   useEffect(() => {
-    if (!autoFocus || !visible || !terminalReady || autoFocusConsumedRef.current) {
+    // Wait for the first screen: until then the container is visibility:hidden, so focus taken
+    // now does not last, yet the check below would already consume autoFocus (T3, #5971).
+    if (!autoFocus || !visible || !terminalReady || isLoading || autoFocusConsumedRef.current) {
       return;
     }
 
@@ -303,7 +327,7 @@ export function TerminalView({
       cancelled = true;
       cancelAnimationFrame(rafId);
     };
-  }, [autoFocus, visible, terminalReady, consumeAutoFocus]);
+  }, [autoFocus, visible, terminalReady, isLoading, consumeAutoFocus]);
 
   // Reset loading state when session changes
   useEffect(() => {
@@ -327,8 +351,9 @@ export function TerminalView({
           }
           break;
         }
-      } catch {
-        if (!controller.signal.aborted) {
+      } catch (error) {
+        // A lost connection is not an exit: the next client runs this effect again.
+        if (isStreamFailure(error, controller.signal)) {
           // Treat failed subscriptions as exits (session ended before listener attached).
           handleExit(0);
         }
@@ -370,16 +395,8 @@ export function TerminalView({
           console.warn("[TerminalView] Error writing output:", err);
         }
       },
-      onScreenState: (state) => {
-        // Write screen state (may be empty for new sessions)
-        if (state) {
-          try {
-            term.write(state);
-          } catch (err) {
-            // xterm WASM can throw "memory access out of bounds" intermittently
-            console.warn("[TerminalView] Error writing screenState:", err);
-          }
-        }
+      onScreenState: (state, options) => {
+        writeScreenState(term, state, options?.replace === true);
         // Mark loading complete - we now have valid content to show
         setIsLoading(false);
       },
@@ -388,7 +405,7 @@ export function TerminalView({
 
     // Send initial resize to sync PTY dimensions
     const { cols, rows } = term;
-    void router.resize(sessionId, cols, rows);
+    router.syncSize(sessionId, cols, rows);
 
     return unsubscribe;
   }, [visible, terminalReady, sessionId, router, handleExit]);

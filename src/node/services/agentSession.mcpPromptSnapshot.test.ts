@@ -1,7 +1,6 @@
 import { describe, expect, mock, spyOn, test } from "bun:test";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
-import type { AIService } from "@/node/services/aiService";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import {
   createAgentSessionHarness,
@@ -234,7 +233,7 @@ describe("AgentSession MCP prompt snapshots", () => {
     const harness = await createAgentSessionHarness({
       workspaceId: "workspace",
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
       },
     });
 

@@ -14,7 +14,6 @@ import { NOW, createWorkspace } from "@/browser/stories/mocks/workspaces";
 import { useWorkspaceStoreRaw, workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
-  GIT_STATUS_INDICATOR_MODE_KEY,
   LEFT_SIDEBAR_COLLAPSED_KEY,
   getStatusStateKey,
   getWorkspaceLastReadKey,
@@ -163,7 +162,6 @@ function StoryScaffold(props: {
   }
   workspaceStore.setActiveWorkspaceId(props.activeWorkspaceId ?? null);
   updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, false);
-  updatePersistedState(GIT_STATUS_INDICATOR_MODE_KEY, "line-delta");
   updatePersistedState(getStatusStateKey("ws-selected"), {
     emoji: "🔍",
     message: "Agent text will go here like so",
@@ -661,7 +659,7 @@ export const SubAgentStates: Story = {
   name: "SubAgent States/Gallery",
   render: renderSubAgentGallery,
   // ws-active streams asynchronously: the scaffold's onChat emits stream-start
-  // through a fire-and-forget store subscription (ensureActiveOnChatSubscription
+  // through a fire-and-forget store subscription (ensureOnChatSubscriptions
   // → void runOnChatSubscription), which flips its rows to the "active" visual
   // state (success-colored status dot). With no play() the snapshot races that
   // async transition and captures the dot as active-or-not at random. Wait for

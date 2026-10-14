@@ -344,7 +344,7 @@ function buildScopePrompt(question) {
     question,
     "",
     "Generate 5 distinct search queries that cover broad, primary/authoritative, recent, skeptical/contrarian, and practitioner angles where relevant.",
-    "Make the queries specific and non-overlapping. Return structured output only.",
+    "Make the queries specific and non-overlapping. Send the result through `agent_report`, then end with a one-line final response.",
   ].join("\n");
 }
 
@@ -356,7 +356,7 @@ function buildSearchPrompt(question, angle) {
     "Search query: " + angle.query,
     "",
     "Use the `web_search` tool with this query or a tighter equivalent. Return the top 4-6 relevant results.",
-    "Rank by relevance to the original question. Avoid SEO spam, content farms, and low-signal duplicates. Return structured output only.",
+    "Rank by relevance to the original question. Avoid SEO spam, content farms, and low-signal duplicates. Send the result through `agent_report`, then end with a one-line final response.",
   ].join("\n");
 }
 
@@ -369,7 +369,7 @@ function buildFetchPrompt(question, source, angle) {
     "Title: " + source.title,
     "",
     "Use the `web_fetch` tool to retrieve the source. Extract 2-5 falsifiable claims relevant to the question.",
-    "Each claim needs a direct supporting quote and an importance rating. If fetch fails, the page is irrelevant, or it is paywalled, return claims: [] and sourceQuality: unreliable. Use an empty string for unknown publishDate. Return structured output only.",
+    "Each claim needs a direct supporting quote and an importance rating. If fetch fails, the page is irrelevant, or it is paywalled, return claims: [] and sourceQuality: unreliable. Use an empty string for unknown publishDate. Send the result through `agent_report`, then end with a one-line final response.",
   ].join("\n");
 }
 
@@ -384,7 +384,7 @@ function buildVerifyPrompt(question, claim, voteIndex) {
     "Supporting quote: " + claim.quote,
     "",
     "Use `web_search` and, if needed, `web_fetch` to check contradiction, overreach, source quality, and staleness.",
-    "Set refuted=true if the quote does not support the claim, credible sources contradict it, the source is too weak, or the claim is stale/marketing. Use an empty string for counterSource if no counter-source exists. Return structured output only.",
+    "Set refuted=true if the quote does not support the claim, credible sources contradict it, the source is too weak, or the claim is stale/marketing. Use an empty string for counterSource if no counter-source exists. Send the result through `agent_report`, then end with a one-line final response.",
   ].join("\n");
 }
 
@@ -403,7 +403,7 @@ function buildSynthesisPrompt(question, confirmed, killed) {
     "2. Group related claims into findings that directly answer the question.",
     "3. Assign confidence: high for multiple strong sources/unanimous votes; medium for secondary sources or split votes; low for single/weak sources.",
     "4. Write a concise executive summary, caveats, and 2-4 open questions.",
-    "Return structured output only.",
+    "Send the result through `agent_report`, then end with a one-line final response.",
   ].join("\n");
 }
 

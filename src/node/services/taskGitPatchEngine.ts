@@ -392,7 +392,8 @@ async function findPatch(params: {
   const parentById = new Map<string, string | undefined>();
   for (const project of cfg.projects.values()) {
     for (const workspace of project.workspaces) {
-      if (!workspace.id) continue;
+      // First row wins for duplicate ids, as in findWorkspaceEntry (#4550).
+      if (!workspace.id || parentById.has(workspace.id)) continue;
       parentById.set(workspace.id, workspace.parentWorkspaceId);
     }
   }
@@ -779,7 +780,7 @@ interface GitStatusPorcelainEntry {
   status: string;
 }
 
-function parseGitStatusPorcelainZ(stdout: string): GitStatusPorcelainEntry[] {
+export function parseGitStatusPorcelainZ(stdout: string): GitStatusPorcelainEntry[] {
   const entriesByPath: GitStatusPorcelainEntry[] = [];
   const entries = stdout.split("\0");
   for (let i = 0; i < entries.length; i += 1) {

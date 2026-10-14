@@ -229,7 +229,6 @@ export const createWorkflowRunTool: ToolFactory = (config: ToolConfiguration) =>
               runtime: config.runtime,
               workspacePath: config.cwd,
               xumScope: config.xumScope,
-              includeAgentPlugins: config.experiments?.agentPlugins === true,
             })
           : null;
       const script = await resolveWorkflowScript({
@@ -238,7 +237,6 @@ export const createWorkflowRunTool: ToolFactory = (config: ToolConfiguration) =>
         runtime: config.runtime,
         workspacePath: config.cwd,
         projectTrusted: config.trusted === true,
-        includeAgentPlugins: config.experiments?.agentPlugins === true,
         ...(skillCtx != null ? { skillStorageContext: skillCtx } : {}),
       });
       // Duplicate guard: a retried or replayed turn must not mint a second active run of the

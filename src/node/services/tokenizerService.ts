@@ -1,4 +1,9 @@
-import { countTokens, countTokensBatch } from "@/node/utils/main/tokenizer";
+import { createHash } from "node:crypto";
+import {
+  countTokens,
+  countTokensBatch,
+  shouldUseApproxTokenizer,
+} from "@/node/utils/main/tokenizer";
 import { calculateTokenStats } from "@/common/utils/tokens/tokenStatsCalculator";
 import type { MuxMessage } from "@/common/types/message";
 import type { ChatStats } from "@/common/types/chatStats";
@@ -7,11 +12,17 @@ import assert from "@/common/utils/assert";
 import { computeProvidersConfigFingerprint } from "@/common/utils/providers/configFingerprint";
 import { getToolAvailabilityOptions } from "@/common/utils/tools/toolAvailability";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
+import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
+import { renderPluginHookContextForProvider } from "@/node/utils/messages/renderPluginHookContextForProvider";
 import type { SessionUsageService, SessionUsageTokenStatsCacheV1 } from "./sessionUsageService";
 import { log } from "./log";
 import type { AIService } from "./aiService";
 import type { ProviderService } from "./providerService";
 import { mergeTranscriptPartial, type HistoryService } from "./historyService";
+import { VERSION } from "@/version";
+
+/** The cache has no usageHistory, and the renderer drops it anyway. */
+export type WorkspaceTokenStats = Omit<ChatStats, "usageHistory">;
 
 function getMaxHistorySequence(messages: MuxMessage[]): number | undefined {
   let max: number | undefined;
@@ -35,6 +46,14 @@ export class TokenizerService {
   // persisting stale `tokenStatsCache` data if an older calculation finishes after a newer one.
   private latestCalcIdByWorkspace = new Map<string, number>();
   private nextCalcId = 0;
+  // Identical concurrent requests (e.g. two tabs opening the same cold chat) share one pass
+  // instead of each reading and counting the same rows (#5061). Keyed by the history receipt
+  // and every calculation input, so a request that could see other rows or count differently
+  // never joins. An entry lives only until its pass reads its persistence claim.
+  private sharedPassByKey = new Map<
+    string,
+    { calcId: number; promise: Promise<WorkspaceTokenStats> }
+  >();
 
   constructor(
     sessionUsageService: SessionUsageService,
@@ -42,7 +61,7 @@ export class TokenizerService {
     private readonly providerService: Pick<ProviderService, "getConfig">,
     private readonly historyService: Pick<
       HistoryService,
-      "getHistoryFromLatestBoundary" | "readPartial"
+      "getHistoryForTokenStats" | "readPartial" | "captureTokenStatsReceiptKey"
     >
   ) {
     this.sessionUsageService = sessionUsageService;
@@ -54,9 +73,9 @@ export class TokenizerService {
    * The renderer used to upload its full message list with every recalculation (tool-call-end,
    * stream end, ...). During an active stream that was ~36 KB/s of redundant WebSocket traffic
    * per tab for a 370 KB history, so the IPC now carries only workspaceId + model and the
-   * backend reads chat.jsonl + partial.json, which it already owns. The two reads are not
-   * under one lock; mergeTranscriptPartial's part-count guard keeps a freshly committed row
-   * from being replaced by a partial snapshot read just before the commit. The partial read is
+   * backend reads partial.json, then chat.jsonl, not under one lock; mergeTranscriptPartial's
+   * part-count guard keeps a row committed in between from being replaced by the stale partial
+   * (the cached count is keyed by that partial and the rows' receipt). The partial read is
    * strict: a missing file is a normal "no in-flight turn" (null), and malformed JSON still
    * self-heals to null inside readPartial, but an I/O or permission failure rejects like a
    * history-read failure does, instead of silently persisting a cache that omits the turn.
@@ -64,25 +83,100 @@ export class TokenizerService {
    * The calculation generation is claimed before any read so the latest-calculation guard
    * orders overlapping requests by arrival: a request that read an older transcript but
    * finished its reads later must not become "latest" and persist the older snapshot.
+   * The cache is served without reading history only if the receipt and every input match;
+   * a recount records the receipt that certifies the rows it counted (getHistoryForTokenStats).
    */
-  async calculateWorkspaceStats(input: { workspaceId: string; model: string }): Promise<ChatStats> {
+  async calculateWorkspaceStats(input: {
+    workspaceId: string;
+    model: string;
+  }): Promise<WorkspaceTokenStats> {
     const calcId = this.beginCalculation(input.workspaceId);
-    const [metadata, historyResult, partial] = await Promise.all([
+    const [cached, metadata, partial, before] = await Promise.all([
+      this.sessionUsageService.peekTokenStatsCache(input.workspaceId),
       this.aiService.getWorkspaceMetadata(input.workspaceId),
-      this.historyService.getHistoryFromLatestBoundary(input.workspaceId, 0),
       this.historyService.readPartial(input.workspaceId, { throwOnError: true }),
+      this.historyService.captureTokenStatsReceiptKey(input.workspaceId),
     ]);
-    if (!historyResult.success) {
-      throw new Error(`Failed to read history for token stats: ${historyResult.error}`);
-    }
-    return this.calculateStatsForGeneration(
-      calcId,
-      input.workspaceId,
-      mergeTranscriptPartial(historyResult.data, partial),
-      input.model,
-      this.providerService.getConfig(),
-      metadata.success ? (metadata.data.parentWorkspaceId ?? null) : null
+    const providersConfig = this.providerService.getConfig();
+    const providersFingerprint = computeProvidersConfigFingerprint(providersConfig);
+    const parentWorkspaceId = metadata.success ? (metadata.data.parentWorkspaceId ?? null) : null;
+    // Built from the exact objects that go into the count, never re-read after an await.
+    // createHash, not crypto.hash: the headless CLI still accepts Node 20 before 20.12.
+    const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+    const inputsKey = sha256(
+      JSON.stringify({
+        v: 1,
+        partial: partial === null ? null : sha256(JSON.stringify(partial)),
+        hasParent: Boolean(parentWorkspaceId),
+        app: [VERSION.git_describe, VERSION.git_commit],
+        approx: shouldUseApproxTokenizer(),
+      })
     );
+    if (
+      cached?.source &&
+      before !== null &&
+      cached.model === input.model &&
+      cached.providersConfigVersion === providersFingerprint &&
+      cached.source.inputsKey === inputsKey &&
+      cached.source.historyReceipt === before &&
+      // Same invariants as the write path: corrupt counters are a miss (sum of tokens >= 0).
+      cached.consumers.reduce((sum, c) => (c.tokens >= 0 ? sum + c.tokens : NaN), 0) ===
+        cached.totalTokens
+    ) {
+      const { consumers, totalTokens, tokenizerName, topFilePaths } = cached;
+      return { consumers, totalTokens, model: input.model, tokenizerName, topFilePaths };
+    }
+    const { workspaceId } = input;
+    const passKey =
+      before === null
+        ? null
+        : JSON.stringify([workspaceId, input.model, providersFingerprint, inputsKey, before]);
+    const shared = passKey === null ? undefined : this.sharedPassByKey.get(passKey);
+    if (shared) {
+      // The shared pass answers this request's generation, so it inherits this request's
+      // persistence claim unless a newer request holds it: joining never drops a write.
+      if (this.latestCalcIdByWorkspace.get(workspaceId) === calcId) {
+        this.latestCalcIdByWorkspace.set(workspaceId, shared.calcId);
+      }
+      return shared.promise;
+    }
+    // Identity-guarded: a newer pass under the same key may own the entry by now. Only called
+    // after the pass's first await, so `pass` is initialized.
+    const closePass = () => {
+      if (passKey !== null && this.sharedPassByKey.get(passKey)?.promise === pass) {
+        this.sharedPassByKey.delete(passKey);
+      }
+    };
+    const pass: Promise<WorkspaceTokenStats> = (async () => {
+      const historyResult = await this.historyService.getHistoryForTokenStats(workspaceId);
+      if (!historyResult.success) {
+        throw new Error(`Failed to read history for token stats: ${historyResult.error}`);
+      }
+      // The key certifies exactly the rows counted; a write during the read made the service
+      // retry or fail, so no uncertified count is ever recorded.
+      const { messages, receiptKey } = historyResult.data;
+      const source = receiptKey !== null ? { historyReceipt: receiptKey, inputsKey } : undefined;
+      const { usageHistory: _usageHistory, ...stats } = await this.calculateStatsForGeneration(
+        calcId,
+        workspaceId,
+        mergeTranscriptPartial(messages, partial),
+        input.model,
+        providersConfig,
+        parentWorkspaceId,
+        source,
+        // Closed before the claim is read: a request joining later could no longer hand its
+        // claim to this pass, so it must run its own.
+        closePass
+      );
+      return stats;
+    })();
+    if (passKey !== null) this.sharedPassByKey.set(passKey, { calcId, promise: pass });
+    try {
+      return await pass;
+    } finally {
+      // A rejected pass never reached its claim; clear it so a later request retries.
+      closePass();
+    }
   }
 
   private beginCalculation(workspaceId: string): number {
@@ -145,7 +239,9 @@ export class TokenizerService {
     messages: MuxMessage[],
     model: string,
     providersConfig: ProvidersConfigMap | null,
-    parentWorkspaceId: string | null
+    parentWorkspaceId: string | null,
+    source?: SessionUsageTokenStatsCacheV1["source"],
+    beforeClaim?: () => void
   ): Promise<ChatStats> {
     assert(Array.isArray(messages), "Tokenizer calculateStats requires an array of messages");
     assert(
@@ -154,9 +250,17 @@ export class TokenizerService {
     );
 
     const activeContextMessages = sliceMessagesForProviderFromLatestContextBoundary(messages);
+    // Plan-review records (snapshots can be tens of thousands of tokens) never reach a provider
+    // request, so they must not count as context. The cache's history identity below still
+    // describes the raw rows, which is what the client compares for freshness.
+    // Prompt-hook context lives in metadata and becomes text only in the request, so render it
+    // here too: the token display must count what the provider receives.
+    const countedMessages = renderPluginHookContextForProvider(
+      activeContextMessages.filter((message) => !isPlanReviewRecordMessage(message))
+    );
 
     const stats = await calculateTokenStats(
-      activeContextMessages,
+      countedMessages,
       model,
       providersConfig,
       getToolAvailabilityOptions({ workspaceId, parentWorkspaceId })
@@ -164,6 +268,7 @@ export class TokenizerService {
 
     // Only persist the cache for the most recently-started calculation.
     // Older calculations can finish later and would otherwise overwrite a newer cache.
+    beforeClaim?.();
     if (this.latestCalcIdByWorkspace.get(workspaceId) !== calcId) {
       return stats;
     }
@@ -181,6 +286,7 @@ export class TokenizerService {
       consumers: stats.consumers,
       totalTokens: stats.totalTokens,
       topFilePaths: stats.topFilePaths,
+      ...(source && { source }),
     };
 
     // Defensive: keep cache invariants tight so we don't persist corrupt state.

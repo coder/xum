@@ -5,14 +5,19 @@
  * chunks (`useBoundedTranscriptReveal`). These plays prove what happy-dom cannot: that a
  * rendering opportunity (an animation frame) separates the tail commit from the first chunk,
  * and that a reader who scrolled up mid-reveal keeps their place while older rows mount above.
+ * A transcript above the automatic rows budget pauses there; "Load older messages" mounts more.
  */
 import type { ComponentType } from "react";
 import { expect, userEvent, waitFor, within } from "@storybook/test";
 import type { APIClient } from "@/browser/contexts/API";
 import type { ChatMuxMessage } from "@/common/orpc/types";
-import { TRANSCRIPT_REVEAL_TAIL_ROWS } from "@/common/constants/ui";
+import {
+  TRANSCRIPT_REVEAL_AUTO_MAX_ROWS,
+  TRANSCRIPT_REVEAL_CHUNK_ROWS,
+  TRANSCRIPT_REVEAL_TAIL_ROWS,
+} from "@/common/constants/ui";
 import { transcriptRevealFrameScheduler } from "@/browser/hooks/useBoundedTranscriptReveal";
-import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
+import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { createMockORPCClient } from "./mocks/orpc";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
 import { createWorkspace, groupWorkspacesByProject } from "./mocks/workspaces";
@@ -27,6 +32,12 @@ import {
 export default { ...appMeta, title: "App/TranscriptReveal" };
 
 const LARGE_ROWS = 300;
+/**
+ * History rows whose DISPLAYED transcript exceeds the automatic budget by more than a chunk and
+ * stays below two budgets. The transcript truncation keeps every user prompt (odd rows collapse
+ * behind history-hidden markers), so the user prompts alone must exceed the budget.
+ */
+const OVER_BUDGET_ROWS = 2 * (TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + 2 * TRANSCRIPT_REVEAL_CHUNK_ROWS);
 const rowId = (index: number) => `reveal-row-${index}`;
 const rowText = (index: number) => `Transcript row ${index} of the tail-first reveal.`;
 
@@ -41,15 +52,15 @@ const largeWorkspace = createWorkspace({
   projectName: "mux",
 });
 
-function largeHistory(): ChatMuxMessage[] {
-  return Array.from({ length: LARGE_ROWS }, (_, index) =>
+function largeHistory(rowCount = LARGE_ROWS): ChatMuxMessage[] {
+  return Array.from({ length: rowCount }, (_, index) =>
     index % 2 === 0
       ? createUserMessage(rowId(index), rowText(index), { historySequence: index + 1 })
       : createAssistantMessage(rowId(index), rowText(index), { historySequence: index + 1 })
   );
 }
 
-function setup(): APIClient {
+function setup(largeRows = LARGE_ROWS): APIClient {
   selectWorkspace(smallWorkspace);
   collapseLeftSidebar();
   collapseRightSidebar();
@@ -59,7 +70,7 @@ function setup(): APIClient {
     workspaces: [smallWorkspace, largeWorkspace],
     onChat: (workspaceId, emit) => {
       if (workspaceId === largeWorkspace.id) {
-        for (const row of largeHistory()) emit(row);
+        for (const row of largeHistory(largeRows)) emit(row);
       } else {
         emit(createAssistantMessage("small-1", "A short transcript.", { historySequence: 1 }));
       }
@@ -271,5 +282,95 @@ export const ScrollUpMidReveal: AppStory = {
     } finally {
       transcriptRevealFrameScheduler.schedule = realSchedule;
     }
+  },
+};
+
+const setupOverBudget = () => setup(OVER_BUDGET_ROWS);
+
+const pauseAtBudget: AppStory["play"] = async ({ canvasElement, step }) => {
+  const canvas = within(canvasElement);
+  await findVisibleText(canvasElement, "A short transcript.");
+  // Every mounted transcript row, history-hidden markers included (they have no message id).
+  const mountedCount = () =>
+    canvasElement.querySelectorAll('[data-testid="message-window"] [data-testid="chat-message"]')
+      .length;
+  await step("The automatic reveal pauses at its rows budget", async () => {
+    await switchToLargeWorkspace(canvasElement);
+    await findVisibleText(canvasElement, rowText(OVER_BUDGET_ROWS - 1));
+    await waitFor(
+      async () => {
+        await expect(
+          canvasElement.querySelector('[data-testid="message-window"][data-loaded="true"]')
+        ).not.toBeNull();
+        await expect(mountedCount()).toBeGreaterThanOrEqual(TRANSCRIPT_REVEAL_AUTO_MAX_ROWS);
+      },
+      { timeout: 15_000 }
+    );
+    const pausedCount = mountedCount();
+    await expect(pausedCount).toBeLessThanOrEqual(
+      TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + TRANSCRIPT_REVEAL_CHUNK_ROWS
+    );
+    // Paused, not merely between chunks: a few more frames mount nothing.
+    for (let frame = 0; frame < 4; frame += 1) {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    }
+    await expect(mountedCount()).toBe(pausedCount);
+    await expect(canvas.queryByText(rowText(0))).toBeNull();
+  });
+  await step("Load older messages mounts the rest of the loaded rows", async () => {
+    const button = await canvas.findByRole("button", { name: "Load older messages" });
+    await waitFor(() => expect(button).toBeVisible());
+    const pausedCount = mountedCount();
+    // The button is only reachable at scrollTop 0, where native scroll anchoring does not
+    // apply: the row being read must still stay in place while older rows mount above it.
+    const messageWindow = canvasElement.querySelector<HTMLElement>(
+      '[data-testid="message-window"]'
+    )!;
+    // A wheel gesture releases the bottom lock, as a reader scrolling up would.
+    messageWindow.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true }));
+    messageWindow.scrollTop = 0;
+    messageWindow.dispatchEvent(new Event("scroll"));
+    await canvas.findByRole("button", { name: /Jump to bottom/ });
+    await expect(messageWindow.scrollTop).toBe(0);
+    const readRow = messageWindow.querySelector<HTMLElement>("[data-message-id]")!;
+    const readRowTop = readRow.getBoundingClientRect().top;
+    await userEvent.click(button);
+    // Fewer rows than one more budget remain, so the reveal completes; with no older server
+    // page to offer, the button goes away.
+    await waitFor(() => expect(canvas.queryByText(rowText(0))).not.toBeNull(), {
+      timeout: 15_000,
+    });
+    await expect(mountedCount()).toBeGreaterThan(pausedCount);
+    await expect(readRow.isConnected).toBe(true);
+    await expect(Math.abs(readRow.getBoundingClientRect().top - readRowTop)).toBeLessThanOrEqual(1);
+    await waitFor(() =>
+      expect(canvas.queryByRole("button", { name: "Load older messages" })).toBeNull()
+    );
+  });
+};
+
+// Play-only (Pixel disabled): Pixel hides the Load-older button, so a capture would duplicate
+// TailFirstSwitch, and the repo-wide snapshot budget has no headroom.
+export const PauseAtBudget: AppStory = {
+  render: () => <AppWithMocks setup={setupOverBudget} />,
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  play: pauseAtBudget,
+};
+
+export const PauseAtBudgetPhone: AppStory = {
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  render: () => <AppWithMocks setup={setupOverBudget} />,
+  // The decorator forces the phone width for the test-runner, which applies no viewport.
+  decorators: [IPhone16eDecorator],
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  play: async (context) => {
+    await waitFor(() =>
+      expect(
+        context.canvasElement
+          .querySelector('[data-testid="message-window"]')!
+          .getBoundingClientRect().width
+      ).toBeLessThanOrEqual(IPHONE_16E.width)
+    );
+    await pauseAtBudget(context);
   },
 };

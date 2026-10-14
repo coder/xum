@@ -1,9 +1,10 @@
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import { SUBAGENT_FAILURE_FOOTER } from "@/common/utils/subagentFailureEnvelope";
 import type { StartupRecoveryState } from "./startupRecovery";
 import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
 import type { ExperimentId } from "@/common/constants/experiments";
-import type { GoalSyntheticMessageKind } from "@/constants/goals";
+import type { GoalSyntheticMessageKind, TaskTurnKind } from "@/constants/goals";
 import type { ArchivePreflightResult, ArchiveWorkspaceResult } from "@/common/orpc/schemas/api";
 import type { FilePart, SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
 import type { SendMessageError } from "@/common/types/errors";
@@ -14,11 +15,14 @@ import type {
 } from "@/common/types/message";
 import type { Result } from "@/common/types/result";
 import type { StreamErrorRecoveryOutcome } from "@/node/services/agentSession";
+import type { TurnId } from "@/node/services/turnCoordinator";
+import type { SendIdentity } from "@/node/services/sendIds";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type {
   FrontendWorkspaceMetadata,
   WorkspaceMetadata,
   WorkspaceRemovalDescendant,
+  WorkspaceRemoveWarning,
 } from "@/common/types/workspace";
 import type { AgentAiSettingsLayerValues } from "@/common/types/agentAiSettings";
 import type {
@@ -69,6 +73,7 @@ export interface ResolvedWorkspaceAiSettings {
   thinkingLevel?: ThinkingLevel;
   /** OpenAI pro reasoning mode; per-workspace choice inherited by spawned tasks. */
   reasoningMode?: OpenAIReasoningMode;
+  serviceTier?: ServiceTier;
 }
 
 export type WorkspaceLifecycleResult = z.infer<typeof TaskWorkspaceLifecycleToolTargetResultSchema>;
@@ -124,14 +129,6 @@ export interface TaskCreateArgs {
    * Defaults to blocking when omitted.
    */
   attentionPolicy?: BackgroundWorkAttentionPolicy;
-  /** Experiments to inherit to subagent */
-  experiments?: {
-    programmaticToolCalling?: boolean;
-    /** RLM mode: persisted on the task record so RLM-gated child features survive restarts. */
-    rlm?: boolean;
-    advisorTool?: boolean;
-    dynamicWorkflows?: boolean;
-  };
 }
 
 export function formatSubagentReportUserMessage(params: {
@@ -257,6 +254,33 @@ export function getIsoNow(): string {
   return new Date().toISOString();
 }
 
+/**
+ * A removal bound to the task attempt its caller confirmed (#4478): WorkspaceService.remove
+ * refuses when the row names another attempt by the time it closes admission.
+ */
+export interface RemovalAttemptBinding {
+  expectedAttemptId: string | undefined;
+}
+
+/** keepBranch: remove only the checkout, e.g. undoing a creation that reused a branch (#4819). */
+export interface RemovalCheckoutOptions {
+  keepBranch?: boolean;
+  /**
+   * The caller already holds this workspace's structural mutation gate: a parent removal gates
+   * its whole sub-agent tree before removing any of it (#4477).
+   */
+  mutationGateHeld?: boolean;
+}
+
+/**
+ * What a model-facing archive would lose across the tree it cascades over (#4930): the untracked
+ * paths of the target itself and of each sub-agent whose snapshot archive cannot preserve them.
+ */
+export interface ArchiveCascadePreflight {
+  targetPaths: string[];
+  subagents: Array<{ workspaceId: string; title: string; paths: string[] }>;
+}
+
 export interface ArchiveWorkspaceOptions {
   /**
    * Refuse to archive when the effective worktree archive behavior would delete the checkout
@@ -303,6 +327,11 @@ export interface ArchiveWorkspaceOptions {
    * otherwise strand already-interrupted turns behind a failed archive.
    */
   coderWorkspaceArchiveBehaviorOverride?: CoderWorkspaceArchiveBehavior;
+  /**
+   * The caller already holds this workspace's structural mutation gate: a parent archive gates
+   * its sub-agent tree before archiving any of it (#4477).
+   */
+  mutationGateHeld?: boolean;
 }
 
 export interface WorkspaceLiveActivity {
@@ -328,6 +357,19 @@ export interface WorkspaceLiveActivity {
 export type TurnAcceptanceOrigin = "manual" | "automatic";
 
 export interface SendMessageInternalOptions {
+  /**
+   * Set only by the artifact-interaction sender (Artifacts M5b). Generic sends refuse
+   * `muxMetadata.artifactInteraction`, so the "from artifact" label cannot be spoofed.
+   */
+  artifactInteraction?: true;
+  /**
+   * Idempotent sends: the ids a re-send carries (a held Retry reuses its original ids). Absent on
+   * a new manual send: WorkspaceService assigns its id at entry. An automatic send carries only
+   * the ids set here (a task launch's brief id); nothing is minted for it.
+   */
+  sendIdentities?: SendIdentity[];
+  /** This send re-sends a held input: queued, it is never batched with other input. */
+  resendsHeldInput?: true;
   acceptanceOrigin?: TurnAcceptanceOrigin;
   allowQueuedAgentTask?: boolean;
   skipAutoResumeReset?: boolean;
@@ -338,6 +380,11 @@ export interface SendMessageInternalOptions {
   goalKind?: GoalSyntheticMessageKind;
   /** Goal identity persisted alongside goalKind so reconciliation can scope the row. */
   goalId?: string;
+  /**
+   * Provenance of an automatic TaskService turn in a sub-agent workspace, persisted on the
+   * user row and every replay path; gates set_goal (see TaskTurnKind).
+   */
+  taskTurnKind?: TaskTurnKind;
   /** Force Copilot billing classification to "agent" for internal sends. */
   agentInitiated?: boolean;
   onAccepted?: () => Promise<void> | void;
@@ -357,18 +404,33 @@ export interface SendMessageInternalOptions {
    */
   admissionStale?: () => boolean;
   /**
+   * Synthetic wakes whose caller restrictions or in-memory guards a durable compaction follow-up
+   * cannot preserve skip on-send compaction (see AgentSession SendMessageInternalOptions).
+   */
+  skipOnSendCompaction?: boolean;
+  /**
+   * Obligation minted by TaskService for a send it fenced itself (task launch). When absent on a
+   * send into an agent-task workspace, WorkspaceService asks TaskService for one at the session
+   * handoff (admitTaskWorkspaceTurn) so every task-workspace send is accounted for.
+   */
+  turnAdmission?: TurnAdmissionToken;
+  /**
    * Synthetic assistant rows persisted just before the turn's user row
    * (family-message payloads). Delivered atomically with the message —
    * queued alongside it when the workspace is busy — so they never land
    * inside another turn's PREPARING window (see AgentSession.sendMessage).
    */
   preTurnMessages?: MuxMessage[];
-  /** r54: fired once pre-turn rows cross the rollback horizon (see AgentSession). */
-  onPreTurnRowsPersisted?: () => void;
   /** Return once the user message is accepted; stream startup continues asynchronously. */
   startStreamInBackground?: boolean;
   /** When true, reject instead of queueing if the workspace is busy. */
   requireIdle?: boolean;
+  /**
+   * Set only by WorkspaceService.planReviewSubmitFeedback, the one send allowed to carry
+   * plan-review muxMetadata (see carriesPlanReviewMetadata). Internal-only: no oRPC schema maps
+   * onto these options, so external callers cannot set it.
+   */
+  planReviewFeedback?: true;
   /** Preserve workspace-turn correlation only when this send is the next continuation. */
   workspaceTurnContinuation?: boolean;
   /** Coalescing for queued sends: drop the message when the same key is already queued. */
@@ -391,6 +453,22 @@ export interface SendMessageInternalOptions {
    * heartbeat's model/agent.
    */
   yieldToQueuedMessages?: boolean;
+  /**
+   * For opportunistic promoted tool-end wakes (busy-owner sub-agent report cuts): quietly drop
+   * the send (success) when another send is in preflight, or when, at the enqueue point, the
+   * promoted entry would not become the queue head. Unlike yieldToQueuedMessages, hidden
+   * turn-end entries do not block it. A preflight manual send is invisible to the queue but may
+   * carry stricter caller restrictions; queued behind it, this wake would run after it with the
+   * older grants it captured. The in-preflight recheck also rides the entry to its dispatch
+   * gates, like the other preflight-yielding sends.
+   */
+  yieldToPreflightSends?: boolean;
+  /**
+   * An agent message (#4804): apply the target's agent-message hold preference at the
+   * synchronous enqueue point, so a hold turned on during this method's awaits still makes the
+   * queued entry turn-end. Callers resolve the preference before sending as well.
+   */
+  honorRecipientHold?: boolean;
 }
 
 export interface WorkspaceTurnHost {
@@ -407,18 +485,37 @@ export interface WorkspaceTurnHost {
       acceptanceOrigin?: TurnAcceptanceOrigin;
       allowQueuedAgentTask?: boolean;
       agentInitiated?: boolean;
+      /** See SendMessageInternalOptions.turnAdmission. */
+      turnAdmission?: TurnAdmissionToken;
+      /** See SendMessageInternalOptions.taskTurnKind. */
+      taskTurnKind?: TaskTurnKind;
     }
   ): Promise<Result<{ started: boolean }, SendMessageError>>;
-  clearQueue(workspaceId: string, options?: { cancelReason?: string }): Result<void>;
+  /**
+   * `preserveUserInput`: hand queued manual sends back as held input (restore-to-input) instead
+   * of discarding them; every entry still leaves the runnable queue.
+   */
+  clearQueue(
+    workspaceId: string,
+    options?: { cancelReason?: string; preserveUserInput?: boolean }
+  ): Result<void>;
   replaceHistory(
     workspaceId: string,
     summaryMessage: MuxMessage,
     options?: {
       mode?: "destructive" | "append-compaction-boundary" | null;
       deletePlanFile?: boolean;
+      /** See WorkspaceService.replaceHistory. */
+      admitsAppend?: () => boolean;
     }
   ): Promise<Result<void>>;
   waitForIdleAndNoQueuedMessages(workspaceId: string): Promise<void>;
+  /** See WorkspaceService.refuseUnavailableGoalTurnAgent (#5402). */
+  refuseUnavailableGoalTurnAgent(
+    workspaceId: string,
+    options: Pick<SendMessageOptions, "agentId" | "disableWorkspaceAgents">,
+    isCurrent?: () => boolean | Promise<boolean>
+  ): Promise<string | null>;
   waitForPendingCompactionCompletionDecision(
     workspaceId: string,
     messageId: string
@@ -430,12 +527,43 @@ export interface WorkspaceTurnHost {
 }
 
 export interface TurnAdmissionHost {
+  /**
+   * Whether shutdown has latched the sessions (WorkspaceService.beginShutdown). Set before any
+   * session refuses work, so a send that failed against the latch always observes it.
+   */
+  isShuttingDown(): boolean;
   acquireIdleTurnExclusion(workspaceId: string): Result<Disposable>;
   getStartupRecoveryState(workspaceId: string): Promise<StartupRecoveryState>;
-  dispatchPendingCompactionFollowUp(workspaceId: string): Promise<Result<boolean>>;
+  /**
+   * Startup re-drive of a pending compaction follow-up. `internal.turnAdmission` is the
+   * task-attempt obligation the caller bound for it (admitTaskWorkspaceTurn): carried to the
+   * session's send as its token and staleness probe, so the follow-up is admitted under exactly
+   * that attempt or refused. The caller disposes a token that produced no turn.
+   */
+  dispatchPendingCompactionFollowUp(
+    workspaceId: string,
+    internal?: { turnAdmission?: TurnAdmissionToken }
+  ): Promise<Result<boolean>>;
   isBusyForMessage(workspaceId: string): boolean;
   hasQueuedMessages(workspaceId: string, dispatchMode?: "tool-end" | "turn-end"): boolean;
+  /**
+   * The user's manual input is queued or held (refused, unsent) in the workspace's session. Both
+   * live only in that session, so removing the workspace would silently lose them.
+   */
+  hasPendingUserInput(workspaceId: string): boolean;
+  /**
+   * Whether a promoteAheadOfHiddenTurnEnd tool-end send would become the next dispatchable entry
+   * (only hidden withdrawn entries stay ahead of it), so it would cut the active stream. False
+   * while a user-authored entry, or a live tool-end entry that already cuts, would stay ahead.
+   */
+  promotedToolEndWouldLeadQueue(workspaceId: string): boolean;
   hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
+  /**
+   * Re-run the workspace's idle queue drain. Called by the task layer when a stream-end decision
+   * that held a queued entry (see TurnAdmissionToken.resolveDispatch) resolves; a no-op while a
+   * turn is active or nothing is queued.
+   */
+  drainQueuedMessagesIfIdle(workspaceId: string): void;
   hasPendingAutoRetry(workspaceId: string): boolean;
   hasPendingBashMonitorWakeContinuation(workspaceId: string): boolean;
   hasPendingWorkspaceTurnContinuation(
@@ -491,7 +619,71 @@ export interface TurnAdmissionHost {
   onWorkspaceTurnSettled(
     listener: (workspaceId: string, turnGeneration: symbol) => void
   ): () => void;
+  /**
+   * Fires when the coordinator replaced a live turn generation with a successor WITHOUT the
+   * predecessor ever going idle (a queued entry dispatched at a step boundary, an auto-retry or
+   * rollover handoff). The predecessor will never emit onWorkspaceTurnSettled; whatever waited
+   * on it now waits on the successor.
+   */
+  onWorkspaceTurnSuperseded(
+    listener: (workspaceId: string, previous: symbol, next: symbol) => void
+  ): () => void;
 }
+
+/**
+ * Obligation handle for one send into an agent-task workspace, minted by TaskService when the
+ * send is admitted against the task's current attempt and carried with the send through
+ * WorkspaceService, AgentSession and the MessageQueue. It is the only evidence of what became of
+ * the send: the token's owner fires exactly one of the lifecycle events below at the seam where
+ * that outcome is decided, never inferred from a return value. A pending or enqueued obligation
+ * keeps the task's stop cascade from settling the attempt; an admitted one is discharged only when
+ * the turn it names settles.
+ */
+export interface TurnAdmissionToken {
+  /**
+   * Refusal authority, evaluated synchronously at every admission gate before the coordinator
+   * claims PREPARING: true once this send may no longer start work (its attempt was superseded,
+   * closed or stopped, or the token was disposed). Inert once admitted.
+   */
+  admissionStale(): boolean;
+  /** The send took a queue slot (actual insertion); the entry owns its disposition from here. */
+  onEnqueued(): void;
+  /**
+   * The coordinator admitted this send's turn. Fired inside the synchronous admission callback,
+   * before any observer can clear the queue; idempotent per turn (a dequeued entry is adopted by
+   * a second sendMessage with the same id).
+   */
+  onAdmitted(turnId: TurnId): void;
+  /**
+   * No turn will exist for this send. Ignored once admitted (cancellation requests termination,
+   * it does not prove settlement); terminal otherwise — a disposed token never admits.
+   */
+  onDisposed(kind: "no-work" | "refused" | "canceled-before-admission"): void;
+  /**
+   * Consulted by the queue's dequeue gate once per drain pass, BEFORE admissionStale and before
+   * the coordinator claims a turn. `hold` keeps the entry queued without dispatching it — the
+   * token's owner is still deciding whether the stream that just ended carried the task's
+   * terminal report, and wakes the drain again (drainQueuedMessagesIfIdle) once it knows;
+   * `proceed` continues to the ordinary gates; a refusal removes the entry with a recoverable
+   * message. Never blocks: the drain returns immediately on `hold`.
+   */
+  resolveDispatch?(): QueuedDispatchDecision;
+}
+
+/** Outcome of {@link TurnAdmissionToken.resolveDispatch}. */
+export type QueuedDispatchDecision = "hold" | "proceed" | { refuse: string };
+
+/** Outcome of AgentTaskIntegration.reawakenInterruptedTask. */
+export type TaskReawakenOutcome =
+  | { kind: "not-applicable" }
+  | { kind: "reawakened"; attemptId: string; statusChanged: boolean }
+  | { kind: "refused"; message: string };
+
+/** Result of asking TaskService to admit a send into a workspace (see admitTaskWorkspaceTurn). */
+export type TaskTurnAdmission =
+  | { kind: "not-a-task" }
+  | { kind: "admitted"; token: TurnAdmissionToken }
+  | { kind: "refused"; message: string };
 
 /**
  * Outcome of the queue entry selected to continue a turn the host cut at a step boundary
@@ -534,11 +726,16 @@ export interface WorkspaceLifecycleHost {
     workspaceId: string,
     options?: { worktreeArchiveBehaviorOverride?: WorktreeArchiveBehavior }
   ): Promise<Result<ArchivePreflightResult>>;
+  preflightArchiveCascade(
+    workspaceId: string,
+    worktreeArchiveBehavior: WorktreeArchiveBehavior
+  ): Promise<Result<ArchiveCascadePreflight>>;
   acquirePreInterruptionArchiveHold(
     workspaceId: string,
     options: {
       queuedDelegatedTurnCount: number;
       expectedDelegatedTurnCorrelations: readonly WorkspaceTurnTaskCorrelation[];
+      operation?: "archive" | "remove";
     }
   ): Result<Disposable>;
   listLiveWorkspaceActivity(workspaceId: string): WorkspaceLiveActivity;
@@ -554,9 +751,14 @@ export interface WorkspaceLifecycleHost {
   remove(
     workspaceId: string,
     force?: boolean,
-    options?: { beforeRemove?: () => Promise<boolean> }
+    options?: { beforeRemove?: () => Promise<boolean | RemovalAttemptBinding> }
   ): Promise<Result<void>>;
-  removeWhileTaskTreeLocked(workspaceId: string, force?: boolean): Promise<Result<void>>;
+  removeWhileTaskTreeLocked(
+    workspaceId: string,
+    force?: boolean,
+    binding?: RemovalAttemptBinding,
+    options?: RemovalCheckoutOptions
+  ): Promise<Result<void> & { warnings?: WorkspaceRemoveWarning[] }>;
   /** Own cleanup outside the originating session callback and inside bounded app shutdown. */
   deferWorkspaceCleanup(run: () => Promise<void>): void;
 }
@@ -571,8 +773,27 @@ export interface WorkspaceProvisioningHost {
     subProjectPath?: string,
     pendingAutoTitle?: boolean,
     tags?: Record<string, string>,
-    options?: { awaitMaterialization?: boolean }
+    options?: {
+      awaitMaterialization?: boolean;
+      defaultUnrelatedConsent?: "after-setup" | "caller-finalizes" | "none";
+      delegatedCreation?: { handleId: string; ownerWorkspaceId: string };
+    }
+  ): Promise<Result<{ metadata: FrontendWorkspaceMetadata; createdBranch?: boolean }>>;
+  /** Project-less create for scratch owners; same consent/crash-binding options as create(). */
+  createScratch(
+    title?: string,
+    tags?: Record<string, string>,
+    options?: {
+      defaultUnrelatedConsent?: "caller-finalizes" | "none";
+      delegatedCreation?: { handleId: string; ownerWorkspaceId: string };
+    }
   ): Promise<Result<{ metadata: FrontendWorkspaceMetadata }>>;
+  /** Grant or clear a "caller-finalizes" creation's pending default (#4453). Never throw. */
+  grantPendingDefaultUnrelatedWorkspaceConsent(workspaceId: string): Promise<void>;
+  clearPendingDefaultUnrelatedConsent(workspaceId: string): Promise<void>;
+  /** A delegated target's creation mark (#4983): drop it (never throws) or flag it (CAS). */
+  clearDelegatedCreationMark(workspaceId: string, handleId: string): Promise<void>;
+  markDelegatedCreationInterrupted(workspaceId: string, handleId: string): Promise<boolean>;
   sanitizeMaterializedTaskWorkspace(
     workspaceId: string,
     workspacePath: string,
@@ -619,27 +840,82 @@ export interface AgentTaskIntegration {
   withTaskTreeLifecycleLock<T>(workspaceId: string, operation: () => Promise<T>): Promise<T>;
   hasDescendantAgentTasks(workspaceId: string): boolean;
   listWorkspaceRemovalDescendants(workspaceId: string): WorkspaceRemovalDescendant[];
+  /** gatedIds: workspaces whose mutation gate the caller holds (#4477). */
   removeAcknowledgedDescendantsWhileTaskTreeLocked(
     workspaceId: string,
-    acknowledgedIds: string[]
-  ): Promise<Result<void>>;
+    acknowledgedIds: string[],
+    gatedIds?: ReadonlySet<string>
+  ): Promise<Result<void> & { warnings?: WorkspaceRemoveWarning[] }>;
   hasActiveDescendantAgentTasksForWorkspace(workspaceId: string): boolean;
   hasActiveTopLevelWorkflowRunsForWorkspace(workspaceId: string): Promise<boolean>;
+  /** A running continuation has a matching accepted live registration, not only a persisted execution status. */
+  hasLiveAgentTaskContinuation(workspaceId: string): boolean;
   getAgentTaskStatus(workspaceId: string): AgentTaskStatus | null | undefined;
   resetAutoResumeCount(workspaceId: string): void;
+  /** The workspace left the config: drop the task's in-memory marks (#5028). */
+  noteWorkspaceRemoved(workspaceId: string): void;
   backgroundForegroundWaitsForWorkspace(workspaceId: string): number;
   markInterruptedTaskRunning(workspaceId: string): Promise<boolean>;
+  /**
+   * The user-resume rescue a manual send/resume runs before binding its obligation, with its
+   * outcome made explicit (markInterruptedTaskRunning reports only a status change):
+   *  - `not-applicable`: nothing to reawaken (an active task, a stop in progress, a retired
+   *    attempt, not a task); the send binds through the ordinary fence, which refuses what the
+   *    fence refuses.
+   *  - `reawakened`: this call committed a fresh owned attempt; the send must bind to exactly
+   *    `attemptId` (`statusChanged`: the row moved to running and needs restoring on failure).
+   *  - `refused`: this call decided to reawaken and lost — another writer (another backend's
+   *    resume) moved the row first, or a Stop overtook it. The send must be refused: binding it
+   *    generically would adopt the winner's attempt and stream it twice.
+   */
+  reawakenInterruptedTask(workspaceId: string): Promise<TaskReawakenOutcome>;
+  /**
+   * Synchronous admission fence for a send into a workspace, evaluated at the session handoff
+   * (right before the queue insertion or the session's own admission awaits). Non-task workspaces
+   * and pre-identity task entries carry no obligation; a task whose current attempt is closed,
+   * stopping or retired refuses; otherwise the returned token must ride with the send.
+   */
+  admitTaskWorkspaceTurn(
+    workspaceId: string,
+    options: {
+      acceptanceOrigin: TurnAcceptanceOrigin;
+      /**
+       * The attempt this send was decided for (a reservation's id, a startup rotation): refused
+       * when the row names another attempt, so a decision never adopts a successor admitted by
+       * another writer between its own admission and this handoff.
+       */
+      expectedAttemptId?: string;
+    }
+  ): TaskTurnAdmission;
+  /**
+   * Roll back a failed resume's status flip. `expectedAttemptId`: the attempt the resume's own
+   * reawaken won; the rollback is a CAS on it (a row another writer re-admitted since is left
+   * alone). Omitted when the resume reawakened nothing (today's unconditional rollback).
+   */
   restoreInterruptedTaskAfterResumeFailure(
     workspaceId: string,
-    previousStatus?: AgentTaskStatus | null
+    previousStatus?: AgentTaskStatus | null,
+    expectedAttemptId?: string
   ): Promise<void>;
   markParentWorkspaceInterrupted(workspaceId: string): void;
   latchHardInterruptCascade(workspaceId: string): (() => void) | undefined;
   terminateAllDescendantAgentTasks(
     workspaceId: string,
-    options?: { workflowRunId?: string }
+    options?: {
+      workflowRunId?: string;
+      /**
+       * A user Stop's retirement of each stopped descendant's owed bash-monitor attention (#5377),
+       * called synchronously as the cascade latches the descendant, before any await.
+       */
+      retireBashMonitorAttention?: (taskId: string) => void;
+    }
   ): Promise<string[]>;
   noteWorkspaceUnarchived(workspaceId: string): Promise<void>;
+  /**
+   * Settle a child goal pause owed by a closing write made outside TaskService (the archive of a
+   * shared-desktop child, #5411). A no-op when nothing is owed; never throws.
+   */
+  settleOwedChildGoalPause(workspaceId: string): Promise<void>;
   /**
    * Admission barrier: true while a stop cascade holds this workspace's latch (from its epoch
    * bump until the stopped execution has authoritatively settled and cleanup finished). Every
@@ -680,6 +956,18 @@ export interface WorkspaceTurnTaskHost {
     targetAgentId: string
   ): AgentAiSettingsLayerValues[];
   bumpWorkspaceStopEpoch(workspaceId: string): void;
+  /**
+   * The workspace's live delegated-turn registration was released (the turn settled, or recovery
+   * or stale cleanup dropped it). TaskService then delivers peer messages that waited for that
+   * turn to finish (#4997). Called synchronously from the release; implementations only schedule.
+   */
+  onWorkspaceTurnRegistrationReleased(workspaceId: string): void;
+  /**
+   * A new delegated turn registered on the workspace (not an update of the live one). TaskService
+   * counts registrations so a peer message that waited for an earlier turn is dropped (#5271).
+   * Synchronous.
+   */
+  onWorkspaceTurnRegistered(workspaceId: string): void;
   countActiveAgentTasks(config: ReturnType<Config["loadConfigOrDefault"]>): number;
   editWorkspaceEntry(
     workspaceId: string,

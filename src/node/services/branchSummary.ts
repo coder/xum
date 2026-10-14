@@ -1,3 +1,4 @@
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 /**
  * Branch summarization on fork/truncate (rlm-mode experiment).
  *
@@ -21,10 +22,15 @@ import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { buildCompactionPrompt } from "@/common/constants/ui";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import {
+  anthropicRejectsDisabledThinking,
+  anthropicThinksUnlessDisabled,
+} from "@/common/types/thinking";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import assert from "@/common/utils/assert";
+import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
 import { getErrorMessage } from "@/common/utils/errors";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
@@ -34,6 +40,7 @@ import {
   BRANCH_SUMMARY_MAX_TRANSCRIPT_CHARS,
   BRANCH_SUMMARY_MIN_SEGMENT_TOKENS,
   BRANCH_SUMMARY_TARGET_WORDS,
+  BRANCH_SUMMARY_THINKING_HEADROOM_TOKENS,
   BRANCH_SUMMARY_TIMEOUT_MS,
 } from "@/constants/branchSummary";
 import {
@@ -53,47 +60,27 @@ export const BRANCH_SUMMARY_LABEL = "Summary of the abandoned branch:";
 
 /**
  * Structural subset of AIService so tests can pass lightweight fakes.
- * Pinned-metadata creation (not plain createModel): usage recorded below must
+ * Pinned creation (not plain createModel): usage recorded below must
  * carry the creation-time pricing identity, or a Coder catalog refresh
  * mid-generation could re-attribute the spend (same rationale as the status
- * generator and /refine).
+ * generator and /refine). The pinned route also selects the wire for the
+ * provider options below.
  */
 export type BranchSummaryAiService = Pick<
   AIService,
-  "createModelWithPinnedMetadata" | "getWorkspaceMetadata"
+  "createModelWithPinnedOptions" | "getWorkspaceMetadata"
 >;
 
-/** Send-option experiment flags relevant to RLM gating (subset of ExperimentsSchema). */
-export interface RlmExperimentFlags {
-  rlm?: boolean;
-  programmaticToolCalling?: boolean;
-}
-
-/**
- * True when RLM mode applies. RLM is a sub-experiment of Programmatic Tool
- * Calling: without a PTC parent flag it stays inert (matching the experiments
- * registry). Flags resolve PER-FIELD, mirroring
- * resolveBackendGatedPtcExperiments (toolAssembly.ts): an explicit renderer
- * boolean is authoritative — `rlm: false` wins over machine overrides — but a
- * MISSING field falls back to the backend's persisted overrides. A
- * defined-but-empty experiments object is exactly what the renderer sends
- * when flags are enabled only through backend overrides
- * (useExperimentOverrideValue sends no explicit values), and treating it as
- * authoritative-false desynced this predicate from tool assembly: the
- * workspace got the persistent RLM kernel while edit-resend summaries,
- * keep-recent stamps, and read-file reinjection stayed silently off (r22).
- */
+/** RLM is a sub-experiment of Programmatic Tool Calling: without PTC it stays inert. */
 export function isRlmModeEnabled(
-  experiments: RlmExperimentFlags | undefined,
   isExperimentEnabled: ((experimentId: ExperimentId) => boolean) | undefined
 ): boolean {
   // Guard for test mocks that may not implement isExperimentEnabled.
-  const backend = (id: ExperimentId): boolean =>
-    typeof isExperimentEnabled === "function" ? isExperimentEnabled(id) : false;
-  const rlm = experiments?.rlm ?? backend(EXPERIMENT_IDS.RLM);
-  const ptc =
-    experiments?.programmaticToolCalling ?? backend(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
-  return rlm && ptc;
+  if (!isExperimentEnabled) return false;
+  return (
+    isExperimentEnabled(EXPERIMENT_IDS.RLM) &&
+    isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING)
+  );
 }
 
 function extractTextForTranscript(message: MuxMessage): string {
@@ -146,7 +133,11 @@ function formatMessageForBranchTranscript(message: MuxMessage): string {
  */
 export function buildAbandonedBranchTranscript(messages: MuxMessage[]): string {
   assert(Array.isArray(messages), "buildAbandonedBranchTranscript requires a message array");
-  const formatted = messages.map(formatMessageForBranchTranscript).filter((s) => s.length > 0);
+  // Both /refine and abandoned-branch summaries must exclude hidden state before the char cap.
+  const formatted = messages
+    .filter((message) => !isModelHiddenMessage(message))
+    .map(formatMessageForBranchTranscript)
+    .filter((s) => s.length > 0);
 
   let totalChars = formatted.reduce((sum, s) => sum + s.length, 0);
   let drop = 0;
@@ -384,7 +375,7 @@ async function generateAbandonedBranchSummaryText(input: {
     // refresh) would otherwise block OUTSIDE every deadline race — the
     // synchronous edit-resend path past BRANCH_SUMMARY_TIMEOUT_MS, and
     // workspace removal indefinitely on the background drain.
-    const modelPromise = input.aiService.createModelWithPinnedMetadata(modelString, {
+    const modelPromise = input.aiService.createModelWithPinnedOptions(modelString, {
       agentInitiated: true,
       workspaceId: input.workspaceId,
     });
@@ -411,13 +402,36 @@ async function generateAbandonedBranchSummaryText(input: {
     try {
       // streamText (not generateText): Codex OAuth endpoints require
       // stream:true in the request body (same rationale as workspaceTitleGenerator).
-      // No thinking provider options are passed, so the call itself stays
-      // thinking-free on top of the thinking-stripped transcript.
+      // No thinking provider options are passed, so the call stays thinking-free
+      // on top of the thinking-stripped transcript, except on models that cannot
+      // disable thinking: those get low effort and thinking headroom instead.
+      // Models that think unless told not to (Haiku 5.5) get explicit disabled
+      // thinking, or their thinking could use up the small summary budget. Each
+      // route spells that differently, so it is built for the pinned route.
+      const pinned = modelResult.data;
+      const alwaysThinks = anthropicRejectsDisabledThinking(pinned.metadataModel);
+      const thinksUnlessDisabled = anthropicThinksUnlessDisabled(pinned.metadataModel);
       const stream = streamText({
         model: modelResult.data.model,
         system: input.system,
         prompt: input.prompt,
-        maxOutputTokens: BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
+        maxOutputTokens: alwaysThinks
+          ? BRANCH_SUMMARY_MAX_OUTPUT_TOKENS + BRANCH_SUMMARY_THINKING_HEADROOM_TOKENS
+          : BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
+        ...(alwaysThinks && { providerOptions: { anthropic: { effort: "low" } } }),
+        ...(thinksUnlessDisabled && {
+          providerOptions: buildProviderOptions(
+            pinned.optionsModelString,
+            "off",
+            undefined,
+            undefined,
+            pinned.optionsMuxProviderOptions,
+            undefined,
+            undefined,
+            pinned.optionsProvidersConfig,
+            pinned.optionsRouteProvider
+          ) as Parameters<typeof streamText>[0]["providerOptions"],
+        }),
         abortSignal,
       });
       // Consume deltas incrementally (not stream.text) so a deadline that
@@ -632,8 +646,6 @@ export interface AbandonedBranchSummaryInput {
   workspaceId: string;
   /** The removed tail, as returned by HistoryService.truncateAfterMessage. */
   abandonedMessages: MuxMessage[];
-  /** Send-option experiments when available (edit path); omit for IPC ops without send options (fork). */
-  experiments?: RlmExperimentFlags;
   /**
    * Explicit side-channel candidates resolved by the caller
    * (deriveSideChannelModelCandidates). The fork path MUST supply these from
@@ -645,7 +657,7 @@ export interface AbandonedBranchSummaryInput {
    * omit this and use the metadata-derived path.
    */
   modelCandidates?: string[];
-  /** Machine-override fallback (ExperimentsService/AIService.isExperimentEnabled). */
+  /** Experiment flags from ExperimentsService (AIService.isExperimentEnabled). */
   isExperimentEnabled?: (experimentId: ExperimentId) => boolean;
   /**
    * Cost telemetry sink: the side-channel call bills real tokens, and without
@@ -692,7 +704,7 @@ export async function maybeAppendAbandonedBranchSummary(
 ): Promise<MuxMessage | null> {
   try {
     // RLM off => byte-identical behavior to today: no model call, no row.
-    if (!isRlmModeEnabled(input.experiments, input.isExperimentEnabled)) {
+    if (!isRlmModeEnabled(input.isExperimentEnabled)) {
       return null;
     }
     if (input.abandonedMessages.length === 0) {
@@ -708,8 +720,10 @@ export async function maybeAppendAbandonedBranchSummary(
     // Filtered here — NOT in buildAbandonedBranchTranscript, which /refine
     // also uses on the active epoch where the preserved copies are the tail's
     // only representation.
+    // Hidden records also cannot make a tiny visible segment eligible for a model call.
     const abandonedMessages = input.abandonedMessages.filter(
       (message) =>
+        !isModelHiddenMessage(message) &&
         message.metadata?.rlmPreservedTailCopy !== true &&
         (message.metadata?.compacted === undefined || message.metadata.compacted === false)
     );

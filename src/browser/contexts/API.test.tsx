@@ -1,8 +1,14 @@
 import { VERSION } from "@/version";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
-import type { RecursivePartial } from "@/browser/testUtils";
+import { createTestApiClient } from "@/browser/testUtils";
+import * as RealOrpcClientModule from "@/common/orpc/client";
+import * as RealWebSocketLinkModule from "@orpc/client/websocket";
+import * as RealMessagePortLinkModule from "@orpc/client/message-port";
+import * as RealAuthTokenModalModule from "@/browser/components/AuthTokenModal/AuthTokenModal";
+import { restoreModulesAfterSuite } from "../../../tests/ui/moduleMocks";
 
 // Mock WebSocket that we can control
 class MockWebSocket {
@@ -71,6 +77,14 @@ const clearStoredAuthTokenMock = mock(() => {
   storedAuthToken = null;
 });
 
+// Restore the real modules after this suite so the transport and auth stubs below cannot
+// leak into later files.
+restoreModulesAfterSuite([
+  ["@/common/orpc/client", { ...RealOrpcClientModule }],
+  ["@orpc/client/websocket", { ...RealWebSocketLinkModule }],
+  ["@orpc/client/message-port", { ...RealMessagePortLinkModule }],
+  ["@/browser/components/AuthTokenModal/AuthTokenModal", { ...RealAuthTokenModalModule }],
+]);
 void mock.module("@/common/orpc/client", () => ({
   createClient: () => ({
     general: {
@@ -97,11 +111,7 @@ void mock.module("@/browser/components/AuthTokenModal/AuthTokenModal", () => ({
 }));
 
 // Import the real API module types (not the mocked version)
-import type {
-  APIClient as _APIClient,
-  UseAPIResult as _UseAPIResult,
-  APIProvider as APIProviderType,
-} from "./API";
+import type { UseAPIResult as _UseAPIResult, APIProvider as APIProviderType } from "./API";
 
 // IMPORTANT: Other test files mock @/browser/contexts/API with a fake APIProvider.
 // Module mocks leak between test files in bun (https://github.com/oven-sh/bun/issues/12823).
@@ -110,11 +120,11 @@ import type {
 const RealAPIModule: {
   APIProvider: typeof APIProviderType;
   useAPI: () => _UseAPIResult;
+  useLiveAPI: () => _UseAPIResult["api"];
   useConnectionLatencyMs: () => number | null;
 } = require("./API?real=1");
 /* eslint-enable @typescript-eslint/no-require-imports, @typescript-eslint/no-unsafe-assignment */
-const { APIProvider, useAPI, useConnectionLatencyMs } = RealAPIModule;
-type APIClient = _APIClient;
+const { APIProvider, useAPI, useLiveAPI, useConnectionLatencyMs } = RealAPIModule;
 type UseAPIResult = _UseAPIResult;
 
 // Each observation carries the API context value by reference (apiState) plus the latency
@@ -138,6 +148,7 @@ const createMockWebSocket = (url: string) => new MockWebSocket(url) as unknown a
 
 describe("API reconnection", () => {
   beforeEach(() => {
+    saveDomGlobals();
     // Minimal DOM setup required by @testing-library/react.
     //
     // Happy DOM can default to an opaque origin ("null") in some modes (e.g. coverage).
@@ -165,8 +176,7 @@ describe("API reconnection", () => {
     cleanup();
     MockWebSocket.reset();
     globalThis.fetch = originalFetch;
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    restoreDomGlobals();
   });
 
   test("constructs WebSocket URL with app proxy prefix", () => {
@@ -186,10 +196,10 @@ describe("API reconnection", () => {
   test("injected clients skip internal auth token setup", async () => {
     window.location.href = "https://mux.example.com/?token=injected-token";
     const states: string[] = [];
-    const injectedClient: RecursivePartial<APIClient> = { general: {} };
+    const injectedClient = createTestApiClient({ general: {} });
 
     render(
-      <APIProvider client={injectedClient as APIClient}>
+      <APIProvider client={injectedClient}>
         <APIStateObserver onState={(s) => states.push(s.status)} />
       </APIProvider>
     );
@@ -208,10 +218,10 @@ describe("API reconnection", () => {
   test("injected clients keep internal connection controls disabled", async () => {
     const states: string[] = [];
     let latestState: UseAPIResult | null = null;
-    const injectedClient: RecursivePartial<APIClient> = { general: {} };
+    const injectedClient = createTestApiClient({ general: {} });
 
     render(
-      <APIProvider client={injectedClient as APIClient}>
+      <APIProvider client={injectedClient}>
         <APIStateObserver
           onState={(state) => {
             latestState = state.apiState;
@@ -354,6 +364,39 @@ describe("API reconnection", () => {
     await waitFor(() => {
       expect(MockWebSocket.instances.length).toBeGreaterThan(1);
     });
+  });
+
+  // The stores, deferred writes and offline gates read useLiveAPI(): it must be null whenever the
+  // connection is down, even while useAPI().api keeps the last client.
+  test("useLiveAPI() is the client only while connected; useAPI().api keeps it in the gap", async () => {
+    const renders: Array<{ status: string; api: unknown; live: unknown }> = [];
+    function Probe() {
+      const state = useAPI();
+      renders.push({ status: state.status, api: state.api, live: useLiveAPI() });
+      return null;
+    }
+    render(
+      <APIProvider createWebSocket={createMockWebSocket}>
+        <Probe />
+      </APIProvider>
+    );
+    for (let cycle = 0; cycle < 3; cycle++) {
+      const ws = MockWebSocket.lastInstance();
+      await act(async () => {
+        ws!.simulateOpen();
+        await new Promise((r) => setTimeout(r, 10));
+      });
+      act(() => {
+        ws!.simulateClose(1006);
+      });
+      await waitFor(() => expect(MockWebSocket.instances.length).toBeGreaterThan(cycle + 1));
+    }
+    const connected = renders.filter((r) => r.status === "connected");
+    const offline = renders.filter((r) => r.status === "reconnecting" && r.api != null);
+    expect(connected).not.toHaveLength(0);
+    expect(offline).not.toHaveLength(0);
+    expect(connected.filter((r) => r.live !== r.api)).toEqual([]);
+    expect(offline.filter((r) => r.live !== null)).toEqual([]);
   });
 
   test("shows auth_required on close with auth error codes (4401)", async () => {

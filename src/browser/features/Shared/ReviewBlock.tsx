@@ -11,7 +11,10 @@ import { Pencil, Check, Trash2, Unlink } from "lucide-react";
 import { DiffRenderer } from "./DiffRenderer";
 import { Button } from "@/browser/components/Button/Button";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
-import { formatLineRangeCompact } from "@/browser/utils/review/lineRange";
+import {
+  formatLineRangeCompact,
+  formatReviewLocationLabel,
+} from "@/browser/utils/review/lineRange";
 import { matchesKeybind, formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { parseReviewLineRange } from "@/common/types/review";
 import type { ReviewNoteDataForDisplay } from "@/common/types/message";
@@ -28,6 +31,8 @@ interface ReviewBlockCoreProps {
   oldStart?: number;
   newStart?: number;
   comment: string;
+  /** Header labels (full / compact) overriding `path:L<range>`, e.g. for artifact comments. */
+  locationLabels?: { full: string; compact: string };
   /** Detach from chat (sets status back to pending) */
   onDetach?: () => void;
   /** Mark as complete (checked) */
@@ -50,6 +55,7 @@ const ReviewBlockCore: React.FC<ReviewBlockCoreProps> = ({
   oldStart,
   newStart,
   comment,
+  locationLabels,
   onDetach,
   onComplete,
   onDelete,
@@ -115,14 +121,14 @@ const ReviewBlockCore: React.FC<ReviewBlockCoreProps> = ({
         {/* File path and line range - only show if not compact */}
         {!compact && (
           <span className="text-primary min-w-0 flex-1 truncate font-mono text-[11px]">
-            {filePath}:L{formatLineRangeCompact(lineRange)}
+            {locationLabels?.full ?? `${filePath}:L${formatLineRangeCompact(lineRange)}`}
           </span>
         )}
 
         {/* In compact mode, show line range only */}
         {compact && (
           <span className="text-muted min-w-0 flex-1 truncate font-mono text-[10px]">
-            L{formatLineRangeCompact(lineRange)}
+            {locationLabels?.compact ?? `L${formatLineRangeCompact(lineRange)}`}
           </span>
         )}
 
@@ -320,6 +326,14 @@ export const ReviewBlockFromData: React.FC<ReviewBlockFromDataProps> = ({
       oldStart={data.oldStart}
       newStart={data.newStart}
       comment={data.userNote}
+      locationLabels={
+        data.artifact != null
+          ? {
+              full: formatReviewLocationLabel(data),
+              compact: formatReviewLocationLabel(data, true),
+            }
+          : undefined
+      }
       onDetach={onDetach}
       compact={compact}
       onComplete={onComplete}

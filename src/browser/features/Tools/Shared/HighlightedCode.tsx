@@ -1,5 +1,8 @@
 import React, { useState, useEffect } from "react";
-import { highlightCode } from "@/browser/utils/highlighting/highlightWorkerClient";
+import {
+  highlightCode,
+  isAbortedHighlight,
+} from "@/browser/utils/highlighting/highlightWorkerClient";
 import { extractShikiLines, isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
 import { useTheme } from "@/browser/contexts/ThemeContext";
 import { cn } from "@/common/lib/utils";
@@ -39,10 +42,12 @@ export const HighlightedCode: React.FC<HighlightedCodeProps> = ({
 
   useEffect(() => {
     let cancelled = false;
+    // Aborting in cleanup drops a superseded request from the worker queue.
+    const abortController = new AbortController();
 
     async function highlight() {
       try {
-        const html = await highlightCode(code, language, theme);
+        const html = await highlightCode(code, language, theme, abortController.signal);
         if (!cancelled) {
           const lines = extractShikiLines(html);
           const filtered = lines.filter((l, i, a) => i < a.length - 1 || l.trim() !== "");
@@ -53,6 +58,7 @@ export const HighlightedCode: React.FC<HighlightedCodeProps> = ({
           }
         }
       } catch (error) {
+        if (isAbortedHighlight(error, abortController.signal)) return;
         console.warn(`Failed to highlight ${language}:`, error);
         if (!cancelled) setHighlighted(null);
       }
@@ -61,6 +67,7 @@ export const HighlightedCode: React.FC<HighlightedCodeProps> = ({
     void highlight();
     return () => {
       cancelled = true;
+      abortController.abort();
     };
   }, [code, language, theme]);
 

@@ -1,5 +1,5 @@
 /**
- * Tier-1 sandboxed plugin hooks (agent-plugins experiment).
+ * Tier-1 sandboxed plugin hooks.
  *
  * Discovers `hooks.js` modules inside Agent Plugin roots (same containers and
  * Project Trust gating as plugin MCP config), loads each one into its own
@@ -53,6 +53,7 @@ import {
   type AgentPluginContainer,
   type AgentPluginInfo,
 } from "./discovery";
+import { buildPluginServerKey, resolvePluginInstanceId } from "./mcpConfig";
 import { readMutationEpochToken, STAGING_DIR_NAME } from "./journals";
 import {
   buildHookInvokeScript,
@@ -82,14 +83,24 @@ export interface EnsureWorkspaceHooksArgs {
   sessionDir: string;
   /** Durable journal for this workspace session (hook-context rows). */
   journal: DurableEventJournal;
-  /** agent-plugins experiment gate; false tears down any registered hooks. */
-  enabled: boolean;
   /** `~/.mux` root anchoring the global plugin container. */
   xumHome: string;
   /** Host checkout root for project containers; omit for off-host workspaces. */
   projectRoot?: string;
+  /** Project identity for project-plugin instance IDs (same as the plugin MCP provider). */
+  projectKey?: string;
   projectTrusted: boolean;
 }
+
+/**
+ * Structured settings (`openai/settings`) of one plugin instance's MCP
+ * servers in a workspace, keyed by server name. Must never throw.
+ */
+export type PluginHookSettingsProvider = (
+  workspaceId: string,
+  serverKeyPrefix: string,
+  timeoutMs: number
+) => Promise<Record<string, Record<string, unknown>>>;
 
 /** One discovered plugin with a hooks.js, plus its pinned source snapshot. */
 interface DiscoveredHookPlugin {
@@ -102,6 +113,8 @@ interface DiscoveredHookPlugin {
 interface LoadedPluginHookState {
   pluginName: string;
   grants: CapabilityGrants;
+  /** `plugin:<instanceId>:`: this plugin's MCP server keys (hook `settings`). */
+  serverKeyPrefix: string;
   /** Pinned hooks.js source; re-evaluated when the mount is rebuilt. */
   source: string;
   mountOptions: AcquireMountOptions;
@@ -142,7 +155,12 @@ interface AgentPluginHookServiceDeps {
   runtimeFactoryLoader?: () => Promise<IJSRuntimeFactory>;
   /** Container computation seam (tests pin containers to temp dirs). */
   computeContainers?: typeof computeAgentPluginContainers;
+  /** Deadline for a hook-time settings read (cache miss only). */
+  settingsTimeoutMs?: number;
 }
+
+/** A cache-miss settings read is short: it runs inside a tool call's hook. */
+const HOOK_SETTINGS_TIMEOUT_MS = 1_000;
 
 function loadQuickJSRuntimeFactory(): Promise<IJSRuntimeFactory> {
   // The heavy QuickJS WASM stack loads at first runtime creation
@@ -158,6 +176,8 @@ export class AgentPluginHookService {
   private readonly hookTimeoutMs: number;
   private readonly runtimeFactoryLoader: () => Promise<IJSRuntimeFactory>;
   private readonly computeContainers: typeof computeAgentPluginContainers;
+  private readonly settingsTimeoutMs: number;
+  private settingsProvider: PluginHookSettingsProvider | undefined;
 
   private readonly registrations = new Map<string, WorkspaceHookRegistration>();
   /** Serializes ensure/dispose per workspace (concurrent sends must not race teardown). */
@@ -172,6 +192,12 @@ export class AgentPluginHookService {
     this.hookTimeoutMs = deps.hookTimeoutMs ?? HOOK_EVAL_TIMEOUT_MS;
     this.runtimeFactoryLoader = deps.runtimeFactoryLoader ?? loadQuickJSRuntimeFactory;
     this.computeContainers = deps.computeContainers ?? computeAgentPluginContainers;
+    this.settingsTimeoutMs = deps.settingsTimeoutMs ?? HOOK_SETTINGS_TIMEOUT_MS;
+  }
+
+  /** The MCP manager is built after this module-level singleton. */
+  setSettingsProvider(provider: PluginHookSettingsProvider): void {
+    this.settingsProvider = provider;
   }
 
   /** Normal and headless requests share the same broken-plugin isolation posture. */
@@ -192,11 +218,6 @@ export class AgentPluginHookService {
    */
   async ensureWorkspaceHooks(args: EnsureWorkspaceHooksArgs): Promise<void> {
     await using _guard = await this.lockFor(args.workspaceId).acquire();
-
-    if (!args.enabled) {
-      await this.teardownLocked(args.workspaceId);
-      return;
-    }
 
     // Capture the epoch BEFORE discovery: a mutation landing between this
     // read and registration makes the stored token stale, so the dispatch
@@ -291,6 +312,14 @@ export class AgentPluginHookService {
     const state: LoadedPluginHookState = {
       pluginName: plugin.name,
       grants: candidate.grants,
+      // Same instance ID as the plugin's MCP servers (one hashing rule).
+      serverKeyPrefix: buildPluginServerKey(
+        resolvePluginInstanceId(plugin, {
+          projectRoot: args.projectRoot,
+          projectKey: args.projectKey,
+        }),
+        ""
+      ),
       source: candidate.source,
       mountOptions: {
         lifetime: "persistent",
@@ -614,6 +643,19 @@ export class AgentPluginHookService {
     if (state.disposed) {
       return null;
     }
+    // Preflight: a plugin already revoked (here or by another backend's committed update or
+    // uninstall) must not even have its settings server contacted.
+    if (await this.retireIfEpochStale(workspaceId)) {
+      return null;
+    }
+    // Every hook point gets `settings` from the plugin's own MCP servers.
+    // Read BEFORE the revocation checks below: an uninstall or teardown that
+    // lands during this read must stop the call, or withPersistentMount would
+    // recreate the dropped mount and run the removed hook once more
+    // (the last review fix of #6040).
+    const settings =
+      (await this.settingsProvider?.(workspaceId, state.serverKeyPrefix, this.settingsTimeoutMs)) ??
+      {};
     if (await this.retireIfEpochStale(workspaceId)) {
       return null;
     }
@@ -623,7 +665,7 @@ export class AgentPluginHookService {
       return null;
     }
     try {
-      const inputJson = JSON.stringify(input);
+      const inputJson = JSON.stringify({ ...input, settings });
       assert(typeof inputJson === "string", "hook input must be JSON-serializable");
       const evalResult = await this.sandboxHost.withPersistentMount(
         state.mountOptions,

@@ -1,7 +1,6 @@
 import { type Page } from "@playwright/test";
 import { electronTest as test, electronExpect as expect } from "../electronTest";
 import { getXumE2EEnv } from "../env";
-import { REVIEW_SORT_ORDER_KEY } from "../../../src/common/constants/storage";
 import { STORAGE_KEYS } from "../../../src/constants/workspaceDefaults";
 import {
   readReactProfileSnapshot,
@@ -9,7 +8,7 @@ import {
   withChromeProfiles,
   writePerfArtifacts,
 } from "../utils/perfProfile";
-import { disableReviewTutorial, seedLargeReviewDiff } from "../utils/reviewPerfFixture";
+import { seedLargeReviewDiff, setReviewPreferences } from "../utils/reviewPerfFixture";
 
 const shouldRunPerfScenarios = getXumE2EEnv("E2E_RUN_PERF") === "1";
 
@@ -36,24 +35,15 @@ test.describe("regular review performance profiling", () => {
     ui,
     workspace,
   }, testInfo) => {
-    await disableReviewTutorial(page);
-
     const diffSummary = seedLargeReviewDiff(workspace.demoProject.workspacePath);
     const reviewDiffBaseKey = STORAGE_KEYS.reviewDiffBase(workspace.demoProject.workspaceId);
 
     // Pin Review to HEAD before the panel mounts so the warm-cache reopen profiles
     // the regular-review render path rather than origin/main fallback handling.
-    await page.evaluate(
-      ({ diffBaseKey, sortOrderKey }) => {
-        window.localStorage.setItem(diffBaseKey, JSON.stringify("HEAD"));
-        window.localStorage.setItem("review-show-read", JSON.stringify(true));
-        window.localStorage.setItem(sortOrderKey, JSON.stringify("file-order"));
-      },
-      {
-        diffBaseKey: reviewDiffBaseKey,
-        sortOrderKey: REVIEW_SORT_ORDER_KEY,
-      }
-    );
+    await page.evaluate((diffBaseKey) => {
+      window.localStorage.setItem(diffBaseKey, JSON.stringify("HEAD"));
+    }, reviewDiffBaseKey);
+    await setReviewPreferences(page, { showRead: true, sortOrder: "file-order" });
 
     await ui.projects.openFirstWorkspace();
     await ui.metaSidebar.expectVisible();

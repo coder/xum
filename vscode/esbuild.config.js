@@ -106,6 +106,32 @@ function copyKatexAssets() {
 
 
 
+const webviewCssInputPath = path.resolve(__dirname, "src", "webview", "webview.css");
+
+// Compile the webview stylesheet. Exported so webviewCss.test.ts checks the real output.
+// `dependencies` lists the files Tailwind inlined via @import (the shared desktop styles under
+// src/browser/styles/), so watch mode can rebuild when they change.
+async function compileWebviewCss() {
+  const input = fs.readFileSync(webviewCssInputPath, "utf8");
+  const dependencies = [];
+
+  const compiled = await tailwind.compile(input, {
+    base: path.dirname(webviewCssInputPath),
+    from: webviewCssInputPath,
+    onDependency: (dependency) => {
+      dependencies.push(dependency);
+    },
+  });
+
+  const scanner = new Scanner({ sources: compiled.sources });
+  const candidates = scanner.scan();
+
+  const built = compiled.build(candidates);
+  const css = tailwind.optimize(built, { minify: true }).code;
+
+  return { css, dependencies };
+}
+
 function buildWebviewCss() {
   if (webviewCssBuildPromise) {
     return webviewCssBuildPromise;
@@ -114,23 +140,11 @@ function buildWebviewCss() {
   webviewCssBuildPromise = (async () => {
     ensureOutDir();
 
-    const inputPath = path.resolve(__dirname, "src", "webview", "webview.css");
     const outputPath = path.resolve(__dirname, "out", "xumChatView.css");
-    const input = fs.readFileSync(inputPath, "utf8");
+    const { css, dependencies } = await compileWebviewCss();
 
-    const compiled = await tailwind.compile(input, {
-      base: path.dirname(inputPath),
-      from: inputPath,
-      onDependency: () => undefined,
-    });
-
-    const scanner = new Scanner({ sources: compiled.sources });
-    const candidates = scanner.scan();
-
-    const built = compiled.build(candidates);
-    const optimized = tailwind.optimize(built, { minify: true }).code;
-
-    fs.writeFileSync(outputPath, optimized);
+    fs.writeFileSync(outputPath, css);
+    return dependencies;
   })().finally(() => {
     webviewCssBuildPromise = null;
   });
@@ -138,19 +152,31 @@ function buildWebviewCss() {
   return webviewCssBuildPromise;
 }
 
-function watchWebviewCss() {
-  const inputPath = path.resolve(__dirname, "src", "webview", "webview.css");
-  let timeout = null;
+const watchedWebviewCssFiles = new Set();
+let webviewCssRebuildTimeout = null;
 
-  fs.watch(inputPath, { persistent: true }, () => {
-    if (timeout) {
-      clearTimeout(timeout);
+// Watch webview.css and every file it imports, so edits to the shared desktop styles
+// rebuild the webview stylesheet too. New imports are picked up after each rebuild.
+function watchWebviewCssFiles(files) {
+  for (const file of files) {
+    if (watchedWebviewCssFiles.has(file)) {
+      continue;
     }
+    watchedWebviewCssFiles.add(file);
 
-    timeout = setTimeout(() => {
-      void buildWebviewCss();
-    }, 25);
-  });
+    fs.watch(file, { persistent: true }, () => {
+      if (webviewCssRebuildTimeout) {
+        clearTimeout(webviewCssRebuildTimeout);
+      }
+
+      webviewCssRebuildTimeout = setTimeout(() => {
+        buildWebviewCss().then(watchWebviewCssFiles, (error) => {
+          // eslint-disable-next-line no-console
+          console.error(error);
+        });
+      }, 25);
+    });
+  }
 }
 
 // Support Vite-style SVG React imports ("*.svg?react") used by mux UI.
@@ -274,8 +300,8 @@ async function main() {
   copySetiFont();
 
   if (isWatch) {
-    await buildWebviewCss();
-    watchWebviewCss();
+    const dependencies = await buildWebviewCss();
+    watchWebviewCssFiles([webviewCssInputPath, ...dependencies]);
 
     const ext = await esbuild.context(extensionBuild);
     const web = await esbuild.context(webviewBuild);
@@ -295,8 +321,13 @@ async function main() {
   ]);
 }
 
-main().catch((error) => {
-  // eslint-disable-next-line no-console
-  console.error(error);
-  process.exit(1);
-});
+// webviewCss.test.ts requires this file for the real bundle config; only build when run directly.
+if (require.main === module) {
+  main().catch((error) => {
+    // eslint-disable-next-line no-console
+    console.error(error);
+    process.exit(1);
+  });
+}
+
+module.exports = { webviewBuild, compileWebviewCss };

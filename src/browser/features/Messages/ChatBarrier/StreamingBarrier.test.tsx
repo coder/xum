@@ -1,10 +1,16 @@
+import "../../../../../tests/ui/dom";
+import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
+import * as RealSettingsContextModule from "@/browser/contexts/SettingsContext";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../../../tests/ui/domGlobals";
+import { createTestApiClient } from "@/browser/testUtils";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
+import type { ReactElement, ReactNode } from "react";
 
-import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
-import type * as ModelsFromSettingsModule from "@/browser/hooks/useModelsFromSettings";
-import type * as APIModule from "@/browser/contexts/API";
+import * as RealWorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
+import * as RealModelsFromSettingsModule from "@/browser/hooks/useModelsFromSettings";
+import { APIProvider } from "@/browser/contexts/API";
 import { overlayWorkspaceStoreRaw } from "@/browser/stores/workspaceStoreTestOverlay";
 
 interface MockWorkspaceState {
@@ -64,10 +70,13 @@ const setAutoRetryEnabled = mock((_input: unknown) =>
 );
 const openSettings = mock((_section?: string) => undefined);
 
-/* eslint-disable @typescript-eslint/no-require-imports */
-const actualWorkspaceStore =
-  require("@/browser/stores/WorkspaceStore?real=1") as typeof WorkspaceStoreModule;
-/* eslint-enable @typescript-eslint/no-require-imports */
+// Snapshot the real exports before this file mocks the module. Do not load a second copy with
+// require("...WorkspaceStore?real=1"): Bun's LCOV keeps only the last-loaded copy of a file, so a
+// later second copy replaces WorkspaceStore.test.ts's coverage of WorkspaceStore.ts in the shard.
+const actualWorkspaceStore = { ...RealWorkspaceStoreModule };
+
+// The overlay also changes the store identity, so it must stay local to this suite.
+restoreModulesAfterSuite([["@/browser/stores/WorkspaceStore", { ...actualWorkspaceStore }]]);
 
 // Overlay (not replace) the raw store: bun evaluates every test file before running tests
 // and static import bindings freeze at eval time, so this file-scope mock is what any
@@ -86,28 +95,29 @@ void mock.module("@/browser/stores/WorkspaceStore", () => ({
   useWorkspaceStreamingStats: () => currentStreamingStats,
 }));
 
-/* eslint-disable @typescript-eslint/no-require-imports */
-const actualAPI = require("@/browser/contexts/API?real=1") as typeof APIModule;
-/* eslint-enable @typescript-eslint/no-require-imports */
+// Later full-app suites must not inherit the SettingsContext stub below (it drops
+// SettingsProvider, which SettingsSectionStory renders).
+restoreModulesAfterSuite([
+  ["@/browser/contexts/SettingsContext", { ...RealSettingsContextModule }],
+]);
 
-// Spread the real module: replacing it outright deletes exports like APIContext that
-// later-evaluated test files import statically, crashing them at load (module mocks are
-// process-wide and bun evaluates every test file before running tests).
-void mock.module("@/browser/contexts/API", () => ({
-  ...actualAPI,
-  useAPI: () => ({
-    api: {
-      workspace: {
-        interruptStream,
-        setAutoRetryEnabled,
-      },
-    },
-    status: "connected" as const,
-    error: null,
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
-}));
+// Inject the client through the real provider: a module mock of contexts/API is process-wide
+// and leaks this partial client into later-evaluated suites.
+const apiClient = createTestApiClient({
+  workspace: {
+    interruptStream,
+    setAutoRetryEnabled,
+  },
+});
+
+function ApiWrapper(props: { children: ReactNode }) {
+  return <APIProvider client={apiClient}>{props.children}</APIProvider>;
+}
+
+// The wrapper is kept by view.rerender(), so rerenders stay inside the provider.
+function renderWithApi(ui: ReactElement) {
+  return render(ui, { wrapper: ApiWrapper });
+}
 
 void mock.module("@/browser/contexts/SettingsContext", () => ({
   useSettings: () => ({
@@ -127,10 +137,13 @@ void mock.module("@/browser/contexts/SettingsContext", () => ({
 // before running tests), deleting exports that later-evaluated suites need (seen as
 // GeneralSection/MemoryTab CI failures).
 
-/* eslint-disable @typescript-eslint/no-require-imports */
-const actualModelsFromSettings =
-  require("@/browser/hooks/useModelsFromSettings?real=1") as typeof ModelsFromSettingsModule;
-/* eslint-enable @typescript-eslint/no-require-imports */
+// A snapshot, not a require("...?real=1") copy, which would replace useModelsFromSettings.test.ts's
+// coverage in the shard (see actualWorkspaceStore above).
+const actualModelsFromSettings = { ...RealModelsFromSettingsModule };
+
+restoreModulesAfterSuite([
+  ["@/browser/hooks/useModelsFromSettings", { ...actualModelsFromSettings }],
+]);
 
 // Spread the real module: this suite only pins getDefaultModel (its assertions expect
 // "openai:gpt-4o-mini"); replacing the whole module would leak missing exports.
@@ -144,6 +157,7 @@ import { StreamingBarrier } from "./StreamingBarrier";
 
 describe("StreamingBarrier", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
 
@@ -159,8 +173,7 @@ describe("StreamingBarrier", () => {
   afterEach(() => {
     cleanup();
     mock.restore();
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    restoreDomGlobals();
   });
 
   test("clicking stop during normal streaming interrupts with default options", async () => {
@@ -171,7 +184,7 @@ describe("StreamingBarrier", () => {
     });
 
     // First appearance is immediate — stop button available right away.
-    const view = render(<StreamingBarrier workspaceId="ws-1" />);
+    const view = renderWithApi(<StreamingBarrier workspaceId="ws-1" />);
 
     fireEvent.click(view.getByRole("button", { name: "Stop streaming" }));
 
@@ -192,7 +205,7 @@ describe("StreamingBarrier", () => {
       pendingStreamModel: "openai:gpt-4o-mini",
     });
 
-    const view = render(<StreamingBarrier workspaceId="ws-1" />);
+    const view = renderWithApi(<StreamingBarrier workspaceId="ws-1" />);
 
     const stopButton = view.getByRole("button", { name: "Stop streaming" });
     expect(stopButton.textContent).toContain("Esc");
@@ -216,7 +229,7 @@ describe("StreamingBarrier", () => {
       pendingStreamModel: null,
     });
 
-    const view = render(<StreamingBarrier workspaceId="ws-1" />);
+    const view = renderWithApi(<StreamingBarrier workspaceId="ws-1" />);
     expect(view.queryByRole("button", { name: "Stop streaming" })).toBeNull();
 
     // Activate streaming phase — barrier appears immediately on first
@@ -240,7 +253,7 @@ describe("StreamingBarrier", () => {
       runtimeStatus: { phase: "starting", detail: "" },
     });
 
-    const view = render(<StreamingBarrier workspaceId="ws-1" />);
+    const view = renderWithApi(<StreamingBarrier workspaceId="ws-1" />);
 
     expect(view.getByRole("button", { name: "Stop streaming" })).toBeTruthy();
   });
@@ -253,7 +266,7 @@ describe("StreamingBarrier", () => {
       runtimeStatus: { phase: "starting", detail: "Loading tools..." },
     });
 
-    const view = render(<StreamingBarrier workspaceId="ws-1" />);
+    const view = renderWithApi(<StreamingBarrier workspaceId="ws-1" />);
 
     // First appearance is immediate — text visible right away.
     expect(view.getByText("Loading tools...")).toBeTruthy();
@@ -267,7 +280,7 @@ describe("StreamingBarrier", () => {
       runtimeStatus: { phase: "starting", detail: "Starting workspace..." },
     });
 
-    const view = render(<StreamingBarrier workspaceId="ws-1" />);
+    const view = renderWithApi(<StreamingBarrier workspaceId="ws-1" />);
 
     // First appearance shows immediately.
     expect(view.getByText("Starting workspace...")).toBeTruthy();
@@ -300,7 +313,7 @@ describe("StreamingBarrier", () => {
       runtimeStatus: { phase: "starting", detail: "Loading tools..." },
     });
 
-    const view = render(<StreamingBarrier workspaceId="ws-1" />);
+    const view = renderWithApi(<StreamingBarrier workspaceId="ws-1" />);
     expect(view.getByText("Loading tools...")).toBeTruthy();
 
     // Transition to streaming — cross-phase, so immediate.
@@ -321,7 +334,7 @@ describe("StreamingBarrier", () => {
     });
 
     // First appearance is immediate.
-    const view = render(<StreamingBarrier workspaceId="ws-1" />);
+    const view = renderWithApi(<StreamingBarrier workspaceId="ws-1" />);
     expect(view.getByText("claude-opus-4-6 streaming...")).toBeTruthy();
 
     // Token count updates don't change statusText, so the displayed text stays.
@@ -342,7 +355,7 @@ describe("StreamingBarrier", () => {
       pendingStreamModel: "openai:gpt-4o-mini",
     });
 
-    const view = render(<StreamingBarrier workspaceId="ws-1" vimEnabled />);
+    const view = renderWithApi(<StreamingBarrier workspaceId="ws-1" vimEnabled />);
 
     const stopButton = view.getByRole("button", { name: "Stop streaming" });
     const expectedVimShortcut = formatKeybind(KEYBINDS.INTERRUPT_STREAM_VIM).replace(
@@ -361,7 +374,7 @@ describe("StreamingBarrier", () => {
     });
 
     const onCancelCompaction = mock(() => undefined);
-    const view = render(
+    const view = renderWithApi(
       <StreamingBarrier workspaceId="ws-1" onCancelCompaction={onCancelCompaction} />
     );
 
@@ -380,7 +393,7 @@ describe("StreamingBarrier", () => {
       isCompacting: true,
     });
 
-    const view = render(<StreamingBarrier workspaceId="ws-1" />);
+    const view = renderWithApi(<StreamingBarrier workspaceId="ws-1" />);
 
     fireEvent.click(view.getByRole("button", { name: "Stop streaming" }));
 
@@ -399,7 +412,7 @@ describe("StreamingBarrier", () => {
       currentModel: "anthropic:claude-opus-4-6",
     });
 
-    const view = render(<StreamingBarrier workspaceId="ws-1" />);
+    const view = renderWithApi(<StreamingBarrier workspaceId="ws-1" />);
     expect(view.getByText("claude-opus-4-6 streaming...")).toBeTruthy();
 
     // Switch workspace — immediately shows the new workspace's text.
@@ -420,7 +433,7 @@ describe("StreamingBarrier", () => {
       awaitingUserQuestion: true,
     });
 
-    const view = render(<StreamingBarrier workspaceId="ws-1" />);
+    const view = renderWithApi(<StreamingBarrier workspaceId="ws-1" />);
 
     expect(view.queryByRole("button", { name: "Stop streaming" })).toBeNull();
     expect(view.getByText("type a message to respond")).toBeTruthy();
@@ -432,7 +445,7 @@ describe("StreamingBarrier", () => {
       activeBashMonitorCount: 1,
     });
 
-    const view = render(<StreamingBarrier workspaceId="ws-1" />);
+    const view = renderWithApi(<StreamingBarrier workspaceId="ws-1" />);
 
     // Shown immediately (not debounced) so the stream-end -> waiting handoff
     // doesn't flash an empty transcript tail.
@@ -450,7 +463,7 @@ describe("StreamingBarrier", () => {
       activeBashMonitorCount: 0,
     });
 
-    const view = render(<StreamingBarrier workspaceId="ws-1" />);
+    const view = renderWithApi(<StreamingBarrier workspaceId="ws-1" />);
 
     expect(view.container.textContent).toBe("");
   });
@@ -461,7 +474,7 @@ describe("StreamingBarrier", () => {
       activeBashMonitorCount: 2,
     });
 
-    const view = render(<StreamingBarrier workspaceId="ws-1" />);
+    const view = renderWithApi(<StreamingBarrier workspaceId="ws-1" />);
 
     expect(view.getByText("gpt-4o-mini streaming...")).toBeTruthy();
     expect(view.getByRole("button", { name: "Stop streaming" })).toBeTruthy();

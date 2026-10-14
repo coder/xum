@@ -23,6 +23,8 @@ import { log } from "@/node/services/log";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import { GIT_NO_HOOKS_ENV } from "@/node/utils/gitNoHooksEnv";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
+import { STAGED_ATTACHMENT_DIRS } from "@/common/constants/stagedAttachments";
+import { stagedAttachmentMirrorMatchesCheckout } from "@/node/utils/attachments/stageWorkspaceAttachment";
 
 const SNAPSHOT_VERSION = 1;
 const SNAPSHOT_DIR_NAME = "archive-state";
@@ -82,6 +84,65 @@ function findWorkspaceEntryByIdOrPath(
   };
 }
 
+/**
+ * Staged attachments a snapshot archive would lose (#4895). The staging dirs are git-ignored, so
+ * git lists them at best as part of an untracked `.xum/` directory, and not at all when the repo
+ * tracks files under `.xum/` or `.mux/`. A staged file survives only through its session-dir
+ * mirror copy (restored after unarchive), so list every entry without a valid one: legacy `.mux`
+ * uploads (never mirrored), non-canonical names, symlinks and special files, and files whose
+ * mirror is missing or holds different bytes. Draft-only uploads that were never staged into the
+ * checkout are invisible here (they live in renderer storage).
+ * Never follows symlinks; an unreadable directory is listed itself (fail closed).
+ */
+async function listUnmirroredStagedAttachments(
+  workspacePath: string,
+  sessionDir: string
+): Promise<string[]> {
+  const lossy: string[] = [];
+  const isRealDir = async (absolute: string): Promise<boolean> => {
+    try {
+      return (await fsPromises.lstat(absolute)).isDirectory();
+    } catch {
+      return false;
+    }
+  };
+  // Staged uploads are `<stagingDir>/<uuid>/<name>`; anything deeper is listed, not walked.
+  const visit = async (relative: string, depth: number): Promise<void> => {
+    let entries;
+    try {
+      entries = await fsPromises.readdir(path.join(workspacePath, relative), {
+        withFileTypes: true,
+      });
+    } catch {
+      lossy.push(`${relative}/`);
+      return;
+    }
+    for (const entry of entries) {
+      const entryPath = `${relative}/${entry.name}`;
+      if (entry.isDirectory()) {
+        if (depth === 0) await visit(entryPath, 1);
+        else lossy.push(`${entryPath}/`);
+      } else if (!entry.isFile() || !(await hasValidMirror(entryPath))) {
+        lossy.push(entryPath);
+      }
+    }
+  };
+  const hasValidMirror = (stagedPath: string): Promise<boolean> =>
+    stagedAttachmentMirrorMatchesCheckout({ workspacePath, sessionDir, stagedPath });
+  for (const stagingDir of STAGED_ATTACHMENT_DIRS) {
+    // Only a real directory chain (no symlinked `.xum` or staging dir) holds staged uploads.
+    const [metadataDir] = stagingDir.split("/");
+    if (
+      !(await isRealDir(path.join(workspacePath, metadataDir))) ||
+      !(await isRealDir(path.join(workspacePath, stagingDir)))
+    ) {
+      continue;
+    }
+    await visit(stagingDir, 0);
+  }
+  return lossy;
+}
+
 export class WorktreeArchiveSnapshotService {
   constructor(private readonly config: Config) {}
 
@@ -129,7 +190,10 @@ export class WorktreeArchiveSnapshotService {
 
     try {
       for (const projectRepo of projectRepos) {
-        await this.ensureNoUnsupportedUntrackedFiles(projectRepo.repoCwd);
+        await this.ensureNoUnsupportedUntrackedFiles(
+          projectRepo.repoCwd,
+          path.join(this.config.sessionsDir, args.workspaceId)
+        );
         await this.ensureNoDirtySubmodules(projectRepo.repoCwd);
       }
       return Ok(undefined);
@@ -195,7 +259,10 @@ export class WorktreeArchiveSnapshotService {
 
       const allUntrackedPaths: string[] = [];
       for (const projectRepo of projectRepos) {
-        const paths = await this.listUnsupportedUntrackedFiles(projectRepo.repoCwd);
+        const paths = await this.listUnsupportedUntrackedFiles(
+          projectRepo.repoCwd,
+          path.join(this.config.sessionsDir, args.workspaceId)
+        );
         if (projectRepos.length > 1) {
           // Prefix with project name for disambiguation in multi-project workspaces.
           for (const p of paths) {
@@ -281,7 +348,10 @@ export class WorktreeArchiveSnapshotService {
 
       const projectSnapshots: WorktreeArchiveSnapshotProject[] = [];
       for (const projectRepo of projectRepos) {
-        const currentUntracked = await this.listUnsupportedUntrackedFiles(projectRepo.repoCwd);
+        const currentUntracked = await this.listUnsupportedUntrackedFiles(
+          projectRepo.repoCwd,
+          sessionDir
+        );
         if (args.acknowledgedUntrackedPaths != null) {
           // Re-verify untracked files at capture time to close the race window between
           // the preflight check and actual snapshot capture. Any files created after the
@@ -688,22 +758,33 @@ export class WorktreeArchiveSnapshotService {
    * List untracked files/directories in a repo that archive snapshots cannot preserve.
    * Returns a sorted, normalized array of relative paths.
    */
-  private async listUnsupportedUntrackedFiles(repoCwd: string): Promise<string[]> {
+  private async listUnsupportedUntrackedFiles(
+    repoCwd: string,
+    sessionDir: string
+  ): Promise<string[]> {
     const untrackedOutput = await this.gitStdout(repoCwd, [
       "ls-files",
       "--others",
       "--exclude-standard",
       "--directory",
     ]);
-    return untrackedOutput
+    const gitPaths = untrackedOutput
       .split("\n")
       .map((line) => line.trim())
-      .filter((line) => line.length > 0)
-      .sort();
+      .filter((line) => line.length > 0);
+    // A staged path under a directory git already lists is covered by that entry.
+    const stagedPaths = (await listUnmirroredStagedAttachments(repoCwd, sessionDir)).filter(
+      (stagedPath) =>
+        !gitPaths.some((gitPath) => gitPath.endsWith("/") && stagedPath.startsWith(gitPath))
+    );
+    return [...new Set([...gitPaths, ...stagedPaths])].sort();
   }
 
-  private async ensureNoUnsupportedUntrackedFiles(repoCwd: string): Promise<void> {
-    const untrackedPaths = await this.listUnsupportedUntrackedFiles(repoCwd);
+  private async ensureNoUnsupportedUntrackedFiles(
+    repoCwd: string,
+    sessionDir: string
+  ): Promise<void> {
+    const untrackedPaths = await this.listUnsupportedUntrackedFiles(repoCwd, sessionDir);
     if (untrackedPaths.length > 0) {
       throw new Error(
         `Archive snapshot does not yet support untracked files: ${untrackedPaths.join(", ")}`
@@ -929,8 +1010,10 @@ export class WorktreeArchiveSnapshotService {
   ): Promise<void> {
     const sessionDir = path.join(this.config.sessionsDir, workspaceId);
     const stateDir = this.resolveSessionRelativePath(sessionDir, snapshot.stateDirPath);
-    await fsPromises.rm(stateDir, { recursive: true, force: true });
 
+    // Clear the pointer before deleting the artifacts (#4746): a rejected write must keep
+    // both, so config never points at a deleted snapshot. A failed delete afterwards only
+    // orphans the directory inside the session dir, which workspace removal deletes.
     await this.config.editConfig((config) => {
       const workspaceEntry = findWorkspaceEntryByIdOrPath(this.config, config, workspaceId);
       if (workspaceEntry) {
@@ -938,6 +1021,16 @@ export class WorktreeArchiveSnapshotService {
       }
       return config;
     });
+
+    try {
+      await fsPromises.rm(stateDir, { recursive: true, force: true });
+    } catch (error) {
+      log.warn("Failed to delete worktree archive snapshot state; leaving it orphaned", {
+        workspaceId,
+        stateDir,
+        error: getErrorMessage(error),
+      });
+    }
   }
 
   private async cleanupFailedRestore(args: {

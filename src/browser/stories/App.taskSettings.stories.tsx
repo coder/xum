@@ -1,5 +1,6 @@
 import { expect, userEvent, within } from "@storybook/test";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
+import { openSettingsDialog } from "./storyPlayHelpers";
 import { expandLeftSidebar } from "./helpers/uiState";
 import { setupSettingsStory } from "@/browser/features/Settings/Sections/settingsStoryUtils";
 
@@ -13,7 +14,7 @@ function setupTaskSettings() {
   return setupSettingsStory({
     // A global Pro default must not make the unknown calling chat look Pro.
     agentAiDefaults: {
-      exec: { modelString: "openai:gpt-5.6-sol", thinkingLevel: "high", reasoningMode: "pro" },
+      exec: { modelString: "openai:gpt-6.1-sol", thinkingLevel: "high", reasoningMode: "pro" },
     },
     providersConfig: {
       openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
@@ -22,8 +23,7 @@ function setupTaskSettings() {
 }
 
 async function exerciseInheritance(canvasElement: HTMLElement) {
-  const canvas = within(canvasElement);
-  await userEvent.click(await canvas.findByTestId("settings-button", {}, { timeout: 10000 }));
+  const canvas = within(await openSettingsDialog(canvasElement));
   await userEvent.click(await canvas.findByRole("button", { name: "Agents" }));
   const card = await canvas.findByRole("group", { name: "Exec defaults" });
   const controls = within(card);

@@ -20,6 +20,7 @@ import { Command } from "commander";
 
 import { getErrorMessage } from "@/common/utils/errors";
 import { Config, type ProjectConfig } from "@/node/config";
+import { resolvesToFilesystemRoot, PROJECT_AT_FILESYSTEM_ROOT_ERROR } from "@/node/utils/pathUtils";
 import { isProjectTrusted } from "@/node/utils/projectTrust";
 import { getParseOptions } from "./argv";
 import { exitAfterStdoutFlush } from "./processExit";
@@ -168,13 +169,15 @@ export async function resolveProjectTrusted(
   return mainRepoDir != null && isProjectTrusted(realConfig, mainRepoDir);
 }
 
-/** Replace all run-root trust entries so removed grants cannot survive root reuse. */
-export async function replaceRunTrustProjects(
-  realConfig: Config,
-  targetConfig: Config
-): Promise<void> {
+/**
+ * Rebuild the run-root config from the real config's trust grants and tool-search
+ * opt-out (turns read it from this config), so removed grants and settings cannot
+ * survive root reuse.
+ */
+export async function replaceRunConfig(realConfig: Config, targetConfig: Config): Promise<void> {
+  const real = realConfig.loadConfigOrDefault();
   const trustOnlyProjects = new Map<string, ProjectConfig>();
-  for (const [projectPath, projectConfig] of realConfig.loadConfigOrDefault().projects) {
+  for (const [projectPath, projectConfig] of real.projects) {
     if (projectConfig.trusted === undefined) {
       continue;
     }
@@ -185,7 +188,10 @@ export async function replaceRunTrustProjects(
     });
   }
 
-  await targetConfig.editConfig(() => ({ projects: trustOnlyProjects }));
+  await targetConfig.editConfig(() => ({
+    projects: trustOnlyProjects,
+    ...(real.toolSearchEnabled === false ? { toolSearchEnabled: false } : {}),
+  }));
 }
 
 /**
@@ -209,7 +215,8 @@ export async function materializeResolvedTrust(
     project.trusted = true;
     return config;
   });
-  // Config.saveConfig swallows write errors, so verify the exact-path entry before continuing.
+  // editConfig rejects when the save fails (#4444); verifying the exact-path entry is belt and
+  // braces against another writer.
   if (targetConfig.loadConfigOrDefault().projects.get(projectDir)?.trusted !== true) {
     throw new Error(`Failed to persist resolved trust for ${projectDir}`);
   }
@@ -238,6 +245,7 @@ async function runTrust(options: TrustCLIOptions): Promise<number> {
   // discovery and hooks actually consult.
   const wasTrusted = await resolveProjectTrusted(realConfig, projectDir);
   if (wasTrusted !== trusted) {
+    const trustDirIsRoot = await resolvesToFilesystemRoot(trustDir);
     await realConfig.editConfig((config) => {
       const setEntryTrusted = (dir: string, createIfMissing: boolean) => {
         let project = config.projects.get(dir);
@@ -248,7 +256,10 @@ async function runTrust(options: TrustCLIOptions): Promise<number> {
           // Mirror the desktop setTrust handler (projects.setTrust in
           // src/node/orpc/router.ts): create a minimal project entry when the project
           // was never added to mux, so headless CLI use works without the desktop app
-          // or server.
+          // or server. Never at the filesystem root, as the desktop handler refuses (#5917).
+          if (dir === trustDir && trustDirIsRoot) {
+            throw new Error(PROJECT_AT_FILESYSTEM_ROOT_ERROR);
+          }
           project = { workspaces: [] };
           config.projects.set(dir, project);
         }
@@ -269,10 +280,9 @@ async function runTrust(options: TrustCLIOptions): Promise<number> {
       }
       return config;
     });
-    // Config.saveConfig swallows write failures (self-healing keeps the desktop app
-    // alive on bad disks), so editConfig resolves even when nothing was persisted.
-    // A headless trust command must not report success in that case: re-read from
-    // disk and fail loudly instead of letting automation proceed with a wrong
+    // editConfig rejects when the save fails (#4444). A headless trust command must never report
+    // success for a trust state that is not on disk, so this re-read is belt and braces against a
+    // write another writer replaced: fail loudly instead of letting automation proceed with a wrong
     // assumption about the project's trust state.
     if ((await resolveProjectTrusted(realConfig, projectDir)) !== trusted) {
       throw new Error(

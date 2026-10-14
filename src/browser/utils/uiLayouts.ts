@@ -36,6 +36,7 @@ import {
   readRightSidebarLayout,
 } from "@/browser/utils/rightSidebarTabFocus";
 import { isTabType, makeTerminalTabType, type TabType } from "@/browser/types/rightSidebar";
+import { Err, Ok, type Result } from "@/common/types/result";
 import { createTerminalSession } from "@/browser/utils/terminal";
 import type { APIClient } from "@/browser/contexts/API";
 
@@ -136,6 +137,9 @@ function toPresetTab(
     return tab;
   }
 
+  // Presets deliberately store only Stats, Review and terminals: older builds drop a preset
+  // (and a slot without a keybind) holding any other tab id, so widening the encoding would
+  // lose saved layouts on downgrade. Other tabs, the New tab and side chats are left out.
   return null;
 }
 
@@ -207,21 +211,19 @@ function findFirstPresetTabsetId(root: RightSidebarLayoutPresetNode): string | n
   return findFirstPresetTabsetId(root.children[0]) ?? findFirstPresetTabsetId(root.children[1]);
 }
 
-function convertLayoutStateToPreset(state: RightSidebarLayoutState): RightSidebarLayoutPresetState {
+export const LAYOUT_PRESET_NO_SAVEABLE_TABS_MESSAGE =
+  "Layouts can only save Stats, Review and terminal tabs in the right sidebar. Open one of them first.";
+
+/** Returns null when no tab in the layout can be stored in a preset. */
+function convertLayoutStateToPreset(
+  state: RightSidebarLayoutState
+): RightSidebarLayoutPresetState | null {
   const ctx = { terminalCounter: 0 };
   const root = convertNodeToPreset(state.root, ctx);
 
   if (!root) {
-    // Fallback to default layout without terminals.
-    const fallback = getDefaultRightSidebarLayoutState(getRightSidebarTabFallback());
-    const fallbackRoot = convertNodeToPreset(fallback.root, { terminalCounter: 0 });
-    assert(fallbackRoot !== null, "default right sidebar layout must convert");
-    return {
-      version: 1,
-      nextId: fallback.nextId,
-      focusedTabsetId: fallback.focusedTabsetId,
-      root: fallbackRoot,
-    };
+    // Refuse rather than save a substitute layout the user never had open.
+    return null;
   }
 
   const focusedTabsetId =
@@ -241,7 +243,7 @@ export function createPresetFromCurrentWorkspace(
   workspaceId: string,
   name: string,
   existingPresetId?: string
-): LayoutPreset {
+): Result<LayoutPreset> {
   const trimmedName = name.trim();
   assert(trimmedName.length > 0, "preset name must be non-empty");
 
@@ -252,6 +254,9 @@ export function createPresetFromCurrentWorkspace(
   const rightSidebarLayout = readRightSidebarLayout(workspaceId);
 
   const presetLayout = convertLayoutStateToPreset(rightSidebarLayout);
+  if (!presetLayout) {
+    return Err(LAYOUT_PRESET_NO_SAVEABLE_TABS_MESSAGE);
+  }
 
   const preset: LayoutPreset = {
     id: existingPresetId ?? createLayoutPresetId(),
@@ -265,7 +270,7 @@ export function createPresetFromCurrentWorkspace(
     },
   };
 
-  return preset;
+  return Ok(preset);
 }
 
 function collectTerminalTabs(
@@ -395,6 +400,7 @@ function resolvePresetLayoutToLayoutState(
 
   return {
     version: 1,
+    openTabsOnly: true,
     nextId: preset.nextId,
     focusedTabsetId,
     root,

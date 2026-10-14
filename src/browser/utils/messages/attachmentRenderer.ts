@@ -6,6 +6,7 @@ import type {
   EditedFilesReferenceAttachment,
   CompletedReportsIndexAttachment,
   ReadFilesReferenceAttachment,
+  ArtifactsIndexAttachment,
 } from "@/common/types/attachment";
 import {
   AGENT_SKILL_BODY_TRUNCATION_NOTE,
@@ -112,6 +113,20 @@ function renderReadFilesReference(attachment: ReadFilesReferenceAttachment): str
   return (
     `${count} previously read file${count === 1 ? "" : "s"} had their contents ` +
     `summarized away by compaction; re-read files when their contents are needed again.`
+  );
+}
+
+/**
+ * SECURITY AUDIT: same channel as renderReadFilesReference above. Artifact paths are file names
+ * the agent (or repo content it copied) chose, and labels are model-written text, so neither is
+ * rendered here: only the count, derived from list length. artifact_list returns the names and
+ * versions through a normal tool result when the model needs them.
+ */
+function renderArtifactsIndex(attachment: ArtifactsIndexAttachment): string {
+  const count = attachment.artifacts.length;
+  return (
+    `${count} artifact${count === 1 ? " has" : "s have"} published versions in ` +
+    `$XUM_SCRATCH_DIR/artifacts; call artifact_list for names and versions.`
   );
 }
 
@@ -276,8 +291,9 @@ function sortAttachmentsForInjection(
     // truncation cannot drop them.
     completed_reports_index: 2,
     read_files_reference: 3,
-    loaded_skills_snapshot: 4,
-    edited_files_reference: 5,
+    artifacts_index: 4,
+    loaded_skills_snapshot: 5,
+    edited_files_reference: 6,
   };
 
   return attachments
@@ -373,6 +389,15 @@ export function renderAttachmentsToContentWithBudget(
     if (attachment.type === "read_files_reference") {
       // Compact one-liner (paths only) — include whole or not at all.
       const content = renderReadFilesReference(attachment);
+      if (content.length <= remainingForContent) {
+        addBlock(wrapSystemUpdate(content));
+      }
+      continue;
+    }
+
+    if (attachment.type === "artifacts_index") {
+      // Bounded list of handles — include whole or not at all.
+      const content = renderArtifactsIndex(attachment);
       if (content.length <= remainingForContent) {
         addBlock(wrapSystemUpdate(content));
       }

@@ -1,8 +1,8 @@
 import { expect, userEvent, waitFor, within } from "@storybook/test";
 import { appMeta, AppWithMocks, type AppStory } from "./meta";
 import { expandLeftSidebar } from "./helpers/uiState";
+import { getSettingsDialog, openSettingsDialog } from "./storyPlayHelpers";
 import { setupSettingsStory } from "@/browser/features/Settings/Sections/settingsStoryUtils";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { AgentPluginInstallPreview } from "@/common/orpc/schemas/agentPlugins";
 import type { AgentPluginInstallEntry } from "@/common/config/schemas/agentPluginInstalls";
 
@@ -32,13 +32,14 @@ const preview: AgentPluginInstallPreview = {
   agents: ["reviewer.md"],
   workflows: ["review.js"],
   slashCommands: [{ name: "review-status", description: "Summarize review status" }],
+  codexHooks: [],
   hook: { path: "hooks.js", toolGrants: ["file_read"] },
   warnings: [],
 };
 
 function setupPluginSettings(installed = false, conflict = false) {
   expandLeftSidebar();
-  const client = setupSettingsStory({ experiments: { [EXPERIMENT_IDS.AGENT_PLUGINS]: true } });
+  const client = setupSettingsStory({});
   let entry: AgentPluginInstallEntry = {
     name: preview.manifest.name,
     scope: "global",
@@ -53,7 +54,6 @@ function setupPluginSettings(installed = false, conflict = false) {
     composition: {
       get: () =>
         Promise.resolve({
-          agentPluginsEnabled: true,
           plugins: [],
           diagnostics: [],
           skills: [],
@@ -112,19 +112,18 @@ function setupPluginSettings(installed = false, conflict = false) {
 }
 
 async function openPlugins(canvasElement: HTMLElement) {
-  const canvas = within(canvasElement);
-  await userEvent.click(await canvas.findByTestId("settings-button", {}, { timeout: 10000 }));
+  const canvas = within(await openSettingsDialog(canvasElement));
   await userEvent.click(await canvas.findByRole("button", { name: "Plugins" }));
   return canvas;
 }
 
-async function checkPhoneBounds(canvasElement: HTMLElement) {
+async function checkPhoneBounds() {
   // CI's test-runner ignores viewport globals; only check narrow bounds when actually pinned.
   if (window.innerWidth >= 768) return;
   await waitFor(() =>
     expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth)
   );
-  for (const group of within(canvasElement).getAllByRole("group")) {
+  for (const group of within(getSettingsDialog()).getAllByRole("group")) {
     await expect(group.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
   }
 }
@@ -145,7 +144,7 @@ export const PreviewDesktop: AppStory = {
         await expect(checkbox).not.toBeChecked();
     }
     await expect(canvas.getByRole("button", { name: "Install" })).toBeEnabled();
-    await checkPhoneBounds(canvasElement);
+    await checkPhoneBounds();
     canvas.getByRole("group", { name: "Skills" }).scrollIntoView({ block: "start" });
   },
 };
@@ -183,7 +182,7 @@ export const ManageComponentsDesktop: AppStory = {
     await expect(await canvas.findByRole("checkbox", { name: "review" })).not.toBeChecked();
     await expect(canvas.getByRole("checkbox", { name: "research" })).toBeChecked();
     await expect(canvas.getByRole("button", { name: "Save changes" })).toBeDisabled();
-    await checkPhoneBounds(canvasElement);
+    await checkPhoneBounds();
   },
 };
 
@@ -215,7 +214,7 @@ export const EmptySelection: AppStory = {
     await expect(
       canvas.getByRole("button", { name: "Manage components for review-tools" })
     ).toBeEnabled();
-    await checkPhoneBounds(canvasElement);
+    await checkPhoneBounds();
   },
 };
 
@@ -238,6 +237,6 @@ export const SelectionConflict: AppStory = {
     await canvas.findByText(/2 of 2 skills imported/);
     await waitFor(() => expect(canvas.getByRole("button", { name: "Done" })).toBeEnabled());
     await expect(canvas.queryByRole("alert")).not.toBeInTheDocument();
-    await checkPhoneBounds(canvasElement);
+    await checkPhoneBounds();
   },
 };

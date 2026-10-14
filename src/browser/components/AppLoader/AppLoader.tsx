@@ -1,40 +1,54 @@
-import { useState, useEffect, useRef, type ReactNode } from "react";
-import { AnimatePresence, motion } from "motion/react";
+import { useState, useEffect, useLayoutEffect, useRef, type ReactNode } from "react";
 import App from "../../App";
 import { AuthTokenModal } from "../AuthTokenModal/AuthTokenModal";
 import { ThemeProvider } from "../../contexts/ThemeContext";
 import { LoadingScreen } from "../LoadingScreen/LoadingScreen";
 import { StartupConnectionError } from "../StartupConnectionError/StartupConnectionError";
-import { useReducedMotion } from "../../hooks/useReducedMotion";
 import { useWorkspaceStoreRaw, workspaceStore } from "../../stores/WorkspaceStore";
 import { useGitStatusStoreRaw } from "../../stores/GitStatusStore";
 import { useRuntimeStatusStoreRaw } from "../../stores/RuntimeStatusStore";
 import { useBackgroundBashStoreRaw } from "../../stores/BackgroundBashStore";
+import { getAgentSkillsStore } from "../../stores/AgentSkillsStore";
+import { getReviewStateStore } from "../../stores/ReviewStateStore";
 import { getPRStatusStoreInstance } from "../../stores/PRStatusStore";
 import { getAppConfigStore } from "../../stores/AppConfigStore";
+import { getDraftStore, useDraftStoreReady } from "../../stores/DraftStore";
 import { getProvidersConfigStore } from "../../stores/ProvidersConfigStore";
 import { ProjectProvider, useProjectContext } from "../../contexts/ProjectContext";
-import { PolicyProvider, usePolicy } from "@/browser/contexts/PolicyContext";
-import { PolicyBlockedScreen } from "@/browser/components/PolicyBlockedScreen/PolicyBlockedScreen";
-import { APIProvider, useAPI, type APIClient } from "@/browser/contexts/API";
+import { APIProvider, useAPI, useLiveAPI, type APIClient } from "@/browser/contexts/API";
 import { WorkspaceProvider, useWorkspaceContext } from "../../contexts/WorkspaceContext";
 import { RouterProvider } from "../../contexts/RouterContext";
-import {
-  hydrateUserPreferencesLocalCache,
-  UserPreferencesProvider,
-} from "@/browser/contexts/UserPreferencesContext";
 import { TerminalRouterProvider } from "../../terminal/TerminalRouterContext";
 import { UpdateRestartOverlay } from "@/browser/components/UpdateRestartOverlay/UpdateRestartOverlay";
+import { removeFirstRunView } from "@/browser/features/SplashScreens/SplashScreenProvider";
 
 const USER_PREFERENCES_BOOTSTRAP_TIMEOUT_MS = 2000;
 
+/**
+ * T3 #5971, C step 2: the static first-run view covers the page until the live wizard replaces it.
+ * It must never cover the token prompt, a startup error or the reconnect screen.
+ */
+export function FirstRunViewConnectionGuard() {
+  const { status } = useAPI();
+  const blocked = status === "auth_required" || status === "error" || status === "reconnecting";
+  useLayoutEffect(() => {
+    if (blocked) removeFirstRunView();
+  }, [blocked]);
+  return null;
+}
+
 function UserPreferencesStartupGate(props: { children: ReactNode }) {
   const apiState = useAPI();
+  // The bound runs only while connected: a drop cancels it, and the reconnect starts it again,
+  // so the timeout cannot pick the launch route from code defaults while offline.
+  const liveApi = useLiveAPI();
   const [ready, setReady] = useState(false);
   const bootstrappedRef = useRef(false);
 
+  // The bound starts once the API client exists: a token prompt or a slow connect must not use it
+  // up, or RouterProvider picks the launch route from code defaults.
   useEffect(() => {
-    if (bootstrappedRef.current || !apiState.api) {
+    if (bootstrappedRef.current || !liveApi) {
       return;
     }
 
@@ -43,17 +57,21 @@ function UserPreferencesStartupGate(props: { children: ReactNode }) {
     const timeoutPromise = new Promise<"timeout">((resolve) => {
       timeoutId = setTimeout(resolve, USER_PREFERENCES_BOOTSTRAP_TIMEOUT_MS, "timeout");
     });
-    const hydratePromise = hydrateUserPreferencesLocalCache({
-      configClient: apiState.api.config,
-      signal: abortController.signal,
-    }).catch((error) => {
-      console.warn("Failed to bootstrap user preferences:", error);
-      return undefined;
-    });
 
-    const startup = Promise.race([hydratePromise, timeoutPromise]);
-    // User preference hydration must happen before RouterProvider reads launch behavior, but
-    // startup still needs a hard fallback so a slow backend cannot trap users on the boot screen.
+    const appConfigStore = getAppConfigStore();
+    let unsubscribeAppConfig: (() => void) | undefined;
+    const appConfigPromise = new Promise<void>((resolve) => {
+      const resolveWhenLoaded = () => {
+        if (appConfigStore.getSnapshot()?.userPreferences) resolve();
+      };
+      unsubscribeAppConfig = appConfigStore.subscribe(resolveWhenLoaded);
+      abortController.signal.addEventListener("abort", () => resolve(), { once: true });
+      resolveWhenLoaded();
+    }).finally(() => unsubscribeAppConfig?.());
+
+    const startup = Promise.race([appConfigPromise, timeoutPromise]);
+    // RouterProvider reads launch behavior from the first snapshot, but a slow backend must not
+    // trap users on the boot screen.
     void startup
       .then((result) => {
         if (result === "timeout") {
@@ -78,9 +96,11 @@ function UserPreferencesStartupGate(props: { children: ReactNode }) {
         clearTimeout(timeoutId);
       }
     };
-  }, [apiState.api]);
+  }, [liveApi]);
 
-  if (bootstrappedRef.current || ready) {
+  // bootstrappedRef is set together with `ready`, so `ready` alone decides here; reading
+  // the ref during render would make React Compiler skip this component.
+  if (ready) {
     return <>{props.children}</>;
   }
 
@@ -95,18 +115,27 @@ function UserPreferencesStartupGate(props: { children: ReactNode }) {
     );
   }
 
+  // #6017: these startup screens are the whole page, so each sits in the page's one main
+  // landmark. LoadingScreen and StartupConnectionError stay landmark-free because
+  // UpdateRestartOverlay shows LoadingScreen above the App, which has its own main.
   if (apiState.status === "error") {
-    return <StartupConnectionError error={apiState.error} onRetry={apiState.retry} />;
+    return (
+      <main>
+        <StartupConnectionError error={apiState.error} onRetry={apiState.retry} />
+      </main>
+    );
   }
 
   return (
-    <LoadingScreen
-      statusText={
-        apiState.status === "reconnecting"
-          ? `Reconnecting to backend (attempt ${apiState.attempt})...`
-          : "Loading preferences"
-      }
-    />
+    <main>
+      <LoadingScreen
+        statusText={
+          apiState.status === "reconnecting"
+            ? `Reconnecting to backend (attempt ${apiState.attempt})...`
+            : "Loading preferences"
+        }
+      />
+    </main>
   );
 }
 
@@ -131,18 +160,15 @@ export function AppLoader(props: AppLoaderProps) {
   return (
     <ThemeProvider>
       <APIProvider client={props.client}>
+        <FirstRunViewConnectionGuard />
         <UserPreferencesStartupGate>
-          <PolicyProvider>
-            <RouterProvider>
-              <ProjectProvider>
-                <WorkspaceProvider>
-                  <UserPreferencesProvider>
-                    <AppLoaderInner />
-                  </UserPreferencesProvider>
-                </WorkspaceProvider>
-              </ProjectProvider>
-            </RouterProvider>
-          </PolicyProvider>
+          <RouterProvider>
+            <ProjectProvider>
+              <WorkspaceProvider>
+                <AppLoaderInner />
+              </WorkspaceProvider>
+            </ProjectProvider>
+          </RouterProvider>
         </UserPreferencesStartupGate>
       </APIProvider>
     </ThemeProvider>
@@ -154,18 +180,17 @@ export function AppLoader(props: AppLoaderProps) {
  * Syncs stores and shows loading screen until ready.
  */
 function AppLoaderInner() {
-  const policyState = usePolicy();
   const workspaceContext = useWorkspaceContext();
   const projectContext = useProjectContext();
   const apiState = useAPI();
-  const api = apiState.api;
+  // The stores must see "offline": they drop their client and resubscribe once it is back.
+  // useAPI().api can keep the last client while Xum reconnects (see useLiveAPI).
+  const api = useLiveAPI();
 
   const workspaceStoreInstance = useWorkspaceStoreRaw();
   const gitStatusStore = useGitStatusStoreRaw();
   const runtimeStatusStore = useRuntimeStatusStoreRaw();
   const backgroundBashStore = useBackgroundBashStoreRaw();
-
-  const prefersReducedMotion = useReducedMotion();
 
   // Track whether stores have been synced
   const [storesSynced, setStoresSynced] = useState(false);
@@ -177,6 +202,15 @@ function AppLoaderInner() {
 
   // Sync stores when metadata finishes loading
   useEffect(() => {
+    // #4662: git/PR probes for a workspace wait for its chat replay to settle. Wire the gate
+    // before setClient/syncWorkspaces below, which can refresh synchronously.
+    const chatReplayGate = {
+      isReplayPending: workspaceStore.isWorkspaceChatReplayPending,
+      subscribeKey: workspaceStore.subscribeKey,
+    };
+    gitStatusStore.setChatReplayGate(chatReplayGate);
+    getPRStatusStoreInstance().setChatReplayGate(chatReplayGate);
+
     // Keep store clients in sync even during backend restarts (api can be null while reconnecting).
     workspaceStoreInstance.setClient(api ?? null);
     gitStatusStore.setClient(api ?? null);
@@ -184,7 +218,9 @@ function AppLoaderInner() {
     backgroundBashStore.setClient(api ?? null);
     getPRStatusStoreInstance().setClient(api ?? null);
     getProvidersConfigStore().setClient(api ?? null);
-    getAppConfigStore().setClient(api ?? null);
+    getReviewStateStore().setClient(api ?? null);
+    getDraftStore().setClient(api ?? null);
+    getAgentSkillsStore().setClient(api ?? null);
 
     if (!workspaceContext.loading) {
       workspaceStoreInstance.syncWorkspaces(workspaceContext.workspaceMetadata);
@@ -211,19 +247,25 @@ function AppLoaderInner() {
     api,
   ]);
 
+  // Composers render the in-memory draft store; hold the app until it has the backend's drafts
+  // (and imported legacy localStorage drafts) so a composer never starts from an empty draft.
+  const draftsReady = useDraftStoreReady();
+
   useEffect(() => {
     if (initialLoadComplete) {
       return;
     }
 
-    if (!projectContext.loading && !workspaceContext.loading && storesSynced) {
+    if (!projectContext.loading && !workspaceContext.loading && storesSynced && draftsReady) {
       setInitialLoadComplete(true);
     }
-  }, [initialLoadComplete, projectContext.loading, storesSynced, workspaceContext.loading]);
-
-  if (policyState.status.state === "blocked") {
-    return <PolicyBlockedScreen reason={policyState.status.reason} />;
-  }
+  }, [
+    initialLoadComplete,
+    projectContext.loading,
+    storesSynced,
+    workspaceContext.loading,
+    draftsReady,
+  ]);
 
   // If we're in browser mode and auth is required, show the token prompt before any data loads.
   if (apiState.status === "auth_required") {
@@ -237,19 +279,15 @@ function AppLoaderInner() {
     );
   }
 
-  // AnimatePresence provides a smooth fade-out when the loading screen
-  // transitions to the main app. mode="wait" ensures the exit animation
-  // completes before the enter animation starts.
+  // T3 #5971: no fade. The old exit animation (0.4 s, mode "wait") delayed even mounting the app,
+  // then faded it in from opacity 0, and kept `motion` on the first load. Reduced motion already
+  // got this instant swap.
   return (
-    <AnimatePresence mode="wait">
+    <>
       {!initialLoadComplete ? (
-        <motion.div
-          key="loading"
-          initial={{ opacity: 1 }}
-          exit={prefersReducedMotion ? { opacity: 0 } : { opacity: 0, y: -20 }}
-          transition={prefersReducedMotion ? { duration: 0 } : { duration: 0.4, ease: "easeInOut" }}
-          className="bg-surface-primary h-full"
-        >
+        // #6017: the loading screen is the whole page, so it is the page's main landmark until the
+        // App (with its own main) replaces it in the same commit, so the two never overlap.
+        <main className="bg-surface-primary h-full">
           {apiState.status === "error" ? (
             <StartupConnectionError error={apiState.error} onRetry={apiState.retry} />
           ) : (
@@ -261,21 +299,15 @@ function AppLoaderInner() {
               }
             />
           )}
-        </motion.div>
+        </main>
       ) : (
-        <motion.div
-          key="app"
-          initial={prefersReducedMotion ? { opacity: 1 } : { opacity: 0 }}
-          animate={{ opacity: 1 }}
-          transition={prefersReducedMotion ? { duration: 0 } : { duration: 0.3, ease: "easeOut" }}
-          className="bg-surface-primary h-full"
-        >
+        <div className="bg-surface-primary h-full">
           <TerminalRouterProvider>
             <App />
             <UpdateRestartOverlay />
           </TerminalRouterProvider>
-        </motion.div>
+        </div>
       )}
-    </AnimatePresence>
+    </>
   );
 }

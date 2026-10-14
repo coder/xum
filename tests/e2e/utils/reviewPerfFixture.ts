@@ -2,7 +2,7 @@ import fs from "fs";
 import path from "path";
 import { spawnSync } from "child_process";
 import { type Page } from "@playwright/test";
-import { TUTORIAL_STATE_KEY } from "../../../src/common/constants/storage";
+import type { UserPreferences } from "../../../src/common/config/schemas/userPreferences";
 
 export const LARGE_CHANGE_ROOT = "src/review/perf-large-change";
 const LARGE_CHANGE_GROUP_COUNT = 20;
@@ -123,26 +123,17 @@ function countGitDiffHunks(diffOutput: string): number {
   return diffOutput.split("\n").filter((line) => line.startsWith("@@ ")).length;
 }
 
-export async function disableReviewTutorial(page: Page): Promise<void> {
-  await page.evaluate((tutorialStateKey) => {
-    const raw = window.localStorage.getItem(tutorialStateKey);
-    const parsed = raw
-      ? (JSON.parse(raw) as { disabled?: boolean; completed?: Record<string, boolean> })
-      : null;
-    window.localStorage.setItem(
-      tutorialStateKey,
-      JSON.stringify({
-        disabled: parsed?.disabled ?? false,
-        completed: {
-          ...(parsed?.completed ?? {}),
-          review: true,
-        },
-      })
-    );
-  }, TUTORIAL_STATE_KEY);
-
-  await page.reload();
-  await page.waitForLoadState("domcontentloaded");
+/** Writes review preferences through the backend into the test root's config.json. */
+export async function setReviewPreferences(
+  page: Page,
+  review: NonNullable<UserPreferences["review"]>
+): Promise<void> {
+  await page.waitForFunction(() => Boolean(window.__ORPC_CLIENT__));
+  await page.evaluate(async (patch) => {
+    const api = window.__ORPC_CLIENT__;
+    if (!api) throw new Error("E2E API client not initialized");
+    await api.config.updateUserPreferences({ patches: [{ review: patch }] });
+  }, review);
 }
 
 export function seedLargeReviewDiff(

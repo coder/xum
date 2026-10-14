@@ -276,6 +276,64 @@ export function resolveCoderGatewayProvider(
 }
 
 /**
+ * Canonical providers whose native models (anthropic:<model>, ...) the user
+ * can map to a same-type AI Gateway instance via `coder.canonicalRoutes`.
+ */
+export const CODER_CANONICAL_ROUTE_ORIGINS = ["anthropic", "openai", "google"] as const;
+export type CoderCanonicalRouteOrigin = (typeof CODER_CANONICAL_ROUTE_ORIGINS)[number];
+export type CoderCanonicalRoutes = Partial<Record<CoderCanonicalRouteOrigin, string>>;
+
+function isCoderCanonicalRouteOrigin(value: string): value is CoderCanonicalRouteOrigin {
+  return (CODER_CANONICAL_ROUTE_ORIGINS as readonly string[]).includes(value);
+}
+
+/** Parse persisted (hand-editable) `canonicalRoutes`: known origins with non-empty names only. */
+export function parseCoderCanonicalRoutes(value: unknown): CoderCanonicalRoutes {
+  const routes: CoderCanonicalRoutes = {};
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return routes;
+  }
+  for (const [origin, instance] of Object.entries(value as Record<string, unknown>)) {
+    if (isCoderCanonicalRouteOrigin(origin) && typeof instance === "string" && instance) {
+      routes[origin] = instance;
+    }
+  }
+  return routes;
+}
+
+/**
+ * The AI Gateway instance serving a canonical origin when routing picks
+ * Coder, or null when the origin is not routable through Coder.
+ * A mapping is honored only for a KNOWN instance whose type equals the origin:
+ * falling back to the default-named instance would silently send traffic to
+ * an upstream the user moved away from, and a guessed type would speak the
+ * wrong wire. Without a mapping, anthropic/openai keep the default-named
+ * instance; google has no default because its instances are custom-named.
+ */
+export function resolveCoderCanonicalRouteInstance(
+  origin: string,
+  coderConfig:
+    | { canonicalRoutes?: unknown; discoveredProviders?: unknown; additionalProviders?: unknown }
+    | undefined
+): string | null {
+  if (!isCoderCanonicalRouteOrigin(origin)) {
+    return null;
+  }
+  const mapped = parseCoderCanonicalRoutes(coderConfig?.canonicalRoutes)[origin];
+  if (mapped == null) {
+    return origin === "google" ? null : origin;
+  }
+  const provider =
+    parseCoderGatewayProviders(coderConfig?.additionalProviders).find(
+      (entry) => entry.name === mapped
+    ) ??
+    parseCoderGatewayProviders(coderConfig?.discoveredProviders).find(
+      (entry) => entry.name === mapped
+    );
+  return provider?.type === origin ? provider.name : null;
+}
+
+/**
  * Normalize a user-supplied deployment URL: require http(s), strip trailing
  * slashes and any path/query/fragment noise. Returns null when invalid.
  */

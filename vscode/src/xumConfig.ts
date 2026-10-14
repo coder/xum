@@ -37,7 +37,7 @@ export interface WorkspaceWithContext extends FrontendWorkspaceMetadata {
   extensionMetadata?: ExtensionMetadata;
 }
 
-function enrichAndSort(
+export function enrichAndSort(
   workspaces: FrontendWorkspaceMetadata[],
   extensionMeta: Map<string, ExtensionMetadata>
 ): WorkspaceWithContext[] {
@@ -104,6 +104,7 @@ export async function getAllWorkspacesFromApi(
       streaming: activity.streaming,
       lastModel: activity.lastModel,
       lastThinkingLevel: activity.lastThinkingLevel,
+      agentStatus: null,
     });
   }
 

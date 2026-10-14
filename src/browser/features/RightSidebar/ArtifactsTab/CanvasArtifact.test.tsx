@@ -1,0 +1,371 @@
+// Bootstrap Happy DOM before react-dom evaluates (see MemoryTab.test.tsx).
+import "../../../../../tests/ui/dom";
+
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { useState, type ReactNode } from "react";
+import { installDom } from "../../../../../tests/ui/dom";
+import { APIProvider } from "@/browser/contexts/API";
+import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import { createTestApiClient } from "@/browser/testUtils";
+import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
+import { getArtifactKind } from "@/common/utils/artifactKind";
+import { ARTIFACT_ASSET_LIMITS } from "./artifactAssets";
+import { CanvasArtifact } from "./CanvasArtifact";
+import {
+  CANVAS_MAX_BLOCKS,
+  CANVAS_MAX_CHART_SERIES,
+  chartSeries,
+  parseCanvas,
+  resolveJsonPointer,
+} from "./canvasSpec";
+import type { JsonValue } from "./jsonData";
+
+function ok(path: string, content: string): ArtifactReadResult {
+  return {
+    status: "ok",
+    path,
+    kind: getArtifactKind(path),
+    size: content.length,
+    modifiedMs: 1,
+    encoding: "utf8",
+    content,
+  };
+}
+
+let files: Record<string, ArtifactReadResult> = {};
+let readPaths: string[] = [];
+
+function Wrapper(props: { children: ReactNode }) {
+  // One client per mount, as in the app: a fresh client on every rerender would re-run every
+  // effect that depends on the API and hide missing reload dependencies.
+  const [api] = useState(() =>
+    createTestApiClient({
+      artifacts: {
+        read: (input: { workspaceId: string; path: string }) => {
+          readPaths.push(input.path);
+          const file = files[input.path];
+          return Promise.resolve(
+            file
+              ? { success: true as const, data: file }
+              : { success: false as const, error: `Artifact not found: ${input.path}` }
+          );
+        },
+      },
+    })
+  );
+  return (
+    <ThemeProvider forcedTheme="dark">
+      <APIProvider client={api}>{props.children}</APIProvider>
+    </ThemeProvider>
+  );
+}
+
+function canvas(blocks: unknown[]): string {
+  return JSON.stringify({ $xum: "canvas", blocks });
+}
+
+describe("parseCanvas", () => {
+  test("keeps valid blocks and marks unknown or malformed ones per block", () => {
+    const parsed = parseCanvas(
+      canvas([{ type: "stat", label: "Runs", value: 3 }, { type: "widget" }, { type: "chart" }, 7])
+    );
+    expect(parsed.ok && parsed.blocks).toEqual([
+      { type: "stat", label: "Runs", value: 3 },
+      { type: "unsupported", blockType: "widget" },
+      { type: "invalid", blockType: "chart" },
+      { type: "unsupported", blockType: "" },
+    ]);
+  });
+
+  test("rejects invalid JSON and documents that are not canvases", () => {
+    expect(parseCanvas("{oops")).toEqual({ ok: false, reason: "not_json" });
+    expect(parseCanvas(JSON.stringify({ $xum: "table", blocks: [] }))).toEqual({
+      ok: false,
+      reason: "not_canvas",
+    });
+  });
+});
+
+describe("chartSeries", () => {
+  test("plots at most CANVAS_MAX_CHART_SERIES series and counts the rest", () => {
+    const many = Array.from({ length: 10_000 }, (_, i) => `s${i}`);
+    expect(chartSeries(many)).toEqual({
+      series: many.slice(0, CANVAS_MAX_CHART_SERIES),
+      total: 10_000,
+    });
+    expect(chartSeries("v")).toEqual({ series: ["v"], total: 1 });
+  });
+});
+
+describe("resolveJsonPointer", () => {
+  const document: JsonValue = { "a/b": { "m~n": [1, { x: 2 }], "~1": "tilde-one" }, "": 5 };
+
+  test("follows RFC 6901 tokens, escapes and array indexes", () => {
+    expect(resolveJsonPointer(document, "")).toEqual({ ok: true, value: document });
+    expect(resolveJsonPointer(document, "/a~1b/m~0n/1/x")).toEqual({ ok: true, value: 2 });
+    // "~01" decodes to the key "~1", not to "~/".
+    expect(resolveJsonPointer(document, "/a~1b/~01")).toEqual({ ok: true, value: "tilde-one" });
+    expect(resolveJsonPointer(document, "/")).toEqual({ ok: true, value: 5 });
+  });
+
+  test("reports missing targets and malformed pointers", () => {
+    for (const pointer of [
+      "/missing",
+      "/a~1b/m~0n/2",
+      "/a~1b/m~0n/01",
+      "/a~1b/m~0n/-",
+      "/a~2",
+      "x",
+    ]) {
+      expect(resolveJsonPointer(document, pointer).ok).toBe(false);
+    }
+  });
+});
+
+describe("CanvasArtifact", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+    files = {};
+    readPaths = [];
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  function renderCanvas(
+    content: string,
+    interactions?: { requestSend: (t: string, d?: unknown) => void }
+  ) {
+    return render(
+      <CanvasArtifact
+        content={content}
+        path="reports/q3.canvas.json"
+        workspaceId="ws-canvas"
+        interactions={interactions}
+      />,
+      { wrapper: Wrapper }
+    );
+  }
+
+  test("shows the source for a file that is not a canvas", () => {
+    const content = JSON.stringify({ $xum: "nope" });
+    const view = renderCanvas(content);
+    expect(view.getByText(content)).toBeTruthy();
+    expect(view.queryByTestId("canvas-artifact")).toBeNull();
+  });
+
+  test("renders unsupported blocks as a notice next to the supported ones", () => {
+    const view = renderCanvas(
+      canvas([{ type: "stat", label: "Latency", value: "142 ms" }, { type: "widget" }])
+    );
+    expect(view.getByText("142 ms")).toBeTruthy();
+    expect(view.getByText("Unsupported block: widget")).toBeTruthy();
+  });
+
+  test("reads contained refs only, and reports escaping, external and missing ones", async () => {
+    files["reports/data/s.json"] = ok(
+      "reports/data/s.json",
+      JSON.stringify({ series: [{ q: "Q1", v: 1 }] })
+    );
+    const view = renderCanvas(
+      canvas([
+        { type: "chart", kind: "bar", data: "data/s.json#/series", x: "q", y: "v", title: "Good" },
+        { type: "chart", kind: "line", data: "data/s.json#/nope", x: "q", y: "v" },
+        { type: "chart", kind: "bar", data: "../../secret.json#/x", x: "q", y: "v" },
+        { type: "image", src: "https://tracker.example/p.png" },
+        { type: "diff", patch: "../../etc/passwd" },
+      ])
+    );
+    expect(view.getByText("Reference leaves the artifacts folder: ../../secret.json")).toBeTruthy();
+    expect(view.getByText("Reference leaves the artifacts folder: ../../etc/passwd")).toBeTruthy();
+    expect(
+      view.getByText(
+        "Only files in the artifacts folder can be referenced: https://tracker.example/p.png"
+      )
+    ).toBeTruthy();
+    expect(await view.findByText("Nothing at JSON pointer /nope")).toBeTruthy();
+    expect(view.getByText("Good")).toBeTruthy();
+    // Both charts share one read of the contained file; nothing else is requested.
+    expect(readPaths).toEqual(["reports/data/s.json"]);
+  });
+
+  test("a panel refresh re-reads referenced files and shows their new data", async () => {
+    files["reports/data/s.json"] = ok(
+      "reports/data/s.json",
+      JSON.stringify({ series: [{ q: "Q1", v: 1 }] })
+    );
+    const content = canvas([
+      { type: "chart", kind: "bar", data: "data/s.json#/series", x: "q", y: "v", title: "Q" },
+    ]);
+    const element = (reloadToken: number) => (
+      <CanvasArtifact
+        content={content}
+        path="reports/q3.canvas.json"
+        workspaceId="ws-canvas"
+        reloadToken={reloadToken}
+      />
+    );
+    const view = render(element(0), { wrapper: Wrapper });
+    expect(await view.findByText("Q")).toBeTruthy();
+    // The agent rewrites the data file; the canvas file itself is unchanged.
+    files["reports/data/s.json"] = ok("reports/data/s.json", JSON.stringify({ other: [] }));
+    view.rerender(element(1));
+    expect(await view.findByText("Nothing at JSON pointer /series")).toBeTruthy();
+    expect(readPaths).toEqual(["reports/data/s.json", "reports/data/s.json"]);
+  });
+
+  test("charts that share one data file parse it once", async () => {
+    const content = JSON.stringify({ a: [{ q: "Q1", v: 1 }], b: [{ q: "Q2", v: 2 }] });
+    files["reports/data/s.json"] = ok("reports/data/s.json", content);
+    const parse = spyOn(JSON, "parse");
+    try {
+      const view = renderCanvas(
+        canvas(
+          ["A", "B", "C", "D"].map((title, i) => ({
+            type: "chart",
+            kind: "bar",
+            data: `data/s.json#/${i % 2 === 0 ? "a" : "b"}`,
+            x: "q",
+            y: "v",
+            title,
+          }))
+        )
+      );
+      expect(await view.findByText("D")).toBeTruthy();
+      // Many blocks may point at one large file; each extra parse is a full synchronous pass.
+      expect(parse.mock.calls.filter((call) => call[0] === content)).toHaveLength(1);
+    } finally {
+      parse.mockRestore();
+    }
+  });
+
+  test("a chart with too many series says how many it plots", () => {
+    const y = Array.from({ length: 10_000 }, (_, i) => `s${i}`);
+    const view = renderCanvas(
+      canvas([{ type: "chart", kind: "line", data: [{ q: 1 }], x: "q", y }])
+    );
+    expect(view.getByText(`Showing first ${CANVAS_MAX_CHART_SERIES} of 10000 series`)).toBeTruthy();
+  });
+
+  test("renders at most CANVAS_MAX_BLOCKS blocks and says how many it left out", () => {
+    const blocks = Array.from({ length: CANVAS_MAX_BLOCKS + 25 }, (_, i) => ({
+      type: "markdown",
+      text: `block-${i}`,
+    }));
+    const view = renderCanvas(canvas(blocks));
+    expect(view.getByText(`block-${CANVAS_MAX_BLOCKS - 1}`)).toBeTruthy();
+    expect(view.queryByText(`block-${CANVAS_MAX_BLOCKS}`)).toBeNull();
+    expect(
+      view.getByText(`Showing the first ${CANVAS_MAX_BLOCKS} blocks; 25 more are not shown.`)
+    ).toBeTruthy();
+  });
+
+  function image(path: string, size: number): ArtifactReadResult {
+    return {
+      status: "ok",
+      path,
+      kind: getArtifactKind(path),
+      size,
+      modifiedMs: 1,
+      encoding: "base64",
+      content: "iVBORw==",
+    };
+  }
+
+  test("Markdown blocks read a shared image once", async () => {
+    files["reports/img/p.png"] = image("reports/img/p.png", 4);
+    const view = renderCanvas(
+      canvas([1, 2, 3].map((i) => ({ type: "markdown", text: `# H${i}\n\n![p](img/p.png)` })))
+    );
+    expect(await view.findByText("H3")).toBeTruthy();
+    await waitFor(() =>
+      expect(view.container.querySelectorAll('img[src^="data:"]')).toHaveLength(3)
+    );
+    expect(readPaths).toEqual(["reports/img/p.png"]);
+  });
+
+  test("Markdown blocks share one asset budget across the canvas", async () => {
+    // Four 5 MiB images in four blocks: the canvas-wide 15 MiB budget admits three of them.
+    const size = ARTIFACT_ASSET_LIMITS.maxAssetBytes;
+    for (const name of ["a", "b", "c", "d"]) {
+      files[`reports/img/${name}.png`] = image(`reports/img/${name}.png`, size);
+    }
+    const view = renderCanvas(
+      canvas(
+        ["a", "b", "c", "d"].map((name) => ({
+          type: "markdown",
+          text: `# ${name.toUpperCase()}\n\n![${name}](img/${name}.png)`,
+        }))
+      )
+    );
+    expect(await view.findByText("D")).toBeTruthy();
+    await waitFor(() => expect(readPaths).toHaveLength(4));
+    await waitFor(() => expect(view.queryAllByText("Loading…")).toHaveLength(0));
+    expect(view.container.querySelectorAll('img[src^="data:"]')).toHaveLength(3);
+  });
+
+  test("refreshes re-read data files but keep images, within one budget", async () => {
+    // A full canvas budget: one 5 MiB data file and two 5 MiB images.
+    const size = ARTIFACT_ASSET_LIMITS.maxAssetBytes;
+    files["reports/data/s.json"] = {
+      ...ok("reports/data/s.json", JSON.stringify({ series: [{ q: "Q1", v: 1 }] })),
+      size,
+    };
+    files["reports/img/a.png"] = image("reports/img/a.png", size);
+    files["reports/img/b.png"] = image("reports/img/b.png", size);
+    const content = canvas([
+      { type: "chart", kind: "bar", data: "data/s.json#/series", x: "q", y: "v", title: "Q" },
+      { type: "markdown", text: "# A\n\n![a](img/a.png)" },
+      { type: "markdown", text: "# B\n\n![b](img/b.png)" },
+    ]);
+    const element = (reloadToken: number) => (
+      <CanvasArtifact
+        content={content}
+        path="reports/q3.canvas.json"
+        workspaceId="ws-canvas"
+        reloadToken={reloadToken}
+      />
+    );
+    const view = render(element(0), { wrapper: Wrapper });
+    await waitFor(() =>
+      expect(view.container.querySelectorAll('img[src^="data:"]')).toHaveLength(2)
+    );
+    for (const tick of [1, 2, 3]) {
+      view.rerender(element(tick));
+      await waitFor(() =>
+        expect(readPaths.filter((p) => p === "reports/data/s.json")).toHaveLength(tick + 1)
+      );
+    }
+    // Polls re-read the data file only; the images stay cached.
+    expect(readPaths.filter((p) => p.startsWith("reports/img/"))).toEqual([
+      "reports/img/a.png",
+      "reports/img/b.png",
+    ]);
+    // Each re-read replaces the earlier one in the budget instead of adding to it.
+    expect(view.queryByText(/limit reached/)).toBeNull();
+    expect(view.getByText("Q")).toBeTruthy();
+    expect(view.queryByText("Could not read data/s.json (asset size limit reached).")).toBeNull();
+  });
+
+  test("buttons only exist with interactions and send only when clicked", () => {
+    const content = canvas([
+      { type: "button", label: "Rerun", send: "rerun the report", data: { quarter: "Q3" } },
+    ]);
+    const readOnly = renderCanvas(content);
+    expect(readOnly.queryByRole("button", { name: "Rerun" })).toBeNull();
+    cleanup();
+
+    const requestSend = mock((_text: string, _data?: unknown) => undefined);
+    const view = renderCanvas(content, { requestSend });
+    const button = view.getByRole("button", { name: "Rerun" });
+    expect(requestSend).not.toHaveBeenCalled();
+    fireEvent.click(button);
+    expect(requestSend.mock.calls).toEqual([["rerun the report", { quarter: "Q3" }]]);
+  });
+});

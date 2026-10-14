@@ -257,9 +257,17 @@ beforeEach(async () => {
     const config = createTestToolConfig(fixture.tempDir, { workspaceId });
     config.historyService = fixture.historyService;
     const tool = createSessionHistoryTool(config);
-    return TOOL_DEFINITIONS.session_history.resultSchema.parse(
+    const result = TOOL_DEFINITIONS.session_history.resultSchema.parse(
       await tool.execute!(input, { ...mockToolCallOptions, abortSignal })
     );
+    // Every item reports its start, and a continuation resumes exactly where its text ends.
+    for (const item of result.items ?? []) {
+      expect(typeof item.startCharOffset).toBe("number");
+      if (item.nextCharOffset !== undefined) {
+        expect(item.startCharOffset! + item.text.length).toBe(item.nextCharOffset);
+      }
+    }
+    return result;
   };
   await append("first", "opening facts");
 });
@@ -1197,19 +1205,6 @@ describe("session_history real disk recovery", () => {
     ]);
   });
 
-  test("a malformed reset appended between chunks restarts the read behind it", async () => {
-    await append("one", "match one");
-    await append("two", "match two");
-    expect(
-      await searchInterleaved("match", () =>
-        appendRawRows([
-          '{"metadata":{"contextBoundaryKind":"reset"},"parts":[',
-          createMuxMessage("after", "assistant", "match after"),
-        ])
-      )
-    ).toEqual(["match after"]);
-  });
-
   test("lists root, sequenced compactions, heartbeat/rollover windows and legacy IDs", async () => {
     const compact = await append("compact", "summary", {
       compacted: "user",
@@ -1646,6 +1641,7 @@ describe("session_history real disk recovery", () => {
         const item = page.items![0];
         expect(Buffer.from(item.text, "utf8").toString("utf8")).toBe(item.text);
         expect(item.text.length).toBeGreaterThan(0);
+        expect(item.startCharOffset).toBe(offset);
         recovered += item.text;
         if (item.nextCharOffset !== undefined) {
           expect(item.nextCharOffset).toBeGreaterThan(offset);
@@ -1688,6 +1684,52 @@ describe("session_history real disk recovery", () => {
     expect(end).toEqual({ success: false, error: "item_not_found" });
   });
 
+  test("read_item reports its actual start after pair rounding and clamping", async () => {
+    const text = "A😀B" + "c".repeat(20);
+    const message = await append("start-offsets", text);
+    const read = async (offset: number) =>
+      (
+        await itemsOf({
+          action: "read_item",
+          item_id: String(message.metadata!.historySequence),
+          offset_chars: offset,
+          limit_chars: 4,
+        })
+      )[0];
+    expect(await read(0)).toMatchObject({ startCharOffset: 0, text: "A😀B", nextCharOffset: 4 });
+    expect(await read(8)).toMatchObject({ startCharOffset: 8, text: "cccc", nextCharOffset: 12 });
+    // Inside the pair: rounded back one unit so the character stays whole.
+    expect(await read(2)).toMatchObject({ startCharOffset: 1, text: "😀Bc", nextCharOffset: 5 });
+    // Past the end: clamped to the row length, an empty final page.
+    const past = await read(100);
+    expect(past).toMatchObject({ startCharOffset: text.length, text: "" });
+    expect(past.nextCharOffset).toBeUndefined();
+  });
+
+  test("search snippets report a mid-row start even when they reach the row end", async () => {
+    // max_chars_per_item 40 allows up to 20 lead-in characters before the match.
+    const whole = `${"x".repeat(20)}needle end`; // the match sits exactly lead-in chars in
+    const suffix = `${"y".repeat(30)}needle end`;
+    const early = "an early needle";
+    const long = `${"z".repeat(50)}needle${"w".repeat(50)}`;
+    for (const [id, text] of [
+      ["whole", whole],
+      ["suffix", suffix],
+      ["early", early],
+      ["long", long],
+    ])
+      await append(id, text);
+    const found = await itemsOf({ action: "search", query: "needle", max_chars_per_item: 40 });
+    expect(found.map((item) => [item.startCharOffset, item.text, item.nextCharOffset])).toEqual([
+      // Same shape (20 chars before the match, reaches the end); only the start tells them apart.
+      [0, whole, undefined],
+      [10, suffix.slice(10), undefined],
+      // Less context than the lead-in: the snippet starts at the row start.
+      [0, early, undefined],
+      [30, long.slice(30, 70), 70],
+    ]);
+  });
+
   test("JSON-budget shrinking preserves emoji pairs and exact continuation offsets", async () => {
     const text = '"\\'.repeat(100) + "😀".repeat(4501);
     const message = await append("budget-astral", text);
@@ -1707,6 +1749,8 @@ describe("session_history real disk recovery", () => {
       const item = page.items![0];
       expect(Buffer.from(item.text, "utf8").toString("utf8")).toBe(item.text);
       expect(item.text.length).toBeGreaterThan(0);
+      // Shrinking moves only the end: the page still starts at the requested offset.
+      expect(item.startCharOffset).toBe(offset);
       recovered += item.text;
       shrank ||= page.truncated === true;
       if (item.nextCharOffset !== undefined) {
@@ -2501,44 +2545,85 @@ describe("session_history real disk recovery", () => {
     expect(twice.chunks).toBe(2);
   });
 
-  test("an in-place anchor mutation between chunks restarts once from the fresh baseline", async () => {
+  // Between-chunk mutation x outcome. Each mutation lands after the first (intermediate)
+  // chunk of one search; the call restarts once from the fresh baseline and answers behind
+  // any new privacy floor, and a fresh read afterwards agrees with it.
+  test.each<
+    [
+      string,
+      {
+        mutate: () => Promise<unknown>;
+        texts: string[];
+        warnings?: SessionHistoryResult["warnings"];
+      },
+    ]
+  >([
+    [
+      "an in-place anchor rewrite leaves the first row malformed",
+      {
+        mutate: async () => {
+          const handle = await fs.open(chatPath, "r+");
+          try {
+            await handle.write(Buffer.from("!"), 0, 1, 0);
+          } finally {
+            await handle.close();
+          }
+        },
+        texts: ["match one", "match two"],
+        warnings: ["malformed_rows_skipped"],
+      },
+    ],
+    [
+      // A cross-process append without rotation must still invalidate privacy, rather
+      // than relying on inode replacement as the gate.
+      "a raw manual reset without rotation is a new floor",
+      {
+        mutate: () =>
+          appendRawRows([
+            manualReset("reset"),
+            createMuxMessage("after", "assistant", "match after"),
+          ]),
+        texts: ["match after"],
+      },
+    ],
+    [
+      // HistoryService rotates the sealed prefix into the archive on a boundary write.
+      "a rotating manual reset is a new floor",
+      {
+        mutate: async () => {
+          await append("reset", "", { contextBoundaryKind: "reset", synthetic: true });
+          await append("after", "match after");
+        },
+        texts: ["match after"],
+      },
+    ],
+    [
+      "a malformed reset is a new floor",
+      {
+        mutate: () =>
+          appendRawRows([
+            '{"metadata":{"contextBoundaryKind":"reset"},"parts":[',
+            createMuxMessage("after", "assistant", "match after"),
+          ]),
+        texts: ["match after"],
+        warnings: ["malformed_rows_skipped"],
+      },
+    ],
+  ])("between chunks: %s", async (_name, { mutate, texts, warnings }) => {
     await append("one", "match one");
     await seedFiller();
     await append("two", "match two");
-    const seam = mutateBetweenChunks(async () => {
-      const handle = await fs.open(chatPath, "r+");
-      try {
-        await handle.write(Buffer.from("!"), 0, 1, 0);
-      } finally {
-        await handle.close();
-      }
-    });
+    const seam = mutateBetweenChunks(mutate);
+    let result: SessionHistoryResult;
     try {
-      // The first row ("opening facts") is malformed now; the rest is read from the new baseline.
-      const result = await complete({ action: "search", query: "match" });
-      expect(result.items?.map((item) => item.text)).toEqual(["match one", "match two"]);
-      expect(result.warnings).toEqual(["malformed_rows_skipped"]);
+      result = await complete({ action: "search", query: "match" });
     } finally {
       seam.restore();
     }
+    expect(result.items?.map((item) => item.text)).toEqual(texts);
+    expect(result.warnings).toEqual(warnings);
     expectIntermediate(seam);
-  });
-
-  test("a manual reset appended between chunks without rotation restarts behind it", async () => {
-    await append("one", "match one");
-    await seedFiller();
-    await append("two", "match two");
-    // Simulate a cross-process append without rotation: the reset must still
-    // invalidate privacy, rather than relying on inode replacement as the gate.
-    const seam = mutateBetweenChunks(() =>
-      appendRawRows([manualReset("reset"), createMuxMessage("after", "assistant", "match after")])
-    );
-    try {
-      expect(await textsOf({ action: "search", query: "match" })).toEqual(["match after"]);
-    } finally {
-      seam.restore();
-    }
-    expectIntermediate(seam);
+    expect(await textsOf({ action: "search", query: "match" })).toEqual(texts);
   });
 
   test("below-watermark repaired and imported active rows survive bounded recovery chunks", async () => {
@@ -3918,22 +4003,6 @@ describe("session_history complete results", () => {
     }
   });
 
-  test("a manual reset appended between chunks restarts the read from the new floor", async () => {
-    await append("one", "match one");
-    await seedFiller();
-    const seam = mutateBetweenChunks(async () => {
-      await append("reset", "", { contextBoundaryKind: "reset", synthetic: true });
-      await append("after", "match after reset");
-    });
-    try {
-      expect(await textsOf({ action: "search", query: "match" })).toEqual(["match after reset"]);
-    } finally {
-      seam.restore();
-    }
-    expectIntermediate(seam);
-    expect(await textsOf({ action: "search", query: "match" })).toEqual(["match after reset"]);
-  });
-
   test("a second invalidation during the restarted read returns history_changed without data", async () => {
     await append("one", "match one");
     await seedFiller();
@@ -3953,28 +4022,6 @@ describe("session_history complete results", () => {
     expect(await textsOf({ action: "search", query: "match" })).toEqual(["match after reset 2"]);
   });
 
-  test("one in-place rewrite between chunks restarts once from the fresh baseline", async () => {
-    await append("one", "match one");
-    await seedFiller();
-    const seam = mutateBetweenChunks(async () => {
-      const handle = await fs.open(chatPath, "r+");
-      try {
-        await handle.write(Buffer.from("!"), 0, 1, 0);
-      } finally {
-        await handle.close();
-      }
-    });
-    try {
-      // The first row is now malformed; the rest of the fresh baseline is delivered.
-      const result = await complete({ action: "search", query: "match" });
-      expect(result.items?.map((item) => item.text)).toEqual(["match one"]);
-      expect(result.warnings).toEqual(["malformed_rows_skipped"]);
-    } finally {
-      seam.restore();
-    }
-    expectIntermediate(seam);
-  });
-
   test("a first invalidation with no time left is history_timeout, not history_changed", async () => {
     await append("one", "match one");
     await seedFiller();
@@ -3992,11 +4039,6 @@ describe("session_history complete results", () => {
     }
     expect(seam.runs).toBe(1);
     expect(readsOf(workspaceId)).toBe(2);
-  });
-
-  test("an unresolved truncate marker is history_changed after the single restart", async () => {
-    await fs.writeFile(`${archivePath}.truncate`, "pending transaction");
-    expect(await call({ action: "search", query: "opening facts" })).toEqual(CHANGED_RESULT);
   });
 });
 

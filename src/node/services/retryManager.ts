@@ -1,7 +1,7 @@
 import { Duration, Effect, Fiber } from "effect";
 import assert from "@/common/utils/assert";
 import {
-  calculateBackoffDelay,
+  calculateRetryDelay,
   createFailedRetryState,
   createFreshRetryState,
   type RetryState,
@@ -15,6 +15,8 @@ import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 export interface RetryFailureError {
   type: string;
   message?: string;
+  /** Provider-requested wait (Retry-After) for a rate-limited stream; see calculateRetryDelay. */
+  retryAfterMs?: number;
 }
 
 // Status events emitted during auto-retry lifecycle
@@ -112,7 +114,7 @@ export class RetryManager {
     // If a retry is already pending, cancel it and reschedule with updated backoff.
     // This can happen when multiple error events arrive before the timer fires.
     this.state = createFailedRetryState(this.state.attempt, error);
-    const delay = calculateBackoffDelay(this.state.attempt);
+    const delay = calculateRetryDelay(this.state.attempt, error.retryAfterMs);
 
     const scheduledEvent: AutoRetryScheduledEvent = {
       type: "auto-retry-scheduled",
@@ -138,7 +140,7 @@ export class RetryManager {
    * the same observable ordering as the previous `setTimeout` call.
    *
    * The backoff policy itself stays the hand-rolled pure
-   * `calculateBackoffDelay`: attempts are driven by external stream events
+   * `calculateRetryDelay`: attempts are driven by external stream events
    * (not by retrying an effect), so an Effect `Schedule` would only re-encode
    * the same shared one-liner behind effectful stepping machinery.
    */
@@ -254,20 +256,27 @@ export class RetryManager {
     this.interruptRetryFiber();
   }
 
+  /**
+   * Cancel any pending/in-flight retry and, when one existed, notify the frontend so the UI
+   * clears the retry status (e.g., "Retrying…" or countdown). A bare cancel() is silent: the
+   * renderer only leaves its retry state on a stream start/end or a terminal retry event, so a
+   * silent cancel of a scheduled retry strands it on "Retrying… (attempt N)".
+   */
+  abandon(reason: string): void {
+    assert(reason.length > 0, "RetryManager.abandon: reason must be non-empty");
+    // Check state.attempt rather than isRetryPending because the timer may
+    // have already fired (retryTimer is null) while the onRetry callback is
+    // still executing — the UI would otherwise remain stuck in retry state.
+    const hadActiveRetry = this.isRetryPending || this.state.attempt > 0;
+    this.cancel();
+    if (hadActiveRetry) {
+      this.onStatusChange({ type: "auto-retry-abandoned", reason });
+    }
+  }
+
   setEnabled(enabled: boolean): void {
     this.enabled = enabled;
-    if (!enabled) {
-      // Cancel any pending/in-flight retry and notify the frontend so the UI
-      // clears the retry status (e.g., "Retrying…" or countdown).
-      // Check state.attempt rather than isRetryPending because the timer may
-      // have already fired (retryTimer is null) while the onRetry callback is
-      // still executing — the UI would otherwise remain stuck in retry state.
-      const hadActiveRetry = this.isRetryPending || this.state.attempt > 0;
-      this.cancel();
-      if (hadActiveRetry) {
-        this.onStatusChange({ type: "auto-retry-abandoned", reason: "disabled_by_user" });
-      }
-    }
+    if (!enabled) this.abandon("disabled_by_user");
   }
 
   get isRetryPending(): boolean {

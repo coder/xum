@@ -95,6 +95,7 @@ async function runOrchestrateFork(params: {
     projectPath: PROJECT_ONE_PATH,
     sourceWorkspaceName: SOURCE_WORKSPACE_NAME,
     newWorkspaceName: NEW_WORKSPACE_NAME,
+    newWorkspaceId: "ws-new",
     initLogger: createInitLogger(),
     config:
       params.config ??
@@ -272,6 +273,7 @@ describe("orchestrateFork (multi-project)", () => {
       success: true,
       workspacePath: "/tmp/child/project-one",
       sourceBranch: "main",
+      createdBranch: true,
     } satisfies WorkspaceForkResult);
     projectTwoRuntime.forkWorkspace.mockResolvedValue({
       success: true,
@@ -300,14 +302,17 @@ describe("orchestrateFork (multi-project)", () => {
       NEW_WORKSPACE_NAME,
       false,
       undefined,
-      true
+      true,
+      { keepBranch: false }
     );
     expect(projectTwoRuntime.deleteWorkspace).toHaveBeenCalledWith(
       PROJECT_TWO_PATH,
       NEW_WORKSPACE_NAME,
       false,
       undefined,
-      true
+      true,
+      // Project two's fork did not report making the branch, so rollback keeps it (#4775).
+      { keepBranch: true }
     );
     expect(removeContainerMock).not.toHaveBeenCalled();
   });
@@ -599,6 +604,7 @@ describe("orchestrateFork (multi-project)", () => {
       projectPath: PROJECT_ONE_PATH,
       sourceWorkspaceName: SOURCE_WORKSPACE_NAME,
       newWorkspaceName: NEW_WORKSPACE_NAME,
+      newWorkspaceId: "ws-new",
       initLogger: createInitLogger(),
       config: createConfig({
         [PROJECT_ONE_PATH]: true,
@@ -621,7 +627,8 @@ describe("orchestrateFork (multi-project)", () => {
       NEW_WORKSPACE_NAME,
       false,
       undefined,
-      true
+      true,
+      { keepBranch: true }
     );
     expect(projectTwoRuntime.deleteWorkspace).not.toHaveBeenCalled();
     expect(createContainerMock).not.toHaveBeenCalled();

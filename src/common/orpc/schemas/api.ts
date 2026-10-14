@@ -4,6 +4,8 @@ import {
   ClaudeDesignStatusSchema,
   ClaudeDesignExperimentSnapshotSchema,
 } from "./claudeDesign";
+import { FlightRecorderStatusSchema } from "./perfFlightRecorder";
+import { ComputerUsePermissionKindSchema, ComputerUseStatusSchema } from "./computerUse";
 import { eventIterator } from "@orpc/server";
 import { UIModeSchema } from "../../types/mode";
 import { z } from "zod";
@@ -13,6 +15,7 @@ import { WORKTREE_ARCHIVE_BEHAVIORS } from "@/common/config/worktreeArchiveBehav
 import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constants/heartbeat";
 import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { MAX_RENDERED_MODELS } from "@/common/constants/ui";
 import {
   MAX_STAGED_ATTACHMENT_BASE64_CHARS,
   MAX_STAGED_ATTACHMENT_SIZE_BYTES,
@@ -22,9 +25,19 @@ import { ChatStatsSchema, SessionUsageFileSchema } from "./chatStats";
 import { AdditionalSystemContextSchema, WorkspaceInstructionsSchema } from "./instructions";
 import {
   NameGenerationErrorSchema,
+  PlanReviewErrorSchema,
   ProjectRemoveErrorSchema,
   SendMessageErrorSchema,
 } from "./errors";
+import { PlanReviewAnchorSchema } from "@/common/utils/planReview/planReviewRecord";
+import {
+  PLAN_REVIEW_MAX_BODY_CHARS,
+  PLAN_REVIEW_MAX_COMMENTS_PER_FEEDBACK,
+  PLAN_REVIEW_MAX_QUOTE_CHARS,
+  PLAN_REVIEW_MAX_REPLIES_PER_FEEDBACK,
+  PLAN_REVIEW_MAX_SUMMARY_CHARS,
+} from "@/constants/planReview";
+import { PlanReviewStateSchema } from "@/common/utils/planReview/planReviewState";
 import { BranchListResultSchema, FilePartSchema, MuxMessageSchema } from "./message";
 import {
   GoalClearInputSchema,
@@ -50,7 +63,30 @@ import {
   MemoryFileInfoSchema,
   MemorySaveErrorSchema,
 } from "./memory";
+import {
+  ArtifactCapabilitiesSchema,
+  ArtifactListingSchema,
+  ArtifactReadResultSchema,
+  ArtifactShelfListingSchema,
+  ArtifactShelfScopeSchema,
+  ArtifactVersionListSchema,
+  PinnedArtifactFilesSchema,
+} from "./artifacts";
 import { ResultSchema } from "./result";
+import {
+  McpAppToolCallRequestSchema,
+  McpAppToolCallResultSchema,
+  McpAppApproveDomainsRequestSchema,
+  McpAppEntrypointSchema,
+  McpAppModelContextRequestSchema,
+  McpAppOpenEntrypointRequestSchema,
+  McpAppViewDomainsSchema,
+  McpAppResourceReadRequestSchema,
+  McpAppViewRecordsRequestSchema,
+  McpAppViewRecordsSchema,
+  McpAppViewRequestSchema,
+  McpAppViewSchema,
+} from "./mcpApps";
 import { SshPromptEventSchema, SshPromptResponseInputSchema } from "./ssh";
 import {
   RuntimeConfigSchema,
@@ -60,10 +96,11 @@ import {
 import { SecretSchema } from "./secrets";
 import {
   CompletedMessagePartSchema,
-  ExperimentsSchema,
   HeartbeatEventSchema,
   OnChatModeSchema,
   SendMessageOptionsSchema,
+  AcpPromptCorrelationSchema,
+  SendIdLookupSchema,
   hasExactlyOneEditFence,
   EDIT_FENCE_REQUIRED_MESSAGE,
   StreamEndEventSchema,
@@ -87,21 +124,43 @@ import {
 import { BashToolResultSchema, FileTreeNodeSchema } from "./tools";
 import { WorkspaceStatsSnapshotSchema } from "./workspaceStats";
 import {
+  ReviewStateDeltaSchema,
+  ReviewStateEventSchema,
+  ReviewStateImportLegacyOutputSchema,
+  ReviewStateSectionsSchema,
+  ReviewStateUpdateOutputSchema,
+} from "./reviewState";
+import {
+  DraftBeginSendInputSchema,
+  DraftEventSchema,
+  DraftGetOutputSchema,
+  DraftImportLegacyOutputSchema,
+  DraftListEntrySchema,
+  DraftListSchema,
+  DraftResolveSendsInputSchema,
+  DraftResolveSendsOutputSchema,
+  DraftRevisionOutputSchema,
+  DraftScopeSchema,
+  DraftSetSendReceiverInputSchema,
+  DraftSetSendReceiverOutputSchema,
+  DraftSummarySchema,
+  DraftUpdateInputSchema,
+  DraftWriteOutputSchema,
+  RemovedCreationDraftSchema,
+} from "./drafts";
+import {
+  AgentMessageDispatchModeSchema,
   FrontendWorkspaceMetadataSchema,
   WorkspaceRemoveResultSchema,
+  WorkspaceRemoveWarningSchema,
   GitStatusSchema,
   ProjectRefSchema,
   WorkspaceActivitySnapshotSchema,
   WorkspaceGoalDefaultsOverrideSchema,
   WorkspaceHeartbeatSettingsSchema,
 } from "./workspace";
-import { WorkspaceAISettingsSchema } from "./workspaceAiSettings";
-import {
-  AgentSkillDescriptorSchema,
-  AgentSkillIssueSchema,
-  AgentSkillPackageSchema,
-  SkillNameSchema,
-} from "./agentSkill";
+import { WorkspaceAgentAISettingsSchema, WorkspaceAISettingsSchema } from "./workspaceAiSettings";
+import { AgentSkillListResultSchema, AgentSkillPackageSchema, SkillNameSchema } from "./agentSkill";
 import {
   AvailableWorkflowSchema,
   WorkflowRunIdSchema,
@@ -123,6 +182,9 @@ import {
   MCPRemoveGlobalParamsSchema,
   MCPRemoveParamsSchema,
   MCPServerMapSchema,
+  MCPSettingsReadInputSchema,
+  MCPSettingsSnapshotSchema,
+  MCPSettingsUpdateParamsSchema,
   MCPSetEnabledGlobalParamsSchema,
   MCPSetEnabledParamsSchema,
   MCPSetToolAllowlistGlobalParamsSchema,
@@ -139,18 +201,20 @@ import {
   AgentPluginInstallEntrySchema,
   AgentPluginInstallPreviewSchema,
   AgentPluginComponentsSchema,
+  AgentPluginHooksSchema,
   AgentPluginListItemSchema,
   AgentPluginUpdateCheckSchema,
   AgentPluginUpdateConsentSchema,
   AgentPluginUpdateReviewSchema,
 } from "./agentPlugins";
-import { PolicyGetResponseSchema } from "./policy";
 import {
   AgentAiDefaultsSchema,
+  EvaluationDefaultsSchema,
   ModelFallbacksSchema,
   UpdateChannelSchema,
 } from "../../config/schemas/appConfigOnDisk";
 import {
+  AnthropicSpeedSchema,
   CacheTtlSchema,
   CodexOauthDefaultAuthSchema,
   FastModePreviousServiceTierSchema,
@@ -159,8 +223,32 @@ import {
 import { ProviderModelEntrySchema } from "../../config/schemas/providerModelEntry";
 import { UserPreferencesSchema } from "../../config/schemas/userPreferences";
 import { TaskSettingsSchema } from "../../config/schemas/taskSettings";
-import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
+import { ThinkingLevelSchema } from "../../types/thinking";
 import { AutoModelRoutingConfigSchema } from "../../types/autoModelRouting";
+
+// Native host computer use (desktop app only)
+export const computerUse = {
+  getStatus: {
+    input: z.void(),
+    output: ComputerUseStatusSchema,
+  },
+  setEnabled: {
+    input: z.object({ workspaceId: z.string(), enabled: z.boolean() }),
+    output: ComputerUseStatusSchema,
+  },
+  toggle: {
+    input: z.object({ workspaceId: z.string() }),
+    output: ComputerUseStatusSchema,
+  },
+  requestPermission: {
+    input: z.object({ kind: ComputerUsePermissionKindSchema }),
+    output: ComputerUseStatusSchema,
+  },
+  subscribe: {
+    input: z.void(),
+    output: eventIterator(ComputerUseStatusSchema),
+  },
+};
 
 // Experiments
 export const experiments = {
@@ -168,11 +256,13 @@ export const experiments = {
     input: z.void(),
     output: eventIterator(ClaudeDesignExperimentSnapshotSchema),
   },
-  getOverrides: {
+  // Experiment control for the perf flight recorder: pushes the backend-adopted
+  // status so every renderer follows toggles made anywhere (Settings, CLI, reload).
+  onPerfFlightRecorderChange: {
     input: z.void(),
-    output: z.partialRecord(z.enum(EXPERIMENT_IDS), z.boolean()),
+    output: eventIterator(FlightRecorderStatusSchema),
   },
-  setOverride: {
+  set: {
     input: z.object({
       experimentId: z.enum(EXPERIMENT_IDS),
       enabled: z.boolean().nullish(),
@@ -185,6 +275,18 @@ export { telemetry } from "./telemetry";
 
 // Re-export analytics schemas
 export { analytics } from "./analytics";
+
+// Re-export perf flight recorder schemas
+export { perf } from "./perfFlightRecorder";
+
+// Re-export triggered CPU profile schemas
+export { perfCaptures } from "./perfCaptures";
+
+// Re-export "Report slowness" bundle schemas
+export { perfReports } from "./perfReports";
+
+// Re-export session tape command schemas
+export { sessionTapes } from "./sessionTapes";
 export { ProviderModelEntrySchema } from "../../config/schemas/providerModelEntry";
 
 // --- API Router Schemas ---
@@ -258,7 +360,7 @@ export const tokenizer = {
       workspaceId: z.string(),
       model: z.string(),
     }),
-    output: ChatStatsSchema,
+    output: ChatStatsSchema.omit({ usageHistory: true }),
   },
 };
 
@@ -297,8 +399,12 @@ export const ProviderConfigInfoSchema = z.object({
   /** OpenAI/xAI Responses storage. Set false for ZDR orgs. */
   store: z.boolean().optional(),
   webSocketTransportEnabled: z.boolean().optional(),
+  /** OpenAI-only: offer Cyber (Daybreak access program) on supported models. */
+  cyberModelEnabled: z.boolean().optional(),
   /** Anthropic-specific fields */
   cacheTtl: CacheTtlSchema.optional(),
+  /** Anthropic Fast mode preference ("fast" sends `speed: "fast"` on supported routes). */
+  speed: AnthropicSpeedSchema.optional(),
   disableBetaFeatures: z.boolean().optional(),
   /** OpenAI-only: whether Codex OAuth tokens are present in providers.jsonc */
   codexOauthSet: z.boolean().optional(),
@@ -329,17 +435,20 @@ export const ProviderConfigInfoSchema = z.object({
    */
   discoveredProviders: z.array(z.object({ name: z.string(), type: z.string() })).optional(),
   additionalProviders: z.array(z.object({ name: z.string(), type: z.string() })).optional(),
+  /** Coder-only: canonical provider -> gateway instance name (sanitized canonicalRoutes). */
+  canonicalRoutes: z.record(z.string(), z.string()).optional(),
   /**
    * Coder-only: model IDs discovered from the deployment's AI Bridge
-   * catalogs. Authoritative for gateway routing when present; `models` is the
-   * user-visible union of these and manually added entries.
+   * catalogs. Authoritative for gateway routing when present; never merged
+   * into `models`, which holds only the entries the user added.
    */
   discoveredModels: z.array(z.string()).optional(),
   /**
-   * Coder-only: model IDs the user explicitly removed. Excluded from
+   * Coder-only: legacy routing tombstones — model IDs the user removed while
+   * discovery still merged the catalog into `models`. Excluded from
    * accessibility even while the discovered catalog is unknown, so the
    * frontend mirrors the backend's routing decisions (see
-   * gatewayModelCatalog.ts).
+   * gatewayModelCatalog.ts). Never written anymore; cleared on re-add.
    */
   removedModels: z.array(z.string()).optional(),
 });
@@ -378,11 +487,6 @@ export const CustomProviderMutationErrorSchema = z.discriminatedUnion("code", [
     reason: z.string().optional(),
   }),
   z.object({
-    code: z.literal("policy_denied"),
-    message: z.string(),
-    reason: z.string().optional(),
-  }),
-  z.object({
     code: z.literal("config_repair_failed"),
     message: z.string(),
     reason: z.string().optional(),
@@ -394,7 +498,56 @@ export const CustomProviderMutationErrorSchema = z.discriminatedUnion("code", [
   }),
 ]);
 
+export const ProviderModelDiscoveryResultSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("ok"), modelIds: z.array(z.string()) }),
+  z.object({ status: z.literal("unsupported") }),
+  z.object({ status: z.literal("not-configured") }),
+  z.object({
+    status: z.literal("error"),
+    reason: z.enum([
+      "aborted",
+      "timeout",
+      "request-failed",
+      "invalid-response",
+      "limit-exceeded",
+      "stale-config",
+    ]),
+  }),
+]);
+
+export const ModelCatalogSearchInputSchema = z.object({
+  query: z.string().optional(),
+  provider: z.string().optional(),
+  offset: z.number().int().min(0).optional(),
+  // Omitted limit returns every match; paging is opt-in.
+  limit: z.number().int().min(1).max(MAX_RENDERED_MODELS).optional(),
+});
+
+export const ModelCatalogEntrySchema = z.object({
+  /** Canonical `provider:model` id. */
+  id: z.string(),
+  provider: z.string(),
+  providerModelId: z.string(),
+  contextWindowTokens: z.number().nullable(),
+  builtIn: z.boolean(),
+});
+
+export const ModelCatalogSearchResultSchema = z.object({
+  models: z.array(ModelCatalogEntrySchema),
+  /** Match count before paging. */
+  total: z.number(),
+  nextOffset: z.number().nullable(),
+});
+
 export const providers = {
+  discoverModels: {
+    input: z.object({ provider: z.string() }),
+    output: ProviderModelDiscoveryResultSchema,
+  },
+  searchModelCatalog: {
+    input: ModelCatalogSearchInputSchema,
+    output: ModelCatalogSearchResultSchema,
+  },
   addCustomProvider: {
     input: z.object({
       provider: z.string(),
@@ -449,24 +602,6 @@ export const providers = {
   },
 };
 
-// Policy (admin-enforced config)
-export const policy = {
-  get: {
-    input: z.void(),
-    output: PolicyGetResponseSchema,
-  },
-  // Subscription: emits when the effective policy changes (file refresh)
-  onChanged: {
-    input: z.void(),
-    output: eventIterator(z.void()),
-  },
-  // Force a refresh of the effective policy (re-reads MUX_POLICY_FILE or Governor policy)
-  refreshNow: {
-    input: z.void(),
-    output: ResultSchema(PolicyGetResponseSchema, z.string()),
-  },
-};
-
 // Xum Gateway OAuth (desktop login flow)
 export const muxGatewayOauth = {
   startDesktopFlow: {
@@ -518,34 +653,6 @@ export const copilotOauth = {
     output: ResultSchema(z.void(), z.string()),
   },
   cancelDeviceFlow: {
-    input: z.object({ flowId: z.string() }).strict(),
-    output: z.void(),
-  },
-};
-
-// Xum Governor OAuth (enrollment for enterprise policy service)
-export const muxGovernorOauth = {
-  startDesktopFlow: {
-    input: z.object({ governorOrigin: z.string() }).strict(),
-    output: ResultSchema(
-      z.object({
-        flowId: z.string(),
-        authorizeUrl: z.string(),
-        redirectUri: z.string(),
-      }),
-      z.string()
-    ),
-  },
-  waitForDesktopFlow: {
-    input: z
-      .object({
-        flowId: z.string(),
-        timeoutMs: z.number().int().positive().optional(),
-      })
-      .strict(),
-    output: ResultSchema(z.void(), z.string()),
-  },
-  cancelDesktopFlow: {
     input: z.object({ flowId: z.string() }).strict(),
     output: z.void(),
   },
@@ -627,9 +734,15 @@ export const coderOauth = {
     input: z.void(),
     output: ResultSchema(z.void(), z.string()),
   },
-  // Re-run AI Gateway provider/model discovery with the stored credential so
-  // newly configured providers/models appear without a re-login.
+  // Load (or re-load) the AI Gateway provider list and every instance's model
+  // catalog with the stored credential. User-triggered only: login discovers
+  // provider instances, not catalogs.
   refreshModels: {
+    input: z.void(),
+    output: ResultSchema(z.void(), z.string()),
+  },
+  // Re-list the deployment's AI Gateway provider instances only (no catalogs).
+  refreshProviders: {
     input: z.void(),
     output: ResultSchema(z.void(), z.string()),
   },
@@ -720,7 +833,8 @@ export const mcpOauth = {
     output: z.void(),
   },
   getAuthStatus: {
-    input: z.object({ serverUrl: z.string() }).strict(),
+    /** `serverName` applies that configured server's plugin client (see getAuthStatusForApi). */
+    input: z.object({ serverUrl: z.string(), serverName: z.string().optional() }).strict(),
     output: z.object({
       serverUrl: z.string().optional(),
       isLoggedIn: z.boolean(),
@@ -791,7 +905,10 @@ export const projects = {
   },
   remove: {
     input: z.object({ projectPath: z.string(), force: z.boolean().nullish() }).passthrough(),
-    output: ResultSchema(z.void(), ProjectRemoveErrorSchema),
+    output: ResultSchema(
+      z.object({ removedCreationDrafts: z.array(RemovedCreationDraftSchema) }),
+      ProjectRemoveErrorSchema
+    ),
   },
   // Read-only preflight for the delete confirmation dialog: projects.list no
   // longer embeds archived workspaces, so blocker counts come from the backend.
@@ -1023,6 +1140,29 @@ export const projects = {
  */
 export const mcp = {
   designStatus: { input: z.void(), output: ClaudeDesignStatusSchema },
+  /** OpenAI structured settings of one workspace server (`openai/settings`). */
+  settings: {
+    read: {
+      input: MCPSettingsReadInputSchema,
+      /**
+       * Per server name: null when the server has no `openai/settings` capability;
+       * `{ notConnected: true }` when `ifConnected` found it not running.
+       */
+      output: z.record(
+        z.string(),
+        ResultSchema(
+          z
+            .union([MCPSettingsSnapshotSchema, z.object({ notConnected: z.literal(true) })])
+            .nullable(),
+          z.string()
+        )
+      ),
+    },
+    update: {
+      input: MCPSettingsUpdateParamsSchema,
+      output: ResultSchema(MCPSettingsSnapshotSchema.shape.values, z.string()),
+    },
+  },
   configureDesign: {
     input: ClaudeDesignSettingsSchema.pick({ source: true, reuseEnabled: true }).partial({
       source: true,
@@ -1071,7 +1211,7 @@ export const mcp = {
 };
 
 /**
- * Managed Agent Plugin installs (agent-plugins experiment; global scope only).
+ * Managed Agent Plugin installs (global scope only).
  *
  * Human-driven surfaces only (Settings + palette) — there is deliberately no
  * agent-facing installer tool in v1. All endpoints return Result values; the
@@ -1104,6 +1244,21 @@ export const agentPlugins = {
   getComponents: {
     input: z.object({ name: z.string() }),
     output: ResultSchema(AgentPluginComponentsSchema, z.string()),
+  },
+  /** Codex-format hooks (hooks.json) of a managed plugin, with their trust review state. */
+  getHooks: {
+    input: z.object({ name: z.string() }),
+    output: ResultSchema(AgentPluginHooksSchema, z.string()),
+  },
+  /** Trust, turn off, or clear (null) one hook; refused when `hash` is no longer current. */
+  setHookTrust: {
+    input: z.object({
+      name: z.string(),
+      key: z.string(),
+      hash: z.string(),
+      state: z.enum(["trusted", "disabled"]).nullable(),
+    }),
+    output: ResultSchema(z.void(), z.string()),
   },
   setComponents: {
     input: z.object({
@@ -1235,6 +1390,187 @@ const ArchiveWorkspaceResultSchema = z.discriminatedUnion("kind", [
 ]);
 
 /**
+ * Artifacts tab (experiment: "artifacts"): files the agent writes to
+ * $XUM_SCRATCH_DIR/artifacts. One bulk list call, then size-capped reads.
+ */
+export const artifacts = {
+  list: {
+    input: z.object({ workspaceId: z.string() }),
+    output: ResultSchema(ArtifactListingSchema, z.string()),
+  },
+  read: {
+    input: z.object({
+      workspaceId: z.string(),
+      path: z.string(),
+      /** Lower read cap (clamped to the server's): larger files return too_large, no bytes. */
+      maxBytes: z.number().int().positive().nullish(),
+    }),
+    output: ResultSchema(ArtifactReadResultSchema, z.string()),
+  },
+  /** Runtime tooling probes (cached per workspace); never fails, null means unknown. */
+  capabilities: {
+    input: z.object({ workspaceId: z.string() }),
+    output: ArtifactCapabilitiesSchema,
+  },
+  /** Versions of the artifact at `path` (relative to the artifacts dir), newest first. */
+  listVersions: {
+    input: z.object({ workspaceId: z.string(), path: z.string() }),
+    output: ResultSchema(ArtifactVersionListSchema, z.string()),
+  },
+  /** One stored version, in the same shape as `read` (modifiedMs = version creation time). */
+  readVersion: {
+    input: z.object({
+      workspaceId: z.string(),
+      artifactId: z.string(),
+      version: z.number().int().positive(),
+    }),
+    output: ResultSchema(ArtifactReadResultSchema, z.string()),
+  },
+  /** Pinned workspace files with their current size/mtime (live, no snapshots). */
+  listPinned: {
+    input: z.object({ workspaceId: z.string() }),
+    output: ResultSchema(PinnedArtifactFilesSchema, z.string()),
+  },
+  /**
+   * Pin a checkout file; `path` may be absolute inside the checkout. A relative `path` resolves
+   * from the checkout root, or from the tool cwd (a sub-project dir) with `relativeTo:
+   * "tool-cwd"`, as file tools resolve it. Returns the stored checkout-relative path.
+   */
+  pinFile: {
+    input: z.object({
+      workspaceId: z.string(),
+      path: z.string(),
+      relativeTo: z.enum(["tool-cwd", "checkout"]).nullish(),
+    }),
+    output: ResultSchema(z.object({ path: z.string() }), z.string()),
+  },
+  unpinFile: {
+    input: z.object({ workspaceId: z.string(), path: z.string() }),
+    output: ResultSchema(z.void(), z.string()),
+  },
+  /** Read a pinned file (same shape and cap as `read`; path relative to the checkout). */
+  readPinned: {
+    input: z.object({ workspaceId: z.string(), path: z.string() }),
+    output: ResultSchema(ArtifactReadResultSchema, z.string()),
+  },
+  /** Shelf entries visible from this workspace: its project shelf, then the global shelf. */
+  listShelf: {
+    input: z.object({ workspaceId: z.string() }),
+    output: ResultSchema(ArtifactShelfListingSchema, z.string()),
+  },
+  /** Read one shelf entry (read-only; same shape and cap as `read`). */
+  readShelf: {
+    input: z.object({
+      workspaceId: z.string(),
+      scope: ArtifactShelfScopeSchema,
+      name: z.string(),
+    }),
+    output: ResultSchema(ArtifactReadResultSchema, z.string()),
+  },
+  /** User pin: copy one stored version to the project or global shelf. */
+  pinToShelf: {
+    input: z.object({
+      workspaceId: z.string(),
+      artifactId: z.string(),
+      version: z.number().int().positive(),
+      scope: ArtifactShelfScopeSchema,
+    }),
+    output: ResultSchema(z.object({ name: z.string() }), z.string()),
+  },
+  unpinShelf: {
+    input: z.object({
+      workspaceId: z.string(),
+      scope: ArtifactShelfScopeSchema,
+      name: z.string(),
+      /** pinnedAtMs from the listing: an entry pinned again since then is kept. */
+      expectedPinnedAtMs: z.number(),
+    }),
+    output: ResultSchema(z.void(), z.string()),
+  },
+  /**
+   * A send the user confirmed in the Artifacts tab (window.xum.send or a canvas button). The
+   * backend persists it, then delivers it as a user message at the next tool boundary (M5b).
+   * `version: null` targets the live file (latest stored version).
+   */
+  sendInteraction: {
+    input: z.object({
+      workspaceId: z.string(),
+      path: z.string(),
+      version: z.number().int().nonnegative().nullable(),
+      text: z.string(),
+      data: z.unknown().optional(),
+    }),
+    output: ResultSchema(z.object({ id: z.string() }), z.string()),
+  },
+  /** Persisted window.xum.state of an artifact (null when none); one state for all versions. */
+  getState: {
+    input: z.object({
+      workspaceId: z.string(),
+      path: z.string(),
+    }),
+    output: ResultSchema(z.object({ state: z.unknown() }), z.string()),
+  },
+  setState: {
+    input: z.object({
+      workspaceId: z.string(),
+      path: z.string(),
+      state: z.unknown(),
+    }),
+    output: ResultSchema(z.void(), z.string()),
+  },
+};
+
+/**
+ * MCP Apps views in the Artifacts tab (artifacts experiment): the view resource plus the
+ * host-only tool result, and tools/call and resources/read issued by a view.
+ */
+export const mcpApps = {
+  getView: {
+    input: McpAppViewRequestSchema,
+    output: ResultSchema(McpAppViewSchema, z.string()),
+  },
+  /** Views of tool calls by their result records alone (tabs restored after a restart). */
+  getViewRecords: {
+    input: McpAppViewRecordsRequestSchema,
+    output: ResultSchema(McpAppViewRecordsSchema, z.string()),
+  },
+  callTool: {
+    input: McpAppToolCallRequestSchema,
+    output: ResultSchema(McpAppToolCallResultSchema, z.string()),
+  },
+  /** resources/read issued by a view; returns the server's raw ReadResourceResult. */
+  readResource: {
+    input: McpAppResourceReadRequestSchema,
+    output: ResultSchema(z.unknown(), z.string()),
+  },
+  approveViewDomains: {
+    input: McpAppApproveDomainsRequestSchema,
+    output: ResultSchema(z.object({ approvedDomains: z.array(z.string()) }), z.string()),
+  },
+  listViewDomains: { input: z.void(), output: z.array(McpAppViewDomainsSchema) },
+  /** Mounted views of the server in this renderer reload under the narrower policy. */
+  revokeViewDomains: {
+    input: McpAppViewDomainsSchema.pick({ projectPath: true, serverName: true }),
+    output: z.void(),
+  },
+  /** ui/update-model-context of a view; used by the workspace's next requests. */
+  updateModelContext: {
+    input: McpAppModelContextRequestSchema,
+    output: ResultSchema(z.object({}), z.string()),
+  },
+  /** Entry points of the servers enabled in the workspace (starts them like prompt discovery). */
+  listEntrypoints: {
+    input: z.object({ workspaceId: z.string().min(1) }),
+    output: z.array(McpAppEntrypointSchema),
+  },
+  /** Call an entry point's tool with `{}` and store its view record (no chat row). */
+  openEntrypoint: {
+    input: McpAppOpenEntrypointRequestSchema,
+    output: ResultSchema(McpAppEntrypointSchema, z.string()),
+  },
+};
+
+/**
  * Memory curation routes (Memory tab + Settings → Memory; experiment:
  * "memory"). workspaceId is optional: when present, the router resolves that
  * workspace's runtime + checkout cwd to map virtual /memories paths onto
@@ -1332,11 +1668,7 @@ export type RefineRecordPayload = z.infer<typeof RefineRecordSchema>;
 export const refinements = {
   /** Manual /refine trajectory-distillation pass (RLM mode only; the backend refuses otherwise). Stages edits; nothing is applied until `apply`. */
   run: {
-    // experiments: the renderer's effective flags ride the request (same
-    // authority as send options.experiments) because persisting overrides to
-    // the backend is asynchronous/best-effort — a backend-only gate could
-    // refuse /refine while the workspace already runs with the RLM kernel.
-    input: z.object({ workspaceId: z.string(), experiments: ExperimentsSchema.optional() }),
+    input: z.object({ workspaceId: z.string() }),
     output: ResultSchema(RefineRecordSchema, z.string()),
   },
   /** Apply the staged edits from the last run (explicit user approval step). */
@@ -1351,7 +1683,6 @@ export const refinements = {
        * alone; apply refuses when this hash no longer matches the staged set.
        */
       approvedProposalHash: z.string().min(1),
-      experiments: ExperimentsSchema.optional(),
     }),
     output: ResultSchema(RefineRecordSchema, z.string()),
   },
@@ -1373,6 +1704,14 @@ export const workspace = {
       })
       .optional(),
     output: z.array(FrontendWorkspaceMetadataSchema),
+  },
+  /**
+   * Every known workspace id (active, archived, sub-agent, multi-project, legacy aliases) for the
+   * renderer's orphaned localStorage GC. Fails instead of returning a partial set.
+   */
+  listKnownIdsForStorageGc: {
+    input: z.void(),
+    output: z.object({ workspaceIds: z.array(z.string()) }),
   },
   create: {
     input: z.object({
@@ -1451,6 +1790,11 @@ export const workspace = {
     input: z.object({ workspaceId: z.string(), pinned: z.boolean() }),
     output: ResultSchema(z.void(), z.string()),
   },
+  /** Keep a delegated workspace whose setup was interrupted (#4983): clears its flag. */
+  keepInterruptedDelegatedWorkspace: {
+    input: z.object({ workspaceId: z.string() }),
+    output: ResultSchema(z.void(), z.string()),
+  },
   reorderPinned: {
     /**
      * Full desired pinned order for one project bucket. The server derives the
@@ -1500,6 +1844,14 @@ export const workspace = {
     set: {
       input: WorkspaceHeartbeatSettingsSchema.extend({
         workspaceId: z.string(),
+        // Absent preserves the saved interval; null clears it so the workspace follows the
+        // global default interval again (#5692).
+        intervalMs: z
+          .number()
+          .int()
+          .min(HEARTBEAT_MIN_INTERVAL_MS)
+          .max(HEARTBEAT_MAX_INTERVAL_MS)
+          .nullish(),
       }),
       output: ResultSchema(z.void(), z.string()),
     },
@@ -1525,7 +1877,7 @@ export const workspace = {
     input: z.object({
       workspaceId: z.string(),
       agentId: AgentIdSchema,
-      aiSettings: WorkspaceAISettingsSchema,
+      aiSettings: WorkspaceAgentAISettingsSchema,
       persistSelectedAgentId: z.boolean().nullish(),
     }),
     output: ResultSchema(z.void(), z.string()),
@@ -1546,6 +1898,14 @@ export const workspace = {
     input: z.object({
       workspaceId: z.string(),
       thinkingLevel: ThinkingLevelSchema,
+    }),
+    output: ResultSchema(z.object({ accepted: z.boolean() }), z.string()),
+  },
+  // OpenAI speed changes apply to the next model step of the active turn, like thinking.
+  setActiveTurnServiceTier: {
+    input: z.object({
+      workspaceId: z.string(),
+      serviceTier: ServiceTierSchema,
     }),
     output: ResultSchema(z.object({ accepted: z.boolean() }), z.string()),
   },
@@ -1612,6 +1972,14 @@ export const workspace = {
         metadata: FrontendWorkspaceMetadataSchema,
         projectPath: z.string(),
       }),
+      z.object({ success: z.literal(false), error: z.string() }),
+    ]),
+  },
+  /** Start an ephemeral `/side` chat forked from a workspace (see WorkspaceService.createSideChat). */
+  createSideChat: {
+    input: z.object({ parentWorkspaceId: z.string() }),
+    output: z.discriminatedUnion("success", [
+      z.object({ success: z.literal(true), metadata: FrontendWorkspaceMetadataSchema }),
       z.object({ success: z.literal(false), error: z.string() }),
     ]),
   },
@@ -1717,6 +2085,15 @@ export const workspace = {
     }),
     output: ResultSchema(z.void(), z.string()),
   },
+  // Recipient-side delivery preference for agent messages that arrive while this workspace is
+  // busy (see WorkspaceMetadata.agentMessageDispatchMode).
+  setAgentMessageDispatchMode: {
+    input: z.object({
+      workspaceId: z.string(),
+      mode: AgentMessageDispatchModeSchema,
+    }),
+    output: ResultSchema(z.void(), z.string()),
+  },
   interruptStream: {
     input: z.object({
       workspaceId: z.string(),
@@ -1740,6 +2117,52 @@ export const workspace = {
     input: z.object({ workspaceId: z.string() }),
     output: ResultSchema(z.void(), z.string()),
   },
+  /**
+   * Re-send a held input (see HeldInputsChangedEventSchema) as a new manual send. It stays held
+   * unless the send is accepted; the error explains why it was not.
+   */
+  sendHeldInput: {
+    input: z.object({
+      workspaceId: z.string(),
+      heldInputId: z.string(),
+      /** ACP /send-held only: re-send as this prompt instead of the one it was queued as. */
+      acpCorrelation: AcpPromptCorrelationSchema.optional(),
+    }),
+    output: ResultSchema(z.void(), SendMessageErrorSchema),
+  },
+  /**
+   * Idempotent sends: what the receiver knows about send ids (see WorkspaceService.getSendStatus).
+   * `receiverId` is the process the sends went to (from an earlier answer); omitted or ours, an id
+   * held nowhere is "not-accepted" and later refused; another process's is "unknown". An empty
+   * list only returns this process's receiverId.
+   */
+  getSendStatus: {
+    input: z
+      .object({
+        workspaceId: z.string(),
+        sendIds: z.array(SendIdLookupSchema).max(100),
+        receiverId: z.string().min(1).optional(),
+      })
+      .strict(),
+    // A list, not a record: every valid id (even "__proto__") survives output validation.
+    output: ResultSchema(
+      z.object({
+        receiverId: z.string(),
+        statuses: z.array(
+          z.object({
+            sendId: SendIdLookupSchema,
+            status: z.enum(["accepted", "pending", "not-accepted", "unknown"]),
+          })
+        ),
+      }),
+      z.string()
+    ),
+  },
+  /** Drop a held input without sending it. */
+  discardHeldInput: {
+    input: z.object({ workspaceId: z.string(), heldInputId: z.string() }),
+    output: ResultSchema(z.void(), z.string()),
+  },
   setQueuedMessageDispatchMode: {
     input: z.object({
       workspaceId: z.string(),
@@ -1757,6 +2180,86 @@ export const workspace = {
   resetContext: {
     input: z.object({ workspaceId: z.string() }),
     output: ResultSchema(z.enum(["reset", "noop"]), z.string()),
+  },
+  /**
+   * Native plan review (history-backed). Every mutation returns the fresh projection; the UI
+   * never composes `<mux_plan_review>` envelopes itself.
+   */
+  planReview: {
+    getState: {
+      input: z.object({ workspaceId: z.string() }),
+      output: ResultSchema(PlanReviewStateSchema, PlanReviewErrorSchema),
+    },
+    ensureSnapshot: {
+      input: z.object({
+        workspaceId: z.string(),
+        /** Bind the snapshot to a `propose_plan` call when snapshotting on behalf of its card. */
+        proposalToolCallId: z.string().min(1).nullish(),
+      }),
+      output: ResultSchema(
+        z.object({
+          snapshotId: z.string(),
+          contentHash: z.string(),
+          created: z.boolean(),
+          state: PlanReviewStateSchema,
+        }),
+        PlanReviewErrorSchema
+      ),
+    },
+    setThreadResolved: {
+      input: z.object({
+        workspaceId: z.string(),
+        threadId: z.string().min(1),
+        resolved: z.boolean(),
+      }),
+      output: ResultSchema(PlanReviewStateSchema, PlanReviewErrorSchema),
+    },
+    submitFeedback: {
+      input: z.object({
+        workspaceId: z.string(),
+        snapshotId: z.string().min(1),
+        // Bounded at the boundary: unresolved feedback is re-rendered into every plan turn's
+        // system prompt and persisted as one history row, so sizes are product limits, not
+        // storage details (see src/constants/planReview.ts).
+        summary: z.string().max(PLAN_REVIEW_MAX_SUMMARY_CHARS).nullish(),
+        comments: z
+          .array(
+            z.object({
+              anchor: PlanReviewAnchorSchema,
+              quote: z.string().max(PLAN_REVIEW_MAX_QUOTE_CHARS),
+              body: z.string().min(1).max(PLAN_REVIEW_MAX_BODY_CHARS),
+            })
+          )
+          .max(PLAN_REVIEW_MAX_COMMENTS_PER_FEEDBACK),
+        replies: z
+          .array(
+            z.object({
+              threadId: z.string().min(1),
+              body: z.string().min(1).max(PLAN_REVIEW_MAX_BODY_CHARS),
+            })
+          )
+          .max(PLAN_REVIEW_MAX_REPLIES_PER_FEEDBACK),
+        /**
+         * Agent/model/thinking for the resulting user turn, as the plan card's Implement sends
+         * them. Edit semantics are excluded: an edit truncates history before the row persists,
+         * which could delete the very snapshot/thread the feedback references.
+         */
+        options: SendMessageOptionsSchema.omit({
+          editMessageId: true,
+          historyEditPrecondition: true,
+          unfencedEdit: true,
+        }),
+      }),
+      output: ResultSchema(
+        z.object({
+          feedbackId: z.string(),
+          // null when the feedback was sent but refreshing review state afterwards failed: the
+          // mutation is committed, so callers must not retry it; refresh via getState instead.
+          state: PlanReviewStateSchema.nullable(),
+        }),
+        PlanReviewErrorSchema
+      ),
+    },
   },
   replaceChatHistory: {
     input: z.object({
@@ -1805,6 +2308,8 @@ export const workspace = {
             beforeMessageId: z.string().nullish(),
           })
           .nullish(),
+        // The client holds a replay window (#4961): bounded pages inside the active epoch.
+        windowed: z.boolean().optional(),
       }),
       output: z.object({
         messages: z.array(WorkspaceChatMessageSchema),
@@ -1815,6 +2320,8 @@ export const workspace = {
           })
           .nullable(),
         hasOlder: z.boolean(),
+        // Windowed requests only: the rows before the cursor cannot be paged; do a full replay.
+        notPageable: z.boolean().optional(),
       }),
     },
     /** Searches full history, including prompts before the replay boundary. */
@@ -1886,16 +2393,34 @@ export const workspace = {
       // One-shot migration hint: legacy renderer localStorage opt-out value.
       // Used only when backend auto-retry preference file is missing.
       legacyAutoRetryEnabled: z.boolean().optional(),
+      // The client can unpack `message-batch` events, so the server may group replayed history
+      // rows (#4868). Servers without this field strip it (the input object is not strict) and
+      // send single rows; clients that do not send it (ACP, VS Code, tests, older renderers)
+      // always get single rows.
+      batchReplay: z.boolean().optional(),
+      // The client can hold a window of the newest rows, so a full replay may send only those
+      // (#4961); `hasOlderHistory` on caught-up then says whether older rows exist. Clients that
+      // do not send it get the whole active epoch, as before.
+      replayWindow: z.boolean().optional(),
     }),
     output: eventIterator(WorkspaceChatMessageSchema), // Stream event
   },
   onMetadata: {
-    input: z.void(),
+    // `archived` selects the snapshot list exactly like `workspace.list`.
+    input: z.object({ archived: z.boolean().optional() }).optional(),
+    // The first event is a snapshot built after the listener attached, so changes made before or
+    // while it is built are either in it or follow it as updates (#5189).
     output: eventIterator(
-      z.object({
-        workspaceId: z.string(),
-        metadata: FrontendWorkspaceMetadataSchema.nullable(),
-      })
+      z.union([
+        z.object({
+          type: z.literal("snapshot"),
+          workspaces: z.array(FrontendWorkspaceMetadataSchema),
+        }),
+        z.object({
+          workspaceId: z.string(),
+          metadata: FrontendWorkspaceMetadataSchema.nullable(),
+        }),
+      ])
     ),
   },
   activity: {
@@ -1994,6 +2519,30 @@ export const workspace = {
     }),
   },
   /**
+   * An SSH workspace from before #5174 whose only plan is at the shared pre-#5174 path, which
+   * another installation may own: that path, offered for an explicit importLegacyPlan (#5174,
+   * Option B). Null for every other workspace.
+   */
+  getImportableLegacyPlan: {
+    input: z.object({ workspaceId: z.string() }),
+    output: ResultSchema(z.string().nullable(), z.string()),
+  },
+  /**
+   * Copy an SSH workspace's plan from before #5174 into this installation's plan path, on the
+   * user's request only. Never replaces an existing plan (a repeat is a no-op) and never moves or
+   * deletes the legacy file.
+   */
+  importLegacyPlan: {
+    input: z.object({ workspaceId: z.string() }),
+    output: ResultSchema(
+      z.object({
+        status: z.enum(["imported", "already_present", "nothing_to_import"]),
+        planPath: z.string(),
+      }),
+      z.string()
+    ),
+  },
+  /**
    * Toggle whether a post-compaction item is excluded from injection.
    * Item IDs: "plan" for plan file, "file:<path>" for tracked files.
    */
@@ -2004,6 +2553,21 @@ export const workspace = {
       excluded: z.boolean(),
     }),
     output: ResultSchema(z.void(), z.string()),
+  },
+  // Per-workspace code-review state persisted in <sessionDir>/review-state.json.
+  reviewState: {
+    subscribe: {
+      input: z.object({ workspaceId: z.string() }),
+      output: eventIterator(ReviewStateEventSchema),
+    },
+    update: {
+      input: z.object({ workspaceId: z.string(), delta: ReviewStateDeltaSchema }),
+      output: ReviewStateUpdateOutputSchema,
+    },
+    importLegacy: {
+      input: z.object({ workspaceId: z.string(), sections: ReviewStateSectionsSchema }),
+      output: ReviewStateImportLegacyOutputSchema,
+    },
   },
   stats: {
     subscribe: {
@@ -2193,6 +2757,29 @@ export const tasks = {
       z.string()
     ),
   },
+  /** #5106: what removing a sub-agent would lose (summary null = nothing), for the user's confirmation. */
+  previewRemoval: {
+    input: z.object({ taskId: z.string() }),
+    output: ResultSchema(
+      z.object({ summary: z.string().nullable(), paths: z.array(z.string()) }),
+      z.string()
+    ),
+  },
+  /**
+   * #5106: user-confirmed sub-agent removal; never exposed as a model tool. `acknowledgedWork` is
+   * the preview the user confirmed: removal refuses if the work changed since.
+   */
+  remove: {
+    input: z.object({
+      taskId: z.string(),
+      acknowledgedWork: z.object({ summary: z.string().nullable(), paths: z.array(z.string()) }),
+    }),
+    // Warnings name what the forced removal left behind (#5143), as workspace.remove does.
+    output: ResultSchema(
+      z.object({ warnings: z.array(WorkspaceRemoveWarningSchema).optional() }),
+      z.string()
+    ),
+  },
 };
 
 // Agent definitions (unifies UI modes + subagents)
@@ -2237,14 +2824,7 @@ export const agents = {
 export const agentSkills = {
   list: {
     input: AgentDiscoveryInputSchema,
-    output: z.array(AgentSkillDescriptorSchema),
-  },
-  listDiagnostics: {
-    input: AgentDiscoveryInputSchema,
-    output: z.object({
-      skills: z.array(AgentSkillDescriptorSchema),
-      invalidSkills: z.array(AgentSkillIssueSchema),
-    }),
+    output: AgentSkillListResultSchema,
   },
   get: {
     input: AgentDiscoveryInputSchema.and(z.object({ skillName: SkillNameSchema })),
@@ -2413,7 +2993,11 @@ export const terminal = {
    * Guarantees no missed output between state snapshot and live stream.
    */
   attach: {
-    input: z.object({ sessionId: z.string() }),
+    input: z.object({
+      sessionId: z.string(),
+      /** Set by pop-out terminal windows; their sessions stay out of listSessions meanwhile. */
+      popout: z.boolean().nullish(),
+    }),
     output: eventIterator(
       z.discriminatedUnion("type", [
         z.object({ type: z.literal("screenState"), data: z.string() }),
@@ -2437,7 +3021,11 @@ export const terminal = {
     output: z.void(),
   },
   closeWindow: {
-    input: z.object({ workspaceId: z.string() }),
+    input: z.object({
+      workspaceId: z.string(),
+      /** Close only the pop-out showing this session (its shell exited); omitted closes all. */
+      sessionId: z.string().nullish(),
+    }),
     output: z.void(),
   },
   /**
@@ -2578,10 +3166,6 @@ const ResolvedTaskSettingsSchema = TaskSettingsSchema.required({
   maxTaskNestingDepth: true,
 });
 
-const AdvisorModelStringSchema = z.string().nullable();
-const AdvisorThinkingLevelSchema = ThinkingLevelSchema.nullable();
-const AdvisorMaxUsesPerTurnSchema = z.number().int().positive().nullable();
-const AdvisorMaxOutputTokensSchema = z.number().int().positive().nullable();
 const GoalDefaultsConfigSchema = z.object({
   defaultBudgetCents: z
     .number()
@@ -2612,7 +3196,6 @@ export const config = {
   getConfig: {
     input: z.void(),
     output: z.object({
-      userPreferencesInitialized: z.boolean(),
       userPreferences: UserPreferencesSchema.optional(),
       taskSettings: ResolvedTaskSettingsSchema,
       muxGatewayEnabled: z.boolean().optional(),
@@ -2623,11 +3206,6 @@ export const config = {
       modelFallbacks: ModelFallbacksSchema.optional(),
       autoModelRouting: AutoModelRoutingConfigSchema,
       defaultModel: z.string().optional(),
-      advisorModelString: AdvisorModelStringSchema,
-      advisorThinkingLevel: AdvisorThinkingLevelSchema,
-      advisorReasoningMode: OpenAIReasoningModeSchema.nullable(),
-      advisorMaxUsesPerTurn: AdvisorMaxUsesPerTurnSchema.optional(),
-      advisorMaxOutputTokens: AdvisorMaxOutputTokensSchema.optional(),
       hiddenModels: z.array(z.string()).optional(),
       hiddenModelsInitialized: z.boolean().optional(),
       coderWorkspaceArchiveBehavior: z.enum(CODER_ARCHIVE_BEHAVIORS),
@@ -2635,26 +3213,30 @@ export const config = {
       runtimeEnablement: z.record(z.string(), z.boolean()),
       defaultRuntime: z.string().nullable(),
       agentAiDefaults: AgentAiDefaultsSchema,
-      // Xum Governor enrollment status (safe fields only - token never exposed)
-      muxGovernorUrl: z.string().nullable(),
-      muxGovernorEnrolled: z.boolean(),
       chatTranscriptFullWidth: z.boolean(),
       llmDebugLogs: z.boolean(),
+      keepScreenAwake: z.boolean(),
+      toolSearchEnabled: z.boolean(),
+      bashAiProxyEnabled: z.boolean(),
+      agentHeartbeatsEnabled: z.boolean(),
       heartbeatDefaultPrompt: z.string().optional(),
       heartbeatDefaultIntervalMs: z.number().optional(),
       goalDefaults: GoalDefaultsConfigSchema,
+      evaluationDefaults: EvaluationDefaultsSchema.optional(),
+      experiments: z.partialRecord(z.enum(EXPERIMENT_IDS), z.boolean()),
     }),
   },
   saveConfig: {
     input: z.object({
-      userPreferences: UserPreferencesSchema.nullish(),
       taskSettings: ResolvedTaskSettingsSchema.nullish(),
-      advisorModelString: AdvisorModelStringSchema.nullish(),
-      advisorThinkingLevel: AdvisorThinkingLevelSchema.nullish(),
-      advisorReasoningMode: OpenAIReasoningModeSchema.nullish(),
-      advisorMaxUsesPerTurn: AdvisorMaxUsesPerTurnSchema.nullish(),
-      advisorMaxOutputTokens: AdvisorMaxOutputTokensSchema.nullish(),
       agentAiDefaults: AgentAiDefaultsSchema.optional(),
+    }),
+    output: z.void(),
+  },
+  updateUserPreferences: {
+    input: z.object({
+      // RFC 7386 merge patches against the stored userPreferences, applied in order.
+      patches: z.array(z.record(z.string(), z.unknown())),
     }),
     output: z.void(),
   },
@@ -2717,7 +3299,7 @@ export const config = {
   getAutoModelRoutingEvaluationStatus: {
     // Omit to check the saved evaluation model; pass one to check an unsaved edit.
     input: z.object({ evaluationModel: z.string().optional() }).optional(),
-    // Whether the evaluator can be built (credentials, policy) and why not; never a key.
+    // Whether the evaluator can be built (credentials) and why not; never a key.
     output: z.object({
       evaluationModel: z.string(),
       available: z.boolean(),
@@ -2774,6 +3356,10 @@ export const config = {
   },
   updateChatTranscriptFullWidth: booleanToggleRoute,
   updateLlmDebugLogs: booleanToggleRoute,
+  updateKeepScreenAwake: booleanToggleRoute,
+  updateToolSearchEnabled: booleanToggleRoute,
+  updateBashAiProxyEnabled: booleanToggleRoute,
+  updateAgentHeartbeatsEnabled: booleanToggleRoute,
   updateHeartbeatDefaultPrompt: {
     input: z
       .object({
@@ -2803,8 +3389,13 @@ export const config = {
       .strict(),
     output: z.void(),
   },
-  unenrollMuxGovernor: {
-    input: z.void(),
+  updateEvaluationDefaults: {
+    input: z
+      .object({
+        // Blank or null clears the default.
+        model: z.string().nullish(),
+      })
+      .strict(),
     output: z.void(),
   },
 };
@@ -2864,6 +3455,9 @@ const DevToolsStepSchema = z.object({
   responseHeaders: z.record(z.string(), z.string()).nullable(),
   rawResponse: z.unknown().nullable(),
   rawChunks: z.unknown().nullable(),
+  inputTransformations: z
+    .array(z.object({ type: z.string(), path: z.string(), reason: z.string().optional() }))
+    .nullable(),
 });
 
 const DevToolsRunSummarySchema = z.object({
@@ -3058,6 +3652,75 @@ export const browser = {
   },
 };
 
+// Composer drafts (text + attachments) persisted by the backend DraftService.
+export const drafts = {
+  /** Every draft as metadata (no attachment payloads), for bulk hydration. */
+  list: {
+    input: z.void(),
+    output: z.array(DraftSummarySchema),
+  },
+  /** One draft including attachment payloads. */
+  get: {
+    input: z.object({ scope: DraftScopeSchema }),
+    output: DraftGetOutputSchema,
+  },
+  update: {
+    input: DraftUpdateInputSchema,
+    output: DraftWriteOutputSchema,
+  },
+  delete: {
+    input: z.object({ scope: DraftScopeSchema }),
+    output: DraftRevisionOutputSchema,
+  },
+  importLegacy: {
+    input: DraftUpdateInputSchema,
+    output: DraftImportLegacyOutputSchema,
+  },
+  /**
+   * Idempotent sends: the one draft write before a composer send. Moves the sent text and
+   * attachments into the retained part and records the pending send. Idempotent by send id.
+   */
+  beginSend: {
+    input: DraftBeginSendInputSchema,
+    output: DraftWriteOutputSchema,
+  },
+  /** A retry's receiver rewrite (before it re-sends); never recreates a resolved entry. */
+  setSendReceiver: {
+    input: DraftSetSendReceiverInputSchema,
+    output: DraftSetSendReceiverOutputSchema,
+  },
+  /**
+   * Ask the receiver about every pending send of a workspace draft and apply the final answers
+   * (accepted: drop; not accepted: visible again) under the draft lock.
+   */
+  resolveSends: {
+    input: DraftResolveSendsInputSchema,
+    output: DraftResolveSendsOutputSchema,
+  },
+  /**
+   * The creation draft list, strictly: rejects when it cannot be read (the subscription snapshot
+   * falls back to an empty list instead). For the renderer's storage GC.
+   */
+  getList: {
+    input: z.void(),
+    output: DraftListSchema,
+  },
+  /** Add a creation draft to the list, or update its sub-project. Output: the list revision. */
+  putListEntry: {
+    input: DraftListEntrySchema,
+    output: DraftRevisionOutputSchema,
+  },
+  /** One-way import of the legacy localStorage list (never clobbers). Output: the list revision. */
+  importLegacyList: {
+    input: z.object({ entries: z.array(DraftListEntrySchema) }),
+    output: DraftRevisionOutputSchema,
+  },
+  subscribe: {
+    input: z.void(),
+    output: eventIterator(DraftEventSchema),
+  },
+};
+
 // UI Layouts (global settings)
 export const uiLayouts = {
   getAll: {
@@ -3155,17 +3818,6 @@ export const general = {
   ping: {
     input: z.string(),
     output: z.string(),
-  },
-  /**
-   * Test endpoint: emits numbered ticks at an interval.
-   * Useful for verifying streaming works over HTTP and WebSocket.
-   */
-  tick: {
-    input: z.object({
-      count: z.number().int().min(1).max(100),
-      intervalMs: z.number().int().min(10).max(5000),
-    }),
-    output: eventIterator(z.object({ tick: z.number(), timestamp: z.number() })),
   },
   restartApp: {
     input: z.void(),
@@ -3280,21 +3932,6 @@ export const voice = {
   transcribe: {
     input: z.object({ audioBase64: z.string() }),
     output: ResultSchema(z.string(), z.string()),
-  },
-};
-
-// Debug endpoints (test-only, not for production use)
-export const debug = {
-  /**
-   * Trigger an artificial stream error for testing recovery.
-   * Used by integration tests to simulate network errors mid-stream.
-   */
-  triggerStreamError: {
-    input: z.object({
-      workspaceId: z.string(),
-      errorMessage: z.string().optional(),
-    }),
-    output: z.boolean(), // true if error was triggered on an active stream
   },
 };
 

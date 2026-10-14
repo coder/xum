@@ -2,7 +2,6 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { Result } from "@/common/types/result";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "@/node/services/agentPlugins/manifest";
 import { AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0 } from "@/node/services/agentPlugins/mcpConfig";
@@ -52,10 +51,6 @@ function unwrap<T>(result: Result<T, string>): T {
   beforeAll(async () => {
     env = await createTestEnvironment();
     remote = await createTempGitRepo();
-    await env.orpc.experiments.setOverride({
-      experimentId: EXPERIMENT_IDS.AGENT_PLUGINS,
-      enabled: true,
-    });
     await commitComponents(["selective-first", "selective-second"]);
   });
 
@@ -95,7 +90,7 @@ function unwrap<T>(result: Result<T, string>): T {
     ]);
     expect(inventory.importedComponents).toEqual(selection);
 
-    const skills = await env.orpc.agentSkills.list({ projectPath: remote });
+    const { skills } = await env.orpc.agentSkills.list({ projectPath: remote });
     expect(skills.some((skill) => skill.name === "selective-first")).toBe(true);
     expect(skills.some((skill) => skill.name === "selective-second")).toBe(false);
     await expect(
@@ -154,12 +149,12 @@ function unwrap<T>(result: Result<T, string>): T {
         .filter((server) => server.plugin)
         .map((server) => server.plugin?.serverName)
     ).toEqual(["selective-second"]);
-    expect(Object.values(serversAfter).filter((server) => server.plugin)[0].disabled).toBe(true);
+    expect(Object.values(serversAfter).find((server) => server.plugin)?.disabled).toBe(true);
     await expect(
       env.orpc.agentSkills.get({ projectPath: remote, skillName: "selective-first" })
     ).rejects.toThrow();
     expect(
-      (await env.orpc.agentSkills.list({ projectPath: remote })).some(
+      (await env.orpc.agentSkills.list({ projectPath: remote })).skills.some(
         (skill) => skill.name === "selective-second"
       )
     ).toBe(true);
@@ -176,7 +171,7 @@ function unwrap<T>(result: Result<T, string>): T {
     );
     expect(updated.importedComponents?.skills).not.toContain("selective-third");
     expect(
-      (await env.orpc.agentSkills.list({ projectPath: remote })).some(
+      (await env.orpc.agentSkills.list({ projectPath: remote })).skills.some(
         (skill) => skill.name === "selective-third"
       )
     ).toBe(false);
@@ -202,7 +197,7 @@ function unwrap<T>(result: Result<T, string>): T {
       })
     );
     expect(
-      (await env.orpc.agentSkills.list({ projectPath: remote })).some(
+      (await env.orpc.agentSkills.list({ projectPath: remote })).skills.some(
         (skill) => skill.name === "selective-third"
       )
     ).toBe(true);

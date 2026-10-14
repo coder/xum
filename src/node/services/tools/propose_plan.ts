@@ -5,7 +5,7 @@ import { completeInProgressTodoItems } from "@/common/utils/todoList";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { log } from "@/node/services/log";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
-import { RuntimeError } from "@/node/runtime/Runtime";
+import { RuntimeError, isRuntimeTransportError } from "@/node/runtime/Runtime";
 import { readFileString } from "@/node/utils/runtime/helpers";
 import { setTodosForSessionDir } from "./todo";
 
@@ -37,11 +37,24 @@ export const createProposePlanTool: ToolFactory = (config) => {
         };
       }
 
-      // Read plan file using workspace runtime (works for both local and SSH)
+      // Read plan file using workspace runtime (works for both local and SSH).
+      // requireRegularFile: a FIFO at the plan path would otherwise block this
+      // read (and a libuv worker) indefinitely; it lands in the RuntimeError
+      // branch below like any other unreadable plan.
       let planContent: string;
       try {
-        planContent = await readFileString(config.runtime, planPath);
+        planContent = await readFileString(config.runtime, planPath, undefined, {
+          requireRegularFile: true,
+        });
       } catch (err) {
+        // An unreachable runtime is not a missing plan (#4826): "write your plan"
+        // would invite the agent to overwrite a plan it simply could not reach.
+        if (isRuntimeTransportError(err)) {
+          return {
+            success: false as const,
+            error: `Could not read the plan file at ${planPath} because the workspace runtime is unreachable: ${err.message}`,
+          };
+        }
         if (err instanceof RuntimeError) {
           return {
             success: false as const,
@@ -57,6 +70,10 @@ export const createProposePlanTool: ToolFactory = (config) => {
           error: `Plan file at ${planPath} is empty. Please write your plan content before calling propose_plan.`,
         };
       }
+
+      // The plan-review snapshot of this proposal must hold these validated bytes, not a later
+      // re-read of the (mutable) plan file.
+      config.recordProposedPlan?.(options.toolCallId, planContent);
 
       // Record file state for external edit detection
       if (config.recordFileState) {

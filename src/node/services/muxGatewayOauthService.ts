@@ -272,8 +272,7 @@ export class MuxGatewayOauthService {
                   ? "You can return to Xum. You may now close this tab."
                   : (r.error ?? "Unknown error"),
                 success: r.success,
-                extraHead:
-                  '<meta name="theme-color" content="#0e0e0e" />\n    <link rel="stylesheet" href="https://gateway.mux.coder.com/static/css/site.css" />',
+                extraHead: `<meta name="theme-color" content="#0e0e0e" />\n    <link rel="stylesheet" href="${MUX_GATEWAY_ORIGIN}/static/css/site.css" />`,
               }),
           }),
         catch: (error) =>

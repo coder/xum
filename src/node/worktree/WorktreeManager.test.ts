@@ -29,6 +29,31 @@ function createNullInitLogger(): InitLogger {
   };
 }
 
+/**
+ * The `git --version` capability cache is keyed by PATH for the process lifetime. Tests that fake
+ * the probe output give it a PATH no other test uses (still resolving the real git) so their
+ * fake result neither hits nor pollutes another test's cache entry.
+ */
+async function withUniquePath<T>(suffix: string, run: () => Promise<T>): Promise<T> {
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${originalPath ?? ""}${path.delimiter}${suffix}`;
+  try {
+    return await run();
+  } finally {
+    process.env.PATH = originalPath;
+  }
+}
+
+function countGitVersionProbes() {
+  const realExec = disposableExec.execFileAsync;
+  let probes = 0;
+  const spy = spyOn(disposableExec, "execFileAsync").mockImplementation((file, args, options) => {
+    if (file === "git" && args[0] === "--version") probes++;
+    return realExec(file, args, options);
+  });
+  return { spy, probes: () => probes };
+}
+
 async function createWorktreeManagerFixture(options?: {
   existingBranchName?: string;
   currentBranchName?: string;
@@ -227,7 +252,7 @@ describe("WorktreeManager.createWorkspace", () => {
           trusted: false,
           initLogger,
         });
-        expect(result).toEqual({ success: true, workspacePath });
+        expect(result).toEqual({ success: true, workspacePath, createdBranch: !existing });
         expect(checkoutStarted).toBe(true);
         expect(await fsPromises.readFile(path.join(workspacePath, "README.md"), "utf8")).toBe(
           expectedContent
@@ -463,6 +488,7 @@ describe("WorktreeManager.createWorkspace", () => {
         success: true,
         workspacePath,
         pendingMaterialization: { fastForwardFromOrigin: false },
+        createdBranch: false,
       });
       // Reserved but empty: registered with git, no files, no checkout activity yet.
       expect(
@@ -812,27 +838,29 @@ describe("WorktreeManager.createWorkspace", () => {
         }
       );
       try {
-        const result = await fixture.manager.createWorkspace({
-          projectPath: fixture.projectPath,
-          branchName: "compat-source",
-          trunkBranch: "main",
-          skipRemoteSync: true,
-          trusted,
-          initLogger: fixture.initLogger,
-          deferMaterialization: true,
+        await withUniquePath(fixture.rootDir, async () => {
+          const result = await fixture.manager.createWorkspace({
+            projectPath: fixture.projectPath,
+            branchName: "compat-source",
+            trunkBranch: "main",
+            skipRemoteSync: true,
+            trusted,
+            initLogger: fixture.initLogger,
+            deferMaterialization: true,
+          });
+          expect(result.success).toBe(true);
+          if (!result.success || !result.workspacePath) throw new Error("Expected creation");
+          expect(result.pendingMaterialization !== undefined).toBe(deferred);
+          expect(existsSync(path.join(result.workspacePath, "README.md"))).toBe(!deferred);
+          const fork = await fixture.manager.forkWorkspace({
+            projectPath: fixture.projectPath,
+            sourceWorkspaceName: "compat-source",
+            newWorkspaceName: "compat-fork",
+            trusted,
+            initLogger: fixture.initLogger,
+          });
+          expect(fork).toMatchObject({ success: true, sourceBranch: "compat-source" });
         });
-        expect(result.success).toBe(true);
-        if (!result.success || !result.workspacePath) throw new Error("Expected creation");
-        expect(result.pendingMaterialization !== undefined).toBe(deferred);
-        expect(existsSync(path.join(result.workspacePath, "README.md"))).toBe(!deferred);
-        const fork = await fixture.manager.forkWorkspace({
-          projectPath: fixture.projectPath,
-          sourceWorkspaceName: "compat-source",
-          newWorkspaceName: "compat-fork",
-          trusted,
-          initLogger: fixture.initLogger,
-        });
-        expect(fork).toMatchObject({ success: true, sourceBranch: "compat-source" });
       } finally {
         execSpy.mockRestore();
         await fixture.cleanup();
@@ -859,20 +887,158 @@ describe("WorktreeManager.createWorkspace", () => {
       }
     );
     try {
-      const result = await fixture.manager.createWorkspace({
+      await withUniquePath(fixture.rootDir, async () => {
+        const result = await fixture.manager.createWorkspace({
+          projectPath: fixture.projectPath,
+          branchName: "cancelled-capability",
+          trunkBranch: "main",
+          trusted: true,
+          skipRemoteSync: true,
+          initLogger: fixture.initLogger,
+          deferMaterialization: true,
+          abortSignal: controller.signal,
+        });
+        expect(result.success).toBe(false);
+        expect(
+          existsSync(fixture.manager.getWorkspacePath(fixture.projectPath, "cancelled-capability"))
+        ).toBe(false);
+      });
+    } finally {
+      execSpy.mockRestore();
+      await fixture.cleanup();
+    }
+  });
+
+  it("probes git --version once per PATH across manager instances", async () => {
+    const first = await createWorktreeManagerFixture();
+    const second = await createWorktreeManagerFixture();
+    const counter = countGitVersionProbes();
+    const create = (
+      fixture: Awaited<ReturnType<typeof createWorktreeManagerFixture>>,
+      branchName: string
+    ) =>
+      fixture.manager.createWorkspace({
         projectPath: fixture.projectPath,
-        branchName: "cancelled-capability",
+        branchName,
         trunkBranch: "main",
-        trusted: true,
         skipRemoteSync: true,
+        trusted: true,
         initLogger: fixture.initLogger,
         deferMaterialization: true,
-        abortSignal: controller.signal,
       });
-      expect(result.success).toBe(false);
-      expect(
-        existsSync(fixture.manager.getWorkspacePath(fixture.projectPath, "cancelled-capability"))
-      ).toBe(false);
+    try {
+      await withUniquePath(first.rootDir, async () => {
+        expect(await create(first, "cached-one")).toMatchObject({ success: true });
+        expect(await create(second, "cached-two")).toMatchObject({ success: true });
+        expect(counter.probes()).toBe(1);
+      });
+      // A different PATH can resolve a different git binary, so it is probed again.
+      await withUniquePath(second.rootDir, async () => {
+        expect(await create(first, "cached-three")).toMatchObject({ success: true });
+        expect(counter.probes()).toBe(2);
+      });
+    } finally {
+      counter.spy.mockRestore();
+      await first.cleanup();
+      await second.cleanup();
+    }
+  });
+
+  it("probes again after a failed git --version and keeps eager creation each time", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    const realExec = disposableExec.execFileAsync;
+    let probes = 0;
+    const execSpy = spyOn(disposableExec, "execFileAsync").mockImplementation(
+      (file, args, options) => {
+        const proc = realExec(file, args, options);
+        if (file === "git" && args[0] === "--version") {
+          probes++;
+          Object.defineProperty(proc, "result", {
+            value: proc.result.then(() => {
+              throw new Error("spawn git ENOENT");
+            }),
+          });
+        }
+        return proc;
+      }
+    );
+    try {
+      await withUniquePath(fixture.rootDir, async () => {
+        for (const branchName of ["missing-git-one", "missing-git-two"]) {
+          const result = await fixture.manager.createWorkspace({
+            projectPath: fixture.projectPath,
+            branchName,
+            trunkBranch: "main",
+            skipRemoteSync: true,
+            trusted: true,
+            initLogger: fixture.initLogger,
+            deferMaterialization: true,
+          });
+          if (!result.success || !result.workspacePath) throw new Error("Expected creation");
+          expect(result.pendingMaterialization).toBeUndefined();
+          expect(existsSync(path.join(result.workspacePath, "README.md"))).toBe(true);
+        }
+        expect(probes).toBe(2);
+      });
+    } finally {
+      execSpy.mockRestore();
+      await fixture.cleanup();
+    }
+  });
+
+  it("honors cancellation before a cached capability result is used", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    const controller = new AbortController();
+    const realExec = disposableExec.execFileAsync;
+    let probes = 0;
+    const execSpy = spyOn(disposableExec, "execFileAsync").mockImplementation(
+      (file, args, options) => {
+        const proc = realExec(file, args, options);
+        if (file === "git" && args[0] === "--version") probes++;
+        // Abort right after the worktree is added, just before capability detection.
+        if (
+          args.includes("worktree") &&
+          args.includes("add") &&
+          args.includes("cancelled-cached")
+        ) {
+          Object.defineProperty(proc, "result", {
+            value: proc.result.then((output) => {
+              controller.abort();
+              return output;
+            }),
+          });
+        }
+        return proc;
+      }
+    );
+    try {
+      await withUniquePath(fixture.rootDir, async () => {
+        const warm = await fixture.manager.createWorkspace({
+          projectPath: fixture.projectPath,
+          branchName: "warm-cache",
+          trunkBranch: "main",
+          skipRemoteSync: true,
+          trusted: true,
+          initLogger: fixture.initLogger,
+          deferMaterialization: true,
+        });
+        expect(warm).toMatchObject({ success: true });
+        const result = await fixture.manager.createWorkspace({
+          projectPath: fixture.projectPath,
+          branchName: "cancelled-cached",
+          trunkBranch: "main",
+          skipRemoteSync: true,
+          trusted: true,
+          initLogger: fixture.initLogger,
+          deferMaterialization: true,
+          abortSignal: controller.signal,
+        });
+        expect(result.success).toBe(false);
+        expect(probes).toBe(1);
+        expect(
+          existsSync(fixture.manager.getWorkspacePath(fixture.projectPath, "cancelled-cached"))
+        ).toBe(false);
+      });
     } finally {
       execSpy.mockRestore();
       await fixture.cleanup();
@@ -1299,6 +1465,7 @@ describe("WorktreeManager.createWorkspace", () => {
       expect(result).toEqual({
         success: true,
         workspacePath: fixture.manager.getWorkspacePath(fixture.projectPath, "feature-submodules"),
+        createdBranch: true,
       });
     } finally {
       await fixture.cleanup();
@@ -1606,6 +1773,50 @@ describe("WorktreeManager.renameWorkspace", () => {
   }, 20_000);
 });
 
+describe("WorktreeManager.renameWorkspace undo (#4779)", () => {
+  const branchOf = (cwd: string) =>
+    execFileSync("git", ["branch", "--show-current"], { cwd, encoding: "utf8" }).trim();
+
+  it.each([
+    // Diverged: directory "foo" tracks branch "bar", renamed to "bar". The forward move leaves the
+    // branch alone, and deriving the undo from names alone would rename "bar" to "foo".
+    { label: "diverged", branchName: "bar", expectedRenamed: false },
+    { label: "name-tracking", branchName: "foo", expectedRenamed: true },
+  ])("$label: undo restores the branch the rename found", async (c) => {
+    const fixture = await createWorktreeManagerFixture();
+    try {
+      const { manager, projectPath, initLogger } = fixture;
+      const created = await manager.createWorkspace({
+        projectPath,
+        branchName: c.branchName,
+        directoryName: "foo",
+        trunkBranch: "main",
+        skipRemoteSync: true,
+        trusted: true,
+        initLogger,
+      });
+      expect(created.success).toBe(true);
+
+      const forward = await manager.renameWorkspace(projectPath, "foo", "bar", true);
+      if (!forward.success) throw new Error(forward.error);
+      expect(forward.branchRenamed).toBe(c.expectedRenamed);
+
+      const undo = await manager.renameWorkspace(projectPath, "bar", "foo", true, {
+        renameBranch: forward.branchRenamed,
+      });
+      if (!undo.success) throw new Error(undo.error);
+      expect(undo.newPath).toBe(forward.oldPath);
+      expect(branchOf(forward.oldPath)).toBe(c.branchName);
+      // The mapping follows too: a later ordinary rename still sees the original branch.
+      const later = await manager.renameWorkspace(projectPath, "foo", "baz", true);
+      if (!later.success) throw new Error(later.error);
+      expect(branchOf(later.newPath)).toBe(c.expectedRenamed ? "baz" : c.branchName);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+});
+
 describe("WorktreeManager.deleteWorkspace", () => {
   it("keeps returning declared results and force-deletes when the main checkout is gone", async () => {
     const fixture = await createWorktreeManagerFixture({
@@ -1908,9 +2119,7 @@ describe("WorktreeManager.deleteWorkspace", () => {
       delete branchMap[workspaceName];
       await fsPromises.writeFile(branchMapPath, `${JSON.stringify(branchMap, null, 2)}\n`);
 
-      await fsPromises.rm(createResult.workspacePath, { recursive: true, force: true });
-      execSync("git worktree prune", { cwd: projectPath, stdio: "ignore" });
-
+      // The checkout is still registered on the name-matching branch: that proves ownership.
       const deleteResult = await manager.deleteWorkspace(projectPath, workspaceName, true);
       expect(deleteResult.success).toBe(true);
 
@@ -1921,6 +2130,47 @@ describe("WorktreeManager.deleteWorkspace", () => {
         .toString()
         .trim();
       expect(branchAfter).toBe("");
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
+  it("keeps a branch named like the workspace when neither a map entry nor a checkout proves ownership", async () => {
+    const fixture = await createWorktreeManagerFixture({
+      tempDirPrefix: "worktree-manager-delete-",
+    });
+
+    try {
+      const { projectPath, manager, initLogger } = fixture;
+      // A removal retry: the first attempt removed the checkout of
+      // "feature/x" (directory feature-x) and dropped its map entry, then deregistration failed.
+      const createResult = await manager.createWorkspace({
+        projectPath,
+        branchName: "feature/x",
+        directoryName: "feature-x",
+        trunkBranch: "main",
+        initLogger,
+        trusted: true,
+      });
+      expect(createResult.success).toBe(true);
+      const first = await manager.deleteWorkspace(projectPath, "feature-x", true);
+      expect(first.success).toBe(true);
+      // The user's own, unrelated branch, one commit ahead so only `branch -D` deletes it.
+      execSync('git branch feature-x "$(git commit-tree "HEAD^{tree}" -p HEAD -m "user work")"', {
+        cwd: projectPath,
+        stdio: "ignore",
+      });
+
+      const retry = await manager.deleteWorkspace(projectPath, "feature-x", true);
+      expect(retry.success).toBe(true);
+
+      const branchAfter = execSync('git branch --list "feature-x"', {
+        cwd: projectPath,
+        stdio: ["ignore", "pipe", "ignore"],
+      })
+        .toString()
+        .trim();
+      expect(branchAfter).toBe("feature-x");
     } finally {
       await fixture.cleanup();
     }

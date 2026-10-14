@@ -61,15 +61,6 @@ describe("formatNameGenerationError", () => {
     expect(formatted.title).toBe("Access denied");
   });
 
-  test("returns policy-specific guidance for policy errors", () => {
-    const result = formatNameGenerationError({
-      type: "policy",
-      provider: "openai",
-    });
-    expect(result.title).toBe("Blocked by policy");
-    expect(result.hint).toContain("administrator");
-  });
-
   test("formats rate_limit with waiting hint", () => {
     const formatted = format({ type: "rate_limit" });
 

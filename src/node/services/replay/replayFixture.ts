@@ -19,9 +19,14 @@ import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { z } from "zod";
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { DevToolsLogEntry } from "@/common/types/devtools";
-import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import {
+  createMuxMessage,
+  type MuxMessage,
+  type PluginHookContextEntry,
+} from "@/common/types/message";
 import { applyCacheControlToTools, type AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import assert from "@/common/utils/assert";
+import { collectDeferLoadingToolNames } from "@/common/utils/tools/toolCatalog";
 import { HistoryService } from "@/node/services/historyService";
 import { emitTurnEnvelope } from "@/node/services/turnEnvelope";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
@@ -64,8 +69,12 @@ const REPLAY_FIXTURE_WIRE_PROVIDER = "anthropic";
 /** One turn appended to a fixture session by appendReplayFixtureTurn. */
 export interface ReplayFixtureTurnSpec {
   userText: string;
+  /** Prompt-hook context saved on the user row (MuxMetadata.pluginHookContext). */
+  pluginHookContext?: PluginHookContextEntry[];
   /** Omit to simulate a stream that failed before appending an assistant row. */
   assistantText?: string;
+  /** Extra assistant-row parts after the text (e.g. completed tool calls). */
+  assistantParts?: MuxMessage["parts"];
   /** Agent handling the request; recorded on the assistant row. Default "exec". */
   agentId?: string;
   systemPrompt: string;
@@ -78,7 +87,13 @@ export interface ReplayFixtureTurnSpec {
   postCompactionAttachments?: PostCompactionAttachment[];
   /** Refusal-fallback partial continuation (envelope-only, never in chat.jsonl). */
   partialContinuation?: MuxMessage;
+  /** MCP Apps model context message (request-only, never in chat.jsonl). */
+  mcpAppModelContext?: MuxMessage;
+  /** Simulate an envelope written without the model context it sent. */
+  envelopeOmitsMcpAppModelContext?: boolean;
   anthropicCacheTtl?: AnthropicCacheTtl;
+  /** Volatile system tail length (production splits it into its own block). */
+  systemVolatileSuffixLength?: number;
   /** Set false to simulate devtools logging being off for this turn. */
   recordDevtools?: boolean;
   /**
@@ -86,6 +101,8 @@ export interface ReplayFixtureTurnSpec {
    * before the final one — simulates retried attempts whose streams failed.
    */
   extraEnvelopeAttempts?: number;
+  /** A trimmed compaction request: the budget production recorded in its DevTools run. */
+  compactionInputBudgetTokens?: number;
 }
 
 /** Mutable state threaded through appendReplayFixtureTurn calls. */
@@ -147,6 +164,7 @@ export async function appendReplayFixtureTurn(
 
   const userMessage = createMuxMessage(`user-${turnNumber}`, "user", spec.userText, {
     timestamp: baseTimestamp,
+    ...(spec.pluginHookContext != null ? { pluginHookContext: spec.pluginHookContext } : {}),
   });
   const requestHistorySequence = await appendOrThrow(ctx, userMessage);
 
@@ -163,6 +181,7 @@ export async function appendReplayFixtureTurn(
       journal: ctx.journal,
       workspaceId: ctx.workspaceId,
       systemMessage: spec.systemPrompt,
+      systemVolatileSuffixLength: spec.systemVolatileSuffixLength,
       tools: spec.tools,
       modelString: REPLAY_FIXTURE_MODEL,
       thinkingLevel: "off",
@@ -174,6 +193,8 @@ export async function appendReplayFixtureTurn(
       planFilePath: spec.planFilePath,
       postCompactionAttachments: spec.postCompactionAttachments,
       partialContinuationMessage: spec.partialContinuation,
+      mcpAppModelContextMessage:
+        spec.envelopeOmitsMcpAppModelContext === true ? undefined : spec.mcpAppModelContext,
     });
   }
 
@@ -181,6 +202,7 @@ export async function appendReplayFixtureTurn(
     const rebuilt = await buildReplayRequest({
       historyMessages: historyResult.data,
       systemPrompt: spec.systemPrompt,
+      systemPromptVolatileSuffixLength: spec.systemVolatileSuffixLength,
       modelString: REPLAY_FIXTURE_MODEL,
       thinkingLevel: "off",
       effectiveAgentId: agentId,
@@ -191,6 +213,10 @@ export async function appendReplayFixtureTurn(
       planFilePath: spec.planFilePath,
       postCompactionAttachments: spec.postCompactionAttachments,
       partialContinuation: spec.partialContinuation,
+      mcpAppModelContext: spec.mcpAppModelContext,
+      // Production derives these from the request tools (assemblePromptPayload).
+      deferLoadingToolNames: collectDeferLoadingToolNames(spec.tools),
+      compactionInputBudgetTokens: spec.compactionInputBudgetTokens,
       workspaceId: ctx.workspaceId,
     });
     // Wire tool definitions use the same cache treatment as the prompt assembler.
@@ -213,6 +239,8 @@ export async function appendReplayFixtureTurn(
         workspaceId: ctx.workspaceId,
         startedAt: new Date(baseTimestamp + 1_000).toISOString(),
         requestHistorySequence,
+        // JSON drops the key when the turn has no budget.
+        compactionInputBudgetTokens: spec.compactionInputBudgetTokens,
       },
     };
     const stepEntry: DevToolsLogEntry = {
@@ -238,6 +266,7 @@ export async function appendReplayFixtureTurn(
         responseHeaders: null,
         rawResponse: null,
         rawChunks: null,
+        inputTransformations: null,
       },
     };
     ctx.devtoolsLines.push(JSON.stringify(runEntry), JSON.stringify(stepEntry));
@@ -256,7 +285,8 @@ export async function appendReplayFixtureTurn(
         requestHistorySequence,
         ...(spec.usage !== undefined ? { usage: spec.usage } : {}),
         ...(spec.providerMetadata !== undefined ? { providerMetadata: spec.providerMetadata } : {}),
-      }
+      },
+      spec.assistantParts
     );
     await appendOrThrow(ctx, assistantMessage);
   }

@@ -17,6 +17,20 @@ describe("AppConfigOnDiskSchema", () => {
     expect(AppConfigOnDiskSchema.safeParse(valid).success).toBe(true);
   });
 
+  it("validates evaluationDefaults and rejects a blank model", () => {
+    expect(
+      AppConfigOnDiskSchema.safeParse({ evaluationDefaults: { model: "openai:gpt-5-mini" } })
+        .success
+    ).toBe(true);
+    expect(AppConfigOnDiskSchema.safeParse({ evaluationDefaults: {} }).success).toBe(true);
+    expect(AppConfigOnDiskSchema.safeParse({ evaluationDefaults: { model: "" } }).success).toBe(
+      false
+    );
+    expect(
+      AppConfigOnDiskSchema.safeParse({ evaluationDefaults: "openai:gpt-5-mini" }).success
+    ).toBe(false);
+  });
+
   it("validates the full-width chat transcript flag", () => {
     expect(AppConfigOnDiskSchema.safeParse({ chatTranscriptFullWidth: true }).success).toBe(true);
     expect(AppConfigOnDiskSchema.safeParse({ chatTranscriptFullWidth: "true" }).success).toBe(

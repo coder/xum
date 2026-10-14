@@ -14,15 +14,7 @@ import {
 
 /** Set localStorage to select a workspace */
 export function selectWorkspace(workspace: FrontendWorkspaceMetadata): void {
-  localStorage.setItem(
-    SELECTED_WORKSPACE_KEY,
-    JSON.stringify({
-      workspaceId: workspace.id,
-      projectPath: workspace.projectPath,
-      projectName: workspace.projectName,
-      namedWorkspacePath: workspace.namedWorkspacePath,
-    })
-  );
+  localStorage.setItem(SELECTED_WORKSPACE_KEY, JSON.stringify({ workspaceId: workspace.id }));
 }
 
 /** Clear workspace selection from localStorage (for sidebar-focused stories) */

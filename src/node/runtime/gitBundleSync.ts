@@ -51,6 +51,30 @@ export async function getOriginUrlForBundle(
 const TRACKING_BRANCHES_COMMAND =
   "for branch in $(git for-each-ref --format='%(refname:short)' refs/remotes/origin/ | grep -v 'origin/HEAD'); do localname=${branch#origin/}; git show-ref --verify --quiet refs/heads/$localname || git branch $localname $branch; done";
 
+/**
+ * Private refs recording which branch tips and stash a standalone repository copy (Docker bundle
+ * clones and forks, SSH `cp -R -P` forks) got from its source. The task_remove lossy check
+ * (subagentRemovalWorkCheck.ts) treats commits these refs hold as the source's, so it counts only
+ * commits the child made; without them it counts every other branch (#5105).
+ */
+export const SOURCE_REF_SNAPSHOT_NAMESPACE = "refs/xum/source-snapshot/";
+
+/**
+ * Shell command, run in the copy before its task branch is created, that replaces the snapshot
+ * with the copy's current branches, remote-tracking refs and stash. Callers treat a failure as
+ * best-effort: a missing snapshot only makes removal refuse more often, never lose work.
+ */
+export function buildSourceRefSnapshotCommand(gitPrefix = ""): string {
+  const ns = SOURCE_REF_SNAPSHOT_NAMESPACE;
+  // A fork of a copy inherits the parent's snapshot, which describes the parent's source, not the
+  // parent: clear it before recording the copy's own refs. Only update-ref needs the prefix: it runs
+  // the reference-transaction hook, while for-each-ref runs no repository automation.
+  return (
+    `git for-each-ref '--format=delete %(refname)' ${ns} | ${gitPrefix}git update-ref --stdin && ` +
+    `git for-each-ref '--format=update ${ns}%(refname) %(objectname)' refs/heads/ refs/remotes/ refs/stash | ${gitPrefix}git update-ref --stdin`
+  );
+}
+
 export interface GitBundleSyncParams {
   /** Local project path (where git bundle is created) */
   projectPath: string;
@@ -168,6 +192,14 @@ export async function syncProjectViaGitBundle(params: GitBundleSyncParams): Prom
       abortSignal,
     });
     await trackingStream.exitCode;
+
+    // Before a URL-less origin (and its origin/* refs) goes away: record the source's branches for
+    // the task_remove lossy check (#5105). Best-effort, like the tracking branches.
+    const snapshotStream = await exec(
+      buildSourceRefSnapshotCommand(gitNoHooksPrefix(params.trusted)),
+      { cwd: workspacePath, timeout: 30, abortSignal }
+    );
+    await snapshotStream.exitCode;
 
     // Update origin remote.
     if (originUrl) {

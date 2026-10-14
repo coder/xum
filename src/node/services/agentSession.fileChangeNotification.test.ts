@@ -6,17 +6,9 @@ import { join } from "path";
 import { createMuxMessage } from "@/common/types/message";
 import type { MuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
-import type { Config } from "@/node/config";
 import type { AgentSession } from "./agentSession";
-import type { AIService, StreamMessageOptions } from "./aiService";
-import type { BackgroundProcessManager } from "./backgroundProcessManager";
-import type { InitStateManager } from "./initStateManager";
-import { createTestHistoryService } from "./testHistoryService";
-import {
-  createStartedTurnHandle,
-  createStreamLifecycleMocks,
-  createTestAgentSession,
-} from "./agentSession.testHarness";
+import type { StreamMessageOptions } from "./aiService";
+import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 
 /**
  * Log purity: externally-edited files must produce a durable <system-file-update>
@@ -42,46 +34,21 @@ describe("AgentSession file-change notification (turn start)", () => {
 
   /** Real history service + mocked AI service, seeded with one user row. */
   async function createSessionFixture() {
-    const { historyService, config, cleanup } = await createTestHistoryService();
-    historyCleanup = cleanup;
-    await historyService.appendToHistory(
-      "ws",
-      createMuxMessage("user-1", "user", "hello", { timestamp: Date.now() })
-    );
-
     const capturedRequests: MuxMessage[][] = [];
     const streamMessage = mock((opts: StreamMessageOptions) => {
       capturedRequests.push(opts.messages);
       return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      on: mock(() => aiService),
-      off: mock(() => aiService),
-      stopStream: mock(() => Promise.resolve(Ok(undefined))),
-      isStreaming: mock(() => false),
-      streamMessage,
-    } as unknown as AIService;
-
-    const initStateManager: InitStateManager = {
-      on: mock(() => initStateManager),
-      off: mock(() => initStateManager),
-    } as unknown as InitStateManager;
-
-    const backgroundProcessManager: BackgroundProcessManager = {
-      cleanup: mock(() => Promise.resolve()),
-      setMessageQueued: mock(() => undefined),
-    } as unknown as BackgroundProcessManager;
-
-    const session = createTestAgentSession({
+    const { historyService, session, cleanup } = await createAgentSessionHarness({
       workspaceId: "ws",
-      config: config as unknown as Config,
-      historyService,
-      aiService,
-      initStateManager,
-      backgroundProcessManager,
+      aiServiceOverrides: { streamMessage },
     });
+    historyCleanup = cleanup;
     sessions.push(session);
+    await historyService.appendToHistory(
+      "ws",
+      createMuxMessage("user-1", "user", "hello", { timestamp: Date.now() })
+    );
 
     return { historyService, session, capturedRequests, streamMessage };
   }

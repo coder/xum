@@ -25,7 +25,7 @@ There is no library entry, so we generate one:
   `exported` set** (there is no `.d.ts` to derive it from, so without this every
   storybook title drops as `[TITLE_UNMAPPED]`).
 - The barrel also exports the providers the preview harness needs
-  (PROVIDER_LINES: Theme, Tooltip, API, Policy, Experiments, Settings, Router,
+  (PROVIDER_LINES: Theme, Tooltip, API, Experiments, Settings, Router,
   Project, AboutDialog) so they live on `window.Mux` and previews can shim to
   them. `cfg.provider` references `window.Mux.ThemeProvider`.
 
@@ -79,7 +79,7 @@ per component, in `.design-sync/previews/<RealName>.tsx`:
 
 - Each renders the component DIRECTLY with inline mock props, inside
   `MuxPreviewShell` (`.design-sync/preview-harness.tsx`) — a lightweight provider
-  chain (theme, API+mock client, experiments, policy, router, project, settings,
+  chain (theme, API+mock client, experiments, router, project, settings,
   about-dialog, tooltip) WITHOUT the app shell. No heavy renderers.
 - **`MuxPreviewShell` injects a `height:auto` reset** for `html,body,#root,
   #storybook-root`. globals.css pins those to `100vh;min-height:100vh` (so the

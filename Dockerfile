@@ -20,7 +20,7 @@ WORKDIR /app
 ARG RELEASE_TAG
 
 # Install bun (used for package management and build tooling)
-RUN npm install -g bun@1.2
+RUN npm install -g bun@1.4.3
 
 # Install git (needed for version generation) and build tools for native modules
 # bzip2 is required for lzma-native to extract its bundled xz source tarball
@@ -46,11 +46,12 @@ RUN ELECTRON_SKIP_BINARY_DOWNLOAD=1 bun install --frozen-lockfile && \
 # Copy build orchestration files used by Make targets.
 COPY Makefile fmt.mk ./
 
-# Copy source files needed for build
+# Copy source files needed for build.
+# Keep the `docker` path filter in .github/workflows/pr.yml in sync with these COPY lines.
 COPY src/ src/
 COPY tsconfig.json tsconfig.main.json ./
 COPY scripts/generate-version.sh scripts/generate-builtin-agents.sh scripts/generate-builtin-skills.sh scripts/
-COPY scripts/gen_builtin_skills.ts scripts/gen_workflow_runtime_sources.ts scripts/
+COPY scripts/gen_builtin_skills.ts scripts/gen_workflow_runtime_sources.ts scripts/precompress-static.ts scripts/
 COPY docs/ docs/
 COPY index.html terminal.html desktop.html vite.config.ts ./
 COPY public/ public/
@@ -70,7 +71,10 @@ RUN git init && \
 # This runs version generation, builtin content generation, main+renderer builds,
 # server bundle creation, worker bundle creation, and runtime artifact assertions.
 # Thread RELEASE_TAG through to scripts/generate-version.sh when CI provides it.
-RUN RELEASE_TAG="${RELEASE_TAG}" make verify-docker-runtime-artifacts
+# The runtime image is glibc (node:22-slim): drop DuckDB's musl bindings before the
+# runtime stage copies node_modules/@duckdb for the analytics worker.
+RUN RELEASE_TAG="${RELEASE_TAG}" make verify-docker-runtime-artifacts && \
+    rm -rf node_modules/@duckdb/node-bindings-*-musl
 
 # ==============================================================================
 # Stage 2: Runtime
@@ -111,6 +115,8 @@ COPY --from=builder /app/node_modules/sharp ./node_modules/sharp
 COPY --from=builder /app/node_modules/@img ./node_modules/@img
 COPY --from=builder /app/node_modules/detect-libc ./node_modules/detect-libc
 COPY --from=builder /app/node_modules/semver ./node_modules/semver
+# - @duckdb: native bindings for dist/runtime/analyticsWorker.js (#5603); they also use detect-libc
+COPY --from=builder /app/node_modules/@duckdb ./node_modules/@duckdb
 
 # - resvg-wasm: public JS and wasm asset stay together for the isolated SVG decoder.
 COPY --from=builder /app/node_modules/@resvg/resvg-wasm ./node_modules/@resvg/resvg-wasm
@@ -121,6 +127,12 @@ COPY --from=builder /app/dist/static ./dist/static
 COPY --from=builder /app/dist/*.html ./dist/
 COPY --from=builder /app/dist/*.css ./dist/
 COPY --from=builder /app/dist/*.js ./dist/
+COPY --from=builder /app/dist/*.br /app/dist/*.gz ./dist/
+# Vite also writes public/ (manifest, icons, font licenses) and hashed font files
+# to dist/ (#5964). Copy them by extension: dist/ also holds tsc output folders
+# and *.map files that the bundled server never reads.
+COPY --from=builder /app/dist/*.json /app/dist/*.ico /app/dist/*.png /app/dist/*.txt ./dist/
+COPY --from=builder /app/dist/*.woff /app/dist/*.woff2 /app/dist/*.ttf ./dist/
 
 # Copy TypeScript lib files used by the bundled PTC validator at server startup.
 COPY --from=builder /app/dist/typescript-lib ./dist/typescript-lib
@@ -136,6 +148,16 @@ ENV NODE_ENV=production
 ENV XUM_ROOT=/root/.mux
 ENV MUX_ROOT=/root/.mux
 
+# Node 22 runs AsyncLocalStorage on async_hooks promise hooks. Xum keeps those
+# hooks on for the whole backend lifetime, and they cost a measurable share of
+# backend CPU. --experimental-async-context-frame switches Node 22.7+ to the
+# AsyncContextFrame implementation. Node 24+ already uses it by default and
+# rejects the flag as a fatal "bad option", so the flag goes only on the
+# ENTRYPOINT below, never in NODE_OPTIONS (child processes inherit that).
+# Remove the flag when this image moves to Node 24.
+# Fail the build if this Node rejects the flag or ignores it.
+RUN node --experimental-async-context-frame -e 'const { AsyncLocalStorage } = require("node:async_hooks"); if (!String(AsyncLocalStorage).includes("AsyncContextFrame")) { console.error("AsyncContextFrame is not active"); process.exit(1); }'
+
 # Expose server port
 EXPOSE 3000
 
@@ -146,5 +168,6 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
 # Run bundled xum server
 # --host 0.0.0.0: bind to all interfaces (required for Docker networking)
 # --port 3000: default port (can be remapped via docker run -p)
-ENTRYPOINT ["node", "dist/runtime/server-bundle.js"]
+# --experimental-async-context-frame: see the build-time check above.
+ENTRYPOINT ["node", "--experimental-async-context-frame", "dist/runtime/server-bundle.js"]
 CMD ["--host", "0.0.0.0", "--port", "3000"]

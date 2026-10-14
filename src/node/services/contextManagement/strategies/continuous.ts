@@ -1,6 +1,7 @@
 import assert from "@/common/utils/assert";
 import type { SendMessageOptions, ProvidersConfigMap } from "@/common/orpc/types";
 import type { MuxMessage, CompactionFollowUpRequest } from "@/common/types/message";
+import { FORCE_COMPACTION_BUFFER_PERCENT } from "@/common/constants/ui";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import { isAnthropic1MEffectivelyEnabled } from "@/common/utils/ai/providerOptions";
 import { injectPostCompactionAttachments } from "@/browser/utils/messages/modelMessageTransform";
@@ -92,7 +93,7 @@ export class ContinuousStrategy {
         const attachments = await this.buildContinuousCompactionAttachments(head);
         return { ...prepared, attachments };
       },
-      summarize: (head, signal, context: SessionCompactionContext) => {
+      summarize: (head, signal, context: SessionCompactionContext, receiptRows) => {
         const baseOptions = context.sendOptions ?? { model: context.model, agentId: "exec" };
         const request = this.host.buildAutoCompactionRequest({
           baseOptions,
@@ -105,6 +106,7 @@ export class ContinuousStrategy {
           aiService: this.deps.aiService,
           sessionUsageService: this.deps.sessionUsageService,
           head,
+          receiptRows,
           signal,
           context,
           baseOptions,
@@ -147,10 +149,7 @@ export class ContinuousStrategy {
     this.lastThreshold = { model, threshold };
     const providersConfig = this.host.state.providersConfig;
     const selection = resolveContextStrategy({
-      experiments: options?.experiments,
-      isEnabled: (id) =>
-        typeof this.deps.aiService.isExperimentEnabled === "function" &&
-        this.deps.aiService.isExperimentEnabled(id),
+      isEnabled: (id) => this.deps.aiService.isExperimentEnabled(id),
       isCompactionRequest: isCompactionRequestMetadata(options?.muxMetadata),
     });
     return {
@@ -335,6 +334,7 @@ export class ContinuousStrategy {
       agentInitiated: context.agentInitiated,
       goalKind: context.goalKind,
       goalId: context.goalId,
+      taskTurnKind: context.taskTurnKind,
       muxMetadata: context.workspaceTurnMetadata,
       autoModelRouting: context.autoModelRouting,
     });
@@ -369,9 +369,10 @@ export class ContinuousStrategy {
         this.host.coordinator.admissionBlocked
       )
         return;
+      const threshold = this.resolveThreshold(context.modelString);
       const pressure = this.monitor.checkBeforeSend({
         model: context.modelString,
-        threshold: this.resolveThreshold(context.modelString),
+        threshold,
         usage: this.host.state.usage,
         use1MContext: is1MContextEnabledForModel(
           context.modelString,
@@ -380,13 +381,20 @@ export class ContinuousStrategy {
         ),
         providersConfig: context.providersConfig,
       });
-      if (pressure.shouldForceCompact) {
+      // Same no-relief guard as the legacy paths (#4421, #4796): after an auto-compaction that
+      // brought no relief, resume the turn with a plain Continue instead of compacting again.
+      const forceCompact =
+        pressure.shouldForceCompact &&
+        !this.monitor.suppressRepeatedAutoCompaction("mid-stream", pressure.usagePercentage);
+      if (forceCompact) {
         await eventSpine.run("compaction.prepare", {
           workspaceId: this.host.workspaceId,
           reason: "mid-stream",
         });
+        // The guard arms only if this compaction completes.
+        this.monitor.noteAutoCompactionRequested(threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT);
       }
-      const fallback = pressure.shouldForceCompact
+      const fallback = forceCompact
         ? this.host.buildAutoCompactionRequest({
             baseOptions: context.options,
             followUpContent: followUp,
@@ -403,6 +411,7 @@ export class ContinuousStrategy {
           agentInitiated: fallback?.agentInitiated ?? context.agentInitiated,
           goalKind: fallback ? undefined : context.goalKind,
           goalId: fallback ? undefined : context.goalId,
+          taskTurnKind: fallback ? undefined : context.taskTurnKind,
         },
         {
           stream: context,

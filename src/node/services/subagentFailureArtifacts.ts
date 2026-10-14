@@ -3,6 +3,7 @@ import * as path from "node:path";
 
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
+import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 
@@ -103,16 +104,63 @@ export async function readSubagentFailureArtifact(
   }
 
   // Self-healing: drop malformed entries instead of surfacing partial data.
-  if (
-    typeof entry.errorMessage !== "string" ||
-    entry.errorMessage.length === 0 ||
-    typeof entry.errorType !== "string" ||
-    !isStringArray(entry.ancestorWorkspaceIds)
-  ) {
-    return null;
-  }
+  return isWellFormedFailureArtifact(entry) ? entry : null;
+}
 
-  return entry;
+function isWellFormedFailureArtifact(entry: SubagentFailureArtifact): boolean {
+  return (
+    typeof entry.errorMessage === "string" &&
+    entry.errorMessage.length > 0 &&
+    typeof entry.errorType === "string" &&
+    isStringArray(entry.ancestorWorkspaceIds)
+  );
+}
+
+/**
+ * Fail-closed read for attempt classification (G2): unlike readSubagentFailureArtifact, which
+ * self-heals a damaged file to "no failure", a present but unparseable file or entry is
+ * `unreadable`, so a terminal failure is never mistaken for an attempt that merely ended.
+ */
+export async function readSubagentFailureArtifactStrict(
+  workspaceSessionDir: string,
+  childTaskId: string
+): Promise<
+  | { kind: "found"; artifact: SubagentFailureArtifact }
+  | { kind: "not_found" }
+  | { kind: "unreadable"; error: string }
+> {
+  let raw: string;
+  try {
+    raw = await fsPromises.readFile(
+      getSubagentFailureArtifactsFilePath(workspaceSessionDir),
+      "utf-8"
+    );
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      return { kind: "not_found" };
+    }
+    return { kind: "unreadable", error: getErrorMessage(error) };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    return { kind: "unreadable", error: getErrorMessage(error) };
+  }
+  const file = parsed as { version?: unknown; failuresByChildTaskId?: unknown } | null;
+  if (
+    file?.version !== SUBAGENT_FAILURE_ARTIFACTS_FILE_VERSION ||
+    file.failuresByChildTaskId == null ||
+    typeof file.failuresByChildTaskId !== "object"
+  ) {
+    return { kind: "unreadable", error: "unexpected failure artifacts file shape" };
+  }
+  const failures = file.failuresByChildTaskId as Record<string, SubagentFailureArtifact>;
+  if (!Object.hasOwn(failures, childTaskId)) return { kind: "not_found" };
+  const artifact = failures[childTaskId];
+  return artifact != null && typeof artifact === "object" && isWellFormedFailureArtifact(artifact)
+    ? { kind: "found", artifact }
+    : { kind: "unreadable", error: "malformed failure artifact entry" };
 }
 
 export async function upsertSubagentFailureArtifact(params: {

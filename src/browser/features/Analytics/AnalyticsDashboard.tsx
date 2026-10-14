@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
-import { ArrowLeft, Menu } from "lucide-react";
+import { useState } from "react";
+import { X } from "lucide-react";
+import { Dialog, DialogContent, DialogTitle } from "@/browser/components/Dialog/Dialog";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useRouter } from "@/browser/contexts/RouterContext";
 import {
@@ -14,12 +15,10 @@ import {
   useAnalyticsTokensByModel,
   useSavedQueries,
 } from "@/browser/hooks/useAnalytics";
-import { DESKTOP_TITLEBAR_HEIGHT_CLASS, isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { isEditableElement, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
+import type { useModalFocusReturn } from "@/browser/hooks/useModalFocusReturn";
+import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { ToggleGroup } from "@/browser/components/ToggleGroup/ToggleGroup";
 import { Button } from "@/browser/components/Button/Button";
-import { cn } from "@/common/lib/utils";
 import { AgentCostChart } from "./AgentCostChart";
 import { DelegationChart } from "./DelegationChart";
 import { SavedQueryPanel } from "./SavedQueryPanel";
@@ -32,35 +31,7 @@ import { TimingChart } from "./TimingChart";
 import { TokensByModelChart } from "./TokensByModelChart";
 import { formatProjectDisplayName } from "./analyticsUtils";
 import { buildTimeFilterPredicate } from "./sqlTimeFilter";
-
-interface AnalyticsDashboardProps {
-  leftSidebarCollapsed: boolean;
-  onToggleLeftSidebarCollapsed: () => void;
-}
-
-type TimeRange = "7d" | "30d" | "90d" | "all";
-type TimingMetric = "ttft" | "duration" | "tps";
-type TimeZoneMode = "local" | "utc";
-
-const VALID_TIME_RANGES = new Set<string>(["7d", "30d", "90d", "all"]);
-const VALID_TIMING_METRICS = new Set<string>(["ttft", "duration", "tps"]);
-
-const VALID_TIME_ZONE_MODES = new Set<string>(["local", "utc"]);
-const ANALYTICS_TIME_RANGE_STORAGE_KEY = "analytics:timeRange";
-const ANALYTICS_TIMING_METRIC_STORAGE_KEY = "analytics:timingMetric";
-const ANALYTICS_TIME_ZONE_MODE_STORAGE_KEY = "analytics:timeZoneMode";
-
-/** Coerce a persisted value to a known TimeRange, falling back to "30d" if stale/corrupted. */
-function normalizeTimeRange(value: unknown): TimeRange {
-  return typeof value === "string" && VALID_TIME_RANGES.has(value) ? (value as TimeRange) : "30d";
-}
-
-/** Coerce a persisted value to a known TimingMetric, falling back to "duration" if stale/corrupted. */
-function normalizeTimingMetric(value: unknown): TimingMetric {
-  return typeof value === "string" && VALID_TIMING_METRICS.has(value)
-    ? (value as TimingMetric)
-    : "duration";
-}
+import type { AnalyticsTimeRange } from "@/common/config/schemas/userPreferences";
 
 /** Build a calendar-date boundary for the selected timezone. */
 function getDateKeyInTimeZone(date: Date, timeZone: string): string {
@@ -94,7 +65,7 @@ function daysAgoInTimeZone(days: number, timeZone: string): Date {
 }
 
 function computeDateRange(
-  timeRange: TimeRange,
+  timeRange: AnalyticsTimeRange,
   timeZone: string
 ): {
   from: Date | null;
@@ -116,40 +87,64 @@ function computeDateRange(
   }
 }
 
-/** Coerce a persisted value to a supported timezone mode. */
-function normalizeTimeZoneMode(value: unknown): TimeZoneMode {
-  return typeof value === "string" && VALID_TIME_ZONE_MODES.has(value)
-    ? (value as TimeZoneMode)
-    : "local";
-}
-
 function getBrowserTimeZone(): string {
   return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 }
 
-export function AnalyticsDashboard(props: AnalyticsDashboardProps) {
-  const { navigateFromAnalytics } = useRouter();
+/**
+ * Analytics renders as a route-backed modal over the page it was opened from (like Settings), so
+ * the chat underneath stays mounted and keeps its draft and scroll position.
+ */
+// The caller owns the focus-return hook: this dashboard is lazy-loaded and first mounts already
+// open, so it cannot record the opener itself (see LazyAnalyticsDashboard).
+export function AnalyticsDashboard(props: { focusReturn: ReturnType<typeof useModalFocusReturn> }) {
+  const { isAnalyticsOpen, navigateFromAnalytics } = useRouter();
+
+  return (
+    <Dialog open={isAnalyticsOpen} onOpenChange={(open) => !open && navigateFromAnalytics()}>
+      {/* Phone widths get a full-screen sheet; md+ gets a large centered dialog. */}
+      <DialogContent
+        showCloseButton={false}
+        // Escape in the SQL explorer (or any other text field) stays with that field instead of
+        // closing the dialog, which would unmount unsaved query text. This matches Settings and
+        // the previous page-level Escape handler, which also ignored editable targets. A focused
+        // <select> (the autofocused project filter) still lets Escape close the dialog.
+        allowEditableEscape
+        aria-describedby={undefined}
+        onOpenAutoFocus={props.focusReturn.onOpenAutoFocus}
+        onCloseAutoFocus={props.focusReturn.onCloseAutoFocus}
+        className="max-md:ios-standalone:top-px max-md:ios-standalone:h-[calc(100%-1px)] top-0 left-0 flex h-full w-full max-w-none translate-x-0 translate-y-0 flex-col gap-0 overflow-hidden rounded-none border-0 p-0 pt-[env(safe-area-inset-top)] md:top-[50%] md:left-[50%] md:h-[min(880px,88vh)] md:w-[min(1100px,92vw)] md:translate-x-[-50%] md:translate-y-[-50%] md:rounded-lg md:border"
+      >
+        {/* Mounted only while open, so closed analytics issues no queries. */}
+        <AnalyticsDashboardContent />
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={navigateFromAnalytics}
+          // Phones get a 44px touch target that still fits the header's pr-12 gutter; md+ keeps
+          // the compact Settings-style button. Placed by its center (translate classes) so the
+          // touch 44px minimum cannot push it below the title at exactly 768px, where the md: size
+          // and that minimum both apply.
+          className="absolute top-[calc(env(safe-area-inset-top)+1.5rem)] right-[1.625rem] h-11 w-11 translate-x-1/2 -translate-y-1/2 md:right-7 md:h-6 md:w-6"
+          aria-label="Close analytics"
+        >
+          <X className="h-4 w-4" />
+        </Button>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function AnalyticsDashboardContent() {
   const { userProjects } = useProjectContext();
 
   const [projectPath, setProjectPath] = useState<string | null>(null);
-  const [rawTimeRange, setTimeRange] = usePersistedState<TimeRange>(
-    ANALYTICS_TIME_RANGE_STORAGE_KEY,
-    "30d"
-  );
-  const [rawTimingMetric, setTimingMetric] = usePersistedState<TimingMetric>(
-    ANALYTICS_TIMING_METRIC_STORAGE_KEY,
-    "duration"
-  );
-  const [rawTimeZoneMode, setTimeZoneMode] = usePersistedState<TimeZoneMode>(
-    ANALYTICS_TIME_ZONE_MODE_STORAGE_KEY,
-    "local"
-  );
-
-  // Coerce persisted values to known enums — stale/corrupted localStorage
-  // entries self-heal to defaults instead of crashing the dashboard.
-  const timeRange = normalizeTimeRange(rawTimeRange);
-  const timingMetric = normalizeTimingMetric(rawTimingMetric);
-  const timeZoneMode = normalizeTimeZoneMode(rawTimeZoneMode);
+  const timeRange =
+    useUserPreferences((preferences) => preferences.ui?.analyticsTimeRange) ?? "30d";
+  const timingMetric =
+    useUserPreferences((preferences) => preferences.ui?.analyticsTimingMetric) ?? "duration";
+  const timeZoneMode =
+    useUserPreferences((preferences) => preferences.ui?.analyticsTimeZoneMode) ?? "local";
   const timeZone = timeZoneMode === "utc" ? "UTC" : getBrowserTimeZone();
 
   const dateRange = computeDateRange(timeRange, "UTC");
@@ -213,79 +208,16 @@ export function AnalyticsDashboard(props: AnalyticsDashboardProps) {
     }))
     .sort((a, b) => a.label.localeCompare(b.label));
 
-  const desktopMode = isDesktopMode();
-
-  // Close analytics on Escape. Uses bubble phase so inner surfaces (Select dropdowns,
-  // Popover) that call stopPropagation/preventDefault on Escape get first
-  // right of refusal—only an unclaimed Escape navigates away from analytics.
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (!matchesKeybind(e, KEYBINDS.CANCEL)) return;
-      if (e.defaultPrevented) return;
-      if (isEditableElement(e.target)) return;
-
-      e.preventDefault();
-      e.stopPropagation();
-      navigateFromAnalytics();
-    };
-
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [navigateFromAnalytics]);
-
   return (
-    <div className="bg-surface-primary flex min-h-0 flex-1 flex-col overflow-hidden">
+    <>
       <div
         data-testid="analytics-header"
-        className={cn(
-          `bg-surface-primary border-border-light titlebar-safe-right 
-          titlebar-safe-right-gutter-3 flex shrink-0 items-center gap-2 border-b px-3`,
-          desktopMode
-            ? `${DESKTOP_TITLEBAR_HEIGHT_CLASS} titlebar-drag flex-nowrap`
-            : "flex-wrap py-2 md:h-8 md:flex-nowrap md:py-0"
-        )}
+        // pr-12 keeps the wrapped controls clear of the absolutely positioned close button.
+        className="border-border-medium flex shrink-0 flex-wrap items-center gap-2 border-b py-3 pr-12 pl-4"
       >
-        <div
-          className={cn(
-            "flex min-w-0 items-center gap-2",
-            desktopMode ? "w-auto titlebar-no-drag" : "w-full md:w-auto"
-          )}
-        >
-          {props.leftSidebarCollapsed && (
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={props.onToggleLeftSidebarCollapsed}
-              title="Open sidebar"
-              aria-label="Open sidebar"
-              // The left sidebar is fully off-canvas on narrow viewports, so this route must
-              // expose the shared mobile menu control instead of hiding its only opener.
-              className="mobile-menu-btn text-muted hover:text-foreground hidden h-6 w-6 md:inline-flex"
-            >
-              <Menu className="h-4 w-4" />
-            </Button>
-          )}
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={navigateFromAnalytics}
-            className="text-muted hover:text-foreground h-6 gap-1 px-2 text-xs"
-            title="Back"
-            aria-label="Back to previous view"
-          >
-            <ArrowLeft className="h-3.5 w-3.5" />
-            Back
-          </Button>
-          <h1 className="text-foreground text-sm font-semibold">Analytics</h1>
-        </div>
+        <DialogTitle className="text-sm leading-normal tracking-normal">Analytics</DialogTitle>
 
-        <div
-          className={cn(
-            desktopMode
-              ? "titlebar-no-drag ml-auto flex min-w-fit items-center gap-2"
-              : "flex w-full min-w-0 flex-wrap items-center gap-2 md:ml-auto md:w-auto md:min-w-fit md:flex-nowrap"
-          )}
-        >
+        <div className="flex w-full min-w-0 flex-wrap items-center gap-2 md:ml-auto md:w-auto">
           {/* Keep the project control labeled on mobile for screen readers while
               keeping the compact mobile header visually uncluttered. */}
           <label
@@ -319,7 +251,9 @@ export function AnalyticsDashboard(props: AnalyticsDashboardProps) {
                 { value: "utc", label: "UTC" },
               ]}
               value={timeZoneMode}
-              onChange={setTimeZoneMode}
+              onChange={(analyticsTimeZoneMode) =>
+                updateUserPreferences({ ui: { analyticsTimeZoneMode } })
+              }
             />
           </div>
 
@@ -337,7 +271,7 @@ export function AnalyticsDashboard(props: AnalyticsDashboardProps) {
                 variant={timeRange === range ? "secondary" : "ghost"}
                 size="sm"
                 className="h-6 px-2 text-xs"
-                onClick={() => setTimeRange(range)}
+                onClick={() => updateUserPreferences({ ui: { analyticsTimeRange: range } })}
               >
                 {label}
               </Button>
@@ -346,7 +280,7 @@ export function AnalyticsDashboard(props: AnalyticsDashboardProps) {
         </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-4">
+      <div className="min-h-0 min-w-0 flex-1 overflow-y-auto p-4">
         <div className="mx-auto flex w-full max-w-6xl flex-col gap-4">
           <SummaryCards data={summary.data} loading={summary.loading} error={summary.error} />
           <SpendChart
@@ -367,7 +301,9 @@ export function AnalyticsDashboard(props: AnalyticsDashboardProps) {
             loading={timingDistribution.loading}
             error={timingDistribution.error}
             metric={timingMetric}
-            onMetricChange={setTimingMetric}
+            onMetricChange={(analyticsTimingMetric) =>
+              updateUserPreferences({ ui: { analyticsTimingMetric } })
+            }
           />
           <ProviderCacheHitChart
             data={providerCacheHitRatios.data}
@@ -400,6 +336,6 @@ export function AnalyticsDashboard(props: AnalyticsDashboardProps) {
           <SqlExplorer onSaveQuery={saveQuery} timeFilterSql={timeFilterSql} />
         </div>
       </div>
-    </div>
+    </>
   );
 }

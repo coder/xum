@@ -16,9 +16,11 @@ import {
   createMuxMessage,
   type CompactionFollowUpRequest,
   type MuxMessage,
+  type MuxMetadata,
 } from "@/common/types/message";
 import { selectRollingCut, type RollingCut } from "@/common/utils/compaction/rollingCut";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import {
   isDurableContextBoundaryMarker,
   sliceMessagesFromLatestCompactionBoundary,
@@ -43,6 +45,11 @@ interface StreamSnapshot {
   parts: MuxMessage["parts"];
   stepStartIndices: readonly number[];
   currentStepStartIndex: number;
+  // The live turn's Anthropic thinking-repair receipt can exist only in memory (#5996).
+  initialMetadata?: Pick<
+    MuxMetadata,
+    "anthropicThinkingReplay" | "anthropicThinkingReplayFromStep"
+  >;
 }
 interface Dependencies {
   workspaceId: string;
@@ -69,7 +76,10 @@ interface Dependencies {
   summarize(
     head: MuxMessage[],
     signal: AbortSignal,
-    context: ContinuousCompactionContext
+    context: ContinuousCompactionContext,
+    // The whole segment, for the thinking-repair receipt: it can sit in the retained tail
+    // while the head holds signed thinking it says must stay out (#5996).
+    receiptRows: MuxMessage[]
   ): Promise<{ text: string; model: string } | null>;
   fastApply(
     apply: (pendingFollowUp?: CompactionFollowUpRequest) => Promise<boolean>
@@ -88,8 +98,11 @@ interface StagedSummary {
   attachmentTokens: number;
 }
 
-/** Only durable request-affecting metadata participates: committing a partial is not an edit. */
-function fingerprint(rows: MuxMessage[]): string {
+/**
+ * Only durable request-affecting metadata participates: committing a partial is not an edit.
+ * Exported for journal compatibility tests (fingerprints persisted by earlier builds).
+ */
+export function fingerprint(rows: MuxMessage[]): string {
   const hash = createHash("sha256");
   for (const row of rows) {
     const metadata = row.metadata;
@@ -125,6 +138,20 @@ function boundaryIdentity(rows: MuxMessage[]): { epoch: number; boundarySequence
     epoch: boundary?.metadata?.compactionEpoch ?? 0,
     boundarySequence: boundary?.metadata?.historySequence,
   };
+}
+
+/**
+ * Rows a journal's source fingerprint covers: everything before the live source plus the
+ * source's committed parts. Journals compare what the model saw (the visible projection, like
+ * the cut and head), so hidden records appended while the stream runs cannot invalidate them;
+ * raw snapshot equality still fences publication (see finalizeJournal's shouldPersist).
+ */
+function journalSourceRows(
+  rows: MuxMessage[],
+  source: MuxMessage,
+  partIndex: number
+): MuxMessage[] {
+  return [...rows.slice(0, -1), { ...source, parts: source.parts.slice(0, partIndex) }];
 }
 
 /** Background summary + recent pages. Only the short apply is serialized with the turn. */
@@ -312,7 +339,17 @@ export class ContinuousCompactor {
       rows[index] = {
         ...rows[index],
         parts: structuredClone(live.parts),
-        metadata: { ...rows[index].metadata, stepStartPartIndices: [...live.stepStartIndices] },
+        metadata: {
+          ...rows[index].metadata,
+          stepStartPartIndices: [...live.stepStartIndices],
+          ...(live.initialMetadata?.anthropicThinkingReplay === "off"
+            ? {
+                anthropicThinkingReplay: "off" as const,
+                anthropicThinkingReplayFromStep:
+                  live.initialMetadata.anthropicThinkingReplayFromStep,
+              }
+            : {}),
+        },
       };
     }
     return rows;
@@ -339,9 +376,15 @@ export class ContinuousCompactor {
       if (index < 0) return;
       rows[index] = { ...rows[index], parts: structuredClone(live.parts.slice(0, completedEnd)) };
     }
-    context = await this.withAttachmentEstimate(rows, context);
+    // Model-hidden rows (workflow display, plan-review records) never reach a request, so they
+    // must not count toward cut selection, attachment estimation, or the summarizer's input:
+    // a large plan snapshot in the tail cluster would otherwise force a smaller retained tail
+    // (or no cut at all) and feed the summarizer text the model never saw. Structural evidence
+    // (boundaryIdentity, fingerprints of the persisted rows) keeps reading the raw snapshot.
+    const visibleRows = rows.filter((row) => !isModelHiddenMessage(row));
+    context = await this.withAttachmentEstimate(visibleRows, context);
     if (job.generation !== this.generation) return;
-    const cut = selectRollingCut(rows, live ?? null, {
+    const cut = selectRollingCut(visibleRows, live ?? null, {
       contextWindowTokens: context.contextWindowTokens,
       // Before the model call only the system/attachment cost is known. Reject
       // provably oversized tails now, then check the actual summary before staging.
@@ -366,7 +409,7 @@ export class ContinuousCompactor {
       headEnd: { id: headEnd.id, sequence: headEnd.metadata.historySequence },
       headFingerprint: fingerprint(cut.head),
     };
-    const summary = await this.deps.summarize(cut.head, job.abort.signal, context);
+    const summary = await this.deps.summarize(cut.head, job.abort.signal, context, rows);
     if (!summary || job.generation !== this.generation || job.abort.signal.aborted) return;
     assert(summary.text.trim().length > 0, "Continuous summarizer returned empty text");
     const staged = { ...stagedBase, ...summary, attachmentTokens: context.attachmentTokens ?? 0 };
@@ -380,6 +423,8 @@ export class ContinuousCompactor {
   }
 
   private headFromRows(staged: StagedSummary, rows: MuxMessage[]): MuxMessage[] | null {
+    // Same visible projection the cut was selected from, so the fingerprint stays comparable.
+    rows = rows.filter((row) => !isModelHiddenMessage(row));
     const end = rows.findIndex(
       (row) =>
         row.id === staged.headEnd.id && row.metadata?.historySequence === staged.headEnd.sequence
@@ -426,6 +471,9 @@ export class ContinuousCompactor {
           },
         ];
       }
+      // Model-hidden rows (workflow display, plan-review records) never reach a request;
+      // copying them behind the boundary would only duplicate UI state.
+      if (isModelHiddenMessage(row)) return [];
       return index > end || copiedCluster.has(row.id) ? [row] : [];
     });
   }
@@ -477,7 +525,10 @@ export class ContinuousCompactor {
       return false;
     this.swapAttempted = staged;
     const live = this.deps.streamManager.getStreamInfo(this.deps.workspaceId);
-    const source = rows.at(-1);
+    // Model-semantic identity uses the visible projection (as cut selection and the head do):
+    // a hidden review record appended during the stream is not a newer source.
+    const visibleRows = rows.filter((row) => !isModelHiddenMessage(row));
+    const source = visibleRows.at(-1);
     if (!live || source?.id !== live.messageId || source.metadata?.historySequence == null)
       return false;
     const tail = this.materializeTail(staged, rows);
@@ -529,10 +580,7 @@ export class ContinuousCompactor {
         prefixSourceRows: [boundary, ...staticCopies],
         systemPrefix: z.array(z.json()).parse(exactJson(prepared.systemPrefix)),
         cacheEnabled: prepared.cacheEnabled,
-        sourceFingerprint: fingerprint([
-          ...rows.slice(0, -1),
-          { ...source, parts: source.parts.slice(0, partIndex) },
-        ]),
+        sourceFingerprint: fingerprint(journalSourceRows(visibleRows, source, partIndex)),
         postCompactionAttachments: prepared.attachments,
         preparation: prepared.preparation,
         requestProviderOptions:
@@ -632,13 +680,19 @@ export class ContinuousCompactor {
       return true;
     }
     const spec = journal.liveTailCopySpec;
-    const source = rows.at(-1);
     const identity = boundaryIdentity(rows);
-    const headEnd = rows.findIndex(
+    // The journal's head and source fingerprints were taken from the model-visible projection
+    // the cut was selected from (see headFromRows and activateSwap); rebuild both from that same
+    // projection, or a hidden record inside the head or appended after the live source would
+    // discard a valid journal and the prefix would never fold. The source is still identified by
+    // the captured message id and sequence, so a genuine later visible row refuses the fold.
+    const visibleRows = rows.filter((row) => !isModelHiddenMessage(row));
+    const source = visibleRows.at(-1);
+    const headEnd = visibleRows.findIndex(
       (row) =>
         row.id === journal.headEnd.id && row.metadata?.historySequence === journal.headEnd.sequence
     );
-    const head = rows.slice(0, headEnd + 1);
+    const head = visibleRows.slice(0, headEnd + 1);
     if (journal.headPartIndex != null && head.length)
       head[head.length - 1] = {
         ...head[head.length - 1],
@@ -655,10 +709,13 @@ export class ContinuousCompactor {
       identity.boundarySequence !== journal.boundarySequence ||
       headEnd < 0 ||
       fingerprint(head) !== journal.headFingerprint ||
-      fingerprint([
-        ...rows.slice(0, -1),
-        { ...source, parts: source.parts.slice(0, spec.partIndex) },
-      ]) !== journal.sourceFingerprint
+      (fingerprint(journalSourceRows(visibleRows, source, spec.partIndex)) !==
+        journal.sourceFingerprint &&
+        // A journal persisted by a build that fingerprinted the raw rows still recovers when
+        // nothing was appended after its source.
+        (rows.at(-1) !== source ||
+          fingerprint(journalSourceRows(rows, source, spec.partIndex)) !==
+            journal.sourceFingerprint))
     ) {
       log.warn("[continuous-compaction] discarded mismatched journal", {
         workspaceId: this.deps.workspaceId,

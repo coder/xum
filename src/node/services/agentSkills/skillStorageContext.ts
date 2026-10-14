@@ -33,7 +33,7 @@ export interface SkillStorageContext {
 function buildProjectLocalRoots(
   runtime: Runtime,
   xumScope: Extract<XumToolScope, { type: "project" }>,
-  options?: { includeClaudeSkills?: boolean; includeAgentPlugins?: boolean }
+  options?: { includeClaudeSkills?: boolean }
 ): AgentSkillsRoots {
   const projectSearchRoot = xumScope.checkoutRoot ?? xumScope.projectRoot;
 
@@ -46,21 +46,17 @@ function buildProjectLocalRoots(
     globalRoot: path.join(xumScope.xumHome, "skills"),
     universalRoot: "~/.agents/skills",
     ...(options?.includeClaudeSkills ? { globalClaudeRoot: "~/.claude/skills" } : {}),
-    // agent-plugins experiment: read-only plugin containers at lowest precedence within each scope.
+    // Read-only Agent Plugins containers at lowest precedence within each scope.
     // Containers anchor at the CHECKOUT root: for subProjectPath workspaces
     // `projectRoot` is the execution subdirectory, but plugins live (and are
     // listed by the UI) at the checkout level.
-    ...(options?.includeAgentPlugins
-      ? {
-          projectPluginRoots: [
-            ...listProjectMetadataRelativePaths("plugins").map((relativePath) =>
-              path.join(projectSearchRoot, relativePath)
-            ),
-            path.join(projectSearchRoot, ".agents", "plugins"),
-          ],
-          globalPluginRoots: [path.join(xumScope.xumHome, "plugins"), "~/.agents/plugins"],
-        }
-      : {}),
+    projectPluginRoots: [
+      ...listProjectMetadataRelativePaths("plugins").map((relativePath) =>
+        path.join(projectSearchRoot, relativePath)
+      ),
+      path.join(projectSearchRoot, ".agents", "plugins"),
+    ],
+    globalPluginRoots: [path.join(xumScope.xumHome, "plugins"), "~/.agents/plugins"],
   };
 }
 
@@ -68,7 +64,6 @@ function buildGlobalLocalRoots(input: {
   runtime: Runtime;
   xumScope?: XumToolScope | null;
   includeClaudeSkills?: boolean;
-  includeAgentPlugins?: boolean;
 }): AgentSkillsRoots {
   const xumHome = input.xumScope?.xumHome ?? input.runtime.getXumHome();
 
@@ -78,10 +73,8 @@ function buildGlobalLocalRoots(input: {
     universalRoot: "~/.agents/skills",
     // claude-skills-compat experiment: read-only root at lowest global precedence.
     ...(input.includeClaudeSkills ? { globalClaudeRoot: "~/.claude/skills" } : {}),
-    // agent-plugins experiment: read-only plugin containers at lowest global precedence.
-    ...(input.includeAgentPlugins
-      ? { globalPluginRoots: [path.join(xumHome, "plugins"), "~/.agents/plugins"] }
-      : {}),
+    // Read-only Agent Plugins containers at lowest global precedence.
+    globalPluginRoots: [path.join(xumHome, "plugins"), "~/.agents/plugins"],
   };
 }
 
@@ -108,8 +101,6 @@ export function resolveSkillStorageContext(input: {
   xumScope?: XumToolScope | null;
   /** claude-skills-compat experiment: include read-only .claude/skills roots in discovery. */
   includeClaudeSkills?: boolean;
-  /** agent-plugins experiment: include read-only Agent Plugins skill roots in discovery. */
-  includeAgentPlugins?: boolean;
 }): SkillStorageContext {
   if (input.xumScope?.type !== "project") {
     return {
@@ -122,7 +113,6 @@ export function resolveSkillStorageContext(input: {
         runtime: input.runtime,
         xumScope: input.xumScope,
         includeClaudeSkills: input.includeClaudeSkills,
-        includeAgentPlugins: input.includeAgentPlugins,
       }),
       containment: { kind: "none" },
     };
@@ -136,7 +126,6 @@ export function resolveSkillStorageContext(input: {
       workspacePath: input.workspacePath,
       roots: getDefaultAgentSkillsRoots(input.runtime, input.workspacePath, {
         includeClaudeSkills: input.includeClaudeSkills,
-        includeAgentPlugins: input.includeAgentPlugins,
         projectSearchRoot,
       }),
       containment: {
@@ -156,7 +145,6 @@ export function resolveSkillStorageContext(input: {
     workspacePath: input.workspacePath,
     roots: buildProjectLocalRoots(projectRuntime, input.xumScope, {
       includeClaudeSkills: input.includeClaudeSkills,
-      includeAgentPlugins: input.includeAgentPlugins,
     }),
     containment: {
       kind: "local",

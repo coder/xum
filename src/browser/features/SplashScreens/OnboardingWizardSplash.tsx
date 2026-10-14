@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowLeft,
   Bot,
@@ -9,7 +9,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import { SplashScreen } from "./SplashScreen";
-import { useOnboardingPause } from "./SplashScreenProvider";
+import { hasFirstRunView, removeFirstRunView, useOnboardingPause } from "./SplashScreenProvider";
 import { DocsLink } from "@/browser/components/DocsLink/DocsLink";
 import { ProviderWithIcon } from "@/browser/components/ProviderIcon/ProviderIcon";
 import {
@@ -28,7 +28,7 @@ import { Button } from "@/browser/components/Button/Button";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { getStoredAuthToken } from "@/browser/components/AuthTokenModal/AuthTokenModal";
 import { getBrowserBackendBaseUrl } from "@/browser/utils/backendBaseUrl";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useRouting } from "@/browser/hooks/useRouting";
@@ -37,13 +37,13 @@ import {
   useMuxGatewayAccountStatus,
 } from "@/browser/hooks/useMuxGatewayAccountStatus";
 import { KEYBINDS, formatKeybind } from "@/browser/utils/ui/keybinds";
+import { MUX_GATEWAY_ORIGIN } from "@/common/constants/muxGatewayOAuth";
 import { getAgentsInitNudgeKey } from "@/common/constants/storage";
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
-import { usePolicy } from "@/browser/contexts/PolicyContext";
-import { getAllowedProvidersForUi } from "@/browser/utils/policyUi";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   formatProviderDisplayName,
+  getProviderIdsForUi,
   isBuiltInProvider,
 } from "@/common/utils/providers/customProviders";
 
@@ -61,6 +61,11 @@ function getServerAuthToken(): string | null {
   return urlToken?.length ? urlToken : getStoredAuthToken();
 }
 
+// Wizard text uses text-content-secondary, not text-muted: the light theme's muted token is
+// below WCAG AA (4.5:1) on the dialog backgrounds (#5944). The token stays as is because it
+// colors muted text across the whole app.
+const WIZARD_DOCS_LINK_CLASSNAME = "text-content-secondary";
+
 const KBD_CLASSNAME =
   "bg-background-secondary text-foreground border-border-medium rounded border px-2 py-0.5 font-mono text-xs";
 
@@ -76,6 +81,9 @@ function ProgressDots(props: { count: number; activeIndex: number }) {
   return (
     <div
       className="flex items-center gap-1"
+      // aria-label is not allowed on a div without a role (Lighthouse aria-prohibited-attr,
+      // #5944). The dots are one picture of the progress, so "img" names them as a whole.
+      role="img"
       aria-label={`Step ${props.activeIndex + 1} of ${props.count}`}
     >
       {Array.from({ length: props.count }).map((_, i) => (
@@ -93,7 +101,8 @@ function ProgressDots(props: { count: number; activeIndex: number }) {
 function WizardHeader(props: { stepIndex: number; totalSteps: number }) {
   return (
     <div className="flex items-center justify-end gap-2">
-      <span className="text-muted text-xs">
+      {/* Hidden from screen readers: the progress dots already announce "Step N of M" (#5948). */}
+      <span className="text-content-secondary text-xs" aria-hidden="true">
         {props.stepIndex + 1} / {props.totalSteps}
       </span>
       <ProgressDots count={props.totalSteps} activeIndex={props.stepIndex} />
@@ -119,7 +128,7 @@ function Card(props: {
         </span>
         {props.title}
       </div>
-      <div className="text-muted mt-2 text-sm">{props.children}</div>
+      <div className="text-content-secondary mt-2 text-sm">{props.children}</div>
     </div>
   );
 }
@@ -184,6 +193,35 @@ function CommandPalettePreview(props: { shortcut: string }) {
   );
 }
 
+/**
+ * T3 #5971, C step 2: the server's static first-run view (#xum-pre) already shows the gateway step.
+ * The live wizard renders nothing while it loads under that view, then swaps it out in its first
+ * real commit (a layout effect runs before paint). The dialog and overlay never play their entry
+ * animation in this mount: they stay open, so clearing the override later would replay it. The
+ * step skips its entry animation only until the user moves on. A wizard that starts past the
+ * gateway step replaces the view too.
+ */
+function useFirstRunViewHandoff(isLoading: boolean) {
+  const [startsUnderFirstRunView] = useState(hasFirstRunView);
+  const [skipStepEntry, setSkipStepEntry] = useState(startsUnderFirstRunView);
+  useLayoutEffect(() => {
+    if (!isLoading) removeFirstRunView();
+  }, [isLoading]);
+  return {
+    hideWhileLoading: isLoading && startsUnderFirstRunView,
+    skipDialogEntry: startsUnderFirstRunView,
+    skipStepEntry,
+    stopSkipping: () => setSkipStepEntry(false),
+  };
+}
+
+function stepEntryClassName(direction: Direction, skipEntryAnimation: boolean): string {
+  if (skipEntryAnimation) return "";
+  return direction === "forward"
+    ? "animate-in fade-in-0 slide-in-from-right-2"
+    : "animate-in fade-in-0 slide-in-from-left-2";
+}
+
 export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
   const onboardingPause = useOnboardingPause();
   const [stepIndex, setStepIndex] = useState(onboardingPause.paused?.stepIndex ?? 0);
@@ -198,14 +236,8 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
     [onboardingPause, openSettings, stepIndex]
   );
 
-  const policyState = usePolicy();
-  const effectivePolicy =
-    policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
   const { config: providersConfig, loading: providersLoading } = useProvidersConfig();
-  const visibleProviders = useMemo(
-    () => getAllowedProvidersForUi(effectivePolicy, providersConfig),
-    [effectivePolicy, providersConfig]
-  );
+  const visibleProviders = useMemo(() => getProviderIdsForUi(providersConfig), [providersConfig]);
   const { addProject, userProjects } = useProjectContext();
 
   const projectAddFormRef = useRef<ProjectAddFormHandle | null>(null);
@@ -215,6 +247,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
   const [direction, setDirection] = useState<Direction>("forward");
 
   const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const {
     data: muxGatewayAccountStatus,
     error: muxGatewayAccountError,
@@ -286,18 +319,18 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
       setMuxGatewayServerState(null);
 
       if (isDesktop) {
-        if (!api) {
+        if (!liveApi) {
           setMuxGatewayLoginStatus("error");
           setMuxGatewayLoginError("Xum API not connected.");
           return;
         }
 
         setMuxGatewayLoginStatus("starting");
-        const startResult = await api.muxGatewayOauth.startDesktopFlow();
+        const startResult = await liveApi.muxGatewayOauth.startDesktopFlow();
 
         if (attempt !== muxGatewayLoginAttemptRef.current) {
           if (startResult.success) {
-            void api.muxGatewayOauth.cancelDesktopFlow({ flowId: startResult.data.flowId });
+            void liveApi.muxGatewayOauth.cancelDesktopFlow({ flowId: startResult.data.flowId });
           }
           return;
         }
@@ -319,7 +352,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
           return;
         }
 
-        const waitResult = await api.muxGatewayOauth.waitForDesktopFlow({ flowId });
+        const waitResult = await liveApi.muxGatewayOauth.waitForDesktopFlow({ flowId });
 
         if (attempt !== muxGatewayLoginAttemptRef.current) {
           return;
@@ -426,7 +459,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
       setMuxGatewayLoginStatus("error");
       setMuxGatewayLoginError(message);
     }
-  }, [api, backendBaseUrl, disableMuxGatewayRoute, isDesktop, refreshMuxGatewayAccountStatus]);
+  }, [liveApi, backendBaseUrl, disableMuxGatewayRoute, isDesktop, refreshMuxGatewayAccountStatus]);
 
   useEffect(() => {
     const attempt = muxGatewayLoginAttemptRef.current;
@@ -602,7 +635,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
                 href="https://coder.com"
                 target="_blank"
                 rel="noopener noreferrer"
-                className="text-accent hover:underline"
+                className="text-accent underline"
               >
                 Coder
               </a>
@@ -633,14 +666,14 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
 
                   <div className="mt-2 space-y-1">
                     <div className="flex items-center justify-between gap-4">
-                      <span className="text-muted">Balance</span>
+                      <span className="text-content-secondary">Balance</span>
                       <span className="text-foreground font-mono">
                         {formatMuxGatewayBalance(muxGatewayAccountStatus?.remaining_microdollars)}
                       </span>
                     </div>
 
                     <div className="flex items-center justify-between gap-4">
-                      <span className="text-muted">Concurrent requests per user</span>
+                      <span className="text-content-secondary">Concurrent requests per user</span>
                       <span className="text-foreground font-mono">
                         {muxGatewayAccountStatus?.ai_gateway_concurrent_requests_per_user ?? "—"}
                       </span>
@@ -657,15 +690,15 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
                     <p className="text-destructive font-medium">
                       Your Xum Gateway credits are depleted.
                     </p>
-                    <p className="text-muted mt-1">
+                    <p className="text-content-secondary mt-1">
                       Gateway routing has been disabled. Configure another provider below, or visit{" "}
                       <a
-                        href="https://gateway.mux.coder.com"
+                        href={MUX_GATEWAY_ORIGIN}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="text-accent hover:underline"
+                        className="text-accent underline"
                       >
-                        gateway.mux.coder.com
+                        {new URL(MUX_GATEWAY_ORIGIN).host}
                       </a>{" "}
                       to add credits.
                     </p>
@@ -713,7 +746,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
                   href="https://discord.gg/VfZXvtnR"
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-accent hover:underline"
+                  className="text-accent underline"
                 >
                   Discord
                 </a>
@@ -721,10 +754,10 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
               <li>
                 vouchers which you can{" "}
                 <a
-                  href="https://gateway.mux.coder.com"
+                  href={MUX_GATEWAY_ORIGIN}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-accent hover:underline"
+                  className="text-accent underline"
                 >
                   claim here
                 </a>
@@ -735,7 +768,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
               You can enable this in{" "}
               <button
                 type="button"
-                className="text-accent hover:underline"
+                className="text-accent underline"
                 onClick={() => openProvidersSettings()}
               >
                 Settings → Providers
@@ -791,7 +824,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
               })}
             </div>
 
-            <div className="text-muted mt-2 flex items-center gap-2 text-xs">
+            <div className="text-content-secondary mt-2 flex items-center gap-2 text-xs">
               <span className="h-2 w-2 rounded-full bg-green-500" />
               <span>Configured</span>
               <span className="bg-border-medium h-2 w-2 rounded-full" />
@@ -803,7 +836,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
             Configure keys and endpoints in{" "}
             <button
               type="button"
-              className="text-accent hover:underline"
+              className="text-accent underline"
               onClick={() => openProvidersSettings()}
             >
               Settings → Providers
@@ -888,7 +921,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
               <div className="mt-1 flex flex-wrap items-center gap-2">
                 <span>Agent picker</span>
                 <kbd className={KBD_CLASSNAME}>{agentPickerShortcut}</kbd>
-                <span className="text-muted mx-1">•</span>
+                <span className="text-content-secondary mx-1">•</span>
                 <span>Cycle agent</span>
                 <kbd className={KBD_CLASSNAME}>{cycleAgentShortcut}</kbd>
               </div>
@@ -896,8 +929,12 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
           </div>
 
           <div className="mt-3 flex items-center gap-3">
-            <DocsLink path="/agents">Agent docs</DocsLink>
-            <DocsLink path="/agents/plan-mode">Plan mode</DocsLink>
+            <DocsLink path="/agents" className={WIZARD_DOCS_LINK_CLASSNAME}>
+              Agent docs
+            </DocsLink>
+            <DocsLink path="/agents/plan-mode" className={WIZARD_DOCS_LINK_CLASSNAME}>
+              Plan mode
+            </DocsLink>
           </div>
         </>
       ),
@@ -979,7 +1016,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
           </p>
 
           <div className="mt-3 flex flex-wrap items-center gap-2">
-            <span className="text-muted text-sm">Open command palette</span>
+            <span className="text-content-secondary text-sm">Open command palette</span>
             <kbd className={KBD_CLASSNAME}>{commandPaletteShortcut}</kbd>
           </div>
 
@@ -1035,6 +1072,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
 
   const totalSteps = steps.length;
   const currentStep = steps[stepIndex] ?? steps[0];
+  const firstRunView = useFirstRunViewHandoff(isLoading);
 
   useEffect(() => {
     if (currentStep?.key !== "mux-gateway" && muxGatewayLoginInProgress) {
@@ -1042,7 +1080,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
     }
   }, [cancelMuxGatewayLogin, currentStep?.key, muxGatewayLoginInProgress]);
 
-  if (!currentStep) {
+  if (!currentStep || firstRunView.hideWhileLoading) {
     return null;
   }
 
@@ -1054,6 +1092,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
       return;
     }
     setDirection("back");
+    firstRunView.stopSkipping();
     // Changing steps remounts the project form without its inline error, so
     // clear the stale flag or the "click Next" nudge stays hidden on return.
     setProjectFormHasError(false);
@@ -1065,6 +1104,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
       return;
     }
     setDirection("forward");
+    firstRunView.stopSkipping();
     setProjectFormHasError(false);
     setStepIndex((i) => Math.min(totalSteps - 1, i + 1));
   };
@@ -1083,6 +1123,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
         props.onDismiss();
       }}
       dismissLabel={null}
+      skipEntryAnimation={firstRunView.skipDialogEntry}
       footerClassName="justify-between"
       footer={
         <>
@@ -1139,16 +1180,13 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
         </>
       }
     >
-      <div className="text-muted flex flex-col gap-4">
+      <div className="text-content-secondary flex flex-col gap-4">
         <WizardHeader stepIndex={stepIndex} totalSteps={totalSteps} />
 
         <div
           key={currentStep.key}
-          className={`flex flex-col gap-3 ${
-            direction === "forward"
-              ? "animate-in fade-in-0 slide-in-from-right-2"
-              : "animate-in fade-in-0 slide-in-from-left-2"
-          }`}
+          data-onboarding-step={currentStep.key}
+          className={`flex flex-col gap-3 ${stepEntryClassName(direction, firstRunView.skipStepEntry)}`}
         >
           <div className="text-foreground flex items-center gap-2 text-sm font-medium">
             <span className="bg-accent/10 text-accent inline-flex h-8 w-8 items-center justify-center rounded-md">
@@ -1157,7 +1195,9 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
             <span>{currentStep.title}</span>
           </div>
 
-          <div className="text-muted flex flex-col gap-3 text-sm">{currentStep.body}</div>
+          <div className="text-content-secondary flex flex-col gap-3 text-sm">
+            {currentStep.body}
+          </div>
         </div>
       </div>
     </SplashScreen>

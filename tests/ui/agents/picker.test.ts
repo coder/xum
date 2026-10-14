@@ -44,7 +44,7 @@ const describeIntegration = shouldRunIntegrationTests() ? describe : describe.sk
 async function openAgentPicker(container: HTMLElement): Promise<void> {
   const trigger = await waitFor(
     () => {
-      const btn = container.querySelector('[aria-label="Select agent"]') as HTMLElement;
+      const btn = container.querySelector('[aria-label="Select agent"]')!;
       if (!btn) throw new Error("Agent picker trigger not found");
       return btn;
     },
@@ -213,9 +213,9 @@ You are a code review agent. Review code for quality, readability, and best prac
         await openAgentPicker(view.container);
 
         // Click on Plan agent row
-        const planRow = view.container.querySelector('[data-agent-id="plan"]') as HTMLElement;
+        const planRow = view.container.querySelector('[data-agent-id="plan"]')!;
         expect(planRow).toBeTruthy();
-        fireEvent.click(planRow!);
+        fireEvent.click(planRow);
 
         // Wait for dropdown to close
         await waitFor(

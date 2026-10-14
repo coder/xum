@@ -5,6 +5,8 @@ import { spawn } from "child_process";
 import { createHash, randomBytes } from "crypto";
 import {
   validateProjectPath,
+  resolvesToFilesystemRoot,
+  PROJECT_AT_FILESYSTEM_ROOT_ERROR,
   isGitRepository,
   isInsideGitRepository,
   stripTrailingSlashes,
@@ -35,6 +37,7 @@ import {
 } from "./sshCloneFailure";
 import type { BranchListResult } from "@/common/orpc/types";
 import type { ProjectRemoveErrorSchema } from "@/common/orpc/schemas/errors";
+import type { RemovedCreationDraft } from "@/common/orpc/schemas/drafts";
 import type { FileTreeNode } from "@/common/utils/git/numstatParser";
 import * as path from "path";
 import { getXumProjectsDir } from "@/common/constants/paths";
@@ -404,6 +407,7 @@ export class ProjectService {
   private workspaceService?: WorkspaceRemover;
   private workspaceMetadataRefresher?: WorkspaceMetadataRefresher;
   private mcpServerManager?: Pick<MCPServerManager, "applyProjectTrust" | "forgetProjectTrust">;
+  private draftCleaner?: { deleteProjectDrafts(projectPath: string): Promise<string[]> };
 
   constructor(
     private readonly config: Config,
@@ -425,6 +429,13 @@ export class ProjectService {
     mcpServerManager: Pick<MCPServerManager, "applyProjectTrust" | "forgetProjectTrust">
   ): void {
     this.mcpServerManager = mcpServerManager;
+  }
+
+  /** Deletes a removed project's creation drafts (DraftService); wired by the service container. */
+  setDraftCleaner(draftCleaner: {
+    deleteProjectDrafts(projectPath: string): Promise<string[]>;
+  }): void {
+    this.draftCleaner = draftCleaner;
   }
 
   setDirectoryPicker(picker: (initialPath?: string | null) => Promise<string | null>) {
@@ -511,6 +522,11 @@ export class ProjectService {
         normalizedPath = path.resolve(expandTilde(projectPath));
       } else {
         normalizedPath = path.resolve(projectPath);
+      }
+      // File completions, git status and review scans would walk the whole disk (#5917). A
+      // symlink to the root counts as the root.
+      if (await resolvesToFilesystemRoot(normalizedPath)) {
+        return Err(PROJECT_AT_FILESYSTEM_ROOT_ERROR);
       }
 
       let existingStat: Stats | null = null;
@@ -823,8 +839,8 @@ export class ProjectService {
           createResult.success &&
           !this.config.loadConfigOrDefault().projects.has(normalizedPath)
         ) {
-          // Config persistence (editConfig → private saveConfig) logs-and-continues on
-          // write failures. Without this check a git-initialized project would report
+          // editConfig rejects when the save fails (#4444); this check is belt and braces against a
+          // write another writer replaced. Without it a git-initialized project could report
           // success, vanish after restart, and block retries on the leftover .git.
           await cleanupCreatedDirectory();
           return Err("Failed to save project configuration");
@@ -1126,18 +1142,26 @@ export class ProjectService {
       }
 
       const projectConfig: ProjectConfig = { workspaces: [] };
-      await this.config.editConfig((freshConfig) => {
-        if (freshConfig.projects.has(normalizedPath)) {
-          return freshConfig;
-        }
-        const updatedProjects = new Map(freshConfig.projects);
-        updatedProjects.set(normalizedPath, projectConfig);
-        return { ...freshConfig, projects: updatedProjects };
-      });
+      // A rejected write takes the same rollback as an unpersisted one (#4444): jumping to the
+      // outer catch would orphan the clone at the user's chosen path.
+      let persistError: unknown;
+      await this.config
+        .editConfig((freshConfig) => {
+          if (freshConfig.projects.has(normalizedPath)) {
+            return freshConfig;
+          }
+          const updatedProjects = new Map(freshConfig.projects);
+          updatedProjects.set(normalizedPath, projectConfig);
+          return { ...freshConfig, projects: updatedProjects };
+        })
+        .catch((error: unknown) => {
+          persistError = error;
+        });
 
+      // Decide from the fresh config, not the rejection: another backend may have registered
+      // this path meanwhile, and its checkout must not be deleted. The re-read is also belt and
+      // braces against a write another writer replaced.
       if (!this.config.loadConfigOrDefault().projects.has(normalizedPath)) {
-        // Config persistence (editConfig → private saveConfig) logs-and-continues on write
-        // failures, so verify persistence explicitly before reporting success.
         try {
           await fsPromises.rm(normalizedPath, { recursive: true, force: true });
         } catch {
@@ -1146,7 +1170,10 @@ export class ProjectService {
         yield {
           type: "error",
           code: "clone_failed",
-          error: "Failed to persist cloned project configuration",
+          error:
+            persistError === undefined
+              ? "Failed to persist cloned project configuration"
+              : `Failed to persist cloned project configuration: ${getErrorMessage(persistError)}`,
         };
         return;
       }
@@ -1301,6 +1328,7 @@ export class ProjectService {
       try {
         while (!processEnded) {
           if (stderrChunks.length > 0) {
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
             yield { type: "progress", line: stderrChunks.shift()! };
             continue;
           }
@@ -1317,6 +1345,7 @@ export class ProjectService {
       }
 
       while (stderrChunks.length > 0) {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         yield { type: "progress", line: stderrChunks.shift()! };
       }
 
@@ -1373,7 +1402,10 @@ export class ProjectService {
     return Err("Clone did not return a completion event");
   }
 
-  async remove(projectPath: string, force = false): Promise<Result<void, ProjectRemoveError>> {
+  async remove(
+    projectPath: string,
+    force = false
+  ): Promise<Result<{ removedCreationDrafts: RemovedCreationDraft[] }, ProjectRemoveError>> {
     if (this.shuttingDown) throw new Error("Server is shutting down");
     try {
       const normalizedPath = stripTrailingSlashes(projectPath);
@@ -1385,11 +1417,6 @@ export class ProjectService {
       }
 
       if (projectConfig.parentProjectPath) {
-        try {
-          await this.secretsStore.updateProjectSecrets(normalizedPath, []);
-        } catch (error) {
-          log.error(`Failed to clean up secrets for sub-project ${normalizedPath}:`, error);
-        }
         // Mutate inside the serialized editConfig transform, re-resolving the sub-project
         // and its parent from FRESH config: persisting the pre-read snapshot would clobber
         // concurrent config edits (e.g. resurrect concurrently removed workspaces).
@@ -1407,8 +1434,17 @@ export class ProjectService {
           freshConfig.projects.delete(normalizedPath);
           return freshConfig;
         });
+        // Delete secrets only after the config write lands (#4746): a rejected write
+        // must not leave the sub-project configured without its secrets. A failed
+        // delete here only orphans the secrets file entry.
+        try {
+          await this.secretsStore.updateProjectSecrets(normalizedPath, []);
+        } catch (error) {
+          log.error(`Failed to clean up secrets for sub-project ${normalizedPath}:`, error);
+        }
+        const removedCreationDrafts = await this.deleteCreationDrafts([normalizedPath]);
         this.mcpServerManager?.forgetProjectTrust(normalizedPath);
-        return Ok(undefined);
+        return Ok({ removedCreationDrafts });
       }
 
       // Self-healing: purge workspace entries whose backing directories no longer exist.
@@ -1503,6 +1539,9 @@ export class ProjectService {
           }
         }
 
+        // Each WorkspaceService.remove records its own removal durably before deleting
+        // (pendingRemoval marker) and drops its config row, so a later failure leaves the
+        // project configured with only the workspaces that still exist (#4746).
         for (const workspace of orderWorkspacesForCascadeRemoval(projectConfig.workspaces)) {
           // Legacy workspace entries can be missing `id`. Resolve through metadata so
           // WorkspaceService.remove() receives the canonical workspace ID (it cannot remove by path).
@@ -1559,6 +1598,11 @@ export class ProjectService {
         return freshConfig;
       });
 
+      const removedCreationDrafts = await this.deleteCreationDrafts([
+        normalizedPath,
+        ...removedSubProjectPaths,
+      ]);
+
       for (const subProjectPath of removedSubProjectPaths) {
         try {
           await this.secretsStore.updateProjectSecrets(subProjectPath, []);
@@ -1576,11 +1620,30 @@ export class ProjectService {
       for (const removedPath of [normalizedPath, ...removedSubProjectPaths]) {
         this.mcpServerManager?.forgetProjectTrust(removedPath);
       }
-      return Ok(undefined);
+      return Ok({ removedCreationDrafts });
     } catch (error) {
       const message = getErrorMessage(error);
       return Err({ type: "unknown" as const, message: `Failed to remove project: ${message}` });
     }
+  }
+
+  /**
+   * Creation drafts are keyed by the owning project; delete them server-side so a removal from
+   * any client (or none mounted) leaves no draft files behind. Best-effort like the secrets
+   * cleanup: the startup GC removes whatever this misses. Returns the deleted drafts, whose
+   * localStorage keys the removing renderer cleans up (its own list may not have hydrated yet).
+   */
+  private async deleteCreationDrafts(projectPaths: string[]): Promise<RemovedCreationDraft[]> {
+    const removed: RemovedCreationDraft[] = [];
+    for (const projectPath of projectPaths) {
+      try {
+        const draftIds = (await this.draftCleaner?.deleteProjectDrafts(projectPath)) ?? [];
+        for (const draftId of draftIds) removed.push({ projectPath, draftId });
+      } catch (error) {
+        log.error(`Failed to clean up drafts for project ${projectPath}:`, error);
+      }
+    }
+    return removed;
   }
 
   /**
@@ -1675,6 +1738,7 @@ export class ProjectService {
       if (!validation.valid) {
         throw new Error(validation.error ?? "Invalid project path");
       }
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const normalizedPath = validation.expandedPath!;
 
       // Non-git repos return empty branches - they're restricted to local runtime only.
@@ -1782,6 +1846,7 @@ export class ProjectService {
       if (!validation.valid) {
         return Err(validation.error ?? "Invalid project path");
       }
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const normalizedPath = validation.expandedPath!;
       // Same exclusive claim as create(): concurrent initializations of one directory
       // could double-commit or let one call's failure rollback delete the other's .git.
@@ -1822,6 +1887,7 @@ export class ProjectService {
       return { paths: [] };
     }
 
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     const normalizedPath = validation.expandedPath!;
 
     let cacheEntry = this.fileCompletionsCache.get(normalizedPath);
@@ -1973,9 +2039,14 @@ export class ProjectService {
 
   async setTrust(projectPath: string, trusted: boolean): Promise<void> {
     const normalizedPath = stripTrailingSlashes(projectPath);
+    // Checked on the unstripped path: a Windows drive root strips to a drive-relative spelling.
+    const isRootPath = await resolvesToFilesystemRoot(projectPath);
     await this.config.editConfig((config) => {
       let project = config.projects.get(normalizedPath);
       if (!project) {
+        // Trust can create a project entry, but never a new one at the root (#5917). An existing
+        // root project (from an older config) can still change its trust.
+        if (isRootPath) throw new Error(PROJECT_AT_FILESYSTEM_ROOT_ERROR);
         project = { workspaces: [] };
         config.projects.set(normalizedPath, project);
       }
@@ -2069,13 +2140,21 @@ export class ProjectService {
     if (result.ok) {
       return;
     }
-    await this.config.editConfig((config) => {
-      const project = config.projects.get(normalizedPath);
-      if (project?.codeWorkspaceSyncPath === trimmed) {
-        project.codeWorkspaceSyncPath = previousValue;
-      }
-      return config;
-    });
+    // Best effort (#4748): a failed rollback must not replace the sync error the user needs.
+    await this.config
+      .editConfig((config) => {
+        const project = config.projects.get(normalizedPath);
+        if (project?.codeWorkspaceSyncPath === trimmed) {
+          project.codeWorkspaceSyncPath = previousValue;
+        }
+        return config;
+      })
+      .catch((rollbackError: unknown) => {
+        log.warn("Failed to roll back the code workspace sync path", {
+          projectPath: normalizedPath,
+          error: getErrorMessage(rollbackError),
+        });
+      });
     throw new ORPCError("BAD_REQUEST", { message: result.error });
   }
   // ─────────────────────────────────────────────────────────────────────────────

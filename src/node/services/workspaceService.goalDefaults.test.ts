@@ -1,14 +1,10 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { EventEmitter } from "events";
-import type { ProjectConfig, ProjectsConfig, Workspace } from "@/common/types/project";
-import type { Config } from "@/node/config";
-import type { AIService } from "./aiService";
-import type { BackgroundProcessManager } from "./backgroundProcessManager";
-import type { ExtensionMetadataService } from "./ExtensionMetadataService";
-import type { HistoryService } from "./historyService";
-import type { InitStateManager } from "./initStateManager";
-import { ContextManagementService } from "./contextManagement/contextManagementService";
-import { WorkspaceService } from "./workspaceService";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import type { Workspace } from "@/common/types/project";
+import { saveWorkspaces } from "./taskService.testHarness";
+import {
+  createWorkspaceServiceHarness,
+  type WorkspaceServiceHarness,
+} from "./workspaceService.testHarness";
 
 // Round-trip + edge-case tests for the per-workspace goal-defaults override.
 // Modeled on workspaceService.heartbeatSettings.test.ts so the two
@@ -22,84 +18,28 @@ const TEST_WORKSPACE_ID = "test-ws";
 const TEST_WORKSPACE_PATH = "/test/path";
 const TEST_PROJECT_PATH = "/test/project";
 
-function createProjectsConfig(workspace: Workspace): ProjectsConfig {
-  const projectConfig: ProjectConfig = {
-    workspaces: [workspace],
-  };
-  return {
-    projects: new Map([[TEST_PROJECT_PATH, projectConfig]]),
-  };
-}
-
-function createWorkspace(
-  goalDefaults?: {
-    defaultBudgetCents?: number | null;
-    defaultTurnCap?: number | null;
-    alwaysRequireExplicitBudget?: boolean | null;
-  } | null
-): Workspace {
-  return {
-    id: TEST_WORKSPACE_ID,
-    path: TEST_WORKSPACE_PATH,
-    name: "test",
-    ...(goalDefaults != null ? { goalDefaults } : {}),
-  } as unknown as Workspace;
+function createWorkspace(): Workspace {
+  return { id: TEST_WORKSPACE_ID, path: TEST_WORKSPACE_PATH, name: "test" };
 }
 
 describe("WorkspaceService goal-defaults override", () => {
-  let currentProjectsConfig: ProjectsConfig;
-  let mockConfig: Config;
-  let service: WorkspaceService;
-  let saveConfigCalls: number;
+  let harness: WorkspaceServiceHarness;
+  let service: WorkspaceServiceHarness["service"];
 
-  beforeEach(() => {
-    saveConfigCalls = 0;
-    currentProjectsConfig = createProjectsConfig(createWorkspace(null));
-
-    mockConfig = {
-      loadConfigOrDefault: mock(() => currentProjectsConfig),
-      findWorkspace: mock(() => ({
-        workspacePath: TEST_WORKSPACE_PATH,
-        projectPath: TEST_PROJECT_PATH,
-      })),
-      // Goal-defaults writes mutate inside serialized editConfig transforms (saveConfig
-      // is private); mirror that by applying the transform and counting queued writes.
-      editConfig: mock((transform: (config: ProjectsConfig) => ProjectsConfig) => {
-        currentProjectsConfig = transform(currentProjectsConfig);
-        saveConfigCalls += 1;
-        return Promise.resolve();
-      }),
-    } as unknown as Config;
-
-    const historyService = {} as unknown as HistoryService;
-    const aiService = new EventEmitter() as unknown as AIService;
-    service = new WorkspaceService(
-      mockConfig,
-      historyService,
-      aiService,
-      new ContextManagementService({ config: mockConfig, historyService, aiService }),
-      new EventEmitter() as unknown as InitStateManager,
-      {
-        updateRecency: mock(() =>
-          Promise.resolve({
-            recency: Date.now(),
-            streaming: false,
-            lastModel: null,
-            lastThinkingLevel: null,
-            agentStatus: null,
-          })
-        ),
-      } as unknown as ExtensionMetadataService,
-      {} as BackgroundProcessManager
-    );
-    (
-      service as unknown as { emitCurrentWorkspaceMetadata: () => Promise<void> }
-    ).emitCurrentWorkspaceMetadata = mock(() => Promise.resolve());
+  beforeEach(async () => {
+    harness = await createWorkspaceServiceHarness();
+    service = harness.service;
+    await saveWorkspaces(harness.config, TEST_PROJECT_PATH, [createWorkspace()]);
   });
 
-  afterEach(() => {
-    mock.restore();
+  afterEach(async () => {
+    await harness.cleanup();
   });
+
+  function storedGoalDefaults() {
+    return harness.config.loadConfigOrDefault().projects.get(TEST_PROJECT_PATH)?.workspaces.at(0)
+      ?.goalDefaults;
+  }
 
   test("getWorkspaceGoalDefaults returns null when no override is set", () => {
     expect(service.getWorkspaceGoalDefaults(TEST_WORKSPACE_ID)).toBeNull();
@@ -117,10 +57,7 @@ describe("WorkspaceService goal-defaults override", () => {
       defaultTurnCap: null,
       alwaysRequireExplicitBudget: null,
     });
-    const stored = currentProjectsConfig.projects
-      .get(TEST_PROJECT_PATH)
-      ?.workspaces.at(0)?.goalDefaults;
-    expect(stored).toEqual({
+    expect(storedGoalDefaults()).toEqual({
       defaultBudgetCents: 1500,
       defaultTurnCap: null,
       alwaysRequireExplicitBudget: null,
@@ -156,21 +93,19 @@ describe("WorkspaceService goal-defaults override", () => {
     });
     expect(result.success).toBe(true);
     expect(service.getWorkspaceGoalDefaults(TEST_WORKSPACE_ID)).toBeNull();
-    const stored = currentProjectsConfig.projects
-      .get(TEST_PROJECT_PATH)
-      ?.workspaces.at(0)?.goalDefaults;
-    expect(stored).toBeUndefined();
+    expect(storedGoalDefaults()).toBeUndefined();
   });
 
   test("no-op writes are short-circuited (no saveConfig call)", async () => {
+    const editConfig = spyOn(harness.config, "editConfig");
     await service.setWorkspaceGoalDefaults(TEST_WORKSPACE_ID, {
       defaultBudgetCents: 200,
       defaultTurnCap: null,
       alwaysRequireExplicitBudget: null,
     });
-    const baseline = saveConfigCalls;
+    const baseline = editConfig.mock.calls.length;
 
-    // Identical second write should not bump saveConfigCalls — keeps
+    // Identical second write should not queue another editConfig — keeps
     // ~/.mux/config.json untouched + avoids spurious metadata emits.
     const result = await service.setWorkspaceGoalDefaults(TEST_WORKSPACE_ID, {
       defaultBudgetCents: 200,
@@ -178,7 +113,7 @@ describe("WorkspaceService goal-defaults override", () => {
       alwaysRequireExplicitBudget: null,
     });
     expect(result.success).toBe(true);
-    expect(saveConfigCalls).toBe(baseline);
+    expect(editConfig.mock.calls.length).toBe(baseline);
   });
 
   test("rejects negative budget input", async () => {
@@ -200,8 +135,7 @@ describe("WorkspaceService goal-defaults override", () => {
   });
 
   test("returns Err when workspace cannot be located", async () => {
-    (mockConfig.findWorkspace as unknown as ReturnType<typeof mock>).mockImplementation(() => null);
-    const result = await service.setWorkspaceGoalDefaults(TEST_WORKSPACE_ID, {
+    const result = await service.setWorkspaceGoalDefaults("missing-ws", {
       defaultBudgetCents: 100,
       defaultTurnCap: null,
       alwaysRequireExplicitBudget: null,

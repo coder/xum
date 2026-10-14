@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeEach } from "bun:test";
 import { z } from "zod";
 import type { Tool } from "ai";
-import { generateXumTypes, getCachedXumTypes, clearTypeCache } from "./typeGenerator";
+import { generateXumTypes, getCachedXumTypes, clearTypeCacheForTests } from "./typeGenerator";
 
 /**
  * Create a mock tool with the given schema and optional execute function.
@@ -328,7 +328,7 @@ describe("generateXumTypes", () => {
 
 describe("getCachedXumTypes", () => {
   beforeEach(() => {
-    clearTypeCache();
+    clearTypeCacheForTests();
   });
 
   test("invalidates cache when tool schema changes", async () => {

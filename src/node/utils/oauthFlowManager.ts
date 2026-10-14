@@ -8,7 +8,7 @@ import { log } from "@/node/services/log";
 /**
  * Shared desktop OAuth flow lifecycle manager.
  *
- * Four OAuth services (Gateway, Governor, Codex, MCP) track in-flight desktop
+ * Three OAuth services (Gateway, Codex, MCP) track in-flight desktop
  * flows with an identical `Map<string, DesktopFlow>` + `waitFor`/`cancel`/
  * `finish`/`shutdownAll` pattern. This class extracts that shared lifecycle
  * so each service can delegate flow bookkeeping here.

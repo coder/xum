@@ -47,6 +47,8 @@ export const BACKUP_MANIFEST_FILE = "manifest.json";
  * ignored by the manifest-driven reader.
  */
 export const PROJECT_BUNDLE_DIR = "project-bundle";
+/** Opt-in artifact shelf sidecar (Artifacts M5c), beside the project bundle for the same reason. */
+export const ARTIFACT_SHELF_BACKUP_DIR = "artifact-shelf";
 const PROJECT_MEMORY_PATH_PREFIX = "memory/project/";
 /**
  * A payload is read wholly into memory on both sides, and the repository side is written by
@@ -251,7 +253,10 @@ function backupPathSegments(relativePath: string): string[] {
  * satisfy: the core payload and the project bundle validate different path sets but reject
  * the same traversal, hidden-name, forbidden-basename, and portability hazards.
  */
-function hasDisallowedPathShape(relativePath: string, options: { portable: boolean }): boolean {
+export function hasDisallowedPathShape(
+  relativePath: string,
+  options: { portable: boolean }
+): boolean {
   const segments = backupPathSegments(relativePath);
   return (
     path.isAbsolute(relativePath) ||
@@ -911,14 +916,29 @@ const BACKED_UP_APPEARANCE_FIELDS = [
   "terminalFontConfig",
   "terminalBadgeConfig",
   "vimEnabled",
+  "powerModeEnabled",
+  "gitStatusIndicatorMode",
 ] as const satisfies ReadonlyArray<keyof Appearance>;
 
-function projectAppearance(value: Appearance | undefined): Appearance | undefined {
+type Review = NonNullable<UserPreferences["review"]>;
+
+// `defaultBaseByProject` is keyed by local project paths, so it stays out of a backup.
+const BACKED_UP_REVIEW_FIELDS = [
+  "includeUncommitted",
+  "sortOrder",
+  "fileTreeViewMode",
+  "showRead",
+] as const satisfies ReadonlyArray<keyof Review>;
+
+function projectFields<T extends object>(
+  value: T | undefined,
+  fields: ReadonlyArray<keyof T>
+): Partial<T> | undefined {
   if (!value) return undefined;
-  const projected: Appearance = {};
-  for (const field of BACKED_UP_APPEARANCE_FIELDS) {
+  const projected: Partial<T> = {};
+  for (const field of fields) {
     if (value[field] !== undefined) {
-      Object.assign(projected, { [field]: copyJson(value[field]) });
+      projected[field] = copyJson(value[field]);
     }
   }
   return Object.keys(projected).length > 0 ? projected : undefined;
@@ -951,7 +971,7 @@ export function projectBackupPreferences(value: unknown): UserPreferences {
   const parsed = UserPreferencesSchema.parse(value ?? {});
   const projected: UserPreferences = {};
 
-  const appearance = projectAppearance(parsed.appearance);
+  const appearance = projectFields(parsed.appearance, BACKED_UP_APPEARANCE_FIELDS);
   if (appearance !== undefined) projected.appearance = appearance;
   if (parsed.navigation?.launchBehavior !== undefined) {
     projected.navigation = { launchBehavior: parsed.navigation.launchBehavior };
@@ -968,8 +988,13 @@ export function projectBackupPreferences(value: unknown): UserPreferences {
     }
     if (Object.keys(ai).length > 0) projected.ai = ai;
   }
-  if (parsed.review?.includeUncommitted !== undefined) {
-    projected.review = { includeUncommitted: parsed.review.includeUncommitted };
+  const review = projectFields(parsed.review, BACKED_UP_REVIEW_FIELDS);
+  if (review !== undefined) projected.review = review;
+  if (parsed.ui !== undefined) {
+    // The artifact CDN choice is a security setting: a repository that could turn it back on
+    // would reopen the CDN request channel to hostile artifacts.
+    const { artifactsAllowCdnScripts, ...ui } = parsed.ui;
+    if (Object.keys(ui).length > 0) projected.ui = copyJson(ui);
   }
 
   return projected;
@@ -1005,6 +1030,7 @@ export function mergeBackupPreferences(
       : {}),
     ...(projected.ai ? { ai: mergeAiPreferences(current?.ai, projected.ai) } : {}),
     ...(projected.review ? { review: { ...current?.review, ...projected.review } } : {}),
+    ...(projected.ui ? { ui: { ...current?.ui, ...projected.ui } } : {}),
   });
 }
 
@@ -1545,7 +1571,19 @@ function isRecursivelyCollected(filePath: string): boolean {
     filePath.startsWith("memory/global/") ||
     // Project-bundle memory files are scanned alongside the core payload with their
     // bundle-relative paths, and are swept up recursively the same way global memory is.
-    filePath.startsWith(PROJECT_MEMORY_PATH_PREFIX)
+    filePath.startsWith(PROJECT_MEMORY_PATH_PREFIX) ||
+    // Shelf artifacts are agent output (HTML, JSON, images...): anything but Markdown or text
+    // waits for review like other recursively collected files.
+    filePath.startsWith(`${ARTIFACT_SHELF_BACKUP_DIR}/`)
+  );
+}
+
+/** Shelf entry metadata Xum writes itself; its content is still scanned for secrets. */
+function isShelfEntryMeta(filePath: string): boolean {
+  return (
+    filePath.startsWith(`${ARTIFACT_SHELF_BACKUP_DIR}/`) &&
+    (path.posix.basename(filePath) === "meta.json" ||
+      filePath === `${ARTIFACT_SHELF_BACKUP_DIR}/${BACKUP_MANIFEST_FILE}`)
   );
 }
 
@@ -1568,7 +1606,7 @@ export function scanBackupFilesForSecrets(
       // Every collected file, not just the recursive ones: `agents/` is collected by name and
       // its `.md` filter would otherwise auto-publish `agents/api-key.md`.
       if (hasCredentialPathHint(file.path)) return true;
-      if (!isRecursivelyCollected(file.path)) return false;
+      if (!isRecursivelyCollected(file.path) || isShelfEntryMeta(file.path)) return false;
       return !AUTO_PUBLISHED_RECURSIVE_FILE.test(file.path);
     })
     .map((file) => file.path)

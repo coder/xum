@@ -49,6 +49,32 @@ describe("task_remove tool", () => {
     });
   });
 
+  it("asks the service to refuse lossy removals and returns the blocking paths", async () => {
+    using tempDir = new TestTempDir("test-task-remove-lossy");
+    const refused = { status: "error", taskId: "child", paths: ["notes.txt"], error: "refused" };
+    const removeOwnedTaskWorkspace = mock((_owner: string, _taskId: string, _options?: unknown) =>
+      Promise.resolve(Ok({ ...refused, action: "remove" }))
+    );
+    const taskService = {
+      listDescendantAgentTasks: mock(() => [{ taskId: "child", depth: 1 }]),
+      removeInactiveDescendantAgentTask: removeOwnedTaskWorkspace,
+    } as unknown as TaskService;
+    const tool = createTaskRemoveTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "root" }),
+      taskService,
+    });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!({ task_ids: ["child"] }, toolOptions)
+    );
+
+    // task_remove is model-driven, so it must opt into the refusal (#4723); the user cascade does not.
+    expect(removeOwnedTaskWorkspace).toHaveBeenCalledWith("root", "child", {
+      lossyWorkPolicy: "refuse",
+    });
+    expect(result).toEqual({ results: [refused] });
+  });
+
   it("surfaces active and scope outcomes without removing", async () => {
     using tempDir = new TestTempDir("test-task-remove-outcomes");
     const removeOwnedTaskWorkspace = mock(

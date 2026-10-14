@@ -65,12 +65,6 @@ export function tryParseSource(source: string): { owner: string; repo: string } 
   return { owner, repo };
 }
 
-export function parseSource(source: string): { owner: string; repo: string } {
-  const parsed = tryParseSource(source);
-  if (!parsed) throw new Error(`Invalid source format '${source}'. Expected 'owner/repo'`);
-  return parsed;
-}
-
 async function assertGitAvailable(): Promise<void> {
   try {
     using proc = execFileAsync("git", ["--version"]);

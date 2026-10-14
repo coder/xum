@@ -1,8 +1,11 @@
+import "../../../../tests/ui/dom";
+
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 import { MAX_LOG_ENTRIES } from "@/common/constants/ui";
+import { APIProvider } from "@/browser/contexts/API";
 
 type LogLevel = "error" | "warn" | "info" | "debug";
 
@@ -18,26 +21,24 @@ type LogStreamEvent =
   | { type: "append"; epoch: number; entries: LogEntry[] }
   | { type: "reset"; epoch: number };
 
-interface MockAPI {
-  general: {
-    subscribeLogs: () => Promise<AsyncGenerator<LogStreamEvent, void, unknown>>;
-    clearLogs: () => Promise<{ success: boolean; error?: string | null }>;
-  };
-}
-
-let mockApi: MockAPI | null = null;
-
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({
-    api: mockApi,
-    status: mockApi ? ("connected" as const) : ("connecting" as const),
-    error: null,
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
-}));
+let mockApi: TestApiOverrides<APIClient> | null = null;
 
 import { OutputTab } from "../OutputTab/OutputTab";
+import type { APIClient } from "@/browser/contexts/API";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
+
+// Inject the per-test client through the real provider; mocking the API module leaks
+// process-wide into later suites.
+function renderOutputTab() {
+  if (!mockApi) {
+    throw new Error("Tests must assign mockApi before rendering OutputTab");
+  }
+  return render(
+    <APIProvider client={createTestApiClient(mockApi)}>
+      <OutputTab workspaceId="workspace-1" />
+    </APIProvider>
+  );
+}
 
 function formatEntryMessage(id: number): string {
   return `entry-${id.toString().padStart(4, "0")}`;
@@ -97,7 +98,7 @@ describe("OutputTab", () => {
       },
     };
 
-    const view = render(<OutputTab workspaceId="workspace-1" />);
+    const view = renderOutputTab();
 
     await waitFor(() => {
       expect(view.getAllByText(/^entry-\d{4}$/)).toHaveLength(5);
@@ -124,7 +125,7 @@ describe("OutputTab", () => {
       },
     };
 
-    const view = render(<OutputTab workspaceId="workspace-1" />);
+    const view = renderOutputTab();
 
     await waitFor(() => {
       expect(view.getAllByText(/^entry-\d{4}$/)).toHaveLength(MAX_LOG_ENTRIES);
@@ -158,7 +159,7 @@ describe("OutputTab", () => {
       },
     };
 
-    const view = render(<OutputTab workspaceId="workspace-1" />);
+    const view = renderOutputTab();
 
     await waitFor(() => {
       expect(view.getByText(formatEntryMessage(0))).toBeTruthy();
@@ -185,7 +186,7 @@ describe("OutputTab", () => {
         },
       };
 
-      const view = render(<OutputTab workspaceId="workspace-1" />);
+      const view = renderOutputTab();
       const deleteButton = view.getByRole("button", { name: "Delete output logs" });
 
       fireEvent.click(deleteButton);
@@ -224,7 +225,7 @@ describe("OutputTab", () => {
       },
     };
 
-    const view = render(<OutputTab workspaceId="workspace-1" />);
+    const view = renderOutputTab();
 
     await waitFor(() => {
       expect(view.getByText(formatEntryMessage(0))).toBeTruthy();

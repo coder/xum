@@ -10,7 +10,6 @@ import { TestTempDir } from "./testHelpers";
 import {
   assertValidSkillId,
   fetchSkillContent,
-  parseSource,
   searchSkillsCatalog,
   tryParseSource,
 } from "./skillsCatalogFetch";
@@ -60,19 +59,6 @@ function createOversizedSkillMarkdown(name: string): string {
 
 afterEach(() => {
   mock.restore();
-});
-
-describe("parseSource", () => {
-  it("parses owner/repo from source string", () => {
-    expect(parseSource("vercel-labs/agent-skills")).toEqual({
-      owner: "vercel-labs",
-      repo: "agent-skills",
-    });
-  });
-
-  it("throws on invalid source format", () => {
-    expect(() => parseSource("invalid")).toThrow("Invalid source format");
-  });
 });
 
 describe("tryParseSource", () => {

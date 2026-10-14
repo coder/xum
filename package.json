@@ -1,6 +1,6 @@
 {
   "name": "@coder/xum",
-  "version": "0.30.0",
+  "version": "0.31.0",
   "desktopName": "xum.desktop",
   "description": "xum - coding agent multiplexer",
   "author": "Coder",
@@ -17,7 +17,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "packageManager": "bun@1.3.5",
+  "packageManager": "bun@1.4.3",
   "scripts": {
     "dev": "make dev",
     "prebuild:main": "./scripts/generate-version.sh",
@@ -49,7 +49,7 @@
   "dependencies": {
     "@agentclientprotocol/sdk": "^0.25.0",
     "@ai-sdk/amazon-bedrock": "^5.0.88",
-    "@ai-sdk/anthropic": "^4.0.58",
+    "@ai-sdk/anthropic": "^4.0.69",
     "@ai-sdk/deepseek": "^3.0.49",
     "@ai-sdk/google": "^4.0.76",
     "@ai-sdk/moonshotai": "^3.0.54",
@@ -58,6 +58,7 @@
     "@ai-sdk/typesafe-ai": "^3.0.4",
     "@ai-sdk/xai": "^4.0.37",
     "@ai-sdk/zai": "^3.0.15",
+    "@aws-sdk/client-bedrock": "3.943.0",
     "@aws-sdk/credential-providers": "^3.940.0",
     "@dnd-kit/core": "^6.3.1",
     "@dnd-kit/sortable": "^10.0.0",
@@ -95,7 +96,7 @@
     "@xterm/addon-serialize": "^0.14.0",
     "@xterm/headless": "^6.0.0",
     "ai": "7.0.107",
-    "ai-tokenizer": "^1.0.6",
+    "ai-tokenizer": "^1.0.7",
     "ajv": "^8.20.0",
     "chalk": "^5.6.2",
     "comlink": "^4.4.2",
@@ -110,7 +111,7 @@
     "express": "^5.1.0",
     "fix-path": "5.0.0",
     "ghostty-web": "^0.4.0-next.7.g03ead6e",
-    "happy-dom": "^20.0.10",
+    "happy-dom": "20.0.11",
     "ignore": "^7.0.5",
     "json-schema-to-typescript": "^15.0.4",
     "jsonc-parser": "^3.3.1",
@@ -118,8 +119,10 @@
     "lru-cache": "^11.2.2",
     "lucide-react": "^0.553.0",
     "markdown-it": "^14.1.0",
+    "marked": "17.0.1",
     "minimist": "^1.2.8",
     "motion": "^12.23.24",
+    "negotiator": "^1.0.0",
     "ollama-ai-provider-v2": "^3.5.0",
     "openai": "^6.18.0",
     "parse-duration": "^2.1.4",
@@ -135,6 +138,7 @@
     "rehype-harden": "^1.1.5",
     "rehype-sanitize": "^6.0.0",
     "remark-breaks": "^4.0.0",
+    "remend": "1.4.0",
     "saxes": "6.0.0",
     "sharp": "^0.34.5",
     "shescape": "^2.1.6",
@@ -151,7 +155,7 @@
     "ws": "^8.18.3",
     "xxhash-wasm": "^1.1.0",
     "yaml": "^2.8.2",
-    "zod": "^4.2.0",
+    "zod": "^4.6.5",
     "zod-to-json-schema": "^3.24.6"
   },
   "devDependencies": {
@@ -160,6 +164,7 @@
     "@babel/preset-react": "^7.28.5",
     "@babel/preset-typescript": "^7.28.5",
     "@coder/pixel-storybook": "0.3.0",
+    "@e2e-dev/web": "0.14.0",
     "@eslint/js": "^9.36.0",
     "@playwright/test": "^1.56.0",
     "@storybook/addon-docs": "^10.0.0",
@@ -199,6 +204,7 @@
     "cmdk": "^1.0.0",
     "concurrently": "^8.2.0",
     "dotenv": "^17.2.3",
+    "e2e": "0.20.0",
     "electron-builder": "^24.6.0",
     "electron-devtools-installer": "^4.0.0",
     "electron-mock-ipc": "^0.3.12",
@@ -212,8 +218,10 @@
     "geist": "^1.5.1",
     "jest": "^30.1.3",
     "mermaid": "^11.12.0",
+    "mitata": "1.0.34",
     "nodemon": "^3.1.10",
     "playwright": "^1.56.0",
+    "playwright-core": "1.57.0",
     "postcss": "^8.5.6",
     "posthog-js": "^1.276.0",
     "prettier": "^3.6.2",
@@ -239,7 +247,8 @@
     "vite-plugin-top-level-await": "^1.6.0"
   },
   "optionalDependencies": {
-    "electron": "^40.9.3"
+    "electron": "^44.5.1",
+    "robotjs": "^0.9.1"
   },
   "files": [
     "dist/**/*.js",
@@ -252,8 +261,9 @@
     "dist/**/*.woff2",
     "dist/**/*.json",
     "dist/**/*.png",
+    "dist/**/*.br",
+    "dist/**/*.gz",
     "dist/assets/**/*",
-    "patches/**/*",
     "npm-shrinkwrap.json",
     "README.md",
     "LICENSE"
@@ -287,7 +297,8 @@
       "**/node_modules/@lydell/**/*",
       "**/node_modules/@duckdb/**/*.node",
       "**/node_modules/sharp/**/*",
-      "**/node_modules/@img/**/*"
+      "**/node_modules/@img/**/*",
+      "**/node_modules/robotjs/**/*"
     ],
     "mac": {
       "category": "public.app-category.developer-tools",
@@ -329,7 +340,6 @@
     "core-js",
     "cpu-features",
     "edgedriver",
-    "electron",
     "esbuild",
     "geckodriver",
     "lzma-native",
@@ -339,6 +349,7 @@
   ],
   "patchedDependencies": {
     "@ai-sdk/xai@4.0.37": "patches/@ai-sdk%2Fxai@4.0.37.patch",
-    "trpc-cli@0.12.1": "patches/trpc-cli@0.12.1.patch"
+    "trpc-cli@0.12.1": "patches/trpc-cli@0.12.1.patch",
+    "happy-dom@20.0.11": "patches/happy-dom@20.0.11.patch"
   }
 }

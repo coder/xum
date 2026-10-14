@@ -15,12 +15,25 @@ import {
   ToggleGroup,
   ToggleGroupItem,
 } from "@/browser/components/ToggleGroupPrimitive/ToggleGroupPrimitive";
+import { isStreamFailure } from "@/browser/contexts/connectionLink";
 
 const channelDescriptions: Record<UpdateChannel, string> = {
   stable: "Official releases only.",
   nightly: "Nightly pre-release builds from main.",
   npm: "Most recently published npm package, including pre-releases.",
 };
+
+/**
+ * Names shown per blocker line; the rest collapse into a count so the dialog stays bounded. The
+ * backend already cut each name (nameRestartBlockerWorkspaces), keeping a duplicate's ID suffix.
+ */
+const MAX_BLOCKER_WORKSPACE_NAMES = 3;
+
+function formatBlockerWorkspaceNames(names: readonly string[]): string {
+  const shown = names.slice(0, MAX_BLOCKER_WORKSPACE_NAMES).join(", ");
+  const hidden = names.length - MAX_BLOCKER_WORKSPACE_NAMES;
+  return hidden > 0 ? `${shown} and ${hidden} more` : shown;
+}
 
 const blockerLabels: Record<RestartBlocker["kind"], string> = {
   "active-streams": "Active streams",
@@ -32,6 +45,7 @@ const blockerLabels: Record<RestartBlocker["kind"], string> = {
   requests: "Requests in flight",
   "desktop-sessions": "Live desktop sessions",
   "queued-messages": "Sessions with queued messages",
+  "held-inputs": "Sessions with unsent messages",
   "auto-retries": "Pending auto-retries",
   terminals: "Open terminals",
   "background-processes": "Running background processes",
@@ -125,7 +139,8 @@ export function AboutDialog() {
           }
         }
       } catch (error) {
-        if (!signal.aborted) {
+        // A lost connection is not a stream error: the next client opens the stream again.
+        if (isStreamFailure(error, signal)) {
           console.error("Update status stream error:", error);
         }
       }
@@ -366,6 +381,13 @@ export function AboutDialog() {
                         <li key={blocker.kind}>
                           {blockerLabels[blocker.kind]}:{" "}
                           <span className="counter-nums">{blocker.count}</span>
+                          {/* Which workspaces to open, e.g. an archived one (#4770). */}
+                          {blocker.workspaceNames != null && blocker.workspaceNames.length > 0 && (
+                            <span className="break-words">
+                              {" "}
+                              ({formatBlockerWorkspaceNames(blocker.workspaceNames)})
+                            </span>
+                          )}
                         </li>
                       ))}
                     </ul>

@@ -1,15 +1,16 @@
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
-import { getReviewDefaultBaseKey } from "@/common/constants/storage";
+import { getReviewDiffBaseKey } from "@/common/constants/storage";
 import { THINKING_LEVEL_OFF } from "@/common/types/thinking";
+
+/** Displayed until the side conversation's first user message supplies its own title. */
+export const SIDE_CHAT_INITIAL_TITLE = "New chat";
 
 /**
  * Storage key helpers for persisted settings.
  */
 export const STORAGE_KEYS = {
-  /** Per-project default diff base for code review. Pass projectPath. */
-  reviewDefaultBase: getReviewDefaultBaseKey,
   /** Per-workspace diff base override. Pass workspaceId. */
-  reviewDiffBase: (workspaceId: string) => `review-diff-base:${workspaceId}`,
+  reviewDiffBase: getReviewDiffBaseKey,
 } as const;
 
 Object.freeze(STORAGE_KEYS);
@@ -19,14 +20,8 @@ Object.freeze(STORAGE_KEYS);
  *
  * These defaults are IMMUTABLE and serve as the fallback when:
  * - A new workspace is created
- * - A workspace has no stored override in localStorage
+ * - A workspace has no stored override in its metadata
  * - Settings are reset to defaults
- *
- * Per-workspace overrides persist in localStorage using keys like:
- * - `agentId:{workspaceId}`
- * - `model:{workspaceId}`
- * - `thinkingLevel:{workspaceId}`
- * - `input:{workspaceId}`
  *
  * The global defaults themselves CANNOT be changed by users.
  * Only per-workspace overrides are mutable.

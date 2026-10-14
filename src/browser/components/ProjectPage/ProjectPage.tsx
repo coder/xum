@@ -10,12 +10,14 @@ import type { ChatInputAPI, WorkspaceCreatedOptions } from "@/browser/features/C
 import { ProjectMCPOverview } from "../ProjectMCPOverview/ProjectMCPOverview";
 import { ArchivedWorkspaces } from "../ArchivedWorkspaces/ArchivedWorkspaces";
 import { useAPI } from "@/browser/contexts/API";
+import { isStreamFailure } from "@/browser/contexts/connectionLink";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { getErrorMessage } from "@/common/utils/errors";
 import { GitInitBanner } from "../GitInitBanner/GitInitBanner";
 import { ConfiguredProvidersBar } from "../ConfiguredProvidersBar/ConfiguredProvidersBar";
 import { ConfigureProvidersPrompt } from "../ConfigureProvidersPrompt/ConfigureProvidersPrompt";
 import { hasConfiguredProvider, useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
+import { useCreationSendBlocked } from "./useCreationSendBlocked";
 import { AgentsInitBanner } from "../AgentsInitBanner/AgentsInitBanner";
 import {
   usePersistedState,
@@ -23,15 +25,15 @@ import {
   readPersistedState,
 } from "@/browser/hooks/usePersistedState";
 import {
-  getAgentIdKey,
+  ARCHIVED_WORKSPACES_CACHE_MAX_CHARS,
   getAgentsInitNudgeKey,
   getArchivedWorkspacesKey,
   getArchivedWorkspacesExpandedKey,
-  getDraftScopeId,
-  getInputKey,
-  getPendingScopeId,
-  getProjectScopeId,
 } from "@/common/constants/storage";
+import { updateUserPreferences } from "@/browser/stores/AppConfigStore";
+import { getDraftStore } from "@/browser/stores/DraftStore";
+import { trimArrayToChars } from "@/browser/utils/boundedPersistedValue";
+import { getComposerDraftScope } from "@/browser/features/ChatInput/useComposerDraft";
 import { Button } from "@/browser/components/Button/Button";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
@@ -92,7 +94,11 @@ const ProjectArchivedWorkspaces: React.FC<{ projectPath: string; projectName: st
     // Persist outside the state updater: a restore navigates away before its refresh
     // resolves, and an unmounted component's updater never runs, so the next mount
     // would otherwise start from a cache that still lists the restored workspace.
-    updatePersistedState(getArchivedWorkspacesKey(projectPath), next);
+    // The cache only seeds the first render, so keep just the leading entries that fit its budget.
+    updatePersistedState(
+      getArchivedWorkspacesKey(projectPath),
+      trimArrayToChars(next, ARCHIVED_WORKSPACES_CACHE_MAX_CHARS)
+    );
     setArchivedWorkspaces((prev) => (prev && archivedListsEqual(prev, next) ? prev : next));
   }, [projectPath]);
 
@@ -105,39 +111,32 @@ const ProjectArchivedWorkspaces: React.FC<{ projectPath: string; projectName: st
     [projectPath, syncArchivedState]
   );
 
-  // Keep archived metadata off the project page startup path.
-  useEffect(() => {
-    if (!api || !archivedExpanded) return;
-    let cancelled = false;
+  // Bumped to re-list after a restore/delete: a fresh stream's snapshot stays ordered with the
+  // updates around it, unlike a separate list() (#5189).
+  const [archivedListRevision, setArchivedListRevision] = useState(0);
 
-    const loadArchived = async () => {
-      try {
-        const allArchived = await api.workspace.list({ archived: true });
-        if (cancelled) return;
-        setArchivedLoadError(undefined);
-        replaceArchivedList(allArchived);
-      } catch (error) {
-        console.error("Failed to load archived workspaces:", error);
-        if (!cancelled) setArchivedLoadError(getErrorMessage(error));
-      }
-    };
-
-    void loadArchived();
-    return () => {
-      cancelled = true;
-    };
-  }, [api, replaceArchivedList, archivedExpanded]);
-
-  // Subscribe to metadata events to reactively update archived list
+  // Keep archived metadata off the project page startup path. The stream's first event is the
+  // archived snapshot, built after the server attached the listener, so no update falls between.
   useEffect(() => {
     if (!api || !archivedExpanded) return;
     const controller = new AbortController();
+    let snapshotReceived = false;
 
     (async () => {
       try {
-        const iterator = await api.workspace.onMetadata(undefined, { signal: controller.signal });
+        const iterator = await api.workspace.onMetadata(
+          { archived: true },
+          { signal: controller.signal }
+        );
         for await (const event of iterator) {
           if (controller.signal.aborted) break;
+
+          if ("type" in event) {
+            snapshotReceived = true;
+            setArchivedLoadError(undefined);
+            replaceArchivedList(event.workspaces);
+            continue;
+          }
 
           const meta = event.metadata;
           // Only care about workspaces in this project
@@ -155,15 +154,27 @@ const ProjectArchivedWorkspaces: React.FC<{ projectPath: string; projectName: st
 
           syncArchivedState();
         }
+        if (!snapshotReceived && !controller.signal.aborted) {
+          throw new Error("Archived workspace stream ended before its snapshot");
+        }
       } catch (err) {
-        if (!controller.signal.aborted) {
-          console.error("Failed to subscribe to metadata for archived workspaces:", err);
+        // A lost connection is no load failure: the reconnect opens the stream again.
+        if (isStreamFailure(err, controller.signal)) {
+          console.error("Failed to load archived workspaces:", err);
+          setArchivedLoadError(getErrorMessage(err));
         }
       }
     })();
 
     return () => controller.abort();
-  }, [api, projectPath, syncArchivedState, archivedExpanded]);
+  }, [
+    api,
+    projectPath,
+    replaceArchivedList,
+    syncArchivedState,
+    archivedExpanded,
+    archivedListRevision,
+  ]);
 
   return (
     <div className="flex justify-center px-4 pb-4">
@@ -175,8 +186,7 @@ const ProjectArchivedWorkspaces: React.FC<{ projectPath: string; projectName: st
           loadError={archivedLoadError}
           onWorkspacesChanged={() => {
             // Refresh archived list after unarchive/delete
-            if (!api) return;
-            void api.workspace.list({ archived: true }).then(replaceArchivedList);
+            setArchivedListRevision((revision) => revision + 1);
           }}
         />
       </div>
@@ -200,6 +210,10 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
   const { api } = useAPI();
   const chatInputRef = useRef<ChatInputAPI | null>(null);
   const pendingAgentsInitSendRef = useRef(false);
+  // #6038: "Run /init" sends through the creation composer, which cannot send while its branch
+  // list loads (or failed). Off until the composer of this scope reports it can send.
+  const creationComposerKey = `${projectPath}:${pendingDraftId ?? "__pending__"}`;
+  const [creationSendBlocked, setCreationSendBlocked] = useCreationSendBlocked(creationComposerKey);
   const [showAgentsInitNudge, setShowAgentsInitNudge] = usePersistedState<boolean>(
     getAgentsInitNudgeKey(projectPath),
     false,
@@ -258,7 +272,7 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
 
   const handleRunAgentsInit = useCallback(() => {
     // Switch project-scope mode to exec.
-    updatePersistedState(getAgentIdKey(getProjectScopeId(projectPath)), "exec");
+    updateUserPreferences({ ai: { projectDefaults: { [projectPath]: { agentId: "exec" } } } });
 
     // Run the /init skill and start the creation chat.
     if (chatInputRef.current) {
@@ -268,11 +282,15 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
       });
     } else {
       pendingAgentsInitSendRef.current = true;
-      const pendingScopeId =
-        typeof pendingDraftId === "string" && pendingDraftId.trim().length > 0
-          ? getDraftScopeId(projectPath, pendingDraftId)
-          : getPendingScopeId(projectPath);
-      updatePersistedState(getInputKey(pendingScopeId), "/init");
+      getDraftStore().setText(
+        getComposerDraftScope({
+          variant: "creation",
+          workspaceId: null,
+          creationProjectPath: projectPath,
+          pendingDraftId: pendingDraftId ?? undefined,
+        }),
+        "/init"
+      );
     }
 
     setShowAgentsInitNudge(false);
@@ -305,7 +323,8 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
     <AgentProvider projectPath={projectPath}>
       <ThinkingProvider projectPath={projectPath}>
         {/* Flex container to fill parent space */}
-        <div className="bg-surface-primary relative flex flex-1 flex-col overflow-hidden">
+        {/* No workspace is open, so this page is the one `main` landmark (#5969). */}
+        <main className="bg-surface-primary relative flex flex-1 flex-col overflow-hidden">
           {/* Draggable header bar - matches WorkspaceMenuBar for consistency */}
           <div
             className={cn(
@@ -348,19 +367,21 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
                       <AgentsInitBanner
                         onRunInit={handleRunAgentsInit}
                         onDismiss={handleDismissAgentsInit}
+                        runDisabled={creationSendBlocked}
                       />
                     )}
                     {/* ChatInput for workspace creation. */}
                     <ChatInput
                       // Key by project + draft so project navigation and draft switches both remount
                       // creation-local state (including any in-flight creation send).
-                      key={`${projectPath}:${pendingDraftId ?? "__pending__"}`}
+                      key={creationComposerKey}
                       variant="creation"
                       projectPath={projectPath}
                       projectName={projectName}
                       pendingSubProjectPath={pendingSubProjectPath}
                       pendingDraftId={pendingDraftId}
                       onReady={handleChatReady}
+                      onCreationSendBlockedChange={setCreationSendBlocked}
                       onWorkspaceCreated={onWorkspaceCreated}
                     />
                     {providersLoading ? (
@@ -392,7 +413,7 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
               projectName={projectName}
             />
           </div>
-        </div>
+        </main>
       </ThinkingProvider>
     </AgentProvider>
   );

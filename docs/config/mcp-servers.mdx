@@ -52,9 +52,9 @@ These overrides are stored in a workspace-local file: `.xum/mcp.local.jsonc`.
 
 This means you configure servers once (globally or with repo overrides), but each workspace (branch) gets isolated server instances with independent state.
 
-## Agent Plugins servers (experiment)
+## Agent Plugins servers
 
-With the **Agent Plugins** experiment enabled (Settings → Experiments), MCP servers declared in an [Agent Plugin's](https://agent-plugins.org) `mcp.json` also appear in server listings. Plugin servers are:
+MCP servers declared in an [Agent Plugin's](https://agent-plugins.org) `mcp.json` also appear in server listings. Plugin servers are:
 
 - **Disabled by default** — globally installed plugins can be enabled for all eligible local workspaces in **Settings → MCP**, which saves their keys in `enabledPluginServers` in `~/.xum/mcp.jsonc`. Repo plugins are enabled per workspace via the Workspace MCP dialog. Workspace enable/disable overrides take precedence over the global default
 - **Read-only definitions** — commands and tool allowlists cannot be edited globally, and servers cannot be removed individually. Definitions are never written into `mcp.jsonc`; only enabled server keys appear in `enabledPluginServers`, which a managed uninstall clears for that plugin
@@ -66,6 +66,12 @@ With the **Agent Plugins** experiment enabled (Settings → Experiments), MCP se
 Stdio plugin servers launch with the spec's `PLUGIN_ROOT` and `PLUGIN_DATA` environment variables; per-plugin data directories live under `~/.xum/plugin-data/`.
 
 **Settings → Plugins** installs plugins from git into `~/.xum/plugins` (paste a git URL or `owner/repo[@ref]`); the exact location derives from the active Xum home (a legacy `~/.mux` home keeps working) and is shown in the section. Before anything is written, a consent preview lists the plugin's manifest, every skill, and every MCP server command line. Installs are pinned to the resolved commit; update checks compare the tracked branch or tag against the pinned commit and never auto-apply. Applying an update replaces the plugin directory wholesale — local edits to a managed plugin directory are discarded — and restarts that plugin's running MCP servers. Uninstalling removes the directory, the registry entry, and the plugin's global enablement and per-workspace server overrides, but keeps `~/.xum/plugin-data/` unless you opt in to deleting it.
+
+## Tool search
+
+Tool search is on by default. Xum keeps MCP tool definitions out of the model-visible tool list until the model finds them with the `tool_catalog_search` tool, which saves context when you have many MCP tools. Turn it off in **Settings → MCP** to advertise every MCP tool up front.
+
+Claude 4.5 and later models with Anthropic prompt caching, used directly or through Mux Gateway or a Coder instance, use Anthropic's native deferred loading: every MCP tool stays in the request, so the cached prefix is unchanged, and a search loads the matched definitions in place. Other models, including Claude through OpenRouter, GitHub Copilot, or Bedrock, get a tool list that grows as searches find tools. Each search costs an extra model round trip, so the native path defers only when the MCP tool definitions are large (roughly 8k tokens or more); smaller catalogs are sent in full, as with tool search off. On the other models, turning tool search off can be cheaper with only a few MCP tools.
 
 ## Behavior
 
@@ -111,7 +117,7 @@ Select **Use Claude Code credentials** to opt into read-only access and test the
 connection. Then enable `claude_design` globally in MCP Servers. Workspace MCP
 controls can restrict access, but cannot enable a globally disabled Design server:
 checkout-local files are not authoritative consent to use your Claude credentials.
-Existing tool allowlists and HTTP MCP policy still apply. A conflicting
+Existing tool allowlists still apply. A conflicting
 server name must be renamed or removed first; Mux never replaces that server or
 lends it Claude credentials.
 

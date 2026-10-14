@@ -85,7 +85,7 @@ async function executeWorkspaceBashOrThrow(params: {
 }
 
 function getHunk(container: HTMLElement): HTMLElement | null {
-  return container.querySelector("[data-hunk-id]") as HTMLElement | null;
+  return container.querySelector("[data-hunk-id]");
 }
 
 async function refreshReviewAndWaitForHunk(view: RenderedApp): Promise<void> {
@@ -109,7 +109,7 @@ async function refreshReviewAndWaitForHunk(view: RenderedApp): Promise<void> {
 async function waitForButtonToDisappear(
   container: HTMLElement,
   ariaLabel: string,
-  timeoutMs: number = 10_000
+  timeoutMs = 10_000
 ): Promise<void> {
   await waitFor(
     () => {
@@ -120,10 +120,7 @@ async function waitForButtonToDisappear(
   );
 }
 
-async function waitForNotLoading(
-  container: HTMLElement,
-  timeoutMs: number = 15_000
-): Promise<void> {
+async function waitForNotLoading(container: HTMLElement, timeoutMs = 15_000): Promise<void> {
   await waitFor(
     () => {
       const text = container.textContent ?? "";
@@ -155,7 +152,7 @@ async function withReviewPanel(
 async function waitForButton(
   container: HTMLElement,
   ariaLabel: string,
-  timeoutMs: number = 10_000
+  timeoutMs = 10_000
 ): Promise<HTMLElement> {
   return waitFor(
     () => {
@@ -490,38 +487,6 @@ git diff HEAD -- tiny-file.ts | grep -q "MODIFIED"`,
 
         await waitForButtonToDisappear(container, "Collapse context above", 10_000);
         expect(getHunk(container)).not.toBeNull();
-      });
-    });
-  }, 180_000);
-
-  // Skip: happy-dom cleanup issue with React state updates after unmount
-  // The persistence is tested via Storybook stories which use real browser
-  test.skip("expansion state persists across tab switches", async () => {
-    await withSharedWorkspace("anthropic", async ({ env, workspaceId, metadata }) => {
-      await withReviewPanel({ apiClient: env.orpc, metadata }, async (view) => {
-        const container = await setupReviewPanelWithDiff(view, metadata, workspaceId, env.orpc);
-
-        const expandUpButton = await waitForButton(container, "Show more context above");
-        fireEvent.click(expandUpButton);
-        await waitForNotLoading(container, 10_000);
-
-        // Switch away from review tab - use costs tab which is always available
-        const costsTab = container.querySelector('[role="tab"][aria-controls*="costs"]');
-        if (costsTab) fireEvent.click(costsTab);
-
-        // Give time for tab switch
-        await new Promise((r) => setTimeout(r, 500));
-
-        // Switch back to review tab
-        const reviewTab = container.querySelector('[role="tab"][aria-controls*="review"]');
-        if (reviewTab) fireEvent.click(reviewTab);
-
-        await waitFor(
-          () => {
-            expect(getHunk(container)).not.toBeNull();
-          },
-          { timeout: 15_000 }
-        );
       });
     });
   }, 180_000);

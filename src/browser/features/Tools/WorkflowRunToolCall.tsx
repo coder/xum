@@ -1,7 +1,6 @@
 import React, { useContext, useEffect, useRef, useState, useSyncExternalStore } from "react";
 
 import { APIContext, type APIClient } from "@/browser/contexts/API";
-import { useExperimentValue } from "@/browser/contexts/ExperimentsContext";
 import {
   Dialog,
   DialogContent,
@@ -14,7 +13,6 @@ import {
   useOptionalCommandRegistry,
   type CommandAction,
 } from "@/browser/contexts/CommandRegistryContext";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN } from "@/common/constants/workflowReports";
 import { WorkflowTimeline } from "@/browser/features/RightSidebar/Workflows/WorkflowTimeline";
 import {
@@ -284,16 +282,23 @@ function getStructuredOutput(value: unknown): unknown {
 type WorkflowTaskEvent = Extract<WorkflowRunEvent, { type: "task" }>;
 type WorkflowChildEvent = Extract<WorkflowRunEvent, { type: "workflow" }>;
 type WorkflowPatchEvent = Extract<WorkflowRunEvent, { type: "patch" }>;
+type WorkflowEvaluationEvent = Extract<WorkflowRunEvent, { type: "evaluation" }>;
 
 type WorkflowDisplayRow =
   | { kind: "event"; event: WorkflowRunEvent }
   | { kind: "task"; firstEvent: WorkflowTaskEvent; latestEvent: WorkflowTaskEvent }
   | { kind: "workflow"; firstEvent: WorkflowChildEvent; latestEvent: WorkflowChildEvent }
-  | { kind: "patch"; firstEvent: WorkflowPatchEvent; latestEvent: WorkflowPatchEvent };
+  | { kind: "patch"; firstEvent: WorkflowPatchEvent; latestEvent: WorkflowPatchEvent }
+  | {
+      kind: "evaluation";
+      firstEvent: WorkflowEvaluationEvent;
+      latestEvent: WorkflowEvaluationEvent;
+    };
 
 type WorkflowTaskRow = Extract<WorkflowDisplayRow, { kind: "task" }>;
 type WorkflowChildDisplayRow = Extract<WorkflowDisplayRow, { kind: "workflow" }>;
 type WorkflowPatchRow = Extract<WorkflowDisplayRow, { kind: "patch" }>;
+type WorkflowEvaluationRow = Extract<WorkflowDisplayRow, { kind: "evaluation" }>;
 
 const MAX_TOOL_INLINE_NESTED_WORKFLOW_DEPTH = 3;
 
@@ -385,11 +390,16 @@ function getWorkflowChildEventKey(event: WorkflowChildEvent): string {
 function getPatchEventKey(event: WorkflowPatchEvent): string {
   return `patch:${event.stepId}:${event.sourceTaskId}`;
 }
+
+function getEvaluationEventKey(event: WorkflowEvaluationEvent): string {
+  return `evaluation:${event.stepId}:${event.inputHash}`;
+}
 function getWorkflowDisplayRows(events: readonly WorkflowRunEvent[]): WorkflowDisplayRow[] {
   const rows: WorkflowDisplayRow[] = [];
   const taskRows = new Map<string, WorkflowTaskRow>();
   const workflowRows = new Map<string, WorkflowChildDisplayRow>();
   const patchRows = new Map<string, WorkflowPatchRow>();
+  const evaluationRows = new Map<string, WorkflowEvaluationRow>();
 
   for (const event of events) {
     if (event.type === "status" || event.type === "result") {
@@ -452,6 +462,27 @@ function getWorkflowDisplayRows(events: readonly WorkflowRunEvent[]): WorkflowDi
       continue;
     }
 
+    if (event.type === "evaluation") {
+      // One evaluate step emits started → completed/failed per attempt (and
+      // `cached` on replay) for the same stepId+inputHash; every attempt is the
+      // same logical step, so collapse them into one row with the latest status.
+      const key = getEvaluationEventKey(event);
+      const existingRow = evaluationRows.get(key);
+      if (existingRow != null) {
+        existingRow.latestEvent = event;
+        continue;
+      }
+
+      const row: WorkflowEvaluationRow = {
+        kind: "evaluation",
+        firstEvent: event,
+        latestEvent: event,
+      };
+      evaluationRows.set(key, row);
+      rows.push(row);
+      continue;
+    }
+
     rows.push({ kind: "event", event });
   }
   return rows;
@@ -467,10 +498,25 @@ function getDisplayRowKey(row: WorkflowDisplayRow): string {
   if (row.kind === "patch") {
     return getPatchEventKey(row.firstEvent);
   }
+  if (row.kind === "evaluation") {
+    return getEvaluationEventKey(row.firstEvent);
+  }
   return getEventKey(row.event);
 }
 function getEventKey(event: WorkflowRunEvent): string {
   return `${event.sequence}:${event.type}`;
+}
+
+/**
+ * Label the coalesced row with the latest status but the `started` event's
+ * title: a terminal event written by an older build (or a replay `cached`
+ * event) may omit `title`, which would otherwise fall back to the raw step id.
+ */
+function getEvaluationRowEvent(row: WorkflowEvaluationRow): WorkflowEvaluationEvent {
+  if (row.latestEvent.title != null || row.firstEvent.title == null) {
+    return row.latestEvent;
+  }
+  return { ...row.latestEvent, title: row.firstEvent.title };
 }
 
 function getWorkflowEventLabel(event: WorkflowRunEvent): string {
@@ -509,6 +555,15 @@ function getWorkflowEventLabel(event: WorkflowRunEvent): string {
         ? `${event.stepId} validation ${verdict}: ${event.message}`
         : `${event.stepId} validation ${verdict}`;
     }
+    case "evaluation": {
+      // `title` is author-provided display text; React escaping is the only
+      // rendering path (see the schema comment), never string-interpolated
+      // into model-facing text.
+      const label = `${event.title ?? event.stepId} / evaluation / ${event.status}`;
+      return event.status === "failed" && event.reason
+        ? `${label} (${event.reason}/${event.code ?? "unknown"})`
+        : label;
+    }
     case "error":
       return event.message;
     case "status":
@@ -533,6 +588,8 @@ function getWorkflowEventDetail(event: WorkflowRunEvent): unknown {
       return event.data;
     case "result":
       return event.result;
+    case "evaluation":
+      return event.usage;
     case "task":
     case "validation":
     case "error":
@@ -575,6 +632,13 @@ function getEventTone(event: WorkflowRunEvent): "normal" | "success" | "warning"
     return event.status === "completed"
       ? "success"
       : event.status === "failed" || event.status === "interrupted"
+        ? "warning"
+        : "normal";
+  }
+  if (event.type === "evaluation") {
+    return event.status === "completed" || event.status === "cached"
+      ? "success"
+      : event.status === "failed"
         ? "warning"
         : "normal";
   }
@@ -698,7 +762,9 @@ function WorkflowEventTooltip(props: {
   );
 }
 
-function getWorkflowMergedRowDetail(row: WorkflowChildDisplayRow | WorkflowPatchRow): unknown {
+function getWorkflowMergedRowDetail(
+  row: WorkflowChildDisplayRow | WorkflowPatchRow | WorkflowEvaluationRow
+): unknown {
   const firstDetail = getWorkflowEventDetail(row.firstEvent);
   const latestDetail = getWorkflowEventDetail(row.latestEvent);
   if (row.firstEvent === row.latestEvent || row.latestEvent.status === "started") {
@@ -1367,22 +1433,16 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
   const headerProgressSummary =
     displayStatus === "completed" ? null : getWorkflowHeaderProgressSummary(run);
   const workspaceStore = useWorkspaceStoreRaw();
-  // Active runs stay visible in the transcript as a live surface. The Workflows tab remains the
-  // broader detail and history surface once a run settles.
-  const workflowsTabEnabled = useExperimentValue(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS);
   const {
     expanded,
     setLocalExpanded,
     toggleExpanded,
     markInteracted: markExpansionInteracted,
   } = useAutoCollapsingToolExpansion(true, {
-    // Active runs are a live transcript surface even when the Workflows tab is available. Once a
-    // run settles, the experiment restores the compact history presentation. Without the tab, only
-    // completed runs collapse. Tool errors always stay open because no durable run may exist.
-    autoCollapsed:
-      errorResult == null &&
-      !parentRunActive &&
-      (workflowsTabEnabled || displayStatus === "completed"),
+    // Active runs stay visible in the transcript as a live surface; once a run settles the
+    // Workflows tab is the detail and history surface. Tool errors always stay open because no
+    // durable run may exist.
+    autoCollapsed: errorResult == null && !parentRunActive,
     resetKey: runId,
   });
 
@@ -1584,10 +1644,11 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
       return;
     }
 
+    const api = apiState.api;
     let ignore = false;
     const discover = async () => {
       try {
-        const runs = await apiState.api.workflows.listRuns({ workspaceId });
+        const runs = await api.workflows.listRuns({ workspaceId });
         const foregroundRun = findForegroundWorkflowRun({
           runs,
           args: launchArgs,
@@ -1627,10 +1688,11 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
       return;
     }
 
+    const api = apiState.api;
     let ignore = false;
     const discover = async () => {
       try {
-        const nextRun = await apiState.api.workflows.getRun({
+        const nextRun = await api.workflows.getRun({
           workspaceId,
           runId: exactDiscoveryRunId,
         });
@@ -1681,10 +1743,11 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
       return;
     }
 
+    const api = apiState.api;
     let ignore = false;
     const refresh = async () => {
       try {
-        const nextRun = await apiState.api.workflows.getRun({
+        const nextRun = await api.workflows.getRun({
           workspaceId: workflowWorkspaceId,
           runId,
         });
@@ -1716,10 +1779,11 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
       return;
     }
 
+    const api = apiState.api;
     let ignore = false;
     const refresh = async () => {
       try {
-        const nextRun = await apiState.api.workflows.getRun({
+        const nextRun = await api.workflows.getRun({
           workspaceId: run.workspaceId,
           runId,
         });
@@ -1801,6 +1865,18 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
                 <WorkflowEventRow
                   key={getDisplayRowKey(row)}
                   event={row.latestEvent}
+                  tooltipEvent={row.firstEvent}
+                  detailOverride={getWorkflowMergedRowDetail(row)}
+                  displayIndex={index + 1}
+                  steps={run?.steps ?? []}
+                />
+              );
+            }
+            if (row.kind === "evaluation") {
+              return (
+                <WorkflowEventRow
+                  key={getDisplayRowKey(row)}
+                  event={getEvaluationRowEvent(row)}
                   tooltipEvent={row.firstEvent}
                   detailOverride={getWorkflowMergedRowDetail(row)}
                   displayIndex={index + 1}

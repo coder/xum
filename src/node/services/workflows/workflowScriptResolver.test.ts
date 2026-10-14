@@ -372,7 +372,7 @@ describe("resolveWorkflowScript", () => {
       };
     }
 
-    test("resolves a plugin workflow when the agent-plugins experiment is enabled", async () => {
+    test("resolves a plugin workflow", async () => {
       using tempDir = new TestTempDir("workflow-script-plugin");
       const container = path.join(tempDir.path, ".mux", "plugins");
       await writePluginWithWorkflow(container, "my-plugin", "release.js");
@@ -382,7 +382,6 @@ describe("resolveWorkflowScript", () => {
         runtime: new LocalRuntime(tempDir.path),
         workspacePath: tempDir.path,
         projectTrusted: true,
-        includeAgentPlugins: true,
         roots: pluginRoots(tempDir, container),
       });
 
@@ -406,7 +405,6 @@ describe("resolveWorkflowScript", () => {
         runtime: new LocalRuntime(project),
         workspacePath: project,
         projectTrusted: true,
-        includeAgentPlugins: true,
         roots: {
           ...createIsolatedAgentSkillsRoots(tempDir.path),
           projectPluginRoots: [alias],
@@ -423,22 +421,6 @@ describe("resolveWorkflowScript", () => {
       ).rejects.toThrow("not found");
     });
 
-    test("rejects plugin workflows without the agent-plugins experiment", async () => {
-      using tempDir = new TestTempDir("workflow-script-plugin-gated");
-      const container = path.join(tempDir.path, ".mux", "plugins");
-      await writePluginWithWorkflow(container, "my-plugin", "release.js");
-
-      await expect(
-        resolveWorkflowScript({
-          scriptPath: "plugin://my-plugin/release.js",
-          runtime: new LocalRuntime(tempDir.path),
-          workspacePath: tempDir.path,
-          projectTrusted: true,
-          roots: pluginRoots(tempDir, container),
-        })
-      ).rejects.toThrow("agent-plugins experiment");
-    });
-
     test("project plugin workflows are not resolvable for untrusted projects", async () => {
       using tempDir = new TestTempDir("workflow-script-plugin-untrusted");
       const container = path.join(tempDir.path, ".mux", "plugins");
@@ -450,7 +432,6 @@ describe("resolveWorkflowScript", () => {
           runtime: new LocalRuntime(tempDir.path),
           workspacePath: tempDir.path,
           projectTrusted: false,
-          includeAgentPlugins: true,
           roots: pluginRoots(tempDir, container),
         })
       ).rejects.toThrow("not found");
@@ -464,7 +445,6 @@ describe("resolveWorkflowScript", () => {
         runtime: new LocalRuntime(tempDir.path),
         workspacePath: tempDir.path,
         projectTrusted: true,
-        includeAgentPlugins: true,
         roots: pluginRoots(tempDir, container),
       };
 
@@ -490,7 +470,6 @@ describe("resolveWorkflowScript", () => {
         runtime: new LocalRuntime(tempDir.path),
         workspacePath: tempDir.path,
         projectTrusted: true,
-        includeAgentPlugins: true,
         roots: pluginRoots(tempDir, container),
       };
 

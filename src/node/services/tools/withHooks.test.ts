@@ -2,10 +2,13 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
-import { tool } from "ai";
+import { jsonSchema, tool, type Tool } from "ai";
 import { z } from "zod";
 import { withHooks } from "./withHooks";
+import { eventSpine, type ToolExecuteContext } from "@/node/services/events/eventSpine";
+import { MCP_TOOL_ORIGIN } from "@/node/services/agentPlugins/codexToolNames";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { sanitizeMCPToolsForOpenAI } from "@/common/utils/tools/schemaSanitizer";
 
 describe("withHooks", () => {
   let tempDir: string;
@@ -27,6 +30,40 @@ describe("withHooks", () => {
       execute: (args) => executeFn(args),
     });
   }
+
+  test("hands an MCP tool's origin and input schema to tool.execute middleware", async () => {
+    const baseTool = createTestTool((args) => Promise.resolve({ output: args.input }));
+    Object.defineProperty(baseTool, MCP_TOOL_ORIGIN, {
+      value: { serverName: "plugin:0123456789abcdef:scanner", toolName: "scan" },
+      enumerable: true,
+    });
+    const seen: Array<Pick<ToolExecuteContext, "mcpOrigin"> & { schema: unknown }> = [];
+    const unregister = eventSpine.useBefore(
+      "tool.execute",
+      (ctx) => {
+        seen.push({ mcpOrigin: ctx.mcpOrigin, schema: ctx.inputJsonSchema?.() });
+      },
+      { workspaceId: "origin-ws" }
+    );
+    try {
+      const wrapped = withHooks("plugin_x_scanner_scan", baseTool, {
+        runtime,
+        cwd: tempDir,
+        runtimeTempDir: tempDir,
+        workspaceId: "origin-ws",
+      });
+      await wrapped.execute!({ input: "hi" }, {} as never);
+    } finally {
+      unregister();
+    }
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.mcpOrigin).toEqual({
+      serverName: "plugin:0123456789abcdef:scanner",
+      toolName: "scan",
+    });
+    expect(seen[0]?.schema).toMatchObject({ properties: { input: { type: "string" } } });
+  });
 
   test("executes tool directly when no hook exists", async () => {
     const baseTool = createTestTool((args) =>
@@ -323,5 +360,61 @@ exit 0
     expect(result.value).toBe(42);
     expect(result.hook_output).toContain("post ran:");
     expect(result.hook_output).toContain('"value":42');
+  });
+
+  test("hook rewrites see the MCP tool's full schema, not the OpenAI-sanitized one", async () => {
+    const schema = {
+      type: "object" as const,
+      properties: { name: { type: "string" as const, minLength: 1 } },
+      required: ["name"],
+    };
+    const mcpTool = tool({
+      description: "MCP tool",
+      inputSchema: jsonSchema(schema),
+      execute: () => Promise.resolve({ ok: true }),
+    }) as Tool;
+    const { scan: sanitized } = sanitizeMCPToolsForOpenAI({ scan: mcpTool });
+    const seen: unknown[] = [];
+    const unregister = eventSpine.useBefore("tool.execute", (ctx) => {
+      seen.push(ctx.inputJsonSchema?.());
+    });
+    try {
+      const wrapped = withHooks("scan", sanitized, {
+        runtime,
+        cwd: tempDir,
+        runtimeTempDir: tempDir,
+        workspaceId: "test-ws",
+      });
+      await wrapped.execute!({ name: "a" }, {} as never);
+    } finally {
+      unregister();
+    }
+    expect(seen).toEqual([schema]);
+  });
+
+  test("a post-block keeps the model-visible result: the hook's feedback replaces the output", async () => {
+    // Codex PRRT_kwDOPxxmWM6r6NnK: the pipeline reports a post-block to nested callers, but an
+    // ordinary tool call still returns the feedback exactly as before.
+    const feedback = { error: "[plugin:guard] secrets stay out" };
+    const unregister = eventSpine.use(
+      "tool.execute",
+      async (ctx, next) => {
+        await next();
+        ctx.result = feedback;
+        ctx.postBlocked = true;
+      },
+      { workspaceId: "post-block-ws" }
+    );
+    try {
+      const wrapped = withHooks(
+        "test_tool",
+        createTestTool(() => Promise.resolve({ output: "SECRET" })),
+        { runtime, cwd: tempDir, runtimeTempDir: tempDir, workspaceId: "post-block-ws" }
+      );
+      const result: unknown = await wrapped.execute!({ input: "x" }, {} as never);
+      expect(result).toEqual(feedback);
+    } finally {
+      unregister();
+    }
   });
 });

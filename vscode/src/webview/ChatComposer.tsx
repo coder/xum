@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import { useMemo, useRef, useState, type CSSProperties } from "react";
 
 import { SendHorizontal } from "lucide-react";
 
@@ -6,13 +6,20 @@ import type { StreamingMessageAggregator } from "xum/browser/utils/messages/Stre
 import { getSendOptionsFromStorage } from "xum/browser/utils/messages/sendOptions";
 
 import { matchesKeybind, formatKeybind, KEYBINDS } from "xum/browser/utils/ui/keybinds";
+import { CUSTOM_EVENTS, createCustomEvent } from "xum/common/constants/events";
 import { useAPI } from "xum/browser/contexts/API";
-import { AgentProvider, useAgent } from "xum/browser/contexts/AgentContext";
+import { useAgent } from "xum/browser/contexts/AgentContext";
+import { useWorkspaceAiSelection } from "xum/browser/utils/workspaceAiSettingsSync";
 import { ThinkingProvider } from "xum/browser/contexts/ThinkingContext";
-import { useThinkingLevel } from "xum/browser/hooks/useThinkingLevel";
 import { usePersistedState } from "xum/browser/hooks/usePersistedState";
+import { useUserPreferences } from "xum/browser/stores/AppConfigStore";
 import { useModelsFromSettings } from "xum/browser/hooks/useModelsFromSettings";
-import { normalizeToCanonical } from "xum/common/utils/ai/models";
+import { normalizeSelectedModel } from "xum/common/utils/ai/models";
+import {
+  consumeAiSelectionIntent,
+  getAiSelectionIntentForSendOptions,
+  markAiSelectionIntent,
+} from "xum/browser/utils/aiSelectionIntent";
 import { useProviderOptions } from "xum/browser/hooks/useProviderOptions";
 import { useAutoCompactionSettings } from "xum/browser/hooks/useAutoCompactionSettings";
 
@@ -20,47 +27,29 @@ import { VimTextArea } from "xum/browser/components/VimTextArea/VimTextArea";
 import { ModelSelector } from "xum/browser/components/ModelSelector/ModelSelector";
 import { ThinkingSelector } from "xum/browser/components/ThinkingSelector/ThinkingSelector";
 import { ContextUsageIndicatorButton } from "xum/browser/components/ContextUsageIndicatorButton/ContextUsageIndicatorButton";
+import { AgentModePicker } from "xum/browser/components/AgentModePicker/AgentModePicker";
+import { Button } from "xum/browser/components/Button/Button";
 import { Tooltip, TooltipTrigger, TooltipContent } from "xum/browser/components/Tooltip/Tooltip";
-
-import type { AgentId } from "xum/common/orpc/schemas";
 
 import { calculateTokenMeterData } from "xum/common/utils/tokens/tokenMeterUtils";
 import { createDisplayUsage } from "xum/common/utils/tokens/displayUsage";
 import type { ChatUsageDisplay } from "xum/common/utils/tokens/usageAggregator";
-import { enforceThinkingPolicy } from "xum/common/utils/thinking/policy";
 import { cn } from "xum/common/lib/utils";
-import { VIM_ENABLED_KEY, getInputKey, getModelKey } from "xum/common/constants/storage";
+import {
+  COMPOSER_CONTROL_HEIGHT_CLASS,
+  COMPOSER_WORKSPACE_ICON_ONLY_HIDE_CLASS,
+} from "xum/constants/layout";
+import { getInputKey } from "xum/common/constants/storage";
 
 const SEND_MESSAGE_TIMEOUT_MS = 30_000;
 
-/**
- * Simple agent toggle for VS Code extension (no agent discovery).
- * Just toggles between Exec and Plan agents.
- */
-function SimpleAgentToggle(props: { agentId: AgentId; onChange: (agentId: AgentId) => void }) {
-  const isPlan = props.agentId === "plan";
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <button
-          type="button"
-          onClick={() => props.onChange(isPlan ? "exec" : "plan")}
-          className={cn(
-            "rounded-sm px-1.5 py-0.5 text-[11px] font-medium transition-all duration-150",
-            isPlan
-              ? "bg-plan-mode text-white hover:bg-plan-mode-hover"
-              : "bg-exec-mode text-white hover:bg-exec-mode-hover"
-          )}
-        >
-          {isPlan ? "Plan" : "Exec"}
-        </button>
-      </TooltipTrigger>
-      <TooltipContent align="center">
-        Click to switch to {isPlan ? "Exec" : "Plan"} agent ({formatKeybind(KEYBINDS.TOGGLE_MODE)})
-      </TooltipContent>
-    </Tooltip>
-  );
-}
+// #4781: at most one AI-settings-persisting send per workspace may be unresolved, so an earlier
+// write can never land after a later pick's. The backend saves the settings before sendMessage
+// returns, so a server reply (success or failure) settles the entry. "unknown": a persisting send
+// ended without a reply (timeout abort or transport error), so its write may still land; later
+// sends for that workspace do not persist until the webview reloads (fail closed; the picks still
+// apply to the turns). Module scope, because the composer remounts per workspace.
+const aiPersistenceByWorkspace = new Map<string, "in-flight" | "unknown">();
 
 function getLastContextUsage(
   aggregator: StreamingMessageAggregator,
@@ -99,14 +88,22 @@ function ChatComposerInner(props: {
   disabled: boolean;
   disabledReason?: string | undefined;
   aggregator: StreamingMessageAggregator | null;
+  /** The workspace's own AI settings are loaded; until then nothing may be persisted (#4781). */
+  aiSettingsLoaded: boolean;
+  /** AgentProvider has a workspace scope; an unscoped toggle would write the global agent key. */
+  agentScoped: boolean;
+  /** The oldest held input, which the held-input shortcuts act on (#4771). */
+  heldInputId?: string | undefined;
   onSendComplete: () => void;
   onNotice: (notice: { level: "info" | "error"; message: string }) => void;
 }): JSX.Element {
   const apiState = useAPI();
   const api = apiState.api;
 
-  const { agentId, setAgentId } = useAgent();
-  const [thinkingLevel] = useThinkingLevel();
+  const { agentId, currentAgent, isAgentSelectionLocked } = useAgent();
+  // #4820: without a workspace scope a pick would write the webview's global agent key.
+  const agentPickerUsable = props.agentScoped && isAgentSelectionLocked !== true;
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const { options: providerOptions } = useProviderOptions();
   const use1M = providerOptions.anthropic?.use1MContext ?? false;
@@ -122,23 +119,19 @@ function ChatComposerInner(props: {
     setDefaultModel,
   } = useModelsFromSettings();
 
-  const modelKey = getModelKey(props.workspaceId);
-  const [preferredModel, setPreferredModel] = usePersistedState<string>(modelKey, defaultModel, {
-    listener: true,
-  });
-
-  const baseModel = normalizeToCanonical(preferredModel);
+  // Gateway-preserving, like the desktop composer: an explicit gateway pick (e.g.
+  // openrouter:openai/gpt-5) stays selected instead of showing as its direct-provider model.
+  const storedModel = useWorkspaceAiSelection(props.workspaceId, agentId).model;
 
   const inputKey = getInputKey(props.workspaceId);
   const [input, setInput] = usePersistedState<string>(inputKey, "", { listener: true });
 
-  const [vimEnabled, setVimEnabled] = usePersistedState<boolean>(VIM_ENABLED_KEY, false, {
-    listener: true,
-  });
+  const vimEnabled = useUserPreferences(
+    (preferences) => preferences.appearance?.vimEnabled === true
+  );
   const [isSending, setIsSending] = useState(false);
 
   const aggregator = props.aggregator;
-  const canInterruptStream = Boolean(aggregator?.getActiveStreamMessageId());
   const isCompactingStream = aggregator?.isCompacting() ?? false;
   const usageModelFromAggregator = aggregator?.getCurrentModel() ?? null;
 
@@ -188,25 +181,13 @@ function ChatComposerInner(props: {
     Boolean(api);
 
   const onModelChange = (model: string) => {
-    const canonicalModel = normalizeToCanonical(model);
-    ensureModelInSettings(canonicalModel);
-    setPreferredModel(canonicalModel);
+    // The desktop's setPreferredModel semantics (ChatInput): keep an explicit gateway route, and
+    // record the deliberate pick so a sub-agent's metadata refresh keeps it until a send carries it.
+    const selectedModel = normalizeSelectedModel(model);
+    ensureModelInSettings(selectedModel);
+    markAiSelectionIntent(props.workspaceId, "model", selectedModel);
 
-    if (!api) {
-      return;
-    }
-
-    const effectiveThinkingLevel = enforceThinkingPolicy(canonicalModel, thinkingLevel);
-
-    api.workspace
-      .updateAgentAISettings({
-        workspaceId: props.workspaceId,
-        agentId,
-        aiSettings: { model: canonicalModel, thinkingLevel: effectiveThinkingLevel },
-      })
-      .catch(() => {
-        // Best-effort only.
-      });
+    // #4781: nothing is written here; the next send persists the pick (desktop parity).
   };
 
   const cycleModels = customModels.length > 0 ? customModels : models;
@@ -216,7 +197,7 @@ function ChatComposerInner(props: {
       return;
     }
 
-    const currentIndex = cycleModels.indexOf(baseModel);
+    const currentIndex = cycleModels.indexOf(storedModel);
     const nextIndex = currentIndex === -1 ? 0 : (currentIndex + 1) % cycleModels.length;
     const nextModel = cycleModels[nextIndex];
     if (nextModel) {
@@ -225,16 +206,24 @@ function ChatComposerInner(props: {
   };
 
   const onSend = async () => {
+    // Re-check at dispatch: the composer can be disabled (e.g. history replay not caught up)
+    // after the keystroke or click that triggered this send. Like the disabled Send button (and the
+    // desktop composer), Enter must not start a second send while one is in flight.
+    if (props.disabled || isSending) {
+      return;
+    }
     const trimmed = input.trim();
     if (!trimmed) {
       return;
     }
 
     if (trimmed === "/vim") {
-      const next = !vimEnabled;
-      setVimEnabled(next);
+      // Vim mode lives in Xum's config, which the webview cannot write.
       setInput("");
-      props.onNotice({ level: "info", message: `Vim mode ${next ? "enabled" : "disabled"}.` });
+      props.onNotice({
+        level: "info",
+        message: `Vim mode is ${vimEnabled ? "enabled" : "disabled"}. Change it in Xum.`,
+      });
       return;
     }
 
@@ -256,8 +245,33 @@ function ChatComposerInner(props: {
       controller.abort();
     }, SEND_MESSAGE_TIMEOUT_MS);
 
+    const baseOptions = {
+      ...getSendOptionsFromStorage(props.workspaceId),
+      // The effective agent: for a sub-agent workspace, the locked agent (#4738), not a local pick.
+      agentId,
+    };
+    // #4781: persist only explicit picks, through the desktop's send-time path (the backend saves the
+    // sent settings unless skipAiSettingsPersistence; aiSelectionIntent pins them on a sub-agent).
+    // Never seeded values (no pending pick), never before the workspace's settings are loaded
+    // (#4755), and never while an earlier persisting send for this workspace is unresolved. The
+    // thinking level is sent as selected; the backend applies the authoritative floor.
+    const mayPersist = props.aiSettingsLoaded && !aiPersistenceByWorkspace.has(props.workspaceId);
+    const aiSelection = getAiSelectionIntentForSendOptions(props.workspaceId, agentId, {
+      ...baseOptions,
+      skipAiSettingsPersistence: !mayPersist,
+    });
+    // An agent-only or Auto-only pick attaches a token but no field intent; it is explicit too.
+    const persist = Object.values(aiSelection.attachedTokens).some((token) => token !== undefined);
+    if (persist) {
+      aiPersistenceByWorkspace.set(props.workspaceId, "in-flight");
+    }
+
     try {
-      const options = getSendOptionsFromStorage(props.workspaceId);
+      const options = {
+        ...baseOptions,
+        skipAiSettingsPersistence: !persist,
+        ...(aiSelection.intent ? { aiSelectionIntent: aiSelection.intent } : {}),
+      };
 
       const result = await api.workspace.sendMessage(
         {
@@ -267,6 +281,10 @@ function ChatComposerInner(props: {
         },
         { signal: controller.signal }
       );
+      if (persist) {
+        // The server replied, so this send's settings write has landed (or was skipped).
+        aiPersistenceByWorkspace.delete(props.workspaceId);
+      }
 
       if (!result.success) {
         const errorString =
@@ -276,8 +294,15 @@ function ChatComposerInner(props: {
         return;
       }
 
+      if (persist) {
+        // A pick made while this send was in flight has a newer token and stays pending.
+        consumeAiSelectionIntent(props.workspaceId, agentId, aiSelection);
+      }
       props.onSendComplete();
     } catch (error) {
+      if (persist) {
+        aiPersistenceByWorkspace.set(props.workspaceId, "unknown");
+      }
       if (controller.signal.aborted) {
         props.onNotice({
           level: "error",
@@ -311,91 +336,170 @@ function ChatComposerInner(props: {
       return `Compacting... (${formatKeybind(interruptKeybind)} cancel | ${formatKeybind(KEYBINDS.SEND_MESSAGE)} to queue)`;
     }
 
-    const hints: string[] = [];
-    if (canInterruptStream) {
-      const interruptKeybind = vimEnabled
-        ? KEYBINDS.INTERRUPT_STREAM_VIM
-        : KEYBINDS.INTERRUPT_STREAM_NORMAL;
-      hints.push(`${formatKeybind(interruptKeybind)} to interrupt`);
-    }
-
-    hints.push(
-      `${formatKeybind(KEYBINDS.SEND_MESSAGE)} to ${canInterruptStream ? "queue" : "send"}`
-    );
-    hints.push(`Click model to choose, ${formatKeybind(KEYBINDS.CYCLE_MODEL)} to cycle`);
-    hints.push(`/vim to toggle Vim mode (${vimEnabled ? "on" : "off"})`);
-
-    return `Type a message... (${hints.join(", ")})`;
+    // Desktop's tip carousel advertises slash commands and symbol shortcuts the webview does not
+    // implement (it only handles /vim locally), so use desktop's plain placeholder instead.
+    return "Type a message...";
   })();
 
+  // Mirrors the desktop composer (ChatInput): same surface, hint row, and control row. Attach,
+  // voice, and send-mode menus are omitted because the webview does not support them.
+  const composerSurfaceStyle: CSSProperties & { "--composer-focus-border": string } = {
+    "--composer-focus-border": currentAgent?.uiColor ?? "var(--color-border-light)",
+  };
+
   return (
-    <div className="flex flex-col gap-2">
-      <VimTextArea
-        value={input}
-        onChange={setInput}
-        placeholder={placeholder}
-        disabled={props.disabled}
-        onKeyDown={(e) => {
-          if (matchesKeybind(e, KEYBINDS.CYCLE_MODEL)) {
-            e.preventDefault();
-            cycleToNextModel();
-            return;
-          }
+    <div className="flex flex-col gap-1">
+      {/* Scope the focus border to the textarea so sibling controls do not trigger it. */}
+      <div
+        className="border-border-light rounded-md border p-2 has-[textarea:focus]:border-[var(--composer-focus-border)]"
+        style={composerSurfaceStyle}
+        data-component="ChatInputSurface"
+      >
+        <div className="relative flex items-end pb-1" data-component="ChatInputControls">
+          <VimTextArea
+            ref={textareaRef}
+            value={input}
+            onChange={setInput}
+            placeholder={placeholder}
+            disabled={props.disabled}
+            className="min-h-22"
+            onKeyDown={(e) => {
+              if (matchesKeybind(e, KEYBINDS.CYCLE_MODEL)) {
+                e.preventDefault();
+                cycleToNextModel();
+                return;
+              }
 
-          if (matchesKeybind(e, KEYBINDS.SEND_MESSAGE)) {
-            e.preventDefault();
-            void onSend();
-          }
-        }}
-      />
+              // Same held-input shortcuts as the desktop composer: only from an empty composer, and
+              // routed to the HeldInput banner so they share its in-flight guard and error display.
+              const heldAction = matchesKeybind(e, KEYBINDS.SEND_HELD_INPUT)
+                ? "send"
+                : matchesKeybind(e, KEYBINDS.DISCARD_HELD_INPUT)
+                  ? "discard"
+                  : null;
+              if (heldAction != null && props.heldInputId != null && input.trim() === "") {
+                e.preventDefault();
+                if (e.repeat) return;
+                window.dispatchEvent(
+                  createCustomEvent(CUSTOM_EVENTS.HELD_INPUT_ACTION, {
+                    workspaceId: props.workspaceId,
+                    heldInputId: props.heldInputId,
+                    action: heldAction,
+                  })
+                );
+                return;
+              }
 
-      <div className="flex flex-col gap-2">
-        <div className="w-full min-w-0" data-component="ModelSelectorGroup">
-          <ModelSelector
-            value={baseModel}
-            onChange={onModelChange}
-            models={models}
-            hiddenModels={hiddenModels}
-            defaultModel={defaultModel}
-            onSetDefaultModel={setDefaultModel}
-            onHideModel={hideModel}
-            onUnhideModel={unhideModel}
+              if (matchesKeybind(e, KEYBINDS.SEND_MESSAGE)) {
+                e.preventDefault();
+                void onSend();
+              }
+            }}
           />
+          {/* Only shortcuts the webview handles: no FOCUS_CHAT handler exists here, and agent
+              cycling is hinted only when the picker itself is usable. Unlike desktop, there is no
+              touch-layout hiding: the webview only runs inside VS Code, a keyboard surface where
+              these shortcuts work. */}
+          {input.trim() === "" && (
+            <div className="text-muted @container pointer-events-none absolute right-2 bottom-3 left-2 flex flex-nowrap items-center gap-4 overflow-hidden text-[11px] whitespace-nowrap">
+              <span className="shrink-0">
+                <span className="font-mono">{formatKeybind(KEYBINDS.CYCLE_MODEL)}</span>
+                <span> - change model</span>
+              </span>
+              {agentPickerUsable && (
+                <span className="shrink-0 [@container(max-width:520px)]:hidden">
+                  <span className="font-mono">{formatKeybind(KEYBINDS.CYCLE_AGENT)}</span>
+                  <span> - change agent</span>
+                </span>
+              )}
+            </div>
+          )}
         </div>
 
-        <div className="@container flex items-center justify-between gap-2">
-          <div className="flex shrink-0 items-center overflow-visible">
-            <ThinkingSelector modelString={baseModel} allowProMode={false} allowFastMode={false} />
-          </div>
+        <div className="flex flex-col gap-0.5" data-component="ChatModeToggles">
+          <div
+            className="@container flex flex-nowrap items-center gap-1.5"
+            data-component="ComposerControlRow"
+          >
+            <div className="flex min-w-0 flex-1 items-center gap-1.5">
+              <div className="min-w-0 [@container(max-width:320px)]:hidden">
+                <AgentModePicker
+                  className="min-w-0"
+                  iconOnlyHideClassName={COMPOSER_WORKSPACE_ICON_ONLY_HIDE_CLASS}
+                  disabled={!props.agentScoped}
+                  onComplete={() => textareaRef.current?.focus()}
+                />
+              </div>
 
-          <div className="flex shrink-0 items-center gap-1.5">
-            <ContextUsageIndicatorButton
-              data={contextUsageData}
-              autoCompaction={autoCompactionSettings}
-            />
-            <SimpleAgentToggle agentId={agentId} onChange={setAgentId} />
+              <div
+                className={cn(
+                  "outline-border-light flex min-w-0 items-center gap-1.5 rounded-md px-1.5 outline-1 -outline-offset-1",
+                  COMPOSER_CONTROL_HEIGHT_CLASS
+                )}
+                data-component="ModelSelectorGroup"
+              >
+                <ModelSelector
+                  value={storedModel}
+                  onChange={onModelChange}
+                  models={models}
+                  hiddenModels={hiddenModels}
+                  defaultModel={defaultModel}
+                  onSetDefaultModel={setDefaultModel}
+                  onHideModel={hideModel}
+                  onUnhideModel={unhideModel}
+                  className="h-full max-w-[8rem] min-w-0"
+                />
+                <span className="bg-border-light h-3.5 w-px shrink-0" aria-hidden="true" />
 
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  onClick={() => void onSend()}
-                  disabled={!canSend}
-                  aria-label="Send message"
-                  className={cn(
-                    "inline-flex items-center gap-1 rounded-sm border border-border-light px-1.5 py-0.5 text-[11px] font-medium text-white transition-colors duration-200 disabled:opacity-50",
-                    agentId === "plan"
-                      ? "bg-plan-mode hover:bg-plan-mode-hover disabled:hover:bg-plan-mode"
-                      : "bg-exec-mode hover:bg-exec-mode-hover disabled:hover:bg-exec-mode"
-                  )}
-                >
-                  <SendHorizontal className="h-3.5 w-3.5" strokeWidth={2.5} />
-                </button>
-              </TooltipTrigger>
-              <TooltipContent align="center">
-                Send message ({formatKeybind(KEYBINDS.SEND_MESSAGE)})
-              </TooltipContent>
-            </Tooltip>
+                <div className="flex shrink-0 items-center" data-component="ThinkingSelectorGroup">
+                  <ThinkingSelector
+                    modelString={storedModel}
+                    allowReasoningModes={false}
+                    allowFastMode={false}
+                  />
+                </div>
+              </div>
+
+              <ContextUsageIndicatorButton
+                data={contextUsageData}
+                // No setter: the host blocks every config write from the webview, so the
+                // threshold is shown read-only.
+                autoCompaction={{
+                  threshold: autoCompactionSettings.threshold,
+                  rolloverEnabled: autoCompactionSettings.rolloverEnabled,
+                }}
+              />
+            </div>
+
+            <div
+              className="flex shrink-0 items-center justify-end gap-1"
+              data-component="ModelControls"
+            >
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    onClick={() => void onSend()}
+                    disabled={!canSend}
+                    aria-label="Send message"
+                    size="xs"
+                    variant="ghost"
+                    className={cn(
+                      "inline-flex h-7 w-7 items-center justify-center rounded-full p-0 font-medium transition-colors duration-200",
+                      // Pin text colors because the ghost variant otherwise overrides the glyph.
+                      canSend
+                        ? "bg-composer-send hover:bg-composer-send text-composer-send-foreground hover:text-composer-send-foreground hover:opacity-90"
+                        : "bg-surface-secondary text-composer-send-foreground"
+                    )}
+                  >
+                    <SendHorizontal className="h-3.5 w-3.5" strokeWidth={2.5} />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent align="start">
+                  Send message ({formatKeybind(KEYBINDS.SEND_MESSAGE)})
+                </TooltipContent>
+              </Tooltip>
+            </div>
           </div>
         </div>
       </div>
@@ -408,21 +512,27 @@ export function ChatComposer(props: {
   disabled: boolean;
   disabledReason?: string | undefined;
   aggregator: StreamingMessageAggregator | null;
+  /** The workspace's own AI settings are loaded; until then nothing may be persisted (#4781). */
+  aiSettingsLoaded: boolean;
+  agentScoped: boolean;
+  heldInputId?: string | undefined;
   onSendComplete: () => void;
   onNotice: (notice: { level: "info" | "error"; message: string }) => void;
 }): JSX.Element {
+  // AgentProvider is mounted by App so the transcript shares it (#4711).
   return (
-    <AgentProvider workspaceId={props.workspaceId}>
-      <ThinkingProvider workspaceId={props.workspaceId}>
-        <ChatComposerInner
-          workspaceId={props.workspaceId}
-          disabled={props.disabled}
-          disabledReason={props.disabledReason}
-          aggregator={props.aggregator}
-          onSendComplete={props.onSendComplete}
-          onNotice={props.onNotice}
-        />
-      </ThinkingProvider>
-    </AgentProvider>
+    <ThinkingProvider workspaceId={props.workspaceId}>
+      <ChatComposerInner
+        workspaceId={props.workspaceId}
+        disabled={props.disabled}
+        disabledReason={props.disabledReason}
+        aggregator={props.aggregator}
+        aiSettingsLoaded={props.aiSettingsLoaded}
+        agentScoped={props.agentScoped}
+        heldInputId={props.heldInputId}
+        onSendComplete={props.onSendComplete}
+        onNotice={props.onNotice}
+      />
+    </ThinkingProvider>
   );
 }

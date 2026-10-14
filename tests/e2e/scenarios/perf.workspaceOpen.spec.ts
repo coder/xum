@@ -2,6 +2,11 @@ import { electronTest as test, electronExpect as expect } from "../electronTest"
 import { getXumE2EEnv } from "../env";
 import { parseHistoryProfilesFromEnv, seedWorkspaceHistoryProfile } from "../utils/historyFixture";
 import {
+  readPageMilestones,
+  startPageMilestones,
+  type PageMilestones,
+} from "../utils/pageMilestones";
+import {
   readReactProfileSnapshot,
   resetReactProfileSamples,
   withChromeProfiles,
@@ -33,12 +38,18 @@ test.describe("workspace open performance profiling", () => {
       await resetReactProfileSamples(page);
 
       const runLabel = `workspace-open-${profile}`;
+      let milestones: PageMilestones | undefined;
       const chromeProfile = await withChromeProfiles(page, { label: runLabel }, async () => {
+        await startPageMilestones(page);
         await ui.projects.openFirstWorkspace();
         await expect(page.getByTestId("message-window")).toHaveAttribute("data-loaded", "true", {
           timeout: 20_000,
         });
+        milestones = await readPageMilestones(page);
       });
+      if (!milestones) {
+        throw new Error("Page milestones were not captured");
+      }
 
       const reactProfileSnapshot = await readReactProfileSnapshot(page);
       if (!reactProfileSnapshot) {
@@ -51,9 +62,12 @@ test.describe("workspace open performance profiling", () => {
         chromeProfile,
         reactProfile: reactProfileSnapshot,
         historyProfile: historySummary,
+        milestones,
       });
 
       expect(chromeProfile.wallTimeMs).toBeGreaterThan(0);
+      // The assertion above saw data-loaded, so the in-page observer must have too.
+      expect(milestones.fullyLoadedMs).not.toBeNull();
       expect(chromeProfile.cpuProfile).not.toBeNull();
       const interestingRenderPaths = [
         "chat-pane",

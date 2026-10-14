@@ -3,6 +3,11 @@ import type { Config } from "@/node/config";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
+import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
+import { sideChatCapabilityGrants } from "@/node/services/sideChat";
+import type { MCPServerManager } from "@/node/services/mcpServerManager";
+import { eventSpine } from "@/node/services/events/eventSpine";
+import { codexPluginHookService } from "./codexHookService";
 import { agentPluginHookService } from "./hookService";
 import { resolveAgentPluginsMcpContext } from "./mcpConfig";
 
@@ -11,8 +16,9 @@ export async function prepareWorkspaceRequestHooks(args: {
   config: Config;
   metadata: WorkspaceMetadata;
   hostCheckoutRoot: string | null;
-  enabled: boolean;
   journal: DurableEventJournal;
+  /** Codex-format hooks (hooks.json) call plugin MCP servers through it; absent: none run. */
+  mcpServerManager?: Pick<MCPServerManager, "callToolForPluginHook" | "canCallToolForPluginHook">;
 }): Promise<void> {
   const pluginContext = args.hostCheckoutRoot
     ? resolveAgentPluginsMcpContext(args.metadata, args.hostCheckoutRoot)
@@ -21,9 +27,25 @@ export async function prepareWorkspaceRequestHooks(args: {
     workspaceId: args.metadata.id,
     sessionDir: path.join(args.config.sessionsDir, args.metadata.id),
     journal: args.journal,
-    enabled: args.enabled,
     xumHome: args.config.rootDir,
     projectRoot: pluginContext?.projectRoot,
+    projectKey: pluginContext?.projectKey,
     projectTrusted: isWorkspaceProjectTrusted(args.config, args.metadata),
   });
+  if (args.mcpServerManager !== undefined) {
+    const { config, metadata } = args;
+    await codexPluginHookService.ensureWorkspaceHooks({
+      workspaceId: metadata.id,
+      sideChat: sideChatCapabilityGrants(metadata) != null,
+      xumHome: config.rootDir,
+      // A function, not a value: the gate re-reads trust before every hook call. Every project of
+      // the workspace must be trusted: hooks run MCP tools in the runtime they all share, the
+      // rule for the repo's own tool hooks too (Codex PRRT_kwDOPxxmWM6r_vUC).
+      isProjectTrusted: () =>
+        isWorkspaceTrustedForSharedExecution(metadata, config.loadConfigOrDefault().projects),
+      mcp: args.mcpServerManager,
+      notifyUser: (pluginName, message) =>
+        eventSpine.emit("plugin.hook.notice", { workspaceId: metadata.id, pluginName, message }),
+    });
+  }
 }

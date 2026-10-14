@@ -41,8 +41,8 @@ import type { ExtensionMetadataService } from "@/node/services/ExtensionMetadata
 import type { WorkspaceService } from "@/node/services/workspaceService";
 import type { TaskService } from "@/node/services/taskService";
 import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
-import type { PolicyService } from "@/node/services/policyService";
 import type { TelemetryService } from "@/node/services/telemetryService";
+import type { EvaluationService } from "@/node/services/evaluation/evaluationService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import type { MemoryService } from "@/node/services/memoryService";
 import type { MemoryConsolidationService } from "@/node/services/memoryConsolidationService";
@@ -61,7 +61,6 @@ export interface CoreServicesOptions {
   mcpConfig?: Config;
   mcpServerManagerOptions?: MCPServerManagerOptions;
   /** Optional cross-cutting services (desktop creates before core services). */
-  policyService?: PolicyService;
   telemetryService?: TelemetryService;
   analyticsService?: GoalLifecycleAnalyticsSink;
   goalServiceOptions?: WorkspaceGoalServiceOptions;
@@ -94,6 +93,8 @@ export interface CoreServices {
    */
   idleDispatcher: IdleDispatcher;
   aiService: AIService;
+  /** Headless `experimental_evaluate` wrapper for the workflow `evaluate()` primitive. */
+  evaluationService: EvaluationService;
   streamManager: StreamManager;
   mcpConfigService: MCPConfigService;
   mcpServerManager: MCPServerManager;

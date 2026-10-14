@@ -1,24 +1,24 @@
-import { afterEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { EventEmitter } from "events";
-import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
+import type { StreamMessageOptions } from "@/node/services/aiService";
 import type { TurnStreamHandle } from "@/node/services/streamManager";
 import type { SendMessageError } from "@/common/types/errors";
-import type { AgentSession } from "./agentSession";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
-import type { CompactionMonitor } from "./compactionMonitor";
-import type { Config } from "@/node/config";
+import { CompactionMonitor } from "./compactionMonitor";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type {
   AutoModelRouter,
   AutoModelRouterClassifyInput,
+  AutoModelRouterFailure,
 } from "@/node/services/autoModelRouter";
 import type {
   AutoModelRoutingDecision,
   AutoModelRoutingEscalation,
   AutoModelRoutingRecord,
+  AutoModelRoutingTier,
 } from "@/common/types/autoModelRouting";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL } from "@/constants/autoModelRouting";
@@ -28,30 +28,25 @@ import {
   type MuxMessageMetadata,
 } from "@/common/types/message";
 import type { LiveTurnRouting } from "./thinkingOverride";
+import type { AgentSessionAIService } from "./agentSession";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getTotalCost } from "@/common/utils/tokens/usageAggregator";
 import { createTestHistoryService } from "./testHistoryService";
 import {
+  createAgentSessionHarness,
   createFailedTurnHandle,
   createStartedTurnHandle,
-  createStreamLifecycleMocks,
-  createTestAgentSession,
   runSessionTerminalPolicy,
+  seedAutoCompactionThreshold,
 } from "./agentSession.testHarness";
 import { waitForCondition } from "./testDispatchHelpers";
 
 const COMPOSER_MODEL = "anthropic:claude-3-5-sonnet-latest";
 const HARD_MODEL = "openai:gpt-5.5";
 
-interface TierInput {
-  id: string;
-  label: string;
-  description: string;
-  model?: string;
-  thinkingLevel?: string;
-}
+type TierInput = AutoModelRoutingTier;
 
 const TIERS: TierInput[] = [
   { id: "easy", label: "Easy", description: "Trivial", model: "anthropic:claude-3-5-haiku-latest" },
@@ -75,7 +70,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     experimentEnabled: boolean;
     classify?: (
       input: AutoModelRouterClassifyInput
-    ) => Promise<Result<AutoModelRoutingDecision, string>>;
+    ) => Promise<Result<AutoModelRoutingDecision, AutoModelRouterFailure>>;
     tiers?: TierInput[];
     /** Saved evaluation model; absent means the normalized default. */
     evaluationModel?: string;
@@ -84,19 +79,13 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     /** Priced cost the workspace ledger reports for the evaluator's usage; absent means unpriced. */
     evaluatorCostUsd?: number;
   }) {
-    const { historyService, cleanup } = await createTestHistoryService();
+    const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
-    const config = {
-      rootDir: "/tmp",
-      sessionsDir: "/tmp",
-      srcDir: "/tmp",
-      loadConfigOrDefault: () => ({
-        autoModelRouting: {
-          tiers: options.tiers ?? TIERS,
-          ...(options.evaluationModel ? { evaluationModel: options.evaluationModel } : {}),
-        },
-      }),
-    } as unknown as Config;
+    // Persist the routing settings the way the Settings UI does.
+    await config.updateAutoModelRouting({
+      tiers: options.tiers ?? TIERS,
+      ...(options.evaluationModel ? { evaluationModel: options.evaluationModel } : {}),
+    });
     // Goal service stub: only the pricing gate has behavior; every other method the
     // send path touches is a no-op resolving to undefined (no goal exists here).
     const unpriced = new Set(options.unpricedModels ?? []);
@@ -121,16 +110,18 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       (opts: StreamMessageOptions): Promise<Result<TurnStreamHandle, SendMessageError>> =>
         Promise.resolve(Ok(createStartedTurnHandle(opts.abortSignal!)))
     );
-    const aiService = Object.assign(new EventEmitter(), {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock((_workspaceId: string) => false),
-      stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
+    // Only what differs from the harness's typed default AI service.
+    const aiServiceOverrides = {
       getProvidersConfig: mock(() => ({})),
+      // The workspace is not registered in this config, so the real service reports it missing.
+      getWorkspaceMetadata: mock((workspaceId: string) =>
+        Promise.resolve(Err(`Workspace ${workspaceId} not found`))
+      ),
       isExperimentEnabled: mock(
         (id: ExperimentId) => id === EXPERIMENT_IDS.AUTO_MODEL_ROUTING && options.experimentEnabled
       ),
-      streamMessage: streamMessage as unknown as AIService["streamMessage"],
-    }) as unknown as AIService;
+      streamMessage,
+    } satisfies Partial<AgentSessionAIService>;
     const classify = mock<NonNullable<typeof options.classify>>(
       options.classify ?? (() => Promise.resolve(Ok(decision("hard"))))
     );
@@ -157,11 +148,11 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       }
     );
 
-    const session = createTestAgentSession({
+    const harness = await createAgentSessionHarness({
       workspaceId: "ws-auto-routing",
       config,
       historyService,
-      aiService,
+      aiServiceOverrides,
       initStateManager: new EventEmitter() as unknown as InitStateManager,
       backgroundProcessManager: {
         cleanup: mock((_workspaceId: string) => Promise.resolve()),
@@ -177,9 +168,11 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       workspaceGoalService,
     });
     return {
-      session,
+      session: harness.session,
+      config,
       historyService,
-      aiService,
+      // The harness's AI service is its emitter; merging only unifies the two typed views.
+      aiService: Object.assign(harness.aiEmitter, harness.aiService),
       streamMessage,
       classify,
       recordHeadlessUsage,
@@ -188,6 +181,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
   }
 
   afterEach(async () => {
+    mock.restore();
     await historyCleanup?.();
   });
 
@@ -215,23 +209,38 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       : undefined;
   }
 
-  /** Make the next send hit the on-send compaction threshold. */
-  function forceOnSendCompaction(session: Awaited<ReturnType<typeof createHarness>>["session"]) {
-    const internals = session as unknown as {
-      contextController: { compactionMonitor: CompactionMonitor };
-    };
-    internals.contextController.compactionMonitor = {
-      checkBeforeSend: mock(() => ({
-        shouldShowWarning: true,
-        shouldForceCompact: true,
-        usagePercentage: 99,
-        thresholdPercentage: 85,
-      })),
-      checkMidStream: mock(() => false),
-      resetForNewStream: mock(() => undefined),
-      setThreshold: mock(() => undefined),
-      getThreshold: mock(() => 0.85),
-    } as unknown as CompactionMonitor;
+  /** Settles the active turn the way the engine reports a completed response. */
+  function endTurn(
+    harness: Pick<Awaited<ReturnType<typeof createHarness>>, "session" | "aiService">,
+    model: string,
+    usage: { inputTokens: number; outputTokens: number; totalTokens: number },
+    text?: string
+  ) {
+    return runSessionTerminalPolicy(harness.session, harness.aiService, {
+      type: "stream-end",
+      workspaceId: "ws-auto-routing",
+      messageId: "test-assistant",
+      parts: text == null ? [] : [{ type: "text", text }],
+      metadata: { model, agentId: "exec", finishReason: "stop", usage },
+    });
+  }
+
+  /** Context usage far past any catalogued window, so the real threshold check forces compaction. */
+  const OVERFLOWING_USAGE = { inputTokens: 10_000_000, outputTokens: 1, totalTokens: 10_000_001 };
+
+  /**
+   * Make the next send hit the on-send compaction threshold: the session seeds its context
+   * usage from the last assistant row in history before the pressure check.
+   */
+  async function seedContextPressure(
+    historyService: Awaited<ReturnType<typeof createTestHistoryService>>["historyService"]
+  ) {
+    const prior = createMuxMessage("prior-assistant", "assistant", "earlier answer", {
+      timestamp: Date.now() - 5_000,
+      model: COMPOSER_MODEL,
+      contextUsage: OVERFLOWING_USAGE,
+    });
+    expect((await historyService.appendToHistory("ws-auto-routing", prior)).success).toBe(true);
   }
 
   const UNSUPPORTED_IMAGE = {
@@ -319,7 +328,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
   it("keeps the composer model when the classifier fails and records the reason", async () => {
     const { session, streamMessage, classify } = await createHarness({
       experimentEnabled: true,
-      classify: () => Promise.resolve(Err("Classifier returned HTTP 429")),
+      classify: () => Promise.resolve(Err({ reason: "Classifier returned HTTP 429" })),
     });
 
     const result = await session.sendMessage("hello", {
@@ -616,6 +625,20 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       [UNSUPPORTED_IMAGE]
     );
     expect((await historyService.appendToHistory("ws-auto-routing", rejected)).success).toBe(true);
+    // Damaged review records remain hidden even if they carry an extra file part.
+    const hiddenReview = createMuxMessage(
+      "review-image",
+      "user",
+      "hidden plan snapshot",
+      {
+        synthetic: true,
+        muxMetadata: { type: "plan-review", kind: "snapshot", recordId: "review-image" },
+      },
+      [UNSUPPORTED_IMAGE]
+    );
+    expect((await historyService.appendToHistory("ws-auto-routing", hiddenReview)).success).toBe(
+      true
+    );
 
     await session.sendMessage("Refactor the scheduler", {
       model: COMPOSER_MODEL,
@@ -760,7 +783,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
 
   it("carries the routing record on the on-send compaction follow-up instead of reclassifying", async () => {
     const { session, historyService, classify } = await createHarness({ experimentEnabled: true });
-    forceOnSendCompaction(session);
+    await seedContextPressure(historyService);
 
     const result = await session.sendMessage("Refactor the scheduler", {
       model: COMPOSER_MODEL,
@@ -786,7 +809,16 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       experimentEnabled: true,
       tiers: TIERS_WITH_GROK,
     });
-    forceOnSendCompaction(session);
+    // The compaction turn falls back to the composer model, whose window the model catalog
+    // does not know, so no real usage can cross its threshold: force the decision instead.
+    spyOn(CompactionMonitor.prototype, "checkBeforeSend").mockReturnValue({
+      shouldShowWarning: true,
+      shouldForceCompact: true,
+      usagePercentage: 99,
+      thresholdPercentage: 85,
+      contextTokens: 198_000,
+      maxTokens: 200_000,
+    });
     const earlier = createMuxMessage("earlier-image", "user", "Look at this", undefined, [
       UNSUPPORTED_IMAGE,
     ]);
@@ -875,7 +907,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
         ...record,
         model: COMPOSER_MODEL,
         status: "fallback",
-        reason: "Provider is blocked by policy.",
+        reason: "Provider is disabled.",
       }),
       streamedModel: COMPOSER_MODEL,
       status: "fallback",
@@ -915,7 +947,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
         return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
       });
       aiService.stopStream = mock((workspaceId: string) => {
-        void runSessionTerminalPolicy(session, aiService as unknown as EventEmitter, {
+        void runSessionTerminalPolicy(session, aiService, {
           type: "stream-abort",
           workspaceId,
           messageId: "assistant-routed",
@@ -924,30 +956,19 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
         return Promise.resolve(Ok(undefined));
       });
 
-      const internals = session as unknown as {
-        contextController: { compactionMonitor: CompactionMonitor };
-        sendMessage: AgentSession["sendMessage"];
-      };
+      // Forced: the fallback composer model has no catalogued window. The spy records the
+      // model each check priced.
       let midStreamChecks = 0;
-      const checkMidStream = mock((_params: { model: string }) => {
+      const checkMidStream = spyOn(
+        CompactionMonitor.prototype,
+        "checkMidStream"
+      ).mockImplementation(() => {
         midStreamChecks += 1;
         return midStreamChecks === 1;
       });
-      internals.contextController.compactionMonitor = {
-        checkBeforeSend: mock(() => ({
-          shouldShowWarning: false,
-          shouldForceCompact: false,
-          usagePercentage: 0,
-          thresholdPercentage: 85,
-        })),
-        checkMidStream,
-        resetForNewStream: mock(() => undefined),
-        setThreshold: mock(() => undefined),
-        getThreshold: mock(() => 0.85),
-      } as unknown as CompactionMonitor;
       const originalSendMessage = session.sendMessage.bind(session);
       let compactionRequest: SendMessageOptions | undefined;
-      internals.sendMessage = ((...args: Parameters<AgentSession["sendMessage"]>) => {
+      const sendMessage = spyOn(session, "sendMessage").mockImplementation((...args) => {
         // Send options carry muxMetadata as a black box; the session stamps a typed payload.
         const muxMetadata = args[1]?.muxMetadata as MuxMessageMetadata | undefined;
         if (muxMetadata?.type !== "compaction-request") return originalSendMessage(...args);
@@ -955,14 +976,14 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
         // what the resumed turn would dispatch.
         compactionRequest ??= args[1];
         return Promise.resolve(Err({ type: "unknown", raw: "captured" }));
-      }) as AgentSession["sendMessage"];
+      });
 
       let streamErrored = false;
       session.onChatEvent(({ message }) => {
         if (message.type === "stream-error") streamErrored = true;
       });
 
-      const result = await internals.sendMessage("Refactor the scheduler", {
+      const result = await sendMessage("Refactor the scheduler", {
         model: COMPOSER_MODEL,
         agentId: "exec",
         autoModelRouting: true,
@@ -1107,7 +1128,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
         experimentEnabled: true,
         classify: () => Promise.resolve(Ok(decision("hard"))),
       });
-      const usage = { inputTokens: 4_000, outputTokens: 1, totalTokens: 4_001 };
+      const usage = OVERFLOWING_USAGE;
       let streamCalls = 0;
       streamMessage.mockImplementation((opts: StreamMessageOptions) => {
         streamCalls += 1;
@@ -1136,7 +1157,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
         return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
       });
       aiService.stopStream = mock((workspaceId: string) => {
-        void runSessionTerminalPolicy(session, aiService as unknown as EventEmitter, {
+        void runSessionTerminalPolicy(session, aiService, {
           type: "stream-abort",
           workspaceId,
           messageId: "assistant-routed",
@@ -1145,40 +1166,20 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
         return Promise.resolve(Ok(undefined));
       });
 
-      const internals = session as unknown as {
-        contextController: { compactionMonitor: CompactionMonitor };
-        sendMessage: AgentSession["sendMessage"];
-      };
-      let midStreamChecks = 0;
-      internals.contextController.compactionMonitor = {
-        checkBeforeSend: mock(() => ({
-          shouldShowWarning: false,
-          shouldForceCompact: false,
-          usagePercentage: 0,
-          thresholdPercentage: 85,
-        })),
-        checkMidStream: mock(() => {
-          midStreamChecks += 1;
-          return midStreamChecks === 1;
-        }),
-        resetForNewStream: mock(() => undefined),
-        setThreshold: mock(() => undefined),
-        getThreshold: mock(() => 0.85),
-      } as unknown as CompactionMonitor;
       const originalSendMessage = session.sendMessage.bind(session);
       let compactionRequest: SendMessageOptions | undefined;
-      internals.sendMessage = ((...args: Parameters<AgentSession["sendMessage"]>) => {
+      const sendMessage = spyOn(session, "sendMessage").mockImplementation((...args) => {
         const muxMetadata = args[1]?.muxMetadata as MuxMessageMetadata | undefined;
         if (muxMetadata?.type !== "compaction-request") return originalSendMessage(...args);
         compactionRequest ??= args[1];
         return Promise.resolve(Err({ type: "unknown", raw: "captured" }));
-      }) as AgentSession["sendMessage"];
+      });
       let streamErrored = false;
       session.onChatEvent(({ message }) => {
         if (message.type === "stream-error") streamErrored = true;
       });
 
-      const result = await internals.sendMessage("design it", {
+      const result = await sendMessage("design it", {
         model: COMPOSER_MODEL,
         agentId: "exec",
         thinkingLevel: "low",
@@ -1309,6 +1310,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
 
     // The resume request is the routed turn (report rows are not retry targets), so the
     // routing lookup must skip the report row the same way.
+    // A manual resumeStream refuses a report-row tail before streaming, so call the lookup directly.
     const internals = session as unknown as {
       applyAutoRoutedResume(options: {
         model: string;
@@ -1355,6 +1357,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     }
     expect(streamMessage).toHaveBeenCalledTimes(1);
 
+    // A manual resumeStream refuses a report-row tail before streaming, so call the lookup directly.
     const internals = session as unknown as {
       applyAutoRoutedResume(options: {
         model: string;
@@ -1408,6 +1411,51 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     );
   });
 
+  it("bills and goal-charges a rejected verdict the provider already billed (#4774)", async () => {
+    const evaluatorUsage = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
+    const providerMetadata = { openai: { reasoningTokens: 2 } };
+    const harness = await createHarness({
+      experimentEnabled: true,
+      unpricedModels: [],
+      evaluatorCostUsd: 0.0042,
+      classify: () =>
+        Promise.resolve(
+          Err({
+            reason: "Evaluation failed (AI_InvalidResponseDataError)",
+            usage: evaluatorUsage,
+            providerMetadata,
+          })
+        ),
+    });
+    const { session, streamMessage, recordHeadlessUsage, recordStreamAccounting } = harness;
+    await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+    });
+    expect(recordHeadlessUsage).toHaveBeenCalledWith(
+      "ws-auto-routing",
+      DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL,
+      evaluatorUsage,
+      providerMetadata,
+      { analyticsSource: "auto_model_routing" }
+    );
+    expect(streamMessage.mock.calls[0]?.[0]?.autoModelRouting).toMatchObject({
+      status: "fallback",
+      model: COMPOSER_MODEL,
+      reason: "Evaluation failed (AI_InvalidResponseDataError)",
+    });
+
+    const usage = { inputTokens: 1_000_000, outputTokens: 0, totalTokens: 1_000_000 };
+    await endTurn(harness, COMPOSER_MODEL, usage);
+    const responseCost = getTotalCost(createDisplayUsage(usage, COMPOSER_MODEL)) ?? 0;
+    expect(recordStreamAccounting).toHaveBeenCalledTimes(1);
+    expect((recordStreamAccounting.mock.calls[0]?.[0] as { costUsd: number }).costUsd).toBeCloseTo(
+      responseCost + 0.0042,
+      10
+    );
+  });
+
   it("charges the evaluator's priced spend with the routed turn's own stream accounting", async () => {
     const evaluatorUsage = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
     const { session, aiService, streamMessage, recordStreamAccounting } = await createHarness({
@@ -1442,7 +1490,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     expect(recordStreamAccounting).not.toHaveBeenCalled();
 
     const usage = { inputTokens: 1_000_000, outputTokens: 0, totalTokens: 1_000_000 };
-    await runSessionTerminalPolicy(session, aiService as unknown as EventEmitter, {
+    await runSessionTerminalPolicy(session, aiService, {
       type: "stream-end",
       workspaceId: "ws-auto-routing",
       messageId: "assistant-routed",
@@ -1463,12 +1511,13 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
 
   it("a send that never streams charges the evaluator by itself instead of the next turn", async () => {
     const evaluatorUsage = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
-    const { session, streamMessage, recordStreamAccounting } = await createHarness({
+    const harness = await createHarness({
       experimentEnabled: true,
       unpricedModels: [],
       evaluatorCostUsd: 0.0042,
       classify: () => Promise.resolve(Ok({ ...decision("hard"), usage: evaluatorUsage })),
     });
+    const { session, streamMessage, recordStreamAccounting } = harness;
     // Request preparation fails after classification: neither the tier model nor the
     // composer's fallback could be built.
     streamMessage.mockImplementation(() =>
@@ -1498,10 +1547,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       autoModelRouting: true,
     });
     const usage = { inputTokens: 1_000_000, outputTokens: 0, totalTokens: 1_000_000 };
-    const internals = session as unknown as {
-      recordGoalAccountingFromUsage(input: { model: string; usage: typeof usage }): Promise<void>;
-    };
-    await internals.recordGoalAccountingFromUsage({ model: HARD_MODEL, usage });
+    await endTurn(harness, HARD_MODEL, usage);
     expect(recordStreamAccounting).toHaveBeenCalledTimes(2);
     const hardCost = getTotalCost(createDisplayUsage(usage, HARD_MODEL)) ?? 0;
     expect((recordStreamAccounting.mock.calls[1]?.[0] as { costUsd: number }).costUsd).toBeCloseTo(
@@ -1512,12 +1558,16 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
 
   it("a compaction the user stops settles the evaluator spend it carried for its follow-up", async () => {
     const evaluatorUsage = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
-    const { session, aiService, streamMessage, recordStreamAccounting } = await createHarness({
+    const harness = await createHarness({
       experimentEnabled: true,
       unpricedModels: [],
       evaluatorCostUsd: 0.0042,
       classify: () => Promise.resolve(Ok({ ...decision("hard"), usage: evaluatorUsage })),
     });
+    const { session, config, historyService, aiService, streamMessage, recordStreamAccounting } =
+      harness;
+    // The delivered stream is an on-send compaction; the send behind its boundary is deferred.
+    await seedContextPressure(historyService);
     streamMessage.mockImplementation((opts: StreamMessageOptions) => {
       aiService.emit("stream-start", {
         type: "stream-start",
@@ -1538,11 +1588,10 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     });
     expect(recordStreamAccounting).not.toHaveBeenCalled();
 
-    // The delivered stream is an on-send compaction; the user stops it before the deferred
-    // send behind its boundary is dispatched, and the queue holding that send is cleared.
-    const internals = session as unknown as { activeCompactionRequest?: { id: string } };
-    internals.activeCompactionRequest = { id: "compaction-1" };
-    await runSessionTerminalPolicy(session, aiService as unknown as EventEmitter, {
+    expect(await persistedCompactionFollowUp(historyService)).toBeDefined();
+    // The user stops the compaction before the deferred send behind its boundary is
+    // dispatched, and the queue holding that send is cleared.
+    await runSessionTerminalPolicy(session, aiService, {
       type: "stream-abort",
       workspaceId: "ws-auto-routing",
       messageId: "assistant-compaction",
@@ -1556,12 +1605,16 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
 
     // Nothing is left over for the next unrelated turn.
     const usage = { inputTokens: 1_000_000, outputTokens: 0, totalTokens: 1_000_000 };
-    const accounting = session as unknown as {
-      recordGoalAccountingFromUsage(input: { model: string; usage: typeof usage }): Promise<void>;
-    };
     const callsBefore = recordStreamAccounting.mock.calls.length;
-    await accounting.recordGoalAccountingFromUsage({ model: HARD_MODEL, usage });
+    // Turn auto-compaction off so the seeded pressure does not compact the unrelated turn too.
+    await seedAutoCompactionThreshold(config, HARD_MODEL, 100);
+    await session.sendMessage("Unrelated question", { model: HARD_MODEL, agentId: "exec" });
+    await endTurn(harness, HARD_MODEL, usage);
     const hardCost = getTotalCost(createDisplayUsage(usage, HARD_MODEL)) ?? 0;
+    expect(recordStreamAccounting.mock.calls[callsBefore]?.[0]).toMatchObject({
+      isCompaction: false,
+      streamOriginKind: "user",
+    });
     expect(
       (recordStreamAccounting.mock.calls[callsBefore]?.[0] as { costUsd: number }).costUsd
     ).toBeCloseTo(hardCost, 10);
@@ -1569,13 +1622,14 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
 
   it("a routed stream that fails terminally still charges the evaluator's spend", async () => {
     const evaluatorUsage = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
-    const { session, aiService, streamMessage, recordStreamAccounting } = await createHarness({
+    const harness = await createHarness({
       experimentEnabled: true,
       unpricedModels: [],
       evaluatorCostUsd: 0.0042,
       classify: () => Promise.resolve(Ok({ ...decision("hard"), usage: evaluatorUsage })),
     });
-    streamMessage.mockImplementation((opts: StreamMessageOptions) => {
+    const { session, aiService, streamMessage, recordStreamAccounting } = harness;
+    streamMessage.mockImplementationOnce((opts: StreamMessageOptions) => {
       aiService.emit("stream-start", {
         type: "stream-start",
         workspaceId: "ws-auto-routing",
@@ -1608,11 +1662,13 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
 
     // Nothing is left over for the next unrelated turn.
     const usage = { inputTokens: 1_000_000, outputTokens: 0, totalTokens: 1_000_000 };
-    const accounting = session as unknown as {
-      recordGoalAccountingFromUsage(input: { model: string; usage: typeof usage }): Promise<void>;
-    };
-    await accounting.recordGoalAccountingFromUsage({ model: HARD_MODEL, usage });
+    await session.sendMessage("Unrelated question", { model: HARD_MODEL, agentId: "exec" });
+    await endTurn(harness, HARD_MODEL, usage);
     const hardCost = getTotalCost(createDisplayUsage(usage, HARD_MODEL)) ?? 0;
+    expect(recordStreamAccounting.mock.calls[1]?.[0]).toMatchObject({
+      isCompaction: false,
+      streamOriginKind: "user",
+    });
     expect((recordStreamAccounting.mock.calls[1]?.[0] as { costUsd: number }).costUsd).toBeCloseTo(
       hardCost,
       10
@@ -1621,40 +1677,42 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
 
   it("a compaction stream leaves the evaluator spend for the turn behind its boundary", async () => {
     const evaluatorUsage = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
-    const { session, recordStreamAccounting } = await createHarness({
+    const harness = await createHarness({
       experimentEnabled: true,
       unpricedModels: [],
       evaluatorCostUsd: 0.0042,
       classify: () => Promise.resolve(Ok({ ...decision("hard"), usage: evaluatorUsage })),
     });
+    const { session, historyService, streamMessage, recordStreamAccounting } = harness;
+    await seedContextPressure(historyService);
     await session.sendMessage("Refactor the scheduler", {
       model: COMPOSER_MODEL,
       agentId: "exec",
       autoModelRouting: true,
     });
     const usage = { inputTokens: 1_000_000, outputTokens: 0, totalTokens: 1_000_000 };
-    const internals = session as unknown as {
-      recordGoalAccountingFromUsage(input: {
-        model: string;
-        usage: typeof usage;
-        isCompaction?: boolean;
-      }): Promise<void>;
-    };
     // An on-send compaction streams first; its accounting never charges the goal.
-    await internals.recordGoalAccountingFromUsage({
-      model: COMPOSER_MODEL,
-      usage,
-      isCompaction: true,
-    });
-    await internals.recordGoalAccountingFromUsage({ model: HARD_MODEL, usage });
-    await internals.recordGoalAccountingFromUsage({ model: HARD_MODEL, usage });
+    const compactionModel = streamMessage.mock.calls[0]?.[0]?.modelString;
+    if (compactionModel == null) throw new Error("Expected the compaction stream");
+    await endTurn(harness, compactionModel, usage, "Summary of the scheduler work so far.");
+    // The routed send behind the boundary dispatches next, then an unrelated turn.
+    await waitForCondition(() => streamMessage.mock.calls.length === 2, { timeoutMs: 2_000 });
+    expect(streamMessage.mock.calls[1]?.[0]?.autoModelRouting).toMatchObject({ tierId: "hard" });
+    await endTurn(harness, HARD_MODEL, usage);
+    await session.sendMessage("Unrelated question", { model: HARD_MODEL, agentId: "exec" });
+    await endTurn(harness, HARD_MODEL, usage);
     const costs = recordStreamAccounting.mock.calls.map(
       (call) => (call[0] as { costUsd: number }).costUsd
     );
-    const composerCost = getTotalCost(createDisplayUsage(usage, COMPOSER_MODEL)) ?? 0;
+    const compactionCost = getTotalCost(createDisplayUsage(usage, compactionModel)) ?? 0;
     const hardCost = getTotalCost(createDisplayUsage(usage, HARD_MODEL)) ?? 0;
+    expect(recordStreamAccounting.mock.calls.map((call) => call[0])).toMatchObject([
+      { isCompaction: true },
+      { isCompaction: false },
+      { isCompaction: false },
+    ]);
     expect(costs).toHaveLength(3);
-    expect(costs[0]).toBeCloseTo(composerCost, 10);
+    expect(costs[0]).toBeCloseTo(compactionCost, 10);
     // The turn behind the boundary carries the evaluator's spend, exactly once.
     expect(costs[1]).toBeCloseTo(hardCost + 0.0042, 10);
     expect(costs[2]).toBeCloseTo(hardCost, 10);
@@ -1943,11 +2001,17 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     });
   });
 
-  it("keeps display-only rows (rejected prompts, workflow triggers) out of the evaluator context", async () => {
+  it("keeps model-hidden rows out of the evaluator context", async () => {
     const { session, historyService, classify } = await createHarness({ experimentEnabled: true });
     for (const [id, text, metadata] of [
       ["user-kept", "kept earlier prompt", {}],
       ["user-rejected", "rejected oversized prompt", { contextBudgetRejected: true }],
+      // Missing synthetic metadata must not make a hidden review record visible.
+      [
+        "user-plan-review",
+        "hidden plan snapshot",
+        { muxMetadata: { type: "plan-review", kind: "snapshot", recordId: "routing-snapshot" } },
+      ],
       [
         "user-workflow",
         "/workflow display-only trigger",
@@ -1982,6 +2046,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     expect(recent).toContain("kept earlier prompt");
     expect(recent).not.toContain("rejected oversized prompt");
     expect(recent).not.toContain("/workflow display-only trigger");
+    expect(recent).not.toContain("hidden plan snapshot");
   });
 
   it("keeps an earlier prompt in the evaluator context behind more than twenty report rows", async () => {

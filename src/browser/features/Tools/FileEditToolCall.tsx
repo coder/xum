@@ -30,6 +30,8 @@ import { DiffContainer, DiffRenderer, SelectableDiffRenderer } from "../Shared/D
 import { KebabMenu, type KebabMenuItem } from "@/browser/components/KebabMenu/KebabMenu";
 import { JsonHighlight } from "./Shared/HighlightedCode";
 import type { ReviewNoteData } from "@/common/types/review";
+import { DIFF_ADDED_TEXT_COLOR, DIFF_REMOVED_TEXT_COLOR } from "@/constants/diffColors";
+import { OpenAsArtifactButton } from "@/browser/features/RightSidebar/ArtifactsTab/OpenAsArtifactButton";
 
 type FileEditOperationArgs =
   | FileEditReplaceStringToolArgs
@@ -46,6 +48,13 @@ type FileEditToolResult =
 const LARGE_DIFF_PREVIEW_LINE_THRESHOLD = 600;
 const LARGE_DIFF_PREVIEW_CHAR_THRESHOLD = 80_000;
 const LARGE_DIFF_PREVIEW_LINE_LIMIT = 240;
+
+// Header "+N" / "-N" colors. The raw success/danger tokens are below WCAG AA on the chat
+// background in the light themes and flexoki-dark (#6010), so the counts share the diff gutter's
+// AA-tuned colors. Module-level style objects, so each render reuses them instead of allocating
+// new inline objects.
+const ADDITIONS_STYLE = { color: DIFF_ADDED_TEXT_COLOR } as const;
+const DELETIONS_STYLE = { color: DIFF_REMOVED_TEXT_COLOR } as const;
 
 interface LargeDiffPreview {
   previewDiff: string;
@@ -142,6 +151,7 @@ interface FileEditToolCallProps {
   result?: FileEditToolResult;
   status?: ToolStatus;
   onReviewNote?: (data: ReviewNoteData) => void;
+  workspaceId?: string;
 }
 
 function renderDiff(
@@ -205,6 +215,7 @@ export const FileEditToolCall: React.FC<FileEditToolCallProps> = ({
   result,
   status = "pending",
   onReviewNote,
+  workspaceId,
 }) => {
   // Collapse failed edits by default since they're common and expected. This is just
   // the fallback: the per-workspace sticky tools preference (set once the user
@@ -265,6 +276,13 @@ export const FileEditToolCall: React.FC<FileEditToolCallProps> = ({
           <div className="text-text flex max-w-96 min-w-0 items-center gap-1.5">
             <FileIcon filePath={filePath} className="text-[15px] leading-none" />
             <span className="font-monospace truncate">{filePath}</span>
+            {filePath && (
+              <OpenAsArtifactButton
+                workspaceId={workspaceId}
+                path={filePath}
+                relativeTo="tool-cwd"
+              />
+            )}
           </div>
           {diffLineDelta && (
             <span
@@ -272,9 +290,9 @@ export const FileEditToolCall: React.FC<FileEditToolCallProps> = ({
               title={diffLineDelta.title}
               aria-label={diffLineDelta.title}
             >
-              <span className="text-success">{diffLineDelta.additionsLabel}</span>
+              <span style={ADDITIONS_STYLE}>{diffLineDelta.additionsLabel}</span>
               <span className="text-muted">, </span>
-              <span className="text-danger">{diffLineDelta.deletionsLabel}</span>
+              <span style={DELETIONS_STYLE}>{diffLineDelta.deletionsLabel}</span>
             </span>
           )}
         </div>

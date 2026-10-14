@@ -2,14 +2,15 @@ import { tool } from "ai";
 import assert from "@/common/utils/assert";
 import type { MemoryToolResult } from "@/common/types/tools";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
-import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
+import { TOOL_DEFINITIONS, buildMemoryToolDescription } from "@/common/utils/tools/toolDefinitions";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
-  MEMORY_MAX_FILE_BYTES,
+  MEMORY_SCOPES,
+  MEMORY_VIRTUAL_ROOT,
+  SHARED_MEMORY_SCOPES,
   type MemoryScope,
   type MemoryScopeAccess,
 } from "@/common/constants/memory";
-import { CONTEXT_NOTES_RESERVED_BYTES } from "@/common/constants/contextBudget";
 import type { z } from "zod";
 import {
   formatMemoryIndexForToolDescription,
@@ -18,11 +19,15 @@ import {
   type MemoryService,
 } from "@/node/services/memoryService";
 
-/** Safe default: without an explicit policy, every scope is read-only. */
+/**
+ * Safe default: without an explicit policy, every shared scope is read-only. The session scope is
+ * the agent's own checkpoint, which no other agent reads, so read-only agents may write it too.
+ */
 const READ_ONLY_ACCESS: MemoryScopeAccess = {
   global: "read",
   project: "read",
   workspace: "read",
+  session: "readwrite",
 };
 
 /** Full write access to every scope, shared by plan-like and exec-like agents. */
@@ -30,6 +35,7 @@ const READ_WRITE_ACCESS: MemoryScopeAccess = {
   global: "readwrite",
   project: "readwrite",
   workspace: "readwrite",
+  session: "readwrite",
 };
 
 /**
@@ -38,7 +44,7 @@ const READ_WRITE_ACCESS: MemoryScopeAccess = {
  * - Plan-like and editing-capable (exec-like) agents get read-write everywhere;
  *   project memory is host-local (opt-in settings backup aside) and never
  *   mutates the repo checkout, so even plan agents may write it.
- * - Everything else (explore/read-only agents) is view-only.
+ * - Everything else (explore/read-only agents) is view-only, except its own session scope.
  */
 export function resolveMemoryAccessPolicy(options: {
   planLike: boolean;
@@ -51,29 +57,34 @@ export function resolveMemoryAccessPolicy(options: {
 }
 
 /**
+ * The session scope only holds the rollover checkpoint, which has no purpose outside
+ * token-budget mode, so other agents never see it.
+ */
+export function resolveMemoryScopes(tokenBudgetEnabled: boolean): readonly MemoryScope[] {
+  return tokenBudgetEnabled ? MEMORY_SCOPES : SHARED_MEMORY_SCOPES;
+}
+
+/** Safe default, like READ_ONLY_ACCESS: without an explicit list, the session scope stays hidden. */
+function toolMemoryScopes(config: ToolConfiguration): readonly MemoryScope[] {
+  return config.memoryScopes ?? resolveMemoryScopes(false);
+}
+
+/**
  * Build the dynamic memory tool description: the base description plus the
  * session-segment memory index (same disclosure mechanic as skills — index
  * advertised next to the tool schema, contents fetched on demand). Falls back
  * to the base description when no snapshot was resolved.
  */
 function buildMemoryDescription(config: ToolConfiguration): string {
-  // Pinned mode (context-budget final flush) inverts the generic contract: one path, one write,
-  // `create` replaces, updates create a missing file, no delete/rename. The model must not be
-  // told the opposite during its only preservation step.
-  const baseDescription =
-    config.memoryWritePath != null
-      ? `Persistent memory, pinned for this preservation step to ${config.memoryWritePath}: only that file may be written, and this request allows exactly one call. ` +
-        "There is no second step, so do not read first (view is unavailable here; a possibly truncated excerpt of the file, if any, is preloaded above). Commands:\n" +
-        "- create: write the complete file (REPLACES existing contents)\n" +
-        "- str_replace: replace a unique occurrence of old_str with new_str (creates the file with new_str if it is missing)\n" +
-        "- insert: insert insert_text after line insert_line (0 = top; creates the file if it is missing)\n" +
-        "view, delete, rename, and every other path are refused. " +
-        `The resulting file has a storage ceiling of ${MEMORY_MAX_FILE_BYTES} bytes, not an output target. Keep this call brief and within the step's output budget. Use a prepend or text replacement only when the full file is visible and sufficient space is known. Otherwise use create for a compact checkpoint of the essential known state; it replaces the entire file, including unshown content. Keep essential state first: only a bounded excerpt (up to ${CONTEXT_NOTES_RESERVED_BYTES} bytes) is preloaded, and the full saved file can be read in the next window.`
-      : TOOL_DEFINITIONS.memory.description;
+  const scopes = toolMemoryScopes(config);
+  const baseDescription = buildMemoryToolDescription({ sessionScope: scopes.includes("session") });
   if (config.memoryIndexEntries == null) {
     return baseDescription;
   }
-  return `${baseDescription}\n\n${formatMemoryIndexForToolDescription(config.memoryIndexEntries)}`;
+  const entries = config.memoryIndexEntries.filter((entry) =>
+    scopes.some((scope) => entry.path.startsWith(`${MEMORY_VIRTUAL_ROOT}/${scope}/`))
+  );
+  return `${baseDescription}\n\n${formatMemoryIndexForToolDescription(entries)}`;
 }
 
 /** Share exactly the same scope identity between direct and headless memory reads. */
@@ -89,6 +100,7 @@ export function memoryScopeContextFromToolConfig(config: ToolConfiguration): Mem
     // so "" disables project-keyed memory (same resolution as
     // resolveMemoryProjectIdentity; config.projects mirrors metadata.projects).
     projectPath: (config.projects?.length ?? 0) > 1 ? "" : (config.workspaceProjectPath ?? ""),
+    scopes: toolMemoryScopes(config),
   };
 }
 
@@ -103,40 +115,11 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
   const access = config.memoryAccess ?? READ_ONLY_ACCESS;
 
   const ctx = memoryScopeContextFromToolConfig(config);
-  // Normalized once so trailing slashes or whitespace in a call cannot bypass the pin.
-  const writePath = config.memoryWritePath;
-  const writePin = writePath != null ? parseMemoryPath(writePath) : null;
-  assert(
-    writePin == null || (writePin.scope !== null && writePin.relPath !== ""),
-    "memoryWritePath must name a file inside a memory scope"
-  );
-
-  /**
-   * SECURITY: a hidden flush turn runs on a transcript that may carry injected tool output;
-   * pinning every command (reads included) to one file keeps it from reaching or disclosing
-   * other memory stores. Invalid paths fall through (null) to the canonical validation error.
-   */
-  function checkPinnedPath(virtualPath: string): MemoryToolResult | null {
-    if (writePath == null || !writePin) return null;
-    let parsed: ReturnType<typeof parseMemoryPath>;
-    try {
-      parsed = parseMemoryPath(virtualPath);
-    } catch {
-      return null;
-    }
-    return parsed.scope !== writePin.scope || parsed.relPath !== writePin.relPath
-      ? {
-          success: false,
-          error: `This turn may only access ${writePath}; other memory paths are unavailable.`,
-        }
-      : null;
-  }
 
   /**
    * Returns a recoverable error result when the (parsed) scope is read-only
-   * for this agent or the mutation leaves the pinned path; null when the
-   * mutation may proceed. Invalid paths fall through (null) so the service
-   * produces its canonical validation error.
+   * for this agent; null when the mutation may proceed. Invalid paths fall
+   * through (null) so the service produces its canonical validation error.
    */
   function checkWriteAccess(virtualPath: string): MemoryToolResult | null {
     let scope: MemoryScope | null;
@@ -151,74 +134,17 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
         error: `The ${scope} memory scope is read-only for this agent; only 'view' is allowed.`,
       };
     }
-    return checkPinnedPath(virtualPath);
+    return null;
   }
 
-  // Pinned mode is a preservation turn: exactly one create/update of the pinned file per
-  // tool instance (one provider request); deletes, renames, and sibling mutations are refused
-  // so injected content cannot erase the recovery notes or run several mutations.
-  let pinnedMutationUsed = false;
   return tool({
     description: buildMemoryDescription(config),
     inputSchema: TOOL_DEFINITIONS.memory.schema,
     execute: async (input, { toolCallId, abortSignal }): Promise<MemoryToolResult> => {
-      if (writePath != null && writePin) {
-        // The pinned turn gets one provider step: a read-only view would consume it without a
-        // write, so the only accepted calls are the ones that preserve the notes.
-        if (input.command === "view" || input.command === "delete" || input.command === "rename") {
-          return {
-            success: false,
-            error: `This turn may only create or update ${writePath}; '${input.command}' is unavailable.`,
-          };
-        }
-        // Only a mutation the executor would accept (required fields present, pinned path)
-        // claims the single slot, so a malformed or mis-targeted sibling cannot waste the
-        // preservation step. Mirrors executeMemoryCommand's own field validation exactly.
-        const wellFormed =
-          input.path != null &&
-          checkPinnedPath(input.path) == null &&
-          (input.command === "create"
-            ? input.file_text != null
-            : input.command === "str_replace"
-              ? input.old_str != null
-              : input.insert_line != null && input.insert_text != null);
-        if (wellFormed) {
-          if (pinnedMutationUsed) {
-            return {
-              success: false,
-              error: `This turn allows a single memory mutation of ${writePath}; it was already used.`,
-            };
-          }
-          pinnedMutationUsed = true;
-          // Resolve create-or-update and cap the actual result under the mutation lock. Use
-          // the ordinary storage cap, not the preload budget: rejecting a larger checkpoint
-          // would waste the last preservation step before rollover. A refused write changed
-          // nothing, so it frees the slot.
-          const result =
-            checkWriteAccess(input.path!) ??
-            (await memoryService.writePinnedFile(
-              ctx,
-              input.path!,
-              input.command === "create"
-                ? { command: "create", fileText: input.file_text! }
-                : input.command === "str_replace"
-                  ? { command: "str_replace", oldStr: input.old_str!, newStr: input.new_str ?? "" }
-                  : {
-                      command: "insert",
-                      insertLine: input.insert_line!,
-                      insertText: input.insert_text!,
-                    },
-              MEMORY_MAX_FILE_BYTES,
-              "agent",
-              toolCallId,
-              // Stop during the flush must not let the write land once the lock is acquired.
-              abortSignal
-            ));
-          if (!result.success) pinnedMutationUsed = false;
-          return result;
-        }
-      }
-      return executeMemoryCommand(memoryService, ctx, input, checkWriteAccess, toolCallId);
+      // A stopped stream must not commit a late write.
+      return executeMemoryCommand(memoryService, ctx, input, checkWriteAccess, toolCallId, {
+        abortSignal,
+      });
     },
   });
 };

@@ -85,6 +85,7 @@ export async function resolveContainerCli(
   }
 }
 
+/** Test reset hook for the module-level container CLI detection cache. */
 export function resetContainerCliCacheForTests(): void {
   cachedContainerCli = undefined;
   detectionInFlight = undefined;

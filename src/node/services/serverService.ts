@@ -10,6 +10,7 @@ import * as childProcess from "node:child_process";
 import { VERSION } from "@/version";
 import { buildMuxMdnsServiceOptions, MdnsAdvertiserService } from "./mdnsAdvertiserService";
 import type { AppRouter } from "@/node/orpc/router";
+import { isSessionTapeReplayMode } from "@/node/services/sessionTapes/sessionTapeReplaySource";
 
 export interface ServerInfo {
   /** Base URL that is always connectable from the local machine (loopback for wildcard binds). */
@@ -363,6 +364,12 @@ export class ServerService {
     if (this.server) {
       throw new Error("Server already running in this process");
     }
+    // Session tape replay mode (perf harness) serves tapes only to desktop windows, whose
+    // network egress desktop main blocks. A browser or CLI client of this server would render
+    // recorded content (remote images) outside that block, so replay mode runs no API server.
+    if (isSessionTapeReplayMode()) {
+      throw new Error("The API server is disabled in session tape replay mode (XUM_REPLAY_TAPES)");
+    }
 
     // Create lockfile instance for checking - don't store yet
     const lockfile = new ServerLockfile(options.xumHome);
@@ -549,8 +556,9 @@ export async function setServerSshHost(
   context: ServerSettingsContext,
   sshHost: string | null | undefined
 ): Promise<void> {
-  context.serverService.setSshHost(sshHost ?? undefined);
+  // Write first (#4444): a rejected write must not leave the in-memory host ahead of disk.
   await context.config.editConfig((config) => ({ ...config, serverSshHost: sshHost ?? undefined }));
+  context.serverService.setSshHost(sshHost ?? undefined);
 }
 
 export function getApiServerStatus(context: ServerSettingsContext) {
@@ -570,14 +578,37 @@ export async function setApiServerSettings(
   const serveWebUi =
     input.serveWebUi === undefined ? prevServeWebUi : input.serveWebUi === true ? true : undefined;
   const port = input.port === null || input.port === 0 ? undefined : input.port;
+  // Best effort: a failed restore must not replace the error the caller needs to see (#4748).
+  const restorePreviousSettings = async (): Promise<void> => {
+    try {
+      await context.config.editConfig((config) => {
+        config.apiServerServeWebUi = prevServeWebUi;
+        config.apiServerBindHost = prevBindHost;
+        config.apiServerPort = prevPort;
+        return config;
+      });
+    } catch (restoreError) {
+      log.warn("Failed to restore previous API server settings", { error: restoreError });
+    }
+  };
 
-  if (wasRunning) await context.serverService.stopServer();
+  // Write before stopping (#4748): a rejected write then leaves the running server untouched,
+  // instead of stopped while disk keeps the old settings. If the stop itself fails, put the
+  // previous settings back so disk matches the server that is still running.
   await context.config.editConfig((config) => {
     config.apiServerServeWebUi = serveWebUi;
     config.apiServerBindHost = bindHost;
     config.apiServerPort = port;
     return config;
   });
+  if (wasRunning) {
+    try {
+      await context.serverService.stopServer();
+    } catch (error) {
+      await restorePreviousSettings();
+      throw error;
+    }
+  }
 
   if (resolveXumEnvironmentValue("NO_API_SERVER", process.env) !== "1") {
     const authToken = context.serverService.getApiAuthToken();
@@ -594,12 +625,7 @@ export async function setApiServerSettings(
         port: envPort ?? port ?? 0,
       });
     } catch (error) {
-      await context.config.editConfig((config) => {
-        config.apiServerServeWebUi = prevServeWebUi;
-        config.apiServerBindHost = prevBindHost;
-        config.apiServerPort = prevPort;
-        return config;
-      });
+      await restorePreviousSettings();
       if (wasRunning) {
         try {
           await context.serverService.startServer({

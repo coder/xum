@@ -10,6 +10,7 @@ import { createContextBudgetRejectedMessage } from "@/common/utils/messages/cont
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { markLockOwnerDead } from "@/node/utils/concurrency/fileLockTestHelpers";
 import { CONTINUOUS_COMPACTION_GENERATION_FILE } from "@/constants/continuousCompaction";
 import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget";
 import type { ContinuousCompactionJournal } from "@/common/orpc/schemas/continuousCompaction";
@@ -1757,9 +1758,7 @@ describe("compaction replacement acceptance", () => {
               args[0] === (artifact === "file" ? chatPath : path.dirname(chatPath))
             ) {
               const lockPath = historyWriteLockPath(fixture.config.rootDir, workspaceId);
-              const token = await fs.readFile(lockPath, "utf8");
-              await fs.writeFile(lockPath, token.split(":").slice(0, 2).join(":"));
-              await fs.utimes(lockPath, new Date(0), new Date(0));
+              await markLockOwnerDead(lockPath);
               successor = await acquireProcessFileLock({
                 lockPath,
                 timeoutMs: 1000,
@@ -3077,6 +3076,17 @@ describe("compaction replacement acceptance", () => {
       releaseForeign.resolve();
       await foreignLock;
     }
+
+    // The scoped witness must still detect a real read under this workspace's lock.
+    await workspaceFileLocks.withLock(workspaceId, async () => {
+      const handle = await fs.open(archivePath, "r");
+      try {
+        await handle.read(Buffer.alloc(1), 0, 1, 0);
+      } finally {
+        await handle.close();
+      }
+    });
+    expect(archiveBytesReadUnderLock).toBe(1);
   });
 
   it.each(["Stop", "append"] as const)(

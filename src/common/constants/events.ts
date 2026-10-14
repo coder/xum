@@ -29,6 +29,26 @@ export const CUSTOM_EVENTS = {
   CLEAR_CHAT_COMPOSER: "mux:clearChatComposer",
 
   /**
+   * Event asking a held-input banner to run its Send or Discard action (keyboard shortcut from
+   * the composer), so the shortcut shares the banner's in-flight guard and error display.
+   * Detail: { workspaceId: string; heldInputId: string; action: "send" | "discard" }
+   */
+  HELD_INPUT_ACTION: "mux:heldInputAction",
+
+  /**
+   * Event asking the workspace's latest plan card to run its primary action (Implement, or
+   * Continue in Auto) from the command palette. The card sets `handled` when it started it.
+   * Detail: { workspaceId: string; handled: boolean }
+   */
+  RUN_LATEST_PLAN_ACTION: "mux:runLatestPlanAction",
+
+  /**
+   * Asks the workspace's background processes strip to take focus (command palette); it sets
+   * `handled` when it did. Detail: { workspaceId: string; handled: boolean }
+   */
+  FOCUS_BACKGROUND_PROCESSES: "mux:focusBackgroundProcesses",
+
+  /**
    * Event to open the model selector
    * No detail
    */
@@ -123,7 +143,45 @@ export const CUSTOM_EVENTS = {
    */
   OPEN_GOAL_TAB: "mux:openGoalTab",
 
+  /**
+   * Open (and focus) a New tab in the focused right-sidebar pane, the same path as "+" and the
+   * keyboard shortcut. Detail: { workspaceId: string }
+   */
+  OPEN_NEW_SIDEBAR_TAB: "mux:openNewSidebarTab",
+
+  /**
+   * Expand the collapsed right sidebar on its focused tab, the same path as the overview card's
+   * Expand button. Sent by the header's stand-in for the card where the card would cover the
+   * transcript. Detail: { workspaceId: string }
+   */
+  EXPAND_RIGHT_SIDEBAR: "mux:expandRightSidebar",
+
+  /**
+   * Open a /side chat as a right-sidebar tab of its parent workspace. Dispatched cancelable: the
+   * sidebar calls preventDefault() once it shows the tab, and the sender falls back to opening
+   * the side chat full-screen when nothing did (sidebar hidden on narrow viewports).
+   */
+  OPEN_SIDE_CHAT_TAB: "mux:openSideChatTab",
+
+  /**
+   * Open an MCP Apps view in its app tab (artifacts experiment): uncollapse the right sidebar
+   * and open or focus the view's tab, or open the view's sheet on small viewports.
+   */
+  OPEN_MCP_APP_VIEW: "mux:openMcpAppView",
+
+  /**
+   * Open the Artifacts tab on one artifact (Artifacts M4). Senders persist the selection first.
+   * Detail: { workspaceId: string, path: string, versionId?: number }
+   */
+  OPEN_ARTIFACT: "mux:openArtifact",
+
   REVEAL_TIMELINE_ANCHOR: "mux:revealTimelineAnchor",
+
+  /**
+   * The palette asked for the Stats tool. Only while the right sidebar is hidden, WorkspaceMenuBar
+   * shows the Stats tab in the full-screen sidebar (#5767). Detail: { workspaceId: string }
+   */
+  OPEN_STATS_DIALOG: "mux:openStatsDialog",
 
   /**
    * Event emitted when LLM debug logs are toggled in Settings.
@@ -143,14 +201,39 @@ export interface CustomEventPayloads {
   };
   [CUSTOM_EVENTS.UPDATE_CHAT_INPUT]: {
     text: string;
-    mode?: "replace" | "append";
+    /** "restore": put a returned queued message in front of the current draft (never replaces it). */
+    mode?: "replace" | "append" | "restore";
     fileParts?: FilePart[];
     reviews?: ReviewNoteDataForDisplay[];
     /** When set, only the matching workspace composer may apply this update. */
     workspaceId?: string;
+    /** "restore" only: backend held inputs to acknowledge once the composer applied it (#4448). */
+    heldInputIds?: string[];
+    /** "restore" only: the input per restored send, with its send ids (idempotent sends). */
+    inputs?: Array<{
+      text: string;
+      fileParts?: FilePart[];
+      reviews?: ReviewNoteDataForDisplay[];
+      sendIds: string[];
+    }>;
   };
   [CUSTOM_EVENTS.CLEAR_CHAT_COMPOSER]: {
     workspaceId: string;
+  };
+  [CUSTOM_EVENTS.HELD_INPUT_ACTION]: {
+    workspaceId: string;
+    heldInputId: string;
+    action: "send" | "discard";
+  };
+  [CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION]: {
+    workspaceId: string;
+    /** Set synchronously by the plan card that started the action. */
+    handled: boolean;
+  };
+  [CUSTOM_EVENTS.FOCUS_BACKGROUND_PROCESSES]: {
+    workspaceId: string;
+    /** Set synchronously by the strip when it took focus. */
+    handled: boolean;
   };
   [CUSTOM_EVENTS.OPEN_AGENT_PICKER]: never; // No payload
   [CUSTOM_EVENTS.CLOSE_AGENT_PICKER]: never; // No payload
@@ -183,6 +266,10 @@ export interface CustomEventPayloads {
     type: "success" | "error";
     message: string;
     title?: string;
+    /** Adds a copy button; the toast then stays until dismissed. */
+    copyText?: string;
+    /** Auto-dismiss delay in ms; omitted uses the toast's default. */
+    duration?: number;
   };
   [CUSTOM_EVENTS.OPEN_TOUCH_REVIEW_IMMERSIVE]: {
     workspaceId: string;
@@ -194,6 +281,35 @@ export interface CustomEventPayloads {
   [CUSTOM_EVENTS.OPEN_GOAL_TAB]: {
     workspaceId: string;
     openCompleteInput?: boolean;
+  };
+  [CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB]: {
+    workspaceId: string;
+  };
+  [CUSTOM_EVENTS.EXPAND_RIGHT_SIDEBAR]: {
+    workspaceId: string;
+  };
+  [CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB]: {
+    /** The main chat whose right sidebar shows the tab. */
+    workspaceId: string;
+    sideChatWorkspaceId: string;
+    /** A New tab launcher to replace, rather than adding to the focused pane. */
+    tabsetId?: string;
+  };
+  [CUSTOM_EVENTS.OPEN_MCP_APP_VIEW]: {
+    workspaceId: string;
+    toolCallId: string;
+  };
+  [CUSTOM_EVENTS.OPEN_STATS_DIALOG]: {
+    workspaceId: string;
+  };
+  [CUSTOM_EVENTS.OPEN_ARTIFACT]: {
+    workspaceId: string;
+    /** Artifacts-relative path, or a checkout-relative path when `pinned`. */
+    path: string;
+    /** Version number to show; absent means "Latest (live)". */
+    versionId?: number;
+    /** True for pinned workspace files (Concept C). */
+    pinned?: boolean;
   };
   [CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR]: {
     workspaceId: string;

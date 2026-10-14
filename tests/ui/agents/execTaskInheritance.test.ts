@@ -11,6 +11,7 @@ import { Err, Ok } from "@/common/types/result";
 import { ProviderModelFactory } from "@/node/services/providerModelFactory";
 import { shouldRunIntegrationTests } from "../../testUtils";
 import { setupProviders } from "../../ipc/setup";
+import { trackApiCalls, type ApiCallTracker } from "../apiCallTracker";
 import { createAppHarness } from "../harness";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
@@ -18,7 +19,14 @@ const MODEL_A = KNOWN_MODELS.OPUS.id;
 const MODEL_B = KNOWN_MODELS.SONNET.id;
 const FALLBACK_MODEL = KNOWN_MODELS.HAIKU.id;
 
-async function selectAgent(container: HTMLElement, agentId: string): Promise<void> {
+async function selectAgent(
+  container: HTMLElement,
+  agentId: string,
+  agentList: ApiCallTracker
+): Promise<void> {
+  // The picker shows "Loading agents…" until the app's agents.list answers, and that call waits
+  // for workspace init. Await it rather than race it with waitFor's 1 s default (#6143).
+  await agentList.settled();
   const user = userEvent.setup({ document: container.ownerDocument });
   await user.click(within(container).getByRole("button", { name: "Select agent" }));
   const option = await waitFor(() => {
@@ -44,7 +52,7 @@ async function selectModel(container: HTMLElement, model: string): Promise<void>
 
 async function sendMessage(container: HTMLElement, text: string): Promise<void> {
   const user = userEvent.setup({ document: container.ownerDocument });
-  const textarea = await within(container).findByRole("textbox", { name: "Message Claude" });
+  const textarea = await within(container).findByRole("textbox", { name: "Message" });
   await user.type(textarea, text);
   await user.click(within(container).getByRole("button", { name: "Send message" }));
 }
@@ -66,8 +74,10 @@ describeIntegration("Calling-chat Exec inheritance", () => {
     const delegated = new Set<string>();
     // MockAiRouter emits canned tool results without executing them. Mock only the
     // provider instead so picker -> send -> task -> child runs the real backend.
+    const agentList = trackApiCalls("agents", "list");
     const app = await createAppHarness({
       branchPrefix: "exec-inheritance",
+      wrapApiClient: agentList.wrap,
       aiMode: "none",
       beforeRenderEnvironment: async (env) => {
         await setupProviders(env, { anthropic: { apiKey: "provider-free-test-key" } });
@@ -141,7 +151,7 @@ describeIntegration("Calling-chat Exec inheritance", () => {
     });
 
     try {
-      await selectAgent(app.view.container, "exec");
+      await selectAgent(app.view.container, "exec", agentList);
       await selectModel(app.view.container, MODEL_A);
       // Do not pre-seed workspace AI settings or wait for their persistence: the
       // very first send must save the selected Exec model before task execution.
@@ -182,4 +192,152 @@ describeIntegration("Calling-chat Exec inheritance", () => {
       jest.restoreAllMocks();
     }
   }, 120_000);
+
+  test("reawakened children follow the current Delegated default unless pinned", async () => {
+    const requestLog: { workspaceId: string; model: string }[] = [];
+    const handled = new Set<string>();
+    const agentList = trackApiCalls("agents", "list");
+    const app = await createAppHarness({
+      branchPrefix: "exec-reawaken",
+      wrapApiClient: agentList.wrap,
+      aiMode: "none",
+      beforeRenderEnvironment: async (env) => {
+        await setupProviders(env, { anthropic: { apiKey: "provider-free-test-key" } });
+        await env.orpc.config.updateAgentAiDefaults({
+          agentAiDefaults: { exec: { modelString: FALLBACK_MODEL } },
+        });
+        jest
+          .spyOn(ProviderModelFactory.prototype, "createModel")
+          .mockResolvedValue(
+            Err({ type: "unknown", raw: "Side-channel generation disabled in provider-free test" })
+          );
+        jest
+          .spyOn(ProviderModelFactory.prototype, "resolveAndCreateModel")
+          .mockImplementation((modelString, _thinkingLevel, _providerOptions, options) =>
+            Promise.resolve(
+              Ok({
+                effectiveModelString: modelString,
+                canonicalModelString: modelString,
+                canonicalProviderName: "anthropic",
+                canonicalModelId: modelString.split(":")[1],
+                wireProviderName: "anthropic",
+                routedThroughGateway: false,
+                model: new MockLanguageModelV3({
+                  provider: "anthropic",
+                  modelId: modelString.split(":")[1],
+                  doStream: (request) => {
+                    const workspaceId = options?.workspaceId;
+                    if (!workspaceId)
+                      throw new Error("Expected a workspace-scoped provider request");
+                    requestLog.push({ workspaceId, model: modelString });
+                    const lastUser = request.prompt.findLast((message) => message.role === "user");
+                    const text =
+                      lastUser?.content
+                        .filter((part) => part.type === "text")
+                        .map((part) => part.text)
+                        .join("") ?? "";
+                    const chunks: LanguageModelV3StreamPart[] = [];
+                    if (text.startsWith("Delegate ") && !handled.has(text)) {
+                      handled.add(text);
+                      chunks.push(
+                        {
+                          type: "tool-call",
+                          toolCallId: `delegate-${handled.size}`,
+                          toolName: "task",
+                          input: JSON.stringify({
+                            agentId: "exec",
+                            title: `Reviewer ${handled.size}`,
+                            prompt: "Return a brief report without changing files.",
+                            run_in_background: false,
+                            ...(text.includes("pinned") ? { model: MODEL_A } : {}),
+                          }),
+                        },
+                        finish("tool-calls")
+                      );
+                    } else if (text.startsWith("Follow up ") && !handled.has(text)) {
+                      handled.add(text);
+                      // One parent step reawakens every listed child: a second manual parent
+                      // send would race the first child's report wake-up turn.
+                      const taskIds = text.slice("Follow up ".length).trim().split(/\s+/);
+                      chunks.push(
+                        ...taskIds.map(
+                          (taskId, index): LanguageModelV3StreamPart => ({
+                            type: "tool-call",
+                            toolCallId: `follow-up-${handled.size}-${index}`,
+                            toolName: "task_send_message",
+                            input: JSON.stringify({
+                              task_id: taskId,
+                              message: "Take one more pass.",
+                            }),
+                          })
+                        ),
+                        finish("tool-calls")
+                      );
+                    } else {
+                      chunks.push(
+                        { type: "text-start", id: "answer" },
+                        { type: "text-delta", id: "answer", delta: "Finished reviewing." },
+                        { type: "text-end", id: "answer" },
+                        finish("stop")
+                      );
+                    }
+                    return Promise.resolve({ stream: simulateReadableStream({ chunks }) });
+                  },
+                }),
+              })
+            )
+          );
+      },
+    });
+
+    const childIds = async () =>
+      (await app.env.orpc.workspace.list())
+        .filter((workspace) => workspace.parentWorkspaceId === app.workspaceId)
+        .map((workspace) => workspace.id);
+    const modelsFor = (workspaceId: string) =>
+      requestLog.filter((entry) => entry.workspaceId === workspaceId).map((entry) => entry.model);
+
+    try {
+      await selectAgent(app.view.container, "exec", agentList);
+      await sendMessage(app.view.container, "Delegate the first review.");
+      await app.chat.expectTranscriptContains("Finished reviewing.");
+      await app.chat.expectStreamComplete();
+      const [unpinnedId] = await childIds();
+
+      await sendMessage(app.view.container, "Delegate the pinned review.");
+      await waitFor(async () => expect(await childIds()).toHaveLength(2), { timeout: 30_000 });
+      await app.chat.expectStreamComplete();
+      const pinnedId = (await childIds()).find((id) => id !== unpinnedId);
+      if (!pinnedId) throw new Error("Pinned child was not created");
+      await waitFor(() => expect(modelsFor(pinnedId).length).toBeGreaterThan(0), {
+        timeout: 30_000,
+      });
+      expect(modelsFor(unpinnedId)[0]).not.toBe(MODEL_B);
+      expect(modelsFor(pinnedId)[0]).toBe(MODEL_A);
+
+      await app.env.orpc.config.updateAgentAiDefaults({
+        agentAiDefaults: {
+          exec: { modelString: FALLBACK_MODEL, subagent: { modelString: MODEL_B } },
+        },
+      });
+
+      const before = [modelsFor(unpinnedId).length, modelsFor(pinnedId).length];
+      await sendMessage(app.view.container, `Follow up ${unpinnedId} ${pinnedId}`);
+      await waitFor(
+        () => {
+          expect(modelsFor(unpinnedId).length).toBeGreaterThan(before[0]);
+          expect(modelsFor(pinnedId).length).toBeGreaterThan(before[1]);
+        },
+        { timeout: 30_000 }
+      );
+
+      expect(modelsFor(unpinnedId).at(-1)).toBe(MODEL_B);
+      expect(modelsFor(pinnedId).at(-1)).toBe(MODEL_A);
+      const unpinned = await app.env.orpc.workspace.getInfo({ workspaceId: unpinnedId });
+      expect(unpinned?.aiSettingsByAgent?.exec?.model).toBe(MODEL_B);
+    } finally {
+      await app.dispose();
+      jest.restoreAllMocks();
+    }
+  }, 180_000);
 });

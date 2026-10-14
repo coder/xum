@@ -30,6 +30,7 @@ import {
   type BaseSshAcquireConnectionOptions,
   withSshBackoffJitter,
 } from "./sshBackoff";
+import { isPermanentSSHFailure } from "./Runtime";
 
 export type OpenSSHHostKeyPolicyMode = "strict" | "headless-fallback";
 
@@ -103,6 +104,7 @@ export interface ConnectionHealth {
 const HEALTHY_TTL_MS = 15 * 1000; // 15 seconds
 
 const SSH_OPERATION_ABORTED_ERROR = "Operation aborted";
+const SSH_PROBE_TIMED_OUT_ERROR = "SSH probe timed out";
 const DEFAULT_PROBE_TIMEOUT_MS = 10_000;
 export interface AcquireConnectionOptions extends BaseSshAcquireConnectionOptions {
   /**
@@ -110,18 +112,12 @@ export interface AcquireConnectionOptions extends BaseSshAcquireConnectionOption
    * the default host-scoped ControlPath is used.
    */
   controlPath?: string;
-
-  /**
-   * Test seam.
-   *
-   * If provided, this is used for sleeping between wait cycles.
-   */
-  sleep?: (ms: number, abortSignal?: AbortSignal) => Promise<void>;
 }
 
+/** Waits for `promise`, ending early on the caller's abort or (when set) after `timeoutMs`. */
 async function waitForPromiseWithTimeout<T>(
   promise: Promise<T>,
-  timeoutMs: number,
+  timeoutMs: number | undefined,
   abortSignal?: AbortSignal,
   timeoutError?: Error
 ): Promise<T> {
@@ -150,9 +146,12 @@ async function waitForPromiseWithTimeout<T>(
       finish(() => reject(new Error("Operation aborted")));
     };
 
-    const timer = setTimeout(() => {
-      finish(() => reject(timeoutError ?? new Error("Operation timed out")));
-    }, timeoutMs);
+    const timer =
+      timeoutMs == null
+        ? undefined
+        : setTimeout(() => {
+            finish(() => reject(timeoutError ?? new Error("Operation timed out")));
+          }, timeoutMs);
 
     abortSignal?.addEventListener("abort", onAbort);
     promise.then(
@@ -203,7 +202,6 @@ export class SSHConnectionPool {
         : (timeoutMsOrOptions ?? {});
 
     const timeoutMs = options.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
-    const sleep = options.sleep ?? sleepWithAbort;
 
     const maxWaitMs = options.maxWaitMs ?? DEFAULT_SSH_MAX_WAIT_MS;
     const shouldWait = maxWaitMs > 0;
@@ -218,6 +216,10 @@ export class SSHConnectionPool {
         `SSH connection to ${config.host} did not become healthy within ${maxWaitMs}ms. ` +
           `Last error: ${lastError ?? "unknown"}`
       );
+
+    // Only errors from probes this call saw: the health record also holds failures reported by
+    // execs (e.g. a nested `ssh` refused), which say nothing about this host (#5453 review).
+    let lastProbeError: string | undefined;
 
     while (true) {
       if (options.abortSignal?.aborted) {
@@ -245,7 +247,7 @@ export class SSHConnectionPool {
 
         const waitMs = Math.min(remainingMs, budgetMs);
         options.onWait?.(waitMs);
-        await sleep(waitMs, options.abortSignal);
+        await sleepWithAbort(waitMs, options.abortSignal);
         continue;
       }
 
@@ -286,18 +288,21 @@ export class SSHConnectionPool {
               createWaitBudgetExceededError(health?.lastError)
             );
           } else {
-            await existing;
+            await waitForPromiseWithTimeout(existing, undefined, options.abortSignal);
           }
+          lastProbeError = undefined; // the shared probe succeeded: older failures are stale
           continue;
         } catch (error) {
           // Probe failed; if we're in wait mode we'll loop and sleep through the backoff.
           if (
             !shouldWait ||
+            isPermanentSSHFailure(error) ||
             (error instanceof Error &&
               error.message.includes(`did not become healthy within ${maxWaitMs}ms`))
           ) {
             throw error;
           }
+          lastProbeError = error instanceof Error ? error.message : String(error);
           continue;
         }
       }
@@ -309,40 +314,72 @@ export class SSHConnectionPool {
       if (probeTimeoutMs <= 0) {
         throw createWaitBudgetExceededError(health?.lastError);
       }
+      // #5453: a probe capped by the wait budget can get only a sliver of time (the backoff
+      // may end just before the budget does), so its timeout alone can hide the real cause.
+      // When it times out, the reported reason keeps the earlier probe's error next to it.
+      const probeCutOffByBudget = shouldWait && probeTimeoutMs < timeoutMs;
       log.debug(`SSH connection to ${config.host} needs probe, starting health check`);
-      const probe = this.probeConnection(
-        config,
-        probeTimeoutMs,
-        key,
-        requestedControlPath,
-        options.abortSignal
-      );
-      this.inflight.set(key, probe);
+      const probe = this.startSharedProbe(config, probeTimeoutMs, key, requestedControlPath);
 
       try {
-        await probe;
+        // Only this caller's wait ends at its abort; the shared probe keeps running for the
+        // other callers (#5112). Its timeout is already capped to this caller's budget.
+        await waitForPromiseWithTimeout(probe, undefined, options.abortSignal);
         return;
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        const wasAborted =
-          (options.abortSignal?.aborted ?? false) || errorMessage === SSH_OPERATION_ABORTED_ERROR;
+        if (!shouldWait || options.abortSignal?.aborted || isPermanentSSHFailure(error)) {
+          throw error;
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        if (
+          probeCutOffByBudget &&
+          lastProbeError != null &&
+          message === SSH_PROBE_TIMED_OUT_ERROR
+        ) {
+          throw createWaitBudgetExceededError(
+            `${message} (an earlier probe failed with: ${lastProbeError})`
+          );
+        }
+        lastProbeError = message;
+        continue;
+      }
+    }
+  }
 
+  /**
+   * Starts the probe that concurrent callers for `key` share. It takes no caller's abort
+   * signal: one caller aborting must not kill the probe every joiner waits on (#5112, the
+   * OpenSSH counterpart of #5101). It is bounded by its own timeout, and its bookkeeping
+   * (backoff, in-flight entry) runs when it settles, whether or not anyone still waits.
+   */
+  private startSharedProbe(
+    config: SSHConnectionConfig,
+    timeoutMs: number,
+    key: string,
+    controlPath: string
+  ): Promise<void> {
+    const probe = this.probeConnection(config, timeoutMs, key, controlPath)
+      .catch((error: unknown) => {
         // Ensure backoff is recorded even if probeConnection rejected before
         // reaching markFailedByKey (e.g., askpass setup failure). Without this,
         // the while-loop retries immediately with no backoff — a hot loop.
-        // Explicit user cancellation is not host failure and must not poison health/backoff.
         const h = this.health.get(key);
-        if (!wasAborted && (!h?.backoffUntil || h.backoffUntil <= new Date())) {
-          this.markFailedByKey(key, errorMessage);
+        if (!h?.backoffUntil || h.backoffUntil <= new Date()) {
+          this.markFailedByKey(key, error instanceof Error ? error.message : String(error));
         }
-        if (!shouldWait || wasAborted) {
-          throw error;
+        throw error;
+      })
+      .finally(() => {
+        // Identity check: clearAllHealthForTests may have dropped this entry and a newer
+        // probe may own the key now.
+        if (this.inflight.get(key) === probe) {
+          this.inflight.delete(key);
         }
-        continue;
-      } finally {
-        this.inflight.delete(key);
-      }
-    }
+      });
+    // A probe whose callers all aborted has no awaiter; its outcome is already recorded.
+    probe.catch(() => undefined);
+    this.inflight.set(key, probe);
+    return probe;
   }
 
   private isControlPathReady(key: string, controlPath: string): boolean {
@@ -394,6 +431,21 @@ export class SSHConnectionPool {
   }
 
   /**
+   * Make the next acquire probe the host before it runs anything.
+   * Call when an exec's outcome is ambiguous (OpenSSH exit 255: a connection failure or the
+   * remote command's own exit). It neither starts a backoff nor records an error: a failing
+   * probe does both. A backoff that a probe already set stays in place.
+   */
+  requireReprobe(config: SSHConnectionConfig): void {
+    const key = makeConnectionKey(config);
+    this.clearReadyControlPaths(key);
+    const current = this.health.get(key);
+    if (current?.status === "healthy") {
+      this.health.set(key, { ...current, status: "unknown" });
+    }
+  }
+
+  /**
    * Mark connection as healthy by key (internal use)
    */
   private markHealthyByKey(key: string): void {
@@ -431,7 +483,7 @@ export class SSHConnectionPool {
    * Clear all health state. Used in tests to reset between test cases
    * so backoff from one test doesn't affect subsequent tests.
    */
-  clearAllHealth(): void {
+  clearAllHealthForTests(): void {
     this.health.clear();
     this.readyControlPaths.clear();
     this.inflight.clear();
@@ -444,13 +496,8 @@ export class SSHConnectionPool {
     config: SSHConnectionConfig,
     timeoutMs: number,
     key: string,
-    controlPath = getControlPath(config),
-    abortSignal?: AbortSignal
+    controlPath = getControlPath(config)
   ): Promise<void> {
-    if (abortSignal?.aborted) {
-      throw new Error(SSH_OPERATION_ABORTED_ERROR);
-    }
-
     const promptService = sshPromptService;
     const canPromptInteractively = isInteractiveHostKeyApprovalAvailable();
 
@@ -517,12 +564,6 @@ export class SSHConnectionPool {
         : undefined;
 
     return new Promise((resolve, reject) => {
-      if (abortSignal?.aborted) {
-        askpass?.cleanup();
-        reject(new Error(SSH_OPERATION_ABORTED_ERROR));
-        return;
-      }
-
       const proc = spawn("ssh", args, {
         stdio: ["ignore", "pipe", "pipe"],
         ...(askpass ? { env: { ...process.env, ...askpass.env } } : {}),
@@ -533,22 +574,8 @@ export class SSHConnectionPool {
 
       const cleanup = () => {
         if (timer) clearTimeout(timer);
-        abortSignal?.removeEventListener("abort", onAbort);
         askpass?.cleanup();
       };
-
-      let aborted = false;
-
-      const onAbort = () => {
-        aborted = true;
-        proc.kill("SIGKILL");
-        cleanup();
-        reject(new Error(SSH_OPERATION_ABORTED_ERROR));
-      };
-      abortSignal?.addEventListener("abort", onAbort, { once: true });
-      if (abortSignal?.aborted) {
-        onAbort();
-      }
 
       const scheduleKill = (ms: number) => {
         if (timer) {
@@ -558,7 +585,7 @@ export class SSHConnectionPool {
           timedOut = true;
           proc.kill("SIGKILL");
           cleanup();
-          const error = "SSH probe timed out";
+          const error = SSH_PROBE_TIMED_OUT_ERROR;
           this.markFailedByKey(key, error);
           reject(new Error(error));
         }, ms);
@@ -574,7 +601,7 @@ export class SSHConnectionPool {
 
       proc.on("close", (code) => {
         cleanup();
-        if (timedOut || aborted) return; // Already handled by timeout/abort
+        if (timedOut) return; // Already handled by the timeout
 
         if (code === 0) {
           this.markHealthyByKey(key);

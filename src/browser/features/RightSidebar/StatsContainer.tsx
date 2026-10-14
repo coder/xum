@@ -16,6 +16,7 @@ import { CostsTab } from "./CostsTab";
 import { ContextTab } from "./ContextTab";
 import { ContextUsageSection } from "./ContextUsageSection";
 import { TimingPanel, ModelBreakdownPanel } from "./StatsTab";
+import { STATS_CONTAINER_SUB_TAB_KEY } from "@/common/constants/storage";
 
 type StatsSubTab = "cost" | "context" | "timing" | "models";
 
@@ -36,7 +37,11 @@ interface StatsContainerProps {
 }
 
 export function StatsContainer(props: StatsContainerProps) {
-  const [subTab, setSubTab] = usePersistedState<StatsSubTab>("statsContainer:subTab", "cost");
+  // listener: every mounted copy shows the same choice. The panels' view preferences listen for
+  // the same reason.
+  const [subTab, setSubTab] = usePersistedState<StatsSubTab>(STATS_CONTAINER_SUB_TAB_KEY, "cost", {
+    listener: true,
+  });
 
   const effectiveTab = OPTIONS.some((o) => o.value === subTab) ? subTab : "cost";
 
@@ -53,7 +58,8 @@ export function StatsContainer(props: StatsContainerProps) {
                 type="button"
                 className={`rounded-full px-2.5 py-0.5 text-xs font-medium transition-colors ${
                   isActive
-                    ? "bg-accent text-foreground"
+                    ? // text-foreground on the accent failed WCAG AA in every theme (#5980).
+                      "bg-accent text-accent-foreground"
                     : "text-muted hover:text-foreground hover:bg-accent/50"
                 }`}
                 onClick={() => setSubTab(option.value)}

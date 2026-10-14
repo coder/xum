@@ -1,7 +1,21 @@
-import { describe, expect, test, beforeEach, mock, spyOn } from "bun:test";
-import type { HistoryEditPrecondition, SendMessageOptions } from "@/common/orpc/types";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { afterEach, describe, expect, test, beforeEach, mock, spyOn } from "bun:test";
+import type {
+  HistoryEditPrecondition,
+  ProvidersConfigMap,
+  SendMessageOptions,
+} from "@/common/orpc/types";
+import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
+import { getProjectScopeId, MODEL_KEY_MAX_CHARS } from "@/common/constants/storage";
+import { getWorkspaceAiSelection } from "./workspaceAiSettingsSync";
 import {
+  markAiSelectionIntent,
+  resetAiSelectionIntentForTests,
+  setWorkspaceAgentPick,
+  setWorkspaceAiMetadata,
+} from "./aiSelectionIntent";
+import { setWorkspaceServiceTier } from "./fastModeServiceTier";
+import {
+  createNewWorkspace,
   executeCompaction,
   parseRuntimeString,
   prepareCompactionMessage,
@@ -15,19 +29,21 @@ import {
 import { parseCommand } from "./slashCommands/parser";
 import type { ReviewNoteData } from "@/common/types/review";
 import { useWorkspaceStoreRaw, workspaceStore } from "@/browser/stores/WorkspaceStore";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { createTestApiClient } from "@/browser/testUtils";
+import type { RuntimeConfig, RuntimeEnablementId } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import { HEARTBEAT_DEFAULT_INTERVAL_MS } from "@/constants/heartbeat";
 import {
   EDIT_HISTORY_CHANGED_MESSAGE,
   EDIT_NOT_HELD_MESSAGE,
   TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE,
 } from "@/constants/transcriptBarrier";
 
-// Simple mock for localStorage to satisfy resolveCompactionModel and experiment gating.
+// Simple mock for localStorage to satisfy resolveCompactionModel.
 // Note: command helpers read from window.localStorage, so we set both globalThis.localStorage
 // and window.localStorage for test isolation.
 beforeEach(() => {
-  // Ensure `window` exists for browser-environment functions like isExperimentEnabled.
+  // Ensure `window` exists for browser-environment functions.
   if (typeof globalThis.window === "undefined") {
     (globalThis as unknown as { window: typeof globalThis }).window = globalThis;
   }
@@ -168,13 +184,6 @@ function expectToast(
   if (expected.title) expect(action?.toast.title).toBe(expected.title);
 }
 
-function setHeartbeatExperiment(enabled: boolean): void {
-  localStorage.setItem(
-    getExperimentKey(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS),
-    JSON.stringify(enabled)
-  );
-}
-
 /**
  * The transcript mutation barrier reads the store's caught-up flag at dispatch time. Pin it for
  * the duration of `fn` instead of driving a full onChat replay through the singleton store.
@@ -212,19 +221,6 @@ describe("processSlashCommand workflow results", () => {
     const start = mock(() =>
       Promise.resolve({ runId: "wfr_123", status: "running", result: null })
     );
-    const disabled = await processSlashCommand(
-      { type: "workflow-run", scriptPath: "skill://deep-research/workflow.js", argsText: "{}" },
-      createEnv({
-        api: { workflows: { start } } as unknown as SlashCommandEnv["api"],
-        dynamicWorkflowsEnabled: false,
-      })
-    );
-    expect(disabled.kind).toBe("complete");
-    if (disabled.kind !== "complete") throw new Error("expected complete result");
-    expectDisposition(disabled, "restore");
-    expectToast(disabled.actions, { type: "error", message: "Dynamic workflows are disabled" });
-    expect(start).not.toHaveBeenCalled();
-
     const invalidArgs = await processSlashCommand(
       {
         type: "workflow-run",
@@ -233,7 +229,6 @@ describe("processSlashCommand workflow results", () => {
       },
       createEnv({
         api: { workflows: { start } } as unknown as SlashCommandEnv["api"],
-        dynamicWorkflowsEnabled: true,
       })
     );
     expect(invalidArgs.kind).toBe("complete");
@@ -273,7 +268,6 @@ describe("processSlashCommand workflow results", () => {
           workspace: { sendMessage },
         } as unknown as SlashCommandEnv["api"],
         rawInput: '/deep-research {"input":"mux"}',
-        dynamicWorkflowsEnabled: true,
       })
     );
     expect(initial.kind).toBe("phase");
@@ -323,7 +317,6 @@ describe("processSlashCommand workflow results", () => {
       { type: "workflow-run", scriptPath: "skill://flow/workflow.js", argsText: "{}" },
       createEnv({
         api: { workflows: { start } } as unknown as SlashCommandEnv["api"],
-        dynamicWorkflowsEnabled: true,
       })
     );
     const settled = await finishCommand(initial);
@@ -347,7 +340,6 @@ describe("processSlashCommand workflow results", () => {
           workflows: { start, getRun },
           workspace: { sendMessage: mock(() => Promise.resolve({ success: true })) },
         } as unknown as SlashCommandEnv["api"],
-        dynamicWorkflowsEnabled: true,
         isCurrent: () => false,
       })
     );
@@ -363,7 +355,6 @@ describe("processSlashCommand workflow results", () => {
         api: {
           workflows: { start: mock(() => Promise.reject(new Error("workflow failed"))) },
         } as unknown as SlashCommandEnv["api"],
-        dynamicWorkflowsEnabled: true,
       })
     );
     const settled = await finishCommand(initial);
@@ -388,7 +379,6 @@ describe("processSlashCommand workflow results", () => {
             workflows: { start, getRun },
             workspace: { sendMessage },
           } as unknown as SlashCommandEnv["api"],
-          dynamicWorkflowsEnabled: true,
         })
       )
     );
@@ -460,6 +450,248 @@ describe("processSlashCommand clear results", () => {
   });
 });
 
+describe("processSlashCommand speed toggles", () => {
+  beforeEach(() => resetAiSelectionIntentForTests());
+  afterEach(() => resetAiSelectionIntentForTests());
+  const store = getProvidersConfigStore();
+  let config: ProvidersConfigMap;
+
+  beforeEach(() => {
+    const provider = { apiKeySet: true, isEnabled: true, isConfigured: true, models: [] };
+    config = {
+      openai: { ...provider, serviceTier: "flex" },
+      anthropic: { ...provider },
+      xai: { ...provider },
+      openrouter: { ...provider },
+    };
+    // Pin routing/cache state without opening app-wide backend subscriptions in these unit tests.
+    spyOn(getAppConfigStore(), "getSnapshot").mockReturnValue({ routePriority: ["direct"] });
+    spyOn(store, "getConfig").mockImplementation(() => config);
+    spyOn(store, "refresh").mockResolvedValue(undefined);
+    spyOn(store, "updateOptimistically").mockImplementation((provider, patch) => {
+      config = { ...config, [provider]: { ...config[provider], ...patch } };
+    });
+  });
+
+  afterEach(() => mock.restore());
+
+  function setup(model = "openai:gpt-6-astra") {
+    const setProviderConfig = mock(() =>
+      Promise.resolve({ success: true as const, data: undefined })
+    );
+    const getConfig = mock(() => Promise.resolve(config));
+    const setActiveTurnServiceTier = mock<
+      NonNullable<SlashCommandEnv["api"]>["workspace"]["setActiveTurnServiceTier"]
+    >(() => Promise.resolve({ success: true as const, data: { accepted: true } }));
+    const api = createTestApiClient({
+      providers: { getConfig, setProviderConfig },
+      workspace: { setActiveTurnServiceTier },
+    });
+    const sendMessage = spyOn(api.workspace, "sendMessage");
+    const env = createEnv({ api, sendMessageOptions: { ...sendMessageOptions, model } });
+    const run = async (command: string, overrides: Partial<SlashCommandEnv> = {}) =>
+      finishCommand(await processSlashCommand(parseCommand(command), { ...env, ...overrides }));
+    return { run, setProviderConfig, getConfig, setActiveTurnServiceTier, sendMessage };
+  }
+
+  test.each(["workspace", "creation"] as const)(
+    "switches chat-local tiers without sending a message in %s",
+    async (variant) => {
+      const { run, setProviderConfig, setActiveTurnServiceTier, sendMessage } = setup();
+      const scopeId = variant === "workspace" ? "test-ws" : getProjectScopeId("/tmp/project");
+      for (const [command, tier] of [
+        ["/fast", "priority"],
+        ["/ultrafast", "ultrafast"],
+        ["/ultrafast", "default"],
+        ["/fast", "priority"],
+        ["/fast", "default"],
+      ] as const) {
+        const { batches, result } = await run(command, {
+          variant,
+          currentModel: "google:gemini-3-pro",
+        });
+        expectDisposition(result, "consume");
+        expect(batches[0]).toContainEqual({ type: "clear-input" });
+        expect(getWorkspaceAiSelection(scopeId).serviceTier).toBe(tier);
+        expect(config.openai.serviceTier).toBe("flex");
+        expect(setProviderConfig).not.toHaveBeenCalled();
+        expect(sendMessage).not.toHaveBeenCalled();
+        if (variant === "workspace") {
+          expect(setActiveTurnServiceTier).toHaveBeenLastCalledWith({
+            workspaceId: "test-ws",
+            serviceTier: tier,
+          });
+        } else {
+          expect(setActiveTurnServiceTier).not.toHaveBeenCalled();
+        }
+      }
+    }
+  );
+
+  test("shares picker selections without changing another chat or a premium global default", async () => {
+    const { run, setActiveTurnServiceTier, setProviderConfig } = setup();
+    config.openai.serviceTier = "priority";
+    const settings = { model: "openai:gpt-6-astra", thinkingLevel: "high" as const };
+    setWorkspaceAiMetadata("test-ws", {
+      aiSettingsByAgent: { exec: { ...settings, serviceTier: "default" } },
+    });
+    setWorkspaceAiMetadata("other-chat", {
+      aiSettingsByAgent: { exec: { ...settings, serviceTier: "ultrafast" } },
+    });
+    expectDisposition((await run("/fast")).result, "consume");
+    expect(getWorkspaceAiSelection("test-ws").serviceTier).toBe("priority");
+    // Same path as the picker; the slash handler must read it, not its old send-options snapshot.
+    setWorkspaceServiceTier(null, "test-ws", "ultrafast");
+    expectDisposition((await run("/ultrafast")).result, "consume");
+    expect(getWorkspaceAiSelection("test-ws").serviceTier).toBe("default");
+    expect(getWorkspaceAiSelection("other-chat").serviceTier).toBe("ultrafast");
+    expect(getWorkspaceAiSelection("test-ws", "plan").serviceTier).toBeUndefined();
+    expect(setActiveTurnServiceTier.mock.calls).toEqual([
+      [{ workspaceId: "test-ws", serviceTier: "priority" }],
+      [{ workspaceId: "test-ws", serviceTier: "default" }],
+    ]);
+    expect(setProviderConfig).not.toHaveBeenCalled();
+    expect(config.openai.serviceTier).toBe("priority");
+  });
+
+  test("uses the owning creation AI scope for sub-projects and sends no active-turn update", async () => {
+    const { run, setActiveTurnServiceTier, setProviderConfig } = setup();
+    const scopeId = getProjectScopeId("/tmp/project");
+    expectDisposition(
+      (
+        await run("/fast", {
+          variant: "creation",
+          workspaceId: undefined,
+          projectPath: "/tmp/project/sub-project",
+          aiScopeId: scopeId,
+          isCurrent: () => false, // The composer's existing callback is workspace-only.
+        })
+      ).result,
+      "consume"
+    );
+    expect(getWorkspaceAiSelection(scopeId).serviceTier).toBe("priority");
+    expect(
+      getWorkspaceAiSelection(getProjectScopeId("/tmp/project/sub-project")).serviceTier
+    ).toBeUndefined();
+    expect(setActiveTurnServiceTier).not.toHaveBeenCalled();
+    expect(setProviderConfig).not.toHaveBeenCalled();
+  });
+
+  test("respects a picker speed change while capabilities load", async () => {
+    const { run, getConfig, setActiveTurnServiceTier } = setup();
+    const pending = Promise.withResolvers<ProvidersConfigMap>();
+    getConfig.mockReturnValueOnce(pending.promise);
+    const command = run("/fast");
+    await Promise.resolve();
+    setWorkspaceServiceTier(null, "test-ws", "priority");
+    pending.resolve(config);
+    expectDisposition((await command).result, "consume");
+    expect(getWorkspaceAiSelection("test-ws").serviceTier).toBe("default");
+    expect(setActiveTurnServiceTier).toHaveBeenCalledWith({
+      workspaceId: "test-ws",
+      serviceTier: "default",
+    });
+  });
+
+  test.each(["agent", "model", "workspace"] as const)(
+    "does not apply to a changed %s after loading capabilities",
+    async (change) => {
+      const { run, getConfig, setActiveTurnServiceTier, setProviderConfig } = setup();
+      const pending = Promise.withResolvers<ProvidersConfigMap>();
+      getConfig.mockReturnValueOnce(pending.promise);
+      let current = true;
+      const command = run("/fast", { isCurrent: () => current });
+      await Promise.resolve();
+      if (change === "agent") setWorkspaceAgentPick("test-ws", "plan");
+      if (change === "model") markAiSelectionIntent("test-ws", "model", "google:gemini-3-pro");
+      if (change === "workspace") current = false;
+      pending.resolve(config);
+      expectDisposition((await command).result, "restore-if-empty");
+      expect(getWorkspaceAiSelection("test-ws").serviceTier).toBeUndefined();
+      expect(setActiveTurnServiceTier).not.toHaveBeenCalled();
+      expect(setProviderConfig).not.toHaveBeenCalled();
+    }
+  );
+
+  test.each([
+    ["anthropic:claude-opus-5-5", "anthropic", "speed", "fast"],
+    ["xai:grok-4.7", "xai", "serviceTier", "priority"],
+  ])("uses the native preference for %s", async (model, provider, key, value) => {
+    const { run, setProviderConfig } = setup(model);
+    expectDisposition((await run("/fast")).result, "consume");
+    expect(setProviderConfig).toHaveBeenCalledWith({ provider, keyPath: [key], value });
+    expectDisposition((await run("/fast")).result, "consume");
+    expect(setProviderConfig).toHaveBeenLastCalledWith({
+      provider,
+      keyPath: [key === "speed" ? key : "fastModePreviousServiceTier"],
+      value: "",
+    });
+  });
+
+  test.each([
+    ["/fast", "google:gemini-3-pro"],
+    ["/ultrafast", "openrouter:openai/gpt-6-astra"],
+    ["/ultrafast", "openai:gpt-6-luna"],
+    ["/ultrafast", "anthropic:claude-opus-5-5"],
+    ["/ultrafast", "xai:grok-4.7"],
+  ])("rejects %s for unsupported model/route %s without writing", async (command, model) => {
+    const { run, setProviderConfig } = setup(model);
+    const { result } = await run(command);
+    expectDisposition(result, "restore-if-empty");
+    const toast = result.actions.find((action) => action.type === "show-toast");
+    expect(toast?.toast.type).toBe("error");
+    expect(setProviderConfig).not.toHaveBeenCalled();
+  });
+
+  test("honors route overrides and wire format restrictions", async () => {
+    const { run, setProviderConfig } = setup();
+    spyOn(getAppConfigStore(), "getSnapshot").mockReturnValue({
+      routeOverrides: { "openai:gpt-6-astra": "openrouter" },
+    });
+    expectDisposition((await run("/ultrafast")).result, "restore-if-empty");
+    spyOn(getAppConfigStore(), "getSnapshot").mockReturnValue({ routePriority: ["direct"] });
+    config.openai.wireFormat = "chatCompletions";
+    expectDisposition((await run("/ultrafast")).result, "restore-if-empty");
+    expect(setProviderConfig).not.toHaveBeenCalled();
+  });
+
+  test("refreshes after a failed write and releases the toggle guard", async () => {
+    const { run, setProviderConfig } = setup("xai:grok-4.7");
+    setProviderConfig.mockRejectedValueOnce(new Error("write failed"));
+    expectDisposition((await run("/fast")).result, "restore-if-empty");
+    expect(store.refresh).toHaveBeenCalledTimes(1);
+    expect(store.updateOptimistically).not.toHaveBeenCalled();
+    expectDisposition((await run("/fast")).result, "consume");
+  });
+
+  test("rejects disconnected, side-chat, and invalid commands before reading config", async () => {
+    const { run, getConfig } = setup();
+    for (const command of ["/fast", "/ultrafast"]) {
+      expectDisposition((await run(command, { api: null })).result, "restore");
+      expectDisposition((await run(command, { isSideChat: true })).result, "restore");
+      expectDisposition((await run(`${command} on`)).result, "restore");
+    }
+    expect(getConfig).not.toHaveBeenCalled();
+  });
+
+  test("does not race duplicate submissions while provider config loads", async () => {
+    const { run, getConfig, setProviderConfig } = setup();
+    const pending = Promise.withResolvers<ProvidersConfigMap>();
+    getConfig.mockReturnValueOnce(pending.promise);
+    const first = run("/fast");
+    // Let the command's lazy phase enter its config read before submitting again.
+    await Promise.resolve();
+    const second = await run("/ultrafast");
+    expectDisposition(second.result, "restore");
+    expect(setProviderConfig).not.toHaveBeenCalled();
+    pending.resolve(config);
+    expectDisposition((await first).result, "consume");
+    expect(getWorkspaceAiSelection("test-ws").serviceTier).toBe("priority");
+    expect(config.openai.serviceTier).toBe("flex");
+    expect(setProviderConfig).not.toHaveBeenCalled();
+  });
+});
+
 describe("processSlashCommand model and gating results", () => {
   test("reports provider verification failure through result data", async () => {
     const result = await processSlashCommand(
@@ -477,6 +709,28 @@ describe("processSlashCommand model and gating results", () => {
       type: "error",
       message: 'Could not verify provider "custom": backend unreachable. Please retry.',
     });
+  });
+
+  // A selected model longer than the per-workspace model key would be lost on restart.
+  test("refuses a model ID too long to persist without adding or selecting it", async () => {
+    const setModels = mock(() => Promise.resolve());
+    const result = await processSlashCommand(
+      { type: "model-set", modelString: `openai:${"m".repeat(MODEL_KEY_MAX_CHARS)}` },
+      createEnv({
+        api: {
+          providers: {
+            getConfig: mock(() => Promise.resolve({ openai: { models: [] } })),
+            setModels,
+          },
+        } as unknown as SlashCommandEnv["api"],
+      })
+    );
+    expect(result.kind).toBe("complete");
+    if (result.kind !== "complete") throw new Error("expected complete result");
+    expectDisposition(result, "restore");
+    expect(result.actions[0]).toMatchObject({ type: "show-toast", toast: { type: "error" } });
+    expect(result.actions.some((action) => action.type === "set-preferred-model")).toBe(false);
+    expect(setModels).not.toHaveBeenCalled();
   });
 
   test("refuses an unpriced model for a budgeted active goal", async () => {
@@ -562,6 +816,124 @@ describe("processSlashCommand model and gating results", () => {
     });
   });
 
+  test("side chats gate every workspace operation before any early handler runs", async () => {
+    const forbidden = mock(() => Promise.reject(new Error("must not reach backend")));
+    const env = createEnv({
+      isSideChat: true,
+      api: createTestApiClient({
+        workflows: { start: forbidden },
+        projects: { idleCompaction: { set: forbidden } },
+        workspace: { createSideChat: forbidden, heartbeat: { get: forbidden, set: forbidden } },
+      }),
+    });
+    for (const parsed of [
+      parseCommand("/side"),
+      parseCommand("/btw"),
+      parseCommand("/fork"),
+      parseCommand("/new"),
+      parseCommand("/idle 2"),
+      parseCommand("/heartbeat 10"),
+      { type: "workflow-run", scriptPath: "skill://flow/workflow.js", argsText: "{}" } as const,
+      {
+        type: "command-invalid-args",
+        command: "workflow",
+        input: "bad",
+        usage: "/workflow",
+      } as const,
+      parseCommand("/idle bad"),
+      parseCommand("/heartbeat bad"),
+      parseCommand("/goal"),
+    ]) {
+      const result = await processSlashCommand(parsed, env);
+      if (result.kind !== "complete") throw new Error("expected gate before async handler");
+      expectDisposition(result, "restore");
+      expect(
+        result.actions.some(
+          (action) => action.type === "show-toast" && action.toast.type === "error"
+        )
+      ).toBe(true);
+    }
+    expect(forbidden).not.toHaveBeenCalled();
+
+    // Conversation-local preferences stay usable; they do not start a workspace operation.
+    const vim = await processSlashCommand({ type: "vim-toggle" }, env);
+    if (vim.kind !== "complete") throw new Error("expected complete result");
+    expectDisposition(vim, "consume");
+    expect(vim.actions).toContainEqual({ type: "toggle-vim" });
+    const model = await processSlashCommand(
+      { type: "model-set", modelString: "anthropic:claude-sonnet-4-6" },
+      createEnv({ isSideChat: true })
+    );
+    if (model.kind !== "complete") throw new Error("expected complete result");
+    expectDisposition(model, "consume");
+    expect(model.actions).toContainEqual({
+      type: "set-preferred-model",
+      model: "anthropic:claude-sonnet-4-6",
+    });
+  });
+
+  test("/side and /btw open a blank side chat without sending a first message", async () => {
+    ensureWindowDispatchEvent();
+    const sendMessage = mock(() => Promise.reject(new Error("must not auto-send")));
+    const createSideChat = mock(() =>
+      Promise.resolve({
+        success: true as const,
+        metadata: {
+          id: "side-id",
+          name: "side",
+          projectName: "project",
+          projectPath: "/tmp/project",
+          namedWorkspacePath: "/tmp/side",
+          runtimeConfig: { type: "local" as const },
+          sideChatParentWorkspaceId: "test-ws",
+        },
+      })
+    );
+    const env = createEnv({
+      api: createTestApiClient({ workspace: { createSideChat, sendMessage } }),
+    });
+    for (const input of ["/side", "/btw"]) {
+      const { result } = await finishCommand(await processSlashCommand(parseCommand(input), env));
+      expectDisposition(result, "consume");
+    }
+    expect(createSideChat).toHaveBeenCalledTimes(2);
+    expect(createSideChat).toHaveBeenCalledWith({ parentWorkspaceId: "test-ws" });
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("arguments to /side and /btw preserve the input and never create or send", async () => {
+    const forbidden = mock(() => Promise.reject(new Error("must not reach backend")));
+    const env = createEnv({
+      api: createTestApiClient({
+        workspace: { createSideChat: forbidden, sendMessage: forbidden },
+      }),
+    });
+    for (const input of ["/side why?", "/btw --help"]) {
+      const { result, batches } = await finishCommand(
+        await processSlashCommand(parseCommand(input), env)
+      );
+      expectDisposition(result, "restore");
+      expect(batches.flat().some((action) => action.type === "clear-input")).toBe(false);
+    }
+    expect(forbidden).not.toHaveBeenCalled();
+  });
+
+  test("/side starts a side chat of the current workspace and restores input on failure", async () => {
+    const createSideChat = mock((_input: { parentWorkspaceId: string }) =>
+      Promise.resolve({ success: false as const, error: "Side chats cannot be nested." })
+    );
+    const { batches, result } = await finishCommand(
+      await processSlashCommand(
+        { type: "side" },
+        createEnv({ api: createTestApiClient({ workspace: { createSideChat } }) })
+      )
+    );
+    expect(createSideChat).toHaveBeenCalledWith({ parentWorkspaceId: "test-ws" });
+    expect(batches[0]).toContainEqual({ type: "clear-input" });
+    expectDisposition(result, "restore");
+    expectToast(result.actions, { type: "error", message: "Side chats cannot be nested." });
+  });
+
   test("returns idle-compaction and debug actions", async () => {
     const setIdleCompaction = mock(() => Promise.resolve({ success: true, data: undefined }));
     const idle = await processSlashCommand(
@@ -601,44 +973,8 @@ function createGoalEnv(api: SlashCommandEnv["api"]): SlashCommandEnv {
 }
 
 describe("processSlashCommand goal results", () => {
-  test("retries one conflict and returns a consumed result", async () => {
-    ensureWindowDispatchEvent();
-    const getGoal = mock()
-      .mockResolvedValueOnce({
-        goal: { goalId: "11111111-1111-4111-8111-111111111111", objective: "old" },
-      })
-      .mockResolvedValueOnce({
-        goal: { goalId: "22222222-2222-4222-8222-222222222222", objective: "fresh" },
-      });
-    const setGoal = mock()
-      .mockResolvedValueOnce({
-        success: false,
-        error: {
-          type: "goal_conflict",
-          expectedGoalId: "11111111-1111-4111-8111-111111111111",
-          actualGoalId: "22222222-2222-4222-8222-222222222222",
-        },
-      })
-      .mockResolvedValueOnce({
-        success: true,
-        data: { goalId: "33333333-3333-4333-8333-333333333333", objective: "new" },
-      });
-    const settled = await finishCommand(
-      await processSlashCommand(
-        { type: "goal-set", objective: "new" },
-        createGoalEnv({
-          config: { getConfig: mock(() => Promise.resolve({})) },
-          workspace: { getGoal, setGoal },
-        } as unknown as SlashCommandEnv["api"])
-      )
-    );
-    expect(settled.batches[0]).toEqual([{ type: "clear-input" }]);
-    expectDisposition(settled.result, "consume");
-    expect(settled.result.actions).toEqual([]);
-    expect(setGoal).toHaveBeenCalledTimes(2);
-  });
-
-  test("surfaces a second conflict as a restore result", async () => {
+  // #5461: a conflict means the goal was replaced; retrying would pause the replacement.
+  test("surfaces a conflict as a restore result without retrying", async () => {
     const conflict = {
       success: false as const,
       error: {
@@ -647,6 +983,7 @@ describe("processSlashCommand goal results", () => {
         actualGoalId: "22222222-2222-4222-8222-222222222222",
       },
     };
+    const setGoal = mock(() => Promise.resolve(conflict));
     const settled = await finishCommand(
       await processSlashCommand(
         { type: "goal-pause" },
@@ -654,14 +991,15 @@ describe("processSlashCommand goal results", () => {
           workspace: {
             getGoal: mock(() =>
               Promise.resolve({
-                goal: { goalId: "11111111-1111-4111-8111-111111111111" },
+                goal: { goalId: "11111111-1111-4111-8111-111111111111", status: "active" },
               })
             ),
-            setGoal: mock(() => Promise.resolve(conflict)),
+            setGoal,
           },
         } as unknown as SlashCommandEnv["api"])
       )
     );
+    expect(setGoal).toHaveBeenCalledTimes(1);
     expectDisposition(settled.result, "restore");
     expectToast(settled.result.actions, {
       type: "error",
@@ -712,13 +1050,70 @@ describe("processSlashCommand goal results", () => {
     });
   });
 
+  // The backend lets the user move a completed goal to paused (a revive); /goal pause must not.
+  test.each(["complete", "paused", null] as const)(
+    "refuses /goal pause without a running goal (%p)",
+    async (status) => {
+      const setGoal = mock();
+      const settled = await finishCommand(
+        await processSlashCommand(
+          { type: "goal-pause" },
+          createGoalEnv({
+            workspace: {
+              getGoal: mock(() =>
+                Promise.resolve({ goal: status == null ? null : { goalId: "id", status } })
+              ),
+              setGoal,
+            },
+          } as unknown as SlashCommandEnv["api"])
+        )
+      );
+      expect(setGoal).not.toHaveBeenCalled();
+      expectDisposition(settled.result, "restore");
+      expect(settled.result.actions[0]).toMatchObject({
+        type: "show-toast",
+        toast: { type: "error" },
+      });
+    }
+  );
+
+  test.each([
+    { status: "paused", opensForm: true },
+    { status: "complete", opensForm: false },
+    { status: null, opensForm: false },
+  ] as const)(
+    "/goal complete without a summary opens the form only for a completable goal ($status)",
+    async ({ status, opensForm }) => {
+      ensureWindowDispatchEvent();
+      const settled = await finishCommand(
+        await processSlashCommand(
+          { type: "goal-complete" },
+          createGoalEnv({
+            workspace: {
+              getGoal: mock(() =>
+                Promise.resolve({ goal: status == null ? null : { goalId: "id", status } })
+              ),
+            },
+          } as unknown as SlashCommandEnv["api"])
+        )
+      );
+      expectDisposition(settled.result, opensForm ? "consume" : "restore");
+      if (!opensForm) {
+        expect(settled.result.actions[0]).toMatchObject({
+          type: "show-toast",
+          toast: { type: "error" },
+        });
+      }
+    }
+  );
+
   test("returns lifecycle success and pricing failure actions", async () => {
     const paused = await finishCommand(
       await processSlashCommand(
         { type: "goal-pause" },
         createGoalEnv({
           workspace: {
-            getGoal: mock(() => Promise.resolve({ goal: null })),
+            getGoal: mock(() => Promise.resolve({ goal: { goalId: "id", status: "active" } })),
             setGoal: mock(() =>
               Promise.resolve({ success: true, data: { goalId: "id", status: "paused" } })
             ),
@@ -749,20 +1144,10 @@ describe("processSlashCommand goal results", () => {
 });
 
 describe("processSlashCommand heartbeat results", () => {
-  test("returns gating errors before a phase", async () => {
+  test("returns a missing-workspace error before a phase", async () => {
     const api = {
       workspace: { heartbeat: { get: mock(), set: mock() } },
     } as unknown as SlashCommandEnv["api"];
-    const disabled = await processSlashCommand(
-      { type: "heartbeat-set", minutes: 30 },
-      createEnv({ api })
-    );
-    expect(disabled.kind).toBe("complete");
-    if (disabled.kind !== "complete") throw new Error("expected complete result");
-    expectDisposition(disabled, "restore");
-    expect(disabled.actions[0]).toMatchObject({ type: "show-toast", toast: { type: "error" } });
-
-    setHeartbeatExperiment(true);
     const missing = await processSlashCommand(
       { type: "heartbeat-set", minutes: 30 },
       createEnv({ api, workspaceId: undefined })
@@ -773,7 +1158,6 @@ describe("processSlashCommand heartbeat results", () => {
   });
 
   test("preserves saved heartbeat fields and returns success", async () => {
-    setHeartbeatExperiment(true);
     const heartbeatGet = mock(() =>
       Promise.resolve({
         enabled: true as const,
@@ -809,8 +1193,9 @@ describe("processSlashCommand heartbeat results", () => {
     });
   });
 
-  test("uses the default interval when disabling without saved settings", async () => {
-    setHeartbeatExperiment(true);
+  // Disabling must not save an interval: a workspace without one follows the global default,
+  // and writing the built-in default would silently pin it (#5692).
+  test("leaves the interval unset when disabling without saved settings", async () => {
     const heartbeatSet = mock(() => Promise.resolve({ success: true, data: undefined }));
     const settled = await finishCommand(
       await processSlashCommand(
@@ -831,12 +1216,10 @@ describe("processSlashCommand heartbeat results", () => {
     expect(heartbeatSet).toHaveBeenCalledWith({
       workspaceId: "test-ws",
       enabled: false,
-      intervalMs: HEARTBEAT_DEFAULT_INTERVAL_MS,
     });
   });
 
   test("returns backend update failures with restore disposition", async () => {
-    setHeartbeatExperiment(true);
     const settled = await finishCommand(
       await processSlashCommand(
         { type: "heartbeat-set", minutes: 30 },
@@ -1672,5 +2055,41 @@ describe("prepareCompactionMessage", () => {
     expectCompactionMetadata(metadata);
 
     expect(metadata.parsed.followUpContent?.reviews).toHaveLength(1);
+  });
+});
+
+describe("createNewWorkspace", () => {
+  afterEach(() => {
+    getAppConfigStore().updateOptimistically({ defaultRuntime: undefined });
+  });
+
+  test("/new applies only a configured local default runtime, the project's first", async () => {
+    const runtimeConfigs: Array<RuntimeConfig | undefined> = [];
+    let projectDefaultRuntime: RuntimeEnablementId | undefined;
+    const client = createTestApiClient({
+      projects: {
+        list: () =>
+          Promise.resolve([["/repo", { workspaces: [], defaultRuntime: projectDefaultRuntime }]]),
+      },
+      workspace: {
+        create: (input: { runtimeConfig?: RuntimeConfig }) => {
+          runtimeConfigs.push(input.runtimeConfig);
+          return Promise.resolve({ success: false as const, error: "stop after create" });
+        },
+      },
+    });
+
+    for (const [globalDefault, projectDefault] of [
+      ["local", undefined],
+      ["ssh", undefined],
+      ["local", "worktree"],
+      ["worktree", "local"],
+    ] as const) {
+      getAppConfigStore().updateOptimistically({ defaultRuntime: globalDefault });
+      projectDefaultRuntime = projectDefault;
+      await createNewWorkspace({ client, projectPath: "/repo", trunkBranch: "main" });
+    }
+
+    expect(runtimeConfigs).toEqual([{ type: "local" }, undefined, undefined, { type: "local" }]);
   });
 });

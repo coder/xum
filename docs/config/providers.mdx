@@ -19,9 +19,10 @@ Most providers only need an API key. The UI handles validation and shows which p
 | Provider           | Models                      | Get API Key                                             |
 | ------------------ | --------------------------- | ------------------------------------------------------- |
 | **Anthropic**      | Claude Opus, Sonnet, Haiku  | [console.anthropic.com](https://console.anthropic.com/) |
-| **OpenAI**         | GPT-5, Codex                | [platform.openai.com](https://platform.openai.com/)     |
+| **OpenAI**         | GPT-6                       | [platform.openai.com](https://platform.openai.com/)     |
 | **Google**         | Gemini Pro, Flash           | [aistudio.google.com](https://aistudio.google.com/)     |
 | **xAI**            | Grok                        | [console.x.ai](https://console.x.ai/)                   |
+| **Meta**           | Muse Wonder                 | [dev.meta.ai](https://dev.meta.ai/docs)                 |
 | **DeepSeek**       | DeepSeek Chat, Reasoner     | [platform.deepseek.com](https://platform.deepseek.com/) |
 | **Moonshot AI**    | Kimi K3                     | [platform.moonshot.ai](https://platform.moonshot.ai/)   |
 | **Z.ai**           | GLM 5.3 Flash               | [z.ai](https://z.ai/model-api)                          |
@@ -30,6 +31,8 @@ Most providers only need an API key. The UI handles validation and shows which p
 | **Bedrock**        | Claude via AWS              | AWS Console                                             |
 | **GitHub Copilot** | GPT-4o, Claude Sonnet, etc. | [GitHub Copilot](https://github.com/features/copilot)   |
 | **Coder**          | Models via AI Gateway       | Your Coder deployment (Login with Coder, no key needed) |
+
+For catalog suggestions and manual model IDs, see [Add custom models](/config/models#add-custom-models).
 
 ## Environment Variables
 
@@ -44,6 +47,7 @@ Providers also read from environment variables as fallback:
 | Google         | `GOOGLE_GENERATIVE_AI_API_KEY` or `GOOGLE_API_KEY` |
 | xAI            | `XAI_API_KEY`                                      |
 | OpenRouter     | `OPENROUTER_API_KEY`                               |
+| meta           | `META_MODEL_API_KEY` or `MODEL_API_KEY`            |
 | DeepSeek       | `DEEPSEEK_API_KEY`                                 |
 | Moonshot AI    | `MOONSHOT_API_KEY`                                 |
 | Z.ai           | `ZAI_API_KEY`                                      |
@@ -70,6 +74,33 @@ Azure OpenAI env vars configure the OpenAI provider with Azure backend.
 </details>
 
 {/* END PROVIDER_ENV_VARS */}
+
+## AI Calls from Bash Commands
+
+Scripts that the agent runs in the bash tool (test harnesses, `make bug-bash`, SDK scripts) can call Anthropic and OpenAI directly. Turn on **Settings → Providers → Bash commands** to count that spend (it is off by default). Each bash command then gets a local endpoint and a workspace key, and Xum adds the usage to that workspace's Costs tab and to Analytics (source `headless:bash_proxy`).
+
+| Variable                                                      | Value                                 |
+| ------------------------------------------------------------- | ------------------------------------- |
+| `ANTHROPIC_BASE_URL`                                          | `http://127.0.0.1:<port>/anthropic`   |
+| `OPENAI_BASE_URL`                                             | `http://127.0.0.1:<port>/openai/v1`   |
+| `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `OPENAI_API_KEY` | `xum-proxy-…` (one key per workspace) |
+
+- Xum sends the calls with the provider keys from this page. The command never sees the real key.
+- Local and Worktree commands reach Xum directly. SSH and Coder commands reach it through a reverse SSH forward (`ssh -R`) that Xum opens to each host, on the host's `127.0.0.1`. The first turn on a host can wait up to 10 seconds for it. The forward uses its own SSH connection without the forwards in your `~/.ssh/config`. A host that refuses forwarding (`AllowTcpForwarding no`) gets no variables, and Xum tries it again after 5 minutes. After a connection failure Xum tries again after 30 seconds. A host that asks for a password or a key passphrase gets no variables: the forward does not prompt, so load the key into `ssh-agent`.
+- With `XUM_ALLOW_MULTIPLE_INSTANCES=1`, or while a `xum server` of another process uses the same Xum home, SSH and Coder commands get no variables: a host keeps one forwarded port per Xum home, and two backends would each pick their own. Xum does not detect a desktop app started with `XUM_NO_API_SERVER=1` next to `xum server`.
+- Docker and devcontainer commands keep their environment: they have no route to Xum.
+- Bash commands in `xum run` and `xum workflow` sessions do not get the variables.
+- Commands in untrusted projects, and every command while `XUM_DISABLE_PROJECT_AUTOMATION=1` is set, get no variables: Xum blanks provider keys there, so repo code cannot spend through the proxy. Revoking a project's trust also refuses calls from its commands that are still running.
+- A provider without a Xum API key (for example OpenAI with Codex OAuth only) gets no variables. A provider that your [project secrets](/config/project-secrets) configure keeps the secret values. This includes `OPENAI_ORG_ID` and `OPENAI_PROJECT_ID`.
+- Xum logs each skipped provider once per workspace, with the reason, for example `[bash-ai-proxy] skipped anthropic: a secret sets ANTHROPIC_API_KEY`. The calls of a skipped provider are not counted.
+- A secret replaces only the variables it sets. A secret `ANTHROPIC_API_KEY` next to the `ANTHROPIC_BASE_URL` or `ANTHROPIC_AUTH_TOKEN` of the Xum process sends that key to the host's endpoint, and a gateway can answer 403. Xum logs a warning for this mix (not in `xum run` and `xum workflow` sessions). See [Provider keys in secrets](/config/project-secrets#provider-keys-in-secrets).
+- The proxy allows Messages, Responses, Chat Completions, token counting and model listing. Other paths get 404.
+- The port, the keys and the forwarded ports stay the same when Xum restarts, so background commands keep working. Xum keeps them in `~/.xum/bash-ai-proxy.json`. Deleting that file changes all keys. At startup Xum opens the forwards to SSH hosts again, but not to Coder workspaces, because connecting can start a stopped workspace. Their forward comes back with the next agent turn there.
+- If the saved port is busy when Xum starts, Xum uses another port for that session and keeps the saved one. Commands started in that session lose access after the next restart.
+- A key stops working when its workspace is removed.
+- A script that exports its own `ANTHROPIC_API_KEY` but keeps the proxy URL gets 401. Set both the key and the base URL, or neither.
+- Agent CLIs that read these variables also go through the proxy. `claude -p` in a bash command then bills the Xum Anthropic key instead of a Claude subscription login.
+- CAUTION: on SSH hosts, Xum passes the variables in the remote command line, and any user on a shared host can reach its `127.0.0.1`. Another user who reads the key with `ps` can spend through your provider keys. Turn this off for shared SSH hosts.
 
 ## Advanced: Manual Configuration
 
@@ -102,6 +133,23 @@ For advanced options not exposed in the UI, edit `~/.xum/providers.jsonc` direct
 }
 ```
 
+### Meta
+
+Configure **Meta** in Settings → Providers with a Meta Model API key, or set
+`MODEL_API_KEY` as in Meta's quickstart. `META_MODEL_API_KEY` is also supported
+and takes precedence when both are set. The default endpoint is `https://api.meta.ai/v1`.
+Select **Muse Wonder** (`meta:muse-wonder-1.0`), or use `/model wonder`.
+
+Muse Wonder is in preview with a 1,048,576-token context window. Xum uses a
+practical output cap of 131,072 tokens from [models.dev](https://models.dev).
+[Published pricing](https://dev.meta.ai/docs/pricing-rate-limits) is $4 per million
+input tokens, $0.20 per million cached input tokens, and $20 per million output
+tokens, with no long-context premium.
+
+Reasoning is private: Xum offers low, medium, high, xhigh, and max effort, not off.
+Muse Wonder Full is only available in Muse Code, not the Model API; max effort
+does not select Full. See the [Meta API documentation](https://dev.meta.ai/docs).
+
 ### OpenAI wire format
 
 The built-in `openai` provider supports two wire formats:
@@ -131,6 +179,30 @@ add a trailing slash to keep requests at the origin root.
 
 For llama.cpp, vLLM, LM Studio, and multiple local endpoints, prefer named custom
 `providerType: "openai-compatible"` providers instead of changing the built-in OpenAI provider.
+
+### Cyber mode (OpenAI Daybreak)
+
+OpenAI's [Daybreak access programs](https://developers.openai.com/api/docs/guides/daybreak)
+provide approved access for cybersecurity work; a Responses API request selects one with
+`access_programs.cyber`. The request value selects behavior within your approved access and does
+not grant access. Turn on
+**Settings → Providers → OpenAI → Enable cyber model** (off by default) to add a **Cyber** option
+to the reasoning selector next to the model picker, or run "Toggle Cyber Mode" from the Command
+Palette. Cyber and Pro are mutually exclusive.
+
+Cyber appears only for models with a documented Daybreak value. GPT-6.1 Sol and GPT-6 Astra send
+`daybreak_blue`. OpenAI requires Daybreak Red approval for reduced refusals on these models, but
+they still take `daybreak_blue`. Cyber works only with the built-in OpenAI provider's API key on
+the `responses` wire format. A custom base URL on the built-in provider also receives the field.
+Gateways, custom providers, Codex OAuth, and Chat Completions use standard safeguards.
+
+If OpenAI rejects the program, Xum shows OpenAI's message and does not retry:
+
+| Error code                   | Meaning                                                  |
+| ---------------------------- | -------------------------------------------------------- |
+| `invalid_access_program`     | The model needs a different program value.               |
+| `unsupported_access_program` | OpenAI does not offer Daybreak on this model to you.     |
+| `access_program_not_enabled` | The API key's project or organization lacks the program. |
 
 ### Custom providers
 
@@ -262,18 +334,61 @@ registration), completes an authorization-code + PKCE flow, and stores the resul
 in `~/.xum/providers.jsonc`. Tokens refresh automatically; **Disconnect** revokes and clears
 them.
 
-After login, Xum discovers the deployment's configured AI Gateway providers and their model
-catalogs, listing models as `coder:<provider>/<model>` (e.g. `coder:anthropic/<model>`,
-`coder:my-openai/<model>`). Each provider's type (anthropic, openai, bedrock,
-openai-compat, ...) decides the wire protocol Xum speaks to its gateway route. Use the
-**Refresh models** button (or the "Settings: Refresh Coder Models" command) to re-discover
-without a re-login. You can also add model IDs manually under the provider's model list;
-manual edits are preserved across re-logins and catalog refreshes: added entries stay
-listed, and removed catalog entries stay removed.
+After login, Xum discovers the deployment's configured AI Gateway providers (instances such as
+`anthropic` or `claude-aws-us-east-2`) but does not load their model catalogs, which can hold
+thousands of IDs. Each provider's type (anthropic, openai, google, bedrock, openai-compat, ...)
+decides the wire protocol Xum speaks to its gateway route. Use **Refresh providers** under
+**Model routing** (or run the "Settings: Refresh Coder providers" command) to re-discover
+providers without a re-login. A loaded catalog then drops the models of providers that were
+removed or changed type.
 
-Listing the deployment's providers requires an admin-level API on some deployments; when it
-is unavailable Xum probes the default provider names instead. If your deployment uses
-custom-named provider instances that Xum cannot discover, declare them by hand in
+Press **Load model catalog** (or run the "Settings: Load Coder model catalog" command) to fetch
+every provider's catalog. Catalog models are identified as `coder:<provider>/<model>` (e.g.
+`coder:anthropic/<model>`, `coder:my-openai/<model>`), and the button then reads **Refresh model
+catalog (N)** with the number of loaded IDs. If any provider's catalog request fails (a provider
+that serves no catalog is skipped), the first load does not complete and the catalog stays
+unloaded until a retry succeeds; once loaded, a failing provider keeps its previous entries.
+Catalog loading never adds models to your configured list. Under **Settings →
+Models**, select the **Coder** provider, then use the **Model ID** field to search catalog
+suggestions or type a custom model ID; typing works even when the catalog is not loaded.
+Picking a suggestion adds it immediately; press **Add** or **Enter** to add a typed ID. Nothing
+appears in the model picker until you add it. Added models survive catalog refreshes, re-logins
+and **Disconnect**. Removing a model only removes it from your list; use the **Route** column to
+steer a model away from Coder. Once a catalog is loaded, built-in models route through Coder only
+when the catalog lists them; `/model coder:<provider>/<model>` still selects a catalog model for
+the current workspace without adding it.
+
+#### Model routing
+
+**Model routing** maps each native provider (Anthropic, OpenAI, Google) to the deployment's AI
+Gateway provider that should serve its models. The model picker keeps showing native models such
+as `anthropic:<model>`; when route priority picks Coder for one, Xum sends it to the mapped
+provider instead (`coder:claude-aws-us-east-2/<model>` on the wire).
+
+- Only providers of the same type are offered: an Anthropic mapping must point at an
+  anthropic-type provider, and so on.
+- **Default** keeps the built-in behavior: Anthropic and OpenAI models use the gateway provider
+  named `anthropic` or `openai`; Google models route through Coder only when mapped.
+- A mapping to a provider that is no longer known (or has a different type) shows as "(not
+  found)", and that native provider does not route through Coder until you pick another one.
+- Mapping does not change whether Coder is used: route priority and per-model **Route**
+  overrides still decide that. Explicit `coder:<provider>/<model>` selections always address the
+  named provider literally.
+- The Coder card's **Routes to** line lists the native providers that currently route through
+  Coder, including a mapped Google and excluding a "(not found)" mapping.
+- The model picker does not show the route: **Settings → Models** shows it per model, and replies
+  from native models sent through Coder are marked "via Coder" in the transcript.
+- The deployment's AI Gateway logs attribute Gemini traffic to `openai`, because Xum speaks the
+  OpenAI-compatible protocol to google-type providers.
+- Mappings are stored as `canonicalRoutes` in the `coder` section of `~/.xum/providers.jsonc`.
+  Xum also keeps its own bookkeeping keys there (`discoveredProviders`, `discoveredModels`,
+  `staleDiscoveredModels`, `discoveredModelsUnlisted`, `coderCatalogGeneration`); do not edit
+  them by hand.
+
+Listing the deployment's providers requires AI Gateway provider read access, which member
+accounts may lack. When it is unavailable, loading the catalog probes the default provider
+names instead. If your deployment uses custom-named provider instances that Xum cannot
+discover (for example to map them under **Model routing**), declare them by hand in
 `~/.xum/providers.jsonc`:
 
 ```jsonc
@@ -300,6 +415,12 @@ Bedrock supports multiple authentication methods (tried in order):
 3. **AWS Credential Chain** - Automatic resolution from environment, `~/.aws/credentials`, SSO, EC2/ECS roles
 
 If you're already authenticated with AWS CLI (`aws sso login`), Xum uses those credentials automatically.
+
+### Anthropic Fast mode
+
+Claude Opus 5.5, Opus 5, and Opus 4.8 support Anthropic's [Fast mode](https://platform.claude.com/docs/en/build-with-claude/fast-mode) research preview: up to 2.5× faster output at 2× token pricing. Toggle it from the thinking selector's **Fast mode** row, the command palette (**Toggle Fast Mode**), or its keyboard shortcut. Xum stores the preference as `"speed": "fast"` under `anthropic` in `providers.jsonc`.
+
+Fast mode is only sent on the direct Anthropic API with an account that has Fast mode access. It is hidden for gateway routes (Xum Gateway, OpenRouter, Bedrock, Coder), custom Anthropic-compatible providers, a non-`api.anthropic.com` base URL, and when Anthropic beta features are disabled for ZDR. Costs are priced from the speed Anthropic reports for each response.
 
 ### OpenRouter Provider Routing
 

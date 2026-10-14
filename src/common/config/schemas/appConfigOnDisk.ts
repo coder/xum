@@ -24,7 +24,6 @@ export {
   AgentPluginGitSourceSchema,
   AgentPluginInstallEntrySchema,
   AgentPluginInstallSourceSchema,
-  AgentPluginInstallsSchema,
 } from "./agentPluginInstalls";
 export type {
   AgentPluginGitSource,
@@ -49,8 +48,10 @@ export const AgentAiDefaultsEntrySchema = z.object({
   // Sparse like the other fields: only explicit "pro" is persisted; absent
   // inherits the workspace's current reasoning mode.
   reasoningMode: OpenAIReasoningModeSchema.optional(),
+  // Auto routing is interactive-only; only `true` persists, while concrete values remain fallbacks.
+  autoModelRouting: z.boolean().optional(),
+  autoThinkingLevel: z.boolean().optional(),
   enabled: z.boolean().optional(),
-  advisorEnabled: z.boolean().optional(),
   subagent: AgentAiSubagentProfileSchema.optional(),
 });
 
@@ -106,6 +107,22 @@ export const ModelFallbackEntrySchema = z.object({
 /** Per-model fallback chains, keyed by canonical source model. */
 export const ModelFallbacksSchema = z.record(z.string(), ModelFallbackEntrySchema);
 
+/**
+ * Settings → Tasks & Workflows → Evaluation model: the default for workflow
+ * `evaluate()` steps that do not pass `model` themselves (a `provider:model`
+ * string). Absent means "no default" — the step fails with
+ * `invalid-input/no-model`; it is never inferred from the chat model.
+ *
+ * Deliberately separate from `autoModelRouting.evaluationModel` below: that one
+ * selects the prompt-difficulty classifier for automatic chat model routing
+ * (defaulting to TypeSafe's Jev), whereas this one selects an explicit,
+ * author-invoked workflow evaluator with its own admission and billing
+ * semantics. Neither falls back to the other.
+ */
+export const EvaluationDefaultsSchema = z.object({
+  model: z.string().min(1).optional(),
+});
+
 export const AppConfigMigrationsSchema = z
   .object({
     /**
@@ -114,11 +131,9 @@ export const AppConfigMigrationsSchema = z
      * not re-run their exec split migration.
      */
     execSubagentDefaultsSplit: z.boolean().optional(),
-    userPreferencesInitialized: z.boolean().optional(),
-    daybreakModelsHidden: z.boolean().optional(),
     // Default seeding must not claim legacy local-only hidden preferences.
     hiddenModelsInitialized: z.boolean().optional(),
-    /** One-time seed of DEFAULT_MODEL_FALLBACKS; not re-applied while true. */
+    /** One-time seed of SEEDED_MODEL_FALLBACKS; not re-applied while true. */
     defaultModelFallbacksSeeded: z.boolean().optional(),
     /**
      * One-time re-run of the fallback seed after the fable alias moved to
@@ -128,6 +143,10 @@ export const AppConfigMigrationsSchema = z
     defaultModelFallbacksSeededFable51: z.boolean().optional(),
     /** One-time migration from the legacy auto-delete default to persistent sub-agents. */
     persistentSubagentsDefaulted: z.boolean().optional(),
+    /** One-time move of task limits still at PREVIOUS_TASK_SETTINGS_DEFAULTS to the new defaults. */
+    taskSettingsDefaultsRaised: z.boolean().optional(),
+    /** One-time carry-over of the former workspace-heartbeats experiment into agentHeartbeatsEnabled. */
+    agentHeartbeatsSeeded: z.boolean().optional(),
   })
   // Preserve flags introduced by newer app versions: without the catchall a
   // downgrade to this version would strip unknown flags on save, re-running
@@ -154,6 +173,14 @@ export const AppConfigOnDiskSchema = z
     chatTranscriptFullWidth: z.boolean().optional(),
     muxGatewayEnabled: z.boolean().optional(),
     llmDebugLogs: z.boolean().optional(),
+    /** Desktop only: hold a display-sleep blocker while any local agent is working. */
+    keepScreenAwake: z.boolean().optional(),
+    /** Defer MCP tool definitions behind tool_catalog_search. Absent = on. */
+    toolSearchEnabled: z.boolean().optional(),
+    /** Route AI calls from bash tool commands through Xum's cost-tracking proxy. Absent = off. */
+    bashAiProxyEnabled: z.boolean().optional(),
+    /** Expose the `heartbeat` tool so agents can schedule their own recurring turns. Absent = off. */
+    agentHeartbeatsEnabled: z.boolean().optional(),
     heartbeatDefaultPrompt: z.string().optional(),
     heartbeatDefaultIntervalMs: z
       .number()
@@ -162,6 +189,7 @@ export const AppConfigOnDiskSchema = z
       .max(HEARTBEAT_MAX_INTERVAL_MS)
       .optional(),
     goalDefaults: GoalDefaultsSchema.optional(),
+    evaluationDefaults: EvaluationDefaultsSchema.optional(),
     muxGatewayModels: z.array(z.string()).optional(),
     routePriority: z.array(z.string()).optional(),
     routeOverrides: z.record(z.string(), z.string()).optional(),
@@ -192,11 +220,6 @@ export const AppConfigOnDiskSchema = z
       .optional()
       .catch(undefined),
     defaultModel: z.string().optional(),
-    advisorModelString: z.string().optional(),
-    advisorThinkingLevel: ThinkingLevelSchema.optional(),
-    advisorReasoningMode: OpenAIReasoningModeSchema.optional(),
-    advisorMaxUsesPerTurn: z.number().int().positive().nullable().optional(),
-    advisorMaxOutputTokens: z.number().int().positive().nullable().optional(),
     hiddenModels: z.array(z.string()).optional(),
     preferredCompactionModel: z.string().optional(),
     agentAiDefaults: AgentAiDefaultsSchema.optional(),
@@ -209,8 +232,6 @@ export const AppConfigOnDiskSchema = z
     subagentAiDefaults: SubagentAiDefaultsSchema.optional(),
     migrations: AppConfigMigrationsSchema.optional(),
     useSSH2Transport: z.boolean().optional(),
-    muxGovernorUrl: z.string().optional(),
-    muxGovernorToken: z.string().optional(),
     coderWorkspaceArchiveBehavior: z.enum(CODER_ARCHIVE_BEHAVIORS).optional(),
     worktreeArchiveBehavior: z.enum(WORKTREE_ARCHIVE_BEHAVIORS).optional(),
     deleteWorktreeOnArchive: z.boolean().optional(),
@@ -237,6 +258,7 @@ export type AgentAiDefaultsEntry = z.infer<typeof AgentAiDefaultsEntrySchema>;
 export type AgentAiDefaults = z.infer<typeof AgentAiDefaultsSchema>;
 export type SubagentAiDefaults = z.infer<typeof SubagentAiDefaultsSchema>;
 export type ModelFallbacks = z.infer<typeof ModelFallbacksSchema>;
+export type EvaluationDefaults = z.infer<typeof EvaluationDefaultsSchema>;
 export type UpdateChannel = z.infer<typeof UpdateChannelSchema>;
 
 export type AppConfigOnDisk = z.infer<typeof AppConfigOnDiskSchema>;

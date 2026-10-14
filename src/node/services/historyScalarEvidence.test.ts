@@ -3,7 +3,7 @@ import { mkdtemp, open, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { scanHistoryRows } from "./historyRowScanner";
+import { scanHistoryRows } from "./historyRowScanner.testHarness";
 import {
   createHistoryCanonicalEvidence,
   createHistoryNumberEvidence,

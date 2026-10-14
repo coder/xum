@@ -92,6 +92,54 @@ describe("MCPConfigService", () => {
     expect(raw).toContain('"test"');
   });
 
+  // Server names are keys of plain objects: names like "constructor" must not read
+  // Object.prototype members as configured servers (#5740).
+  test("servers named after Object.prototype keys behave like any other name (#5740)", async () => {
+    // A name that is not configured is not found, and nothing is written for it.
+    for (const name of ["toString", "constructor", "hasOwnProperty"]) {
+      expect((await configService.setServerEnabled(name, false)).success).toBe(false);
+      expect((await configService.setToolAllowlist(name, [])).success).toBe(false);
+      expect((await configService.removeServer(name)).success).toBe(false);
+    }
+    expect(Object.keys(await configService.listServers())).toEqual([]);
+
+    // A configured "constructor" server round-trips like any other.
+    const added = await configService.addServer("constructor", {
+      transport: "http",
+      url: "https://example.com/mcp",
+    });
+    expect(added).toEqual({ success: true, data: undefined });
+    expect((await configService.listServers()).constructor).toMatchObject({
+      transport: "http",
+      url: "https://example.com/mcp",
+      disabled: false,
+    });
+    expect((await configService.setServerEnabled("constructor", false)).success).toBe(true);
+    expect((await configService.listServers()).constructor).toMatchObject({ disabled: true });
+    expect((await configService.removeServer("constructor")).success).toBe(true);
+    expect(Object.keys(await configService.listServers())).toEqual([]);
+
+    // "__proto__" cannot be stored as a plain-object key, so it is refused.
+    expect(
+      (await configService.addServer("__proto__", { transport: "stdio", command: "x" })).success
+    ).toBe(false);
+    expect(Object.keys(await configService.listServers())).toEqual([]);
+  });
+
+  test("addServer refuses remote servers whose URL is not absolute http(s)", async () => {
+    for (const url of ["not a url", "example.com/mcp", "ftp://example.com/mcp", "file:///tmp/x"]) {
+      const result = await configService.addServer("remote", { transport: "http", url });
+      expect(result.success).toBe(false);
+    }
+    expect(await configService.listServers()).not.toHaveProperty("remote");
+
+    const ok = await configService.addServer("remote", {
+      transport: "http",
+      url: "https://example.com/mcp",
+    });
+    expect(ok).toEqual({ success: true, data: undefined });
+  });
+
   test("listServers merges repo overrides on top of global (override wins by name)", async () => {
     await configService.addServer("shared", {
       transport: "stdio",
@@ -117,6 +165,53 @@ describe("MCPConfigService", () => {
       shared: { transport: "stdio", command: "repo-shared", disabled: false },
       "global-only": { transport: "stdio", command: "global-only", disabled: false },
       "repo-only": { transport: "stdio", command: "repo-only", disabled: true },
+    });
+  });
+
+  test("listForApi reports the user config layer that owns each server entry", async () => {
+    // #4297: the workspace MCP modal attributes `disabled` to a layer. Project
+    // entries replace global ones by name, so the owning layer alone decides.
+    await fs.writeFile(
+      path.join(config.rootDir, "mcp.jsonc"),
+      JSON.stringify({
+        servers: {
+          "global-off": { command: "g", disabled: true },
+          "both-off": { command: "g", disabled: true },
+          "project-off": "g",
+        },
+      }),
+      "utf-8"
+    );
+    const projectPath = path.join(tempDir, "repo-layers");
+    await fs.mkdir(path.join(projectPath, ".xum"), { recursive: true });
+    await fs.writeFile(
+      path.join(projectPath, ".xum", "mcp.jsonc"),
+      JSON.stringify({
+        servers: {
+          "project-off": { command: "p", disabled: true },
+          "both-off": { command: "p", disabled: true },
+        },
+      }),
+      "utf-8"
+    );
+    const layersOf = (servers: Record<string, MCPServerInfo>) =>
+      Object.fromEntries(Object.entries(servers).map(([name, info]) => [name, info.configLayer]));
+
+    // Untrusted projects never load the repo layer.
+    expect(layersOf(await configService.listForApi({ projectPath }))).toEqual({
+      "global-off": "global",
+      "both-off": "global",
+      "project-off": "global",
+    });
+
+    await config.editConfig((cfg) => ({
+      ...cfg,
+      projects: new Map([[projectPath, { trusted: true, workspaces: [] }]]),
+    }));
+    expect(layersOf(await configService.listForApi({ projectPath }))).toEqual({
+      "global-off": "global",
+      "both-off": "project",
+      "project-off": "project",
     });
   });
 
@@ -198,18 +293,9 @@ describe("MCPConfigService", () => {
       }
     }
   });
-  test("API mutations enforce policy and emit telemetry", async () => {
+  test("API mutations emit telemetry", async () => {
     const capture = mock(() => undefined);
-    const apiService = new MCPConfigService(config, {
-      policyService: {
-        isEnforced: () => true,
-        isMcpTransportAllowed: (transport: string) => transport === "stdio",
-      },
-      telemetryService: { capture },
-    });
-    expect(
-      await apiService.addForApi({ name: "remote", transport: "http", url: "https://x" })
-    ).toEqual({ success: false, error: "MCP transport is disabled by policy" });
+    const apiService = new MCPConfigService(config, { telemetryService: { capture } });
     await apiService.addForApi({ name: "local", command: "node server.js" });
     expect(capture).toHaveBeenCalledWith(
       expect.objectContaining({ event: "mcp_server_config_changed" })
@@ -264,7 +350,7 @@ describe("MCP server disable filtering", () => {
     });
   });
 
-  // --- Agent Plugins provider (agent-plugins experiment) ---
+  // --- Agent Plugins provider ---
 
   const PLUGIN_SERVER = {
     transport: "stdio" as const,
@@ -820,8 +906,12 @@ describe("MCP server disable filtering", () => {
         staleMs: 60_000,
         timeoutMessage: "holder failed",
       });
+      // The spy is module-global: async work left over from an earlier test in the
+      // same process can take an unrelated lock inside this window. Shorten and
+      // count only this service's config lock, and pass other callers through.
       const acquireSpy = spyOn(crossProcessLock, "acquireCrossProcessLock").mockImplementation(
-        (options) => acquire({ ...options, acquireTimeoutMs: 1 })
+        (options) =>
+          acquire(options.lockPath === lockPath ? { ...options, acquireTimeoutMs: 1 } : options)
       );
       try {
         const mutations = [
@@ -837,9 +927,10 @@ describe("MCP server disable filtering", () => {
           if (!result.success) expect(result.error).not.toBe("");
           expect(await fs.readFile(configPath, "utf-8")).toBe(raw);
         }
-        expect(acquireSpy).toHaveBeenCalledTimes(mutations.length);
-        for (const [options] of acquireSpy.mock.calls) {
-          expect(options).toMatchObject({ lockPath, acquireTimeoutMs: 60_000 });
+        const attempts = acquireSpy.mock.calls.filter(([options]) => options.lockPath === lockPath);
+        expect(attempts).toHaveLength(mutations.length);
+        for (const [options] of attempts) {
+          expect(options).toMatchObject({ acquireTimeoutMs: 60_000 });
         }
       } finally {
         acquireSpy.mockRestore();

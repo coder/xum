@@ -1,4 +1,3 @@
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { WorkspaceCompositionEntry } from "@/common/orpc/schemas/agentPlugins";
 import { isMultiProject } from "@/common/utils/multiProject";
 import { defaultConfig } from "@/node/config";
@@ -11,7 +10,6 @@ import {
   createAgentPluginsMcpProvider,
   resolveAgentPluginsMcpContext,
 } from "@/node/services/agentPlugins/mcpConfig";
-import { readPersistedExperimentEnabled } from "@/node/services/experimentsService";
 import { MCPConfigService } from "@/node/services/mcpConfigService";
 import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
 
@@ -31,9 +29,7 @@ function printEntries(label: string, entries: WorkspaceCompositionEntry[]): void
  * slash command/hook, its source (built-in | global | project | plugin:<name>),
  * and what shadowed what.
  *
- * Runs host-locally against the workspace checkout; plugin discovery and
- * manifest validation work regardless of the agent-plugins experiment, which
- * only gates whether plugin artifacts join the effective layers.
+ * Runs host-locally against the workspace checkout.
  *
  * Usage: bun run debug plugins <workspace-id>
  */
@@ -74,14 +70,10 @@ export async function pluginsCommand(workspaceId: string): Promise<void> {
       : null;
 
   const projectTrusted = isWorkspaceProjectTrusted(defaultConfig, metadata);
-  const agentPluginsEnabled = await readPersistedExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS, {
-    xumHome: defaultConfig.rootDir,
-  });
 
   const mcpConfigService = new MCPConfigService(defaultConfig, {
     agentPluginsMcpProvider: createAgentPluginsMcpProvider({
       xumHome: defaultConfig.rootDir,
-      isEnabled: () => agentPluginsEnabled,
     }),
   });
 
@@ -102,7 +94,6 @@ export async function pluginsCommand(workspaceId: string): Promise<void> {
     hostCheckoutRoot,
     xumHome: defaultConfig.rootDir,
     projectTrusted,
-    agentPluginsEnabled,
     listMcpServerLayers: () =>
       mcpConfigService.listServerLayers(metadata.projectPath, projectTrusted, {
         agentPlugins,
@@ -117,9 +108,6 @@ export async function pluginsCommand(workspaceId: string): Promise<void> {
     console.log(`host checkout (plugin containers): ${hostCheckoutRoot}`);
   }
   console.log(`project trusted: ${projectTrusted ? "yes" : "no"}`);
-  console.log(
-    `agent-plugins experiment: ${composition.agentPluginsEnabled ? "enabled" : "disabled (plugin artifacts are discovered but not loaded)"}`
-  );
   console.log();
 
   console.log(`Plugins (${composition.plugins.length}):`);

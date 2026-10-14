@@ -1,10 +1,13 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
 import { EventEmitter } from "node:events";
 import * as path from "node:path";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import assert from "@/common/utils/assert";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
+import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget";
+import { Ok } from "@/common/types/result";
+import { createAgentSessionHarness } from "./agentSession.testHarness";
 import { CompactionHandler } from "./compactionHandler";
 import { prepareMessagesForProvider } from "./messagePipeline";
 import { createTestHistoryService } from "./testHistoryService";
@@ -17,6 +20,7 @@ describe("continuous compaction provider replay", () => {
     store = await createTestHistoryService();
   });
   afterEach(async () => {
+    mock.restore();
     await store.cleanup();
   });
 
@@ -122,6 +126,97 @@ describe("continuous compaction provider replay", () => {
     assert(rows.success, "Expected committed boundary");
     expect(rows.data).toHaveLength(1);
     expect(rows.data[0].metadata?.compactionBoundary).toBe(true);
+  });
+
+  it("builds visible tail copies whose thinking Anthropic requests leave out", async () => {
+    // Preserved thinking: the rolling summary replaces the rows the tail's thinking
+    // was bound to, so the copies must not replay it. They keep the text for the UI.
+    const handler = new CompactionHandler({
+      workspaceId,
+      historyService: store.historyService,
+      sessionDir: path.join(store.tempDir, "pending"),
+      emitter: new EventEmitter(),
+    });
+    const prompt = createMuxMessage("recent-user", "user", "Verify the fix");
+    const answer = createMuxMessage("recent-answer", "assistant", "", {
+      stepStartPartIndices: [0, 2],
+    });
+    answer.parts = [
+      { type: "reasoning", text: "plan", providerOptions: { anthropic: { signature: "s1" } } },
+      {
+        type: "dynamic-tool",
+        toolCallId: "check",
+        toolName: "bash",
+        state: "output-available",
+        input: { script: "bun test", timeout_secs: 10 },
+        output: { success: true, output: "Tests passed" },
+      },
+      { type: "reasoning", text: "", providerOptions: { anthropic: { redactedData: "r1" } } },
+      { type: "reasoning", text: "legacy", signature: "legacy" },
+      {
+        type: "reasoning",
+        text: "gemini thought",
+        providerOptions: { google: { thoughtSignature: "g" } },
+      },
+      { type: "text", text: "Done" },
+    ];
+    const { boundary, copies } = handler.buildContinuousCompactionRows({
+      messages: [],
+      text: "Summary",
+      model: "anthropic:test-model",
+      tail: [prompt, answer],
+      systemMessageTokens: 0,
+      attachmentTokens: 0,
+    });
+    const answerCopy = copies[1];
+    expect(answerCopy.metadata?.uiVisible).toBe(true);
+    expect(answerCopy.parts.map((part) => part.type)).toEqual(
+      answer.parts.map((part) => part.type)
+    );
+    expect(answerCopy.metadata?.stepStartPartIndices).toEqual([0, 2]);
+    expect(answerCopy.parts[0]).toEqual({ type: "reasoning", text: "plan" });
+    expect(answerCopy.parts[4]).toMatchObject({
+      providerOptions: { google: { thoughtSignature: "g" } },
+    });
+    for (const part of answerCopy.parts) {
+      if (part.type !== "reasoning") continue;
+      expect(part.signature).toBeUndefined();
+      expect(part.providerOptions?.anthropic).toBeUndefined();
+    }
+
+    const toAnthropic = (rows: MuxMessage[]) =>
+      prepareMessagesForProvider({
+        messagesWithSentinel: rows.map((row, index) => ({
+          ...row,
+          metadata: { ...row.metadata, historySequence: index },
+        })),
+        effectiveAgentId: "exec",
+        toolNamesForSentinel: [],
+        providerForMessages: "anthropic",
+        effectiveThinkingLevel: "high",
+        modelString: "anthropic:test-model",
+        workspaceId,
+      });
+    // Replayable Anthropic thinking = a reasoning part with a signature or redacted data.
+    // Unsigned "..." placeholders for tool-use turns are not sent by the SDK.
+    const replayedThinking = (wire: Awaited<ReturnType<typeof toAnthropic>>) =>
+      wire.flatMap((message) =>
+        message.role === "assistant" && typeof message.content !== "string"
+          ? message.content.filter(
+              (part) =>
+                part.type === "reasoning" &&
+                (part.providerOptions?.anthropic != null || part.text !== "...")
+            )
+          : []
+      );
+    // Control: the original rows replay their signed and redacted blocks.
+    expect(replayedThinking(await toAnthropic([prompt, answer])).length).toBeGreaterThan(0);
+    const wire = await toAnthropic([boundary, ...copies]);
+    expect(replayedThinking(wire)).toEqual([]);
+    const assistantParts = wire.flatMap((message) =>
+      message.role === "assistant" && typeof message.content !== "string" ? message.content : []
+    );
+    expect(assistantParts.some((part) => part.type === "tool-call")).toBe(true);
   });
 
   for (const provider of ["anthropic", "openai"]) {
@@ -246,4 +341,64 @@ describe("continuous compaction provider replay", () => {
       ]);
     });
   }
+
+  // #4551: a runaway summary must not push the boundary past the history line limit, where
+  // startup recovery (which reads the epoch when tail copies trail the boundary) cannot find it.
+  it("bounds a runaway summary so a pending follow-up survives restart behind tail copies", async () => {
+    const olderBoundary = createMuxMessage("older-boundary", "assistant", "Older summary", {
+      compacted: "user",
+      compactionBoundary: true,
+      compactionEpoch: 1,
+    });
+    const prompt = createMuxMessage("recent-user", "user", "Keep going");
+    const answer = createMuxMessage("recent-answer", "assistant", "Working on it");
+    for (const message of [olderBoundary, prompt, answer]) {
+      expect((await store.historyService.appendToHistory(workspaceId, message)).success).toBe(true);
+    }
+    const before = await store.historyService.getHistoryFromLatestBoundary(workspaceId);
+    assert(before.success, "Expected readable seeded history");
+    const handler = new CompactionHandler({
+      workspaceId,
+      historyService: store.historyService,
+      sessionDir: path.join(store.tempDir, "pending"),
+      emitter: new EventEmitter(),
+    });
+    const followUp = { text: "follow up after restart", model: "openai:gpt-4o", agentId: "exec" };
+    expect(
+      await handler.persistContinuousCompaction({
+        preparation: handler.beginPreparation(() => true),
+        publication: {
+          generation: await store.historyService
+            .getContinuousCompactionJournal(workspaceId)
+            .captureGeneration(),
+        },
+        attachmentMessages: before.data,
+        shouldPersist: () => true,
+        messages: before.data,
+        text: "s".repeat(SESSION_HISTORY_MAX_LINE_BYTES + 64 * 1024),
+        model: "anthropic:test-model",
+        tail: [prompt, answer],
+        systemMessageTokens: 0,
+        attachmentTokens: 0,
+        pendingFollowUp: followUp,
+      })
+    ).toBe(true);
+
+    const { session } = await createAgentSessionHarness({
+      workspaceId,
+      config: store.config,
+      historyService: store.historyService,
+    });
+    try {
+      const dispatched: string[] = [];
+      spyOn(session, "sendMessage").mockImplementation((message: string) => {
+        dispatched.push(message);
+        return Promise.resolve(Ok(undefined));
+      });
+      await session.runStartupRecovery();
+      expect(dispatched).toEqual([followUp.text]);
+    } finally {
+      await session.dispose();
+    }
+  });
 });

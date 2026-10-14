@@ -33,6 +33,12 @@ jobs:
       backend: ${{ steps.filter.outputs.backend }}
       browser: ${{ steps.filter.outputs.browser }}
       nix_deps: ${{ steps.filter.outputs.nix_deps }}
+      docker: ${{ steps.filter.outputs.docker }}
+      # Shared job gates, computed once instead of repeated in every job.
+      # tests: code or CI config changed, and this isn't the merge queue's post-merge
+      # push to main (the merge_group run already validated that exact commit).
+      tests: ${{ (steps.filter.outputs.src == 'true' || steps.filter.outputs.config == 'true') && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
+      linux-runner: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -52,6 +58,16 @@ jobs:
               - 'src/common/**'
               - 'tests/ipc/**'
               - 'tests/runtime/**'
+              # Shared Jest harness (setup.ts, testUtils.ts, __mocks__, fixtures), root-level
+              # suites (workerBudget.test.ts), tests/run, and Jest's own config: the
+              # integration job below runs Jest only when this filter (or browser) matches.
+              - 'tests/*'
+              - 'tests/__mocks__/**'
+              - 'tests/fixtures/**'
+              - 'tests/run/**'
+              - 'jest.config.js'
+              - 'babel.config.cjs'
+              - 'scripts/lib/worker_budget.js'
             browser:
               - 'src/browser/**'
               - 'tests/ui/**'
@@ -59,7 +75,8 @@ jobs:
               - '.github/**'
               - 'scripts/**'
               - 'packages/mux-compat/**'
-              - 'jest.config.cjs'
+              - 'jest.config.js'
+              - 'bunfig.toml'
               - 'babel.config.cjs'
               - 'package.json'
               - 'bun.lock'
@@ -67,16 +84,53 @@ jobs:
               - 'vite*.ts'
               - 'Makefile'
               - 'electron-builder.yml'
+              # Pixel's default matrix and the Storybook config decide which snapshots exist,
+              # so the snapshot-budget step (Test / Storybook) must run when they change.
+              - 'pixel.jsonc'
+              - '.storybook/**'
             nix_deps:
               - 'package.json'
               - 'bun.lock'
+              - 'patches/**'
               - 'flake.nix'
+              - 'nix/**'
               - 'flake.lock'
+            # Server image inputs: everything the Dockerfile copies into the build stage
+            # (keep in sync with its COPY list), plus this workflow. Smoke / Docker runs on
+            # PRs that touch them (#5605), not only in the merge queue.
+            docker:
+              - 'Dockerfile'
+              - '.dockerignore'
+              - 'package.json'
+              - 'bun.lock'
+              - 'bunfig.toml'
+              - 'patches/**'
+              - 'Makefile'
+              - 'fmt.mk'
+              - 'src/**'
+              - 'tsconfig.json'
+              - 'tsconfig.main.json'
+              - 'scripts/generate-version.sh'
+              - 'scripts/generate-builtin-agents.sh'
+              - 'scripts/generate-builtin-skills.sh'
+              - 'scripts/gen_builtin_skills.ts'
+              - 'scripts/gen_workflow_runtime_sources.ts'
+              - 'scripts/precompress-static.ts'
+              - 'scripts/check-analytics-worker.cjs'
+              - 'docs/**'
+              - 'index.html'
+              - 'terminal.html'
+              - 'desktop.html'
+              - 'vite.config.ts'
+              - 'public/**'
+              - 'static/**'
+              - '.github/workflows/pr.yml'
 
   static-check:
     name: Static Checks
+    needs: [changes]
     if: github.event_name != 'push' || github.actor != 'github-merge-queue[bot]'
-    runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
+    runs-on: ${{ needs.changes.outputs.linux-runner }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -137,8 +191,8 @@ jobs:
         env:
           MUX_ESLINT_CONCURRENCY: 4
 
-  flake-hash-check:
-    name: Flake Hash Check
+  nix-build:
+    name: Nix Build
     needs: [changes]
     if: ${{ needs.changes.outputs.nix_deps == 'true' && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
     runs-on: ubuntu-latest
@@ -151,7 +205,7 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-      - run: make flake-hash-check
+      - run: nix build .#xum --no-link -L
 
   lint-actions:
     name: Lint Actions
@@ -167,13 +221,18 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   test-unit:
-    name: Test / Unit
+    name: Test / Unit (${{ matrix.shard }}/${{ strategy.job-total }})
     needs: [changes]
-    if: ${{ (needs.changes.outputs.src == 'true' || needs.changes.outputs.config == 'true') && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
+    if: needs.changes.outputs.tests == 'true'
     # Bound hung runs while allowing setup, build, coverage, and cleanup to finish.
-    # Healthy unit jobs can exceed the previous wall-clock budget.
     timeout-minutes: 20
-    runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
+    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The single-process suite was the pipeline's critical path; see scripts/test-unit-ci.sh.
+        # A manual test_filter runs unsharded.
+        shard: ${{ fromJSON(github.event.inputs.test_filter != '' && '[1]' || '[1, 2, 3, 4, 5, 6]') }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -182,102 +241,42 @@ jobs:
       - run: make build-main
       # workflow_dispatch inputs are only triggerable by repo members, so direct
       # interpolation is acceptable and preserves shell quoting in the filter.
-      - run: | # zizmor: ignore[template-injection]
-          set -euo pipefail
-
-          if [[ -n "${{ github.event.inputs.test_filter }}" ]]; then
-            bun test --max-concurrency=1 --coverage --coverage-reporter=lcov ${{ github.event.inputs.test_filter }}
-            exit 0
-          fi
-
-
-          isolated_unit_tests=(
-            # QuickJS-heavy tests can crash or lose runtime callbacks under Bun coverage
-            # when sharing the monolithic process; keep them in fresh isolated processes.
-            src/node/services/workflows/WorkflowRunner.test.ts
-            src/node/services/ptc/quickjsRuntime.test.ts
-            src/node/services/tools/code_execution.test.ts
-            # This suite also creates QuickJS runtimes. Shared coverage can trap during startup.
-            src/node/services/tools/code_execution.integration.test.ts
-            src/node/services/sandbox/sandboxHostService.test.ts
-            src/node/services/agentPlugins/hookService.test.ts
-            src/node/orpc/router.test.ts
-            src/browser/components/WorkspaceHeartbeatModal/WorkspaceHeartbeatModal.test.tsx
-            src/browser/features/Messages/InlineSkillMarkdown.test.tsx
-            src/browser/hooks/useChatTranscriptFullWidth.test.tsx
-            src/browser/utils/commands/sources.test.ts
-            # In the shared monolithic process on CI runners this file can enter an
-            # infinite 'Maximum update depth exceeded' render loop (timing/coverage
-            # sensitive; also seen on main and sibling branches) that spews ~1GB of
-            # warnings until the 15-minute job timeout. Passes reliably in isolation
-            # and could not be reproduced locally even with the exact CI file order,
-            # bun version, and coverage flags.
-            src/browser/components/CommandPalette/CommandPalette.prompt.test.tsx
-            # Its tooltip test asserts Radix portal content, and Radix tooltip module
-            # state binds to the first document that mounted a TooltipProvider in the
-            # process — any earlier test file rendering a tooltip (raw happy-dom swap
-            # or installDom alike) makes the portal land in a stale document. Verified
-            # order-dependent on origin/main; only reliable in its own process.
-            src/browser/features/RightSidebar/Memory/MemoryTab.test.tsx
-            # Its "last prompt" popup tests fail when any earlier test file in the
-            # shared process evaluated UI modules without a DOM installed (Radix's
-            # use-layout-effect binds to `globalThis.document` at module eval, so a
-            # DOM-less first import caches the broken no-op mode process-wide).
-            # Verified order-dependent on origin/main via a two-file repro; only
-            # reliable in its own process. Took the merge queue down on 2026-08-29
-            # when runner file enumeration order changed.
-            src/browser/components/ChatPane/WorkspaceFooterBar.test.tsx
-            # Post-login catalog refreshes can outlive their test and hit a later global fetch mock,
-            # making catalog-call assertions order-dependent in the shared process.
-            src/node/services/coderOauthService.test.ts
-          )
-          # One process per file rather than one shared isolated process. Sharing it still
-          # segfaults Bun on the runner (exit 132, "Bun has crashed", zero failing assertions)
-          # while leaving the file transition as the only suspect, and these files are already
-          # here because they do not survive sharing a process.
-          # Bun can also crash at teardown after every test passed (e.g. exit 132).
-          # Retry only signal exits (>= 128); genuine test failures exit 1.
-          for isolated_unit_test in "${isolated_unit_tests[@]}"; do
-            for attempt in 1 2 3; do
-              exit_code=0
-              bun test --max-concurrency=1 "$isolated_unit_test" || exit_code=$?
-              if [[ "$exit_code" -eq 0 ]]; then
-                break
-              fi
-              if [[ "$exit_code" -lt 128 || "$attempt" -eq 3 ]]; then
-                exit "$exit_code"
-              fi
-              echo "bun crashed (exit $exit_code) on $isolated_unit_test, retrying (attempt $attempt of 3)..."
-            done
-          done
-
-          # Derive the exclusions from isolated_unit_tests so the two lists cannot
-          # drift. A hand-maintained duplicate list previously desynced: the QuickJS-heavy
-          # sandboxHostService.test.ts ran a second time inside this shared coverage
-          # process and segfaulted Bun mid-suite (merge-queue runs 32666269009 and
-          # 32667158072), kicking a fully green PR out of the queue.
-          find_excludes=()
-          for isolated_unit_test in "${isolated_unit_tests[@]}"; do
-            find_excludes+=(! -path "$isolated_unit_test")
-          done
-
-          mapfile -d '' unit_files < <(
-            find src -type f \( -name '*.test.ts' -o -name '*.test.tsx' \) \
-              "${find_excludes[@]}" \
-              -print0
-          )
-          bun test --max-concurrency=1 --coverage --coverage-reporter=lcov "${unit_files[@]}"
+      - if: github.event.inputs.test_filter != ''
+        run: bun test --max-concurrency=1 --coverage --coverage-reporter=lcov ${{ github.event.inputs.test_filter }} # zizmor: ignore[template-injection]
+      - if: github.event.inputs.test_filter == ''
+        run: make test-unit-ci
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+          SHARD_TOTAL: ${{ strategy.job-total }}
+      # A shard writes one report per process: coverage/lcov.info for the shared
+      # process, plus coverage/isolated/<n>/ and coverage/tooling/ (see
+      # scripts/test-unit-ci.sh). Upload them all.
+      - name: List coverage reports
+        id: lcov
+        run: echo "files=$(find coverage -name lcov.info 2>/dev/null | LC_ALL=C sort | paste -sd, -)" >>"$GITHUB_OUTPUT"
+      # Quality / CRAP merges every shard's report; keep them only briefly. A
+      # failed shard's report is incomplete, so it uploads none and the summary
+      # shows partial coverage. Informational: an upload error must not fail
+      # this required job.
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        if: ${{ success() && github.event_name == 'pull_request' }}
+        continue-on-error: true
+        with:
+          name: crap-lcov-unit-${{ matrix.shard }}
+          path: coverage/**/lcov.info
+          if-no-files-found: ignore
+          retention-days: 3
       - uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de # v5.5.2
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./coverage/lcov.info
+          files: ${{ steps.lcov.outputs.files }}
           flags: unit-tests
           fail_ci_if_error: false
 
   test-integration:
-    name: Test / Integration
+    name: Test / Integration (${{ matrix.shard }}/${{ strategy.job-total }})
     needs: [changes]
-    if: ${{ (needs.changes.outputs.src == 'true' || needs.changes.outputs.config == 'true') && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
+    if: needs.changes.outputs.tests == 'true'
     # Healthy runs finish in ~4-5 min, but jest's integration testTimeout is 10 minutes,
     # so a single hung test used to collide with a 10-minute job cap: the runner killed
     # the job ("exceeded the maximum execution time of 10m0s") and destroyed all logs,
@@ -285,7 +284,12 @@ jobs:
     # 32639270365, 32640298486). 20 minutes lets jest fail the hung test with real
     # diagnostics and still bounds a wedged runner.
     timeout-minutes: 20
-    runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
+    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # jest --shard splits suites across runners; ~7.5 min in one job was on the critical path.
+        shard: ${{ fromJSON(github.event.inputs.test_filter != '' && '[1]' || '[1, 2, 3]') }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -310,7 +314,7 @@ jobs:
 
           # Manual override (workflow_dispatch input)
           if [[ -n "${{ github.event.inputs.test_filter }}" ]]; then
-            TEST_INTEGRATION=1 bun x jest --coverage --silent ${{ github.event.inputs.test_filter }}
+            TEST_INTEGRATION=1 bun x jest --coverage --silent --shard="$SHARD" ${{ github.event.inputs.test_filter }}
             exit 0
           fi
 
@@ -323,11 +327,11 @@ jobs:
           # Backend changed: run ALL integration tests (includes tests/ui)
           if [[ "$BACKEND" == "true" ]]; then
             echo "Backend changes detected - running all integration tests"
-            TEST_INTEGRATION=1 bun x jest --coverage --silent tests/
+            TEST_INTEGRATION=1 bun x jest --coverage --silent --shard="$SHARD" tests/
           else
             # Browser-only changes: run tests/ui
             echo "Browser changes detected - running tests/ui"
-            TEST_INTEGRATION=1 bun x jest --coverage --silent tests/ui/
+            TEST_INTEGRATION=1 bun x jest --coverage --silent --shard="$SHARD" tests/ui/
           fi
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -335,6 +339,19 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           BACKEND: ${{ needs.changes.outputs.backend }}
           BROWSER: ${{ needs.changes.outputs.browser }}
+          SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
+      # Quality / CRAP merges every shard's report; keep them only briefly. A
+      # failed shard's report is incomplete, so it uploads none and the summary
+      # shows partial coverage. Informational: an upload error must not fail
+      # this required job.
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        if: ${{ success() && github.event_name == 'pull_request' }}
+        continue-on-error: true
+        with:
+          name: crap-lcov-integration-${{ matrix.shard }}
+          path: coverage/lcov.info
+          if-no-files-found: ignore
+          retention-days: 3
       - uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de # v5.5.2
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -342,11 +359,60 @@ jobs:
           flags: integration-tests
           fail_ci_if_error: false
 
+  crap:
+    name: Quality / CRAP
+    # Informational: not in Required, and scripts/crap/ci.ts always exits 0. A
+    # skipped or failed test shard leaves no report, which the summary shows as
+    # partial coverage.
+    needs: [changes, test-unit, test-integration]
+    if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+    continue-on-error: true
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      # Compare against the merge commit's first parent: the base GitHub built
+      # the merge ref on. pull_request.base.sha can differ (a stacked PR's base
+      # branch merges into its own test ref, main moves), and then the report
+      # scores other PRs' changes. Read the parent from the raw commit object
+      # and fetch only it, so no PR commit enters the history: check.ts then
+      # reads no Crap-Debt trailers here, and in CI the crap-debt label is the
+      # escape hatch (trailers are for the local hook).
+      - name: Fetch the merge base
+        id: base
+        run: |
+          set -euo pipefail
+          sha=$(git cat-file -p HEAD | sed -n 's/^parent //p' | head -n 1)
+          git fetch --no-tags --depth=1 origin "$sha"
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+      - uses: oven-sh/setup-bun@b7a1c7ccf290d58743029c4f6903da283811b979 # v2.1.0
+        with:
+          bun-version: 1.4.3
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          pattern: crap-lcov-*
+          path: coverage-shards
+      - name: CRAP report
+        env:
+          BASE_REF: ${{ steps.base.outputs.sha }}
+          LCOV_DIR: coverage-shards
+          # Shard counts of the test-unit and test-integration matrices above.
+          EXPECTED_UNIT: "6"
+          EXPECTED_INTEGRATION: "3"
+          CRAP_DEBT_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'crap-debt') }}
+        run: bun scripts/crap/ci.ts
+
   test-storybook:
     name: Test / Storybook
     needs: [changes]
-    if: ${{ (needs.changes.outputs.src == 'true' || needs.changes.outputs.config == 'true') && github.event.inputs.test_filter == '' && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
-    runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
+    if: needs.changes.outputs.tests == 'true' && github.event.inputs.test_filter == ''
+    runs-on: ${{ needs.changes.outputs.linux-runner }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -367,21 +433,27 @@ jobs:
           done
           # Fail the step if Storybook never became reachable.
           curl -sf http://127.0.0.1:6006 >/dev/null
+      # Separate step so a budget overrun is not mixed up with interaction-test failures.
+      - run: make storybook-budget
       - run: make test-storybook
 
   test-e2e:
-    name: Test / E2E (${{ matrix.os }})
+    # Renders "linux 1/4" for shards and plain "macos" for the unsharded entry.
+    name: Test / E2E (${{ matrix.os }}${{ matrix.shard && format(' {0}', matrix.shard) || '' }})
     needs: [changes]
-    if: ${{ (needs.changes.outputs.src == 'true' || needs.changes.outputs.config == 'true') && github.event.inputs.test_filter == '' && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
+    if: needs.changes.outputs.tests == 'true' && github.event.inputs.test_filter == ''
     strategy:
       fail-fast: false
       matrix:
+        # Linux runs the full suite with one worker (shared display focus/clipboard), which
+        # took ~9 min serially; Playwright --shard spreads spec files across runners instead.
         include:
-          - os: linux
-            runner: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
-          - os: macos
-            runner: macos-latest
-    runs-on: ${{ matrix.runner }}
+          - { os: linux, shard: 1/4 }
+          - { os: linux, shard: 2/4 }
+          - { os: linux, shard: 3/4 }
+          - { os: linux, shard: 4/4 }
+          - { os: macos }
+    runs-on: ${{ matrix.os == 'macos' && 'macos-latest' || needs.changes.outputs.linux-runner }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -400,22 +472,72 @@ jobs:
       # Bound browser setup; Playwright downloads can stall after progress reaches 100%.
       - uses: ./.github/actions/setup-playwright
         timeout-minutes: 10
+      # The bug-bash repros (make test-bugbash-repros) run once, on linux shard 1. Their browser
+      # comes from @e2e-dev/web's own playwright-core, not the Playwright version above.
+      - name: Install bug-bash repro browser
+        if: matrix.shard == '1/4'
+        timeout-minutes: 10
+        run: node_modules/.bin/e2e-web install chromium
       - name: Run tests
         if: matrix.os == 'linux'
         # Native focus and clipboard are shared by every Electron app on this display.
-        run: xvfb-run -a make test-e2e PLAYWRIGHT_ARGS="--workers=1"
+        run: xvfb-run -a make test-e2e PLAYWRIGHT_ARGS="--workers=1 --shard=$SHARD"
         env:
           ELECTRON_DISABLE_SANDBOX: 1
+          SHARD: ${{ matrix.shard }}
+          # No provider secrets here, so the repros' app uses the mock AI.
+          BUGBASH_REPROS: ${{ matrix.shard == '1/4' && '1' || '0' }}
       - name: Run tests
         if: matrix.os == 'macos'
         env:
           NODE_OPTIONS: --max-old-space-size=4096
+          BUGBASH_REPROS: "0"
         run: make test-e2e PLAYWRIGHT_ARGS="tests/e2e/scenarios/windowLifecycle.spec.ts"
+      # A failed bug-bash repro writes its trace page, screen (accessibility tree, focus) and
+      # failure screenshot under tests/bugbash/.e2e/<phase>/results/<test>/ (e2e 0.20+), next to
+      # the report. On the host the app log goes to e2e.config.ts's default, .e2e/logs/app.log.
+      # Upload them, so a flaky failure (#5810) leaves evidence.
+      - name: Upload bug-bash repro failures
+        if: failure() && matrix.shard == '1/4'
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: bugbash-repro-failures
+          path: |
+            tests/bugbash/.e2e/repros*/results/*/trace.md
+            tests/bugbash/.e2e/repros*/results/**/screen-at-failure.txt
+            tests/bugbash/.e2e/repros*/results/**/screenshots/*-failure.png
+            tests/bugbash/.e2e/repros*/report.json
+            tests/bugbash/.e2e/logs/app.log
+          # Every path is under the hidden .e2e folder, which upload-artifact skips by default.
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 14
+
+  bugbash-sandbox:
+    # The bug-bash sandbox (#5714, #5931): its self-check (isolation, proxy and export refusals,
+    # against a fake upstream) and the repros of fixed bugs through its launcher, on the mock app
+    # AI. No secrets and no model. The launcher pulls the pinned image by digest without
+    # credentials, and exits nonzero on a refusal, a failed check or a container left `unknown`.
+    # E2E shard 1 still runs the same repros on the host until this job proves stable.
+    name: Test / Bug-bash sandbox
+    needs: [changes]
+    if: needs.changes.outputs.tests == 'true' && github.event.inputs.test_filter == ''
+    timeout-minutes: 30
+    runs-on: ${{ needs.changes.outputs.linux-runner }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-xum
+      - name: Sandbox self-check
+        run: make bug-bash-sandbox-check
+      - name: Repros in the sandbox
+        run: make test-bugbash-repros-sandbox
 
   test-windows:
     name: Test / Windows
     needs: [changes]
-    if: ${{ (needs.changes.outputs.src == 'true' || needs.changes.outputs.config == 'true') && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
+    if: needs.changes.outputs.tests == 'true'
     timeout-minutes: 15
     runs-on: windows-latest
     steps:
@@ -434,10 +556,13 @@ jobs:
       - name: Run unit tests (Windows smoke)
         shell: pwsh
         run: |
-          bun test src/node/utils/paths.test.ts src/node/utils/main/bashPath.test.ts src/node/utils/main/resolveLocalPtyShell.test.ts src/node/runtime/SSH2ConnectionPool.test.ts
+          bun test src/node/utils/paths.test.ts src/node/utils/findExecutableOnPath.test.ts src/node/utils/gitNoHooksEnv.discovery.test.ts src/node/utils/main/bashPath.test.ts src/node/utils/main/resolveLocalPtyShell.test.ts src/node/runtime/SSH2ConnectionPool.test.ts src/node/services/historyService.statusLock.test.ts
       - name: Verify Windows plugin path aliases
         shell: pwsh
         run: bun test src/node/services/agentPlugins/discovery.test.ts -t "coalesces Windows case aliases"
+      - name: Verify Windows namespaced filesystem roots
+        shell: pwsh
+        run: bun test src/node/utils/pathUtils.test.ts -t "refuses Windows namespaced roots"
       - name: Run Windows integration smoke tests
         shell: pwsh
         run: |
@@ -454,8 +579,8 @@ jobs:
   smoke-server:
     name: Smoke / Server
     needs: [changes]
-    if: ${{ (needs.changes.outputs.src == 'true' || needs.changes.outputs.config == 'true') && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
-    runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
+    if: needs.changes.outputs.tests == 'true'
+    runs-on: ${{ needs.changes.outputs.linux-runner }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -464,6 +589,7 @@ jobs:
       - uses: ./.github/actions/setup-xum
       - run: ./scripts/generate-npm-shrinkwrap.sh
       - run: make build
+      - run: make check-startup-imports-runtime
       - name: Pack npm package
         id: pack
         run: echo "tarball=$(./scripts/pack-npm-package.sh)" >> "$GITHUB_OUTPUT"
@@ -487,9 +613,14 @@ jobs:
 
   smoke-docker:
     name: Smoke / Docker
-    # Only run on merge queue (not every PR, not on merge-queue push to main)
-    if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.actor != 'github-merge-queue[bot]')
-    runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
+    needs: [changes]
+    # Merge queue, non-queue pushes to main, and PRs that touch server image inputs
+    # (changes.docker). Not on every PR, and not on the merge queue's push to main.
+    if: >-
+      github.event_name == 'merge_group' ||
+      (github.event_name == 'push' && github.actor != 'github-merge-queue[bot]') ||
+      (github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true')
+    runs-on: ${{ needs.changes.outputs.linux-runner }}
     permissions:
       contents: read
       id-token: write # Depot OIDC authentication
@@ -521,6 +652,17 @@ jobs:
           done
           curl -sf http://localhost:3000/health | grep -q '"status":"ok"'
           curl -sf http://localhost:3000/version | grep -q '"mode":"server"'
+          # The runtime stage copies dist/ files by extension (#5964). Fetch one
+          # public/ file, one icon and the font the served page preloads, so a dropped
+          # pattern fails here.
+          curl -sf http://localhost:3000/manifest.json | grep -q '"icons"'
+          curl -sf -o /dev/null http://localhost:3000/icon-192.png
+          font=$(curl -sf http://localhost:3000/ | grep -o 'as="font"[^>]*href="\./[^"]*\.woff2"' | sed 's/.*href="\.\///; s/"$//')
+          test -n "$font"
+          curl -sf -o /dev/null "http://localhost:3000/$font"
+          # /health passes without the analytics worker, which starts lazily (#5603).
+          # Start the shipped worker bundle and open a DuckDB database through it.
+          docker exec -i mux-test node - /app/dist/runtime/analyticsWorker.js < scripts/check-analytics-worker.cjs
       - if: failure()
         run: docker logs mux-test
       - if: always()
@@ -529,8 +671,8 @@ jobs:
   build-linux:
     name: Build / Linux
     needs: [changes]
-    if: ${{ (needs.changes.outputs.src == 'true' || needs.changes.outputs.config == 'true') && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
-    runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
+    if: needs.changes.outputs.tests == 'true'
+    runs-on: ${{ needs.changes.outputs.linux-runner }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -547,12 +689,21 @@ jobs:
           archive: false
 
   build-macos:
-    name: Build / macOS
+    # One runner per arch: both arches packaging in parallel on one 3-core runner was a
+    # ~11 min critical-path job.
+    name: Build / macOS (${{ matrix.arch }})
     needs: [changes]
     if: ${{ needs.changes.outputs.src == 'true' || needs.changes.outputs.config == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
     runs-on: macos-15
     env:
       NODE_OPTIONS: --max-old-space-size=4096
+      ARCH: ${{ matrix.arch }}
+      # PRs only need the DMG they upload; merge-queue and main runs keep the full target list.
+      MAC_TARGETS: ${{ github.event_name == 'pull_request' && 'dmg' || '' }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -568,22 +719,15 @@ jobs:
           AC_APIKEY_P8_BASE64: ${{ secrets.AC_APIKEY_P8_BASE64 }}
           AC_APIKEY_ID: ${{ secrets.AC_APIKEY_ID }}
           AC_APIKEY_ISSUER_ID: ${{ secrets.AC_APIKEY_ISSUER_ID }}
-      - name: Build macOS distributables
+      - name: Build macOS distributable
         # Retry for transient Apple timestamp-server failures during code signing.
-        run: ./scripts/retry.sh 3 30 make dist-mac
+        run: ./scripts/retry.sh 3 30 make "dist-mac-$ARCH"
       - name: Smoke test packaged macOS attach_file runtime
-        run: make check-mac-attach-file-runtime
-      - name: Upload x64 artifact
+        run: make check-mac-attach-file-runtime MAC_ARCH="$ARCH"
+      - name: Upload artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          path: release/*-x64-mac.dmg
-          retention-days: 30
-          if-no-files-found: error
-          archive: false
-      - name: Upload arm64 artifact
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        with:
-          path: release/*-arm64-mac.dmg
+          path: release/*-${{ matrix.arch }}-mac.dmg
           retention-days: 30
           if-no-files-found: error
           archive: false
@@ -643,8 +787,8 @@ jobs:
   build-vscode:
     name: Build / VS Code
     needs: [changes]
-    if: ${{ (needs.changes.outputs.src == 'true' || needs.changes.outputs.config == 'true') && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
-    runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
+    if: needs.changes.outputs.tests == 'true'
+    runs-on: ${{ needs.changes.outputs.linux-runner }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -661,19 +805,21 @@ jobs:
 
   codex-comments:
     name: Codex Comments
+    needs: [changes]
     if: github.event_name == 'pull_request'
-    runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
+    runs-on: ${{ needs.changes.outputs.linux-runner }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
           persist-credentials: false
       - name: Test PR readiness gates
-        run: make test-codex-comments test-pr-checks
+        run: make test-codex-comments test-pr-checks test-required-superseded
       - env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         # Codex starts reviewing the same push that started this job, so give it
         # time to finish. Reviews take a few minutes; the slowest test jobs take longer.
+        # Usage-limit notices pass; actionable findings still fail the gate.
         run: ./scripts/check_codex_comments.sh ${{ github.event.pull_request.number }} --wait-for-review 900
 
   # Single required check - configure branch protection to require only this job
@@ -683,13 +829,14 @@ jobs:
     needs:
       - changes
       - static-check
-      - flake-hash-check
+      - nix-build
       - lint-actions
       - test-unit
       - test-integration
       - test-storybook
       - test-windows
       - test-e2e
+      - bugbash-sandbox
       - smoke-server
       - smoke-docker
       - build-linux
@@ -698,11 +845,47 @@ jobs:
       - build-vscode
       - codex-comments
     runs-on: ubuntu-latest
+    # superseded: read this workflow's runs/jobs and check out the decision script.
+    permissions:
+      actions: read
+      contents: read
     steps:
-      - run: |
-          results="${{ join(needs.*.result, ' ') }}"
-          echo "Job results: $results"
-          for result in $results; do
+      # A cancelled duplicate run must not leave a red Required when another run for
+      # this PR will publish one (#4547). The script stands down only with proof and
+      # fails closed otherwise; see its header for the rules.
+      - if: >-
+          github.event_name == 'pull_request' &&
+          contains(join(needs.*.result, ' '), 'cancelled') &&
+          !contains(join(needs.*.result, ' '), 'failure')
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/lib/required_superseded.sh
+          sparse-checkout-cone-mode: false
+      - id: superseded
+        if: >-
+          github.event_name == 'pull_request' &&
+          contains(join(needs.*.result, ' '), 'cancelled') &&
+          !contains(join(needs.*.result, ' '), 'failure')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if ./scripts/lib/required_superseded.sh; then
+            echo "value=true" >>"$GITHUB_OUTPUT"
+          fi
+      - env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+          SUPERSEDED: ${{ steps.superseded.outputs.value }}
+        run: |
+          echo "Job results: $RESULTS"
+          if [[ "$SUPERSEDED" == "true" ]]; then
+            echo "⏭️ Superseded; a newer run for this commit reports Required"
+            exit 0
+          fi
+          for result in $RESULTS; do
             if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
               echo "❌ CI failed"
               exit 1

@@ -1,5 +1,11 @@
-import { appMeta, AppWithMocks, type AppStory } from "@/browser/stories/meta.js";
-import { waitFor, within, userEvent } from "@storybook/test";
+import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "@/browser/stories/meta.js";
+import { expect, waitFor, within, userEvent } from "@storybook/test";
+import {
+  getSettingsDialog,
+  openSettingsDialog,
+  waitForChatInputAutofocusDone,
+} from "@/browser/stories/storyPlayHelpers.js";
+import type { LayoutPresetsConfig } from "@/common/types/uiLayouts";
 import { setupSettingsStory } from "./Sections/settingsStoryUtils.js";
 
 export default {
@@ -10,6 +16,7 @@ export default {
 const BASE_SECTION_LABELS = [
   "General",
   "Agents",
+  "Heartbeats",
   "Providers",
   "Models",
   "MCP",
@@ -24,11 +31,11 @@ const BASE_SECTION_LABELS = [
 ] as const;
 
 type BaseSectionLabel = (typeof BASE_SECTION_LABELS)[number];
-type SectionNavLabel = BaseSectionLabel;
 
 const SECTION_CONTENT_MATCHERS: Record<BaseSectionLabel, RegExp> = {
   General: /Theme/i,
   Agents: /Max Parallel Agent Tasks/i,
+  Heartbeats: /Default interval/i,
   Providers: /Configure API keys and endpoints for AI providers|API Key/i,
   Models: /Custom Models|Built-in Models/i,
   MCP: /MCP Servers/i,
@@ -42,41 +49,37 @@ const SECTION_CONTENT_MATCHERS: Record<BaseSectionLabel, RegExp> = {
   Backup: /Settings backup/i,
 };
 
-async function openSettings(canvasElement: HTMLElement): Promise<void> {
+async function openSettings(canvasElement: HTMLElement): Promise<HTMLElement> {
   const canvas = within(canvasElement);
-
-  const settingsButton = await canvas.findByTestId("settings-button", {}, { timeout: 10000 });
-  await userEvent.click(settingsButton);
+  // Phone renders start with the left sidebar (and its settings button) collapsed.
+  await waitFor(() =>
+    expect(
+      canvas.queryByTestId("settings-button") ??
+        canvas.queryByRole("button", { name: "Open sidebar menu" })
+    ).not.toBeNull()
+  );
+  if (!canvas.queryByTestId("settings-button")) {
+    await userEvent.click(canvas.getByRole("button", { name: "Open sidebar menu" }));
+  }
+  return openSettingsDialog(canvasElement);
 }
 
-async function clickSectionButton(
-  canvasElement: HTMLElement,
-  sectionLabel: SectionNavLabel
-): Promise<void> {
-  const canvas = within(canvasElement);
-
-  // Desktop + mobile settings nav buttons can both exist in the test DOM.
-  const sectionButtons = await canvas.findAllByRole("button", {
-    name: new RegExp(`^${sectionLabel}$`, "i"),
-  });
-  const sectionButton = sectionButtons[0];
-  if (!sectionButton) {
-    throw new Error(`Settings section button not found for ${sectionLabel}`);
-  }
-
-  await userEvent.click(sectionButton);
+async function clickSectionButton(dialog: HTMLElement, sectionLabel: string): Promise<void> {
+  await userEvent.click(
+    await within(dialog).findByRole("button", { name: new RegExp(`^${sectionLabel}$`, "i") })
+  );
 }
 
 async function assertSectionBodyRendered(
-  canvasElement: HTMLElement,
+  dialog: HTMLElement,
   sectionLabel: BaseSectionLabel
 ): Promise<void> {
-  const canvas = within(canvasElement);
+  const settings = within(dialog);
   const sectionContentMatcher = SECTION_CONTENT_MATCHERS[sectionLabel];
 
   await waitFor(
     () => {
-      if (canvas.queryAllByText(sectionContentMatcher).length === 0) {
+      if (settings.queryAllByText(sectionContentMatcher).length === 0) {
         throw new Error(`Expected ${sectionLabel} section content to render.`);
       }
     },
@@ -84,14 +87,210 @@ async function assertSectionBodyRendered(
   );
 }
 
+async function waitForSettingsClosed(): Promise<void> {
+  await waitFor(() =>
+    expect(within(document.body).queryByRole("dialog", { name: "Settings" })).toBeNull()
+  );
+}
+
+// Radix's DismissableLayer ignores Escape until one more render after the dialog mounts: its
+// `isHighestLayer` check uses a layer index computed during render, and the layer registers in
+// an effect that then forces that re-render. Nothing in the DOM marks the moment, so under CI
+// load a play that presses Escape right after the dialog appears can have the key dropped
+// (#5127). Press again while the dialog is still open; stop once it starts closing, so no extra
+// Escape reaches the element that gets focus back.
+async function closeSettingsWithEscape(): Promise<void> {
+  await waitFor(
+    async () => {
+      const dialog = within(document.body).queryByRole("dialog", { name: "Settings" });
+      if (dialog?.getAttribute("data-state") === "open") {
+        await userEvent.keyboard("{Escape}");
+      }
+      await expect(within(document.body).queryByRole("dialog", { name: "Settings" })).toBeNull();
+    },
+    { timeout: 5000 }
+  );
+}
+
 export const SectionsSmoke: AppStory = {
+  // Pixel budget: the App task and compaction settings stories already capture this
+  // dialog on desktop, so this file's snapshot slot goes to PhoneFullScreen.
+  parameters: { pixel: PIXEL_DISABLED },
   render: () => <AppWithMocks setup={() => setupSettingsStory({})} />,
   play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
-    await openSettings(canvasElement);
+    const dialog = await openSettings(canvasElement);
 
     for (const sectionLabel of BASE_SECTION_LABELS) {
-      await clickSectionButton(canvasElement, sectionLabel);
-      await assertSectionBodyRendered(canvasElement, sectionLabel);
+      await clickSectionButton(dialog, sectionLabel);
+      await assertSectionBodyRendered(dialog, sectionLabel);
+    }
+  },
+};
+
+const LAYOUT_PRESET = {
+  version: 2,
+  slots: [
+    {
+      slot: 1,
+      preset: {
+        id: "preset-1",
+        name: "My Layout",
+        leftSidebarCollapsed: false,
+        rightSidebar: {
+          collapsed: true,
+          width: { mode: "px", value: 400 },
+          layout: {
+            version: 1,
+            nextId: 2,
+            focusedTabsetId: "tabset-1",
+            root: { type: "tabset", id: "tabset-1", tabs: ["costs"], activeTab: "costs" },
+          },
+        },
+      },
+    },
+  ],
+} satisfies LayoutPresetsConfig;
+
+// Real-browser Escape routing: an inline editor inside the modal cancels its own edit without
+// closing settings, while an unclaimed Escape closes the modal.
+export const EscapeInInlineEditor: AppStory = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => <AppWithMocks setup={() => setupSettingsStory({ layoutPresets: LAYOUT_PRESET })} />,
+  play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
+    const dialog = await openSettings(canvasElement);
+    const settings = within(dialog);
+    await clickSectionButton(dialog, "Layouts");
+
+    await userEvent.dblClick(await settings.findByText("My Layout"));
+    const rename = await settings.findByRole("textbox", { name: "Rename layout Slot 1" });
+    await expect(rename).toHaveFocus();
+    await userEvent.keyboard("{Escape}");
+
+    await waitFor(() =>
+      expect(settings.queryByRole("textbox", { name: "Rename layout Slot 1" })).toBeNull()
+    );
+    await expect(getSettingsDialog()).toBe(dialog);
+    await expect(settings.getByText("My Layout")).toBeVisible();
+
+    dialog.focus();
+    await userEvent.keyboard("{Escape}");
+    await waitForSettingsClosed();
+    // Settings has no DialogTrigger, so focus must be returned to the opener explicitly.
+    await waitFor(() => expect(within(canvasElement).getByTestId("settings-button")).toHaveFocus());
+  },
+};
+
+// The palette item and model-selector entry that open settings unmount as it opens, so closing
+// must return focus to the chat input they came from instead of leaving it on the body.
+export const FocusReturnsWhenOpenerUnmounts: AppStory = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => <AppWithMocks setup={() => setupSettingsStory({})} />,
+  play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
+    const body = within(canvasElement.ownerDocument.body);
+    await waitForChatInputAutofocusDone(canvasElement);
+    const chatInput = canvasElement.querySelector<HTMLElement>(
+      '[data-component="ChatInputSection"]'
+    );
+    if (!chatInput) {
+      throw new Error("Chat input section not found");
+    }
+    const composer = within(chatInput).getByRole("textbox");
+
+    await userEvent.click(composer);
+    await userEvent.keyboard("{Control>}{Shift>}p{/Shift}{/Control}");
+    await userEvent.keyboard(">Settings: Models{Enter}");
+    await body.findByRole("dialog", { name: "Settings" });
+    await closeSettingsWithEscape();
+    await waitFor(() => expect(composer).toHaveFocus());
+    await userEvent.keyboard("typed");
+    await expect(composer).toHaveValue("typed");
+
+    const modelSelector = chatInput.querySelector<HTMLElement>(
+      '[data-component="ModelSelectorGroup"]'
+    );
+    if (!modelSelector) {
+      throw new Error("Model selector not found");
+    }
+    await userEvent.click(within(modelSelector).getByRole("combobox"));
+    await userEvent.click(await body.findByRole("button", { name: "Model settings" }));
+    await body.findByRole("dialog", { name: "Settings" });
+    await closeSettingsWithEscape();
+    await waitFor(() => expect(composer).toHaveFocus());
+  },
+};
+
+export const HeartbeatDefaults: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() =>
+        setupSettingsStory({
+          heartbeatDefaultIntervalMs: 45 * 60_000,
+          heartbeatDefaultPrompt: "Review pending work before continuing.",
+        })
+      }
+    />
+  ),
+  play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
+    const dialog = await openSettings(canvasElement);
+    await clickSectionButton(dialog, "Heartbeats");
+    const settings = within(dialog);
+    const threshold = await settings.findByLabelText("Default heartbeat threshold in minutes");
+    await waitFor(() => expect(threshold).toHaveValue(45));
+    const prompt = await settings.findByLabelText("Default heartbeat prompt");
+    await waitFor(() => expect(prompt).toHaveValue("Review pending work before continuing."));
+  },
+};
+
+const phoneParameters = { pixel: { matrix: { viewports: ["phone"] } } };
+
+// Ends with settings open so the phone capture shows the full-screen sheet.
+export const PhoneFullScreen: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() =>
+        setupSettingsStory({
+          providersConfig: {
+            coder: {
+              apiKeySet: false,
+              isEnabled: true,
+              isConfigured: true,
+              deploymentUrl: "https://coder.example.com",
+              coderOauthSet: true,
+              discoveredProviders: [
+                { name: "anthropic", type: "anthropic" },
+                { name: "openai", type: "openai" },
+              ],
+              canonicalRoutes: { anthropic: "anthropic" },
+            },
+          },
+        })
+      }
+    />
+  ),
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: phoneParameters,
+  play: async ({ canvasElement, parameters }) => {
+    await expect(parameters.pixel).toEqual(phoneParameters.pixel);
+    const dialog = await openSettings(canvasElement);
+    await clickSectionButton(dialog, "Providers");
+    await assertSectionBodyRendered(dialog, "Providers");
+    // Coder model routing selects switch to full width below the sm breakpoint.
+    await userEvent.click(await within(dialog).findByRole("button", { name: /^Coder/ }));
+    const routeSelects = await within(dialog).findAllByRole("combobox", {
+      name: /Coder provider$/,
+    });
+
+    // The test-runner plays at desktop size; only Pixel/manager pin the phone width.
+    if (window.innerWidth < 768) {
+      const rect = dialog.getBoundingClientRect();
+      await expect(rect.left).toBe(0);
+      await expect(rect.width).toBe(window.innerWidth);
+      await expect(dialog.scrollWidth).toBeLessThanOrEqual(dialog.clientWidth);
+      const close = within(dialog).getByRole("button", { name: "Close settings" });
+      await expect(close.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
+      for (const select of routeSelects) {
+        await expect(select.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
+      }
     }
   },
 };

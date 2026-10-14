@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import {
   applyBudgetDrivenStatus,
-  evaluateGoalContinuation,
+  evaluateGoalContinuationBeforeGoal,
+  evaluateGoalContinuationGoal,
   hasReachedAnyGoalLimit,
   hasReachedGoalBudgetLimit,
   hasReachedGoalTurnLimit,
@@ -86,7 +87,13 @@ function policyState(overrides: PolicyOverrides = {}): GoalContinuationPolicySta
   };
 }
 
-describe("evaluateGoalContinuation", () => {
+// Production (WorkspaceGoalService) runs the probe stage before loading the goal and
+// only reaches the goal stage when the probe returns no decision; compose them the same way.
+function evaluateGoalContinuation(state: GoalContinuationPolicyState): GoalContinuationDecision {
+  return evaluateGoalContinuationBeforeGoal(state) ?? evaluateGoalContinuationGoal(state);
+}
+
+describe("goal continuation policy stages", () => {
   const cases: Array<{
     name: string;
     state: PolicyOverrides;
@@ -254,6 +261,57 @@ describe("evaluateGoalContinuation", () => {
       name: "continues immediately when CLI cooldown is zero",
       state: { continuationCooldownMs: 0, goal: goal({ lastContinuationFiredAtMs: 10_000 }) },
       expected: { kind: "continue", mode: "continuation" },
+    },
+    {
+      name: "defers an error resume until its backoff elapses",
+      state: {
+        candidate: {
+          goalId: GOAL_ID,
+          source: "stream_error",
+          sendOptions: { agentId: "exec", mode: "exec" },
+          notBeforeMs: 12_000,
+        },
+      },
+      expected: { kind: "defer", reason: "error_backoff", untilMs: 12_000 },
+    },
+    {
+      name: "continues an error resume once its backoff elapsed",
+      state: {
+        candidate: {
+          goalId: GOAL_ID,
+          source: "stream_error",
+          sendOptions: { agentId: "exec", mode: "exec" },
+          notBeforeMs: 10_000,
+        },
+      },
+      expected: { kind: "continue", mode: "continuation" },
+    },
+    {
+      name: "drops an error resume for a limited goal instead of running a wrap-up",
+      state: {
+        candidate: {
+          goalId: GOAL_ID,
+          source: "stream_error",
+          sendOptions: { agentId: "exec", mode: "exec" },
+          notBeforeMs: 12_000,
+        },
+        goal: goal({ status: "budget_limited" }),
+        lastStreamStamp: { goalId: GOAL_ID, originKind: "goal_continuation" },
+      },
+      expected: { kind: "stop", reason: "goal_not_active", dropCandidate: true },
+    },
+    {
+      name: "keeps an error resume behind an unacknowledged user Stop",
+      state: {
+        candidate: {
+          goalId: GOAL_ID,
+          source: "stream_error",
+          sendOptions: { agentId: "exec", mode: "exec" },
+          notBeforeMs: 12_000,
+        },
+        goal: goal({ requireUserAcknowledgmentSinceMs: 9_000 }),
+      },
+      expected: { kind: "stop", reason: "requires_ack", dropCandidate: false },
     },
   ];
 

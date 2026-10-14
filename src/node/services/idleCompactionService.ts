@@ -7,6 +7,8 @@ import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import type { HistoryService } from "./historyService";
 import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import { computeRecencyFromMessages } from "@/common/utils/recency";
+import type { MuxMessage } from "@/common/types/message";
+import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
 import { log } from "./log";
 
 export const INITIAL_CHECK_DELAY_MS = 60 * 1000; // 1 minute - let startup initialization settle
@@ -43,6 +45,11 @@ export type IdleCompactionOutcome = { success: true } | { success: false; modelN
  * Compactions are globally serialized to avoid thundering herd behavior when
  * one check cycle finds many idle workspaces at once.
  */
+/** Last row that is not a hidden plan-review record (see isPlanReviewRecordMessage). */
+function findLastNonRecordMessage(messages: readonly MuxMessage[]): MuxMessage | undefined {
+  return messages.findLast((message) => !isPlanReviewRecordMessage(message));
+}
+
 export class IdleCompactionService {
   private readonly config: Config;
   private readonly historyService: HistoryService;
@@ -154,6 +161,7 @@ export class IdleCompactionService {
       const thresholdMs = idleHours * HOURS_TO_MS;
 
       for (const workspace of projectConfig.workspaces) {
+        if (workspace.sideChatParentWorkspaceId != null) continue;
         if (isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) continue;
         const workspaceId = workspace.id ?? workspace.name;
         if (!workspaceId) continue;
@@ -277,6 +285,10 @@ export class IdleCompactionService {
   ): Promise<{ eligible: boolean; reason?: string }> {
     // Recheck queued work too: a workspace can be archived while waiting for compaction.
     const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
+    // Inherited timestamps are reference context, not permission to start a background side turn.
+    if (workspace?.sideChatParentWorkspaceId != null) {
+      return { eligible: false, reason: "side_chat" };
+    }
     if (workspace && isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) {
       return { eligible: false, reason: "archived" };
     }
@@ -310,15 +322,31 @@ export class IdleCompactionService {
       return { eligible: false, reason: "currently_streaming" };
     }
 
-    // 4. Already compacted? (last message is compacted summary)
-    const lastMessage = messages[messages.length - 1];
+    // 4./5. judge the tail by the last row the model would see. Hidden plan-review records
+    // (resolve/reopen or an on-demand snapshot appended while idle) are user-role rows but never
+    // a prompt awaiting a response, so they must not disable compaction; a real unanswered
+    // prompt before them keeps its protection.
+    let lastMessage = findLastNonRecordMessage(messages);
+    if (lastMessage === undefined) {
+      // The bounded tail held only hidden rows, so it cannot tell an answered turn from a
+      // pending prompt further back: consult the history since the latest boundary.
+      const fullHistory = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!fullHistory.success) {
+        return { eligible: false, reason: "no_messages" };
+      }
+      lastMessage = findLastNonRecordMessage(fullHistory.data);
+      if (lastMessage === undefined) {
+        return { eligible: false, reason: "no_messages" };
+      }
+    }
+    // Already compacted? (last message is compacted summary)
     // Support both new enum ("user"|"idle") and legacy boolean (true)
-    if (lastMessage?.metadata?.compacted) {
+    if (lastMessage.metadata?.compacted) {
       return { eligible: false, reason: "already_compacted" };
     }
 
-    // 5. Last message is user message with no response? (incomplete conversation)
-    if (lastMessage?.role === "user") {
+    // Last message is user message with no response? (incomplete conversation)
+    if (lastMessage.role === "user") {
       return { eligible: false, reason: "awaiting_response" };
     }
 

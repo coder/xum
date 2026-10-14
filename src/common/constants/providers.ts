@@ -10,6 +10,10 @@
  * Simple providers (requiresApiKey + standard factory pattern) need NO aiService.ts changes.
  */
 
+import type { OpenAIProviderSettings } from "@ai-sdk/openai";
+import { META_API_BASE_URL } from "@/constants/modelDiscovery";
+import { normalizeOpenAICompatibleBaseURL } from "@/common/utils/providers/baseUrl";
+
 /**
  * Union type of all supported provider names
  */
@@ -19,6 +23,7 @@ export type ProviderName =
   | "openai"
   | "google"
   | "xai"
+  | "meta"
   | "deepseek"
   | "moonshotai"
   | "zai"
@@ -149,6 +154,22 @@ export const PROVIDER_DEFINITIONS = {
     requiresApiKey: true,
     kind: "direct",
   },
+  meta: {
+    displayName: "Meta",
+    // Adapt the endpoint, not the SDK namespace: encrypted reasoning uses the
+    // existing openai persistence/replay path without inheriting OpenAI settings.
+    import: () =>
+      import("@ai-sdk/openai").then(({ createOpenAI }) => ({
+        createMeta: (config: OpenAIProviderSettings) =>
+          createOpenAI({
+            ...config,
+            baseURL: normalizeOpenAICompatibleBaseURL(config.baseURL ?? META_API_BASE_URL),
+          }),
+      })),
+    factoryName: "createMeta",
+    requiresApiKey: true,
+    kind: "direct",
+  },
   deepseek: {
     displayName: "DeepSeek",
     import: () => import("@ai-sdk/deepseek"),
@@ -242,6 +263,12 @@ export const GATEWAY_PROVIDERS = Object.entries(PROVIDER_DEFINITIONS)
 export const SUPPORTED_PROVIDERS = Object.keys(PROVIDER_DEFINITIONS) as ProviderName[];
 
 /**
+ * Providers users cannot add custom models under: mux-gateway is a routing
+ * layer enabled per model, not a standalone model list.
+ */
+export const CUSTOM_MODEL_HIDDEN_PROVIDERS: ReadonlySet<string> = new Set(["mux-gateway"]);
+
+/**
  * Display names for providers (proper casing for UI)
  * Derived from PROVIDER_DEFINITIONS - do not edit directly
  */
@@ -261,5 +288,7 @@ export const PROVIDER_REGISTRY = Object.fromEntries(
  * Type guard to check if a string is a valid provider name
  */
 export function isValidProvider(provider: string): provider is ProviderName {
-  return provider in PROVIDER_REGISTRY;
+  // Own-property check: `in` also matches inherited Object.prototype keys such as
+  // "toString", "constructor", and "__proto__".
+  return Object.hasOwn(PROVIDER_REGISTRY, provider);
 }

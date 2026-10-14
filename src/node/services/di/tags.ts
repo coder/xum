@@ -21,6 +21,7 @@ import type {
 } from "@/node/config";
 import type { AgentPluginInstallService } from "@/node/services/agentPlugins/installService";
 import type { AgentStatusService } from "@/node/services/agentStatusService";
+import type { BashAiProxyService } from "@/node/services/bashAiProxy/bashAiProxyService";
 import type { AIService } from "@/node/services/aiService";
 import type { AutoModelRouter } from "@/node/services/autoModelRouter";
 import type { AnalyticsService } from "@/node/services/analytics/analyticsService";
@@ -39,9 +40,13 @@ import type { ContextManagementService } from "@/node/services/contextManagement
 import type { DesktopBridgeServer } from "@/node/services/desktop/DesktopBridgeServer";
 import type { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import type { ComputerUseService } from "@/node/services/computerUse/computerUseService";
 import type { DesktopTokenManager } from "@/node/services/desktop/DesktopTokenManager";
 import type { DevToolsService } from "@/node/services/devToolsService";
+import type { ReviewStateService } from "@/node/services/reviewStateService";
+import type { DraftService } from "@/node/services/draftService";
 import type { EditorService } from "@/node/services/editorService";
+import type { EvaluationService } from "@/node/services/evaluation/evaluationService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import type { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import type { HeartbeatService } from "@/node/services/heartbeatService";
@@ -58,8 +63,6 @@ import type { MemoryMetaService } from "@/node/services/memoryMeta";
 import type { MemoryService } from "@/node/services/memoryService";
 import type { MenuEventService } from "@/node/services/menuEventService";
 import type { MuxGatewayOauthService } from "@/node/services/muxGatewayOauthService";
-import type { MuxGovernorOauthService } from "@/node/services/muxGovernorOauthService";
-import type { PolicyService } from "@/node/services/policyService";
 import type { ProjectService } from "@/node/services/projectService";
 import type { ProviderService } from "@/node/services/providerService";
 import type { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
@@ -136,6 +139,11 @@ export class AI extends Context.Service<AI, AIService>()("xum/AI") {}
 export class AutoModelRouterTag extends Context.Service<AutoModelRouterTag, AutoModelRouter>()(
   "xum/AutoModelRouter"
 ) {}
+
+/** Headless `experimental_evaluate` wrapper for the workflow `evaluate()` primitive. */
+export class Evaluation extends Context.Service<Evaluation, EvaluationService>()(
+  "xum/Evaluation"
+) {}
 export class StreamManagerTag extends Context.Service<StreamManagerTag, StreamManager>()(
   "xum/StreamManager"
 ) {}
@@ -176,7 +184,6 @@ export class TurnRequestBuilderBindingsTag extends Context.Service<
 
 // Desktop cross-cutting services that the core graph's options derive from
 // (`CrossCuttingLive` in ./layers/desktop.ts).
-export class Policy extends Context.Service<Policy, PolicyService>()("xum/Policy") {}
 export class Telemetry extends Context.Service<Telemetry, TelemetryService>()("xum/Telemetry") {}
 export class Experiments extends Context.Service<Experiments, ExperimentsService>()(
   "xum/Experiments"
@@ -186,6 +193,10 @@ export class SessionTiming extends Context.Service<SessionTiming, SessionTimingS
 ) {}
 export class Analytics extends Context.Service<Analytics, AnalyticsService>()("xum/Analytics") {}
 export class DevTools extends Context.Service<DevTools, DevToolsService>()("xum/DevTools") {}
+export class ReviewState extends Context.Service<ReviewState, ReviewStateService>()(
+  "xum/ReviewState"
+) {}
+export class Drafts extends Context.Service<Drafts, DraftService>()("xum/Drafts") {}
 export class WorkspaceMcpOverrides extends Context.Service<
   WorkspaceMcpOverrides,
   WorkspaceMcpOverridesService
@@ -217,6 +228,10 @@ export class DesktopSessionManagerTag extends Context.Service<
   DesktopSessionManagerTag,
   DesktopSessionManager
 >()("xum/DesktopSessionManager") {}
+export class ComputerUseServiceTag extends Context.Service<
+  ComputerUseServiceTag,
+  ComputerUseService
+>()("xum/ComputerUseService") {}
 export class DesktopTokenManagerTag extends Context.Service<
   DesktopTokenManagerTag,
   DesktopTokenManager
@@ -269,9 +284,6 @@ export class McpOauth extends Context.Service<McpOauth, McpOauthService>()("xum/
 export class MuxGatewayOauth extends Context.Service<MuxGatewayOauth, MuxGatewayOauthService>()(
   "xum/MuxGatewayOauth"
 ) {}
-export class MuxGovernorOauth extends Context.Service<MuxGovernorOauth, MuxGovernorOauthService>()(
-  "xum/MuxGovernorOauth"
-) {}
 export class CodexOauth extends Context.Service<CodexOauth, CodexOauthService>()(
   "xum/CodexOauth"
 ) {}
@@ -295,6 +307,9 @@ export class Timeline extends Context.Service<Timeline, TimelineService>()("xum/
 export class Refine extends Context.Service<Refine, RefineService>()("xum/Refine") {}
 export class AgentStatus extends Context.Service<AgentStatus, AgentStatusService>()(
   "xum/AgentStatus"
+) {}
+export class BashAiProxy extends Context.Service<BashAiProxy, BashAiProxyService>()(
+  "xum/BashAiProxy"
 ) {}
 
 /** The process's config stores (`ConfigStores`), one tag per store. */
@@ -326,6 +341,7 @@ export type CoreTags =
   | WorkspaceGoal
   | IdleDispatcherTag
   | AI
+  | Evaluation
   | StreamManagerTag
   | MCPConfig
   | MCPServerManagerTag
@@ -353,12 +369,13 @@ export type CoreRootTags =
 
 /** The desktop cross-cutting services provided by `CrossCuttingLive`. */
 export type CrossCuttingTags =
-  | Policy
   | Telemetry
   | Experiments
   | SessionTiming
   | Analytics
   | DevTools
+  | ReviewState
+  | Drafts
   | WorkspaceMcpOverrides;
 
 /** The desktop-only services provided by the `DesktopLive` group layers, by group. */
@@ -370,6 +387,7 @@ export type BrowserTags =
   | BrowserBridgeServerTag;
 export type DesktopBridgeTags =
   | DesktopSessionManagerTag
+  | ComputerUseServiceTag
   | DesktopTokenManagerTag
   | DesktopBridgeServerTag;
 export type TerminalEditorTags = PTY | Terminal | Editor | Tokenizer | Instructions;
@@ -388,14 +406,8 @@ export type MiscDesktopTags =
   | ServerAuth
   | WorkspaceLifecycleHooksTag
   | WorktreeArchiveSnapshot;
-export type OauthTags =
-  | McpOauth
-  | MuxGatewayOauth
-  | MuxGovernorOauth
-  | CodexOauth
-  | CoderOauth
-  | CopilotOauth;
-export type WorkerTags = IdleCompaction | Heartbeat | Timeline | Refine | AgentStatus;
+export type OauthTags = McpOauth | MuxGatewayOauth | CodexOauth | CoderOauth | CopilotOauth;
+export type WorkerTags = IdleCompaction | Heartbeat | Timeline | Refine | AgentStatus | BashAiProxy;
 export type DesktopTags =
   | BrowserTags
   | DesktopBridgeTags

@@ -405,14 +405,6 @@ describe("validateModelData", () => {
       validateModelData({ catalog: chatEntries(600), droppedModelIds: dropped })
     ).toThrow(/entries have invalid pricing/);
   });
-
-  test("rejects data missing curated known models", () => {
-    // A large catalog that satisfies the size floor but carries none of the
-    // curated model keys that models-extra does not already cover.
-    expect(() => validateModelData({ catalog: chatEntries(600), droppedModelIds: [] })).toThrow(
-      /curated known models missing from upstream/
-    );
-  });
 });
 
 describe("serializeModelData", () => {

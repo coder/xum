@@ -16,9 +16,12 @@ import type {
   Runtime,
   BackgroundHandle,
   BackgroundMonitorProbeResult,
+  BackgroundOutputRead,
   ExecStream,
+  OutputReadOptions,
 } from "@/node/runtime/Runtime";
 import * as fs from "fs/promises";
+import * as os from "os";
 import * as path from "path";
 import { log } from "./log";
 import {
@@ -30,12 +33,14 @@ import {
   shellQuote,
 } from "@/node/runtime/backgroundCommands";
 import { execBuffered, writeFileString } from "@/node/utils/runtime/helpers";
-import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
+import { LocalBaseRuntime, localRuntimeTempRoot } from "@/node/runtime/LocalBaseRuntime";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { NON_INTERACTIVE_ENV_VARS } from "@/common/constants/env";
 import { toPosixPath } from "@/node/utils/paths";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { getErrorMessage } from "@/common/utils/errors";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+import assert from "@/common/utils/assert";
 
 /**
  * Quote a path for shell commands.
@@ -67,6 +72,8 @@ export function spawnRecordsAreHostLocal(runtime: Runtime): boolean {
  */
 const FALLBACK_CWD = process.platform === "win32" ? (process.env.TEMP ?? "C:\\") : "/tmp";
 const BACKGROUND_CWD_ENV = "XUM_INTERNAL_BACKGROUND_CWD";
+// Upper bound on waiting for a killed migrated process to report its exit.
+const MIGRATED_PROCESS_EXIT_JOIN_MS = 5_000;
 
 /** Helper to extract error message for logging */
 function errorMsg(error: unknown): string {
@@ -94,8 +101,26 @@ export const BG_EXIT_CODE_FILENAME = EXIT_CODE_FILENAME;
  * records outlive the app while nohup/setsid children keep running.
  */
 export function localBgWorkspaceDir(workspaceId: string): string {
-  const tempRoot = process.platform === "win32" ? (process.env.TEMP ?? "C:\\Temp") : "/tmp";
-  return `${tempRoot}/${BG_OUTPUT_SUBDIR}/${workspaceId}`;
+  return `${localBgRecordsRoot()}/${workspaceId}`;
+}
+
+/**
+ * The one host-local background record root (`<localRuntimeTempRoot()>/mux-bashes`). Local
+ * spawns write here (LocalBaseRuntime.tempDir()), production migrations write here (the
+ * BackgroundProcessManager bgOutputDir in di/layers/core.ts), both take their name lock here,
+ * and other backends' mutation gates scan it (hasOrphanedRunningBackgroundProcesses).
+ */
+export function localBgRecordsRoot(): string {
+  return `${localRuntimeTempRoot()}/${BG_OUTPUT_SUBDIR}`;
+}
+
+/**
+ * Where builds before the shared root wrote migrated records: path.join(os.tmpdir(),
+ * "mux-bashes"), which differs from localBgRecordsRoot() on macOS or with TMPDIR set. Gates keep
+ * scanning it so an older backend's live migrated command stays visible during an upgrade.
+ */
+export function legacyMigratedBgRecordsRoot(): string {
+  return path.join(os.tmpdir(), BG_OUTPUT_SUBDIR);
 }
 
 /**
@@ -131,6 +156,11 @@ export interface SpawnOptions {
   env?: Record<string, string>;
   /** Host-namespace paths to translate before injecting as environment variables. */
   pathEnv?: Record<string, string>;
+  /**
+   * The caller created the record directory for this spawn (BackgroundProcessManager's atomic
+   * mkdir claim on non-host runtimes, #4889), so a failure before the spawn may remove it.
+   */
+  recordDirClaimed?: boolean;
 }
 
 /**
@@ -168,21 +198,6 @@ export async function spawnProcess(
   // Use shell-safe quoting for paths (handles spaces, special chars)
   const quotePath = quotePathForShell;
 
-  // Verify working directory exists
-  const cwdCheck = await execBuffered(
-    runtime,
-    `printf '%s\n' "$${BACKGROUND_CWD_ENV}"; cd "$${BACKGROUND_CWD_ENV}"`,
-    {
-      cwd: FALLBACK_CWD,
-      pathEnv: { [BACKGROUND_CWD_ENV]: options.cwd },
-      timeout: 10,
-    }
-  );
-  if (cwdCheck.exitCode !== 0) {
-    const execCwd = cwdCheck.stdout.trim() || options.cwd;
-    return { success: false, error: `Working directory does not exist: ${execCwd}` };
-  }
-
   // Compute output paths (unified output.log instead of separate stdout/stderr)
   const { outputDir, outputPath, exitCodePath } = computeOutputPaths(
     bgOutputDir,
@@ -202,6 +217,30 @@ export async function spawnProcess(
       // Best-effort: a leftover directory only over-refuses model-driven archives.
     }
   };
+
+  // Verify working directory exists. Nothing is dispatched yet, so a directory the caller
+  // claimed for this spawn (non-host runtimes, #4889) must not outlive a failure here, whether
+  // the check fails or its exec throws (e.g. a transport error). Otherwise nothing was created.
+  let cwdCheck: Awaited<ReturnType<typeof execBuffered>>;
+  try {
+    cwdCheck = await execBuffered(
+      runtime,
+      `printf '%s\n' "$${BACKGROUND_CWD_ENV}"; cd "$${BACKGROUND_CWD_ENV}"`,
+      {
+        cwd: FALLBACK_CWD,
+        pathEnv: { [BACKGROUND_CWD_ENV]: options.cwd },
+        timeout: 10,
+      }
+    );
+  } catch (error) {
+    if (options.recordDirClaimed === true) await removeOutputDirBestEffort();
+    throw error;
+  }
+  if (cwdCheck.exitCode !== 0) {
+    const execCwd = cwdCheck.stdout.trim() || options.cwd;
+    if (options.recordDirClaimed === true) await removeOutputDirBestEffort();
+    return { success: false, error: `Working directory does not exist: ${execCwd}` };
+  }
 
   // Create output directory and empty file
   try {
@@ -244,11 +283,11 @@ export async function spawnProcess(
     cwd: options.cwd,
     cwdEnvVar: BACKGROUND_CWD_ENV,
     env: wrapperEnv,
-    script,
   });
 
   const spawnCommand = buildSpawnCommand({
     wrapperScript,
+    script,
     outputPath,
     quotePath,
   });
@@ -328,10 +367,138 @@ export async function spawnProcess(
 interface SpawnRecordProbe {
   /** Byte size of output.log. */
   outputFileSize(): Promise<number>;
-  /** output.log contents from `offset` to (at least) `fileSize`, plus the offset read up to. */
-  readOutputFrom(offset: number, fileSize: number): Promise<{ content: string; newOffset: number }>;
+  /**
+   * output.log contents from `offset` to (at least) `fileSize`, or about `maxBytes` of them (see
+   * decodeOutputBytes), plus the offset read up to.
+   */
+  readOutputFrom(
+    offset: number,
+    fileSize: number,
+    maxBytes?: number,
+    options?: OutputReadOptions
+  ): Promise<BackgroundOutputRead>;
   /** Raw exit marker contents; "" when the marker does not exist yet (process still running). */
   readExitCodeMarker(): Promise<string>;
+}
+
+/** Bytes a bounded read loads past its limit, to finish a UTF-8 character cut there. */
+const UTF8_CHARACTER_MARGIN_BYTES = 3;
+
+/** How many bytes of output.log to load at `offset`: up to `fileSize`, at most about `maxBytes`. */
+function outputReadLength(offset: number, fileSize: number, maxBytes?: number): number {
+  const available = Math.max(fileSize - offset, 0);
+  if (maxBytes == null) return available;
+  assert(Number.isInteger(maxBytes) && maxBytes > 0, `maxBytes must be a positive integer`);
+  return Math.min(available, maxBytes + UTF8_CHARACTER_MARGIN_BYTES);
+}
+
+/**
+ * Decode `bytes`, loaded from output.log at `offset`. A bounded read that stopped before the end
+ * of the file returns `maxBytes` and then stops at the first place where decoding the bytes on
+ * each side apart gives the same text as decoding them together: before a byte that is not a
+ * UTF-8 continuation byte (10xxxxxx), or after 3 continuation bytes (no character needs more).
+ * So the pages of a log decode to exactly the text of the whole log, invalid bytes included.
+ *
+ * A bounded read that is not `final` also stops before an incomplete character at its end: the
+ * file size was sampled before the read, so a character the process is still writing would
+ * otherwise decode to U+FFFD and the cursor would move past its first bytes.
+ */
+function decodeOutputBytes(
+  bytes: Uint8Array,
+  offset: number,
+  fileSize: number,
+  maxBytes?: number,
+  options?: OutputReadOptions
+): BackgroundOutputRead {
+  const end =
+    maxBytes == null
+      ? bytes.length
+      : boundedReadEnd(bytes, offset + bytes.length < fileSize, maxBytes, options);
+  const newOffset = offset + end;
+  return {
+    // ignoreBOM: a read that starts at a U+FEFF must return it, not strip it as a byte-order mark.
+    content: new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes.subarray(0, end)),
+    newOffset,
+    fileSize: Math.max(fileSize, newOffset),
+  };
+}
+
+/** Where a bounded read stops in the bytes it loaded (see decodeOutputBytes). */
+function boundedReadEnd(
+  bytes: Uint8Array,
+  fileGoesOn: boolean,
+  maxBytes: number,
+  options?: OutputReadOptions
+): number {
+  const end = bytes.length > maxBytes && fileGoesOn ? safeCutAfter(bytes, maxBytes) : bytes.length;
+  // Only the last loaded byte can end a character that more bytes may complete: a cut before
+  // the last one sees the byte after it, so a sequence cut there is already known to be broken.
+  if (end < bytes.length || options?.final === true) return end;
+  return incompleteCharacterStart(bytes, end);
+}
+
+/** The first cut at or after `maxBytes` where the bytes decode the same apart as together. */
+function safeCutAfter(bytes: Uint8Array, maxBytes: number): number {
+  let end = maxBytes;
+  const limit = maxBytes + UTF8_CHARACTER_MARGIN_BYTES;
+  while (end < limit && end < bytes.length && (bytes[end] & 0xc0) === 0x80) end++;
+  return end;
+}
+
+/**
+ * Where an incomplete UTF-8 character at the end of `bytes[0, end)` starts (`end` when there is
+ * none): a lead byte followed by fewer continuation bytes than it announces. Invalid leads
+ * (0xC0, 0xC1, 0xF5 and above) announce nothing, so they decode at once.
+ */
+function incompleteCharacterStart(bytes: Uint8Array, end: number): number {
+  for (let back = 1; back <= UTF8_CHARACTER_MARGIN_BYTES && back <= end; back++) {
+    const byte = bytes[end - back];
+    if ((byte & 0xc0) === 0x80) continue;
+    return utf8SequenceLength(byte) > back ? end - back : end;
+  }
+  return end;
+}
+
+/** The length a UTF-8 lead byte announces; 1 for ASCII and for bytes that cannot start one. */
+function utf8SequenceLength(byte: number): number {
+  if (byte >= 0xc2 && byte <= 0xdf) return 2;
+  if (byte >= 0xe0 && byte <= 0xef) return 3;
+  if (byte >= 0xf0 && byte <= 0xf4) return 4;
+  return 1;
+}
+
+/** Read output.log on the host from `offset` (see SpawnRecordProbe.readOutputFrom). */
+async function readLocalOutputFile(
+  outputPath: string,
+  offset: number,
+  fileSize: number,
+  maxBytes?: number,
+  options?: OutputReadOptions
+): Promise<BackgroundOutputRead> {
+  const fd = await fs.open(outputPath, "r");
+  try {
+    const buffer = Buffer.alloc(outputReadLength(offset, fileSize, maxBytes));
+    const { bytesRead } = await fd.read(buffer, 0, buffer.length, offset);
+    return decodeOutputBytes(buffer.subarray(0, bytesRead), offset, fileSize, maxBytes, options);
+  } finally {
+    await fd.close();
+  }
+}
+
+/** All bytes of a stream, undecoded. */
+async function readStreamBytes(stream: ReadableStream<Uint8Array>): Promise<Buffer> {
+  const chunks: Uint8Array[] = [];
+  const reader = stream.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks);
 }
 
 /** Host-local records: plain Node fs calls, no child process per tick. */
@@ -345,21 +512,13 @@ class LocalFsSpawnRecordProbe implements SpawnRecordProbe {
     return (await fs.stat(this.outputPath)).size;
   }
 
-  async readOutputFrom(
+  readOutputFrom(
     offset: number,
-    fileSize: number
-  ): Promise<{ content: string; newOffset: number }> {
-    const fd = await fs.open(this.outputPath, "r");
-    try {
-      const buffer = Buffer.alloc(fileSize - offset);
-      const { bytesRead } = await fd.read(buffer, 0, buffer.length, offset);
-      return {
-        content: buffer.subarray(0, bytesRead).toString("utf-8"),
-        newOffset: offset + bytesRead,
-      };
-    } finally {
-      await fd.close();
-    }
+    fileSize: number,
+    maxBytes?: number,
+    options?: OutputReadOptions
+  ): Promise<BackgroundOutputRead> {
+    return readLocalOutputFile(this.outputPath, offset, fileSize, maxBytes, options);
   }
 
   async readExitCodeMarker(): Promise<string> {
@@ -373,6 +532,16 @@ class LocalFsSpawnRecordProbe implements SpawnRecordProbe {
       throw error;
     }
     return fs.readFile(this.exitCodePath, "utf-8");
+  }
+}
+
+/** What the remote read prints on stderr when tail fails (see readOutputFrom). */
+const TAIL_FAILED_MARKER = "xum-tail-exit:";
+
+/** Fail the remote read when tail failed before it sent all `length` bytes (see readOutputFrom). */
+function assertTailSucceeded(bytesRead: number, length: number, stderr: string): void {
+  if (bytesRead < length && stderr.includes(TAIL_FAILED_MARKER)) {
+    throw new Error(`readOutput tail probe failed (${stderr.trim()})`);
   }
 }
 
@@ -405,21 +574,34 @@ class ShellSpawnRecordProbe implements SpawnRecordProbe {
 
   async readOutputFrom(
     offset: number,
-    _fileSize: number
-  ): Promise<{ content: string; newOffset: number }> {
+    fileSize: number,
+    maxBytes?: number,
+    options?: OutputReadOptions
+  ): Promise<BackgroundOutputRead> {
     const filePath = this.quotePath(this.outputPath);
-    // Read from offset to end of file using tail -c (faster than dd bs=1)
-    // tail -c +N means "start at byte N" (1-indexed)
-    const readResult = await execBuffered(
-      this.runtime,
-      `tail -c +${offset + 1} ${filePath} 2>/dev/null`,
-      { cwd: FALLBACK_CWD, timeout: 30 }
-    );
-    this.assertProbeSucceeded("readOutput tail probe", readResult.exitCode);
-    return {
-      content: readResult.stdout,
-      newOffset: offset + Buffer.byteLength(readResult.stdout),
-    };
+    // Read from offset using tail -c (faster than dd bs=1); tail -c +N means "start at byte N"
+    // (1-indexed). head -c stops at fileSize, or after one page for a bounded read.
+    //
+    // A pipeline exits with head's status, so tail reports its own failure on stderr (its
+    // messages go to /dev/null). Plain POSIX sh, BusyBox ash included: no pipefail. A tail that
+    // failed only because head stopped early (SIGPIPE, exit 141, or EPIPE where SIGPIPE is
+    // ignored) still sent all `length` bytes, so only a short read with a tail failure fails.
+    const length = outputReadLength(offset, fileSize, maxBytes);
+    const command =
+      `{ tail -c +${offset + 1} ${filePath} 2>/dev/null || echo "${TAIL_FAILED_MARKER}$?" >&2; }` +
+      ` | head -c ${length}`;
+    const stream = await this.runtime.exec(command, { cwd: FALLBACK_CWD, timeout: 30 });
+    await stream.stdin.close();
+    // Raw bytes, not execBuffered's text: the offset counts bytes, and a decoded U+FFFD or a
+    // stripped byte-order mark has a different size than the bytes it came from.
+    const [bytes, stderr, exitCode] = await Promise.all([
+      readStreamBytes(stream.stdout),
+      readStreamBytes(stream.stderr),
+      stream.exitCode,
+    ]);
+    this.assertProbeSucceeded("readOutput tail probe", exitCode);
+    assertTailSucceeded(bytes.length, length, stderr.toString("utf8"));
+    return decodeOutputBytes(bytes, offset, fileSize, maxBytes, options);
   }
 
   async readExitCodeMarker(): Promise<string> {
@@ -449,7 +631,7 @@ class ShellSpawnRecordProbe implements SpawnRecordProbe {
  * Output files (output.log, exit_code) are on the runtime's filesystem.
  */
 class RuntimeBackgroundHandle implements BackgroundHandle {
-  private terminated = false;
+  private termination: Promise<void> | undefined;
 
   constructor(
     private readonly runtime: Runtime,
@@ -500,9 +682,14 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
    * Terminate the process group.
    * Sends SIGTERM to process group, waits briefly, then SIGKILL if still running.
    */
-  async terminate(): Promise<void> {
-    if (this.terminated) return;
+  terminate(): Promise<void> {
+    // Memoized synchronously, before the first await: concurrent callers (task_stop and the
+    // timeout timer, cleanup) share one kill sequence instead of each running their own.
+    this.termination ??= this.runTerminate();
+    return this.termination;
+  }
 
+  private async runTerminate(): Promise<void> {
     try {
       const exitCodePath = `${this.outputDir}/${EXIT_CODE_FILENAME}`;
       const terminateCmd = buildTerminateCommand(this.pid, exitCodePath, this.quotePath);
@@ -515,8 +702,6 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
       // Process may already be dead - that's fine
       log.debug(`RuntimeBackgroundHandle.terminate: Error: ${errorMsg(error)}`);
     }
-
-    this.terminated = true;
   }
 
   /**
@@ -557,25 +742,33 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
     }
   }
 
-  private async readOutputStrict(offset: number): Promise<{ content: string; newOffset: number }> {
+  private async readOutputStrict(
+    offset: number,
+    maxBytes?: number,
+    options?: OutputReadOptions
+  ): Promise<BackgroundOutputRead> {
     const fileSize = await this.probe.outputFileSize();
 
     if (offset >= fileSize) {
-      return { content: "", newOffset: offset };
+      return { content: "", newOffset: offset, fileSize: offset };
     }
 
-    return this.probe.readOutputFrom(offset, fileSize);
+    return this.probe.readOutputFrom(offset, fileSize, maxBytes, options);
   }
 
   /**
    * Read output from output.log at the given byte offset.
    */
-  async readOutput(offset: number): Promise<{ content: string; newOffset: number }> {
+  async readOutput(
+    offset: number,
+    maxBytes?: number,
+    options?: OutputReadOptions
+  ): Promise<BackgroundOutputRead> {
     try {
-      return await this.readOutputStrict(offset);
+      return await this.readOutputStrict(offset, maxBytes, options);
     } catch (error) {
       log.debug(`RuntimeBackgroundHandle.readOutput: Error: ${errorMsg(error)}`);
-      return { content: "", newOffset: offset };
+      return { content: "", newOffset: offset, fileSize: offset };
     }
   }
 
@@ -602,6 +795,8 @@ export interface MigrateOptions {
   existingOutput: string[];
   /** Human-readable name for the process */
   displayName?: string;
+  /** Kills the running process tree (the foreground exec's abort); see MigratedBackgroundHandle.terminate */
+  kill?: () => void;
 }
 
 /**
@@ -648,7 +843,7 @@ export async function migrateToBackground(
     await fs.writeFile(outputPath, options.existingOutput.join("\n") + "\n");
 
     // Create handle that will continue writing to file
-    const handle = new MigratedBackgroundHandle(execStream, outputDir, outputPath);
+    const handle = new MigratedBackgroundHandle(execStream, outputDir, outputPath, options.kill);
 
     // Start consuming remaining output in background
     handle.startConsuming();
@@ -678,7 +873,8 @@ class MigratedBackgroundHandle implements BackgroundHandle {
   constructor(
     private readonly execStream: ExecStream,
     public readonly outputDir: string,
-    private readonly outputPath: string
+    private readonly outputPath: string,
+    private readonly kill?: () => void
   ) {}
 
   /**
@@ -763,8 +959,15 @@ class MigratedBackgroundHandle implements BackgroundHandle {
   }
 
   async terminate(): Promise<void> {
-    // ExecStream doesn't expose a kill method directly
-    // Cancel the streams to stop reading (process continues but we stop tracking)
+    // ExecStream has no kill method, so the foreground exec's abort is passed in. Workspace
+    // removal terminates processes before deleting the checkout (#4760), so kill the process
+    // and join its exit (bounded: a remote exec may never report one) before returning.
+    if (this.kill) {
+      this.kill();
+      await raceWithAbortAndTimeout(this.execStream.exitCode, {
+        timeoutMs: MIGRATED_PROCESS_EXIT_JOIN_MS,
+      }).catch(() => undefined);
+    }
     try {
       await this.execStream.stdout.cancel();
       await this.execStream.stderr.cancel();
@@ -803,29 +1006,22 @@ class MigratedBackgroundHandle implements BackgroundHandle {
     }
   }
 
-  async readOutput(offset: number): Promise<{ content: string; newOffset: number }> {
+  async readOutput(
+    offset: number,
+    maxBytes?: number,
+    options?: OutputReadOptions
+  ): Promise<BackgroundOutputRead> {
     try {
       const fileSize = await this.getOutputFileSize();
 
       if (offset >= fileSize) {
-        return { content: "", newOffset: offset };
+        return { content: "", newOffset: offset, fileSize: offset };
       }
 
-      // Read from offset to end
-      const fd = await fs.open(this.outputPath, "r");
-      try {
-        const buffer = Buffer.alloc(fileSize - offset);
-        const { bytesRead } = await fd.read(buffer, 0, buffer.length, offset);
-        return {
-          content: buffer.slice(0, bytesRead).toString("utf-8"),
-          newOffset: offset + bytesRead,
-        };
-      } finally {
-        await fd.close();
-      }
+      return await readLocalOutputFile(this.outputPath, offset, fileSize, maxBytes, options);
     } catch (error) {
       log.debug(`MigratedBackgroundHandle.readOutput: ${errorMsg(error)}`);
-      return { content: "", newOffset: offset };
+      return { content: "", newOffset: offset, fileSize: offset };
     }
   }
 }

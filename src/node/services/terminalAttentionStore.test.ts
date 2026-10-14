@@ -3,7 +3,7 @@ import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 
 import {
   TERMINAL_ATTENTION_DIR,
@@ -268,4 +268,49 @@ describe("TerminalAttentionStore", () => {
 
     expect(await store.listPendingOwnerWorkspaceIds()).toEqual([...expectedOwners].sort());
   });
+
+  // #5056: a delete that lands between a status update's read and its write must not be undone
+  // (the write used to re-create the deleted record with the new status). Interleaving from the
+  // #5057 investigation: hold the update right after its read, delete, then let it write.
+  test.each([
+    ["markDelivered", "pending"],
+    ["markSuperseded", "pending"],
+    ["markPending", "delivered"],
+  ] as const)(
+    "%s does not re-create a record deleted between its read and its write",
+    async (update, initialStatus) => {
+      const store = new TerminalAttentionStore(makeConfig(rootDir));
+      const owner = "owner-race";
+      const created = await store.enqueueIfAbsent({
+        ownerWorkspaceId: owner,
+        sourceKind: "workspace_turn",
+        sourceId: "wst_race",
+      });
+      expect(created).not.toBeNull();
+      const id = created!.id;
+      if (initialStatus === "delivered") await store.markDelivered(owner, id);
+      expect((await store.get(owner, id))?.status).toBe(initialStatus);
+
+      const readDone = Promise.withResolvers<void>();
+      const releaseWrite = Promise.withResolvers<void>();
+      const get = store.get.bind(store);
+      spyOn(store, "get").mockImplementationOnce(async (...args) => {
+        const record = await get(...args);
+        readDone.resolve();
+        await releaseWrite.promise;
+        return record;
+      });
+
+      const updating = store[update](owner, id);
+      await readDone.promise;
+      const deleting = store.delete(owner, id);
+      // A correct store makes the delete wait for the update; the unfixed one lets it finish
+      // here. The bounded wait can only hide the bug (a very slow rm), never fail a fixed build.
+      await Promise.race([deleting, new Promise((resolve) => setTimeout(resolve, 50))]);
+      releaseWrite.resolve();
+      await Promise.all([updating, deleting]);
+
+      expect(await store.get(owner, id)).toBeNull();
+    }
+  );
 });

@@ -256,6 +256,9 @@ test("short-token reserve fits worst-case escaped metadata and preserves Unicode
   expect(first.items?.[0]?.text.length).toBeGreaterThan(0);
   const item = first.items![0];
   expect(item.windowId).toBe(`w:m:${id}`);
+  // Shrinking moves only the end: the truncated row still starts at 0 and continues right after its text.
+  expect(item.startCharOffset).toBe(0);
+  expect(item.nextCharOffset).toBe(item.text.length);
   let recovered = item.text;
   let offset = item.nextCharOffset;
   while (offset !== undefined) {
@@ -269,6 +272,7 @@ test("short-token reserve fits worst-case escaped metadata and preserves Unicode
     expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(
       SESSION_HISTORY_MAX_RESULT_BYTES
     );
+    expect(page.items![0].startCharOffset).toBe(offset);
     recovered += page.items![0].text;
     offset = page.items![0].nextCharOffset;
   }

@@ -31,6 +31,7 @@ function makeStep(overrides: Partial<DevToolsStep> & { id: string; runId: string
     responseHeaders: null,
     rawResponse: null,
     rawChunks: null,
+    inputTransformations: null,
     ...rest,
   };
 }
@@ -215,6 +216,28 @@ describe("DevToolsService", () => {
 
       expect(run1?.toolPolicy).toEqual(policy);
       expect(run2?.toolPolicy).toBeUndefined();
+    });
+
+    it("applies a turn's metadata to its refusal-fallback run until the turn clears it", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+      const metadataId = "turn-stream-token";
+      service.setPendingRunMetadata("ws-1", metadataId, {
+        requestHistorySequence: 7,
+        contextEpoch: "row-1",
+      });
+      // The fallback model has its own middleware, so its run is a second createRun with the
+      // same request metadata ID header.
+      await service.createRun("ws-1", makeRun("primary", "2025-06-01T00:00:00Z"), metadataId);
+      await service.createRun("ws-1", makeRun("fallback", "2025-06-01T00:00:10Z"), metadataId);
+      // Turn end (stream-end / error / abort): AIService clears the pending entry.
+      service.clearPendingRunMetadata("ws-1", metadataId);
+      await service.createRun("ws-1", makeRun("later", "2025-06-01T00:01:00Z"), metadataId);
+
+      const runs = await service.getRuns("ws-1");
+      const byId = (id: string) => runs.find((run) => run.id === id);
+      expect(byId("primary")).toMatchObject({ requestHistorySequence: 7, contextEpoch: "row-1" });
+      expect(byId("fallback")).toMatchObject({ requestHistorySequence: 7, contextEpoch: "row-1" });
+      expect(byId("later")?.requestHistorySequence).toBeUndefined();
     });
 
     it("stores pending metadata per metadata id for overlapping requests", async () => {
@@ -570,6 +593,7 @@ describe("DevToolsService", () => {
       delete (legacyStep as Record<string, unknown>).rawChunks;
       delete (legacyStep as Record<string, unknown>).requestHeaders;
       delete (legacyStep as Record<string, unknown>).responseHeaders;
+      delete (legacyStep as Record<string, unknown>).inputTransformations;
       const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
 
       await fs.mkdir(path.dirname(logPath), { recursive: true });
@@ -586,6 +610,40 @@ describe("DevToolsService", () => {
       expect(runWithSteps?.steps[0]?.requestHeaders).toBeNull();
       expect(runWithSteps?.steps[0]?.responseHeaders).toBeNull();
       expect(runWithSteps?.steps[0]?.rawChunks).toBeNull();
+      expect(runWithSteps?.steps[0]?.inputTransformations).toBeNull();
+    });
+
+    it("drops malformed input transformation entries when replaying persisted steps", async () => {
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const run = makeRun("run-1");
+      const step = {
+        ...makeStep({ id: "step-1", runId: "run-1" }),
+        inputTransformations: [
+          {
+            type: "thinking_dropped",
+            path: "messages.1.content.0",
+            reason: "prefix_binding_mismatch",
+          },
+          { type: "thinking_dropped" },
+          "junk",
+        ],
+      };
+      const logPath = getDevtoolsLogPath(sessionsDir, "ws-1");
+      await fs.mkdir(path.dirname(logPath), { recursive: true });
+      await fs.writeFile(
+        logPath,
+        `${JSON.stringify({ type: "run", run })}\n${JSON.stringify({ type: "step", step })}\n`,
+        "utf-8"
+      );
+
+      const runWithSteps = await new DevToolsService(config).getRunWithSteps("ws-1", "run-1");
+      expect(runWithSteps?.steps[0]?.inputTransformations).toEqual([
+        {
+          type: "thinking_dropped",
+          path: "messages.1.content.0",
+          reason: "prefix_binding_mismatch",
+        },
+      ]);
     });
 
     it("skips corrupted lines while replaying persisted logs", async () => {

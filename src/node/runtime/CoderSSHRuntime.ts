@@ -202,6 +202,16 @@ export class CoderSSHRuntime extends SSHRuntime {
     return status;
   }
 
+  /** Keep cleanup hooks from starting stopped Coder workspaces through SSH. */
+  async isRunningWithoutStart(abortSignal: AbortSignal): Promise<boolean> {
+    const workspaceName = this.coderConfig.workspaceName;
+    if (!workspaceName) return false;
+    const status = await this.coderService.getWorkspaceStatus(workspaceName, {
+      signal: abortSignal,
+    });
+    return status.kind === "ok" && status.status === "running";
+  }
+
   /** In-flight ensureReady promise to avoid duplicate start/wait sequences */
   private ensureReadyPromise: Promise<EnsureReadyResult> | null = null;
 
@@ -581,21 +591,36 @@ export class CoderSSHRuntime extends SSHRuntime {
     workspaceName: string,
     force: boolean,
     abortSignal?: AbortSignal,
-    trusted?: boolean
+    trusted?: boolean,
+    options?: { keepBranch?: boolean }
   ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }> {
     // Deleting a Coder workspace is dangerous; CoderService refuses to delete workspaces
     // without the mux- prefix to avoid accidentally deleting user-owned Coder workspaces.
 
     // If this workspace is an existing Coder workspace that mux didn't create, just do SSH cleanup.
     if (this.coderConfig.existingWorkspace) {
-      return super.deleteWorkspace(projectPath, workspaceName, force, abortSignal, trusted);
+      return super.deleteWorkspace(
+        projectPath,
+        workspaceName,
+        force,
+        abortSignal,
+        trusted,
+        options
+      );
     }
 
     const coderWorkspaceName = this.coderConfig.workspaceName;
 
     if (!coderWorkspaceName) {
       log.warn("Coder workspace name not set, falling back to SSH-only deletion");
-      return super.deleteWorkspace(projectPath, workspaceName, force, abortSignal, trusted);
+      return super.deleteWorkspace(
+        projectPath,
+        workspaceName,
+        force,
+        abortSignal,
+        trusted,
+        options
+      );
     }
 
     // For force deletes ("cancel creation"), skip SSH cleanup and focus on deleting the
@@ -694,7 +719,8 @@ export class CoderSSHRuntime extends SSHRuntime {
       workspaceName,
       force,
       abortSignal,
-      trusted
+      trusted,
+      options
     );
 
     // In the normal (force=false) delete path, only delete the Coder workspace if the SSH delete
@@ -766,6 +792,15 @@ export class CoderSSHRuntime extends SSHRuntime {
       forkedRuntimeConfig: sharedRuntimeConfig,
       sourceRuntimeConfig: sharedRuntimeConfig,
     };
+  }
+
+  /** A new-mode creation's provisioning session is consumed only by postCreateSetup (#5113). */
+  async releaseCreationSetup(): Promise<void> {
+    const coderWorkspaceName = this.coderConfig.workspaceName;
+    if (this.coderConfig.existingWorkspace || !coderWorkspaceName) {
+      return;
+    }
+    await this.coderService.disposeProvisioningSession(coderWorkspaceName).catch(() => undefined);
   }
 
   /**

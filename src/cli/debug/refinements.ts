@@ -35,8 +35,6 @@ export function summarizeRefinementAction(row: RefinementEvent): string {
 export interface RefinementsCommandOptions {
   rollback?: string;
   force?: boolean;
-  /** Test seam: bypass ~/.mux session resolution for fixture sessions. */
-  sessionDir?: string;
 }
 
 /**
@@ -47,7 +45,7 @@ export async function refinementsCommand(
   workspaceId: string,
   opts: RefinementsCommandOptions = {}
 ): Promise<void> {
-  const sessionDir = opts.sessionDir ?? path.join(defaultConfig.sessionsDir, workspaceId);
+  const sessionDir = path.join(defaultConfig.sessionsDir, workspaceId);
 
   if (opts.rollback !== undefined) {
     const result = await rollbackRefinement({

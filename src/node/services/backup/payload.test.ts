@@ -70,6 +70,29 @@ import { MEMORY_MAX_FILE_BYTES, MEMORY_MAX_FILES_PER_SCOPE } from "@/common/cons
 /** Every core category selected, as a fresh install's defaults leave them. */
 const CONTENTS = resolveBackupContents({});
 
+/**
+ * The JSON.stringify calls that serialize one of `paths`. A spy on JSON.stringify is
+ * process-global, so async work left over from earlier tests in the same Bun process can call
+ * it inside the spy window (#4920). Only calls on this manifest's redaction paths come from the
+ * payload code under test, which keys each path with JSON.stringify to find duplicates.
+ */
+function redactionPathSerializations(
+  calls: ReadonlyArray<readonly unknown[]>,
+  paths: ReadonlyArray<ReadonlyArray<string | number>>
+): unknown[] {
+  return calls
+    .map((args) => args[0])
+    .filter(
+      (value) =>
+        Array.isArray(value) &&
+        paths.some(
+          (jsonPath) =>
+            jsonPath.length === value.length &&
+            jsonPath.every((segment, index) => segment === value[index])
+        )
+    );
+}
+
 async function isExecutable(filePath: string): Promise<boolean> {
   return ((await fs.stat(filePath)).mode & 0o111) !== 0;
 }
@@ -209,11 +232,16 @@ describe("backup payload", () => {
       sourceLabel: "test-host",
       exportedAt: "2026-07-30T00:00:00.000Z",
       preferences: {
-        appearance: { theme: "dark", vimEnabled: true },
+        appearance: {
+          theme: "dark",
+          vimEnabled: true,
+          powerModeEnabled: true,
+          gitStatusIndicatorMode: "line-delta",
+        },
         navigation: { launchBehavior: "dashboard", projectOrder: ["/private/project"] },
         ai: {
           globalDefaults: { agentId: "exec" },
-          projectDefaults: { "/private/project": { model: "secret/model" } },
+          projectDefaults: { "/private/project": { model: "openai:secret-model" } },
           autoCompactionThresholdByModel: { "openai/gpt": 75 },
         },
         workspaceCreation: { byProject: { "/private/project": { trunkBranch: "main" } } },
@@ -221,7 +249,11 @@ describe("backup payload", () => {
         review: {
           includeUncommitted: true,
           defaultBaseByProject: { "/private/project": "main" },
+          sortOrder: "file-order",
+          fileTreeViewMode: "flat",
+          showRead: false,
         },
+        ui: { tutorialState: { disabled: true } },
       },
     });
 
@@ -240,13 +272,24 @@ describe("backup payload", () => {
       unknown
     >;
     expect(preferences).toEqual({
-      appearance: { theme: "dark", vimEnabled: true },
+      appearance: {
+        theme: "dark",
+        vimEnabled: true,
+        powerModeEnabled: true,
+        gitStatusIndicatorMode: "line-delta",
+      },
       navigation: { launchBehavior: "dashboard" },
       ai: {
         globalDefaults: { agentId: "exec" },
         autoCompactionThresholdByModel: { "openai/gpt": 75 },
       },
-      review: { includeUncommitted: true },
+      review: {
+        includeUncommitted: true,
+        sortOrder: "file-order",
+        fileTreeViewMode: "flat",
+        showRead: false,
+      },
+      ui: { tutorialState: { disabled: true } },
     });
   });
 
@@ -676,6 +719,10 @@ describe("backup payload", () => {
     });
   });
 
+  // This boundary-sized round trip adds two markers per server, each applied as its own
+  // jsonc edit, and can exceed the default timeout late in the full `bun test src` process
+  // (measured 208 ms standalone vs 4.2 s after 825 files). Keep the fixture at the limit
+  // rather than reducing coverage; this is completion headroom, not a performance assertion.
   it("keeps a large backup restorable when deselecting a category adds many markers", async () => {
     const servers = Object.fromEntries(
       Array.from({ length: MAX_BACKUP_MCP_REDACTIONS + 1 }, (_, index) => [
@@ -705,7 +752,7 @@ describe("backup payload", () => {
     expect(jsonc.parse(await fs.readFile(path.join(restoreRoot, "mcp.jsonc"), "utf-8"))).toEqual({
       servers,
     });
-  });
+  }, 30_000);
 
   it("does not create manifests above the MCP redaction limit", async () => {
     const redactedValues = Object.fromEntries(
@@ -838,6 +885,28 @@ describe("backup payload", () => {
     expect(merged.appearance?.editorConfig).toEqual({ editor: "vscode" });
   });
 
+  it("restores the backed-up ui fields and keeps the ones the backup lacks", () => {
+    const merged = mergeBackupPreferences(
+      { ui: { tutorialState: { completed: { creation: true } }, outputTabLevel: "debug" } },
+      { ui: { tutorialState: { disabled: true }, sidebarFlatMode: true } }
+    );
+    expect(merged.ui).toEqual({
+      tutorialState: { disabled: true },
+      outputTabLevel: "debug",
+      sidebarFlatMode: true,
+    });
+  });
+
+  it("keeps the artifact CDN choice out of both the backup and the restore", () => {
+    const local = { ui: { artifactsAllowCdnScripts: false } };
+    expect(serializeBackupPreferences(local).toString("utf-8")).not.toContain("Cdn");
+
+    const merged = mergeBackupPreferences(local, {
+      ui: { artifactsAllowCdnScripts: true, sidebarFlatMode: true },
+    });
+    expect(merged.ui).toEqual({ artifactsAllowCdnScripts: false, sidebarFlatMode: true });
+  });
+
   it("refuses an oversized file and an oversized payload on both sides", async () => {
     // Sparse, so the size is real to stat while nothing is ever read or written.
     async function sparseFile(root: string, relativePath: string, size: number): Promise<void> {
@@ -966,7 +1035,10 @@ describe("backup payload", () => {
       exportedAt: "2026-08-07T00:00:00.000Z",
       muxVersion: "1.2.3",
       sourceLabel: "test-host",
-      mcpRedactions: Array.from({ length: MAX_BACKUP_MCP_REDACTIONS + 1 }, (_, index) => [index]),
+      // Distinctive paths, so the serialization check below cannot match unrelated calls.
+      mcpRedactions: Array.from({ length: MAX_BACKUP_MCP_REDACTIONS + 1 }, (_, index) => [
+        `too-many-mcp-redactions-${index}`,
+      ]),
       files: [],
     };
     const manifestPath = path.join(destination, "manifest.json");
@@ -979,7 +1051,9 @@ describe("backup payload", () => {
       expect((rejected as Error).message).toBe(
         `Backup has more than ${MAX_BACKUP_MCP_REDACTIONS} MCP redactions`
       );
-      expect(stringify.mock.calls).toHaveLength(0);
+      expect(
+        redactionPathSerializations(stringify.mock.calls, manifest.mcpRedactions)
+      ).toHaveLength(0);
     } finally {
       stringify.mockRestore();
     }
@@ -1034,7 +1108,9 @@ describe("backup payload", () => {
       expect((cumulative as Error).message).toBe(
         `Backup MCP redaction paths have more than ${MAX_BACKUP_MCP_REDACTION_SEGMENTS} total segments`
       );
-      expect(stringify.mock.calls).toHaveLength(0);
+      expect(redactionPathSerializations(stringify.mock.calls, overCumulativeLimit)).toHaveLength(
+        0
+      );
     } finally {
       stringify.mockRestore();
     }

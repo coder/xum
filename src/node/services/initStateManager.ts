@@ -1,4 +1,7 @@
+import { randomUUID } from "node:crypto";
 import { EventEmitter } from "events";
+import * as fsPromises from "node:fs/promises";
+import * as path from "node:path";
 import type { Config } from "@/node/config";
 import { EventStore } from "@/node/utils/eventStore";
 import type { WorkspaceInitEvent } from "@/common/orpc/types";
@@ -6,6 +9,14 @@ import { log } from "@/node/services/log";
 import { INIT_HOOK_MAX_LINES } from "@/common/constants/toolLimits";
 import { getErrorMessage } from "@/common/utils/errors";
 import { clamp } from "@/common/utils/clamp";
+import { UnsanitizedTaskCheckoutError } from "@/node/services/unsanitizedTaskCheckout";
+import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
+import { initRecordLockDir, workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
+import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
+import {
+  acquireCrossProcessLock,
+  inspectCrossProcessLock,
+} from "@/node/utils/main/crossProcessLock";
 
 /**
  * Output line with timestamp for replay timing.
@@ -41,6 +52,20 @@ export interface InitStatus {
  * Currently identical to InitStatus, but kept separate for future extension.
  */
 type InitHookState = InitStatus;
+
+/** Renewal cadence for the lock kit only, as for the use leases: no build reclaims these by age. */
+const INIT_RECORD_LOCK_STALE_MS = 5 * 60 * 1000;
+
+/**
+ * #4918: this backend may still write a workspace's init record. Its lock is held from before
+ * startInit's "running" write until endInit's final write landed (or clearInMemoryState), so
+ * another backend's replay never judges a record its owner can still write. The init use lease
+ * does not cover that: it is taken after startInit and released before the final write lands.
+ */
+interface InitRecordClaim {
+  /** The record lock's release, or null when it could not be taken (replay then judges as before). */
+  lock: Promise<(() => Promise<void>) | null>;
+}
 
 /** Appended when replay finds a creation record that no live init owns (the app exited mid-way). */
 const INTERRUPTED_INIT_LINE =
@@ -90,7 +115,21 @@ export class InitStateManager extends EventEmitter {
     }
   >();
 
-  constructor(config: Config) {
+  /**
+   * Task checkouts whose launch sanitize failed (#4674). Terminal for the task id: removal may
+   * leave the checkout behind, so clearInMemoryState keeps it; a retained row's persisted marker
+   * covers restarts. MCP discovery and turns check it after waitForInit, which itself never
+   * throws (tools and inspection proceed).
+   */
+  private readonly unsanitizedCheckouts = new Set<string>();
+
+  /** Names this backend's init-record lock files (#4918). */
+  private readonly recordLockToken = randomUUID();
+  private readonly recordClaims = new Map<string, InitRecordClaim>();
+  /** Record-lock releases in flight: a restarted init takes the lock again only after them. */
+  private readonly recordReleases = new Map<string, Promise<void>>();
+
+  constructor(private readonly config: Config) {
     super();
     this.store = new EventStore(
       config,
@@ -192,10 +231,17 @@ export class InitStateManager extends EventEmitter {
     this.store.setState(workspaceId, state);
     // Persisted while running so an app exit mid-creation leaves a record for replayInit to
     // finalize; per-workspace writes are serialized, so endInit's later write lands after it.
+    // #4918: the write lands only once this backend's record lock is held, so no replay judges
+    // the record before then. A restarted init keeps the lock.
+    const lock = this.recordClaims.get(workspaceId)?.lock ?? this.acquireRecordLock(workspaceId);
+    this.recordClaims.set(workspaceId, { lock });
     void this.store.persist(
       workspaceId,
       { ...state, lines: [] },
-      { shouldWrite: () => this.store.hasState(workspaceId) }
+      {
+        beforeWrite: () => lock.then(() => undefined),
+        shouldWrite: () => this.store.getState(workspaceId) === state,
+      }
     );
 
     // Create completion promise for this init
@@ -215,9 +261,12 @@ export class InitStateManager extends EventEmitter {
 
     this.initPromises.set(workspaceId, {
       promise,
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       resolve: resolve!,
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       reject: reject!,
       hookPhasePromise,
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       resolveHookPhase: resolveHookPhase!,
     });
 
@@ -332,10 +381,15 @@ export class InitStateManager extends EventEmitter {
     };
 
     // Persist FIRST - ensures file exists before in-memory state shows completion
-    await this.store.persist(workspaceId, stateToPerist, {
+    const claim = this.recordClaims.get(workspaceId);
+    const persisted = await this.store.persist(workspaceId, stateToPerist, {
       // If WorkspaceService.remove() cleared init state, do not recreate ~/.xum/sessions/<id>/
       shouldWrite: () => this.store.hasState(workspaceId),
     });
+    // #4918: the final status landed, so another backend's replay may judge the record now. A
+    // failed write leaves it saying "running": keep the lock (fail closed) until the state is
+    // cleared or this process exits, so no replay records this init as interrupted.
+    if (persisted) await this.releaseRecordClaim(workspaceId, claim);
 
     // NOW update in-memory state (replay will now see file exists)
     state.status = finalStatus;
@@ -405,11 +459,11 @@ export class InitStateManager extends EventEmitter {
    */
   async replayInit(workspaceId: string): Promise<void> {
     if (!this.store.hasState(workspaceId)) {
-      const persisted = await this.store.readPersisted(workspaceId);
-      if (persisted?.status === "running") {
-        // Written by startInit and never finalized, with no live init here: the process that ran
-        // it is gone and the checkout may be empty or partial. Record the failure once so this
-        // and every later replay show the creation as failed.
+      const persisted = await this.readUnownedRunningInit(workspaceId);
+      if (persisted != null) {
+        // Written by startInit and never finalized, with no live init anywhere: the process that
+        // ran it is gone and the checkout may be empty or partial. Record the failure once so
+        // this and every later replay show the creation as failed.
         const endTime = Date.now();
         await this.store.persist(workspaceId, {
           ...persisted,
@@ -425,6 +479,88 @@ export class InitStateManager extends EventEmitter {
     }
     // Pass workspaceId as context for serialization
     await this.store.replay(workspaceId, { workspaceId });
+  }
+
+  /**
+   * The persisted init record if it says "running" but no init runs it anymore. The caller has
+   * no in-memory state for it; #4801: a live init lease (#4890) means another backend on this
+   * Xum root (the desktop app beside a `xum server`) still runs it, so the record is not ours to
+   * judge. Read again after the lease probe, so an owner that finished and released its lease
+   * meanwhile is judged by its final status, not by the stale "running".
+   */
+  private async readUnownedRunningInit(workspaceId: string): Promise<InitStatus | null> {
+    if ((await this.store.readPersisted(workspaceId))?.status !== "running") return null;
+    // #4918: the record lock covers the whole time an owner can write the record; the init lease
+    // is still probed for owners running an older build.
+    if (await workspaceUseLeasesFor(this.config).isHeld(workspaceId, "init")) return null;
+    if (await this.isRecordLockHeld(workspaceId)) return null;
+    const persisted = await this.store.readPersisted(workspaceId);
+    return persisted?.status === "running" ? persisted : null;
+  }
+
+  /** Take this backend's init-record lock for the workspace (#4918), or null if it fails. */
+  private async acquireRecordLock(workspaceId: string): Promise<(() => Promise<void>) | null> {
+    // The lock path is this backend's own: an earlier claim's release must finish first.
+    await this.recordReleases.get(workspaceId);
+    try {
+      return await acquireCrossProcessLock({
+        lockPath: path.join(
+          initRecordLockDir(this.config.rootDir, workspaceId),
+          `${this.recordLockToken}.lock`
+        ),
+        acquireTimeoutMs: 0,
+        staleMs: INIT_RECORD_LOCK_STALE_MS,
+        timeoutMessage: `The init record lock of ${workspaceId} is unexpectedly held.`,
+      });
+    } catch (error) {
+      log.warn(`Failed to take the init record lock for ${workspaceId}`, {
+        error: getErrorMessage(error),
+      });
+      return null;
+    }
+  }
+
+  /** Release the claim's record lock unless a newer startInit took it over (it releases then). */
+  private async releaseRecordClaim(
+    workspaceId: string,
+    claim: InitRecordClaim | undefined
+  ): Promise<void> {
+    if (claim == null || this.recordClaims.get(workspaceId) !== claim) return;
+    this.recordClaims.delete(workspaceId);
+    const releasing = (async () => {
+      // A status write already past its shouldWrite check still lands: drain the workspace's
+      // queued writes (a no-op turn on their lock) before a replay may judge the record.
+      await workspaceFileLocks.withLock(workspaceId, () => Promise.resolve());
+      const release = await claim.lock;
+      await release?.().catch((error: unknown) => {
+        // A failed release leaves the lock held (fail closed): replays leave the record alone.
+        log.warn(`Failed to release the init record lock for ${workspaceId}`, {
+          error: getErrorMessage(error),
+        });
+      });
+    })();
+    this.recordReleases.set(workspaceId, releasing);
+    await releasing;
+    if (this.recordReleases.get(workspaceId) === releasing) this.recordReleases.delete(workspaceId);
+  }
+
+  /** Whether any backend's live init-record lock exists for the workspace (#4918). */
+  private async isRecordLockHeld(workspaceId: string): Promise<boolean> {
+    const dir = initRecordLockDir(this.config.rootDir, workspaceId);
+    let names: string[];
+    try {
+      names = await fsPromises.readdir(dir);
+    } catch (error) {
+      // Unreadable: its holders cannot be ruled out.
+      return !hasErrorCode(error, "ENOENT");
+    }
+    for (const name of names) {
+      // Only published lock files: the kit's temp and takeover-guard files end differently. This
+      // backend's own is skipped: with no in-memory state here (replayInit), it is being released.
+      if (!name.endsWith(".lock") || name === `${this.recordLockToken}.lock`) continue;
+      if ((await inspectCrossProcessLock(path.join(dir, name))).state === "held") return true;
+    }
+    return false;
   }
 
   /**
@@ -445,6 +581,9 @@ export class InitStateManager extends EventEmitter {
    */
   clearInMemoryState(workspaceId: string): void {
     this.store.deleteState(workspaceId);
+    // Cleared state writes nothing more, so the record lock (#4918) goes too. Not awaited: callers
+    // clear synchronously, and a late release only makes replays leave the record alone longer.
+    void this.releaseRecordClaim(workspaceId, this.recordClaims.get(workspaceId));
 
     // Cancel any running init promise for this workspace
     const promiseEntry = this.initPromises.get(workspaceId);
@@ -453,6 +592,27 @@ export class InitStateManager extends EventEmitter {
       promiseEntry.resolveHookPhase();
       this.initPromises.delete(workspaceId);
     }
+  }
+
+  /** Record a task checkout whose launch sanitize failed, before its init completes (#4674). */
+  markCheckoutUnsanitized(workspaceId: string): void {
+    this.unsanitizedCheckouts.add(workspaceId);
+  }
+
+  getUnsanitizedCheckoutError(workspaceId: string): UnsanitizedTaskCheckoutError | undefined {
+    return this.unsanitizedCheckouts.has(workspaceId) || this.hasPersistedMarker(workspaceId)
+      ? new UnsanitizedTaskCheckoutError(workspaceId)
+      : undefined;
+  }
+
+  /** The row's persisted marker (written with the launch failure) survives a restart. */
+  private hasPersistedMarker(workspaceId: string): boolean {
+    // Stat-keyed snapshot: cheap on the send and discovery paths.
+    for (const project of this.config.loadConfigOrDefault().projects.values()) {
+      const row = project.workspaces.find((workspace) => workspace.id === workspaceId);
+      if (row) return row.taskCheckoutUnsanitized === true;
+    }
+    return false;
   }
 
   /**

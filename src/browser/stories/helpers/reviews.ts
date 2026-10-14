@@ -1,18 +1,12 @@
-import type { ReviewSortOrder } from "@/common/types/review";
-import type { HunkFirstSeenState } from "@/browser/hooks/useHunkFirstSeen";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import type { Review } from "@/common/types/review";
-import { getHunkFirstSeenKey, REVIEW_SORT_ORDER_KEY } from "@/common/constants/storage";
+import { seedMockReviewState } from "@/browser/stories/mocks/reviewState";
 
-/** Set hunk first-seen timestamps for a workspace (for storybook) */
+/**
+ * Set hunk first-seen timestamps for a workspace (for storybook). Seeds the mock backend's
+ * review state, so call it before creating the story's mock client.
+ */
 export function setHunkFirstSeen(workspaceId: string, firstSeen: Record<string, number>): void {
-  const state: HunkFirstSeenState = { firstSeen };
-  updatePersistedState(getHunkFirstSeenKey(workspaceId), state);
-}
-
-/** Set the review panel sort order (global) */
-export function setReviewSortOrder(order: ReviewSortOrder): void {
-  localStorage.setItem(REVIEW_SORT_ORDER_KEY, JSON.stringify(order));
+  seedMockReviewState(workspaceId, { firstSeen });
 }
 
 /** Create a sample review for stories */

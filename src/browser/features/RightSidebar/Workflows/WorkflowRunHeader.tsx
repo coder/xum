@@ -1,7 +1,7 @@
 import React from "react";
 import { Check, ChevronRight, Clock, Coins, Play, RotateCcw, Square, Workflow } from "lucide-react";
 
-import { useAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 import { canRetryWorkflowFromCheckpoint } from "@/common/utils/workflowRetryEligibility";
 
@@ -17,7 +17,7 @@ import {
 const BTN_BASE =
   "inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition-colors disabled:cursor-default disabled:opacity-50";
 const BTN_DEFAULT = `${BTN_BASE} border-border bg-surface-secondary text-foreground hover:bg-hover`;
-const BTN_ACCENT = `${BTN_BASE} border-accent bg-accent text-white hover:opacity-90`;
+const BTN_ACCENT = `${BTN_BASE} border-accent bg-accent text-accent-foreground hover:bg-accent-button-hover`;
 
 function isInlineWorkflowPath(scriptPath: string): boolean {
   return scriptPath.startsWith("inline://");
@@ -48,8 +48,11 @@ interface WorkflowRunHeaderProps {
 }
 
 export const WorkflowRunHeader: React.FC<WorkflowRunHeaderProps> = (props) => {
-  const { api } = useAPI();
+  // Run actions need a live connection. While Xum reconnects the run stays on screen, but its
+  // actions are disabled (`blocked`), so a click never silently does nothing.
+  const api = useLiveAPI();
   const [busy, setBusy] = React.useState(false);
+  const blocked = busy || api == null;
   const [actionError, setActionError] = React.useState<string | null>(null);
 
   const run = props.run;
@@ -62,7 +65,7 @@ export const WorkflowRunHeader: React.FC<WorkflowRunHeaderProps> = (props) => {
   const canRerun = rerunScriptPath != null;
 
   const runAction = async (action: () => Promise<unknown>) => {
-    if (api == null || busy) {
+    if (blocked) {
       return;
     }
     setBusy(true);
@@ -81,14 +84,17 @@ export const WorkflowRunHeader: React.FC<WorkflowRunHeaderProps> = (props) => {
   // guard + error state) so they satisfy onClick's void-return contract.
   const interrupt = () => {
     void runAction(() =>
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       api!.workflows.interrupt({ workspaceId: props.workspaceId, runId: run.id })
     );
   };
   const resume = () => {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     void runAction(() => api!.workflows.resume({ workspaceId: props.workspaceId, runId: run.id }));
   };
   const retry = () => {
     void runAction(() =>
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       api!.workflows.retryFromCheckpoint({ workspaceId: props.workspaceId, runId: run.id })
     );
   };
@@ -97,6 +103,7 @@ export const WorkflowRunHeader: React.FC<WorkflowRunHeaderProps> = (props) => {
       return;
     }
     void runAction(() =>
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       api!.workflows.start({
         workspaceId: props.workspaceId,
         scriptPath: rerunScriptPath,
@@ -218,16 +225,16 @@ export const WorkflowRunHeader: React.FC<WorkflowRunHeaderProps> = (props) => {
 
       <div className="flex flex-wrap gap-2">
         {isLive ? (
-          <button type="button" className={BTN_DEFAULT} onClick={interrupt} disabled={busy}>
+          <button type="button" className={BTN_DEFAULT} onClick={interrupt} disabled={blocked}>
             <Square className="h-3 w-3" /> Interrupt
           </button>
         ) : run.status === "interrupted" ? (
           <>
-            <button type="button" className={BTN_ACCENT} onClick={resume} disabled={busy}>
+            <button type="button" className={BTN_ACCENT} onClick={resume} disabled={blocked}>
               <Play className="h-3 w-3" /> Resume
             </button>
             {canRerun && (
-              <button type="button" className={BTN_DEFAULT} onClick={rerun} disabled={busy}>
+              <button type="button" className={BTN_DEFAULT} onClick={rerun} disabled={blocked}>
                 <RotateCcw className="h-3 w-3" /> Re-run
               </button>
             )}
@@ -235,12 +242,12 @@ export const WorkflowRunHeader: React.FC<WorkflowRunHeaderProps> = (props) => {
         ) : (
           <>
             {canRetry && (
-              <button type="button" className={BTN_ACCENT} onClick={retry} disabled={busy}>
+              <button type="button" className={BTN_ACCENT} onClick={retry} disabled={blocked}>
                 <Play className="h-3 w-3" /> Retry from checkpoint
               </button>
             )}
             {canRerun && (
-              <button type="button" className={BTN_DEFAULT} onClick={rerun} disabled={busy}>
+              <button type="button" className={BTN_DEFAULT} onClick={rerun} disabled={blocked}>
                 <RotateCcw className="h-3 w-3" /> Re-run
               </button>
             )}

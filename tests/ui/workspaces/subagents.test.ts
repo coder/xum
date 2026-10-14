@@ -34,9 +34,7 @@ import { cleanupView, setupWorkspaceView } from "../helpers";
 import { renderApp, type RenderedApp } from "../renderReviewPanel";
 
 function getWorkspaceRow(container: HTMLElement, workspaceId: string): HTMLElement | null {
-  return container.querySelector(
-    `[data-workspace-id="${workspaceId}"][role="button"]`
-  ) as HTMLElement | null;
+  return container.querySelector(`[data-workspace-id="${workspaceId}"][role="button"]`);
 }
 
 function getSubagentConnector(container: HTMLElement, workspaceId: string): HTMLElement | null {
@@ -59,9 +57,9 @@ async function findWorkspaceActionsButton(params: {
 }): Promise<HTMLButtonElement> {
   return waitFor(
     () => {
-      const button = params.container.querySelector(
+      const button = params.container.querySelector<HTMLButtonElement>(
         `button[aria-label="Workspace actions for ${params.title}"]`
-      ) as HTMLButtonElement | null;
+      );
       if (!button) {
         throw new Error(`Workspace actions button not found for ${params.title}`);
       }
@@ -74,7 +72,7 @@ async function findWorkspaceActionsButton(params: {
 async function findMenuItem(label: string): Promise<HTMLButtonElement> {
   return waitFor(
     () => {
-      const buttons = Array.from(document.querySelectorAll("button")) as HTMLButtonElement[];
+      const buttons = Array.from(document.querySelectorAll("button"));
       const menuItem = buttons.find((button) => button.textContent?.includes(label));
       if (!menuItem) {
         throw new Error(`Menu item not found: ${label}`);
@@ -96,7 +94,7 @@ function getAncestorTrunkSegments(container: HTMLElement, workspaceId: string): 
     return [];
   }
 
-  return Array.from(wrapper.querySelectorAll('[data-testid="ancestor-trunk"]')) as HTMLElement[];
+  return Array.from(wrapper.querySelectorAll('[data-testid="ancestor-trunk"]'));
 }
 
 interface SubagentSidebarHarness {
@@ -242,7 +240,7 @@ describe("Workspace sidebar completed sub-agent expansion (UI)", () => {
       );
       const renameInput = renderedView.container.querySelector(
         `input[aria-label="Edit title for workspace ${parentDisplayTitle}"]`
-      ) as HTMLInputElement;
+      )!;
       fireEvent.keyDown(renameInput, { key: "Escape" });
 
       const parentActionsButton = await findWorkspaceActionsButton({
@@ -256,6 +254,40 @@ describe("Workspace sidebar completed sub-agent expansion (UI)", () => {
       );
       expect(menuLabels.some((label) => label.includes("Show sub-agents"))).toBe(false);
       expect(menuLabels.some((label) => label.includes("Hide sub-agents"))).toBe(false);
+    } finally {
+      await harness.cleanup();
+    }
+  }, 90_000);
+
+  test("offers heartbeat configuration on parent rows but not on sub-agent rows", async () => {
+    const harness = await createSubagentSidebarHarness();
+    const { env, repoPath } = harness;
+
+    try {
+      const parentWorkspace = await harness.createWorkspace("Heartbeat Parent", "heartbeat-parent");
+      const childWorkspace = await harness.createWorkspace("Heartbeat Child", "heartbeat-child");
+      await env.config.addWorkspace(repoPath, {
+        ...childWorkspace,
+        parentWorkspaceId: parentWorkspace.id,
+        taskStatus: "running",
+      });
+
+      const renderedView = await harness.render(parentWorkspace);
+      const openMenuLabels = async (title: string) => {
+        fireEvent.click(
+          await findWorkspaceActionsButton({ container: renderedView.container, title })
+        );
+        await findMenuItem("Generate new title");
+        return Array.from(document.querySelectorAll("button")).map(
+          (button) => button.textContent ?? ""
+        );
+      };
+
+      const childLabels = await openMenuLabels(childWorkspace.title ?? childWorkspace.name);
+      expect(childLabels.some((label) => label.includes("Configure heartbeat"))).toBe(false);
+
+      const parentLabels = await openMenuLabels(parentWorkspace.title ?? parentWorkspace.name);
+      expect(parentLabels.some((label) => label.includes("Configure heartbeat"))).toBe(true);
     } finally {
       await harness.cleanup();
     }

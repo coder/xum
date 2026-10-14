@@ -1,6 +1,7 @@
 import { tool } from "ai";
 import assert from "node:assert/strict";
 // NOTE: We avoid readline; consume Web Streams directly to prevent race conditions
+import * as fs from "fs";
 import * as path from "path";
 import {
   BASH_DEFAULT_TIMEOUT_SECS,
@@ -22,6 +23,7 @@ import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools"
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { toBashTaskId } from "./taskId";
 import { migrateToBackground } from "@/node/services/backgroundProcessExecutor";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import { getToolEnvPath } from "@/node/services/hooks";
 import {
@@ -30,13 +32,14 @@ import {
   gitNoRepoAutomationEnv,
   gitNoRepoAutomationEnvForLocalRepo,
   gitNoRepoAutomationEnvForRuntimeRepo,
+  LOCAL_DISCOVERY_AUTOMATION_ERROR,
 } from "@/node/utils/gitNoHooksEnv";
 import { getErrorMessage } from "@/common/utils/errors";
 import { emitChatEventBestEffort } from "./toolUtils";
 import type { BackgroundProcessMonitorConfig } from "@/node/services/backgroundProcessManager";
 
 const CAT_FILE_READ_NOTICE =
-  "[IMPORTANT]\n\nDO NOT use `cat`, `rg`, or `grep` to read files. Use the `file_read` tool instead (supports offset/limit paging). Bash output may be truncated or auto-filtered, which can hide parts of the file.";
+  "Use the `file_read` tool to read files instead of `cat`, `rg`, or `grep`: bash output may be truncated or auto-filtered, which can hide parts of the file, and file_read supports offset/limit paging.";
 
 function prependToolNote(existing: string | undefined, extra: string): string {
   if (!existing) {
@@ -869,6 +872,20 @@ export function buildBashToolDescription(cwd: string, projects: ProjectRef[]): s
 }
 
 /**
+ * Local discovery treats `git -C <path>` exit 128 as "not a repository" and returns only the
+ * static env, so a missing directory would silently skip the repo's driver config. Fail
+ * instead; remote discovery already fails on a missing cwd.
+ */
+async function assertLocalRepoDirectoryExists(repoPath: string): Promise<void> {
+  const stats = await fs.promises.stat(repoPath).catch(() => null);
+  if (!stats?.isDirectory()) {
+    throw new Error(LOCAL_DISCOVERY_AUTOMATION_ERROR, {
+      cause: new Error(`Repository directory does not exist: ${repoPath}`),
+    });
+  }
+}
+
+/**
  * Bash execution tool factory for AI assistant
  * Creates a bash tool that can execute commands with a configurable timeout
  * @param config Required configuration including working directory
@@ -918,8 +935,12 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
       // selected by highest-precedence .git/info/attributes on every runtime.
       let hooksEnv: Record<string, string> = {};
       if (!gitHooksAllowed(config.trusted)) {
+        // getProjects() returns one entry even for a single-project workspace, whose cwd is
+        // the checkout itself (or a directory inside it). Only a multi-project cwd (the
+        // _workspaces/<name> container with one <projectName> symlink per checkout) is joined
+        // with project names. The threshold matches isMultiProject().
         const repoPaths =
-          config.projects != null && config.projects.length > 0
+          config.projects != null && config.projects.length > 1
             ? [
                 ...new Set(
                   config.projects.map((project) => path.join(config.cwd, project.projectName))
@@ -928,10 +949,12 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
             : [config.cwd];
         const repoEnvs: Array<Record<string, string>> = [];
         for (const repoPath of repoPaths) {
-          repoEnvs.push(
-            config.runtime instanceof LocalBaseRuntime
-              ? await gitNoRepoAutomationEnvForLocalRepo(repoPath, abortSignal, true)
-              : config.runtime != null
+          if (config.runtime instanceof LocalBaseRuntime) {
+            await assertLocalRepoDirectoryExists(repoPath);
+            repoEnvs.push(await gitNoRepoAutomationEnvForLocalRepo(repoPath, abortSignal, true));
+          } else {
+            repoEnvs.push(
+              config.runtime != null
                 ? await gitNoRepoAutomationEnvForRuntimeRepo(
                     config.runtime,
                     repoPath,
@@ -939,7 +962,8 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
                     true
                   )
                 : gitNoRepoAutomationEnv()
-          );
+            );
+          }
         }
         hooksEnv = combineGitNoRepoAutomationEnvs(repoEnvs);
       }
@@ -1022,6 +1046,17 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
           };
         }
 
+        // B2: a stopped stream (archive, removal) must not start a background process. Checked
+        // right before spawn(), whose admission runs synchronously, so a stop that lands later
+        // finds this spawn pending (cleanup waits for it) or the workspace sealed.
+        if (abortSignal?.aborted) {
+          return withNotice({
+            success: false,
+            error: "Command execution was aborted",
+            exitCode: -1,
+            wall_duration_ms: 0,
+          });
+        }
         const startTime = performance.now();
         const spawnResult = await config.backgroundProcessManager.spawn(
           config.runtime,
@@ -1378,6 +1413,9 @@ ${scriptWithEnv}`;
       // normal completion path so we don't drop any last-millisecond output (especially
       // on Windows, where stream/exit events can arrive slightly out of order).
       const BACKGROUND_EXIT_GRACE_MS = 100;
+      // Bounded wait for a terminated command's exit after a failed migration (#4805), like the
+      // MCP stdio kill join: a removal's cleanup() waits on the migration until then.
+      const FAILED_MIGRATION_EXIT_JOIN_MS = 5_000;
 
       let exitCode: number;
       try {
@@ -1392,6 +1430,36 @@ ${scriptWithEnv}`;
         // If the process already exited, drain the foreground streams for reliable output
         // instead of backgrounding based on timing.
         if (shouldBackground) {
+          // Tracked from here until the command is registered below, terminated after a failed
+          // migration, or found exited: a cleanup() in between waits for it (#4805), including
+          // the awaited name claim and exit grace (#4967). Refused (not admitted) once cleanup
+          // has started for the workspace (#4967).
+          const migration =
+            config.backgroundProcessManager && config.workspaceId
+              ? config.backgroundProcessManager.beginMigration(config.workspaceId)
+              : undefined;
+          // Ends the migration with this block, unless the failed-migration path below hands it
+          // to the terminated command's exit (#5522).
+          let migrationHandedToExit = false;
+          using _endMigration = {
+            [Symbol.dispose]: () => {
+              if (!migrationHandedToExit) migration?.[Symbol.dispose]();
+            },
+          };
+          // Claim the migrated record's name across backends BEFORE the exit check below
+          // (#4878): the claim may wait on another backend's spawn lock, and a command that
+          // exits during that wait must take the normal completion path, not be reported as
+          // backgrounded (or as a failed migration). The lock stays held until the migrated
+          // record directory exists (end of this block). A refused migration claims nothing:
+          // cleanup() is waiting for it, and the lock can be held for its whole timeout.
+          const claim =
+            config.backgroundProcessManager && config.workspaceId && migration?.admitted
+              ? await config.backgroundProcessManager.claimMigrationProcessId(
+                  config.workspaceId,
+                  safeDisplayName
+                )
+              : null;
+          await using claimLock = claim?.success ? claim : null;
           const didExit =
             exitCodeResolved ||
             (await Promise.race([
@@ -1402,6 +1470,12 @@ ${scriptWithEnv}`;
             ]));
 
           if (didExit) {
+            // Nothing was written under the claimed name. Release it before draining, which
+            // can outlast the exit (e.g. a grandchild holding stdout open).
+            claimLock?.releaseName();
+            await claimLock?.[Symbol.asyncDispose]();
+            // Nor is the command migrating any more; cleanup() must not wait for the drain.
+            migration?.[Symbol.dispose]();
             const completed = await foregroundCompletion;
             exitCode = completed[0];
           } else {
@@ -1430,14 +1504,14 @@ ${scriptWithEnv}`;
             const wall_duration_ms = Math.round(performance.now() - startTime);
 
             // Migrate to background tracking if manager is available
-            let migrationError = "background process manager unavailable";
-            if (config.backgroundProcessManager && config.workspaceId) {
-              // Allocate-and-reserve atomically: the migration awaits below would otherwise
-              // let a concurrent same-name migration receive the same ID and share this
-              // process's output directory and manager entry (see reserveUniqueProcessId).
-              const reservation =
-                config.backgroundProcessManager.reserveUniqueProcessId(safeDisplayName);
-              const processId = reservation.processId;
+            let migrationError =
+              migration?.admitted === false
+                ? "the workspace's background processes are being cleaned up"
+                : claim?.success === false
+                  ? claim.error
+                  : "background process manager unavailable";
+            if (config.backgroundProcessManager && config.workspaceId && claimLock) {
+              const processId = claimLock.processId;
 
               // Create a synthetic ExecStream for the migration streams
               // The UI streams are still being consumed, migration streams continue to files
@@ -1457,6 +1531,9 @@ ${scriptWithEnv}`;
                   processId,
                   script,
                   existingOutput: lines,
+                  // Abort is detached from the tool call once backgrounded, so the wrapped
+                  // controller now only fires through the handle's terminate (#4760).
+                  kill: () => wrappedAbortController.abort(),
                 },
                 config.backgroundProcessManager.getBgOutputDir()
               );
@@ -1471,7 +1548,7 @@ ${scriptWithEnv}`;
                   safeDisplayName
                 );
                 // The processes map now holds the name; the reservation has done its job.
-                reservation.release();
+                claimLock.releaseName();
 
                 return withNotice({
                   success: true,
@@ -1486,7 +1563,9 @@ ${scriptWithEnv}`;
               // name reserved until the aborted process's exit actually settles; if it never
               // does, leaking the name for the session is the safe fail-closed behavior.
               migrationError = migrateResult.error;
-              void execStream.exitCode.catch(() => undefined).finally(() => reservation.release());
+              void execStream.exitCode
+                .catch(() => undefined)
+                .finally(() => claimLock.releaseName());
             }
 
             // Migration failure (e.g. ENOSPC/EACCES creating the output dir) leaves neither a
@@ -1502,6 +1581,23 @@ ${scriptWithEnv}`;
             stderrForMigration.cancel().catch(() => {
               /* ignore */ return;
             });
+            // Keep the migration pending until the terminated command's exit settles, even past
+            // the bounded join below, so a removal's cleanup() keeps waiting (and fails closed at
+            // its drain deadline) instead of deleting the checkout under a command whose kill
+            // has not taken effect yet (#5522).
+            // A rejected exitCode (e.g. a remote transport error) does not confirm the stop, so the
+            // migration then stays pending for the session: removal and archive keep failing
+            // closed rather than deleting the checkout under a command that may still run. Session
+            // disposal, which deletes nothing, does not wait for a stopping migration (#5589).
+            migrationHandedToExit = true;
+            migration?.markStopping();
+            void execStream.exitCode.then(
+              () => migration?.[Symbol.dispose](),
+              () => undefined
+            );
+            await raceWithAbortAndTimeout(execStream.exitCode, {
+              timeoutMs: FAILED_MIGRATION_EXIT_JOIN_MS,
+            }).catch(() => undefined);
             return withNotice({
               success: false,
               error: `Failed to send process to background (${migrationError}); the process was terminated because it could not be tracked.\n\nOutput so far (${lines.length} lines):\n${lines.slice(-20).join("\n")}${lines.length > 20 ? "\n...(showing last 20 lines)" : ""}`,

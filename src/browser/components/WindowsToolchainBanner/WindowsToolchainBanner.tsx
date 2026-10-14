@@ -2,8 +2,8 @@ import { useEffect, useState } from "react";
 import { AlertTriangle, X } from "lucide-react";
 
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { WINDOWS_TOOLCHAIN_BANNER_DISMISSED_KEY } from "@/common/constants/storage";
 
-const WINDOWS_TOOLCHAIN_BANNER_DISMISSED_KEY = "windowsToolchainBannerDismissedAt";
 const DISMISS_DURATION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 /**

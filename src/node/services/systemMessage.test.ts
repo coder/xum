@@ -1,9 +1,17 @@
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
-import { buildSystemMessage, extractToolInstructions, readToolInstructions } from "./systemMessage";
+import {
+  buildSystemMessageFromSources,
+  extractToolInstructions,
+  extractToolInstructionsFromSources,
+  loadWorkspaceInstructionSources,
+  type BuildSystemMessageFromSourcesOptions,
+} from "./systemMessage";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProjectConfig } from "@/common/types/project";
+import type { MCPServerMap } from "@/common/types/mcp";
+import type { Runtime } from "@/node/runtime/Runtime";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 
 const extractTagContent = (message: string, tagName: string): string | null => {
@@ -15,6 +23,58 @@ import { describe, test, expect, beforeEach, afterEach, spyOn, type Mock } from 
 import { randomUUID } from "node:crypto";
 import * as markdown from "@/node/utils/main/markdown";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+
+// Stream startup loads one instruction-source snapshot (turnContextAssembler) and shares it
+// between the prompt and tool-instruction extraction (turnRequestBuilder). These helpers run
+// that same load-then-derive sequence so each test reads real files through the runtime.
+async function buildSystemMessage(
+  metadata: WorkspaceMetadata,
+  runtime: Runtime,
+  workspacePath: string,
+  additionalSystemInstructions?: string,
+  modelString?: string,
+  mcpServers?: MCPServerMap,
+  options?: BuildSystemMessageFromSourcesOptions & {
+    projectConfigs?: Map<string, ProjectConfig>;
+    claudeSkillsCompatEnabled?: boolean;
+  }
+): Promise<string> {
+  const sources = await loadWorkspaceInstructionSources(
+    metadata,
+    runtime,
+    workspacePath,
+    options?.projectConfigs,
+    options?.claudeSkillsCompatEnabled
+  );
+  return buildSystemMessageFromSources(
+    metadata,
+    sources,
+    workspacePath,
+    additionalSystemInstructions,
+    modelString,
+    mcpServers,
+    options
+  );
+}
+
+async function readToolInstructions(
+  metadata: WorkspaceMetadata,
+  runtime: Runtime,
+  workspacePath: string,
+  modelString: string,
+  agentInstructions?: readonly string[],
+  projectConfigs?: Map<string, ProjectConfig>,
+  claudeSkillsCompatEnabled = false
+): Promise<Record<string, string>> {
+  const sources = await loadWorkspaceInstructionSources(
+    metadata,
+    runtime,
+    workspacePath,
+    projectConfigs,
+    claudeSkillsCompatEnabled
+  );
+  return extractToolInstructionsFromSources(sources, modelString, metadata, agentInstructions);
+}
 
 // Note: in this file we avoid tests that are merely tautological assertions of constants. Only
 // tests that verify branching logic should be here.
@@ -253,6 +313,46 @@ Use clear examples.
     const customInstructions = extractTagContent(systemMessage, "custom-instructions") ?? "";
     expect(customInstructions).toContain("Always be helpful.");
     expect(customInstructions).toContain("Use clear examples.");
+  });
+
+  test("promises $XUM_SCRATCH_DIR locally always and remotely only when it is set", async () => {
+    const base: WorkspaceMetadata = {
+      id: "test-workspace",
+      name: "test-workspace",
+      projectName: "test-project",
+      projectPath: projectDir,
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    };
+    const environmentFor = async (
+      runtimeConfig: WorkspaceMetadata["runtimeConfig"],
+      scratchDirSet: boolean
+    ) =>
+      extractTagContent(
+        await buildSystemMessage(
+          { ...base, runtimeConfig },
+          runtime,
+          workspaceDir,
+          undefined,
+          undefined,
+          undefined,
+          { scratchDirSet }
+        ),
+        "environment"
+      ) ?? "";
+
+    // Local/worktree use the host session dir, which always exists.
+    expect(await environmentFor(DEFAULT_RUNTIME_CONFIG, false)).toContain("$XUM_SCRATCH_DIR");
+    expect(await environmentFor({ type: "local" }, false)).toContain("$XUM_SCRATCH_DIR");
+    // Remote runtimes get one only with the Artifacts experiment and once the runtime confirmed
+    // it (runtimeScratchDir.ts): the line follows whether it is set this turn.
+    for (const remote of [
+      { type: "ssh", host: "example.test", srcBaseDir: "/srv/src" },
+      { type: "docker", image: "node:20" },
+      { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" },
+    ] as const) {
+      expect(await environmentFor(remote, true)).toContain("$XUM_SCRATCH_DIR");
+      expect(await environmentFor(remote, false)).not.toContain("$XUM_SCRATCH_DIR");
+    }
   });
 
   describe("Claude global instruction compatibility", () => {

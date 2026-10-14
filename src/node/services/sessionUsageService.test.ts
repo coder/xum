@@ -1,5 +1,5 @@
 import * as path from "path";
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import { SessionUsageService, type SessionUsageTokenStatsCacheV1 } from "./sessionUsageService";
 import type { HistoryService } from "./historyService";
 import type { Config } from "@/node/config";
@@ -404,19 +404,19 @@ describe("SessionUsageService", () => {
     it("keeps mixed-model session totals separate while lastRequest follows the latest write", async () => {
       const workspaceId = "test-workspace";
       const parentModel = "openai:gpt-5.2";
-      const advisorModel = "anthropic:claude-sonnet-4-20250514";
+      const intuitionModel = "anthropic:claude-sonnet-4-20250514";
       const parentUsage = createUsage(100, 50);
-      const advisorUsage = createUsage(40, 10);
+      const intuitionUsage = createUsage(40, 10);
 
       await service.recordUsage(workspaceId, parentModel, parentUsage);
-      await service.recordUsage(workspaceId, advisorModel, advisorUsage);
+      await service.recordUsage(workspaceId, intuitionModel, intuitionUsage);
 
       const result = await service.getSessionUsage(workspaceId);
       expect(result).toBeDefined();
       expect(result?.byModel[parentModel]).toEqual(parentUsage);
-      expect(result?.byModel[advisorModel]).toEqual(advisorUsage);
-      expect(result?.lastRequest?.model).toBe(advisorModel);
-      expect(result?.lastRequest?.usage).toEqual(advisorUsage);
+      expect(result?.byModel[intuitionModel]).toEqual(intuitionUsage);
+      expect(result?.lastRequest?.model).toBe(intuitionModel);
+      expect(result?.lastRequest?.usage).toEqual(intuitionUsage);
     });
 
     it("should update lastRequest with each recordUsage call", async () => {
@@ -672,10 +672,24 @@ describe("SessionUsageService", () => {
 
       await service.recordUsage(workspaceId, model, createUsageWithCosts(100, 50, 0.12, 0.08));
 
-      await service.resetSessionUsage(workspaceId);
+      await service.resetSessionUsage(workspaceId, 1_000);
 
       const result = await service.getSessionUsage(workspaceId);
-      expect(result).toEqual({ byModel: {}, version: 1 });
+      expect(result).toEqual({ byModel: {}, version: 1, forkedAt: 1_000 });
+    });
+
+    it("keeps the fork marker as the fork records its own usage", async () => {
+      const workspaceId = "forked-workspace";
+      await service.resetSessionUsage(workspaceId, 1_000);
+      await service.recordUsage(
+        workspaceId,
+        "claude-sonnet-4-20250514",
+        createUsageWithCosts(100, 50, 0.12, 0.08)
+      );
+
+      const result = await service.getSessionUsage(workspaceId);
+      expect(result?.forkedAt).toBe(1_000);
+      expect(Object.keys(result?.byModel ?? {})).toHaveLength(1);
     });
   });
 
@@ -732,6 +746,53 @@ describe("SessionUsageService", () => {
       expect(result!.byModel[model].output.tokens).toBe(53);
       expect(result!.lastRequest).toBeDefined();
     });
+  });
+
+  describe("peekTokenStatsCache", () => {
+    const workspaceId = "peek-workspace";
+    const cache: SessionUsageTokenStatsCacheV1 = {
+      version: 1,
+      computedAt: 1,
+      model: "gpt-4",
+      tokenizerName: "approx-4",
+      history: { messageCount: 1 },
+      consumers: [{ name: "User", tokens: 3, percentage: 100 }],
+      totalTokens: 3,
+      source: { historyReceipt: "receipt", inputsKey: "inputs" },
+    };
+    const writeUsageFile = async (contents: string) => {
+      const dir = path.join(config.sessionsDir, workspaceId);
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(path.join(dir, "session-usage.json"), contents);
+    };
+
+    it("returns the persisted cache, source included", async () => {
+      await writeUsageFile(JSON.stringify({ byModel: {}, version: 1, tokenStatsCache: cache }));
+      expect(await service.peekTokenStatsCache(workspaceId)).toEqual(cache);
+    });
+
+    for (const [name, contents] of [
+      ["a missing file", null],
+      ["corrupt JSON", "{ not json"],
+      ["a JSON null file", "null"],
+      [
+        "a bad cache schema",
+        JSON.stringify({ byModel: {}, version: 1, tokenStatsCache: { version: 2 } }),
+      ],
+    ] as const) {
+      it(`returns undefined for ${name} and never rebuilds from history`, async () => {
+        // A history row would make the getSessionUsage path rebuild; peek must not.
+        await historyService.appendToHistory(workspaceId, createMuxMessage("m", "user", "hi"));
+        if (contents !== null) await writeUsageFile(contents);
+        const iterateSpy = spyOn(historyService, "iterateFullHistoryUnderLock");
+        try {
+          expect(await service.peekTokenStatsCache(workspaceId)).toBeUndefined();
+          expect(iterateSpy).not.toHaveBeenCalled();
+        } finally {
+          iterateSpy.mockRestore();
+        }
+      });
+    }
   });
 
   describe("getSessionUsage", () => {
@@ -802,7 +863,7 @@ describe("SessionUsageService", () => {
         anthropic: { cacheCreationInputTokens: 10 },
       };
       const toolUsage = {
-        toolName: "advisor",
+        toolName: "intuition",
         toolCallId: "tool-call-1",
         timestamp: Date.now(),
         model,
@@ -870,7 +931,7 @@ describe("SessionUsageService", () => {
       const rawModel = "coder:prod-anthropic/claude-opus-4-5";
       const metadataModel = "anthropic:claude-opus-4-5";
       const toolUsage = {
-        toolName: "advisor",
+        toolName: "intuition",
         toolCallId: "tool-call-coder-1",
         timestamp: Date.now(),
         model: rawModel,
@@ -959,7 +1020,7 @@ describe("SessionUsageService", () => {
         },
       };
       const validOtherModelToolUsage = {
-        toolName: "advisor",
+        toolName: "intuition",
         toolCallId: "tool-call-valid-2",
         timestamp: 1_700_000_000_050,
         model: otherModel,

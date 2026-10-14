@@ -27,6 +27,7 @@ describe("formatModelDisplayName", () => {
     test("formats Sonnet models", () => {
       expect(formatModelDisplayName("claude-sonnet-4-5")).toBe("Sonnet 4.5");
       expect(formatModelDisplayName("claude-sonnet-4")).toBe("Sonnet 4");
+      expect(formatModelDisplayName("claude-sonnet-5-5")).toBe("Sonnet 5.5");
     });
 
     test("formats Opus models", () => {

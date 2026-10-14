@@ -4,10 +4,12 @@ import { AlertCircle, Check, ChevronDown, Clock3, Loader2, Pencil, Send } from "
 import { ChatDockSurface } from "@/browser/components/ChatPane/chatDockColumn";
 import { SEND_DISPATCH_MODES } from "@/browser/features/ChatInput/sendDispatchModes";
 import type { QueueDispatchMode } from "@/browser/features/ChatInput/types";
+import { ArtifactInteractionPill } from "@/browser/features/Messages/ArtifactInteractionPill";
 import { UserMessageContent } from "@/browser/features/Messages/UserMessageContent";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { cn } from "@/common/lib/utils";
+import { stripReviewBlocksForDisplay } from "@/common/types/review";
 
 interface QueuedMessageProps {
   message: QueuedMessageType;
@@ -27,9 +29,7 @@ interface QueuedPreview {
 
 function deriveQueuedPreview(message: QueuedMessageType): QueuedPreview {
   const hasReviews = (message.reviews?.length ?? 0) > 0;
-  const sanitizedText = hasReviews
-    ? message.content.replace(/<review>[\s\S]*?<\/review>\s*/g, "").trim()
-    : message.content;
+  const sanitizedText = hasReviews ? stripReviewBlocksForDisplay(message.content) : message.content;
 
   return {
     sanitizedText,
@@ -91,9 +91,19 @@ export const QueuedMessage: React.FC<QueuedMessageProps> = (props) => {
           >
             {/* Keep queued drafts bounded so long content never pushes the composer off-screen. */}
             <div className="max-h-[40vh] overflow-y-auto px-3 py-2">
+              {props.message.artifactInteraction != null && (
+                <div className="mb-1">
+                  {/* No workspace here: the label shows where it came from but opens nothing. */}
+                  <ArtifactInteractionPill
+                    interaction={props.message.artifactInteraction}
+                    workspaceId={null}
+                  />
+                </div>
+              )}
               <UserMessageContent
                 content={preview.sanitizedText || preview.fallbackLabel}
                 reviews={props.message.reviews}
+                artifactInteraction={props.message.artifactInteraction}
                 fileParts={props.message.fileParts}
                 variant="sent"
               />
@@ -114,7 +124,8 @@ export const QueuedMessage: React.FC<QueuedMessageProps> = (props) => {
             className="mt-1.5 flex max-w-full flex-wrap items-center justify-end gap-1 text-[11px]"
             data-component="QueuedMessageActions"
           >
-            {props.onEdit && (
+            {/* An artifact send is the artifact's message, not a draft: it cannot be edited. */}
+            {props.onEdit && props.message.artifactInteraction == null && (
               <button
                 type="button"
                 onClick={props.onEdit}

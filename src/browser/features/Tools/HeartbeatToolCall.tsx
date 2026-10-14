@@ -224,7 +224,14 @@ export const HeartbeatToolCall: React.FC<HeartbeatToolCallProps> = (props) => {
     badge = { tone: "cleared", label: "Cleared" };
   } else if (settings) {
     badge = settings.enabled
-      ? { tone: "enabled", label: `Every ${formatHeartbeatIntervalShort(settings.intervalMs)}` }
+      ? {
+          tone: "enabled",
+          // The tool reports the effective interval; an absent one means the global default.
+          label:
+            settings.intervalMs != null
+              ? `Every ${formatHeartbeatIntervalShort(settings.intervalMs)}`
+              : "Enabled",
+        }
       : { tone: "disabled", label: "Paused" };
   } else if (success?.action === "get") {
     badge = { tone: "cleared", label: "Not set" };
@@ -269,9 +276,13 @@ export const HeartbeatToolCall: React.FC<HeartbeatToolCallProps> = (props) => {
                 <HeartbeatStat
                   label="Cadence"
                   value={
-                    <span className="counter-nums">
-                      every {formatHeartbeatInterval(settings.intervalMs)}
-                    </span>
+                    settings.intervalMs != null ? (
+                      <span className="counter-nums">
+                        every {formatHeartbeatInterval(settings.intervalMs)}
+                      </span>
+                    ) : (
+                      "global default"
+                    )
                   }
                 />
                 <HeartbeatStat label="Context" value={ctx.label} />

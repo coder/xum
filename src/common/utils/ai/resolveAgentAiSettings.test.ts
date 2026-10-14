@@ -10,7 +10,7 @@ import { InvalidExplicitAiSettingError, resolveAgentAiSettings } from "./resolve
 const MODEL_A = "custom:model-a";
 const MODEL_B = "custom:model-b";
 const MODEL_C = "custom:model-c";
-const PRO_MODEL = "openai:gpt-5.6";
+const PRO_MODEL = "openai:gpt-6.1-sol";
 
 function base(overrides: Partial<ResolveAgentAiSettingsInput>): ResolveAgentAiSettingsInput {
   return {
@@ -430,6 +430,24 @@ describe("resolveAgentAiSettings normalization and clamping", () => {
     );
     expect(result.selected.reasoningMode).toBe("pro");
     expect(result.effective.reasoningMode).toBeUndefined();
+  });
+
+  it("keeps selected cyber but drops it from effective settings where Cyber is unavailable", () => {
+    const resolve = (model: string, cyberModelEnabled = true) =>
+      resolveAgentAiSettings(
+        base({
+          targetWorkspaceSettings: { model, reasoningMode: "cyber" },
+          providersConfig: {
+            openai: { apiKeySet: true, isEnabled: true, isConfigured: true, cyberModelEnabled },
+          },
+        })
+      );
+
+    expect(resolve(PRO_MODEL).effective.reasoningMode).toBe("cyber");
+    for (const result of [resolve(PRO_MODEL, false), resolve("openai:gpt-6-luna")]) {
+      expect(result.selected.reasoningMode).toBe("cyber");
+      expect(result.effective.reasoningMode).toBeUndefined();
+    }
   });
 
   it("invalid persisted candidates fall through with diagnostics", () => {

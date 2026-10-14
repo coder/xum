@@ -4,6 +4,7 @@ import * as path from "node:path";
 
 import { describe, expect, test } from "bun:test";
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import { isPathSafeWorkspaceId, WorkflowRunStore } from "./WorkflowRunStore";
 
 const definition = {
@@ -14,6 +15,43 @@ const definition = {
 };
 
 const source = "export default async function workflow() { return 'ok'; }\n";
+
+/**
+ * Hold a store lock the way another live process would: this process's live crossProcessLock
+ * record, taken without the store's in-process queue.
+ */
+async function holdStoreLock(lockPath: string): Promise<() => Promise<void>> {
+  return await acquireCrossProcessLock({
+    lockPath,
+    acquireTimeoutMs: 0,
+    staleMs: 1_000,
+    timeoutMessage: "test lock busy",
+  });
+}
+
+/**
+ * One-shot pause on a store's next call of private method `method` (a real mutation, holding its
+ * locks). In-process holders wake waiters at once, unlike crossProcessLock's 250 ms retry.
+ */
+function pauseNext(store: WorkflowRunStore, method: "getRunUnlocked" | "writeRunFile") {
+  let signalEntered!: () => void;
+  let release!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    signalEntered = resolve;
+  });
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const internals = store as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
+  const original = internals[method].bind(store);
+  internals[method] = async (...args: unknown[]) => {
+    internals[method] = original;
+    signalEntered();
+    await released;
+    return await original(...args);
+  };
+  return { entered, release };
+}
 
 async function createStore(sessionDir: string, staleLeaseMs = 10) {
   const store = new WorkflowRunStore({ sessionDir, staleLeaseMs });
@@ -312,6 +350,86 @@ describe("WorkflowRunStore", () => {
     expect(run.events).toHaveLength(1);
     expect(run.steps).toHaveLength(1);
     expect(completed?.result?.structuredOutput).toEqual({ ok: true });
+  });
+
+  // zod >= 4.5 rejects minute-precision datetimes with a zone ("...T00:01Z") unless the schema
+  // allows them, and zod 4.4 accepted them. Xum writes toISOString (always with seconds), but a
+  // persisted record from a hand edit or another writer must stay readable: an unreadable
+  // run.json also makes createRunIfAbsent treat the run as half-created and delete it.
+  test("keeps minute-precision journal lines readable", async () => {
+    using tmp = new DisposableTempDir("workflow-runs-minute-precision");
+    const store = await createStore(tmp.path);
+    const runDir = path.join(tmp.path, "workflows", "wfr_123");
+
+    await store.appendEvent("wfr_123", {
+      sequence: 1,
+      type: "phase",
+      at: new Date("2026-05-29T00:00:01Z").toISOString(),
+      name: "scope",
+    });
+    await fs.appendFile(
+      path.join(runDir, "events.jsonl"),
+      [
+        { sequence: 2, type: "log", at: "2026-05-29T00:01Z", message: "minute precision" },
+        { sequence: 3, type: "log", at: "2026-05-29T00:02+02:00", message: "offset" },
+      ]
+        .map((event) => `${JSON.stringify(event)}\n`)
+        .join("")
+    );
+    await fs.appendFile(
+      path.join(runDir, "steps.jsonl"),
+      `${JSON.stringify({
+        stepId: "minute-step",
+        inputHash: "input:2",
+        status: "started",
+        startedAt: "2026-05-29T00:01Z",
+      })}\n`
+    );
+
+    const run = await store.getRun("wfr_123");
+
+    expect(run.events.map((event) => event.sequence)).toEqual([1, 2, 3]);
+    expect(run.steps.map((step) => step.startedAt)).toEqual(["2026-05-29T00:01Z"]);
+    expect(run.updatedAt).toBe("2026-05-29T00:02+02:00");
+  });
+
+  test("keeps a run.json with minute-precision timestamps readable and in place", async () => {
+    using tmp = new DisposableTempDir("workflow-runs-minute-precision-run");
+    const store = new WorkflowRunStore({ sessionDir: tmp.path });
+    const input = {
+      id: "wfr_child_minute",
+      workspaceId: "workspace-1",
+      workflow: definition,
+      source: source,
+      args: { topic: "nested" },
+      parentWorkflow: { runId: "wfr_parent", stepId: "child", inputHash: "hash:child", depth: 0 },
+      now: "2026-05-29T00:00:00.000Z",
+    };
+    await store.createRunIfAbsent(input);
+    await store.appendEvent("wfr_child_minute", {
+      sequence: 1,
+      type: "log",
+      at: "2026-05-29T00:00:01.000Z",
+      message: "kept",
+    });
+    const runFile = path.join(tmp.path, "workflows", "wfr_child_minute", "run.json");
+    const raw = JSON.parse(await fs.readFile(runFile, "utf-8")) as Record<string, unknown>;
+    await fs.writeFile(
+      runFile,
+      JSON.stringify({ ...raw, createdAt: "2026-05-29T00:00Z", updatedAt: "2026-05-29T00:01Z" })
+    );
+
+    await expect(store.getRun("wfr_child_minute")).resolves.toMatchObject({
+      createdAt: "2026-05-29T00:00Z",
+    });
+    await expect(store.getRunStatusSnapshot("wfr_child_minute")).resolves.toMatchObject({
+      id: "wfr_child_minute",
+    });
+    const again = await store.createRunIfAbsent(input);
+    expect(again.events.map((event) => event.type === "log" && event.message)).toEqual(["kept"]);
+    await expect(
+      fs.readFile(path.join(tmp.path, "workflows", "wfr_child_minute", "events.jsonl"), "utf-8")
+    ).resolves.toContain('"kept"');
   });
 
   test("rejects duplicate or out-of-order event sequence numbers", async () => {
@@ -1037,23 +1155,20 @@ describe("WorkflowRunStore", () => {
     using tmp = new DisposableTempDir("workflow-runs-active-writer-snapshot");
     const store = await createStore(tmp.path);
     await store.appendStatus("wfr_123", "running", "2026-05-29T00:00:01.000Z");
-    const lockDir = path.join(tmp.path, "workflows", "wfr_123", "events.jsonl.lock");
-    await fs.mkdir(lockDir);
-    await fs.appendFile(
-      path.join(tmp.path, "workflows", "wfr_123", "events.jsonl"),
-      `${JSON.stringify({
-        sequence: 2,
-        type: "status",
-        at: "2026-05-29T00:00:02.000Z",
-        status: "completed",
-      })}\n`,
-      "utf-8"
-    );
+    // A real writer, paused after its journal append and before its run.json rewrite: only its
+    // held events lock tells readers that the journal is ahead of the snapshot.
+    const pause = pauseNext(store, "writeRunFile");
+    const writer = store.appendStatus("wfr_123", "completed", "2026-05-29T00:00:02.000Z");
+    await pause.entered;
 
-    await expect(store.getRun("wfr_123")).resolves.toMatchObject({ status: "running" });
+    const whileWriting = (await store.getRun("wfr_123")).status;
+    pause.release();
+    await writer;
 
-    await fs.rm(lockDir, { recursive: true, force: true });
-    await expect(store.getRun("wfr_123")).resolves.toMatchObject({ status: "completed" });
+    expect({ whileWriting, after: (await store.getRun("wfr_123")).status }).toEqual({
+      whileWriting: "running",
+      after: "completed",
+    });
   });
 
   test("does not overwrite terminal runs with later interrupt status", async () => {
@@ -1129,12 +1244,13 @@ describe("WorkflowRunStore", () => {
     const store = await createStore(tmp.path);
 
     await expect(store.acquireLease("wfr_123", "runner-a", 1000)).resolves.toBe(true);
-    const lockDir = path.join(tmp.path, "workflows", "wfr_123", "lease.json.lock");
-    await fs.mkdir(lockDir);
+    const releaseLock = await holdStoreLock(
+      path.join(tmp.path, "workflows", "wfr_123", "lease.json.xlock")
+    );
 
     await expect(store.acquireLease("wfr_123", "runner-b", 1012)).resolves.toBe(false);
 
-    await fs.rm(lockDir, { recursive: true, force: true });
+    await releaseLock();
     await expect(store.acquireLease("wfr_123", "runner-b", 1012)).resolves.toBe(true);
   });
 
@@ -1145,12 +1261,17 @@ describe("WorkflowRunStore", () => {
     await expect(store.acquireLease("wfr_123", "runner-a", 1000)).resolves.toBe(true);
     const runDir = path.join(tmp.path, "workflows", "wfr_123");
     const leaseFile = path.join(runDir, "lease.json");
-    const lockDir = `${leaseFile}.lock`;
-    await fs.mkdir(lockDir);
+    // A fenced journal write holds the lease lock while paused.
+    const holder = pauseNext(store, "getRunUnlocked");
+    const fencedWrite = store.appendStatus("wfr_123", "running", "2026-05-29T00:00:01.000Z", {
+      expectedLeaseOwnerId: "runner-a",
+    });
+    await holder.entered;
 
     const renewal = store.renewLease("wfr_123", "runner-a", 1005);
     await fs.writeFile(leaseFile, JSON.stringify({ ownerId: "runner-b", acquiredAtMs: 1004 }));
-    await fs.rm(lockDir, { recursive: true, force: true });
+    holder.release();
+    await fencedWrite;
 
     await expect(renewal).resolves.toBe(false);
     await expect(fs.readFile(leaseFile, "utf-8")).resolves.toContain("runner-b");
@@ -1162,17 +1283,49 @@ describe("WorkflowRunStore", () => {
 
     await expect(store.acquireLease("wfr_123", "runner-a", 1000)).resolves.toBe(true);
     const leaseFile = path.join(tmp.path, "workflows", "wfr_123", "lease.json");
-    const lockDir = `${leaseFile}.lock`;
-    await fs.mkdir(lockDir);
+    const holder = pauseNext(store, "getRunUnlocked");
+    const fencedWrite = store.appendStatus("wfr_123", "running", "2026-05-29T00:00:01.000Z", {
+      expectedLeaseOwnerId: "runner-a",
+    });
+    await holder.entered;
 
     const release = store.releaseLease("wfr_123", "runner-a");
     await new Promise((resolve) => setTimeout(resolve, 5));
     await expect(fs.readFile(leaseFile, "utf-8")).resolves.toContain("runner-a");
 
-    await fs.rm(lockDir, { recursive: true, force: true });
+    holder.release();
+    await fencedWrite;
     await release;
 
     await expect(store.acquireLease("wfr_123", "runner-b", 1001)).resolves.toBe(true);
+  });
+
+  test("late lock-taking operations never recreate a deleted run directory", async () => {
+    using tmp = new DisposableTempDir("workflow-runs-deleted-run-dir");
+    const store = await createStore(tmp.path);
+    await expect(store.acquireLease("wfr_123", "runner-a", 1000)).resolves.toBe(true);
+    const runDir = path.join(tmp.path, "workflows", "wfr_123");
+    // Workspace/run cleanup removes the run directory under a live runner.
+    await fs.rm(runDir, { recursive: true, force: true });
+
+    const late = {
+      renew: await store.renewLease("wfr_123", "runner-a", 1005),
+      release: await store.releaseLease("wfr_123", "runner-a").then(
+        () => "resolved",
+        (error: unknown) => (error as { code?: string }).code
+      ),
+      append: await store
+        .appendStatus("wfr_123", "failed", "2026-05-29T00:00:02.000Z", {
+          expectedLeaseOwnerId: "runner-a",
+        })
+        .then(
+          () => "resolved",
+          (error: unknown) => (error as { code?: string }).code
+        ),
+    };
+
+    expect(late).toEqual({ renew: false, release: "ENOENT", append: "ENOENT" });
+    expect(await fs.readdir(path.join(tmp.path, "workflows"))).toEqual([]);
   });
 
   test("prevents concurrent runners while allowing stale lease recovery", async () => {

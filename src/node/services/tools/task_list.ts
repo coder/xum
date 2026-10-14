@@ -14,7 +14,7 @@ import { TaskListToolResultSchema, TOOL_DEFINITIONS } from "@/common/utils/tools
 import { isWorkspaceArchived } from "@/common/utils/archive";
 
 import { isNestedWorkflowRun } from "@/common/types/workflow";
-import type { TaskService } from "@/node/services/taskService";
+import type { TaskService, TaskTreeAgentsResult } from "@/node/services/taskService";
 import type { AgentTaskStatus } from "@/node/services/taskWorkspaceSeam";
 import type { Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { Config } from "@/node/config";
@@ -80,19 +80,19 @@ const INACTIVE_CHILD_RETENTION_NOTE = `Inactive persistent children remain avail
 
 const TREE_SCOPE_NOTE =
   'Rows (including the root "workspace" row) are addressable via task_send_message, except your own "self" row, best-of candidate rows (`bestOf` metadata, refused to preserve candidate independence), and non-descendant rows in terminal states like reported/interrupted (peers cannot reactivate a task — only its parent can); ' +
-  "the relationship field is computed relative to this workspace.";
+  "the relationship field is computed relative to this workspace. main_chat/side_chat rows are direct side-chat ↔ own-main links for explicit messaging only, not task ancestry or lifecycle control.";
 
 const TREE_SCOPE_RESTRICTED_NOTE =
   "This workspace cannot send or receive peer messages (best-of candidates stay independent; workflow-owned tasks communicate through the workflow journal), so only self/descendant rows are listed; descendants remain addressable via task_send_message guidance.";
 
 const INSTANCE_SCOPE_NOTE =
-  "Rows are local/worktree root workspaces in this Xum instance and an availability snapshot. Unrelated roots must opt in through their workspace settings; absent or revoked consent hides them, including from searches and counts. Non-local or unresolved runtimes, archived, user-stopped, stopping, and delegated-turn roots are omitted, and a listed target can still refuse if its state changes (including consent, runtime, or a delegated turn starting on it). " +
-  'Message them with task_send_message — "unrelated" rows receive your text as an untrusted agent message, queued to turn-end while they are busy, under their own agent/model settings; discovery grants no additional control. Your own "self" row is not addressable.';
+  'Rows are local/worktree root workspaces in this Xum instance and an availability snapshot. Unrelated roots must have consented (newly created roots are opted in by default, task(kind:"workspace") targets once their first turn ends; others enable it in their workspace settings); absent or revoked consent hides them, including from searches and counts. Non-local or unresolved runtimes, archived, user-stopped, stopping, and delegated-turn roots are omitted, and a listed target can still refuse if its state changes (including consent, runtime, or a delegated turn starting on it). ' +
+  'Message them with task_send_message — "unrelated" rows receive your text as an untrusted agent message, delivered at their next tool boundary while they are busy (or after the turn, if they chose that), under their own agent/model settings; discovery grants no additional control. Your own "self" row is not addressable.';
 
 // The tree note promises self/descendant rows, which would be false here: a restricted caller
 // gets no instance rows at all.
 const INSTANCE_SCOPE_RESTRICTED_NOTE =
-  "Instance discovery is unavailable from this workspace. Unrelated discovery and messaging require local/worktree runtimes and exclude best-of candidates and workflow-owned tasks. Existing same-tree messaging rules are unchanged; no instance rows are listed.";
+  "Instance discovery is unavailable from this workspace. Unrelated discovery and messaging require local/worktree runtimes and exclude side chats, best-of candidates and workflow-owned tasks. A side chat can discover its own main chat with scope tree for explicit messaging only. Existing same-tree messaging rules are unchanged; no instance rows are listed.";
 
 const INSTANCE_SCOPE_TRUNCATED_NOTE =
   " More rows match; pass `nextOffset` as `offset` to continue. Paging is best-effort while workspaces are created, removed, or archived, so restart from offset 0 or deduplicate by ID when completeness matters.";
@@ -231,9 +231,26 @@ function shouldHideArchivedWorkspaceTurn(
   );
 }
 
+/** Direct links are plain messaging addresses, not owned tasks or execution handles. */
+function relatedChatRows(
+  tree: TaskTreeAgentsResult,
+  includeWorkspaces: boolean
+): TaskListToolSuccessResult["tasks"] {
+  if (!includeWorkspaces || tree.callerPeerMessagingRestricted === true) return [];
+  return (tree.relatedChats ?? []).map((chat) => ({
+    taskId: chat.workspaceId,
+    status: "workspace" as const,
+    ...(chat.title != null ? { title: chat.title } : {}),
+    relationship: chat.relationship,
+    // Depth 0 is the plain workspace-row convention, not task ancestry.
+    depth: 0,
+  }));
+}
+
 /**
  * scope:"tree" — peer-discovery view: every agent workspace in the caller's task tree plus the
- * root workspace row. Workflow runs, workspace turns, and bash processes stay descendants-only.
+ * root workspace row and direct main/side-chat messaging links. Workflow runs, workspace turns,
+ * and bash processes stay descendants-only.
  */
 async function executeTreeScope(
   taskService: TaskService,
@@ -267,6 +284,8 @@ async function executeTreeScope(
       depth: 0,
     });
   }
+
+  tasks.push(...relatedChatRows(tree, statusFilter.has("workspace")));
 
   const resolveAgentExecution =
     taskService.getDescendantAgentTaskExecutionSnapshot?.bind(taskService);

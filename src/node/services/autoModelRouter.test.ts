@@ -1,15 +1,17 @@
-import { afterEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import type {
   Experimental_EvaluationModelV4,
   Experimental_EvaluationModelV4Result,
 } from "@ai-sdk/provider";
+import { createOpenAI } from "@ai-sdk/openai";
 import { APICallError } from "ai";
 import { Effect } from "effect";
 import * as fs from "fs";
 import * as fsp from "fs/promises";
 import * as os from "os";
 import * as path from "path";
-import { AutoModelRouter, type AutoModelRouterDeps } from "./autoModelRouter";
+import { AutoModelRouter } from "./autoModelRouter";
+import * as evaluationModelFactory from "./evaluationModelFactory";
 import {
   createEvaluationModel,
   resolveEvaluationModelTarget,
@@ -60,29 +62,35 @@ function providersStore(providers: Record<string, unknown> | null) {
   return { loadProvidersConfig: () => providers as ProvidersConfig | null };
 }
 
-/** Router over a fake evaluation model so the real experimental_evaluate runs, minus I/O. */
+/**
+ * Router whose providers.jsonc-backed factory yields a fake evaluation model, so the real
+ * experimental_evaluate runs, minus I/O.
+ */
 function createRouter(options: {
   doEvaluate?: DoEvaluate;
-  policyService?: AutoModelRouterDeps["policyService"];
+  /** A real provider evaluation model instead of the fake; `doEvaluate` is then unused. */
+  model?: Experimental_EvaluationModelV4;
 }) {
   const doEvaluate = mock<DoEvaluate>(options.doEvaluate ?? (() => Promise.resolve(verdict())));
+  const buildModel = spyOn(evaluationModelFactory, "createEvaluationModel").mockImplementation(() =>
+    Effect.succeed(Ok(options.model ?? fakeEvaluationModel(doEvaluate)))
+  );
   const router = new AutoModelRouter({
     providersConfigStore: providersStore({}),
-    policyService: options.policyService,
     env: {},
-    createEvaluationModel: () => Effect.succeed(Ok(fakeEvaluationModel(doEvaluate))),
   });
-  return { router, doEvaluate };
+  return { router, doEvaluate, buildModel };
 }
 
 const tempPaths: string[] = [];
 afterEach(() => {
+  mock.restore();
   for (const p of tempPaths.splice(0)) fs.rmSync(p, { recursive: true, force: true });
 });
 
 describe("AutoModelRouter.classify", () => {
   it("asks one choice question keyed by tier id and maps the verdict", async () => {
-    const { router, doEvaluate } = createRouter({});
+    const { router, doEvaluate, buildModel } = createRouter({});
 
     const result = await router.classify({
       prompt: "Rename a variable",
@@ -101,6 +109,8 @@ describe("AutoModelRouter.classify", () => {
         providerMetadata: { [TYPESAFE_PROVIDER_KEY]: { confidence: { difficulty: 0.6 } } },
       },
     });
+    // The judge is built from the requested evaluation model, not a default.
+    expect(buildModel.mock.calls.map(([modelString]) => modelString)).toEqual([EVALUATION_MODEL]);
     expect(doEvaluate).toHaveBeenCalledTimes(1);
     const call = doEvaluate.mock.calls[0][0];
     const state = call.state as { prompt: string; recentUserMessages?: string[] };
@@ -154,8 +164,10 @@ describe("AutoModelRouter.classify", () => {
     });
     expect(result.success).toBe(false);
     if (result.success) return;
-    expect(result.error).toContain("Evaluation failed");
-    expect(result.error).not.toContain("sk-secret");
+    expect(result.error.reason).toContain("Evaluation failed");
+    expect(JSON.stringify(result.error)).not.toContain("sk-secret");
+    // No response arrived, so nothing was billed.
+    expect(result.error.usage).toBeUndefined();
   });
 
   it("reduces a provider HTTP failure to its status code", async () => {
@@ -176,7 +188,7 @@ describe("AutoModelRouter.classify", () => {
       tiers: TIERS,
       evaluationModel: EVALUATION_MODEL,
     });
-    expect(result).toEqual(Err("Evaluation request failed with HTTP 429"));
+    expect(result).toEqual(Err({ reason: "Evaluation request failed with HTTP 429" }));
   });
 
   it("passes the evaluator's usage and provider metadata through for cost accounting", async () => {
@@ -194,6 +206,92 @@ describe("AutoModelRouter.classify", () => {
     expect(result.data.usage).toMatchObject({ inputTokens: 40, outputTokens: 3 });
     expect(result.data.providerMetadata).toEqual({
       [TYPESAFE_PROVIDER_KEY]: { confidence: { difficulty: 0.6 } },
+    });
+  });
+
+  // #4774: the provider billed these responses even though the answer was rejected.
+  it("keeps the billed usage of a verdict outside the tiers", async () => {
+    const { router } = createRouter({
+      doEvaluate: () =>
+        Promise.resolve(
+          verdict("impossible", {
+            usage: { inputTokens: 40, outputTokens: 4 },
+            providerMetadata: { openai: { reasoningTokens: 2, responseId: "resp_secret" } },
+          })
+        ),
+    });
+    const result = await router.classify({
+      prompt: "x",
+      tiers: TIERS,
+      evaluationModel: EVALUATION_MODEL,
+    });
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error).toEqual({
+      reason: expect.stringContaining("Evaluation failed") as unknown as string,
+      usage: { inputTokens: 40, outputTokens: 4, totalTokens: 44 },
+      // Only the allowlisted usage metadata survives, as for other evaluations.
+      providerMetadata: { openai: { reasoningTokens: 2 } },
+    });
+  });
+
+  it("omits a billed total that overflows the safe-integer range", async () => {
+    const { router } = createRouter({
+      doEvaluate: () =>
+        Promise.resolve(
+          verdict("impossible", {
+            usage: { inputTokens: Number.MAX_SAFE_INTEGER, outputTokens: 1 },
+          })
+        ),
+    });
+    const result = await router.classify({
+      prompt: "x",
+      tiers: TIERS,
+      evaluationModel: EVALUATION_MODEL,
+    });
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error.usage).toEqual({ inputTokens: Number.MAX_SAFE_INTEGER, outputTokens: 1 });
+  });
+
+  it("keeps the billed usage of an answer the real OpenAI evaluation adapter rejects", async () => {
+    // "c9" is not one of the tier option codes, so provider-utils throws inside
+    // doEvaluate before it would return usage.
+    const fetch = (() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            id: "resp_test",
+            created_at: 0,
+            model: "gpt-5-nano",
+            output: [
+              {
+                type: "message",
+                role: "assistant",
+                id: "msg_test",
+                content: [
+                  { type: "output_text", text: JSON.stringify({ q0: "c9" }), annotations: [] },
+                ],
+              },
+            ],
+            usage: { input_tokens: 120, output_tokens: 30 },
+          }),
+          { headers: { "Content-Type": "application/json" } }
+        )
+      )) as unknown as typeof globalThis.fetch;
+    const { router } = createRouter({
+      model: createOpenAI({ apiKey: "test", fetch }).evaluationModel("gpt-5-nano"),
+    });
+    const result = await router.classify({
+      prompt: "x",
+      tiers: TIERS,
+      evaluationModel: "openai:gpt-5-nano",
+    });
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error).toEqual({
+      reason: expect.stringContaining("Evaluation failed") as unknown as string,
+      usage: { inputTokens: 120, outputTokens: 30, totalTokens: 150 },
     });
   });
 
@@ -229,10 +327,9 @@ describe("AutoModelRouter.classify", () => {
       tiers: TIERS,
       evaluationModel: EVALUATION_MODEL,
     });
-    expect(result).toEqual({
-      success: false,
-      error: `No API key configured for ${TYPESAFE_PROVIDER_KEY} in providers.jsonc`,
-    });
+    expect(result).toEqual(
+      Err({ reason: `No API key configured for ${TYPESAFE_PROVIDER_KEY} in providers.jsonc` })
+    );
     expect(router.getEvaluationStatus(EVALUATION_MODEL)).toEqual({
       evaluationModel: EVALUATION_MODEL,
       available: false,
@@ -344,63 +441,13 @@ describe("evaluation model factory", () => {
     }
   });
 
-  it("honors provider enablement and enforced policy, including the forced base URL", () => {
+  it("honors provider enablement", () => {
     expect(
       resolveEvaluationModelTarget(
         "openai:gpt-5-nano",
         deps({ openai: { apiKey: "k", enabled: false } })
       )
     ).toMatchObject({ success: false, error: { code: "provider_disabled" } });
-
-    const denyProvider = deps(
-      { typesafe: { apiKey: "k" } },
-      {
-        policyService: {
-          isEnforced: () => true,
-          isProviderAllowed: (provider) => provider !== TYPESAFE_PROVIDER_KEY,
-          isModelAllowed: () => true,
-          getForcedBaseUrl: () => undefined,
-        },
-      }
-    );
-    expect(resolveEvaluationModelTarget(EVALUATION_MODEL, denyProvider)).toMatchObject({
-      success: false,
-      error: { code: "policy_denied" },
-    });
-
-    const denyModel = deps(
-      { typesafe: { apiKey: "k" } },
-      {
-        policyService: {
-          isEnforced: () => true,
-          isProviderAllowed: () => true,
-          isModelAllowed: (provider, modelId) =>
-            !(provider === TYPESAFE_PROVIDER_KEY && modelId === "jev-latest"),
-          getForcedBaseUrl: () => undefined,
-        },
-      }
-    );
-    expect(resolveEvaluationModelTarget(EVALUATION_MODEL, denyModel)).toMatchObject({
-      success: false,
-      error: { code: "policy_denied" },
-    });
-
-    const forced = deps(
-      { typesafe: { apiKey: "k", baseUrl: "https://user.example.test/v1" } },
-      {
-        policyService: {
-          isEnforced: () => true,
-          isProviderAllowed: () => true,
-          isModelAllowed: () => true,
-          getForcedBaseUrl: (provider) =>
-            provider === TYPESAFE_PROVIDER_KEY ? "https://proxy.example.test/typesafe/" : undefined,
-        },
-      }
-    );
-    expect(resolveEvaluationModelTarget(EVALUATION_MODEL, forced)).toMatchObject({
-      success: true,
-      data: { settings: { baseURL: "https://proxy.example.test/typesafe/" } },
-    });
   });
 
   it("refuses an id shadowed by a custom chat provider instead of using env credentials", () => {

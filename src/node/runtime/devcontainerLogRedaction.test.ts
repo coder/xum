@@ -1,12 +1,16 @@
 import { describe, expect, it } from "bun:test";
-import {
-  redactDevcontainerArgsForLog,
-  SENSITIVE_REMOTE_ENV_KEYS,
-} from "./devcontainerLogRedaction";
+import { redactDevcontainerArgsForLog } from "./devcontainerLogRedaction";
 
 describe("redactDevcontainerArgsForLog", () => {
   it("redacts every sensitive --remote-env key", () => {
-    for (const key of SENSITIVE_REMOTE_ENV_KEYS) {
+    // Test-owned list: dropping a credential key from the production set must fail here.
+    for (const key of [
+      "GH_TOKEN",
+      "GITHUB_TOKEN",
+      "GH_ENTERPRISE_TOKEN",
+      "GITHUB_ENTERPRISE_TOKEN",
+      "CODER_AGENT_TOKEN",
+    ]) {
       const args = ["exec", "--remote-env", `${key}=super-secret-value`];
       expect(redactDevcontainerArgsForLog(args)).toEqual([
         "exec",

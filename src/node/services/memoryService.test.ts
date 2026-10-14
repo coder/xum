@@ -1,6 +1,10 @@
 import { describe, it, expect, spyOn } from "bun:test";
 
-import { MEMORY_MAX_FILES_PER_SCOPE, MEMORY_MAX_FILE_BYTES } from "@/common/constants/memory";
+import {
+  MEMORY_MAX_FILES_PER_SCOPE,
+  MEMORY_MAX_FILE_BYTES,
+  MEMORY_SCOPES,
+} from "@/common/constants/memory";
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -16,7 +20,6 @@ import {
   projectMemoryDirName,
   resolveMemoryProjectIdentity,
   type MemoryScopeContext,
-  type PinnedFileMutation,
 } from "./memoryService";
 import { MemoryMetaService, memoryLogicalKey } from "./memoryMeta";
 import {
@@ -571,89 +574,6 @@ describe("MemoryService", () => {
       );
       expect(result.success).toBe(false);
     });
-
-    it("writePinnedFile resolves create-or-update under the lock and caps the actual result", async () => {
-      using fixture = await createFixture();
-      const notes = "/memories/global/notes.md";
-      const write = (mutation: PinnedFileMutation) =>
-        fixture.service.writePinnedFile(fixture.ctx, notes, mutation, 100, "agent");
-      const read = async () => {
-        const result = await fixture.service.readFileWithSha(fixture.ctx, notes);
-        return result.success ? result.data.content : null;
-      };
-      // An update command on a missing file creates it from its payload.
-      expect(
-        (await write({ command: "str_replace", oldStr: "gone", newStr: "seed" })).success
-      ).toBe(true);
-      expect(await read()).toBe("seed");
-      // create replaces an existing file instead of failing on a stale existence verdict.
-      expect((await write({ command: "create", fileText: "a".repeat(60) })).success).toBe(true);
-      expect(await read()).toBe("a".repeat(60));
-      // 60 + 41 > 100: rejected against the actual contents even though the payload alone fits.
-      const grow = await write({ command: "insert", insertLine: 0, insertText: "b".repeat(40) });
-      expect(grow.success).toBe(false);
-      if (!grow.success) expect(grow.error).toContain("limited to 100 bytes");
-      expect(await read()).toBe("a".repeat(60));
-      // Replacing content that frees space fits under the same cap.
-      expect(
-        (await write({ command: "str_replace", oldStr: "a".repeat(60), newStr: "c".repeat(90) }))
-          .success
-      ).toBe(true);
-      expect(await read()).toBe("c".repeat(90));
-      // insert on a missing file ignores the line position and normalizes like insert.
-      await fixture.service.deletePath(fixture.ctx, notes, "agent");
-      expect(
-        (await write({ command: "insert", insertLine: 7, insertText: "x\ny\n" })).success
-      ).toBe(true);
-      expect(await read()).toBe("x\ny");
-    });
-
-    it("writePinnedFile ignores the per-scope file cap and lets create replace a malformed file", async () => {
-      using fixture = await createFixture();
-      const notes = "/memories/global/notes.md";
-      const globalDir = path.join(fixture.xumHome, "memory", "global");
-      await fsPromises.mkdir(globalDir, { recursive: true });
-      await Promise.all(
-        Array.from({ length: MEMORY_MAX_FILES_PER_SCOPE }, (_, i) =>
-          fsPromises.writeFile(path.join(globalDir, `f${i}.md`), "x")
-        )
-      );
-      // The ordinary create is refused by the cap; the pinned notes slot is exempt.
-      expect((await fixture.service.create(fixture.ctx, notes, "seed", "agent")).success).toBe(
-        false
-      );
-      expect(
-        (
-          await fixture.service.writePinnedFile(
-            fixture.ctx,
-            notes,
-            { command: "insert", insertLine: 0, insertText: "seed" },
-            100,
-            "agent"
-          )
-        ).success
-      ).toBe(true);
-      // Externally corrupted notes (NUL byte) cannot be edited, but the pinned create replaces them.
-      await fsPromises.writeFile(path.join(globalDir, "notes.md"), "bad\u0000bytes");
-      const edit = await fixture.service.writePinnedFile(
-        fixture.ctx,
-        notes,
-        { command: "str_replace", oldStr: "bad", newStr: "good" },
-        100,
-        "agent"
-      );
-      expect(edit.success).toBe(false);
-      const replaced = await fixture.service.writePinnedFile(
-        fixture.ctx,
-        notes,
-        { command: "create", fileText: "repaired" },
-        100,
-        "agent"
-      );
-      expect(replaced.success).toBe(true);
-      const result = await fixture.service.readFileWithSha(fixture.ctx, notes);
-      expect(result.success && result.data.content).toBe("repaired");
-    });
   });
 
   describe("UI read/save", () => {
@@ -1008,6 +928,55 @@ describe("MemoryService", () => {
       ).toBe(false);
     });
 
+    it("keeps each agent's session checkpoint in its own session dir, invisible to the rest of the tree", async () => {
+      using fixture = await createFixture("ws-child");
+      await registerTaskTree(fixture);
+      const checkpoint = "/memories/session/checkpoint.md";
+      // Only token-budget agents and the Memory tab opt in to the session scope.
+      const sessionCtx = (workspaceId: string) => ({
+        ...fixture.ctx,
+        workspaceId,
+        scopes: MEMORY_SCOPES,
+      });
+      for (const workspaceId of ["ws-owner", "ws-child"]) {
+        const created = await fixture.service.create(
+          sessionCtx(workspaceId),
+          checkpoint,
+          `${workspaceId} state`,
+          "agent"
+        );
+        expect(created.success).toBe(true);
+      }
+      // Parent and child each read their own checkpoint, never the other's.
+      for (const [workspaceId, other] of [
+        ["ws-owner", "ws-child"],
+        ["ws-child", "ws-owner"],
+      ]) {
+        const viewed = await fixture.service.view(sessionCtx(workspaceId), checkpoint);
+        expect(viewed.success).toBe(true);
+        if (viewed.success) {
+          expect(viewed.output).toContain(`${workspaceId} state`);
+          expect(viewed.output).not.toContain(`${other} state`);
+        }
+      }
+      // The grandchild shares the owner's workspace scope but not its checkpoint.
+      const grandchild = await fixture.service.view(sessionCtx("ws-grandchild"), checkpoint);
+      expect(grandchild.success).toBe(false);
+      // Background agents (consolidation, refinement) use the default scopes and never see it.
+      const background = await fixture.service.view(
+        { ...fixture.ctx, workspaceId: "ws-owner" },
+        checkpoint
+      );
+      expect(background.success).toBe(false);
+      const ownerWorkspaceScope = await fixture.service.view(
+        { ...fixture.ctx, workspaceId: "ws-owner" },
+        "/memories/workspace"
+      );
+      if (ownerWorkspaceScope.success) {
+        expect(ownerWorkspaceScope.output).not.toContain("checkpoint.md");
+      }
+    });
+
     it("refuses a sub-agent's mutation once the owner's removal tombstone exists", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
@@ -1357,11 +1326,7 @@ describe("MemoryService", () => {
         if (!result.success) expect(result.error).toContain("ws-child was removed");
       }
       expect(await fixture.service.listIndexEntries(ownerCtx)).toEqual([]);
-      expect(
-        await fixture.service.listHotMemories(ownerCtx, {
-          countTokens: (text) => Promise.resolve(text.length),
-        })
-      ).toEqual([]);
+      expect(await fixture.service.listHotMemories(ownerCtx)).toEqual([]);
       expect(
         await fsPromises.readFile(
           path.join(fixture.config.sessionsDir, "ws-owner", "memory", "n.md"),
@@ -1452,9 +1417,7 @@ describe("MemoryService", () => {
 
       // Hot-set reads happen after the index enumeration passed: the
       // tombstone landing before the file read drops the item.
-      const hotBefore = await fixture.service.listHotMemories(fixture.ctx, {
-        countTokens: (text) => Promise.resolve(text.length),
-      });
+      const hotBefore = await fixture.service.listHotMemories(fixture.ctx);
       expect(hotBefore.some((item) => item.path === "/memories/workspace/n.md")).toBe(true);
       // Interleaving: the tombstone lands after listIndexEntries built the
       // candidate list and before the hot-set file reads.
@@ -1468,9 +1431,7 @@ describe("MemoryService", () => {
         }
       );
       try {
-        const hot = await fixture.service.listHotMemories(fixture.ctx, {
-          countTokens: (text) => Promise.resolve(text.length),
-        });
+        const hot = await fixture.service.listHotMemories(fixture.ctx);
         expect(hot.some((item) => item.path === "/memories/workspace/n.md")).toBe(false);
         // The ACTING workspace is the one removed: nothing is served to it,
         // global notes included (a removed child's redirected run surveys
@@ -1480,22 +1441,6 @@ describe("MemoryService", () => {
         listIndex.mockRestore();
         await untombstone();
       }
-      // Selection keeps awaiting token counts after the file reads: a
-      // tombstone landing there still withholds the workspace items.
-      let counted = 0;
-      const hotAfterCount = await fixture.service.listHotMemories(fixture.ctx, {
-        countTokens: async (text) => {
-          if (counted++ === 0) {
-            await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
-            await fsPromises.writeFile(tombstonePath, JSON.stringify({ workspaceId: "ws-child" }));
-          }
-          return text.length;
-        },
-      });
-      expect(counted).toBeGreaterThan(0);
-      expect(hotAfterCount.some((item) => item.path === "/memories/workspace/n.md")).toBe(false);
-      expect(hotAfterCount.some((item) => item.path === "/memories/global/g.md")).toBe(false);
-      await untombstone();
     });
 
     it("refuses a pin toggle once the owner it was bound to is tombstoned", async () => {
@@ -4759,22 +4704,47 @@ describe("MemoryService", () => {
       expect(await fsPromises.readFile(path.join(ownerRoot, "note.md"), "utf-8")).toBe("v1");
     });
 
-    it("withholds an already selected global hot item when the tombstone lands during token counting", async () => {
+    it("withholds an already selected global hot item when the tombstone lands during a later read", async () => {
       using fixture = await createFixture("ws-child");
       await registerTaskTree(fixture);
-      // Only a global note: no workspace item is ever selected, so a guard
+      // Only global notes: no workspace item is ever selected, so a guard
       // conditioned on workspace items would never run.
       await fixture.service.create(fixture.ctx, "/memories/global/g.md", "global", "agent");
       await fixture.service.setPinned(fixture.ctx, "/memories/global/g.md", true);
+      await fixture.service.create(fixture.ctx, "/memories/global/h.md", "later", "agent");
       const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, "ws-child");
-      const hot = await fixture.service.listHotMemories(fixture.ctx, {
-        countTokens: async (text) => {
+      // The index also reads h.md (description prefix): arm only once the
+      // candidate list is built, so the per-candidate selection reads trip it.
+      let armed = false;
+      const originalList = fixture.service.listIndexEntries.bind(fixture.service);
+      const listIndex = spyOn(fixture.service, "listIndexEntries").mockImplementationOnce(
+        async (ctx) => {
+          const result = await originalList(ctx);
+          armed = true;
+          return result;
+        }
+      );
+      const realOpen = fsPromises.open.bind(fsPromises);
+      // g.md (pinned) is selected first; the tombstone lands while h.md is read.
+      const open = spyOn(fsPromises, "open").mockImplementation((async (
+        p: Parameters<typeof fsPromises.open>[0],
+        ...rest: unknown[]
+      ) => {
+        if (armed && String(p).endsWith(`${path.sep}h.md`)) {
+          armed = false;
           await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
           await fsPromises.writeFile(tombstonePath, JSON.stringify({ workspaceId: "ws-child" }));
-          return text.length;
-        },
-      });
-      expect(hot).toEqual([]);
+        }
+        return (realOpen as (...args: unknown[]) => unknown)(p, ...rest);
+      }) as never);
+      try {
+        expect(await fixture.service.listHotMemories(fixture.ctx)).toEqual([]);
+        // Tripped during selection (the trigger is armed only after the index).
+        expect(await fsPromises.readFile(tombstonePath, "utf-8")).toContain("ws-child");
+      } finally {
+        open.mockRestore();
+        listIndex.mockRestore();
+      }
     });
 
     it("never probes a sibling receipt that names a path outside the owner store", async () => {
@@ -5120,50 +5090,6 @@ describe("MemoryService", () => {
       expect(index).not.toContain("pwn");
     });
 
-    it("keeps the context notes indexed when the workspace scope exceeds the cap", async () => {
-      using fixture = await createFixture();
-      // The notes slot is exempt from the cap on write, so it must also survive the enumeration
-      // cut even when every other file sorts before it.
-      const memoryDir = path.join(fixture.xumHome, "sessions", fixture.ctx.workspaceId, "memory");
-      await fsPromises.mkdir(memoryDir, { recursive: true });
-      await Promise.all([
-        ...Array.from({ length: MEMORY_MAX_FILES_PER_SCOPE + 5 }, (_, i) =>
-          fsPromises.writeFile(path.join(memoryDir, `a${String(i).padStart(4, "0")}.md`), "x")
-        ),
-        fsPromises.writeFile(path.join(memoryDir, "context-notes.md"), "handoff"),
-      ]);
-      const entries = (await fixture.service.listIndexEntries(fixture.ctx)).filter(
-        (entry) => entry.scope === "workspace"
-      );
-      expect(entries).toHaveLength(MEMORY_MAX_FILES_PER_SCOPE);
-      expect(entries.map((entry) => entry.path)).toContain("/memories/workspace/context-notes.md");
-      expect(entries[0]?.relPath).toBe("a0000.md");
-    });
-
-    it("drops a symlinked context-notes slot from the over-cap probe", async () => {
-      using fixture = await createFixture();
-      // The direct probe must admit only what the walk's dirent filter admits: a symlink
-      // pointing outside the root would otherwise be read into the provider request.
-      const memoryDir = path.join(fixture.xumHome, "sessions", fixture.ctx.workspaceId, "memory");
-      await fsPromises.mkdir(memoryDir, { recursive: true });
-      const outside = path.join(fixture.xumHome, "outside-secret.md");
-      await fsPromises.writeFile(outside, "---\ndescription: leaked\n---\n");
-      await Promise.all([
-        ...Array.from({ length: MEMORY_MAX_FILES_PER_SCOPE + 5 }, (_, i) =>
-          fsPromises.writeFile(path.join(memoryDir, `a${String(i).padStart(4, "0")}.md`), "x")
-        ),
-        fsPromises.symlink(outside, path.join(memoryDir, "context-notes.md")),
-      ]);
-      const entries = (await fixture.service.listIndexEntries(fixture.ctx)).filter(
-        (entry) => entry.scope === "workspace"
-      );
-      expect(entries).toHaveLength(MEMORY_MAX_FILES_PER_SCOPE);
-      expect(entries.map((entry) => entry.path)).not.toContain(
-        "/memories/workspace/context-notes.md"
-      );
-      expect(entries.some((entry) => entry.description === "leaked")).toBe(false);
-    });
-
     it("caps indexed files per scope to the declared limit", async () => {
       using fixture = await createFixture();
       // Files edited outside MemoryService can bypass the write-time per-scope
@@ -5386,9 +5312,7 @@ describe("MemoryService", () => {
       );
       await fixture.metaService.setPinned("global:pinned.md", true);
 
-      const items = await fixture.service.listHotMemories(fixture.ctx, {
-        countTokens: () => Promise.resolve(1),
-      });
+      const items = await fixture.service.listHotMemories(fixture.ctx);
       const paths = items.map((item) => item.path);
       expect(paths[0]).toBe("/memories/global/pinned.md");
       expect(paths).toContain("/memories/global/used.md");
@@ -5399,37 +5323,10 @@ describe("MemoryService", () => {
       );
     });
 
-    it("preloads never-accessed context notes without changing pins/stats or truncating the stored file", async () => {
-      using fixture = await createFixture();
-      const memoryDir = path.join(fixture.config.sessionsDir, fixture.ctx.workspaceId, "memory");
-      await fsPromises.mkdir(memoryDir, { recursive: true });
-      const notesPath = "/memories/workspace/context-notes.md";
-      const physicalPath = path.join(memoryDir, "context-notes.md");
-      const content = "界😀 facts\n".repeat(2000) + "retained tail";
-      await fsPromises.writeFile(physicalPath, content);
-      const before = await fixture.metaService.getEntries();
-      expect(
-        await fixture.service.listHotMemories(fixture.ctx, {
-          countTokens: (text) => Promise.resolve(Math.ceil(text.length / 3.5)),
-        })
-      ).toEqual([]);
-      const items = await fixture.service.listHotMemories(fixture.ctx, {
-        countTokens: (text) => Promise.resolve(Math.ceil(text.length / 3.5)),
-        tokenBudgetActive: true,
-      });
-      expect(items[0]).toMatchObject({ path: notesPath, pinned: false, truncated: true });
-      expect(items[0].content).not.toContain("retained tail");
-      expect(await fixture.metaService.getEntries()).toEqual(before);
-      expect(await fsPromises.readFile(physicalPath, "utf-8")).toBe(content);
-      const viewed = await fixture.service.view(fixture.ctx, notesPath, { offset: 2001, limit: 1 });
-      expect(viewed.success).toBe(true);
-      if (viewed.success) expect(viewed.output).toContain("retained tail");
-    });
-
     it("preloading hot memories does not itself count as a use", async () => {
       using fixture = await createFixture();
       await fixture.service.create(fixture.ctx, "/memories/global/a.md", "v1", "agent");
-      await fixture.service.listHotMemories(fixture.ctx, { countTokens: () => Promise.resolve(1) });
+      await fixture.service.listHotMemories(fixture.ctx);
       expect((await fixture.metaService.getEntries()).get("global:a.md")?.accessCount).toBe(1);
     });
   });

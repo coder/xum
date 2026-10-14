@@ -1,12 +1,13 @@
-import { wrapAsyncIterator } from "@orpc/shared";
 import { expect, userEvent, waitFor, within } from "@storybook/test";
-import type { WorkspaceActivitySnapshot, WorkspaceChatMessage } from "@/common/orpc/types";
+import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
+import { createActivityFeed } from "./mocks/activityFeed";
 import { createMockORPCClient } from "./mocks/orpc";
 import { createAssistantMessage } from "./mocks/messages";
 import type { ProjectConfig } from "@/common/types/project";
 import { createWorkspace, groupWorkspacesByProject, STABLE_TIMESTAMP } from "./mocks/workspaces";
+import { waitForAppFadeInDone } from "./storyPlayHelpers";
 import {
   clearWorkspaceSelection,
   collapseLeftSidebar,
@@ -113,50 +114,6 @@ async function finishReplayWithoutLayoutShift(
     before.messageTop
   );
   await expect(scrollport.scrollHeight).toBe(before.scrollHeight);
-}
-
-type ActivitySubscribe = ReturnType<
-  typeof createMockORPCClient
->["workspace"]["activity"]["subscribe"];
-interface ActivityEvent {
-  type: "activity";
-  workspaceId: string;
-  activity: WorkspaceActivitySnapshot | null;
-}
-
-// Background activity snapshots (the always-on per-workspace subscription) queue through
-// `emit` and stay deliverable until the store aborts; client swaps between stories must
-// release the previous subscription, so the iterator also ends on abort.
-function createActivityFeed(): {
-  subscribe: ActivitySubscribe;
-  emit: (workspaceId: string, activity: WorkspaceActivitySnapshot) => void;
-} {
-  const queued: ActivityEvent[] = [];
-  let wake: (() => void) | null = null;
-  const subscribe: ActivitySubscribe = (_input, options) => {
-    async function* iterate() {
-      while (!options?.signal?.aborted) {
-        const next = queued.shift();
-        if (next) {
-          yield next;
-          continue;
-        }
-        await new Promise<void>((resolve) => {
-          wake = resolve;
-          options?.signal?.addEventListener("abort", () => resolve(), { once: true });
-        });
-        wake = null;
-      }
-    }
-    return Promise.resolve(wrapAsyncIterator(iterate(), {}));
-  };
-  return {
-    subscribe,
-    emit: (workspaceId, activity) => {
-      queued.push({ type: "activity", workspaceId, activity });
-      wake?.();
-    },
-  };
 }
 
 function createHydrationStory(workspaceId: string): AppStory {
@@ -472,14 +429,15 @@ function createHydrationStory(workspaceId: string): AppStory {
     });
 
     await step(
-      "Switching back to a workspace that streamed in the background shows the skeleton, not cached rows",
+      "Switching back to a workspace that streamed in the background keeps cached rows painted during the since replay",
       async () => {
         await switchWorkspace(canvasElement, otherWorkspace.id);
         await expect(
           await canvas.findByText("Another workspace response.", {}, { timeout: 5000 })
         ).toBeVisible();
         // A new turn started while this workspace was unsubscribed from onChat: the cached
-        // rows are missing that content, so they must not paint and then jump on caught-up.
+        // rows are missing that content, but the since replay mostly appends after the
+        // server-verified cursor, so they stay painted with the dock shimmer (#4505).
         emitActivity(workspace.id, {
           recency: STABLE_TIMESTAMP + 1,
           streaming: true,
@@ -491,9 +449,9 @@ function createHydrationStory(workspaceId: string): AppStory {
         await waitFor(() => expect(subscriptions).toBe(4));
         await expect(await canvas.findByRole("button", { name: "Stop streaming" })).toBeVisible();
         await checkTranscriptLayout(canvasElement);
-        await expect(canvas.getByTestId("transcript-hydration-placeholder")).toBeVisible();
-        await expect(canvas.queryByText("Previously loaded response.")).toBeNull();
-        await expect(canvas.queryByTestId("transcript-loading-status")).toBeNull();
+        await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
+        await expect(canvas.getByText("Previously loaded response.")).toBeVisible();
+        await expect(canvas.getByTestId("transcript-loading-status")).toBeVisible();
         emitChat(history);
         emitChat({
           type: "caught-up",
@@ -627,6 +585,7 @@ function createStreamingHydrationStory(workspaceId: string): AppStory {
       const canvas = within(canvasElement);
       await waitFor(() => expect(typeof emitChat).toBe("function"));
       await checkTranscriptLayout(canvasElement);
+      await waitForAppFadeInDone(canvas.getByRole("log"));
       await expect(canvas.getByTestId("transcript-hydration-placeholder")).toBeVisible();
       emitChat({ type: "stream-lifecycle", workspaceId, phase: "preparing", hadAnyOutput: false });
       const stop = await canvas.findByRole("button", { name: "Stop streaming" });

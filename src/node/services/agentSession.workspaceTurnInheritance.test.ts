@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from "bun:test";
 
 import { createMuxMessage, type MuxMessage, type MuxMessageMetadata } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
-import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
+import type { StreamMessageOptions } from "@/node/services/aiService";
 
 import { inheritOpenWorkspaceTurnMetadata } from "./agentSession";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
@@ -34,6 +34,17 @@ function wake(id: string): MuxMessage {
 describe("inheritOpenWorkspaceTurnMetadata", () => {
   test("wake after a queue-cut correlated assistant inherits the turn correlation", () => {
     const messages = [turnPrompt("prompt"), cutAssistant("cut"), wake("wake")];
+    expect(inheritOpenWorkspaceTurnMetadata(messages)).toEqual(correlation);
+  });
+
+  test("a hidden plan-review record after the cut does not close the turn", () => {
+    // Resolving a review thread appends a synthetic user row as the history tail; it is UI
+    // state, not a human turn, so the wake must still reach the correlated assistant.
+    const resolved = createMuxMessage("resolve", "user", "<mux_plan_review>...</mux_plan_review>", {
+      synthetic: true,
+      muxMetadata: { type: "plan-review", kind: "resolve", recordId: "rec_1", threadId: "thr_1" },
+    });
+    const messages = [turnPrompt("prompt"), cutAssistant("cut"), resolved, wake("wake")];
     expect(inheritOpenWorkspaceTurnMetadata(messages)).toEqual(correlation);
   });
 
@@ -150,7 +161,7 @@ describe("AgentSession workspace-turn correlation inheritance", () => {
     const { session, cleanup, historyService } = await createAgentSessionHarness({
       workspaceId: "workspace-turn-inheritance",
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
       },
     });
     try {
@@ -280,6 +291,10 @@ describe("AgentSession workspace-turn correlation inheritance", () => {
           })),
           checkMidStream: mock(() => false),
           resetForNewStream: mock(() => undefined),
+          noteUserTurn: mock(() => undefined),
+          noteAutoCompactionRequested: mock(() => undefined),
+          noteAutoCompactionCompleted: mock(() => undefined),
+          suppressRepeatedAutoCompaction: mock(() => false),
         };
 
         const result = await session.sendMessage(

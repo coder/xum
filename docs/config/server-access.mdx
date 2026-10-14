@@ -49,7 +49,7 @@ When enabled, the auth modal shows **Login with GitHub**. Xum verifies the GitHu
   GitHub organization membership rules.
 </Note>
 
-## Server Access settings page
+## Server Access settings
 
 Open **Settings → Server Access** to manage browser sessions.
 
@@ -93,6 +93,60 @@ After activation, the server exits gracefully and the supervisor relaunches it. 
   server cannot read the remaining restart budget. Ensure the supervisor has restarts available, or
   configure unlimited restarts (`max_restart_attempts=0`) before relying on self-update.
 </Warning>
+
+## Running the desktop app and `xum server` together
+
+If `xum server` is already running when you open the desktop app on the same machine and Xum data directory, the desktop app does not start a second API server. It still runs its own full backend on the same data: both processes read and write the same projects, workspaces, chat history, and tasks.
+
+What stays consistent between the two:
+
+- Config changes, such as creating a workspace or changing a setting, are written under a shared lock.
+- Chat history appends are written under a shared lock.
+- A workspace turn that one process runs is never marked interrupted by the other while the first process is alive.
+- A consent change you make in one app wins over a default that the other app was about to apply.
+- Background commands that both apps run in one local workspace get separate output records, even when they have the same name. This also holds when you send a running command to the background, and after a command finishes.
+- Renaming or deleting a workspace fails while the other app has a turn, an open terminal, or a background command in it, or in a sub-agent that shares its checkout. Deleting a workspace together with its sub-agents checks all of them first: if the other app uses any of them, nothing is deleted. The same holds for archiving a workspace, which also archives its sub-agents with the same archive setting (unarchiving the workspace later leaves them archived). The same applies to an archive that removes the checkout (the **Delete** or **Snapshot** archive setting) or stops or deletes a Coder workspace that Xum created for it, to restoring that snapshot on unarchive, and to deleting an archived workspace's worktree. Any unarchive fails while the other app renames, deletes, or archives the workspace, or deletes its worktree. The same applies while the other app runs an MCP server that runs in the workspace (a stdio server), an init hook, or a one-off command such as a git status refresh, and after it opened a native terminal or an external editor for the workspace, until it archives or removes the workspace (it cannot tell when those apps close). The error names the activity; try again when it ends. Background commands of the other app in SSH or Docker workspaces are not checked yet.
+
+What does not work across the two:
+
+- Streams, Stop, and message queues belong to the process that started them. Stopping a turn in one app does not stop a turn that the other app runs.
+- Busy state and delegated-turn checks are per process. The other app can admit a message into a workspace that looks busy only in the first app.
+- An open chat or sidebar does not update when the other app writes. Reload the app or reopen the workspace to see the other app's messages and changes.
+
+<Note>
+  You can use one workspace from both apps at the same time, within the limits above. Known gaps:
+  the rename, delete, and archive checks do not see background commands of the other app in SSH,
+  Docker, dev container, and multi-project workspaces, where same-name commands can also share
+  output records ([#4889](https://github.com/coder/xum/issues/4889)).
+</Note>
+
+<Note>
+  When one of the two processes starts, it recovers the sub-agent tasks that were starting, running,
+  or awaiting a report. It leaves alone a task that the other process is using right now: running a
+  turn, an init hook, an MCP server, or a command in it, or having opened a terminal or editor for
+  it. A task that the other process is not actively working on at that moment (while it is being set
+  up, between turns, or while it waits for its own sub-agents) can still be restarted by the
+  starting process. The other process's copy then stops counting: its report and status updates are
+  refused, but it keeps running until it finishes or you stop it in that app.
+</Note>
+
+Running two different Xum versions on the same data directory is not supported.
+
+### Open the running server in a desktop window
+
+To work with the server's own state (its streams, Stop, and queues) from the desktop app, open a server window:
+
+- Press Ctrl+Shift+O (Cmd+Shift+O on macOS) in the desktop window.
+- Run **Open Server Window** from the command palette or the **Window** menu.
+- Or select **Settings → Remote Connection → Open local xum server**.
+
+How it works:
+
+- The desktop app reads the server's address and token from `server.lock` in the Xum data directory, so you do not paste a token. The token is only used to sign the server window in.
+- The server window opens next to your local window, which keeps working. One server window can be open at a time. Running the action again focuses it. If the server restarted with a new token, the window reloads and signs in again.
+- If no server runs for this data directory, the action opens **Settings → Remote Connection**. You can also connect to another server by URL there.
+- The server window runs the server's web UI in an isolated window. It cannot use desktop-only features: opening files in your editor, native file pickers, notifications, and voice input. Terminal and desktop pop-outs open inside the server window's session.
+- Press Ctrl+Shift+L (Cmd+Shift+L on macOS) in the server window to close it and return to the local window.
 
 ## Related
 

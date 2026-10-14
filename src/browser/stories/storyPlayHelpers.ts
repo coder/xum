@@ -1,4 +1,57 @@
-import { waitFor } from "@storybook/test";
+import { userEvent, waitFor, within } from "@storybook/test";
+
+/**
+ * Open Settings from the titlebar button and return the Settings dialog. The page behind the
+ * modal stays mounted, so plays should query within the dialog rather than the whole canvas.
+ */
+export async function openSettingsDialog(canvasElement: HTMLElement): Promise<HTMLElement> {
+  const canvas = within(canvasElement);
+  await userEvent.click(await canvas.findByTestId("settings-button", {}, { timeout: 10000 }));
+  return findSettingsDialog(canvasElement.ownerDocument);
+}
+
+/**
+ * Find the open Settings dialog once it takes clicks. Settings is lazy-loaded, so its first open
+ * commits when the chunk arrives, not inside the opening event. Radix's modal layer then sets
+ * `pointer-events: none` on the body in an effect and sets `auto` on the dialog one render later,
+ * so a click right after the dialog appears can hit `pointer-events: none`.
+ */
+export async function findSettingsDialog(doc: Document = document): Promise<HTMLElement> {
+  const dialog = await within(doc.body).findByRole(
+    "dialog",
+    { name: "Settings" },
+    { timeout: 10000 }
+  );
+  // Inline `auto` is Radix's own signal that this modal layer is registered and on top.
+  await waitFor(() => {
+    if (dialog.style.pointerEvents !== "auto") {
+      throw new Error("Settings dialog does not take pointer events yet");
+    }
+  });
+  return dialog;
+}
+
+export function getSettingsDialog(): HTMLElement {
+  return within(document.body).getByRole("dialog", { name: "Settings" });
+}
+
+/**
+ * Wait until AppLoader's fade-in has committed. Motion cancels the finished WAAPI fade a frame
+ * before it writes the final opacity, so for that frame the app shell reads opacity 0 and a
+ * direct toBeVisible on any element inside it fails.
+ */
+export async function waitForAppFadeInDone(element: Element): Promise<void> {
+  await waitFor(
+    () => {
+      for (let node: Element | null = element; node; node = node.parentElement) {
+        if (getComputedStyle(node).opacity !== "1" || node.getAnimations().length > 0) {
+          throw new Error("App shell is still fading in");
+        }
+      }
+    },
+    { timeout: 5000 }
+  );
+}
 
 /**
  * Wait for chat messages to finish loading.

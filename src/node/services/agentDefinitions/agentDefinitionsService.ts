@@ -2,9 +2,12 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import assert from "@/common/utils/assert";
 
-import type { Runtime } from "@/node/runtime/Runtime";
+import {
+  isRuntimeReadFailure,
+  isRuntimeTransportError,
+  type Runtime,
+} from "@/node/runtime/Runtime";
 import type { ORPCContext } from "@/node/orpc/context";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
@@ -13,7 +16,11 @@ import { resolveAgentVisibility } from "./agentVisibility";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import { resolveGlobalRuntime } from "@/node/runtime/hostGlobalXumHome";
 import { getErrorMessage } from "@/common/utils/errors";
-import { execBuffered, readFileString } from "@/node/utils/runtime/helpers";
+import {
+  execBuffered,
+  readFileString,
+  throwIfTransportFailure,
+} from "@/node/utils/runtime/helpers";
 import { shellQuote } from "@/node/runtime/backgroundCommands";
 
 import {
@@ -102,16 +109,15 @@ const GLOBAL_AGENTS_ROOT = "~/.xum/agents";
 export interface AgentDefinitionsRoots {
   projectRoots: string[];
   globalRoot: string;
-  /** Agent Plugins container dirs, e.g. <projectRoot>/.xum/plugins (agent-plugins experiment; read-only). */
+  /** Agent Plugins container dirs, e.g. <projectRoot>/.xum/plugins (read-only). */
   projectPluginRoots?: string[];
-  /** Agent Plugins container dirs, e.g. ~/.xum/plugins (agent-plugins experiment; read-only). */
+  /** Agent Plugins container dirs, e.g. ~/.xum/plugins (read-only). */
   globalPluginRoots?: string[];
 }
 
 export function getDefaultAgentDefinitionsRoots(
   runtime: Runtime,
-  workspacePath: string,
-  options?: { includeAgentPlugins?: boolean }
+  workspacePath: string
 ): AgentDefinitionsRoots {
   if (!workspacePath) {
     throw new Error("getDefaultAgentDefinitionsRoots: workspacePath is required");
@@ -122,9 +128,11 @@ export function getDefaultAgentDefinitionsRoots(
       runtime.normalizePath(relativePath, workspacePath)
     ),
     globalRoot: GLOBAL_AGENTS_ROOT,
-    // Agent Plugins discovery is host-filesystem-only (v1), so remote runtimes
-    // never get plugin containers (mirrors agentSkillsService).
-    ...(options?.includeAgentPlugins && !(runtime instanceof RemoteRuntime)
+    // Agent Plugins discovery reads the host filesystem only. Remote runtimes
+    // (SSH/Docker) get the GLOBAL host plugin containers (read through a host
+    // LocalRuntime) but no project plugin containers, because a remote
+    // checkout is not on the host filesystem (mirrors agentSkillsService).
+    ...(!(runtime instanceof RemoteRuntime)
       ? {
           projectPluginRoots: [
             ...listProjectMetadataRelativePaths("plugins").map((relativePath) =>
@@ -134,7 +142,10 @@ export function getDefaultAgentDefinitionsRoots(
           ],
           globalPluginRoots: [`${runtime.getXumHome()}/plugins`, UNIVERSAL_AGENT_PLUGINS_CONTAINER],
         }
-      : {}),
+      : {
+          // Tilde form: the host LocalRuntime maps ~/.xum to the host Xum home.
+          globalPluginRoots: ["~/.xum/plugins", UNIVERSAL_AGENT_PLUGINS_CONTAINER],
+        }),
   };
 }
 
@@ -295,6 +306,7 @@ async function listAgentFilesFromRuntime(
     `fi`;
 
   const result = await execBuffered(runtime, command, { cwd: options.cwd, timeout: 10 });
+  throwIfTransportFailure(runtime, result, `Failed to read agents directory ${root}`);
   if (result.exitCode !== 0) {
     log.warn(`Failed to read agents directory ${root}: ${result.stderr || result.stdout}`);
     return [];
@@ -358,7 +370,8 @@ async function readAgentDescriptorFromFile(
     let stat;
     try {
       stat = await runtime.stat(filePath);
-    } catch {
+    } catch (error) {
+      if (isRuntimeTransportError(error)) throw error;
       return null;
     }
 
@@ -375,6 +388,7 @@ async function readAgentDescriptorFromFile(
     try {
       content = await readFileString(runtime, filePath);
     } catch (err) {
+      if (isRuntimeTransportError(err)) throw err;
       log.warn(`Failed to read agent definition ${filePath}: ${getErrorMessage(err)}`);
       return null;
     }
@@ -436,8 +450,6 @@ export async function discoverAgentDefinitions(
   workspacePath: string,
   options?: {
     roots?: AgentDefinitionsRoots;
-    /** agent-plugins experiment: also scan Agent Plugins agents (used only when `roots` is absent). */
-    includeAgentPlugins?: boolean;
     /**
      * When false, return every discovered descriptor in precedence order
      * (shadowed ids included) instead of only the effective one per id.
@@ -450,11 +462,7 @@ export async function discoverAgentDefinitions(
     throw new Error("discoverAgentDefinitions: workspacePath is required");
   }
 
-  const roots =
-    options?.roots ??
-    getDefaultAgentDefinitionsRoots(runtime, workspacePath, {
-      includeAgentPlugins: options?.includeAgentPlugins,
-    });
+  const roots = options?.roots ?? getDefaultAgentDefinitionsRoots(runtime, workspacePath);
   const dedupeById = options?.dedupeById ?? true;
 
   const byId = new Map<AgentId, AgentDefinitionDescriptor>();
@@ -468,6 +476,7 @@ export async function discoverAgentDefinitions(
     try {
       resolvedRoot = await scan.runtime.resolvePath(scan.root);
     } catch (err) {
+      if (isRuntimeTransportError(err)) throw err;
       log.warn(`Failed to resolve agents root ${scan.root}: ${getErrorMessage(err)}`);
       continue;
     }
@@ -556,16 +565,73 @@ export async function discoverAgentDefinitions(
   });
 }
 
+/**
+ * Request-scoped memo for `readAgentDefinition`.
+ *
+ * One stream request resolves the same definitions several times (agent
+ * resolution, disablement checks, inheritance, prompt body, frontmatter, and
+ * sub-agent discovery); on SSH runtimes every probe is a remote round-trip.
+ * Create one cache per request and drop it with the request. Nothing is shared
+ * across requests, so edits between turns are always picked up.
+ *
+ * The key covers every input that can change the winning definition (runtime
+ * identity, workspace path, agent id, roots identity, plugin inclusion, and
+ * skipped scopes), so precedence and base resolution are exactly as uncached.
+ * Promises are memoized so concurrent lookups in one request share one read.
+ */
+export class AgentDefinitionRequestCache {
+  private readonly definitions = new Map<string, Promise<AgentDefinitionPackage>>();
+  /** Identity keys: distinct runtime or roots objects never share entries. */
+  private readonly objectIds = new WeakMap<Runtime | AgentDefinitionsRoots, number>();
+  private nextObjectId = 1;
+
+  private objectId(value: Runtime | AgentDefinitionsRoots): number {
+    let id = this.objectIds.get(value);
+    if (id == null) {
+      id = this.nextObjectId++;
+      this.objectIds.set(value, id);
+    }
+    return id;
+  }
+
+  read(
+    runtime: Runtime,
+    workspacePath: string,
+    agentId: AgentId,
+    options: ReadAgentDefinitionOptions | undefined,
+    load: () => Promise<AgentDefinitionPackage>
+  ): Promise<AgentDefinitionPackage> {
+    const key = JSON.stringify([
+      this.objectId(runtime),
+      workspacePath,
+      agentId,
+      options?.roots != null ? this.objectId(options.roots) : null,
+      options?.skipScopesAbove ?? null,
+    ]);
+    let definition = this.definitions.get(key);
+    if (definition == null) {
+      definition = load();
+      this.definitions.set(key, definition);
+    }
+    return definition;
+  }
+}
+
 export interface ReadAgentDefinitionOptions {
   roots?: AgentDefinitionsRoots;
-  /** agent-plugins experiment: also probe Agent Plugins agents (used only when `roots` is absent). */
-  includeAgentPlugins?: boolean;
+  /** Per-request reuse of resolved definitions; the caller owns its lifetime. */
+  cache?: AgentDefinitionRequestCache;
   /**
    * Skip scopes at or above this level when resolving.
    * Used for base resolution: when a project-scope agent has `base: exec`,
    * we skip project scope to find the global/built-in exec, avoiding self-reference.
    */
   skipScopesAbove?: AgentDefinitionScope;
+  /**
+   * Cancels the underlying runtime stat/read work (e.g. SSH commands) and stops
+   * probing further candidates; readAgentDefinition then rejects with the abort reason.
+   */
+  abortSignal?: AbortSignal;
 }
 
 const SCOPE_PRIORITY: AgentDefinitionScope[] = ["project", "global", "built-in"];
@@ -579,12 +645,22 @@ export async function readAgentDefinition(
   if (!workspacePath) {
     throw new Error("readAgentDefinition: workspacePath is required");
   }
+  const cache = options?.cache;
+  if (cache != null) {
+    return cache.read(runtime, workspacePath, agentId, options, () =>
+      loadAgentDefinition(runtime, workspacePath, agentId, options)
+    );
+  }
+  return loadAgentDefinition(runtime, workspacePath, agentId, options);
+}
 
-  const roots =
-    options?.roots ??
-    getDefaultAgentDefinitionsRoots(runtime, workspacePath, {
-      includeAgentPlugins: options?.includeAgentPlugins,
-    });
+async function loadAgentDefinition(
+  runtime: Runtime,
+  workspacePath: string,
+  agentId: AgentId,
+  options?: ReadAgentDefinitionOptions
+): Promise<AgentDefinitionPackage> {
+  const roots = options?.roots ?? getDefaultAgentDefinitionsRoots(runtime, workspacePath);
   const skipScopesAbove = options?.skipScopesAbove;
 
   // Determine which scopes to skip based on skipScopesAbove
@@ -603,7 +679,9 @@ export async function readAgentDefinition(
   // plugin(global) overrides built-in.
   const candidates = await buildScanCandidates(runtime, workspacePath, roots);
 
+  const abortSignal = options?.abortSignal;
   for (const candidate of candidates) {
+    abortSignal?.throwIfAborted();
     if (skipScopes.has(candidate.scope)) {
       continue;
     }
@@ -611,7 +689,10 @@ export async function readAgentDefinition(
     let resolvedRoot: string;
     try {
       resolvedRoot = await candidate.runtime.resolvePath(candidate.root);
-    } catch {
+    } catch (error) {
+      // An unreachable host is not a missing root: never fall through to a
+      // lower scope or the built-in agent on a transport failure (#4438).
+      if (isRuntimeTransportError(error)) throw error;
       continue;
     }
 
@@ -644,7 +725,7 @@ export async function readAgentDefinition(
         content = result.content;
         byteSize = result.byteSize;
       } else {
-        const stat = await candidate.runtime.stat(filePath);
+        const stat = await candidate.runtime.stat(filePath, abortSignal);
         if (stat.isDirectory) {
           continue;
         }
@@ -654,7 +735,7 @@ export async function readAgentDefinition(
           throw new Error(sizeValidation.error);
         }
 
-        content = await readFileString(candidate.runtime, filePath);
+        content = await readFileString(candidate.runtime, filePath, abortSignal);
         byteSize = stat.size;
       }
       const parsed = parseAgentDefinitionMarkdown({ content, byteSize });
@@ -677,7 +758,11 @@ export async function readAgentDefinition(
       }
 
       return validated.data;
-    } catch {
+    } catch (error) {
+      // An aborted or failed read (transport, permission) is not a missing
+      // candidate: stop probing instead of falling through to a lower scope
+      // (#4438, #4827). Parse and validation errors still skip the candidate.
+      if (abortSignal?.aborted || isRuntimeReadFailure(error)) throw error;
       continue;
     }
   }
@@ -714,8 +799,8 @@ export async function resolveAgentBody(
   agentId: AgentId,
   options?: {
     roots?: AgentDefinitionsRoots;
-    includeAgentPlugins?: boolean;
     skipScopesAbove?: AgentDefinitionScope;
+    cache?: AgentDefinitionRequestCache;
   }
 ): Promise<string> {
   const visited = new Set<string>();
@@ -755,8 +840,8 @@ export async function resolveAgentBody(
 
     const pkg = await readAgentDefinition(runtime, workspacePath, id, {
       roots: options?.roots,
-      includeAgentPlugins: options?.includeAgentPlugins,
       skipScopesAbove,
+      cache: options?.cache,
     });
 
     const visitKey = agentVisitKey(pkg.id, pkg.scope);
@@ -898,8 +983,8 @@ export async function resolveAgentDefinition(
 
     const pkg = await readAgentDefinition(runtime, workspacePath, id, {
       roots: options?.roots,
-      includeAgentPlugins: options?.includeAgentPlugins,
       skipScopesAbove,
+      cache: options?.cache,
     });
 
     const visitKey = agentVisitKey(pkg.id, pkg.scope);
@@ -983,7 +1068,6 @@ export async function resolveHeadlessAgentDefinition(
 
 export type AgentDefinitionsContext = Pick<ORPCContext, "config"> & {
   aiService: Pick<ORPCContext["aiService"], "getWorkspaceMetadata">;
-  experimentsService: Pick<ORPCContext["experimentsService"], "isExperimentEnabled">;
   initStateManager: Pick<ORPCContext["initStateManager"], "waitForInit">;
 };
 
@@ -1006,6 +1090,7 @@ export async function resolveAgentDiscoveryContext(
       metadata,
     };
   }
+  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
   const projectPath = input.projectPath!;
   return {
     runtime: createRuntime({ type: "local", srcBaseDir: context.config.srcDir }, { projectPath }),
@@ -1024,12 +1109,7 @@ export async function listAgentDefinitions(
 ) {
   if (input.workspaceId) await context.initStateManager.waitForInit(input.workspaceId);
   const { runtime, discoveryPath } = await resolveAgentDiscoveryContext(context, input);
-  const includeAgentPlugins = context.experimentsService.isExperimentEnabled(
-    EXPERIMENT_IDS.AGENT_PLUGINS
-  );
-  const descriptors = await discoverAgentDefinitions(runtime, discoveryPath, {
-    includeAgentPlugins,
-  });
+  const descriptors = await discoverAgentDefinitions(runtime, discoveryPath);
   const cfg = context.config.loadConfigOrDefault();
   const resolved = await Promise.all(
     descriptors.map(async (listedDescriptor) => {
@@ -1046,7 +1126,6 @@ export async function listAgentDefinitions(
         const resolvedFrontmatter =
           headless?.frontmatter ??
           (await resolveAgentFrontmatter(runtime, discoveryPath, descriptor.id, {
-            includeAgentPlugins,
             skipScopesAbove: getSkipScopesAboveForKnownScope(descriptor.scope),
           }));
         if (
@@ -1091,9 +1170,5 @@ export async function getAgentDefinition(
 ) {
   if (input.workspaceId) await context.initStateManager.waitForInit(input.workspaceId);
   const { runtime, discoveryPath } = await resolveAgentDiscoveryContext(context, input);
-  return readAgentDefinition(runtime, discoveryPath, input.agentId, {
-    includeAgentPlugins: context.experimentsService.isExperimentEnabled(
-      EXPERIMENT_IDS.AGENT_PLUGINS
-    ),
-  });
+  return readAgentDefinition(runtime, discoveryPath, input.agentId);
 }

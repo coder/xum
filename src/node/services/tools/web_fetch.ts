@@ -11,10 +11,14 @@ import {
   WEB_FETCH_TIMEOUT_SECS,
   WEB_FETCH_MAX_OUTPUT_BYTES,
   WEB_FETCH_MAX_HTML_BYTES,
+  WEB_FETCH_MAX_ADDRESS_ATTEMPTS,
 } from "@/common/constants/toolLimits";
 import { EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import * as runtimeHelpers from "@/node/utils/runtime/helpers";
 import { getErrorMessage } from "@/common/utils/errors";
+import { assert } from "@/common/utils/assert";
+import type { Runtime } from "@/node/runtime/Runtime";
+import { log } from "@/node/services/log";
 import {
   isBlockedHostname,
   isBlockedIpAddress,
@@ -30,6 +34,8 @@ const WEB_FETCH_BLOCKED_TARGET_ERROR =
   "Blocked URL: web_fetch cannot access loopback, private, link-local, or internal network targets";
 const WEB_FETCH_RESOLVE_ERROR = "Failed to fetch URL: Could not resolve host";
 const WEB_FETCH_TIMEOUT_ERROR = "Failed to fetch URL: Operation timed out";
+const WEB_FETCH_CURL_PROBE_ERROR = "Failed to fetch URL: could not determine the curl version";
+const CURL_ROUTE_MARKER = "XUM_CURL_ROUTE=";
 
 class WebFetchValidationError extends Error {}
 
@@ -224,12 +230,78 @@ async function resolveHostnameInRuntime(
   return parseResolvedAddresses(result.stdout);
 }
 
+// One probe per runtime instance, shared by concurrent first fetches. It resolves to
+// whether curl reports %{proxy_used} (8.7+). A failed probe is not cached, so a later
+// fetch probes again; this fetch refuses before any request.
+const curlReportsProxyUsedByRuntime = new WeakMap<Runtime, Promise<boolean>>();
+
+function probeCurlReportsProxyUsed(config: ToolConfiguration): Promise<boolean> {
+  const cached = curlReportsProxyUsedByRuntime.get(config.runtime);
+  if (cached) return cached;
+  const probe = (async () => {
+    // No abort signal: concurrent fetches share this probe, so one caller's abort must
+    // not fail the others. The fixed timeout bounds it instead.
+    const result = await runtimeHelpers.execBuffered(config.runtime, "curl -q --version", {
+      cwd: config.cwd,
+      timeout: WEB_FETCH_RESOLVE_TIMEOUT_SECS,
+    });
+    const match = /^curl (\d+)\.(\d+)\.\d+/.exec(result.stdout);
+    if (result.exitCode !== 0 || !match) {
+      throw new WebFetchValidationError(WEB_FETCH_CURL_PROBE_ERROR);
+    }
+    // No version floor: a curl without --connect-to rejects the unknown option (exit 2)
+    // before it connects, so the pin cannot be skipped silently.
+    const [major, minor] = [Number(match[1]), Number(match[2])];
+    const reportsProxyUsed = major > 8 || (major === 8 && minor >= 7);
+    if (!reportsProxyUsed) {
+      log.debug("web_fetch: curl before 8.7 has no %{proxy_used}; skipping the route check");
+    }
+    return reportsProxyUsed;
+  })();
+  curlReportsProxyUsedByRuntime.set(config.runtime, probe);
+  probe.catch(() => {
+    if (curlReportsProxyUsedByRuntime.get(config.runtime) === probe) {
+      curlReportsProxyUsedByRuntime.delete(config.runtime);
+    }
+  });
+  return probe;
+}
+
+interface WebFetchTarget {
+  url: URL;
+  /**
+   * The validated addresses this URL may connect to, in resolver order, or just the IP
+   * literal. Each request pins one of them; never curl's own DNS (#5966).
+   */
+  addresses: string[];
+  /** False for IP-literal URLs, which curl connects to without resolving. */
+  pinned: boolean;
+}
+
+/**
+ * `--connect-to <host>:<port>:<addr>:<port>` for one validated address. curl matches the
+ * pin against the request's host and port exactly and silently ignores a mismatch (then
+ * curl, or a proxy, resolves the hostname again), so build the key from the same URL the
+ * command fetches and refuse anything that would not match. The hostname stays the URL's
+ * for Host, SNI and certificate checks; only the TCP route is pinned.
+ */
+function buildConnectToPin(url: URL, address: string): string {
+  const port = url.port || (url.protocol === "https:" ? "443" : "80");
+  // The hostname goes into the pin verbatim (trailing dot and punycode included): the
+  // command fetches url.toString(), whose host is this same string.
+  if (url.hostname.length === 0 || /[:[\]]/.test(url.hostname) || !/^\d+$/.test(port)) {
+    throw new WebFetchValidationError(WEB_FETCH_BLOCKED_TARGET_ERROR);
+  }
+  const routedAddress = net.isIP(address) === 6 ? `[${address}]` : address;
+  return `${url.hostname}:${port}:${routedAddress}:${port}`;
+}
+
 async function assertWebFetchTargetAllowed(
   config: ToolConfiguration,
   rawUrl: string,
   deadlineMs: number,
   abortSignal?: AbortSignal
-): Promise<URL> {
+): Promise<WebFetchTarget> {
   let parsedUrl: URL;
   try {
     parsedUrl = new URL(rawUrl);
@@ -248,7 +320,7 @@ async function assertWebFetchTargetAllowed(
     if (isBlockedIpAddress(hostname)) {
       throw new WebFetchValidationError(WEB_FETCH_BLOCKED_TARGET_ERROR);
     }
-    return parsedUrl;
+    return { url: parsedUrl, addresses: [hostname], pinned: false };
   }
 
   const resolvedAddresses = await resolveHostnameInRuntime(
@@ -263,7 +335,8 @@ async function assertWebFetchTargetAllowed(
     }
   }
 
-  return parsedUrl;
+  assert(resolvedAddresses.length > 0, "web_fetch: resolver returned no addresses");
+  return { url: parsedUrl, addresses: resolvedAddresses, pinned: true };
 }
 
 /** Parse curl -i output into headers and body */
@@ -319,9 +392,15 @@ function isRedirectStatusCode(statusCode: number): boolean {
   );
 }
 
-function buildCurlCommand(url: string, timeoutSecs: number): string {
+function buildCurlCommand(
+  url: string,
+  timeoutSecs: number,
+  connectTo: string | null,
+  reportsProxyUsed: boolean
+): string {
   return [
     "curl",
+    "-q", // Must be first: ignore .curlrc (a `location` there would skip per-hop checks)
     "-sS", // Silent but show errors
     "-i", // Include headers in output
     "--fail-with-body", // Return exit code 22 for HTTP 4xx/5xx but still output body
@@ -340,8 +419,122 @@ function buildCurlCommand(url: string, timeoutSecs: number): string {
     shellQuote(
       "Accept: text/markdown, text/x-markdown, text/plain, text/html, application/xhtml+xml"
     ),
+    // Pin the validated address (#5966 security finding): curl must not resolve the
+    // hostname again. --proxytunnel makes a configured proxy CONNECT to the pinned IP
+    // instead of resolving the hostname itself.
+    "--proxytunnel",
+    // Keep the proxy's CONNECT reply out of the -i output, or it parses as the response.
+    "--suppress-connect-headers",
+    ...(connectTo != null ? ["--connect-to", shellQuote(connectTo)] : []),
+    // Older curl only warns about an unknown %{proxy_used}, so ask for it only on 8.7+.
+    ...(reportsProxyUsed
+      ? ["-w", shellQuote(`%{stderr}${CURL_ROUTE_MARKER}%{remote_ip};%{proxy_used}\n`)]
+      : []),
     shellQuote(url),
   ].join(" ");
+}
+
+/** curl's route report: the address it connected to and whether a proxy was used. */
+interface CurlRoute {
+  remoteIp: string;
+  proxyUsed: boolean;
+}
+
+/** Remove curl's route line from stderr; `route` is null when it is missing or malformed. */
+function takeCurlRouteLine(stderr: string): { route: CurlRoute | null; stderr: string } {
+  const lines = stderr.split("\n");
+  const index = lines.findLastIndex((line) => line.startsWith(CURL_ROUTE_MARKER));
+  if (index === -1) return { route: null, stderr: stderr.trim() };
+  const fields = lines[index].slice(CURL_ROUTE_MARKER.length).split(";");
+  lines.splice(index, 1);
+  const [remoteIp, proxyUsed] = fields;
+  const wellFormed = fields.length === 2 && (proxyUsed === "0" || proxyUsed === "1");
+  return {
+    route: wellFormed ? { remoteIp, proxyUsed: proxyUsed === "1" } : null,
+    stderr: lines.join("\n").trim(),
+  };
+}
+
+/**
+ * Remove curl's route line from stderr and check it. This is an invariant check, NOT the
+ * SSRF defense: it runs after curl already connected, so it can only keep a wrong route's
+ * response out of the result; pinning prevents the connection. It needs %{proxy_used}
+ * (curl 8.7+) and checks direct connections only: through a proxy, %{remote_ip} is the
+ * proxy. A missing or malformed route line with a response is treated as a wrong route,
+ * and so is a direct connection that produced a response but reports no address (#5990).
+ * An empty address with no response is curl failing before it connected: its own error
+ * is reported instead.
+ */
+function checkCurlRoute(
+  result: runtimeHelpers.ExecResult,
+  expectedAddress: string
+): { result: runtimeHelpers.ExecResult; route: CurlRoute | null } {
+  const { route, stderr } = takeCurlRouteLine(result.stderr);
+  const hasResponse = result.stdout.length > 0;
+  const wrongRoute =
+    route === null
+      ? hasResponse
+      : !route.proxyUsed &&
+        (route.remoteIp === ""
+          ? hasResponse
+          : normalizeHostname(route.remoteIp) !== normalizeHostname(expectedAddress));
+  if (wrongRoute) {
+    throw new WebFetchValidationError(WEB_FETCH_BLOCKED_TARGET_ERROR);
+  }
+  return { result: { ...result, stderr }, route };
+}
+
+/**
+ * #5977: whether the pinned address itself was unreachable. curl exits 7 also when a proxy
+ * refuses the tunnel or is down, but then it reports proxy_used=1. Only a direct attempt
+ * that got no response at all qualifies.
+ */
+function isPinnedAddressUnreachable(
+  result: runtimeHelpers.ExecResult,
+  route: CurlRoute | null
+): boolean {
+  return route?.proxyUsed === false && result.exitCode === 7 && result.stdout.length === 0;
+}
+
+/**
+ * One request for one target. A later validated address is tried only when the pinned one
+ * was unreachable (#5977): at most once each, at most WEB_FETCH_MAX_ADDRESS_ATTEMPTS in
+ * total, inside the same deadline, never unpinned.
+ * Without the route line (curl before 8.7) a refused CONNECT looks the same as a dead
+ * address, so that curl makes one attempt only.
+ */
+async function fetchTargetFromValidatedAddresses(
+  config: ToolConfiguration,
+  target: WebFetchTarget,
+  deadlineMs: number,
+  reportsProxyUsed: boolean,
+  abortSignal?: AbortSignal
+): Promise<runtimeHelpers.ExecResult> {
+  let result: runtimeHelpers.ExecResult | undefined;
+  for (const address of target.addresses.slice(0, WEB_FETCH_MAX_ADDRESS_ATTEMPTS)) {
+    const curlTimeoutSecs = getRemainingWebFetchTimeoutSecs(deadlineMs);
+    const connectTo = target.pinned ? buildConnectToPin(target.url, address) : null;
+    const raw = await runtimeHelpers.execBuffered(
+      config.runtime,
+      buildCurlCommand(target.url.toString(), curlTimeoutSecs, connectTo, reportsProxyUsed),
+      {
+        cwd: config.cwd,
+        abortSignal,
+        // Keep redirect hops inside the original fetch deadline instead of
+        // letting each curl invocation block for a fresh full timeout.
+        timeout: curlTimeoutSecs + WEB_FETCH_RUNTIME_TIMEOUT_GRACE_SECS,
+      }
+    );
+    if (!reportsProxyUsed) return raw;
+    const checked = checkCurlRoute(raw, address);
+    result = checked.result;
+    if (!isPinnedAddressUnreachable(result, checked.route) || abortSignal?.aborted) {
+      return result;
+    }
+    log.debug("web_fetch: pinned address unreachable, trying the next validated one");
+  }
+  assert(result, "web_fetch: a target always has at least one address");
+  return result;
 }
 
 async function executeWebFetchRequest(
@@ -350,20 +543,18 @@ async function executeWebFetchRequest(
   abortSignal?: AbortSignal
 ): Promise<{ result: runtimeHelpers.ExecResult; finalUrl: string }> {
   const deadlineMs = Date.now() + WEB_FETCH_TIMEOUT_SECS * 1000;
-  let currentUrl = await assertWebFetchTargetAllowed(config, rawUrl, deadlineMs, abortSignal);
+  let target = await assertWebFetchTargetAllowed(config, rawUrl, deadlineMs, abortSignal);
+  // A curl that cannot be classified refuses here, before any HTTP request.
+  const reportsProxyUsed = await probeCurlReportsProxyUsed(config);
 
   for (let redirectCount = 0; redirectCount <= WEB_FETCH_MAX_REDIRECTS; redirectCount++) {
-    const curlTimeoutSecs = getRemainingWebFetchTimeoutSecs(deadlineMs);
-    const result = await runtimeHelpers.execBuffered(
-      config.runtime,
-      buildCurlCommand(currentUrl.toString(), curlTimeoutSecs),
-      {
-        cwd: config.cwd,
-        abortSignal,
-        // Keep redirect hops inside the original fetch deadline instead of
-        // letting each curl invocation block for a fresh full timeout.
-        timeout: curlTimeoutSecs + WEB_FETCH_RUNTIME_TIMEOUT_GRACE_SECS,
-      }
+    const currentUrl = target.url;
+    const result = await fetchTargetFromValidatedAddresses(
+      config,
+      target,
+      deadlineMs,
+      reportsProxyUsed,
+      abortSignal
     );
 
     if (result.exitCode !== 0) {
@@ -385,7 +576,7 @@ async function executeWebFetchRequest(
       throw new WebFetchValidationError("Failed to fetch URL: Too many redirects");
     }
 
-    currentUrl = await assertWebFetchTargetAllowed(
+    target = await assertWebFetchTargetAllowed(
       config,
       new URL(redirectLocation, currentUrl).toString(),
       deadlineMs,

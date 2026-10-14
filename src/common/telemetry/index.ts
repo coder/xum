@@ -12,7 +12,6 @@
  */
 
 export { initTelemetry } from "./client";
-export { trackAppStarted } from "./lifecycle";
 
 // Tracking functions - callers pass raw values, rounding handled internally
 export {

@@ -1,5 +1,7 @@
 import { StreamStopCauseSchema } from "@/common/types/streamStopCause";
 import { z } from "zod";
+import { stripClientPluginSendHookFields } from "@/common/utils/messages/pluginSendHookFields";
+import { ServiceTierSchema } from "../../config/schemas/providersConfig";
 import { MCPToolCallDisplaySchema } from "./mcp";
 import { AgentDefinitionScopeSchema, AgentIdSchema } from "./agentDefinition";
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
@@ -14,9 +16,13 @@ import {
   MuxReasoningPartSchema,
   MuxTextPartSchema,
   MuxToolPartSchema,
+  PersistedToolModelUsagesSchema,
 } from "./message";
 import type { MuxMessageMetadata } from "../../types/message";
+import type { AssistedReviewHunk } from "../../types/review";
+import type { TodoItem } from "../../types/tools";
 import { MuxProviderOptionsSchema } from "./providerOptions";
+import { ReviewNoteDataSchema } from "./reviewState";
 import { RuntimeModeSchema } from "./runtime";
 import { WorkflowRunIdSchema, WorkflowRunRecordSchema } from "./workflow";
 
@@ -76,7 +82,37 @@ export const OnChatDowngradeReasonSchema = z.enum([
   "oldest-mismatch",
   "fingerprint-mismatch",
   "history-read-failed",
+  /** A windowed client's since range could not be read within the window budget (#4961). */
+  "outside-window",
 ]);
+
+const WindowSeedSchema = z.object({
+  todos: z.array(
+    z.object({ content: z.string(), status: z.enum(["pending", "in_progress", "completed"]) })
+  ),
+  assistedReview: z.array(
+    z.object({
+      path: z.string(),
+      range: z.object({ start: z.number(), end: z.number() }).optional(),
+      comment: z.string().optional(),
+    })
+  ),
+});
+
+// Zod strips unknown keys, so a field added to TodoItem or AssistedReviewHunk but not here would
+// vanish from the seed silently. These exact-type checks fail typecheck on any drift, optional
+// keys included. `addedAt` is frontend-only and never persisted.
+type IsExactly<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
+type WindowSeed = z.infer<typeof WindowSeedSchema>;
+export type WindowSeedMatchesSessionFiles = [
+  IsExactly<WindowSeed["todos"][number], TodoItem> extends true ? true : never,
+  IsExactly<WindowSeed["assistedReview"][number], Omit<AssistedReviewHunk, "addedAt">> extends true
+    ? true
+    : never,
+];
+const windowSeedMatchesSessionFiles: WindowSeedMatchesSessionFiles = [true, true];
+void windowSeedMatchesSessionFiles;
 
 export const CaughtUpMessageSchema = z.object({
   type: z.literal("caught-up"),
@@ -102,6 +138,13 @@ export const CaughtUpMessageSchema = z.object({
    * Omitted for since/live replays so the client can preserve existing pagination state.
    */
   hasOlderHistory: z.boolean().optional(),
+  /**
+   * Windowed replay (#4961): present exactly when a windowed full replay stops short of the
+   * active epoch's start. Todos and Review-pane pins are derived from replayed rows, so a window
+   * can miss their last write; these are the session files the agent itself reads, for the
+   * client to use as a baseline that the replayed rows override.
+   */
+  windowSeed: WindowSeedSchema.optional(),
   /** Server's cursor at end of replay (client should use this for next reconnect). */
   cursor: OnChatCursorSchema.optional(),
 });
@@ -211,6 +254,10 @@ export const StreamStartEventSchema = z.object({
     .string()
     .optional()
     .meta({ description: "ACP prompt correlation id for matching stream events" }),
+  // Same turn metadata that stream-end and the persisted row carry. Sent at start so the
+  // renderer can classify the turn (e.g. hide a token-budget maintenance flush) before the
+  // first delta paints, instead of only once the turn has settled.
+  muxMetadata: z.custom<MuxMessageMetadata>().optional(),
 });
 
 export const StreamDeltaEventSchema = z.object({
@@ -289,6 +336,8 @@ export const StreamEndEventSchema = z.object({
       providerMetadata: z.record(z.string(), z.unknown()).optional(),
       // Last step's provider metadata (for context window cache display)
       contextProviderMetadata: z.record(z.string(), z.unknown()).optional(),
+      // Model-backed tool and refused-attempt usage, as persisted on the history row.
+      toolModelUsages: PersistedToolModelUsagesSchema.optional(),
       finishReason: z.string().optional(),
       stopCause: StreamStopCauseSchema.optional(),
       duration: z.number().optional(),
@@ -356,6 +405,8 @@ export const StreamAbortEventSchema = z.object({
       duration: z.number().optional(),
       model: z.string().optional(),
       metadataModel: z.string().optional(),
+      // Model-backed tool and refused-attempt usage, as persisted on the committed partial.
+      toolModelUsages: PersistedToolModelUsagesSchema.optional(),
     })
     .optional()
     .meta({
@@ -431,48 +482,6 @@ export const BashOutputEventSchema = z.object({
   text: z.string(),
   isError: z.boolean().meta({ description: "True if this chunk is from stderr" }),
   timestamp: z.number().meta({ description: "When output was flushed (Date.now())" }),
-});
-
-/**
- * UI-only advisor progress update for live phase display.
- *
- * This is intentionally NOT part of the tool result returned to the model.
- * It is streamed over workspace.onChat so the UI can show honest advisor progress.
- */
-export const AdvisorPhaseEventSchema = z.object({
-  type: z.literal("advisor-phase"),
-  workspaceId: z.string(),
-  toolCallId: z.string(),
-  phase: z.enum(["preparing_context", "waiting_for_response", "finalizing_result"]),
-  timestamp: z.number().meta({ description: "When the phase changed (Date.now())" }),
-});
-
-/**
- * UI-only incremental output from the advisor tool.
- *
- * This is intentionally NOT part of the tool result returned to the model.
- * It is streamed over workspace.onChat so users can read advice while it is generated.
- */
-export const AdvisorOutputEventSchema = z.object({
-  type: z.literal("advisor-output"),
-  workspaceId: z.string(),
-  toolCallId: z.string(),
-  text: z.string(),
-  timestamp: z.number().meta({ description: "When output was received (Date.now())" }),
-});
-
-/**
- * UI-only incremental reasoning from the advisor tool.
- *
- * This is intentionally NOT part of the tool result returned to the model.
- * It is streamed over workspace.onChat so users can see advisor thinking while it is generated.
- */
-export const AdvisorReasoningOutputEventSchema = z.object({
-  type: z.literal("advisor-reasoning-output"),
-  workspaceId: z.string(),
-  toolCallId: z.string(),
-  text: z.string(),
-  timestamp: z.number().meta({ description: "When reasoning output was received (Date.now())" }),
 });
 
 /**
@@ -665,15 +674,14 @@ export const ChatMuxMessageSchema = MuxMessageSchema.extend({
   type: z.literal("message"),
 });
 
-// Review data schema for queued message display
-export const ReviewNoteDataSchema = z.object({
-  filePath: z.string(),
-  lineRange: z.string(),
-  selectedCode: z.string(),
-  selectedDiff: z.string().optional(),
-  oldStart: z.number().optional(),
-  newStart: z.number().optional(),
-  userNote: z.string(),
+/**
+ * Consecutive replayed history rows in order, as parsed by the wire schema (#4868). Sent only to
+ * onChat subscribers that pass `batchReplay: true`, to save one event/frame per row on large
+ * replays; clients unpack it into single `message` rows.
+ */
+export const ChatMuxMessageBatchSchema = z.object({
+  type: z.literal("message-batch"),
+  messages: z.array(ChatMuxMessageSchema),
 });
 
 export const GoalBudgetLimitedEventSchema = z.object({
@@ -685,6 +693,28 @@ export const GoalBudgetLimitedEventSchema = z.object({
   message: z.string(),
 });
 
+/**
+ * A plugin hook's `systemMessage` (Codex: "surfaced as a warning in the UI"). Live only: it is never
+ * saved to chat.jsonl and never sent to the model.
+ */
+export const PluginHookNoticeEventSchema = z.object({
+  type: z.literal("plugin-hook-notice"),
+  workspaceId: z.string(),
+  plugin: z.string(),
+  message: z.string(),
+});
+
+/** Wire shape of ArtifactInteractionMetadata (Artifacts M5b), for queued-message projections. */
+export const ArtifactInteractionMetadataSchema = z.object({
+  id: z.string(),
+  artifactPath: z.string(),
+  title: z.string(),
+  version: z.number().int().nonnegative(),
+  action: z.literal("send"),
+  text: z.string(),
+  data: z.unknown().optional(),
+});
+
 export const QueuedMessageChangedEventSchema = z.object({
   type: z.literal("queued-message-changed"),
   workspaceId: z.string(),
@@ -692,11 +722,26 @@ export const QueuedMessageChangedEventSchema = z.object({
   hasQueuedMessages: z.boolean().optional(),
   queuedMessages: z.array(z.string()),
   displayText: z.string(),
+  /**
+   * Send ids of the visible queued entries (idempotent sends): the composer knows these reached
+   * the receiver, and a queue edit of sends its draft still retains does not insert them again.
+   */
+  sendIds: z.array(z.string()).optional(),
   fileParts: z.array(FilePartSchema).optional(),
   reviews: z.array(ReviewNoteDataSchema).optional(),
+  /**
+   * Set when the only visible queued entry is a message sent from an artifact: the renderer
+   * shows it like the sent message (label, confirmed text) instead of the model-facing tag.
+   */
+  artifactInteraction: ArtifactInteractionMetadataSchema.optional(),
   queueDispatchMode: z.enum(["tool-end", "turn-end"]).optional(),
   /** True when the queued message is a compaction request (/compact) */
   hasCompactionRequest: z.boolean().optional(),
+  /**
+   * ACP prompts whose entries are still queued (hidden entries included). A queued prompt gets no
+   * correlated event while it waits, so the ACP agent pauses its pre-correlation timeout (#5198).
+   */
+  acpPromptIds: z.array(z.string()).optional(),
 });
 
 export const RestoreToInputEventSchema = z.object({
@@ -705,6 +750,63 @@ export const RestoreToInputEventSchema = z.object({
   text: z.string(),
   fileParts: z.array(FilePartSchema).optional(),
   reviews: z.array(ReviewNoteDataSchema).optional(),
+  /**
+   * Held inputs (see HeldInputsChangedEventSchema) that keep this restored input until a composer
+   * takes it (#4448). A composer that applies the restore acknowledges them with
+   * workspace.discardHeldInput; one that cannot (edit mode, not mounted, not subscribed) leaves
+   * them held, so the input is never lost with this one-shot event.
+   */
+  heldInputIds: z.array(z.string()).optional(),
+  /**
+   * The same input split per restored send (the fields above join them): each input's own
+   * authored text, file parts and send ids. A composer that still retains a send's draft under
+   * those ids (pendingSends) does not insert it again: its draft resolves instead.
+   */
+  inputs: z
+    .array(
+      z.object({
+        text: z.string(),
+        fileParts: z.array(FilePartSchema).optional(),
+        reviews: z.array(ReviewNoteDataSchema).optional(),
+        sendIds: z.array(z.string()),
+      })
+    )
+    .optional(),
+});
+
+/**
+ * The session's held inputs (see AgentSession.heldInputs): manual queued messages refused at
+ * dispatch because the task reported before they ran, or returned by a restore that no composer
+ * has taken yet (`interrupted`). Full list, oldest first; sent on every
+ * change and replayed on subscription while non-empty. The session keeps each full send and
+ * re-sends or discards it only on explicit request (workspace.sendHeldInput/discardHeldInput),
+ * so this carries display data only.
+ */
+export const HeldInputsChangedEventSchema = z.object({
+  type: z.literal("held-inputs-changed"),
+  workspaceId: z.string(),
+  heldInputs: z.array(
+    z.object({
+      id: z.string(),
+      /**
+       * Why it was refused. `reported`: the turn before it was the task's terminal report.
+       * `indeterminate`: it could not run and no report was confirmed (the report's outcome could
+       * not be established, or the attempt was otherwise closed/superseded). `interrupted`: Stop,
+       * an edit or a failed queued send returned it from the queue and no composer took it (edit
+       * mode, not mounted, not subscribed).
+       */
+      reason: z.enum(["reported", "indeterminate", "interrupted"]),
+      /** The user's authored text (or slash command); empty for attachment/review-only input. */
+      displayText: z.string(),
+      attachmentCount: z.number().int().nonnegative(),
+      reviewCount: z.number().int().nonnegative(),
+      /**
+       * The ACP prompt that queued this input, when one did. Such an input never starts a stream,
+       * so the ACP agent settles that prompt's turn from this list (#5171).
+       */
+      acpPromptId: z.string().optional(),
+    })
+  ),
 });
 
 // All streaming events now have a `type` field for O(1) discriminated union lookup.
@@ -714,6 +816,29 @@ export const PrefixSwapInvalidatedEventSchema = z.object({
   type: z.literal("prefix-swap-invalidated"),
   workspaceId: z.string(),
   messageId: z.string(),
+});
+
+// Inert legacy wire shapes: version 3 session tapes can contain advisor progress.
+// Keep validating those recordings without restoring a producer or dedicated UI.
+const legacyAdvisorEventFields = {
+  workspaceId: z.string(),
+  toolCallId: z.string(),
+  timestamp: z.number(),
+};
+const LegacyAdvisorOutputEventSchema = z.object({
+  ...legacyAdvisorEventFields,
+  type: z.literal("advisor-output"),
+  text: z.string(),
+});
+const LegacyAdvisorReasoningOutputEventSchema = z.object({
+  ...legacyAdvisorEventFields,
+  type: z.literal("advisor-reasoning-output"),
+  text: z.string(),
+});
+const LegacyAdvisorPhaseEventSchema = z.object({
+  ...legacyAdvisorEventFields,
+  type: z.literal("advisor-phase"),
+  phase: z.enum(["preparing_context", "waiting_for_response", "finalizing_result"]),
 });
 
 export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
@@ -734,22 +859,24 @@ export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
   ToolCallDeltaEventSchema,
   ToolCallEndEventSchema,
   BashOutputEventSchema,
-  AdvisorOutputEventSchema,
-  AdvisorReasoningOutputEventSchema,
+  LegacyAdvisorOutputEventSchema,
+  LegacyAdvisorReasoningOutputEventSchema,
+  LegacyAdvisorPhaseEventSchema,
   TaskCreatedEventSchema,
   WorkflowRunAttachedEventSchema,
-  AdvisorPhaseEventSchema,
   // Reasoning events
   ReasoningDeltaEventSchema,
   ReasoningEndEventSchema,
   // Error events
   ErrorEventSchema,
   GoalBudgetLimitedEventSchema,
+  PluginHookNoticeEventSchema,
   // Usage and queue events
   UsageDeltaEventSchema,
   SessionUsageDeltaEventSchema,
   QueuedMessageChangedEventSchema,
   RestoreToInputEventSchema,
+  HeldInputsChangedEventSchema,
   // Auto-compaction status events
   AutoCompactionTriggeredEventSchema,
   AutoCompactionCompletedEventSchema,
@@ -763,6 +890,7 @@ export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
   ...WorkspaceInitEventSchema.def.options,
   // Chat messages with type discriminator
   ChatMuxMessageSchema,
+  ChatMuxMessageBatchSchema,
 ]);
 
 // Update Status
@@ -777,11 +905,19 @@ export const RestartBlockerSchema = z.object({
     "requests",
     "desktop-sessions",
     "queued-messages",
+    // Refused queued messages the session keeps for the user (AgentSession.heldInputs); memory only.
+    "held-inputs",
     "auto-retries",
     "terminals",
     "background-processes",
   ]),
   count: z.number().int().positive(),
+  /**
+   * Display names of the workspaces behind the blocker, so the user knows which one to open.
+   * Set for held-inputs only (#4770): unsent messages of an archived workspace are otherwise
+   * visible only in that workspace.
+   */
+  workspaceNames: z.array(z.string()).optional(),
 });
 
 export const UpdateStatusSchema = z.discriminatedUnion("type", [
@@ -820,48 +956,6 @@ export const ToolPolicySchema = z.array(ToolPolicyFilterSchema).meta({
   description:
     "Tool policy - array of filters applied in order. Default behavior is allow all tools.",
 });
-
-// Experiments schema for feature gating.
-//
-// Unknown keys (e.g. `goals` from older persisted send-options written
-// before the Goals experiment graduated to GA) are stripped by Zod's
-// default behavior, so we do not need to retain a deprecated field.
-export const ExperimentsSchema = z.preprocess(
-  // Legacy alias: startup-retry snapshots persisted by builds where "PTC
-  // Exclusive Mode" was a separate experiment may carry only the exclusive
-  // flag; the merged PTC experiment activates exactly that posture (`true`
-  // wins over an explicit programmaticToolCalling: false).
-  (value) =>
-    typeof value === "object" &&
-    value !== null &&
-    (value as Record<string, unknown>).programmaticToolCallingExclusive === true
-      ? { ...value, programmaticToolCalling: true }
-      : value,
-  z.object({
-    programmaticToolCalling: z.boolean().optional(),
-    /**
-     * Downgrade-compat mirror (see withLegacyPtcExclusiveMirror): retained
-     * through parsing and stamped alongside programmaticToolCalling in
-     * persisted startup-retry snapshots so a downgraded build resumes in the
-     * exclusive posture instead of supplement mode.
-     */
-    programmaticToolCallingExclusive: z.boolean().optional(),
-    /**
-     * RLM mode (sub-experiment of Programmatic Tool Calling): persistent
-     * sandbox kernel for code_execution. Inert unless a PTC flag is also on.
-     */
-    rlm: z.boolean().optional(),
-    advisorTool: z.boolean().optional(),
-    dynamicWorkflows: z.boolean().optional(),
-    memory: z.boolean().optional(),
-    memoryIntuition: z.boolean().optional(),
-    timeline: z.boolean().optional(),
-    workspaceHeartbeats: z.boolean().optional(),
-    toolSearch: z.boolean().optional(),
-    continuousCompaction: z.boolean().optional(),
-    tokenBudget: z.boolean().optional(),
-  })
-);
 
 /**
  * `steer` is accepted for older clients, but the backend treats every manual
@@ -908,6 +1002,24 @@ export function hasExactlyOneEditFence(options: {
 export const EDIT_FENCE_REQUIRED_MESSAGE =
   "editMessageId requires exactly one of historyEditPrecondition or unfencedEdit";
 
+/** Prefix of backend-minted send ids, reserved: a client id may not start with it. */
+export const MINTED_SEND_ID_PREFIX = "srv-";
+
+/** Any send id, a backend-minted one included (lookups; see SendIdSchema for sends). */
+export const SendIdLookupSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(/^[A-Za-z0-9_-]+$/);
+
+/** A send id: opaque, URL-safe, bounded (the backend matches it as a raw string in history). */
+export const SendIdSchema = SendIdLookupSchema.refine(
+  (id) => !id.startsWith(MINTED_SEND_ID_PREFIX),
+  {
+    message: `send ids starting with "${MINTED_SEND_ID_PREFIX}" are reserved for the backend`,
+  }
+);
+
 // SendMessage options
 export const SendMessageOptionsSchema = z.object({
   editMessageId: z.string().optional(),
@@ -918,6 +1030,7 @@ export const SendMessageOptionsSchema = z.object({
   thinkingLevel: ThinkingLevelSchema.optional(),
   /** OpenAI reasoning mode (pro toggle); inert for models without pro-mode support. */
   reasoningMode: OpenAIReasoningModeSchema.optional(),
+  serviceTier: ServiceTierSchema.optional(),
   model: z.string("No model specified"),
   toolPolicy: ToolPolicySchema.optional(),
   additionalSystemInstructions: z.string().optional(),
@@ -939,12 +1052,26 @@ export const SendMessageOptionsSchema = z.object({
     .array(z.string())
     .optional()
     .meta({ description: "Tool names delegated back to ACP clients for this request" }),
-  muxMetadata: z.any().optional(), // Black box
+  // Black box, except one prompt-hook field only Xum may set: a client-supplied "hooks already
+  // ran" flag on a compaction follow-up would skip message.send.
+  muxMetadata: z.any().transform(stripClientPluginSendHookFields).optional(),
   /**
    * When true, skip persisting AI settings (e.g., for one-shot or compaction sends).
    */
   skipAiSettingsPersistence: z.boolean().optional(),
-  experiments: ExperimentsSchema.optional(),
+  /**
+   * Fields the user deliberately picked (model/thinking/reasoning pickers) before this
+   * manual send. Pins those sent values on agent-task workspaces so they survive
+   * reawakenings. Renderer-origin only; stripped before queueing and dispatch.
+   */
+  aiSelectionIntent: z
+    .object({
+      model: z.literal(true).optional(),
+      thinkingLevel: z.literal(true).optional(),
+      reasoningMode: z.literal(true).optional(),
+      serviceTier: z.literal(true).optional(),
+    })
+    .optional(),
   /**
    * Composer model set to "Auto" (auto-model-routing experiment): classify the prompt's
    * difficulty and run on the matching tier's model. `model` stays the concrete
@@ -958,6 +1085,11 @@ export const SendMessageOptionsSchema = z.object({
    * composer's concrete level and doubles as the fallback.
    */
   autoThinkingLevel: z.boolean().optional(),
+  /**
+   * Auto choices to save for the agent instead of this send's own flags: a plan handoff sends
+   * with routing off but keeps the target agent's Auto choices for its later sends.
+   */
+  savedAutoRouting: z.object({ model: z.boolean(), thinkingLevel: z.boolean() }).optional(),
   /**
    * When true, workspace-specific agent definitions are disabled.
    * Only built-in and global agents are loaded. Useful for "unbricking" when
@@ -1007,12 +1139,30 @@ export const SendMessageOptionsSchema = z.object({
       }),
     ])
     .optional(),
-  /**
-   * Desktop/app-only capability: expose set_goal so an agent can create a
-   * continuation-backed goal for its current parent workspace. Headless callers
-   * omit this, so plain one-shot mux run stays one-shot.
-   */
-  allowAgentSetGoal: z.boolean().optional(),
   goalInterventionPolicy: GoalInterventionPolicySchema.nullish(),
   queueDispatchMode: z.enum(["tool-end", "turn-end"]).nullish(),
+  /**
+   * The user's authored text when the message text is not it: the composer formats attached
+   * review notes into the provider-facing message (prepareUserMessageForSend) and also carries
+   * them as structured reviews. Queue restores and held-input previews show this text next to
+   * the reviews, so a retry does not send every review twice. Transient: the queue keeps it per
+   * add and never forwards it to the turn.
+   */
+  authoredText: z.string().optional(),
+  /**
+   * Stable id of this send (idempotent sends): a retry of the same send reuses it with the same
+   * payload. The user row that accepts the send carries it (metadata.sendIds), and the backend
+   * never appends a second row for an id that a row already carries. When absent, the backend
+   * mints one at entry, so a held Retry still reuses the id of its original send.
+   */
+  sendId: SendIdSchema.optional(),
 });
+
+/**
+ * The ACP prompt a held input is re-sent as (#5170): replaces the correlation it was queued with,
+ * so the resent turn reports to the prompt that asked for it.
+ */
+export const AcpPromptCorrelationSchema = SendMessageOptionsSchema.pick({
+  acpPromptId: true,
+  delegatedToolNames: true,
+}).required({ acpPromptId: true });

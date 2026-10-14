@@ -6,9 +6,21 @@ import { ModelParametersByModelSchema } from "./modelParameters";
 import { ProviderModelEntrySchema } from "./providerModelEntry";
 
 export const CacheTtlSchema = z.enum(["5m", "1h"]);
-export const ServiceTierSchema = z.enum(["auto", "default", "flex", "priority"]);
+/** Anthropic request speed; "fast" opts into Fast mode (see anthropicFastMode.ts). */
+export const AnthropicSpeedSchema = z.enum(["standard", "fast"]);
+export type AnthropicSpeed = z.infer<typeof AnthropicSpeedSchema>;
+// "ultrafast" is OpenAI's model-gated premium tier (DevDay 2026-09-29); requests for
+// models without it drop the tier (see openaiModelSupportsServiceTier).
+export const ServiceTierSchema = z.enum(["auto", "default", "flex", "priority", "ultrafast"]);
 export type ServiceTier = z.infer<typeof ServiceTierSchema>;
-export const FastModePreviousServiceTierSchema = z.enum(["auto", "default", "flex", "unset"]);
+// Fast mode remembers the tier it replaced, so toggling Fast off from Ultrafast restores it.
+export const FastModePreviousServiceTierSchema = z.enum([
+  "auto",
+  "default",
+  "flex",
+  "ultrafast",
+  "unset",
+]);
 export type FastModePreviousServiceTier = z.infer<typeof FastModePreviousServiceTierSchema>;
 export const XAIServiceTierSchema = z.enum(["default", "priority"]);
 export type XAIServiceTier = z.infer<typeof XAIServiceTierSchema>;
@@ -32,6 +44,7 @@ export const BaseProviderConfigSchema = z
 
 export const AnthropicProviderConfigSchema = BaseProviderConfigSchema.extend({
   cacheTtl: CacheTtlSchema.optional(),
+  speed: AnthropicSpeedSchema.optional(),
 });
 
 export const OpenAIProviderConfigSchema = BaseProviderConfigSchema.extend({
@@ -43,6 +56,8 @@ export const OpenAIProviderConfigSchema = BaseProviderConfigSchema.extend({
   defaultModel: z.string().optional(),
   apiVersion: z.string().optional(),
   webSocketTransportEnabled: z.boolean().optional(),
+  /** Offer Cyber (OpenAI Daybreak access program) in the thinking menu. Absent = off. */
+  cyberModelEnabled: z.boolean().optional(),
 });
 
 export const BedrockProviderConfigSchema = BaseProviderConfigSchema.extend({
@@ -82,20 +97,36 @@ export const CoderProviderConfigSchema = BaseProviderConfigSchema.extend({
   coderOauth: z.record(z.string(), z.unknown()).optional(),
   /**
    * Model IDs discovered from the deployment's AI Bridge catalogs (written by
-   * coderOauthService only). Doubles as the authoritative-catalog marker for
-   * gateway routing (see gatewayModelCatalog.ts) and as the bookkeeping that
-   * separates discovered entries from manually added ones in `models`, so
-   * user-managed entries survive re-logins and catalog refreshes.
+   * coderOauthService only). The ONLY place the catalog is persisted, and the
+   * authoritative-catalog marker for gateway routing (see
+   * gatewayModelCatalog.ts): present = known, absent = unknown (fail open).
+   * Discovery never copies these into `models`; Settings offers them in an
+   * "add model" dropdown so the user adds the few they want.
    */
   discoveredModels: z.array(z.string()).optional(),
   /**
-   * Model IDs the user removed from the model list (discovered or not —
-   * catalog provenance is lossy across re-logins, so every deletion is
-   * recorded). User-managed exclusions: catalog refreshes and re-logins must
-   * not resurrect them (maintained by ProviderService.setModels, honored by
-   * discovery merges).
+   * Legacy routing tombstones: model IDs the user deleted from the model
+   * list while discovery still merged the catalog into `models`. Deleting a
+   * merged catalog model was the only way to route it directly, so routing
+   * keeps honoring these (see gatewayModelCatalog.ts). Never written anymore;
+   * re-adding a model under Settings → Models clears its tombstone
+   * (ProviderService.applyCoderModelEdit).
    */
   removedModels: z.array(z.string()).optional(),
+  /**
+   * Marks that `models` holds only user-managed entries. Set by every
+   * new-code writer of the section's model bookkeeping (catalog refresh —
+   * conclusive or inconclusive —, login commit, disconnect, Settings → Models
+   * edits) and by the one-shot startup migration
+   * (coderOauthService.separateDiscoveredModelsOnce).
+   * Before this flag existed, discovery merged the catalog into `models`.
+   * Invariant that keeps explicit adds safe: a catalog marker
+   * (`discoveredModels`/`staleDiscoveredModels`) WITHOUT this flag can only
+   * have been written by old code, whose `models` list is a merge by
+   * construction — so the migration strips catalog-derived plain entries
+   * exactly once and can never strip an entry the user added afterwards.
+   */
+  discoveredModelsUnlisted: z.boolean().optional(),
   /**
    * AI Gateway provider instances discovered from the deployment (written by
    * coderOauthService only). `name` is the gateway route segment and model ID
@@ -112,6 +143,13 @@ export const CoderProviderConfigSchema = BaseProviderConfigSchema.extend({
    * admin-only) and probing default names cannot find them.
    */
   additionalProviders: z.array(z.object({ name: z.string(), type: z.string() })).optional(),
+  /**
+   * User preference mapping a canonical provider (anthropic/openai/google) to
+   * the same-type gateway instance that serves its native models when routing
+   * picks Coder (see resolveCoderCanonicalRouteInstance). Login, refresh, and
+   * disconnect never touch it.
+   */
+  canonicalRoutes: z.record(z.string(), z.string()).optional(),
   /**
    * Cross-process disconnect generation (monotonic counter, incremented by
    * coderOauthService.disconnect). Each login flow snapshots the persisted
@@ -139,6 +177,7 @@ export const CoderProviderConfigSchema = BaseProviderConfigSchema.extend({
 export const GoogleProviderConfigSchema = BaseProviderConfigSchema;
 export const DeepSeekProviderConfigSchema = BaseProviderConfigSchema;
 export const MoonshotAIProviderConfigSchema = BaseProviderConfigSchema;
+export const MetaProviderConfigSchema = BaseProviderConfigSchema;
 export const ZaiProviderConfigSchema = BaseProviderConfigSchema;
 export const OllamaProviderConfigSchema = BaseProviderConfigSchema;
 export const GitHubCopilotProviderConfigSchema = BaseProviderConfigSchema;
@@ -150,6 +189,7 @@ export const ProvidersConfigSchema = z
     bedrock: BedrockProviderConfigSchema.optional(),
     openrouter: OpenRouterProviderConfigSchema.optional(),
     xai: XAIProviderConfigSchema.optional(),
+    meta: MetaProviderConfigSchema.optional(),
     "mux-gateway": MuxGatewayProviderConfigSchema.optional(),
     google: GoogleProviderConfigSchema.optional(),
     deepseek: DeepSeekProviderConfigSchema.optional(),

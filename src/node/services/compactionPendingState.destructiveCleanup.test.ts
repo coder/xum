@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { createMuxMessage } from "@/common/types/message";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { markLockOwnerDead } from "@/node/utils/concurrency/fileLockTestHelpers";
 import { CompactionPendingState } from "./compactionPendingState";
 import { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
@@ -164,9 +165,7 @@ describe("destructive compaction cleanup compatibility", () => {
         if (scenario === "queued") queued = publishSuccessor();
         else {
           const lockPath = historyWriteLockPath(h.config.rootDir, workspaceId);
-          const token = await fs.readFile(lockPath, "utf8");
-          await fs.writeFile(lockPath, token.split(":").slice(0, 2).join(":"));
-          await fs.utimes(lockPath, new Date(0), new Date(0));
+          await markLockOwnerDead(lockPath);
           lease = await acquireProcessFileLock({ lockPath, timeoutMs: 1000, label: "successor" });
           const generation = await h.historyService
             .getContinuousCompactionJournal(workspaceId)

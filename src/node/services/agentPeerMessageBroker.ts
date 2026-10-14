@@ -1,24 +1,15 @@
-import assert from "node:assert/strict";
-
 import {
   formatAgentMessageEnvelope,
   type AgentMessageRelationship,
 } from "@/common/utils/agentMessageEnvelope";
 import {
-  MAX_CONSECUTIVE_PEER_WAKES,
   MAX_QUEUED_PEER_MESSAGES_PER_TARGET,
   PEER_MESSAGE_DEDUPE_WINDOW_MS,
   PEER_MESSAGE_RATE_LIMIT_MAX,
   PEER_MESSAGE_RATE_WINDOW_MS,
   PEER_MESSAGE_TARGET_RATE_LIMIT_MAX,
 } from "@/constants/agentMessaging";
-import {
-  TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS,
-  TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES,
-  TASK_FAMILY_MESSAGE_MAX_TITLE_CHARS,
-  TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_CHARS,
-  TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES,
-} from "@/constants/taskMessages";
+import { TASK_FAMILY_MESSAGE_MAX_TITLE_CHARS } from "@/constants/taskMessages";
 import { createFamilyMessageId } from "@/node/services/utils/messageIds";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 
@@ -31,7 +22,12 @@ export type AgentPeerMessageAdmissionError =
   | { code: "rate_limited"; retryAfterMs?: number };
 
 /** Routing relations that take the untrusted envelope path (everything except parent→child). */
-export type PeerPathRelation = "target_ancestor" | "peer" | "target_unrelated";
+export type PeerPathRelation =
+  | "target_ancestor"
+  | "peer"
+  | "target_unrelated"
+  | "target_main_chat"
+  | "target_side_chat";
 
 /**
  * Routing relation (sender-centric) → envelope relationship (what the recipient reads about the
@@ -42,18 +38,16 @@ const PEER_PATH_RELATIONSHIPS: Record<PeerPathRelation, AgentMessageRelationship
   target_ancestor: "descendant",
   peer: "sibling",
   target_unrelated: "unrelated",
+  target_main_chat: "side_chat",
+  target_side_chat: "main_chat",
 };
 
 export class AgentPeerMessageBroker {
   // Serialize multi-step delivery per target so concurrent senders cannot interleave admission.
   private readonly deliveryLocks = new MutexMap<string>();
-  private readonly familyMessageTotals = new Map<string, { count: number; chars: number }>();
-  private readonly familyMessageTargetTotals = new Map<string, { count: number; chars: number }>();
   private readonly peerMessageSendTimesByPair = new Map<string, number[]>();
   private readonly peerMessageSendTimesByTarget = new Map<string, number[]>();
   private readonly peerMessageDedupeTimes = new Map<string, number>();
-  /** Peer sends admitted since the target's last user or parent attention. */
-  private readonly consecutivePeerWakes = new Map<string, number>();
 
   constructor(
     private readonly host: AgentPeerMessageBrokerHost,
@@ -104,20 +98,16 @@ export class AgentPeerMessageBroker {
       };
     }
 
-    // Charged synchronously under the target event lock, so queued and delivered entries share
-    // one admission cap without a dequeue-to-acceptance gap.
-    if ((this.consecutivePeerWakes.get(targetId) ?? 0) >= MAX_CONSECUTIVE_PEER_WAKES) {
-      return {
-        code: "refused",
-        reason:
-          "Target reached its consecutive peer-wake limit and needs user or parent attention.",
-      };
-    }
-
     return null;
   }
 
   recordPeerSend(senderWorkspaceId: string, targetId: string, message: string): void {
+    this.recordPeerAttempt(senderWorkspaceId, targetId);
+    this.recordPeerDelivery(senderWorkspaceId, targetId, message);
+  }
+
+  /** Consume one rate-limit slot for the pair and the target. */
+  recordPeerAttempt(senderWorkspaceId: string, targetId: string): void {
     const now = this.now();
     const pairKey = `${senderWorkspaceId}\u0000${targetId}`;
     const pairTimes = this.peerMessageSendTimesByPair.get(pairKey) ?? [];
@@ -126,15 +116,12 @@ export class AgentPeerMessageBroker {
     const targetTimes = this.peerMessageSendTimesByTarget.get(targetId) ?? [];
     targetTimes.push(now);
     this.peerMessageSendTimesByTarget.set(targetId, targetTimes);
-    this.peerMessageDedupeTimes.set(`${pairKey}\u0000${message}`, now);
   }
 
-  chargeConsecutivePeerWake(targetId: string): void {
-    this.consecutivePeerWakes.set(targetId, (this.consecutivePeerWakes.get(targetId) ?? 0) + 1);
-  }
-
-  resetConsecutivePeerWakes(targetId: string): void {
-    this.consecutivePeerWakes.delete(targetId);
+  /** Arm duplicate suppression for a delivered message. */
+  recordPeerDelivery(senderWorkspaceId: string, targetId: string, message: string): void {
+    const pairKey = `${senderWorkspaceId}\u0000${targetId}`;
+    this.peerMessageDedupeTimes.set(`${pairKey}\u0000${message}`, this.now());
   }
 
   preparePeerMessage(params: {
@@ -184,68 +171,11 @@ export class AgentPeerMessageBroker {
     };
   }
 
-  /**
-   * Reserve both sender-to-target and all-senders-to-target session budgets. The synchronous
-   * reservation prevents concurrent sends from passing either ceiling; failed delivery refunds it.
-   */
-  reserveBudget(
-    senderWorkspaceId: string,
-    targetWorkspaceId: string,
-    chars: number
-  ): (() => void) | null {
-    assert(chars > 0, "reserveBudget: chars must be positive");
-    const pairKey = `${senderWorkspaceId}\u0000${targetWorkspaceId}`;
-    const pairTotals = this.familyMessageTotals.get(pairKey) ?? { count: 0, chars: 0 };
-    const targetTotals = this.familyMessageTargetTotals.get(targetWorkspaceId) ?? {
-      count: 0,
-      chars: 0,
-    };
-    if (
-      pairTotals.count + 1 > TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES ||
-      pairTotals.chars + chars > TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS ||
-      targetTotals.count + 1 > TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES ||
-      targetTotals.chars + chars > TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_CHARS
-    ) {
-      return null;
-    }
-    pairTotals.count += 1;
-    pairTotals.chars += chars;
-    this.familyMessageTotals.set(pairKey, pairTotals);
-    targetTotals.count += 1;
-    targetTotals.chars += chars;
-    this.familyMessageTargetTotals.set(targetWorkspaceId, targetTotals);
-    let refunded = false;
-    return () => {
-      if (refunded) return;
-      refunded = true;
-      pairTotals.count -= 1;
-      pairTotals.chars -= chars;
-      targetTotals.count -= 1;
-      targetTotals.chars -= chars;
-    };
-  }
-
   capTitle(title: string): string {
     // Titles are attacker-influenced and otherwise unbounded; keep them inside the untrusted row.
     return title.length > TASK_FAMILY_MESSAGE_MAX_TITLE_CHARS
       ? `${title.slice(0, TASK_FAMILY_MESSAGE_MAX_TITLE_CHARS)}…`
       : title;
-  }
-
-  budgetExhaustedError(): { code: "send_failed"; message: string } {
-    return {
-      code: "send_failed" as const,
-      message:
-        `Family-message budget to this target is exhausted for this session ` +
-        `(max ${TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES} messages / ` +
-        `${TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS} chars). Consolidate updates and ` +
-        `use agent_report for the final result.`,
-    };
-  }
-
-  triggerCharge(renderedTrigger: string): number {
-    // Queued synthetic triggers are newline-joined, so charge one separator as a safe upper bound.
-    return renderedTrigger.length + "\n".length;
   }
 
   withDeliveryLock<T>(targetId: string, fn: () => Promise<T>): Promise<T> {

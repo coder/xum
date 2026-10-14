@@ -1,4 +1,6 @@
 import assert from "node:assert";
+import { isBashCollapsedSummaryMode, isTranscriptDensity } from "xum/common/constants/storage";
+import { normalizeAgentAiDefaults } from "xum/common/types/agentAiDefaults";
 
 const FORBIDDEN_SEGMENTS = new Set(["__proto__", "prototype", "constructor"]);
 
@@ -22,16 +24,42 @@ function hasSafeSegments(path: string[]): boolean {
 }
 
 const ALLOWED_PROCEDURES = {
-  general: new Set(["listDirectory", "createDirectory", "ping", "tick", "openInEditor"]),
+  general: new Set(["listDirectory", "createDirectory", "ping", "openInEditor"]),
   workspace: new Set([
     "sendMessage",
     "interruptStream",
     "updateAgentAISettings",
     "answerAskUserQuestion",
     "getPlanContent",
+    // Send or drop a held input from its banner (#4771); limited to shown workspaces by
+    // sanitizeWebviewOrpcInput.
+    "sendHeldInput",
+    "discardHeldInput",
+    // The retry barrier's Retry and the interrupted divider's resume (#5092); limited to shown
+    // workspaces by sanitizeWebviewOrpcInput.
+    "resumeStream",
   ]),
+  // redactWebviewOrpcResult strips URL and key-file fields from providers.getConfig (#4766).
   providers: new Set(["list", "getConfig", "onConfigChanged", "setModels"]),
+  // App config for the model routing and thinking-floor stores (#4766). getConfig is projected to
+  // the fields those stores read (see redactWebviewOrpcResult); onConfigChanged only emits empty
+  // change signals. Every write (saveConfig, update*) stays blocked.
+  config: new Set(["getConfig", "onConfigChanged"]),
+  // Read-only agent descriptors (names, descriptions, UI flags, model defaults, tool patterns) for
+  // the agent picker and agent-cycle shortcut (#4751). agents.get (full prompt bodies) stays
+  // blocked, and sanitizeWebviewOrpcInput limits the input to workspaces the webview is shown.
+  agents: new Set(["list"]),
 } as const;
+
+// The only nested procedures the webview may call: the background processes strip lists
+// (subscribe) and terminates a workspace's background bashes (#5092), and the output dialog reads
+// a process's output (getOutput, #5196). sendToBackground stays blocked (bashForegroundControls is
+// unsupported). sanitizeWebviewOrpcInput limits each to workspaces the extension sent.
+const ALLOWED_NESTED_PROCEDURES = new Set([
+  "workspace.backgroundBashes.subscribe",
+  "workspace.backgroundBashes.terminate",
+  "workspace.backgroundBashes.getOutput",
+]);
 
 export function isAllowedOrpcPath(path: string[]): boolean {
   assert(Array.isArray(path), "isAllowedOrpcPath requires path array");
@@ -40,8 +68,11 @@ export function isAllowedOrpcPath(path: string[]): boolean {
     return false;
   }
 
-  // We only support direct procedure access from the VS Code webview.
-  // Nested routers expand the surface area and aren't needed for the sidebar.
+  // We only support direct procedure access from the VS Code webview, plus the few nested
+  // procedures listed above. Other nested routers expand the surface area and aren't needed.
+  if (path.length === 3) {
+    return ALLOWED_NESTED_PROCEDURES.has(path.join("."));
+  }
   if (path.length !== 2) {
     return false;
   }
@@ -55,7 +86,319 @@ export function isAllowedOrpcPath(path: string[]): boolean {
       return ALLOWED_PROCEDURES.workspace.has(procedure);
     case "providers":
       return ALLOWED_PROCEDURES.providers.has(procedure);
+    case "agents":
+      return ALLOWED_PROCEDURES.agents.has(procedure);
+    case "config":
+      return ALLOWED_PROCEDURES.config.has(procedure);
     default:
       return false;
   }
+}
+
+/**
+ * Removes fields the webview does not need from results before they cross the bridge.
+ *
+ * config.getConfig (#4766): the app config also holds prompts, preferences and
+ * task settings. Only the fields AppConfigStore reads are forwarded (an allow-list, so fields added
+ * later stay in the host).
+ * Of the task settings, only proposePlanImplementReplacesChatHistory (a boolean) is forwarded (#4942).
+ * Of the user preferences, only appearance.bashCollapsedSummaryMode (a valid mode),
+ * appearance.transcriptDensity (a valid density), appearance.vimEnabled (a boolean),
+ * ui.artifactsAllowCdnScripts (a boolean) and the numeric
+ * entries of ai.autoCompactionThresholdByModel are forwarded, and agentAiDefaults is forwarded
+ * rebuilt by normalizeAgentAiDefaults (#4972, #4979, #4962).
+ *
+ * providers.getConfig (#4766): it carries no keys (only apiKeySet-style booleans), but base URLs and
+ * the deployment URL can embed credentials and apiKeyFile is a local path; no webview code reads
+ * them, so they are removed from every provider entry.
+ */
+export function redactWebviewOrpcResult(path: string[], value: unknown): unknown {
+  const procedure = path.join(".");
+  if (procedure === "config.getConfig") {
+    return projectAppConfig(value);
+  }
+  if (procedure === "providers.getConfig") {
+    return redactProvidersConfig(value);
+  }
+  if (procedure === "workspace.backgroundBashes.subscribe") {
+    return redactBackgroundBashState(value);
+  }
+  return value;
+}
+
+const WEBVIEW_APP_CONFIG_FIELDS = [
+  "routePriority",
+  "routeOverrides",
+  "minThinkingLevelByModel",
+  "experiments",
+  "defaultModel",
+  "hiddenModels",
+];
+const REDACTED_PROVIDER_CONFIG_FIELDS = new Set([
+  "baseUrl",
+  "baseUrlResolved",
+  "deploymentUrl",
+  "apiKeyFile",
+]);
+
+function projectAppConfig(value: unknown): Record<string, unknown> {
+  const projected: Record<string, unknown> = {};
+  if (typeof value !== "object" || value === null) {
+    return projected;
+  }
+  const config = value as Record<string, unknown>;
+  for (const field of WEBVIEW_APP_CONFIG_FIELDS) {
+    if (config[field] !== undefined) {
+      projected[field] = config[field];
+    }
+  }
+  // The plan card needs this one task setting to refuse Implement when it would replace the chat
+  // history, which the webview cannot do (#4942). Only the boolean crosses, never taskSettings.
+  const taskSettings = config.taskSettings as Record<string, unknown> | null | undefined;
+  const replacesHistory =
+    typeof taskSettings === "object" && taskSettings !== null
+      ? taskSettings.proposePlanImplementReplacesChatHistory
+      : undefined;
+  if (typeof replacesHistory === "boolean") {
+    projected.taskSettings = { proposePlanImplementReplacesChatHistory: replacesHistory };
+  }
+  // Bash tool headers follow the user's collapsed-summary preference, and the transcript its
+  // density (work bundles), as on desktop (#4972, #4979). Only these valid values cross, never the
+  // rest of userPreferences (theme, editor, paths, ...).
+  const userPreferences = config.userPreferences as Record<string, unknown> | null | undefined;
+  const appearance =
+    typeof userPreferences === "object" && userPreferences !== null
+      ? (userPreferences.appearance as Record<string, unknown> | null | undefined)
+      : undefined;
+  const bashMode =
+    typeof appearance === "object" && appearance !== null
+      ? appearance.bashCollapsedSummaryMode
+      : undefined;
+  const transcriptDensity =
+    typeof appearance === "object" && appearance !== null
+      ? appearance.transcriptDensity
+      : undefined;
+  const projectedAppearance: Record<string, unknown> = {};
+  if (isBashCollapsedSummaryMode(bashMode)) {
+    projectedAppearance.bashCollapsedSummaryMode = bashMode;
+  }
+  if (isTranscriptDensity(transcriptDensity)) {
+    projectedAppearance.transcriptDensity = transcriptDensity;
+  }
+  const vimEnabled = appearance?.vimEnabled;
+  if (typeof vimEnabled === "boolean") {
+    projectedAppearance.vimEnabled = vimEnabled;
+  }
+  const projectedPreferences: Record<string, unknown> = {};
+  if (Object.keys(projectedAppearance).length > 0) {
+    projectedPreferences.appearance = projectedAppearance;
+  }
+  // The composer's context meter shows the per-model compaction threshold; only the numbers cross.
+  const ai =
+    typeof userPreferences === "object" && userPreferences !== null
+      ? (userPreferences.ai as Record<string, unknown> | null | undefined)
+      : undefined;
+  const thresholds = ai?.autoCompactionThresholdByModel;
+  if (typeof thresholds === "object" && thresholds !== null) {
+    const projectedThresholds = Object.fromEntries(
+      Object.entries(thresholds).filter(
+        ([, percent]) => typeof percent === "number" && Number.isFinite(percent)
+      )
+    );
+    if (Object.keys(projectedThresholds).length > 0) {
+      projectedPreferences.ai = { autoCompactionThresholdByModel: projectedThresholds };
+    }
+  }
+  // MCP app frames grant CDN script sources only while the user allows them.
+  const ui =
+    typeof userPreferences === "object" && userPreferences !== null
+      ? (userPreferences.ui as Record<string, unknown> | null | undefined)
+      : undefined;
+  const allowCdnScripts = ui?.artifactsAllowCdnScripts;
+  if (typeof allowCdnScripts === "boolean") {
+    projectedPreferences.ui = { artifactsAllowCdnScripts: allowCdnScripts };
+  }
+  if (Object.keys(projectedPreferences).length > 0) {
+    projected.userPreferences = projectedPreferences;
+  }
+  // Agent switches and plan actions fall back to the per-agent defaults (Settings > Tasks) when the
+  // workspace has no settings for the target agent (#4962). normalizeAgentAiDefaults rebuilds each
+  // entry from named fields only, so unknown on-disk fields stay in the host.
+  if (typeof config.agentAiDefaults === "object" && config.agentAiDefaults !== null) {
+    projected.agentAiDefaults = normalizeAgentAiDefaults(config.agentAiDefaults);
+  }
+  return projected;
+}
+
+function redactProvidersConfig(value: unknown): unknown {
+  if (typeof value !== "object" || value === null) {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value).map(([provider, info]: [string, unknown]) => [
+      provider,
+      typeof info === "object" && info !== null
+        ? Object.fromEntries(
+            Object.entries(info).filter(([field]) => !REDACTED_PROVIDER_CONFIG_FIELDS.has(field))
+          )
+        : info,
+    ])
+  );
+}
+
+export type SanitizedOrpcInput = { ok: true; input: unknown } | { ok: false; error: string };
+
+/**
+ * Narrows webview-supplied input for procedures whose input could otherwise reach beyond what the
+ * webview is shown. The webview is less trusted than the extension host (it renders model output).
+ *
+ * agents.list: a free-form projectPath would let the webview read agent-file frontmatter from any
+ * directory, so only a workspaceId the extension already sent to the webview is accepted, and only
+ * {workspaceId, disableWorkspaceAgents} is forwarded (projectPath/includeDisabled are dropped).
+ *
+ * workspace.sendHeldInput / discardHeldInput (#4771): only for a workspace the extension sent, and
+ * only {workspaceId, heldInputId} is forwarded.
+ *
+ * workspace.resumeStream (#5092): only for a workspace the extension sent, and only
+ * {workspaceId, options} is forwarded.
+ *
+ * workspace.backgroundBashes.subscribe / terminate (#5092) / getOutput (#5196): only for a
+ * workspace the extension sent. subscribe forwards {workspaceId}, terminate {workspaceId, processId},
+ * and getOutput {workspaceId, processId} plus numeric fromOffset/tailBytes (the backend schema
+ * bounds them). The backend refuses a processId of another workspace.
+ */
+export function sanitizeWebviewOrpcInput(
+  path: string[],
+  input: unknown,
+  knownWorkspaceIds: ReadonlySet<string>
+): SanitizedOrpcInput {
+  assert(isAllowedOrpcPath(path), "sanitizeWebviewOrpcInput requires an allowed path");
+
+  const procedure = path.join(".");
+  if (procedure === "workspace.sendHeldInput" || procedure === "workspace.discardHeldInput") {
+    return sanitizeHeldInputAction(procedure, input, knownWorkspaceIds);
+  }
+  if (procedure === "workspace.resumeStream") {
+    return sanitizeResumeStream(input, knownWorkspaceIds);
+  }
+  if (ALLOWED_NESTED_PROCEDURES.has(procedure)) {
+    return sanitizeBackgroundBashAction(procedure, input, knownWorkspaceIds);
+  }
+
+  if (procedure !== "agents.list") {
+    return { ok: true, input };
+  }
+
+  if (typeof input !== "object" || input === null) {
+    return { ok: false, error: "agents.list requires an input object" };
+  }
+  const record = input as Record<string, unknown>;
+  const workspaceId = record.workspaceId;
+  if (typeof workspaceId !== "string" || !knownWorkspaceIds.has(workspaceId)) {
+    return { ok: false, error: "agents.list is limited to known workspaces" };
+  }
+  return {
+    ok: true,
+    input: {
+      workspaceId,
+      ...(record.disableWorkspaceAgents === true ? { disableWorkspaceAgents: true } : {}),
+    },
+  };
+}
+
+function sanitizeHeldInputAction(
+  procedure: string,
+  input: unknown,
+  knownWorkspaceIds: ReadonlySet<string>
+): SanitizedOrpcInput {
+  if (typeof input !== "object" || input === null) {
+    return { ok: false, error: `${procedure} requires an input object` };
+  }
+  const record = input as Record<string, unknown>;
+  const workspaceId = record.workspaceId;
+  if (typeof workspaceId !== "string" || !knownWorkspaceIds.has(workspaceId)) {
+    return { ok: false, error: `${procedure} is limited to known workspaces` };
+  }
+  if (typeof record.heldInputId !== "string") {
+    return { ok: false, error: `${procedure} requires a heldInputId` };
+  }
+  return { ok: true, input: { workspaceId, heldInputId: record.heldInputId } };
+}
+
+function sanitizeResumeStream(
+  input: unknown,
+  knownWorkspaceIds: ReadonlySet<string>
+): SanitizedOrpcInput {
+  if (typeof input !== "object" || input === null) {
+    return { ok: false, error: "workspace.resumeStream requires an input object" };
+  }
+  const record = input as Record<string, unknown>;
+  const workspaceId = record.workspaceId;
+  if (typeof workspaceId !== "string" || !knownWorkspaceIds.has(workspaceId)) {
+    return { ok: false, error: "workspace.resumeStream is limited to known workspaces" };
+  }
+  return { ok: true, input: { workspaceId, options: record.options } };
+}
+
+function sanitizeBackgroundBashAction(
+  procedure: string,
+  input: unknown,
+  knownWorkspaceIds: ReadonlySet<string>
+): SanitizedOrpcInput {
+  if (typeof input !== "object" || input === null) {
+    return { ok: false, error: `${procedure} requires an input object` };
+  }
+  const record = input as Record<string, unknown>;
+  const workspaceId = record.workspaceId;
+  if (typeof workspaceId !== "string" || !knownWorkspaceIds.has(workspaceId)) {
+    return { ok: false, error: `${procedure} is limited to known workspaces` };
+  }
+  if (procedure === "workspace.backgroundBashes.subscribe") {
+    return { ok: true, input: { workspaceId } };
+  }
+  if (typeof record.processId !== "string") {
+    return { ok: false, error: `${procedure} requires a processId` };
+  }
+  if (procedure === "workspace.backgroundBashes.getOutput") {
+    return {
+      ok: true,
+      input: {
+        workspaceId,
+        processId: record.processId,
+        ...(typeof record.fromOffset === "number" ? { fromOffset: record.fromOffset } : {}),
+        ...(typeof record.tailBytes === "number" ? { tailBytes: record.tailBytes } : {}),
+      },
+    };
+  }
+  assert(procedure === "workspace.backgroundBashes.terminate", `unexpected procedure ${procedure}`);
+  return { ok: true, input: { workspaceId, processId: record.processId } };
+}
+
+/**
+ * workspace.backgroundBashes.subscribe (#5092): a process's monitor carries up to 20 matched
+ * stdout/stderr lines (monitor.lastLines). Neither the strip nor the output dialog reads them (the
+ * dialog reads output through getOutput), so they are emptied before the state crosses the bridge.
+ * Everything else in each state passes through; the input is not mutated.
+ */
+function redactBackgroundBashState(value: unknown): unknown {
+  if (typeof value !== "object" || value === null) {
+    return value;
+  }
+  const state = value as { processes?: unknown };
+  if (!Array.isArray(state.processes)) {
+    return value;
+  }
+  return {
+    ...state,
+    processes: state.processes.map((process: unknown) => {
+      if (typeof process !== "object" || process === null) {
+        return process;
+      }
+      const record = process as { monitor?: unknown };
+      if (typeof record.monitor !== "object" || record.monitor === null) {
+        return process;
+      }
+      return { ...record, monitor: { ...(record.monitor as object), lastLines: [] } };
+    }),
+  };
 }

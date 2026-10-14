@@ -27,6 +27,7 @@ import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { HistoryService } from "@/node/services/historyService";
 import { PENDING_INITIAL_USER_MESSAGE_ID } from "@/browser/utils/messages/pendingInitialUserMessage";
 import { getDraftScopeId } from "@/common/constants/storage";
+import { Err } from "@/common/types/result";
 import type { TestEnvironment } from "../../ipc/setup";
 
 interface CreationHarness {
@@ -39,6 +40,22 @@ interface CreationHarness {
   dispose(): Promise<void>;
 }
 
+// The Send button enables before the project's branches load. Sending then fails the
+// backend's "Trunk branch is required" check, and no workspace is created. That happened on
+// a cold CI jest worker, so wait until a source branch is selected.
+async function waitForSourceBranch(view: RenderedApp): Promise<void> {
+  await waitFor(
+    () => {
+      const trigger = view.container.querySelector('[aria-label="Select source branch"]');
+      const selected = trigger?.textContent?.trim();
+      if (!selected || selected === "Select source branch") {
+        throw new Error("Source branch not selected yet");
+      }
+    },
+    { timeout: 10_000 }
+  );
+}
+
 async function createCreationHarness(options?: {
   beforeRender?: (env: TestEnvironment) => void;
 }): Promise<CreationHarness> {
@@ -48,14 +65,30 @@ async function createCreationHarness(options?: {
 
   try {
     env.services.aiService.enableMockMode();
+    // Mock mode covers chat streams, not workspace naming. With provider keys in the environment
+    // (CI's integration job sets them), every first send waited for a real naming request before
+    // the workspace was created, and a slow provider ran past waitForCreatedWorkspaceId (#5989).
+    // No usable model is what a keyless run sees: the composer then takes its fallback name.
+    jest
+      .spyOn(env.services.aiService, "createModelWithPinnedOptions")
+      .mockImplementation((modelString) =>
+        Promise.resolve(
+          Err({ type: "api_key_not_found", provider: modelString.split(":")[0] ?? modelString })
+        )
+      );
     await trustProject(env, repoPath);
 
     options?.beforeRender?.(env);
     const view = renderApp({ apiClient: env.orpc });
     const projectPath = await addProjectViaUI(view, repoPath);
     await openProjectCreationView(view, projectPath);
+    await waitForSourceBranch(view);
     const draftId = await waitForLatestDraftId(projectPath);
-    const chat = new ChatHarness(view.container, getDraftScopeId(projectPath, draftId));
+    const chat = new ChatHarness(view.container, getDraftScopeId(projectPath, draftId), {
+      kind: "creation",
+      projectPath,
+      draftId,
+    });
 
     return {
       env,
@@ -86,35 +119,30 @@ async function createCreationHarness(options?: {
   }
 }
 
-type WorkspaceSendMessageFn = TestEnvironment["orpc"]["workspace"]["sendMessage"];
-type WorkspaceCreateFn = TestEnvironment["orpc"]["workspace"]["create"];
-
-function overrideWorkspaceSendMessage(
-  env: TestEnvironment,
-  override: WorkspaceSendMessageFn
-): () => void {
-  const workspaceApi = env.orpc.workspace as typeof env.orpc.workspace & {
-    sendMessage: WorkspaceSendMessageFn;
-  };
-  const originalSendMessage = workspaceApi.sendMessage;
-  workspaceApi.sendMessage = override;
-  return () => {
-    workspaceApi.sendMessage = originalSendMessage;
-  };
+// Hold the backend calls behind the app's create and send. Patching `env.orpc.workspace` does not
+// work: the oRPC router client builds a new object on every property access, so an assignment
+// there is lost and the app reaches the real procedure (#5989). The procedures call these
+// WorkspaceService methods, so a spy on the service holds every caller.
+function holdWorkspaceCreate(env: TestEnvironment, wait: Promise<void>): () => void {
+  const service = env.services.workspaceService;
+  const create = service.create.bind(service);
+  const spy = jest.spyOn(service, "create").mockImplementation(async (...args) => {
+    await wait;
+    return create(...args);
+  });
+  return () => spy.mockRestore();
 }
 
-function overrideWorkspaceCreate(env: TestEnvironment, override: WorkspaceCreateFn): () => void {
-  const workspaceApi = env.orpc.workspace as typeof env.orpc.workspace & {
-    create: WorkspaceCreateFn;
-  };
-  const originalCreate = workspaceApi.create;
-  workspaceApi.create = override;
-  return () => {
-    workspaceApi.create = originalCreate;
-  };
+function holdWorkspaceSendMessage(env: TestEnvironment, wait: Promise<void>): () => void {
+  const service = env.services.workspaceService;
+  const sendMessage = service.sendMessage.bind(service);
+  const spy = jest.spyOn(service, "sendMessage").mockImplementation(async (...args) => {
+    await wait;
+    return sendMessage(...args);
+  });
+  return () => spy.mockRestore();
 }
 
-// eslint-disable-next-line local/no-unsafe-child-process
 const execAsync = promisify(exec);
 
 function gate(): { release: () => void; wait: Promise<void> } {
@@ -157,13 +185,7 @@ describe("New chat streaming flash regression", () => {
     let restoreSendMessage: () => void = () => {};
     const app = await createCreationHarness({
       beforeRender: (env) => {
-        const originalSendMessage = env.orpc.workspace.sendMessage.bind(
-          env.orpc.workspace
-        ) as WorkspaceSendMessageFn;
-        restoreSendMessage = overrideWorkspaceSendMessage(env, (async (input) => {
-          await sendGate;
-          return originalSendMessage(input);
-        }) as WorkspaceSendMessageFn);
+        restoreSendMessage = holdWorkspaceSendMessage(env, sendGate);
       },
     });
 
@@ -247,27 +269,11 @@ describe("New chat streaming flash regression", () => {
     const typed = "Show my first message before the workspace exists";
     const createGate = gate();
     const sendGate = gate();
-    const restores: Array<() => void> = [];
+    const restores: (() => void)[] = [];
     const app = await createCreationHarness({
       beforeRender: (env) => {
-        const originalCreate = env.orpc.workspace.create.bind(
-          env.orpc.workspace
-        ) as WorkspaceCreateFn;
-        restores.push(
-          overrideWorkspaceCreate(env, (async (input) => {
-            await createGate.wait;
-            return originalCreate(input);
-          }) as WorkspaceCreateFn)
-        );
-        const originalSendMessage = env.orpc.workspace.sendMessage.bind(
-          env.orpc.workspace
-        ) as WorkspaceSendMessageFn;
-        restores.push(
-          overrideWorkspaceSendMessage(env, (async (input) => {
-            await sendGate.wait;
-            return originalSendMessage(input);
-          }) as WorkspaceSendMessageFn)
-        );
+        restores.push(holdWorkspaceCreate(env, createGate.wait));
+        restores.push(holdWorkspaceSendMessage(env, sendGate.wait));
       },
     });
     const container = app.view.container;

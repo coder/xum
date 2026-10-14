@@ -3,6 +3,8 @@ import { GlobalWindow } from "happy-dom";
 import { cleanup, render } from "@testing-library/react";
 import type { ReviewActionCallbacks } from "@/browser/features/Shared/InlineReviewNote";
 import type { Review, ReviewNoteData } from "@/common/types/review";
+import * as RealDiffRendererModule from "@/browser/features/Shared/DiffRenderer";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 
 interface MockSelectableDiffRendererProps {
   content: string;
@@ -25,6 +27,11 @@ const selectableDiffRendererMock = mock((props: MockSelectableDiffRendererProps)
   </div>
 ));
 
+// Snapshot the real exports before mocking so later suites (e.g. the drag-select renderer
+// test) get the real SelectableDiffRenderer back once this file finishes.
+restoreModulesAfterSuite([
+  ["@/browser/features/Shared/DiffRenderer", { ...RealDiffRendererModule }],
+]);
 void mock.module("@/browser/features/Shared/DiffRenderer", () => ({
   SelectableDiffRenderer: (props: MockSelectableDiffRendererProps) =>
     selectableDiffRendererMock(props),

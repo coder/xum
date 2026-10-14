@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { ServiceTierSchema } from "../../config/schemas/providersConfig";
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
 
 /**
@@ -14,10 +15,22 @@ export const WorkspaceAISettingsSchema = z.object({
   thinkingLevel: ThinkingLevelSchema.meta({
     description: "Thinking/reasoning effort level",
   }),
+  // OpenAI speed is a chat choice, not a provider-global mutation. Absence inherits the provider default.
+  serviceTier: ServiceTierSchema.optional(),
   // Optional so legacy persisted settings without the field parse unchanged.
   reasoningMode: OpenAIReasoningModeSchema.optional().meta({
     description:
       'OpenAI reasoning mode (orthogonal to effort). Applies to supported models on direct OpenAI Responses API routes; inert elsewhere. Absent = "standard".',
+  }),
+});
+
+// Only sends and workspace creation (updateAgentAISettings) persist the auto-routing flags.
+export const WorkspaceAgentAISettingsSchema = WorkspaceAISettingsSchema.extend({
+  autoModelRouting: z.boolean().optional().meta({
+    description: "Composer model set to Auto on the last send. Absent = off.",
+  }),
+  autoThinkingLevel: z.boolean().optional().meta({
+    description: "Composer thinking level set to Auto on the last send. Absent = off.",
   }),
 });
 
@@ -29,5 +42,5 @@ export const WorkspaceAISettingsSchema = z.object({
  */
 export const WorkspaceAISettingsByAgentSchema = z.record(
   z.string().min(1),
-  WorkspaceAISettingsSchema
+  WorkspaceAgentAISettingsSchema
 );

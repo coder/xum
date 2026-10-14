@@ -1,8 +1,15 @@
 import React from "react";
-import { TerminalView } from "@/browser/components/TerminalView/TerminalView";
+import { LazyFeature } from "@/browser/components/LazyFeature/LazyFeature";
 import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import type { TabType } from "@/browser/types/rightSidebar";
 import { getTerminalSessionId } from "@/browser/types/rightSidebar";
+
+// Code-split (T3, #5971): ghostty-web inlines its WASM, so keep it off the first load.
+const TerminalView = React.lazy(() =>
+  import("@/browser/components/TerminalView/TerminalView").then((m) => ({
+    default: m.TerminalView,
+  }))
+);
 
 interface TerminalTabProps {
   workspaceId: string;
@@ -45,19 +52,21 @@ export const TerminalTab: React.FC<TerminalTabProps> = (props) => {
   }
 
   return (
-    <TerminalView
-      workspaceId={props.workspaceId}
-      sessionId={sessionId}
-      visible={props.visible}
-      setDocumentTitle={false}
-      onTitleChange={props.onTitleChange}
-      onAutoFocusConsumed={props.onAutoFocusConsumed}
-      autoFocus={props.autoFocus ?? false}
-      onExit={props.onExit}
-      workspaceName={metadata?.name ?? ""}
-      projectName={metadata?.projectName ?? ""}
-      tabName={props.tabName}
-      tabIndex={props.tabIndex}
-    />
+    <LazyFeature name="Terminal" fallback={<div className="h-full w-full" />}>
+      <TerminalView
+        workspaceId={props.workspaceId}
+        sessionId={sessionId}
+        visible={props.visible}
+        setDocumentTitle={false}
+        onTitleChange={props.onTitleChange}
+        onAutoFocusConsumed={props.onAutoFocusConsumed}
+        autoFocus={props.autoFocus ?? false}
+        onExit={props.onExit}
+        workspaceName={metadata?.name ?? ""}
+        projectName={metadata?.projectName ?? ""}
+        tabName={props.tabName}
+        tabIndex={props.tabIndex}
+      />
+    </LazyFeature>
   );
 };

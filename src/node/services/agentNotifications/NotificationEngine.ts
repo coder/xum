@@ -9,6 +9,8 @@ export interface AgentNotification {
 export interface NotificationPollContext {
   toolName: string;
   toolSucceeded: boolean;
+  /** False when the tool result (e.g. a string) has no place to attach notifications. */
+  resultCanCarryNotifications?: boolean;
   now: number;
 }
 

@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { requireTestModule } from "@/browser/testUtils";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
@@ -7,7 +7,7 @@ import { cleanup, render, waitFor } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import * as RealLottieModule from "lottie-react";
-import * as RealAPIModule from "@/browser/contexts/API";
+import { APIContext } from "@/browser/contexts/API";
 import * as RealProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
 import * as RealConfiguredProvidersBarModule from "@/browser/components/ConfiguredProvidersBar/ConfiguredProvidersBar";
 import * as RealProjectContextModule from "@/browser/contexts/ProjectContext";
@@ -21,7 +21,6 @@ let readyCalls = 0;
 
 restoreModulesAfterSuite([
   ["lottie-react", { ...RealLottieModule }],
-  ["@/browser/contexts/API", { ...RealAPIModule }],
   ["@/browser/hooks/useProvidersConfig", { ...RealProvidersConfigModule }],
   [
     "@/browser/components/ConfiguredProvidersBar/ConfiguredProvidersBar",
@@ -39,17 +38,6 @@ function registerProjectPageMocks() {
   void mock.module("lottie-react", () => ({
     __esModule: true,
     default: () => <div data-testid="LottieMock" />,
-  }));
-
-  void mock.module("@/browser/contexts/API", () => ({
-    useAPI: () => ({
-      api: null,
-      status: "connecting" as const,
-      error: null,
-      authenticate: () => undefined,
-      retry: () => undefined,
-    }),
-    useOptionalAPI: () => null,
   }));
 
   // Mock useProvidersConfig to return a configured provider so ChatInput renders
@@ -141,6 +129,24 @@ function registerProjectPageMocks() {
   }));
 }
 
+// The page renders against a backend that is still connecting. Inject that state through
+// the real context instead of mocking the API module (module mocks leak across suites).
+function ConnectingAPIWrapper(props: { children: ReactNode }) {
+  return (
+    <APIContext.Provider
+      value={{
+        api: null,
+        status: "connecting",
+        error: null,
+        authenticate: () => undefined,
+        retry: () => undefined,
+      }}
+    >
+      {props.children}
+    </APIContext.Provider>
+  );
+}
+
 describe("ProjectPage", () => {
   beforeEach(() => {
     cleanupDom = installDom();
@@ -181,7 +187,8 @@ describe("ProjectPage", () => {
             <ProjectPage {...baseProps} />
           </WorkspaceProvider>
         </SettingsProvider>
-      </RouterProvider>
+      </RouterProvider>,
+      { wrapper: ConnectingAPIWrapper }
     );
 
     await waitFor(() => expect(readyCalls).toBe(1));

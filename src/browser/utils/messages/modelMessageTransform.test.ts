@@ -3,7 +3,6 @@ import type { ModelMessage, AssistantModelMessage, ToolModelMessage } from "ai";
 import {
   transformModelMessages,
   validateAnthropicCompliance,
-  getAnthropicThinkingDisableReason,
   addInterruptedSentinel,
   injectAgentTransition,
   filterEmptyAssistantMessages,
@@ -153,8 +152,10 @@ describe("modelMessageTransform", () => {
       });
 
       expect(result).toHaveLength(2);
-      expect((result[0] as AssistantModelMessage).content[0]).toMatchObject({ type: "reasoning" });
-      expect(getAnthropicThinkingDisableReason(result)).toBeUndefined();
+      expect((result[0] as AssistantModelMessage).content[0]).toMatchObject({
+        type: "reasoning",
+        providerOptions: { anthropic: { signature: "sig" } },
+      });
     });
 
     it("should insert empty reasoning for final assistant message when Anthropic thinking is enabled", () => {
@@ -391,81 +392,6 @@ describe("modelMessageTransform", () => {
     });
   });
 
-  describe("getAnthropicThinkingDisableReason", () => {
-    it("returns a reason when tool-call message lacks signed reasoning", () => {
-      const assistantMsg: AssistantModelMessage = {
-        role: "assistant",
-        content: [{ type: "tool-call", toolCallId: "call1", toolName: "bash", input: {} }],
-      };
-      const toolMsg: ToolModelMessage = {
-        role: "tool",
-        content: [
-          {
-            type: "tool-result",
-            toolCallId: "call1",
-            toolName: "bash",
-            output: { type: "json", value: {} },
-          },
-        ],
-      };
-
-      const reason = getAnthropicThinkingDisableReason([assistantMsg, toolMsg]);
-      expect(reason).toContain("Message 0");
-    });
-
-    it("returns undefined when tool-call message starts with signed reasoning", () => {
-      const assistantMsg: AssistantModelMessage = {
-        role: "assistant",
-        content: [
-          {
-            type: "reasoning",
-            text: "...",
-            providerOptions: { anthropic: { signature: "sig" } },
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          } as any,
-          { type: "tool-call", toolCallId: "call1", toolName: "bash", input: {} },
-        ],
-      };
-      const toolMsg: ToolModelMessage = {
-        role: "tool",
-        content: [
-          {
-            type: "tool-result",
-            toolCallId: "call1",
-            toolName: "bash",
-            output: { type: "json", value: {} },
-          },
-        ],
-      };
-
-      expect(getAnthropicThinkingDisableReason([assistantMsg, toolMsg])).toBeUndefined();
-    });
-
-    it("treats unsigned reasoning as absent", () => {
-      const assistantMsg: AssistantModelMessage = {
-        role: "assistant",
-        content: [
-          { type: "reasoning", text: "..." },
-          { type: "tool-call", toolCallId: "call1", toolName: "bash", input: {} },
-        ],
-      };
-      const toolMsg: ToolModelMessage = {
-        role: "tool",
-        content: [
-          {
-            type: "tool-result",
-            toolCallId: "call1",
-            toolName: "bash",
-            output: { type: "json", value: {} },
-          },
-        ],
-      };
-
-      const reason = getAnthropicThinkingDisableReason([assistantMsg, toolMsg]);
-      expect(reason).toContain("Message 0");
-    });
-  });
-
   describe("validateAnthropicCompliance", () => {
     it("should validate correct message sequences", () => {
       const assistantMsg1: AssistantModelMessage = {
@@ -615,6 +541,30 @@ describe("modelMessageTransform", () => {
       expect((result[0].content as Array<{ type: string; text: string }>)[0].text).toBe(
         "First\nSecond\nThird"
       );
+    });
+
+    it("keeps every text part of merged messages, and a file-only message's place", () => {
+      const file = { type: "file" as const, mediaType: "image/png", data: "AAAA" };
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "Context" }] },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Request" },
+            { type: "text", text: "Converted SVG" },
+          ],
+        },
+        { role: "user", content: [file] },
+      ];
+
+      const result = transformModelMessages(messages, "anthropic");
+      // A message without text still adds its separator, as before multi-text merging.
+      expect(result).toEqual([
+        {
+          role: "user",
+          content: [{ type: "text", text: "Context\nRequest\nConverted SVG\n" }, file],
+        },
+      ]);
     });
 
     it("should not merge user messages separated by assistant message", () => {
@@ -966,6 +916,172 @@ describe("modelMessageTransform", () => {
     });
   });
 
+  describe("Anthropic preserved thinking blocks", () => {
+    // Newer Claude models bind every replayed thinking block to its prefix, so
+    // each block must go back as returned: own signature, own position.
+    const thinkingOn = { anthropicThinkingEnabled: true };
+    const sig = (signature: string) => ({ anthropic: { signature } });
+
+    function assistantContent(messages: ModelMessage[]) {
+      const assistant = messages.find(
+        (msg): msg is AssistantModelMessage => msg.role === "assistant"
+      );
+      expect(assistant).toBeDefined();
+      return assistant?.content;
+    }
+
+    it("joins the streamed deltas of one block but keeps adjacent signed blocks apart", () => {
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "go" }] },
+        {
+          role: "assistant",
+          content: [
+            // Block 1 streamed as two deltas; Anthropic signs the last one.
+            { type: "reasoning", text: "pl" },
+            { type: "reasoning", text: "an", providerOptions: sig("sig-1") },
+            // Block 2 directly follows block 1.
+            { type: "reasoning", text: "check", providerOptions: sig("sig-2") },
+            // Block 3: empty thinking with only a signature.
+            { type: "reasoning", text: "", providerOptions: sig("sig-3") },
+            { type: "text", text: "done" },
+          ],
+        },
+      ];
+
+      expect(assistantContent(transformModelMessages(messages, "anthropic", thinkingOn))).toEqual([
+        { type: "reasoning", text: "plan", providerOptions: sig("sig-1") },
+        { type: "reasoning", text: "check", providerOptions: sig("sig-2") },
+        { type: "reasoning", text: "", providerOptions: sig("sig-3") },
+        { type: "text", text: "done" },
+      ]);
+    });
+
+    it("keeps redacted_thinking blocks in place and never merges them with neighbors", () => {
+      const redacted = { anthropic: { redactedData: "opaque" } };
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "go" }] },
+        {
+          role: "assistant",
+          content: [
+            { type: "reasoning", text: "", providerOptions: redacted },
+            { type: "reasoning", text: "", providerOptions: redacted },
+            // An unsigned delta after a redacted block starts a new block.
+            { type: "reasoning", text: "next", providerOptions: sig("sig-1") },
+            { type: "text", text: "done" },
+          ],
+        },
+      ];
+
+      expect(assistantContent(transformModelMessages(messages, "anthropic", thinkingOn))).toEqual([
+        { type: "reasoning", text: "", providerOptions: redacted },
+        { type: "reasoning", text: "", providerOptions: redacted },
+        { type: "reasoning", text: "next", providerOptions: sig("sig-1") },
+        { type: "text", text: "done" },
+      ]);
+    });
+
+    it("still merges OpenAI reasoning deltas that carry the itemId on the first part", () => {
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "go" }] },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "reasoning",
+              text: "a",
+              providerOptions: { openai: { itemId: "rs_1", reasoningEncryptedContent: "enc" } },
+            },
+            { type: "reasoning", text: "b" },
+            { type: "text", text: "done" },
+          ],
+        },
+      ];
+
+      expect(assistantContent(transformModelMessages(messages, "openai"))).toEqual([
+        {
+          type: "reasoning",
+          text: "ab",
+          providerOptions: { openai: { itemId: "rs_1", reasoningEncryptedContent: "enc" } },
+        },
+        { type: "text", text: "done" },
+      ]);
+    });
+
+    // #5887: interleaved thinking can put text between two thinking blocks before a tool
+    // call. Moving the second block forward edits the prefix every later block is bound to.
+    it("replays a tool-call message that starts with thinking in its original block order", () => {
+      const redacted = { anthropic: { redactedData: "opaque" } };
+      const toolCall = {
+        type: "tool-call",
+        toolCallId: "c1",
+        toolName: "bash",
+        input: {},
+      } as const;
+      const toolResult: ToolModelMessage = {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "c1",
+            toolName: "bash",
+            output: { type: "text", value: "ok" },
+          },
+        ],
+      };
+      const openers = [
+        { type: "reasoning", text: "plan", providerOptions: sig("sig-1") },
+        { type: "reasoning", text: "", providerOptions: redacted },
+      ] as const;
+      for (const opener of openers) {
+        const content: AssistantModelMessage["content"] = [
+          opener,
+          { type: "text", text: "Let me check." },
+          { type: "reasoning", text: "check", providerOptions: sig("sig-2") },
+          toolCall,
+        ];
+        const messages: ModelMessage[] = [
+          { role: "user", content: [{ type: "text", text: "go" }] },
+          { role: "assistant", content },
+          toolResult,
+        ];
+
+        expect(assistantContent(transformModelMessages(messages, "anthropic", thinkingOn))).toEqual(
+          content
+        );
+      }
+    });
+
+    it("still moves thinking first when a tool-call message starts with text", () => {
+      // Manual extended thinking requires the final assistant turn to start with thinking.
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "go" }] },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Let me check." },
+            { type: "reasoning", text: "check", providerOptions: sig("sig-1") },
+            { type: "tool-call", toolCallId: "c1", toolName: "bash", input: {} },
+          ],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "c1",
+              toolName: "bash",
+              output: { type: "text", value: "ok" },
+            },
+          ],
+        },
+      ];
+
+      expect(
+        assistantContent(transformModelMessages(messages, "anthropic", thinkingOn))?.[0]
+      ).toEqual({ type: "reasoning", text: "check", providerOptions: sig("sig-1") });
+    });
+  });
+
   describe("reasoning part handling for OpenAI", () => {
     it("should preserve reasoning parts for OpenAI provider (managed via explicit history)", () => {
       const messages: ModelMessage[] = [
@@ -1265,6 +1381,49 @@ describe("injectAgentTransition", () => {
     expect(result[0]).toEqual(messages[0]);
     expect(result[1]).toEqual(messages[1]);
     expect(result[3]).toEqual(messages[2]); // Last user message shifted
+  });
+
+  it("injects the transition before the user prompt, not before a trailing Token Budget warning", () => {
+    const messages: MuxMessage[] = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [{ type: "text", text: "Here's the plan..." }],
+        metadata: { timestamp: 1000, agentId: "plan" },
+      },
+      {
+        id: "user-1",
+        role: "user",
+        parts: [{ type: "text", text: "Now execute it" }],
+        metadata: { timestamp: 2000 },
+      },
+      {
+        id: "warning-1",
+        role: "user",
+        parts: [{ type: "text", text: "Token budget warning" }],
+        metadata: {
+          timestamp: 3000,
+          synthetic: true,
+          uiVisible: true,
+          muxMetadata: {
+            type: "context-budget-warning",
+            contextTokens: 80,
+            maxTokens: 100,
+            budgetTokens: 90,
+          },
+        },
+      },
+    ];
+
+    const result = injectAgentTransition(messages, "exec");
+
+    expect(result.map((message) => message.id)).toEqual([
+      "assistant-1",
+      result[1].id,
+      "user-1",
+      "warning-1",
+    ]);
+    expect(result[1].metadata?.synthetic).toBe(true);
   });
 
   it("should not inject transition when agent is the same", () => {

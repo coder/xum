@@ -1,8 +1,8 @@
 import * as path from "path";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { Context, Effect, Layer } from "effect";
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type {
   ErrorEvent,
   ReasoningDeltaEvent,
@@ -18,7 +18,10 @@ import {
   createCoderArchiveHook,
   createCoderUnarchiveHook,
 } from "@/node/runtime/coderLifecycleHooks";
-import { setGlobalCoderService } from "@/node/runtime/runtimeFactory";
+import {
+  setDevcontainerScratchMountGate,
+  setGlobalCoderService,
+} from "@/node/runtime/runtimeFactory";
 import {
   createRuntimeForWorkspace,
   resolveWorkspaceExecutionPath,
@@ -28,6 +31,17 @@ import { setSshPromptService } from "@/node/runtime/sshConnectionPool";
 import { createWorktreeArchiveHook } from "@/node/runtime/worktreeLifecycleHooks";
 import { AgentPluginInstallService } from "@/node/services/agentPlugins/installService";
 import { AgentStatusService } from "@/node/services/agentStatusService";
+import {
+  BASH_AI_PROXY_ANALYTICS_SOURCE,
+  BashAiProxyService,
+} from "@/node/services/bashAiProxy/bashAiProxyService";
+import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
+import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
+import {
+  createSshForwardTarget,
+  isXumRootShared,
+} from "@/node/services/bashAiProxy/sshForwardTarget";
+import type { ProviderConfigRaw } from "@/node/utils/providerRequirements";
 import {
   AnalyticsService,
   type IngestWorkspaceMeta,
@@ -45,8 +59,11 @@ import { CodexOauthService } from "@/node/services/codexOauthService";
 import { CopilotOauthService } from "@/node/services/copilotOauthService";
 import { DesktopBridgeServer } from "@/node/services/desktop/DesktopBridgeServer";
 import { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import { ComputerUseService } from "@/node/services/computerUse/computerUseService";
 import { DesktopTokenManager } from "@/node/services/desktop/DesktopTokenManager";
 import { DevToolsService } from "@/node/services/devToolsService";
+import { ReviewStateService } from "@/node/services/reviewStateService";
+import { DraftService } from "@/node/services/draftService";
 import { EffectRunnerTag } from "@/node/services/di/effectRunner";
 import {
   AgentBrowserSessionDiscovery,
@@ -56,6 +73,7 @@ import {
   Analytics,
   BackgroundProcessManagerTag,
   Backup,
+  BashAiProxy,
   BrowserBridgeServerTag,
   BrowserBridgeTokenManagerTag,
   BrowserControl,
@@ -67,9 +85,12 @@ import {
   CopilotOauth,
   DesktopBridgeServerTag,
   DesktopSessionManagerTag,
+  ComputerUseServiceTag,
   DesktopInputCoordinatorTag,
   DesktopTokenManagerTag,
   DevTools,
+  ReviewState,
+  Drafts,
   Editor,
   Experiments,
   ExtensionMetadata,
@@ -87,8 +108,6 @@ import {
   MemoryMeta,
   MenuEvent,
   MuxGatewayOauth,
-  MuxGovernorOauth,
-  Policy,
   Project,
   Provider,
   ProvidersConfigStoreTag,
@@ -128,14 +147,16 @@ import {
 } from "@/node/services/di/tags";
 import { EditorService } from "@/node/services/editorService";
 import { ExperimentsService } from "@/node/services/experimentsService";
+import {
+  GoalStatusBoardService,
+  createWorkspaceBoardBashRunner,
+} from "@/node/services/goalStatusBoard";
 import { HeartbeatService } from "@/node/services/heartbeatService";
 import { IdleCompactionService } from "@/node/services/idleCompactionService";
 import { InstructionsService } from "@/node/services/instructionsService";
 import { McpOauthService } from "@/node/services/mcpOauthService";
 import { MenuEventService } from "@/node/services/menuEventService";
 import { MuxGatewayOauthService } from "@/node/services/muxGatewayOauthService";
-import { MuxGovernorOauthService } from "@/node/services/muxGovernorOauthService";
-import { PolicyService } from "@/node/services/policyService";
 import { ProjectService } from "@/node/services/projectService";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { PTYService } from "@/node/services/ptyService";
@@ -185,25 +206,30 @@ import { CoreOptionsTag } from "./core";
 export const CrossCuttingLive: Layer.Layer<CrossCuttingTags, never, ConfigTag> =
   Layer.effectContext(
     Effect.map(ConfigTag, (config) => {
-      const policyService = new PolicyService(config);
       const telemetryService = new TelemetryService(config.rootDir);
       const experimentsService = new ExperimentsService({
         telemetryService,
         xumHome: config.rootDir,
       });
+      setDevcontainerScratchMountGate(() =>
+        experimentsService.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS)
+      );
       const sessionTimingService = new SessionTimingService(config, telemetryService);
       const analyticsService = new AnalyticsService(config);
       const devToolsService = new DevToolsService(config);
+      const reviewStateService = new ReviewStateService(config);
+      const draftService = new DraftService(config);
       // Desktop passes WorkspaceMcpOverridesService explicitly so AIService uses
       // the persistent config rather than creating a default with an ephemeral one.
       const workspaceMcpOverridesService = new WorkspaceMcpOverridesService(config);
       return Context.empty().pipe(
-        Context.add(Policy, policyService),
         Context.add(Telemetry, telemetryService),
         Context.add(Experiments, experimentsService),
         Context.add(SessionTiming, sessionTimingService),
         Context.add(Analytics, analyticsService),
         Context.add(DevTools, devToolsService),
+        Context.add(ReviewState, reviewStateService),
+        Context.add(Drafts, draftService),
         Context.add(WorkspaceMcpOverrides, workspaceMcpOverridesService)
       );
     })
@@ -224,7 +250,6 @@ export const CoreOptionsFromDesktopLive: Layer.Layer<
     const config = yield* ConfigTag;
     return {
       extensionMetadataPath: path.join(config.rootDir, "extensionMetadata.json"),
-      policyService: yield* Policy,
       telemetryService: yield* Telemetry,
       analyticsService: yield* Analytics,
       experimentsService: yield* Experiments,
@@ -288,11 +313,12 @@ export const DesktopBridgeLive: Layer.Layer<
   ConfigTag | Experiments | Workspace | DesktopInputCoordinatorTag
 > = Layer.effectContext(
   Effect.gen(function* () {
+    const workspaceService = yield* Workspace;
     const desktopSessionManager = new DesktopSessionManager({
       inputCoordinator: yield* DesktopInputCoordinatorTag,
       config: yield* ConfigTag,
       experimentsService: yield* Experiments,
-      workspaceService: yield* Workspace,
+      workspaceService,
     });
     const desktopTokenManager = new DesktopTokenManager();
     const desktopBridgeServer = new DesktopBridgeServer({
@@ -302,8 +328,14 @@ export const DesktopBridgeLive: Layer.Layer<
     desktopSessionManager.setBridgeConnectionProbe((workspaceId, resolveOwner) =>
       desktopBridgeServer.hasActiveBridge(workspaceId, resolveOwner)
     );
+    const config = yield* ConfigTag;
+    const computerUseService = new ComputerUseService({
+      getWorkspaceMetadata: (workspaceId) => config.getWorkspaceMetadataById(workspaceId),
+    });
+    workspaceService.on("metadata", (event) => computerUseService.handleWorkspaceMetadata(event));
     return Context.empty().pipe(
       Context.add(DesktopSessionManagerTag, desktopSessionManager),
+      Context.add(ComputerUseServiceTag, computerUseService),
       Context.add(DesktopTokenManagerTag, desktopTokenManager),
       Context.add(DesktopBridgeServerTag, desktopBridgeServer)
     );
@@ -321,7 +353,9 @@ export const TerminalEditorLive: Layer.Layer<
     const aiService = yield* AI;
     // Terminal services - PTYService is cross-platform
     const ptyService = new PTYService();
-    const terminalService = new TerminalService(config, ptyService, yield* SecretsStoreTag);
+    const terminalService = new TerminalService(config, ptyService, yield* SecretsStoreTag, () =>
+      aiService.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS)
+    );
     // Editor service for opening workspaces in code editors
     const editorService = new EditorService(config, yield* Workspace);
     const tokenizerService = new TokenizerService(
@@ -351,8 +385,6 @@ export const MiscDesktopLive: Layer.Layer<
   | ConfigTag
   | SecretsStoreTag
   | ProvidersConfigStoreTag
-  | Experiments
-  | Policy
   | Provider
   | MCPConfig
   | MCPServerManagerTag
@@ -360,8 +392,6 @@ export const MiscDesktopLive: Layer.Layer<
 > = Layer.effectContext(
   Effect.gen(function* () {
     const config = yield* ConfigTag;
-    const experimentsService = yield* Experiments;
-    const policyService = yield* Policy;
     const providerService = yield* Provider;
     const providersConfigStore = yield* ProvidersConfigStoreTag;
     const workflowRuntimeFactory = new QuickJSRuntimeFactory();
@@ -373,12 +403,10 @@ export const MiscDesktopLive: Layer.Layer<
       }),
       payload: createBackupPayloadStore({ config }),
     });
-    // Managed Agent Plugin installer (agent-plugins experiment). Gated on the
-    // backend ExperimentsService exactly like the plugin MCP provider; the
-    // MCP manager dependency lets update/uninstall recycle running plugin
-    // servers whose content changed behind an unchanged command line.
+    // Managed Agent Plugin installer. The MCP manager dependency lets
+    // update/uninstall recycle running plugin servers whose content changed
+    // behind an unchanged command line.
     const agentPluginInstallService = new AgentPluginInstallService(config, {
-      isEnabled: () => experimentsService.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS),
       mcpServerManager: yield* MCPServerManagerTag,
       mcpConfigService: yield* MCPConfig,
       workspaceMcpOverridesService: yield* WorkspaceMcpOverrides,
@@ -387,12 +415,7 @@ export const MiscDesktopLive: Layer.Layer<
     const updateService = new UpdateService(config);
     const serverService = new ServerService();
     const menuEventService = new MenuEventService();
-    const voiceService = new VoiceService(
-      config,
-      providerService,
-      policyService,
-      providersConfigStore
-    );
+    const voiceService = new VoiceService(config, providerService, providersConfigStore);
     const serverAuthService = new ServerAuthService(config);
     const workspaceLifecycleHooks = new WorkspaceLifecycleHooks();
     const worktreeArchiveSnapshotService = new WorktreeArchiveSnapshotService(config);
@@ -424,7 +447,6 @@ export const OauthLive: Layer.Layer<
   | FileLeaseManagerTag
   | MCPConfig
   | Provider
-  | Policy
   | Telemetry
   | WindowTag
 > = Layer.effectContext(
@@ -433,7 +455,6 @@ export const OauthLive: Layer.Layer<
     const windowService = yield* WindowTag;
     const providersConfigStore = yield* ProvidersConfigStoreTag;
     const providerService = yield* Provider;
-    const policyService = yield* Policy;
     const mcpOauthService = new McpOauthService(
       config,
       yield* MCPConfig,
@@ -445,11 +466,6 @@ export const OauthLive: Layer.Layer<
       providerService,
       windowService
     );
-    const muxGovernorOauthService = new MuxGovernorOauthService(
-      config,
-      windowService,
-      policyService
-    );
     const codexOauthService = new CodexOauthService(
       providersConfigStore,
       providerService,
@@ -459,16 +475,12 @@ export const OauthLive: Layer.Layer<
       providersConfigStore,
       yield* FileLeaseManagerTag,
       providerService,
-      windowService,
-      // Policy-aware: an enforced forcedBaseUrl overrides the deployment URL
-      // for logins, refreshes, and issuer checks.
-      policyService
+      windowService
     );
     const copilotOauthService = new CopilotOauthService(providerService, windowService);
     return Context.empty().pipe(
       Context.add(McpOauth, mcpOauthService),
       Context.add(MuxGatewayOauth, muxGatewayOauthService),
-      Context.add(MuxGovernorOauth, muxGovernorOauthService),
       Context.add(CodexOauth, codexOauthService),
       Context.add(CoderOauth, coderOauthService),
       Context.add(CopilotOauth, copilotOauthService)
@@ -498,6 +510,7 @@ export const WorkersLive: Layer.Layer<
   | SessionUsage
   | Tokenizer
   | WindowTag
+  | ProvidersConfigStoreTag
 > = Layer.effectContext(
   Effect.gen(function* () {
     const config = yield* ConfigTag;
@@ -530,7 +543,7 @@ export const WorkersLive: Layer.Layer<
       yield* IdleDispatcherTag,
       effectRunner
     );
-    const timelineService = new TimelineService(config, historyService, experimentsService);
+    const timelineService = new TimelineService(config, historyService);
     // /refine trajectory distillation (RLM r11). Chat emission routes through
     // WorkspaceService so a live session renders the appended summary row
     // immediately (the row itself is already durable in chat.jsonl).
@@ -576,7 +589,53 @@ export const WorkersLive: Layer.Layer<
         },
       }
     );
+    // Bash AI proxy: AI calls made by bash tool processes go through it so their spend lands in
+    // the workspace ledger (Costs tab) and the analytics sidecar, like status generation above.
+    const providersConfigStore = yield* ProvidersConfigStoreTag;
+    const bashAiProxy = new BashAiProxyService({
+      rootDir: config.rootDir,
+      workspaceExists: (workspaceId) => config.findWorkspace(workspaceId) !== null,
+      // The same rule as the bash tool's trust (TurnRequestBuilder sharedExecutionTrusted).
+      isWorkspaceTrusted: async (workspaceId) => {
+        const metadata = await config.getWorkspaceMetadataById(workspaceId);
+        return (
+          metadata != null &&
+          isWorkspaceTrustedForSharedExecution(metadata, config.loadConfigOrDefault().projects) &&
+          !projectAutomationDisabled()
+        );
+      },
+      isRootShared: () => isXumRootShared(config.rootDir),
+      forwardTargetFor: async (workspaceId) => {
+        const metadata = await config.getWorkspaceMetadataById(workspaceId);
+        return metadata ? createSshForwardTarget(createRuntimeForWorkspace(metadata)) : undefined;
+      },
+      // Opt-in: with the vars set, agent CLIs such as `claude -p` bill the Xum API key instead
+      // of a subscription login, so Xum must not change that silently.
+      isEnabled: () => config.loadConfigOrDefault().bashAiProxyEnabled === true,
+      loadProviderConfig: (provider) =>
+        (providersConfigStore.loadProvidersConfig()?.[provider] ?? {}) as ProviderConfigRaw,
+      recordUsage: async (workspaceId, modelString, usage, providerMetadata) => {
+        const recorded = await sessionUsageService.recordHeadlessUsage(
+          workspaceId,
+          modelString,
+          usage,
+          providerMetadata,
+          { analyticsSource: BASH_AI_PROXY_ANALYTICS_SOURCE }
+        );
+        workspaceService.emit("analyticsIngest", { workspaceId });
+        return recorded;
+      },
+      onUsageRecorded: (workspaceId, recorded) =>
+        workspaceService.emitChatEvent(workspaceId, {
+          type: "session-usage-delta",
+          workspaceId,
+          sourceWorkspaceId: workspaceId,
+          byModelDelta: { [recorded.model]: recorded.usage },
+          timestamp: Date.now(),
+        }),
+    });
     return Context.empty().pipe(
+      Context.add(BashAiProxy, bashAiProxy),
       Context.add(IdleCompaction, idleCompactionService),
       Context.add(Heartbeat, heartbeatService),
       Context.add(Timeline, timelineService),
@@ -615,6 +674,7 @@ export const DesktopWiringLive: Layer.Layer<
     const backupService = yield* Backup;
     const memoryService = yield* Memory;
     const projectService = yield* Project;
+    const draftService = yield* Drafts;
     const sshPromptService = yield* SshPrompt;
     const desktopSessionManager = yield* DesktopSessionManagerTag;
     const idleCompactionService = yield* IdleCompaction;
@@ -627,12 +687,17 @@ export const DesktopWiringLive: Layer.Layer<
     const terminalService = yield* Terminal;
     const workspaceLifecycleHooks = yield* WorkspaceLifecycleHooksTag;
     const worktreeArchiveSnapshotService = yield* WorktreeArchiveSnapshot;
+    const experimentsService = yield* Experiments;
 
     turnRequestBuilderBindings.analyticsService = analyticsService;
+    const bashAiProxy = yield* BashAiProxy;
+    turnRequestBuilderBindings.bashAiProxy = bashAiProxy;
 
     projectService.setWorkspaceService(workspaceService);
     projectService.setWorkspaceMetadataRefresher(workspaceService);
     projectService.setMcpServerManager(mcpServerManager);
+    projectService.setDraftCleaner(draftService);
+    workspaceService.setDraftForkCopier(draftService);
     // Backup restores register approved project imports through the same create() path the
     // UI uses; setter injection because BackupService is constructed before ProjectService.
     backupService.setProjectService(projectService);
@@ -640,6 +705,7 @@ export const DesktopWiringLive: Layer.Layer<
     // MemoryService for the memory browser's change subscription.
     backupService.setMemoryNotifier(memoryService);
     turnRequestBuilderBindings.desktopSessionManager = desktopSessionManager;
+    turnRequestBuilderBindings.computerUseService = yield* ComputerUseServiceTag;
 
     // Forward terminal idle-compaction outcomes so the loop stops re-attempting a
     // persistently failing workspace (immediately on model_not_found, otherwise after
@@ -656,10 +722,29 @@ export const DesktopWiringLive: Layer.Layer<
     taskService.setTimelineRecorder(timelineService);
     heartbeatService.setTimelineRecorder(timelineService);
     workspaceGoalService.setTimelineRecorder(timelineService);
+    // Artifacts goal status board: the host keeps goal.status.html current at goal events,
+    // continuation-turn starts and checklist updates. Refreshes run in the background and never
+    // fail a turn.
+    const goalStatusBoard = new GoalStatusBoardService({
+      sessionsDir: config.sessionsDir,
+      isArtifactsEnabled: () => experimentsService.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS),
+      getWorkspaceMetadata: (workspaceId) => workspaceService.getInfo(workspaceId),
+      runBash: createWorkspaceBoardBashRunner((...args) => workspaceService.executeBash(...args)),
+      // Archiving stops a dedicated Coder workspace; a late board write would restart it.
+      isWorkspaceRemoving: (workspaceId) =>
+        workspaceService.isRemoving(workspaceId) || workspaceService.isArchiving(workspaceId),
+    });
+    workspaceGoalService.setGoalStatusObserver((workspaceId, goal) =>
+      goalStatusBoard.requestRefresh(workspaceId, goal)
+    );
+    workspaceService.setOnTodosChanged((workspaceId) =>
+      goalStatusBoard.handleTodosChanged(workspaceId)
+    );
     turnRequestBuilderBindings.timelineService = timelineService;
     timelineService.subscribeToWorkspace(workspaceService);
 
     mcpServerManager.setMcpOauthService(mcpOauthService);
+    (yield* AgentPluginInstall).setMcpOauthService(mcpOauthService);
     turnRequestBuilderBindings.codexOauthService = codexOauthService;
     turnRequestBuilderBindings.coderOauthService = coderOauthService;
 

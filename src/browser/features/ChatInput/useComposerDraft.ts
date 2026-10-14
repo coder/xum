@@ -1,24 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  subscribePersistedStateWrites,
-  updatePersistedState,
-  usePersistedState,
-} from "@/browser/hooks/usePersistedState";
-import {
-  getDraftScopeId,
-  getInputAttachmentsKey,
-  getInputKey,
-  getPendingScopeId,
-} from "@/common/constants/storage";
+  defaultCreationDraftScope,
+  getDraftStore,
+  useDraft,
+  type DraftStoreScope,
+} from "@/browser/stores/DraftStore";
 import type { ReviewNoteDataForDisplay } from "@/common/types/message";
 import type { Review } from "@/common/types/review";
+import { DRAFT_ID_PATTERN } from "@/constants/drafts";
 import type { ChatAttachment } from "./ChatAttachments";
 import type { Toast } from "./ChatInputToast";
-import {
-  estimatePersistedChatAttachmentsChars,
-  MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS,
-  readPersistedChatAttachments,
-} from "./draftAttachmentsStorage";
 
 interface UseComposerDraftOptions {
   variant: "creation" | "workspace";
@@ -29,63 +20,79 @@ interface UseComposerDraftOptions {
   pushToast: (toast: Omit<Toast, "id" | "type"> & { type: Toast["type"] | "info" }) => void;
 }
 
+/**
+ * The draft scope a composer edits. A creation composer without a (valid) draft id edits the
+ * project's default creation draft, which the backend persists like any other. A workspace
+ * composer that has no workspace id yet uses the memory-only pending scope (see
+ * PendingDraftScope), because it must never write to the backend.
+ */
+export function getComposerDraftScope(options: {
+  variant: "creation" | "workspace";
+  workspaceId: string | null;
+  creationProjectPath: string;
+  pendingDraftId?: string;
+}): DraftStoreScope {
+  if (options.variant === "workspace") {
+    return options.workspaceId
+      ? { kind: "workspace", workspaceId: options.workspaceId }
+      : { kind: "pending", projectPath: "" };
+  }
+  const draftId = options.pendingDraftId?.trim() ?? "";
+  return DRAFT_ID_PATTERN.test(draftId)
+    ? { kind: "creation", projectPath: options.creationProjectPath, draftId }
+    : defaultCreationDraftScope(options.creationProjectPath);
+}
+
 export function useComposerDraft(options: UseComposerDraftOptions) {
-  const { attachedReviews, creationProjectPath, pendingDraftId, pushToast, variant, workspaceId } =
-    options;
-  const scopeId =
-    variant === "workspace"
-      ? (workspaceId ?? "")
-      : pendingDraftId?.trim().length
-        ? getDraftScopeId(creationProjectPath, pendingDraftId)
-        : getPendingScopeId(creationProjectPath);
-  const inputKey = getInputKey(scopeId);
-  const attachmentsKey = getInputAttachmentsKey(scopeId);
-  const [input, setInput] = usePersistedState(inputKey, "", { listener: true });
+  const { attachedReviews, pushToast } = options;
+  const draftStore = getDraftStore();
+  const draftScope = getComposerDraftScope(options);
+  // Drafts live in the in-memory DraftStore, persisted to the backend in the background. The
+  // rendered text never waits for (or depends on) a storage write succeeding (issue 5006).
+  const draft = useDraft(draftScope);
+  const input = draft.text;
+  const attachments = draft.attachments;
+  const setInput = (value: string | ((previous: string) => string)) =>
+    draftStore.setText(draftScope, value);
   const latestInputValueRef = useRef(input);
   latestInputValueRef.current = input;
-  const tooLargeToastKeyRef = useRef<string | null>(null);
-  const selfWriteRef = useRef(false);
-  const [attachments, setAttachmentsState] = useState<ChatAttachment[]>(() =>
-    readPersistedChatAttachments(attachmentsKey)
-  );
+  // Synchronous: the store applies the change before returning, so a Stop restore can flush it
+  // right after this call (#4448) even if the composer unmounts before the next render.
   const setAttachments = (
     value: ChatAttachment[] | ((previous: ChatAttachment[]) => ChatAttachment[])
-  ) =>
-    setAttachmentsState((previous) => {
-      const next = value instanceof Function ? value(previous) : value;
-      const persists =
-        next.length > 0 &&
-        estimatePersistedChatAttachmentsChars(next) <= MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS;
-      selfWriteRef.current = true;
-      try {
-        updatePersistedState<ChatAttachment[] | undefined>(
-          attachmentsKey,
-          persists ? next : undefined
-        );
-      } finally {
-        selfWriteRef.current = false;
-      }
-      if (persists || next.length === 0) tooLargeToastKeyRef.current = null;
-      else if (tooLargeToastKeyRef.current !== attachmentsKey) {
-        tooLargeToastKeyRef.current = attachmentsKey;
-        pushToast({
-          type: "error",
-          message:
-            "This draft attachment is too large to save. It will be lost when you switch workspaces or restart.",
-          duration: 5000,
-        });
-      }
-      return next;
-    });
+  ) => draftStore.setAttachments(draftScope, value);
+  const pushToastRef = useRef(pushToast);
+  pushToastRef.current = pushToast;
+  const { variant, workspaceId, creationProjectPath, pendingDraftId } = options;
   useEffect(() => {
-    tooLargeToastKeyRef.current = null;
-    setAttachmentsState(readPersistedChatAttachments(attachmentsKey));
-    return subscribePersistedStateWrites((event) => {
-      if (event.key === attachmentsKey && !selfWriteRef.current) {
-        setAttachmentsState(readPersistedChatAttachments(attachmentsKey));
-      }
+    const scope = getComposerDraftScope({
+      variant,
+      workspaceId,
+      creationProjectPath,
+      pendingDraftId,
     });
-  }, [attachmentsKey]);
+    // Hydration carries attachment metadata only; fetch this draft's payloads once it is shown.
+    getDraftStore()
+      .ensurePayloads(scope)
+      .catch((error: unknown) => console.warn("Failed to load draft attachments:", error));
+    // A persistent save failure (e.g. a draft over the size limit) is surfaced once per streak.
+    // A failure after unmount stays unreported, so the next composer of this scope surfaces it.
+    const unsubscribeSaveErrors = getDraftStore().subscribeSaveErrors(scope, (message) => {
+      pushToastRef.current({
+        type: "error",
+        message: `Failed to save draft: ${message}`,
+        duration: 5000,
+      });
+    });
+    return () => {
+      unsubscribeSaveErrors();
+      // Leaving this draft (workspace switch, route change, unmount): write it now rather than
+      // after the debounce. A failure keeps the change in the store, which retries it.
+      getDraftStore()
+        .flush(scope)
+        .catch(() => undefined);
+    };
+  }, [variant, workspaceId, creationProjectPath, pendingDraftId]);
   const [draftReviews, setDraftReviews] = useState<ReviewNoteDataForDisplay[] | null>(null);
   const draftReviewIdsRef = useRef(new WeakMap<ReviewNoteDataForDisplay, string>());
   const nextDraftReviewIdRef = useRef(0);
@@ -129,16 +136,16 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
       }))
     : attachedReviews;
   const getDraft = () => ({ text: input, attachments });
-  const setDraft = (draft: { text: string; attachments: ChatAttachment[] }) => {
-    setInput(draft.text);
-    setAttachments(draft.attachments);
+  const setDraft = (next: { text: string; attachments: ChatAttachment[] }) => {
+    setInput(next.text);
+    setAttachments(next.attachments);
   };
-  const preEditDraftRef = useRef<ReturnType<typeof getDraft>>({ text: "", attachments: [] });
-  const preEditReviewsRef = useRef<ReviewNoteDataForDisplay[] | null>(null);
   return {
-    storageKeys: { inputKey },
+    draftScope,
     input,
     setInput,
+    payloadsLoaded: draft.payloadsLoaded,
+    unresolvedSendCount: draft.unresolvedSendCount,
     latestInputValueRef,
     attachments,
     setAttachments,
@@ -146,8 +153,6 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
     setDraftReviews,
     getDraft,
     setDraft,
-    preEditDraftRef,
-    preEditReviewsRef,
     reviewOverrideActive,
     reviewData,
     reviewIdsForCheck,

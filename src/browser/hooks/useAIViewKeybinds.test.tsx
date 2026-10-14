@@ -1,93 +1,50 @@
 import type { ReactNode, RefObject } from "react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, renderHook, waitFor } from "@testing-library/react";
-import { copyFile, readFile, rm, writeFile } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { GlobalWindow } from "happy-dom";
 import type { ChatInputAPI } from "@/browser/features/ChatInput";
-import type * as APIModule from "@/browser/contexts/API";
-import type { APIClient } from "@/browser/contexts/API";
-import { requireTestModule, type RecursivePartial } from "@/browser/testUtils";
-import type * as UseAIViewKeybindsModule from "./useAIViewKeybinds";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
+import { useAIViewKeybinds } from "./useAIViewKeybinds";
 
-let currentClientMock: RecursivePartial<APIClient> = {};
+let currentClientMock: TestApiOverrides<APIClient> = {};
 let originalWindow: typeof globalThis.window;
 let originalDocument: typeof globalThis.document;
 let originalHTMLElement: unknown;
-let APIProvider!: typeof APIModule.APIProvider;
-let useAIViewKeybinds!: typeof UseAIViewKeybindsModule.useAIViewKeybinds;
-let isolatedModulePaths: string[] = [];
-
-const hooksDir = dirname(fileURLToPath(import.meta.url));
-const contextsDir = join(hooksDir, "../contexts");
-
-async function importIsolatedAIViewKeybindModules() {
-  const suffix = randomUUID();
-  const isolatedApiPath = join(contextsDir, `API.real.${suffix}.tsx`);
-  const isolatedHookPath = join(hooksDir, `useAIViewKeybinds.real.${suffix}.ts`);
-
-  await copyFile(join(contextsDir, "API.tsx"), isolatedApiPath);
-
-  const hookSource = await readFile(join(hooksDir, "useAIViewKeybinds.ts"), "utf8");
-  const isolatedHookSource = hookSource.replace(
-    'from "@/browser/contexts/API";',
-    `from "../contexts/API.real.${suffix}.tsx";`
-  );
-
-  if (isolatedHookSource === hookSource) {
-    throw new Error("Failed to rewrite useAIViewKeybinds API import for the isolated test copy");
-  }
-
-  await writeFile(isolatedHookPath, isolatedHookSource);
-
-  ({ APIProvider } = requireTestModule<{ APIProvider: typeof APIModule.APIProvider }>(
-    isolatedApiPath
-  ));
-  ({ useAIViewKeybinds } = requireTestModule<{
-    useAIViewKeybinds: typeof UseAIViewKeybindsModule.useAIViewKeybinds;
-  }>(isolatedHookPath));
-
-  return [isolatedApiPath, isolatedHookPath];
-}
-
+let originalElement: unknown;
 function renderUseAIViewKeybinds(props: Parameters<typeof useAIViewKeybinds>[0]) {
   const wrapper = ({ children }: { children: ReactNode }) => (
-    <APIProvider client={currentClientMock as APIClient}>{children}</APIProvider>
+    <APIProvider client={createTestApiClient(currentClientMock)}>{children}</APIProvider>
   );
 
   return renderHook(() => useAIViewKeybinds(props), { wrapper });
 }
 
 describe("useAIViewKeybinds", () => {
-  beforeEach(async () => {
-    isolatedModulePaths = await importIsolatedAIViewKeybindModules();
+  beforeEach(() => {
     mock.restore();
 
     originalWindow = globalThis.window;
     originalDocument = globalThis.document;
     originalHTMLElement = (globalThis as unknown as { HTMLElement: unknown }).HTMLElement;
+    originalElement = (globalThis as unknown as { Element: unknown }).Element;
 
     const domWindow = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.window = domWindow;
     globalThis.document = domWindow.document;
-    // happy-dom doesn't define HTMLElement on globalThis by default.
-    // Our keybind helpers use `target instanceof HTMLElement`, so polyfill it for tests.
+    // happy-dom doesn't define HTMLElement or Element on globalThis by default.
+    // Our keybind helpers use `instanceof HTMLElement`/`Element`, so polyfill them for tests.
     (globalThis as unknown as { HTMLElement: unknown }).HTMLElement = domWindow.HTMLElement;
+    (globalThis as unknown as { Element: unknown }).Element = domWindow.Element;
   });
 
-  afterEach(async () => {
+  afterEach(() => {
     cleanup();
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
     (globalThis as unknown as { HTMLElement: unknown }).HTMLElement = originalHTMLElement;
+    (globalThis as unknown as { Element: unknown }).Element = originalElement;
     currentClientMock = {};
-
-    for (const modulePath of isolatedModulePaths) {
-      await rm(modulePath, { force: true });
-    }
-    isolatedModulePaths = [];
   });
 
   test("Escape interrupts an active stream in normal mode", async () => {

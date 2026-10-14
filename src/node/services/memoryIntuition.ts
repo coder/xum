@@ -10,6 +10,8 @@ import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import assert from "@/common/utils/assert";
 import {
   MEMORY_INTUITION_CANDIDATE_THRESHOLD,
+  MEMORY_INTUITION_EVAL_MAX_CHUNKS,
+  MEMORY_INTUITION_EVAL_MAX_ENTRIES,
   MEMORY_INTUITION_INDEX_AUTH_CONCURRENCY,
   MEMORY_INTUITION_MAX_CUE_CHARS,
   MEMORY_INTUITION_MAX_EXCERPT_CHARS,
@@ -53,11 +55,25 @@ import type { ThinkingLevel } from "@/common/types/thinking";
 import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import { getExplicitGatewayPrefix } from "@/common/utils/ai/models";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
+import type { Result } from "@/common/types/result";
+import { EVALUATION_MAX_QUESTIONS, EVALUATION_MAX_REQUEST_BYTES } from "@/constants/evaluation";
+import type { EvaluationService } from "./evaluation/evaluationService";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
+import { log } from "./log";
+import { normalizeWhitespace, runEvaluationRecall } from "./memoryIntuitionEvaluation";
+import type { EvaluationResolveError, PinnedEvaluationModel } from "./providerModelFactory";
 import { runThroughToolHookPipeline, type HookConfig } from "./tools/withHooks";
+import { extractToolJsonSchema } from "@/common/utils/tools/extractToolJsonSchema";
+
+/** The memory tool's own schema: a hook's allowed rewrite of a view is checked against it. */
+const memoryInputJsonSchema = () =>
+  extractToolJsonSchema({ inputSchema: TOOL_DEFINITIONS.memory.schema });
 
 // Verification evidence stays private; memory_read exposes only the hook-filtered result.
-type IntuitionReadResult = MemoryToolResult & { effectivePath?: string; rawContent?: string };
+export type IntuitionReadResult = MemoryToolResult & {
+  effectivePath?: string;
+  rawContent?: string;
+};
 type IntuitionModel = Awaited<
   ReturnType<NonNullable<ToolConfiguration["intuitionRuntime"]>["createModel"]>
 >;
@@ -123,8 +139,6 @@ export function selectIndexForCue(entries: readonly MemoryIndexEntry[], cue: str
     indexEntriesOmitted: entries.length - selected.length,
   };
 }
-
-const normalizeWhitespace = (text: string) => text.replace(/\s+/gu, " ").trim();
 
 interface ClassifiedMemories {
   memories: IntuitionMemory[];
@@ -216,6 +230,22 @@ function validateBudgets(): void {
       "intuition budgets must be positive integers"
     );
   }
+  for (const questions of [MEMORY_INTUITION_EVAL_MAX_ENTRIES, MEMORY_INTUITION_EVAL_MAX_CHUNKS]) {
+    assert(
+      Number.isSafeInteger(questions) && questions > 0 && questions <= EVALUATION_MAX_QUESTIONS,
+      "intuition evaluation question budgets must fit one evaluation request"
+    );
+  }
+  // Ordinary text (≤3 UTF-8 bytes per UTF-16 unit) plus the index-bounded paths must
+  // fit one excerpt request; escape-heavy outliers are trimmed at runtime instead.
+  assert(
+    3 *
+      (MEMORY_INTUITION_EVAL_MAX_CHUNKS * MEMORY_INTUITION_MAX_EXCERPT_CHARS +
+        MEMORY_INTUITION_MAX_CUE_CHARS) +
+      MEMORY_INTUITION_MAX_INDEX_BYTES <
+      EVALUATION_MAX_REQUEST_BYTES,
+    "intuition excerpt evaluation must fit the evaluation request cap"
+  );
 }
 
 /** Bound setup, stream consumption, and optional telemetry even when a dependency ignores abort. */
@@ -260,6 +290,7 @@ async function authorizeIntuitionIndex(
                 args: input,
                 config: hooks,
                 abortSignal: signal,
+                inputJsonSchema: memoryInputJsonSchema,
                 execute: (current): Promise<MemoryToolResult> => {
                   const parsed = TOOL_DEFINITIONS.memory.schema.safeParse(current);
                   if (
@@ -305,6 +336,12 @@ export async function runMemoryIntuition(args: {
   modelString: string;
   thinkingLevel?: ThinkingLevel;
   resolveAgentBody: () => Promise<string | null>;
+  /**
+   * Evaluation recall (at most two requests) replaces the tool loop when both are
+   * present and the model resolves. Resolution sends nothing, so falling back is safe.
+   */
+  createEvaluationModel?: () => Promise<Result<PinnedEvaluationModel, EvaluationResolveError>>;
+  evaluationService?: EvaluationService;
   memoryService: MemoryService;
   ctx: MemoryScopeContext;
   cue: string;
@@ -346,8 +383,12 @@ export async function runMemoryIntuition(args: {
       .slice(0, MEMORY_INTUITION_MAX_CUE_CHARS)
       .replace(/<\/cue\s*>/gi, "&lt;/cue&gt;")
       .slice(0, MEMORY_INTUITION_MAX_CUE_CHARS);
+    // The session scope is the agent's own rollover checkpoint, read directly after a rollover;
+    // recall ranks durable memories only.
     let selection = selectIndexForCue(
-      await untilAborted(signal, () => args.memoryService.listIndexEntries(args.ctx)),
+      (await untilAborted(signal, () => args.memoryService.listIndexEntries(args.ctx))).filter(
+        (entry) => entry.scope !== "session"
+      ),
       cue
     );
     stats.indexEntriesConsidered = selection.indexEntriesConsidered;
@@ -363,28 +404,9 @@ export async function runMemoryIntuition(args: {
       stats.indexEntriesOmitted = stats.indexEntriesConsidered - selection.entries.length;
     }
     if (selection.entries.length === 0) return { kind: "no_report", stats };
-    const {
-      model,
-      optionsModelString,
-      optionsProvidersConfig,
-      optionsMuxProviderOptions,
-      optionsRouteProvider,
-    } = await untilAborted(signal, async () => {
-      const created = await args.createModel();
-      // The factory may finish after timeout/abort. Take ownership here, before
-      // the racing await, so even a late model releases its transport resources.
-      if (signal.aborted) runLanguageModelCleanup(created.model);
-      else ownedModel = created.model;
-      metadataModel = created.metadataModel;
-      return created;
-    });
-    const body = await untilAborted(signal, args.resolveAgentBody);
-    if (!body?.trim())
-      return { kind: "error", message: "Intuition agent definition is missing", stats };
     const allowed = new Set(selection.entries.map((entry) => entry.path));
     const physicalReads = new Map<string, Promise<MemoryReadFileResult>>();
     let reservedBytes = 0;
-    let returnedBytes = 0;
     const readMemoryView = (path: string): Promise<IntuitionReadResult> => {
       return untilAborted(signal, async (): Promise<IntuitionReadResult> => {
         let effectivePath: string | undefined;
@@ -447,6 +469,7 @@ export async function runMemoryIntuition(args: {
               args: input,
               config: args.hooks,
               abortSignal: signal,
+              inputJsonSchema: memoryInputJsonSchema,
               execute,
             })
           : { blocked: false as const, result: await execute(input) };
@@ -469,6 +492,82 @@ export async function runMemoryIntuition(args: {
         return { ...(outcome.result as object), ...parsed.data, effectivePath, rawContent };
       }).catch(() => ({ success: false as const, error: "Memory read failed or aborted" }));
     };
+    // Pick the strategy before any request: once an evaluation request is sent,
+    // its failure is final and never retried through the (also billable) loop.
+    let evaluation: { pinned: PinnedEvaluationModel; service: EvaluationService } | undefined;
+    const { createEvaluationModel, evaluationService } = args;
+    if (createEvaluationModel && evaluationService) {
+      try {
+        const resolved = await untilAborted(signal, createEvaluationModel);
+        if (resolved.success) evaluation = { pinned: resolved.data, service: evaluationService };
+        else
+          log.debug("[intuition] evaluation model unavailable; using the tool loop", {
+            reason: resolved.error.reason,
+            routeKind: resolved.error.routeKind,
+          });
+      } catch (error) {
+        log.debug("[intuition] evaluation model resolution failed; using the tool loop", {
+          error: getErrorMessage(error),
+        });
+      }
+    }
+    if (evaluation) {
+      log.debug("[intuition] using evaluation recall", { model: evaluation.pinned.modelString });
+      metadataModel = evaluation.pinned.metadataModel;
+      const tokens = cueTokens(cue);
+      const outcome = await runEvaluationRecall({
+        model: evaluation.pinned.model,
+        evaluationService: evaluation.service,
+        cue,
+        entries: selection.entries,
+        readMemoryView,
+        scoreText: (text) => [...cueTokens(text)].filter((token) => tokens.has(token)).length,
+        signal,
+        // One deadline for the whole call, shared with the runner's own timer.
+        deadlineAt: started + MEMORY_INTUITION_TIMEOUT_MS,
+        stats,
+        onUsage: (usage, providerMetadata) => {
+          completedUsage = addUsage(completedUsage, usage);
+          completedMetadata = accumulateProviderMetadata(completedMetadata, providerMetadata);
+        },
+      });
+      if (outcome.kind === "error") return { kind: "error", message: outcome.message, stats };
+      if (outcome.kind === "timed_out") {
+        // A caller abort is not a timeout; the tool reports it as cancellation.
+        if (!signal.aborted) stats.timedOut = true;
+        return { kind: "no_report", stats };
+      }
+      // Re-verify through the current hooks: they can revoke, redact, or rewrite between
+      // stages, so an excerpt copied from an earlier filtered view is not yet evidence.
+      const classified = await classifyIntuitionReport({
+        items: outcome.items,
+        entries: selection.entries,
+        readFile: readMemoryView,
+      });
+      // Verification reads turn an abort into failed reads (downgrading memories to
+      // leads), so a deadline hit here must still end as a timeout, not a report.
+      if (signal.aborted) return { kind: "no_report", stats };
+      return { kind: "report", ...classified, stats };
+    }
+    const {
+      model,
+      optionsModelString,
+      optionsProvidersConfig,
+      optionsMuxProviderOptions,
+      optionsRouteProvider,
+    } = await untilAborted(signal, async () => {
+      const created = await args.createModel();
+      // The factory may finish after timeout/abort. Take ownership here, before
+      // the racing await, so even a late model releases its transport resources.
+      if (signal.aborted) runLanguageModelCleanup(created.model);
+      else ownedModel = created.model;
+      metadataModel = created.metadataModel;
+      return created;
+    });
+    const body = await untilAborted(signal, args.resolveAgentBody);
+    if (!body?.trim())
+      return { kind: "error", message: "Intuition agent definition is missing", stats };
+    let returnedBytes = 0;
     const report: { items?: IntuitionReportToolArgs["items"] } = {};
     const errors: string[] = [];
     assert(typeof model !== "string", "intuition requires a pinned model instance");
@@ -584,6 +683,9 @@ export async function runMemoryIntuition(args: {
             entries: selection.entries,
             readFile: readMemoryView,
           });
+    // Same contract as evaluation recall: verification reads turn an abort into failed
+    // reads (downgrading memories to leads), so a deadline hit here ends as a timeout.
+    if (signal.aborted) return { kind: "no_report", stats };
     if (classified) return { kind: "report", ...classified, stats };
     if (errors.length > 0 && !signal.aborted) return { kind: "error", message: errors[0], stats };
     return { kind: "no_report", stats };

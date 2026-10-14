@@ -11,14 +11,23 @@ test.skip(
 );
 
 test.describe("streaming behavior", () => {
-  test("stream continues after settings opens", async ({ ui, page }) => {
+  test("stream continues after settings opens", async ({ ui }) => {
     await ui.projects.openFirstWorkspace();
 
+    let markSent!: () => void;
+    const sent = new Promise<void>((resolve) => {
+      markSent = resolve;
+    });
     const streamPromise = ui.chat.captureStreamTimeline(async () => {
       await ui.chat.sendMessage(MOCK_LIST_PROGRAMMING_LANGUAGES);
+      markSent();
     });
 
-    await page.waitForTimeout(50);
+    // sendMessage waits for Send to enable after transcript catch-up. Opening Settings
+    // before that replaces the composer and hides the button, so open it only once the
+    // send was submitted: the stream is then starting or active, as this test intends.
+    // Racing streamPromise surfaces a failed send instead of hanging on `sent`.
+    await Promise.race([sent, streamPromise]);
     await ui.settings.open();
     const timeline = await streamPromise;
     await ui.settings.close();

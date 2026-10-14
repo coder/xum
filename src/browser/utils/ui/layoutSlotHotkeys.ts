@@ -2,6 +2,7 @@ import type { LayoutPresetsConfig, LayoutSlotNumber } from "@/common/types/uiLay
 import { getEffectiveSlotKeybind, getPresetForSlot } from "@/browser/utils/uiLayouts";
 import {
   matchesKeybind,
+  isAltGraphPressed,
   isBrowserViewportFocused,
   isDesktopViewportFocused,
   isTerminalFocused,
@@ -44,7 +45,7 @@ export function handleLayoutSlotHotkeys(
   }
 
   // AltGr is commonly implemented as Ctrl+Alt; avoid treating it as our shortcut.
-  if (typeof e.getModifierState === "function" && e.getModifierState("AltGraph")) {
+  if (isAltGraphPressed(e)) {
     return false;
   }
 

@@ -1,3 +1,4 @@
+import { ServiceTierSchema } from "@/common/config/schemas/providersConfig";
 /**
  * Pure field-wise resolver for agent AI settings (model, thinkingLevel,
  * reasoningMode). Every execution surface resolves through this one precedence
@@ -35,6 +36,7 @@ import {
   type ThinkingLevel,
 } from "@/common/types/thinking";
 import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
+import { openaiCyberModeAvailable } from "@/common/utils/ai/cyberMode";
 import { openaiProModeAvailable } from "@/common/utils/ai/proMode";
 import {
   enforceThinkingPolicy,
@@ -171,7 +173,7 @@ function buildCandidates(input: ResolveAgentAiSettingsInput): Candidate[] {
 /** First candidate whose field survives coercion wins; invalid values fall through. */
 function pickField<T>(
   candidates: readonly Candidate[],
-  field: "model" | "thinkingLevel" | "reasoningMode",
+  field: "model" | "thinkingLevel" | "reasoningMode" | "serviceTier",
   coerce: (raw: unknown) => T | undefined,
   diagnostics: string[]
 ): { value: T; source: AiSettingSource } | undefined {
@@ -241,6 +243,17 @@ export function resolveAgentAiSettings(
     reasoning = pickField(candidates, "reasoningMode", coerceOpenAIReasoningMode, diagnostics);
   }
 
+  // Absent speed stays absent so legacy chats still inherit the provider default.
+  const serviceTier =
+    input.explicit?.serviceTier != null
+      ? { value: input.explicit.serviceTier, source: { tier: "explicit" as const } }
+      : pickField(
+          candidates,
+          "serviceTier",
+          (raw) => ServiceTierSchema.safeParse(raw).data,
+          diagnostics
+        );
+
   // --- effective values (provider-safe) ---
   const minThinkingFloor = resolveMinimumThinkingLevel(
     model.value,
@@ -257,23 +270,30 @@ export function resolveAgentAiSettings(
   const proAvailable =
     input.proModeAvailable ?? openaiProModeAvailable(model.value, { providersConfig });
   const effectiveReasoning =
-    reasoning?.value === "pro" && !proAvailable ? undefined : reasoning?.value;
+    (reasoning?.value === "pro" && !proAvailable) ||
+    (reasoning?.value === "cyber" && !openaiCyberModeAvailable(model.value, { providersConfig }))
+      ? undefined
+      : reasoning?.value;
 
   return {
     selected: {
       model: model.value,
       thinkingLevel: thinking.value,
       ...(reasoning !== undefined ? { reasoningMode: reasoning.value } : {}),
+      ...(serviceTier != null ? { serviceTier: serviceTier.value } : {}),
     },
     effective: {
       model: model.value,
       thinkingLevel: effectiveThinking,
       ...(effectiveReasoning !== undefined ? { reasoningMode: effectiveReasoning } : {}),
+      // Route/model gating happens when building OpenAI provider options.
+      ...(serviceTier != null ? { serviceTier: serviceTier.value } : {}),
     },
     sources: {
       model: model.source,
       thinkingLevel: thinking.source,
       ...(reasoning !== undefined ? { reasoningMode: reasoning.source } : {}),
+      ...(serviceTier != null ? { serviceTier: serviceTier.source } : {}),
     },
     diagnostics,
   };

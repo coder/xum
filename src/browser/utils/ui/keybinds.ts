@@ -51,6 +51,19 @@ export function isMac(): boolean {
  * Check if a keyboard event matches a keybind definition.
  * On macOS, ctrl in the definition defaults to matching Ctrl or Cmd unless overridden.
  */
+/**
+ * AltGr is commonly reported as Ctrl+Alt (Windows and many Linux layouts) and types characters
+ * (e.g. AltGr+N), so Ctrl+Alt shortcuts must not claim AltGr input.
+ */
+export function isAltGraphPressed(event: React.KeyboardEvent | KeyboardEvent): boolean {
+  return typeof event.getModifierState === "function" && event.getModifierState("AltGraph");
+}
+
+/** NEW_SIDEBAR_TAB is a Ctrl/Cmd+Alt chord, so it ignores AltGr input (see isAltGraphPressed). */
+export function matchesNewSidebarTabKeybind(event: React.KeyboardEvent | KeyboardEvent): boolean {
+  return !isAltGraphPressed(event) && matchesKeybind(event, KEYBINDS.NEW_SIDEBAR_TAB);
+}
+
 export function matchesKeybind(
   event: React.KeyboardEvent | KeyboardEvent,
   keybind: Keybind
@@ -217,6 +230,34 @@ export function isTerminalFocused(target: EventTarget | null): boolean {
 }
 
 /**
+ * Marks each /side chat pane with its workspace ID. Multiple side tabs can be visible together,
+ * so the value distinguishes their window-level chat shortcuts (see paneHandlesKeyEvent).
+ */
+export const SIDE_CHAT_PANE_ATTR = "data-side-chat-pane";
+
+/** Which chat pane a set of window-level shortcuts belongs to. */
+export type ChatPaneScope = "main" | `side:${string}`;
+
+/**
+ * A side pane handles only events inside its own workspace's nearest pane marker; the main pane
+ * handles everything outside side panes (including when nothing is focused). Text-node targets
+ * resolve through their parent so they follow the same ownership as focused elements.
+ */
+export function paneHandlesKeyEvent(scope: ChatPaneScope, target: EventTarget | null): boolean {
+  const element =
+    typeof HTMLElement !== "undefined" && target instanceof HTMLElement
+      ? target
+      : typeof Node !== "undefined" && target instanceof Node
+        ? target.parentElement
+        : null;
+  const sidePane = element?.closest(`[${SIDE_CHAT_PANE_ATTR}]`);
+  const sideWorkspaceId = sidePane?.getAttribute(SIDE_CHAT_PANE_ATTR);
+  return scope === "main"
+    ? !sidePane
+    : sideWorkspaceId != null && scope === `side:${sideWorkspaceId}`;
+}
+
+/**
  * Check if the event target is inside a browser viewport container.
  * Used by global keyboard handlers to avoid stealing keystrokes from live browser sessions.
  */
@@ -246,6 +287,15 @@ export function isDialogOpen(): boolean {
     document.querySelector(`[${MODAL_DIALOG_OVERLAY_ATTRIBUTE}][data-state="open"]`) !== null ||
     document.querySelector('[role="dialog"][aria-modal="true"]') !== null
   );
+}
+
+/**
+ * True when a key event comes from inside the command palette. isDialogOpen() does not see the
+ * palette (cmdk renders no modal overlay), so global shortcuts that move focus check this too:
+ * focus must not move behind the open palette.
+ */
+export function isCommandPaletteTarget(target: EventTarget | null): boolean {
+  return target instanceof Element && target.closest("[cmdk-root]") != null;
 }
 
 /**
@@ -279,18 +329,34 @@ export function formatKeybind(keybind: Keybind): string {
     if (keybind.meta) parts.push("Meta");
   }
 
-  // Add the key (handle special cases, then capitalize single letters)
-  let key: string;
-  if (keybind.key === " ") {
-    key = "Space";
-  } else if (keybind.key.length === 1) {
-    key = keybind.key.toUpperCase();
-  } else {
-    key = keybind.key;
-  }
-  parts.push(key);
+  parts.push(formatKeyName(keybind.key));
 
   return isMac() ? parts.join("\u00B7") : parts.join("+"); // · on Mac, + elsewhere
+}
+
+/**
+ * Format a keybind as an `aria-keyshortcuts` value, so assistive technology can announce a
+ * shortcut that is otherwise only shown in a tooltip. Uses the same modifier as formatKeybind.
+ */
+export function formatKeybindForAria(keybind: Keybind): string {
+  const commandOnMac =
+    isMac() &&
+    keybind.ctrl === true &&
+    keybind.meta !== true &&
+    keybind.macCtrlBehavior !== "control";
+  const modifiers: Array<[boolean | undefined, string]> = [
+    [keybind.ctrl && !commandOnMac, "Control"],
+    [keybind.alt, "Alt"],
+    [keybind.shift, "Shift"],
+    [keybind.meta === true || commandOnMac, "Meta"],
+  ];
+  const names = modifiers.filter(([enabled]) => enabled === true).map(([, name]) => name);
+  return [...names, formatKeyName(keybind.key)].join("+");
+}
+
+function formatKeyName(key: string): string {
+  if (key === " ") return "Space";
+  return key.length === 1 ? key.toUpperCase() : key;
 }
 
 /**
@@ -326,6 +392,12 @@ export const KEYBINDS = {
   /** Send an existing queued message immediately */
   SEND_QUEUED_MESSAGE_NOW: { key: "Enter", ctrl: true, shift: true },
 
+  /** Send the oldest held (refused, unsent) message from an empty composer */
+  SEND_HELD_INPUT: { key: "Enter", ctrl: true, alt: true },
+
+  /** Discard the oldest held (refused, unsent) message from an empty composer */
+  DISCARD_HELD_INPUT: { key: "Backspace", ctrl: true, alt: true },
+
   /** Send message after current turn ends */
   SEND_MESSAGE_AFTER_TURN: { key: "Enter", ctrl: true },
 
@@ -341,13 +413,17 @@ export const KEYBINDS = {
   /** Save edit (Cmd/Ctrl+Enter) */
   SAVE_EDIT: { key: "Enter", ctrl: true },
 
+  /** Toggle a Markdown file between rendered preview and the editor (memory file view) */
+  // macOS uses Cmd so that the Control chord keeps its native text-editing meaning in the textarea.
+  TOGGLE_MARKDOWN_PREVIEW: { key: "e", ctrl: true, macCtrlBehavior: "command" },
+
   /** Interrupt active stream (destructive - stops AI generation) */
   // Vim mode: Ctrl+C (familiar from terminal interrupt)
   // Non-Vim mode: Esc (intuitive cancel/stop key)
   INTERRUPT_STREAM_VIM: { key: "c", ctrl: true, macCtrlBehavior: "control" },
   INTERRUPT_STREAM_NORMAL: { key: "Escape" },
 
-  /** Continue an interrupted stream (R = resume; transcript-focused, like Shift+G) */
+  /** Retry a failed stream or continue an interrupted one (R = resume; transcript-focused, like Shift+G) */
   RESUME_STREAM: { key: "R", shift: true },
 
   /** Focus chat input */
@@ -381,6 +457,18 @@ export const KEYBINDS = {
   // Option remapping, so matching on key alone is safe here.
   MOVE_PINNED_UP: { key: "ArrowUp", ctrl: true, alt: true },
   MOVE_PINNED_DOWN: { key: "ArrowDown", ctrl: true, alt: true },
+
+  // Workspace actions menu rows (#6328), on the Ctrl+Alt+Shift layer: no other keybind, browser
+  // or common OS shortcut uses these. Physical codes, because macOS Option remaps event.key.
+  // While a row's actions menu is open, the menu handles these keys for its own workspace.
+  /** Fork the current workspace onto a new branch (B = branch) */
+  FORK_WORKSPACE: { key: "b", code: "KeyB", ctrl: true, alt: true, shift: true },
+  /** Stop the current workspace's running devcontainer */
+  STOP_WORKSPACE_RUNTIME: { key: "x", code: "KeyX", ctrl: true, alt: true, shift: true },
+  /** Mark a workspace unread (only in its actions menu: the selected workspace is always read) */
+  MARK_WORKSPACE_UNREAD: { key: "m", code: "KeyM", ctrl: true, alt: true, shift: true },
+  /** Show or hide a workspace's completed sub-agents (only in its actions menu) */
+  TOGGLE_COMPLETED_SUB_AGENTS: { key: "a", code: "KeyA", ctrl: true, alt: true, shift: true },
 
   /** Jump to bottom of chat */
   JUMP_TO_BOTTOM: { key: "G", shift: true },
@@ -454,20 +542,93 @@ export const KEYBINDS = {
   // macOS: Cmd+Shift+F, Win/Linux: Ctrl+Shift+F
   TOGGLE_FAST_MODE: { key: "F", ctrl: true, shift: true },
 
+  /** Toggle OpenAI Ultrafast mode for the selected workspace model (supported models only) */
+  // code keeps the chord layout-safe: macOS Option changes the produced key.
+  TOGGLE_ULTRAFAST_MODE: { key: "U", code: "KeyU", ctrl: true, alt: true, shift: true },
+
+  /** Turn computer use on or off for the selected workspace (desktop app only) */
+  TOGGLE_COMPUTER_USE: { key: "X", ctrl: true, shift: true },
+
+  /**
+   * Turn computer use off from anywhere. Display only: the desktop main process registers it as
+   * a global OS shortcut (COMPUTER_USE_STOP_ACCELERATOR) so it works while another app is focused.
+   */
+  STOP_COMPUTER_USE: { key: "Escape", ctrl: true, shift: true },
+
+  // Expand the background processes strip and focus its first row; again (or Esc) collapses it.
+  // The VS Code webview forwards every keydown to the workbench: avoid VS Code's global chords.
+  FOCUS_BACKGROUND_PROCESSES: { key: "J", ctrl: true, shift: true },
+  // Scoped to a focused row of the background processes strip.
+  BACKGROUND_PROCESS_NEXT: { key: "ArrowDown" },
+  BACKGROUND_PROCESS_PREV: { key: "ArrowUp" },
+  BACKGROUND_PROCESS_VIEW_OUTPUT: { key: "Enter" },
+  // Backspace, not Delete: macOS keyboards' delete key reports Backspace.
+  BACKGROUND_PROCESS_TERMINATE: { key: "Backspace" },
+
   /** Focus chat input from anywhere */
   // Works even when focus is already in an input field
   // macOS: Cmd+I, Win/Linux: Ctrl+I
   FOCUS_CHAT: { key: "I", ctrl: true },
 
-  /** Close current tab in right sidebar (if closeable - currently only terminal tabs) */
+  /** Open (or show) a New tab, the tool launcher, in the focused right-sidebar pane */
+  // macOS: Cmd+Option+N, Win/Linux: Ctrl+Alt+N. "New" mnemonic without Ctrl/Cmd+N (new
+  // workspace) or Ctrl/Cmd+Shift+N (new scratch chat). Ctrl/Cmd+Alt+T would mirror
+  // OPEN_TERMINAL, but GNOME/Ubuntu reserve Ctrl+Alt+T for a system terminal. Matched by
+  // `code` because Option+N is a dead key on macOS (event.key is "Dead").
+  NEW_SIDEBAR_TAB: { key: "n", code: "KeyN", ctrl: true, alt: true },
+
+  /** Close the active tab of the focused right-sidebar pane */
   // macOS: Cmd+W (matches Ghostty), Win/Linux: Ctrl+W
   CLOSE_TAB: { key: "w", ctrl: true, macCtrlBehavior: "command" },
 
   /** Reveal the selected timeline event in the transcript */
   REVEAL_TIMELINE_EVENT: { key: "Enter", ctrl: true, shift: true },
 
-  /** Open the timeline dialog on small viewports where the right sidebar is hidden */
+  /** Show the Timeline tab full-screen on small viewports, where the right sidebar is hidden */
   OPEN_TIMELINE_DIALOG: { key: "t", shift: true },
+
+  /** Show the Stats tab full-screen on small viewports, where the right sidebar is hidden */
+  OPEN_STATS_DIALOG: { key: "s", shift: true },
+
+  /** Open (or focus) the Artifacts tab in the right sidebar */
+  OPEN_ARTIFACTS_TAB: { key: "K", ctrl: true, shift: true },
+
+  // Artifacts tab shortcuts: only handled while focus is inside the Artifacts panel,
+  // like the Review panel's single-key hunk navigation.
+  /** Toggle fullscreen for the selected artifact */
+  TOGGLE_ARTIFACT_FULLSCREEN: { key: "F", shift: true },
+  /** Select the next artifact */
+  NEXT_ARTIFACT: { key: "j" },
+  /** Select the previous artifact */
+  PREV_ARTIFACT: { key: "k" },
+  /** Reload the selected artifact */
+  RELOAD_ARTIFACT: { key: "r" },
+  /** Unpin the selected pinned workspace file */
+  UNPIN_ARTIFACT_FILE: { key: "u" },
+  // Image artifact zoom: handled while focus is inside the image viewer (its controls or the
+  // image itself). `code` so both "=" and Shift+"=" ("+") zoom in.
+  /** Zoom in on an image artifact */
+  ZOOM_IN_ARTIFACT_IMAGE: { key: "=", code: "Equal", allowShift: true },
+  /** Zoom out of an image artifact */
+  ZOOM_OUT_ARTIFACT_IMAGE: { key: "-" },
+  /** Fit an image artifact to the panel */
+  FIT_ARTIFACT_IMAGE: { key: "0" },
+  /** Show an image artifact at actual size (100%) */
+  ACTUAL_SIZE_ARTIFACT_IMAGE: { key: "1" },
+  /** Pin the shown artifact version to the project shelf */
+  PIN_ARTIFACT_TO_PROJECT_SHELF: { key: "p" },
+  /** Pin the shown artifact version to the global shelf */
+  PIN_ARTIFACT_TO_GLOBAL_SHELF: { key: "P", shift: true },
+  /** Unpin the selected shelf entry */
+  UNPIN_SHELF_ENTRY: { key: "u" },
+  /** Toggle annotate (comment) mode for the selected artifact */
+  TOGGLE_ARTIFACT_ANNOTATE: { key: "c" },
+  // The confirm strip an artifact's window.xum.send opens. Chords, not single keys: they confirm
+  // a message the artifact (untrusted) wrote. Not Ctrl+Alt+Backspace: that discards held input.
+  /** Send the message an artifact asked to send */
+  SEND_ARTIFACT_MESSAGE: { key: "Enter", ctrl: true },
+  /** Dismiss the message an artifact asked to send */
+  DISMISS_ARTIFACT_MESSAGE: { key: "Backspace", ctrl: true },
 
   /** Reveal the last prompt in the transcript while its popup is open */
   REVEAL_LAST_PROMPT: { key: "Enter", ctrl: true, alt: true },
@@ -516,10 +677,29 @@ export const KEYBINDS = {
   // macOS: Cmd+, Win/Linux: Ctrl+,
   OPEN_SETTINGS: { key: ",", ctrl: true },
 
+  /** Open a window for the xum server running on this Xum root (desktop only, #4846) */
+  // macOS: Cmd+Shift+O, Win/Linux: Ctrl+Shift+O
+  OPEN_SERVER_WINDOW: { key: "O", ctrl: true, shift: true },
+
   /** Open analytics dashboard */
   // macOS: Cmd+Shift+Y, Win/Linux: Ctrl+Shift+Y
   // "Y" for analYtics — Ctrl+. is reserved for CYCLE_AGENT
   OPEN_ANALYTICS: { key: "Y", ctrl: true, shift: true },
+
+  /** Write a local "Report slowness" bundle (experiment perfFlightRecorder; no-op while off) */
+  // macOS: Cmd+Option+Shift+S, Win/Linux: Ctrl+Alt+Shift+S
+  // Matched by code: Option changes event.key on macOS. Shift keeps it apart from
+  // SETTINGS_BACKUP_SAVE (Ctrl+Alt+S).
+  REPORT_SLOWNESS: { key: "S", code: "KeyS", ctrl: true, alt: true, shift: true },
+
+  /** Save open session tapes (experiment sessionTapes) */
+  // macOS: Cmd+Option+Shift+T, Win/Linux: Ctrl+Alt+Shift+T
+  // Matched by code: Option changes event.key on macOS.
+  SAVE_SESSION_TAPES: { key: "T", code: "KeyT", ctrl: true, alt: true, shift: true },
+
+  /** Reveal the session tapes folder (experiment sessionTapes) */
+  // macOS: Cmd+Option+Shift+F, Win/Linux: Ctrl+Alt+Shift+F
+  REVEAL_SESSION_TAPES: { key: "F", code: "KeyF", ctrl: true, alt: true, shift: true },
 
   /** Toggle voice input (dictation) */
   // macOS: Cmd+D, Win/Linux: Ctrl+D
@@ -537,9 +717,11 @@ export const KEYBINDS = {
   NAVIGATE_FORWARD: { key: "]", ctrl: true },
 
   /** Toggle notifications on response for current workspace */
-  // macOS: Cmd+Shift+N, Win/Linux: Ctrl+Shift+N
-  // "N" for Notifications
-  TOGGLE_NOTIFICATIONS: { key: "N", ctrl: true, shift: true },
+  // macOS: Cmd+Shift+Comma, Win/Linux: Ctrl+Shift+Comma
+  // Not Ctrl/Cmd+Shift+N: NEW_SCRATCH_CHAT owns it. Every free Ctrl+Shift+letter is a browser
+  // or OS shortcut, and Ctrl+Alt+letter is AltGr on Windows layouts (this listener fires while
+  // typing). `code` keeps it working when Shift turns event.key into "<".
+  TOGGLE_NOTIFICATIONS: { key: ",", code: "Comma", ctrl: true, shift: true },
 
   TOGGLE_DRIFT_MODE: { key: "G", ctrl: true, shift: true },
 
@@ -564,6 +746,7 @@ export const KEYBINDS = {
   SETTINGS_BACKUP_TOGGLE_MCP_COMMANDS: { key: "d", code: "KeyD", ctrl: true, alt: true },
   // Not Ctrl+Alt+P: that is PIN_WORKSPACE, which is global.
   SETTINGS_BACKUP_TOGGLE_PROJECTS: { key: "j", code: "KeyJ", ctrl: true, alt: true },
+  SETTINGS_BACKUP_TOGGLE_GLOBAL_ARTIFACTS: { key: "u", code: "KeyU", ctrl: true, alt: true },
 
   /** Confirm action in confirmation dialogs */
   CONFIRM_DIALOG_YES: { key: "y", allowShift: true },
@@ -626,6 +809,12 @@ export const KEYBINDS = {
 
   /** Toggle plan annotation mode in propose_plan */
   TOGGLE_PLAN_ANNOTATE: { key: "a", shift: true },
+
+  /**
+   * Run the latest plan's primary action (Implement, or Continue in Auto in Auto mode).
+   * Not while typing: only from an empty or unfocused field.
+   */
+  RUN_LATEST_PLAN_ACTION: { key: "Enter", alt: true },
 
   /** Copy image to clipboard (scoped to image lightbox / image context menu) */
   IMAGE_COPY: { key: "c", ctrl: true },

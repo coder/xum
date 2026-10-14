@@ -177,7 +177,6 @@ describe("createWorktreeArchiveHook", () => {
     });
     const managedPath = getManagedPath(workspaceMetadata);
     await mkdir(managedPath, { recursive: true });
-    const debugSpy = spyOn(log, "debug").mockImplementation(() => undefined);
 
     const hook = createWorktreeArchiveHook({
       getWorktreeArchiveBehavior: () => "snapshot",
@@ -187,10 +186,6 @@ describe("createWorktreeArchiveHook", () => {
 
     expect(result).toEqual(Ok(undefined));
     expect(await pathExists(managedPath)).toBe(true);
-    expect(debugSpy).toHaveBeenCalledWith(
-      "Skipping snapshot worktree cleanup for multi-project archive",
-      { workspaceId: workspaceMetadata.id }
-    );
   });
 
   it("skips cleanup for non-worktree runtimes even when cleanup is enabled", async () => {

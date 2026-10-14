@@ -14,7 +14,15 @@ import {
   BUDGET_TOKEN_CHUNK_SLACK,
   REQUEST_FRAMING_TOKENS,
 } from "@/common/constants/contextBudget";
+import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
+import { normalizeUsage, type AiSdkUsageLike } from "@/common/utils/tokens/usageHelpers";
+import { countToolReferences } from "@/common/utils/tools/toolCatalog";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
+import {
+  CLAUDE_ENCODING_BUDGET_FACTOR,
+  CLAUDE_TOOL_OVERHEAD_TOKENS,
+  CLAUDE_TOOL_PREAMBLE_TOKENS,
+} from "@/constants/tokenizerCorrection";
 
 interface BudgetModel {
   model: string;
@@ -30,12 +38,24 @@ async function countBudgetInput(
   input: BudgetTokenCountInput,
   model: BudgetModel,
   framing: number,
-  ceiling?: number
+  ceiling?: number,
+  toolCount = 0
 ): Promise<number> {
   const tokenizer = await getTokenizerForModel(model.model, model.metadataModel, {
     requireRealEncoding: true,
   });
   assert(tokenizer.encoding !== "approx-4", "A hard budget guard requires a real encoding");
+  // The local `claude` encoding under-counts newer Claude tokenizers by up to ~1.55x (#5219), so
+  // every claude-encoded count is scaled by one measured factor and pays Anthropic's tool-use
+  // framing. Older Claude models are over-counted on purpose; see tokenizerCorrection.ts.
+  const claude = tokenizer.encoding === "claude";
+  const factor = claude ? CLAUDE_ENCODING_BUDGET_FACTOR : 1;
+  const toolFraming =
+    claude && toolCount > 0
+      ? CLAUDE_TOOL_PREAMBLE_TOKENS + CLAUDE_TOOL_OVERHEAD_TOKENS * toolCount
+      : 0;
+  // The factor scales encoded text only: fixedTokens already charges one token per omitted byte.
+  const textEstimate = (count: number) => Math.ceil(count * factor) + input.fixedTokens + framing;
   let encoded = 0;
   let chunks = 0;
   for (let start = 0; start < input.text.length; ) {
@@ -46,12 +66,14 @@ async function countBudgetInput(
     assert(Number.isSafeInteger(count) && count >= 0, "Invalid encoded budget count");
     encoded += count + (chunks > 0 ? BUDGET_TOKEN_CHUNK_SLACK : 0);
     chunks += 1;
-    if (ceiling != null && encoded + input.fixedTokens + framing > ceiling) return ceiling + 1;
+    // This early exit returns a lower bound, not an exact request size.
+    if (ceiling != null && textEstimate(encoded) + toolFraming > ceiling) return ceiling + 1;
     start = end;
   }
   // Retain existing conservative ASCII estimates while correcting token-dense text.
   // Encoding failures propagate; never fall back silently to chars-per-token.
-  return Math.max(input.heuristicTokens, encoded + input.fixedTokens + framing);
+  // Tool framing is provider overhead neither text measure contains, so it is added after both.
+  return Math.max(input.heuristicTokens, textEstimate(encoded)) + toolFraming;
 }
 
 export function estimateFreshRequestTokensForModel(
@@ -75,13 +97,18 @@ export function estimateToolResultTokensForModel(
   return countBudgetInput(prepareBudgetTokenCount(output), model, REQUEST_FRAMING_TOKENS);
 }
 
-export async function checkAssembledRequestBudgetForModel(
+/**
+ * The assembled-request estimate the per-step preflight enforces. Above the hard ceiling the
+ * count stops early and returns a lower bound (ceiling + 1), not the exact request size.
+ * Undefined when the model has no usable context limit.
+ */
+export async function estimateAssembledRequestTokensForModel(
   payload: AssembledRequestBudgetInput,
   options: BudgetModel & {
     modelContextLimit: number | null | undefined;
     activeTools?: readonly string[];
   }
-): Promise<ContextBudgetExceeded | undefined> {
+): Promise<{ estimate: number; hardCeiling: number } | undefined> {
   const limit = options.modelContextLimit;
   if (limit == null || !Number.isFinite(limit) || limit <= 0) return undefined;
   const hardCeiling = getContextBudgetHardCeiling(limit);
@@ -94,15 +121,171 @@ export async function checkAssembledRequestBudgetForModel(
             payload.tools && name in payload.tools ? [[name, payload.tools[name]]] : []
           )
         );
-  const framing =
-    REQUEST_FRAMING_TOKENS * (1 + payload.messages.length + Object.keys(tools ?? {}).length);
-  const estimate = await countBudgetInput(
+  // Anthropic expands every tool_reference into the full definition, repeats included (#5413).
+  // The loaded tool list holds each referenced tool once, so each further reference (or a
+  // reference to a tool the list omits) pays its schema again, one single-tool record each.
+  const repeats = [...countToolReferences(payload.messages)].flatMap(([name, count]) => {
+    const tool = payload.tools && Object.hasOwn(payload.tools, name) ? payload.tools[name] : null;
+    const charged = tools != null && Object.hasOwn(tools, name) ? 1 : 0;
+    return tool == null ? [] : Array.from({ length: count - charged }, () => ({ [name]: tool }));
+  });
+  const parts = [
     prepareAssembledRequestTokenCount({ ...payload, tools }),
+    ...repeats.map((repeat) => prepareAssembledRequestTokenCount({ messages: [], tools: repeat })),
+  ];
+  const toolCount = Object.keys(tools ?? {}).length + repeats.length;
+  const framing = REQUEST_FRAMING_TOKENS * (1 + payload.messages.length + toolCount);
+  const estimate = await countBudgetInput(
+    {
+      text: parts.map((part) => part.text).join("\n"),
+      fixedTokens: parts.reduce((sum, part) => sum + part.fixedTokens, 0),
+      heuristicTokens: parts.reduce((sum, part) => sum + part.heuristicTokens, 0),
+    },
     options,
     framing,
-    hardCeiling
+    hardCeiling,
+    toolCount
   );
-  return estimate > hardCeiling
-    ? { type: "context_budget_exceeded", model: options.model, estimate, hardCeiling }
+  return { estimate, hardCeiling };
+}
+
+/** The request a step sent, as the request builder already holds it (no serialization). */
+export interface ContextBudgetAnchorRequest extends BudgetModel {
+  system: AssembledRequestBudgetInput["system"];
+  tools: AssembledRequestBudgetInput["tools"];
+  activeTools: readonly string[] | undefined;
+  messages: readonly unknown[];
+}
+
+export interface ContextBudgetAnchor extends ContextBudgetAnchorRequest {
+  /** Provider-counted input of that request (cache reads/writes included). */
+  providerTokens: number;
+}
+
+/**
+ * Pairs a step's request with the usage the provider reported for it. Reasoning output is
+ * added because the next request replays it and the local estimator skips encrypted
+ * reasoning. Undefined (so the caller uses the full estimate) when the provider reported no
+ * positive integer input total, or when the step emitted reasoning without a reported count.
+ */
+export function createContextBudgetAnchor(
+  request: ContextBudgetAnchorRequest | undefined,
+  step:
+    | {
+        usage: AiSdkUsageLike | undefined;
+        providerMetadata?: Record<string, unknown>;
+        reasoning?: readonly unknown[];
+      }
+    | undefined
+): ContextBudgetAnchor | undefined {
+  if (request == null || step?.usage == null) return undefined;
+  const normalized = normalizeUsage(step.usage);
+  // Cache or reasoning details without an input total do not count the whole request.
+  const input = normalized.inputTokens;
+  if (input == null || !Number.isSafeInteger(input) || input <= 0) return undefined;
+  const usage = createDisplayUsage(normalized, request.model, step.providerMetadata);
+  if (usage == null) return undefined;
+  // Display recovery also reads provider-metadata-only reasoning counts. Zero cannot tell
+  // "no reasoning" from "not reported", so a step that emitted reasoning needs a count.
+  const reasoning = usage.reasoning.tokens;
+  if (reasoning === 0 && (step.reasoning?.length ?? 0) > 0) return undefined;
+  const providerTokens =
+    usage.input.tokens + usage.cached.tokens + usage.cacheCreate.tokens + reasoning;
+  return Number.isSafeInteger(providerTokens) && providerTokens > 0
+    ? { ...request, providerTokens }
     : undefined;
+}
+
+export function isExactAppend(
+  payload: AssembledRequestBudgetInput,
+  options: BudgetModel & { activeTools?: readonly string[] },
+  anchor: ContextBudgetAnchor
+): boolean {
+  const tools = options.activeTools;
+  return (
+    anchor.model === options.model &&
+    anchor.metadataModel === options.metadataModel &&
+    anchor.system === payload.system &&
+    anchor.tools === payload.tools &&
+    anchor.activeTools?.length === tools?.length &&
+    (anchor.activeTools ?? []).every((name, i) => tools?.[i] === name) &&
+    payload.messages.length >= anchor.messages.length &&
+    anchor.messages.every((message, i) => payload.messages[i] === message) &&
+    // A repeated tool_reference leaves the loaded tools unchanged, yet the provider expands it
+    // into the full definition the delta estimate never charges (#5413). Use the full estimate.
+    countToolReferences(payload.messages.slice(anchor.messages.length)).size === 0
+  );
+}
+
+/**
+ * Anchored estimate (#4858). Contract: the anchor is used ONLY when this request is an exact
+ * append of the step whose usage it carries: same model, the same system prompt and tool set
+ * objects, the same advertised tool names, a message list that starts with that step's sent
+ * messages (element identity, so any rewrite of the prefix fails), and a positive integer
+ * provider input total plus a reasoning count whenever the step emitted reasoning. The estimate is then the provider's count plus the existing estimator applied to the
+ * appended messages only. ANY doubt means the full estimate; edge cases get a new full-estimate
+ * condition here, never new mechanism. On an exact append, `delta` is the counted estimate of
+ * the appended messages (`anchor.providerTokens + delta === estimate`); a full count omits it.
+ */
+export async function estimateAnchoredRequestTokensForModel(
+  payload: AssembledRequestBudgetInput,
+  options: BudgetModel & {
+    modelContextLimit: number | null | undefined;
+    activeTools?: readonly string[];
+  },
+  anchor: ContextBudgetAnchor | undefined
+): Promise<{ estimate: number; hardCeiling: number; delta?: number } | undefined> {
+  if (anchor == null || !isExactAppend(payload, options, anchor)) {
+    return estimateAssembledRequestTokensForModel(payload, options);
+  }
+  const limit = options.modelContextLimit;
+  if (limit == null || !Number.isFinite(limit) || limit <= 0) return undefined;
+  const hardCeiling = getContextBudgetHardCeiling(limit);
+  const delta = payload.messages.slice(anchor.messages.length);
+  // Same early-exit lower bound as the full estimate: above the ceiling, not exact.
+  const deltaEstimate = await countBudgetInput(
+    prepareAssembledRequestTokenCount({ messages: delta }),
+    options,
+    REQUEST_FRAMING_TOKENS * (1 + delta.length),
+    Math.max(0, hardCeiling - anchor.providerTokens)
+  );
+  return { estimate: anchor.providerTokens + deltaEstimate, hardCeiling, delta: deltaEstimate };
+}
+
+/**
+ * The budget check's single count, with its estimate and exact-append delta (#5286). `exceeded`
+ * is set iff the estimate is above the hard ceiling, where it is the early-exit lower bound.
+ */
+export async function measureAssembledRequestBudgetForModel(
+  payload: AssembledRequestBudgetInput,
+  options: BudgetModel & {
+    modelContextLimit: number | null | undefined;
+    activeTools?: readonly string[];
+  },
+  anchor?: ContextBudgetAnchor
+): Promise<
+  | { estimate: number; hardCeiling: number; delta?: number; exceeded?: ContextBudgetExceeded }
+  | undefined
+> {
+  const counted = await estimateAnchoredRequestTokensForModel(payload, options, anchor);
+  if (counted == null || counted.estimate <= counted.hardCeiling) return counted;
+  // Built field by field: the error is serialized to the frontend and must not carry `delta`.
+  const exceeded: ContextBudgetExceeded = {
+    type: "context_budget_exceeded",
+    model: options.model,
+    estimate: counted.estimate,
+    hardCeiling: counted.hardCeiling,
+  };
+  return { ...counted, exceeded };
+}
+
+export async function checkAssembledRequestBudgetForModel(
+  payload: AssembledRequestBudgetInput,
+  options: BudgetModel & {
+    modelContextLimit: number | null | undefined;
+    activeTools?: readonly string[];
+  },
+  anchor?: ContextBudgetAnchor
+): Promise<ContextBudgetExceeded | undefined> {
+  return (await measureAssembledRequestBudgetForModel(payload, options, anchor))?.exceeded;
 }

@@ -169,7 +169,7 @@ async function openWorkspace(
 
 async function sendMessage(page: Page, text: string): Promise<void> {
   const input = page.getByRole("textbox", {
-    name: /Message Claude|Edit your last message/,
+    name: /^(Message|Edit message)$/,
   });
   await input.waitFor({ state: "visible", timeout: 60_000 });
   await input.fill(text);
@@ -428,16 +428,6 @@ async function main() {
     try {
       const page = await browser.newPage({ viewport: { width: 1600, height: 900 } });
       await page.goto(`http://127.0.0.1:${vitePort}`, { waitUntil: "domcontentloaded" });
-      await page.evaluate(() => {
-        localStorage.setItem(
-          "tutorialState",
-          JSON.stringify({
-            disabled: false,
-            completed: { settings: true, creation: true, workspace: true },
-          })
-        );
-      });
-      await page.reload({ waitUntil: "domcontentloaded" });
 
       await waitForProjectPage(page);
       const trunkBranch = readTrunkBranch(demoProject.projectPath);

@@ -8,13 +8,10 @@
 import {
   EDIT_FAILED_NOTE_PREFIX,
   NOTE_READ_FILE_FIRST_RETRY,
-  NOTE_READ_FILE_RETRY,
-  NOTE_READ_FILE_AGAIN_RETRY,
   type FileEditReplaceStringToolArgs,
-  type FileEditReplaceLinesToolArgs,
 } from "@/common/types/tools";
 
-import { convertNewlines, detectFileEol, normalizeNewlinesToLF } from "./eol";
+import { convertNewlines, detectFileEol } from "./eol";
 
 interface OperationMetadata {
   edits_applied: number;
@@ -37,9 +34,8 @@ export interface OperationError {
 export type OperationOutcome = OperationResult | OperationError;
 
 // Re-export schema-derived types for backward compatibility.
-// Local code previously imported StringReplaceArgs / LineReplaceArgs from this module.
+// Local code previously imported StringReplaceArgs from this module.
 export type StringReplaceArgs = FileEditReplaceStringToolArgs;
-export type LineReplaceArgs = FileEditReplaceLinesToolArgs;
 
 /**
  * Handle string-based replacement
@@ -127,74 +123,4 @@ export function handleStringReplace(
       edits_applied: editsApplied,
     },
   };
-}
-
-/**
- * Handle line-range replacement
- */
-export function handleLineReplace(
-  args: LineReplaceArgs,
-  originalContent: string
-): OperationOutcome {
-  const startIndex = args.start_line - 1;
-  const endIndex = args.end_line - 1;
-
-  if (args.start_line <= 0) {
-    return {
-      success: false,
-      error: `start_line must be >= 1 (received ${args.start_line}).`,
-      note: `${EDIT_FAILED_NOTE_PREFIX} Line numbers must be >= 1.`,
-    };
-  }
-
-  if (args.end_line < args.start_line) {
-    return {
-      success: false,
-      error: `end_line must be >= start_line (received start ${args.start_line}, end ${args.end_line}).`,
-      note: `${EDIT_FAILED_NOTE_PREFIX} The end_line must be >= start_line.`,
-    };
-  }
-
-  const fileEol = detectFileEol(originalContent);
-  const lines = normalizeNewlinesToLF(originalContent).split("\n");
-
-  if (startIndex >= lines.length) {
-    return {
-      success: false,
-      error: `start_line ${args.start_line} exceeds current file length (${lines.length}).`,
-      note: `${EDIT_FAILED_NOTE_PREFIX} The file has ${lines.length} lines. ${NOTE_READ_FILE_RETRY}`,
-    };
-  }
-
-  const clampedEndIndex = Math.min(endIndex, lines.length - 1);
-  const currentRange = lines.slice(startIndex, clampedEndIndex + 1);
-
-  if (args.expected_lines && !arraysEqual(currentRange, args.expected_lines)) {
-    return {
-      success: false,
-      error: `expected_lines validation failed. Current lines [${currentRange.join("\n")}] differ from expected [${args.expected_lines.join("\n")}].`,
-      note: `${EDIT_FAILED_NOTE_PREFIX} The file content changed since you last read it. ${NOTE_READ_FILE_AGAIN_RETRY}`,
-    };
-  }
-
-  const before = lines.slice(0, startIndex);
-  const after = lines.slice(clampedEndIndex + 1);
-  const updatedLines = [...before, ...args.new_lines, ...after];
-  const linesReplaced = currentRange.length;
-  const totalDelta = args.new_lines.length - currentRange.length;
-
-  return {
-    success: true,
-    newContent: updatedLines.join(fileEol),
-    metadata: {
-      edits_applied: 1,
-      lines_replaced: linesReplaced,
-      line_delta: totalDelta,
-    },
-  };
-}
-
-function arraysEqual(a: string[], b: string[]): boolean {
-  if (a.length !== b.length) return false;
-  return a.every((value, index) => value === b[index]);
 }

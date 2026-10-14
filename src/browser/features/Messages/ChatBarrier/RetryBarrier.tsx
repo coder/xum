@@ -1,35 +1,168 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, RefreshCw } from "lucide-react";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { useAPI } from "@/browser/contexts/API";
+import { useUserPreferences } from "@/browser/stores/AppConfigStore";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useWorkspaceState } from "@/browser/stores/WorkspaceStore";
 import { getLastMainRetryCandidateMessage } from "@/common/utils/messages/retryEligibility";
-import { KEYBINDS, formatKeybind } from "@/browser/utils/ui/keybinds";
-import { VIM_ENABLED_KEY } from "@/common/constants/storage";
+import {
+  KEYBINDS,
+  formatKeybind,
+  isDesktopViewportFocused,
+  isDialogOpen,
+  isEditableElement,
+  matchesKeybind,
+  paneHandlesKeyEvent,
+} from "@/browser/utils/ui/keybinds";
+import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyCompactionOverrides } from "@/browser/utils/messages/compactionOptions";
 import { stopStream } from "@/browser/utils/stopStream";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 import { getErrorMessage } from "@/common/utils/errors";
+import { runWithCatchFinally } from "@/browser/utils/compilerSafeControlFlow";
+import type { AutoRetryStatus } from "@/browser/utils/messages/autoRetryStatus";
+import type { DisplayedMessage } from "@/common/types/message";
+import type { StreamErrorType } from "@/common/types/errors";
 
 interface RetryBarrierProps {
   workspaceId: string;
   visible?: boolean;
 }
 
+// RetryManager.abandon reasons that are not stream error types. Error types (rate_limit,
+// api_error, ...) still show as sent: they name the failure the user can look up.
+const ABANDON_REASON_LABELS: Record<string, string> = {
+  user_interrupt: "you stopped it",
+  disabled_by_user: "auto-retry is turned off",
+  context_changed: "the conversation changed",
+};
+
+function formatAbandonReason(reason: string): string {
+  return ABANDON_REASON_LABELS[reason] ?? reason;
+}
+
+// Barrier title for a failed stream, by error kind. A Record so a new StreamErrorType must pick
+// a title here. `null` keeps the generic "Stream interrupted": only a real user abort is one.
+const STREAM_ERROR_TITLES: Record<StreamErrorType, string | null> = {
+  authentication: "Authentication failed",
+  rate_limit: "Rate limited",
+  server_error: "Server error",
+  api: "API error",
+  retry_failed: "Retries exhausted",
+  aborted: null,
+  network: "Network error",
+  context_exceeded: "Context limit exceeded",
+  context_budget_blocked: "Request too large",
+  quota: "Quota exceeded",
+  model_not_found: "Model not found",
+  runtime_not_ready: "Runtime not ready",
+  runtime_start_failed: "Runtime failed to start",
+  empty_output: "Empty response",
+  stream_truncated: "Response cut off",
+  max_output_tokens: "Output limit reached",
+  model_refusal: "Model refused",
+  agent_resolution: "Agent unavailable",
+  reasoning_rejected: "Reasoning rejected",
+  session_tape_replay: "Session replay refused",
+  plugin_blocked: "Blocked by plugin",
+  unknown: "Stream error",
+};
+
+/** Desktop entry point: feeds {@link RetryBarrierContent} from WorkspaceStore. */
 export const RetryBarrier: React.FC<RetryBarrierProps> = (props) => {
-  const { api } = useAPI();
   const workspaceState = useWorkspaceState(props.workspaceId);
+  return (
+    <RetryBarrierContent
+      workspaceId={props.workspaceId}
+      visible={props.visible}
+      messages={workspaceState.messages}
+      autoRetryStatus={workspaceState.autoRetryStatus}
+      isStreamStarting={workspaceState.isStreamStarting}
+      canInterrupt={workspaceState.canInterrupt}
+    />
+  );
+};
+
+interface RetryBarrierContentProps extends RetryBarrierProps {
+  messages: DisplayedMessage[];
+  autoRetryStatus: AutoRetryStatus | null;
+  isStreamStarting: boolean;
+  canInterrupt: boolean;
+  /**
+   * Replaces the default Retry (temporarily enable auto-retry, then resume). The VS Code webview
+   * does not toggle auto-retry: it retries through its resume path (useResumeStream), which owns
+   * the error it reports as `retryError`.
+   */
+  onRetry?: () => Promise<void>;
+  retryError?: string | null;
+  /**
+   * Whether the scheduled-retry state offers Stop (default true). The VS Code webview shows the
+   * backend's countdown read-only: it never stops or toggles auto-retry.
+   */
+  showStopAutoRetry?: boolean;
+}
+
+/**
+ * The barrier's Retry with its Shift+R shortcut (#5111). Mounted only while Retry is offered (barrier
+ * visible, no automatic retry running), so the always-mounted barrier keeps no key listener. The
+ * interrupted divider's resume shares the key and is never offered while this barrier shows. Same
+ * guards as that transcript key: never while typing, in a dialog, or in a remote desktop viewport.
+ */
+const RetryButton: React.FC<{ disabled: boolean; onRetry: () => void }> = (props) => {
+  const onRetryRef = useRef(props.onRetry);
+  useEffect(() => {
+    onRetryRef.current = props.onRetry;
+  });
+  // The main chat and the /side chat tab can both show Retry; only the pane owning the focused
+  // element retries, so one Shift+R never retries both chats.
+  const paneScope = useChatPaneScope();
+  useEffect(() => {
+    const handleKeyDownCapture = (e: KeyboardEvent) => {
+      if (
+        !matchesKeybind(e, KEYBINDS.RESUME_STREAM) ||
+        !paneHandlesKeyEvent(paneScope, e.target) ||
+        isDesktopViewportFocused(e.target) ||
+        isDialogOpen() ||
+        isEditableElement(e.target)
+      ) {
+        return;
+      }
+      e.preventDefault();
+      onRetryRef.current();
+    };
+    window.addEventListener("keydown", handleKeyDownCapture, { capture: true });
+    return () => window.removeEventListener("keydown", handleKeyDownCapture, { capture: true });
+  }, [paneScope]);
+
+  return (
+    <button
+      className="bg-warning font-primary text-background cursor-pointer rounded border-none px-4 py-2 text-xs font-semibold whitespace-nowrap transition-all duration-200 hover:-translate-y-px hover:brightness-120 active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-50"
+      disabled={props.disabled}
+      onClick={props.onRetry}
+    >
+      Retry{" "}
+      <span aria-hidden="true" className="mobile-hide-shortcut-hints">
+        ({formatKeybind(KEYBINDS.RESUME_STREAM)})
+      </span>
+    </button>
+  );
+};
+
+export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) => {
+  const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const [countdown, setCountdown] = useState(0);
   const [manualRetryError, setManualRetryError] = useState<string | null>(null);
   const [isManualRetrying, setIsManualRetrying] = useState(false);
 
-  const [vimEnabled] = usePersistedState<boolean>(VIM_ENABLED_KEY, false, { listener: true });
+  const vimEnabled = useUserPreferences(
+    (preferences) => preferences.appearance?.vimEnabled === true
+  );
   const stopKeybind = formatKeybind(
     vimEnabled ? KEYBINDS.INTERRUPT_STREAM_VIM : KEYBINDS.INTERRUPT_STREAM_NORMAL
   );
 
-  const autoRetryStatus = workspaceState.autoRetryStatus;
+  const autoRetryStatus = props.autoRetryStatus;
   const isAutoRetryScheduled = autoRetryStatus?.type === "auto-retry-scheduled";
   const isAutoRetryActive =
     autoRetryStatus?.type === "auto-retry-scheduled" ||
@@ -39,11 +172,12 @@ export const RetryBarrier: React.FC<RetryBarrierProps> = (props) => {
   const manualRetryRollbackPendingRef = useRef(false);
   const manualRetryRollbackArmedRef = useRef(false);
   const manualRetryRollbackBaselineMessageCountRef = useRef<number | null>(null);
-  const apiRef = useRef(api);
+  // The rollback skips while offline, as it did when useAPI() went null in the gap.
+  const apiRef = useRef(liveApi);
 
   useEffect(() => {
-    apiRef.current = api;
-  }, [api]);
+    apiRef.current = liveApi;
+  }, [liveApi]);
 
   const rollbackManualRetryAutoRetryIfNeeded = useCallback(
     async (options?: { suppressErrors?: boolean }): Promise<void> => {
@@ -105,7 +239,7 @@ export const RetryBarrier: React.FC<RetryBarrierProps> = (props) => {
     const autoRetryActive =
       autoRetryStatus?.type === "auto-retry-scheduled" ||
       autoRetryStatus?.type === "auto-retry-starting";
-    const streamInFlight = workspaceState.isStreamStarting || workspaceState.canInterrupt;
+    const streamInFlight = props.isStreamStarting || props.canInterrupt;
 
     // Mirror ask_user rollback semantics: keep temporary enablement while the resumed
     // stream/retry attempt is in flight, then restore preference after terminal outcome.
@@ -116,7 +250,7 @@ export const RetryBarrier: React.FC<RetryBarrierProps> = (props) => {
 
     const baselineMessageCount = manualRetryRollbackBaselineMessageCountRef.current;
     const hasObservedPostRetryMessage =
-      baselineMessageCount !== null && workspaceState.messages.length > baselineMessageCount;
+      baselineMessageCount !== null && props.messages.length > baselineMessageCount;
     if (!manualRetryRollbackArmedRef.current && !hasObservedPostRetryMessage) {
       return;
     }
@@ -124,9 +258,9 @@ export const RetryBarrier: React.FC<RetryBarrierProps> = (props) => {
     void rollbackManualRetryAutoRetryIfNeeded();
   }, [
     autoRetryStatus,
-    workspaceState.isStreamStarting,
-    workspaceState.canInterrupt,
-    workspaceState.messages.length,
+    props.isStreamStarting,
+    props.canInterrupt,
+    props.messages.length,
     rollbackManualRetryAutoRetryIfNeeded,
   ]);
 
@@ -159,7 +293,7 @@ export const RetryBarrier: React.FC<RetryBarrierProps> = (props) => {
     }
   }, [isAutoRetryActive]);
   const handleManualRetry = async () => {
-    if (!api) {
+    if (!liveApi) {
       setManualRetryError("Not connected to server");
       return;
     }
@@ -171,67 +305,81 @@ export const RetryBarrier: React.FC<RetryBarrierProps> = (props) => {
     setIsManualRetrying(true);
     setManualRetryError(null);
 
-    try {
-      let options = getSendOptionsFromStorage(props.workspaceId);
-      const lastUserMessage = [...workspaceState.messages]
-        .reverse()
-        .find(
-          (message): message is Extract<typeof message, { type: "user" }> => message.type === "user"
-        );
-
-      if (lastUserMessage?.compactionRequest) {
-        options = applyCompactionOverrides(options, lastUserMessage.compactionRequest.parsed);
-      }
-
-      const enableResult = await api.workspace.setAutoRetryEnabled?.({
-        workspaceId: props.workspaceId,
-        enabled: true,
-        persist: false,
-      });
-      if (enableResult && !enableResult.success) {
-        setManualRetryError(enableResult.error);
-        return;
-      }
-
-      if (enableResult?.success && enableResult.data.previousEnabled === false) {
-        // Manual retry temporarily enables auto-retry for this resumed attempt.
-        // Restore only when stream/retry outcome is terminal.
-        manualRetryRollbackWorkspaceIdRef.current = props.workspaceId;
-        manualRetryRollbackPendingRef.current = true;
-        manualRetryRollbackArmedRef.current = false;
-        manualRetryRollbackBaselineMessageCountRef.current = workspaceState.messages.length;
-      }
-
-      const resumeResult = await api.workspace.resumeStream({
-        workspaceId: props.workspaceId,
-        options,
-      });
-
-      if (!resumeResult.success) {
-        const formatted = formatSendMessageError(resumeResult.error);
-        const details = formatted.resolutionHint
-          ? `${formatted.message} ${formatted.resolutionHint}`
-          : formatted.message;
-        setManualRetryError(details);
-
-        // Keep preference consistent when resume fails before retry/stream events.
-        await rollbackManualRetryAutoRetryIfNeeded();
-        return;
-      }
-
-      if (
-        manualRetryRollbackPendingRef.current &&
-        !manualRetryRollbackArmedRef.current &&
-        resumeResult.data.started === false
-      ) {
-        await rollbackManualRetryAutoRetryIfNeeded();
-      }
-    } catch (error) {
-      setManualRetryError(getErrorMessage(error));
-      await rollbackManualRetryAutoRetryIfNeeded();
-    } finally {
-      setIsManualRetrying(false);
+    const onRetry = props.onRetry;
+    if (onRetry) {
+      await runWithCatchFinally(
+        onRetry,
+        (error) => setManualRetryError(getErrorMessage(error)),
+        () => setIsManualRetrying(false)
+      );
+      return;
     }
+
+    // runWithCatchFinally keeps try/catch/finally out of the component so React Compiler compiles it.
+    await runWithCatchFinally(
+      async () => {
+        let options = getSendOptionsFromStorage(props.workspaceId);
+        const lastUserMessage = [...props.messages]
+          .reverse()
+          .find(
+            (message): message is Extract<typeof message, { type: "user" }> =>
+              message.type === "user"
+          );
+
+        if (lastUserMessage?.compactionRequest) {
+          options = applyCompactionOverrides(options, lastUserMessage.compactionRequest.parsed);
+        }
+
+        const enableResult = await liveApi.workspace.setAutoRetryEnabled?.({
+          workspaceId: props.workspaceId,
+          enabled: true,
+          persist: false,
+        });
+        if (enableResult && !enableResult.success) {
+          setManualRetryError(enableResult.error);
+          return;
+        }
+
+        if (enableResult?.success && enableResult.data.previousEnabled === false) {
+          // Manual retry temporarily enables auto-retry for this resumed attempt.
+          // Restore only when stream/retry outcome is terminal.
+          manualRetryRollbackWorkspaceIdRef.current = props.workspaceId;
+          manualRetryRollbackPendingRef.current = true;
+          manualRetryRollbackArmedRef.current = false;
+          manualRetryRollbackBaselineMessageCountRef.current = props.messages.length;
+        }
+
+        const resumeResult = await liveApi.workspace.resumeStream({
+          workspaceId: props.workspaceId,
+          options,
+        });
+
+        if (!resumeResult.success) {
+          const formatted = formatSendMessageError(resumeResult.error);
+          const details = formatted.resolutionHint
+            ? `${formatted.message} ${formatted.resolutionHint}`
+            : formatted.message;
+          setManualRetryError(details);
+
+          // Keep preference consistent when resume fails before retry/stream events.
+          await rollbackManualRetryAutoRetryIfNeeded();
+          return;
+        }
+
+        if (
+          manualRetryRollbackPendingRef.current &&
+          !manualRetryRollbackArmedRef.current &&
+          resumeResult.data.started === false
+        ) {
+          await rollbackManualRetryAutoRetryIfNeeded();
+        }
+      },
+      async (error) => {
+        setManualRetryError(getErrorMessage(error));
+        await rollbackManualRetryAutoRetryIfNeeded();
+      },
+      () => setIsManualRetrying(false)
+    );
   };
 
   const handleStopAutoRetry = async () => {
@@ -241,11 +389,12 @@ export const RetryBarrier: React.FC<RetryBarrierProps> = (props) => {
     await stopStream(api, props.workspaceId, { disableAutoRetry: true });
   };
 
-  const lastMessage = getLastMainRetryCandidateMessage(workspaceState.messages);
+  const lastMessage = getLastMainRetryCandidateMessage(props.messages);
   const lastStreamError = lastMessage?.type === "stream-error" ? lastMessage : null;
-  const interruptionReason = lastStreamError?.errorType === "rate_limit" ? "Rate limited" : null;
-  const isWaitingForInitialResponse =
-    lastMessage?.type === "user" && workspaceState.isStreamStarting;
+  const interruptionReason = lastStreamError
+    ? STREAM_ERROR_TITLES[lastStreamError.errorType]
+    : null;
+  const isWaitingForInitialResponse = lastMessage?.type === "user" && props.isStreamStarting;
 
   let statusIcon: React.ReactNode = (
     <AlertTriangle aria-hidden="true" className="text-warning h-4 w-4 shrink-0" />
@@ -262,15 +411,12 @@ export const RetryBarrier: React.FC<RetryBarrierProps> = (props) => {
     </>
   );
   let actionButton: React.ReactNode = (
-    <button
-      className="bg-warning font-primary text-background cursor-pointer rounded border-none px-4 py-2 text-xs font-semibold whitespace-nowrap transition-all duration-200 hover:-translate-y-px hover:brightness-120 active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-50"
+    <RetryButton
       disabled={isManualRetrying}
-      onClick={() => {
+      onRetry={() => {
         void handleManualRetry();
       }}
-    >
-      Retry
-    </button>
+    />
   );
 
   if (isAutoRetryActive) {
@@ -300,26 +446,29 @@ export const RetryBarrier: React.FC<RetryBarrierProps> = (props) => {
       );
     }
 
-    actionButton = (
-      <button
-        className="border-warning font-primary text-warning hover:bg-warning-overlay cursor-pointer rounded border bg-transparent px-4 py-2 text-xs font-semibold whitespace-nowrap transition-all duration-200 hover:-translate-y-px active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-50"
-        onClick={() => {
-          void handleStopAutoRetry();
-        }}
-      >
-        Stop <span className="mobile-hide-shortcut-hints">({stopKeybind})</span>
-      </button>
-    );
+    // Never Retry while a retry is active: a manual attempt would race the armed backoff.
+    actionButton =
+      props.showStopAutoRetry === false ? null : (
+        <button
+          className="border-warning font-primary text-warning hover:bg-warning-overlay cursor-pointer rounded border bg-transparent px-4 py-2 text-xs font-semibold whitespace-nowrap transition-all duration-200 hover:-translate-y-px active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-50"
+          onClick={() => {
+            void handleStopAutoRetry();
+          }}
+        >
+          Stop <span className="mobile-hide-shortcut-hints">({stopKeybind})</span>
+        </button>
+      );
   }
 
-  const details = manualRetryError ? (
+  const retryError = manualRetryError ?? props.retryError ?? null;
+  const details = retryError ? (
     <div className="font-primary text-foreground/80 pl-8 text-[12px]">
-      <span className="text-warning font-semibold">Retry failed:</span> {manualRetryError}
+      <span className="text-warning font-semibold">Retry failed:</span> {retryError}
     </div>
   ) : autoRetryStatus?.type === "auto-retry-abandoned" ? (
     <div className="font-primary text-foreground/80 pl-8 text-[12px]">
       <span className="text-warning font-semibold">Auto-retry stopped:</span>{" "}
-      {autoRetryStatus.reason}
+      {formatAbandonReason(autoRetryStatus.reason)}
     </div>
   ) : null;
 
@@ -329,8 +478,10 @@ export const RetryBarrier: React.FC<RetryBarrierProps> = (props) => {
 
   return (
     <div className="border-warning my-5 flex flex-col gap-3 rounded border-l-4 bg-gradient-to-br from-[rgba(255,165,0,0.1)] to-[rgba(255,140,0,0.1)] px-5 py-4">
-      <div className="flex items-center justify-between gap-4">
-        <div className="flex flex-1 items-center gap-3">
+      {/* Wraps so Retry moves under the status in a narrow pane (VS Code sidebar, #5151) instead of
+          overflowing the card; the status keeps its content width before it wraps. */}
+      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+        <div className="flex min-w-0 flex-auto items-center gap-3">
           <span className="shrink-0">{statusIcon}</span>
           <div className="font-primary text-foreground text-[13px] font-medium">{statusText}</div>
         </div>

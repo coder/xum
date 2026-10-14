@@ -2,7 +2,7 @@ import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 
 /**
  * Process-wide kill-switch for automatic repo-controlled automation:
- * .xum/init hooks, bash tool hooks (tool_env/tool_pre/tool_post),
+ * .xum lifecycle hooks (init/archive/delete), bash tool hooks (tool_env/tool_pre/tool_post),
  * project-local MCP servers (.xum/mcp.jsonc), project plugin containers
  * (.xum/plugins hooks/commands/MCP), and git hooks in trusted checkouts
  * (gitHooksAllowed in gitNoHooksEnv.ts).

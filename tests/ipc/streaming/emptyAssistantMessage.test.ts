@@ -51,7 +51,7 @@ describeIntegration("empty assistant message self-healing", () => {
 
         // Write corrupted history directly
         for (const msg of messages) {
-          const result = await historyService.appendToHistory(workspaceId, msg as any);
+          const result = await historyService.appendToHistory(workspaceId, msg);
           if (!result.success) {
             throw new Error(`Failed to seed history: ${result.error}`);
           }
@@ -119,7 +119,7 @@ describeIntegration("empty assistant message self-healing", () => {
 
         // Write corrupted history directly
         for (const msg of messages) {
-          const result = await historyService.appendToHistory(workspaceId, msg as any);
+          const result = await historyService.appendToHistory(workspaceId, msg);
           if (!result.success) {
             throw new Error(`Failed to seed history: ${result.error}`);
           }

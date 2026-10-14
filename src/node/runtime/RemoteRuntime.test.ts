@@ -1,7 +1,18 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { spawn } from "node:child_process";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { EXIT_CODE_ABORTED } from "@/common/constants/exitCodes";
 import type { ExecOptions, ExecStream } from "./Runtime";
 import type { SpawnResult } from "./RemoteRuntime";
-import { TestRemoteRuntime } from "./testRemoteRuntime";
+import { execBuffered } from "@/node/utils/runtime/helpers";
+import {
+  MISSING_CWD_COMMANDS,
+  MULTI_LINE_COMMAND_CASES,
+  ShellRemoteRuntime,
+  TestRemoteRuntime,
+} from "./testRemoteRuntime";
 
 class RecordingRemoteRuntime extends TestRemoteRuntime {
   spawnCount = 0;
@@ -83,7 +94,7 @@ describe("RemoteRuntime file path canonicalization", () => {
     await runtime.stat("nested/../stat.txt");
     await runtime.ensureDir("~/dir");
 
-    expect(runtime.commands).toContain("cat '/workspace/read.txt'");
+    expect(runtime.commands).toContain("LC_ALL=C cat '/workspace/read.txt'");
     expect(runtime.commands.some((command) => command.includes("'/home/test/write.txt'"))).toBe(
       true
     );
@@ -145,6 +156,47 @@ describe("RemoteRuntime file operation aborts", () => {
   });
 });
 
+/** Spawns a real long-running local process so abort handling can be observed end to end. */
+class SleepingRemoteRuntime extends TestRemoteRuntime {
+  spawned: ReturnType<typeof spawn> | undefined;
+
+  protected override spawnRemoteProcess(): Promise<SpawnResult> {
+    this.spawned = spawn("sleep", ["30"], { stdio: ["pipe", "pipe", "pipe"] });
+    return Promise.resolve({ process: this.spawned });
+  }
+}
+
+describe("RemoteRuntime abort cancels the underlying command", () => {
+  // Reawakened sub-agents bound definition reads with an abort signal; the timeout only
+  // bounds remote work if an aborted stat/readFile really ends its command.
+  it("a caller abort forwards into the stat exec", async () => {
+    const runtime = new ReadFileRemoteRuntime();
+    const abort = new AbortController();
+    const pending = runtime.stat("/workspace/agent.md", abort.signal).catch(() => undefined);
+    await Bun.sleep(0);
+    expect(runtime.capturedSignal).toBeDefined();
+    expect(runtime.capturedSignal?.aborted).toBe(false);
+
+    abort.abort();
+    expect(runtime.capturedSignal?.aborted).toBe(true);
+    void pending;
+  });
+
+  it("aborting exec terminates the spawned process", async () => {
+    const runtime = new SleepingRemoteRuntime();
+    const abort = new AbortController();
+    const stream = await runtime.exec("sleep 30", {
+      cwd: "/workspace",
+      abortSignal: abort.signal,
+    });
+    expect(runtime.spawned?.exitCode).toBeNull();
+
+    abort.abort();
+    expect(await stream.exitCode).toBe(EXIT_CODE_ABORTED);
+    expect(runtime.spawned?.signalCode).toBe("SIGTERM");
+  });
+});
+
 describe("RemoteRuntime.writeFile", () => {
   it("does not start a remote write command when aborted before the first write", async () => {
     const runtime = new RecordingRemoteRuntime();
@@ -160,4 +212,68 @@ describe("RemoteRuntime.writeFile", () => {
 
     expect(runtime.spawnCount).toBe(0);
   });
+});
+
+// ShellRemoteRuntime needs GNU-style `timeout` and bash.
+const noShellTransport = process.platform === "win32" || process.platform === "darwin";
+
+describe("RemoteRuntime.exec multi-line commands", () => {
+  let root: string;
+
+  beforeEach(async () => {
+    root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "remote-exec-lines-")));
+    await fs.mkdir(path.join(root, "login"));
+    await fs.mkdir(path.join(root, "workspace"));
+  });
+
+  afterEach(async () => {
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it.skipIf(noShellTransport)(
+    "a missing cwd fails the command instead of running later lines in the login directory",
+    async () => {
+      const runtime = new ShellRemoteRuntime(path.join(root, "login"));
+      for (const command of MISSING_CWD_COMMANDS) {
+        const result = await execBuffered(runtime, command, {
+          cwd: path.join(root, "missing"),
+          env: { XUM_TEST_VAR: "set" },
+          timeout: 10,
+        });
+        expect({ command, failed: result.exitCode !== 0, stdout: result.stdout }).toEqual({
+          command,
+          failed: true,
+          stdout: "",
+        });
+      }
+    }
+  );
+
+  it.skipIf(noShellTransport)("later lines run in the cwd with the exported env", async () => {
+    const runtime = new ShellRemoteRuntime(path.join(root, "login"));
+    const cwd = path.join(root, "workspace");
+    const result = await execBuffered(runtime, 'true\npwd\necho "var=$XUM_TEST_VAR"', {
+      cwd,
+      env: { XUM_TEST_VAR: "set" },
+      timeout: 10,
+    });
+    expect({ exitCode: result.exitCode, stdout: result.stdout }).toEqual({
+      exitCode: 0,
+      stdout: `${cwd}\nvar=set\n`,
+    });
+  });
+
+  for (const c of MULTI_LINE_COMMAND_CASES) {
+    it.skipIf(noShellTransport)(`keeps output and exit code: ${c.name}`, async () => {
+      const runtime = new ShellRemoteRuntime(path.join(root, "login"));
+      const result = await execBuffered(runtime, c.command, {
+        cwd: path.join(root, "workspace"),
+        timeout: 10,
+      });
+      expect({ exitCode: result.exitCode, stdout: result.stdout }).toEqual({
+        exitCode: c.exitCode,
+        stdout: c.stdout,
+      });
+    });
+  }
 });

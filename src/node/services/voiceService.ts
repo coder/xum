@@ -5,7 +5,6 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
 import { resolveProviderCredentials } from "@/node/utils/providerRequirements";
 import { ProvidersConfigStore, type Config } from "@/node/config";
-import type { PolicyService } from "@/node/services/policyService";
 import type { ProviderService } from "@/node/services/providerService";
 
 const OPENAI_TRANSCRIPTION_URL = "https://api.openai.com/v1/audio/transcriptions";
@@ -37,7 +36,6 @@ export class VoiceService {
   constructor(
     private readonly config: Config,
     private readonly providerService?: ProviderService,
-    private readonly policyService?: PolicyService,
     providersConfigStore?: ProvidersConfigStore
   ) {
     this.providersConfigStore = providersConfigStore ?? new ProvidersConfigStore(config.rootDir);
@@ -61,8 +59,7 @@ export class VoiceService {
       const gatewayAvailable =
         mainConfig.muxGatewayEnabled !== false &&
         !isProviderDisabledInConfig(gatewayConfig ?? {}) &&
-        !!gatewayToken &&
-        (this.policyService?.isProviderAllowed("mux-gateway") ?? true);
+        !!gatewayToken;
       // Resolve through the shared config -> file -> env funnel so voice honors
       // the same credential fallbacks as chat requests (and ignores legacy
       // op:// references from the removed 1Password integration).
@@ -70,10 +67,7 @@ export class VoiceService {
         "openai",
         providersConfig.openai ?? {}
       ).apiKey;
-      const openaiAvailable =
-        !isProviderDisabledInConfig(openaiConfig ?? {}) &&
-        !!openaiApiKey &&
-        (this.policyService?.isProviderAllowed("openai") ?? true);
+      const openaiAvailable = !isProviderDisabledInConfig(openaiConfig ?? {}) && !!openaiApiKey;
       const transcriptionRoute = this.resolveTranscriptionRoute({
         routePriority: mainConfig.routePriority,
         routeOverrides: mainConfig.routeOverrides,
@@ -149,10 +143,7 @@ export class VoiceService {
     couponCode: string,
     gatewayConfig: MuxGatewayTranscriptionConfig | undefined
   ): Promise<Result<string, string>> {
-    const forcedBaseUrl = this.policyService?.getForcedBaseUrl("mux-gateway");
-    const gatewayBase = this.resolveGatewayBase(
-      forcedBaseUrl ?? gatewayConfig?.baseURL ?? gatewayConfig?.baseUrl
-    );
+    const gatewayBase = this.resolveGatewayBase(gatewayConfig?.baseURL ?? gatewayConfig?.baseUrl);
     const response = await fetch(`${gatewayBase}${MUX_GATEWAY_TRANSCRIPTION_PATH}`, {
       method: "POST",
       headers: {
@@ -182,9 +173,7 @@ export class VoiceService {
     apiKey: string,
     openaiConfig: OpenAITranscriptionConfig | undefined
   ): Promise<Result<string, string>> {
-    const forcedBaseUrl = this.policyService?.getForcedBaseUrl("openai");
-
-    const response = await fetch(this.resolveOpenAITranscriptionUrl(openaiConfig, forcedBaseUrl), {
+    const response = await fetch(this.resolveOpenAITranscriptionUrl(openaiConfig), {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -220,11 +209,9 @@ export class VoiceService {
   }
 
   private resolveOpenAITranscriptionUrl(
-    openaiConfig: OpenAITranscriptionConfig | undefined,
-    forcedBaseUrl?: string
+    openaiConfig: OpenAITranscriptionConfig | undefined
   ): string {
-    // Policy-forced base URL takes precedence over user config.
-    const baseURL = forcedBaseUrl ?? openaiConfig?.baseUrl ?? openaiConfig?.baseURL;
+    const baseURL = openaiConfig?.baseUrl ?? openaiConfig?.baseURL;
     if (!baseURL) {
       return OPENAI_TRANSCRIPTION_URL;
     }

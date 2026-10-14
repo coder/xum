@@ -2,23 +2,24 @@ import "../../../tests/ui/dom";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { act, cleanup, render } from "@testing-library/react";
 import { installDom } from "../../../tests/ui/dom";
-import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { APIProvider } from "@/browser/contexts/API";
 import { mcpIconRefCache } from "@/browser/utils/mcp/iconRefCache";
 import { useMcpIcon } from "./useMcpIcon";
+import { createTestApiClient } from "@/browser/testUtils";
 
 const PNG = "data:image/png;base64,iVBORw0KGgo=";
 
 /** Minimal API client: only the bulk icon lookup the hook needs, with a call counter. */
 function fakeClient(answer: (iconRefs: string[]) => Record<string, string | null>) {
   const calls: string[][] = [];
-  const client = {
+  const client = createTestApiClient({
     mcp: {
       icons: (input: { iconRefs: string[] }) => {
         calls.push([...input.iconRefs]);
         return Promise.resolve(answer(input.iconRefs));
       },
     },
-  } as unknown as APIClient;
+  });
   return { client, calls };
 }
 

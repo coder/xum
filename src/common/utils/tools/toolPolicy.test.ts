@@ -2,8 +2,6 @@ import {
   applyToolPolicy,
   applyToolPolicyToNames,
   buildRequiredToolPatterns,
-  isSessionHistoryDisabled,
-  withContextBudgetFlushToolPolicy,
   type ToolPolicy,
 } from "./toolPolicy";
 import { tool } from "ai";
@@ -44,6 +42,19 @@ const mockTools = {
 };
 
 describe("applyToolPolicy", () => {
+  test("offers new_context only with memory and session_history", () => {
+    const budgetTools = {
+      new_context: mockTools.bash,
+      memory: mockTools.bash,
+      session_history: mockTools.bash,
+    };
+    expect(Object.keys(applyToolPolicy(budgetTools))).toContain("new_context");
+    for (const gate of ["memory", "session_history"]) {
+      const result = applyToolPolicy(budgetTools, [{ regex_match: gate, action: "disable" }]);
+      expect(Object.keys(result)).not.toContain("new_context");
+    }
+  });
+
   describe("default behavior", () => {
     test("allows all tools when no policy provided", () => {
       const result = applyToolPolicy(mockTools);
@@ -372,30 +383,5 @@ describe("buildRequiredToolPatterns", () => {
   test("returns empty for undefined or require-free policies", () => {
     expect(buildRequiredToolPatterns(undefined)).toEqual([]);
     expect(buildRequiredToolPatterns([{ regex_match: "bash", action: "disable" }])).toEqual([]);
-  });
-});
-
-describe("withContextBudgetFlushToolPolicy", () => {
-  const names = ["memory", "session_history", "bash", "file_edit_replace_string", "mcp__srv__op"];
-
-  it("keeps only memory regardless of enabling caller rules", () => {
-    expect(applyToolPolicyToNames(names, withContextBudgetFlushToolPolicy(undefined))).toEqual([
-      "memory",
-    ]);
-    expect(
-      applyToolPolicyToNames(
-        names,
-        withContextBudgetFlushToolPolicy([
-          { regex_match: "bash", action: "enable" },
-          { regex_match: "session_history", action: "enable" },
-        ])
-      )
-    ).toEqual(["memory"]);
-  });
-
-  it("preserves the inherited verdict for memory", () => {
-    const policy = withContextBudgetFlushToolPolicy([{ regex_match: "memory", action: "disable" }]);
-    expect(applyToolPolicyToNames(names, policy)).toEqual([]);
-    expect(isSessionHistoryDisabled(policy)).toBe(true);
   });
 });

@@ -1,7 +1,7 @@
 import { expect, userEvent, waitFor, within } from "@storybook/test";
 import type { ComponentType } from "react";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
   LEFT_SIDEBAR_COLLAPSED_KEY,
   RIGHT_SIDEBAR_COLLAPSED_KEY,
@@ -29,13 +29,14 @@ function setupDesktopStory(state: DesktopStoryState, sidebarWidth = 640) {
     workspaceId: WORKSPACE_ID,
     workspaceName: "desktop-viewer",
     messages: [],
+    experiments: { [EXPERIMENT_IDS.PORTABLE_DESKTOP]: true },
   });
-  updatePersistedState(getExperimentKey(EXPERIMENT_IDS.PORTABLE_DESKTOP), true);
   updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, true);
   updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
   updatePersistedState(RIGHT_SIDEBAR_WIDTH_KEY, sidebarWidth);
   updatePersistedState(getRightSidebarLayoutKey(WORKSPACE_ID), {
     version: 1,
+    openTabsOnly: true,
     nextId: 2,
     focusedTabsetId: "desktop-tabset",
     root: { type: "tabset", id: "desktop-tabset", tabs: ["desktop"], activeTab: "desktop" },
@@ -226,7 +227,7 @@ export const PhoneUnavailable: AppStory = {
   parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } } },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await canvas.findByRole("textbox", { name: "Message Claude" });
+    await canvas.findByRole("textbox", { name: "Message" });
     // The full app intentionally hides workspace insights at phone widths.
     await waitFor(() => expect(canvas.queryByRole("complementary")).not.toBeInTheDocument());
     await expect(

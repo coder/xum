@@ -11,13 +11,30 @@
  *                user opts into the project bundle)
  * - workspace -> <sessionDir>/memory/ of the task-tree OWNER (host-local, deleted
  *                with that workspace; sub-agents share their parent's store)
+ * - session   -> <sessionDir>/session-memory/ of the ACTING workspace (host-local,
+ *                deleted with that workspace; never shared with the parent or
+ *                sub-agents). Token budget keeps its rollover checkpoint here, and
+ *                agents see the scope only in token-budget mode.
  */
+
+import { EVALUATION_MAX_QUESTIONS } from "@/constants/evaluation";
 
 /** Virtual root prefix all memory paths are expressed under. */
 export const MEMORY_VIRTUAL_ROOT = "/memories";
 
-export const MEMORY_SCOPES = ["global", "project", "workspace"] as const;
+export const MEMORY_SCOPES = ["global", "project", "workspace", "session"] as const;
 export type MemoryScope = (typeof MEMORY_SCOPES)[number];
+
+/** Scopes every memory caller may use; the session scope needs an explicit opt-in. */
+export const SHARED_MEMORY_SCOPES: readonly MemoryScope[] = MEMORY_SCOPES.filter(
+  (scope) => scope !== "session"
+);
+
+/** Directory of the session scope inside the acting workspace's session dir. */
+export const SESSION_MEMORY_DIR_NAME = "session-memory";
+
+/** Virtual directory of the session scope, where token-budget agents keep their checkpoint. */
+export const SESSION_MEMORY_VIRTUAL_DIR = `${MEMORY_VIRTUAL_ROOT}/session/`;
 
 export type MemoryAccessLevel = "read" | "readwrite";
 
@@ -26,7 +43,9 @@ export type MemoryAccessLevel = "read" | "readwrite";
  * - Exec-like (editing-capable): all scopes read-write.
  * - Plan-like: all scopes read-write; project memory is host-local and never
  *   mutates the checkout.
- * - Explore/read-only: all scopes read-only (view only).
+ * - Explore/read-only: all scopes read-only (view only), except session.
+ * Every agent may write its own session scope: it is a private checkpoint that no
+ * other agent reads, and read-only agents need it to survive a context rollover.
  */
 export type MemoryScopeAccess = Record<MemoryScope, MemoryAccessLevel>;
 
@@ -62,14 +81,17 @@ export const MEMORY_VIEW_MAX_DEPTH = 2;
  * prompt-cache-stable bytes.
  */
 /** Maximum bytes of a single preloaded memory file (longer files are truncated). */
-export const MEMORY_HOT_SET_MAX_ITEM_BYTES = 16 * 1024;
-/** Maximum total bytes of selected hot-memory file content. */
-export const MEMORY_HOT_SET_MAX_TOTAL_BYTES = 48 * 1024;
-/** Maximum tokens consumed by the rendered <hot_memories> block. */
-export const MEMORY_HOT_SET_MAX_TOTAL_TOKENS = 12_000;
+export const MEMORY_HOT_SET_MAX_ITEM_BYTES = 4 * 1024;
+/**
+ * Maximum UTF-8 bytes of the rendered <hot_memories> block. Bytes, not a
+ * stand-in tokenizer count: the densest current tokenizers (Opus/Haiku 5.5)
+ * bill ~2.5 bytes per token on memory text (44,805 chars billed 17,802
+ * tokens), so 10 KiB stays within ~4k billed tokens on every supported model.
+ */
+export const MEMORY_HOT_SET_MAX_BLOCK_BYTES = 10 * 1024;
 /** Maximum number of memory files preloaded into the system prompt. */
 export const MEMORY_HOT_SET_MAX_ITEMS = 8;
-/** Maximum ranked candidates to read/tokenize while filling the hot set. */
+/** Maximum ranked candidates to read while filling the hot set. */
 export const MEMORY_HOT_SET_MAX_SELECTION_ATTEMPTS = 64;
 /** Half-life of the recency decay applied to access counts when ranking auto-hot files. */
 export const MEMORY_HOT_SET_DECAY_HALF_LIFE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -103,7 +125,12 @@ export const MEMORY_INTUITION_RECOGNITION_THRESHOLD = 0.7;
 export const MEMORY_INTUITION_CANDIDATE_THRESHOLD = 0.3;
 export const MEMORY_INTUITION_MAX_STEPS = 6;
 export const MEMORY_INTUITION_TIMEOUT_MS = 20_000;
-export const MEMORY_INTUITION_MAX_OUTPUT_TOKENS = 2048;
+/**
+ * Per-step output cap. MEMORY_INTUITION_MAX_RESULTS full-length excerpts already
+ * need about 2k tokens, and thinking (always on for Opus 5.5 and Fable/Mythos)
+ * counts toward the same cap. MEMORY_INTUITION_TIMEOUT_MS still bounds wall time.
+ */
+export const MEMORY_INTUITION_MAX_OUTPUT_TOKENS = 4096;
 export const MEMORY_INTUITION_MAX_USES_PER_TURN = 3;
 export const MEMORY_INTUITION_MAX_RESULTS = 6;
 export const MEMORY_INTUITION_MAX_EXCERPT_CHARS = 1200;
@@ -112,3 +139,9 @@ export const MEMORY_INTUITION_MAX_READ_BYTES = 256 * 1024;
 export const MEMORY_INTUITION_MAX_INDEX_ENTRIES = 200;
 export const MEMORY_INTUITION_MAX_INDEX_BYTES = 32 * 1024;
 export const MEMORY_INTUITION_INDEX_AUTH_CONCURRENCY = 4;
+/**
+ * Evaluation recall: index entries judged by stage 1 and memory chunks scored by
+ * stage 2. Each stage is one request, so both follow the shared per-request cap.
+ */
+export const MEMORY_INTUITION_EVAL_MAX_ENTRIES = EVALUATION_MAX_QUESTIONS;
+export const MEMORY_INTUITION_EVAL_MAX_CHUNKS = EVALUATION_MAX_QUESTIONS;

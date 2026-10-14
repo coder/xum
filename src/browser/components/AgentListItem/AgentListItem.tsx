@@ -1,7 +1,6 @@
 import { useTitleEdit } from "@/browser/contexts/WorkspaceTitleEditContext";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { useContextMenuPosition } from "@/browser/hooks/useContextMenuPosition";
-import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import {
   getWorkspaceStreamingStatusPhase,
   useWorkspaceStreamingStatusPhase,
@@ -18,7 +17,6 @@ import {
 } from "@/browser/utils/ui/workspaceFiltering";
 import assert from "@/common/utils/assert";
 import { cn } from "@/common/lib/utils";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { isDevcontainerRuntime } from "@/common/types/runtime";
 import { getWorkspaceLastReadKey } from "@/common/constants/storage";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -53,18 +51,15 @@ import {
   Trash,
   EllipsisVertical,
   Loader2,
-  Sparkles,
   PenLine,
   MessageCircleQuestionMark,
-  Eye,
-  EyeOff,
   ChevronDown,
   HeartPulse,
   Pin,
   Workflow,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
+import { isWorkspacePinned } from "@/common/utils/pin";
 import { WorkspaceStatusIndicator } from "../WorkspaceStatusIndicator/WorkspaceStatusIndicator";
 import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 import { WorkspaceTerminalIcon } from "../icons/WorkspaceTerminalIcon/WorkspaceTerminalIcon";
@@ -72,13 +67,17 @@ import {
   WORKSPACE_DRAG_TYPE,
   type WorkspaceDragItem,
 } from "../WorkspaceSectionDropZone/WorkspaceSectionDropZone";
-import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import type { PinnedDropEdge } from "@/browser/utils/ui/pinnedReorder";
-import { WorkspaceHeartbeatModal } from "../WorkspaceHeartbeatModal";
 import { WorkspaceActionsMenuContent } from "../WorkspaceActionsMenuContent/WorkspaceActionsMenuContent";
-import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
-import { useAPI } from "@/browser/contexts/API";
+import { requestGenerateWorkspaceTitle } from "../WorkspaceActionsMenuContent/workspaceActionHandlers";
+import { LazyFeature } from "../LazyFeature/LazyFeature";
 import { useWorkspaceActionsOptional } from "@/browser/contexts/WorkspaceContext";
+
+// The sidebar is on every page's first load, so its rows load these dialogs only when one opens
+// (#6202, the first-load split of #6206). The open state stays outside the lazy module.
+const RowSettingsDialog = React.lazy(async () => ({
+  default: (await import("./RowSettingsDialog")).RowSettingsDialog,
+}));
 
 export interface WorkspaceSelection {
   projectPath: string;
@@ -408,7 +407,7 @@ function QuickArchiveButton(props: {
             <ArchiveIcon className="h-3 w-3 shrink-0" />
           </button>
         </TooltipTrigger>
-        <TooltipContent side="right">Archive chat</TooltipContent>
+        <TooltipContent side="right">Archive workspace</TooltipContent>
       </Tooltip>
     </div>
   );
@@ -500,10 +499,12 @@ function DraftAgentListItemInner(props: DraftAgentListItemProps) {
           {props.projectBadgeName != null && (
             // The badge width cap can truncate hierarchical "Parent / Sub"
             // names, so the shared tooltip keeps the full label reachable.
+            // text-foreground: the badge tint is the project color at 12.5% alpha, so full-strength
+            // text reaches WCAG AA on every color in every theme; text-secondary did not (#5978).
             <TooltipIfPresent tooltip={props.projectBadgeName}>
               <span
                 data-testid={`workspace-project-badge-draft-${draft.draftId}`}
-                className="text-secondary max-w-20 shrink-0 truncate rounded border px-1.5 py-0.5 text-[10px] leading-none font-medium"
+                className="text-foreground max-w-20 shrink-0 truncate rounded border px-1.5 py-0.5 text-[10px] leading-none font-medium"
                 style={
                   props.projectBadgeColor != null
                     ? {
@@ -609,7 +610,6 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
 
   // Destructure metadata for convenience
   const { id: workspaceId, namedWorkspacePath } = metadata;
-  const workspaceHeartbeatsEnabled = useExperimentValue(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
   const isInitializing = metadata.isInitializing === true;
   const isRemoving = isRemovingProp === true || metadata.isRemoving === true;
   const isDisabled = isRemoving || isArchiving === true;
@@ -618,17 +618,10 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
   const runtimeStatus = useRuntimeStatus(workspaceId);
 
   // Get title edit context — manages inline title editing state across the sidebar
-  const {
-    editingWorkspaceId,
-    requestEdit,
-    confirmEdit,
-    cancelEdit,
-    generatingTitleWorkspaceIds,
-    wrapGenerateTitle,
-  } = useTitleEdit();
+  const { editingWorkspaceId, requestEdit, confirmEdit, cancelEdit, generatingTitleWorkspaceIds } =
+    useTitleEdit();
   const isGeneratingTitle = generatingTitleWorkspaceIds.has(workspaceId);
   const isPendingAutoTitle = metadata.pendingAutoTitle === true;
-  const { api } = useAPI();
   // Route pin toggles through the context wrapper: it applies an optimistic
   // pinnedAt (instant reorder on click) and works with mock API clients.
   // Optional because stories/tests render this row without WorkspaceProvider.
@@ -658,8 +651,9 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
       : workspaceTitle;
   const isEditing = editingWorkspaceId === workspaceId;
   const isPinned = isWorkspacePinned(metadata);
-  const isPinnable = isWorkspacePinnable(metadata);
-  const [heartbeatModalOpen, setHeartbeatModalOpen] = useState(false);
+  // The menu's settings dialogs mount on demand, so a row with its menu closed runs none of
+  // their hooks or subscriptions (#6202).
+  const [openModal, setOpenModal] = useState<"heartbeat" | "mcp" | "messaging" | null>(null);
   const overflowMenuButtonRef = useRef<HTMLButtonElement | null>(null);
   const overflowMenuFrameRef = useRef<number | null>(null);
 
@@ -866,7 +860,6 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
     !showCompletedChildrenIndicator &&
     !showsVisibleStatusDot;
   const shouldShowHeartbeatFallback =
-    workspaceHeartbeatsEnabled &&
     metadata.heartbeat?.enabled === true &&
     !isSubAgentRow &&
     !showCompletedChildrenIndicator &&
@@ -1217,107 +1210,55 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                   align={ctxMenu.position ? "start" : "end"}
                   side={ctxMenu.position ? "right" : "bottom"}
                   sideOffset={ctxMenu.position ? 0 : 6}
-                  className="bg-surface-primary w-[250px] min-w-0! p-1"
+                  // Size to the widest row ("Archive workspace" + its shortcut overflowed a
+                  // fixed 250px), but never wider than the viewport, like the menu bar's menu.
+                  className="bg-surface-primary w-max max-w-[calc(100vw-1rem)] min-w-[250px]! p-1"
                   onClick={(event: React.MouseEvent<HTMLDivElement>) => {
                     event.stopPropagation();
                   }}
                 >
                   <WorkspaceActionsMenuContent
-                    onEditTitle={startEditing}
-                    onConfigureHeartbeat={
-                      workspaceHeartbeatsEnabled ? () => setHeartbeatModalOpen(true) : null
-                    }
-                    onStopRuntime={
-                      isRuntimeRunning && onStopRuntime
-                        ? () =>
-                            void onStopRuntime(
-                              workspaceId,
-                              overflowMenuButtonRef.current ?? undefined
-                            )
-                        : null
-                    }
-                    // Scratch chats have no repo and the backend rejects
-                    // forking them, so hide the action instead of offering a
-                    // menu item that can only fail.
-                    onForkChat={
-                      hasWorkspaceRepository(metadata)
-                        ? (anchorEl) => {
-                            void onForkWorkspace(workspaceId, anchorEl);
-                          }
-                        : null
-                    }
-                    onTogglePinned={
-                      isPinnable && setWorkspacePinned
+                    state={{
+                      surface: "sidebar",
+                      workspace: metadata,
+                      showsSubAgent: isSubAgentRow,
+                      isRuntimeRunning,
+                      canMarkUnread: !isSelected && !isUnread,
+                      canToggleSubAgents: canToggleCompletedChildren,
+                    }}
+                    actions={{
+                      editTitle: startEditing,
+                      generateTitle: () => requestGenerateWorkspaceTitle(workspaceId),
+                      configureMcp: () => setOpenModal("mcp"),
+                      configureHeartbeat: () => setOpenModal("heartbeat"),
+                      configureMessaging: () => setOpenModal("messaging"),
+                      togglePinned: setWorkspacePinned
                         ? () => {
                             // Fire-and-forget: optimistic reorder happens synchronously
                             // inside setWorkspacePinned; errors are logged there.
                             void setWorkspacePinned(workspaceId, !isPinned);
                           }
-                        : null
-                    }
-                    isPinned={isPinned}
-                    onArchiveChat={
-                      isSubAgentRow
-                        ? null
-                        : (anchorEl) => {
-                            void onArchiveWorkspace(workspaceId, anchorEl);
-                          }
-                    }
-                    onCloseMenu={() => ctxMenu.close()}
-                  />
-                  {!isSelected && !isUnread && (
-                    <PositionedMenuItem
-                      icon={<EyeOff className="h-4 w-4 shrink-0" strokeWidth={1.8} />}
-                      label="Mark unread"
-                      onClick={() => {
-                        // Reset the read marker to epoch so existing activity is treated as unseen.
-                        updatePersistedState(getWorkspaceLastReadKey(workspaceId), 0);
-                        ctxMenu.close();
-                      }}
-                    />
-                  )}
-                  {canToggleCompletedChildren && (
-                    <PositionedMenuItem
-                      icon={
-                        isCompletedChildrenExpanded ? (
-                          <EyeOff className="h-4 w-4 shrink-0" strokeWidth={1.8} />
-                        ) : (
-                          <Eye className="h-4 w-4 shrink-0" strokeWidth={1.8} />
-                        )
-                      }
-                      label={isCompletedChildrenExpanded ? "Hide sub-agents" : "Show sub-agents"}
-                      onClick={() => {
-                        toggleCompletedChildren();
-                        ctxMenu.close();
-                      }}
-                    />
-                  )}
-                  <PositionedMenuItem
-                    icon={<Sparkles />}
-                    label="Generate new title"
-                    shortcut={formatKeybind(KEYBINDS.GENERATE_WORKSPACE_TITLE)}
-                    onClick={() => {
-                      ctxMenu.close();
-                      wrapGenerateTitle(workspaceId, () => {
-                        if (!api) {
-                          return Promise.resolve({
-                            success: false,
-                            error: "Not connected to server",
-                          });
-                        }
-                        return api.workspace.regenerateTitle({ workspaceId });
-                      });
+                        : undefined,
+                      // Reset the read marker to epoch so existing activity is treated as unseen.
+                      markUnread: () =>
+                        updatePersistedState(getWorkspaceLastReadKey(workspaceId), 0),
+                      toggleSubAgents: toggleCompletedChildren,
+                      fork: (anchorEl) => void onForkWorkspace(workspaceId, anchorEl),
+                      stopRuntime: onStopRuntime
+                        ? () =>
+                            void onStopRuntime(
+                              workspaceId,
+                              overflowMenuButtonRef.current ?? undefined
+                            )
+                        : undefined,
+                      archive: (anchorEl) => void onArchiveWorkspace(workspaceId, anchorEl),
                     }}
+                    isPinned={isPinned}
+                    subAgentsExpanded={isCompletedChildrenExpanded}
+                    onCloseMenu={() => ctxMenu.close()}
                   />
                 </PopoverContent>
               </Popover>
-              {workspaceHeartbeatsEnabled && (
-                <WorkspaceHeartbeatModal
-                  workspaceId={workspaceId}
-                  open={heartbeatModalOpen}
-                  onOpenChange={setHeartbeatModalOpen}
-                />
-              )}
             </ActionButtonWrapper>
           )
         )}
@@ -1359,10 +1300,11 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                 {props.projectBadgeName != null && (
                   // The badge width cap can truncate hierarchical "Parent / Sub"
                   // names, so the shared tooltip keeps the full label reachable.
+                  // text-foreground reaches WCAG AA on every project tint (#5978), as on drafts.
                   <TooltipIfPresent tooltip={props.projectBadgeName}>
                     <span
                       data-testid={`workspace-project-badge-${workspaceId}`}
-                      className="text-secondary max-w-20 shrink-0 truncate rounded border px-1.5 py-0.5 text-[10px] leading-none font-medium"
+                      className="text-foreground max-w-20 shrink-0 truncate rounded border px-1.5 py-0.5 text-[10px] leading-none font-medium"
                       style={
                         props.projectBadgeColor != null
                           ? {
@@ -1467,6 +1409,20 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
           )}
         </div>
       </div>
+      {/* Outside the clickable row: React bubbles a portal's events through its React parents,
+          and a click on a dialog's backdrop (outside [role="dialog"]) would select the row. */}
+      {openModal !== null && (
+        // No loading fallback: the small chunk arrives in a moment, and an empty slot keeps the
+        // sidebar rows still. A failed load shows LazyFeature's Reload message under the row.
+        <LazyFeature name="Workspace settings">
+          <RowSettingsDialog
+            kind={openModal}
+            workspace={metadata}
+            projectPath={projectPath}
+            onClose={() => setOpenModal(null)}
+          />
+        </LazyFeature>
+      )}
       {titleError && isEditing && (
         <div className="bg-error-bg border-error text-error absolute top-full right-8 left-8 z-10 mt-1 rounded-sm border px-2 py-1.5 text-xs">
           {titleError}

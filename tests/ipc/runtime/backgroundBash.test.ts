@@ -76,7 +76,7 @@ function collectTaskAwaitOutputs(events: WorkspaceChatMessage[]): string {
     if (!("toolName" in event) || event.toolName !== "task_await") continue;
 
     const results = (
-      event as { result?: { results?: Array<{ output?: string; reportMarkdown?: string }> } }
+      event as { result?: { results?: { output?: string; reportMarkdown?: string }[] } }
     ).result?.results;
 
     if (!Array.isArray(results)) continue;
@@ -104,7 +104,7 @@ function extractStoppedTaskIds(events: WorkspaceChatMessage[]): string[] {
     const results = (
       event as {
         result?: {
-          results?: Array<{ status?: string; stoppedTaskIds?: string[] }>;
+          results?: { status?: string; stoppedTaskIds?: string[] }[];
         };
       }
     ).result?.results;
@@ -293,7 +293,7 @@ describeIntegration("Background Bash Execution", () => {
           const startEvents = await sendMessageAndWait(
             env,
             workspaceId,
-            `Use the bash tool with args: { script: "echo \"${marker}\" && sleep 1", timeout_secs: 30, run_in_background: true, display_name: "bg-output" }. Do not spawn a sub-agent.`,
+            `Use the bash tool with args: { script: "echo "${marker}" && sleep 1", timeout_secs: 30, run_in_background: true, display_name: "bg-output" }. Do not spawn a sub-agent.`,
             HAIKU_MODEL,
             BASH_ONLY,
             30000

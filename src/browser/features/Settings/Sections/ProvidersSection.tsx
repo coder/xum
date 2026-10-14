@@ -8,7 +8,6 @@ import {
   EyeOff,
   GripVertical,
   Loader2,
-  ShieldCheck,
   X,
 } from "lucide-react";
 import {
@@ -30,12 +29,12 @@ import { CSS } from "@dnd-kit/utilities";
 import { createEditKeyHandler } from "@/browser/utils/ui/keybinds";
 import { getBrowserBackendBaseUrl } from "@/browser/utils/backendBaseUrl";
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
-import { usePolicy } from "@/browser/contexts/PolicyContext";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
-import { getAllowedProvidersForUi } from "@/browser/utils/policyUi";
 import { ProviderIcon, ProviderWithIcon } from "@/browser/components/ProviderIcon/ProviderIcon";
 import { getStoredAuthToken } from "@/browser/components/AuthTokenModal/AuthTokenModal";
-import { useAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
+import { DocsLink } from "@/browser/components/DocsLink/DocsLink";
+import { ConfigSwitchSetting, type SettingsApi } from "./ConfigSwitchSetting";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import {
@@ -64,8 +63,9 @@ import {
   TooltipTrigger,
 } from "@/browser/components/Tooltip/Tooltip";
 import { getErrorMessage } from "@/common/utils/errors";
+import { CoderCanonicalRoutes } from "./CoderCanonicalRoutes";
 import { TypeSafeProviderCard } from "./TypeSafeProviderCard";
-import { useExperimentValue } from "@/browser/contexts/ExperimentsContext";
+import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
 
@@ -73,6 +73,7 @@ import { repairLocalModelPreferencesForRemovedProvider } from "@/browser/utils/m
 import {
   CUSTOM_PROVIDER_TYPES,
   formatProviderDisplayName,
+  getProviderIdsForUi,
   isBuiltInProvider,
   isCustomProviderConfig,
   isCustomProviderType,
@@ -83,7 +84,11 @@ import {
 import type { AddCustomProviderInput, ProviderConfigInfo } from "@/common/orpc/types";
 import type { ServiceTier, XAIServiceTier } from "@/common/config/schemas/providersConfig";
 import type { Result } from "@/common/types/result";
-import { CODER_OAUTH_SERVER_START_PATH } from "@/common/constants/coderOAuth";
+import {
+  CODER_CANONICAL_ROUTE_ORIGINS,
+  CODER_OAUTH_SERVER_START_PATH,
+  resolveCoderCanonicalRouteInstance,
+} from "@/common/constants/coderOAuth";
 
 type MuxGatewayLoginStatus = "idle" | "starting" | "waiting" | "success" | "error";
 type CodexOauthFlowStatus = "idle" | "starting" | "waiting" | "error";
@@ -101,7 +106,13 @@ type OpenAIServiceTier = ServiceTier;
 type OpenAIServiceTierSelectValue = typeof OPENAI_SERVICE_TIER_UNSET | OpenAIServiceTier;
 
 function isOpenAIServiceTier(value: string): value is OpenAIServiceTier {
-  return value === "auto" || value === "default" || value === "flex" || value === "priority";
+  return (
+    value === "auto" ||
+    value === "default" ||
+    value === "flex" ||
+    value === "priority" ||
+    value === "ultrafast"
+  );
 }
 
 function isXAIServiceTier(value: string): value is XAIServiceTier {
@@ -323,6 +334,7 @@ const PROVIDER_KEY_URLS: Partial<Record<ProviderName, string>> = {
   openai: "https://platform.openai.com/api-keys",
   google: "https://aistudio.google.com/app/apikey",
   xai: "https://console.x.ai/team/default/api-keys",
+  meta: "https://dev.meta.ai/docs",
   deepseek: "https://platform.deepseek.com/api_keys",
   moonshotai: "https://platform.moonshot.ai/console/api-keys",
   zai: "https://z.ai/manage-apikey/apikey-list",
@@ -454,11 +466,12 @@ function GatewayRoutePriorityList({
   );
 }
 
-export function ProvidersSection() {
-  const policyState = usePolicy();
-  const effectivePolicy =
-    policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
+const loadBashAiProxyEnabled = async (api: SettingsApi) =>
+  (await api.config.getConfig()).bashAiProxyEnabled;
+const saveBashAiProxyEnabled = (api: SettingsApi, enabled: boolean) =>
+  api.config.updateBashAiProxyEnabled({ enabled });
 
+export function ProvidersSection() {
   const {
     providersExpandedProvider,
     setProvidersExpandedProvider,
@@ -466,13 +479,14 @@ export function ProvidersSection() {
     setProvidersStartCoderLogin,
   } = useSettings();
 
-  const { api } = useAPI();
+  // The live client only, for gates, disabled states and writes: offline (the last client kept
+  // while reconnecting) a write would fail, and the optimistic value would look saved until the
+  // reconnect puts the server value back. Loads go through useProvidersConfig.
+  const liveApi = useLiveAPI();
+  const api = liveApi;
   const { config, loading: configLoading, refresh, updateOptimistically } = useProvidersConfig();
-  const { workspaceMetadata, selectedWorkspace, refreshWorkspaceMetadata } = useWorkspaceContext();
-  const visibleProviders = useMemo(
-    () => getAllowedProvidersForUi(effectivePolicy, config),
-    [effectivePolicy, config]
-  );
+  const { refreshWorkspaceMetadata } = useWorkspaceContext();
+  const visibleProviders = useMemo(() => getProviderIdsForUi(config), [config]);
   const {
     data: muxGatewayAccountStatus,
     error: muxGatewayAccountError,
@@ -487,17 +501,15 @@ export function ProvidersSection() {
   // cannot leave the dropdown claiming disabled while requests still send store=true.
   // xAI frontier Grok always uses store=false in the request path (no settings surface).
   const [openaiStoreSaving, setOpenAIStoreSaving] = useState(false);
+  const [openaiCyberSaving, setOpenAICyberSaving] = useState(false);
 
   const routing = useRouting();
 
   // The TypeSafe evaluation key is only useful to the auto-model-routing experiment. A legacy
   // custom chat provider under the same id is listed with the custom providers instead.
   const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
-  const typesafeAccess = effectivePolicy?.providerAccess;
   const showTypeSafeProvider =
-    autoModelRoutingEnabled &&
-    (typesafeAccess == null || typesafeAccess.some((p) => p.id === TYPESAFE_PROVIDER_KEY)) &&
-    !isCustomProviderInfo(config?.[TYPESAFE_PROVIDER_KEY]);
+    autoModelRoutingEnabled && !isCustomProviderInfo(config?.[TYPESAFE_PROVIDER_KEY]);
 
   const providerGroups = useMemo(() => {
     const groups: Record<"direct" | "gateway" | "local" | "custom", string[]> = {
@@ -506,8 +518,6 @@ export function ProvidersSection() {
       local: [],
       custom: [],
     };
-    const policyAllowedSet = new Set(visibleProviders);
-
     for (const provider of visibleProviders) {
       if (!isBuiltInProvider(provider) || isCustomProviderInfo(config?.[provider])) {
         continue;
@@ -517,7 +527,7 @@ export function ProvidersSection() {
     }
 
     for (const [provider, providerInfo] of Object.entries(config ?? {})) {
-      if (!policyAllowedSet.has(provider) || !isCustomProviderInfo(providerInfo)) {
+      if (!isCustomProviderInfo(providerInfo)) {
         continue;
       }
 
@@ -590,7 +600,7 @@ export function ProvidersSection() {
   const startCodexOauthBrowserConnect = async () => {
     const attempt = ++codexOauthAttemptRef.current;
 
-    if (!api) {
+    if (!liveApi) {
       setCodexOauthStatus("error");
       setCodexOauthError("Xum API not connected.");
       return;
@@ -598,10 +608,10 @@ export function ProvidersSection() {
 
     // Best-effort: cancel any in-progress flow before starting a new one.
     if (codexOauthDesktopFlowId) {
-      void api.codexOauth.cancelDesktopFlow({ flowId: codexOauthDesktopFlowId });
+      void liveApi.codexOauth.cancelDesktopFlow({ flowId: codexOauthDesktopFlowId });
     }
     if (codexOauthDeviceFlow) {
-      void api.codexOauth.cancelDeviceFlow({ flowId: codexOauthDeviceFlow.flowId });
+      void liveApi.codexOauth.cancelDeviceFlow({ flowId: codexOauthDeviceFlow.flowId });
     }
 
     setCodexOauthError(null);
@@ -613,11 +623,11 @@ export function ProvidersSection() {
       setCodexOauthStatus("starting");
 
       if (!isDesktop) {
-        const startResult = await api.codexOauth.startDeviceFlow();
+        const startResult = await liveApi.codexOauth.startDeviceFlow();
 
         if (attempt !== codexOauthAttemptRef.current) {
           if (startResult.success) {
-            void api.codexOauth.cancelDeviceFlow({ flowId: startResult.data.flowId });
+            void liveApi.codexOauth.cancelDeviceFlow({ flowId: startResult.data.flowId });
           }
           return;
         }
@@ -637,7 +647,7 @@ export function ProvidersSection() {
 
         // Keep device-code login manual per user request: we only open the
         // verification page from the explicit "Copy & Open" action.
-        const waitResult = await api.codexOauth.waitForDeviceFlow({
+        const waitResult = await liveApi.codexOauth.waitForDeviceFlow({
           flowId: startResult.data.flowId,
         });
 
@@ -658,11 +668,11 @@ export function ProvidersSection() {
         return;
       }
 
-      const startResult = await api.codexOauth.startDesktopFlow();
+      const startResult = await liveApi.codexOauth.startDesktopFlow();
 
       if (attempt !== codexOauthAttemptRef.current) {
         if (startResult.success) {
-          void api.codexOauth.cancelDesktopFlow({ flowId: startResult.data.flowId });
+          void liveApi.codexOauth.cancelDesktopFlow({ flowId: startResult.data.flowId });
         }
         return;
       }
@@ -678,7 +688,7 @@ export function ProvidersSection() {
       setCodexOauthAuthorizeUrl(authorizeUrl);
       setCodexOauthStatus("waiting");
 
-      const waitResult = await api.codexOauth.waitForDesktopFlow({ flowId });
+      const waitResult = await liveApi.codexOauth.waitForDesktopFlow({ flowId });
 
       if (attempt !== codexOauthAttemptRef.current) {
         return;
@@ -706,7 +716,7 @@ export function ProvidersSection() {
   const startCodexOauthDeviceConnect = async () => {
     const attempt = ++codexOauthAttemptRef.current;
 
-    if (!api) {
+    if (!liveApi) {
       setCodexOauthStatus("error");
       setCodexOauthError("Xum API not connected.");
       return;
@@ -714,10 +724,10 @@ export function ProvidersSection() {
 
     // Best-effort: cancel any in-progress flow before starting a new one.
     if (codexOauthDesktopFlowId) {
-      void api.codexOauth.cancelDesktopFlow({ flowId: codexOauthDesktopFlowId });
+      void liveApi.codexOauth.cancelDesktopFlow({ flowId: codexOauthDesktopFlowId });
     }
     if (codexOauthDeviceFlow) {
-      void api.codexOauth.cancelDeviceFlow({ flowId: codexOauthDeviceFlow.flowId });
+      void liveApi.codexOauth.cancelDeviceFlow({ flowId: codexOauthDeviceFlow.flowId });
     }
 
     setCodexOauthError(null);
@@ -727,11 +737,11 @@ export function ProvidersSection() {
 
     try {
       setCodexOauthStatus("starting");
-      const startResult = await api.codexOauth.startDeviceFlow();
+      const startResult = await liveApi.codexOauth.startDeviceFlow();
 
       if (attempt !== codexOauthAttemptRef.current) {
         if (startResult.success) {
-          void api.codexOauth.cancelDeviceFlow({ flowId: startResult.data.flowId });
+          void liveApi.codexOauth.cancelDeviceFlow({ flowId: startResult.data.flowId });
         }
         return;
       }
@@ -749,7 +759,7 @@ export function ProvidersSection() {
       });
       setCodexOauthStatus("waiting");
 
-      const waitResult = await api.codexOauth.waitForDeviceFlow({
+      const waitResult = await liveApi.codexOauth.waitForDeviceFlow({
         flowId: startResult.data.flowId,
       });
 
@@ -780,7 +790,7 @@ export function ProvidersSection() {
   const disconnectCodexOauth = async () => {
     const attempt = ++codexOauthAttemptRef.current;
 
-    if (!api) {
+    if (!liveApi) {
       setCodexOauthStatus("error");
       setCodexOauthError("Xum API not connected.");
       return;
@@ -788,10 +798,10 @@ export function ProvidersSection() {
 
     // Best-effort: cancel any in-progress flow.
     if (codexOauthDesktopFlowId) {
-      void api.codexOauth.cancelDesktopFlow({ flowId: codexOauthDesktopFlowId });
+      void liveApi.codexOauth.cancelDesktopFlow({ flowId: codexOauthDesktopFlowId });
     }
     if (codexOauthDeviceFlow) {
-      void api.codexOauth.cancelDeviceFlow({ flowId: codexOauthDeviceFlow.flowId });
+      void liveApi.codexOauth.cancelDeviceFlow({ flowId: codexOauthDeviceFlow.flowId });
     }
 
     setCodexOauthError(null);
@@ -801,7 +811,7 @@ export function ProvidersSection() {
 
     try {
       setCodexOauthStatus("starting");
-      const result = await api.codexOauth.disconnect();
+      const result = await liveApi.codexOauth.disconnect();
 
       if (attempt !== codexOauthAttemptRef.current) {
         return;
@@ -898,18 +908,18 @@ export function ProvidersSection() {
       setMuxGatewayAuthorizeUrl(null);
 
       if (isDesktop) {
-        if (!api) {
+        if (!liveApi) {
           setMuxGatewayLoginStatus("error");
           setMuxGatewayLoginError("Xum API not connected.");
           return;
         }
 
         setMuxGatewayLoginStatus("starting");
-        const startResult = await api.muxGatewayOauth.startDesktopFlow();
+        const startResult = await liveApi.muxGatewayOauth.startDesktopFlow();
 
         if (attempt !== muxGatewayLoginAttemptRef.current) {
           if (startResult.success) {
-            void api.muxGatewayOauth.cancelDesktopFlow({ flowId: startResult.data.flowId });
+            void liveApi.muxGatewayOauth.cancelDesktopFlow({ flowId: startResult.data.flowId });
           }
           return;
         }
@@ -929,7 +939,7 @@ export function ProvidersSection() {
           return;
         }
 
-        const waitResult = await api.muxGatewayOauth.waitForDesktopFlow({ flowId });
+        const waitResult = await liveApi.muxGatewayOauth.waitForDesktopFlow({ flowId });
 
         if (attempt !== muxGatewayLoginAttemptRef.current) {
           return;
@@ -1117,7 +1127,7 @@ export function ProvidersSection() {
       setCopilotLoginError(null);
       setCopilotLoginStatus("starting");
 
-      if (!api) {
+      if (!liveApi) {
         setCopilotLoginStatus("error");
         setCopilotLoginError("API not connected.");
         return;
@@ -1125,16 +1135,16 @@ export function ProvidersSection() {
 
       // Best-effort: cancel any in-progress flow before starting a new one.
       if (copilotFlowIdRef.current) {
-        void api.copilotOauth.cancelDeviceFlow({ flowId: copilotFlowIdRef.current });
+        void liveApi.copilotOauth.cancelDeviceFlow({ flowId: copilotFlowIdRef.current });
         copilotFlowIdRef.current = null;
         setCopilotFlowId(null);
       }
 
-      const startResult = await api.copilotOauth.startDeviceFlow();
+      const startResult = await liveApi.copilotOauth.startDeviceFlow();
 
       if (attempt !== copilotLoginAttemptRef.current) {
         if (startResult.success) {
-          void api.copilotOauth.cancelDeviceFlow({ flowId: startResult.data.flowId });
+          void liveApi.copilotOauth.cancelDeviceFlow({ flowId: startResult.data.flowId });
         }
         return;
       }
@@ -1156,7 +1166,7 @@ export function ProvidersSection() {
       // verification page from the explicit "Copy & Open" action.
 
       // Wait for flow to complete (polling happens on backend)
-      const waitResult = await api.copilotOauth.waitForDeviceFlow({ flowId });
+      const waitResult = await liveApi.copilotOauth.waitForDeviceFlow({ flowId });
 
       if (attempt !== copilotLoginAttemptRef.current) return;
 
@@ -1191,8 +1201,8 @@ export function ProvidersSection() {
   const coderDeploymentUrl = config?.coder?.deploymentUrl ?? "";
   const coderLoginInProgress = coderLoginStatus === "starting" || coderLoginStatus === "waiting";
 
-  // Manual AI Gateway model re-discovery: newly configured providers/models
-  // on the deployment otherwise only appear after a re-login.
+  // Explicit AI Gateway catalog load: login discovers provider instances only,
+  // because a full catalog can hold thousands of IDs and gates routing.
   const [coderModelRefreshState, setCoderModelRefreshState] = useState<
     { kind: "idle" } | { kind: "refreshing" } | { kind: "error"; message: string }
   >({ kind: "idle" });
@@ -1251,7 +1261,7 @@ export function ProvidersSection() {
   const startCoderLogin = useCallback(async () => {
     const attempt = ++coderLoginAttemptRef.current;
 
-    if (!api) {
+    if (!liveApi) {
       setCoderLoginStatus("error");
       setCoderLoginError("Xum API not connected.");
       return;
@@ -1261,7 +1271,7 @@ export function ProvidersSection() {
     // old flow cannot commit a login after this replacement attempt begins.
     if (coderFlowId) {
       try {
-        await api.coderOauth.cancelDesktopFlow({ flowId: coderFlowId });
+        await liveApi.coderOauth.cancelDesktopFlow({ flowId: coderFlowId });
       } catch {
         // Proceed anyway; the backend's last-committed-login-wins semantics
         // still bound the damage if the old flow survives.
@@ -1292,7 +1302,7 @@ export function ProvidersSection() {
       // Desktop: loopback listener on this machine. Browser (local or remote
       // server): the redirect lands on the Xum server's own callback route.
       const startResult = isDesktop
-        ? await api.coderOauth.startDesktopFlow({ deploymentUrl, flowId })
+        ? await liveApi.coderOauth.startDesktopFlow({ deploymentUrl, flowId })
         : await startCoderServerFlow(backendBaseUrl, deploymentUrl, flowId);
 
       if (attempt !== coderLoginAttemptRef.current) {
@@ -1311,7 +1321,7 @@ export function ProvidersSection() {
       setCoderAuthorizeUrl(authorizeUrl);
       setCoderLoginStatus("waiting");
 
-      const waitResult = await api.coderOauth.waitForDesktopFlow({ flowId });
+      const waitResult = await liveApi.coderOauth.waitForDesktopFlow({ flowId });
 
       if (attempt !== coderLoginAttemptRef.current) return;
 
@@ -1330,17 +1340,21 @@ export function ProvidersSection() {
       setCoderLoginStatus("error");
       setCoderLoginError(getErrorMessage(err));
     }
-  }, [api, coderFlowId, coderDeploymentUrl, refresh, isDesktop, backendBaseUrl]);
+  }, [liveApi, coderFlowId, coderDeploymentUrl, refresh, isDesktop, backendBaseUrl]);
 
   const disconnectCoderOauth = async () => {
     const attempt = ++coderLoginAttemptRef.current;
-    if (!api) return;
+    if (!liveApi) {
+      setCoderLoginStatus("error");
+      setCoderLoginError("Xum API not connected.");
+      return;
+    }
 
     // Awaited: an unsettled flow could otherwise commit a login AFTER the
     // disconnect below cleared credentials, silently reconnecting the account.
     if (coderFlowId) {
       try {
-        await api.coderOauth.cancelDesktopFlow({ flowId: coderFlowId });
+        await liveApi.coderOauth.cancelDesktopFlow({ flowId: coderFlowId });
       } catch {
         // Proceed with disconnect regardless.
       }
@@ -1352,7 +1366,7 @@ export function ProvidersSection() {
     setCoderLoginStatus("idle");
 
     try {
-      const result = await api.coderOauth.disconnect();
+      const result = await liveApi.coderOauth.disconnect();
 
       if (attempt !== coderLoginAttemptRef.current) return;
 
@@ -1555,7 +1569,7 @@ export function ProvidersSection() {
           return; // Stale: a newer selection owns the shared state.
         }
         // The format decides the request wire protocol, so an optimistic
-        // value that failed to persist (policy denial, lock/write failure)
+        // value that failed to persist (lock/write failure)
         // must not keep advertising an adapter the backend never adopted.
         // Restore the previous value first: refresh() is best-effort and
         // keeps the optimistic state when the refetch itself fails.
@@ -1739,7 +1753,7 @@ export function ProvidersSection() {
   const handleAddCustomProvider = useCallback(async () => {
     setCustomProviderSubmitAttempted(true);
 
-    if (!api) {
+    if (!liveApi) {
       setCustomProviderSubmitError("Xum API not connected.");
       return;
     }
@@ -1775,7 +1789,7 @@ export function ProvidersSection() {
     setCustomProviderSubmitError(null);
     setCustomProviderNotice(null);
     try {
-      const result = await api.providers.addCustomProvider(input);
+      const result = await liveApi.providers.addCustomProvider(input);
       if (!result.success) {
         setCustomProviderSubmitError(result.error.message);
         return;
@@ -1802,7 +1816,7 @@ export function ProvidersSection() {
     setExpandedProvider(provider);
     setProvidersExpandedProvider(provider);
   }, [
-    api,
+    liveApi,
     customProviderApiKey,
     customProviderApiKeyFile,
     customProviderBaseUrl,
@@ -1825,7 +1839,7 @@ export function ProvidersSection() {
 
   const handleRemoveCustomProvider = useCallback(
     async (provider: string) => {
-      if (!api) {
+      if (!liveApi) {
         setCustomProviderRemoveErrors((prev) => ({
           ...prev,
           [provider]: "Xum API not connected.",
@@ -1844,16 +1858,11 @@ export function ProvidersSection() {
       // would recreate the entry (setConfig creates absent sections).
       providerTypeWritesRef.current.delete(provider);
 
-      const workspaceIds = new Set(workspaceMetadata.keys());
-      if (selectedWorkspace) {
-        workspaceIds.add(selectedWorkspace.workspaceId);
-      }
-
       clearCustomProviderRemoveError(provider);
       setCustomProviderNotice(null);
       setCustomProviderRemoving(provider);
       try {
-        const result = await api.providers.removeCustomProvider({ provider });
+        const result = await liveApi.providers.removeCustomProvider({ provider });
         if (!result.success && result.error.code !== "config_repair_failed") {
           setCustomProviderRemoveErrors((prev) => ({
             ...prev,
@@ -1883,7 +1892,7 @@ export function ProvidersSection() {
             // Browser cache repair still needs to run after backend removal succeeds.
           }
         } finally {
-          repairLocalModelPreferencesForRemovedProvider(provider, workspaceIds);
+          repairLocalModelPreferencesForRemovedProvider(provider);
         }
 
         setExpandedProvider((prev) => (prev === provider ? null : prev));
@@ -1901,13 +1910,11 @@ export function ProvidersSection() {
       }
     },
     [
-      api,
+      liveApi,
       clearCustomProviderRemoveError,
       refresh,
       refreshWorkspaceMetadata,
-      selectedWorkspace,
       setProvidersExpandedProvider,
-      workspaceMetadata,
     ]
   );
 
@@ -1917,13 +1924,6 @@ export function ProvidersSection() {
         Configure API keys and endpoints for AI providers. Keys are stored in{" "}
         <code className="text-accent">~/.xum/providers.jsonc</code>
       </p>
-
-      {policyState.status.state === "enforced" && (
-        <div className="border-border-medium bg-background-secondary/50 text-muted flex items-center gap-2 rounded-md border px-3 py-2 text-xs">
-          <ShieldCheck className="h-4 w-4" aria-hidden />
-          <span>Your settings are controlled by a policy.</span>
-        </div>
-      )}
 
       {customProviderNotice && (
         <div className="border-warning/40 bg-warning/10 text-warning rounded-md border px-3 py-2 text-xs">
@@ -1968,8 +1968,16 @@ export function ProvidersSection() {
                 ? PROVIDER_KEY_URLS[provider]
                 : undefined;
               const apiKeySource = providerInfo?.apiKeySource;
+              // Coder's targets follow canonicalRoutes (a mapped Google, a stale
+              // mapping), not the static default route table.
               const gatewayRouteTargets =
-                providerDefinition?.kind === "gateway" ? (providerDefinition.routes ?? []) : [];
+                provider === "coder"
+                  ? CODER_CANONICAL_ROUTE_ORIGINS.filter(
+                      (origin) => resolveCoderCanonicalRouteInstance(origin, providerInfo) != null
+                    )
+                  : providerDefinition?.kind === "gateway"
+                    ? (providerDefinition.routes ?? [])
+                    : [];
               const isCustom = isCustomProviderInfo(providerInfo);
               const statusDotColor = !enabled
                 ? "bg-warning"
@@ -2506,8 +2514,10 @@ export function ProvidersSection() {
                                   }
                                 >
                                   {coderModelRefreshState.kind === "refreshing"
-                                    ? "Refreshing..."
-                                    : "Refresh models"}
+                                    ? "Loading..."
+                                    : config?.coder?.discoveredModels == null
+                                      ? "Load model catalog"
+                                      : `Refresh model catalog (${config.coder.discoveredModels.length})`}
                                 </Button>
                               )}
 
@@ -2540,10 +2550,12 @@ export function ProvidersSection() {
 
                             {coderModelRefreshState.kind === "error" && (
                               <p className="text-destructive text-xs">
-                                Model refresh failed: {coderModelRefreshState.message}
+                                Model catalog refresh failed: {coderModelRefreshState.message}
                               </p>
                             )}
                           </div>
+
+                          {coderOauthIsConnected && <CoderCanonicalRoutes />}
                         </div>
                       )}
 
@@ -2790,7 +2802,7 @@ export function ProvidersSection() {
                                   </label>
                                   <p className="text-muted text-xs">
                                     Applies to models that support both ChatGPT OAuth and API keys
-                                    (e.g. <code className="text-accent">gpt-5.5</code>).
+                                    (e.g. <code className="text-accent">gpt-6.1-sol</code>).
                                   </p>
                                 </div>
 
@@ -2811,7 +2823,9 @@ export function ProvidersSection() {
                                     });
                                   }}
                                   size="sm"
-                                  className="h-9"
+                                  // Two nowrap labels are wider than a phone screen: let the
+                                  // items wrap onto a second row instead of overflowing.
+                                  className="h-auto min-h-9 max-w-full flex-wrap"
                                   disabled={!api || !codexOauthDefaultAuthIsEditable}
                                 >
                                   <ToggleGroupItem
@@ -2920,6 +2934,7 @@ export function ProvidersSection() {
                                     <SelectItem value="default">default</SelectItem>
                                     <SelectItem value="flex">flex</SelectItem>
                                     <SelectItem value="priority">priority</SelectItem>
+                                    <SelectItem value="ultrafast">ultrafast</SelectItem>
                                   </SelectContent>
                                 </Select>
                               </div>
@@ -3012,6 +3027,52 @@ export function ProvidersSection() {
                                   </div>
                                 </div>
                               )}
+
+                              <div className="border-border-light border-t pt-3">
+                                <div className="flex items-center justify-between gap-3">
+                                  <div>
+                                    <label className="text-foreground block text-xs font-medium">
+                                      Enable cyber model
+                                    </label>
+                                    <span className="text-muted text-xs">
+                                      Shows a Cyber option in the thinking menu for supported
+                                      models. Requires OpenAI Daybreak approval for this API
+                                      key&apos;s project.
+                                    </span>
+                                  </div>
+                                  <Switch
+                                    checked={config?.openai?.cyberModelEnabled === true}
+                                    disabled={!api || openaiCyberSaving}
+                                    onCheckedChange={(nextChecked) => {
+                                      if (!api || openaiCyberSaving) return;
+
+                                      // Persist before publishing: a rejected write must not show
+                                      // Cyber off while the backend still sends access_programs.
+                                      setOpenAICyberSaving(true);
+                                      void api.providers
+                                        .setProviderConfig({
+                                          provider: "openai",
+                                          keyPath: ["cyberModelEnabled"],
+                                          value: nextChecked ? true : "",
+                                        })
+                                        .then(
+                                          (result) => {
+                                            if (result.success) {
+                                              updateOptimistically("openai", {
+                                                cyberModelEnabled: nextChecked ? true : undefined,
+                                              });
+                                              return undefined;
+                                            }
+                                            return refresh();
+                                          },
+                                          () => refresh()
+                                        )
+                                        .finally(() => setOpenAICyberSaving(false));
+                                    }}
+                                    aria-label="Enable cyber model"
+                                  />
+                                </div>
+                              </div>
 
                               <div className="border-border-light border-t pt-3">
                                 <div className="mb-1 flex items-center gap-1">
@@ -3216,7 +3277,10 @@ export function ProvidersSection() {
             {section.key === "custom" && (
               <div className="border-border-medium bg-background-secondary/50 space-y-3 rounded-md border px-3 py-3">
                 <div className="flex items-center justify-between gap-3">
-                  <div>
+                  {/* min-w-0 + shrink-0 on the button: at phone width the description must
+                      wrap; otherwise the flex row shrinks the nowrap button and its label
+                      overflows the button. */}
+                  <div className="min-w-0">
                     <div className="text-foreground text-xs font-medium">Add a custom provider</div>
                     <div className="text-muted text-xs">
                       Add providers that use OpenAI Chat Completions, OpenAI Responses, or Anthropic
@@ -3226,6 +3290,7 @@ export function ProvidersSection() {
                   <Button
                     size="sm"
                     variant="secondary"
+                    className="shrink-0"
                     onClick={() => {
                       setCustomProviderFormOpen((prev) => {
                         const next = !prev;
@@ -3393,6 +3458,32 @@ export function ProvidersSection() {
           />
         </div>
       )}
+
+      <div className="space-y-2 pt-2">
+        <div className="text-muted text-xs font-medium tracking-wide uppercase">Bash commands</div>
+        <ConfigSwitchSetting
+          title="Count AI calls from bash commands"
+          description={
+            <>
+              Bash commands get ANTHROPIC_BASE_URL, OPENAI_BASE_URL and a workspace key that point
+              at Xum (on SSH and Coder hosts through a reverse SSH forward). Xum forwards their
+              calls with the API keys above and adds the tokens and cost to the workspace&apos;s
+              Cost tab and to Analytics. Agent CLIs that you start in bash, such as Claude Code,
+              then bill these API keys instead of your subscription. When off, new commands get no
+              proxy variables, and Xum refuses calls from commands that still hold a workspace key.
+              Xum skips a provider when secrets set its variables or Xum has no key for it, and
+              skips all providers in untrusted projects, with XUM_DISABLE_PROJECT_AUTOMATION=1, and
+              in Docker and devcontainer workspaces. Xum logs each skip.{" "}
+              <DocsLink path="/config/providers#ai-calls-from-bash-commands">docs</DocsLink>
+            </>
+          }
+          ariaLabel="Count AI calls from bash commands"
+          placeholderChecked={false}
+          load={loadBashAiProxyEnabled}
+          save={saveBashAiProxyEnabled}
+          saveErrorMessage="Failed to update the bash AI proxy setting"
+        />
+      </div>
 
       {config && !hasAnyConfiguredProvider && (
         <div className="border-warning/40 bg-warning/10 text-warning rounded-md border px-3 py-2 text-xs">

@@ -48,6 +48,11 @@ export const SKILL_DYNAMIC_OUTPUT_CAP_BYTES = 16 * 1024;
  */
 const SKILL_DYNAMIC_DIRECTIVE_RE = /^\s*!`([^`]+)`\s*$/;
 
+/** Whether `line` is a whole-line !`command` directive (it would run when injection is on). */
+export function isSkillDynamicDirectiveLine(line: string): boolean {
+  return SKILL_DYNAMIC_DIRECTIVE_RE.test(line);
+}
+
 export interface SkillDynamicExecResult {
   stdout: string;
   stderr: string;
@@ -55,25 +60,6 @@ export interface SkillDynamicExecResult {
 }
 
 export type SkillDynamicExecute = (command: string) => Promise<SkillDynamicExecResult>;
-
-/**
- * Extract the commands of whole-line !`command` directives, in body order,
- * capped at MAX_SKILL_DYNAMIC_COMMANDS (matching what injectSkillDynamicContext
- * would execute). Pure — exported for tests and potential UI reuse (e.g.
- * previewing which commands a skill would run).
- */
-export function extractSkillDynamicCommands(body: string): string[] {
-  assert(typeof body === "string", "extractSkillDynamicCommands requires a string body");
-
-  const commands: string[] = [];
-  for (const line of body.split("\n")) {
-    const match = SKILL_DYNAMIC_DIRECTIVE_RE.exec(line);
-    if (!match) continue;
-    if (commands.length >= MAX_SKILL_DYNAMIC_COMMANDS) break;
-    commands.push(match[1]);
-  }
-  return commands;
-}
 
 /** Longest backtick run + 1 (min 3) so the fence can never collide with output content. */
 function computeFence(content: string): string {

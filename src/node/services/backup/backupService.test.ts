@@ -740,8 +740,8 @@ describe("BackupService", () => {
     const service = createService(tempDir, {
       config,
     });
-    // saveConfig logs and swallows write errors, so a full disk looks exactly like this:
-    // the edit callback runs, editConfig resolves, and the stored config never changes.
+    // A write that did not land (another writer replaced it): the edit callback runs,
+    // editConfig resolves, and the stored config never changes.
     spyOn(config, "editConfig").mockImplementation((edit) => {
       edit(config.loadConfigOrDefault());
       return Promise.resolve();

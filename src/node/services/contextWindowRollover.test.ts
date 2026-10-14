@@ -7,6 +7,7 @@ import {
   estimateLastStepToolResults,
   hasRolloverEligibleMessages,
   hasUnconsumedNewContextRequest,
+  resolveContextWindowIds,
   type ContextWindowRollover,
 } from "./contextWindowRollover";
 
@@ -25,36 +26,37 @@ describe("context budget warnings", () => {
     contextTokens: 90_000,
     maxTokens: 128_000,
     budgetTokens: 119_808,
-    memoryWritable: true,
     sessionHistoryAvailable: true,
   };
 
-  test("publishes a visible advisory with optional backward-compatible handoff metadata", () => {
-    const warning = createContextBudgetWarning(options);
-    expect(warning.role).toBe("user");
-    expect(warning.metadata).toMatchObject({ synthetic: true, uiVisible: true });
-    expect(warning.metadata?.muxMetadata).not.toHaveProperty("handoff");
-    expect(warning.metadata?.muxMetadata).not.toHaveProperty("handoffTokens");
+  test("publishes a visible advisory with backward-compatible stage metadata", () => {
     const handoff = createContextBudgetWarning({
       ...options,
       handoff: true,
       handoffTokens: 89_600,
     });
+    expect(handoff.role).toBe("user");
+    expect(handoff.metadata).toMatchObject({ synthetic: true, uiVisible: true });
     expect(handoff.metadata?.muxMetadata).toMatchObject({
       handoff: true,
       handoffTokens: 89_600,
       budgetTokens: 119_808,
     });
     expect(handoff.metadata?.muxMetadata).not.toHaveProperty("final");
-    expect(handoff.parts).not.toEqual(warning.parts);
+    const final = createContextBudgetWarning({ ...options, final: true });
+    expect(final.metadata?.muxMetadata).toMatchObject({ final: true });
+    expect(final.metadata?.muxMetadata).not.toHaveProperty("handoff");
+    expect(final.parts).not.toEqual(handoff.parts);
   });
 
   test("rejects contradictory stages and budgets outside the known limit", () => {
     expect(() => createContextBudgetWarning({ ...options, final: true, handoff: true })).toThrow();
-    expect(() => createContextBudgetWarning({ ...options, budgetTokens: 128_001 })).toThrow();
-    expect(() => createContextBudgetWarning({ ...options, handoffTokens: 128_001 })).toThrow();
+    expect(() => createContextBudgetWarning(options)).toThrow();
+    const handoff = { ...options, handoff: true };
+    expect(() => createContextBudgetWarning({ ...handoff, budgetTokens: 128_001 })).toThrow();
+    expect(() => createContextBudgetWarning({ ...handoff, handoffTokens: 128_001 })).toThrow();
     expect(() =>
-      createContextBudgetWarning({ ...options, final: true, memoryWritable: false })
+      createContextBudgetWarning({ ...options, final: true, sessionHistoryAvailable: false })
     ).toThrow();
   });
 
@@ -65,12 +67,10 @@ describe("context budget warnings", () => {
     // Policy permission cannot prove advertising: unknown and permitted use conditional guidance.
     expect(parts({ newContextAvailable: "unknown" })).toEqual(parts({ newContextAvailable: true }));
     expect(parts({ newContextAvailable: false })).not.toEqual(parts({ newContextAvailable: true }));
-    expect(parts({ memoryWritable: false })).not.toEqual(parts({ memoryWritable: true }));
     // History recovery takes precedence over a tool that would discard the active window.
     expect(parts({ sessionHistoryAvailable: false, newContextAvailable: true })).toEqual(
       parts({ sessionHistoryAvailable: false, newContextAvailable: false })
     );
-    expect(parts({ final: true, handoff: false })).not.toEqual(parts({ handoff: false }));
   });
 });
 
@@ -85,24 +85,23 @@ describe("context window rollover recovery", () => {
       contextTokens: 80_000,
       maxTokens: 128_000,
       budgetTokens: 96_000,
-      memoryWritable: true,
       sessionHistoryAvailable: true,
+      handoff: true,
     });
     expect(hasRolloverEligibleMessages([old, boundary, leadIn, warning])).toBe(false);
-    const finalFlush = createContextBudgetWarning({
+    const finalPrompt = createContextBudgetWarning({
       contextTokens: 110_000,
       maxTokens: 128_000,
       budgetTokens: 96_000,
-      memoryWritable: true,
       sessionHistoryAvailable: true,
       final: true,
     });
     expect(warning.metadata?.muxMetadata).not.toHaveProperty("final");
-    expect(finalFlush.metadata?.muxMetadata).toMatchObject({
+    expect(finalPrompt.metadata?.muxMetadata).toMatchObject({
       type: "context-budget-warning",
       final: true,
     });
-    expect(hasRolloverEligibleMessages([old, boundary, leadIn, warning, finalFlush])).toBe(false);
+    expect(hasRolloverEligibleMessages([old, boundary, leadIn, warning, finalPrompt])).toBe(false);
     expect(
       hasRolloverEligibleMessages([
         old,
@@ -127,8 +126,8 @@ describe("context window rollover recovery", () => {
           contextTokens: 80_000,
           maxTokens: 128_000,
           budgetTokens: 96_000,
-          memoryWritable: true,
           sessionHistoryAvailable: true,
+          handoff: true,
         }),
       ])
     ).toBe("w:12");
@@ -161,6 +160,24 @@ describe("context window rollover recovery", () => {
     expect(
       leadIn.parts.some((part) => part.type === "text" && part.text.includes(previousWindowId))
     ).toBe(true);
+  });
+
+  test("window IDs name a previous window only after a token-budget rollover", () => {
+    expect(resolveContextWindowIds([])).toEqual({ currentWindowId: "w:0" });
+    const [boundary] = createRolloverPrefix({ ...rollover, previousWindowId: "w:3" });
+    boundary.metadata!.historySequence = 12;
+    expect(resolveContextWindowIds([boundary])).toEqual({
+      currentWindowId: "w:12",
+      previousWindowId: "w:3",
+    });
+    // A manual reset is a privacy floor, not a continuation of the window before it.
+    const [manualReset] = createRolloverPrefix(rollover);
+    delete manualReset.metadata!.muxMetadata;
+    manualReset.metadata!.historySequence = 20;
+    expect(resolveContextWindowIds([boundary, manualReset])).toEqual({ currentWindowId: "w:20" });
+    // A boundary without a persisted sequence has no canonical ID to show.
+    const [unsequenced] = createRolloverPrefix(rollover);
+    expect(resolveContextWindowIds([unsequenced])).toBeUndefined();
   });
 
   test.each(

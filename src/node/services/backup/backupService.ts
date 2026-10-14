@@ -78,7 +78,13 @@ export interface BackupPayloadStore {
     repositoryRoot: string;
     managedPath: string;
     contents: BackupContents;
-  }): Promise<{ redactions: string[]; secretFiles: string[]; secretApproval: string }>;
+  }): Promise<{
+    redactions: string[];
+    secretFiles: string[];
+    secretApproval: string;
+    /** Artifact shelf files left out of the export, with the reason (M5c). */
+    shelfSkipped?: string[];
+  }>;
   previewRestore(options: {
     repositoryRoot: string;
     managedPath: string;
@@ -89,6 +95,8 @@ export interface BackupPayloadStore {
     commandApprovals: BackupCommandApproval[];
     projectImports: BackupProjectImport[];
     projectBundleSkipped: boolean;
+    /** Shelf files a restore would not write, with the reason (M5c). */
+    shelfSkipped?: string[];
   }>;
   validateRestore(options: {
     repositoryRoot: string;
@@ -118,6 +126,7 @@ export interface BackupPayloadStore {
     changedFiles: string[];
     localOnlyFiles: string[];
     projectBundleSkipped: boolean;
+    shelfSkipped?: string[];
     /** Matched memory actually written, per registered project, for change notification. */
     restoredProjectMemory: Array<{ projectPath: string; files: string[] }>;
   }>;
@@ -458,6 +467,7 @@ async function discardInactiveCache(cachePath: string): Promise<void> {
     await discardBackupCache(cachePath);
   } finally {
     cacheReapClaims.delete(cacheName);
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     releaseClaim!();
   }
 }
@@ -554,6 +564,8 @@ export class BackupService {
         commandApprovals: BackupCommandApproval[];
         projectImports: BackupProjectImport[];
         projectBundleSkipped: boolean;
+        /** Artifact shelf files left out of the push or the restore, with the reason. */
+        shelfSkipped: string[];
         pushError: string | null;
       },
       BackupOperationError
@@ -573,7 +585,7 @@ export class BackupService {
         // The push half fails on local state alone (an over-limit project list, an
         // unexportable path); that must not hide the restore half, which is the only
         // way to obtain the import approvals a cross-machine restore needs.
-        let exported: { redactions: string[] } | { pushError: string };
+        let exported: { redactions: string[]; shelfSkipped?: string[] } | { pushError: string };
         try {
           exported = await this.dependencies.payload.exportTo({
             repositoryRoot: repository.rootDir,
@@ -595,6 +607,10 @@ export class BackupService {
         commandApprovals: restorePreview.commandApprovals,
         projectImports: restorePreview.projectImports,
         projectBundleSkipped: restorePreview.projectBundleSkipped,
+        shelfSkipped: [
+          ...("pushError" in exported ? [] : (exported.shelfSkipped ?? [])),
+          ...(restorePreview.shelfSkipped ?? []),
+        ],
         pushError: "pushError" in exported ? exported.pushError : null,
       });
     });
@@ -628,6 +644,7 @@ export class BackupService {
         changed: boolean;
         credential: BackupCredentialKind;
         redactions: string[];
+        shelfSkipped: string[];
       },
       BackupOperationError
     >
@@ -663,6 +680,7 @@ export class BackupService {
       return Ok({
         ...pushed,
         redactions: exported.redactions,
+        shelfSkipped: exported.shelfSkipped ?? [],
       });
     });
   }
@@ -682,6 +700,7 @@ export class BackupService {
         localOnlyFiles: string[];
         projectImportResults: BackupProjectImportResult[];
         projectBundleSkipped: boolean;
+        shelfSkipped: string[];
         /**
          * Candidates the restore did not import because no approval was given — a restore
          * run without a preview, or with candidates left unchecked. Reported so a
@@ -799,6 +818,7 @@ export class BackupService {
               localOnlyFiles: restored.localOnlyFiles,
               projectImportResults,
               projectBundleSkipped: restored.projectBundleSkipped,
+              shelfSkipped: restored.shelfSkipped ?? [],
               unapprovedProjectImports: [
                 ...unapprovedProjectImports,
                 ...validated.projectImports.filter((candidate) =>
@@ -1409,10 +1429,10 @@ export class BackupService {
       throw new BackupServiceError("IO_ERROR", "Settings backup configuration was not saved");
     }
     const persisted = saved;
-    // saveConfig logs and swallows write failures by design, so a resolved editConfig does
-    // not prove the write landed; on a full disk this method would otherwise report saved
-    // settings, a recorded push, or a recorded restore that config.json never received.
-    // loadConfigOrDefault reads the file fresh, so a lost write reads back as the old value.
+    // editConfig rejects when the save fails (#4444); this re-read is belt and braces against a
+    // write another writer replaced, so this method never reports saved settings, a recorded push,
+    // or a recorded restore that config.json does not hold. loadConfigOrDefault reads the file
+    // fresh, so a lost write reads back as the old value.
     const stored = this.config.loadConfigOrDefault().settingsBackup;
     if (
       stored?.repoUrl !== persisted.repoUrl ||

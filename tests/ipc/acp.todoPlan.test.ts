@@ -140,43 +140,6 @@ function getUserTextChunks(sessionUpdates: SessionNotification[]): string[] {
   });
 }
 
-function makeAdvisorOutput(toolCallId: string, text: string): WorkspaceChatMessage {
-  return {
-    type: "advisor-output",
-    workspaceId: "workspace-1",
-    toolCallId,
-    text,
-    timestamp: 3,
-  } as WorkspaceChatMessage;
-}
-
-function getToolUpdateContent(sessionUpdates: SessionNotification[]): string[] {
-  return sessionUpdates.flatMap((notification) => {
-    if (notification.update.sessionUpdate !== "tool_call_update") {
-      return [];
-    }
-
-    const content = notification.update.content ?? [];
-    return content.flatMap((block) => {
-      if (block.type !== "content" || block.content.type !== "text") {
-        return [];
-      }
-      return [block.content.text];
-    });
-  });
-}
-
-describe("ACP advisor output translation", () => {
-  it("forwards live advisor output as tool updates", async () => {
-    const { translator, sessionUpdates } = createHarness();
-
-    await forwardEvents(translator, [makeAdvisorOutput("advisor-call-1", "partial advice")]);
-
-    expect(getUpdateKinds(sessionUpdates)).toEqual(["tool_call_update"]);
-    expect(getToolUpdateContent(sessionUpdates)).toEqual(["partial advice"]);
-  });
-});
-
 describe("ACP todo_write plan translation", () => {
   it("emits ACP plan updates from todo_write tool input", async () => {
     const { translator, sessionUpdates } = createHarness();
@@ -195,7 +158,7 @@ describe("ACP todo_write plan translation", () => {
 
     const planUpdate = sessionUpdates[2]?.update;
     expect(planUpdate).toBeDefined();
-    if (planUpdate == null || planUpdate.sessionUpdate !== "plan") {
+    if (planUpdate?.sessionUpdate !== "plan") {
       throw new Error("Expected third session update to be a plan update");
     }
 
@@ -221,7 +184,7 @@ describe("ACP todo_write plan translation", () => {
       (notification) => notification.update.sessionUpdate === "plan"
     )?.update;
     expect(planUpdate).toBeDefined();
-    if (planUpdate == null || planUpdate.sessionUpdate !== "plan") {
+    if (planUpdate?.sessionUpdate !== "plan") {
       throw new Error("Expected todo_write with JSON string input to emit a plan update");
     }
 
@@ -440,7 +403,7 @@ describe("ACP tool call terminal state translation", () => {
     expect(getUpdateKinds(sessionUpdates)).toEqual(["tool_call", "tool_call_update"]);
 
     const failureUpdate = sessionUpdates[1]?.update;
-    if (failureUpdate == null || failureUpdate.sessionUpdate !== "tool_call_update") {
+    if (failureUpdate?.sessionUpdate !== "tool_call_update") {
       throw new Error("Expected terminal tool_call_update after message-scoped stream error");
     }
 
@@ -477,10 +440,10 @@ describe("ACP tool call terminal state translation", () => {
     const session1Failure = session1Notifications[1]?.update;
     const session2Failure = session2Notifications[1]?.update;
 
-    if (session1Failure == null || session1Failure.sessionUpdate !== "tool_call_update") {
+    if (session1Failure?.sessionUpdate !== "tool_call_update") {
       throw new Error("Expected session-1 to receive a terminal tool_call_update");
     }
-    if (session2Failure == null || session2Failure.sessionUpdate !== "tool_call_update") {
+    if (session2Failure?.sessionUpdate !== "tool_call_update") {
       throw new Error("Expected session-2 to receive a terminal tool_call_update");
     }
 
@@ -556,7 +519,7 @@ describe("ACP tool call terminal state translation", () => {
 
     const completionUpdate = sessionUpdates[1]?.update;
     expect(completionUpdate).toBeDefined();
-    if (completionUpdate == null || completionUpdate.sessionUpdate !== "tool_call_update") {
+    if (completionUpdate?.sessionUpdate !== "tool_call_update") {
       throw new Error("Expected replayed pending tool call to emit terminal tool_call_update");
     }
 
@@ -565,7 +528,7 @@ describe("ACP tool call terminal state translation", () => {
 
     const completionContent = completionUpdate.content?.[0];
     expect(completionContent).toBeDefined();
-    if (completionContent == null || completionContent.type !== "content") {
+    if (completionContent?.type !== "content") {
       throw new Error("Expected replayed tool completion to include text output content");
     }
 

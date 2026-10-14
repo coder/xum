@@ -20,6 +20,7 @@ import { log } from "@/node/services/log";
 import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 
 import { buildTaskGroupLaunches } from "@/common/utils/tools/taskGroups";
+import { pageTaskReportForResult } from "@/common/utils/tools/pageToolText";
 import {
   emitChatEventBestEffort,
   parseToolResult,
@@ -73,12 +74,26 @@ function resolveRuntimeMode(config: ToolConfiguration): RuntimeMode | undefined 
 }
 
 /**
+ * Whether to offer `isolation: "none"`: only where TaskService honors it — runtimes that can share
+ * the parent checkout, in single-project workspaces. Multi-project workspaces run through a runtime
+ * that derives every checkout from the task's own name, so TaskService refuses it there (#4411).
+ */
+function supportsSharedIsolation(config: ToolConfiguration): boolean {
+  return (
+    runtimeModeSupportsSharedTaskWorkspace(resolveRuntimeMode(config)) &&
+    (config.projects?.length ?? 0) <= 1
+  );
+}
+
+/**
  * Build dynamic task tool description with runtime-specific workspace visibility
  * guidance and the currently available sub-agents.
  */
 function buildTaskDescription(config: ToolConfiguration): string {
   const runtimeMode = resolveRuntimeMode(config);
-  const baseDescription = buildTaskToolDescription(runtimeMode);
+  const baseDescription = buildTaskToolDescription(runtimeMode, {
+    sharedIsolation: supportsSharedIsolation(config),
+  });
   const subagents = config.availableSubagents?.filter((a) => a.subagentRunnable) ?? [];
 
   if (subagents.length === 0) {
@@ -116,8 +131,11 @@ function buildParentRuntimeAiSettings(
  * thinking indices stay deferred as a `ParsedThinkingInput` so they resolve
  * against the sub-agent's chosen model in `resolveTaskAISettings`. Throws a
  * descriptive error on invalid input so the model can correct the call.
+ *
+ * Exported so the models_list tests can prove every advertised model/alias/level
+ * is accepted by exactly this parser.
  */
-function parseTaskAiOverrides(args: { model?: string | null; thinking?: string | null }): {
+export function parseTaskAiOverrides(args: { model?: string | null; thinking?: string | null }): {
   modelString?: string;
   thinkingLevel?: ParsedThinkingInput;
 } {
@@ -218,9 +236,14 @@ function toAggregatePendingStatus(
 }
 
 function serializeCompletedReport(report: CompletedTaskInfo) {
+  // A foreground result holds the first page of a long report, like task_await does; the
+  // note names the task_await call that reads the next page.
+  const page = pageTaskReportForResult(report.taskId, report.reportMarkdown, undefined);
   return {
     taskId: report.taskId,
-    reportMarkdown: report.reportMarkdown,
+    reportMarkdown: page.text,
+    nextCharOffset: page.nextCharOffset,
+    note: page.note,
     structuredOutput: report.structuredOutput,
     title: report.title,
     agentId: report.agentId,
@@ -228,6 +251,21 @@ function serializeCompletedReport(report: CompletedTaskInfo) {
     modelString: report.modelString,
     thinkingLevel: report.thinkingLevel,
     desktopOwnerWorkspaceId: report.desktopOwnerWorkspaceId,
+  };
+}
+
+/** The first page of a foreground workspace turn's report, plus any supersede note. */
+function pageWorkspaceTurnReport(
+  taskId: string,
+  reportMarkdown: string,
+  supersedeNote: string | undefined
+): { reportMarkdown: string; nextCharOffset?: number; note?: string } {
+  const page = pageTaskReportForResult(taskId, reportMarkdown, undefined);
+  const notes = [supersedeNote, page.note].filter((note) => note != null);
+  return {
+    reportMarkdown: page.text,
+    nextCharOffset: page.nextCharOffset,
+    ...(notes.length > 0 ? { note: notes.join(" ") } : {}),
   };
 }
 
@@ -311,6 +349,8 @@ function buildCompletedTaskResult(params: {
       status: "completed",
       taskId: report.taskId,
       reportMarkdown: report.reportMarkdown,
+      nextCharOffset: report.nextCharOffset,
+      note: report.note,
       structuredOutput: report.structuredOutput,
       title: report.title,
       agentId: report.agentId,
@@ -368,12 +408,11 @@ function normalizePendingTaskStatuses(params: {
 }
 
 export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
-  // Only advertise the `isolation` parameter on runtimes where sharing the parent checkout is
-  // supported. On local runtimes the field is omitted from the schema entirely, so it never
+  // Only advertise the `isolation` parameter where sharing the parent checkout is supported (see
+  // supportsSharedIsolation). Elsewhere the field is omitted from the schema entirely, so it never
   // enters LLM context.
-  const runtimeMode = resolveRuntimeMode(config);
   const inputSchema = buildTaskToolAgentArgsSchema({
-    includeIsolation: runtimeModeSupportsSharedTaskWorkspace(runtimeMode),
+    includeIsolation: supportsSharedIsolation(config),
   });
   const taskTool = tool({
     description: buildTaskDescription(config),
@@ -435,7 +474,6 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
           title,
           // Agent mode for the launched turn (e.g. "plan"); createWorkspaceTurn defaults to exec.
           ...(agentId != null ? { agentId } : {}),
-          experiments: config.experiments,
           ...(aiOverrides.modelString != null ? { modelString: aiOverrides.modelString } : {}),
           ...(aiOverrides.thinkingLevel != null
             ? { thinkingLevel: aiOverrides.thinkingLevel }
@@ -496,11 +534,14 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
               taskId: created.data.taskId,
               workspaceId: report.workspaceId ?? created.data.workspaceId,
               handleKind: "workspace_turn" as const,
-              reportMarkdown: report.reportMarkdown,
               title: report.title,
               messageId: report.messageId,
               finalMessageRef: report.finalMessageRef,
-              ...(completedSupersedeNote != null ? { note: completedSupersedeNote } : {}),
+              ...pageWorkspaceTurnReport(
+                created.data.taskId,
+                report.reportMarkdown,
+                completedSupersedeNote
+              ),
             },
             "task"
           );
@@ -576,7 +617,6 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
           agentType: requestedAgentId,
           prompt: launch.prompt,
           title,
-          experiments: config.experiments,
           ...(aiOverrides.modelString != null ? { modelString: aiOverrides.modelString } : {}),
           ...(aiOverrides.thinkingLevel != null
             ? { thinkingLevel: aiOverrides.thinkingLevel }

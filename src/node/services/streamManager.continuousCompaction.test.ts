@@ -13,12 +13,16 @@ import { historyWriteLockPath, removeSessionDirUnderMemoryLocks } from "./worksp
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { readFile, writeFile } from "node:fs/promises";
 import assert from "@/common/utils/assert";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import {
   ContinuousCompactionJournalSchema,
   type ContinuousCompactionJournal,
 } from "@/common/orpc/schemas/continuousCompaction";
-import { StreamManager } from "./streamManager";
+import { countToolReferences } from "@/common/utils/tools/toolCatalog";
+import type { StreamManager, TurnEngineEvent, TurnExecutionOptions } from "./streamManager";
+import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
+import { prepareStepForTests, type PreparedStepForTests } from "./streamManager.suite.testHarness";
+import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { createTestHistoryService } from "./testHistoryService";
 import {
   exactJson,
@@ -103,53 +107,21 @@ function journalFixture(): ContinuousCompactionJournal {
   };
 }
 
-interface Tracker {
-  workspaceId: string;
-  pendingPrefixSwap?: ContinuousPrefixSwap;
-  consumedPrefixSwap?: ContinuousPrefixSwap;
-  prefixSwapInvalidated?: boolean;
-  latestMessages?: ai.ModelMessage[];
-}
-type Prepare = NonNullable<Parameters<typeof ai.streamText>[0]["prepareStep"]>;
+type StreamTextOptions = Parameters<typeof ai.streamText>[0];
 
-function prepareHarness(
-  manager: StreamManager,
-  tracker: Tracker,
-  requestOptions: Record<string, unknown> = {}
-) {
-  const spy = spyOn(ai, "streamText").mockReturnValue({} as ReturnType<typeof ai.streamText>);
-  const create = Reflect.get(manager, "createStreamResult") as (
-    request: { model: ai.LanguageModel; messages: ai.ModelMessage[] },
-    controller: AbortController,
-    tracker: Tracker
-  ) => unknown;
-  const controller = new AbortController();
-  create.call(
-    manager,
-    { model, messages: originalMessages, ...requestOptions },
-    controller,
-    tracker
-  );
-  const prepare: Prepare | undefined = spy.mock.calls.at(-1)?.[0].prepareStep;
-  assert(prepare, "Expected prepareStep callback");
-  return {
-    controller,
-    run: (messages = originalMessages, stepNumber = 1) =>
-      Promise.resolve(
-        prepare({
-          messages,
-          stepNumber,
-          model,
-          steps: [],
-          initialMessages: originalMessages,
-          responseMessages: [],
-          instructions: undefined,
-          initialInstructions: undefined,
-          toolsContext: {},
-          runtimeContext: {},
-        })
-      ),
-  };
+/** Provider stream that stays open until the turn is aborted. */
+async function* hangUntilAborted(signal: AbortSignal | undefined) {
+  await new Promise<void>((resolve) => {
+    if (signal?.aborted) resolve();
+    signal?.addEventListener("abort", () => resolve(), { once: true });
+  });
+  yield* [];
+}
+
+async function* answer() {
+  await Promise.resolve();
+  yield { type: "text-delta", text: "answer" };
+  yield { type: "finish", finishReason: "stop" };
 }
 
 describe("continuous prefix prepareStep and journal", () => {
@@ -161,7 +133,12 @@ describe("continuous prefix prepareStep and journal", () => {
       createMuxMessage("live", "assistant", "placeholder")
     );
   });
+  // Streams started by a test; stopped before the session dir is removed.
+  let liveTurns: Array<{ stop: () => Promise<unknown>; completion: Promise<unknown> }> = [];
   afterEach(async () => {
+    await Promise.all(liveTurns.map((turn) => turn.stop()));
+    await Promise.all(liveTurns.map((turn) => turn.completion));
+    liveTurns = [];
     mock.restore();
     await history.cleanup();
   });
@@ -170,11 +147,93 @@ describe("continuous prefix prepareStep and journal", () => {
     const journal = journalFixture();
     const prefix = await rebuildContinuousPrefix(journal, workspaceId);
     const swap: ContinuousPrefixSwap = { journal, prefix, firstTailToolCallId: "keep" };
-    const tracker: Tracker = { workspaceId, pendingPrefixSwap: swap };
-    const manager = new StreamManager(history.historyService);
-    const harness = prepareHarness(manager, tracker);
     const store = history.historyService.getContinuousCompactionJournal(workspaceId);
-    return { ...harness, store, tracker, swap, manager };
+    return { store, swap };
+  }
+
+  type Attempt = (
+    options: StreamTextOptions,
+    manager: StreamManager
+  ) => AsyncGenerator<unknown, void, unknown>;
+
+  /**
+   * Starts the live turn the journal names (message "live" on the parent model)
+   * through startStream. Each provider attempt gets the streamText options the
+   * engine built; the default attempt stays open so the test can play its steps.
+   */
+  async function startLiveTurn(
+    input: {
+      requestOptions?: Partial<TurnExecutionOptions>;
+      attempts?: Attempt[];
+      eventSink?: (event: TurnEngineEvent, manager: StreamManager) => void;
+    } = {}
+  ) {
+    const calls: StreamTextOptions[] = [];
+    const attempts = input.attempts ? [...input.attempts] : undefined;
+    const controller = new AbortController();
+    let latestMessages: ai.ModelMessage[] | undefined;
+    const manager: StreamManager = createStreamManagerForTests(history.historyService, {
+      eventSink: (event) => input.eventSink?.(event, manager),
+      streamText: fakeStreamText((options) => {
+        calls.push(options);
+        const attempt: Attempt | undefined = attempts
+          ? attempts.shift()
+          : () => hangUntilAborted(options.abortSignal);
+        assert(attempt, `Unexpected provider attempt ${calls.length}`);
+        return {
+          fullStream: attempt(options, manager),
+          usage: Promise.resolve(undefined),
+          totalUsage: Promise.resolve(undefined),
+          providerMetadata: Promise.resolve(undefined),
+          steps: Promise.resolve([]),
+        };
+      }),
+    });
+    const started = await manager.startStream({
+      workspaceId,
+      messageId: "live",
+      model,
+      modelString: "anthropic:claude-sonnet-4-5",
+      messages: originalMessages,
+      historySequence: 1,
+      system: "system",
+      runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
+      providedRuntimeTempDir: "",
+      abortSignal: controller.signal,
+      // The transcript each prepared step sends (the engine's latest step messages).
+      onStepMessages: (messages) => {
+        latestMessages = messages;
+      },
+      ...input.requestOptions,
+    });
+    assert(started.success, "Expected the live turn to start");
+    const completion = started.data.completion;
+    // The session settles an aborted turn through stopStream (a bare abort
+    // signal only halts the provider request).
+    const stop = () => manager.stopStream(workspaceId, { abortReason: "system" });
+    liveTurns.push({ stop, completion });
+    const first = calls[0];
+    assert(first, "Expected startStream to build the provider request");
+    return {
+      manager,
+      controller,
+      stop,
+      calls,
+      completion,
+      latestMessages: () => latestMessages,
+      swapState: () => manager.getPrefixSwapState(workspaceId),
+      run: (messages: ai.ModelMessage[] = originalMessages, stepNumber?: number) =>
+        prepareStepForTests(first, messages, stepNumber),
+    };
+  }
+
+  /** setup() plus a live turn whose swap was activated through setPrefixSwap. */
+  async function setupLiveSwap(requestOptions?: Partial<TurnExecutionOptions>) {
+    const fixture = await setup();
+    const turn = await startLiveTurn({ requestOptions });
+    expect(turn.manager.setPrefixSwap(workspaceId, fixture.swap)).toBe(true);
+    expect(turn.swapState()).toBe("pending");
+    return { ...fixture, ...turn };
   }
 
   it("cannot overwrite or clear a foreign journal revision in the same generation", async () => {
@@ -479,7 +538,7 @@ describe("continuous prefix prepareStep and journal", () => {
   });
 
   it("journals before returning, swaps once by content identity, and strips retained cache markers", async () => {
-    const { run, tracker, store, swap } = await setup();
+    const { run, latestMessages, swapState, store, swap } = await setupLiveSwap();
     const result = await run();
     assert(result?.messages, "Expected swapped messages");
     const persisted = ContinuousCompactionJournalSchema.parse(
@@ -492,41 +551,153 @@ describe("continuous prefix prepareStep and journal", () => {
     expect(JSON.stringify(result.messages)).toContain("kept output");
     // System + prefix are the two message breakpoints; tools supply the third.
     expect(JSON.stringify(result.messages).match(/cacheControl/g)?.length).toBe(2);
-    expect(tracker.latestMessages).toBe(result.messages);
-    expect(tracker.pendingPrefixSwap).toBeUndefined();
-    expect(tracker.consumedPrefixSwap).toBe(swap);
+    expect(latestMessages()).toBe(result.messages);
+    expect(swapState()).toBe("consumed");
     expect(swap.consumed).toBe(true);
     const write = spyOn(store, "write");
     expect(await run(result.messages, 2)).toBeUndefined();
     expect(write).not.toHaveBeenCalled();
-    expect(tracker.latestMessages).toEqual(result.messages);
+    expect(latestMessages()).toEqual(result.messages);
   });
+
+  const searchResult = (toolCallId: string): ai.ModelMessage => {
+    const raw: unknown = {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId,
+          toolName: "tool_catalog_search",
+          output: {
+            type: "content",
+            value: [
+              {
+                type: "custom",
+                providerOptions: {
+                  anthropic: { type: "tool-reference", toolName: "zulip_send_message" },
+                },
+              },
+            ],
+          },
+        },
+      ],
+    };
+    return raw as ai.ModelMessage;
+  };
+  const withRepeatedReference = (): ai.ModelMessage[] => [
+    ...originalMessages.slice(0, 3),
+    {
+      role: "assistant",
+      content: [{ type: "tool-call", toolCallId: "old-search", toolName: "bash", input: {} }],
+    },
+    searchResult("old-search"),
+    ...originalMessages.slice(3),
+    searchResult("keep"),
+  ];
+
+  it("dedupes native tool_references against the swapped prefix, not the dropped one", async () => {
+    // The only earlier reference to the tool lives in the dropped prefix; the
+    // retained tail repeats it. Deduping before the swap would project the tail
+    // against the dropped prefix and lose the turn's only surviving reference.
+    const { run, swapState } = await setupLiveSwap();
+    const result = await run(withRepeatedReference());
+    assert(result?.messages, "Expected swapped messages");
+    expect(swapState()).toBe("consumed");
+    const references = JSON.stringify(result.messages).match(/"tool-reference"/g);
+    expect(references).toHaveLength(1);
+    expect(JSON.stringify(result.messages)).not.toContain("old-search");
+  });
+
+  it("restores a reference projected on an earlier step when the swap drops its anchor", async () => {
+    // The dedupe projection is request-only, but the SDK accumulates the next
+    // step's input from the returned (projected) messages. A later swap that
+    // drops the first occurrence must fall back to the retained result's raw
+    // reference, not the carried projection that already removed it.
+    const fixture = await setup();
+    const turn = await startLiveTurn();
+    const first = await turn.run(withRepeatedReference());
+    assert(first?.messages, "Expected deduped messages");
+    // Count wire references via outputs: the projected result's stash keeps
+    // the raw reference bytes in providerOptions, off the wire.
+    expect([...countToolReferences(first.messages).values()]).toEqual([1]);
+    expect(turn.manager.setPrefixSwap(workspaceId, fixture.swap)).toBe(true);
+    // The SDK carries the projected first-step messages into the next step.
+    const second = await turn.run(first.messages, 2);
+    assert(second?.messages, "Expected swapped messages");
+    expect(turn.swapState()).toBe("consumed");
+    const references = JSON.stringify(second.messages).match(/"tool-reference"/g) ?? [];
+    expect(references).toHaveLength(1);
+    expect(JSON.stringify(second.messages)).not.toContain("old-search");
+    // The retained bash result reuses the search result's toolCallId ("keep");
+    // restoration must match the projected occurrence, not the reusable ID.
+    expect(JSON.stringify(second.messages)).toContain("kept output");
+  });
+
+  it.each([
+    [{ type: "between_tools" }, false],
+    [{ type: "adaptive" }, false],
+  ] as const)(
+    "after a prefix swap, thinking=%o replays in-turn reasoning: %p (#5086)",
+    async (thinking, replayed) => {
+      // Preserved thinking: a thinking block replayed after the swap edited everything
+      // before it would fail the prefix check on enforced accounts, for every thinking
+      // mode (between_tools cannot carry blockBinding; only the direct route sends
+      // drop_block for adaptive).
+      const withReasoning = originalMessages.map((message, index) =>
+        index === 3 && Array.isArray(message.content)
+          ? {
+              ...message,
+              content: [
+                {
+                  type: "reasoning" as const,
+                  text: "note",
+                  providerOptions: { anthropic: { signature: "s" } },
+                },
+                ...message.content,
+              ],
+            }
+          : message
+      ) as ai.ModelMessage[];
+      const replaysReasoning = (messages: ai.ModelMessage[]) =>
+        JSON.stringify(messages).includes('"type":"reasoning"');
+      const { run, swapState } = await setupLiveSwap({
+        providerOptions: { anthropic: { thinking, effort: "low" } },
+      });
+      const result = await run(withReasoning);
+      assert(result?.messages, "Expected swapped messages");
+      expect(swapState()).toBe("consumed");
+      expect(JSON.stringify(result.messages)).toContain("kept output");
+      expect({ thinking, replayed: replaysReasoning(result.messages) }).toEqual({
+        thinking,
+        replayed,
+      });
+    }
+  );
 
   for (const tail of [[], originalMessages.slice(4)]) {
     it("drops a missing/non-assistant locator without slicing or writing", async () => {
-      const { run, tracker, store } = await setup();
+      const { run, latestMessages, swapState, store } = await setupLiveSwap();
       expect(await run(tail)).toBeUndefined();
-      expect(tracker.latestMessages).toBe(tail);
-      expect(tracker.pendingPrefixSwap).toBeUndefined();
-      expect(tracker.consumedPrefixSwap).toBeUndefined();
+      expect(latestMessages()).toBe(tail);
+      expect(swapState()).toBe("none");
       expect(await store.read()).toBeNull();
     });
   }
 
   it("drops a pending swap when thinking options change before the first prepared step", async () => {
-    const { manager, tracker, store } = await setup();
-    const { run } = prepareHarness(manager, tracker, { thinkingOverrideState: { pending: "off" } });
+    const { run, latestMessages, swapState, store } = await setupLiveSwap({
+      thinkingOverrideState: { pending: "off" },
+    });
     expect(await run(originalMessages, 0)).toBeUndefined();
-    expect(tracker.pendingPrefixSwap).toBeUndefined();
-    expect(tracker.consumedPrefixSwap).toBeUndefined();
-    expect(tracker.latestMessages).toBe(originalMessages);
+    expect(swapState()).toBe("none");
+    expect(latestMessages()).toBe(originalMessages);
     expect(await store.read()).toBeNull();
   });
 
   it.each(["historical", "live-steps", "same-message"] as const)(
     "declines ambiguous %s anchors before journaling",
     async (mode) => {
-      const { run, store, tracker } = await setup();
+      const { run, store, latestMessages, swapState } = await setupLiveSwap();
       const duplicate: ai.AssistantModelMessage = {
         role: "assistant",
         content: [
@@ -545,19 +716,18 @@ describe("continuous prefix prepareStep and journal", () => {
             ];
       const write = spyOn(store, "write");
       expect(await run(messages)).toBeUndefined();
-      expect(tracker.latestMessages).toEqual(messages);
-      expect(tracker.pendingPrefixSwap).toBeUndefined();
-      expect(tracker.consumedPrefixSwap).toBeUndefined();
+      expect(latestMessages()).toEqual(messages);
+      expect(swapState()).toBe("none");
       expect(write).not.toHaveBeenCalled();
       expect(await store.read()).toBeNull();
     }
   );
 
   it("rebuilds a flattened committed step cut in the prefix and swaps at the live anchor", async () => {
-    const { run, tracker, store, swap } = await setup();
-    const committed = createMuxMessage("committed", "assistant", "", {
-      stepStartPartIndices: [0, 2],
-    });
+    const { run, swapState, store, swap } = await setupLiveSwap();
+    // No stepStartPartIndices: a row from before they were persisted, the case where the
+    // rebuild still folds the tool-first step into the previous one (flattened cut).
+    const committed = createMuxMessage("committed", "assistant", "", {});
     committed.parts = [
       { type: "text", text: "summarized head must not return" },
       {
@@ -603,8 +773,9 @@ describe("continuous prefix prepareStep and journal", () => {
     ];
     swap.journal.prefixSourceRows = [swap.journal.boundary, ...swap.journal.staticCopies];
     swap.prefix = await rebuildContinuousPrefix(swap.journal, workspaceId);
+    const { deferLoadingToolNames: _deferred, ...preparation } = swap.journal.preparation;
     const messages = await prepareMessagesForProvider({
-      ...swap.journal.preparation,
+      ...preparation,
       workspaceId,
       messagesWithSentinel: [
         createMuxMessage("user", "user", "request"),
@@ -628,28 +799,33 @@ describe("continuous prefix prepareStep and journal", () => {
         : []
     );
     expect(calls).toEqual(["static-keep", "keep"]);
-    expect(tracker.consumedPrefixSwap).toBe(swap);
+    expect(swapState()).toBe("consumed");
+    expect(swap.consumed).toBe(true);
     expect((await store.read())?.prefixSourceRows).toEqual(swap.journal.prefixSourceRows);
   });
 
   it.each(["during-write", "after-write"] as const)(
     "thinking change %s rejects the old prefix and still rebuilds step zero",
     async (phase) => {
-      const { manager, tracker, store, swap } = await setup();
+      const { store, swap } = await setup();
       swap.journal.preparation.effectiveThinkingLevel = "high";
       swap.prefix = await rebuildContinuousPrefix(swap.journal, workspaceId);
       const state: ActiveTurnThinkingOverride = { applied: "high" };
       const providerOptions = { anthropic: { thinking: { type: "enabled", budgetTokens: 1024 } } };
       const rebuilt = mock(() => Promise.resolve(originalMessages));
-      const { run } = prepareHarness(manager, tracker, {
-        thinkingOverrideState: state,
-        providerOptions,
-        rebuildProviderOptionsForThinkingLevel: () => ({
-          effectiveLevel: "off",
-          providerOptions: { anthropic: { thinking: { type: "disabled" } } },
-        }),
-        rebuildFirstStepForThinkingLevel: rebuilt,
+      const { run, manager, swapState } = await startLiveTurn({
+        requestOptions: {
+          thinkingLevel: "high",
+          thinkingOverrideState: state,
+          providerOptions,
+          rebuildProviderOptionsForThinkingLevel: () => ({
+            effectiveLevel: "off",
+            providerOptions: { anthropic: { thinking: { type: "disabled" } } },
+          }),
+          rebuildFirstStepForThinkingLevel: rebuilt,
+        },
       });
+      expect(manager.setPrefixSwap(workspaceId, swap)).toBe(true);
       let release!: () => void;
       const gate = new Promise<void>((resolve) => {
         release = resolve;
@@ -685,8 +861,8 @@ describe("continuous prefix prepareStep and journal", () => {
         release();
       }
       const result = await preparing;
-      expect(tracker.consumedPrefixSwap).toBeUndefined();
-      expect(tracker.pendingPrefixSwap).toBeUndefined();
+      expect(swapState()).toBe("none");
+      expect(swap.consumed).toBeUndefined();
       expect(await store.read()).toBeNull();
       expect(rebuilt).toHaveBeenCalledTimes(1);
       expect(result?.messages).toEqual(originalMessages);
@@ -695,19 +871,24 @@ describe("continuous prefix prepareStep and journal", () => {
   );
 
   it("rejects a prefix whose prepared thinking level is stale at activation or consumption", async () => {
-    const { manager, tracker, store, swap } = await setup();
+    const { store, swap } = await setup();
     swap.journal.preparation.effectiveThinkingLevel = "high";
-    const streams = Reflect.get(manager, "workspaceStreams") as Map<string, unknown>;
-    streams.set(workspaceId, {
-      messageId: swap.journal.streamMessageId,
-      model: swap.journal.parentModel,
-      thinkingLevel: "off",
-      stepTracker: {},
+    // Activation: the live turn runs at "off", not the level the prefix was prepared at.
+    const offTurn = await startLiveTurn();
+    expect(offTurn.manager.setPrefixSwap(workspaceId, swap)).toBe(false);
+    expect(offTurn.swapState()).toBe("none");
+    await offTurn.stop();
+    await offTurn.completion;
+    // Consumption: the turn activated at "high", but the level applied since is "off".
+    const state: ActiveTurnThinkingOverride = { applied: "high" };
+    const highTurn = await startLiveTurn({
+      requestOptions: { thinkingLevel: "high", thinkingOverrideState: state },
     });
-    expect(manager.setPrefixSwap(workspaceId, swap)).toBe(false);
-    const { run } = prepareHarness(manager, tracker, { thinkingOverrideState: { applied: "off" } });
-    expect(await run()).toBeUndefined();
-    expect(tracker.consumedPrefixSwap).toBeUndefined();
+    expect(highTurn.manager.setPrefixSwap(workspaceId, swap)).toBe(true);
+    state.applied = "off";
+    expect(await highTurn.run()).toBeUndefined();
+    expect(highTurn.swapState()).toBe("none");
+    expect(swap.consumed).toBeUndefined();
     expect(await store.read()).toBeNull();
   });
 
@@ -736,8 +917,9 @@ describe("continuous prefix prepareStep and journal", () => {
         reasoning,
         createMuxMessage("next-assistant", "assistant", "Later answer"),
       ];
+      const { deferLoadingToolNames: _deferred, ...preparation } = journal.preparation;
       const expected = await assemblePromptPayload({
-        ...journal.preparation,
+        ...preparation,
         workspaceId,
         history: journal.prefixSourceRows,
         systemMessage: "",
@@ -751,23 +933,242 @@ describe("continuous prefix prepareStep and journal", () => {
     }
   );
 
+  it("prefix replay honors a thinking-repair receipt on an empty kept row (#5886)", async () => {
+    const journal = journalFixture();
+    journal.preparation.modelString = "anthropic:claude-opus-5-5";
+    journal.preparation.effectiveThinkingLevel = "high";
+    const signed = createMuxMessage("signed", "assistant", "", undefined, [
+      {
+        type: "reasoning",
+        text: "removed thinking",
+        providerOptions: { anthropic: { signature: "sig-removed" } },
+      },
+      { type: "text", text: "kept answer" },
+    ]);
+    // A repaired turn that failed before output: commitPartial kept only its receipt.
+    const receiptOnly: MuxMessage = {
+      id: "repaired-no-output",
+      role: "assistant",
+      metadata: { anthropicThinkingReplay: "off" },
+      parts: [],
+    };
+    journal.prefixSourceRows = [
+      journal.boundary,
+      createMuxMessage("user-1", "user", "first"),
+      signed,
+      createMuxMessage("user-2", "user", "second"),
+      receiptOnly,
+      createMuxMessage("user-3", "user", "third"),
+    ];
+    const { deferLoadingToolNames: _deferred, ...preparation } = journal.preparation;
+    const expected = await assemblePromptPayload({
+      ...preparation,
+      workspaceId,
+      history: journal.prefixSourceRows,
+      systemMessage: "",
+      postCompactionAttachments: journal.postCompactionAttachments,
+    });
+    const actual = (await rebuildContinuousPrefix(journal, workspaceId)).filter(
+      (message) => message.role !== "system"
+    );
+    expect(actual).toEqual(expected.messages.filter((message) => message.role !== "system"));
+    const serialized = JSON.stringify(actual);
+    expect(serialized).toContain("kept answer");
+    expect(serialized).not.toContain("removed thinking");
+  });
+
+  it("prefix replay keeps the thinking after a server tool out, tool pairs intact (#5887)", async () => {
+    const journal = journalFixture();
+    journal.preparation.modelString = "anthropic:claude-opus-5-5";
+    journal.preparation.effectiveThinkingLevel = "high";
+    // The row a server-tool turn commits (streamManager.preservedThinking.test.ts): the
+    // server tool stored as a client tool call, thinking after it, and the receipt.
+    const serverToolRow = createMuxMessage(
+      "server-tool-turn",
+      "assistant",
+      "",
+      { anthropicThinkingReplay: "off" },
+      [
+        {
+          type: "reasoning",
+          text: "plan",
+          providerOptions: { anthropic: { signature: "sig-plan" } },
+        },
+        {
+          type: "dynamic-tool",
+          toolCallId: "srvtoolu_1",
+          toolName: "web_search",
+          state: "output-available",
+          input: { query: "xum" },
+          output: [
+            {
+              url: "https://example.com/xum",
+              title: "Xum",
+              pageAge: null,
+              type: "web_search_result",
+            },
+          ],
+        },
+        {
+          type: "reasoning",
+          text: "read",
+          providerOptions: { anthropic: { signature: "sig-read" } },
+        },
+        {
+          type: "dynamic-tool",
+          toolCallId: "toolu_2",
+          toolName: "bash",
+          state: "output-available",
+          input: { script: "pwd" },
+          output: "/tmp",
+        },
+        { type: "text", text: "kept answer" },
+      ]
+    );
+    journal.prefixSourceRows = [
+      journal.boundary,
+      createMuxMessage("user-1", "user", "search"),
+      serverToolRow,
+      createMuxMessage("user-2", "user", "next"),
+    ];
+    const { deferLoadingToolNames: _deferred, ...preparation } = journal.preparation;
+    const expected = await assemblePromptPayload({
+      ...preparation,
+      workspaceId,
+      history: journal.prefixSourceRows,
+      systemMessage: "",
+      postCompactionAttachments: journal.postCompactionAttachments,
+    });
+    const actual = (await rebuildContinuousPrefix(journal, workspaceId)).filter(
+      (message) => message.role !== "system"
+    );
+    expect(actual).toEqual(expected.messages.filter((message) => message.role !== "system"));
+    const parts = actual.flatMap((message) =>
+      Array.isArray(message.content) ? (message.content as Array<{ type: string }>) : []
+    );
+    // No signed thinking is left (an unsigned placeholder never reaches the wire).
+    expect(JSON.stringify(actual)).not.toContain("sig-");
+    expect(parts.filter((part) => part.type === "tool-call")).toHaveLength(2);
+    expect(parts.filter((part) => part.type === "tool-result")).toHaveLength(2);
+    expect(JSON.stringify(actual)).toContain("kept answer");
+  });
+
+  it("prefix replay keeps native tool search results as tool references (#5262)", async () => {
+    const journal = journalFixture();
+    journal.preparation.deferLoadingToolNames = ["slack_send_message"];
+    journal.prefixSourceRows = [
+      journal.boundary,
+      createMuxMessage("search", "assistant", "", undefined, [
+        {
+          type: "dynamic-tool",
+          toolCallId: "call-1",
+          toolName: "tool_catalog_search",
+          state: "output-available",
+          input: { query: "slack" },
+          output: {
+            query: "slack",
+            matches: [{ name: "slack_send_message", description: "Send a message" }],
+            totalDeferred: 1,
+          },
+        },
+      ]),
+      createMuxMessage("next", "user", "continue"),
+    ];
+    const outputs = (await rebuildContinuousPrefix(journal, workspaceId)).flatMap((message) =>
+      message.role === "tool"
+        ? message.content.flatMap((part) => (part.type === "tool-result" ? [part.output] : []))
+        : []
+    );
+    expect(outputs).toEqual([
+      {
+        type: "content",
+        value: [
+          {
+            type: "custom",
+            providerOptions: {
+              anthropic: { type: "tool-reference", toolName: "slack_send_message" },
+            },
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("a swapped prefix lists only deferred tools a retained search still loads (#5262)", async () => {
+    const journal = journalFixture();
+    journal.preparation.deferLoadingToolNames = ["jira_create_issue", "slack_send_message"];
+    // jira_create_issue was loaded by a search that the summary replaced.
+    journal.preparation.toolNamesForSentinel = ["bash", "jira_create_issue", "slack_send_message"];
+    journal.prefixSourceRows = [
+      journal.boundary,
+      createMuxMessage("search", "assistant", "", { agentId: "plan" }, [
+        {
+          type: "dynamic-tool",
+          toolCallId: "call-1",
+          toolName: "tool_catalog_search",
+          state: "output-available",
+          input: { query: "slack" },
+          output: {
+            query: "slack",
+            matches: [{ name: "slack_send_message", description: "Send a message" }],
+            totalDeferred: 2,
+          },
+        },
+      ]),
+      createMuxMessage("next", "user", "continue"),
+    ];
+    const prefix = JSON.stringify(await rebuildContinuousPrefix(journal, workspaceId));
+    expect(prefix).toContain("Available tools: bash, slack_send_message.");
+  });
+
+  it("swap preparation carries native deferred tools and lists only loaded ones (#5262)", async () => {
+    const execute = () => Promise.resolve("ok");
+    const tools = {
+      bash: ai.tool({ description: "bash", inputSchema: z.object({}), execute }),
+      slack_send_message: ai.tool({
+        description: "Send a message",
+        inputSchema: z.object({}),
+        execute,
+        providerOptions: { anthropic: { deferLoading: true } },
+      }),
+      tool_catalog_search: ai.tool({ description: "search", inputSchema: z.object({}), execute }),
+    };
+    const toolSearchState = {
+      catalog: [{ name: "slack_send_message", description: "Send a message", paramText: "" }],
+      deferredToolNames: new Set(["slack_send_message"]),
+      allToolNames: Object.keys(tools),
+      activatedToolNames: new Set<string>(),
+      native: true,
+    };
+    const { manager } = await startLiveTurn({ requestOptions: { tools, toolSearchState } });
+
+    const before = manager.getPrefixSwapPreparation(workspaceId)?.preparation;
+    expect(before?.toolNamesForSentinel).toEqual(["bash", "tool_catalog_search"]);
+    expect(before?.deferLoadingToolNames).toEqual(["slack_send_message"]);
+    toolSearchState.activatedToolNames.add("slack_send_message");
+    expect(manager.getPrefixSwapPreparation(workspaceId)?.preparation.toolNamesForSentinel).toEqual(
+      ["bash", "slack_send_message", "tool_catalog_search"]
+    );
+  });
+
   it("does not return a swap when atomic journal persistence fails", async () => {
-    const { run, tracker, store } = await setup();
+    const { run, latestMessages, swapState, swap, store } = await setupLiveSwap();
     spyOn(atomicWrite, "default").mockImplementationOnce(
       Object.assign(() => Promise.reject(new Error("disk full")), {
         sync: atomicWrite.default.sync,
       })
     );
     expect(await run()).toBeUndefined();
-    expect(tracker.latestMessages).toBe(originalMessages);
-    expect(tracker.consumedPrefixSwap).toBeUndefined();
+    expect(latestMessages()).toBe(originalMessages);
+    expect(swapState()).toBe("none");
+    expect(swap.consumed).toBeUndefined();
     expect(await store.read()).toBeNull();
   });
 
   it.each(["reset-before-write", "abort-after-write"] as const)(
     "%s fences the swap return and deletes the stale journal",
     async (mode) => {
-      const { run, tracker, store, controller } = await setup();
+      const { run, manager, swap, store, controller } = await setupLiveSwap();
       let release!: () => void;
       const gate = new Promise<void>((resolve) => {
         release = resolve;
@@ -792,7 +1193,7 @@ describe("continuous prefix prepareStep and journal", () => {
       await started;
       let cleared = Promise.resolve();
       if (mode === "reset-before-write") {
-        tracker.pendingPrefixSwap = undefined;
+        manager.clearPrefixSwap(workspaceId);
         cleared = store.clearForReset();
       } else {
         controller.abort();
@@ -801,16 +1202,17 @@ describe("continuous prefix prepareStep and journal", () => {
       expect(await preparing).toBeUndefined();
       await cleared;
       expect(await store.read()).toBeNull();
-      expect(tracker.consumedPrefixSwap).toBeUndefined();
+      expect(swap.consumed).toBeUndefined();
     }
   );
 
   it("rejects lossy options rather than silently JSON-dropping them", async () => {
-    const { run, tracker, swap, store } = await setup();
+    const { run, swapState, swap, store } = await setupLiveSwap();
     // A request-affecting function is intentionally outside the SDK's JSON option contract.
     Reflect.set(swap.prefix[0], "unknownRequestField", () => "must not disappear");
     expect(await run()).toBeUndefined();
-    expect(tracker.consumedPrefixSwap).toBeUndefined();
+    expect(swapState()).toBe("none");
+    expect(swap.consumed).toBeUndefined();
     expect(await store.read()).toBeNull();
   });
 
@@ -832,28 +1234,163 @@ describe("continuous prefix prepareStep and journal", () => {
 
   for (const consumed of [false, true]) {
     it(`step-boundary retry ${consumed ? "retains the consumed view" : "discards a pending swap"}`, async () => {
-      const { tracker, manager, swap, run, store } = await setup();
-      if (consumed) await run();
-      const before = tracker.latestMessages;
-      const stream = {
-        stepTracker: tracker,
-        parts: [{ type: "text", text: "completed" }],
-        stepStartIndices: [0],
-        currentStepStartIndex: 1,
-        partialWritePromise: undefined,
-      };
-      const reset = Reflect.get(manager, "resetStreamStateForRetry") as (
-        id: string,
-        info: unknown,
-        options: { preserveParts: boolean }
-      ) => Promise<void>;
-      await reset.call(manager, workspaceId, stream, { preserveParts: true });
-      expect(tracker.pendingPrefixSwap).toBeUndefined();
-      expect(tracker.consumedPrefixSwap).toBe(consumed ? swap : undefined);
-      expect(tracker.latestMessages).toBe(before);
-      expect((await store.read()) !== null).toBe(consumed);
+      const { swap, store } = await setup();
+      const retried: {
+        state?: string;
+        persisted?: boolean;
+        retryStep?: PreparedStepForTests;
+      } = {};
+      const first: { step?: PreparedStepForTests } = {};
+      let activated = false;
+      const turn = await startLiveTurn({
+        // A previousResponseId rejection after a completed step retries at that step boundary.
+        requestOptions: { providerOptions: { openai: { previousResponseId: "resp_abc123" } } },
+        attempts: [
+          async function* (options, manager) {
+            if (consumed) {
+              activated = manager.setPrefixSwap(workspaceId, swap);
+              first.step = await prepareStepForTests(options, originalMessages);
+            } else {
+              first.step = await prepareStepForTests(options, originalMessages);
+              // Compaction finished while this step was streaming: the swap is still pending.
+              activated = manager.setPrefixSwap(workspaceId, swap);
+            }
+            yield { type: "start-step" };
+            yield { type: "text-delta", text: "completed" };
+            yield {
+              type: "finish-step",
+              usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+            };
+            yield {
+              type: "error",
+              error: new ai.APICallError({
+                message: "Previous response with id 'resp_abc123' not found.",
+                url: "https://api.openai.com/v1/responses",
+                requestBodyValues: {},
+                statusCode: 400,
+                responseBody: "Previous response with id 'resp_abc123' not found.",
+                isRetryable: false,
+                data: { error: { code: "previous_response_not_found" } },
+              }),
+            };
+          },
+          async function* (options, manager) {
+            retried.state = manager.getPrefixSwapState(workspaceId);
+            retried.persisted = (await store.read()) !== null;
+            assert(options.messages, "Expected the retry to resend messages");
+            retried.retryStep = await prepareStepForTests(
+              options,
+              options.messages ?? originalMessages
+            );
+            yield* answer();
+          },
+        ],
+      });
+      expect((await turn.completion) as { status: string }).toMatchObject({ status: "completed" });
+
+      expect(activated).toBe(true);
+      expect(turn.calls).toHaveLength(2);
+      expect(retried.state).toBe(consumed ? "consumed" : "none");
+      expect(retried.persisted).toBe(consumed);
+      // The retry resends the step transcript it had: the swapped view, or full context.
+      expect(turn.calls[1]?.messages).toEqual(consumed ? first.step?.messages : originalMessages);
+      // A discarded pending swap is not consumed by the retried step.
+      expect(retried.retryStep).toBeUndefined();
+      expect(swap.consumed).toBe(consumed ? true : undefined);
     });
   }
+
+  it("a fallback over a consumed prefix sends none of that prefix's thinking (#5886)", async () => {
+    const { swap } = await setup();
+    swap.journal.liveTailCopySpec.partIndex = 0;
+    // The swapped prefix predates the turn's thinking-repair receipt.
+    const systemCount = swap.prefix.filter((message) => message.role === "system").length;
+    swap.prefix = [
+      ...swap.prefix.slice(0, systemCount),
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "reasoning",
+            text: "removed prefix thinking",
+            providerOptions: { anthropic: { signature: "sig-removed" } },
+          },
+          { type: "text", text: "kept prefix answer" },
+        ],
+      },
+      ...swap.prefix.slice(systemCount),
+    ];
+    const nextModel = "anthropic:fallback-model";
+    const rebuilt = createMuxMessage("live", "assistant", "", { stepStartPartIndices: [0] });
+    rebuilt.parts = [
+      { type: "text", text: "retained step" },
+      {
+        type: "dynamic-tool",
+        toolCallId: "keep",
+        toolName: "bash",
+        state: "output-available",
+        input: {},
+        output: { success: true },
+      },
+      { type: "text", text: "refused response after swap" },
+    ];
+    const { deferLoadingToolNames: _deferred, ...preparation } = swap.journal.preparation;
+    const payload = await assemblePromptPayload({
+      ...preparation,
+      modelString: nextModel,
+      systemMessage: "Fresh fallback system",
+      workspaceId,
+      history: [createMuxMessage("prompt", "user", "original request"), rebuilt],
+    });
+    let firstFallbackStep: ai.ModelMessage[] | undefined;
+    const turn = await startLiveTurn({
+      requestOptions: {
+        initialMetadata: { anthropicThinkingReplay: "off" },
+        modelFallback: {
+          chain: [nextModel],
+          prepare: () =>
+            Promise.resolve({
+              success: true as const,
+              data: {
+                model,
+                modelString: nextModel,
+                messages: payload.messages,
+                system: payload.system,
+                tools: payload.tools,
+                thinkingLevel: "off" as const,
+              },
+            }),
+        },
+      },
+      attempts: [
+        async function* (options, manager) {
+          expect(manager.setPrefixSwap(workspaceId, swap)).toBe(true);
+          await prepareStepForTests(options, originalMessages);
+          yield { type: "start-step" };
+          yield { type: "text-delta", text: "retained step" };
+          yield { type: "finish-step", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } };
+          yield { type: "finish", finishReason: "content-filter" };
+        },
+        async function* (options) {
+          // The messages the fallback's first provider request actually carries.
+          const step = await prepareStepForTests(options, options.messages ?? [], 0);
+          firstFallbackStep = step?.messages ?? options.messages;
+          yield* answer();
+        },
+      ],
+    });
+    await turn.completion;
+
+    expect(turn.calls).toHaveLength(2);
+    // The fallback request carries the swapped prefix as recorded (thinking included):
+    // prepareStep's prefix-swap guard (#5086) removes it before the provider call.
+    const requested = JSON.stringify(turn.calls[1]?.messages);
+    expect(requested).toContain("kept prefix answer");
+    expect(requested).toContain("removed prefix thinking");
+    const sent = JSON.stringify(firstFallbackStep);
+    expect(sent).toContain("kept prefix answer");
+    expect(sent).not.toContain("removed prefix thinking");
+  });
 
   for (const family of ["anthropic", "openai"]) {
     for (const mode of [
@@ -863,11 +1400,16 @@ describe("continuous prefix prepareStep and journal", () => {
       "sliced-row",
       "journal-failure",
       "ambiguous-anchor",
+      "native-mismatch",
     ] as const) {
       const consumed = mode !== "pending";
       const sliced = mode === "sliced-row";
-      it(`${family} fallback ${mode} preserves the correct view and emits only after reset`, async () => {
-        const { tracker, manager, run, swap, store } = await setup();
+      it(`${family} fallback ${mode} preserves the correct view and emits only after the hop commits`, async () => {
+        const { swap, store } = await setup();
+        // The parent deferred a tool natively; the fallback's tools do not.
+        if (mode === "native-mismatch") {
+          swap.journal.preparation.deferLoadingToolNames = ["slack_send_message"];
+        }
         if (sliced) {
           swap.journal.headEnd = { id: "live", sequence: 1 };
           swap.journal.headPartIndex = 2;
@@ -913,19 +1455,15 @@ describe("continuous prefix prepareStep and journal", () => {
           swap.journal.prefixSourceRows = [swap.journal.boundary, ...swap.journal.staticCopies];
           swap.prefix = await rebuildContinuousPrefix(swap.journal, workspaceId);
         }
-        if (consumed) await run();
-        const controller = new AbortController();
         const nextModel = `${family}:fallback-model`;
-        let resetFinished = false;
-        const events: string[] = [];
-        manager.setEventSink((event) => {
-          expect(resetFinished).toBe(true);
-          events.push(event.type);
-          controller.abort();
-        });
-        const rebuilt = createMuxMessage("live", "assistant", "", {
-          stepStartPartIndices: sliced ? [0, 2] : [0],
-        });
+        // Sliced: no stepStartPartIndices, so the rebuild folds the tool-first step into the
+        // head step (a row from before the indices were persisted).
+        const rebuilt = createMuxMessage(
+          "live",
+          "assistant",
+          "",
+          sliced ? {} : { stepStartPartIndices: [0] }
+        );
         rebuilt.parts = [
           ...(sliced
             ? [
@@ -962,8 +1500,9 @@ describe("continuous prefix prepareStep and journal", () => {
             output: { result: "obsolete result" },
           },
         ];
+        const { deferLoadingToolNames: _deferred, ...preparation } = swap.journal.preparation;
         const payload = await assemblePromptPayload({
-          ...swap.journal.preparation,
+          ...preparation,
           modelString: nextModel,
           providerForMessages: family,
           systemMessage: `Fresh fallback system for ${nextModel} with nextTool`,
@@ -996,36 +1535,50 @@ describe("continuous prefix prepareStep and journal", () => {
           );
           expect(JSON.stringify(containing)).toContain("summarized live head");
         }
-        const stream = {
-          model: swap.journal.parentModel,
-          metadataModel: swap.journal.parentModel,
-          streamResult: {
-            usage: Promise.resolve(undefined),
-            steps: Promise.resolve([]),
-            providerMetadata: Promise.resolve(undefined),
+        const invalidates =
+          consumed &&
+          (family === "openai" ||
+            sliced ||
+            mode === "journal-failure" ||
+            mode === "ambiguous-anchor" ||
+            mode === "native-mismatch");
+        const originalAtomicWrite = atomicWrite.default;
+        let failJournalWrites = false;
+        if (mode === "journal-failure" && family === "anthropic") {
+          // Fail only the fallback's journal record: the swap journal and partial writes succeed.
+          spyOn(atomicWrite, "default").mockImplementation(
+            Object.assign(
+              async (filename: string, data: string | Buffer) => {
+                if (failJournalWrites && filename.startsWith(store.path)) {
+                  throw new Error("fallback journal disk full");
+                }
+                await originalAtomicWrite(filename, data);
+              },
+              { sync: originalAtomicWrite.sync }
+            )
+          );
+        }
+        const hop: { prepareState?: string; events?: string[]; eventModel?: string } = {};
+        const hopEvents: string[] = [];
+        let liveManager: StreamManager | undefined;
+        let activated = false;
+        let blocked: unknown;
+        let sessionStop: Promise<unknown> | undefined;
+        const turn = await startLiveTurn({
+          eventSink: (event, manager) => {
+            if (hop.prepareState === undefined) return;
+            hopEvents.push(event.type);
+            if (event.type === "prefix-swap-invalidated") {
+              hop.eventModel = manager.getStreamInfo(workspaceId, true)?.model;
+            }
           },
-          startTime: Date.now(),
-          messageId: "live",
-          historySequence: 1,
-          parts: rebuilt.parts,
-          stepStartIndices: [0],
-          currentStepStartIndex: 1,
-          stepTracker: tracker,
-          softInterrupt: { pending: false },
-          abortController: controller,
-          request: { model, messages: originalMessages },
-          toolModelUsages: [],
-          cumulativeUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
-          modelFallback: {
-            requestedModel: swap.journal.parentModel,
-            refusedModels: [],
-            original: {},
-            options: {
+          requestOptions: {
+            modelFallback: {
               chain: [nextModel],
               prepare: () => {
-                expect(tracker.pendingPrefixSwap).toBeUndefined();
+                hop.prepareState = liveManager?.getPrefixSwapState(workspaceId);
                 return Promise.resolve({
-                  success: true,
+                  success: true as const,
                   data: {
                     model,
                     modelString: nextModel,
@@ -1033,68 +1586,67 @@ describe("continuous prefix prepareStep and journal", () => {
                     system: payload.system,
                     tools: payload.tools,
                     providerOptions: fallbackOptions,
-                    thinkingLevel: "off",
+                    thinkingLevel: "off" as const,
                   },
                 });
               },
             },
           },
-        };
-        const reset = Reflect.get(manager, "resetStreamStateForRetry") as (
-          id: string,
-          info: unknown,
-          options: unknown
-        ) => Promise<void>;
-        Reflect.set(
-          manager,
-          "resetStreamStateForRetry",
-          async (...args: Parameters<typeof reset>) => {
-            await reset.call(manager, ...args);
-            expect(events).toEqual([]);
-            resetFinished = true;
-          }
-        );
-        const fallback = Reflect.get(manager, "tryModelFallbackAfterRefusal") as (
-          id: string,
-          stream: unknown,
-          reason: string,
-          options: { preserveParts: boolean }
-        ) => Promise<{ kind: string }>;
-        if (mode === "journal-failure" && family === "anthropic") {
-          spyOn(atomicWrite, "default").mockImplementationOnce(
-            Object.assign(() => Promise.reject(new Error("fallback journal disk full")), {
-              sync: atomicWrite.default.sync,
-            })
-          );
-        }
-        expect(
-          await fallback.call(manager, workspaceId, stream, "content-filter", {
-            preserveParts: true,
-          })
-        ).toEqual({ kind: "swapped" });
-        expect(events).toEqual(
-          consumed &&
-            (family === "openai" ||
-              sliced ||
-              mode === "journal-failure" ||
-              mode === "ambiguous-anchor")
-            ? ["prefix-swap-invalidated"]
-            : []
-        );
-        if (
-          consumed &&
-          family === "anthropic" &&
-          !sliced &&
-          mode !== "journal-failure" &&
-          mode !== "ambiguous-anchor"
-        ) {
-          expect(JSON.stringify(stream.request.messages)).not.toContain("original request");
-          expect(JSON.stringify(stream.request.messages)).not.toContain("obsolete result");
+          attempts: [
+            async function* (options, manager) {
+              liveManager = manager;
+              activated = manager.setPrefixSwap(workspaceId, swap);
+              if (consumed) await prepareStepForTests(options, originalMessages);
+              yield { type: "start-step" };
+              yield { type: "text-delta", text: "retained step" };
+              yield {
+                type: "finish-step",
+                usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+              };
+              failJournalWrites = true;
+              yield { type: "finish", finishReason: "content-filter" };
+            },
+            async function* (options, manager) {
+              hop.events = [...hopEvents];
+              if (invalidates) {
+                // Until the session stops the stream, the fallback cannot send the
+                // invalidated prefix: preparing its first step waits for the stop and fails.
+                assert(options.messages, "Expected fallback messages");
+                const step = prepareStepForTests(
+                  options,
+                  options.messages ?? originalMessages,
+                  0
+                ).catch((error: unknown) => error);
+                // The session stops the stream for a durable fold; that stop waits
+                // for this attempt to exit, so it is awaited after the turn settles.
+                sessionStop = manager.stopStream(workspaceId, { abortReason: "system" });
+                blocked = await step;
+                return;
+              }
+              yield* answer();
+            },
+          ],
+        });
+        const completion = await turn.completion;
+        await sessionStop;
+
+        expect(activated).toBe(true);
+        expect(turn.calls).toHaveLength(2);
+        // The refused step's pending swap is dropped before the fallback is prepared.
+        expect(hop.prepareState).toBe(consumed ? "consumed" : "none");
+        // Only the invalidation is emitted during the hop, after the fallback committed.
+        expect(hop.events).toEqual(invalidates ? ["prefix-swap-invalidated"] : []);
+        if (invalidates) expect(hop.eventModel).toBe(nextModel);
+        const sent = turn.calls[1];
+        assert(sent, "Expected the fallback request");
+        const sentMessages = sent.messages;
+        assert(sentMessages, "Expected fallback messages");
+        if (consumed && !invalidates) {
+          expect(JSON.stringify(sentMessages)).not.toContain("original request");
+          expect(JSON.stringify(sentMessages)).not.toContain("obsolete result");
           const systems = preparedMessages.filter((message) => message.role === "system");
-          expect(stream.request.messages.filter((message) => message.role === "system")).toEqual(
-            systems
-          );
-          const sentPrefix = stream.request.messages.slice(
+          expect(sentMessages.filter((message) => message.role === "system")).toEqual(systems);
+          const sentPrefix = sentMessages.slice(
             0,
             systems.length + swap.prefix.filter((message) => message.role !== "system").length
           );
@@ -1108,7 +1660,7 @@ describe("continuous prefix prepareStep and journal", () => {
           expect(persisted?.fallbackPrefixes?.at(-1)?.prefix).toEqual(sentPrefix.map(exactJson));
           expect(persisted?.fallbackPrefixes?.at(-1)?.modelString).toBe(nextModel);
           if (committed) {
-            const calls = stream.request.messages.flatMap((message) =>
+            const calls = sentMessages.flatMap((message) =>
               message.role === "assistant" && Array.isArray(message.content)
                 ? message.content.flatMap((part) =>
                     part.type === "tool-call" ? [part.toolCallId] : []
@@ -1118,34 +1670,28 @@ describe("continuous prefix prepareStep and journal", () => {
             expect(calls).toEqual(["keep-static", "keep"]);
           }
         } else {
-          expect(stream.request.messages).toEqual(preparedMessages);
+          expect(sentMessages).toEqual(preparedMessages);
         }
         if (mode === "journal-failure") {
           const preserved = await store.read();
           expect(preserved?.prefix).toEqual(swap.prefix.map(exactJson));
           expect(preserved?.fallbackPrefixes).toBeUndefined();
         }
-        expect(Reflect.get(stream.request, "system")).toEqual(payload.system);
-        expect(Reflect.get(stream.request, "tools")).toHaveProperty("nextTool");
-        if (
-          consumed &&
-          (family === "openai" ||
-            sliced ||
-            mode === "journal-failure" ||
-            mode === "ambiguous-anchor")
-        ) {
-          const blocked = prepareHarness(manager, tracker);
-          const result = blocked.run().catch((error: unknown) => error);
-          blocked.controller.abort(new Error("stop for durable fold"));
-          expect(await result).toBeInstanceOf(Error);
+        expect(sent.system).toEqual(payload.system);
+        expect(sent.tools).toHaveProperty("nextTool");
+        if (invalidates) {
+          expect(blocked).toBeInstanceOf(Error);
+          expect(completion.status).toBe("aborted");
+        } else {
+          expect(completion.status).toBe("completed");
         }
       });
     }
   }
 
   it("retains original and successive fallback prefixes and refuses stale or lossy updates", async () => {
-    const { run, store, swap } = await setup();
-    await run();
+    const { run, store, swap } = await setupLiveSwap();
+    expect((await run())?.messages).toBeDefined();
     const initial = swap.journal;
     const prefix: ai.ModelMessage[] = [
       { role: "system", content: "First fallback system" },

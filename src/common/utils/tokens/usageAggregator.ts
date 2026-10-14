@@ -21,6 +21,9 @@ export interface ChatUsageDisplay {
   input: ChatUsageComponent;
   cached: ChatUsageComponent;
   cacheCreate: ChatUsageComponent; // Cache creation tokens (separate billing concept)
+  // Share of cacheCreate.tokens Anthropic wrote at the 1h TTL (billed 2x input instead
+  // of 1.25x). Absent when no response reported a 1h split.
+  cacheCreate1hTokens?: number;
 
   // Output is the part of the output excluding reasoning, so
   // totalOutput = output + reasoning
@@ -37,7 +40,13 @@ export interface ChatUsageDisplay {
   // billing (providerMetadata.mux.costsIncluded). These entries should not be
   // repriced when model mappings change.
   costsIncluded?: boolean;
+
+  // OpenAI service tier the costs were priced at, so repricing keeps a Fast or Flex
+  // premium (#4787). Absent means Standard; "mixed" marks a sum across tiers.
+  serviceTier?: ChatUsageServiceTier;
 }
+
+export type ChatUsageServiceTier = "flex" | "fast" | "ultrafast" | "unknown" | "mixed";
 
 /**
  * Sum multiple ChatUsageDisplay objects into a single cumulative display
@@ -53,6 +62,8 @@ export function sumUsageHistory(usageHistory: ChatUsageDisplay[]): ChatUsageDisp
   // repriced during mapping changes — we can't separate which tokens were billed
   // by the gateway vs. which were priced from model metadata.
   let anyCostsIncluded = false;
+  const serviceTiers = new Set<ChatUsageServiceTier | "standard">();
+  let cacheCreate1hTokens = 0;
 
   const sum: ChatUsageDisplay = {
     input: { tokens: 0, cost_usd: 0 },
@@ -65,6 +76,13 @@ export function sumUsageHistory(usageHistory: ChatUsageDisplay[]): ChatUsageDisp
   for (const usage of usageHistory) {
     if (usage.costsIncluded) anyCostsIncluded = true;
     if (usage.hasUnknownCosts) hasIncompleteCosts = true;
+    serviceTiers.add(usage.serviceTier ?? "standard");
+    // Clamp each entry's share to its own writes: a malformed persisted share must not claim
+    // later 5m writes of the same aggregate (the backend sums rows without repricing them first).
+    const share = usage.cacheCreate1hTokens ?? 0;
+    cacheCreate1hTokens += Number.isFinite(share)
+      ? Math.min(usage.cacheCreate.tokens, Math.max(0, share))
+      : 0;
     // Iterate over each component and sum tokens and costs
     const componentKeys: Array<"input" | "cached" | "cacheCreate" | "output" | "reasoning"> = [
       "input",
@@ -83,6 +101,9 @@ export function sumUsageHistory(usageHistory: ChatUsageDisplay[]): ChatUsageDisp
     }
   }
 
+  if (cacheCreate1hTokens > 0) {
+    sum.cacheCreate1hTokens = cacheCreate1hTokens;
+  }
   // Flag if any costs were incomplete/unknown (partial/inaccurate total)
   if (hasIncompleteCosts) {
     sum.hasUnknownCosts = true;
@@ -92,6 +113,12 @@ export function sumUsageHistory(usageHistory: ChatUsageDisplay[]): ChatUsageDisp
   // because we can't separate which tokens were billed by the gateway.
   if (anyCostsIncluded) {
     sum.costsIncluded = true;
+  }
+  // One tier across the sum keeps it repriceable at that tier; several cannot be separated.
+  const [onlyTier] = serviceTiers;
+  const serviceTier = serviceTiers.size > 1 ? "mixed" : onlyTier;
+  if (serviceTier !== undefined && serviceTier !== "standard") {
+    sum.serviceTier = serviceTier;
   }
 
   return sum;

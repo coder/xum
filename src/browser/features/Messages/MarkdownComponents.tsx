@@ -1,9 +1,13 @@
 import type { ReactNode } from "react";
-import React, { useContext, useEffect, useState } from "react";
+import React, { useContext, useEffect, useRef, useState } from "react";
 import { Play } from "lucide-react";
-import { Mermaid } from "./Mermaid";
+import { MermaidPendingFrame } from "./MermaidPendingFrame";
 import { useOptionalMessageListContext } from "./MessageListContext";
-import { highlightCode } from "@/browser/utils/highlighting/highlightWorkerClient";
+import { StreamingContext } from "./StreamingContext";
+import {
+  highlightCode,
+  isAbortedHighlight,
+} from "@/browser/utils/highlighting/highlightWorkerClient";
 import { extractShikiLines, isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
 import { useTheme } from "@/browser/contexts/ThemeContext";
 import { CopyButton } from "@/browser/components/CopyButton/CopyButton";
@@ -11,6 +15,11 @@ import { resolveBrowserLocalhostProxyTemplate } from "@/browser/utils/browserLoc
 import { normalizeLocalhostProxyUrl } from "@/common/utils/localhostProxyUrl";
 import { InlineSkillPreviewContext } from "./InlineSkillPreviewContext";
 import { INTERNAL_INLINE_SKILL_HREF_PREFIX } from "./inlineSkillMarkdown";
+import { LazyFeature } from "@/browser/components/LazyFeature/LazyFeature";
+
+// Lazy so the `mermaid` package stays off the first load (T3, #5971): diagrams render only
+// when a message contains one.
+const Mermaid = React.lazy(() => import("./Mermaid").then((m) => ({ default: m.Mermaid })));
 
 interface CodeProps {
   node?: unknown;
@@ -157,16 +166,101 @@ export function getCurrentHighlightedCodeBlockLines(
   return null;
 }
 
+// Streamdown remounts its whole subtree when a message switches between static and streaming
+// mode (the two modes build different trees), e.g. when a stream completes or the transcript
+// backfill ends mid-stream. A remounted CodeBlock loses its Shiki state and would repaint as plain
+// text until the async highlighter answers again, so results from streaming rows (the only rows
+// that switch modes) are kept here to seed it. Completed rows never write, so an older row
+// mounting during the backfill cannot evict the in-flight reply's blocks. A growing block replaces
+// the entry it wrote last, so it holds one entry; an entry other blocks also wrote (identical code)
+// stays until its last writer moves on. Bounded because the highlighted HTML of a large block can
+// be hundreds of KB; a reply with more fences than the bound falls back to re-highlighting.
+export const HIGHLIGHT_CACHE_MAX_ENTRIES = 32;
+
+interface HighlightCacheEntry {
+  highlighted: HighlightedCodeBlockLines;
+  /** CodeBlock instances whose latest highlight is this entry. */
+  writers: Set<symbol>;
+}
+
+const highlightCache = new Map<string, HighlightCacheEntry>();
+
+function highlightCacheKey(code: string, shikiLanguage: string, theme: "light" | "dark"): string {
+  return `${theme}\0${shikiLanguage}\0${code}`;
+}
+
+function readHighlightCache(key: string): HighlightedCodeBlockLines | null {
+  const cached = highlightCache.get(key);
+  if (cached === undefined) return null;
+  // Refresh recency: Map iteration order is insertion order, so the first key is the oldest.
+  highlightCache.delete(key);
+  highlightCache.set(key, cached);
+  return cached.highlighted;
+}
+
+function releaseReplacedHighlight(key: string, writer: symbol, replacesKey: string | null): void {
+  if (replacesKey === null || replacesKey === key) return;
+  const replaced = highlightCache.get(replacesKey);
+  replaced?.writers.delete(writer);
+  if (replaced?.writers.size === 0) highlightCache.delete(replacesKey);
+}
+
+// A CodeBlock that paints from the cache after a remount takes over the entry its unmounted
+// predecessor wrote, so its next write retires that entry instead of leaving it to the LRU, where
+// it could evict a live block of the same reply (#4677).
+function adoptHighlightCacheEntry(key: string, writer: symbol, replacesKey: string | null): void {
+  releaseReplacedHighlight(key, writer, replacesKey);
+  highlightCache.get(key)?.writers.add(writer);
+}
+
+// Runs when a CodeBlock leaves the key it last wrote: it grew, or it unmounted. It stops owning the
+// entry but leaves it cached, because the instance that replaces it on a remount reads the entry and
+// adopts it. Without this, the unmounted instance would own the entry forever and the adopter's
+// next write could never retire it. An entry nobody adopts is retired by the next write that
+// replaces it, or by the LRU.
+function releaseHighlightCacheWriter(
+  lastWrittenKeyRef: { readonly current: string | null },
+  writer: symbol
+): void {
+  const key = lastWrittenKeyRef.current;
+  if (key !== null) highlightCache.get(key)?.writers.delete(writer);
+}
+
+function writeHighlightCache(
+  key: string,
+  highlighted: HighlightedCodeBlockLines,
+  writer: symbol,
+  replacesKey: string | null
+): void {
+  releaseReplacedHighlight(key, writer, replacesKey);
+  const writers = highlightCache.get(key)?.writers ?? new Set<symbol>();
+  writers.add(writer);
+  highlightCache.delete(key);
+  highlightCache.set(key, { highlighted, writers });
+  while (highlightCache.size > HIGHLIGHT_CACHE_MAX_ENTRIES) {
+    const oldestKey = highlightCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    highlightCache.delete(oldestKey);
+  }
+}
+
 /**
  * CodeBlock component with async Shiki highlighting
  * Displays code with line numbers in a CSS grid
  */
 const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage }) => {
-  const [highlighted, setHighlighted] = useState<HighlightedCodeBlockLines | null>(null);
-
   const shikiLanguage = highlightLanguage ?? language;
   const { theme: themeMode } = useTheme();
   const theme = isLightThemeMode(themeMode) ? "light" : "dark";
+  const cacheKey = highlightCacheKey(code, shikiLanguage, theme);
+  const { isStreaming } = useContext(StreamingContext);
+  // Stable identity of this instance as a cache writer.
+  const cacheWriterRef = useRef(Symbol("CodeBlock"));
+  const lastWrittenCacheKeyRef = useRef<string | null>(null);
+
+  const [highlighted, setHighlighted] = useState<HighlightedCodeBlockLines | null>(() =>
+    readHighlightCache(cacheKey)
+  );
 
   // Split code into lines, removing trailing empty line
   const plainLines = code
@@ -174,11 +268,27 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
     .filter((line, idx, arr) => idx < arr.length - 1 || line !== "");
 
   useEffect(() => {
+    const cacheWriter = cacheWriterRef.current;
+    const cached = readHighlightCache(cacheKey);
+    if (cached) {
+      // Adopt here rather than in the useState initializer: render must stay side-effect free,
+      // and this branch also runs on the mount that the initializer seeded.
+      if (isStreaming) {
+        adoptHighlightCacheEntry(cacheKey, cacheWriter, lastWrittenCacheKeyRef.current);
+        lastWrittenCacheKeyRef.current = cacheKey;
+      }
+      setHighlighted(cached);
+      return () => releaseHighlightCacheWriter(lastWrittenCacheKeyRef, cacheWriter);
+    }
+
     let cancelled = false;
+    // A streaming block re-runs this effect on every commit. Aborting in cleanup drops the
+    // superseded request from the worker queue instead of running it for a stale result.
+    const abortController = new AbortController();
 
     async function highlight() {
       try {
-        const html = await highlightCode(code, shikiLanguage, theme);
+        const html = await highlightCode(code, shikiLanguage, theme, abortController.signal);
 
         if (!cancelled) {
           const lines = extractShikiLines(html);
@@ -187,12 +297,23 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
             (line, idx, arr) => idx < arr.length - 1 || line.trim() !== ""
           );
           if (filteredLines.length > 0) {
-            setHighlighted({ code, shikiLanguage, theme, lines: filteredLines });
+            const result: HighlightedCodeBlockLines = {
+              code,
+              shikiLanguage,
+              theme,
+              lines: filteredLines,
+            };
+            if (isStreaming) {
+              writeHighlightCache(cacheKey, result, cacheWriter, lastWrittenCacheKeyRef.current);
+              lastWrittenCacheKeyRef.current = cacheKey;
+            }
+            setHighlighted(result);
           } else {
             setHighlighted(null);
           }
         }
       } catch (error) {
+        if (isAbortedHighlight(error, abortController.signal)) return;
         console.warn(`Failed to highlight code block (${shikiLanguage}):`, error);
         if (!cancelled) setHighlighted(null);
       }
@@ -201,8 +322,10 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
     void highlight();
     return () => {
       cancelled = true;
+      abortController.abort();
+      releaseHighlightCacheWriter(lastWrittenCacheKeyRef, cacheWriter);
     };
-  }, [code, shikiLanguage, theme]);
+  }, [cacheKey, code, isStreaming, shikiLanguage, theme]);
 
   const messageListContext = useOptionalMessageListContext();
   const openTerminal = messageListContext?.openTerminal;
@@ -376,7 +499,11 @@ export const markdownComponents = {
 
     // Handle mermaid diagrams specially
     if (!isInline && language === "mermaid") {
-      return <Mermaid chart={childString} />;
+      return (
+        <LazyFeature name="Diagram" fallback={<MermaidPendingFrame />}>
+          <Mermaid chart={childString} />
+        </LazyFeature>
+      );
     }
 
     // Code blocks with language - use async Shiki highlighting

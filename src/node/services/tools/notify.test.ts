@@ -23,12 +23,6 @@ describe("notify tool", () => {
     config = createTestToolConfig(tempDir.path);
   });
 
-  it("should create a tool with correct schema", () => {
-    const tool = createNotifyTool(config);
-    expect(tool).toBeDefined();
-    expect(tool.description).toContain("notification");
-  });
-
   it("should reject empty title", async () => {
     const tool = createNotifyTool(config);
     const execute = tool.execute as (args: {

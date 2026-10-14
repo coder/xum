@@ -1,3 +1,5 @@
+import type { WorkspaceChatMessage } from "@/common/orpc/types";
+
 export interface LiveBashOutputView {
   stdout: string;
   stderr: string;
@@ -124,4 +126,39 @@ export function appendLiveBashOutputChunk(
   }
 
   return next;
+}
+
+/**
+ * Applies one chat event to a live bash output map keyed by toolCallId. Shared by WorkspaceStore
+ * and the VS Code webview so both hosts follow the same rules. Returns true when the map changed.
+ *
+ * - `bash-output` appends to the tool call's tail buffer (oldest output dropped past maxBytes).
+ * - A bash `tool-call-end` whose result carries output drops the buffer. If output is missing
+ *   (e.g. tmpfile overflow), the tail stays so the UI still shows something.
+ */
+export function applyLiveBashOutputEvent(
+  liveOutput: Map<string, LiveBashOutputInternal>,
+  event: WorkspaceChatMessage,
+  maxBytes: number
+): boolean {
+  if (event.type === "bash-output") {
+    const prev = liveOutput.get(event.toolCallId);
+    const next = appendLiveBashOutputChunk(
+      prev,
+      { text: event.text, isError: event.isError },
+      maxBytes
+    );
+    if (next === prev) return false;
+    liveOutput.set(event.toolCallId, next);
+    return true;
+  }
+
+  if (event.type === "tool-call-end" && event.toolName === "bash") {
+    const output = (event.result as { output?: unknown } | undefined)?.output;
+    if (typeof output === "string") {
+      return liveOutput.delete(event.toolCallId);
+    }
+  }
+
+  return false;
 }

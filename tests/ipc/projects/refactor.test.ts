@@ -1,6 +1,8 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
+import { exec } from "child_process";
+import { promisify } from "util";
 import { shouldRunIntegrationTests, createTestEnvironment, cleanupTestEnvironment } from "../setup";
 import { resolveOrpcClient } from "../helpers";
 
@@ -38,9 +40,7 @@ describeIntegration("ProjectService IPC Handlers", () => {
     // We need to init git manually to have branches
 
     // Initialize git repo to have branches
-    const { exec } = require("child_process");
-    const util = require("util");
-    const execAsync = util.promisify(exec);
+    const execAsync = promisify(exec);
 
     await execAsync("git init", { cwd: projectPath });
     await execAsync("git config user.email 'test@example.com'", { cwd: projectPath });

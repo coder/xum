@@ -16,9 +16,8 @@ import { BackgroundProcessManager } from "@/node/services/backgroundProcessManag
 import { fireEvent } from "@testing-library/react";
 import { createAppHarness } from "../harness";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getAutoCompactionThresholdKey } from "@/common/constants/storage";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
+import { getAppConfigStore, updateUserPreferences } from "@/browser/stores/AppConfigStore";
 import { resolveAutoCompactionThreshold } from "@/common/utils/compaction/autoCompactionThreshold";
 
 interface ServiceContainerPrivates {
@@ -62,8 +61,8 @@ async function getActiveTextarea(container: HTMLElement): Promise<HTMLTextAreaEl
   return waitFor(
     () => {
       const textareas = Array.from(
-        container.querySelectorAll('textarea[aria-label="Message Claude"]')
-      ) as HTMLTextAreaElement[];
+        container.querySelectorAll<HTMLTextAreaElement>('textarea[aria-label="Message"]')
+      );
       if (textareas.length === 0) {
         throw new Error("Chat textarea not found");
       }
@@ -82,12 +81,13 @@ async function getActiveTextarea(container: HTMLElement): Promise<HTMLTextAreaEl
 const FORCE_THRESHOLD_PERCENT = 10;
 
 /**
- * Move the per-model slider the way the UI does (a persisted-state write that the
- * UserPreferencesProvider mirrors into config.json). 10% threshold + 5% force buffer =>
- * force compaction triggers at 15%.
+ * Move the per-model slider the way the UI does (a merge patch to config.json).
+ * 10% threshold + 5% force buffer => force compaction triggers at 15%.
  */
 function moveThresholdSlider(percent: number): void {
-  updatePersistedState(getAutoCompactionThresholdKey(WORKSPACE_DEFAULTS.model), percent);
+  updateUserPreferences({
+    ai: { autoCompactionThresholdByModel: { [WORKSPACE_DEFAULTS.model]: percent } },
+  });
 }
 
 /** The backend reads the threshold from config.json; wait until the mirrored write landed. */
@@ -207,13 +207,24 @@ describe("Compaction UI (mock AI router)", () => {
       await app.chat.expectTranscriptContains(`Mock response: ${seedMessage}`);
 
       const sendMessage = jest.spyOn(app.env.services.workspaceService, "sendMessage");
-      const saveUserConfig = jest
-        .spyOn(app.env.config, "saveUserConfig")
-        .mockRejectedValue(new Error("disk full"));
+      let failSave: (error: Error) => void = () => undefined;
+      const updateUserPreferences = jest
+        .spyOn(app.env.config, "updateUserPreferences")
+        .mockImplementation(
+          () =>
+            new Promise<void>((_resolve, reject) => {
+              failSave = reject;
+            })
+        );
+      const flush = jest.spyOn(getAppConfigStore(), "flushUserPreferences");
       const draft = "Draft that must survive a failed settings save";
       moveThresholdSlider(FORCE_THRESHOLD_PERCENT);
-      await waitFor(() => expect(saveUserConfig).toHaveBeenCalled(), { timeout: 10_000 });
+      await waitFor(() => expect(updateUserPreferences).toHaveBeenCalled(), { timeout: 10_000 });
       await app.chat.send(draft);
+      // Fail the save only once the send waits on it.
+      await waitFor(() => expect(flush).toHaveBeenCalled(), { timeout: 10_000 });
+      failSave(new Error("disk full"));
+      flush.mockRestore();
 
       // The composer refuses the send visibly rather than streaming with a stale threshold.
       await waitFor(
@@ -391,7 +402,7 @@ describe("Compaction UI (mock AI router)", () => {
 });
 
 describe("Auto-follow-up and compaction notification behavior (mock AI router)", () => {
-  const notifications: Array<{ title: string; body?: string }> = [];
+  const notifications: { title: string; body?: string }[] = [];
   let originalWindowNotification: unknown;
 
   beforeAll(async () => {
@@ -447,12 +458,12 @@ describe("Auto-follow-up and compaction notification behavior (mock AI router)",
       globalThis as { Notification: unknown }
     ).Notification;
 
-    // Enable notifications via UI (click bell button in workspace header)
-    const notifyButton = app.view.container.querySelector(
-      '[data-testid="notify-on-response-button"]'
-    );
-    if (!notifyButton) throw new Error("Notify button not found");
-    fireEvent.click(notifyButton);
+    // Enable notifications with the toggle shortcut. The bell only opens the settings popover,
+    // and Radix popover content does not render in happy-dom.
+    if (!app.view.container.querySelector('[data-testid="notify-on-response-button"]')) {
+      throw new Error("Notify button not found");
+    }
+    fireEvent.keyDown(window, { key: ",", code: "Comma", ctrlKey: true, shiftKey: true });
 
     // Send seed message and wait for notification
     await app.chat.send(seedMessage);
@@ -544,29 +555,6 @@ describe("Auto-follow-up and compaction notification behavior (mock AI router)",
       await app.chat.expectStreamComplete();
 
       expect(notifications.length).toBe(countAfterSeed);
-    } finally {
-      await cleanup();
-    }
-  }, 60_000);
-
-  // Note: Force compaction interrupts an active stream. In the real backend, this would send
-  // a stream-abort event and the interrupted stream would NOT trigger a notification.
-  // However, the mock AI completes streams normally (no mid-stream abort simulation),
-  // so the "interrupted" stream's completion still fires a notification.
-  test.skip("force compaction with auto-continue should fire only ONE notification", async () => {
-    const { app, countAfterSeed, cleanup } = await setupNotificationTest(
-      "Seed for force compaction"
-    );
-
-    try {
-      // Force compaction auto-generates a "Continue" message
-      await app.chat.send("[force] Trigger force compaction");
-      await app.chat.expectTranscriptContains("Mock compaction summary:", 60_000);
-      await app.chat.expectTranscriptContains("Mock response: Continue", 60_000);
-
-      const { newCount, last } = await waitForNewNotifications(countAfterSeed);
-      expect(newCount).toBe(1);
-      expect(last.body).toBe("Mock response: Continue");
     } finally {
       await cleanup();
     }

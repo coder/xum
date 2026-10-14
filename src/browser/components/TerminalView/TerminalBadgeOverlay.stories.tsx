@@ -1,10 +1,9 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useEffect, useState } from "react";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { lightweightMeta } from "@/browser/stories/meta.js";
 import {
   DEFAULT_TERMINAL_BADGE_CONFIG,
-  TERMINAL_BADGE_CONFIG_KEY,
   type TerminalBadgeConfig,
 } from "@/common/constants/storage";
 import { TerminalBadgeOverlay } from "./TerminalBadgeOverlay";
@@ -21,23 +20,22 @@ interface BadgeStoryProps {
   width?: number;
 }
 
-/** Fake terminal surface: badge config is persisted state, so seed it before the overlay's first read. */
+/** Fake terminal surface: seed the badge config before the overlay's first read. */
 const BadgeStory = (props: BadgeStoryProps) => {
   useState(() =>
-    updatePersistedState<TerminalBadgeConfig>(TERMINAL_BADGE_CONFIG_KEY, {
-      ...DEFAULT_TERMINAL_BADGE_CONFIG,
-      enabled: true,
-      ...props.config,
+    getAppConfigStore().updateOptimistically({
+      userPreferences: {
+        appearance: {
+          terminalBadgeConfig: { ...DEFAULT_TERMINAL_BADGE_CONFIG, enabled: true, ...props.config },
+        },
+      },
     })
   );
-  // Storybook reuses one browser origin across stories; restore the disabled
-  // default on unmount so later stories with terminals don't inherit the badge.
+  // The store outlives the story; drop the badge on unmount so later stories with
+  // terminals don't inherit it.
   useEffect(() => {
     return () => {
-      updatePersistedState<TerminalBadgeConfig>(
-        TERMINAL_BADGE_CONFIG_KEY,
-        DEFAULT_TERMINAL_BADGE_CONFIG
-      );
+      getAppConfigStore().updateOptimistically({ userPreferences: undefined });
     };
   }, []);
 

@@ -1,12 +1,27 @@
 import { ProvidersConfigStore, type ProvidersConfig } from "@/node/config";
-import { describe, expect, it, spyOn } from "bun:test";
-import { generateText, jsonSchema, streamText, tool, type LanguageModel, type Tool } from "ai";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import {
+  generateText,
+  jsonSchema,
+  stepCountIs,
+  streamText,
+  tool,
+  type LanguageModel,
+  type ModelMessage,
+  type Tool,
+} from "ai";
+import type { Experimental_EvaluationModelV4 } from "@ai-sdk/provider";
 import { xai } from "@ai-sdk/xai";
+import { z } from "zod";
+import { Cause, Effect, Exit, Option } from "effect";
+import { makeEvaluationService } from "@/node/services/evaluation/evaluationService";
 import { writeFile } from "node:fs/promises";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { Config } from "@/node/config";
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
+import type { ThinkingLevel } from "@/common/types/thinking";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { CODEX_ENDPOINT, CODEX_OAUTH_ROUTED_HEADER } from "@/common/constants/codexOAuth";
@@ -17,19 +32,23 @@ import {
   resolveProviderOptionsNamespaceKey,
 } from "@/common/utils/ai/providerOptions";
 import { Ok } from "@/common/types/result";
+import { TOOL_PAYLOAD_DEPTH_REJECTION } from "@/common/utils/tools/toolPayloadDepth";
+import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import {
   ProviderModelFactory,
   buildAIProviderRequestHeaders,
   classifyCopilotInitiator,
-  countAnthropicCacheBreakpoints,
   XUM_AI_PROVIDER_USER_AGENT,
   normalizeCodexResponsesBody,
   markCodexOauthRoutedResponse,
   normalizeOpenAICompatibleBaseURL,
   resolveAIProviderHeaderSource,
+  muxGatewayPromptCacheRoute,
+  requestEndpoint,
   resolveOpenAIWebSocketResponsesUrl,
   wrapFetchWithAnthropicCacheControl,
   wrapFetchWithXAIServiceTier,
+  withAnthropicEvaluationEffort,
   type OauthServiceBindings,
 } from "./providerModelFactory";
 import { hasLanguageModelCleanup, runLanguageModelCleanup } from "./languageModelCleanup";
@@ -37,8 +56,8 @@ import * as openAIWebSocketTransport from "./openAIWebSocketTransportFetch";
 import type { DevToolsService } from "./devToolsService";
 import { CodexOauthService } from "./codexOauthService";
 import type { CoderOauthService } from "./coderOauthService";
-import { PolicyService } from "./policyService";
 import { ProviderService } from "./providerService";
+import type { TimelineEventDraft } from "@/common/orpc/schemas/timeline";
 
 const LOCAL_VLLM_BASE_URL = "http://localhost:8000/v1";
 const LOCAL_VLLM_MODEL = "qwen3-coder";
@@ -112,12 +131,11 @@ async function withTempConfig(
   try {
     const config = new Config(tmpDir);
     const providersConfigStore = new ProvidersConfigStore(config.rootDir);
-    const providerService = new ProviderService(config, undefined, providersConfigStore);
+    const providerService = new ProviderService(config, providersConfigStore);
     const oauth: OauthServiceBindings = {};
     const factory = new ProviderModelFactory(
       config,
       providerService,
-      undefined,
       oauth,
       undefined,
       providersConfigStore
@@ -149,40 +167,26 @@ async function withOpenAIBaseUrlEnvUnset(run: () => Promise<void>): Promise<void
   }
 }
 
-async function withTempPolicyProviderFactory(
-  policy: unknown,
-  run: (
-    config: Config,
-    factory: ProviderModelFactory,
-    policyService: PolicyService,
-    oauth: OauthServiceBindings
-  ) => Promise<void> | void
-): Promise<void> {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-provider-model-factory-"));
-  const policyPath = path.join(tmpDir, "policy.json");
-  const prevPolicyFileEnv = process.env.MUX_POLICY_FILE;
-  let policyService: PolicyService | null = null;
-
-  try {
-    const config = new Config(tmpDir);
-    await writeFile(policyPath, JSON.stringify(policy), "utf-8");
-    process.env.MUX_POLICY_FILE = policyPath;
-
-    policyService = new PolicyService(config);
-    await policyService.initialize();
-    const providerService = new ProviderService(config, policyService);
-    const oauth: OauthServiceBindings = {};
-    const factory = new ProviderModelFactory(config, providerService, policyService, oauth);
-    await run(config, factory, policyService, oauth);
-  } finally {
-    policyService?.dispose();
-    if (prevPolicyFileEnv === undefined) {
-      delete process.env.MUX_POLICY_FILE;
-    } else {
-      process.env.MUX_POLICY_FILE = prevPolicyFileEnv;
+/**
+ * Unsets `names` for every test in the calling describe block and restores them afterwards.
+ * Coder workspaces export gateway base URLs (ANTHROPIC_BASE_URL, OPENAI_BASE_URL) that would
+ * silently move these cases off the first-party route they test (#5414).
+ */
+function unsetEnvForEachTest(...names: string[]): void {
+  const saved = new Map<string, string | undefined>();
+  beforeEach(() => {
+    for (const name of names) {
+      saved.set(name, process.env[name]);
+      delete process.env[name];
     }
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-  }
+  });
+  afterEach(() => {
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    saved.clear();
+  });
 }
 
 describe("resolveOpenAIWebSocketResponsesUrl", () => {
@@ -388,8 +392,10 @@ describe("ProviderModelFactory.createModel", () => {
         return;
       }
 
+      // `<name>.chat` is the OpenAI-compatible Chat adapter's provider id (the completion
+      // adapter reports `<name>.completion`). createModel wraps every v4 model in the
+      // tool-input depth guard, so the concrete class is no longer observable here.
       expect((listedModel.data as { provider?: unknown }).provider).toBe("local-vllm.chat");
-      expect(listedModel.data.constructor.name).toMatch(/OpenAICompatibleChatLanguageModel$/);
 
       const unlistedModel = await factory.createModel("local-vllm:any-other-id");
       expect(unlistedModel.success).toBe(true);
@@ -504,56 +510,6 @@ describe("ProviderModelFactory.createModel", () => {
       expect(result.success).toBe(true);
       expect(muxOptions.anthropic?.disableBetaFeatures).toBe(true);
     });
-  });
-
-  it("allows policy-allowed custom OpenAI-compatible providers when policy is enforced", async () => {
-    await withTempPolicyProviderFactory(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "local-vllm" }],
-      },
-      async (config, factory) => {
-        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-          "local-vllm": {
-            providerType: "openai-compatible",
-            baseUrl: "http://localhost:8000/v1",
-            models: ["qwen3-coder"],
-          },
-        });
-
-        const result = await factory.createModel("local-vllm:qwen3-coder");
-
-        expect(result.success).toBe(true);
-        if (!result.success) {
-          expect(result.error.type).not.toBe("policy_denied");
-        }
-      }
-    );
-  });
-
-  it("denies policy-denied custom OpenAI-compatible providers when policy is enforced", async () => {
-    await withTempPolicyProviderFactory(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "openai" }],
-      },
-      async (config, factory) => {
-        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-          "local-vllm": {
-            providerType: "openai-compatible",
-            baseUrl: "http://localhost:8000/v1",
-            models: ["qwen3-coder"],
-          },
-        });
-
-        const result = await factory.createModel("local-vllm:qwen3-coder");
-
-        expect(result.success).toBe(false);
-        if (!result.success) {
-          expect(result.error.type).toBe("policy_denied");
-        }
-      }
-    );
   });
 
   it("returns provider_disabled for disabled custom OpenAI-compatible providers", async () => {
@@ -1061,7 +1017,11 @@ describe("ProviderModelFactory GitHub Copilot", () => {
       );
       expect(result.data.routeProvider).toBe("github-copilot");
       expect(result.data.effectiveModelString).toBe("github-copilot:gpt-5.3-codex");
-      expect(result.data.model.constructor.name).toBe("CopilotResponsesLanguageModel");
+      // The depth guard wraps every object model, so the v2 Copilot Responses class is
+      // observable only through its provider id; the wrapper reports the SDK-adapted v4.
+      expect((result.data.model as { specificationVersion?: unknown }).specificationVersion).toBe(
+        "v4"
+      );
     });
   });
 
@@ -1092,7 +1052,7 @@ describe("ProviderModelFactory GitHub Copilot", () => {
             JSON.stringify({
               id: "resp_test",
               created_at: 0,
-              model: "gpt-5.3-codex",
+              model: "gpt-6.1-sol",
               output: [
                 {
                   type: "message",
@@ -1138,7 +1098,7 @@ describe("ProviderModelFactory GitHub Copilot", () => {
       };
 
       try {
-        const result = await factory.createModel("openai:gpt-5.3-codex");
+        const result = await factory.createModel("openai:gpt-6.1-sol");
         expect(result.success).toBe(true);
         if (!result.success) {
           return;
@@ -1149,7 +1109,7 @@ describe("ProviderModelFactory GitHub Copilot", () => {
         }
 
         const originalBody = JSON.stringify({
-          model: "gpt-5.3-codex",
+          model: "gpt-6.1-sol",
           input: [
             { role: "user", content: [{ type: "input_text", text: "Ship the fix." }] },
             { type: "item_reference", id: "rs_123" },
@@ -1203,7 +1163,7 @@ describe("ProviderModelFactory GitHub Copilot", () => {
               method: "POST",
               headers: cacheHeaders,
               body: JSON.stringify({
-                model: "gpt-5.3-codex",
+                model: "gpt-6.1-sol",
                 input: [{ role: "user", content: `Turn ${turn}` }],
                 prompt_cache_key: promptCacheKey,
                 store: true,
@@ -1234,9 +1194,82 @@ describe("ProviderModelFactory GitHub Copilot", () => {
       }
 
       expect((result.data as { provider?: unknown }).provider).toBe("github-copilot.responses");
-      expect(result.data.constructor.name).toBe("CopilotResponsesLanguageModel");
+      expect((result.data as { specificationVersion?: unknown }).specificationVersion).toBe("v4");
     });
   });
+
+  it.each([
+    ["deep (depth 2100) arguments are rejected before parsing and never executed", 2100, false],
+    ["shallow arguments pass through and execute", 1, true],
+  ])(
+    "guards the v2 Copilot Responses model via the actual factory route: %s",
+    async (_label, depth, expectExecuted) => {
+      await withTempConfig(async (_config, factory, _oauth, providersConfigStore) => {
+        const argumentsText = `{"payload":${"[".repeat(depth - 1)}1${"]".repeat(depth - 1)}}`;
+        const responsesFetch = () =>
+          Promise.resolve(
+            new Response(
+              JSON.stringify({
+                id: "resp_deep",
+                created_at: 0,
+                model: "gpt-5.3-codex",
+                output: [
+                  {
+                    type: "function_call",
+                    id: "fc_1",
+                    call_id: "call_deep",
+                    name: "permissive",
+                    arguments: argumentsText,
+                    status: "completed",
+                  },
+                ],
+                usage: { input_tokens: 1, output_tokens: 1 },
+              }),
+              { headers: { "Content-Type": "application/json" } }
+            )
+          );
+        spyOn(providersConfigStore, "loadProvidersConfig").mockReturnValue({
+          "github-copilot": {
+            apiKey: COPILOT_TOKEN,
+            models: ["gpt-5.3-codex"],
+            fetch: responsesFetch,
+          },
+        } as unknown as ProvidersConfig);
+
+        const created = await factory.createModel("github-copilot:gpt-5.3-codex");
+        expect(created.success).toBe(true);
+        if (!created.success) return;
+        expect((created.data as { provider?: unknown }).provider).toBe("github-copilot.responses");
+
+        const executed: unknown[] = [];
+        const result = await generateText({
+          model: created.data,
+          prompt: "call the tool",
+          tools: {
+            // Accepts ANY object: a valid-JSON replacement would validate and execute.
+            permissive: tool({
+              description: "permissive",
+              inputSchema: z.record(z.string(), z.unknown()),
+              execute: (input: unknown) => {
+                executed.push(input);
+                return Promise.resolve({ ok: true });
+              },
+            }),
+          },
+        });
+        const toolCall = result.content.find((part) => part.type === "tool-call");
+        if (toolCall?.type !== "tool-call") throw new Error("Expected a tool-call part");
+        if (expectExecuted) {
+          expect(executed).toEqual([JSON.parse(argumentsText)]);
+          expect(toolCall.invalid).not.toBe(true);
+        } else {
+          expect(executed).toEqual([]);
+          expect(toolCall.invalid).toBe(true);
+          expect(toolCall.input).toBe(TOOL_PAYLOAD_DEPTH_REJECTION);
+        }
+      });
+    }
+  );
 
   it("returns api_key_not_found before checking a stale Copilot model catalog", async () => {
     await withTempConfig(async (config, factory) => {
@@ -1317,6 +1350,163 @@ describe("ProviderModelFactory GitHub Copilot", () => {
       }
 
       expect(result.data).toHaveProperty("provider", "github-copilot.chat");
+    });
+  });
+});
+
+describe("ProviderModelFactory Meta", () => {
+  const metaOptions = (thinking: ThinkingLevel) => {
+    const options = buildProviderOptions("meta:muse-wonder-1.0", thinking);
+    if (!("openai" in options)) throw new Error("Meta must use the OpenAI SDK namespace");
+    return { openai: options.openai };
+  };
+
+  unsetEnvForEachTest(
+    "META_MODEL_API_KEY",
+    "MODEL_API_KEY",
+    "META_BASE_URL",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL"
+  );
+
+  it("never uses ambient OpenAI credentials for Meta", async () => {
+    process.env.OPENAI_API_KEY = "openai-only-key";
+    await withTempConfig(async (_config, factory) => {
+      expect(await factory.createModel("meta:muse-wonder-1.0")).toEqual({
+        success: false,
+        error: { type: "api_key_not_found", provider: "meta" },
+      });
+    });
+  });
+
+  it.each([
+    [undefined, "https://api.meta.ai/v1/responses"],
+    ["https://meta-proxy.example.com", "https://meta-proxy.example.com/v1/responses"],
+    [
+      "https://meta-proxy.example.com/custom/v1/",
+      "https://meta-proxy.example.com/custom/v1/responses",
+    ],
+  ])("uses Meta credentials and the configured endpoint %s", async (baseUrl, expectedUrl) => {
+    process.env.OPENAI_API_KEY = "wrong-key";
+    process.env.OPENAI_BASE_URL = "https://wrong.example.com/v1";
+    process.env.META_MODEL_API_KEY = "env-meta-key";
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({
+        meta: { apiKey: "config-meta-key", baseUrl, headers: { "x-meta-test": "value" } },
+      });
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel("meta:muse-wonder-1.0");
+        if (!result.success) throw new Error(result.error.type);
+        await generateText({
+          model: result.data,
+          prompt: "hello",
+          providerOptions: metaOptions("max"),
+          maxRetries: 0,
+        }).catch(() => undefined);
+        expect(calls).toHaveLength(1);
+        expect(calls[0].url).toBe(expectedUrl);
+        const headers = new Headers(calls[0].init.headers);
+        expect(headers.get("authorization")).toBe("Bearer config-meta-key");
+        expect(headers.get("x-meta-test")).toBe("value");
+        expect(parseSentBody(calls[0])).toMatchObject({
+          model: "muse-wonder-1.0",
+          store: false,
+          include: ["reasoning.encrypted_content"],
+          reasoning: { effort: "max", summary: "auto" },
+        });
+        expect(parseSentBody(calls[0])).not.toHaveProperty("service_tier");
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
+
+  it("replays encrypted reasoning and tool results across Responses steps", async () => {
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({ meta: { apiKey: "meta-key" } });
+      const calls: CapturedFetchCall[] = [];
+      const fakeFetch = Object.assign((input: RequestInfo | URL, init?: RequestInit) => {
+        calls.push({
+          url: input instanceof Request ? input.url : input.toString(),
+          init: init ?? {},
+        });
+        const output =
+          calls.length === 1
+            ? [
+                {
+                  type: "reasoning",
+                  id: "rs_meta",
+                  summary: [],
+                  encrypted_content: "encrypted-meta-reasoning",
+                },
+                {
+                  type: "function_call",
+                  id: "fc_meta",
+                  call_id: "call_meta",
+                  name: "multiply",
+                  arguments: '{"a":17,"b":19}',
+                },
+              ]
+            : [
+                {
+                  type: "message",
+                  id: "msg_meta",
+                  role: "assistant",
+                  content: [{ type: "output_text", text: "323", annotations: [] }],
+                },
+              ];
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              id: `resp_meta_${calls.length}`,
+              created_at: 0,
+              status: "completed",
+              model: "muse-wonder-1.0",
+              output,
+              usage: { input_tokens: 10, output_tokens: 5 },
+            }),
+            { headers: { "content-type": "application/json" } }
+          )
+        );
+      }, fetch) as typeof fetch;
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const model = await factory.createModel("meta:muse-wonder-1.0");
+        if (!model.success) throw new Error(model.error.type);
+        const result = await generateText({
+          model: model.data,
+          prompt: "Multiply 17 by 19 using the tool.",
+          providerOptions: metaOptions("high"),
+          tools: {
+            multiply: tool({
+              inputSchema: z.object({ a: z.number(), b: z.number() }),
+              execute: ({ a, b }) => Promise.resolve(a * b),
+            }),
+          },
+          stopWhen: stepCountIs(2),
+          maxRetries: 0,
+        });
+        expect(result.text).toBe("323");
+        expect(calls).toHaveLength(2);
+        expect(parseSentBody(calls[1]).input).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              type: "reasoning",
+              encrypted_content: "encrypted-meta-reasoning",
+            }),
+            expect.objectContaining({
+              type: "function_call_output",
+              call_id: "call_meta",
+              output: "323",
+            }),
+          ])
+        );
+        expect(parseSentBody(calls[1])).not.toHaveProperty("previous_response_id");
+      } finally {
+        fetchSpy.mockRestore();
+      }
     });
   });
 });
@@ -1461,6 +1651,196 @@ describe("ProviderModelFactory native OpenAI alias tiers", () => {
       });
     }
   );
+
+  it.each([
+    ["gpt-6-astra", "responses", "ultrafast"],
+    ["gpt-6.1-sol", "responses", "ultrafast"],
+    // Ultrafast is model-gated: other models drop the tier instead of sending one
+    // OpenAI rejects (and never fall back to the separately billed Fast tier).
+    ["gpt-6-luna", "responses", undefined],
+    ["gpt-6-sol", "responses", undefined],
+    // Chat Completions' service_tier enum has no "ultrafast", so the stored wire drops it.
+    ["gpt-6.1-sol", "chatCompletions", undefined],
+  ] as const)(
+    "sends the configured Ultrafast tier for %s over %s only when supported",
+    async (model, wireFormat, tier) => {
+      await withTempConfig(async (_config, factory, _oauth, store) => {
+        store.saveProvidersConfig({
+          openai: {
+            apiKey: "native-key",
+            baseUrl: "https://native.example.com/v1",
+            serviceTier: "ultrafast",
+            wireFormat,
+          },
+        });
+        const { calls, fakeFetch } = createCapturingFetch();
+        const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+        try {
+          const result = await factory.createModel(`openai:${model}`);
+          if (!result.success) throw new Error(result.error.type);
+          await generateText({ model: result.data, prompt: "hello", maxRetries: 0 }).catch(
+            () => undefined
+          );
+          expect(calls.length).toBe(1);
+          expect(parseSentBody(calls[0]).service_tier).toBe(tier);
+        } finally {
+          fetchSpy.mockRestore();
+        }
+      });
+    }
+  );
+});
+
+async function sendWithCyberKey(
+  model: LanguageModel,
+  stream: boolean,
+  cyberAccessProgram: string | null = "daybreak_blue"
+): Promise<void> {
+  const request = {
+    model,
+    prompt: "hello",
+    maxRetries: 0,
+    providerOptions: cyberAccessProgram == null ? undefined : { openai: { cyberAccessProgram } },
+  };
+  if (stream) {
+    await streamText(request).consumeStream({ onError: () => undefined });
+  } else {
+    await generateText(request).catch(() => undefined);
+  }
+}
+
+describe("ProviderModelFactory Cyber access program", () => {
+  unsetEnvForEachTest("OPENAI_BASE_URL", "OPENAI_API_BASE");
+  it.each(["responses", "chatCompletions"] as const)(
+    "serializes the private Cyber key only into direct OpenAI %s bodies",
+    async (wireFormat) => {
+      await withTempConfig(async (_config, factory, _oauth, store) => {
+        store.saveProvidersConfig({
+          openai: {
+            apiKey: "native-key",
+            baseUrl: "https://native.example.com/v1",
+            wireFormat,
+            webSocketTransportEnabled: false,
+          },
+        });
+        const { calls, fakeFetch } = createCapturingFetch();
+        const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+        try {
+          const result = await factory.createModel("openai:gpt-6.1-sol");
+          if (!result.success) throw new Error(result.error.type);
+          for (const stream of [false, true]) {
+            await sendWithCyberKey(result.data, stream);
+            await sendWithCyberKey(result.data, stream, null);
+          }
+          expect(calls.map((call) => parseSentBody(call).access_programs)).toEqual(
+            wireFormat === "responses"
+              ? [{ cyber: "daybreak_blue" }, undefined, { cyber: "daybreak_blue" }, undefined]
+              : [undefined, undefined, undefined, undefined]
+          );
+        } finally {
+          fetchSpy.mockRestore();
+        }
+      });
+    }
+  );
+
+  it("never sends access programs through Codex OAuth or custom Responses providers", async () => {
+    await withTempConfig(async (_config, factory, oauth, store) => {
+      const auth = {
+        type: "oauth" as const,
+        access: "test-access",
+        refresh: "test-refresh",
+        expires: Date.now() + 3_600_000,
+      };
+      store.saveProvidersConfig({
+        openai: { codexOauth: auth },
+        "responses-proxy": {
+          providerType: "openai-responses",
+          baseUrl: "https://proxy.example.com/v1",
+          apiKey: "custom-key",
+        },
+      });
+      oauth.codexOauthService = Object.create(CodexOauthService.prototype) as CodexOauthService;
+      oauth.codexOauthService.getValidAuth = () => Promise.resolve(Ok(auth));
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        for (const model of ["openai:gpt-6.1-sol", "responses-proxy:gpt-6.1-sol"]) {
+          const result = await factory.createModel(model);
+          if (!result.success) throw new Error(result.error.type);
+          await sendWithCyberKey(result.data, false);
+        }
+        expect(calls.map((call) => call.url)).toEqual([
+          CODEX_ENDPOINT,
+          "https://proxy.example.com/v1/responses",
+        ]);
+        for (const call of calls) {
+          expect(parseSentBody(call)).not.toHaveProperty("access_programs");
+        }
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
+});
+
+describe("ProviderModelFactory GPT-6 Chat Completions tool reasoning", () => {
+  // Headless tool loops (Dream, harvest, refine, sidebar status) call
+  // streamText with tools and no provider options. Luna Chat Completions
+  // accepts function calling only with reasoning_effort "none", so the model
+  // itself must fill it in for tool-bearing requests that asked for no effort;
+  // Responses, tool-free requests and Astra keep the provider default, and an
+  // explicit caller effort is preserved (covered by the "requested effort"
+  // cases in "GPT-6 Luna reasoning effort none").
+  it.each([
+    ["chatCompletions", "gpt-6-luna", true],
+    ["chatCompletions", "team-luna", true],
+    ["chatCompletions", "gpt-6-astra", false],
+    ["responses", "gpt-6-luna", false],
+  ] as const)(
+    "clamps %s tool requests for %s at the model boundary (%p)",
+    async (wireFormat, modelId, clamped) => {
+      await withTempConfig(async (_config, factory, _oauth, store) => {
+        store.saveProvidersConfig({
+          openai: {
+            apiKey: "native-key",
+            baseUrl: "https://native.example.com/v1",
+            wireFormat,
+            models: [{ id: "team-luna", mappedToModel: "openai:gpt-6-luna" }],
+          },
+        });
+        const { calls, fakeFetch } = createCapturingFetch();
+        const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+        try {
+          const result = await factory.createModel(`openai:${modelId}`);
+          if (!result.success) throw new Error(result.error.type);
+          const probe = tool({
+            inputSchema: jsonSchema<Record<string, never>>({ type: "object" }),
+          });
+          for (const tools of [{ probe }, undefined]) {
+            const before = calls.length;
+            await streamText({
+              model: result.data,
+              prompt: "hello",
+              tools,
+              maxRetries: 0,
+            }).consumeStream({ onError: () => undefined });
+            expect(calls.length).toBe(before + 1);
+            const body = parseSentBody(calls[before]);
+            expect(Array.isArray(body.tools)).toBe(tools != null);
+            const expectedEffort = clamped && tools != null ? "none" : undefined;
+            if (wireFormat === "chatCompletions") {
+              expect(body.reasoning_effort).toBe(expectedEffort);
+            } else {
+              expect(body.reasoning).toBeUndefined();
+            }
+          }
+        } finally {
+          fetchSpy.mockRestore();
+        }
+      });
+    }
+  );
 });
 
 describe("ProviderModelFactory OpenAI WebSocket transport", () => {
@@ -1583,7 +1963,7 @@ describe("ProviderModelFactory OpenAI WebSocket transport", () => {
         },
       });
 
-      const result = await factory.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
+      const result = await factory.createModel(KNOWN_MODELS.GPT.id);
 
       expect(result.success).toBe(true);
       if (!result.success) {
@@ -1628,7 +2008,6 @@ describe("ProviderModelFactory OpenAI WebSocket transport", () => {
         const factory = new ProviderModelFactory(
           config,
           providerService,
-          undefined,
           undefined,
           devToolsService
         );
@@ -1705,7 +2084,7 @@ describe("ProviderModelFactory Codex authentication", () => {
         },
       });
 
-      const result = await factory.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
+      const result = await factory.createModel(KNOWN_MODELS.GPT.id);
       expect(result.success).toBe(true);
       if (!result.success) {
         return;
@@ -1726,7 +2105,7 @@ describe("ProviderModelFactory Codex authentication", () => {
             expires: Date.now() + 60_000,
             accountId: "test-account-id",
           },
-          models: [{ id: "team-codex", mappedToModel: KNOWN_MODELS.GPT_53_CODEX.id }],
+          models: [{ id: "team-codex", mappedToModel: KNOWN_MODELS.GPT.id }],
         },
       });
 
@@ -1773,7 +2152,7 @@ describe("ProviderModelFactory Codex authentication", () => {
       try {
         // Codex OAuth serves only the Responses API, so the factory must hand the
         // SDK the real key instead of the "codex-oauth" placeholder.
-        const result = await factory.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
+        const result = await factory.createModel(KNOWN_MODELS.GPT.id);
         expect(result.success).toBe(true);
         expect(capturedApiKey).toBe("sk-test");
       } finally {
@@ -1790,7 +2169,7 @@ describe("ProviderModelFactory Codex authentication", () => {
         },
       });
 
-      const result = await factory.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
+      const result = await factory.createModel(KNOWN_MODELS.GPT.id);
       expect(result.success).toBe(true);
       if (!result.success) {
         return;
@@ -1800,6 +2179,131 @@ describe("ProviderModelFactory Codex authentication", () => {
     });
   });
 });
+describe("ProviderModelFactory.resolveGatewayModelString (mux gateway)", () => {
+  // Raw file writes (not editConfig/saveProvidersConfig) keep the legacy
+  // muxGateway* config keys exactly as older configs persist them.
+  async function writeMainConfig(config: Config, mainConfig: object): Promise<void> {
+    await writeFile(
+      path.join(config.rootDir, "config.json"),
+      JSON.stringify({ projects: [], ...mainConfig }, null, 2),
+      "utf-8"
+    );
+  }
+
+  async function writeProvidersConfig(config: Config, providersConfig: object): Promise<void> {
+    await writeFile(
+      path.join(config.rootDir, "providers.jsonc"),
+      JSON.stringify(providersConfig, null, 2),
+      "utf-8"
+    );
+  }
+
+  function toGatewayModelString(modelString: string): string {
+    const colonIndex = modelString.indexOf(":");
+    const provider = colonIndex === -1 ? modelString : modelString.slice(0, colonIndex);
+    const modelId = colonIndex === -1 ? "" : modelString.slice(colonIndex + 1);
+    return `mux-gateway:${provider}/${modelId}`;
+  }
+
+  it("routes allowlisted models when gateway is enabled + configured", async () => {
+    await withTempConfig(async (config, factory) => {
+      await writeMainConfig(config, {
+        muxGatewayEnabled: true,
+        muxGatewayModels: [KNOWN_MODELS.SONNET.id],
+      });
+      await writeProvidersConfig(config, {
+        "mux-gateway": { couponCode: "test-coupon" },
+      });
+
+      const resolved = factory.resolveGatewayModelString(KNOWN_MODELS.SONNET.id);
+
+      expect(resolved).toBe(toGatewayModelString(KNOWN_MODELS.SONNET.id));
+    });
+  });
+
+  it("does not route when the mux-gateway provider is disabled", async () => {
+    await withTempConfig(async (config, factory) => {
+      await writeMainConfig(config, {
+        routePriority: ["mux-gateway", "direct"],
+      });
+      await writeProvidersConfig(config, {
+        anthropic: { apiKey: "sk-ant-test" },
+        "mux-gateway": {
+          couponCode: "test-coupon",
+          enabled: false,
+        },
+      });
+
+      const resolved = factory.resolveGatewayModelString(KNOWN_MODELS.SONNET.id);
+
+      expect(resolved).toBe(KNOWN_MODELS.SONNET.id);
+    });
+  });
+
+  it("does not route when gateway is not configured", async () => {
+    await withTempConfig(async (config, factory) => {
+      await writeMainConfig(config, {
+        muxGatewayEnabled: true,
+        muxGatewayModels: [KNOWN_MODELS.SONNET.id],
+      });
+
+      const resolved = factory.resolveGatewayModelString(KNOWN_MODELS.SONNET.id);
+
+      expect(resolved).toBe(KNOWN_MODELS.SONNET.id);
+    });
+  });
+
+  it("does not route unsupported providers even when allowlisted", async () => {
+    await withTempConfig(async (config, factory) => {
+      const modelString = "openrouter:some-model";
+      await writeMainConfig(config, {
+        muxGatewayEnabled: true,
+        muxGatewayModels: [modelString],
+      });
+      await writeProvidersConfig(config, {
+        "mux-gateway": { couponCode: "test-coupon" },
+      });
+
+      const resolved = factory.resolveGatewayModelString(modelString);
+
+      expect(resolved).toBe(modelString);
+    });
+  });
+
+  it("routes model variants when the base model is allowlisted via modelKey", async () => {
+    await withTempConfig(async (config, factory) => {
+      const variant = "xai:grok-4-1-fast-reasoning";
+      await writeMainConfig(config, {
+        muxGatewayEnabled: true,
+        muxGatewayModels: ["xai:grok-4-1-fast"],
+      });
+      await writeProvidersConfig(config, {
+        "mux-gateway": { couponCode: "test-coupon" },
+      });
+
+      const resolved = factory.resolveGatewayModelString(variant, "xai:grok-4-1-fast");
+
+      expect(resolved).toBe(toGatewayModelString(variant));
+    });
+  });
+
+  it("honors explicit mux-gateway prefixes from legacy clients", async () => {
+    await withTempConfig(async (config, factory) => {
+      await writeMainConfig(config, {
+        muxGatewayEnabled: true,
+        muxGatewayModels: [],
+      });
+      await writeProvidersConfig(config, {
+        "mux-gateway": { couponCode: "test-coupon" },
+      });
+
+      const resolved = factory.resolveGatewayModelString(KNOWN_MODELS.GPT.id, undefined, true);
+
+      expect(resolved).toBe(toGatewayModelString(KNOWN_MODELS.GPT.id));
+    });
+  });
+});
+
 describe("ProviderModelFactory routing", () => {
   it("honors non-mux gateway routes end-to-end", async () => {
     await withTempConfig(async (config, factory) => {
@@ -2184,9 +2688,9 @@ describe("ProviderModelFactory routing", () => {
 
         // Direct OpenAI should win because Codex OAuth makes it available for routing.
         // Use a model from CODEX_OAUTH_ALLOWED_MODELS so createModel can route through OAuth.
-        const result = await factory.resolveAndCreateModel("openai:gpt-5.2", "off");
+        const result = await factory.resolveAndCreateModel("openai:gpt-6-luna", "off");
         expectSuccessfulRouteResult(result, {
-          effectiveModelString: "openai:gpt-5.2",
+          effectiveModelString: "openai:gpt-6-luna",
           routeProvider: "openai",
           routedThroughGateway: false,
         });
@@ -2296,81 +2800,6 @@ describe("classifyCopilotInitiator", () => {
   });
 });
 
-describe("countAnthropicCacheBreakpoints", () => {
-  it("counts the intended three manual Anthropic cache breakpoints for direct requests", () => {
-    const requestBody = {
-      model: "claude-sonnet-4-5",
-      system: [
-        {
-          type: "text",
-          text: "You are a helpful assistant",
-          cache_control: { type: "ephemeral", ttl: "1h" },
-        },
-      ],
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: "hello" },
-            {
-              type: "text",
-              text: "world",
-              cache_control: { type: "ephemeral", ttl: "1h" },
-            },
-          ],
-        },
-      ],
-      tools: [
-        {
-          name: "read_file",
-          input_schema: { type: "object" },
-        },
-        {
-          name: "bash",
-          input_schema: { type: "object" },
-          cache_control: { type: "ephemeral", ttl: "1h" },
-        },
-      ],
-    };
-
-    expect(countAnthropicCacheBreakpoints(requestBody)).toBe(3);
-  });
-
-  it("treats a top-level Anthropic cache_control block as an extra breakpoint", () => {
-    const requestBody = {
-      cache_control: { type: "ephemeral", ttl: "1h" },
-      system: [
-        {
-          type: "text",
-          text: "You are a helpful assistant",
-          cache_control: { type: "ephemeral", ttl: "1h" },
-        },
-      ],
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: "world",
-              cache_control: { type: "ephemeral", ttl: "1h" },
-            },
-          ],
-        },
-      ],
-      tools: [
-        {
-          name: "bash",
-          input_schema: { type: "object" },
-          cache_control: { type: "ephemeral", ttl: "1h" },
-        },
-      ],
-    };
-
-    expect(countAnthropicCacheBreakpoints(requestBody)).toBe(4);
-  });
-});
-
 describe("resolveAIProviderHeaderSource", () => {
   it("uses Request headers when init.headers is not provided", () => {
     const input = new Request("https://example.com", {
@@ -2459,6 +2888,122 @@ function parseSentBody(call: CapturedFetchCall): Record<string, unknown> {
   return JSON.parse(call.init.body as string) as Record<string, unknown>;
 }
 
+describe("ProviderModelFactory Anthropic Fast mode", () => {
+  unsetEnvForEachTest("ANTHROPIC_BASE_URL");
+  const sendOnce = async (
+    anthropicConfig: Record<string, unknown>,
+    modelString: string
+  ): Promise<CapturedFetchCall> => {
+    let captured: CapturedFetchCall | undefined;
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({ anthropic: { apiKey: "test-key", ...anthropicConfig } });
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel(modelString);
+        if (!result.success) throw new Error(result.error.type);
+        await generateText({ model: result.data, prompt: "hello", maxRetries: 0 }).catch(
+          () => undefined
+        );
+        expect(calls).toHaveLength(1);
+        captured = calls[0];
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+    if (captured == null) throw new Error("expected a captured request");
+    return captured;
+  };
+  const betaHeader = (call: CapturedFetchCall) =>
+    new Headers(call.init.headers).get("anthropic-beta") ?? "";
+
+  it("pins speed=fast and the beta header for supported direct models", async () => {
+    const call = await sendOnce({ speed: "fast" }, "anthropic:claude-opus-5-5");
+    expect(parseSentBody(call)).toMatchObject({ speed: "fast" });
+    expect(betaHeader(call)).toContain("fast-mode-2026-02-01");
+  });
+
+  it.each([
+    ["unsupported model", { speed: "fast" }, "anthropic:claude-opus-4-7"],
+    ["ZDR beta opt-out", { speed: "fast", disableBetaFeatures: true }, "anthropic:claude-opus-5-5"],
+    ["preference unset", {}, "anthropic:claude-opus-5-5"],
+    [
+      "non-first-party base URL",
+      { speed: "fast", baseUrl: "https://llm-proxy.example.com/anthropic" },
+      "anthropic:claude-opus-5-5",
+    ],
+  ] as const)("omits speed for %s", async (_label, anthropicConfig, modelString) => {
+    const call = await sendOnce(anthropicConfig, modelString);
+    expect(parseSentBody(call)).not.toHaveProperty("speed");
+    expect(betaHeader(call)).not.toContain("fast-mode-2026-02-01");
+  });
+});
+
+// @ai-sdk/openai strips reasoningEffort "none" for every gpt-6-* ID; Xum must still
+// serialize it for Luna (Chat Completions function calling requires it).
+describe("ProviderModelFactory GPT-6 Luna reasoning effort none", () => {
+  const cases = [
+    ["gpt-6-luna", "none", "none"],
+    ["gpt-6-luna-2026-09-22", "none", "none"],
+    ["gpt-6-luna", "high", "high"],
+    // Astra genuinely rejects "none"; keep the SDK's gating for it.
+    ["gpt-6-astra", "none", undefined],
+  ] as const;
+  // The SDK gates effort on the raw wire ID, so on Chat Completions an opaque alias
+  // mapped to Luna already keeps "none" (and so its tool calls) without the rewrite.
+  // On Responses the SDK treats opaque aliases as non-reasoning and drops every
+  // effort, a pre-existing alias limitation not specific to "none" or GPT-6.
+  const chatOnlyCases = [["team-model", "none", "none"]] as const;
+  for (const wireFormat of ["responses", "chatCompletions"] as const) {
+    it.each(wireFormat === "chatCompletions" ? [...cases, ...chatOnlyCases] : cases)(
+      `sends %s requested effort %s as %s with tools over ${wireFormat}`,
+      async (modelId, requestedEffort, expectedEffort) => {
+        await withTempConfig(async (_config, factory, _oauth, store) => {
+          store.saveProvidersConfig({
+            openai: {
+              apiKey: "native-key",
+              wireFormat,
+              webSocketTransportEnabled: false,
+              models: [{ id: "team-model", mappedToModel: "openai:gpt-6-luna" }],
+            },
+          });
+          const { calls, fakeFetch } = createCapturingFetch();
+          const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+          try {
+            const result = await factory.createModel(`openai:${modelId}`);
+            if (!result.success) throw new Error(result.error.type);
+            await generateText({
+              model: result.data,
+              prompt: "hello",
+              tools: {
+                lookup: tool({
+                  inputSchema: jsonSchema<{ query: string }>({
+                    type: "object",
+                    properties: { query: { type: "string" } },
+                    required: ["query"],
+                  }),
+                }),
+              },
+              providerOptions: { openai: { reasoningEffort: requestedEffort } },
+              maxRetries: 0,
+            }).catch(() => undefined);
+            expect(calls).toHaveLength(1);
+            const body = parseSentBody(calls[0]);
+            expect(body.tools).toHaveLength(1);
+            const sentEffort =
+              wireFormat === "chatCompletions"
+                ? body.reasoning_effort
+                : (body.reasoning as { effort?: unknown } | undefined)?.effort;
+            expect(sentEffort).toBe(expectedEffort);
+          } finally {
+            fetchSpy.mockRestore();
+          }
+        });
+      }
+    );
+  }
+});
+
 describe("wrapFetchWithXAIServiceTier", () => {
   it("injects priority processing into xAI request bodies", async () => {
     const { calls, fakeFetch } = createCapturingFetch();
@@ -2501,9 +3046,8 @@ describe("wrapFetchWithAnthropicCacheControl — ZDR stripping", () => {
       injectCacheControl: false,
     });
 
-    // Markers the request pipeline can serialize before the wrapper runs:
-    // eligibility checks read a policy-filtered view that can hide the
-    // global disableBetaFeatures flag, so the wire must strip them.
+    // Markers the request pipeline can serialize before the wrapper runs; the
+    // wire strips them whatever upstream eligibility checks decided.
     await wrapped("https://proxy.example/v1/messages", {
       method: "POST",
       body: JSON.stringify({
@@ -2539,6 +3083,35 @@ describe("wrapFetchWithAnthropicCacheControl — ZDR stripping", () => {
 
     expect(calls).toHaveLength(1);
     expect(JSON.stringify(parseSentBody(calls[0]))).toContain("cache_control");
+  });
+});
+
+describe("wrapFetchWithAnthropicCacheControl — deferred tools (#5262)", () => {
+  it("marks the last non-deferred tool and never leaves cache_control on a deferred one", async () => {
+    const { calls, fakeFetch } = createCapturingFetch();
+    const wrapped = wrapFetchWithAnthropicCacheControl(fakeFetch, "1h");
+
+    await wrapped("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+        tools: [
+          { name: "bash" },
+          { name: "tool_catalog_search" },
+          { name: "zulip_list", defer_loading: true, cache_control: { type: "ephemeral" } },
+          // Gateway prompt format carries the marker in providerOptions.
+          { name: "zulip_send", providerOptions: { anthropic: { deferLoading: true } } },
+        ],
+      }),
+    });
+
+    const tools = (parseSentBody(calls[0]) as { tools: Array<Record<string, unknown>> }).tools;
+    expect(tools.map((tool) => [tool.name, tool.cache_control])).toEqual([
+      ["bash", undefined],
+      ["tool_catalog_search", { type: "ephemeral", ttl: "1h" }],
+      ["zulip_list", undefined],
+      ["zulip_send", undefined],
+    ]);
   });
 });
 
@@ -2604,6 +3177,7 @@ describe("wrapFetchWithAnthropicCacheControl — reasoning fields pass through u
 });
 
 describe("ProviderModelFactory Coder", () => {
+  unsetEnvForEachTest("OPENAI_BASE_URL", "OPENAI_API_BASE");
   const CODER_DEPLOYMENT_URL = "https://coder.example.com";
 
   function saveCoderConfig(config: Config, overrides: Record<string, unknown> = {}): void {
@@ -2657,12 +3231,14 @@ describe("ProviderModelFactory Coder", () => {
     "github-copilot:gpt-6-astra",
     "github-copilot:gpt-5.4",
     "openai:gpt-6-astra",
+    "openai:gpt-6.1-sol",
+    "openai:gpt-6-luna",
     "openai:team-astra",
     "responses-proxy:team-astra",
     "openrouter:openai/team-astra",
     "mux-gateway:openai/team-astra",
     "responses-proxy:gpt-6-astra",
-  ])("pins and serializes the shared Fast tier through %s", async (modelString) => {
+  ])("pins Fast tiers and isolates live per-chat speed changes through %s", async (modelString) => {
     await withTempConfig(async (config, factory, oauth, store) => {
       saveCoderConfig(config, {
         models: [
@@ -2808,6 +3384,107 @@ describe("ProviderModelFactory Coder", () => {
             }
           }
         }
+
+        for (const pinnedTier of [undefined, "priority"] as const) {
+          store.saveProvidersConfig({
+            ...providersConfig,
+            openai: { ...providersConfig.openai, serviceTier: pinnedTier },
+          });
+          // Models can be prepared before a chat has selected a speed. Each
+          // callback must stay attached to its own holder, even when unset.
+          const chatA: { serviceTier?: ServiceTier } = {};
+          const chatB: { serviceTier?: ServiceTier } = {};
+          const modelA = await factory.createModel(modelString, undefined, {
+            getServiceTierOverride: () => chatA.serviceTier,
+          });
+          const modelB = await factory.resolveAndCreateModel(modelString, "off", undefined, {
+            getServiceTierOverride: () => chatB.serviceTier,
+          });
+          if (!modelA.success) throw new Error(modelA.error.type);
+          if (!modelB.success) throw new Error(modelB.error.type);
+
+          // Preference, credentials, aliases, instance types and wire edits
+          // must not be reloaded by existing chats when only A changes speed.
+          store.saveProvidersConfig({
+            openai: {
+              apiKey: "edited-key",
+              baseUrl: "https://edited.example.com/v1",
+              serviceTier: "flex",
+              wireFormat: "chatCompletions",
+            },
+          });
+          const staleOptions: Record<string, Record<string, string>> = modelString.startsWith(
+            "openrouter:"
+          )
+            ? { openrouter: { service_tier: "auto" } }
+            : modelString.startsWith("github-copilot:")
+              ? { "github-copilot": { serviceTier: "auto" } }
+              : { openai: { serviceTier: "auto" } };
+          const staleOptionsSnapshot = structuredClone(staleOptions);
+          const supportsUltrafast =
+            (modelString.startsWith("openai:") && !modelString.endsWith("gpt-6-luna")) ||
+            modelString.startsWith("responses-proxy:") ||
+            modelString.startsWith("coder:openai/") ||
+            modelString.startsWith("coder:prod-ai/");
+          let originalCall: CapturedFetchCall | undefined;
+          for (const tier of [
+            undefined,
+            "default",
+            "priority",
+            "ultrafast",
+            "default",
+            undefined,
+          ] as const) {
+            chatA.serviceTier = tier;
+            for (const stream of [false, true]) {
+              for (const { expected, ...request } of [
+                {
+                  model: modelA.data,
+                  expected:
+                    tier === "ultrafast" && !supportsUltrafast ? undefined : (tier ?? pinnedTier),
+                },
+                {
+                  model: modelA.data,
+                  providerOptions: staleOptions,
+                  expected:
+                    tier === "ultrafast" && !supportsUltrafast
+                      ? undefined
+                      : (tier ?? ("auto" as const)),
+                },
+                { model: modelB.data.model, expected: pinnedTier },
+              ]) {
+                const before = calls.length;
+                if (stream) {
+                  await streamText({ ...request, prompt: "hello", maxRetries: 0 }).consumeStream({
+                    onError: () => undefined,
+                  });
+                } else {
+                  await generateText({ ...request, prompt: "hello", maxRetries: 0 }).catch(
+                    () => undefined
+                  );
+                }
+                expect(calls.length).toBe(before + 1);
+                const call = calls[before];
+                const body = parseSentBody(call);
+                originalCall ??= call;
+                expect(call.url).toBe(originalCall.url);
+                expect(body.model).toBe(parseSentBody(originalCall).model);
+                expect(new Headers(call.init.headers).get("authorization")).toBe(
+                  new Headers(originalCall.init.headers).get("authorization")
+                );
+                if (modelString.startsWith("mux-gateway:")) {
+                  expect((body.providerOptions as MuxProviderOptions)?.openai?.serviceTier).toBe(
+                    expected
+                  );
+                } else {
+                  expect(body.service_tier).toBe(expected);
+                }
+              }
+            }
+          }
+          expect(chatB.serviceTier).toBeUndefined();
+          expect(staleOptions).toEqual(staleOptionsSnapshot);
+        }
       } finally {
         fetchSpy.mockRestore();
       }
@@ -2914,35 +3591,174 @@ describe("ProviderModelFactory Coder", () => {
     }
   );
 
-  it("does not serialize a retained OpenAI tier under a Coder-only enforced policy", async () => {
-    await withTempPolicyProviderFactory(
-      { policy_format_version: "0.1", provider_access: [{ id: "coder" }] },
-      async (config, factory, _policyService, oauth) => {
-        saveCoderConfig(config);
-        const store = new ProvidersConfigStore(config.rootDir);
-        store.saveProvidersConfig({
-          ...store.loadProvidersConfig(),
-          openai: { serviceTier: "priority" },
+  // The gateway's openai-compat instances speak Chat Completions, so the same
+  // tool-reasoning clamp applies there. A Coder-scoped "Treat as" mapping is
+  // the only capability identity such an alias has; the raw origin id is not.
+  it.each([
+    ["coder:chat-proxy/team-luna", true],
+    ["coder:chat-proxy/gpt-6-luna", true],
+    ["coder:chat-proxy/team-astra", false],
+  ])(
+    "clamps %s tool requests through a Coder openai-compat instance (%p)",
+    async (modelString, clamped) => {
+      await withTempConfig(async (config, factory, oauth) => {
+        saveCoderConfig(config, {
+          models: [
+            { id: "chat-proxy/team-luna", mappedToModel: "openai:gpt-6-luna" },
+            { id: "chat-proxy/team-astra", mappedToModel: "openai:gpt-6-astra" },
+          ],
+          additionalProviders: [{ name: "chat-proxy", type: "openai-compat" }],
         });
         oauth.coderOauthService = stubCoderOauthService();
         const { calls, fakeFetch } = createCapturingFetch();
         const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
         try {
-          for (const options of [undefined, { openai: { serviceTier: "priority" as const } }]) {
-            const created = await factory.createModel("coder:openai/gpt-6-astra", options);
-            if (!created.success) throw new Error(created.error.type);
+          const result = await factory.createModel(modelString);
+          if (!result.success) throw new Error(result.error.type);
+          const probe = tool({
+            inputSchema: jsonSchema<Record<string, never>>({ type: "object" }),
+          });
+          for (const tools of [{ probe }, undefined]) {
             const before = calls.length;
-            await generateText({ model: created.data, prompt: "hello", maxRetries: 0 }).catch(
-              () => undefined
-            );
+            await streamText({
+              model: result.data,
+              prompt: "hello",
+              tools,
+              maxRetries: 0,
+            }).consumeStream({ onError: () => undefined });
             expect(calls.length).toBe(before + 1);
-            expect(parseSentBody(calls[before])).not.toHaveProperty("service_tier");
+            expect(calls[before].url).toContain("/chat/completions");
+            const body = parseSentBody(calls[before]);
+            expect(Array.isArray(body.tools)).toBe(tools != null);
+            expect(body.reasoning_effort).toBe(clamped && tools != null ? "none" : undefined);
           }
         } finally {
           fetchSpy.mockRestore();
         }
+      });
+    }
+  );
+
+  // @ai-sdk/openai's Chat Completions adapter drops the response's
+  // service_tier, so usage through an openai-compat instance priced at base
+  // rates even when the upstream billed Fast (#4786). Only a tier the upstream
+  // reports counts: compatible upstreams may ignore the requested tier.
+  it.each([
+    ["priority", "priority"],
+    [undefined, undefined],
+  ])(
+    "reports the upstream service tier %p through a Coder openai-compat instance",
+    async (reportedTier, expectedTier) => {
+      const tierField = reportedTier == null ? {} : { service_tier: reportedTier };
+      const base = { id: "c1", created: 1, model: "team-astra", ...tierField };
+      const usage = { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 };
+      const server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        async fetch(req) {
+          const body = (await req.json()) as { stream?: boolean };
+          if (!body.stream) {
+            return Response.json({
+              ...base,
+              object: "chat.completion",
+              choices: [
+                { index: 0, message: { role: "assistant", content: "hi" }, finish_reason: "stop" },
+              ],
+              usage,
+            });
+          }
+          const chunks = [
+            { choices: [{ index: 0, delta: { role: "assistant", content: "hi" } }] },
+            { choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage },
+          ].map(
+            (chunk) =>
+              `data: ${JSON.stringify({ ...base, object: "chat.completion.chunk", ...chunk })}\n\n`
+          );
+          return new Response(`${chunks.join("")}data: [DONE]\n\n`, {
+            headers: { "content-type": "text/event-stream" },
+          });
+        },
+      });
+      const deploymentUrl = server.url.origin;
+      try {
+        await withTempConfig(async (config, factory, oauth) => {
+          saveCoderConfig(config, {
+            deploymentUrl,
+            coderOauth: {
+              type: "oauth",
+              sessionId: "session_factory",
+              deploymentUrl,
+              access: "at_factory",
+              refresh: "rt_factory",
+              expires: Date.now() + 3_600_000,
+              clientId: "c",
+              clientSecret: "s",
+            },
+            additionalProviders: [{ name: "chat-proxy", type: "openai-compat" }],
+          });
+          oauth.coderOauthService = stubCoderOauthService("at_factory", deploymentUrl);
+          const result = await factory.createModel("coder:chat-proxy/team-astra");
+          if (!result.success) throw new Error(result.error.type);
+          const providerOptions = { openai: { serviceTier: "priority" as const } };
+
+          const generated = await generateText({
+            model: result.data,
+            prompt: "hello",
+            providerOptions,
+            maxRetries: 0,
+          });
+          expect(generated.text).toBe("hi");
+          expect(generated.providerMetadata?.openai?.serviceTier).toBe(expectedTier);
+
+          const streamed = streamText({
+            model: result.data,
+            prompt: "hello",
+            providerOptions,
+            maxRetries: 0,
+          });
+          expect(await streamed.text).toBe("hi");
+          expect((await streamed.providerMetadata)?.openai?.serviceTier).toBe(expectedTier);
+
+          // Raw chunks are requested internally only; a caller that did not ask
+          // for them must not receive them (streamText hides them on its own).
+          const model = result.data;
+          if (typeof model === "string" || model.specificationVersion !== "v4") {
+            throw new Error("expected a v4 language model");
+          }
+          const { stream } = await model.doStream({
+            prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+          });
+          const partTypes: string[] = [];
+          const reader = stream.getReader();
+          for (let next = await reader.read(); !next.done; next = await reader.read()) {
+            partTypes.push(next.value.type);
+          }
+          expect(partTypes).toContain("finish");
+          expect(partTypes).not.toContain("raw");
+        });
+      } finally {
+        await server.stop(true);
       }
-    );
+    }
+  );
+
+  it("never sends access programs through Coder's OpenAI Responses route", async () => {
+    await withTempConfig(async (config, factory, oauth) => {
+      saveCoderConfig(config);
+      oauth.coderOauthService = stubCoderOauthService();
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel("coder:openai/gpt-6.1-sol");
+        if (!result.success) throw new Error(result.error.type);
+        await sendWithCyberKey(result.data, false);
+        expect(calls).toHaveLength(1);
+        expect(calls[0].url).toEndWith("/responses");
+        expect(parseSentBody(calls[0])).not.toHaveProperty("access_programs");
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
   });
 
   it("does not pin OpenAI tiers on OAuth or non-OpenAI Coder upstreams", async () => {
@@ -2992,6 +3808,30 @@ describe("ProviderModelFactory Coder", () => {
             expect(hasLanguageModelCleanup(result.data.model)).toBe(false);
           }
           expect(parseSentBody(calls[before])).not.toHaveProperty("service_tier");
+
+          const chat: { serviceTier?: ServiceTier } = {};
+          const live = await factory.createModel(model, undefined, {
+            getServiceTierOverride: () => chat.serviceTier,
+          });
+          if (!live.success) throw new Error(live.error.type);
+          for (const tier of ["priority", "ultrafast", "default"] as const) {
+            chat.serviceTier = tier;
+            for (const stream of [false, true]) {
+              const liveBefore = calls.length;
+              const request = { model: live.data, prompt: "hello", maxRetries: 0 };
+              if (stream) {
+                await streamText(request).consumeStream({ onError: () => undefined });
+              } else {
+                await generateText(request).catch(() => undefined);
+              }
+              expect(calls.length).toBe(liveBefore + 1);
+              expect(calls[liveBefore].url).toBe(calls[before].url);
+              expect(parseSentBody(calls[liveBefore]).model).toBe(
+                parseSentBody(calls[before]).model
+              );
+              expect(parseSentBody(calls[liveBefore])).not.toHaveProperty("service_tier");
+            }
+          }
         }
       } finally {
         fetchSpy.mockRestore();
@@ -3313,6 +4153,293 @@ describe("ProviderModelFactory Coder", () => {
       } finally {
         PROVIDER_REGISTRY.openai = originalOpenAIRegistry;
       }
+    });
+  });
+
+  it("routes canonical models to the canonicalRoutes-mapped instance with native identity", async () => {
+    await withTempConfig(async (config, factory, oauth) => {
+      saveCoderConfig(config, {
+        discoveredProviders: [
+          { name: "anthropic", type: "anthropic" },
+          { name: "claude-aws-us-east-2", type: "anthropic" },
+          { name: "agents-google", type: "google" },
+        ],
+        canonicalRoutes: { anthropic: "claude-aws-us-east-2", google: "agents-google" },
+      });
+      await saveRoutePriority(config, ["coder"]);
+      oauth.coderOauthService = stubCoderOauthService();
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      const sendAndGetUrl = async (model: LanguageModel): Promise<string | undefined> => {
+        await generateText({ model, prompt: "hello", maxRetries: 0 }).catch(() => undefined);
+        return calls.at(-1)?.url;
+      };
+      try {
+        const routed = await factory.resolveAndCreateModel("anthropic:claude-opus-5-5", "off");
+        if (!routed.success) throw new Error(routed.error.type);
+        expect(routed.data.effectiveModelString).toBe("coder:claude-aws-us-east-2/claude-opus-5-5");
+        expect(routed.data.canonicalModelString).toBe("anthropic:claude-opus-5-5");
+        expect(routed.data.wireProviderName).toBe("anthropic");
+        expect(factory.resolveEffectiveModelString("anthropic:claude-opus-5-5")).toBe(
+          "coder:claude-aws-us-east-2/claude-opus-5-5"
+        );
+        expect(await sendAndGetUrl(routed.data.model)).toBe(
+          `${CODER_DEPLOYMENT_URL}/api/v2/aibridge/claude-aws-us-east-2/v1/messages`
+        );
+
+        // An explicit selection keeps addressing the instance literally named in it.
+        const explicit = await factory.resolveAndCreateModel(
+          "coder:anthropic/claude-opus-5-5",
+          "off"
+        );
+        if (!explicit.success) throw new Error(explicit.error.type);
+        expect(explicit.data.effectiveModelString).toBe("coder:anthropic/claude-opus-5-5");
+        expect(factory.resolveEffectiveModelString("coder:anthropic/claude-opus-5-5")).toBe(
+          "coder:anthropic/claude-opus-5-5"
+        );
+        expect(await sendAndGetUrl(explicit.data.model)).toBe(
+          `${CODER_DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/messages`
+        );
+
+        const gemini = await factory.resolveAndCreateModel("google:gemini-3.8-flash", "off");
+        if (!gemini.success) throw new Error(gemini.error.type);
+        expect(gemini.data.effectiveModelString).toBe("coder:agents-google/gemini-3.8-flash");
+        expect(gemini.data.canonicalModelString).toBe("google:gemini-3.8-flash");
+        expect(await sendAndGetUrl(gemini.data.model)).toBe(
+          `${CODER_DEPLOYMENT_URL}/api/v2/aibridge/agents-google/v1/chat/completions`
+        );
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
+
+  it("samples live per-chat speed between SDK tool steps without changing an active request", async () => {
+    await withTempConfig(async (config, factory, oauth, store) => {
+      saveCoderConfig(config, {
+        additionalProviders: [{ name: "chat-proxy", type: "openai-compat" }],
+        models: [{ id: "chat-proxy/team-astra", mappedToModel: "openai:gpt-6-astra" }],
+      });
+      store.saveProvidersConfig({
+        ...store.loadProvidersConfig(),
+        openai: { serviceTier: "priority" },
+      });
+      await saveRoutePriority(config, ["direct"]);
+      oauth.coderOauthService = stubCoderOauthService();
+      const chat: { serviceTier: ServiceTier } = { serviceTier: "default" };
+      const requestStarted = Promise.withResolvers<void>();
+      const releaseFirstRequest = Promise.withResolvers<void>();
+      const sse = (chunks: unknown[]) =>
+        new Response(
+          `${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("")}data: [DONE]\n\n`,
+          {
+            headers: { "content-type": "text/event-stream" },
+          }
+        );
+      const responses = [
+        sse([
+          {
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  role: "assistant",
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: "call_echo",
+                      type: "function",
+                      function: { name: "echo", arguments: '{"text":"hello"}' },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+          { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+        ]),
+        sse([{ choices: [{ index: 0, delta: { content: "done" }, finish_reason: "stop" }] }]),
+      ];
+      const { calls, fakeFetch: capture } = createCapturingFetch();
+      const fakeFetch = Object.assign(async (...args: Parameters<typeof capture>) => {
+        await capture(...args);
+        const response = responses.shift();
+        if (!response) throw new Error("Unexpected extra model request");
+        if (calls.length === 1) {
+          requestStarted.resolve();
+          await releaseFirstRequest.promise;
+        }
+        return response;
+      }, capture);
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const model = await factory.resolveAndCreateModel(
+          "coder:chat-proxy/team-astra",
+          "off",
+          undefined,
+          {
+            getServiceTierOverride: () => chat.serviceTier,
+          }
+        );
+        if (!model.success) throw new Error(model.error.type);
+        const echoed: string[] = [];
+        const result = streamText({
+          model: model.data.model,
+          prompt: "echo hello",
+          providerOptions: { openai: { serviceTier: "flex" } },
+          maxRetries: 0,
+          tools: {
+            echo: tool({
+              inputSchema: z.object({ text: z.string() }),
+              execute: ({ text }) => {
+                echoed.push(text);
+                return Promise.resolve(text);
+              },
+            }),
+          },
+          stopWhen: stepCountIs(2),
+        });
+        const text = result.text;
+        await requestStarted.promise;
+        const firstBody = calls[0].init.body;
+        // The selector changes while the first request is still awaiting its
+        // response. Only the next SDK step may observe the new chat value.
+        chat.serviceTier = "priority";
+        store.saveProvidersConfig({ openai: { serviceTier: "auto" } });
+        releaseFirstRequest.resolve();
+
+        expect(await text).toBe("done");
+        expect(echoed).toEqual(["hello"]);
+        expect(calls).toHaveLength(2);
+        expect(calls[0].init.body).toBe(firstBody);
+        expect(calls.map((call) => parseSentBody(call).service_tier)).toEqual([
+          "default",
+          "priority",
+        ]);
+        for (const call of calls) {
+          expect(call.url).toBe(
+            `${CODER_DEPLOYMENT_URL}/api/v2/aibridge/chat-proxy/v1/chat/completions`
+          );
+          expect(parseSentBody(call).model).toBe("team-astra");
+        }
+        const second = parseSentBody(calls[1]) as { messages: Array<Record<string, unknown>> };
+        expect(
+          second.messages
+            .filter((message) => message.role === "tool")
+            .map((message) => message.tool_call_id)
+        ).toEqual(["call_echo"]);
+      } finally {
+        releaseFirstRequest.resolve();
+        fetchSpy.mockRestore();
+      }
+    });
+  });
+
+  it("runs Gemini tool calls streamed without an index through a Coder chat instance", async () => {
+    await withTempConfig(async (config, factory, oauth) => {
+      saveCoderConfig(config, {
+        discoveredProviders: [{ name: "agents-google", type: "google" }],
+        canonicalRoutes: { google: "agents-google" },
+      });
+      await saveRoutePriority(config, ["coder"]);
+      oauth.coderOauthService = stubCoderOauthService();
+      const sse = (chunks: unknown[]) => {
+        const body = `${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("")}data: [DONE]\n\n`;
+        // Split the first tool_calls line across network reads.
+        const cut = body.indexOf('"tool_calls"') + '"tool'.length;
+        const parts = cut < '"tool'.length ? [body] : [body.slice(0, cut), body.slice(cut)];
+        const encoder = new TextEncoder();
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              for (const part of parts) controller.enqueue(encoder.encode(part));
+              controller.close();
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } }
+        );
+      };
+      // Gemini's OpenAI-compatible shape: each call whole in its own chunk, no index.
+      const toolCallChunk = (id: string, text: string) => ({
+        choices: [
+          {
+            index: 0,
+            delta: {
+              role: "assistant",
+              tool_calls: [
+                {
+                  id,
+                  type: "function",
+                  function: { name: "echo", arguments: JSON.stringify({ text }) },
+                },
+              ],
+            },
+          },
+        ],
+      });
+      const responses = [
+        sse([
+          toolCallChunk("call_a", "a"),
+          toolCallChunk("call_b", "b"),
+          { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+        ]),
+        sse([{ choices: [{ index: 0, delta: { content: "done" }, finish_reason: "stop" }] }]),
+      ];
+      const requestBodies: Array<{ messages?: Array<Record<string, unknown>> }> = [];
+      const fakeFetch = Object.assign((_input: RequestInfo | URL, init?: RequestInit) => {
+        requestBodies.push(JSON.parse(init?.body as string) as (typeof requestBodies)[number]);
+        const response = responses.shift();
+        return response ? Promise.resolve(response) : Promise.reject(new Error("unexpected"));
+      }, fetch) as typeof fetch;
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const routed = await factory.resolveAndCreateModel("google:gemini-3.8-flash", "off");
+        if (!routed.success) throw new Error(routed.error.type);
+        const echoed: string[] = [];
+        const result = streamText({
+          model: routed.data.model,
+          prompt: "echo a and b",
+          tools: {
+            echo: tool({
+              inputSchema: jsonSchema<{ text: string }>({
+                type: "object",
+                properties: { text: { type: "string" } },
+                required: ["text"],
+              }),
+              execute: ({ text }) => {
+                echoed.push(text);
+                return Promise.resolve(text);
+              },
+            }),
+          },
+          stopWhen: stepCountIs(2),
+        });
+
+        expect(await result.text).toBe("done");
+        expect(echoed).toEqual(["a", "b"]);
+        expect(
+          requestBodies[1]?.messages
+            ?.filter((message) => message.role === "tool")
+            .map((message) => message.tool_call_id)
+        ).toEqual(["call_a", "call_b"]);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
+
+  it("does not route a canonical model through Coder when its mapped instance is unknown", async () => {
+    await withTempConfig(async (config, factory, oauth) => {
+      saveCoderConfig(config, {
+        discoveredProviders: [{ name: "anthropic", type: "anthropic" }],
+        canonicalRoutes: { anthropic: "deleted-instance" },
+      });
+      await saveRoutePriority(config, ["coder", "direct"]);
+      oauth.coderOauthService = stubCoderOauthService();
+
+      expect(factory.resolveEffectiveModelString("anthropic:claude-opus-5-5")).toBe(
+        "anthropic:claude-opus-5-5"
+      );
     });
   });
 
@@ -3864,246 +4991,6 @@ describe("ProviderModelFactory Coder", () => {
     });
   });
 
-  it("rechecks policy per request, not only at model creation", async () => {
-    // Regression: an enforced policy can refresh mid-stream (or during the
-    // awaited setup between resolveAndCreateModel and the first fetch) to
-    // deny Coder or the specific model. getValidAuth() only validates the
-    // credential/issuer, so without a per-request policy gate the wrapper
-    // would keep attaching the OAuth token for the remainder of a long
-    // multi-step stream.
-    await withTempPolicyProviderFactory(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "coder" }],
-      },
-      async (config, factory, policyService, oauth) => {
-        const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
-        const originalFetch = globalThis.fetch;
-        let capturedFetch: typeof fetch | undefined;
-        let upstreamCalls = 0;
-
-        saveCoderConfig(config);
-        oauth.coderOauthService = stubCoderOauthService();
-
-        PROVIDER_REGISTRY.anthropic = async () => {
-          const module = await originalAnthropicRegistry();
-          return {
-            ...module,
-            createAnthropic: (options) => {
-              capturedFetch = options?.fetch;
-              return module.createAnthropic(options);
-            },
-          };
-        };
-
-        globalThis.fetch = Object.assign(
-          (_input: Parameters<typeof fetch>[0], _init?: Parameters<typeof fetch>[1]) => {
-            upstreamCalls++;
-            return Promise.resolve(new Response("{}", { status: 200 }));
-          },
-          { preconnect: () => undefined }
-        ) as typeof fetch;
-
-        try {
-          // Model creation succeeds under the permissive policy.
-          const result = await factory.createModel("coder:anthropic/claude-sonnet-4-5");
-          expect(result.success).toBe(true);
-          expect(capturedFetch).toBeDefined();
-
-          // First request under the permissive policy goes through.
-          await capturedFetch!(`${CODER_DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/messages`, {
-            method: "POST",
-            headers: { "x-api-key": "coder" },
-            body: "{}",
-          });
-          expect(upstreamCalls).toBe(1);
-
-          // The policy refreshes mid-session: coder allows only another model.
-          await writeFile(
-            process.env.MUX_POLICY_FILE!,
-            JSON.stringify({
-              policy_format_version: "0.1",
-              provider_access: [{ id: "coder", model_access: ["openai/gpt-5.2"] }],
-            }),
-            "utf-8"
-          );
-          const refresh = await policyService.refreshNow();
-          expect(refresh.success).toBe(true);
-
-          // The SAME created model's next request must fail closed without
-          // hitting the upstream (no token attached, no bypass).
-          // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-          await expect(
-            capturedFetch!(`${CODER_DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/messages`, {
-              method: "POST",
-              headers: { "x-api-key": "coder" },
-              body: "{}",
-            })
-          ).rejects.toThrow("not allowed by policy");
-          expect(upstreamCalls).toBe(1);
-
-          // A refresh that denies the provider entirely fails the same way.
-          await writeFile(
-            process.env.MUX_POLICY_FILE!,
-            JSON.stringify({
-              policy_format_version: "0.1",
-              provider_access: [{ id: "openai" }],
-            }),
-            "utf-8"
-          );
-          expect((await policyService.refreshNow()).success).toBe(true);
-          // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-          await expect(
-            capturedFetch!(`${CODER_DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/messages`, {
-              method: "POST",
-              headers: { "x-api-key": "coder" },
-              body: "{}",
-            })
-          ).rejects.toThrow("not allowed by policy");
-          expect(upstreamCalls).toBe(1);
-        } finally {
-          globalThis.fetch = originalFetch;
-          PROVIDER_REGISTRY.anthropic = originalAnthropicRegistry;
-        }
-      }
-    );
-  });
-
-  it("rechecks policy after the awaited token refresh, before attaching credentials", async () => {
-    // Regression: getValidAuth() can spend tens of seconds refreshing an
-    // expired token and waiting for cross-process file locks AFTER the
-    // wrapper's pre-await policy check passed. A policy refresh landing in
-    // that window (denying Coder or this model) must not be bypassed — the
-    // wrapper must recheck immediately before adding the Authorization
-    // header. Deterministically simulated by flipping the policy inside the
-    // stubbed getValidAuth.
-    await withTempPolicyProviderFactory(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "coder" }],
-      },
-      async (config, factory, policyService, oauth) => {
-        const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
-        const originalFetch = globalThis.fetch;
-        let capturedFetch: typeof fetch | undefined;
-        let upstreamCalls = 0;
-
-        saveCoderConfig(config);
-        const stub = stubCoderOauthService();
-        const stubbedGetValidAuth = stub.getValidAuth.bind(stub);
-        stub.getValidAuth = async () => {
-          // The policy refreshes to deny coder WHILE the token refresh is in
-          // flight — after the wrapper's pre-await check already passed.
-          await writeFile(
-            process.env.MUX_POLICY_FILE!,
-            JSON.stringify({
-              policy_format_version: "0.1",
-              provider_access: [{ id: "openai" }],
-            }),
-            "utf-8"
-          );
-          const refresh = await policyService.refreshNow();
-          expect(refresh.success).toBe(true);
-          return stubbedGetValidAuth();
-        };
-        oauth.coderOauthService = stub;
-
-        PROVIDER_REGISTRY.anthropic = async () => {
-          const module = await originalAnthropicRegistry();
-          return {
-            ...module,
-            createAnthropic: (options) => {
-              capturedFetch = options?.fetch;
-              return module.createAnthropic(options);
-            },
-          };
-        };
-
-        globalThis.fetch = Object.assign(
-          (_input: Parameters<typeof fetch>[0], _init?: Parameters<typeof fetch>[1]) => {
-            upstreamCalls++;
-            return Promise.resolve(new Response("{}", { status: 200 }));
-          },
-          { preconnect: () => undefined }
-        ) as typeof fetch;
-
-        try {
-          const result = await factory.createModel("coder:anthropic/claude-sonnet-4-5");
-          expect(result.success).toBe(true);
-          expect(capturedFetch).toBeDefined();
-
-          // The pre-await check passes (policy still allows coder), the
-          // awaited getValidAuth flips the policy, and the post-await
-          // recheck must fail closed without attaching the token.
-          // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-          await expect(
-            capturedFetch!(`${CODER_DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/messages`, {
-              method: "POST",
-              headers: { "x-api-key": "coder" },
-              body: "{}",
-            })
-          ).rejects.toThrow("not allowed by policy");
-          expect(upstreamCalls).toBe(0);
-        } finally {
-          globalThis.fetch = originalFetch;
-          PROVIDER_REGISTRY.anthropic = originalAnthropicRegistry;
-        }
-      }
-    );
-  });
-
-  it("routes through the policy-forced base URL when the login matches it", async () => {
-    const LOCKED_URL = "https://locked.coder.example.com";
-    await withTempPolicyProviderFactory(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "coder", base_url: LOCKED_URL }],
-      },
-      async (config, factory, _policyService, oauth) => {
-        const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
-        let capturedBaseURL: string | undefined;
-
-        // Login performed against the policy-locked deployment (the
-        // policy-aware CoderOauthService logs in to the forced URL).
-        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-          coder: {
-            deploymentUrl: LOCKED_URL,
-            coderOauth: {
-              type: "oauth",
-              sessionId: "session_factory",
-              deploymentUrl: LOCKED_URL,
-              access: "at_factory",
-              refresh: "rt_factory",
-              expires: Date.now() + 3_600_000,
-              clientId: "c",
-              clientSecret: "s",
-            },
-          },
-        } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
-        oauth.coderOauthService = stubCoderOauthService("at_factory", LOCKED_URL);
-
-        PROVIDER_REGISTRY.anthropic = async () => {
-          const module = await originalAnthropicRegistry();
-          return {
-            ...module,
-            createAnthropic: (options) => {
-              capturedBaseURL = options?.baseURL;
-              return module.createAnthropic(options);
-            },
-          };
-        };
-
-        try {
-          const result = await factory.createModel("coder:anthropic/claude-sonnet-4-5");
-          expect(result.success).toBe(true);
-          expect(capturedBaseURL).toBe(`${LOCKED_URL}/api/v2/aibridge/anthropic/v1`);
-        } finally {
-          PROVIDER_REGISTRY.anthropic = originalAnthropicRegistry;
-        }
-      }
-    );
-  });
-
   it("only routes models from the discovered bridge catalog through Coder", async () => {
     await withTempConfig(async (config, factory, oauth) => {
       // Coder is logged in and preferred over direct, but its discovered
@@ -4239,131 +5126,6 @@ describe("ProviderModelFactory Coder", () => {
     });
   });
 
-  it("routes policy-disallowed models away from Coder at routing time", async () => {
-    await withTempPolicyProviderFactory(
-      {
-        policy_format_version: "0.1",
-        provider_access: [
-          { id: "coder", model_access: ["anthropic/claude-sonnet-4-5"] },
-          { id: "anthropic" },
-        ],
-      },
-      async (config, factory, _policyService, oauth) => {
-        // The persisted catalog is deliberately policy-unfiltered (both
-        // models present); the CURRENT policy must gate routing so the
-        // disallowed model falls back to direct instead of being rewritten
-        // to coder: and dying at model creation with policy_denied.
-        saveCoderConfig(config, {
-          models: ["anthropic/claude-sonnet-4-5", "anthropic/claude-opus-4-1"],
-          discoveredModels: ["anthropic/claude-sonnet-4-5", "anthropic/claude-opus-4-1"],
-        });
-        const providersConfig =
-          new ProvidersConfigStore(config.rootDir).loadProvidersConfig() ?? {};
-        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-          ...providersConfig,
-          anthropic: { apiKey: "sk-ant-test" },
-        } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
-        oauth.coderOauthService = stubCoderOauthService();
-
-        await saveRoutePriority(config, ["coder", "direct"]);
-
-        // Allowed by policy: routed through Coder.
-        expect(
-          factory.resolveGatewayModelString(
-            "anthropic:claude-sonnet-4-5",
-            "anthropic:claude-sonnet-4-5"
-          )
-        ).toBe("coder:anthropic/claude-sonnet-4-5");
-
-        // In the catalog but disallowed by the current policy: direct.
-        expect(
-          factory.resolveGatewayModelString(
-            "anthropic:claude-opus-4-1",
-            "anthropic:claude-opus-4-1"
-          )
-        ).toBe("anthropic:claude-opus-4-1");
-      }
-    );
-  });
-
-  it("accepts policy-bound credentials even when the editable deploymentUrl was changed", async () => {
-    const LOCKED_URL = "https://locked.coder.example.com";
-    await withTempPolicyProviderFactory(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "coder", base_url: LOCKED_URL }],
-      },
-      async (config, factory, _policyService, oauth) => {
-        const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
-        let capturedBaseURL: string | undefined;
-
-        // Tokens were minted by the forced deployment, but the user has since
-        // edited the (unlocked) deploymentUrl field to point elsewhere. The
-        // forced URL must be resolved FIRST so the valid policy-bound
-        // credentials are not rejected as issuer-mismatched.
-        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-          coder: {
-            deploymentUrl: "https://user-edited.example.com",
-            coderOauth: {
-              type: "oauth",
-              sessionId: "session_factory",
-              deploymentUrl: LOCKED_URL,
-              access: "at_factory",
-              refresh: "rt_factory",
-              expires: Date.now() + 3_600_000,
-              clientId: "c",
-              clientSecret: "s",
-            },
-          },
-        } as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]);
-        oauth.coderOauthService = stubCoderOauthService("at_factory", LOCKED_URL);
-
-        PROVIDER_REGISTRY.anthropic = async () => {
-          const module = await originalAnthropicRegistry();
-          return {
-            ...module,
-            createAnthropic: (options) => {
-              capturedBaseURL = options?.baseURL;
-              return module.createAnthropic(options);
-            },
-          };
-        };
-
-        try {
-          const result = await factory.createModel("coder:anthropic/claude-sonnet-4-5");
-          expect(result.success).toBe(true);
-          expect(capturedBaseURL).toBe(`${LOCKED_URL}/api/v2/aibridge/anthropic/v1`);
-        } finally {
-          PROVIDER_REGISTRY.anthropic = originalAnthropicRegistry;
-        }
-      }
-    );
-  });
-
-  it("fails closed when tokens were not minted by the policy-forced deployment", async () => {
-    await withTempPolicyProviderFactory(
-      {
-        policy_format_version: "0.1",
-        provider_access: [{ id: "coder", base_url: "https://locked.coder.example.com" }],
-      },
-      async (config, factory, _policyService, oauth) => {
-        // Logged in to a different (user-chosen) deployment: those tokens must
-        // not be used for the policy-locked endpoint, nor may traffic flow to
-        // the user-chosen deployment while policy is enforced. The coder route
-        // is unavailable (issuer mismatch with the forced URL), so the model
-        // falls back to the direct origin — which the policy also denies.
-        saveCoderConfig(config);
-        oauth.coderOauthService = stubCoderOauthService();
-
-        const result = await factory.createModel("coder:anthropic/claude-sonnet-4-5");
-        expect(result.success).toBe(false);
-        if (!result.success) {
-          expect(["api_key_not_found", "policy_denied"]).toContain(result.error.type);
-        }
-      }
-    );
-  });
-
   it("refuses to attach credentials minted by a different deployment than the model's", async () => {
     await withTempConfig(async (config, factory, oauth) => {
       const originalAnthropicRegistry = PROVIDER_REGISTRY.anthropic;
@@ -4454,5 +5216,925 @@ describe("ProviderModelFactory Coder", () => {
         expect(result.error.type).toBe("api_key_not_found");
       }
     });
+  });
+});
+
+describe("withAnthropicEvaluationEffort", () => {
+  const questions = {
+    q: { type: "choice", instructions: "Pick one.", criteria: { a: "A", b: "B" } },
+  } as const;
+
+  it("defaults always-thinking models to low effort without overriding the caller", async () => {
+    const seen: unknown[] = [];
+    const inner: Experimental_EvaluationModelV4 = {
+      specificationVersion: "v4",
+      provider: "anthropic.messages",
+      modelId: "claude-opus-5-5",
+      supportedQuestionTypes: ["choice"],
+      doEvaluate: (options) => {
+        seen.push(options.providerOptions);
+        return Promise.resolve({ answers: {}, warnings: [] });
+      },
+    };
+
+    expect(withAnthropicEvaluationEffort(inner, "claude-opus-5")).toBe(inner);
+    const wrapped = withAnthropicEvaluationEffort(inner, "claude-opus-5-5");
+    await wrapped.doEvaluate({
+      state: "x",
+      questions,
+      providerOptions: { other: { keep: true } },
+    });
+    await wrapped.doEvaluate({
+      state: "x",
+      questions,
+      providerOptions: { anthropic: { effort: "high" } },
+    });
+    expect(seen).toEqual([
+      { other: { keep: true }, anthropic: { effort: "low" } },
+      { anthropic: { effort: "high" } },
+    ]);
+  });
+
+  it("keeps evaluation calls on low adaptive thinking for always-thinking models", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const captureFetch = Object.assign(
+      (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        if (typeof init?.body !== "string") {
+          throw new Error("Expected a JSON request body");
+        }
+        bodies.push(JSON.parse(init.body) as Record<string, unknown>);
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              type: "error",
+              error: { type: "invalid_request_error", message: "x" },
+            }),
+            { status: 400, headers: { "content-type": "application/json" } }
+          )
+        );
+      },
+      { preconnect: fetch.preconnect.bind(fetch) }
+    );
+    const { createAnthropic } = await PROVIDER_REGISTRY.anthropic();
+    const evaluationModel = (modelId: string) =>
+      createAnthropic({ apiKey: "test", fetch: captureFetch }).evaluationModel(modelId);
+
+    // Unwrapped, @ai-sdk/anthropic 4.0.67+ maps the evaluation's reasoning "none" to
+    // `between_tools` on Sonnet 5.5. #5086 keeps evaluation calls on low adaptive
+    // thinking, which the wrapper's explicit effort preserves.
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(
+      evaluationModel("claude-sonnet-5-5").doEvaluate({ state: "x", questions })
+    ).rejects.toThrow();
+    expect(bodies[0].thinking).toEqual({ type: "between_tools" });
+
+    for (const modelId of ["claude-sonnet-5-5", "claude-opus-5-5"]) {
+      bodies.length = 0;
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(
+        withAnthropicEvaluationEffort(evaluationModel(modelId), modelId).doEvaluate({
+          state: "x",
+          questions,
+        })
+      ).rejects.toThrow();
+      expect(bodies).toHaveLength(1);
+      expect({ modelId, thinking: bodies[0].thinking }).toEqual({ modelId, thinking: undefined });
+      expect(bodies[0].output_config).toMatchObject({ effort: "low" });
+    }
+  });
+});
+
+describe("withAnthropicEvaluationEffort billed usage (#4728)", () => {
+  it("keeps the usage of an answer the wrapped adapter rejects", async () => {
+    const answerFetch = Object.assign(
+      (): Promise<Response> =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({
+              id: "msg_1",
+              type: "message",
+              role: "assistant",
+              model: "claude-opus-5-5",
+              content: [{ type: "text", text: JSON.stringify({ q0: "c9" }) }],
+              stop_reason: "end_turn",
+              stop_sequence: null,
+              usage: { input_tokens: 70, output_tokens: 7 },
+            }),
+            { headers: { "content-type": "application/json" } }
+          )
+        ),
+      { preconnect: fetch.preconnect.bind(fetch) }
+    );
+    const { createAnthropic } = await PROVIDER_REGISTRY.anthropic();
+    const model = withAnthropicEvaluationEffort(
+      createAnthropic({ apiKey: "test", fetch: answerFetch }).evaluationModel("claude-opus-5-5"),
+      "claude-opus-5-5"
+    );
+    const exit = await Effect.runPromiseExit(
+      makeEvaluationService().evaluate({
+        model,
+        state: "x",
+        questions: {
+          q: { type: "choice", instructions: "Pick one.", criteria: { a: "A", b: "B" } },
+        },
+      })
+    );
+    const error = Exit.isFailure(exit) ? Cause.findErrorOption(exit.cause) : Option.none();
+    expect(Option.isSome(error)).toBe(true);
+    if (!Option.isSome(error)) return;
+    expect(error.value).toMatchObject({ reason: "invalid-output", code: "invalid-response" });
+    expect(error.value.billedUsage?.usage).toEqual({
+      inputTokens: 70,
+      outputTokens: 7,
+      totalTokens: 77,
+    });
+  });
+});
+
+describe("ProviderModelFactory.createEvaluationModel", () => {
+  // Credential resolution reads provider env vars; the host may export real
+  // keys/base URLs, so every case runs against the temp providers.jsonc only.
+  const PROVIDER_ENV_VARS = [
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "GOOGLE_API_KEY",
+    "GOOGLE_GENERATIVE_AI_API_KEY",
+    "GOOGLE_BASE_URL",
+    "XAI_API_KEY",
+    "TYPESAFE_API_KEY",
+    "TYPESAFE_AI_API_KEY",
+    "JEV_API_KEY",
+  ] as const;
+
+  async function withEvaluationFixture(
+    providers: Record<string, unknown>,
+    run: (
+      config: Config,
+      factory: ProviderModelFactory,
+      fetchSpy: ReturnType<typeof spyOn<typeof globalThis, "fetch">>
+    ) => Promise<void>
+  ): Promise<void> {
+    const saved = new Map<string, string | undefined>();
+    for (const name of PROVIDER_ENV_VARS) {
+      saved.set(name, process.env[name]);
+      delete process.env[name];
+    }
+    const fetchSpy = spyOn(globalThis, "fetch");
+    try {
+      await withTempConfig(async (config, factory) => {
+        new ProvidersConfigStore(config.rootDir).saveProvidersConfig(
+          providers as Parameters<ProvidersConfigStore["saveProvidersConfig"]>[0]
+        );
+        await run(config, factory, fetchSpy);
+      });
+    } finally {
+      fetchSpy.mockRestore();
+      for (const [name, value] of saved) {
+        if (value === undefined) {
+          delete process.env[name];
+        } else {
+          process.env[name] = value;
+        }
+      }
+    }
+  }
+
+  function expectResolved(
+    result: Awaited<ReturnType<ProviderModelFactory["createEvaluationModel"]>>
+  ) {
+    expect(result.success).toBe(true);
+    if (!result.success) {
+      throw new Error(`Expected evaluation model, got ${result.error.reason}`);
+    }
+    return result.data;
+  }
+
+  function expectRejected(
+    result: Awaited<ReturnType<ProviderModelFactory["createEvaluationModel"]>>
+  ) {
+    expect(result.success).toBe(false);
+    if (result.success) {
+      throw new Error("Expected a typed rejection");
+    }
+    return result.error;
+  }
+
+  it.each([
+    ["openai:gpt-5", "openai"],
+    ["anthropic:claude-haiku-4-5", "anthropic"],
+    ["google:gemini-2.5-flash", "google"],
+  ] as const)(
+    "resolves %s to a direct evaluation model without network I/O",
+    async (modelString, providerName) => {
+      await withEvaluationFixture(
+        {
+          openai: { apiKey: "sk-openai" },
+          anthropic: { apiKey: "sk-anthropic" },
+          google: { apiKey: "sk-google" },
+        },
+        async (_config, factory, fetchSpy) => {
+          const pinned = expectResolved(await factory.createEvaluationModel(modelString));
+          expect(pinned.model.specificationVersion).toBe("v4");
+          expect(typeof pinned.model.doEvaluate).toBe("function");
+          expect(pinned.model.provider.startsWith(providerName)).toBe(true);
+          expect(pinned.model.modelId).toBe(modelString.slice(modelString.indexOf(":") + 1));
+          expect(pinned.routeKind).toBe("direct");
+          expect(pinned.wireProviderName).toBe(providerName);
+          expect(pinned.effectiveModelString).toBe(modelString);
+          expect(pinned.modelString).toBe(modelString);
+          expect(pinned.configFingerprint).toMatch(/^[0-9a-f]{64}$/);
+
+          const again = expectResolved(await factory.createEvaluationModel(modelString));
+          expect(again.configFingerprint).toBe(pinned.configFingerprint);
+          expect(fetchSpy).not.toHaveBeenCalled();
+        }
+      );
+    }
+  );
+
+  it("changes the fingerprint with the base URL but not with the API key", async () => {
+    let baseline: string | undefined;
+    await withEvaluationFixture({ openai: { apiKey: "sk-one" } }, async (_c, factory) => {
+      baseline = expectResolved(
+        await factory.createEvaluationModel("openai:gpt-5")
+      ).configFingerprint;
+    });
+    await withEvaluationFixture({ openai: { apiKey: "sk-two" } }, async (_c, factory) => {
+      const pinned = expectResolved(await factory.createEvaluationModel("openai:gpt-5"));
+      expect(pinned.configFingerprint).toBe(baseline!);
+    });
+    await withEvaluationFixture(
+      { openai: { apiKey: "sk-one", baseUrl: "https://proxy.example/openai" } },
+      async (_c, factory) => {
+        const pinned = expectResolved(await factory.createEvaluationModel("openai:gpt-5"));
+        expect(pinned.configFingerprint).not.toBe(baseline!);
+      }
+    );
+  });
+
+  it.each([
+    ["google", "google:gemini-2.5-flash", "GOOGLE_BASE_URL", "https://proxy.example/google"],
+    ["openai", "openai:gpt-5", "OPENAI_BASE_URL", "https://proxy.example/openai/v1"],
+    [
+      "anthropic",
+      "anthropic:claude-haiku-4-5",
+      "ANTHROPIC_BASE_URL",
+      "https://proxy.example/anthropic/v1",
+    ],
+  ] as const)(
+    "treats a blank configured %s base URL as unset so the env proxy applies",
+    async (provider, modelString, envVar, proxyUrl) => {
+      // A blank configured baseURL (raw `baseURL` spelling reaches the resolver
+      // untrimmed) must not shadow the *_BASE_URL proxy.
+      let viaEnv: string | undefined;
+      await withEvaluationFixture(
+        { [provider]: { apiKey: "k-key", baseURL: "  " } },
+        async (_c, factory) => {
+          process.env[envVar] = proxyUrl;
+          viaEnv = expectResolved(
+            await factory.createEvaluationModel(modelString)
+          ).configFingerprint;
+        }
+      );
+      let explicit: string | undefined;
+      await withEvaluationFixture(
+        { [provider]: { apiKey: "k-key", baseUrl: proxyUrl } },
+        async (_c, factory) => {
+          explicit = expectResolved(
+            await factory.createEvaluationModel(modelString)
+          ).configFingerprint;
+        }
+      );
+      let none: string | undefined;
+      await withEvaluationFixture({ [provider]: { apiKey: "k-key" } }, async (_c, factory) => {
+        none = expectResolved(await factory.createEvaluationModel(modelString)).configFingerprint;
+      });
+      expect(viaEnv).toBeDefined();
+      expect(viaEnv).toBe(explicit);
+      expect(viaEnv).not.toBe(none);
+    }
+  );
+
+  it.each([
+    ["anthropic", "anthropic:claude-haiku-4-5", "api.anthropic.com"],
+    ["openai", "openai:gpt-5-mini", "api.openai.com"],
+    ["google", "google:gemini-2.5-flash", "generativelanguage.googleapis.com"],
+  ] as const)(
+    "sends %s requests to the provider default when the configured base URL is blank and no env proxy exists",
+    async (provider, modelString, defaultHost) => {
+      // Regression: the blank `baseURL` property used to survive the config
+      // spread into the SDK settings, so requests targeted "  /v1/…".
+      await withEvaluationFixture(
+        { [provider]: { apiKey: "k-key", baseURL: "  " } },
+        async (_c, factory, fetchSpy) => {
+          const pinned = expectResolved(await factory.createEvaluationModel(modelString));
+          const urls: string[] = [];
+          fetchSpy.mockImplementation(
+            Object.assign(
+              (input: Parameters<typeof fetch>[0]) => {
+                urls.push(input instanceof Request ? input.url : String(input));
+                return Promise.reject(new Error("captured"));
+              },
+              { preconnect: () => undefined }
+            )
+          );
+          await pinned.model
+            .doEvaluate({
+              state: "hello",
+              questions: { q: { type: "boolean", instructions: "Is it a greeting?" } },
+            })
+            .then(
+              () => undefined,
+              () => undefined
+            );
+          expect(urls).toHaveLength(1);
+          expect(new URL(urls[0] ?? "").host).toBe(defaultHost);
+        }
+      );
+    }
+  );
+
+  it("rejects an OpenAI model the chat path would route through Codex OAuth", async () => {
+    const codexOauth = {
+      type: "oauth",
+      access: "test-access-token",
+      refresh: "test-refresh-token",
+      expires: Date.now() + 60_000,
+      accountId: "test-account-id",
+    };
+    // OAuth only (no API key): the chat path would reroute to chatgpt.com.
+    await withEvaluationFixture({ openai: { codexOauth } }, async (_c, factory) => {
+      expect(expectRejected(await factory.createEvaluationModel(KNOWN_MODELS.GPT.id))).toEqual({
+        reason: "unsupported-route",
+        routeKind: "codex-oauth",
+        providerName: "openai",
+      });
+    });
+    // Both credentials, OAuth preferred: still rerouted by the chat path, so rejected.
+    await withEvaluationFixture(
+      { openai: { apiKey: "sk-test", codexOauth, codexOauthDefaultAuth: "oauth" } },
+      async (_c, factory) => {
+        expect(
+          expectRejected(await factory.createEvaluationModel(KNOWN_MODELS.GPT.id)).routeKind
+        ).toBe("codex-oauth");
+      }
+    );
+    // Both credentials, API key preferred: the chat path uses the key, and so does evaluation.
+    await withEvaluationFixture(
+      { openai: { apiKey: "sk-test", codexOauth, codexOauthDefaultAuth: "apiKey" } },
+      async (_c, factory) => {
+        expectResolved(await factory.createEvaluationModel(KNOWN_MODELS.GPT.id));
+      }
+    );
+  });
+
+  it("rejects a routePriority that prefers a configured gateway", async () => {
+    await withEvaluationFixture(
+      { openai: { apiKey: "sk-test" }, openrouter: { apiKey: "or-test" } },
+      async (config, factory) => {
+        await saveRoutePriority(config, ["openrouter", "direct"]);
+        expect(expectRejected(await factory.createEvaluationModel("openai:gpt-5"))).toEqual({
+          reason: "unsupported-route",
+          routeKind: "gateway",
+          providerName: "openrouter",
+        });
+        // Direct first: the same config resolves.
+        await saveRoutePriority(config, ["direct", "openrouter"]);
+        expectResolved(await factory.createEvaluationModel("openai:gpt-5"));
+      }
+    );
+  });
+
+  it("rejects explicit gateway prefixes instead of rewriting them to a direct route", async () => {
+    await withEvaluationFixture({ openai: { apiKey: "sk-test" } }, async (_c, factory) => {
+      expect(
+        expectRejected(await factory.createEvaluationModel("mux-gateway:openai/gpt-5"))
+      ).toEqual({ reason: "unsupported-route", routeKind: "gateway", providerName: "mux-gateway" });
+      expect(
+        expectRejected(await factory.createEvaluationModel("coder:anthropic/claude-haiku-4-5"))
+      ).toMatchObject({ reason: "unsupported-route", providerName: "coder" });
+    });
+  });
+
+  it("rejects a custom provider shadowing a built-in evaluation provider id", async () => {
+    await withEvaluationFixture(
+      { openai: { providerType: "openai-compatible", baseUrl: LOCAL_VLLM_BASE_URL, apiKey: "x" } },
+      async (_c, factory) => {
+        expect(expectRejected(await factory.createEvaluationModel("openai:gpt-5"))).toEqual({
+          reason: "unsupported-route",
+          routeKind: "custom",
+        });
+      }
+    );
+  });
+
+  it("rejects unconfigured or disabled providers as unauthorized", async () => {
+    await withEvaluationFixture({}, async (_c, factory) => {
+      expect(
+        expectRejected(await factory.createEvaluationModel("anthropic:claude-haiku-4-5"))
+      ).toEqual({ reason: "unauthorized", providerName: "anthropic" });
+    });
+    await withEvaluationFixture(
+      { google: { apiKey: "sk-google", enabled: false } },
+      async (_c, factory) => {
+        expect(
+          expectRejected(await factory.createEvaluationModel("google:gemini-2.5-flash"))
+        ).toEqual({ reason: "unauthorized", providerName: "google" });
+      }
+    );
+  });
+
+  it("rejects providers without an evaluation factory and malformed model strings", async () => {
+    await withEvaluationFixture({ xai: { apiKey: "xai-test" } }, async (_c, factory) => {
+      expect(expectRejected(await factory.createEvaluationModel("xai:grok-4-1-fast"))).toEqual({
+        reason: "unsupported-provider",
+        providerName: "xai",
+      });
+      expect(expectRejected(await factory.createEvaluationModel("nobody:model"))).toEqual({
+        reason: "unsupported-provider",
+      });
+      expect(expectRejected(await factory.createEvaluationModel("gpt-5"))).toEqual({
+        reason: "unknown-model",
+      });
+      expect(expectRejected(await factory.createEvaluationModel("openai:"))).toEqual({
+        reason: "unknown-model",
+      });
+    });
+  });
+
+  // `typesafe` is the evaluation-only credential key, not a chat ProviderName:
+  // it resolves with no chat provider configured and from its own env vars.
+  it("resolves typesafe:jev-latest from the reserved providers.jsonc entry or its env vars", async () => {
+    await withEvaluationFixture(
+      { typesafe: { apiKey: "ts-key" } },
+      async (_c, factory, fetchSpy) => {
+        const pinned = expectResolved(await factory.createEvaluationModel("typesafe:jev-latest"));
+        expect(pinned.model.provider).toBe("typesafe.evaluation");
+        expect(pinned.model.modelId).toBe("jev-latest");
+        expect(pinned.wireProviderName).toBe("typesafe");
+        expect(pinned.routeKind).toBe("direct");
+        expect(pinned.effectiveModelString).toBe("typesafe:jev-latest");
+        expect(pinned.configFingerprint).toMatch(/^[0-9a-f]{64}$/);
+        expect(fetchSpy).not.toHaveBeenCalled();
+      }
+    );
+    await withEvaluationFixture({}, async (_c, factory) => {
+      process.env.JEV_API_KEY = "env-key";
+      expectResolved(await factory.createEvaluationModel("typesafe:jev-latest"));
+    });
+  });
+
+  it("sends google evaluation requests to the trimmed configured base URL", async () => {
+    await withEvaluationFixture(
+      { google: { apiKey: "sk-google", baseUrl: "  https://proxy.example/google/v1beta  " } },
+      async (_c, factory, fetchSpy) => {
+        const pinned = expectResolved(
+          await factory.createEvaluationModel("google:gemini-2.5-flash")
+        );
+        const urls: string[] = [];
+        fetchSpy.mockImplementation(
+          Object.assign(
+            (input: Parameters<typeof fetch>[0]) => {
+              urls.push(input instanceof Request ? input.url : String(input));
+              return Promise.reject(new Error("captured"));
+            },
+            { preconnect: () => undefined }
+          )
+        );
+        await pinned.model
+          .doEvaluate({
+            state: "hello",
+            questions: { q: { type: "boolean", instructions: "Is it a greeting?" } },
+          })
+          .then(
+            () => undefined,
+            () => undefined
+          );
+        expect(urls).toHaveLength(1);
+        expect(urls[0]).toStartWith("https://proxy.example/google/v1beta/");
+      }
+    );
+  });
+
+  it("sends typesafe requests to the API default or the configured base URL", async () => {
+    const captureUrl = async (
+      factory: ProviderModelFactory,
+      fetchSpy: ReturnType<typeof spyOn<typeof globalThis, "fetch">>
+    ) => {
+      const pinned = expectResolved(await factory.createEvaluationModel("typesafe:jev-latest"));
+      const urls: string[] = [];
+      fetchSpy.mockImplementation(
+        Object.assign(
+          (input: Parameters<typeof fetch>[0]) => {
+            urls.push(input instanceof Request ? input.url : String(input));
+            return Promise.reject(new Error("captured"));
+          },
+          { preconnect: () => undefined }
+        )
+      );
+      await pinned.model
+        .doEvaluate({
+          state: "hello",
+          questions: { q: { type: "boolean", instructions: "Is it a greeting?" } },
+        })
+        .then(
+          () => undefined,
+          () => undefined
+        );
+      expect(urls).toHaveLength(1);
+      return { url: urls[0] ?? "", fingerprint: pinned.configFingerprint };
+    };
+    let defaultFingerprint: string | undefined;
+    await withEvaluationFixture({ typesafe: { apiKey: "ts-key" } }, async (_c, factory, spy) => {
+      const { url, fingerprint } = await captureUrl(factory, spy);
+      expect(url).toBe("https://api.typesafe.ai/v1/systemone");
+      defaultFingerprint = fingerprint;
+    });
+    await withEvaluationFixture(
+      { typesafe: { apiKey: "ts-key", baseUrl: "https://proxy.example/typesafe/v1" } },
+      async (_c, factory, spy) => {
+        const { url, fingerprint } = await captureUrl(factory, spy);
+        expect(url).toBe("https://proxy.example/typesafe/v1/systemone");
+        expect(fingerprint).not.toBe(defaultFingerprint!);
+      }
+    );
+    // A hand-edited entry with surrounding whitespace is normalized the same
+    // way the credential resolver (and auto model routing) already normalize it.
+    await withEvaluationFixture(
+      { typesafe: { apiKey: "ts-key", baseUrl: " https://proxy.example/typesafe/v1 " } },
+      async (_c, factory, spy) => {
+        const { url } = await captureUrl(factory, spy);
+        expect(url).toBe("https://proxy.example/typesafe/v1/systemone");
+      }
+    );
+  });
+
+  it("rejects an unconfigured, disabled or custom-shadowed typesafe entry like any provider", async () => {
+    await withEvaluationFixture({ openai: { apiKey: "sk-openai" } }, async (_c, factory) => {
+      expect(expectRejected(await factory.createEvaluationModel("typesafe:jev-latest"))).toEqual({
+        reason: "unauthorized",
+        providerName: "typesafe",
+      });
+    });
+    await withEvaluationFixture(
+      { typesafe: { apiKey: "ts-key", enabled: false } },
+      async (_c, factory) => {
+        expect(expectRejected(await factory.createEvaluationModel("typesafe:jev-latest"))).toEqual({
+          reason: "unauthorized",
+          providerName: "typesafe",
+        });
+      }
+    );
+    await withEvaluationFixture(
+      {
+        typesafe: { providerType: "openai-compatible", baseUrl: LOCAL_VLLM_BASE_URL, apiKey: "x" },
+      },
+      async (_c, factory) => {
+        expect(expectRejected(await factory.createEvaluationModel("typesafe:jev-latest"))).toEqual({
+          reason: "unsupported-route",
+          routeKind: "custom",
+        });
+      }
+    );
+  });
+});
+
+describe("ProviderModelFactory Ollama tool schemas", () => {
+  // Ollama servers before v0.6.6 parse a tool schema `type` only as a string, so one `type`
+  // array fails the whole tool request. zod >= 4.5 emits nullable fields as type arrays, and
+  // MCP servers can send them in raw JSON Schema, so the request must carry `anyOf` instead.
+  const sendTools = async (tools: Record<string, Tool>): Promise<Record<string, unknown>> => {
+    let body: Record<string, unknown> | undefined;
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({ ollama: { baseUrl: "http://127.0.0.1:11434/api" } });
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel("ollama:qwen3:8b");
+        if (!result.success) throw new Error(result.error.type);
+        await generateText({ model: result.data, prompt: "hello", tools, maxRetries: 0 }).catch(
+          () => undefined
+        );
+        expect(calls).toHaveLength(1);
+        body = parseSentBody(calls[0]);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+    const sent = body?.tools as Array<{ function: { name: string; parameters: unknown } }>;
+    return Object.fromEntries(
+      sent.map((entry) => [entry.function.name, entry.function.parameters])
+    );
+  };
+  const rawTool = (schema: Record<string, unknown>) =>
+    tool({ inputSchema: jsonSchema<Record<string, unknown>>(schema) });
+  const typeArrayPaths = (node: unknown, at = "$"): string[] => {
+    if (Array.isArray(node))
+      return node.flatMap((item, index) => typeArrayPaths(item, `${at}[${index}]`));
+    if (node === null || typeof node !== "object") return [];
+    const own = Array.isArray((node as { type?: unknown }).type) ? [at] : [];
+    return own.concat(
+      Object.entries(node).flatMap(([key, value]) => typeArrayPaths(value, `${at}.${key}`))
+    );
+  };
+
+  it("rewrites nested nullable type arrays to anyOf", async () => {
+    const sent = await sendTools({
+      mcp_tool: rawTool({
+        type: "object",
+        properties: {
+          outer: { type: "object", properties: { inner: { type: ["string", "null"] } } },
+          list: { type: "array", items: { type: ["integer", "null"], minimum: 0 } },
+          single: { type: ["boolean"] },
+          both: { type: ["string", "null"], anyOf: [{ minLength: 1 }, { const: null }] },
+        },
+      }),
+    });
+
+    expect(sent.mcp_tool).toEqual({
+      type: "object",
+      properties: {
+        outer: {
+          type: "object",
+          properties: { inner: { anyOf: [{ type: "string" }, { type: "null" }] } },
+        },
+        list: {
+          type: "array",
+          items: { anyOf: [{ type: "integer" }, { type: "null" }], minimum: 0 },
+        },
+        single: { type: "boolean" },
+        both: {
+          anyOf: [{ minLength: 1 }, { const: null }],
+          allOf: [{ anyOf: [{ type: "string" }, { type: "null" }] }],
+        },
+      },
+    });
+  });
+
+  // Old Ollama's OpenAI-compatible /v1 endpoint decodes tools into the same Go structs, so a
+  // custom openai-compatible provider pointed at it needs the same rewrite.
+  it("rewrites type arrays for custom openai-compatible providers", async () => {
+    let body: Record<string, unknown> | undefined;
+    await withTempConfig(async (config, factory) => {
+      saveLocalVllmConfig(config, { models: [LOCAL_VLLM_MODEL] });
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel(`local-vllm:${LOCAL_VLLM_MODEL}`);
+        if (!result.success) throw new Error(result.error.type);
+        const tools = {
+          mcp_tool: rawTool({
+            type: "object",
+            properties: {
+              outer: { type: "object", properties: { inner: { type: ["string", "null"] } } },
+              list: { type: "array", items: { type: ["integer", "null"] } },
+            },
+          }),
+        };
+        await generateText({ model: result.data, prompt: "hello", tools, maxRetries: 0 }).catch(
+          () => undefined
+        );
+        expect(calls).toHaveLength(1);
+        body = parseSentBody(calls[0]);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+    const sent = body?.tools as Array<{ function: { parameters: unknown } }>;
+    expect(sent).toHaveLength(1);
+    expect(typeArrayPaths(sent[0].function.parameters)).toEqual([]);
+    expect(sent[0].function.parameters).toMatchObject({
+      properties: {
+        outer: { properties: { inner: { anyOf: [{ type: "string" }, { type: "null" }] } } },
+        list: { items: { anyOf: [{ type: "integer" }, { type: "null" }] } },
+      },
+    });
+  });
+
+  it("sends real tool definitions without type arrays", async () => {
+    const sent = await sendTools({
+      session_history: tool({ inputSchema: TOOL_DEFINITIONS.session_history.schema }),
+    });
+
+    expect(typeArrayPaths(sent.session_history)).toEqual([]);
+    expect(
+      (sent.session_history as { properties: Record<string, unknown> }).properties.recent_first
+    ).toMatchObject({ anyOf: [{ type: "boolean" }, { type: "null" }] });
+  });
+
+  it("leaves schemas without type arrays unchanged", async () => {
+    const schema = {
+      type: "object",
+      properties: {
+        name: { type: "string", minLength: 1 },
+        count: { type: "integer" },
+        mode: { enum: ["a", "b"] },
+        maybe: { anyOf: [{ type: "string" }, { type: "null" }] },
+        // Data under these keywords can look like a schema but must arrive as sent.
+        literal: { const: { type: ["a", "b"] } },
+        choice: { enum: [{ type: ["a", "b"] }] },
+        defaulted: { type: "object", default: { type: ["x", "null"] } },
+        sample: { type: "object", examples: [{ type: ["y", "z"] }] },
+      },
+      required: ["name"],
+    };
+    const sent = await sendTools({ plain: rawTool(structuredClone(schema)) });
+
+    expect(sent.plain).toEqual(schema);
+  });
+});
+
+describe("ProviderModelFactory prompt-cache prefix observation", () => {
+  const recorded: TimelineEventDraft[] = [];
+  const recorder = {
+    record: (_workspaceId: string, draft: TimelineEventDraft) => void recorded.push(draft),
+    closeWorkspace: () => Promise.resolve(),
+    reopenWorkspace: () => undefined,
+  };
+  beforeEach(() => {
+    recorded.length = 0;
+  });
+
+  /** A base fetch that records each sent body and answers with a status the observer accepts. */
+  function capturingFetch(sent: Array<Record<string, unknown>>): typeof fetch {
+    return Object.assign((_input: RequestInfo | URL, init?: RequestInit) => {
+      if (typeof init?.body === "string") {
+        sent.push(JSON.parse(init.body) as Record<string, unknown>);
+      }
+      return Promise.resolve(new Response("{}", { status: 200 }));
+    }, fetch) as typeof fetch;
+  }
+
+  /** One generateText call; the canned response does not parse, which is fine after dispatch. */
+  async function send(model: LanguageModel, messages: ModelMessage[]) {
+    await generateText({ model, messages, maxRetries: 0 }).catch(() => undefined);
+  }
+
+  it("observes mux-gateway requests after file-part normalization", async () => {
+    await withTempConfig(async (_config, factory) => {
+      const sent: Array<Record<string, unknown>> = [];
+      const providersConfig = {
+        "mux-gateway": { couponCode: "test-coupon", fetch: capturingFetch(sent) },
+      } as unknown as ProvidersConfig;
+      const messages = (image: string) => [
+        {
+          role: "user" as const,
+          content: [
+            { type: "text" as const, text: "What is in this image?" },
+            { type: "file" as const, mediaType: "image/png", data: image },
+          ],
+        },
+      ];
+      for (const image of ["AAAA", "BBBB"]) {
+        const scope = factory.createPromptCacheTurnScope("ws-gateway", recorder);
+        const result = await factory.createModel(
+          "mux-gateway:anthropic/claude-sonnet-4-5",
+          {},
+          {
+            promptCacheScope: scope,
+            providersConfig,
+          }
+        );
+        if (!result.success) throw new Error("expected a gateway model");
+        await send(result.data, messages(image));
+      }
+
+      // The changed image breaks the prefix, and the event describes the part as the gateway
+      // received it (the v3 data-URL string), not the SDK's v4 tagged object.
+      const sentFile = (sent[1].prompt as Array<{ content: Array<Record<string, unknown>> }>)
+        .flatMap((message) => message.content)
+        .find((part) => part.type === "file");
+      expect(sentFile?.data).toBe("data:image/png;base64,BBBB");
+      const { cache_control: _marker, ...unmarkedFile } = sentFile ?? {};
+      expect(recorded).toMatchObject([
+        {
+          kind: "cache.prefix_break",
+          data: {
+            promptCacheBreak: {
+              section: "messages",
+              next: { type: "file", length: JSON.stringify(unmarkedFile).length },
+            },
+          },
+        },
+      ]);
+    });
+  });
+
+  it("does not compare requests sent to another Anthropic base URL", async () => {
+    await withTempConfig(async (_config, factory) => {
+      const sent: Array<Record<string, unknown>> = [];
+      const sendTo = async (baseURL: string, text: string) => {
+        const scope = factory.createPromptCacheTurnScope("ws-base-url", recorder);
+        const result = await factory.createModel(
+          "anthropic:claude-sonnet-4-5",
+          {},
+          {
+            promptCacheScope: scope,
+            providersConfig: {
+              anthropic: { apiKey: "test-key", baseURL, fetch: capturingFetch(sent) },
+            } as unknown as ProvidersConfig,
+          }
+        );
+        if (!result.success) throw new Error("expected an Anthropic model");
+        await send(result.data, [{ role: "user", content: text }]);
+      };
+      await sendTo("https://proxy-a.example.com/v1", "first");
+      // Another endpoint holds another cache: its first request is a new baseline.
+      await sendTo("https://proxy-b.example.com/v1", "second");
+      expect(sent).toHaveLength(2);
+      expect(recorded).toEqual([]);
+      // On the same endpoint a rewritten prompt is still reported.
+      await sendTo("https://proxy-b.example.com/v1", "third");
+      expect(recorded).toHaveLength(1);
+    });
+  });
+
+  it("keys a base-URL query by its hash: another tenant is another baseline", async () => {
+    await withTempConfig(async (_config, factory) => {
+      const sent: Array<Record<string, unknown>> = [];
+      const sendTo = async (baseURL: string, text: string) => {
+        const scope = factory.createPromptCacheTurnScope("ws-query", recorder);
+        const result = await factory.createModel(
+          "anthropic:claude-sonnet-4-5",
+          {},
+          {
+            promptCacheScope: scope,
+            providersConfig: {
+              anthropic: { apiKey: "test-key", baseURL, fetch: capturingFetch(sent) },
+            } as unknown as ProvidersConfig,
+          }
+        );
+        if (!result.success) throw new Error("expected an Anthropic model");
+        await send(result.data, [{ role: "user", content: text }]);
+      };
+      // The proxy picks the account by the query: tenant B's first request is a new baseline.
+      await sendTo("https://proxy.example.com/v1?token=tenant-a-secret", "first");
+      await sendTo("https://proxy.example.com/v1?token=tenant-b-secret", "second");
+      expect(sent).toHaveLength(2);
+      expect(recorded).toEqual([]);
+      // The same query is the same cache, so a rewritten prompt is reported.
+      await sendTo("https://proxy.example.com/v1?token=tenant-b-secret", "third");
+      expect(recorded).toHaveLength(1);
+      expect(JSON.stringify(recorded)).not.toContain("secret");
+    });
+  });
+
+  it("keys mux-gateway baselines by account: another sign-in is another baseline", async () => {
+    await withTempConfig(async (_config, factory) => {
+      const sent: Array<Record<string, unknown>> = [];
+      const sendAs = async (couponCode: string, text: string) => {
+        const scope = factory.createPromptCacheTurnScope("ws-gateway-account", recorder);
+        const result = await factory.createModel(
+          "mux-gateway:anthropic/claude-sonnet-4-5",
+          {},
+          {
+            promptCacheScope: scope,
+            providersConfig: {
+              "mux-gateway": { couponCode, fetch: capturingFetch(sent) },
+            } as unknown as ProvidersConfig,
+          }
+        );
+        if (!result.success) throw new Error("expected a gateway model");
+        await send(result.data, [{ role: "user", content: text }]);
+      };
+      // Same base URL, another account: its first request is a new baseline.
+      await sendAs("account-a-secret", "first");
+      await sendAs("account-b-secret", "second");
+      expect(sent).toHaveLength(2);
+      expect(recorded).toEqual([]);
+      // The same account is the same cache, so a rewritten prompt is reported.
+      await sendAs("account-b-secret", "third");
+      expect(recorded).toHaveLength(1);
+      expect(JSON.stringify(recorded)).not.toContain("secret");
+    });
+  });
+
+  it("the mux-gateway route holds a stable hash of the account, not its credential", () => {
+    const accountA = muxGatewayPromptCacheRoute("account-a-secret");
+    expect(accountA).toMatch(/^mux-gateway:[0-9a-f]{16}$/);
+    expect(accountA).toBe(muxGatewayPromptCacheRoute("account-a-secret"));
+    expect(accountA).not.toBe(muxGatewayPromptCacheRoute("account-b-secret"));
+    expect(accountA).not.toContain("secret");
+  });
+
+  it("requestEndpoint keeps no query text, only a stable hash of it", () => {
+    const tenantA = requestEndpoint("https://proxy.example.com/v1?token=tenant-a-secret/messages");
+    const tenantB = requestEndpoint("https://proxy.example.com/v1?token=tenant-b-secret/messages");
+    expect(tenantA).toMatch(/^https:\/\/proxy\.example\.com\/v1\?sha256:[0-9a-f]{16}$/);
+    expect(tenantA).not.toBe(tenantB);
+    expect(requestEndpoint("https://proxy.example.com/v1?token=tenant-a-secret/messages")).toBe(
+      tenantA
+    );
+    for (const endpoint of [tenantA, tenantB, requestEndpoint("not a url ?token=secret")]) {
+      expect(endpoint).not.toContain("token");
+      expect(endpoint).not.toContain("secret");
+    }
+    expect(requestEndpoint("https://api.anthropic.com/v1/messages")).toBe(
+      "https://api.anthropic.com/v1/messages"
+    );
   });
 });

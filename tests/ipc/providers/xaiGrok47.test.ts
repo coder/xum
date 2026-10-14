@@ -10,12 +10,21 @@ import {
   sendMessageWithModel,
 } from "../helpers";
 import { setupWorkspace, shouldRunIntegrationTests, validateApiKeys } from "../setup";
+import {
+  ProviderCapacityError,
+  isProviderCapacityError,
+  isProviderStall,
+  retryOnProviderCapacity,
+  withProviderCapacityRetryBudget,
+} from "./liveProviderCapacity";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
 if (shouldRunIntegrationTests()) {
   validateApiKeys(["XAI_API_KEY"]);
 }
+
+type StreamCollector = ReturnType<typeof createStreamCollector>;
 
 const DISABLE_TOOLS: ToolPolicy = [{ regex_match: ".*", action: "disable" }];
 
@@ -42,9 +51,18 @@ async function waitForTerminal(
     collector.waitForEvent("stream-error", timeoutMs),
   ]);
   if (!terminalEvent) {
+    const eventTypes = collector.getEvents().map((event) => ("type" in event ? event.type : ""));
+    if (isProviderStall(eventTypes)) {
+      throw new ProviderCapacityError(
+        `xAI sent no output within ${timeoutMs / 1000} s after the stream started`
+      );
+    }
     throw new Error("Expected terminal stream event from Grok 4.7");
   }
   if (terminalEvent.type === "stream-error") {
+    if (isProviderCapacityError(terminalEvent)) {
+      throw new ProviderCapacityError(terminalEvent.error);
+    }
     throw new Error(`Grok 4.7 stream failed: ${terminalEvent.error}`);
   }
   if (!isStreamEnd(terminalEvent)) {
@@ -56,126 +74,146 @@ async function waitForTerminal(
 describeIntegration("xAI Grok 4.7 integration", () => {
   configureTestRetries(3);
 
-  test("streams a priority request and reports exact billed cost metadata", async () => {
-    const { env, workspaceId, cleanup } = await setupWorkspace("xai", "grok-4-7");
-    const collector = createStreamCollector(env.orpc, workspaceId);
-    collector.start();
+  test(
+    "streams a priority request and reports exact billed cost metadata",
+    async () => {
+      await retryOnProviderCapacity("xAI Grok 4.7 priority stream", async () => {
+        const { env, workspaceId, cleanup } = await setupWorkspace("xai", "grok-4-7");
+        const collector = createStreamCollector(env.orpc, workspaceId);
+        collector.start();
 
-    try {
-      const result = await sendMessageWithModel(
-        env,
-        workspaceId,
-        "Reply with exactly: GROK47_OK",
-        KNOWN_MODELS.GROK_47.id,
-        {
-          // Grok 4.7's built-in minimum thinking floor is medium.
-          thinkingLevel: "medium",
-          providerOptions: {
-            xai: {
-              serviceTier: "priority",
-              searchParameters: { mode: "off" },
-            },
-          },
+        try {
+          // Subscribe before sending so a stall check sees this turn's stream-start.
+          await collector.waitForSubscription();
+          const result = await sendMessageWithModel(
+            env,
+            workspaceId,
+            "Reply with exactly: GROK47_OK",
+            KNOWN_MODELS.GROK_47.id,
+            {
+              // Grok 4.7's built-in minimum thinking floor is medium.
+              thinkingLevel: "medium",
+              providerOptions: {
+                xai: {
+                  serviceTier: "priority",
+                  searchParameters: { mode: "off" },
+                },
+              },
+            }
+          );
+
+          expect(result.success).toBe(true);
+
+          const streamEnd = await waitForTerminal(collector, 60_000);
+
+          assertStreamSuccess(collector);
+          expect(streamEnd.metadata.model).toBe(KNOWN_MODELS.GROK_47.id);
+          expect(streamEnd.metadata.thinkingLevel).toBe("medium");
+
+          const xaiMetadata = streamEnd.metadata.providerMetadata?.xai as
+            | { costInUsdTicks?: unknown }
+            | undefined;
+          expect(typeof xaiMetadata?.costInUsdTicks).toBe("number");
+          expect(xaiMetadata?.costInUsdTicks).toBeGreaterThan(0);
+          expect(collector.getStreamContent().trim().length).toBeGreaterThan(0);
+        } finally {
+          collector.stop();
+          await cleanup();
         }
-      );
+      });
+    },
+    withProviderCapacityRetryBudget(90_000)
+  );
 
-      expect(result.success).toBe(true);
+  test(
+    "multi-turn with default store=false keeps encrypted reasoning and continues cleanly",
+    async () => {
+      // Grok 4.7 Responses always use store=false in Mux (ZDR-safe default).
+      // With store=false, xAI returns reasoning.encrypted_content which Mux must
+      // persist and replay; otherwise the second turn fails or loses quality.
+      await retryOnProviderCapacity("xAI Grok 4.7 store=false multi-turn", async () => {
+        const { env, workspaceId, cleanup } = await setupWorkspace("xai", "grok-4-7-zdr");
+        const historyService = new HistoryService(env.config);
+        // A capacity error throws out of waitForTerminal before a turn's own stop(); stop
+        // every collector here so a retried attempt leaves no subscription or timer behind.
+        const collectors: StreamCollector[] = [];
 
-      const streamEnd = await waitForTerminal(collector, 60_000);
+        try {
+          const firstCollector = createStreamCollector(env.orpc, workspaceId);
+          collectors.push(firstCollector);
+          firstCollector.start();
+          await firstCollector.waitForSubscription();
 
-      assertStreamSuccess(collector);
-      expect(streamEnd.metadata.model).toBe(KNOWN_MODELS.GROK_47.id);
-      expect(streamEnd.metadata.thinkingLevel).toBe("medium");
+          const firstResult = await sendMessageWithModel(
+            env,
+            workspaceId,
+            [
+              "Think carefully about this secret codeword for the rest of the chat: MUXZDR42.",
+              "Do not mention the codeword yet.",
+              "Reply with exactly: READY",
+            ].join(" "),
+            KNOWN_MODELS.GROK_47.id,
+            {
+              thinkingLevel: "medium",
+              toolPolicy: DISABLE_TOOLS,
+              // Explicitly exercise the non-store path (also the product default).
+              providerOptions: {
+                xai: {
+                  store: false,
+                },
+              },
+            }
+          );
+          expect(firstResult.success).toBe(true);
 
-      const xaiMetadata = streamEnd.metadata.providerMetadata?.xai as
-        | { costInUsdTicks?: unknown }
-        | undefined;
-      expect(typeof xaiMetadata?.costInUsdTicks).toBe("number");
-      expect(xaiMetadata?.costInUsdTicks).toBeGreaterThan(0);
-      expect(collector.getStreamContent().trim().length).toBeGreaterThan(0);
-    } finally {
-      collector.stop();
-      await cleanup();
-    }
-  }, 90_000);
+          const firstEnd = await waitForTerminal(firstCollector, 90_000);
+          assertStreamSuccess(firstCollector);
+          expect(firstCollector.getStreamContent()).toMatch(/READY/i);
+          firstCollector.stop();
 
-  test("multi-turn with default store=false keeps encrypted reasoning and continues cleanly", async () => {
-    // Grok 4.7 Responses always use store=false in Mux (ZDR-safe default).
-    // With store=false, xAI returns reasoning.encrypted_content which Mux must
-    // persist and replay; otherwise the second turn fails or loses quality.
-    const { env, workspaceId, cleanup } = await setupWorkspace("xai", "grok-4-7-zdr");
-    const historyService = new HistoryService(env.config);
+          // Prove encrypted reasoning landed in persisted history under store=false.
+          const historyResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+          expect(historyResult.success).toBe(true);
+          if (!historyResult.success) {
+            throw new Error(historyResult.error);
+          }
+          expect(hasXaiEncryptedReasoning(historyResult.data)).toBe(true);
 
-    try {
-      const firstCollector = createStreamCollector(env.orpc, workspaceId);
-      firstCollector.start();
-      await firstCollector.waitForSubscription();
+          // Second turn must succeed by replaying encrypted reasoning without server storage.
+          const secondCollector = createStreamCollector(env.orpc, workspaceId);
+          collectors.push(secondCollector);
+          secondCollector.start();
+          await secondCollector.waitForSubscription();
 
-      const firstResult = await sendMessageWithModel(
-        env,
-        workspaceId,
-        [
-          "Think carefully about this secret codeword for the rest of the chat: MUXZDR42.",
-          "Do not mention the codeword yet.",
-          "Reply with exactly: READY",
-        ].join(" "),
-        KNOWN_MODELS.GROK_47.id,
-        {
-          thinkingLevel: "medium",
-          toolPolicy: DISABLE_TOOLS,
-          // Explicitly exercise the non-store path (also the product default).
-          providerOptions: {
-            xai: {
-              store: false,
-            },
-          },
+          const secondResult = await sendMessageWithModel(
+            env,
+            workspaceId,
+            "Now reply with exactly the secret codeword and nothing else.",
+            KNOWN_MODELS.GROK_47.id,
+            {
+              thinkingLevel: "medium",
+              toolPolicy: DISABLE_TOOLS,
+              providerOptions: {
+                xai: {
+                  store: false,
+                },
+              },
+            }
+          );
+          expect(secondResult.success).toBe(true);
+
+          await waitForTerminal(secondCollector, 90_000);
+          assertStreamSuccess(secondCollector);
+
+          expect(secondCollector.getStreamContent()).toMatch(/MUXZDR42/);
+          expect(firstEnd.metadata.model).toBe(KNOWN_MODELS.GROK_47.id);
+          secondCollector.stop();
+        } finally {
+          for (const collector of collectors) collector.stop();
+          await cleanup();
         }
-      );
-      expect(firstResult.success).toBe(true);
-
-      const firstEnd = await waitForTerminal(firstCollector, 90_000);
-      assertStreamSuccess(firstCollector);
-      expect(firstCollector.getStreamContent()).toMatch(/READY/i);
-      firstCollector.stop();
-
-      // Prove encrypted reasoning landed in persisted history under store=false.
-      const historyResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
-      expect(historyResult.success).toBe(true);
-      if (!historyResult.success) {
-        throw new Error(historyResult.error);
-      }
-      expect(hasXaiEncryptedReasoning(historyResult.data)).toBe(true);
-
-      // Second turn must succeed by replaying encrypted reasoning without server storage.
-      const secondCollector = createStreamCollector(env.orpc, workspaceId);
-      secondCollector.start();
-      await secondCollector.waitForSubscription();
-
-      const secondResult = await sendMessageWithModel(
-        env,
-        workspaceId,
-        "Now reply with exactly the secret codeword and nothing else.",
-        KNOWN_MODELS.GROK_47.id,
-        {
-          thinkingLevel: "medium",
-          toolPolicy: DISABLE_TOOLS,
-          providerOptions: {
-            xai: {
-              store: false,
-            },
-          },
-        }
-      );
-      expect(secondResult.success).toBe(true);
-
-      await waitForTerminal(secondCollector, 90_000);
-      assertStreamSuccess(secondCollector);
-
-      expect(secondCollector.getStreamContent()).toMatch(/MUXZDR42/);
-      expect(firstEnd.metadata.model).toBe(KNOWN_MODELS.GROK_47.id);
-      secondCollector.stop();
-    } finally {
-      await cleanup();
-    }
-  }, 180_000);
+      });
+    },
+    withProviderCapacityRetryBudget(180_000)
+  );
 });

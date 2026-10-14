@@ -16,13 +16,12 @@ import { z } from "zod";
 import * as path from "path";
 import * as fs from "fs/promises";
 import { createConfigStores } from "../node/config";
-import { materializeResolvedTrust, replaceRunTrustProjects } from "./trust";
+import { materializeResolvedTrust, replaceRunConfig } from "./trust";
 import { runBestEffortCleanup } from "./runCleanup";
 import { DisposableTempDir } from "../node/services/tempDir";
 import { AgentSession, type AgentSessionChatEvent } from "../node/services/agentSession";
 import { CodexOauthService } from "../node/services/codexOauthService";
 import { CoderOauthService } from "../node/services/coderOauthService";
-import { PolicyService } from "../node/services/policyService";
 import { ProviderService } from "../node/services/providerService";
 import { createCoreServices } from "../node/services/coreServicesRoot";
 import { closeScopeBounded, disposeAppRuntime } from "../node/services/di/appRuntime";
@@ -42,7 +41,7 @@ import {
   type SendMessageOptions,
   type WorkspaceChatMessage,
 } from "../common/orpc/types";
-import type { ServiceTier } from "../common/config/schemas/providersConfig";
+import { ServiceTierSchema, type ServiceTier } from "../common/config/schemas/providersConfig";
 import { createDisplayUsage } from "../common/utils/tokens/displayUsage";
 import {
   getTotalCost,
@@ -83,11 +82,11 @@ import { createRuntime, runFullInit } from "../node/runtime/runtimeFactory";
 import type { Runtime } from "../node/runtime/Runtime";
 import { execSync } from "child_process";
 import { getParseOptions } from "./argv";
+import type { ExperimentId } from "../common/constants/experiments";
 import {
-  EXPERIMENT_IDS,
-  LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID,
-  type ExperimentId,
-} from "../common/constants/experiments";
+  collectHeadlessExperiments,
+  createHeadlessExperimentsService,
+} from "./headlessExperiments";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
   createRunConfig,
@@ -96,6 +95,7 @@ import {
   type PreparedRunSessionRoot,
 } from "./runSessionRoot";
 import { describeCliGoalStop, driveCliGoalUntilTerminal } from "./goalRunDriver";
+import { CliStreamWaits } from "./runStreamWaits";
 import {
   parseGoalBudgetInputCents,
   parseGoalTurnCapInput,
@@ -277,89 +277,6 @@ function renderUnknown(value: unknown): string {
   }
 }
 
-/**
- * Experiment IDs `xum run` can actually forward, each mapped to its
- * SendMessageOptions.experiments field. A single table (instead of ad-hoc
- * `includes` checks) guarantees an ID accepted by `-e` cannot be silently
- * dropped here — that previously swallowed `rlm-mode`, so PTC+RLM CLI runs
- * degraded to the flat non-kernel PTC toolset while desktop honored the flag.
- */
-const SEND_MESSAGE_EXPERIMENT_FIELDS = {
-  [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: "programmaticToolCalling",
-  [EXPERIMENT_IDS.RLM]: "rlm",
-  [EXPERIMENT_IDS.DYNAMIC_WORKFLOWS]: "dynamicWorkflows",
-  // Deliberately absent (accepting them would be a silent no-op or worse,
-  // which is exactly what this table exists to prevent):
-  // - TIMELINE: AIService resolves the timeline experiment exclusively from
-  //   the backend ExperimentsService (the schema's `timeline` request field is
-  //   never read), and `xum run` wires no timeline service.
-  // - MEMORY: MemoryService derives its storage from the CLI's ephemeral
-  //   tempDir config root, so persistent memories under the user's Xum home
-  //   would be invisible and new writes deleted on process exit.
-  // - ADVISOR_TOOL: AIService only exposes the advisor tool when the config
-  //   has a non-empty advisorModelString, which the CLI's ephemeral config
-  //   never carries over.
-  [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: "workspaceHeartbeats",
-  [EXPERIMENT_IDS.TOOL_SEARCH]: "toolSearch",
-} as const satisfies Partial<
-  Record<ExperimentId, keyof NonNullable<SendMessageOptions["experiments"]>>
->;
-
-function isSendMessageExperimentId(
-  value: string
-): value is keyof typeof SEND_MESSAGE_EXPERIMENT_FIELDS {
-  // Own-property check: `in` would also accept Object.prototype names like
-  // "constructor" or "toString", which have no mapping and would silently
-  // produce a garbage experiments field.
-  return Object.hasOwn(SEND_MESSAGE_EXPERIMENT_FIELDS, value);
-}
-
-function collectExperiments(value: string, previous: string[]): string[] {
-  let experimentId = value.trim().toLowerCase();
-  // Hidden compat alias: "PTC Exclusive Mode" merged into PTC, and the merged
-  // flag activates exactly the old exclusive posture — keep existing
-  // automation that passes the removed ID working instead of erroring.
-  if (experimentId === LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID) {
-    experimentId = EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING;
-  }
-  // App-level experiments (e.g. agent-browser) have no send-options field and
-  // would be silent no-ops in a headless run, so reject them loudly.
-  if (!isSendMessageExperimentId(experimentId)) {
-    throw new Error(
-      `Unknown or unsupported experiment "${value}". Valid experiments: ${Object.keys(
-        SEND_MESSAGE_EXPERIMENT_FIELDS
-      ).join(", ")}`
-    );
-  }
-  if (previous.includes(experimentId)) {
-    return previous; // Dedupe
-  }
-  return [...previous, experimentId];
-}
-
-/**
- * Convert experiment ID array to the experiments object expected by SendMessageOptions.
- * Only requested experiments are set (to true); unspecified flags stay undefined so
- * backend fallbacks apply, mirroring how the desktop renderer sends them.
- */
-function buildExperimentsObject(experimentIds: string[]): SendMessageOptions["experiments"] {
-  if (experimentIds.length === 0) return undefined;
-
-  const experiments: NonNullable<SendMessageOptions["experiments"]> = {};
-  for (const experimentId of experimentIds) {
-    assert(isSendMessageExperimentId(experimentId), `Unmapped experiment id: ${experimentId}`);
-    experiments[SEND_MESSAGE_EXPERIMENT_FIELDS[experimentId]] = true;
-  }
-  // RLM is a sub-experiment of PTC: tool assembly only builds code_execution
-  // when the PTC flag is set, so rlm-mode alone would be silently inert. Imply
-  // the parent flag, mirroring the desktop where Settings nests RLM under the
-  // PTC toggle (PTC is exclusive-only, so RLM then runs the kernel posture).
-  if (experiments.rlm) {
-    experiments.programmaticToolCalling = true;
-  }
-  return experiments;
-}
-
 interface MCPServerEntry {
   name: string;
   command: string;
@@ -407,12 +324,21 @@ program
   .option("-q, --quiet", "only output final result")
   .option("--mcp <server>", "MCP server as name=command (can be repeated)", collectMcpServers, [])
   .option("--no-mcp-config", "ignore global + repo MCP config files (use only --mcp servers)")
-  .option("-e, --experiment <id>", "enable experiment (can be repeated)", collectExperiments, [])
+  .option(
+    "-e, --experiment <id>",
+    "enable experiment (can be repeated)",
+    collectHeadlessExperiments,
+    []
+  )
   .option("-b, --budget <usd>", "stop when session cost exceeds budget (USD)", parseFloat)
   .option("--goal <objective>", "drive an ephemeral CLI Goal Run until complete")
   .option("--goal-budget <budget>", "goal budget, e.g. $5, 5.00, or 500c")
   .option("--goal-turns <turns>", "maximum automatic goal continuation turns")
-  .option("--service-tier <tier>", "OpenAI service tier: auto, default, flex, priority")
+  .option(
+    "--service-tier <tier>",
+    // Derived from the schema so new tiers (e.g. ultrafast) cannot drift from the help text.
+    `OpenAI service tier: ${ServiceTierSchema.options.join(", ")}`
+  )
   .option("--use-1m", "enable 1M context window for supported Anthropic models")
   .option(
     "--keep-background-processes",
@@ -433,6 +359,8 @@ Examples:
   $ xum run --json "List all files" | jq '.type'
   $ xum run --mcp "memory=npx -y @modelcontextprotocol/server-memory" "Remember this"
   $ xum run --mcp "chrome=npx chrome-devtools-mcp" --mcp "fs=npx @anthropic/mcp-fs" "Take a screenshot"
+
+A goal the agent creates with set_goal is adopted and driven like --goal.
 `
   );
 
@@ -451,7 +379,7 @@ interface CLIOptions {
   quiet?: boolean;
   mcp: MCPServerEntry[];
   mcpConfig: boolean;
-  experiment: string[];
+  experiment: ExperimentId[];
   budget?: number;
   goal?: string;
   goalBudget?: string;
@@ -540,11 +468,11 @@ async function main(): Promise<number> {
     Object.keys(existingSecrets).length > 0 ? JSON.stringify(existingSecrets, null, 2) : undefined
   );
 
-  // Copy only project trust metadata so AIService can read trust flags.
+  // Copy only project trust metadata and the tool-search opt-out so AIService can read them.
   // Avoid importing workspace/task metadata into ephemeral CLI config because
   // stale queued/running records can incorrectly throttle sub-agent tasks.
   // Replace the full map so a reused run root cannot retain trust removed from real config.
-  await replaceRunTrustProjects(realConfig, config);
+  await replaceRunConfig(realConfig, config);
 
   const workspaceId = generateWorkspaceId();
   const projectDir = path.resolve(opts.dir);
@@ -633,14 +561,6 @@ async function main(): Promise<number> {
     }
   }
 
-  // Enforce managed policy (MUX_POLICY_FILE / Xum Governor) in headless runs
-  // too, matching the desktop wiring: without this, `xum run` would keep using
-  // providers/models/credentials that providerAccess now denies. Bind to the
-  // REAL config so governor enrollment settings (muxGovernorUrl/Token) are
-  // honored — the ephemeral tempDir config only receives project trust flags.
-  const policyService = new PolicyService(realConfig);
-  await policyService.initialize();
-
   // Initialize the core service graph (shared with ServiceContainer).
   // CLI overrides: ephemeral extension metadata, persistent MCP config via
   // realConfig, and CLI-specific MCPServerManager options for inline servers.
@@ -665,22 +585,22 @@ async function main(): Promise<number> {
     appFiberScope,
   } = createCoreServices({
     ...runStores,
-    policyService,
     extensionMetadataPath: path.join(tempDir.path, "extensionMetadata.json"),
     // Session config lives in tempDir (deleted on exit) — disable workspace.*
     // host actions so workflows can't create worktrees whose tags evaporate.
     mcpConfig: realConfig,
+    experimentsService: await createHeadlessExperimentsService(config.rootDir, opts.experiment),
     mcpServerManagerOptions: {
       inlineServers,
       ignoreConfigFile: !opts.mcpConfig,
     },
-    goalServiceOptions: hasGoal
-      ? {
-          continuationCooldownMs: 0,
-          allowUserOriginBudgetWrapup: true,
-          suppressKickoffContinuation: true,
-        }
-      : undefined,
+    // Plain runs drive a goal the agent creates with set_goal, like a chat session
+    // does (#5356): the goal's own budget and turn caps bound that spend.
+    goalServiceOptions: {
+      continuationCooldownMs: 0,
+      allowUserOriginBudgetWrapup: true,
+      suppressKickoffContinuation: true,
+    },
   });
 
   // `xum run` uses createCoreServices directly (without ServiceContainer), so wire
@@ -696,18 +616,13 @@ async function main(): Promise<number> {
   const realFileLeaseManager = realStores.fileLeaseManager;
   const realProviderService = new ProviderService(
     realConfig,
-    policyService,
     realProvidersStore,
     realFileLeaseManager
   );
   const coderOauthService = new CoderOauthService(
     realProvidersStore,
     realFileLeaseManager,
-    realProviderService,
-    undefined,
-    // Policy-aware: an enforced forcedBaseUrl overrides the deployment URL for
-    // token refreshes/issuer checks, and denied providers fail closed.
-    policyService
+    realProviderService
   );
   turnRequestBuilderBindings.coderOauthService = coderOauthService;
 
@@ -749,6 +664,9 @@ async function main(): Promise<number> {
     backgroundProcessManager,
     workspaceGoalService,
     keepBackgroundProcesses,
+    // sendAndAwait returns on each stream-end, and the run can exit after it: a turn.stop
+    // continuation queued after stream-end would run unseen (Codex PRRT_kwDOPxxmWM6rxPMC).
+    callerOwnsTurnEnd: true,
     // Direct CLI registration bypasses WorkspaceService.create, so a
     // preserved checkout could carry a stale `plugin:` MCP override into a
     // same-name reinstall on the first send; sanitize before announcing.
@@ -858,6 +776,7 @@ async function main(): Promise<number> {
         projectPath: projectDir,
         branchName,
         trunkBranch,
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         workspacePath: createResult.workspacePath!,
         initLogger,
         env: createEnv,
@@ -883,6 +802,7 @@ async function main(): Promise<number> {
     }
 
     // Docker maps to /src in-container; SSH returns the remote checkout path.
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     workspacePath = createResult.workspacePath!;
   }
 
@@ -898,13 +818,10 @@ async function main(): Promise<number> {
   // Calling initialize() on a fresh config is a no-op, but skipping it makes the intent
   // clear and avoids any risk of cross-workspace side effects if config were ever shared.
 
-  const experiments = buildExperimentsObject(opts.experiment);
-
   const buildSendOptions = (cliMode: CLIMode): SendMessageOptions => ({
     model,
     thinkingLevel,
     agentId: cliMode,
-    experiments,
     providerOptions: {
       ...(opts.use1m && { anthropic: { use1MContext: true } }),
       ...(opts.serviceTier != null && { openai: { serviceTier: opts.serviceTier } }),
@@ -926,6 +843,9 @@ async function main(): Promise<number> {
 
   let goalStopReason: string | null = null;
   let cliGoalId: string | undefined;
+  // True once the run owns a goal: --goal from the start, or a plain run whose
+  // agent created one with set_goal during its first turn (adopted below).
+  let drivesGoal = hasGoal;
   if (hasGoal) {
     const setGoalResult = await workspaceGoalService.setGoal({
       workspaceId,
@@ -971,7 +891,6 @@ async function main(): Promise<number> {
   let streamLineOpen = false;
   let activeMessageId: string | null = null;
   let planProposed = false;
-  let streamEnded = false;
 
   // Track usage for cost summary at end of run
   const usageHistory: ChatUsageDisplay[] = [];
@@ -1045,87 +964,28 @@ async function main(): Promise<number> {
     lastOutputType = nextType;
   };
 
-  let resolveCompletion: ((value: void) => void) | null = null;
-  let rejectCompletion: ((reason?: unknown) => void) | null = null;
-  let completionPromise: Promise<void> = Promise.resolve();
-
-  let resolveStreamStarted: (() => void) | null = null;
-  let streamStartedPromise: Promise<void> = Promise.resolve();
-
-  const createCompletionPromise = (): Promise<void> => {
-    streamEnded = false;
-    streamStartedPromise = new Promise<void>((resolve) => {
-      resolveStreamStarted = resolve;
-    });
-    return new Promise<void>((resolve, reject) => {
-      resolveCompletion = resolve;
-      rejectCompletion = reject;
-    });
-  };
-
-  const waitForCompletion = async (): Promise<void> => {
-    await completionPromise;
-
-    if (!streamEnded) {
-      throw new Error("Stream completion promise resolved unexpectedly without stream end");
-    }
-  };
-
-  const waitForStreamStarted = async (timeoutMs?: number): Promise<void> => {
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const streamFailedOrEndedBeforeStart = completionPromise.then(() => {
-      throw new Error("Goal continuation stream ended before it started");
-    });
-    const waits: Array<Promise<void>> = [streamStartedPromise, streamFailedOrEndedBeforeStart];
-    if (timeoutMs != null) {
-      waits.push(
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => {
-            reject(new Error("Timed out waiting for goal continuation stream to start"));
-          }, timeoutMs);
-          timer.unref?.();
-        })
-      );
-    }
-    try {
-      await Promise.race(waits);
-    } finally {
-      if (timer != null) {
-        clearTimeout(timer);
-      }
-    }
-  };
-
-  const resetCompletionHandlers = () => {
-    resolveCompletion = null;
-    rejectCompletion = null;
-    resolveStreamStarted = null;
-  };
+  const streamWaits = new CliStreamWaits();
 
   const rejectStream = (error: Error) => {
     // Keep terminal output readable (error messages should not start mid-line)
     closeHumanLine();
-    rejectCompletion?.(error);
-    resetCompletionHandlers();
+    streamWaits.onStreamFailed(error);
   };
 
   const resolveStream = () => {
     closeHumanLine();
-
-    streamEnded = true;
-    resolveCompletion?.();
-    resetCompletionHandlers();
+    streamWaits.onStreamEnd();
 
     activeMessageId = null;
     toolCallArgs.clear();
   };
 
   const sendAndAwait = async (msg: string, options: SendMessageOptions): Promise<void> => {
-    completionPromise = createCompletionPromise();
+    streamWaits.arm();
     const sendResult = await session.sendMessage(
       msg,
       options,
-      hasGoal
+      drivesGoal
         ? {
             // CLI goal runs suppress the desktop kickoff dispatcher and drive
             // their own user turns, so mark them as the durable goal
@@ -1153,11 +1013,11 @@ async function main(): Promise<number> {
       }
       throw new Error(`Failed to send message: ${formattedError}`);
     }
-    await waitForCompletion();
+    await streamWaits.waitForCompletion();
   };
 
   const getGoal = async (): Promise<GoalRecordV1 | null> => {
-    if (!hasGoal) return null;
+    if (!drivesGoal) return null;
     return workspaceGoalService.getGoal(workspaceId);
   };
 
@@ -1253,7 +1113,7 @@ async function main(): Promise<number> {
         );
         return;
       }
-      resolveStreamStarted?.();
+      streamWaits.onStreamStart();
       activeMessageId = payload.messageId;
       return;
     }
@@ -1457,7 +1317,30 @@ async function main(): Promise<number> {
         `Workspace ${workspaceId} history could not be read; refusing to send into an unverified transcript`
       );
     }
+    // The workspace is fresh, so any goal it holds was created by the agent's set_goal.
+    // Adopt it after each turn the run sends itself (the initial turn and the plan
+    // auto-approval, where a plan run's agent first can call set_goal): from then on
+    // the run drives it and exits exactly like a --goal run.
+    const adoptAgentCreatedGoal = async (): Promise<void> => {
+      if (drivesGoal) return;
+      const createdGoal = await workspaceGoalService.getGoal(workspaceId);
+      if (createdGoal == null) return;
+      drivesGoal = true;
+      cliGoalId = createdGoal.goalId;
+      emitJsonLine({
+        type: "goal-adopted",
+        workspaceId,
+        goalId: createdGoal.goalId,
+        objective: createdGoal.objective,
+        status: createdGoal.status,
+        budgetCents: createdGoal.budgetCents,
+        turnCap: createdGoal.turnCap,
+      });
+      writeHumanLineClosed(`[goal] adopted: ${createdGoal.objective}`);
+    };
+
     await sendAndAwait(message, buildSendOptions(initialMode));
+    await adoptAgentCreatedGoal();
 
     // Stop if budget was exceeded during first message
     if (budgetExceeded) {
@@ -1467,7 +1350,7 @@ async function main(): Promise<number> {
       planProposed = false;
       if (initialMode === "plan" && !planWasProposed) {
         const goalAfterFirstTurn = await getGoal();
-        if (!hasGoal || goalAfterFirstTurn?.status !== "budget_limited") {
+        if (!drivesGoal || goalAfterFirstTurn?.status !== "budget_limited") {
           throw new Error("Plan mode was requested, but the assistant never proposed a plan.");
         }
       }
@@ -1476,8 +1359,9 @@ async function main(): Promise<number> {
           "\n[auto] Plan received. Approving and switching to execute mode...\n"
         );
         await sendAndAwait("Plan approved. Execute it.", buildSendOptions("exec"));
+        await adoptAgentCreatedGoal();
       }
-      if (hasGoal && !budgetExceeded) {
+      if (drivesGoal && !budgetExceeded) {
         try {
           await driveCliGoalUntilTerminal({
             workspaceId,
@@ -1492,11 +1376,9 @@ async function main(): Promise<number> {
               idleDispatcher.requestDispatch(workspaceId, GOAL_CONTINUATION_IDLE_CONSUMER_NAME),
             checkGoalContinuationEligibility: (nowMs) =>
               workspaceGoalService.checkGoalContinuationEligibility(workspaceId, nowMs),
-            prepareForContinuation: () => {
-              completionPromise = createCompletionPromise();
-            },
-            waitForStreamStarted,
-            waitForCompletion,
+            prepareForContinuation: () => streamWaits.prepareForContinuation(),
+            waitForStreamStarted: (timeoutMs) => streamWaits.waitForStreamStarted(timeoutMs),
+            waitForCompletion: () => streamWaits.waitForCompletion(),
             streamStartTimeoutMs: CLI_GOAL_STREAM_START_TIMEOUT_MS,
             isSessionBudgetExceeded: () => budgetExceeded,
             nowMs: Date.now,
@@ -1518,7 +1400,7 @@ async function main(): Promise<number> {
 
     if (
       budgetExceeded &&
-      hasGoal &&
+      drivesGoal &&
       goalStopReason == null &&
       finalGoalRecord?.status !== "complete"
     ) {
@@ -1616,7 +1498,6 @@ async function main(): Promise<number> {
         { name: "codexOauthService.dispose", run: () => codexOauthService.dispose() },
         { name: "coderOauthService.dispose", run: () => coderOauthService.dispose() },
         { name: "realProviderService.dispose", run: () => realProviderService.dispose() },
-        { name: "policyService.dispose", run: () => policyService.dispose() },
         ...(keepBackgroundProcesses
           ? []
           : [
@@ -1639,7 +1520,7 @@ async function main(): Promise<number> {
   let exitOutcome: number;
   if (budgetExceeded) {
     exitOutcome = 2;
-  } else if (hasGoal && (goalDriverError != null || finalGoalRecord?.status !== "complete")) {
+  } else if (drivesGoal && (goalDriverError != null || finalGoalRecord?.status !== "complete")) {
     const reason = goalStopReason ?? describeCliGoalStop(finalGoalRecord);
     writeHumanLineClosed(`[goal] stopped: ${reason}`);
     emitJsonLine({

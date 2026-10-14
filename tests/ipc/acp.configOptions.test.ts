@@ -1,5 +1,5 @@
 import type { SessionConfigOption, SessionConfigSelectOption } from "@agentclientprotocol/sdk";
-import { DEFAULT_HIDDEN_MODELS, KNOWN_MODELS } from "../../src/common/constants/knownModels";
+import { KNOWN_MODELS } from "../../src/common/constants/knownModels";
 import {
   AGENT_MODE_CONFIG_ID,
   buildConfigOptions,
@@ -10,7 +10,7 @@ import type { ORPCClient } from "../../src/node/acp/serverConnection";
 interface WorkspaceAiSettings {
   model: string;
   thinkingLevel: "off" | "low" | "medium" | "high" | "xhigh" | "max";
-  reasoningMode?: "standard" | "pro";
+  reasoningMode?: "standard" | "pro" | "cyber";
 }
 
 interface WorkspaceState {
@@ -60,16 +60,16 @@ function createHarness(
   client: ORPCClient;
   getWorkspaceState: () => WorkspaceState;
   onAgentModeChanged: jest.Mock<void, [string, WorkspaceAiSettings]>;
-  updateModeCalls: Array<{
+  updateModeCalls: {
     workspaceId: string;
     mode: "exec" | "plan";
     aiSettings: WorkspaceAiSettings;
-  }>;
-  updateAgentCalls: Array<{
+  }[];
+  updateAgentCalls: {
     workspaceId: string;
     agentId: string;
     aiSettings: WorkspaceAiSettings;
-  }>;
+  }[];
 } {
   const workspaceState: WorkspaceState = {
     agentId: initial.agentId,
@@ -77,16 +77,16 @@ function createHarness(
     aiSettingsByAgent: { ...initial.aiSettingsByAgent },
   };
 
-  const updateModeCalls: Array<{
+  const updateModeCalls: {
     workspaceId: string;
     mode: "exec" | "plan";
     aiSettings: WorkspaceAiSettings;
-  }> = [];
-  const updateAgentCalls: Array<{
+  }[] = [];
+  const updateAgentCalls: {
     workspaceId: string;
     agentId: string;
     aiSettings: WorkspaceAiSettings;
-  }> = [];
+  }[] = [];
 
   const availableAgents = options?.agents ?? DEFAULT_AGENT_DESCRIPTORS;
 
@@ -143,7 +143,7 @@ function getSelectConfigOption(
   id: string
 ): Extract<SessionConfigOption, { type: "select" }> {
   const option = options.find((candidate) => candidate.id === id);
-  if (option == null || option.type !== "select") {
+  if (option?.type !== "select") {
     throw new Error(`Expected select config option '${id}'`);
   }
   return option;
@@ -156,33 +156,15 @@ function flattenSelectOptions(
 }
 
 describe("ACP config options", () => {
+  const luna = KNOWN_MODELS.GPT_6_LUNA.id;
+  const astra = KNOWN_MODELS.GPT_6_ASTRA.id;
+
   it.each([
-    { hiddenModels: undefined, current: KNOWN_MODELS.GPT.id, blue: false, red: false },
-    {
-      hiddenModels: [...DEFAULT_HIDDEN_MODELS],
-      current: KNOWN_MODELS.GPT.id,
-      blue: false,
-      red: false,
-    },
-    { hiddenModels: [], current: KNOWN_MODELS.GPT.id, blue: true, red: true },
-    {
-      hiddenModels: [KNOWN_MODELS.DAYBREAK_BLUE.id],
-      current: KNOWN_MODELS.GPT.id,
-      blue: false,
-      red: true,
-    },
-    {
-      hiddenModels: [KNOWN_MODELS.DAYBREAK_RED.id],
-      current: KNOWN_MODELS.GPT.id,
-      blue: true,
-      red: false,
-    },
-    {
-      hiddenModels: [...DEFAULT_HIDDEN_MODELS],
-      current: KNOWN_MODELS.DAYBREAK_BLUE.id,
-      blue: true,
-      red: false,
-    },
+    { hiddenModels: undefined, current: KNOWN_MODELS.GPT.id, luna: true, astra: true },
+    { hiddenModels: [], current: KNOWN_MODELS.GPT.id, luna: true, astra: true },
+    { hiddenModels: [luna], current: KNOWN_MODELS.GPT.id, luna: false, astra: true },
+    { hiddenModels: [astra], current: KNOWN_MODELS.GPT.id, luna: true, astra: false },
+    { hiddenModels: [luna, astra], current: luna, luna: true, astra: false },
   ])("respects model visibility while retaining the current selection: %j", async (scenario) => {
     const harness = createHarness(
       {
@@ -194,8 +176,8 @@ describe("ACP config options", () => {
     );
     const option = getSelectConfigOption(await buildConfigOptions(harness.client, "ws-1"), "model");
     const values = flattenSelectOptions(option).map((entry) => entry.value);
-    expect(values.includes(KNOWN_MODELS.DAYBREAK_BLUE.id)).toBe(scenario.blue);
-    expect(values.includes(KNOWN_MODELS.DAYBREAK_RED.id)).toBe(scenario.red);
+    expect(values.includes(luna)).toBe(scenario.luna);
+    expect(values.includes(astra)).toBe(scenario.astra);
     expect(values).toContain(scenario.current);
     expect(new Set(values).size).toBe(values.length);
     expect(option.currentValue).toBe(scenario.current);
@@ -246,36 +228,6 @@ describe("ACP config options", () => {
       "medium",
       "high",
       "max",
-    ]);
-  });
-
-  it("normalizes openai thinking labels and current value to xhigh (not max)", async () => {
-    const harness = createHarness({
-      agentId: "exec",
-      aiSettings: {
-        model: "openai:gpt-5.2",
-        thinkingLevel: "max",
-      },
-      aiSettingsByAgent: {
-        exec: {
-          model: "openai:gpt-5.2",
-          thinkingLevel: "max",
-        },
-      },
-    });
-
-    const options = await buildConfigOptions(harness.client, "ws-1", { activeAgentId: "exec" });
-
-    const thinkingOption = getSelectConfigOption(options, "thinkingLevel");
-    const thinkingEntries = flattenSelectOptions(thinkingOption);
-
-    expect(thinkingOption.currentValue).toBe("xhigh");
-    expect(thinkingEntries.map((entry) => entry.name)).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
     ]);
   });
 
@@ -363,13 +315,13 @@ describe("ACP config options", () => {
       harness.client,
       "ws-1",
       "model",
-      "openai:gpt-5-pro",
+      "google:gemini-3.1-pro-preview",
       { activeAgentId: "exec", onAgentModeChanged: harness.onAgentModeChanged }
     );
 
     expect(harness.updateModeCalls).toHaveLength(0);
     expect(harness.onAgentModeChanged.mock.calls[0]?.[1]).toEqual({
-      model: "openai:gpt-5-pro",
+      model: "google:gemini-3.1-pro-preview",
       thinkingLevel: "high",
     });
 
@@ -377,7 +329,7 @@ describe("ACP config options", () => {
     const thinkingEntries = flattenSelectOptions(thinkingOption);
 
     expect(thinkingOption.currentValue).toBe("high");
-    expect(thinkingEntries.map((entry) => entry.value)).toEqual(["high"]);
+    expect(thinkingEntries.map((entry) => entry.value)).toEqual(["low", "high"]);
     expect(harness.getWorkspaceState().aiSettingsByAgent.exec).toEqual({
       model: "anthropic:claude-opus-4-6",
       thinkingLevel: "xhigh",

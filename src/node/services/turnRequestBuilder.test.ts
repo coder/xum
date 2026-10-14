@@ -3,6 +3,7 @@ import { tool } from "ai";
 import { z } from "zod";
 import { getContextBudgetHardCeiling } from "@/common/utils/compaction/contextBudget";
 import { ContextBudgetExceededError } from "./contextBudgetError";
+import { estimateAssembledRequestTokensForModel } from "./contextBudgetCounting";
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
@@ -22,6 +23,7 @@ import {
   TurnRequestBuilder,
   assembleBudgetCheckedPromptPayload,
   prepareProviderRequestMessages,
+  resolveMuxProjectRootForHostFs,
   resolveXumToolScope,
   type PrepareModelAttemptOptions,
 } from "./turnRequestBuilder";
@@ -64,7 +66,6 @@ async function createPreparationHarness() {
       throw new Error("not used by request preparation tests");
     },
     isClaudeSkillsCompatEnabled: () => false,
-    isAgentPluginsEnabled: () => false,
     wrapToolsForDelegation: (_workspaceId, tools) => tools,
     durableEventJournalFor: () => {
       throw new Error("not used by request preparation tests");
@@ -275,6 +276,48 @@ describe("TurnRequestBuilder assembled preflight", () => {
     }
   });
 
+  it("applies the claude-encoding correction only when Token Budget is on", async () => {
+    // Same request and window for both encodings: its OpenAI-encoded estimate fits the 8100-token
+    // ceiling, while the corrected claude-encoded estimate does not (#5219).
+    const window = 10_800;
+    const request = (modelString: string) => {
+      const base = options(modelString);
+      return {
+        ...base,
+        providersConfig: {
+          ...base.providersConfig,
+          openai: {
+            ...base.providersConfig.openai,
+            models: [{ id: "custom-context-model", contextWindowTokens: window }],
+          },
+          anthropic: {
+            apiKeySet: true,
+            isEnabled: true,
+            isConfigured: true,
+            models: [{ id: "custom-claude", contextWindowTokens: window }],
+          },
+        },
+      };
+    };
+    const openai = await assembleBudgetCheckedPromptPayload(
+      request("openai:custom-context-model"),
+      {
+        enabled: true,
+      }
+    );
+    expect(openai.contextBudgetLimit).toBe(window);
+    const refused = await assembleBudgetCheckedPromptPayload(request("anthropic:custom-claude"), {
+      enabled: true,
+    }).catch((error: unknown) => error);
+    expect(refused).toBeInstanceOf(ContextBudgetExceededError);
+    // Token Budget off: no estimate gates the request, so it is sent unchanged.
+    const off = await assembleBudgetCheckedPromptPayload(request("anthropic:custom-claude"), {
+      enabled: false,
+    });
+    expect(off.contextBudgetLimit).toBeUndefined();
+    expect(off.messages.length).toBeGreaterThan(0);
+  });
+
   it("rechecks the target limit when a large-window primary falls back to a smaller model", async () => {
     const primary = await assembleBudgetCheckedPromptPayload(
       options("openai:large-context-model"),
@@ -376,6 +419,36 @@ describe("TurnRequestBuilder assembled preflight", () => {
     const payload = await assembleBudgetCheckedPromptPayload(options(), { enabled: false });
     expect(payload.messages.length).toBeGreaterThan(0);
   });
+
+  // #5286: turn-start stage decisions read E from the payload instead of counting it again.
+  it("keeps the enforced estimate on the payload", async () => {
+    const request = options("openai:large-context-model");
+    const payload = await assembleBudgetCheckedPromptPayload(request, { enabled: true });
+    expect(payload.contextBudgetEstimate).toBe(
+      (await estimateAssembledRequestTokensForModel(payload, {
+        model: request.modelString,
+        modelContextLimit: payload.contextBudgetLimit,
+      }))!.estimate
+    );
+    const off = await assembleBudgetCheckedPromptPayload(request, { enabled: false });
+    expect(off.contextBudgetEstimate).toBeUndefined();
+  });
+
+  it("measure-only mode returns the over-ceiling estimate instead of refusing", async () => {
+    const refused = await assembleBudgetCheckedPromptPayload(options(), { enabled: true }).catch(
+      (error: unknown) => error
+    );
+    if (!(refused instanceof ContextBudgetExceededError)) throw new Error("Expected refusal");
+    const measured = await assembleBudgetCheckedPromptPayload(options(), {
+      enabled: true,
+      measureOnly: true,
+    });
+    expect(measured.contextBudgetEstimate).toBe(refused.details.estimate);
+    const unchecked = await assembleBudgetCheckedPromptPayload(options(), { enabled: false });
+    expect(measured.messages).toEqual(unchecked.messages);
+    expect(measured.system).toEqual(unchecked.system);
+    expect(Object.keys(measured.tools ?? {})).toEqual(Object.keys(unchecked.tools ?? {}));
+  });
 });
 
 describe("TurnRequestBuilder tool scope", () => {
@@ -404,6 +477,33 @@ describe("TurnRequestBuilder tool scope", () => {
 });
 
 describe("TurnRequestBuilder model attempt preparation", () => {
+  it("merges saved Meta extras into the Responses SDK namespace", async () => {
+    const harness = await createPreparationHarness();
+    try {
+      harness.providersConfigStore.saveProvidersConfig({
+        meta: { modelParameters: { "*": { parallelToolCalls: false } } },
+      });
+      const prepared = harness.builder.prepareModelAttempt(
+        preparationOptions(harness.providerService.getConfig() ?? {}, {
+          rawModelString: "meta:muse-wonder-1.0",
+          canonicalModelString: "meta:muse-wonder-1.0",
+          canonicalProviderName: "meta",
+          effectiveModelString: "meta:muse-wonder-1.0",
+          optionsModelString: "meta:muse-wonder-1.0",
+          wireProviderName: "meta",
+          routeProvider: "meta",
+          effectiveThinkingLevel: "high",
+        })
+      );
+      expect(prepared.providerOptions).toMatchObject({
+        openai: { parallelToolCalls: false, reasoningEffort: "high", store: false },
+      });
+      expect(prepared.providerOptions).not.toHaveProperty("meta");
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
   it("merges call settings and provider extras at the resolved namespace", async () => {
     const harness = await createPreparationHarness();
     try {
@@ -462,6 +562,76 @@ describe("TurnRequestBuilder model attempt preparation", () => {
     }
   });
 
+  it("runs a mid-turn switch to 'off' on Sonnet 5.5 as low adaptive, not between_tools", async () => {
+    // #5086: effort stays pinned for the conversation, and a mid-turn level change
+    // is a change within it.
+    const harness = await createPreparationHarness();
+    try {
+      const sonnet55 = "anthropic:claude-sonnet-5-5";
+      const snapshot: ProvidersConfigMap = {
+        anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true },
+      };
+      const prepared = harness.builder.prepareModelAttempt(
+        preparationOptions(snapshot, {
+          rawModelString: sonnet55,
+          canonicalModelString: sonnet55,
+          effectiveModelString: sonnet55,
+          optionsModelString: sonnet55,
+          routeProvider: "anthropic",
+          effectiveThinkingLevel: "medium",
+        })
+      );
+
+      const rebuilt = prepared.rebuildProviderOptionsForThinkingLevel("off");
+      expect(rebuilt?.effectiveLevel).toBe("low");
+      expect(rebuilt?.providerOptions.anthropic).toMatchObject({
+        thinking: { type: "adaptive", display: "summarized" },
+        effort: "low",
+      });
+      // Already at low: "off" resolves to the same level, so nothing is rebuilt.
+      expect(prepared.rebuildProviderOptionsForThinkingLevel("off")).toBeNull();
+      // A pre-stream override (before any provider call) looks only at the history.
+      const folded = prepared.computeRebuiltProviderOptions("off", "medium", true);
+      expect(folded?.effectiveLevel).toBe("off");
+      expect(folded?.providerOptions.anthropic).toMatchObject({
+        thinking: { type: "between_tools" },
+      });
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  it("resolves a Sonnet 5.5 'off' override consumed before the first provider request as between_tools", async () => {
+    // #5279: StreamManager can consume an override at step 0, after the pre-construction
+    // fold but before any request; it must resolve as it would at turn start.
+    const harness = await createPreparationHarness();
+    try {
+      const sonnet55 = "anthropic:claude-sonnet-5-5";
+      const prepared = harness.builder.prepareModelAttempt(
+        preparationOptions(
+          { anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true } },
+          {
+            rawModelString: sonnet55,
+            canonicalModelString: sonnet55,
+            effectiveModelString: sonnet55,
+            optionsModelString: sonnet55,
+            routeProvider: "anthropic",
+            effectiveThinkingLevel: "medium",
+          }
+        )
+      );
+
+      const rebuilt = prepared.rebuildProviderOptionsForThinkingLevel("off", true);
+      expect(rebuilt?.effectiveLevel).toBe("off");
+      expect(rebuilt?.providerOptions.anthropic).toMatchObject({
+        thinking: { type: "between_tools" },
+        effort: "low",
+      });
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
   it.each([
     { routeProvider: "openai" as const, hasCacheKey: true },
     { routeProvider: "mux-gateway" as const, hasCacheKey: false },
@@ -472,11 +642,11 @@ describe("TurnRequestBuilder model attempt preparation", () => {
         preparationOptions(
           { openai: { apiKeySet: true, isEnabled: true, isConfigured: true } },
           {
-            rawModelString: "openai:gpt-5.6-luna",
-            canonicalModelString: "openai:gpt-5.6-luna",
+            rawModelString: "openai:gpt-6-luna",
+            canonicalModelString: "openai:gpt-6-luna",
             canonicalProviderName: "openai",
-            effectiveModelString: "openai:gpt-5.6-luna",
-            optionsModelString: "openai:gpt-5.6-luna",
+            effectiveModelString: "openai:gpt-6-luna",
+            optionsModelString: "openai:gpt-6-luna",
             wireProviderName: "openai",
             routeProvider: testCase.routeProvider,
             effectiveThinkingLevel: "off",
@@ -566,5 +736,66 @@ describe("TurnRequestBuilder model attempt preparation", () => {
     } finally {
       await harness.cleanup();
     }
+  });
+});
+
+describe("resolveMuxProjectRootForHostFs", () => {
+  const projectPath = "/home/user/projects/my-app";
+  const workspacePath = "/home/user/.mux/src/my-app/feature-branch";
+
+  function createMetadata(runtimeConfig: WorkspaceMetadata["runtimeConfig"]): WorkspaceMetadata {
+    return {
+      id: "workspace-id",
+      name: "feature-branch",
+      projectName: "my-app",
+      projectPath,
+      runtimeConfig,
+    };
+  }
+
+  it("returns workspacePath for local runtime", () => {
+    expect(resolveMuxProjectRootForHostFs(createMetadata({ type: "local" }), workspacePath)).toBe(
+      workspacePath
+    );
+  });
+
+  it("returns workspacePath for worktree runtime", () => {
+    expect(
+      resolveMuxProjectRootForHostFs(
+        createMetadata({ type: "worktree", srcBaseDir: "/home/user/.mux/src" }),
+        workspacePath
+      )
+    ).toBe(workspacePath);
+  });
+
+  it("returns workspacePath for devcontainer runtime", () => {
+    expect(
+      resolveMuxProjectRootForHostFs(
+        createMetadata({ type: "devcontainer", configPath: ".devcontainer/devcontainer.json" }),
+        workspacePath
+      )
+    ).toBe(workspacePath);
+  });
+
+  it("returns projectPath for ssh runtime", () => {
+    expect(
+      resolveMuxProjectRootForHostFs(
+        createMetadata({
+          type: "ssh",
+          host: "remote",
+          srcBaseDir: "/home/remote/.mux/src",
+        }),
+        "/remote/workspace/path"
+      )
+    ).toBe(projectPath);
+  });
+
+  it("returns projectPath for docker runtime", () => {
+    expect(
+      resolveMuxProjectRootForHostFs(
+        createMetadata({ type: "docker", image: "ubuntu:22.04" }),
+        "/src"
+      )
+    ).toBe(projectPath);
   });
 });

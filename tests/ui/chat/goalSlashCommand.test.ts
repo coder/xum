@@ -7,12 +7,11 @@ jest.mock("lottie-react", () => ({
 
 import { act, fireEvent, waitFor } from "@testing-library/react";
 
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   lockInitialStaging,
   unlockInitialStaging,
 } from "@/browser/features/ChatInput/initialStagingLock";
-import { getInputAttachmentsKey } from "@/common/constants/storage";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import { preloadTestModules } from "../../ipc/setup";
 import { createAppHarness } from "../harness";
 
@@ -43,17 +42,20 @@ describe("Goal slash command", () => {
       });
 
       await app.chat.typeWithoutSending("/goal this is your new goal,");
-      const textarea = app.view.container.querySelector(
-        'textarea[aria-label="Message Claude"]'
-      ) as HTMLTextAreaElement | null;
+      const textarea = app.view.container.querySelector('textarea[aria-label="Message"]');
       expect(textarea).not.toBeNull();
       fireEvent.keyDown(textarea!, { key: "Enter" });
 
-      await waitFor(async () => {
-        const { goal } = await app.env.orpc.workspace.getGoal({ workspaceId: app.workspaceId });
-        expect(goal?.objective).toBe("this is your new goal,");
-        expect(goal?.status).toBe("active");
-      });
+      // Each poll is a backend round trip, and under CI load one getGoal call can outlast
+      // waitFor's default 1 s budget on its own (#5029). Use the harness's 10 s bound.
+      await waitFor(
+        async () => {
+          const { goal } = await app.env.orpc.workspace.getGoal({ workspaceId: app.workspaceId });
+          expect(goal?.objective).toBe("this is your new goal,");
+          expect(goal?.status).toBe("active");
+        },
+        { timeout: 10_000 }
+      );
     } finally {
       await app.dispose();
     }
@@ -66,7 +68,7 @@ describe("Goal slash command", () => {
     const app = await createAppHarness({
       branchPrefix: "goal-staged",
       beforeRender: (workspaceId) => {
-        updatePersistedState(getInputAttachmentsKey(workspaceId), [
+        getDraftStore().setAttachments({ kind: "workspace", workspaceId: workspaceId }, [
           {
             kind: "staged",
             id: "s1",
@@ -108,7 +110,7 @@ describe("Goal slash command", () => {
       // staging on deferred runtimes can finish minutes after the workspace
       // composer mounted, so the write must sync into the mounted composer.
       act(() => {
-        updatePersistedState(getInputAttachmentsKey(app.workspaceId), [
+        getDraftStore().setAttachments({ kind: "workspace", workspaceId: app.workspaceId }, [
           {
             kind: "staged",
             id: "s1",
@@ -135,9 +137,7 @@ describe("Goal slash command", () => {
 
     try {
       const getTextarea = () =>
-        app.view.container.querySelector(
-          'textarea[aria-label="Message Claude"]'
-        ) as HTMLTextAreaElement | null;
+        app.view.container.querySelector<HTMLTextAreaElement>('textarea[aria-label="Message"]');
 
       await waitFor(() => {
         const textarea = getTextarea();

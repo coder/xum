@@ -61,13 +61,27 @@ export function useChatViewDataReady(workspaceId: string): boolean {
   const allKnown =
     backgroundBashKnown && providersConfigLoaded && sessionUsageKnown && instructionsHydrated;
 
-  // Resilience deadline: every source self-heals on *error*, but a hung
-  // backend (no response, no rejection) has no deterministic failure signal —
-  // so force-reveal after a bound rather than holding the skeleton forever.
-  // Per AGENTS.md, startup-style initialization must never block the app:
-  // time out and fall back silently (decorations then mount late, which is
-  // exactly the pre-barrier degraded behavior).
+  return useChatViewDataReadyDeadline(workspaceId, allKnown);
+}
+
+/**
+ * Resilience deadline: every source self-heals on *error*, but a hung
+ * backend (no response, no rejection) has no deterministic failure signal,
+ * so force-reveal after a bound rather than holding the skeleton forever.
+ * Per AGENTS.md, startup-style initialization must never block the app:
+ * time out and fall back silently (decorations then mount late, which is
+ * exactly the pre-barrier degraded behavior). The VS Code webview's reveal
+ * gate shares it.
+ */
+export function useChatViewDataReadyDeadline(workspaceId: string, allKnown: boolean): boolean {
   const [forcedReadyWorkspaceId, setForcedReadyWorkspaceId] = useState<string | null>(null);
+  // A forced reveal covers only the visit that waited: returning to the workspace before its
+  // data is known waits again instead of revealing without it.
+  const [deadlineWorkspaceId, setDeadlineWorkspaceId] = useState(workspaceId);
+  if (deadlineWorkspaceId !== workspaceId) {
+    setDeadlineWorkspaceId(workspaceId);
+    setForcedReadyWorkspaceId(null);
+  }
   useEffect(() => {
     if (allKnown) {
       return;
@@ -84,7 +98,7 @@ export function useChatViewDataReady(workspaceId: string): boolean {
 // Generous relative to the expected cost (each source is roughly one local
 // IPC round trip resolved in parallel), tight enough that a wedged source
 // degrades to "decorations pop in late" instead of "chat looks broken".
-const CHAT_VIEW_DATA_READY_TIMEOUT_MS = 2_000;
+export const CHAT_VIEW_DATA_READY_TIMEOUT_MS = 2_000;
 
 export interface ChatViewRevealInputs {
   /** Transcript history replay still in flight for the active workspace. */
@@ -95,6 +109,8 @@ export interface ChatViewRevealInputs {
   hasRenderableMessages: boolean;
   /** Cached rows are known to be missing backend content (WorkspaceState.isTranscriptStale). */
   isTranscriptStale: boolean;
+  /** Catch-up is a since replay (WorkspaceState.isIncrementalCatchUp). */
+  isIncrementalCatchUp: boolean;
 }
 
 export interface ChatViewRevealState {
@@ -113,16 +129,20 @@ export interface ChatViewRevealState {
  * - Revisit with trustworthy cached rows: they paint immediately (no skeleton)
  *   and the latched known-flags make decorations renderable in that same
  *   first commit.
- * - Stale cached rows or an empty transcript hold the skeleton until caught-up,
- *   even with an active stream/monitor barrier: an active turn does not mean
- *   history has loaded, and painting rows that are known to be incomplete would
- *   jump when the missing content lands. Live status stays in the composer dock
- *   so Stop remains reachable without following the skeleton or history height.
+ * - Stale cached rows repaired by a since replay stay painted with the dock
+ *   shimmer: the server verifies every row up to the cursor. Rows after it (sent
+ *   live since the last caught-up) grow, or are swapped in one commit at caught-up
+ *   if they were edited or deleted elsewhere meanwhile.
+ * - Stale cached rows under a full replay, or an empty transcript, hold the
+ *   skeleton until caught-up, even with an active stream/monitor barrier: an
+ *   active turn does not mean history has loaded, and a full replay rebuilds the
+ *   transcript from scratch. Live status stays in the composer dock so Stop
+ *   remains reachable without following the skeleton or history height.
  */
 export function computeChatViewReveal(inputs: ChatViewRevealInputs): ChatViewRevealState {
   const showHydrationPlaceholder =
     (inputs.isHydratingTranscript || !inputs.chatViewDataReady) &&
-    (!inputs.hasRenderableMessages || inputs.isTranscriptStale);
+    (!inputs.hasRenderableMessages || (inputs.isTranscriptStale && !inputs.isIncrementalCatchUp));
 
   return {
     showHydrationPlaceholder,

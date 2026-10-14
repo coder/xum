@@ -12,11 +12,18 @@ import type { SendMessageOptions } from "@/common/orpc/types";
 import type { MuxMessage } from "@/common/types/message";
 import { coerceThinkingLevel } from "@/common/types/thinking";
 import {
+  anthropicBetweenToolsRouteAvailable,
   buildProviderOptions,
   buildRequestHeaders,
   isAnthropic1MEffectivelyEnabled,
 } from "@/common/utils/ai/providerOptions";
-import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
+import {
+  assistantThinkingLevels,
+  enforceThinkingPolicy,
+  resolveBetweenToolsThinkingLevel,
+} from "@/common/utils/thinking/policy";
+import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
+import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
@@ -45,6 +52,11 @@ export async function summarizeContinuousCompaction(args: {
   aiService: AgentSessionAIService;
   sessionUsageService?: Pick<SessionUsageService, "recordHeadlessUsage">;
   head: MuxMessage[];
+  /**
+   * Rows searched for the thinking-repair receipt: the whole segment, head included. Required
+   * so a caller cannot silently fall back to the head alone (#5996).
+   */
+  receiptRows: MuxMessage[];
   signal: AbortSignal;
   context: ContinuousCompactionContext;
   baseOptions: SendMessageOptions;
@@ -85,9 +97,9 @@ export async function summarizeContinuousCompaction(args: {
     workspaceId: args.workspaceId,
     sessionDir,
     journal: sharedDurableEventJournal(sessionDir),
-    enabled: args.aiService.isAgentPluginsEnabled?.() === true,
     xumHome: args.config.rootDir,
     projectRoot: pluginContext?.projectRoot,
+    projectKey: pluginContext?.projectKey,
     projectTrusted: isWorkspaceProjectTrusted(args.config, metadata.data),
   });
   args.signal.throwIfAborted();
@@ -101,7 +113,6 @@ export async function summarizeContinuousCompaction(args: {
     callerToolPolicy: [{ regex_match: ".*", action: "disable" }],
     cfg: args.config.loadConfigOrDefault(),
     emitError: () => undefined,
-    includeAgentPlugins: args.aiService.isAgentPluginsEnabled?.(),
   });
   if (!agent.success) throw new Error(`Cannot resolve compact agent: ${agent.error.type}`);
   const system = await resolveAgentBody(
@@ -109,7 +120,6 @@ export async function summarizeContinuousCompaction(args: {
     agent.data.agentDiscoveryPath,
     agent.data.agentDefinition.id,
     {
-      includeAgentPlugins: args.aiService.isAgentPluginsEnabled?.(),
       skipScopesAbove: getSkipScopesAboveForKnownScope(agent.data.agentDefinition.scope),
     }
   );
@@ -123,11 +133,25 @@ export async function summarizeContinuousCompaction(args: {
   if (!created.success) throw new Error(`Cannot create compact model: ${created.error.type}`);
   try {
     args.signal.throwIfAborted();
-    const thinkingLevel = enforceThinkingPolicy(
-      created.data.optionsModelString,
-      coerceThinkingLevel(options.thinkingLevel) ?? "off",
-      undefined,
-      created.data.optionsProvidersConfig
+    // Resolve Sonnet 5.5 "off" (between_tools or low adaptive, #5086) before message
+    // preparation so the prepared messages and the provider options agree.
+    const thinkingLevel = resolveBetweenToolsThinkingLevel(
+      resolveModelForMetadata(
+        created.data.optionsModelString,
+        created.data.optionsProvidersConfig ?? null
+      ),
+      enforceThinkingPolicy(
+        created.data.optionsModelString,
+        coerceThinkingLevel(options.thinkingLevel) ?? "off",
+        undefined,
+        created.data.optionsProvidersConfig
+      ),
+      anthropicBetweenToolsRouteAvailable(
+        created.data.optionsModelString,
+        created.data.optionsRouteProvider,
+        created.data.optionsProvidersConfig
+      ),
+      assistantThinkingLevels(sliceMessagesForProviderFromLatestContextBoundary(args.head))
     );
     const prepared = prepareProviderRequestMessages(
       args.head,
@@ -136,6 +160,7 @@ export async function summarizeContinuousCompaction(args: {
     );
     const messages = await prepareMessagesForProvider({
       messagesWithSentinel: addInterruptedSentinel(prepared.providerRequestMessages),
+      replayReceiptMessages: args.receiptRows,
       effectiveAgentId: "compact",
       toolNamesForSentinel: [],
       postCompactionAttachments: null,
@@ -187,7 +212,9 @@ export async function summarizeContinuousCompaction(args: {
       providerOptions: buildProviderOptions(
         created.data.optionsModelString,
         thinkingLevel,
-        args.head,
+        // The provider-visible rows: buildProviderOptions re-runs the #5086 effort pin,
+        // which must see the same boundary-sliced history as the resolution above.
+        prepared.providerRequestMessages,
         undefined,
         created.data.optionsMuxProviderOptions,
         args.workspaceId,

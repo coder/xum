@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
-import { resolveWorkspaceAiSettingsForAgent } from "./workspaceModeAi";
+import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
+import { resolveConfiguredAiDefaults, resolveWorkspaceAiSettingsForAgent } from "./workspaceModeAi";
 
 describe("resolveWorkspaceAiSettingsForAgent", () => {
   test("uses global agent defaults when configured", () => {
@@ -406,5 +407,45 @@ describe("resolveWorkspaceAiSettingsForAgent", () => {
       resolvedThinking: "off",
       resolvedReasoningMode: "standard",
     });
+  });
+});
+
+describe("resolveConfiguredAiDefaults Auto flags", () => {
+  test("the nearest declared layer setting a dimension decides Auto", () => {
+    const agentBaseById = new Map([
+      ["reviewer", "writer"],
+      ["writer", "exec"],
+    ]);
+    const resolve = (agentAiDefaults: AgentAiDefaults) => {
+      const configured = resolveConfiguredAiDefaults("reviewer", agentAiDefaults, agentBaseById);
+      return {
+        model: configured.autoModelRouting === true,
+        thinkingLevel: configured.autoThinkingLevel === true,
+      };
+    };
+
+    // A child's concrete value blocks ancestor Auto for that dimension only.
+    expect(
+      resolve({
+        reviewer: { modelString: "openai:gpt-5.2" },
+        exec: { autoModelRouting: true, autoThinkingLevel: true },
+      })
+    ).toEqual({ model: false, thinkingLevel: true });
+
+    // Auto plus a concrete value on the same layer stays Auto.
+    expect(
+      resolve({
+        writer: { modelString: "openai:gpt-5.2", autoModelRouting: true },
+        exec: { modelString: "anthropic:claude-opus-4-6" },
+      })
+    ).toEqual({ model: true, thinkingLevel: false });
+  });
+
+  test("the implicit exec fallback contributes no Auto to undeclared agents", () => {
+    const configured = resolveConfiguredAiDefaults("custom", {
+      exec: { autoModelRouting: true, autoThinkingLevel: true },
+    });
+    expect(configured.autoModelRouting).toBeUndefined();
+    expect(configured.autoThinkingLevel).toBeUndefined();
   });
 });

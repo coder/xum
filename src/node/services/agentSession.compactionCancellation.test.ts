@@ -24,6 +24,7 @@ import {
   CompactionCancellationReadRefusedError,
 } from "./compactionCancellation";
 import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSession.testHarness";
+import { createContextBudgetWarning } from "./contextWindowRollover";
 
 const workspaceId = "cancellation-runtime";
 const options = { model: "openai:gpt-4o", agentId: "exec" };
@@ -83,14 +84,16 @@ describe("compaction cancellation runtime", () => {
     "public interrupt preserves synchronous reset order (%j)",
     async ({ abandonPartial, pending }) => {
       const h = await fixture();
-      const budget = h.session as unknown as {
+      // Budget state is controller-private strategy state, reached through the same names
+      // the controller uses. The interrupt fence must clear it before any physical stop.
+      const budget = Reflect.get(h.state.contextController, "tokenBudget") as {
         clearContextBudgetState(): void;
         contextBudgetGeneration: number;
-        contextBudgetWarningClaimed: boolean;
-        contextBudgetFlushClaimed: boolean;
+        contextBudgetHandoffClaimed: boolean;
+        contextBudgetFinalClaimed: boolean;
       };
-      budget.contextBudgetWarningClaimed = true;
-      budget.contextBudgetFlushClaimed = true;
+      budget.contextBudgetHandoffClaimed = true;
+      budget.contextBudgetFinalClaimed = true;
       const generation = budget.contextBudgetGeneration;
       const token = pending ? h.state.coordinator.beginCompactionObservation("continuous") : null;
       if (pending) {
@@ -119,8 +122,8 @@ describe("compaction cancellation runtime", () => {
       try {
         // No await: admission and stale-work invalidation must precede the physical stop.
         expect(budget.contextBudgetGeneration).toBe(generation + 1);
-        expect(budget.contextBudgetWarningClaimed).toBe(false);
-        expect(budget.contextBudgetFlushClaimed).toBe(false);
+        expect(budget.contextBudgetHandoffClaimed).toBe(false);
+        expect(budget.contextBudgetFinalClaimed).toBe(false);
         // Ordinary Stop cancels compaction before budget cleanup. The later abandon branch
         // remains separate: moving either reset would change its synchronous admission fence.
         expect(order).toEqual([
@@ -1083,19 +1086,14 @@ describe("compaction cancellation runtime", () => {
     async (rollbackFails) => {
       const h = await fixture();
       const cancel = new AbortController();
-      let rowsPersisted = false;
-      let budgetReserved = true;
       const accepted = mock(() => undefined);
-      const canceled = mock(() => {
-        if (!rowsPersisted) budgetReserved = false;
-      });
+      const canceled = mock(() => undefined);
       const publish = h.historyService.acceptCompactionReplacement.bind(h.historyService);
       spyOn(h.historyService, "acceptCompactionReplacement").mockImplementationOnce(
         async (...args) => {
           const result = await publish(...args);
           assert(result.success && result.data.kind === "accepted");
           expect(result.data.witness).toBeNull();
-          expect(rowsPersisted).toBe(false);
           cancel.abort();
           return result;
         }
@@ -1115,17 +1113,9 @@ describe("compaction cancellation runtime", () => {
               synthetic: true,
             }),
           ],
-          onPreTurnRowsPersisted: () => {
-            rowsPersisted = true;
-          },
-          onAcceptedPreStreamFailure: () => {
-            if (!rowsPersisted) budgetReserved = false;
-          },
         })
       ).toEqual(Ok(undefined));
       expect(await h.rows()).toHaveLength(rollbackFails ? 2 : 0);
-      expect(rowsPersisted).toBe(rollbackFails);
-      expect(budgetReserved).toBe(rollbackFails);
       expect(accepted).toHaveBeenCalledTimes(rollbackFails ? 1 : 0);
       expect(canceled).toHaveBeenCalledTimes(rollbackFails ? 0 : 1);
     }
@@ -1154,16 +1144,11 @@ describe("compaction cancellation runtime", () => {
     expect(await h.session.interruptStream()).toEqual(Ok(undefined));
     const stopped = await h.storage.read();
     assert(stopped?.version === 2);
-    let budgetReserved = true;
-    let rowsPersisted = false;
     const accepted = mock(() => {
-      expect(rowsPersisted).toBe(true);
       throw new Error("acceptance observer failed");
     });
     const canceled = mock(() => undefined);
-    const failed = mock(() => {
-      if (!rowsPersisted) budgetReserved = false;
-    });
+    const failed = mock(() => undefined);
     await nodeAssert.rejects(
       h.session.sendMessage("accepted automatic input", options, {
         acceptanceOrigin: "automatic",
@@ -1175,14 +1160,10 @@ describe("compaction cancellation runtime", () => {
             synthetic: true,
           }),
         ],
-        onPreTurnRowsPersisted: () => {
-          rowsPersisted = true;
-        },
       }),
       /acceptance observer failed/
     );
     expect(accepted).toHaveBeenCalledTimes(1);
-    expect(budgetReserved).toBe(true);
     expect((await h.rows()).map((row) => row.id)).toContain("peer-payload");
     expect(canceled).not.toHaveBeenCalled();
     expect(failed).toHaveBeenCalledTimes(1);
@@ -1202,13 +1183,9 @@ describe("compaction cancellation runtime", () => {
       const foreignStorage = foreignHistory.getCompactionCancellationStorage(workspaceId);
       const foreign = new CompactionCancellation(foreignStorage);
       let successor: Awaited<ReturnType<typeof foreignStorage.read>> = null;
-      let rowsPersisted = false;
-      let budgetReserved = true;
       const accepted = mock(() => undefined);
       const canceled = mock(() => undefined);
-      const failed = mock(() => {
-        if (!rowsPersisted) budgetReserved = false;
-      });
+      const failed = mock(() => undefined);
       const publish = h.historyService.acceptCompactionReplacement.bind(h.historyService);
       spyOn(h.historyService, "acceptCompactionReplacement").mockImplementationOnce(
         async (...args) => {
@@ -1235,16 +1212,11 @@ describe("compaction cancellation runtime", () => {
             synthetic: true,
           }),
         ],
-        onPreTurnRowsPersisted: () => {
-          rowsPersisted = true;
-        },
       });
       expect(result.success).toBe(foreignStop === "none");
       expect(accepted).toHaveBeenCalledTimes(foreignStop === "none" ? 1 : 0);
       expect(failed).toHaveBeenCalledTimes(foreignStop === "none" ? 0 : 1);
       expect(canceled).not.toHaveBeenCalled();
-      expect(rowsPersisted).toBe(true);
-      expect(budgetReserved).toBe(true);
       const rows = await h.rows();
       expect(rows.map((row) => row.id)).toContain("retirement-peer-payload");
       expect(rows.at(-1)?.metadata?.compactionReplacementNonce).toBe(stopped.nonce);
@@ -2308,7 +2280,7 @@ describe("compaction cancellation runtime", () => {
     }
   );
 
-  test.each(["user", "assistant", "partial"] as const)(
+  test.each(["user", "assistant", "partial", "user-then-budget-warning"] as const)(
     "explicit resume stamps the actual %s tail before notices",
     async (kind) => {
       const h = await fixture();
@@ -2316,16 +2288,37 @@ describe("compaction cancellation runtime", () => {
         workspaceId,
         createMuxMessage("user", "user", "prior")
       );
+      // #5286 appends the Token Budget warning after the turn's user row. The warning is a
+      // notice, so the resume target stays the user row it follows.
+      const warning = createContextBudgetWarning({
+        contextTokens: 90_000,
+        maxTokens: 128_000,
+        budgetTokens: 119_808,
+        sessionHistoryAvailable: true,
+        handoff: true,
+        handoffTokens: 89_600,
+        newContextAvailable: true,
+      });
+      if (kind === "user-then-budget-warning")
+        await h.historyService.appendToHistory(workspaceId, warning);
+      const targetId = kind === "user-then-budget-warning" ? "user" : kind;
+      const tailId = kind === "user-then-budget-warning" ? warning.id : kind;
       if (kind === "assistant")
         await h.historyService.appendToHistory(
           workspaceId,
           createMuxMessage("assistant", "assistant", "answer")
         );
-      if (kind === "partial")
+      if (kind === "partial") {
+        // The interrupted stream's empty placeholder row precedes its partial.
+        await h.historyService.appendToHistory(workspaceId, {
+          ...createMuxMessage("partial", "assistant", "", { historySequence: 1 }),
+          parts: [],
+        });
         await h.historyService.writePartial(
           workspaceId,
           createMuxMessage("partial", "assistant", "interrupted answer", { historySequence: 1 })
         );
+      }
       await h.session.cancelCompaction(true);
       const stop = await h.storage.read();
       const detect = h.state.fileChangeTracker.getChangedAttachments.bind(
@@ -2333,10 +2326,14 @@ describe("compaction cancellation runtime", () => {
       );
       const notice = spyOn(h.state.fileChangeTracker, "getChangedAttachments").mockImplementation(
         async () => {
-          expect((await h.rows()).at(-1)).toMatchObject({
-            id: kind,
-            metadata: { compactionReplacementNonce: stop?.nonce },
-          });
+          const rows = await h.rows();
+          // No notice row lands before the stamp: the tail is still the resumed history.
+          expect(rows.at(-1)?.id).toBe(tailId);
+          const stamped = rows.filter(
+            (row) => row.metadata?.compactionReplacementNonce === stop?.nonce
+          );
+          expect(stop?.nonce).toBeDefined();
+          expect(stamped.map((row) => row.id)).toEqual([targetId]);
           expect(await h.storage.read()).toBeNull();
           return detect();
         }

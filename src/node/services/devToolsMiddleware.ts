@@ -21,9 +21,14 @@ import {
   DEVTOOLS_RUN_METADATA_ID_HEADER,
   DEVTOOLS_STEP_ID_HEADER,
   consumeCapturedRequestHeaders,
+  consumePromptCacheWire,
+  closeCapturedRequestBody,
+  consumeRedactedRequestBody,
+  discardCapturedRequestBody,
   redactHeaders,
 } from "./devToolsHeaderCapture";
 import type { DevToolsService } from "./devToolsService";
+import { readInputTransformations } from "@/node/utils/messages/anthropicInputTransformations";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -142,6 +147,7 @@ function createEmptyStep(
     responseHeaders: null,
     rawResponse: null,
     rawChunks: null,
+    inputTransformations: null,
   };
 }
 
@@ -236,6 +242,20 @@ export function extractUsage(
   }
 
   return normalizedUsage;
+}
+
+/**
+ * A step's finalization update, with the cache wrapper's facts for its last fetch (route,
+ * markers, observation time) for the replay audit. Consumes them: they are absent when no
+ * Anthropic cache wrapper saw the step.
+ */
+function finalizationUpdate(
+  stepId: string,
+  durationMs: number,
+  update: Partial<DevToolsStep>
+): Partial<DevToolsStep> {
+  const promptCacheWire = consumePromptCacheWire(stepId);
+  return { durationMs, ...update, ...(promptCacheWire != null ? { promptCacheWire } : {}) };
 }
 
 export function createDevToolsMiddleware(
@@ -375,10 +395,11 @@ export function createDevToolsMiddleware(
         }
 
         try {
-          await service.updateStep(workspaceId, stepId, {
-            durationMs: Date.now() - startedAtMs,
-            ...update,
-          });
+          await service.updateStep(
+            workspaceId,
+            stepId,
+            finalizationUpdate(stepId, Date.now() - startedAtMs, update)
+          );
         } catch (error) {
           // DevTools persistence is best-effort; never let observability failures
           // reject the model call that already succeeded.
@@ -392,6 +413,7 @@ export function createDevToolsMiddleware(
 
       const abortHandler = (): void => {
         const capturedRequestHeaders = consumeCapturedRequestHeaders(stepId);
+        closeCapturedRequestBody(stepId);
         void finalizeStep({
           output: null,
           usage: null,
@@ -401,6 +423,7 @@ export function createDevToolsMiddleware(
           responseHeaders: null,
           rawResponse: null,
           rawChunks: null,
+          inputTransformations: null,
         });
       };
 
@@ -415,6 +438,7 @@ export function createDevToolsMiddleware(
       try {
         const result = await doGenerate();
         const capturedRequestHeaders = consumeCapturedRequestHeaders(stepId);
+        discardCapturedRequestBody(stepId);
 
         await finalizeStep({
           output: extractGenerateOutput(result),
@@ -430,6 +454,7 @@ export function createDevToolsMiddleware(
               : null,
           rawResponse: result.response?.body ?? null,
           rawChunks: null,
+          inputTransformations: readInputTransformations([result.response?.body]),
           error: null,
         });
 
@@ -440,11 +465,13 @@ export function createDevToolsMiddleware(
           output: null,
           usage: null,
           error: getErrorMessage(error),
-          rawRequest: null,
+          // No result means no SDK body; use the redacted body the fetch wrapper captured.
+          rawRequest: consumeRedactedRequestBody(stepId),
           requestHeaders: capturedRequestHeaders,
           responseHeaders: null,
           rawResponse: null,
           rawChunks: null,
+          inputTransformations: null,
         });
         throw error;
       }
@@ -466,6 +493,7 @@ export function createDevToolsMiddleware(
       injectStepIdHeader(params, stepId);
 
       let finalized = false;
+      let doStreamSettled = false;
       let capturedRequestHeaders: Record<string, string> | null = null;
       let rawRequest: unknown = null;
       let responseHeaders: Record<string, string> | null = null;
@@ -514,6 +542,7 @@ export function createDevToolsMiddleware(
           | "responseHeaders"
           | "rawResponse"
           | "rawChunks"
+          | "inputTransformations"
         >
       ): Promise<void> => {
         if (finalized) {
@@ -526,10 +555,11 @@ export function createDevToolsMiddleware(
         }
 
         try {
-          await service.updateStep(workspaceId, stepId, {
-            durationMs: Date.now() - startedAtMs,
-            ...update,
-          });
+          await service.updateStep(
+            workspaceId,
+            stepId,
+            finalizationUpdate(stepId, Date.now() - startedAtMs, update)
+          );
         } catch (error) {
           // DevTools persistence is best-effort; never let observability failures
           // reject the model call that already succeeded.
@@ -542,6 +572,14 @@ export function createDevToolsMiddleware(
       };
 
       const abortHandler = (): void => {
+        // Before doStream() settles, a fetch that ignores the abort may never settle it, so
+        // drop the body and refuse later captures. Once it settled, the paths below already
+        // cleaned up; a closed mark here would never be cleared.
+        if (doStreamSettled) {
+          discardCapturedRequestBody(stepId);
+        } else {
+          closeCapturedRequestBody(stepId);
+        }
         void finalizeStep({
           output: buildOutput(),
           usage,
@@ -551,6 +589,7 @@ export function createDevToolsMiddleware(
           responseHeaders,
           rawResponse: fullStreamChunks,
           rawChunks,
+          inputTransformations: readInputTransformations(rawChunks),
         });
       };
 
@@ -565,18 +604,23 @@ export function createDevToolsMiddleware(
       let streamResult: LanguageModelV4StreamResult;
       try {
         streamResult = await doStream();
+        doStreamSettled = true;
         capturedRequestHeaders = consumeCapturedRequestHeaders(stepId);
+        discardCapturedRequestBody(stepId);
       } catch (error) {
+        doStreamSettled = true;
         capturedRequestHeaders = consumeCapturedRequestHeaders(stepId);
         await finalizeStep({
           output: null,
           usage: null,
           error: getErrorMessage(error),
-          rawRequest: null,
+          // A pre-stream rejection has no SDK body; use the redacted body the fetch wrapper captured.
+          rawRequest: consumeRedactedRequestBody(stepId),
           requestHeaders: capturedRequestHeaders,
           responseHeaders: null,
           rawResponse: null,
           rawChunks: null,
+          inputTransformations: null,
         });
         throw error;
       }
@@ -671,6 +715,7 @@ export function createDevToolsMiddleware(
                   responseHeaders,
                   rawResponse: fullStreamChunks,
                   rawChunks,
+                  inputTransformations: readInputTransformations(rawChunks),
                 });
                 controller.close();
                 return;
@@ -695,6 +740,7 @@ export function createDevToolsMiddleware(
               responseHeaders,
               rawResponse: fullStreamChunks,
               rawChunks,
+              inputTransformations: readInputTransformations(rawChunks),
             });
             controller.error(error);
           }
@@ -713,6 +759,7 @@ export function createDevToolsMiddleware(
               responseHeaders,
               rawResponse: fullStreamChunks,
               rawChunks,
+              inputTransformations: readInputTransformations(rawChunks),
             });
           }
         },

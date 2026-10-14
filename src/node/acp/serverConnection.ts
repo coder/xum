@@ -232,6 +232,12 @@ async function connectViaWebSocket(
   const wsUrl = buildWsUrl(normalizedBaseUrl);
   const headers = buildAuthHeaders(authToken);
   const websocket = new WebSocket(wsUrl, headers ? { headers } : undefined);
+  // Bun's `ws` client shim can emit 'error' with none of our listeners attached: since
+  // 1.3.10 once() installs two native forwarders (a refused connection fires 'error'
+  // twice), and 1.3.14 also emits one when terminate() stops a CONNECTING socket after the
+  // open timeout detached its listeners. An unhandled 'error' throws and skips the lockfile
+  // fallback, so keep a lifetime no-op listener; the helpers below still see every error.
+  websocket.on("error", () => undefined);
 
   await waitForWebSocketOpen(websocket, wsUrl);
 

@@ -2,9 +2,7 @@ import React, { useEffect } from "react";
 import { ArrowLeftRight, Github, MessageCircle } from "lucide-react";
 import { cn } from "@/common/lib/utils";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
-import { GIT_STATUS_INDICATOR_MODE_KEY } from "@/common/constants/storage";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import type { GitStatusIndicatorMode } from "../GitStatusIndicatorView/GitStatusIndicatorView";
+import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import { getDevcontainerStatusChip } from "@/browser/utils/runtimeUi";
 import { formatTokens } from "@/common/utils/tokens/tokenMeterUtils";
@@ -84,15 +82,16 @@ function WorkspaceDriftIndicator(props: {
   );
 }
 
-/** Shares the divergence dialog's persisted mode key so both surfaces stay in sync. */
+/** Shares the divergence dialog's mode preference so both surfaces stay in sync. */
 function DriftModeToggle() {
-  const [mode, setMode] = usePersistedState<GitStatusIndicatorMode>(
-    GIT_STATUS_INDICATOR_MODE_KEY,
-    "line-delta",
-    { listener: true }
-  );
+  const mode =
+    useUserPreferences((preferences) => preferences.appearance?.gitStatusIndicatorMode) ??
+    "line-delta";
   const isLineDelta = mode === "line-delta";
-  const toggleMode = () => setMode((prev) => (prev === "line-delta" ? "divergence" : "line-delta"));
+  const toggleMode = () =>
+    updateUserPreferences({
+      appearance: { gitStatusIndicatorMode: isLineDelta ? "divergence" : "line-delta" },
+    });
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -130,12 +129,15 @@ function WorkspaceBranchControls(props: {
   workspaceName: string;
   devcontainerChip: ReturnType<typeof getDevcontainerStatusChip>;
 }) {
+  // The branch is the one footer item that can shrink (its name truncates with an ellipsis), so a
+  // long name no longer pushes the row wider than a phone screen (#5769).
   return (
-    <div className="flex shrink-0 items-center gap-1">
+    <div className="flex min-w-0 items-center gap-1">
       <BranchSelector
         key={props.workspaceId}
         workspaceId={props.workspaceId}
         workspaceName={props.workspaceName}
+        className="min-w-0"
       />
       {props.devcontainerChip && (
         <span
@@ -169,10 +171,11 @@ function FooterRepositoryLabel(props: { workspaceId: string; projectLabel: strin
           target="_blank"
           rel="noopener noreferrer"
           data-testid="workspace-footer-repository"
-          className="text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent flex h-5 shrink-0 items-center gap-1 rounded-md px-1.5 transition-colors focus-visible:ring-1"
+          className="text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent flex h-5 min-w-0 items-center gap-1 rounded-md px-1.5 transition-colors focus-visible:ring-1"
         >
           <Github className="h-3 w-3 shrink-0" aria-hidden="true" />
-          <span className="font-mono">{slug}</span>
+          {/* Truncates like the branch name, so a long owner/repo fits a phone screen (#5769). */}
+          <span className="truncate font-mono">{slug}</span>
         </a>
       </TooltipTrigger>
       <TooltipContent side="top">Open on GitHub</TooltipContent>
@@ -220,7 +223,7 @@ function FooterLastPrompt(props: { workspaceId: string }) {
   const revealOperationRef = React.useRef(0);
   const lastPromptMessageId = lastPrompt?.messageId;
   const [revealState, setRevealState] = React.useState<
-    "idle" | "revealing" | "not-found" | "error"
+    "idle" | "revealing" | "not-found" | "not-loaded" | "error"
   >("idle");
 
   useEffect(() => {
@@ -353,6 +356,8 @@ function FooterLastPrompt(props: { workspaceId: string }) {
         </button>
         {revealState === "not-found" ? (
           <div className="text-muted mt-1.5 text-[10px]">Prompt not found in the transcript</div>
+        ) : revealState === "not-loaded" ? (
+          <div className="text-muted mt-1.5 text-[10px]">Prompt is too far back to reveal</div>
         ) : revealState === "error" ? (
           <div className="text-muted mt-1.5 text-[10px]">Reveal unavailable</div>
         ) : null}
@@ -394,11 +399,11 @@ export const WorkspaceFooterBar: React.FC<WorkspaceFooterBarProps> = (props) => 
     // reclaiming. Wider layouts still take their clearance from the root.
     <footer
       data-testid="workspace-footer-bar"
-      className="bg-sidebar border-border-light shrink-0 border-t [@media(max-width:768px)]:pb-[min(env(safe-area-inset-bottom,0px),8px)]"
+      className="bg-sidebar border-border-light shrink-0 border-t"
     >
       {/* min-h rather than a fixed height: mobile raises these buttons to 44px touch targets, and a
         capped row would clip them along the same axis overflow-x-auto makes scrollable. */}
-      <div className="scrollbar-none flex min-h-7 items-center gap-2 overflow-x-auto px-2 text-xs whitespace-nowrap">
+      <div className="scrollbar-none scroll-fade-x flex min-h-7 items-center gap-2 overflow-x-auto px-2 text-xs whitespace-nowrap">
         <RuntimeBadge
           runtimeConfig={props.runtimeConfig}
           isWorking={isWorking}

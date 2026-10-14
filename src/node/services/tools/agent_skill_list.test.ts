@@ -321,45 +321,7 @@ describe("agent_skill_list", () => {
     });
   });
 
-  it("hides Agent Plugins skills when the agent-plugins experiment is off", async () => {
-    using homeDir = new TestTempDir("test-agent-skill-list-plugins-off-home");
-    using project = new TestTempDir("test-agent-skill-list-plugins-off-project");
-    using xumHomeDir = new TestTempDir("test-agent-skill-list-plugins-off-mux-home");
-
-    await withHomeDir(homeDir.path, async () => {
-      await withMuxRoot(xumHomeDir.path, async () => {
-        await writePlugin(path.join(project.path, ".mux", "plugins"), "project-plugin", [
-          { name: "plugin-project", description: "from project plugin" },
-        ]);
-        await writePlugin(path.join(xumHomeDir.path, "plugins"), "global-plugin", [
-          { name: "plugin-global", description: "from global plugin" },
-        ]);
-
-        // Default tool config: no experiments => plugin roots must stay invisible.
-        const tool = createAgentSkillListTool(
-          createTestToolConfig(project.path, {
-            xumScope: {
-              type: "project",
-              xumHome: xumHomeDir.path,
-              projectRoot: project.path,
-              projectStorageAuthority: "host-local",
-            },
-          })
-        );
-        const result = (await tool.execute!({}, mockToolCallOptions)) as AgentSkillListToolResult;
-
-        expect(result.success).toBe(true);
-        if (!result.success) {
-          return;
-        }
-
-        expect(result.skills.find((skill) => skill.name === "plugin-project")).toBeUndefined();
-        expect(result.skills.find((skill) => skill.name === "plugin-global")).toBeUndefined();
-      });
-    });
-  });
-
-  it("lists Agent Plugins skills when the agent-plugins experiment is on", async () => {
+  it("lists Agent Plugins skills", async () => {
     using homeDir = new TestTempDir("test-agent-skill-list-plugins-on-home");
     using project = new TestTempDir("test-agent-skill-list-plugins-on-project");
     using xumHomeDir = new TestTempDir("test-agent-skill-list-plugins-on-mux-home");
@@ -389,7 +351,6 @@ describe("agent_skill_list", () => {
               projectStorageAuthority: "host-local",
             },
           }),
-          experiments: { agentPlugins: true },
         });
         const result = (await tool.execute!({}, mockToolCallOptions)) as AgentSkillListToolResult;
 
@@ -450,7 +411,6 @@ describe("agent_skill_list", () => {
               projectStorageAuthority: "host-local",
             },
           }),
-          experiments: { agentPlugins: true },
         });
         const list = async () => {
           const result = (await tool.execute!({}, mockToolCallOptions)) as AgentSkillListToolResult;
@@ -513,7 +473,6 @@ describe("agent_skill_list", () => {
                 projectStorageAuthority: "host-local",
               },
             }),
-            experiments: { agentPlugins: true },
           });
           const list = async () => {
             const result = (await tool.execute!(
@@ -563,7 +522,6 @@ describe("agent_skill_list", () => {
               checkoutRoot: checkout.path,
             },
           }),
-          experiments: { agentPlugins: true },
         });
         const result = (await tool.execute!({}, mockToolCallOptions)) as AgentSkillListToolResult;
 
@@ -619,7 +577,6 @@ describe("agent_skill_list", () => {
               projectStorageAuthority: "host-local",
             },
           }),
-          experiments: { agentPlugins: true },
         });
         const result = (await tool.execute!({}, mockToolCallOptions)) as AgentSkillListToolResult;
 

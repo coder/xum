@@ -1,22 +1,21 @@
-import { useCallback, useSyncExternalStore } from "react";
+import { useCallback } from "react";
 import { useAPI } from "@/browser/contexts/API";
-import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { getAppConfigStore, useAppConfig } from "@/browser/stores/AppConfigStore";
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
 import {
+  DEFAULT_ROUTE_PRIORITY,
   availableRoutes as listAvailableRoutes,
   resolveRoute as resolveRouteForModel,
   type AvailableRoute,
   type RouteContext,
 } from "@/common/routing";
-import { usePolicy } from "@/browser/contexts/PolicyContext";
-import { isGatewayModelAccessibleForUi } from "@/browser/utils/policyUi";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
+import { createGatewayRouting } from "@/common/utils/providers/gatewayModelCatalog";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 
 import { useProvidersConfig } from "./useProvidersConfig";
 
-const DEFAULT_ROUTE_PRIORITY = ["direct"];
 // Stable fallback so snapshot-less renders don't churn referential equality.
 const EMPTY_ROUTE_OVERRIDES: Record<string, string> = {};
 
@@ -45,7 +44,7 @@ export interface RoutingState {
     displayName: string;
   };
 
-  /** Actual route for a raw selection, including policy-aware explicit gateway fallback. */
+  /** Actual route for a raw selection, including explicit gateway fallback. */
   resolveEffectiveRoute: (modelString: string) => string;
 
   /** What route would be used if all per-model overrides were cleared? */
@@ -71,16 +70,12 @@ export interface RoutingState {
 export function useRouting(): RoutingState {
   const { api } = useAPI();
   const { config: providersConfig } = useProvidersConfig();
-  const policyState = usePolicy();
-  const effectivePolicy =
-    policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
   // Shared AppConfigStore (one fetch + one onConfigChanged subscription per
   // app session) instead of per-mount fetches: surfaces render one picker per
   // row, so per-instance subscriptions fanned out O(rows) backend reads.
   const store = getAppConfigStore();
-  const appConfig = useSyncExternalStore(store.subscribe, store.getSnapshot);
-  const routePriority = appConfig?.routePriority ?? DEFAULT_ROUTE_PRIORITY;
-  const routeOverrides = appConfig?.routeOverrides ?? EMPTY_ROUTE_OVERRIDES;
+  const routePriority = useAppConfig((config) => config.routePriority) ?? DEFAULT_ROUTE_PRIORITY;
+  const routeOverrides = useAppConfig((config) => config.routeOverrides) ?? EMPTY_ROUTE_OVERRIDES;
 
   const isConfigured = useCallback(
     (provider: string) =>
@@ -89,13 +84,9 @@ export function useRouting(): RoutingState {
     [providersConfig]
   );
 
-  // Policy-aware so route pickers, availability, and resolution never offer a
-  // gateway route the backend rejects at send time.
-  const isGatewayModelAccessible = useCallback(
-    (gateway: string, modelId: string) =>
-      isGatewayModelAccessibleForUi(effectivePolicy, providersConfig, gateway, modelId),
-    [effectivePolicy, providersConfig]
-  );
+  // Catalog- and canonicalRoutes-aware so route pickers, availability, and
+  // resolution never offer a gateway route the backend rejects at send time.
+  const { isGatewayModelAccessible, resolveGatewayModelId } = createGatewayRouting(providersConfig);
 
   const persistRoutePreferences = useCallback(
     (priority: string[], overrides: Record<string, string>) => {
@@ -157,7 +148,8 @@ export function useRouting(): RoutingState {
         routePriority,
         routeOverrides,
         isConfigured,
-        isGatewayModelAccessible
+        isGatewayModelAccessible,
+        resolveGatewayModelId
       );
 
       const route = resolved.routeProvider === resolved.origin ? "direct" : resolved.routeProvider;
@@ -174,7 +166,7 @@ export function useRouting(): RoutingState {
         displayName: getRouteDisplayName(route),
       };
     },
-    [isConfigured, isGatewayModelAccessible, routeOverrides, routePriority]
+    [isConfigured, isGatewayModelAccessible, resolveGatewayModelId, routeOverrides, routePriority]
   );
 
   const resolveEffectiveRoute = (modelString: string): string => {
@@ -198,7 +190,8 @@ export function useRouting(): RoutingState {
       routePriority,
       routeOverrides,
       isConfigured,
-      isGatewayModelAccessible
+      isGatewayModelAccessible,
+      resolveGatewayModelId
     );
     return resolved.routeProvider === resolved.origin ? "direct" : resolved.routeProvider;
   };
@@ -212,7 +205,8 @@ export function useRouting(): RoutingState {
         routePriority,
         {}, // empty overrides — priority-walk only
         isConfigured,
-        isGatewayModelAccessible
+        isGatewayModelAccessible,
+        resolveGatewayModelId
       );
 
       const route = resolved.routeProvider === resolved.origin ? "direct" : resolved.routeProvider;
@@ -222,13 +216,18 @@ export function useRouting(): RoutingState {
         displayName: getRouteDisplayName(route),
       };
     },
-    [isConfigured, isGatewayModelAccessible, routePriority]
+    [isConfigured, isGatewayModelAccessible, resolveGatewayModelId, routePriority]
   );
 
   const availableRoutes = useCallback(
     (canonicalModel: string): AvailableRoute[] =>
-      listAvailableRoutes(canonicalModel, isConfigured, isGatewayModelAccessible),
-    [isConfigured, isGatewayModelAccessible]
+      listAvailableRoutes(
+        canonicalModel,
+        isConfigured,
+        isGatewayModelAccessible,
+        resolveGatewayModelId
+      ),
+    [isConfigured, isGatewayModelAccessible, resolveGatewayModelId]
   );
 
   return {

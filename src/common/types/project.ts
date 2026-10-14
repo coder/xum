@@ -7,6 +7,7 @@ import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchive
 import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
 import type {
   AppConfigMigrations,
+  EvaluationDefaults,
   ModelFallbacks,
   UpdateChannel,
 } from "@/common/config/schemas/appConfigOnDisk";
@@ -19,7 +20,7 @@ import type { AutoModelRoutingConfig } from "./autoModelRouting";
 import type { RuntimeEnablementId } from "./runtime";
 import type { TaskSettings } from "./tasks";
 import type { LayoutPresetsConfig } from "./uiLayouts";
-import type { OpenAIReasoningMode, ThinkingLevel } from "./thinking";
+import type { ThinkingLevel } from "./thinking";
 import type { GoalDefaults } from "@/constants/goals";
 
 export type Workspace = z.infer<typeof WorkspaceConfigSchema>;
@@ -93,12 +94,35 @@ export interface ProjectsConfig {
   muxGatewayEnabled?: boolean;
   /** Enable recording AI SDK devtools logs to ~/.xum/sessions/<workspace>/devtools.jsonl */
   llmDebugLogs?: boolean;
+  /**
+   * Desktop only: keep the display (and system) awake while any local workspace is
+   * streaming or waiting on background bash / workflow activity. Absent = off.
+   */
+  keepScreenAwake?: boolean;
+  /**
+   * Defer MCP tool definitions out of the model-visible tool list until the model
+   * discovers them via tool_catalog_search. Absent = on; only `false` disables it.
+   */
+  toolSearchEnabled?: boolean;
+  /**
+   * Route Anthropic/OpenAI calls from bash tool commands through Xum's local proxy so their
+   * spend shows in the Costs tab and Analytics. Absent = off: with it on, agent CLIs such as
+   * `claude -p` bill the Xum API key instead of a subscription login.
+   */
+  bashAiProxyEnabled?: boolean;
+  /**
+   * Expose the `heartbeat` tool so agents can schedule their own recurring (paid) turns.
+   * Absent = off; users opt in from Settings.
+   */
+  agentHeartbeatsEnabled?: boolean;
   /** Default heartbeat prompt used when a workspace heartbeat does not set its own message. */
   heartbeatDefaultPrompt?: string;
   /** Default heartbeat interval used when a workspace heartbeat does not set its own cadence. */
   heartbeatDefaultIntervalMs?: number;
   /** Global defaults for new workspace goals. */
   goalDefaults?: GoalDefaults;
+  /** Default evaluation model for workflow `evaluate()` steps (Settings → Tasks & Workflows). */
+  evaluationDefaults?: EvaluationDefaults;
   muxGatewayModels?: string[];
   routePriority?: string[];
   routeOverrides?: Record<string, string>;
@@ -118,25 +142,9 @@ export interface ProjectsConfig {
   /** Difficulty tiers for the auto-model-routing experiment; always normalized on load. */
   autoModelRouting?: AutoModelRoutingConfig;
 
-  /**
-   * Default model used for new workspaces (shared via ~/.xum/config.json).
-   * Mirrors the browser localStorage cache (DEFAULT_MODEL_KEY).
-   */
+  /** Default model used for new workspaces (shared via ~/.xum/config.json). */
   defaultModel?: string;
-  /** Global advisor model override for the experimental advisor tool. */
-  advisorModelString?: string;
-  /** Global advisor reasoning override for the experimental advisor tool. */
-  advisorThinkingLevel?: ThinkingLevel;
-  /** Advisor Pro/Standard selection, independent of effort and the parent chat mode. */
-  advisorReasoningMode?: OpenAIReasoningMode;
-  /** Positive per-turn advisor cap; null/undefined means unlimited. */
-  advisorMaxUsesPerTurn?: number | null;
-  /** Positive max-output-tokens cap for advisor responses; null/undefined means unlimited. */
-  advisorMaxOutputTokens?: number | null;
-  /**
-   * Hidden model IDs (shared via ~/.xum/config.json).
-   * Mirrors the browser localStorage cache (HIDDEN_MODELS_KEY).
-   */
+  /** Hidden model IDs (shared via ~/.xum/config.json). */
   hiddenModels?: string[];
   /**
    * Default model/thinking/reasoning overrides per agentId. Base fields are the
@@ -148,11 +156,6 @@ export interface ProjectsConfig {
   migrations?: AppConfigMigrations;
   /** Use built-in SSH2 library instead of system OpenSSH for remote connections (non-Windows only) */
   useSSH2Transport?: boolean;
-
-  /** Xum Governor server URL (normalized origin, no trailing slash) */
-  muxGovernorUrl?: string;
-  /** Xum Governor OAuth access token (secret - never return to UI) */
-  muxGovernorToken?: string;
 
   /**
    * What to do with a dedicated mux-created Coder workspace when its chat is archived.

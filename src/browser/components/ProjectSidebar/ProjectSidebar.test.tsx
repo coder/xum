@@ -1,18 +1,16 @@
 import "../../../../tests/ui/dom";
 
 import React, { type ComponentProps, type PropsWithChildren } from "react";
-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import * as ReactDndModule from "react-dnd";
 import * as ReactDndHtml5BackendModule from "react-dnd-html5-backend";
 import * as ReactColorfulModule from "react-colorful";
 import { installDom } from "../../../../tests/ui/dom";
-import {
-  EXPANDED_PROJECTS_KEY,
-  SIDEBAR_FLAT_MODE_KEY,
-  SIDEBAR_HIDE_SUBAGENTS_KEY,
-} from "@/common/constants/storage";
-import { getDraftScopeId, getInputKey } from "@/common/constants/storage";
+import { EXPANDED_PROJECTS_KEY } from "@/common/constants/storage";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { getDraftStore } from "@/browser/stores/DraftStore";
+import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_SIDEBAR_SECTION_ID } from "@/common/constants/scratch";
 import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
@@ -44,7 +42,11 @@ import * as WorkspaceSectionDropZoneModule from "../WorkspaceSectionDropZone/Wor
 import * as WorkspaceDragLayerModule from "../WorkspaceDragLayer/WorkspaceDragLayer";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import type ProjectSidebarComponent from "./ProjectSidebar";
+import type * as AgentListItemModuleExports from "@/browser/components/AgentListItem/AgentListItem";
 import type * as WorkspaceStatusIndicatorModuleExports from "../WorkspaceStatusIndicator/WorkspaceStatusIndicator";
+import * as RealPositionedMenuModule from "@/browser/components/PositionedMenu/PositionedMenu";
+import * as RealContextMenuPositionModule from "@/browser/hooks/useContextMenuPosition";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 
 const agentItemTestId = (workspaceId: string) => `agent-item-${workspaceId}`;
 const toggleButtonLabel = (workspaceId: string) => `toggle-completed-${workspaceId}`;
@@ -57,23 +59,54 @@ const ProviderIconSvgStub = (props: React.SVGProps<SVGSVGElement>) => (
   <svg data-testid="provider-icon-mock" {...props} />
 );
 
-function installProviderIconSvgMocks() {
-  const providerIconSvgPaths = [
-    "@/browser/assets/icons/anthropic.svg?react",
-    "@/browser/assets/icons/openai.svg?react",
-    "@/browser/assets/icons/google.svg?react",
-    "@/browser/assets/icons/xai.svg?react",
-    "@/browser/assets/icons/openrouter.svg?react",
-    "@/browser/assets/icons/ollama.svg?react",
-    "@/browser/assets/icons/deepseek.svg?react",
-    "@/browser/assets/icons/moonshotai.svg?react",
-    "@/browser/assets/icons/zai.svg?react",
-    "@/browser/assets/icons/aws.svg?react",
-    "@/browser/assets/icons/github.svg?react",
-    "@/browser/assets/icons/coder.svg?react",
-  ] as const;
+const PROVIDER_ICON_SVG_PATHS = [
+  "@/browser/assets/icons/anthropic.svg?react",
+  "@/browser/assets/icons/openai.svg?react",
+  "@/browser/assets/icons/google.svg?react",
+  "@/browser/assets/icons/xai.svg?react",
+  "@/browser/assets/icons/openrouter.svg?react",
+  "@/browser/assets/icons/ollama.svg?react",
+  "@/browser/assets/icons/deepseek.svg?react",
+  "@/browser/assets/icons/moonshotai.svg?react",
+  "@/browser/assets/icons/zai.svg?react",
+  "@/browser/assets/icons/aws.svg?react",
+  "@/browser/assets/icons/github.svg?react",
+  "@/browser/assets/icons/coder.svg?react",
+] as const;
 
-  for (const svgPath of providerIconSvgPaths) {
+// installProjectSidebarTestDoubles() registers module mocks from setup hooks, and `mock.restore()`
+// in cleanup does not undo mock.module, so restore the real modules once the suite ends; they
+// otherwise leak into every later test file in the bun process (#4639).
+restoreModulesAfterSuite([
+  ["@/browser/hooks/useContextMenuPosition", { ...RealContextMenuPositionModule }],
+  ["@/browser/components/PositionedMenu/PositionedMenu", { ...RealPositionedMenuModule }],
+]);
+// AgentListItem and the SVGs (logos, provider icons) are restored lazily instead: loading them
+// (or AgentListItem's SVG icons) while this file's module graph is being evaluated makes bun's
+// warm transpiler cache parse the SVG assets as JSX ("Legacy HTML comments not implemented").
+// The query-suffixed AgentListItem is the same real instance the real-row tests render. Without
+// svgr, bun test's real `?react` SVG module is the file loader's `{ default: <asset path> }`.
+function realAgentListItemModule(): typeof AgentListItemModuleExports {
+  /* eslint-disable @typescript-eslint/no-require-imports */
+  return require("../AgentListItem/AgentListItem?project-sidebar-real-row=1") as typeof AgentListItemModuleExports;
+  /* eslint-enable @typescript-eslint/no-require-imports */
+}
+afterAll(() => {
+  for (const svgPath of [
+    "@/browser/assets/logos/xum-logo-dark.svg?react",
+    "@/browser/assets/logos/xum-logo-light.svg?react",
+    ...PROVIDER_ICON_SVG_PATHS,
+  ]) {
+    void mock.module(svgPath, () => ({
+      default: Bun.resolveSync(svgPath.replace(/\?react$/, ""), import.meta.dir),
+    }));
+  }
+  const realAgentListItem = { ...realAgentListItemModule() };
+  void mock.module("@/browser/components/AgentListItem/AgentListItem", () => realAgentListItem);
+});
+
+function installProviderIconSvgMocks() {
+  for (const svgPath of PROVIDER_ICON_SVG_PATHS) {
     void mock.module(svgPath, () => ({
       __esModule: true,
       default: ProviderIconSvgStub,
@@ -136,6 +169,7 @@ interface MockAgentListItemProps {
   completedChildrenExpanded?: boolean;
   onToggleCompletedChildren?: (workspaceId: string) => void;
   onArchiveWorkspace?: (workspaceId: string, button: HTMLElement) => Promise<void>;
+  onCancelCreation?: (workspaceId: string) => Promise<void>;
 }
 
 type HexColorPickerProps = ComponentProps<typeof ReactColorfulModule.HexColorPicker>;
@@ -144,17 +178,9 @@ let renderRealAgentListItems = false;
 let latestArchiveWorkspaceHandler:
   | ((workspaceId: string, button: HTMLElement) => Promise<void>)
   | null = null;
+let latestCancelCreationHandler: ((workspaceId: string) => Promise<void>) | null = null;
 
 let ProjectSidebar!: typeof ProjectSidebarComponent;
-let latestArchiveConfirmationModalProps: {
-  isOpen: boolean;
-  title: string;
-  description?: string;
-  warning?: string;
-  confirmLabel?: string;
-  onConfirm: () => void | Promise<void>;
-  onCancel: () => void;
-} | null = null;
 let preflightArchiveWorkspaceMock = mock(
   (_workspaceId: string): Promise<ArchivePreflightActionResult> => resolveArchivePreflight()
 );
@@ -190,8 +216,13 @@ function setupProjectSidebarDom(projectPath = "/projects/demo-project") {
   installProjectSidebarTestDoubles();
 }
 
+function setSidebarPreferences(ui: NonNullable<UserPreferences["ui"]>) {
+  getAppConfigStore().updateOptimistically({ userPreferences: { ui } });
+}
+
 function cleanupProjectSidebarDom() {
   cleanup();
+  getAppConfigStore().updateOptimistically({ userPreferences: undefined });
   cleanupDom?.();
   cleanupDom = null;
   mock.restore();
@@ -302,7 +333,7 @@ function installProjectSidebarTestDoubles() {
   );
   confirmDialogMock = mock(() => Promise.resolve(true));
   latestArchiveWorkspaceHandler = null;
-  latestArchiveConfirmationModalProps = null;
+  latestCancelCreationHandler = null;
   void mock.module("@/browser/assets/logos/xum-logo-dark.svg?react", () => ({
     __esModule: true,
     default: () => <svg data-testid="xum-logo-dark" />,
@@ -311,7 +342,7 @@ function installProjectSidebarTestDoubles() {
     __esModule: true,
     default: () => <svg data-testid="xum-logo-light" />,
   }));
-  void mock.module("../AgentListItem/AgentListItem", () => ({
+  void mock.module("@/browser/components/AgentListItem/AgentListItem", () => ({
     AgentListItem: (props: MockAgentListItemProps) => {
       if (props.draft) {
         return (
@@ -328,13 +359,8 @@ function installProjectSidebarTestDoubles() {
       const metadata = props.metadata;
 
       if (renderRealAgentListItems) {
-        /* eslint-disable @typescript-eslint/no-require-imports */
-        const ActualAgentListItem = (
-          require("../AgentListItem/AgentListItem?project-sidebar-real-row=1") as {
-            AgentListItem: React.ComponentType<Record<string, unknown>>;
-          }
-        ).AgentListItem;
-        /* eslint-enable @typescript-eslint/no-require-imports */
+        const ActualAgentListItem = realAgentListItemModule()
+          .AgentListItem as unknown as React.ComponentType<Record<string, unknown>>;
         return <ActualAgentListItem {...(props as unknown as Record<string, unknown>)} />;
       }
 
@@ -345,6 +371,7 @@ function installProjectSidebarTestDoubles() {
       const displayTitle = metadata.title ?? metadata.name;
 
       latestArchiveWorkspaceHandler = props.onArchiveWorkspace ?? null;
+      latestCancelCreationHandler = props.onCancelCreation ?? null;
 
       return (
         <div
@@ -515,6 +542,9 @@ function installProjectSidebarTestDoubles() {
     navigateFromSettings: () => undefined,
     navigateToAnalytics: () => undefined,
     navigateFromAnalytics: () => undefined,
+    navigateBack: () => undefined,
+    navigateForward: () => undefined,
+    usesBrowserHistory: false,
     currentWorkspaceId: null,
     currentSettingsSection: null,
     currentProjectId: null,
@@ -631,7 +661,6 @@ function installProjectSidebarTestDoubles() {
     onConfirm: () => void | Promise<void>;
     onCancel: () => void;
   }) => {
-    latestArchiveConfirmationModalProps = props;
     return props.isOpen ? (
       <div data-testid="archive-confirmation-modal">
         <div>{props.title}</div>
@@ -681,7 +710,7 @@ function installProjectSidebarTestDoubles() {
   spyOn(WorkspaceDragLayerModule, "WorkspaceDragLayer").mockImplementation(
     (() => null) as unknown as typeof WorkspaceDragLayerModule.WorkspaceDragLayer
   );
-  void mock.module("../PositionedMenu/PositionedMenu", () => ({
+  void mock.module("@/browser/components/PositionedMenu/PositionedMenu", () => ({
     PositionedMenu: (props: { open: boolean; children: React.ReactNode }) =>
       props.open ? <div data-testid="project-actions-menu">{props.children}</div> : null,
     PositionedMenuItem: (props: {
@@ -799,7 +828,7 @@ describe("ProjectSidebar scratch chats", () => {
         ["/projects/beta", { displayName: "Beta Project", color: "Green", workspaces: [] }],
       ]),
     });
-    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+    setSidebarPreferences({ sidebarFlatMode: true });
 
     const view = render(
       <ProjectSidebar
@@ -832,7 +861,9 @@ describe("ProjectSidebar scratch chats", () => {
       agentItemTestId("alpha"),
     ]);
 
-    act(() => updatePersistedState(SIDEBAR_FLAT_MODE_KEY, false));
+    act(() => {
+      setSidebarPreferences({ sidebarFlatMode: false });
+    });
     await waitFor(() => {
       expect(view.getByLabelText("Expand project alpha")).toBeTruthy();
       expect(view.getByLabelText("Expand project beta")).toBeTruthy();
@@ -910,6 +941,53 @@ describe("ProjectSidebar scratch chats", () => {
   });
 });
 
+describe("ProjectSidebar title keys", () => {
+  // setupProjectSidebarDom loads ProjectSidebar behind the shared test doubles.
+  beforeEach(() => setupProjectSidebarDom());
+
+  afterEach(cleanupProjectSidebarDom);
+
+  // The collapsed sidebar renders no rows, but Shift+F2 needs none (#6328).
+  test("Shift+F2 generates the selected workspace's title with the sidebar collapsed", async () => {
+    const workspace = createWorkspace("title-target");
+    mockWorkspaceActions({
+      selectedWorkspace: {
+        workspaceId: workspace.id,
+        projectPath: workspace.projectPath,
+        projectName: workspace.projectName,
+        namedWorkspacePath: workspace.namedWorkspacePath,
+      },
+    });
+    const regenerateTitle = mock((_input: { workspaceId: string }) =>
+      Promise.resolve({ success: true as const, data: { title: "Generated" } })
+    );
+    const api = { workspace: { regenerateTitle } } as unknown as NonNullable<
+      ReturnType<typeof APIModule.useAPI>["api"]
+    >;
+    spyOn(APIModule, "useAPI").mockImplementation(() => ({
+      api,
+      status: "connected",
+      error: null,
+      authenticate: () => undefined,
+      retry: () => undefined,
+    }));
+
+    render(
+      <ProjectSidebar
+        collapsed={true}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([[workspace.projectPath, [workspace]]])}
+        workspaceRecency={{ [workspace.id]: Date.now() }}
+      />
+    );
+    fireEvent.keyDown(window, { key: "F2", shiftKey: true });
+
+    await waitFor(() =>
+      expect(regenerateTitle).toHaveBeenCalledWith({ workspaceId: workspace.id })
+    );
+  });
+});
+
 describe("ProjectSidebar flat chat list", () => {
   beforeEach(() => {
     setupProjectSidebarDom();
@@ -918,7 +996,7 @@ describe("ProjectSidebar flat chat list", () => {
       default: typeof ProjectSidebarComponent;
     });
     /* eslint-enable @typescript-eslint/no-require-imports */
-    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+    setSidebarPreferences({ sidebarFlatMode: true });
   });
 
   afterEach(cleanupProjectSidebarDom);
@@ -1113,12 +1191,15 @@ describe("ProjectSidebar flat chat list", () => {
         }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
     );
     // Give both drafts persisted content so their rows would render.
-    updatePersistedState(getInputKey(getDraftScopeId("_multi", "draft-multi")), "Multi draft");
-    updatePersistedState(
-      getInputKey(getDraftScopeId("/projects/demo-project", "draft-single")),
+    getDraftStore().setText(
+      { kind: "creation", projectPath: "_multi", draftId: "draft-multi" },
+      "Multi draft"
+    );
+    getDraftStore().setText(
+      { kind: "creation", projectPath: "/projects/demo-project", draftId: "draft-single" },
       "Single draft"
     );
-    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+    setSidebarPreferences({ sidebarFlatMode: true });
 
     const view = render(
       <ProjectSidebar
@@ -1163,11 +1244,11 @@ describe("ProjectSidebar flat chat list", () => {
           deleteWorkspaceDraft: () => undefined,
         }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
     );
-    updatePersistedState(
-      getInputKey(getDraftScopeId("_multi", "draft-multi-badge")),
+    getDraftStore().setText(
+      { kind: "creation", projectPath: "_multi", draftId: "draft-multi-badge" },
       "Multi draft"
     );
-    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+    setSidebarPreferences({ sidebarFlatMode: true });
 
     const view = render(
       <ProjectSidebar
@@ -1190,7 +1271,7 @@ describe("ProjectSidebar flat chat list", () => {
       ...createWorkspace("solo", { title: "Solo chat" }),
       projects: singleProjectRefs,
     };
-    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+    setSidebarPreferences({ sidebarFlatMode: true });
     // Grouped-mode expansion state must not nest chats under flat headers.
     updatePersistedState(EXPANDED_PROJECTS_KEY, ["/projects/demo-project"]);
 
@@ -1260,7 +1341,7 @@ describe("ProjectSidebar flat chat list", () => {
           deleteWorkspaceDraft: () => undefined,
         }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
     );
-    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+    setSidebarPreferences({ sidebarFlatMode: true });
 
     const view = render(
       <ProjectSidebar
@@ -1335,7 +1416,7 @@ describe("ProjectSidebar flat chat list", () => {
         ],
       ]),
     });
-    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+    setSidebarPreferences({ sidebarFlatMode: true });
 
     const view = render(
       <ProjectSidebar
@@ -1436,11 +1517,11 @@ describe("ProjectSidebar flat chat list", () => {
         }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
     );
     // Non-empty drafts render as rows; empty ones stay hidden.
-    updatePersistedState(
-      getInputKey(getDraftScopeId("/projects/demo-project", "draft-order")),
+    getDraftStore().setText(
+      { kind: "creation", projectPath: "/projects/demo-project", draftId: "draft-order" },
       "Draft prompt"
     );
-    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+    setSidebarPreferences({ sidebarFlatMode: true });
 
     const view = render(
       <ProjectSidebar
@@ -1494,8 +1575,8 @@ describe("ProjectSidebar flat chat list", () => {
         }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
     );
     // Give the draft persisted content so the draft row would render pre-substitution.
-    updatePersistedState(
-      getInputKey(getDraftScopeId("/projects/demo-project", "draft-promoted")),
+    getDraftStore().setText(
+      { kind: "creation", projectPath: "/projects/demo-project", draftId: "draft-promoted" },
       "Draft prompt"
     );
 
@@ -1528,12 +1609,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
     installProjectSidebarTestDoubles();
   });
 
-  afterEach(() => {
-    cleanup();
-    cleanupDom?.();
-    cleanupDom = null;
-    mock.restore();
-  });
+  afterEach(cleanupProjectSidebarDom);
 
   test("filters multi-project rows out entirely when the experiment is disabled", () => {
     spyOn(ExperimentsModule, "useExperimentValue").mockImplementation(() => false);
@@ -1644,7 +1720,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
   });
 
   test("hides sub-agent rows behind a parent summary when the setting is on", () => {
-    window.localStorage.setItem(SIDEBAR_HIDE_SUBAGENTS_KEY, JSON.stringify(true));
+    setSidebarPreferences({ sidebarHideSubAgents: true });
     const parentWorkspace = createWorkspace("parent", { title: "Parent workspace" });
     const runningChild = createWorkspace("running-child", {
       parentWorkspaceId: "parent",
@@ -1686,7 +1762,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
   });
 
   test("summarizes a hidden workflow run on the parent row instead of a group header", () => {
-    window.localStorage.setItem(SIDEBAR_HIDE_SUBAGENTS_KEY, JSON.stringify(true));
+    setSidebarPreferences({ sidebarHideSubAgents: true });
     window.localStorage.setItem(EXPANDED_PROJECTS_KEY, JSON.stringify(["/projects/demo-project"]));
     projectContextValue = createProjectContextValue({
       userProjects: new Map([["/projects/demo-project", { workspaces: [] }]]),
@@ -1755,7 +1831,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
   });
 
   test("retains a hidden run's workflow name across workerless step gaps", () => {
-    window.localStorage.setItem(SIDEBAR_HIDE_SUBAGENTS_KEY, JSON.stringify(true));
+    setSidebarPreferences({ sidebarHideSubAgents: true });
     window.localStorage.setItem(EXPANDED_PROJECTS_KEY, JSON.stringify(["/projects/demo-project"]));
     projectContextValue = createProjectContextValue({
       userProjects: new Map([["/projects/demo-project", { workspaces: [] }]]),
@@ -2751,119 +2827,6 @@ describe("ProjectSidebar archive confirmations", () => {
     expect(view.getByText("Archive workspace with untracked files?")).toBeTruthy();
     expect(view.getByRole("button", { name: "Archive and delete files" })).toBeTruthy();
   });
-
-  test("reopens the archive confirmation modal when archive finds new untracked files", async () => {
-    let archiveAttempt = 0;
-    archiveWorkspaceActionMock = mock(
-      (
-        workspaceId: string,
-        options?: { acknowledgedUntrackedPaths?: string[] }
-      ): Promise<ArchiveWorkspaceActionResult> => {
-        archiveAttempt += 1;
-        if (archiveAttempt === 1) {
-          return resolveArchiveResult({
-            kind: "confirm-lossy-untracked-files",
-            paths: ["late-file.txt"],
-          });
-        }
-
-        expect(workspaceId).toBe("archive-late-confirm");
-        expect(options).toEqual({ acknowledgedUntrackedPaths: ["late-file.txt"] });
-        return resolveArchiveResult({ kind: "archived" });
-      }
-    );
-
-    const workspace = {
-      ...createWorkspace("archive-late-confirm"),
-      projects: [{ projectPath: "/projects/demo-project", projectName: "demo-project" }],
-    };
-    const view = renderProjectSidebarForWorkspace(workspace);
-
-    const archiveButton = document.createElement("button");
-    expect(latestArchiveWorkspaceHandler).toBeTruthy();
-    await act(async () => {
-      await latestArchiveWorkspaceHandler?.(workspace.id, archiveButton);
-    });
-
-    await waitFor(() => {
-      expect(view.getByTestId("archive-confirmation-modal")).toBeTruthy();
-    });
-    expect(archivePopoverShowErrorMock).not.toHaveBeenCalled();
-    expect(archiveWorkspaceActionMock).toHaveBeenCalledTimes(1);
-    expect(archiveWorkspaceActionMock).toHaveBeenNthCalledWith(1, workspace.id, undefined);
-
-    act(() => {
-      fireEvent.click(view.getByRole("button", { name: "Archive and delete files" }));
-    });
-
-    await waitFor(() => {
-      expect(archiveWorkspaceActionMock).toHaveBeenCalledTimes(2);
-    });
-    expect(archiveWorkspaceActionMock).toHaveBeenNthCalledWith(2, workspace.id, {
-      acknowledgedUntrackedPaths: ["late-file.txt"],
-    });
-    expect(archivePopoverShowErrorMock).not.toHaveBeenCalled();
-  });
-
-  test("surfaces archive errors after confirmation when untracked paths are unchanged", async () => {
-    let preflightCallCount = 0;
-    preflightArchiveWorkspaceMock = mock(
-      (_workspaceId: string): Promise<ArchivePreflightActionResult> => {
-        preflightCallCount += 1;
-        return resolveArchivePreflight({
-          kind: "confirm-lossy-untracked-files",
-          paths: ["late-file.txt"],
-        });
-      }
-    );
-    archiveWorkspaceActionMock = mock(
-      (
-        workspaceId: string,
-        options?: { acknowledgedUntrackedPaths?: string[] }
-      ): Promise<ArchiveWorkspaceActionResult> => {
-        expect(workspaceId).toBe("archive-stable-untracked");
-        expect(options).toEqual({ acknowledgedUntrackedPaths: ["late-file.txt"] });
-        return Promise.resolve({ success: false as const, error: "snapshot failed" });
-      }
-    );
-
-    spyOn(PopoverErrorHookModule, "usePopoverError").mockImplementation(
-      () =>
-        ({
-          error: null,
-          showError: archivePopoverShowErrorMock,
-          clearError: mock(() => undefined),
-        }) as unknown as ReturnType<typeof PopoverErrorHookModule.usePopoverError>
-    );
-
-    const workspace = {
-      ...createWorkspace("archive-stable-untracked"),
-      projects: [{ projectPath: "/projects/demo-project", projectName: "demo-project" }],
-    };
-    const view = renderProjectSidebarForWorkspace(workspace);
-
-    const archiveButton = document.createElement("button");
-    expect(latestArchiveWorkspaceHandler).toBeTruthy();
-    await act(async () => {
-      await latestArchiveWorkspaceHandler?.(workspace.id, archiveButton);
-    });
-
-    await waitFor(() => {
-      expect(view.getByTestId("archive-confirmation-modal")).toBeTruthy();
-    });
-
-    await act(async () => {
-      await latestArchiveConfirmationModalProps?.onConfirm();
-    });
-
-    await waitFor(() => {
-      expect(archiveWorkspaceActionMock).toHaveBeenCalledTimes(1);
-      expect(archivePopoverShowErrorMock).toHaveBeenCalledTimes(1);
-    });
-    expect(preflightCallCount).toBe(2);
-    expect(archivePopoverShowErrorMock).toHaveBeenCalledWith(workspace.id, "snapshot failed");
-    expect(view.queryByTestId("archive-confirmation-modal")).toBeNull();
-  });
 });
 
 describe("ProjectSidebar archive errors", () => {
@@ -2942,67 +2905,51 @@ describe("ProjectSidebar archive errors", () => {
   });
 });
 
-describe("ProjectSidebar archive confirmations", () => {
-  beforeEach(() => setupProjectSidebarDom());
+// #5143: cancel-creation forces the removal without the Force Delete dialog, so what the removal
+// left behind (a devcontainer that may still hold the plan) must reach the user another way.
+describe("ProjectSidebar cancel-creation warnings", () => {
+  const showPopoverMock = mock(
+    (_workspaceId: string, _message: string, _anchor?: { top: number; left: number }) => undefined
+  );
+
+  beforeEach(() => {
+    setupProjectSidebarDom();
+    showPopoverMock.mockClear();
+    spyOn(PopoverErrorHookModule, "usePopoverError").mockImplementation(
+      () =>
+        ({
+          error: null,
+          showError: showPopoverMock,
+          clearError: mock(() => undefined),
+        }) as unknown as ReturnType<typeof PopoverErrorHookModule.usePopoverError>
+    );
+  });
   afterEach(cleanupProjectSidebarDom);
 
-  test("reopens the archive confirmation modal when archive finds new untracked files", async () => {
-    const workspace = {
-      ...createWorkspace("archive-race-window"),
-      projects: [{ projectPath: "/projects/demo-project", projectName: "demo-project" }],
-    };
-    let preflightCallCount = 0;
-    const preflightArchiveWorkspace = mock(
-      (workspaceId: string): Promise<ArchivePreflightActionResult> => {
-        if (workspaceId !== workspace.id) {
-          return Promise.resolve({ success: true, data: { kind: "ready" } });
-        }
-        preflightCallCount += 1;
-        if (preflightCallCount === 1) {
-          return Promise.resolve({
-            success: true,
-            data: { kind: "confirm-lossy-untracked-files", paths: ["a.txt"] },
-          });
-        }
-        return Promise.resolve({
-          success: true,
-          data: { kind: "confirm-lossy-untracked-files", paths: ["a.txt", "b.txt"] },
-        });
-      }
-    );
-    const archiveWorkspace = mock(() =>
+  test("shows what a cancelled creation's forced removal left behind", async () => {
+    const description = "The devcontainer container labeled x was left behind";
+    const removeWorkspaceMock = mock((_workspaceId: string, _options?: { force?: boolean }) =>
       Promise.resolve({
-        success: false as const,
-        error:
-          "Untracked files changed since you reviewed them. New files: b.txt. Please try again.",
+        success: true,
+        warnings: [{ kind: "leftover" as const, description }],
       })
     );
-
-    mockWorkspaceActions({ preflightArchiveWorkspace, archiveWorkspace });
-
+    mockWorkspaceActions({ removeWorkspace: removeWorkspaceMock });
+    const workspace = {
+      ...createWorkspace("cancel-target"),
+      projects: [{ projectPath: "/projects/demo-project", projectName: "demo-project" }],
+    };
     renderProjectSidebarForWorkspace(workspace);
 
-    const archiveButton = document.createElement("button");
-    expect(latestArchiveWorkspaceHandler).toBeTruthy();
+    expect(latestCancelCreationHandler).toBeTruthy();
     await act(async () => {
-      await latestArchiveWorkspaceHandler?.(workspace.id, archiveButton);
+      await latestCancelCreationHandler?.(workspace.id);
     });
 
-    await waitFor(() => {
-      expect(latestArchiveConfirmationModalProps?.isOpen).toBe(true);
-      expect(latestArchiveConfirmationModalProps?.warning?.includes("a.txt")).toBe(true);
-    });
-
-    await act(async () => {
-      await latestArchiveConfirmationModalProps?.onConfirm();
-    });
-
-    await waitFor(() => {
-      expect(preflightArchiveWorkspace.mock.calls.length).toBe(2);
-      expect(latestArchiveConfirmationModalProps?.isOpen).toBe(true);
-      expect(latestArchiveConfirmationModalProps?.warning?.includes("b.txt")).toBe(true);
-    });
-    expect(archivePopoverShowErrorMock).not.toHaveBeenCalled();
+    expect(removeWorkspaceMock).toHaveBeenCalledWith(workspace.id, { force: true });
+    expect(showPopoverMock).toHaveBeenCalledTimes(1);
+    expect(showPopoverMock.mock.calls[0]?.[0]).toBe(workspace.id);
+    expect(showPopoverMock.mock.calls[0]?.[1]).toContain(description);
   });
 });
 
@@ -3483,11 +3430,11 @@ describe("ProjectSidebar project actions menu", () => {
     const view = renderSidebar();
     expect(view.getByText("Empty")).toBeTruthy();
 
-    const draftScopeId = getDraftScopeId(demoProjectPath, draftId);
-    const draftInputKey = getInputKey(draftScopeId);
-
     act(() => {
-      updatePersistedState<string>(draftInputKey, "Visible draft prompt", "");
+      getDraftStore().setText(
+        { kind: "creation", projectPath: demoProjectPath, draftId },
+        "Visible draft prompt"
+      );
     });
 
     await waitFor(() => {

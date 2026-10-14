@@ -115,11 +115,8 @@ describe("buildWorkspaceComposition", () => {
       hostCheckoutRoot: workspace.path,
       xumHome: path.join(workspace.path, ".fixture-mux-home"),
       projectTrusted: true,
-      agentPluginsEnabled: true,
       listMcpServerLayers: stubMcpLayers,
     });
-
-    expect(composition.agentPluginsEnabled).toBe(true);
 
     // Plugin summary lists every contributed component kind.
     const plugin = composition.plugins.find((p) => p.name === PLUGIN_NAME);
@@ -167,34 +164,6 @@ describe("buildWorkspaceComposition", () => {
     expect(shellHook).toBeDefined();
   }, 120_000);
 
-  test("plugins are inspected but not loaded when the experiment is disabled", async () => {
-    using workspace = new DisposableTempDir("composition-workspace-gated");
-    await writeFixturePlugin(workspace.path);
-
-    const composition = await buildWorkspaceComposition({
-      runtime: new LocalRuntime(workspace.path),
-      workspacePath: workspace.path,
-      hostCheckoutRoot: workspace.path,
-      xumHome: path.join(workspace.path, ".fixture-mux-home"),
-      projectTrusted: true,
-      agentPluginsEnabled: false,
-      listMcpServerLayers: () => Promise.resolve({ plugin: {}, global: {}, project: {} }),
-    });
-
-    expect(composition.agentPluginsEnabled).toBe(false);
-    // Inspection is unconditional: the plugin and its components are reported.
-    expect(composition.plugins.map((p) => p.name)).toContain(PLUGIN_NAME);
-    // Loading is gated: no plugin-sourced artifacts in the effective layers.
-    const allEntries = [
-      ...composition.skills,
-      ...composition.agents,
-      ...composition.workflows,
-      ...composition.slashCommands,
-      ...composition.hooks,
-    ];
-    expect(allEntries.some((entry) => entry.source === PLUGIN_SOURCE)).toBe(false);
-  }, 120_000);
-
   test("subProjectPath workspaces report checkout-level plugin skills", async () => {
     using workspace = new DisposableTempDir("composition-workspace-subproject");
     // Plugin at the CHECKOUT root; the workspace executes in a subdirectory
@@ -211,7 +180,6 @@ describe("buildWorkspaceComposition", () => {
       hostCheckoutRoot: workspace.path,
       xumHome: path.join(workspace.path, ".fixture-mux-home"),
       projectTrusted: true,
-      agentPluginsEnabled: true,
       listMcpServerLayers: () => Promise.resolve({ plugin: {}, global: {}, project: {} }),
     });
 
@@ -220,7 +188,7 @@ describe("buildWorkspaceComposition", () => {
     expect(pluginSkill?.source).toBe(PLUGIN_SOURCE);
   }, 120_000);
 
-  test("off-host workspaces (null host root) discover no plugin containers", async () => {
+  test("off-host workspaces (null host root) report no plugin summaries", async () => {
     using workspace = new DisposableTempDir("composition-workspace-offhost");
     // A plugin exists at the workspace path on the HOST filesystem — the
     // off-host bug was scanning the remote workspacePath as a host project
@@ -233,19 +201,12 @@ describe("buildWorkspaceComposition", () => {
       hostCheckoutRoot: null,
       xumHome: path.join(workspace.path, ".fixture-mux-home"),
       projectTrusted: true,
-      agentPluginsEnabled: true,
       listMcpServerLayers: () => Promise.resolve({ plugin: {}, global: {}, project: {} }),
     });
 
     expect(composition.plugins).toHaveLength(0);
     expect(composition.diagnostics).toHaveLength(0);
-    const allEntries = [
-      ...composition.skills,
-      ...composition.agents,
-      ...composition.workflows,
-      ...composition.slashCommands,
-      ...composition.hooks,
-    ];
-    expect(allEntries.some((entry) => entry.source === PLUGIN_SOURCE)).toBe(false);
+    const pluginOnlyEntries = [...composition.slashCommands, ...composition.hooks];
+    expect(pluginOnlyEntries.some((entry) => entry.source === PLUGIN_SOURCE)).toBe(false);
   }, 120_000);
 });

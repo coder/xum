@@ -1,17 +1,9 @@
 import type { TurnCoordinator } from "./turnCoordinator";
 import assert from "@/common/utils/assert";
-import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { EventEmitter } from "events";
-import * as path from "node:path";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 
-import type { Config } from "@/node/config";
-
-import type { AIService } from "./aiService";
 import type { AgentSession } from "./agentSession";
-import { createStreamLifecycleMocks, createTestAgentSession } from "./agentSession.testHarness";
-import type { BackgroundProcessManager } from "./backgroundProcessManager";
-import type { InitStateManager } from "./initStateManager";
-import { createTestHistoryService } from "./testHistoryService";
+import { createAgentSessionHarness } from "./agentSession.testHarness";
 import { Err } from "@/common/types/result";
 
 /**
@@ -41,47 +33,9 @@ describe("AgentSession.drainQueuedMessagesIfIdle", () => {
   });
 
   async function createSession(): Promise<AgentSession> {
-    const created = await createTestHistoryService();
-    cleanup = created.cleanup;
-    const aiEmitter = new EventEmitter();
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
-        aiEmitter.on(String(eventName), listener);
-        return this;
-      },
-      off(eventName: string | symbol, listener: (...args: unknown[]) => void) {
-        aiEmitter.off(String(eventName), listener);
-        return this;
-      },
-      stopStream: mock(() => Promise.resolve({ success: true as const, data: undefined })),
-    } as unknown as AIService;
-    const initStateManager: InitStateManager = {
-      on() {
-        return this;
-      },
-      off() {
-        return this;
-      },
-    } as unknown as InitStateManager;
-    const backgroundProcessManager: BackgroundProcessManager = {
-      setMessageQueued: mock(() => undefined),
-      cleanup: mock(() => Promise.resolve()),
-    } as unknown as BackgroundProcessManager;
-    const config: Config = {
-      rootDir: created.config.rootDir,
-      sessionsDir: created.config.sessionsDir,
-      srcDir: path.join(created.config.rootDir, "src"),
-      loadConfigOrDefault: mock(() => ({})),
-    } as unknown as Config;
-    session = createTestAgentSession({
-      workspaceId: WORKSPACE_ID,
-      config,
-      historyService: created.historyService,
-      aiService,
-      initStateManager,
-      backgroundProcessManager,
-    });
+    const harness = await createAgentSessionHarness({ workspaceId: WORKSPACE_ID });
+    cleanup = harness.cleanup;
+    session = harness.session;
     return session;
   }
 

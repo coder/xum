@@ -5,6 +5,7 @@ import {
 } from "@/common/constants/contextBoundary";
 import { isPositiveInteger } from "@/common/utils/numbers";
 import { hasProviderReplayableContent } from "@/common/utils/messages/providerEligibility";
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 
 import type { MuxMessage } from "@/common/types/message";
 
@@ -69,6 +70,15 @@ export function getContextBoundaryKind(
 
 export function isDurableContextBoundaryMarker(message: MuxMessage | undefined): boolean {
   return getContextBoundaryKind(message) !== null;
+}
+
+/**
+ * Rows that may follow a compaction summary while its pendingFollowUp is still dispatchable:
+ * keep-recent tail copies and model-hidden records. Any other row after the summary proves the
+ * follow-up was consumed (its dispatched user row) or dropped as stale.
+ */
+export function leavesCompactionFollowUpPending(message: MuxMessage): boolean {
+  return message.metadata?.rlmPreservedTailCopy === true || isModelHiddenMessage(message);
 }
 
 /**

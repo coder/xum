@@ -1,7 +1,7 @@
-import { useCallback, useSyncExternalStore } from "react";
+import { useCallback } from "react";
 import { useOptionalAPI } from "@/browser/contexts/API";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
-import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { getAppConfigStore, useAppConfig } from "@/browser/stores/AppConfigStore";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
 import {
   getAvailableThinkingLevels,
@@ -45,8 +45,8 @@ export function useMinThinkingLevels(): MinThinkingLevelsState {
   // Shared AppConfigStore (one fetch + one onConfigChanged subscription per
   // app session) instead of per-mount fetches — see useRouting.
   const store = getAppConfigStore();
-  const appConfig = useSyncExternalStore(store.subscribe, store.getSnapshot);
-  const minThinkingLevelByModel = appConfig?.minThinkingLevelByModel ?? EMPTY_MIN_LEVELS;
+  const minThinkingLevelByModel =
+    useAppConfig((config) => config.minThinkingLevelByModel) ?? EMPTY_MIN_LEVELS;
 
   // Lookups go through lookupMinThinkingLevelOverride so floors persisted by
   // older versions under the name-canonical key keep applying (see helper).

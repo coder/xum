@@ -1,4 +1,5 @@
 import * as crypto from "crypto";
+import { getOwn } from "@/common/utils/getOwn";
 import * as http from "http";
 import type { IncomingHttpHeaders } from "http";
 import * as path from "path";
@@ -6,6 +7,10 @@ import * as fsPromises from "fs/promises";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import {
   auth,
+  checkResourceAllowed,
+  discoverAuthorizationServerMetadata,
+  discoverOAuthServerInfo,
+  IssuerMismatchError,
   type OAuthClientProvider,
   type OAuthDiscoveryState,
 } from "@modelcontextprotocol/client";
@@ -18,6 +23,8 @@ import { log } from "@/node/services/log";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
 import { roundToBase2 } from "@/common/telemetry/utils";
+import type { MCPServerOAuthConfig } from "@/common/types/mcp";
+import { readPluginClientSecret } from "@/node/services/agentPlugins/openaiMcpAuth";
 import type {
   MCPOAuthAuthStatus,
   MCPOAuthClientInformation,
@@ -34,6 +41,16 @@ const DEFAULT_DESKTOP_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_SERVER_TIMEOUT_MS = 10 * 60 * 1000;
 const COMPLETED_FLOW_TTL_MS = 60 * 1000;
 const STORE_FILE_NAME = "mcp-oauth.json";
+// RFC 6749 §4.1.2.1 authorization-response error codes (safe to display).
+const RFC6749_AUTHORIZATION_ERROR_CODES = new Set([
+  "invalid_request",
+  "unauthorized_client",
+  "access_denied",
+  "unsupported_response_type",
+  "invalid_scope",
+  "server_error",
+  "temporarily_unavailable",
+]);
 
 interface McpOauthStoreFileV1 {
   version: 1;
@@ -107,6 +124,9 @@ interface OAuthFlowBase {
 
   /** PKCE verifier for this flow (set by the MCP SDK auth()). */
   codeVerifier: string | null;
+
+  /** Plugin OAuth settings; the client secret lives only here, in memory. */
+  plugin?: { config: MCPServerOAuthConfig; clientSecret?: string };
   discoveryState: OAuthDiscoveryState | undefined;
 
   timeout: ReturnType<typeof setTimeout>;
@@ -115,6 +135,8 @@ interface OAuthFlowBase {
   resultPromise: Promise<Result<void, string>>;
   resolveResult: (result: Result<void, string>) => void;
   settled: boolean;
+  /** The server key's sign-out generation when the flow started (see signOutGenerations). */
+  signOutGeneration: number;
 }
 
 interface DesktopFlow extends OAuthFlowBase {
@@ -122,6 +144,220 @@ interface DesktopFlow extends OAuthFlowBase {
 }
 
 type ServerFlow = OAuthFlowBase;
+
+/** baseScopes always; defaultScopes replace the discovered scope. */
+function resolvePluginScope(
+  config: MCPServerOAuthConfig,
+  discovered: string | undefined
+): string | undefined {
+  const defaults = config.defaultScopes ?? discovered?.split(" ").filter(Boolean) ?? [];
+  const scopes = [...new Set([...(config.baseScopes ?? []), ...defaults])];
+  return scopes.length > 0 ? scopes.join(" ") : undefined;
+}
+
+/**
+ * A standalone authorizationServerBase only changes where discovery fetches metadata. The SDK
+ * refuses metadata whose `issuer` is not that URL (path included, RFC 8414 §3.3), so a
+ * tenant-A base never yields tenant-B endpoints. Plugins cannot override the authorization or
+ * token endpoints: follow-up #6142 binds such overrides to verified issuer metadata.
+ */
+function pluginDiscoveryState(config?: MCPServerOAuthConfig): OAuthDiscoveryState | undefined {
+  const base = config?.discovery?.authorizationServerBase;
+  return base !== undefined ? { authorizationServerUrl: base } : undefined;
+}
+
+/**
+ * Whether `url` sits under the issuer identifier: same origin and a path inside the issuer's
+ * path (a whole segment, so `/tenant-a` does not cover `/tenant-ab`).
+ */
+function isUnderIssuer(url: string, issuer: string): boolean {
+  const target = new URL(url);
+  const base = new URL(issuer);
+  if (target.origin !== base.origin) return false;
+  const prefix = base.pathname.endsWith("/") ? base.pathname : `${base.pathname}/`;
+  return target.pathname === base.pathname || target.pathname.startsWith(prefix);
+}
+
+/**
+ * The discovery state a sign-in starts from. A standalone registrationUrl replaces the
+ * discovered registration endpoint, so discovery runs here first: the SDK registers with the
+ * metadata it is given. SECURITY AUDIT: the metadata is issuer-checked by the SDK, and the URL
+ * is kept only when it is the metadata's own registration_endpoint or sits under the full
+ * issuer URL (path prefix, not just origin: tenants can share one origin). Otherwise it is
+ * dropped and plain discovery applies.
+ */
+async function pluginFlowDiscoveryState(
+  config: MCPServerOAuthConfig,
+  challenge: BearerChallenge | null,
+  serverUrlForDiscovery: string
+): Promise<OAuthDiscoveryState | undefined> {
+  const registrationUrl = config.discovery?.registrationUrl;
+  if (registrationUrl === undefined) return pluginDiscoveryState(config);
+  const base = config.discovery?.authorizationServerBase;
+  try {
+    const discovered =
+      base !== undefined
+        ? {
+            authorizationServerUrl: base,
+            authorizationServerMetadata: await discoverAuthorizationServerMetadata(base),
+          }
+        : await discoverOAuthServerInfo(serverUrlForDiscovery, {
+            ...(challenge?.resourceMetadataUrl !== undefined
+              ? { resourceMetadataUrl: challenge.resourceMetadataUrl }
+              : {}),
+          });
+    const metadata = discovered.authorizationServerMetadata;
+    if (metadata === undefined) return pluginDiscoveryState(config);
+    if (
+      registrationUrl !== metadata.registration_endpoint &&
+      !isUnderIssuer(registrationUrl, metadata.issuer)
+    ) {
+      log.warn("[MCP OAuth] Ignoring a plugin registrationUrl outside the issuer", {
+        issuer: metadata.issuer,
+      });
+      return pluginDiscoveryState(config);
+    }
+    return {
+      authorizationServerUrl: String(discovered.authorizationServerUrl),
+      authorizationServerMetadata: { ...metadata, registration_endpoint: registrationUrl },
+      ...("resourceMetadata" in discovered && discovered.resourceMetadata !== undefined
+        ? { resourceMetadata: discovered.resourceMetadata }
+        : {}),
+    };
+  } catch (error) {
+    // The SDK repeats discovery and reports the failure to the user.
+    log.debug("[MCP OAuth] Plugin registrationUrl discovery failed", { error });
+    return pluginDiscoveryState(config);
+  }
+}
+
+/** A plugin's registered client (skips DCR). The SDK sends client_secret to the token endpoint only. */
+function pluginClient(
+  config: MCPServerOAuthConfig | undefined,
+  clientSecret: string | undefined
+): MCPOAuthClientInformation | undefined {
+  if (config?.clientId === undefined) return undefined;
+  return {
+    client_id: config.clientId,
+    ...(clientSecret !== undefined ? { client_secret: clientSecret } : {}),
+    ...(config.tokenEndpointAuthMethod !== undefined
+      ? { token_endpoint_auth_method: config.tokenEndpointAuthMethod }
+      : {}),
+  };
+}
+
+/**
+ * A URL whose serialization is the configured string. The SDK sends `resource.href` in the
+ * authorization, token and refresh requests, and `new URL("https://api.example.com").href`
+ * appends a slash: an authorization server that compares RFC 8707 resources exactly rejects
+ * that. The value is still validated as a URL by the constructor.
+ */
+class ExactResourceURL extends URL {
+  readonly #raw: string;
+  constructor(raw: string) {
+    super(raw);
+    this.#raw = raw;
+  }
+  override get href(): string {
+    return this.#raw;
+  }
+  override toString(): string {
+    return this.#raw;
+  }
+  override toJSON(): string {
+    return this.#raw;
+  }
+}
+
+/**
+ * Defense in depth for the plugin resource (mcpConfig already dropped one
+ * that does not cover the server): the SDK's own resource/server rule.
+ */
+function pluginResourceValidator(resource: string): (serverResource: URL) => Promise<URL> {
+  return (serverResource) =>
+    checkResourceAllowed({ requestedResource: serverResource, configuredResource: resource })
+      ? Promise.resolve(new ExactResourceURL(resource))
+      : Promise.reject(
+          new Error(`Plugin resource ${resource} does not cover ${serverResource.href}`)
+        );
+}
+
+/**
+ * The issuer a plugin config pins: its authorizationServerBase (the SDK verifies the metadata
+ * issuer is exactly that URL). Undefined when discovery picks the issuer: then it is the
+ * server's own choice, which no plugin update changes, and the SDK's auth() already discards
+ * credentials stamped by another issuer before a refresh (SEP-2352).
+ */
+function pinnedIssuer(config: MCPServerOAuthConfig | undefined): string | undefined {
+  return config?.discovery?.authorizationServerBase;
+}
+
+/** The SDK's SEP-2352 comparison: one trailing slash of difference is the same issuer. */
+function issuersMatch(a: string, b: string): boolean {
+  return a === b || a.replace(/\/$/, "") === b.replace(/\/$/, "");
+}
+
+/**
+ * The use-time rule that decides whether stored credentials may serve a server: they belong
+ * to the client and the issuer that minted them. A plugin with another provided client, or one
+ * that pins another issuer (a second plugin at the same URL, an update, a remove and re-add),
+ * must not use them, and must never refresh client A's token with client B. Sign-out on update
+ * is only cleanup: a write from an old-identity flow or refresh that lands after it carries the
+ * old client ID or issuer stamp, so it never matches the new config, and a later sign-in
+ * overwrites it.
+ *
+ * SECURITY: with a pinned issuer, credentials must carry a matching issuer stamp (or a matching
+ * legacy `authorization_server` binding). Unstamped ones are refused and the user signs in
+ * again: the SDK would stamp them with the pinned issuer and post the refresh token there, so a
+ * plugin update that moves authorizationServerBase to another origin could collect it. Without
+ * a pinned issuer unstamped credentials pass, like in the SDK (non-plugin servers unchanged).
+ *
+ * Known limit: a change of only scopes or resource (same client, same issuer) keeps the old
+ * tokens and their old grant until the server asks for re-authorization; the update-time
+ * sign-out covers the normal path. Follow-up for scope coverage: #6141.
+ */
+function storedClientMatches(
+  stored: MCPOAuthStoredCredentials | null | undefined,
+  config: MCPServerOAuthConfig | undefined
+): boolean {
+  if (config?.clientId !== undefined && stored?.clientInformation?.client_id !== config.clientId)
+    return false;
+  const issuer = pinnedIssuer(config);
+  if (issuer === undefined) return true;
+  // Each record the SDK reads must be bound to the pinned issuer: its SEP-2352 stamp, or for a
+  // pre-upgrade record its legacy authorization_server binding.
+  return [stored?.clientInformation, stored?.tokens].every((record) => {
+    if (record === undefined) return true;
+    const binding = record.issuer ?? record.authorization_server;
+    return binding !== undefined && issuersMatch(binding, issuer);
+  });
+}
+
+/** SECURITY AUDIT: the store (mcp-oauth.json) never receives a plugin client secret. */
+function withoutPluginSecret(
+  info: MCPOAuthClientInformation,
+  config: MCPServerOAuthConfig | undefined
+): MCPOAuthClientInformation {
+  if (config?.clientId === undefined) return info;
+  const persisted = { ...info };
+  delete persisted.client_secret;
+  return persisted;
+}
+
+async function readClientSecret(config?: MCPServerOAuthConfig): Promise<string | undefined> {
+  if (config?.clientSecretSource === undefined || config.clientId === undefined) return undefined;
+  try {
+    return await readPluginClientSecret(config.clientSecretSource, config.clientId);
+  } catch (error) {
+    // Never log the file content: it holds the secret. readPluginClientSecret reports a
+    // parse failure as a fixed category; read errors name only the path.
+    log.warn("[MCP OAuth] Could not read the plugin client secret", {
+      serverName: config.clientSecretSource.serverName,
+      error: getErrorMessage(error),
+    });
+    return undefined;
+  }
+}
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -443,6 +679,12 @@ function parseStoredCredentials(value: unknown): MCPOAuthStoredCredentials | nul
           typeof clientInformationRaw.client_secret === "string"
             ? clientInformationRaw.client_secret
             : undefined,
+        // A dynamically registered client's method: plugin endpoint metadata advertises no
+        // supported methods, so without it the SDK falls back to client_secret_basic.
+        token_endpoint_auth_method:
+          typeof clientInformationRaw.token_endpoint_auth_method === "string"
+            ? clientInformationRaw.token_endpoint_auth_method
+            : undefined,
         client_id_issued_at:
           typeof clientInformationRaw.client_id_issued_at === "number"
             ? clientInformationRaw.client_id_issued_at
@@ -675,11 +917,41 @@ export class McpOauthService {
       input.projectPath,
       isProjectTrusted(this.config, input.projectPath)
     );
-    const server = servers[input.serverName];
+    const server = getOwn(servers, input.serverName);
     if (!server || server.transport === "stdio") {
       return { isLoggedIn: false, hasRefreshToken: false };
     }
-    return this.getAuthStatus({ serverUrl: server.url });
+    return this.getAuthStatus({
+      serverUrl: server.url,
+      ...(server.oauth !== undefined ? { oauth: server.oauth } : {}),
+    });
+  }
+
+  /**
+   * Settings (global scope): with `serverName`, the configured server's plugin OAuth settings
+   * apply, so tokens of another client read as signed out like they do at connect time.
+   */
+  async getAuthStatusForApi(input: {
+    serverUrl: string;
+    serverName?: string;
+  }): Promise<MCPOAuthAuthStatus> {
+    if (input.serverName === undefined) return this.getAuthStatus({ serverUrl: input.serverUrl });
+    const servers = await this.mcpConfigService.listServers(
+      this.config.rootDir,
+      isProjectTrusted(this.config, this.config.rootDir)
+    );
+    const server = getOwn(servers, input.serverName);
+    const oauth =
+      server !== undefined &&
+      server.transport !== "stdio" &&
+      normalizeServerUrlForComparison(server.url) ===
+        normalizeServerUrlForComparison(input.serverUrl)
+        ? server.oauth
+        : undefined;
+    return this.getAuthStatus({
+      serverUrl: input.serverUrl,
+      ...(oauth !== undefined ? { oauth } : {}),
+    });
   }
 
   async logoutProjectServer(input: {
@@ -690,13 +962,17 @@ export class McpOauthService {
       input.projectPath,
       isProjectTrusted(this.config, input.projectPath)
     );
-    const server = servers[input.serverName];
+    const server = getOwn(servers, input.serverName);
     if (!server || server.transport === "stdio") {
       return Ok(undefined);
     }
     return this.logout({ serverUrl: server.url });
   }
-  async getAuthStatus(input: { serverUrl: string }): Promise<MCPOAuthAuthStatus> {
+  async getAuthStatus(input: {
+    serverUrl: string;
+    /** Plugin OAuth settings: tokens issued to another client read as signed out. */
+    oauth?: MCPServerOAuthConfig;
+  }): Promise<MCPOAuthAuthStatus> {
     const normalizedServerUrl = normalizeServerUrlForComparison(input.serverUrl);
     if (!normalizedServerUrl) {
       return { isLoggedIn: false, hasRefreshToken: false };
@@ -704,7 +980,9 @@ export class McpOauthService {
 
     const creds = await this.getValidStoredCredentials({ serverUrl: normalizedServerUrl });
 
-    const tokens = creds?.tokens;
+    // The same guard as getAuthProviderForServer: status must not say "Logged in" for tokens
+    // the connection will not use.
+    const tokens = storedClientMatches(creds, input.oauth) ? creds?.tokens : undefined;
     return {
       serverUrl: normalizedServerUrl,
       isLoggedIn: Boolean(tokens),
@@ -714,11 +992,49 @@ export class McpOauthService {
     };
   }
 
+  /**
+   * Sign-outs per credential key. Settling a flow does not stop a token exchange already in
+   * flight, so each flow remembers the generation it started under, and its saves are dropped
+   * (inside the store lock) once a sign-out bumped it.
+   */
+  private readonly signOutGenerations = new Map<string, number>();
+
+  private signOutGeneration(serverUrlForStoreKey: string): number {
+    return this.signOutGenerations.get(serverUrlForStoreKey) ?? 0;
+  }
+
+  /** True (and logged) when a sign-out happened after the flow started. */
+  private isStaleFlowSave(serverUrl: string, flowGeneration: number | undefined): boolean {
+    if (flowGeneration === undefined || flowGeneration === this.signOutGeneration(serverUrl))
+      return false;
+    log.info("[MCP OAuth] Dropping credentials of a flow started before a sign-out", { serverUrl });
+    return true;
+  }
+
+  /** The credential-store key of a server URL (null for an invalid URL). */
+  credentialKey(serverUrl: string): string | null {
+    return normalizeServerUrlForComparison(serverUrl);
+  }
+
   async logout(input: { serverUrl: string }): Promise<Result<void, string>> {
     const normalizedServerUrl = normalizeServerUrlForComparison(input.serverUrl);
     if (!normalizedServerUrl) {
       return Ok(undefined);
     }
+    // Before any await: an exchange already past its settled check must not save either.
+    this.signOutGenerations.set(
+      normalizedServerUrl,
+      this.signOutGeneration(normalizedServerUrl) + 1
+    );
+    // A flow started before the sign-out must not save its credentials back.
+    await Promise.all([
+      ...[...this.desktopFlows]
+        .filter(([, flow]) => flow.serverUrlForStoreKey === normalizedServerUrl)
+        .map(([id]) => this.finishDesktopFlow(id, Err("Signed out"))),
+      ...[...this.serverFlows]
+        .filter(([, flow]) => flow.serverUrlForStoreKey === normalizedServerUrl)
+        .map(([id]) => this.finishServerFlow(id, Err("Signed out"))),
+    ]);
 
     try {
       await this.storeLock.withLock(this.storeFilePath, async () => {
@@ -748,6 +1064,8 @@ export class McpOauthService {
   async getAuthProviderForServer(input: {
     serverUrl: string;
     serverName?: string;
+    /** Plugin OAuth settings of this server (for token refresh). */
+    oauth?: MCPServerOAuthConfig;
   }): Promise<OAuthClientProvider | undefined> {
     const normalizedServerUrl = normalizeServerUrlForComparison(input.serverUrl);
     if (!normalizedServerUrl) {
@@ -759,24 +1077,35 @@ export class McpOauthService {
     if (!creds?.tokens || !creds.clientInformation) {
       return undefined;
     }
+    // Tokens of another client: signed out for this plugin server.
+    if (!storedClientMatches(creds, input.oauth)) {
+      return undefined;
+    }
 
     return this.createBackgroundProvider({
       serverUrl: normalizedServerUrl,
       serverName: input.serverName,
+      oauth: input.oauth,
     });
   }
 
   /**
    * Used by MCPServerManager caching to restart servers when auth state changes.
    */
-  async hasAuthTokens(input: { serverUrl: string }): Promise<boolean> {
+  async hasAuthTokens(input: {
+    serverUrl: string;
+    /** Plugin OAuth settings: the same client check as getAuthProviderForServer. */
+    oauth?: MCPServerOAuthConfig;
+  }): Promise<boolean> {
     const normalizedServerUrl = normalizeServerUrlForComparison(input.serverUrl);
     if (!normalizedServerUrl) {
       return false;
     }
 
     const creds = await this.getValidStoredCredentials({ serverUrl: normalizedServerUrl });
-    return Boolean(creds?.tokens && creds.clientInformation);
+    return Boolean(
+      creds?.tokens && creds.clientInformation && storedClientMatches(creds, input.oauth)
+    );
   }
 
   private async resolveServerForOauthFlow(input: {
@@ -789,6 +1118,7 @@ export class McpOauthService {
         serverUrlForDiscovery: string;
         serverUrlForStoreKey: string;
         transport: "http" | "sse" | "auto";
+        oauth?: MCPServerOAuthConfig;
       },
       string
     >
@@ -817,7 +1147,7 @@ export class McpOauthService {
       input.projectPath,
       isProjectTrusted(this.config, input.projectPath)
     );
-    const server = servers[input.serverName];
+    const server = getOwn(servers, input.serverName);
     if (!server) {
       return Err("MCP server not found");
     }
@@ -836,7 +1166,12 @@ export class McpOauthService {
       return Err("Invalid MCP server URL");
     }
 
-    return Ok({ serverUrlForDiscovery, serverUrlForStoreKey, transport: server.transport });
+    return Ok({
+      serverUrlForDiscovery,
+      serverUrlForStoreKey,
+      transport: server.transport,
+      ...(server.oauth !== undefined ? { oauth: server.oauth } : {}),
+    });
   }
 
   async startDesktopFlow(input: {
@@ -890,10 +1225,12 @@ export class McpOauthService {
       const code = url.searchParams.get("code");
       const error = url.searchParams.get("error");
       const errorDescription = url.searchParams.get("error_description") ?? undefined;
+      const iss = url.searchParams.get("iss");
 
       void this.handleDesktopCallback({
         flowId,
         code,
+        iss,
         error,
         errorDescription,
         res,
@@ -936,10 +1273,13 @@ export class McpOauthService {
       clientInformation: null,
       authorizeUrl: "",
       redirectUri,
-      scope: await resolveOAuthScope(challenge),
+      ...(await this.pluginFlowFields(
+        serverConfig.data.oauth,
+        challenge,
+        serverConfig.data.serverUrlForDiscovery
+      )),
       resourceMetadataUrl: challenge?.resourceMetadataUrl,
       codeVerifier: null,
-      discoveryState: undefined,
       server: serverListener,
       timeout: setTimeout(() => {
         void this.finishDesktopFlow(flowId, Err("Timed out waiting for OAuth callback"));
@@ -948,6 +1288,7 @@ export class McpOauthService {
       resultPromise,
       resolveResult,
       settled: false,
+      signOutGeneration: this.signOutGeneration(serverUrlForStoreKey),
     };
 
     this.desktopFlows.set(flowId, flow);
@@ -1081,10 +1422,13 @@ export class McpOauthService {
       clientInformation: null,
       authorizeUrl: "",
       redirectUri: redirectUri.toString(),
-      scope: await resolveOAuthScope(challenge),
+      ...(await this.pluginFlowFields(
+        serverConfig.data.oauth,
+        challenge,
+        serverConfig.data.serverUrlForDiscovery
+      )),
       resourceMetadataUrl: challenge?.resourceMetadataUrl,
       codeVerifier: null,
-      discoveryState: undefined,
       timeout: setTimeout(() => {
         void this.finishServerFlow(flowId, Err("Timed out waiting for OAuth callback"));
       }, DEFAULT_SERVER_TIMEOUT_MS),
@@ -1092,6 +1436,7 @@ export class McpOauthService {
       resultPromise,
       resolveResult,
       settled: false,
+      signOutGeneration: this.signOutGeneration(serverUrlForStoreKey),
     };
 
     this.serverFlows.set(flowId, flow);
@@ -1176,6 +1521,7 @@ export class McpOauthService {
   async handleServerCallbackAndExchange(input: {
     state: string | null;
     code: string | null;
+    iss?: string | null;
     error: string | null;
     errorDescription?: string;
   }): Promise<Result<void, string>> {
@@ -1197,6 +1543,7 @@ export class McpOauthService {
 
     const result = await this.exchangeAuthorizationCode(flow, {
       code: input.code,
+      iss: input.iss,
       error: input.error,
       errorDescription: input.errorDescription,
     });
@@ -1239,6 +1586,22 @@ export class McpOauthService {
     return "unknown";
   }
 
+  /** Scope, discovery state and plugin client for a new flow. */
+  private async pluginFlowFields(
+    config: MCPServerOAuthConfig | undefined,
+    challenge: BearerChallenge | null,
+    serverUrlForDiscovery: string
+  ): Promise<Pick<OAuthFlowBase, "scope" | "discoveryState" | "plugin">> {
+    const scope = await resolveOAuthScope(challenge);
+    if (config === undefined) return { scope, discoveryState: undefined };
+    const clientSecret = await readClientSecret(config);
+    return {
+      scope: resolvePluginScope(config, scope),
+      discoveryState: await pluginFlowDiscoveryState(config, challenge, serverUrlForDiscovery),
+      plugin: { config, ...(clientSecret !== undefined ? { clientSecret } : {}) },
+    };
+  }
+
   private createFlowProvider(flow: OAuthFlowBase): OAuthClientProvider {
     return {
       tokens: () => Promise.resolve(undefined),
@@ -1248,6 +1611,8 @@ export class McpOauthService {
           // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
           tokens: tokens as unknown as MCPOAuthTokens,
           legacyBinding: deriveAuthorizationServerBinding(flow.discoveryState),
+          flowGeneration: flow.signOutGeneration,
+          clientId: flow.clientInformation?.client_id ?? flow.plugin?.config.clientId,
         });
       },
       saveDiscoveryState: (state) => {
@@ -1297,18 +1662,27 @@ export class McpOauthService {
       clientInformation: () => {
         // We intentionally register an OAuth client per interactive flow because the
         // redirect URI may vary between environments (desktop loopback ports, proxied
-        // server origins, etc.).
-        return Promise.resolve(flow.clientInformation ?? undefined);
+        // server origins, etc.). A plugin-provided client skips registration.
+        return Promise.resolve(
+          flow.clientInformation ??
+            pluginClient(flow.plugin?.config, flow.plugin?.clientSecret) ??
+            undefined
+        );
       },
+      ...(flow.plugin?.config.resource !== undefined
+        ? { validateResourceURL: pluginResourceValidator(flow.plugin.config.resource) }
+        : {}),
       saveClientInformation: async (clientInformation) => {
         // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
         const next = clientInformation as unknown as MCPOAuthClientInformation;
+        // Memory keeps a plugin secret for the code exchange; the store does not.
         flow.clientInformation = next;
 
         await this.saveClientInformation({
           serverUrl: flow.serverUrlForStoreKey,
-          clientInformation: next,
+          clientInformation: withoutPluginSecret(next, flow.plugin?.config),
           legacyBinding: deriveAuthorizationServerBinding(flow.discoveryState),
+          flowGeneration: flow.signOutGeneration,
         });
       },
       state: () => Promise.resolve(flow.flowId),
@@ -1318,12 +1692,17 @@ export class McpOauthService {
   private createBackgroundProvider(input: {
     serverUrl: string;
     serverName?: string;
+    oauth?: MCPServerOAuthConfig;
   }): OAuthClientProvider {
     let discoveryState: OAuthDiscoveryState | undefined;
+    // The client a refresh runs with: its tokens are saved only while that client is stored.
+    let refreshedWithClientId: string | undefined;
+    const pluginState = pluginDiscoveryState(input.oauth);
 
     return {
       tokens: async () => {
         const creds = await this.getValidStoredCredentials({ serverUrl: input.serverUrl });
+        if (!storedClientMatches(creds, input.oauth)) return undefined;
         // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
         return creds?.tokens as unknown as MCPOAuthTokens | undefined;
       },
@@ -1333,6 +1712,7 @@ export class McpOauthService {
           // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
           tokens: tokens as unknown as MCPOAuthTokens,
           legacyBinding: deriveAuthorizationServerBinding(discoveryState),
+          clientId: refreshedWithClientId ?? input.oauth?.clientId,
         });
       },
       saveDiscoveryState: (state) => {
@@ -1376,14 +1756,26 @@ export class McpOauthService {
       },
       clientInformation: async () => {
         const creds = await this.getValidStoredCredentials({ serverUrl: input.serverUrl });
-        // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-        return creds?.clientInformation as unknown as MCPOAuthClientInformation | undefined;
+        const stored = storedClientMatches(creds, input.oauth)
+          ? creds?.clientInformation
+          : undefined;
+        refreshedWithClientId = stored?.client_id;
+        // Token refresh re-reads a plugin secret from its consented file.
+        const plugin = stored && pluginClient(input.oauth, await readClientSecret(input.oauth));
+        return stored && { ...stored, ...plugin };
       },
+      ...(pluginState !== undefined ? { discoveryState: () => Promise.resolve(pluginState) } : {}),
+      ...(input.oauth?.resource !== undefined
+        ? { validateResourceURL: pluginResourceValidator(input.oauth.resource) }
+        : {}),
       saveClientInformation: async (clientInformation) => {
         await this.saveClientInformation({
           serverUrl: input.serverUrl,
-          // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-          clientInformation: clientInformation as unknown as MCPOAuthClientInformation,
+          clientInformation: withoutPluginSecret(
+            // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
+            clientInformation as unknown as MCPOAuthClientInformation,
+            input.oauth
+          ),
           legacyBinding: deriveAuthorizationServerBinding(discoveryState),
         });
       },
@@ -1393,6 +1785,7 @@ export class McpOauthService {
   private async handleDesktopCallback(input: {
     flowId: string;
     code: string | null;
+    iss: string | null;
     error: string | null;
     errorDescription?: string;
     res: http.ServerResponse;
@@ -1409,6 +1802,7 @@ export class McpOauthService {
 
     const result = await this.exchangeAuthorizationCode(flow, {
       code: input.code,
+      iss: input.iss,
       error: input.error,
       errorDescription: input.errorDescription,
     });
@@ -1433,13 +1827,25 @@ export class McpOauthService {
 
   private async exchangeAuthorizationCode(
     flow: OAuthFlowBase,
-    input: { code: string | null; error: string | null; errorDescription?: string }
+    input: {
+      code: string | null;
+      iss?: string | null;
+      error: string | null;
+      errorDescription?: string;
+    }
   ): Promise<Result<void, string>> {
     if (input.error) {
-      const message = input.errorDescription
-        ? `${input.error}: ${input.errorDescription}`
-        : input.error;
-      return Err(`MCP OAuth error: ${message}`);
+      // Callback error fields are attacker-controllable in a mix-up attack and
+      // arrive before the SDK can check `iss`, so the SDK says not to display
+      // them. Show only a standard RFC 6749 error code; keep the rest in logs.
+      log.warn("[MCP OAuth] Authorization server returned an error", {
+        error: input.error,
+        errorDescription: input.errorDescription,
+      });
+      const code = RFC6749_AUTHORIZATION_ERROR_CODES.has(input.error)
+        ? input.error
+        : "unknown_error";
+      return Err(`MCP OAuth error: ${code}`);
     }
 
     if (!input.code) {
@@ -1452,6 +1858,10 @@ export class McpOauthService {
       const result = await auth(provider, {
         serverUrl: flow.serverUrlForDiscovery,
         authorizationCode: input.code,
+        // RFC 9207 mix-up defense: the SDK compares `iss` to the discovered
+        // issuer and requires it when the issuer advertises support. Forward it
+        // unmodified; null -> undefined because the SDK treats only undefined as absent.
+        iss: input.iss ?? undefined,
         scope: flow.scope,
         resourceMetadataUrl: flow.resourceMetadataUrl,
       });
@@ -1464,6 +1874,15 @@ export class McpOauthService {
 
       return Ok(undefined);
     } catch (error) {
+      // The received `iss` is attacker-controllable in a mix-up attack and the
+      // SDK says callers must not display it; keep it in logs only (the SDK
+      // JSON-encodes it in the message) and show just the trusted expected issuer.
+      if (error instanceof IssuerMismatchError && error.kind === "authorization_response") {
+        log.warn("[MCP OAuth] Authorization response issuer mismatch", { error: error.message });
+        return Err(
+          `Issuer mismatch in authorization response (RFC 9207): the response did not come from the expected authorization server ${JSON.stringify(error.expected)}`
+        );
+      }
       const message = getErrorMessage(error);
       return Err(message);
     }
@@ -1636,9 +2055,29 @@ export class McpOauthService {
     serverUrl: string;
     tokens: MCPOAuthTokens;
     legacyBinding?: AuthorizationServerBinding;
+    /** An interactive flow's sign-out generation; the save is dropped when it is stale. */
+    flowGeneration?: number;
+    /** The client the tokens were issued to (the flow's or the refresh's). */
+    clientId?: string;
   }): Promise<void> {
     await this.storeLock.withLock(this.storeFilePath, async () => {
+      if (this.isStaleFlowSave(input.serverUrl, input.flowGeneration)) return;
       const store = await this.ensureStoreLoadedLocked();
+      // Two plugin servers can share an MCP URL with different clients, and their sign-ins
+      // interleave: A saves client A, B saves client B, then A's token lands. One record per
+      // URL cannot hold both, so a token for a client that is no longer stored is dropped
+      // (never client B with token A). The losing server signs in once more; #6159 keys
+      // credentials by client to remove that extra sign-in. No stored client also drops the
+      // write: after a logout, a late token from client A would otherwise create a tokens-only
+      // entry that client B's later saveClientInformation keeps (#6297). Every flow saves its
+      // client (the SDK stamps the issuer on a provided client) before its tokens.
+      const storedClientId = store.entries[input.serverUrl]?.clientInformation?.client_id;
+      if (input.clientId !== undefined && storedClientId !== input.clientId) {
+        log.info("[MCP OAuth] Dropping tokens of a client that is no longer stored", {
+          serverUrl: input.serverUrl,
+        });
+        return;
+      }
       const creds = (store.entries[input.serverUrl] ??= {
         serverUrl: input.serverUrl,
         updatedAtMs: Date.now(),
@@ -1666,8 +2105,10 @@ export class McpOauthService {
     serverUrl: string;
     clientInformation: MCPOAuthClientInformation;
     legacyBinding?: AuthorizationServerBinding;
+    flowGeneration?: number;
   }): Promise<void> {
     await this.storeLock.withLock(this.storeFilePath, async () => {
+      if (this.isStaleFlowSave(input.serverUrl, input.flowGeneration)) return;
       const store = await this.ensureStoreLoadedLocked();
       const creds = (store.entries[input.serverUrl] ??= {
         serverUrl: input.serverUrl,

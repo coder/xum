@@ -1,7 +1,5 @@
 import "../dom";
 import { fireEvent, waitFor } from "@testing-library/react";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { TRANSCRIPT_DENSITY_KEY, type TranscriptDensity } from "@/common/constants/storage";
 import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
 import { createWorkspace } from "@/browser/stories/mocks/workspaces";
 import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
@@ -56,7 +54,6 @@ function expectTextOrder(container: HTMLElement, ...orderedText: string[]): void
 describe("Hyper transcript density", () => {
   test("expands work bundles and nested operational bundles through the app render path", async () => {
     const cleanupDom = installDom();
-    updatePersistedState<TranscriptDensity>(TRANSCRIPT_DENSITY_KEY, "hyper");
 
     const metadata = createWorkspace({
       id: "ws-density",
@@ -65,6 +62,7 @@ describe("Hyper transcript density", () => {
       projectPath: "/home/user/projects/my-app",
     });
     const client = setupSimpleChatStory({
+      userPreferences: { appearance: { transcriptDensity: "hyper" } },
       workspaceId: metadata.id,
       workspaceName: metadata.name,
       projectName: metadata.projectName,
@@ -186,7 +184,6 @@ describe("Hyper transcript density", () => {
 
   test("reveals a tail propose_plan through collapsed hyper-density bundles", async () => {
     const cleanupDom = installDom();
-    updatePersistedState<TranscriptDensity>(TRANSCRIPT_DENSITY_KEY, "hyper");
 
     const metadata = createWorkspace({
       id: "ws-tail-plan",
@@ -195,6 +192,7 @@ describe("Hyper transcript density", () => {
       projectPath: "/home/user/projects/my-app",
     });
     const client = setupSimpleChatStory({
+      userPreferences: { appearance: { transcriptDensity: "hyper" } },
       workspaceId: metadata.id,
       workspaceName: metadata.name,
       projectName: metadata.projectName,
@@ -254,7 +252,6 @@ describe("Hyper transcript density", () => {
 
   test("keeps historical propose_plan collapsed when a later image tool call exists", async () => {
     const cleanupDom = installDom();
-    updatePersistedState<TranscriptDensity>(TRANSCRIPT_DENSITY_KEY, "hyper");
 
     const metadata = createWorkspace({
       id: "ws-historical-plan",
@@ -263,6 +260,7 @@ describe("Hyper transcript density", () => {
       projectPath: "/home/user/projects/my-app",
     });
     const client = setupSimpleChatStory({
+      userPreferences: { appearance: { transcriptDensity: "hyper" } },
       workspaceId: metadata.id,
       workspaceName: metadata.name,
       projectName: metadata.projectName,

@@ -18,6 +18,14 @@ BOT = "chatgpt-codex-connector"
 BEFORE = "2026-09-08T14:00:00Z"
 REQUEST = "2026-09-08T15:00:00Z"
 AFTER = "2026-09-08T16:00:00Z"
+USAGE_LIMIT_NOTICES = (
+    "Codex usage limits have been reached.",
+    "You have reached your Codex usage limits for code reviews.",
+    "You have reached your Codex usage limits for code reviews. You can see your limits in the "
+    "[Codex usage dashboard](https://chatgpt.com/codex/cloud/settings/usage).\n"
+    "To continue using code reviews, add credits to your account and enable them for code reviews "
+    "in your [settings](https://chatgpt.com/codex/cloud/settings/code-review).",
+)
 # A PR head no fixture board was written for.
 NEWER_HEAD = "b" * 40
 
@@ -42,11 +50,14 @@ def comment(body, author=BOT, created_at=AFTER, minimized=False):
     }
 
 
-def thread(body, author=BOT, resolved=False, created_at=AFTER):
+def thread(body, author=BOT, resolved=False, created_at=AFTER, discussion="1"):
+    """`discussion` is the root comment ID that board links use (#discussion_r<id>)."""
+    root = comment(body, author, created_at)
+    root["fullDatabaseId"] = discussion
     return {
         "id": "thread",
         "isResolved": resolved,
-        "comments": {"nodes": [comment(body, author, created_at)]},
+        "comments": {"nodes": [root]},
     }
 
 
@@ -237,6 +248,35 @@ else:
             for cached in (False, True):
                 with self.subTest(body=body, cached=cached):
                     data = snapshot([comment(body)])
+                    self.assert_gate(expected, data, cache=data if cached else None)
+
+    def test_resolved_advisory_threads_clear_their_board_bullets(self):
+        # Codex can leave a bullet without its Resolved marker after the thread is
+        # resolved and later reviews complete (coder/xum#5045).
+        board = (
+            FIXTURES["security_findings_summary"]["body"]
+            .replace('"status":"running"', '"status":"completed"')
+            .replace("🔄 **Running** since", "✅ **Completed**")
+        )
+        advisory = "3960253571"
+        for threads, expected in (
+            ([thread("[P2] Advisory", resolved=True, discussion=advisory)], 0),
+            ([thread("[P2] Other", resolved=True, discussion="1")], 1),
+            (
+                [
+                    thread(
+                        "[P2] Advisory",
+                        author="human-reviewer",
+                        resolved=True,
+                        discussion=advisory,
+                    )
+                ],
+                1,
+            ),
+        ):
+            for cached in (False, True):
+                with self.subTest(threads=threads, cached=cached):
+                    data = snapshot([comment(board)], threads)
                     self.assert_gate(expected, data, cache=data if cached else None)
 
     def test_wait_for_review_polls_until_codex_finishes(self):
@@ -466,12 +506,66 @@ else:
                 ([comment("[P1] Fix authorization")], []),
                 ([], [thread("[P1] Fix authorization")]),
                 ([comment("Please create a Codex account to review.")], []),
-                ([comment("Codex usage limits have been reached.")], []),
             ):
                 with self.subTest(name=name, comments=extra_comments, threads=threads):
                     self.assert_gate(
                         1, snapshot(comments + extra_comments, threads), "wait_pr_codex.sh"
                     )
+
+    def test_usage_limits_pass_ci_and_readiness_without_claiming_approval(self):
+        request = comment("@codex review", "maintainer", REQUEST)
+        for notice in USAGE_LIMIT_NOTICES:
+            data = snapshot([request, comment(notice)])
+            with self.subTest(notice=notice):
+                self.assert_gate(0, data, wait=1)
+                result = self.assert_gate(0, data, "wait_pr_codex.sh")
+                self.assertIn("review skipped", result.stdout)
+                self.assertNotIn("Codex approved", result.stdout)
+
+    def test_usage_limits_do_not_hide_findings_or_other_review_failures(self):
+        request = comment("@codex review", "maintainer", REQUEST)
+        for notice in USAGE_LIMIT_NOTICES:
+            for extra_comments, threads in (
+                ([comment("[P1] Fix authorization")], []),
+                ([], [thread("[P1] Fix authorization", created_at=BEFORE)]),
+                ([comment("Codex Review: Something went wrong.")], []),
+                ([comment(notice + "\n\n[P1] Fix authorization")], []),
+                ([comment("The error was: " + notice)], []),
+            ):
+                data = snapshot([request, comment(notice)] + extra_comments, threads, more=True)
+                for script in ("check_codex_comments.sh", "wait_pr_codex.sh"):
+                    with self.subTest(notice=notice, script=script, extra=extra_comments, threads=threads):
+                        self.assert_gate(1, data, script)
+        # Account setup errors remain failures even though CI treats them as informational.
+        self.assert_gate(
+            1,
+            snapshot([request, comment(USAGE_LIMIT_NOTICES[0]), comment("Please create a Codex account to review.")]),
+            "wait_pr_codex.sh",
+        )
+
+    def test_usage_limit_skip_requires_a_fresh_unminimized_bot_notice(self):
+        request = comment("@codex review", "maintainer", REQUEST)
+        for notice in USAGE_LIMIT_NOTICES:
+            for author, created_at, minimized in (
+                (BOT, BEFORE, False),
+                ("human-reviewer", AFTER, False),
+                (BOT + "-impostor", AFTER, False),
+                (BOT, AFTER, True),
+            ):
+                with self.subTest(notice=notice, author=author, created_at=created_at, minimized=minimized):
+                    self.assert_gate(
+                        10,
+                        snapshot([request, comment(notice, author, created_at, minimized)]),
+                        "wait_pr_codex.sh",
+                    )
+
+    def test_usage_limits_still_wait_for_running_reviews(self):
+        request = comment("@codex review", "maintainer", REQUEST)
+        self.assert_gate(
+            10,
+            snapshot([request, comment(USAGE_LIMIT_NOTICES[0]), comment(FIXTURES["running_summary"]["body"])]),
+            "wait_pr_codex.sh",
+        )
 
     def test_only_authenticated_codex_authors_get_protocol_exemptions(self):
         comments = [
@@ -492,7 +586,7 @@ else:
                 + BOT
                 + '"; "'
                 + board_head(FIXTURES["summary"]["body"])
-                + '")]',
+                + '"; [])]',
             ],
             input=json.dumps(comments),
             text=True,
@@ -507,6 +601,11 @@ else:
             (BOT, BEFORE, 10),
             ("human-reviewer", AFTER, 10),
             (BOT, AFTER, 0),
+            # GitHub's GraphQL returns the reacting bot's User login with the
+            # [bot] suffix (comment authors come back without it).
+            (BOT + "[bot]", AFTER, 0),
+            (BOT + "[bot]", BEFORE, 10),
+            (BOT + "-impostor[bot]", AFTER, 10),
         ):
             with self.subTest(author=author, created_at=created_at):
                 data = snapshot(

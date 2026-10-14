@@ -6,8 +6,10 @@ import * as os from "os";
 import * as path from "path";
 import { Config } from "@/node/config";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
+import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import {
+  boundContainerMutation,
   isPositivelyAbsent,
   MCP_OVERRIDES_REVISION_UNAVAILABLE,
   readHostOverrideDocumentNoFollow,
@@ -2725,6 +2727,327 @@ describe("WorkspaceMcpOverridesService", () => {
     );
     expect((await service.getOverridesForWorkspace(victim.workspaceId)).overrides).toEqual({
       enabledServers: ["shots"],
+    });
+  });
+
+  /**
+   * Records every shell command a host runtime spawns (the real exec still
+   * runs). Callers must `restore()` in `finally`: nested prototype spies recurse.
+   */
+  function recordHostExecCommands(): { commands: string[]; restore: () => void } {
+    const commands: string[] = [];
+    // Called with the spied instance as `this` below.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    const realExec = LocalBaseRuntime.prototype.exec;
+    const spy = spyOn(LocalBaseRuntime.prototype, "exec").mockImplementation(function (
+      this: LocalBaseRuntime,
+      command,
+      options
+    ) {
+      commands.push(command);
+      return realExec.call(this, command, options);
+    });
+    return { commands, restore: () => spy.mockRestore() };
+  }
+  const isFileWriterCommand = (command: string) => /\b(rm|mv)\b/.test(command);
+
+  it("clearing settings on a host checkout removes every override document without a shell", async () => {
+    // A host exec child is a detached shell that can outlive a crashed lock
+    // holder and delete a successor's document (#4415): removal must run
+    // in-process, and still cover the canonical and legacy names.
+    const service = new WorkspaceMcpOverridesService(config);
+    const { workspaceId, workspacePath } = await registerWorkspace("host-clear");
+    await service.setOverridesForWorkspace(workspaceId, { enabledServers: ["shots"] });
+    const legacy = [".xum/mcp.local.json", ".mux/mcp.local.jsonc", ".mux/mcp.local.json"].map(
+      (relative) => path.join(workspacePath, relative)
+    );
+    for (const filePath of legacy) {
+      await fs.mkdir(path.dirname(filePath), { recursive: true });
+      await fs.writeFile(filePath, JSON.stringify({ enabledServers: ["legacy"] }));
+    }
+    const { commands, restore } = recordHostExecCommands();
+    try {
+      await service.setOverridesForWorkspace(workspaceId, {});
+    } finally {
+      restore();
+    }
+    for (const filePath of [path.join(workspacePath, ".xum", "mcp.local.jsonc"), ...legacy]) {
+      expect(await pathExists(filePath)).toBe(false);
+    }
+    expect(commands.filter(isFileWriterCommand)).toEqual([]);
+    expect((await service.getOverridesForWorkspace(workspaceId)).overrides).toEqual({});
+  });
+
+  it("clearing a host document surfaces removal failures other than absence", async () => {
+    // Callers (plugin uninstall tombstone retirement) rely on the clear
+    // rejecting when a document could not be removed.
+    const service = new WorkspaceMcpOverridesService(config);
+    const { workspaceId, workspacePath } = await registerWorkspace("host-clear-failure");
+    await service.setOverridesForWorkspace(workspaceId, { enabledServers: ["shots"] });
+    const unlinkSpy = spyOn(fsPromisesModule, "unlink").mockImplementation(() =>
+      Promise.reject(Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }))
+    );
+    try {
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(service.setOverridesForWorkspace(workspaceId, {})).rejects.toThrow(
+        "Failed to remove workspace MCP overrides file: EACCES"
+      );
+    } finally {
+      unlinkSpy.mockRestore();
+    }
+    expect(await pathExists(path.join(workspacePath, ".xum", "mcp.local.jsonc"))).toBe(true);
+  });
+
+  it("clearing a host checkout removes the canonical document last", async () => {
+    // Read precedence picks the first present document: if the process dies
+    // between unlinks, only lower-precedence fallbacks may be gone already —
+    // otherwise a stale fallback would resurrect the cleared settings.
+    const service = new WorkspaceMcpOverridesService(config);
+    const { workspaceId, workspacePath } = await registerWorkspace("host-clear-order");
+    await service.setOverridesForWorkspace(workspaceId, { enabledServers: ["shots"] });
+    const canonical = path.join(workspacePath, ".xum", "mcp.local.jsonc");
+    const fallbacks = [".xum/mcp.local.json", ".mux/mcp.local.jsonc", ".mux/mcp.local.json"].map(
+      (relative) => path.join(workspacePath, relative)
+    );
+    for (const filePath of fallbacks) {
+      await fs.mkdir(path.dirname(filePath), { recursive: true });
+      await fs.writeFile(filePath, JSON.stringify({ enabledServers: ["stale"] }));
+    }
+    const realUnlink = fsPromisesModule.unlink;
+    // The crash: the canonical unlink never happens.
+    const unlinkSpy = spyOn(fsPromisesModule, "unlink").mockImplementation((target) =>
+      target === canonical
+        ? Promise.reject(Object.assign(new Error("EIO: simulated crash"), { code: "EIO" }))
+        : realUnlink(target)
+    );
+    try {
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(service.setOverridesForWorkspace(workspaceId, {})).rejects.toThrow("EIO");
+    } finally {
+      unlinkSpy.mockRestore();
+    }
+    for (const filePath of fallbacks) {
+      expect(await pathExists(filePath)).toBe(false);
+    }
+    expect(await pathExists(canonical)).toBe(true);
+    expect((await service.getOverridesForWorkspace(workspaceId)).overrides).toEqual({
+      enabledServers: ["shots"],
+    });
+  });
+
+  it("clearing a devcontainer workspace keeps the exec path, bounded in the container", async () => {
+    // A devcontainer's name-derived workspacePath may not be its persisted
+    // host checkout, and a host unlink would follow a symlink the container
+    // swapped in (#4696). The container-side `rm` must still not outlive this
+    // process indefinitely (#4481): it runs under boundContainerMutation.
+    const service = new WorkspaceMcpOverridesService(config);
+    const checkout = path.join(config.srcDir, "devcontainer-clear");
+    const filePath = path.join(checkout, ".xum", "mcp.local.jsonc");
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, JSON.stringify({ disabledServers: ["shots"] }));
+    const runtime = createRuntime({ type: "local" }, { projectPath: checkout });
+    const commands: string[] = [];
+    const recording = Object.create(runtime) as typeof runtime;
+    recording.exec = (command, options) => {
+      commands.push(command);
+      return runtime.exec(command, options);
+    };
+    const removeOverridesFile = (
+      service as unknown as { removeOverridesFile: (...args: unknown[]) => Promise<void> }
+    ).removeOverridesFile.bind(service);
+    await removeOverridesFile(recording, checkout, {
+      type: "devcontainer",
+      configPath: ".devcontainer/devcontainer.json",
+    });
+    // Lowest read precedence first, canonical last: a kill at the bound
+    // between operands must never leave a stale fallback authoritative.
+    const rm = `rm -f ${[".mux/mcp.local.json", ".mux/mcp.local.jsonc", ".xum/mcp.local.json", ".xum/mcp.local.jsonc"].map((relative) => `"${relative}"`).join(" ")}`;
+    expect(commands).toEqual([boundContainerMutation(rm)]);
+    expect(await pathExists(filePath)).toBe(false);
+  });
+
+  describe("boundContainerMutation", () => {
+    // Run exactly as DevcontainerRuntime.exec composes it: `cd <cwd> && <command>`.
+    const runInShell = async (dir: string, command: string) => {
+      const runtime = createRuntime({ type: "local" }, { projectPath: dir });
+      const started = Date.now();
+      const result = await execBuffered(runtime, `cd "${dir}" && ${command}`, {
+        cwd: dir,
+        timeout: 30,
+      });
+      return { ...result, elapsedMs: Date.now() - started };
+    };
+
+    it("preserves the mutation's exit code and working directory", async () => {
+      const dir = path.join(config.srcDir, "bounded-ok");
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(path.join(dir, "doc"), "x");
+      expect((await runInShell(dir, boundContainerMutation('rm -f "doc"'))).exitCode).toBe(0);
+      expect(await pathExists(path.join(dir, "doc"))).toBe(false);
+      expect((await runInShell(dir, boundContainerMutation("exit 3"))).exitCode).toBe(3);
+    });
+
+    it("never runs the mutation when the cd prefix fails", async () => {
+      const dir = path.join(config.srcDir, "bounded-cd");
+      await fs.mkdir(dir, { recursive: true });
+      const runtime = createRuntime({ type: "local" }, { projectPath: dir });
+      const result = await execBuffered(
+        runtime,
+        `cd "${path.join(dir, "missing")}" && ${boundContainerMutation('touch "marker"')}`,
+        { cwd: dir, timeout: 30 }
+      );
+      expect(result.exitCode).not.toBe(0);
+      expect(await pathExists(path.join(dir, "marker"))).toBe(false);
+    });
+
+    it("kills a stuck mutation and its children at the bound", async () => {
+      const dir = path.join(config.srcDir, "bounded-stuck");
+      await fs.mkdir(dir, { recursive: true });
+      // A compound mutation whose first step hangs: the kill must reach the
+      // whole group, so the second step can never run later.
+      const result = await runInShell(
+        dir,
+        boundContainerMutation('echo $BASHPID > "pid"; sleep 30; touch "marker"', 1)
+      );
+      expect(result.exitCode).not.toBe(0);
+      expect(result.elapsedMs).toBeLessThan(15_000);
+      const pid = Number((await fs.readFile(path.join(dir, "pid"), "utf8")).trim());
+      expect(Number.isInteger(pid) && pid > 0).toBe(true);
+      const alive = () => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      // The killed process may linger briefly as an unreaped zombie.
+      for (let i = 0; i < 100 && alive(); i++) await new Promise((r) => setTimeout(r, 20));
+      expect(alive()).toBe(false);
+      expect(await pathExists(path.join(dir, "marker"))).toBe(false);
+    });
+  });
+
+  describe("migration rollback (removeExactDocument)", () => {
+    type RemoveExactDocument = (
+      runtime: ReturnType<typeof createRuntime>,
+      workspacePath: string,
+      filePath: string,
+      expectedContent: string,
+      runtimeConfig: unknown
+    ) => Promise<void>;
+    const setup = async (name: string) => {
+      const service = new WorkspaceMcpOverridesService(config);
+      const workspacePath = path.join(config.srcDir, name);
+      const filePath = path.join(workspacePath, ".xum", "mcp.local.jsonc");
+      await fs.mkdir(path.dirname(filePath), { recursive: true });
+      const runtime = createRuntime({ type: "local" }, { projectPath: workspacePath });
+      const removeExactDocument = (
+        service as unknown as { removeExactDocument: RemoveExactDocument }
+      ).removeExactDocument.bind(service);
+      return { workspacePath, filePath, runtime, removeExactDocument };
+    };
+    const ours = JSON.stringify({ enabledServers: ["ours"] });
+
+    it("deletes only its own document on the host, without a shell", async () => {
+      const { workspacePath, filePath, runtime, removeExactDocument } = await setup("rb-ours");
+      await fs.writeFile(filePath, ours);
+      const replaced = JSON.stringify({ enabledServers: ["replaced"] });
+      const { commands, restore } = recordHostExecCommands();
+      try {
+        await removeExactDocument(runtime, workspacePath, filePath, ours, { type: "local" });
+        expect(await fs.readdir(path.dirname(filePath))).toEqual([]);
+
+        await fs.writeFile(filePath, replaced);
+        await removeExactDocument(runtime, workspacePath, filePath, ours, { type: "local" });
+      } finally {
+        restore();
+      }
+      expect(await fs.readFile(filePath, "utf8")).toBe(replaced);
+      expect(await fs.readdir(path.dirname(filePath))).toEqual(["mcp.local.jsonc"]);
+      expect(commands).toEqual([]);
+    });
+
+    it("never clobbers a newer document that appeared while ours was aside", async () => {
+      const { workspacePath, filePath, runtime, removeExactDocument } = await setup("rb-newer");
+      await fs.writeFile(filePath, JSON.stringify({ enabledServers: ["older"] }));
+      const newer = JSON.stringify({ enabledServers: ["newer"] });
+      const realLink = fsPromisesModule.link;
+      // A successor saves while the replaced document is held aside.
+      const linkSpy = spyOn(fsPromisesModule, "link").mockImplementation(
+        async (existing, target) => {
+          await fs.writeFile(filePath, newer);
+          return realLink(existing, target);
+        }
+      );
+      try {
+        await removeExactDocument(runtime, workspacePath, filePath, ours, { type: "local" });
+      } finally {
+        linkSpy.mockRestore();
+      }
+      expect(await fs.readFile(filePath, "utf8")).toBe(newer);
+      // The obsolete aside copy is dropped (same as `mv -n … && rm -f`).
+      expect(await fs.readdir(path.dirname(filePath))).toEqual(["mcp.local.jsonc"]);
+    });
+
+    it("keeps the shell path for exec-backed runtimes", async () => {
+      const { workspacePath, filePath, runtime, removeExactDocument } = await setup("rb-remote");
+      const commands: string[] = [];
+      const recording = Object.create(runtime) as typeof runtime;
+      recording.exec = (command, options) => {
+        commands.push(command);
+        return runtime.exec(command, options);
+      };
+      await fs.writeFile(filePath, ours);
+      await removeExactDocument(recording, workspacePath, filePath, ours, {
+        type: "ssh",
+        host: "remote",
+        srcBaseDir: "/remote",
+      });
+      expect(await pathExists(filePath)).toBe(false);
+      expect(commands.some((command) => command.startsWith("mv "))).toBe(true);
+
+      commands.length = 0;
+      await fs.writeFile(filePath, ours);
+      const removeOverridesFile = (
+        service: WorkspaceMcpOverridesService
+      ): ((...args: unknown[]) => Promise<void>) =>
+        (
+          service as unknown as { removeOverridesFile: (...args: unknown[]) => Promise<void> }
+        ).removeOverridesFile.bind(service);
+      await removeOverridesFile(new WorkspaceMcpOverridesService(config))(
+        recording,
+        workspacePath,
+        { type: "ssh", host: "remote", srcBaseDir: "/remote" }
+      );
+      expect(await pathExists(filePath)).toBe(false);
+      expect(commands.some((command) => command.startsWith("rm -f "))).toBe(true);
+    });
+
+    it("bounds every container-side mv/rm of a devcontainer rollback (#4481)", async () => {
+      const { workspacePath, filePath, runtime, removeExactDocument } = await setup("rb-container");
+      const commands: string[] = [];
+      const recording = Object.create(runtime) as typeof runtime;
+      recording.exec = (command, options) => {
+        commands.push(command);
+        return runtime.exec(command, options);
+      };
+      const devcontainer = { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" };
+      await fs.writeFile(filePath, ours);
+      await removeExactDocument(recording, workspacePath, filePath, ours, devcontainer);
+      expect(await pathExists(filePath)).toBe(false);
+      const replaced = JSON.stringify({ enabledServers: ["replaced"] });
+      await fs.writeFile(filePath, replaced);
+      await removeExactDocument(recording, workspacePath, filePath, ours, devcontainer);
+      expect(await fs.readFile(filePath, "utf8")).toBe(replaced);
+      expect(await fs.readdir(path.dirname(filePath))).toEqual(["mcp.local.jsonc"]);
+      // mv + rm (ours), then mv + mv -n/rm (replaced): all four bounded.
+      expect(commands).toHaveLength(4);
+      for (const command of commands) {
+        const inner = /^\{ set -m; \( (.*) \) & w=/.exec(command)?.[1];
+        expect(inner).toBeDefined();
+        expect(command).toBe(boundContainerMutation(inner!));
+      }
     });
   });
 

@@ -15,7 +15,6 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
 import { SLASH_COMMAND_HINTS } from "@/common/constants/slashCommandHints";
 import { assert } from "@/common/utils/assert";
-import { isExperimentEnabled as readExperimentEnabled } from "@/browser/hooks/useExperiments";
 import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import { parseGoalBudgetInputCents } from "@/common/utils/goals/budgetParser";
 import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constants/heartbeat";
@@ -270,6 +269,25 @@ const modelCommandDefinition: SlashCommandDefinition = {
   },
 };
 
+const speedModeCommandDefinitions: SlashCommandDefinition[] = (["fast", "ultrafast"] as const).map(
+  (mode) => ({
+    key: mode,
+    description: `Toggle ${mode === "fast" ? "Fast" : "Ultrafast"} mode (faster responses at higher cost)`,
+    appendSpace: false,
+    handler: ({ cleanRemainingTokens }): ParsedCommand => {
+      if (cleanRemainingTokens.length > 0) {
+        return {
+          type: "command-invalid-args",
+          command: mode,
+          input: cleanRemainingTokens.join(" "),
+          usage: `/${mode}`,
+        };
+      }
+      return { type: "speed-mode-toggle", mode };
+    },
+  })
+);
+
 const vimCommandDefinition: SlashCommandDefinition = {
   key: "vim",
   description: "Toggle Vim mode for the chat input",
@@ -346,6 +364,31 @@ const newCommandDefinition: SlashCommandDefinition = {
   },
 };
 
+// Opening a side chat is separate from sending a question: let the user compose in the new pane.
+const parseSideCommand: NonNullable<SlashCommandDefinition["handler"]> = ({
+  rawInput,
+  definition,
+}) => {
+  const input = rawInput.trim();
+  return input.length === 0
+    ? { type: "side" }
+    : { type: "command-invalid-args", command: definition.key, input, usage: `/${definition.key}` };
+};
+
+const sideCommandDefinition: SlashCommandDefinition = {
+  key: "side",
+  description: "Open a new side chat next to this chat. Closing it discards it.",
+  appendSpace: false,
+  handler: parseSideCommand,
+};
+
+const btwCommandDefinition: SlashCommandDefinition = {
+  key: "btw",
+  description: "Alias for /side.",
+  appendSpace: false,
+  handler: parseSideCommand,
+};
+
 const IDLE_USAGE = `/idle ${SLASH_COMMAND_HINTS.idle}`;
 const HEARTBEAT_USAGE = `/heartbeat ${SLASH_COMMAND_HINTS.heartbeat}`;
 const HEARTBEAT_INTERVAL_GRANULARITY_MS = 60_000;
@@ -400,7 +443,6 @@ const idleCommandDefinition: SlashCommandDefinition = {
 
 const heartbeatCommandDefinition: SlashCommandDefinition = {
   key: "heartbeat",
-  experimentGate: EXPERIMENT_IDS.WORKSPACE_HEARTBEATS,
   description: `Configure workspace heartbeats. Usage: ${HEARTBEAT_USAGE}`,
   inputHint: SLASH_COMMAND_HINTS.heartbeat,
   appendSpace: false,
@@ -664,7 +706,6 @@ const WORKFLOW_COMMAND_USAGE = `/workflow ${SLASH_COMMAND_HINTS.workflow}`;
 const workflowCommandDefinition: SlashCommandDefinition = {
   key: "workflow",
   description: "Run an explicit workflow by script path",
-  experimentGate: EXPERIMENT_IDS.DYNAMIC_WORKFLOWS,
   inputHint: SLASH_COMMAND_HINTS.workflow,
   handler: ({ rawInput }): ParsedCommand => {
     const trimmed = rawInput.trim();
@@ -699,7 +740,10 @@ export const SLASH_COMMAND_DEFINITIONS: readonly SlashCommandDefinition[] = [
 
   forkCommandDefinition,
   newCommandDefinition,
+  sideCommandDefinition,
+  btwCommandDefinition,
   vimCommandDefinition,
+  ...speedModeCommandDefinitions,
   idleCommandDefinition,
   heartbeatCommandDefinition,
   goalCommandDefinition,
@@ -738,13 +782,7 @@ export function isSlashCommandVisible(
     return true;
   }
 
-  try {
-    const resolveExperiment = context.isExperimentEnabled ?? readExperimentEnabled;
-    return resolveExperiment(definition.experimentGate) === true;
-  } catch {
-    // Experiment check unavailable (e.g., test environments without window) — hide by default.
-    return false;
-  }
+  return context.isExperimentEnabled?.(definition.experimentGate) === true;
 }
 
 export function getCommandGhostHint(

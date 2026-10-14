@@ -80,6 +80,12 @@ export function getExplicitGatewayPrefix(modelString: string): ProviderName | un
   return PROVIDER_DEFINITIONS[providerName]?.kind === "gateway" ? providerName : undefined;
 }
 
+function sdkProviderOptionsNamespace(provider: string): string {
+  // Meta reuses the OpenAI Responses adapter. Saved provider extras must reach
+  // that SDK namespace too, not just the built-in reasoning options.
+  return provider === "meta" ? "openai" : provider;
+}
+
 /**
  * Resolve which providerOptions namespace a request will use for a given
  * canonical origin and route provider. Passthrough gateways (mux-gateway)
@@ -98,10 +104,10 @@ export function resolveProviderOptionsNamespaceKey(
       "passthrough" in routeDefinition &&
       routeDefinition.passthrough === true)
   ) {
-    return canonicalProviderName;
+    return sdkProviderOptionsNamespace(canonicalProviderName);
   }
 
-  return routeProvider;
+  return sdkProviderOptionsNamespace(routeProvider);
 }
 
 /**
@@ -188,7 +194,9 @@ const ANTHROPIC_NATIVE_1M_PATTERNS = [
   new RegExp(`^claude-opus-4-7${OPTIONAL_VERSION_SUFFIX}$`, "i"),
   new RegExp(`^claude-opus-4-6${OPTIONAL_VERSION_SUFFIX}$`, "i"),
   new RegExp(`^claude-sonnet-5${OPTIONAL_VERSION_SUFFIX}$`, "i"),
+  new RegExp(`^claude-sonnet-5-5${OPTIONAL_VERSION_SUFFIX}$`, "i"),
   new RegExp(`^claude-sonnet-4-6${OPTIONAL_VERSION_SUFFIX}$`, "i"),
+  new RegExp(`^claude-haiku-5-5${OPTIONAL_VERSION_SUFFIX}$`, "i"),
 ];
 const ANTHROPIC_BETA_1M_PATTERNS = [
   new RegExp(`^claude-sonnet-4-5${OPTIONAL_VERSION_SUFFIX}$`, "i"),
@@ -273,11 +281,4 @@ export function supports1MContext(
   providersConfig?: Record<string, unknown> | null
 ): boolean {
   return getAnthropic1MContextMode(modelString, providersConfig) === "beta";
-}
-
-export function hasNative1MContext(
-  modelString: string,
-  providersConfig?: Record<string, unknown> | null
-): boolean {
-  return getAnthropic1MContextMode(modelString, providersConfig) === "native";
 }

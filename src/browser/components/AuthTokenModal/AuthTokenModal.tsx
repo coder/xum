@@ -12,6 +12,12 @@ import { Button } from "@/browser/components/Button/Button";
 import { getBrowserBackendBaseUrl } from "@/browser/utils/backendBaseUrl";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isAbortError } from "@/browser/utils/isAbortError";
+import {
+  readPersistedRawString,
+  removePersistedStateKeys,
+  writePersistedRawString,
+} from "@/browser/hooks/usePersistedState";
+import { AUTH_TOKEN_KEY } from "@/common/constants/storage";
 
 interface AuthTokenModalProps {
   isOpen: boolean;
@@ -31,27 +37,19 @@ interface GithubLoginStartResponse {
   error?: string;
 }
 
-const AUTH_TOKEN_STORAGE_KEY = "mux:auth-token";
-
+// Stored raw (not JSON-encoded): older builds read this key with a raw getItem, so a JSON-quoted
+// token would break authentication after a downgrade.
 export function getStoredAuthToken(): string | null {
-  try {
-    return localStorage.getItem(AUTH_TOKEN_STORAGE_KEY);
-  } catch {
-    return null;
-  }
+  return readPersistedRawString(AUTH_TOKEN_KEY);
 }
 
 export function setStoredAuthToken(token: string): void {
-  try {
-    localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token);
-  } catch {
-    // Ignore storage errors
-  }
+  writePersistedRawString(AUTH_TOKEN_KEY, token);
 }
 
 export function clearStoredAuthToken(): void {
   try {
-    localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+    removePersistedStateKeys([AUTH_TOKEN_KEY]);
   } catch {
     // Ignore storage errors
   }

@@ -6,6 +6,8 @@ import { describe, expect, it } from "bun:test";
 
 import type { ProvidersConfig } from "@/node/config";
 import {
+  buildProvidersFromEnv,
+  providerSecretEnvVarNames,
   hasAnyConfiguredProvider,
   isProviderAutoRouteEligible,
   resolveCustomProviderCredentials,
@@ -152,6 +154,59 @@ describe("hasAnyConfiguredProvider", () => {
     };
 
     expect(hasAnyConfiguredProvider(providers)).toBe(false);
+  });
+});
+
+describe("resolveProviderCredentials - Meta", () => {
+  it.each(["META_MODEL_API_KEY", "MODEL_API_KEY"])(
+    "resolves and bootstraps Meta via %s without borrowing OpenAI's key",
+    (key) => {
+      const env = { [key]: " meta-test-key ", OPENAI_API_KEY: "other-provider-key" };
+      expect(resolveProviderCredentials("meta", {}, env)).toMatchObject({
+        isConfigured: true,
+        apiKey: "meta-test-key",
+        apiKeySource: "env",
+      });
+      expect(buildProvidersFromEnv(env).meta).toEqual({ apiKey: "meta-test-key" });
+      expect(
+        resolveProviderCredentials("meta", {}, { OPENAI_API_KEY: "other-provider-key" })
+          .isConfigured
+      ).toBe(false);
+      expect(providerSecretEnvVarNames()).toContain(key);
+    }
+  );
+
+  it("prefers the namespaced Meta key and falls back when it is empty", () => {
+    expect(
+      resolveProviderCredentials(
+        "meta",
+        {},
+        {
+          META_MODEL_API_KEY: "namespaced-key",
+          MODEL_API_KEY: "official-key",
+        }
+      ).apiKey
+    ).toBe("namespaced-key");
+    expect(
+      resolveProviderCredentials(
+        "meta",
+        {},
+        {
+          META_MODEL_API_KEY: " ",
+          MODEL_API_KEY: "official-key",
+        }
+      ).apiKey
+    ).toBe("official-key");
+  });
+
+  it("prefers saved Meta credentials and excludes disabled Meta from auto-routing", () => {
+    const env = { META_MODEL_API_KEY: "env-key" };
+    expect(resolveProviderCredentials("meta", { apiKey: "saved-key" }, env)).toMatchObject({
+      apiKey: "saved-key",
+      apiKeySource: "config",
+    });
+    expect(isProviderAutoRouteEligible("meta", {}, env)).toBe(true);
+    expect(isProviderAutoRouteEligible("meta", { enabled: false }, env)).toBe(false);
   });
 });
 

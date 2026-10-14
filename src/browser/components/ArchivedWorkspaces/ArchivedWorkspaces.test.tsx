@@ -3,16 +3,17 @@ import "../../../../tests/ui/dom";
 import { type ComponentProps, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
   waitFor,
   waitForElementToBeRemoved,
+  within,
 } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
 import * as APIModule from "@/browser/contexts/API";
 import type { APIClient } from "@/browser/contexts/API";
-import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import * as TooltipModule from "@/browser/components/Tooltip/Tooltip";
 import * as ForceDeleteModalModule from "@/browser/components/ForceDeleteModal/ForceDeleteModal";
@@ -35,18 +36,8 @@ import {
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 
 import { ArchivedWorkspaces } from "./ArchivedWorkspaces";
-
-function installTestDoubles() {
-  // Re-register the full WorkspaceStore mock before each test to avoid Bun's global mock leakage.
-  /* eslint-disable @typescript-eslint/no-require-imports */
-  const actualWorkspaceStore =
-    require("@/browser/stores/WorkspaceStore?real=1") as typeof WorkspaceStoreModule;
-  /* eslint-enable @typescript-eslint/no-require-imports */
-
-  void mock.module("@/browser/stores/WorkspaceStore", () => ({
-    ...actualWorkspaceStore,
-  }));
-}
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
+import type { Result } from "@/common/types/result";
 
 function stubPageChrome() {
   spyOn(AgentContextModule, "AgentProvider").mockImplementation((props) => <>{props.children}</>);
@@ -66,17 +57,27 @@ function stubPageChrome() {
   }));
 }
 
-function stubPageApi(list: APIClient["workspace"]["list"], getSessionUsageBatch: unknown) {
-  const api = {
+// Like the server, the metadata stream opens with a snapshot equal to workspace.list(input).
+function stubPageApi(
+  list: APIClient["workspace"]["list"],
+  getSessionUsageBatch: TestApiOverrides<APIClient["workspace"]>["getSessionUsageBatch"],
+  onMetadata: TestApiOverrides<APIClient["workspace"]>["onMetadata"] = (input) =>
+    Promise.resolve(
+      (async function* () {
+        yield { type: "snapshot" as const, workspaces: await list(input) };
+      })()
+    )
+) {
+  const api = createTestApiClient({
     workspace: {
       list,
       getSessionUsageBatch,
-      onMetadata: async function* () {
-        yield* await Promise.resolve([]);
-      },
+      onMetadata,
     },
-    projects: { listBranches: () => Promise.resolve({ branches: ["main"] }) },
-  } as unknown as APIClient;
+    projects: {
+      listBranches: () => Promise.resolve({ branches: ["main"], recommendedTrunk: "main" }),
+    },
+  });
   spyOn(APIModule, "useAPI").mockImplementation(() => ({
     api,
     status: "connected",
@@ -109,7 +110,9 @@ function createWorkspace(overrides: Partial<FrontendWorkspaceMetadata>): Fronten
 let cleanupDom: (() => void) | null = null;
 
 describe("ArchivedWorkspaces", () => {
-  const deleteWorktreeMock = mock(() => Promise.resolve({ success: true }));
+  const deleteWorktreeMock = mock(
+    (): Promise<Result<void>> => Promise.resolve({ success: true, data: undefined })
+  );
   const getSessionUsageBatchMock = mock(() => Promise.resolve({}));
   const unarchiveWorkspaceMock = mock(() => Promise.resolve({ success: true }));
   const removeWorkspaceMock = mock(
@@ -124,7 +127,6 @@ describe("ArchivedWorkspaces", () => {
 
   beforeEach(() => {
     modalProps = undefined;
-    installTestDoubles();
     cleanupDom = installDom();
     deleteWorktreeMock.mockClear();
     getSessionUsageBatchMock.mockClear();
@@ -135,12 +137,12 @@ describe("ArchivedWorkspaces", () => {
     localStorage.clear();
 
     spyOn(APIModule, "useAPI").mockImplementation(() => ({
-      api: {
+      api: createTestApiClient({
         workspace: {
           deleteWorktree: deleteWorktreeMock,
           getSessionUsageBatch: getSessionUsageBatchMock,
         },
-      } as unknown as APIClient,
+      }),
       status: "connected",
       error: null,
       authenticate: () => undefined,
@@ -319,6 +321,61 @@ describe("ArchivedWorkspaces", () => {
         undefined
       )
     ).toEqual([]);
+  });
+
+  test("keeps an archive event that follows the snapshot over a stale archived list", async () => {
+    stubPageChrome();
+    const workspace = createWorkspace({ id: "archived-late", name: "archived-late" });
+    const staleList = Promise.withResolvers<FrontendWorkspaceMetadata[]>();
+    // A separate list() requested before the archive would answer without it.
+    const list = mock(() => staleList.promise);
+    stubPageApi(list, getSessionUsageBatchMock, () =>
+      Promise.resolve(
+        (async function* () {
+          yield { type: "snapshot" as const, workspaces: await Promise.resolve([]) };
+          yield { workspaceId: workspace.id, metadata: workspace };
+        })()
+      )
+    );
+    updatePersistedState(getArchivedWorkspacesExpandedKey(workspace.projectPath), true);
+    const view = render(
+      <ProjectPage
+        {...pageProps}
+        projectPath={workspace.projectPath}
+        projectName={workspace.projectName}
+      />
+    );
+    await waitFor(() => view.getByLabelText("Restore workspace archived-late"));
+    await act(async () => {
+      staleList.resolve([]);
+      await staleList.promise;
+    });
+    expect(view.getByLabelText("Restore workspace archived-late")).toBeTruthy();
+  });
+
+  test.each([
+    { when: "before", snapshot: false, shows: "Failed to load archived workspaces" },
+    { when: "after", snapshot: true, shows: "No archived workspaces" },
+  ])("an archived stream that ends $when its snapshot shows $shows", async (row) => {
+    stubPageChrome();
+    stubPageApi(
+      mock(() => Promise.resolve([])),
+      getSessionUsageBatchMock,
+      () =>
+        Promise.resolve(
+          (async function* () {
+            await Promise.resolve();
+            if (row.snapshot) yield { type: "snapshot" as const, workspaces: [] };
+          })()
+        )
+    );
+    updatePersistedState(getArchivedWorkspacesExpandedKey("/tmp/project"), true);
+    const view = render(
+      <ProjectPage {...pageProps} projectPath="/tmp/project" projectName="project" />
+    );
+    const regionText = () => view.getByRole("region", { name: "Archived workspaces" }).textContent;
+    await waitFor(() => expect(regionText()).toContain(row.shows));
+    expect(regionText()).not.toContain(row.snapshot ? "Failed to load" : "No archived workspaces");
   });
 
   test("distinguishes a pending archive load from an empty archive", () => {
@@ -524,6 +581,96 @@ describe("ArchivedWorkspaces", () => {
     expect(removeWorkspaceMock).toHaveBeenNthCalledWith(1, workspace.id);
     expect(removeWorkspaceMock).toHaveBeenNthCalledWith(2, workspace.id, { force: true });
     expect(modalProps).toBeUndefined();
+  });
+
+  // #5143: forced paths that skip the Force Delete dialog show what the removal left behind.
+  const leftover = "The devcontainer container labeled x was left behind";
+  const successWithLeftover: WorkspaceRemoveResult = {
+    success: true,
+    warnings: [{ kind: "leftover", description: leftover }],
+  };
+
+  test("bulk deletion shows what a forced removal left behind", async () => {
+    const workspace = createWorkspace({ id: "ws-left", name: "left" });
+    removeWorkspaceMock.mockResolvedValueOnce(successWithLeftover);
+    const view = render(
+      <ArchivedWorkspaces
+        projectPath={workspace.projectPath}
+        projectName={workspace.projectName}
+        workspaces={[workspace]}
+        onWorkspacesChanged={onWorkspacesChangedMock}
+      />
+    );
+    fireEvent.click(view.getByLabelText("Expand archived workspaces"));
+    fireEvent.click(await waitFor(() => view.getByLabelText("Select left")));
+    fireEvent.click(view.getByLabelText("Delete selected"));
+    fireEvent.click(view.getByRole("button", { name: "Yes, delete 1" }));
+
+    // Inside the progress dialog: a popover beside it would be aria-hidden by the modal and
+    // cleared by the click on Done.
+    const dialog = await view.findByRole("dialog");
+    const status = await within(dialog).findByRole("status");
+    expect(status.textContent).toContain(leftover);
+    expect(status.textContent).toContain(workspace.name);
+  });
+
+  test("Shift-click shows what the forced removal left behind", async () => {
+    const workspace = createWorkspace({ id: "parent", name: "parent" });
+    removeWorkspaceMock.mockResolvedValueOnce({
+      success: false,
+      error: "Container teardown failed",
+    });
+    removeWorkspaceMock.mockResolvedValueOnce(successWithLeftover);
+    const view = render(
+      <ArchivedWorkspaces
+        projectPath={workspace.projectPath}
+        projectName={workspace.projectName}
+        workspaces={[workspace]}
+        onWorkspacesChanged={onWorkspacesChangedMock}
+      />
+    );
+    fireEvent.click(view.getByLabelText("Expand archived workspaces"));
+    fireEvent.click(await waitFor(() => view.getByLabelText("Delete workspace parent")), {
+      shiftKey: true,
+    });
+
+    const alert = await view.findByRole("alert");
+    expect(alert.textContent).toContain(leftover);
+    expect(removeWorkspaceMock).toHaveBeenNthCalledWith(2, workspace.id, { force: true });
+    expect(onWorkspacesChangedMock).toHaveBeenCalledTimes(1);
+    expect(modalProps).toBeUndefined();
+    // The row is gone, so the warning must survive an unrelated click until dismissed.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    fireEvent.click(document.body);
+    expect(view.getByRole("alert").textContent).toContain(leftover);
+    fireEvent.click(view.getByRole("button", { name: "Dismiss" }));
+    expect(view.queryByRole("alert")).toBeNull();
+  });
+
+  test("a Force Delete retry shows what it left behind", async () => {
+    const workspace = createWorkspace({ id: "parent", name: "parent" });
+    removeWorkspaceMock.mockResolvedValueOnce({
+      success: false,
+      error: "Container teardown failed",
+    });
+    const view = render(
+      <ArchivedWorkspaces
+        projectPath={workspace.projectPath}
+        projectName={workspace.projectName}
+        workspaces={[workspace]}
+        onWorkspacesChanged={onWorkspacesChangedMock}
+      />
+    );
+    fireEvent.click(view.getByLabelText("Expand archived workspaces"));
+    fireEvent.click(await waitFor(() => view.getByLabelText("Delete workspace parent")));
+    await waitFor(() => expect(modalProps).toBeDefined());
+    removeWorkspaceMock.mockResolvedValueOnce(successWithLeftover);
+
+    await act(async () => {
+      await modalProps?.onForceDelete(workspace.id, undefined);
+    });
+
+    expect(view.getByRole("alert").textContent).toContain(leftover);
   });
 
   test("shows delete worktree for archived worktree workspaces and calls the API", async () => {

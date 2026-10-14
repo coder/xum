@@ -21,6 +21,7 @@ import {
   type HighlightedChunk,
 } from "@/browser/utils/highlighting/highlightDiffChunk";
 import { LRUCache } from "lru-cache";
+import { DIFF_ADDED_TEXT_COLOR, DIFF_REMOVED_TEXT_COLOR } from "@/constants/diffColors";
 import {
   highlightSearchMatches,
   type SearchHighlightConfig,
@@ -103,9 +104,11 @@ const splitDiffLines = (diff: string): string[] => {
 };
 
 // Line number color - brighter for changed lines, dimmed for context.
+// Context numbers stay dimmer than changed ones but reach WCAG AA (4.5:1) in every theme (#5985):
+// plain --color-muted is 4.47:1 on flexoki-light's code background, so mix in some text color.
 const getLineNumberColor = (type: DiffLineType): string => {
   return type === "context"
-    ? "color-mix(in srgb, var(--color-muted) 40%, transparent)"
+    ? "color-mix(in srgb, var(--color-muted), var(--color-text) 15%)"
     : "var(--color-text)";
 };
 
@@ -149,12 +152,13 @@ const doesLineMatchReviewRange = (
   return matchesOld || matchesNew;
 };
 
+// The +/- signs use the shared AA-tuned added/removed text colors (#5985).
 const getIndicatorColor = (type: DiffLineType): string => {
   switch (type) {
     case "add":
-      return "var(--color-success)";
+      return DIFF_ADDED_TEXT_COLOR;
     case "remove":
-      return "var(--color-danger)";
+      return DIFF_REMOVED_TEXT_COLOR;
     default:
       return "transparent";
   }

@@ -12,15 +12,27 @@ export type NewContextResult = z.infer<typeof TOOL_DEFINITIONS.new_context.resul
  * same rollover continuation the automatic token budget uses; on restart, AgentSession recovers
  * an unconsumed receipt from the current window's last completed assistant message.
  */
-export const createNewContextTool: ToolFactory = (_config: ToolConfiguration) =>
+export const createNewContextTool: ToolFactory = (config: ToolConfiguration) =>
   tool({
     description: TOOL_DEFINITIONS.new_context.description,
     inputSchema: TOOL_DEFINITIONS.new_context.schema,
     execute: (): Promise<NewContextResult> =>
-      Promise.resolve({
-        success: true,
-        status: "scheduled",
-        message:
-          "A fresh context window starts after this tool step settles. Finish any notes now; completed tool results stay retrievable through session_history.",
-      }),
+      Promise.resolve(
+        // The tool is registered even while auto-compaction at 100% disables
+        // rollover, so a settings edit does not change the tool block (prompt
+        // cache, #5249). Refuse then: a successful result is a durable receipt
+        // that a later send would honor once rollover is re-enabled.
+        config.contextBudgetRolloverAvailable === false
+          ? {
+              success: false,
+              code: "rollover_disabled",
+              error:
+                "Automatic rollover is disabled (auto-compaction threshold 100%), so no new context window can start. Continue in this window.",
+            }
+          : {
+              success: true,
+              status: "scheduled",
+              message: "A new context window will start without summarizing conversation history.",
+            }
+      ),
   });

@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import { isPlainObject } from "@/common/utils/isPlainObject";
+import { isNonNegativeInteger } from "@/common/utils/numbers";
 import { createHash } from "node:crypto";
 import assert from "node:assert";
 import {
@@ -13,14 +14,19 @@ import {
   SESSION_HISTORY_RESET_PROBE_CHARS,
   SESSION_HISTORY_MAX_SCAN_ROWS,
   SESSION_HISTORY_MAX_LINE_BYTES,
+  SESSION_HISTORY_COMPACTION_BOUNDARY_NEEDLE,
+  SESSION_HISTORY_MAX_BOUNDARY_ROW_BYTES,
 } from "@/common/constants/contextBudget";
 import type { MuxMessage } from "@/common/types/message";
 import { getContextWindowId, isManualHistoryReset } from "@/common/utils/messages/contextWindows";
 import {
   getContextBoundaryKind,
+  isDurableCompactionBoundaryMarker,
   isDurableContextBoundaryMarker,
 } from "@/common/utils/messages/compactionBoundary";
 import { normalizeLegacyMuxMetadata } from "@/node/utils/messages/legacy";
+import { normalizePersistedMessage } from "@/node/utils/messages/normalizePersistedMessage";
+import { EventLoopYielder } from "@/node/utils/concurrency/eventLoopYielder";
 import {
   isHistoryIdentifierRepresentable,
   type HistoryArtifact,
@@ -28,25 +34,11 @@ import {
   type HistorySnapshot,
 } from "./historyCursor";
 import type { CompactionPendingBoundary as PendingBoundary } from "./compactionPendingState";
+import { log } from "./log";
+import { projectStatusHistoryRow } from "./historyStatusProjection";
 
 const [resetKeyToken, resetValueToken] = SESSION_HISTORY_RESET_NEEDLE.split(":");
-const resetTokenPattern = new RegExp(
-  [resetKeyToken, resetValueToken, ":"]
-    .map((token) =>
-      [...token]
-        .map((character) => {
-          const hex = character
-            .charCodeAt(0)
-            .toString(16)
-            .padStart(4, "0")
-            .replace(/[a-f]/g, (letter) => `[${letter}${letter.toUpperCase()}]`);
-          return `(?:${character}|\\\\(?:u${hex}|x${hex.slice(2)}))`;
-        })
-        .join("")
-    )
-    .join("|"),
-  "g"
-);
+const RESET_PROBE_TOKENS = [resetKeyToken, resetValueToken, ":"] as const;
 
 export function isReadableHistoryMessage(value: unknown): value is MuxMessage {
   return (
@@ -80,11 +72,231 @@ function compactResetProbe(text: string): string {
   return stripEscapedResetSeparators(stripRawResetSeparators(text));
 }
 
+// Raw characters the reset recognizers treat as removable separators. Defined once: the plain-row
+// gate below (RESET_OR_BOUNDARY_CANDIDATE) is only sound while it uses exactly this class.
+const RESET_SEPARATOR = String.raw`[\s\p{Cc}]`;
+const RESET_SEPARATORS = new RegExp(RESET_SEPARATOR, "gu");
+
 function stripRawResetSeparators(text: string): string {
-  return text.replace(/[\s\p{Cc}]/gu, "");
+  return text.replace(RESET_SEPARATORS, "");
 }
 function stripEscapedResetSeparators(text: string): string {
   return text.replace(/\\(?:u00|x)(?:[0189][\da-f]|20|7f)/gi, "");
+}
+
+// ── Separator-aware matching on latin1 text ───────────────────────────────────────────────
+// addHistoryResetProbe and the oversized-row raw probe read rows as latin1 (one character per
+// byte) and match markers in place instead of rewriting the text: separators are skipped where
+// they occur, reproducing hasRawResetMarker's single pass (remove raw separators, then escaped
+// separators once, then decode escapes) without a replace over every space of a giant row.
+
+/**
+ * RESET_SEPARATOR as latin1 bytes: the UTF-8 encoding of every separator code point. A
+ * separator's lead byte is never a UTF-8 continuation byte, so its complete encoding always
+ * decodes as that separator, and UTF-8 decoding yields a separator only from its encoding
+ * (invalid bytes become U+FFFD). All separators are in the BMP.
+ */
+const [RAW_SEPARATOR_BYTE, MULTIBYTE_SEPARATORS] = (() => {
+  const single = new Uint8Array(256);
+  const multi = new Set<string>();
+  let bmp = "";
+  for (let cp = 0; cp < 0x10000; cp++)
+    if (cp < 0xd800 || cp > 0xdfff) bmp += String.fromCharCode(cp);
+  for (const match of bmp.matchAll(RESET_SEPARATORS)) {
+    const bytes = Buffer.from(match[0], "utf8");
+    if (bytes.length === 1) single[bytes[0]] = 1;
+    else multi.add(bytes.toString("latin1"));
+  }
+  assert(single[0x20] === 1 && multi.size > 0, "reset separators cover ASCII and multibyte");
+  return [single, multi] as const;
+})();
+const MULTIBYTE_SEPARATOR_LEAD = new Uint8Array(256);
+for (const bytes of MULTIBYTE_SEPARATORS) MULTIBYTE_SEPARATOR_LEAD[bytes.charCodeAt(0)] = 1;
+
+/** Length of the raw separator starting at `i`, or 0. */
+function rawSeparatorLength(text: string, i: number): number {
+  const c = text.charCodeAt(i);
+  if (RAW_SEPARATOR_BYTE[c] === 1) return 1;
+  if (MULTIBYTE_SEPARATOR_LEAD[c] !== 1) return 0;
+  if (MULTIBYTE_SEPARATORS.has(text.slice(i, i + 2))) return 2;
+  return MULTIBYTE_SEPARATORS.has(text.slice(i, i + 3)) ? 3 : 0;
+}
+
+function skipRawSeparators(text: string, i: number): number {
+  for (let length = rawSeparatorLength(text, i); length > 0; length = rawSeparatorLength(text, i))
+    i += length;
+  return i;
+}
+
+function hexValue(c: number): number {
+  if (c >= 0x30 && c <= 0x39) return c - 0x30;
+  const lower = c | 0x20;
+  return lower >= 0x61 && lower <= 0x66 ? lower - 0x57 : -1;
+}
+
+/**
+ * End of the escaped separator starting at the backslash at `i`, or -1: a
+ * stripEscapedResetSeparators shape, with raw separators allowed between its characters because
+ * they are removed first.
+ */
+function escapedSeparatorEnd(text: string, i: number): number {
+  let j = skipRawSeparators(text, i + 1);
+  const kind = text.charCodeAt(j) | 0x20;
+  if (kind === 0x75) {
+    for (let zero = 0; zero < 2; zero++) {
+      j = skipRawSeparators(text, j + 1);
+      if (text.charCodeAt(j) !== 0x30) return -1;
+    }
+  } else if (kind !== 0x78) return -1;
+  j = skipRawSeparators(text, j + 1);
+  const high = text.charCodeAt(j);
+  j = skipRawSeparators(text, j + 1);
+  const low = text.charCodeAt(j);
+  const separator =
+    high === 0x30 || high === 0x31 || high === 0x38 || high === 0x39
+      ? hexValue(low) >= 0
+      : high === 0x32
+        ? low === 0x30
+        : high === 0x37 && (low | 0x20) === 0x66;
+  return separator ? j + 1 : -1;
+}
+
+/** Skip raw and escaped separators (single pass: an escaped separator exposed by removing another is not one). */
+function skipSeparators(text: string, i: number): number {
+  for (;;) {
+    const raw = rawSeparatorLength(text, i);
+    if (raw > 0) i += raw;
+    else if (text.charCodeAt(i) !== 0x5c) return i;
+    else {
+      const end = escapedSeparatorEnd(text, i);
+      if (end < 0) return i;
+      i = end;
+    }
+  }
+}
+
+let unitEnd = 0;
+/**
+ * Decoded character of the unit at `i`, ending at unitEnd: a character, or a \uXXXX / \xXX escape
+ * with separators allowed inside (they are removed before decoding). -1 past the text.
+ */
+function readUnit(text: string, i: number): number {
+  const c = text.charCodeAt(i);
+  if (Number.isNaN(c)) return -1;
+  unitEnd = i + 1;
+  if (c !== 0x5c) return c;
+  let j = skipSeparators(text, i + 1);
+  const kind = text.charCodeAt(j);
+  const digits = kind === 0x75 ? 4 : kind === 0x78 ? 2 : 0;
+  let value = 0;
+  for (let digit = 0; digit < digits; digit++) {
+    j = skipSeparators(text, j + 1);
+    const hex = hexValue(text.charCodeAt(j));
+    if (hex < 0) return 0x5c;
+    value = value * 16 + hex;
+  }
+  if (digits === 0) return 0x5c;
+  unitEnd = j + 1;
+  return value;
+}
+
+/**
+ * End of `literal` read unit by unit from the unit starting at `start`, separators skipped
+ * between units, or -1. For any unit start, this matches exactly where the text after
+ * hasRawResetMarker's transforms holds `literal`.
+ */
+function matchResetLiteral(text: string, start: number, literal: string): number {
+  // Exact fast reject for the common case, a unit followed by a plain byte (no separator or
+  // escape can start there): then the first two units are single characters, except that a
+  // backslash starts an escape only before u or x. Scanning giant rows depends on this.
+  const c = text.charCodeAt(start);
+  const next = text.charCodeAt(start + 1);
+  if (next !== 0x5c && RAW_SEPARATOR_BYTE[next] !== 1 && MULTIBYTE_SEPARATOR_LEAD[next] !== 1) {
+    if (c === 0x5c) {
+      if (next !== 0x75 && next !== 0x78 && literal.charCodeAt(0) !== 0x5c) return -1;
+    } else if (c !== literal.charCodeAt(0)) return -1;
+    else if (literal.length > 1 && next !== literal.charCodeAt(1)) return -1;
+  }
+  let i = start;
+  for (let k = 0; k < literal.length; k++) {
+    if (k > 0) i = skipSeparators(text, i);
+    if (readUnit(text, i) !== literal.charCodeAt(k)) return -1;
+    i = unitEnd;
+  }
+  return i;
+}
+
+/**
+ * Global regex matching exactly the positions where matchResetLiteral passes its fast reject
+ * for one of `literals`: a literal's first character followed by its second or by a byte that is
+ * not plain, or a backslash followed by u, x or a byte that is not plain. Every other position
+ * fails (readUnit reads its own character there, and literals never start with a backslash), so
+ * a caller visiting only these positions misses no match, while the regex engine skips the plain
+ * text in between natively.
+ */
+function resetCandidatePattern(literals: readonly string[]) {
+  const byte = (c: number) => `\\x${c.toString(16).padStart(2, "0")}`;
+  let notPlain = byte(0x5c);
+  for (let c = 0; c < 256; c++)
+    if (RAW_SEPARATOR_BYTE[c] === 1 || MULTIBYTE_SEPARATOR_LEAD[c] === 1) notPlain += byte(c);
+  const alternatives = new Set([`${byte(0x5c)}[${byte(0x75)}${byte(0x78)}${notPlain}]`]);
+  for (const literal of literals) {
+    assert(literal.length > 0 && literal.charCodeAt(0) !== 0x5c, "literal starts plainly");
+    const first = byte(literal.charCodeAt(0));
+    alternatives.add(
+      literal.length === 1 ? first : `${first}[${byte(literal.charCodeAt(1))}${notPlain}]`
+    );
+  }
+  return {
+    pattern: new RegExp([...alternatives].join("|"), "g"),
+    /**
+     * The bytes a match can start with (latin1 decoding keeps each byte's char code), the common
+     * literal starts first so text segments stop the search early.
+     */
+    anchors: [...new Set([...literals.map((literal) => literal.charCodeAt(0)), 0x5c])],
+  };
+}
+const RAW_PROBE_CANDIDATES = resetCandidatePattern([
+  SESSION_HISTORY_RESET_NEEDLE,
+  SESSION_HISTORY_COMPACTION_BOUNDARY_NEEDLE,
+]);
+const TOKEN_PROBE_CANDIDATES = resetCandidatePattern(RESET_PROBE_TOKENS);
+/** Byte search (memchr) is far cheaper than the candidate regex over anchor-free payload. */
+const hasCandidateAnchor = (segment: Buffer, anchors: readonly number[]) =>
+  anchors.some((anchor) => segment.includes(anchor));
+
+/**
+ * `text` from `start` with every separator run shortened to a form the matcher reads alike, until
+ * at least `limit` characters are out. A run of raw separators is dropped, or kept as one space
+ * next to a byte >= 0x80 (a join could otherwise form a multibyte separator); a run holding an
+ * escaped separator becomes \x00 (an escaped separator admits only raw ones inside). This bounds
+ * retained overlap without changing what a later join can match.
+ */
+function canonicalizeSeparators(text: string, start: number, limit: number): string {
+  let out = "";
+  let i = start;
+  while (i < text.length && out.length < limit) {
+    let j = i;
+    let escaped = false;
+    for (;;) {
+      const raw = rawSeparatorLength(text, j);
+      if (raw > 0) j += raw;
+      else if (text.charCodeAt(j) !== 0x5c) break;
+      else {
+        const end = escapedSeparatorEnd(text, j);
+        if (end < 0) break;
+        j = end;
+        escaped = true;
+      }
+    }
+    if (j === i) out += text[i++];
+    else {
+      if (escaped) out += "\\x00";
+      else if (text.charCodeAt(i - 1) >= 0x80 || text.charCodeAt(j) >= 0x80) out += " ";
+      i = j;
+    }
+  }
+  return out;
 }
 
 /** Streaming counterpart of hasRawResetMarker; each transform keeps only a partial escape. */
@@ -113,6 +325,53 @@ export function createRawHistoryResetProbe() {
     finish() {
       pushText(decoder.end(), true);
       return found;
+    },
+  };
+}
+
+/**
+ * The raw reset check (hasRawResetMarker) for one row pushed last segment first, as the provider
+ * locator reads rows. `boundary` says whether the same transforms of the row hold the compaction
+ * boundary needle, which covers every JSON spelling of that pair (escaped key characters,
+ * whitespace around the colon). Retains only a canonical head (canonicalizeSeparators) of the
+ * text pushed so far, so memory stays bounded for any row size.
+ */
+function createReverseRawHistoryProbe() {
+  const resetNeedle = SESSION_HISTORY_RESET_NEEDLE;
+  const boundaryNeedle = SESSION_HISTORY_COMPACTION_BOUNDARY_NEEDLE;
+  // A needle unit spans at most 30 canonical characters: a \u00XX escape (6) with a \x00 run
+  // (4) in each of its 5 gaps (hasRawResetMarker removes escaped separators before decoding),
+  // plus a \x00 run before the next unit.
+  const keep = 30 * Math.max(resetNeedle.length, boundaryNeedle.length);
+  let head = "";
+  let reset = false;
+  let boundary = false;
+  return {
+    push(bytes: Buffer) {
+      // Reset evidence decides the row (a floor), so stop once it is found.
+      if (reset) return;
+      const raw = bytes.toString("latin1");
+      const text = raw + head;
+      // Anchors in `head` were tried when their segment arrived, with all text to their right, so
+      // a segment without anchors starts no match; its text still joins `head`, where a needle
+      // starting further left can end.
+      const starts = hasCandidateAnchor(bytes, RAW_PROBE_CANDIDATES.anchors) ? text : "";
+      const candidates = RAW_PROBE_CANDIDATES.pattern;
+      candidates.lastIndex = 0;
+      for (let found = candidates.exec(starts); found !== null; found = candidates.exec(starts)) {
+        const i = found.index;
+        if (i >= raw.length) break;
+        candidates.lastIndex = i + 1;
+        if (matchResetLiteral(text, i, resetNeedle) >= 0) {
+          reset = true;
+          return;
+        }
+        boundary ||= matchResetLiteral(text, i, boundaryNeedle) >= 0;
+      }
+      head = canonicalizeSeparators(text, 0, keep).slice(0, keep);
+    },
+    finish(): { reset: boolean; boundary: boolean } {
+      return { reset, boundary };
     },
   };
 }
@@ -171,27 +430,57 @@ function addHistoryResetProbe(state: HistoryResetProbe, segment: Buffer, reverse
   // nested objects conservatively) without parsing or retaining the row.
   // Keep only token-sized raw overlap plus a three-stage recognizer.
   // Junk of arbitrary size may separate intact tokens in unreadable rows;
-  // valid rows isolate their own evidence in deliver() and reset this state.
+  // the locator resets this state after every readable row (settle()).
+  //
+  // Separators are skipped inside and between token characters as hasRawResetMarker removes them
+  // (F2): rows join without their LF, so a CR or space before it, or a separator anywhere inside a
+  // token, must not hide the token. Tokens are matched at every `"`, `:` and backslash, so they may
+  // overlap. Retained overlap is canonical (canonicalizeSeparators): long separator runs never
+  // push a token half out of it. Every candidate starts with an anchor byte, so a segment without
+  // one starts no token: reverse skips matching (the segment can still supply a later token's
+  // tail via the overlap), forward matches only starts in the overlap, which can end in `raw`.
   const raw = segment.toString("latin1");
-  const previousLength = state.resetProbe.length;
-  const probe = reverse ? raw + state.resetProbe : state.resetProbe + raw;
-  const tokens = [...probe.matchAll(resetTokenPattern)];
+  const window = reverse ? raw + state.resetProbe : state.resetProbe + raw;
+  // Tokens starting at or after `edge` (reverse) or ending at or before it (forward) lie in the
+  // already-consumed overlap: counted before, and replaying them could manufacture the opposite
+  // token ordering.
+  const edge = reverse ? raw.length : state.resetProbe.length;
+  const tokens: string[] = [];
+  const anchored = hasCandidateAnchor(segment, TOKEN_PROBE_CANDIDATES.anchors);
+  // Forward keeps raw's first character, which a two-character candidate at edge - 1 reads.
+  const starts = anchored ? window : reverse ? "" : window.slice(0, edge + 1);
+  const candidates = TOKEN_PROBE_CANDIDATES.pattern;
+  candidates.lastIndex = 0;
+  for (let found = candidates.exec(starts); found !== null; found = candidates.exec(starts)) {
+    const i = found.index;
+    if (reverse && i >= edge) break;
+    candidates.lastIndex = i + 1;
+    for (const token of RESET_PROBE_TOKENS) {
+      const end = matchResetLiteral(window, i, token);
+      if (end >= 0 && (reverse || end > edge)) tokens.push(token);
+    }
+  }
   if (reverse) tokens.reverse();
-  for (const match of tokens) {
-    // Ignore tokens entirely inside already-consumed overlap. Otherwise
-    // replaying overlap could manufacture the opposite token ordering.
-    if (reverse ? match.index >= raw.length : match.index + match[0].length <= previousLength)
-      continue;
-    const token = decodeResetEscapes(match[0]);
+  for (const token of tokens) {
     if (token === (reverse ? resetValueToken : resetKeyToken)) {
       if (state.resetStage === 0) state.resetStage = 1;
     } else if (token === ":" && state.resetStage === 1) state.resetStage = 2;
     else if (token === (reverse ? resetKeyToken : resetValueToken) && state.resetStage === 2)
       state.possibleReset = true;
   }
-  state.resetProbe = reverse
-    ? probe.slice(0, SESSION_HISTORY_RESET_PROBE_CHARS - 1)
-    : probe.slice(-(SESSION_HISTORY_RESET_PROBE_CHARS - 1));
+  const keep = SESSION_HISTORY_RESET_PROBE_CHARS - 1;
+  if (reverse) state.resetProbe = canonicalizeSeparators(window, 0, keep).slice(0, keep);
+  else {
+    // Canonicalize a tail long enough to yield `keep` characters.
+    for (let from = Math.max(0, window.length - 2 * keep); ; ) {
+      const tail = canonicalizeSeparators(window, from, Infinity);
+      if (tail.length >= keep || from === 0) {
+        state.resetProbe = tail.slice(-keep);
+        break;
+      }
+      from = Math.max(0, window.length - 2 * (window.length - from));
+    }
+  }
 }
 
 /** Feed one oversized row in reverse byte ranges, using the provider's unchanged recognizer. */
@@ -203,7 +492,8 @@ export function createUnreadableHistoryResetProbe() {
   };
 }
 
-function classifyHistoryScanRow(text: string, probe: HistoryResetProbe): MuxMessage | null {
+// Exported for tests: historyScanner.plainRow.test.ts checks readPlainHistoryRow against it.
+export function classifyHistoryScanRow(text: string, probe: HistoryResetProbe): MuxMessage | null {
   let rowReset = hasRawResetMarker(text);
   probe.possibleReset ||= rowReset;
   try {
@@ -220,8 +510,113 @@ function classifyHistoryScanRow(text: string, probe: HistoryResetProbe): MuxMess
     // Readable payloads may discuss resets; only their top-level metadata can
     // mark one. Raw evidence is reserved for unreadable/ambiguous rows above.
     probe.possibleReset = false;
-    return normalizeLegacyMuxMetadata(raw);
+    return normalizePersistedMessage(raw);
   } catch {
+    return null;
+  }
+}
+
+// Any backslash that may start a \u / \x escape (separators allowed before the letter, as
+// stripRawResetSeparators removes them first), the letters of "reset" joined only by separators,
+// or the compaction boundary key. See readPlainHistoryRow for why this set suffices.
+const RESET_OR_BOUNDARY_CANDIDATE = (() => {
+  const separators = `${RESET_SEPARATOR}*`;
+  return new RegExp(
+    [String.raw`\\${separators}[uUxX]`, [..."reset"].join(separators), "compactionBoundary"].join(
+      "|"
+    ),
+    "u"
+  );
+})();
+
+// Rows with more `[` plus `{` bytes than this take the full classifier path: nesting depth is at
+// most that count, and JSON.stringify must provably not throw for plain rows (see below).
+const PLAIN_ROW_MAX_BRACKETS = 1024;
+
+/**
+ * Startup check for the bracket guard. JSON.parse is iterative, but JSON.stringify recurses: V8
+ * on the Node main thread throws around depth 3-5k, Bun/JSC far deeper. If this runtime cannot
+ * stringify PLAIN_ROW_MAX_BRACKETS levels (alternating objects and arrays), disable the plain-row
+ * fast path so every row keeps the full classifier.
+ */
+const plainRowFastPathEnabled = (() => {
+  let nested: unknown = [];
+  for (let depth = 1; depth < PLAIN_ROW_MAX_BRACKETS; depth++)
+    nested = depth % 2 === 0 ? [nested] : { a: nested };
+  try {
+    JSON.stringify(nested);
+    return true;
+  } catch (error) {
+    log.warn("Disabled the provider history plain-row fast path: shallow JSON.stringify failed", {
+      depth: PLAIN_ROW_MAX_BRACKETS,
+      error: String(error),
+    });
+    return false;
+  }
+})();
+
+/** True when the row's `[` plus `{` bytes exceed PLAIN_ROW_MAX_BRACKETS. */
+function exceedsPlainRowBrackets(segments: readonly Buffer[], size: number): boolean {
+  if (size <= PLAIN_ROW_MAX_BRACKETS) return false;
+  let count = 0;
+  for (const segment of segments) {
+    for (const bracket of [0x5b, 0x7b]) {
+      for (let i = segment.indexOf(bracket); i !== -1; i = segment.indexOf(bracket, i + 1))
+        if (++count > PLAIN_ROW_MAX_BRACKETS) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Fast path of the provider locator for a row of at most SESSION_HISTORY_MAX_LINE_BYTES: returns
+ * the message classifyHistoryScanRow would return when the row provably carries no reset or
+ * boundary evidence, and null otherwise (the caller then runs the reset probe and the full
+ * classifier). `segments` are the row's bytes in any order, `text` their utf8 decoding in file
+ * order, `size` their total length.
+ *
+ * SAFETY (provider privacy, #4655): for rows this returns non-null, skipping the probe and the
+ * full classifier cannot change what the locator returns or delivers:
+ * 1. The caller defers the row's addHistoryResetProbe calls and replays them in arrival order
+ *    only when this returns null (or at once when the row turns oversized), so the probe sees
+ *    the exact call sequence it saw before. Nothing reads the probe between a row's add() and its
+ *    delivery; recoverOversizedBoundary reads it only after that flush.
+ * 2. For a row the full path classifies readable, the probe state is unobservable: the
+ *    classifier forces possibleReset = false and the locator clears the probe after a readable
+ *    row. The only outputs are the message, unreadableRunEnd = null and the boundary checks.
+ * 3. No candidate match implies hasRawResetMarker(text) is false: with no backslash followed
+ *    (after optional separators) by u/U/x/X, stripEscapedResetSeparators and decodeResetEscapes
+ *    are identities on stripRawResetSeparators(text), and the needle contains "reset", which then
+ *    needs r, e, s, e, t joined only by separator characters (the same RESET_SEPARATOR class).
+ * 4. The needle in JSON.stringify(parsed) needs a parsed string exactly "reset". Without \u
+ *    escapes JSON.parse forms letters only from literal letters, so the text would contain a
+ *    literal "reset", which the candidate regex excludes.
+ * 5. JSON.stringify of parsed data throws only on nesting deeper than the stack allows (its
+ *    output is at most 6x a 1 MiB row). Depth is at most the bracket count, capped at
+ *    PLAIN_ROW_MAX_BRACKETS, and the startup check proved that depth safe in this runtime.
+ * 6. So rowReset stays false (hasAmbiguousResetKeys is never consulted) and the classifier returns
+ *    normalizePersistedMessage of the same parse, as below. normalize (legacy rename,
+ *    idleCompacted, tool payload depth) never adds compactionBoundary or contextBoundaryKind, and
+ *    without \u escapes a parsed key needs its literal text, so the message is neither a durable
+ *    boundary nor a manual reset, and the locator takes the same branches with the same message.
+ * Unreadable rows and rows with reset or boundary evidence, escapes, deep nesting or oversize all
+ * keep the full path. If this gate ever needs more cases, narrow it (send more rows to the full
+ * path) instead of adding mechanism.
+ */
+// Exported for tests: historyScanner.plainRow.test.ts checks it against classifyHistoryScanRow.
+export function readPlainHistoryRow(
+  text: string,
+  segments: readonly Buffer[],
+  size: number
+): MuxMessage | null {
+  if (!plainRowFastPathEnabled || RESET_OR_BOUNDARY_CANDIDATE.test(text)) return null;
+  if (exceedsPlainRowBrackets(segments, size)) return null;
+  try {
+    const raw: unknown = JSON.parse(text);
+    if (!isReadableHistoryMessage(raw)) return null;
+    return normalizePersistedMessage(raw);
+  } catch {
+    // Same as classifyHistoryScanRow: a parse or normalize failure makes the row unreadable.
     return null;
   }
 }
@@ -234,6 +629,13 @@ export function hasUnreadableHistoryResetEvidence(rows: readonly Buffer[]): bool
     addHistoryResetProbe(probe, raw, true);
     if (raw.length <= SESSION_HISTORY_MAX_LINE_BYTES)
       classifyHistoryScanRow(raw.toString("utf8"), probe);
+    else {
+      // The provider locator also checks an oversized row's own text for the marker (F1).
+      const local = createRawHistoryResetProbe();
+      for (let offset = 0; offset < raw.length; offset += SESSION_HISTORY_SCAN_CHUNK_BYTES)
+        local.push(raw.subarray(offset, offset + SESSION_HISTORY_SCAN_CHUNK_BYTES));
+      probe.possibleReset ||= local.finish();
+    }
     if (probe.possibleReset) return true;
   }
   return false;
@@ -252,14 +654,34 @@ interface LocatedHistoryBoundary {
 }
 type ProviderHistoryStart =
   | ({ kind: "start" } & LocatedHistoryBoundary)
-  | { kind: "exhausted"; oldestBoundary: LocatedHistoryBoundary | null; boundaryCount: number };
+  | { kind: "exhausted"; oldestBoundary: LocatedHistoryBoundary | null; boundaryCount: number }
+  | { kind: "stopped" };
 
-/** Provider-only location: bound row/probe carryover, not the amount of context scanned. */
-async function findProviderHistoryStart(
+/** One non-empty row delivered by the provider locator, newest first. */
+interface ScannedHistoryRow {
+  start: number;
+  /** Row bytes, excluding the newline. */
+  size: number;
+  /**
+   * Null for unreadable and ambiguous-reset rows, and for oversized
+   * (> SESSION_HISTORY_MAX_LINE_BYTES) rows other than a recovered compaction boundary.
+   */
+  message: MuxMessage | null;
+}
+const STOPPED = Symbol("stopped");
+
+/**
+ * Provider-only location: bound row/probe carryover, not the amount of context scanned.
+ * `visit` sees every delivered row and may request a stop; the stop is honored only right
+ * after a readable row that is not the start, where no scan state carries over.
+ */
+// Exported for tests: historyScanner.differential.test.ts compares it with the frozen #4655 oracle.
+export async function findProviderHistoryStart(
   handle: fs.FileHandle,
   fileSize: number,
   skip: number,
-  includeReadableResetFloor: boolean
+  includeReadableResetFloor: boolean,
+  visit?: (row: ScannedHistoryRow) => boolean
 ): Promise<ProviderHistoryStart> {
   const probe: HistoryResetProbe = { resetProbe: "", resetStage: 0, possibleReset: false };
   let parts: Buffer[] = [];
@@ -268,21 +690,77 @@ async function findProviderHistoryStart(
   let unreadableRunEnd: number | null = null;
   let oldestBoundary: LocatedHistoryBoundary | null = null;
   let boundaryCount = 0;
-  const add = (bytes: Buffer) => {
-    addHistoryResetProbe(probe, bytes, true);
-    size += bytes.length;
-    if (size <= SESSION_HISTORY_MAX_LINE_BYTES) parts.push(bytes);
-    else parts = [];
+  // Oversized rows are never classified, so their segments also stream through the raw probe:
+  // hasRawResetMarker for the row's own reset evidence (a floor, F1), and any JSON spelling of the
+  // compaction boundary pair to pick rows worth re-reading (F3). Rows up to the line limit get
+  // both from the classifier instead.
+  let oversizedProbe: ReturnType<typeof createReverseRawHistoryProbe> | null = null;
+  // `parts` holds the row's segments in arrival (reverse file) order while the row fits
+  // SESSION_HISTORY_MAX_LINE_BYTES. Their reset-probe calls are deferred (readPlainHistoryRow,
+  // point 1): replayed in arrival order by readBufferedRow when the fast path declines, or flushed
+  // here the moment the row turns oversized, after which segments stream into the probe as before.
+  const feedProbe = (segments: readonly Buffer[]) => {
+    for (const segment of segments) addHistoryResetProbe(probe, segment, true);
   };
-  const deliver = (start: number): LocatedHistoryBoundary | null => {
-    if (size === 0) {
-      rowEnd = start;
+  const add = (bytes: Buffer) => {
+    size += bytes.length;
+    if (size <= SESSION_HISTORY_MAX_LINE_BYTES) {
+      parts.push(bytes);
+      return;
+    }
+    if (!oversizedProbe) {
+      oversizedProbe = createReverseRawHistoryProbe();
+      for (const part of parts) oversizedProbe.push(part);
+    }
+    feedProbe(parts);
+    parts = [];
+    addHistoryResetProbe(probe, bytes, true);
+    oversizedProbe.push(bytes);
+  };
+  /**
+   * An oversized compaction boundary behaves exactly like a normal-size one (#4551): rotation
+   * already treats it as the epoch start, and skipping it here would bring the sealed epoch back
+   * from the archive. Re-read just that row and classify it unchanged, accepting only a durable
+   * compaction boundary. The raw probe picks candidates in any JSON spelling (F3), so the classifier
+   * decides; memory stays bounded by SESSION_HISTORY_MAX_BOUNDARY_ROW_BYTES as before. Reset
+   * evidence keeps the row an unreadable floor (the classifier also treats reset keys in oversized
+   * text as ambiguous).
+   */
+  const recoverOversizedBoundary = async (start: number): Promise<MuxMessage | null> => {
+    assert(oversizedProbe, "an oversized row streams through the raw probe");
+    const evidence = oversizedProbe.finish();
+    // Local reset evidence floors an oversized row exactly like a classified one.
+    probe.possibleReset ||= evidence.reset;
+    if (!evidence.boundary || probe.possibleReset) return null;
+    if (size > SESSION_HISTORY_MAX_BOUNDARY_ROW_BYTES) {
+      log.warn("Oversized compaction boundary row exceeds the recovery ceiling", {
+        offset: start,
+        bytes: size,
+      });
       return null;
     }
-    const message =
-      size > SESSION_HISTORY_MAX_LINE_BYTES
-        ? null
-        : classifyHistoryScanRow(Buffer.concat(parts.reverse()).toString("utf8"), probe);
+    const row = Buffer.alloc(size);
+    const read = await handle.read(row, 0, size, start);
+    if (read.bytesRead !== size) throw new Error("History changed during provider read");
+    const candidate = classifyHistoryScanRow(row.toString("utf8"), probe);
+    if (!isDurableCompactionBoundaryMarker(candidate ?? undefined)) return null;
+    log.debug("Recovered an oversized compaction boundary row", { offset: start, bytes: size });
+    return candidate;
+  };
+  const readBufferedRow = (): MuxMessage | null => {
+    // Single-segment rows (all but rows crossing a chunk edge) need no concat; keep `parts` in
+    // arrival order for the probe replay below.
+    const text = (parts.length === 1 ? parts[0] : Buffer.concat([...parts].reverse())).toString(
+      "utf8"
+    );
+    const plain = readPlainHistoryRow(text, parts, size);
+    if (plain) return plain;
+    feedProbe(parts);
+    return classifyHistoryScanRow(text, probe);
+  };
+  type Delivered = LocatedHistoryBoundary | typeof STOPPED | null;
+  const settle = (start: number, message: MuxMessage | null): Delivered => {
+    const stopRequested = visit?.({ start, size, message }) === true;
     if (message) unreadableRunEnd = null;
     else unreadableRunEnd ??= rowEnd;
     const durableBoundary = message !== null && isDurableContextBoundaryMarker(message);
@@ -313,11 +791,38 @@ async function findProviderHistoryStart(
       probe.resetProbe = "";
       probe.resetStage = 0;
       probe.possibleReset = false;
+      // Suffix reads (#4720) may stop only here, right after a readable row R that is not the
+      // start. Why that equals the full read's tail:
+      // - Clean state: the probe was just reset, unreadableRunEnd is null (set above), parts
+      //   and size reset below, rowEnd becomes R.start, and with skip 0 no boundary was
+      //   skipped (the first durable boundary always returns). That is exactly a fresh scan of
+      //   [0, R.start), which can only return a start <= R.start or "exhausted" (whose archive
+      //   fallback keeps every row of this file). So every row visited so far, R included, is
+      //   in the full provider read of this snapshot.
+      // - Readable rows only: a fragmented raw reset can span a run of unreadable rows
+      //   (including oversized rows the classifier never parses). When it completes further
+      //   left, the floor is unreadableRunEnd, which also drops the NEWER rows of that run, so
+      //   stopping on an unreadable row could return rows the full read excludes.
+      if (stopRequested) {
+        assert(skip === 0, "provider suffix stops require skip 0");
+        return STOPPED;
+      }
     }
     parts = [];
     size = 0;
     rowEnd = start;
+    oversizedProbe = null;
     return null;
+  };
+  /** Synchronous for rows up to the line limit: only an oversized row may re-read the file. */
+  const deliver = (start: number): Delivered | Promise<Delivered> => {
+    if (size === 0) {
+      rowEnd = start;
+      return null;
+    }
+    if (size > SESSION_HISTORY_MAX_LINE_BYTES)
+      return recoverOversizedBoundary(start).then((message) => settle(start, message));
+    return settle(start, readBufferedRow());
   };
   for (let end = fileSize; end > 0; ) {
     const start = Math.max(0, end - SESSION_HISTORY_SCAN_CHUNK_BYTES);
@@ -325,32 +830,53 @@ async function findProviderHistoryStart(
     const read = await handle.read(chunk, 0, chunk.length, start);
     if (read.bytesRead !== chunk.length) throw new Error("History changed during provider read");
     let edge = chunk.length;
-    for (let i = chunk.length - 1; i >= 0; i--) {
-      if (chunk[i] !== 10) continue;
+    // Native newline search. Stop explicitly at index 0: a negative offset would search from the
+    // end of the chunk again.
+    for (let i = chunk.lastIndexOf(10); i >= 0; i = i > 0 ? chunk.lastIndexOf(10, i - 1) : -1) {
       add(chunk.subarray(i + 1, edge));
-      const location = deliver(start + i + 1);
+      const delivered = deliver(start + i + 1);
+      const location = delivered instanceof Promise ? await delivered : delivered;
+      if (location === STOPPED) return { kind: "stopped" };
       if (location !== null) return { kind: "start", ...location };
       edge = i;
     }
     add(chunk.subarray(0, edge));
     end = start;
   }
-  const location = deliver(0);
+  const delivered = deliver(0);
+  const location = delivered instanceof Promise ? await delivered : delivered;
+  if (location === STOPPED) return { kind: "stopped" };
   return location === null
     ? { kind: "exhausted", oldestBoundary, boundaryCount }
     : { kind: "start", ...location };
 }
 
-/** Keep raw location and projected tail reads on one verified snapshot, without write-lock re-entry. */
-async function readHistoryProjectionFromLatestBoundary<Row>(
-  paths: Record<HistoryArtifact, string>,
-  skip: number,
-  project?: (value: unknown) => Row | null,
-  includeReadableResetFloor = false,
-  clampToOldest = true
-): Promise<{ messages: Row[]; boundary: PendingBoundary; boundaryPublicationId?: string }> {
-  assert(Number.isSafeInteger(skip) && skip >= 0, "provider boundary skip must be non-negative");
-  const files = new Map<HistoryArtifact, { handle: fs.FileHandle; size: number; stamp: string }>();
+interface HistorySnapshotFile {
+  handle: fs.FileHandle;
+  size: number;
+  stamp: string;
+}
+
+/**
+ * Open descriptors of both history files, pinned with their stamps at open time. The status read
+ * (#4790) opens it under the history lock and scans it after releasing the lock, so opening,
+ * verifying and closing are separate steps. (Not historyCursor's HistorySnapshot, which is a
+ * persisted scan position.)
+ */
+export interface OpenHistorySnapshot {
+  files: ReadonlyMap<HistoryArtifact, HistorySnapshotFile>;
+  /** Throws "History changed during provider read" if either pathname was replaced or resized. */
+  verify(): Promise<void>;
+  close(): Promise<void>;
+}
+
+export async function openHistorySnapshot(
+  paths: Record<HistoryArtifact, string>
+): Promise<OpenHistorySnapshot> {
+  const files = new Map<HistoryArtifact, HistorySnapshotFile>();
+  const close = async () => {
+    await Promise.all([...files.values()].map((file) => file.handle.close()));
+  };
   try {
     for (const artifact of ["chat", "archive"] as const) {
       let handle: fs.FileHandle;
@@ -365,14 +891,69 @@ async function readHistoryProjectionFromLatestBoundary<Row>(
       const stat = await handle.stat();
       files.set(artifact, { handle, size: stat.size, stamp: historyFileStamp(stat) });
     }
-    const locate = (
+  } catch (error) {
+    await close();
+    throw error;
+  }
+  return {
+    files,
+    verify: async () => {
+      // Foreign writers can replace either pathname while these descriptors stay
+      // open. Never release provider rows assembled from an obsolete raw offset.
+      for (const artifact of ["chat", "archive"] as const) {
+        const stat = await fs.stat(paths[artifact]).catch((error: NodeJS.ErrnoException) => {
+          if (error.code !== "ENOENT") throw error;
+          return undefined;
+        });
+        if (historyFileStamp(stat) !== (files.get(artifact)?.stamp ?? "missing")) {
+          throw new Error("History changed during provider read");
+        }
+      }
+    },
+    close,
+  };
+}
+
+/** Run `read` on open descriptors of both history files and fail closed if either was replaced. */
+async function withVerifiedHistorySnapshot<T>(
+  paths: Record<HistoryArtifact, string>,
+  read: (files: ReadonlyMap<HistoryArtifact, HistorySnapshotFile>) => Promise<T>
+): Promise<T> {
+  const snapshot = await openHistorySnapshot(paths);
+  try {
+    const result = await read(snapshot.files);
+    await snapshot.verify();
+    return result;
+  } finally {
+    await snapshot.close();
+  }
+}
+
+/** Keep raw location and projected tail reads on one verified snapshot, without write-lock re-entry. */
+async function readHistoryProjectionFromLatestBoundary<Row>(
+  paths: Record<HistoryArtifact, string>,
+  skip: number,
+  project?: (value: unknown) => Row | null,
+  includeReadableResetFloor = false,
+  clampToOldest = true,
+  onBytesRead?: (bytes: number) => void
+): Promise<{ messages: Row[]; boundary: PendingBoundary; boundaryPublicationId?: string }> {
+  assert(Number.isSafeInteger(skip) && skip >= 0, "provider boundary skip must be non-negative");
+  return withVerifiedHistorySnapshot(paths, async (files) => {
+    const locate = async (
       artifact: HistoryArtifact,
       skipCount: number
-    ): Promise<ProviderHistoryStart> => {
+    ): Promise<Exclude<ProviderHistoryStart, { kind: "stopped" }>> => {
       const file = files.get(artifact);
-      return file
-        ? findProviderHistoryStart(file.handle, file.size, skipCount, includeReadableResetFloor)
-        : Promise.resolve({ kind: "exhausted", oldestBoundary: null, boundaryCount: 0 });
+      if (!file) return { kind: "exhausted", oldestBoundary: null, boundaryCount: 0 };
+      const location = await findProviderHistoryStart(
+        file.handle,
+        file.size,
+        skipCount,
+        includeReadableResetFloor
+      );
+      assert(location.kind !== "stopped", "provider reads without a visitor never stop");
+      return location;
     };
     const readTail = async (artifact: HistoryArtifact, offset: number): Promise<Row[]> => {
       const file = files.get(artifact);
@@ -381,8 +962,20 @@ async function readHistoryProjectionFromLatestBoundary<Row>(
       const buffer = Buffer.alloc(file.size - offset);
       const read = await file.handle.read(buffer, 0, buffer.length, offset);
       if (read.bytesRead !== buffer.length) throw new Error("History changed during provider read");
+      onBytesRead?.(read.bytesRead);
       const messages: Row[] = [];
-      for (const line of buffer.toString("utf8").split("\n")) {
+      // Multi-hundred-MB epochs parse for seconds; keep timers (onChat heartbeats) alive.
+      const yielder = new EventLoopYielder();
+      // Decode per row instead of one toString+split of the whole tail (a single ~0.4 s block at
+      // hundreds of MB, #4655). Equal output: 0x0A is ASCII, never inside a UTF-8 multibyte
+      // sequence, and an invalid sequence ends at it, so per-row decoding matches decoding the
+      // whole buffer and splitting on "\n".
+      for (let pos = 0; pos < buffer.length; ) {
+        if (yielder.isDue()) await yielder.yield();
+        const newline = buffer.indexOf(10, pos);
+        const end = newline === -1 ? buffer.length : newline;
+        const line = buffer.toString("utf8", pos, end);
+        pos = end + 1;
         if (!line.trim()) continue;
         try {
           const row = project(JSON.parse(line) as unknown);
@@ -404,6 +997,7 @@ async function readHistoryProjectionFromLatestBoundary<Row>(
     } else {
       const archive = await locate("archive", skip - chat.boundaryCount);
       if (archive.kind === "start" || (clampToOldest && archive.oldestBoundary !== null)) {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const location = archive.kind === "start" ? archive : archive.oldestBoundary!;
         boundary = location.boundary;
         boundaryPublicationId = location.boundaryPublicationId;
@@ -417,21 +1011,8 @@ async function readHistoryProjectionFromLatestBoundary<Row>(
         messages = await readTail("chat", chat.oldestBoundary.offset);
       } else messages = [...(await readTail("archive", 0)), ...(await readTail("chat", 0))];
     }
-    // Foreign writers can replace either pathname while these descriptors stay
-    // open. Never release provider rows assembled from an obsolete raw offset.
-    for (const artifact of ["chat", "archive"] as const) {
-      const stat = await fs.stat(paths[artifact]).catch((error: NodeJS.ErrnoException) => {
-        if (error.code !== "ENOENT") throw error;
-        return undefined;
-      });
-      if (historyFileStamp(stat) !== (files.get(artifact)?.stamp ?? "missing")) {
-        throw new Error("History changed during provider read");
-      }
-    }
     return { messages, boundary, boundaryPublicationId };
-  } finally {
-    await Promise.all([...files.values()].map((file) => file.handle.close()));
-  }
+  });
 }
 
 export function readProviderHistoryFromLatestBoundary(
@@ -440,14 +1021,357 @@ export function readProviderHistoryFromLatestBoundary(
   options?: {
     /** Mutation classification needs the excluded floor itself; provider requests leave this off. */
     includeReadableResetFloor?: boolean;
+    /** Replay timing (#4504): raw tail bytes read from disk, reported per file read. */
+    onBytesRead?: (bytes: number) => void;
   }
 ): Promise<MuxMessage[]> {
   return readHistoryProjectionFromLatestBoundary(
     paths,
     skip,
-    (value) => (isReadableHistoryMessage(value) ? normalizeLegacyMuxMetadata(value) : null),
-    options?.includeReadableResetFloor
+    (value) => (isReadableHistoryMessage(value) ? normalizePersistedMessage(value) : null),
+    options?.includeReadableResetFloor,
+    undefined,
+    options?.onBytesRead
   ).then((view) => view.messages);
+}
+
+/**
+ * The sidebar status read (#4720, #4790): a suffix of readProviderHistoryFromLatestBoundary(paths,
+ * 0) holding at least `minMatching` rows that satisfy `matches`, or the whole read when it has
+ * fewer. Same raw locator and snapshot verification, but it stops at the first safe row once the
+ * window is full instead of parsing the whole active epoch. The caller owns `snapshot.close()`.
+ *
+ * Rows over SESSION_HISTORY_MAX_LINE_BYTES are status-grade, never provider-grade: their tool
+ * payloads come back null and their file URLs "" (historyStatusProjection.ts), and the elided
+ * bytes are not validated. Status reads none of them; see projectStatusHistoryRow for why the
+ * row set and every field status reads stay equal.
+ */
+export async function readStatusHistorySuffix(
+  snapshot: OpenHistorySnapshot,
+  minMatching: number,
+  matches: (message: MuxMessage) => boolean
+): Promise<MuxMessage[]> {
+  assert(Number.isSafeInteger(minMatching) && minMatching > 0, "suffix window must be positive");
+  const messages = await scanHistorySnapshot(
+    snapshot.files,
+    { minMatching, matches },
+    undefined,
+    true
+  );
+  await snapshot.verify();
+  return messages;
+}
+
+/**
+ * readProviderHistoryFromLatestBoundary(paths, 0) in one pass (#4655): the suffix scan with a
+ * stop that is never requested, so the active epoch is read and parsed once instead of located
+ * and then re-read. Why the result is equal:
+ * - The scan visits every row from the end of chat.jsonl to the located start (or the whole file
+ *   when exhausted), keeps rows with `start >= from`, and reads the archive only when chat is
+ *   exhausted. With skip 0 an exhausted file has no oldest boundary (the first durable boundary
+ *   always returns a start), so the two-pass reader's clamp branches never apply.
+ * - Rows the classifier leaves null but the two-pass projection would accept (reset evidence with
+ *   ambiguous keys, a stringify throw) floor themselves out: the start is at or after such a row,
+ *   so it is never in the returned range (#4720; statusSuffix "unbounded window" cases).
+ * - A row up to the line limit keeps the locator's message, normalizePersistedMessage of the same
+ *   JSON.parse the projection does; oversized rows are re-read and parsed by that projection.
+ * `onBytesRead` keeps the replay-timing meaning (#4504): the raw tail bytes of each file whose
+ * rows are returned, archive before chat.
+ */
+export function readProviderHistory(
+  paths: Record<HistoryArtifact, string>,
+  options?: { onBytesRead?: (bytes: number) => void }
+): Promise<MuxMessage[]> {
+  return withVerifiedHistorySnapshot(paths, (files) =>
+    scanHistorySnapshot(files, undefined, options?.onBytesRead, false)
+  );
+}
+
+/**
+ * readProviderHistory on a snapshot the caller opened under the history lock and scans after
+ * releasing it (token stats, #5301). The scan never reads past the sizes captured at open (every
+ * positional read is bounded by `file.size` and length-checked); verify() rejects a replaced or
+ * resized pathname. The caller closes the snapshot.
+ */
+export async function readProviderHistoryFromSnapshot(
+  snapshot: OpenHistorySnapshot
+): Promise<MuxMessage[]> {
+  const messages = await scanHistorySnapshot(snapshot.files, undefined, undefined, false);
+  await snapshot.verify();
+  return messages;
+}
+
+/** Assembly's synchronous stretch before a yield; an event-loop block budget, not a timeout. */
+const ASSEMBLY_YIELD_BUDGET_MS = 8;
+
+/**
+ * Shared scan of readStatusHistorySuffix (with `stop`, projecting oversized rows) and
+ * readProviderHistory (without either). Every positional read checks its length: under the
+ * status read's released lock a foreign in-place shrink must fail closed, never parse a partial
+ * row (#4790).
+ */
+async function scanHistorySnapshot(
+  files: ReadonlyMap<HistoryArtifact, HistorySnapshotFile>,
+  stop: { minMatching: number; matches: (message: MuxMessage) => boolean } | undefined,
+  onBytesRead: ((bytes: number) => void) | undefined,
+  projectOversized: boolean
+): Promise<MuxMessage[]> {
+  // Newest file first; each file's rows are newest first and those starting before `from` are
+  // not part of the read.
+  const scanned: Array<{ file: HistorySnapshotFile; rows: ScannedHistoryRow[]; from: number }> = [];
+  let matching = 0;
+  for (const artifact of ["chat", "archive"] as const) {
+    const file = files.get(artifact);
+    if (!file) continue;
+    const rows: ScannedHistoryRow[] = [];
+    const location = await findProviderHistoryStart(file.handle, file.size, 0, false, (row) => {
+      rows.push(row);
+      if (!stop) return false;
+      // Only rows the full read projects count; oversized rows are parsed below.
+      if (row.message !== null && stop.matches(row.message)) matching++;
+      // Monotonic: the stop stays requested across unreadable rows until a safe one.
+      return matching >= stop.minMatching;
+    });
+    assert(
+      stop !== undefined || location.kind !== "stopped",
+      "provider reads without a stop never stop"
+    );
+    scanned.push({ file, rows, from: location.kind === "start" ? location.offset : 0 });
+    // A start or a clean stop ends the read. An exhausted file keeps all its rows (no older
+    // file can exclude them); continue into the archive only while the window is short.
+    if (location.kind !== "exhausted" || (stop && matching >= stop.minMatching)) break;
+  }
+  const messages: MuxMessage[] = [];
+  // Assembly awaits only microtasks for normal rows, so a 1.24M-row epoch was one long block
+  // (#5301). Yield a macrotask about every 8 ms; the rows and their order are unchanged.
+  const yielder = new EventLoopYielder(ASSEMBLY_YIELD_BUDGET_MS);
+  for (let s = scanned.length - 1; s >= 0; s--) {
+    const { file, rows, from } = scanned[s];
+    onBytesRead?.(file.size - from);
+    for (let i = rows.length - 1; i >= 0; i--) {
+      if (yielder.isDue()) await yielder.yield();
+      if (rows[i].start < from) continue;
+      const message = await projectScannedRow(file, rows[i], projectOversized);
+      if (message) messages.push(message);
+    }
+  }
+  return messages;
+}
+
+/** A located row as the full read projects it: the locator's parse, or a re-read if oversized. */
+async function projectScannedRow(
+  file: HistorySnapshotFile,
+  row: ScannedHistoryRow,
+  projectOversized: boolean
+): Promise<MuxMessage | null> {
+  if (row.size <= SESSION_HISTORY_MAX_LINE_BYTES) return row.message;
+  // The locator does not parse oversized rows, but the full read's tail projection does.
+  // allocUnsafe is safe only because a short read throws before any byte is decoded.
+  const buffer = Buffer.allocUnsafe(row.size);
+  const read = await file.handle.read(buffer, 0, buffer.length, row.start);
+  if (read.bytesRead !== buffer.length) throw new Error("History changed during provider read");
+  try {
+    // Status only: cut the payloads it never reads before decoding (#4790).
+    const text =
+      (projectOversized ? projectStatusHistoryRow(buffer) : null) ?? buffer.toString("utf8");
+    const value: unknown = JSON.parse(text);
+    return isReadableHistoryMessage(value) ? normalizePersistedMessage(value) : null;
+  } catch {
+    // Same as the full read: unusable rows are not projected.
+    return null;
+  }
+}
+
+// ── Trailing window for onChat replay (#4961) ──────────────────────────────
+// Contract of readProviderHistoryWindow:
+// - It returns at most `maxRows` rows and `maxBytes` raw row bytes.
+// - It never returns a row that full replay (readProviderHistory) would drop: the window is
+//   always a suffix of that read.
+// - The window starts at a clean turn start: the first row after the previous turn's last
+//   assistant row, so a prompt's snapshot cluster always stays with its prompt. An active epoch
+//   that fits the budget is returned whole, from the epoch start.
+// - The only fallback: when the budget holds no clean turn start (one turn is longer than the
+//   window, or the newest row alone is over `maxBytes`), it returns "not-windowable" and the
+//   caller uses full replay.
+// How: the backward scan counts every row toward the budget (unreadable, oversized and malformed
+// rows too) and never classifies them. It keeps only rows within the budget, so a long corrupt
+// tail is never retained (#5220). The final pass projects those rows exactly as full replay does
+// (dropping malformed rows, re-reading oversized ones) and trims forward only, to the first clean
+// turn start. There is no backward extension.
+
+// Pages before a cursor (#4961 PR3) reuse the same scan. Contract of readProviderHistoryPage:
+// - A page holds at most `maxRows` rows and `maxBytes` raw row bytes, and never a row that full
+//   replay would drop.
+// - The cursor is the numeric historySequence of the client's oldest row. A page ends right
+//   before the cursor row and starts at a clean turn start (as above), or at the epoch start.
+// - The only fallback is "not-pageable" (the client then does a full replay): the cursor row is
+//   not located exactly once in the scanned range, a readable row in that range has no numeric
+//   sequence, or no clean turn start fits the budget. Rows newer than the cursor are skipped,
+//   neither kept nor counted; oversized and malformed rows are counted, never classified.
+// - "before-epoch" means no active-epoch row precedes the cursor (the cursor is the epoch's first
+//   row, or older): the caller pages older epochs as before.
+
+// Since reconnects of a windowed client (#4961 PR2b) reuse it too. Contract of
+// readProviderHistorySince, for a client whose rows run from its floor row to its anchor row:
+// - "range" is the suffix of full replay from the floor row (the row whose historySequence is
+//   `floor`) to EOF. Rows older than the floor row are never read.
+// - It holds at most two windows (`caps` twice): the client's rows plus a delta, where the delta
+//   (rows newer than the anchor row) alone fits `caps`.
+// - The only other result is "not-in-range": the floor row is not in the active epoch within that
+//   budget (a compaction or reset since, truncated, or too old), or a second row carries the
+//   anchor's sequence. The caller then does a fresh windowed full replay.
+// - It checks nothing else: the caller's since checks (anchor row, oldest sequence, fingerprint)
+//   run on the returned rows. Oversized rows are never matched as the floor or anchor row (the
+//   locator does not parse them), which only makes the read stricter.
+
+export interface HistoryWindowCaps {
+  maxRows: number;
+  maxBytes: number;
+}
+
+export type HistoryWindow =
+  | { kind: "window"; messages: MuxMessage[]; reachedEpochStart: boolean }
+  | { kind: "not-windowable" };
+
+export type HistoryPage =
+  | { kind: "page"; messages: MuxMessage[]; reachedEpochStart: boolean }
+  | { kind: "not-pageable" }
+  | { kind: "before-epoch" };
+
+export async function readProviderHistoryWindow(
+  paths: Record<HistoryArtifact, string>,
+  caps: HistoryWindowCaps
+): Promise<HistoryWindow> {
+  const tail = await readActiveEpochTail(paths, caps, undefined);
+  assert(tail.kind !== "before-epoch", "a window has no cursor");
+  return tail.kind === "page" ? { ...tail, kind: "window" } : { kind: "not-windowable" };
+}
+
+export function readProviderHistoryPage(
+  paths: Record<HistoryArtifact, string>,
+  caps: HistoryWindowCaps,
+  beforeHistorySequence: number
+): Promise<HistoryPage> {
+  assert(isNonNegativeInteger(beforeHistorySequence), "page cursor must be a sequence");
+  return readActiveEpochTail(paths, caps, beforeHistorySequence);
+}
+
+export type HistorySinceRange =
+  | { kind: "range"; messages: MuxMessage[] }
+  | { kind: "not-in-range" };
+
+export async function readProviderHistorySince(
+  paths: Record<HistoryArtifact, string>,
+  caps: HistoryWindowCaps,
+  since: { floor: number; anchor: number }
+): Promise<HistorySinceRange> {
+  assert(isNonNegativeInteger(since.floor), "since floor must be a sequence");
+  assert(isNonNegativeInteger(since.anchor), "since anchor must be a sequence");
+  const tail = await readActiveEpochTail(paths, caps, undefined, since);
+  return tail.kind === "page"
+    ? { kind: "range", messages: tail.messages }
+    : { kind: "not-in-range" };
+}
+
+/**
+ * The newest rows of the active epoch that precede the `before` row (or EOF when undefined), or
+ * with `since`, the rows from EOF back to the floor row.
+ */
+function readActiveEpochTail(
+  paths: Record<HistoryArtifact, string>,
+  caps: HistoryWindowCaps,
+  before: number | undefined,
+  since?: { floor: number; anchor: number }
+): Promise<HistoryPage> {
+  assert(Number.isSafeInteger(caps.maxRows) && caps.maxRows > 0, "window maxRows must be > 0");
+  assert(Number.isSafeInteger(caps.maxBytes) && caps.maxBytes > 0, "window maxBytes must be > 0");
+  return withVerifiedHistorySnapshot(paths, async (files) => {
+    // Newest first, like scanHistorySnapshot: rows starting before a file's located start are
+    // not part of full replay, and the archive is read only after chat.jsonl is exhausted.
+    const kept: Array<{ file: HistorySnapshotFile; row: ScannedHistoryRow }> = [];
+    let rows = 0;
+    let bytes = 0;
+    let overBudget = false;
+    // Page cursor state; a window starts at EOF, so its cursor is "located" from the start.
+    let cursor: { file: HistorySnapshotFile; start: number } | undefined;
+    let unpageable = false;
+    let oldestSequence: number | undefined;
+    // Since state: the cursor is the floor row.
+    let anchorSeen = false;
+    const sinceRange = { maxRows: 2 * caps.maxRows, maxBytes: 2 * caps.maxBytes };
+    for (const artifact of ["chat", "archive"] as const) {
+      const file = files.get(artifact);
+      if (!file) continue;
+      const fileRows: ScannedHistoryRow[] = [];
+      const location = await findProviderHistoryStart(file.handle, file.size, 0, false, (row) => {
+        if (before !== undefined && row.message) {
+          const sequence = row.message.metadata?.historySequence;
+          if (!isNonNegativeInteger(sequence)) unpageable = true;
+          else {
+            oldestSequence = sequence;
+            if (sequence === before) {
+              if (cursor) unpageable = true;
+              cursor = { file, start: row.start };
+              return false;
+            }
+          }
+        }
+        if (before !== undefined && !cursor) return unpageable;
+        const rowSequence = row.message?.metadata?.historySequence;
+        if (since && rowSequence === since.anchor) {
+          if (anchorSeen) unpageable = true;
+          anchorSeen = true;
+        }
+        // Since: the delta (rows newer than the anchor row) fits one window, the whole range two.
+        const limit = since && anchorSeen ? sinceRange : caps;
+        if (!overBudget && rows < limit.maxRows && bytes + row.size <= limit.maxBytes) {
+          rows++;
+          bytes += row.size;
+          fileRows.push(row);
+        } else overBudget = true;
+        if (since && rowSequence === since.floor && !overBudget) {
+          cursor = { file, start: row.start };
+          return true;
+        }
+        // Monotonic: the locator honors the stop at the next readable row. Every row visited up
+        // to there is in full replay, and rows past the budget were counted, never kept.
+        return overBudget || unpageable;
+      });
+      const from = location.kind === "start" ? location.offset : 0;
+      // A cursor row below the file's epoch start is not a row of full replay.
+      if (cursor?.file === file && cursor.start < from) unpageable = true;
+      for (const row of fileRows) if (row.start >= from) kept.push({ file, row });
+      if (location.kind !== "exhausted" || overBudget || unpageable) break;
+    }
+    if (unpageable) return { kind: "not-pageable" };
+    // The floor row is found only within the budget; the since read then ends at it.
+    if (since && !cursor) return { kind: "not-pageable" };
+    if (before !== undefined && !cursor) {
+      // Missing from the epoch: older than all of it, or gone (truncated) while held.
+      const older = oldestSequence === undefined || before < oldestSequence;
+      return { kind: older ? "before-epoch" : "not-pageable" };
+    }
+    const messages: MuxMessage[] = [];
+    for (let i = kept.length - 1; i >= 0; i--) {
+      const message = await projectScannedRow(kept[i].file, kept[i].row, false);
+      if (message) messages.push(message);
+    }
+    // Within budget, the scan reached the epoch start (or read all history): the whole epoch.
+    if (!overBudget) {
+      if (before !== undefined && messages.length === 0) return { kind: "before-epoch" };
+      return { kind: "page", messages, reachedEpochStart: true };
+    }
+    // Otherwise the oldest kept row's turn may begin before the budget: trim forward only.
+    const start = messages.findIndex(
+      (message, i) => i > 0 && message.role === "user" && messages[i - 1].role === "assistant"
+    );
+    if (start === -1) return { kind: "not-pageable" };
+    // The next page ends right before this row, so it needs a sequence (an oversized row's
+    // sequence is only known here).
+    const first = messages[start].metadata?.historySequence;
+    if (before !== undefined && !isNonNegativeInteger(first)) return { kind: "not-pageable" };
+    return { kind: "page", messages: messages.slice(start), reachedEpochStart: false };
+  });
 }
 
 /** Exact occurrence evidence shares the verified boundary scan; never persist it in legacy fallback tags. */
@@ -594,7 +1518,8 @@ export async function scanHistoryFilesBounded(
       assert(length >= 0 && result.bytesRead + length <= maxBytes);
       const buffer = Buffer.alloc(length);
       const bytesRead = handles.has(artifact)
-        ? (await handles.get(artifact)!.read(buffer, 0, length, start)).bytesRead
+        ? // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+          (await handles.get(artifact)!.read(buffer, 0, length, start)).bytesRead
         : 0;
       result.bytesRead += bytesRead;
       options.abortSignal?.throwIfAborted();
@@ -638,7 +1563,9 @@ export async function scanHistoryFilesBounded(
       ? structuredClone(options.cursor)
       : {
           provenanceEpoch,
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           snapshots: { chat: initialChat!, archive: await snapshot("archive") },
+          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
           validatedChatSnapshot: initialChat!,
           phase: "floor",
           recentFirst: options.recentFirst === true,
@@ -899,7 +1826,9 @@ export async function scanHistoryFilesBounded(
     // boundary row (or the floor), retaining only locations. Returns false when
     // the page budget ran out.
     const probePage = async (): Promise<boolean> => {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const probe = state.probe!;
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const floor = state.floor!;
       assert(probe && floor, "newest-first probe requires floor and probe state");
       const lower = probe.artifact === floor.artifact ? floor.byteOffset : 0;
@@ -955,7 +1884,9 @@ export async function scanHistoryFilesBounded(
     // Reverse delivery of one discovered span, from its end (state position) down
     // to its boundary row, crossing the chat -> archive seam when the span does.
     const deliverPage = async (): Promise<boolean> => {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const span = state.span!;
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const floor = state.floor!;
       assert(span && floor, "newest-first delivery requires span and floor state");
       const artifact = state.artifact;
@@ -1044,6 +1975,7 @@ export async function scanHistoryFilesBounded(
             // Keep the legacy cursor field, but sequence coverage is not replay proof.
             const sequence = message?.metadata?.historySequence;
             if (artifact === "archive" && Number.isSafeInteger(sequence))
+              // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
               state.archiveWatermark = Math.max(state.archiveWatermark, sequence!);
             if (isManualHistoryReset(message, possibleReset)) {
               // Corrupt reset rows are privacy floors even when they parse or
@@ -1061,6 +1993,7 @@ export async function scanHistoryFilesBounded(
           assert(raw, "readable browse rows retain their bounded raw bytes");
           const sequence = message.metadata?.historySequence;
           const anchorSequence =
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
             Number.isSafeInteger(sequence) && sequence! >= 0 ? sequence! : null;
           // Repaired/imported rows may reuse archived sequences with different
           // identities or payloads. Retain possible replays without exact proof.

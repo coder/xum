@@ -1,8 +1,7 @@
 /**
- * Guest-side protocol for Tier-1 sandboxed plugin hooks (agent-plugins
- * experiment): a plugin's `hooks.js` runs inside a QuickJS sandbox mount, and
- * the host adapter (hookService.ts) marshals event-spine contexts in and hook
- * outputs back out as JSON.
+ * Guest-side protocol for Tier-1 sandboxed plugin hooks: a plugin's `hooks.js`
+ * runs inside a QuickJS sandbox mount, and the host adapter (hookService.ts)
+ * marshals event-spine contexts in and hook outputs back out as JSON.
  *
  * Module shape (mirrors OpenCode's validated hook vocabulary): `hooks.js` is a
  * script whose completion value is an object mapping hook names to functions,

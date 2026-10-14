@@ -4,7 +4,11 @@
  */
 
 import type { ModelMessage, AssistantModelMessage, ToolModelMessage } from "ai";
-import type { MuxMessage } from "@/common/types/message";
+import {
+  isContextBudgetWarningMessage,
+  type MuxMessage,
+  type MuxReasoningPart,
+} from "@/common/types/message";
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import { MAX_POST_COMPACTION_INJECTION_CHARS } from "@/common/constants/attachments";
 import { hasProviderReplayableContent } from "@/common/utils/messages/providerEligibility";
@@ -137,7 +141,7 @@ export function injectAgentTransition(
   // Find the index of the last user message
   let lastUserIndex = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === "user") {
+    if (messages[i].role === "user" && !isContextBudgetWarningMessage(messages[i])) {
       lastUserIndex = i;
       break;
     }
@@ -499,6 +503,20 @@ function filterReasoningOnlyMessages(messages: ModelMessage[]): ModelMessage[] {
 }
 
 /**
+ * Drop every replayed reasoning part, and the assistant rows that held only
+ * reasoning (Sonnet 5.5 `between_tools`, #5086).
+ */
+export function stripAnthropicReasoning(messages: ModelMessage[]): ModelMessage[] {
+  return filterReasoningOnlyMessages(
+    messages.map((msg) =>
+      msg.role === "assistant" && typeof msg.content !== "string"
+        ? { ...msg, content: msg.content.filter((part) => part.type !== "reasoning") }
+        : msg
+    )
+  );
+}
+
+/**
  * Remove tool-call/tool-result parts that do not have a matching counterpart.
  *
  * Some providers (e.g., OpenAI responses) reject requests when a tool call is
@@ -852,15 +870,15 @@ function stripUnsignedAnthropicReasoning(messages: ModelMessage[]): ModelMessage
       return msg;
     }
 
-    // Filter out reasoning parts without anthropic.signature in providerOptions
+    // Keep reasoning the SDK can replay: signed `thinking` blocks and
+    // `redacted_thinking` blocks (redactedData, no signature). Dropping a replayable
+    // block would move every later block off the prefix it was signed against.
     const content = assistantMsg.content.filter((part) => {
       if (part.type !== "reasoning") {
         return true;
       }
-      // Check for anthropic.signature in providerOptions
-      const anthropicMeta = (part.providerOptions as { anthropic?: { signature?: string } })
-        ?.anthropic;
-      return anthropicMeta?.signature != null;
+      const anthropicMeta = anthropicReasoningMeta(part);
+      return anthropicMeta?.signature != null || anthropicMeta?.redactedData != null;
     });
 
     const result: typeof assistantMsg = { ...assistantMsg, content };
@@ -885,11 +903,38 @@ function stripUnsignedAnthropicReasoning(messages: ModelMessage[]): ModelMessage
   });
 }
 
+type AnthropicReasoningMeta = NonNullable<MuxReasoningPart["providerOptions"]>["anthropic"];
+
+function anthropicReasoningMeta(part: {
+  providerOptions?: Record<string, unknown>;
+}): AnthropicReasoningMeta | undefined {
+  return part.providerOptions?.anthropic as AnthropicReasoningMeta | undefined;
+}
+
+/**
+ * Whether `part` continues the reasoning block that `lastPart` belongs to.
+ * Anthropic signs the LAST streamed part of each thinking block, so a signed
+ * part closes its block: merging the next part into it would fuse two blocks
+ * under one signature and invalidate every later block (preserved thinking).
+ * A redacted_thinking block is one opaque part and never merges either way.
+ */
+function continuesReasoningBlock(
+  lastPart: { providerOptions?: Record<string, unknown>; signature?: string },
+  part: { providerOptions?: Record<string, unknown> }
+): boolean {
+  const lastMeta = anthropicReasoningMeta(lastPart);
+  if (lastMeta?.signature != null || lastMeta?.redactedData != null || lastPart.signature) {
+    return false;
+  }
+  return anthropicReasoningMeta(part)?.redactedData == null;
+}
+
 /**
  * Coalesce consecutive parts of the same type within each message.
  * Streaming creates many individual text/reasoning parts; merge them for easier debugging.
  * Also reduces JSON overhead when sending messages to the API.
- * Tool calls remain atomic (not merged).
+ * Tool calls remain atomic (not merged). Reasoning merges only within one
+ * provider block (see continuesReasoningBlock).
  */
 function coalesceConsecutiveParts(messages: ModelMessage[]): ModelMessage[] {
   return messages.map((msg) => {
@@ -918,8 +963,12 @@ function coalesceConsecutiveParts(messages: ModelMessage[]): ModelMessage[] {
         continue;
       }
 
-      // Merge consecutive reasoning parts (extended thinking)
-      if (part.type === "reasoning" && lastPart?.type === "reasoning") {
+      // Merge consecutive reasoning parts of one block (extended thinking)
+      if (
+        part.type === "reasoning" &&
+        lastPart?.type === "reasoning" &&
+        continuesReasoningBlock(lastPart, part)
+      ) {
         lastPart.text += part.text;
         // Streaming splits one reasoning block across many parts and replay
         // metadata can land on any of them: Anthropic signatures arrive on the
@@ -968,19 +1017,20 @@ function mergeConsecutiveUserMessages(messages: ModelMessage[]): ModelMessage[] 
       // Consecutive user message - merge with previous
       const prevMsg = merged[merged.length - 1];
 
-      // Get text content from both messages
-      const prevText = Array.isArray(prevMsg.content)
-        ? (prevMsg.content.find((c) => c.type === "text")?.text ?? "")
-        : prevMsg.content;
-
-      const currentText = Array.isArray(msg.content)
-        ? (msg.content.find((c) => c.type === "text")?.text ?? "")
-        : typeof msg.content === "string"
-          ? msg.content
-          : "";
-
-      // Merge with newline prefix
-      const mergedText = prevText + "\n" + currentText;
+      // Every text part of both messages, joined by newlines: a message can carry several (an
+      // SVG attachment becomes a second text part, inlineSvgAsTextForProvider), and keeping only
+      // the first silently dropped the rest from the provider request. A message without text
+      // counts as one empty text, so single-text merges keep their exact bytes.
+      const textsOf = (content: ModelMessage["content"]): string[] => {
+        const texts =
+          typeof content === "string"
+            ? [content]
+            : Array.isArray(content)
+              ? content.flatMap((c) => (c.type === "text" ? [c.text] : []))
+              : [];
+        return texts.length > 0 ? texts : [""];
+      };
+      const mergedText = [...textsOf(prevMsg.content), ...textsOf(msg.content)].join("\n");
 
       // Collect file/image parts from both messages
       const prevImageParts = Array.isArray(prevMsg.content)
@@ -1085,7 +1135,12 @@ function ensureAnthropicThinkingBeforeToolCalls(messages: ModelMessage[]): Model
 
     const content = assistantMsg.content;
     const hasToolCall = content.some((part) => part.type === "tool-call");
-    if (!hasToolCall) {
+    // A message that already starts with thinking meets the API rule (manual thinking: the
+    // final assistant turn must start with a thinking block). Keep its block order: with
+    // interleaved thinking, text can sit between two thinking blocks, and moving a block
+    // edits the prefix every later block is bound to (#5887). Preserved thinking: "send it
+    // back unchanged ... in the order received".
+    if (!hasToolCall || content[0]?.type === "reasoning") {
       result.push(msg);
       continue;
     }
@@ -1192,6 +1247,8 @@ export function transformModelMessages(
   provider: string,
   options?: {
     anthropicThinkingEnabled?: boolean;
+    /** Drop every replayed reasoning part (Sonnet 5.5 `between_tools`, #5086). */
+    anthropicStripReasoning?: boolean;
   }
 ): ModelMessage[] {
   // Pass 0: Coalesce consecutive parts to reduce JSON overhead from streaming (applies to all providers)
@@ -1221,7 +1278,9 @@ export function transformModelMessages(
       const signedReasoning = stripUnsignedAnthropicReasoning(taskAwaitCoalesced);
       reasoningHandled = ensureAnthropicThinkingBeforeToolCalls(signedReasoning);
     } else {
-      reasoningHandled = filterReasoningOnlyMessages(taskAwaitCoalesced);
+      reasoningHandled = options?.anthropicStripReasoning
+        ? stripAnthropicReasoning(taskAwaitCoalesced)
+        : filterReasoningOnlyMessages(taskAwaitCoalesced);
     }
   } else {
     // Unknown provider: no reasoning handling
@@ -1323,68 +1382,4 @@ export function validateAnthropicCompliance(messages: ModelMessage[]): {
   }
 
   return { valid: true };
-}
-
-function hasAnthropicThinkingSignature(part: { providerOptions?: unknown } | undefined): boolean {
-  const providerOptions = part?.providerOptions as
-    | { anthropic?: { signature?: unknown } }
-    | undefined;
-  return (
-    typeof providerOptions?.anthropic?.signature === "string" &&
-    providerOptions.anthropic.signature.length > 0
-  );
-}
-
-/**
- * Anthropic Extended Thinking self-healing check.
- *
- * When Anthropic `thinking` is enabled, the API requires that assistant messages containing
- * tool calls begin with a thinking block. The AI SDK only replays thinking blocks when the
- * reasoning part includes a valid Anthropic signature.
- *
- * If we have tool-call messages but no signed reasoning to replay, Anthropic rejects the
- * request with errors like:
- * "Expected thinking or redacted_thinking, but found tool_use."
- *
- * In that case, the safest fallback is to disable thinking for the request.
- */
-export function getAnthropicThinkingDisableReason(messages: ModelMessage[]): string | undefined {
-  for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i];
-    if (msg.role !== "assistant") {
-      continue;
-    }
-
-    // String-only assistant messages never contain tool calls.
-    if (typeof msg.content === "string") {
-      continue;
-    }
-
-    // Treat unsigned reasoning as absent (the AI SDK will drop it).
-    const content = msg.content.filter(
-      (part) => part.type !== "reasoning" || hasAnthropicThinkingSignature(part)
-    );
-
-    const hasToolCall = content.some((part) => part.type === "tool-call");
-    if (!hasToolCall) {
-      continue;
-    }
-
-    const firstPart = content[0];
-    if (!firstPart) {
-      // Shouldn't happen, but defensively treat it as unsupported.
-      return `Message ${i}: tool-call assistant message became empty after stripping unsigned reasoning`;
-    }
-
-    if (firstPart.type !== "reasoning") {
-      return `Message ${i}: tool-call assistant message does not start with signed reasoning (starts with ${firstPart.type})`;
-    }
-
-    if (!hasAnthropicThinkingSignature(firstPart)) {
-      // Shouldn't happen because we filtered, but keep error message explicit.
-      return `Message ${i}: assistant message starts with reasoning but is missing anthropic.signature`;
-    }
-  }
-
-  return undefined;
 }

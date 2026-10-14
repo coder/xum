@@ -315,7 +315,7 @@ export function getBashPath(
 }
 
 /** Reset cached bash path (used by tests). */
-export function resetBashPathCache(): void {
+export function resetBashPathCacheForTests(): void {
   cachedBashPath = null;
   cachedBashPathError = null;
   cachedUnixBashPath = null;

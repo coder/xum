@@ -3,6 +3,7 @@ import {
   ArrowDownToLine,
   ArrowLeft,
   CircleAlert,
+  ExternalLink,
   Loader2,
   Plus,
   RefreshCw,
@@ -17,6 +18,7 @@ import { cn } from "@/common/lib/utils";
 import type {
   AgentPluginComponents,
   AgentPluginInstallPreview,
+  AgentPluginInterfaceSummary,
   AgentPluginListItem,
   AgentPluginUpdateCheck,
   AgentPluginUpdateReview,
@@ -29,9 +31,14 @@ import {
   subscribePluginsSectionIntents,
   type PluginsSectionIntent,
 } from "./pluginsSectionIntents";
+import {
+  describePluginHookHandler,
+  PLUGIN_HOOK_STATUS_NOTE,
+  PluginHooksPanel,
+} from "./PluginHooksPanel";
 
 /**
- * Settings → Plugins (agent-plugins experiment; global scope only).
+ * Settings → Plugins (global scope only).
  *
  * Managed installs come from the `~/.mux/plugins.json` registry;
  * unmanaged plugin directories found by discovery are listed read-only.
@@ -54,11 +61,14 @@ function formatSource(item: AgentPluginListItem): string | null {
 
 const Badge: React.FC<{
   tone: "muted" | "accent" | "warning" | "error";
+  /** Manifest text (up to 120 chars) must wrap on narrow cards; status words stay on one line. */
+  wrap?: boolean;
   children: React.ReactNode;
 }> = (props) => (
   <span
     className={cn(
-      "rounded px-1.5 py-0.5 text-[10px] font-medium whitespace-nowrap",
+      "rounded px-1.5 py-0.5 text-[10px] font-medium",
+      props.wrap === true ? "max-w-full wrap-anywhere" : "whitespace-nowrap",
       props.tone === "muted" && "bg-foreground/10 text-muted",
       props.tone === "accent" && "bg-accent/15 text-accent",
       props.tone === "warning" && "bg-warning/15 text-warning",
@@ -68,6 +78,60 @@ const Badge: React.FC<{
     {props.children}
   </span>
 );
+
+/**
+ * OpenAI `interface` metadata. Every manifest string renders as React text
+ * (escaped, no HTML or markdown). The logo is a backend-read data URL, links
+ * are https only and open externally (the desktop main process routes
+ * _blank navigations through shell.openExternal).
+ */
+const PluginInterfaceDetails: React.FC<{ info: AgentPluginInterfaceSummary }> = (props) => {
+  const links: Array<{ label: string; url: string | undefined }> = [
+    { label: "Website", url: props.info.websiteURL },
+    { label: "Privacy", url: props.info.privacyPolicyURL },
+    { label: "Terms", url: props.info.termsOfServiceURL },
+    { label: "Support", url: props.info.supportURL },
+  ];
+  const httpsLinks = links.filter((link) => link.url?.startsWith("https://") === true);
+  return (
+    <div className="mt-1 flex min-w-0 items-start gap-2" data-testid="plugin-interface">
+      {props.info.logoDataUrl?.startsWith("data:image/") && (
+        <img src={props.info.logoDataUrl} alt="" className="size-8 shrink-0 rounded" />
+      )}
+      <div className="min-w-0 space-y-0.5">
+        <p className="text-foreground text-xs break-words">
+          <span className="font-medium">{props.info.displayName}</span>
+          <span className="text-muted"> · by {props.info.developerName}</span>
+        </p>
+        <p className="text-muted text-xs break-words">{props.info.shortDescription}</p>
+        {props.info.capabilities !== undefined && props.info.capabilities.length > 0 && (
+          <div className="flex flex-wrap gap-1">
+            {props.info.capabilities.map((capability) => (
+              <Badge key={capability} tone="muted" wrap>
+                {capability}
+              </Badge>
+            ))}
+          </div>
+        )}
+        {httpsLinks.length > 0 && (
+          <div className="flex flex-wrap gap-x-3 text-[11px]">
+            {httpsLinks.map(({ label, url }) => (
+              <a
+                key={label}
+                href={url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-link inline-flex items-center gap-1"
+              >
+                {label} <ExternalLink aria-hidden className="size-3" />
+              </a>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
 
 /** Only skills/MCP are selective; keep full-package consent below this shared chooser. */
 const ComponentChooser: React.FC<{
@@ -546,6 +610,9 @@ const AddPluginPanel: React.FC<{
             {preview.manifest.description && (
               <p className="text-muted text-xs">{preview.manifest.description}</p>
             )}
+            {preview.manifest.interface && (
+              <PluginInterfaceDetails info={preview.manifest.interface} />
+            )}
             {/* break-all: URLs and a 64-char separator-free plugin dir name
                 have no natural break points and would overflow the card on
                 phone widths. */}
@@ -627,6 +694,34 @@ const AddPluginPanel: React.FC<{
                     {command.description && (
                       <span className="text-muted"> — {command.description}</span>
                     )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {preview.codexHooks.length > 0 && (
+            <div>
+              <h4 className="text-foreground mb-1 text-xs font-medium">
+                hooks.json hooks ({preview.codexHooks.length})
+              </h4>
+              {/* Install trusts none of them (Codex trust per hash): consent must say so. */}
+              <p className="text-muted mb-1 text-xs">
+                None of these run until you trust each one in Settings → Plugins.
+              </p>
+              <ul className="space-y-1">
+                {preview.codexHooks.map((hook) => (
+                  <li key={hook.key} className="text-xs break-all">
+                    <span className="text-foreground font-mono">{hook.event}</span>
+                    {hook.matcher !== undefined && (
+                      <span className="text-muted font-mono"> ({hook.matcher})</span>
+                    )}
+                    <span className="text-muted">
+                      {" "}
+                      — {describePluginHookHandler(hook.handler)}
+                      {PLUGIN_HOOK_STATUS_NOTE[hook.status] != null &&
+                        `. ${PLUGIN_HOOK_STATUS_NOTE[hook.status] ?? ""}`}
+                    </span>
                   </li>
                 ))}
               </ul>
@@ -832,6 +927,9 @@ export const PluginsSettingsSection: React.FC = () => {
   const [componentsTarget, setComponentsTarget] = useState<string | null>(
     initialIntent?.type === "manage-components" ? initialIntent.name : null
   );
+  const [hooksTarget, setHooksTarget] = useState<string | null>(
+    initialIntent?.type === "review-hooks" ? initialIntent.name : null
+  );
   const [installSucceeded, setInstallSucceeded] = useState(false);
   /** Name of the plugin with an update/uninstall in flight. */
   const [busyPlugin, setBusyPlugin] = useState<string | null>(null);
@@ -921,6 +1019,9 @@ export const PluginsSettingsSection: React.FC = () => {
           break;
         case "manage-components":
           setComponentsTarget(intent.name);
+          break;
+        case "review-hooks":
+          setHooksTarget(intent.name);
           break;
         case "confirm-uninstall":
           setUninstallTarget(intent.name);
@@ -1030,16 +1131,6 @@ export const PluginsSettingsSection: React.FC = () => {
 
   return (
     <div className="space-y-6">
-      {/* Mirrors the Backup section's experimental posture: nav flask icon
-          (SettingsPage `experimental: true`) + in-section warning banner. */}
-      <div className="bg-warning/10 border-warning/30 text-warning flex items-start gap-2 rounded-md border px-3 py-2 text-xs">
-        <TriangleAlert aria-hidden="true" className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-        <p>
-          Agent Plugins are experimental. The plugin format and install behavior may change or be
-          removed in a future release; use them carefully.
-        </p>
-      </div>
-
       <div>
         <p className="text-muted mb-4 text-xs">
           Install Agent Plugins from git repositories into{" "}
@@ -1160,6 +1251,7 @@ export const PluginsSettingsSection: React.FC = () => {
                       {item.description && (
                         <p className="text-muted mt-0.5 text-xs">{item.description}</p>
                       )}
+                      {item.interface && <PluginInterfaceDetails info={item.interface} />}
                       {/* break-all: locations/sources can contain unbreakable
                           64-char tokens (max-length plugin names) that would
                           otherwise overflow the card at phone widths. */}
@@ -1194,6 +1286,20 @@ export const PluginsSettingsSection: React.FC = () => {
                             aria-label={`Manage components for ${item.name}`}
                           >
                             Manage components
+                          </Button>
+                        )}
+                        {item.present && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-7 px-2 text-xs"
+                            disabled={busyPlugin !== null}
+                            onClick={() =>
+                              setHooksTarget(hooksTarget === item.name ? null : item.name)
+                            }
+                            aria-label={`Review hooks for ${item.name}`}
+                          >
+                            Hooks
                           </Button>
                         )}
                         {updateAvailable && (
@@ -1242,6 +1348,15 @@ export const PluginsSettingsSection: React.FC = () => {
                       name={item.name}
                       onSaved={refresh}
                       onClose={() => setComponentsTarget(null)}
+                    />
+                  )}
+                  {item.managed && item.present && hooksTarget === item.name && (
+                    <PluginHooksPanel
+                      // Keyed by the installed commit too: an update (here or from the palette)
+                      // remounts the panel, so it never shows the old hooks and trust states.
+                      key={`${item.name}@${item.lockedSha ?? ""}`}
+                      name={item.name}
+                      onClose={() => setHooksTarget(null)}
                     />
                   )}
                   {item.managed && updateReview?.name === item.name && (

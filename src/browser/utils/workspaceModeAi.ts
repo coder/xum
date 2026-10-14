@@ -38,16 +38,39 @@ export function resolveConfiguredAiDefaults(
   agentId: string,
   agentAiDefaults: AgentAiDefaults,
   agentBaseById?: ReadonlyMap<string, string | undefined>
-): { modelString?: string; thinkingLevel?: ThinkingLevel; reasoningMode?: OpenAIReasoningMode } {
+): {
+  modelString?: string;
+  thinkingLevel?: ThinkingLevel;
+  reasoningMode?: OpenAIReasoningMode;
+  // Each Auto flag is true only when the nearest config layer deciding that dimension chose Auto.
+  autoModelRouting?: true;
+  autoThinkingLevel?: true;
+} {
   const normalizedAgentId = normalizeAgentId(agentId);
   const descriptorsById = new Map([...(agentBaseById ?? [])].map(([id, base]) => [id, { base }]));
+  const ancestors = collectDeclaredAncestorLayers(normalizedAgentId, descriptorsById);
   const resolved = resolveAgentAiSettings({
     targetAgentId: normalizedAgentId,
     profile: "interactive",
     agentAiDefaults,
-    ancestors: collectDeclaredAncestorLayers(normalizedAgentId, descriptorsById),
+    ancestors,
   });
   const fromConfig = (source: AiSettingSource | undefined) => source?.tier === "config";
+
+  // The nearest declared layer setting Auto or a concrete value decides each dimension.
+  // The implicit exec fallback contributes only reasoningMode.
+  const chainIds = [normalizedAgentId, ...ancestors.map((ancestor) => ancestor.agentId)];
+  const resolveConfiguredAuto = (
+    flag: "autoModelRouting" | "autoThinkingLevel",
+    source: AiSettingSource | undefined
+  ): true | undefined => {
+    for (const id of chainIds) {
+      if (agentAiDefaults[id]?.[flag] === true) return true;
+      if (fromConfig(source) && source?.agentId === id) return undefined;
+    }
+    return undefined;
+  };
+
   return {
     modelString: fromConfig(resolved.sources.model) ? resolved.selected.model : undefined,
     thinkingLevel: fromConfig(resolved.sources.thinkingLevel)
@@ -56,6 +79,8 @@ export function resolveConfiguredAiDefaults(
     reasoningMode: fromConfig(resolved.sources.reasoningMode)
       ? resolved.selected.reasoningMode
       : undefined,
+    autoModelRouting: resolveConfiguredAuto("autoModelRouting", resolved.sources.model),
+    autoThinkingLevel: resolveConfiguredAuto("autoThinkingLevel", resolved.sources.thinkingLevel),
   };
 }
 

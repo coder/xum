@@ -5,17 +5,27 @@ import {
   useEffect,
   useMemo,
   useRef,
+  useState,
   type ReactNode,
 } from "react";
-import { MemoryRouter, useLocation, useNavigate, useSearchParams } from "react-router-dom";
+import {
+  BrowserRouter,
+  MemoryRouter,
+  useLocation,
+  useNavigate,
+  NavigationType,
+  useNavigationType,
+  type NavigateFunction,
+} from "react-router-dom";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
+  INITIAL_APP_PROXY_BASE_PATH,
   prependInitialAppProxyBasePath,
   stripInitialAppProxyBasePathFromPathname,
 } from "@/browser/utils/frontendBasePath";
+import { getUserPreferences } from "@/browser/stores/AppConfigStore";
 import {
   LAST_VISITED_ROUTE_KEY,
-  LAUNCH_BEHAVIOR_KEY,
   SELECTED_WORKSPACE_KEY,
   type LaunchBehavior,
 } from "@/common/constants/storage";
@@ -34,9 +44,17 @@ export interface RouterContext {
   navigateFromSettings: () => void;
   navigateToAnalytics: () => void;
   navigateFromAnalytics: () => void;
+  /** In-app history back. Never leaves Xum, even when the browser tab has older entries. */
+  navigateBack: () => void;
+  navigateForward: () => void;
+  /**
+   * True when app navigation lives in the browser tab's own history, so the browser (and mouse)
+   * Back and Forward buttons already move inside the app.
+   */
+  usesBrowserHistory: boolean;
   currentWorkspaceId: string | null;
 
-  /** Settings section from URL (null when not on settings page). */
+  /** Settings section from URL (null when settings is closed). */
   currentSettingsSection: string | null;
 
   /** Project identifier from URL (does not include full filesystem path). */
@@ -182,8 +200,9 @@ function getInitialRoute(): string {
   const isStorybook = routePathname.endsWith("iframe.html");
   const isStandalone = isStandalonePwa();
   const navigationType = getStartupNavigationType();
+  // The startup gate holds RouterProvider until the store's first snapshot (or its timeout).
   const launchBehavior = !isStandalone
-    ? readPersistedState<LaunchBehavior>(LAUNCH_BEHAVIOR_KEY, "dashboard")
+    ? (getUserPreferences().navigation?.launchBehavior ?? "dashboard")
     : null;
 
   if (window.location.protocol === "file:") {
@@ -219,7 +238,7 @@ function getInitialRoute(): string {
   // In Storybook, stories seed localStorage via selectWorkspace() during setup.
   // Read that selection so stories start at the correct workspace view.
   if (isStorybook) {
-    const savedWorkspace = readPersistedState<WorkspaceSelection | null>(
+    const savedWorkspace = readPersistedState<Pick<WorkspaceSelection, "workspaceId"> | null>(
       SELECTED_WORKSPACE_KEY,
       null
     );
@@ -229,7 +248,7 @@ function getInitialRoute(): string {
   }
 
   if (!isStandalone && launchBehavior === "last-workspace") {
-    const savedWorkspace = readPersistedState<WorkspaceSelection | null>(
+    const savedWorkspace = readPersistedState<Pick<WorkspaceSelection, "workspaceId"> | null>(
       SELECTED_WORKSPACE_KEY,
       null
     );
@@ -243,10 +262,58 @@ function getInitialRoute(): string {
   return "/";
 }
 
+const EMBEDDED_INITIAL_ROUTE = "/";
+
+/**
+ * A plain browser tab (server mode) keeps app navigation in the tab's own history, so the
+ * browser's Back and Forward buttons move inside Xum instead of leaving it (#5699). Every other
+ * host keeps an in-memory history: Electron (window.api, including dev builds served over http;
+ * its file:// reloads restore the route from localStorage), the VS Code webview (embedded, whose
+ * document URL is not an app route), Storybook, and the standalone PWA (App.tsx keeps it in the
+ * app with its own popstate handler).
+ */
+function shouldUseBrowserHistory(embedded: boolean): boolean {
+  if (embedded || window.api) return false;
+  if (window.location.protocol !== "http:" && window.location.protocol !== "https:") return false;
+  if (stripInitialAppProxyBasePathFromPathname(window.location.pathname).endsWith("iframe.html")) {
+    return false;
+  }
+  return !isStandalonePwa();
+}
+
+/** react-router's browser history stores its entry index in history.state.idx. */
+function getBrowserHistoryIndex(): number {
+  const state: unknown = window.history.state;
+  if (!state || typeof state !== "object" || !("idx" in state)) return 0;
+  const idx = (state as { idx?: unknown }).idx;
+  return typeof idx === "number" ? idx : 0;
+}
+
+/**
+ * Close a route-backed modal. In a browser tab, step back to the page's own entry: pushing a copy
+ * would leave the modal for the browser's Back to reopen. Otherwise (in-memory history, or an
+ * entry without an index) push the page with its state.
+ */
+function returnToBackground(
+  navigate: NavigateFunction,
+  usesBrowserHistory: boolean,
+  background: ModalBackgroundLocation
+): void {
+  if (usesBrowserHistory && background.historyIdx !== undefined) {
+    const delta = background.historyIdx - getBrowserHistoryIndex();
+    if (delta < 0) {
+      void navigate(delta);
+      return;
+    }
+  }
+  void navigate(background.pathname + background.search, { state: background.state });
+}
+
 /** Sync router state to browser URL (dev server) and persist the desktop route. */
-function useUrlSync(): void {
+function useUrlSync(enabled: boolean, usesBrowserHistory: boolean): void {
   const location = useLocation();
   useEffect(() => {
+    if (!enabled) return;
     const url = location.pathname + location.search + location.hash;
 
     // The dedicated Xum home page is gone. Keep "/" as a transient compatibility
@@ -261,15 +328,89 @@ function useUrlSync(): void {
     if (currentRoutePathname.endsWith("iframe.html")) return;
     // Skip in Electron (file:// reloads always boot through index.html; we restore via localStorage above)
     if (window.location.protocol === "file:") return;
+    // BrowserRouter already writes every route to the address bar.
+    if (usesBrowserHistory) return;
 
     const browserUrl = prependInitialAppProxyBasePath(url);
     if (browserUrl !== window.location.pathname + window.location.search + window.location.hash) {
       window.history.replaceState(null, "", browserUrl);
     }
-  }, [location.pathname, location.search, location.hash]);
+  }, [enabled, usesBrowserHistory, location.pathname, location.search, location.hash]);
 }
 
-function RouterContextInner(props: { children: ReactNode }) {
+interface ModalBackgroundLocation {
+  pathname: string;
+  search: string;
+  state: unknown;
+  /**
+   * Browser tabs only: the page's own history entry index, so closing the modal can step back to
+   * that entry instead of pushing a copy (which would leave the modal for the browser's Back).
+   */
+  historyIdx?: number;
+}
+
+const SETTINGS_ROUTE_PATTERN = /^\/settings\/([^/]+)$/;
+const ANALYTICS_ROUTE = "/analytics";
+const ROOT_BACKGROUND: ModalBackgroundLocation = { pathname: "/", search: "", state: null };
+
+// location.state is untyped and can come from older history entries, so malformed values are
+// treated as "no background" (the modal then sits over the root shell). Settings may sit over
+// analytics (closing settings returns to analytics), but a modal never sits over itself, and
+// analytics never sits over settings.
+function getModalBackground(
+  state: unknown,
+  key: "settingsBackground" | "analyticsBackground"
+): ModalBackgroundLocation | null {
+  if (!state || typeof state !== "object" || !(key in state)) return null;
+  const background = (state as Record<string, unknown>)[key];
+  if (!background || typeof background !== "object") return null;
+  const {
+    pathname,
+    search,
+    state: backgroundState,
+    historyIdx,
+  } = background as Record<string, unknown>;
+  if (typeof pathname !== "string" || !pathname.startsWith("/")) return null;
+  if (SETTINGS_ROUTE_PATTERN.test(pathname)) return null;
+  if (key === "analyticsBackground" && pathname === ANALYTICS_ROUTE) return null;
+  return {
+    pathname,
+    search: typeof search === "string" ? search : "",
+    state: backgroundState ?? null,
+    ...(typeof historyIdx === "number" && Number.isInteger(historyIdx) && historyIdx >= 0
+      ? { historyIdx }
+      : {}),
+  };
+}
+
+/**
+ * Resolve which modals are open and the page rendered underneath them. Both settings and
+ * analytics are route-backed modals that store the page they were opened over in navigation
+ * state; settings opened from analytics stores the analytics route (with its own background).
+ */
+function resolveModalLocation(location: ModalBackgroundLocation): {
+  page: ModalBackgroundLocation;
+  /** The analytics route location (with its background state) when analytics is open. */
+  analytics: ModalBackgroundLocation | null;
+} {
+  let current = location;
+  if (SETTINGS_ROUTE_PATTERN.test(current.pathname)) {
+    current = getModalBackground(current.state, "settingsBackground") ?? ROOT_BACKGROUND;
+  }
+  if (current.pathname !== ANALYTICS_ROUTE) {
+    return { page: current, analytics: null };
+  }
+  return {
+    page: getModalBackground(current.state, "analyticsBackground") ?? ROOT_BACKGROUND,
+    analytics: current,
+  };
+}
+
+function RouterContextInner(props: {
+  children: ReactNode;
+  embedded: boolean;
+  usesBrowserHistory: boolean;
+}) {
   function getProjectPathFromLocationState(state: unknown): string | null {
     if (!state || typeof state !== "object") return null;
     if (!("projectPath" in state)) return null;
@@ -284,52 +425,36 @@ function RouterContextInner(props: { children: ReactNode }) {
   }, [navigate]);
 
   const location = useLocation();
-  const [searchParams] = useSearchParams();
-  useUrlSync();
+  const locationState: unknown = location.state;
+  useUrlSync(!props.embedded, props.usesBrowserHistory);
 
-  const workspaceMatch = /^\/workspace\/(.+)$/.exec(location.pathname);
-  const currentWorkspaceId = workspaceMatch ? decodePathSegment(workspaceMatch[1]) : null;
-  const currentProjectId =
-    location.pathname === "/project"
-      ? (searchParams.get("project") ?? searchParams.get("path"))
-      : null;
-  const currentProjectPathFromState =
-    location.pathname === "/project" ? getProjectPathFromLocationState(location.state) : null;
-  const settingsMatch = /^\/settings\/([^/]+)$/.exec(location.pathname);
+  const settingsMatch = SETTINGS_ROUTE_PATTERN.exec(location.pathname);
   const currentSettingsSection = settingsMatch ? decodePathSegment(settingsMatch[1]) : null;
-  const isAnalyticsOpen = location.pathname === "/analytics";
 
-  interface NonSettingsLocationSnapshot {
-    url: string;
-    state: unknown;
-  }
+  // Settings and analytics render as modals over the page they were opened from, so page-level
+  // route state (workspace, project, draft) comes from that background location. Cold modal links
+  // have no background and sit over the root shell.
+  const currentLocation: ModalBackgroundLocation = {
+    pathname: location.pathname,
+    search: location.search,
+    state: locationState,
+  };
+  const { page: effectiveLocation, analytics: analyticsLocation } =
+    resolveModalLocation(currentLocation);
+  const effectiveSearchParams = new URLSearchParams(effectiveLocation.search);
+  const isProjectRoute = effectiveLocation.pathname === "/project";
 
-  // When leaving settings, we need to restore the *full* previous location including
-  // any in-memory navigation state (e.g. /project relies on { projectPath } state, and
-  // the legacy ?path= deep link rewrite stores that path in location.state).
-  // Include /analytics so Settings opened from Analytics can close back to Analytics.
-  const lastNonSettingsLocationRef = useRef<NonSettingsLocationSnapshot>({
-    url: getInitialRoute(),
-    state: null,
-  });
-  // Keep a separate "close analytics" snapshot that intentionally excludes /analytics so
-  // closing analytics still returns to the last non-analytics route.
-  const lastNonAnalyticsLocationRef = useRef<NonSettingsLocationSnapshot>({
-    url: getInitialRoute(),
-    state: null,
-  });
-  useEffect(() => {
-    if (!location.pathname.startsWith("/settings")) {
-      const locationSnapshot: NonSettingsLocationSnapshot = {
-        url: location.pathname + location.search,
-        state: location.state,
-      };
-      lastNonSettingsLocationRef.current = locationSnapshot;
-      if (location.pathname !== "/analytics") {
-        lastNonAnalyticsLocationRef.current = locationSnapshot;
-      }
-    }
-  }, [location.pathname, location.search, location.state]);
+  const workspaceMatch = /^\/workspace\/(.+)$/.exec(effectiveLocation.pathname);
+  const currentWorkspaceId = workspaceMatch ? decodePathSegment(workspaceMatch[1]) : null;
+  const currentProjectId = isProjectRoute
+    ? (effectiveSearchParams.get("project") ?? effectiveSearchParams.get("path"))
+    : null;
+  const currentProjectPathFromState = isProjectRoute
+    ? getProjectPathFromLocationState(effectiveLocation.state)
+    : null;
+  // Also true while settings sits over analytics, so closing settings returns to analytics.
+  const isAnalyticsOpen = analyticsLocation != null;
+  const pendingDraftId = isProjectRoute ? effectiveSearchParams.get("draft") : null;
 
   // Back-compat: if we ever land on a legacy deep link (/project?path=<full path>),
   // immediately replace it with the non-path project id URL.
@@ -351,8 +476,6 @@ function RouterContextInner(props: { children: ReactNode }) {
       void navigateRef.current(url, { replace: true, state: { projectPath: legacyPath } });
     }
   }, [location.pathname, location.search]);
-  const pendingDraftId = location.pathname === "/project" ? searchParams.get("draft") : null;
-
   // Navigation defaults to push so back/forward keeps working as expected.
   // Callers can opt into replace for compatibility-root redirects that should not
   // add a disposable "/" history entry.
@@ -381,38 +504,114 @@ function RouterContextInner(props: { children: ReactNode }) {
     void navigateRef.current("/");
   }, []);
 
-  const navigateToSettings = useCallback((section?: string, options?: { replace?: boolean }) => {
-    const nextSection = section ?? "general";
-    void navigateRef.current(`/settings/${encodeURIComponent(nextSection)}`, {
-      replace: options?.replace === true,
-    });
-  }, []);
+  const usesBrowserHistory = props.usesBrowserHistory;
+
+  // Browser tabs: the newest app entry index this page has seen. The tab's entries after it are
+  // not Xum (a site opened in this tab and then left with Back), so in-app Forward stops there,
+  // as MemoryRouter Forward stopped at its last entry. After a reload the page cannot see which
+  // later entries are Xum, so in-app Forward starts disabled (the browser's Forward still works).
+  const navigationType = useNavigationType();
+  const newestAppHistoryIdxRef = useRef(usesBrowserHistory ? getBrowserHistoryIndex() : 0);
+  useEffect(() => {
+    if (!usesBrowserHistory) return;
+    const idx = getBrowserHistoryIndex();
+    // A push drops the tab's forward entries; Back/Forward to a later entry proves it is Xum.
+    newestAppHistoryIdxRef.current =
+      navigationType === NavigationType.Push ? idx : Math.max(newestAppHistoryIdxRef.current, idx);
+  }, [usesBrowserHistory, navigationType, location.key]);
+  useEffect(() => {
+    if (!usesBrowserHistory) return;
+    // Restored from the back/forward cache after the user left Xum: leaving dropped every app
+    // entry after this one.
+    const handlePageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) newestAppHistoryIdxRef.current = getBrowserHistoryIndex();
+    };
+    window.addEventListener("pageshow", handlePageShow);
+    return () => window.removeEventListener("pageshow", handlePageShow);
+  }, [usesBrowserHistory]);
+  // Key of the rendered location that already navigated to analytics; see navigateToAnalytics.
+  // Cleared on every location change so returning to that same history entry (back) can open
+  // analytics again.
+  const analyticsOpenedFromKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    analyticsOpenedFromKeyRef.current = null;
+  }, [location.key]);
+
+  // These close over the rendered location (not a ref updated in an effect): settings redirect
+  // effects run in children before this provider's effects, so a ref could still be stale.
+  const navigateToSettings = useCallback(
+    (section?: string, options?: { replace?: boolean }) => {
+      const nextSection = section ?? "general";
+      // Section switches and redirects inside settings keep the original background.
+      const state = SETTINGS_ROUTE_PATTERN.test(location.pathname)
+        ? locationState
+        : {
+            settingsBackground: {
+              pathname: location.pathname,
+              search: location.search,
+              state: locationState,
+              ...(usesBrowserHistory ? { historyIdx: getBrowserHistoryIndex() } : {}),
+            } satisfies ModalBackgroundLocation,
+          };
+      void navigateRef.current(`/settings/${encodeURIComponent(nextSection)}`, {
+        replace: options?.replace === true,
+        state,
+      });
+    },
+    [location.pathname, location.search, locationState, usesBrowserHistory]
+  );
 
   const navigateFromSettings = useCallback(() => {
-    const lastLocation = lastNonSettingsLocationRef.current;
-    if (!lastLocation.url || lastLocation.url.startsWith("/settings")) {
+    if (!SETTINGS_ROUTE_PATTERN.test(location.pathname)) return;
+    const background = getModalBackground(locationState, "settingsBackground");
+    if (!background) {
       void navigateRef.current("/");
       return;
     }
-    void navigateRef.current(lastLocation.url, { state: lastLocation.state });
-  }, []);
+    returnToBackground(navigateRef.current, usesBrowserHistory, background);
+  }, [location.pathname, locationState, usesBrowserHistory]);
 
   const navigateToAnalytics = useCallback(() => {
-    void navigateRef.current("/analytics");
-  }, []);
-
-  const navigateFromAnalytics = useCallback(() => {
-    const lastLocation = lastNonAnalyticsLocationRef.current;
-    if (
-      !lastLocation.url ||
-      lastLocation.url.startsWith("/settings") ||
-      lastLocation.url === "/analytics"
-    ) {
-      void navigateRef.current("/");
+    if (location.pathname === ANALYTICS_ROUTE) return;
+    // Opens dispatched before the next render (e.g. keydowns fired in one task) all see the old
+    // location, so without this each would push its own /analytics history entry.
+    if (analyticsOpenedFromKeyRef.current === location.key) return;
+    analyticsOpenedFromKeyRef.current = location.key;
+    const resolved = resolveModalLocation({
+      pathname: location.pathname,
+      search: location.search,
+      state: locationState,
+    });
+    // Settings over analytics: returning to the analytics entry closes settings.
+    if (resolved.analytics) {
+      void navigateRef.current(resolved.analytics.pathname + resolved.analytics.search, {
+        state: resolved.analytics.state,
+      });
       return;
     }
-    void navigateRef.current(lastLocation.url, { state: lastLocation.state });
-  }, []);
+    // Opening from settings uses the page under settings, so modals never nest as backgrounds.
+    // That background already carries the page's history index; a page opened directly is the
+    // current entry.
+    const page: ModalBackgroundLocation =
+      usesBrowserHistory && !SETTINGS_ROUTE_PATTERN.test(location.pathname)
+        ? { ...resolved.page, historyIdx: getBrowserHistoryIndex() }
+        : resolved.page;
+    void navigateRef.current(ANALYTICS_ROUTE, {
+      state: { analyticsBackground: page },
+    });
+  }, [location.key, location.pathname, location.search, locationState, usesBrowserHistory]);
+
+  const navigateFromAnalytics = useCallback(() => {
+    const resolved = resolveModalLocation({
+      pathname: location.pathname,
+      search: location.search,
+      state: locationState,
+    });
+    if (!resolved.analytics) return;
+    // Closes analytics (and settings over it) and returns to the page underneath, including its
+    // in-memory state (/project relies on { projectPath }).
+    returnToBackground(navigateRef.current, usesBrowserHistory, resolved.page);
+  }, [location.pathname, location.search, locationState, usesBrowserHistory]);
 
   const value = useMemo<RouterContext>(
     () => ({
@@ -423,6 +622,20 @@ function RouterContextInner(props: { children: ReactNode }) {
       navigateFromSettings,
       navigateToAnalytics,
       navigateFromAnalytics,
+      navigateBack: () => {
+        // The tab's first app entry sits on top of whatever the tab showed before Xum. Going back
+        // from it would leave the app, which the in-app shortcut never did (MemoryRouter stops at
+        // entry 0).
+        if (usesBrowserHistory && getBrowserHistoryIndex() <= 0) return;
+        void navigateRef.current(-1);
+      },
+      navigateForward: () => {
+        if (usesBrowserHistory && getBrowserHistoryIndex() >= newestAppHistoryIdxRef.current) {
+          return;
+        }
+        void navigateRef.current(1);
+      },
+      usesBrowserHistory,
       currentWorkspaceId,
       currentSettingsSection,
       currentProjectId,
@@ -438,6 +651,7 @@ function RouterContextInner(props: { children: ReactNode }) {
       navigateToAnalytics,
       navigateFromAnalytics,
       navigateToWorkspace,
+      usesBrowserHistory,
       currentWorkspaceId,
       currentSettingsSection,
       currentProjectId,
@@ -455,10 +669,47 @@ function RouterContextInner(props: { children: ReactNode }) {
 // Without this, React processes navigation at transition (lower) priority,
 // causing a flash of stale UI between normal-priority updates (e.g.
 // setIsSending(false)) and the deferred route change.
-export function RouterProvider(props: { children: ReactNode }) {
+//
+// `embedded` is for hosts whose document URL is not an app route (the VS Code webview): start at
+// "/" and keep navigation in memory only — never rewrite the host URL or persist a route for the
+// desktop app's relaunch restore.
+export function RouterProvider(props: { children: ReactNode; embedded?: boolean }) {
+  const embedded = props.embedded === true;
+  // Decided once per mount: the host does not change while the page lives.
+  const [startup] = useState(() => {
+    const usesBrowserHistory = shouldUseBrowserHistory(embedded);
+    const initialRoute = embedded ? EMBEDDED_INITIAL_ROUTE : getInitialRoute();
+    if (usesBrowserHistory) {
+      // BrowserRouter reads its start route from the address bar when it first renders, so apply
+      // the startup choice (launch behavior, last workspace) to the tab's current entry first.
+      // Replacing keeps a startup redirect from adding a Back step.
+      const browserUrl = prependInitialAppProxyBasePath(initialRoute);
+      const currentUrl = window.location.pathname + window.location.search + window.location.hash;
+      if (browserUrl !== currentUrl) {
+        window.history.replaceState(null, "", browserUrl);
+      }
+    }
+    return { usesBrowserHistory, initialRoute };
+  });
+
+  const inner = (
+    <RouterContextInner embedded={embedded} usesBrowserHistory={startup.usesBrowserHistory}>
+      {props.children}
+    </RouterContextInner>
+  );
+  if (startup.usesBrowserHistory) {
+    return (
+      <BrowserRouter
+        basename={INITIAL_APP_PROXY_BASE_PATH ?? undefined}
+        unstable_useTransitions={false}
+      >
+        {inner}
+      </BrowserRouter>
+    );
+  }
   return (
-    <MemoryRouter initialEntries={[getInitialRoute()]} unstable_useTransitions={false}>
-      <RouterContextInner>{props.children}</RouterContextInner>
+    <MemoryRouter initialEntries={[startup.initialRoute]} unstable_useTransitions={false}>
+      {inner}
     </MemoryRouter>
   );
 }

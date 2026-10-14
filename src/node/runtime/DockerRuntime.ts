@@ -11,6 +11,8 @@
  * Extends RemoteRuntime for shared exec/file operations.
  */
 
+import { DOCKER_SCRATCH_DIR } from "./runtimeScratchDir";
+import { isContainerUnavailableExit } from "./containerExecFailure";
 import { spawn } from "child_process";
 import { createHash } from "crypto";
 import * as path from "path";
@@ -32,7 +34,7 @@ import { RemoteRuntime, type SpawnResult } from "./RemoteRuntime";
 import { findInitHookRelativePath, runInitHookOnRuntime, runWorkspaceInitHook } from "./initHook";
 import { getProjectName } from "@/node/utils/runtime/helpers";
 import { getErrorMessage } from "@/common/utils/errors";
-import { syncProjectViaGitBundle } from "./gitBundleSync";
+import { buildSourceRefSnapshotCommand, syncProjectViaGitBundle } from "./gitBundleSync";
 import { gitNoHooksPrefix } from "@/node/utils/gitNoHooksEnv";
 import {
   readHostGitconfig,
@@ -363,6 +365,10 @@ export class DockerRuntime extends RemoteRuntime {
     return `cd ${shescape.quote(cwd)}`;
   }
 
+  override isTransportFailureExit(exitCode: number, stderr: string): boolean {
+    return isContainerUnavailableExit(exitCode, stderr);
+  }
+
   protected async spawnRemoteProcess(
     fullCommand: string,
     _options: ExecOptions & { deadlineMs?: number }
@@ -645,7 +651,9 @@ export class DockerRuntime extends RemoteRuntime {
     abortSignal?: AbortSignal
   ): Promise<DockerCommandResult> {
     return runDockerCommand(
-      `exec --user root ${containerName} sh -c 'mkdir -p ${CONTAINER_SRC_DIR} /var/mux/plans && chown ${userInfo.uid}:${userInfo.gid} ${CONTAINER_SRC_DIR} /var/mux /var/mux/plans'`,
+      // DOCKER_SCRATCH_DIR is the workspace's $XUM_SCRATCH_DIR: it lives and dies with this
+      // container, which is exactly the workspace's lifetime (no volume to clean up).
+      `exec --user root ${containerName} sh -c 'mkdir -p ${CONTAINER_SRC_DIR} /var/mux/plans ${DOCKER_SCRATCH_DIR} && chown ${userInfo.uid}:${userInfo.gid} ${CONTAINER_SRC_DIR} /var/mux /var/mux/plans ${DOCKER_SCRATCH_DIR}'`,
       10000,
       abortSignal
     );
@@ -1058,6 +1066,9 @@ export class DockerRuntime extends RemoteRuntime {
     const destContainerName = getContainerName(projectPath, newWorkspaceName);
     const hostTempPath = path.join(os.tmpdir(), `mux-fork-${Date.now()}.bundle`);
     const containerBundlePath = "/tmp/fork.bundle";
+    // Cleanup only touches containers we actually used: a pre-aborted fork must not spawn
+    // Docker at all (a slow daemon made the cleanup outlast the caller, flaking CI).
+    let srcBundleAttempted = false;
     let destContainerCreated = false;
     let forkSucceeded = false;
 
@@ -1092,6 +1103,7 @@ export class DockerRuntime extends RemoteRuntime {
       // 3. Create git bundle inside source container
       initLogger.logStep("Creating git bundle from source...");
       throwIfAborted();
+      srcBundleAttempted = true;
       const bundleResult = await runDockerCommand(
         `exec ${srcContainerName} git -C ${CONTAINER_SRC_DIR} bundle create ${containerBundlePath} --all`,
         300000,
@@ -1223,6 +1235,17 @@ export class DockerRuntime extends RemoteRuntime {
         // Ignore - best-effort
       }
 
+      // Record the copied branches and stash before step 8 can remove origin/*, so the task_remove
+      // lossy check counts only the fork's own commits (#5105). Best-effort: without it the check
+      // counts every other branch.
+      try {
+        const snapshotCmd = `cd ${CONTAINER_SRC_DIR} && ${buildSourceRefSnapshotCommand(gitNoHooksPrefix(params.trusted))}`;
+        // Array args: the pipeline must reach the container's shell, not the host's (cmd.exe on Windows).
+        await runContainerSpawnCommand(["exec", destContainerName, "sh", "-c", snapshotCmd], 30000);
+      } catch {
+        // Ignore - best-effort
+      }
+
       // 8. Preserve origin URL (best-effort)
       try {
         const originResult = await runDockerCommand(
@@ -1276,9 +1299,11 @@ export class DockerRuntime extends RemoteRuntime {
       // 10. Cleanup (best-effort, ignore errors)
       /* eslint-disable @typescript-eslint/no-empty-function */
       // Clean up bundle in source container
-      await runDockerCommand(`exec ${srcContainerName} rm -f ${containerBundlePath}`, 5000).catch(
-        () => {}
-      );
+      if (srcBundleAttempted) {
+        await runDockerCommand(`exec ${srcContainerName} rm -f ${containerBundlePath}`, 5000).catch(
+          () => {}
+        );
+      }
       // Clean up bundle in destination container (if it exists)
       if (destContainerCreated) {
         await runDockerCommand(

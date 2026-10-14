@@ -3,11 +3,16 @@ import { cleanup, render } from "@testing-library/react";
 
 import { installDom } from "../../../../../tests/ui/dom";
 import type { WorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
+import * as RealWorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
+import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 
 // The label subscribes to the workspace sidebar store to surface a live count
 // of active workflow runs. Mock the hook so these tests stay focused on the
 // badge's gating without a real workspace store.
 let mockedSidebarState: WorkspaceSidebarState | null = null;
+// The partial store stub below drops every other export; restore the real module after this
+// suite so later files see the full WorkspaceStore.
+restoreModulesAfterSuite([["@/browser/stores/WorkspaceStore", { ...RealWorkspaceStoreModule }]]);
 void mock.module("@/browser/stores/WorkspaceStore", () => ({
   useOptionalWorkspaceSidebarState: () => mockedSidebarState,
   useWorkspaceUsage: () => ({ sessionTotal: null, liveCostUsage: null }),

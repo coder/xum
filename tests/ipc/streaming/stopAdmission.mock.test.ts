@@ -178,8 +178,8 @@ describe("manual admission after mock stream interruption", () => {
         expect(await original.waitForEvent("stream-delta", 5000)).not.toBeNull();
         expect(await original.waitForEvent("stream-error", 5000)).not.toBeNull();
         await session.waitForIdle();
-        // Mock error playback clears partials. Seed the delivered prefix as real
-        // stream recovery does, so the resumed acceptance also preserves existing text.
+        // Seed the delivered prefix into the history row as real stream recovery does, so the
+        // resumed acceptance also preserves existing text.
         const historyService = new HistoryService(env.config);
         const before = await historyService.getLastMessages(workspaceId, 10);
         if (!before.success) throw new Error(before.error);

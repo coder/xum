@@ -3,9 +3,8 @@ import { describe, expect, test, mock, spyOn } from "bun:test";
 import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as nodePath from "node:path";
-import type { Config } from "@/node/config";
 import { createTestHistoryService } from "./testHistoryService";
-import type { AIService } from "./aiService";
+import type { AgentSessionAIService } from "./agentSession";
 import type { InitStateManager } from "./initStateManager";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { Result } from "@/common/types/result";
@@ -18,11 +17,10 @@ import {
   type BranchSummaryAiService,
 } from "./branchSummary";
 import {
+  createAgentSessionAIServiceFake,
   createAgentSessionHarness,
   createStreamLifecycleMocks,
-  createTestAgentSession,
 } from "./agentSession.testHarness";
-import type { StreamMessageOptions } from "./aiService";
 import type { TurnCompletion } from "./streamManager";
 import type { TurnCoordinator } from "./turnCoordinator";
 
@@ -41,24 +39,22 @@ describe("AgentSession disposal race conditions", () => {
   test("does not crash if disposed while auto-sending a queued message", async () => {
     const aiHandlers = new Map<string, (...args: unknown[]) => void>();
 
-    const streamMessage = mock(() => Promise.resolve(Ok(undefined)));
+    // The session must never reach the provider in this test.
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() =>
+      Promise.resolve(Err({ type: "unknown", raw: "stream must not start in this test" }))
+    );
 
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
-        aiHandlers.set(String(eventName), listener);
-        return this;
+    const aiService = createAgentSessionAIServiceFake({
+      overrides: {
+        on(eventName: string, listener: (...args: unknown[]) => void) {
+          aiHandlers.set(eventName, listener);
+        },
+        streamMessage,
       },
-      off(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
-      },
-      stopStream: mock(() => Promise.resolve(Ok(undefined))),
-      isStreaming: mock(() => false),
-      streamMessage,
-    } as unknown as AIService;
+    });
 
     const history = await createTestHistoryService();
-    const historyService = history.historyService;
+    const { historyService, config } = history;
 
     const initStateManager: InitStateManager = {
       on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
@@ -74,12 +70,7 @@ describe("AgentSession disposal race conditions", () => {
       setMessageQueued: mock(() => undefined),
     } as unknown as BackgroundProcessManager;
 
-    const config: Config = {
-      srcDir: "/tmp",
-      sessionsDir: "/tmp",
-    } as unknown as Config;
-
-    const session = createTestAgentSession({
+    const { session } = await createAgentSessionHarness({
       workspaceId: "ws",
       config,
       historyService,
@@ -134,19 +125,15 @@ describe("AgentSession disposal race conditions", () => {
   });
 
   test("bails out of a send parked on the branch-summary await when removal disposes the session", async () => {
-    const streamMessage = mock(() => Promise.resolve(Ok(undefined)));
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
+    // The session must never reach the provider in this test.
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() =>
+      Promise.resolve(Err({ type: "unknown", raw: "stream must not start in this test" }))
+    );
+    const aiService = createAgentSessionAIServiceFake({
+      overrides: {
+        streamMessage,
       },
-      off(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
-      },
-      stopStream: mock(() => Promise.resolve(Ok(undefined))),
-      isStreaming: mock(() => false),
-      streamMessage,
-    } as unknown as AIService;
+    });
 
     // Real HistoryService on a real temp session dir (r55): the assertion
     // below is about actual disk state — a late append would recreate the
@@ -180,7 +167,7 @@ describe("AgentSession disposal race conditions", () => {
       }
     );
     try {
-      const session = createTestAgentSession({
+      const { session } = await createAgentSessionHarness({
         workspaceId,
         config,
         historyService,
@@ -198,13 +185,13 @@ describe("AgentSession disposal race conditions", () => {
         releaseModel = resolve;
       });
       const gatedAiService = {
-        createModelWithPinnedMetadata: async () => {
+        createModelWithPinnedOptions: async () => {
           await modelGate;
           return Err({ type: "api_key_not_found" as const, provider: "anthropic" });
         },
         // Side-channel candidates are confined to workspace-configured
         // providers; metadata must resolve with a model or the writer settles
-        // null before createModelWithPinnedMetadata — the gate above would
+        // null before createModelWithPinnedOptions — the gate above would
         // never park the send.
         getWorkspaceMetadata: () =>
           Promise.resolve(Ok({ aiSettings: { model: "anthropic:claude-sonnet-4-5" } })),
@@ -219,7 +206,7 @@ describe("AgentSession disposal race conditions", () => {
           createMuxMessage("bs-u", "user", filler, { timestamp: 1 }),
           createMuxMessage("bs-a", "assistant", filler, { timestamp: 2 }),
         ],
-        experiments: { rlm: true, programmaticToolCalling: true },
+        isExperimentEnabled: () => true,
         guardTailMessageId: "bs-a",
       });
 
@@ -269,19 +256,13 @@ describe("AgentSession disposal race conditions", () => {
   test("forwards task-created events to onChatEvent subscribers for the matching workspace", async () => {
     const aiHandlers = new Map<string, (...args: unknown[]) => void>();
 
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
-        aiHandlers.set(String(eventName), listener);
-        return this;
+    const aiService = createAgentSessionAIServiceFake({
+      overrides: {
+        on(eventName: string, listener: (...args: unknown[]) => void) {
+          aiHandlers.set(eventName, listener);
+        },
       },
-      off(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
-      },
-      stopStream: mock(() => Promise.resolve(Ok(undefined))),
-      isStreaming: mock(() => false),
-      streamMessage: mock(() => Promise.resolve(Ok(undefined))),
-    } as unknown as AIService;
+    });
 
     // Session startup owns compaction/history services even when this test only forwards events.
     const { historyService, config, cleanup } = await createTestHistoryService();
@@ -301,7 +282,7 @@ describe("AgentSession disposal race conditions", () => {
       setMessageQueued: mock(() => undefined),
     } as unknown as BackgroundProcessManager;
 
-    const session = createTestAgentSession({
+    const { session } = await createAgentSessionHarness({
       workspaceId: "ws",
       config,
       historyService,
@@ -352,19 +333,13 @@ describe("AgentSession disposal race conditions", () => {
   test("forwards session-usage-delta events to onChatEvent subscribers for the matching workspace", async () => {
     const aiHandlers = new Map<string, (...args: unknown[]) => void>();
 
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
-        aiHandlers.set(String(eventName), listener);
-        return this;
+    const aiService = createAgentSessionAIServiceFake({
+      overrides: {
+        on(eventName: string, listener: (...args: unknown[]) => void) {
+          aiHandlers.set(eventName, listener);
+        },
       },
-      off(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
-      },
-      stopStream: mock(() => Promise.resolve(Ok(undefined))),
-      isStreaming: mock(() => false),
-      streamMessage: mock(() => Promise.resolve(Ok(undefined))),
-    } as unknown as AIService;
+    });
 
     const { historyService, config, cleanup } = await createTestHistoryService();
     await using _history = { [Symbol.asyncDispose]: cleanup };
@@ -383,7 +358,7 @@ describe("AgentSession disposal race conditions", () => {
       setMessageQueued: mock(() => undefined),
     } as unknown as BackgroundProcessManager;
 
-    const session = createTestAgentSession({
+    const { session } = await createAgentSessionHarness({
       workspaceId: "ws",
       config,
       historyService,
@@ -442,18 +417,7 @@ describe("AgentSession disposal race conditions", () => {
   });
 
   test("does not reset auto-retry intent for synthetic or rejected sends", async () => {
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
-      },
-      off(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
-      },
-      stopStream: mock(() => Promise.resolve(Ok(undefined))),
-      isStreaming: mock(() => false),
-      streamMessage: mock(() => Promise.resolve(Ok(undefined))),
-    } as unknown as AIService;
+    const aiService = createAgentSessionAIServiceFake();
 
     const { historyService, config, cleanup } = await createTestHistoryService();
     await using _history = { [Symbol.asyncDispose]: cleanup };
@@ -472,7 +436,7 @@ describe("AgentSession disposal race conditions", () => {
       setMessageQueued: mock(() => undefined),
     } as unknown as BackgroundProcessManager;
 
-    const session = createTestAgentSession({
+    const { session } = await createAgentSessionHarness({
       workspaceId: "ws",
       config,
       historyService,
@@ -506,13 +470,13 @@ describe("AgentSession disposal race conditions", () => {
 
   test("drops failed turn completions delivered after disposal", async () => {
     const completion = createDeferred<TurnCompletion>();
-    const streamMessage = mock((_opts: StreamMessageOptions) =>
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() =>
       Promise.resolve(Ok({ messageId: "assistant-post-dispose", completion: completion.promise }))
     );
     const { session, cleanup } = await createAgentSessionHarness({
       workspaceId: "ws-dispose-turn-completion",
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
       },
     });
     try {
@@ -585,18 +549,7 @@ describe("AgentSession disposal race conditions", () => {
   });
 
   test("preserves synthetic flag when flushing queued messages", async () => {
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
-      },
-      off(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
-      },
-      stopStream: mock(() => Promise.resolve(Ok(undefined))),
-      isStreaming: mock(() => false),
-      streamMessage: mock(() => Promise.resolve(Ok(undefined))),
-    } as unknown as AIService;
+    const aiService = createAgentSessionAIServiceFake();
 
     const { historyService, config, cleanup } = await createTestHistoryService();
     await using _history = { [Symbol.asyncDispose]: cleanup };
@@ -615,7 +568,7 @@ describe("AgentSession disposal race conditions", () => {
       setMessageQueued: mock(() => undefined),
     } as unknown as BackgroundProcessManager;
 
-    const session = createTestAgentSession({
+    const { session } = await createAgentSessionHarness({
       workspaceId: "ws",
       config,
       historyService,

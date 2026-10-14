@@ -1,6 +1,10 @@
 import type { SkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import type { Runtime } from "@/node/runtime/Runtime";
-import { execBuffered, readFileString } from "@/node/utils/runtime/helpers";
+import {
+  execBuffered,
+  readFileString,
+  throwIfTransportFailure,
+} from "@/node/utils/runtime/helpers";
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
 
 import { MAX_FILE_SIZE } from "./fileCommon";
@@ -252,6 +256,9 @@ printf '%s\n' "$TARGET_DIR_RESOLUTION"
     timeout: 10,
   });
 
+  // Callers read a failed probe as an escaped skill and skip it; an unreachable
+  // host must fail instead of letting a lower-scope skill win (#4438).
+  throwIfTransportFailure(runtime, result, "Runtime containment probe failed");
   if (result.exitCode !== 0) {
     const details = result.stderr.trim() || result.stdout.trim() || `exit code ${result.exitCode}`;
     throw new Error(`Runtime containment probe failed: ${details}`);

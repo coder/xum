@@ -1,13 +1,12 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import { EventEmitter } from "events";
-import type { AIService } from "./aiService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { HistoryService } from "./historyService";
 import type { InitStateManager } from "./initStateManager";
 import type { AgentSession } from "./agentSession";
 import { createTestHistoryService } from "./testHistoryService";
-import { createStartedTurnHandle, createTestAgentSession } from "./agentSession.testHarness";
+import { createAgentSessionHarness } from "./agentSession.testHarness";
 import { WorkspaceGoalService } from "./workspaceGoalService";
 // Registers a no-op goal-continuation consumer so the in-AS pricing gate
 // path runs end-to-end (DEREM-52). Bridge registration alone is now
@@ -44,31 +43,6 @@ async function setGoalOk(
   return result.data;
 }
 
-function createAiService(workspaceId: string, getClosingSignal: () => AbortSignal): AIService {
-  const aiEmitter = new EventEmitter();
-  return Object.assign(aiEmitter, {
-    isStreaming: mock((_workspaceId: string) => false),
-    stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
-    streamMessage: mock((_request: unknown) =>
-      Promise.resolve(Ok(createStartedTurnHandle(getClosingSignal())))
-    ),
-    getStreamInfo: mock((_workspaceId: string) => null),
-    getProvidersConfig: mock(() => null),
-    getWorkspaceMetadata: mock((_workspaceId: string) =>
-      Promise.resolve(
-        Ok({
-          id: workspaceId,
-          name: workspaceId,
-          projectName: "project",
-          projectPath: PROJECT_PATH,
-          runtimeConfig: { type: "local" },
-        })
-      )
-    ),
-    replayStream: mock((_workspaceId: string) => Promise.resolve()),
-  }) as unknown as AIService;
-}
-
 async function createSessionHarness(workspaceId: string): Promise<SessionHarness> {
   const { historyService, config, cleanup } = await createTestHistoryService();
   await config.addWorkspace(PROJECT_PATH, {
@@ -94,11 +68,23 @@ async function createSessionHarness(workspaceId: string): Promise<SessionHarness
     setMessageQueued: mock((_workspaceId: string, _queued: boolean) => undefined),
   } as unknown as BackgroundProcessManager;
 
-  const session: AgentSession = createTestAgentSession({
+  const { session } = await createAgentSessionHarness({
     workspaceId,
     config,
     historyService,
-    aiService: createAiService(workspaceId, () => session.closingSignal),
+    aiServiceOverrides: {
+      getWorkspaceMetadata: mock((_workspaceId: string) =>
+        Promise.resolve(
+          Ok({
+            id: workspaceId,
+            name: workspaceId,
+            projectName: "project",
+            projectPath: PROJECT_PATH,
+            runtimeConfig: { type: "local" as const },
+          })
+        )
+      ),
+    },
     initStateManager,
     backgroundProcessManager,
     workspaceGoalService: goalService,

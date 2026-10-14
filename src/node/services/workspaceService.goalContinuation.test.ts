@@ -1,0 +1,1182 @@
+import { afterEach, describe, expect, test, mock, spyOn } from "bun:test";
+import type { WorkspaceService } from "./workspaceService";
+import * as fsPromises from "fs/promises";
+import { tmpdir } from "os";
+import path from "path";
+import type { ProjectsConfig } from "@/common/types/project";
+import type { HistoryService } from "./historyService";
+import { createTestHistoryService } from "./testHistoryService";
+import { ExtensionMetadataService } from "./ExtensionMetadataService";
+import type { SendMessageOptions } from "@/common/orpc/types";
+import { createMuxMessage } from "@/common/types/message";
+import { WorkspaceGoalService } from "./workspaceGoalService";
+import { IdleDispatcher } from "./idleDispatcher";
+import { waitForCondition } from "./testDispatchHelpers";
+import { Err, Ok } from "@/common/types/result";
+import { createUnknownSendMessageError } from "./utils/sendMessageError";
+import { AIService } from "./aiService";
+import { ProviderService } from "./providerService";
+import { ProvidersConfigStore } from "@/node/config/providersConfigStore";
+import { NOOP_TIMELINE_RECORDER } from "./timelineRecorder";
+import {
+  createWorkspaceServiceHarness,
+  type WorkspaceServiceHarness,
+} from "./workspaceService.testHarness";
+
+// Regression: persisted completed init state must not defer goal continuations as initializing.
+describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
+  const harnesses: WorkspaceServiceHarness[] = [];
+  afterEach(async () => {
+    await Promise.all(harnesses.splice(0).map((harness) => harness.cleanup()));
+  });
+
+  /** Real-dependency service; each test seeds only the state it reads. */
+  async function makeHarness(): Promise<WorkspaceServiceHarness> {
+    const harness = await createWorkspaceServiceHarness();
+    harnesses.push(harness);
+    return harness;
+  }
+
+  /** Drives the real InitStateManager to the requested init phase for `workspaceId`. */
+  async function makeService(
+    initStatus: "running" | "success" | undefined,
+    workspaceId = "ws-1"
+  ): Promise<WorkspaceService> {
+    const { service, initStateManager } = await makeHarness();
+    if (initStatus !== undefined) {
+      initStateManager.startInit(workspaceId, "/tmp/proj");
+      if (initStatus === "success") {
+        await initStateManager.endInit(workspaceId, 0);
+      }
+    }
+    return service;
+  }
+
+  test("isInitializing is false when init has finished successfully", async () => {
+    const service = await makeService("success");
+    expect(service.getGoalContinuationRuntimeState("ws-1").isInitializing).toBe(false);
+  });
+
+  test("isInitializing is false when no init state has ever existed", async () => {
+    const service = await makeService(undefined);
+    expect(service.getGoalContinuationRuntimeState("ws-1").isInitializing).toBe(false);
+  });
+
+  test("isInitializing is true only while init is actively running", async () => {
+    const service = await makeService("running");
+    expect(service.getGoalContinuationRuntimeState("ws-1").isInitializing).toBe(true);
+  });
+
+  test("in-preflight direct sends report the workspace busy for goal continuations", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cECpR): a direct send does not set PREPARING
+    // until late in AgentSession.sendMessage, so a kickoff candidate restored
+    // while the send is mid-preflight (manual row already durable, session
+    // still phase-idle) could otherwise be consumed by goal-continuation
+    // eligibility and dispatched ahead of the user's turn. The runtime busy
+    // predicate must include sendMessage's preflight counter.
+    const service = await makeService(undefined);
+    expect(service.getGoalContinuationRuntimeState("ws-1").isBusy).toBe(false);
+
+    const counts = (service as unknown as { preflightSendCounts: Map<string, number> })
+      .preflightSendCounts;
+    counts.set("ws-1", 1);
+    expect(service.getGoalContinuationRuntimeState("ws-1").isBusy).toBe(true);
+    counts.delete("ws-1");
+    expect(service.getGoalContinuationRuntimeState("ws-1").isBusy).toBe(false);
+  });
+
+  test("held user input defers goal continuations like queued user input", async () => {
+    const service = await makeService(undefined);
+    // A session whose only pending input is held (a manual send refused at dispatch).
+    const sessions = (service as unknown as { sessions: Map<string, unknown> }).sessions;
+    sessions.set("ws-1", {
+      isBusy: () => false,
+      hasPendingManualFollowUp: () => false,
+      hasPendingUserInput: () => true,
+    });
+    try {
+      expect(service.getGoalContinuationRuntimeState("ws-1").hasQueuedMessages).toBe(true);
+    } finally {
+      sessions.delete("ws-1");
+    }
+  });
+
+  test("kickoff continuation fires on a freshly-init'd workspace", async () => {
+    const workspaceId = "kickoff-after-init";
+    const service = await makeService("success", workspaceId);
+
+    const { historyService, config, cleanup } = await createTestHistoryService();
+    try {
+      await config.addWorkspace("/tmp/kickoff-proj", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "kickoff-proj",
+        projectPath: "/tmp/kickoff-proj",
+        runtimeConfig: { type: "local" },
+      });
+      const extensionMetadata = new ExtensionMetadataService(
+        `${config.rootDir}/kickoff-extension-metadata.json`
+      );
+      const goalService = new WorkspaceGoalService(config, historyService, extensionMetadata);
+
+      const dispatcher = new IdleDispatcher();
+      const execute = mock(() => Promise.resolve(true));
+      goalService.registerGoalContinuationConsumer(dispatcher, {
+        hasActiveDescendantTasks: () => false,
+        getRuntimeState: (id) => service.getGoalContinuationRuntimeState(id),
+        executeGoalContinuation: execute,
+        getKickoffSendOptions: () => Promise.resolve({ model: "openai:gpt-4o", agentId: "exec" }),
+      });
+
+      const result = await goalService.setGoal({ workspaceId, objective: "Ship the kickoff fix" });
+      expect(result.success).toBe(true);
+
+      // Wait for the kickoff continuation dispatch via the shared
+      // `waitForCondition` helper instead of an inline `Date.now()` loop —
+      // the dispatcher worker is microtask + setTimeout-driven so we poll
+      // until it lands (Coder-agents-review nit DEREM-50).
+      await waitForCondition(() => execute.mock.calls.length > 0, { timeoutMs: 1_000 });
+
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(execute).toHaveBeenCalledWith(expect.objectContaining({ workspaceId }));
+    } finally {
+      await cleanup();
+    }
+  });
+
+  // Goals carry no owner: automatic turns resolve the workspace's selected agent. A
+  // read-only agent may set a goal only as that selection, and its goal then also
+  // recovers on it after a restart (explore is hidden but persistable via a send).
+  test("a read-only selected agent's goal recovers on that agent; a one-shot override is refused", async () => {
+    const workspaceId = "ws-read-only-goal";
+    const projectPath = "/tmp/read-only-goal-proj";
+    const { service, config, historyService, extensionMetadata } = await makeHarness();
+    await config.addWorkspace(projectPath, {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "read-only-goal-proj",
+      projectPath,
+      runtimeConfig: { type: "local" },
+      agentId: "exec",
+      aiSettingsByAgent: {
+        exec: { model: "openai:gpt-4o", thinkingLevel: "off" as const },
+        explore: { model: "anthropic:claude-haiku-4-5", thinkingLevel: "off" as const },
+      },
+    });
+    const setterService = new WorkspaceGoalService(
+      config,
+      historyService,
+      extensionMetadata,
+      undefined,
+      {
+        suppressKickoffContinuation: true,
+      }
+    );
+    const exploreGoal = {
+      workspaceId,
+      objective: "Map every caller of the goal gate",
+      turnCap: 3,
+      initiator: "model" as const,
+      requireSelectedAgentId: "explore",
+    };
+
+    // A one-shot explore turn on an exec-selected workspace: automatic turns would
+    // continue the goal as exec, so it is refused.
+    const refused = await setterService.setGoal(exploreGoal);
+    expect(refused.success).toBe(false);
+    expect(await setterService.getGoal(workspaceId)).toBeNull();
+
+    await config.editConfig((cfg) => {
+      const entry = cfg.projects.get(projectPath)?.workspaces.find((w) => w.id === workspaceId);
+      if (entry == null) throw new Error("test workspace missing");
+      entry.agentId = "explore";
+      return cfg;
+    });
+    const created = await setterService.setGoal(exploreGoal);
+    expect(created.success).toBe(true);
+
+    // Restart: a fresh goal service recovers the pending kickoff through the real
+    // WorkspaceService kickoff resolution.
+    const restarted = new WorkspaceGoalService(config, historyService, extensionMetadata);
+    const executed: SendMessageOptions[] = [];
+    restarted.registerGoalContinuationConsumer(new IdleDispatcher(), {
+      hasActiveDescendantTasks: () => false,
+      getRuntimeState: () => ({ isRuntimeCompatible: true }),
+      executeGoalContinuation: (input) => {
+        executed.push(input.options);
+        return Promise.resolve(true);
+      },
+      getKickoffSendOptions: (id) => service.getGoalContinuationKickoffSendOptions(id),
+    });
+    await restarted.recoverPendingDispatchAfterRestart(workspaceId);
+    await waitForCondition(() => executed.length > 0, { timeoutMs: 1_000 });
+
+    expect(executed[0]).toMatchObject({ agentId: "explore", model: "anthropic:claude-haiku-4-5" });
+    expect(executed[0]?.strictAgentResolution).toBeUndefined();
+  });
+
+  test.each(["error", "ok"] as const)(
+    "a kickoff that fails before streaming inside its send (send result %s) retries with backoff",
+    async (sendResultKind) => {
+      // #5029: the idle dispatcher runs the kickoff continuation. When its accepted send failed
+      // before streaming (e.g. workspace removal disposing the session mid-preparation), the
+      // failure callback awaited a re-dispatch of the SAME workspace. The dispatcher never
+      // starts a workspace it is still dispatching, so both waits blocked forever and session
+      // disposal (which drains the preparation) hung workspace removal. The failure must
+      // instead release the dispatch and retry through the dispatcher's backoff, never in a
+      // tight loop, even when every attempt fails. AgentSession returns Ok for an accepted
+      // startup that was canceled before streaming, and an error otherwise.
+      const workspaceId = `kickoff-pre-stream-failure-${sendResultKind}`;
+      const service = await makeService("success", workspaceId);
+
+      const { historyService, config, cleanup } = await createTestHistoryService();
+      let unregister: (() => void) | undefined;
+      try {
+        await config.addWorkspace("/tmp/kickoff-proj", {
+          id: workspaceId,
+          name: workspaceId,
+          projectName: "kickoff-proj",
+          projectPath: "/tmp/kickoff-proj",
+          runtimeConfig: { type: "local" },
+        });
+        const extensionMetadata = new ExtensionMetadataService(
+          `${config.rootDir}/kickoff-extension-metadata.json`
+        );
+        const goalService = new WorkspaceGoalService(config, historyService, extensionMetadata);
+        service.setWorkspaceGoalService(goalService);
+
+        // Every send is accepted and then fails before streaming. AgentSession awaits the
+        // failure callback before the send settles (settlePreparationFailure).
+        const error = createUnknownSendMessageError("workspace is being removed");
+        const sendTimes: number[] = [];
+        spyOn(service, "sendMessage").mockImplementation(
+          async (_workspaceId, _message, _options, internal) => {
+            sendTimes.push(Date.now());
+            await internal?.onAcceptedPreStreamFailure?.(error);
+            return sendResultKind === "ok" ? Ok(undefined) : Err(error);
+          }
+        );
+        const settled: boolean[] = [];
+        const dispatcher = new IdleDispatcher();
+        unregister = goalService.registerGoalContinuationConsumer(dispatcher, {
+          hasActiveDescendantTasks: () => false,
+          getRuntimeState: (id) => service.getGoalContinuationRuntimeState(id),
+          executeGoalContinuation: async (input) => {
+            const accepted = await service.executeGoalContinuation(input);
+            settled.push(accepted);
+            return accepted;
+          },
+          getKickoffSendOptions: () => Promise.resolve({ model: "openai:gpt-4o", agentId: "exec" }),
+        });
+
+        // Before the fix this hung: setGoal awaits the kickoff dispatch, which waited on its
+        // own re-dispatch.
+        const result = await goalService.setGoal({ workspaceId, objective: "Ship the fix" });
+        expect(result.success).toBe(true);
+        await waitForCondition(() => settled.length > 0, { timeoutMs: 2_000 });
+        expect(settled[0]).toBe(false);
+
+        await waitForCondition(() => sendTimes.length >= 2, { timeoutMs: 3_000 });
+        // The retry waited for the dispatcher's backoff instead of running immediately.
+        expect(sendTimes[1] - sendTimes[0]).toBeGreaterThanOrEqual(900);
+      } finally {
+        unregister?.();
+        await cleanup();
+      }
+    }
+  );
+
+  // --------------------------------------------------------------------------
+  // getDelegatedTurnContinuationSendOptions — bash-monitor wake continuations
+  // --------------------------------------------------------------------------
+
+  describe("delegated-turn continuation send options", () => {
+    async function makeServiceWithHistory(): Promise<{
+      service: WorkspaceService;
+      historyService: HistoryService;
+    }> {
+      const { service, historyService } = await makeHarness();
+      return { service, historyService };
+    }
+
+    interface DelegatedContinuationInternals {
+      getDelegatedTurnContinuationSendOptions: (
+        workspaceId: string
+      ) => Promise<SendMessageOptions | null>;
+    }
+
+    const delegatedTurnCorrelation = {
+      type: "workspace-turn-task" as const,
+      taskHandleId: "wst_handle",
+      ownerWorkspaceId: "owner-ws",
+      turnId: "turn-1",
+    };
+
+    const delegatedTurnMessage = (id: string) =>
+      createMuxMessage(id, "user", "Delegated prompt", {
+        timestamp: Date.now(),
+        muxMetadata: delegatedTurnCorrelation,
+        retrySendOptions: {
+          model: "anthropic:claude-opus-4-6",
+          agentId: "plan",
+          serviceTier: "priority",
+          strictAgentResolution: true,
+          agentInitiated: true,
+        },
+      });
+
+    /** Correlated assistant response; "tool-calls" is the queue-dispatch cut that leaves the turn open. */
+    const delegatedAssistantMessage = (id: string, finishReason: "tool-calls" | "stop") =>
+      createMuxMessage(id, "assistant", "Working…", {
+        timestamp: Date.now(),
+        partial: false,
+        finishReason,
+        muxMetadata: delegatedTurnCorrelation,
+      });
+
+    test("continues a still-open delegated turn under its own per-turn options", async () => {
+      const workspaceId = "ws-delegated-continuation";
+      const { service, historyService } = await makeServiceWithHistory();
+      await historyService.appendToHistory(workspaceId, delegatedTurnMessage("delegated-1"));
+      await historyService.appendToHistory(
+        workspaceId,
+        delegatedAssistantMessage("assistant-cut", "tool-calls")
+      );
+      // A previous wake continuation must not hide the delegated turn's options.
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("wake-1", "user", "Monitor matched", {
+          timestamp: Date.now(),
+          muxMetadata: { type: "bash-monitor-wake" as const, records: [] },
+        })
+      );
+
+      const internals = service as unknown as DelegatedContinuationInternals;
+      const options = await internals.getDelegatedTurnContinuationSendOptions(workspaceId);
+
+      expect(options).not.toBeNull();
+      // Per-turn overrides (agent, strictness) continue the turn; they never become
+      // workspace defaults, and internal-only fields are not forwarded.
+      expect(options).toMatchObject({
+        model: "anthropic:claude-opus-4-6",
+        agentId: "plan",
+        strictAgentResolution: true,
+        skipAiSettingsPersistence: true,
+      });
+      expect(options?.serviceTier).toBe("priority");
+      expect(options && "agentInitiated" in options).toBe(false);
+      expect(options?.muxMetadata).toBeUndefined();
+    });
+
+    test("recovers options from a wake row after on-send compaction hid the delegated row", async () => {
+      const workspaceId = "ws-delegated-post-compaction";
+      const { service, historyService } = await makeServiceWithHistory();
+      // On-send compaction consumed a wake continuation: the original delegated row is
+      // behind the boundary; the compaction summary proves the turn is still open and
+      // the follow-up wake-typed row is the remaining carrier of the turn's options.
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("summary-1", "assistant", "Summary", {
+          timestamp: Date.now(),
+          muxMetadata: {
+            type: "compaction-summary" as const,
+            pendingFollowUp: {
+              text: "Continue",
+              model: "anthropic:claude-opus-4-6",
+              agentId: "plan",
+              workspaceTurnMetadata: delegatedTurnCorrelation,
+            },
+          },
+        })
+      );
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("wake-followup", "user", "Monitor matched", {
+          timestamp: Date.now(),
+          muxMetadata: { type: "bash-monitor-wake" as const, records: [] },
+          retrySendOptions: {
+            model: "anthropic:claude-opus-4-6",
+            agentId: "plan",
+            strictAgentResolution: { expectedScope: "built-in" },
+          },
+        })
+      );
+
+      const internals = service as unknown as DelegatedContinuationInternals;
+      const options = await internals.getDelegatedTurnContinuationSendOptions(workspaceId);
+      expect(options).toMatchObject({
+        model: "anthropic:claude-opus-4-6",
+        agentId: "plan",
+        strictAgentResolution: { expectedScope: "built-in" },
+        skipAiSettingsPersistence: true,
+      });
+    });
+
+    test("sanitizes persisted options through the canonical whitelist", async () => {
+      const workspaceId = "ws-delegated-sanitized";
+      const { service, historyService } = await makeServiceWithHistory();
+      const tamperedRetrySendOptions: Record<string, unknown> = {
+        model: "anthropic:claude-opus-4-6",
+        agentId: "plan",
+        editMessageId: "innocent-message",
+        muxMetadata: { type: "workspace-turn-task" },
+      };
+      const malformedRetrySendOptions: Record<string, unknown> = { agentId: "plan" }; // model missing
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("delegated-tampered", "user", "Delegated prompt", {
+          timestamp: Date.now(),
+          muxMetadata: delegatedTurnCorrelation,
+          // History is untrusted at rest: injected fields outside the whitelist
+          // (editMessageId would flip the send into the edit/truncation flow) must
+          // never reach the internal continuation send.
+          retrySendOptions: tamperedRetrySendOptions as never,
+        })
+      );
+      await historyService.appendToHistory(
+        workspaceId,
+        delegatedAssistantMessage("assistant-cut-3", "tool-calls")
+      );
+
+      const internals = service as unknown as DelegatedContinuationInternals;
+      const options = await internals.getDelegatedTurnContinuationSendOptions(workspaceId);
+      expect(options).toMatchObject({ agentId: "plan", skipAiSettingsPersistence: true });
+      expect(options && "editMessageId" in options && options.editMessageId).toBeFalsy();
+      expect(options?.muxMetadata).toBeUndefined();
+
+      // A row whose options fail schema validation entirely yields nothing.
+      const malformedWorkspaceId = "ws-delegated-malformed";
+      await historyService.appendToHistory(
+        malformedWorkspaceId,
+        createMuxMessage("delegated-malformed", "user", "Delegated prompt", {
+          timestamp: Date.now(),
+          muxMetadata: delegatedTurnCorrelation,
+          retrySendOptions: malformedRetrySendOptions as never,
+        })
+      );
+      await historyService.appendToHistory(
+        malformedWorkspaceId,
+        delegatedAssistantMessage("assistant-cut-4", "tool-calls")
+      );
+      expect(
+        await internals.getDelegatedTurnContinuationSendOptions(malformedWorkspaceId)
+      ).toBeNull();
+    });
+
+    test("yields nothing after a terminal assistant response closed the delegated turn", async () => {
+      const workspaceId = "ws-delegated-closed";
+      const { service, historyService } = await makeServiceWithHistory();
+      await historyService.appendToHistory(workspaceId, delegatedTurnMessage("delegated-2"));
+      // finishReason "stop" ends the delegated turn: a later monitor match is a NEW
+      // synthetic turn and must resolve from persisted defaults, not stale overrides.
+      await historyService.appendToHistory(
+        workspaceId,
+        delegatedAssistantMessage("assistant-final", "stop")
+      );
+
+      const internals = service as unknown as DelegatedContinuationInternals;
+      expect(await internals.getDelegatedTurnContinuationSendOptions(workspaceId)).toBeNull();
+    });
+
+    test("yields nothing once another user send follows the delegated prompt", async () => {
+      const workspaceId = "ws-delegated-superseded";
+      const { service, historyService } = await makeServiceWithHistory();
+      await historyService.appendToHistory(workspaceId, delegatedTurnMessage("delegated-3"));
+      await historyService.appendToHistory(
+        workspaceId,
+        delegatedAssistantMessage("assistant-cut-2", "tool-calls")
+      );
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-1", "user", "Manual user message", { timestamp: Date.now() })
+      );
+
+      const internals = service as unknown as DelegatedContinuationInternals;
+      expect(await internals.getDelegatedTurnContinuationSendOptions(workspaceId)).toBeNull();
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // getGoalContinuationKickoffSendOptions — model-resolution cascade
+  // --------------------------------------------------------------------------
+
+  describe("model-resolution cascade", () => {
+    /** Seeds the real Config (round-tripped through config.json) the cascade reads. */
+    async function makeServiceWithConfig(
+      seed: Partial<ProjectsConfig> = {}
+    ): Promise<WorkspaceService> {
+      const { service, config } = await makeHarness();
+      await config.editConfig((cfg) => ({ ...cfg, ...seed }));
+      return service;
+    }
+
+    test("returns null when the workspace is not found in config", async () => {
+      const service = await makeServiceWithConfig();
+      expect(await service.getGoalContinuationKickoffSendOptions("ws-unknown")).toBeNull();
+    });
+
+    test("automatic turns retain the selected agent's saved speed without borrowing another chat", async () => {
+      const service = await makeServiceWithConfig({
+        projects: new Map([
+          [
+            "/tmp/proj",
+            {
+              workspaces: [
+                {
+                  id: "speed-chat",
+                  path: "/tmp/proj/speed-chat",
+                  agentId: "exec",
+                  aiSettingsByAgent: {
+                    exec: {
+                      model: "openai:gpt-5.2",
+                      thinkingLevel: "high",
+                      serviceTier: "priority",
+                    },
+                    plan: { model: "openai:gpt-5.2", thinkingLevel: "high", serviceTier: "flex" },
+                    compact: {
+                      model: "openai:gpt-5.2",
+                      thinkingLevel: "high",
+                      serviceTier: "default",
+                    },
+                  },
+                },
+                { id: "other-chat", path: "/tmp/proj/other-chat" },
+              ],
+            },
+          ],
+        ]),
+      });
+      const internal = service as unknown as {
+        buildIdleCompactionSendOptions(workspaceId: string): Promise<SendMessageOptions>;
+        buildHeartbeatSendOptions(
+          workspaceId: string
+        ): Promise<{ sendOptions: SendMessageOptions }>;
+      };
+      expect((await service.getGoalContinuationKickoffSendOptions("speed-chat"))?.serviceTier).toBe(
+        "priority"
+      );
+      expect((await internal.buildHeartbeatSendOptions("speed-chat")).sendOptions.serviceTier).toBe(
+        "priority"
+      );
+      expect((await internal.buildIdleCompactionSendOptions("speed-chat")).serviceTier).toBe(
+        "default"
+      );
+      expect(
+        (await service.getGoalContinuationKickoffSendOptions("other-chat"))?.serviceTier
+      ).toBeUndefined();
+    });
+
+    test("prefers per-workspace agent model over workspace default and globals", async () => {
+      const projectPath = "/tmp/proj";
+      const workspaceId = "ws-1";
+      const projects = new Map([
+        [
+          projectPath,
+          {
+            workspaces: [
+              {
+                id: workspaceId,
+                path: "/tmp/proj/ws",
+                aiSettingsByAgent: {
+                  exec: { model: "anthropic:claude-haiku-4-5", thinkingLevel: "off" as const },
+                },
+                aiSettings: { model: "openai:gpt-4o", thinkingLevel: "off" as const },
+              },
+            ],
+          },
+        ],
+      ]);
+      const service = await makeServiceWithConfig({
+        projects,
+        agentAiDefaults: { exec: { modelString: "google:gemini-2.5-pro" } },
+      });
+      const result = await service.getGoalContinuationKickoffSendOptions(workspaceId);
+      expect(result?.model).toContain("haiku");
+      expect(result?.agentId).toBe("exec");
+    });
+
+    test("uses the persisted selected agent for initial goal kickoff options", async () => {
+      const projectPath = "/tmp/proj";
+      const workspaceId = "ws-selected-agent";
+      const projects = new Map([
+        [
+          projectPath,
+          {
+            workspaces: [
+              {
+                id: workspaceId,
+                path: "/tmp/proj/ws",
+                agentId: "review",
+                aiSettingsByAgent: {
+                  review: { model: "anthropic:claude-sonnet-4-6", thinkingLevel: "off" as const },
+                  exec: { model: "openai:gpt-4o", thinkingLevel: "off" as const },
+                },
+              },
+            ],
+          },
+        ],
+      ]);
+      const service = await makeServiceWithConfig({ projects });
+
+      const result = await service.getGoalContinuationKickoffSendOptions(workspaceId);
+
+      expect(result).toEqual({
+        model: "anthropic:claude-sonnet-4-6",
+        agentId: "review",
+        thinkingLevel: "off",
+        // The bucket owns the reasoning choice; absent resolves to explicit standard.
+        reasoningMode: "standard",
+      });
+    });
+
+    test("carries the persisted thinking level with the winning model candidate", async () => {
+      const projectPath = "/tmp/proj";
+      const workspaceId = "ws-thinking";
+      const projects = new Map([
+        [
+          projectPath,
+          {
+            workspaces: [
+              {
+                id: workspaceId,
+                path: "/tmp/proj/ws",
+                aiSettingsByAgent: {
+                  exec: { model: "anthropic:claude-fable-5", thinkingLevel: "medium" as const },
+                },
+              },
+            ],
+          },
+        ],
+      ]);
+      const service = await makeServiceWithConfig({ projects });
+
+      const result = await service.getGoalContinuationKickoffSendOptions(workspaceId);
+
+      // Regression: continuations previously dropped the persisted thinking
+      // level, streaming with an implicit "off" that Fable/Mythos-class
+      // Anthropic models reject ("thinking.type.disabled" unsupported).
+      expect(result).toEqual({
+        model: "anthropic:claude-fable-5",
+        agentId: "exec",
+        thinkingLevel: "medium",
+        reasoningMode: "standard",
+      });
+    });
+
+    test("falls back to exec when the selected agent cannot run goal continuations", async () => {
+      const projectPath = "/tmp/proj";
+      const workspaceId = "ws-plan-agent";
+      const projects = new Map([
+        [
+          projectPath,
+          {
+            workspaces: [
+              {
+                id: workspaceId,
+                path: "/tmp/proj/ws",
+                agentId: "plan",
+                aiSettingsByAgent: {
+                  plan: { model: "anthropic:claude-sonnet-4-6", thinkingLevel: "off" as const },
+                  exec: { model: "openai:gpt-4o", thinkingLevel: "off" as const },
+                },
+              },
+            ],
+          },
+        ],
+      ]);
+      const service = await makeServiceWithConfig({ projects });
+
+      const result = await service.getGoalContinuationKickoffSendOptions(workspaceId);
+
+      expect(result).toEqual({
+        model: "openai:gpt-4o",
+        agentId: "exec",
+        thinkingLevel: "off",
+        reasoningMode: "standard",
+      });
+    });
+
+    test("falls through to workspace default model when per-agent is missing", async () => {
+      const projectPath = "/tmp/proj";
+      const workspaceId = "ws-1";
+      const projects = new Map([
+        [
+          projectPath,
+          {
+            workspaces: [
+              {
+                id: workspaceId,
+                path: "/tmp/proj/ws",
+                aiSettings: { model: "openai:gpt-4o", thinkingLevel: "off" as const },
+              },
+            ],
+          },
+        ],
+      ]);
+      const service = await makeServiceWithConfig({ projects });
+      const result = await service.getGoalContinuationKickoffSendOptions(workspaceId);
+      expect(result?.model).toBe("openai:gpt-4o");
+    });
+
+    test("falls through to global agent default when workspace has no model", async () => {
+      const projectPath = "/tmp/proj";
+      const workspaceId = "ws-1";
+      const projects = new Map([
+        [projectPath, { workspaces: [{ id: workspaceId, path: "/tmp/proj/ws" }] }],
+      ]);
+      const service = await makeServiceWithConfig({
+        projects,
+        agentAiDefaults: { exec: { modelString: "anthropic:claude-sonnet-4-6" } },
+      });
+      const result = await service.getGoalContinuationKickoffSendOptions(workspaceId);
+      expect(result?.model).toContain("sonnet");
+    });
+
+    // A `/goal` before any chat message leaves the workspace without AI settings.
+    test("falls back to the configured default model when nothing else names one", async () => {
+      const projectPath = "/tmp/proj";
+      const workspaceId = "ws-1";
+      const projects = new Map([
+        [projectPath, { workspaces: [{ id: workspaceId, path: "/tmp/proj/ws" }] }],
+      ]);
+      const service = await makeServiceWithConfig({
+        projects,
+        defaultModel: "anthropic:claude-haiku-4-5",
+      });
+      const result = await service.getGoalContinuationKickoffSendOptions(workspaceId);
+      expect(result?.model).toBe("anthropic:claude-haiku-4-5");
+    });
+
+    test("model-less reasoning-only agent default still contributes its fields", async () => {
+      const projectPath = "/tmp/proj";
+      const workspaceId = "ws-1";
+      const projects = new Map([
+        [projectPath, { workspaces: [{ id: workspaceId, path: "/tmp/proj/ws" }] }],
+      ]);
+      const service = await makeServiceWithConfig({
+        projects,
+        // "Inherit" model in settings persists entries with only thinking
+        // fields; the model must fall through while these fields apply.
+        agentAiDefaults: {
+          exec: { thinkingLevel: "high" as const, reasoningMode: "pro" as const },
+        },
+      });
+      const result = await service.getGoalContinuationKickoffSendOptions(workspaceId);
+      expect(result?.model).toBeTruthy();
+      expect(result?.thinkingLevel).toBe("high");
+      expect(result?.reasoningMode).toBe("pro");
+    });
+
+    test("resolves defaults through the selected agent's declared base chain", async () => {
+      // A custom agent declaring base: plan must inherit Plan's configured
+      // defaults, not fall through to the Exec approximation (mirrors
+      // Settings/ACP/task-spawn resolution).
+      const projectPath = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-goal-chain-"));
+      try {
+        const agentsDir = path.join(projectPath, ".mux", "agents");
+        await fsPromises.mkdir(agentsDir, { recursive: true });
+        await fsPromises.writeFile(
+          path.join(agentsDir, "researcher.md"),
+          `---\nname: Researcher\ndescription: Plan-derived custom agent for tests\nbase: plan\nsubagent:\n  runnable: true\n---\n\nTest agent body.\n`,
+          "utf-8"
+        );
+
+        const workspaceId = "ws-1";
+        const projects = new Map([
+          [
+            projectPath,
+            {
+              // getInfo reads this real entry, so the checkout root is the fixture directory
+              // holding the agent definition.
+              workspaces: [
+                {
+                  id: workspaceId,
+                  path: projectPath,
+                  runtimeConfig: { type: "local" as const },
+                  agentId: "researcher",
+                },
+              ],
+            },
+          ],
+        ]);
+        const service = await makeServiceWithConfig({
+          projects,
+          agentAiDefaults: {
+            plan: { thinkingLevel: "high" as const, reasoningMode: "pro" as const },
+            exec: { thinkingLevel: "low" as const, reasoningMode: "standard" as const },
+          },
+        });
+
+        const result = await service.getGoalContinuationKickoffSendOptions(workspaceId);
+        expect(result?.thinkingLevel).toBe("high");
+        expect(result?.reasoningMode).toBe("pro");
+      } finally {
+        await fsPromises.rm(projectPath, { recursive: true, force: true });
+      }
+    });
+
+    test("a project-scoped exec override with base: plan inherits Plan's defaults", async () => {
+      // Every agent's declaration must be inspected, including one named
+      // "exec": a project exec.md with base: plan must resolve Plan's pro
+      // default, matching ACP/task/desktop resolution.
+      const projectPath = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-exec-chain-"));
+      try {
+        const agentsDir = path.join(projectPath, ".mux", "agents");
+        await fsPromises.mkdir(agentsDir, { recursive: true });
+        await fsPromises.writeFile(
+          path.join(agentsDir, "exec.md"),
+          `---\nname: Exec\ndescription: Project exec override for tests\nbase: plan\n---\n\nTest agent body.\n`,
+          "utf-8"
+        );
+
+        const workspaceId = "ws-1";
+        const projects = new Map([
+          [
+            projectPath,
+            {
+              // Real entry read by getInfo, like the researcher test above.
+              workspaces: [
+                {
+                  id: workspaceId,
+                  path: projectPath,
+                  runtimeConfig: { type: "local" as const },
+                  agentId: "exec",
+                },
+              ],
+            },
+          ],
+        ]);
+        const service = await makeServiceWithConfig({
+          projects,
+          agentAiDefaults: {
+            plan: { reasoningMode: "pro" as const },
+          },
+        });
+
+        const result = await service.getGoalContinuationKickoffSendOptions(workspaceId);
+        expect(result?.reasoningMode).toBe("pro");
+      } finally {
+        await fsPromises.rm(projectPath, { recursive: true, force: true });
+      }
+    });
+
+    test("idle compaction inherits reasoning through compact's configured base chain", async () => {
+      // Same class as the /compact frontend fix: exec's configured pro must
+      // reach backend compaction even with no workspace-level overrides.
+      const projectPath = "/tmp/proj";
+      const workspaceId = "ws-1";
+      const projects = new Map([
+        [projectPath, { workspaces: [{ id: workspaceId, path: "/tmp/proj/ws" }] }],
+      ]);
+      const service = await makeServiceWithConfig({
+        projects,
+        agentAiDefaults: {
+          exec: { reasoningMode: "pro" as const },
+        },
+      });
+
+      const result = await (
+        service as unknown as {
+          buildIdleCompactionSendOptions(id: string): Promise<{ reasoningMode?: string }>;
+        }
+      ).buildIdleCompactionSendOptions(workspaceId);
+      expect(result.reasoningMode).toBe("pro");
+    });
+
+    test("heartbeat reasoning resolves through the selected agent's declared base chain", async () => {
+      // Same parity requirement as goal kickoffs: a base: plan custom agent
+      // must inherit Plan's configured Pro default, not the Exec fallback.
+      const projectPath = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-hb-chain-"));
+      try {
+        const agentsDir = path.join(projectPath, ".mux", "agents");
+        await fsPromises.mkdir(agentsDir, { recursive: true });
+        await fsPromises.writeFile(
+          path.join(agentsDir, "researcher.md"),
+          `---\nname: Researcher\ndescription: Plan-derived custom agent for tests\nbase: plan\nsubagent:\n  runnable: true\n---\n\nTest agent body.\n`,
+          "utf-8"
+        );
+
+        const workspaceId = "ws-1";
+        const projects = new Map([
+          [
+            projectPath,
+            {
+              // getInfo reads this real entry, so the checkout root is the fixture directory
+              // holding the agent definition.
+              workspaces: [
+                {
+                  id: workspaceId,
+                  path: projectPath,
+                  runtimeConfig: { type: "local" as const },
+                  agentId: "researcher",
+                },
+              ],
+            },
+          ],
+        ]);
+        const service = await makeServiceWithConfig({
+          projects,
+          agentAiDefaults: {
+            plan: {
+              modelString: "openai:gpt-5.6-sol",
+              thinkingLevel: "high" as const,
+              reasoningMode: "pro" as const,
+            },
+            exec: {
+              modelString: "anthropic:claude-sonnet-4-6",
+              thinkingLevel: "low" as const,
+              reasoningMode: "standard" as const,
+            },
+          },
+        });
+
+        // Model, thinking, and reasoning must ALL resolve through the chain:
+        // inheriting pro beside exec's Anthropic model would gate pro out.
+        const result = await (
+          service as unknown as {
+            buildHeartbeatSendOptions(id: string): Promise<{
+              sendOptions: { model: string; thinkingLevel?: string; reasoningMode?: string };
+            }>;
+          }
+        ).buildHeartbeatSendOptions(workspaceId);
+        expect(result.sendOptions.model).toBe("openai:gpt-5.6-sol");
+        expect(result.sendOptions.thinkingLevel).toBe("high");
+        expect(result.sendOptions.reasoningMode).toBe("pro");
+      } finally {
+        await fsPromises.rm(projectPath, { recursive: true, force: true });
+      }
+    });
+
+    test("falls through to DEFAULT_MODEL as the final fallback", async () => {
+      const projectPath = "/tmp/proj";
+      const workspaceId = "ws-1";
+      const projects = new Map([
+        [projectPath, { workspaces: [{ id: workspaceId, path: "/tmp/proj/ws" }] }],
+      ]);
+      const service = await makeServiceWithConfig({ projects });
+      const result = await service.getGoalContinuationKickoffSendOptions(workspaceId);
+      expect(result?.model).toBeTruthy();
+      expect(result?.agentId).toBe("exec");
+    });
+
+    test("skips invalid candidate strings and tries the next fallback", async () => {
+      const projectPath = "/tmp/proj";
+      const workspaceId = "ws-1";
+      const projects = new Map([
+        [
+          projectPath,
+          {
+            workspaces: [
+              {
+                id: workspaceId,
+                path: "/tmp/proj/ws",
+                aiSettings: { model: "   ", thinkingLevel: "off" as const }, // whitespace-only -> skipped
+              },
+            ],
+          },
+        ],
+      ]);
+      const service = await makeServiceWithConfig({
+        projects,
+        agentAiDefaults: { exec: { modelString: "openai:gpt-4o" } },
+      });
+      const result = await service.getGoalContinuationKickoffSendOptions(workspaceId);
+      expect(result?.model).toBe("openai:gpt-4o");
+    });
+  });
+});
+
+// #5402: an automatic goal turn whose agent is gone must not start (it would run as exec). Real
+// goal service, WorkspaceService gate and AIService resolution; only turn execution is recorded.
+describe("automatic goal turns whose selected agent is unavailable (#5402)", () => {
+  const harnesses: WorkspaceServiceHarness[] = [];
+  afterEach(async () => {
+    await Promise.all(harnesses.splice(0).map((harness) => harness.cleanup()));
+  });
+  const workspaceId = "ws-goal-agent-unavailable";
+
+  async function setup(selectedAgentId: string) {
+    const real: { ai?: AIService } = {};
+    const harness = await createWorkspaceServiceHarness({
+      aiServiceOverrides: {
+        getAutomaticGoalTurnAgentRefusal: (id, options) =>
+          real.ai?.getAutomaticGoalTurnAgentRefusal(id, options) ?? Promise.resolve(null),
+      },
+    });
+    harnesses.push(harness);
+    const { config, historyService, initStateManager, extensionMetadata, service } = harness;
+    real.ai = new AIService(
+      config,
+      historyService,
+      initStateManager,
+      new ProviderService(config, new ProvidersConfigStore(config.rootDir))
+    );
+    const projectPath = path.join(harness.rootDir, "project");
+    const agentFile = path.join(projectPath, ".xum", "agents", "researcher.md");
+    await fsPromises.mkdir(path.dirname(agentFile), { recursive: true });
+    const readOnly =
+      "---\nname: Researcher\nbase: exec\ntools:\n  remove:\n    - file_edit_.*\n---\nRead-only.";
+    await fsPromises.writeFile(agentFile, readOnly);
+    await config.addWorkspace(projectPath, {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "project",
+      projectPath,
+      runtimeConfig: { type: "local" },
+    });
+    // A project-dir local workspace (its checkout is the project) with the given selection.
+    const selectAgent = (agentId: string) =>
+      config.editConfig((cfg) => {
+        const entry = cfg.projects.get(projectPath)?.workspaces.find((w) => w.id === workspaceId);
+        if (entry == null) throw new Error("test workspace missing");
+        entry.path = projectPath;
+        entry.agentId = agentId;
+        return cfg;
+      });
+    await selectAgent(selectedAgentId);
+    const executed: Array<{ kind: string | undefined; options: SendMessageOptions }> = [];
+    const skipped: string[] = [];
+    const goalService = (options?: { suppressKickoffContinuation?: boolean }) => {
+      const goals = new WorkspaceGoalService(
+        config,
+        historyService,
+        extensionMetadata,
+        undefined,
+        options
+      );
+      goals.setTimelineRecorder({
+        ...NOOP_TIMELINE_RECORDER,
+        record: (_id, draft) => {
+          if (draft.status === "skipped") skipped.push(draft.data?.reason ?? "");
+        },
+      });
+      goals.registerGoalContinuationConsumer(new IdleDispatcher(), {
+        hasActiveDescendantTasks: () => false,
+        getRuntimeState: (id) => service.getGoalContinuationRuntimeState(id),
+        executeGoalContinuation: (input) => {
+          executed.push({ kind: input.kind, options: input.options });
+          return Promise.resolve(true);
+        },
+        getKickoffSendOptions: (id) => service.getGoalContinuationKickoffSendOptions(id),
+        refuseUnavailableAgent: (id, options, isCurrent) =>
+          service.refuseUnavailableGoalTurnAgent(id, options, isCurrent),
+      });
+      return goals;
+    };
+    return {
+      config,
+      service,
+      executed,
+      skipped,
+      selectAgent,
+      goalService,
+      deleteAgent: () => fsPromises.rm(agentFile),
+    };
+  }
+
+  test.each([
+    ["deleted", "its definition was not found"],
+    ["disabled", "it is disabled"],
+  ] as const)(
+    "a %s agent's kickoff runs no turn; the goal pauses, then resumes on a new selection",
+    async (breakage, detail) => {
+      const t = await setup("researcher");
+      if (breakage === "deleted") await t.deleteAgent();
+      else
+        await t.config.editConfig((cfg) => ({
+          ...cfg,
+          agentAiDefaults: { ...cfg.agentAiDefaults, researcher: { enabled: false } },
+        }));
+      const goals = t.goalService();
+
+      expect((await goals.setGoal({ workspaceId, objective: "Survey" })).success).toBe(true);
+      await waitForCondition(() => t.skipped.length > 0, { timeoutMs: 2_000 });
+      expect((await goals.getGoal(workspaceId))?.status).toBe("paused");
+      expect(t.executed).toEqual([]);
+      expect(t.skipped).toHaveLength(1);
+      expect(t.skipped[0]).toContain(`Selected agent 'researcher' is unavailable: ${detail}`);
+
+      await t.selectAgent("explore");
+      expect((await goals.setGoal({ workspaceId, status: "active" })).success).toBe(true);
+      await waitForCondition(() => t.executed.length > 0, { timeoutMs: 2_000 });
+      expect(t.executed[0]?.options.agentId).toBe("explore");
+    }
+  );
+
+  // #5452: a synchronous staleness probe (the root dispatcher's candidate identity) is evaluated
+  // in the same tick as the chat error, so no candidate replacement can slip in between.
+  test("a synchronous staleness probe stays adjacent to the refusal's chat error", async () => {
+    const t = await setup("researcher");
+    await t.deleteAgent();
+    const session = t.service.getOrCreateSession(workspaceId);
+    let replacedAfterProbe = false;
+    const replacedAtEmission: boolean[] = [];
+    spyOn(session, "emitChatEvent").mockImplementation(() => {
+      replacedAtEmission.push(replacedAfterProbe);
+    });
+
+    const refusal = await t.service.refuseUnavailableGoalTurnAgent(
+      workspaceId,
+      { agentId: "researcher" },
+      () => {
+        queueMicrotask(() => {
+          replacedAfterProbe = true;
+        });
+        return true;
+      }
+    );
+
+    expect(refusal).not.toBeNull();
+    expect(replacedAtEmission).toEqual([false]);
+  });
+
+  test("a hidden saved selection (explore) still continues", async () => {
+    const t = await setup("explore");
+    const goals = t.goalService();
+
+    expect((await goals.setGoal({ workspaceId, objective: "Map callers" })).success).toBe(true);
+    await waitForCondition(() => t.executed.length > 0, { timeoutMs: 2_000 });
+    expect(t.executed[0]?.options.agentId).toBe("explore");
+    expect(t.skipped).toEqual([]);
+  });
+
+  test("restart recovery of an active goal runs no turn once its agent is gone; a failed pause retries", async () => {
+    const t = await setup("researcher");
+    const setter = t.goalService({ suppressKickoffContinuation: true });
+    expect((await setter.setGoal({ workspaceId, objective: "Survey" })).success).toBe(true);
+    await t.deleteAgent();
+
+    const restarted = t.goalService();
+    const setGoal = spyOn(restarted, "setGoal").mockRejectedValueOnce(new Error("EIO"));
+    await restarted.recoverPendingDispatchAfterRestart(workspaceId);
+    await waitForCondition(() => t.skipped.length > 0, { timeoutMs: 3_000 });
+    expect(setGoal).toHaveBeenCalledTimes(2);
+    expect((await restarted.getGoal(workspaceId))?.status).toBe("paused");
+    expect(t.executed).toEqual([]);
+  });
+
+  test("a refused budget wrap-up runs no turn and leaves the goal budget_limited with nothing owed", async () => {
+    const t = await setup("researcher");
+    const setter = t.goalService({ suppressKickoffContinuation: true });
+    const created = await setter.setGoal({ workspaceId, objective: "Survey", budgetCents: 100 });
+    if (!created.success) throw new Error("goal not created");
+    await setter.recordStreamAccounting({
+      workspaceId,
+      costUsd: 1.25,
+      streamStartedAtMs: created.data.createdAtMs + 1,
+      streamOriginKind: "goal_continuation",
+    });
+    await t.deleteAgent();
+
+    const restarted = t.goalService();
+    await restarted.recoverPendingDispatchAfterRestart(workspaceId);
+    await waitForCondition(() => t.skipped.length > 0, { timeoutMs: 2_000 });
+    expect(t.executed).toEqual([]);
+    expect(t.skipped[0]).toContain("Selected agent 'researcher' is unavailable");
+    expect(await restarted.getGoal(workspaceId)).toMatchObject({
+      status: "budget_limited",
+      // Consumed, so restart recovery owes no wrap-up and never re-arms it.
+      budgetLimitInjectedForGoalId: created.data.goalId,
+    });
+  });
+});

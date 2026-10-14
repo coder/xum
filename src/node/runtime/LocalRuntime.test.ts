@@ -4,6 +4,7 @@ import * as path from "path";
 import * as fs from "fs/promises";
 import * as nodeFs from "fs";
 import { Readable } from "stream";
+import { getXumHome } from "@/common/constants/paths";
 import { LocalRuntime } from "./LocalRuntime";
 import type { InitLogger, RuntimeStatusEvent } from "./Runtime";
 
@@ -357,15 +358,18 @@ describe("LocalRuntime", () => {
     it("stat expands tilde paths", async () => {
       const runtime = new LocalRuntime(testDir);
 
-      // Create a file in home directory's .mux folder
-      const muxDir = path.join(os.homedir(), ".mux", "test-tilde");
-      await fs.mkdir(muxDir, { recursive: true });
+      // ~/.mux is a legacy alias for the product home, which resolves to ~/.xum once that
+      // exists (e.g. created by an earlier test on the same machine), so create it there.
+      // Unique child dir so a developer's real product home is never overwritten or deleted.
+      await fs.mkdir(getXumHome(), { recursive: true });
+      const muxDir = await fs.mkdtemp(path.join(getXumHome(), "test-tilde-"));
+      const tildeDir = `~/.mux/${path.basename(muxDir)}`;
       const testFile = path.join(muxDir, "test.txt");
       await fs.writeFile(testFile, "test content");
 
       try {
         // Use tilde path - should work
-        const stat = await runtime.stat("~/.mux/test-tilde/test.txt");
+        const stat = await runtime.stat(`${tildeDir}/test.txt`);
         expect(stat.size).toBeGreaterThan(0);
         expect(stat.isDirectory).toBe(false);
       } finally {
@@ -376,16 +380,19 @@ describe("LocalRuntime", () => {
     it("readFile expands tilde paths", async () => {
       const runtime = new LocalRuntime(testDir);
 
-      // Create a file in home directory's .mux folder
-      const muxDir = path.join(os.homedir(), ".mux", "test-tilde");
-      await fs.mkdir(muxDir, { recursive: true });
+      // ~/.mux is a legacy alias for the product home, which resolves to ~/.xum once that
+      // exists (e.g. created by an earlier test on the same machine), so create it there.
+      // Unique child dir so a developer's real product home is never overwritten or deleted.
+      await fs.mkdir(getXumHome(), { recursive: true });
+      const muxDir = await fs.mkdtemp(path.join(getXumHome(), "test-tilde-"));
+      const tildeDir = `~/.mux/${path.basename(muxDir)}`;
       const testFile = path.join(muxDir, "read-test.txt");
       const content = "hello from tilde path";
       await fs.writeFile(testFile, content);
 
       try {
         // Use tilde path - should work
-        const stream = runtime.readFile("~/.mux/test-tilde/read-test.txt");
+        const stream = runtime.readFile(`${tildeDir}/read-test.txt`);
         const reader = stream.getReader();
         let result = "";
         while (true) {
@@ -473,13 +480,15 @@ describe("LocalRuntime", () => {
       const runtime = new LocalRuntime(testDir);
 
       // Create parent directory in home
-      const muxDir = path.join(os.homedir(), ".mux", "test-tilde-write");
-      await fs.mkdir(muxDir, { recursive: true });
+      // Unique child dir so a developer's real product home is never overwritten or deleted.
+      await fs.mkdir(getXumHome(), { recursive: true });
+      const muxDir = await fs.mkdtemp(path.join(getXumHome(), "test-tilde-write-"));
+      const tildeDir = `~/.mux/${path.basename(muxDir)}`;
 
       try {
         // Use tilde path - should work
         const content = "written via tilde path";
-        const stream = runtime.writeFile("~/.mux/test-tilde-write/write-test.txt");
+        const stream = runtime.writeFile(`${tildeDir}/write-test.txt`);
         const writer = stream.getWriter();
         await writer.write(new TextEncoder().encode(content));
         await writer.close();

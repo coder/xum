@@ -10,6 +10,7 @@ import { collapseLeftSidebar } from "@/browser/stories/helpers/uiState";
 import { userEvent, waitFor, within } from "@storybook/test";
 import {
   createAgentPeerMessage,
+  createAgentPeerTriggerMessage,
   createAssistantMessage,
   createBashMonitorWakeMessage,
   createGoalBudgetLimitMessage,
@@ -856,7 +857,8 @@ export const BashMonitorWakeMessages: AppStory = {
 /**
  * Agent peer messages from every relationship the envelope supports: a same-tree sibling, a
  * descendant messaging upward, and an unrelated workspace from another task tree (cross-tree
- * sends take the same untrusted peer path and render the same card with an "unrelated" badge).
+ * sends take the same untrusted peer path and render the same card). The cross-tree message also
+ * carries its fixed wake trigger row, which folds into the card instead of rendering separately.
  */
 function setupAgentPeerMessagesStory() {
   collapseLeftSidebar();
@@ -896,6 +898,14 @@ function setupAgentPeerMessagesStory() {
         message:
           "Release branch `release/2026.09` is being cut at 17:00 UTC. Please hold merges touching `workspace_sessions` until then.",
       }),
+      createAgentPeerTriggerMessage("msg-6", {
+        historySequence: 6,
+        timestamp: STABLE_TIMESTAMP - 29000,
+        fromWorkspaceId: "ws-release-coordinator",
+        fromTitle: "Release Coordinator",
+        relationship: "unrelated",
+        payloadMessageId: "msg-5",
+      }),
     ],
   });
 }
@@ -934,7 +944,7 @@ export const AgentPeerMessages: AppStory = {
     const canvas = within(canvasElement);
     const toggles = await findCollapsedPeerMessageToggles(canvasElement);
 
-    // Sender attribution and relationship badges must be visible while collapsed.
+    // Sender attribution must be visible while collapsed.
     if (canvas.queryByText(/Message from Schema Migrator/) == null) {
       throw new Error("Expected titled peer message header");
     }
@@ -944,9 +954,9 @@ export const AgentPeerMessages: AppStory = {
     if (canvas.queryByText(/Message from Release Coordinator/) == null) {
       throw new Error("Expected cross-tree peer message header");
     }
-    // The badge is the only cue that the sender shares no ancestry with this workspace.
-    if (canvas.queryByText("unrelated", { exact: true }) == null) {
-      throw new Error("Expected the cross-tree peer message to carry an unrelated badge");
+    // The paired wake trigger folds into the card: one peer message, one transcript row.
+    if (canvas.queryByText("Agent message notification") != null) {
+      throw new Error("Expected the paired wake trigger to fold into its agent-message card");
     }
 
     // Expand the second (descendant) message; the sibling and unrelated messages stay collapsed.
@@ -962,7 +972,7 @@ export const AgentPeerMessages: AppStory = {
 const AGENT_PEER_PHONE_WIDTH = 390;
 
 /**
- * Phone-width contract for the peer cards: the collapsed header (badge, sender, relationship) and
+ * Phone-width contract for the peer cards: the collapsed header (badge, sender) and
  * the expanded cross-tree body must fit a 390px frame without horizontal overflow. Pinned to the
  * Pixel phone viewport; the fixed-width decorator keeps the frame narrow in the desktop-sized
  * test-runner, while media-dependent fit assertions are guarded on the real viewport width.
@@ -1013,11 +1023,6 @@ export const AgentPeerMessagesPhone390: AppStory = {
         throw new Error("Expected the expanded cross-tree message to reveal its body");
       }
     });
-
-    // The unrelated badge must survive truncation of the sender title at phone width.
-    if (canvas.queryByText("unrelated", { exact: true }) == null) {
-      throw new Error("Expected the unrelated badge to stay visible at phone width");
-    }
 
     // The desktop-sized test-runner retains the app's desktop minimum width; only the
     // manager/Pixel phone viewport activates its narrow media rules, so fit is asserted there.

@@ -1,0 +1,39 @@
+// N10 (#5670): on reload the right sidebar dropped the saved Artifacts tab while experiments loaded,
+// then re-added it at the end. Proves the saved tab order is the same after a reload.
+import { test } from "@e2e-dev/web";
+import { expect } from "e2e";
+import { openPlayground, WORKSPACE_TITLE } from "./helpers";
+
+test(
+  "the right sidebar keeps its saved tab order across a reload",
+  { tags: ["bugbash", "N10"] },
+  async ({ app, screen, browser }) => {
+    // The web target's size, set here so the repro runs the same on every target: the narrow
+    // layout hides the right sidebar.
+    await browser.setViewport({ width: 1440, height: 900 });
+    await openPlayground(app, screen, browser);
+    const tablist = screen.getByRole("tablist", "Sidebar views");
+    // The strip shows only opened tabs: open Artifacts, then Goal after it, from New tabs.
+    for (const tool of ["Artifacts", "Goal"]) {
+      // The launcher button is a sibling of the tablist so the list owns only tabs.
+      await screen
+        .getByRole("complementary", "Workspace insights")
+        .getByRole("button", "New tab")
+        .tap();
+      await screen
+        .getByRole("tabpanel", /^New tab/)
+        .getByRole("button", tool)
+        .tap();
+    }
+    const artifactsTab = tablist.getByRole("tab", /^Artifacts/);
+    await expect(artifactsTab).toBeVisible({ timeout: 15_000 });
+    // Goal sits after Artifacts, so moving Artifacts to the end shows.
+    const saved = await tablist.getByRole("tab").allTextContents();
+    expect(saved.findIndex((tab) => tab.startsWith("Artifacts"))).toBeLessThan(saved.length - 1);
+
+    await browser.reload();
+    await expect(screen.getByText(WORKSPACE_TITLE).first()).toBeVisible({ timeout: 15_000 });
+    await expect(artifactsTab).toBeVisible({ timeout: 15_000 });
+    await expect.poll(() => tablist.getByRole("tab").allTextContents()).toEqual(saved);
+  }
+);

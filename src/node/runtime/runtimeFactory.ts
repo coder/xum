@@ -1,4 +1,5 @@
 import * as fs from "fs/promises";
+import { getWorkspaceScratchDir } from "./workspaceScratchDir";
 import * as path from "path";
 import type { Runtime, WorkspaceInitParams, WorkspaceInitResult } from "./Runtime";
 import { LocalRuntime } from "./LocalRuntime";
@@ -14,6 +15,8 @@ import { hasSrcBaseDir } from "@/common/types/runtime";
 import { isIncompatibleRuntimeConfig } from "@/common/utils/runtimeCompatibility";
 import { detectContainerEngine, isEngineResponsive } from "./containerCli";
 import type { CoderService } from "@/node/services/coderService";
+import type { WorkspaceUseLeases } from "@/node/services/workspaceUseLeases";
+import { log } from "@/node/services/log";
 import { Config } from "@/node/config";
 import { checkDevcontainerCliVersion } from "./devcontainerCli";
 import { buildDevcontainerConfigInfo, scanDevcontainerConfigs } from "./devcontainerConfigs";
@@ -55,15 +58,22 @@ export async function runFullInit(
  * error paths that must tear down the checkout can await termination first —
  * deleting a worktree while init still runs against it races its writes and
  * open handles. Callers that never tear down may ignore it with `void`.
+ *
+ * #4857: the init hook runs in the checkout, so it holds this backend's "init" use lease until
+ * it ends, and another backend sharing the Xum root refuses to rename or remove the workspace
+ * meanwhile. The lease is released before the returned promise settles, so a caller awaiting
+ * the settlement (archive, remove) no longer sees it. While another backend mutates the
+ * workspace, the init does not run and fails like any other init failure.
  */
 export function runBackgroundInit(
   runtime: Runtime,
   params: WorkspaceInitParams,
   workspaceId: string,
+  useLeases: Pick<WorkspaceUseLeases, "hold">,
   // eslint-disable-next-line local/no-object-parameters -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
   logger?: { error: (msg: string, ctx: object) => void }
 ): Promise<void> {
-  return runFullInit(runtime, params).then(
+  return withInitUseLease(useLeases, workspaceId, () => runFullInit(runtime, params)).then(
     () => undefined,
     (error: unknown) => {
       const errorMsg = getErrorMessage(error);
@@ -72,6 +82,42 @@ export function runBackgroundInit(
       params.initLogger.logComplete(-1);
     }
   );
+}
+
+/**
+ * Run a background init under this backend's "init" use lease for the workspace (#4857; see
+ * runBackgroundInit). Throws WorkspaceMutationInProgressError, without running `init`, while
+ * another backend mutates the workspace. The lease is released before the returned promise
+ * settles. Multi-project creation runs its per-project inits through this directly.
+ */
+export async function withInitUseLease<T>(
+  useLeases: Pick<WorkspaceUseLeases, "hold">,
+  workspaceId: string,
+  init: () => Promise<T>
+): Promise<T> {
+  const lease = await useLeases.hold(workspaceId, "init");
+  try {
+    return await init();
+  } finally {
+    // A failed release leaves the lease file held (fail closed); never fail the init for it.
+    await lease.release().catch((error: unknown) => {
+      log.warn(`Failed to release the init use lease for ${workspaceId}`, {
+        error: getErrorMessage(error),
+      });
+    });
+  }
+}
+
+/**
+ * Whether new devcontainer runtimes bind-mount the workspace scratch dir. Only with the Artifacts
+ * experiment, like remote scratch dirs in agent turns and terminals (turnRequestBuilder,
+ * TerminalService): a daemon that refuses the mount source must never break `devcontainer up` for
+ * users who did not opt in. Registered by the layer that owns ExperimentsService; off until then.
+ */
+let isDevcontainerScratchMountEnabled: () => boolean = () => false;
+
+export function setDevcontainerScratchMountGate(gate: () => boolean): void {
+  isDevcontainerScratchMountEnabled = gate;
 }
 
 function shouldUseSSH2Runtime(): boolean {
@@ -115,6 +161,11 @@ export interface CreateRuntimeOptions {
    * Used by devcontainer runtimes to preserve the exact host path from startup.
    */
   workspacePath?: string;
+  /**
+   * Workspace id, when known. Devcontainers use it to bind-mount the workspace's host scratch
+   * dir (see DevcontainerRuntimeOptions.scratchMountDir).
+   */
+  workspaceId?: string;
   /**
    * Coder service - required for SSH runtimes with Coder configuration.
    * When provided and config has coder field, returns a Coder SSH runtime (SSH/SSH2).
@@ -215,10 +266,15 @@ export function createRuntime(config: RuntimeConfig, options?: CreateRuntimeOpti
     case "devcontainer": {
       // Devcontainer uses worktrees on host + container exec
       // srcBaseDir sourced from config to honor MUX_ROOT and dev-mode suffixes
+      const xumConfig = new Config();
       const runtime = new DevcontainerRuntime({
-        srcBaseDir: new Config().srcDir,
+        srcBaseDir: xumConfig.srcDir,
         configPath: config.configPath,
         shareCredentials: config.shareCredentials,
+        scratchMountDir:
+          options?.workspaceId != null && isDevcontainerScratchMountEnabled()
+            ? getWorkspaceScratchDir(xumConfig.sessionsDir, options.workspaceId)
+            : undefined,
       });
       // Set workspace path for existing workspaces
       // For existing workspaces, prefer the persisted workspacePath — Docker labels

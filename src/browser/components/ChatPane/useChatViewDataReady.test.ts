@@ -57,6 +57,7 @@ describe("useChatViewDataReady", () => {
         chatViewDataReady: result.current,
         hasRenderableMessages: false,
         isTranscriptStale: false,
+        isIncrementalCatchUp: false,
       })
     ).toEqual({ showHydrationPlaceholder: false, revealDecorations: true });
   });
@@ -86,6 +87,7 @@ describe("computeChatViewReveal", () => {
         chatViewDataReady: false,
         hasRenderableMessages: false,
         isTranscriptStale: false,
+        isIncrementalCatchUp: false,
       })
     ).toEqual({ showHydrationPlaceholder: true, revealDecorations: false });
 
@@ -98,6 +100,7 @@ describe("computeChatViewReveal", () => {
         chatViewDataReady: true,
         hasRenderableMessages: false,
         isTranscriptStale: false,
+        isIncrementalCatchUp: false,
       })
     ).toEqual({ showHydrationPlaceholder: true, revealDecorations: false });
 
@@ -108,6 +111,7 @@ describe("computeChatViewReveal", () => {
         chatViewDataReady: true,
         hasRenderableMessages: true,
         isTranscriptStale: false,
+        isIncrementalCatchUp: false,
       })
     ).toEqual({ showHydrationPlaceholder: false, revealDecorations: true });
   });
@@ -121,6 +125,7 @@ describe("computeChatViewReveal", () => {
         chatViewDataReady: false,
         hasRenderableMessages: false,
         isTranscriptStale: false,
+        isIncrementalCatchUp: false,
       })
     ).toEqual({ showHydrationPlaceholder: true, revealDecorations: false });
   });
@@ -134,19 +139,44 @@ describe("computeChatViewReveal", () => {
         chatViewDataReady: true,
         hasRenderableMessages: true,
         isTranscriptStale: false,
+        isIncrementalCatchUp: false,
       })
     ).toEqual({ showHydrationPlaceholder: false, revealDecorations: true });
   });
 
-  test("stale cached rows hold the skeleton while hydrating", () => {
-    // Rows known to be missing backend content must not paint and then jump on
-    // caught-up; decorations wait for the same reveal commit.
+  test("stale cached rows paint during a since catch-up but hold the skeleton otherwise", () => {
+    // A since replay only appends after the server-verified cursor, so stale rows stay
+    // painted (with the dock shimmer) and decorations reveal with them.
     expect(
       computeChatViewReveal({
         isHydratingTranscript: true,
         chatViewDataReady: true,
         hasRenderableMessages: true,
         isTranscriptStale: true,
+        isIncrementalCatchUp: true,
+      })
+    ).toEqual({ showHydrationPlaceholder: false, revealDecorations: true });
+
+    // An empty transcript has nothing to paint, even when the catch-up is incremental.
+    expect(
+      computeChatViewReveal({
+        isHydratingTranscript: true,
+        chatViewDataReady: true,
+        hasRenderableMessages: false,
+        isTranscriptStale: false,
+        isIncrementalCatchUp: true,
+      })
+    ).toEqual({ showHydrationPlaceholder: true, revealDecorations: false });
+
+    // A full replay rebuilds the transcript, so stale rows must not paint and then be
+    // swapped out at caught-up; decorations wait for the same reveal commit.
+    expect(
+      computeChatViewReveal({
+        isHydratingTranscript: true,
+        chatViewDataReady: true,
+        hasRenderableMessages: true,
+        isTranscriptStale: true,
+        isIncrementalCatchUp: false,
       })
     ).toEqual({ showHydrationPlaceholder: true, revealDecorations: false });
 
@@ -158,6 +188,7 @@ describe("computeChatViewReveal", () => {
         chatViewDataReady: true,
         hasRenderableMessages: true,
         isTranscriptStale: true,
+        isIncrementalCatchUp: false,
       })
     ).toEqual({ showHydrationPlaceholder: false, revealDecorations: true });
   });
@@ -170,6 +201,7 @@ describe("computeChatViewReveal", () => {
       chatViewDataReady: false,
       hasRenderableMessages: false,
       isTranscriptStale: false,
+      isIncrementalCatchUp: false,
     });
     expect(state.showHydrationPlaceholder).toBe(true);
     expect(state.revealDecorations).toBe(false);

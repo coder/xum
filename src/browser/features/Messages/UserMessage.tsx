@@ -1,5 +1,5 @@
 import React from "react";
-import { APIContext } from "@/browser/contexts/API";
+import { APIContext, liveClientOf } from "@/browser/contexts/API";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { cn } from "@/common/lib/utils";
 import type { DisplayedMessage } from "@/common/types/message";
@@ -9,6 +9,7 @@ import {
 } from "@/browser/features/ChatInput/stagedAttachments";
 import type { ButtonConfig } from "./MessageWindow";
 import { MessageWindow } from "./MessageWindow";
+import { useOptionalMessageListContext } from "./MessageListContext";
 import { UserMessageContent } from "./UserMessageContent";
 import { GoalSyntheticMessageContent } from "./GoalSyntheticMessageContent";
 import {
@@ -19,6 +20,7 @@ import {
 import { parseSubagentFailureEnvelope } from "@/common/utils/subagentFailureEnvelope";
 import { SubagentFailureMessageContent } from "./SubagentFailureMessageContent";
 import { TerminalOutput } from "./TerminalOutput";
+import { ArtifactInteractionPill } from "./ArtifactInteractionPill";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { useCopyToClipboard } from "@/browser/hooks/useCopyToClipboard";
 import { copyToClipboard } from "@/browser/utils/clipboard";
@@ -28,8 +30,7 @@ import {
   canEditDisplayedUserMessage,
   type EditingMessageState,
 } from "@/browser/utils/chatEditing";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { VIM_ENABLED_KEY } from "@/common/constants/storage";
+import { useUserPreferences } from "@/browser/stores/AppConfigStore";
 import {
   Bot,
   ChevronLeft,
@@ -64,6 +65,7 @@ interface UserMessageProps {
   className?: string;
   onEdit?: (message: EditingMessageState) => void;
   isCompacting?: boolean;
+  editSendPending?: boolean;
   clipboardWriteText?: (data: string) => Promise<void>;
   /** Navigation info for backward/forward between user messages */
   navigation?: UserMessageNavigation;
@@ -79,6 +81,7 @@ export const UserMessage: React.FC<UserMessageProps> = ({
   className,
   onEdit,
   isCompacting,
+  editSendPending,
   clipboardWriteText = copyToClipboard,
   navigation,
 }) => {
@@ -100,15 +103,23 @@ export const UserMessage: React.FC<UserMessageProps> = ({
         ...(structuredOutputJson ? [`Structured output:\n${structuredOutputJson}`] : []),
       ].join("\n\n")
     : visibleContent;
-  const [vimEnabled] = usePersistedState<boolean>(VIM_ENABLED_KEY, false, { listener: true });
+  const vimEnabled = useUserPreferences(
+    (preferences) => preferences.appearance?.vimEnabled === true
+  );
   const isMobileTouch =
     typeof window !== "undefined" &&
     window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches;
 
   const apiState = React.useContext(APIContext);
-  const api = apiState?.api ?? null;
+  // The live client only: offline, the download reports its own error.
+  const api = apiState == null ? null : liveClientOf(apiState);
   const workspaceContext = useOptionalWorkspaceContext();
-  const workspaceId = workspaceContext?.selectedWorkspace?.workspaceId ?? null;
+  // Prefer the transcript's own workspace: a /side chat transcript renders next to the routed
+  // (selected) workspace, so the selection would download, cache-key, and guard against the wrong
+  // workspace. The selection remains the fallback outside a chat transcript.
+  const messageListContext = useOptionalMessageListContext();
+  const workspaceId =
+    messageListContext?.workspaceId ?? workspaceContext?.selectedWorkspace?.workspaceId ?? null;
 
   // Tracks the workspace this message currently renders for (null once
   // unmounted), so an in-flight download fetch can detect that the user
@@ -190,7 +201,8 @@ export const UserMessage: React.FC<UserMessageProps> = ({
           {
             label: "Previous message",
             onClick: hasPrev
-              ? () => navigation.onNavigate(navigation.prevUserMessageId!)
+              ? // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+                () => navigation.onNavigate(navigation.prevUserMessageId!)
               : undefined,
             disabled: !hasPrev,
             icon: <ChevronLeft className={!hasPrev ? "opacity-30" : undefined} />,
@@ -204,7 +216,8 @@ export const UserMessage: React.FC<UserMessageProps> = ({
           {
             label: "Next message",
             onClick: hasNext
-              ? () => navigation.onNavigate(navigation.nextUserMessageId!)
+              ? // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+                () => navigation.onNavigate(navigation.nextUserMessageId!)
               : undefined,
             disabled: !hasNext,
             icon: <ChevronRight className={!hasNext ? "opacity-30" : undefined} />,
@@ -217,13 +230,15 @@ export const UserMessage: React.FC<UserMessageProps> = ({
           {
             label: "Edit",
             onClick: handleEdit,
-            disabled: isCompacting,
+            disabled: isCompacting === true || editSendPending === true,
             icon: <Pencil />,
             tooltip: isCompacting
               ? isMobileTouch
                 ? "Cannot edit while compacting"
                 : `Cannot edit while compacting (${formatKeybind(vimEnabled ? KEYBINDS.INTERRUPT_STREAM_VIM : KEYBINDS.INTERRUPT_STREAM_NORMAL)} to cancel)`
-              : undefined,
+              : editSendPending
+                ? "Cannot edit while an edit is sending"
+                : undefined,
           },
         ]
       : []),
@@ -269,6 +284,14 @@ export const UserMessage: React.FC<UserMessageProps> = ({
         subagent
       </span>
     );
+  } else if (message.artifactInteraction != null) {
+    // Human input from an artifact: a full-opacity user bubble with a label opening the artifact.
+    label = (
+      <ArtifactInteractionPill
+        interaction={message.artifactInteraction}
+        workspaceId={workspaceId}
+      />
+    );
   } else if (isSynthetic) {
     label = (
       <span className="bg-muted/20 text-muted rounded-sm px-1.5 py-0.5 text-[10px] font-medium uppercase">
@@ -305,6 +328,7 @@ export const UserMessage: React.FC<UserMessageProps> = ({
         agentSkillSnapshot={message.agentSkill?.snapshot}
         inlineSkillSnapshots={message.inlineSkillSnapshots}
         reviews={message.reviews}
+        artifactInteraction={message.artifactInteraction}
         fileParts={message.fileParts}
         onDownloadStagedAttachment={(attachment) => void handleDownloadStagedAttachment(attachment)}
         variant="sent"

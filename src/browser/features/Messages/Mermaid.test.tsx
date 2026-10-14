@@ -7,6 +7,8 @@ import { getTranscriptContextMenuMarkdown } from "@/browser/utils/messages/trans
 import MarkdownIt from "markdown-it";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import * as RealMermaidModule from "mermaid";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 
 const DEFAULT_SVG =
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10" /></svg>';
@@ -15,6 +17,8 @@ const mermaidInitialize = mock(() => undefined);
 const mermaidParse = mock((_chart: string) => Promise.resolve());
 const mermaidRender = mock((_id: string, _chart: string) => Promise.resolve({ svg: DEFAULT_SVG }));
 
+// Restore the real mermaid module after this suite so the renderer stub cannot leak into later files.
+restoreModulesAfterSuite([["mermaid", { ...RealMermaidModule }]]);
 void mock.module("mermaid", () => ({
   default: {
     initialize: mermaidInitialize,
@@ -61,6 +65,32 @@ describe("Mermaid layout stability", () => {
     globalThis.HTMLElement = originalHTMLElement;
     mermaidParse.mockClear();
     mermaidRender.mockClear();
+  });
+
+  // React.lazy caches the resolved module for the whole process, so this must stay the first
+  // markdown mermaid render: later renders mount Mermaid synchronously (e.g. under `--rerun-each`).
+  test("markdown shows the pending diagram frame until the Mermaid chunk loads", async () => {
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <MarkdownRenderer content={"```mermaid\ngraph TD\nA-->B\n```"} />
+      </ThemeProvider>
+    );
+
+    // The chunk has not loaded yet: no zoom controls, but the same box Mermaid reserves.
+    const pending = view.container.querySelector<HTMLElement>(".mermaid-container");
+    expect(view.queryAllByRole("button")).toHaveLength(0);
+    expect(pending?.style.minHeight).toBe("300px");
+    expect(pending?.textContent).toBe("Rendering diagram...");
+    const pendingFrameStyle = pending?.parentElement?.style.cssText;
+
+    expect(await view.findByRole("button", { name: "⤢" })).toBeTruthy();
+    await waitFor(() =>
+      expect(view.container.querySelector(".mermaid-container svg")).not.toBeNull()
+    );
+    // Same outer frame before and after the chunk loads, so nothing shifts.
+    const loaded = view.container.querySelector<HTMLElement>(".mermaid-container");
+    expect(loaded?.parentElement?.style.cssText).toBe(pendingFrameStyle);
+    expect(loaded?.style.minHeight).toBe("300px");
   });
 
   test("copies a selected textless diagram and excludes diagram controls", async () => {

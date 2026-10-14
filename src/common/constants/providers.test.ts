@@ -1,18 +1,23 @@
-/**
- * Test that provider registry structure is correct
- */
-
 import { describe, test, expect } from "bun:test";
-import { PROVIDER_REGISTRY, isValidProvider } from "./providers";
+import { isValidProvider } from "./providers";
 
-describe("Provider Registry", () => {
-  test("registry is not empty", () => {
-    expect(Object.keys(PROVIDER_REGISTRY).length).toBeGreaterThan(0);
+describe("isValidProvider", () => {
+  test("accepts registered providers", () => {
+    expect(isValidProvider("anthropic")).toBe(true);
+    expect(isValidProvider("openai")).toBe(true);
   });
 
-  test("isValidProvider rejects invalid providers", () => {
-    expect(isValidProvider("invalid")).toBe(false);
-    expect(isValidProvider("")).toBe(false);
-    expect(isValidProvider("gpt-4")).toBe(false);
+  test("rejects unknown names and inherited Object.prototype keys", () => {
+    for (const name of [
+      "invalid",
+      "",
+      "gpt-4",
+      "toString",
+      "constructor",
+      "__proto__",
+      "hasOwnProperty",
+    ]) {
+      expect(isValidProvider(name)).toBe(false);
+    }
   });
 });

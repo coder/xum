@@ -1,5 +1,6 @@
 import { restoreContextBudgetRejectedMessageForDisplay } from "@/common/utils/messages/contextBudgetRejection";
 import type {
+  ArtifactInteractionMetadata,
   BashMonitorWakeDisplayRecord,
   CompactionRequestData,
   DisplayedMessage,
@@ -19,6 +20,7 @@ import {
   getValidAgentPeerMessageMeta,
   getValidAgentPeerTriggerMeta,
   parseAgentMessageEnvelope,
+  type AgentPeerMessageMeta,
 } from "@/common/utils/agentMessageEnvelope";
 import { GOAL_BUDGET_LIMIT_KIND, GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { getFollowUpContentText } from "@/browser/utils/compaction/format";
@@ -30,6 +32,7 @@ import {
 } from "@/common/utils/messages/compactionBoundary";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReason";
+import { getAuthenticPlanReviewRecord } from "@/common/utils/planReview/planReviewEnvelope";
 import { isDynamicToolPart, type DynamicToolPart } from "@/common/types/toolParts";
 
 /**
@@ -289,6 +292,23 @@ function getValidAgentPeerMessage(
   return meta;
 }
 
+/**
+ * Validated attribution of a peer-message wake trigger row, or null. SECURITY/self-healing:
+ * requires synthetic provenance AND validated attribution — a corrupted human user row wearing
+ * peer metadata must keep ordinary rendering, not be disguised as (or folded into) a machine
+ * notification. When the recipient is executing a delegated workspace turn, the trigger carries
+ * that turn's correlation metadata with the attribution nested on it.
+ */
+function getAgentPeerTriggerRowMeta(message: MuxMessage): AgentPeerMessageMeta | null {
+  if (message.role !== "user" || message.metadata?.synthetic !== true) return null;
+  const muxMeta = message.metadata.muxMetadata;
+  if (muxMeta?.type === "agent-peer-message") return getValidAgentPeerMessageMeta(muxMeta);
+  if (muxMeta?.type === "workspace-turn-task") {
+    return getValidAgentPeerTriggerMeta(muxMeta.agentPeerMessageTrigger);
+  }
+  return null;
+}
+
 function getRawCommand(muxMetadata: unknown): string | undefined {
   if (!isPlainObject(muxMetadata) || typeof muxMetadata.type !== "string") {
     return undefined;
@@ -308,6 +328,37 @@ function getRawCommand(muxMetadata: unknown): string | undefined {
   }
 }
 
+/**
+ * The "from artifact" pill and its rendering come only from this metadata, which the backend alone
+ * can write (generic sends refuse it), never from the model-facing tag text. Malformed metadata is
+ * dropped so the row renders as an ordinary message.
+ */
+function toArtifactInteractionDisplay(value: unknown): ArtifactInteractionMetadata | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const meta = value as Partial<Record<keyof ArtifactInteractionMetadata, unknown>>;
+  if (
+    typeof meta.id !== "string" ||
+    typeof meta.artifactPath !== "string" ||
+    typeof meta.title !== "string" ||
+    typeof meta.text !== "string" ||
+    meta.action !== "send" ||
+    typeof meta.version !== "number" ||
+    !Number.isInteger(meta.version) ||
+    meta.version < 0
+  ) {
+    return undefined;
+  }
+  return {
+    id: meta.id,
+    artifactPath: meta.artifactPath,
+    title: meta.title,
+    version: meta.version,
+    action: "send",
+    text: meta.text,
+    ...(meta.data !== undefined ? { data: meta.data } : {}),
+  };
+}
+
 function buildUserDisplayedMessages(options: {
   message: MuxMessage;
   agentSkillSnapshot?: { frontmatterYaml?: string; body?: string };
@@ -319,6 +370,7 @@ function buildUserDisplayedMessages(options: {
     options;
   const muxMeta = message.metadata?.muxMetadata;
   const partsContent = getTextPartContent(message.parts);
+  const peerTriggerMeta = getAgentPeerTriggerRowMeta(message);
 
   const fileParts = message.parts
     .filter((p): p is MuxFilePart => p.type === "file")
@@ -386,6 +438,8 @@ function buildUserDisplayedMessages(options: {
       contextBudgetRejected: message.metadata?.contextBudgetRejected === true ? true : undefined,
       isGoalContinuation: message.metadata?.kind === GOAL_CONTINUATION_KIND ? true : undefined,
       isBudgetLimitWrapup: message.metadata?.kind === GOAL_BUDGET_LIMIT_KIND ? true : undefined,
+      isPlanReviewFeedback:
+        getAuthenticPlanReviewRecord(message)?.kind === "feedback" ? true : undefined,
       timestamp: baseTimestamp,
       agentSkill,
       mcpPromptRefs,
@@ -393,6 +447,7 @@ function buildUserDisplayedMessages(options: {
       inlineSkillSnapshots,
       compactionRequest,
       reviews: muxMeta?.reviews,
+      artifactInteraction: toArtifactInteractionDisplay(muxMeta?.artifactInteraction),
       bashMonitorWake: bashMonitorWakeRecords ? { records: bashMonitorWakeRecords } : undefined,
       // Only genuine machine rows get collapsed; corrupted metadata must not hide human input.
       contextBudgetWarning:
@@ -410,19 +465,14 @@ function buildUserDisplayedMessages(options: {
             }
           : undefined,
       // The peer-message wake trigger is a synthetic machine row: mark it so prompt
-      // navigation skips it (the envelope payload itself is a separate assistant row). When the
-      // recipient is executing a delegated workspace turn, the trigger carries that turn's
-      // correlation metadata with the attribution nested on it. SECURITY/self-healing: require
-      // synthetic provenance AND validated attribution before collapsing the row — a corrupted
-      // human user row wearing peer metadata must fall back to ordinary rendering, not be
-      // disguised as a machine notification hidden from prompt navigation.
-      agentPeerMessageTrigger:
-        message.metadata?.synthetic === true &&
-        (muxMeta?.type === "agent-peer-message"
-          ? getValidAgentPeerMessageMeta(muxMeta) != null
-          : muxMeta?.type === "workspace-turn-task" &&
-            getValidAgentPeerTriggerMeta(muxMeta.agentPeerMessageTrigger) != null)
-          ? true
+      // navigation skips it (the envelope payload itself is a separate assistant row).
+      agentPeerMessageTrigger: peerTriggerMeta != null ? true : undefined,
+      agentPeerTriggerPayload:
+        peerTriggerMeta?.payloadMessageId != null
+          ? {
+              payloadMessageId: peerTriggerMeta.payloadMessageId,
+              fromWorkspaceId: peerTriggerMeta.fromWorkspaceId,
+            }
           : undefined,
     },
   ];

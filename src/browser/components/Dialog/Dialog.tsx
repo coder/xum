@@ -4,7 +4,7 @@ import * as VisuallyHiddenPrimitive from "@radix-ui/react-visually-hidden";
 import { X } from "lucide-react";
 
 import { cn } from "@/common/lib/utils";
-import { MODAL_DIALOG_OVERLAY_ATTRIBUTE } from "@/browser/utils/ui/keybinds";
+import { isEditableElement, MODAL_DIALOG_OVERLAY_ATTRIBUTE } from "@/browser/utils/ui/keybinds";
 
 /**
  * VisuallyHidden component for accessibility - hides content visually but keeps it available to screen readers.
@@ -42,6 +42,8 @@ const DialogOverlay = React.forwardRef<
 ));
 DialogOverlay.displayName = DialogPrimitive.Overlay.displayName;
 
+const NO_ANIMATION: React.CSSProperties = { animation: "none" };
+
 const DialogContent = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Content>,
   React.ComponentPropsWithoutRef<typeof DialogPrimitive.Content> & {
@@ -51,6 +53,13 @@ const DialogContent = React.forwardRef<
     maxWidth?: string;
     /** Maximum height of the dialog */
     maxHeight?: string;
+    /**
+     * Let Escape pressed in an input/textarea/contentEditable reach that element (for example to
+     * cancel an inline edit) instead of dismissing the dialog.
+     */
+    allowEditableEscape?: boolean;
+    /** Open without the entry animation, when the same frame is already on screen. */
+    skipEntryAnimation?: boolean;
   }
 >(
   (
@@ -60,6 +69,8 @@ const DialogContent = React.forwardRef<
       showCloseButton = true,
       maxWidth,
       maxHeight,
+      allowEditableEscape = false,
+      skipEntryAnimation = false,
       style,
       onEscapeKeyDown,
       ...props
@@ -67,10 +78,23 @@ const DialogContent = React.forwardRef<
     ref
   ) => (
     <DialogPortal>
-      <DialogOverlay />
+      <DialogOverlay style={skipEntryAnimation ? NO_ANIMATION : undefined} />
       <DialogPrimitive.Content
         ref={ref}
         onEscapeKeyDown={(e) => {
+          // A focused, closed <select> has no use for Escape (an open native picker consumes it
+          // before the page sees it), so it must not block dismissal: Analytics autofocuses its
+          // project select, and exempting it made the first Escape after opening do nothing.
+          if (
+            allowEditableEscape &&
+            isEditableElement(e.target) &&
+            !(e.target instanceof HTMLElement && e.target.tagName === "SELECT")
+          ) {
+            // preventDefault keeps the dialog open; skipping stopPropagation lets the editor's
+            // own onKeyDown run. Global Escape handlers already ignore editable targets.
+            e.preventDefault();
+            return;
+          }
           // Prevent Escape from propagating to global handlers (e.g., stream interrupt).
           // Radix uses capture phase for Escape, so we must use onEscapeKeyDown (not onKeyDown).
           e.stopPropagation();
@@ -82,7 +106,12 @@ const DialogContent = React.forwardRef<
           maxHeight && "overflow-y-auto",
           className
         )}
-        style={{ ...(maxWidth && { maxWidth }), ...(maxHeight && { maxHeight }), ...style }}
+        style={{
+          ...(maxWidth && { maxWidth }),
+          ...(maxHeight && { maxHeight }),
+          ...(skipEntryAnimation && NO_ANIMATION),
+          ...style,
+        }}
         {...props}
       >
         {children}

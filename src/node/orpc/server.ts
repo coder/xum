@@ -6,9 +6,12 @@
  * The CLI entry point (server.ts) uses this to start the server.
  */
 import express, { type Express } from "express";
+import Negotiator from "negotiator";
 import * as fs from "fs/promises";
 import * as http from "http";
+import type * as net from "net";
 import * as path from "path";
+import * as zlib from "zlib";
 import { WebSocketServer, type WebSocket } from "ws";
 import { RPCHandler } from "@orpc/server/node";
 import { RPCHandler as ORPCWebSocketServerHandler } from "@orpc/server/websocket";
@@ -35,6 +38,8 @@ import { extractCookieValues, extractWsHeaders, safeEq } from "@/node/orpc/authM
 import { VERSION } from "@/version";
 import { formatOrpcError } from "@/node/orpc/formatOrpcError";
 import { BROWSER_BRIDGE_WS_PATH, DESKTOP_WS_PATH, ORPC_WS_PATH } from "@/node/orpc/wsPaths";
+import { createFlowControlledWebSocket, type FlowControlObserver } from "@/node/orpc/wsFlowControl";
+import { perfEpochNowMs } from "@/common/utils/perf/clock";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { log } from "@/node/services/log";
 import {
@@ -51,7 +56,14 @@ import {
   CODER_OAUTH_SERVER_CALLBACK_PATH,
   CODER_OAUTH_SERVER_START_PATH,
 } from "@/common/constants/coderOAuth";
+import { MUX_GATEWAY_ORIGIN } from "@/common/constants/muxGatewayOAuth";
 import { assert } from "@/common/utils/assert";
+import {
+  findFirstViewFont,
+  firstViewFontPreload,
+  isHashedStaticAssetName,
+  PRECOMPRESSED_ENCODINGS,
+} from "@/node/orpc/staticAssets";
 import { getAppProxyBasePathFromPathname, stripAppProxyBasePath } from "@/common/appProxyBasePath";
 
 type AliveWebSocket = WebSocket & { isAlive?: boolean };
@@ -146,6 +158,20 @@ function escapeHtmlAttribute(value: string): string {
 
 const SLASHLESS_ROOT_REDIRECT_SCRIPT =
   '<script>(()=>{const pathname=location.pathname;if(pathname.startsWith("//")||pathname.endsWith("/"))return;location.replace(location.origin+pathname+"/"+location.search+location.hash);})();</script>';
+
+const NEGOTIATED_ENCODINGS = [...PRECOMPRESSED_ENCODINGS.map((e) => e.encoding), "identity"];
+
+/**
+ * The encoding to send, or undefined for identity. Client q-values decide first. On ties the server
+ * order wins (brotli, then gzip): req.acceptsEncodings breaks ties by header order and would pick
+ * gzip for every browser ("gzip, deflate, br, zstd").
+ */
+function negotiateEncoding(req: express.Request) {
+  const [encoding] = new Negotiator(req).encodings(NEGOTIATED_ENCODINGS, {
+    preferred: NEGOTIATED_ENCODINGS,
+  });
+  return PRECOMPRESSED_ENCODINGS.find((e) => e.encoding === encoding);
+}
 
 function injectBaseHref(
   indexHtml: string,
@@ -729,7 +755,6 @@ function buildPublicAbsoluteUrl(
 
 const OAUTH_CALLBACK_ORIGIN_BYPASS_PATHS = new Set<string>([
   "/auth/mux-gateway/callback",
-  "/auth/mux-governor/callback",
   "/auth/mcp-oauth/callback",
   CODER_OAUTH_SERVER_CALLBACK_PATH,
 ]);
@@ -747,6 +772,118 @@ function shouldEnforceOriginValidation(req: Pick<express.Request, "path">): bool
   return (
     req.path.startsWith("/orpc") || req.path.startsWith("/api") || req.path.startsWith("/auth/")
   );
+}
+
+function listenOnce(server: net.Server, port: number, host: string): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const onListenError = (error: Error) => {
+      server.removeListener("error", onListenError);
+      reject(error);
+    };
+
+    server.once("error", onListenError);
+    server.listen(port, host, () => {
+      server.removeListener("error", onListenError);
+      resolve();
+    });
+  });
+}
+
+function closeListener(server: net.Server): Promise<void> {
+  return new Promise<void>((resolve) => server.close(() => resolve()));
+}
+
+function getListenErrorCode(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null || !("code" in error)) {
+    return undefined;
+  }
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" ? code : undefined;
+}
+
+/** The address family is disabled or has no loopback address on this host. */
+function isLoopbackFamilyUnavailable(error: unknown): boolean {
+  const code = getListenErrorCode(error);
+  return code === "EAFNOSUPPORT" || code === "EADDRNOTAVAIL";
+}
+
+/** Random-port attempts before giving up when ::1 is taken on the port chosen for 127.0.0.1. */
+const LOOPBACK_PAIR_RANDOM_PORT_ATTEMPTS = 5;
+
+/**
+ * Bind "localhost" as both 127.0.0.1 and ::1 on the same port.
+ *
+ * Node resolves "localhost" to a single address and binds only that family, which left the
+ * other loopback address free: a dev server started later could bind the same port there
+ * without EADDRINUSE, and clients (browsers, Coder port forwarding) then reached whichever
+ * server matched the family they picked. Holding both addresses makes the port exclusive,
+ * so a later bind fails instead of silently splitting traffic.
+ *
+ * The ::1 listener is a second HTTP server that re-emits its request, upgrade, and
+ * clientError events on the primary server, so both families share one set of handlers.
+ * (Handing raw sockets over with emit("connection") works in Node but not in Bun.)
+ * When one family has no loopback (IPv4-only containers, IPv6-only hosts), binds the other
+ * one alone, as the previous single-family bind did. Returns the IPv6 server, or null when
+ * the primary server is the only listener.
+ */
+async function listenOnBothLoopbacks(
+  httpServer: http.Server,
+  port: number
+): Promise<http.Server | null> {
+  const attempts = port === 0 ? LOOPBACK_PAIR_RANDOM_PORT_ATTEMPTS : 1;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await listenOnce(httpServer, port, "127.0.0.1");
+    } catch (error) {
+      if (!isLoopbackFamilyUnavailable(error)) {
+        throw error;
+      }
+      log.debug("IPv4 loopback unavailable; listening on ::1 only");
+      await listenOnce(httpServer, port, "::1");
+      return null;
+    }
+    const address = httpServer.address();
+    assert(address !== null && typeof address !== "string", "expected a TCP listen address");
+
+    // Clients can connect to 127.0.0.1 before the ::1 bind settles. If that bind fails,
+    // close() would wait on them (upgraded WebSockets are never closed by the HTTP server),
+    // so track them and destroy them on failure.
+    const bindWindowSockets = new Set<net.Socket>();
+    const trackSocket = (socket: net.Socket) => {
+      bindWindowSockets.add(socket);
+      socket.once("close", () => bindWindowSockets.delete(socket));
+    };
+    httpServer.on("connection", trackSocket);
+
+    const ipv6Server = http.createServer();
+    attachStreamErrorHandler(ipv6Server, "orpc-http-server-ipv6", { logger: log });
+    for (const event of ["request", "upgrade", "clientError"] as const) {
+      ipv6Server.on(event, (...args: unknown[]) => httpServer.emit(event, ...args));
+    }
+    try {
+      await listenOnce(ipv6Server, address.port, "::1");
+      return ipv6Server;
+    } catch (error) {
+      if (isLoopbackFamilyUnavailable(error)) {
+        log.debug("IPv6 loopback unavailable; listening on 127.0.0.1 only");
+        return null;
+      }
+
+      const closed = closeListener(httpServer);
+      for (const socket of bindWindowSockets) {
+        socket.destroy();
+      }
+      await closed;
+      // A random IPv4 port can already be in use on ::1; pick another one. An explicit
+      // port stays an error: someone else owns it on ::1, which is the clash we prevent.
+      if (getListenErrorCode(error) === "EADDRINUSE" && attempt < attempts) {
+        continue;
+      }
+      throw error;
+    } finally {
+      httpServer.removeListener("connection", trackSocket);
+    }
+  }
 }
 
 /**
@@ -898,12 +1035,21 @@ export async function createOrpcServer({
   });
 
   let rawSpaIndexHtml: string | null = null;
+  let firstViewFont: string | undefined;
 
   // Static file serving (optional)
   if (serveStatic) {
     try {
       const indexHtmlPath = path.join(staticDir, "index.html");
       rawSpaIndexHtml = await fs.readFile(indexHtmlPath, "utf8");
+      // The font file comes from the stylesheets index.html links, so a rebuild with new hashes needs
+      // no code change. A stylesheet that cannot be read only costs the preload.
+      for (const [, href] of rawSpaIndexHtml.matchAll(
+        /<link[^>]*rel="stylesheet"[^>]*href="\.?\/?([^"]+\.css)"/g
+      )) {
+        const css = await fs.readFile(path.join(staticDir, href), "utf8").catch(() => "");
+        firstViewFont ??= findFirstViewFont(css);
+      }
     } catch (error) {
       log.error("Failed to read index.html for SPA fallback:", error);
     }
@@ -911,9 +1057,46 @@ export async function createOrpcServer({
     // Serve JS/CSS/assets from disk, but never serve index.html — the SPA fallback
     // (below all API routes) serves the injected version with base href + proxy template.
     const serveStaticAssets = express.static(staticDir, { index: false });
+    // Content-hashed files (#5943) are cached for a year and sent as the build-time .br/.gz
+    // sibling when the client accepts it. These headers are set only when a file is actually
+    // sent, so a missing hashed-looking path still reaches the SPA fallback untouched.
+    const hashedOptions = { index: false, maxAge: "1y", immutable: true } as const;
+    const serveHashedIdentity = express.static(staticDir, {
+      ...hashedOptions,
+      setHeaders: (res) => res.vary("Accept-Encoding"),
+    });
+    const serveHashedEncoded = express.static(staticDir, {
+      ...hashedOptions,
+      // A byte range of the compressed stream is not a range of the resource: send it whole.
+      acceptRanges: false,
+      setHeaders: (res, filePath) => {
+        const precompressed = PRECOMPRESSED_ENCODINGS.find((e) => filePath.endsWith(e.extension));
+        assert(precompressed, `unexpected precompressed asset path: ${filePath}`);
+        res.vary("Accept-Encoding");
+        res.setHeader("Content-Encoding", precompressed.encoding);
+        res.type(path.extname(filePath.slice(0, -precompressed.extension.length)));
+      },
+    });
     app.use((req, res, next) => {
       if (req.path === "/index.html") return next();
-      serveStaticAssets(req, res, next);
+      if (!isHashedStaticAssetName(req.path.slice(1))) {
+        serveStaticAssets(req, res, next);
+        return;
+      }
+      const precompressed = negotiateEncoding(req);
+      const requestPath = splitRequestUrlPathAndQuery(req.url);
+      if (!precompressed || !requestPath) {
+        serveHashedIdentity(req, res, next);
+        return;
+      }
+      const originalUrl = req.url;
+      req.url = `${requestPath.pathname}${precompressed.extension}${requestPath.querySuffix}`;
+      serveHashedEncoded(req, res, (error?: unknown) => {
+        req.url = originalUrl;
+        if (error) return next(error);
+        // No precompressed sibling on disk: serve the identity file.
+        serveHashedIdentity(req, res, next);
+      });
     });
   }
 
@@ -1113,7 +1296,7 @@ export async function createOrpcServer({
     <meta name="color-scheme" content="dark light" />
     <meta name="theme-color" content="#0e0e0e" />
     <title>${title}</title>
-    <link rel="stylesheet" href="https://gateway.mux.coder.com/static/css/site.css" />
+    <link rel="stylesheet" href="${MUX_GATEWAY_ORIGIN}/static/css/site.css" />
   </head>
   <body>
     <div class="page">
@@ -1231,159 +1414,6 @@ export async function createOrpcServer({
     sendOAuthCallbackPage(req, res, { type: "mux-gateway-oauth", state, result });
   });
 
-  // --- Xum Governor OAuth (unauthenticated bootstrap routes) ---
-  // Similar to Xum Gateway OAuth but accepts user-provided governorUrl.
-  app.get("/auth/mux-governor/start", async (req, res) => {
-    if (!(await isHttpRequestAuthenticated(req))) {
-      res.status(401).json({ error: "Invalid or missing auth token/session" });
-      return;
-    }
-
-    const governorUrl = typeof req.query.governorUrl === "string" ? req.query.governorUrl : null;
-    if (!governorUrl) {
-      res.status(400).json({ error: "Missing governorUrl query parameter" });
-      return;
-    }
-
-    const redirectUri = buildPublicAbsoluteUrl(req, "/auth/mux-governor/callback", allowHttpOrigin);
-    if (!redirectUri) {
-      res.status(400).json({ error: "Missing or invalid Host header" });
-      return;
-    }
-    const result = context.muxGovernorOauthService.startServerFlow({
-      governorOrigin: governorUrl,
-      redirectUri,
-    });
-
-    if (!result.success) {
-      res.status(400).json({ error: result.error });
-      return;
-    }
-
-    res.json({ authorizeUrl: result.data.authorizeUrl, state: result.data.state });
-  });
-
-  app.all("/auth/mux-governor/callback", async (req, res) => {
-    // Some providers use 307/308 redirects that preserve POST, or response_mode=form_post.
-    if (req.method !== "GET" && req.method !== "POST") {
-      res.sendStatus(405);
-      return;
-    }
-
-    const state = getStringParamFromQueryOrBody(req, "state");
-    const code = getStringParamFromQueryOrBody(req, "code");
-    const error = getStringParamFromQueryOrBody(req, "error");
-    const errorDescription = getStringParamFromQueryOrBody(req, "error_description") ?? undefined;
-
-    log.debug("Governor OAuth callback received", {
-      method: req.method,
-      state,
-      hasCode: typeof code === "string" && code.length > 0,
-      hasError: typeof error === "string" && error.length > 0,
-    });
-
-    const result = await context.muxGovernorOauthService.handleServerCallbackAndExchange({
-      state,
-      code,
-      error,
-      errorDescription,
-    });
-
-    const payload = {
-      type: "mux-governor-oauth",
-      state,
-      ok: result.success,
-      error: result.success ? null : result.error,
-    };
-
-    const payloadJson = escapeJsonForHtmlScript(payload);
-
-    const title = result.success ? "Enrollment complete" : "Enrollment failed";
-    const description = result.success
-      ? "You can return to Xum. You may now close this tab."
-      : payload.error
-        ? escapeHtml(payload.error)
-        : "An unknown error occurred.";
-    const returnPath = getPublicAppRootPath(req, res);
-    const returnPathJson = escapeJsonForHtmlScript(returnPath);
-    const returnPathHref = escapeHtmlAttribute(returnPath);
-
-    const html = `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="color-scheme" content="dark light" />
-    <title>${title}</title>
-    <style>
-      body { font-family: system-ui, sans-serif; max-width: 600px; margin: 4rem auto; padding: 1rem; }
-      h1 { margin-bottom: 1rem; }
-      .muted { color: #666; }
-      .btn { display: inline-block; padding: 0.5rem 1rem; background: #333; color: #fff; text-decoration: none; border-radius: 4px; }
-    </style>
-  </head>
-  <body>
-    <h1>${title}</h1>
-    <p>${description}</p>
-    ${result.success ? '<p class="muted">This tab should close automatically.</p>' : ""}
-    <p><a class="btn" href="${returnPathHref}">Return to Xum</a></p>
-
-    <script>
-      (() => {
-        const payload = ${payloadJson};
-        const ok = payload.ok === true;
-
-        try {
-          if (window.opener && typeof window.opener.postMessage === "function") {
-            window.opener.postMessage(payload, "*");
-          }
-        } catch {
-          // Ignore postMessage failures.
-        }
-
-        if (!ok) {
-          return;
-        }
-
-        try {
-          if (window.opener && typeof window.opener.focus === "function") {
-            window.opener.focus();
-          }
-        } catch {
-          // Ignore focus failures.
-        }
-
-        try {
-          window.close();
-        } catch {
-          // Ignore close failures.
-        }
-
-        setTimeout(() => {
-          try {
-            window.close();
-          } catch {
-            // Ignore close failures.
-          }
-        }, 50);
-
-        setTimeout(() => {
-          try {
-            window.location.replace(${returnPathJson});
-          } catch {
-            // Ignore navigation failures.
-          }
-        }, 150);
-      })();
-    </script>
-  </body>
-</html>`;
-
-    res.status(result.success ? 200 : 400);
-    res.setHeader("Content-Type", "text/html");
-    res.send(html);
-  });
-
   // --- MCP OAuth (unauthenticated redirect callback) ---
   // The OAuth provider cannot attach a mux Bearer token during redirects.
   app.all("/auth/mcp-oauth/callback", async (req, res) => {
@@ -1395,12 +1425,15 @@ export async function createOrpcServer({
 
     const state = getStringParamFromQueryOrBody(req, "state");
     const code = getStringParamFromQueryOrBody(req, "code");
+    // RFC 9207 issuer; the MCP SDK validates it during the code exchange.
+    const iss = getStringParamFromQueryOrBody(req, "iss");
     const error = getStringParamFromQueryOrBody(req, "error");
     const errorDescription = getStringParamFromQueryOrBody(req, "error_description") ?? undefined;
 
     const result = await context.mcpOauthService.handleServerCallbackAndExchange({
       state,
       code,
+      iss,
       error,
       errorDescription,
     });
@@ -1586,6 +1619,31 @@ export async function createOrpcServer({
         return next();
       }
 
+      // #5945: a missing file (/llms.txt, /assets/x.js) or a dot segment probe (/.well-known/*,
+      // /.env, /.git/config) gets a 404 instead of the SPA page. The check reads only the pathname
+      // string (a fixed number of prefix and extension checks, no filesystem call).
+      // `/workspace/<id>` is a client route whatever its ID: legacy IDs are `${project}-${branch}`
+      // and can contain dots (next.js-main).
+      const isWorkspaceRoute =
+        req.path.startsWith("/workspace/") && !req.path.includes("/", "/workspace/".length);
+      // Express keeps percent escapes in req.path (/%2Eenv), but serve-static decodes them before
+      // its lookup, so classify the decoded path. A malformed escape keeps the raw path.
+      let filePath = req.path;
+      if (filePath.includes("%")) {
+        try {
+          filePath = decodeURIComponent(filePath);
+        } catch {
+          // Not decodable: classify the raw path.
+        }
+      }
+      if (
+        req.path !== "/index.html" &&
+        !isWorkspaceRoute &&
+        (filePath.includes("/.") || path.posix.extname(filePath) !== "")
+      ) {
+        return next();
+      }
+
       if (rawSpaIndexHtml !== null) {
         const spaIndexHtml = injectProxyUriTemplate(
           injectBaseHref(rawSpaIndexHtml, getPublicBaseHref(req, res), {
@@ -1594,9 +1652,27 @@ export async function createOrpcServer({
           getBrowserProxyUriTemplate()
         );
         varyPublicBasePathHeaders(res);
-        res.setHeader("Content-Type", "text/html");
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
         res.setHeader("Cache-Control", "no-store");
-        res.send(spaIndexHtml);
+        // After the injected <base>, so the relative font URLs resolve under a proxy base path.
+        const html = spaIndexHtml.replace(
+          /<\/head>/i,
+          `${firstViewFontPreload(firstViewFont)}</head>`
+        );
+        // Compressed per response, because the HTML is rewritten per request (base href, redirect).
+        // br quality 5 takes about 0.15 ms for this page. Quality 11 blocks for about 10 ms.
+        res.vary("Accept-Encoding");
+        const encoding = negotiateEncoding(req)?.encoding;
+        if (encoding) res.setHeader("Content-Encoding", encoding);
+        res.send(
+          encoding === "br"
+            ? zlib.brotliCompressSync(html, {
+                params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 5 },
+              })
+            : encoding === "gzip"
+              ? zlib.gzipSync(html)
+              : html
+        );
         return;
       }
 
@@ -1651,7 +1727,8 @@ export async function createOrpcServer({
         log.warn("Blocked cross-origin WebSocket upgrade request", {
           origin: getFirstHeaderValue(req, "origin"),
           expectedOrigins,
-          url: req.url,
+          // Never log req.url: browser clients send the auth token as `?token=` (#4853).
+          path: routePathname,
         });
 
         try {
@@ -1721,6 +1798,18 @@ export async function createOrpcServer({
   const orpcWsHandler = new ORPCWebSocketServerHandler(orpcRouter, {
     interceptors: [onError(onOrpcError)],
   });
+  // Flow-control waits go to the perf flight recorder (a no-op unless it is collecting). The
+  // Electron MessagePort transport has no send buffer or flow control, so it records none.
+  // Partial test contexts can lack the recorder, hence the widened type.
+  const perfRecorder: ORPCContext["perfFlightRecorder"] | undefined = context.perfFlightRecorder;
+  const wsFlowControlObserver: FlowControlObserver | undefined =
+    perfRecorder === undefined
+      ? undefined
+      : {
+          waitStarted: () => perfRecorder.beginRpcCall(),
+          waitEnded: (wait) =>
+            perfRecorder.recordWsFlowControlWait({ ...wait, endMs: perfEpochNowMs() }),
+        };
 
   wsServer.on("connection", (ws, req) => {
     const terminate = () => {
@@ -1755,22 +1844,33 @@ export async function createOrpcServer({
         writable: true,
       },
     });
-    void orpcWsHandler.upgrade(ws, { context: wsContext });
+    // Flow control bounds the socket's send backlog so a large replay cannot
+    // starve heartbeats or the keepalive pong (#4655). The keepalive above
+    // keeps using the raw ws; oRPC keys peers by this one wrapper instance.
+    void orpcWsHandler.upgrade(createFlowControlledWebSocket(ws, wsFlowControlObserver), {
+      context: wsContext,
+    });
   });
 
   // Start listening
-  await new Promise<void>((resolve, reject) => {
-    const onListenError = (error: Error) => {
-      httpServer.removeListener("error", onListenError);
-      reject(error);
-    };
-
-    httpServer.once("error", onListenError);
-    httpServer.listen(port, host, () => {
-      httpServer.removeListener("error", onListenError);
-      resolve();
-    });
-  });
+  let ipv6LoopbackServer: http.Server | null = null;
+  try {
+    // Hostnames are case-insensitive; normalize like ServerService.isLoopbackHost.
+    if (host.trim().toLowerCase() === "localhost") {
+      ipv6LoopbackServer = await listenOnBothLoopbacks(httpServer, port);
+    } else {
+      await listenOnce(httpServer, port, host);
+    }
+  } catch (error) {
+    // The caller gets no OrpcServer to close, and desktop startup keeps running after a
+    // failed bind, so release what was created above instead of leaking it per attempt.
+    clearInterval(heartbeatInterval);
+    for (const ws of wsServer.clients) {
+      ws.terminate();
+    }
+    wsServer.close();
+    throw error;
+  }
 
   // Get actual port (useful when port=0)
   const address = httpServer.address();
@@ -1812,7 +1912,14 @@ export async function createOrpcServer({
         await browserBridgeServer.stop();
       }
 
-      // Then close HTTP server.
+      // Then close HTTP server (and the IPv6 loopback listener feeding it).
+      if (ipv6LoopbackServer) {
+        ipv6LoopbackServer.closeIdleConnections?.();
+        ipv6LoopbackServer.closeAllConnections?.();
+        if (ipv6LoopbackServer.listening) {
+          await closeListener(ipv6LoopbackServer);
+        }
+      }
       httpServer.closeIdleConnections?.();
       httpServer.closeAllConnections?.();
       if (httpServer.listening) {

@@ -1,15 +1,14 @@
 import { useEffect } from "react";
 import {
-  ArrowLeft,
   Blocks,
   Brain,
-  Menu,
   Settings,
   Key,
   Cpu,
   X,
   FlaskConical,
   Bot,
+  HeartPulse,
   Keyboard,
   Layout,
   Container,
@@ -21,16 +20,17 @@ import {
   ArchiveRestore,
   ScrollText,
 } from "lucide-react";
+import { Dialog, DialogContent, DialogTitle } from "@/browser/components/Dialog/Dialog";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useOnboardingPause } from "@/browser/features/SplashScreens/SplashScreenProvider";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
-import { isEditableElement, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
+import type { useModalFocusReturn } from "@/browser/hooks/useModalFocusReturn";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { GeneralSection } from "./Sections/GeneralSection";
 import { TasksSection } from "./Sections/TasksSection";
+import { HeartbeatSection } from "./Sections/HeartbeatSection";
 import { ProvidersSection } from "./Sections/ProvidersSection";
 import { ModelsSection } from "./Sections/ModelsSection";
-import { GovernorSection } from "./Sections/GovernorSection";
 import { MemorySection } from "./Sections/MemorySection";
 import { Button } from "@/browser/components/Button/Button";
 import { MCPSettingsSection } from "./Sections/MCPSettingsSection";
@@ -47,7 +47,7 @@ import { SecuritySection } from "./Sections/SecuritySection";
 import { BackupSection } from "./Sections/BackupSection";
 import type { SettingsSection } from "./types";
 
-const LEGACY_EXPERIMENT_SETTINGS_SECTION_IDS = new Set(["goals", "heartbeat"]);
+const LEGACY_EXPERIMENT_SETTINGS_SECTION_IDS = new Set(["goals"]);
 
 const BASE_SECTIONS: SettingsSection[] = [
   {
@@ -61,6 +61,12 @@ const BASE_SECTIONS: SettingsSection[] = [
     label: "Agents",
     icon: <Bot className="h-4 w-4" />,
     component: TasksSection,
+  },
+  {
+    id: "heartbeat",
+    label: "Heartbeats",
+    icon: <HeartPulse className="h-4 w-4" />,
+    component: HeartbeatSection,
   },
   {
     id: "instructions",
@@ -85,6 +91,12 @@ const BASE_SECTIONS: SettingsSection[] = [
     label: "MCP",
     icon: <Server className="h-4 w-4" />,
     component: MCPSettingsSection,
+  },
+  {
+    id: "plugins",
+    label: "Plugins",
+    icon: <Blocks className="h-4 w-4" />,
+    component: PluginsSettingsSection,
   },
   {
     id: "secrets",
@@ -136,9 +148,7 @@ interface SettingsSectionRedirect {
 }
 
 export function getSettingsSections(
-  governorEnabled: boolean,
   memoryEnabled: boolean,
-  agentPluginsEnabled: boolean,
   remoteConnectionAvailable = false
 ): SettingsSection[] {
   const sections = [...BASE_SECTIONS];
@@ -149,17 +159,6 @@ export function getSettingsSections(
       label: "Remote Connection",
       icon: <Monitor className="h-4 w-4 shrink-0" />,
       component: RemoteConnectionSection,
-    });
-  }
-  if (agentPluginsEnabled) {
-    // Next to MCP: plugins contribute skills + MCP servers.
-    const mcpIndex = sections.findIndex((section) => section.id === "mcp");
-    sections.splice(mcpIndex + 1, 0, {
-      id: "plugins",
-      label: "Plugins",
-      icon: <Blocks className="h-4 w-4" />,
-      component: PluginsSettingsSection,
-      experimental: true,
     });
   }
   if (memoryEnabled) {
@@ -177,37 +176,24 @@ export function getSettingsSections(
     component: BackupSection,
     experimental: true,
   });
-  if (governorEnabled) {
-    sections.push({
-      id: "governor",
-      label: "Governor",
-      icon: <ShieldCheck className="h-4 w-4" />,
-      component: GovernorSection,
-    });
-  }
   return sections;
 }
 
 export function getSettingsSectionRedirect(
   activeSection: string,
-  governorEnabled: boolean,
   memoryEnabled: boolean,
-  agentPluginsEnabled: boolean,
   remoteConnectionAvailable = false
 ): SettingsSectionRedirect | null {
   if (LEGACY_EXPERIMENT_SETTINGS_SECTION_IDS.has(activeSection)) {
     return { section: "experiments", replace: true };
   }
 
-  if (!governorEnabled && activeSection === "governor") {
-    return { section: BASE_SECTIONS[0]?.id ?? "general" };
+  // Removed section: replace so the restored URL and back stack drop the dead route.
+  if (activeSection === "governor") {
+    return { section: BASE_SECTIONS[0]?.id ?? "general", replace: true };
   }
 
   if (!memoryEnabled && activeSection === "memory") {
-    return { section: BASE_SECTIONS[0]?.id ?? "general" };
-  }
-
-  if (!agentPluginsEnabled && activeSection === "plugins") {
     return { section: BASE_SECTIONS[0]?.id ?? "general" };
   }
 
@@ -218,26 +204,22 @@ export function getSettingsSectionRedirect(
   return null;
 }
 
-interface SettingsPageProps {
-  leftSidebarCollapsed: boolean;
-  onToggleLeftSidebarCollapsed: () => void;
-}
-
-export function SettingsPage(props: SettingsPageProps) {
-  const { close, activeSection, setActiveSection } = useSettings();
+// The caller owns the focus-return hook: this page is lazy-loaded and first mounts already open,
+// so it cannot record the opener itself (see LazySettingsPage).
+export function SettingsPage(props: { focusReturn: ReturnType<typeof useModalFocusReturn> }) {
+  const { isOpen, close, activeSection, setActiveSection } = useSettings();
   const onboardingPause = useOnboardingPause();
-  const governorEnabled = useExperimentValue(EXPERIMENT_IDS.MUX_GOVERNOR);
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
-  const agentPluginsEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_PLUGINS);
   const remoteConnectionAvailable = window.api?.remoteConnection != null;
 
   // Redirect restored links when an experiment or desktop bridge is unavailable.
   useEffect(() => {
+    if (!isOpen) {
+      return;
+    }
     const redirect = getSettingsSectionRedirect(
       activeSection,
-      governorEnabled,
       memoryEnabled,
-      agentPluginsEnabled,
       remoteConnectionAvailable
     );
     if (!redirect) {
@@ -250,94 +232,34 @@ export function SettingsPage(props: SettingsPageProps) {
     }
 
     setActiveSection(redirect.section);
-  }, [
-    activeSection,
-    setActiveSection,
-    governorEnabled,
-    memoryEnabled,
-    agentPluginsEnabled,
-    remoteConnectionAvailable,
-  ]);
+  }, [isOpen, activeSection, setActiveSection, memoryEnabled, remoteConnectionAvailable]);
 
-  // Close settings on Escape. Uses bubble phase so inner surfaces (Select dropdowns,
-  // Popover, Dialog) that call stopPropagation/preventDefault on Escape get first
-  // right of refusal—only an unclaimed Escape navigates away from settings.
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (!matchesKeybind(e, KEYBINDS.CANCEL)) return;
-      if (e.defaultPrevented) return;
-      if (isEditableElement(e.target)) return;
-
-      e.preventDefault();
-      e.stopPropagation();
-      close();
-    };
-
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [close]);
-  const sections = getSettingsSections(
-    governorEnabled,
-    memoryEnabled,
-    agentPluginsEnabled,
-    remoteConnectionAvailable
-  );
+  const sections = getSettingsSections(memoryEnabled, remoteConnectionAvailable);
   const currentSection = sections.find((section) => section.id === activeSection) ?? sections[0];
   const SectionComponent = currentSection.component;
 
   return (
-    <div className="bg-surface-primary flex min-h-0 flex-1 flex-col overflow-hidden">
-      {/*
-        Keep explicit mobile escape controls in the page chrome:
-        - The desktop close button is hidden below md.
-        - On touch layouts, the left sidebar is often off-canvas by default.
-        Without back + menu actions here, /settings/:section can trap users in-pane.
-      */}
-      <div
-        className="bg-surface-primary border-border-light flex shrink-0 items-center 
-        justify-between border-b px-2 md:hidden [@media(max-width:768px)]:h-auto 
-        [@media(max-width:768px)]:py-2"
+    <Dialog open={isOpen} onOpenChange={(open) => !open && close()}>
+      {/* Phone widths get a full-screen sheet; md+ gets a large centered dialog. */}
+      <DialogContent
+        showCloseButton={false}
+        allowEditableEscape
+        aria-describedby={undefined}
+        onOpenAutoFocus={props.focusReturn.onOpenAutoFocus}
+        onCloseAutoFocus={props.focusReturn.onCloseAutoFocus}
+        className="max-md:ios-standalone:top-px max-md:ios-standalone:h-[calc(100%-1px)] top-0 left-0 flex h-full w-full max-w-none translate-x-0 translate-y-0 flex-col gap-0 overflow-hidden rounded-none border-0 p-0 pt-[env(safe-area-inset-top)] md:top-[50%] md:left-[50%] md:h-[min(880px,88vh)] md:w-[min(1100px,92vw)] md:translate-x-[-50%] md:translate-y-[-50%] md:flex-row md:rounded-lg md:border"
       >
-        <div className="flex min-w-0 items-center gap-2">
-          {props.leftSidebarCollapsed && (
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={props.onToggleLeftSidebarCollapsed}
-              title="Open sidebar"
-              aria-label="Open sidebar menu"
-              className="mobile-menu-btn text-muted hover:text-foreground hidden h-6 w-6 shrink-0"
-            >
-              <Menu className="h-4 w-4" />
-            </Button>
-          )}
-          <span className="text-foreground text-sm font-semibold">Settings</span>
-        </div>
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={close}
-          title="Back"
-          aria-label="Back to previous page"
-          className="text-muted hover:text-foreground px-2"
-        >
-          <ArrowLeft className="h-3.5 w-3.5" />
-          Back
-        </Button>
-      </div>
-
-      <div className="flex min-h-0 flex-1 overflow-hidden">
-        <aside className="border-border-medium hidden w-48 shrink-0 flex-col border-r md:flex">
-          <div className="border-border-medium flex h-12 items-center border-b px-4">
-            <span className="text-foreground text-sm font-semibold">Settings</span>
+        <div className="border-border-medium flex min-w-0 shrink-0 flex-col border-b md:w-48 md:border-r md:border-b-0">
+          <div className="border-border-medium flex h-12 shrink-0 items-center border-b px-4">
+            <DialogTitle className="text-sm leading-normal tracking-normal">Settings</DialogTitle>
           </div>
-          <nav className="flex flex-1 flex-col gap-1 overflow-y-auto p-2">
+          <nav className="flex gap-1 overflow-x-auto p-2 md:flex-1 md:flex-col md:overflow-x-hidden md:overflow-y-auto">
             {sections.map((section) => (
               <Button
                 key={section.id}
                 variant="ghost"
                 onClick={() => setActiveSection(section.id)}
-                className={`flex h-auto w-full items-center justify-start gap-2 rounded-md px-3 py-2 text-left text-sm ${
+                className={`flex h-auto shrink-0 items-center justify-start gap-2 rounded-md px-3 py-2 text-left text-sm whitespace-nowrap md:w-full ${
                   activeSection === section.id
                     ? "bg-accent/20 text-accent hover:bg-accent/20 hover:text-accent"
                     : "text-muted hover:bg-hover hover:text-foreground"
@@ -351,43 +273,11 @@ export function SettingsPage(props: SettingsPageProps) {
               </Button>
             ))}
           </nav>
-        </aside>
+        </div>
 
-        <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-          <div className="border-border-medium shrink-0 border-b md:hidden">
-            <nav className="flex gap-1 overflow-x-auto p-2">
-              {sections.map((section) => (
-                <Button
-                  key={section.id}
-                  variant="ghost"
-                  onClick={() => setActiveSection(section.id)}
-                  className={`flex h-auto shrink-0 items-center justify-start gap-2 rounded-md px-3 py-2 text-left text-sm whitespace-nowrap ${
-                    activeSection === section.id
-                      ? "bg-accent/20 text-accent hover:bg-accent/20 hover:text-accent"
-                      : "text-muted hover:bg-hover hover:text-foreground"
-                  }`}
-                >
-                  {section.icon}
-                  {section.label}
-                  {section.experimental && (
-                    <FlaskConical aria-hidden="true" className="text-warning h-3 w-3 shrink-0" />
-                  )}
-                </Button>
-              ))}
-            </nav>
-          </div>
-
-          <div className="border-border-medium hidden h-12 items-center justify-between border-b px-6 md:flex">
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+          <div className="border-border-medium hidden h-12 shrink-0 items-center border-b px-6 md:flex">
             <span className="text-foreground text-sm font-medium">{currentSection.label}</span>
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={close}
-              className="h-6 w-6"
-              aria-label="Close settings"
-            >
-              <X className="h-4 w-4" />
-            </Button>
           </div>
           <div className="flex-1 overflow-y-auto p-4 md:p-6">
             {/* Keep settings content width bounded so long forms remain readable on wide screens.
@@ -406,7 +296,23 @@ export function SettingsPage(props: SettingsPageProps) {
             </div>
           </div>
         </div>
-      </div>
-    </div>
+
+        {/* One close button for both layouts: it sits in the top-right header row either way.
+            Touch screens force buttons to a 44px minimum (globals.css), so a 24px box offset by
+            0.75rem grew downward and sat below the "Settings" title. The button is therefore
+            placed by its center (the translate classes), at the 48px header row's middle, so any
+            box size stays aligned. That matters at exactly 768px on touch, where the md: size
+            and the 44px minimum both apply. Phones get a 44px box. */}
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={close}
+          className="absolute top-[calc(env(safe-area-inset-top)+1.5rem)] right-[1.625rem] h-11 w-11 translate-x-1/2 -translate-y-1/2 md:right-9 md:h-6 md:w-6"
+          aria-label="Close settings"
+        >
+          <X className="h-4 w-4" />
+        </Button>
+      </DialogContent>
+    </Dialog>
   );
 }

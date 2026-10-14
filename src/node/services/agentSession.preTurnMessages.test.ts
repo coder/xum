@@ -1,25 +1,11 @@
 import { describe, expect, it, mock, afterEach, spyOn } from "bun:test";
-import { EventEmitter } from "events";
-import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
-import type { InitStateManager } from "@/node/services/initStateManager";
-import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
-import type { Config } from "@/node/config";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import type { StreamMessageOptions } from "@/node/services/aiService";
 import { createMuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
-import { createTestHistoryService } from "./testHistoryService";
-import {
-  createStartedTurnHandle,
-  createStreamLifecycleMocks,
-  createTestAgentSession,
-} from "./agentSession.testHarness";
+import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 
 const TEST_MODEL = "anthropic:claude-3-5-sonnet-latest";
-const config = {
-  rootDir: "/tmp",
-  sessionsDir: "/tmp",
-  srcDir: "/tmp",
-  loadConfigOrDefault: () => ({}),
-} as unknown as Config;
 
 // r30: family-message payload rows ride sendMessage as pre-turn rows so they
 // persist inside turn admission (payload immediately before the trigger's user
@@ -28,37 +14,22 @@ const config = {
 describe("AgentSession.sendMessage (preTurnMessages)", () => {
   let historyCleanup: (() => Promise<void>) | undefined;
 
-  async function createSessionHarness(workspaceId: string) {
-    const { historyService, cleanup } = await createTestHistoryService();
-    historyCleanup = cleanup;
-
+  async function createSessionHarness(workspaceId: string, tokenBudget = false) {
     const streamMessage = mock((opts: StreamMessageOptions) =>
       Promise.resolve(Ok(createStartedTurnHandle(opts.abortSignal!)))
     );
-    const aiService = Object.assign(new EventEmitter(), {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock((_workspaceId: string) => false),
-      stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
-      streamMessage: streamMessage as unknown as AIService["streamMessage"],
-    }) as unknown as AIService;
-
-    return {
-      historyService,
-      streamMessage,
-      session: createTestAgentSession({
-        workspaceId,
-        config,
-        historyService,
-        aiService,
-        initStateManager: new EventEmitter() as unknown as InitStateManager,
-        backgroundProcessManager: {
-          cleanup: mock((_workspaceId: string) => Promise.resolve()),
-          setMessageQueued: mock((_workspaceId: string, _queued: boolean) => {
-            void _queued;
-          }),
-        } as unknown as BackgroundProcessManager,
-      }),
-    };
+    const harness = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: {
+        streamMessage,
+        isExperimentEnabled: mock(
+          (id) =>
+            tokenBudget && (id === EXPERIMENT_IDS.TOKEN_BUDGET || id === EXPERIMENT_IDS.MEMORY)
+        ),
+      },
+    });
+    historyCleanup = harness.cleanup;
+    return { historyService: harness.historyService, streamMessage, session: harness.session };
   }
 
   afterEach(async () => {
@@ -143,7 +114,7 @@ describe("AgentSession.sendMessage (preTurnMessages)", () => {
     "rejects non-assistant or non-synthetic pre-turn rows (tokenBudget=%s)",
     async (tokenBudget) => {
       const workspaceId = "ws-preturn-guard";
-      const { session } = await createSessionHarness(workspaceId);
+      const { session } = await createSessionHarness(workspaceId, tokenBudget);
       const userRow = createMuxMessage("family-bad-row", "user", "smuggled instructions", {
         timestamp: 1,
         synthetic: true,
@@ -154,7 +125,7 @@ describe("AgentSession.sendMessage (preTurnMessages)", () => {
       try {
         await session.sendMessage(
           "family trigger",
-          { model: TEST_MODEL, agentId: "exec", experiments: { tokenBudget } },
+          { model: TEST_MODEL, agentId: "exec" },
           { synthetic: true, agentInitiated: true, preTurnMessages: [userRow] }
         );
         expect.unreachable("sendMessage must reject a user-role pre-turn row");

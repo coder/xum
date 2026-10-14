@@ -6,7 +6,7 @@ import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import type { ProjectsConfig, Workspace } from "@/common/types/project";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { Config } from "@/node/config";
-import { findWorkspaceEntry } from "@/node/services/taskUtils";
+import { findWorkspaceEntry, markChildGoalPauseOwed } from "@/node/services/taskUtils";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 
 export interface DesktopTarget {
@@ -36,7 +36,11 @@ export function settleArchivedSharedDesktopTask(workspace: Workspace): boolean {
     workspace.taskExecutionStatus === "queued" ||
     workspace.taskExecutionStatus === "starting" ||
     workspace.taskExecutionStatus === "running";
-  if (activeTask) workspace.taskStatus = "interrupted";
+  if (activeTask) {
+    workspace.taskStatus = "interrupted";
+    // Same closing write as every task termination; settled when the task runs again.
+    markChildGoalPauseOwed(workspace);
+  }
   // Both status sources reserve input; an old execution must not reclaim it on unarchive.
   if (activeExecution) workspace.taskExecutionStatus = "interrupted";
   return activeTask || activeExecution;

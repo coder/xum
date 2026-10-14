@@ -5,6 +5,7 @@ import * as atomicWrite from "@/node/utils/writeFileAtomic";
 import { createMuxMessage } from "@/common/types/message";
 import { CONTINUOUS_COMPACTION_GENERATION_FILE } from "@/constants/continuousCompaction";
 import * as fileLock from "@/node/utils/concurrency/fileLock";
+import { markLockOwnerDead } from "@/node/utils/concurrency/fileLockTestHelpers";
 import { CompactionPendingState } from "./compactionPendingState";
 import { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
@@ -124,9 +125,7 @@ describe("empty context reset transactions", () => {
       try {
         await entered.promise;
         const lockPath = historyWriteLockPath(h.config.rootDir, workspaceId);
-        const token = await fs.readFile(lockPath, "utf8");
-        await fs.writeFile(lockPath, token.split(":").slice(0, 2).join(":"));
-        await fs.utimes(lockPath, new Date(0), new Date(0));
+        await markLockOwnerDead(lockPath);
         successor = await fileLock.acquireProcessFileLock({
           lockPath,
           timeoutMs: 1000,

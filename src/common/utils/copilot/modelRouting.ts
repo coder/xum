@@ -3,10 +3,6 @@ export type CopilotApiMode = "responses" | "chatCompletions";
 // Keep this in sync with the Copilot model filtering used after OAuth login.
 export const COPILOT_MODEL_PREFIXES = ["gpt-5", "claude-", "gemini-3", "grok-code"] as const;
 
-export function isCopilotRoutableModel(_modelId: string): boolean {
-  return true;
-}
-
 // Copilot's catalog marks these models as Responses-only, and chat completions rejects them
 // with unsupported_api_for_model. Use explicit membership because routing has no catalog credentials.
 const COPILOT_RESPONSES_ONLY_MODELS = new Set(["gpt-5.4", "gpt-5.4-mini"]);

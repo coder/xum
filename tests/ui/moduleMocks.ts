@@ -8,7 +8,7 @@ import { afterAll, mock } from "bun:test";
  * registering suite finishes.
  */
 export function restoreModulesAfterSuite(
-  entries: Array<[modulePath: string, realExports: Record<string, unknown>]>
+  entries: [modulePath: string, realExports: Record<string, unknown>][]
 ): void {
   for (const [modulePath] of entries) {
     // Relative paths resolve against THIS file, not the caller, so the restore

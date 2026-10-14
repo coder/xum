@@ -15,6 +15,7 @@ import type { Config } from "@/node/config";
 import { log } from "@/node/services/log";
 import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
+import { sanitizeInputTransformations } from "@/node/utils/messages/anthropicInputTransformations";
 
 /**
  * Retention policy for in-memory DevTools state.
@@ -258,10 +259,18 @@ function applyStepBackwardCompatibilityDefaults(step: DevToolsStep): DevToolsSte
     responseHeaders: step.responseHeaders ?? null,
     rawResponse: step.rawResponse ?? null,
     rawChunks: step.rawChunks ?? null,
+    // Rows from older binaries lack the field; hand-edited or damaged rows must not
+    // reach the renderer as non-arrays.
+    inputTransformations: sanitizeInputTransformations(step.inputTransformations),
   };
 }
 
-type PendingRunMetadata = Partial<Pick<DevToolsRun, "toolPolicy" | "requestHistorySequence">>;
+type PendingRunMetadata = Partial<
+  Pick<
+    DevToolsRun,
+    "toolPolicy" | "requestHistorySequence" | "contextEpoch" | "compactionInputBudgetTokens"
+  >
+>;
 
 export class DevToolsService extends EventEmitter {
   private readonly workspaces = new Map<string, WorkspaceData>();
@@ -295,7 +304,9 @@ export class DevToolsService extends EventEmitter {
    *
    * This bridges the timing gap between policy resolution in AIService (before
    * any provider call) and lazy run creation in DevTools middleware (on first
-   * provider invocation). Metadata is consumed exactly once by createRun.
+   * provider invocation). createRun applies it to every run that carries the
+   * metadata ID: the primary run and each refusal-fallback run (a new model, so a
+   * new run) of the same turn. AIService clears it when the turn ends.
    */
   setPendingRunMetadata(
     workspaceId: string,
@@ -372,14 +383,12 @@ export class DevToolsService extends EventEmitter {
     const byWorkspace = this.pendingRunMetadata.get(workspaceId);
     const normalizedMetadataId = metadataId?.trim();
     if (byWorkspace && normalizedMetadataId != null && normalizedMetadataId.length > 0) {
+      // Kept for the turn's later runs: a fallback run without the chat-turn metadata looks
+      // like a headless side call to the replay audit, which then drops the fallback model's
+      // steps and baseline. clearPendingRunMetadata drops it at the turn's end.
       const pendingMetadata = byWorkspace.get(normalizedMetadataId);
       if (pendingMetadata != null) {
         Object.assign(run, pendingMetadata);
-        byWorkspace.delete(normalizedMetadataId);
-      }
-
-      if (byWorkspace.size === 0) {
-        this.pendingRunMetadata.delete(workspaceId);
       }
     }
 

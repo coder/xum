@@ -8,6 +8,23 @@ import {
 } from "@modelcontextprotocol/client";
 import { dynamicTool, jsonSchema, type JSONSchema7, type Tool } from "ai";
 import assert from "@/common/utils/assert";
+import {
+  advertisedMCPSettingsToolNames,
+  parseMCPSettingsCapability,
+  type MCPSettingsCapability,
+} from "@/common/utils/mcpSettings";
+import {
+  isModelVisibleTool,
+  MCP_APP_MIME_TYPE,
+  MCP_APPS_EXTENSION_ID,
+  MCP_APP_TOOL_NAME_MAX_CHARS,
+  mcpAppEntrypointTitle,
+  parseMCPAppEntrypoints,
+  parseMCPToolUiMeta,
+  type MCPAppEntrypointType,
+  type MCPToolUi,
+} from "@/common/utils/mcpApps";
+import { log } from "@/node/services/log";
 
 /**
  * MCP client adapter over the official TypeScript SDK v2
@@ -46,6 +63,10 @@ export const MCP_TOOL_CALL_TIMEOUT_MS = 300_000;
  */
 const SDK_TOOL_CALL_TIMEOUT_MS = MCP_TOOL_CALL_TIMEOUT_MS + 5_000;
 const PROMPT_GET_TIMEOUT_MS = 30_000;
+/** resources/read for MCP Apps views blocks opening the view, so keep it short. */
+const RESOURCE_READ_TIMEOUT_MS = 30_000;
+/** tools/call issued by an MCP Apps view (not by the model). */
+const APP_TOOL_CALL_TIMEOUT_MS = 120_000;
 // One hung server must not stall the whole slash/inline prompt catalog.
 const PROMPT_LIST_TIMEOUT_MS = 10_000;
 
@@ -82,10 +103,36 @@ export interface MCPClientConfig {
    * plain initialize handshake directly.
    */
   prior?: PriorDiscovery;
+  /**
+   * MCP Apps host support (artifacts experiment, read at connect time): announce the
+   * `io.modelcontextprotocol/ui` extension, keep tool `_meta.ui`, and leave tools whose
+   * visibility lacks "model" out of tools(). When false the client behaves exactly as before.
+   */
+  mcpApps?: boolean;
 }
 
 export type MCPPrompt = Awaited<ReturnType<Client["listPrompts"]>>["prompts"][number];
 export type MCPGetPromptResult = Awaited<ReturnType<Client["getPrompt"]>>;
+export type MCPReadResourceResult = Awaited<ReturnType<Client["readResource"]>>;
+export type MCPRawCallToolResult = Awaited<ReturnType<Client["callTool"]>>;
+
+// `_meta.ui` of the tools() result, read by wrapMCPTools. A WeakMap keeps it off the Tool
+// objects the AI SDK serializes for providers.
+const toolUiByTool = new WeakMap<Tool, MCPToolUi>();
+
+/** MCP Apps view metadata of a tool built by tools(), if any. */
+export function getMCPToolUi(tool: Tool): MCPToolUi | undefined {
+  return toolUiByTool.get(tool);
+}
+
+/** A tool of the latest tools/list that declares MCP App entry points (it always has a view). */
+export interface MCPAppEntrypointTool {
+  toolName: string;
+  /** The spec's entry point title: `title`, then `annotations.title`, then `name`. */
+  title: string;
+  resourceUri: string;
+  types: MCPAppEntrypointType[];
+}
 
 export interface MCPClientHandle {
   /** Fetch tools/list and build AI SDK tools whose execute calls tools/call. */
@@ -109,6 +156,44 @@ export interface MCPClientHandle {
    * later connect against the same server config.
    */
   priorDiscovery(): PriorDiscovery;
+  /**
+   * MCP Apps only: `_meta.ui` of a tool from the latest tools() listing, including tools hidden
+   * from the model. Undefined when the tool is unknown or declares no view.
+   */
+  toolUi(name: string): MCPToolUi | undefined;
+  /** MCP Apps only: whether the latest tools() listing contained `name` (hidden tools included). */
+  hasTool(name: string): boolean;
+  /** MCP Apps only: the entry point tools of the latest tools() listing (hidden tools included). */
+  appEntrypoints(): readonly MCPAppEntrypointTool[];
+  /** MCP Apps only: tools/call on behalf of a view; returns the raw CallToolResult. */
+  callToolForApp(
+    name: string,
+    args: Record<string, unknown>,
+    options?: { signal?: AbortSignal }
+  ): Promise<MCPRawCallToolResult>;
+  /**
+   * tools/call for a Codex-format plugin hook (mcp_tool handler); returns the raw CallToolResult.
+   * The caller owns the deadline through `signal`.
+   */
+  callToolForHook(
+    name: string,
+    args: Record<string, unknown>,
+    options: { signal: AbortSignal }
+  ): Promise<MCPRawCallToolResult>;
+  /** MCP Apps only: resources/read for a view's ui:// resource or a view's own read. */
+  readResource(uri: string, options?: { signal?: AbortSignal }): Promise<MCPReadResourceResult>;
+  /** The server's `openai/settings` capability, read once at connect. */
+  settingsCapability(): MCPSettingsCapability | undefined;
+  /**
+   * tools/call for the host's settings UI only (the model never sees these
+   * tools). `meta` becomes the request `_meta`.
+   */
+  callSettingsTool(
+    name: string,
+    args: Record<string, unknown>,
+    meta: Record<string, unknown>,
+    options?: { signal?: AbortSignal; timeoutMs?: number }
+  ): Promise<MCPRawCallToolResult>;
   close(): Promise<void>;
 }
 
@@ -226,12 +311,24 @@ function mcpToModelOutput({
  * `prior` verdict skips the probe entirely.
  */
 export async function createMCPClient(config: MCPClientConfig): Promise<MCPClientHandle> {
+  const mcpApps = config.mcpApps === true;
   const client = new Client(CLIENT_INFO, {
     versionNegotiation: {
       mode: "auto",
       probe: { timeoutMs: NEGOTIATION_PROBE_TIMEOUT_MS },
     },
+    // Advertise only what is implemented: text/html views (MCP Apps, SEP-1865).
+    ...(mcpApps
+      ? {
+          capabilities: {
+            extensions: { [MCP_APPS_EXTENSION_ID]: { mimeTypes: [MCP_APP_MIME_TYPE] } },
+          },
+        }
+      : {}),
   });
+  // Every tool of the latest listing (hidden ones included) -> its `_meta.ui`, if any.
+  let listedTools = new Map<string, MCPToolUi | undefined>();
+  let listedEntrypoints: readonly MCPAppEntrypointTool[] = [];
 
   if (config.onUncaughtError) {
     const onUncaughtError = config.onUncaughtError;
@@ -243,6 +340,11 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
     : config.transport;
 
   await client.connect(transport, config.prior !== undefined ? { prior: config.prior } : {});
+  const settings = parseMCPSettingsCapability(client.getServerCapabilities());
+  // Only the host reads and writes settings: hiding the tools keeps the model
+  // from changing what the user configured.
+  // Every advertised name, even from a half-malformed capability: hiding stays on.
+  const settingsTools = new Set(advertisedMCPSettingsToolNames(client.getServerCapabilities()));
 
   return {
     tools: async () => {
@@ -250,9 +352,48 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
       assert(Array.isArray(listResult.tools), "MCP tools/list result must carry a tools array");
 
       const tools: Record<string, Tool> = {};
+      const listed = new Map<string, MCPToolUi | undefined>();
+      const entrypoints: MCPAppEntrypointTool[] = [];
       for (const definition of listResult.tools) {
+        // Settings tools are host-only: left out of the listing too, so an MCP App view
+        // cannot call them through callToolForApp (hasTool is false for them).
+        if (settingsTools.has(definition.name)) continue;
+        const ui = mcpApps ? parseMCPToolUiMeta(definition._meta) : undefined;
+        listed.set(definition.name, ui);
+        // Read before the visibility filter below: entry points ignore visibility.
+        if (ui?.resourceUri !== undefined) {
+          const { types, skippedFile } = parseMCPAppEntrypoints(definition._meta);
+          if (skippedFile) {
+            log.debug("[MCP Apps] Skipping a file entry point (not supported)", {
+              tool: definition.name,
+            });
+          }
+          const title = mcpAppEntrypointTitle(
+            [definition.title, definition.annotations?.title],
+            definition.name
+          );
+          // The routes take 1 to MCP_APP_TOOL_NAME_MAX_CHARS characters (see the constant).
+          const routable =
+            definition.name.length > 0 && definition.name.length <= MCP_APP_TOOL_NAME_MAX_CHARS;
+          if (!routable) {
+            log.debug("[MCP Apps] Skipping an entry point whose tool name the routes refuse", {
+              nameLength: definition.name.length,
+            });
+          }
+          if (types.length > 0 && title !== undefined && routable) {
+            entrypoints.push({
+              toolName: definition.name,
+              title,
+              resourceUri: ui.resourceUri,
+              types,
+            });
+          }
+        }
+        // MCP Apps: "Host MUST NOT include tools in the agent's tool list" when visibility
+        // lacks "model". Such tools stay callable by their views (callToolForApp).
+        if (!isModelVisibleTool(ui)) continue;
         const inputSchema = definition.inputSchema ?? { type: "object" };
-        tools[definition.name] = dynamicTool({
+        const tool = dynamicTool({
           description: definition.description,
           title: definition.title ?? definition.annotations?.title,
           // Server-provided JSON schemas are runtime data; the SDK types them
@@ -281,7 +422,11 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
           },
           toModelOutput: mcpToModelOutput,
         });
+        if (ui !== undefined) toolUiByTool.set(tool, ui);
+        tools[definition.name] = tool;
       }
+      listedTools = listed;
+      listedEntrypoints = entrypoints;
       return tools;
     },
     prompts: async (options) => {
@@ -310,6 +455,42 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
     priorDiscovery: (): PriorDiscovery => {
       const discover = client.getDiscoverResult();
       return discover !== undefined ? { kind: "modern", discover } : { kind: "legacy" };
+    },
+    toolUi: (name) => listedTools.get(name),
+    hasTool: (name) => listedTools.has(name),
+    appEntrypoints: () => listedEntrypoints,
+    callToolForApp: (name, args, options) => {
+      assert(mcpApps, "callToolForApp requires an MCP Apps connection");
+      return client.callTool(
+        { name, arguments: args },
+        {
+          timeout: APP_TOOL_CALL_TIMEOUT_MS,
+          ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+        }
+      );
+    },
+    callToolForHook: (name, args, options) =>
+      client.callTool({ name, arguments: args }, { signal: options.signal }),
+    readResource: (uri, options) => {
+      assert(mcpApps, "readResource requires an MCP Apps connection");
+      return client.readResource(
+        { uri },
+        {
+          timeout: RESOURCE_READ_TIMEOUT_MS,
+          ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+        }
+      );
+    },
+    settingsCapability: () => settings,
+    callSettingsTool: (name, args, meta, options) => {
+      assert(settingsTools.has(name), "callSettingsTool only calls the advertised settings tools");
+      return client.callTool(
+        { name, arguments: args, _meta: meta },
+        {
+          timeout: options?.timeoutMs ?? APP_TOOL_CALL_TIMEOUT_MS,
+          ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+        }
+      );
     },
     close: () => client.close(),
   };

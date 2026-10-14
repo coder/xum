@@ -1,4 +1,4 @@
-import { useSyncExternalStore } from "react";
+import { useCallback, useSyncExternalStore } from "react";
 import type { APIClient } from "@/browser/contexts/API";
 import type { BackgroundProcessInfo } from "@/common/orpc/schemas/api";
 import { isAbortError } from "@/browser/utils/isAbortError";
@@ -91,6 +91,30 @@ export class BackgroundBashStore {
   private subscriptionCounts = new Map<string, number>();
   private retryAttempts = new Map<string, number>();
   private retryTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
+
+  /**
+   * Drops every workspace's cached process state. For a host that switches between servers (the
+   * VS Code webview): workspace IDs can repeat across servers, so one server's rows must never be
+   * shown, or terminated, against another. Call it before installing the new server's client.
+   */
+  clearCachedState(): void {
+    const workspaceIds = new Set([
+      ...this.processesCache.keys(),
+      ...this.foregroundIdsCache.keys(),
+      ...this.terminatingIdsCache.keys(),
+      ...this.stateKnownWorkspaces,
+    ]);
+    this.processesCache.clear();
+    this.foregroundIdsCache.clear();
+    this.terminatingIdsCache.clear();
+    this.stateKnownWorkspaces.clear();
+    for (const workspaceId of workspaceIds) {
+      this.processesStore.bump(workspaceId);
+      this.foregroundIdsStore.bump(workspaceId);
+      this.terminatingIdsStore.bump(workspaceId);
+      this.stateKnownStore.bump(workspaceId);
+    }
+  }
 
   setClient(client: APIClient | null): void {
     this.client = client;
@@ -497,29 +521,44 @@ export function useBackgroundBashStoreRaw(): BackgroundBashStore {
   return getStoreInstance();
 }
 
+// The subscribe callbacks below start and stop the workspace's backend subscription. An unstable
+// callback makes React re-subscribe on every render, which drops the last subscriber and restarts
+// the backend stream; the VS Code webview is not React-Compiler compiled, so it re-rendered the
+// background processes strip into a new stream on every chat flush (#5092). These useCallbacks
+// are for correctness, not performance.
 export function useBackgroundProcesses(workspaceId: string | undefined): BackgroundProcessInfo[] {
   const store = getStoreInstance();
-  return useSyncExternalStore(
-    (listener) => (workspaceId ? store.subscribeProcesses(workspaceId, listener) : () => undefined),
-    () => (workspaceId ? store.getProcesses(workspaceId) : EMPTY_PROCESSES)
+  const subscribe = useCallback(
+    (listener: () => void) =>
+      workspaceId ? store.subscribeProcesses(workspaceId, listener) : () => undefined,
+    [store, workspaceId]
+  );
+  return useSyncExternalStore(subscribe, () =>
+    workspaceId ? store.getProcesses(workspaceId) : EMPTY_PROCESSES
   );
 }
 
 export function useForegroundBashToolCallIds(workspaceId: string | undefined): Set<string> {
   const store = getStoreInstance();
-  return useSyncExternalStore(
-    (listener) =>
+  const subscribe = useCallback(
+    (listener: () => void) =>
       workspaceId ? store.subscribeForegroundIds(workspaceId, listener) : () => undefined,
-    () => (workspaceId ? store.getForegroundIds(workspaceId) : EMPTY_SET)
+    [store, workspaceId]
+  );
+  return useSyncExternalStore(subscribe, () =>
+    workspaceId ? store.getForegroundIds(workspaceId) : EMPTY_SET
   );
 }
 
 export function useBackgroundBashTerminatingIds(workspaceId: string | undefined): Set<string> {
   const store = getStoreInstance();
-  return useSyncExternalStore(
-    (listener) =>
+  const subscribe = useCallback(
+    (listener: () => void) =>
       workspaceId ? store.subscribeTerminatingIds(workspaceId, listener) : () => undefined,
-    () => (workspaceId ? store.getTerminatingIds(workspaceId) : EMPTY_SET)
+    [store, workspaceId]
+  );
+  return useSyncExternalStore(subscribe, () =>
+    workspaceId ? store.getTerminatingIds(workspaceId) : EMPTY_SET
   );
 }
 
@@ -529,10 +568,14 @@ export function useBackgroundBashTerminatingIds(workspaceId: string | undefined)
  * Subscribing also keeps the live backend subscription alive — see
  * subscribeStateKnown.
  */
-export function useBackgroundBashStateKnown(workspaceId: string): boolean {
+export function useBackgroundBashStateKnown(workspaceId: string | undefined): boolean {
   const store = getStoreInstance();
-  return useSyncExternalStore(
-    (listener) => store.subscribeStateKnown(workspaceId, listener),
-    () => store.isStateKnown(workspaceId)
+  const subscribe = useCallback(
+    (listener: () => void) =>
+      workspaceId ? store.subscribeStateKnown(workspaceId, listener) : () => undefined,
+    [store, workspaceId]
+  );
+  return useSyncExternalStore(subscribe, () =>
+    workspaceId ? store.isStateKnown(workspaceId) : false
   );
 }

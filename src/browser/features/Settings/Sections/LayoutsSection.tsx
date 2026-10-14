@@ -200,7 +200,7 @@ export function LayoutsSection() {
   const [capturingSlot, setCapturingSlot] = useState<LayoutSlotNumber | null>(null);
   const [captureError, setCaptureError] = useState<string | null>(null);
 
-  // selectedWorkspace is URL-derived and becomes null on /settings routes.
+  // selectedWorkspace is null when settings opens from a cold link or a non-workspace page.
   // Fall back to the last selected workspace so capture/apply actions remain usable.
   const persistedWorkspaceSelection = useMemo(() => {
     const raw = readPersistedState<unknown>(SELECTED_WORKSPACE_KEY, null);
@@ -300,11 +300,16 @@ export function LayoutsSection() {
     }
 
     try {
-      const preset = await saveCurrentWorkspaceToSlot(
+      const result = await saveCurrentWorkspaceToSlot(
         workspaceId,
         nextSlotNumber,
         `Layout ${nextSlotNumber}`
       );
+      if (!result.success) {
+        setActionError(result.error);
+        return;
+      }
+      const preset = result.data;
       setEditingName({ slot: nextSlotNumber, value: preset.name, original: preset.name });
       setNameError(null);
     } catch {
@@ -411,9 +416,14 @@ export function LayoutsSection() {
                     return;
                   }
 
-                  void saveCurrentWorkspaceToSlot(workspaceId, slot).catch(() => {
-                    setActionError("Failed to update layout.");
-                  });
+                  void saveCurrentWorkspaceToSlot(workspaceId, slot).then(
+                    (result) => {
+                      if (!result.success) setActionError(result.error);
+                    },
+                    () => {
+                      setActionError("Failed to update layout.");
+                    }
+                  );
                 },
               },
               {

@@ -1,8 +1,9 @@
 import { Check, Settings } from "lucide-react";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
-import { formatProviderDisplayName } from "@/common/utils/providers/customProviders";
-import { usePolicy } from "@/browser/contexts/PolicyContext";
-import { getAllowedProvidersForUi } from "@/browser/utils/policyUi";
+import {
+  formatProviderDisplayName,
+  getProviderIdsForUi,
+} from "@/common/utils/providers/customProviders";
 import { hasProviderIcon, ProviderIcon } from "../ProviderIcon/ProviderIcon";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../Tooltip/Tooltip";
@@ -16,10 +17,7 @@ interface ConfiguredProvidersBarProps {
  * Displayed above ChatInput on the Project page.
  */
 export function ConfiguredProvidersBar(props: ConfiguredProvidersBarProps) {
-  const policyState = usePolicy();
-  const effectivePolicy =
-    policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
-  const visibleProviders = getAllowedProvidersForUi(effectivePolicy, props.providersConfig);
+  const visibleProviders = getProviderIdsForUi(props.providersConfig);
 
   const settings = useSettings();
   const configuredProviders = visibleProviders.filter(

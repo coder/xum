@@ -6,6 +6,7 @@
  * to ensure consistent behavior and avoid duplication.
  */
 
+import { isGoalLifecycleActive } from "@/common/types/goal";
 import type { RouterClient } from "@orpc/server";
 import type { AppRouter } from "@/node/orpc/router";
 import type {
@@ -34,9 +35,8 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { RUNTIME_MODE, parseRuntimeModeAndHost } from "@/common/types/runtime";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
-import { isExperimentEnabled } from "@/browser/hooks/useExperiments";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import type { Toast } from "@/browser/features/ChatInput/ChatInputToast";
 import {
   formatCompactionCommandLine,
@@ -52,8 +52,9 @@ import {
   UNPRICED_TARGET_MODEL_GOAL_MESSAGE,
 } from "@/common/utils/goals/budgetPricing";
 import { getContextResetSuccessMessage } from "@/browser/utils/contextResetFeedback";
-import { HEARTBEAT_DEFAULT_INTERVAL_MS } from "@/constants/heartbeat";
 import {
+  SIDE_CHAT_DISALLOWED_COMMAND_KEYS,
+  SIDE_CHAT_DISALLOWED_COMMAND_TYPES,
   WORKSPACE_ONLY_COMMAND_KEYS,
   WORKSPACE_ONLY_COMMAND_TYPES,
   type WorkspaceOnlyCommandType,
@@ -65,7 +66,14 @@ import { getExplicitGatewayPrefix, normalizeToCanonical } from "@/common/utils/a
 import type { QueueDispatchMode } from "@/browser/features/ChatInput/types";
 import type { ChatAttachment } from "../features/ChatInput/ChatAttachments";
 import { dispatchWorkspaceSwitch } from "./workspaceEvents";
-import { getRuntimeKey, copyWorkspaceStorage } from "@/common/constants/storage";
+import { copyWorkspaceStorage } from "@/browser/utils/workspaceStorage";
+import {
+  consumeAiSelectionIntent,
+  getAiSelectionIntentForSendOptions,
+  getWorkspaceAgentId,
+  snapshotPendingAiSelection,
+} from "@/browser/utils/aiSelectionIntent";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import { getProviderModelEntryId } from "@/common/utils/providers/modelEntries";
 import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
@@ -90,17 +98,36 @@ import {
   addEphemeralMessage,
   getDisplayedRefineProposalHash,
 } from "@/browser/stores/WorkspaceStore";
-import { setGoalWithConflictRetry } from "@/browser/utils/goals/setGoalWithConflictRetry";
+import { setGoalForIntendedGoal } from "@/browser/utils/goals/setGoalForIntendedGoal";
 import { loadGoalDefaults, resolveGoalSetIntent } from "@/browser/utils/goals/resolveGoalSetIntent";
 import {
   WORKFLOW_RESULT_METADATA_TYPE,
   buildWorkflowResultContextMessage,
 } from "@/common/utils/workflowRunMessages";
 import { isTranscriptMutationAllowed } from "@/browser/utils/transcriptBarrier";
+import { getModelIdLengthError } from "@/browser/utils/boundedPersistedValue";
 import {
   EDIT_NOT_HELD_MESSAGE,
   TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE,
 } from "@/constants/transcriptBarrier";
+
+import { getProjectScopeId, GLOBAL_SCOPE_ID } from "@/common/constants/storage";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
+import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
+import { DEFAULT_ROUTE_PRIORITY, resolveRoute } from "@/common/routing";
+import { createGatewayRouting } from "@/common/utils/providers/gatewayModelCatalog";
+import {
+  applyFastModeToggle,
+  getFastModeProvider,
+  isFastModeActive,
+  isUltrafastModeActive,
+  setWorkspaceServiceTier,
+  toggleServiceTier,
+  ultrafastModeAvailable,
+} from "@/browser/utils/fastModeServiceTier";
+
+// Non-OpenAI speed preferences remain global: serialize slash toggles while config loads.
+let speedModeToggleInFlight = false;
 
 const BUILT_IN_MODEL_SET = new Set<string>(Object.values(KNOWN_MODELS).map((model) => model.id));
 
@@ -127,6 +154,13 @@ export interface ForkResult {
  */
 export async function forkWorkspace(options: ForkOptions): Promise<ForkResult> {
   const { client } = options;
+  const copyPendingAiSelectionTo = snapshotPendingAiSelection(options.sourceWorkspaceId);
+  // The backend copies the source's draft file into the fork: save the latest (debounced) edit
+  // first. A failed save does not block the fork, which then copies the last saved draft; the
+  // source keeps the change and retries it.
+  await getDraftStore()
+    .flush({ kind: "workspace", workspaceId: options.sourceWorkspaceId })
+    .catch((error: unknown) => console.warn("Failed to save the draft before forking:", error));
   const result = await client.workspace.fork({
     sourceWorkspaceId: options.sourceWorkspaceId,
     newName: options.newName,
@@ -139,6 +173,7 @@ export async function forkWorkspace(options: ForkOptions): Promise<ForkResult> {
   }
 
   copyWorkspaceStorage(options.sourceWorkspaceId, result.metadata.id);
+  copyPendingAiSelectionTo(result.metadata.id);
 
   // Get workspace info for switching
   const workspaceInfo = await client.workspace.getInfo({ workspaceId: result.metadata.id });
@@ -157,12 +192,19 @@ export async function forkWorkspace(options: ForkOptions): Promise<ForkResult> {
   const startMessage = options.startMessage;
   const sendMessageOptions = options.sendMessageOptions;
   if (startMessage && sendMessageOptions) {
+    const forkId = result.metadata.id;
+    const agentId = sendMessageOptions.agentId;
     requestAnimationFrame(() => {
+      // Like a composer send, the start message saves the copied picks it carries, so they end.
+      const aiSelection = getAiSelectionIntentForSendOptions(forkId, agentId, sendMessageOptions);
       client.workspace
         .sendMessage({
-          workspaceId: result.metadata.id,
+          workspaceId: forkId,
           message: startMessage,
           options: sendMessageOptions,
+        })
+        .then((sent) => {
+          if (sent.success) consumeAiSelectionIntent(forkId, agentId, aiSelection);
         })
         .catch(() => {
           // Best-effort: the user can send the message manually if this fails.
@@ -205,13 +247,13 @@ export type CommandResult =
 
 export interface SlashCommandEnv {
   api: RouterClient<AppRouter> | null;
+  /** Composer's AI scope, which may be the owning project rather than a sub-project path. */
+  aiScopeId?: string;
   workspaceId?: string;
   variant: "workspace" | "creation";
   projectPath?: string | null;
   /** Original slash command text as typed, for durable command display. */
   rawInput?: string;
-  /** Current dynamic-workflows experiment assignment for executable workflow commands. */
-  dynamicWorkflowsEnabled?: boolean;
   currentModel?: string | null;
   sendMessageOptions: SendMessageOptions;
   attachments?: ChatAttachment[];
@@ -224,6 +266,8 @@ export interface SlashCommandEnv {
   resetContext?: () => Promise<"reset" | "noop">;
   truncateHistory?: (percentage?: number) => Promise<void>;
   isCurrent?: () => boolean;
+  /** The composer belongs to an ephemeral /side chat (see handleSideCommand). */
+  isSideChat?: boolean;
 }
 
 interface WorkspaceCommandEnv extends SlashCommandEnv {
@@ -348,6 +392,37 @@ export async function processSlashCommand(
   env: SlashCommandEnv
 ): Promise<CommandResult> {
   if (!parsed) return complete("restore");
+  const workspaceOnlyKey = (() => {
+    switch (parsed.type) {
+      case "command-missing-args":
+      case "command-invalid-args":
+      case "command-unknown-flag":
+      case "unknown-command":
+        return parsed.command;
+      default:
+        return null;
+    }
+  })();
+  const isWorkspaceCommandType = isWorkspaceOnlyParsedCommand(parsed);
+  const isWorkspaceOnlyCommand =
+    isWorkspaceCommandType ||
+    (workspaceOnlyKey ? WORKSPACE_ONLY_COMMAND_KEYS.has(workspaceOnlyKey) : false);
+  // Side chats cannot own workspace/project operations. Gate them before any handler,
+  // including the early workflow, idle and heartbeat branches, so no backend mutation starts.
+  if (
+    env.isSideChat === true &&
+    (SIDE_CHAT_DISALLOWED_COMMAND_TYPES.has(parsed.type) ||
+      (workspaceOnlyKey != null && SIDE_CHAT_DISALLOWED_COMMAND_KEYS.has(workspaceOnlyKey)))
+  ) {
+    return complete("restore", [
+      showToast({
+        id: Date.now().toString(),
+        type: "error",
+        message: "Command not available in side chats. Press Esc to return to the main chat.",
+      }),
+    ]);
+  }
+
   const client = env.api;
   const notConnected = () =>
     complete("restore", [
@@ -369,6 +444,12 @@ export async function processSlashCommand(
     const separatorIndex = selectedModel.indexOf(":");
     const provider = selectedModel.slice(0, separatorIndex);
     const modelId = selectedModel.slice(separatorIndex + 1);
+    const lengthError = getModelIdLengthError(provider, modelId);
+    if (lengthError) {
+      return complete("restore", [
+        showToast({ id: Date.now().toString(), type: "error", message: lengthError }),
+      ]);
+    }
     const canonicalModel = normalizeToCanonical(selectedModel);
     const explicitGateway = getExplicitGatewayPrefix(selectedModel);
     try {
@@ -448,17 +529,6 @@ export async function processSlashCommand(
   }
 
   if (parsed.type === "workflow-run") {
-    const workflowsEnabled =
-      env.dynamicWorkflowsEnabled ?? isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS) === true;
-    if (!workflowsEnabled) {
-      return complete("restore", [
-        showToast({
-          id: Date.now().toString(),
-          type: "error",
-          message: "Dynamic workflows are disabled",
-        }),
-      ]);
-    }
     if (!client) return notConnected();
     if (!env.workspaceId) {
       return complete("restore", [
@@ -658,22 +728,6 @@ export async function processSlashCommand(
 
   if (parsed.type === "heartbeat-set") {
     if (!client) return notConnected();
-    let heartbeatExperimentEnabled: boolean | undefined;
-    try {
-      heartbeatExperimentEnabled = isExperimentEnabled(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
-    } catch {
-      heartbeatExperimentEnabled = false;
-    }
-    if (!heartbeatExperimentEnabled) {
-      return complete("restore", [
-        showToast({
-          id: Date.now().toString(),
-          type: "error",
-          message:
-            "Heartbeat configuration requires the Workspace Heartbeats experiment to be enabled",
-        }),
-      ]);
-    }
     if (!env.workspaceId) {
       return complete("restore", [
         showToast({ id: Date.now().toString(), type: "error", message: "No workspace selected" }),
@@ -690,14 +744,12 @@ export async function processSlashCommand(
         } catch {
           currentHeartbeatSettings = null;
         }
-        const intervalMs =
-          parsed.minutes === null
-            ? (currentHeartbeatSettings?.intervalMs ?? HEARTBEAT_DEFAULT_INTERVAL_MS)
-            : parsed.minutes * 60 * 1000;
         const result = await client.workspace.heartbeat.set({
           workspaceId,
           enabled: parsed.minutes !== null,
-          intervalMs,
+          // Turning heartbeats off keeps the saved interval. Omitting it also keeps a workspace
+          // that follows the global default on the default (#5692).
+          ...(parsed.minutes !== null ? { intervalMs: parsed.minutes * 60 * 1000 } : {}),
           ...(currentHeartbeatSettings?.message != null
             ? { message: currentHeartbeatSettings.message }
             : {}),
@@ -733,26 +785,118 @@ export async function processSlashCommand(
     });
   }
 
+  if (parsed.type === "speed-mode-toggle") {
+    if (!client) return notConnected();
+    if (speedModeToggleInFlight) return complete("restore");
+    const scopeId =
+      env.aiScopeId ??
+      (env.variant === "workspace"
+        ? env.workspaceId
+        : env.projectPath
+          ? getProjectScopeId(env.projectPath)
+          : GLOBAL_SCOPE_ID);
+    const selectedAgent = scopeId ? getWorkspaceAgentId(scopeId) : undefined;
+    const selectedModel = scopeId ? getWorkspaceAiSelection(scopeId).model : undefined;
+    trackCommandUsed(parsed.mode);
+    return phase([{ type: "clear-input" }], async () => {
+      if (speedModeToggleInFlight) return complete("restore-if-empty");
+      speedModeToggleInFlight = true;
+      const store = getProvidersConfigStore();
+      const label = parsed.mode === "fast" ? "Fast" : "Ultrafast";
+      try {
+        // Use the selected model, including creation composers, and preserve the
+        // same route/model restrictions as the speed selector.
+        const model = env.sendMessageOptions.model;
+        const providersConfig = await client.providers.getConfig();
+        const routeConfig = getAppConfigStore().getSnapshot() ?? (await client.config.getConfig());
+        const { isGatewayModelAccessible, resolveGatewayModelId } =
+          createGatewayRouting(providersConfig);
+        const route = resolveRoute(
+          normalizeToCanonical(model),
+          routeConfig.routePriority ?? DEFAULT_ROUTE_PRIORITY,
+          routeConfig.routeOverrides ?? {},
+          (provider) =>
+            providersConfig[provider]?.isConfigured === true &&
+            providersConfig[provider]?.isEnabled !== false,
+          isGatewayModelAccessible,
+          resolveGatewayModelId
+        );
+        const availability = {
+          providersConfig,
+          resolvedRouteProvider:
+            route.routeProvider === route.origin ? "direct" : route.routeProvider,
+        };
+        const provider = getFastModeProvider(model, availability);
+        if (
+          provider == null ||
+          (parsed.mode === "ultrafast" && !ultrafastModeAvailable(model, availability))
+        ) {
+          throw new Error(
+            `${label} mode is not available for ${model} on its current provider route and wire format.`
+          );
+        }
+        const targetTier = parsed.mode === "fast" ? "priority" : "ultrafast";
+        let enabled: boolean;
+        if (provider === "openai") {
+          if (!scopeId) throw new Error("Workspace ID required");
+          // Async capability loading must not apply an old command to a newly selected agent.
+          if (
+            (env.variant === "workspace" && env.isCurrent?.() === false) ||
+            getWorkspaceAgentId(scopeId) !== selectedAgent ||
+            getWorkspaceAiSelection(scopeId).model !== selectedModel
+          ) {
+            return complete("restore-if-empty");
+          }
+          // Share the picker/shortcut's pending choice and next-step nudge, not a
+          // provider-wide write. Read after awaits so an intervening pick is respected.
+          const currentTier =
+            getWorkspaceAiSelection(scopeId).serviceTier ?? providersConfig.openai?.serviceTier;
+          const tier = toggleServiceTier(currentTier, targetTier);
+          setWorkspaceServiceTier(client, scopeId, tier);
+          enabled = tier === targetTier;
+        } else {
+          const patch = await applyFastModeToggle(
+            client.providers,
+            provider,
+            providersConfig[provider],
+            targetTier
+          );
+          if (!patch) throw new Error(`Failed to toggle ${label} mode`);
+          store.updateOptimistically(provider, patch);
+          if (store.getConfig() == null) await store.refresh();
+          const updatedConfig = { ...providersConfig[provider], ...patch };
+          enabled =
+            parsed.mode === "fast"
+              ? isFastModeActive(provider, updatedConfig)
+              : isUltrafastModeActive(updatedConfig);
+        }
+        return complete("consume", [
+          showToast({
+            id: Date.now().toString(),
+            type: "success",
+            message: `${label} mode ${enabled ? "enabled" : "disabled"}`,
+          }),
+        ]);
+      } catch (error) {
+        await store.refresh();
+        return complete("restore-if-empty", [
+          showToast({
+            id: Date.now().toString(),
+            type: "error",
+            message: error instanceof Error ? error.message : `Failed to toggle ${label} mode`,
+          }),
+        ]);
+      } finally {
+        speedModeToggleInFlight = false;
+      }
+    });
+  }
+
   if (parsed.type === "vim-toggle") {
     trackCommandUsed("vim");
     return complete("consume", [{ type: "clear-input" }, { type: "toggle-vim" }]);
   }
 
-  const workspaceOnlyKey = (() => {
-    switch (parsed.type) {
-      case "command-missing-args":
-      case "command-invalid-args":
-      case "command-unknown-flag":
-      case "unknown-command":
-        return parsed.command;
-      default:
-        return null;
-    }
-  })();
-  const isWorkspaceCommandType = isWorkspaceOnlyParsedCommand(parsed);
-  const isWorkspaceOnlyCommand =
-    isWorkspaceCommandType ||
-    (workspaceOnlyKey ? WORKSPACE_ONLY_COMMAND_KEYS.has(workspaceOnlyKey) : false);
   if (isWorkspaceOnlyCommand && env.variant !== "workspace") {
     return complete("restore", [
       showToast({
@@ -827,7 +971,6 @@ export async function processSlashCommand(
             }),
           ]);
         }
-        const experiments = env.sendMessageOptions.experiments;
         return complete("consume", [{ type: "clear-input" }], async () => {
           try {
             const result =
@@ -835,9 +978,8 @@ export async function processSlashCommand(
                 ? await client.refinements.apply({
                     workspaceId,
                     approvedProposalHash: displayedProposalHash,
-                    experiments,
                   })
-                : await client.refinements.run({ workspaceId, experiments });
+                : await client.refinements.run({ workspaceId });
             const appliedCount = result.success
               ? result.data.applied.length + (result.data.untrackedApplied ?? 0)
               : 0;
@@ -885,6 +1027,10 @@ export async function processSlashCommand(
       case "fork":
         if (!client) return notConnected();
         return handleForkCommand(parsed, { ...env, api: client });
+      case "side":
+        if (!env.workspaceId) throw new Error("Workspace ID required");
+        if (!client) return notConnected();
+        return handleSideCommand({ ...env, api: client, workspaceId: env.workspaceId });
       case "new":
         if (!env.workspaceId) throw new Error("Workspace ID required");
         if (!client) return notConnected();
@@ -936,11 +1082,11 @@ type GoalSetCommandResult =
   | { success: true; goal: GoalRecordV1 }
   | { success: false; error: GoalSetError };
 
-async function setGoalWithSingleConflictRetry(
+async function setGoalForCommand(
   env: WorkspaceCommandEnv,
   intent: GoalSetCommandIntent
 ): Promise<GoalSetCommandResult> {
-  const result = await setGoalWithConflictRetry(env.api, env.workspaceId, intent);
+  const result = await setGoalForIntendedGoal(env.api, env.workspaceId, intent);
   if (result.success) return { success: true, goal: result.data };
   return { success: false, error: result.error };
 }
@@ -1047,7 +1193,20 @@ function handleGoalCommand(
       }
 
       if (parsed.type === "goal-pause") {
-        const result = await setGoalWithSingleConflictRetry(env, { status: "paused" });
+        // Same rule as the Goal tab and the palette: only a running goal pauses. The backend also
+        // lets the user move a completed goal to paused (a revive), which /goal pause must not do
+        // (bug bash: it reopened a completed goal and reported "Goal paused").
+        const currentGoal = await env.api.workspace.getGoal({ workspaceId: env.workspaceId });
+        if (currentGoal.goal?.status !== "active") {
+          return complete("restore", [
+            showToast({
+              id: Date.now().toString(),
+              type: "error",
+              message: "No running goal to pause.",
+            }),
+          ]);
+        }
+        const result = await setGoalForCommand(env, { status: "paused" });
         if (!result.success) {
           return complete("restore", [showToast(createGoalSetErrorToast(result.error))]);
         }
@@ -1065,7 +1224,7 @@ function handleGoalCommand(
         ) {
           return complete("restore", [showToast(createUnpricedModelGoalToast())]);
         }
-        const result = await setGoalWithSingleConflictRetry(env, { status: "active" });
+        const result = await setGoalForCommand(env, { status: "active" });
         if (!result.success) {
           return complete("restore", [showToast(createGoalSetErrorToast(result.error))]);
         }
@@ -1077,6 +1236,18 @@ function handleGoalCommand(
 
       if (parsed.type === "goal-complete") {
         if (!parsed.summary) {
+          // The summary form lives in the Goal tab and only shows for a goal that can complete:
+          // without one, opening the tab would do nothing visible (bug bash).
+          const currentGoal = await env.api.workspace.getGoal({ workspaceId: env.workspaceId });
+          if (currentGoal.goal == null || !isGoalLifecycleActive(currentGoal.goal.status)) {
+            return complete("restore", [
+              showToast({
+                id: Date.now().toString(),
+                type: "error",
+                message: "No goal to complete.",
+              }),
+            ]);
+          }
           window.dispatchEvent?.(
             createCustomEvent(CUSTOM_EVENTS.OPEN_GOAL_TAB, {
               workspaceId: env.workspaceId,
@@ -1085,7 +1256,7 @@ function handleGoalCommand(
           );
           return complete("consume");
         }
-        const result = await setGoalWithSingleConflictRetry(env, {
+        const result = await setGoalForCommand(env, {
           status: "complete",
           completionSummary: parsed.summary,
         });
@@ -1121,7 +1292,7 @@ function handleGoalCommand(
         if (hasGoalBudgetLimit(parsed.budgetCents) && !(await currentModelHasPricingData(env))) {
           return complete("restore", [showToast(createUnpricedModelGoalToast())]);
         }
-        const result = await setGoalWithSingleConflictRetry(env, {
+        const result = await setGoalForCommand(env, {
           budgetCents: parsed.budgetCents,
         });
         if (!result.success) {
@@ -1148,7 +1319,7 @@ function handleGoalCommand(
       ) {
         return complete("restore", [showToast(createUnpricedModelGoalToast())]);
       }
-      const result = await setGoalWithSingleConflictRetry(env, goalSetIntent);
+      const result = await setGoalForCommand(env, goalSetIntent);
       if (!result.success) {
         return complete("restore", [showToast(createGoalSetErrorToast(result.error))]);
       }
@@ -1224,6 +1395,53 @@ function handleClearCommand(
       return complete("restore", [
         showToast({ id: Date.now().toString(), type: "error", message: normalized.message }),
       ]);
+    }
+  });
+}
+
+/**
+ * /side (Codex's side conversation): open an ephemeral fork of this chat. It opens as a tab in
+ * this workspace's right sidebar so both chats stay visible (closing the tab discards it). Where
+ * the sidebar is hidden (narrow viewports) it takes over the chat view instead, like Codex, and
+ * leaving it discards it (useDiscardSideChatOnLeave).
+ */
+export async function openSideChat(options: {
+  api: RouterClient<AppRouter>;
+  workspaceId: string;
+  /** Replace this launcher's New tab; slash commands simply add a tab. */
+  tabsetId?: string;
+}): Promise<void> {
+  const result = await options.api.workspace.createSideChat({
+    parentWorkspaceId: options.workspaceId,
+  });
+  if (!result.success) throw new Error(result.error);
+  // Both entry points inherit the same settings without submitting or modifying the main draft.
+  copyWorkspaceStorage(options.workspaceId, result.metadata.id);
+  const openTab = new CustomEvent(CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB, {
+    detail: {
+      workspaceId: options.workspaceId,
+      sideChatWorkspaceId: result.metadata.id,
+      tabsetId: options.tabsetId,
+    },
+    cancelable: true,
+  });
+  // A hidden sidebar leaves this unclaimed, so narrow layouts still open the full-screen chat.
+  if (window.dispatchEvent(openTab)) dispatchWorkspaceSwitch(result.metadata);
+}
+
+function handleSideCommand(env: WorkspaceCommandEnv): CommandResult {
+  return phase([{ type: "clear-input" }, { type: "set-sending", sending: true }], async () => {
+    const failed = (message: string) =>
+      complete("restore", [
+        showToast({ id: Date.now().toString(), type: "error", title: "Side Chat Failed", message }),
+        { type: "set-sending", sending: false },
+      ]);
+    try {
+      await openSideChat({ api: env.api, workspaceId: env.workspaceId });
+      trackCommandUsed("side");
+      return complete("consume", [{ type: "set-sending", sending: false }]);
+    } catch (error) {
+      return failed(error instanceof Error ? error.message : "Failed to start side chat");
     }
   });
 }
@@ -1399,18 +1617,18 @@ export async function createNewWorkspace(
     effectiveTrunk = recommendedTrunk ?? "main";
   }
 
-  // Use saved default runtime preference if not explicitly provided
-  let effectiveRuntime = options.runtime;
-  if (effectiveRuntime === undefined) {
-    const runtimeKey = getRuntimeKey(options.projectPath);
-    const savedRuntime = localStorage.getItem(runtimeKey);
-    if (savedRuntime) {
-      effectiveRuntime = savedRuntime;
-    }
+  // /new cannot ask for the host, image or config path the other runtimes need, so only a
+  // configured local default applies; anything else gets the backend's worktree default.
+  let runtime = options.runtime;
+  if (runtime === undefined) {
+    // A project default replaces the global one, as in the creation UI.
+    const projects = new Map(await options.client.projects.list());
+    const defaultRuntime =
+      projects.get(options.projectPath)?.defaultRuntime ??
+      getAppConfigStore().getSnapshot()?.defaultRuntime;
+    if (defaultRuntime === RUNTIME_MODE.LOCAL) runtime = defaultRuntime;
   }
-
-  // Parse runtime config if provided.
-  const runtimeConfig = parseRuntimeString(effectiveRuntime);
+  const runtimeConfig = parseRuntimeString(runtime);
 
   const result = await options.client.workspace.create({
     projectPath: options.projectPath,

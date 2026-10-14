@@ -118,7 +118,7 @@ export const HEARTBEAT_REMOVED_SUMMARY = "Heartbeat settings removed for this wo
 
 /** Human-readable heartbeat state, shared by the heartbeat tool result and the timeline row. */
 export function summarizeHeartbeatSettings(
-  settings: { enabled: boolean; intervalMs: number; trigger?: unknown; whenBusy?: unknown } | null
+  settings: { enabled: boolean; intervalMs?: number; trigger?: unknown; whenBusy?: unknown } | null
 ): string {
   if (!settings) {
     return "No heartbeat settings are configured for this workspace.";
@@ -128,5 +128,9 @@ export function summarizeHeartbeatSettings(
   // Mention the schedule shape only when it deviates from the default idle trigger.
   const scheduleSuffix =
     resolveHeartbeatSchedulePolicy(settings).trigger === "interval" ? " (fixed schedule)" : "";
-  return `Heartbeat is ${status} for this workspace at ${formatHeartbeatInterval(settings.intervalMs)}${scheduleSuffix}.`;
+  const interval =
+    settings.intervalMs != null
+      ? formatHeartbeatInterval(settings.intervalMs)
+      : "the global default interval";
+  return `Heartbeat is ${status} for this workspace at ${interval}${scheduleSuffix}.`;
 }

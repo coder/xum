@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import { Input } from "@/browser/components/Input/Input";
@@ -17,15 +17,13 @@ import {
 import { copyToClipboard } from "@/browser/utils/clipboard";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { getDefaultModel, useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
-import { updatePersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
-import { resolveAdvisorEnabledForAgent } from "@/common/constants/advisor";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { useWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import {
-  AGENT_AI_DEFAULTS_KEY,
-  GLOBAL_SCOPE_ID,
-  getAgentIdKey,
-  getModelKey,
-} from "@/common/constants/storage";
+  getAppConfigStore,
+  updateUserPreferences,
+  useUserPreferences,
+} from "@/browser/stores/AppConfigStore";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import {
@@ -48,16 +46,20 @@ import {
 } from "@/common/types/thinking";
 import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import { getErrorMessage } from "@/common/utils/errors";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { FALLBACK_AGENTS, deriveTasksSectionAgentGroups } from "./TasksSection.agents";
 
 const INHERIT = "__inherit__";
+/** Shown while an autosave waits for the connection. */
+const OFFLINE_SAVE_MESSAGE =
+  "Not connected to the Xum server. Your changes save after it reconnects.";
 
 // Agents whose requests run outside the send path (raw streamText: Dream in
 // memoryConsolidation, Name Workspace in workspaceTitleGenerator) and never
-// apply reasoningMode. Never offer a Pro toggle that cannot affect requests.
+// apply reasoningMode. Never offer a Pro/Cyber toggle that cannot affect requests.
 // Compact stays eligible: compaction goes through the send path, which
 // threads reasoningMode.
 const HEADLESS_REASONING_AGENT_IDS = new Set(["dream", "name_workspace", "intuition"]);
@@ -93,8 +95,9 @@ function updateAgentDefaultEntry(
     !updated.modelString &&
     !updated.thinkingLevel &&
     !updated.reasoningMode &&
+    updated.autoModelRouting === undefined &&
+    updated.autoThinkingLevel === undefined &&
     updated.enabled === undefined &&
-    updated.advisorEnabled === undefined &&
     updated.subagent === undefined
   ) {
     delete next[normalizedId];
@@ -221,23 +224,6 @@ function renderPolicySummary(agent: AgentDefinitionDescriptor): React.ReactNode 
   );
 }
 
-function getAdvisorSwitchState(
-  agentId: string,
-  advisorEnabledOverride: boolean | undefined
-): { checked: boolean; title: string } {
-  const checked = resolveAdvisorEnabledForAgent(agentId, advisorEnabledOverride);
-  const title =
-    advisorEnabledOverride === undefined
-      ? checked
-        ? "Advisor enabled by default."
-        : "Advisor disabled by default."
-      : advisorEnabledOverride
-        ? "Advisor enabled (local override)."
-        : "Advisor disabled (local override).";
-
-  return { checked, title };
-}
-
 function areTaskSettingsEqual(a: TaskSettings, b: TaskSettings): boolean {
   return (
     a.maxParallelAgentTasks === b.maxParallelAgentTasks &&
@@ -284,10 +270,13 @@ function areAgentAiDefaultsEqual(a: AgentAiDefaults, b: AgentAiDefaults): boolea
     if ((aEntry?.reasoningMode ?? undefined) !== (bEntry?.reasoningMode ?? undefined)) {
       return false;
     }
-    if ((aEntry?.enabled ?? undefined) !== (bEntry?.enabled ?? undefined)) {
+    if ((aEntry?.autoModelRouting ?? undefined) !== (bEntry?.autoModelRouting ?? undefined)) {
       return false;
     }
-    if ((aEntry?.advisorEnabled ?? undefined) !== (bEntry?.advisorEnabled ?? undefined)) {
+    if ((aEntry?.autoThinkingLevel ?? undefined) !== (bEntry?.autoThinkingLevel ?? undefined)) {
+      return false;
+    }
+    if ((aEntry?.enabled ?? undefined) !== (bEntry?.enabled ?? undefined)) {
       return false;
     }
     if (!areSubagentProfilesEqual(aEntry?.subagent, bEntry?.subagent)) {
@@ -297,6 +286,16 @@ function areAgentAiDefaultsEqual(a: AgentAiDefaults, b: AgentAiDefaults): boolea
 
   return true;
 }
+/** Offline, or before a load answered: an edit then would be lost or replaced. */
+function areControlsLocked(offline: boolean, loaded: boolean): boolean {
+  return offline || !loaded;
+}
+
+function clearSaveTimer(timerRef: { current: ReturnType<typeof setTimeout> | null }): void {
+  if (timerRef.current) clearTimeout(timerRef.current);
+  timerRef.current = null;
+}
+
 function coerceAgentId(value: unknown): string {
   return normalizeAgentId(value, WORKSPACE_DEFAULTS.agentId);
 }
@@ -308,13 +307,15 @@ interface AiDefaultsControlsProps {
   reasoningModeInherited?: boolean;
   modelCapabilitiesDeferred?: boolean;
   applyMinimumThinkingLevel?: boolean;
-  /** Forwarded to the picker; false hides the Pro toggle (e.g. Dream, whose requests never apply reasoningMode). */
-  allowProMode?: boolean;
+  /** Forwarded to the picker; false hides the Pro and Cyber toggles (e.g. Dream, whose requests never apply reasoningMode). */
+  allowReasoningModes?: boolean;
   effectiveModel: string | undefined;
   models: string[];
   hiddenModelsForSelector: string[];
   inheritLabel?: string;
   showThinkingResetButton?: boolean;
+  modelAutoRouting?: { active: boolean; onSelect: () => void };
+  thinkingAutoRouting?: { active: boolean; onSelect: () => void };
   onModelChange: (value: string) => void;
   onThinkingChange: (value: string) => void;
   onReasoningModeChange: (mode: OpenAIReasoningMode) => void;
@@ -337,8 +338,9 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
             hiddenModels={props.hiddenModelsForSelector}
             variant="box"
             className="bg-modal-bg"
+            autoRouting={props.modelAutoRouting}
           />
-          {props.modelValue !== INHERIT ? (
+          {props.modelValue !== INHERIT || props.modelAutoRouting?.active === true ? (
             <Button
               type="button"
               variant="ghost"
@@ -355,8 +357,7 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
       <div className="space-y-1">
         <div className="text-muted text-xs">Reasoning</div>
         <div className="flex items-center gap-2">
-          {/* Shared composer picker so settings inherit the same features
-            (route-aware Pro mode, provider Fast mode) as the chat input. */}
+          {/* Reasoning defaults share the composer picker; speed remains a per-chat choice. */}
           <ThinkingSelectorControl
             modelString={props.effectiveModel}
             modelCapabilitiesDeferred={props.modelCapabilitiesDeferred}
@@ -366,13 +367,17 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
             reasoningMode={props.reasoningModeValue}
             reasoningModeInherited={props.reasoningModeInherited}
             onReasoningModeChange={props.onReasoningModeChange}
-            allowProMode={props.allowProMode}
+            allowReasoningModes={props.allowReasoningModes}
+            allowFastMode={false}
             variant="box"
             inheritOption={{
               label: inheritLabel,
-              selected: props.thinkingValue === INHERIT,
+              // Inherit remains the fallback, but only Auto reads as selected.
+              selected:
+                props.thinkingValue === INHERIT && props.thinkingAutoRouting?.active !== true,
               onSelect: () => props.onThinkingChange(INHERIT),
             }}
+            autoRouting={props.thinkingAutoRouting}
           />
           {props.showThinkingResetButton === true && props.thinkingValue !== INHERIT ? (
             <Button
@@ -393,6 +398,13 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
 
 export function TasksSection() {
   const { api } = useAPI();
+  // The autosave sends only through a live client. Offline it keeps the change pending and says
+  // so: the reload after the reconnect keeps a pending change, and the autosave sends it then.
+  const liveApi = useLiveAPI();
+  const liveApiRef = useRef(liveApi);
+  useEffect(() => {
+    liveApiRef.current = liveApi;
+  }, [liveApi]);
   const { selectedWorkspace } = useWorkspaceContext();
 
   const selectedWorkspaceRef = useRef(selectedWorkspace);
@@ -417,16 +429,11 @@ export function TasksSection() {
   const pendingSaveRef = useRef<TasksSectionSavePayload | null>(null);
 
   const { models, hiddenModelsForSelector } = useModelsFromSettings();
-  const [globalDefaultAgentIdRaw, setGlobalDefaultAgentIdRaw] = usePersistedState<string>(
-    getAgentIdKey(GLOBAL_SCOPE_ID),
-    WORKSPACE_DEFAULTS.agentId,
-    {
-      listener: true,
-    }
+  const newWorkspaceDefaultAgentId = coerceAgentId(
+    useUserPreferences((preferences) => preferences.ai?.globalDefaults?.agentId)
   );
-  const newWorkspaceDefaultAgentId = coerceAgentId(globalDefaultAgentIdRaw);
   const portableDesktopEnabled = useExperimentValue(EXPERIMENT_IDS.PORTABLE_DESKTOP);
-  const advisorToolEnabled = useExperimentValue(EXPERIMENT_IDS.ADVISOR_TOOL);
+  const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
   // Dream only runs when both flags are on (see memoryConsolidationService);
   // mirror that gate for its Settings card.
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
@@ -438,19 +445,13 @@ export function TasksSection() {
   // Resolve the workspace's active model so that when a sub-agent's model is
   // "Inherit", we show thinking levels for the workspace model (falling back to
   // the global default). This mirrors the workspace model resolution chain used when sending messages.
-  const selectedWorkspaceId = selectedWorkspace?.workspaceId ?? null;
-  const defaultModel = getDefaultModel();
-  const workspaceModelStorageKey = selectedWorkspaceId
-    ? getModelKey(selectedWorkspaceId)
-    : "__tasks_workspace_model_fallback__";
-  const [workspaceModelRaw] = usePersistedState<unknown>(workspaceModelStorageKey, defaultModel, {
-    listener: true,
-  });
-  const inheritedEffectiveModel =
-    (typeof workspaceModelRaw === "string" ? workspaceModelRaw.trim() : "") || defaultModel;
+  const selectedWorkspaceId = selectedWorkspace?.workspaceId ?? "";
+  const workspaceModel = useWorkspaceAiSelection(selectedWorkspaceId).model;
+  const inheritedEffectiveModel = selectedWorkspaceId ? workspaceModel : getDefaultModel();
 
   const lastSyncedTaskSettingsRef = useRef<TaskSettings | null>(null);
   const lastSyncedAgentAiDefaultsRef = useRef<AgentAiDefaults | null>(null);
+  const shownAgentsScopeRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!api) return;
@@ -462,11 +463,16 @@ export function TasksSection() {
     void api.config
       .getConfig()
       .then((cfg) => {
+        // A reload after a reconnect keeps values the user changed and not yet saved: the
+        // autosave sends them through the new client once `loaded` is back.
+        if (pendingSaveRef.current != null || savingRef.current) {
+          setLoaded(true);
+          return;
+        }
         const normalizedTaskSettings = normalizeTaskSettings(cfg.taskSettings);
         setTaskSettings(normalizedTaskSettings);
         const normalizedAgentDefaults = normalizeAgentAiDefaults(cfg.agentAiDefaults);
         setAgentAiDefaults(normalizedAgentDefaults);
-        updatePersistedState(AGENT_AI_DEFAULTS_KEY, normalizedAgentDefaults);
 
         setLoadFailed(false);
         lastSyncedTaskSettingsRef.current = normalizedTaskSettings;
@@ -475,6 +481,8 @@ export function TasksSection() {
         setLoaded(true);
       })
       .catch((error: unknown) => {
+        // A lost connection is no load failure: the reconnect loads again.
+        if (isConnectionLostError(error)) return;
         setSaveError(getErrorMessage(error));
         setLoadFailed(true);
         setLoaded(true);
@@ -495,8 +503,14 @@ export function TasksSection() {
     }
 
     let cancelled = false;
-    setAgentsLoaded(false);
-    setAgentsLoadFailed(false);
+    // Only a new scope shows "Loading agents…": a new client (reconnect) reloads the same
+    // scope behind the shown list.
+    const scope = JSON.stringify([projectPath, workspaceId]);
+    if (shownAgentsScopeRef.current !== scope) {
+      shownAgentsScopeRef.current = scope;
+      setAgentsLoaded(false);
+      setAgentsLoadFailed(false);
+    }
 
     void Promise.all([
       api.agents.list({ projectPath, workspaceId }),
@@ -509,8 +523,8 @@ export function TasksSection() {
         setAgentsLoadFailed(false);
         setAgentsLoaded(true);
       })
-      .catch(() => {
-        if (cancelled) return;
+      .catch((error: unknown) => {
+        if (cancelled || isConnectionLostError(error)) return;
         setAgents([]);
         setEnabledAgentIds(FALLBACK_AGENTS.map((agent) => agent.id));
         setAgentsLoadFailed(true);
@@ -523,7 +537,6 @@ export function TasksSection() {
   }, [api, selectedWorkspace?.projectPath, selectedWorkspace?.workspaceId]);
 
   useEffect(() => {
-    if (!api) return;
     if (!loaded) return;
     if (loadFailed) return;
 
@@ -541,32 +554,37 @@ export function TasksSection() {
       areAgentAiDefaultsEqual(lastAgentDefaults, agentAiDefaults)
     ) {
       pendingSaveRef.current = null;
-      if (saveTimerRef.current) {
-        clearTimeout(saveTimerRef.current);
-        saveTimerRef.current = null;
-      }
+      clearSaveTimer(saveTimerRef);
       return;
     }
 
-    // Keep agent defaults cache up-to-date for any syncers/non-react readers.
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, agentAiDefaults);
-
-    if (saveTimerRef.current) {
-      clearTimeout(saveTimerRef.current);
-      saveTimerRef.current = null;
+    if (!liveApi) {
+      // Offline: the change stays pending (the reload after the reconnect keeps it) and the
+      // autosave sends it once this effect runs with the new client.
+      clearSaveTimer(saveTimerRef);
+      setSaveError(OFFLINE_SAVE_MESSAGE);
+      return;
     }
+
+    // Readers of the shared store see the edit before the debounced save lands.
+    getAppConfigStore().updateOptimistically({ agentAiDefaults });
+
+    clearSaveTimer(saveTimerRef);
 
     saveTimerRef.current = setTimeout(() => {
       const flush = () => {
         if (savingRef.current) return;
-        if (!api) return;
+        // The live client now, not this effect's: a retry after a lost connection must not take
+        // the pending change while offline (it would fail again and lose it).
+        const client = liveApiRef.current;
+        if (!client) return;
 
         const payload = pendingSaveRef.current;
         if (!payload) return;
 
         pendingSaveRef.current = null;
         savingRef.current = true;
-        void api.config
+        void client.config
           .saveConfig(payload)
           .then(() => {
             const previousAgentDefaults = lastSyncedAgentAiDefaultsRef.current;
@@ -592,8 +610,8 @@ export function TasksSection() {
               // while the user tweaks values.
               setAgentsLoadFailed(false);
               void Promise.all([
-                api.agents.list({ projectPath, workspaceId }),
-                api.agents.list({ projectPath, workspaceId, includeDisabled: true }),
+                client.agents.list({ projectPath, workspaceId }),
+                client.agents.list({ projectPath, workspaceId, includeDisabled: true }),
               ])
                 .then(([enabled, all]) => {
                   setAgents(all);
@@ -622,12 +640,9 @@ export function TasksSection() {
     }, 400);
 
     return () => {
-      if (saveTimerRef.current) {
-        clearTimeout(saveTimerRef.current);
-        saveTimerRef.current = null;
-      }
+      clearSaveTimer(saveTimerRef);
     };
-  }, [api, agentAiDefaults, loaded, loadFailed, taskSettings]);
+  }, [liveApi, agentAiDefaults, loaded, loadFailed, taskSettings]);
 
   // Flush any pending debounced save on unmount so changes aren't lost.
   useEffect(() => {
@@ -636,10 +651,7 @@ export function TasksSection() {
     if (loadFailed) return;
 
     return () => {
-      if (saveTimerRef.current) {
-        clearTimeout(saveTimerRef.current);
-        saveTimerRef.current = null;
-      }
+      clearSaveTimer(saveTimerRef);
 
       if (savingRef.current) return;
       const payload = pendingSaveRef.current;
@@ -673,12 +685,14 @@ export function TasksSection() {
   };
 
   const setNewWorkspaceDefaultAgentId = (agentId: string) => {
-    setGlobalDefaultAgentIdRaw(coerceAgentId(agentId));
+    updateUserPreferences({ ai: { globalDefaults: { agentId: coerceAgentId(agentId) } } });
   };
 
   const setAgentModel = (agentId: string, value: string) => {
     setAgentAiDefaults((prev) =>
       updateAgentDefaultEntry(prev, agentId, (updated) => {
+        // Any non-Auto model selection exits Auto.
+        delete updated.autoModelRouting;
         if (value === INHERIT || value.trim().length === 0) {
           delete updated.modelString;
         } else {
@@ -691,6 +705,7 @@ export function TasksSection() {
   const setAgentThinking = (agentId: string, value: string) => {
     setAgentAiDefaults((prev) =>
       updateAgentDefaultEntry(prev, agentId, (updated) => {
+        delete updated.autoThinkingLevel;
         if (value === INHERIT) {
           // The Inherit row resets the whole reasoning config: a retained
           // reasoning override would be invisible (explicit "standard" renders
@@ -704,6 +719,34 @@ export function TasksSection() {
       })
     );
   };
+
+  // Selecting Auto keeps any concrete value as the routing fallback.
+  const setAgentAutoRouting = (agentId: string, flag: "autoModelRouting" | "autoThinkingLevel") => {
+    setAgentAiDefaults((prev) =>
+      updateAgentDefaultEntry(prev, agentId, (updated) => {
+        updated[flag] = true;
+      })
+    );
+  };
+
+  // Unknown IDs may be UI agents defined elsewhere, so keep stored Auto flags clearable.
+  // Delegated and internal agents never route prompts.
+  const getAutoRoutingProps = (
+    agentId: string,
+    entry: AgentAiDefaultsEntry | undefined
+  ): Pick<AiDefaultsControlsProps, "modelAutoRouting" | "thinkingAutoRouting"> =>
+    autoModelRoutingEnabled
+      ? {
+          modelAutoRouting: {
+            active: entry?.autoModelRouting === true,
+            onSelect: () => setAgentAutoRouting(agentId, "autoModelRouting"),
+          },
+          thinkingAutoRouting: {
+            active: entry?.autoThinkingLevel === true,
+            onSelect: () => setAgentAutoRouting(agentId, "autoThinkingLevel"),
+          },
+        }
+      : {};
 
   // Mirrors resolveAgentAiSettings' field-wise base-chain walk (ACP
   // resolution): agents without their own default inherit each field from the
@@ -731,8 +774,10 @@ export function TasksSection() {
     return { modelString, reasoningMode };
   };
 
-  const baseChainInheritsPro = (agentId: string): boolean =>
-    resolveBaseChainDefaults(agentId).reasoningMode === "pro";
+  const baseChainSuppliesNonStandardMode = (agentId: string): boolean => {
+    const inherited = resolveBaseChainDefaults(agentId).reasoningMode;
+    return inherited !== undefined && inherited !== "standard";
+  };
 
   // Definitions may pin ai.model (possibly an alias like "sonnet"); ACP/task
   // resolution slots it below Settings overrides and above the ambient
@@ -742,14 +787,14 @@ export function TasksSection() {
 
   const setAgentReasoningMode = (agentId: string, mode: OpenAIReasoningMode) => {
     // "standard" is the wire default; keep entries sparse by only persisting
-    // "pro", unless a base agent supplies pro, where deleting the override
-    // would silently fall back to pro (see baseChainInheritsPro).
-    const inheritsPro = baseChainInheritsPro(agentId);
+    // non-standard modes, unless a base agent supplies one, where deleting the
+    // override would silently fall back to it.
+    const inheritsNonStandard = baseChainSuppliesNonStandardMode(agentId);
     setAgentAiDefaults((prev) =>
       updateAgentDefaultEntry(prev, agentId, (updated) => {
-        if (mode === "pro") {
-          updated.reasoningMode = "pro";
-        } else if (inheritsPro) {
+        if (mode !== "standard") {
+          updated.reasoningMode = mode;
+        } else if (inheritsNonStandard) {
           updated.reasoningMode = "standard";
         } else {
           delete updated.reasoningMode;
@@ -811,22 +856,6 @@ export function TasksSection() {
     );
   };
 
-  const setAgentAdvisorEnabled = (agentId: string, value: boolean) => {
-    setAgentAiDefaults((prev) =>
-      updateAgentDefaultEntry(prev, agentId, (updated) => {
-        updated.advisorEnabled = value;
-      })
-    );
-  };
-
-  const resetAgentAdvisorEnabled = (agentId: string) => {
-    setAgentAiDefaults((prev) =>
-      updateAgentDefaultEntry(prev, agentId, (updated) => {
-        delete updated.advisorEnabled;
-      })
-    );
-  };
-
   const listedAgents = agents.length > 0 ? agents : FALLBACK_AGENTS;
   const enabledAgentIdSet = new Set(enabledAgentIds);
 
@@ -872,8 +901,6 @@ export function TasksSection() {
     const modelValue = entry?.modelString ?? INHERIT;
     const thinkingValue = entry?.thinkingLevel ?? INHERIT;
     const enabledOverride = entry?.enabled;
-    const advisorEnabledOverride = entry?.advisorEnabled;
-    const advisorSwitchState = getAdvisorSwitchState(agent.id, advisorEnabledOverride);
 
     const enablementLocked =
       agent.id === "exec" || agent.id === "plan" || agent.id === "compact" || agent.id === "mux";
@@ -1003,34 +1030,6 @@ export function TasksSection() {
                 </Button>
               ) : null}
             </div>
-            {advisorToolEnabled && agent.id !== "intuition" ? (
-              <div className="flex items-center gap-3">
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <div className="flex items-center gap-2">
-                      <div className="text-muted text-xs">Advisor</div>
-                      <Switch
-                        checked={advisorSwitchState.checked}
-                        onCheckedChange={(checked) => setAgentAdvisorEnabled(agent.id, checked)}
-                        aria-label={`Toggle ${agent.id} advisor`}
-                      />
-                    </div>
-                  </TooltipTrigger>
-                  <TooltipContent>{advisorSwitchState.title}</TooltipContent>
-                </Tooltip>
-                {advisorEnabledOverride !== undefined ? (
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    className="px-2"
-                    onClick={() => resetAgentAdvisorEnabled(agent.id)}
-                  >
-                    Reset
-                  </Button>
-                ) : null}
-              </div>
-            ) : null}
           </div>
         </div>
 
@@ -1038,12 +1037,13 @@ export function TasksSection() {
           modelValue={modelValue}
           thinkingValue={thinkingValue}
           reasoningModeValue={entry?.reasoningMode ?? inheritedDefaults.reasoningMode ?? "standard"}
-          allowProMode={!HEADLESS_REASONING_AGENT_IDS.has(agent.id)}
+          allowReasoningModes={!HEADLESS_REASONING_AGENT_IDS.has(agent.id)}
           // Intuition clamps to model capabilities, not the chat's minimum effort.
           applyMinimumThinkingLevel={agent.id !== "intuition"}
           effectiveModel={effectiveModel}
           models={models}
           hiddenModelsForSelector={hiddenModelsForSelector}
+          {...(agent.uiSelectable ? getAutoRoutingProps(agent.id, entry) : {})}
           onModelChange={(value) => setAgentModel(agent.id, value)}
           onThinkingChange={(value) => setAgentThinking(agent.id, value)}
           onReasoningModeChange={(mode) => setAgentReasoningMode(agent.id, mode)}
@@ -1072,7 +1072,7 @@ export function TasksSection() {
           <div className="text-muted mt-1 text-xs">
             Unset fields use the calling chat’s Exec settings at task creation, falling back to UI
             Exec defaults when no chat selection exists. Model capabilities are enforced at launch.
-            Enabled and advisor settings stay shared with UI Exec.
+            Enabled settings stay shared with UI Exec.
           </div>
         </div>
 
@@ -1099,8 +1099,6 @@ export function TasksSection() {
     const entry = agentAiDefaults[agentId];
     const modelValue = entry?.modelString ?? INHERIT;
     const thinkingValue = entry?.thinkingLevel ?? INHERIT;
-    const advisorEnabledOverride = entry?.advisorEnabled;
-    const advisorSwitchState = getAdvisorSwitchState(agentId, advisorEnabledOverride);
     // Base-chain model wins over the ambient default (see renderAgentDefaults).
     const inheritedDefaults = resolveBaseChainDefaults(agentId);
     const effectiveModel =
@@ -1118,34 +1116,6 @@ export function TasksSection() {
             <div className="text-foreground text-sm font-medium">{agentId}</div>
             <div className="text-muted text-xs">Not discovered in the current workspace</div>
           </div>
-          {advisorToolEnabled ? (
-            <div className="flex shrink-0 items-center gap-3">
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <div className="flex items-center gap-2">
-                    <div className="text-muted text-xs">Advisor</div>
-                    <Switch
-                      checked={advisorSwitchState.checked}
-                      onCheckedChange={(checked) => setAgentAdvisorEnabled(agentId, checked)}
-                      aria-label={`Toggle ${agentId} advisor`}
-                    />
-                  </div>
-                </TooltipTrigger>
-                <TooltipContent>{advisorSwitchState.title}</TooltipContent>
-              </Tooltip>
-              {advisorEnabledOverride !== undefined ? (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  className="px-2"
-                  onClick={() => resetAgentAdvisorEnabled(agentId)}
-                >
-                  Reset
-                </Button>
-              ) : null}
-            </div>
-          ) : null}
         </div>
 
         <AiDefaultsControls
@@ -1155,6 +1125,7 @@ export function TasksSection() {
           effectiveModel={effectiveModel}
           models={models}
           hiddenModelsForSelector={hiddenModelsForSelector}
+          {...getAutoRoutingProps(agentId, entry)}
           onModelChange={(value) => setAgentModel(agentId, value)}
           onThinkingChange={(value) => setAgentThinking(agentId, value)}
           onReasoningModeChange={(mode) => setAgentReasoningMode(agentId, mode)}
@@ -1164,7 +1135,10 @@ export function TasksSection() {
   };
 
   return (
-    <div className="space-y-6">
+    // Offline every control is disabled: an edit kept only in this section's state is lost when
+    // the user leaves the section before the reconnect. Until a load answers, too: the autosave
+    // does not track an edit made then, so the answer would replace it.
+    <fieldset disabled={areControlsLocked(liveApi == null, loaded)} className="min-w-0 space-y-6">
       <div>
         <h3 className="text-foreground mb-4 text-sm font-medium">Task Settings</h3>
         <div className="space-y-4">
@@ -1299,6 +1273,6 @@ export function TasksSection() {
           <div className="space-y-4">{unknownAgentIds.map(renderUnknownAgentDefaults)}</div>
         </div>
       ) : null}
-    </div>
+    </fieldset>
   );
 }

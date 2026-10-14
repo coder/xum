@@ -1,3 +1,4 @@
+import { EventEmitter } from "events";
 import * as fs from "fs/promises";
 import * as nodeFs from "node:fs";
 import * as os from "os";
@@ -74,6 +75,25 @@ function createStartupInfo(options: {
 }
 
 let desktopManagerTestLock: Promise<void> = Promise.resolve();
+
+/**
+ * Stands in for the FSWatcher that watchWorkspaceConfig creates. Bun 1.3.5 leaks one
+ * thread-pool thread, blocked forever, for each real directory watcher closed in the tick
+ * that created it. The unit-test process shares that pool, so enough leaks stall pending fs
+ * work and can block the main thread inside a later close(), hanging the shard (#4463).
+ * These tests only drive the watcher's events and close(), so a fake is sufficient.
+ */
+class FakeFsWatcher extends EventEmitter {
+  closeCalls = 0;
+
+  close(): void {
+    this.closeCalls += 1;
+  }
+
+  asFsWatcher(): nodeFs.FSWatcher {
+    return this as unknown as nodeFs.FSWatcher;
+  }
+}
 
 async function withDesktopManagerHarness(
   run: (harness: DesktopManagerHarness) => Promise<void>
@@ -1713,14 +1733,14 @@ describe("DesktopSessionManager", () => {
 
   for (const event of ["error", "close"] as const) {
     test(`config watcher ${event} fails closed once and explicit disposal does not`, async () => {
-      await withDesktopManagerHarness(({ config, tempDir }) => {
+      await withDesktopManagerHarness(({ config }) => {
         const manager = new DesktopSessionManager({
           config,
           experimentsService: createExperimentsService(true),
           workspaceService: createWorkspaceService(() => Promise.resolve(null)),
         });
-        const watcher = nodeFs.watch(tempDir, { persistent: false });
-        const watch = spyOn(nodeFs, "watch").mockReturnValue(watcher);
+        const watcher = new FakeFsWatcher();
+        const watch = spyOn(nodeFs, "watch").mockReturnValue(watcher.asFsWatcher());
         const failures: unknown[] = [];
         const stop = manager.watchWorkspaceConfig(
           () => undefined,
@@ -1729,25 +1749,27 @@ describe("DesktopSessionManager", () => {
         try {
           watcher.emit(event, new Error("watch lost"));
           expect(failures).toHaveLength(1);
+          expect(watcher.closeCalls).toBe(1);
           stop();
           expect(failures).toHaveLength(1);
+          expect(watcher.closeCalls).toBe(1);
         } finally {
           stop();
           watch.mockRestore();
         }
 
-        const cleanWatch = nodeFs.watch(tempDir, { persistent: false });
-        const cleanSpy = spyOn(nodeFs, "watch").mockReturnValue(cleanWatch);
+        const cleanWatch = new FakeFsWatcher();
+        const cleanSpy = spyOn(nodeFs, "watch").mockReturnValue(cleanWatch.asFsWatcher());
         try {
           const dispose = manager.watchWorkspaceConfig(
             () => undefined,
             (error) => failures.push(error)
           );
           dispose();
+          expect(cleanWatch.closeCalls).toBe(1);
           cleanWatch.emit("close");
           expect(failures).toHaveLength(1);
         } finally {
-          cleanWatch.close();
           cleanSpy.mockRestore();
         }
         return Promise.resolve();

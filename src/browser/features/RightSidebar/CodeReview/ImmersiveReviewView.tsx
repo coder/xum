@@ -39,7 +39,7 @@ import {
 } from "./immersiveMinimapMath";
 import { KeycapGroup } from "@/browser/components/Keycap/Keycap";
 import { useTheme } from "@/browser/contexts/ThemeContext";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { formatLineRangeCompact } from "@/browser/utils/review/lineRange";
 import {
   findAdjacentFileHunkId,
@@ -77,6 +77,7 @@ import {
 } from "@/common/types/review";
 import type { FileStats, FileTreeNode } from "@/common/utils/git/numstatParser";
 import type { ReviewActionCallbacks } from "../../Shared/InlineReviewNote";
+import { runWithCatchFinally } from "@/browser/utils/compilerSafeControlFlow";
 
 interface ImmersiveReviewViewProps {
   workspaceId: string;
@@ -87,6 +88,8 @@ interface ImmersiveReviewViewProps {
   allHunks: DiffHunk[];
   /** True while diff/tree payload for this workspace is still loading. */
   isLoading?: boolean;
+  /** Why the diff failed to load; shown instead of the empty state (#5674). */
+  loadError?: string | null;
   isRead: (hunkId: string) => boolean;
   onToggleRead: (hunkId: string) => void;
   onMarkFileAsRead: (hunkId: string) => void;
@@ -316,13 +319,14 @@ function findReviewHunkId(review: Review, fileHunks: DiffHunk[]): string | null 
 }
 
 export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) => {
-  const containerRef = useRef<HTMLDivElement>(null);
+  const containerRef = useRef<HTMLElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const notesSidebarRef = useRef<HTMLDivElement>(null);
   const hunkJumpScrollBlockRef = useRef<ScrollLogicalPosition>("center");
   const hunkJumpRef = useRef(false);
   const pendingJumpSelectAllHunkIdRef = useRef<string | null>(null);
   const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const { theme } = useTheme();
 
   const {
@@ -584,7 +588,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
         lineMap = newLineMap;
         range = parsed.new;
       } else if (parsed.old) {
-        oldLineMap ??= buildOldLineNumberToIndexMap(overlayData.content);
+        oldLineMap = oldLineMap ?? buildOldLineNumberToIndexMap(overlayData.content);
         lineMap = oldLineMap;
         range = parsed.old;
       } else {
@@ -721,7 +725,11 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
 
   // Refs keep hot-path callbacks stable so cursor movement doesn't trigger expensive re-renders.
   const activeLineIndexRef = useRef<number | null>(null);
+  // The ref serves the stable hot-path callbacks; the state mirror feeds render
+  // (the line-selection summary), since React Compiler rejects ref reads during render.
+  // Every write sets both, next to the cursor/selection updates it batches with.
   const hunkJumpLineRangeRef = useRef<SelectedLineRange | null>(null);
+  const [hunkJumpLineRange, setHunkJumpLineRange] = useState<SelectedLineRange | null>(null);
   const selectedLineRangeRef = useRef<SelectedLineRange | null>(null);
   const selectedHunkIdRef = useRef<string | null>(selectedHunkId);
   const isReadRef = useRef(isRead);
@@ -838,6 +846,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
       pendingJumpSelectAllHunkIdRef.current = null;
       clearHunkJumpRangeHighlight();
       hunkJumpLineRangeRef.current = null;
+      setHunkJumpLineRange(null);
       skipScrollUntilCursorSettlesRef.current = false;
       setActiveLineIndex(null);
       setSelectedLineRange(null);
@@ -851,11 +860,10 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
       const modifiedStart = selectedHunkRange.firstModifiedIndex ?? selectedHunkRange.startIndex;
       const modifiedEnd = selectedHunkRange.lastModifiedIndex ?? selectedHunkRange.endIndex;
       skipScrollUntilCursorSettlesRef.current = activeLineIndexRef.current !== modifiedEnd;
-      hunkJumpLineRangeRef.current = {
-        startIndex: modifiedStart,
-        endIndex: modifiedEnd,
-      };
-      applyHunkJumpRangeHighlight(hunkJumpLineRangeRef.current);
+      const jumpRange = { startIndex: modifiedStart, endIndex: modifiedEnd };
+      hunkJumpLineRangeRef.current = jumpRange;
+      setHunkJumpLineRange(jumpRange);
+      applyHunkJumpRangeHighlight(jumpRange);
       setActiveLineIndex(modifiedEnd);
       setSelectedLineRange(null);
       return;
@@ -867,6 +875,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
     ) {
       clearHunkJumpRangeHighlight();
       hunkJumpLineRangeRef.current = null;
+      setHunkJumpLineRange(null);
     }
 
     const cursorLineIndex = activeLineIndexRef.current;
@@ -1099,8 +1108,8 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
       return selectedLineRange;
     }
 
-    if (hunkJumpLineRangeRef.current) {
-      return hunkJumpLineRangeRef.current;
+    if (hunkJumpLineRange) {
+      return hunkJumpLineRange;
     }
 
     if (activeLineIndex === null) {
@@ -1108,7 +1117,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
     }
 
     return { startIndex: activeLineIndex, endIndex: activeLineIndex };
-  }, [activeLineIndex, selectedLineRange]);
+  }, [activeLineIndex, hunkJumpLineRange, selectedLineRange]);
 
   const selectedLineSummary = useMemo(() => {
     const selection = getCurrentLineSelection();
@@ -1195,6 +1204,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
       // cursor (activeLineIndex) rather than the stale range from this comment.
       clearHunkJumpRangeHighlight();
       hunkJumpLineRangeRef.current = null;
+      setHunkJumpLineRange(null);
       setSelectedLineRange(null);
       containerRef.current?.focus();
     },
@@ -1207,6 +1217,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
     setInlineComposerRequest(null);
     clearHunkJumpRangeHighlight();
     hunkJumpLineRangeRef.current = null;
+    setHunkJumpLineRange(null);
     setSelectedLineRange(null);
     containerRef.current?.focus();
   }, [clearHunkJumpRangeHighlight]);
@@ -1223,6 +1234,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
 
       clearHunkJumpRangeHighlight();
       hunkJumpLineRangeRef.current = null;
+      setHunkJumpLineRange(null);
       setActiveLineIndex(nextIndex);
 
       if (extendRange) {
@@ -1396,13 +1408,16 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
   } | null>(null);
   const copyFileRequestIdRef = useRef(0);
   const pendingCopyFilePathRef = useRef<string | null>(null);
-  // Both refs update during render so isStale() sees path AND content-version
-  // changes before passive effects run; a resolved read's microtask can otherwise
-  // beat the invalidation effect after a same-path refresh commits.
+  // Both refs update in a layout effect (same task as the commit, before passive effects)
+  // so isStale() sees path AND content-version changes before passive effects run; a
+  // resolved read's microtask can otherwise beat the invalidation effect after a same-path
+  // refresh commits. (React Compiler rejects ref writes during render.)
   const activeFilePathRef = useRef(activeFilePath);
-  activeFilePathRef.current = activeFilePath;
   const activeFileContentVersionRef = useRef(activeFileContentVersion);
-  activeFileContentVersionRef.current = activeFileContentVersion;
+  useLayoutEffect(() => {
+    activeFilePathRef.current = activeFilePath;
+    activeFileContentVersionRef.current = activeFileContentVersion;
+  });
 
   useEffect(() => {
     return () => {
@@ -1461,7 +1476,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
     }
     // The API union supplies api: null while connecting/reconnecting/errored; the
     // already-rendered view keeps its copy affordance, so fail visibly, not silently.
-    if (!api) {
+    if (!liveApi) {
       showCopyFileFeedback("failed", filePath, contentVersion, {
         message: "Copy failed: backend connection unavailable",
       });
@@ -1485,8 +1500,8 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
       requestId !== copyFileRequestIdRef.current ||
       activeFilePathRef.current !== filePath ||
       activeFileContentVersionRef.current !== contentVersion;
-    try {
-      const result = await api.workspace.executeBash({
+    const copyFileContents = async () => {
+      const result = await liveApi.workspace.executeBash({
         workspaceId: props.workspaceId,
         script: buildReadFileScript(filePath, {
           // The IPC bash channel truncates output beyond 1MiB, so cap copies at what
@@ -1534,12 +1549,14 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
       if (!isStale()) {
         showCopyFileFeedback("copied", filePath, contentVersion);
       }
-    } catch (error) {
+    };
+    const reportCopyFailure = (error: unknown) => {
       console.error("Failed to copy file contents:", error);
       if (!isStale()) {
         showCopyFileFeedback("failed", filePath, contentVersion);
       }
-    } finally {
+    };
+    await runWithCatchFinally(copyFileContents, reportCopyFailure, () => {
       // A superseding request owns the pending slot; only the current one releases it.
       if (
         pendingCopyFilePathRef.current === filePath &&
@@ -1547,13 +1564,15 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
       ) {
         pendingCopyFilePathRef.current = null;
       }
-    }
+    });
   };
 
   // Keyboard handling reads the handler through a ref (matching onToggleReadRef) so the
   // effect does not depend on a per-render function identity.
   const handleCopyFileRef = useRef(handleCopyFile);
-  handleCopyFileRef.current = handleCopyFile;
+  useLayoutEffect(() => {
+    handleCopyFileRef.current = handleCopyFile;
+  });
 
   const activeCopyFileFeedback = copyFileFeedback?.kind ?? null;
 
@@ -1567,6 +1586,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
 
       clearHunkJumpRangeHighlight();
       hunkJumpLineRangeRef.current = null;
+      setHunkJumpLineRange(null);
       const anchorIndex = shiftKey
         ? (selectedLineRangeRef.current?.startIndex ?? activeLineIndexRef.current ?? lineIndex)
         : lineIndex;
@@ -1632,13 +1652,19 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if (isDesktopViewportFocused(e.target)) return;
+      // The notes sidebar is CSS-hidden in narrow windows, including after the window
+      // shrinks while notes mode is active. Keys then act on the visible diff, so
+      // J/K/Enter/Delete never touch notes the user cannot see. Derive this per key
+      // press instead of resetting focusedPanel, so widening again restores notes mode.
+      const isNotesSidebarShown = (notesSidebarRef.current?.getClientRects().length ?? 0) > 0;
+      const effectivePanel = isNotesSidebarShown ? focusedPanel : "diff";
       // Tab: toggle between diff and notes panels.
       if (matchesKeybind(e, KEYBINDS.REVIEW_FOCUS_NOTES)) {
         // Keep normal tab behavior when typing in inline note editors.
         if (isEditableElement(e.target)) return;
         e.preventDefault();
-        if (focusedPanel === "diff") {
-          if (allReviews.length > 0) {
+        if (effectivePanel === "diff") {
+          if (allReviews.length > 0 && isNotesSidebarShown) {
             setFocusedPanel("notes");
           }
         } else {
@@ -1649,7 +1675,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
       }
 
       // --- Notes sidebar keyboard mode ---
-      if (focusedPanel === "notes") {
+      if (effectivePanel === "notes") {
         // Don't intercept when typing in editable elements.
         if (isEditableElement(e.target)) return;
 
@@ -2047,7 +2073,9 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
           : "empty";
 
   return (
-    <div
+    // While immersive review is open the chat pane (and its `main`) is hidden and inert, so this
+    // view is the page's one `main` landmark (landmark-one-main, #5969).
+    <main
       ref={containerRef}
       tabIndex={isTouchExperience ? -1 : 0}
       className="flex h-full flex-col overflow-hidden outline-none"
@@ -2297,8 +2325,10 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
           the diff tree; renders nothing when there's no plan and no stream. */}
       <ImmersiveReviewAgentStatusBar workspaceId={props.workspaceId} />
 
-      {/* Unified whole-file diff with hunk overlays + notes sidebar */}
-      <div className="flex min-h-0 flex-1">
+      {/* Unified whole-file diff with hunk overlays + notes sidebar. The body is a size
+          container so the fixed-width notes sidebar can hide in narrow mouse-driven
+          windows instead of squeezing the diff to a sliver. */}
+      <div className="@container/immersive-review-body flex min-h-0 flex-1">
         {/* Diff column. The assisted-review callout lives INSIDE this column (not
             above the whole body) so the agent's per-hunk comment spans only the
             diff width and lines up with the code it refers to — rather than
@@ -2369,14 +2399,21 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
                     <button
                       type="button"
                       onClick={onExit}
-                      className="bg-accent hover:bg-accent/80 text-accent-foreground inline-flex items-center rounded-md px-3 py-1.5 text-xs font-medium transition-colors"
+                      className="bg-accent hover:bg-accent-button-hover text-accent-foreground inline-flex items-center rounded-md px-3 py-1.5 text-xs font-medium transition-colors"
                     >
                       Return to chat
                     </button>
                   </div>
                 </div>
+              ) : props.loadError != null && currentFileHunks.length === 0 ? (
+                <div
+                  role="alert"
+                  className="text-danger-soft bg-danger-soft/10 border-danger-soft/30 font-monospace m-3 rounded border p-6 text-xs leading-[1.5] break-words whitespace-pre-wrap"
+                >
+                  {props.loadError}
+                </div>
               ) : currentFileHunks.length === 0 ? (
-                <div className="text-muted flex items-center justify-center py-12 text-sm">
+                <div className="text-muted flex items-center justify-center px-4 py-12 text-center text-sm">
                   {activeFilePath ? "No hunks for this file" : "No files to review"}
                 </div>
               ) : (
@@ -2449,7 +2486,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
         )}
 
         {!isReviewComplete && !isTouchExperience && (
-          <aside className="border-border-light bg-dark flex w-[280px] min-w-[280px] flex-col border-l">
+          <aside className="border-border-light bg-dark hidden w-[280px] min-w-[280px] flex-col border-l @2xl/immersive-review-body:flex">
             <div className="border-border-light flex items-center justify-between border-b px-3 py-2">
               <h2
                 className={cn(
@@ -2468,7 +2505,13 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
               {allReviews.length === 0 ? (
                 <div className="text-muted flex h-full flex-col items-center justify-center text-center text-xs">
                   <p>No notes yet</p>
-                  <p className="text-dim mt-1">Press Shift+L to add one</p>
+                  {/* openComposer needs diff lines to anchor a note, so only advertise
+                      the add-note shortcut when pressing it would open the composer. */}
+                  {overlayData.lineHunkIds.length > 0 && (
+                    <p className="text-dim mobile-hide-shortcut-hints mt-1">
+                      Press {formatKeybind(KEYBINDS.REVIEW_COMMENT)} to add one
+                    </p>
+                  )}
                 </div>
               ) : (
                 <div className="space-y-1.5">
@@ -2596,14 +2639,20 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
             <KeycapGroup keys={["Shift", "↑↓"]} label="select" />
             <KeycapGroup keys={["m"]} label="read" />
             <KeycapGroup keys={["u"]} label="undo" />
-            <KeycapGroup keys={["⇧M"]} label="file read" />
-            <KeycapGroup keys={["⇧C"]} label="comment" />
-            <KeycapGroup keys={["⇧L", "⇧D"]} label="like / dislike" />
+            <KeycapGroup keys={[formatKeybind(KEYBINDS.MARK_FILE_READ)]} label="file read" />
+            <KeycapGroup keys={[formatKeybind(KEYBINDS.REVIEW_COMMENT)]} label="comment" />
+            <KeycapGroup
+              keys={[
+                formatKeybind(KEYBINDS.REVIEW_QUICK_LIKE),
+                formatKeybind(KEYBINDS.REVIEW_QUICK_DISLIKE),
+              ]}
+              label="like / dislike"
+            />
             <KeycapGroup keys={["Enter"]} label="submit" />
             <KeycapGroup keys={["Tab"]} label="notes" />
           </div>
         </>
       )}
-    </div>
+    </main>
   );
 };

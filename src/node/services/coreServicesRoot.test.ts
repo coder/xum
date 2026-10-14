@@ -5,6 +5,10 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import type { Context } from "effect";
 import { createConfigStores, type ConfigStores } from "@/node/config";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
+import {
+  agentPluginHookService,
+  type PluginHookSettingsProvider,
+} from "@/node/services/agentPlugins/hookService";
 import * as agentPluginsMcpConfig from "@/node/services/agentPlugins/mcpConfig";
 import type { CoreServices } from "@/node/services/coreServices";
 import { AppFiberScopeTag } from "@/node/services/di/appFiberScope";
@@ -21,6 +25,7 @@ import {
   BackgroundProcessManagerTag,
   ConfigTag,
   ContextManagement,
+  Evaluation,
   ExtensionMetadata,
   FileLeaseManagerTag,
   History,
@@ -66,6 +71,7 @@ const CORE_FIELD_TAGS: Record<keyof CoreServices, Context.Key<CoreTags, unknown>
   workspaceGoalService: WorkspaceGoal,
   idleDispatcher: IdleDispatcherTag,
   aiService: AI,
+  evaluationService: Evaluation,
   streamManager: StreamManagerTag,
   mcpConfigService: MCPConfig,
   mcpServerManager: MCPServerManagerTag,
@@ -290,6 +296,21 @@ describe("createCoreServices", () => {
     expect(root.runtime.get(WorkspaceMcpOverrides)).toBeDefined();
     expect(root.runtime.get(TerminalAttentionStoreTag)).toBeDefined();
     expect(root.memoryMetaService).toBe(root.runtime.get(MemoryMeta));
+  });
+
+  it("gives plugin hooks their MCP servers' settings in the headless roots too", async () => {
+    root = createCoreServices({
+      ...stores,
+      extensionMetadataPath: path.join(tempDir, "extensionMetadata.json"),
+    });
+    const read = spyOn(root.mcpServerManager, "getSettingsForPluginHooks").mockResolvedValue({
+      prefs: { on: true },
+    });
+    const provider = (
+      agentPluginHookService as unknown as { settingsProvider?: PluginHookSettingsProvider }
+    ).settingsProvider;
+    expect(await provider?.("ws-1", "plugin:abc:", 100)).toEqual({ prefs: { on: true } });
+    expect(read).toHaveBeenCalledWith("ws-1", "plugin:abc:", 100);
   });
 
   it("wires the graph like the construction body did (each line has an observable effect)", async () => {

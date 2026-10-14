@@ -1,8 +1,16 @@
-import { useState, useRef, useCallback, useEffect, useMemo } from "react";
+import { useState, useRef, useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
 import { z } from "zod";
 import { useAPI } from "@/browser/contexts/API";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { getWorkspaceNameStateKey } from "@/common/constants/storage";
+import {
+  createSessionValueStore,
+  truncateStringToChars,
+} from "@/browser/utils/boundedPersistedValue";
+import {
+  WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS,
+  WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS,
+  getWorkspaceNameStateKey,
+} from "@/common/constants/storage";
 import type { NameGenerationError } from "@/common/types/errors";
 import {
   validateWorkspaceBranchName,
@@ -95,12 +103,68 @@ const WorkspaceNamePersistedStateSchema = z.object({
 
 export type WorkspaceNamePersistedState = z.infer<typeof WorkspaceNamePersistedStateSchema>;
 
+/** FNV-1a (32-bit). Only detects changes past the stored prefix; not a security hash. */
+function hashMessage(message: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < message.length; index++) {
+    hash ^= message.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16);
+}
+
+/**
+ * lastGeneratedFor only detects whether the message changed, so a long message is stored as a
+ * bounded fingerprint: the full creation message can be many KB, and the persisted state must fit
+ * its localStorage budget. The fingerprint ends with the full message's length and hash, so an
+ * edit past the prefix still counts as a change and regenerates the name.
+ */
+function toStoredMessage(message: string): string {
+  if (JSON.stringify(message).length <= WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS) return message;
+  // The suffix needs no JSON escapes, so the result serializes within the cap (and maps to itself).
+  const suffix = `\u2026#${message.length}:${hashMessage(message)}`;
+  return (
+    truncateStringToChars(message, WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS - suffix.length) + suffix
+  );
+}
+
+/**
+ * Bound the user-input-sized fields of persisted name state so it fits its key budget; also
+ * shrinks state that older builds stored unbounded. Returns null when `state` is not name state.
+ */
+export function boundWorkspaceNamePersistedState(
+  state: unknown
+): WorkspaceNamePersistedState | null {
+  const parsed = WorkspaceNamePersistedStateSchema.safeParse(state);
+  if (!parsed.success) return null;
+  return {
+    ...parsed.data,
+    manualName: truncateStringToChars(
+      parsed.data.manualName,
+      WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS
+    ),
+    lastGeneratedFor: toStoredMessage(parsed.data.lastGeneratedFor),
+  };
+}
+
+// Full manual names whose persisted copy is a bounded prefix (see setNameManual), so they stay
+// visible for the rest of the session, also after the creation controls remount.
+const sessionManualNames = createSessionValueStore<{ name: string; persisted: string }>();
+
 const DEFAULT_PERSISTED_STATE: WorkspaceNamePersistedState = {
   generatedIdentity: null,
   manualName: "",
   autoGenerate: true,
   lastGeneratedFor: "",
 };
+
+/** The workspace name the creation form shows for persisted name state ("" when none). */
+export function getNameFromPersistedState(state: unknown): string {
+  const parsed = WorkspaceNamePersistedStateSchema.partial().safeParse(state);
+  if (!parsed.success) return "";
+  const { autoGenerate, generatedIdentity, manualName } = parsed.data;
+  return autoGenerate !== false ? (generatedIdentity?.name ?? "") : (manualName ?? "");
+}
 
 /**
  * Extract the display title from persisted workspace name state.
@@ -161,6 +225,13 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
 
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState<WorkspaceNameUIError | null>(null);
+  // Only a bounded prefix of a very long typed name persists; the full name stays visible while the
+  // stored value is still that prefix (another tab's edit wins).
+  const sessionManualName = useSyncExternalStore(sessionManualNames.subscribe, () =>
+    sessionManualNames.get(persistedKey)
+  );
+  const displayedManualName =
+    sessionManualName?.persisted === manualName ? sessionManualName.name : manualName;
 
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Message pending in debounce timer (captured at schedule time)
@@ -175,7 +246,11 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
   } | null>(null);
 
   // Name shown in CreationControls UI: generated name when auto, manual when not
-  const name = autoGenerate ? (generatedIdentity?.name ?? "") : manualName;
+  const name = autoGenerate ? (generatedIdentity?.name ?? "") : displayedManualName;
+  // Derived rather than set on keystrokes so a restored invalid name (e.g. a bounded prefix after a
+  // restart) is flagged right away instead of failing only on submit.
+  const manualNameValidationError =
+    !autoGenerate && name.trim() ? validateWorkspaceBranchName(name).error : undefined;
   // Title is only shown when auto-generation is enabled (manual mode doesn't have generated title)
   const title = autoGenerate ? (generatedIdentity?.title ?? null) : null;
 
@@ -220,6 +295,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
         resolvePromise = resolve;
       });
       // TypeScript doesn't understand the Promise executor runs synchronously
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const safeResolve = resolvePromise!;
       generationPromiseRef.current = { promise, resolve: safeResolve, requestId };
 
@@ -246,7 +322,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
           setStored((prev) => ({
             ...prev,
             generatedIdentity: identity,
-            lastGeneratedFor: forMessage,
+            lastGeneratedFor: toStoredMessage(forMessage),
           }));
 
           safeResolve(identity);
@@ -257,7 +333,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
         setStored((prev) => ({
           ...prev,
           generatedIdentity: fallbackIdentity,
-          lastGeneratedFor: forMessage,
+          lastGeneratedFor: toStoredMessage(forMessage),
         }));
         setError(null);
         safeResolve(fallbackIdentity);
@@ -270,7 +346,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
         setStored((prev) => ({
           ...prev,
           generatedIdentity: fallbackIdentity,
-          lastGeneratedFor: forMessage,
+          lastGeneratedFor: toStoredMessage(forMessage),
         }));
         setError(null);
         safeResolve(fallbackIdentity);
@@ -291,7 +367,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     // - Auto-generation is disabled
     // - Message is empty
     // - Already generated for this message
-    if (!autoGenerate || !message.trim() || lastGeneratedFor === message) {
+    if (!autoGenerate || !message.trim() || lastGeneratedFor === toStoredMessage(message)) {
       // Clear any pending timer since conditions changed
       if (debounceTimerRef.current) {
         clearTimeout(debounceTimerRef.current);
@@ -353,30 +429,29 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
 
   const setNameManual = useCallback(
     (newName: string) => {
-      setStored((prev) => ({ ...prev, manualName: newName }));
-      // Validate in real-time as user types (skip empty - will show on submit)
-      if (newName.trim()) {
-        const validation = validateWorkspaceBranchName(newName);
-        setError(validation.error ? { kind: "validation", message: validation.error } : null);
-      } else {
-        setError(null);
-      }
+      const persisted = truncateStringToChars(newName, WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS);
+      sessionManualNames.set(
+        persistedKey,
+        persisted === newName ? undefined : { name: newName, persisted }
+      );
+      setStored((prev) => ({ ...prev, manualName: persisted }));
+      setError(null);
     },
-    [setStored]
+    [setStored, persistedKey]
   );
 
   const waitForGeneration = useCallback(async (): Promise<WorkspaceIdentity | null> => {
     // If auto-generate is off, user has provided a manual name
     // Use that name directly with a generated title from the message
     if (!autoGenerate) {
-      if (!manualName.trim()) {
+      if (!name.trim()) {
         setError({ kind: "validation", message: "Please enter a workspace name" });
         return null;
       }
       // Manual name provided — skip LLM call entirely.
       // The manual name doubles as the display title; users who type a custom
       // name expect to see exactly that in the sidebar.
-      return { name: manualName.trim(), title: manualName.trim() };
+      return { name: name.trim(), title: name.trim() };
     }
 
     // Always wait for generation to complete on the full message.
@@ -401,7 +476,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     }
 
     // If we have an identity that was generated for the current message, use it
-    if (generatedIdentity && lastGeneratedFor === message) {
+    if (generatedIdentity && lastGeneratedFor === toStoredMessage(message)) {
       return generatedIdentity;
     }
 
@@ -411,7 +486,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     }
 
     return null;
-  }, [autoGenerate, manualName, generatedIdentity, lastGeneratedFor, message, generateIdentity]);
+  }, [autoGenerate, name, generatedIdentity, lastGeneratedFor, message, generateIdentity]);
 
   return useMemo(
     () => ({
@@ -419,7 +494,9 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
       title,
       isGenerating,
       autoGenerate,
-      error,
+      error: manualNameValidationError
+        ? { kind: "validation", message: manualNameValidationError }
+        : error,
       setAutoGenerate: handleSetAutoGenerate,
       setName: setNameManual,
       waitForGeneration,
@@ -430,6 +507,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
       isGenerating,
       autoGenerate,
       error,
+      manualNameValidationError,
       handleSetAutoGenerate,
       setNameManual,
       waitForGeneration,

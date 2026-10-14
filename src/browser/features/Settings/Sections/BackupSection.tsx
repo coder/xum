@@ -5,6 +5,7 @@ import { Checkbox } from "@/browser/components/Checkbox/Checkbox";
 import { ConfirmationModal } from "@/browser/components/ConfirmationModal/ConfirmationModal";
 import { Input } from "@/browser/components/Input/Input";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
+import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import {
   formatKeybind,
   isDialogOpen,
@@ -22,6 +23,7 @@ import {
   type BackupContentFlag,
   type BackupContents,
 } from "@/common/config/schemas/settingsBackup";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { BACKUP_CREDENTIAL_LABELS } from "@/constants/backup";
 
 type BackupRoute = keyof APIClient["backup"];
@@ -122,7 +124,26 @@ const BACKUP_CONTENT_OPTIONS: readonly BackupContentOption[] = [
       "Adds your project list and per-project memories to the backup, and lets a restore reimport them on another machine.",
     shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_PROJECTS,
   },
+  {
+    // Project shelves travel with the project bundle above; this covers only the global shelf.
+    flag: "includeGlobalArtifacts",
+    label: "Pinned global artifacts",
+    description:
+      "Artifacts are not settings. Include pinned global artifacts in the backup? Project shelves travel with the project bundle. Files over 8 MiB are skipped and listed.",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_GLOBAL_ARTIFACTS,
+  },
 ];
+
+/**
+ * The projects row's copy while the Artifacts experiment is on: project shelves travel with the
+ * project bundle (adapters.ts), so the row says so and turning it on is informed consent to
+ * back up pinned project artifacts too.
+ */
+const PROJECTS_WITH_ARTIFACTS_COPY = {
+  label: "Project list, project memories & pinned project artifacts",
+  description:
+    "Adds your project list, per-project memories and each project's pinned artifacts to the backup, and lets a restore reimport them on another machine.",
+} as const;
 
 type BackupDraft = SettingsBackupInput & BackupContents;
 
@@ -149,6 +170,14 @@ function draftsEqual(left: BackupDraft, right: BackupDraft): boolean {
     left.path === right.path &&
     BACKUP_CONTENT_FLAGS.every((flag) => left[flag] === right[flag])
   );
+}
+
+/** The save error for the first required field the draft leaves blank, or null. */
+function getMissingFieldError(draft: BackupDraft): string | null {
+  if (draft.repoUrl.trim() === "") return "Repository URL is required.";
+  if (draft.branch.trim() === "") return "Branch is required.";
+  if (draft.path.trim() === "") return "Subdirectory is required.";
+  return null;
 }
 
 function getOperationErrorMessage(error: BackupOperationError): string {
@@ -236,8 +265,32 @@ function ChangeList(props: {
   );
 }
 
+// Inside the Settings dialog isDialogOpen() is always true, so ownership is scoped to focus: act
+// only while focus is in the dialog hosting this section, never in a nested dialog or popover.
+// A nested dialog without a trigger drops focus to the body when it closes; the section owns the
+// keys again once its host is the topmost (last portaled) dialog.
+function ownsBackupShortcuts(root: HTMLElement | null, target: EventTarget | null): boolean {
+  const hostDialog = root?.closest('[role="dialog"]');
+  if (!hostDialog) return !isDialogOpen();
+  if (target === document.body) {
+    const dialogs = document.querySelectorAll('[role="dialog"]');
+    return dialogs[dialogs.length - 1] === hostDialog;
+  }
+  return target instanceof Element && target.closest('[role="dialog"]') === hostDialog;
+}
+
 export function BackupSection() {
   const { api } = useAPI();
+  // The global artifact shelf only exists with the Artifacts experiment: without it the row is
+  // hidden and its shortcut does nothing.
+  const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  const contentOptions = artifactsEnabled
+    ? BACKUP_CONTENT_OPTIONS.map((option) =>
+        option.flag === "includeProjects" ? { ...option, ...PROJECTS_WITH_ARTIFACTS_COPY } : option
+      )
+    : BACKUP_CONTENT_OPTIONS.filter((option) => option.flag !== "includeGlobalArtifacts");
+  const contentOptionsRef = useRef(contentOptions);
+  contentOptionsRef.current = contentOptions;
   const [draft, setDraft] = useState<BackupDraft>(DEFAULT_DRAFT);
   const [savedDraft, setSavedDraft] = useState<BackupDraft>(DEFAULT_DRAFT);
   const [loading, setLoading] = useState(true);
@@ -261,18 +314,31 @@ export function BackupSection() {
   >({});
   const [projectImportResults, setProjectImportResults] = useState<BackupProjectImportResult[]>([]);
   const [projectBundleSkipped, setProjectBundleSkipped] = useState(false);
+  // Pinned artifacts the last preview, push, or restore left out, each with its reason.
+  const [shelfSkipped, setShelfSkipped] = useState<string[]>([]);
   const [restoreConfirmationOpen, setRestoreConfirmationOpen] = useState(false);
   const refreshGenerationRef = useRef(0);
   const draftRef = useRef(draft);
   const savedDraftRef = useRef(savedDraft);
+  const settingsLoadedRef = useRef(false);
   const refreshRef = useRef<((options?: { markFresh?: boolean }) => Promise<void>) | null>(null);
   draftRef.current = draft;
   savedDraftRef.current = savedDraft;
 
   const isDirty = !draftsEqual(draft, savedDraft);
+  // What the repository operations act on. With the Artifacts experiment off the global shelf
+  // is left out even when the saved setting includes it: the row is hidden, so the user could
+  // not see or change it. The saved setting itself is kept for when the experiment returns.
+  const requestDraft: BackupDraft = artifactsEnabled
+    ? savedDraft
+    : { ...savedDraft, includeGlobalArtifacts: false };
   const configured = settingsFresh && savedDraft.repoUrl.trim() !== "";
   const saving = activeAction === "save";
   const busy = activeAction !== null;
+  // A settings read is pending (a reconnect keeps the form on screen while it reloads). Save
+  // waits for it: the draft's untouched fields would overwrite changes made on the server.
+  const [reading, setReading] = useState(false);
+  const saveBlocked = busy || reading;
 
   useEffect(() => {
     if (!api) {
@@ -288,13 +354,16 @@ export function BackupSection() {
     // Liveness belongs to this API subscription. An older effect can finish after its
     // replacement starts, so sharing this flag across generations creates stale writes.
     let streamLive = false;
-    setLoading(true);
+    // Only the first load hides the form: a new client (reconnect) reloads behind the shown
+    // settings. Destructive actions still wait until the reload is fresh.
+    if (!settingsLoadedRef.current) setLoading(true);
     setSettingsFresh(false);
     setSaveError(null);
 
     const refresh = async (options?: { markFresh?: boolean }) => {
       const version = (refreshGenerationRef.current += 1);
       setSettingsFresh(false);
+      setReading(true);
 
       try {
         const settings = await api.backup.getSettings();
@@ -307,6 +376,7 @@ export function BackupSection() {
           setDraft(nextDraft);
         }
         savedDraftRef.current = nextDraft;
+        settingsLoadedRef.current = true;
         setSavedDraft(nextDraft);
         if (options?.markFresh !== false && streamLive) setSettingsFresh(true);
         setSaveError(null);
@@ -322,6 +392,7 @@ export function BackupSection() {
           setProjectImports([]);
           setProjectImportSelections({});
           setProjectBundleSkipped(false);
+          setShelfSkipped([]);
           setRestoreConfirmationOpen(false);
           setActionError(null);
           setStatusMessage(null);
@@ -333,6 +404,7 @@ export function BackupSection() {
       } finally {
         if (!signal.aborted && version === refreshGenerationRef.current) {
           setLoading(false);
+          setReading(false);
         }
       }
     };
@@ -390,17 +462,10 @@ export function BackupSection() {
   }, [api]);
 
   async function handleSave() {
-    if (!api || activeAction !== null) return;
-    if (draft.repoUrl.trim() === "") {
-      setSaveError("Repository URL is required.");
-      return;
-    }
-    if (draft.branch.trim() === "") {
-      setSaveError("Branch is required.");
-      return;
-    }
-    if (draft.path.trim() === "") {
-      setSaveError("Subdirectory is required.");
+    if (!api || saveBlocked) return;
+    const missingField = getMissingFieldError(draft);
+    if (missingField != null) {
+      setSaveError(missingField);
       return;
     }
 
@@ -438,6 +503,7 @@ export function BackupSection() {
       setProjectImports([]);
       setProjectImportSelections({});
       setProjectBundleSkipped(false);
+      setShelfSkipped([]);
       setOverrideSecretScan(false);
       setSecretScanBlocked(false);
       setStatusMessage("Backup settings saved.");
@@ -475,7 +541,7 @@ export function BackupSection() {
     setValidation(null);
 
     try {
-      const result = await api.backup.validate(savedDraft);
+      const result = await api.backup.validate(requestDraft);
       if (!result.success) {
         setActionError(getOperationErrorMessage(result.error));
         return;
@@ -505,9 +571,10 @@ export function BackupSection() {
     // change.
     setProjectImports([]);
     setProjectBundleSkipped(false);
+    setShelfSkipped([]);
 
     try {
-      const result = await api.backup.preview(savedDraft);
+      const result = await api.backup.preview(requestDraft);
       if (!result.success) {
         setActionError(getOperationErrorMessage(result.error));
         return;
@@ -537,6 +604,7 @@ export function BackupSection() {
         return next;
       });
       setProjectBundleSkipped(result.data.projectBundleSkipped);
+      setShelfSkipped(result.data.shelfSkipped ?? []);
       setStatusMessage("Preview refreshed.");
     } catch (error) {
       setActionError(getErrorMessage(error));
@@ -553,7 +621,7 @@ export function BackupSection() {
 
     try {
       const result = await api.backup.push({
-        ...savedDraft,
+        ...requestDraft,
         // The digest from the block the user is looking at, so approval cannot carry over to
         // a payload another window changed in between. Sent only while the control is visible.
         approvedSecretDigest:
@@ -579,6 +647,7 @@ export function BackupSection() {
       setProjectImports([]);
       setProjectImportSelections({});
       setProjectBundleSkipped(false);
+      setShelfSkipped(result.data.shelfSkipped ?? []);
       setStatusMessage(
         `Backed up settings at ${result.data.commit} using ${BACKUP_CREDENTIAL_LABELS[result.data.credential]}.`
       );
@@ -597,7 +666,7 @@ export function BackupSection() {
 
     try {
       const result = await api.backup.restore({
-        ...savedDraft,
+        ...requestDraft,
         approvedCommandTokens: approveCommands ? commandApprovals.map((item) => item.token) : [],
         // Only candidates the user explicitly checked; the backend re-verifies each token
         // against the checked-out payload and validates the target path.
@@ -655,6 +724,7 @@ export function BackupSection() {
         mergeImportResults(previous, result.data.projectImportResults)
       );
       setProjectBundleSkipped(result.data.projectBundleSkipped);
+      setShelfSkipped(result.data.shelfSkipped ?? []);
       setStatusMessage(
         `Restored ${describeRestoredFiles(result.data.changedFiles.length)}. Safety snapshot: ${result.data.snapshotPath}${
           unapproved.length === 0
@@ -696,6 +766,7 @@ export function BackupSection() {
       }
     },
   };
+  const rootRef = useRef<HTMLDivElement>(null);
   const toggleContentRef = useRef<(option: BackupContentOption) => void>(() => undefined);
   toggleContentRef.current = (option) => {
     if (busy) return;
@@ -708,11 +779,12 @@ export function BackupSection() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (isDialogOpen() || isEditableElement(event.target)) return;
+      if (!ownsBackupShortcuts(rootRef.current, event.target)) return;
+      if (isEditableElement(event.target)) return;
 
       const shortcut = BACKUP_SHORTCUTS.find(([, keybind]) => matchesKeybind(event, keybind));
       const action = shortcut && actionsRef.current?.[shortcut[0]];
-      const option = BACKUP_CONTENT_OPTIONS.find((candidate) =>
+      const option = contentOptionsRef.current.find((candidate) =>
         matchesKeybind(event, candidate.shortcut)
       );
       if (!action && !option) return;
@@ -732,7 +804,7 @@ export function BackupSection() {
   }
 
   return (
-    <div className="space-y-6">
+    <div ref={rootRef} className="space-y-6">
       <div className="bg-warning/10 border-warning/30 text-warning flex items-start gap-2 rounded-md border px-3 py-2 text-xs">
         <TriangleAlert aria-hidden="true" className="mt-0.5 h-3.5 w-3.5 shrink-0" />
         <p>
@@ -790,7 +862,7 @@ export function BackupSection() {
           <legend className="text-foreground text-xs font-medium">
             What to back up and restore
           </legend>
-          {BACKUP_CONTENT_OPTIONS.map((option) => {
+          {contentOptions.map((option) => {
             const parentOff = option.parent !== undefined && !draft[option.parent];
             return (
               <label
@@ -832,7 +904,7 @@ export function BackupSection() {
           <Button
             size="sm"
             onClick={() => void handleSave()}
-            disabled={busy || !isDirty}
+            disabled={saveBlocked || !isDirty}
             tooltip={`Save settings (${formatKeybind(KEYBINDS.SETTINGS_BACKUP_SAVE)})`}
             className="w-full sm:w-auto"
           >
@@ -1040,6 +1112,17 @@ export function BackupSection() {
         <div className="border-border-light text-muted rounded-md border p-3 text-xs">
           This backup carries a project bundle, but project backup is disabled here, so it was
           skipped. Enable “Include project list &amp; project memories” and save to restore it.
+        </div>
+      ) : null}
+
+      {shelfSkipped.length > 0 ? (
+        <div className="border-border-light text-muted rounded-md border p-3 text-xs">
+          Some pinned artifacts were left out:
+          <ul className="mt-1 list-disc pl-4">
+            {shelfSkipped.map((notice) => (
+              <li key={notice}>{notice}</li>
+            ))}
+          </ul>
         </div>
       ) : null}
 

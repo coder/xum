@@ -7,6 +7,7 @@ import {
   resolveInlineSkillReferences,
   type InlineSkillCandidate,
 } from "./inlineSkillReferences";
+import { createTestApiClient } from "@/browser/testUtils";
 
 type AgentSkillsGetInput = Parameters<APIClient["agentSkills"]["get"]>[0];
 type AgentSkillsGetOutput = Awaited<ReturnType<APIClient["agentSkills"]["get"]>>;
@@ -35,7 +36,7 @@ function skillPackage(
 }
 
 function apiClient(get: APIClient["agentSkills"]["get"]): APIClient {
-  return { agentSkills: { get } } as unknown as APIClient;
+  return createTestApiClient({ agentSkills: { get } });
 }
 
 describe("extractInlineSkillReferenceCandidates", () => {

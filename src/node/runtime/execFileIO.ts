@@ -7,20 +7,139 @@
  */
 
 import type { ExecStream, FileStat } from "./Runtime";
-import { RuntimeError } from "./Runtime";
+import { RuntimeError, isRuntimeRetryableTransportError } from "./Runtime";
 import { getErrorMessage } from "@/common/utils/errors";
+import { READ_RETRY_TIMEOUT_SECS } from "@/constants/runtimeReads";
+import { log } from "@/node/services/log";
 import { streamToString } from "./streamUtils";
 
 /** Starts the exec for one file operation; must honor the given signal. */
 type StartExec = (abortSignal: AbortSignal) => Promise<ExecStream>;
 
 /**
+ * Starts one attempt of an idempotent read (`attempt` 0, then 1 for the single
+ * retry). Pass `readAttemptTimeoutSecs(attempt, …)` as the exec timeout, and
+ * read only a regular file on the retry (`buildRegularFileReadCommand`): the
+ * failed attempt may already have consumed a FIFO's or device's data, so
+ * re-reading one is not replay-safe.
+ */
+type StartReadExec = (abortSignal: AbortSignal, attempt: number) => Promise<ExecStream>;
+
+/** Exec timeout for a read attempt: the caller's own on the first, the short bound on the retry. */
+export function readAttemptTimeoutSecs(attempt: number, firstAttemptSecs: number): number {
+  return attempt === 0 ? firstAttemptSecs : Math.min(firstAttemptSecs, READ_RETRY_TIMEOUT_SECS);
+}
+
+/**
+ * Whether a failed read attempt gets its one retry: only a transport failure
+ * (one blip: connection reset, channel refused under MaxSessions, a pool
+ * refusal) and only when the caller has not aborted — an abort can surface as
+ * a transport error too. Permission errors, missing files and permanent SSH
+ * failures (rejected credentials, host key; #5034) never retry.
+ */
+function shouldRetryRead(error: unknown, abortSignal: AbortSignal | undefined): boolean {
+  return abortSignal?.aborted !== true && isRuntimeRetryableTransportError(error);
+}
+
+/**
+ * Runs the one retry. When it fails too, the FIRST failure is what callers
+ * see, so a retry never turns a retryable transport error into something
+ * else (for example "not a regular file" for a FIFO, which the retry refuses
+ * to re-read): the result is never worse than without the retry.
+ */
+async function retryOrRethrow<T>(
+  firstError: unknown,
+  what: string,
+  retry: () => Promise<T>
+): Promise<T> {
+  log.debug(`Retrying ${what} after a transport failure`, firstError);
+  try {
+    return await retry();
+  } catch (retryError) {
+    log.debug(`Retry of ${what} failed too`, retryError);
+    throw firstError;
+  }
+}
+
+/**
+ * Whether a non-zero exit is the transport's own failure (e.g. OpenSSH exit
+ * 255) rather than the command's. Such failures become RuntimeError
+ * "network" so callers never read an unreachable host as a missing file.
+ */
+export type ClassifyTransportExit = (exitCode: number, stderr: string) => boolean;
+
+/**
+ * A failed exec-backed read or stat: transport first (host unreachable), then
+ * positively identified absence, then everything else (permission denied, I/O
+ * errors), which callers must not read as a missing file (#4827).
+ *
+ * Absence needs the tool's OWN diagnostic line (`cat: …`/`stat: …`, pinned to
+ * English by LC_ALL=C): OpenSSH can print `Warning: Identity file … not
+ * accessible: No such file or directory` on a connection that still works, so
+ * a bare substring match would turn a permission error into "missing".
+ */
+function nonZeroExitError(
+  message: string,
+  exitCode: number,
+  stderr: string,
+  classifyExit: ClassifyTransportExit | undefined
+): RuntimeError {
+  if (classifyExit?.(exitCode, stderr) === true) {
+    return new RuntimeError(message, "network");
+  }
+  const absence = /^(?:cat|stat): [^\n]*(No such file or directory|Not a directory)$/m.exec(stderr);
+  if (absence == null) {
+    return new RuntimeError(message, "file_io");
+  }
+  const code = absence[1] === "Not a directory" ? "ENOTDIR" : "ENOENT";
+  return new RuntimeError(message, "file_io", Object.assign(new Error(absence[0]), { code }));
+}
+
+/** `cat` with its diagnostics pinned to English, so absence stays recognizable. */
+export const CAT_VIA_EXEC_COMMAND = "LC_ALL=C cat";
+
+/**
+ * Shell command for ReadFileOptions.requireRegularFile on exec-backed runtimes.
+ * `quotedPath` must already be shell-safe (quoteForRemote / an env-var reference).
+ *
+ * Acquire the descriptor first (`exec 3<`), classify THAT descriptor via
+ * `/dev/fd/3`, then stream from the same descriptor (`cat <&3`) — so the type
+ * check applies to the inode actually read, never to a stat→open pre-check.
+ * Exit codes: 65 open failed, 66 not a regular file, 67 `/dev/fd` missing
+ * (fail closed rather than silently dropping the guarantee). stderr text
+ * reaches callers through readFileViaExec's RuntimeError message.
+ *
+ * Acquisition is NOT nonblocking here (unlike the local runtimes' O_NONBLOCK
+ * open): the leading `[ -e ] && ! [ -f ]` precheck is advisory. It fails fast
+ * on a FIFO already sitting at the path, but a path replaced by a writer-less
+ * FIFO between the precheck and `exec 3<` still blocks acquisition in the
+ * exec's shell (not a libuv worker), as the plain `cat` blocks on any FIFO.
+ * Ending that shell is the transport's job: abort, stream cancel and the exec
+ * timeout end it when the signal reaches the shell; when it reaches only a
+ * client (an ssh/docker exec CLI that does not forward signals), only
+ * RemoteRuntime's remote `timeout -s KILL` wrapper does. DevcontainerRuntime's
+ * exec has no such wrapper. See execFileIO.regularFile.test.ts. The fd-based
+ * check guarantees the file type after acquisition, not a nonblocking one.
+ * Requires POSIX sh + procfs/devfs `/dev/fd` (Linux, macOS) — the same
+ * assumptions as the plain `cat` command.
+ */
+export function buildRegularFileReadCommand(quotedPath: string): string {
+  return [
+    `if [ -e ${quotedPath} ] && ! [ -f ${quotedPath} ]; then echo 'not a regular file' >&2; exit 66; fi`,
+    `exec 3<${quotedPath} || { echo 'open failed' >&2; exit 65; }`,
+    `if [ -e /dev/fd/3 ]; then [ -f /dev/fd/3 ] || { echo 'not a regular file' >&2; exit 66; }; else echo 'cannot verify regular file' >&2; exit 67; fi`,
+    `cat <&3`,
+  ].join("; ");
+}
+
+/**
  * Read file contents as a stream via exec.
  */
 export function readFileViaExec(
   filePath: string,
-  startExec: StartExec,
-  abortSignal?: AbortSignal
+  startExec: StartReadExec,
+  abortSignal?: AbortSignal,
+  classifyExit?: ClassifyTransportExit
 ): ReadableStream<Uint8Array> {
   // Internal controller so CANCELLING the returned stream kills the remote
   // cat: the eager pump below has no other path to the exec, and without
@@ -44,21 +163,38 @@ export function readFileViaExec(
       cleanupAbortForwarder();
     },
     start: async (controller: ReadableStreamDefaultController<Uint8Array>) => {
-      try {
-        const stream = await startExec(readAbort.signal);
+      // A retry is only safe before the consumer has seen any bytes: a second
+      // cat would repeat them.
+      let delivered = false;
+      const readOnce = async (attempt: number) => {
+        const stream = await startExec(readAbort.signal, attempt);
         const reader = stream.stdout.getReader();
         const exitCodePromise = stream.exitCode;
 
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
+          delivered = true;
           controller.enqueue(value);
         }
 
         const code = await exitCodePromise;
         if (code !== 0) {
           const stderr = await streamToString(stream.stderr);
-          throw new RuntimeError(`Failed to read file ${filePath}: ${stderr}`, "file_io");
+          throw nonZeroExitError(
+            `Failed to read file ${filePath}: ${stderr}`,
+            code,
+            stderr,
+            classifyExit
+          );
+        }
+      };
+      try {
+        try {
+          await readOnce(0);
+        } catch (err) {
+          if (delivered || !shouldRetryRead(err, readAbort.signal)) throw err;
+          await retryOrRethrow(err, `read of ${filePath}`, () => readOnce(1));
         }
 
         controller.close();
@@ -187,9 +323,25 @@ export const STAT_VIA_EXEC_COMMAND = "LC_ALL=C stat -L -c '%s %Y %F'";
  */
 export async function statViaExec(
   filePath: string,
-  startExec: () => Promise<ExecStream>
+  startExec: (attempt: number) => Promise<ExecStream>,
+  classifyExit?: ClassifyTransportExit,
+  abortSignal?: AbortSignal
 ): Promise<FileStat> {
-  const stream = await startExec();
+  try {
+    return await statOnce(filePath, await startExec(0), classifyExit);
+  } catch (err) {
+    if (!shouldRetryRead(err, abortSignal)) throw err;
+    return retryOrRethrow(err, `stat of ${filePath}`, async () =>
+      statOnce(filePath, await startExec(1), classifyExit)
+    );
+  }
+}
+
+async function statOnce(
+  filePath: string,
+  stream: ExecStream,
+  classifyExit: ClassifyTransportExit | undefined
+): Promise<FileStat> {
   const [stdout, stderr, exitCode] = await Promise.all([
     streamToString(stream.stdout),
     streamToString(stream.stderr),
@@ -197,7 +349,7 @@ export async function statViaExec(
   ]);
 
   if (exitCode !== 0) {
-    throw new RuntimeError(`Failed to stat ${filePath}: ${stderr}`, "file_io");
+    throw nonZeroExitError(`Failed to stat ${filePath}: ${stderr}`, exitCode, stderr, classifyExit);
   }
 
   const parts = stdout.trim().split(" ");

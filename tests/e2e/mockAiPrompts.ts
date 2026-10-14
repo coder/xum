@@ -39,3 +39,6 @@ export const MOCK_SLASH_COMMAND_PROMPTS = {
 } as const;
 
 export const MOCK_COMPACTION_SUMMARY_PREFIX = "Mock compaction summary:";
+
+/** Streams for ~18 s so perf scenarios can switch between chats that stay mid-stream. */
+export const MOCK_LONG_STREAM_PROMPT = "[mock:long-stream] Keep streaming for a while";

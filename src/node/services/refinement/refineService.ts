@@ -1,3 +1,4 @@
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import * as path from "path";
 /**
  * /refine orchestration (RLM track, phase r11): user-invokable trajectory
@@ -7,9 +8,8 @@ import * as path from "path";
  * (backend refuses when off), one-run-at-a-time-per-workspace locking
  * (concurrent invocations are REJECTED, not queued — an explicit /refine has
  * nothing to gain from running twice over the same trajectory), trajectory
- * assembly (recent chat.jsonl + timeline events when the Timeline experiment
- * is on), model resolution, journal-row correlation, and the completion chat
- * message.
+ * assembly (recent chat.jsonl + timeline events), model resolution,
+ * journal-row correlation, and the completion chat message.
  *
  * v1 tradeoff (intentional, no proposal/approval UI): edits are auto-applied
  * and the summary row points at the r6 rollback paths ("bun run debug
@@ -25,7 +25,7 @@ import { createHash } from "node:crypto";
 import * as os from "node:os";
 import type { LanguageModel, Tool } from "ai";
 
-import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import type { ExperimentId } from "@/common/constants/experiments";
 import type { RefineAppliedEditPayload, RefineRecordPayload } from "@/common/orpc/schemas/api";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import {
@@ -48,11 +48,7 @@ import {
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { Config } from "@/node/config";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import {
-  buildAbandonedBranchTranscript,
-  isRlmModeEnabled,
-  type RlmExperimentFlags,
-} from "@/node/services/branchSummary";
+import { buildAbandonedBranchTranscript, isRlmModeEnabled } from "@/node/services/branchSummary";
 import {
   findLatestContextBoundaryIndex,
   isDurableContextResetBoundaryMarker,
@@ -335,21 +331,12 @@ export class RefineService {
     private readonly options: RefineServiceOptions = {}
   ) {}
 
-  private enabled(experiments?: RlmExperimentFlags): boolean {
-    // RLM is a sub-experiment of Programmatic Tool Calling; both machine
-    // overrides must be on. Explicit renderer flags ride the request with the
-    // same authority as send options.experiments (r32): persisting overrides
-    // to the backend is asynchronous/best-effort, so a backend-only predicate
-    // could refuse /refine while the same workspace is already running with
-    // the RLM kernel the renderer sees.
-    return isRlmModeEnabled(experiments, (id) => this.experiments.isExperimentEnabled(id));
+  private enabled(): boolean {
+    return isRlmModeEnabled((id) => this.experiments.isExperimentEnabled(id));
   }
 
-  async run(
-    workspaceId: string,
-    experiments?: RlmExperimentFlags
-  ): Promise<Result<RefineRecord, string>> {
-    if (!this.enabled(experiments)) {
+  async run(workspaceId: string): Promise<Result<RefineRecord, string>> {
+    if (!this.enabled()) {
       return Err("rlm-mode experiment is disabled (enable Programmatic Tool Calling + RLM Mode)");
     }
     if (this.inFlight.has(workspaceId)) {
@@ -409,10 +396,9 @@ export class RefineService {
      * that only its own renderer displayed, so binding approval to the
      * newest transcript row would apply edits this user never audited.
      */
-    approvedProposalHash: string,
-    experiments?: RlmExperimentFlags
+    approvedProposalHash: string
   ): Promise<Result<RefineRecord, string>> {
-    if (!this.enabled(experiments)) {
+    if (!this.enabled()) {
       return Err("rlm-mode experiment is disabled (enable Programmatic Tool Calling + RLM Mode)");
     }
     if (this.inFlight.has(workspaceId)) {
@@ -586,9 +572,8 @@ export class RefineService {
     const turnExclusionResult = this.acquireTurnExclusionIfWired(workspaceId);
     if (!turnExclusionResult.success) {
       return Err(
-        `a turn is active in this workspace (${turnExclusionResult.error}); refinements cannot ` +
-          `be applied into a running conversation — run /refine apply again once the workspace ` +
-          `is idle (nothing was applied)`
+        `refinements cannot be applied now (${turnExclusionResult.error}) — run /refine apply ` +
+          `again once the workspace is idle (nothing was applied)`
       );
     }
     using _turnExclusion = turnExclusionResult.data;
@@ -948,7 +933,10 @@ export class RefineService {
     // thinking-stripped, char-bounded — exactly the evidence shape a
     // distillation pass needs. The tail cap preserves the prior bound on
     // transcript size.
-    const transcript = buildAbandonedBranchTranscript(activeSegment.slice(-REFINE_MAX_MESSAGES));
+    // Keep the raw fingerprints above, but do not spend the model's row budget on hidden state.
+    const transcript = buildAbandonedBranchTranscript(
+      activeSegment.filter((message) => !isModelHiddenMessage(message)).slice(-REFINE_MAX_MESSAGES)
+    );
     if (transcript.length === 0) {
       // Empty trajectory: a clean first-class no-op without spending a model call.
       return Ok({ applied: [], summary: "Nothing worth distilling.", noOp: true });
@@ -1140,9 +1128,8 @@ export class RefineService {
       const turnExclusionResult = this.acquireTurnExclusionIfWired(workspaceId);
       if (!turnExclusionResult.success) {
         return Err(
-          `a turn is active in this workspace (${turnExclusionResult.error}); the distilled ` +
-            `proposal cannot be published into a running conversation — run /refine again once ` +
-            `the workspace is idle`
+          `the distilled proposal cannot be published now (${turnExclusionResult.error}) — run ` +
+            `/refine again once the workspace is idle`
         );
       }
       using _turnExclusion = turnExclusionResult.data;
@@ -1498,12 +1485,11 @@ export class RefineService {
     }
   }
 
-  /** Timeline digest when the Timeline experiment is on; undefined otherwise. */
+  /** Timeline digest when a timeline service is wired; undefined otherwise. */
   private async buildTimelineText(
     workspaceId: string,
     sinceTs?: number
   ): Promise<string | undefined> {
-    if (!this.experiments.isExperimentEnabled(EXPERIMENT_IDS.TIMELINE)) return undefined;
     if (this.options.timelineService === undefined) return undefined;
     try {
       const page = await this.options.timelineService.list(workspaceId, {

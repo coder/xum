@@ -5,11 +5,11 @@
  * Pixel snapshots both light and dark themes at the phone viewport.
  */
 
-import { userEvent, within, waitFor } from "@storybook/test";
+import { wrapAsyncIterator } from "@orpc/shared";
+import { expect, fn, userEvent, within, waitFor } from "@storybook/test";
 import type { ComponentType } from "react";
 
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 import type { TimelineEvent } from "@/common/orpc/schemas/timeline";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
@@ -229,7 +229,8 @@ export const IPhone16ePRLinkPlacement: AppStory = {
   },
 };
 
-export const IPhone16eAnalyticsSidebarControl: AppStory = {
+// Analytics opens as a full-screen sheet over the still-mounted chat; ends open for the capture.
+export const IPhone16eAnalyticsSheet: AppStory = {
   globals: {
     viewport: { value: "mobile1", isRotated: false },
   },
@@ -259,12 +260,21 @@ export const IPhone16eAnalyticsSidebarControl: AppStory = {
     await stabilizePhoneViewportStory(canvasElement);
 
     await userEvent.click(await canvas.findByTestId("analytics-button"));
-    await canvas.findByTestId("analytics-header");
-    await userEvent.click(canvas.getByRole("button", { name: "Collapse sidebar" }));
+    const dialog = await within(canvasElement.ownerDocument.body).findByRole(
+      "dialog",
+      { name: "Analytics" },
+      { timeout: 10000 }
+    );
+    await expect(canvasElement.querySelector('[data-testid="message-window"]')).not.toBeNull();
 
-    const openSidebarButton = await canvas.findByRole("button", { name: "Open sidebar" });
-    if (!openSidebarButton.classList.contains("mobile-menu-btn")) {
-      throw new Error("Analytics sidebar opener is not enabled for the phone viewport");
+    // The test-runner plays at desktop size; only Pixel/manager pin the phone width.
+    if (window.innerWidth < 768) {
+      const rect = dialog.getBoundingClientRect();
+      await expect(rect.left).toBe(0);
+      await expect(rect.width).toBe(window.innerWidth);
+      await expect(dialog.scrollWidth).toBeLessThanOrEqual(dialog.clientWidth);
+      const close = within(dialog).getByRole("button", { name: "Close analytics" });
+      await expect(close.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
     }
 
     blurActiveElement();
@@ -533,11 +543,6 @@ export const IPhone17ProMaxTouchReviewImmersive: AppStory = {
         if (canvas.queryByRole("heading", { name: "Notes" })) {
           throw new Error("Touch immersive mode should hide the desktop notes sidebar.");
         }
-        // The chat column is hidden here, so it must not keep claiming the bottom safe-area inset
-        // the app root would otherwise reserve for this view's own scroll area.
-        if (document.querySelectorAll("[data-bottom-inset-owner]").length > 0) {
-          throw new Error("Immersive review left the bottom safe-area inset unowned.");
-        }
       },
       { timeout: 10_000 }
     );
@@ -585,11 +590,11 @@ const TIMELINE_DIALOG_EVENTS: TimelineEvent[] = [
 ];
 
 /**
- * Timeline on small viewports: the right sidebar (the timeline's usual home) is
- * hidden at phone widths, so the workspace actions menu offers a Timeline entry
- * that opens the panel in a dialog instead.
+ * Timeline on small viewports: the right sidebar (the timeline's usual home) is hidden at phone
+ * widths, so the workspace actions menu's Sidebar row shows it full-screen, and its New tab
+ * launcher opens the Timeline.
  */
-export const IPhone16eTimelineDialog: AppStory = {
+export const IPhone16eTimeline: AppStory = {
   globals: {
     viewport: { value: "mobile1", isRotated: false },
   },
@@ -603,7 +608,6 @@ export const IPhone16eTimelineDialog: AppStory = {
           messages: [...MESSAGES],
           timelineEvents: TIMELINE_DIALOG_EVENTS,
         });
-        updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TIMELINE), true);
         return client;
       }}
     />
@@ -618,32 +622,190 @@ export const IPhone16eTimelineDialog: AppStory = {
   play: async ({ canvasElement }) => {
     await stabilizePhoneViewportStory(canvasElement);
 
-    // The Timeline menu action is gated on `window.matchMedia`, which the fixed-width
-    // decorator cannot move; only assert where the viewport is genuinely narrow (Pixel's
-    // phone viewport). The test-runner executes at desktop window size and skips here.
-    if (!window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`).matches) {
-      return;
-    }
-
+    // No viewport gate: the fixed-width decorator hides the sidebar through the shell's container
+    // query, so the Sidebar row shows even where the test runner plays at desktop width.
     const canvas = within(canvasElement);
     await userEvent.click(await canvas.findByTestId("workspace-more-actions"));
     await userEvent.click(
-      await waitFor(() => within(document.body).getByTestId("workspace-timeline-button"))
+      await waitFor(() => within(document.body).getByTestId("workspace-open-sidebar"))
     );
-
-    // The dialog portals to document.body, outside the story canvas.
-    await waitFor(
-      () => {
-        const dialog = document.querySelector('[data-testid="timeline-dialog"]');
-        if (!dialog) {
-          throw new Error("Timeline dialog did not open");
-        }
-        within(dialog as HTMLElement).getByText(
-          "Wired the mobile timeline dialog behind the workspace actions menu"
-        );
-      },
+    // A new workspace's sidebar shows its New tab launcher.
+    const sidebar = await canvas.findByRole("complementary", { name: "Workspace insights" });
+    await userEvent.click(await within(sidebar).findByRole("button", { name: /^Timeline/ }));
+    await within(sidebar).findByText(
+      "Wired the mobile timeline dialog behind the workspace actions menu",
+      undefined,
       { timeout: 10_000 }
     );
+
+    blurActiveElement();
+  },
+};
+
+/**
+ * Stats on small viewports (#5767): like the Timeline, the Stats tab lives in the hidden right
+ * sidebar. Its shortcut shows that tab in the full-screen sidebar.
+ */
+export const IPhone16eStats: AppStory = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  render: () => (
+    <AppWithMocks
+      setup={() =>
+        setupSimpleChatStory({
+          workspaceId: "ws-iphone-16e-stats",
+          workspaceName: "mobile-stats",
+          projectName: "mux",
+          messages: [...MESSAGES],
+        })
+      }
+    />
+  ),
+  decorators: [IPhone16eDecorator],
+  // No Pixel capture: the snapshot budget (scripts/check-storybook-snapshot-budget.mjs) is full.
+  // The play asserts the full-screen Stats tab instead.
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  play: async ({ canvasElement }) => {
+    await stabilizePhoneViewportStory(canvasElement);
+
+    // No viewport gate: the fixed-width decorator hides the sidebar through the shell's container
+    // query, so the shortcut works even where the test runner plays at desktop width.
+    const canvas = within(canvasElement);
+    await canvas.findByTestId("workspace-more-actions");
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "S", shiftKey: true }));
+
+    // The full-screen sidebar shows the Stats tab with its sub-tabs.
+    const sidebar = await canvas.findByRole("complementary", { name: "Workspace insights" });
+    await waitFor(() => expect(sidebar).toBeVisible());
+    const timing = await within(sidebar).findByRole(
+      "button",
+      { name: "Timing" },
+      { timeout: 10_000 }
+    );
+
+    // With the view open, the Timeline shortcut switches its tab. Focus was in the Stats panel,
+    // which the switch unmounts, so it moves to the Timeline tab instead of leaving the view.
+    timing.focus();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "T", shiftKey: true }));
+    const timelineTab = within(sidebar).getByRole("tab", { name: /Timeline/ });
+    await expect(timelineTab).toHaveAttribute("aria-selected", "true");
+    await expect(timelineTab).toHaveFocus();
+
+    blurActiveElement();
+  },
+};
+
+function createHomeScreenTerminalProbe() {
+  return {
+    windowOpen: fn(),
+    createdSessionIds: [] as string[],
+    closedSessionIds: [] as string[],
+    exitShell: new Map<string, () => void>(),
+  };
+}
+
+// Shared by the story's mock client and its play; beforeEach starts each run with a fresh one.
+let homeScreenTerminal = createHomeScreenTerminalProbe();
+
+/**
+ * An iOS Home Screen web app has a single window: a pop-out terminal replaced the app with
+ * terminal.html, which had no way back. It opens in an in-app dialog instead.
+ */
+export const IPhone16eHomeScreenTerminal: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        const client = setupSimpleChatStory({
+          workspaceId: "ws-iphone-16e-home-screen-terminal",
+          workspaceName: "mobile-terminal",
+          projectName: "mux",
+          messages: [...MESSAGES],
+        });
+        const { create, close } = client.terminal;
+        client.terminal.create = async (input) => {
+          const session = await create(input);
+          homeScreenTerminal.createdSessionIds.push(session.sessionId);
+          return session;
+        };
+        client.terminal.close = (input) => {
+          homeScreenTerminal.closedSessionIds.push(input.sessionId);
+          return close(input);
+        };
+        client.terminal.onExit = (input, options) => {
+          async function* untilShellExits() {
+            const exited = await new Promise<boolean>((resolve) => {
+              homeScreenTerminal.exitShell.set(input.sessionId, () => resolve(true));
+              options?.signal?.addEventListener("abort", () => resolve(false), { once: true });
+            });
+            if (exited) yield 0;
+          }
+          return Promise.resolve(wrapAsyncIterator(untilShellExits(), {}));
+        };
+        return client;
+      }}
+    />
+  ),
+  decorators: [IPhone16eDecorator],
+  // No Pixel capture: the snapshot budget is full, and the play asserts the behavior.
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  beforeEach: () => {
+    homeScreenTerminal = createHomeScreenTerminalProbe();
+    const standalone = Object.getOwnPropertyDescriptor(navigator, "standalone");
+    const windowOpen = window.open;
+    Object.defineProperty(navigator, "standalone", { configurable: true, value: true });
+    window.open = homeScreenTerminal.windowOpen;
+    return () => {
+      window.open = windowOpen;
+      if (standalone) Object.defineProperty(navigator, "standalone", standalone);
+      else Reflect.deleteProperty(navigator, "standalone");
+    };
+  },
+  play: async ({ canvasElement }) => {
+    await stabilizePhoneViewportStory(canvasElement);
+    const canvas = within(canvasElement);
+    const body = within(document.body);
+    const isDialogGone = () =>
+      expect(document.querySelector('[data-testid="terminal-dialog"]')).toBeNull();
+
+    // The fixed-width decorator hides the right sidebar, so New terminal takes the pop-out path.
+    await userEvent.click(await canvas.findByRole("button", { name: "New terminal" }));
+    const dialog = await body.findByTestId("terminal-dialog");
+    await expect(homeScreenTerminal.windowOpen).not.toHaveBeenCalled();
+
+    await userEvent.click(within(dialog).getByRole("button", { name: "Close terminal" }));
+    await waitFor(isDialogGone);
+    await expect(homeScreenTerminal.closedSessionIds).toEqual(homeScreenTerminal.createdSessionIds);
+    // Back in the app: the composer takes input again.
+    const composer = canvas.getByRole("textbox");
+    await userEvent.type(composer, "back in the chat");
+    await expect(composer).toHaveValue("back in the chat");
+
+    // The close-tab shortcut also works from the shell, which stops the keys it handles.
+    await userEvent.click(canvas.getByRole("button", { name: "New terminal" }));
+    const [shell] = await within(await body.findByTestId("terminal-dialog")).findAllByRole(
+      "textbox",
+      { name: "Terminal input" }
+    );
+    shell.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "w",
+        code: "KeyW",
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      })
+    );
+    await waitFor(isDialogGone);
+    await expect(homeScreenTerminal.closedSessionIds).toEqual(homeScreenTerminal.createdSessionIds);
+
+    // The shell exiting closes the dialog too.
+    await userEvent.click(canvas.getByRole("button", { name: "New terminal" }));
+    await body.findByTestId("terminal-dialog");
+    const exitingSessionId = homeScreenTerminal.createdSessionIds[2];
+    await waitFor(() => expect(homeScreenTerminal.exitShell.has(exitingSessionId)).toBe(true));
+    homeScreenTerminal.exitShell.get(exitingSessionId)?.();
+    await waitFor(isDialogGone);
 
     blurActiveElement();
   },

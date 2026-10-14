@@ -7,7 +7,7 @@
  */
 
 import { tool } from "ai";
-import { z } from "zod";
+import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { Tool } from "ai";
 import type { ToolBridge } from "@/node/services/ptc/toolBridge";
 import type { IJSRuntime, IJSRuntimeFactory } from "@/node/services/ptc/runtime";
@@ -24,7 +24,7 @@ import type { KernelFileLoader } from "@/node/services/tools/kernelFileLoad";
 
 import { analyzeCode, normalizeMultilineStrings } from "@/node/services/ptc/staticAnalysis";
 import { log } from "@/node/services/log";
-import { getCachedXumTypes, clearTypeCache } from "@/node/services/ptc/typeGenerator";
+import { getCachedXumTypes } from "@/node/services/ptc/typeGenerator";
 import {
   buildHandlePreview,
   RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES,
@@ -43,13 +43,6 @@ import { jsonSafeClone } from "@/common/utils/jsonSafeClone";
 const DEFAULT_MEMORY_BYTES = 64 * 1024 * 1024; // 64MB
 const DEFAULT_TIMEOUT_SECS = 5 * 60; // 5 minutes
 const MAX_TIMEOUT_SECS = 60 * 60; // 1 hour
-
-/**
- * Clear all type caches. Call for test isolation or when tool schemas might have changed.
- */
-export function clearTypeCaches(): void {
-  clearTypeCache();
-}
 
 /** PTC event with parentToolCallId attached by code_execution */
 export type PTCEventWithParent = PTCEvent & { parentToolCallId: string };
@@ -542,7 +535,7 @@ export async function createCodeExecutionTool(
   // mount override keep their current descriptions byte-identical.
   const kernelFirstPreamble =
     kernel && options?.kernelFirst === true
-      ? `**Kernel-first workflow:** this is your primary tool — other tools are \`mux.*\` calls inside it. Write complete programs: batch ALL steps of a task — every file load, transformation, and check — into a single call using loops and in-code error handling (try/catch), instead of one tool call per code_execution; split into separate calls only when a later step genuinely depends on your own review of intermediate output. Persist state in \`vars\` across calls and turns; nested results stay in the kernel (you see compact {tool, ok, bytes} summaries), and an oversized return value comes back as {handle, preview, size} — read or slice the full value at its handle in a follow-up call${
+      ? `**Kernel-first workflow:** this is your primary tool for the bridged tools listed below; call separately exposed tools (including file edits) directly. Write complete programs: batch related bridged steps of a task — every file load, transformation, and check — into a single call using loops and in-code error handling (try/catch), instead of one tool call per code_execution; split into separate calls only when a later step genuinely depends on your own review of intermediate output. Persist state in \`vars\` across calls and turns; nested results stay in the kernel (you see compact {tool, ok, bytes} summaries), and an oversized return value comes back as {handle, preview, size} — read or slice the full value at its handle in a follow-up call${
           "task" in bridgeableTools
             ? "; spawn sub-agents with `xum.task_spawn(...)` and collect their reports with `xum.events()`"
             : ""
@@ -570,23 +563,7 @@ ${xumTypes}
 
 **Security:** The sandbox has no access to \`require\`, \`import\`, \`process\`, \`fetch\`, or filesystem outside of \`xum.*\` tools.`,
 
-    inputSchema: z.object({
-      code: z
-        .string()
-        .min(1)
-        .describe(
-          "JavaScript code to execute. xum.* calls are synchronous—do not use await. mux.* is a compatibility alias. Use 'return' for final result."
-        ),
-      timeout_secs: z
-        .number()
-        .int()
-        .positive()
-        .nullish()
-        .describe(
-          "Execution timeout in seconds (default: 300, max: 3600). " +
-            "Increase when spawning subagents that may take 5-15+ minutes."
-        ),
-    }),
+    inputSchema: TOOL_DEFINITIONS.code_execution.schema,
 
     execute: async (
       { code, timeout_secs },

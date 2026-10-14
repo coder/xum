@@ -19,7 +19,7 @@ export function MemorySection() {
         </p>
       </div>
       {/* Bordered panel so the editable area is visually distinct from the
-          settings page background (the sidebar Memory tab has its own chrome). */}
+          settings dialog background (the sidebar Memory tab has its own chrome). */}
       <div className="border-border-light flex min-h-0 flex-1 flex-col overflow-hidden rounded-md border">
         <MemoryBrowser workspaceId={null} scopes={["global"]} />
       </div>

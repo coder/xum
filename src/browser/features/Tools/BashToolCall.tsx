@@ -15,13 +15,19 @@ import {
   ErrorBox,
   ExitCodeBadge,
 } from "./Shared/ToolPrimitives";
-import { useToolExpansion, getStatusDisplay, type ToolStatus } from "./Shared/toolUtils";
+import {
+  useToolExpansion,
+  getStatusDisplay,
+  normalizeToolResultForRendering,
+  type ToolStatus,
+} from "./Shared/toolUtils";
 import { formatDuration } from "@/common/utils/formatDuration";
 import { cn } from "@/common/lib/utils";
 import { ElapsedTimeDisplay } from "./Shared/ElapsedTimeDisplay";
 import { useBashToolLiveOutput } from "@/browser/stores/WorkspaceStore";
 import { useForegroundBashToolCallIds } from "@/browser/stores/BackgroundBashStore";
 import { useBackgroundBashActions } from "@/browser/contexts/BackgroundBashContext";
+import { useChatHostContext } from "@/browser/contexts/ChatHostContext";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 import { buildBashCollapsedSummary } from "./bashCollapsedSummary";
 import { useBashCollapsedSummaryMode } from "./BashCollapsedSummaryModeContext";
@@ -71,6 +77,12 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
     status === "executing" ? workspaceId : undefined
   );
   const { sendToBackground } = useBackgroundBashActions();
+  // Hosts that cannot send a foreground bash to the background (the VS Code webview) hide the
+  // control instead of offering an action their bridge refuses.
+  const { uiSupport } = useChatHostContext();
+  const canHostSendToBackground = uiSupport.bashForegroundControls === "supported";
+  // Hosts without the output dialog hide its button.
+  const canViewOutput = uiSupport.backgroundBashOutput === "supported";
 
   const liveOutput = useBashToolLiveOutput(
     shouldTrackLiveBashState ? workspaceId : undefined,
@@ -87,6 +99,18 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
 
   const liveOutputView = liveOutput ?? EMPTY_LIVE_OUTPUT;
   const combinedLiveOutput = liveOutputView.combined;
+
+  // A blocking tool_pre or plugin tool.execute.before hook returns `{ error }` without
+  // `success` (#6044): that shape is model-visible and replayed, so the card reads the reason
+  // from any non-empty `error` instead of requiring `success: false`. The shared normalizer
+  // unwraps the SDK JSON container (`{ type: "json", value }`); the object check keeps a
+  // primitive result (0, false) from throwing in the `in` check below.
+  const normalizedResult: unknown = normalizeToolResultForRendering(result);
+  const errorText: unknown =
+    typeof normalizedResult === "object" && normalizedResult !== null && "error" in normalizedResult
+      ? normalizedResult.error
+      : undefined;
+  const resultError = typeof errorText === "string" && errorText.length > 0 ? errorText : null;
 
   const isPending = status === "executing" || status === "pending";
   const backgroundProcessId =
@@ -121,7 +145,7 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
     toolCallId && workspaceId && foregroundBashToolCallIds.has(toolCallId)
   );
   const handleSendToBackground =
-    toolCallId && workspaceId
+    canHostSendToBackground && toolCallId && workspaceId
       ? () => {
           sendToBackground(toolCallId);
         }
@@ -176,7 +200,7 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
             {bashCollapsedSummary.command}
           </span>
         )}
-        {isBackground && backgroundProcessId && workspaceId && (
+        {isBackground && backgroundProcessId && workspaceId && canViewOutput && (
           <Tooltip>
             <TooltipTrigger asChild>
               <button
@@ -185,6 +209,7 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
                   e.stopPropagation();
                   setOutputDialogOpen(true);
                 }}
+                aria-label="View output"
                 className="text-muted hover:text-secondary ml-2 rounded p-1 transition-colors"
               >
                 <FileText size={12} />
@@ -230,6 +255,7 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
             <TooltipTrigger asChild>
               <button
                 type="button"
+                aria-label="Send to background"
                 onClick={(e) => {
                   e.stopPropagation(); // Don't toggle expand
                   handleSendToBackground();
@@ -274,7 +300,9 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
           )}
           <DetailSection>
             <DetailLabel>Script</DetailLabel>
-            <DetailContent className="px-2 py-1.5">{args.script}</DetailContent>
+            {/* Capped at the block's max height; the bottom edge fades while more of the command
+                is below the cut, since phones hide the scrollbar (#5769). */}
+            <DetailContent className="scroll-fade-y px-2 py-1.5">{args.script}</DetailContent>
           </DetailSection>
 
           {/* Truncation notices */}
@@ -286,10 +314,11 @@ export const BashToolCall: React.FC<BashToolCallProps> = ({
 
           {result && (
             <>
-              {result.success === false && result.error && (
+              {resultError !== null && (
                 <DetailSection>
                   <DetailLabel>Error</DetailLabel>
-                  <ErrorBox>{result.error}</ErrorBox>
+                  {/* Hook reasons can carry long unbroken paths: wrap them at phone width. */}
+                  <ErrorBox className="wrap-anywhere whitespace-pre-wrap">{resultError}</ErrorBox>
                 </DetailSection>
               )}
 

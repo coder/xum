@@ -26,6 +26,15 @@ export {
 // Workspace stats schemas
 export { WorkspaceStatsSnapshotSchema } from "./schemas/workspaceStats";
 
+// Workspace review-state schemas
+export {
+  ReviewStateDeltaSchema,
+  ReviewStateEventSchema,
+  ReviewStateImportLegacyOutputSchema,
+  ReviewStateSectionsSchema,
+  ReviewStateSnapshotSchema,
+} from "./schemas/reviewState";
+
 // Chat stats schemas
 export { ChatStatsSchema, TokenConsumerSchema } from "./schemas/chatStats";
 
@@ -34,8 +43,10 @@ export {
   AgentSkillDescriptorSchema,
   AgentSkillFrontmatterSchema,
   AgentSkillIssueSchema,
+  AgentSkillListResultSchema,
   AgentSkillPackageSchema,
   AgentSkillScopeSchema,
+  AgentSkillUnavailableSourceSchema,
   SkillNameSchema,
   resolveSkillAdvertise,
   resolveSkillUserInvocable,
@@ -81,19 +92,12 @@ export {
   SendMessageErrorSchema,
   StreamErrorTypeSchema,
   NameGenerationErrorSchema,
+  PlanReviewErrorSchema,
 } from "./schemas/errors";
 
 // Secrets schemas
 export { SecretSchema } from "./schemas/secrets";
 
-// Policy schemas
-export {
-  PolicySourceSchema,
-  PolicyStatusSchema,
-  EffectivePolicySchema,
-  PolicyGetResponseSchema,
-  PolicyRuntimeIdSchema,
-} from "./schemas/policy";
 // Provider options schemas
 export { MuxProviderOptionsSchema } from "./schemas/providerOptions";
 
@@ -125,11 +129,13 @@ export {
   DeleteMessageSchema,
   ErrorEventSchema,
   GoalBudgetLimitedEventSchema,
+  PluginHookNoticeEventSchema,
   OnChatDowngradeReasonSchema,
   ReasoningDeltaEventSchema,
   ReasoningEndEventSchema,
   RuntimeStatusEventSchema,
   SendMessageOptionsSchema,
+  AcpPromptCorrelationSchema,
   HistoryEditPreconditionSchema,
   StreamAbortReasonSchema,
   StreamAbortEventSchema,
@@ -146,9 +152,6 @@ export {
   BashOutputEventSchema,
   TaskCreatedEventSchema,
   WorkflowRunAttachedEventSchema,
-  AdvisorOutputEventSchema,
-  AdvisorReasoningOutputEventSchema,
-  AdvisorPhaseEventSchema,
   RestartBlockerSchema,
   UpdateStatusSchema,
   UsageDeltaEventSchema,
@@ -165,8 +168,8 @@ export {
   config,
   browser,
   devtools,
+  drafts,
   uiLayouts,
-  debug,
   desktop,
   general,
   menu,
@@ -179,18 +182,22 @@ export {
   mcpOauth,
   mcp,
   memory,
+  artifacts,
+  mcpApps,
   refinements,
   secrets,
   CustomProviderMutationErrorSchema,
   ProviderConfigInfoSchema,
+  ProviderModelDiscoveryResultSchema,
   ProviderModelEntrySchema,
+  ModelCatalogEntrySchema,
+  ModelCatalogSearchInputSchema,
+  ModelCatalogSearchResultSchema,
   muxGateway,
   muxGatewayOauth,
   copilotOauth,
-  muxGovernorOauth,
   codexOauth,
   coderOauth,
-  policy,
   providers,
   ProvidersConfigMapSchema,
   server,
@@ -199,7 +206,12 @@ export {
   splashScreens,
   tasks,
   experiments,
+  computerUse,
   telemetry,
+  perf,
+  perfCaptures,
+  perfReports,
+  sessionTapes,
   ssh,
   terminal,
   tokenizer,

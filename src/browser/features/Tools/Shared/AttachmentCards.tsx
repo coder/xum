@@ -59,7 +59,9 @@ const AttachmentDownloadButton: React.FC<{ dataUrl: string; filename?: string }>
   <button
     type="button"
     onClick={() => downloadDataUrl(props.dataUrl, props.filename ?? "attachment")}
-    className="border-border-light hover:bg-surface flex items-center gap-1 rounded border px-2 py-1 text-[var(--color-text)]"
+    // shrink-0: the touch-phone 44px minimum (globals.css) replaces the flex item's content-based
+    // min-width, so beside the long description this button shrank below its label.
+    className="border-border-light hover:bg-surface flex shrink-0 items-center gap-1 rounded border px-2 py-1 text-[var(--color-text)]"
   >
     <Download className="h-3 w-3" />
     Download

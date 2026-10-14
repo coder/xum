@@ -1,6 +1,7 @@
 import { computeHistoryRangeFingerprint } from "@/common/orpc/onChatCursorFingerprint";
 import type { HistoryEditPrecondition } from "@/common/orpc/types";
 import { isSyntheticSnapshotUserMessage, type MuxMessage } from "@/common/types/message";
+import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
 import assert from "@/common/utils/assert";
 import { isNonNegativeInteger } from "@/common/utils/numbers";
 
@@ -26,7 +27,11 @@ export function getEditTruncateTargetFromMessages(
   let truncateTargetId = editMessageId;
   for (let i = editIndex - 1; i >= 0; i -= 1) {
     const message = messages[i];
-    if (!isSyntheticSnapshotUserMessage(message)) {
+    // Only this turn's own prelude snapshots (file @-mentions, skills, MCP prompts) are cut
+    // with the edit. Plan-review records are hidden rows too, but independent durable
+    // mutations (a resolve/reopen while idle, an on-demand snapshot): cutting one would silently
+    // undo the user's review state, so the walk stops at them.
+    if (!isSyntheticSnapshotUserMessage(message) || isPlanReviewRecordMessage(message)) {
       break;
     }
     truncateTargetId = message.id;
@@ -67,9 +72,11 @@ export function buildHistoryEditPrecondition(
   assert(isNonNegativeInteger(rangeStart.metadata?.historySequence), "range start is committed");
   let newest = rangeStart;
   for (const message of committed) {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     if (message.metadata!.historySequence! > newest.metadata!.historySequence!) newest = message;
   }
   const rangeStartHistorySequence = rangeStart.metadata.historySequence;
+  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
   const newestHistorySequence = newest.metadata!.historySequence!;
   const range = computeHistoryRangeFingerprint(
     committed,

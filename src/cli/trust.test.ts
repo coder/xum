@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { describe, expect, test } from "bun:test";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { Config } from "@/node/config";
-import { materializeResolvedTrust, replaceRunTrustProjects, resolveProjectDir } from "./trust";
+import { materializeResolvedTrust, replaceRunConfig, resolveProjectDir } from "./trust";
 
 const BUN_EXECUTABLE = process.execPath;
 const TRUST_ENTRY = path.join(import.meta.dir, "trust.ts");
@@ -98,7 +98,7 @@ describe("xum trust CLI", () => {
     expect(trustByPath.get(worktree)).toBe(false);
   }, 15_000);
 
-  test("replaceRunTrustProjects rebuilds config without foreign settings", async () => {
+  test("replaceRunConfig keeps trust and the tool-search opt-out, not foreign settings", async () => {
     using tmp = new DisposableTempDir("trust-replace-run");
     const realConfig = new Config(path.join(tmp.path, "real-root"));
     const targetConfig = new Config(path.join(tmp.path, "run-root"));
@@ -106,6 +106,7 @@ describe("xum trust CLI", () => {
     const staleProject = path.join(tmp.path, "removed-project");
     await realConfig.editConfig((config) => {
       config.projects.set(intendedProject, { workspaces: [], trusted: true });
+      config.toolSearchEnabled = false;
       return config;
     });
     await targetConfig.editConfig((config) => {
@@ -114,7 +115,7 @@ describe("xum trust CLI", () => {
       return config;
     });
 
-    await replaceRunTrustProjects(realConfig, targetConfig);
+    await replaceRunConfig(realConfig, targetConfig);
 
     const onDisk = JSON.parse(
       await fs.readFile(path.join(targetConfig.rootDir, "config.json"), "utf8")
@@ -128,6 +129,7 @@ describe("xum trust CLI", () => {
     expect(reloaded.projects.has(staleProject)).toBe(false);
     expect(reloaded.projects.get(intendedProject)?.trusted).toBe(true);
     expect(reloaded.routeOverrides).toBeUndefined();
+    expect(reloaded.toolSearchEnabled).toBe(false);
   });
 
   test("materializeResolvedTrust copies main-repo trust onto the exact worktree entry", async () => {
@@ -198,7 +200,7 @@ describe("xum trust CLI", () => {
     expect(await materializeResolvedTrust(realConfig, targetConfig, spoofed)).toBe(false);
     expect(targetConfig.loadConfigOrDefault().projects.has(spoofed)).toBe(false);
 
-    // A trusted source must fail loudly when Config swallows the target write error.
+    // A trusted source must fail loudly when the target write fails.
     const unwritableRoot = path.join(base, "unwritable-root");
     await fs.writeFile(unwritableRoot, "not a directory\n", "utf-8");
     const unwritableConfig = new Config(unwritableRoot);
@@ -215,9 +217,9 @@ describe("xum trust CLI", () => {
     using tmp = new DisposableTempDir("trust-cli-unwritable");
     const repo = path.join(tmp.path, "repo");
     await fs.mkdir(repo, { recursive: true });
-    // MUX_ROOT pointing at a regular file makes config.json unwritable;
-    // Config.saveConfig swallows the write error, so only the post-write
-    // verification can surface the failure.
+    // MUX_ROOT pointing at a regular file makes config.json unwritable; the
+    // write gate, a rejected save (#4444), or the post-write verification must
+    // surface the failure.
     const muxRootFile = path.join(tmp.path, "mux-root-file");
     await fs.writeFile(muxRootFile, "not a directory\n", "utf-8");
 
@@ -236,6 +238,18 @@ describe("xum trust CLI", () => {
       /Failed to persist trust change|Skipping config write/
     );
     expect(result.stdout.toString()).toBe("");
+  }, 15_000);
+
+  test("refuses to trust the filesystem root as a new project", async () => {
+    using tmp = new DisposableTempDir("trust-cli-root");
+    const result = await Bun.$`${BUN_EXECUTABLE} ${TRUST_ENTRY} --dir / --json`
+      .env({ ...process.env, MUX_ROOT: tmp.path })
+      .nothrow()
+      .quiet();
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr.toString()).toContain("A project cannot be the filesystem root");
+    expect(new Config(tmp.path).loadConfigOrDefault().projects.size).toBe(0);
   }, 15_000);
 
   test("trust from a linked worktree records trust for the main repository", async () => {

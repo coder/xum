@@ -1,13 +1,21 @@
 import "../../../../tests/ui/dom";
 
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import type { UpdateStatus } from "@/common/orpc/types";
-import type * as APIModule from "@/browser/contexts/API";
-import type { APIClient } from "@/browser/contexts/API";
+import { APIContext, type APIClient } from "@/browser/contexts/API";
 import { installDom } from "../../../../tests/ui/dom";
 import { ThemeProvider } from "../../contexts/ThemeContext";
+import * as RealDarkLogoModule from "@/browser/assets/logos/xum-logo-dark.svg?react";
+import * as RealLightLogoModule from "@/browser/assets/logos/xum-logo-light.svg?react";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
 
+// Restore the real logo modules after this suite so the stubs cannot leak into later files.
+restoreModulesAfterSuite([
+  ["@/browser/assets/logos/xum-logo-dark.svg?react", { ...RealDarkLogoModule }],
+  ["@/browser/assets/logos/xum-logo-light.svg?react", { ...RealLightLogoModule }],
+]);
 // SVG ?react imports don't work in happy-dom; stub them as simple svgs.
 void mock.module("@/browser/assets/logos/xum-logo-dark.svg?react", () => ({
   __esModule: true,
@@ -18,12 +26,31 @@ void mock.module("@/browser/assets/logos/xum-logo-light.svg?react", () => ({
   default: () => <svg data-testid="xum-logo-mock" />,
 }));
 
+/** A status stream that stays open until its consumer aborts. */
+function createStatusStreamOverrides() {
+  return {
+    update: {
+      onStatus: (_input: unknown, options?: { signal?: AbortSignal }) =>
+        Promise.resolve(
+          (async function* (): AsyncGenerator<UpdateStatus, void, unknown> {
+            await new Promise<void>((resolve) =>
+              options?.signal?.addEventListener("abort", () => resolve(), { once: true })
+            );
+            yield* [];
+          })()
+        ),
+    },
+  };
+}
+
 /** Push-driven stand-in for the update.onStatus subscription. */
 function createStatusStream() {
   const queue: UpdateStatus[] = [];
   let wake: (() => void) | null = null;
-  const onStatus = async function* (_input: undefined, options: { signal: AbortSignal }) {
-    while (!options.signal.aborted) {
+  const onStatus = async function* (_input: unknown, options?: { signal?: AbortSignal }) {
+    const signal = options?.signal;
+    if (!signal) throw new Error("update.onStatus double expects the consumer's abort signal");
+    while (!signal.aborted) {
       const next = queue.shift();
       if (next) {
         yield next;
@@ -31,12 +58,14 @@ function createStatusStream() {
       }
       await new Promise<void>((resolve) => {
         wake = resolve;
-        options.signal.addEventListener("abort", () => resolve(), { once: true });
+        signal.addEventListener("abort", () => resolve(), { once: true });
       });
     }
   };
   return {
-    api: { update: { onStatus } } as unknown as APIClient,
+    api: createTestApiClient({
+      update: { onStatus: (input, options) => Promise.resolve(onStatus(input, options)) },
+    }),
     push(status: UpdateStatus) {
       queue.push(status);
       wake?.();
@@ -50,25 +79,8 @@ let apiState: { api: APIClient | null; status: "connected" | "reconnecting" } = 
   status: "reconnecting",
 };
 
-/* eslint-disable @typescript-eslint/no-require-imports */
-const actualAPI = require("@/browser/contexts/API?real=1") as typeof APIModule;
-/* eslint-enable @typescript-eslint/no-require-imports */
-
-// Spread the real module: replacing it outright deletes exports other test files import
-// statically (module mocks are process-wide and persist across files).
-void mock.module("@/browser/contexts/API", () => ({
-  ...actualAPI,
-  useAPI: () => ({
-    api: apiState.api,
-    status: apiState.status,
-    error: null,
-    attempt: 1,
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
-}));
-
 import type { UpdateRestartOverlay as UpdateRestartOverlayComponent } from "./UpdateRestartOverlay";
+import { createTestApiClient } from "@/browser/testUtils";
 
 // Required after the mocks above so the svg stubs are in place when LoadingScreen evaluates.
 /* eslint-disable @typescript-eslint/no-require-imports, @typescript-eslint/no-unsafe-assignment */
@@ -81,11 +93,31 @@ const {
 
 const OVERLAY = "update-restart-overlay";
 
+// Inject `apiState` through the real context instead of mocking the API module (module
+// mocks leak across suites). The wrapper reads `apiState` on every render, so rerenders
+// switch between connected and reconnecting without remounting the overlay.
+function MutableAPIWrapper(props: { children: React.ReactNode }) {
+  const authenticate = () => undefined;
+  const retry = () => undefined;
+  return (
+    <APIContext.Provider
+      value={
+        apiState.status === "connected" && apiState.api
+          ? { status: "connected", api: apiState.api, error: null, authenticate, retry }
+          : { status: "reconnecting", api: null, error: null, attempt: 1, authenticate, retry }
+      }
+    >
+      {props.children}
+    </APIContext.Provider>
+  );
+}
+
 function renderOverlay() {
   return render(
     <ThemeProvider>
       <UpdateRestartOverlay />
-    </ThemeProvider>
+    </ThemeProvider>,
+    { wrapper: MutableAPIWrapper }
   );
 }
 
@@ -155,5 +187,26 @@ describe("UpdateRestartOverlay", () => {
 
     stream.push({ type: "error", phase: "install", message: "activation failed" });
     await waitFor(() => expect(view.queryByTestId(OVERLAY)).toBeNull());
+  });
+
+  // The App keeps the last client while Xum reconnects (kept-gap), so a drop ends the stream
+  // with ConnectionLostError instead of an effect cleanup: that is not a stream error.
+  test.each([...GAP_MODES])("a lost connection logs no stream error (%s)", async (mode) => {
+    const harness = createConnectionHarness(mode, () => createStatusStreamOverrides());
+    const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      render(
+        <ThemeProvider>
+          <UpdateRestartOverlay />
+        </ThemeProvider>,
+        { wrapper: harness.Wrapper }
+      );
+      await flushStream();
+      await harness.drop();
+      await flushStream();
+      expect(consoleError.mock.calls).toEqual([]);
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 });

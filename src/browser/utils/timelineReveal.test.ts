@@ -165,4 +165,37 @@ describe("revealTimelineTarget", () => {
       window.removeEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, listener);
     }
   });
+  it("reports not-loaded when the page budget runs out with older history left", async () => {
+    const store = createStore({ hasOlderHistory: true });
+    const loadOlderHistory = mock(() => Promise.resolve("loaded" as const));
+    store.loadOlderHistory = loadOlderHistory;
+
+    const result = await revealTimelineTarget({
+      workspaceId,
+      getTarget: () => ({ messageId: "prompt-far" }),
+      workspaceStore: store,
+      pinTarget: mock(() => undefined),
+      maxHistoryPages: 3,
+    });
+    // The target may exist further back (#4961): not "gone", and no fourth page.
+    expect(result).toBe("not-loaded");
+    expect(loadOlderHistory).toHaveBeenCalledTimes(3);
+  });
+
+  it("reports not-found only after reading back to the start of history", async () => {
+    const store = createStore({ hasOlderHistory: true });
+    store.loadOlderHistory = mock(() => {
+      store.state.hasOlderHistory = false;
+      return Promise.resolve("loaded" as const);
+    });
+
+    const result = await revealTimelineTarget({
+      workspaceId,
+      getTarget: () => ({ messageId: "prompt-gone" }),
+      workspaceStore: store,
+      pinTarget: mock(() => undefined),
+      maxHistoryPages: 3,
+    });
+    expect(result).toBe("not-found");
+  });
 });

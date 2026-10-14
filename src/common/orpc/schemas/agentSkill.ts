@@ -137,3 +137,20 @@ export const AgentSkillIssueSchema = z.object({
   /** Optional fix suggestion. */
   hint: z.string().min(1).optional(),
 });
+
+/** A skills root that could not be read, e.g. a project root on an unreachable SSH host. */
+export const AgentSkillUnavailableSourceSchema = z.object({
+  scope: AgentSkillScopeSchema,
+  displayPath: z.string().min(1),
+  message: z.string().min(1),
+});
+
+/**
+ * A skill list is partial by design: it keeps every source that answered and
+ * names each source that did not, so one unreachable root never hides the rest.
+ */
+export const AgentSkillListResultSchema = z.object({
+  skills: z.array(AgentSkillDescriptorSchema),
+  invalidSkills: z.array(AgentSkillIssueSchema),
+  unavailableSources: z.array(AgentSkillUnavailableSourceSchema),
+});

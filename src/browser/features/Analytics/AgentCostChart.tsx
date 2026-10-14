@@ -5,8 +5,10 @@ import {
   ANALYTICS_CHART_COLORS,
   CHART_AXIS_STROKE,
   CHART_AXIS_TICK,
+  formatAgentLabel,
   formatCompactNumber,
   formatUsd,
+  formatUsdAxisTick,
 } from "./analyticsUtils";
 
 interface AgentCostChartProps {
@@ -49,7 +51,7 @@ function AgentCostTooltipContent(props: {
       className="bg-background-secondary border-border-medium rounded-md border p-2 text-xs"
       style={{ minWidth: 180 }}
     >
-      <div className="text-foreground mb-1 font-medium">{row.agentId}</div>
+      <div className="text-foreground mb-1 font-medium">{formatAgentLabel(row.agentId)}</div>
       <div className="text-muted flex items-center justify-between gap-2">
         <span>Cost</span>
         <span className="text-foreground font-mono">{formatUsd(row.costUsd)}</span>
@@ -59,7 +61,8 @@ function AgentCostTooltipContent(props: {
         <span className="text-foreground font-mono">{formatCompactNumber(row.tokenCount)}</span>
       </div>
       <div className="text-muted flex items-center justify-between gap-2">
-        <span>Responses</span>
+        {/* Chat turns only: background rows are not counted yet (#5778). */}
+        <span>Chat responses</span>
         <span className="text-foreground font-mono">{formatCompactNumber(row.responseCount)}</span>
       </div>
     </div>
@@ -96,13 +99,14 @@ export function AgentCostChart(props: AgentCostChartProps) {
               <XAxis
                 type="number"
                 tick={CHART_AXIS_TICK}
-                tickFormatter={(value: number) => formatUsd(Number(value))}
+                tickFormatter={(value: number) => formatUsdAxisTick(Number(value))}
                 stroke={CHART_AXIS_STROKE}
               />
               <YAxis
                 type="category"
                 dataKey="agentId"
                 width={140}
+                tickFormatter={(value: string) => formatAgentLabel(String(value))}
                 tick={CHART_AXIS_TICK}
                 stroke={CHART_AXIS_STROKE}
               />

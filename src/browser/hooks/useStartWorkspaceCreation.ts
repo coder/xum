@@ -1,15 +1,10 @@
 import { useCallback, useEffect } from "react";
 import type { ProjectConfig } from "@/common/types/project";
 import { CUSTOM_EVENTS, type CustomEventPayloads } from "@/common/constants/events";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import {
-  getAutoModelRoutingKey,
-  getInputKey,
-  getModelKey,
-  getPendingScopeId,
-  getProjectScopeId,
-  getTrunkBranchKey,
-} from "@/common/constants/storage";
+import { updateUserPreferences } from "@/browser/stores/AppConfigStore";
+import { defaultCreationDraftScope, getDraftStore } from "@/browser/stores/DraftStore";
+import { getProjectScopeId } from "@/common/constants/storage";
+import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
 import {
   getFirstTopLevelProjectPath,
   resolveWorkspaceCreationScope,
@@ -18,35 +13,32 @@ import {
 export type StartWorkspaceCreationDetail =
   CustomEventPayloads[typeof CUSTOM_EVENTS.START_WORKSPACE_CREATION];
 
-type PersistFn = typeof updatePersistedState;
-
 export function persistWorkspaceCreationPrefill(
   projectPath: string,
-  detail: StartWorkspaceCreationDetail | undefined,
-  persist: PersistFn = updatePersistedState
+  detail: StartWorkspaceCreationDetail | undefined
 ): void {
   if (!detail) {
     return;
   }
 
   if (detail.startMessage !== undefined) {
-    persist(getInputKey(getPendingScopeId(projectPath)), detail.startMessage);
+    // The creation composer opened without a draft id edits the project's default creation
+    // draft; WorkspaceContext moves it into a listed creation draft when it creates one.
+    getDraftStore().setText(defaultCreationDraftScope(projectPath), detail.startMessage);
   }
 
   if (detail.model !== undefined) {
-    const projectScopeId = getProjectScopeId(projectPath);
-    persist(getModelKey(projectScopeId), detail.model);
+    updateUserPreferences({ ai: { projectDefaults: { [projectPath]: { model: detail.model } } } });
     // A prefilled model is an explicit pick, so it leaves Auto (see setWorkspaceModelWithOrigin);
     // otherwise the creation send would treat it as the routing fallback.
-    persist(getAutoModelRoutingKey(projectScopeId), false);
+    setAutoRoutingChoice(getProjectScopeId(projectPath), "model", false);
   }
 
   if (detail.trunkBranch !== undefined) {
     const normalizedTrunk = detail.trunkBranch.trim();
-    persist(
-      getTrunkBranchKey(projectPath),
-      normalizedTrunk.length > 0 ? normalizedTrunk : undefined
-    );
+    updateUserPreferences({
+      workspaceCreation: { byProject: { [projectPath]: { trunkBranch: normalizedTrunk || null } } },
+    });
   }
 
   // Note: runtime is intentionally NOT persisted here - it's a one-time override.

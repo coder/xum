@@ -1,8 +1,9 @@
 import "../dom";
-import { fireEvent, waitFor, within } from "@testing-library/react";
+import { fireEvent, waitFor } from "@testing-library/react";
 import { shouldRunIntegrationTests } from "../../testUtils";
 import { preloadTestModules } from "../../ipc/setup";
 import { createAppHarness } from "../harness";
+import { openSettingsDialog } from "../helpers";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
@@ -14,11 +15,9 @@ describeIntegration("Memory Intuition settings", () => {
   test("parent toggle hides recall controls and its internal agent without resetting the preference", async () => {
     const app = await createAppHarness({ branchPrefix: "intuition-settings", aiMode: "none" });
     try {
-      const canvas = within(app.view.container);
-      fireEvent.click(await canvas.findByTestId("settings-button"));
+      const canvas = await openSettingsDialog(app.view.container);
       const openSection = async (name: string) => {
-        const buttons = await canvas.findAllByRole("button", { name });
-        fireEvent.click(buttons[0]);
+        fireEvent.click(await canvas.findByRole("button", { name }));
       };
       await openSection("Experiments");
       const memoryToggle = await canvas.findByLabelText("Toggle Agent Memory");

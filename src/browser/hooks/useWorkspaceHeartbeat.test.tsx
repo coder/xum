@@ -4,30 +4,19 @@ import type React from "react";
 
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import {
+  createConnectionHarness,
+  GAP_MODES,
+  type ConnectionHarness,
+} from "@/browser/contexts/connection.testHarness";
+import {
   WorkspaceContext,
   type WorkspaceContext as WorkspaceContextValue,
 } from "@/browser/contexts/WorkspaceContext";
+import { createTestApiClient, createTestConfig, type TestApiOverrides } from "@/browser/testUtils";
+import { Ok } from "@/common/types/result";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { installDom } from "../../../tests/ui/dom";
 import { useWorkspaceHeartbeat, type HeartbeatFormSettings } from "./useWorkspaceHeartbeat";
-
-interface HeartbeatApi {
-  workspace: {
-    heartbeat: {
-      get: (input: { workspaceId: string }) => Promise<HeartbeatFormSettings | null>;
-      set: (input: { workspaceId: string } & HeartbeatFormSettings) => Promise<{
-        success: boolean;
-        error?: string;
-      }>;
-    };
-  };
-  config: {
-    getConfig: () => Promise<{
-      heartbeatDefaultIntervalMs?: number;
-      heartbeatDefaultPrompt?: string;
-    }>;
-  };
-}
 
 const TEST_WORKSPACE_ID = "workspace-1";
 
@@ -41,7 +30,7 @@ const setWorkspaceMetadataMock = mock((update: WorkspaceMetadataUpdater) => {
 
 // Use real providers instead of mock.module(): Bun runs test files in one process, so
 // module-level API/context mocks can leak into unrelated hook tests.
-function createWrapper(api: HeartbeatApi): React.FC<{ children: React.ReactNode }> {
+function createWrapper(api: TestApiOverrides<APIClient>): React.FC<{ children: React.ReactNode }> {
   return function Wrapper(props) {
     const workspaceContext = {
       workspaceMetadata: new Map<string, FrontendWorkspaceMetadata>(),
@@ -52,7 +41,7 @@ function createWrapper(api: HeartbeatApi): React.FC<{ children: React.ReactNode 
     } as unknown as WorkspaceContextValue;
 
     return (
-      <APIProvider client={api as unknown as APIClient}>
+      <APIProvider client={createTestApiClient(api)}>
         <WorkspaceContext.Provider value={workspaceContext}>
           {props.children}
         </WorkspaceContext.Provider>
@@ -111,8 +100,8 @@ describe("useWorkspaceHeartbeat", () => {
   });
 
   test("optimistically enables heartbeat metadata after a successful save", async () => {
-    const saveHeartbeat = mock(() => Promise.resolve({ success: true }));
-    const api: HeartbeatApi = {
+    const saveHeartbeat = mock(() => Promise.resolve(Ok(undefined)));
+    const api: TestApiOverrides<APIClient> = {
       workspace: {
         heartbeat: {
           get: () => Promise.resolve(null),
@@ -120,7 +109,7 @@ describe("useWorkspaceHeartbeat", () => {
         },
       },
       config: {
-        getConfig: () => Promise.resolve({}),
+        getConfig: () => Promise.resolve(createTestConfig()),
       },
     };
 
@@ -171,15 +160,15 @@ describe("useWorkspaceHeartbeat", () => {
       contextMode: "compact",
       message: "Keep watching",
     };
-    const api: HeartbeatApi = {
+    const api: TestApiOverrides<APIClient> = {
       workspace: {
         heartbeat: {
           get: () => Promise.resolve(initialSettings),
-          set: () => Promise.resolve({ success: true }),
+          set: () => Promise.resolve(Ok(undefined)),
         },
       },
       config: {
-        getConfig: () => Promise.resolve({}),
+        getConfig: () => Promise.resolve(createTestConfig()),
       },
     };
 
@@ -216,5 +205,88 @@ describe("useWorkspaceHeartbeat", () => {
     expect(updatedMetadata.heartbeat?.intervalMs).toBe(initialSettings.intervalMs);
     expect(updatedMetadata.heartbeat?.contextMode).toBe(initialSettings.contextMode);
     expect(updatedMetadata.heartbeat?.message).toBe(initialSettings.message);
+  });
+});
+
+// A reconnect reloads the workspace's heartbeat settings through the new client. The dialog keeps
+// the shown settings (no "loading" form) until the reload answers; another workspace resets it.
+describe.each([...GAP_MODES])("useWorkspaceHeartbeat across a reconnect (%s)", (mode) => {
+  let cleanupDom: (() => void) | null = null;
+  let harness: ConnectionHarness;
+  /** The message the next server's heartbeat.get answers, or a promise of it. */
+  let serverMessage: string | Promise<string>;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+    serverMessage = "old";
+    harness = createConnectionHarness(mode, (): TestApiOverrides<APIClient> => {
+      const message = Promise.resolve(serverMessage);
+      return {
+        workspace: {
+          heartbeat: {
+            get: () =>
+              message.then((text) => ({
+                enabled: true,
+                intervalMs: 120000,
+                contextMode: "normal" as const,
+                message: text,
+              })),
+          },
+        },
+        config: { getConfig: () => Promise.resolve(createTestConfig()) },
+      };
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  function Wrapper(props: { children: React.ReactNode }) {
+    const workspaceContext = {
+      workspaceMetadata: new Map<string, FrontendWorkspaceMetadata>(),
+      setWorkspaceMetadata: setWorkspaceMetadataMock,
+    } as unknown as WorkspaceContextValue;
+    return (
+      <harness.Wrapper>
+        <WorkspaceContext.Provider value={workspaceContext}>
+          {props.children}
+        </WorkspaceContext.Provider>
+      </harness.Wrapper>
+    );
+  }
+
+  test("keeps the shown settings until the reload answers", async () => {
+    const view = renderHook(
+      (props: { workspaceId: string }) => useWorkspaceHeartbeat({ workspaceId: props.workspaceId }),
+      { wrapper: Wrapper, initialProps: { workspaceId: TEST_WORKSPACE_ID } }
+    );
+    await waitFor(() => expect(view.result.current.settings.message).toBe("old"));
+
+    let answer: ((message: string) => void) | null = null;
+    serverMessage = new Promise((resolve) => (answer = resolve));
+    await harness.drop();
+    harness.reconnect();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    });
+    expect(view.result.current.isLoading).toBe(false);
+    expect(view.result.current.settings.message).toBe("old");
+    // A save waits for the new client's read: the old form would overwrite server changes.
+    expect(view.result.current.isReloading).toBe(true);
+
+    act(() => answer?.("new"));
+    await waitFor(() => expect(view.result.current.settings.message).toBe("new"));
+    expect(view.result.current.isReloading).toBe(false);
+
+    // Another workspace shows "loading" (not the first workspace's settings) until it loads.
+    serverMessage = new Promise(() => undefined);
+    await harness.drop();
+    harness.reconnect();
+    view.rerender({ workspaceId: "workspace-2" });
+    expect(view.result.current.isLoading).toBe(true);
+    expect(view.result.current.settings.message).not.toBe("new");
   });
 });

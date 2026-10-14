@@ -29,6 +29,7 @@ import { ChatInputDecoration } from "@/browser/components/ChatPane/ChatInputDeco
 import type { Review } from "@/common/types/review";
 import { useReviews } from "@/browser/hooks/useReviews";
 import { formatRelativeTime } from "@/browser/utils/ui/dateTime";
+import { formatReviewLocationLabel } from "@/browser/utils/review/lineRange";
 import { DiffRenderer } from "@/browser/features/Shared/DiffRenderer";
 import { matchesKeybind, formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 
@@ -218,7 +219,9 @@ const ReviewItem: React.FC<ReviewItemProps> = ({
           className="flex min-w-0 flex-1 items-center gap-2 text-left"
         >
           <span className="shrink-0 truncate font-mono text-[var(--color-review-accent)]">
-            {review.data.filePath}:{review.data.lineRange}
+            {review.data.artifact != null
+              ? formatReviewLocationLabel(review.data)
+              : `${review.data.filePath}:${review.data.lineRange}`}
           </span>
           {review.data.userNote && (
             <span className="text-secondary min-w-0 flex-1 truncate italic">
@@ -369,8 +372,9 @@ const ReviewsBannerInner: React.FC<ReviewsBannerInnerProps> = ({ workspaceId }) 
     [reviewsHook]
   );
 
-  // Don't show anything if no reviews
-  if (reviewsHook.reviews.length === 0) {
+  // Nothing to list: attached reviews show in the composer, not here, so a banner holding only
+  // those read "No pending reviews" (#5675).
+  if (pendingList.length === 0 && completedList.length === 0) {
     return null;
   }
 
@@ -474,11 +478,6 @@ const ReviewsBannerInner: React.FC<ReviewsBannerInnerProps> = ({ workspaceId }) 
                 </button>
               )}
             </div>
-          )}
-
-          {/* Empty state */}
-          {pendingList.length === 0 && completedList.length === 0 && (
-            <div className="text-muted py-3 text-center text-xs">No reviews yet</div>
           )}
         </>
       )}

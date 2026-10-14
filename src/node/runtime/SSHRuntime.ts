@@ -31,7 +31,11 @@ import type {
   WorkspaceForkResult,
   InitLogger,
 } from "./Runtime";
-import { WORKSPACE_REPO_MISSING_ERROR } from "./Runtime";
+import {
+  RuntimeError,
+  WORKSPACE_REPO_MISSING_ERROR,
+  isRuntimeRetryableTransportError,
+} from "./Runtime";
 import { RemoteRuntime, type SpawnResult } from "./RemoteRuntime";
 import { log } from "@/node/services/log";
 import { findInitHookRelativePath, runInitHookOnRuntime, runWorkspaceInitHook } from "./initHook";
@@ -39,13 +43,14 @@ import { expandTildeForSSH, cdCommandForSSH } from "./tildeExpansion";
 import { sleepWithAbort } from "@/node/utils/abort";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { getErrorMessage } from "@/common/utils/errors";
+import { EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import {
   type SSHRuntimeConfig,
   getControlPath,
   appendOpenSSHHostKeyPolicyArgs,
   sshConnectionPool,
 } from "./sshConnectionPool";
-import { getOriginUrlForBundle } from "./gitBundleSync";
+import { buildSourceRefSnapshotCommand, getOriginUrlForBundle } from "./gitBundleSync";
 import { gitNoHooksPrefix } from "@/node/utils/gitNoHooksEnv";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import { syncRuntimeGitSubmodules } from "./submoduleSync";
@@ -53,6 +58,7 @@ import {
   OpenSSHTransport,
   type PtyHandle,
   type PtySessionParams,
+  type ReverseForward,
   type SSHTransport,
 } from "./transports";
 import {
@@ -500,6 +506,9 @@ async function fastReadGitHeadsRefs(projectPath: string): Promise<string | null>
  *
  * Extends RemoteRuntime for shared exec/file operations.
  */
+/** Trunk-like names SSH cleanups never `branch -D`, even when they look orphaned. */
+const PROTECTED_BRANCHES = ["main", "master", "trunk", "develop", "default"];
+
 export class SSHRuntime extends RemoteRuntime {
   private readonly config: SSHRuntimeConfig;
   private readonly transport: SSHTransport;
@@ -561,6 +570,11 @@ export class SSHRuntime extends RemoteRuntime {
   /** Create a PTY session using the underlying transport. */
   public createPtySession(params: PtySessionParams): Promise<PtyHandle> {
     return this.transport.createPtySession(params);
+  }
+
+  /** Reverse-forward a remote loopback port to a backend loopback port (bash AI proxy). */
+  public openReverseForward(remotePort: number, localPort: number): Promise<ReverseForward> {
+    return this.transport.openReverseForward(remotePort, localPort);
   }
 
   /** Get SSH configuration (for PTY terminal spawning). */
@@ -1100,6 +1114,15 @@ export class SSHRuntime extends RemoteRuntime {
     return cdCommandForSSH(cwd);
   }
 
+  override isTransportFailureExit(exitCode: number, stderr: string): boolean {
+    // A probe that hit its own client-side deadline proved nothing about the
+    // file: a stalled link (docker pause, dead peer before keepalives notice)
+    // reaches the 5–10 s probe deadlines first (#4825). The callers of this
+    // hook are trivial non-login primitives (cat, stat, find, mv); resolvePath
+    // runs a slow `bash -lc` login shell and deliberately does not use it.
+    return exitCode === EXIT_CODE_TIMEOUT || this.transport.isConnectionFailure(exitCode, stderr);
+  }
+
   protected async spawnRemoteProcess(
     fullCommand: string,
     options: ExecOptions & { deadlineMs?: number }
@@ -1126,6 +1149,23 @@ export class SSHRuntime extends RemoteRuntime {
   // ===== Runtime interface implementations =====
 
   async resolvePath(filePath: string): Promise<string> {
+    // One bounded retry on a transport failure (#4830), as for reads and
+    // stats: each attempt is already capped at 10 s, so a persistent outage
+    // still fails fast. A login-shell timeout is not transport and never
+    // retries. If the retry fails too, callers see the first failure.
+    try {
+      return await this.resolvePathOnce(filePath);
+    } catch (error) {
+      if (!isRuntimeRetryableTransportError(error)) throw error;
+      log.debug(`Retrying SSH path resolution of ${filePath} after a transport failure`, error);
+      return this.resolvePathOnce(filePath).catch((retryError: unknown) => {
+        log.debug(`Retry of SSH path resolution of ${filePath} failed too`, retryError);
+        throw error;
+      });
+    }
+  }
+
+  protected override async resolvePathOnce(filePath: string): Promise<string> {
     // Expand ~ on the remote host.
     // Note: `p='~/x'; echo "$p"` does NOT expand ~ (tilde expansion happens before assignment).
     // We do explicit expansion using parameter substitution (no reliance on `realpath`, `readlink -f`, etc.).
@@ -1167,6 +1207,11 @@ export class SSHRuntime extends RemoteRuntime {
 
       if (result.exitCode !== 0) {
         const message = result.stderr || result.stdout || "Unknown error";
+        // An unreachable host says nothing about the path; callers must not
+        // skip the root as if it were absent (#4438).
+        if (this.transport.isConnectionFailure(result.exitCode, result.stderr)) {
+          throw new RuntimeError(`Failed to resolve SSH path: ${message}`, "network");
+        }
         throw new Error(`Failed to resolve SSH path: ${message}`);
       }
 
@@ -1806,6 +1851,16 @@ export class SSHRuntime extends RemoteRuntime {
       const errorDetail = stderr || stdout || "git unavailable";
       const isCommandMissing =
         verifyResult.exitCode === 127 || /command not found/i.test(stderr || stdout);
+
+      // A stall that hits the verify deadline is not a missing repository:
+      // keep it retryable instead of a permanent runtime_not_ready (#4825).
+      if (verifyResult.exitCode === EXIT_CODE_TIMEOUT) {
+        return {
+          ready: false,
+          error: "Failed to reach SSH host: repository check timed out",
+          errorType: "runtime_start_failed",
+        };
+      }
 
       if (this.transport.isConnectionFailure(verifyResult.exitCode, verifyResult.stderr)) {
         return {
@@ -3161,7 +3216,8 @@ export class SSHRuntime extends RemoteRuntime {
     workspaceName: string,
     force: boolean,
     abortSignal?: AbortSignal,
-    trusted?: boolean
+    trusted?: boolean,
+    options?: { keepBranch?: boolean }
   ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }> {
     // Check if already aborted
     if (abortSignal?.aborted) {
@@ -3355,8 +3411,12 @@ export class SSHRuntime extends RemoteRuntime {
         // that re-forking with the same workspace name can use the fast worktree
         // path (git worktree add -b fails if the branch already exists).
         // Skip protected trunk branch names to avoid accidental deletion.
-        const PROTECTED_BRANCHES = ["main", "master", "trunk", "develop", "default"];
-        if (branchToDelete && !PROTECTED_BRANCHES.includes(branchToDelete)) {
+        // keepBranch: the caller undoes a creation that reused this branch (#4819).
+        if (
+          branchToDelete &&
+          !PROTECTED_BRANCHES.includes(branchToDelete) &&
+          options?.keepBranch !== true
+        ) {
           // HEAD neutralization migrates legacy *Xum-owned* base repos whose
           // HEAD still points at a user branch (the Graphite-poisoning state)
           // so `branch -D` keeps Git's native checked-out-branch guard instead
@@ -3485,6 +3545,19 @@ export class SSHRuntime extends RemoteRuntime {
         { cwd: "/tmp", timeout: 30 }
       ).catch(() => undefined);
       await removeStaging(reason);
+      // Callers run only after this fork's `worktree add -b` succeeded, and that refuses an
+      // existing branch, so the fork made `newWorkspaceName` and nothing has committed to it.
+      // Leaving it would make a retry of the name miss the fast path and the copy fallback check
+      // out the stale branch (#5125). This runs after the staging removal: `branch -D` refuses a
+      // branch any registered worktree still uses (even one whose dir is gone), so when the
+      // removal failed or another worktree took the branch, it is kept.
+      if (!PROTECTED_BRANCHES.includes(newWorkspaceName)) {
+        await execBuffered(
+          this,
+          `${nhp}git -C ${baseRepoPathArg} branch -D ${shescape.quote(newWorkspaceName)} 2>/dev/null || true`,
+          { cwd: "/tmp", timeout: 10 }
+        ).catch(() => undefined);
+      }
     };
 
     // Hoisted outside the try block so the catch handler can reach them when
@@ -3616,6 +3689,18 @@ export class SSHRuntime extends RemoteRuntime {
           await execBuffered(
             this,
             `cd ${stagingPathArg} && for branch in $(git for-each-ref --format='%(refname:short)' refs/remotes/origin/ | grep -v 'origin/HEAD'); do localname=\${branch#origin/}; git show-ref --verify --quiet refs/heads/$localname || git branch $localname $branch; done`,
+            { cwd: "/tmp", timeout: 30 }
+          );
+        } catch {
+          // Ignore - best-effort.
+        }
+
+        // Best-effort: record the inherited branches and stash before origin/* can go away, so the
+        // task_remove lossy check counts only the fork's own commits (#5105).
+        try {
+          await execBuffered(
+            this,
+            `cd ${stagingPathArg} && ${buildSourceRefSnapshotCommand(nhp)}`,
             { cwd: "/tmp", timeout: 30 }
           );
         } catch {
@@ -3763,7 +3848,15 @@ export class SSHRuntime extends RemoteRuntime {
         }
       }
 
-      return { success: true, workspacePath: newWorkspacePath, sourceBranch };
+      // `worktree add -b` refuses an existing branch, so only the worktree path demonstrably made
+      // the fork's branch; the copy fallback may have checked out an existing one. Rollbacks
+      // delete the branch only when this is true (#5119).
+      return {
+        success: true,
+        workspacePath: newWorkspacePath,
+        sourceBranch,
+        createdBranch: usedWorktree,
+      };
     } catch (error) {
       // Catch-all cleanup so an aborted/thrown fork can never leave the
       // staging worktree registered in the bare repo with a dangling gitdir.

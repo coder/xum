@@ -3,12 +3,10 @@ import { isPixel } from "@coder/pixel-storybook/storyapi";
 import { ThemeProvider, type ThemeMode } from "../src/browser/contexts/ThemeContext";
 import "../src/browser/styles/globals.css";
 import {
-  TUTORIAL_STATE_KEY,
   RIGHT_SIDEBAR_COLLAPSED_KEY,
   LEFT_SIDEBAR_COLLAPSED_KEY,
   EXPANDED_PROJECTS_KEY,
   WORKSPACE_DRAFTS_BY_PROJECT_KEY,
-  type TutorialState,
 } from "../src/common/constants/storage";
 import { NOW } from "../src/browser/stories/storyTime";
 import { updatePersistedState } from "../src/browser/hooks/usePersistedState";
@@ -34,6 +32,17 @@ const PIXEL_STABILITY_CSS = `
     caret-color: transparent !important;
     scroll-behavior: auto !important;
     transition: none !important;
+  }
+  /*
+   * Sticky elements (the chat composer dock, tool headers, sidebars) often rest at a
+   * fractional offset inside a composited scroller. Chromium rasterizes them either
+   * in their own layer or with the scroller depending on timing, which snaps their
+   * text/borders a device pixel apart between otherwise identical captures (seen as
+   * a composer "jitter" diff on App/MCP Identity/Chat/Plugin Server Details).
+   * Forcing a dedicated layer makes the snapping path deterministic.
+   */
+  .sticky {
+    will-change: transform;
   }
 `;
 
@@ -63,21 +72,21 @@ function ensureStorybookFontsReady(): Promise<void> {
 
   return fontsReadyPromise;
 }
-// Mock Date.now() globally for deterministic snapshots
-// Components using Date.now() for elapsed time calculations need stable reference
-Date.now = () => NOW;
-
-// Disable tutorials by default in Storybook to prevent them from interfering with stories
-// Individual stories can override this by setting localStorage before rendering
-function disableTutorials() {
-  if (typeof localStorage !== "undefined") {
-    const disabledState: TutorialState = {
-      disabled: true,
-      completed: { creation: true, workspace: true },
-    };
-    localStorage.setItem(TUTORIAL_STATE_KEY, JSON.stringify(disabledState));
-  }
-}
+// Freeze the wall clock globally for deterministic snapshots. Components using
+// Date.now() for elapsed-time math need a stable reference, and so does every
+// zero-arg `new Date()`: mocking only Date.now left `new Date()` on the real
+// clock, so fixtures stamped with it (e.g. createWorkspace's default createdAt)
+// sorted by whichever millisecond each call landed in. That reordered the
+// sidebar in App/ChatLoading/Replay between otherwise identical captures.
+const RealDate = Date;
+globalThis.Date = new Proxy(RealDate, {
+  construct: (target, args: unknown[], newTarget: new (...args: unknown[]) => unknown) =>
+    Reflect.construct(target, args.length === 0 ? [NOW] : args, newTarget) as object,
+  // `Date()` called as a function returns the current time as a string.
+  apply: () => new RealDate(NOW).toString(),
+  get: (target, property, receiver) =>
+    property === "now" ? () => NOW : Reflect.get(target, property, receiver),
+});
 
 // Collapse right sidebar by default to ensure deterministic snapshots
 // Stories that need expanded sidebar call expandRightSidebar() in their setup
@@ -103,10 +112,11 @@ function collapseProjects() {
 }
 
 // Clear workspace drafts to ensure deterministic snapshots.
-// Drafts persist in localStorage and can leak between stories causing flaky diffs.
-// Uses updatePersistedState to notify subscribers (WorkspaceContext uses listener: true).
+// The draft list lives on the (mock) backend now; stories seed it through the legacy localStorage
+// list, which the DraftStore imports. Remove a leftover legacy list so only the story's own seed
+// is imported (the key is read-and-remove only, so writing "{}" would shadow the seed).
 function clearWorkspaceDrafts() {
-  updatePersistedState(WORKSPACE_DRAFTS_BY_PROJECT_KEY, {});
+  updatePersistedState(WORKSPACE_DRAFTS_BY_PROJECT_KEY, undefined);
 }
 
 const preview: Preview = {
@@ -146,11 +156,6 @@ const preview: Preview = {
       if (typeof document !== "undefined") {
         document.documentElement.dataset.theme = mode;
         document.documentElement.style.colorScheme = mode;
-      }
-
-      // Disable tutorials by default unless explicitly enabled for this story
-      if (!context.parameters?.tutorialEnabled) {
-        disableTutorials();
       }
 
       // Reset the left sidebar to the app's viewport-dependent default.

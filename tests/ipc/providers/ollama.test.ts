@@ -8,6 +8,7 @@ import {
   configureTestRetries,
 } from "../helpers";
 import { spawn } from "child_process";
+import { isToolCallEnd, isToolCallStart } from "../../../src/common/orpc/types";
 import { loadTokenizerModules } from "../../../src/node/utils/main/tokenizer";
 
 // Skip all tests if TEST_INTEGRATION or TEST_OLLAMA is not set
@@ -32,11 +33,11 @@ async function ensureOllamaModel(model: string): Promise<void> {
     let stdout = "";
     let stderr = "";
 
-    checkProcess.stdout.on("data", (data) => {
+    checkProcess.stdout.on("data", (data: Buffer) => {
       stdout += data.toString();
     });
 
-    checkProcess.stderr.on("data", (data) => {
+    checkProcess.stderr.on("data", (data: Buffer) => {
       stderr += data.toString();
     });
 
@@ -61,7 +62,7 @@ async function ensureOllamaModel(model: string): Promise<void> {
 
       // Capture output for error reporting but don't log progress
       let pullStderr = "";
-      pullProcess.stderr?.on("data", (data) => {
+      pullProcess.stderr?.on("data", (data: Buffer) => {
         pullStderr += data.toString();
       });
 
@@ -158,22 +159,25 @@ describeOllama("Ollama integration", () => {
 
       // Verify bash was called via events
       const events = collector.getEvents();
-      const toolCallStarts = events.filter((e: any) => e.type === "tool-call-start");
+      const toolCallStarts = events.filter(isToolCallStart);
       expect(toolCallStarts.length).toBeGreaterThan(0);
 
-      const bashCall = toolCallStarts.find((e: any) => e.toolName === "bash");
+      const bashCall = toolCallStarts.find((e) => e.toolName === "bash");
       expect(bashCall).toBeDefined();
 
       // Verify we got a response and/or tool output with date/time info
       const deltas = collector.getDeltas();
       const responseText = extractTextFromEvents(deltas).toLowerCase();
 
-      const toolCallEnds = events.filter(
-        (e: any) => e.type === "tool-call-end" && e.toolName === "bash"
-      );
+      const toolCallEnds = events.filter(isToolCallEnd).filter((e) => e.toolName === "bash");
       const bashOutput = toolCallEnds
-        .map((e: any) => e.result?.output)
-        .filter((t: any) => typeof t === "string")
+        .map((e) => {
+          const result = e.result;
+          return typeof result === "object" && result !== null && "output" in result
+            ? result.output
+            : undefined;
+        })
+        .filter((t) => typeof t === "string")
         .join("\n")
         .toLowerCase();
 
@@ -207,10 +211,10 @@ describeOllama("Ollama integration", () => {
 
       // Verify file_read tool was called via events
       const events = collector.getEvents();
-      const toolCallStarts = events.filter((e: any) => e.type === "tool-call-start");
+      const toolCallStarts = events.filter(isToolCallStart);
       expect(toolCallStarts.length).toBeGreaterThan(0);
 
-      const fileReadCall = toolCallStarts.find((e: any) => e.toolName === "file_read");
+      const fileReadCall = toolCallStarts.find((e) => e.toolName === "file_read");
       expect(fileReadCall).toBeDefined();
 
       // Verify response mentions README content (mux heading or similar)

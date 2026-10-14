@@ -1,0 +1,30 @@
+import { Switch } from "@/browser/components/Switch/Switch";
+import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
+
+/** Per-user settings for the Artifacts experiment, shown under its row in Experiments. */
+export function ArtifactsExperimentConfig() {
+  // Same default as SandboxedArtifactFrame and McpAppFrame.
+  const allowCdn =
+    useUserPreferences((preferences) => preferences.ui?.artifactsAllowCdnScripts) ?? true;
+  return (
+    <div className="bg-background-secondary flex items-center justify-between gap-4 px-4 py-3">
+      <div className="flex-1">
+        <div className="text-foreground text-sm">Allow CDN scripts in artifacts</div>
+        <div className="text-muted text-xs">
+          HTML and SVG artifacts run in a sandbox whose content policy blocks network requests,
+          except scripts from a few public CDNs (cdnjs, unpkg, jsDelivr, jQuery, Tailwind) and
+          Google Fonts. This is not a full network block: a hostile artifact could still leak data,
+          for example through WebRTC or the paths of those CDN requests. Turn this off to block
+          every CDN.
+        </div>
+      </div>
+      <Switch
+        checked={allowCdn}
+        onCheckedChange={(checked) =>
+          updateUserPreferences({ ui: { artifactsAllowCdnScripts: checked } })
+        }
+        aria-label="Toggle CDN scripts in artifacts"
+      />
+    </div>
+  );
+}

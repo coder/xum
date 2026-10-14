@@ -3,11 +3,15 @@ import { TRANSCRIPT_REVEAL_STEP_CHARS } from "@/common/constants/ui";
 import type { DisplayedMessage } from "@/common/types/message";
 import {
   computeOperationalBundleInfos,
-  computeTaskAwaitPollGroupInfos,
   computeWorkBundleInfos,
   estimateTranscriptRowWeight,
   summarizeOperationalBundle,
 } from "./transcriptRenderProjection";
+
+// ChatPane groups only task_await polls outside hyper density.
+function computeTaskAwaitPollGroupInfos(messages: DisplayedMessage[]) {
+  return computeOperationalBundleInfos(messages, { isTurnActive: false, taskAwaitPollsOnly: true });
+}
 
 let nextToolId = 0;
 

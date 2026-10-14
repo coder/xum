@@ -1,0 +1,218 @@
+/**
+ * MCP Apps (SEP-1865, `io.modelcontextprotocol/ui`, spec 2026-01-26) shared constants and pure
+ * helpers. Gated by the artifacts experiment: with it off, Xum neither announces the extension
+ * nor keeps any `_meta.ui`.
+ */
+
+import { sanitizeText } from "@/common/utils/mcp/displayText";
+
+export const MCP_APPS_EXTENSION_ID = "io.modelcontextprotocol/ui";
+export const MCP_APP_MIME_TYPE = "text/html;profile=mcp-app";
+/**
+ * ChatGPT Apps SDK templates (reached through `_meta["openai/outputTemplate"]`) are served as
+ * this legacy MIME type. Accepted for view resources next to MCP_APP_MIME_TYPE.
+ */
+export const MCP_APP_SKYBRIDGE_MIME_TYPE = "text/html+skybridge";
+/** Largest view resource (decoded HTML) the host accepts from resources/read. */
+export const MCP_APP_RESOURCE_MAX_BYTES = 2 * 1024 * 1024;
+/** Longest ui:// URI kept on tool metadata and display snapshots. */
+export const MCP_APP_RESOURCE_URI_MAX_CHARS = 512;
+/** Largest ui/update-model-context text (UTF-8 bytes) a view may store; larger is -32602. */
+export const MCP_APP_MODEL_CONTEXT_MAX_BYTES = 16 * 1024;
+/** Most domains in one declared CSP list (`_meta.ui.csp`, or `openai/widgetCSP` when it omits the list). */
+export const MCP_APP_CSP_DOMAINS_MAX = 32;
+/** Most approved view domains kept per server and project. */
+export const MCP_APP_VIEW_DOMAINS_MAX = 64;
+
+/**
+ * The origin a view may be granted for a declared CSP domain, or null. Only a bare https origin
+ * qualifies: no wildcard, path, query, fragment or credentials, so an approval names exactly the
+ * host (and port) the user saw in the strip.
+ */
+export function mcpAppGrantableOrigin(declared: string): string | null {
+  if (declared.includes("*")) return null;
+  let url: URL;
+  try {
+    url = new URL(declared);
+  } catch {
+    return null;
+  }
+  const bare =
+    url.protocol === "https:" &&
+    url.username === "" &&
+    url.password === "" &&
+    url.search === "" &&
+    url.hash === "" &&
+    (url.pathname === "/" || url.pathname === "");
+  return bare ? url.origin : null;
+}
+
+/** Longest URI a view may pass to resources/read (any scheme its server serves). */
+export const MCP_APP_READ_URI_MAX_CHARS = 2048;
+/** Most tool calls one mcpApps.getViewRecords request may name (the client splits longer lists). */
+export const MCP_APP_VIEW_RECORDS_MAX_IDS = 64;
+
+export type MCPToolVisibility = "model" | "app";
+
+export interface MCPToolUi {
+  /**
+   * The tool's view. Optional: an app-only helper may declare `visibility` without a view of
+   * its own, and its visibility must still apply. Callers that associate a view (result
+   * records, display snapshots, "Open in Artifacts") require it.
+   */
+  resourceUri?: string;
+  visibility: MCPToolVisibility[];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export function isMcpAppResourceUri(uri: unknown): uri is string {
+  return (
+    typeof uri === "string" &&
+    uri.startsWith("ui://") &&
+    uri.length > "ui://".length &&
+    uri.length <= MCP_APP_RESOURCE_URI_MAX_CHARS
+  );
+}
+
+/** The spec's default when a tool declares no visibility (including tools without `_meta.ui`). */
+const DEFAULT_VISIBILITY: readonly MCPToolVisibility[] = ["model", "app"];
+
+/**
+ * Read a tool definition's `_meta.ui` (or the deprecated flat `_meta["ui/resourceUri"]`).
+ * The view URI is taken from the first key present, in this order: `_meta.ui.resourceUri`,
+ * `_meta["ui/resourceUri"]`, then ChatGPT's compatibility alias `_meta["openai/outputTemplate"]`
+ * (so servers built for ChatGPT render here too). ChatGPT's `openai/visibility` and
+ * `openai/widgetAccessible` are not mapped: their documented semantics do not say how they
+ * combine with the spec's default visibility, so only `_meta.ui.visibility` counts.
+ * The view URI and the visibility are parsed independently: an invalid or missing ui:// view
+ * drops only `resourceUri`, never a declared visibility (a `visibility: ["app"]` helper must
+ * stay hidden from the model). Returns undefined when neither is declared. Visibility defaults
+ * to ["model", "app"] per the spec; unknown visibility entries are ignored.
+ */
+export function parseMCPToolUiMeta(meta: unknown): MCPToolUi | undefined {
+  if (!isRecord(meta)) return undefined;
+  const ui = isRecord(meta.ui) ? meta.ui : undefined;
+  const rawResourceUri = ui?.resourceUri ?? meta["ui/resourceUri"] ?? meta["openai/outputTemplate"];
+  const resourceUri = isMcpAppResourceUri(rawResourceUri) ? rawResourceUri : undefined;
+  const rawVisibility = ui?.visibility;
+  if (resourceUri === undefined && !Array.isArray(rawVisibility)) return undefined;
+  const visibility = Array.isArray(rawVisibility)
+    ? [
+        ...new Set(
+          rawVisibility.filter((v): v is MCPToolVisibility => v === "model" || v === "app")
+        ),
+      ]
+    : ([...DEFAULT_VISIBILITY] satisfies MCPToolVisibility[]);
+  return resourceUri !== undefined ? { resourceUri, visibility } : { visibility };
+}
+
+/** Whether a tool belongs in the agent's tool list. */
+export function isModelVisibleTool(ui: MCPToolUi | undefined): boolean {
+  return (ui?.visibility ?? DEFAULT_VISIBILITY).includes("model");
+}
+
+/**
+ * Whether a view may call the tool through tools/call (the host MUST reject it otherwise).
+ * Tools without `_meta.ui` get the default visibility, so they are app-callable but, being
+ * model-visible too, need a per-call user confirmation.
+ */
+export function isAppCallableTool(ui: MCPToolUi | undefined): boolean {
+  return (ui?.visibility ?? DEFAULT_VISIBILITY).includes("app");
+}
+
+/**
+ * View-initiated tools/call + resources/read budget per view (both reach the server). Opening an
+ * entry point calls its tool, so the backend applies the same budget per workspace and server.
+ */
+export const MCP_APP_TOOL_CALLS_PER_WINDOW = 5;
+export const MCP_APP_TOOL_CALL_WINDOW_MS = 10_000;
+
+/** An entry point type Xum opens (see parseMCPAppEntrypoints for the skipped `file` type). */
+export type MCPAppEntrypointType = "global" | "thread";
+
+/** The spec's limit on entry points per tool. */
+export const MCP_APP_ENTRYPOINTS_MAX = 3;
+
+/**
+ * Read `_meta["openai/ui"].entrypoints` (OpenAI MCP extensions, "MCP App Entrypoints"): at most
+ * three `{type: "global"}`, `{type: "thread"}` or `{type: "file", extensions}` entries. Xum skips
+ * `file` entry points: they open with a FileInput argument and read the file through the
+ * extended `openai/resource` APIs, which Xum does not implement. Unknown types are ignored;
+ * duplicates collapse. `_meta.ui.visibility` does not apply to entry points (the spec ignores it
+ * when a view opens as one), so a `visibility: ["app"]` tool still has its entry points.
+ */
+export function parseMCPAppEntrypoints(meta: unknown): {
+  types: MCPAppEntrypointType[];
+  skippedFile: boolean;
+} {
+  const openaiUi = isRecord(meta) && isRecord(meta["openai/ui"]) ? meta["openai/ui"] : undefined;
+  const raw = Array.isArray(openaiUi?.entrypoints)
+    ? openaiUi.entrypoints.slice(0, MCP_APP_ENTRYPOINTS_MAX)
+    : [];
+  const types = new Set<MCPAppEntrypointType>();
+  let skippedFile = false;
+  for (const entry of raw) {
+    const type = isRecord(entry) ? entry.type : undefined;
+    if (type === "global" || type === "thread") types.add(type);
+    else if (type === "file") skippedFile = true;
+  }
+  return { types: [...types], skippedFile };
+}
+
+/**
+ * Longest tool name the MCP Apps routes accept (a view's tools/call, an entry point listing and
+ * open). An entry point whose tool name does not fit is not listed: one bad name would fail the
+ * listing's output schema for every server.
+ */
+export const MCP_APP_TOOL_NAME_MAX_CHARS = 256;
+
+/** Longest entry point title shown (launcher row, palette command, tab label). */
+export const MCP_APP_ENTRYPOINT_TITLE_MAX_CHARS = 120;
+
+/**
+ * An entry point's display title from a server-controlled candidate list (the spec's order:
+ * `title`, then `annotations.title`), else the tool name: each cleaned like server identity
+ * text (bidi and control characters, which could visually reorder the command the user is
+ * about to run, become spaces; whitespace collapses; a bounded prefix is kept). The first
+ * candidate that is not empty after cleaning wins; undefined when even the name cleans to
+ * nothing (the entry point is then skipped).
+ */
+export function mcpAppEntrypointTitle(
+  candidates: readonly unknown[],
+  toolName: string
+): string | undefined {
+  for (const candidate of [...candidates, toolName]) {
+    const title = sanitizeText(candidate, MCP_APP_ENTRYPOINT_TITLE_MAX_CHARS);
+    if (title !== undefined) return title;
+  }
+  return undefined;
+}
+
+/**
+ * The result-store key of an opened entry point (one view record per server, tool and type).
+ * Names are encoded: server keys contain colons (`plugin:<hex>:<server>`), and a raw join would
+ * give `a` + `b:c` and `a:b` + `c` the same key.
+ */
+export function mcpAppEntrypointKey(
+  serverName: string,
+  toolName: string,
+  type: MCPAppEntrypointType
+): string {
+  return `entrypoint:${encodeKeyPart(serverName)}:${encodeKeyPart(toolName)}:${type}`;
+}
+
+/**
+ * Escape every UTF-16 code unit outside `[A-Za-z0-9._-]` as `%` + four hex digits. Total (unlike
+ * encodeURIComponent, which throws on a lone surrogate: one bad name would fail the whole
+ * listing) and injective (fixed width, `%` itself is escaped). The regex has no `u` flag, so it
+ * matches code units, not code points.
+ */
+function encodeKeyPart(part: string): string {
+  return part.replace(
+    /[^A-Za-z0-9._-]/g,
+    (unit) => `%${unit.charCodeAt(0).toString(16).padStart(4, "0")}`
+  );
+}

@@ -40,16 +40,11 @@ export class ContextManagementService {
    * plain EventEmitter, so per-session listeners would trip the default listener limit with a
    * handful of parallel agents. The threshold lives in config.json (owned by the slider through
    * user preferences); a change for the model a session's continuous compaction is working
-   * against invalidates its staged fold, exactly as the former RPC setter did. Test doubles may
-   * omit the subscription.
+   * against invalidates its staged fold, exactly as the former RPC setter did.
    */
   private ensureConfigSubscription(): void {
     if (this.unsubscribeConfigChanged) return;
-    const maybeConfig = this.deps.config as Config & {
-      onConfigChanged?: Config["onConfigChanged"];
-    };
-    if (typeof maybeConfig.onConfigChanged !== "function") return;
-    this.unsubscribeConfigChanged = maybeConfig.onConfigChanged(() => {
+    this.unsubscribeConfigChanged = this.deps.config.onConfigChanged(() => {
       for (const controller of this.openControllers) {
         controller.onPersistedPreferencesChanged();
       }

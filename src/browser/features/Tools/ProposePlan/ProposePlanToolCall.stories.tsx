@@ -99,10 +99,9 @@ export const ProposePlanInPlanMode: AppStory = {
   render: () => (
     <AppWithMocks
       setup={() => {
-        window.localStorage.setItem("agentId:ws-plan-mode", JSON.stringify("plan"));
-
         return setupSimpleChatStory({
           workspaceId: "ws-plan-mode",
+          agentId: "plan",
           messages: [
             createUserMessage("msg-1", "Help me refactor the authentication module", {
               historySequence: 1,
@@ -192,7 +191,7 @@ export const ProposePlanMobile: AppStory = {
  * Wide-viewport story that exercises the sticky plan TOC.
  *
  * The TOC lives in an absolutely-positioned `<aside>` outside the centered
- * `max-w-4xl` transcript column, and is gated by a container query on the
+ * `max-w-chat` transcript column, and is gated by a container query on the
  * transcript scrollport. At desktop (1280px) viewport the gate stays closed;
  * the `wide` viewport (1600px) gives the scrollport enough room to reveal
  * the TOC alongside the plan.

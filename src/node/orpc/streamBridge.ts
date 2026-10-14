@@ -37,8 +37,9 @@
  *   first `next()` call, matching async-generator semantics.
  */
 import type { Cause, Context } from "effect";
-import { Effect, Queue, Stream } from "effect";
-import { SUBSCRIPTION_HEARTBEAT_INTERVAL_MS } from "@/common/utils/withQueueHeartbeat";
+import { Effect, Exit, Queue, Stream } from "effect";
+import assert from "@/common/utils/assert";
+import { SUBSCRIPTION_HEARTBEAT_INTERVAL_MS } from "@/constants/orpcSubscriptions";
 
 /** Producer-facing handle. Safe to call from any non-Effect callsite. */
 export interface SubscriptionEmit<T> {
@@ -52,6 +53,14 @@ export interface SubscriptionEmit<T> {
    * delivered, then the stream ends (and `onEnd` runs, if provided).
    */
   end: () => void;
+}
+
+/** Observes one subscription's delivered values (perf flight recorder, F3). */
+export interface SubscriptionTap {
+  /** One value is about to be yielded to the consumer. */
+  event(): void;
+  /** The subscription ended (any exit path); called exactly once. */
+  close(): void;
 }
 
 export interface SubscriptionStreamOptions<T> {
@@ -70,19 +79,28 @@ export interface SubscriptionStreamOptions<T> {
   /**
    * Buffering strategy. `"all"` (default) is an unbounded FIFO. `"latest"`
    * coalesces: an unconsumed value is replaced by the newest one, so a slow
-   * consumer never accumulates a backlog and never replays stale snapshots
-   * (mirrors `createLatestValueQueue`).
+   * consumer never accumulates a backlog and never replays stale snapshots.
    */
   buffer?: "all" | "latest";
   /**
    * Inject `value` into the queue every `intervalMs` (default
    * SUBSCRIPTION_HEARTBEAT_INTERVAL_MS) while the subscription is live.
-   * The ticker starts after `initialize` completes — heartbeats cannot
-   * interleave into a history replay — and stops with the stream's scope.
+   * The ticker starts after `initialize` completes (or together with it under
+   * `progressiveInitialize`) and stops with the stream's scope.
    */
   heartbeat?: { value: T; intervalMs?: number };
   /** Runs after attach, before any value is delivered. Pushes are buffered. */
   initialize?: (emit: SubscriptionEmit<T>) => void | Promise<void>;
+  /**
+   * Deliver values while `initialize` is still running instead of after it
+   * resolves, and start the heartbeat ticker before it. A slow initialize (a
+   * large onChat history replay) otherwise sends nothing for its whole
+   * duration, so the client's stall watchdog aborts and restarts it (#4506).
+   * Heartbeats may then interleave with initialize's pushes; consumers must
+   * treat them as no-ops. Values keep their push order. Cannot combine with
+   * `initial`, which must precede everything initialize pushes.
+   */
+  progressiveInitialize?: boolean;
   /**
    * Produce a value delivered before any buffered events (evaluated after
    * attach + `initialize`, so subscriptions cannot lose events that fire
@@ -96,6 +114,19 @@ export interface SubscriptionStreamOptions<T> {
    * the subscription (used to surface bootstrap errors to the client).
    */
   onEnd?: () => void | Promise<void>;
+  /**
+   * Applied to every delivered value (including `initial` and heartbeats) just before it is
+   * yielded. A throw fails the subscription like a failed pull and runs teardown. A plain hook
+   * rather than an extra wrapping async generator: a generator layer per value costs about 1 s
+   * of CPU on a 1.24M-row onChat replay (#4868).
+   */
+  mapValue?: (value: T) => T;
+  /**
+   * Called once when the generator starts (after the pre-aborted check). The tap counts every
+   * yielded value at the single yield point and is closed in the same `finally` as teardown,
+   * so observing costs no extra generator layer.
+   */
+  openTap?: () => SubscriptionTap | null;
 }
 
 /**
@@ -127,10 +158,39 @@ function subscriptionStream<T>(options: SubscriptionStreamOptions<T>): Stream.St
         (unsubscribe) => Effect.sync(unsubscribe)
       );
 
-      if (options.initialize) {
-        const initialize = options.initialize;
-        // Async thunk so synchronous throws follow the same rejection path.
-        yield* Effect.promise(async () => initialize(emit));
+      const startHeartbeat = Effect.gen(function* () {
+        if (!options.heartbeat) return;
+        const heartbeat = options.heartbeat;
+        // Scope-tied ticker fiber: interrupted with the stream.
+        yield* Effect.forkScoped(
+          Effect.forever(
+            Effect.flatMap(
+              Effect.sleep(heartbeat.intervalMs ?? SUBSCRIPTION_HEARTBEAT_INTERVAL_MS),
+              () => Queue.offer(queue, heartbeat.value)
+            )
+          )
+        );
+      });
+
+      // Async thunk so synchronous throws follow the same rejection path.
+      const initialize = options.initialize;
+      const runInitialize = initialize ? Effect.promise(async () => initialize(emit)) : Effect.void;
+
+      if (options.progressiveInitialize) {
+        assert(!options.initial, "progressiveInitialize cannot be combined with initial");
+        yield* startHeartbeat;
+        // Scope-tied fiber rather than Stream.merge, so the steady-state pipeline stays a plain
+        // fromQueue after replay. A failure closes the queue with its cause: values already
+        // pushed are still delivered, then the pull rejects like the blocking path does.
+        yield* Effect.forkScoped(
+          Effect.flatMap(Effect.exit(runInitialize), (exit) =>
+            Effect.sync(() => {
+              if (Exit.isFailure(exit)) Queue.failCauseUnsafe(queue, exit.cause);
+            })
+          )
+        );
+      } else {
+        yield* runInitialize;
       }
 
       let head: Stream.Stream<T> = Stream.empty;
@@ -140,19 +200,9 @@ function subscriptionStream<T>(options: SubscriptionStreamOptions<T>): Stream.St
         head = Stream.make(value);
       }
 
-      if (options.heartbeat) {
-        const heartbeat = options.heartbeat;
-        // Scope-tied ticker fiber: interrupted with the stream. Started after
-        // `initialize` so heartbeats never interleave into replayed history.
-        yield* Effect.forkScoped(
-          Effect.forever(
-            Effect.flatMap(
-              Effect.sleep(heartbeat.intervalMs ?? SUBSCRIPTION_HEARTBEAT_INTERVAL_MS),
-              () => Queue.offer(queue, heartbeat.value)
-            )
-          )
-        );
-      }
+      // Blocking path: the ticker starts after `initialize` so heartbeats never interleave
+      // into what it pushed.
+      if (!options.progressiveInitialize) yield* startHeartbeat;
 
       const onEnd = options.onEnd;
       let stream: Stream.Stream<T> = Stream.concat(head, Stream.fromQueue(queue));
@@ -190,13 +240,16 @@ export function subscriptionIterable<T>(options: SubscriptionStreamOptions<T>): 
     options.signal?.addEventListener("abort", onAbort, { once: true });
     if (options.signal?.aborted) onAbort();
 
+    const tap = options.openTap?.() ?? null;
     try {
       while (true) {
         const result = await iterator.next();
         if (result.done) return;
-        yield result.value;
+        tap?.event();
+        yield options.mapValue ? options.mapValue(result.value) : result.value;
       }
     } finally {
+      tap?.close();
       options.signal?.removeEventListener("abort", onAbort);
       await iterator.return?.();
     }

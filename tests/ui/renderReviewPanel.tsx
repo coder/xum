@@ -1,8 +1,18 @@
 import { render, type RenderResult, waitFor } from "@testing-library/react";
 
 import { AppLoader } from "@/browser/components/AppLoader/AppLoader";
+// App renders its pages through React.lazy (#6206), so the first page navigation of a test file
+// required the whole page module tree inside the bounded waitForPageSettled (tests/ui/helpers.ts).
+// A cold Jest transform with coverage instrumentation, as in CI, outran that bound (#6252).
+// Importing the pages here loads them with the test file, so React.lazy resolves them at once.
+import "@/browser/components/AIView/AIView";
+import "@/browser/components/ProjectPage/ProjectPage";
+import "@/browser/components/ScratchPage/ScratchPage";
 import type { APIClient } from "@/browser/contexts/API";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+
+/** Row names in the right sidebar's New tab launcher. */
+const LAUNCHER_TOOL_NAMES = { costs: "Stats", review: "Review", terminal: "Terminal" } as const;
 
 interface RenderReviewPanelParams {
   apiClient: APIClient;
@@ -76,13 +86,26 @@ export function renderApp(props: RenderReviewPanelParams): RenderedApp {
       await waitFor(
         () => {
           // Find tab button by role and name
-          const tabButton = result.container.querySelector(
+          const tabButton = result.container.querySelector<HTMLElement>(
             `[role="tab"][aria-controls*="${tab}"]`
-          ) as HTMLElement | null;
-          if (!tabButton) {
-            throw new Error(`Tab "${tab}" not found`);
+          );
+          if (tabButton) {
+            tabButton.click();
+            return;
           }
-          tabButton.click();
+          // The strip holds only opened tabs: open the tool from a New tab's launcher, adding
+          // a New tab with "+" first when none is showing. The retry then selects the tab.
+          const launcherRow = Array.from(
+            result.container.querySelectorAll<HTMLElement>(
+              '[role="tabpanel"][id*="-panel-new"] button'
+            )
+          ).find((row) => row.getAttribute("aria-label") === LAUNCHER_TOOL_NAMES[tab]);
+          if (launcherRow) {
+            launcherRow.click();
+          } else {
+            result.container.querySelector<HTMLElement>('button[aria-label="New tab"]')?.click();
+          }
+          throw new Error(`Tab "${tab}" not open yet`);
         },
         { timeout: 5000 }
       );

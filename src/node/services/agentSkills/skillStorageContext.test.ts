@@ -30,6 +30,7 @@ describe("resolveSkillStorageContext", () => {
       projectRoot: "",
       globalRoot: path.join(tempDir.path, "skills"),
       universalRoot: "~/.agents/skills",
+      globalPluginRoots: [path.join(tempDir.path, "plugins"), "~/.agents/plugins"],
     });
   });
 
@@ -54,6 +55,7 @@ describe("resolveSkillStorageContext", () => {
       projectRoot: "",
       globalRoot: path.join(runtimeMuxHome, "skills"),
       universalRoot: "~/.agents/skills",
+      globalPluginRoots: [path.join(runtimeMuxHome, "plugins"), "~/.agents/plugins"],
     });
   });
 
@@ -90,6 +92,12 @@ describe("resolveSkillStorageContext", () => {
       ],
       globalRoot: path.join(tempDir.path, "skills"),
       universalRoot: "~/.agents/skills",
+      projectPluginRoots: [
+        path.join(projectRoot, ".xum", "plugins"),
+        path.join(projectRoot, ".mux", "plugins"),
+        path.join(projectRoot, ".agents", "plugins"),
+      ],
+      globalPluginRoots: [path.join(tempDir.path, "plugins"), "~/.agents/plugins"],
     });
   });
 
@@ -124,6 +132,12 @@ describe("resolveSkillStorageContext", () => {
       globalRoot: path.join(tempDir.path, "skills"),
       universalRoot: "~/.agents/skills",
       globalClaudeRoot: "~/.claude/skills",
+      projectPluginRoots: [
+        path.join(projectRoot, ".xum", "plugins"),
+        path.join(projectRoot, ".mux", "plugins"),
+        path.join(projectRoot, ".agents", "plugins"),
+      ],
+      globalPluginRoots: [path.join(tempDir.path, "plugins"), "~/.agents/plugins"],
     });
 
     const globalContext = resolveSkillStorageContext({
@@ -141,10 +155,11 @@ describe("resolveSkillStorageContext", () => {
       globalRoot: path.join(tempDir.path, "skills"),
       universalRoot: "~/.agents/skills",
       globalClaudeRoot: "~/.claude/skills",
+      globalPluginRoots: [path.join(tempDir.path, "plugins"), "~/.agents/plugins"],
     });
   });
 
-  it("adds read-only Agent Plugins containers when includeAgentPlugins is set", () => {
+  it("adds read-only Agent Plugins containers", () => {
     using tempDir = new TestTempDir("skill-storage-context-plugin-roots");
     const runtime = new LocalRuntime(tempDir.path);
 
@@ -156,19 +171,10 @@ describe("resolveSkillStorageContext", () => {
       projectStorageAuthority: "host-local",
     };
 
-    const offContext = resolveSkillStorageContext({
-      runtime,
-      workspacePath: "/remote/workspace",
-      xumScope,
-    });
-    expect(offContext.roots?.projectPluginRoots).toBeUndefined();
-    expect(offContext.roots?.globalPluginRoots).toBeUndefined();
-
     const projectContext = resolveSkillStorageContext({
       runtime,
       workspacePath: "/remote/workspace",
       xumScope,
-      includeAgentPlugins: true,
     });
     expect(projectContext.roots?.projectPluginRoots).toEqual([
       path.join(projectRoot, ".xum", "plugins"),
@@ -187,7 +193,6 @@ describe("resolveSkillStorageContext", () => {
         type: "global",
         xumHome: tempDir.path,
       },
-      includeAgentPlugins: true,
     });
     expect(globalContext.roots?.projectPluginRoots).toBeUndefined();
     expect(globalContext.roots?.globalPluginRoots).toEqual([
@@ -236,6 +241,12 @@ describe("resolveSkillStorageContext", () => {
       ],
       globalRoot: path.join(xumHome, "skills"),
       universalRoot: "~/.agents/skills",
+      projectPluginRoots: [
+        path.join(projectRoot, ".xum", "plugins"),
+        path.join(projectRoot, ".mux", "plugins"),
+        path.join(projectRoot, ".agents", "plugins"),
+      ],
+      globalPluginRoots: [path.join(xumHome, "plugins"), "~/.agents/plugins"],
     });
 
     const hostGlobalStat = await context.runtime.stat(path.join(xumHome, "skills"));

@@ -93,29 +93,30 @@ describe("McpIconRefCache", () => {
     const p2 = cache.resolve(ref(2), api);
     const p3 = cache.resolve(ref(3), api);
     await Promise.resolve();
-    // Never more refs per IPC call than the capacity; never more entries either.
+    // Never more refs per IPC call than the capacity.
     expect(calls).toEqual([[ref(1), ref(2)], [ref(3)]]);
-    expect(cache.size).toBe(2);
     expect(cache.peek(ref(1))).toBeUndefined();
 
-    // The evicted ref is looked up again instead of joining the evicted request.
+    // Never more entries either: the pending ref 3 pushed the pending ref 1 out, so ref 1 is
+    // looked up again instead of joining the evicted request (which would issue no call).
     const p1b = cache.resolve(ref(1), api);
     await Promise.resolve();
     expect(calls).toHaveLength(3);
     expect(calls[2]).toEqual([ref(1)]);
-    expect(cache.size).toBe(2);
 
-    // The evicted request still answers its callers but cannot cache or evict.
+    // The evicted requests still answer their callers but cannot cache or evict.
     batches[0].resolve({ [ref(1)]: "data:image/png;base64,old=", [ref(2)]: null });
     expect(await p1).toBe("data:image/png;base64,old=");
     expect(await p2).toBeNull();
     expect(cache.peek(ref(1))).toBeUndefined();
+    expect(cache.peek(ref(2))).toBeUndefined();
     batches[2].resolve(icons([ref(1)]));
     expect(await p1b).toBe(PNG);
     expect(cache.peek(ref(1))).toBe(PNG);
     batches[1].resolve(icons([ref(3)]));
     expect(await p3).toBe(PNG);
-    expect(cache.size).toBe(2);
+    // Exactly the two newest refs survive.
+    expect([1, 2, 3].map((n) => cache.peek(ref(n)))).toEqual([PNG, undefined, PNG]);
   });
 
   test("a replacement client owns pending refs; the old client's late outcome cannot touch them", async () => {
@@ -134,13 +135,15 @@ describe("McpIconRefCache", () => {
     const currentToo = cache.resolve(ref(2), fresh);
     await Promise.resolve();
     expect(fresh.calls).toEqual([[ref(1), ref(2)]]);
-    expect(cache.size).toBe(2);
 
-    // Old rejection: nothing deleted, the new lookup still succeeds.
+    // Old rejection: nothing deleted (a deleted entry would make the new client ask again, and
+    // its answer below could no longer be cached), the new lookup still succeeds.
     oldBatch.reject(new Error("socket closed"));
     await stale.catch(() => undefined);
     await staleToo.catch(() => undefined);
-    expect(cache.size).toBe(2);
+    expect(cache.resolve(ref(1), fresh)).toBe(current);
+    await Promise.resolve();
+    expect(fresh.calls).toHaveLength(1);
     newBatch.resolve({ [ref(1)]: PNG, [ref(2)]: null });
     expect(await current).toBe(PNG);
     expect(await currentToo).toBeNull();
@@ -173,13 +176,11 @@ describe("McpIconRefCache", () => {
     const api = client((refs) => Promise.resolve(icons(refs)));
     const refs = Array.from({ length: 8 }, (_, i) => ref(i + 1));
     const results = refs.map((r) => cache.resolve(r, api));
-    expect(cache.size).toBe(3);
     await Promise.resolve();
     expect(api.calls.map((call) => call.length)).toEqual([3, 3, 2]);
     expect(api.calls.flat()).toEqual(refs);
-    // Every caller is answered; only the surviving entries are memoized.
+    // Every caller is answered; only the three surviving entries are memoized.
     expect(await Promise.all(results)).toEqual(refs.map(() => PNG));
-    expect(cache.size).toBe(3);
     expect(refs.slice(0, 5).map((r) => cache.peek(r))).toEqual([
       undefined,
       undefined,
@@ -244,7 +245,8 @@ describe("McpIconRefCache", () => {
     expect(cache.peek(ref(5))).toBeNull();
     // The open batch holding the evicted request was sent before 4 was queued anew.
     expect(api.calls.slice(3)).toEqual([[ref(4), ref(5)], [ref(4)]]);
-    expect(cache.size).toBe(3);
+    // Refs 1 and 2 were evicted; exactly the three newest entries remain.
+    expect([1, 2, 3].map((n) => cache.peek(ref(n)))).toEqual([undefined, undefined, PNG]);
   });
 
   test("an evicted-then-re-requested ref whose original batch rejects still resolves through the new one", async () => {
@@ -287,11 +289,16 @@ describe("McpIconRefCache", () => {
     // request for 4 and the resolved 3 are untouched.
     expect(cache.peek(ref(5))).toBeUndefined();
     expect(cache.peek(ref(3))).toBe(PNG);
-    expect(cache.size).toBe(2);
     batches[batches.length - 1].resolve(icons([ref(4)]));
     expect(await again).toBe(PNG);
     expect((await againSettled)[0].status).toBe("fulfilled");
     expect(cache.peek(ref(4))).toBe(PNG);
+    // The rejected entry for 5 is gone, not stranded as pending: the next mount asks again.
+    const retryFive = cache.resolve(ref(5), api);
+    await Promise.resolve();
+    expect(api.calls.at(-1)).toEqual([ref(5)]);
+    batches[batches.length - 1].resolve(icons([ref(5)], null));
+    expect(await retryFive).toBeNull();
   });
 
   test("rejects a non-positive capacity", () => {

@@ -1739,6 +1739,14 @@ describe("inactive real cancellation storage", () => {
       contextBoundaryKind: "reset",
       muxMetadata: { type: "compaction-summary", pendingFollowUp: followUp() },
     });
+    // The summary stream's empty placeholder row precedes its partial.
+    const placeholder = await h.historyService.appendToHistory(workspaceId, {
+      id: partial.id,
+      role: "assistant",
+      parts: [],
+      metadata: { historySequence: 1 },
+    });
+    expect(placeholder.success).toBe(true);
     expect((await h.historyService.writePartial(workspaceId, partial)).success).toBe(true);
     const before = (await foreign.readPartial(workspaceId))!;
     await fs.writeFile(storage.path, "{broken cancellation");

@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Info } from "lucide-react";
-import { useExperiment, useExperimentValue } from "@/browser/contexts/ExperimentsContext";
+import { useExperiment, useExperimentValue } from "@/browser/hooks/useExperiments";
 import {
   getExperimentList,
   getExperimentPlatformRestrictionLabel,
@@ -22,11 +22,11 @@ import {
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import type { ApiServerStatus, DesktopPrereqStatus } from "@/common/orpc/types";
 import { Input } from "@/browser/components/Input/Input";
-import { useAPI, type APIClient } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
-import { AdvisorToolExperimentConfig } from "./AdvisorToolExperimentConfig";
+import { ArtifactsExperimentConfig } from "./ArtifactsExperimentConfig";
 import { AutoModelRoutingExperimentConfig } from "./AutoModelRoutingExperimentConfig";
-import { HeartbeatDefaultsControls } from "./HeartbeatSection";
 
 const PORTABLE_DESKTOP_INSTALL_URL = "https://github.com/coder/portabledesktop";
 
@@ -41,8 +41,6 @@ const MEMORY_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [
 // Sub-experiments of Programmatic Tool Calling: same nesting treatment — RLM
 // mode is a no-op while PTC is off (code_execution is never assembled).
 const PTC_SUB_EXPERIMENT_IDS: readonly ExperimentId[] = [EXPERIMENT_IDS.RLM];
-
-type SettingsConfig = Awaited<ReturnType<APIClient["config"]["getConfig"]>>;
 
 interface ExperimentRowProps {
   experimentId: ExperimentId;
@@ -64,10 +62,12 @@ function ExperimentRow(props: ExperimentRowProps) {
         return;
       }
 
-      setEnabled(value);
+      // Dependent settings (the LAN bind reset) change only once the write is saved.
+      setEnabled(value)
+        .then(() => onToggle?.(value))
+        .catch(() => undefined);
       // Track the override for analytics
       telemetry.experimentOverridden(experimentId, value);
-      onToggle?.(value);
     },
     [disabled, setEnabled, telemetry, experimentId, onToggle]
   );
@@ -95,6 +95,40 @@ function ExperimentRow(props: ExperimentRowProps) {
   );
 }
 
+function isPortableDesktopBinaryMissing(status: DesktopPrereqStatus | null): boolean {
+  return !status?.available && status?.reason === "binary_not_found";
+}
+
+/** The warning's buttons. Offline they are disabled: they could not reach the server. */
+function PortableDesktopWarningActions(props: {
+  loading: boolean;
+  restarting: boolean;
+  onCheckAgain: () => void;
+  onRestart: () => void;
+}) {
+  const offline = useLiveAPI() == null;
+  return (
+    <div className="flex flex-wrap gap-2">
+      <Button
+        variant="outline"
+        size="xs"
+        onClick={props.onCheckAgain}
+        disabled={props.restarting || offline}
+      >
+        {props.loading ? "Checking…" : "Check again"}
+      </Button>
+      <Button
+        variant="outline"
+        size="xs"
+        onClick={props.onRestart}
+        disabled={props.loading || props.restarting || offline}
+      >
+        {props.restarting ? "Restarting…" : "Restart Xum"}
+      </Button>
+    </div>
+  );
+}
+
 export function PortableDesktopExperimentWarning() {
   const enabled = useExperimentValue(EXPERIMENT_IDS.PORTABLE_DESKTOP);
   const { api } = useAPI();
@@ -116,9 +150,9 @@ export function PortableDesktopExperimentWarning() {
     setError(null);
 
     try {
-      // This warning lives on /settings/experiments, where selectedWorkspace is intentionally
-      // URL-derived and null. Probe the machine-level desktop prerequisite instead of a
-      // workspace-scoped capability so the warning still renders on settings routes.
+      // Settings can open with no workspace behind it (cold links, project pages). Probe the
+      // machine-level desktop prerequisite instead of a workspace-scoped capability so the
+      // warning renders regardless of the background page.
       const nextStatus = await api.desktop.getPrereqStatus();
       if (requestIdRef.current !== requestId) {
         return;
@@ -126,7 +160,8 @@ export function PortableDesktopExperimentWarning() {
 
       setPrereqStatus(nextStatus);
     } catch (e) {
-      if (requestIdRef.current !== requestId) {
+      // A lost connection is no check failure: the reconnect checks again.
+      if (requestIdRef.current !== requestId || isConnectionLostError(e)) {
         return;
       }
 
@@ -141,10 +176,13 @@ export function PortableDesktopExperimentWarning() {
   useEffect(() => {
     if (!enabled || !api) {
       requestIdRef.current += 1;
-      setPrereqStatus(null);
       setLoading(false);
       setRestarting(false);
-      setError(null);
+      // Offline (`!api`), keep the shown status: the reconnect checks again.
+      if (!enabled) {
+        setPrereqStatus(null);
+        setError(null);
+      }
       return;
     }
 
@@ -174,7 +212,7 @@ export function PortableDesktopExperimentWarning() {
     }
   }, [api]);
 
-  const isBinaryMissing = !prereqStatus?.available && prereqStatus?.reason === "binary_not_found";
+  const isBinaryMissing = isPortableDesktopBinaryMissing(prereqStatus);
 
   if (!enabled || !isBinaryMissing) {
     return null;
@@ -199,28 +237,17 @@ export function PortableDesktopExperimentWarning() {
             to enable this feature. If you installed it into a location that xum can already see,
             choose Check again. If you changed PATH after xum launched, restart xum to pick it up.
           </div>
-          <div className="flex flex-wrap gap-2">
-            <Button
-              variant="outline"
-              size="xs"
-              onClick={() => {
-                void loadPrereqStatus();
-              }}
-              disabled={restarting}
-            >
-              {loading ? "Checking…" : "Check again"}
-            </Button>
-            <Button
-              variant="outline"
-              size="xs"
-              onClick={() => {
-                void handleRestart();
-              }}
-              disabled={loading || restarting}
-            >
-              {restarting ? "Restarting…" : "Restart Xum"}
-            </Button>
-          </div>
+          {/* Offline the kept warning stays, but its buttons are disabled. */}
+          <PortableDesktopWarningActions
+            loading={loading}
+            restarting={restarting}
+            onCheckAgain={() => {
+              void loadPrereqStatus();
+            }}
+            onRestart={() => {
+              void handleRestart();
+            }}
+          />
           {error && <div className="text-[11px]">{error}</div>}
         </div>
       </div>
@@ -670,8 +697,8 @@ function ExperimentSettingsPanel(props: ExperimentSettingsPanelProps) {
 
 // Renders a parent experiment's sub-experiment toggles as a nested list.
 // Extracted so the nested-config call sites mirror their siblings
-// (AdvisorToolExperimentConfig, HeartbeatDefaultsControls) instead of
-// inlining the map in the section render.
+// (AutoModelRoutingExperimentConfig) instead of inlining the map in the
+// section render.
 function SubExperimentRows(props: { experimentIds: readonly ExperimentId[] }) {
   return (
     <div className="divide-border-light divide-y">
@@ -693,47 +720,10 @@ function SubExperimentRows(props: { experimentIds: readonly ExperimentId[] }) {
 export function ExperimentsSection() {
   const allExperiments = getExperimentList();
   const { api } = useAPI();
-  const advisorToolEnabled = useExperimentValue(EXPERIMENT_IDS.ADVISOR_TOOL);
   const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
-  const workspaceHeartbeatsEnabled = useExperimentValue(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const ptcEnabled = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
-  const settingsConfigRequestRef = useRef<{
-    api: APIClient;
-    request: Promise<SettingsConfig>;
-  } | null>(null);
-
-  useEffect(() => {
-    settingsConfigRequestRef.current = null;
-  }, [api]);
-
-  const loadExperimentSettingsConfig = useCallback(() => {
-    if (!api) {
-      return Promise.reject(new Error("Cannot load settings config before API connection."));
-    }
-
-    const cachedRequest = settingsConfigRequestRef.current;
-    if (cachedRequest?.api === api) {
-      return cachedRequest.request;
-    }
-
-    const request = api.config.getConfig();
-    settingsConfigRequestRef.current = { api, request };
-    request.then(
-      () => {
-        if (settingsConfigRequestRef.current?.request === request) {
-          settingsConfigRequestRef.current = null;
-        }
-      },
-      () => {
-        if (settingsConfigRequestRef.current?.request === request) {
-          settingsConfigRequestRef.current = null;
-        }
-      }
-    );
-    return request;
-  }, [api]);
-
+  const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
   // Only show user-overridable experiments (non-overridable ones are hidden since users can't
   // change them). Sub-experiments render nested under their parent row instead.
   const experiments = useMemo(
@@ -788,18 +778,8 @@ export function ExperimentsSection() {
                     : undefined
                 }
               />
-              {exp.id === EXPERIMENT_IDS.ADVISOR_TOOL && advisorToolEnabled && (
-                <AdvisorToolExperimentConfig />
-              )}
               {exp.id === EXPERIMENT_IDS.AUTO_MODEL_ROUTING && autoModelRoutingEnabled && (
                 <AutoModelRoutingExperimentConfig />
-              )}
-              {exp.id === EXPERIMENT_IDS.WORKSPACE_HEARTBEATS && workspaceHeartbeatsEnabled && (
-                <ExperimentSettingsPanel>
-                  <HeartbeatDefaultsControls
-                    loadConfig={api ? loadExperimentSettingsConfig : undefined}
-                  />
-                </ExperimentSettingsPanel>
               )}
               {exp.id === EXPERIMENT_IDS.MEMORY && memoryEnabled && (
                 <ExperimentSettingsPanel>
@@ -810,6 +790,9 @@ export function ExperimentsSection() {
                 <ExperimentSettingsPanel>
                   <SubExperimentRows experimentIds={PTC_SUB_EXPERIMENT_IDS} />
                 </ExperimentSettingsPanel>
+              )}
+              {exp.id === EXPERIMENT_IDS.ARTIFACTS && artifactsEnabled && (
+                <ArtifactsExperimentConfig />
               )}
               {exp.id === EXPERIMENT_IDS.PORTABLE_DESKTOP && <PortableDesktopExperimentWarning />}
               {exp.id === EXPERIMENT_IDS.CONFIGURABLE_BIND_URL && <ConfigurableBindUrlControls />}

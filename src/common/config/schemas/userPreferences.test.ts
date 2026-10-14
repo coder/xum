@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
+import { DEFAULT_TERMINAL_BADGE_CONFIG } from "@/common/constants/storage";
 import {
   UserPreferencesSchema,
   normalizeUserPreferences,
@@ -71,10 +72,10 @@ describe("UserPreferencesSchema", () => {
             bad: 101,
           },
         },
+        review: "not-an-object",
       })
     ).toEqual({
       appearance: {
-        theme: "dark",
         vimEnabled: true,
       },
       ai: {
@@ -88,6 +89,47 @@ describe("UserPreferencesSchema", () => {
           "openai:gpt-4.1": 75,
         },
       },
+    });
+  });
+
+  test("repairs stored values the way clients read them", () => {
+    const badge = { enabled: true, template: "{ws}", position: "top-left" as const, fontSize: 20 };
+    expect(
+      normalizeUserPreferences({
+        appearance: {
+          terminalBadgeConfig: { ...badge, opacity: 0 },
+          terminalFontConfig: { fontFamily: " ", fontSize: "16" },
+          editorConfig: { editor: "custom", customCommand: "" },
+        },
+        navigation: { projectOrder: ["/repo/a", null, " /repo/b ", "/repo/a"] },
+        ai: {
+          globalDefaults: { agentId: " Plan ", thinkingLevel: "med" },
+          projectDefaults: {
+            "/a": { agentId: "exec", model: "mux-gateway:openai" },
+            "/b": { model: " openai:gpt-4.1 ", thinkingLevel: "med" },
+          },
+        },
+        workspaceCreation: {
+          byProject: { "/a": { trunkBranch: " main " }, "/b": { trunkBranch: " " } },
+        },
+        review: { defaultBaseByProject: { "/a": " origin/main ", "/b": " " } },
+      })
+    ).toEqual({
+      appearance: {
+        terminalBadgeConfig: { ...badge, opacity: DEFAULT_TERMINAL_BADGE_CONFIG.opacity },
+        terminalFontConfig: { fontSize: 16 },
+        editorConfig: { editor: "custom" },
+      },
+      navigation: { projectOrder: ["/repo/a", "/repo/b"] },
+      ai: {
+        globalDefaults: { agentId: "plan", thinkingLevel: "medium" },
+        projectDefaults: {
+          "/a": { agentId: "exec" },
+          "/b": { model: "openai:gpt-4.1", thinkingLevel: "medium" },
+        },
+      },
+      workspaceCreation: { byProject: { "/a": { trunkBranch: "main" } } },
+      review: { defaultBaseByProject: { "/a": "origin/main" } },
     });
   });
 

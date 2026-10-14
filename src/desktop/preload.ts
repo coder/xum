@@ -20,6 +20,7 @@ import { contextBridge, ipcRenderer } from "electron";
 import type { DeepLinkPayload } from "@/common/types/deepLink";
 import type { RemoteConnectionApi, RemoteConnectionState } from "@/common/types/remoteConnection";
 import { REMOTE_CONNECTION_CHANNELS } from "@/common/constants/remoteConnection";
+import { isSessionTapeReplayConfigured } from "@/common/utils/sessionTapes/sessionTapeReplay";
 
 const getXumEnv = (suffix: string): string | undefined =>
   resolveXumEnvironmentValue(suffix, process.env);
@@ -64,10 +65,16 @@ const remoteConnection: RemoteConnectionApi = {
   getState: () => ipcRenderer.invoke(REMOTE_CONNECTION_CHANNELS.getState),
   connect: (url) => ipcRenderer.invoke(REMOTE_CONNECTION_CHANNELS.connect, url),
   disconnect: () => ipcRenderer.invoke(REMOTE_CONNECTION_CHANNELS.disconnect),
+  openLocalServer: () => ipcRenderer.invoke(REMOTE_CONNECTION_CHANNELS.openLocalServer),
   onStateChanged: (callback) => {
     const listener = (_event: unknown, state: RemoteConnectionState) => callback(state);
     ipcRenderer.on(REMOTE_CONNECTION_CHANNELS.stateChanged, listener);
     return () => ipcRenderer.off(REMOTE_CONNECTION_CHANNELS.stateChanged, listener);
+  },
+  onOpenServerWindowRequested: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on(REMOTE_CONNECTION_CHANNELS.openServerWindowRequested, listener);
+    return () => ipcRenderer.off(REMOTE_CONNECTION_CHANNELS.openServerWindowRequested, listener);
   },
 };
 
@@ -80,6 +87,7 @@ contextBridge.exposeInMainWorld("api", {
     electron: process.versions.electron,
   },
   isE2E: getXumEnv("E2E") === "1",
+  isSessionTapeReplay: isSessionTapeReplayConfigured(process.env),
   enableReactPerfProfile: getXumEnv("PROFILE_REACT") === "1",
   enableTelemetryInDev: getXumEnv("ENABLE_TELEMETRY_IN_DEV") === "1",
   enableTutorialsInSandbox: getEnableTutorialsInSandbox(),
@@ -90,6 +98,11 @@ contextBridge.exposeInMainWorld("api", {
   // like `child_process` (which can break in hardened/sandboxed environments).
   getIsRosetta: () => ipcRenderer.invoke("mux:get-is-rosetta"),
   getIsWindowsWslShell: () => ipcRenderer.invoke("mux:get-is-windows-wsl-shell"),
+  // Tells the main process which webContents this page's perf flight recorder ID belongs to,
+  // so a long-animation-frame trip profiles exactly this page.
+  announcePerfRendererId: (rendererId: string) => {
+    ipcRenderer.send("mux:perf-announce-renderer-id", rendererId);
+  },
   // Register a callback for notification clicks (navigates to workspace)
   // Returns an unsubscribe function.
   onNotificationClicked: (callback: (data: { workspaceId: string }) => void) => {

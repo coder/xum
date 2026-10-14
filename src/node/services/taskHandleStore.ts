@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
@@ -17,11 +18,18 @@ import {
 } from "@/common/types/workspaceTurn";
 import { log } from "@/node/services/log";
 import { isErrnoWithCode } from "@/node/utils/fs";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
+import { acquireProcessFileLock, type ProcessFileLock } from "@/node/utils/concurrency/fileLock";
 
 export type { WorkspaceTurnFinalMessageRef };
 
 export const WORKSPACE_TURN_TASK_ID_PREFIX = "wst_";
 const TASK_HANDLES_DIR = "task-handles";
+/**
+ * A hold covers one handle read and write, plus the owner's mirror claim, a config edit that can
+ * itself wait up to a minute for the project registration lock. A longer wait means a wedged holder.
+ */
+const WORKSPACE_TURN_PUBLICATION_LOCK_TIMEOUT_MS = 120_000;
 
 export type WorkspaceTurnTaskStatus =
   | "queued"
@@ -148,10 +156,64 @@ export class TaskHandleStore {
     this.assertValidRecord(record);
     const dir = this.getOwnerHandleDir(record.ownerWorkspaceId);
     await fsPromises.mkdir(dir, { recursive: true });
-    await fsPromises.writeFile(
+    // Replace atomically. Waiters, task_await and task_list read handles without the settlement
+    // lock, and a truncate-then-write update let them see an empty file, which reads as a missing
+    // handle ("Workspace turn not found or out of scope", coder/xum#4410).
+    await writeFileAtomic(
       this.getHandlePath(record.ownerWorkspaceId, record.handleId),
       JSON.stringify(record, null, 2)
     );
+  }
+
+  /**
+   * Whether the handle file still holds `record`'s outcome generation: the same turn, status and
+   * updatedAt. Every outcome write mints a fresh updatedAt; metadata-only writes after settlement
+   * (attention policy, delivery markers) keep it, so they do not count as replacing the record.
+   * Synchronous so a caller can test it inside a config edit transform (#4926). A missing or
+   * corrupt file reads as replaced; other read errors propagate, as in getWorkspaceTurn.
+   */
+  stillHoldsWorkspaceTurnGenerationSync(record: WorkspaceTurnTaskHandleRecord): boolean {
+    let current: unknown;
+    try {
+      current = JSON.parse(
+        // eslint-disable-next-line local/no-sync-fs-methods -- callers check inside a synchronous config edit transform, under its lock (#4926).
+        fs.readFileSync(this.getHandlePath(record.ownerWorkspaceId, record.handleId), "utf-8")
+      );
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT") || error instanceof SyntaxError) return false;
+      throw error;
+    }
+    const held = current as Partial<WorkspaceTurnTaskHandleRecord> | null;
+    return (
+      held?.turnId === record.turnId &&
+      held.status === record.status &&
+      held.updatedAt === record.updatedAt
+    );
+  }
+
+  /**
+   * #5362: run `fn` holding a per-handle cross-process lock, so a read-then-write of the handle
+   * cannot interleave with another backend's read-then-write of the same handle. Hold it only
+   * across the read, the write and the config edits that must commit with them; never across
+   * sends, and never take it again inside `fn` (it is not reentrant). The lock file exists only
+   * while held: release unlinks it.
+   */
+  async withWorkspaceTurnPublicationLock<T>(
+    handleId: string,
+    fn: (lock: ProcessFileLock) => Promise<T>
+  ): Promise<T> {
+    assertValidWorkspaceTurnTaskId(handleId);
+    await using lock = await acquireProcessFileLock({
+      lockPath: path.join(
+        this.config.rootDir,
+        "locks",
+        "workspace-turn-publications",
+        `${handleId}.lock`
+      ),
+      timeoutMs: WORKSPACE_TURN_PUBLICATION_LOCK_TIMEOUT_MS,
+      label: "workspace turn publication lock",
+    });
+    return await fn(lock);
   }
 
   async updateWorkspaceTurn(
@@ -181,6 +243,21 @@ export class TaskHandleStore {
     }
     const record = await this.readWorkspaceTurnFile(ownerWorkspaceId, handleId);
     return record?.ownerWorkspaceId === ownerWorkspaceId ? record : null;
+  }
+
+  /**
+   * Whether a record file exists for the handle, readable or not (#4983). getWorkspaceTurn()
+   * answers null for a corrupt record and for one a newer build wrote (strict schema), so only
+   * this proves a handle never persisted. Errors other than ENOENT propagate (fail closed).
+   */
+  async hasWorkspaceTurnFile(ownerWorkspaceId: string, handleId: string): Promise<boolean> {
+    try {
+      await fsPromises.lstat(this.getHandlePath(ownerWorkspaceId, handleId));
+      return true;
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT")) return false;
+      throw error;
+    }
   }
 
   async listWorkspaceTurns(
@@ -216,14 +293,26 @@ export class TaskHandleStore {
   async listAllWorkspaceTurns(
     options: { statuses?: readonly WorkspaceTurnTaskStatus[] } = {}
   ): Promise<WorkspaceTurnTaskHandleRecord[]> {
+    return (await this.scanAllWorkspaceTurns(options)).records;
+  }
+
+  /**
+   * listAllWorkspaceTurns plus whether every owner directory was read. A skipped (unreadable)
+   * directory still yields the other owners' records; `complete` lets a caller that must see every
+   * record, such as the startup stale-turn sweep, retry later instead of trusting a partial pass.
+   */
+  async scanAllWorkspaceTurns(
+    options: { statuses?: readonly WorkspaceTurnTaskStatus[] } = {}
+  ): Promise<{ records: WorkspaceTurnTaskHandleRecord[]; complete: boolean }> {
     let entries: Array<{ isDirectory: () => boolean; name: string }>;
     try {
       entries = await fsPromises.readdir(this.config.sessionsDir, { withFileTypes: true });
     } catch (error) {
-      if (isErrnoWithCode(error, "ENOENT")) return [];
+      if (isErrnoWithCode(error, "ENOENT")) return { records: [], complete: true };
       throw error;
     }
 
+    let complete = true;
     const recordsByOwner = await Promise.all(
       entries
         .filter((entry) => entry.isDirectory())
@@ -237,11 +326,15 @@ export class TaskHandleStore {
               ownerWorkspaceId: entry.name,
               error,
             });
+            complete = false;
             return [];
           }
         })
     );
-    return recordsByOwner.flat().sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    return {
+      records: recordsByOwner.flat().sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
+      complete,
+    };
   }
 
   async isWorkspaceOwnedBy(ownerWorkspaceId: string, workspaceId: string): Promise<boolean> {

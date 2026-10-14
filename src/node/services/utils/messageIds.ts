@@ -53,6 +53,10 @@ export const createRefineSummaryMessageId = (): string =>
 export const createFamilyMessageId = (): string =>
   `family-message-${Date.now()}-${randomSuffix(9)}`;
 
+/** Plan-review record row IDs (snapshot/resolve/reopen): plan-review-{timestamp}-{random} */
+export const createPlanReviewRecordMessageId = (): string =>
+  `plan-review-${Date.now()}-${randomSuffix(9)}`;
+
 /** Context reset boundary IDs: context-reset-{timestamp}-{random} */
 export const createContextResetBoundaryMessageId = (): string =>
   `context-reset-${Date.now()}-${randomSuffix(9)}`;

@@ -14,6 +14,19 @@ export interface DevToolsRun {
    * toggling). Absent on runs recorded by older binaries.
    */
   requestHistorySequence?: number;
+  /**
+   * The request's context epoch (the id of its first provider-request message), as the
+   * runtime prompt-cache monitor uses it. `/clear`, "start here" and context rollovers change
+   * it, and the replay step audit resets its baseline then. Absent on older runs.
+   */
+  contextEpoch?: string;
+  /**
+   * The estimated token budget a compaction request's history was fitted to
+   * (trimCompactionInput). The replay verifier uses the same budget. Absent on requests
+   * without a budget (not compaction, a model that can still switch to 1M, an unknown
+   * window except on its retry) and on older runs.
+   */
+  compactionInputBudgetTokens?: number;
 }
 
 /** A "step" = a single LLM round-trip within a run. */
@@ -35,6 +48,57 @@ export interface DevToolsStep {
   responseHeaders: Record<string, string> | null;
   rawResponse: unknown;
   rawChunks: unknown;
+  /**
+   * Anthropic `input_transformations` for this step (beta
+   * `thinking-binding-controls-2026-08-01`): replayed thinking blocks the API
+   * dropped or let through despite a failed binding check. Null when the response
+   * did not report the field (other providers, header not sent, older rows).
+   */
+  inputTransformations: AnthropicInputTransformation[] | null;
+  /**
+   * What the Anthropic cache wrapper saw on the wire for this step, written at finalization.
+   * The replay audit holds recorded steps to the runtime prompt-cache monitor's rules with it.
+   * Absent on non-Anthropic wires, on the steps of older binaries, and when DevTools did not
+   * track the request.
+   */
+  promptCacheWire?: DevToolsPromptCacheWire;
+}
+
+/** The facts the runtime prompt-cache monitor keys and filters on, for one recorded step. */
+export interface DevToolsPromptCacheWire {
+  /** Route identity, as the monitor keys baselines (e.g. "anthropic", "coder:<instance>"). */
+  route: string;
+  /** The effective model string the monitor keys baselines by. */
+  modelString: string;
+  /** Origin and path of the request URL, as the monitor keys it. Absent in older logs. */
+  endpoint?: string;
+  /** False when cache markers were stripped (beta features off): no cache entry exists. */
+  cacheMarkersInjected: boolean;
+  /** True once the provider answered (any HTTP status); false when the fetch itself failed. */
+  dispatched: boolean;
+  /**
+   * ISO time the last attempt's OK response arrived: the monitor's observation time. Absent
+   * when no attempt got an OK response; such a request neither creates nor breaks a cache entry.
+   */
+  observedAt?: string;
+  /**
+   * Process-wide observation counter, taken with observedAt: it orders two OK responses that
+   * arrived in the same millisecond. It restarts with the process. Absent in older logs.
+   */
+  observedSeq?: number;
+}
+
+/**
+ * One Anthropic `input_transformations` entry. Known types are `thinking_dropped`
+ * (reason `prefix_binding_mismatch`, `model_binding_mismatch` or
+ * `organization_binding_mismatch`) and `thinking_mismatch_allowed`. Anthropic adds
+ * new types and reasons over time, so both stay open strings. `path` names the
+ * block, e.g. `messages.3.content.0`. Entries carry no signatures.
+ */
+export interface AnthropicInputTransformation {
+  type: string;
+  path: string;
+  reason?: string;
 }
 
 export interface DevToolsStepInput {

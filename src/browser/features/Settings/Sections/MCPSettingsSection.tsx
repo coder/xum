@@ -1,11 +1,16 @@
-import { useClaudeDesignRevision } from "@/browser/contexts/ExperimentsContext";
+import { useClaudeDesign } from "@/browser/hooks/useClaudeDesign";
+import { publishGlobalMcpEnablementChanged } from "@/browser/utils/workspaceMcpMutations";
+import {
+  McpAppViewDomainsSection,
+  unlistedMcpAppViewDomains,
+  useMcpAppViewDomains,
+} from "./McpAppViewDomains";
+import { getOwn } from "@/common/utils/getOwn";
 import { ClaudeDesignCard } from "./ClaudeDesignCard";
-import { useExperimentValue } from "@/browser/hooks/useExperiments";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { CLAUDE_DESIGN_SERVER_NAME } from "@/common/constants/claudeDesign";
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { usePolicy } from "@/browser/contexts/PolicyContext";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { useGlobalSecretKeys } from "./SecretsSection";
 import {
   Trash2,
   Play,
@@ -29,7 +34,9 @@ import {
   SelectValue,
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { createEditKeyHandler } from "@/browser/utils/ui/keybinds";
+import { getMcpServerUrlError } from "@/common/utils/mcp/serverUrl";
 import { Switch } from "@/browser/components/Switch/Switch";
+import { ConfigSwitchSetting, type SettingsApi } from "./ConfigSwitchSetting";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import { cn } from "@/common/lib/utils";
 import { formatRelativeTime } from "@/browser/utils/ui/dateTime";
@@ -68,11 +75,12 @@ const ToolsDisclosureButton: React.FC<{
     type="button"
     onClick={props.onToggle}
     aria-expanded={props.expanded}
-    className="text-muted hover:text-foreground flex items-center gap-1 text-xs"
+    // Forced-colors mode drops box-shadow rings, so keep an outline fallback.
+    className="text-content-secondary hover:text-foreground focus-visible:ring-accent flex items-center gap-1 rounded-sm text-xs focus-visible:ring-1 forced-colors:focus-visible:outline"
   >
     {props.expanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
     <span>{props.summary}</span>
-    <span className="text-muted/60 ml-1">({formatRelativeTime(props.testedAt)})</span>
+    <span className="ml-1">({formatRelativeTime(props.testedAt)})</span>
     {props.saving && <Loader2 className="ml-1 h-3 w-3 animate-spin" />}
   </button>
 );
@@ -223,7 +231,7 @@ const PluginToolListSection: React.FC<{ tools: string[]; testedAt: number }> = (
       />
       {expanded && (
         <div className="mt-2">
-          <p className="text-muted mb-2 text-xs">
+          <p className="text-content-secondary mb-2 text-xs">
             Discovered by the connection test. Tool permissions for plugin servers are chosen per
             workspace via Configure MCP servers.
           </p>
@@ -253,6 +261,17 @@ interface MCPOAuthAuthStatus {
 }
 
 type MCPOAuthAPI = NonNullable<ReturnType<typeof useAPI>["api"]>["mcpOauth"];
+
+/**
+ * URL error for a remote add/edit draft. Stdio drafts hold a command, and a blank
+ * URL is already gated by the required-field check, so neither shows an error.
+ */
+const DUPLICATE_SERVER_NAME_ERROR = "A server with this name already exists";
+
+function getDraftUrlError(draft: { transport: MCPServerTransport; value: string }): string | null {
+  if (draft.transport === "stdio" || !draft.value.trim()) return null;
+  return getMcpServerUrlError(draft.value);
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   // In dev-server (browser) mode, the ORPC client can surface namespaces/procedures as Proxy
@@ -330,13 +349,14 @@ function getMCPOAuthLoginFlowMode(input: {
 }
 
 function useMCPOAuthLogin(input: {
-  api: ReturnType<typeof useAPI>["api"];
   isDesktop: boolean;
   serverName: string;
   pendingServer?: MCPOAuthPendingServerConfig;
   onSuccess?: () => void | Promise<void>;
 }) {
-  const { api, isDesktop, serverName, pendingServer, onSuccess } = input;
+  const { isDesktop, serverName, pendingServer, onSuccess } = input;
+  // The live client only: offline, startLogin shows its own "not connected" error.
+  const api = useLiveAPI();
   const loginAttemptRef = useRef(0);
   const [flowId, setFlowId] = useState<string | null>(null);
 
@@ -550,15 +570,15 @@ const MCPOAuthRequiredCalloutView: React.FC<{
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <p className="font-medium">This server requires OAuth.</p>
-          {disabledReason && <p className="text-muted mt-0.5">{disabledReason}</p>}
+          {disabledReason && <p className="text-content-secondary mt-0.5">{disabledReason}</p>}
 
           {loginStatus === "waiting" && (
             <>
-              <p className="text-muted mt-0.5">
+              <p className="text-content-secondary mt-0.5">
                 Finish the login flow in your browser, then return here.
               </p>
               {!isDesktop && (
-                <p className="text-muted mt-0.5">
+                <p className="text-content-secondary mt-0.5">
                   If a new tab didn&apos;t open, your browser may have blocked the popup. Allow
                   popups and try again.
                 </p>
@@ -567,7 +587,7 @@ const MCPOAuthRequiredCalloutView: React.FC<{
           )}
 
           {(loginStatus === "completing" || loginStatus === "success") && (
-            <p className="text-muted mt-0.5">Logged in.</p>
+            <p className="text-content-secondary mt-0.5">Logged in.</p>
           )}
 
           {loginStatus === "error" && loginError && (
@@ -606,9 +626,7 @@ const MCPOAuthRequiredCallout: React.FC<{
   disabledReason?: string;
   onLoginSuccess?: () => void | Promise<void>;
 }> = (props) => {
-  const { api } = useAPI();
   const login = useMCPOAuthLogin({
-    api,
     isDesktop: !!window.api,
     serverName: props.serverName,
     pendingServer: props.pendingServer,
@@ -647,7 +665,7 @@ const RemoteMCPOAuthSection: React.FC<{
     setAuthStatusError(null);
 
     try {
-      const status = await mcpOauthApi.getAuthStatus({ serverUrl: url });
+      const status = await mcpOauthApi.getAuthStatus({ serverUrl: url, serverName });
       setAuthStatus(status);
     } catch (err) {
       setAuthStatus(null);
@@ -655,14 +673,13 @@ const RemoteMCPOAuthSection: React.FC<{
     } finally {
       setAuthStatusLoading(false);
     }
-  }, [api, url]);
+  }, [api, url, serverName]);
 
   useEffect(() => {
     void refreshAuthStatus();
   }, [refreshAuthStatus, transport, url, oauthRefreshNonce]);
 
   const { loginStatus, loginError, loginInProgress, startLogin, cancelLogin } = useMCPOAuthLogin({
-    api,
     isDesktop,
     serverName,
     onSuccess: refreshAuthStatus,
@@ -732,14 +749,14 @@ const RemoteMCPOAuthSection: React.FC<{
     <div className="mt-1 flex items-center justify-between gap-2">
       <div className="flex min-w-0 items-center gap-2 text-xs">
         <span className="text-foreground font-medium">OAuth</span>
-        <span className="text-muted truncate">
+        <span className="text-content-secondary truncate">
           {authStatusText}
           {updatedAtText}
         </span>
 
         {oauthDebugErrors.length > 0 && (
           <details className="group inline-block">
-            <summary className="text-muted hover:text-foreground cursor-pointer list-none text-[11px] underline-offset-2 group-open:underline">
+            <summary className="text-content-secondary hover:text-foreground cursor-pointer list-none text-[11px] underline-offset-2 group-open:underline">
               Details
             </summary>
             <div className="border-border-medium bg-background-secondary mt-1 space-y-1 rounded-md border px-2 py-1 text-xs">
@@ -811,20 +828,39 @@ const RemoteMCPOAuthSection: React.FC<{
   );
 };
 
+const loadToolSearchEnabled = async (api: SettingsApi) =>
+  (await api.config.getConfig()).toolSearchEnabled;
+const saveToolSearchEnabled = (api: SettingsApi, enabled: boolean) =>
+  api.config.updateToolSearchEnabled({ enabled });
+
+function ToolSearchSetting() {
+  return (
+    <ConfigSwitchSetting
+      title="Tool search"
+      description={
+        <>
+          Defer MCP tool definitions until the model discovers them with{" "}
+          <code className="text-accent">tool_catalog_search</code>. With Anthropic prompt caching,
+          uses Anthropic&apos;s native deferred loading, which keeps the cache intact.
+        </>
+      }
+      ariaLabel="Toggle MCP tool search"
+      placeholderChecked={true}
+      load={loadToolSearchEnabled}
+      save={saveToolSearchEnabled}
+      saveErrorMessage="Failed to update tool search"
+    />
+  );
+}
+
 export const MCPSettingsSection: React.FC = () => {
-  const designEnabled = useExperimentValue(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP);
-  const designRevision = useClaudeDesignRevision();
+  const design = useClaudeDesign();
   const refreshRequest = useRef({ id: 0 });
   const { api } = useAPI();
-  const policyState = usePolicy();
-  const mcpAllowUserDefined =
-    policyState.status.state === "enforced" ? policyState.policy?.mcp.allowUserDefined : undefined;
-  const mcpDisabledByPolicy = Boolean(
-    mcpAllowUserDefined?.stdio === false && mcpAllowUserDefined.remote === false
-  );
   const [servers, setServers] = useState<Record<string, MCPServerInfo>>({});
   const [loading, setLoading] = useState(false);
-  const [globalSecretKeys, setGlobalSecretKeys] = useState<string[]>([]);
+  // Global secrets (used for {secret:"KEY"} header values).
+  const [globalSecretKeys] = useGlobalSecretKeys(api);
   const [error, setError] = useState<string | null>(null);
 
   // Test state with caching (global MCP config)
@@ -833,7 +869,8 @@ export const MCPSettingsSection: React.FC = () => {
     setResult: cacheTestResult,
     clearResult: clearTestResult,
   } = useMCPTestCache("__global__");
-  const [testingServer, setTestingServer] = useState<string | null>(null);
+  // Per server: tests on different rows can run at the same time, and each row shows its own.
+  const [testingServers, setTestingServers] = useState<Record<string, true>>({});
   // Server-reported identity is display-only and lives in memory for one
   // configuration load: refresh() starts a new generation and drops all
   // branding, and a test that started under an older generation may cache its
@@ -845,6 +882,7 @@ export const MCPSettingsSection: React.FC = () => {
     Record<string, { serverInfo: MCPServerIdentity; icon?: string }>
   >({});
   const [mcpOauthRefreshNonce, setMcpOauthRefreshNonce] = useState(0);
+  const viewDomains = useMcpAppViewDomains();
 
   interface EditableServer {
     name: string;
@@ -856,39 +894,6 @@ export const MCPSettingsSection: React.FC = () => {
   }
 
   // Add form state
-
-  // Ensure the "Add server" transport select always points to a policy-allowed value.
-  useEffect(() => {
-    if (!mcpAllowUserDefined) {
-      return;
-    }
-
-    const isAllowed = (transport: MCPServerTransport): boolean => {
-      if (transport === "stdio") {
-        return mcpAllowUserDefined.stdio;
-      }
-
-      return mcpAllowUserDefined.remote;
-    };
-
-    setNewServer((prev) => {
-      if (isAllowed(prev.transport)) {
-        return prev;
-      }
-
-      const fallback: MCPServerTransport | null = mcpAllowUserDefined.stdio
-        ? "stdio"
-        : mcpAllowUserDefined.remote
-          ? "http"
-          : null;
-
-      if (!fallback) {
-        return prev;
-      }
-
-      return { ...prev, transport: fallback, value: "", headersRows: [] };
-    });
-  }, [mcpAllowUserDefined]);
   const [newServer, setNewServer] = useState<EditableServer>({
     name: "",
     transport: "stdio",
@@ -922,31 +927,6 @@ export const MCPSettingsSection: React.FC = () => {
     }
   }, [api]);
 
-  // Load global secrets (used for {secret:"KEY"} header values).
-  useEffect(() => {
-    if (!api) {
-      setGlobalSecretKeys([]);
-      return;
-    }
-
-    let cancelled = false;
-    (async () => {
-      try {
-        const secrets = await api.secrets.get({});
-        if (cancelled) return;
-        setGlobalSecretKeys(secrets.map((s) => s.key));
-      } catch (err) {
-        if (cancelled) return;
-        console.error("Failed to load global secrets:", err);
-        setGlobalSecretKeys([]);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [api]);
-
   useEffect(() => {
     // A sibling can change reuse/server settings while the experiment stays enabled.
     const requests = refreshRequest.current;
@@ -954,7 +934,7 @@ export const MCPSettingsSection: React.FC = () => {
     return () => {
       requests.id++;
     };
-  }, [refresh, designEnabled, designRevision]);
+  }, [refresh, design.enabled, design.revision]);
 
   // Clear new-server test result when transport/value/headers change
   useEffect(() => {
@@ -970,6 +950,7 @@ export const MCPSettingsSection: React.FC = () => {
         if (!result.success) {
           setError(result.error ?? "Failed to remove MCP server");
         } else {
+          publishGlobalMcpEnablementChanged();
           clearTestResult(name);
           await refresh();
         }
@@ -1002,6 +983,8 @@ export const MCPSettingsSection: React.FC = () => {
             [name]: { ...prev[name], disabled: enabled },
           }));
           setError(result.error ?? "Failed to update server");
+        } else {
+          publishGlobalMcpEnablementChanged();
         }
       } catch (err) {
         // Revert on error
@@ -1019,7 +1002,10 @@ export const MCPSettingsSection: React.FC = () => {
     async (name: string) => {
       if (!api) return;
       const generation = loadGeneration.current;
-      setTestingServer(name);
+      setTestingServers((prev) => ({ ...prev, [name]: true }));
+      // Drop the old result while the test runs (#5680): a re-test usually writes the
+      // same result back, so keeping it on screen made the click look like a no-op.
+      clearTestResult(name);
       // The new result replaces the old test, even if it fails or has no identity.
       setBranding((prev) => {
         const { [name]: _previous, ...remaining } = prev;
@@ -1039,10 +1025,13 @@ export const MCPSettingsSection: React.FC = () => {
           error: err instanceof Error ? err.message : "Test failed",
         });
       } finally {
-        setTestingServer(null);
+        setTestingServers((prev) => {
+          const { [name]: _done, ...rest } = prev;
+          return rest;
+        });
       }
     },
-    [api, cacheTestResult]
+    [api, cacheTestResult, clearTestResult]
   );
 
   const serverDisplayValue = (entry: MCPServerInfo): string =>
@@ -1052,6 +1041,12 @@ export const MCPSettingsSection: React.FC = () => {
     if (!api || !newServer.name.trim() || !newServer.value.trim()) return;
 
     const serverName = newServer.name.trim();
+    // mcp.add is add-or-replace (Edit saves through it), so Add must refuse a taken
+    // name itself: replacing a server silently loses its config (#5679).
+    if (Object.hasOwn(servers, serverName)) {
+      setError(DUPLICATE_SERVER_NAME_ERROR);
+      return;
+    }
     const serverTransport = newServer.transport;
     const serverValue = newServer.value.trim();
     const serverHeadersRows = newServer.headersRows;
@@ -1087,6 +1082,7 @@ export const MCPSettingsSection: React.FC = () => {
         setError(result.error ?? "Failed to add MCP server");
         return;
       }
+      publishGlobalMcpEnablementChanged();
 
       setNewServer({ name: "", transport: "stdio", value: "", headersRows: [] });
       setNewTestResult(null);
@@ -1108,7 +1104,16 @@ export const MCPSettingsSection: React.FC = () => {
     } finally {
       setAddingServer(false);
     }
-  }, [api, newServer, newTestResult, refresh, cacheTestResult, handleTest, globalSecretKeys]);
+  }, [
+    api,
+    newServer,
+    newTestResult,
+    servers,
+    refresh,
+    cacheTestResult,
+    handleTest,
+    globalSecretKeys,
+  ]);
 
   const handleStartEdit = useCallback((name: string, entry: MCPServerInfo) => {
     setEditing({
@@ -1124,7 +1129,8 @@ export const MCPSettingsSection: React.FC = () => {
   }, []);
 
   const handleSaveEdit = useCallback(async () => {
-    if (!api || !editing?.value.trim()) return;
+    // Enter saves too, so repeat the Save button's URL gate here.
+    if (!api || !editing?.value.trim() || getDraftUrlError(editing) !== null) return;
     setSavingEdit(true);
     setError(null);
 
@@ -1154,6 +1160,7 @@ export const MCPSettingsSection: React.FC = () => {
       if (!result.success) {
         setError(result.error ?? "Failed to update MCP server");
       } else {
+        publishGlobalMcpEnablementChanged();
         // Clear cached test result since config changed
         clearTestResult(editing.name);
         setEditing(null);
@@ -1173,13 +1180,20 @@ export const MCPSettingsSection: React.FC = () => {
           knownSecretKeys: new Set(globalSecretKeys),
         }).validation;
 
+  const newServerUrlError = getDraftUrlError(newServer);
+  // Own-property check: names like "constructor" are not configured servers.
+  const newServerNameTaken = Object.hasOwn(servers, newServer.name.trim());
   const canAdd =
     newServer.name.trim().length > 0 &&
+    !newServerNameTaken &&
     newServer.value.trim().length > 0 &&
+    newServerUrlError === null &&
     (newServer.transport === "stdio" || newHeadersValidation.errors.length === 0);
 
+  // Same URL gate as Add: testing a non-URL only reports "Invalid URL" from the client.
   const canTest =
     newServer.value.trim().length > 0 &&
+    newServerUrlError === null &&
     (newServer.transport === "stdio" || newHeadersValidation.errors.length === 0);
 
   // OAuth login for the add-server draft lives here rather than in the callout so the form
@@ -1190,16 +1204,18 @@ export const MCPSettingsSection: React.FC = () => {
   const newServerUrl = newServer.value.trim();
   // If the server already exists in config, prefer that config for OAuth.
   const newServerOauthPendingServer: MCPOAuthPendingServerConfig | undefined =
-    newServerName && !servers[newServerName] && newServer.transport !== "stdio" && newServerUrl
+    newServerName &&
+    !Object.hasOwn(servers, newServerName) &&
+    newServer.transport !== "stdio" &&
+    newServerUrl
       ? { transport: newServer.transport, url: newServerUrl }
       : undefined;
   const newServerOauthDisabledReason = !newServerName
     ? "Enter a server name to enable OAuth login."
-    : (servers[newServerName]?.transport ?? newServer.transport) === "stdio"
+    : (getOwn(servers, newServerName)?.transport ?? newServer.transport) === "stdio"
       ? "OAuth login is only supported for remote (http/sse) MCP servers."
       : undefined;
   const newServerOauthLogin = useMCPOAuthLogin({
-    api,
     isDesktop: !!window.api,
     serverName: newServerName,
     pendingServer: newServerOauthPendingServer,
@@ -1210,7 +1226,7 @@ export const MCPSettingsSection: React.FC = () => {
       // this name during the browser round-trip, only refresh that row's test result so we
       // never overwrite its config with the draft.
       const current = (await api.mcp.list({})) ?? {};
-      if (current[newServerName]) {
+      if (Object.hasOwn(current, newServerName)) {
         // Install the fresh list so the row is visible before its test result lands.
         await refresh();
         await handleTest(newServerName);
@@ -1279,6 +1295,7 @@ export const MCPSettingsSection: React.FC = () => {
     resetNewServerOauthLogin,
   ]);
 
+  const editUrlError = editing ? getDraftUrlError(editing) : null;
   const editHeadersValidation =
     editing && editing.transport !== "stdio"
       ? mcpHeaderRowsToRecord(editing.headersRows, {
@@ -1290,7 +1307,7 @@ export const MCPSettingsSection: React.FC = () => {
     <div className="space-y-6">
       {/* Intro */}
       <div>
-        <p className="text-muted mb-4 text-xs">
+        <p className="text-content-secondary mb-4 text-xs">
           Configure global MCP servers. Global config lives in{" "}
           <code className="text-accent">~/.xum/mcp.jsonc</code>, with optional repo overrides in{" "}
           <code className="text-accent">./.xum/mcp.jsonc</code> and workspace overrides in{" "}
@@ -1298,10 +1315,11 @@ export const MCPSettingsSection: React.FC = () => {
         </p>
       </div>
 
-      {designEnabled && (
+      <ToolSearchSetting />
+
+      {design.enabled && (
         <ClaudeDesignCard
           onChange={refresh}
-          remoteDisabled={mcpAllowUserDefined?.remote === false}
           conflict={Boolean(
             servers[CLAUDE_DESIGN_SERVER_NAME] &&
             (servers[CLAUDE_DESIGN_SERVER_NAME].transport === "stdio" ||
@@ -1314,481 +1332,499 @@ export const MCPSettingsSection: React.FC = () => {
       <div>
         <h3 className="text-foreground mb-4 text-sm font-medium">MCP Servers</h3>
 
-        {mcpDisabledByPolicy ? (
-          <p className="text-muted py-2 text-sm">MCP servers are disabled by policy.</p>
-        ) : (
-          <>
-            {error && (
-              <div className="bg-destructive/10 text-destructive mb-3 flex items-center gap-2 rounded-md px-3 py-2 text-sm">
-                <XCircle className="h-4 w-4 shrink-0" />
-                {error}
-              </div>
-            )}
+        {error && (
+          <div className="bg-destructive/10 text-destructive mb-3 flex items-center gap-2 rounded-md px-3 py-2 text-sm">
+            <XCircle className="h-4 w-4 shrink-0" />
+            {error}
+          </div>
+        )}
 
-            {/* Server list */}
-            <div className="space-y-2">
-              {loading ? (
-                <div className="text-muted flex items-center gap-2 py-4 text-sm">
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  Loading servers…
-                </div>
-              ) : Object.keys(servers).length === 0 ? (
-                <p className="text-muted py-2 text-sm">No MCP servers configured yet.</p>
-              ) : (
-                Object.entries(servers).map(([name, entry]) => {
-                  const isTesting = testingServer === name;
-                  const cached = testCache[name];
-                  const isEditing = editing?.name === name;
-                  const isEnabled = !entry.disabled;
-                  const remoteEntry = entry.transport === "stdio" ? null : entry;
-                  // Plugin definitions remain read-only (no edit/remove/allowlist).
-                  // Global enablement persists only their keys in enabledPluginServers.
-                  const isPluginEntry = entry.plugin !== undefined;
-                  const isDesignEntry = remoteEntry?.managed === "claude-design";
-                  const displayName = entry.plugin
-                    ? `${entry.plugin.pluginName}/${entry.plugin.serverName}`
-                    : name;
-                  return (
-                    <div
-                      key={name}
-                      className="border-border-medium bg-background-secondary overflow-hidden rounded-md border"
-                    >
-                      <div className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-3 px-3 py-2">
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <div className="mt-0.5 shrink-0">
-                              <Switch
-                                checked={isEnabled}
-                                onCheckedChange={(checked) =>
-                                  void handleToggleEnabled(name, checked)
-                                }
-                                aria-label={`Toggle ${displayName} enabled`}
-                              />
-                            </div>
-                          </TooltipTrigger>
-                          <TooltipContent side="top">
-                            {isEnabled ? "Disable server" : "Enable server"}
-                          </TooltipContent>
-                        </Tooltip>
-                        <div className={cn("min-w-0", !isEnabled && "opacity-50")}>
-                          {/* flex-wrap + wrap-anywhere: repo-controlled plugin names and
-                              install locations can be long unbroken tokens; wrap-anywhere
-                              shrinks their min-content so they cannot starve the actions
-                              column at ~375px. */}
-                          <div className="flex flex-wrap items-center gap-2">
-                            {branding[name] && !isEditing && (
-                              <MCPServerIdentityBadge
-                                connection={describeConfiguredConnection(name, entry)}
-                                identity={branding[name].serverInfo}
-                                icon={branding[name].icon}
-                              />
-                            )}
-                            <span className="text-foreground min-w-0 text-sm font-medium wrap-anywhere">
-                              {displayName}
-                            </span>
-                            {entry.plugin && (
-                              <span className="text-muted bg-background min-w-0 rounded px-1.5 py-0.5 text-xs wrap-anywhere">
-                                {/* Include the install location: same-name plugins can
-                                    exist in sibling containers (.mux vs .agents). */}
-                                plugin · {entry.plugin.sourceLocation}
+        {/* Server list */}
+        <div className="space-y-2">
+          {loading ? (
+            <div className="text-content-secondary flex items-center gap-2 py-4 text-sm">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Loading servers…
+            </div>
+          ) : Object.keys(servers).length === 0 ? (
+            <p className="text-content-secondary py-2 text-sm">No MCP servers configured yet.</p>
+          ) : (
+            Object.entries(servers).map(([name, entry]) => {
+              const isTesting = Object.hasOwn(testingServers, name);
+              // Own-property reads: a server may be named "constructor" (#5740).
+              const cached = getOwn(testCache, name);
+              const serverBranding = getOwn(branding, name);
+              const isEditing = editing?.name === name;
+              const isEnabled = !entry.disabled;
+              const remoteEntry = entry.transport === "stdio" ? null : entry;
+              // Plugin definitions remain read-only (no edit/remove/allowlist).
+              // Global enablement persists only their keys in enabledPluginServers.
+              const isPluginEntry = entry.plugin !== undefined;
+              const isDesignEntry = remoteEntry?.managed === "claude-design";
+              const displayName = entry.plugin
+                ? `${entry.plugin.pluginName}/${entry.plugin.serverName}`
+                : name;
+              return (
+                <div
+                  key={name}
+                  className="border-border-medium bg-background-secondary overflow-hidden rounded-md border"
+                >
+                  <div className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-3 px-3 py-2">
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <div className="mt-0.5 shrink-0">
+                          <Switch
+                            checked={isEnabled}
+                            onCheckedChange={(checked) => void handleToggleEnabled(name, checked)}
+                            aria-label={`Toggle ${displayName} enabled`}
+                          />
+                        </div>
+                      </TooltipTrigger>
+                      <TooltipContent side="top">
+                        {isEnabled ? "Disable server" : "Enable server"}
+                      </TooltipContent>
+                    </Tooltip>
+                    <div className={cn("min-w-0", !isEnabled && "opacity-50")}>
+                      {/* flex-wrap + wrap-anywhere: repo-controlled plugin names and
+                          install locations can be long unbroken tokens; wrap-anywhere
+                          shrinks their min-content so they cannot starve the actions
+                          column at ~375px. */}
+                      <div className="flex flex-wrap items-center gap-2">
+                        {serverBranding && !isEditing && (
+                          <MCPServerIdentityBadge
+                            connection={describeConfiguredConnection(name, entry)}
+                            identity={serverBranding.serverInfo}
+                            icon={serverBranding.icon}
+                          />
+                        )}
+                        <span className="text-foreground min-w-0 text-sm font-medium wrap-anywhere">
+                          {displayName}
+                        </span>
+                        {entry.plugin && (
+                          <span className="text-content-secondary bg-background min-w-0 rounded px-1.5 py-0.5 text-xs wrap-anywhere">
+                            {/* Include the install location: same-name plugins can
+                                exist in sibling containers (.mux vs .agents). */}
+                            plugin · {entry.plugin.sourceLocation}
+                          </span>
+                        )}
+                        {cached?.result.success && !isEditing && isEnabled && (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span className="rounded bg-green-500/10 px-1.5 py-0.5 text-xs text-green-500">
+                                {cached.result.tools.length} tools
                               </span>
-                            )}
-                            {cached?.result.success && !isEditing && isEnabled && (
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <span className="rounded bg-green-500/10 px-1.5 py-0.5 text-xs text-green-500">
-                                    {cached.result.tools.length} tools
-                                  </span>
-                                </TooltipTrigger>
-                                <TooltipContent side="top">
-                                  Tested {formatRelativeTime(cached.testedAt)}
-                                </TooltipContent>
-                              </Tooltip>
-                            )}
-                            {!isEnabled && <span className="text-muted text-xs">disabled</span>}
-                          </div>
-                          {isEditing ? (
-                            <div className="mt-2 space-y-2">
-                              <p className="text-muted text-xs">transport: {editing.transport}</p>
-                              <input
-                                type="text"
-                                value={editing.value}
-                                onChange={(e) => setEditing({ ...editing, value: e.target.value })}
-                                className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-xs focus:outline-none"
-                                autoFocus
-                                spellCheck={false}
-                                onKeyDown={createEditKeyHandler({
-                                  onSave: () => void handleSaveEdit(),
-                                  onCancel: handleCancelEdit,
-                                })}
-                              />
-                              {editing.transport !== "stdio" && (
-                                <div>
-                                  <div className="text-muted mb-1 text-[11px]">
-                                    HTTP headers (optional)
-                                  </div>
-                                  <MCPHeadersEditor
-                                    rows={editing.headersRows}
-                                    onChange={(rows) =>
-                                      setEditing({
-                                        ...editing,
-                                        headersRows: rows,
-                                      })
-                                    }
-                                    secretKeys={globalSecretKeys}
-                                    disabled={savingEdit}
-                                  />
-                                </div>
-                              )}
-                            </div>
-                          ) : (
-                            <p className="text-muted mt-0.5 font-mono text-xs break-all">
-                              {serverDisplayValue(entry)}
-                            </p>
-                          )}
-                        </div>
-                        <div className="flex shrink-0 items-center gap-0.5">
-                          {isEditing ? (
-                            <>
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <span className="inline-flex">
-                                    <Button
-                                      variant="ghost"
-                                      size="icon"
-                                      onClick={() => void handleSaveEdit()}
-                                      disabled={
-                                        savingEdit ||
-                                        !editing.value.trim() ||
-                                        editHeadersValidation.errors.length > 0
-                                      }
-                                      className="h-7 w-7 text-green-500 hover:text-green-400"
-                                      aria-label="Save"
-                                    >
-                                      {savingEdit ? (
-                                        <Loader2 className="h-4 w-4 animate-spin" />
-                                      ) : (
-                                        <Check className="h-4 w-4" />
-                                      )}
-                                    </Button>
-                                  </span>
-                                </TooltipTrigger>
-                                <TooltipContent side="top">Save (Enter)</TooltipContent>
-                              </Tooltip>
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <span className="inline-flex">
-                                    <Button
-                                      variant="ghost"
-                                      size="icon"
-                                      onClick={handleCancelEdit}
-                                      disabled={savingEdit}
-                                      className="text-muted hover:text-foreground h-7 w-7"
-                                      aria-label="Cancel"
-                                    >
-                                      <X className="h-4 w-4" />
-                                    </Button>
-                                  </span>
-                                </TooltipTrigger>
-                                <TooltipContent side="top">Cancel (Esc)</TooltipContent>
-                              </Tooltip>
-                            </>
-                          ) : (
-                            <>
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <span className="inline-flex">
-                                    <Button
-                                      variant="ghost"
-                                      size="icon"
-                                      onClick={() => void handleTest(name)}
-                                      disabled={isTesting}
-                                      className="text-muted hover:text-accent h-7 w-7"
-                                      aria-label="Test connection"
-                                    >
-                                      {isTesting ? (
-                                        <Loader2 className="h-4 w-4 animate-spin" />
-                                      ) : (
-                                        <Play className="h-4 w-4" />
-                                      )}
-                                    </Button>
-                                  </span>
-                                </TooltipTrigger>
-                                <TooltipContent side="top">Test connection</TooltipContent>
-                              </Tooltip>
-                              {/* Plugin entries are read-only: no edit/remove. */}
-                              {!isPluginEntry && !isDesignEntry && (
-                                <>
-                                  <Tooltip>
-                                    <TooltipTrigger asChild>
-                                      <span className="inline-flex">
-                                        <Button
-                                          variant="ghost"
-                                          size="icon"
-                                          onClick={() => handleStartEdit(name, entry)}
-                                          className="text-muted hover:text-accent h-7 w-7"
-                                          aria-label="Edit server"
-                                        >
-                                          <Pencil className="h-4 w-4" />
-                                        </Button>
-                                      </span>
-                                    </TooltipTrigger>
-                                    <TooltipContent side="top">Edit server</TooltipContent>
-                                  </Tooltip>
-                                  <Tooltip>
-                                    <TooltipTrigger asChild>
-                                      <span className="inline-flex">
-                                        <Button
-                                          variant="ghost"
-                                          size="icon"
-                                          onClick={() => void handleRemove(name)}
-                                          disabled={loading}
-                                          className="text-muted hover:text-error h-7 w-7"
-                                          aria-label="Remove server"
-                                        >
-                                          <Trash2 className="h-4 w-4" />
-                                        </Button>
-                                      </span>
-                                    </TooltipTrigger>
-                                    <TooltipContent side="top">Remove server</TooltipContent>
-                                  </Tooltip>
-                                </>
-                              )}
-                            </>
-                          )}
-                        </div>
-                        {!isEditing && remoteEntry && !isDesignEntry && (
-                          <div
-                            className={cn(
-                              "col-start-2 col-span-2 min-w-0",
-                              !isEnabled && "opacity-50"
-                            )}
-                          >
-                            <RemoteMCPOAuthSection
-                              serverName={name}
-                              transport={remoteEntry.transport}
-                              url={remoteEntry.url}
-                              oauthRefreshNonce={mcpOauthRefreshNonce}
-                            />
-                          </div>
+                            </TooltipTrigger>
+                            <TooltipContent side="top">
+                              Tested {formatRelativeTime(cached.testedAt)}
+                            </TooltipContent>
+                          </Tooltip>
+                        )}
+                        {!isEnabled && (
+                          <span className="text-content-secondary text-xs">disabled</span>
                         )}
                       </div>
-                      {cached && !cached.result.success && !isEditing && (
-                        <div className="border-border-medium border-t px-3 py-2 text-xs">
-                          <div className="text-destructive flex items-start gap-1.5">
-                            <XCircle className="mt-0.5 h-3 w-3 shrink-0" />
-                            <span>{cached.result.error}</span>
-                          </div>
-
-                          {cached.result.oauthChallenge && !isDesignEntry && (
-                            <div className="mt-2">
-                              <MCPOAuthRequiredCallout
-                                serverName={name}
-                                disabledReason={
-                                  remoteEntry
-                                    ? undefined
-                                    : "OAuth login is only supported for remote (http/sse) MCP servers."
+                      {isEditing ? (
+                        <div className="mt-2 space-y-2">
+                          <p className="text-content-secondary text-xs">
+                            transport: {editing.transport}
+                          </p>
+                          <input
+                            type="text"
+                            value={editing.value}
+                            onChange={(e) => setEditing({ ...editing, value: e.target.value })}
+                            className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-xs focus:outline-none"
+                            autoFocus
+                            spellCheck={false}
+                            onKeyDown={createEditKeyHandler({
+                              onSave: () => void handleSaveEdit(),
+                              onCancel: handleCancelEdit,
+                            })}
+                          />
+                          {editUrlError && (
+                            <p className="text-destructive text-xs">{editUrlError}</p>
+                          )}
+                          {editing.transport !== "stdio" && (
+                            <div>
+                              <div className="text-content-secondary mb-1 text-[11px]">
+                                HTTP headers (optional)
+                              </div>
+                              <MCPHeadersEditor
+                                rows={editing.headersRows}
+                                onChange={(rows) =>
+                                  setEditing({
+                                    ...editing,
+                                    headersRows: rows,
+                                  })
                                 }
-                                onLoginSuccess={async () => {
-                                  setMcpOauthRefreshNonce((prev) => prev + 1);
-                                  await handleTest(name);
-                                }}
+                                secretKeys={globalSecretKeys}
+                                disabled={savingEdit}
                               />
                             </div>
                           )}
                         </div>
+                      ) : (
+                        <p className="text-content-secondary mt-0.5 font-mono text-xs break-all">
+                          {serverDisplayValue(entry)}
+                        </p>
                       )}
-                      {cached?.result.success && cached.result.tools.length > 0 && !isEditing && (
-                        <div className="border-border-medium border-t px-3 py-2">
-                          {isPluginEntry ? (
-                            // Plugin servers are read-only here (setToolAllowlist rejects
-                            // plugin keys); their allowlists live in Workspace MCP. Users
-                            // can still inspect what the connection test discovered.
-                            <PluginToolListSection
-                              tools={cached.result.tools}
-                              testedAt={cached.testedAt}
-                            />
-                          ) : (
-                            <ToolAllowlistSection
-                              serverName={name}
-                              availableTools={cached.result.tools}
-                              currentAllowlist={entry.toolAllowlist}
-                              testedAt={cached.testedAt}
-                            />
+                    </div>
+                    <div className="flex shrink-0 items-center gap-0.5">
+                      {isEditing ? (
+                        <>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span className="inline-flex">
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  onClick={() => void handleSaveEdit()}
+                                  disabled={
+                                    savingEdit ||
+                                    !editing.value.trim() ||
+                                    editUrlError !== null ||
+                                    editHeadersValidation.errors.length > 0
+                                  }
+                                  className="h-7 w-7 text-green-500 hover:text-green-400"
+                                  aria-label="Save"
+                                >
+                                  {savingEdit ? (
+                                    <Loader2 className="h-4 w-4 animate-spin" />
+                                  ) : (
+                                    <Check className="h-4 w-4" />
+                                  )}
+                                </Button>
+                              </span>
+                            </TooltipTrigger>
+                            <TooltipContent side="top">Save (Enter)</TooltipContent>
+                          </Tooltip>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span className="inline-flex">
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  onClick={handleCancelEdit}
+                                  disabled={savingEdit}
+                                  className="text-muted hover:text-foreground h-7 w-7"
+                                  aria-label="Cancel"
+                                >
+                                  <X className="h-4 w-4" />
+                                </Button>
+                              </span>
+                            </TooltipTrigger>
+                            <TooltipContent side="top">Cancel (Esc)</TooltipContent>
+                          </Tooltip>
+                        </>
+                      ) : (
+                        <>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <span className="inline-flex">
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  onClick={() => void handleTest(name)}
+                                  disabled={isTesting}
+                                  className="text-muted hover:text-accent h-7 w-7"
+                                  aria-label="Test connection"
+                                >
+                                  {isTesting ? (
+                                    <Loader2 className="h-4 w-4 animate-spin" />
+                                  ) : (
+                                    <Play className="h-4 w-4" />
+                                  )}
+                                </Button>
+                              </span>
+                            </TooltipTrigger>
+                            <TooltipContent side="top">Test connection</TooltipContent>
+                          </Tooltip>
+                          {/* Plugin entries are read-only: no edit/remove. */}
+                          {!isPluginEntry && !isDesignEntry && (
+                            <>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <span className="inline-flex">
+                                    <Button
+                                      variant="ghost"
+                                      size="icon"
+                                      onClick={() => handleStartEdit(name, entry)}
+                                      className="text-muted hover:text-accent h-7 w-7"
+                                      aria-label="Edit server"
+                                    >
+                                      <Pencil className="h-4 w-4" />
+                                    </Button>
+                                  </span>
+                                </TooltipTrigger>
+                                <TooltipContent side="top">Edit server</TooltipContent>
+                              </Tooltip>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <span className="inline-flex">
+                                    <Button
+                                      variant="ghost"
+                                      size="icon"
+                                      onClick={() => void handleRemove(name)}
+                                      disabled={loading}
+                                      className="text-muted hover:text-error h-7 w-7"
+                                      aria-label="Remove server"
+                                    >
+                                      <Trash2 className="h-4 w-4" />
+                                    </Button>
+                                  </span>
+                                </TooltipTrigger>
+                                <TooltipContent side="top">Remove server</TooltipContent>
+                              </Tooltip>
+                            </>
                           )}
+                        </>
+                      )}
+                    </div>
+                    {!isEditing && remoteEntry && !isDesignEntry && (
+                      <div
+                        className={cn("col-start-2 col-span-2 min-w-0", !isEnabled && "opacity-50")}
+                      >
+                        <RemoteMCPOAuthSection
+                          serverName={name}
+                          transport={remoteEntry.transport}
+                          url={remoteEntry.url}
+                          oauthRefreshNonce={mcpOauthRefreshNonce}
+                        />
+                      </div>
+                    )}
+                  </div>
+                  {isTesting && !isEditing && (
+                    <div className="border-border-medium text-content-secondary flex items-center gap-1.5 border-t px-3 py-2 text-xs">
+                      <Loader2 className="h-3 w-3 shrink-0 animate-spin" />
+                      <span>Testing connection…</span>
+                    </div>
+                  )}
+                  {cached && !cached.result.success && !isEditing && (
+                    <div className="border-border-medium border-t px-3 py-2 text-xs">
+                      <div className="text-destructive flex items-start gap-1.5">
+                        <XCircle className="mt-0.5 h-3 w-3 shrink-0" />
+                        <span>{cached.result.error}</span>
+                      </div>
+
+                      {cached.result.oauthChallenge && !isDesignEntry && (
+                        <div className="mt-2">
+                          <MCPOAuthRequiredCallout
+                            serverName={name}
+                            disabledReason={
+                              remoteEntry
+                                ? undefined
+                                : "OAuth login is only supported for remote (http/sse) MCP servers."
+                            }
+                            onLoginSuccess={async () => {
+                              setMcpOauthRefreshNonce((prev) => prev + 1);
+                              await handleTest(name);
+                            }}
+                          />
                         </div>
                       )}
                     </div>
-                  );
-                })
+                  )}
+                  {cached?.result.success && cached.result.tools.length > 0 && !isEditing && (
+                    <div className="border-border-medium border-t px-3 py-2">
+                      {isPluginEntry ? (
+                        // Plugin servers are read-only here (setToolAllowlist rejects
+                        // plugin keys); their allowlists live in Workspace MCP. Users
+                        // can still inspect what the connection test discovered.
+                        <PluginToolListSection
+                          tools={cached.result.tools}
+                          testedAt={cached.testedAt}
+                        />
+                      ) : (
+                        <ToolAllowlistSection
+                          serverName={name}
+                          availableTools={cached.result.tools}
+                          currentAllowlist={entry.toolAllowlist}
+                          testedAt={cached.testedAt}
+                        />
+                      )}
+                    </div>
+                  )}
+                  <McpAppViewDomainsSection
+                    entries={viewDomains.entries.filter((e) => e.serverName === name)}
+                    onRevoke={(e) => void viewDomains.revoke(e)}
+                    error={viewDomains.revokeError}
+                  />
+                </div>
+              );
+            })
+          )}
+        </div>
+        <McpAppViewDomainsSection
+          entries={unlistedMcpAppViewDomains(viewDomains.entries, servers)}
+          onRevoke={(e) => void viewDomains.revoke(e)}
+          showServer
+          error={viewDomains.revokeError}
+        />
+
+        {/* Add server form */}
+        <details className="group mt-3">
+          <summary className="text-accent hover:text-accent/80 flex cursor-pointer list-none items-center gap-1 text-sm font-medium">
+            <ChevronRight className="h-4 w-4 transition-transform group-open:rotate-90" />
+            Add server
+          </summary>
+          <div className="border-border-medium bg-background-secondary mt-2 space-y-3 rounded-md border p-3">
+            <div>
+              <label htmlFor="server-name" className="text-content-secondary mb-1 block text-xs">
+                Name
+              </label>
+              <input
+                id="server-name"
+                type="text"
+                placeholder="e.g., memory"
+                value={newServer.name}
+                onChange={(e) => setNewServer((prev) => ({ ...prev, name: e.target.value }))}
+                disabled={newServerOauthPending}
+                className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 text-sm focus:outline-none"
+              />
+              {newServerNameTaken && (
+                <p className="text-destructive mt-1 text-xs">{DUPLICATE_SERVER_NAME_ERROR}</p>
               )}
             </div>
 
-            {/* Add server form */}
-            <details className="group mt-3">
-              <summary className="text-accent hover:text-accent/80 flex cursor-pointer list-none items-center gap-1 text-sm font-medium">
-                <ChevronRight className="h-4 w-4 transition-transform group-open:rotate-90" />
-                Add server
-              </summary>
-              <div className="border-border-medium bg-background-secondary mt-2 space-y-3 rounded-md border p-3">
-                <div>
-                  <label htmlFor="server-name" className="text-muted mb-1 block text-xs">
-                    Name
-                  </label>
-                  <input
-                    id="server-name"
-                    type="text"
-                    placeholder="e.g., memory"
-                    value={newServer.name}
-                    onChange={(e) => setNewServer((prev) => ({ ...prev, name: e.target.value }))}
-                    disabled={newServerOauthPending}
-                    className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 text-sm focus:outline-none"
-                  />
-                </div>
+            <div>
+              <label className="text-content-secondary mb-1 block text-xs">Transport</label>
+              <Select
+                value={newServer.transport}
+                disabled={newServerOauthPending}
+                onValueChange={(value) =>
+                  setNewServer((prev) => ({
+                    ...prev,
+                    transport: value as MCPServerTransport,
+                    value: "",
+                    headersRows: [],
+                  }))
+                }
+              >
+                <SelectTrigger className="border-border-medium bg-modal-bg h-8 w-full text-sm">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="stdio">Stdio</SelectItem>
+                  <SelectItem value="http">HTTP (Streamable)</SelectItem>
+                  <SelectItem value="sse">SSE (Legacy)</SelectItem>
+                  <SelectItem value="auto">Auto (HTTP → SSE)</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
 
-                <div>
-                  <label className="text-muted mb-1 block text-xs">Transport</label>
-                  <Select
-                    value={newServer.transport}
-                    disabled={newServerOauthPending}
-                    onValueChange={(value) =>
-                      setNewServer((prev) => ({
-                        ...prev,
-                        transport: value as MCPServerTransport,
-                        value: "",
-                        headersRows: [],
-                      }))
-                    }
-                  >
-                    <SelectTrigger className="border-border-medium bg-modal-bg h-8 w-full text-sm">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {mcpAllowUserDefined?.stdio !== false && (
-                        <SelectItem value="stdio">Stdio</SelectItem>
-                      )}
-                      {mcpAllowUserDefined?.remote !== false && (
-                        <>
-                          <SelectItem value="http">HTTP (Streamable)</SelectItem>
-                          <SelectItem value="sse">SSE (Legacy)</SelectItem>
-                          <SelectItem value="auto">Auto (HTTP → SSE)</SelectItem>
-                        </>
-                      )}
-                    </SelectContent>
-                  </Select>
-                </div>
+            <div>
+              <label htmlFor="server-value" className="text-content-secondary mb-1 block text-xs">
+                {newServer.transport === "stdio" ? "Command" : "URL"}
+              </label>
+              <input
+                id="server-value"
+                type="text"
+                placeholder={
+                  newServer.transport === "stdio"
+                    ? "e.g., npx -y @modelcontextprotocol/server-memory"
+                    : "e.g., http://localhost:3333/mcp"
+                }
+                value={newServer.value}
+                onChange={(e) => setNewServer((prev) => ({ ...prev, value: e.target.value }))}
+                spellCheck={false}
+                disabled={newServerOauthPending}
+                className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-sm focus:outline-none"
+              />
+              {newServerUrlError && (
+                <p className="text-destructive mt-1 text-xs">{newServerUrlError}</p>
+              )}
+            </div>
 
-                <div>
-                  <label htmlFor="server-value" className="text-muted mb-1 block text-xs">
-                    {newServer.transport === "stdio" ? "Command" : "URL"}
-                  </label>
-                  <input
-                    id="server-value"
-                    type="text"
-                    placeholder={
-                      newServer.transport === "stdio"
-                        ? "e.g., npx -y @modelcontextprotocol/server-memory"
-                        : "e.g., http://localhost:3333/mcp"
-                    }
-                    value={newServer.value}
-                    onChange={(e) => setNewServer((prev) => ({ ...prev, value: e.target.value }))}
-                    spellCheck={false}
-                    disabled={newServerOauthPending}
-                    className="bg-modal-bg border-border-medium focus:border-accent w-full rounded border px-2 py-1.5 font-mono text-sm focus:outline-none"
-                  />
-                </div>
-
-                {newServer.transport !== "stdio" && (
-                  <div>
-                    <label className="text-muted mb-1 block text-xs">HTTP headers (optional)</label>
-                    <MCPHeadersEditor
-                      rows={newServer.headersRows}
-                      onChange={(rows) =>
-                        setNewServer((prev) => ({
-                          ...prev,
-                          headersRows: rows,
-                        }))
-                      }
-                      secretKeys={globalSecretKeys}
-                      disabled={addingServer || testingNew || newServerOauthPending}
-                    />
-                  </div>
-                )}
-
-                {/* Test result */}
-                {newTestResult && (
-                  <div
-                    className={cn(
-                      "flex items-start gap-2 rounded-md px-3 py-2 text-sm",
-                      newTestResult.result.success
-                        ? "bg-green-500/10 text-green-500"
-                        : "bg-destructive/10 text-destructive"
-                    )}
-                  >
-                    {newTestResult.result.success ? (
-                      <>
-                        <CheckCircle className="mt-0.5 h-4 w-4 shrink-0" />
-                        <div>
-                          <span className="font-medium">
-                            Connected — {newTestResult.result.tools.length} tools
-                          </span>
-                          {newTestResult.result.tools.length > 0 && (
-                            <p className="mt-0.5 text-xs opacity-80">
-                              {newTestResult.result.tools.join(", ")}
-                            </p>
-                          )}
-                        </div>
-                      </>
-                    ) : (
-                      <>
-                        <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
-                        <span>{newTestResult.result.error}</span>
-                      </>
-                    )}
-                  </div>
-                )}
-
-                {newTestResult &&
-                  !newTestResult.result.success &&
-                  newTestResult.result.oauthChallenge && (
-                    <div className="mt-2">
-                      <MCPOAuthRequiredCalloutView
-                        login={newServerOauthLogin}
-                        disabledReason={newServerOauthDisabledReason}
-                      />
-                    </div>
-                  )}
-                <div className="flex gap-2 pt-1">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => void handleTestNewServer()}
-                    disabled={!canTest || testingNew || newServerOauthPending}
-                  >
-                    {testingNew ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    ) : (
-                      <Play className="h-3.5 w-3.5" />
-                    )}
-                    {testingNew ? "Testing…" : "Test"}
-                  </Button>
-                  <Button
-                    size="sm"
-                    onClick={() => void handleAddServer()}
-                    disabled={!canAdd || addingServer || newServerOauthPending}
-                  >
-                    {addingServer ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    ) : (
-                      <Plus className="h-3.5 w-3.5" />
-                    )}
-                    {addingServer ? "Adding…" : "Add"}
-                  </Button>
-                </div>
+            {newServer.transport !== "stdio" && (
+              <div>
+                <label className="text-content-secondary mb-1 block text-xs">
+                  HTTP headers (optional)
+                </label>
+                <MCPHeadersEditor
+                  rows={newServer.headersRows}
+                  onChange={(rows) =>
+                    setNewServer((prev) => ({
+                      ...prev,
+                      headersRows: rows,
+                    }))
+                  }
+                  secretKeys={globalSecretKeys}
+                  disabled={addingServer || testingNew || newServerOauthPending}
+                />
               </div>
-            </details>
-          </>
-        )}
+            )}
+
+            {/* Test result */}
+            {newTestResult && (
+              <div
+                className={cn(
+                  "flex items-start gap-2 rounded-md px-3 py-2 text-sm",
+                  newTestResult.result.success
+                    ? "bg-green-500/10 text-green-500"
+                    : "bg-destructive/10 text-destructive"
+                )}
+              >
+                {newTestResult.result.success ? (
+                  <>
+                    <CheckCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                    <div>
+                      <span className="font-medium">
+                        Connected — {newTestResult.result.tools.length} tools
+                      </span>
+                      {newTestResult.result.tools.length > 0 && (
+                        <p className="mt-0.5 text-xs opacity-80">
+                          {newTestResult.result.tools.join(", ")}
+                        </p>
+                      )}
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                    <span>{newTestResult.result.error}</span>
+                  </>
+                )}
+              </div>
+            )}
+
+            {newTestResult &&
+              !newTestResult.result.success &&
+              newTestResult.result.oauthChallenge && (
+                <div className="mt-2">
+                  <MCPOAuthRequiredCalloutView
+                    login={newServerOauthLogin}
+                    disabledReason={newServerOauthDisabledReason}
+                  />
+                </div>
+              )}
+            <div className="flex gap-2 pt-1">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void handleTestNewServer()}
+                disabled={!canTest || testingNew || newServerOauthPending}
+              >
+                {testingNew ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Play className="h-3.5 w-3.5" />
+                )}
+                {testingNew ? "Testing…" : "Test"}
+              </Button>
+              <Button
+                size="sm"
+                onClick={() => void handleAddServer()}
+                disabled={!canAdd || addingServer || newServerOauthPending}
+              >
+                {addingServer ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Plus className="h-3.5 w-3.5" />
+                )}
+                {addingServer ? "Adding…" : "Add"}
+              </Button>
+            </div>
+          </div>
+        </details>
       </div>
     </div>
   );

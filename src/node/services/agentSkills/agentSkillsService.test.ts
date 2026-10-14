@@ -9,11 +9,12 @@ import { SkillNameSchema } from "@/common/orpc/schemas";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RemoteRuntime, type SpawnResult } from "@/node/runtime/RemoteRuntime";
+import { RuntimeError } from "@/node/runtime/Runtime";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import {
   discoverAgentSkills,
-  discoverAgentSkillsDiagnostics,
+  requireReachableSkills,
   getDefaultAgentSkillsRoots,
   readAgentSkill,
 } from "./agentSkillsService";
@@ -332,7 +333,7 @@ describe("agentSkillsService", () => {
     const roots = { projectRoot: projectSkillsRoot, globalRoot: globalSkillsRoot };
     const runtime = new LocalRuntime(project.path);
 
-    const skills = await discoverAgentSkills(runtime, project.path, { roots });
+    const { skills } = await discoverAgentSkills(runtime, project.path, { roots });
 
     // Should include project/global skills plus built-in skills
     // Note: deep-review is a project skill in the Xum repo, not a built-in.
@@ -389,7 +390,7 @@ describe("agentSkillsService", () => {
       throw new Error("Expected project-local skill roots");
     }
 
-    const skills = await discoverAgentSkills(context.runtime, context.workspacePath, {
+    const { skills } = await discoverAgentSkills(context.runtime, context.workspacePath, {
       roots: context.roots,
       containment: context.containment,
     });
@@ -443,7 +444,7 @@ describe("agentSkillsService", () => {
     };
     const runtime = new LocalRuntime(project.path);
 
-    const skills = await discoverAgentSkills(runtime, project.path, { roots });
+    const { skills } = await discoverAgentSkills(runtime, project.path, { roots });
 
     expect(skills.find((skill) => skill.name === "project-only")).toBeUndefined();
     expect(skills.find((skill) => skill.name === "global-only")).toMatchObject({
@@ -491,7 +492,7 @@ describe("agentSkillsService", () => {
 
     expect(context.runtime).toBeInstanceOf(LocalRuntime);
 
-    const skills = await discoverAgentSkills(context.runtime, context.workspacePath, {
+    const { skills } = await discoverAgentSkills(context.runtime, context.workspacePath, {
       roots: context.roots,
       containment: context.containment,
     });
@@ -540,22 +541,10 @@ describe("agentSkillsService", () => {
       globalRoot: path.posix.join(remoteWorkspaceRoot, ".mux", "global-skills"),
     };
 
-    const skills = await discoverAgentSkills(runtime, remoteWorkspaceRoot, { roots });
+    const { skills } = await discoverAgentSkills(runtime, remoteWorkspaceRoot, { roots });
 
     expect(runtime.execCallCount).toBeGreaterThan(0);
     expect(skills.find((skill) => skill.name === "docker-like-skill")).toMatchObject({
-      name: "docker-like-skill",
-      description: "from remote runtime",
-      scope: "project",
-    });
-
-    runtime.execCallCount = 0;
-    const diagnostics = await discoverAgentSkillsDiagnostics(runtime, remoteWorkspaceRoot, {
-      roots,
-    });
-
-    expect(runtime.execCallCount).toBeGreaterThan(0);
-    expect(diagnostics.skills.find((skill) => skill.name === "docker-like-skill")).toMatchObject({
       name: "docker-like-skill",
       description: "from remote runtime",
       scope: "project",
@@ -615,7 +604,7 @@ describe("agentSkillsService", () => {
     });
     const containment = { kind: "runtime" as const, root: remoteCheckoutRoot };
 
-    const skills = await discoverAgentSkills(runtime, remoteSubprojectRoot, {
+    const { skills } = await discoverAgentSkills(runtime, remoteSubprojectRoot, {
       roots,
       containment,
     });
@@ -652,7 +641,7 @@ describe("agentSkillsService", () => {
     });
     const roots = getDefaultAgentSkillsRoots(runtime, remoteWorkspaceRoot);
 
-    const skills = await discoverAgentSkills(runtime, remoteWorkspaceRoot, { roots });
+    const { skills } = await discoverAgentSkills(runtime, remoteWorkspaceRoot, { roots });
 
     expect(skills.find((skill) => skill.name === "docker-global-skill")).toMatchObject({
       name: "docker-global-skill",
@@ -691,7 +680,7 @@ describe("agentSkillsService", () => {
     };
     const runtime = new LocalRuntime(project.path);
 
-    const skills = await discoverAgentSkills(runtime, project.path, { roots });
+    const { skills } = await discoverAgentSkills(runtime, project.path, { roots });
 
     const shared = skills.find((s) => s.name === "shared");
     expect(shared).toBeDefined();
@@ -726,7 +715,7 @@ describe("agentSkillsService", () => {
     };
     const runtime = new LocalRuntime(project.path);
 
-    const skills = await discoverAgentSkills(runtime, project.path, { roots });
+    const { skills } = await discoverAgentSkills(runtime, project.path, { roots });
 
     const projectUniversal = skills.find((s) => s.name === "project-universal");
     expect(projectUniversal).toBeDefined();
@@ -752,7 +741,7 @@ describe("agentSkillsService", () => {
     };
     const runtime = new LocalRuntime(project.path);
 
-    const skills = await discoverAgentSkills(runtime, project.path, { roots });
+    const { skills } = await discoverAgentSkills(runtime, project.path, { roots });
 
     const sharedProject = skills.find((s) => s.name === "shared-project");
     expect(sharedProject).toBeDefined();
@@ -795,9 +784,10 @@ describe("agentSkillsService", () => {
       ...getDefaultAgentSkillsRoots(runtime, project.path),
       globalRoot: global.path,
       universalRoot: "",
+      globalPluginRoots: [],
     };
 
-    const skills = await discoverAgentSkills(runtime, project.path, { roots });
+    const { skills } = await discoverAgentSkills(runtime, project.path, { roots });
 
     expect(skills.find((s) => s.name === "claude-only")).toBeUndefined();
     // Sanity: sibling .agents root still discovered, so absence above is claude-specific.
@@ -827,7 +817,7 @@ describe("agentSkillsService", () => {
       globalClaudeRoot: "",
     };
 
-    const skills = await discoverAgentSkills(runtime, project.path, { roots });
+    const { skills } = await discoverAgentSkills(runtime, project.path, { roots });
 
     expect(skills.find((s) => s.name === "claude-only")).toMatchObject({
       scope: "project",
@@ -868,7 +858,7 @@ describe("agentSkillsService", () => {
     };
     const runtime = new LocalRuntime(project.path);
 
-    const skills = await discoverAgentSkills(runtime, project.path, { roots });
+    const { skills } = await discoverAgentSkills(runtime, project.path, { roots });
 
     // Precedence: ~/.agents beats ~/.claude for colliding names.
     expect(skills.find((s) => s.name === "shared-global")).toMatchObject({
@@ -879,31 +869,6 @@ describe("agentSkillsService", () => {
       scope: "global",
       description: "from claude global",
     });
-  });
-
-  test("discoverAgentSkillsDiagnostics includes project .agents/skills", async () => {
-    using project = new DisposableTempDir("agent-skills-project");
-    using global = new DisposableTempDir("agent-skills-global");
-
-    const projectSkillsRoot = path.join(project.path, ".mux", "skills");
-    const projectUniversalSkillsRoot = path.join(project.path, ".agents", "skills");
-    const globalSkillsRoot = global.path;
-
-    await writeSkill(projectUniversalSkillsRoot, "diag-project-universal", "from diagnostics root");
-
-    const roots = {
-      projectRoot: projectSkillsRoot,
-      projectRoots: [projectSkillsRoot, projectUniversalSkillsRoot],
-      globalRoot: globalSkillsRoot,
-    };
-    const runtime = new LocalRuntime(project.path);
-
-    const diagnostics = await discoverAgentSkillsDiagnostics(runtime, project.path, { roots });
-
-    const diagSkill = diagnostics.skills.find((s) => s.name === "diag-project-universal");
-    expect(diagSkill).toBeDefined();
-    expect(diagSkill!.scope).toBe("project");
-    expect(diagSkill!.description).toBe("from diagnostics root");
   });
 
   test("readAgentSkill resolves project before global", async () => {
@@ -957,7 +922,7 @@ describe("agentSkillsService", () => {
     const roots = { projectRoot: projectSkillsRoot, globalRoot: globalSkillsRoot };
     const runtime = new LocalRuntime(project.path);
 
-    const skills = await discoverAgentSkills(runtime, project.path, { roots });
+    const { skills } = await discoverAgentSkills(runtime, project.path, { roots });
     const muxDocs = skills.find((s) => s.name === "xum-docs");
 
     expect(muxDocs).toBeDefined();
@@ -970,7 +935,7 @@ describe("agentSkillsService", () => {
     expect(resolved.package.scope).toBe("project");
   });
 
-  test("discoverAgentSkillsDiagnostics surfaces invalid skills", async () => {
+  test("discoverAgentSkills surfaces invalid skills", async () => {
     using project = new DisposableTempDir("agent-skills-project");
     using global = new DisposableTempDir("agent-skills-global");
 
@@ -1008,7 +973,7 @@ describe("agentSkillsService", () => {
     const roots = { projectRoot: projectSkillsRoot, globalRoot: globalSkillsRoot };
     const runtime = new LocalRuntime(project.path);
 
-    const diagnostics = await discoverAgentSkillsDiagnostics(runtime, project.path, { roots });
+    const diagnostics = await discoverAgentSkills(runtime, project.path, { roots });
 
     expect(diagnostics.skills.map((s) => s.name)).toEqual([
       "background-monitors",
@@ -1068,7 +1033,7 @@ describe("agentSkillsService", () => {
     const roots = { projectRoot: projectSkillsRoot, globalRoot: "/nonexistent" };
     const runtime = new LocalRuntime(project.path);
 
-    const skills = await discoverAgentSkills(runtime, project.path, { roots });
+    const { skills } = await discoverAgentSkills(runtime, project.path, { roots });
     const found = skills.find((s) => s.name === "my-skill");
     expect(found).toBeDefined();
     expect(found!.description).toBe("A symlinked skill");
@@ -1126,7 +1091,7 @@ describe("agentSkillsService", () => {
     const runtime = new LocalRuntime(projectRoot);
 
     // Discovery should find the symlinked skill
-    const skills = await discoverAgentSkills(runtime, projectRoot, { roots });
+    const { skills } = await discoverAgentSkills(runtime, projectRoot, { roots });
     const found = skills.find((s) => s.name === "kalshi-docs");
     expect(found).toBeDefined();
     expect(found!.description).toBe("Kalshi API documentation");
@@ -1173,7 +1138,10 @@ describe("agentSkillsService", () => {
     const runtime = new LocalRuntime(projectRoot);
     const containment = { kind: "local" as const, root: projectRoot };
 
-    const discovered = await discoverAgentSkills(runtime, projectRoot, { roots, containment });
+    const { skills: discovered } = await discoverAgentSkills(runtime, projectRoot, {
+      roots,
+      containment,
+    });
     expect(discovered.find((skill) => skill.name === skillName)).toBeUndefined();
 
     const parsed = SkillNameSchema.parse(skillName);
@@ -1212,17 +1180,13 @@ describe("agentSkillsService", () => {
     const runtime = new LocalRuntime(projectRoot);
     const containment = { kind: "runtime" as const, root: projectRoot };
 
-    const discovered = await discoverAgentSkills(runtime, projectRoot, {
+    const diagnostics = await discoverAgentSkills(runtime, projectRoot, {
       roots,
       containment,
     });
+    const discovered = diagnostics.skills;
     expect(discovered.find((skill) => skill.name === safeSkillName)?.scope).toBe("project");
     expect(discovered.find((skill) => skill.name === escapedSkillName)).toBeUndefined();
-
-    const diagnostics = await discoverAgentSkillsDiagnostics(runtime, projectRoot, {
-      roots,
-      containment,
-    });
     expect(
       diagnostics.invalidSkills.some(
         (issue) =>
@@ -1284,17 +1248,13 @@ describe("agentSkillsService", () => {
     const runtime = new LocalRuntime(projectRoot);
     const containment = { kind: "runtime" as const, root: projectRoot };
 
-    const discovered = await discoverAgentSkills(runtime, projectRoot, {
+    const diagnostics = await discoverAgentSkills(runtime, projectRoot, {
       roots,
       containment,
     });
+    const discovered = diagnostics.skills;
     expect(discovered.find((skill) => skill.name === safeSkillName)?.scope).toBe("project");
     expect(discovered.find((skill) => skill.name === escapedSkillName)).toBeUndefined();
-
-    const diagnostics = await discoverAgentSkillsDiagnostics(runtime, projectRoot, {
-      roots,
-      containment,
-    });
     expect(
       diagnostics.invalidSkills.find((issue) => issue.directoryName === safeSkillName)
     ).toBeUndefined();
@@ -1345,16 +1305,16 @@ describe("agentSkillsService", () => {
     const roots = { projectRoot: projectSkillsRoot, globalRoot: "/nonexistent" };
     const runtime = new LocalRuntime(project.path);
 
-    const skills = await discoverAgentSkills(runtime, project.path, { roots });
+    const { skills } = await discoverAgentSkills(runtime, project.path, { roots });
     const found = skills.find((s) => s.name === "file-linked");
     expect(found).toBeDefined();
     expect(found!.description).toBe("Symlinked SKILL.md");
   });
 });
 
-// Agent Plugins (agent-plugins experiment): plugin skills join discovery at the
-// lowest per-scope precedence. See src/node/services/agentPlugins/ for the
-// container/manifest layer.
+// Agent Plugins: plugin skills join discovery at the lowest per-scope
+// precedence. See src/node/services/agentPlugins/ for the container/manifest
+// layer.
 describe("agentSkillsService agent plugins", () => {
   const PLUGIN_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
 
@@ -1418,15 +1378,10 @@ describe("agentSkillsService agent plugins", () => {
         globalPluginRoots: [],
       };
       const options = { roots };
-      const skills = await discoverAgentSkills(runtime, home.path, options);
+      const { skills } = await discoverAgentSkills(runtime, home.path, options);
       expect(skills.find((skill) => skill.name === "allowed")?.scope).toBe("project");
       expect(skills.some((skill) => skill.name === "blocked")).toBe(false);
       expect(skills.some((skill) => skill.name === "unmanaged")).toBe(true);
-      expect(
-        (await discoverAgentSkillsDiagnostics(runtime, home.path, options)).skills.some(
-          (skill) => skill.name === "blocked"
-        )
-      ).toBe(false);
       await expect(
         readAgentSkill(runtime, home.path, SkillNameSchema.parse("blocked"), options)
       ).rejects.toThrow("not found");
@@ -1435,7 +1390,7 @@ describe("agentSkillsService agent plugins", () => {
           .package.scope
       ).toBe("project");
       await fs.writeFile(registryPath, "{");
-      const corrupted = await discoverAgentSkills(runtime, home.path, options);
+      const { skills: corrupted } = await discoverAgentSkills(runtime, home.path, options);
       expect(corrupted.some((skill) => ["allowed", "blocked"].includes(skill.name))).toBe(false);
       expect(corrupted.some((skill) => skill.name === "unmanaged")).toBe(true);
       await expect(
@@ -1482,14 +1437,14 @@ describe("agentSkillsService agent plugins", () => {
       })()
     );
     try {
-      const raced = await discoverAgentSkills(runtime, tmp.path, options);
+      const { skills: raced } = await discoverAgentSkills(runtime, tmp.path, options);
       expect(intercepted.mock.calls[0][0]).toBe(owner);
       expect(raced.some((skill) => skill.name === "blocked")).toBe(false);
     } finally {
       intercepted.mockRestore();
     }
     expect(
-      (await discoverAgentSkills(runtime, tmp.path, options)).some(
+      (await discoverAgentSkills(runtime, tmp.path, options)).skills.some(
         (skill) => skill.name === "blocked"
       )
     ).toBe(false);
@@ -1526,7 +1481,7 @@ describe("agentSkillsService agent plugins", () => {
       universalRoot: "",
       globalPluginRoots: [container, universal],
     };
-    const skills = await discoverAgentSkills(runtime, tmp.path, { roots });
+    const { skills } = await discoverAgentSkills(runtime, tmp.path, { roots });
     expect(skills.find((s) => s.name === "universal")?.description).toBe("unmanaged");
     expect(
       (await readAgentSkill(runtime, tmp.path, SkillNameSchema.parse("universal"), { roots }))
@@ -1535,9 +1490,6 @@ describe("agentSkillsService agent plugins", () => {
     expect(skills.find((s) => s.name === "allowed")?.description).toBe("selected");
     expect(skills.find((s) => s.name === "blocked")).toBeUndefined();
     expect(skills.find((s) => s.name === "shared")?.description).toBe("fallback");
-    const diagnostics = await discoverAgentSkillsDiagnostics(runtime, tmp.path, { roots });
-    expect(diagnostics.skills.find((s) => s.name === "blocked")).toBeUndefined();
-    expect(diagnostics.skills.find((s) => s.name === "shared")?.description).toBe("fallback");
     await expect(
       readAgentSkill(runtime, tmp.path, SkillNameSchema.parse("blocked"), { roots })
     ).rejects.toThrow("not found");
@@ -1577,7 +1529,9 @@ describe("agentSkillsService agent plugins", () => {
         globalPluginRoots: [container],
       };
       expect(
-        (await discoverAgentSkills(runtime, tmp.path, { roots })).some((s) => s.name === "guarded")
+        (await discoverAgentSkills(runtime, tmp.path, { roots })).skills.some(
+          (s) => s.name === "guarded"
+        )
       ).toBe(false);
       await expect(
         readAgentSkill(runtime, tmp.path, SkillNameSchema.parse("guarded"), { roots })
@@ -1604,7 +1558,9 @@ describe("agentSkillsService agent plugins", () => {
     for (const corrupt of ["{", "{}", '{"plugins":null}', '{"plugins":[null]}']) {
       await fs.writeFile(registryFile, corrupt);
       expect(
-        (await discoverAgentSkills(runtime, tmp.path, { roots })).some((s) => s.name === "guarded")
+        (await discoverAgentSkills(runtime, tmp.path, { roots })).skills.some(
+          (s) => s.name === "guarded"
+        )
       ).toBe(false);
       await expect(
         readAgentSkill(runtime, tmp.path, SkillNameSchema.parse("guarded"), { roots })
@@ -1615,7 +1571,7 @@ describe("agentSkillsService agent plugins", () => {
         projectPluginRoots: [projectContainer],
       };
       expect(
-        (await discoverAgentSkills(runtime, tmp.path, { roots: projectRoots })).some(
+        (await discoverAgentSkills(runtime, tmp.path, { roots: projectRoots })).skills.some(
           (s) => s.name === "guarded"
         )
       ).toBe(true);
@@ -1630,34 +1586,93 @@ describe("agentSkillsService agent plugins", () => {
     }
   });
 
-  test("getDefaultAgentSkillsRoots includes plugin containers only when includeAgentPlugins is set", () => {
+  test("getDefaultAgentSkillsRoots includes plugin containers for local runtimes", () => {
     using project = new DisposableTempDir("agent-skills-plugin-roots");
     const runtime = new LocalRuntime(project.path);
 
-    const defaultRoots = getDefaultAgentSkillsRoots(runtime, project.path);
-    expect(defaultRoots.projectPluginRoots).toBeUndefined();
-    expect(defaultRoots.globalPluginRoots).toBeUndefined();
-
-    const onRoots = getDefaultAgentSkillsRoots(runtime, project.path, {
-      includeAgentPlugins: true,
-    });
-    expect(onRoots.projectPluginRoots).toEqual([
+    const roots = getDefaultAgentSkillsRoots(runtime, project.path);
+    expect(roots.projectPluginRoots).toEqual([
       path.join(project.path, ".xum", "plugins"),
       path.join(project.path, ".mux", "plugins"),
       path.join(project.path, ".agents", "plugins"),
     ]);
-    expect(onRoots.globalPluginRoots).toEqual(["~/.xum/plugins", "~/.agents/plugins"]);
+    expect(roots.globalPluginRoots).toEqual(["~/.xum/plugins", "~/.agents/plugins"]);
   });
 
-  test("getDefaultAgentSkillsRoots never includes plugin containers for remote runtimes", () => {
-    using project = new DisposableTempDir("agent-skills-plugin-remote");
-    const runtime = new RemotePathMappedRuntime(project.path, "/remote/workspace");
+  async function withHostXumHome<T>(xumHome: string, run: () => Promise<T>): Promise<T> {
+    const previousRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = xumHome;
+    try {
+      return await run();
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+    }
+  }
 
-    const onRoots = getDefaultAgentSkillsRoots(runtime, "/remote/workspace", {
-      includeAgentPlugins: true,
+  test("remote runtimes discover global host plugin skills but not project plugins in the checkout", async () => {
+    using hostHome = new DisposableTempDir("agent-skills-remote-plugin-host-home");
+    using checkout = new DisposableTempDir("agent-skills-remote-plugin-checkout");
+    await writePlugin(path.join(hostHome.path, "plugins"), "host-plugin", [
+      { name: "host-plugin-skill", description: "from host plugin" },
+    ]);
+    await writePlugin(path.join(checkout.path, ".xum", "plugins"), "checkout-plugin", [
+      { name: "checkout-plugin-skill", description: "from checkout plugin" },
+    ]);
+    // Identity mapping: the checkout path also exists on the host, so a regression
+    // that scans project plugin containers with the host runtime would find it.
+    const runtime = new RemotePathMappedRuntime(checkout.path, checkout.path);
+
+    await withHostXumHome(hostHome.path, async () => {
+      const { skills } = await discoverAgentSkills(runtime, checkout.path);
+      expect(skills.find((skill) => skill.name === "host-plugin-skill")).toMatchObject({
+        scope: "global",
+        pluginName: "host-plugin",
+        description: "from host plugin",
+      });
+      expect(skills.some((skill) => skill.name === "checkout-plugin-skill")).toBe(false);
+
+      const resolved = await readAgentSkill(
+        runtime,
+        checkout.path,
+        SkillNameSchema.parse("host-plugin-skill")
+      );
+      expect(resolved.package.scope).toBe("global");
+      expect(resolved.package.frontmatter.description).toBe("from host plugin");
+      await expect(
+        readAgentSkill(runtime, checkout.path, SkillNameSchema.parse("checkout-plugin-skill"))
+      ).rejects.toThrow("not found");
     });
-    expect(onRoots.projectPluginRoots).toBeUndefined();
-    expect(onRoots.globalPluginRoots).toBeUndefined();
+  });
+
+  test("remote runtimes with an in-runtime global root honor host plugin import receipts", async () => {
+    using hostHome = new DisposableTempDir("agent-skills-remote-plugin-receipts");
+    using runtimeBase = new DisposableTempDir("agent-skills-remote-plugin-receipts-runtime");
+    await writePlugin(path.join(hostHome.path, "plugins"), "managed", [
+      { name: "imported-skill", description: "imported" },
+      { name: "unimported-skill", description: "not imported" },
+    ]);
+    await fs.writeFile(
+      path.join(hostHome.path, "plugins.json"),
+      JSON.stringify({
+        plugins: [
+          createTestPluginInstallEntry("managed", { skills: ["imported-skill"], mcpServers: [] }),
+        ],
+      })
+    );
+    // Docker-style: the global skill root is a container path (/var/mux/skills),
+    // which must not be used to locate the host plugin registry.
+    const runtime = new RemotePathMappedRuntime(runtimeBase.path, "/var", { xumHome: "/var/mux" });
+    const workspacePath = "/var/workspace";
+
+    await withHostXumHome(hostHome.path, async () => {
+      const { skills } = await discoverAgentSkills(runtime, workspacePath);
+      expect(skills.find((skill) => skill.name === "imported-skill")?.pluginName).toBe("managed");
+      expect(skills.some((skill) => skill.name === "unimported-skill")).toBe(false);
+      await expect(
+        readAgentSkill(runtime, workspacePath, SkillNameSchema.parse("unimported-skill"))
+      ).rejects.toThrow("not found");
+    });
   });
 
   test("default discovery (no containment options) rejects project plugins symlinked outside the checkout", async () => {
@@ -1679,13 +1694,13 @@ describe("agentSkillsService agent plugins", () => {
 
     const runtime = new LocalRuntime(project.path);
     const roots = {
-      ...getDefaultAgentSkillsRoots(runtime, project.path, { includeAgentPlugins: true }),
+      ...getDefaultAgentSkillsRoots(runtime, project.path),
       globalRoot: global.path,
       universalRoot: "",
       globalPluginRoots: [],
     };
 
-    const skills = await discoverAgentSkills(runtime, project.path, { roots });
+    const { skills } = await discoverAgentSkills(runtime, project.path, { roots });
 
     expect(skills.find((s) => s.name === "escaping-skill")).toBeUndefined();
     // Sanity: sibling contained plugin still discovered, so absence is containment-specific.
@@ -1722,13 +1737,13 @@ describe("agentSkillsService agent plugins", () => {
 
     const runtime = new LocalRuntime(project.path);
     const roots = {
-      ...getDefaultAgentSkillsRoots(runtime, project.path, { includeAgentPlugins: true }),
+      ...getDefaultAgentSkillsRoots(runtime, project.path),
       globalRoot: global.path,
       universalRoot: "",
       globalPluginRoots: [],
     };
 
-    const skills = await discoverAgentSkills(runtime, project.path, { roots });
+    const { skills } = await discoverAgentSkills(runtime, project.path, { roots });
     expect(skills.find((s) => s.name === "linked-skill")).toMatchObject({ scope: "project" });
 
     const resolved = await readAgentSkill(
@@ -1740,30 +1755,7 @@ describe("agentSkillsService agent plugins", () => {
     expect(resolved.package.frontmatter.description).toBe("via contained symlink");
   });
 
-  test("experiment off: plugin skills stay invisible with default-shaped roots", async () => {
-    using project = new DisposableTempDir("agent-skills-plugin-off");
-    using global = new DisposableTempDir("agent-skills-plugin-off-global");
-
-    await writePlugin(path.join(project.path, ".mux", "plugins"), "hello-plugin", [
-      { name: "plugin-only", description: "from plugin" },
-    ]);
-    await writeSkill(path.join(project.path, ".agents", "skills"), "agents-only", "from agents");
-
-    const runtime = new LocalRuntime(project.path);
-    const roots = {
-      ...getDefaultAgentSkillsRoots(runtime, project.path),
-      globalRoot: global.path,
-      universalRoot: "",
-    };
-
-    const skills = await discoverAgentSkills(runtime, project.path, { roots });
-
-    expect(skills.find((s) => s.name === "plugin-only")).toBeUndefined();
-    // Sanity: sibling .agents root still discovered, so absence above is plugin-specific.
-    expect(skills.find((s) => s.name === "agents-only")).toMatchObject({ scope: "project" });
-  });
-
-  test("experiment on: discovers plugin skills at lowest per-scope precedence", async () => {
+  test("discovers plugin skills at lowest per-scope precedence", async () => {
     using project = new DisposableTempDir("agent-skills-plugin-on");
     using global = new DisposableTempDir("agent-skills-plugin-on-global");
     using globalPlugins = new DisposableTempDir("agent-skills-plugin-on-global-plugins");
@@ -1787,7 +1779,7 @@ describe("agentSkillsService agent plugins", () => {
       globalPluginRoots: [globalPlugins.path],
     };
 
-    const skills = await discoverAgentSkills(runtime, project.path, { roots });
+    const { skills } = await discoverAgentSkills(runtime, project.path, { roots });
 
     // Project plugin skill loses the name collision to .mux/skills.
     expect(skills.find((s) => s.name === "shared-mux")).toMatchObject({
@@ -1836,7 +1828,7 @@ describe("agentSkillsService agent plugins", () => {
       projectPluginRoots: [container],
     };
 
-    const skills = await discoverAgentSkills(runtime, project.path, { roots });
+    const { skills } = await discoverAgentSkills(runtime, project.path, { roots });
 
     expect(skills.find((s) => s.name === "valid-skill")).toMatchObject({ scope: "project" });
     expect(skills.find((s) => s.name === "broken-skill")).toBeUndefined();
@@ -1865,7 +1857,7 @@ describe("agentSkillsService agent plugins", () => {
       projectPluginRoots: [container],
     };
 
-    const result = await discoverAgentSkillsDiagnostics(runtime, project.path, {
+    const result = await discoverAgentSkills(runtime, project.path, {
       roots,
       projectContainmentRoot: project.path,
     });
@@ -1911,7 +1903,7 @@ describe("agentSkillsService agent plugins", () => {
         projectPluginRoots: [container],
       };
 
-      const skills = await discoverAgentSkills(runtime, project.path, {
+      const { skills } = await discoverAgentSkills(runtime, project.path, {
         roots,
         projectContainmentRoot: project.path,
       });
@@ -1919,4 +1911,106 @@ describe("agentSkillsService agent plugins", () => {
       expect(skills.find((s) => s.name === "linked-skill")).toBeUndefined();
     }
   );
+});
+
+// #4438: on SSH runtimes a transport failure says nothing about a skill. It must
+// never let a lower-scope or built-in skill win, or silently drop the skills index.
+describe("agent skills transport failures", () => {
+  /** A remote runtime with OpenSSH semantics: exit 255 is the transport's own failure. */
+  class SshLikeRuntime extends RemotePathMappedRuntime {
+    constructor(
+      localBase: string,
+      remoteBase: string,
+      private readonly failing: RegExp
+    ) {
+      super(localBase, remoteBase);
+    }
+
+    override isTransportFailureExit(exitCode: number): boolean {
+      return exitCode === 255;
+    }
+
+    failedCommandCount = 0;
+
+    override exec(
+      command: string,
+      options: Parameters<LocalRuntime["exec"]>[1]
+    ): ReturnType<LocalRuntime["exec"]> {
+      if (!this.failing.test(command)) return super.exec(command, options);
+      this.failedCommandCount++;
+      return super.exec(
+        "echo 'ssh: connect to host h port 22: Connection refused' >&2; exit 255",
+        options
+      );
+    }
+
+    override stat(filePath: string, abortSignal?: AbortSignal): ReturnType<LocalRuntime["stat"]> {
+      if (!this.failing.test(filePath)) return super.stat(filePath, abortSignal);
+      return Promise.reject(new RuntimeError(`Failed to stat ${filePath}: refused`, "network"));
+    }
+  }
+
+  async function remoteSkills(base: string, failing: RegExp) {
+    const local = path.join(base, "workspace");
+    await writeSkill(path.join(local, ".mux", "skills"), "shared", "from project");
+    await writeSkill(path.join(local, ".mux", "global-skills"), "shared", "from global");
+    const remote = "/remote/workspace";
+    return {
+      runtime: new SshLikeRuntime(local, remote, failing),
+      remote,
+      roots: {
+        projectRoot: path.posix.join(remote, ".mux", "skills"),
+        // Global skills resolve on the host, not the remote workspace.
+        globalRoot: path.join(local, ".mux", "global-skills"),
+      },
+    };
+  }
+
+  test("a project root that fails in transport is reported; other sources still list", async () => {
+    using base = new DisposableTempDir("agent-skills-transport-listing");
+    const { runtime, remote, roots } = await remoteSkills(base.path, /find -L/);
+    const secondProjectRoot = path.posix.join(remote, ".agents", "skills");
+    const result = await discoverAgentSkills(runtime, remote, {
+      roots: { ...roots, projectRoots: [roots.projectRoot, secondProjectRoot] },
+    });
+
+    expect(result.skills.find((skill) => skill.name === "shared")?.scope).toBe("global");
+    expect(result.skills.some((skill) => skill.scope === "built-in")).toBe(true);
+    expect(
+      result.unavailableSources.map(({ scope, displayPath }) => ({ scope, displayPath }))
+    ).toEqual([
+      { scope: "project", displayPath: roots.projectRoot },
+      { scope: "project", displayPath: secondProjectRoot },
+    ]);
+    // The second root on the same host fails at once instead of waiting out another timeout.
+    expect(runtime.failedCommandCount).toBe(1);
+    // Strict callers (the turn's skill index) still fail rather than act on the partial list.
+    const strictOutcome = (() => {
+      try {
+        return requireReachableSkills(result);
+      } catch (error) {
+        return error;
+      }
+    })();
+    expect(strictOutcome).toMatchObject({ type: "network" });
+  });
+
+  test("a project skill that fails in transport does not fall back to global", async () => {
+    using base = new DisposableTempDir("agent-skills-transport-read");
+    const { runtime, remote, roots } = await remoteSkills(base.path, /^\/remote\/.*skills\/shared/);
+    const outcome = await readAgentSkill(runtime, remote, SkillNameSchema.parse("shared"), {
+      roots,
+    }).catch((error: unknown) => error);
+    expect(outcome).toMatchObject({ type: "network" });
+  });
+
+  test("a missing project skill still falls back to global", async () => {
+    using base = new DisposableTempDir("agent-skills-transport-control");
+    const { runtime, remote, roots } = await remoteSkills(base.path, /^$/);
+    await fs.rm(path.join(base.path, "workspace", ".mux", "skills", "shared"), { recursive: true });
+    const resolved = await readAgentSkill(runtime, remote, SkillNameSchema.parse("shared"), {
+      roots,
+    });
+    expect(resolved.package.frontmatter.description).toBe("from global");
+  });
 });

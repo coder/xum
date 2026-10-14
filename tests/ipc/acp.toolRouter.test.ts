@@ -15,9 +15,9 @@ function createRouter(overrides?: {
   extMethod?: (toolName: string, params: Record<string, unknown>) => Promise<unknown>;
 }): {
   router: ToolRouter;
-  writeCalls: Array<{ sessionId: string; path: string; content: string }>;
+  writeCalls: { sessionId: string; path: string; content: string }[];
 } {
-  const writeCalls: Array<{ sessionId: string; path: string; content: string }> = [];
+  const writeCalls: { sessionId: string; path: string; content: string }[] = [];
 
   const connection = {
     readTextFile:
@@ -102,7 +102,7 @@ describe("ACP ToolRouter", () => {
       exitCode: 0,
     });
     expect(result).toEqual(
-      expect.objectContaining({
+      expect.objectContaining<Record<string, unknown>>({
         wall_duration_ms: expect.any(Number),
       })
     );
@@ -166,7 +166,7 @@ describe("ACP ToolRouter", () => {
       timeout_secs: 0.02,
     });
 
-    expect(result).toMatchObject({
+    expect(result).toMatchObject<Record<string, unknown>>({
       success: false,
       output: "partial\n",
       exitCode: -1,

@@ -31,6 +31,8 @@ interface MessageRendererProps {
   onEditQueuedMessage?: () => void;
   workspaceId?: string;
   isCompacting?: boolean;
+  /** An edit send is unresolved: user messages cannot start another edit. */
+  editSendPending?: boolean;
   /** Handler for adding review notes from inline diffs */
   onReviewNote?: (data: ReviewNoteData) => void;
   /** Whether this message is the latest propose_plan tool call (for external edit detection) */
@@ -41,6 +43,13 @@ interface MessageRendererProps {
   taskReportLinking?: TaskReportLinking;
   /** Navigation info for user messages (backward/forward between user messages) */
   userMessageNavigation?: UserMessageNavigation;
+  /**
+   * Closes an ephemeral row (plan-display). Hosts that keep their own aggregator (the VS Code
+   * webview) pass it because the default path acts on WorkspaceStore's aggregator.
+   */
+  onCloseEphemeral?: (historyId: string) => void;
+  /** "Load all" handler for history-hidden rows; same reason as onCloseEphemeral. */
+  onShowAllHistory?: () => void;
 }
 
 function getMessageHistoryId(message: DisplayedMessage): string | undefined {
@@ -79,18 +88,21 @@ function getTranscriptQuoteText(message: DisplayedMessage): string | null {
 // Memoized to prevent unnecessary re-renders when parent (AIView) updates
 export const MessageRenderer = React.memo<MessageRendererProps>(
   ({
-    message,
+    message: messageProp,
     className,
     onEditUserMessage,
     workspaceId,
     isCompacting,
+    editSendPending,
     onReviewNote,
     isLatestProposePlan,
     bashOutputGroup,
     taskReportLinking,
     userMessageNavigation,
+    onCloseEphemeral,
+    onShowAllHistory,
   }) => {
-    message = useStreamingMessageDelta(workspaceId, message);
+    const message = useStreamingMessageDelta(workspaceId, messageProp);
     let renderedMessage: React.ReactNode;
 
     // Route based on message type
@@ -104,7 +116,7 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
               content={message.content}
               summary={
                 message.contextBudgetWarning.final
-                  ? "Context window ending: notes flush"
+                  ? "Context window ending: final handoff"
                   : message.contextBudgetWarning.handoff
                     ? "Context handoff requested"
                     : "Context budget warning"
@@ -138,6 +150,7 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
               className={className}
               onEdit={onEditUserMessage}
               isCompacting={isCompacting}
+              editSendPending={editSendPending}
               navigation={userMessageNavigation}
             />
           );
@@ -184,7 +197,12 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
         break;
       case "history-hidden":
         renderedMessage = (
-          <HistoryHiddenMessage message={message} className={className} workspaceId={workspaceId} />
+          <HistoryHiddenMessage
+            message={message}
+            className={className}
+            workspaceId={workspaceId}
+            onShowAll={onShowAllHistory}
+          />
         );
         break;
       case "workspace-init":
@@ -199,7 +217,9 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
             path={message.path}
             workspaceId={workspaceId}
             onClose={() => {
-              if (workspaceId) {
+              if (onCloseEphemeral) {
+                onCloseEphemeral(message.historyId);
+              } else if (workspaceId) {
                 removeEphemeralMessage(workspaceId, message.historyId);
               }
             }}

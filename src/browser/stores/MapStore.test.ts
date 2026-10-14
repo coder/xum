@@ -123,6 +123,119 @@ describe("MapStore", () => {
     });
   });
 
+  describe("bounded snapshots", () => {
+    test("keeps snapshot identity until only that key is bumped", () => {
+      const snapshots = new MapStore<string, object>();
+      let computeCount = 0;
+      const compute = () => ({ revision: ++computeCount });
+      const first = snapshots.get("first", compute);
+      const second = snapshots.get("second", compute);
+
+      expect(snapshots.get("first", compute)).toBe(first);
+      snapshots.bump("first");
+      expect(computeCount).toBe(2); // Invalidation stays lazy.
+      expect(snapshots.get("second", compute)).toBe(second);
+      const updated = snapshots.get("first", compute);
+      expect(updated).not.toBe(first);
+      expect(snapshots.get("first", compute)).toBe(updated);
+      expect(computeCount).toBe(3);
+    });
+
+    test("releases old snapshots on bump and bounds retention across many updates", () => {
+      const snapshots = new MapStore<string, object>();
+      const idle = snapshots.get("idle", () => ({}));
+      snapshots.get("streaming", () => ({}));
+
+      // Inspect strong cache references directly: a GC/WeakRef assertion would be nondeterministic.
+      const { cache } = snapshots as unknown as { cache: ReadonlyMap<unknown, unknown> };
+      for (let revision = 0; revision < 1_000; revision++) {
+        snapshots.bump("streaming");
+        expect(cache.size).toBe(1);
+        snapshots.get("streaming", () => ({ revision }));
+        expect(cache.size).toBe(2);
+      }
+      expect(snapshots.get("idle", () => ({}))).toBe(idle);
+      snapshots.delete("streaming");
+      expect(cache.size).toBe(1);
+      snapshots.clear();
+      expect(cache.size).toBe(0);
+    });
+
+    test("invalidates before notifying global and per-key subscribers", () => {
+      let value = 1;
+      store.get("key1", () => value);
+      const observed: number[] = [];
+      store.subscribeAny(() => observed.push(store.get("key1", () => value)));
+      store.subscribeKey("key1", () => observed.push(store.get("key1", () => value)));
+      value = 2;
+      store.bump("key1");
+      expect(observed).toEqual([2, 2]);
+    });
+
+    test("caches undefined values until invalidation", () => {
+      const snapshots = new MapStore<string, number | undefined>();
+      expect(snapshots.get("key", () => undefined)).toBeUndefined();
+      expect(snapshots.get("key", () => 42)).toBeUndefined();
+      snapshots.bump("key");
+      expect(snapshots.get("key", () => 42)).toBe(42);
+    });
+
+    test("delete clears read-only snapshots and notifies once, but missing keys are a no-op", () => {
+      store.get("key1", () => 42);
+      let globalCount = 0;
+      let keyCount = 0;
+      store.subscribeAny(() => globalCount++);
+      store.subscribeKey("key1", () => keyCount++);
+      expect(store.has("key1")).toBe(false);
+
+      store.delete("key1");
+      store.delete("key1");
+      expect(globalCount).toBe(1);
+      expect(keyCount).toBe(1);
+      expect(store.has("key1")).toBe(false);
+      expect(store.get("key1", () => 99)).toBe(99);
+    });
+
+    test("delete leaves keys sharing a string prefix untouched", () => {
+      store.bump("key");
+      store.get("key", () => 1);
+      store.get("key:child", () => 2);
+      store.delete("key");
+      expect(store.get("key:child", () => 3)).toBe(2);
+    });
+
+    test("keys with the same string representation have independent snapshots", () => {
+      const snapshots = new MapStore<object | string | number, object>();
+      const keys = [{}, {}, "1", 1];
+      const values = keys.map((key) => snapshots.get(key, () => ({})));
+      expect(new Set(values).size).toBe(keys.length);
+      snapshots.bump(keys[0]);
+      snapshots.delete(keys[1]);
+      for (const index of [2, 3]) {
+        expect(snapshots.get(keys[index], () => ({}))).toBe(values[index]);
+      }
+    });
+
+    test("clear invalidates bumped and read-only snapshots before notifying", () => {
+      store.bump("bumped");
+      store.get("bumped", () => 1);
+      store.get("read-only", () => 2);
+      const observed: number[] = [];
+      store.subscribeAny(() => {
+        expect(store.has("bumped")).toBe(false);
+        observed.push(
+          store.get("bumped", () => 3),
+          store.get("read-only", () => 4)
+        );
+      });
+      let keyCount = 0;
+      store.subscribeKey("bumped", () => keyCount++);
+      store.clear();
+      expect(observed).toEqual([3, 4]);
+      expect(keyCount).toBe(0); // clear retains its global-only notification contract.
+    });
+  });
+
   describe("subscribeAny", () => {
     test("notifies on bump", () => {
       let count = 0;

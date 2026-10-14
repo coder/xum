@@ -5,11 +5,27 @@
 import { cleanup, fireEvent, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { FrontendWorkspaceMetadata, GitStatus } from "@/common/types/workspace";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { TUTORIAL_STATE_KEY, WORKSPACE_DRAFTS_BY_PROJECT_KEY } from "@/common/constants/storage";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import type { RenderedApp } from "./renderReviewPanel";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { useGitStatusStoreRaw } from "@/browser/stores/GitStatusStore";
+
+/**
+ * Open Settings from the titlebar button and scope queries to the Settings dialog. The page
+ * behind the modal stays mounted, so broader queries can match background content too.
+ */
+export async function openSettingsDialog(container: HTMLElement) {
+  fireEvent.click(await within(container).findByTestId("settings-button"));
+  const body = container.ownerDocument.body;
+  return within(await within(body).findByRole("dialog", { name: "Settings" }, { timeout: 10000 }));
+}
+
+/** Open Analytics from the titlebar button and return its dialog (a modal like Settings). */
+export async function openAnalyticsDialog(container: HTMLElement): Promise<HTMLElement> {
+  fireEvent.click(await within(container).findByTestId("analytics-button"));
+  const body = container.ownerDocument.body;
+  return within(body).findByRole("dialog", { name: "Analytics" }, { timeout: 30000 });
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // REFRESH BUTTON HELPERS
@@ -27,7 +43,7 @@ export function getRefreshIconClass(refreshButton: HTMLElement): string {
  */
 export async function waitForRefreshButtonIdle(
   refreshButton: HTMLElement,
-  timeoutMs: number = 60_000
+  timeoutMs = 60_000
 ): Promise<void> {
   await waitFor(
     () => {
@@ -47,7 +63,7 @@ export async function waitForRefreshButtonIdle(
 export async function assertRefreshButtonHasLastRefreshInfo(
   refreshButton: HTMLElement,
   expectedTrigger: string,
-  timeoutMs: number = 5_000
+  timeoutMs = 5_000
 ): Promise<void> {
   await waitFor(
     () => {
@@ -74,6 +90,26 @@ export function simulateFileModifyingToolEnd(workspaceId: string): void {
 // ═══════════════════════════════════════════════════════════════════════════════
 // WORKSPACE/VIEW SETUP HELPERS
 // ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Wait until a page navigation has settled. Pages are lazy chunks (T3 #5971): while a chunk loads,
+ * React keeps the previous page mounted with `display: none` next to the "Opening page..."
+ * fallback, so a query can match a control (an agent picker, a textarea) on the hidden old page.
+ */
+async function waitForPageSettled(container: HTMLElement): Promise<void> {
+  await waitFor(
+    () => {
+      const mains = [...container.querySelectorAll("main")];
+      if (
+        mains.some((main) => main.closest('[style*="display: none"]')) ||
+        mains.some((main) => main.textContent?.includes("Opening page"))
+      ) {
+        throw new Error("Page chunk still loading");
+      }
+    },
+    { timeout: 10_000 }
+  );
+}
 
 /**
  * Set up the full App UI and navigate to a workspace.
@@ -117,6 +153,7 @@ export async function setupWorkspaceView(
     { timeout: 10_000 }
   );
   fireEvent.click(workspaceElement);
+  await waitForPageSettled(view.container);
 
   // Ensure the workspace is registered and activated in the store so that
   // runOnChatSubscription starts. In the real app, WorkspaceContext handles
@@ -142,7 +179,7 @@ export async function openProjectCreationView(
     () => {
       const el = view.container.querySelector(
         `[data-project-path="${projectPath}"][aria-controls]`
-      ) as HTMLElement | null;
+      );
       if (!el) throw new Error("Project not found in sidebar");
       return el;
     },
@@ -150,6 +187,7 @@ export async function openProjectCreationView(
   );
 
   fireEvent.click(projectRow);
+  await waitForPageSettled(view.container);
 
   await waitFor(
     () => {
@@ -159,6 +197,17 @@ export async function openProjectCreationView(
       }
     },
     { timeout: 10_000 }
+  );
+  // The page renders its composer before the branch list loads, and until then the trunk branch
+  // is empty, so a send that fast is refused for a worktree runtime ("Trunk branch is required").
+  // A slow host reaches that state (#6016): wait for the branch selector, as a user would.
+  await waitFor(
+    () => {
+      if (!view.container.querySelector('[aria-label="Select source branch"]')) {
+        throw new Error("Source branches not loaded");
+      }
+    },
+    { timeout: 30_000 }
   );
 }
 
@@ -245,17 +294,23 @@ export async function addProjectViaUI(view: RenderedApp, projectPath: string): P
 }
 
 export function getWorkspaceDraftIds(projectPath: string): string[] {
-  const parsedDrafts = readPersistedState<Record<string, { draftId: string }[]>>(
-    WORKSPACE_DRAFTS_BY_PROJECT_KEY,
-    {}
-  );
-  const draftsForProject = parsedDrafts[projectPath] ?? [];
+  const draftsForProject = getDraftStore().getCreationDraftsByProject()[projectPath] ?? [];
   return draftsForProject.map((draft) => draft.draftId);
+}
+
+/** Delete every listed creation draft of a project (the list lives on the backend). */
+export async function clearWorkspaceDrafts(projectPath: string): Promise<void> {
+  await getDraftStore().whenReady();
+  await Promise.all(
+    getWorkspaceDraftIds(projectPath).map((draftId) =>
+      getDraftStore().deleteDraft({ kind: "creation", projectPath, draftId })
+    )
+  );
 }
 
 export async function waitForLatestDraftId(
   projectPath: string,
-  timeoutMs: number = 5_000
+  timeoutMs = 5_000
 ): Promise<string> {
   return waitFor(
     () => {
@@ -287,7 +342,8 @@ export async function cleanupView(view: RenderedApp, cleanupDom: () => void): Pr
  * Called automatically by setupTestDom().
  */
 export function disableTutorial(): void {
-  updatePersistedState(TUTORIAL_STATE_KEY, { disabled: true, completed: {} });
+  // Runtime-only, like a sandbox launch: the tutorial preference lives in the backend config.
+  globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__ = false;
 }
 
 /**
@@ -299,7 +355,7 @@ export function disableTutorial(): void {
 export function setupTestDom(options?: { enableTutorial?: boolean }): () => void {
   // Import here to avoid circular dependency issues
   // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { installDom } = require("./dom");
+  const { installDom } = require("./dom") as typeof import("./dom");
   const cleanupDom = installDom();
 
   if (!options?.enableTutorial) {
@@ -342,7 +398,7 @@ export function getGitStatusFromElement(element: HTMLElement): Partial<GitStatus
 export async function waitForGitStatusElement(
   container: HTMLElement,
   workspaceId: string,
-  timeoutMs: number = 30_000
+  timeoutMs = 30_000
 ): Promise<HTMLElement> {
   const store = useGitStatusStoreRaw();
 
@@ -391,7 +447,7 @@ async function waitForGitStatus(
 export function waitForDirtyStatus(
   container: HTMLElement,
   workspaceId: string,
-  timeoutMs: number = 60_000
+  timeoutMs = 60_000
 ): Promise<GitStatus> {
   return waitForGitStatus(container, workspaceId, (s) => !!s.dirty, "dirty status", timeoutMs);
 }
@@ -402,7 +458,7 @@ export function waitForDirtyStatus(
 export function waitForCleanStatus(
   container: HTMLElement,
   workspaceId: string,
-  timeoutMs: number = 60_000
+  timeoutMs = 60_000
 ): Promise<GitStatus> {
   return waitForGitStatus(container, workspaceId, (s) => !s.dirty, "clean status", timeoutMs);
 }
@@ -414,7 +470,7 @@ export function waitForAheadStatus(
   container: HTMLElement,
   workspaceId: string,
   minAhead: number,
-  timeoutMs: number = 60_000
+  timeoutMs = 60_000
 ): Promise<GitStatus> {
   return waitForGitStatus(
     container,
@@ -432,7 +488,7 @@ export function waitForBranchStatus(
   container: HTMLElement,
   workspaceId: string,
   expectedBranch: string,
-  timeoutMs: number = 60_000
+  timeoutMs = 60_000
 ): Promise<GitStatus> {
   return waitForGitStatus(
     container,
@@ -451,7 +507,7 @@ export function waitForIdleGitStatus(
   workspaceId: string,
   predicate: (status: GitStatus) => boolean,
   description: string,
-  timeoutMs: number = 60_000
+  timeoutMs = 60_000
 ): Promise<GitStatus> {
   const store = useGitStatusStoreRaw();
 

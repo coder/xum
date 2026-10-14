@@ -2,12 +2,11 @@ import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import type { ExecResult } from "@/node/utils/runtime/helpers";
 import * as runtimeHelpers from "@/node/utils/runtime/helpers";
 import { createWebFetchTool } from "./web_fetch";
-import type { WebFetchToolArgs, WebFetchToolResult } from "@/common/types/tools";
+import type { WebFetchToolResult } from "@/common/types/tools";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
 import type { ToolExecutionOptions } from "ai";
 import { WEB_FETCH_TIMEOUT_SECS } from "@/common/constants/toolLimits";
 
-const itIntegration = process.env.TEST_INTEGRATION === "1" ? it : it.skip;
 const toolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
   messages: [],
@@ -39,7 +38,32 @@ function createExecResult(overrides: Partial<ExecResult> = {}): ExecResult {
 }
 
 function isCurlCommand(command: string): boolean {
-  return command.startsWith("curl ");
+  return command.startsWith("curl ") && !isCurlVersionProbe(command);
+}
+
+function isCurlVersionProbe(command: string): boolean {
+  return command === "curl -q --version";
+}
+
+type ExecBufferedArgs = Parameters<typeof runtimeHelpers.execBuffered>;
+
+/**
+ * Spy on execBuffered for one test. The once-per-runtime curl version probe is answered
+ * with `probeStdout` (default: curl 8.5, which skips the post-request route check, so
+ * canned curl output needs no route line) and is NOT recorded: the returned mock sees
+ * only resolver and fetch commands.
+ */
+function mockRuntimeExec(
+  handler: (...args: ExecBufferedArgs) => Promise<ExecResult>,
+  probeStdout = "curl 8.5.0 (x86_64-pc-linux-gnu) libcurl/8.5.0\n"
+) {
+  const calls = mock(handler);
+  spyOn(runtimeHelpers, "execBuffered").mockImplementation((...args: ExecBufferedArgs) =>
+    isCurlVersionProbe(args[1])
+      ? Promise.resolve(createExecResult({ stdout: probeStdout }))
+      : calls(...args)
+  );
+  return calls;
 }
 
 function isRuntimeResolveCommand(command: string): boolean {
@@ -66,53 +90,41 @@ afterEach(() => {
 });
 
 describe("web_fetch tool", () => {
-  itIntegration("should fetch and convert a real web page to markdown", async () => {
+  // These cases used to hit live sites behind TEST_INTEGRATION, which nothing in CI sets.
+  // Canned curl output keeps each response-handling branch deterministic; HTML-to-markdown
+  // extraction and resolver failures are covered by the fixture tests below.
+  it("returns plain text responses verbatim without HTML processing", async () => {
     using testEnv = createTestWebFetchTool();
-    const args: WebFetchToolArgs = {
-      url: "https://example.com",
-    };
+    const url = "https://93.184.216.34/cdn-cgi/trace";
+    const body = "fl=123f45\nh=example.com\n<b>not html</b>\n";
+    mockRuntimeExec(() =>
+      Promise.resolve(
+        createExecResult({
+          stdout: "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" + body,
+        })
+      )
+    );
 
-    const result = (await testEnv.tool.execute!(args, toolCallOptions)) as WebFetchToolResult;
+    const result = (await testEnv.tool.execute!({ url }, toolCallOptions)) as WebFetchToolResult;
 
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.title).toContain("Example Domain");
-      expect(result.url).toBe("https://example.com");
-      expect(result.content).toContain("documentation");
-      expect(result.length).toBeGreaterThan(0);
-    }
+    expect(result).toEqual({ success: true, title: url, content: body, url, length: body.length });
   });
 
-  itIntegration("should fetch plain text content without HTML processing", async () => {
+  it.each([
+    { exitCode: 6, error: "Failed to fetch URL: Could not resolve host" },
+    { exitCode: 7, error: "Failed to fetch URL: Failed to connect" },
+  ])("maps curl exit $exitCode to a readable error", async ({ exitCode, error }) => {
     using testEnv = createTestWebFetchTool();
-    const args: WebFetchToolArgs = {
-      url: "https://cloudflare.com/cdn-cgi/trace",
-    };
+    mockRuntimeExec(() =>
+      Promise.resolve(createExecResult({ exitCode, stderr: "curl: transport failure" }))
+    );
 
-    const result = (await testEnv.tool.execute!(args, toolCallOptions)) as WebFetchToolResult;
+    const result = (await testEnv.tool.execute!(
+      { url: "https://93.184.216.34/page" },
+      toolCallOptions
+    )) as WebFetchToolResult;
 
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.content).toContain("fl=");
-      expect(result.content).toContain("h=");
-      expect(result.content).toContain("ip=");
-      expect(result.title).toBe("https://cloudflare.com/cdn-cgi/trace");
-      expect(result.length).toBeGreaterThan(0);
-    }
-  });
-
-  itIntegration("should handle DNS failure gracefully", async () => {
-    using testEnv = createTestWebFetchTool();
-    const args: WebFetchToolArgs = {
-      url: "https://this-domain-does-not-exist.invalid/page",
-    };
-
-    const result = (await testEnv.tool.execute!(args, toolCallOptions)) as WebFetchToolResult;
-
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error).toContain("Failed to fetch URL");
-    }
+    expect(result).toEqual({ success: false, error });
   });
 
   it.each(["file:///tmp/secret.txt", "data:text/plain,hello", "javascript:alert(1)"])(
@@ -165,8 +177,8 @@ describe("web_fetch tool", () => {
   it("rejects hostnames whose fallback runtime resolution returns private addresses", async () => {
     using testEnv = createTestWebFetchTool();
 
-    const execSpy = spyOn(runtimeHelpers, "execBuffered").mockResolvedValue(
-      createExecResult({ stdout: "10.0.0.5\n" })
+    const execSpy = mockRuntimeExec(() =>
+      Promise.resolve(createExecResult({ stdout: "10.0.0.5\n" }))
     );
 
     const result = (await testEnv.tool.execute!(
@@ -202,7 +214,7 @@ describe("web_fetch tool", () => {
   ])("fails closed on $name", async ({ execResult }) => {
     using testEnv = createTestWebFetchTool();
 
-    const execSpy = spyOn(runtimeHelpers, "execBuffered").mockResolvedValue(execResult);
+    const execSpy = mockRuntimeExec(() => Promise.resolve(execResult));
 
     const result = (await testEnv.tool.execute!(
       { url: "https://public.example/article" },
@@ -221,27 +233,25 @@ describe("web_fetch tool", () => {
   it("validates public hostnames through fallback runtime resolvers before fetching", async () => {
     using testEnv = createTestWebFetchTool();
 
-    const execSpy = spyOn(runtimeHelpers, "execBuffered").mockImplementation(
-      (_runtime, command) => {
-        if (isRuntimeResolveCommand(command)) {
-          expect(command).toContain("public.example");
-          expect(command).toContain("command -v getent");
-          expect(command).toContain("command -v nslookup");
-          return Promise.resolve(createExecResult({ stdout: "93.184.216.34\n" }));
-        }
-
-        expect(isCurlCommand(command)).toBe(true);
-        expect(command).toContain("https://public.example/article");
-        return Promise.resolve(
-          createExecResult({
-            stdout:
-              "HTTP/1.1 200 OK\r\n" +
-              "Content-Type: text/html; charset=utf-8\r\n\r\n" +
-              "<!DOCTYPE html><html><head><title>Runtime Resolved</title></head><body><article><h1>Resolved</h1><p>Fetched after runtime validation.</p></article></body></html>",
-          })
-        );
+    const execSpy = mockRuntimeExec((_runtime, command) => {
+      if (isRuntimeResolveCommand(command)) {
+        expect(command).toContain("public.example");
+        expect(command).toContain("command -v getent");
+        expect(command).toContain("command -v nslookup");
+        return Promise.resolve(createExecResult({ stdout: "93.184.216.34\n" }));
       }
-    );
+
+      expect(isCurlCommand(command)).toBe(true);
+      expect(command).toContain("https://public.example/article");
+      return Promise.resolve(
+        createExecResult({
+          stdout:
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: text/html; charset=utf-8\r\n\r\n" +
+            "<!DOCTYPE html><html><head><title>Runtime Resolved</title></head><body><article><h1>Resolved</h1><p>Fetched after runtime validation.</p></article></body></html>",
+        })
+      );
+    });
 
     const result = (await testEnv.tool.execute!(
       { url: "https://public.example/article" },
@@ -261,28 +271,26 @@ describe("web_fetch tool", () => {
   it("revalidates redirect hostnames through the runtime before following them", async () => {
     using testEnv = createTestWebFetchTool();
 
-    const execSpy = spyOn(runtimeHelpers, "execBuffered").mockImplementation(
-      (_runtime, command) => {
-        if (isRuntimeResolveCommand(command) && command.includes("public.example")) {
-          return Promise.resolve(createExecResult({ stdout: '["93.184.216.34"]' }));
-        }
-        if (isCurlCommand(command)) {
-          return Promise.resolve(
-            createExecResult({
-              stdout:
-                "HTTP/1.1 302 Found\r\n" +
-                "Location: https://redirect.example/private\r\n" +
-                "Content-Type: text/plain\r\n\r\n",
-            })
-          );
-        }
-        if (isRuntimeResolveCommand(command) && command.includes("redirect.example")) {
-          return Promise.resolve(createExecResult({ stdout: '["10.0.0.5"]' }));
-        }
-
-        throw new Error(`Unexpected command: ${command}`);
+    const execSpy = mockRuntimeExec((_runtime, command) => {
+      if (isRuntimeResolveCommand(command) && command.includes("public.example")) {
+        return Promise.resolve(createExecResult({ stdout: '["93.184.216.34"]' }));
       }
-    );
+      if (isCurlCommand(command)) {
+        return Promise.resolve(
+          createExecResult({
+            stdout:
+              "HTTP/1.1 302 Found\r\n" +
+              "Location: https://redirect.example/private\r\n" +
+              "Content-Type: text/plain\r\n\r\n",
+          })
+        );
+      }
+      if (isRuntimeResolveCommand(command) && command.includes("redirect.example")) {
+        return Promise.resolve(createExecResult({ stdout: '["10.0.0.5"]' }));
+      }
+
+      throw new Error(`Unexpected command: ${command}`);
+    });
 
     const result = (await testEnv.tool.execute!(
       { url: "https://public.example/start" },
@@ -303,20 +311,18 @@ describe("web_fetch tool", () => {
   it("does not use runtime hostname resolution for public IP literals", async () => {
     using testEnv = createTestWebFetchTool();
 
-    const execSpy = spyOn(runtimeHelpers, "execBuffered").mockImplementation(
-      (_runtime, command) => {
-        expect(isCurlCommand(command)).toBe(true);
-        expect(command).toContain("https://93.184.216.34/article");
-        return Promise.resolve(
-          createExecResult({
-            stdout:
-              "HTTP/1.1 200 OK\r\n" +
-              "Content-Type: text/html; charset=utf-8\r\n\r\n" +
-              "<!DOCTYPE html><html><head><title>IP Literal</title></head><body><article><h1>Literal</h1><p>No runtime DNS lookup.</p></article></body></html>",
-          })
-        );
-      }
-    );
+    const execSpy = mockRuntimeExec((_runtime, command) => {
+      expect(isCurlCommand(command)).toBe(true);
+      expect(command).toContain("https://93.184.216.34/article");
+      return Promise.resolve(
+        createExecResult({
+          stdout:
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: text/html; charset=utf-8\r\n\r\n" +
+            "<!DOCTYPE html><html><head><title>IP Literal</title></head><body><article><h1>Literal</h1><p>No runtime DNS lookup.</p></article></body></html>",
+        })
+      );
+    });
 
     const result = (await testEnv.tool.execute!(
       { url: "https://93.184.216.34/article" },
@@ -353,11 +359,13 @@ describe("web_fetch tool", () => {
           <footer>Footer chrome that should be removed</footer>
         </body>
       </html>`;
-    const execSpy = spyOn(runtimeHelpers, "execBuffered").mockResolvedValue(
-      createExecResult({
-        stdout:
-          "HTTP/1.1 200 OK\r\n" + "Content-Type: text/html; charset=utf-8\r\n\r\n" + articleHtml,
-      })
+    const execSpy = mockRuntimeExec(() =>
+      Promise.resolve(
+        createExecResult({
+          stdout:
+            "HTTP/1.1 200 OK\r\n" + "Content-Type: text/html; charset=utf-8\r\n\r\n" + articleHtml,
+        })
+      )
     );
 
     const result = (await testEnv.tool.execute!(
@@ -382,25 +390,27 @@ describe("web_fetch tool", () => {
   it("follows validated public redirects and returns the final content", async () => {
     using testEnv = createTestWebFetchTool();
 
-    const execSpy = spyOn(runtimeHelpers, "execBuffered")
-      .mockResolvedValueOnce({
-        stdout:
-          "HTTP/1.1 302 Found\r\n" +
-          "Location: https://93.184.216.35/final\r\n" +
-          "Content-Type: text/plain\r\n\r\n",
-        stderr: "",
-        exitCode: 0,
-        duration: 1,
-      })
-      .mockResolvedValueOnce({
-        stdout:
-          "HTTP/1.1 200 OK\r\n" +
-          "Content-Type: text/html; charset=utf-8\r\n\r\n" +
-          "<!DOCTYPE html><html><head><title>Redirected Page</title></head><body><article><h1>Redirected</h1><p>Public content.</p></article></body></html>",
-        stderr: "",
-        exitCode: 0,
-        duration: 1,
-      });
+    const execSpy = mockRuntimeExec(
+      mock<(...args: ExecBufferedArgs) => Promise<ExecResult>>()
+        .mockResolvedValueOnce({
+          stdout:
+            "HTTP/1.1 302 Found\r\n" +
+            "Location: https://93.184.216.35/final\r\n" +
+            "Content-Type: text/plain\r\n\r\n",
+          stderr: "",
+          exitCode: 0,
+          duration: 1,
+        })
+        .mockResolvedValueOnce({
+          stdout:
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: text/html; charset=utf-8\r\n\r\n" +
+            "<!DOCTYPE html><html><head><title>Redirected Page</title></head><body><article><h1>Redirected</h1><p>Public content.</p></article></body></html>",
+          stderr: "",
+          exitCode: 0,
+          duration: 1,
+        })
+    );
 
     const result = (await testEnv.tool.execute!(
       { url: "https://93.184.216.34/start" },
@@ -421,47 +431,45 @@ describe("web_fetch tool", () => {
     let now = 1_000;
     spyOn(Date, "now").mockImplementation(() => now);
 
-    const execSpy = spyOn(runtimeHelpers, "execBuffered").mockImplementation(
-      (_runtime, command, options) => {
-        if (isRuntimeResolveCommand(command) && command.includes("public.example")) {
-          expect(options.timeout).toBeCloseTo(6, 5);
-          now = 3_000;
-          return Promise.resolve(createExecResult({ stdout: '["93.184.216.34"]' }));
-        }
-        if (isCurlCommand(command) && command.includes("https://public.example/start")) {
-          expect(getCurlMaxTime(command)).toBeCloseTo(WEB_FETCH_TIMEOUT_SECS - 2, 5);
-          expect(options.timeout).toBeCloseTo(WEB_FETCH_TIMEOUT_SECS - 1, 5);
-          now = 12_000;
-          return Promise.resolve(
-            createExecResult({
-              stdout:
-                "HTTP/1.1 302 Found\r\n" +
-                "Location: https://redirect.example/final\r\n" +
-                "Content-Type: text/plain\r\n\r\n",
-            })
-          );
-        }
-        if (isRuntimeResolveCommand(command) && command.includes("redirect.example")) {
-          expect(options.timeout).toBeCloseTo(5, 5);
-          now = 13_500;
-          return Promise.resolve(createExecResult({ stdout: '["93.184.216.35"]' }));
-        }
-        if (isCurlCommand(command) && command.includes("https://redirect.example/final")) {
-          expect(getCurlMaxTime(command)).toBeCloseTo(2.5, 5);
-          expect(options.timeout).toBeCloseTo(3.5, 5);
-          return Promise.resolve(
-            createExecResult({
-              stdout:
-                "HTTP/1.1 200 OK\r\n" +
-                "Content-Type: text/html; charset=utf-8\r\n\r\n" +
-                "<!DOCTYPE html><html><head><title>Shared Deadline</title></head><body><article><h1>Done</h1><p>Final content.</p></article></body></html>",
-            })
-          );
-        }
-
-        throw new Error(`Unexpected command: ${command}`);
+    const execSpy = mockRuntimeExec((_runtime, command, options) => {
+      if (isRuntimeResolveCommand(command) && command.includes("public.example")) {
+        expect(options.timeout).toBeCloseTo(6, 5);
+        now = 3_000;
+        return Promise.resolve(createExecResult({ stdout: '["93.184.216.34"]' }));
       }
-    );
+      if (isCurlCommand(command) && command.includes("https://public.example/start")) {
+        expect(getCurlMaxTime(command)).toBeCloseTo(WEB_FETCH_TIMEOUT_SECS - 2, 5);
+        expect(options.timeout).toBeCloseTo(WEB_FETCH_TIMEOUT_SECS - 1, 5);
+        now = 12_000;
+        return Promise.resolve(
+          createExecResult({
+            stdout:
+              "HTTP/1.1 302 Found\r\n" +
+              "Location: https://redirect.example/final\r\n" +
+              "Content-Type: text/plain\r\n\r\n",
+          })
+        );
+      }
+      if (isRuntimeResolveCommand(command) && command.includes("redirect.example")) {
+        expect(options.timeout).toBeCloseTo(5, 5);
+        now = 13_500;
+        return Promise.resolve(createExecResult({ stdout: '["93.184.216.35"]' }));
+      }
+      if (isCurlCommand(command) && command.includes("https://redirect.example/final")) {
+        expect(getCurlMaxTime(command)).toBeCloseTo(2.5, 5);
+        expect(options.timeout).toBeCloseTo(3.5, 5);
+        return Promise.resolve(
+          createExecResult({
+            stdout:
+              "HTTP/1.1 200 OK\r\n" +
+              "Content-Type: text/html; charset=utf-8\r\n\r\n" +
+              "<!DOCTYPE html><html><head><title>Shared Deadline</title></head><body><article><h1>Done</h1><p>Final content.</p></article></body></html>",
+          })
+        );
+      }
+
+      throw new Error(`Unexpected command: ${command}`);
+    });
 
     const result = (await testEnv.tool.execute!(
       { url: "https://public.example/start" },
@@ -476,32 +484,52 @@ describe("web_fetch tool", () => {
     }
   });
 
-  itIntegration("should include HTTP status code in error for non-2xx responses", async () => {
+  it("reports the HTTP status for non-2xx responses", async () => {
     using testEnv = createTestWebFetchTool();
-    const args: WebFetchToolArgs = {
-      url: "https://httpbin.dev/status/404",
-    };
+    // curl --fail-with-body exits 22 on HTTP errors but still prints the response.
+    mockRuntimeExec(() =>
+      Promise.resolve(
+        createExecResult({
+          exitCode: 22,
+          stdout:
+            "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n\r\n<html><body></body></html>",
+        })
+      )
+    );
 
-    const result = (await testEnv.tool.execute!(args, toolCallOptions)) as WebFetchToolResult;
+    const result = (await testEnv.tool.execute!(
+      { url: "https://93.184.216.34/missing" },
+      toolCallOptions
+    )) as WebFetchToolResult;
 
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error).toContain("HTTP 404");
-    }
+    expect(result).toEqual({ success: false, error: "HTTP 404" });
   });
 
-  itIntegration("should detect Cloudflare challenge pages", async () => {
+  it.each([
+    {
+      name: "cf-mitigated header",
+      headers: "HTTP/2 403\r\ncf-mitigated: challenge\r\nContent-Type: text/html\r\n\r\n",
+      body: "<html><body>Blocked</body></html>",
+    },
+    {
+      name: "interstitial body",
+      headers: "HTTP/2 403\r\nContent-Type: text/html\r\n\r\n",
+      body: "<html><title>Just a moment...</title><body>Enable JavaScript and cookies to continue</body></html>",
+    },
+  ])("detects Cloudflare challenge pages from the $name", async ({ headers, body }) => {
     using testEnv = createTestWebFetchTool();
-    const args: WebFetchToolArgs = {
-      url: "https://platform.openai.com",
-    };
+    mockRuntimeExec(() =>
+      Promise.resolve(createExecResult({ exitCode: 22, stdout: headers + body }))
+    );
 
-    const result = (await testEnv.tool.execute!(args, toolCallOptions)) as WebFetchToolResult;
+    const result = (await testEnv.tool.execute!(
+      { url: "https://93.184.216.34/" },
+      toolCallOptions
+    )) as WebFetchToolResult;
 
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error).toContain("Cloudflare");
-      expect(result.error).toContain("JavaScript");
-    }
+    expect(result).toEqual({
+      success: false,
+      error: "HTTP 403: Cloudflare security challenge (page requires JavaScript)",
+    });
   });
 });

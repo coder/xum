@@ -1,4 +1,10 @@
 import * as path from "path";
+import {
+  buildScratchShellPrelude,
+  ensureScratchDirForSpec,
+  resolveScratchDirSpec,
+} from "@/node/runtime/runtimeScratchDir";
+import { isMultiProject } from "@/common/utils/multiProject";
 import { EventEmitter } from "events";
 import * as fs from "fs";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
@@ -24,6 +30,7 @@ import {
 } from "@/node/runtime/runtimeHelpers";
 import { log } from "@/node/services/log";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
+import { workspaceUseLeasesFor, type WorkspaceUseLease } from "@/node/services/workspaceUseLeases";
 import { isCommandAvailable, findAvailableCommand } from "@/node/utils/commandDiscovery";
 import { resolveContainerCli } from "@/node/runtime/containerCli";
 import { sanitizeXumChildEnv } from "@/node/runtime/childProcessEnv";
@@ -53,6 +60,17 @@ type NativeTerminalConfig =
       command?: string;
     };
 
+/**
+ * XUM_DISABLE_TERMINALS=1 refuses every terminal: no PTY or native terminal starts and no input
+ * reaches one. The bug-bash app's real-AI mode (tests/bugbash/startApp.ts) sets it, because an
+ * explorer model that follows injected text from an AI reply could otherwise type host commands.
+ */
+function assertTerminalsEnabled(): void {
+  if (process.env.XUM_DISABLE_TERMINALS === "1") {
+    throw new Error("Terminals are disabled on this server (XUM_DISABLE_TERMINALS=1)");
+  }
+}
+
 export class TerminalService {
   private readonly config: Config;
   private readonly ptyService: PTYService;
@@ -67,15 +85,33 @@ export class TerminalService {
   private readonly headlessTerminals = new Map<string, Terminal>();
   private readonly serializeAddons = new Map<string, SerializeAddon>();
   private readonly headlessOnDataDisposables = new Map<string, { dispose: () => void }>();
+  /**
+   * Each session's workspace use lease (#4476): another backend on the same Xum root must not
+   * rename or remove the checkout while a shell runs in it. Released when the PTY exits (close
+   * paths only signal it), and at once when a create fails before any shell was spawned.
+   */
+  private readonly sessionUseLeases = new Map<string, WorkspaceUseLease>();
   private readonly titleChangeDisposables = new Map<string, { dispose: () => void }>();
 
   private shuttingDown = false;
   // Per-session activity tracking for sidebar indicator.
   // Maps sessionId -> { workspaceId, isRunning (derived from terminal title) }.
   private readonly sessionActivity = new Map<string, { workspaceId: string; isRunning: boolean }>();
+  /**
+   * Live pop-out window attach streams per session (#5673). listSessions skips these sessions so
+   * a main-window reload does not adopt a pop-out's terminal as a right-sidebar tab. In memory
+   * only: each count drops when its attach stream ends (pop-out closed, crashed or reloaded), and
+   * a backend restart starts with none.
+   */
+  private readonly popoutAttachCounts = new Map<string, number>();
   // In-flight create() reservations per workspace (see create): counted before any await so
   // archive admission gates observe startups that have not yet registered a session.
   private readonly pendingSessionCreations = new Map<string, number>();
+  // Bumped by closeWorkspaceSessions while startups are pending (#4760). A startup that sees
+  // a different value than it captured was superseded by an archive/removal close: removal's
+  // guard is cleared once it finishes, so the guard alone misses a startup spanning it.
+  // Entries are dropped when the workspace's last pending startup settles.
+  private readonly startupCloseEpochs = new Map<string, number>();
   // Injected by WorkspaceService: true while an archive admission gate is active for the
   // workspace. Checked synchronously with the startup reservation (see create) so a terminal
   // startup and an archive always observe each other.
@@ -198,7 +234,12 @@ export class TerminalService {
     ptyService: PTYService,
     private readonly secretsStore: Pick<SecretsStore, "getEffectiveSecrets"> = new SecretsStore(
       config.rootDir
-    )
+    ),
+    /**
+     * Remote runtimes get a scratch dir only with the Artifacts experiment (same rule as agent
+     * turns in turnRequestBuilder); local/worktree always get theirs.
+     */
+    private readonly isArtifactsExperimentEnabled: () => boolean = () => false
   ) {
     this.config = config;
     this.ptyService = ptyService;
@@ -206,6 +247,29 @@ export class TerminalService {
 
   setTerminalWindowManager(manager: TerminalWindowManager) {
     this.terminalWindowManager = manager;
+    // A user closing a desktop pop-out window ends its session, like closing a sidebar terminal
+    // tab (which does not ask first either). Its reload and a crash do not close the window.
+    // Windows the app closes (closeWindow, after a pop-out's shell exited, or a close-all from a
+    // caller without a session) keep their sessions, so no running command is killed by them.
+    manager.setSessionWindowClosedHandler((sessionId, closedBy) => {
+      if (closedBy === "user") this.close(sessionId);
+    });
+  }
+
+  /** Mark a session as shown in a pop-out window; call the returned function when it detaches. */
+  markPopoutAttached(sessionId: string): () => void {
+    this.popoutAttachCounts.set(sessionId, (this.popoutAttachCounts.get(sessionId) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const remaining = (this.popoutAttachCounts.get(sessionId) ?? 1) - 1;
+      if (remaining > 0) {
+        this.popoutAttachCounts.set(sessionId, remaining);
+      } else {
+        this.popoutAttachCounts.delete(sessionId);
+      }
+    };
   }
 
   /**
@@ -240,6 +304,7 @@ export class TerminalService {
 
   async create(params: TerminalCreateParams): Promise<TerminalSession> {
     if (this.shuttingDown) throw new Error("Server is shutting down");
+    assertTerminalsEnabled();
     // Reserve the startup synchronously: a creation that has passed its archived check but is
     // still awaiting metadata/secrets/PTY spawn is not yet in sessionActivity, so without this
     // reservation an archive's live-activity gate could pass and the pending creation would
@@ -250,24 +315,41 @@ export class TerminalService {
       params.workspaceId,
       (this.pendingSessionCreations.get(params.workspaceId) ?? 0) + 1
     );
+    const closeEpoch = this.startupCloseEpochs.get(params.workspaceId) ?? 0;
     try {
       if (this.workspaceArchiveGuard?.(params.workspaceId) === true) {
         throw new Error(
           `Workspace is being archived: ${params.workspaceId}. Unarchive it before opening a terminal.`
         );
       }
-      return await this.createUnreserved(params);
+      // Throws while another backend renames or removes the workspace: no shell may start there.
+      const lease = await workspaceUseLeasesFor(this.config).hold(params.workspaceId, "terminal");
+      try {
+        return await this.createUnreserved(params, closeEpoch, lease);
+      } catch (error) {
+        // A spawned PTY's exit releases its lease (the shell may still be running); otherwise no
+        // shell ever started, so release it now.
+        if (![...this.sessionUseLeases.values()].includes(lease)) await lease.release();
+        throw error;
+      }
     } finally {
       const remaining = (this.pendingSessionCreations.get(params.workspaceId) ?? 1) - 1;
       if (remaining <= 0) {
         this.pendingSessionCreations.delete(params.workspaceId);
+        this.startupCloseEpochs.delete(params.workspaceId);
       } else {
         this.pendingSessionCreations.set(params.workspaceId, remaining);
       }
     }
   }
 
-  private async createUnreserved(params: TerminalCreateParams): Promise<TerminalSession> {
+  private async createUnreserved(
+    params: TerminalCreateParams,
+    closeEpoch: number,
+    lease: WorkspaceUseLease
+  ): Promise<TerminalSession> {
+    const closedSinceStart = () =>
+      (this.startupCloseEpochs.get(params.workspaceId) ?? 0) !== closeEpoch;
     try {
       // 1. Resolve workspace
       const allMetadata = await this.config.getAllWorkspaceMetadata();
@@ -312,9 +394,23 @@ export class TerminalService {
       // We intentionally skip dynamic values (like cost/model) because long-lived shells would go stale.
       const runtimeType = getRuntimeType(workspaceMetadata.runtimeConfig);
       const shouldInjectLocalEnv = runtimeType === "local" || runtimeType === "worktree";
+      // Same scratch dir as the agent's bash tool (turnRequestBuilder), on every runtime. Host
+      // dirs travel as process env; remote shells create and export theirs in a shell prelude
+      // (no extra exec before the PTY opens).
+      const scratchSpec = await resolveScratchDirSpec({
+        runtimeConfig: workspaceMetadata.runtimeConfig,
+        workspaceId: workspaceMetadata.id,
+        sessionsDir: this.config.sessionsDir,
+        runtime,
+        multiProject: isMultiProject(workspaceMetadata),
+      });
+      const scratchDir = shouldInjectLocalEnv
+        ? await ensureScratchDirForSpec(runtime, scratchSpec)
+        : undefined;
       const xumEnv = shouldInjectLocalEnv
         ? getXumEnv(workspaceMetadata.projectPath, runtimeType, workspaceMetadata.name, {
             workspaceId: workspaceMetadata.id,
+            scratchDir,
           })
         : undefined;
 
@@ -357,9 +453,15 @@ export class TerminalService {
 
       const onExit = (code: number) => {
         if (tempSessionId) {
-          const emitter = this.exitEmitters.get(tempSessionId);
-          emitter?.emit("exit", code);
-          this.cleanup(tempSessionId);
+          const sessionId = tempSessionId;
+          try {
+            const emitter = this.exitEmitters.get(sessionId);
+            emitter?.emit("exit", code);
+            this.cleanup(sessionId);
+          } finally {
+            // The shell has exited: only now may another backend rename or remove its checkout.
+            this.releaseSessionUseLease(sessionId);
+          }
         }
       };
 
@@ -370,7 +472,8 @@ export class TerminalService {
       // spawned now would run hidden in the archived workspace.
       if (
         this.workspaceArchiveGuard?.(params.workspaceId) === true ||
-        this.isArchivedNow(params.workspaceId)
+        this.isArchivedNow(params.workspaceId) ||
+        closedSinceStart()
       ) {
         throw new Error(
           `Workspace is archived: ${params.workspaceId}. Unarchive it before opening a terminal.`
@@ -383,10 +486,20 @@ export class TerminalService {
         onData,
         onExit,
         workspaceMetadata.runtimeConfig,
-        { env: terminalEnv, defaultShell: projectsConfig.terminalDefaultShell }
+        {
+          env: terminalEnv,
+          defaultShell: projectsConfig.terminalDefaultShell,
+          remoteShellPrelude:
+            shouldInjectLocalEnv || !this.isArtifactsExperimentEnabled()
+              ? undefined
+              : buildScratchShellPrelude(scratchSpec),
+        }
       );
 
       tempSessionId = session.sessionId;
+      // From here the PTY's exit owns the lease: close paths only signal the shell, which can
+      // keep using the checkout until it actually exits.
+      this.sessionUseLeases.set(session.sessionId, lease);
 
       // Post-spawn recheck: a user-driven archive (which force-closes rather than refuses) may
       // have run closeWorkspaceSessions while createSession was awaiting — that close only
@@ -394,7 +507,8 @@ export class TerminalService {
       // the archived workspace. Kill the just-spawned PTY instead of registering it.
       if (
         this.workspaceArchiveGuard?.(params.workspaceId) === true ||
-        this.isArchivedNow(params.workspaceId)
+        this.isArchivedNow(params.workspaceId) ||
+        closedSinceStart()
       ) {
         try {
           this.ptyService.closeSession(session.sessionId);
@@ -523,6 +637,7 @@ export class TerminalService {
   }
 
   sendInput(sessionId: string, data: string): void {
+    assertTerminalsEnabled();
     try {
       this.ptyService.sendInput(sessionId, data);
 
@@ -561,6 +676,7 @@ export class TerminalService {
         log.info(
           `Opening terminal window for workspace: ${workspaceId}${sessionId ? ` (session: ${sessionId})` : ""}`
         );
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         await this.terminalWindowManager!.openTerminalWindow(workspaceId, sessionId, initialTitle);
       } else {
         log.info(
@@ -573,13 +689,13 @@ export class TerminalService {
     }
   }
 
-  closeWindow(workspaceId: string): void {
+  closeWindow(workspaceId: string, sessionId?: string): void {
     try {
       if (!this.terminalWindowManager) {
         // Not an error in server mode, just no-op
         return;
       }
-      this.terminalWindowManager.closeTerminalWindow(workspaceId);
+      this.terminalWindowManager.closeTerminalWindow(workspaceId, sessionId);
     } catch (err) {
       log.error("Error closing terminal window:", err);
       throw err;
@@ -594,6 +710,7 @@ export class TerminalService {
    * For SSH workspaces, opens a terminal that SSHs into the remote host.
    */
   async openNative(workspaceId: string): Promise<void> {
+    assertTerminalsEnabled();
     // Pending-open admission pairing (same synchronous block as the archive guard check
     // below, mirroring create()): the count is registered before any await so archive gates
     // observe the intent immediately, and it keeps hasOpenedNativeTerminal true for the
@@ -626,16 +743,49 @@ export class TerminalService {
     }
   }
 
+  /**
+   * #4883: this backend's use lease for the native terminals it opened, per workspace. A native
+   * terminal is detached and daemonizes, so its lifetime cannot be tracked; the conservative
+   * lifetime is from the first open until this backend archives or removes the workspace (see
+   * releaseNativeTerminalUseLease) or exits. Another backend's rename or removal refuses
+   * meanwhile; this backend's own mutators treat it like its other terminals.
+   */
+  private readonly nativeTerminalUseLeases = new Map<string, WorkspaceUseLease>();
+
+  /** Ends the native-terminal use lease of a workspace this backend archives or removes. */
+  async releaseNativeTerminalUseLease(workspaceId: string): Promise<void> {
+    const lease = this.nativeTerminalUseLeases.get(workspaceId);
+    if (lease == null) return;
+    this.nativeTerminalUseLeases.delete(workspaceId);
+    await lease.release();
+  }
+
   /** Body of openNative after pending-open admission; see openNative. */
   private async openNativeAdmitted(workspaceId: string): Promise<void> {
     let admissionToken: symbol | null = null;
+    // This open's share of the lease until it is kept or released below.
+    let openLease: WorkspaceUseLease | undefined;
     try {
+      // #4913: an unknown ID must not publish a lease directory (they are never pruned). This
+      // synchronous registry lookup (which also resolves id-less legacy rows) only decides
+      // whether to take the lease; the metadata read under the lease below stays authoritative.
+      if (this.config.findWorkspace(workspaceId) == null) {
+        throw new Error(`Workspace not found: ${workspaceId}`);
+      }
+      // #4902: held before the path is read, and on every open (it probes the gate), so another
+      // backend's rename, removal or archive can neither slip in between nor run meanwhile.
+      // Throws while one runs: no terminal may open there.
+      const leases = workspaceUseLeasesFor(this.config);
+      openLease = await leases.hold(workspaceId, "terminal");
       const allMetadata = await this.config.getAllWorkspaceMetadata();
       const workspace = allMetadata.find((w) => w.id === workspaceId);
 
       if (!workspace) {
         throw new Error(`Workspace not found: ${workspaceId}`);
       }
+      // This backend's own rename or removal ignores its terminal leases, so it may have taken
+      // the gate during the read: probe again (a nested hold) now that the path is known.
+      await (await leases.hold(workspaceId, "terminal")).release();
 
       // Persisted archived state (not just an in-progress archive): a stale renderer can
       // request a terminal for an already-archived workspace whose checkout may already be
@@ -647,6 +797,15 @@ export class TerminalService {
           `Workspace is archived: ${workspaceId}. Unarchive it before opening a terminal.`
         );
       }
+
+      // Before any durable effect: one share per workspace is kept, after a failed launch too
+      // (fail closed; see nativeTerminalUseLeases), and a refusal above releases this open's.
+      if (this.nativeTerminalUseLeases.has(workspaceId)) {
+        await openLease.release();
+      } else {
+        this.nativeTerminalUseLeases.set(workspaceId, openLease);
+      }
+      openLease = undefined;
 
       // Durable marker: the detached emulator can outlive Xum, so a restart must not forget
       // the open (the in-memory Set resets, and both archive checks would otherwise let a
@@ -753,6 +912,7 @@ export class TerminalService {
         });
       }
     } catch (err) {
+      await openLease?.release();
       // No failure path in openNative launches a shell: pre-marker failures (unknown/archived
       // workspace, marker persistence) never reach a launcher and recorded nothing durable
       // (the pending-open count covers that window and releases in openNative's finally). A
@@ -1082,10 +1242,16 @@ export class TerminalService {
 
   onExit(sessionId: string, callback: (code: number) => void): () => void {
     const emitter = this.exitEmitters.get(sessionId);
-    if (!emitter)
+    if (!emitter) {
+      // #6029: the emitter exists from before create() returns the ID until the PTY exits,
+      // so a missing one means the session already ended (or never existed). Report it now,
+      // or a late subscriber (the renderer subscribes from a mount effect) waits forever.
+      // 0 matches the renderer's "ended before the listener attached" fallback.
+      callback(0);
       return () => {
         /* no-op */
       };
+    }
 
     const handler = (code: number) => callback(code);
     emitter.on("exit", handler);
@@ -1250,11 +1416,13 @@ export class TerminalService {
   }
 
   /**
-   * Get all session IDs for a workspace.
-   * Used by frontend to discover existing sessions to reattach to after reload.
+   * Session IDs the main window may reattach to as sidebar tabs after a reload: those without a
+   * live pop-out window.
    */
   getWorkspaceSessionIds(workspaceId: string): string[] {
-    return this.ptyService.getWorkspaceSessionIds(workspaceId);
+    return this.ptyService
+      .getWorkspaceSessionIds(workspaceId)
+      .filter((sessionId) => !this.popoutAttachCounts.has(sessionId));
   }
 
   private getTrackedSessionIdsForWorkspace(workspaceId: string): string[] {
@@ -1298,6 +1466,9 @@ export class TerminalService {
    * Called when a workspace is archived or removed to prevent resource leaks.
    */
   closeWorkspaceSessions(workspaceId: string): void {
+    if ((this.pendingSessionCreations.get(workspaceId) ?? 0) > 0) {
+      this.startupCloseEpochs.set(workspaceId, (this.startupCloseEpochs.get(workspaceId) ?? 0) + 1);
+    }
     const sessionIds = this.getTrackedSessionIdsForWorkspace(workspaceId);
     this.terminateTrackedSessions(sessionIds);
   }
@@ -1336,5 +1507,19 @@ export class TerminalService {
     headless?.dispose();
     this.headlessTerminals.delete(sessionId);
     this.serializeAddons.delete(sessionId);
+  }
+
+  private releaseSessionUseLease(sessionId: string): void {
+    const lease = this.sessionUseLeases.get(sessionId);
+    if (lease == null) return;
+    this.sessionUseLeases.delete(sessionId);
+    // Called from the synchronous PTY exit callback. The release enters the lease's FIFO
+    // transition lock synchronously, so a later hold or mutation check always observes it.
+    lease.release().catch((error: unknown) => {
+      log.warn("Failed to release a terminal's workspace use lease", {
+        sessionId,
+        error: getErrorMessage(error),
+      });
+    });
   }
 }

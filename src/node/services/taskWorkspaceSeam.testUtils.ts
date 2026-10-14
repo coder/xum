@@ -7,18 +7,29 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
       run().catch(() => undefined);
     },
     sendMessage: () => Promise.resolve(Ok(undefined)),
+    grantPendingDefaultUnrelatedWorkspaceConsent: () => Promise.resolve(),
+    clearPendingDefaultUnrelatedConsent: () => Promise.resolve(),
+    clearDelegatedCreationMark: () => Promise.resolve(),
+    markDelegatedCreationInterrupted: () => Promise.resolve(false),
     resumeStream: () => Promise.resolve(Ok({ started: true })),
     clearQueue: () => Ok(undefined),
     replaceHistory: () => Promise.resolve(Ok(undefined)),
     waitForIdleAndNoQueuedMessages: () => Promise.resolve(),
-    waitForPendingCompactionCompletionDecision: () => Promise.resolve(true),
+    refuseUnavailableGoalTurnAgent: () => Promise.resolve(null),
+    // No session behind the fake, so no compaction decision (WorkspaceService without a session).
+    // Tests that model a compaction handing completion to its durable follow-up override this.
+    waitForPendingCompactionCompletionDecision: () => Promise.resolve(undefined),
     waitForPendingStreamErrorRecoveryDecision: () => Promise.resolve(undefined),
     getStartupRecoveryState: () => Promise.resolve("interrupted"),
     dispatchPendingCompactionFollowUp: () => Promise.resolve(Ok(false)),
     acquireIdleTurnExclusion: () => Ok({ [Symbol.dispose]: () => undefined }),
+    isShuttingDown: () => false,
     isBusyForMessage: () => false,
     hasQueuedMessages: () => false,
+    hasPendingUserInput: () => false,
+    promotedToolEndWouldLeadQueue: () => true,
     hasPendingQueuedOrPreparingTurn: () => false,
+    drainQueuedMessagesIfIdle: () => undefined,
     hasPendingAutoRetry: () => false,
     hasPendingBashMonitorWakeContinuation: () => false,
     hasPendingWorkspaceTurnContinuation: () => false,
@@ -35,10 +46,12 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     onQueuedMessageChanged: () => () => undefined,
     getActiveTurnGeneration: () => undefined,
     onWorkspaceTurnSettled: () => () => undefined,
+    onWorkspaceTurnSuperseded: () => () => undefined,
     archive: () => Promise.resolve(Ok({ kind: "archived" })),
     archiveWhileTaskTreeLocked: () => Promise.resolve(Ok({ kind: "archived" })),
     unarchiveWhileTaskTreeLocked: () => Promise.resolve(Ok(undefined)),
     preflightArchive: () => Promise.resolve(Ok({ kind: "ready" })),
+    preflightArchiveCascade: () => Promise.resolve(Ok({ targetPaths: [], subagents: [] })),
     // No live activity grants the hold so task tests reach interruption behavior.
     acquirePreInterruptionArchiveHold: () => Ok({ [Symbol.dispose]: () => undefined }),
     listLiveWorkspaceActivity: () => ({
@@ -57,6 +70,7 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     remove: () => Promise.resolve(Ok(undefined)),
     removeWhileTaskTreeLocked: () => Promise.resolve(Ok(undefined)),
     create: () => Promise.resolve(Err("workspaceHost.create not mocked")),
+    createScratch: () => Promise.resolve(Err("workspaceHost.createScratch not mocked")),
     // Task-create tests exercise launch flow, not plugin-override sanitization.
     sanitizeMaterializedTaskWorkspace: () => Promise.resolve(undefined),
     discardExtensionMetadataEntry: () => Promise.resolve(),
@@ -73,10 +87,13 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
   };
 }
 
+/** Attempt id the fake's derived reawakenInterruptedTask reports for a successful rescue. */
+export const FAKE_REAWAKENED_ATTEMPT_ID = "att_00000000000000fa";
+
 export function makeAgentTaskIntegrationFake(
   overrides: Partial<AgentTaskIntegration> = {}
 ): AgentTaskIntegration {
-  return {
+  const fake: AgentTaskIntegration = {
     withTaskTreeLifecycleLock: <T>(_workspaceId: string, operation: () => Promise<T>): Promise<T> =>
       operation(),
     hasDescendantAgentTasks: () => false,
@@ -84,19 +101,30 @@ export function makeAgentTaskIntegrationFake(
     removeAcknowledgedDescendantsWhileTaskTreeLocked: () => Promise.resolve(Ok(undefined)),
     hasActiveDescendantAgentTasksForWorkspace: () => false,
     hasActiveTopLevelWorkflowRunsForWorkspace: () => Promise.resolve(false),
+    hasLiveAgentTaskContinuation: () => false,
     getAgentTaskStatus: () => undefined,
     resetAutoResumeCount: () => undefined,
+    noteWorkspaceRemoved: () => undefined,
     acknowledgeAgentReports: () => Promise.resolve(new Set<string>()),
     backgroundForegroundWaitsForWorkspace: () => 0,
     markInterruptedTaskRunning: () => Promise.resolve(false),
+    admitTaskWorkspaceTurn: () => ({ kind: "not-a-task" as const }),
     restoreInterruptedTaskAfterResumeFailure: () => Promise.resolve(),
     markParentWorkspaceInterrupted: () => undefined,
     latchHardInterruptCascade: () => undefined,
     terminateAllDescendantAgentTasks: () => Promise.resolve([]),
     noteWorkspaceUnarchived: () => Promise.resolve(),
+    settleOwedChildGoalPause: () => Promise.resolve(),
     isWorkspaceStopInProgress: () => false,
     getWorkspaceStopEpoch: () => 0,
     reactivateInactiveAgentTaskFromBashMonitorWake: () => Promise.resolve(null),
+    // Derived from the (possibly overridden) boolean rescue, so suites that script only
+    // markInterruptedTaskRunning keep driving the outcome WorkspaceService consumes.
+    reawakenInterruptedTask: async (workspaceId) =>
+      (await fake.markInterruptedTaskRunning(workspaceId))
+        ? { kind: "reawakened", attemptId: FAKE_REAWAKENED_ATTEMPT_ID, statusChanged: true }
+        : { kind: "not-applicable" },
     ...overrides,
   };
+  return fake;
 }

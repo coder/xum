@@ -1,5 +1,7 @@
 import { describe, test, expect } from "bun:test";
 import { createDisplayUsage, recomputeUsageCosts } from "./displayUsage";
+import { getTotalCost, sumUsageHistory } from "./usageAggregator";
+import { ChatUsageDisplaySchema } from "@/common/orpc/schemas/chatStats";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 
 describe("createDisplayUsage", () => {
@@ -276,13 +278,15 @@ describe("createDisplayUsage", () => {
 
   describe("tiered long-context pricing", () => {
     test.each([
-      ["openai:gpt-6-sol", 2, 0.2, 10],
+      ["openai:gpt-6.1-sol", 2, 0.1, 10],
       ["openai:gpt-6-luna", 0.1, 0.01, 0.5],
     ] as const)(
       "applies %s pricing only above the 272K boundary",
       (model, input, cached, output) => {
         for (const tokens of [272000, 272001]) {
           const longContext = tokens > 272000;
+          // inputTokens is inclusive of cache reads and writes; the tier is chosen from
+          // the whole prompt, so the boundary also moves cache-read and cache-write rates.
           const result = createDisplayUsage(
             {
               inputTokens: tokens,
@@ -290,17 +294,35 @@ describe("createDisplayUsage", () => {
               outputTokens: 1000,
               totalTokens: tokens + 1000,
             },
-            model
+            model,
+            { anthropic: { cacheCreationInputTokens: 5000 } }
           );
           expect(result?.input.cost_usd).toBeCloseTo(
-            (((tokens - 100000) * input) / 1e6) * (longContext ? 2 : 1),
+            (((tokens - 105000) * input) / 1e6) * (longContext ? 2 : 1),
             12
           );
           expect(result?.cached.cost_usd).toBeCloseTo(0.1 * cached * (longContext ? 2 : 1), 12);
+          // Cache writes bill at 1.25x the active input rate.
+          expect(result?.cacheCreate.cost_usd).toBeCloseTo(
+            0.005 * input * 1.25 * (longContext ? 2 : 1),
+            12
+          );
           expect(result?.output.cost_usd).toBeCloseTo(0.001 * output * (longContext ? 1.5 : 1), 12);
         }
       }
     );
+
+    test("applies Haiku 5.5's 5x tier only above its published 100K boundary", () => {
+      for (const tokens of [100000, 100001]) {
+        const multiplier = tokens > 100000 ? 5 : 1;
+        const result = createDisplayUsage(
+          { inputTokens: tokens, outputTokens: 1000, totalTokens: tokens + 1000 },
+          "anthropic:claude-haiku-5-5"
+        );
+        expect(result?.input.cost_usd).toBeCloseTo(((tokens * 0.1) / 1e6) * multiplier, 12);
+        expect(result?.output.cost_usd).toBeCloseTo(0.001 * 0.5 * multiplier, 12);
+      }
+    });
 
     test("keeps GPT-5.5 on base rates at the published 272K boundary", () => {
       const usage: LanguageModelV2Usage = {
@@ -314,24 +336,6 @@ describe("createDisplayUsage", () => {
       expect(result).toBeDefined();
       expect(result!.input.cost_usd).toBeCloseTo(1.36);
       expect(result!.output.cost_usd).toBeCloseTo(0.03);
-    });
-
-    test("switches GPT-5.5 to long-context rates above 272K including cache reads", () => {
-      const usage: LanguageModelV2Usage = {
-        inputTokens: 300000,
-        outputTokens: 1000,
-        totalTokens: 301000,
-        cachedInputTokens: 100000,
-      };
-
-      const result = createDisplayUsage(usage, "openai:gpt-5.5");
-
-      expect(result).toBeDefined();
-      expect(result!.input.tokens).toBe(200000);
-      expect(result!.cached.tokens).toBe(100000);
-      expect(result!.input.cost_usd).toBeCloseTo(2);
-      expect(result!.cached.cost_usd).toBeCloseTo(0.1);
-      expect(result!.output.cost_usd).toBeCloseTo(0.045);
     });
 
     test("falls back to LiteLLM's default 200K threshold for existing tiered models", () => {
@@ -376,27 +380,20 @@ describe("createDisplayUsage", () => {
       expect(result!.output.cost_usd).toBeCloseTo(0.0225);
     });
 
-    test("preserves aggregate GPT-5.5 totals during repricing and flags them as approximate", () => {
-      const aggregate = {
-        input: { tokens: 200000, cost_usd: 1 },
-        cached: { tokens: 100000, cost_usd: 0.05 },
-        cacheCreate: { tokens: 0, cost_usd: 0 },
-        output: { tokens: 1000, cost_usd: 0.03 },
-        reasoning: { tokens: 0, cost_usd: 0 },
-        model: "openai:gpt-5.5",
-      };
+    test("keeps the recorded costs of a tiered aggregate without an unknown-pricing flag", () => {
+      const model = "anthropic:claude-haiku-5-5";
+      // Each request is under Haiku 5.5's 100K threshold; their sum is not.
+      const request = () =>
+        createDisplayUsage({ inputTokens: 80000, outputTokens: 500, totalTokens: 80500 }, model)!;
+      const aggregate = sumUsageHistory([request(), request()])!;
 
-      const result = recomputeUsageCosts(aggregate, "openai:gpt-5.5", {
-        aggregatedUsage: true,
-      });
+      const result = recomputeUsageCosts(aggregate, model, { aggregatedUsage: true });
 
-      expect(result).toEqual({
-        ...aggregate,
-        hasUnknownCosts: true,
-      });
+      expect(result).toEqual(aggregate);
+      expect(result.hasUnknownCosts).toBeUndefined();
     });
 
-    test("recomputes persisted GPT-5.5 Pro usage with the higher long-context tier", () => {
+    test("recomputes persisted GPT-6 Astra usage with the higher long-context tier", () => {
       const result = recomputeUsageCosts(
         {
           input: { tokens: 280000 },
@@ -404,14 +401,14 @@ describe("createDisplayUsage", () => {
           cacheCreate: { tokens: 0 },
           output: { tokens: 1000 },
           reasoning: { tokens: 500 },
-          model: "openai:gpt-5.5-pro",
+          model: "openai:gpt-6-astra",
         },
-        "openai:gpt-5.5-pro"
+        "openai:gpt-6-astra"
       );
 
-      expect(result.input.cost_usd).toBeCloseTo(16.8);
-      expect(result.output.cost_usd).toBeCloseTo(0.27);
-      expect(result.reasoning.cost_usd).toBeCloseTo(0.135);
+      expect(result.input.cost_usd).toBeCloseTo(5.6);
+      expect(result.output.cost_usd).toBeCloseTo(0.075);
+      expect(result.reasoning.cost_usd).toBeCloseTo(0.0375);
     });
   });
 
@@ -570,5 +567,329 @@ describe("createDisplayUsage", () => {
       expect(result).toBeDefined();
       expect(result!.cacheCreate.tokens).toBe(1500);
     });
+  });
+});
+
+describe("Anthropic 1h-TTL cache-write pricing", () => {
+  const CACHE_WRITE = 40_000;
+  // Raw Anthropic usage as the SDK surfaces it on providerMetadata.anthropic.usage.
+  const metadata = (split?: { fiveMinute: number; oneHour: number }) => ({
+    anthropic: {
+      cacheCreationInputTokens: CACHE_WRITE,
+      ...(split && {
+        usage: {
+          cache_creation: {
+            ephemeral_5m_input_tokens: split.fiveMinute,
+            ephemeral_1h_input_tokens: split.oneHour,
+          },
+        },
+      }),
+    },
+  });
+  const display = (
+    model: string,
+    meta: Record<string, unknown> | undefined,
+    inputTokens = CACHE_WRITE + 10_000
+  ) => {
+    const usage = createDisplayUsage({ inputTokens, outputTokens: 500 }, model, meta);
+    if (usage === undefined) throw new Error("expected display usage");
+    return usage;
+  };
+  const cacheWriteCost = (usage: ReturnType<typeof display>) => {
+    const cost = usage.cacheCreate.cost_usd;
+    if (cost === undefined) throw new Error("expected a priced cache write");
+    return cost;
+  };
+
+  test("prices a 1h write at 2x the response's own input rate, above the 5m rate", () => {
+    // Haiku 5.5 crosses its 100K tier, so the 1h rate must follow the tier's input rate.
+    for (const [model, inputTokens] of [
+      ["anthropic:claude-sonnet-5-5", undefined],
+      ["anthropic:claude-opus-4-8", undefined],
+      ["anthropic:claude-haiku-5-5", 150_000],
+    ] as const) {
+      const fiveMinute = display(model, metadata(), inputTokens);
+      const oneHour = display(
+        model,
+        metadata({ fiveMinute: 0, oneHour: CACHE_WRITE }),
+        inputTokens
+      );
+      const inputRate = (oneHour.input.cost_usd ?? NaN) / oneHour.input.tokens;
+      expect(oneHour.cacheCreate1hTokens).toBe(CACHE_WRITE);
+      expect(cacheWriteCost(oneHour) / CACHE_WRITE).toBeCloseTo(2 * inputRate, 15);
+      expect(cacheWriteCost(oneHour)).toBeGreaterThan(cacheWriteCost(fiveMinute));
+      expect(getTotalCost(oneHour)).toBeGreaterThan(getTotalCost(fiveMinute) ?? Infinity);
+    }
+  });
+
+  test("keeps the 5m price when no 1h split is reported", () => {
+    const model = "anthropic:claude-sonnet-5-5";
+    const noSplit = display(model, metadata());
+    const allFiveMinute = display(model, metadata({ fiveMinute: CACHE_WRITE, oneHour: 0 }));
+    expect(noSplit.cacheCreate1hTokens).toBeUndefined();
+    expect(allFiveMinute.cacheCreate1hTokens).toBeUndefined();
+    expect(cacheWriteCost(allFiveMinute)).toBe(cacheWriteCost(noSplit));
+    // A malformed persisted split self-heals to the 5m price instead of a negative count.
+    const malformed = display(model, {
+      anthropic: {
+        cacheCreationInputTokens: CACHE_WRITE,
+        usage: { cache_creation: { ephemeral_1h_input_tokens: -5 } },
+      },
+    });
+    expect(cacheWriteCost(malformed)).toBe(cacheWriteCost(noSplit));
+  });
+
+  test("prices each part of a mixed 5m/1h split at its own rate", () => {
+    const model = "anthropic:claude-sonnet-5-5";
+    const fiveMinuteRate = cacheWriteCost(display(model, metadata())) / CACHE_WRITE;
+    const oneHourRate =
+      cacheWriteCost(display(model, metadata({ fiveMinute: 0, oneHour: CACHE_WRITE }))) /
+      CACHE_WRITE;
+    const mixed = display(model, metadata({ fiveMinute: 30_000, oneHour: 10_000 }));
+    expect(mixed.cacheCreate1hTokens).toBe(10_000);
+    expect(cacheWriteCost(mixed)).toBeCloseTo(30_000 * fiveMinuteRate + 10_000 * oneHourRate, 12);
+  });
+
+  test("repricing and session aggregates keep the 1h premium", () => {
+    const model = "anthropic:claude-sonnet-5-5";
+    const mixed = display(model, metadata({ fiveMinute: 30_000, oneHour: 10_000 }));
+    const parsed = ChatUsageDisplaySchema.parse(mixed);
+    expect(getTotalCost(recomputeUsageCosts(parsed, model))).toBeCloseTo(
+      getTotalCost(mixed) ?? NaN,
+      12
+    );
+
+    const aggregate = sumUsageHistory([mixed, display(model, metadata())]);
+    if (aggregate === undefined) throw new Error("expected an aggregate");
+    expect(aggregate.cacheCreate1hTokens).toBe(10_000);
+    const repriced = recomputeUsageCosts(aggregate, model, { aggregatedUsage: true });
+    expect(getTotalCost(repriced)).toBeCloseTo(getTotalCost(aggregate) ?? NaN, 12);
+  });
+
+  test("repricing repairs a malformed 1h share instead of carrying it into later sums", () => {
+    const model = "anthropic:claude-sonnet-5-5";
+    const write = (tokens: number, oneHour: number) =>
+      display(model, {
+        anthropic: {
+          cacheCreationInputTokens: tokens,
+          usage: {
+            cache_creation: {
+              ephemeral_5m_input_tokens: tokens - oneHour,
+              ephemeral_1h_input_tokens: oneHour,
+            },
+          },
+        },
+      });
+    // A persisted row claims 100 1h tokens out of only 10 cache-write tokens.
+    const corrupt = { ...write(10, 10), cacheCreate1hTokens: 100 };
+    const repaired = recomputeUsageCosts(corrupt, model);
+    const later = sumUsageHistory([repaired, write(90, 0)]);
+    const expected = sumUsageHistory([write(10, 10), write(90, 0)]);
+    if (later === undefined || expected === undefined) throw new Error("expected aggregates");
+    expect(recomputeUsageCosts(later, model).cacheCreate.cost_usd).toBeCloseTo(
+      expected.cacheCreate.cost_usd ?? NaN,
+      12
+    );
+  });
+});
+
+describe("OpenAI service-tier pricing (#4352)", () => {
+  const tierMetadata = (tier: string | undefined) =>
+    tier === undefined ? undefined : { openai: { serviceTier: tier } };
+  const display = (model: string, inputTokens: number, tier?: string, outputTokens = 1_000) => {
+    const usage = createDisplayUsage({ inputTokens, outputTokens }, model, tierMetadata(tier));
+    if (usage === undefined) throw new Error("expected display usage");
+    return usage;
+  };
+  const cost = (model: string, inputTokens: number, tier?: string) => {
+    const total = getTotalCost(display(model, inputTokens, tier));
+    if (total === undefined) throw new Error("expected a priced model");
+    return total;
+  };
+
+  test("prices the tier the provider reported, not the base rate", () => {
+    const sol = (tier?: string) => cost("openai:gpt-6.1-sol", 100_000, tier);
+    // A ramp-downgraded Fast request reports "default" and is billed at Standard.
+    expect(sol("default")).toBe(sol(undefined));
+    expect(sol("auto")).toBe(sol(undefined));
+    expect(sol("priority")).toBe(sol("fast"));
+    expect(sol("fast")).toBeGreaterThan(sol("default"));
+    expect(sol("flex")).toBeLessThan(sol("default"));
+  });
+
+  test("scales long-context Fast from the Standard long rate across the 272K boundary", () => {
+    const ratio = (inputTokens: number) =>
+      cost("openai:gpt-6.1-sol", inputTokens, "fast") / cost("openai:gpt-6.1-sol", inputTokens);
+    expect(ratio(272_000)).toBeGreaterThan(1);
+    expect(ratio(272_001)).toBeCloseTo(ratio(272_000), 12);
+  });
+
+  test("charges the highest published rate for an unpublished Fast long-context cell", () => {
+    // gpt-5.5 publishes Fast short-context rates only.
+    const fastShort = display("openai:gpt-5.5", 272_000, "priority");
+    const standardLong = display("openai:gpt-5.5", 272_001);
+    const fastLong = display("openai:gpt-5.5", 272_001, "priority");
+    const perToken = (value: number | undefined, tokens: number) => (value ?? NaN) / tokens;
+    expect(getTotalCost(fastLong)).toBeGreaterThan(getTotalCost(standardLong) ?? Infinity);
+    expect(fastLong.input.cost_usd).toBeCloseTo(
+      272_001 *
+        Math.max(
+          perToken(fastShort.input.cost_usd, 272_000),
+          perToken(standardLong.input.cost_usd, 272_001)
+        ),
+      12
+    );
+    expect(fastLong.output.cost_usd).toBeCloseTo(
+      Math.max(fastShort.output.cost_usd ?? NaN, standardLong.output.cost_usd ?? NaN),
+      12
+    );
+  });
+
+  test("prices an unknown reported tier at least as high as Fast", () => {
+    const unknown = cost("openai:gpt-6.1-sol", 100_000, "hyperfast");
+    expect(unknown).toBeGreaterThan(cost("openai:gpt-6.1-sol", 100_000));
+    expect(unknown).toBeGreaterThanOrEqual(cost("openai:gpt-6.1-sol", 100_000, "fast"));
+    // A published Ultrafast card is part of the highest-published-rate fallback.
+    expect(cost("openai:gpt-6-astra", 100_000, "hyperfast")).toBeGreaterThanOrEqual(
+      cost("openai:gpt-6-astra", 100_000, "ultrafast")
+    );
+  });
+
+  test("prices Ultrafast at 6x Standard in both context bands", () => {
+    // gpt-6-luna has no Ultrafast card and falls back to the same 6x multiplier.
+    for (const model of ["openai:gpt-6-astra", "openai:gpt-6.1-sol", "openai:gpt-6-luna"]) {
+      for (const inputTokens of [100_000, 300_000]) {
+        expect(cost(model, inputTokens, "ultrafast")).toBeCloseTo(6 * cost(model, inputTokens), 9);
+      }
+      expect(cost(model, 100_000, "ultrafast")).toBeGreaterThan(cost(model, 100_000, "fast"));
+    }
+  });
+
+  test("keeps gateway-included costs at zero whatever tier was reported", () => {
+    const usage = createDisplayUsage(
+      { inputTokens: 100_000, outputTokens: 1_000 },
+      "openai:gpt-6.1-sol",
+      {
+        openai: { serviceTier: "priority" },
+        mux: { costsIncluded: true },
+      }
+    );
+    expect(getTotalCost(usage)).toBe(0);
+  });
+
+  test("resolves the same tier rates for dated snapshots and metadata-model overrides", () => {
+    const base = cost("openai:gpt-6.1-sol", 100_000, "fast");
+    expect(cost("openai:gpt-6.1-sol-2026-09-01", 100_000, "fast")).toBe(base);
+    const viaOverride = createDisplayUsage(
+      { inputTokens: 100_000, outputTokens: 1_000 },
+      "coder:openai/gpt-6.1-sol",
+      tierMetadata("fast"),
+      "openai:gpt-6.1-sol"
+    );
+    expect(getTotalCost(viaOverride)).toBe(base);
+  });
+});
+
+describe("Anthropic Fast mode pricing", () => {
+  const display = (model: string, speed?: string) => {
+    const usage = createDisplayUsage(
+      { inputTokens: 300_000, outputTokens: 1_000, cachedInputTokens: 50_000 },
+      model,
+      speed === undefined ? undefined : { anthropic: { usage: { speed } } }
+    );
+    if (usage === undefined) throw new Error("expected display usage");
+    return usage;
+  };
+  const total = (usage: Parameters<typeof getTotalCost>[0]) => {
+    const value = getTotalCost(usage);
+    if (value === undefined) throw new Error("expected a priced total");
+    return value;
+  };
+
+  test("prices the speed Anthropic reported at 2x across every token class", () => {
+    for (const model of ["anthropic:claude-opus-5-5", "anthropic:claude-opus-4-8"]) {
+      const standard = display(model, "standard");
+      const fast = display(model, "fast");
+      expect(total(standard)).toBe(total(display(model)));
+      expect(fast.serviceTier).toBe("fast");
+      expect(standard.serviceTier).toBeUndefined();
+      expect(fast.input.cost_usd).toBeCloseTo(2 * (standard.input.cost_usd ?? NaN), 12);
+      expect(fast.cached.cost_usd).toBeCloseTo(2 * (standard.cached.cost_usd ?? NaN), 12);
+      expect(fast.output.cost_usd).toBeCloseTo(2 * (standard.output.cost_usd ?? NaN), 12);
+    }
+  });
+
+  test("reprices a stored Fast turn at Fast rates", () => {
+    const fast = display("anthropic:claude-opus-5-5", "fast");
+    expect(total(recomputeUsageCosts(fast, "anthropic:claude-opus-5-5"))).toBeCloseTo(
+      total(fast),
+      12
+    );
+  });
+});
+
+describe("repricing keeps the billed service tier (#4787)", () => {
+  // o4-mini has Fast and Flex rates but no long-context tier, so its session
+  // aggregates are repriced rather than preserved.
+  const MODEL = "openai:o4-mini";
+  const priced = (model: string, tier?: string) => {
+    const usage = createDisplayUsage(
+      { inputTokens: 100_000, outputTokens: 1_000 },
+      model,
+      tier === undefined ? undefined : { openai: { serviceTier: tier } }
+    );
+    if (usage === undefined) throw new Error("expected display usage");
+    return usage;
+  };
+  const total = (usage: Parameters<typeof getTotalCost>[0]) => {
+    const value = getTotalCost(usage);
+    if (value === undefined) throw new Error("expected a priced total");
+    return value;
+  };
+
+  test("reprices a Fast or Flex request at the tier it was billed at", () => {
+    expect(total(priced("openai:gpt-6.1-sol", "priority"))).toBeGreaterThan(
+      total(priced("openai:gpt-6.1-sol"))
+    );
+    for (const tier of ["priority", "flex"]) {
+      const usage = priced("openai:gpt-6.1-sol", tier);
+      expect(total(recomputeUsageCosts(usage, "openai:gpt-6.1-sol"))).toBeCloseTo(total(usage), 12);
+    }
+  });
+
+  test("the billed tier survives the session-usage schema", () => {
+    for (const [model, tier] of [
+      ["openai:gpt-6.1-sol", "priority"],
+      ["openai:gpt-6-astra", "ultrafast"],
+    ] as const) {
+      const usage = priced(model, tier);
+      const parsed = ChatUsageDisplaySchema.parse(usage);
+      expect(total(recomputeUsageCosts(parsed, model))).toBeCloseTo(total(usage), 12);
+    }
+  });
+
+  test("reprices an aggregate of one tier at that tier", () => {
+    const aggregate = sumUsageHistory([priced(MODEL, "priority"), priced(MODEL, "priority")]);
+    if (aggregate === undefined) throw new Error("expected an aggregate");
+    const repriced = recomputeUsageCosts(aggregate, MODEL, { aggregatedUsage: true });
+    expect(repriced.hasUnknownCosts).toBeUndefined();
+    expect(total(repriced)).toBeCloseTo(total(aggregate), 12);
+  });
+
+  test("keeps the recorded costs of an aggregate that mixes tiers", () => {
+    const aggregate = sumUsageHistory([priced(MODEL, "priority"), priced(MODEL)]);
+    if (aggregate === undefined) throw new Error("expected an aggregate");
+    expect(recomputeUsageCosts(aggregate, MODEL, { aggregatedUsage: true })).toEqual(aggregate);
+  });
+
+  test("an unpriced model's sum keeps its unknown-pricing flag through the schema", () => {
+    const unpriced = () =>
+      createDisplayUsage(
+        { inputTokens: 1000, outputTokens: 100, totalTokens: 1100 },
+        "openai:some-unknown-model"
+      )!;
+    // Merging turns the unknown costs into numeric partial sums; only the flag remains.
+    const merged = ChatUsageDisplaySchema.parse(sumUsageHistory([unpriced(), unpriced()]));
+    expect(sumUsageHistory([merged])?.hasUnknownCosts).toBe(true);
   });
 });

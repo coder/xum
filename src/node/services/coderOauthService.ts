@@ -36,11 +36,14 @@ import {
   type CoderGatewayProvider,
 } from "@/common/constants/coderOAuth";
 import type { FileLeaseManager, ProvidersConfigStore } from "@/node/config";
-import type { PolicyService } from "@/node/services/policyService";
 import type { ProviderService } from "@/node/services/providerService";
 import type { WindowService } from "@/node/services/windowService";
 import { log } from "@/node/services/log";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
+import {
+  readPriorCoderCatalog,
+  reconcileProviderCatalog,
+} from "@/node/services/coderGatewayCatalogMerge";
 import {
   isCoderOauthAuthExpired,
   parseCoderOauthAuth,
@@ -50,11 +53,7 @@ import { createDeferred, toWireResult } from "@/node/utils/oauthUtils";
 import { startLoopbackServer } from "@/node/utils/oauthLoopbackServer";
 import { OAuthFlowManager } from "@/node/utils/oauthFlowManager";
 import { getErrorMessage } from "@/common/utils/errors";
-import type { ProviderModelEntry } from "@/common/orpc/types";
-import {
-  maybeGetProviderModelEntryId,
-  normalizeProviderModelEntries,
-} from "@/common/utils/providers/modelEntries";
+import { userManagedModelEntries } from "@/common/utils/providers/modelEntries";
 
 const DEFAULT_DESKTOP_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -275,35 +274,36 @@ function parseEndpointUrl(value: unknown): string | null {
 }
 
 /**
- * Entries of the coder section's `models` list that carry user-managed data:
- * everything NOT recorded in `discoveredModels` (the bookkeeping of what
- * catalog discovery wrote), plus any object-form entry — normalization
- * collapses override-free objects to plain strings, so an object entry means
- * the user edited it (context window override, model mapping) even when its
- * ID was discovered. Logins, catalog refreshes, and disconnects must carry
- * these forward instead of clobbering them with the server catalog.
+ * The one-shot `models` separation (see separateDiscoveredModelsOnce) applied
+ * to a clone of `section`, with `discoveredModelsUnlisted` stamped. Every
+ * OAuth writer that stamps the flag goes through here, because the flag is
+ * what makes the startup migration skip the file: a writer that stamped it
+ * over a still-merged list (startup migration skipped or failed on a
+ * transient lock or persistence error) would freeze the old catalog entries
+ * into `models` for good. Eligibility is the migration's: a catalog marker
+ * WITHOUT the flag means old code wrote the list. Otherwise `models` is
+ * preserved exactly as found (present, missing, or empty). Must be applied
+ * BEFORE the caller clears or replaces the catalog markers — they are the
+ * classification input. The explicit Models edit
+ * (ProviderService.applyCoderModelEdit) applies the same classification to the
+ * persisted list before stamping, because Settings resubmits whatever merged
+ * rows it was shown while the migration was pending.
  */
-function manualModelEntries(section: Record<string, unknown> | undefined): ProviderModelEntry[] {
-  if (!Array.isArray(section?.models)) {
-    return [];
-  }
-  // Discovered classification unions the authoritative catalog with the
-  // stale marker (entries retained in `models` while the catalog was
-  // inconclusive). Without the marker, an inconclusive refresh would
-  // reclassify retained catalog entries as manual — surviving disconnect and
-  // resurrecting across refreshes as if the user had added them.
-  const discovered = new Set(
-    [section.discoveredModels, section.staleDiscoveredModels].flatMap((value) =>
-      Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : []
-    )
-  );
-  return normalizeProviderModelEntries(section.models).filter((entry) => {
-    if (typeof entry !== "string") {
-      return true; // User-authored settings on a (possibly discovered) model.
+function separateDiscoveredModels(section: Record<string, unknown>): Record<string, unknown> {
+  const next = { ...section };
+  if (
+    section.discoveredModelsUnlisted !== true &&
+    (Array.isArray(section.discoveredModels) || Array.isArray(section.staleDiscoveredModels))
+  ) {
+    const userManaged = userManagedModelEntries(section);
+    if (userManaged.length > 0) {
+      next.models = userManaged;
+    } else {
+      delete next.models;
     }
-    const id = maybeGetProviderModelEntryId(entry);
-    return id == null || !discovered.has(id);
-  });
+  }
+  next.discoveredModelsUnlisted = true;
+  return next;
 }
 
 /**
@@ -362,8 +362,7 @@ export class CoderOauthService {
     private readonly providersConfigStore: ProvidersConfigStore,
     private readonly fileLeaseManager: FileLeaseManager,
     private readonly providerService: ProviderService,
-    private readonly windowService?: WindowService,
-    private readonly policyService?: PolicyService
+    private readonly windowService?: WindowService
   ) {
     // Another Xum process sharing providers.jsonc (desktop vs `mux run`) can
     // disconnect or re-login to the SAME deployment; the deployment URL then
@@ -373,34 +372,6 @@ export class CoderOauthService {
     this.unsubscribeConfigChanged = this.providerService.onConfigChanged(() => {
       this.cachedAuth = null;
     });
-  }
-
-  /**
-   * True when an enforced policy denies the coder provider outright —
-   * including the "blocked" state, which must behave as deny-all so direct
-   * backend RPCs (CLI/headless/orpc) cannot bypass the UI block. Checked
-   * before login network I/O AND again before commit: policy can refresh
-   * while the browser authorization is pending.
-   */
-  private isCoderDeniedByPolicy(): boolean {
-    return (
-      this.policyService?.isEnforced() === true && !this.policyService.isProviderAllowed("coder")
-    );
-  }
-
-  /**
-   * An enforced policy forcedBaseUrl overrides every user-supplied or stored
-   * deployment URL: logins, refreshes, and issuer checks must all target the
-   * policy-locked deployment or Coder traffic could bypass it.
-   */
-  private effectiveDeploymentUrl(candidate: string | null): string | null {
-    const forced = this.policyService?.isEnforced()
-      ? this.policyService.getForcedBaseUrl("coder")
-      : undefined;
-    if (!forced) {
-      return candidate;
-    }
-    return normalizeCoderDeploymentUrl(forced);
   }
 
   async disconnect(): Promise<Result<void, string>> {
@@ -443,9 +414,9 @@ export class CoderOauthService {
       // would let a refresh rotate + persist in the meantime. The predicate
       // matches on the session lineage id — stable across rotations, re-minted
       // by each login — so it clears the disconnected session even if it just
-      // rotated, while a genuinely newer login is preserved. Tokens and models
-      // are cleared in ONE locked mutation so racing observers see either the
-      // connected state or the fully disconnected state, never a mix.
+      // rotated, while a genuinely newer login is preserved. Tokens and the
+      // catalog are cleared in ONE locked mutation so racing observers see
+      // either the connected state or the fully disconnected state, never a mix.
       //
       // The clear runs under the cross-process login-commit lock: a commit in
       // another Xum process persists its login and announces success as one
@@ -475,7 +446,10 @@ export class CoderOauthService {
                 // Capture the freshest rotation of the session so revocation below
                 // targets a token that is actually still alive server-side.
                 removed = stored;
-                const next = { ...(section ?? {}) };
+                // Finishes an unsuccessful legacy `models` migration (and stamps
+                // the flag) before the markers it classifies by are cleared below;
+                // an already-separated list is preserved.
+                const next = separateDiscoveredModels(section ?? {});
                 delete next.coderOauth;
                 // Cross-process tombstone: cancelAll/disconnectGeneration above only
                 // reach flows in THIS process. A login flow in another Xum process
@@ -491,10 +465,9 @@ export class CoderOauthService {
                 // Discovered models/providers were fetched from the deployment's AI
                 // Gateway at login time; they are meaningless without credentials and
                 // are refetched on the next login. discoveredModels stays PRESENT
-                // (as []) so the catalog reads as authoritatively empty, while
-                // manually added entries (and additionalProviders) are user-managed
-                // data and survive the disconnect.
-                next.models = manualModelEntries(section);
+                // (as []) so the catalog reads as authoritatively empty. `models`
+                // (and additionalProviders) are user-managed data: not touched
+                // beyond the migration step above.
                 next.discoveredModels = [];
                 next.discoveredProviders = [];
                 delete next.staleDiscoveredModels;
@@ -661,39 +634,12 @@ export class CoderOauthService {
       const initialDisconnectGeneration = self.disconnectGeneration;
       const flowStartPersistedGeneration = self.readPersistedDisconnectGeneration();
 
-      // Policy gate BEFORE any network I/O: a deny-all/provider-restricted (or
-      // blocked) policy must stop direct backend RPCs from registering OAuth
-      // clients or minting credentials, not just hide the login UI.
-      if (self.isCoderDeniedByPolicy()) {
-        return yield* Effect.fail(
-          new CoderOauthError({
-            reason: "The Coder provider is not allowed by the enforced policy",
-          })
-        );
-      }
-
-      const requestedUrl = normalizeCoderDeploymentUrl(input.deploymentUrl);
-      if (!requestedUrl) {
+      const deploymentUrl = normalizeCoderDeploymentUrl(input.deploymentUrl);
+      if (!deploymentUrl) {
         return yield* Effect.fail(
           new CoderOauthError({
             reason: "Invalid Coder deployment URL (expected e.g. https://coder.example.com)",
           })
-        );
-      }
-
-      // Policy override: login must target the policy-locked deployment so the
-      // minted tokens are issuer-bound to it (getValidAuth enforces the match).
-      const deploymentUrl = self.effectiveDeploymentUrl(requestedUrl);
-      if (!deploymentUrl) {
-        return yield* Effect.fail(
-          new CoderOauthError({
-            reason: "Policy-forced Coder base URL is not a valid deployment URL",
-          })
-        );
-      }
-      if (deploymentUrl !== requestedUrl) {
-        log.debug(
-          `[Coder OAuth] Deployment URL overridden by policy: ${requestedUrl} -> ${deploymentUrl}`
         );
       }
 
@@ -982,12 +928,15 @@ export class CoderOauthService {
         args.channel
       );
 
-      // Model discovery runs only after the flow is committed: Cancel is no
+      // Provider discovery runs only after the flow is committed: Cancel is no
       // longer possible, so this network await cannot strand half-cancelled
       // state (persisted auth with a cancelled flow). Its Result is folded
-      // and ignored like the pre-Effect fire-and-forget refresh.
+      // and ignored like the pre-Effect fire-and-forget refresh. Model
+      // catalogs are NOT fetched here: a deployment can expose thousands of
+      // IDs, and a loaded catalog switches Coder routing into catalog-gated
+      // mode, so loading it is an explicit user action (refreshModels).
       if (committed) {
-        yield* toWireResult(self.refreshBridgeModelsEffect(tokenResult.auth));
+        yield* toWireResult(self.refreshGatewayProvidersEffect(tokenResult.auth));
       }
     });
   }
@@ -1176,7 +1125,7 @@ export class CoderOauthService {
     const coderConfig = providersConfig.coder as Record<string, unknown> | undefined;
     const raw = coderConfig?.deploymentUrl;
     const configured = typeof raw === "string" ? normalizeCoderDeploymentUrl(raw) : null;
-    return this.effectiveDeploymentUrl(configured);
+    return configured;
   }
 
   async dispose(): Promise<void> {
@@ -1712,9 +1661,10 @@ export class CoderOauthService {
       //   key means "catalog unknown" (routing fails open) until discovery
       //   persists a conclusive list; [] would read as an authoritative empty
       //   catalog and block Coder routing entirely (see gatewayModelCatalog.ts).
-      // - models reduced to the MANUAL entries: discovered entries belong to
-      //   the old catalog, but manually added ones are user-managed data and
-      //   must survive every re-login.
+      // - `models` preserved: it is user-managed data and must survive every
+      //   re-login. The one exception is a legacy merged list whose startup
+      //   migration did not land (see separateDiscoveredModels): the commit
+      //   stamps the flag, so it finishes that separation first.
       // The previous section is captured under the same lock so a post-persist
       // cancellation can restore it verbatim (not just delete the new blob,
       // which would log out a previously connected account).
@@ -1740,35 +1690,12 @@ export class CoderOauthService {
           commitRefusalMessage = "Login was superseded by a disconnect";
           return null;
         }
-        // Policy checks run HERE, inside the synchronous write predicate —
-        // not merely before the mutation. Another process can hold the
-        // providers-file lock for seconds, and policy can refresh while this
-        // mutation waits for it (updateProviderSection itself does no policy
-        // gating). A login started under a permissive policy must not
-        // persist a credential after coder was denied, and a credential
-        // minted by deployment A must not be persisted once the policy pins
-        // B — routing and Settings would resolve against B and strand the
-        // issuer-mismatched credential while the login reported success.
-        // Refusing here routes the exchanged tokens through the caller's
-        // non-committed revocation path.
-        if (this.isCoderDeniedByPolicy()) {
-          commitRefusalMessage = "The Coder provider is not allowed by the enforced policy";
-          return null;
-        }
-        if (this.effectiveDeploymentUrl(deploymentUrl) !== deploymentUrl) {
-          commitRefusalMessage = "The policy-enforced Coder deployment URL changed during login";
-          return null;
-        }
         previousSection = { ...(section ?? {}) };
-        const next = { ...(section ?? {}) };
+        // Before the old markers are deleted below: they classify the legacy
+        // list. Also stamps the flag.
+        const next = separateDiscoveredModels(section ?? {});
         next.deploymentUrl = deploymentUrl;
         next.coderOauth = auth;
-        const manual = manualModelEntries(section);
-        if (manual.length > 0) {
-          next.models = manual;
-        } else {
-          delete next.models;
-        }
         // Fresh login: the previous deployment's catalog and provider set are
         // meaningless; discovery (running right after commit) repopulates
         // them. Deleted, not emptied, so routing fails open until then.
@@ -1785,11 +1712,10 @@ export class CoderOauthService {
       }
       if (!persistResult.data.applied) {
         if (commitRefusalMessage !== null) {
-          // A refusal recorded by the write predicate (disconnect tombstone
-          // or policy): unlike the local-cancel case below, this flow is
-          // still live in this process — finish it so the waiter and browser
-          // callback see the failure instead of hanging until the flow
-          // timeout.
+          // A refusal recorded by the write predicate (disconnect tombstone):
+          // unlike the local-cancel case below, this flow is still live in
+          // this process — finish it so the waiter and browser callback see
+          // the failure instead of hanging until the flow timeout.
           channel.sendFailureResponse(commitRefusalMessage);
           await this.desktopFlows.finish(flowId, Err(commitRefusalMessage));
           return { outcome: "failed" as const };
@@ -2341,10 +2267,9 @@ export class CoderOauthService {
   }
 
   /**
-   * Re-discover the deployment's AI Gateway providers and model catalogs with
-   * the stored credential. Runs automatically after login; exposed to the UI
-   * as the Settings "Refresh models" action so new providers/models don't
-   * require a re-login.
+   * Load the deployment's AI Gateway providers and model catalogs with the
+   * stored credential. User-triggered only (Settings "Load model catalog" and
+   * the command palette); login discovers provider instances only.
    */
   async refreshModels(): Promise<Result<void, string>> {
     return Effect.runPromise(this.refreshModelsEffect());
@@ -2372,6 +2297,74 @@ export class CoderOauthService {
     );
   }
 
+  /** Re-list provider instances with the stored credential (no catalogs). */
+  async refreshProviders(): Promise<Result<void, string>> {
+    return Effect.runPromise(this.refreshProvidersEffect());
+  }
+
+  refreshProvidersEffect(): Effect.Effect<Result<void, string>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const authResult = yield* self.getValidAuthEffect();
+      if (!authResult.success) {
+        return Err(authResult.error);
+      }
+      return yield* toWireResult(self.refreshGatewayProvidersEffect(authResult.data));
+    }).pipe(
+      Effect.catchDefect((defect) =>
+        Effect.succeed(
+          Err(`Failed to refresh Coder providers: ${getErrorMessage(defect)}`) as Result<
+            void,
+            string
+          >
+        )
+      )
+    );
+  }
+
+  /**
+   * One-shot upgrade migration (a best-effort startup core step, see
+   * serviceContainer): older versions merged the discovered catalog into the
+   * coder section's `models` list; now `models` is user-managed only and the
+   * catalog lives in `discoveredModels`. Strip the catalog-derived
+   * plain-string entries once, keeping user-edited object entries and IDs the
+   * catalog never listed, and stamp `discoveredModelsUnlisted` so this never
+   * runs again on that file.
+   *
+   * Only a section that carries a catalog marker WITHOUT the flag is eligible:
+   * old code merged only when it wrote such a marker, and every new-code
+   * writer stamps the flag, so an explicit add of a catalog ID made under the
+   * new contract can never be mistaken for merged data. Not a catalog commit:
+   * catalog markers, legacy `removedModels` tombstones and generation
+   * counters are left untouched. Never throws (startup rule); when the write
+   * is skipped or fails, the OAuth writers finish the separation before they
+   * stamp the flag (separateDiscoveredModels), and a later start retries.
+   */
+  async separateDiscoveredModelsOnce(): Promise<void> {
+    try {
+      // updateProviderSection runs the predicate under the cross-process
+      // providers.jsonc lock, so the read, the classification and the write
+      // are one critical section against concurrent Xum processes.
+      const result = await this.providerService.updateProviderSection("coder", (section) => {
+        if (
+          section === undefined ||
+          section.discoveredModelsUnlisted === true ||
+          (!Array.isArray(section.discoveredModels) &&
+            !Array.isArray(section.staleDiscoveredModels))
+        ) {
+          return null; // Nothing to migrate: no write (an unflagged marker-less list stays unflagged).
+        }
+        return { value: separateDiscoveredModels(section) };
+      });
+      if (!result.success) {
+        log.error(`[Coder OAuth] Failed to separate discovered models: ${result.error}`);
+      }
+    } catch (error) {
+      log.error(`[Coder OAuth] Failed to separate discovered models: ${getErrorMessage(error)}`);
+    }
+  }
+
   private refreshBridgeModelsEffect(auth: CoderOauthAuth): Effect.Effect<void, CoderOauthError> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
@@ -2381,6 +2374,100 @@ export class CoderOauthService {
     return Effect.acquireUseRelease(
       Effect.promise(() => self.catalogRefreshMutex.acquire()),
       () => self.refreshBridgeModelsSerializedEffect(auth),
+      (lock) => Effect.promise(() => lock[Symbol.asyncDispose]())
+    );
+  }
+
+  /**
+   * Provider-instance discovery only: persists `discoveredProviders` from the
+   * admin listing under the same locked commit rules as the catalog refresh,
+   * fetching no catalogs. No per-instance /models probing
+   * when the listing is unavailable: probing is what loads catalogs, and
+   * members can declare custom-named instances via additionalProviders.
+   */
+  private refreshGatewayProvidersEffect(
+    auth: CoderOauthAuth
+  ): Effect.Effect<void, CoderOauthError> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.acquireUseRelease(
+      Effect.promise(() => self.catalogRefreshMutex.acquire()),
+      () =>
+        Effect.gen(function* () {
+          const refreshStartGeneration = sanitizeGenerationCounter(
+            (
+              self.providersConfigStore.loadProvidersConfig()?.coder as
+                | { coderCatalogGeneration?: unknown }
+                | undefined
+            )?.coderCatalogGeneration
+          );
+          const listing = yield* self.retryTransientEffect(self.fetchGatewayProvidersEffect(auth));
+          if (listing.kind !== "ok") {
+            return yield* Effect.fail(
+              new CoderOauthError({
+                reason:
+                  listing.kind === "unavailable"
+                    ? "Listing AI Gateway providers requires provider read access on the deployment"
+                    : "Failed to list the deployment's AI Gateway providers",
+              })
+            );
+          }
+          let supersededByConcurrentRefresh = false;
+          const setResult = yield* Effect.promise(() =>
+            self.providerService.updateProviderSection("coder", (section) => {
+              const stored = parseCoderOauthAuth(section?.coderOauth);
+              if (
+                !stored ||
+                stored.sessionId !== auth.sessionId ||
+                stored.deploymentUrl !== auth.deploymentUrl
+              ) {
+                return null;
+              }
+              const currentCatalogGeneration = sanitizeGenerationCounter(
+                section?.coderCatalogGeneration
+              );
+              if (currentCatalogGeneration !== refreshStartGeneration) {
+                supersededByConcurrentRefresh = true;
+                return null;
+              }
+              // A loaded catalog keeps only instances still listed under the
+              // type their models were fetched with (the catalog refresh's
+              // carry-forward rule): removed instances' models must stop
+              // passing the catalog gate, and a retyped instance's must not go
+              // out over its new wire.
+              const previousProviders = parseCoderGatewayProviders(section?.discoveredProviders);
+              const next = separateDiscoveredModels(section ?? {});
+              if (Array.isArray(next.discoveredModels)) {
+                next.discoveredModels = next.discoveredModels.filter((id) => {
+                  if (typeof id !== "string") {
+                    return false;
+                  }
+                  const name = id.split("/", 1)[0];
+                  const previousType =
+                    previousProviders.find((provider) => provider.name === name)?.type ?? name;
+                  return listing.providers.some(
+                    (provider) => provider.name === name && provider.type === previousType
+                  );
+                });
+              }
+              next.discoveredProviders = listing.providers;
+              next.coderCatalogGeneration = currentCatalogGeneration + 1;
+              return { value: next };
+            })
+          );
+          if (!setResult.success) {
+            return yield* Effect.fail(new CoderOauthError({ reason: setResult.error }));
+          }
+          if (!setResult.data.applied) {
+            return yield* Effect.fail(
+              new CoderOauthError({
+                reason: supersededByConcurrentRefresh
+                  ? "Provider refresh superseded by a concurrent refresh; try again"
+                  : "Provider refresh superseded by a newer login; try again",
+              })
+            );
+          }
+        }),
       (lock) => Effect.promise(() => lock[Symbol.asyncDispose]())
     );
   }
@@ -2468,9 +2555,10 @@ export class CoderOauthService {
       // repopulate models over a disconnect or a newer deployment's catalog.
       // The credential check also pins the deployment, so per-provider
       // carry-forward below can only resurrect entries from THIS deployment.
-      // `models` stays the user-visible union: manually added entries (those
-      // not recorded in discoveredModels) are carried forward ahead of the
-      // fresh catalog, so discovery never clobbers user-managed data.
+      // Discovery writes the catalog markers only; `models` is user-managed
+      // (Settings offers the catalog in an "add model" dropdown) and is not
+      // read or written here — except to finish a legacy migration that did
+      // not land at startup (see separateDiscoveredModels).
       let catalogInconclusive = false;
       let supersededByConcurrentRefresh = false;
       const setResult = yield* Effect.promise(() =>
@@ -2502,162 +2590,38 @@ export class CoderOauthService {
           }
           // Prior catalog state must be read INSIDE the locked mutation (a
           // concurrent login/refresh may have changed it since discovery began).
-          const previousKnown = Array.isArray(section?.discoveredModels);
-          const previousDiscovered = Array.isArray(section?.discoveredModels)
-            ? section.discoveredModels.filter((id): id is string => typeof id === "string")
-            : [];
-          // Display state retained through an earlier inconclusive refresh (the
-          // authoritative catalog was deleted then; this marker is all that
-          // remains of it). Never authoritative prior state — it only keeps
-          // entries user-visible across consecutive failed refreshes.
-          const staleDiscovered = Array.isArray(section?.staleDiscoveredModels)
-            ? section.staleDiscoveredModels.filter((id): id is string => typeof id === "string")
-            : [];
-          const previousProviders = parseCoderGatewayProviders(section?.discoveredProviders);
-
-          // Per-provider conclusiveness: "ok" replaces the provider's entries,
-          // "unavailable" (404) conclusively clears them, and a transient "error"
-          // carries the provider's previous entries forward — one provider whose
-          // upstream rejects /models (Bedrock) or merely flaked must not poison
-          // every other provider's refresh, and a recovered provider heals on the
-          // next refresh instead of the next login. Carry-forward requires PRIOR
-          // STATE for that provider (a prior catalog naming it, or prior entries
-          // under its prefix): an errored provider without prior state — fresh
-          // login, or an instance the admin just added — makes the whole catalog
-          // inconclusive, because persisting the other providers' lists would
-          // read as an authoritative catalog that blocks every model of the
-          // failed provider until a later successful refresh.
-          // The COMPLETE discovered catalog is persisted, deliberately without
-          // policy filtering: policies refresh remotely, so a temporarily
-          // restrictive policy must not carve models out of the durable catalog.
-          // Policy is applied at exposure time instead — getConfig() filters the
-          // reported lists, routing checks the current policy, and the factory
-          // enforces it per model at creation.
-          const modelIds: string[] = [];
-          const nextProviders: CoderGatewayProvider[] = [];
-          for (const { provider, result } of results) {
-            const previous = previousProviders.find((prev) => prev.name === provider.name);
-            // Prior state must also TYPE-match under an authoritative listing:
-            // when the admin changes an instance's type (same name), the old
-            // type's model IDs are not valid carry-forward state — the write
-            // persists the NEW type, so carried entries would stay selectable and
-            // be sent over the new wire protocol until a successful refresh.
-            // A name with no stored metadata previously resolved via the
-            // name === type default, so that default is its effective prior type.
-            // The probe path persists `previous` (not the probe default), so no
-            // type change can occur there and the check is skipped.
-            const previousType = previous?.type ?? provider.name;
-            const typeUnchanged = !authoritative || previousType === provider.type;
-            const hasPriorState =
-              previousKnown &&
-              typeUnchanged &&
-              (previous !== undefined ||
-                previousDiscovered.some((id) => id.startsWith(`${provider.name}/`)));
-            if (result.kind === "ok") {
-              modelIds.push(...result.ids);
-              if (!authoritative) {
-                // The probe confirmed the route exists; prefer previously stored
-                // metadata (its type may come from an earlier authoritative
-                // listing) over the probe-derived name === type default.
-                nextProviders.push(previous ?? provider);
-              }
-            } else if (result.kind === "error") {
-              if (!hasPriorState) {
-                catalogInconclusive = true;
-                // Consecutive failed refreshes: after an inconclusive refresh the
-                // authoritative catalog is gone (previousKnown false), so a
-                // transiently failing provider has no carry-forward state — but
-                // its stale display entries must stay user-visible instead of
-                // vanishing from Settings/the selector. The catalog stays
-                // inconclusive, so these IDs land back in models +
-                // staleDiscoveredModels, never in discoveredModels. Type-gated
-                // like authoritative carry-forward.
-                if (typeUnchanged) {
-                  modelIds.push(
-                    ...staleDiscovered.filter((id) => id.startsWith(`${provider.name}/`))
-                  );
-                }
-                continue;
-              }
-              modelIds.push(
-                ...previousDiscovered.filter((id) => id.startsWith(`${provider.name}/`))
-              );
-              if (!authoritative && previous) {
-                nextProviders.push(previous);
-              }
-            } else if (!authoritative && previous !== undefined) {
-              // "unavailable" on the PROBE path for an instance recorded by an
-              // earlier authoritative listing: the 404 proves only that the
-              // upstream serves no /models route — not that the admin removed
-              // the gateway instance (only an authoritative listing can say
-              // that). Dropping it would leave manually configured
-              // coder:<custom>/<model> entries unresolvable until a listing
-              // succeeds again, so keep the metadata and carry prior entries
-              // forward like a transient error.
-              nextProviders.push(previous);
-              if (previousKnown) {
-                modelIds.push(
-                  ...previousDiscovered.filter((id) => id.startsWith(`${provider.name}/`))
-                );
-              } else {
-                // No authoritative prior catalog: stale display entries must not
-                // be promoted into a conclusive write.
-                catalogInconclusive = true;
-                modelIds.push(
-                  ...staleDiscovered.filter((id) => id.startsWith(`${provider.name}/`))
-                );
-              }
-            }
-            // "unavailable" otherwise: the authoritative listing already names
-            // every existing instance (a listed instance whose /models 404s
-            // conclusively serves no catalog), and probe-default names carry no
-            // recorded metadata — the route is conclusively absent; drop it.
-          }
-
-          const manual = manualModelEntries(section);
-          const manualIds = new Set(manual.map((entry) => maybeGetProviderModelEntryId(entry)));
-          // User-removed discovered models (recorded by setModels) stay excluded:
-          // a catalog refresh or re-login must not resurrect entries the user
-          // deleted from the model list.
-          const removed = new Set(
-            Array.isArray(section?.removedModels)
-              ? section.removedModels.filter((id): id is string => typeof id === "string")
-              : []
+          const prior = readPriorCoderCatalog(section);
+          // Per-provider rules (carry-forward, type gating, conclusiveness):
+          // see reconcileProviderCatalog.
+          const contributions = results.map(({ provider, result }) =>
+            reconcileProviderCatalog(provider, result, prior, authoritative)
           );
-          // User-visible union: manual entries first, then discovered/carried IDs.
-          const retainedDiscovered = modelIds.filter(
-            (id) => !manualIds.has(id) && !removed.has(id)
-          );
-          const merged = [...manual, ...retainedDiscovered];
+          const modelIds = contributions.flatMap((contribution) => contribution.ids);
+          const nextProviders = contributions.flatMap((contribution) => contribution.providers);
+          catalogInconclusive = contributions.some((contribution) => contribution.inconclusive);
 
           if (catalogInconclusive) {
             // The catalog cannot be written as authoritative. Keep/flip it to
             // UNKNOWN so routing fails open (the failed provider's models stay
             // reachable), losing at worst one refresh's worth of catalog data —
             // the next successful refresh rebuilds it. The healthy providers'
-            // fetched and carried-forward entries STAY user-visible in `models`
-            // (only the authoritative `discoveredModels` marker is dropped):
-            // wiping them would empty Settings and the model selector until a
-            // later fully successful refresh. The authoritative admin listing is
-            // conclusive independently of the catalog fetches, so it is still
-            // persisted: custom-named instances must stay resolvable (e.g. for
-            // manually added models). Probe-derived metadata is just the
-            // name === type default that resolveCoderGatewayProvider already
-            // applies without persistence, so the probe path persists nothing
-            // new and keeps any previously stored metadata.
-            const next = { ...(section ?? {}) };
-            if (merged.length > 0) {
-              next.models = merged;
-            } else {
-              delete next.models;
-            }
+            // fetched and carried-forward entries are kept in the stale marker
+            // (only the authoritative `discoveredModels` marker is dropped) so
+            // the next inconclusive refresh can carry them forward again. The
+            // authoritative admin listing is conclusive independently of the
+            // catalog fetches, so it is still persisted: custom-named instances
+            // must stay resolvable (e.g. for manually added models).
+            // Probe-derived metadata is just the name === type default that
+            // resolveCoderGatewayProvider already applies without persistence,
+            // so the probe path persists nothing new and keeps any previously
+            // stored metadata.
+            // Both writes below stamp the flag, so both first finish a legacy
+            // `models` migration that did not land — classified by the OLD
+            // markers, before they are replaced (see separateDiscoveredModels).
+            const next = separateDiscoveredModels(section ?? {});
             delete next.discoveredModels;
-            // Record which retained entries came from discovery so
-            // manualModelEntries keeps classifying them as catalog data (cleared
-            // by disconnect/login, excluded from manual carry-forward) while the
-            // authoritative marker is absent.
-            if (retainedDiscovered.length > 0) {
-              next.staleDiscoveredModels = retainedDiscovered;
+            if (modelIds.length > 0) {
+              next.staleDiscoveredModels = modelIds;
             } else {
               delete next.staleDiscoveredModels;
             }
@@ -2680,8 +2644,7 @@ export class CoderOauthService {
           // Conclusive catalog: the stale marker's entries are either re-listed
           // in discoveredModels or conclusively gone.
           const conclusive: Record<string, unknown> = {
-            ...(section ?? {}),
-            models: merged,
+            ...separateDiscoveredModels(section ?? {}),
             discoveredModels: modelIds,
             discoveredProviders: nextProviders,
             coderCatalogGeneration: currentCatalogGeneration + 1,
@@ -2784,7 +2747,7 @@ export class CoderOauthService {
           }
           const raw = section?.deploymentUrl;
           const configured = typeof raw === "string" ? normalizeCoderDeploymentUrl(raw) : null;
-          if (self.effectiveDeploymentUrl(configured) !== auth.deploymentUrl) {
+          if (configured !== auth.deploymentUrl) {
             return null;
           }
           return { value: { ...(section ?? {}), coderOauth: auth } };

@@ -1,0 +1,1311 @@
+import { createHash } from "crypto";
+import { EventEmitter } from "events";
+import * as fs from "fs/promises";
+import * as path from "path";
+import { z } from "zod";
+import assert from "@/common/utils/assert";
+import type { Config } from "@/node/config";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
+import { log } from "@/node/services/log";
+import {
+  withTargetMutationLock,
+  withTargetMutationLocks,
+} from "@/node/services/refinement/targetMutationLocks";
+import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
+import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
+import {
+  DEFAULT_CREATION_DRAFT_ID,
+  DRAFT_ID_PATTERN,
+  MAX_DRAFT_JSON_BYTES,
+} from "@/constants/drafts";
+import {
+  DraftListEntrySchema,
+  PendingSendSchema,
+  type BasisSend,
+  type Draft,
+  type DraftAttachment,
+  type DraftBeginSendInput,
+  type DraftEvent,
+  type DraftGetOutput,
+  type DraftImportLegacyOutput,
+  type DraftList,
+  type DraftListEntry,
+  type DraftScope,
+  type DraftSetSendReceiverInput,
+  type DraftSummary,
+  type DraftUpdateInput,
+  type DraftWriteOutput,
+  type PendingSend,
+} from "@/common/orpc/schemas/drafts";
+import {
+  hasDraftBlock,
+  joinDraftText,
+  removeDraftBlock,
+  removeSentText,
+} from "@/common/utils/composerDraftText";
+import {
+  buildLegacyDraftText,
+  draftJsonBytes,
+  draftScopeKey,
+  draftTooLargeMessage,
+  retainedAttachmentIds,
+  sanitizeDraft,
+  splitLegacyDraftText,
+  stripStagedDraftAttachments,
+  summarizeDraft,
+} from "@/common/utils/drafts";
+
+/**
+ * Composer drafts (text + attachments) persisted on the backend.
+ *
+ * They used to live in renderer localStorage, where base64 attachment payloads exhausted the
+ * origin quota (QuotaExceededError on `input:<workspaceId>`). The backend also shares one copy
+ * between every client of a server (Electron window, browser tabs), which per-origin localStorage
+ * could not.
+ *
+ * - Workspace drafts: `<sessionDir>/draft.json`. The session dir gives the lifecycle for free:
+ *   removal deletes it, rename keeps the workspace ID, and fork copies the draft through
+ *   copyWorkspaceDraftForFork (staged attachments stripped).
+ * - Creation drafts ("new workspace" composer): `<xumRoot>/drafts/<projectHash>/<draftId>.json`,
+ *   storing projectPath inside the file. Deleted by `delete`, by project removal
+ *   (deleteProjectDrafts) and by the startup GC (collectOrphanedCreationDrafts).
+ * - The creation draft list (sidebar rows, including empty drafts): `<xumRoot>/drafts/list.json`.
+ *   Only `delete`, putListEntry, importLegacyList, project removal, the GC and the snapshot's
+ *   relisting of bodies without a row change it; clearing a draft's text never delists it.
+ *   `delete` removes the body, then the entry, under the body lock: a crash in between leaves an
+ *   empty listed row. Lock order: a project's drafts dir (body) lock, then the list lock; nothing
+ *   takes a dir lock while holding the list lock.
+ */
+const DRAFT_FILE_NAME = "draft.json";
+const CREATION_DRAFTS_DIR_NAME = "drafts";
+const DRAFT_FILE_VERSION = 1;
+const LIST_FILE_NAME = "list.json";
+const LIST_FILE_VERSION = 1;
+
+/**
+ * A list.json row. `synthesized` marks a row relisted from a body without one (no sub-project,
+ * createdAt from the file): an authentic write (a put, a legacy import) replaces it. File-only:
+ * the API never returns it. An older build that rewrites the list drops the unknown key, so the
+ * row turns ordinary, as before this marker; a LIST_FILE_VERSION bump would make that build
+ * refuse every list write instead.
+ */
+const DraftListFileEntrySchema = DraftListEntrySchema.extend({
+  synthesized: z.literal(true).optional(),
+});
+type DraftListFileEntry = z.infer<typeof DraftListFileEntrySchema>;
+
+type WorkspaceScope = Extract<DraftScope, { kind: "workspace" }>;
+type CreationScope = Extract<DraftScope, { kind: "creation" }>;
+
+interface IndexEntry {
+  summary: DraftSummary;
+  filePath: string;
+}
+
+/**
+ * A draft file's content. `text` and `attachments` are the legacy fields an older build reads as
+ * the whole draft: `text` = buildLegacyDraftText(pendingSends, visible text), and `attachments`
+ * holds the retained ones (in entry order) before the visible ones. `pendingSends` is the
+ * idempotent-send bookkeeping; an older build drops it on its next write, which leaves everything
+ * visible (never lost). Only this service builds `text`; clients see and edit the visible part
+ * (DraftSummary, DraftUpdateInput).
+ */
+interface StoredDraft {
+  text: string;
+  attachments: DraftAttachment[];
+  pendingSends: PendingSend[];
+}
+
+function emptyStoredDraft(): StoredDraft {
+  return { text: "", attachments: [], pendingSends: [] };
+}
+
+/** No file: an attachment-only or review-only pending send still keeps its file. */
+function isStoredDraftEmpty(draft: StoredDraft): boolean {
+  return (
+    draft.text.length === 0 && draft.attachments.length === 0 && draft.pendingSends.length === 0
+  );
+}
+
+/** The composer's part of a validated stored draft (load drops bookkeeping that does not fit). */
+function visibleTextOf(draft: StoredDraft): string {
+  const visible = splitLegacyDraftText(draft.text, draft.pendingSends);
+  assert(visible !== null, "a stored draft's legacy text starts with its retained text");
+  return visible;
+}
+
+/** The API view: visible text, every attachment (clients hide retained ones), pending sends. */
+function viewOf(draft: StoredDraft): Draft {
+  return { text: visibleTextOf(draft), attachments: draft.attachments };
+}
+
+/**
+ * Which send ids durable history holds a row for (accepted). Passive: unlike getSendStatus it
+ * records nothing, so asking never refuses a send that is still on its way.
+ */
+export interface SendAcceptance {
+  acceptedSendIds(workspaceId: string, sendIds: readonly string[]): Promise<ReadonlySet<string>>;
+}
+
+/**
+ * A window's write merged with what happened to the pending sends it wrote against (BasisSend).
+ * The backend is the only place that applies send results to a draft; a window writes only its
+ * own edits, against the sends it saw:
+ * - A send the backend holds (pending) is retained: no write shows its text where the window
+ *   may hold a stale copy (it did not see the send yet, undid it after a lost reply, or had it
+ *   in unsaved text when it saw it). Text typed after the window saw the send is the user's.
+ * - For a basis send settled since, the stored state wins, for its text and its attachments
+ *   alike: returned (not accepted) and still in the visible text, it stays (put in front when
+ *   the write lacks it: the window had it hidden); accepted, or edited away since by someone
+ *   else, it stays out: a stale copy in the window's unsaved text (`inUnsavedText`) is taken
+ *   out. Text the window typed after it saw the send is the user's and stays, even when it
+ *   matches (e.g. editing the sent message).
+ * - A send this window undid (`undone`) and the backend no longer holds is the window's own
+ *   content again: its write speaks for it.
+ * Every other part of the write is the window's, as before.
+ */
+function mergeWrite(
+  current: StoredDraft,
+  write: { text?: string; attachments?: readonly DraftAttachment[] },
+  basis: readonly BasisSend[],
+  accepted: ReadonlySet<string>
+): { visibleText: string; attachments: DraftAttachment[] } {
+  const pending = new Set(current.pendingSends.map(({ sendId }) => sendId));
+  const settled = basis.filter((send) => send.undone !== true && !pending.has(send.sendId));
+  const theirs = visibleTextOf(current);
+  let visibleText = theirs;
+  if (write.text !== undefined) {
+    let text = write.text;
+    const seen = new Map(basis.map((send) => [send.sendId, send]));
+    for (const send of current.pendingSends) {
+      // Only a copy the window may hold unknowingly: it did not see the send, undid it, or had
+      // it in unsaved text then. Text typed after it saw the send is the user's.
+      const basisSend = seen.get(send.sendId);
+      if (
+        basisSend === undefined ||
+        basisSend.undone === true ||
+        basisSend.inUnsavedText === true
+      ) {
+        text = removeDraftBlock(text, send.text);
+      }
+    }
+    const restored: string[] = [];
+    // Each returned send matches its own block (in the stored text, and in the write): repeated
+    // texts count one by one.
+    let unmatched = text;
+    let storedLeft = theirs;
+    for (const send of settled) {
+      const stays =
+        !accepted.has(send.sendId) &&
+        send.text.trim().length > 0 &&
+        hasDraftBlock(storedLeft, send.text);
+      if (stays) storedLeft = removeDraftBlock(storedLeft, send.text);
+      if (!stays) {
+        if (send.inUnsavedText === true) {
+          text = removeDraftBlock(text, send.text);
+          unmatched = removeDraftBlock(unmatched, send.text);
+        }
+      } else if (hasDraftBlock(unmatched, send.text)) {
+        unmatched = removeDraftBlock(unmatched, send.text);
+      } else {
+        restored.push(send.text);
+      }
+    }
+    visibleText = joinDraftText(...restored, text);
+  }
+  if (write.attachments === undefined) return { visibleText, attachments: current.attachments };
+  const storedWins = new Set([
+    ...retainedAttachmentIds(current.pendingSends),
+    ...basis.filter((send) => send.undone !== true).flatMap((send) => send.attachmentIds),
+  ]);
+  return {
+    visibleText,
+    attachments: [
+      ...current.attachments.filter(({ id }) => storedWins.has(id)),
+      ...write.attachments.filter(({ id }) => !storedWins.has(id)),
+    ],
+  };
+}
+
+/** The draft with one pending send replaced (a receiver move). */
+function withPendingSend(current: StoredDraft, updated: PendingSend): StoredDraft {
+  return {
+    ...current,
+    pendingSends: current.pendingSends.map((send) =>
+      send.sendId === updated.sendId ? updated : send
+    ),
+  };
+}
+
+/** A write's reply: the stored draft's view (DraftWriteOutputSchema). */
+function writeOutput(scope: DraftScope, draft: StoredDraft, revision: number): DraftWriteOutput {
+  const { scope: _scope, ...view } = summarizeDraft(
+    scope,
+    viewOf(draft),
+    revision,
+    draft.pendingSends
+  );
+  return view;
+}
+
+/** Build the stored form: retained attachments first (entry order), then the visible ones. */
+function storedDraftFrom(
+  visibleText: string,
+  attachments: readonly DraftAttachment[],
+  pendingSends: PendingSend[]
+): StoredDraft {
+  const byId = new Map(attachments.map((attachment) => [attachment.id, attachment]));
+  const retainedIds = [...new Set(pendingSends.flatMap((send) => send.attachmentIds))];
+  const retained = retainedIds.map((id) => {
+    const attachment = byId.get(id);
+    assert(attachment !== undefined, `pending send attachment ${id} is in the draft`);
+    return attachment;
+  });
+  const retainedSet = new Set(retainedIds);
+  const seen = new Set<string>();
+  const visible = attachments.filter((attachment) => {
+    if (retainedSet.has(attachment.id) || seen.has(attachment.id)) return false;
+    seen.add(attachment.id);
+    return true;
+  });
+  return {
+    text: buildLegacyDraftText(pendingSends, visibleText),
+    attachments: [...retained, ...visible],
+    pendingSends,
+  };
+}
+
+/** Key-order independent JSON, to compare a repeated beginSend with the stored entry. */
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record)
+    .filter((key) => record[key] !== undefined)
+    .sort();
+  return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`).join(",")}}`;
+}
+
+/** The same send: everything but the receiver (a retry rewrites that). */
+function isSamePendingSend(a: PendingSend, b: PendingSend): boolean {
+  const { receiverId: _a, ...restA } = a;
+  const { receiverId: _b, ...restB } = b;
+  return canonicalJson(restA) === canonicalJson(restB);
+}
+
+/**
+ * The pending sends of a parsed draft file, or none when they do not fit its legacy fields: an
+ * older build (or another writer) rewrote the text or dropped an attachment, so the bookkeeping
+ * no longer describes the file. Dropping it leaves everything visible: no loss.
+ */
+function validPendingSends(raw: unknown, draft: Draft, filePath: string): PendingSend[] {
+  if (raw === undefined) return [];
+  const drop = (reason: string) => {
+    log.warn(`Dropping pending sends of draft file ${filePath}: ${reason}`);
+    return [];
+  };
+  if (!Array.isArray(raw)) return drop("malformed");
+  // A malformed entry is dropped on its own (its text and attachments stay visible); the rest
+  // stays only if it still fits the legacy fields (checked below).
+  const sends: PendingSend[] = [];
+  for (const entry of raw) {
+    const parsed = PendingSendSchema.safeParse(entry);
+    if (parsed.success) sends.push(parsed.data);
+    else log.warn(`Dropping a malformed pending send of draft file ${filePath}`);
+  }
+  if (new Set(sends.map((send) => send.sendId)).size !== sends.length) return drop("repeated id");
+  const attachmentIds = sends.flatMap((send) => send.attachmentIds);
+  const present = new Set(draft.attachments.map((attachment) => attachment.id));
+  if (
+    new Set(attachmentIds).size !== attachmentIds.length ||
+    attachmentIds.some((id) => !present.has(id))
+  ) {
+    return drop("attachments changed");
+  }
+  if (splitLegacyDraftText(draft.text, sends) === null) return drop("text changed");
+  return sends;
+}
+
+/** Thrown for a scope whose id would resolve outside its storage dir. */
+class InvalidDraftScopeError extends Error {}
+
+/** Short, filesystem-safe directory name for a project's creation drafts. */
+function projectDraftsDirName(projectPath: string): string {
+  return createHash("sha256").update(projectPath).digest("hex").slice(0, 16);
+}
+
+export class DraftService extends EventEmitter {
+  static readonly CHANGE_EVENT = "change";
+
+  private readonly config: Config;
+  private readonly creationRoot: string;
+  /**
+   * In-memory per-scope revision, bumped on every persisted change. Scopes start at the process
+   * start time, so a restarted backend does not regress below the previous process's revisions
+   * in practice (writes are far rarer than one per millisecond).
+   */
+  private readonly revisions = new Map<string, number>();
+  private readonly initialRevision = Date.now();
+  private listRevision = this.initialRevision;
+  /**
+   * Metadata (text + attachment metadata, no payloads) of every draft, so bulk hydration does not
+   * re-read multi-MB files. Filled lazily by the first list(); writes keep it current.
+   */
+  private readonly index = new Map<string, IndexEntry>();
+  private indexLoad: Promise<void> | null = null;
+  /** Keys written while a scan runs: the scan must not overwrite them with what it read. */
+  private scanTouched: Set<string> | null = null;
+
+  private readonly listFile: string;
+
+  constructor(config: Config) {
+    super();
+    this.config = config;
+    this.creationRoot = path.join(config.rootDir, CREATION_DRAFTS_DIR_NAME);
+    this.listFile = path.join(this.creationRoot, LIST_FILE_NAME);
+  }
+
+  /**
+   * The creation draft list, read from disk every time: it is small, and a sibling backend on the
+   * same root may have changed it (no lock: writes are atomic renames).
+   */
+  async getList(options?: { strict?: boolean }): Promise<DraftList> {
+    // Revision BEFORE the file, as in `get`: never old entries labelled with a newer revision
+    // (the renderer drops list events that are not newer than its snapshot).
+    const revision = this.listRevision;
+    const { entries, state } = await this.readListFile();
+    // Strict readers (the renderer's storage GC) must never mistake a damaged list for the truth.
+    if (options?.strict === true && state === "damaged") {
+      throw new Error(`Creation draft list ${this.listFile} is damaged`);
+    }
+    return { entries: entries.map(toApiEntry), revision };
+  }
+
+  /**
+   * List a creation draft, or update a listed draft's sub-project (its createdAt is kept). Skipped
+   * for a project without an owner (like `update`) and for the default draft, which is never
+   * listed. A synthesized row is replaced by the put entry. Returns the list revision.
+   */
+  async putListEntry(entry: DraftListEntry): Promise<{ revision: number }> {
+    assert(DRAFT_ID_PATTERN.test(entry.draftId), "putListEntry requires a valid draftId");
+    const scope: CreationScope = { kind: "creation", ...entry };
+    if (entry.draftId === DEFAULT_CREATION_DRAFT_ID) return { revision: this.listRevision };
+    // Under the project's drafts dir lock too: a project removal's cleanup holds it until it has
+    // delisted the project, so a row put after a re-registration is not delisted with the old ones.
+    const revision = await this.withWriteLock(scope, () =>
+      this.mutateList(async (entries) => {
+        if (!(await this.hasOwner(scope))) return null;
+        const index = entries.findIndex((listed) => isSameListEntry(listed, entry));
+        if (index === -1) return [...entries, toApiEntry(entry)];
+        const listed = entries[index];
+        const next = [...entries];
+        if (listed.synthesized === true) {
+          next[index] = toApiEntry(entry);
+        } else {
+          if (listed.subProjectPath === entry.subProjectPath) return null;
+          next[index] = { ...listed, subProjectPath: entry.subProjectPath };
+        }
+        return next;
+      })
+    );
+    return { revision };
+  }
+
+  /**
+   * One-way import of a renderer's legacy localStorage list: adds only entries the list lacks or
+   * holds as synthesized rows (another origin may have imported or edited them already) and skips
+   * unowned projects. The first import (no list.json yet) also lists every non-empty creation
+   * draft body without an entry: the legacy list dropped newer entries once it outgrew its
+   * localStorage budget (#5225), leaving their bodies unreachable. Returns the list revision.
+   */
+  async importLegacyList(legacy: DraftListEntry[]): Promise<{ revision: number }> {
+    // The relisting below needs the index; its first scan reads every draft file, so it runs
+    // before the locks. Under the entries' project dir locks, as putListEntry.
+    await this.ensureIndex();
+    const projectDirs = legacy.map((entry) => this.projectDraftsDir(entry.projectPath));
+    const revision = await withTargetMutationLocks(this.config.rootDir, projectDirs, () =>
+      this.mutateList(async (entries, exists) => {
+        const configured = this.configuredProjectDirNames();
+        const next = [...entries];
+        let changed = !exists;
+        for (const entry of legacy) {
+          const owned =
+            entry.projectPath === SCRATCH_PROJECT_CONFIG_KEY ||
+            configured.has(projectDraftsDirName(entry.projectPath));
+          if (!owned || entry.draftId === DEFAULT_CREATION_DRAFT_ID) continue;
+          const index = next.findIndex((listed) => isSameListEntry(listed, entry));
+          if (index !== -1 && next[index].synthesized !== true) continue;
+          // A synthesized row lacks the legacy row's sub-project and createdAt.
+          if (index === -1) next.push(toApiEntry(entry));
+          else next[index] = toApiEntry(entry);
+          changed = true;
+        }
+        // Every import also lists owned bodies without a row: origins migrate at different times,
+        // and an origin's legacy bodies can be imported after another origin created the list.
+        const unlisted = await this.findUnlistedCreationDrafts(next);
+        if (unlisted.length > 0) changed = true;
+        return changed ? [...next, ...unlisted] : null;
+      })
+    );
+    return { revision };
+  }
+
+  /** Every draft as metadata (no attachment payloads). */
+  async list(): Promise<DraftSummary[]> {
+    await this.ensureIndex();
+    const summaries: DraftSummary[] = [];
+    for (const [key, entry] of [...this.index]) {
+      // Session dirs are deleted by workspace removal without telling this service; drop entries
+      // whose file is gone so removed workspaces do not linger in hydration.
+      try {
+        await fs.access(entry.filePath);
+      } catch (error) {
+        if (hasErrorCode(error, "ENOENT") && this.index.get(key) === entry) {
+          this.index.delete(key);
+          continue;
+        }
+      }
+      summaries.push(entry.summary);
+    }
+    return summaries;
+  }
+
+  /** Full draft including attachment payloads; empty for a scope without a draft. */
+  async get(scope: DraftScope): Promise<DraftGetOutput> {
+    const key = draftScopeKey(scope);
+    // Revision BEFORE the file: a write landing in between leaves content newer than its
+    // revision (harmless), never an old file labelled with the new write's revision.
+    const revision = this.getRevision(key);
+    // No lock: writes are atomic renames, so a read sees either the old or the new file.
+    const draft = (await this.load(scope)) ?? emptyStoredDraft();
+    return {
+      ...viewOf(draft),
+      ...(draft.pendingSends.length > 0 ? { pendingSends: draft.pendingSends } : {}),
+      revision,
+    };
+  }
+
+  /**
+   * Partial update: omitted fields keep their stored value. A draft that ends up empty is
+   * deleted. A write for a scope without an owner (unregistered workspace, unconfigured project)
+   * is skipped and returns the current revision.
+   */
+  async update(input: DraftUpdateInput, acceptance?: SendAcceptance): Promise<DraftWriteOutput> {
+    const { scope } = input;
+    const filePath = this.filePathFor(scope);
+    const basis = input.basisSends ?? [];
+    const accepted = await this.acceptedBasisSends(scope, basis, acceptance);
+    return this.withWriteLock(scope, async () => {
+      const current = (await this.load(scope)) ?? emptyStoredDraft();
+      // Clients write the visible part; what pending sends retain stays (only their resolution
+      // removes it), and what happened to the sends the client wrote against is merged here.
+      const merged = mergeWrite(current, input, basis, accepted);
+      const next = storedDraftFrom(merged.visibleText, merged.attachments, current.pendingSends);
+      const bytes = draftJsonBytes(next);
+      if (bytes > MAX_DRAFT_JSON_BYTES) {
+        throw new Error(draftTooLargeMessage(bytes));
+      }
+      if (!(await this.hasOwner(scope))) {
+        return writeOutput(scope, current, this.getRevision(draftScopeKey(scope)));
+      }
+      return writeOutput(scope, next, await this.persist(scope, filePath, next));
+    });
+  }
+
+  /**
+   * The basis sends history holds a row for. Asked only when one has left the stored draft (it
+   * was settled after the writer's view): the lookup reads history. A basis send settled after
+   * this read counts as not accepted, which is safe: its text is merged back only while the
+   * visible text holds it, and an accepted send's text never comes back there. A failed lookup
+   * counts none as accepted (a visible duplicate beats a loss).
+   */
+  private async acceptedBasisSends(
+    scope: DraftScope,
+    basis: readonly BasisSend[],
+    acceptance: SendAcceptance | undefined
+  ): Promise<ReadonlySet<string>> {
+    if (scope.kind !== "workspace" || acceptance === undefined || basis.length === 0) {
+      return new Set();
+    }
+    try {
+      const current = await this.load(scope);
+      const pending = new Set(current?.pendingSends.map(({ sendId }) => sendId) ?? []);
+      const settled = basis
+        .filter(({ sendId }) => !pending.has(sendId))
+        .map(({ sendId }) => sendId);
+      if (settled.length === 0) return new Set();
+      return await acceptance.acceptedSendIds(scope.workspaceId, settled);
+    } catch (error) {
+      log.warn("Draft write: accepted-send lookup failed; merging as not accepted", { error });
+      return new Set();
+    }
+  }
+
+  /**
+   * Delete a draft; a creation draft is also delisted (after its body, see the class comment).
+   * No owner check: removing data is always allowed.
+   */
+  async delete(scope: DraftScope): Promise<{ revision: number }> {
+    const filePath = this.filePathFor(scope);
+    return this.withWriteLock(scope, async () => {
+      const revision = await this.persist(scope, filePath, emptyStoredDraft());
+      // Delisted under the body lock too (body lock, then list lock; nothing takes them in the
+      // other order), so no write can recreate the body between the two steps.
+      if (scope.kind === "creation") {
+        await this.mutateList((entries) => {
+          const next = entries.filter((listed) => !isSameListEntry(listed, scope));
+          return next.length === entries.length ? null : next;
+        });
+      }
+      return { revision };
+    });
+  }
+
+  /**
+   * Non-clobbering one-way migration of a legacy localStorage draft: stored only when the backend
+   * has no draft for the scope. localStorage is per origin (desktop app vs browser tab) while this
+   * store is shared, so another origin may already have imported (or since edited) this scope.
+   */
+  async importLegacy(input: DraftUpdateInput): Promise<DraftImportLegacyOutput> {
+    const { scope } = input;
+    let filePath: string;
+    try {
+      filePath = this.filePathFor(scope);
+    } catch (error) {
+      if (error instanceof InvalidDraftScopeError) {
+        return { result: "orphaned", revision: this.initialRevision };
+      }
+      throw error;
+    }
+    // Sanitize with the file loader's rules: the client drops malformed entries too, but this is
+    // untrusted input and must never write a file the loader would reject.
+    const legacy = sanitizeDraft({
+      text: input.text ?? "",
+      attachments: input.attachments ?? [],
+    }).draft;
+    const bytes = draftJsonBytes(legacy);
+    if (bytes > MAX_DRAFT_JSON_BYTES) {
+      throw new Error(draftTooLargeMessage(bytes));
+    }
+    return this.withWriteLock(scope, async () => {
+      const key = draftScopeKey(scope);
+      const current = await this.load(scope);
+      if (current !== null && !isStoredDraftEmpty(current)) {
+        return { result: "present", revision: this.getRevision(key) };
+      }
+      if (!(await this.hasOwner(scope))) {
+        return { result: "orphaned", revision: this.getRevision(key) };
+      }
+      const stored: StoredDraft = { ...legacy, pendingSends: [] };
+      if (isStoredDraftEmpty(stored)) {
+        return { result: "applied", revision: this.getRevision(key) };
+      }
+      return { result: "applied", revision: await this.persist(scope, filePath, stored) };
+    });
+  }
+
+  /**
+   * Idempotent sends: the one draft write before a composer send. The sent text leaves the visible
+   * text (removeSentText, computed here so another window's newer visible edits stay) and is
+   * retained in the legacy text with the attachments; the entry keeps the exact request for
+   * retries. Idempotent by send id: a repeat with the same send changes nothing but its receiver; a
+   * different payload under a known id is refused.
+   */
+  async beginSend(
+    input: DraftBeginSendInput,
+    acceptance?: SendAcceptance
+  ): Promise<DraftWriteOutput> {
+    const { scope, pendingSend } = input;
+    const filePath = this.filePathFor(scope);
+    const basis = input.basisSends ?? [];
+    const accepted = await this.acceptedBasisSends(scope, basis, acceptance);
+    return this.withWriteLock(scope, async () => {
+      const key = draftScopeKey(scope);
+      const current = (await this.load(scope)) ?? emptyStoredDraft();
+      const existing = current.pendingSends.find(({ sendId }) => sendId === pendingSend.sendId);
+      if (existing) {
+        if (!isSamePendingSend(existing, pendingSend)) {
+          throw new Error("This send id is already pending for a different message");
+        }
+        if (existing.receiverId === pendingSend.receiverId) {
+          return writeOutput(scope, current, this.getRevision(key));
+        }
+        const moved = withPendingSend(current, pendingSend);
+        return writeOutput(scope, moved, await this.persist(scope, filePath, moved));
+      }
+      // Each attachment belongs to one send: a second send cannot retain it again.
+      const retained = retainedAttachmentIds(current.pendingSends);
+      if (pendingSend.attachmentIds.some((id) => retained.has(id))) {
+        throw new Error("A pending send already holds one of these attachments");
+      }
+      // The sender's payloads win for the ids it sends: a client may replace an attachment under
+      // the same id (a pending file that became staged) before saving it.
+      const taken = new Set(pendingSend.attachmentIds);
+      const attachments = current.attachments.map((attachment) =>
+        taken.has(attachment.id)
+          ? (input.attachments.find(({ id }) => id === attachment.id) ?? attachment)
+          : attachment
+      );
+      for (const id of pendingSend.attachmentIds) {
+        if (attachments.some((attachment) => attachment.id === id)) continue;
+        const payload = input.attachments.find((attachment) => attachment.id === id);
+        if (payload === undefined) throw new Error(`Pending send attachment ${id} has no payload`);
+        attachments.push(payload);
+      }
+      const merged = mergeWrite(current, { text: input.text }, basis, accepted);
+      const next = storedDraftFrom(
+        removeSentText(merged.visibleText, pendingSend.text),
+        attachments,
+        [...current.pendingSends, pendingSend]
+      );
+      const bytes = draftJsonBytes(next);
+      if (bytes > MAX_DRAFT_JSON_BYTES) throw new Error(draftTooLargeMessage(bytes));
+      if (!(await this.hasOwner(scope))) {
+        throw new Error(`Draft write refused: workspace ${scope.workspaceId} is not registered`);
+      }
+      return writeOutput(scope, next, await this.persist(scope, filePath, next));
+    });
+  }
+
+  /**
+   * A retry's receiver rewrite (the draft write before the re-send). Never recreates an entry that
+   * was resolved meanwhile: `present` is false and the retry stops.
+   */
+  async setSendReceiver(
+    input: DraftSetSendReceiverInput
+  ): Promise<{ revision: number; present: boolean }> {
+    const { scope } = input;
+    const filePath = this.filePathFor(scope);
+    return this.withWriteLock(scope, async () => {
+      const key = draftScopeKey(scope);
+      const current = await this.load(scope);
+      const existing = current?.pendingSends.find(({ sendId }) => sendId === input.sendId);
+      if (current == null || existing === undefined) {
+        return { revision: this.getRevision(key), present: false };
+      }
+      if (existing.receiverId === input.receiverId) {
+        return { revision: this.getRevision(key), present: true };
+      }
+      const moved = withPendingSend(current, { ...existing, receiverId: input.receiverId });
+      return { revision: await this.persist(scope, filePath, moved), present: true };
+    });
+  }
+
+  /** The pending sends of a workspace draft (no lock: resolution rechecks under it). */
+  async getPendingSends(scope: Extract<DraftScope, { kind: "workspace" }>): Promise<PendingSend[]> {
+    return (await this.load(scope))?.pendingSends ?? [];
+  }
+
+  /**
+   * Apply the receiver's answers, under the draft lock. An answer applies only while its entry
+   * still exists and still names the receiver that was asked: another window may have resolved it,
+   * or a retry may have sent it to another receiver since. Accepted: the entry, its retained text
+   * and its attachments go. Not accepted: the entry goes and its text and attachments become
+   * visible again (retained texts first, in entry order). Pending or unknown: kept. Never infers
+   * acceptance from anything but the answer.
+   */
+  async applySendStatuses(
+    scope: Extract<DraftScope, { kind: "workspace" }>,
+    answers: ReadonlyArray<{ sendId: string; receiverId: string; status: string }>
+  ): Promise<void> {
+    const filePath = this.filePathFor(scope);
+    await this.withWriteLock(scope, async () => {
+      const current = await this.load(scope);
+      if (current === null) return;
+      const resolved: Array<{ sendId: string; status: "accepted" | "not-accepted" }> = [];
+      for (const entry of current.pendingSends) {
+        const answer = answers.find(
+          ({ sendId, receiverId }) => sendId === entry.sendId && receiverId === entry.receiverId
+        );
+        if (answer?.status === "accepted" || answer?.status === "not-accepted") {
+          resolved.push({ sendId: entry.sendId, status: answer.status });
+        }
+      }
+      if (resolved.length === 0) return;
+      const statusOf = (send: PendingSend) =>
+        resolved.find(({ sendId }) => sendId === send.sendId)?.status;
+      const acceptedIds = new Set(
+        current.pendingSends
+          .filter((send) => statusOf(send) === "accepted")
+          .flatMap((send) => send.attachmentIds)
+      );
+      const restoredTexts = current.pendingSends
+        .filter((send) => statusOf(send) === "not-accepted")
+        .map((send) => send.text);
+      const next = storedDraftFrom(
+        joinDraftText(...restoredTexts, visibleTextOf(current)),
+        current.attachments.filter(({ id }) => !acceptedIds.has(id)),
+        current.pendingSends.filter((send) => statusOf(send) === undefined)
+      );
+      await this.persist(scope, filePath, next);
+    });
+  }
+
+  /**
+   * Copy a workspace draft into a fork's session dir. Staged attachments point at files in the
+   * source worktree, which the fork does not share, so they are dropped. Runs while the fork is
+   * being set up, before the new workspace is registered, so no owner check applies.
+   */
+  async copyWorkspaceDraftForFork(
+    sourceWorkspaceId: string,
+    newWorkspaceId: string
+  ): Promise<void> {
+    const source: WorkspaceScope = { kind: "workspace", workspaceId: sourceWorkspaceId };
+    const target: WorkspaceScope = { kind: "workspace", workspaceId: newWorkspaceId };
+    const draft = await this.load(source);
+    if (draft === null) return;
+    // Only the visible part: the pending sends went to the source workspace (and its history,
+    // which the fork may share), so the fork must not resolve or show them again.
+    const retained = retainedAttachmentIds(draft.pendingSends);
+    const forked = storedDraftFrom(
+      visibleTextOf(draft),
+      stripStagedDraftAttachments(draft.attachments).filter(({ id }) => !retained.has(id)),
+      []
+    );
+    if (isStoredDraftEmpty(forked)) return;
+    const filePath = this.filePathFor(target);
+    await this.withWriteLock(target, () => this.persist(target, filePath, forked));
+  }
+
+  /**
+   * Delete every creation draft of a removed project (server-side, not only in a renderer). The
+   * whole hashed dir goes, so unparseable files (which name no project) do not outlive it.
+   * Best-effort: the startup GC deletes what a failure leaves. Returns the ids of the drafts it
+   * deleted, listed or not, except the default draft (renderers clean up their localStorage keys).
+   */
+  async deleteProjectDrafts(projectPath: string): Promise<string[]> {
+    assert(projectPath.length > 0, "DraftService.deleteProjectDrafts requires a projectPath");
+    const dirName = projectDraftsDirName(projectPath);
+    const projectDir = path.join(this.creationRoot, dirName);
+    return withTargetMutationLock(this.config.rootDir, projectDir, async () => {
+      // The same recheck as the GC: this runs after the removal's config write, so the path may
+      // be registered again (with a new creation draft) by now; its drafts are owned again.
+      if (this.configuredProjectDirNames().has(dirName)) return [];
+      // Bodies without a row count too: a list put that failed before an exit leaves one.
+      const deletedBodies: CreationScope[] = [];
+      let delisted: string[] = [];
+      try {
+        await this.clearProjectDir(projectDir, deletedBodies);
+        // Delisted under the same lock (dir lock, then list lock, as in `delete`): once the
+        // bodies are gone the rows go too, even if the path is registered again right after.
+        await this.mutateList((entries) => {
+          delisted = entries
+            .filter((entry) => entry.projectPath === projectPath)
+            .map((entry) => entry.draftId);
+          return delisted.length === 0
+            ? null
+            : entries.filter((entry) => entry.projectPath !== projectPath);
+        });
+      } catch (error) {
+        // Drafts deleted before the failure are still reported.
+        log.warn(`Failed to delete the creation drafts of removed project ${projectPath}`, {
+          error,
+        });
+      }
+      const bodyIds = deletedBodies
+        .map((scope) => scope.draftId)
+        .filter((draftId) => draftId !== DEFAULT_CREATION_DRAFT_ID);
+      return [...new Set([...bodyIds, ...delisted])];
+    });
+  }
+
+  /**
+   * Startup GC: delete the drafts dirs of projects that are no longer configured (e.g. removed
+   * while this build was not running), including files too broken to name their project. The
+   * scratch pseudo-project is always kept: it is only added to the config when its first workspace
+   * is created. Best-effort; never throws.
+   */
+  async collectOrphanedCreationDrafts(): Promise<void> {
+    try {
+      for (const dirName of await readDirNames(this.creationRoot, { dirsOnly: true })) {
+        if (this.configuredProjectDirNames().has(dirName)) continue;
+        const projectDir = path.join(this.creationRoot, dirName);
+        try {
+          await withTargetMutationLock(this.config.rootDir, projectDir, async () => {
+            // Re-check under the lock creation-draft writes take: a project re-added since the
+            // check above (e.g. while an earlier dir was being deleted) keeps its new drafts.
+            if (this.configuredProjectDirNames().has(dirName)) return;
+            await this.clearProjectDir(projectDir);
+          });
+        } catch (error) {
+          // One dir that cannot be cleared must not keep the others (or the list) uncollected.
+          log.warn(`Failed to collect orphaned creation drafts in ${projectDir}`, { error });
+        }
+      }
+    } catch (error) {
+      log.warn("Failed to collect orphaned creation drafts", { error });
+    }
+    try {
+      // Empty listed drafts have no body, hence no dir: collect their entries separately.
+      await this.removeUnownedListEntries();
+    } catch (error) {
+      log.warn("Failed to delist orphaned creation drafts", { error });
+    }
+  }
+
+  /** The event a new subscription starts with. */
+  async getSnapshotEvent(): Promise<Extract<DraftEvent, { type: "snapshot" }>> {
+    try {
+      // A body whose list put failed before an exit has no row, and nothing else relists it while
+      // list.json is healthy. Every (re)subscription (backend or renderer restart) relists such
+      // bodies as synthesized rows. Best-effort: it must never block the snapshot.
+      // The first index scan reads every draft file, so it runs before the list lock.
+      await this.ensureIndex();
+      await this.mutateList(async (entries) => {
+        const unlisted = await this.findUnlistedCreationDrafts(entries);
+        return unlisted.length > 0 ? [...entries, ...unlisted] : null;
+      });
+    } catch (error) {
+      log.warn("Failed to relist unlisted creation drafts", { error });
+    }
+    let list: DraftList;
+    try {
+      list = await this.getList();
+    } catch (error) {
+      // An unreadable list file (EACCES, EISDIR...) must not block every draft body: the list
+      // shows empty until it is readable again (writes to it keep failing and are retried).
+      log.warn("Failed to read the creation draft list", { error });
+      list = { entries: [], revision: this.listRevision };
+    }
+    return { type: "snapshot", drafts: await this.list(), list };
+  }
+
+  private getRevision(key: string): number {
+    return this.revisions.get(key) ?? this.initialRevision;
+  }
+
+  private filePathFor(scope: DraftScope): string {
+    if (scope.kind === "workspace") {
+      assert(scope.workspaceId.length > 0, "Draft scope requires a workspaceId");
+      const sessionDir = path.join(this.config.sessionsDir, scope.workspaceId);
+      // IDs arrive over the API and must not reach other paths (e.g. `../x`).
+      if (path.dirname(path.resolve(sessionDir)) !== path.resolve(this.config.sessionsDir)) {
+        throw new InvalidDraftScopeError(
+          `Invalid workspace id for a draft: ${JSON.stringify(scope.workspaceId)}`
+        );
+      }
+      return path.join(sessionDir, DRAFT_FILE_NAME);
+    }
+    // The schema validates draftId too; re-check because the service is also called directly.
+    if (!DRAFT_ID_PATTERN.test(scope.draftId) || scope.projectPath.length === 0) {
+      throw new InvalidDraftScopeError(`Invalid creation draft scope: ${JSON.stringify(scope)}`);
+    }
+    return path.join(
+      this.creationRoot,
+      projectDraftsDirName(scope.projectPath),
+      `${scope.draftId}.json`
+    );
+  }
+
+  /**
+   * Missing file: null. Unparseable or malformed: self-heal (empty or sanitized, with a warning).
+   * Any other read failure (EACCES, EIO, EISDIR...) throws: treating it as empty would let the
+   * next write replace data that exists but could not be read, while a rejection makes the
+   * client keep its change and retry.
+   */
+  private async load(scope: DraftScope): Promise<StoredDraft | null> {
+    const filePath = this.filePathFor(scope);
+    let text: string;
+    try {
+      text = await fs.readFile(filePath, "utf-8");
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) return null;
+      throw error;
+    }
+    let raw: unknown;
+    try {
+      raw = JSON.parse(text);
+    } catch (error) {
+      log.warn(`Ignoring unparseable draft file ${filePath}`, { error });
+      return emptyStoredDraft();
+    }
+    if (
+      scope.kind === "creation" &&
+      (raw as { projectPath?: unknown } | null)?.projectPath !== scope.projectPath
+    ) {
+      // A hash collision (or a hand-moved file) belongs to another project: not this draft.
+      log.warn(`Ignoring creation draft file for another project ${filePath}`);
+      return null;
+    }
+    const { draft, droppedEntries } = sanitizeDraft(raw);
+    if (droppedEntries > 0) {
+      log.warn(`Dropped malformed entries from draft file ${filePath}`, { droppedEntries });
+    }
+    const pendingSends =
+      scope.kind === "workspace"
+        ? validPendingSends(
+            (raw as { pendingSends?: unknown } | null)?.pendingSends,
+            draft,
+            filePath
+          )
+        : [];
+    return { ...draft, pendingSends };
+  }
+
+  /**
+   * Serialize a read-modify-write per storage dir on the target mutation lock (in-process mutex +
+   * cross-process file lock). For workspace drafts it is the lock workspace removal holds while it
+   * publishes its tombstone and deletes the session dir (like ReviewState/DevTools writers).
+   */
+  private withWriteLock<T>(scope: DraftScope, fn: () => Promise<T>): Promise<T> {
+    return withTargetMutationLock(this.config.rootDir, path.dirname(this.filePathFor(scope)), fn);
+  }
+
+  /** A project's creation drafts dir, the key of its write lock. */
+  private projectDraftsDir(projectPath: string): string {
+    return path.join(this.creationRoot, projectDraftsDirName(projectPath));
+  }
+
+  /**
+   * Whether a write may create the draft. Refuses (throws) for a workspace being removed: the
+   * tombstone probe fails closed and a removal can roll back, so the client keeps its change and
+   * retries. Config reads are strict (an unreadable config throws) for the same reason; only a
+   * conclusive "not registered" returns false.
+   */
+  private async hasOwner(scope: DraftScope): Promise<boolean> {
+    if (scope.kind === "workspace") {
+      if (await isWorkspaceRemovalTombstoned(this.config.rootDir, scope.workspaceId)) {
+        throw new Error(`Draft write refused: workspace ${scope.workspaceId} is being removed`);
+      }
+      return this.config.findWorkspace(scope.workspaceId, { throwOnError: true }) != null;
+    }
+    if (scope.projectPath === SCRATCH_PROJECT_CONFIG_KEY) return true;
+    return this.config.loadConfigOrDefault({ throwOnError: true }).projects.has(scope.projectPath);
+  }
+
+  /**
+   * Write (or delete, for an empty draft) under withWriteLock, update the index and notify
+   * subscribers. Returns the new revision, or the current one when nothing changed.
+   */
+  private async persist(scope: DraftScope, filePath: string, draft: StoredDraft): Promise<number> {
+    const key = draftScopeKey(scope);
+    // A running scan skips keys written meanwhile (the write's entry is newer), so a key is marked
+    // only once its write landed: a failed write must not hide the draft still on disk.
+    if (isStoredDraftEmpty(draft)) {
+      let existed = true;
+      try {
+        await fs.unlink(filePath);
+      } catch (error) {
+        if (!hasErrorCode(error, "ENOENT")) throw error;
+        existed = false;
+      }
+      this.scanTouched?.add(key);
+      if (!existed && !this.index.has(key)) return this.getRevision(key);
+      const revision = this.bumpRevision(key);
+      this.index.delete(key);
+      const event: DraftEvent = { type: "deleted", scope, revision };
+      this.emit(DraftService.CHANGE_EVENT, event);
+      return revision;
+    }
+    const file =
+      scope.kind === "creation"
+        ? { version: DRAFT_FILE_VERSION, projectPath: scope.projectPath, draftId: scope.draftId }
+        : { version: DRAFT_FILE_VERSION };
+    const { pendingSends, ...legacy } = draft;
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await writeFileAtomic(
+      filePath,
+      JSON.stringify({ ...file, ...legacy, ...(pendingSends.length > 0 ? { pendingSends } : {}) })
+    );
+    this.scanTouched?.add(key);
+    const revision = this.bumpRevision(key);
+    const summary = summarizeDraft(scope, viewOf(draft), revision, pendingSends);
+    this.index.set(key, { summary, filePath });
+    const event: DraftEvent = { type: "changed", ...summary };
+    this.emit(DraftService.CHANGE_EVENT, event);
+    return revision;
+  }
+
+  /**
+   * "missing": no list.json yet. "damaged": unparseable, a malformed structure, dropped malformed
+   * entries or duplicate rows of one draft (the valid entries are kept, duplicates merged, with a
+   * warning); the next mutation rebuilds it (see mutateList). Other read failures throw, so a write
+   * never replaces a list it could not read.
+   */
+  private async readListFile(): Promise<{
+    entries: DraftListFileEntry[];
+    state: "ok" | "missing" | "damaged";
+    /** Written by a newer version: readable, but never rewritten by this one. */
+    newer: boolean;
+  }> {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(await fs.readFile(this.listFile, "utf-8"));
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) return { entries: [], state: "missing", newer: false };
+      if (!(error instanceof SyntaxError)) throw error;
+      log.warn(`Rebuilding unparseable creation draft list ${this.listFile}`, { error });
+      return { entries: [], state: "damaged", newer: false };
+    }
+    const file = (raw ?? {}) as { version?: unknown; entries?: unknown };
+    const newer = typeof file.version === "number" && file.version > LIST_FILE_VERSION;
+    const rawEntries = file.entries;
+    // Duplicates keep the first position with the last values: what the renderer shows.
+    const byDraft = new Map<string, DraftListFileEntry>();
+    let valid = 0;
+    for (const rawEntry of Array.isArray(rawEntries) ? rawEntries : []) {
+      const parsed = DraftListFileEntrySchema.safeParse(rawEntry);
+      if (!parsed.success) continue;
+      valid++;
+      byDraft.set(draftScopeKey({ kind: "creation", ...parsed.data }), parsed.data);
+    }
+    const entries = [...byDraft.values()];
+    // A newer version may give duplicates a meaning; only this version's duplicates are damage.
+    const intact =
+      Array.isArray(rawEntries) &&
+      valid === rawEntries.length &&
+      (newer || entries.length === valid);
+    if (!intact && !newer) log.warn(`Rebuilding malformed creation draft list ${this.listFile}`);
+    return { entries, state: intact ? "ok" : "damaged", newer };
+  }
+
+  /**
+   * Read-modify-write list.json under its own lock (see the class comment for the lock order).
+   * `change` returns the new entries, or null for no change. Writing a missing list, and every
+   * mutation of a damaged one (even a no-op), also lists each owned, non-empty creation body
+   * without an entry (as synthesized rows, which the renderer's legacy import then replaces). A
+   * missing list is not created by a no-op. Returns the (new) list revision.
+   */
+  private mutateList(
+    change: (
+      entries: DraftListFileEntry[],
+      exists: boolean
+    ) => DraftListFileEntry[] | null | Promise<DraftListFileEntry[] | null>
+  ): Promise<number> {
+    return withTargetMutationLock(this.config.rootDir, this.listFile, async () => {
+      const { entries, state, newer } = await this.readListFile();
+      if (newer) {
+        // A downgrade: rewriting a newer version's file would silently drop or contradict its
+        // data. Refuse; clients keep their change and retry, and the next upgrade can write it.
+        throw new Error(`Creation draft list ${this.listFile} was written by a newer version`);
+      }
+      let next = await change(entries, state === "ok");
+      if (next === null && state !== "damaged") return this.listRevision;
+      next ??= entries;
+      if (state !== "ok") next = [...next, ...(await this.findUnlistedCreationDrafts(next))];
+      await fs.mkdir(this.creationRoot, { recursive: true });
+      await writeFileAtomic(
+        this.listFile,
+        JSON.stringify({ version: LIST_FILE_VERSION, entries: next })
+      );
+      this.listRevision++;
+      const event: DraftEvent = {
+        type: "list",
+        entries: next.map(toApiEntry),
+        revision: this.listRevision,
+      };
+      this.emit(DraftService.CHANGE_EVENT, event);
+      return this.listRevision;
+    });
+  }
+
+  /** Drop the entries of projects that are no longer configured (scratch is always owned). */
+  private async removeUnownedListEntries(): Promise<void> {
+    await this.mutateList((entries) => {
+      const owned = this.configuredProjectDirNames();
+      const next = entries.filter(
+        (entry) =>
+          entry.projectPath === SCRATCH_PROJECT_CONFIG_KEY ||
+          owned.has(projectDraftsDirName(entry.projectPath))
+      );
+      return next.length === entries.length ? null : next;
+    });
+  }
+
+  /**
+   * Non-empty creation draft bodies of owned projects without a list entry (never the default
+   * draft), oldest first.
+   */
+  private async findUnlistedCreationDrafts(
+    listed: DraftListFileEntry[]
+  ): Promise<DraftListFileEntry[]> {
+    await this.ensureIndex();
+    const owned = this.configuredProjectDirNames();
+    const found: DraftListFileEntry[] = [];
+    for (const { summary, filePath } of [...this.index.values()]) {
+      const scope = summary.scope;
+      if (scope.kind !== "creation" || scope.draftId === DEFAULT_CREATION_DRAFT_ID) continue;
+      if (!owned.has(projectDraftsDirName(scope.projectPath))) continue;
+      if (listed.some((entry) => isSameListEntry(entry, scope))) continue;
+      let createdAt: number;
+      try {
+        createdAt = (await fs.stat(filePath)).mtimeMs;
+      } catch (error) {
+        if (hasErrorCode(error, "ENOENT")) continue;
+        throw error;
+      }
+      found.push({
+        projectPath: scope.projectPath,
+        draftId: scope.draftId,
+        subProjectPath: null,
+        createdAt,
+        synthesized: true,
+      });
+    }
+    return found.sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  private bumpRevision(key: string): number {
+    const revision = this.getRevision(key) + 1;
+    this.revisions.set(key, revision);
+    return revision;
+  }
+
+  private ensureIndex(): Promise<void> {
+    this.indexLoad ??= this.scanIndex().catch((error: unknown) => {
+      // Retry on the next list instead of caching the failure.
+      this.indexLoad = null;
+      throw error;
+    });
+    return this.indexLoad;
+  }
+
+  /** Read every draft file once. Keys written meanwhile keep the write's (newer) entry. */
+  private async scanIndex(): Promise<void> {
+    const touched = new Set<string>();
+    this.scanTouched = touched;
+    try {
+      const found = new Map<string, IndexEntry>();
+      const add = (scope: DraftScope, filePath: string, draft: StoredDraft | null) => {
+        if (draft === null || isStoredDraftEmpty(draft)) return;
+        const key = draftScopeKey(scope);
+        found.set(key, {
+          summary: summarizeDraft(scope, viewOf(draft), this.getRevision(key), draft.pendingSends),
+          filePath,
+        });
+      };
+
+      for (const workspaceId of await readDirNames(this.config.sessionsDir, { dirsOnly: true })) {
+        const scope: WorkspaceScope = { kind: "workspace", workspaceId };
+        try {
+          add(scope, this.filePathFor(scope), await this.load(scope));
+        } catch (error) {
+          // One unreadable file must not hide every other draft; a write to it still fails.
+          log.warn(`Skipping unreadable draft for workspace ${workspaceId}`, { error });
+        }
+      }
+      for (const dirName of await readDirNames(this.creationRoot, { dirsOnly: true })) {
+        // One file at a time: only its metadata is kept, so near-limit payloads never pile up.
+        for await (const file of this.readCreationDraftFiles(
+          path.join(this.creationRoot, dirName)
+        )) {
+          add(file.scope, file.filePath, file.draft && { ...file.draft, pendingSends: [] });
+        }
+      }
+
+      for (const [key, entry] of found) {
+        if (!touched.has(key)) this.index.set(key, entry);
+      }
+    } finally {
+      this.scanTouched = null;
+    }
+  }
+
+  /**
+   * The well-formed creation draft files of one project dir, read one at a time (unreadable ones
+   * are skipped).
+   */
+  private async *readCreationDraftFiles(projectDir: string): AsyncGenerator<{
+    scope: CreationScope;
+    projectPath: string;
+    draftId: string;
+    filePath: string;
+    draft: Draft | null;
+  }> {
+    for (const name of await readDirNames(projectDir)) {
+      if (!name.endsWith(".json")) continue;
+      const filePath = path.join(projectDir, name);
+      let raw: unknown;
+      try {
+        raw = JSON.parse(await fs.readFile(filePath, "utf-8"));
+      } catch (error) {
+        log.warn(`Skipping unreadable creation draft file ${filePath}`, { error });
+        continue;
+      }
+      const record = raw as { projectPath?: unknown; draftId?: unknown } | null;
+      const projectPath = record?.projectPath;
+      const draftId = record?.draftId;
+      if (
+        typeof projectPath !== "string" ||
+        projectPath.length === 0 ||
+        typeof draftId !== "string" ||
+        `${draftId}.json` !== name ||
+        !DRAFT_ID_PATTERN.test(draftId) ||
+        projectDraftsDirName(projectPath) !== path.basename(projectDir)
+      ) {
+        log.warn(`Skipping malformed creation draft file ${filePath}`);
+        continue;
+      }
+      const { draft, droppedEntries } = sanitizeDraft(raw);
+      if (droppedEntries > 0) {
+        log.warn(`Dropped malformed entries from draft file ${filePath}`, { droppedEntries });
+      }
+      yield {
+        scope: { kind: "creation" as const, projectPath, draftId },
+        projectPath,
+        draftId,
+        filePath,
+        draft,
+      };
+    }
+  }
+
+  /** Hashed dir names of the configured projects plus scratch. */
+  private configuredProjectDirNames(): Set<string> {
+    // Strict: an unreadable config must never be mistaken for "no projects".
+    const projects = this.config.loadConfigOrDefault({ throwOnError: true }).projects;
+    const names = new Set([projectDraftsDirName(SCRATCH_PROJECT_CONFIG_KEY)]);
+    for (const projectPath of projects.keys()) names.add(projectDraftsDirName(projectPath));
+    return names;
+  }
+
+  /**
+   * Under the dir's write lock: delete its drafts (index entries and well-formed files, so
+   * subscribers see each deletion), then the whole dir with any unparseable or temp files.
+   * Adds each draft to `deleted` as soon as it is gone, so a later failure keeps the record.
+   */
+  private async clearProjectDir(projectDir: string, deleted: CreationScope[] = []): Promise<void> {
+    const scopes = new Map<string, CreationScope>();
+    for (const [key, entry] of this.index) {
+      const scope = entry.summary.scope;
+      if (scope.kind === "creation" && path.dirname(entry.filePath) === projectDir) {
+        scopes.set(key, scope);
+      }
+    }
+    for await (const file of this.readCreationDraftFiles(projectDir)) {
+      scopes.set(draftScopeKey(file.scope), file.scope);
+    }
+    for (const scope of scopes.values()) {
+      await this.persist(scope, this.filePathFor(scope), emptyStoredDraft());
+      deleted.push(scope);
+    }
+    await fs.rm(projectDir, { recursive: true, force: true });
+  }
+}
+
+/** A list row as the API returns it (never the file-only marker). */
+function toApiEntry(entry: DraftListFileEntry): DraftListEntry {
+  const { synthesized: _synthesized, ...apiEntry } = entry;
+  return apiEntry;
+}
+
+function isSameListEntry(
+  a: { projectPath: string; draftId: string },
+  b: { projectPath: string; draftId: string }
+): boolean {
+  return a.projectPath === b.projectPath && a.draftId === b.draftId;
+}
+
+/** Entry names of a directory; empty when it does not exist. */
+async function readDirNames(dir: string, options?: { dirsOnly: boolean }): Promise<string[]> {
+  try {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    return entries
+      .filter((entry) => options?.dirsOnly !== true || entry.isDirectory())
+      .map((entry) => entry.name);
+  } catch (error) {
+    if (hasErrorCode(error, "ENOENT")) return [];
+    throw error;
+  }
+}

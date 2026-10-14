@@ -1,12 +1,21 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
 
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  getAutoRoutingPick,
+  getPendingAiSelection,
+  markAiSelectionIntent,
+  setWorkspaceAgentPick,
+} from "@/browser/utils/aiSelectionIntent";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import {
   consumeWorkspaceModelChange,
+  setAutoRoutingChoice,
   setWorkspaceModelWithOrigin,
 } from "@/browser/utils/modelChange";
-import { getAutoModelRoutingKey } from "@/common/constants/storage";
+import { getProjectScopeId } from "@/common/constants/storage";
+import { getAutoRouting } from "@/browser/utils/workspaceAiSettingsSync";
 
 let workspaceCounter = 0;
 
@@ -17,6 +26,7 @@ function nextWorkspaceId(): string {
 
 describe("modelChange", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
     globalThis.localStorage = globalThis.window.localStorage;
@@ -24,25 +34,47 @@ describe("modelChange", () => {
   });
 
   afterEach(() => {
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-    globalThis.localStorage = undefined as unknown as Storage;
+    restoreDomGlobals();
   });
 
-  test("explicit user and agent picks turn Auto off; sync keeps it", () => {
+  test("an explicit user pick turns Auto off; sync keeps it", () => {
     const workspaceId = nextWorkspaceId();
-    const autoKey = getAutoModelRoutingKey(workspaceId);
 
-    updatePersistedState(autoKey, true);
+    setAutoRoutingChoice(workspaceId, "model", true);
     setWorkspaceModelWithOrigin(workspaceId, "openai:gpt-5.2-codex", "sync");
-    expect(readPersistedState(autoKey, false)).toBe(true);
+    expect(getAutoRouting(workspaceId, "model")).toBe(true);
 
-    setWorkspaceModelWithOrigin(workspaceId, "anthropic:claude-sonnet-4-5", "agent");
-    expect(readPersistedState(autoKey, false)).toBe(false);
+    setWorkspaceModelWithOrigin(workspaceId, "anthropic:claude-sonnet-4-5", "user");
+    expect(getAutoRouting(workspaceId, "model")).toBe(false);
+  });
 
-    updatePersistedState(autoKey, true);
+  test("a legacy workspace id that starts with __ records the pick as unsent", () => {
+    const legacyId = "__proj-main";
+    setWorkspaceModelWithOrigin(legacyId, "openai:gpt-5.2-codex", "user");
+    expect(getPendingAiSelection(legacyId, "exec", "model")).toBe("openai:gpt-5.2-codex");
+  });
+
+  test("a project without its own agent records Auto picks for the inherited global agent", () => {
+    getAppConfigStore().updateOptimistically({
+      userPreferences: { ai: { globalDefaults: { agentId: "plan" } } },
+    });
+    const scopeId = getProjectScopeId("/model-change-project");
+    setAutoRoutingChoice(scopeId, "model", true);
+    getAppConfigStore().updateOptimistically({ userPreferences: undefined });
+    expect(getAutoRoutingPick(scopeId, "plan", "model")).toBe(true);
+  });
+
+  test("records routing picks for the selected agent only", () => {
+    const workspaceId = nextWorkspaceId();
+    setWorkspaceAgentPick(workspaceId, "plan");
+
+    setAutoRoutingChoice(workspaceId, "thinkingLevel", true);
+    setAutoRoutingChoice(workspaceId, "model", true);
     setWorkspaceModelWithOrigin(workspaceId, "openai:gpt-5.2-codex", "user");
-    expect(readPersistedState(autoKey, false)).toBe(false);
+
+    expect(getAutoRouting(workspaceId, "thinkingLevel", "plan")).toBe(true);
+    expect(getAutoRouting(workspaceId, "model", "plan")).toBe(false);
+    expect(getAutoRouting(workspaceId, "thinkingLevel", "exec")).toBe(false);
   });
 
   test("does not record explicit entries for no-op model changes", () => {
@@ -50,7 +82,7 @@ describe("modelChange", () => {
     const model = "openai:gpt-5.2-codex";
     const otherModel = "anthropic:claude-sonnet-4-5";
 
-    setWorkspaceModelWithOrigin(workspaceId, model, "sync");
+    markAiSelectionIntent(workspaceId, "model", model);
 
     // Simulate user selecting the already-active model.
     setWorkspaceModelWithOrigin(workspaceId, model, "user");

@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, mock } from "bun:test";
 import { EventEmitter } from "events";
 import { UpdaterService, type UpdateStatus } from "./updater";
+import * as RealElectronUpdaterModule from "electron-updater";
+import * as RealUpdateInstallStateModule from "@/desktop/updateInstallState";
+import { restoreModulesAfterSuite } from "../../tests/ui/moduleMocks";
 
 // Create a mock autoUpdater that's an EventEmitter with the required methods
 const mockAutoUpdater = Object.assign(new EventEmitter(), {
@@ -19,6 +22,12 @@ const mockAutoUpdater = Object.assign(new EventEmitter(), {
 
 let mockUpdateInstallInProgress = false;
 
+// Restore the real modules after this suite so the stubs below cannot leak into later files
+// (updateInstallState.test.ts exercises the real install-state module).
+restoreModulesAfterSuite([
+  ["electron-updater", { ...RealElectronUpdaterModule }],
+  ["@/desktop/updateInstallState", { ...RealUpdateInstallStateModule }],
+]);
 // Mock electron-updater module
 void mock.module("electron-updater", () => ({
   autoUpdater: mockAutoUpdater,

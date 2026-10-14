@@ -500,7 +500,13 @@ async function queryAgentCostBreakdown(
     conn,
     `
     SELECT
-      COALESCE(agent_id, 'unknown') AS agent_id,
+      -- Headless rows (status, memory, dropped streams) run outside any agent turn: group them by
+      -- their source tool_name (headless:<source>) so they do not land in "unknown" (#5766).
+      COALESCE(
+        agent_id,
+        CASE WHEN tool_name LIKE 'headless:%' THEN tool_name END,
+        'unknown'
+      ) AS agent_id,
       COALESCE(SUM(total_cost_usd), 0) AS cost_usd,
       COALESCE(
         SUM(input_tokens + output_tokens + reasoning_tokens + cached_tokens + cache_create_tokens),

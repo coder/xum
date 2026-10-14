@@ -11,9 +11,9 @@ import type { ModelFallbacks } from "@/common/config/schemas/appConfigOnDisk";
 export const MODEL_FALLBACK_CHAIN_LIMIT = 3;
 
 /**
- * Default refusal-fallback chains shipped with the app. Fable 5 safeguards
- * may refuse requests the Opus tier can serve, so retrying on Opus is the
- * sensible out-of-the-box behavior.
+ * Refusal-fallback chains that the one-time seed passes add to EXISTING
+ * configs. Fable 5 safeguards may refuse requests the Opus tier can serve, so
+ * retrying on Opus is the sensible out-of-the-box behavior.
  *
  * The target is pinned to the literal Opus 5 id rather than KNOWN_MODELS.OPUS.id:
  * Opus 5.5 (the current `opus` alias) ships the same safeguard classifiers as
@@ -30,8 +30,23 @@ export const MODEL_FALLBACK_CHAIN_LIMIT = 3;
  * re-upgrade round-trip re-seeds a deleted chain; bounded to re-adding this
  * benign, re-deletable default.)
  */
-export const DEFAULT_MODEL_FALLBACKS: ModelFallbacks = {
+export const SEEDED_MODEL_FALLBACKS: ModelFallbacks = {
   [KNOWN_MODELS.FABLE.id]: { models: ["anthropic:claude-opus-5"] },
+};
+
+/**
+ * Default refusal-fallback chains for fresh installs: the seeded chains plus
+ * chains added after the seed flags shipped. Those later chains reach fresh
+ * installs only; existing configs get no migration and no new flag, and users
+ * add them by hand (docs/config/models.mdx). Maintainer decision on #5087.
+ *
+ * Sonnet 5.5 → Sonnet 5 mirrors Anthropic's own server-side fallback for
+ * Sonnet 5.5's cyber safeguards. Both ids are pinned literals, not
+ * KNOWN_MODELS.SONNET: a later `sonnet` alias move must not retarget the chain.
+ */
+export const DEFAULT_MODEL_FALLBACKS: ModelFallbacks = {
+  ...SEEDED_MODEL_FALLBACKS,
+  "anthropic:claude-sonnet-5-5": { models: ["anthropic:claude-sonnet-5"] },
 };
 
 /**
@@ -49,6 +64,7 @@ export const LEGACY_DEFAULT_MODEL_FALLBACKS: ModelFallbacks = {
 // defaults, seed merge). Accidental in-place mutation must crash fast instead
 // of silently corrupting the process-wide default.
 for (const entry of [
+  ...Object.values(Object.freeze(SEEDED_MODEL_FALLBACKS)),
   ...Object.values(Object.freeze(DEFAULT_MODEL_FALLBACKS)),
   ...Object.values(Object.freeze(LEGACY_DEFAULT_MODEL_FALLBACKS)),
 ]) {

@@ -46,7 +46,9 @@
             "pages": [
               "workspaces",
               "workspaces/scratch-chats",
+              "workspaces/artifacts",
               "workspaces/fork",
+              "workspaces/side-chats",
               "workspaces/xumignore",
               {
                 "group": "Compaction",
@@ -72,7 +74,7 @@
               },
               {
                 "group": "Hooks",
-                "pages": ["hooks/init", "hooks/tools", "hooks/environment-variables"]
+                "pages": ["hooks/init", "hooks/lifecycle", "hooks/tools", "hooks/environment-variables"]
               }
             ]
           },
@@ -85,14 +87,14 @@
               "agents/plan-mode",
               "agents/system-prompt",
               "agents/prompting-tips",
-              "agents/best-of-n"
+              "agents/best-of-n",
+              "agents/computer-use"
             ]
           },
           {
             "group": "Configuration",
             "pages": [
               "config/mcp-servers",
-              "config/policy-file",
               "config/project-secrets",
               "config/agentic-git-identity",
               "config/keybinds",
@@ -120,6 +122,8 @@
             "pages": [
               "reference/mux-compatibility",
               "reference/debugging",
+              "reference/profiling",
+              "reference/code-benchmarks",
               "reference/telemetry",
               "reference/storybook",
               "reference/benchmarking",
@@ -127,6 +131,7 @@
               "adr/0004-cli-goal-runs-are-not-strict-goal-aliases",
               "adr/0005-token-budget-context-windows",
               "adr/0006-agent-led-context-handoff",
+              "adr/0007-session-memory-is-the-rollover-checkpoint",
               "AGENTS"
             ]
           }

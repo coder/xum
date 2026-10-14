@@ -25,7 +25,7 @@ CLI Goal Runs bypass the interactive goal continuation cooldown because the proc
 
 ## Consequences
 
-- `xum run` remains single-request by default, with `--goal` documented as the explicit multi-continuation exception.
+- `xum run` remains single-request by default, with `--goal` documented as the explicit multi-continuation exception. Since #5356, a plain run whose agent creates a goal with `set_goal` adopts it and continues the same way.
 - Scripts can trust exit code `0` only when the persisted goal is complete; free-text claims are not enough unless existing goal completion fallback persisted them.
 - Goal and session budgets can stop the same process for different reasons, so CLI output and JSON events must identify which limit won.
 - CLI-specific continuation behavior is parameterized in the shared goal service instead of duplicating goal prompt/accounting logic in the CLI.

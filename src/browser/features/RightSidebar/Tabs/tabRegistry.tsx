@@ -13,27 +13,27 @@
  */
 
 import React from "react";
+import type { LucideIcon } from "lucide-react";
 import { ErrorBoundary } from "@/browser/components/ErrorBoundary/ErrorBoundary";
-import { InstructionsTab } from "@/browser/components/InstructionsTab/InstructionsTab";
-import { OutputTab } from "@/browser/components/OutputTab/OutputTab";
+import { LazyFeature } from "@/browser/components/LazyFeature/LazyFeature";
 import { StatsContainer } from "@/browser/features/RightSidebar/StatsContainer";
 import { ReviewPanel } from "@/browser/features/RightSidebar/CodeReview/ReviewPanel";
-import { DesktopPanel } from "@/browser/features/desktop/DesktopPanel";
-import { BrowserTab } from "@/browser/features/RightSidebar/BrowserTab";
-import { DevToolsTab } from "@/browser/features/RightSidebar/DevToolsTab";
-import { GoalTab, type GoalCreateIntent } from "@/browser/features/RightSidebar/GoalTab";
-import { MemoryTab } from "@/browser/features/RightSidebar/Memory/MemoryTab";
-import { WorkflowsTab } from "@/browser/features/RightSidebar/Workflows/WorkflowsTab";
+import type { GoalCreateIntent } from "@/browser/features/RightSidebar/GoalTab";
+// Timeline and Artifacts load eagerly, unlike the LazyFeature panels: the phone dialogs that
+// imported them statically are gone, so they could move to LazyFeature in a separate change.
 import { TimelinePanel } from "@/browser/features/RightSidebar/Timeline/TimelinePanel";
+import { ArtifactsPanel } from "@/browser/features/RightSidebar/ArtifactsTab/ArtifactsPanel";
 import type { GoalSnapshot, GoalStatus } from "@/common/types/goal";
 import type { ReviewNoteData } from "@/common/types/review";
 import { BASE_TAB_IDS, TAB_CONFIG, type BaseTabType, type TabConfig } from "./tabConfig";
+import { TAB_ICONS } from "./tabIcons";
 import {
   BrowserTabLabel,
   DebugTabLabel,
   DesktopTabLabel,
   GoalTabLabel,
   InstructionsTabLabel,
+  ArtifactsTabLabel,
   MemoryTabLabel,
   OutputTabLabel,
   ReviewTabLabel,
@@ -43,6 +43,46 @@ import {
 } from "./TabLabels";
 
 export { isBaseTabId, type BaseTabType } from "./tabConfig";
+
+/**
+ * A panel that stays off the first load until its tab first renders (T3, #5971). Costs (the default
+ * tab) and Review stay eager: Review's module also holds the always-mounted stats reporter.
+ */
+function lazyPanel<P extends object>(name: string, load: () => Promise<React.ComponentType<P>>) {
+  const Panel = React.lazy(async () => ({ default: await load() }));
+  return function LazyPanel(props: React.PropsWithRef<P> & React.JSX.IntrinsicAttributes) {
+    return (
+      <LazyFeature name={name}>
+        <Panel {...props} />
+      </LazyFeature>
+    );
+  };
+}
+
+const InstructionsTab = lazyPanel("Instructions", () =>
+  import("@/browser/components/InstructionsTab/InstructionsTab").then((m) => m.InstructionsTab)
+);
+const OutputTab = lazyPanel("Output", () =>
+  import("@/browser/components/OutputTab/OutputTab").then((m) => m.OutputTab)
+);
+const DesktopPanel = lazyPanel("Desktop", () =>
+  import("@/browser/features/desktop/DesktopPanel").then((m) => m.DesktopPanel)
+);
+const BrowserTab = lazyPanel("Browser", () =>
+  import("@/browser/features/RightSidebar/BrowserTab").then((m) => m.BrowserTab)
+);
+const DevToolsTab = lazyPanel("Debug", () =>
+  import("@/browser/features/RightSidebar/DevToolsTab").then((m) => m.DevToolsTab)
+);
+const GoalTab = lazyPanel("Goal", () =>
+  import("@/browser/features/RightSidebar/GoalTab").then((m) => m.GoalTab)
+);
+const MemoryTab = lazyPanel("Memory", () =>
+  import("@/browser/features/RightSidebar/Memory/MemoryTab").then((m) => m.MemoryTab)
+);
+const WorkflowsTab = lazyPanel("Workflows", () =>
+  import("@/browser/features/RightSidebar/Workflows/WorkflowsTab").then((m) => m.WorkflowsTab)
+);
 
 /** Stats reported by ReviewPanel for tab display (kept local to the registry). */
 export interface ReviewStats {
@@ -82,6 +122,11 @@ export interface TabPanelContext {
     isTouchImmersive: boolean;
     onTouchImmersiveChange: (isTouch: boolean) => void;
   };
+  artifacts: {
+    /** Set when a shortcut opened the tab: the panel takes focus so its single-key shortcuts work. */
+    autoFocus: boolean;
+    onAutoFocusConsumed: () => void;
+  };
   goal: {
     snapshot: GoalSnapshot | null;
     openCompleteInputRequest: number;
@@ -94,11 +139,15 @@ export interface TabPanelContext {
     onUpdateTurnCap: (turnCap: number | null) => Promise<void>;
     onClear: () => Promise<void>;
     onCreate: (intent: GoalCreateIntent) => Promise<void>;
+    /** Sub-agent: show the goal's status actions only; board, defaults and create are parent-only. */
+    isChildWorkspace: boolean;
   };
 }
 
 /** Static description of one non-terminal tab, including UI renderers. */
 export interface TabRegistration extends TabConfig {
+  /** Icon for the New tab launcher row. */
+  Icon: LucideIcon;
   /** Workspace-scope label component (subscribes to per-workspace stores as needed). */
   Label: React.ComponentType<TabLabelContext>;
   /** Renders the panel body. Receives a workspace-scoped context bag. */
@@ -142,7 +191,8 @@ const TAB_RENDERERS = {
     renderPanel: (ctx) => (
       <ErrorBoundary workspaceInfo="Goal tab">
         <GoalTab
-          workspaceId={ctx.workspaceId}
+          workspaceId={ctx.goal.isChildWorkspace ? undefined : ctx.workspaceId}
+          isChildWorkspace={ctx.goal.isChildWorkspace}
           goal={ctx.goal.snapshot}
           openCompleteInputRequest={ctx.goal.openCompleteInputRequest}
           onSetStatus={ctx.goal.onSetStatus}
@@ -150,7 +200,7 @@ const TAB_RENDERERS = {
           onUpdateBudget={ctx.goal.onUpdateBudget}
           onUpdateTurnCap={ctx.goal.onUpdateTurnCap}
           onClear={ctx.goal.onClear}
-          onCreate={ctx.goal.onCreate}
+          onCreate={ctx.goal.isChildWorkspace ? undefined : ctx.goal.onCreate}
         />
       </ErrorBoundary>
     ),
@@ -160,6 +210,18 @@ const TAB_RENDERERS = {
     renderPanel: (ctx) => (
       <ErrorBoundary workspaceInfo="Timeline tab">
         <TimelinePanel workspaceId={ctx.workspaceId} />
+      </ErrorBoundary>
+    ),
+  },
+  artifacts: {
+    Label: ArtifactsTabLabel,
+    renderPanel: (ctx) => (
+      <ErrorBoundary workspaceInfo="Artifacts tab">
+        <ArtifactsPanel
+          workspaceId={ctx.workspaceId}
+          autoFocus={ctx.artifacts.autoFocus}
+          onAutoFocusConsumed={ctx.artifacts.onAutoFocusConsumed}
+        />
       </ErrorBoundary>
     ),
   },
@@ -213,5 +275,5 @@ const TAB_RENDERERS = {
 
 /** Public UI registry indexed by tab id. */
 export const TAB_REGISTRY: Record<BaseTabType, TabRegistration> = Object.fromEntries(
-  BASE_TAB_IDS.map((id) => [id, { ...TAB_CONFIG[id], ...TAB_RENDERERS[id] }])
+  BASE_TAB_IDS.map((id) => [id, { ...TAB_CONFIG[id], Icon: TAB_ICONS[id], ...TAB_RENDERERS[id] }])
 ) as Record<BaseTabType, TabRegistration>;

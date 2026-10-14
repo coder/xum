@@ -91,20 +91,6 @@ async function writeTodos(
   });
 }
 
-async function clearTodos(workspaceId: string, workspaceSessionDir: string): Promise<void> {
-  await workspaceFileLocks.withLock(workspaceId, async () => {
-    const todoFile = getTodoFilePath(workspaceSessionDir);
-    try {
-      await fs.unlink(todoFile);
-    } catch (error) {
-      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
-        return;
-      }
-      throw error;
-    }
-  });
-}
-
 /**
  * Todo write tool factory
  * Creates a tool that allows the AI to create/update the todo list
@@ -144,7 +130,7 @@ export const createTodoReadTool: ToolFactory = (config) => {
 };
 
 /**
- * Set todos for a workspace session directory (useful for testing)
+ * Set todos for a workspace session directory (propose_plan uses this to mark todos completed).
  */
 export async function setTodosForSessionDir(
   workspaceId: string,
@@ -152,21 +138,4 @@ export async function setTodosForSessionDir(
   todos: TodoItem[]
 ): Promise<void> {
   await writeTodos(workspaceId, workspaceSessionDir, todos);
-}
-
-/**
- * Get todos for a workspace session directory (useful for testing)
- */
-export async function getTodosForSessionDir(workspaceSessionDir: string): Promise<TodoItem[]> {
-  return readTodosForSessionDir(workspaceSessionDir);
-}
-
-/**
- * Clear todos for a workspace session directory (useful for testing and cleanup)
- */
-export async function clearTodosForSessionDir(
-  workspaceId: string,
-  workspaceSessionDir: string
-): Promise<void> {
-  await clearTodos(workspaceId, workspaceSessionDir);
 }

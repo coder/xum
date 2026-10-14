@@ -11,7 +11,10 @@ describeIntegration("Server update IPC", () => {
       const client = resolveOrpcClient(env);
       const statuses = await client.update.onStatus(undefined, { signal: controller.signal });
       const first = await statuses.next();
-      expect(first.value).toMatchObject({ type: "unsupported", reason: expect.any(String) });
+      expect(first.value).toMatchObject<Record<string, unknown>>({
+        type: "unsupported",
+        reason: expect.any(String),
+      });
       await client.update.check({ source: "manual" });
       await client.update.download();
       await client.update.install();

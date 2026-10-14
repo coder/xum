@@ -1,3 +1,4 @@
+import type { WorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { ProjectConfig } from "@/common/types/project";
 import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
@@ -127,6 +128,32 @@ export interface DelegatedActivityOptions {
   isWorkspaceLiveActive?: (workspaceId: string) => boolean;
 }
 
+/**
+ * The sidebar's "working" reading of a workspace's live store state, used as the
+ * `isWorkspaceLiveActive` hint above. Shared so the composer tray and the sidebar
+ * cannot drift on what counts as live activity.
+ */
+export function isWorkspaceSidebarStateWorking(
+  state: Pick<
+    WorkspaceSidebarState,
+    | "canInterrupt"
+    | "isStarting"
+    | "activeWorkflowRunCount"
+    | "activeBashMonitorCount"
+    | "awaitingUserQuestion"
+  >
+): boolean {
+  return (
+    (state.canInterrupt ||
+      state.isStarting ||
+      state.activeWorkflowRunCount > 0 ||
+      // An armed background bash monitor keeps the workspace "working" so collapsed
+      // project/parent rows don't look idle while it waits to be woken.
+      state.activeBashMonitorCount > 0) &&
+    !state.awaitingUserQuestion
+  );
+}
+
 function createEmptyDelegatedActivity(): WorkspaceDelegatedActivity {
   return {
     activeCount: 0,
@@ -161,12 +188,6 @@ export function isSidebarSubAgentRunning(
     options.hasActiveBashMonitor?.(workspace.id) === true ||
     getIsWorkspaceLiveActive(workspace.id, options)
   );
-}
-
-export function isActionableTaskExecutionStatus(
-  status: FrontendWorkspaceMetadata["taskExecutionStatus"]
-): boolean {
-  return status === "queued" || status === "starting" || status === "running";
 }
 
 export function isActiveOrStartingTaskStatus(
@@ -206,7 +227,10 @@ function isWorkspaceDelegatedActivityQueued(workspace: FrontendWorkspaceMetadata
 }
 
 export function isWorkspaceDelegatedActivityActive(
-  workspace: FrontendWorkspaceMetadata,
+  workspace: Pick<
+    FrontendWorkspaceMetadata,
+    "id" | "taskStatus" | "taskExecutionStatus" | "reportedAt"
+  >,
   options: DelegatedActivityOptions = {}
 ): boolean {
   if (
@@ -1012,6 +1036,9 @@ export function buildSortedWorkspacesByProject(
     for (const ws of config.workspaces) {
       if (!ws.id) continue;
       const meta = workspaceMetadata.get(ws.id);
+      // /side chats are ephemeral views of their main chat, never sidebar rows (like Codex,
+      // where a side conversation never shows up in the thread list).
+      if (meta?.sideChatParentWorkspaceId != null) continue;
       if (meta) {
         metadataList.push(meta);
         includedIds.add(ws.id);
@@ -1023,7 +1050,7 @@ export function buildSortedWorkspacesByProject(
   // Second pass: add workspaces from metadata not yet in projects config
   // (handles race condition where metadata event arrives before config refresh completes)
   for (const [id, metadata] of workspaceMetadata) {
-    if (!includedIds.has(id)) {
+    if (!includedIds.has(id) && metadata.sideChatParentWorkspaceId == null) {
       const projectWorkspaces = result.get(metadata.projectPath) ?? [];
       projectWorkspaces.push(metadata);
       result.set(metadata.projectPath, projectWorkspaces);
@@ -1280,6 +1307,7 @@ export function partitionWorkspacesBySection(
   for (const workspace of workspaces) {
     const effectiveSectionId = resolveEffectiveSectionId(workspace, byId, sectionIds);
     if (effectiveSectionId) {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const list = bySectionId.get(effectiveSectionId)!;
       list.push(workspace);
     } else {

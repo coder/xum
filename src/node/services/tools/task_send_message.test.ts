@@ -75,11 +75,46 @@ describe("task_send_message tool", () => {
     ).toEqual({ status: "accepted", taskId: "sib-b", targetRelation: "sibling" });
   });
 
+  it.each([
+    { relation: "target_main_chat", targetRelation: "main_chat" },
+    { relation: "target_side_chat", targetRelation: "side_chat" },
+  ] as const)(
+    "labels $relation without implying task ancestry",
+    async ({ relation, targetRelation }) => {
+      using tempDir = new TestTempDir("task-send-message-linked-chat");
+      const outcomes: TreeSendResult[] = [
+        Ok({ delivery: "accepted", relation }),
+        Ok({ delivery: "queued", queueDispatchMode: "turn-end", relation }),
+      ];
+      const tool = createTaskSendMessageTool({
+        ...createTestToolConfig(tempDir.path, { workspaceId: "sender" }),
+        taskService: {
+          sendAgentTreeMessage: mock(
+            (): Promise<TreeSendResult> => Promise.resolve(outcomes.shift()!)
+          ),
+        } as unknown as TaskService,
+      });
+      const args = { task_id: "linked-chat", message: "Please explain the decision." };
+      expect(await tool.execute!(args, toolCallOptions)).toEqual({
+        status: "accepted",
+        taskId: args.task_id,
+        targetRelation,
+      });
+      expect(await tool.execute!(args, toolCallOptions)).toEqual({
+        status: "queued",
+        taskId: args.task_id,
+        targetRelation,
+        queueDispatchMode: "turn-end",
+      });
+    }
+  );
+
   it("labels cross-tree deliveries as unrelated on accepted and queued results", async () => {
     using tempDir = new TestTempDir("task-send-message-unrelated");
     const outcomes: TreeSendResult[] = [
       Ok({ delivery: "accepted", relation: "target_unrelated" }),
       Ok({ delivery: "queued", queueDispatchMode: "turn-end", relation: "target_unrelated" }),
+      Ok({ delivery: "queued", relation: "target_unrelated", awaitsDelegatedTurn: true }),
     ];
     const taskService = {
       sendAgentTreeMessage: mock((): Promise<TreeSendResult> => Promise.resolve(outcomes.shift()!)),
@@ -95,7 +130,7 @@ describe("task_send_message tool", () => {
       )
     ).toEqual({ status: "accepted", taskId: "ws-root-b", targetRelation: "unrelated" });
 
-    // The service owns the turn-end default for unrelated targets; the tool only echoes it.
+    // The service resolves the mode (here a recipient that holds messages); the tool echoes it.
     expect(
       await Promise.resolve(
         tool.execute!({ task_id: "ws-root-b", message: "Release cut at 17:00." }, toolCallOptions)
@@ -105,6 +140,18 @@ describe("task_send_message tool", () => {
       taskId: "ws-root-b",
       queueDispatchMode: "turn-end",
       targetRelation: "unrelated",
+    });
+
+    // The target runs a delegated turn the sender does not own: the message waits for it.
+    expect(
+      await Promise.resolve(
+        tool.execute!({ task_id: "ws-root-b", message: "Release cut at 17:00." }, toolCallOptions)
+      )
+    ).toEqual({
+      status: "queued",
+      taskId: "ws-root-b",
+      targetRelation: "unrelated",
+      awaitsDelegatedTurn: true,
     });
   });
 

@@ -3,11 +3,15 @@
  */
 
 import { describe, test, expect, afterAll } from "bun:test";
-import { analyzeCode, disposeAnalysisContext, normalizeMultilineStrings } from "./staticAnalysis";
+import {
+  analyzeCode,
+  disposeAnalysisContextForTests,
+  normalizeMultilineStrings,
+} from "./staticAnalysis";
 import { MAX_MULTILINE_STRING_PARSE_CHARACTERS } from "@/constants/codeExecution";
 
 afterAll(() => {
-  disposeAnalysisContext();
+  disposeAnalysisContextForTests();
 });
 
 describe("staticAnalysis", () => {
