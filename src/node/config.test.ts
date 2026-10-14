@@ -1871,6 +1871,53 @@ describe("Config", () => {
       expect(config.getUpdateChannel()).toBe("nightly");
     });
 
+    it("notifies for another process's rewrite of a symlinked config.json", async () => {
+      // writeFileAtomic renames over the link's target, so the event lands in the target dir.
+      const targetDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-"));
+      try {
+        fs.writeFileSync(path.join(targetDir, "config.json"), JSON.stringify({ projects: [] }));
+        fs.symlinkSync(path.join(targetDir, "config.json"), path.join(tempDir, "config.json"));
+        const next = nextNotification(config);
+        await new Config(tempDir).setUpdateChannel("nightly");
+        await next.promise;
+        next.unsubscribe();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        fs.rmSync(targetDir, { recursive: true, force: true });
+      }
+    });
+
+    it("notifies for a rewrite that lands while the watch starts", async () => {
+      await config.setUpdateChannel("npm");
+      const realWatch = fs.watch;
+      let rewrote = false;
+      // The rewrite lands after the subscriber's own read and before the watch is installed,
+      // so no watch event reports it.
+      const watchSpy = spyOn(fs, "watch").mockImplementation(((
+        ...args: Parameters<typeof fs.watch>
+      ) => {
+        if (!rewrote) {
+          rewrote = true;
+          fs.writeFileSync(
+            path.join(tempDir, "config.json"),
+            JSON.stringify({ projects: [], updateChannel: "nightly" })
+          );
+        }
+        return realWatch(...args);
+      }) as typeof fs.watch);
+      try {
+        let notifications = 0;
+        const unsubscribe = config.onConfigChanged(() => {
+          notifications += 1;
+        });
+        expect(rewrote).toBe(true);
+        expect(notifications).toBe(1);
+        unsubscribe();
+      } finally {
+        watchSpy.mockRestore();
+      }
+    });
+
     it("notifies once for its own edit", async () => {
       await config.setUpdateChannel("npm");
       let notifications = 0;

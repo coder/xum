@@ -1532,8 +1532,11 @@ export class Config {
     };
   }
 
-  /** Watch on the config dir; open only while onConfigChanged has listeners. */
-  private configFileWatcher: fs.FSWatcher | null = null;
+  /**
+   * Watches on the config dir (and on a symlinked config.json's target dir); open only while
+   * onConfigChanged has listeners.
+   */
+  private configFileWatchers: fs.FSWatcher[] = [];
   /**
    * The config.json stamp the last notification covers. Own saves set it before they
    * notify, so the watcher's echo of an own save compares equal and stays silent. A stamp
@@ -1543,36 +1546,57 @@ export class Config {
   private notifiedConfigFileStamp = "missing";
 
   private ensureConfigFileWatcher(): void {
-    if (this.configFileWatcher != null) return;
-    const configFileName = path.basename(this.configFile);
+    if (this.configFileWatchers.length > 0) return;
+    // The baseline comes before the watch: a rewrite between the two then reads as a new
+    // stamp in the check below instead of being adopted silently.
+    const baseline = this.configFileStamp();
+    // Watch directories, not the file: atomic saves rename a temp file over config.json, and
+    // a file watch follows the old inode. writeFileAtomic renames over a symlink's target, so
+    // a symlinked config.json also needs its target's directory.
+    const targets = new Map([[this.rootDir, path.basename(this.configFile)]]);
+    const realFile = this.realConfigFilePath();
+    targets.set(path.dirname(realFile), path.basename(realFile));
+    for (const [dir, fileName] of targets) {
+      const watcher = this.watchConfigDir(dir, fileName);
+      if (watcher) this.configFileWatchers.push(watcher);
+    }
+    // The config dir does not exist before the first save, so no watch starts. Listeners
+    // read config when they subscribe, and writeConfigFileTracked retries the watch.
+    if (this.configFileWatchers.length === 0) return;
+    this.notifiedConfigFileStamp = baseline;
+    this.handleConfigFileEvent();
+  }
+
+  private realConfigFilePath(): string {
+    try {
+      return fs.realpathSync(this.configFile);
+    } catch {
+      return this.configFile;
+    }
+  }
+
+  private watchConfigDir(dir: string, fileName: string): fs.FSWatcher | null {
     let watcher: fs.FSWatcher;
     try {
-      // Watch the directory, not the file: atomic saves rename a temp file over config.json,
-      // and a file watch follows the old inode.
-      watcher = fs.watch(this.rootDir, { persistent: false }, (_event, filename) => {
+      watcher = fs.watch(dir, { persistent: false }, (_event, filename) => {
         // Some platforms omit the filename; treat that as a possible config.json change.
-        if (filename != null && filename !== configFileName) return;
+        if (filename != null && filename !== fileName) return;
         this.handleConfigFileEvent();
       });
     } catch (error) {
-      // The root dir does not exist before the first save. saveConfig retries after it
-      // creates the dir.
-      log.debug("Config file watcher not started", { rootDir: this.rootDir, error });
-      return;
+      log.debug("Config file watcher not started", { dir, error });
+      return null;
     }
     watcher.on("error", (error) => {
-      log.debug("Config file watcher stopped", { rootDir: this.rootDir, error });
-      if (this.configFileWatcher === watcher) this.closeConfigFileWatcher();
+      log.debug("Config file watcher stopped", { dir, error });
+      if (this.configFileWatchers.includes(watcher)) this.closeConfigFileWatcher();
     });
-    this.configFileWatcher = watcher;
-    // Changes before the watch started are not events: listeners read config when they
-    // subscribe.
-    this.notifiedConfigFileStamp = this.configFileStamp();
+    return watcher;
   }
 
   private closeConfigFileWatcher(): void {
-    this.configFileWatcher?.close();
-    this.configFileWatcher = null;
+    for (const watcher of this.configFileWatchers) watcher.close();
+    this.configFileWatchers = [];
   }
 
   private closeUnusedConfigFileWatcher(): void {
