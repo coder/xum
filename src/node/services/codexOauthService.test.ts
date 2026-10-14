@@ -3,7 +3,6 @@ import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 
 import {
   CODEX_OAUTH_BROWSER_REDIRECT_URI,
-  CODEX_OAUTH_CLIENT_ID,
   CODEX_OAUTH_DEVICE_TOKEN_POLL_URL,
   CODEX_OAUTH_DEVICE_USERCODE_URL,
   CODEX_OAUTH_TOKEN_URL,
@@ -477,8 +476,8 @@ describe("CodexOauthService", () => {
   // -------------------------------------------------------------------------
 
   describe("desktop flow callback", () => {
-    // Routes the token endpoint to `tokenResponse` and every other URL (the
-    // loopback callback the test itself hits) to the real fetch.
+    // Answers the token endpoint with `tokenResponse` and rejects every other
+    // URL. The test hits the loopback callback with `originalFetch` directly.
     function mockTokenEndpoint(tokenResponse: () => Response): URLSearchParams[] {
       const bodies: URLSearchParams[] = [];
       mockFetch((input, init) => {
@@ -486,7 +485,7 @@ describe("CodexOauthService", () => {
           bodies.push(new URLSearchParams(requestBodyText(init)));
           return Promise.resolve(tokenResponse());
         }
-        return originalFetch(input, init);
+        return Promise.reject(new Error(`unexpected fetch ${requestUrl(input)}`));
       });
       return bodies;
     }
@@ -629,7 +628,8 @@ describe("CodexOauthService", () => {
         verifyUrl: "https://auth.openai.com/codex/device",
         intervalSeconds: 2,
       });
-      expect(JSON.parse(calls.userCode[0])).toEqual({ client_id: CODEX_OAUTH_CLIENT_ID });
+      // The registered public client ID (an external contract).
+      expect(JSON.parse(calls.userCode[0])).toEqual({ client_id: "app_EMoamEEZ73f0CkXaXp7hrann" });
     });
 
     it("clamps a sub-second interval to 1 and defaults a missing interval and lifetime", async () => {
@@ -796,7 +796,7 @@ describe("CodexOauthService", () => {
           success: false,
           error: "Timed out waiting for device authorization",
         });
-        // The next poll waits the interval plus 3 s, so only one was sent.
+        // The next poll comes only after the wait has timed out, so only one was sent.
         expect(calls.poll).toHaveLength(1);
         expect(calls.token).toHaveLength(0);
       }
