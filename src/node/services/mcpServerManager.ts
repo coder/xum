@@ -2511,21 +2511,33 @@ export class MCPServerManager {
         name: instance.name,
         toolCount: Object.keys(instance.tools).length,
       });
-      const refresh = instance
-        .refreshTools()
-        .catch((error: unknown) => {
-          log.debug("[MCP] Tool list refresh failed; keeping cached tools", {
-            name: instance.name,
-            error: getErrorMessage(error),
-          });
-        })
-        .finally(() => {
-          if (this.toolRefreshesInFlight.get(instance) === refresh) {
-            this.toolRefreshesInFlight.delete(instance);
-          }
-        });
-      this.toolRefreshesInFlight.set(instance, refresh);
+      void this.refreshInstanceTools(instance);
     }
+  }
+
+  /**
+   * One deduped tools/list refresh of a modern-era instance; never rejects (a failed refresh
+   * keeps the cached tools). Legacy instances have no refresh and resolve at once.
+   */
+  private refreshInstanceTools(instance: MCPServerInstance): Promise<void> {
+    const inFlight = this.toolRefreshesInFlight.get(instance);
+    if (inFlight !== undefined) return inFlight;
+    if (instance.isClosed || !instance.refreshTools) return Promise.resolve();
+    const refresh = instance
+      .refreshTools()
+      .catch((error: unknown) => {
+        log.debug("[MCP] Tool list refresh failed; keeping cached tools", {
+          name: instance.name,
+          error: getErrorMessage(error),
+        });
+      })
+      .finally(() => {
+        if (this.toolRefreshesInFlight.get(instance) === refresh) {
+          this.toolRefreshesInFlight.delete(instance);
+        }
+      });
+    this.toolRefreshesInFlight.set(instance, refresh);
+    return refresh;
   }
 
   /**
@@ -5144,30 +5156,48 @@ export class MCPServerManager {
    * MCP App entry points of the workspace's enabled, connected servers. The tool allowlist
    * applies (opening one calls the tool); `_meta.ui.visibility` does not (spec).
    */
-  listMcpAppEntrypoints(workspaceId: string): McpAppEntrypoint[] {
-    const entry = this.workspaceServers.get(workspaceId);
-    if (entry === undefined || this.mcpApps?.isEnabled() !== true) return [];
-    const entrypoints: McpAppEntrypoint[] = [];
-    for (const [serverName, instance] of entry.instances) {
-      if (!entry.enabledServerNames.has(serverName) || instance.isClosed || !instance.apps)
-        continue;
+  async listMcpAppEntrypoints(workspaceId: string): Promise<McpAppEntrypoint[]> {
+    if (this.mcpApps?.isEnabled() !== true) return [];
+    // The send path refreshes tool catalogs in the background, so after tools/list_changed the
+    // held catalog is stale until the next send. Wait for a refresh here: through the SDK's
+    // response cache a still-fresh list costs no round trip.
+    await Promise.all(
+      this.appInstances(workspaceId).map(({ instance }) => this.refreshInstanceTools(instance))
+    );
+    // Read again: the servers can stop or restart while the refresh runs.
+    return this.appInstances(workspaceId).flatMap(({ serverName, apps }) => {
       const allowlist = this.appToolAllowlist(workspaceId, serverName);
-      for (const tool of instance.apps.appEntrypoints()) {
-        if (allowlist !== null && !allowlist.has(tool.toolName)) continue;
-        for (const type of tool.types) {
-          entrypoints.push({
+      const serverLabel = this.appServerLabel(workspaceId, serverName);
+      return apps
+        .appEntrypoints()
+        .filter((tool) => allowlist === null || allowlist.has(tool.toolName))
+        .flatMap((tool) =>
+          tool.types.map((type) => ({
             serverName,
-            serverLabel: this.appServerLabel(workspaceId, serverName),
+            serverLabel,
             toolName: tool.toolName,
             title: tool.title,
             resourceUri: tool.resourceUri,
             type,
             viewKey: mcpAppEntrypointKey(serverName, tool.toolName, type),
-          });
-        }
-      }
-    }
-    return entrypoints;
+          }))
+        );
+    });
+  }
+
+  /** The workspace's enabled, open instances with an MCP Apps connection. */
+  private appInstances(workspaceId: string): Array<{
+    serverName: string;
+    instance: MCPServerInstance;
+    apps: NonNullable<MCPServerInstance["apps"]>;
+  }> {
+    const entry = this.workspaceServers.get(workspaceId);
+    if (entry === undefined) return [];
+    return [...entry.instances].flatMap(([serverName, instance]) =>
+      entry.enabledServerNames.has(serverName) && !instance.isClosed && instance.apps
+        ? [{ serverName, instance, apps: instance.apps }]
+        : []
+    );
   }
 
   /**
@@ -5185,9 +5215,6 @@ export class MCPServerManager {
   ): Promise<McpAppEntrypoint> {
     assert(this.mcpApps, "MCP Apps support is not configured");
     const store = this.mcpApps.store;
-    if (!this.allowEntrypointCall(workspaceId, serverName)) {
-      throw new Error(`Too many entry point opens for '${serverName}'; try again shortly`);
-    }
     // One-shot dispatch, as in callMcpAppTool: an epoch retry must not call the tool twice.
     let dispatched: Promise<McpAppEntrypoint> | null = null;
     return this.invokeServerOperation(
@@ -5204,6 +5231,13 @@ export class MCPServerManager {
         if (tool === undefined || (allowlist !== null && !allowlist.has(toolName))) {
           return Promise.reject(
             new Error(`'${serverName}' has no ${type} entry point named '${toolName}'`)
+          );
+        }
+        // Budgeted only once the entry point is known to exist, so the budget map holds only
+        // servers the workspace runs (an unknown name never adds an entry).
+        if (!this.allowEntrypointCall(workspaceId, serverName)) {
+          return Promise.reject(
+            new Error(`Too many entry point opens for '${serverName}'; try again shortly`)
           );
         }
         log.info("[MCP Apps] Opening an entry point", { workspaceId, serverName, toolName, type });
@@ -5256,6 +5290,13 @@ export class MCPServerManager {
   }
 
   private readonly entrypointCallWindows = new Map<string, { start: number; count: number }>();
+
+  /** Entry point budgets of a stopped workspace would otherwise outlive it. */
+  private dropEntrypointBudgets(workspaceId: string): void {
+    for (const key of this.entrypointCallWindows.keys()) {
+      if (key.startsWith(`${workspaceId}\0`)) this.entrypointCallWindows.delete(key);
+    }
+  }
 
   /** The view tool-call budget (mcpAppHost), applied per workspace and server. */
   private allowEntrypointCall(workspaceId: string, serverName: string): boolean {
@@ -5712,6 +5753,7 @@ export class MCPServerManager {
       this.latestWorkspaceOverrides.delete(workspaceId);
       this.idleStoppedPromptCatalogs.delete(workspaceId);
     }
+    this.dropEntrypointBudgets(workspaceId);
     const entry = this.workspaceServers.get(workspaceId);
     if (!entry) return;
 

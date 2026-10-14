@@ -164,11 +164,15 @@ export function isMcpAppEntrypointKey(key: string): boolean {
   return key.startsWith("entrypoint:");
 }
 
-/** The result-store key of an opened entry point (one view record per server, tool and type). */
+/**
+ * The result-store key of an opened entry point (one view record per server, tool and type).
+ * Names are encoded: server keys contain colons (`plugin:<hex>:<server>`), and a raw join would
+ * give `a` + `b:c` and `a:b` + `c` the same key.
+ */
 export function mcpAppEntrypointKey(
   serverName: string,
   toolName: string,
   type: MCPAppEntrypointType
 ): string {
-  return `entrypoint:${serverName}:${toolName}:${type}`;
+  return `entrypoint:${encodeURIComponent(serverName)}:${encodeURIComponent(toolName)}:${type}`;
 }
