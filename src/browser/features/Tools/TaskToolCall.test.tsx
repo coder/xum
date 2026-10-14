@@ -537,6 +537,23 @@ describe("TaskToolCall", () => {
       expect(renderCard(corruptResult, []).text).toContain(firstPage.text);
     });
 
+    test("ignores tool rows named after Object.prototype members", () => {
+      // A persisted toolName is untrusted: "__proto__" or "constructor" must not resolve to a
+      // prototype member and throw while the transcript renders.
+      const linking = computeTaskReportLinking([
+        createToolMessage({ toolName: "__proto__", args: {}, result: {} }),
+        createToolMessage({ toolName: "constructor", args: {}, result: {} }),
+        createToolMessage({
+          toolName: "task",
+          args: foregroundArgs,
+          result: singleResult("fg-ok"),
+        }),
+        awaitPage("fg-ok", 10),
+        awaitPage("fg-ok", 20),
+      ]);
+      expect(linking.reportByTaskId.get("fg-ok")?.reportMarkdown).toBe(report);
+    });
+
     test("starts a new join when a woken task reports again", () => {
       // The second attempt's first page matches the first attempt's text.
       const secondReport = "Page zero. Fresh end.";

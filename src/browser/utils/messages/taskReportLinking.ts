@@ -297,28 +297,40 @@ function getDeliveredSendTaskId(result: unknown): string | null {
 
 type ToolMessage = Extract<DisplayedMessage, { type: "tool" }>;
 
-/** How each tool that carries or resets a report feeds the report joins. */
-const REPORT_JOIN_HANDLERS: Partial<
-  Record<string, (msg: ToolMessage, state: ReportJoinState) => void>
-> = {
-  task: (msg, state) => {
-    for (const page of readForegroundFirstPages(msg.result)) linkReportPage(page, undefined, state);
-  },
-  task_send_message: (msg, state) => {
-    const taskId = getDeliveredSendTaskId(msg.result);
-    if (taskId != null) state.newAttemptTaskIds.add(taskId);
-  },
-  task_await: (msg, state) => {
-    const results = (msg.result as { results?: unknown } | null | undefined)?.results;
-    if (!Array.isArray(results)) return;
-    for (const r of results) linkReportPage(r, msg.args, state);
-  },
-};
+/**
+ * How each tool that carries or resets a report feeds the report joins. A Map, not an object
+ * literal: a persisted toolName such as "__proto__" or "constructor" must miss, not resolve to
+ * an Object.prototype member and throw while the transcript renders.
+ */
+const REPORT_JOIN_HANDLERS = new Map<string, (msg: ToolMessage, state: ReportJoinState) => void>([
+  [
+    "task",
+    (msg, state) => {
+      for (const page of readForegroundFirstPages(msg.result))
+        linkReportPage(page, undefined, state);
+    },
+  ],
+  [
+    "task_send_message",
+    (msg, state) => {
+      const taskId = getDeliveredSendTaskId(msg.result);
+      if (taskId != null) state.newAttemptTaskIds.add(taskId);
+    },
+  ],
+  [
+    "task_await",
+    (msg, state) => {
+      const results = (msg.result as { results?: unknown } | null | undefined)?.results;
+      if (!Array.isArray(results)) return;
+      for (const r of results) linkReportPage(r, msg.args, state);
+    },
+  ],
+]);
 
 /** Feed one tool message into the report joins. */
 function linkToolMessage(msg: DisplayedMessage, state: ReportJoinState): void {
   if (msg.type !== "tool") return;
-  REPORT_JOIN_HANDLERS[msg.toolName]?.(msg, state);
+  REPORT_JOIN_HANDLERS.get(msg.toolName)?.(msg, state);
 }
 
 /**

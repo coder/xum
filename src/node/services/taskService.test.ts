@@ -213,6 +213,7 @@ describe("TaskService", () => {
     const reportMarkdown = "The delegated investigation is complete.";
     const completed = { status: "completed", taskId, reportMarkdown };
     const awaitOutput = { results: [completed] };
+    const pagedCompleted = { ...completed, nextCharOffset: reportMarkdown.length };
     const toolPart = (toolName: string, output: unknown): DynamicToolPart => ({
       type: "dynamic-tool",
       toolCallId: "await-report",
@@ -374,6 +375,10 @@ describe("TaskService", () => {
         true,
         1,
       ],
+      // A long foreground report is one page plus nextCharOffset. A projection without the
+      // marker hides that more text exists, so it does not deliver the report.
+      ["paged report without its marker", "task", pagedCompleted, completed, true, 1],
+      ["paged report with its marker", "task", pagedCompleted, pagedCompleted, true, 0],
     ] satisfies Array<[string, string, unknown, unknown, boolean, number]>) {
       test("kernel report visibility: " + name, async () => {
         const fixture = await setup();

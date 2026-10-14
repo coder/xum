@@ -1708,17 +1708,14 @@ function collectReferencedTaskIdsFromTaskToolOutput(output: unknown, into: Set<s
   }
 }
 
-type CompletedTaskReportReceipt =
-  | { kind: "initial"; taskId: string; reportMarkdown: string }
-  | {
-      kind: "continuation";
-      taskId: string;
-      handleId?: string;
-      messageId: string;
-      reportMarkdown: string;
-      /** Where reportMarkdown starts in the full report, when the row is one paged page. */
-      pageOffset?: number;
-    };
+type CompletedTaskReportReceipt = (
+  | { kind: "initial"; taskId: string }
+  | { kind: "continuation"; taskId: string; handleId?: string; messageId: string }
+) & {
+  reportMarkdown: string;
+  /** Where reportMarkdown starts in the full report, when the row is one paged page. */
+  pageOffset?: number;
+};
 
 /**
  * A paged row (task_await, or a foreground task since #6427) holds one page of a long report:
@@ -1787,9 +1784,25 @@ function completedTaskReports(toolName: unknown, output: unknown): CompletedTask
       ];
     }
     return handleId == null
-      ? [{ kind: "initial", taskId, reportMarkdown: row.reportMarkdown }]
+      ? [
+          {
+            kind: "initial",
+            taskId,
+            reportMarkdown: row.reportMarkdown,
+            pageOffset: readReportPageOffset(row),
+          },
+        ]
       : [];
   });
+}
+
+/**
+ * Same text and same page position. A visible projection that drops a page's offset fields
+ * (nextCharOffset/startCharOffset) hides that more text exists and where to read it, so it does
+ * not prove delivery of the genuine paged row.
+ */
+function sameReportPage(a: CompletedTaskReportReceipt, b: CompletedTaskReportReceipt): boolean {
+  return a.reportMarkdown === b.reportMarkdown && a.pageOffset === b.pageOffset;
 }
 
 function sameTaskReportReceipt(
@@ -1799,7 +1812,7 @@ function sameTaskReportReceipt(
   return (
     a.kind === b.kind &&
     a.taskId === b.taskId &&
-    a.reportMarkdown === b.reportMarkdown &&
+    sameReportPage(a, b) &&
     (a.kind === "initial" ||
       (b.kind === "continuation" && a.messageId === b.messageId && a.handleId === b.handleId))
   );
