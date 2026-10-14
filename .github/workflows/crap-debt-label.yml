@@ -6,6 +6,9 @@ name: CRAP debt label
 # on each label change. The re-run job reads the label live (see the CRAP
 # report step), because a re-run reuses the original event payload.
 #
+# A run made before this logic reached the PR's base re-runs its old CRAP job,
+# which reads the stale payload: such a PR needs one new push.
+#
 # Fork PRs get a read-only GITHUB_TOKEN that cannot re-run jobs, so this
 # workflow skips them: a maintainer re-runs Quality / CRAP by hand there.
 
@@ -38,10 +41,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
-          run_id=$(gh run list --workflow pr.yml --event pull_request --commit "$HEAD_SHA" \
-            --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          # Match the PR number too: two PRs can share a head SHA, and a re-run
+          # keeps its run's original PR payload. Runs come newest first.
+          run_id=$(gh api "repos/$GH_REPO/actions/workflows/pr.yml/runs?event=pull_request&head_sha=$HEAD_SHA" \
+            --jq "[.workflow_runs[] | select(any(.pull_requests[]; .number == $PR_NUMBER))][0].id // empty")
           if [[ -z "$run_id" ]]; then
             echo "No PR run for $HEAD_SHA yet: its Quality / CRAP job will read the label."
             exit 0
