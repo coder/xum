@@ -1387,10 +1387,9 @@ describe("Config", () => {
       });
     }
 
-    // #5929: a degraded load (the backup keeps failing) logs once per distinct content and
-    // retries the backup without scanning the config directory again.
+    // #5929: a degraded load (the backup keeps failing) logs once per distinct content.
     (process.getuid?.() === 0 ? it.skip : it)(
-      "logs a failed backup once per distinct content and does not rescan for the same bytes",
+      "logs a failed backup once per distinct content",
       () => {
         const contentA = conflictCases[0][1]();
         const contentB = conflictCases[1][1]();
@@ -1402,14 +1401,10 @@ describe("Config", () => {
         // A read-only config dir makes the sidecar write fail. config.json itself stays
         // writable, so the test can still change its contents.
         fs.chmodSync(tempDir, 0o500);
-        const readdirSpy = spyOn(fs, "readdirSync");
         try {
           config.loadConfigOrDefault();
-          const scans = () =>
-            readdirSpy.mock.calls.filter(([dir]) => String(dir) === tempDir).length;
-          const scansAfterFirstLoad = scans();
           config.loadConfigOrDefault();
-          expect(scans()).toBe(scansAfterFirstLoad);
+          expect(logged()).toBe(1);
 
           writeProjects(contentB);
           config.loadConfigOrDefault();
@@ -1417,14 +1412,41 @@ describe("Config", () => {
           config.loadConfigOrDefault();
           expect(logged()).toBe(2);
         } finally {
-          readdirSpy.mockRestore();
           fs.chmodSync(tempDir, 0o700);
           errorSpy.mockRestore();
         }
       }
     );
 
-    // A retry may skip the reuse scan only after a scan that completed: a scan that threw found
+    (process.getuid?.() === 0 ? it.skip : it)(
+      "logs a failed backup again after a load without the conflict ends the failure",
+      () => {
+        const content = conflictCases[0][1]();
+        const configFile = path.join(tempDir, "config.json");
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        const logged = () =>
+          errorSpy.mock.calls.filter(([message]) => String(message).includes("the backup of"))
+            .length;
+        writeProjects(content);
+        fs.chmodSync(tempDir, 0o500);
+        try {
+          config.loadConfigOrDefault();
+          // The file goes away, then comes back with the same bytes: a new failure episode.
+          fs.chmodSync(tempDir, 0o700);
+          fs.renameSync(configFile, `${configFile}.moved`);
+          config.loadConfigOrDefault();
+          fs.renameSync(`${configFile}.moved`, configFile);
+          fs.chmodSync(tempDir, 0o500);
+          config.loadConfigOrDefault();
+          expect(logged()).toBe(2);
+        } finally {
+          fs.chmodSync(tempDir, 0o700);
+          errorSpy.mockRestore();
+        }
+      }
+    );
+
+    // Each degraded load searches for an identical backup again: a search that failed found
     // nothing, and an identical backup it missed must still be reused later.
     (process.getuid?.() === 0 ? it.skip : it)(
       "scans again after a reuse scan that failed, and reuses the backup it then finds",

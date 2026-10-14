@@ -1244,12 +1244,7 @@ const configLoadFailureStates = new Map<string, ConfigLoadFailureState>();
 // Config files whose last load merged conflicting alias rows but could not back up the bytes
 // (#5929): the backup error for the edit refusal, and a log-dedupe signature (content hash plus
 // errno code: fs messages embed the timestamped sidecar path). Process-scoped as above.
-// `scanned`: the failed attempt finished its search for an identical sidecar, so a retry of the
-// same bytes may skip it.
-const aliasConflictBackupFailures = new Map<
-  string,
-  { message: string; contentHash: string; scanned: boolean }
->();
+const aliasConflictBackupFailures = new Map<string, { message: string }>();
 
 // Failed alias-conflict backups already logged, per config file: sha256 of the bytes plus the
 // errno code (#5929). While backups keep failing, a content that comes back does not log again.
@@ -1308,6 +1303,10 @@ function findIdenticalConfigSidecar(
   return null;
 }
 
+function sha256Hex(bytes: Buffer): string {
+  return crypto.createHash("sha256").update(bytes).digest("hex");
+}
+
 /**
  * Write `rawBytes` next to config.json as `config.json.<tag>-<ms>`, or reuse a byte-identical
  * sidecar with that tag. Throws when neither works. Shared by the corrupt-file backup and the
@@ -1320,33 +1319,6 @@ function writeConfigBytesSidecar(
 ): { path: string; reused: boolean } {
   const reusedPath = findIdenticalConfigSidecar(configFile, tag, rawBytes);
   if (reusedPath !== null) return { path: reusedPath, reused: true };
-  return { path: createConfigSidecar(configFile, tag, rawBytes), reused: false };
-}
-
-/**
- * Back up alias-conflict bytes. `progress.scanned` starts true when the caller skips the search
- * for an identical sidecar (a retry of bytes whose earlier search completed and found none), and
- * becomes true once a search completes.
- */
-function writeAliasConflictSidecar(
-  configFile: string,
-  rawBytes: Buffer,
-  progress: { scanned: boolean }
-): { path: string; reused: boolean } {
-  if (!progress.scanned) {
-    const reusedPath = findIdenticalConfigSidecar(configFile, "alias-conflict", rawBytes);
-    progress.scanned = true;
-    if (reusedPath !== null) return { path: reusedPath, reused: true };
-  }
-  return { path: createConfigSidecar(configFile, "alias-conflict", rawBytes), reused: false };
-}
-
-function sha256Hex(bytes: Buffer): string {
-  return crypto.createHash("sha256").update(bytes).digest("hex");
-}
-
-/** Create a new `config.json.<tag>-<ms>` sidecar holding `rawBytes`, and return its path. */
-function createConfigSidecar(configFile: string, tag: string, rawBytes: Buffer): string {
   // Write the bytes the caller parsed (not a re-read of the file, which another process
   // may have replaced), leaving the source in place so throwOnError cleanup guards
   // continue to reject it. "wx" creates exclusively; on a same-millisecond collision
@@ -1368,7 +1340,7 @@ function createConfigSidecar(configFile: string, tag: string, rawBytes: Buffer):
   // The creation mode is reduced by the process umask (a 0777 umask yields an
   // owner-unreadable file); chmod is not, so pin the final mode explicitly.
   fs.chmodSync(backupPath, 0o600);
-  return backupPath;
+  return { path: backupPath, reused: false };
 }
 
 /** Location of config.json under a Xum root (also used by callers that must stat it without a Config). */
@@ -1939,14 +1911,10 @@ export class Config {
       loggedAliasBackupFailures.delete(this.configFile);
       return true;
     }
-    const failed = aliasConflictBackupFailures.get(this.configFile);
-    // Hash only on a retry after a failure; the first backup attempt needs no hash.
-    const contentHash = failed === undefined ? undefined : sha256Hex(rawBytes);
-    // A retry of the same bytes skips the reuse scan when the failed attempt finished it and
-    // found no copy: every degraded load retries (#5929). A scan that threw proves nothing.
-    const progress = { scanned: failed?.scanned === true && failed.contentHash === contentHash };
     try {
-      const sidecar = writeAliasConflictSidecar(this.configFile, rawBytes, progress);
+      // Every degraded load retries in full, including the search for an identical sidecar: that
+      // search is how a backup that becomes readable again is found (#5929).
+      const sidecar = writeConfigBytesSidecar(this.configFile, "alias-conflict", rawBytes);
       aliasConflictBackupFailures.delete(this.configFile);
       loggedAliasBackupFailures.delete(this.configFile);
       // A reused sidecar means an earlier load already logged this content.
@@ -1958,31 +1926,27 @@ export class Config {
       }
       return true;
     } catch (error) {
-      this.recordAliasBackupFailure(
-        { contentHash: contentHash ?? sha256Hex(rawBytes), scanned: progress.scanned },
-        error,
-        conflicts
-      );
+      this.recordAliasBackupFailure(rawBytes, error, conflicts);
       return false;
     }
   }
 
   /** Arm the edit gate for a failed alias-conflict backup, and log it once per signature. */
   private recordAliasBackupFailure(
-    attempt: { contentHash: string; scanned: boolean },
+    rawBytes: Buffer,
     error: unknown,
     conflicts: ProjectAliasConflict[]
   ): void {
     const message = error instanceof Error ? error.message : String(error);
     // fs messages embed the timestamped sidecar path: dedupe on the errno code instead.
-    const signature = `${attempt.contentHash}:${(error as NodeJS.ErrnoException).code ?? message}`;
+    const signature = `${sha256Hex(rawBytes)}:${(error as NodeJS.ErrnoException).code ?? message}`;
     if (rememberAliasBackupFailure(this.configFile, signature)) {
       log.error(
         `Project config entries share a path and hold conflicting rows for the same workspace, and the backup of ${this.configFile} failed (${message}). Settings changes will not overwrite config.json until a backup succeeds.`,
         { conflicts }
       );
     }
-    aliasConflictBackupFailures.set(this.configFile, { message, ...attempt });
+    aliasConflictBackupFailures.set(this.configFile, { message });
   }
 
   /** Failure state this instance's last failed load wrote; see getConfigLoadError. */
@@ -2105,9 +2069,11 @@ export class Config {
       // The last load decides the alias-conflict gate (#5929): a missing or corrupt file has
       // no merged rows to protect, and the corrupt-file gate below covers the latter.
       aliasConflictBackupFailures.delete(this.configFile);
+      loggedAliasBackupFailures.delete(this.configFile);
       configLoadFailureStates.delete(this.configFile);
     } catch (error) {
       aliasConflictBackupFailures.delete(this.configFile);
+      loggedAliasBackupFailures.delete(this.configFile);
       this.handleConfigLoadFailure(rawBytes, error);
       if (options?.throwOnError) throw error;
     }
