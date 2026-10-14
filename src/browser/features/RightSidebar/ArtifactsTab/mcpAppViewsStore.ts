@@ -415,11 +415,10 @@ export function useMcpAppView(
  * (reloadMcpAppView) can still find it. useMcpAppView returns null for both.
  */
 export function useMcpAppViewLookupFailed(workspaceId: string, toolCallId: string): boolean {
-  return useSyncExternalStore(subscribe, () => isMcpAppViewLookupFailed(workspaceId, toolCallId));
-}
-
-export function isMcpAppViewLookupFailed(workspaceId: string, toolCallId: string): boolean {
-  return recordLookups.get(lookupKey(workspaceId, toolCallId)) === "failed";
+  return useSyncExternalStore(
+    subscribe,
+    () => recordLookups.get(lookupKey(workspaceId, toolCallId)) === "failed"
+  );
 }
 
 /**
