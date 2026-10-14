@@ -243,6 +243,78 @@ describe("AgentPluginInstallService hook trust", () => {
     expect((await service.getHooks({ name: "guard" })).hooks[0]?.review).toBe("trusted");
   });
 
+  const trustFirstHook = async () => {
+    const [hook] = (await service.getHooks({ name: "guard" })).hooks;
+    await service.setHookTrust({ name: "guard", key: hook.key, hash: hook.hash, state: "trusted" });
+    return (await service.getHooks({ name: "guard" })).hooks[0]?.review;
+  };
+
+  test("a non-finite trust version is malformed, not a newer format", async () => {
+    await install();
+    await fsPromises.mkdir(path.dirname(trustFile()), { recursive: true });
+    // 1e400 parses to Infinity.
+    await fsPromises.writeFile(trustFile(), '{ "version": 1e400, "hooks": {} }');
+
+    expect(await trustFirstHook()).toBe("trusted");
+  });
+
+  test("a newer-format record from an earlier install does not block trust changes", async () => {
+    await install();
+    await fsPromises.mkdir(path.dirname(trustFile()), { recursive: true });
+    // A newer build wrote this before a downgrade and a reinstall (a new installedAt).
+    await fsPromises.writeFile(
+      trustFile(),
+      JSON.stringify({ version: 2, installedAt: "2000-01-01T00:00:00.000Z", hooks: {} })
+    );
+
+    expect(await trustFirstHook()).toBe("trusted");
+  });
+
+  test("a regular file at the trust-store root is replaced, not an ENOTDIR error", async () => {
+    await install();
+    const root = path.join(xumRoot, "plugin-hook-trust");
+    await fsPromises.writeFile(root, "corrupted");
+
+    expect(await trustFirstHook()).toBe("trusted");
+    // Uninstall with a corrupted root succeeds and removes it.
+    await fsPromises.rm(root, { recursive: true });
+    await fsPromises.writeFile(root, "corrupted");
+    await service.uninstall({ name: "guard", deletePluginData: false });
+    expect(await fsPromises.stat(root).catch(() => null)).toBeNull();
+  });
+
+  test("a trust file with mode 000 is repaired on the next decision", async () => {
+    if (process.platform === "win32" || process.getuid?.() === 0) return;
+    await install();
+    await fsPromises.mkdir(path.dirname(trustFile()), { recursive: true });
+    await fsPromises.writeFile(trustFile(), "{}", { mode: 0o000 });
+
+    expect(await trustFirstHook()).toBe("trusted");
+    expect((await fsPromises.stat(trustFile())).mode & 0o777).toBe(0o600);
+  });
+
+  test("hook review reads its plugin's registry row even when another row is unparseable", async () => {
+    await install();
+    const registryFile = path.join(xumRoot, "plugins.json");
+    const document = JSON.parse(await fsPromises.readFile(registryFile, "utf8")) as {
+      plugins: unknown[];
+    };
+    // A row a newer Xum wrote (an unknown shape) for another plugin.
+    document.plugins.push({ name: "other", source: { kind: "future" } });
+    await fsPromises.writeFile(registryFile, JSON.stringify(document));
+
+    expect(await trustFirstHook()).toBe("trusted");
+  });
+
+  test("hook review rejects a pending installer journal instead of showing stale trust", async () => {
+    await install();
+    const journal = path.join(xumRoot, "plugin-staging", "update-guard.json");
+    await fsPromises.mkdir(path.dirname(journal), { recursive: true });
+    await fsPromises.writeFile(journal, "{}");
+
+    await expect(service.getHooks({ name: "guard" })).rejects.toThrow(/changed.*review/i);
+  });
+
   test("a malformed trust entry (a directory) does not block uninstall", async () => {
     await install();
     await fsPromises.mkdir(trustFile(), { recursive: true });
