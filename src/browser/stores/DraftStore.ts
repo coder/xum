@@ -819,6 +819,7 @@ export class DraftStore {
     }
     for (const [key, { entry }] of this.pendingListPuts) merged.set(key, entry);
     for (const key of this.pendingDeletes.keys()) merged.delete(key);
+    for (const key of this.waitingDeletes) merged.delete(key);
     const byProject: CreationDraftsByProject = {};
     for (const { projectPath, ...draft } of merged.values()) {
       (byProject[projectPath] ??= []).push(draft);
@@ -1527,10 +1528,12 @@ export class DraftStore {
     } finally {
       this.waitingDeletes.delete(key);
     }
-    if (this.entries.has(key)) return;
+    // Edited again while waiting: the draft stays, and so does any row the list still holds.
+    if (this.entries.has(key)) {
+      if (scope.kind === "creation") this.recomputeList();
+      return;
+    }
     this.pendingDeletes.set(key, scope);
-    // A list event while waiting above may have shown the row again; hide it now.
-    if (scope.kind === "creation") this.recomputeList();
     await this.sendDelete(key, 0);
   }
 
@@ -1827,7 +1830,7 @@ export class DraftStore {
   private applySnapshot(drafts: DraftSummary[]): void {
     const seen = new Set<string>();
     for (const summary of drafts) {
-      if (this.pendingDeletes.has(draftStoreScopeKey(summary.scope))) continue;
+      if (this.isDeleting(draftStoreScopeKey(summary.scope))) continue;
       const entry = this.getOrCreateEntry(summary.scope);
       seen.add(draftStoreScopeKey(summary.scope));
       // Each subscription restarts the revision sequence, so a restarted backend is never ignored.

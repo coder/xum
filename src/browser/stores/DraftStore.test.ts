@@ -556,6 +556,41 @@ describe("DraftStore", () => {
     expect(store.getView(scope).text).toBe("");
   });
 
+  test("a delete that waits for a write is not undone by a reconnect snapshot", async () => {
+    using tempDir = new TestTempDir("draft-store-delete-during-reconnect");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    const scope: DraftScope = { kind: "creation", projectPath, draftId: "d1" };
+    store.putCreationDraft(projectPath, { draftId: "d1", subProjectPath: null, createdAt: 1 });
+    await waitFor(async () => (await service.getList()).entries.length === 1);
+    let sendUpdate: () => void = () => undefined;
+    let sendReply: () => void = () => undefined;
+    control.updateGate = new Promise<void>((resolve) => {
+      sendUpdate = resolve;
+    });
+    control.updateReplyGate = new Promise<void>((resolve) => {
+      sendReply = resolve;
+    });
+    store.setText(scope, "submitted as a workspace");
+    const flushed = store.flush(scope);
+    await waitFor(() => control.updates === 1);
+    const deleted = store.deleteDraft(scope);
+    sendUpdate();
+    await waitFor(async () => (await service.get(scope)).text.length > 0);
+    // The subscription reconnects while the delete waits: its snapshot holds the draft and row.
+    store.setClient(null);
+    await service.update({ scope: WS_SCOPE, text: "marks the snapshot" });
+    store.setClient(client);
+    await waitFor(() => store.getText(WS_SCOPE) === "marks the snapshot");
+    expect(store.getCreationDraftsByProject()[projectPath]).toBeUndefined();
+    sendReply();
+    await Promise.all([flushed, deleted]);
+    expect((await service.get(scope)).text).toBe("");
+    expect((await service.getList()).entries).toEqual([]);
+    expect(store.getView(scope).text).toBe("");
+  });
+
   test("replaces a malformed legacy draft list, so its import still completes", async () => {
     using tempDir = new TestTempDir("draft-store-legacy-list-malformed");
     const { projectPath, service, client } = await createHarness(tempDir);
