@@ -514,6 +514,12 @@ describe("turn.stop", () => {
             synthetic: true,
             admissionStale: () => true,
           });
+        if (turn === 1)
+          session.session.queueMessage("stale capture", options, {
+            acceptanceOrigin: "automatic",
+            synthetic: true,
+            compactionAdmissionStale: () => true,
+          });
       },
     });
 

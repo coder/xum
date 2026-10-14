@@ -470,14 +470,17 @@ export class MessageQueue {
 
   /**
    * Whether any entry would still dispatch: a withdrawn entry drains as a no-op, and an entry
-   * whose admission went stale is refused at the drain (or kept as held input) without streaming.
+   * whose admission (its own, its task attempt's or one add's compaction capture) went stale is
+   * refused at the drain (or kept as held input) without streaming.
    */
   hasDispatchableEntries(): boolean {
     return this.entries.some(
       (entry) =>
         entry.cancelSignal?.aborted !== true &&
         entry.admissionStale?.() !== true &&
-        entry.turnAdmission?.admissionStale() !== true
+        entry.turnAdmission?.admissionStale() !== true &&
+        // dequeueNext folds each add's compaction staleness into the dispatched send's.
+        !entry.acceptanceOrigins.some((add) => add.compactionAdmissionStale?.() === true)
     );
   }
 
