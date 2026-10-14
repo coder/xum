@@ -1,7 +1,7 @@
 import { snapshotPendingAiSelection } from "@/browser/utils/aiSelectionIntent";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { readScopedAiDefault, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
-import type { ParsedRuntime } from "@/common/types/runtime";
+import { RUNTIME_MODE, type ParsedRuntime } from "@/common/types/runtime";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { getProjectScopeId } from "@/common/constants/storage";
 
@@ -100,7 +100,18 @@ async function carryCreationAgent(
  */
 const runtimeHandOffs = new Map<string, ParsedRuntime>();
 
-/** Only between projects: Scratch has no runtime. */
+/**
+ * SECURITY AUDIT: a move hands off only a runtime that keeps the destination's source on this
+ * machine. An SSH host (Coder included) or a container picked for one project would otherwise
+ * receive another project's source, or the user's shared credentials, without the user picking
+ * it for that project. Such a pick stays behind, and the destination shows its own runtime.
+ */
+const HANDED_OFF_RUNTIME_MODES: ReadonlySet<ParsedRuntime["mode"]> = new Set([
+  RUNTIME_MODE.LOCAL,
+  RUNTIME_MODE.WORKTREE,
+]);
+
+/** Only between projects (Scratch has no runtime), and only a local runtime (see above). */
 export function handOffCreationRuntime(handOff: {
   sourceProjectPath: string;
   destProjectPath: string;
@@ -109,6 +120,7 @@ export function handOffCreationRuntime(handOff: {
 }): void {
   const scopes = [handOff.sourceProjectPath, handOff.destProjectPath];
   if (handOff.runtime == null || scopes.includes(SCRATCH_PROJECT_CONFIG_KEY)) return;
+  if (!HANDED_OFF_RUNTIME_MODES.has(handOff.runtime.mode)) return;
   runtimeHandOffs.set(handOff.draftScopeId, handOff.runtime);
 }
 
