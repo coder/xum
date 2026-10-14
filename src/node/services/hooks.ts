@@ -770,7 +770,7 @@ function postHookFailure(
   // A cancelled tool call (user interrupt, memory intuition deadline) aborts its
   // post-hook before or during exec. That is expected, so it is not an error.
   if (abortSignal?.aborted) {
-    log.debug("[hooks] Post-hook skipped: tool call aborted", { hookPath });
+    log.debug("[hooks] Post-hook skipped: tool call aborted", { hookPath, error: err });
   } else {
     log.error("[hooks] Post-hook execution failed", { hookPath, error: err });
   }
