@@ -1584,6 +1584,21 @@ describe("Config", () => {
         });
       }
 
+      it("keeps both rows and loads normally when the rows have no path", () => {
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({
+            projects: [
+              ["/home/u/repo/", { workspaces: [{ name: "x" }] }],
+              ["/home/u/repo", { workspaces: [{ id: "stable-1", name: "x" }] }],
+            ],
+          })
+        );
+        const rows = config.loadConfigOrDefault().projects.get("/home/u/repo")?.workspaces;
+        expect(rows?.map((w) => w.id)).toEqual([undefined, "stable-1"]);
+        expect(config.getConfigLoadError()).toBeNull();
+      });
+
       it("keeps both rows when the legacy row resolves to another id", async () => {
         const checkout = checkoutPath();
         writeLegacyAndIdRows(checkout, "stable-1");

@@ -1034,11 +1034,14 @@ function mergeProjectAliases(group: StoredProjectEntry[]): {
   return { config: merged, conflictingIds: [...conflictingIds] };
 }
 
-/** The ids of the rows that have one, by checkout path. */
+/**
+ * The ids of the rows that have one, by checkout path. Rows without a string path are left out:
+ * config.json rows are not schema-checked, and a load must not throw on a malformed row (#5929).
+ */
 function idRowIdsByPath(workspaces: ProjectConfig["workspaces"]): Map<string, string[]> {
   const idsByPath = new Map<string, string[]>();
   for (const workspace of workspaces) {
-    if (!workspace.id) continue;
+    if (!workspace.id || typeof workspace.path !== "string") continue;
     const ids = idsByPath.get(workspace.path);
     if (ids) ids.push(workspace.id);
     else idsByPath.set(workspace.path, [workspace.id]);
@@ -1062,7 +1065,8 @@ function dropLegacyDuplicateRows(
   const dropped: string[] = [];
   for (let index = workspaces.length - 1; index >= 0; index--) {
     const workspace = workspaces[index];
-    // Only a legacy row that shares its path with an id row costs a lookup.
+    // Only a legacy row that shares its path with an id row costs a lookup. idsByPath holds only
+    // string paths, so a row without one never matches.
     const pathIds = workspace.id ? undefined : idsByPath.get(workspace.path);
     if (pathIds === undefined) continue;
     const resolvedId = resolveLegacyId(workspace);
