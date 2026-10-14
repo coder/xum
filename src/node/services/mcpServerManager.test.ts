@@ -1410,6 +1410,47 @@ describe("MCPServerManager", () => {
     expect(calls).toHaveLength(1);
   });
 
+  test("a plugin server's label is cleaned of bidi and control characters", async () => {
+    using tmp = new DisposableTempDir("mcp-apps-entry-label");
+    manager.setMcpApps({
+      isEnabled: () => true,
+      store: new McpAppResultStore((id) => path.join(tmp.path, id)),
+    });
+    const plugin = (pluginName: string, serverName: string, command: string) => ({
+      ...stdioConfig(command),
+      env: { PLUGIN_DATA: path.join(tmp.path, command) },
+      plugin: {
+        pluginName,
+        serverName,
+        sourceScope: "global" as const,
+        sourceLocation: "~/.xum/plugins/p",
+      },
+    });
+    configService.listServers.mockResolvedValue({
+      // A plugin mcp.json key with RLO and a newline: it must not reorder or wrap the label.
+      reordered: plugin("bits\u202eand\nbolts", "tr\u202eay\n", "apps-entry-label"),
+      // A part that cleans to nothing: the server key's display form instead.
+      blank: plugin("\u202e\n", "tray", "apps-entry-label-blank"),
+    });
+    for (const command of ["apps-entry-label", "apps-entry-label-blank"]) {
+      servers.serve(command, {
+        tools: { show: testTool() },
+        apps: {
+          hasTool: () => true,
+          toolUi: () => undefined,
+          appEntrypoints: () => [
+            { toolName: "board", title: "Board", resourceUri: "ui://x/view", types: ["global"] },
+          ],
+        },
+      });
+    }
+    const request = workspaceRequest("apps-entry-label");
+    await manager.getToolsForWorkspace(request);
+    expect(
+      (await manager.listMcpAppEntrypoints(request.workspaceId)).map((entry) => entry.serverLabel)
+    ).toEqual(["bits and bolts · tr ay", "blank"]);
+  });
+
   test("entry point opens share the view tool-call budget per server", async () => {
     using tmp = new DisposableTempDir("mcp-apps-entry-limit");
     manager.setMcpApps({

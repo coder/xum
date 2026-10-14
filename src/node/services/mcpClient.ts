@@ -17,6 +17,7 @@ import {
   isModelVisibleTool,
   MCP_APP_MIME_TYPE,
   MCP_APPS_EXTENSION_ID,
+  MCP_APP_TOOL_NAME_MAX_CHARS,
   mcpAppEntrypointTitle,
   parseMCPAppEntrypoints,
   parseMCPToolUiMeta,
@@ -371,7 +372,15 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
             [definition.title, definition.annotations?.title],
             definition.name
           );
-          if (types.length > 0 && title !== undefined) {
+          // The routes take 1 to MCP_APP_TOOL_NAME_MAX_CHARS characters (see the constant).
+          const routable =
+            definition.name.length > 0 && definition.name.length <= MCP_APP_TOOL_NAME_MAX_CHARS;
+          if (!routable) {
+            log.debug("[MCP Apps] Skipping an entry point whose tool name the routes refuse", {
+              nameLength: definition.name.length,
+            });
+          }
+          if (types.length > 0 && title !== undefined && routable) {
             entrypoints.push({
               toolName: definition.name,
               title,

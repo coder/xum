@@ -162,6 +162,13 @@ export function parseMCPAppEntrypoints(meta: unknown): {
   return { types: [...types], skippedFile };
 }
 
+/**
+ * Longest tool name the MCP Apps routes accept (a view's tools/call, an entry point listing and
+ * open). An entry point whose tool name does not fit is not listed: one bad name would fail the
+ * listing's output schema for every server.
+ */
+export const MCP_APP_TOOL_NAME_MAX_CHARS = 256;
+
 /** Longest entry point title shown (launcher row, palette command, tab label). */
 export const MCP_APP_ENTRYPOINT_TITLE_MAX_CHARS = 120;
 

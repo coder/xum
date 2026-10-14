@@ -13,11 +13,19 @@ import { withExecutionScope } from "./tools/withExecutionScope";
 const fixture = path.resolve(import.meta.dir, "../../../tests/fixtures/mcp/apps-server.ts");
 const clients: MCPClientHandle[] = [];
 
-async function connect(mcpApps: boolean) {
+/** The test process's environment (defined values only) plus `extra`. */
+function fixtureEnv(extra: Record<string, string>): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) if (value !== undefined) env[key] = value;
+  return { ...env, ...extra };
+}
+
+async function connect(mcpApps: boolean, env?: Record<string, string>) {
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [fixture],
     stderr: "pipe",
+    ...(env !== undefined ? { env: fixtureEnv(env) } : {}),
   });
   const client = await createMCPClient({ transport, mcpApps });
   clients.push(client);
@@ -75,6 +83,17 @@ describe("MCP Apps client gating", () => {
 });
 
 describe("MCP App entry points", () => {
+  test("skips entry points whose tool names the routes refuse (empty, over-long)", async () => {
+    // One bad name in the list would fail the listEntrypoints output schema for every server.
+    const client = await connect(true, { APPS_FIXTURE_BAD_ENTRYPOINT_NAMES: "1" });
+    await client.tools();
+    expect(client.appEntrypoints().map((entry) => entry.toolName)).toEqual([
+      "show_chart",
+      "refresh_chart",
+      "legacy_view",
+    ]);
+  });
+
   test("lists entry points with the spec's title order; visibility does not hide them", async () => {
     expect((await connect(false)).appEntrypoints()).toEqual([]);
     const client = await connect(true);

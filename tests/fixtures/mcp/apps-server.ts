@@ -105,6 +105,24 @@ function chartResult(title: string, values: number[]) {
   };
 }
 
+/**
+ * APPS_FIXTURE_BAD_ENTRYPOINT_NAMES=1: also list app-only entry point tools whose names do not fit
+ * the host's route contract (empty, 300 characters), as a misbehaving server might.
+ */
+function badEntrypointTools() {
+  if (process.env.APPS_FIXTURE_BAD_ENTRYPOINT_NAMES !== "1") return [];
+  return ["", "x".repeat(300)].map((name) => ({
+    name,
+    // Titled, so only the name (not an empty title) decides.
+    title: "Misnamed view",
+    inputSchema: { type: "object", properties: {} },
+    _meta: {
+      ui: { resourceUri: VIEW_URI, visibility: ["app"] },
+      "openai/ui": { entrypoints: [{ type: "global" }] },
+    },
+  }));
+}
+
 const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
 lines.on("line", (line) => {
   const request = JSON.parse(line) as {
@@ -165,6 +183,7 @@ lines.on("line", (line) => {
             },
           },
           { name: "capabilities_probe", inputSchema: { type: "object", properties: {} } },
+          ...badEntrypointTools(),
         ],
       };
       break;
