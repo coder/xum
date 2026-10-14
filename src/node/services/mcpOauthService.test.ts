@@ -1006,6 +1006,42 @@ describe("McpOauthService OAuth flows", () => {
     }
   });
 
+  test("a write that another process replaces at once is not taken as the current file (#6123)", async () => {
+    const urlA = "https://a.example.com/mcp";
+    const urlB = "https://b.example.com/mcp";
+    const entry = (serverUrl: string) => ({
+      serverUrl,
+      updatedAtMs: Date.now(),
+      clientInformation: { client_id: "c" },
+      tokens: { access_token: "at", token_type: "Bearer" },
+    });
+    const storePath = getStoreFilePath(xumHome);
+    await fs.writeFile(storePath, JSON.stringify({ version: 2, entries: { [urlA]: entry(urlA) } }));
+    expect(await service.hasAuthTokens({ serverUrl: urlA })).toBe(true);
+    // The sign-out stats the file once before its write. The other process replaces the file
+    // just before the next stat: right after the write, or at the next credential read.
+    const realStat = fs.stat.bind(fs);
+    let stats = 0;
+    const stat = spyOn(fs, "stat").mockImplementation((async (
+      ...args: Parameters<typeof fs.stat>
+    ) => {
+      if (++stats === 2) {
+        await fs.writeFile(
+          storePath,
+          JSON.stringify({ version: 2, entries: { [urlB]: entry(urlB) } })
+        );
+      }
+      return realStat(...args);
+    }) as typeof fs.stat);
+    try {
+      await service.logout({ serverUrl: urlA });
+      expect(await service.hasAuthTokens({ serverUrl: urlB })).toBe(true);
+      expect(stats).toBeGreaterThanOrEqual(2);
+    } finally {
+      stat.mockRestore();
+    }
+  });
+
   test("a registered client's token endpoint auth method survives a restart", async () => {
     const serverUrl = "https://example.com/mcp";
     await fs.writeFile(
