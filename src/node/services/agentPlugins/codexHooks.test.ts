@@ -487,9 +487,11 @@ describe("loadPluginCodexHooks", () => {
               hooks: [
                 { ...scan, timeout: 1.5 },
                 { ...scan, timeout: 2 },
-                // Every u64 value parses in Codex, also above 2^53; 2^64 does not.
+                // Every u64 value parses in Codex, also above 2^53 and u64::MAX itself (which
+                // JSON.parse rounds to 2^64); a larger value does not.
                 { ...scan, timeout: 1e19 },
                 { ...scan, timeout: 2 ** 64 },
+                { ...scan, timeout: 2 ** 65 },
               ],
             },
           ],
@@ -502,6 +504,7 @@ describe("loadPluginCodexHooks", () => {
     expect(hooks.map((hook) => hook.key)).toEqual([
       "hooks/hooks.json#Stop[0][1]",
       "hooks/hooks.json#Stop[0][2]",
+      "hooks/hooks.json#Stop[0][3]",
     ]);
     expect(warnings).toHaveLength(2);
   });

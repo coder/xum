@@ -56,8 +56,12 @@ const MATCHERLESS_CODEX_HOOK_EVENTS = new Set(["UserPromptSubmit", "Stop", "Inte
 
 const DEFAULT_HOOKS_FILE = "hooks/hooks.json";
 const MAX_HOOKS_FILE_BYTES = 256 * 1024;
-/** Codex reads `timeout` as a u64 (whole seconds); the runner caps it at 30 s anyway. */
-const U64_LIMIT = 2 ** 64;
+/**
+ * Codex reads `timeout` as a u64 (whole seconds); the runner caps it at 30 s anyway. JSON.parse
+ * rounds u64::MAX (18446744073709551615) up to 2^64, so the bound is inclusive: the one value it
+ * also lets through, 2^64 itself, cannot be told apart after parsing (PRRT_kwDOPxxmWM6sSOZI).
+ */
+const U64_MAX_AFTER_PARSE = 2 ** 64;
 /**
  * Bounds for one plugin. Install Preview loads the hooks of an untrusted repository, and a
  * 256 KiB manifest can repeat one path tens of thousands of times: without them one Preview
@@ -307,7 +311,12 @@ function readGroupMatcher(
 }
 
 function isU64(value: unknown): boolean {
-  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value < U64_LIMIT;
+  return (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= 0 &&
+    value <= U64_MAX_AFTER_PARSE
+  );
 }
 
 function parseHandler(
