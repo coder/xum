@@ -23,7 +23,8 @@ import { stableStringify } from "@/common/utils/stableStringify";
 /** Bump when the fingerprint input changes: every record then needs a new review (fails closed). */
 const CONSENT_SCHEME = 1;
 
-type FieldRule = "include" | "exclude";
+/** "presence": only whether the field is set counts (a secret's location and value do not). */
+type FieldRule = "include" | "exclude" | "presence";
 
 /**
  * Every server field, by name. A new field is a compile error here until someone decides, so a
@@ -52,7 +53,10 @@ const HTTP_FIELDS: Record<keyof MCPHttpServerInfo, FieldRule> = {
   plugin: "exclude",
   configLayer: "exclude",
 };
-/** `clientSecretSource` only says where Xum rereads the secret, not what the server does. */
+/**
+ * `clientSecretSource` says where Xum rereads the secret, so its value is not behavior. Whether a
+ * secret is sent at all is: a newer parser that starts reading one must ask for review again.
+ */
 const OAUTH_FIELDS: Record<keyof MCPServerOAuthConfig, FieldRule> = {
   clientId: "include",
   tokenEndpointAuthMethod: "include",
@@ -60,7 +64,7 @@ const OAUTH_FIELDS: Record<keyof MCPServerOAuthConfig, FieldRule> = {
   baseScopes: "include",
   defaultScopes: "include",
   resource: "include",
-  clientSecretSource: "exclude",
+  clientSecretSource: "presence",
 };
 
 export interface ConsentPaths {
@@ -107,10 +111,14 @@ function normalizeValue(value: unknown, paths: ConsentPaths): unknown {
   return value;
 }
 
-function pick<T extends object>(value: T, rules: Record<keyof T, FieldRule>): Partial<T> {
-  const picked: Partial<T> = {};
+function pick<T extends object>(
+  value: T,
+  rules: Record<keyof T, FieldRule>
+): Partial<Record<keyof T, unknown>> {
+  const picked: Partial<Record<keyof T, unknown>> = {};
   for (const key of Object.keys(rules) as Array<keyof T>) {
-    if (rules[key] === "include" && value[key] !== undefined) picked[key] = value[key];
+    if (value[key] === undefined || rules[key] === "exclude") continue;
+    picked[key] = rules[key] === "presence" ? true : value[key];
   }
   return picked;
 }

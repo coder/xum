@@ -56,6 +56,11 @@ describe("serverConsentFingerprint", () => {
     expect(serverConsentFingerprint(otherSecret, roots)).toBe(
       serverConsentFingerprint(remote, roots)
     );
+    // Whether a client secret is sent is behavior: a parser that starts reading one must ask again.
+    const { clientSecretSource: _source, ...publicOauth } = remote.oauth!;
+    expect(serverConsentFingerprint({ ...remote, oauth: publicOauth }, roots)).not.toBe(
+      serverConsentFingerprint(remote, roots)
+    );
   });
 
   test("any launch-relevant change gives a new fingerprint", () => {
