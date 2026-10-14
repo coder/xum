@@ -44,6 +44,7 @@ import {
 } from "./mcpConfig";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import { skillConsentFingerprint } from "./componentConsent";
+import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
 
 /**
  * Lifecycle tests against a real local git "remote". Local-path remotes go
@@ -1641,6 +1642,47 @@ describe("AgentPluginInstallService", () => {
     expect(confirmed.cleanupWarning).toContain("reconcile failed");
     expect(Object.keys(confirmed.entry.componentConsent?.mcpServers ?? {})).toEqual(["echo"]);
     expect((await reviewer.list())[0].reviewRequiredCount).toBe(0);
+  });
+
+  test("an install loads its skill and server only while their review is recorded (#6498)", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const loaded = async () => {
+      const { skills } = await discoverAgentSkills(new LocalRuntime(muxRoot), muxRoot, {
+        roots: {
+          projectRoot: "",
+          globalRoot: path.join(muxRoot, "skills"),
+          universalRoot: "",
+          globalPluginRoots: [pluginsDir()],
+        },
+      });
+      const servers = await createAgentPluginsMcpProvider({ xumHome: muxRoot })({ trusted: false });
+      return {
+        skills: skills.filter((skill) => skill.pluginName === "demo-plugin").map((s) => s.name),
+        servers: Object.values(servers)
+          .filter((info) => info.plugin?.pluginName === "demo-plugin")
+          .map((info) => info.plugin?.serverName),
+      };
+    };
+    // The install recorded what its preview showed.
+    expect(await loaded()).toEqual({ skills: ["greet"], servers: ["echo"] });
+
+    // An install from before #6498 has no records: nothing of it loads, and nothing backfills.
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<Record<string, unknown>>;
+    };
+    delete document.plugins[0].componentConsent;
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+    expect(await loaded()).toEqual({ skills: [], servers: [] });
+    expect((await registry())[0]).not.toHaveProperty("componentConsent");
+
+    const review = await service.previewComponentReview({ name: "demo-plugin" });
+    await service.confirmComponentReview({
+      name: "demo-plugin",
+      expectedLockedSha: review.fromSha,
+      reviewed: review.changes.flatMap((change) => (change.component ? [change.component] : [])),
+    });
+    expect(await loaded()).toEqual({ skills: ["greet"], servers: ["echo"] });
   });
 
   test("an update records consent only for the changes the user reviewed (#6498)", async () => {

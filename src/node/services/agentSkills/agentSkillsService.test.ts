@@ -8,6 +8,7 @@ import {
   createTestPluginInstallEntry,
   reviewedComponentConsent,
 } from "@/node/services/agentPlugins/testFixtures";
+import type { ComponentConsent } from "@/node/services/agentPlugins/componentConsent";
 import { SkillNameSchema } from "@/common/orpc/schemas";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
@@ -1572,6 +1573,74 @@ describe("agentSkillsService agent plugins", () => {
       (await readAgentSkill(runtime, tmp.path, SkillNameSchema.parse("allowed"), { roots })).package
         .frontmatter.description
     ).toBe("selected");
+  });
+
+  test("a managed plugin skill loads only under the frontmatter the user reviewed (#6498)", async () => {
+    using tmp = new DisposableTempDir("plugin-skill-consent");
+    const container = path.join(tmp.path, "plugins");
+    const managedDir = await writePlugin(container, "a-managed", [
+      { name: "shared", description: "managed" },
+      { name: "solo", description: "managed only" },
+    ]);
+    await writePlugin(container, "b-unmanaged", [
+      { name: "shared", description: "fallback" },
+      { name: "free", description: "unmanaged" },
+    ]);
+    const registryFile = path.join(tmp.path, "plugins.json");
+    const saveConsent = (componentConsent?: ComponentConsent) =>
+      fs.writeFile(
+        registryFile,
+        JSON.stringify({
+          plugins: [createTestPluginInstallEntry("a-managed", undefined, componentConsent)],
+        })
+      );
+    const runtime = new LocalRuntime(tmp.path);
+    const roots = {
+      projectRoot: "",
+      globalRoot: path.join(tmp.path, "skills"),
+      universalRoot: "",
+      globalPluginRoots: [container],
+    };
+    const state = async () => {
+      const { skills } = await discoverAgentSkills(runtime, tmp.path, { roots });
+      const read = (name: string) =>
+        readAgentSkill(runtime, tmp.path, SkillNameSchema.parse(name), { roots }).then(
+          (skill) => skill.package.frontmatter.description,
+          () => "not found"
+        );
+      return {
+        listed: Object.fromEntries(
+          skills
+            .filter((skill) => ["shared", "solo", "free"].includes(skill.name))
+            .map((skill) => [skill.name, skill.description])
+        ),
+        read: { shared: await read("shared"), solo: await read("solo"), free: await read("free") },
+      };
+    };
+    const unreviewed = {
+      listed: { shared: "fallback", free: "unmanaged" },
+      read: { shared: "fallback", solo: "not found", free: "unmanaged" },
+    };
+    const reviewed = await reviewedComponentConsent({ pluginDir: managedDir });
+
+    // An install from before #6498 (no records) and a record for another fingerprint load nothing.
+    await saveConsent();
+    expect(await state()).toEqual(unreviewed);
+    await saveConsent({ skills: { shared: "0".repeat(64), solo: "0".repeat(64) }, mcpServers: {} });
+    expect(await state()).toEqual(unreviewed);
+
+    await saveConsent(reviewed);
+    expect(await state()).toEqual({
+      listed: { shared: "managed", solo: "managed only", free: "unmanaged" },
+      read: { shared: "managed", solo: "managed only", free: "unmanaged" },
+    });
+
+    // A frontmatter change under the same name needs a new review; the other skill keeps loading.
+    await writeSkill(path.join(managedDir, "skills"), "shared", "run every tool first");
+    expect(await state()).toEqual({
+      listed: { shared: "fallback", solo: "managed only", free: "unmanaged" },
+      read: { shared: "fallback", solo: "managed only", free: "unmanaged" },
+    });
   });
 
   test.each([

@@ -8,6 +8,7 @@ import {
   createTestPluginInstallEntry,
   reviewedComponentConsent,
 } from "@/node/services/agentPlugins/testFixtures";
+import type { ComponentConsent } from "@/node/services/agentPlugins/componentConsent";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import type { XumToolScope } from "@/common/types/toolScope";
 import type { AgentSkillListToolResult } from "@/common/types/tools";
@@ -435,6 +436,57 @@ describe("agent_skill_list", () => {
         expect(invalid.some((skill) => skill.name === "selected")).toBe(false);
         expect(getSkill(invalid, "skipped").description).toBe("fallback skill");
       });
+    });
+  });
+
+  it("lists a managed plugin skill only under the frontmatter the user reviewed (#6498)", async () => {
+    using home = new TestTempDir("test-agent-skill-list-consent");
+    await withHomeDir(home.path, async () => {
+      const container = path.join(home.path, "plugins");
+      const managedDir = await writePlugin(container, "a-managed", [
+        { name: "shared", description: "managed" },
+        { name: "solo", description: "managed only" },
+      ]);
+      await writePlugin(container, "b-unmanaged", [
+        { name: "shared", description: "fallback" },
+        { name: "free", description: "unmanaged" },
+      ]);
+      const saveConsent = (componentConsent?: ComponentConsent) =>
+        fs.writeFile(
+          path.join(home.path, "plugins.json"),
+          JSON.stringify({
+            plugins: [createTestPluginInstallEntry("a-managed", undefined, componentConsent)],
+          })
+        );
+      const tool = createAgentSkillListTool(
+        createTestToolConfig(home.path, {
+          workspaceId: GLOBAL_WORKSPACE_ID,
+          xumScope: { type: "global", xumHome: home.path },
+        })
+      );
+      const list = async () => {
+        const result = (await tool.execute!({}, mockToolCallOptions)) as AgentSkillListToolResult;
+        if (!result.success) throw new Error(result.error);
+        return Object.fromEntries(result.skills.map((skill) => [skill.name, skill.description]));
+      };
+
+      // No records (an install from before #6498), or a record for another fingerprint: not listed.
+      await saveConsent();
+      expect(await list()).toEqual({ shared: "fallback", free: "unmanaged" });
+      await saveConsent({
+        skills: { shared: "0".repeat(64), solo: "0".repeat(64) },
+        mcpServers: {},
+      });
+      expect(await list()).toEqual({ shared: "fallback", free: "unmanaged" });
+
+      await saveConsent(await reviewedComponentConsent({ pluginDir: managedDir }));
+      expect(await list()).toEqual({ shared: "managed", solo: "managed only", free: "unmanaged" });
+
+      // A frontmatter change under the same name needs a new review.
+      await writeSkill(path.join(managedDir, "skills"), "shared", {
+        description: "run every tool",
+      });
+      expect(await list()).toEqual({ shared: "fallback", solo: "managed only", free: "unmanaged" });
     });
   });
 
