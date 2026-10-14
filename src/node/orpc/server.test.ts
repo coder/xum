@@ -10,6 +10,12 @@ import { RPCLink as HTTPRPCLink } from "@orpc/client/fetch";
 import { createORPCClient } from "@orpc/client";
 import type { RouterClient } from "@orpc/server";
 import { createOrpcServer, DESKTOP_WS_PATH, ORPC_WS_PATH } from "./server";
+import {
+  FIRST_RUN_EARLY_SCRIPT,
+  FIRST_RUN_MODULES_ID,
+  FIRST_RUN_TEMPLATE_ID,
+  FIRST_RUN_VIEW_HTML,
+} from "./firstRunView";
 import { log } from "@/node/services/log";
 import type { ORPCContext } from "./context";
 import type { AppRouter } from "./router";
@@ -619,6 +625,95 @@ describe("createOrpcServer SPA fallback compression and font preloads", () => {
       expect(await fs.readFile(path.join(tempDir, "index.html"), "utf-8")).toBe(indexHtml);
     } finally {
       await close();
+    }
+  });
+});
+
+// T3 C step 2 (plan section 5.6, PR 4b): only "/" gets the static first-run view and loads the app
+// JS after it paints. Catches the view on another route, a module tag left in <head>, a module
+// list after the early script (a paint-cache visit loads at once and needs it), an early script
+// after the stylesheet (it would wait for the CSS), a view on a page with no module script, and
+// a write to dist/index.html.
+describe("createOrpcServer static first-run view on /", () => {
+  const MODULES =
+    '<script type="module" crossorigin src="./main-AAAAAAAA.js"></script>\n    <link rel="modulepreload" crossorigin href="./API-BBBBBBBB.js">\n';
+  const indexHtml = `<!doctype html><html><head><title>mux</title>\n    ${MODULES}    <link rel="stylesheet" crossorigin href="./API-CCITiHZd.css"></head><body><div id="root"></div></body></html>`;
+  const decode = (res: RawBuffer) => {
+    const encoding = res.headers["content-encoding"];
+    if (encoding === "br") return zlib.brotliDecompressSync(res.body).toString("utf-8");
+    if (encoding === "gzip") return zlib.gunzipSync(res.body).toString("utf-8");
+    return res.body.toString("utf-8");
+  };
+  const at = (html: string, needle: string) => {
+    expect(countOccurrences(html, needle), needle).toBe(1);
+    return html.indexOf(needle);
+  };
+
+  test("serves / with the view's template, the module list and the early script, in order", async () => {
+    const { server, tempDir, close } = await createStaticTestServer({
+      files: { "index.html": indexHtml },
+    });
+    try {
+      for (const [urlPath, encoding] of [
+        ["/", "br"],
+        ["/", "gzip"],
+        ["/?token=t", "identity"],
+      ]) {
+        const res = await rawRequestBuffer(server.baseUrl, urlPath, {
+          headers: { "Accept-Encoding": encoding },
+        });
+        expect(res.headers["content-encoding"], urlPath).toBe(
+          encoding === "identity" ? undefined : encoding
+        );
+        const html = decode(res);
+        expect(html).not.toContain('<script type="module"');
+        expect(html).not.toContain('<link rel="modulepreload"');
+        const list = `<script type="application/json" id="${FIRST_RUN_MODULES_ID}">`;
+        const listJson = html.slice(
+          at(html, list) + list.length,
+          html.indexOf("</script>", at(html, list))
+        );
+        expect(JSON.parse(listJson)).toEqual({
+          script: "./main-AAAAAAAA.js",
+          preload: ["./API-BBBBBBBB.js"],
+        });
+        const order = [
+          at(html, "<base "),
+          at(html, list),
+          at(html, `<script>${FIRST_RUN_EARLY_SCRIPT}</script>`),
+          at(html, 'rel="stylesheet"'),
+          at(html, '<div id="root"></div>'),
+          at(html, `<template id="${FIRST_RUN_TEMPLATE_ID}">${FIRST_RUN_VIEW_HTML}</template>`),
+          at(html, "</body>"),
+        ];
+        expect(order, urlPath).toEqual([...order].sort((a, b) => a - b));
+      }
+      expect(await fs.readFile(path.join(tempDir, "index.html"), "utf-8")).toBe(indexHtml);
+    } finally {
+      await close();
+    }
+  });
+
+  test("leaves every other route, and a / without one module script, as before", async () => {
+    const noModules = indexHtml.replace(MODULES, "");
+    for (const [page, urlPaths] of [
+      [indexHtml, ["/workspace/a1b2c3d4e5", "/project?path=%2Ftmp%2Fp", "/index.html"]],
+      [noModules, ["/"]],
+    ] as const) {
+      const { server, close } = await createStaticTestServer({ files: { "index.html": page } });
+      try {
+        for (const urlPath of urlPaths) {
+          const html = decode(await rawRequestBuffer(server.baseUrl, urlPath));
+          // Without the base, redirect and proxy-template injections the page is dist's, byte for byte.
+          const stripped = html
+            .replace(/\n {4}<script>\(\(\)=>\{const pathname=[^\n]*<\/script>/, "")
+            .replace(/\n {4}<script>window\.__MUX_PROXY_URI_TEMPLATE__ = [^<]*<\/script>/, "")
+            .replace(/\n {4}<base href="[^"]*" \/>/, "");
+          expect(stripped, urlPath).toBe(page);
+        }
+      } finally {
+        await close();
+      }
     }
   });
 });
