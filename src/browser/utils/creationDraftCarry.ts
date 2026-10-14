@@ -1,4 +1,5 @@
-import { snapshotPendingAiSelection } from "@/browser/utils/aiSelectionIntent";
+import { getAgentBases, snapshotPendingAiSelection } from "@/browser/utils/aiSelectionIntent";
+import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { readScopedAiDefault, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
 import type { ParsedRuntime } from "@/common/types/runtime";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
@@ -18,17 +19,38 @@ function carryScopedAiDefault<F extends CarriedAiField>(
   }
 }
 
+/** The agent a creation composer shows (undefined while its agents load). */
+export type CreationDraftAgent = Pick<AgentDefinitionDescriptor, "id" | "scope">;
+
+/**
+ * Built-in and global agents exist in every project. A project's own agent exists in another
+ * project only when that project's loaded agents include one with its id.
+ */
+function isAgentAvailableIn(agent: CreationDraftAgent | undefined, destScopeId: string): boolean {
+  if (agent == null) return false;
+  return agent.scope !== "project" || getAgentBases(destScopeId)?.has(agent.id) === true;
+}
+
 /**
  * Moving a creation draft to another project (the creation header's project selector) carries
  * the settings its composer shows. Creation AI settings are project-scoped defaults, so the
  * destination project's defaults take the source's values, as if the user had picked them there.
  * Not setWorkspaceModelWithOrigin: its "user" origin would turn Auto off.
  */
-export function carryCreationAiSettings(sourceProjectPath: string, destProjectPath: string): void {
+export function carryCreationAiSettings(
+  sourceProjectPath: string,
+  destProjectPath: string,
+  agent: CreationDraftAgent | undefined
+): void {
   if (sourceProjectPath === destProjectPath) return;
   const sourceScopeId = getProjectScopeId(sourceProjectPath);
   const destScopeId = getProjectScopeId(destProjectPath);
-  for (const field of ["agentId", "model", "thinkingLevel"] as const) {
+  // An agent the destination lacks stays behind, and the destination keeps its own: its composer
+  // would show the missing agent while a send ran the default one.
+  const fields = isAgentAvailableIn(agent, destScopeId)
+    ? (["agentId", "model", "thinkingLevel"] as const)
+    : (["model", "thinkingLevel"] as const);
+  for (const field of fields) {
     carryScopedAiDefault(sourceScopeId, destScopeId, field);
   }
   // Unsent picks (reasoning mode, service tier, Auto routing) replace the destination's own.

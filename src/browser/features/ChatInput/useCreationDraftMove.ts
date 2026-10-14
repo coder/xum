@@ -1,4 +1,5 @@
 import { useWorkspaceActions } from "@/browser/contexts/WorkspaceContext";
+import type { CreationDraftAgent } from "@/browser/utils/creationDraftCarry";
 import type { ParsedRuntime } from "@/common/types/runtime";
 
 interface CreationDraftMoveSource {
@@ -7,6 +8,7 @@ interface CreationDraftMoveSource {
   /** The composer's listed draft, or undefined for the project's default creation draft. */
   draftId: string | undefined;
   runtimePick: ParsedRuntime | null;
+  agent: CreationDraftAgent | undefined;
   sendInFlight: boolean;
   processingAttachmentCount: number;
   payloadsLoaded: boolean;
@@ -29,6 +31,7 @@ export function useCreationDraftMove(source: CreationDraftMoveSource) {
         draftId: source.draftId,
         destination,
         runtimePick: source.runtimePick,
+        agent: source.agent,
       }),
   };
 }

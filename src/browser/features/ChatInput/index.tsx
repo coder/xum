@@ -901,6 +901,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     projectPath: creationParentProjectPath,
     draftId: creationPendingDraftId,
     runtimePick: creationState.explicitRuntimePick,
+    agent: currentAgent,
     sendInFlight: isSendInFlight,
     processingAttachmentCount,
     payloadsLoaded: draft.payloadsLoaded,

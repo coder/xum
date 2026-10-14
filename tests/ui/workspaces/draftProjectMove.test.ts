@@ -28,7 +28,7 @@ import {
 } from "../helpers";
 import { renderApp, type RenderedApp } from "../renderReviewPanel";
 import { defaultCreationDraftScope, getDraftStore } from "@/browser/stores/DraftStore";
-import { setAutoRoutingPick } from "@/browser/utils/aiSelectionIntent";
+import { getAgentBases, setAutoRoutingPick } from "@/browser/utils/aiSelectionIntent";
 import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import { getAutoRouting, getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { readScopeAgentId } from "@/browser/utils/scopedAiDefaults";
@@ -99,6 +99,18 @@ async function moveDraftTo(container: HTMLElement, label: string): Promise<void>
   }, WAIT);
   await pickOption(trigger, label);
   await waitFor(() => expect(projectSelectorLabel(container)).toBe(label), WAIT);
+}
+
+async function pickAgent(container: HTMLElement, projectPath: string, agentId: string) {
+  fireEvent.click(container.querySelector<HTMLElement>('[aria-label="Select agent"]')!);
+  fireEvent.click(
+    await waitFor(() => {
+      const row = container.querySelector<HTMLElement>(`[data-agent-id="${agentId}"]`);
+      if (!row) throw new Error(`Agent row ${agentId} not found`);
+      return row;
+    }, WAIT)
+  );
+  await waitFor(() => expect(readScopeAgentId(getProjectScopeId(projectPath))).toBe(agentId), WAIT);
 }
 
 async function waitForDraftIds(projectPath: string, expected: string[]): Promise<void> {
@@ -213,15 +225,7 @@ describeIntegration("Creation project selector moves the draft", () => {
       fireEvent.change(nameInput, { target: { value: "moved-name" } });
       await waitFor(() => expect(nameInput.value).toBe("moved-name"), WAIT);
 
-      fireEvent.click(container.querySelector<HTMLElement>('[aria-label="Select agent"]')!);
-      fireEvent.click(
-        await waitFor(() => {
-          const row = container.querySelector<HTMLElement>('[data-agent-id="plan"]');
-          if (!row) throw new Error("Plan agent row not found");
-          return row;
-        }, WAIT)
-      );
-      await waitFor(() => expect(readScopeAgentId(getProjectScopeId(a))).toBe("plan"), WAIT);
+      await pickAgent(container, a, "plan");
       // The model selector's creation path; an explicit pick leaves model Auto.
       setWorkspaceModelWithOrigin(getProjectScopeId(a), KNOWN_MODELS.HAIKU.id, "user");
       // The destination's own Auto pick must not survive the move.
@@ -500,6 +504,43 @@ describeIntegration("Creation project selector moves the draft", () => {
       await cleanupView(view, cleanupDom);
       await getSharedEnv().orpc.projects.remove({ projectPath: plain });
       await fs.rm(plainDir, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  test("a project's own agent moves only to a project that has it", async () => {
+    const agentFiles: string[] = [];
+    const writeAgent = async (projectPath: string, agentId: string) => {
+      const file = path.join(projectPath, ".xum", "agents", `${agentId}.md`);
+      await fs.mkdir(path.dirname(file), { recursive: true });
+      await fs.writeFile(file, `---\nname: ${agentId}\nbase: exec\n---\n\nA test agent.\n`);
+      agentFiles.push(file);
+    };
+    const { view, cleanupDom, a, b } = await openTwoProjects();
+    const { container } = view;
+    try {
+      await writeAgent(a, "in-both");
+      await writeAgent(b, "in-both");
+      await writeAgent(a, "only-in-a");
+      // B's composer loads B's agents, so a move to B knows which ones B has.
+      await openProjectCreationView(view, b);
+      await waitFor(
+        () => expect(getAgentBases(getProjectScopeId(b))?.has("in-both")).toBe(true),
+        WAIT
+      );
+      await openProjectCreationView(view, a);
+      await pickAgent(container, a, "in-both");
+      await moveDraftTo(container, path.basename(b));
+      expect(readScopeAgentId(getProjectScopeId(b))).toBe("in-both");
+
+      await openProjectCreationView(view, a);
+      await pickAgent(container, a, "only-in-a");
+      await moveDraftTo(container, path.basename(b));
+
+      // B keeps its own agent: B's composer would show only-in-a while a send ran exec.
+      expect(readScopeAgentId(getProjectScopeId(b))).toBe("in-both");
+    } finally {
+      await cleanupView(view, cleanupDom);
+      await Promise.all(agentFiles.map((file) => fs.rm(file, { force: true })));
     }
   }, 90_000);
 });

@@ -57,6 +57,7 @@ import {
 import {
   carryCreationAiSettings,
   handOffCreationRuntime,
+  type CreationDraftAgent,
 } from "@/browser/utils/creationDraftCarry";
 import {
   defaultCreationDraftScope,
@@ -286,6 +287,8 @@ export interface WorkspaceDraftMove {
   destination: string;
   /** Carried only between projects (Scratch has no runtime). */
   runtimePick: ParsedRuntime | null;
+  /** The source composer's agent: a project's own agent moves only where it exists. */
+  agent: CreationDraftAgent | undefined;
 }
 
 /**
@@ -359,7 +362,7 @@ function applyWorkspaceDraftMove(move: WorkspaceDraftMove, dest: WorkspaceCreati
     projectPath: dest.projectPath,
     draftId,
   });
-  carryCreationAiSettings(move.projectPath, dest.projectPath);
+  carryCreationAiSettings(move.projectPath, dest.projectPath, move.agent);
   handOffCreationRuntime({
     sourceProjectPath: move.projectPath,
     destProjectPath: dest.projectPath,
