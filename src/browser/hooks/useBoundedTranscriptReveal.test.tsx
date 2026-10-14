@@ -736,5 +736,35 @@ describe("useBoundedTranscriptReveal", () => {
       expect(reveal().toIndex).toBe(toIndex - 50);
       expect(props().messages[reveal().toIndex - 1].id).toBe(keptId);
     });
+
+    test("the budget base keeps counting after an older page, even once the base row is gone", () => {
+      const { frames, reveal, runFrames, setProps, props } = renderSlice(MAX);
+      runFrames();
+      const baseId = props().messages[reveal().fromIndex].id;
+      act(() => reveal().revealMore());
+      runFrames();
+      const fromId = props().messages[reveal().fromIndex].id;
+      setProps({ messages: [...rows(300, "old"), ...props().messages] });
+      setProps({ messages: props().messages.filter((row) => row.id !== baseId) });
+      expect(frames.hasPending()).toBe(false);
+      expect(props().messages[reveal().fromIndex].id).toBe(fromId);
+    });
+
+    test("rows replaced inside the slice stay mounted when the end row goes later", () => {
+      const { reveal, readBack, setProps, props } = renderSlice(MAX);
+      readBack();
+      const { toIndex } = reveal();
+      const replaced = props().messages.map((row, i) =>
+        i >= toIndex - 20 && i < toIndex ? { id: `${row.id}-v2` } : row
+      );
+      setProps({ messages: replaced });
+      setProps({ messages: props().messages.filter((_, i) => i !== toIndex) });
+      expect(reveal().toIndex).toBe(toIndex);
+      // Rows appended later survive while every older newer row and 5 mounted rows go at once.
+      setProps({ messages: [...props().messages, ...rows(3, "new")] });
+      const keep = (i: number) => i < toIndex - 5 || i >= LONG - 1;
+      setProps({ messages: props().messages.filter((_, i) => keep(i)) });
+      expect(reveal().toIndex).toBe(toIndex - 10);
+    });
   });
 });

@@ -151,18 +151,33 @@ function storedSliceEnd(state: RevealState, rows: readonly RevealRow[], isSafeCu
   return nearestSafeCutAtOrBefore(kept, rows.length, isSafeCut);
 }
 
-/** Just after the newest row of `endRows[0, hint)` still in `rows`; 0 when none is. */
+/**
+ * Where the end goes once its row is gone: the nearest still-present row that was unmounted
+ * (`endRows[hint+1..]`, so mounted rows replaced since stay mounted), else just after the newest
+ * still-present mounted row (`endRows[..hint)`), else 0.
+ */
 function endAfterNewestKeptRow(
   rows: readonly RevealRow[],
   endRows: readonly RevealRow[],
   hint: number
 ): number {
   const indexById = new Map(rows.map((row, index) => [row.id, index]));
+  for (let newer = hint + 1; newer < endRows.length; newer += 1) {
+    const index = indexById.get(endRows[newer].id);
+    if (index !== undefined) return index;
+  }
   for (let kept = hint - 1; kept >= 0; kept -= 1) {
     const index = indexById.get(endRows[kept].id);
     if (index !== undefined) return index + 1;
   }
   return 0;
+}
+
+/** `state` with its budget-base hint moved to where the base row is now (like the anchor's). */
+function withBudgetBaseHint(state: RevealState, rows: readonly RevealRow[]): RevealState {
+  if (state.budgetBaseId === null) return state;
+  const base = findRow(rows, state.budgetBaseId, state.budgetBaseHint);
+  return base === -1 || base === state.budgetBaseHint ? state : { ...state, budgetBaseHint: base };
 }
 
 /** Rows revealed toward the automatic budget (see RevealState.autoRowLimit). */
@@ -463,7 +478,7 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
   assert(fromIndex >= 0 && fromIndex <= length, "reveal boundary must stay within the transcript");
   const max = args.maxMountedRows;
   const toIndex = resolveSliceEnd(current, args.messages, fromIndex, max, args.isSafeCut);
-  const sliced = withSliceEnd(current, args.messages, toIndex);
+  const sliced = withSliceEnd(withBudgetBaseHint(current, args.messages), args.messages, toIndex);
   if (sliced !== current) {
     current = sliced;
     setState(current);
