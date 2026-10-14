@@ -47,7 +47,7 @@ export async function runMessageSendHooks(
   workspaceId: string,
   input: MessageSendHookInput & { cwd?: string; signal?: AbortSignal }
 ): Promise<MessageSendHookOutcome> {
-  if (!spine.hasMiddleware("message.send")) return { kind: "none" };
+  if (!spine.hasMiddlewareFor("message.send", workspaceId)) return { kind: "none" };
   const base = {
     workspaceId,
     origin: input.origin,
@@ -90,14 +90,28 @@ export async function runMessageSendHooks(
       reason: reason.slice(0, MESSAGE_SEND_BLOCK_REASON_MAX_CHARS),
     };
   }
+  const kept = capContextEntries(ctx.additionalContext, workspaceId);
+  return kept.length > 0 ? { kind: "context", entries: kept } : { kind: "none" };
+}
+
+/** The non-blank entries, trimmed, in chain order, up to the rendered per-message cap. */
+function capContextEntries(
+  entries: readonly PluginHookContextEntry[],
+  workspaceId: string
+): PluginHookContextEntry[] {
   const kept: PluginHookContextEntry[] = [];
   let size = 0;
-  for (const entry of ctx.additionalContext) {
+  for (const entry of entries) {
     const text = entry.text.trim();
     if (text.length === 0) continue;
     // Charge the whole rendered block (plugin ID, wrapper, escaping), not just the text: many
-    // tiny entries or a long plugin ID must not slip past the cap.
-    const rendered = renderPluginHookContextEntry({ pluginId: entry.pluginId, text }).length;
+    // tiny entries or a long plugin ID must not slip past the cap. Escaping never shrinks text,
+    // so the raw length is a lower bound: check it first, so a huge text is never escaped
+    // (Codex PRRT_kwDOPxxmWM6reh6U, the rule persisted entries follow).
+    const rendered =
+      size + entry.pluginId.length + text.length > PLUGIN_HOOK_CONTEXT_MAX_CHARS
+        ? Infinity
+        : renderPluginHookContextEntry({ pluginId: entry.pluginId, text }).length;
     if (size + rendered > PLUGIN_HOOK_CONTEXT_MAX_CHARS) {
       log.warn("Prompt hooks: message.send context over the cap; dropping the rest", {
         workspaceId,
@@ -107,7 +121,7 @@ export async function runMessageSendHooks(
     kept.push({ pluginId: entry.pluginId, text });
     size += rendered;
   }
-  return kept.length > 0 ? { kind: "context", entries: kept } : { kind: "none" };
+  return kept;
 }
 
 /** turn.stop reply text is cut to this length. */
@@ -122,7 +136,7 @@ export async function runTurnStopHooks(
   workspaceId: string,
   input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive" | "cwd">
 ): Promise<TurnStopHookOutcome> {
-  if (!spine.hasMiddleware("turn.stop")) return { kind: "none" };
+  if (!spine.hasMiddlewareFor("turn.stop", workspaceId)) return { kind: "none" };
   const ctx: TurnStopContext = { workspaceId, ...input, continueReasons: [] };
   try {
     await spine.run("turn.stop", ctx);

@@ -316,10 +316,20 @@ function containerDimensionsOf(container: HTMLElement | null, inline: boolean) {
  *   its identity changes.
  * - `inlineCap` is the inline container's height cap, kept equal to the maxHeight the view is
  *   told (a resize updates both).
- * - `initial()` gives the dimensions for the ui/initialize reply and records them as sent.
+ * - `current()` reads the dimensions for a host context (the ui/initialize reply, or a display
+ *   mode request). It records nothing: most reads are not posted to the view.
+ * - `posted(message)` records the dimensions a message posted to the view carries (the
+ *   ui/initialize reply), so only what the view was actually sent counts as sent.
  * - `flush()` sends dimensions that changed since: the host drops updates until the view sent
  *   initialized, so a resize between the two is sent then.
  */
+/** Record the containerDimensions a ui/initialize reply carries as sent, if `message` is one. */
+function rememberPostedDimensions(sent: { current: string }, message: unknown) {
+  const reply = message as { result?: { hostContext?: { containerDimensions?: unknown } } };
+  const dimensions = reply.result?.hostContext?.containerDimensions;
+  if (dimensions !== undefined) sent.current = JSON.stringify(dimensions);
+}
+
 function useContainerDimensionsUpdates(hostRef: { current: McpAppHost | null }, inline: boolean) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [container, setContainer] = useState<HTMLDivElement | null>(null);
@@ -352,11 +362,8 @@ function useContainerDimensionsUpdates(hostRef: { current: McpAppHost | null }, 
   return {
     attach,
     inlineCap,
-    initial: () => {
-      const dimensions = containerDimensionsOf(containerRef.current, inline);
-      sent.current = JSON.stringify(dimensions);
-      return dimensions;
-    },
+    current: () => containerDimensionsOf(containerRef.current, inline),
+    posted: (message: unknown) => rememberPostedDimensions(sent, message),
     flush: () => flushRef.current(),
   };
 }
@@ -549,7 +556,7 @@ export function McpAppFrame(props: {
       // is the view's fullscreen, its tool card the inline mode. A move mounts a new instance.
       displayMode: inline ? "inline" : "fullscreen",
       availableDisplayModes: ["inline", "fullscreen"],
-      containerDimensions: dimensions.initial(),
+      containerDimensions: dimensions.current(),
       locale: navigator.language,
       timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       platform: hostPlatform(),
@@ -570,7 +577,9 @@ export function McpAppFrame(props: {
       grantedCsp: grant.granted,
       // Never into a frame that navigated away from the view (frameNavigationGuard.tsx).
       postToView: (message) => {
-        if (!navigatedRef.current) channel.post(message);
+        if (navigatedRef.current) return;
+        channel.post(message);
+        dimensions.posted(message);
       },
       getHostContext,
       callTool: async (toolName, args, consented) => {

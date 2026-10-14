@@ -534,6 +534,46 @@ describe("MCP App entry points", () => {
     }
   });
 
+  test("re-lists when a server announces a changed tool catalog", async () => {
+    let title = "Library";
+    const ticks: Array<() => void> = [];
+    const client = createTestApiClient({
+      mcpApps: {
+        listEntrypoints: () => Promise.resolve([entrypoint(title)]),
+        onEntrypointsChanged: (_input: unknown, options?: { signal?: AbortSignal }) =>
+          Promise.resolve(
+            (async function* () {
+              for (;;) {
+                const tick = Promise.withResolvers<void>();
+                ticks.push(tick.resolve);
+                options?.signal?.addEventListener("abort", () => tick.resolve(), { once: true });
+                await tick.promise;
+                if (options?.signal?.aborted === true) return;
+                yield undefined;
+              }
+            })()
+          ),
+      },
+    });
+    const wrapper = (props: { children: React.ReactNode }) => (
+      <APIProvider client={client}>{props.children}</APIProvider>
+    );
+    const { result } = renderHook(
+      () => {
+        useLoadMcpAppEntrypoints("ws-catalog", true);
+        return useMcpAppEntrypoints("ws-catalog");
+      },
+      { wrapper }
+    );
+    await waitFor(() => expect(result.current?.[0]?.title).toBe("Library"));
+    await waitFor(() => expect(ticks.length).toBeGreaterThan(0));
+
+    // tools/list_changed on one of the workspace's servers.
+    title = "Library 2";
+    act(() => ticks.at(-1)?.());
+    await waitFor(() => expect(result.current?.[0]?.title).toBe("Library 2"));
+  });
+
   test("after a restart, a tab whose entry point is gone shows unavailable, not its record", async () => {
     // A fresh workspace ID stands in for a restarted renderer: no ref or retired key is held.
     const target = entrypoint("Library");

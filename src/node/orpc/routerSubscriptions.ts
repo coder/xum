@@ -116,6 +116,23 @@ function shouldIncludeLogEntry(
   );
 }
 
+/** Ticks when an MCP Apps server of the workspace sends tools/list_changed. */
+export function subscribeMcpAppEntrypointChanges(
+  context: ORPCContext,
+  workspaceId: string,
+  signal?: AbortSignal
+): AsyncGenerator<undefined> {
+  return runtimeSubscription<undefined>(context, {
+    signal,
+    // A tick only asks for a re-list: one pending tick covers any number of changes.
+    buffer: "latest",
+    subscribe: (emit) =>
+      context.mcpServerManager.onMcpAppCatalogChanged((changed) => {
+        if (changed === workspaceId) emit.push(undefined);
+      }),
+  });
+}
+
 export function subscribeConfigChanges(
   context: ORPCContext,
   signal?: AbortSignal

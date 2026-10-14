@@ -140,6 +140,7 @@ import { clearLogsForApi, getLogFilePath } from "@/node/services/log";
 import {
   attachTerminal,
   subscribeConfigChanges,
+  subscribeMcpAppEntrypointChanges,
   subscribeDevTools,
   subscribeReviewState,
   subscribeDrafts,
@@ -243,6 +244,9 @@ type McpSettingsReadResult =
   | { success: true; data: MCPSettingsReadSnapshot | { notConnected: true } | null }
   | { success: false; error: string };
 
+const forIpc = (snapshot: MCPSettingsReadSnapshot | null) =>
+  snapshot === null ? null : mcpSettingsSnapshotForIpc(snapshot);
+
 /**
  * `mcp.settings.read` for several servers in one call (concurrently). With `ifConnected`, a
  * server the workspace does not run reads as `{ notConnected: true }`, and a running one is
@@ -250,9 +254,6 @@ type McpSettingsReadResult =
  * runs, so the read never starts or restarts a server (an instance that closed meanwhile
  * fails the read instead).
  */
-const forIpc = (snapshot: MCPSettingsReadSnapshot | null) =>
-  snapshot === null ? null : mcpSettingsSnapshotForIpc(snapshot);
-
 async function readMcpSettingsRoute(
   context: ORPCContext,
   input: { workspaceId: string; serverNames: string[]; ifConnected?: boolean },
@@ -260,8 +261,14 @@ async function readMcpSettingsRoute(
 ): Promise<Record<string, McpSettingsReadResult>> {
   const manager = context.mcpServerManager;
   // Per server: a hung server times out with its own error and does not hold back the others.
-  const timeoutMs = MCP_SETTINGS_READ_TIMEOUT_MS;
+  const readTimeoutMs = MCP_SETTINGS_READ_TIMEOUT_MS;
   const readOne = async (serverName: string): Promise<McpSettingsReadResult> => {
+    // A dialog reopened during a save must not show the values from before the save. The read
+    // gets the time the wait left, so the two share one deadline.
+    const timeoutMs = await manager.settingsSavesSettled(input.workspaceId, serverName, {
+      signal,
+      timeoutMs: readTimeoutMs,
+    });
     if (input.ifConnected !== true)
       return runMcpSettingsRoute(context, input.workspaceId, signal, async () =>
         forIpc(await manager.readSettings(input.workspaceId, serverName, { signal, timeoutMs }))
@@ -1841,6 +1848,12 @@ export const router = (authToken?: string) => {
           listMcpAppEntrypoints(context, input.workspaceId, signal, (workspaceId, warmSignal) =>
             warmWorkspaceMcpServers(context, workspaceId, warmSignal)
           )
+        ),
+      onEntrypointsChanged: t
+        .input(schemas.mcpApps.onEntrypointsChanged.input)
+        .output(schemas.mcpApps.onEntrypointsChanged.output)
+        .handler(({ context, input, signal }) =>
+          subscribeMcpAppEntrypointChanges(context, input.workspaceId, signal)
         ),
       openEntrypoint: t
         .input(schemas.mcpApps.openEntrypoint.input)
