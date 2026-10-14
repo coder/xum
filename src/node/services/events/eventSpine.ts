@@ -192,27 +192,31 @@ interface Registration {
   preservesToolset: boolean;
 }
 
-/** Duck-check for contexts that support blocking (tool.execute, message.send). */
-/** Per isolated point: snapshot what a consumer may change, and return its undo. */
+/**
+ * Per isolated point: snapshot what a consumer may change, and return its undo. The arrays are
+ * copied whole: a consumer can also remove or change earlier entries before it throws, and an
+ * undo by length alone would then leave holes for the later readers.
+ */
 const ISOLATED_CONSUMERS = {
   "message.send": (ctx: MessageSendContext) => {
     const { blocked } = ctx;
-    const contextLength = ctx.additionalContext.length;
+    const context = [...ctx.additionalContext];
     return () => {
       ctx.blocked = blocked;
-      ctx.additionalContext.length = contextLength;
+      ctx.additionalContext.splice(0, ctx.additionalContext.length, ...context);
     };
   },
   "turn.stop": (ctx: TurnStopContext) => {
     const { halted } = ctx;
-    const reasons = ctx.continueReasons.length;
+    const reasons = [...ctx.continueReasons];
     return () => {
       ctx.halted = halted;
-      ctx.continueReasons.length = reasons;
+      ctx.continueReasons.splice(0, ctx.continueReasons.length, ...reasons);
     };
   },
 } satisfies Partial<{ [K in keyof WaterfallPointMap]: (ctx: WaterfallPointMap[K]) => () => void }>;
 
+/** Duck-check for contexts that support blocking (tool.execute, message.send). */
 function isBlocked(ctx: unknown): boolean {
   return (
     typeof ctx === "object" &&
