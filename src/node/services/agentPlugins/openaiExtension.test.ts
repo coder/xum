@@ -146,7 +146,7 @@ describe("readOpenAIExtension", () => {
   test("reads at most the hook loader's entry cap and reports the rest once", () => {
     const { extension, warnings } = readOpenAIExtension({
       extensions: {
-        "com.openai": { hooks: [...Array(100_000).fill("/bad"), "./hooks/late.json"] },
+        "com.openai": { hooks: [...Array<string>(100_000).fill("/bad"), "./hooks/late.json"] },
       },
     });
 
