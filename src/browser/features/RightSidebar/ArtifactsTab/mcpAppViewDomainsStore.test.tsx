@@ -22,10 +22,11 @@ function changeStream() {
       streams.delete(stream);
       stream.wake?.();
     });
+    const stopped = () => options?.signal?.aborted === true;
     async function* changes() {
-      while (options?.signal?.aborted !== true) {
+      while (!stopped()) {
         if (stream.queued === 0) await new Promise<void>((resolve) => (stream.wake = resolve));
-        if (options?.signal?.aborted === true) return;
+        if (stopped()) return;
         stream.queued--;
         yield undefined;
       }
