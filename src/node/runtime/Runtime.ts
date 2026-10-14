@@ -699,6 +699,19 @@ export interface Runtime {
   >;
 
   /**
+   * Rename only the git branch of a workspace; its directory and name stay. Implemented by
+   * WorktreeRuntime, for a workspace created before its generated name existed. The workspace's
+   * branch record moves with the branch, so deletion removes the renamed branch.
+   */
+  renameWorkspaceBranch?(
+    projectPath: string,
+    workspaceName: string,
+    oldBranchName: string,
+    newBranchName: string,
+    trusted?: boolean
+  ): Promise<{ success: true } | { success: false; error: string }>;
+
+  /**
    * Delete workspace directory
    * - LocalRuntime: Uses git worktree remove (with --force only if force param is true)
    * - SSHRuntime: Checks for uncommitted changes unless force is true, then uses rm -rf

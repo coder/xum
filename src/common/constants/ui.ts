@@ -193,3 +193,5 @@ export const TRANSCRIPT_REVEAL_NOMINAL_ROW_CHARS = 2_000;
  * (~340 rows of heavy replies, many short steps) must still reveal fully.
  */
 export const TRANSCRIPT_REVEAL_AUTO_MAX_ROWS = 500;
+/** Mounted-row cap of the two-sided transcript slice (#4961 F20): ~118 KB heap per row. */
+export const TRANSCRIPT_MAX_MOUNTED_ROWS = 1_200;
