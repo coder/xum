@@ -336,6 +336,45 @@ function storedClientMatches(
   });
 }
 
+/**
+ * Why a token write must be dropped (a log phrase), or undefined when it may replace the
+ * stored tokens. Two plugin servers can share an MCP URL with different clients, and their
+ * sign-ins interleave: A saves client A, B saves client B, then A's token lands. One record per
+ * URL cannot hold both, so a token for a client that is no longer stored is dropped (never
+ * client B with token A, #6159). The losing server signs in once more. No stored client also
+ * drops the write: after a logout, a late token from client A would otherwise create a
+ * tokens-only entry that client B's later saveClientInformation keeps. Every flow saves its
+ * client (the SDK stamps the issuer on a provided client) before its tokens.
+ *
+ * The same client ID can be stored for another issuer: a later sign-in pinned to another
+ * authorizationServerBase replaced the client record. A late token of the old issuer would
+ * leave a mixed record that storedClientMatches refuses, signing the new issuer out (#6297).
+ * So the SDK's issuer stamps must match; a legacy unstamped record has none to compare.
+ */
+function tokenWriteConflict(
+  storedClient: MCPOAuthClientInformation | undefined,
+  clientId: string | undefined,
+  tokens: MCPOAuthTokens
+): string | undefined {
+  if (clientId !== undefined && storedClient?.client_id !== clientId)
+    return "of a client that is no longer stored";
+  const issuer = tokens.issuer;
+  if (issuer === undefined || storedClient?.issuer === undefined) return undefined;
+  return issuersMatch(storedClient.issuer, issuer)
+    ? undefined
+    : "of another issuer than the stored client's";
+}
+
+/**
+ * An interactive sign-in whose credentials were dropped must fail: the SDK's auth() would
+ * otherwise return AUTHORIZED and the callback page would say "Login complete" with nothing
+ * stored (#6297). Background refreshes (no flow generation) drop silently: the next request
+ * reads the store and asks for a sign-in if needed.
+ */
+function rejectDroppedFlowSave(saved: boolean, flowGeneration: number | undefined): void {
+  if (!saved && flowGeneration !== undefined) throw new Error(DROPPED_SIGN_IN_ERROR);
+}
+
 /** SECURITY AUDIT: the store (mcp-oauth.json) never receives a plugin client secret. */
 function withoutPluginSecret(
   info: MCPOAuthClientInformation,
@@ -2066,34 +2105,13 @@ export class McpOauthService {
     const saved = await this.storeLock.withLock(this.storeFilePath, async () => {
       if (this.isStaleFlowSave(input.serverUrl, input.flowGeneration)) return false;
       const store = await this.ensureStoreLoadedLocked();
-      // Two plugin servers can share an MCP URL with different clients, and their sign-ins
-      // interleave: A saves client A, B saves client B, then A's token lands. One record per
-      // URL cannot hold both, so a token for a client that is no longer stored is dropped
-      // (never client B with token A, #6159). The losing server signs in once more. No stored
-      // client also drops the write: after a logout, a late token from client A would
-      // otherwise create a tokens-only entry that client B's later saveClientInformation
-      // keeps (#6297). Every flow saves its client (the SDK stamps the issuer on a provided
-      // client) before its tokens.
-      const storedClient = store.entries[input.serverUrl]?.clientInformation;
-      if (input.clientId !== undefined && storedClient?.client_id !== input.clientId) {
-        log.info("[MCP OAuth] Dropping tokens of a client that is no longer stored", {
-          serverUrl: input.serverUrl,
-        });
-        return false;
-      }
-      // The same client ID can be stored for another issuer: a later sign-in pinned to
-      // another authorizationServerBase replaced the client record. A late token of the old
-      // issuer would leave a mixed record that storedClientMatches refuses, signing the new
-      // issuer out (#6297). Compare the SDK's issuer stamps; a legacy unstamped record has
-      // none to compare.
-      if (
-        input.tokens.issuer !== undefined &&
-        storedClient?.issuer !== undefined &&
-        !issuersMatch(storedClient.issuer, input.tokens.issuer)
-      ) {
-        log.info("[MCP OAuth] Dropping tokens of another issuer than the stored client's", {
-          serverUrl: input.serverUrl,
-        });
+      const conflict = tokenWriteConflict(
+        store.entries[input.serverUrl]?.clientInformation,
+        input.clientId,
+        input.tokens
+      );
+      if (conflict !== undefined) {
+        log.info(`[MCP OAuth] Dropping tokens ${conflict}`, { serverUrl: input.serverUrl });
         return false;
       }
       const creds = (store.entries[input.serverUrl] ??= {
@@ -2118,17 +2136,7 @@ export class McpOauthService {
       await this.persistStoreLocked(store);
       return true;
     });
-    if (!saved) this.rejectDroppedFlowSave(input.flowGeneration);
-  }
-
-  /**
-   * An interactive sign-in whose credentials were dropped must fail: the SDK's auth() would
-   * otherwise return AUTHORIZED and the callback page would say "Login complete" with nothing
-   * stored (#6297). Background refreshes (no flow generation) drop silently: the next request
-   * reads the store and asks for a sign-in if needed.
-   */
-  private rejectDroppedFlowSave(flowGeneration: number | undefined): void {
-    if (flowGeneration !== undefined) throw new Error(DROPPED_SIGN_IN_ERROR);
+    rejectDroppedFlowSave(saved, input.flowGeneration);
   }
 
   private async saveClientInformation(input: {
@@ -2172,7 +2180,7 @@ export class McpOauthService {
       await this.persistStoreLocked(store);
       return true;
     });
-    if (!saved) this.rejectDroppedFlowSave(input.flowGeneration);
+    rejectDroppedFlowSave(saved, input.flowGeneration);
   }
 
   private async ensureStoreLoaded(): Promise<void> {
