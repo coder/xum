@@ -63,6 +63,10 @@ import {
   readPluginFileWithinRootCapped,
   UNIVERSAL_AGENT_PLUGINS_CONTAINER,
 } from "@/node/services/agentPlugins/discovery";
+import {
+  isPluginSkillConsented,
+  type PluginSkillConsentGate,
+} from "@/node/services/agentPlugins/componentConsent";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import {
   getCanonicalProjectMetadataRelativePath,
@@ -238,6 +242,8 @@ interface AgentSkillScanCandidate {
   /** Agent Plugins only: contributing plugin name for descriptor attribution. */
   pluginName?: string;
   importedSkills?: string[];
+  /** Managed plugins only: the reviewed skill fingerprints (#6498). */
+  skillConsent?: PluginSkillConsentGate;
 }
 
 /**
@@ -298,6 +304,10 @@ async function buildPluginScanCandidates(args: {
 
     // One candidate per root, in declared order: the scan keeps the first skill of a name.
     const importedSkills = plugin.importedComponents?.skills;
+    const skillConsent =
+      plugin.componentConsent !== undefined
+        ? { pluginRoot: plugin.rootPath, consented: plugin.componentConsent.skills }
+        : undefined;
     candidates.push(
       ...plugin.skillsDirs.map((root) => ({
         scope: args.scope,
@@ -306,6 +316,7 @@ async function buildPluginScanCandidates(args: {
         pluginRoot: plugin.rootPath,
         pluginName: plugin.name,
         importedSkills,
+        ...(skillConsent !== undefined ? { skillConsent } : {}),
       }))
     );
   }
@@ -590,7 +601,12 @@ async function readSkillDescriptorFromDir(
   skillDir: string,
   directoryName: SkillName,
   scope: AgentSkillScope,
-  options?: { invalidSkills?: AgentSkillIssue[]; pluginName?: string; pluginRoot?: string }
+  options?: {
+    invalidSkills?: AgentSkillIssue[];
+    pluginName?: string;
+    pluginRoot?: string;
+    skillConsent?: PluginSkillConsentGate;
+  }
 ): Promise<AgentSkillDescriptor | null> {
   const skillFilePath = runtime.normalizePath("SKILL.md", skillDir);
 
@@ -682,6 +698,13 @@ async function readSkillDescriptorFromDir(
       byteSize,
       directoryName,
     });
+    if (!isPluginSkillConsented(options?.skillConsent, skillDir, parsed.frontmatter)) {
+      pushInvalidSkill(
+        "This plugin skill has not been reviewed on this install, so it does not load.",
+        "Open Settings → Plugins and select Review on the plugin."
+      );
+      return null;
+    }
 
     const descriptor: AgentSkillDescriptor = {
       name: parsed.frontmatter.name,
@@ -831,6 +854,7 @@ export async function discoverAgentSkills(
           invalidSkills: issues,
           ...(scan.pluginName !== undefined ? { pluginName: scan.pluginName } : {}),
           ...(scan.pluginRoot !== undefined ? { pluginRoot: scan.pluginRoot } : {}),
+          ...(scan.skillConsent !== undefined ? { skillConsent: scan.skillConsent } : {}),
         }
       );
       if (!descriptor) continue;
@@ -928,8 +952,9 @@ async function readAgentSkillFromDir(
   skillDir: string,
   directoryName: SkillName,
   scope: AgentSkillScope,
-  pluginRoot?: string
-): Promise<ResolvedAgentSkill> {
+  pluginRoot?: string,
+  skillConsent?: PluginSkillConsentGate
+): Promise<ResolvedAgentSkill | null> {
   const skillFilePath = runtime.normalizePath("SKILL.md", skillDir);
 
   let content: string;
@@ -965,6 +990,8 @@ async function readAgentSkillFromDir(
     byteSize,
     directoryName,
   });
+  // An unreviewed plugin skill reads like a missing one, so a lower-scope skill can serve.
+  if (!isPluginSkillConsented(skillConsent, skillDir, parsed.frontmatter)) return null;
 
   const pkg: AgentSkillPackage = {
     scope,
@@ -1079,13 +1106,16 @@ export async function readAgentSkill(
       const stat = await candidate.runtime.stat(skillDir);
       if (!stat.isDirectory) continue;
 
-      return await readAgentSkillFromDir(
+      const resolved = await readAgentSkillFromDir(
         candidate.runtime,
         skillDir,
         name,
         candidate.scope,
-        candidate.pluginRoot
+        candidate.pluginRoot,
+        candidate.skillConsent
       );
+      if (resolved === null) continue;
+      return resolved;
     } catch (error) {
       // An unreadable skill (transport, permission) must not let a lower-scope
       // skill with the same name win (#4438, #4827).

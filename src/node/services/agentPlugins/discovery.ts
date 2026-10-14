@@ -14,6 +14,7 @@ import { log } from "@/node/services/log";
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { isMutationEpochUnreadable, readContainerMutationState } from "./journals";
 import { PLUGIN_REGISTRY_FILE_NAME, readPluginComponentImports } from "./registry";
+import type { ComponentConsent } from "./componentConsent";
 import {
   isPlainObject,
   isValidAgentPluginName,
@@ -222,6 +223,11 @@ export interface AgentPluginInfo {
   /** Managed global imports; absent means legacy/unmanaged import-all. */
   importedComponents?: AgentPluginImportedComponents;
   componentPolicy?: { registryPath: string; name: string };
+  /**
+   * Managed plugins only: the reviewed fingerprints (#6498). Set together with componentPolicy;
+   * an install without records gets empty ones, so nothing of it loads until reviewed.
+   */
+  componentConsent?: ComponentConsent;
   name: string;
   scope: AgentPluginScope;
   /** Canonical (realpath) plugin root directory. */
@@ -1051,6 +1057,10 @@ export async function discoverAgentPlugins(
           const registryPath = groups.get(canonicalPath)?.registryPath;
           if (registryPath !== undefined && imports?.byName.has(entryName)) {
             plugin.componentPolicy = { registryPath, name: entryName };
+            plugin.componentConsent = imports.consentByName.get(entryName) ?? {
+              skills: {},
+              mcpServers: {},
+            };
           }
           plugin.importedComponents =
             imports === null || (imports?.hasUnidentifiedEntries && !imports.byName.has(entryName))

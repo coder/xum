@@ -10,6 +10,7 @@
  * hashed (a local writer inside the plugin directory can change reviewed bytes either way).
  */
 import { createHash } from "node:crypto";
+import * as path from "node:path";
 
 import type {
   MCPHttpServerInfo,
@@ -284,4 +285,29 @@ export function countUnreviewed(args: {
     }
   }
   return count;
+}
+
+/** The skill consent of one managed plugin (absent for unmanaged plugins, which have no install). */
+export interface PluginSkillConsentGate {
+  /** Canonical plugin root: skill directories are fingerprinted relative to it. */
+  pluginRoot: string;
+  consented: Readonly<Record<string, string>>;
+}
+
+/**
+ * The one load-time skill predicate (#6498): every reader of a plugin skill (the skill index,
+ * agent_skill_read, agent_skill_list, `skill://` scripts) calls it with the frontmatter it parsed.
+ * `skillDir` must be canonical, like `pluginRoot`, so the relative path matches the install review.
+ */
+export function isPluginSkillConsented(
+  gate: PluginSkillConsentGate | undefined,
+  skillDir: string,
+  frontmatter: Readonly<Record<string, unknown>> & { name: string }
+): boolean {
+  if (gate === undefined) return true;
+  const fingerprint = skillConsentFingerprint({
+    relativeDir: path.relative(gate.pluginRoot, skillDir),
+    frontmatter,
+  });
+  return getOwn(gate.consented, frontmatter.name) === fingerprint;
 }

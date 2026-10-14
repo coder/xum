@@ -24,6 +24,7 @@ import {
   MAX_PLUGIN_MANIFEST_BYTES,
   readPluginFileWithinRootCapped,
 } from "./discovery";
+import { serverConsentFingerprint } from "./componentConsent";
 import { expandPluginPlaceholders, type PluginPlaceholderValues } from "./expansion";
 import {
   PLUGIN_MCP_CONFIG_PARSE_ERROR,
@@ -750,6 +751,12 @@ export async function loadPluginMcpServers(
     );
     info.plugin.serverName = serverName;
     if (plugin.componentPolicy !== undefined) info.plugin.componentPolicy = plugin.componentPolicy;
+    // The fingerprint of what will launch (#6498). The lexical install path is a root spelling
+    // too: the install review normalized it, and a manifest can name it literally.
+    info.plugin.consentFingerprint = serverConsentFingerprint(info, {
+      rootPaths: [plugin.rootPath, path.join(plugin.containerPath, plugin.dirName)],
+      dataPaths: [dataPath],
+    });
     servers[buildPluginServerKey(instanceId, serverName)] = info;
   }
 

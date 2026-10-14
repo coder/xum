@@ -1841,7 +1841,7 @@ export class MCPServerManager {
     } catch (error) {
       log.debug("MCP component policy unavailable", { error });
     }
-    return { registryPath: this.componentPolicy?.registryPath ?? "", imports: null };
+    return { registryPath: this.componentPolicy?.registryPath ?? "", imports: null, consent: null };
   }
 
   private async withPluginAdmissionFence<T>(

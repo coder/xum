@@ -20,6 +20,10 @@ import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools"
 import { PLUGIN_REGISTRY_FILE_NAME } from "@/node/services/agentPlugins/registry";
 import { discoverAgentPlugins } from "@/node/services/agentPlugins/discovery";
 import {
+  isPluginSkillConsented,
+  type PluginSkillConsentGate,
+} from "@/node/services/agentPlugins/componentConsent";
+import {
   discoverAgentSkills,
   requireReachableSkills,
   getDefaultAgentSkillsRoots,
@@ -56,7 +60,8 @@ async function readSkillDescriptor(
   skillsRoot: string,
   directoryNameRaw: string,
   scope: "global" | "project",
-  containmentRoot: string
+  containmentRoot: string,
+  skillConsent?: PluginSkillConsentGate
 ): Promise<AgentSkillDescriptor | null> {
   const parsedDirectoryName = SkillNameSchema.safeParse(directoryNameRaw);
   if (!parsedDirectoryName.success) {
@@ -130,6 +135,10 @@ async function readSkillDescriptor(
       byteSize: stat.size,
       directoryName,
     });
+    if (!isPluginSkillConsented(skillConsent, skillDir, parsed.frontmatter)) {
+      log.warn(`Skipping ${scope} plugin skill '${directoryName}': not reviewed on this install`);
+      return null;
+    }
 
     const descriptorResult = AgentSkillDescriptorSchema.safeParse({
       name: parsed.frontmatter.name,
@@ -232,6 +241,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
           containmentRoot: string;
           scope: "global" | "project";
           importedSkills?: readonly string[];
+          skillConsent?: PluginSkillConsentGate;
         }> = [
           {
             skillsRoot: path.join(xumScope.xumHome, "skills"),
@@ -319,13 +329,21 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
               containmentRoot: plugin.rootPath,
               scope: plugin.scope,
               importedSkills,
+              ...(plugin.componentConsent !== undefined
+                ? {
+                    skillConsent: {
+                      pluginRoot: plugin.rootPath,
+                      consented: plugin.componentConsent.skills,
+                    },
+                  }
+                : {}),
             }))
           );
         }
 
         const skills: AgentSkillDescriptor[] = [];
         const seenByScope = new Set<string>();
-        for (const { skillsRoot, containmentRoot, scope, importedSkills } of roots) {
+        for (const { skillsRoot, containmentRoot, scope, importedSkills, skillConsent } of roots) {
           let skillsRootReal: string;
           try {
             skillsRootReal = await fsPromises.realpath(skillsRoot);
@@ -357,7 +375,8 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
               skillsRootReal,
               directoryName,
               scope,
-              containmentRoot
+              containmentRoot,
+              skillConsent
             );
             if (!descriptor) {
               continue;
