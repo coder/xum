@@ -259,8 +259,8 @@ function functionBoundary(node) {
 }
 
 /**
- * The repo's custom `local/*` rules. eslint.config.mjs registers them for ESLint and the
- * generated .oxlintrc.json (scripts/gen-oxlintrc.mjs) loads them as an oxlint JS plugin.
+ * The repo's custom `local/*` rules. eslint.config.mjs registers them for ESLint, and
+ * .oxlintrc.json loads them as an oxlint JS plugin.
  */
 const localPlugin = {
   meta: { name: "local" },

@@ -167,7 +167,6 @@
     "@coder/pixel-storybook": "0.3.0",
     "@e2e-dev/web": "0.14.0",
     "@eslint/js": "^9.36.0",
-    "@oxlint/migrate": "1.88.0",
     "@playwright/test": "^1.56.0",
     "@storybook/addon-docs": "^10.0.0",
     "@storybook/addon-links": "^10.0.0",

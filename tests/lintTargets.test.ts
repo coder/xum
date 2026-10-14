@@ -202,8 +202,10 @@ describe("lint target git discovery", () => {
       "src/renamed.ts",
       "src/untracked.generated.ts",
     ]);
-    // oxlint walks the directories but skips gitignored files, so those are passed explicitly.
+    // oxlint walks the directories: skip what ESLint does not lint, add the gitignored lint files.
     expect(lintTargets.oxlintArgs(repo)).toEqual([
+      "--ignore-pattern",
+      "tests/__mocks__/styleMock.js",
       "src",
       "tests",
       "scripts/lib",

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Usage: scripts/lint.sh [--eslint | --full] [--fix]
 #
-# Default: oxlint on every file, with the eslint.config.mjs rules it can run (see
-# scripts/gen-oxlintrc.mjs). It takes seconds and well under 1 GiB.
+# Default: oxlint on every file with .oxlintrc.json, which mirrors the eslint.config.mjs rules
+# oxlint can run (make check-oxlint-config verifies it). It takes seconds and well under 1 GiB.
 # --eslint: also type-aware ESLint on the files changed since the merge base with origin/main (see
 # scripts/lib/lint_targets.js for why and when it falls back to all files).
 # --full: oxlint, then ESLint on every file, as CI does.
@@ -43,12 +43,7 @@ if [ -n "$PNG_FILES" ]; then
   exit 1
 fi
 
-OXLINT_CONFIG=.oxlintrc.json
-
 run_oxlint() {
-  # The config is generated and gitignored, so it cannot drift from eslint.config.mjs. It lists
-  # every lint file, so it is regenerated when its inputs or the set of lint files change.
-  node scripts/gen-oxlintrc.mjs --if-stale "$OXLINT_CONFIG"
   # A separate assignment so set -e stops on a listing error.
   local listing
   listing="$(node "$SCRIPT_DIR/lib/lint_targets.js" --oxlint-args)"
@@ -58,7 +53,7 @@ run_oxlint() {
   done <<<"$listing"
   echo "Running oxlint (type-aware rules: make lint-eslint, or CI)..."
   # More threads barely help: the JS plugins (Tailwind, the local rules) dominate the run time.
-  bun x oxlint -c "$OXLINT_CONFIG" --threads 4 --deny-warnings "${oxlint_args[@]}" "${FIX_ARGS[@]}"
+  bun x oxlint -c .oxlintrc.json --threads 4 --deny-warnings "${oxlint_args[@]}" "${FIX_ARGS[@]}"
 }
 
 # Workflow runtime and packaged skill workflow sources are executable JS embedded

@@ -1,0 +1,846 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript"],
+  "categories": {
+    "correctness": "off"
+  },
+  "env": {
+    "builtin": true
+  },
+  "ignorePatterns": [
+    "/dist/",
+    "/build/",
+    "/node_modules/",
+    "/*.js",
+    "/*.cjs",
+    "/*.mjs",
+    "!/eslint.config.mjs",
+    "/vite.config.ts",
+    "/electron.vite.config.ts",
+    "/src/browser/main.tsx"
+  ],
+  "rules": {
+    "constructor-super": "error",
+    "for-direction": "error",
+    "getter-return": "error",
+    "no-async-promise-executor": "error",
+    "no-case-declarations": "error",
+    "no-class-assign": "error",
+    "no-compare-neg-zero": "error",
+    "no-cond-assign": "error",
+    "no-const-assign": "error",
+    "no-constant-binary-expression": "error",
+    "no-constant-condition": "error",
+    "no-control-regex": "error",
+    "no-debugger": "error",
+    "no-delete-var": "error",
+    "no-dupe-class-members": "error",
+    "no-dupe-else-if": "error",
+    "no-dupe-keys": "error",
+    "no-duplicate-case": "error",
+    "no-empty": "error",
+    "no-empty-character-class": "error",
+    "no-empty-pattern": "error",
+    "no-empty-static-block": "error",
+    "no-ex-assign": "error",
+    "no-extra-boolean-cast": "error",
+    "no-fallthrough": "error",
+    "no-func-assign": "error",
+    "no-global-assign": "error",
+    "no-import-assign": "error",
+    "no-invalid-regexp": "error",
+    "no-irregular-whitespace": "error",
+    "no-loss-of-precision": "error",
+    "no-misleading-character-class": "error",
+    "no-new-native-nonconstructor": "error",
+    "no-nonoctal-decimal-escape": "error",
+    "no-obj-calls": "error",
+    "no-prototype-builtins": "error",
+    "no-redeclare": "error",
+    "no-regex-spaces": "error",
+    "no-self-assign": "error",
+    "no-setter-return": "error",
+    "no-shadow-restricted-names": "error",
+    "no-sparse-arrays": "error",
+    "no-this-before-super": "error",
+    "no-unexpected-multiline": "error",
+    "no-unreachable": "error",
+    "no-unsafe-finally": "error",
+    "no-unsafe-negation": "error",
+    "no-unused-labels": "error",
+    "no-unused-private-class-members": "error",
+    "no-unused-vars": "error",
+    "no-useless-backreference": "error",
+    "no-useless-catch": "error",
+    "no-useless-escape": "error",
+    "no-with": "error",
+    "require-yield": "error",
+    "use-isnan": "error",
+    "valid-typeof": "error",
+    "no-array-constructor": "error",
+    "no-unused-expressions": "error",
+    "no-empty-function": "error",
+    "typescript/ban-ts-comment": "error",
+    "typescript/no-duplicate-enum-values": "error",
+    "typescript/no-empty-object-type": "error",
+    "typescript/no-explicit-any": "error",
+    "typescript/no-extra-non-null-assertion": "error",
+    "typescript/no-misused-new": "error",
+    "typescript/no-namespace": "error",
+    "typescript/no-non-null-asserted-optional-chain": "error",
+    "typescript/no-require-imports": "error",
+    "typescript/no-this-alias": "error",
+    "typescript/no-unnecessary-type-constraint": "error",
+    "typescript/no-unsafe-declaration-merging": "error",
+    "typescript/no-unsafe-function-type": "error",
+    "typescript/no-wrapper-object-types": "error",
+    "typescript/prefer-as-const": "error",
+    "typescript/prefer-namespace-keyword": "error",
+    "typescript/triple-slash-reference": "error",
+    "typescript/adjacent-overload-signatures": "error",
+    "typescript/array-type": "error",
+    "typescript/ban-tslint-comment": "error",
+    "typescript/class-literal-property-style": "error",
+    "typescript/consistent-generic-constructors": "error",
+    "typescript/consistent-indexed-object-style": "error",
+    "typescript/consistent-type-assertions": "error",
+    "typescript/consistent-type-definitions": "error",
+    "typescript/no-confusing-non-null-assertion": "error",
+    "typescript/prefer-for-of": "error",
+    "typescript/prefer-function-type": "error"
+  },
+  "overrides": [
+    {
+      "files": ["**/*.ts", "**/*.tsx", "**/*.mts", "**/*.cts"],
+      "rules": {
+        "constructor-super": "off",
+        "getter-return": "off",
+        "no-class-assign": "off",
+        "no-const-assign": "off",
+        "no-dupe-class-members": "off",
+        "no-dupe-keys": "off",
+        "no-func-assign": "off",
+        "no-import-assign": "off",
+        "no-new-native-nonconstructor": "off",
+        "no-obj-calls": "off",
+        "no-redeclare": "off",
+        "no-setter-return": "off",
+        "no-this-before-super": "off",
+        "no-unreachable": "off",
+        "no-unsafe-negation": "off",
+        "no-var": "error",
+        "no-with": "off",
+        "prefer-const": "error",
+        "prefer-rest-params": "error",
+        "prefer-spread": "error"
+      }
+    },
+    {
+      "files": ["src/**/*.{ts,tsx}"],
+      "rules": {
+        "react/display-name": "error",
+        "react/jsx-key": "error",
+        "react/jsx-no-comment-textnodes": "error",
+        "react/jsx-no-duplicate-props": "error",
+        "react/jsx-no-target-blank": "error",
+        "react/jsx-no-undef": "error",
+        "react/no-children-prop": "error",
+        "react/no-danger-with-children": "error",
+        "react/no-direct-mutation-state": "error",
+        "react/no-find-dom-node": "error",
+        "react/no-is-mounted": "error",
+        "react/no-render-return-value": "error",
+        "react/no-string-refs": "error",
+        "react/no-unescaped-entities": "error",
+        "react/no-unknown-property": "error",
+        "react/no-unsafe": "off",
+        "react/react-in-jsx-scope": "off",
+        "tailwindcss/classnames-order": "warn",
+        "tailwindcss/enforces-negative-arbitrary-values": "warn",
+        "tailwindcss/enforces-shorthand": "warn",
+        "tailwindcss/migration-from-tailwind-2": "warn",
+        "tailwindcss/no-arbitrary-value": "off",
+        "tailwindcss/no-contradicting-classname": "error",
+        "tailwindcss/no-custom-classname": "off",
+        "no-console": "off",
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "group": ["../!(tests)*", "../../!(tests)*"],
+                "message": "Use absolute imports with @/ instead of relative parent imports. Same-directory imports (./foo) are allowed."
+              }
+            ]
+          }
+        ],
+        "no-warning-comments": [
+          "off",
+          {
+            "terms": ["TODO", "FIXME", "XXX", "HACK"],
+            "location": "start"
+          }
+        ],
+        "no-unused-vars": [
+          "error",
+          {
+            "vars": "all",
+            "args": "after-used",
+            "ignoreRestSiblings": true,
+            "argsIgnorePattern": "^_",
+            "varsIgnorePattern": "^_",
+            "caughtErrors": "all"
+          }
+        ],
+        "react/rules-of-hooks": "error",
+        "react/exhaustive-deps": "warn",
+        "typescript/consistent-type-assertions": [
+          "error",
+          {
+            "assertionStyle": "as",
+            "objectLiteralTypeAssertions": "allow-as-parameter"
+          }
+        ],
+        "typescript/array-type": [
+          "error",
+          {
+            "default": "array-simple",
+            "readonly": "array-simple"
+          }
+        ],
+        "typescript/consistent-type-imports": [
+          "error",
+          {
+            "prefer": "type-imports",
+            "disallowTypeAnnotations": true
+          }
+        ],
+        "typescript/no-var-requires": "off",
+        "typescript/prefer-ts-expect-error": "error",
+        "typescript/ban-ts-comment": [
+          "error",
+          {
+            "ts-expect-error": "allow-with-description",
+            "ts-ignore": true,
+            "ts-nocheck": true,
+            "ts-check": false,
+            "minimumDescriptionLength": 3
+          }
+        ],
+        "react/require-render-return": "error"
+      },
+      "jsPlugins": ["eslint-plugin-tailwindcss"],
+      "globals": {
+        "console": "readonly",
+        "process": "readonly",
+        "Buffer": "readonly",
+        "__dirname": "readonly",
+        "__filename": "readonly",
+        "exports": "writable",
+        "module": "writable",
+        "require": "readonly",
+        "global": "readonly",
+        "window": "readonly",
+        "document": "readonly",
+        "requestAnimationFrame": "readonly",
+        "setTimeout": "readonly",
+        "clearTimeout": "readonly",
+        "setInterval": "readonly",
+        "clearInterval": "readonly",
+        "navigator": "readonly",
+        "alert": "readonly"
+      },
+      "plugins": ["react"]
+    },
+    {
+      "files": [
+        "src/browser/components/**",
+        "src/browser/contexts/**",
+        "src/browser/hooks/**",
+        "src/browser/App.tsx"
+      ],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "group": ["**/services/**", "../services/**", "../../services/**"],
+                "message": "Frontend code cannot import from services/. Use IPC or move shared code to utils/."
+              },
+              {
+                "group": ["**/tokens/tokenizer", "**/tokens/tokenStatsCalculator"],
+                "message": "Frontend code cannot import tokenizer (2MB+ encodings). Use @/utils/tokens/usageAggregator for aggregation or @/utils/tokens/modelStats for pricing."
+              },
+              {
+                "group": ["**/utils/main/**", "@/utils/main/**"],
+                "message": "Frontend code cannot import from utils/main/ (contains Node.js APIs). Move shared code to utils/ or use IPC."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/**/*.ts", "src/**/*.tsx"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "ai-tokenizer/encoding",
+                "allowTypeImports": true,
+                "message": "The ai-tokenizer/encoding barrel evaluates all four encodings (~14.5 s of CPU, #4816). Load one encoding through its subpath (ai-tokenizer/encoding/<name>) inside tokenizer.worker.ts."
+              }
+            ],
+            "patterns": [
+              {
+                "group": ["shiki"],
+                "importNamePattern": "^(?!type\\s)",
+                "allowTypeImports": true,
+                "message": "Shiki must only be imported in highlightWorker.ts to avoid blocking the main thread. Use highlightCode() from highlightWorkerClient.ts instead."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/browser/workers/highlightWorker.ts"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "group": ["../!(tests)*", "../../!(tests)*"],
+                "message": "Use absolute imports with @/ instead of relative parent imports. Same-directory imports (./foo) are allowed."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/browser/**/*.{ts,tsx}", "src/common/**/*.{ts,tsx}"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "ai-tokenizer/encoding",
+                "allowTypeImports": true,
+                "message": "The ai-tokenizer/encoding barrel evaluates all four encodings (~14.5 s of CPU, #4816). Load one encoding through its subpath (ai-tokenizer/encoding/<name>) inside tokenizer.worker.ts."
+              }
+            ],
+            "patterns": [
+              {
+                "group": ["shiki"],
+                "importNamePattern": "^(?!type\\s)",
+                "allowTypeImports": true,
+                "message": "Shiki must only be imported in highlightWorker.ts to avoid blocking the main thread. Use highlightCode() from highlightWorkerClient.ts instead."
+              },
+              {
+                "regex": "(^|/)orpc/schemas$",
+                "allowTypeImports": true,
+                "message": "Import schemas from their leaf module (e.g. @/common/orpc/schemas/runtime), not the @/common/orpc/schemas barrel: a value import of the barrel adds every schema to the first load. Type-only imports are fine."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/browser/workers/highlightWorker.ts"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "group": ["../!(tests)*", "../../!(tests)*"],
+                "message": "Use absolute imports with @/ instead of relative parent imports. Same-directory imports (./foo) are allowed."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/**/*.test.{ts,tsx}"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "ai-tokenizer/encoding",
+                "allowTypeImports": true,
+                "message": "The ai-tokenizer/encoding barrel evaluates all four encodings (~14.5 s of CPU, #4816). Load one encoding through its subpath (ai-tokenizer/encoding/<name>) inside tokenizer.worker.ts."
+              }
+            ],
+            "patterns": [
+              {
+                "group": ["shiki"],
+                "importNamePattern": "^(?!type\\s)",
+                "allowTypeImports": true,
+                "message": "Shiki must only be imported in highlightWorker.ts to avoid blocking the main thread. Use highlightCode() from highlightWorkerClient.ts instead."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/common/orpc/**/*.ts"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "@/common/config/schemas",
+                "message": "Import config schemas via direct file paths (e.g., @/common/config/schemas/appConfigOnDisk), not the barrel."
+              },
+              {
+                "name": "@/common/config/schemas/index",
+                "message": "Import config schemas via direct file paths (e.g., @/common/config/schemas/appConfigOnDisk), not the barrel."
+              }
+            ],
+            "patterns": [
+              {
+                "regex": "(^|/)orpc/schemas$",
+                "allowTypeImports": true,
+                "message": "Import schemas from their leaf module (e.g. @/common/orpc/schemas/runtime), not the @/common/orpc/schemas barrel: a value import of the barrel adds every schema to the first load. Type-only imports are fine."
+              },
+              {
+                "regex": "^\\.\\.?/schemas$",
+                "allowTypeImports": true,
+                "message": "Import schemas from their leaf module (e.g. @/common/orpc/schemas/runtime), not the @/common/orpc/schemas barrel: a value import of the barrel adds every schema to the first load. Type-only imports are fine."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/common/config/schemas/**/*.ts"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "patterns": [
+              {
+                "group": ["@/common/orpc/schemas/*", "**/orpc/schemas/*"],
+                "message": "Config schemas must not import from ORPC; use @/common/schemas/* or @/common/config/schemas/* instead."
+              },
+              {
+                "regex": "(^|/)orpc/schemas$",
+                "allowTypeImports": true,
+                "message": "Import schemas from their leaf module (e.g. @/common/orpc/schemas/runtime), not the @/common/orpc/schemas barrel: a value import of the barrel adds every schema to the first load. Type-only imports are fine."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["src/**/*.{ts,tsx}"],
+      "rules": {
+        "typescript/no-non-null-assertion": "error"
+      }
+    },
+    {
+      "files": [
+        "src/**/{__tests__,__mocks__,test,tests,testing,mocks,stories}/**",
+        "src/**/*.{test,spec}*.{ts,tsx}",
+        "src/**/*.{stories,generated}.{ts,tsx}",
+        "src/**/test[A-Z_.-]*",
+        "src/**/*Test{Helper,Helpers,Harness,Utils,Fixture,Fixtures,Overlay,Child}[!a-zA-Z0-9_]*",
+        "src/**/*.*[fF]ixture*.{ts,tsx}",
+        "src/version.ts",
+        "src/**/*.bench.{ts,tsx}"
+      ],
+      "rules": {
+        "typescript/no-non-null-assertion": "off"
+      }
+    },
+    {
+      "files": ["src/**/*.ts", "src/**/*.tsx"],
+      "rules": {
+        "no-restricted-globals": [
+          "error",
+          {
+            "name": "process",
+            "message": "Renderer code cannot access 'process' global (not available in renderer). Use IPC to communicate with main process or use constants for environment-agnostic values."
+          }
+        ]
+      }
+    },
+    {
+      "files": [
+        "src/cli/**",
+        "src/desktop/**",
+        "src/node/**",
+        "**/*.test.ts",
+        "**/*.test.tsx",
+        "src/common/utils/providers/ensureProvidersConfig.ts",
+        "src/common/telemetry/**"
+      ],
+      "rules": {
+        "no-restricted-globals": "off"
+      }
+    },
+    {
+      "files": [
+        "src/node/builtinSkills/**/*.js",
+        "src/node/builtinWorkflowActions/**/*.js",
+        "src/node/workflowRuntime/*.js",
+        "scripts/lib/*.js"
+      ],
+      "rules": {
+        "no-empty": [
+          "error",
+          {
+            "allowEmptyCatch": true
+          }
+        ],
+        "no-unused-vars": "error",
+        "no-empty-function": "off",
+        "typescript/no-require-imports": "off",
+        "typescript/prefer-for-of": "off",
+        "no-undef": "error"
+      },
+      "globals": {
+        "console": "readonly",
+        "process": "readonly",
+        "Buffer": "readonly",
+        "__dirname": "readonly",
+        "__filename": "readonly",
+        "exports": "writable",
+        "module": "writable",
+        "require": "readonly",
+        "globalThis": "readonly",
+        "setTimeout": "readonly",
+        "clearTimeout": "readonly",
+        "mux": "readonly"
+      }
+    },
+    {
+      "files": ["src/node/builtinWorkflowActions/**/_shared.js"],
+      "rules": {
+        "no-unused-vars": "off"
+      }
+    },
+    {
+      "files": ["src/node/builtinWorkflowActions/**/*.js"],
+      "globals": {
+        "boundedCharBudget": "readonly",
+        "boundedCommentBodyCaptureBytes": "readonly",
+        "boundedIssueViewBodyCaptureBytes": "readonly",
+        "boundedIssueListBodyCaptureBytes": "readonly",
+        "boundedLimit": "readonly",
+        "captureGit": "readonly",
+        "excludedLabelSearchQuery": "readonly",
+        "findComment": "readonly",
+        "getIssueView": "readonly",
+        "inputObject": "readonly",
+        "issueListBodyJq": "readonly",
+        "isMatchingMarker": "readonly",
+        "listComments": "readonly",
+        "markerStatus": "readonly",
+        "normalizeIssue": "readonly",
+        "optionalString": "readonly",
+        "parseNameStatus": "readonly",
+        "parseStatusLine": "readonly",
+        "readStatus": "readonly",
+        "repositoryFromInput": "readonly",
+        "requiredIssueNumber": "readonly",
+        "requiredRepository": "readonly",
+        "requiredString": "readonly",
+        "resolveBase": "readonly",
+        "resolveMergeBase": "readonly",
+        "runGit": "readonly",
+        "splitRepository": "readonly",
+        "stringList": "readonly",
+        "truncateText": "readonly",
+        "tryResolveBase": "readonly",
+        "tryGit": "readonly"
+      },
+      "rules": {}
+    },
+    {
+      "files": ["tests/**/*.{ts,tsx}"],
+      "rules": {
+        "no-empty-function": "off",
+        "no-unused-vars": [
+          "error",
+          {
+            "vars": "all",
+            "args": "after-used",
+            "ignoreRestSiblings": true,
+            "argsIgnorePattern": "^_",
+            "varsIgnorePattern": "^_",
+            "caughtErrors": "all"
+          }
+        ]
+      },
+      "globals": {
+        "console": "readonly",
+        "process": "readonly",
+        "Buffer": "readonly",
+        "__dirname": "readonly",
+        "__filename": "readonly",
+        "require": "readonly",
+        "setTimeout": "readonly",
+        "clearTimeout": "readonly",
+        "setInterval": "readonly",
+        "clearInterval": "readonly",
+        "window": "readonly",
+        "document": "readonly"
+      }
+    },
+    {
+      "files": ["**/*.test.ts", "**/*.test.tsx"],
+      "globals": {
+        "describe": "readonly",
+        "it": "readonly",
+        "test": "readonly",
+        "expect": "readonly",
+        "jest": "readonly",
+        "beforeEach": "readonly",
+        "afterEach": "readonly",
+        "beforeAll": "readonly",
+        "afterAll": "readonly"
+      },
+      "rules": {}
+    },
+    {
+      "files": ["**/*.stories.{ts,tsx,js,jsx,mjs,cjs}", "**/*.story.{ts,tsx,js,jsx,mjs,cjs}"],
+      "rules": {
+        "import/no-anonymous-default-export": "off",
+        "storybook/await-interactions": "error",
+        "storybook/context-in-play-function": "error",
+        "storybook/default-exports": "error",
+        "storybook/hierarchy-separator": "warn",
+        "storybook/no-redundant-story-name": "warn",
+        "storybook/no-renderer-packages": "error",
+        "storybook/prefer-pascal-case": "warn",
+        "storybook/story-exports": "error",
+        "storybook/use-storybook-expect": "error",
+        "storybook/use-storybook-testing-library": "error",
+        "react/rules-of-hooks": "off"
+      },
+      "jsPlugins": ["eslint-plugin-storybook"],
+      "plugins": ["react", "import"]
+    },
+    {
+      "files": [".storybook/main.{js,cjs,mjs,ts}"],
+      "rules": {
+        "storybook/no-uninstalled-addons": "error"
+      },
+      "jsPlugins": ["eslint-plugin-storybook"]
+    },
+    {
+      "files": ["src/**/*.{ts,tsx}"],
+      "jsPlugins": [
+        {
+          "name": "local",
+          "specifier": "./eslint-local-rules.mjs"
+        }
+      ],
+      "rules": {
+        "local/no-unsafe-child-process": "error",
+        "local/no-sync-fs-methods": "error",
+        "local/no-cross-boundary-imports": "error",
+        "local/no-native-interactive-tooltips": "error",
+        "local/no-chained-type-assertions": "error",
+        "local/no-conditional-empty-object-spread": "off",
+        "local/no-known-value-widening": [
+          "error",
+          {
+            "checkAnnotations": false
+          }
+        ],
+        "local/no-widen-then-assert": "error",
+        "local/no-unknown-type-aliases": "error",
+        "local/no-object-parameters": "error"
+      }
+    },
+    {
+      "files": ["src/**/*.{ts,tsx}"],
+      "jsPlugins": [
+        {
+          "name": "local",
+          "specifier": "./eslint-local-rules.mjs"
+        }
+      ],
+      "rules": {
+        "local/no-direct-web-storage": "error"
+      }
+    },
+    {
+      "files": [
+        "src/browser/hooks/usePersistedState.ts",
+        "**/*.test.ts",
+        "**/*.test.tsx",
+        "**/*.stories.ts",
+        "**/*.stories.tsx",
+        "src/browser/stories/**",
+        "src/**/*StoryUtils.tsx",
+        "**/*.testHarness.ts",
+        "src/**/test[A-Z]*.ts"
+      ],
+      "rules": {
+        "local/no-direct-web-storage": "off"
+      }
+    },
+    {
+      "files": [
+        "src/node/config/index.ts",
+        "src/node/config/**/*.ts",
+        "src/cli/debug/**/*.ts",
+        "src/node/git.ts",
+        "src/desktop/main.ts",
+        "src/node/config.test.ts",
+        "src/node/services/gitService.ts",
+        "src/node/services/log.ts",
+        "src/node/services/streamManager.ts",
+        "src/node/services/tempDir.ts",
+        "src/node/services/tools/bash.ts",
+        "src/node/services/tools/bash.test.ts",
+        "src/node/services/tools/testHelpers.ts",
+        "src/node/utils/providerRequirements.ts"
+      ],
+      "jsPlugins": [
+        {
+          "name": "local",
+          "specifier": "./eslint-local-rules.mjs"
+        }
+      ],
+      "rules": {
+        "local/no-sync-fs-methods": "off"
+      }
+    },
+    {
+      "files": [
+        "**/*.bench.ts",
+        "**/*.test.ts",
+        "**/*.test.tsx",
+        "**/*.stories.ts",
+        "**/*.stories.tsx",
+        "src/browser/stories/**",
+        "**/*.testHarness.ts",
+        "src/**/test[A-Z]*.ts"
+      ],
+      "jsPlugins": [
+        {
+          "name": "local",
+          "specifier": "./eslint-local-rules.mjs"
+        }
+      ],
+      "rules": {
+        "local/no-chained-type-assertions": "off",
+        "local/no-known-value-widening": "off",
+        "local/no-widen-then-assert": "off",
+        "local/no-object-parameters": "off"
+      }
+    },
+    {
+      "files": ["**/*.test.ts", "**/*.test.tsx"],
+      "jsPlugins": [
+        {
+          "name": "local",
+          "specifier": "./eslint-local-rules.mjs"
+        }
+      ],
+      "rules": {
+        "local/no-cast-to-api-client": "error",
+        "local/no-clear-dom-global": "error",
+        "local/require-module-mock-restore": [
+          "error",
+          {
+            "allow": {
+              "src/browser/features/desktop/DesktopPanel.test.tsx": ["@novnc/novnc/lib/rfb"],
+              "src/browser/features/desktop/useDesktopConnection.test.tsx": ["@novnc/novnc/lib/rfb"]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "files": [
+        "**/*.test.ts",
+        "**/*.test.tsx",
+        "tests/**/*.{ts,tsx}",
+        "src/**/*.testHarness.{ts,tsx}",
+        "src/**/*.testUtils.{ts,tsx}",
+        "src/**/test[A-Z]*.{ts,tsx}"
+      ],
+      "jsPlugins": [
+        {
+          "name": "local",
+          "specifier": "./eslint-local-rules.mjs"
+        }
+      ],
+      "rules": {
+        "local/no-module-query-copy": [
+          "error",
+          {
+            "allow": {
+              "src/browser/AppEarlyPageImport.test.tsx": [
+                "@/browser/components/AIView/AIView?real=1",
+                "@/browser/App?earlyImport=root",
+                "@/browser/App?earlyImport=workspace",
+                "@/browser/App?prefetch=browser",
+                "@/browser/App?prefetch=desktop"
+              ],
+              "src/browser/components/AgentListItem/AgentListItem.test.tsx": [
+                "./AgentListItem?agent-list-item-test=1"
+              ],
+              "src/browser/components/ChatPane/WorkspaceFooterBar.test.tsx": [
+                "./WorkspaceFooterBar?workspace-footer-bar-test=1",
+                "./WorkspaceFooterBar?workspace-footer-bar-test=2"
+              ],
+              "src/browser/components/Dialog/Dialog.test.tsx": ["./Dialog?real=1"],
+              "src/browser/components/LoadingScreen/LoadingScreen.test.tsx": [
+                "../LoadingScreen/LoadingScreen?real=1"
+              ],
+              "src/browser/components/ProjectSidebar/ProjectSidebar.test.tsx": [
+                "../AgentListItem/AgentListItem?project-sidebar-real-row=1",
+                "./ProjectSidebar?project-sidebar-test=1",
+                "./ProjectSidebar?project-sidebar-scratch-test=1",
+                "./ProjectSidebar?project-sidebar-flat-test=1"
+              ],
+              "src/browser/components/WorkspaceMenuBar/WorkspaceMenuBar.test.tsx": [
+                "../Dialog/Dialog?real=1",
+                "./WorkspaceMenuBar?workspace-menu-bar-test=1"
+              ],
+              "src/browser/contexts/API.test.tsx": ["./API?real=1"],
+              "src/browser/features/Analytics/SavedQuerySqlDialog.test.tsx": [
+                "./SavedQuerySqlDialog?real=1"
+              ],
+              "src/browser/features/RightSidebar/BrowserTab/useBrowserBridgeConnection.test.tsx": [
+                "./useBrowserBridgeConnection.ts?test-isolation=static"
+              ],
+              "src/browser/utils/feedbackToast.test.tsx": ["../components/Dialog/Dialog?real=1"],
+              "src/browser/utils/perf/appShellReady.test.ts": ["./appShellReady?fresh=1"]
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "settings": {
+    "react": {
+      "version": "18.3.1"
+    },
+    "tailwindcss": {
+      "config": false,
+      "cssFiles": ["**/*.css", "!**/node_modules", "!**/.*", "!**/dist", "!**/build"],
+      "callees": []
+    }
+  }
+}

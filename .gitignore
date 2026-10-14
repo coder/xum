@@ -63,8 +63,6 @@ yarn-error.log
 
 # ESLint cache for faster incremental lints
 .eslintcache
-# Generated from eslint.config.mjs by scripts/gen-oxlintrc.mjs
-.oxlintrc.json
 
 # Bun
 bun.lockb

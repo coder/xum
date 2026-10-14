@@ -90,7 +90,7 @@ include fmt.mk
 
 .PHONY: all build dev start clean help
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
-.PHONY: lint lint-eslint lint-full lint-fix typecheck static-check static-check-full
+.PHONY: lint lint-eslint lint-full lint-fix check-oxlint-config typecheck static-check static-check-full
 .PHONY: crap crap-check test-crap-scripts
 .PHONY: test-bugbash-repros test-bugbash-known-failures bugbash-sandbox-key bugbash-sandbox-image bugbash-sandbox-publish bug-bash-sandbox-recover bug-bash-sandbox-check test-bugbash-repros-sandbox
 .PHONY: test test-unit test-unit-ci test-integration test-watch test-coverage test-e2e test-e2e-perf perf-tape-replay smoke-test
@@ -480,10 +480,10 @@ build/icon.png: docs/img/logo-white.svg scripts/generate-icons.ts
 # Keep the default local path fast. Docs link crawling and lockfile-free bench-agent
 # verification stay in static-check-full so local validation remains responsive.
 # static-check lints with oxlint, which runs the eslint.config.mjs rules it supports in seconds
-# (see scripts/gen-oxlintrc.mjs); static-check-full also runs type-aware ESLint on all files, so
-# CI still catches what oxlint cannot check, including type-aware findings that a change
-# surfaces in files it did not touch.
-STATIC_CHECKS := typecheck fmt-check check-startup-imports check-react-compiler check-code-docs-links check-test-routing check-test-seam-comments lint-shellcheck lint-hadolint
+# (.oxlintrc.json, kept in step by check-oxlint-config); static-check-full also runs type-aware
+# ESLint on all files, so CI still catches what oxlint cannot check, including type-aware
+# findings that a change surfaces in files it did not touch.
+STATIC_CHECKS := typecheck fmt-check check-startup-imports check-react-compiler check-code-docs-links check-test-routing check-test-seam-comments check-oxlint-config lint-shellcheck lint-hadolint
 
 static-check: lint $(STATIC_CHECKS) ## Run fast local static checks
 
@@ -531,6 +531,9 @@ test-crap-scripts: ## Test the Crapper adapter (hand-counted fixtures) and crap-
 
 check-test-routing: node_modules/.installed ## Fail when a *.test.ts(x) file is run by no CI lane (or by two)
 	@./scripts/check-test-routing.sh
+
+check-oxlint-config: node_modules/.installed ## Fail when .oxlintrc.json applies different rules than eslint.config.mjs to any lint file
+	@node scripts/check-oxlint-config.mjs
 
 # <1 s: the matcher's tests run first so a broken guard cannot pass vacuously.
 check-test-seam-comments: node_modules/.installed ## Fail when production code gains an unlisted "Exported for tests"-style comment
