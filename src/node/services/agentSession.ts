@@ -328,7 +328,7 @@ import {
 import { substituteSkillArguments } from "@/node/services/agentSkills/skillArguments";
 import {
   assertSkillDirectoryPlaceholdersResolved,
-  appendSkillDirectoryOffHostNote,
+  prependSkillDirectoryOffHostNote,
   resolveSkillDirectory,
   skillDirectoryEnv,
   substituteSkillDirectoryPlaceholdersOutsideDirectives,
@@ -13448,7 +13448,7 @@ export class AgentSession {
       // Host-read skills in off-host workspaces (e.g. global plugin skills on
       // SSH/Docker) tell the model their files are not where bash runs. Added
       // before hashing so the snapshot hash covers the note.
-      const body = appendSkillDirectoryOffHostNote(injectedBody, skillDirectory);
+      const body = prependSkillDirectoryOffHostNote(injectedBody, skillDirectory);
 
       // Include the parsed YAML frontmatter in the hash so frontmatter-only edits (e.g. description)
       // generate a new snapshot and keep the UI hover preview in sync. The hash also covers

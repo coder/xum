@@ -1,3 +1,4 @@
+import { MAX_AGENT_SKILL_SNAPSHOT_CHARS } from "@/common/constants/attachments";
 import { describe, expect, it, mock, afterEach, spyOn } from "bun:test";
 import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
@@ -221,7 +222,8 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     // A devcontainer reads skills on the host but runs bash in the container,
     // the same split as host plugin skills in SSH/Docker workspaces. No tool
     // result reaches the model for a slash skill, so the snapshot must say it.
-    const skillBody = "Run sh ${CLAUDE_SKILL_DIR}/scripts/hello.sh";
+    // Longer than the snapshot cap: the note must survive truncation.
+    const skillBody = `Run sh \${CLAUDE_SKILL_DIR}/scripts/hello.sh\n${"x".repeat(MAX_AGENT_SKILL_SNAPSHOT_CHARS)}`;
     const offHost = await createTestWorkspaceWithSkill({ skillName: "split-skill", skillBody });
     const onHost = await createTestWorkspaceWithSkill({ skillName: "split-skill", skillBody });
     const cases = [
