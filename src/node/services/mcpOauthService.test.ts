@@ -963,7 +963,9 @@ describe("McpOauthService OAuth flows", () => {
         iss: null,
         error: null,
       });
-      expect(await service.hasAuthTokens({ serverUrl: `${base}/mcp` })).toBe(true);
+      expect(
+        await service.hasAuthTokens({ serverUrl: `${base}/mcp`, oauth: { clientId: "c" } })
+      ).toBe(true);
     } finally {
       releaseToken();
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -1619,6 +1621,39 @@ describe("McpOauthService OAuth flows", () => {
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+  });
+
+  test("a server without a provided client never uses another plugin's provided-client sign-in (#6159)", async () => {
+    await withAuthServer(async (base) => {
+      const serverUrl = `${base}/mcp`;
+      // Plugin A signs in with its provided client.
+      spyOn(mcpConfigService, "listServers").mockResolvedValue({
+        a: { transport: "http", url: serverUrl, disabled: true, oauth: { clientId: "plugin-a" } },
+      });
+      const start = await service.startServerFlow({
+        projectPath,
+        serverName: "a",
+        redirectUri: "https://x/cb",
+      });
+      if (!start.success) throw new Error(start.error);
+      const signedIn = await service.handleServerCallbackAndExchange({
+        state: start.data.flowId,
+        code: "code",
+        iss: null,
+        error: null,
+      });
+      expect(signedIn.success).toBe(true);
+      expect(await service.hasAuthTokens({ serverUrl, oauth: { clientId: "plugin-a" } })).toBe(
+        true
+      );
+      // A server at the same URL that registers its own client (a DCR plugin or the user's
+      // own server) reads as signed out and gets no provider.
+      for (const oauth of [{ baseScopes: ["read"] }, undefined]) {
+        expect(await service.hasAuthTokens({ serverUrl, oauth })).toBe(false);
+        expect(await service.getAuthProviderForServer({ serverUrl, oauth })).toBeUndefined();
+        expect((await service.getAuthStatus({ serverUrl, oauth })).isLoggedIn).toBe(false);
+      }
+    });
   });
 
   test("interleaved sign-ins of two clients at one URL never store client B with token A", async () => {

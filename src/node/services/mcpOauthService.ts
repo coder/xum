@@ -385,11 +385,25 @@ function storedClientMatches(
   stored: MCPOAuthStoredCredentials | null | undefined,
   config: MCPServerOAuthConfig | undefined
 ): boolean {
-  if (config?.clientId !== undefined && stored?.clientInformation?.client_id !== config.clientId)
-    return false;
+  if (!storedClientIdMatches(stored?.clientInformation, config)) return false;
   return (
     grantCoversBaseScopes(stored?.tokens?.scope, config) && storedIssuerMatches(stored, config)
   );
+}
+
+/**
+ * The client part of storedClientMatches. A config with a provided client needs that client.
+ * A config without one (dynamic registration, or a server the user configured) refuses a
+ * plugin's provided client: two servers at one URL share one record, and the record holds the
+ * other plugin's account (#6159). Known limit: a provided client stored before the mark existed
+ * reads as a registered one.
+ */
+function storedClientIdMatches(
+  stored: MCPOAuthClientInformation | undefined,
+  config: MCPServerOAuthConfig | undefined
+): boolean {
+  if (config?.clientId === undefined) return stored?.provided_by_plugin !== true;
+  return stored?.client_id === config.clientId;
 }
 
 /** The pinned-issuer part of storedClientMatches. */
@@ -467,13 +481,17 @@ function rejectDroppedFlowSave(saved: boolean, flowGeneration: number | undefine
   if (!saved && flowGeneration !== undefined) throw new Error(DROPPED_SIGN_IN_ERROR);
 }
 
-/** SECURITY AUDIT: the store (mcp-oauth.json) never receives a plugin client secret. */
-function withoutPluginSecret(
+/**
+ * The client record the store receives. SECURITY AUDIT: the store (mcp-oauth.json) never
+ * receives a plugin client secret. A provided client is marked, so a config without one does
+ * not use it (storedClientIdMatches).
+ */
+function persistedClientInfo(
   info: MCPOAuthClientInformation,
   config: MCPServerOAuthConfig | undefined
 ): MCPOAuthClientInformation {
   if (config?.clientId === undefined) return info;
-  const persisted = { ...info };
+  const persisted: MCPOAuthClientInformation = { ...info, provided_by_plugin: true };
   delete persisted.client_secret;
   return persisted;
 }
@@ -772,6 +790,11 @@ function deriveAuthorizationServerBinding(
   };
 }
 
+/** The provided-client mark (MCPOAuthClientInformation.provided_by_plugin). */
+function parseProvidedMark(value: Record<string, unknown>): { provided_by_plugin?: true } {
+  return value.provided_by_plugin === true ? { provided_by_plugin: true } : {};
+}
+
 /**
  * Parses the official SDK v2 issuer stamp (SEP-2352 credential/issuer binding)
  * from a stored credentials object. Must survive the store round-trip:
@@ -833,6 +856,7 @@ function parseStoredCredentials(value: unknown): MCPOAuthStoredCredentials | nul
             : undefined,
         ...parseAuthorizationServerBinding(clientInformationRaw),
         ...parseIssuerStamp(clientInformationRaw),
+        ...parseProvidedMark(clientInformationRaw),
       }
     : undefined;
 
@@ -1793,7 +1817,7 @@ export class McpOauthService {
 
         await this.saveClientInformation({
           serverUrl: flow.serverUrlForStoreKey,
-          clientInformation: withoutPluginSecret(next, flow.plugin?.config),
+          clientInformation: persistedClientInfo(next, flow.plugin?.config),
           legacyBinding: deriveAuthorizationServerBinding(flow.discoveryState),
           flowGeneration: flow.signOutGeneration,
         });
@@ -1899,7 +1923,7 @@ export class McpOauthService {
       saveClientInformation: async (clientInformation) => {
         await this.saveClientInformation({
           serverUrl: input.serverUrl,
-          clientInformation: withoutPluginSecret(
+          clientInformation: persistedClientInfo(
             // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
             clientInformation as unknown as MCPOAuthClientInformation,
             input.oauth
