@@ -421,6 +421,21 @@ function requireAppsConnection(
   return instance.apps;
 }
 
+/** The AI SDK tool call's abort signal, if its execution context carries one. */
+function toolCallAbortSignal(context: unknown): AbortSignal | undefined {
+  return context && typeof context === "object" && "abortSignal" in context
+    ? (context as { abortSignal?: AbortSignal }).abortSignal
+    : undefined;
+}
+
+/**
+ * How an MCP App tool call without a result ended, kept in its result record. A deadline is a
+ * failure, not a user interrupt: only the call's own abort signal counts as interrupted.
+ */
+function failedCallOutcome(signal: AbortSignal | undefined): "failed" | "interrupted" {
+  return signal?.aborted === true ? "interrupted" : "failed";
+}
+
 /**
  * Wrap MCP tools to transform their results to AI SDK format.
  * This ensures image content is properly converted to media type.
@@ -474,12 +489,9 @@ export function wrapMCPTools(
         let sanitizedArgs: unknown;
         let argsSanitized = false;
         let appResultRecorded = false;
+        // Hoisted so the failure path can tell an interrupted call from a failed one.
+        const abortSignal = toolCallAbortSignal(context);
         try {
-          const abortSignal =
-            context && typeof context === "object" && "abortSignal" in context
-              ? (context as { abortSignal?: AbortSignal }).abortSignal
-              : undefined;
-
           sanitizedArgs = sanitizeMCPToolArgs(args, rawInputSchema(tool.inputSchema));
           argsSanitized = true;
           const result: unknown = await runMCPToolWithDeadline(
@@ -565,6 +577,7 @@ export function wrapMCPTools(
               resourceUri: appResourceUri,
               arguments: sanitizedArgs,
               result: null,
+              outcome: failedCallOutcome(abortSignal),
             });
           }
           if (shouldRecycleClientAfterToolError(error)) {

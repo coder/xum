@@ -105,32 +105,74 @@ const TEXT_CAPS: Partial<Record<keyof OpenAIPluginInterface, number>> = {
   category: 64,
 };
 const RULES: Record<FieldKind, string> = {
-  name: "a non-empty single line without control or direction characters",
-  text: "a string without control or direction characters",
+  name: "a non-empty single line without control, direction or invisible formatting characters",
+  text: "a string without control, direction or invisible formatting characters",
   url: "an https URL (max 2048 characters)",
   color: "a #RRGGBB color",
   path: "a relative path inside the plugin",
-  labels: "at most 20 strings of at most 120 characters",
+  labels: "at most 20 non-empty strings of at most 120 characters",
   prompts: "at most 3 strings of at most 512 characters",
   paths: "at most 10 relative paths inside the plugin",
 };
 
 /**
- * Characters manifest text must not carry (OpenAI's package rules exclude them too): C0 and C1
- * controls, the Unicode line and paragraph separators, and the invisible direction controls
- * (LRM/RLM/ALM, embeddings/overrides, isolates), which can spoof a displayed plugin or developer.
- * `longDescription` may break lines with \n only.
+ * Characters manifest text must not carry. OpenAI's package rules exclude "control characters,
+ * Unicode line or paragraph separators, and unsupported invisible formatting characters"
+ * (https://developers.openai.com/plugins/deploy/submission-errors): C0 and C1 controls, U+2028
+ * and U+2029, the Unicode format category (`\p{Cf}`) and the variation selectors (U+FE00-U+FE0F,
+ * U+E0100-U+E01EF, category Mn). Cf holds the direction controls (LRM/RLM/ALM,
+ * embeddings/overrides, isolates) and the zero-width characters (U+200B, U+2060, U+FEFF, soft
+ * hyphen). All of them are invisible, so they can make a displayed plugin or developer name look
+ * like another, or a label look blank (#6162). `longDescription` may break lines with \n only.
  */
 const UNSAFE_TEXT =
   // eslint-disable-next-line no-control-regex -- the control characters are the point
-  /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]/;
+  /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029\p{Cf}\ufe00-\ufe0f\u{e0100}-\u{e01ef}]/u;
+/** Scripts in which ZWNJ changes how letters join or form conjuncts (Persian, Indic). */
+const ZWNJ_SCRIPTS =
+  "\\p{Script=Arabic}\\p{Script=Syriac}\\p{Script=Devanagari}\\p{Script=Bengali}\\p{Script=Gurmukhi}" +
+  "\\p{Script=Gujarati}\\p{Script=Oriya}\\p{Script=Tamil}\\p{Script=Telugu}\\p{Script=Kannada}" +
+  "\\p{Script=Malayalam}\\p{Script=Sinhala}";
+/**
+ * The invisible characters normal text needs, removed before the UNSAFE_TEXT test, but only inside
+ * the sequences that need them. Anywhere else they can spoof a name or fake a blank label (Codex
+ * PRRT_kwDOPxxmWM6sQExO, PRRT_kwDOPxxmWM6sQ79s, PRRT_kwDOPxxmWM6sQ79z). OpenAI names no exact
+ * list, but calls only "unsupported" formatting characters invalid.
+ * - ZWJ (U+200D) between emoji (after an optional skin tone or VS16), as in 👩‍💻.
+ * - ZWNJ (U+200C) between letters of a script that uses it (ZWNJ_SCRIPTS), as in Persian.
+ * - Tag characters (U+E0020-U+E007F) in a subdivision flag: U+1F3F4, tags, then U+E007F.
+ * - VS15/VS16 (U+FE0E, U+FE0F) after an emoji, and VS16 in a keycap (digit, VS16, U+20E3).
+ * The ZWJ rule runs first and keeps the emoji's VS16, which the selector rule then removes.
+ */
+// Capture groups, not lookbehind: Bun's engine (JavaScriptCore) fails a lookbehind that holds a
+// `\p{...}` escape, so the tests would not match the Node/Electron runtime.
+const ALLOWED_FORMAT_SEQUENCES: ReadonlyArray<[RegExp, string]> = [
+  [
+    /(\p{Extended_Pictographic}(?:[\u{1f3fb}-\u{1f3ff}]|\ufe0f)?)\u200d(?=\p{Extended_Pictographic})/gu,
+    "$1",
+  ],
+  [new RegExp(`([${ZWNJ_SCRIPTS}]\\p{M}*)\\u200c(?=[${ZWNJ_SCRIPTS}])`, "gu"), "$1"],
+  [/\u{1f3f4}[\u{e0020}-\u{e007e}]+\u{e007f}/gu, "\u{1f3f4}"],
+  [/(\p{Extended_Pictographic})(?:\ufe0e|\ufe0f)/gu, "$1"],
+  [/([0-9#*])\ufe0f(?=\u20e3)/gu, "$1"],
+];
+const hasUnsafeText = (value: string): boolean =>
+  UNSAFE_TEXT.test(
+    ALLOWED_FORMAT_SEQUENCES.reduce(
+      (text, [sequence, replacement]) => text.replace(sequence, replacement),
+      value
+    )
+  );
 const isText = (value: unknown, max: number, multiline = false): value is string =>
   typeof value === "string" &&
   value.length <= max &&
-  !UNSAFE_TEXT.test(value) &&
+  !hasUnsafeText(value) &&
   (multiline || !value.includes("\n"));
 const isTextList = (value: unknown, count: number, max: number): value is string[] =>
   Array.isArray(value) && value.length <= count && value.every((entry) => isText(entry, max));
+/** OpenAI: "Each capability must be non-empty"; a blank one would render as an empty badge. */
+const isLabelList = (value: unknown): value is string[] =>
+  isTextList(value, 20, 120) && value.every((label) => label.trim().length > 0);
 
 /** The validated value, or undefined when `value` breaks the rule for `kind`. */
 function parseField(kind: FieldKind, value: unknown, cap: number, multiline: boolean): unknown {
@@ -151,7 +193,7 @@ function parseField(kind: FieldKind, value: unknown, cap: number, multiline: boo
     case "path":
       return normalizeOpenAIRelativePath(value);
     case "labels":
-      return isTextList(value, 20, 120) ? value : undefined;
+      return isLabelList(value) ? value : undefined;
     case "prompts": {
       const prompts = typeof value === "string" ? [value] : value;
       return isTextList(prompts, 3, 512) ? prompts : undefined;

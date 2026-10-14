@@ -251,6 +251,7 @@ function viewOfRecord(record: McpAppResultRecord): NonNullable<McpAppViewRecord>
     resourceUri: record.resourceUri,
     arguments: record.arguments,
     entrypoint: record.entrypoint,
+    outcome: record.outcome,
   };
 }
 

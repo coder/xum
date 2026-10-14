@@ -2885,6 +2885,18 @@ describe("session_history item listing and filters", () => {
     return part;
   };
 
+  test("a user row's prompt-hook context is part of its text, as the model saw it", async () => {
+    // Codex PRRT_kwDOPxxmWM6reh6Z: search and read_item return what the provider received.
+    const user = createMuxMessage("hooked", "user", "fix the tests", {
+      pluginHookContext: [{ pluginId: "guard", text: "Ask for a repro first." }],
+    });
+    expect((await fixture.historyService.appendToHistory(workspaceId, user)).success).toBe(true);
+
+    const [hit] = await itemsOf({ action: "search", query: "repro first" });
+    expect(hit?.text).toContain("fix the tests");
+    expect(hit?.text).toContain('<plugin-hook-context plugin="guard">');
+  });
+
   test("unfiltered listing returns rows in persisted order and every ID round-trips", async () => {
     const user = createMuxMessage("ask", "user", "please list");
     expect((await fixture.historyService.appendToHistory(workspaceId, user)).success).toBe(true);

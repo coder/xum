@@ -125,7 +125,8 @@ export function registerCodexPluginHooks(
               { prompt: ctx.text },
               "UserPromptSubmit",
               registration,
-              { cwd: ctx.cwd }
+              // A withdrawn send ends this call, and invoke skips the later ones.
+              { cwd: ctx.cwd, abortSignal: ctx.signal }
             );
             if (output === null) continue;
             // Codex: a block without a non-empty reason is an invalid result and fails open

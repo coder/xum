@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { hasDraftBlock, removeDraftBlock, removeSentText } from "./composerDraftText";
+import { hasDraftBlock, removeDraftBlock, removeSentText, takeSentText } from "./composerDraftText";
 
 describe("removeSentText", () => {
   test("a send of the whole composer text empties it", () => {
@@ -26,6 +26,26 @@ describe("removeSentText", () => {
 
   test("an attachment-only send (no text) leaves the composer text", () => {
     expect(removeSentText("restored draft", "")).toBe("restored draft");
+  });
+});
+
+// #6405: the composer stays on from Enter, so keys typed before the send takes its draft follow
+// the sent text directly.
+describe("takeSentText", () => {
+  test("keys typed right after the sent text stay exactly as typed, without the sent text", () => {
+    expect(takeSentText("first messagex", "first message", true)).toBe("x");
+    expect(takeSentText("first message", "first message", true)).toBe("");
+    expect(takeSentText("first message  indented", "first message", true)).toBe("  indented");
+    expect(takeSentText("first message\nmore", "first message", true)).toBe("\nmore");
+    expect(takeSentText("restored draft", "", true)).toBe("restored draft");
+  });
+
+  test("a text replaced or restored since Enter keeps the whitespace-boundary rule", () => {
+    expect(takeSentText("yesterday", "yes", false)).toBe("yesterday");
+    expect(takeSentText("restored\n\nyes", "yes", false)).toBe("restored");
+    expect(takeSentText("hello\n\nfrom the other window", "hello", false)).toBe(
+      "from the other window"
+    );
   });
 });
 

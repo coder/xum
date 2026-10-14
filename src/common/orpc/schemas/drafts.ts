@@ -183,6 +183,12 @@ export const DraftBeginSendInputSchema = z.object({
    * instead of two before the send); the backend then takes the sent text out of it.
    */
   text: z.string().optional(),
+  /**
+   * #6405: the sender's visible text, the sent text followed only by keys typed after Enter. When
+   * the backend's visible text (after `text` is merged in) is exactly this, it takes exactly the
+   * sent prefix (takeSentText). Otherwise only the whitespace rule applies.
+   */
+  typedAfterSendText: z.string().optional(),
   /** As for drafts.update: the pending sends the sender's unsaved text was written against. */
   basisSends: z.array(BasisSendSchema).max(1000).optional(),
 });
