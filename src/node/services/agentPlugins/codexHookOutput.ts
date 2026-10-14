@@ -101,14 +101,10 @@ export function parsePreToolUseOutput(result: unknown): PreToolUseOutput | null 
   const chosen = hasSpecificDecision(specific)
     ? preSpecificDecision(specific)
     : preLegacyDecision(raw);
-  // PreToolUse does not support continue: false or stopReason. Codex voids such an output; Xum
-  // still honors its deny (see NO_REASON) and voids only the other decisions.
-  const unsupported =
-    raw.continue === false
-      ? "returned unsupported continue false"
-      : raw.stopReason != null
-        ? "returned unsupported stopReason"
-        : undefined;
+  // PreToolUse does not support continue: false, stopReason or suppressOutput. Codex voids such an
+  // output; Xum still honors its deny (see NO_REASON) and voids the rest: a rewrite, the context
+  // (PRRT_kwDOPxxmWM6sSNEa).
+  const unsupported = unsupportedPreToolUseField(raw);
   const decision: Decision<PreToolUseOutput> =
     unsupported !== undefined && !("denyReason" in chosen) ? { invalid: unsupported } : chosen;
   return withContext(
@@ -117,6 +113,13 @@ export function parsePreToolUseOutput(result: unknown): PreToolUseOutput | null 
     specific,
     unsupported === undefined && !("invalid" in decision)
   );
+}
+
+function unsupportedPreToolUseField(raw: Record<string, unknown>): string | undefined {
+  if (raw.continue === false) return "returned unsupported continue false";
+  if (raw.stopReason != null) return "returned unsupported stopReason";
+  if (raw.suppressOutput === true) return "returned unsupported suppressOutput";
+  return undefined;
 }
 
 function hasSpecificDecision(specific: Record<string, unknown>): boolean {
@@ -188,6 +191,7 @@ function postInvalid(
   specific: Record<string, unknown>
 ): string | undefined {
   const block = raw.decision === "block";
+  if (raw.suppressOutput === true) return "returned unsupported suppressOutput";
   if (specific.updatedMCPToolOutput != null) return "returned unsupported updatedMCPToolOutput";
   if (block && trimmed(stringField(raw, "reason")) === undefined) {
     return "returned a block without a non-empty reason";

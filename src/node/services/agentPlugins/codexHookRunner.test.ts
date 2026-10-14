@@ -811,6 +811,31 @@ describe("Codex output rules (output_parser.rs)", () => {
     }
   });
 
+  test("suppressOutput voids a rewrite and the context, but not a deny or block", async () => {
+    const schema = { type: "object", properties: { script: { type: "string" } } };
+    const pre = setup([hook("PreToolUse")], () =>
+      json({
+        suppressOutput: true,
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "allow",
+          updatedInput: { script: "safe" },
+          additionalContext: "Dropped.",
+        },
+      })
+    );
+    expect((await runTool(pre.spine, "bash", { script: "ls" }, schema)).result).toEqual({
+      ran: { script: "ls" },
+    });
+    const post = setup([hook("PostToolUse")], () =>
+      json({
+        suppressOutput: true,
+        hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: "Dropped." },
+      })
+    );
+    expect((await runTool(post.spine, "bash", {})).result).toEqual({ ran: {} });
+  });
+
   test("an invalid decision value is malformed even when another field decides", async () => {
     const pre = setup([hook("PreToolUse")], () =>
       json({
