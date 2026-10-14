@@ -46,12 +46,12 @@ function getKeyAction(
  * (cmdk's root takes focus), so check the palette too (#6434).
  */
 function keysMayAct(event: KeyboardEvent): boolean {
-  return (
-    !isEditableElement(event.target) &&
-    !isCommandPaletteTarget(event.target) &&
-    !isAltGraphPressed(event) &&
-    !isDialogOpen()
-  );
+  return !targetOwnsKeys(event.target) && !isAltGraphPressed(event) && !isDialogOpen();
+}
+
+/** A text field or the open command palette handles its own keys. */
+function targetOwnsKeys(target: EventTarget | null): boolean {
+  return isEditableElement(target) || isCommandPaletteTarget(target);
 }
 
 /**

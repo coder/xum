@@ -244,7 +244,9 @@ function useRowShortcutKeys(
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
       const root = rootRef.current;
-      if (root) handleRowShortcut(event, root, latestRef.current.shown, latestRef.current.props);
+      // Ctrl+Alt chords: AltGr types characters with the same modifiers. A field keeps its keys.
+      if (!root || isAltGraphPressed(event) || isEditableElement(event.target)) return;
+      handleRowShortcut(event, root, latestRef.current.shown, latestRef.current.props);
     };
     window.addEventListener("keydown", handler, true);
     return () => window.removeEventListener("keydown", handler, true);
@@ -257,8 +259,6 @@ function handleRowShortcut(
   shown: WorkspaceActionId[],
   props: WorkspaceActionsMenuContentProps
 ) {
-  // Ctrl+Alt chords: AltGr types characters with the same modifiers. A field keeps its keys.
-  if (isAltGraphPressed(event) || isEditableElement(event.target)) return;
   const match = ROW_KEYBINDS.find((row) => matchesKeybind(event, row.keybind));
   if (!match) return;
   event.preventDefault();
