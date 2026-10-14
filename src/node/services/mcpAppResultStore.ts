@@ -245,7 +245,8 @@ export class McpAppResultStore {
       }
       // Patch the file's own object, so fields of a newer build survive a downgrade's write.
       const { widgetState: _previous, ...rest } = read.raw;
-      const file = stateJson === null ? rest : { ...rest, widgetState: JSON.parse(stateJson) };
+      const file =
+        stateJson === null ? rest : { ...rest, widgetState: JSON.parse(stateJson) as unknown };
       await writeFileAtomic(filePath, JSON.stringify(file));
       const { widgetState: _old, ...known } = read.record;
       // Parsed back from its JSON, so memory holds exactly what the file holds.
