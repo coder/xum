@@ -18,6 +18,16 @@ interface StoredDraft {
 }
 
 /**
+ * One revision sequence for the whole page, as a real backend never answers below its earlier
+ * revisions (DraftService seeds them from its start time; stories freeze Date.now, so that does
+ * not work here). The DraftStore is one per page and outlives each story's mock client: with a
+ * sequence per client, a story that reused a workspace ID got write replies older than the
+ * previous story's last view, and the store applied that old (empty) view over the text being
+ * typed (#6389).
+ */
+let revision = 1;
+
+/**
  * In-memory drafts API for Storybook. Stories seed drafts through the legacy localStorage keys
  * (stories/helpers/drafts.ts, uiState.ts), which the DraftStore imports on hydration exactly like
  * an upgrading user's drafts.
@@ -25,7 +35,6 @@ interface StoredDraft {
 export function createMockDraftsApi() {
   const drafts = new Map<string, StoredDraft>();
   const listeners = new Set<(event: DraftEvent) => void>();
-  let revision = 1;
   let listEntries: DraftListEntry[] = [];
   const isSame = (a: DraftListEntry, b: DraftListEntry) =>
     a.projectPath === b.projectPath && a.draftId === b.draftId;
