@@ -841,15 +841,14 @@ export class AgentPluginInstallService {
    * both mean the managed container may hold unreconciled state.
    */
   /**
-   * Crash recovery, then the pending sign-outs. Pending sign-outs do not make recovery
+   * Crash recovery, then starts the pending sign-outs. Pending sign-outs do not make recovery
    * unhealthy: every discovery gate checks the record itself (containerHasPendingSignOuts).
    */
   private async recover(): Promise<boolean> {
     const allConsumed = await this.reconcileJournals();
-    // A failure here must not latch journal health: the record is its own fence.
-    await this.completePendingSignOuts().catch((error: unknown) => {
-      log.warn("Could not finish pending plugin sign-outs", { error: getErrorMessage(error) });
-    });
+    // Started, not awaited: a slow or failed sign-out must not latch journal health (a
+    // timed-out recovery stores false until the next section open). The record is its own fence.
+    await this.startPendingSignOutPass();
     return allConsumed;
   }
 

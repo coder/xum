@@ -2259,6 +2259,50 @@ describe("AgentPluginInstallService", () => {
       expect(await pendingSignOuts()).toEqual([serverUrl]);
     });
 
+    test("a slow sign-out during section open does not latch journal health", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+        reconciliationTimeoutMs: 10,
+      });
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      let release: (() => void) | undefined;
+      let entered: (() => void) | undefined;
+      const slowEntered = new Promise<void>((resolve) => (entered = resolve));
+      let slow = false;
+      restarted.setMcpOauthService({
+        logout: async (input: { serverUrl: string }) => {
+          if (!slow) return { success: false, error: "offline" };
+          const released = new Promise<void>((resolve) => (release = resolve));
+          entered?.();
+          await released;
+          return oauth.logout(input);
+        },
+        credentialKey: (url: string) => oauth.credentialKey(url),
+      } as unknown as McpOauthService);
+      // The startup pass fails fast and keeps the record; section open meets the slow logout.
+      await restarted.list();
+      slow = true;
+      // The list waits on the plugin mutation lock behind the sign-out, so release it first.
+      const listed = restarted.list();
+      await slowEntered;
+      const internals = restarted as unknown as {
+        pendingSignOutPass?: Promise<void>;
+        reconciliationState: Promise<boolean>;
+      };
+      // Recovery settles while the sign-out still hangs, and its health stays true.
+      expect(await internals.reconciliationState).toBe(true);
+      release?.();
+      await listed;
+      await internals.pendingSignOutPass;
+      expect(await pendingSignOuts()).toBeUndefined();
+      // Journal health stayed true, so the custom gate opens without another section open.
+      expect(await discovered()).toBe(1);
+      await oauth.dispose();
+    });
+
     test("survives an uninstall of the plugin", async () => {
       const { updater, failing, result } = await updateWithFailingSignOut(stopStub);
       await result;
