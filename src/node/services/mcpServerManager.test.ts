@@ -1394,8 +1394,9 @@ describe("MCPServerManager", () => {
     expect(after.instanceToken).toBe(before.instanceToken);
   });
 
-  test("settings: a save read from a replaced server instance saves only when the schema is unchanged", async () => {
+  test("settings: a save or tool action read from a replaced instance proceeds only when the schema is unchanged", async () => {
     const updates: string[] = [];
+    const runs: string[] = [];
     const settingsServer = (id: string, title: string) => ({
       tools: { draw: testTool() },
       settings: {
@@ -1415,6 +1416,10 @@ describe("MCPServerManager", () => {
         },
         settingsToolAction: (tool: string) =>
           tool === "lib" ? { title: "Library", readOnly: true, opensApp: false } : undefined,
+        callSettingsActionTool: () => {
+          runs.push(id);
+          return Promise.resolve({ content: [] });
+        },
       },
     });
     configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-token-v1") });
@@ -1432,17 +1437,32 @@ describe("MCPServerManager", () => {
         .then(() => "saved")
         .catch((error: unknown) => String(error));
 
-    // The dialog stays open while the server restarts with the same schema: the save lands.
+    const run = () =>
+      manager
+        .runSettingsTool("settings-token-ws", "cad", "lib", read.instanceToken, {
+          confirmed: false,
+        })
+        .then(() => "ran")
+        .catch((error: unknown) => String(error));
+
+    // The dialog stays open while the server restarts with the same schema. A tool action is
+    // refused until a read saw the new instance (no schema to compare yet).
     configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-token-v1b") });
     await manager.getToolsForWorkspace(request);
+    expect(await run()).toContain("Reopen");
+    // The save lands (its fresh read sees the new instance), and so does the action after it.
     expect(await save()).toBe("saved");
     expect(updates).toEqual(["v1b"]);
+    expect(await run()).toBe("ran");
+    expect(runs).toEqual(["v1b"]);
 
     // A replacement with another schema is refused: the dialog validated against the old one.
     configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-token-v2") });
     await manager.getToolsForWorkspace(request);
     expect(await save()).toContain("Reopen");
     expect(updates).toEqual(["v1b"]);
+    expect(await run()).toContain("Reopen");
+    expect(runs).toEqual(["v1b"]);
   });
 
   test("settings: a server replaced between the save's fresh read and its update is refused", async () => {
