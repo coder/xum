@@ -1190,7 +1190,10 @@ describe("DraftService workspace name state size", () => {
     ).toBe(true);
     // A legacy name merged under a stored body counts that body too.
     await service.update({ scope, text: "x".repeat(MAX_DRAFT_JSON_BYTES - 100) });
-    const nearLimitName = { ...oversized, generatedIdentity: { name: "n", title: "t".repeat(200) } };
+    const nearLimitName = {
+      ...oversized,
+      generatedIdentity: { name: "n", title: "t".repeat(200) },
+    };
     expect(
       isDraftTooLargeError(
         await rejection(service.importLegacy({ scope, nameState: nearLimitName }))
