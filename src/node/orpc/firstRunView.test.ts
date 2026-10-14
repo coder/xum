@@ -27,16 +27,17 @@ afterEach(async () => {
 
 /** Runs the script on a served "/" (the module list, then the template), with fakes for its inputs. */
 function run(o: { url?: string; viewed?: boolean; token?: string; hidden?: boolean } = {}) {
-  dom = new GlobalWindow({
+  const window = new GlobalWindow({
     url: o.url ?? "http://127.0.0.1/",
     settings: { disableJavaScriptFileLoading: true, handleDisabledFileLoadingAsSuccess: true },
   });
-  const doc = dom.document as unknown as Document;
+  dom = window;
+  const doc = window.document as unknown as Document;
   const list = { script: "./main-A.js", preload: ["./api-B.js"] };
   doc.head.innerHTML = `<script type="application/json" id="${FIRST_RUN_MODULES_ID}">${JSON.stringify(list)}</script>`;
   doc.body.innerHTML = `<div id="root"></div><template id="${FIRST_RUN_TEMPLATE_ID}">${FIRST_RUN_VIEW_HTML}</template>`;
-  if (o.viewed) dom.localStorage.setItem(ONBOARDING_VIEWED_KEY, "true");
-  if (o.token) dom.localStorage.setItem(AUTH_TOKEN_KEY, o.token);
+  if (o.viewed) window.localStorage.setItem(ONBOARDING_VIEWED_KEY, "true");
+  if (o.token) window.localStorage.setItem(AUTH_TOKEN_KEY, o.token);
   let visibility = o.hidden ? "hidden" : "visible";
   Object.defineProperty(doc, "visibilityState", { get: () => visibility, configurable: true });
   const calls: Call[] = [];
@@ -57,17 +58,19 @@ function run(o: { url?: string; viewed?: boolean; token?: string; hidden?: boole
   const names = ["document", "location", "localStorage", "fetch", "setTimeout", "clearTimeout"];
   const fakes = [
     doc,
-    dom.location,
-    dom.localStorage,
+    window.location,
+    window.localStorage,
     fetchFake,
     (fn: () => void, ms: number) => timers.push({ ms, fn, cleared: false }) - 1,
     (id: number) => timers[id] && (timers[id].cleared = true),
   ];
   // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs the shipped script string itself
-  new Function(...names, "requestAnimationFrame", FIRST_RUN_EARLY_SCRIPT)(
-    ...fakes,
-    (fn: () => void) => frames.push(fn)
-  );
+  const script = new Function(...names, "requestAnimationFrame", FIRST_RUN_EARLY_SCRIPT) as (
+    ...args: unknown[]
+  ) => void;
+  script(...fakes, (fn: () => void) => frames.push(fn));
+  // happy-dom's Event, typed as the DOM's for the Document-typed nodes.
+  const event = (type: string) => new (window.Event as unknown as typeof Event)(type);
   const settled = () => new Promise((resolve) => setTimeout(resolve, 0));
   return {
     calls,
@@ -78,7 +81,8 @@ function run(o: { url?: string; viewed?: boolean; token?: string; hidden?: boole
     apps: () => doc.querySelectorAll('script[type="module"]'),
     preloads: () =>
       [...doc.querySelectorAll("link[rel=modulepreload]")].map((l) => l.getAttribute("href")),
-    hide: () => ((visibility = "hidden"), doc.dispatchEvent(new dom!.Event("visibilitychange"))),
+    event,
+    hide: () => ((visibility = "hidden"), doc.dispatchEvent(event("visibilitychange"))),
     flushFrames: () => frames.splice(0).forEach((fn) => fn()),
     /** Answers both POSTs: the viewed list, then the provider config. */
     answer: async (viewedIds: string[], config: Record<string, unknown>) => {
@@ -98,9 +102,10 @@ describe("the early script", () => {
       "http://127.0.0.1/api/splashScreens/getViewedSplashScreens",
       "http://127.0.0.1/api/providers/getConfig",
     ]);
-    expect(page.calls.map((c) => c.headers.Authorization)).toEqual(
-      Array(2).fill("Bearer from-url")
-    );
+    expect(page.calls.map((c) => c.headers.Authorization)).toEqual([
+      "Bearer from-url",
+      "Bearer from-url",
+    ]);
     await page.answer([], { anthropic: { isConfigured: false } });
     expect(page.view()?.hasAttribute("inert")).toBe(true);
     expect(page.apps()).toHaveLength(0);
@@ -165,7 +170,7 @@ describe("the early script", () => {
     await page.answer([], {});
     page.flushFrames();
     page.flushFrames();
-    page.apps()[0].dispatchEvent(new dom!.Event("error"));
+    page.apps()[0].dispatchEvent(page.event("error"));
     expect(page.view() === null).toBe(true);
   });
 
