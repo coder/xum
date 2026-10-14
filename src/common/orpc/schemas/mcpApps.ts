@@ -4,6 +4,7 @@ import {
   MCP_APP_CSP_DOMAINS_MAX,
   MCP_APP_MODEL_CONTEXT_MAX_BYTES,
   MCP_APP_READ_URI_MAX_CHARS,
+  MCP_APP_TOOL_NAME_MAX_CHARS,
   MCP_APP_VIEW_DOMAINS_MAX,
   MCP_APP_VIEW_RECORDS_MAX_IDS,
 } from "@/common/utils/mcpApps";
@@ -92,7 +93,7 @@ export const McpAppViewRecordsSchema = z.array(
 export const McpAppToolCallRequestSchema = z.object({
   workspaceId: z.string().min(1),
   serverName: z.string().min(1),
-  toolName: z.string().min(1).max(256),
+  toolName: z.string().min(1).max(MCP_APP_TOOL_NAME_MAX_CHARS),
   arguments: z.record(z.string(), z.unknown()),
   /** The user allowed this call in the confirm strip (required for model-visible tools). */
   consented: z.boolean(),
@@ -148,7 +149,7 @@ export const McpAppEntrypointSchema = z.object({
   serverName: z.string().min(1),
   /** What the user sees: "<plugin> · <server>" for a plugin server, else the server key. */
   serverLabel: z.string(),
-  toolName: z.string().min(1),
+  toolName: z.string().min(1).max(MCP_APP_TOOL_NAME_MAX_CHARS),
   title: z.string(),
   resourceUri: z.string().refine(isMcpAppResourceUri),
   type: z.enum(["global", "thread"]),
@@ -159,7 +160,7 @@ export type McpAppEntrypoint = z.infer<typeof McpAppEntrypointSchema>;
 export const McpAppOpenEntrypointRequestSchema = z.object({
   workspaceId: z.string().min(1),
   serverName: z.string().min(1),
-  toolName: z.string().min(1).max(256),
+  toolName: z.string().min(1).max(MCP_APP_TOOL_NAME_MAX_CHARS),
   type: z.enum(["global", "thread"]),
 });
 

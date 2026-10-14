@@ -47,11 +47,13 @@ import {
   isAppCallableTool,
   isMcpAppResourceUri,
   isModelVisibleTool,
+  MCP_APP_ENTRYPOINT_TITLE_MAX_CHARS,
   MCP_APP_TOOL_CALL_WINDOW_MS,
   MCP_APP_TOOL_CALLS_PER_WINDOW,
   mcpAppEntrypointKey,
   type MCPAppEntrypointType,
 } from "@/common/utils/mcpApps";
+import { sanitizeText } from "@/common/utils/mcp/displayText";
 import { log } from "@/node/services/log";
 import { MCPStdioTransport, MCP_STDIO_KILL_JOIN_MS } from "@/node/services/mcpStdioTransport";
 import type {
@@ -5306,8 +5308,14 @@ export class MCPServerManager {
    */
   private appServerLabel(workspaceId: string, serverName: string): string {
     const plugin = this.workspaceServers.get(workspaceId)?.enabledServers[serverName]?.plugin;
-    return plugin !== undefined
-      ? `${plugin.pluginName} · ${plugin.serverName}`
+    // Both parts come from plugin files: cleaned like entry point titles, so bidi or control
+    // characters cannot reorder or wrap the label. A part that cleans to nothing falls back to
+    // the key's display form.
+    const parts = [plugin?.pluginName, plugin?.serverName].map((part) =>
+      sanitizeText(part, MCP_APP_ENTRYPOINT_TITLE_MAX_CHARS)
+    );
+    return parts.every((part) => part !== undefined)
+      ? parts.join(" · ")
       : displayConnectionKey(serverName);
   }
 
