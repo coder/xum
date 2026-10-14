@@ -309,14 +309,13 @@ def inlined_literal(node):
     return None
 
 
-def runs_whenever_called(body, target, literal_lines) -> bool:
+def runs_whenever_called(body, target, is_safe) -> bool:
     """Whether nothing in `body` before the declarator `target` can skip it: no return, throw or call.
 
     Every earlier statement, and every earlier declarator of target's own
     statement (`const x = mayThrow(), K = 2`), must declare a plain name (a
-    destructuring pattern can throw) with a value that `literal_lines` resolves
-    (a literal, or an alias of an accepted literal const) or none, so the
-    target runs whenever the function does.
+    destructuring pattern can throw) with a value that `is_safe` accepts or
+    none, so the target runs whenever the function does.
     """
 
     for statement in body.named_children:
@@ -335,7 +334,7 @@ def runs_whenever_called(body, target, literal_lines) -> bool:
             value = declarator.child_by_field_name("value")
             if name is None or name.type != "identifier":
                 return False
-            if value is not None and not literal_lines(value):
+            if value is not None and not is_safe(value):
                 return False
     return True
 
@@ -367,6 +366,20 @@ def literal_const_scopes(root) -> dict[str, list[tuple[int, object]]]:
             if target.start_byte <= value.start_byte < target.end_byte
         ]
 
+    def is_safe_in(body):
+        # A literal, or an alias of a literal const declared earlier in this
+        # same body. A const of an outer scope can be shadowed by a later local
+        # declaration, whose temporal dead zone makes the read throw; a second
+        # const of the same name in one body is a syntax error.
+        def is_safe(value) -> bool:
+            if inlined_literal(value) is not None:
+                return True
+            declarations = consts.get(value.text.decode("utf-8"), []) if value.type == "identifier" else []
+            same = (body.start_byte, body.end_byte)
+            return any((scope.start_byte, scope.end_byte) == same for _, scope in declarations)
+
+        return is_safe
+
     # descendants() walks in source order, so an alias sees its target.
     for node in descendants(root):
         if node.type != "lexical_declaration" or node.child_count == 0 or node.children[0].type != "const":
@@ -384,7 +397,7 @@ def literal_const_scopes(root) -> dict[str, list[tuple[int, object]]]:
             value = declarator.child_by_field_name("value")
             if name is None or value is None or name.type != "identifier":
                 continue
-            if is_function_body and not runs_whenever_called(scope, declarator, literal_lines):
+            if is_function_body and not runs_whenever_called(scope, declarator, is_safe_in(scope)):
                 continue
             for line in literal_lines(value):
                 consts.setdefault(name.text.decode("utf-8"), []).append((line, scope))

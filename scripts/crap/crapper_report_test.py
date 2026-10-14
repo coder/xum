@@ -567,6 +567,15 @@ export function outer(items: number[]): number {
     # Neither can an alias of an earlier literal const.
     alias_first = source.replace("const first = check(items),", "const raw = 1, first = raw,")
     assert suspects(capsys, tmp_path, alias_first, report)["outer"][1] is True
+    # An outer const can be shadowed by a later local one: reading it there
+    # throws (temporal dead zone), so it is not safe.
+    shadowed = "const raw = 1;\n" + alias_first.replace("const raw = 1, first = raw,", "const first = raw,").replace(
+        "  return total + first;\n", "  const raw = check(items);\n  return total + first + raw;\n"
+    )
+    # The same report, one line down.
+    hits = ((1, 16), (2, 10), (3, 0), (4, 0), (5, 0), (6, 0), (8, 0))
+    shifted = "".join(f"DA:{line + 1},{count}\n" for line, count in hits)
+    assert suspects(capsys, tmp_path, shadowed, "DA:1,12\n" + shifted)["outer"][1] is False
 
 def test_javascript_sources_flag_too(tmp_path, capsys):
     # Bun 1.4.3 zeroes a .js module the same way (lines 2-9 at 0).
