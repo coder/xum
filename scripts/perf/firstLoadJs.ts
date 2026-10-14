@@ -12,6 +12,7 @@
  */
 import * as fs from "fs";
 import * as path from "path";
+import { FIRST_RUN_MODULES_ID } from "@/node/orpc/firstRunView";
 
 // Source-map path substrings never allowed on the first load. Later T3 PRs add the module
 // they make lazy (e.g. `node_modules/lottie-web/`) so it cannot come back.
@@ -50,7 +51,7 @@ const ATTRIBUTE = /([^\s="'<>/]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?
  * which this tool counts like the tags it replaces. PR 4b writes that block, and must keep this
  * id and shape.
  */
-export const FIRST_RUN_MODULES_ID = "xum-pre-modules";
+export { FIRST_RUN_MODULES_ID };
 
 function parseAttributes(rest: string): Map<string, string> {
   const attrs = new Map<string, string>();

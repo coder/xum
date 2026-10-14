@@ -42,3 +42,35 @@ export function firstViewFontPreload(file: string | undefined): string {
     ? ""
     : `<link rel="preload" as="font" type="font/woff2" crossorigin href="./${file}" />`;
 }
+
+const MODULE_TAG = /[ \t]*<(script|link)\b([^>]*)>(?:<\/script>)?\n?/gi;
+const attribute = (attrs: string, name: string) =>
+  new RegExp(`\\s${name}\\s*=\\s*"([^"]*)"`, "i").exec(attrs)?.[1];
+
+/**
+ * T3 C step 2 (plan section 5.6, PR 4b): index.html without Vite's module script and modulepreload
+ * tags, and their hrefs in order, for the early script to add after the static first-run view
+ * paints. Null unless the page has exactly one module script with a src: then "/" is served as is.
+ */
+// No `preload` type annotations here: check-startup-imports.test.ts reads every "preload" plus colon
+// in src/ as an Electron preload script.
+export function deferAppModules(html: string) {
+  const scripts: Array<string | undefined> = [];
+  const preload = new Array<string>();
+  const rest = html.replace(MODULE_TAG, (tag, name: string, attrs: string) => {
+    if (name.toLowerCase() === "script") {
+      if (attribute(attrs, "type") !== "module") return tag; // inline boot scripts
+      scripts.push(attribute(attrs, "src"));
+      return "";
+    }
+    const href = attribute(attrs, "href");
+    if (!attribute(attrs, "rel")?.split(/\s+/).includes("modulepreload") || href == null)
+      return tag;
+    preload.push(href);
+    return "";
+  });
+  const [script] = scripts;
+  return scripts.length === 1 && script != null
+    ? { html: rest, modules: { script, preload } }
+    : null;
+}

@@ -182,8 +182,12 @@ export const FIRST_RUN_VIEW_HTML = firstRunViewHtml(VERSION.git_describe);
 /** The <template> that holds FIRST_RUN_VIEW_HTML on the served "/" (PR 4b). */
 export const FIRST_RUN_TEMPLATE_ID = "xum-pre-template";
 
-/** `{"script": href, "preload": [href, ...]}`, the app's modules: scripts/perf/firstLoadJs.ts reads it too. */
-const FIRST_RUN_MODULES_ID = "xum-pre-modules";
+/**
+ * The served "/"'s `<script type="application/json">` with the app's modules,
+ * `{"script": href, "preload": [href, ...]}`: server.ts writes it, the early script loads from it, and
+ * scripts/perf/firstLoadJs.ts counts it. Not in src/common, so the renderer build stays byte-identical.
+ */
+export const FIRST_RUN_MODULES_ID = "xum-pre-modules";
 
 /**
  * The early script (plan section 5.6), for an inline <script> on the served "/" after the slashless
