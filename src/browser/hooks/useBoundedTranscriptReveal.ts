@@ -133,8 +133,8 @@ function storedSliceEnd(state: RevealState, rows: readonly RevealRow[], isSafeCu
   const { endMessageId: id, endIndexHint: hint, endRows } = state;
   if (id === null) return rows.length;
   const found = rows[hint]?.id === id ? hint : rows.findIndex((row) => row.id === id);
-  const end = found === -1 ? endAtNearestUnmountedRow(rows, endRows, hint) : found;
-  return end === rows.length ? end : nearestSafeCutAtOrBefore(end, rows.length, isSafeCut);
+  if (found !== -1) return nearestSafeCutAtOrBefore(found, rows.length, isSafeCut);
+  return endAtNearestUnmountedRow(rows, endRows, hint, isSafeCut);
 }
 
 /**
@@ -146,12 +146,13 @@ function storedSliceEnd(state: RevealState, rows: readonly RevealRow[], isSafeCu
 function endAtNearestUnmountedRow(
   rows: readonly RevealRow[],
   endRows: readonly RevealRow[],
-  hint: number
+  hint: number,
+  isSafeCut: IsSafeCut
 ): number {
   const indexById = new Map(rows.map((row, index) => [row.id, index]));
   for (let newer = hint + 1; newer < endRows.length; newer += 1) {
     const index = indexById.get(endRows[newer].id);
-    if (index !== undefined) return index;
+    if (index !== undefined) return nearestSafeCutAtOrBefore(index, rows.length, isSafeCut);
   }
   return rows.length;
 }
