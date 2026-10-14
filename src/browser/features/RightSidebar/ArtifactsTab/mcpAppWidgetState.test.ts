@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { APIClient } from "@/browser/contexts/API";
+import { createTestApiClient } from "@/browser/testUtils";
 import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
 import {
   mcpAppWidgetStateSeed,
@@ -24,10 +24,12 @@ function loadedView(binding: string | null, widgetState: unknown = null): McpApp
 /** An API whose setWidgetState calls wait until the test settles them. */
 function deferredApi() {
   const writes: Array<{ state: unknown; binding: string; settle: (ok: boolean) => void }> = [];
-  const api = {
+  const api = createTestApiClient({
     mcpApps: {
       setWidgetState: (input: { state: unknown; binding: string }) =>
-        new Promise((resolve) =>
+        new Promise<
+          { success: true; data: Record<string, never> } | { success: false; error: string }
+        >((resolve) =>
           writes.push({
             state: input.state,
             binding: input.binding,
@@ -36,7 +38,7 @@ function deferredApi() {
           })
         ),
     },
-  } as unknown as APIClient;
+  });
   return { api, writes };
 }
 
@@ -69,7 +71,7 @@ describe("MCP App widget state", () => {
     writes[0].settle(true);
   });
 
-  test("a new record under a reused tool call ID gets only its own stored state", async () => {
+  test("a new record under a reused tool call ID gets only its own stored state", () => {
     const { api } = deferredApi();
     saveMcpAppWidgetState(api, mcpAppWidgetStateTarget("ws-reuse", "c1", loadedView("r10")), {
       secret: true,
@@ -78,7 +80,7 @@ describe("MCP App widget state", () => {
     expect(mcpAppWidgetStateSeed({ nonce: "doc-reuse" }, reused)).toBeNull();
   });
 
-  test("a document keeps the seed it was built with, so later writes do not reload it", async () => {
+  test("a document keeps the seed it was built with, so later writes do not reload it", () => {
     const { api } = deferredApi();
     const target = mcpAppWidgetStateTarget("ws-doc", "c1", loadedView("r10", { n: 1 }));
     expect(mcpAppWidgetStateSeed({ nonce: "doc-a" }, target)).toEqual({ n: 1 });
