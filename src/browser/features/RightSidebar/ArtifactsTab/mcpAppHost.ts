@@ -94,14 +94,14 @@ function isJsonValue(value: unknown): boolean {
     case "number":
       return Number.isFinite(value);
     case "object":
-      return value === null || isJsonContainer(value);
+      return value === null || isJsonContainer(value as Readonly<Record<string, unknown>>);
     default:
       return false;
   }
 }
 
 /** An array or a plain object (no Date, Map or other class) of JSON values. */
-function isJsonContainer(value: object): boolean {
+function isJsonContainer(value: Readonly<Record<string, unknown>> | readonly unknown[]): boolean {
   if (Array.isArray(value)) return value.every(isJsonValue);
   const prototype: unknown = Object.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) return false;
