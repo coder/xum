@@ -158,6 +158,11 @@ function isSaveDisabled(state: {
   return state.actionsDisabled || state.offline || state.reading;
 }
 
+/** The rows are read-only while a save runs and while offline. */
+function areRowsLocked(saving: boolean, offline: boolean): boolean {
+  return saving || offline;
+}
+
 export const SecretsSection: React.FC = () => {
   const { api } = useAPI();
   // Offline, the rows stay on screen read-only (as in Tasks): Save could not reach the server,
@@ -244,7 +249,7 @@ export const SecretsSection: React.FC = () => {
   // The scope and project (JSON) whose loaded secrets are shown; null while none are.
   const shownSecretsKeyRef = useRef<string | null>(null);
   const actionsDisabled = !isDirty || saving || loading;
-  const rowsLocked = saving || offline;
+  const rowsLocked = areRowsLocked(saving, offline);
 
   const sortedGlobalSecretKeys = globalSecretKeys
     .slice()
