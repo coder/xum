@@ -1424,6 +1424,40 @@ describe("Config", () => {
       }
     );
 
+    // A retry may skip the reuse scan only after a scan that completed: a scan that threw found
+    // nothing, and an identical backup it missed must still be reused later.
+    (process.getuid?.() === 0 ? it.skip : it)(
+      "scans again after a reuse scan that failed, and reuses the backup it then finds",
+      async () => {
+        writeProjects(conflictCases[0][1]());
+        const configFile = path.join(tempDir, "config.json");
+        const existing = `${configFile}.alias-conflict-1`;
+        fs.writeFileSync(existing, fs.readFileSync(configFile), { mode: 0o600 });
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        // A read-only config dir makes every new sidecar fail, so only a reuse can succeed.
+        fs.chmodSync(tempDir, 0o500);
+        const readdirSpy = spyOn(fs, "readdirSync").mockImplementationOnce(() => {
+          throw Object.assign(new Error("EIO: i/o error, scandir"), { code: "EIO" });
+        });
+        let blocked: unknown;
+        try {
+          config.loadConfigOrDefault();
+          config.loadConfigOrDefault();
+          blocked = await config.setUpdateChannel("nightly").then(
+            () => null,
+            (error: unknown) => error
+          );
+        } finally {
+          readdirSpy.mockRestore();
+          fs.chmodSync(tempDir, 0o700);
+          errorSpy.mockRestore();
+        }
+        // The second load found the existing backup, so the alias gate no longer refuses edits.
+        expect(String(blocked)).not.toContain("could not back them up");
+        expect(aliasConflictBackups()).toEqual([existing]);
+      }
+    );
+
     // Perf contract (#5929): the alias merge adds no file reads or directory listings to a load
     // without a legacy-copy shape, with or without aliases.
     for (const [name, stored] of [
