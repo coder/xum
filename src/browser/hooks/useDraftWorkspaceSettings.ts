@@ -12,7 +12,7 @@ import {
   CODER_RUNTIME_PLACEHOLDER,
 } from "@/common/types/runtime";
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
-import { useCreationRuntimePick } from "./useCreationRuntimePick";
+import { runtimePickAfter, useCreationRuntimePick } from "./useCreationRuntimePick";
 import {
   readOptionField,
   readSshOptionDefaults,
@@ -417,7 +417,7 @@ export function useDraftWorkspaceSettings(
     runtime: runtimePick,
     explicitRuntime: explicitRuntimePick,
     setRuntime: setRuntimePickState,
-    setExplicit: setRuntimePickExplicit,
+    setExplicitRuntime: setExplicitRuntimePick,
   } = useCreationRuntimePick(draftScopeId);
 
   // Project changes remount ChatInput (key includes projectPath), so this effect only handles
@@ -439,10 +439,10 @@ export function useDraftWorkspaceSettings(
         lastDevcontainerShareCredentials
       )
     );
-    setRuntimePickExplicit(false);
+    setExplicitRuntimePick(null);
   }, [
     setRuntimePickState,
-    setRuntimePickExplicit,
+    setExplicitRuntimePick,
     settingsDefaultRuntime,
     defaultRuntimeMode,
     defaultSshHost,
@@ -488,9 +488,10 @@ export function useDraftWorkspaceSettings(
     });
 
     setRuntimePickState(mergedRuntime);
-    // A moved draft carries only the user's pick: another project may offer the runtime that a
-    // fallback here replaced.
-    setRuntimePickExplicit(options.fallback !== true);
+    // A moved draft carries only the user's pick.
+    setExplicitRuntimePick((pick) =>
+      runtimePickAfter(pick, mergedRuntime, options.fallback === true)
+    );
 
     // Persist host/image/coder so they're remembered when switching modes.
     // Avoid wiping the remembered value when the UI switches modes with an empty field.

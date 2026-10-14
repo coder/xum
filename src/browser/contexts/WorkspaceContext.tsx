@@ -62,6 +62,7 @@ import {
 import {
   defaultCreationDraftScope,
   getDraftStore,
+  listedCreationDraftId,
   useCreationDraftsByProject,
   useDraftStoreReady,
   type CreationDraftsByProject,
@@ -281,13 +282,13 @@ export interface WorkspaceContext extends WorkspaceMetadataContextValue {
 export interface WorkspaceDraftMove {
   /** The source's owning project. */
   projectPath: string;
-  /** The source's listed draft, or null for the project's default creation draft. */
+  /** The source route's draft id (none, blank or invalid: the project's default creation draft). */
   draftId?: string | null;
   /** The project selector's value: a project, a sub-project, or SCRATCH_PROJECT_CONFIG_KEY. */
   destination: string;
   /** Carried only between projects (Scratch has no runtime). */
   runtimePick: ParsedRuntime | null;
-  /** The source composer's agent: a project's own agent moves only where it exists. */
+  /** The source composer's agent: an agent moves only to a project that has it. */
   agent: CreationDraftAgent | undefined;
 }
 
@@ -343,7 +344,11 @@ function setListedDraftSubProject(
 }
 
 /** Lists the moved draft (or, within its owning project, changes its sub-project) and moves it. */
-function applyWorkspaceDraftMove(move: WorkspaceDraftMove, dest: WorkspaceCreationScope) {
+function applyWorkspaceDraftMove(
+  move: WorkspaceDraftMove,
+  dest: WorkspaceCreationScope,
+  listAgentIds: (projectPath: string) => Promise<readonly string[]>
+) {
   const listed = findListedDraft(move.projectPath, move.draftId);
   // A sub-project switch inside the owning project keeps the same draft: the composer is keyed
   // by the owner and draft, so it stays mounted with everything it shows.
@@ -362,7 +367,14 @@ function applyWorkspaceDraftMove(move: WorkspaceDraftMove, dest: WorkspaceCreati
     projectPath: dest.projectPath,
     draftId,
   });
-  carryCreationAiSettings(move.projectPath, dest.projectPath, move.agent);
+  carryCreationAiSettings({
+    sourceProjectPath: move.projectPath,
+    destProjectPath: dest.projectPath,
+    agent: move.agent,
+    listAgentIds,
+  }).catch((error: unknown) => {
+    console.warn("Failed to load the destination's agents; the draft's agent stays behind:", error);
+  });
   handOffCreationRuntime({
     sourceProjectPath: move.projectPath,
     destProjectPath: dest.projectPath,
@@ -1922,9 +1934,16 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   const moveWorkspaceDraft = useCallback(
     (move: WorkspaceDraftMove) => {
       const dest = resolveWorkspaceCreationScope(move.destination, userProjects);
-      navigateToProject(dest.projectPath, applyWorkspaceDraftMove(move, dest), { replace: true });
+      // Read like the composer reads its route: a blank or invalid id edits the default draft.
+      const source = { ...move, draftId: listedCreationDraftId(move.draftId) };
+      const listAgentIds = async (projectPath: string) => {
+        if (!api) throw new Error("Not connected to the server");
+        return (await api.agents.list({ projectPath })).map((agent) => agent.id);
+      };
+      const draftId = applyWorkspaceDraftMove(source, dest, listAgentIds);
+      navigateToProject(dest.projectPath, draftId, { replace: true });
     },
-    [userProjects, navigateToProject]
+    [api, userProjects, navigateToProject]
   );
 
   // Split into two context values so metadata-Map churn doesn't re-render

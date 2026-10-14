@@ -704,6 +704,32 @@ describe("DraftStore", () => {
     expect(store.getText(WS_SCOPE)).toBe("typed while loading");
   });
 
+  // The creation header's project selector waits for this: before it, a draft moves as empty.
+  test("tells its ready subscribers when a snapshot after the ready timeout loads the drafts", async () => {
+    using tempDir = new TestTempDir("draft-store-late-hydration");
+    const { client, control } = await createHarness(tempDir);
+    let releaseSubscribe: () => void = () => undefined;
+    control.subscribeGate = new Promise<void>((resolve) => {
+      releaseSubscribe = resolve;
+    });
+    const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
+    fakeTimers.useFakeTimers();
+    let store: DraftStore;
+    try {
+      store = createStore(client);
+      fakeTimers.advanceTimersByTime(DRAFT_STORE_READY_TIMEOUT_MS);
+    } finally {
+      fakeTimers.useRealTimers();
+    }
+    expect(store.isReady()).toBe(true);
+    expect(store.isHydrated()).toBe(false);
+
+    const seen: boolean[] = [];
+    store.subscribeReady(() => seen.push(store.isHydrated()));
+    releaseSubscribe();
+    await waitFor(() => seen.includes(true));
+  });
+
   test("does not retry the backend's size refusal of a draft whose payloads are not loaded", async () => {
     using tempDir = new TestTempDir("draft-store-backend-too-large");
     const { service, client, control } = await createHarness(tempDir);

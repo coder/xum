@@ -96,6 +96,15 @@ export function defaultCreationDraftScope(projectPath: string): DraftStoreScope 
     : { kind: "pending", projectPath };
 }
 
+/**
+ * The listed creation draft a project route's draft id names. Undefined when the id is blank or
+ * invalid: the composer then edits the project's default creation draft.
+ */
+export function listedCreationDraftId(draftId: string | null | undefined): string | undefined {
+  const trimmed = draftId?.trim() ?? "";
+  return DRAFT_ID_PATTERN.test(trimmed) ? trimmed : undefined;
+}
+
 export interface DraftView {
   /** The visible text (without the text pending sends retain). */
   text: string;
@@ -573,6 +582,7 @@ export class DraftStore {
     return this.hydrated;
   }
 
+  /** Called when the store becomes ready and when it hydrates (also later, after a timeout). */
   subscribeReady = (listener: () => void): (() => void) => {
     this.readyListeners.add(listener);
     return () => this.readyListeners.delete(listener);
@@ -1567,6 +1577,14 @@ export class DraftStore {
     for (const listener of this.readyListeners) listener();
   }
 
+  private markHydrated(): void {
+    // Ready came first when the wait for the snapshot timed out: hydrating is news then.
+    const notify = this.ready && !this.hydrated;
+    this.hydrated = true;
+    this.markReady();
+    if (notify) for (const listener of this.readyListeners) listener();
+  }
+
   private clearReadyTimer(): void {
     if (this.readyTimer) clearTimeout(this.readyTimer);
     this.readyTimer = null;
@@ -1712,8 +1730,7 @@ export class DraftStore {
             // every (re)subscription: keys whose import failed are retried, and without keys the
             // scan is cheap.
             await this.migrateLegacyDrafts(client);
-            this.hydrated = true;
-            this.markReady();
+            this.markHydrated();
             for (const entry of this.entries.values()) this.scheduleFlush(entry);
             for (const key of [...this.pendingDeletes.keys()]) {
               this.sendDelete(key, 0).catch(() => undefined);
@@ -2098,4 +2115,10 @@ export function useCreationDraftsByProject(): CreationDraftsByProject {
 export function useDraftStoreReady(): boolean {
   const store = getDraftStore();
   return useSyncExternalStore(store.subscribeReady, () => store.isReady());
+}
+
+/** True once a real drafts snapshot is applied: until then a draft's content is unknown. */
+export function useDraftStoreHydrated(): boolean {
+  const store = getDraftStore();
+  return useSyncExternalStore(store.subscribeReady, () => store.isHydrated());
 }

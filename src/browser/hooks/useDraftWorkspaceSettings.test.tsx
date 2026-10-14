@@ -172,6 +172,35 @@ describe("useDraftWorkspaceSettings", () => {
     });
   });
 
+  // A moved draft carries the explicit pick: another project may offer what this one replaced.
+  test("an automatic fallback keeps the user's runtime pick for a moved draft", async () => {
+    const projectPath = "/tmp/project";
+    const wrapper = createWrapper(projectPath);
+    const { result } = renderHook(() => useDraftWorkspaceSettings(projectPath, ["main"], "main"), {
+      wrapper,
+    });
+    expect(result.current.explicitRuntimePick).toBeNull();
+
+    act(() => {
+      result.current.setSelectedRuntime({ mode: "local" }, { fallback: true });
+    });
+    await waitFor(() => {
+      expect(result.current.settings.selectedRuntime).toEqual({ mode: "local" });
+    });
+    expect(result.current.explicitRuntimePick).toBeNull();
+
+    act(() => {
+      result.current.setSelectedRuntime({ mode: "ssh", host: "dev@host" });
+    });
+    act(() => {
+      result.current.setSelectedRuntime({ mode: "local" }, { fallback: true });
+    });
+    await waitFor(() => {
+      expect(result.current.settings.selectedRuntime).toEqual({ mode: "local" });
+    });
+    expect(result.current.explicitRuntimePick).toEqual({ mode: "ssh", host: "dev@host" });
+  });
+
   test("applies remembered runtime options that load after mount", async () => {
     const projectPath = "/tmp/project";
     getAppConfigStore().updateOptimistically({ defaultRuntime: "docker" });

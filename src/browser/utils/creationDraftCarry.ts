@@ -1,4 +1,4 @@
-import { getAgentBases, snapshotPendingAiSelection } from "@/browser/utils/aiSelectionIntent";
+import { snapshotPendingAiSelection } from "@/browser/utils/aiSelectionIntent";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { readScopedAiDefault, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
 import type { ParsedRuntime } from "@/common/types/runtime";
@@ -22,13 +22,13 @@ function carryScopedAiDefault<F extends CarriedAiField>(
 /** The agent a creation composer shows (undefined while its agents load). */
 export type CreationDraftAgent = Pick<AgentDefinitionDescriptor, "id" | "scope">;
 
-/**
- * Built-in and global agents exist in every project. A project's own agent exists in another
- * project only when that project's loaded agents include one with its id.
- */
-function isAgentAvailableIn(agent: CreationDraftAgent | undefined, destScopeId: string): boolean {
-  if (agent == null) return false;
-  return agent.scope !== "project" || getAgentBases(destScopeId)?.has(agent.id) === true;
+export interface CreationAiSettingsCarry {
+  sourceProjectPath: string;
+  destProjectPath: string;
+  /** The source composer's agent. */
+  agent: CreationDraftAgent | undefined;
+  /** The ids of the agents a project's composer lists. */
+  listAgentIds: (projectPath: string) => Promise<readonly string[]>;
 }
 
 /**
@@ -36,25 +36,62 @@ function isAgentAvailableIn(agent: CreationDraftAgent | undefined, destScopeId: 
  * the settings its composer shows. Creation AI settings are project-scoped defaults, so the
  * destination project's defaults take the source's values, as if the user had picked them there.
  * Not setWorkspaceModelWithOrigin: its "user" origin would turn Auto off.
+ *
+ * Everything is carried before this returns, except an agent that needs the destination's agent
+ * list (see carryCreationAgent): the returned promise settles once that agent moved or stayed.
  */
-export function carryCreationAiSettings(
-  sourceProjectPath: string,
-  destProjectPath: string,
-  agent: CreationDraftAgent | undefined
-): void {
-  if (sourceProjectPath === destProjectPath) return;
-  const sourceScopeId = getProjectScopeId(sourceProjectPath);
-  const destScopeId = getProjectScopeId(destProjectPath);
-  // An agent the destination lacks stays behind, and the destination keeps its own: its composer
-  // would show the missing agent while a send ran the default one.
-  const fields = isAgentAvailableIn(agent, destScopeId)
-    ? (["agentId", "model", "thinkingLevel"] as const)
-    : (["model", "thinkingLevel"] as const);
-  for (const field of fields) {
+export async function carryCreationAiSettings(carry: CreationAiSettingsCarry): Promise<void> {
+  if (carry.sourceProjectPath === carry.destProjectPath) return;
+  const sourceScopeId = getProjectScopeId(carry.sourceProjectPath);
+  const destScopeId = getProjectScopeId(carry.destProjectPath);
+  for (const field of ["model", "thinkingLevel"] as const) {
     carryScopedAiDefault(sourceScopeId, destScopeId, field);
   }
   // Unsent picks (reasoning mode, service tier, Auto routing) replace the destination's own.
   snapshotPendingAiSelection(sourceScopeId)(destScopeId);
+  const agentCarry = carryCreationAgent(sourceScopeId, destScopeId, carry);
+  agentCarries.set(destScopeId, agentCarry);
+  try {
+    await agentCarry;
+  } finally {
+    if (agentCarries.get(destScopeId) === agentCarry) agentCarries.delete(destScopeId);
+  }
+}
+
+/** Agent carries in progress, by destination project scope. */
+const agentCarries = new Map<string, Promise<void>>();
+
+function isAgentInEveryProject(agentId: string, agent: CreationDraftAgent | undefined): boolean {
+  return agent?.id === agentId && agent.scope !== "project";
+}
+
+/**
+ * An agent the destination lacks stays behind, and the destination keeps its own: its composer
+ * would show the missing agent while a send ran the default one. Built-in and global agents exist
+ * in every project and move at once. Any other agent (a project's own, or one the source composer
+ * has not loaded yet) moves once the destination's agent list includes it, unless the user picked
+ * an agent there meanwhile. The list is loaded fresh: the one a composer loaded earlier can be
+ * stale, and it is missing for a project whose composer was not opened.
+ */
+async function carryCreationAgent(
+  sourceScopeId: string,
+  destScopeId: string,
+  carry: CreationAiSettingsCarry
+): Promise<void> {
+  // The draft may move on before the agent that a move into its project carries arrived there:
+  // that agent then follows the draft.
+  const arriving = agentCarries.get(sourceScopeId);
+  if (arriving) await arriving;
+  // Unset, the source shows the global default agent, so it clears the destination's.
+  const agentId = readScopedAiDefault(sourceScopeId, "agentId");
+  const destAgentId = readScopedAiDefault(destScopeId, "agentId");
+  if (agentId === destAgentId) return;
+  if (agentId != null && !isAgentInEveryProject(agentId, carry.agent)) {
+    const destAgentIds = await carry.listAgentIds(carry.destProjectPath);
+    if (!destAgentIds.includes(agentId)) return;
+    if (readScopedAiDefault(destScopeId, "agentId") !== destAgentId) return;
+  }
+  writeScopedAiDefault(destScopeId, "agentId", agentId);
 }
 
 /**

@@ -2,12 +2,12 @@ import { useEffect, useRef, useState } from "react";
 import {
   defaultCreationDraftScope,
   getDraftStore,
+  listedCreationDraftId,
   useDraft,
   type DraftStoreScope,
 } from "@/browser/stores/DraftStore";
 import type { ReviewNoteDataForDisplay } from "@/common/types/message";
 import type { Review } from "@/common/types/review";
-import { DRAFT_ID_PATTERN } from "@/constants/drafts";
 import type { ChatAttachment } from "./ChatAttachments";
 import type { Toast } from "./ChatInputToast";
 
@@ -37,8 +37,8 @@ export function getComposerDraftScope(options: {
       ? { kind: "workspace", workspaceId: options.workspaceId }
       : { kind: "pending", projectPath: "" };
   }
-  const draftId = options.pendingDraftId?.trim() ?? "";
-  return DRAFT_ID_PATTERN.test(draftId)
+  const draftId = listedCreationDraftId(options.pendingDraftId);
+  return draftId != null
     ? { kind: "creation", projectPath: options.creationProjectPath, draftId }
     : defaultCreationDraftScope(options.creationProjectPath);
 }
