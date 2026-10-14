@@ -414,10 +414,11 @@ export function useMcpAppView(
  * (reloadMcpAppView) can still find it. useMcpAppView returns null for both.
  */
 export function useMcpAppViewLookupFailed(workspaceId: string, toolCallId: string): boolean {
-  return useSyncExternalStore(
-    subscribe,
-    () => recordLookups.get(lookupKey(workspaceId, toolCallId)) === "failed"
-  );
+  return useSyncExternalStore(subscribe, () => isMcpAppViewLookupFailed(workspaceId, toolCallId));
+}
+
+export function isMcpAppViewLookupFailed(workspaceId: string, toolCallId: string): boolean {
+  return recordLookups.get(lookupKey(workspaceId, toolCallId)) === "failed";
 }
 
 /**
@@ -427,10 +428,18 @@ export function useMcpAppViewLookupFailed(workspaceId: string, toolCallId: strin
  * still resolves.
  */
 export function openMcpAppViewTab(workspaceId: string, view: McpAppViewRef) {
+  keepMcpAppViewRef(workspaceId, view);
+  focusMcpAppViewTab(workspaceId, view.toolCallId);
+}
+
+/**
+ * Keep the view's ref for the session, so its tab still resolves after the call leaves the
+ * loaded transcript. For callers that open the tab themselves (the Overview card).
+ */
+export function keepMcpAppViewRef(workspaceId: string, view: McpAppViewRef) {
   const current = getMcpAppViews(workspaceId).filter((v) => v.toolCallId !== view.toolCallId);
   viewsByWorkspace.set(workspaceId, [view, ...current]);
   emit();
-  focusMcpAppViewTab(workspaceId, view.toolCallId);
 }
 
 /**

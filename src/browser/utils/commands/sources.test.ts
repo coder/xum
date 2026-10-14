@@ -30,6 +30,7 @@ import { MCP_APP_ENTRYPOINT_NOT_CONNECTED } from "@/browser/features/RightSideba
 import { CommandIds } from "@/browser/utils/commandIds";
 import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
 import { withAppViewTab } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
+import * as viewsStore from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
 import type { OpenLocalServerResult, RemoteConnectionApi } from "@/common/types/remoteConnection";
 
 const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
@@ -2667,6 +2668,35 @@ test("an entry point picked from the palette while disconnected says so in a toa
 
 // An open entry point's tab only gets focus from Open while its record is current, so a failed
 // load needs Reload from the keyboard too.
+// A restored tab whose record lookup failed has no recovered ref, so no "Open App View" lists
+// it: Reload must still reach it from the keyboard.
+test("an open app tab whose record lookup failed gets a Reload command", async () => {
+  const failed = spyOn(viewsStore, "isMcpAppViewLookupFailed").mockImplementation(
+    (_workspaceId, toolCallId) => toolCallId === "call-failed"
+  );
+  try {
+    await withTestWindow(() => {
+      updateRightSidebarLayout("w1", (state) =>
+        withAppViewTab(withAppViewTab(state, "call-failed"), "call-pending")
+      );
+      const actions = getActions({ artifactsEnabled: true });
+      expect(actions.some((a) => a.id === CommandIds.navReloadAppView("call-pending"))).toBe(false);
+      const reload = actions.find((a) => a.id === CommandIds.navReloadAppView("call-failed"));
+      const focused: unknown[] = [];
+      const onFocus = (event: Event) => focused.push((event as CustomEvent).detail);
+      window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onFocus);
+      try {
+        void reload?.run();
+      } finally {
+        window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onFocus);
+      }
+      expect(focused).toEqual([{ workspaceId: "w1", toolCallId: "call-failed" }]);
+    });
+  } finally {
+    failed.mockRestore();
+  }
+});
+
 test("an entry point with an open tab gets a Reload command that focuses its tab", async () => {
   const entrypoint = (toolName: string) => ({
     serverName: "cad",

@@ -52,6 +52,7 @@ import {
   openMcpAppViewTab,
   type McpAppViewRef,
 } from "./ArtifactsTab/mcpAppViewsStore";
+import { appViewTabFor } from "./AppViewTab/appViewTabs";
 
 const WORKSPACE_ID = "ws-main";
 
@@ -481,17 +482,9 @@ describe("RightSidebarOverview", () => {
       ])
     );
     // An app view opens in its own app tab (the Artifacts tab lists only files), through the
-    // view store like its tool card does.
-    const focused: unknown[] = [];
-    const onFocus = (event: Event) => focused.push((event as CustomEvent).detail);
-    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onFocus);
-    try {
-      fireEvent.click(section.getByRole("button", { name: /Roll dice/ }));
-    } finally {
-      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onFocus);
-    }
-    expect(focused).toEqual([{ workspaceId: appsWorkspace, toolCallId: "call-new" }]);
-    expect(opened).toEqual([]);
+    // card's onOpenTab, which moves focus into the opened tab.
+    fireEvent.click(section.getByRole("button", { name: /Roll dice/ }));
+    expect(opened).toEqual([appViewTabFor("call-new")]);
   });
 
   // A view from the transcript only: after compaction drops its call, the tab still needs the

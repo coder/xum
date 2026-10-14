@@ -41,7 +41,8 @@ import { isAbortError } from "@/browser/utils/isAbortError";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { makeSideChatTabType, type TabType } from "@/browser/types/rightSidebar";
 import { openArtifact } from "./ArtifactsTab/openArtifact";
-import { appViewDetails, openMcpAppViewTab, useMcpAppViews } from "./ArtifactsTab/mcpAppViewsStore";
+import { appViewDetails, keepMcpAppViewRef, useMcpAppViews } from "./ArtifactsTab/mcpAppViewsStore";
+import { appViewTabFor } from "./AppViewTab/appViewTabs";
 import { TAB_ICONS } from "./Tabs/tabIcons";
 
 /**
@@ -475,9 +476,13 @@ const OverviewOutputs: React.FC<{
       sub: details[index] || null,
       // The first row the More row revealed takes focus, as for side chats.
       focusOnMount: view.toolCallId === revealedViewId,
-      // Through the view store, like the tool card and the palette: it keeps the view's ref, so
-      // the tab still resolves after compaction drops the call from the loaded transcript.
-      open: () => openMcpAppViewTab(props.workspaceId, view),
+      // The view's ref is kept, as by the tool card and the palette, so the tab still resolves
+      // after compaction drops the call from the loaded transcript. The tab opens through the
+      // card's onOpenTab, which also moves focus into it (the activated row unmounts).
+      open: () => {
+        keepMcpAppViewRef(props.workspaceId, view);
+        props.onOpenTab(appViewTabFor(view.toolCallId));
+      },
     })),
   ];
   // A truncated walk can end before reaching any file (only a too-deep or unreadable folder), yet

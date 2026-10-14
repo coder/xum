@@ -45,6 +45,7 @@ import {
   appViewServerNames,
   focusMcpAppViewTab,
   getMcpAppViews,
+  isMcpAppViewLookupFailed,
   openMcpAppViewTab,
   reloadMcpAppView,
   transcriptViews,
@@ -55,7 +56,10 @@ import {
   openMcpAppEntrypoint,
 } from "@/browser/features/RightSidebar/AppViewTab/openMcpAppEntrypoint";
 import { mcpAppEntrypointDescription } from "@/browser/features/RightSidebar/AppViewTab/mcpAppEntrypoints";
-import { appViewTabFor } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
+import {
+  appViewTabFor,
+  appViewTabToolCallId,
+} from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
 import type { McpAppEntrypoint } from "@/common/orpc/schemas/mcpApps";
 import { revokeMcpAppViewDomains } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewDomainsStore";
 
@@ -199,6 +203,7 @@ import {
 import { formatProjectHierarchyLabel, getTopLevelProjectEntries } from "@/common/utils/subProjects";
 import type { LayoutPresetsConfig, LayoutSlotNumber } from "@/common/types/uiLayouts";
 import {
+  collectAllTabs,
   hasTab,
   openToolFromNewTab,
   selectTabInTabset,
@@ -586,6 +591,27 @@ function appViewActions(
       keywords: ["app", "view", "mcp", "reload", "retry", view.serverName],
     });
     return [open, ...reload];
+  });
+}
+
+/**
+ * Reload for open app tabs whose view record lookup failed (a restored tab outside the loaded
+ * transcript, the backend unreachable at the time). No ref was recovered, so appViewActions
+ * does not list them: this is their keyboard path to the tab's Reload.
+ */
+function failedLookupReloadActions(
+  wsId: string,
+  navigationSection: CommandAction["section"]
+): CommandAction[] {
+  return collectAllTabs(readRightSidebarLayout(wsId).root).flatMap((tab) => {
+    const toolCallId = appViewTabToolCallId(tab);
+    if (toolCallId == null || !isMcpAppViewLookupFailed(wsId, toolCallId)) return [];
+    return reloadAppViewActions(wsId, toolCallId, {
+      title: "Reload App View",
+      subtitle: "This view could not be loaded",
+      section: navigationSection,
+      keywords: ["app", "view", "mcp", "reload", "retry"],
+    });
   });
 }
 
@@ -1075,6 +1101,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               // its tab or focuses the one it has, the keyboard path to "Open in tab".
               // The subtitle carries each call's detail, so several calls of one tool differ.
               ...appViewActions(wsId, p.selectedWorkspaceState?.messages ?? [], section.navigation),
+              ...failedLookupReloadActions(wsId, section.navigation),
               // One per MCP App entry point of an enabled server: opens its app tab (calling
               // the tool with {}) or focuses the one it has.
               ...entrypointActions(p.api, wsId, p.mcpAppEntrypoints ?? [], section.navigation),
