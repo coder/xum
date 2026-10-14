@@ -88,9 +88,10 @@ async function pickOption(
 }
 
 async function moveDraftTo(container: HTMLElement, label: string): Promise<void> {
+  // Locked until the composer's agents load, among others.
   const trigger = await waitFor(() => {
     const element = projectSelector(container);
-    if (!element) throw new Error("Project selector not found");
+    if (!element || element.disabled) throw new Error("Project selector not enabled");
     return element;
   }, WAIT);
   await pickOption(trigger, label);
@@ -157,6 +158,32 @@ function holdNameGeneration(orpc: OrpcClient) {
     calls: () => answered.length,
     allAnswered: () => Promise.allSettled(answered),
   };
+}
+
+/** The app's API client, with agents.list for `projectPath` held until release(). */
+function holdAgentList(orpc: OrpcClient, projectPath: string) {
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let calls = 0;
+  const agents = new Proxy(orpc.agents, {
+    get(target, key, receiver) {
+      if (key !== "list") return Reflect.get(target, key, receiver) as unknown;
+      return async (...args: Parameters<typeof target.list>) => {
+        if (args[0].projectPath !== projectPath) return target.list(...args);
+        calls++;
+        await released;
+        return target.list(...args);
+      };
+    },
+  });
+  const client = new Proxy(orpc, {
+    get(target, key, receiver) {
+      return key === "agents" ? agents : (Reflect.get(target, key, receiver) as unknown);
+    },
+  });
+  return { client, release, calls: () => calls };
 }
 
 /** The app's API client, reporting an OpenAI key, which voice input needs to transcribe. */
@@ -647,10 +674,10 @@ describeIntegration("Creation project selector moves the draft", () => {
     }
   }, 90_000);
 
-  test("a move that keeps its source keeps the source's workspace name", async () => {
+  test("a failed move keeps the draft, its name and runtime pick, and the destination's settings", async () => {
     const { view, cleanupDom, a, b } = await openTwoProjects();
     const { container } = view;
-    // The backend move fails, so the move keeps the source draft.
+    // The backend move fails, so the draft stays where it is.
     const backendMoveSpy = jest
       .spyOn(getSharedEnv().services.draftService, "moveCreation")
       .mockRejectedValue(new Error("move failed"));
@@ -663,15 +690,24 @@ describeIntegration("Creation project selector moves the draft", () => {
       fireEvent.focus(nameInput);
       fireEvent.change(nameInput, { target: { value: "kept-name" } });
       await waitFor(() => expect(nameInput.value).toBe("kept-name"), WAIT);
+      setWorkspaceModelWithOrigin(getProjectScopeId(a), KNOWN_MODELS.HAIKU.id, "user");
+      const destModel = getWorkspaceAiSelection(getProjectScopeId(b)).model;
+      await pickOption(runtimeSelector(container)!, "Local", (text) => text.startsWith("Local"));
+      await waitFor(() => expect(runtimeSelector(container)?.textContent).toContain("Local"), WAIT);
 
-      await moveDraftTo(container, path.basename(b));
-
+      await pickOption(projectSelector(container)!, path.basename(b));
+      await waitFor(() => expect(moveSpy).toHaveBeenCalled(), WAIT);
       expect(await moveSpy.mock.results[0]?.value).toBe(false);
-      // The draft stayed in A, so A's draft opens again instead of B's empty page.
-      await waitFor(() => expect(projectSelectorLabel(container)).toBe(path.basename(a)), WAIT);
+
+      // The draft stays open in A as it was.
+      await waitFor(() => expect(projectSelector(container)?.disabled).toBe(false), WAIT);
+      expect(projectSelectorLabel(container)).toBe(path.basename(a));
       expect(textareaValue(container)).toBe("kept");
+      expect(runtimeSelector(container)?.textContent).toContain("Local");
       expect(getWorkspaceDraftIds(a)).toEqual([sourceDraftId]);
       expect(getWorkspaceDraftIds(b)).toEqual([]);
+      // Nothing moved, so B's own settings stay.
+      expect(getWorkspaceAiSelection(getProjectScopeId(b)).model).toBe(destModel);
       expect(getDraftStore().getView(creationScope(a, sourceDraftId)).nameState).toMatchObject({
         manualName: "kept-name",
       });
@@ -684,12 +720,83 @@ describeIntegration("Creation project selector moves the draft", () => {
     }
   }, 90_000);
 
+  test("the project selector waits for the composer's agents, so a built-in agent moves", async () => {
+    const a = getSharedRepoPath();
+    const agentList = holdAgentList(getSharedEnv().orpc, a);
+    const { view, cleanupDom, b } = await openTwoProjects(agentList.client);
+    const { container } = view;
+    try {
+      writeScopedAiDefault(getProjectScopeId(b), "agentId", "exec");
+      // A persisted pick: the composer knows the agent's id before the agent's definition.
+      writeScopedAiDefault(getProjectScopeId(a), "agentId", "explore");
+      await openProjectCreationView(view, a);
+      await waitFor(() => expect(agentList.calls()).toBeGreaterThan(0), WAIT);
+      expect(projectSelector(container)?.disabled).toBe(true);
+
+      agentList.release();
+      await waitFor(() => expect(projectSelector(container)?.disabled).toBe(false), WAIT);
+      await moveDraftTo(container, path.basename(b));
+
+      expect(readScopeAgentId(getProjectScopeId(b))).toBe("explore");
+    } finally {
+      agentList.release();
+      writeScopedAiDefault(getProjectScopeId(a), "agentId", undefined);
+      await cleanupView(view, cleanupDom);
+    }
+  }, 90_000);
+
+  test("a route with the reserved default draft id moves the default draft to a sub-project", async () => {
+    const subProjectDir = path.join(getSharedRepoPath(), "packages", "default-route");
+    await fs.mkdir(subProjectDir, { recursive: true });
+    const a = getSharedRepoPath();
+    const { view, cleanupDom } = await openTwoProjects(
+      getSharedEnv().orpc,
+      `/project?project=${getProjectRouteId(a)}&draft=default`
+    );
+    const { container } = view;
+    let subProject: string | null = null;
+    try {
+      const created = await getSharedEnv().orpc.projects.create({ projectPath: subProjectDir });
+      if (!created.success) throw new Error(`Failed to add the sub-project: ${created.error}`);
+      subProject = created.data.normalizedPath;
+      const textarea = await waitFor(() => {
+        const element = container.querySelector<HTMLTextAreaElement>(
+          'textarea[aria-label="Message"]'
+        );
+        if (!element) throw new Error("Composer not found");
+        return element;
+      }, WAIT);
+      fireEvent.change(textarea, { target: { value: "on the default route" } });
+      await waitFor(
+        () =>
+          expect(getDraftStore().getView(defaultCreationDraftScope(a)).text).toBe(
+            "on the default route"
+          ),
+        WAIT
+      );
+
+      await moveDraftTo(container, `${path.basename(a)} / default-route`);
+
+      const movedId = await onlyDraftId(a);
+      expect(getDraftStore().getCreationDraftsByProject()[a]).toEqual([
+        expect.objectContaining({ draftId: movedId, subProjectPath: subProject }),
+      ]);
+      await waitFor(() => expect(textareaValue(container)).toBe("on the default route"), WAIT);
+      expect(getDraftStore().getView(defaultCreationDraftScope(a)).text).toBe("");
+    } finally {
+      await cleanupView(view, cleanupDom);
+      if (subProject !== null)
+        await getSharedEnv().orpc.projects.remove({ projectPath: subProject });
+    }
+  }, 90_000);
+
   // The composer reads the route's draft id trimmed, and edits the project's default draft for a
-  // blank or invalid one: the move must take that draft and its name.
+  // blank, invalid or reserved one: the move must take that draft and its name.
   const draftRoutes = [
     { label: "a blank", draftParam: "", listedId: null },
     { label: "a padded", draftParam: "%20padded-id%20", listedId: "padded-id" },
     { label: "an invalid", draftParam: "..%2Fx", listedId: null },
+    { label: "the reserved default", draftParam: "default", listedId: null },
   ] as const;
   for (const route of draftRoutes) {
     test(`a route with ${route.label} draft id moves the draft the composer edits`, async () => {

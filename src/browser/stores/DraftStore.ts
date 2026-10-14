@@ -107,12 +107,15 @@ export function defaultCreationDraftScope(projectPath: string): DraftStoreScope 
 }
 
 /**
- * The listed creation draft a project route's draft id names. Undefined when the id is blank or
- * invalid: the composer then edits the project's default creation draft.
+ * The listed creation draft a project route's draft id names. Undefined when the id is blank,
+ * invalid or the default draft's reserved id (never listed): the composer then edits the
+ * project's default creation draft.
  */
 export function listedCreationDraftId(draftId: string | null | undefined): string | undefined {
   const trimmed = draftId?.trim() ?? "";
-  return DRAFT_ID_PATTERN.test(trimmed) ? trimmed : undefined;
+  return DRAFT_ID_PATTERN.test(trimmed) && trimmed !== DEFAULT_CREATION_DRAFT_ID
+    ? trimmed
+    : undefined;
 }
 
 export interface DraftView {

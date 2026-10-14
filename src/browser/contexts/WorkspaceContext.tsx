@@ -257,7 +257,7 @@ export interface WorkspaceContext extends WorkspaceMetadataContextValue {
    * Move the creation draft being edited (text, attachments, workspace name, AI settings, and a
    * runtime the user picked) to another project, sub-project, or Scratch, and open it there.
    */
-  moveWorkspaceDraft: (move: WorkspaceDraftMove) => void;
+  moveWorkspaceDraft: (move: WorkspaceDraftMove) => Promise<void>;
   openWorkspaceDraft: (projectPath: string, draftId: string) => void;
   deleteWorkspaceDraft: (projectPath: string, draftId: string) => void;
 
@@ -268,7 +268,7 @@ export interface WorkspaceContext extends WorkspaceMetadataContextValue {
 export interface WorkspaceDraftMove {
   /** The source's owning project. */
   projectPath: string;
-  /** The source route's draft id (none, blank or invalid: the project's default creation draft). */
+  /** The source route's draft id (none, blank, invalid or reserved: the default draft). */
   draftId?: string | null;
   /** The project selector's value: a project, a sub-project, or SCRATCH_PROJECT_CONFIG_KEY. */
   destination: string;
@@ -312,25 +312,18 @@ function setListedDraftSubProject(
 }
 
 /**
- * Lists the moved draft (or, within its owning project, changes its sub-project) and moves it.
- * `moved` settles with the backend move (null when the same draft stays).
+ * Moves the draft into a new listed draft of `dest`, and once it moved carries its AI settings
+ * and runtime pick there. Resolves the new draft id, or null when the draft stayed: then nothing
+ * was written for the destination, and the source composer (still open) keeps its own picks.
  */
-function applyWorkspaceDraftMove(
+async function moveDraftToProject(
   move: WorkspaceDraftMove,
   dest: WorkspaceCreationScope
-): { draftId: string; moved: Promise<boolean> | null } {
+): Promise<string | null> {
   const listed = findListedDraft(move.projectPath, move.draftId);
-  // A sub-project switch inside the owning project keeps the same draft: the composer is keyed
-  // by the owner and draft, so it stays mounted with everything it shows.
-  if (move.draftId != null && dest.projectPath === move.projectPath) {
-    setListedDraftSubProject(move.projectPath, move.draftId, listed, dest.subProjectPath);
-    return { draftId: move.draftId, moved: null };
-  }
-
   const draftId = createDraftId();
-  // One backend step moves the body (its workspace name included) and lists the row; the
-  // destination shows the moved content at once. A failed move keeps the source whole.
-  const moved = getDraftStore().moveCreationDraft(
+  // One backend step moves the body (its workspace name included) and lists the row.
+  const moved = await getDraftStore().moveCreationDraft(
     creationDraftScope(move.projectPath, move.draftId),
     {
       projectPath: dest.projectPath,
@@ -339,6 +332,7 @@ function applyWorkspaceDraftMove(
       createdAt: listed?.createdAt ?? Date.now(),
     }
   );
+  if (!moved) return null;
   carryCreationAiSettings({
     sourceProjectPath: move.projectPath,
     destProjectPath: dest.projectPath,
@@ -350,7 +344,7 @@ function applyWorkspaceDraftMove(
     draftScopeId: getDraftScopeId(dest.projectPath, draftId),
     runtime: move.runtimePick,
   });
-  return { draftId, moved };
+  return draftId;
 }
 
 /**
@@ -1924,24 +1918,24 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   );
 
   const moveWorkspaceDraft = useCallback(
-    (move: WorkspaceDraftMove) => {
+    async (move: WorkspaceDraftMove) => {
       const dest = resolveWorkspaceCreationScope(move.destination, userProjects);
       // Read like the composer reads its route: a blank or invalid id edits the default draft.
       const source = { ...move, draftId: listedCreationDraftId(move.draftId) };
+      // A sub-project switch inside the owning project keeps the same draft: the composer is
+      // keyed by the owner and draft, so it stays mounted with everything it shows.
+      if (source.draftId != null && dest.projectPath === source.projectPath) {
+        const listed = findListedDraft(source.projectPath, source.draftId);
+        setListedDraftSubProject(source.projectPath, source.draftId, listed, dest.subProjectPath);
+        navigateToProject(dest.projectPath, source.draftId, { replace: true });
+        return;
+      }
       const startKey = locationKeyRef.current;
-      const { draftId, moved } = applyWorkspaceDraftMove(source, dest);
-      navigateToProject(dest.projectPath, draftId, { replace: true });
-      // A failed move leaves the draft in its project: reopen it there, unless the user went
-      // elsewhere meanwhile or edited the destination (which then stays a draft of its own).
-      moved
-        ?.then((ok) => {
-          if (ok || findListedDraft(dest.projectPath, draftId)) return;
-          // On the destination, or still on the source before that navigation rendered.
-          const stayed =
-            locationKeyRef.current === startKey || routedDraftIdRef.current === draftId;
-          if (stayed) navigateToProject(source.projectPath, source.draftId, { replace: true });
-        })
-        .catch((error: unknown) => console.warn("Failed to move the draft:", error));
+      // The source stays open until the draft moved; a failed move leaves it as it was.
+      const draftId = await moveDraftToProject(source, dest);
+      if (draftId !== null && locationKeyRef.current === startKey) {
+        navigateToProject(dest.projectPath, draftId, { replace: true });
+      }
     },
     [userProjects, navigateToProject]
   );

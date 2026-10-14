@@ -617,7 +617,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   const { open } = useSettings();
   const { selectedWorkspace, workspaceMetadata } = useWorkspaceContext();
-  const { agentId, currentAgent, agents } = useAgent();
+  const { agentId, currentAgent, agents, loaded: agentsLoaded } = useAgent();
 
   // Use current agent's uiColor, or neutral border until agents load
   const agentColor = currentAgent?.uiColor ?? "var(--color-border-light)";
@@ -905,6 +905,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     sendInFlight: isSendInFlight,
     processingAttachmentCount,
     voiceInputActive: voiceInput.state !== "idle",
+    agentsLoaded,
   });
 
   const creationRuntimeError =
