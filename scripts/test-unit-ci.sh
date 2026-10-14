@@ -42,7 +42,9 @@ isolated_unit_tests=(
   # the shared process segfaulted Bun twice on the same head with them included.
   no-coverage:src/node/services/workflows/WorkflowRunner.evaluate.test.ts
   no-coverage:src/node/services/workflows/WorkflowService.evaluate.test.ts
-  no-coverage:src/node/services/ptc/quickjsRuntime.test.ts
+  # Isolated like the QuickJS suites above, but with coverage: it passes under
+  # Bun 1.4.3 coverage, so the CRAP gate can score quickjsRuntime.ts.
+  src/node/services/ptc/quickjsRuntime.test.ts
   no-coverage:src/node/services/tools/code_execution.test.ts
   # This suite also creates QuickJS runtimes. Shared coverage can trap during startup.
   no-coverage:src/node/services/tools/code_execution.integration.test.ts
