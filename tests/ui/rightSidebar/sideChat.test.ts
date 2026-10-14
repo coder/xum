@@ -682,11 +682,12 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
       const firstId = await waitForSideChatId(app);
       const draft = "Unsent question in the first side chat";
-      // Every wait here follows backend work (creating, loading or removing a side chat), which
-      // can take over the default one-second budget on a busy runner (#6375): give each a budget.
+      // Waits after backend work (creating, loading or removing a side chat) can take over the
+      // default one-second budget on a busy runner (#6375), so they get a budget. The draft
+      // store update below is local and keeps the default.
       await waitFor(() => expect(getSideComposer(app).value).toBe(""), { timeout: 10_000 });
       act(() => getDraftStore().setText({ kind: "workspace", workspaceId: firstId }, draft));
-      await waitFor(() => expect(getSideComposer(app).value).toBe(draft), { timeout: 10_000 });
+      await waitFor(() => expect(getSideComposer(app).value).toBe(draft));
 
       await sendFrom(() => getMainComposer(app), app.workspaceId, "/side");
       const secondId = await waitFor(
