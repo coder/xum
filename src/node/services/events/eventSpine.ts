@@ -203,6 +203,8 @@ interface Registration {
  * Per isolated point: snapshot what a consumer may change, and return its undo. The arrays and
  * their entries are copied: a consumer can also remove earlier entries or change them in place
  * before it throws, and an undo by length alone would then leave holes for the later readers.
+ * Cost: O(n) per consumer, where n is the number of entries so far. Nothing bounds n except
+ * what consumers push (the context cap applies after the chain, in runMessageSendHooks).
  */
 const ISOLATED_CONSUMERS = {
   "message.send": (ctx: MessageSendContext) => {
