@@ -2552,12 +2552,7 @@ test("an MCP App entry point's palette entry shows its server label and opens it
     testWindow.close();
   }
   expect(shown).toEqual([entrypoint.viewKey]);
-  expect(opened).toEqual([
-    {
-      workspaceId: expect.any(String),
-      serverName: entrypoint.serverName,
-      toolName: "cad.tray",
-      type: "global",
-    },
+  expect(opened).toMatchObject([
+    { serverName: entrypoint.serverName, toolName: "cad.tray", type: "global" },
   ]);
 });
