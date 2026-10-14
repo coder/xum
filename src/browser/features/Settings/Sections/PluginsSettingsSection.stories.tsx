@@ -876,7 +876,12 @@ export const ComponentReviewPhoneViewport: Story = {
   globals: {
     viewport: { value: "mobile1", isRotated: false },
   },
-  parameters: { layout: "fullscreen", pixel: PIXEL_DISABLED },
+  parameters: {
+    layout: "fullscreen",
+    pixel: {
+      matrix: { themes: ["dark"], viewports: ["phone"] },
+    },
+  },
   render: () => (
     <PluginsSectionStoryShell options={componentReviewOptions()}>
       {/* Fixed phone width so the play's overflow assertion holds in the CI test-runner too. */}

@@ -1201,10 +1201,11 @@ export const PluginsSettingsSection: React.FC = () => {
 
   // Approved update policy: passive check on section open + explicit button only.
   useEffect(() => {
-    void refresh();
+    // A palette review intent opens after the first list refresh: the refresh clears the shared
+    // error, so a concurrent preview failure would vanish without an explanation.
+    void refresh().finally(() => componentReview.openFromIntent(initialIntent));
     void checkForUpdates();
     void api?.agentPlugins.containerLocation().then(setContainerLocation, () => undefined);
-    componentReview.openFromIntent(initialIntent);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- fetch on mount / API reconnect only; refresh/checkForUpdates are plain handlers (compiler-memoized), not inputs
   }, [api]);
 
@@ -1258,6 +1259,8 @@ export const PluginsSettingsSection: React.FC = () => {
     setBusyPlugin(name);
     setError(null);
     setUpdateReview(null);
+    // The update moves lockedSha, so an open component review would confirm against a stale tree.
+    componentReview.close();
     try {
       const preview = await api.agentPlugins.previewUpdate({ name });
       if (!preview.success) {
