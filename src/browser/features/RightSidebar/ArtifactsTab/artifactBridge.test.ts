@@ -15,7 +15,7 @@ import {
   createBridgeRateLimiter,
 } from "./artifactBridge";
 import { KEYBINDS } from "@/browser/utils/ui/keybinds";
-import { MCP_APP_PREAMBLE_SCRIPT } from "./mcpAppCsp";
+import { mcpAppPreambleScript } from "./mcpAppCsp";
 
 // Identity is all the acceptance check uses, so plain objects stand in for windows.
 const frame: Window = Object.create(null) as Window;
@@ -446,7 +446,7 @@ describe("in-page links", () => {
   // jumps to the target itself. HTML artifacts and MCP App views both get it.
   test.each([
     ["HTML artifact bridge", buildArtifactBridgeScript("light")],
-    ["MCP App preamble", MCP_APP_PREAMBLE_SCRIPT],
+    ["MCP App preamble", mcpAppPreambleScript({ nonce: "00", leaveOnBeforeUnload: true })],
   ])("%s jumps to # targets inside the frame document", async (_name, script) => {
     const win = new HappyWindow({ url: "http://localhost/workspace/abc" });
     const doc = win.document;

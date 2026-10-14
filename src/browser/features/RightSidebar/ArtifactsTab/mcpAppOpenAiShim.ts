@@ -1,7 +1,7 @@
 /**
  * ChatGPT compatibility for MCP Apps views: `window.openai` (Apps SDK) on top of the standard
  * MCP Apps bridge, so a view built for ChatGPT renders in Xum. Injected as the second script of
- * every view document, after MCP_APP_PREAMBLE_SCRIPT and before any view script.
+ * every view document, after mcpAppPreambleScript (mcpAppCsp.ts) and before any view script.
  *
  * SECURITY AUDIT: the shim adds no host power. It runs inside the view's own sandboxed document
  * (same opaque origin, same CSP) and only posts JSON-RPC messages the view could post itself

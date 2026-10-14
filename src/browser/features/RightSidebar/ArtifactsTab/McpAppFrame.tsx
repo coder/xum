@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { cn } from "@/common/lib/utils";
@@ -12,7 +12,14 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { mcpServerConsentName, mcpServerDisplayName } from "@/common/utils/mcp/pluginServerKey";
 import { createBridgeRateLimiter, passesFrameGate } from "./artifactBridge";
 import { finalizeSandboxedDocument, parseArtifactHtml } from "./artifactDocument";
-import { buildMcpAppCsp, grantMcpAppCsp, MCP_APP_PREAMBLE_SCRIPT } from "./mcpAppCsp";
+import {
+  buildMcpAppCsp,
+  createMcpAppDocumentGate,
+  grantMcpAppCsp,
+  type McpAppDocumentGate,
+  mcpAppPreambleScript,
+  newMcpAppDocumentNonce,
+} from "./mcpAppCsp";
 import { mcpAppOpenAiShimScript } from "./mcpAppOpenAiShim";
 import {
   createMcpAppHost,
@@ -302,15 +309,36 @@ export function McpAppFrame(props: {
       setDomainsDismissed({ toolCallId, error: getErrorMessage(error) });
     }
   };
+  // The view document's content, without its nonce.
+  const documentKey =
+    current?.view && grant ? JSON.stringify([toolCallId, current.view.html, grant.granted]) : null;
+  const guard = useFrameNavigationGuard(documentKey);
+  const { navigatedRef, leave: leaveDocument } = guard;
+  // One nonce and gate per loaded document (mcpAppPreambleScript): a new grant, tool call or
+  // Reload loads a new one, and the leave of the document it replaces must not close it. Kept
+  // across host rebuilds of the same document, which announced itself only once.
+  const frameDocumentKey = documentKey == null ? null : `${guard.frameKey}:${documentKey}`;
+  const [frameDocument, setFrameDocument] = useState<{
+    key: string;
+    nonce: string;
+    accept: McpAppDocumentGate;
+  } | null>(null);
+  if (frameDocumentKey != null && frameDocument?.key !== frameDocumentKey) {
+    const nonce = newMcpAppDocumentNonce();
+    setFrameDocument({ key: frameDocumentKey, nonce, accept: createMcpAppDocumentGate(nonce) });
+  }
+  const loadedDocument = frameDocument?.key === frameDocumentKey ? frameDocument : null;
+  const nonce = loadedDocument?.nonce ?? null;
   const srcDoc =
-    current?.view && grant
+    current?.view && grant && nonce != null
       ? finalizeSandboxedDocument(parseArtifactHtml(current.view.html), {
           csp: buildMcpAppCsp(grant.granted),
-          bridgeScript: [MCP_APP_PREAMBLE_SCRIPT, mcpAppOpenAiShimScript(openAiSeed)],
+          bridgeScript: [
+            mcpAppPreambleScript({ nonce, leaveOnBeforeUnload: !isDesktopMode() }),
+            mcpAppOpenAiShimScript(openAiSeed),
+          ],
         })
       : null;
-  const guard = useFrameNavigationGuard(srcDoc);
-  const { navigatedRef } = guard;
 
   // Values the long-lived host reads at message time.
   const latest = useRef({ theme, view, result: current?.view ?? null, onClose: props.onClose });
@@ -318,8 +346,10 @@ export function McpAppFrame(props: {
     latest.current = { theme, view, result: current?.view ?? null, onClose: props.onClose };
   });
 
-  useEffect(() => {
-    if (srcDoc == null || grant == null || guard.navigated) return;
+  // A layout effect: the listener must be in place before the frame's preamble announces its
+  // document, or the gate would never open.
+  useLayoutEffect(() => {
+    if (srcDoc == null || grant == null || loadedDocument == null || guard.navigated) return;
     const getHostContext = (): McpAppHostContext => ({
       theme: latest.current.theme,
       styles: { variables: readStyleVariables() },
@@ -440,10 +470,15 @@ export function McpAppFrame(props: {
         console.debug(`[MCP Apps] ${boundServerName}: ${message}`, data ?? ""),
     });
     hostRef.current = host;
+    // SECURITY: only messages of the document built here, from its open announcement until it
+    // starts to leave; its leave counts as a navigation (mcpAppPreambleScript).
+    const acceptFromDocument = loadedDocument.accept;
     const handler = (event: MessageEvent) => {
-      const frameWindow = navigatedRef.current ? null : frameRef.current?.contentWindow;
-      if (!passesFrameGate(event, frameWindow, allowMessage)) return;
-      void host.handleMessage(event.data);
+      if (navigatedRef.current) return;
+      const fromFrame = passesFrameGate(event, frameRef.current?.contentWindow, allowMessage);
+      const verdict = acceptFromDocument(event.data, fromFrame);
+      if (verdict === "left") leaveDocument();
+      else if (verdict === "deliver") void host.handleMessage(event.data);
     };
     window.addEventListener("message", handler);
     return () => {

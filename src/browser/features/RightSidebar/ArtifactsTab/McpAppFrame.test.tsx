@@ -151,10 +151,40 @@ async function pressAllow(button: HTMLElement) {
   fireEvent.click(button);
 }
 
+/**
+ * Run the view document's first script (the preamble) the way the frame's document would: its
+ * messages to the parent arrive from the frame. Returns the document's own event dispatcher.
+ */
+function bootDocument(frame: HTMLIFrameElement) {
+  const doc = new window.DOMParser().parseFromString(frame.getAttribute("srcdoc")!, "text/html");
+  const preamble = doc.querySelector("script")?.textContent ?? "";
+  const listeners: Array<{ type: string; listener: () => void }> = [];
+  const documentWindow = {
+    parent: { postMessage: (message: unknown) => postFromView(frame, message) },
+    addEventListener: (type: string, listener: () => void) => listeners.push({ type, listener }),
+  };
+  // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs our own generated script
+  (new Function("window", preamble) as (window: unknown) => void)(documentWindow);
+  return {
+    dispatch: (type: string) => {
+      for (const entry of listeners) if (entry.type === type) entry.listener();
+    },
+  };
+}
+
+/** The mounted view frame, with its document booted (it announced itself to the host). */
+async function findOpenFrame(view: { findByTestId: (id: string) => Promise<HTMLElement> }) {
+  const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+  bootDocument(frame);
+  return frame;
+}
+
 async function renderFrame() {
   const view = render(<McpAppFrame workspaceId="ws" view={VIEW} />, { wrapper: Wrapper });
   const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
-  return { view, frame, posted: capturePosted(frame) };
+  const posted = capturePosted(frame);
+  const document = bootDocument(frame);
+  return { view, frame, posted, document };
 }
 
 describe("McpAppFrame", () => {
@@ -377,7 +407,7 @@ describe("McpAppFrame", () => {
         <McpAppFrame workspaceId="ws" view={{ ...VIEW, cancelled: true, failed }} />,
         { wrapper: Wrapper }
       );
-      const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+      const frame = await findOpenFrame(view);
       const posted = capturePosted(frame);
       postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
       await waitFor(() =>
@@ -426,7 +456,7 @@ describe("McpAppFrame", () => {
     const view = render(<McpAppFrame workspaceId="ws" view={{ ...VIEW, serverName: key }} />, {
       wrapper: Wrapper,
     });
-    const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+    const frame = await findOpenFrame(view);
     expect(view.getByText("tray")).toBeTruthy();
     expect(view.container.textContent).not.toContain("0123456789abcdef");
     postFromView(frame, {
@@ -600,13 +630,14 @@ describe("McpAppFrame", () => {
       webkitRTCPeerConnection: class {},
       RTCDataChannel: class {},
       fetch: () => undefined,
-      // The preamble also installs the in-page link handler.
+      // The preamble also installs the in-page link handler and announces the document.
       addEventListener: () => undefined,
+      parent: { postMessage: () => undefined },
     };
     // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs our own generated script
     const run = new Function("window", firstScript) as (window: unknown) => void;
     run(fakeWindow);
-    expect(Object.keys(fakeWindow)).toEqual(["fetch", "addEventListener"]);
+    expect(Object.keys(fakeWindow)).toEqual(["fetch", "addEventListener", "parent"]);
   });
 
   test("the view mounts in desktop and browser mode and is told which platform it is on", async () => {
@@ -645,10 +676,93 @@ describe("McpAppFrame", () => {
 
     // Reload brings back a fresh frame with a working host.
     fireEvent.click(view.getByRole("button", { name: "Reload" }));
-    const reloaded = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+    const reloaded = await findOpenFrame(view);
     const replies = capturePosted(reloaded);
     postFromView(reloaded, { jsonrpc: "2.0", id: 10, method: "ping" });
     await waitFor(() => expect(replies.some((m) => m.id === 10)).toBe(true));
+  });
+
+  // #6187: in browser mode nothing blocks the navigation, and until the next page's load event
+  // it posts through the frame's window. The view document's leave closes the bridge first.
+  test("in browser mode, the page a view navigates to gets no reply before its load", async () => {
+    delete window.api;
+    const { view, frame, posted, document } = await renderFrame();
+    postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ping" });
+    await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+
+    document.dispatch("beforeunload");
+    // The next page posts from the same window, with no load event in between.
+    postFromView(frame, { jsonrpc: "2.0", id: 2, method: "ui/initialize", params: {} });
+    expect(await view.findByText(/This artifact navigated away/)).toBeTruthy();
+    expect(view.queryByTestId("mcp-app-frame")).toBeNull();
+    await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+    expect(posted.some((m) => m.id === 2)).toBe(false);
+
+    // Reload loads a fresh document, which gets its own gate.
+    fireEvent.click(view.getByRole("button", { name: "Reload" }));
+    const reloaded = await findOpenFrame(view);
+    const replies = capturePosted(reloaded);
+    postFromView(reloaded, { jsonrpc: "2.0", id: 3, method: "ping" });
+    await waitFor(() => expect(replies.some((m) => m.id === 3)).toBe(true));
+  });
+
+  // The desktop app blocks the navigation after beforeunload, so the view must keep working.
+  test("on the desktop app, only an unloading document closes the bridge", async () => {
+    const { view, frame, posted, document } = await renderFrame();
+    document.dispatch("beforeunload");
+    postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ping" });
+    await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+
+    document.dispatch("pagehide");
+    expect(await view.findByText(/This artifact navigated away/)).toBeTruthy();
+  });
+
+  // Chromium runs pagehide after the next document committed, so the leave no longer comes
+  // from the frame's window (and no beforeunload fires for a redirect while loading).
+  test("a leave from a window that moved on still closes the bridge", async () => {
+    delete window.api;
+    const { view, frame } = await renderFrame();
+    const nonce = /nonce: "([0-9a-f]+)"/.exec(frame.getAttribute("srcdoc")!)![1];
+    const event = new window.Event("message");
+    Object.defineProperty(event, "data", { value: { xumMcpAppDocument: 1, type: "leave", nonce } });
+    Object.defineProperty(event, "source", { value: null });
+    act(() => {
+      window.dispatchEvent(event);
+    });
+    expect(await view.findByText(/This artifact navigated away/)).toBeTruthy();
+  });
+
+  test("messages before the document announced itself, or under another nonce, are dropped", async () => {
+    const view = render(<McpAppFrame workspaceId="ws" view={VIEW} />, { wrapper: Wrapper });
+    const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+    const posted = capturePosted(frame);
+    postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ping" });
+    postFromView(frame, { xumMcpAppDocument: 1, type: "open", nonce: "0123" });
+    postFromView(frame, { jsonrpc: "2.0", id: 2, method: "ping" });
+    await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+    expect(posted).toEqual([]);
+
+    bootDocument(frame);
+    postFromView(frame, { jsonrpc: "2.0", id: 3, method: "ping" });
+    await waitFor(() => expect(posted.map((m) => m.id)).toEqual([3]));
+  });
+
+  test("the leave of a document a new grant replaced does not close the new one", async () => {
+    delete window.api;
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = { connectDomains: ["https://api.example.com"] };
+    const { view, frame, document: before } = await renderFrame();
+    const firstSrcDoc = frame.getAttribute("srcdoc");
+    await pressAllow(view.getByRole("button", { name: "Allow" }));
+    await waitFor(() => expect(frame.getAttribute("srcdoc")).not.toBe(firstSrcDoc));
+
+    // The frame loads the new document; the old one leaves after it was replaced.
+    const posted = capturePosted(frame);
+    bootDocument(frame);
+    before.dispatch("beforeunload");
+    postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ping" });
+    await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+    expect(view.queryByText(/This artifact navigated away/)).toBeNull();
   });
 });
 
@@ -673,7 +787,7 @@ describe("McpAppFrame host strips", () => {
 
   test("a shown consent strip is never replaced; a newer request is declined", async () => {
     const view = render(<McpAppFrame workspaceId="ws" view={VIEW} />, { wrapper: Wrapper });
-    const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+    const frame = await findOpenFrame(view);
     const replies = captureReplies(frame);
 
     postFromView(frame, {
@@ -716,7 +830,7 @@ describe("McpAppFrame host strips", () => {
     window.addEventListener(CUSTOM_EVENTS.UPDATE_CHAT_INPUT, onInsert);
     try {
       const view = render(<McpAppFrame workspaceId="ws" view={VIEW} />, { wrapper: Wrapper });
-      const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+      const frame = await findOpenFrame(view);
       const replies = captureReplies(frame);
       const message = (id: number, text: string) =>
         postFromView(frame, {
@@ -782,7 +896,7 @@ describe("McpAppFrame host strips", () => {
           <McpAppFrame workspaceId="ws" view={VIEW} variant={variant} onClose={onClose} />,
           { wrapper: Wrapper }
         );
-        const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+        const frame = await findOpenFrame(view);
         posted = capturePosted(frame);
         postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
         await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
