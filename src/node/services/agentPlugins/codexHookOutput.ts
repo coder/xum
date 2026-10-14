@@ -98,9 +98,10 @@ export function parsePreToolUseOutput(result: unknown): PreToolUseOutput | null 
   const { raw, specific } = wire;
   // Codex: any hook-specific decision field means the legacy `decision`/`reason` pair is not
   // consulted (PRRT_kwDOPxxmWM6r6NnG).
+  const legacy = preLegacyDecision(raw);
   const chosen = hasSpecificDecision(specific)
-    ? preSpecificDecision(specific)
-    : preLegacyDecision(raw);
+    ? keepLegacyDeny(preSpecificDecision(specific), legacy)
+    : legacy;
   // PreToolUse does not support continue: false, stopReason or suppressOutput. Codex voids such an
   // output; Xum still honors its deny (see NO_REASON) and voids the rest: a rewrite, the context
   // (PRRT_kwDOPxxmWM6sSNEa).
@@ -120,6 +121,18 @@ function unsupportedPreToolUseField(raw: Record<string, unknown>): string | unde
   if (raw.stopReason != null) return "returned unsupported stopReason";
   if (raw.suppressOutput === true) return "returned unsupported suppressOutput";
   return undefined;
+}
+
+/**
+ * An invalid hook-specific decision (a lone permissionDecisionReason, say) does not void a legacy
+ * block next to it: only a valid specific decision supersedes it (Codex security review
+ * PRRT_kwDOPxxmWM6sTAAF, see NO_REASON).
+ */
+function keepLegacyDeny(
+  specific: Decision<PreToolUseOutput>,
+  legacy: Decision<PreToolUseOutput>
+): Decision<PreToolUseOutput> {
+  return "invalid" in specific && "denyReason" in legacy ? legacy : specific;
 }
 
 function hasSpecificDecision(specific: Record<string, unknown>): boolean {

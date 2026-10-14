@@ -854,6 +854,20 @@ describe("Codex output rules (output_parser.rs)", () => {
     expect((await runTool(post.spine, "bash", {})).result).toEqual({ ran: {} });
   });
 
+  test("an invalid hook-specific field does not void a legacy block", async () => {
+    const { spine } = setup([hook("PreToolUse")], () =>
+      json({
+        decision: "block",
+        reason: "no rm",
+        hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecisionReason: "why" },
+      })
+    );
+    const ctx = await runTool(spine, "bash", { script: "rm -rf /" });
+    expect(ctx.blocked?.result).toEqual({
+      error: "Tool call blocked by plugin 'guard' hook: no rm",
+    });
+  });
+
   test("a hook-specific decision wins over a legacy block", async () => {
     const { spine } = setup([hook("PreToolUse")], () =>
       json({
