@@ -37,6 +37,8 @@ let currentWorkspaceState: {
 };
 
 let transcriptCaughtUp = true;
+// False models a host that does not feed WorkspaceStore (the VS Code webview): reads throw.
+let workspaceStoreFed = true;
 
 function createDeferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -109,7 +111,12 @@ void mock.module("@/browser/stores/WorkspaceStore", () => ({
   useWorkspaceStoreRaw: () =>
     overlayWorkspaceStoreRaw(actualWorkspaceStore.useWorkspaceStoreRaw(), {
       subscribeKey: (_workspaceId: string, _listener: () => void) => () => undefined,
-      getWorkspaceState: (_workspaceId: string) => currentWorkspaceState,
+      getWorkspaceState: (_workspaceId: string) => {
+        if (!workspaceStoreFed) {
+          throw new Error("Workspace not registered");
+        }
+        return currentWorkspaceState;
+      },
     }),
 }));
 
@@ -129,6 +136,7 @@ describe("AskUserQuestionToolCall", () => {
     };
 
     transcriptCaughtUp = true;
+    workspaceStoreFed = true;
     spyOn(actualWorkspaceStore.workspaceStore, "isWorkspaceTranscriptCaughtUp").mockImplementation(
       () => transcriptCaughtUp
     );
@@ -533,6 +541,18 @@ describe("AskUserQuestionToolCall", () => {
         expect(view.queryByRole("button", { name: "Submit answers" })).toBeNull()
       );
       expect(sendMessage).not.toHaveBeenCalled();
+    });
+
+    test("sends from a host that does not feed WorkspaceStore", async () => {
+      // The VS Code webview renders this card without registering the workspace in the store.
+      workspaceStoreFed = false;
+      const view = renderAsyncQuestion();
+
+      fireEvent.click(view.getByText("First"));
+      fireEvent.click(view.getByRole("button", { name: "Submit answers" }));
+
+      await waitFor(() => expect(view.getByText("User answered")).toBeTruthy());
+      expect(sendMessage).toHaveBeenCalledTimes(1);
     });
   });
 });

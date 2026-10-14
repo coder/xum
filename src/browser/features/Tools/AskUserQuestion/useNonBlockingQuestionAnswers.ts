@@ -82,6 +82,22 @@ export function getNonBlockingQuestionState(args: {
 }
 
 /**
+ * The latest transcript, read fail-soft like the card's render path: a host that does not feed
+ * WorkspaceStore (the VS Code webview) has no transcript here, so the context check has nothing
+ * to see there, as at render time, instead of failing every answer.
+ */
+function readStoreTranscript(
+  store: ReturnType<typeof useWorkspaceStoreRaw>,
+  workspaceId: string
+): readonly DisplayedMessage[] {
+  try {
+    return store.getWorkspaceState(workspaceId).messages;
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Dispatches one answer message, behind the composer's barriers. Resolves with an error message,
  * or null once the backend accepted the send.
  */
@@ -180,7 +196,7 @@ export function useNonBlockingQuestionAnswers(props: {
       sendId,
       answers,
       isTranscriptMutationAllowed,
-      readTranscript: (workspaceId) => workspaceStore.getWorkspaceState(workspaceId).messages,
+      readTranscript: (workspaceId) => readStoreTranscript(workspaceStore, workspaceId),
     });
     if (error == null) {
       pendingSendRef.current = null;
