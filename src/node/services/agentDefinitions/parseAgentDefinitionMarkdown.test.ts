@@ -154,6 +154,9 @@ Body
 
     test("any Xum-only key keeps Xum semantics", () => {
       for (const frontmatter of [
+        "name: a\nbase: plan",
+        "name: a\ndisabled: true",
+        "name: a\nai:\n  model: sonnet",
         "name: a\ntools:\n  add: [file_read]",
         "name: a\nsubagent:\n  runnable: false",
         "name: a\nui:\n  color: red",

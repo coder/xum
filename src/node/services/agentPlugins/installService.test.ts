@@ -1883,11 +1883,13 @@ describe("AgentPluginInstallService", () => {
       path.join(remoteDir, "agents", "helper.md"),
       "---\nname: helper\ndescription: Reviews\nreadonly: true\n---\nReview.\n"
     );
-    // A Claude tools allowlist is not translated yet: runtime skips the
-    // agent, so the preview must not promise it.
+    // A Claude tool list is not translated yet: runtime skips the agent, so
+    // the preview must not promise it. disallowedTools (not `tools`) because
+    // the schema already rejects a string `tools`, so only the plugin mapping
+    // keeps this one out.
     await fsPromises.writeFile(
       path.join(remoteDir, "agents", "narrow.md"),
-      "---\nname: narrow\ndescription: Reads\ntools: Read, Grep\n---\nRead.\n"
+      "---\nname: narrow\ndescription: Reads\ndisallowedTools: Write\n---\nRead.\n"
     );
     await commitAll(remoteDir, "adds foreign-format agents");
     const preview = await service.preview({ input: remoteDir });
