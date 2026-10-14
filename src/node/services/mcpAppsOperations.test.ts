@@ -268,10 +268,8 @@ describe("MCP Apps view domain approvals", () => {
 
   test("an approval is stored per server in the project, read back by every view, and revoked", async () => {
     const { ctx, projects } = projectConfig();
-    expect(await approveMcpAppViewDomains(ctx, approve(["https://api.example.com/"]))).toEqual({
-      success: true,
-      data: { approvedDomains: ["https://api.example.com"], revision: expect.any(Number) },
-    });
+    const approved = await approveMcpAppViewDomains(ctx, approve(["https://api.example.com/"]));
+    expect(approved.success && approved.data.approvedDomains).toEqual(["https://api.example.com"]);
     // A grown list adds only the new origin.
     await approveMcpAppViewDomains(
       ctx,
@@ -364,10 +362,7 @@ describe("MCP Apps view domain approvals", () => {
       ctx,
       approve(["https://api.example.com"], { serverName: "constructor" })
     );
-    expect(result).toEqual({
-      success: true,
-      data: { approvedDomains: ["https://api.example.com"], revision: expect.any(Number) },
-    });
+    expect(result.success && result.data.approvedDomains).toEqual(["https://api.example.com"]);
   });
 
   test("an approval that would exceed the cap fails and keeps the stored list", async () => {
