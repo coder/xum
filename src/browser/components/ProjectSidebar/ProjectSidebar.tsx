@@ -3638,7 +3638,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
           <SidebarCollapseButton
             collapsed={collapsed}
             onToggle={onToggleCollapsed}
-            side="left"
             shortcut={formatKeybind(KEYBINDS.TOGGLE_SIDEBAR)}
           />
           <PositionedMenu

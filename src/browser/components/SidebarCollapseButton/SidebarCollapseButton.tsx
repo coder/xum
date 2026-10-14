@@ -5,25 +5,20 @@ import { cn } from "@/common/lib/utils";
 interface SidebarCollapseButtonProps {
   collapsed: boolean;
   onToggle: () => void;
-  /** Direction the sidebar expands toward (left sidebar expands right, right sidebar expands left) */
-  side: "left" | "right";
   /** Optional keyboard shortcut to show in tooltip */
   shortcut?: string;
 }
 
 /**
- * Collapse/expand toggle button for sidebars.
+ * Collapse/expand toggle button for the left sidebar.
  * Renders at the bottom of the sidebar with « » chevrons.
  */
 export const SidebarCollapseButton: React.FC<SidebarCollapseButtonProps> = ({
   collapsed,
   onToggle,
-  side,
   shortcut,
 }) => {
-  // Left sidebar: collapsed shows », expanded shows «
-  // Right sidebar: collapsed shows «, expanded shows »
-  const chevron = side === "left" ? (collapsed ? "»" : "«") : collapsed ? "«" : "»";
+  const chevron = collapsed ? "»" : "«";
 
   const label = collapsed ? "Expand sidebar" : "Collapse sidebar";
 

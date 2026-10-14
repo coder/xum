@@ -149,6 +149,8 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
       "true"
     );
     await within(sidebar).findByText(RUN_NAME);
+    // The view closes from its header, so its strip has no collapse button.
+    await expect(within(sidebar).queryByRole("button", { name: "Collapse sidebar" })).toBeNull();
     // Everything behind the view is inert, not just the chat: the left sidebar and the footer
     // sit outside the chat pane.
     await expect(chatPane.closest("[inert]")).not.toBeNull();
@@ -249,6 +251,7 @@ export const FullScreenFromWorkspaceMenu: AppStory = {
       await waitFor(() => expect(sidebar).not.toHaveClass("right-sidebar-fullscreen"));
       await expect(sidebar).toBeVisible();
       await expect(within(sidebar).queryByRole("button", { name: "Close sidebar" })).toBeNull();
+      await expect(within(sidebar).getByRole("button", { name: "Collapse sidebar" })).toBeVisible();
     }
   },
 };

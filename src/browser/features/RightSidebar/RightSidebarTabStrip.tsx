@@ -4,7 +4,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/To
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { useDroppable, useDndContext } from "@dnd-kit/core";
-import { Plus, X } from "lucide-react";
+import { PanelRightClose, Plus, X } from "lucide-react";
 import type { TabType } from "@/browser/types/rightSidebar";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import {
@@ -48,6 +48,8 @@ interface RightSidebarTabStripProps {
   tabsetId: string;
   /** Called when user clicks the "+" button to open (or show) this tabset's New tab */
   onAddNewTab?: () => void;
+  /** Collapses the sidebar. Only the strip at the sidebar's top-right corner gets it. */
+  onCollapseSidebar?: () => void;
 }
 
 /**
@@ -189,6 +191,39 @@ const TabCloseButton: React.FC<{
   </button>
 );
 
+/** Icon button after the tabs ("+", collapse). */
+const StripIconButton: React.FC<{
+  label: string;
+  shortcut?: string;
+  isDesktop: boolean;
+  className?: string;
+  onClick: () => void;
+  children: React.ReactNode;
+}> = (props) => (
+  <Tooltip>
+    <TooltipTrigger asChild>
+      <button
+        type="button"
+        className={cn(
+          "text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent flex shrink-0 items-center justify-center rounded-md p-1 transition-colors focus-visible:ring-1",
+          props.isDesktop && "titlebar-no-drag",
+          props.className
+        )}
+        onClick={props.onClick}
+        aria-label={props.label}
+      >
+        {props.children}
+      </button>
+    </TooltipTrigger>
+    <TooltipContent side="bottom">
+      {props.label}
+      {props.shortcut != null && (
+        <span className="mobile-hide-shortcut-hints"> ({props.shortcut})</span>
+      )}
+    </TooltipContent>
+  </Tooltip>
+);
+
 /** Width of the `.scroll-fade-x` edge fade (scrollbar-none.css): a tab under it looks cut off. */
 const SCROLL_FADE_PX = 24;
 
@@ -223,6 +258,7 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
   ariaLabel = "Sidebar views",
   tabsetId,
   onAddNewTab,
+  onCollapseSidebar,
 }) => {
   const { active } = useDndContext();
   const activeData = active?.data.current as TabDragData | undefined;
@@ -276,13 +312,15 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
         isDesktop && "titlebar-drag"
       )}
     >
-      {/* One row that never wraps: extra tabs scroll sideways (hidden scrollbar, faded edges). */}
+      {/* One row that never wraps: extra tabs scroll sideways (hidden scrollbar, faded edges).
+          It is only as wide as its tabs, so "+" follows the last tab; once they overflow, the
+          row shrinks and scrolls while "+", outside it, stays in view. */}
       <div
         ref={scrollRowRef}
         data-tab-scroll-row
         role="tablist"
         aria-label={ariaLabel}
-        className="scrollbar-none scroll-fade-x flex min-w-0 flex-1 flex-nowrap items-center gap-1 overflow-x-auto"
+        className="scrollbar-none scroll-fade-x flex min-w-0 flex-initial flex-nowrap items-center gap-1 overflow-x-auto"
       >
         {items.map((item, index) => (
           <SortableTab
@@ -294,30 +332,25 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
           />
         ))}
       </div>
-      {/* Outside the scrolling row so it stays visible however many tabs are open. */}
       {onAddNewTab && (
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              className={cn(
-                "text-muted hover:bg-hover hover:text-foreground shrink-0 rounded-md p-1 transition-colors",
-                isDesktop && "titlebar-no-drag"
-              )}
-              onClick={onAddNewTab}
-              aria-label="New tab"
-            >
-              <Plus className="h-3.5 w-3.5" />
-            </button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom">
-            New tab
-            <span className="mobile-hide-shortcut-hints">
-              {" "}
-              ({formatKeybind(KEYBINDS.NEW_SIDEBAR_TAB)})
-            </span>
-          </TooltipContent>
-        </Tooltip>
+        <StripIconButton
+          label="New tab"
+          shortcut={formatKeybind(KEYBINDS.NEW_SIDEBAR_TAB)}
+          isDesktop={isDesktop}
+          onClick={onAddNewTab}
+        >
+          <Plus className="h-3.5 w-3.5" />
+        </StripIconButton>
+      )}
+      {onCollapseSidebar && (
+        <StripIconButton
+          label="Collapse sidebar"
+          isDesktop={isDesktop}
+          className="ml-auto"
+          onClick={onCollapseSidebar}
+        >
+          <PanelRightClose className="h-3.5 w-3.5" />
+        </StripIconButton>
       )}
     </div>
   );

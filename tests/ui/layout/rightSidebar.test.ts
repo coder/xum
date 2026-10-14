@@ -998,6 +998,13 @@ describeIntegration("RightSidebar (UI)", () => {
       const reviewPanel = sidebar.querySelector('[role="tabpanel"][id*="review"]');
       expect(costsPanel).toBeTruthy();
       expect(reviewPanel).toBeTruthy();
+
+      // One collapse button for the whole sidebar, in the top pane's strip.
+      const collapseButtons = sidebar.querySelectorAll('button[aria-label="Collapse sidebar"]');
+      expect(collapseButtons.length).toBe(1);
+      expect(collapseButtons[0].closest("[data-tabset-id]")?.getAttribute("data-tabset-id")).toBe(
+        "tabset-top"
+      );
     } finally {
       await cleanup();
     }
