@@ -989,6 +989,10 @@ export class DraftStore {
           ...(unsavedText !== undefined ? { text: unsavedText } : {}),
           ...(basisSends.length > 0 ? { basisSends } : {}),
         });
+        // A replaced backend's reply: the current one holds neither the removal nor the
+        // pending send, so handle it as a lost reply below (the text comes back and is saved
+        // to the current backend, and the caller does not send) (#6438).
+        this.assertCurrentClient(client);
         // The backend took the same text out of the same (or this window's unsaved) text.
         entry.confirmedTextVersion = Math.max(entry.confirmedTextVersion, removalVersion);
         entry.localSends.delete(pendingSend.sendId);
@@ -1017,7 +1021,7 @@ export class DraftStore {
         entry.inFlight = null;
         settle();
       }
-      this.applyWriteReply(entry, reply, { text: true, attachments: false }, client);
+      this.applyWriteReply(entry, reply, { text: true, attachments: false });
     } catch (error) {
       tracking.issuing.delete(input.sendId);
       if (this.entries.get(key) === entry) {
@@ -2040,7 +2044,7 @@ export class DraftStore {
         entry.inFlight = null;
         settle();
       }
-      this.applyWriteReply(entry, reply, { text: sendText, attachments: sendAttachments }, client);
+      this.applyWriteReply(entry, reply, { text: sendText, attachments: sendAttachments });
     }
   }
 
@@ -2049,21 +2053,17 @@ export class DraftStore {
    * the newest server view (this reply, or a push that came after it); the echo push of this
    * write is stale for this window, so the reply is how the merge reaches it.
    */
-  /**
-   * The entry is still this scope's, and the write went to the current backend. A replaced
-   * backend's reply is not comparable with the current one's revisions (#6438).
-   */
-  private isCurrentWrite(entry: Entry, client: APIClient): boolean {
-    return this.entries.get(draftStoreScopeKey(entry.scope)) === entry && this.client === client;
+  /** Throws when `client` was replaced (a new backend): its replies are not the current one's. */
+  private assertCurrentClient(client: APIClient): void {
+    if (this.client !== client) throw new Error("Draft save failed: the drafts backend changed");
   }
 
   private applyWriteReply(
     entry: Entry,
     reply: DraftWriteOutput,
-    wrote: { text: boolean; attachments: boolean },
-    client: APIClient
+    wrote: { text: boolean; attachments: boolean }
   ): void {
-    if (!this.isCurrentWrite(entry, client)) return;
+    if (this.entries.get(draftStoreScopeKey(entry.scope)) !== entry) return;
     entry.revision = Math.max(entry.revision, reply.revision);
     if (entry.serverView === null || reply.revision >= entry.serverView.revision) {
       entry.serverView = {

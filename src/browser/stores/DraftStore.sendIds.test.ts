@@ -768,8 +768,9 @@ describe("DraftStore idempotent sends", () => {
 
   // #6438: the reply of a send begun on the old backend arrived after the switch. Its view
   // carried the old backend's (higher) revisions, so every write reply of the new backend lost
-  // to it and the old text came back over typing.
-  test("a send's reply from a replaced backend does not outrank the new backend's replies", async () => {
+  // to it and the old text came back over typing. It also counted as begun, so the message went
+  // out while the current backend had no record of the send and no copy of its text.
+  test("a send whose reply came from a replaced backend is refused, and its text is kept", async () => {
     using oldDir = new TestTempDir("draft-sends-old-backend");
     using newDir = new TestTempDir("draft-sends-new-backend");
     const old = await createHarness(oldDir);
@@ -784,7 +785,10 @@ describe("DraftStore idempotent sends", () => {
     const request = pendingSend("s1", "hello", RECEIVER).request;
     const sending = store
       .beginSend(SCOPE, { sendId: "s1", text: "hello", attachments: [], request })
-      .catch(() => undefined);
+      .then(
+        () => "began",
+        () => "refused"
+      );
     await waitFor(() => old.hooks.beforeBeginSend === null);
 
     // A new backend process whose clock is behind numbers its revisions lower.
@@ -799,7 +803,12 @@ describe("DraftStore idempotent sends", () => {
     store.setClient(next.client);
     await waitFor(() => store.isHydrated());
     release();
-    await sending;
+    // The new backend holds neither the send nor its text removal: the send must not go out,
+    // and its text comes back and is saved there.
+    expect(await sending).toBe("refused");
+    expect(store.getText(SCOPE)).toBe("hello");
+    await store.flush(SCOPE);
+    expect((await next.service.get(SCOPE)).text).toBe("hello");
 
     store.setText(SCOPE, "typed after the switch");
     await store.flush(SCOPE);
