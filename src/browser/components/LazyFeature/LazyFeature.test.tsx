@@ -1,7 +1,8 @@
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import React from "react";
 import { installDom } from "../../../../tests/ui/dom";
+import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
 import { LazyFeature } from "./LazyFeature";
 
 /** A lazy component whose chunk import the test settles by hand. */
@@ -13,7 +14,12 @@ function deferredLazy() {
       reject,
     };
   });
-  return { Component: React.lazy(() => chunk), settle };
+  const loads = { count: 0 };
+  const Component = React.lazy(() => {
+    loads.count += 1;
+    return chunk;
+  });
+  return { Component, settle, loads };
 }
 
 describe("LazyFeature", () => {
@@ -89,5 +95,56 @@ describe("LazyFeature", () => {
     } finally {
       consoleError.mockRestore();
     }
+  });
+
+  // #6380: a chunk import started while offline fails, and React.lazy and the browser both keep
+  // that failure, so the feature stayed "failed to load" after the reconnect.
+  describe.each([...GAP_MODES])("while Xum reconnects (%s)", (mode) => {
+    test("a feature opened offline waits for the connection before it loads", async () => {
+      const harness = createConnectionHarness(mode, () => ({}));
+      await harness.drop();
+      const lazy = deferredLazy();
+      const view = render(
+        <LazyFeature name="Feature" fallback={<div data-testid="pending" />}>
+          <lazy.Component />
+        </LazyFeature>,
+        { wrapper: harness.Wrapper }
+      );
+      expect(view.getByTestId("pending")).toBeTruthy();
+      expect(lazy.loads.count).toBe(0);
+
+      harness.reconnect();
+      expect(lazy.loads.count).toBe(1);
+      await act(async () => {
+        lazy.settle.resolve();
+        await Promise.resolve();
+      });
+      expect(await view.findByTestId("lazy-content")).toBeTruthy();
+    });
+
+    // A loaded chunk needs no server: keep showing an open feature, and open a loaded one again.
+    test("a loaded feature stays open and opens again while offline", async () => {
+      const harness = createConnectionHarness(mode, () => ({}));
+      const lazy = deferredLazy();
+      const feature = (
+        <LazyFeature name="Feature" fallback={<div data-testid="pending" />}>
+          <lazy.Component />
+        </LazyFeature>
+      );
+      const first = render(feature, { wrapper: harness.Wrapper });
+      await act(async () => {
+        lazy.settle.resolve();
+        await Promise.resolve();
+      });
+      await first.findByTestId("lazy-content");
+
+      await harness.drop();
+      expect(first.queryByTestId("lazy-content")).not.toBeNull();
+      first.unmount();
+
+      const again = render(feature, { wrapper: harness.Wrapper });
+      expect(again.queryByTestId("lazy-content")).not.toBeNull();
+      expect(again.queryByTestId("pending")).toBeNull();
+    });
   });
 });
