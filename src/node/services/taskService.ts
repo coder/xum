@@ -463,6 +463,15 @@ type AgentReportFinalizationResult =
  * Rendered form of a labeled task message as sendMessageToDescendantAgentTask
  * persists it.
  */
+/**
+ * Config loads leniently: a corrupted non-string or blank id must never become an advertised
+ * related-chat row, or one bad entry would break task_list's result schema for every peer.
+ * Returns the id unchanged (not trimmed) so it still addresses the exact entry.
+ */
+function addressableWorkspaceId(entry: { id?: unknown }): string | undefined {
+  return typeof entry.id === "string" && entry.id.trim().length > 0 ? entry.id : undefined;
+}
+
 function renderLabeledTaskMessage(label: string, message: string): string {
   return `${label}:\n\n${message}`;
 }
@@ -16494,11 +16503,12 @@ export class TaskService implements AgentTaskIntegration {
     caller: WorkspaceConfigEntry,
     candidate: WorkspaceConfigEntry
   ): NonNullable<TaskTreeAgentsResult["relatedChats"]>[number] | undefined {
-    if (candidate.id == null) return undefined;
+    const workspaceId = addressableWorkspaceId(candidate);
+    if (workspaceId == null) return undefined;
     const relationship = this.relatedChatRelationship(caller, candidate);
     if (relationship == null) return undefined;
     return {
-      workspaceId: candidate.id,
+      workspaceId,
       title: coerceNonEmptyString(candidate.title) ?? coerceNonEmptyString(candidate.name),
       relationship,
     };

@@ -273,6 +273,26 @@ describe("TaskService tagged-chat messaging", () => {
     expect(admissionStale?.()).toBe(false);
   });
 
+  test("same-tag entries with corrupted ids are never advertised", async () => {
+    const { config, projectPath } = await setup();
+    await config.editConfig((cfg) => {
+      const workspaces = cfg.projects.get(projectPath)?.workspaces;
+      if (workspaces == null) throw new Error("Missing test project");
+      const corruptedId: unknown = 42;
+      workspaces.push(
+        { path: path.join(projectPath, "blank"), id: "  ", messagingTag: "research" },
+        { path: path.join(projectPath, "num"), id: corruptedId as string, messagingTag: "research" }
+      );
+      return cfg;
+    });
+    const { taskService } = createTaskServiceHarness(config);
+    expect(taskService.listTaskTreeAgents("alpha").relatedChats).toEqual([
+      { workspaceId: "beta", title: "beta", relationship: "tagged" },
+      { workspaceId: "peer3", title: "peer3", relationship: "tagged" },
+      { workspaceId: "side", title: "side", relationship: "side_chat" },
+    ]);
+  });
+
   test("user-stopped tagged roots disappear from discovery", async () => {
     const { config } = await setup();
     const { taskService } = createTaskServiceHarness(config);

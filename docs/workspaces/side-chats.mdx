@@ -32,7 +32,7 @@ xum api workspace set-messaging-tag --workspace-id <workspace-id> --tag research
 
 Chats that share a tag can find and message each other, including remote and container chats.
 
-Tags are yours alone to set: agents cannot create, change, or clear them, and a chat carries at most one. Removing a chat's tag (`--tag ""`) revokes its link — it can no longer be reached through that tag, though messages already received stay in its transcript.
+No agent tool can create, change, or clear a tag, and a chat carries at most one. `xum api` acts with your authority, though, so an agent that can run shell commands as your user could call it too. Removing a chat's tag (`--tag ""`) revokes its link — it can no longer be reached through that tag, though messages already received stay in its transcript.
 
 When the right sidebar is hidden (narrow windows and phones), the side chat takes over the chat view instead. Press <kbd>Esc</kbd> (or <kbd>Ctrl+C</kbd> in Vim mode) when it is idle, or click **Return to main chat**, to go back; leaving discards it.
 
