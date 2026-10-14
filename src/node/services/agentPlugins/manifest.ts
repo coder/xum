@@ -172,19 +172,26 @@ function parseSkillsRoots(
   return roots.length > 0 ? { skills: roots } : {};
 }
 
+/**
+ * Up to MAX_SKILLS_ROOTS distinct safe roots, in declared order. Only kept roots count toward the
+ * cap, so repeated or invalid entries cannot push out a later valid root (Codex
+ * PRRT_kwDOPxxmWM6sPFP6). The scan is pure string checks, so a long list costs no I/O, and one
+ * warning reports every ignored entry.
+ */
 function parseSkillsRootList(raw: unknown[], warnings: string[]): string[] {
-  if (raw.length > MAX_SKILLS_ROOTS) {
-    warnings.push(
-      `'contributes.skills' has ${raw.length} entries; reading only the first ${MAX_SKILLS_ROOTS}`
-    );
-  }
   const roots: string[] = [];
-  for (const entry of raw.slice(0, MAX_SKILLS_ROOTS)) {
-    if (typeof entry !== "string" || !isSafeContributesPath(entry)) {
-      warnings.push(`${SKILLS_PATH_RULE}; ignoring an entry`);
-    } else if (!roots.includes(entry)) {
-      roots.push(entry);
-    }
+  let invalid = 0;
+  let index = 0;
+  for (; index < raw.length && roots.length < MAX_SKILLS_ROOTS; index++) {
+    const entry = raw[index];
+    if (typeof entry !== "string" || !isSafeContributesPath(entry)) invalid++;
+    else if (!roots.includes(entry)) roots.push(entry);
+  }
+  if (invalid > 0) warnings.push(`${SKILLS_PATH_RULE}; ignoring invalid entries (${invalid})`);
+  if (index < raw.length) {
+    warnings.push(
+      `'contributes.skills' lists more than ${MAX_SKILLS_ROOTS} roots; reading only the first ${MAX_SKILLS_ROOTS}`
+    );
   }
   return roots;
 }

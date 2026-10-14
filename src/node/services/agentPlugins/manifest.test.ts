@@ -228,9 +228,19 @@ describe("validatePluginManifest", () => {
     expect(kept.manifest.contributes?.skills).toEqual(["a", "b"]);
     expect(kept.warnings).toEqual([]);
 
+    // One warning counts every ignored entry, however many there are.
     const mixed = read(["a", "../escape", 7, "a", "b"]);
     expect(mixed.manifest.contributes?.skills).toEqual(["a", "b"]);
-    expect(mixed.warnings).toHaveLength(2);
+    expect(mixed.warnings).toHaveLength(1);
+    expect(mixed.warnings[0]).toContain("invalid entries (2)");
+
+    // Repeated and invalid entries do not use up the root cap (Codex PRRT_kwDOPxxmWM6sPFP6).
+    expect(read([...Array<string>(16).fill("core"), "extra"]).manifest.contributes?.skills).toEqual(
+      ["core", "extra"]
+    );
+    expect(read([...Array<string>(16).fill("/abs"), "late"]).manifest.contributes?.skills).toEqual([
+      "late",
+    ]);
 
     // No valid entry: the default skills/ location applies, as for a bad single path.
     for (const skills of [[], ["/abs"]]) {
