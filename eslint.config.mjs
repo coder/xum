@@ -561,7 +561,7 @@ const localPlugin = {
           },
         ],
         messages: {
-          copy: '"{{specifier}}" loads a second copy of a repo module. Bun\'s LCOV keeps only the last-loaded copy of a file, so in a shared CI shard this copy can replace the coverage that the module\'s own tests recorded (#6339). To get the real exports past a module mock, snapshot `{ ...RealModule }` from a static `import * as RealModule` at file scope, before the mock.module call.',
+          copy: "\"{{specifier}}\" loads a second copy of a repo module. Bun's LCOV keeps only the last-loaded copy of a file, so in a shared CI shard this copy can replace the coverage that the module's own tests recorded (#6339). To get the real exports past a module mock, snapshot `{ ...RealModule }` from a static `import * as RealModule` at file scope, before the mock.module call.",
         },
       },
       create(context) {
@@ -2160,11 +2160,48 @@ const SHIKI_RESTRICTION = {
 // modules such as "@/common/orpc/schemas/runtime". Every later no-restricted-imports block that
 // matches browser or common files must include it, because that block replaces this one's options.
 const ORPC_SCHEMAS_BARREL_RESTRICTION = {
-  regex: "(^|/)orpc/schemas$",
+  regex: "(^|/)orpc/schemas(\\.[jt]s)?$",
   allowTypeImports: true,
   message:
     "Import schemas from their leaf module (e.g. @/common/orpc/schemas/runtime), not the @/common/orpc/schemas barrel: a value import of the barrel adds every schema to the first load. Type-only imports are fine.",
 };
+// Browser and common code must not value-import src/node (#6107): a src/node module can
+// value-import the barrel, which bypasses the barrel guard (e.g. src/common/utils/tools/tools.ts ->
+// src/node/services/tools/agent_skill_read.ts -> @/common/orpc/schemas). Unlike the first-load
+// forbid list in scripts/perf/firstLoadJs.ts, this runs in CI and also guards lazy chunks.
+const NODE_VALUE_IMPORT_RESTRICTION = {
+  regex: "^(@/|(\\.\\./)+)node(/|$)",
+  allowTypeImports: true,
+  message:
+    "Browser and common code must not value-import src/node: backend modules can pull the @/common/orpc/schemas barrel and Node APIs into the browser bundle. Move the shared code to src/common. Type-only imports are fine.",
+};
+// Backend-only modules in src/common that value-import src/node. They are exempt from
+// NODE_VALUE_IMPORT_RESTRICTION, so browser and common code must not value-import them either.
+const BACKEND_ONLY_COMMON_FILES = [
+  "src/common/utils/ai/providerOptions.ts",
+  "src/common/utils/tokens/tokenStatsCalculator.ts",
+  "src/common/utils/tools/tools.ts",
+];
+const backendOnlyCommonRestriction = (regex) => ({
+  regex,
+  allowTypeImports: true,
+  message:
+    "This src/common module is backend-only: it value-imports src/node, so browser and common code must not value-import it. Type-only imports are fine.",
+});
+// Matches "@/common/utils/tools/tools" and relative forms such as "../tools/tools". A file in the
+// module's own folder imports it as "./tools", which the per-folder blocks below cover.
+const BACKEND_ONLY_COMMON_RESTRICTION = backendOnlyCommonRestriction(
+  `(^|/)(${BACKEND_ONLY_COMMON_FILES.map((file) => file.split("/").slice(-2).join("/").replace(/\.ts$/, "")).join("|")})(\\.[jt]s)?$`
+);
+// Every no-restricted-imports block for browser or common files replaces the options of the
+// earlier blocks that match the same file, so each one starts from these lists.
+const SHARED_RESTRICTED_PATHS = [AI_TOKENIZER_ENCODING_RESTRICTION];
+const SHARED_RESTRICTED_PATTERNS = [SHIKI_RESTRICTION, ORPC_SCHEMAS_BARREL_RESTRICTION];
+const BROWSER_COMMON_RESTRICTED_PATTERNS = [
+  ...SHARED_RESTRICTED_PATTERNS,
+  NODE_VALUE_IMPORT_RESTRICTION,
+  BACKEND_ONLY_COMMON_RESTRICTION,
+];
 
 export default defineConfig([
   {
@@ -2566,12 +2603,39 @@ export default defineConfig([
       "no-restricted-imports": [
         "error",
         {
-          paths: [AI_TOKENIZER_ENCODING_RESTRICTION],
-          patterns: [SHIKI_RESTRICTION, ORPC_SCHEMAS_BARREL_RESTRICTION],
+          paths: SHARED_RESTRICTED_PATHS,
+          patterns: BROWSER_COMMON_RESTRICTED_PATTERNS,
         },
       ],
     },
   },
+  {
+    // The backend-only src/common modules may value-import src/node and each other.
+    files: BACKEND_ONLY_COMMON_FILES,
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        { paths: SHARED_RESTRICTED_PATHS, patterns: SHARED_RESTRICTED_PATTERNS },
+      ],
+    },
+  },
+  // Files next to a backend-only module import it as "./<name>".
+  ...BACKEND_ONLY_COMMON_FILES.map((file) => ({
+    files: [`${path.posix.dirname(file)}/*.{ts,tsx}`],
+    ignores: [file, "src/**/*.test.{ts,tsx}"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          paths: SHARED_RESTRICTED_PATHS,
+          patterns: [
+            ...BROWSER_COMMON_RESTRICTED_PATTERNS,
+            backendOnlyCommonRestriction(`^\\./${path.posix.basename(file, ".ts")}(\\.[jt]s)?$`),
+          ],
+        },
+      ],
+    },
+  })),
   {
     // ORPC must import config schemas via direct file paths, never the schemas barrel
     files: ["src/common/orpc/**/*.ts"],
@@ -2580,6 +2644,7 @@ export default defineConfig([
         "error",
         {
           paths: [
+            ...SHARED_RESTRICTED_PATHS,
             {
               name: "@/common/config/schemas",
               message:
@@ -2592,9 +2657,9 @@ export default defineConfig([
             },
           ],
           patterns: [
-            ORPC_SCHEMAS_BARREL_RESTRICTION,
+            ...BROWSER_COMMON_RESTRICTED_PATTERNS,
             // Inside src/common/orpc, "./schemas" and "../schemas" are the barrel too.
-            { ...ORPC_SCHEMAS_BARREL_RESTRICTION, regex: "^\\.\\.?/schemas$" },
+            { ...ORPC_SCHEMAS_BARREL_RESTRICTION, regex: "^\\.\\.?/schemas(\\.[jt]s)?$" },
           ],
         },
       ],
@@ -2607,13 +2672,14 @@ export default defineConfig([
       "no-restricted-imports": [
         "error",
         {
+          paths: SHARED_RESTRICTED_PATHS,
           patterns: [
             {
               group: ["@/common/orpc/schemas/*", "**/orpc/schemas/*"],
               message:
                 "Config schemas must not import from ORPC; use @/common/schemas/* or @/common/config/schemas/* instead.",
             },
-            ORPC_SCHEMAS_BARREL_RESTRICTION,
+            ...BROWSER_COMMON_RESTRICTED_PATTERNS,
           ],
         },
       ],

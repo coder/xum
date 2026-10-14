@@ -26,6 +26,10 @@ async function restrictedImports(filePath: string, code: string): Promise<string
 }
 
 const barrelMessage = expect.stringContaining("not the @/common/orpc/schemas barrel");
+const nodeMessage = expect.stringContaining("must not value-import src/node");
+const backendOnlyMessage = expect.stringContaining("module is backend-only");
+const shikiMessage = expect.stringContaining("Shiki must only be imported in highlightWorker.ts");
+const tokenizerMessage = expect.stringContaining("ai-tokenizer/encoding barrel");
 
 describe("orpc schemas barrel guard", () => {
   test.each([
@@ -40,6 +44,10 @@ describe("orpc schemas barrel guard", () => {
     ["src/common/orpc/client.ts", 'import { X } from "./schemas";'],
     ["src/common/orpc/schemas/api.ts", 'import { X } from "../schemas";'],
     ["src/common/config/schemas/example.ts", 'import { X } from "@/common/orpc/schemas";'],
+    // Specifiers with a file extension name the barrel too.
+    ["src/browser/example.ts", 'import { X } from "@/common/orpc/schemas.ts";'],
+    ["src/common/types/example.ts", 'import { X } from "../orpc/schemas.js";'],
+    ["src/common/orpc/client.ts", 'import { X } from "./schemas.ts";'],
   ])("reports a value import in %s: %s", async (filePath, code) => {
     expect(await restrictedImports(filePath, code)).toEqual([barrelMessage]);
   });
@@ -60,14 +68,66 @@ describe("orpc schemas barrel guard", () => {
     expect(await restrictedImports(filePath, code)).toEqual([]);
   });
 
-  test("keeps the shiki and ai-tokenizer restrictions in guarded files", async () => {
+  // The later blocks for src/common/orpc and src/common/config/schemas replace the src-wide
+  // block's options, so they must restate these restrictions (#6107).
+  test.each([
+    "src/browser/example.ts",
+    "src/common/orpc/client.ts",
+    "src/common/config/schemas/example.ts",
+    "src/common/utils/tools/example.ts",
+    "src/common/utils/tools/tools.ts",
+  ])("keeps the shiki and ai-tokenizer restrictions in %s", async (filePath) => {
     const messages = await restrictedImports(
-      "src/browser/example.ts",
+      filePath,
       'import { codeToHtml } from "shiki";\nimport { o200k } from "ai-tokenizer/encoding";'
     );
-    expect(messages).toEqual([
-      expect.stringContaining("Shiki must only be imported in highlightWorker.ts"),
-      expect.stringContaining("ai-tokenizer/encoding barrel"),
-    ]);
+    expect(messages).toEqual([shikiMessage, tokenizerMessage]);
+  });
+});
+
+// A src/node module can value-import the barrel, so browser and common code reaching it through
+// src/node bypasses the barrel guard (#6107), e.g. src/common/utils/tools/tools.ts ->
+// src/node/services/tools/agent_skill_read.ts -> @/common/orpc/schemas.
+describe("src/node guard for browser and common code", () => {
+  test.each([
+    ["src/browser/example.ts", 'import { log } from "@/node/services/log";'],
+    ["src/browser/features/a/example.tsx", 'import { X } from "../../../node/services/log";'],
+    ["src/common/types/example.ts", 'export { X } from "@/node/utils/main/tokenizer";'],
+    ["src/common/orpc/client.ts", 'import { X } from "@/node/services/log";'],
+    ["src/common/config/schemas/example.ts", 'import { X } from "@/node/services/log";'],
+  ])("reports a value import of src/node in %s: %s", async (filePath, code) => {
+    expect(await restrictedImports(filePath, code)).toEqual([nodeMessage]);
+  });
+
+  // These src/common modules value-import src/node and are exempt from that rule, so browser and
+  // common code must not value-import them.
+  test.each([
+    ["src/browser/example.ts", 'import { getToolsForModel } from "@/common/utils/tools/tools";'],
+    ["src/common/types/example.ts", 'import { X } from "../utils/tokens/tokenStatsCalculator";'],
+    ["src/common/utils/ai/example.ts", 'import { X } from "../tools/tools";'],
+    ["src/common/utils/tools/example.ts", 'import { X } from "./tools";'],
+    ["src/common/utils/tokens/example.ts", 'import { X } from "./tokenStatsCalculator.ts";'],
+    ["src/common/utils/ai/example.ts", 'import { X } from "./providerOptions";'],
+    ["src/common/orpc/client.ts", 'import { X } from "@/common/utils/ai/providerOptions";'],
+  ])("reports a value import of a backend-only module in %s: %s", async (filePath, code) => {
+    expect(await restrictedImports(filePath, code)).toEqual([backendOnlyMessage]);
+  });
+
+  test.each([
+    ["src/browser/example.ts", 'import type { log } from "@/node/services/log";'],
+    ["src/common/types/example.ts", 'import type { X } from "@/common/utils/tools/tools";'],
+    // Same names in other folders are different modules.
+    ["src/common/orpc/schemas/api.ts", 'import { BashToolResultSchema } from "./tools";'],
+    ["src/common/orpc/schemas/stream.ts", 'import { X } from "./providerOptions";'],
+    ["src/common/types/example.ts", 'import { X } from "./tools";'],
+    // The backend-only modules themselves, and backend code.
+    [
+      "src/common/utils/tools/tools.ts",
+      'import { X } from "@/node/services/tools/agent_skill_read";',
+    ],
+    ["src/common/utils/ai/providerOptions.ts", 'import { log } from "@/node/services/log";'],
+    ["src/node/services/example.ts", 'import { X } from "@/common/utils/tools/tools";'],
+  ])("allows %s: %s", async (filePath, code) => {
+    expect(await restrictedImports(filePath, code)).toEqual([]);
   });
 });
