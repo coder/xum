@@ -39,12 +39,12 @@ export function netExtractionRelief(baseTotalCc: number, headTotalCc: number): b
 /**
  * Both reliefs also cap a new function's CRAP at this when coverage scores it:
  * above it the finding stays a violation. Without the cap an untested CC 20
- * piece (CRAP 420) only warned. 30 is the CRAP tax stage, so a relieved piece
- * never starts life as a hotspot. At CC 20 it needs about 71% coverage, at
- * CC 12 50%. With coverage CRAP >= CC, so this also caps a net-extraction
- * piece at CC 30. A CC-only score (the hook, no --coverage) is not capped.
+ * piece (CRAP 420) only warned. It is the CRAP tax stage, so a relieved piece
+ * never starts life as a hotspot, and it follows the stage down. With coverage
+ * CRAP >= CC, so this also caps a net-extraction piece's CC. A CC-only score
+ * (the hook, no --coverage) is not capped.
  */
-export const RELIEF_MAX_CRAP = 30;
+export const RELIEF_MAX_CRAP = CRAP_TAX_STAGE;
 
 /** True when relief may apply to a new function with this CRAP (null: no coverage data). */
 export function reliefAllowsCrap(crap: number | null): boolean {
