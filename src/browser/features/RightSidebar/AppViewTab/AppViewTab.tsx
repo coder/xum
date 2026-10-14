@@ -8,6 +8,7 @@ import {
   markMcpAppViewHosted,
   openMcpAppViewTab,
   useMcpAppView,
+  useMcpAppViewReloadKey,
   useMcpAppViews,
   type McpAppViewRef,
 } from "../ArtifactsTab/mcpAppViewsStore";
@@ -96,7 +97,9 @@ export function AppViewTabPanel(props: {
   toolCallId: string | null;
   onClose: () => void;
 }) {
-  const view = useMcpAppView(props.workspaceId, props.toolCallId ?? "");
+  const viewKey = props.toolCallId ?? "";
+  const view = useMcpAppView(props.workspaceId, viewKey);
+  const reloadKey = useMcpAppViewReloadKey(props.workspaceId, viewKey);
   const { workspaceId, toolCallId } = props;
   useEffect(() => {
     if (toolCallId == null) return;
@@ -119,8 +122,8 @@ export function AppViewTabPanel(props: {
   }
   return (
     <McpAppFrame
-      // A new tool call is a new document.
-      key={view.toolCallId}
+      // A new tool call is a new document, and so is a reload (reloadMcpAppView).
+      key={`${view.toolCallId}:${reloadKey}`}
       workspaceId={props.workspaceId}
       view={view}
       onClose={props.onClose}

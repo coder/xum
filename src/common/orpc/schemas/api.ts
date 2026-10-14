@@ -160,7 +160,11 @@ import {
   WorkspaceHeartbeatSettingsSchema,
 } from "./workspace";
 import { WorkspaceAgentAISettingsSchema, WorkspaceAISettingsSchema } from "./workspaceAiSettings";
-import { AgentSkillListResultSchema, AgentSkillPackageSchema, SkillNameSchema } from "./agentSkill";
+import {
+  AgentSkillListResultSchema,
+  AgentSkillPackageSchema,
+  SkillLookupNameSchema,
+} from "./agentSkill";
 import {
   AvailableWorkflowSchema,
   WorkflowRunIdSchema,
@@ -2827,7 +2831,8 @@ export const agentSkills = {
     output: AgentSkillListResultSchema,
   },
   get: {
-    input: AgentDiscoveryInputSchema.and(z.object({ skillName: SkillNameSchema })),
+    // `<plugin>:<skill>` reaches a plugin skill shadowed by a higher-precedence one.
+    input: AgentDiscoveryInputSchema.and(z.object({ skillName: SkillLookupNameSchema })),
     output: AgentSkillPackageSchema,
   },
 };

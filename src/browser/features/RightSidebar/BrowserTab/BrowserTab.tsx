@@ -30,7 +30,7 @@ interface BrowserTabProps {
 const STATUS_BADGES: Record<BrowserSessionStatus, { label: string; className: string }> = {
   starting: {
     label: "Connecting",
-    className: "border-accent/30 bg-accent/10 text-accent",
+    className: "border-accent/30 bg-accent/10 text-accent-text",
   },
   live: {
     label: "Live",
@@ -52,11 +52,11 @@ const DISCOVERY_BADGES: Record<
 > = {
   attachable: {
     label: "Ready",
-    className: "border-accent/30 bg-accent/10 text-accent",
+    className: "border-accent/30 bg-accent/10 text-accent-text",
   },
   missing_stream: {
     label: "Activating",
-    className: "border-accent/30 bg-accent/10 text-accent",
+    className: "border-accent/30 bg-accent/10 text-accent-text",
   },
 };
 
@@ -700,7 +700,7 @@ function BrowserPageTabStripButton(props: {
       <span
         className={cn(
           "flex h-4.5 w-4.5 shrink-0 items-center justify-center rounded",
-          props.tab.active ? "bg-accent/15 text-accent" : "bg-background-tertiary text-muted"
+          props.tab.active ? "bg-accent/15 text-accent-text" : "bg-background-tertiary text-muted"
         )}
       >
         {isPending ? <Loader2 className="h-3 w-3 animate-spin" /> : <Globe2 className="h-3 w-3" />}
@@ -887,7 +887,7 @@ function BrowserSessionPickerOption(props: {
         )}
       </span>
       {props.session.status === "missing_stream" && (
-        <span className="text-accent mt-0.5 shrink-0 text-[10px]">Activating</span>
+        <span className="text-accent-text mt-0.5 shrink-0 text-[10px]">Activating</span>
       )}
     </button>
   );
@@ -947,7 +947,7 @@ function BrowserViewerState(props: {
     <div className="flex h-full items-center justify-center p-6">
       <div className="flex max-w-sm flex-col items-center gap-3 text-center">
         <div className="bg-accent/10 flex h-12 w-12 items-center justify-center rounded-full">
-          <Play className="text-accent h-6 w-6" />
+          <Play className="text-accent-text h-6 w-6" />
         </div>
         <div className="space-y-1">
           <h4 className="text-foreground text-sm font-medium">{content.title}</h4>

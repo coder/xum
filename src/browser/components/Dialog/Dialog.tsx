@@ -176,7 +176,7 @@ const DialogInfo = ({
     className={cn(
       "bg-modal-bg border border-border-medium rounded p-3 mb-5 text-[13px]",
       "[&_p]:m-0 [&_p]:mb-2 [&_p]:text-muted [&_p:last-child]:mb-0",
-      "[&_code]:text-accent [&_code]:font-mono",
+      "[&_code]:text-accent-text [&_code]:font-mono",
       className
     )}
   >

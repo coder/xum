@@ -970,8 +970,18 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     props.kind !== "scratch" &&
     creationState.branchLoad !== "loaded" &&
     creationState.selectedRuntime.mode !== RUNTIME_MODE.LOCAL;
-  useReportCreationSendBlocked(creationBranchesLoading, props);
   const isProcessingAttachments = processingAttachmentCount > 0;
+  // #6423: the same blockers as canSend below, so "Run /init" is off whenever Send is.
+  useReportCreationSendBlocked(
+    {
+      disabled,
+      sendInFlight: sendInFlightBlocksInput,
+      processingAttachments: isProcessingAttachments,
+      coderPresetsLoading,
+      branchesNotLoaded: creationBranchesLoading,
+    },
+    props
+  );
   const hasSendableDraft = hasTypedText || hasImages || hasReviews;
   // Workspace sends/edits mutate history relative to the visible transcript, so they wait for
   // the onChat replay to finish; the creation composer has no transcript to catch up with.
@@ -2215,7 +2225,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     if (!isSameEdit()) return;
                     startEditTranscriptRefresh(editMessageId, precondition);
                   }}
-                  className="text-muted hover:text-accent cursor-pointer border-0 bg-transparent p-0 text-[10px] underline transition-colors"
+                  className="text-muted hover:text-accent-text cursor-pointer border-0 bg-transparent p-0 text-[10px] underline transition-colors"
                 >
                   {EDIT_RETRY_REFRESH_LABEL}
                 </button>

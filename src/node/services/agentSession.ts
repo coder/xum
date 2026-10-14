@@ -130,11 +130,7 @@ import {
 } from "@/constants/goals";
 import { synthesizeSilentContinuationSummary } from "@/constants/goalPrompts";
 import type { SendMessageError } from "@/common/types/errors";
-import {
-  ChatMuxMessageSchema,
-  SendMessageOptionsSchema,
-  SkillNameSchema,
-} from "@/common/orpc/schemas";
+import { ChatMuxMessageSchema, SendMessageOptionsSchema } from "@/common/orpc/schemas";
 import { AutoModelRoutingRecordSchema } from "@/common/orpc/schemas/message";
 import { ToolPolicySchema } from "@/common/orpc/schemas/stream";
 import {
@@ -351,6 +347,7 @@ import type { XumToolScope } from "@/common/types/toolScope";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { renderAgentSkillSnapshotText } from "@/common/utils/agentSkills/skillSnapshot";
+import { parseSkillLookupName } from "@/common/utils/agentSkills/skillLookupName";
 import type { MemorySessionContext } from "@/node/services/memoryService";
 import { materializeFileAtMentions } from "@/node/services/fileAtMentions";
 import { parseSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
@@ -13346,8 +13343,10 @@ export class AgentSession {
 
     const snapshotMessages: MuxMessage[] = [];
     for (const ref of refs) {
-      const parsedName = SkillNameSchema.safeParse(ref.skillName);
-      if (!parsedName.success) {
+      // A lookup name: bare, or `<plugin>:<skill>` for a plugin skill. The ref's
+      // lookup name is the snapshot identity, so a qualified invocation keeps
+      // naming the plugin's skill (bare refs equal frontmatter.name).
+      if (parseSkillLookupName(ref.skillName) == null) {
         if (ref.source === "slash") {
           throw new Error(`Invalid agent skill name: ${ref.skillName}`);
         }
@@ -13382,7 +13381,7 @@ export class AgentSession {
         resolved = await readAgentSkill(
           skillCtx?.runtime ?? runtime,
           skillCtx?.workspacePath ?? skillDiscoveryPath,
-          parsedName.data,
+          ref.skillName,
           {
             ...(skillCtx != null
               ? { roots: skillCtx.roots, containment: skillCtx.containment }
@@ -13456,7 +13455,7 @@ export class AgentSession {
       // distinct snapshots (dedupe must not collapse them).
       const frontmatterYaml = stringifyAgentSkillFrontmatter(skill.frontmatter);
       const snapshot = createLoadedSkillSnapshot({
-        name: skill.frontmatter.name,
+        name: ref.skillName,
         scope: skill.scope,
         body,
         frontmatterYaml,
@@ -13465,7 +13464,7 @@ export class AgentSession {
 
       if (
         recentSnapshots.some(
-          (recent) => recent.skillName === skill.frontmatter.name && recent.sha256 === sha256
+          (recent) => recent.skillName === ref.skillName && recent.sha256 === sha256
         )
       ) {
         continue;
@@ -13478,7 +13477,7 @@ export class AgentSession {
           timestamp: Date.now(),
           synthetic: true,
           agentSkillSnapshot: {
-            skillName: skill.frontmatter.name,
+            skillName: ref.skillName,
             scope: skill.scope,
             sha256,
             frontmatterYaml,
@@ -13488,7 +13487,7 @@ export class AgentSession {
 
       // Defense-in-depth: avoid double-loading this skill within the same turn even if
       // future metadata shapes bypass extractAgentSkillRefs dedupe.
-      recentSnapshots.push({ skillName: skill.frontmatter.name, sha256 });
+      recentSnapshots.push({ skillName: ref.skillName, sha256 });
     }
 
     return snapshotMessages;

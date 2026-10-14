@@ -9,6 +9,7 @@ import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
 import { getErrorMessage } from "@/common/utils/errors";
+import { PlatformPaths } from "@/common/utils/paths";
 import { mcpServerConsentName, mcpServerDisplayName } from "@/common/utils/mcp/pluginServerKey";
 import { createBridgeRateLimiter, passesFrameGate } from "./artifactBridge";
 import { finalizeSandboxedDocument, parseArtifactHtml } from "./artifactDocument";
@@ -168,6 +169,23 @@ function inlineMaxHeight(): number {
 /** Allow waits for the arming delay and for a live client (offline it would dismiss the prompt). */
 function isAllowDisabled(armed: boolean, liveApi: unknown): boolean {
   return !armed || liveApi == null;
+}
+
+/** The domain prompt's text: the origins, and the project that keeps the approval. */
+function DomainsPromptText(props: { origins: readonly string[]; projectPath: string | null }) {
+  return (
+    <div className="text-foreground min-w-0 flex-1 break-words">
+      This view wants to reach: {props.origins.map((origin) => new URL(origin).host).join(", ")}
+      {/* For a task of a multi-project workspace this is the first project, not the task's own
+          (approvalProjectPathOf). */}
+      {props.projectPath != null && (
+        <span className="text-muted">
+          {" "}
+          (for project {PlatformPaths.getProjectName(props.projectPath)})
+        </span>
+      )}
+    </div>
+  );
 }
 
 export function McpAppFrame(props: {
@@ -523,10 +541,7 @@ export function McpAppFrame(props: {
           role="alert"
           className="border-border-light bg-background-secondary flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-xs"
         >
-          <div className="text-foreground min-w-0 flex-1 break-words">
-            This view wants to reach:{" "}
-            {domainsPrompt.map((origin) => new URL(origin).host).join(", ")}
-          </div>
+          <DomainsPromptText origins={domainsPrompt} projectPath={approvalProjectPath} />
           <button
             type="button"
             // Disabled briefly after the strip appears (confirmArming.ts), like the consent strip.

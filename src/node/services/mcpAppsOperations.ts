@@ -49,7 +49,19 @@ export type McpAppsContext = Pick<
  * workspaces. Its MCP config is resolved against its first project (attributionProjectPath), so
  * a server defined by that project's repo config or a project plugin belongs to that project.
  * A global server there has no single owner project: no approval applies and approving fails.
+ * A task of a multi-project workspace counts too (isMultiProjectRow), though it is not stored
+ * under `_multi` (#6181).
  */
+/**
+ * Whether a workspace row is multi-project: stored under `_multi`, or a task of a multi-project
+ * workspace, stored under its first project but keeping the parent's project list (Task.createMany).
+ */
+function isMultiProjectRow(workspace: { projectPath: string; projects?: unknown[] }): boolean {
+  return (
+    workspace.projectPath === MULTI_PROJECT_CONFIG_KEY || (workspace.projects?.length ?? 0) > 1
+  );
+}
+
 async function approvalProjectPathOf(
   context: McpAppsContext,
   workspaceId: string,
@@ -57,7 +69,7 @@ async function approvalProjectPathOf(
 ): Promise<string | null> {
   const workspace = context.config.findWorkspace(workspaceId);
   if (workspace == null) return null;
-  const multi = workspace.projectPath === MULTI_PROJECT_CONFIG_KEY;
+  const multi = isMultiProjectRow(workspace);
   const owner = multi ? workspace.attributionProjectPath : workspace.projectPath;
   const project =
     owner == null ? undefined : context.config.loadConfigOrDefault().projects.get(owner);

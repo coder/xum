@@ -430,6 +430,28 @@ export function focusMcpAppViewTab(workspaceId: string, toolCallId: string) {
 }
 
 /**
+ * Reloads asked for per view, by workspace and tool call. A host passes the count into its
+ * frame's key, so a bump remounts the frame and it loads the view again (McpAppFrame loads a
+ * view once per tool call). Used after an entry point ran again for a tab that is open.
+ */
+const reloadCounts = new Map<string, number>();
+
+/** Remount every frame that shows the view, so it loads the view again. */
+export function reloadMcpAppView(workspaceId: string, toolCallId: string): void {
+  const key = lookupKey(workspaceId, toolCallId);
+  reloadCounts.set(key, (reloadCounts.get(key) ?? 0) + 1);
+  emit();
+}
+
+/** The view's reload count: part of its frame's key. */
+export function useMcpAppViewReloadKey(workspaceId: string, toolCallId: string): number {
+  return useSyncExternalStore(
+    subscribe,
+    () => reloadCounts.get(lookupKey(workspaceId, toolCallId)) ?? 0
+  );
+}
+
+/**
  * Where a view is mounted outside its tool card: its app tab (also on phones, where the sidebar
  * shows full-screen). Counted per workspace, tool call and host, so every place that can show a
  * view yields to it and at most one live instance runs. "card" is an expanded tool card, which
