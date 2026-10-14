@@ -12,7 +12,6 @@ import { Switch } from "../Switch/Switch";
 import { formatTokens, type TokenMeterData } from "@/common/utils/tokens/tokenMeterUtils";
 import { cn } from "@/common/lib/utils";
 import { Toggle1MContext } from "../Toggle1MContext/Toggle1MContext";
-import { Skeleton } from "../Skeleton/Skeleton";
 import { COMPOSER_COMPACT_HIDE_CLASS, COMPOSER_CONTROL_HEIGHT_CLASS } from "@/constants/layout";
 
 /** Compact threshold tick mark for the button view */
@@ -287,7 +286,13 @@ export const ContextUsageIndicatorButton: React.FC<ContextUsageIndicatorButtonPr
             data-context-usage-percent
             className="text-muted counter-nums text-[10px] font-medium"
           >
-            {compactLabel ?? <Skeleton className="bg-surface-quaternary h-2 w-[3ch]" />}
+            {/* Static on purpose: the placeholder only stands in for the number (no pulse). */}
+            {compactLabel ?? (
+              <span
+                aria-hidden
+                className="bg-surface-quaternary inline-block h-2 w-[3ch] rounded"
+              />
+            )}
           </span>
         </button>
       </DialogTrigger>
