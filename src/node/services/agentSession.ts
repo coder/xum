@@ -13017,7 +13017,8 @@ export class AgentSession {
    * deleting it) is ignored. Entries this process already built win: they are what it sent.
    */
   private restoreMemoryContext(windowKey: string | undefined): Promise<void> {
-    if (windowKey === undefined) return Promise.resolve();
+    // A blank id (corrupted history row) is no usable key: skip persistence, never throw.
+    if (!windowKey) return Promise.resolve();
     this.memoryContextRestore ??= (async () => {
       const map = this.memoryContextByModelString;
       const saved = await this.memoryContextStore.load();
@@ -13042,7 +13043,7 @@ export class AgentSession {
     options: { force: boolean }
   ): Promise<void> {
     // A rollover can swap the live map while a build is awaited.
-    if (windowKey === undefined || cache !== this.memoryContextByModelString) return;
+    if (!windowKey || cache !== this.memoryContextByModelString) return;
     if (!options.force && this.savedMemoryContextWindowKey === windowKey) return;
     // Record the key only after a confirmed write, so a failed save is retried on the next hit.
     if (await this.memoryContextStore.save(windowKey, cache)) {

@@ -442,6 +442,28 @@ describe("AgentSession memory context", () => {
     }
   });
 
+  // History deserialization accepts an empty row id. A corrupted first row must only skip
+  // persistence, not fail every send of the workspace.
+  test("builds the context without saving when the window key is blank", async () => {
+    const { historyService, config, cleanup } = await createTestHistoryService();
+    historyCleanup = cleanup;
+
+    const buildMemorySessionContext = mock(() =>
+      Promise.resolve<MemorySessionContext>({
+        indexEntries: [],
+        hotMemoriesBlock: "<hot_memories>v1</hot_memories>",
+      })
+    );
+    const session = await createSession({ historyService, config, buildMemorySessionContext });
+    try {
+      expect((await resolveInWindow(session, "test-model", ""))?.hotMemoriesBlock).toBe(
+        "<hot_memories>v1</hot_memories>"
+      );
+    } finally {
+      await session.dispose();
+    }
+  });
+
   test("rebuilds the context when the saved file is malformed", async () => {
     const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
