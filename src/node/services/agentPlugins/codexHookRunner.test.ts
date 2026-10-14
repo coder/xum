@@ -679,6 +679,21 @@ describe("PostToolUse", () => {
     }
   });
 
+  test("the joined feedback of many blocking PostToolUse hooks is capped", async () => {
+    // Codex PRRT_kwDOPxxmWM6sWuO7: up to MAX_PLUGIN_HOOKS hooks can each block.
+    const reason = "r".repeat(15 * 1024);
+    const { spine } = setup(
+      [1, 2, 3].map((n) => hook("PostToolUse", { input: { n } })),
+      () => json({ decision: "block", reason })
+    );
+
+    const ctx = await runTool(spine, "bash", {});
+
+    const error = (ctx.result as { error: string }).error;
+    expect(error.length).toBeLessThan(33 * 1024);
+    expect(error.endsWith("[plugin hook context cut]")).toBe(true);
+  });
+
   test("the joined context of one call is capped", async () => {
     // Codex PRRT_kwDOPxxmWM6rPqkc: each note is capped, the join is capped too.
     const note = "x".repeat(15 * 1024);
