@@ -297,7 +297,6 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     setError(null);
   }, [persistedKey, cancelPendingGeneration]);
 
-  // Read by storeGeneratedIdentity.
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
