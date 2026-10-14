@@ -10505,10 +10505,10 @@ export class TaskService implements AgentTaskIntegration {
       // Same rule for tag links: both endpoints' generations are captured here and in
       // the parked wait, so restoring the same tag string after a revocation is a new
       // link and cannot revive a message admitted under the previous one.
-      const tagGenerations = {
-        sender: senderEntry.workspace.messagingTagGeneration,
-        target: targetEntry.workspace.messagingTagGeneration,
-      };
+      const tagGenerations = this.messagingTagGenerationsOf(
+        senderEntry.workspace,
+        targetEntry.workspace
+      );
       if (
         awaitedDelegatedTurn != null &&
         this.tagGenerationMismatch(relation, awaitedDelegatedTurn.tagGenerations, tagGenerations)
@@ -11000,10 +11000,11 @@ export class TaskService implements AgentTaskIntegration {
         // The relation can re-resolve as tagged after a clear/re-tag cycle with the
         // same string; the generation fence is what permanently invalidates the send.
         if (
-          this.tagGenerationMismatch(relation, tagGenerations, {
-            sender: freshSender.workspace.messagingTagGeneration,
-            target: freshEntry.workspace.messagingTagGeneration,
-          })
+          this.tagGenerationMismatch(
+            relation,
+            tagGenerations,
+            this.messagingTagGenerationsOf(freshSender.workspace, freshEntry.workspace)
+          )
         ) {
           admissionRefusal = { code: "invalid_scope" as const };
           return true;
@@ -16134,6 +16135,21 @@ export class TaskService implements AgentTaskIntegration {
     return relation === "target_tagged" && !this.messagingTagGenerationsEqual(expected, actual);
   }
 
+  /**
+   * Config loads leniently, so a corrupted generation may be a non-string whose identity
+   * changes on every config reparse. Read only valid strings (else undefined) so corrupted
+   * state can never manufacture a spurious revocation.
+   */
+  private messagingTagGenerationsOf(
+    sender: WorkspaceConfigEntry,
+    target: WorkspaceConfigEntry
+  ): { sender: string | undefined; target: string | undefined } {
+    return {
+      sender: coerceNonEmptyString(sender.messagingTagGeneration),
+      target: coerceNonEmptyString(target.messagingTagGeneration),
+    };
+  }
+
   private messagingTagGenerationsEqual(
     a: { sender: string | undefined; target: string | undefined } | undefined,
     b: { sender: string | undefined; target: string | undefined } | undefined
@@ -16504,15 +16520,28 @@ export class TaskService implements AgentTaskIntegration {
     const candidates = Array.from(cfg.projects.values()).flatMap((project) => project.workspaces);
     return candidates.flatMap((candidate) => {
       const info = this.getRelatedChatInfo(caller, candidate);
-      if (
-        info == null ||
-        this.isInactivePeerMessagingEndpoint(candidate, info.workspaceId) ||
-        this.isPeerMessagingRestricted(index, info.workspaceId)
-      ) {
+      if (info == null || !this.isDiscoverableRelatedChat(index, candidate, info.workspaceId)) {
         return [];
       }
       return [info];
     });
+  }
+
+  /**
+   * Discovery mirrors admission: inactive, restricted, or user-stopped chats are hidden, since
+   * sendTreeMessage refuses a stopped target chain regardless of relationship.
+   */
+  private isDiscoverableRelatedChat(
+    index: AgentTaskIndex,
+    candidate: WorkspaceConfigEntry,
+    workspaceId: string
+  ): boolean {
+    return !(
+      this.isInactivePeerMessagingEndpoint(candidate, workspaceId) ||
+      this.isPeerMessagingRestricted(index, workspaceId) ||
+      this.interruptedParentWorkspaceIds.has(workspaceId) ||
+      this.isWorkspaceStopInProgress(workspaceId)
+    );
   }
 
   // --- Internal orchestration ---

@@ -252,6 +252,44 @@ describe("TaskService tagged-chat messaging", () => {
     expect(admissionStale?.()).toBe(true);
   });
 
+  test("a corrupted non-string generation cannot manufacture a revocation", async () => {
+    const { config } = await setup();
+    // Config loads leniently: simulate a corrupted persisted generation object.
+    const corrupted: unknown = { corrupted: true };
+    await updateWorkspace(config, "beta", { messagingTagGeneration: corrupted as string });
+    const sendMessage = mock((...args: Parameters<WorkspaceHost["sendMessage"]>) => {
+      expect(args[3]?.admissionStale?.()).toBe(false);
+      return Promise.resolve(Ok(undefined));
+    });
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    expect(await taskService.sendAgentTreeMessage("alpha", "beta", "queued")).toMatchObject({
+      success: true,
+      data: { delivery: "queued" },
+    });
+    const admissionStale = sendMessage.mock.calls[0][3]?.admissionStale;
+    // An unrelated rewrite reparses the corrupted object with a new identity; neither tag changed.
+    await updateWorkspace(config, "beta", { title: "renamed" });
+    expect(admissionStale?.()).toBe(false);
+  });
+
+  test("user-stopped tagged roots disappear from discovery", async () => {
+    const { config } = await setup();
+    const { taskService } = createTaskServiceHarness(config);
+    taskService.markParentWorkspaceInterrupted("beta");
+    // Admission refuses a stopped target chain, so discovery must not advertise it.
+    expect(taskService.listTaskTreeAgents("alpha").relatedChats).toEqual([
+      { workspaceId: "peer3", title: "peer3", relationship: "tagged" },
+      { workspaceId: "side", title: "side", relationship: "side_chat" },
+    ]);
+    taskService.resetAutoResumeCount("beta");
+    expect(taskService.listTaskTreeAgents("alpha").relatedChats).toContainEqual({
+      workspaceId: "beta",
+      title: "beta",
+      relationship: "tagged",
+    });
+  });
+
   test("a generation change during send preparation refuses even with the same tag", async () => {
     const { config } = await setup();
     const sendMessage = mock(async (...args: Parameters<WorkspaceHost["sendMessage"]>) => {
