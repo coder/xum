@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { DRAFT_ID_PATTERN } from "@/constants/drafts";
+import { DEFAULT_CREATION_DRAFT_ID, DRAFT_ID_PATTERN } from "@/constants/drafts";
 import { SendIdSchema, SendMessageOptionsSchema } from "./stream";
 
 /**
@@ -10,13 +10,15 @@ import { SendIdSchema, SendMessageOptionsSchema } from "./stream";
  * a draft id uses a fixed draft id (see defaultCreationDraftScope). The legacy renderer pending
  * scope (getPendingScopeId) is never a backend scope.
  */
+const CreationDraftScopeSchema = z.object({
+  kind: z.literal("creation"),
+  projectPath: z.string().min(1),
+  draftId: z.string().regex(DRAFT_ID_PATTERN),
+});
+
 export const DraftScopeSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("workspace"), workspaceId: z.string().min(1) }),
-  z.object({
-    kind: z.literal("creation"),
-    projectPath: z.string().min(1),
-    draftId: z.string().regex(DRAFT_ID_PATTERN),
-  }),
+  CreationDraftScopeSchema,
 ]);
 
 const ProviderDraftAttachmentSchema = z.object({
@@ -273,6 +275,35 @@ export const DraftListEntrySchema = z.object({
   createdAt: z.number(),
 });
 
+/**
+ * Move a creation draft (the project's default draft or a listed one) to a new listed draft, in
+ * the same project or another: body and list row together, then the source is deleted.
+ */
+export const DraftMoveCreationInputSchema = z.object({
+  source: CreationDraftScopeSchema,
+  /** The source revision the client last confirmed; null when it knows of no stored source. */
+  sourceRevision: DraftRevisionSchema.nullable(),
+  /** A fresh draft id the client minted: a retry after a lost reply must find only its move. */
+  dest: CreationDraftScopeSchema.refine((scope) => scope.draftId !== DEFAULT_CREATION_DRAFT_ID, {
+    message: "The default creation draft is never a move destination",
+  }),
+  subProjectPath: z.string().min(1).nullable(),
+  createdAt: z.number(),
+});
+
+/**
+ * "moved": the destination's stored view and the list revision. "changed": the source changed
+ * since `sourceRevision` (its current revision); nothing was written.
+ */
+export const DraftMoveCreationOutputSchema = z.discriminatedUnion("result", [
+  z.object({
+    result: z.literal("moved"),
+    dest: DraftWriteOutputSchema,
+    listRevision: DraftRevisionSchema,
+  }),
+  z.object({ result: z.literal("changed"), revision: DraftRevisionSchema }),
+]);
+
 /** A creation draft deleted by a project removal (never the default draft). */
 export const RemovedCreationDraftSchema = DraftListEntrySchema.pick({
   projectPath: true,
@@ -322,4 +353,6 @@ export type DraftImportLegacyOutput = z.infer<typeof DraftImportLegacyOutputSche
 export type DraftEvent = z.infer<typeof DraftEventSchema>;
 export type DraftListEntry = z.infer<typeof DraftListEntrySchema>;
 export type DraftList = z.infer<typeof DraftListSchema>;
+export type DraftMoveCreationInput = z.infer<typeof DraftMoveCreationInputSchema>;
+export type DraftMoveCreationOutput = z.infer<typeof DraftMoveCreationOutputSchema>;
 export type RemovedCreationDraft = z.infer<typeof RemovedCreationDraftSchema>;

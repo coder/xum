@@ -838,6 +838,10 @@ export const router = (authToken?: string) => {
         .input(schemas.drafts.putListEntry.input)
         .output(schemas.drafts.putListEntry.output)
         .handler(({ context, input }) => context.draftService.putListEntry(input)),
+      moveCreation: t
+        .input(schemas.drafts.moveCreation.input)
+        .output(schemas.drafts.moveCreation.output)
+        .handler(({ context, input }) => context.draftService.moveCreation(input)),
       importLegacyList: t
         .input(schemas.drafts.importLegacyList.input)
         .output(schemas.drafts.importLegacyList.output)

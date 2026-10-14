@@ -138,6 +138,8 @@ import {
   DraftImportLegacyOutputSchema,
   DraftListEntrySchema,
   DraftListSchema,
+  DraftMoveCreationInputSchema,
+  DraftMoveCreationOutputSchema,
   DraftResolveSendsInputSchema,
   DraftResolveSendsOutputSchema,
   DraftRevisionOutputSchema,
@@ -3777,6 +3779,11 @@ export const drafts = {
   putListEntry: {
     input: DraftListEntrySchema,
     output: DraftRevisionOutputSchema,
+  },
+  /** Move a creation draft's body and row to a new listed draft in one step (see the schema). */
+  moveCreation: {
+    input: DraftMoveCreationInputSchema,
+    output: DraftMoveCreationOutputSchema,
   },
   /** One-way import of the legacy localStorage list (never clobbers). Output: the list revision. */
   importLegacyList: {

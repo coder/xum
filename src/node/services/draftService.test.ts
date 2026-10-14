@@ -1120,3 +1120,178 @@ describe("DraftService workspace name state", () => {
     });
   });
 });
+
+describe("DraftService moveCreation", () => {
+  const nameState = {
+    generatedIdentity: null,
+    manualName: "move-me",
+    autoGenerate: false,
+    lastGeneratedFor: "",
+  };
+
+  async function createMoveHarness(tempDir: TestTempDir) {
+    const harness = await createHarness(tempDir);
+    const otherProject = path.join(tempDir.path, "other");
+    await fs.mkdir(otherProject, { recursive: true });
+    await harness.config.addWorkspace(otherProject, {
+      id: "other-ws",
+      name: "other-branch",
+      projectPath: otherProject,
+      projectName: "other",
+      runtimeConfig: { type: "local" },
+    });
+    const service = new DraftService(harness.config);
+    const events: DraftEvent[] = [];
+    service.on(DraftService.CHANGE_EVENT, (event: DraftEvent) => events.push(event));
+    return { ...harness, otherProject, service, events };
+  }
+
+  it("moves the body, name and row to another project and deletes the source", async () => {
+    using tempDir = new TestTempDir("drafts-move");
+    const { config, projectPath, otherProject, service, events } = await createMoveHarness(tempDir);
+    const source: DraftScope = { kind: "creation", projectPath, draftId: "src" };
+    await service.putListEntry({ projectPath, draftId: "src", subProjectPath: null, createdAt: 1 });
+    const written = await service.update({
+      scope: source,
+      text: "ship it",
+      attachments: [image],
+      nameState,
+    });
+    events.length = 0;
+    const dest = { kind: "creation" as const, projectPath: otherProject, draftId: "dst" };
+
+    const reply = await service.moveCreation({
+      source,
+      sourceRevision: written.revision,
+      dest,
+      subProjectPath: null,
+      createdAt: 1,
+    });
+
+    expect(reply).toMatchObject({ result: "moved", dest: { text: "ship it", nameState } });
+    const restarted = new DraftService(config);
+    expect(await restarted.get(dest)).toMatchObject({ text: "ship it", nameState });
+    expect((await restarted.get(dest)).attachments).toEqual([image]);
+    expect(await restarted.get(source)).toMatchObject({ text: "", attachments: [] });
+    expect((await restarted.getList()).entries).toEqual([
+      { projectPath: otherProject, draftId: "dst", subProjectPath: null, createdAt: 1 },
+    ]);
+    // Other windows learn every part of it.
+    expect(events.map((event) => event.type)).toEqual(["changed", "deleted", "list"]);
+  });
+
+  it("moves the default draft and an empty draft's row, to the scratch project too", async () => {
+    using tempDir = new TestTempDir("drafts-move-default");
+    const { projectPath, service } = await createMoveHarness(tempDir);
+    const defaultScope: DraftScope = {
+      kind: "creation",
+      projectPath,
+      draftId: DEFAULT_CREATION_DRAFT_ID,
+    };
+    const written = await service.update({ scope: defaultScope, text: "from the project page" });
+    const scratch = {
+      kind: "creation" as const,
+      projectPath: SCRATCH_PROJECT_CONFIG_KEY,
+      draftId: "s",
+    };
+    await service.moveCreation({
+      source: defaultScope,
+      sourceRevision: written.revision,
+      dest: scratch,
+      subProjectPath: null,
+      createdAt: 2,
+    });
+    expect((await service.get(scratch)).text).toBe("from the project page");
+    expect((await service.get(defaultScope)).text).toBe("");
+
+    // A listed draft without a body moves its row only.
+    await service.putListEntry({
+      projectPath,
+      draftId: "empty",
+      subProjectPath: null,
+      createdAt: 3,
+    });
+    const emptySource = { kind: "creation" as const, projectPath, draftId: "empty" };
+    await service.moveCreation({
+      source: emptySource,
+      sourceRevision: null,
+      dest: { kind: "creation", projectPath, draftId: "moved-empty" },
+      subProjectPath: "sub",
+      createdAt: 3,
+    });
+    expect((await service.getList()).entries.map(({ draftId }) => draftId)).toEqual([
+      "s",
+      "moved-empty",
+    ]);
+  });
+
+  it("answers changed and writes nothing when the source changed since the given revision", async () => {
+    using tempDir = new TestTempDir("drafts-move-changed");
+    const { projectPath, otherProject, service } = await createMoveHarness(tempDir);
+    const source: DraftScope = { kind: "creation", projectPath, draftId: "src" };
+    const seen = await service.update({ scope: source, text: "first" });
+    // Another window types meanwhile.
+    const newer = await service.update({ scope: source, text: "first and more" });
+    const dest = { kind: "creation" as const, projectPath: otherProject, draftId: "dst" };
+    const input = {
+      source,
+      sourceRevision: seen.revision,
+      dest,
+      subProjectPath: null,
+      createdAt: 1,
+    };
+
+    expect(await service.moveCreation(input)).toEqual({
+      result: "changed",
+      revision: newer.revision,
+    });
+    expect((await service.get(source)).text).toBe("first and more");
+    expect((await service.get(dest)).text).toBe("");
+    expect((await service.getList()).entries).toEqual([]);
+    // A source the client never saw stored has changed too.
+    expect((await service.moveCreation({ ...input, sourceRevision: null })).result).toBe("changed");
+  });
+
+  it("answers moved to a retry after a lost reply", async () => {
+    using tempDir = new TestTempDir("drafts-move-retry");
+    const { projectPath, otherProject, service, events } = await createMoveHarness(tempDir);
+    const source: DraftScope = { kind: "creation", projectPath, draftId: "src" };
+    const written = await service.update({ scope: source, text: "once", nameState });
+    const input = {
+      source,
+      sourceRevision: written.revision,
+      dest: { kind: "creation" as const, projectPath: otherProject, draftId: "dst" },
+      subProjectPath: null,
+      createdAt: 1,
+    };
+    // No list.json yet: writing it relists bodies without a row, which must not catch the source.
+    const first = await service.moveCreation(input);
+    expect((await service.getList()).entries.map(({ draftId }) => draftId)).toEqual(["dst"]);
+    events.length = 0;
+
+    expect(await service.moveCreation(input)).toEqual(first);
+    expect(events).toEqual([]);
+  });
+
+  it("refuses an unowned destination and keeps the source", async () => {
+    using tempDir = new TestTempDir("drafts-move-unowned");
+    const { projectPath, service } = await createMoveHarness(tempDir);
+    const source: DraftScope = { kind: "creation", projectPath, draftId: "src" };
+    await service.putListEntry({ projectPath, draftId: "src", subProjectPath: null, createdAt: 1 });
+    const written = await service.update({ scope: source, text: "keep me" });
+
+    let refused: unknown;
+    await service
+      .moveCreation({
+        source,
+        sourceRevision: written.revision,
+        dest: { kind: "creation", projectPath: path.join(tempDir.path, "gone"), draftId: "dst" },
+        subProjectPath: null,
+        createdAt: 1,
+      })
+      .catch((error: unknown) => (refused = error));
+    expect(refused).toBeInstanceOf(Error);
+    expect((await service.get(source)).text).toBe("keep me");
+    expect((await service.getList()).entries.map(({ draftId }) => draftId)).toEqual(["src"]);
+  });
+});

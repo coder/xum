@@ -31,6 +31,8 @@ import {
   type DraftImportLegacyOutput,
   type DraftList,
   type DraftListEntry,
+  type DraftMoveCreationInput,
+  type DraftMoveCreationOutput,
   type DraftScope,
   type DraftSetSendReceiverInput,
   type DraftSummary,
@@ -73,7 +75,7 @@ import {
  *   storing projectPath inside the file. Deleted by `delete`, by project removal
  *   (deleteProjectDrafts) and by the startup GC (collectOrphanedCreationDrafts).
  * - The creation draft list (sidebar rows, including empty drafts): `<xumRoot>/drafts/list.json`.
- *   Only `delete`, putListEntry, importLegacyList, project removal, the GC and the snapshot's
+ *   Only `delete`, putListEntry, moveCreation, importLegacyList, project removal, the GC and the snapshot's
  *   relisting of bodies without a row change it; clearing a draft's text never delists it.
  *   `delete` removes the body, then the entry, under the body lock: a crash in between leaves an
  *   empty listed row. Lock order: a project's drafts dir (body) lock, then the list lock; nothing
@@ -614,6 +616,75 @@ export class DraftService extends EventEmitter {
       }
       return { revision };
     });
+  }
+
+  /**
+   * Move a creation draft (the default draft or a listed one) to a new listed draft in one step:
+   * body (text, attachments, name state) and row together, then the source goes. Under both
+   * projects' dir locks, then the list lock (the class comment's order). A crash loses no content:
+   * after the destination body, that body is unlisted (the next snapshot relists it) next to the
+   * intact source; after the source body's delete, the destination is still relisted that way,
+   * and a listed source stays as an empty row. A retry after a lost reply finds the destination
+   * listed and the source gone, and answers "moved". An unowned destination throws, so the client
+   * keeps the source.
+   */
+  async moveCreation(input: DraftMoveCreationInput): Promise<DraftMoveCreationOutput> {
+    const { source, dest } = input;
+    assert(dest.draftId !== DEFAULT_CREATION_DRAFT_ID, "a draft move never targets the default");
+    assert(draftScopeKey(source) !== draftScopeKey(dest), "a draft move needs a new destination");
+    const dirs = [source, dest].map((scope) => this.projectDraftsDir(scope.projectPath));
+    return withTargetMutationLocks(this.config.rootDir, dirs, async () => {
+      const stored = await this.load(source);
+      if (stored === null && isMoveDone((await this.readListFile()).entries, source, dest)) {
+        return this.movedOutput(dest, this.listRevision);
+      }
+      if (!(await this.hasOwner(dest))) {
+        throw new Error(`Draft move refused: project ${dest.projectPath} is not configured`);
+      }
+      const revision = this.getRevision(draftScopeKey(source));
+      if (stored !== null && revision !== input.sourceRevision) {
+        return { result: "changed", revision };
+      }
+      return this.moveStoredCreation(input, stored ?? emptyStoredDraft());
+    });
+  }
+
+  private async moveStoredCreation(
+    input: DraftMoveCreationInput,
+    stored: StoredDraft
+  ): Promise<DraftMoveCreationOutput> {
+    const { source, dest } = input;
+    // beginSend takes workspace scopes only, so this guards a future change: moving a pending
+    // send's retained text would detach it from its send.
+    if (stored.pendingSends.length > 0) {
+      throw new Error("Draft move refused: the source draft has pending sends");
+    }
+    if (!isStoredDraftEmpty(stored)) await this.persist(dest, this.filePathFor(dest), stored);
+    // Before the list write: writing a missing or damaged list relists every unlisted body.
+    await this.persist(source, this.filePathFor(source), emptyStoredDraft());
+    const row: DraftListEntry = {
+      projectPath: dest.projectPath,
+      draftId: dest.draftId,
+      subProjectPath: input.subProjectPath,
+      createdAt: input.createdAt,
+    };
+    // The destination may hold a synthesized row: its body's relisting after a crashed attempt.
+    const listRevision = await this.mutateList((entries) => [
+      ...entries.filter(
+        (listed) => ![source, dest].some((scope) => isSameListEntry(listed, scope))
+      ),
+      toApiEntry(row),
+    ]);
+    return this.movedOutput(dest, listRevision);
+  }
+
+  private async movedOutput(
+    dest: CreationScope,
+    listRevision: number
+  ): Promise<DraftMoveCreationOutput> {
+    const revision = this.getRevision(draftScopeKey(dest));
+    const stored = (await this.load(dest)) ?? emptyStoredDraft();
+    return { result: "moved", dest: writeOutput(dest, stored, revision), listRevision };
   }
 
   /**
@@ -1353,6 +1424,16 @@ export class DraftService extends EventEmitter {
 function toApiEntry(entry: DraftListFileEntry): DraftListEntry {
   const { synthesized: _synthesized, ...apiEntry } = entry;
   return apiEntry;
+}
+
+/** A move's retry after a lost reply: its destination is listed and its source is not. */
+function isMoveDone(
+  entries: readonly DraftListFileEntry[],
+  source: CreationScope,
+  dest: CreationScope
+): boolean {
+  const listed = (scope: CreationScope) => entries.some((entry) => isSameListEntry(entry, scope));
+  return listed(dest) && !listed(source);
 }
 
 function isSameListEntry(
