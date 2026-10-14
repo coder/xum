@@ -14,6 +14,7 @@ import {
 } from "./mcpOauthService";
 import type { OAuthClientProvider, OAuthDiscoveryState } from "@modelcontextprotocol/client";
 import { Ok } from "@/common/types/result";
+import type { Result } from "@/common/types/result";
 import type { MCPServerOAuthConfig } from "@/common/types/mcp";
 import type {
   MCPOAuthClientInformation,
@@ -1665,19 +1666,17 @@ describe("McpOauthService OAuth flows", () => {
     expect(await provider.tokens()).toBeUndefined();
   });
 
-  test("a sign-in whose server renames the granted scopes stays signed in (#6564)", async () => {
+  /** One server sign-in whose token endpoint answers `grant`; `check` runs before the stub closes. */
+  const signInWithGrant = async (
+    grant: Record<string, unknown>,
+    oauth: MCPServerOAuthConfig,
+    check: (serverUrl: string, result: Result<void, string>) => Promise<void>
+  ): Promise<void> => {
     const server = createServer((req, res) => {
       const pathname = (req.url ?? "/").split("?")[0];
       if (pathname === "/token") {
         res.writeHead(200, { "content-type": "application/json" });
-        // Entra-style: the request names `.default`, the grant lists the permissions.
-        res.end(
-          JSON.stringify({
-            access_token: "at",
-            token_type: "Bearer",
-            scope: "User.Read Files.Read",
-          })
-        );
+        res.end(JSON.stringify({ access_token: "at", token_type: "Bearer", ...grant }));
         return;
       }
       if (pathname === "/.well-known/oauth-authorization-server") {
@@ -1694,12 +1693,7 @@ describe("McpOauthService OAuth flows", () => {
       if (!address || typeof address === "string") throw new Error("Failed to bind");
       const serverUrl = `http://127.0.0.1:${address.port}/mcp`;
       spyOn(mcpConfigService, "listServers").mockResolvedValue({
-        docs: {
-          transport: "http",
-          url: serverUrl,
-          disabled: true,
-          oauth: { clientId: "c", baseScopes: ["api://app/.default"] },
-        },
+        docs: { transport: "http", url: serverUrl, disabled: true, oauth },
       });
       const start = await service.startServerFlow({
         projectPath,
@@ -1713,8 +1707,29 @@ describe("McpOauthService OAuth flows", () => {
         iss: null,
         error: null,
       });
+      await check(serverUrl, result);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  };
+
+  test("a sign-in granted less than the plugin's base scopes fails and stores no token (#6141)", async () => {
+    const oauth = { clientId: "c", baseScopes: ["read", "write"] };
+    await signInWithGrant({ scope: "read" }, oauth, async (serverUrl, result) => {
+      expect(result.success).toBe(false);
+      // The reason names the request and the grant (#6564).
+      expect(result.success ? "" : result.error).toContain(
+        'requested "read write", granted "read"'
+      );
+      expect(await service.hasAuthTokens({ serverUrl })).toBe(false);
+    });
+  });
+
+  test("a sign-in whose server renames the granted scopes stays signed in (#6564)", async () => {
+    const oauth = { clientId: "c", baseScopes: ["api://app/.default"] };
+    // Entra-style: the request names `.default`, the grant lists the permissions.
+    await signInWithGrant({ scope: "User.Read Files.Read" }, oauth, async (serverUrl, result) => {
       expect(result.success).toBe(true);
-      const oauth = { clientId: "c", baseScopes: ["api://app/.default"] };
       expect(await service.hasAuthTokens({ serverUrl, oauth })).toBe(true);
       expect((await service.getAuthStatus({ serverUrl, oauth })).isLoggedIn).toBe(true);
       // A plugin that needs more than that sign-in requested reads as signed out.
@@ -1724,9 +1739,38 @@ describe("McpOauthService OAuth flows", () => {
           oauth: { clientId: "c", baseScopes: ["api://app/.default", "offline_access"] },
         })
       ).toBe(false);
-    } finally {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    }
+    });
+  });
+
+  test("a sign-in granted the URL form of a short scope name stays signed in (#6564)", async () => {
+    const oauth = { clientId: "c", baseScopes: ["email"] };
+    // Google-style: the request names `email`, the grant its URL form.
+    const grant = { scope: "https://www.googleapis.com/auth/userinfo.email openid" };
+    await signInWithGrant(grant, oauth, async (serverUrl, result) => {
+      expect(result.success).toBe(true);
+      expect(await service.hasAuthTokens({ serverUrl, oauth })).toBe(true);
+    });
+  });
+
+  test("a server-supplied requested_scope does not replace Xum's record (#6564)", async () => {
+    const oauth = { clientId: "c", baseScopes: ["read", "write"] };
+    const grant = { scope: "read write", requested_scope: "read" };
+    await signInWithGrant(grant, oauth, async (serverUrl, result) => {
+      expect(result.success).toBe(true);
+      expect(await service.hasAuthTokens({ serverUrl, oauth })).toBe(true);
+      // A refresh answer with its own requested_scope keeps the record too.
+      const provider = await service.getAuthProviderForServer({ serverUrl, oauth });
+      if (provider === undefined) throw new Error("expected a provider");
+      await provider.clientInformation();
+      await provider.tokens(authCtx);
+      await provider.saveTokens({
+        access_token: "refreshed",
+        token_type: "Bearer",
+        scope: "renamed",
+        requested_scope: "read",
+      } as never);
+      expect(await service.hasAuthTokens({ serverUrl, oauth })).toBe(true);
+    });
   });
 
   test("a server without a provided client never uses another plugin's provided-client sign-in (#6159)", async () => {

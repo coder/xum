@@ -358,25 +358,48 @@ function missingBaseScopes(
 /**
  * The scope fields an interactive grant stores. A grant without scope is the requested scope
  * (RFC 6749 §5.1). The request is recorded too: the base-scope check compares it, not the
- * granted names, because some servers rename granted scopes (#6564). A grant that names fewer
- * scopes than requested is kept: Xum cannot tell a renamed scope from a declined one. The
- * request and the grant are logged, so a plugin author can see the mismatch.
+ * granted names, because some servers rename granted scopes (#6564).
+ *
+ * A grant that only names requested scopes and lacks a base scope is a narrower grant: the
+ * sign-in fails, because those tokens cannot serve the plugin (#6141). A grant that names a
+ * scope outside the request is renamed (Entra permissions for `.default`, Google URL forms of
+ * short names): Xum cannot tell which requested scope it covers, so it keeps it and logs both.
  */
 function grantScopeFields(
   granted: string | undefined,
   flow: Pick<OAuthFlowBase, "scope" | "plugin">
 ): { scope?: string; requested_scope?: string } {
   const scope = granted ?? flow.scope;
-  const missing = missingBaseScopes(scope, flow.plugin?.config);
-  if (missing.length > 0)
-    log.warn("[MCP OAuth] The granted scope does not name every requested base scope", {
-      requested: flow.scope,
-      granted: scope,
-    });
+  if (missingBaseScopes(scope, flow.plugin?.config).length > 0)
+    refuseNarrowerGrant(scope, flow.scope);
   return {
     ...(scope !== undefined ? { scope } : {}),
     ...(flow.scope !== undefined ? { requested_scope: flow.scope } : {}),
   };
+}
+
+/** Throws for a narrower grant (only requested names); logs a renamed one (see grantScopeFields). */
+function refuseNarrowerGrant(granted: string | undefined, requested: string | undefined): void {
+  const requestedNames = scopeSet(requested !== undefined ? [requested] : []);
+  const grantedNames = scopeSet(granted !== undefined ? [granted] : []);
+  if (![...grantedNames].some((name) => !requestedNames.has(name)))
+    throw new Error(
+      `The authorization server granted less than the plugin requires: requested "${requested ?? ""}", granted "${granted ?? ""}"`
+    );
+  log.warn("[MCP OAuth] The granted scope does not name every requested base scope", {
+    requested,
+    granted,
+  });
+}
+
+/**
+ * SDK tokens from a token response. `requested_scope` is Xum's own record of the request, so a
+ * server-supplied field of that name is dropped: it must not decide the base-scope check.
+ */
+function serverTokens(tokens: Parameters<OAuthClientProvider["saveTokens"]>[0]): MCPOAuthTokens {
+  const copy: MCPOAuthTokens = { ...tokens };
+  delete copy.requested_scope;
+  return copy;
 }
 
 /**
@@ -1820,8 +1843,7 @@ export class McpOauthService {
         const scopes = grantScopeFields(tokens.scope, flow);
         await this.saveTokens({
           serverUrl: flow.serverUrlForStoreKey,
-          // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-          tokens: { ...tokens, ...scopes } as unknown as MCPOAuthTokens,
+          tokens: { ...serverTokens(tokens), ...scopes },
           legacyBinding: deriveAuthorizationServerBinding(flow.discoveryState),
           flowGeneration: flow.signOutGeneration,
           clientId: flow.clientInformation?.client_id ?? flow.plugin?.config.clientId,
@@ -1935,8 +1957,7 @@ export class McpOauthService {
       saveTokens: async (tokens) => {
         await this.saveTokens({
           serverUrl: input.serverUrl,
-          // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-          tokens: tokens as unknown as MCPOAuthTokens,
+          tokens: serverTokens(tokens),
           legacyBinding: deriveAuthorizationServerBinding(discoveryState),
           clientId: refreshedWithClientId ?? input.oauth?.clientId,
           refreshedFrom,
