@@ -93,6 +93,8 @@ async function createHarness(tempDir: TestTempDir) {
   const hooks = {
     beforeUpdate: null as null | (() => Promise<void>),
     beforeBeginSend: null as null | (() => Promise<void>),
+    /** Holds the next subscription's snapshot (a slow reconnect). */
+    beforeSubscribe: null as null | (() => Promise<void>),
     loseBeginSendReply: false,
   };
   const drafts = {
@@ -123,6 +125,9 @@ async function createHarness(tempDir: TestTempDir) {
         input
       ),
     subscribe: async (_input: void, opts?: { signal?: AbortSignal }) => {
+      const hold = hooks.beforeSubscribe;
+      hooks.beforeSubscribe = null;
+      await hold?.();
       const queue: DraftEvent[] = [];
       let wake: (() => void) | null = null;
       const listener = (event: DraftEvent) => {
@@ -813,5 +818,33 @@ describe("DraftStore idempotent sends", () => {
     store.setText(SCOPE, "typed after the switch");
     await store.flush(SCOPE);
     expect(store.getText(SCOPE)).toBe("typed after the switch");
+  });
+
+  // #6438: a reconnect forgets the backend's views, not the pending sends: until its snapshot,
+  // the send stays retained (its text hidden, its id pending), so it is never shown twice.
+  test("a reconnect keeps the pending sends until the new snapshot", async () => {
+    using tempDir = new TestTempDir("draft-sends-reconnect-pending");
+    const { client, receiver, hooks } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    store.setText(SCOPE, "hello");
+    receiver.statuses.set("s1", "pending");
+    const request = pendingSend("s1", "hello", RECEIVER).request;
+    await store.beginSend(SCOPE, { sendId: "s1", text: "hello", attachments: [], request });
+    expect(await store.settleSend(SCOPE, "s1")).toBe("pending");
+
+    store.setClient(null);
+    let releaseSnapshot: () => void = () => undefined;
+    hooks.beforeSubscribe = () =>
+      new Promise<void>((resolve) => {
+        releaseSnapshot = resolve;
+      });
+    store.setClient(client);
+    expect([...store.getPendingSendIds(SCOPE)]).toEqual(["s1"]);
+    expect(store.getText(SCOPE)).toBe("");
+    releaseSnapshot();
+    await waitFor(() => store.isHydrated());
+    expect([...store.getPendingSendIds(SCOPE)]).toEqual(["s1"]);
+    expect(store.getText(SCOPE)).toBe("");
   });
 });
