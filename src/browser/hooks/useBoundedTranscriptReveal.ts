@@ -135,9 +135,8 @@ function storedSliceEnd(state: RevealState, rows: readonly RevealRow[], isSafeCu
 }
 
 /**
- * Where a slice starting at `fromIndex` ends. Order of operations (#4961 F20): the start is settled
- * first, then a slice over the cap gives up its newest rows in the same render (a first bundle over
- * the cap mounts whole, alone).
+ * Where a slice from `fromIndex` ends (#4961 F20): the start is settled first, then a slice over
+ * the cap gives up its newest rows in the same render; a first bundle over the cap mounts alone.
  */
 function resolveSliceEnd(
   state: RevealState,
@@ -226,6 +225,7 @@ function revealThroughState(
   max: number | undefined,
   isSafeCut: IsSafeCut
 ): RevealState {
+  if (index >= snapshot.messages.length) return previous; // A stale index, as when uncapped.
   if (max !== undefined && (index >= snapshot.toIndex || snapshot.toIndex - index > max)) {
     return sliceStateAt(previous, snapshot, index - Math.floor(max / 2), index, max, isSafeCut);
   }

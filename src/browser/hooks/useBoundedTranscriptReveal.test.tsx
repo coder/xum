@@ -611,7 +611,6 @@ describe("useBoundedTranscriptReveal", () => {
         props = { ...props, ...next };
         view.rerender();
       };
-      // Load older until half the transcript is above the slice (the newest rows unmount).
       const readBack = () => {
         runFrames();
         for (let request = 0; request < 10 && reveal().fromIndex > LONG / 2; request += 1) {
@@ -698,6 +697,7 @@ describe("useBoundedTranscriptReveal", () => {
         expect(Math.abs(target - reveal().fromIndex - MAX / 2)).toBeLessThanOrEqual(10);
         expect(frames.hasPending()).toBe(false);
       }
+      act(() => reveal().revealThrough(LONG)); // A stale index past the end is a no-op.
     });
 
     test("bundles larger than the cap mount whole; centering and revealNewer still reach rows", () => {
