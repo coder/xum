@@ -1326,8 +1326,8 @@ describe("MCPServerManager", () => {
   });
 
   test("settings: a read after pending saves waits for them (the dialog reopened during a save)", async () => {
-    let releaseUpdate = () => {};
-    const updateGate = new Promise<void>((resolve) => (releaseUpdate = resolve));
+    const updateGate = Promise.withResolvers<void>();
+    const releaseUpdate = () => updateGate.resolve();
     let units = "in";
     configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-reopen") });
     servers.serve("settings-reopen", {
@@ -1336,7 +1336,7 @@ describe("MCPServerManager", () => {
         settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
         callSettingsTool: async (name) => {
           if (name === "s.update") {
-            await updateGate;
+            await updateGate.promise;
             units = "mm";
           }
           return {
@@ -1359,14 +1359,24 @@ describe("MCPServerManager", () => {
       { units: "mm" },
       read.instanceToken
     );
-    // Without the option a read does not wait (the save's own reads use that path).
+    // A plain read does not wait (the save's own reads use it).
     expect((await manager.readSettings("settings-reopen-ws", "cad"))?.values).toEqual({
       units: "in",
     });
-    const reopened = manager.readSettings("settings-reopen-ws", "cad", { afterPendingSaves: true });
+    let settled = false;
+    const reopened = manager
+      .settingsSavesSettled("settings-reopen-ws", "cad")
+      .then(() => (settled = true));
+    await Promise.resolve();
+    expect(settled).toBe(false);
     releaseUpdate();
     await save;
-    expect((await reopened)?.values).toEqual({ units: "mm" });
+    await reopened;
+    expect((await manager.readSettings("settings-reopen-ws", "cad"))?.values).toEqual({
+      units: "mm",
+    });
+    // No save in flight: nothing to wait for.
+    await manager.settingsSavesSettled("settings-reopen-ws", "cad");
   });
 
   test("settings: a replaced server instance does not keep the old instance's cached values", async () => {

@@ -262,15 +262,11 @@ async function readMcpSettingsRoute(
   // Per server: a hung server times out with its own error and does not hold back the others.
   const timeoutMs = MCP_SETTINGS_READ_TIMEOUT_MS;
   const readOne = async (serverName: string): Promise<McpSettingsReadResult> => {
+    // A dialog reopened during a save must not show the values from before the save.
+    await manager.settingsSavesSettled(input.workspaceId, serverName);
     if (input.ifConnected !== true)
       return runMcpSettingsRoute(context, input.workspaceId, signal, async () =>
-        forIpc(
-          await manager.readSettings(input.workspaceId, serverName, {
-            signal,
-            timeoutMs,
-            afterPendingSaves: true,
-          })
-        )
+        forIpc(await manager.readSettings(input.workspaceId, serverName, { signal, timeoutMs }))
       );
     if (!manager.isWorkspaceServerConnected(input.workspaceId, serverName))
       return { success: true, data: { notConnected: true } };
@@ -279,7 +275,6 @@ async function readMcpSettingsRoute(
         signal,
         timeoutMs,
         noStart: true,
-        afterPendingSaves: true,
       });
       return { success: true, data: forIpc(data) };
     } catch (error) {

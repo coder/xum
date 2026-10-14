@@ -5014,23 +5014,9 @@ export class MCPServerManager {
   async readSettings(
     workspaceId: string,
     serverName: string,
-    /**
-     * `noStart`: read only a running instance; never start or restart the server.
-     * `afterPendingSaves`: first wait for this server's saves in flight (the dialog's reads: a
-     * dialog reopened during a save must not show the values from before it).
-     */
-    options?: {
-      signal?: AbortSignal;
-      timeoutMs?: number;
-      noStart?: boolean;
-      afterPendingSaves?: boolean;
-    }
+    /** `noStart`: read only a running instance; never start or restart the server. */
+    options?: { signal?: AbortSignal; timeoutMs?: number; noStart?: boolean }
   ): Promise<MCPSettingsReadSnapshot | null> {
-    if (options?.afterPendingSaves === true) {
-      const saves = this.pendingSettingsSaves.get(settingsSaveKey(workspaceId, serverName));
-      // A failed save is the save's own error; this read only waits for it.
-      if (saves !== undefined) await Promise.allSettled([...saves]);
-    }
     const noSettings = Symbol("no settings");
     let source: { instance: MCPServerInstance; requestId: number } | undefined;
     const snapshot = await this.invokeServerOperation(
@@ -5061,8 +5047,18 @@ export class MCPServerManager {
     return { ...snapshot, instanceToken };
   }
 
-  /** Saves in flight per workspace and server (readSettings `afterPendingSaves`). */
+  /** Saves in flight per workspace and server (settingsSavesSettled). */
   private readonly pendingSettingsSaves = new Map<string, Set<Promise<unknown>>>();
+
+  /**
+   * Resolves once this server's saves in flight settled. The dialog's reads wait for it: a
+   * dialog reopened during a save must not show the values from before the save.
+   */
+  async settingsSavesSettled(workspaceId: string, serverName: string): Promise<void> {
+    const saves = this.pendingSettingsSaves.get(settingsSaveKey(workspaceId, serverName));
+    // A failed save is the save's own error; a read only waits for it.
+    if (saves !== undefined) await Promise.allSettled([...saves]);
+  }
 
   /**
    * The schema each recent instance token was read with, as a hash: a save whose token names a
