@@ -238,9 +238,8 @@ describe("loadPluginMcpServers", () => {
     const plugin = await makePlugin(tmp.path, "proto", config, { fileName: ".mcp.json" });
     const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
     expect(Object.values(servers).map((s) => s.plugin?.serverName)).toEqual(["local"]);
-    expect(diagnostics.map((d) => d.message)).toEqual([
-      expect.stringContaining("server '__proto__'"),
-    ]);
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0].message).toContain("server '__proto__'");
   });
 
   test("the Codex dialect infers stdio from a command and accepts a flat server map", async () => {

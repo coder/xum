@@ -538,9 +538,12 @@ function normalizeRemoteEntry(
  * the registry's consent record (a `z.record`) drops that key on parse (#6534): the server could
  * never keep its review, so it is skipped with a diagnostic instead of staying unreviewable.
  */
-function serverEntryShapeError(serverName: string, rawEntry: unknown): string | undefined {
-  if (serverName === "__proto__") return "the server name '__proto__' is reserved";
-  return isPlainObject(rawEntry) ? undefined : "server entry must be an object";
+function checkServerEntryShape(
+  serverName: string,
+  rawEntry: unknown
+): { rawEntry: Record<string, unknown> } | { error: string } {
+  if (serverName === "__proto__") return { error: "the server name '__proto__' is reserved" };
+  return isPlainObject(rawEntry) ? { rawEntry } : { error: "server entry must be an object" };
 }
 
 /**
@@ -655,7 +658,7 @@ export async function loadPluginMcpServers(
     vars: { PLUGIN_ROOT: plugin.rootPath, PLUGIN_DATA: dataPath },
   };
 
-  for (const [serverName, rawEntry] of Object.entries(doc.mcpServers)) {
+  for (const [serverName, rawEntryValue] of Object.entries(doc.mcpServers)) {
     // Filter before registration: saved workspace overrides cannot resurrect an unimported server.
     if (
       plugin.importedComponents != null &&
@@ -674,11 +677,12 @@ export async function loadPluginMcpServers(
       });
     };
 
-    const shapeError = serverEntryShapeError(serverName, rawEntry);
-    if (shapeError !== undefined) {
-      reportEntry("error", shapeError);
+    const shape = checkServerEntryShape(serverName, rawEntryValue);
+    if ("error" in shape) {
+      reportEntry("error", shape.error);
       continue;
     }
+    const { rawEntry } = shape;
     const codex = codexDialect
       ? translateCodexMcpEntry(rawEntry)
       : { entry: rawEntry, ignored: [], warnings: [], hasClientSecret: false };

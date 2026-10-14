@@ -100,7 +100,7 @@ export const AgentPluginInstallEntrySchema = z.object({
    * a changed component under an approved name. Top-level, not under importedComponents: older
    * builds spread importedComponents on save and would keep a nested record stale. Absent on
    * older installs, which then need a review (no backfill). `z.record` drops a `__proto__` key on
-   * parse, so the plugin MCP loader refuses that server name (mcpConfig.ts serverEntryShapeError).
+   * parse, so the plugin MCP loader refuses that server name (mcpConfig.ts checkServerEntryShape).
    */
   componentConsent: z
     .object({
