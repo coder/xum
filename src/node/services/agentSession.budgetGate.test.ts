@@ -65,7 +65,7 @@ async function createSessionHarness(workspaceId: string): Promise<SessionHarness
   }) as unknown as InitStateManager;
   const backgroundProcessManager = {
     cleanup: mock((_workspaceId: string) => Promise.resolve()),
-    setMessageQueued: mock((_workspaceId: string, _queued: boolean) => undefined),
+    setMessageQueued: mock((_workspaceId: string, _queued: (() => boolean) | null) => undefined),
   } as unknown as BackgroundProcessManager;
 
   const { session } = await createAgentSessionHarness({

@@ -81,7 +81,7 @@ function createMockBackgroundProcessManager(
 ): BackgroundProcessManager {
   return {
     cleanup: mock((_workspaceId: string) => Promise.resolve()),
-    setMessageQueued: mock((_workspaceId: string, _queued: boolean) => void _queued),
+    setMessageQueued: mock((_workspaceId: string, _queued: (() => boolean) | null) => void _queued),
     ...overrides,
   } as unknown as BackgroundProcessManager;
 }

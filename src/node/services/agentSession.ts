@@ -2084,6 +2084,7 @@ export class AgentSession {
     };
     // Latch admission without publishing idle before stopStream captures the old attempt.
     this.coordinator.beginShutdown();
+    this.backgroundProcessManager.setMessageQueued(this.workspaceId, null);
     this.queueCutReceipts.clear();
     const stopped = cleanup("stopStream", () =>
       this.streamManager.stopStream(this.workspaceId, {
@@ -10422,7 +10423,7 @@ export class AgentSession {
       if (this.coordinator.editBlocked() || continuousApplyPending) {
         this.queuedProviderToolEndAbortInFlight = false;
         // Clear the queued-message signal while the edit flow owns the next dispatch.
-        this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
+        this.backgroundProcessManager.setMessageQueued(this.workspaceId, null);
         // Do not dispatch stream-end follow-ups while the edit flow is waiting
         // for IDLE; truncation must run before any synthetic turn resumes.
       } else {
@@ -11231,7 +11232,7 @@ export class AgentSession {
     const nextDispatchableMode = this.messageQueue.getNextDispatchableMode();
     this.backgroundProcessManager.setMessageQueued(
       this.workspaceId,
-      nextDispatchableMode === "tool-end"
+      () => this.messageQueue.getNextDispatchableMode() === "tool-end"
     );
     // Undefined only if the entry just added is itself withdrawn; WorkspaceService.sendMessage
     // refuses those before enqueue, so null keeps its "nothing pending was queued" meaning.
@@ -11244,7 +11245,7 @@ export class AgentSession {
     const callbackSets = this.messageQueue.getClearCallbacks();
     this.messageQueue.clear();
     this.emitQueuedMessageChanged();
-    this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
+    this.backgroundProcessManager.setMessageQueued(this.workspaceId, null);
     for (const callbacks of callbackSets) {
       this.notifyQueuedMessageCleared(callbacks, cancelReason);
     }
@@ -11262,7 +11263,7 @@ export class AgentSession {
     // user-authored turn-end entry forward to a step boundary.
     this.backgroundProcessManager.setMessageQueued(
       this.workspaceId,
-      this.messageQueue.getNextDispatchableMode() === "tool-end"
+      () => this.messageQueue.getNextDispatchableMode() === "tool-end"
     );
     return true;
   }
@@ -11305,7 +11306,7 @@ export class AgentSession {
     this.emitQueuedMessageChanged();
     this.backgroundProcessManager.setMessageQueued(
       this.workspaceId,
-      this.messageQueue.getNextDispatchableMode() === "tool-end"
+      () => this.messageQueue.getNextDispatchableMode() === "tool-end"
     );
     // Supersession is not withdrawal: a sub-agent progress report dropped because its child's
     // terminal outcome arrived carries workspace-turn continuation callbacks that would settle
@@ -11341,7 +11342,7 @@ export class AgentSession {
     this.emitQueuedMessageChanged();
     this.backgroundProcessManager.setMessageQueued(
       this.workspaceId,
-      this.messageQueue.getNextDispatchableMode() === "tool-end"
+      () => this.messageQueue.getNextDispatchableMode() === "tool-end"
     );
     this.notifyQueuedMessageCleared(callbacks, cancelReason);
     return true;
@@ -12141,7 +12142,7 @@ export class AgentSession {
     using _dispatch = this.coordinator.enterExecution();
     const candidate = this.messageQueue.peekNext();
     if (candidate == null) {
-      this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
+      this.backgroundProcessManager.setMessageQueued(this.workspaceId, null);
       return;
     }
     // Report-decision hold: the stream that just ended may still be deciding whether it carried
@@ -12258,7 +12259,7 @@ export class AgentSession {
       }
       this.backgroundProcessManager.setMessageQueued(
         this.workspaceId,
-        this.messageQueue.getNextDispatchableMode() === "tool-end"
+        () => this.messageQueue.getNextDispatchableMode() === "tool-end"
       );
       return this.sendMessage(message, options, {
         acceptanceOrigin: attempt.acceptanceOrigin,

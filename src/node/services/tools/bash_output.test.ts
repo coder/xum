@@ -566,7 +566,7 @@ describe("bash_output tool", () => {
     const tool = createBashOutputTool(config);
 
     // Queue a message after 200ms
-    setTimeout(() => manager.setMessageQueued("test-workspace", true), 200);
+    setTimeout(() => manager.setMessageQueued("test-workspace", () => true), 200);
 
     // Call with long timeout - should be interrupted by queued message
     const start = Date.now();
@@ -586,7 +586,7 @@ describe("bash_output tool", () => {
     }
 
     // Cleanup
-    manager.setMessageQueued("test-workspace", false);
+    manager.setMessageQueued("test-workspace", null);
     await manager.terminate(spawnResult.processId, { monitorDisposition: "discard" });
     await manager.cleanup("test-workspace");
     tempDir[Symbol.dispose]();

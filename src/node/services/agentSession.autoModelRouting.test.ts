@@ -156,7 +156,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       initStateManager: new EventEmitter() as unknown as InitStateManager,
       backgroundProcessManager: {
         cleanup: mock((_workspaceId: string) => Promise.resolve()),
-        setMessageQueued: mock((_workspaceId: string, _queued: boolean) => {
+        setMessageQueued: mock((_workspaceId: string, _queued: (() => boolean) | null) => {
           void _queued;
         }),
       } as unknown as BackgroundProcessManager,

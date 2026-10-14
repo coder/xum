@@ -1080,7 +1080,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   // Key is toolCallId to support multiple parallel foreground processes per workspace
   private foregroundProcesses = new Map<string, ForegroundProcess>();
   // Tracks workspaces with queued messages (for bash_output to return early)
-  private queuedMessageWorkspaces = new Set<string>();
+  private queuedMessageReaders = new Map<string, () => boolean>();
 
   // Once set, stopMonitor() suppresses "monitor:stopped" so the persisted armed-monitor
   // registry survives shutdown and the next startup can notify owners their monitors
@@ -1095,25 +1095,29 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     this.bgOutputDir = bgOutputDir;
   }
 
-  /** Release Bash waits only when the queue's next dispatchable entry is tool-end. */
-  setMessageQueued(workspaceId: string, queued: boolean): void {
-    if (queued) {
-      this.queuedMessageWorkspaces.add(workspaceId);
-      // User and agent messages share this backend path, even without a mounted chat.
-      // Turn-end holds must let foreground commands finish naturally.
+  /** Publish the live queue reader, or null while dispatch is suppressed/the queue is empty. */
+  setMessageQueued(workspaceId: string, isQueued: (() => boolean) | null): void {
+    if (isQueued) {
+      this.queuedMessageReaders.set(workspaceId, isQueued);
+    } else {
+      this.queuedMessageReaders.delete(workspaceId);
+    }
+    this.backgroundQueuedProcesses(workspaceId);
+  }
+
+  hasQueuedMessage(workspaceId: string): boolean {
+    // Cancellation and admission probes can withdraw input without another queue notification.
+    return this.queuedMessageReaders.get(workspaceId)?.() ?? false;
+  }
+
+  private backgroundQueuedProcesses(workspaceId: string): void {
+    // User and agent input share this backend path, even without a mounted chat.
+    // The live reader preserves turn-end holds and never revives withdrawn input.
+    if (this.hasQueuedMessage(workspaceId)) {
       this.getForegroundToolCallIds(workspaceId).forEach((toolCallId) =>
         this.sendToBackground(toolCallId)
       );
-    } else {
-      this.queuedMessageWorkspaces.delete(workspaceId);
     }
-  }
-
-  /**
-   * Check if a workspace has a queued user message.
-   */
-  hasQueuedMessage(workspaceId: string): boolean {
-    return this.queuedMessageWorkspaces.has(workspaceId);
   }
 
   /** Emit a change event for a workspace */
@@ -2560,6 +2564,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       `Registered foreground process for workspace ${workspaceId}, toolCallId ${toolCallId}`
     );
     this.emitChange(workspaceId);
+    // Input may have queued while Bash was preparing, before this registration existed.
+    this.backgroundQueuedProcesses(workspaceId);
 
     return {
       unregister: () => {

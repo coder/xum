@@ -1267,8 +1267,8 @@ describe("AgentSession queued message tool-call dispatch", () => {
     const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
       workspaceId,
       backgroundProcessManagerOverrides: {
-        setMessageQueued: mock((_workspaceId: string, queued: boolean) => {
-          queuedSignals.push(queued);
+        setMessageQueued: mock((_workspaceId: string, queued: (() => boolean) | null) => {
+          queuedSignals.push(queued?.() ?? false);
         }),
       },
     });
@@ -1373,6 +1373,16 @@ describe("AgentSession queued message tool-call dispatch", () => {
         sender === "agent" ? peerTriggerInternal("agent-msg:sender:bash") : undefined
       );
       expect(background).toHaveBeenCalledTimes(mode === "tool-end" ? 1 : 0);
+      const lateBackground = mock(() => undefined);
+      const late = manager.registerForegroundProcess(
+        workspaceId,
+        "bash-late",
+        "test",
+        "test",
+        lateBackground
+      );
+      expect(lateBackground).toHaveBeenCalledTimes(mode === "tool-end" ? 1 : 0);
+      late.unregister();
       expect(otherBackground).not.toHaveBeenCalled();
     } finally {
       foreground.unregister();
@@ -1403,6 +1413,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       );
       controller.abort();
       expect(session.hasQueuedMessages()).toBe(false);
+      expect(manager.hasQueuedMessage(workspaceId)).toBe(false);
       const background = mock(() => undefined);
       const foreground = manager.registerForegroundProcess(
         workspaceId,
@@ -1463,8 +1474,8 @@ describe("AgentSession queued message tool-call dispatch", () => {
     const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
       workspaceId,
       backgroundProcessManagerOverrides: {
-        setMessageQueued: mock((_workspaceId: string, queued: boolean) => {
-          queuedSignals.push(queued);
+        setMessageQueued: mock((_workspaceId: string, queued: (() => boolean) | null) => {
+          queuedSignals.push(queued?.() ?? false);
         }),
       },
     });
@@ -1533,8 +1544,8 @@ describe("AgentSession queued message tool-call dispatch", () => {
     const { session, cleanup, aiEmitter, aiService } = await createAgentSessionHarness({
       workspaceId,
       backgroundProcessManagerOverrides: {
-        setMessageQueued: mock((_workspaceId: string, queued: boolean) => {
-          queuedSignals.push(queued);
+        setMessageQueued: mock((_workspaceId: string, queued: (() => boolean) | null) => {
+          queuedSignals.push(queued?.() ?? false);
         }),
       },
     });
@@ -1789,7 +1800,9 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
   test("updates visible queued dispatch mode without dequeuing content", async () => {
     const workspaceId = "queue-dispatch-mode-update";
-    const setMessageQueued = mock((_workspaceId: string, _queued: boolean) => undefined);
+    const setMessageQueued = mock(
+      (_workspaceId: string, _queued: (() => boolean) | null) => undefined
+    );
     const { session, cleanup, events } = await createAgentSessionHarness({
       workspaceId,
       captureEvents: true,
@@ -1814,7 +1827,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
         queuedMessages: ["my queued follow-up"],
         queueDispatchMode: "tool-end",
       });
-      expect(setMessageQueued).toHaveBeenLastCalledWith(workspaceId, true);
+      expect(setMessageQueued.mock.calls.at(-1)?.[1]?.()).toBe(true);
       expect(session.hasQueuedMessages()).toBe(true);
 
       expect(session.setQueuedMessageDispatchMode("turn-end")).toBe(true);
@@ -1823,7 +1836,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
         queuedMessages: ["my queued follow-up"],
         queueDispatchMode: "turn-end",
       });
-      expect(setMessageQueued).toHaveBeenLastCalledWith(workspaceId, false);
+      expect(setMessageQueued.mock.calls.at(-1)?.[1]?.()).toBe(false);
       expect(session.hasQueuedMessages()).toBe(true);
     } finally {
       await session.dispose();
