@@ -70,49 +70,71 @@ const WidgetStateParams = z.object({ state: z.unknown().refine(isStorableWidgetS
 
 /**
  * JSON within the cap, which JSON keeps exactly: no cycle, BigInt, NaN, Infinity, undefined
- * member, sparse array, Date, Map or other class instance, so the stored state is what the
- * widget set.
+ * member, sparse array, array property, Date, Map or other class instance, so the stored state
+ * is what the widget set.
  *
- * SECURITY: the value comes from the view by structured clone, which keeps shared references, so
- * a small message can stand for a huge JSON text. A bounded walk runs first and gives up after
- * MCP_APP_WIDGET_STATE_MAX_BYTES units (every node and string character is at least one byte of
- * JSON), so JSON.stringify only ever sees a value within the cap.
+ * SECURITY: the value comes from the view by structured clone, which keeps shared references and
+ * cycles, so a small message can stand for a huge or endless JSON text. An iterative walk (no
+ * recursion, so no stack to exhaust) runs first. It gives up after MCP_APP_WIDGET_STATE_MAX_BYTES
+ * units (every node and string character is at least one byte of JSON) or below
+ * WIDGET_STATE_MAX_DEPTH, so JSON.stringify only ever sees a small, shallow value.
  */
 function isStorableWidgetState(state: unknown): boolean {
   const value = state ?? null;
-  if (!isJsonValue(value, { left: MCP_APP_WIDGET_STATE_MAX_BYTES })) return false;
+  if (!isBoundedJson(value)) return false;
   return new TextEncoder().encode(JSON.stringify(value)).length <= MCP_APP_WIDGET_STATE_MAX_BYTES;
 }
 
-interface JsonBudget {
-  left: number;
-}
-type JsonContainer = Readonly<Record<string, unknown>> | readonly unknown[];
+/** Deeper widget state is refused: JSON.stringify recurses once per level. */
+const WIDGET_STATE_MAX_DEPTH = 64;
 
-/** Whether JSON round-trips `value` unchanged, within `budget` (spent as it walks). */
-function isJsonValue(value: unknown, budget: JsonBudget): boolean {
-  budget.left -= typeof value === "string" ? value.length + 1 : 1;
-  if (budget.left < 0) return false;
-  if (typeof value === "number") return Number.isFinite(value);
-  if (typeof value !== "object") return typeof value === "string" || typeof value === "boolean";
-  return value === null || isJsonContainer(value as JsonContainer, budget);
-}
-
-/** An array without holes, or a plain object (no Date, Map or other class), of JSON values. */
-function isJsonContainer(value: JsonContainer, budget: JsonBudget): boolean {
-  if (Array.isArray(value)) return isJsonArray(value, budget);
-  const prototype: unknown = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) return false;
-  return Object.entries(value).every(([key, member]) => {
-    budget.left -= key.length;
-    return isJsonValue(member, budget);
-  });
-}
-
-function isJsonArray(value: readonly unknown[], budget: JsonBudget): boolean {
-  for (let i = 0; i < value.length; i++) {
-    if (!(i in value) || !isJsonValue(value[i], budget)) return false;
+function isBoundedJson(root: unknown): boolean {
+  const pending: Array<{ value: unknown; depth: number }> = [{ value: root, depth: 0 }];
+  let left = MCP_APP_WIDGET_STATE_MAX_BYTES;
+  for (let next = pending.pop(); next !== undefined; next = pending.pop()) {
+    const { value, depth } = next;
+    left -= jsonCost(value);
+    if (left < 0 || depth > WIDGET_STATE_MAX_DEPTH) return false;
+    if (isJsonScalar(value)) continue;
+    const children = jsonChildren(value, left);
+    if (children === null) return false;
+    for (const child of children) pending.push({ value: child, depth: depth + 1 });
   }
+  return true;
+}
+
+/** At least the bytes `value` takes in JSON, not counting its children. */
+function jsonCost(value: unknown): number {
+  return typeof value === "string" ? value.length + 1 : 1;
+}
+
+function isJsonScalar(value: unknown): boolean {
+  return (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean" ||
+    (typeof value === "number" && Number.isFinite(value))
+  );
+}
+
+/**
+ * The members of an array without holes or extra properties, or the keys and members of a plain
+ * object; null for anything else (a number JSON changes, a class instance, a function) or when
+ * it has more members than `left` budget units.
+ */
+function jsonChildren(value: unknown, left: number): unknown[] | null {
+  if (typeof value !== "object" || value === null) return null;
+  if (Array.isArray(value)) return isPlainArray(value, left) ? value : null;
+  const prototype: unknown = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return null;
+  const entries = Object.entries(value);
+  // Keys are pushed as strings, so their length is spent like any string's.
+  return entries.length > left ? null : entries.flat();
+}
+
+function isPlainArray(value: readonly unknown[], left: number): boolean {
+  if (value.length > left || Object.keys(value).length !== value.length) return false;
+  for (let i = 0; i < value.length; i++) if (!(i in value)) return false;
   return true;
 }
 const ToolCallParams = z.object({
