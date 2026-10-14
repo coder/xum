@@ -7,7 +7,7 @@ type Selection = { mode: "full"; reason: string } | { mode: "files"; files: stri
 
 // Local shape for the untyped CommonJS helper; only the members these tests exercise.
 interface LintTargetsModule {
-  selectLintTargets(changedFiles: string[]): Selection;
+  selectLintTargets(changedFiles: string[], removedFiles?: string[]): Selection;
   main(cwd: string, env: Record<string, string | undefined>): string;
 }
 
