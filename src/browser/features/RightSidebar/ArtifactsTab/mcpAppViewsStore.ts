@@ -319,10 +319,11 @@ function toolCallViewOfRecord(toolCallId: string, view: McpAppViewRecord): McpAp
     toolName: view.toolName,
     label: mcpToolDisplayName(view.toolName, { key: view.serverName }),
     arguments: view.arguments ?? {},
-    // The record does not say how the call ended: a call without a result opens with
-    // "Result no longer available" instead of tool-cancelled.
-    cancelled: false,
-    failed: false,
+    // The record's outcome says how a call without a result ended, so the view gets
+    // tool-cancelled like a card in the transcript. A record without one (a completed call, or
+    // one written before outcomes) opens with "Result no longer available" when it has no result.
+    cancelled: view.outcome !== undefined,
+    failed: view.outcome === "failed",
   };
 }
 

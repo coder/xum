@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { EventSpine } from "@/node/services/events/eventSpine";
-import { runMessageSendHooks } from "./promptHooks";
+import { runMessageSendHooks, runTurnStopHooks } from "./promptHooks";
 import { renderPluginHookContextEntry } from "@/node/utils/messages/renderPluginHookContextForProvider";
 
 const input = { text: "hello", origin: "user" as const, canBlock: true };
@@ -118,5 +118,46 @@ describe("runMessageSendHooks", () => {
       kind: "context",
       entries: [{ pluginId: "healthy", text: "from a healthy plugin" }],
     });
+  });
+
+  test("a consumer that throws after setting a block or adding context leaves neither", async () => {
+    // Codex PRRT_kwDOPxxmWM6rQd9y, PRRT_kwDOPxxmWM6rQeuF: a failed hook fails open as a whole.
+    const spine = new EventSpine();
+    spine.useBefore("message.send", (ctx) => {
+      ctx.additionalContext.push({ pluginId: "healthy", text: "kept" });
+    });
+    spine.useBefore("message.send", (ctx) => {
+      ctx.additionalContext.push({ pluginId: "broken", text: "half done" });
+      ctx.blocked = { pluginName: "broken", reason: "half done" };
+      throw new Error("broken plugin");
+    });
+
+    expect(await runMessageSendHooks(spine, "ws", input)).toEqual({
+      kind: "context",
+      entries: [{ pluginId: "healthy", text: "kept" }],
+    });
+  });
+});
+
+describe("runTurnStopHooks", () => {
+  test("a consumer that throws is isolated: its partial decision is dropped, the rest still run", async () => {
+    // Codex PRRT_kwDOPxxmWM6rQfGc.
+    const spine = new EventSpine();
+    spine.useBefore("turn.stop", (ctx) => {
+      ctx.continueReasons.push("half done");
+      ctx.halted = { pluginName: "broken" };
+      throw new Error("broken plugin");
+    });
+    spine.useBefore("turn.stop", (ctx) => {
+      ctx.continueReasons.push("Run the tests again.");
+    });
+
+    expect(
+      await runTurnStopHooks(spine, "ws", {
+        messageId: "a1",
+        lastAssistantMessage: "done",
+        stopHookActive: false,
+      })
+    ).toEqual({ kind: "continue", prompt: "Run the tests again." });
   });
 });

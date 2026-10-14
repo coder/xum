@@ -85,6 +85,8 @@ export const McpAppViewRecordSchema = z
     arguments: z.unknown(),
     /** The record is an entry point's view, not a tool call's (only an open writes it). */
     entrypoint: z.literal(true).optional(),
+    /** How a call without a result ended (McpAppResultRecord.outcome); absent when it completed. */
+    outcome: z.enum(["failed", "interrupted"]).optional(),
   })
   .nullable();
 export type McpAppViewRecord = z.infer<typeof McpAppViewRecordSchema>;

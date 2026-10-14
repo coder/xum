@@ -1,4 +1,5 @@
 import { tool } from "ai";
+import { pluginHookContextTexts } from "@/common/utils/messages/pluginHookContext";
 import type { z } from "zod";
 import assert from "@/common/utils/assert";
 import { isPlainObject } from "@/common/utils/isPlainObject";
@@ -91,7 +92,9 @@ function projectHistory(message: MuxMessage): { text: string; toolNames: Set<str
       return [JSON.stringify(sanitize(part, 0, "tool"))];
     })
     .join("\n");
-  return { text, toolNames };
+  // A user row's prompt-hook context reached the model inside that row, so search and read_item
+  // return it too (Codex PRRT_kwDOPxxmWM6reh6Z).
+  return { text: [text, ...pluginHookContextTexts(message)].join("\n"), toolNames };
 }
 
 /**

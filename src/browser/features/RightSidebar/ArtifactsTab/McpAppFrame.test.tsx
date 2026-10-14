@@ -10,6 +10,7 @@ import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
+import assert from "@/common/utils/assert";
 import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
 import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
 import { McpAppFrame } from "./McpAppFrame";
@@ -111,13 +112,34 @@ function Wrapper(props: { children: ReactNode }) {
   );
 }
 
-/** Deliver a JSON-RPC message as if the view frame posted it. */
-function postFromView(frame: HTMLIFrameElement, data: unknown) {
+/** Post from the frame's window to the app window: what a page the view navigated to can do. */
+function postFromFrameWindow(frame: HTMLIFrameElement, data: unknown, ports: unknown[] = []) {
   const event = new window.Event("message");
   Object.defineProperty(event, "data", { value: data });
   Object.defineProperty(event, "source", { value: frame.contentWindow });
+  Object.defineProperty(event, "ports", { value: ports });
   act(() => {
     window.dispatchEvent(event);
+  });
+}
+
+/** A view document run from the frame's srcdoc (its real preamble), by frame. */
+interface BootedDocument {
+  /** The view's `window.parent`: the document's port to the host. */
+  parent: { postMessage: (message: unknown, targetOrigin: string) => void };
+  /** Gets every message the host sends the document. */
+  listeners: Array<(message: Posted) => void>;
+  /** Fire a window event (e.g. pagehide) in the document. */
+  dispatch: (type: string) => void;
+}
+const bootedDocuments = new WeakMap<HTMLIFrameElement, BootedDocument>();
+
+/** Deliver a JSON-RPC message as the view sends it: over its document's port. */
+function postFromView(frame: HTMLIFrameElement, data: unknown) {
+  const booted = bootedDocuments.get(frame);
+  assert(booted != null, "boot the view document first (bootDocument)");
+  act(() => {
+    booted.parent.postMessage(data, "*");
   });
 }
 
@@ -129,24 +151,32 @@ interface Posted {
   error?: { code: number };
 }
 
-/** Every message the host posted into the view. */
+/** Every message the host posted into the view document. */
 function capturePosted(frame: HTMLIFrameElement): Posted[] {
   const posted: Posted[] = [];
-  frame.contentWindow!.postMessage = ((message: Posted) => {
-    posted.push(message);
-  }) as Window["postMessage"];
+  bootedDocuments.get(frame)!.listeners.push((message) => posted.push(message));
   return posted;
 }
 
-/** Replies the host posted into the view, by request id. */
+/** Replies the host posted into the view document, by request id. */
 function captureReplies(frame: HTMLIFrameElement) {
   const replies = new Map<unknown, { result?: unknown; error?: { code: number } }>();
-  const target = frame.contentWindow!;
-  target.postMessage = ((message: { id?: unknown; result?: unknown; error?: { code: number } }) => {
+  bootedDocuments.get(frame)!.listeners.push((message) => {
     if (message.id !== undefined) replies.set(message.id, message);
-  }) as Window["postMessage"];
+  });
   return replies;
 }
+
+/** Messages posted to the frame's window itself, which a navigated page would receive. */
+function captureFrameWindowPosts(frame: HTMLIFrameElement): unknown[] {
+  const posts: unknown[] = [];
+  frame.contentWindow!.postMessage = ((message: unknown) => {
+    posts.push(message);
+  }) as Window["postMessage"];
+  return posts;
+}
+
+const tick = () => act(() => new Promise((resolve) => setTimeout(resolve, 0)));
 
 /** Press the strip's Allow once its arming delay is over (confirmArming.ts). */
 async function pressAllow(button: HTMLElement) {
@@ -157,10 +187,57 @@ async function pressAllow(button: HTMLElement) {
   fireEvent.click(button);
 }
 
+/**
+ * Run the view document's first script (the preamble) the way the frame's document would. It
+ * opens the document's channel: its open announcement reaches the app from the frame's window.
+ */
+function bootDocument(frame: HTMLIFrameElement): BootedDocument {
+  const doc = new window.DOMParser().parseFromString(frame.getAttribute("srcdoc")!, "text/html");
+  const preamble = doc.querySelector("script")?.textContent ?? "";
+  const handlers: Array<{ type: string; listener: () => void }> = [];
+  const listeners: BootedDocument["listeners"] = [];
+  const documentWindow: Record<string, unknown> = {
+    parent: {
+      postMessage: (data: unknown, _origin: string, ports: unknown[] = []) =>
+        postFromFrameWindow(frame, data, ports),
+    },
+    MessageEvent: class {
+      constructor(
+        readonly type: string,
+        readonly init: { data: Posted }
+      ) {}
+    },
+    dispatchEvent: (event: { init: { data: Posted } }) => {
+      for (const listener of listeners) listener(event.init.data);
+      return true;
+    },
+    addEventListener: (type: string, listener: () => void) => handlers.push({ type, listener }),
+  };
+  // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs our own generated script
+  (new Function("window", preamble) as (window: unknown) => void)(documentWindow);
+  const booted: BootedDocument = {
+    parent: documentWindow.parent as BootedDocument["parent"],
+    listeners,
+    dispatch: (type) => {
+      for (const entry of handlers) if (entry.type === type) entry.listener();
+    },
+  };
+  bootedDocuments.set(frame, booted);
+  return booted;
+}
+
+/** The mounted view frame, with its document booted (its channel is open). */
+async function findOpenFrame(view: { findByTestId: (id: string) => Promise<HTMLElement> }) {
+  const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+  bootDocument(frame);
+  return frame;
+}
+
 async function renderFrame() {
   const view = render(<McpAppFrame workspaceId="ws" view={VIEW} />, { wrapper: Wrapper });
   const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
-  return { view, frame, posted: capturePosted(frame) };
+  const document = bootDocument(frame);
+  return { view, frame, posted: capturePosted(frame), document };
 }
 
 describe("McpAppFrame", () => {
@@ -465,7 +542,7 @@ describe("McpAppFrame", () => {
         <McpAppFrame workspaceId="ws" view={{ ...VIEW, cancelled: true, failed }} />,
         { wrapper: Wrapper }
       );
-      const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+      const frame = await findOpenFrame(view);
       const posted = capturePosted(frame);
       postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
       await waitFor(() =>
@@ -514,7 +591,7 @@ describe("McpAppFrame", () => {
     const view = render(<McpAppFrame workspaceId="ws" view={{ ...VIEW, serverName: key }} />, {
       wrapper: Wrapper,
     });
-    const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+    const frame = await findOpenFrame(view);
     expect(view.getByText("tray")).toBeTruthy();
     expect(view.container.textContent).not.toContain("0123456789abcdef");
     postFromView(frame, {
@@ -688,13 +765,20 @@ describe("McpAppFrame", () => {
       webkitRTCPeerConnection: class {},
       RTCDataChannel: class {},
       fetch: () => undefined,
-      // The preamble also installs the in-page link handler.
+      // The preamble also installs the in-page link handler and opens the host channel.
       addEventListener: () => undefined,
+      parent: { postMessage: () => undefined },
+      dispatchEvent: () => true,
     };
     // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs our own generated script
     const run = new Function("window", firstScript) as (window: unknown) => void;
     run(fakeWindow);
-    expect(Object.keys(fakeWindow)).toEqual(["fetch", "addEventListener"]);
+    expect(Object.keys(fakeWindow)).toEqual([
+      "fetch",
+      "addEventListener",
+      "parent",
+      "dispatchEvent",
+    ]);
   });
 
   test("the view mounts in desktop and browser mode and is told which platform it is on", async () => {
@@ -733,10 +817,121 @@ describe("McpAppFrame", () => {
 
     // Reload brings back a fresh frame with a working host.
     fireEvent.click(view.getByRole("button", { name: "Reload" }));
-    const reloaded = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+    const reloaded = await findOpenFrame(view);
     const replies = capturePosted(reloaded);
     postFromView(reloaded, { jsonrpc: "2.0", id: 10, method: "ping" });
     await waitFor(() => expect(replies.some((m) => m.id === 10)).toBe(true));
+  });
+
+  // #6187: in browser mode nothing blocks the navigation, and the next page keeps the frame's
+  // window. The host talks only over the view document's own port.
+  test("a page the view navigates to can neither reach the host nor get its replies", async () => {
+    delete window.api;
+    const { view, frame, posted } = await renderFrame();
+    const windowPosts = captureFrameWindowPosts(frame);
+    // A call that waits for consent: its reply goes out after the navigation.
+    postFromView(frame, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "tool" } });
+    const allow = await view.findByRole("button", { name: "Allow" });
+
+    // The next page posts from the frame's window, and even knowing the nonce cannot rebind.
+    const nonce = /nonce: "([0-9a-f]+)"/.exec(frame.getAttribute("srcdoc")!)![1];
+    const next = new MessageChannel();
+    const nextReceived: unknown[] = [];
+    next.port1.onmessage = (event) => nextReceived.push(event.data);
+    postFromFrameWindow(frame, { jsonrpc: "2.0", id: 2, method: "ui/initialize", params: {} });
+    postFromFrameWindow(frame, { xumMcpAppDocument: 1, type: "open", nonce }, [next.port2]);
+    next.port1.postMessage({ jsonrpc: "2.0", id: 3, method: "ping" });
+
+    await pressAllow(allow);
+    await waitFor(() => expect(posted.find((m) => m.id === 1)?.result).toBeDefined());
+    await tick();
+    expect(posted.some((m) => m.id === 2 || m.id === 3)).toBe(false);
+    expect(nextReceived).toEqual([]);
+    expect(windowPosts).toEqual([]);
+    next.port1.close();
+  });
+
+  test("an unloading view document closes the frame", async () => {
+    delete window.api;
+    const { view, document } = await renderFrame();
+    document.dispatch("pagehide");
+    expect(await view.findByText(/This artifact navigated away/)).toBeTruthy();
+    expect(view.queryByTestId("mcp-app-frame")).toBeNull();
+  });
+
+  // A burst over the rate limit must not hide the unload of a view that then redirects.
+  test("an unloading view document closes the frame even after a burst", async () => {
+    delete window.api;
+    const { view, frame, document } = await renderFrame();
+    for (let id = 100; id < 130; id++) postFromView(frame, { jsonrpc: "2.0", id, method: "ping" });
+    document.dispatch("pagehide");
+    expect(await view.findByText(/This artifact navigated away/)).toBeTruthy();
+  });
+
+  // The HTML standard asks to close discarded ports: an unmounted view must not keep its port.
+  test("unmounting the view closes its document's port", async () => {
+    const close = spyOn(MessagePort.prototype, "close");
+    try {
+      const { view } = await renderFrame();
+      const before = close.mock.calls.length;
+      view.unmount();
+      await waitFor(() => expect(close.mock.calls.length).toBeGreaterThan(before));
+    } finally {
+      close.mockRestore();
+    }
+  });
+
+  test("a view that navigated away has its document's port closed", async () => {
+    delete window.api;
+    const close = spyOn(MessagePort.prototype, "close");
+    try {
+      const { view, document } = await renderFrame();
+      const before = close.mock.calls.length;
+      document.dispatch("pagehide");
+      expect(await view.findByText(/This artifact navigated away/)).toBeTruthy();
+      await waitFor(() => expect(close.mock.calls.length).toBeGreaterThan(before));
+    } finally {
+      close.mockRestore();
+    }
+  });
+
+  test("the host answers nothing before the document opened its channel", async () => {
+    const view = render(<McpAppFrame workspaceId="ws" view={VIEW} />, { wrapper: Wrapper });
+    const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+    const windowPosts = captureFrameWindowPosts(frame);
+    postFromFrameWindow(frame, { jsonrpc: "2.0", id: 1, method: "ping" });
+    await tick();
+    expect(windowPosts).toEqual([]);
+
+    bootDocument(frame);
+    const posted = capturePosted(frame);
+    postFromView(frame, { jsonrpc: "2.0", id: 2, method: "ping" });
+    await waitFor(() => expect(posted.map((m) => m.id)).toEqual([2]));
+  });
+
+  test("a document a new grant replaced neither closes nor silences the new one", async () => {
+    delete window.api;
+    invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
+    viewCsp = { connectDomains: ["https://api.example.com"] };
+    const { view, frame, document: before } = await renderFrame();
+    const firstSrcDoc = frame.getAttribute("srcdoc");
+    const allow = view.getByRole("button", { name: "Allow" });
+    await waitFor(() => expect(allow.hasAttribute("disabled")).toBe(false), {
+      timeout: CONFIRM_ARM_DELAY_MS * 4,
+    });
+    // A burst over the rate limit right before the grant reloads the view.
+    for (let id = 100; id < 130; id++) postFromView(frame, { jsonrpc: "2.0", id, method: "ping" });
+    fireEvent.pointerDown(allow);
+    fireEvent.click(allow);
+    await waitFor(() => expect(frame.getAttribute("srcdoc")).not.toBe(firstSrcDoc));
+
+    // The frame loads the new document; the old one unloads after it was replaced.
+    bootDocument(frame);
+    const posted = capturePosted(frame);
+    before.dispatch("pagehide");
+    postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ping" });
+    await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+    expect(view.queryByText(/This artifact navigated away/)).toBeNull();
   });
 });
 
@@ -761,7 +956,7 @@ describe("McpAppFrame host strips", () => {
 
   test("a shown consent strip is never replaced; a newer request is declined", async () => {
     const view = render(<McpAppFrame workspaceId="ws" view={VIEW} />, { wrapper: Wrapper });
-    const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+    const frame = await findOpenFrame(view);
     const replies = captureReplies(frame);
 
     postFromView(frame, {
@@ -804,7 +999,7 @@ describe("McpAppFrame host strips", () => {
     window.addEventListener(CUSTOM_EVENTS.UPDATE_CHAT_INPUT, onInsert);
     try {
       const view = render(<McpAppFrame workspaceId="ws" view={VIEW} />, { wrapper: Wrapper });
-      const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+      const frame = await findOpenFrame(view);
       const replies = captureReplies(frame);
       const message = (id: number, text: string) =>
         postFromView(frame, {
@@ -870,7 +1065,7 @@ describe("McpAppFrame host strips", () => {
           <McpAppFrame workspaceId="ws" view={VIEW} variant={variant} onClose={onClose} />,
           { wrapper: Wrapper }
         );
-        const frame = (await view.findByTestId("mcp-app-frame")) as HTMLIFrameElement;
+        const frame = await findOpenFrame(view);
         posted = capturePosted(frame);
         postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
         await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));

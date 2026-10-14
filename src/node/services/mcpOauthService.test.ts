@@ -825,6 +825,70 @@ describe("McpOauthService OAuth flows", () => {
     });
   });
 
+  // A sign-in's deadline and Cancel must cover authorization-server discovery: a stalled
+  // metadata request must not keep the start pending (and the desktop listener bound) (#6164).
+  test.each([
+    ["plugin registrationUrl discovery", true, false],
+    ["SDK discovery", false, false],
+    ["scope lookup", false, true],
+  ])(
+    "a sign-in settled during stalled %s returns at once",
+    async (_label, withRegistrationUrl, stallScope) => {
+      let stalled!: () => void;
+      const discoveryStalled = new Promise<void>((resolve) => (stalled = resolve));
+      const stalledPath = stallScope ? "/prm" : "/.well-known/oauth-authorization-server";
+      const server = createServer((req, res) => {
+        const pathname = (req.url ?? "/").split("?")[0];
+        if (pathname.startsWith(stalledPath)) {
+          stalled(); // Never answers until the client gives up.
+          req.on("close", () => res.destroy());
+          return;
+        }
+        if (pathname === "/mcp" && stallScope) {
+          // No scope in the challenge: the scope lookup fetches the resource metadata.
+          const prm = `http://${req.headers.host ?? ""}/prm`;
+          res.writeHead(401, { "WWW-Authenticate": `Bearer resource_metadata="${prm}"` });
+          res.end();
+          return;
+        }
+        res.statusCode = pathname === "/mcp" ? 401 : 404;
+        res.end();
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      try {
+        const address = server.address();
+        if (!address || typeof address === "string") throw new Error("Failed to bind");
+        const base = `http://127.0.0.1:${address.port}`;
+        spyOn(mcpConfigService, "listServers").mockResolvedValue({
+          docs: {
+            transport: "http",
+            url: `${base}/mcp`,
+            disabled: true,
+            oauth: {
+              clientId: "c",
+              ...(withRegistrationUrl
+                ? {
+                    discovery: {
+                      authorizationServerBase: base,
+                      registrationUrl: `${base}/register`,
+                    },
+                  }
+                : {}),
+            },
+          },
+        });
+        const starting = service.startDesktopFlow({ projectPath, serverName: "docs" });
+        await discoveryStalled;
+        // The update-time sign-out settles every flow of this server (the deadline does the same).
+        await service.logout({ serverUrl: `${base}/mcp` });
+        expect(await starting).toEqual({ success: false, error: "Signed out" });
+      } finally {
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    }
+  );
+
   test("a token exchange in flight when the user signs out saves nothing", async () => {
     let tokenRequested!: () => void;
     const requested = new Promise<void>((resolve) => (tokenRequested = resolve));
@@ -899,10 +963,84 @@ describe("McpOauthService OAuth flows", () => {
         iss: null,
         error: null,
       });
-      expect(await service.hasAuthTokens({ serverUrl: `${base}/mcp` })).toBe(true);
+      expect(
+        await service.hasAuthTokens({ serverUrl: `${base}/mcp`, oauth: { clientId: "c" } })
+      ).toBe(true);
     } finally {
       releaseToken();
       await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  // Two Xum backends can share mcp-oauth.json (XUM_ALLOW_MULTIPLE_INSTANCES): each one rereads
+  // the file when another changed it, before it uses or rewrites credentials (#6123).
+  test("a sign-out in another process is seen at once, and a write keeps its entries", async () => {
+    const urlA = "https://a.example.com/mcp";
+    const urlB = "https://b.example.com/mcp";
+    const entry = (serverUrl: string) => ({
+      serverUrl,
+      updatedAtMs: Date.now(),
+      clientInformation: { client_id: "c" },
+      tokens: { access_token: "at", token_type: "Bearer", refresh_token: "rt" },
+    });
+    await fs.writeFile(
+      getStoreFilePath(xumHome),
+      JSON.stringify({ version: 2, entries: { [urlA]: entry(urlA) } })
+    );
+    const other = new McpOauthService(config, mcpConfigService);
+    try {
+      expect(await service.hasAuthTokens({ serverUrl: urlA })).toBe(true);
+      expect(await other.hasAuthTokens({ serverUrl: urlA })).toBe(true);
+      // The other process signs the server out (a plugin update's sign-out).
+      await other.logout({ serverUrl: urlA });
+      expect(await service.hasAuthTokens({ serverUrl: urlA })).toBe(false);
+      expect(await service.getAuthProviderForServer({ serverUrl: urlA })).toBeUndefined();
+      // The other process signs in elsewhere; this process then writes: both entries stay.
+      await fs.writeFile(
+        getStoreFilePath(xumHome),
+        JSON.stringify({ version: 2, entries: { [urlB]: entry(urlB) } })
+      );
+      await service.logout({ serverUrl: urlA });
+      expect(await other.hasAuthTokens({ serverUrl: urlB })).toBe(true);
+      expect(await service.hasAuthTokens({ serverUrl: urlB })).toBe(true);
+    } finally {
+      await other.dispose();
+    }
+  });
+
+  test("a write that another process replaces at once is not taken as the current file (#6123)", async () => {
+    const urlA = "https://a.example.com/mcp";
+    const urlB = "https://b.example.com/mcp";
+    const entry = (serverUrl: string) => ({
+      serverUrl,
+      updatedAtMs: Date.now(),
+      clientInformation: { client_id: "c" },
+      tokens: { access_token: "at", token_type: "Bearer" },
+    });
+    const storePath = getStoreFilePath(xumHome);
+    await fs.writeFile(storePath, JSON.stringify({ version: 2, entries: { [urlA]: entry(urlA) } }));
+    expect(await service.hasAuthTokens({ serverUrl: urlA })).toBe(true);
+    // The sign-out stats the file once before its write. The other process replaces the file
+    // just before the next stat: right after the write, or at the next credential read.
+    const realStat = fs.stat.bind(fs);
+    let stats = 0;
+    const stat = spyOn(fs, "stat").mockImplementation((async (
+      ...args: Parameters<typeof fs.stat>
+    ) => {
+      if (++stats === 2) {
+        await fs.writeFile(
+          storePath,
+          JSON.stringify({ version: 2, entries: { [urlB]: entry(urlB) } })
+        );
+      }
+      return realStat(...args);
+    }) as typeof fs.stat);
+    try {
+      await service.logout({ serverUrl: urlA });
+      expect(await service.hasAuthTokens({ serverUrl: urlB })).toBe(true);
+      expect(stats).toBeGreaterThanOrEqual(2);
+    } finally {
+      stat.mockRestore();
     }
   });
 
@@ -1185,7 +1323,7 @@ describe("McpOauthService OAuth flows", () => {
       expect(await usable(pinned("https://b.example.com"))).toBe(false);
     });
 
-    test("a sign-in whose probe spans a sign-out writes credentials the new issuer never uses", async () => {
+    test("a sign-in whose probe spans a sign-out ends with it and writes nothing", async () => {
       let probing!: () => void;
       const probed = new Promise<void>((resolve) => (probing = resolve));
       let releaseProbe!: () => void;
@@ -1236,21 +1374,11 @@ describe("McpOauthService OAuth flows", () => {
         await probed;
         // The update's sign-out lands while the flow is still probing.
         await service.logout({ serverUrl: url });
-        releaseProbe();
-        const start = await starting;
-        if (!start.success) throw new Error(start.error);
-        await service.handleServerCallbackAndExchange({
-          state: start.data.flowId,
-          code: "the-code",
-          iss: null,
-          error: null,
-        });
-        // The old-identity flow did write; only the issuer it carries keeps it from serving B.
+        // The flow is registered before its probe, so the sign-out ends it and its probe at
+        // once (#6164): the old-identity flow never reaches the token endpoint.
+        expect(await starting).toEqual({ success: false, error: "Signed out" });
         expect(
           await service.getAuthProviderForServer({ serverUrl: url, oauth: configA })
-        ).toBeDefined();
-        expect(
-          await service.getAuthProviderForServer({ serverUrl: url, oauth: configB })
         ).toBeUndefined();
         expect(await service.hasAuthTokens({ serverUrl: url, oauth: configB })).toBe(false);
       } finally {
@@ -1572,6 +1700,39 @@ describe("McpOauthService OAuth flows", () => {
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+  });
+
+  test("a server without a provided client never uses another plugin's provided-client sign-in (#6159)", async () => {
+    await withAuthServer(async (base) => {
+      const serverUrl = `${base}/mcp`;
+      // Plugin A signs in with its provided client.
+      spyOn(mcpConfigService, "listServers").mockResolvedValue({
+        a: { transport: "http", url: serverUrl, disabled: true, oauth: { clientId: "plugin-a" } },
+      });
+      const start = await service.startServerFlow({
+        projectPath,
+        serverName: "a",
+        redirectUri: "https://x/cb",
+      });
+      if (!start.success) throw new Error(start.error);
+      const signedIn = await service.handleServerCallbackAndExchange({
+        state: start.data.flowId,
+        code: "code",
+        iss: null,
+        error: null,
+      });
+      expect(signedIn.success).toBe(true);
+      expect(await service.hasAuthTokens({ serverUrl, oauth: { clientId: "plugin-a" } })).toBe(
+        true
+      );
+      // A server at the same URL that registers its own client (a DCR plugin or the user's
+      // own server) reads as signed out and gets no provider.
+      for (const oauth of [{ baseScopes: ["read"] }, undefined]) {
+        expect(await service.hasAuthTokens({ serverUrl, oauth })).toBe(false);
+        expect(await service.getAuthProviderForServer({ serverUrl, oauth })).toBeUndefined();
+        expect((await service.getAuthStatus({ serverUrl, oauth })).isLoggedIn).toBe(false);
+      }
+    });
   });
 
   test("interleaved sign-ins of two clients at one URL never store client B with token A", async () => {

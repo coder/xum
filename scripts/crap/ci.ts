@@ -239,7 +239,11 @@ function main(): number {
   const text = summary(report, status, expected, toolError, mode);
   console.log(text);
   if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, text);
-  return exitCode(mode, report);
+  const code = exitCode(mode, report);
+  // pr.yml's Verdict step fails the job only on this output, so a timeout or
+  // crash of this step (no output) never blocks.
+  if (code === 1 && env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, "verdict=violations\n");
+  return code;
 }
 
 if (import.meta.main) {

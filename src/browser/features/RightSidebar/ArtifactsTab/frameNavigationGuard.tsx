@@ -17,10 +17,10 @@ import { Notice } from "./SourceText";
  * user to confirm, setState, annotate pins, MCP tool calls that need no consent): until the
  * second load after a navigation the user started (a tapped link), and for as long as it stays
  * open when the artifact itself redirects while its srcdoc is still loading (then the
- * destination's load is the first one seen here). Such a redirect target also receives what the
- * host keeps sending to the frame: for an MCP App view, the `ui/initialize` reply, the tool input
- * and result sent once the view initializes, and the results of its later tool calls. The desktop
- * app blocks the navigation itself.
+ * destination's load is the first one seen here). The desktop app blocks the navigation itself.
+ * MCP App views do not rely on the load count: the host talks to them only over their
+ * document's own MessagePort, which a page the frame navigates to cannot reach
+ * (mcpAppDocumentChannel.ts).
  */
 export function useFrameNavigationGuard(srcDoc: string | null) {
   // Loads seen for the srcdoc currently in the frame; a new srcdoc or a reload starts over.
@@ -34,6 +34,10 @@ export function useFrameNavigationGuard(srcDoc: string | null) {
   const [navigated, setNavigated] = useState(false);
   // Message handlers and posts read this synchronously, ahead of the re-render.
   const navigatedRef = useRef(false);
+  const leave = () => {
+    navigatedRef.current = true;
+    setNavigated(true);
+  };
 
   return {
     /** Changes on Reload: use it as the iframe's key so a fresh frame gets the srcdoc. */
@@ -50,10 +54,11 @@ export function useFrameNavigationGuard(srcDoc: string | null) {
         return true;
       }
       current.count += 1;
-      navigatedRef.current = true;
-      setNavigated(true);
+      leave();
       return false;
     },
+    /** The frame told the host its document unloaded (MCP App views: mcpAppDocumentChannel.ts). */
+    leave,
     reload: () => {
       navigatedRef.current = false;
       setNavigated(false);

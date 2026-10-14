@@ -132,6 +132,7 @@ import { synthesizeSilentContinuationSummary } from "@/constants/goalPrompts";
 import type { SendMessageError } from "@/common/types/errors";
 import { ChatMuxMessageSchema, SendMessageOptionsSchema } from "@/common/orpc/schemas";
 import { AutoModelRoutingRecordSchema } from "@/common/orpc/schemas/message";
+import { readPersistedPluginHookContext } from "@/common/utils/messages/pluginHookContext";
 import { ToolPolicySchema } from "@/common/orpc/schemas/stream";
 import {
   normalizePersistedAgentCandidate,
@@ -552,16 +553,9 @@ function resolveMessageSendOrigin(
 
 /** Raw JSON boundary for a persisted follow-up's hook context: malformed entries are dropped. */
 function coercePluginHookContext(value: unknown): PluginHookContextEntry[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const entries = value.filter(
-    (entry: unknown): entry is PluginHookContextEntry =>
-      typeof entry === "object" &&
-      entry !== null &&
-      "pluginId" in entry &&
-      typeof entry.pluginId === "string" &&
-      "text" in entry &&
-      typeof entry.text === "string"
-  );
+  // The same read as every persisted row: valid entries only, cut at the per-message cap
+  // (Codex PRRT_kwDOPxxmWM6rPrJe).
+  const entries = readPersistedPluginHookContext(value);
   return entries.length > 0 ? entries : undefined;
 }
 
@@ -663,6 +657,10 @@ interface StopContinuationProvenance {
   goalKind?: GoalSyntheticMessageKind;
   goalId?: string;
   agentInitiated?: boolean;
+  /** The model the stream ran with (after any routing fallback). */
+  streamModel?: string;
+  /** The routing record the stream ran with. */
+  autoModelRouting?: AutoModelRoutingRecord;
   /** The stream was a delegated workspace turn: WorkspaceTurnManager owns its end. */
   delegatedWorkspaceTurn: boolean;
   /**
@@ -1261,6 +1259,22 @@ function checkCompactionFollowUpStillPending(
     history.slice(index + 1).every(leavesCompactionFollowUpPending)
     ? "pending"
     : "consumed";
+}
+
+/** Messages the startup recovery probe reads from the end of history. */
+const STARTUP_TAIL_MESSAGE_COUNT = 20;
+
+/**
+ * Whether the startup follow-up dispatch (dispatchPendingFollowUpOnce without a targeted summary)
+ * can still act on this history tail. Conservative: it answers true whenever the tail cannot
+ * decide (only hidden rows, or a preserved tail copy whose epoch boundary may be further back).
+ */
+function mayEndInPendingCompactionFollowUp(tail: readonly MuxMessage[]): boolean {
+  const last = tail.findLast((message) => !isModelHiddenMessage(message));
+  if (last === undefined) return tail.length >= STARTUP_TAIL_MESSAGE_COUNT;
+  if (last.metadata?.rlmPreservedTailCopy === true) return true;
+  const metadata = last.metadata?.muxMetadata;
+  return isCompactionSummaryMetadata(metadata) && metadata.pendingFollowUp != null;
 }
 
 function pendingCompactionSummary(message: MuxMessage): CompactionCancellationSummary | undefined {
@@ -3346,6 +3360,14 @@ export class AgentSession {
     return retryRequest;
   }
 
+  private classifyStartupTail(
+    partial: MuxMessage | null,
+    history: MuxMessage[]
+  ): "interrupted" | "follow-up" | "idle" {
+    if (this.hasInterruptedStartupTail(partial, history)) return "interrupted";
+    return mayEndInPendingCompactionFollowUp(history) ? "follow-up" : "idle";
+  }
+
   private hasInterruptedStartupTail(partial: MuxMessage | null, history: MuxMessage[]): boolean {
     if (this.isPendingAskUserQuestion(partial)) return false;
     if (partial?.role === "assistant" && !this.isFinishedStartupPartial(partial, history)) {
@@ -3587,7 +3609,9 @@ export class AgentSession {
         this.historyService
           .readPartial(this.workspaceId, { throwOnError: strictPartial })
           .catch(() => undefined),
-        this.historyService.getLastMessages(this.workspaceId, 20).catch(() => null),
+        this.historyService
+          .getLastMessages(this.workspaceId, STARTUP_TAIL_MESSAGE_COUNT)
+          .catch(() => null),
       ])
     );
   }
@@ -3625,7 +3649,7 @@ export class AgentSession {
       this.isPendingAskUserQuestion(this.getLastNonSystemHistoryMessage(history.data))
     )
       return "question";
-    return this.hasInterruptedStartupTail(partial, history.data) ? "interrupted" : "idle";
+    return this.classifyStartupTail(partial, history.data);
   }
 
   ensureStartupAutoRetryCheck(): Promise<void> {
@@ -10201,17 +10225,7 @@ export class AgentSession {
     const activeStreamGoalKind = this.activeStreamContext?.goalKind;
     const activeStreamOptions = this.activeStreamContext?.options;
     // A turn.stop continuation keeps this stream's goal provenance (read before the reset below).
-    const activeStreamProvenance: StopContinuationProvenance = {
-      goalKind: activeStreamGoalKind,
-      goalId: this.activeStreamContext?.goalId,
-      agentInitiated: this.activeStreamContext?.agentInitiated,
-      delegatedWorkspaceTurn: this.activeStreamContext?.workspaceTurnMetadata != null,
-      externallyOwnedTurn:
-        this.callerOwnsTurnEnd ||
-        payload.acpPromptId != null ||
-        (normalizeAcpPromptId(activeStreamOptions?.acpPromptId) ??
-          extractAcpPromptId(activeStreamOptions?.muxMetadata)) != null,
-    };
+    const activeStreamProvenance = this.readStopContinuationProvenance(payload);
 
     let goalContinuationRequest: {
       sendOptions: SendMessageOptions;
@@ -10350,7 +10364,10 @@ export class AgentSession {
           return;
       }
 
-      if (!handled && !this.coordinator.editBlocked()) {
+      // A compaction turn whose summary the handler rejected is not a turn end either: its
+      // continuation would run as an extra turn with the compaction options (Codex
+      // PRRT_kwDOPxxmWM6reqlp).
+      if (!handled && completedCompactionRequest == null && !this.coordinator.editBlocked()) {
         // Before the queue flush: a continuation is queued work, so the flush dispatches it and
         // the goal loop waits for it, and input the user queued meanwhile wins over it.
         await this.runTurnStopHooks(streamEndPayload, activeStreamOptions, activeStreamProvenance);
@@ -10494,6 +10511,17 @@ export class AgentSession {
     if (this.aiService.runTurnStopHooks == null) return;
     if (this.config.findWorkspace(this.workspaceId)?.parentWorkspaceId != null) return;
     if (provenance.delegatedWorkspaceTurn) return;
+    // Input queued during the turn is its next turn: the turn has not stopped, so Stop does
+    // not run (Codex PRRT_kwDOPxxmWM6rPrjz). The flush below dispatches it. A turn whose end an
+    // outside client already received ran to its end for that client: its hooks still run
+    // (they only lose the continuation, below). Only committed queue entries count here: a manual
+    // reservation or a send in preflight can still fail without starting a turn, and this turn's
+    // Stop notices would then be lost (Codex PRRT_kwDOPxxmWM6sT80F). Those still cancel the
+    // continuation below.
+    if (!provenance.externallyOwnedTurn && this.messageQueue.hasDispatchableEntries()) {
+      this.stopHookContinuations = 0;
+      return;
+    }
     // A hard Stop can land while a slow hook runs, after the stream ended: it then finds no live
     // stream to supersede and clears the queue before the hook returns. Its epoch fences the
     // continuation instead (rechecked below, after the last await).
@@ -10522,14 +10550,7 @@ export class AgentSession {
     // its turn or cost limit, or a budget wrap-up, ends here.
     let goalAdmissionStale: (() => boolean) | undefined;
     if (provenance.goalKind != null && this.workspaceGoalService != null) {
-      const admission =
-        provenance.goalId == null
-          ? { admissible: false as const }
-          : await this.workspaceGoalService.buildGoalRedispatchAdmission(
-              this.workspaceId,
-              provenance.goalId,
-              GOAL_CONTINUATION_KIND
-            );
+      const admission = await this.readStopContinuationGoalAdmission(provenance.goalId);
       if (!admission.admissible) {
         log.info("Prompt hooks: the goal no longer admits a turn.stop continuation", {
           workspaceId: this.workspaceId,
@@ -10543,7 +10564,7 @@ export class AgentSession {
     // Queued work (typed input, wakes) is the next turn instead; the user turn ends here. A user
     // send still in its preflight (this session's or WorkspaceService's) is not queued yet, but
     // it wins too: the continuation must not run another model turn ahead of newer input.
-    if (this.hasPendingManualFollowUp() || this.hasManualSendInPreflight()) {
+    if (this.hasDispatchableFollowUp()) {
       this.stopHookContinuations = 0;
       return;
     }
@@ -10560,22 +10581,106 @@ export class AgentSession {
       return;
     }
     this.stopHookContinuations++;
-    this.queueMessage(
-      outcome.prompt,
-      { ...pickStartupRetrySendOptions(options), model: options.model },
-      {
-        acceptanceOrigin: "automatic",
-        synthetic: true,
-        ...(provenance.agentInitiated === true ? { agentInitiated: true } : {}),
-        ...(provenance.goalKind != null
-          ? { goalKind: GOAL_CONTINUATION_KIND, goalId: provenance.goalId }
-          : {}),
-        ...(goalAdmissionStale != null ? { admissionStale: goalAdmissionStale } : {}),
-        dedupeKey: STOP_HOOK_CONTINUATION_DEDUPE_KEY,
-        // Codex runs no UserPromptSubmit hook for a Stop continuation (see skipPromptHooks).
-        skipPromptHooks: true,
-      }
+    this.queueMessage(outcome.prompt, this.stopContinuationOptions(options, provenance), {
+      acceptanceOrigin: "automatic",
+      synthetic: true,
+      ...(provenance.agentInitiated === true ? { agentInitiated: true } : {}),
+      ...(provenance.goalKind != null
+        ? { goalKind: GOAL_CONTINUATION_KIND, goalId: provenance.goalId }
+        : {}),
+      ...(goalAdmissionStale != null ? { admissionStale: goalAdmissionStale } : {}),
+      dedupeKey: STOP_HOOK_CONTINUATION_DEDUPE_KEY,
+      // Codex runs no UserPromptSubmit hook for a Stop continuation (see skipPromptHooks).
+      skipPromptHooks: true,
+    });
+  }
+
+  /** The ending stream's provenance for a turn.stop continuation (read before its reset). */
+  private readStopContinuationProvenance(payload: StreamEndEvent): StopContinuationProvenance {
+    const context: Partial<NonNullable<AgentSession["activeStreamContext"]>> =
+      this.activeStreamContext ?? {};
+    return {
+      goalKind: context.goalKind,
+      goalId: context.goalId,
+      agentInitiated: context.agentInitiated,
+      // The model and routing the stream ran with: request preparation can fall back from a
+      // tier model it cannot build, after `options.model` was chosen (PRRT_kwDOPxxmWM6r2jHK).
+      streamModel: context.modelString,
+      autoModelRouting: context.autoModelRouting,
+      delegatedWorkspaceTurn: context.workspaceTurnMetadata != null,
+      externallyOwnedTurn: this.isExternallyOwnedTurn(payload, context.options),
+    };
+  }
+
+  /** See StopContinuationProvenance.externallyOwnedTurn. */
+  private isExternallyOwnedTurn(
+    payload: StreamEndEvent,
+    options: SendMessageOptions | undefined
+  ): boolean {
+    return (
+      this.callerOwnsTurnEnd ||
+      payload.acpPromptId != null ||
+      (normalizeAcpPromptId(options?.acpPromptId) ?? extractAcpPromptId(options?.muxMetadata)) !=
+        null
     );
+  }
+
+  /**
+   * The send options of a turn.stop continuation: the turn's configuration, never its payload.
+   * It streams with the model and routing the turn ran with: request preparation can fall back
+   * from a tier model it cannot build after `options.model` was chosen (Codex
+   * PRRT_kwDOPxxmWM6r2jHK). The live Chat Instructions snapshot is turn configuration too, as for
+   * enqueueContextContinuation (Codex PRRT_kwDOPxxmWM6rQfGi).
+   */
+  private stopContinuationOptions(
+    options: SendMessageOptions,
+    provenance: StopContinuationProvenance
+  ): SendMessageOptions & { autoModelRoutingRecord?: AutoModelRoutingRecord } {
+    return {
+      ...pickStartupRetrySendOptions(options),
+      ...(options.additionalSystemContext !== undefined
+        ? { additionalSystemContext: options.additionalSystemContext }
+        : {}),
+      ...(provenance.autoModelRouting != null
+        ? { autoModelRoutingRecord: provenance.autoModelRouting }
+        : {}),
+      model: provenance.streamModel ?? options.model,
+    };
+  }
+
+  /**
+   * Whether queued work will dispatch, or a user send is still in its preflight. A withdrawn queue
+   * entry drains as a no-op, so it does not count (Codex PRRT_kwDOPxxmWM6rxPMK).
+   */
+  private hasDispatchableFollowUp(): boolean {
+    return (
+      this.messageQueue.hasDispatchableEntries() ||
+      this.coordinator.manualFollowUpPending ||
+      this.hasManualSendInPreflight()
+    );
+  }
+
+  /**
+   * The goal's admission for a Stop continuation. A failed read declines the continuation: the
+   * error must not skip the queue flush after the hooks (Codex PRRT_kwDOPxxmWM6r2jHN).
+   */
+  private async readStopContinuationGoalAdmission(
+    goalId: string | undefined
+  ): Promise<{ admissible: false } | { admissible: true; admissionStale: () => boolean }> {
+    if (goalId == null || this.workspaceGoalService == null) return { admissible: false };
+    try {
+      return await this.workspaceGoalService.buildGoalRedispatchAdmission(
+        this.workspaceId,
+        goalId,
+        GOAL_CONTINUATION_KIND
+      );
+    } catch (error) {
+      log.warn("Prompt hooks: the goal admission for a turn.stop continuation failed", {
+        workspaceId: this.workspaceId,
+        error: getErrorMessage(error),
+      });
+      return { admissible: false };
+    }
   }
 
   private attachAiListeners(): void {
@@ -12355,6 +12460,8 @@ export class AgentSession {
         return false;
       }
     } else {
+      // Keep mayEndInPendingCompactionFollowUp a superset of what this branch dispatches: startup
+      // recovery skips a legacy task whose probe is `idle` without calling this dispatch (#6511).
       // Read the last message from history — only need 1 message, avoid full-file read.
       // Startup recovery must retry on transient read failures, so bubble errors.
       const historyResult = await this.historyService.getLastMessages(this.workspaceId, 1);
