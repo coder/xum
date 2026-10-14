@@ -715,16 +715,7 @@ describe("useBoundedTranscriptReveal", () => {
         expect(() => renderSlice(cap)).toThrow();
     });
 
-    // One reconciliation each (#6667 review deferrals, F20 PR3a-1).
-    test("deleting unmounted newer rows keeps a paused detached slice paused", () => {
-      const { frames, reveal, readBack, setProps, props } = renderSlice(MAX);
-      readBack();
-      const { fromIndex, toIndex } = reveal();
-      setProps({ messages: props().messages.filter((_, i) => i < toIndex || i > toIndex + 100) });
-      expect(frames.hasPending()).toBe(false);
-      expect(reveal()).toMatchObject({ fromIndex, toIndex });
-    });
-
+    // One reconciliation each (#6667 review deferral, F20 PR3a-1).
     test("deleting the end rows on both sides of the edge falls back to the newest kept row", () => {
       const { reveal, readBack, setProps, props } = renderSlice(MAX);
       readBack();
@@ -735,40 +726,6 @@ describe("useBoundedTranscriptReveal", () => {
       });
       expect(reveal().toIndex).toBe(toIndex - 50);
       expect(props().messages[reveal().toIndex - 1].id).toBe(keptId);
-    });
-
-    // Rows a revealMore() budget mounted, measured from a row that was mounted before it.
-    const revealedSince = (ids: Row[], refId: string, fromIndex: number) =>
-      ids.findIndex((row) => row.id === refId) - fromIndex;
-
-    test("an older page plus a deleted request-start row in one update stays within the budget", () => {
-      const { reveal, runFrames, setProps, props, frames } = renderSlice(MAX);
-      runFrames();
-      const start = reveal().fromIndex;
-      const [startId, refId] = [start, start + 1].map((i) => props().messages[i].id);
-      act(() => reveal().revealMore());
-      act(() => frames.flush());
-      const withPage = [...rows(300, "old"), ...props().messages];
-      setProps({ messages: withPage.filter((row) => row.id !== startId) });
-      runFrames();
-      const revealed = revealedSince(props().messages, refId, reveal().fromIndex);
-      expect(revealed).toBeLessThanOrEqual(
-        TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + TRANSCRIPT_REVEAL_CHUNK_ROWS
-      );
-    });
-
-    test("deleting mounted rows never lets the reveal run past its budget", () => {
-      const { reveal, runFrames, setProps, props, frames } = renderSlice(MAX);
-      runFrames();
-      const refId = props().messages[reveal().fromIndex].id;
-      act(() => reveal().revealMore());
-      act(() => frames.flush());
-      setProps({ messages: props().messages.filter((_, i) => i < LONG - 140 || i >= LONG - 40) });
-      runFrames();
-      const revealed = revealedSince(props().messages, refId, reveal().fromIndex);
-      expect(revealed).toBeLessThanOrEqual(
-        TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + TRANSCRIPT_REVEAL_CHUNK_ROWS
-      );
     });
 
     test("rows replaced inside the slice stay mounted when the end row goes later", () => {
@@ -792,49 +749,6 @@ describe("useBoundedTranscriptReveal", () => {
       setProps({ messages: props().messages.filter((_, i) => !gone(i)) });
       expect(reveal().toIndex).toBe(props().messages.length);
       expect(props().messages.findIndex((row) => row.id === "v3")).toBe(toIndex - 21);
-    });
-
-    test("a regrouping that pulls the start back near the limit is charged to the budget", () => {
-      // 480 of the 500-row budget revealed; a new bundle then spans the start and pulls it back.
-      // 300 rows pass the budget (pause); 10 rows do not (the reveal goes on: charged once only).
-      for (const pulled of [300, 10]) {
-        const { frames, reveal, runFrames, setProps } = renderSlice();
-        runFrames();
-        act(() => reveal().revealMore());
-        for (let step = 0; step < 8; step += 1) act(() => frames.flush());
-        const from = reveal().fromIndex;
-        setProps({ isSafeCut: (i) => bundled(i) && !(i > from - pulled && i <= from) });
-        expect(reveal().fromIndex).toBe(from - pulled);
-        expect(reveal().isRevealPaused).toBe(pulled === 300);
-        expect(frames.hasPending()).toBe(pulled !== 300);
-        cleanup();
-      }
-    });
-
-    test("a vanished start anchor with an older page in one update pauses the reveal", () => {
-      const { frames, reveal, runFrames, setProps, props } = renderSlice();
-      runFrames();
-      act(() => reveal().revealMore());
-      act(() => frames.flush());
-      const anchorId = props().messages[reveal().fromIndex].id; // the CURRENT anchor
-      const drop = (messages: Row[]) => messages.filter((row) => row.id !== anchorId);
-      setProps({ messages: drop([...rows(300, "old"), ...props().messages]) });
-      expect(reveal().isRevealPaused).toBe(true);
-      expect(frames.hasPending()).toBe(false);
-
-      // With a new budget and a pending navigation, the navigation still reveals down to its row.
-      act(() => reveal().revealMore());
-      act(() => reveal().revealThrough(100));
-      setProps({ messages: props().messages.filter((_, i) => i !== reveal().fromIndex) });
-      expect(frames.hasPending()).toBe(true);
-
-      // Attached to the start (no anchor): a deletion never pauses.
-      cleanup();
-      const attached = renderSlice();
-      attached.setProps({ messages: rows(TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + 20) }); // reveals fully
-      attached.runFrames();
-      attached.setProps({ messages: attached.props().messages.slice(1) });
-      expect(attached.reveal()).toMatchObject({ isFullyRevealed: true, isRevealPaused: false });
     });
   });
 });

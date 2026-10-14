@@ -81,13 +81,8 @@ interface RevealState {
    * in-place changes leave it in place and never restart the reveal.
    */
   newestMessageId: string | null;
-  /**
-   * Automatic steps stop once `revealedRows` reaches this. Only the tail and the automatic steps
-   * add to the counter (by the rows they mounted), so deletions and older pages can never move
-   * it (#4961 F20). Reset on every restart; revealMore() starts a new budget at zero.
-   */
+  /** Automatic steps stop once this many rows are mounted (reset on every restart). */
   autoRowLimit: number;
-  revealedRows: number;
   /**
    * Row a navigation waits for (see revealThrough): steps continue past the budget until it is
    * mounted, then it clears. Cleared as well when the row disappears or the reveal restarts.
@@ -96,7 +91,7 @@ interface RevealState {
   /** First unmounted newer row while detached, anchored by id like the start; null ⇒ the tail. */
   endMessageId: string | null;
   endIndexHint: number;
-  /** The rows `endIndexHint` indexes: if the end row is gone, the newest kept older row wins. */
+  /** The rows `endIndexHint` indexes, for the fallback when the end row is gone. */
   endRows: readonly RevealRow[];
 }
 
@@ -133,28 +128,20 @@ function nearestSafeCutAtOrAfter(index: number, length: number, isSafeCut: IsSaf
   return cut;
 }
 
-/** Index of the row `id`, trying `hint` first; -1 when it is gone. */
-function findRow(rows: readonly RevealRow[], id: string, hint: number): number {
-  return rows[hint]?.id === id ? hint : rows.findIndex((row) => row.id === id);
-}
-
-/**
- * A detached slice's stored end: its first unmounted row. If one reconciliation deleted it (and
- * maybe mounted rows before it), the end follows the newest still-present row that was mounted.
- */
+/** A detached slice's stored end: its first unmounted row survives deleted mounted rows. */
 function storedSliceEnd(state: RevealState, rows: readonly RevealRow[], isSafeCut: IsSafeCut) {
   const { endMessageId: id, endIndexHint: hint, endRows } = state;
   if (id === null) return rows.length;
-  const found = findRow(rows, id, hint);
+  const found = rows[hint]?.id === id ? hint : rows.findIndex((row) => row.id === id);
   const end = found === -1 ? endAtNearestUnmountedRow(rows, endRows, hint) : found;
   return end === rows.length ? end : nearestSafeCutAtOrBefore(end, rows.length, isSafeCut);
 }
 
 /**
- * Where the end goes once its row is gone: the nearest still-present row that was unmounted
- * (`endRows[hint+1..]`), so mounted rows replaced since stay mounted. If none survives, every row
- * the reader had not reached is gone and the slice ends at the tail: what follows the kept rows
- * is replacements or later appends, and unmounting those could hide rows the reader was reading.
+ * Where the end goes once its row is gone, even when one reconciliation also deleted mounted rows
+ * before it (#6667 review): the nearest still-present row that was unmounted (`endRows[hint+1..]`),
+ * so mounted rows replaced since stay mounted. If none survives, every row the reader had not
+ * reached is gone and the slice ends at the tail: unmounting what follows could hide read rows.
  */
 function endAtNearestUnmountedRow(
   rows: readonly RevealRow[],
@@ -190,17 +177,6 @@ function resolveSliceEnd(
   const fitted = nearestSafeCutAtOrBefore(fromIndex + max, length, isSafeCut);
   if (to - fromIndex > max) to = fitted;
   return to > fromIndex ? to : nearestSafeCutAtOrAfter(fromIndex + 1, length, isSafeCut);
-}
-
-/**
- * The budget counter after the render re-anchors the start, in the same update: a boundary pulled
- * back to a bundle head charges the `pulled` rows it mounted (the next step starts from there). A
- * vanished anchor fails closed: rows that moved under it cannot be counted, so the budget ends
- * (Load older starts a new one; a pending navigation target still reveals).
- */
-function chargedRevealedRows(state: RevealState, anchorIndex: number, pulled: number): number {
-  if (anchorIndex === -1) return Math.max(state.revealedRows, state.autoRowLimit);
-  return state.revealedRows + pulled;
 }
 
 /** `state` with its end fields set for a slice ending at `to` (null at the tail). */
@@ -244,8 +220,7 @@ function sliceStateAt(
     ...previous,
     anchorMessageId: start === 0 ? null : messages[start].id,
     anchorIndexHint: start,
-    autoRowLimit: 0,
-    revealedRows: 0,
+    autoRowLimit: length - start,
     targetMessageId: null,
   };
   return withSliceEnd(moved, messages, endFrom(start));
@@ -351,16 +326,14 @@ function startState<Row extends RevealRow>(
     generation,
     newestMessageId: length > 0 ? messages[length - 1].id : null,
     autoRowLimit: TRANSCRIPT_REVEAL_AUTO_MAX_ROWS,
-    revealedRows: 0,
     targetMessageId: null,
     endMessageId: null,
     endIndexHint: 0,
     endRows: [],
   };
   const cut = nextStepCut(length, TRANSCRIPT_REVEAL_TAIL_ROWS, inputs);
-  const tail = { ...base, revealedRows: length - cut };
-  if (cut === 0) return { ...tail, anchorMessageId: null, anchorIndexHint: 0 };
-  return { ...tail, anchorMessageId: messages[cut].id, anchorIndexHint: cut };
+  if (cut === 0) return { ...base, anchorMessageId: null, anchorIndexHint: 0 };
+  return { ...base, anchorMessageId: messages[cut].id, anchorIndexHint: cut };
 }
 
 const unitRowWeight = (): number => 1;
@@ -450,18 +423,19 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
       current = { ...current, anchorIndexHint: anchorIndex };
       setState(current);
     }
-    const boundary = anchorIndex === -1 ? current.anchorIndexHint : anchorIndex;
-    fromIndex = nearestSafeCutAtOrBefore(boundary, length, args.isSafeCut);
-    const revealedRows = chargedRevealedRows(current, anchorIndex, boundary - fromIndex);
+    fromIndex = nearestSafeCutAtOrBefore(
+      anchorIndex === -1 ? current.anchorIndexHint : anchorIndex,
+      length,
+      args.isSafeCut
+    );
     if (fromIndex === 0) {
-      current = { ...current, anchorMessageId: null, anchorIndexHint: 0, revealedRows };
+      current = { ...current, anchorMessageId: null, anchorIndexHint: 0 };
       setState(current);
     } else if (fromIndex < length && args.messages[fromIndex].id !== current.anchorMessageId) {
       current = {
         ...current,
         anchorMessageId: args.messages[fromIndex].id,
         anchorIndexHint: fromIndex,
-        revealedRows,
       };
       setState(current);
     }
@@ -484,10 +458,11 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
       setState(current);
     }
   }
+  const mountedRows = length - fromIndex;
   const isRevealPaused =
     current.anchorMessageId !== null &&
     current.targetMessageId === null &&
-    current.revealedRows >= current.autoRowLimit;
+    mountedRows >= current.autoRowLimit;
 
   // The scheduled step reads the latest COMMITTED inputs when it runs, not what it captured
   // when scheduled: grouping can change while a frame is pending. Published from a layout
@@ -529,7 +504,8 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
           return previous;
         }
         // A frame that slipped past cancellation must not step a reveal that paused meanwhile.
-        if (previous.targetMessageId === null && previous.revealedRows >= previous.autoRowLimit) {
+        const snapshotMountedRows = snapshot.messages.length - snapshot.fromIndex;
+        if (previous.targetMessageId === null && snapshotMountedRows >= previous.autoRowLimit) {
           return previous;
         }
         const cut = nextStepCut(
@@ -537,12 +513,8 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
           TRANSCRIPT_REVEAL_CHUNK_ROWS,
           snapshot.stepInputs
         );
-        const stepped = {
-          ...previous,
-          revealedRows: previous.revealedRows + snapshot.fromIndex - cut,
-        };
-        if (cut === 0) return { ...stepped, anchorMessageId: null, anchorIndexHint: 0 };
-        return { ...stepped, anchorMessageId: snapshot.messages[cut].id, anchorIndexHint: cut };
+        if (cut === 0) return { ...previous, anchorMessageId: null, anchorIndexHint: 0 };
+        return { ...previous, anchorMessageId: snapshot.messages[cut].id, anchorIndexHint: cut };
       });
     });
     return cancel;
@@ -550,13 +522,13 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
 
   // Both read the latest COMMITTED snapshot (like the scheduled step), so a caller's effect sees
   // the rows and boundary it just rendered.
-  // One more budget: the counter restarts at zero (see RevealState.autoRowLimit).
   const revealMore = () => {
-    const snapshotGeneration = latest.current.generation;
+    const snapshot = latest.current;
+    const limit = snapshot.messages.length - snapshot.fromIndex + TRANSCRIPT_REVEAL_AUTO_MAX_ROWS;
     setState((previous) =>
-      previous.generation !== snapshotGeneration
+      previous.generation !== snapshot.generation || previous.autoRowLimit >= limit
         ? previous
-        : { ...previous, autoRowLimit: TRANSCRIPT_REVEAL_AUTO_MAX_ROWS, revealedRows: 0 }
+        : { ...previous, autoRowLimit: limit }
     );
   };
   const revealNewer = () => {
