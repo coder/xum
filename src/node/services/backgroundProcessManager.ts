@@ -5,6 +5,7 @@ import type {
   Runtime,
   BackgroundHandle,
   BackgroundMonitorProbeResult,
+  OutputReadOptions,
 } from "@/node/runtime/Runtime";
 import {
   spawnProcess,
@@ -732,7 +733,11 @@ interface OutputWaitOptions {
 /** Read the next bytes of output.log into the window. Returns false when there were none. */
 async function readIntoWindow(proc: BackgroundProcess, window: OutputWindow): Promise<boolean> {
   const offset = proc.outputBytesRead;
-  const result = await proc.handle.readOutput(offset, outputReadBytes(window.pending));
+  const result = await proc.handle.readOutput(
+    offset,
+    outputReadBytes(window.pending),
+    finalReadOptions(window)
+  );
   assert(result.newOffset >= offset, "BackgroundHandle.readOutput moved the cursor back");
   // The cursor only moves forward: every byte read stays in `pending` until a page takes it.
   window.pending += result.content;
@@ -742,7 +747,24 @@ async function readIntoWindow(proc: BackgroundProcess, window: OutputWindow): Pr
   // probe that came back empty) cannot spin the wait loop or decide on a line it never read.
   window.reachedEnd = !advanced || result.newOffset >= result.fileSize;
   window.fileSize = result.fileSize;
+  // A remainder of a character's size is a character held back (the process is writing it) or
+  // a short tail: read again, so a held character reads as the end instead of a capped page.
+  if (!window.reachedEnd && result.fileSize - result.newOffset <= MAX_HELD_BACK_BYTES) {
+    await readIntoWindow(proc, window);
+  }
   return advanced;
+}
+
+/** Most bytes a bounded read holds back: an incomplete UTF-8 character's first 3 bytes. */
+const MAX_HELD_BACK_BYTES = 3;
+
+/**
+ * A bounded read holds back a character the process may still be writing (see
+ * BackgroundHandle.readOutput). Once the process has ended, no write can complete it, so reads
+ * take it, and the drain after exit reaches the end of the file.
+ */
+function finalReadOptions(window: OutputWindow): OutputReadOptions {
+  return { final: window.status !== "running" };
 }
 
 /** The window ends inside a line and has room: read on before deciding on that line. */
@@ -876,7 +898,7 @@ async function scanFilteredOutput(
     const room = Math.max(1, MAX_RETAINED_UNREAD_BYTES - Buffer.byteLength(window.pending, "utf8"));
     // Never past the file size the first read saw (plus the bytes that finish a character).
     const readBytes = Math.max(1, Math.min(chunkBytes, targetOffset - offset));
-    const result = await proc.handle.readOutput(offset, readBytes);
+    const result = await proc.handle.readOutput(offset, readBytes, finalReadOptions(window));
     assert(result.newOffset >= offset, "BackgroundHandle.readOutput moved the cursor back");
     targetOffset = Math.min(targetOffset, result.fileSize);
     const advanced = result.newOffset > offset;
@@ -972,8 +994,10 @@ function nextWaitStep(
  * available moments later.
  */
 async function drainAfterExit(proc: BackgroundProcess, window: OutputWindow): Promise<void> {
-  if (window.status === "running" || !window.reachedEnd) return;
-  if (await readIntoWindow(proc, window)) return;
+  if (window.status === "running") return;
+  // A read made before the exit was seen can have held back a split character: this read
+  // (bounded by the window's room) takes it, even when the window is not at the end.
+  if ((await readIntoWindow(proc, window)) || !window.reachedEnd) return;
   // We didn't observe any new output: wait one poll interval and try once more.
   await sleepMs(OUTPUT_POLL_INTERVAL_MS);
   await readIntoWindow(proc, window);

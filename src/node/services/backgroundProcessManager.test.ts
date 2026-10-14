@@ -3565,7 +3565,7 @@ describe("BackgroundProcessManager", () => {
           expect(pages.join("\n")).toBe(["\uFFFD", ...lines].join("\n"));
         });
 
-        it("keeps a character cut at a read boundary once, with the lines around it", async () => {
+        it("holds a character cut at the end of the log until its second half arrives", async () => {
           const result = await manager.spawn(runtime, testWorkspaceId, "sleep 60", {
             cwd: process.cwd(),
             displayName: "test",
@@ -3575,8 +3575,8 @@ describe("BackgroundProcessManager", () => {
           const outputPath = path.join(result.outputDir, "output.log");
           // Many pages, so the reads go through the window before they reach the cut.
           const lines = Array.from({ length: 4_000 }, (_, i) => `line ${i} ${"z".repeat(50)}`);
-          // The log ends inside "é" (0xC3 0xA9): the read that reaches the end decodes its first
-          // half alone, and the next one its second half.
+          // The log ends inside "é" (0xC3 0xA9) while the process runs: the read that reaches
+          // the end holds the first half back until the second one arrives.
           const head = Buffer.concat([
             Buffer.from(`${lines.join("\n")}\ncut-`),
             Buffer.from([0xc3]),
@@ -3589,7 +3589,7 @@ describe("BackgroundProcessManager", () => {
 
           const rest = await readEverything(result.processId, head.length + tail.length);
           const all = [...first, ...rest].join("\n");
-          expect(all).toBe([...lines, "cut-\uFFFD\uFFFD-end", "after"].join("\n"));
+          expect(all).toBe([...lines, "cut-é-end", "after"].join("\n"));
         });
       });
 
@@ -3811,6 +3811,31 @@ describe("BackgroundProcessManager", () => {
 
           const { text } = await drainAndRebuild(processId);
           expect(text).toEndWith("xTAIL\nok\n");
+        });
+
+        // A bounded read holds back a character the process may still be writing. Output that
+        // really ends in a truncated character must still settle once the process has exited.
+        it.each([
+          { name: "unfiltered", filter: undefined },
+          { name: "filtered", filter: "^a" },
+        ])("settles $name reads of output that end in a truncated character", async (testCase) => {
+          const result = await manager.spawn(runtime, testWorkspaceId, "printf 'ab\\342\\202'", {
+            cwd: process.cwd(),
+            displayName: "test",
+          });
+          if (!result.success) throw new Error(result.error);
+          for (let attempt = 0; attempt < 100; attempt++) {
+            if ((await manager.getProcess(result.processId))?.status !== "running") break;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+
+          const read = await manager.getOutput(result.processId, testCase.filter, false, 0);
+          if (!read.success) throw new Error(read.error);
+          expect(read.status).toBe("exited");
+          expect(read.output).toBe("ab\uFFFD");
+          expect(read.note ?? "").not.toContain("more bytes are unread");
+          const proc = await manager.getProcess(result.processId);
+          expect(proc?.outputBytesRead).toBe(4);
         });
 
         // A filtered call scans to the file size its first read saw; output that arrives
