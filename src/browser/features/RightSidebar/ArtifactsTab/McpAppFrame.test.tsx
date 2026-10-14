@@ -16,6 +16,7 @@ import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
 import { McpAppFrame } from "./McpAppFrame";
 import {
   markMcpAppViewHosted,
+  setMcpAppViewFullscreenOnly,
   useMcpAppViewFullscreenOnly,
   useMcpAppViewReloadKey,
   type McpAppViewRef,
@@ -1216,6 +1217,30 @@ describe("McpAppFrame host strips", () => {
     } finally {
       window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onOpen);
     }
+  });
+
+  // A view marked by an earlier mount, opened in its tab: the shim's list-less handshake comes
+  // first there. It must not clear the mark, or closing the tab would host the view inline.
+  test("a list-less handshake keeps an earlier mount's fullscreen-only mark", async () => {
+    setMcpAppViewFullscreenOnly("ws-kept", "call-1", true);
+    let isFullscreenOnly = () => false;
+    function FullscreenOnlyProbe() {
+      const marked = useMcpAppViewFullscreenOnly("ws-kept", "call-1");
+      isFullscreenOnly = () => marked;
+      return null;
+    }
+    const view = render(
+      <>
+        <McpAppFrame workspaceId="ws-kept" view={VIEW} />
+        <FullscreenOnlyProbe />
+      </>,
+      { wrapper: Wrapper }
+    );
+    const frame = await findOpenFrame(view);
+    const posted = capturePosted(frame);
+    postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+    await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+    expect(isFullscreenOnly()).toBe(true);
   });
 
   // E.g. "Open in tab" on a collapsed card: the view first initializes in its tab. Its card must

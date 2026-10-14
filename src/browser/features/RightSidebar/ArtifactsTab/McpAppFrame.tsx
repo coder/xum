@@ -678,9 +678,12 @@ export function McpAppFrame(props: {
       // A view that declared fullscreen but not inline is not hosted inline (#6181): marked,
       // its cards show the "Open in tab" notice instead of a frame (mcpAppViewsStore.ts), so a
       // card instance that learns it unmounts, and the user opens the view in its tab. A later
-      // declaration with inline clears the mark.
-      onViewDisplayModes: (modes) =>
-        setMcpAppViewFullscreenOnly(workspaceId, toolCallId, declaresFullscreenOnly(modes)),
+      // declaration with inline clears the mark. A list-less initialize (the window.openai
+      // shim's) says nothing about the modes, so it keeps the mark of an earlier mount.
+      onViewDisplayModes: (modes) => {
+        if (modes === undefined) return;
+        setMcpAppViewFullscreenOnly(workspaceId, toolCallId, declaresFullscreenOnly(modes));
+      },
       setDisplayMode: (mode) => {
         if (mode === "inline" && !isMcpAppViewHosted(workspaceId, toolCallId, "card")) return null;
         return () => {
