@@ -1077,13 +1077,16 @@ function dropLegacyDuplicateRows(
   return dropped;
 }
 
-/** The non-empty string `id` of a metadata.json text, or undefined. */
-function parseMetadataId(raw: string): string | undefined {
+/**
+ * The non-empty string `id` that a legacy metadata.json names. Null when the file does not exist,
+ * undefined when it cannot be read or parsed, or names no id.
+ */
+function readLegacyMetadataId(file: string): string | null | undefined {
   try {
-    const id = (JSON.parse(raw) as { id?: unknown } | null)?.id;
+    const id = (JSON.parse(fs.readFileSync(file, "utf-8")) as { id?: unknown } | null)?.id;
     return typeof id === "string" && id.length > 0 ? id : undefined;
-  } catch {
-    return undefined;
+  } catch (error) {
+    return isEnoentError(error) ? null : undefined;
   }
 }
 
@@ -2192,26 +2195,25 @@ export class Config {
   }
 
   /**
-   * The id buildWorkspaceMetadata's read-time migration gives an id-less legacy row: the id in
-   * sessions/<legacy id>/metadata.json, else in sessions/<checkout basename>/metadata.json, else
-   * the legacy id. Undefined when such a file exists but cannot be read or names no id.
+   * The one id that an id-less legacy row stands for, or undefined when that is not certain. The
+   * read-time migration reads sessions/<legacy id>/metadata.json, and findWorkspace also resolves
+   * the old layout's sessions/<checkout basename>/metadata.json. Every such file that exists must
+   * name the same id. Two different ids, a file that cannot be read, or a file without an id
+   * give undefined, so the caller keeps the row: dropping it would hide the other identity from
+   * known-id checks that delete data (#5929). With no file, the row stands for the legacy id.
    */
   private resolveLegacyRowId(projectPath: string, workspace: Workspace): string | undefined {
     const legacyId = this.generateLegacyId(projectPath, workspace.path);
-    // The same basename expression as buildWorkspaceMetadata.
+    // The same basename expression as buildWorkspaceMetadata (#6485 tracks its Windows gap).
     const basename =
       workspace.path.split("/").pop() ?? workspace.path.split("\\").pop() ?? "unknown";
+    const ids = new Set<string | undefined>();
     for (const candidate of basename === legacyId ? [legacyId] : [legacyId, basename]) {
-      let raw: string;
-      try {
-        raw = fs.readFileSync(path.join(this.sessionsDir, candidate, "metadata.json"), "utf-8");
-      } catch (error) {
-        if (isEnoentError(error)) continue;
-        return undefined;
-      }
-      return parseMetadataId(raw);
+      const id = readLegacyMetadataId(path.join(this.sessionsDir, candidate, "metadata.json"));
+      if (id !== null) ids.add(id);
     }
-    return legacyId;
+    if (ids.size === 0) return legacyId;
+    return ids.size === 1 ? [...ids][0] : undefined;
   }
 
   private normalizeConfigProjects(

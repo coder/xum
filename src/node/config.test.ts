@@ -1584,6 +1584,22 @@ describe("Config", () => {
         });
       }
 
+      it("keeps both rows when the two legacy metadata files name different ids", async () => {
+        const checkout = checkoutPath();
+        writeLegacyMetadata(checkout, "stable-1");
+        // The old layout's sessions/<checkout basename>/metadata.json names a second identity.
+        const basenameDir = path.join(config.sessionsDir, path.basename(checkout));
+        fs.mkdirSync(basenameDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(basenameDir, "metadata.json"),
+          JSON.stringify({ id: "other-1" })
+        );
+        writeLegacyAndIdRows(checkout, "stable-1");
+        const rows = config.loadConfigOrDefault().projects.get("/home/u/repo")?.workspaces;
+        expect(rows?.filter((w) => w.path === checkout)).toHaveLength(2);
+        expect(aliasConflictBackups()).toHaveLength(0);
+      });
+
       it("keeps both rows and loads normally when the rows have no path", () => {
         fs.writeFileSync(
           path.join(tempDir, "config.json"),
