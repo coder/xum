@@ -6012,4 +6012,24 @@ describe("describeSignInChanges", () => {
       "Client registration changed (https://reg.example.com/tenant-a/register → https://reg.example.com/tenant-b/register)",
     ]);
   });
+
+  test("names a discovery URL added or removed on a host both versions use (#6565)", () => {
+    const before = { authorizationServerBase: "https://id.example.com/tenant-a" };
+    const after = {
+      authorizationServerBase: "https://id.example.com/tenant-b",
+      registrationUrl: "https://id.example.com/register",
+    };
+    expect(
+      describeSignInChanges(signIn({ discovery: before }), signIn({ discovery: after }))
+    ).toEqual([
+      "Sign-in server changed (https://id.example.com/tenant-a → https://id.example.com/tenant-b)",
+      "Client registration added (https://id.example.com/register)",
+    ]);
+    expect(
+      describeSignInChanges(signIn({ discovery: after }), signIn({ discovery: before }))
+    ).toEqual([
+      "Sign-in server changed (https://id.example.com/tenant-b → https://id.example.com/tenant-a)",
+      "Client registration removed (https://id.example.com/register)",
+    ]);
+  });
 });

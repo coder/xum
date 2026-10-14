@@ -542,25 +542,45 @@ function discoveryHosts(discovery: SignInDiscovery): Set<string> {
   );
 }
 
-/** `name changed (x → y)` for a URL that moved on its host (a host move has its own line). */
-function pathMoveLine(
+/**
+ * The line for one discovery URL whose host the host lines do not name: `changed (x → y)` for a
+ * move on its host, `added`/`removed` for a URL on a host that both versions use (#6565).
+ */
+function discoveryFieldLine(
   name: string,
   key: "authorizationServerBase" | "registrationUrl",
-  a: SignInDiscovery,
-  b: SignInDiscovery
+  [a, b]: [SignInDiscovery, SignInDiscovery],
+  hosts: [Set<string>, Set<string>]
 ): string[] {
   const [x, y] = [a?.[key], b?.[key]];
-  if (x === undefined || y === undefined || x === y) return [];
+  if (x === y) return [];
+  if (x === undefined || y === undefined) return addedOrRemovedLine(name, x, y, hosts);
   return new URL(x).host === new URL(y).host ? [`${name} changed (${x} → ${y})`] : [];
+}
+
+/** See discoveryFieldLine: exactly one of `x` (before) and `y` (after) is defined. */
+function addedOrRemovedLine(
+  name: string,
+  x: string | undefined,
+  y: string | undefined,
+  [oldHosts, newHosts]: [Set<string>, Set<string>]
+): string[] {
+  const url = x ?? y;
+  if (url === undefined) return [];
+  // The other version must use this host; otherwise its host line names the change.
+  const otherHosts = x === undefined ? oldHosts : newHosts;
+  if (!otherHosts.has(new URL(url).host)) return [];
+  return [`${name} ${x === undefined ? "added" : "removed"} (${url})`];
 }
 
 /**
  * Review lines for the sign-in discovery URLs: one per added or removed host, and one per URL
- * that moved on its host. Tenants share a host (`/tenant-a` → `/tenant-b`), so a path move gets
- * its own line, also when another discovery URL changed host (#6164).
+ * that changed on a host both versions use. Tenants share a host (`/tenant-a` → `/tenant-b`), so
+ * a path move gets its own line, also when another discovery URL changed host (#6164).
  */
 function describeDiscoveryChanges(a: SignInDiscovery, b: SignInDiscovery): string[] {
-  const [oldHosts, newHosts] = [discoveryHosts(a), discoveryHosts(b)];
+  const hosts: [Set<string>, Set<string>] = [discoveryHosts(a), discoveryHosts(b)];
+  const [oldHosts, newHosts] = hosts;
   const lines = [
     ...[...newHosts]
       .filter((host) => !oldHosts.has(host))
@@ -568,8 +588,8 @@ function describeDiscoveryChanges(a: SignInDiscovery, b: SignInDiscovery): strin
     ...[...oldHosts]
       .filter((host) => !newHosts.has(host))
       .map((host) => `Sign-in at ${host} (removed)`),
-    ...pathMoveLine("Sign-in server", "authorizationServerBase", a, b),
-    ...pathMoveLine("Client registration", "registrationUrl", a, b),
+    ...discoveryFieldLine("Sign-in server", "authorizationServerBase", [a, b], hosts),
+    ...discoveryFieldLine("Client registration", "registrationUrl", [a, b], hosts),
   ];
   if (lines.length === 0 && stableStringify(a ?? null) !== stableStringify(b ?? null))
     lines.push("Sign-in server changed");

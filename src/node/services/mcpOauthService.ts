@@ -41,6 +41,9 @@ import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 
 const DEFAULT_DESKTOP_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_SERVER_TIMEOUT_MS = 10 * 60 * 1000;
+const OAUTH_FLOW_CANCELLED = "OAuth flow cancelled";
+/** Caller-generated flow IDs double as the OAuth state, so they must be long and URL-safe. */
+const CALLER_FLOW_ID_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
 const COMPLETED_FLOW_TTL_MS = 60 * 1000;
 /** Shown on the callback page when a sign-out or another sign-in superseded this sign-in. */
 const DROPPED_SIGN_IN_ERROR =
@@ -140,10 +143,23 @@ interface OAuthFlowBase {
   resultPromise: Promise<Result<void, string>>;
   resolveResult: (result: Result<void, string>) => void;
   settled: boolean;
+  /**
+   * Set when mcp_oauth_flow_started was sent. A flow that settles before (deadline, Cancel,
+   * sign-out or shutdown during discovery) sends no end event either (#6565).
+   */
+  startReported: boolean;
   /** The server key's sign-out generation when the flow started (see signOutGenerations). */
   signOutGeneration: number;
   /** Aborted when the flow settles: the start's discovery requests end with it (#6164). */
   startAbort: AbortController;
+}
+
+/** The server a sign-in runs against (see resolveServerForOauthFlow). */
+interface OAuthFlowServer {
+  serverUrlForDiscovery: string;
+  serverUrlForStoreKey: string;
+  transport: "http" | "sse" | "auto";
+  oauth?: MCPServerOAuthConfig;
 }
 
 interface DesktopFlow extends OAuthFlowBase {
@@ -1027,6 +1043,12 @@ export class McpOauthService {
 
   private readonly desktopFlows = new Map<string, DesktopFlow>();
   private readonly serverFlows = new Map<string, ServerFlow>();
+  /**
+   * Cancels that named a caller flow ID before its flow was registered (the start still
+   * resolved the server config or bound the listener), keyed by ID with the cancel time.
+   * The start refuses such a flow at registration (#6565).
+   */
+  private readonly preCancelledFlowIds = new Map<string, number>();
   private readonly telemetryService?: TelemetryService;
 
   constructor(
@@ -1312,17 +1334,7 @@ export class McpOauthService {
     projectPath: string;
     serverName: string;
     pendingServer?: MCPOAuthPendingServerConfig;
-  }): Promise<
-    Result<
-      {
-        serverUrlForDiscovery: string;
-        serverUrlForStoreKey: string;
-        transport: "http" | "sse" | "auto";
-        oauth?: MCPServerOAuthConfig;
-      },
-      string
-    >
-  > {
+  }): Promise<Result<OAuthFlowServer, string>> {
     if (input.pendingServer) {
       // Defensive: pendingServer comes from user input (add-server form), so validate.
       const transport = input.pendingServer.transport;
@@ -1374,62 +1386,74 @@ export class McpOauthService {
     });
   }
 
+  /** A desktop callback with another flow's state: answers 400 and fails a started flow. */
+  private rejectDesktopState(flowId: string, res: http.ServerResponse): void {
+    res.statusCode = 400;
+    res.setHeader("Content-Type", "text/html");
+    res.end("<h1>Invalid OAuth state</h1>");
+
+    // Strict state validation: if we receive an OAuth callback that doesn't
+    // match the active flow state, fail the flow rather than waiting for a timeout.
+    //
+    // Note: We only fail once the flow has an authorizeUrl to avoid cancelling
+    // due to unrelated localhost probes against the ephemeral loopback port.
+    const flow = this.desktopFlows.get(flowId);
+    if (flow?.authorizeUrl && !flow?.settled) {
+      void this.finishDesktopFlow(flowId, Err("Invalid OAuth state"));
+    }
+  }
+
+  /** The desktop flow's loopback listener: only GET /callback with the flow's state counts. */
+  private handleDesktopRequest(
+    flowId: string,
+    req: http.IncomingMessage,
+    res: http.ServerResponse
+  ): void {
+    const reqUrl = req.url ?? "/";
+    const url = new URL(reqUrl, "http://localhost");
+
+    if (req.method !== "GET" || url.pathname !== "/callback") {
+      res.statusCode = 404;
+      res.end("Not found");
+      return;
+    }
+
+    if (url.searchParams.get("state") !== flowId) {
+      this.rejectDesktopState(flowId, res);
+      return;
+    }
+
+    const code = url.searchParams.get("code");
+    const error = url.searchParams.get("error");
+    const errorDescription = url.searchParams.get("error_description") ?? undefined;
+    const iss = url.searchParams.get("iss");
+
+    void this.handleDesktopCallback({
+      flowId,
+      code,
+      iss,
+      error,
+      errorDescription,
+      res,
+    });
+  }
+
   async startDesktopFlow(input: {
     projectPath: string;
     serverName: string;
     pendingServer?: MCPOAuthPendingServerConfig;
+    flowId?: string;
   }): Promise<Result<{ flowId: string; authorizeUrl: string; redirectUri: string }, string>> {
-    const serverConfig = await this.resolveServerForOauthFlow(input);
-    if (!serverConfig.success) {
-      return Err(serverConfig.error);
-    }
+    const prepared = await this.prepareFlowStart(input);
+    if (!prepared.success) return prepared;
+    const { flowId, server } = prepared.data;
 
-    const flowId = crypto.randomUUID();
     const { promise: resultPromise, resolve: resolveResult } =
       createDeferred<Result<void, string>>();
 
-    const serverListener = http.createServer((req, res) => {
-      const reqUrl = req.url ?? "/";
-      const url = new URL(reqUrl, "http://localhost");
-
-      if (req.method !== "GET" || url.pathname !== "/callback") {
-        res.statusCode = 404;
-        res.end("Not found");
-        return;
-      }
-
-      const state = url.searchParams.get("state");
-      if (state !== flowId) {
-        res.statusCode = 400;
-        res.setHeader("Content-Type", "text/html");
-        res.end("<h1>Invalid OAuth state</h1>");
-
-        // Strict state validation: if we receive an OAuth callback that doesn't
-        // match the active flow state, fail the flow rather than waiting for a timeout.
-        //
-        // Note: We only fail once the flow has an authorizeUrl to avoid cancelling
-        // due to unrelated localhost probes against the ephemeral loopback port.
-        const flow = this.desktopFlows.get(flowId);
-        if (flow?.authorizeUrl && !flow?.settled) {
-          void this.finishDesktopFlow(flowId, Err("Invalid OAuth state"));
-        }
-        return;
-      }
-
-      const code = url.searchParams.get("code");
-      const error = url.searchParams.get("error");
-      const errorDescription = url.searchParams.get("error_description") ?? undefined;
-      const iss = url.searchParams.get("iss");
-
-      void this.handleDesktopCallback({
-        flowId,
-        code,
-        iss,
-        error,
-        errorDescription,
-        res,
-      });
-    });
+    const serverListener = http.createServer((req, res) =>
+      this.handleDesktopRequest(flowId, req, res)
+    );
 
     try {
       await new Promise<void>((resolve, reject) => {
@@ -1448,11 +1472,15 @@ export class McpOauthService {
     }
 
     const redirectUri = `http://127.0.0.1:${address.port}/callback`;
+    if (this.preCancelledFlowIds.delete(flowId)) {
+      await closeServer(serverListener).catch(() => undefined);
+      return Err(OAUTH_FLOW_CANCELLED);
+    }
 
     // Register the flow and start its deadline before any network request, so the deadline,
     // Cancel and a sign-out also end a stalled discovery (#6164).
     const flow: DesktopFlow = {
-      ...this.newFlowBase(input, serverConfig.data, redirectUri),
+      ...this.newFlowBase(input, server, redirectUri),
       server: serverListener,
       timeout: setTimeout(() => {
         void this.finishDesktopFlow(flowId, Err("Timed out waiting for OAuth callback"));
@@ -1463,7 +1491,7 @@ export class McpOauthService {
     };
     this.desktopFlows.set(flowId, flow);
 
-    const started = await this.beginAuthorization(flow, serverConfig.data.oauth);
+    const started = await this.beginAuthorization(flow, server.oauth);
     if (!started.success) {
       await this.finishDesktopFlow(flowId, started);
       return started;
@@ -1500,6 +1528,7 @@ export class McpOauthService {
       codeVerifier: null,
       cleanupTimeout: null,
       settled: false,
+      startReported: false,
       signOutGeneration: this.signOutGeneration(server.serverUrlForStoreKey),
       startAbort: new AbortController(),
     };
@@ -1530,6 +1559,7 @@ export class McpOauthService {
       );
       if (flow.settled) return await flow.resultPromise;
 
+      flow.startReported = true;
       this.captureTelemetry({
         event: "mcp_oauth_flow_started",
         properties: {
@@ -1590,10 +1620,46 @@ export class McpOauthService {
 
   async cancelDesktopFlow(flowId: string): Promise<void> {
     const flow = this.desktopFlows.get(flowId);
-    if (!flow) return;
+    if (!flow) return this.recordPreCancel(flowId);
 
     log.debug("[MCP OAuth] Desktop flow cancelled", { flowId });
-    await this.finishDesktopFlow(flowId, Err("OAuth flow cancelled"));
+    await this.finishDesktopFlow(flowId, Err(OAUTH_FLOW_CANCELLED));
+  }
+
+  /**
+   * The flow ID and server of a new sign-in. A Cancel that named the caller's ID while the
+   * server lookup ran refuses the start (see preCancelledFlowIds).
+   */
+  private async prepareFlowStart(input: {
+    projectPath: string;
+    serverName: string;
+    pendingServer?: MCPOAuthPendingServerConfig;
+    flowId?: string;
+  }): Promise<Result<{ flowId: string; server: OAuthFlowServer }, string>> {
+    const claimed = this.claimFlowId(input.flowId);
+    if (!claimed.success) return claimed;
+    const server = await this.resolveServerForOauthFlow(input);
+    if (!server.success) return server;
+    if (this.preCancelledFlowIds.delete(claimed.data)) return Err(OAUTH_FLOW_CANCELLED);
+    return Ok({ flowId: claimed.data, server: server.data });
+  }
+
+  /** The caller's flow ID (validated and unused), or a new one when the caller sent none. */
+  private claimFlowId(flowId: string | undefined): Result<string, string> {
+    if (flowId === undefined) return Ok(crypto.randomUUID());
+    if (!CALLER_FLOW_ID_PATTERN.test(flowId)) return Err("Invalid OAuth flow ID");
+    if (this.desktopFlows.has(flowId) || this.serverFlows.has(flowId))
+      return Err("OAuth flow ID already in use");
+    return Ok(flowId);
+  }
+
+  /** Remembers a Cancel for a flow that is still starting (see preCancelledFlowIds). */
+  private recordPreCancel(flowId: string): void {
+    const cutoff = Date.now() - DEFAULT_SERVER_TIMEOUT_MS;
+    for (const [id, cancelledAt] of this.preCancelledFlowIds) {
+      if (cancelledAt < cutoff) this.preCancelledFlowIds.delete(id);
+    }
+    if (CALLER_FLOW_ID_PATTERN.test(flowId)) this.preCancelledFlowIds.set(flowId, Date.now());
   }
 
   async startServerFlow(input: {
@@ -1601,11 +1667,11 @@ export class McpOauthService {
     serverName: string;
     redirectUri: string;
     pendingServer?: MCPOAuthPendingServerConfig;
+    flowId?: string;
   }): Promise<Result<{ flowId: string; authorizeUrl: string; redirectUri: string }, string>> {
-    const serverConfig = await this.resolveServerForOauthFlow(input);
-    if (!serverConfig.success) {
-      return Err(serverConfig.error);
-    }
+    const prepared = await this.prepareFlowStart(input);
+    if (!prepared.success) return prepared;
+    const { flowId, server } = prepared.data;
 
     let redirectUri: URL;
     try {
@@ -1618,13 +1684,12 @@ export class McpOauthService {
       return Err("OAuth redirect URI must be http(s)");
     }
 
-    const flowId = crypto.randomUUID();
     const { promise: resultPromise, resolve: resolveResult } =
       createDeferred<Result<void, string>>();
 
     // Registered before any network request, like the desktop flow (#6164).
     const flow: ServerFlow = {
-      ...this.newFlowBase(input, serverConfig.data, redirectUri.toString()),
+      ...this.newFlowBase(input, server, redirectUri.toString()),
       timeout: setTimeout(() => {
         void this.finishServerFlow(flowId, Err("Timed out waiting for OAuth callback"));
       }, DEFAULT_SERVER_TIMEOUT_MS),
@@ -1634,7 +1699,7 @@ export class McpOauthService {
     };
     this.serverFlows.set(flowId, flow);
 
-    const started = await this.beginAuthorization(flow, serverConfig.data.oauth);
+    const started = await this.beginAuthorization(flow, server.oauth);
     if (!started.success) {
       await this.finishServerFlow(flowId, started);
       return started;
@@ -1680,10 +1745,10 @@ export class McpOauthService {
 
   async cancelServerFlow(flowId: string): Promise<void> {
     const flow = this.serverFlows.get(flowId);
-    if (!flow) return;
+    if (!flow) return this.recordPreCancel(flowId);
 
     log.debug("[MCP OAuth] Server flow cancelled", { flowId });
-    await this.finishServerFlow(flowId, Err("OAuth flow cancelled"));
+    await this.finishServerFlow(flowId, Err(OAUTH_FLOW_CANCELLED));
   }
 
   async handleServerCallbackAndExchange(input: {
@@ -2080,6 +2145,25 @@ export class McpOauthService {
     }
   }
 
+  /** mcp_oauth_flow_completed or _failed, for a flow that sent its start event. */
+  private captureFlowEndTelemetry(flow: OAuthFlowBase, result: Result<void, string>): void {
+    if (!flow.startReported) return;
+    const properties = {
+      transport: flow.transport,
+      duration_ms_b2: roundToBase2(Math.max(0, Date.now() - flow.startedAtMs)),
+      has_scope_hint: Boolean(flow.scope),
+      has_resource_metadata_hint: Boolean(flow.resourceMetadataUrl),
+    };
+    if (result.success) {
+      this.captureTelemetry({ event: "mcp_oauth_flow_completed", properties });
+      return;
+    }
+    this.captureTelemetry({
+      event: "mcp_oauth_flow_failed",
+      properties: { ...properties, error_category: this.getOAuthFlowErrorCategory(result.error) },
+    });
+  }
+
   private async finishDesktopFlow(flowId: string, result: Result<void, string>): Promise<void> {
     const flow = this.desktopFlows.get(flowId);
     if (!flow || flow.settled) return;
@@ -2088,34 +2172,7 @@ export class McpOauthService {
     clearTimeout(flow.timeout);
     flow.startAbort.abort();
 
-    const durationMs = Math.max(0, Date.now() - flow.startedAtMs);
-    const durationMsB2 = roundToBase2(durationMs);
-    const hasScopeHint = Boolean(flow.scope);
-    const hasResourceMetadataHint = Boolean(flow.resourceMetadataUrl);
-
-    if (result.success) {
-      this.captureTelemetry({
-        event: "mcp_oauth_flow_completed",
-        properties: {
-          transport: flow.transport,
-          duration_ms_b2: durationMsB2,
-          has_scope_hint: hasScopeHint,
-          has_resource_metadata_hint: hasResourceMetadataHint,
-        },
-      });
-    } else {
-      const errorCategory = this.getOAuthFlowErrorCategory(result.error);
-      this.captureTelemetry({
-        event: "mcp_oauth_flow_failed",
-        properties: {
-          transport: flow.transport,
-          duration_ms_b2: durationMsB2,
-          has_scope_hint: hasScopeHint,
-          has_resource_metadata_hint: hasResourceMetadataHint,
-          error_category: errorCategory,
-        },
-      });
-    }
+    this.captureFlowEndTelemetry(flow, result);
 
     try {
       flow.resolveResult(result);
@@ -2143,34 +2200,7 @@ export class McpOauthService {
     clearTimeout(flow.timeout);
     flow.startAbort.abort();
 
-    const durationMs = Math.max(0, Date.now() - flow.startedAtMs);
-    const durationMsB2 = roundToBase2(durationMs);
-    const hasScopeHint = Boolean(flow.scope);
-    const hasResourceMetadataHint = Boolean(flow.resourceMetadataUrl);
-
-    if (result.success) {
-      this.captureTelemetry({
-        event: "mcp_oauth_flow_completed",
-        properties: {
-          transport: flow.transport,
-          duration_ms_b2: durationMsB2,
-          has_scope_hint: hasScopeHint,
-          has_resource_metadata_hint: hasResourceMetadataHint,
-        },
-      });
-    } else {
-      const errorCategory = this.getOAuthFlowErrorCategory(result.error);
-      this.captureTelemetry({
-        event: "mcp_oauth_flow_failed",
-        properties: {
-          transport: flow.transport,
-          duration_ms_b2: durationMsB2,
-          has_scope_hint: hasScopeHint,
-          has_resource_metadata_hint: hasResourceMetadataHint,
-          error_category: errorCategory,
-        },
-      });
-    }
+    this.captureFlowEndTelemetry(flow, result);
 
     try {
       flow.resolveResult(result);
