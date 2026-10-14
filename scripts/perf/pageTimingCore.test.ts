@@ -4,8 +4,10 @@ import {
   PAGE_SETUP,
   TARGET,
   hostIsQuiet,
+  hostState,
   pairDiffs,
   qualifyHostPage,
+  reapRun,
   runOnQuietHost,
   seedRewrites,
   serviceWorkerProofFailures,
@@ -50,6 +52,33 @@ test("the host rule needs both a low load and low CPU pressure", () => {
   expect(hostIsQuiet(1, null, 32)).toBe(true); // no PSI (macOS, older kernels)
 });
 
+test("each run records the host's 1-minute load and PSI cpu some avg10, or null without PSI", () => {
+  const psi = "some avg10=12.50 avg60=3.00 avg300=1.00 total=9\nfull avg10=0.00 avg60=0.00";
+  expect(hostState(3.2, psi)).toEqual({ load1: 3.2, cpuSomeAvg10: 12.5 });
+  expect(hostState(3.2, null)).toEqual({ load1: 3.2, cpuSomeAvg10: null });
+  expect(() => hostState(3.2, "garbage")).toThrow("/proc/pressure/cpu");
+});
+
+test("processes of a run that outlive the server by 10 s are killed before it returns, and the run is invalid", async () => {
+  let [alive, killed, sleeps] = [[41, 42], [] as number[], 0];
+  // A real macrotask per poll: a reaper that never ends fails on the test timeout instead of hanging.
+  const sleep = () => new Promise<void>((resolve) => setImmediate(() => resolve(void sleeps++)));
+  const kill = (pid: number) => {
+    killed.push(pid);
+    alive = alive.filter((p) => p !== pid);
+    if (pid === 41) alive.push(43); // 41 forks after the SIGKILL was sent: the child is killed too
+  };
+  await expect(reapRun(() => alive, kill, sleep)).rejects.toThrow("were killed");
+  expect([killed, alive, sleeps]).toEqual([[41, 42, 43], [], 102]); // 100 waits of 100 ms first
+  let polls = 3; // exits on its own within the wait: nothing is killed
+  await reapRun(() => (polls-- > 0 ? [7] : []), kill, sleep);
+  expect(killed).toEqual([41, 42, 43]);
+  let late = 130; // gone 30 polls after its SIGKILL (uninterruptible I/O): the reaper still waits for it
+  const lingering = () => (late-- > 0 ? [9] : []);
+  await expect(reapRun(lingering, () => {}, sleep)).rejects.toThrow("were killed");
+  expect(late).toBeLessThan(0);
+});
+
 test("paired differences are head - base in pair order, and a missing or doubled arm is refused", () => {
   const run = (pair: number, arm: Run["arm"], ucs: number): Run => ({
     page: "p2",
@@ -65,7 +94,7 @@ test("paired differences are head - base in pair order, and a missing or doubled
   expect(() => pairDiffs([...runs, run(1, "head", 7)], "p2", "ucs")).toThrow("two head runs");
 });
 
-test("a page's MDI pools the pairs of every A/A block it ran", () => {
+test("a page's MDI pools the pairs of every A/A block it ran, and a qualified page's MDI meets the limits", () => {
   const quiet = [0.02, -0.03, 0.01, 0, -0.01, 0.04, -0.02, 0.03];
   const noisy = [0.2, 0.25, 0.21, 0.19, 0.22, 0.3, 0.18, 0.2]; // median 0.205 fails qualification
   const one = qualifyHostPage([{ ucs: noisy, ir: quiet }]);
@@ -74,10 +103,16 @@ test("a page's MDI pools the pairs of every A/A block it ran", () => {
     { ucs: noisy, ir: quiet },
     { ucs: quiet, ir: quiet },
   ]);
-  expect(two.qualification).toBe("qualified");
+  expect(two.qualification).toBe("inconclusive"); // block 2 passes alone, the pooled MDI misses 0.25 s
   // Alone, the quiet block's d(7) is at most 0.04 s (MDI <= 0.08 s). The pooled MDI keeps the noisy pairs.
   expect(one.mdi.ucs).toBeGreaterThanOrEqual(0.36);
-  expect(two.mdi.ucs).toBeGreaterThan(0.08);
+  expect(two.mdi.ucs).toBeGreaterThan(0.25);
+  const near = Array<number>(8).fill(0.11); // fails on its median only: the pooled MDI stays <= 0.22 s
+  const blocks = [
+    { ucs: near, ir: quiet },
+    { ucs: quiet, ir: quiet },
+  ];
+  expect(qualifyHostPage(blocks).qualification).toBe("qualified");
 });
 
 test("a seed check ignores only the token stats cache the app adds to session-usage.json", () => {

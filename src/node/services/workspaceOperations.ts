@@ -208,7 +208,8 @@ export async function createWorkspace(context: ORPCContext, input: CreateWorkspa
     input.runtimeConfig,
     input.subProjectPath,
     input.pendingAutoTitle,
-    input.tags
+    input.tags,
+    { nameGeneration: input.nameGeneration }
   );
   return result.success
     ? { success: true as const, metadata: result.data.metadata }

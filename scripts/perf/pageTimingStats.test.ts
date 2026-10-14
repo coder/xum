@@ -25,6 +25,18 @@ describe("qualification", () => {
     expect(signalQualifies("ir", outliers(4))).toBe(true);
     expect(signalQualifies("ir", shift(0.31))).toBe(false);
   });
+
+  // The owner's rule (#6204): a qualified block can detect a 0.25 s UCS or 0.30 s IR change. One slow
+  // pair sets the MDI (2 x its d), so it fails a block whose median and outlier count pass.
+  test("a block with an MDI over 0.25 s (UCS) or 0.30 s (IR) does not qualify", () => {
+    const onePair = (d: number) => [d, ...quiet.slice(1)];
+    expect(signalQualifies("ucs", onePair(0.2))).toBe(true);
+    expect(qualifyPage([page(onePair(0.12))])).toBe("qualified");
+    expect(qualifyPage([page(onePair(0.2))])).toBe("needs-confirmation");
+    expect(qualifyPage([{ ucs: quiet, ir: onePair(0.14) }])).toBe("qualified");
+    expect(qualifyPage([{ ucs: quiet, ir: onePair(0.2) }])).toBe("needs-confirmation");
+    expect(qualifyPage([page(onePair(0.2)), page(onePair(0.2))])).toBe("inconclusive");
+  });
 });
 
 describe("gate", () => {
