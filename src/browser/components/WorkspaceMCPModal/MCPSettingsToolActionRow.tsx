@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Loader2 } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import {
@@ -113,6 +113,8 @@ function SettingsAppModal(props: {
   onClose: () => void;
 }) {
   const { view } = props.app;
+  // The frame's close sequence: Escape and outside clicks give the view its teardown too.
+  const closeFrame = useRef<(() => void) | null>(null);
   const ref: McpAppViewRef = {
     toolCallId: view.viewKey,
     serverName: view.serverName,
@@ -125,7 +127,14 @@ function SettingsAppModal(props: {
     failed: false,
   };
   return (
-    <Dialog open onOpenChange={(open) => !open && props.onClose()}>
+    <Dialog
+      open
+      onOpenChange={(open) => {
+        if (open) return;
+        if (closeFrame.current) closeFrame.current();
+        else props.onClose();
+      }}
+    >
       {/* The panel frame has its own Close header. */}
       <DialogContent
         showCloseButton={false}
@@ -147,6 +156,7 @@ function SettingsAppModal(props: {
           view={ref}
           variant="panel"
           onClose={props.onClose}
+          closeRef={closeFrame}
         />
       </DialogContent>
     </Dialog>

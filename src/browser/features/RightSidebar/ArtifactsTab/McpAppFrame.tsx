@@ -251,6 +251,11 @@ export function McpAppFrame(props: {
   variant?: McpAppFrameVariant;
   /** Panel only: closes the panel's host (its app tab). */
   onClose?: () => void;
+  /**
+   * Panel only: receives the frame's close sequence (the view's teardown, then onClose), so a
+   * host's own dismissal (a modal's Escape or outside click) closes the view the same way.
+   */
+  closeRef?: { current: (() => void) | null };
 }) {
   const inline = props.variant === "inline";
   const { api } = useAPI();
@@ -549,6 +554,14 @@ export function McpAppFrame(props: {
     await hostRef.current?.teardown("closed");
     props.onClose?.();
   };
+  const { closeRef } = props;
+  useEffect(() => {
+    if (closeRef === undefined) return;
+    closeRef.current = () => void close();
+    return () => {
+      closeRef.current = null;
+    };
+  });
 
   const header = inline ? null : (
     <McpAppViewHeader serverName={serverName} onClose={() => void close()} />
