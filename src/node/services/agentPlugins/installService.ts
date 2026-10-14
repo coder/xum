@@ -214,8 +214,8 @@ function stableStringify(value: unknown): string {
 type CollectedPluginSkill = AgentPluginPreviewSkill & {
   /** Load-time consent fingerprint (componentConsent.ts): root-relative dir + frontmatter. */
   consentFingerprint: string;
-  /** The fingerprinted fields as text (componentConsent.ts skillConsentDetail). */
-  consentDetail: string;
+  /** The fingerprinted fields as text (componentConsent.ts skillConsentDetail), built on demand. */
+  consentDetail: () => string;
   whenToUse?: string;
   advertise?: boolean;
   paths?: string[];
@@ -247,26 +247,41 @@ function skillChangeSummary(current: SurfaceSkill, staged: SurfaceSkill, name: s
 /** Both consent views of one skill (componentConsent.ts). */
 function skillConsentFields(args: Parameters<typeof skillConsentFingerprint>[0]): {
   consentFingerprint: string;
-  consentDetail: string;
+  consentDetail: () => string;
 } {
   return {
     consentFingerprint: skillConsentFingerprint(args),
-    consentDetail: skillConsentDetail(args),
+    consentDetail: () => skillConsentDetail(args),
   };
 }
 
 /**
- * Before/after for a changed skill or server. When the usual summaries are equal, a
- * non-displayed fingerprinted field changed (a header, an OAuth scope, a frontmatter key):
- * show the fingerprinted fields so the user can see what they approve.
+ * The review text of a skill or server: its usual summary plus every fingerprinted field. The
+ * review records the fingerprint, which covers fields the summary omits (a header, an OAuth scope,
+ * a frontmatter key), so the user must see all of them to approve what is recorded.
  */
-function reviewValues(
-  current: { display: string; consentDetail: string },
-  staged: { display: string; consentDetail: string }
-): { before: string; after: string } {
-  return current.display !== staged.display
-    ? { before: current.display, after: staged.display }
-    : { before: current.consentDetail, after: staged.consentDetail };
+function reviewText(item: { display: string; consentDetail: () => string }): string {
+  return `${item.display}\n\nReviewed fields: ${item.consentDetail()}`;
+}
+
+/**
+ * Upper bound on the text of one review. Frontmatter fields have no size limit, so a crafted
+ * package could make a review too large to send and render. Over the bound, Xum refuses the review
+ * (fails closed) instead of truncating text the user would approve.
+ */
+const MAX_REVIEW_TEXT_CHARS = 1_000_000;
+
+function assertReviewFits(changes: readonly AgentPluginCapabilityChange[]): void {
+  const size = changes.reduce(
+    (total, change) =>
+      total + change.summary.length + (change.before?.length ?? 0) + (change.after?.length ?? 0),
+    0
+  );
+  if (size > MAX_REVIEW_TEXT_CHARS) {
+    throw new Error(
+      "This plugin's review is too large to show, so Xum cannot apply it. Reinstall the plugin or contact its publisher."
+    );
+  }
 }
 
 /** List row field: managed rows count imported components that need a review (#6498). */
@@ -341,7 +356,7 @@ function unreviewedRow(
     {
       summary: `${COMPONENT_LABELS[kind]} '${name}' needs review`,
       before: reviewedBefore(entry.componentConsent, kind, name),
-      after: item.display,
+      after: reviewText(item),
       component: { kind, name, fingerprint },
     },
   ];
@@ -648,8 +663,8 @@ interface SurfaceSkill {
   fingerprint: string;
   consentFingerprint: string;
   display: string;
-  /** Shown instead of `display` when only non-displayed fingerprinted fields changed. */
-  consentDetail: string;
+  /** Every fingerprinted field as text, built on demand for a review row (see reviewText). */
+  consentDetail: () => string;
 }
 
 interface SurfaceServer {
@@ -658,8 +673,8 @@ interface SurfaceServer {
   /** Load-time consent fingerprint (componentConsent.ts). */
   consentFingerprint: string;
   display: string;
-  /** Shown instead of `display` when only non-displayed fingerprinted fields changed. */
-  consentDetail: string;
+  /** Every fingerprinted field as text, built on demand for a review row (see reviewText). */
+  consentDetail: () => string;
   signIn?: SurfaceSignIn;
 }
 
@@ -1771,7 +1786,7 @@ export class AgentPluginInstallService {
         servers.set(info.plugin.serverName, {
           fingerprint,
           consentFingerprint,
-          consentDetail: serverConsentDetail(info, paths),
+          consentDetail: () => serverConsentDetail(info, paths),
           display: this.describeMcpServer(info, rewrite, finalTargetPath).summary,
           ...(signIn !== undefined ? { signIn } : {}),
         });
@@ -1870,7 +1885,8 @@ export class AgentPluginInstallService {
         const authLines = describeSignInChanges(currentServer.signIn, server.signIn);
         changes.push({
           summary: [`changes MCP server '${serverName}'`, ...authLines].join(": "),
-          ...reviewValues(currentServer, server),
+          before: reviewText(currentServer),
+          after: reviewText(server),
           component,
         });
       }
@@ -1923,7 +1939,8 @@ export class AgentPluginInstallService {
         // frontmatter field shows here. The summary names an advertisement change when there is one.
         changes.push({
           summary: skillChangeSummary(currentSkill, skill, skillName),
-          ...reviewValues(currentSkill, skill),
+          before: reviewText(currentSkill),
+          after: reviewText(skill),
           component,
         });
       }
@@ -1951,6 +1968,7 @@ export class AgentPluginInstallService {
         changes.push({ summary: `adds ${component}` });
       }
     }
+    assertReviewFits(changes);
     return changes;
   }
 
@@ -4572,7 +4590,7 @@ export class AgentPluginInstallService {
     name: string;
     expectedLockedSha: string;
     reviewed: AgentPluginComponentRef[];
-  }): Promise<AgentPluginInstallEntry> {
+  }): Promise<{ entry: AgentPluginInstallEntry; cleanupWarning?: string }> {
     const data = await this.runExclusive(async () => {
       const { envelope, rawEntries } = await this.readRegistryDocument("strict");
       const entry = this.parseRegistryEntries(rawEntries, "strict").find(
@@ -4600,16 +4618,15 @@ export class AgentPluginInstallService {
       return { ...entry, componentConsent };
     });
     // Newly consented servers can start: reconcile after the lock, like setComponents. The
-    // consent is committed, so a reconcile failure must not report the review as failed.
+    // consent is committed, so a reconcile failure is a warning, not a failed review.
     try {
       await this.deps.mcpServerManager?.reconcilePluginComponents();
+      return { entry: data };
     } catch (error) {
-      log.warn("Component review saved, but MCP reconciliation failed", {
-        name: args.name,
-        error: getErrorMessage(error),
-      });
+      const cleanupWarning = `Review saved, but MCP servers need a restart to apply it: ${getErrorMessage(error)}`;
+      log.warn(cleanupWarning, { name: args.name });
+      return { entry: data, cleanupWarning };
     }
-    return data;
   }
 
   /** Review rows for imported components without a matching consent record. */
@@ -4627,7 +4644,9 @@ export class AgentPluginInstallService {
       targetPath,
       warnings
     );
-    return { changes: unreviewedRows(entry, surface), warnings };
+    const changes = unreviewedRows(entry, surface);
+    assertReviewFits(changes);
+    return { changes, warnings };
   }
 
   async previewUpdate(args: { name: string }): Promise<AgentPluginUpdateReview> {

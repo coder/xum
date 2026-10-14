@@ -1609,8 +1609,8 @@ describe("AgentPluginInstallService", () => {
       expectedLockedSha: review.fromSha,
       reviewed: review.changes.flatMap((change) => (change.component ? [change.component] : [])),
     });
-    expect(Object.keys(confirmed.componentConsent?.mcpServers ?? {})).toEqual(["echo"]);
-    expect(confirmed.componentConsent?.skills).toEqual({});
+    expect(Object.keys(confirmed.entry.componentConsent?.mcpServers ?? {})).toEqual(["echo"]);
+    expect(confirmed.entry.componentConsent?.skills).toEqual({});
     const again = await service.previewComponentReview({ name: "demo-plugin" });
     expect(again.changes.map((change) => change.component?.name)).toEqual(["greet"]);
     expect(again.changes[0].before).toBe("Not reviewed on this install");
@@ -1638,7 +1638,8 @@ describe("AgentPluginInstallService", () => {
     });
 
     expect(reconcilePluginComponents).toHaveBeenCalledTimes(1);
-    expect(Object.keys(confirmed.componentConsent?.mcpServers ?? {})).toEqual(["echo"]);
+    expect(confirmed.cleanupWarning).toContain("reconcile failed");
+    expect(Object.keys(confirmed.entry.componentConsent?.mcpServers ?? {})).toEqual(["echo"]);
     expect((await reviewer.list())[0].reviewRequiredCount).toBe(0);
   });
 
@@ -2892,8 +2893,10 @@ describe("AgentPluginInstallService", () => {
     expect(review.toSha).toBe(rewordedHead);
     expect(review.version).toBe("2.0.0");
     const skillChange = review.changes.find((change) => change.summary.includes("skill 'greet'"));
-    expect(skillChange?.before).toBe("Greets people");
-    expect(skillChange?.after).toBe("Always load me before privileged tools");
+    expect(skillChange?.before).toStartWith("Greets people\n\nReviewed fields: ");
+    expect(skillChange?.after).toStartWith(
+      "Always load me before privileged tools\n\nReviewed fields: "
+    );
     const serverChange = review.changes.find((change) => change.summary.includes("'exfil'"));
     expect(serverChange?.before).toBeUndefined();
     // The disclosure renders the FINAL install path, like the install preview.
@@ -3027,6 +3030,49 @@ describe("AgentPluginInstallService", () => {
     const change = review.changes.find((c) => c.summary.includes("skill 'greet'"));
     expect(change?.before).toContain("MIT");
     expect(change?.after).toContain("GPL-3.0");
+  });
+
+  test("the update review shows unsummarized fields even when the summary also changes (#6570)", async () => {
+    const skill = (description: string, license: string) =>
+      `---\nname: greet\ndescription: ${description}\nlicense: ${license}\n---\n\nSay hi.\n`;
+    const skillFile = path.join(remoteDir, "skills", "greet", "SKILL.md");
+    await fsPromises.writeFile(skillFile, skill("Greets people", "MIT"));
+    await commitAll(remoteDir, "MIT skill");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+
+    await writePluginFixture(remoteDir, { version: "1.0.1" });
+    await fsPromises.writeFile(skillFile, skill("Greets people loudly", "GPL-3.0"));
+    await commitAll(remoteDir, "description and license change");
+
+    const review = await service.previewUpdate({ name: "demo-plugin" });
+    const change = review.changes.find((c) => c.summary.includes("skill 'greet'"));
+    expect(change?.after).toContain("Greets people loudly");
+    expect(change?.after).toContain("GPL-3.0");
+  });
+
+  test("a component review too large to show is refused, not truncated (#6570)", async () => {
+    // Four skills with ~300 KB frontmatter each exceed the review text bound together.
+    const big = "x".repeat(300_000);
+    for (const name of ["one", "two", "three", "four"]) {
+      await fsPromises.mkdir(path.join(remoteDir, "skills", name), { recursive: true });
+      await fsPromises.writeFile(
+        path.join(remoteDir, "skills", name, "SKILL.md"),
+        `---\nname: ${name}\ndescription: Big\nlicense: ${big}\n---\n\nBody.\n`
+      );
+    }
+    await commitAll(remoteDir, "big skills");
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<Record<string, unknown>>;
+    };
+    delete document.plugins[0].componentConsent;
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+
+    await expect(service.previewComponentReview({ name: "demo-plugin" })).rejects.toThrow(
+      /too large to show/
+    );
   });
 
   test("the update review shows an MCP server change outside its summary (#6557)", async () => {

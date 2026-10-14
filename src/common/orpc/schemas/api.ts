@@ -1335,7 +1335,10 @@ export const agentPlugins = {
       expectedLockedSha: z.string(),
       reviewed: z.array(AgentPluginComponentRefSchema),
     }),
-    output: ResultSchema(AgentPluginInstallEntrySchema, z.string()),
+    output: ResultSchema(
+      z.object({ entry: AgentPluginInstallEntrySchema, cleanupWarning: z.string().optional() }),
+      z.string()
+    ),
   },
 };
 
