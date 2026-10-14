@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
@@ -70,13 +70,23 @@ test("the installed row and the consent preview show the monorepo plugin folder"
     expect(view.container.textContent).toContain("github.com/cursor/plugins/pstack @ main")
   );
 
+  const previewSpy = spyOn(api.agentPlugins, "preview");
   fireEvent.click(await view.findByRole("button", { name: /Add plugin/ }));
   // happy-dom misses React onChange for fireEvent.change, so type for real.
+  // A full URL cannot carry a folder, so the folder field must reach the API.
   await userEvent.type(
     await view.findByLabelText(/Git URL or owner\/repo/),
-    "cursor/plugins/pstack"
+    "https://gitlab.com/acme/mono.git"
   );
+  await userEvent.type(await view.findByLabelText(/Plugin folder/), " packages/pstack ");
   fireEvent.click(await view.findByRole("button", { name: /Preview/ }));
+  await waitFor(() =>
+    expect(previewSpy).toHaveBeenCalledWith({
+      input: "https://gitlab.com/acme/mono.git",
+      ref: null,
+      subpath: "packages/pstack",
+    })
+  );
   await waitFor(() =>
     // The arrow to the target path appears only on the preview card's source line.
     expect(view.container.textContent).toContain("github.com/cursor/plugins/pstack @ main →")
