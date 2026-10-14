@@ -28,6 +28,7 @@ import {
   createMcpAppHost,
   declaresFullscreenOnly,
   type McpAppConsentRequest,
+  type McpAppDisplayMode,
   type McpAppHost,
   type McpAppHostContext,
 } from "./mcpAppHost";
@@ -396,6 +397,27 @@ function useContainerDimensionsUpdates(hostRef: { current: McpAppHost | null }, 
   };
 }
 
+/**
+ * Runs an accepted display-mode move of a view (setDisplayMode): fullscreen opens or focuses
+ * its tab, any other mode (inline) closes the tab so its expanded card takes the view back.
+ */
+function moveViewTo(
+  mode: McpAppDisplayMode,
+  input: { workspaceId: string; view: McpAppViewRef; onClose?: () => void }
+) {
+  if (mode === "fullscreen") {
+    openMcpAppViewTab(input.workspaceId, input.view);
+    return;
+  }
+  // The user collapsed the card during the teardown wait: closing the tab would leave the view
+  // without a frame. It stays in its tab and loads again (it was torn down).
+  if (!isMcpAppViewHosted(input.workspaceId, input.view.toolCallId, "card")) {
+    reloadMcpAppView(input.workspaceId, input.view.toolCallId);
+    return;
+  }
+  input.onClose?.();
+}
+
 /** The domain prompt's text: the origins, and the project that keeps the approval. */
 function DomainsPromptText(props: { origins: readonly string[]; projectPath: string | null }) {
   return (
@@ -599,8 +621,6 @@ export function McpAppFrame(props: {
         },
       },
     });
-    /** Whether the view declared fullscreen but not inline (its last ui/initialize). */
-    let declaredFullscreenOnly = false;
     const host = createMcpAppHost({
       // Shown in consent prompts: the card's sanitized display key, never the raw bound key
       // (repo-defined keys can carry bidi/control characters). Tool calls use the raw key.
@@ -686,34 +706,24 @@ export function McpAppFrame(props: {
       // Inline only while the card is expanded in the loaded transcript: a collapsed (or
       // unloaded) card mounts no inline instance, so closing the tab would lose the view.
       // The host runs the move later; skip it once this instance is gone (closed meanwhile).
-      // A fullscreen-only view is never hosted inline: its cards show the "Open in tab" notice
-      // (mcpAppViewsStore.ts). A tab instance marks it at once. A card instance marks it only
-      // when its move to the tab runs: marking it earlier would unmount the card's frame first,
-      // and the move would then be dropped. A later declaration with inline clears it.
+      // A view that declared fullscreen but not inline is not hosted inline (#6181): marked,
+      // its cards show the "Open in tab" notice instead of a frame (mcpAppViewsStore.ts), so a
+      // card instance that learns it unmounts, and the user opens the view in its tab. A later
+      // declaration with inline clears the mark. A list-less initialize (the window.openai
+      // shim's) says nothing about the modes, so it keeps the mark of an earlier mount.
       onViewDisplayModes: (modes) => {
-        declaredFullscreenOnly = declaresFullscreenOnly(modes);
-        if (!declaredFullscreenOnly || !inline) {
-          setMcpAppViewFullscreenOnly(workspaceId, toolCallId, declaredFullscreenOnly);
-        }
+        if (modes === undefined) return;
+        setMcpAppViewFullscreenOnly(workspaceId, toolCallId, declaresFullscreenOnly(modes));
       },
       setDisplayMode: (mode) => {
         if (mode === "inline" && !isMcpAppViewHosted(workspaceId, toolCallId, "card")) return null;
         return () => {
           if (hostRef.current !== host) return;
-          if (mode === "fullscreen") {
-            // A fullscreen-only view: its card stops mounting it, so closing its tab does not
-            // move it back to the tab again while the card is expanded.
-            if (declaredFullscreenOnly) setMcpAppViewFullscreenOnly(workspaceId, toolCallId, true);
-            openMcpAppViewTab(workspaceId, latest.current.view);
-            return;
-          }
-          // The user collapsed the card during the teardown wait: closing the tab would leave the
-          // view without a frame. It stays in its tab and loads again (it was torn down).
-          if (!isMcpAppViewHosted(workspaceId, toolCallId, "card")) {
-            reloadMcpAppView(workspaceId, toolCallId);
-            return;
-          }
-          latest.current.onClose?.();
+          moveViewTo(mode, {
+            workspaceId,
+            view: latest.current.view,
+            onClose: latest.current.onClose,
+          });
         };
       },
       log: (message, data) =>

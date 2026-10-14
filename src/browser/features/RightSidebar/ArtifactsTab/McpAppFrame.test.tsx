@@ -16,6 +16,7 @@ import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
 import { McpAppFrame } from "./McpAppFrame";
 import {
   markMcpAppViewHosted,
+  setMcpAppViewFullscreenOnly,
   useMcpAppViewFullscreenOnly,
   useMcpAppViewReloadKey,
   type McpAppViewRef,
@@ -1175,96 +1176,71 @@ describe("McpAppFrame host strips", () => {
     });
   });
 
-  // A view that declared only fullscreen is not hosted in its tool card: it moves to its tab.
-  test("a fullscreen-only view in its card moves to its tab once it initializes", async () => {
+  // A view that declared only fullscreen is not hosted in its tool card: the card declines it
+  // (its notice replaces the frame), and no tab opens without the user.
+  test("a card instance marks a fullscreen-only view and opens no tab by itself", async () => {
     const opened: string[] = [];
     const onOpen = (e: Event) =>
       opened.push((e as CustomEvent<{ toolCallId: string }>).detail.toolCallId);
     window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onOpen);
     let isFullscreenOnly = () => false;
     function FullscreenOnlyProbe() {
-      const marked = useMcpAppViewFullscreenOnly("ws-fullscreen-only", "call-1");
+      const marked = useMcpAppViewFullscreenOnly("ws-card-only", "call-1");
       isFullscreenOnly = () => marked;
       return null;
     }
     try {
       const view = render(
         <>
-          <McpAppFrame workspaceId="ws-fullscreen-only" view={VIEW} variant="inline" />
+          <McpAppFrame workspaceId="ws-card-only" view={VIEW} variant="inline" />
           <FullscreenOnlyProbe />
         </>,
         { wrapper: Wrapper }
       );
       const frame = await findOpenFrame(view);
       const posted = capturePosted(frame);
-      postFromView(frame, {
-        jsonrpc: "2.0",
-        id: 1,
-        method: "ui/initialize",
-        params: { appCapabilities: { availableDisplayModes: ["fullscreen"] } },
-      });
-      await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
-      const init = posted.find((m) => m.id === 1)?.result as {
-        hostContext: { displayMode: string };
-      };
-      // It is told the mode it ends up in, never inline, which it did not declare.
-      expect(init.hostContext.displayMode).toBe("fullscreen");
-      // The host sends no request (the move's teardown) before the view is initialized.
-      await tick();
-      expect(posted.some((m) => m.method === "ui/resource-teardown")).toBe(false);
-      postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
-      const teardown = await waitFor(() => {
-        const message = posted.find((m) => m.method === "ui/resource-teardown");
-        if (message === undefined) throw new Error("no teardown yet");
-        return message;
-      });
-      expect(opened).toEqual([]);
-      expect(isFullscreenOnly()).toBe(false);
-      postFromView(frame, { jsonrpc: "2.0", id: teardown.id, result: {} });
-      await waitFor(() => expect(opened).toEqual(["call-1"]));
-      // Its card stops hosting it, so closing the tab does not send it back to a tab.
-      expect(isFullscreenOnly()).toBe(true);
-    } finally {
-      window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onOpen);
-    }
-  });
-
-  // A hybrid view: the window.openai shim's handshake comes first (no modes), then the view's own
-  // client declares fullscreen only. Its initialized must still start the move.
-  test("a fullscreen-only declaration after the first handshake still moves the view", async () => {
-    const opened: string[] = [];
-    const onOpen = (e: Event) =>
-      opened.push((e as CustomEvent<{ toolCallId: string }>).detail.toolCallId);
-    window.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onOpen);
-    try {
-      const view = render(<McpAppFrame workspaceId="ws-late" view={VIEW} variant="inline" />, {
-        wrapper: Wrapper,
-      });
-      const frame = await findOpenFrame(view);
-      const posted = capturePosted(frame);
+      // A hybrid view: the window.openai shim's handshake comes first, with no list.
       postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
       postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
       await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+      expect(isFullscreenOnly()).toBe(false);
+      // Then its own client declares fullscreen only.
       postFromView(frame, {
         jsonrpc: "2.0",
         id: 2,
         method: "ui/initialize",
         params: { appCapabilities: { availableDisplayModes: ["fullscreen"] } },
       });
-      await waitFor(() => expect(posted.some((m) => m.id === 2)).toBe(true));
+      await waitFor(() => expect(isFullscreenOnly()).toBe(true));
       await tick();
-      expect(posted.some((m) => m.method === "ui/resource-teardown")).toBe(false);
-      postFromView(frame, { jsonrpc: "2.0", method: "ui/notifications/initialized" });
-      const teardown = await waitFor(() => {
-        const message = posted.find((m) => m.method === "ui/resource-teardown");
-        if (message === undefined) throw new Error("no teardown yet");
-        return message;
-      });
-      postFromView(frame, { jsonrpc: "2.0", id: teardown.id, result: {} });
-      await waitFor(() => expect(opened).toEqual(["call-1"]));
+      expect(opened).toEqual([]);
     } finally {
       window.removeEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, onOpen);
     }
+  });
+
+  // A view marked by an earlier mount, opened in its tab: the shim's list-less handshake comes
+  // first there. It must not clear the mark, or closing the tab would host the view inline.
+  test("a list-less handshake keeps an earlier mount's fullscreen-only mark", async () => {
+    setMcpAppViewFullscreenOnly("ws-kept", "call-1", true);
+    let isFullscreenOnly = () => false;
+    function FullscreenOnlyProbe() {
+      const marked = useMcpAppViewFullscreenOnly("ws-kept", "call-1");
+      isFullscreenOnly = () => marked;
+      return null;
+    }
+    const view = render(
+      <>
+        <McpAppFrame workspaceId="ws-kept" view={VIEW} />
+        <FullscreenOnlyProbe />
+      </>,
+      { wrapper: Wrapper }
+    );
+    const frame = await findOpenFrame(view);
+    const posted = capturePosted(frame);
+    postFromView(frame, { jsonrpc: "2.0", id: 1, method: "ui/initialize", params: {} });
+    await waitFor(() => expect(posted.some((m) => m.id === 1)).toBe(true));
+    expect(isFullscreenOnly()).toBe(true);
   });
 
   // E.g. "Open in tab" on a collapsed card: the view first initializes in its tab. Its card must
