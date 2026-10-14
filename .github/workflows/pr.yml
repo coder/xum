@@ -548,8 +548,15 @@ jobs:
     name: Test / Bug-bash sandbox
     needs: [changes]
     if: needs.changes.outputs.tests == 'true' && github.event.inputs.test_filter == ''
-    timeout-minutes: 30
+    # 45, not 30: a stale image key adds a local image build of up to 25 minutes (below).
+    timeout-minutes: 45
     runs-on: ${{ needs.changes.outputs.linux-runner }}
+    # Stale-key local build: only main publishes the image, so a PR that changes its inputs (Dockerfile, build.sh,
+    # playwright-core) has a stale image.json. With this opt-in the launcher then builds the image
+    # locally with build.sh, for these two jobs only, and prints a warning. Model-driven runs
+    # (make bug-bash, make mcp-apps-e2e) ignore it and keep the pinned digest.
+    env:
+      BUGBASH_SANDBOX_BUILD_STALE: "1"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:

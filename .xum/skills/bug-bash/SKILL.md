@@ -24,12 +24,18 @@ Xum harness. Where the two differ, follow this skill.
   `tests/bugbash/sandbox/launch.ts`, one container per job.
 - The image `ghcr.io/coder/xum-bugbash-sandbox` (about 1.4 GB, linux/amd64) holds only tools:
   Node 22, Bun, git and the Chromium of `@e2e-dev/web`'s playwright-core. The runner pulls it only
-  by the digest in `tests/bugbash/sandbox/image.json` and never builds it.
+  by the digest in `tests/bugbash/sandbox/image.json`. It builds it only in the case below.
 - The inputs key (`make bugbash-sandbox-key`) is a hash of the Dockerfile, `build.sh` and the
   playwright-core version in `bun.lock`. The runner refuses an image whose key differs from the
-  checkout. After a change to any of the three, a maintainer runs the manual workflow
-  "Bug-bash sandbox image" on main and updates `image.json` in a reviewed PR. An e2e update that
-  keeps playwright-core keeps the key, so the image stays valid.
+  checkout. One exception: with `BUGBASH_SANDBOX_BUILD_STALE=1` (exactly `1`), which only CI's
+  `Test / Bug-bash sandbox` job sets, the self-check and the exact-step repros build the image
+  locally with `build.sh` (local tag, no push, no registry login), check its inputs label, and
+  print a warning (a `::warning::` annotation in GitHub Actions). Explore charters, the MCP Apps
+  suite and the preflight of `make bug-bash` and `make mcp-apps-e2e` always refuse a stale key.
+- An image change lands in three steps: the PR that changes the Dockerfile, `build.sh` or
+  playwright-core passes CI on a local build. After it merges, a maintainer runs the manual
+  workflow "Bug-bash sandbox image" on main. Then a reviewed PR updates `image.json` to pin the
+  new digest. An e2e update that keeps playwright-core keeps the key, so the image stays valid.
 - The container gets `--network none`, `--read-only`, `--cap-drop ALL`, no-new-privileges, a
   non-root user, 4 GB memory and tmpfs scratch folders. It reads copies of the git-listed files,
   plus `dist/` and `node_modules/` read-only. An env allowlist passes no credential.

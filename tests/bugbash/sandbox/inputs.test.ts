@@ -93,7 +93,10 @@ test("a mount source must be a plain folder of the checkout", () => {
 });
 
 test("the container env passes only allowlisted names, and never a credential", () => {
-  const host = { BUGBASH_AI: "mock", HOME: "/home/u", ANTHROPIC_API_KEY: "sk", GH_TOKEN: "t" };
+  // BUGBASH_SANDBOX_BUILD_STALE too: the host's opt-in to a local image is not the container's.
+  // prettier-ignore
+  const host = { BUGBASH_AI: "mock", HOME: "/home/u", ANTHROPIC_API_KEY: "sk", GH_TOKEN: "t",
+    BUGBASH_SANDBOX_BUILD_STALE: "1" };
   expect(containerEnv(host, jobEnv(".e2e/r"))).toEqual({
     HOME: "/home/bugbash",
     TMPDIR: "/tmp",

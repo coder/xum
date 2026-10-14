@@ -40,7 +40,7 @@ import { startProxy, UNREACHABLE } from "./proxy";
 import { Ledger, priced } from "./proxyPolicy";
 // prettier-ignore
 import { checkMountSource, containerEnv, exactStepRefusal, exploreRefusal, jobEnv, outputDir, plainFolders, stage } from "./inputs";
-import { type CleanupState, Refusal, Session, Stopped } from "./runner";
+import { type CleanupState, IMAGE, Refusal, Session, Stopped } from "./runner";
 import { DEFAULT_APP_MODEL } from "../aiMode";
 
 const ROOT = fs.realpathSync(path.resolve(import.meta.dir, "../../.."));
@@ -453,7 +453,14 @@ function checkJob(args: string[], o: LaunchOptions) {
   // First, before any docker command and before the container env exists.
   const ai = appAi(o.env, args[0] === "explore");
   const driven = mcpApps || selfCheck || args[0] === "explore" ? modelJob(o.env) : undefined;
-  return { dir, mcpApps, selfCheck, ai, driven };
+  // The stale-key local build: CI's bugbash-sandbox job sets BUGBASH_SANDBOX_BUILD_STALE=1, so a pull request that
+  // changes the image inputs can pass before main publishes its image. Only the self-check and
+  // exact-step repros may use a local build: they reach no real model. By the job kind, not by
+  // `driven`: the self-check counts as model-driven. Explore charters, the MCP Apps suite and
+  // checkDocker (the preflight of make bug-bash and make mcp-apps-e2e) keep the pinned digest.
+  const exactStep = !selfCheck && !mcpApps && args[0] !== "explore";
+  const localBuild = o.env.BUGBASH_SANDBOX_BUILD_STALE === "1" && (selfCheck || exactStep);
+  return { dir, mcpApps, selfCheck, ai, driven, localBuild };
 }
 
 /** A job's checks and the Docker check, with no job: `--preflight` (Makefile, before the build). */
@@ -465,7 +472,7 @@ export async function preflight(args: string[], o: LaunchOptions): Promise<Clean
 /** Runs one job. A refusal before any docker command is thrown; anything later is returned. */
 export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOutcome> {
   const log = o.log ?? logLine;
-  const { dir, mcpApps, selfCheck, ai, driven } = checkJob(args, o);
+  const { dir, mcpApps, selfCheck, ai, driven, localBuild } = checkJob(args, o);
   const output = outputDir(args);
   const dest = path.join(dir, output);
   const records = `${dest}.proxy.jsonl`;
@@ -529,7 +536,15 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
           ? `leftover: ${entry.id.slice(0, 12)} cannot be inspected (${entry.error})`
           : `leftover: ${entry.job.name} owner ${ownerState(entry.job.owner)} (make bug-bash-sandbox-recover)`
       );
-    const image = await session.ensureImage();
+    const image = await session.ensureImage({ localBuild });
+    // On stderr, not `log`: the self-check's log is not shown, and this must not be missed.
+    if (!image.startsWith(`${IMAGE}@`)) {
+      const warning =
+        `sandbox: LOCAL IMAGE ${image.slice(0, 19)}, built from this checkout, not the pinned ` +
+        `digest in image.json. Publish from main (workflow "Bug-bash sandbox image"), then ` +
+        `update tests/bugbash/sandbox/image.json.`;
+      console.error(o.env.GITHUB_ACTIONS === "true" ? `::warning::${warning}` : warning);
+    }
     // Another job's cleanup can remove the empty per-checkout folder between the two mkdirs.
     for (let attempt = 1; ; attempt++) {
       fs.mkdirSync(path.dirname(jobDir), { recursive: true, mode: 0o700 });
