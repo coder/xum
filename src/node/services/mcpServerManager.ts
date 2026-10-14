@@ -1619,6 +1619,13 @@ export interface MCPServerManagerOptions {
   };
 }
 
+/** Drop a workspace's entries from a map keyed `<workspaceId>\0<key>`. */
+function deleteWorkspaceKeys(map: Map<string, unknown>, workspaceId: string): void {
+  for (const key of map.keys()) {
+    if (key.startsWith(`${workspaceId}\0`)) map.delete(key);
+  }
+}
+
 function categorizeMcpTestError(error: string): "timeout" | "connect" | "http_status" | "unknown" {
   const lower = error.toLowerCase();
   if (lower.includes("timed out")) return "timeout";
@@ -5275,23 +5282,16 @@ export class MCPServerManager {
         }
         log.info("[MCP Apps] Opening an entry point", { workspaceId, serverName, toolName, type });
         const viewKey = mcpAppEntrypointKey(serverName, toolName, type);
-        const openKey = `${workspaceId}\0${viewKey}`;
         const order = ++this.entrypointOpenCount;
         dispatched = apps.callToolForApp(toolName, {}, options).then(async (result) => {
-          // Two windows can open one entry point at once. A call that finishes after a newer
-          // call's result was stored must not overwrite it: the tab shows the latest open.
-          // Stored results are written in this order (the store's writes are queued).
-          if ((this.entrypointStoredOpens.get(openKey) ?? 0) < order) {
-            this.entrypointStoredOpens.set(openKey, order);
-            await store.record(workspaceId, {
-              toolCallId: viewKey,
-              serverName,
-              toolName,
-              resourceUri: tool.resourceUri,
-              arguments: {},
-              result,
-            });
-          }
+          await this.storeEntrypointResult(store, workspaceId, order, {
+            toolCallId: viewKey,
+            serverName,
+            toolName,
+            resourceUri: tool.resourceUri,
+            arguments: {},
+            result,
+          });
           return {
             serverName,
             serverLabel: this.appServerLabel(workspaceId, serverName),
@@ -5344,11 +5344,26 @@ export class MCPServerManager {
 
   /** Entry point budgets of a stopped workspace would otherwise outlive it. */
   private dropEntrypointBudgets(workspaceId: string): void {
-    for (const map of [this.entrypointCallWindows, this.entrypointStoredOpens]) {
-      for (const key of map.keys()) {
-        if (key.startsWith(`${workspaceId}\0`)) map.delete(key);
-      }
-    }
+    deleteWorkspaceKeys(this.entrypointCallWindows, workspaceId);
+    deleteWorkspaceKeys(this.entrypointStoredOpens, workspaceId);
+  }
+
+  /**
+   * Store an entry point open's result as its view record. Two windows can open one entry point
+   * at once: a call that finishes after a newer call's result was stored must not overwrite it,
+   * so the tab shows the latest open. Records are written in the order of this check (the
+   * store queues its writes).
+   */
+  private async storeEntrypointResult(
+    store: McpAppResultStore,
+    workspaceId: string,
+    order: number,
+    record: Parameters<McpAppResultStore["record"]>[1]
+  ): Promise<void> {
+    const key = `${workspaceId}\0${record.toolCallId}`;
+    if ((this.entrypointStoredOpens.get(key) ?? 0) > order) return;
+    this.entrypointStoredOpens.set(key, order);
+    await store.record(workspaceId, record);
   }
 
   /** The view tool-call budget (mcpAppHost), applied per workspace and server. */

@@ -120,8 +120,75 @@ async function withWorkspaceMcpRequest<T, D>(
     callerSignal !== undefined
       ? AbortSignal.any([callerSignal, admission.signal])
       : admission.signal;
+  const options = await resolveWorkspaceMcpRequestOptions(context, workspaceId, signal);
+  if (options === null) return degraded;
+  // `return await`, not `return`: `using` disposes at block exit, and a bare returned promise
+  // would release the admission before server startup settles.
+  try {
+    return await run(options, signal);
+  } catch (error) {
+    // An abort (a removal's, #4805, or the caller's) degrades like the checks above.
+    if (signal.aborted) return degraded;
+    throw error;
+  }
+}
+
+/** The workspace's MCP request options, or null once `signal` aborted. */
+async function resolveWorkspaceMcpRequestOptions(
+  context: ORPCContext,
+  workspaceId: string,
+  signal: AbortSignal
+): Promise<MCPWorkspaceRequestOptions | null> {
+  const ready = await readyWorkspaceRuntime(context, workspaceId, signal);
+  if (ready === null) return null;
+  const { metadata, runtime, workspacePath, hostCheckoutRoot } = ready;
+  // Forward the authority too: a snapshot the service could not establish
+  // must make the manager re-read disk (and fail closed), not start servers.
+  // Bounded and cancellable like the send path: an inheriting child's
+  // resolution reads through an SSH/Docker parent (minutes per remote op),
+  // and discovery holds its archive admission for the duration.
+  const overridesReadStartedAt = Date.now();
+  const { overrides, authoritative } =
+    await context.workspaceMcpOverridesService.getOverridesForWorkspace(workspaceId, {
+      timeoutMs: MCP_OVERRIDES_READ_TIMEOUT_MS,
+      signal,
+    });
+  if (signal.aborted) return null;
+  const projectSecrets = await secretsToRecord(
+    isMultiProject(metadata)
+      ? mergeMultiProjectSecrets(metadata, context.secretsStore)
+      : context.secretsStore.getEffectiveSecrets(metadata.projectPath)
+  );
+  if (signal.aborted) return null;
+  return {
+    workspaceId,
+    projectPath: metadata.projectPath,
+    runtime,
+    workspacePath,
+    trusted: isWorkspaceProjectTrusted(context.config, metadata),
+    overrides,
+    overridesAuthoritative: authoritative,
+    // Like the send path: a non-authoritative read that exhausted its
+    // budget must not be followed by a second full-length attempt inside
+    // the manager while discovery holds its archive admission.
+    ...(authoritative
+      ? {}
+      : { overridesReadDeadlineAt: overridesReadStartedAt + MCP_OVERRIDES_READ_TIMEOUT_MS }),
+    projectSecrets,
+    agentPlugins: hostCheckoutRoot
+      ? resolveAgentPluginsMcpContext(metadata, hostCheckoutRoot)
+      : null,
+  };
+}
+
+/** Wait for the workspace's init and ready its runtime; null once `signal` aborted. */
+async function readyWorkspaceRuntime(
+  context: ORPCContext,
+  workspaceId: string,
+  signal: AbortSignal
+) {
   await context.initStateManager.waitForInit(workspaceId, signal);
-  if (signal.aborted) return degraded;
+  if (signal.aborted) return null;
   // A checkout whose launch sanitize failed (recorded before its init completed, #4674): refuse
   // with a typed error, unlike the archive degrade above, and never start MCP in it.
   const unsanitized = context.initStateManager.getUnsanitizedCheckoutError(workspaceId);
@@ -136,60 +203,12 @@ async function withWorkspaceMcpRequest<T, D>(
   const metadata = metadataResult.data;
   const runtimeResult = context.aiService.createWorkspaceRuntimeContext(workspaceId, metadata);
   if (!runtimeResult.success) throw new Error(formatSendMessageError(runtimeResult.error).message);
-  const { runtime, workspacePath, hostCheckoutRoot } = runtimeResult.data;
-  const ready = await runtime.ensureReady({ signal });
+  const ready = await runtimeResult.data.runtime.ensureReady({ signal });
   // A runtime aborted mid-readiness reports not-ready ("Aborted"): degrade, like the other
   // abort points, instead of failing the RPC.
-  if (signal.aborted) return degraded;
+  if (signal.aborted) return null;
   if (!ready.ready) throw new Error(ready.error);
-  // Forward the authority too: a snapshot the service could not establish
-  // must make the manager re-read disk (and fail closed), not start servers.
-  // Bounded and cancellable like the send path: an inheriting child's
-  // resolution reads through an SSH/Docker parent (minutes per remote op),
-  // and discovery holds its archive admission for the duration.
-  const overridesReadStartedAt = Date.now();
-  const { overrides, authoritative } =
-    await context.workspaceMcpOverridesService.getOverridesForWorkspace(workspaceId, {
-      timeoutMs: MCP_OVERRIDES_READ_TIMEOUT_MS,
-      signal,
-    });
-  if (signal.aborted) return degraded;
-  const projectSecrets = await secretsToRecord(
-    isMultiProject(metadata)
-      ? mergeMultiProjectSecrets(metadata, context.secretsStore)
-      : context.secretsStore.getEffectiveSecrets(metadata.projectPath)
-  );
-  if (signal.aborted) return degraded;
-  // `return await`, not `return`: `using` disposes at block exit, and a bare returned promise
-  // would release the admission before server startup settles.
-  try {
-    return await run(
-      {
-        workspaceId,
-        projectPath: metadata.projectPath,
-        runtime,
-        workspacePath,
-        trusted: isWorkspaceProjectTrusted(context.config, metadata),
-        overrides,
-        overridesAuthoritative: authoritative,
-        // Like the send path: a non-authoritative read that exhausted its
-        // budget must not be followed by a second full-length attempt inside
-        // the manager while discovery holds its archive admission.
-        ...(authoritative
-          ? {}
-          : { overridesReadDeadlineAt: overridesReadStartedAt + MCP_OVERRIDES_READ_TIMEOUT_MS }),
-        projectSecrets,
-        agentPlugins: hostCheckoutRoot
-          ? resolveAgentPluginsMcpContext(metadata, hostCheckoutRoot)
-          : null,
-      },
-      signal
-    );
-  } catch (error) {
-    // An abort (a removal's, #4805, or the caller's) degrades like the checks above.
-    if (signal.aborted) return degraded;
-    throw error;
-  }
+  return { metadata, ...runtimeResult.data };
 }
 
 export async function setWorkspaceMcpOverrides(
