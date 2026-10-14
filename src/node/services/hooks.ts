@@ -756,7 +756,13 @@ export async function runPostHook(
       exitCode: result.exitCode ?? -1,
     };
   } catch (err) {
-    log.error("[hooks] Post-hook execution failed", { hookPath, error: err });
+    // A cancelled tool call (user interrupt, memory intuition deadline) aborts its
+    // post-hook before or during exec. That is expected, so it is not an error.
+    if (context.abortSignal?.aborted) {
+      log.debug("[hooks] Post-hook skipped: tool call aborted", { hookPath });
+    } else {
+      log.error("[hooks] Post-hook execution failed", { hookPath, error: err });
+    }
     return {
       success: false,
       output: `Post-hook failed: ${getErrorMessage(err)}`,

@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
@@ -12,6 +12,7 @@ import {
   runPostHook,
 } from "./hooks";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { log } from "@/node/services/log";
 import { ExecPathMappingRuntime } from "./testExecPathMappingRuntime";
 
 describe("hooks", () => {
@@ -343,6 +344,41 @@ describe("hooks", () => {
 
       expect(result.success).toBe(true);
       expect(result.exitCode).toBe(0);
+    });
+
+    test("a post-hook skipped because its tool call was aborted is not logged as an error", async () => {
+      const hookPath = path.join(tempDir, ".xum", "tool_post");
+      await fs.mkdir(path.dirname(hookPath), { recursive: true });
+      await fs.writeFile(hookPath, "#!/bin/bash\nexit 0");
+      await fs.chmod(hookPath, 0o755);
+      const context = {
+        tool: "test_tool",
+        toolInput: "{}",
+        workspaceId: "test-workspace",
+        projectDir: tempDir,
+        abortSignal: AbortSignal.abort(),
+      };
+      const logError = spyOn(log, "error").mockImplementation(() => undefined);
+      try {
+        // Cancelled tool call (user interrupt, memory intuition deadline): skipped hook.
+        const aborted = await runPostHook(runtime, hookPath, context, { success: true });
+        expect(aborted.success).toBe(false);
+        expect(logError).not.toHaveBeenCalled();
+
+        // Any other failure to run the hook is still an error.
+        const failing = Object.create(runtime) as LocalRuntime;
+        failing.exec = () => Promise.reject(new Error("spawn failed"));
+        const failed = await runPostHook(
+          failing,
+          hookPath,
+          { ...context, abortSignal: undefined },
+          { success: true }
+        );
+        expect(failed.output).toContain("spawn failed");
+        expect(logError).toHaveBeenCalledTimes(1);
+      } finally {
+        logError.mockRestore();
+      }
     });
 
     test("receives MUX_TOOL_RESULT env var", async () => {
