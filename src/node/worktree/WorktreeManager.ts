@@ -193,21 +193,28 @@ export class WorktreeManager {
           "Skipping origin fetch while project automation is disabled; using local state."
         );
       }
-      const fetchedOrigin = remoteSyncAllowed
-        ? await this.fetchOriginTrunk(projectPath, trunkBranch, initLogger, noHooksEnv)
-        : false;
+      // A deferred creation is announced as soon as this returns, and the origin fetch can take
+      // seconds on a remote server, so the reservation reads local refs only and
+      // materializeWorkspace fetches before the checkout, streaming to the creation card.
+      const deferOriginSync = params.deferMaterialization === true && remoteSyncAllowed;
+      const fetchedOrigin =
+        remoteSyncAllowed && !deferOriginSync
+          ? await this.fetchOriginTrunk(projectPath, trunkBranch, initLogger, noHooksEnv)
+          : false;
 
       // Determine best base for new branches: use origin if local can fast-forward to it,
-      // otherwise preserve local state (user may have unpushed work)
-      const shouldUseOrigin =
-        remoteSyncAllowed &&
-        fetchedOrigin &&
-        (await this.canFastForwardToOrigin(
-          projectPath,
-          trunkBranch,
-          initLogger,
-          params.abortSignal
-        ));
+      // otherwise preserve local state (user may have unpushed work). A deferred reservation
+      // checks the last fetched origin/<trunk> quietly; the post-fetch check reports the note.
+      const shouldUseOrigin = deferOriginSync
+        ? await this.trunkCanFastForwardToOrigin(projectPath, trunkBranch, params.abortSignal)
+        : remoteSyncAllowed &&
+          fetchedOrigin &&
+          (await this.canFastForwardToOrigin(
+            projectPath,
+            trunkBranch,
+            initLogger,
+            params.abortSignal
+          ));
 
       // Files are populated by a separate checkout (materializeWorkspace) so large repositories
       // can stream progress, and so callers may announce the workspace before populating it.
@@ -237,10 +244,25 @@ export class WorktreeManager {
       }
 
       // Fast-forward existing branches to origin only when local trunk can fast-forward too
-      // (preserves unpushed work).
+      // (preserves unpushed work). A deferred sync decides this after its fetch.
       const pending: PendingMaterialization = {
-        fastForwardFromOrigin: !skipRemoteSync && shouldUseOrigin && branchExists,
+        fastForwardFromOrigin:
+          !skipRemoteSync && !deferOriginSync && shouldUseOrigin && branchExists,
       };
+      if (deferOriginSync && branchExists) {
+        pending.deferredOriginSync = { existingBranch: true, createdFromOrigin: false };
+      } else if (deferOriginSync && startPoint === undefined) {
+        using tipProc = execFileAsync(
+          "git",
+          ["-C", projectPath, "rev-parse", `refs/heads/${branchName}`],
+          noHooksEnv
+        );
+        pending.deferredOriginSync = {
+          existingBranch: false,
+          createdBranchTip: (await tipProc.result).stdout.trim(),
+          createdFromOrigin: shouldUseOrigin,
+        };
+      }
       // Older Git needs the legacy hook checkout, which briefly changes HEAD. Keep it
       // before announcement so an immediate fork cannot observe its unborn placeholder.
       const nativeHookRunner =
@@ -305,12 +327,14 @@ export class WorktreeManager {
   }
 
   /**
-   * Populate a worktree reserved by createWorkspace: streamed checkout, .xumignore sync,
-   * optional fast-forward, submodules. Throws on failure without touching the worktree; a
-   * deferred checkout is already registered, so its owner decides what happens to it.
+   * Populate a worktree reserved by createWorkspace: the origin sync a deferred reservation
+   * skipped, streamed checkout, .xumignore sync, optional fast-forward, submodules. Throws on
+   * failure without touching the worktree; a deferred checkout is already registered, so its
+   * owner decides what happens to it.
    * abortSignal cancels every phase; when checkoutAbortSignal is given it is the only signal
    * the file checkout honours, so an owner that keeps a cancelled worktree gets complete files
-   * while everything after them still stops.
+   * (at the reserved base, when the cancellation lands during the origin sync) while
+   * everything after them still stops.
    */
   async materializeWorkspace(
     params: {
@@ -333,6 +357,10 @@ export class WorktreeManager {
       params.trusted,
       params.abortSignal
     );
+
+    const fastForwardFromOrigin = pending.deferredOriginSync
+      ? await this.syncOriginBeforeCheckout(params, pending.deferredOriginSync, noHooksEnv)
+      : pending.fastForwardFromOrigin;
 
     initLogger.logStep("Checking out files...");
     // Git's stderr mixes progress with diagnostics. Progress streams live; diagnostics are
@@ -483,7 +511,7 @@ export class WorktreeManager {
     initLogger.logStep("Syncing .xumignore files...");
     await syncXumignoreFiles(projectPath, workspacePath, params.abortSignal);
 
-    if (pending.fastForwardFromOrigin) {
+    if (fastForwardFromOrigin) {
       await this.fastForwardToOrigin(workspacePath, trunkBranch, initLogger, noHooksEnv);
     }
 
@@ -497,6 +525,107 @@ export class WorktreeManager {
       env: params.env,
       trusted: params.trusted,
     });
+  }
+
+  /**
+   * The origin sync a deferred reservation skipped, run before the checkout so a new branch
+   * starts from the fetched trunk. Returns whether the existing branch should fast-forward
+   * after the checkout. Every fallback keeps the reserved base.
+   */
+  private async syncOriginBeforeCheckout(
+    params: {
+      projectPath: string;
+      branchName: string;
+      trunkBranch: string;
+      initLogger: InitLogger;
+      abortSignal?: AbortSignal;
+      checkoutAbortSignal?: AbortSignal;
+    },
+    sync: NonNullable<PendingMaterialization["deferredOriginSync"]>,
+    noHooksEnv: GitExecOptions
+  ): Promise<boolean> {
+    const { projectPath, branchName, trunkBranch, initLogger } = params;
+    const fallback = "keeping the branch at its current commit";
+    try {
+      const fetched = await this.fetchOriginTrunk(
+        projectPath,
+        trunkBranch,
+        initLogger,
+        noHooksEnv,
+        fallback
+      );
+      if (
+        !fetched ||
+        !(await this.canFastForwardToOrigin(
+          projectPath,
+          trunkBranch,
+          initLogger,
+          params.abortSignal,
+          fallback
+        ))
+      ) {
+        return false;
+      }
+      if (sync.existingBranch) return true;
+      if (sync.createdBranchTip === undefined) return false;
+      // No checkout exists yet, so moving the ref is all it takes. The compare-and-swap leaves
+      // a branch that something else moved since the reservation alone.
+      try {
+        using moveProc = execFileAsync(
+          "git",
+          [
+            "-C",
+            projectPath,
+            "update-ref",
+            `refs/heads/${branchName}`,
+            `refs/remotes/origin/${trunkBranch}`,
+            sync.createdBranchTip,
+          ],
+          noHooksEnv
+        );
+        await moveProc.result;
+      } catch (error) {
+        if (isAbortError(error, params.abortSignal)) throw error;
+        initLogger.logStderr(
+          `Note: Could not move ${branchName} to the fetched origin/${trunkBranch} (${getErrorMessage(error)}), ${fallback}`
+        );
+        return false;
+      }
+      initLogger.logStep(`Started ${branchName} from the latest origin/${trunkBranch}`);
+      if (!sync.createdFromOrigin) {
+        // An eager creation would have branched from origin/<trunk> and tracked it.
+        try {
+          using upstreamProc = execFileAsync(
+            "git",
+            ["-C", projectPath, "branch", `--set-upstream-to=origin/${trunkBranch}`, branchName],
+            noHooksEnv
+          );
+          await upstreamProc.result;
+        } catch (error) {
+          if (isAbortError(error, params.abortSignal)) throw error;
+          initLogger.logStderr(
+            `Note: Could not set origin/${trunkBranch} as the upstream of ${branchName} (${getErrorMessage(error)})`
+          );
+        }
+      }
+      return false;
+    } catch (error) {
+      // Archive aborts init but not the file checkout, and parks whatever this leaves, so it
+      // skips the rest of the sync and checks out complete files at the reserved base.
+      // Removal aborts the checkout too and still cancels here.
+      if (
+        params.abortSignal?.aborted === true &&
+        params.checkoutAbortSignal !== undefined &&
+        !params.checkoutAbortSignal.aborted
+      ) {
+        log.debug("Deferred origin sync cancelled by archive; checking out the reserved base", {
+          projectPath,
+          branchName,
+        });
+        return false;
+      }
+      throw error;
+    }
   }
 
   private async rollbackFailedWorkspaceCreation(args: {
@@ -541,12 +670,15 @@ export class WorktreeManager {
   /**
    * Fetch trunk branch from origin before worktree creation.
    * Returns true if fetch succeeded (origin is available for branching).
+   * `fallback` overrides what the notes say happens instead (a deferred sync keeps the
+   * reserved base, which may be the last fetched origin/<trunk> rather than local trunk).
    */
   private async fetchOriginTrunk(
     projectPath: string,
     trunkBranch: string,
     initLogger: InitLogger,
-    noHooksEnv: GitExecOptions
+    noHooksEnv: GitExecOptions,
+    fallback?: string
   ): Promise<boolean> {
     // A credential helper such as Coder's askpass can block the fetch indefinitely while it waits
     // for external authentication, and even a killed fetch leaves helpers holding the stdio pipes.
@@ -573,9 +705,9 @@ export class WorktreeManager {
       if (deadline.aborted) {
         const seconds = Math.round(this.fetchTimeoutMs / 1000);
         initLogger.logStderr(
-          `Note: Fetch from origin did not finish within ${seconds}s (Git may be waiting on a credential helper or external authentication); using local branch state`
+          `Note: Fetch from origin did not finish within ${seconds}s (Git may be waiting on a credential helper or external authentication); ${fallback ?? "using local branch state"}`
         );
-        log.warn("Worktree creation fetch timed out; using local trunk", {
+        log.warn(`Worktree creation fetch timed out; ${fallback ?? "using local trunk"}`, {
           projectPath,
           trunkBranch,
           timeoutMs: this.fetchTimeoutMs,
@@ -585,10 +717,12 @@ export class WorktreeManager {
       const errorMsg = getErrorMessage(error);
       // Branch doesn't exist on origin (common for subagent local-only branches)
       if (errorMsg.includes("couldn't find remote ref")) {
-        initLogger.logStep(`Branch "${trunkBranch}" not found on origin; using local state.`);
+        initLogger.logStep(
+          `Branch "${trunkBranch}" not found on origin; ${fallback ?? "using local state"}.`
+        );
       } else {
         initLogger.logStderr(
-          `Note: Could not fetch from origin (${errorMsg}), using local branch state`
+          `Note: Could not fetch from origin (${errorMsg}), ${fallback ?? "using local branch state"}`
         );
       }
       return false;
@@ -604,6 +738,20 @@ export class WorktreeManager {
     projectPath: string,
     trunkBranch: string,
     initLogger: InitLogger,
+    abortSignal?: AbortSignal,
+    fallback = "using local state"
+  ): Promise<boolean> {
+    if (await this.trunkCanFastForwardToOrigin(projectPath, trunkBranch, abortSignal)) return true;
+    initLogger.logStderr(
+      `Note: Local ${trunkBranch} is ahead of or diverged from origin, ${fallback}`
+    );
+    return false;
+  }
+
+  /** canFastForwardToOrigin without the note; also false when origin/<trunk> is missing. */
+  private async trunkCanFastForwardToOrigin(
+    projectPath: string,
+    trunkBranch: string,
     abortSignal?: AbortSignal
   ): Promise<boolean> {
     try {
@@ -621,9 +769,6 @@ export class WorktreeManager {
         throw error;
       }
       // Local is ahead or diverged - preserve local state
-      initLogger.logStderr(
-        `Note: Local ${trunkBranch} is ahead of or diverged from origin, using local state`
-      );
       return false;
     }
   }

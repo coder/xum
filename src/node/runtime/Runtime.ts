@@ -261,8 +261,8 @@ export interface WorkspaceCreationParams {
   /** Whether the project is trusted — when false, git hooks are disabled */
   trusted?: boolean;
   /**
-   * Return once the checkout is reserved and leave populating its files to
-   * materializeWorkspace(), so that work streams to a workspace that is already announced.
+   * Return once the checkout is reserved and leave populating its files (and any origin fetch)
+   * to materializeWorkspace(), so that work streams to a workspace that is already announced.
    * Runtimes whose creation never populates files ignore this.
    */
   deferMaterialization?: boolean;
@@ -272,6 +272,23 @@ export interface WorkspaceCreationParams {
 export interface PendingMaterialization {
   /** The branch already existed and should fast-forward to origin/<trunkBranch> once checked out. */
   fastForwardFromOrigin: boolean;
+  /**
+   * Set when the reservation skipped the origin fetch so the workspace could be announced
+   * without waiting on the network: materializeWorkspace() fetches origin/<trunkBranch> before
+   * the checkout and then updates the branch.
+   */
+  deferredOriginSync?: {
+    /** The branch existed before this creation; it fast-forwards after the checkout. */
+    existingBranch: boolean;
+    /**
+     * Tip of the branch this creation made from the trunk. The branch moves to the fetched
+     * origin/<trunkBranch> only while it still points here. Absent when nothing may move it
+     * (an existing branch, or an explicit start point).
+     */
+    createdBranchTip?: string;
+    /** The created branch started from origin/<trunkBranch>, so its upstream is already set. */
+    createdFromOrigin: boolean;
+  };
 }
 
 /** Init params for materializeWorkspace(), plus how far a cancellation may reach. */
