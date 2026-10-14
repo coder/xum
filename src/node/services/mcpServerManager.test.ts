@@ -1484,6 +1484,54 @@ describe("MCPServerManager", () => {
     expect((await manager.getToolsForWorkspace(request)).promptDescriptors).toEqual([]);
   });
 
+  test("a canceled prompt discovery leaves the next send waiting for the first list", async () => {
+    configService.listServers.mockResolvedValue({ cmd: stdioConfig("cmd-canceled-prompts") });
+    let canceled = false;
+    servers.serve("cmd-canceled-prompts", {
+      listPrompts: (options) => {
+        if (canceled) return Promise.resolve([{ name: "review" }]);
+        return new Promise((_resolve, reject) =>
+          options?.signal?.addEventListener("abort", () => reject(new Error("aborted")))
+        );
+      },
+    });
+    const request = workspaceRequest("ws-canceled-prompts");
+    const controller = new AbortController();
+
+    const discovery = manager.getPromptsForWorkspace(request, { signal: controller.signal });
+    // The composer's discovery started the servers; cancel its prompts/list.
+    while (!manager.hasWorkspaceRequestOptions(request.workspaceId)) await Bun.sleep(1);
+    canceled = true;
+    controller.abort();
+    await discovery.catch(() => undefined);
+
+    const served = await manager.getToolsForWorkspace(request);
+    expect(served.promptDescriptors.map((prompt) => prompt.promptName)).toEqual(["review"]);
+  });
+
+  test("a catalog restored after an idle stop is served without waiting for prompts/list", async () => {
+    const workspaceId = "ws-idle-warm-prompts";
+    const sweepIdleServers = useManagerWithIdleSweep();
+    configService.listServers = mock(() => Promise.resolve({ cmd: stdioConfig("cmd-idle-warm") }));
+    // First connection lists REVIEW. After the idle restart prompts/list never settles: if the
+    // send waited for it, this test would time out.
+    servers.serve("cmd-idle-warm", (attempt) => ({
+      listPrompts: () =>
+        attempt === 1
+          ? Promise.resolve([{ name: "review" }])
+          : new Promise<Array<{ name: string }>>(() => undefined),
+    }));
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+    setSystemTime(new Date(Date.now() + MCP_IDLE_TIMEOUT_MS + 60_000));
+    sweepIdleServers();
+    await manager.warmWorkspaceServers(workspaceRequest(workspaceId));
+    const served = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+    expect(servers.connectCount("cmd-idle-warm")).toBe(2);
+    expect(served.promptDescriptors.map((prompt) => prompt.promptName)).toEqual(["review"]);
+  });
+
   test("overlapping opens of one entry point keep the newest open's result", async () => {
     using tmp = new DisposableTempDir("mcp-apps-entry-order");
     const store = new McpAppResultStore((id) => path.join(tmp.path, id));

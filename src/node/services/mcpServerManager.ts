@@ -1681,7 +1681,7 @@ export class MCPServerManager {
   private readonly pendingEnablementRepairs = new Map<string, Promise<void>>();
   private readonly latestProjectTrust = new Map<string, boolean>();
   private readonly workspaceRestartLocks = new MutexMap<string>();
-  /** Instances whose prompts/list settled at least once; see repairEnablementForServe. */
+  /** Instances whose prompts/list settled at least once; see awaitFirstPromptLists. */
   private readonly promptListSettledInstances = new WeakSet<MCPServerInstance>();
   /** Orders racing prompt refresh completions per instance; see refreshInstancePrompts. */
   private readonly promptRefreshSequences = new WeakMap<
@@ -2593,7 +2593,11 @@ export class MCPServerManager {
     if (saved.configSignature !== configSignature) return;
     for (const [serverName, instance] of instances) {
       const prompts = saved.prompts.get(serverName);
-      if (prompts !== undefined && instance.prompts.length === 0) instance.prompts = prompts;
+      if (prompts !== undefined && instance.prompts.length === 0) {
+        instance.prompts = prompts;
+        // A restored catalog is a stale value, not a missing one: serve it while revalidating.
+        this.promptListSettledInstances.add(instance);
+      }
     }
   }
 
@@ -2635,52 +2639,52 @@ export class MCPServerManager {
             error: getErrorMessage(error),
           });
         } finally {
-          this.promptListSettledInstances.add(instance);
+          this.markPromptListSettled(instance, signal);
         }
       })
     );
   }
 
+  private markPromptListSettled(instance: MCPServerInstance, signal: AbortSignal | undefined) {
+    // A canceled list says nothing about the server: the next send still waits for one.
+    if (signal?.aborted !== true) this.promptListSettledInstances.add(instance);
+  }
+
+  /** Whether a served instance of the workspace never settled a prompts/list. */
+  private hasUnlistedPromptInstances(workspaceId: string): boolean {
+    const entry = this.workspaceServers.get(workspaceId);
+    return (
+      entry !== undefined &&
+      [...this.promptEligibleInstances(entry).values()].some(
+        (instance) => !this.promptListSettledInstances.has(instance)
+      )
+    );
+  }
+
   /**
-   * Re-derive enablement for a serve from a cached entry.
+   * Wait for the first prompts/list of the workspace's served instances. Returns true when the
+   * serve that just ran used a catalog that was never listed (`unlistedAtServe`, or found now),
+   * so the caller must serve again.
    *
-   * Prompts follow stale-while-revalidate (the caller spawns the background refresh), except
-   * for an instance whose prompts/list never settled: an MCP App entry point warm-up (or a
-   * prompt dispatch) started it without one. Its empty catalog is not a stale value, so the
-   * send waits for the first list, as a cold start does. Otherwise the first send after a Xum
-   * restart had no mcp_prompt_get and the next one had it, and that tools change made
-   * Anthropic reject the replayed thinking blocks.
+   * Sends serve a cached entry's prompts stale-while-revalidate. An entry started without a
+   * prompt list (an MCP App entry point warm-up, a prompt dispatch) has an empty catalog, which
+   * is no value rather than a stale one. The first send after a Xum restart then had no
+   * mcp_prompt_get and the next one had it, and that tools change made Anthropic reject the
+   * replayed thinking blocks. A server whose list failed is not waited for again.
    */
-  private async repairEnablementForServe(
+  private async awaitFirstPromptLists(
     workspaceId: string,
-    options: MCPWorkspaceRequestOptions,
-    entry: WorkspaceServers,
-    configGenerationUsed: number,
-    refreshToolCatalogs: boolean
-  ): Promise<MCPWorkspaceRequestOptions | undefined> {
-    const enablementDerivedFrom = await this.repairEnablementAfterConcurrentMutation(
-      workspaceId,
-      options,
-      entry,
-      configGenerationUsed
-    );
-    // After the repair, so the awaited list never queries a server a mutation just revoked.
-    const unlisted = refreshToolCatalogs
-      ? new Map(
-          [...this.promptEligibleInstances(entry)].filter(
-            ([, instance]) => !this.promptListSettledInstances.has(instance)
-          )
-        )
-      : new Map<string, MCPServerInstance>();
-    if (unlisted.size === 0) return enablementDerivedFrom;
-    await this.refreshInstancePrompts(unlisted);
-    // Mutations can land during the slow list, as in the cold start.
-    return this.repairEnablementAfterConcurrentMutation(
-      workspaceId,
-      options,
-      entry,
-      configGenerationUsed
-    );
+    unlistedAtServe: boolean
+  ): Promise<boolean> {
+    // The serve's own background refresh can settle before this check runs.
+    if (!unlistedAtServe && !this.hasUnlistedPromptInstances(workspaceId)) return false;
+    const entry = this.workspaceServers.get(workspaceId);
+    if (entry === undefined) return false;
+    // Share the serve's background refresh (deduped per entry) with every concurrent send.
+    if (this.hasUnlistedPromptInstances(workspaceId))
+      this.refreshInstancePromptsInBackground(entry);
+    await entry.promptRefreshInFlight;
+    return true;
   }
 
   /**
@@ -3154,9 +3158,20 @@ export class MCPServerManager {
     options: MCPWorkspaceRequestOptions,
     readSignal?: AbortSignal
   ): Promise<MCPToolsForWorkspaceResult> {
-    return this.runWithStablePluginEpoch(() =>
-      this.ensureWorkspaceServers(options, true, readSignal)
+    return this.serveWithFirstPromptLists(options.workspaceId, () =>
+      this.runWithStablePluginEpoch(() => this.ensureWorkspaceServers(options, true, readSignal))
     );
+  }
+
+  /** Run `serve`, and again after awaitFirstPromptLists waited, so the result has the catalog. */
+  private async serveWithFirstPromptLists(
+    workspaceId: string,
+    serve: () => Promise<MCPToolsForWorkspaceResult>
+  ): Promise<MCPToolsForWorkspaceResult> {
+    const unlistedAtServe = this.hasUnlistedPromptInstances(workspaceId);
+    const result = await serve();
+    // The second serve also picks up the current entry and enablement.
+    return (await this.awaitFirstPromptLists(workspaceId, unlistedAtServe)) ? serve() : result;
   }
 
   /**
@@ -3630,12 +3645,11 @@ export class MCPServerManager {
       // A trust or settings mutation can land while getAllServers() runs above;
       // re-derive enablement so this cached return cannot leave a revoked
       // repo-local server invocable.
-      const enablementDerivedFrom = await this.repairEnablementForServe(
+      const enablementDerivedFrom = await this.repairEnablementAfterConcurrentMutation(
         workspaceId,
         options,
         existing,
-        configGenerationUsed,
-        refreshToolCatalogs
+        configGenerationUsed
       );
 
       // Spawned after the repair: a detached refresh cannot be cancelled, so
@@ -3851,12 +3865,11 @@ export class MCPServerManager {
       // while its own listServers is still pending, so
       // `existing.enabledServerNames` is only trustworthy once the repair has
       // re-derived it here — the serve's last await before return.
-      const enablementDerivedFrom = await this.repairEnablementForServe(
+      const enablementDerivedFrom = await this.repairEnablementAfterConcurrentMutation(
         workspaceId,
         options,
         existing,
-        configGenerationUsed,
-        refreshToolCatalogs
+        configGenerationUsed
       );
 
       // Spawned after the repair so the uncancellable detached refresh cannot
@@ -3893,12 +3906,11 @@ export class MCPServerManager {
         if (current.configSignature === signature && !currentHasClosedInstance) {
           current.lastActivity = Date.now();
           // Repair again in case a mutation landed after the concurrent starter's check.
-          const enablementDerivedFrom = await this.repairEnablementForServe(
+          const enablementDerivedFrom = await this.repairEnablementAfterConcurrentMutation(
             workspaceId,
             options,
             current,
-            configGenerationUsed,
-            refreshToolCatalogs
+            configGenerationUsed
           );
           // Spawned after the repair so the uncancellable detached refresh
           // cannot target servers a concurrent mutation just revoked.
