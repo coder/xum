@@ -249,16 +249,17 @@ function userHook(home: string, name: "tool_pre" | "tool_post", status: number):
 }
 
 function runHook(hook: string, script: string, extraEnv: NodeJS.ProcessEnv = {}) {
-  // Without these, the hooks look for the user's hook in the test's own HOME.
+  // The user's Xum home is dir/home/.xum, through XUM_ROOT. The scorer keeps
+  // the real HOME: uv's cache lives there, and a fresh one makes the scorer
+  // time out on CI.
   const env: NodeJS.ProcessEnv = { ...GIT_ENV };
-  delete env.XUM_ROOT;
   delete env.MUX_ROOT;
   delete env.NODE_ENV;
   const result = spawnSync(hook, [], {
     cwd: repo,
     env: {
       ...env,
-      HOME: join(dir, "home"),
+      XUM_ROOT: join(dir, "home/.xum"),
       XUM_TOOL: "bash",
       XUM_TOOL_INPUT_SCRIPT: script,
       ...extraEnv,
@@ -271,10 +272,13 @@ function runHook(hook: string, script: string, extraEnv: NodeJS.ProcessEnv = {})
 test("the project hooks run the user's own hooks and pass their exit codes through", () => {
   // Xum runs the project's .xum/tool_pre instead of ~/.xum/tool_pre, so the
   // shipped hooks must run the user's. Warn mode: no gate before the commit.
+  // These two calls run no scorer, so they can move HOME to test the default
+  // ~/.xum (an empty XUM_ROOT counts as unset).
   const pre = join(REPO, ".xum/tool_pre");
-  expect(runHook(pre, "git commit -am x")).toEqual({ status: 0, out: "" });
+  const home = { HOME: join(dir, "home"), XUM_ROOT: "" };
+  expect(runHook(pre, "git commit -am x", home)).toEqual({ status: 0, out: "" });
   userHook(join(dir, "home/.xum"), "tool_pre", 3);
-  expect(runHook(pre, "git commit -am x")).toEqual({
+  expect(runHook(pre, "git commit -am x", home)).toEqual({
     status: 3,
     out: "user tool_pre: git commit -am x\n",
   });
