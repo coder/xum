@@ -25,7 +25,7 @@ let mockApi: TestApiOverrides<APIClient> | null = null;
 
 import { OutputTab } from "../OutputTab/OutputTab";
 import type { APIClient } from "@/browser/contexts/API";
-import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
+import { createTestApiClient, textOf, type TestApiOverrides } from "@/browser/testUtils";
 
 // Inject the per-test client through the real provider; mocking the API module leaks
 // process-wide into later suites.
@@ -131,8 +131,8 @@ describe("OutputTab", () => {
       expect(view.getAllByText(/^entry-\d{4}$/)).toHaveLength(MAX_LOG_ENTRIES);
     });
 
-    expect(view.queryByText(formatEntryMessage(0))).toBeNull();
-    expect(view.queryByText(formatEntryMessage(199))).toBeNull();
+    expect(textOf(view.queryByText(formatEntryMessage(0)))).toBeNull();
+    expect(textOf(view.queryByText(formatEntryMessage(199)))).toBeNull();
     expect(view.getByText(formatEntryMessage(200))).toBeTruthy();
     expect(view.getByText(formatEntryMessage(MAX_LOG_ENTRIES + 199))).toBeTruthy();
   });
@@ -168,7 +168,7 @@ describe("OutputTab", () => {
     resolveResetGate();
 
     await waitFor(() => {
-      expect(view.queryByText(formatEntryMessage(0))).toBeNull();
+      expect(textOf(view.queryByText(formatEntryMessage(0)))).toBeNull();
     });
   });
 
@@ -234,8 +234,8 @@ describe("OutputTab", () => {
     resolvePostSnapshotGate();
 
     await waitFor(() => {
-      expect(view.queryByText(formatEntryMessage(0))).toBeNull();
-      expect(view.queryByText(formatEntryMessage(1000))).toBeNull();
+      expect(textOf(view.queryByText(formatEntryMessage(0)))).toBeNull();
+      expect(textOf(view.queryByText(formatEntryMessage(1000)))).toBeNull();
       expect(view.getByText(formatEntryMessage(2000))).toBeTruthy();
     });
   });

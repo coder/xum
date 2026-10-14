@@ -312,7 +312,7 @@ export function GoalDefaultsSection(props: GoalDefaultsSectionProps) {
           Goal defaults
           {hasAnyOverride && (
             <span
-              className="bg-accent-soft text-accent rounded-full px-1.5 py-0.5 text-[10px] font-medium uppercase"
+              className="bg-accent-soft text-accent-text rounded-full px-1.5 py-0.5 text-[10px] font-medium uppercase"
               aria-label="Workspace overrides active"
             >
               Workspace
@@ -594,7 +594,7 @@ function OverrideRow(props: OverrideRowProps) {
           className={cn(
             "border-border-medium rounded-md border px-2 py-1 text-xs",
             props.isOverriding
-              ? "bg-accent-soft text-accent border-accent"
+              ? "bg-accent-soft text-accent-text border-accent"
               : "bg-surface-primary text-muted hover:text-foreground"
           )}
           aria-pressed={props.isOverriding}

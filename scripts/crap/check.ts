@@ -4,6 +4,11 @@
 //
 //   bun scripts/crap/check.ts --base <ref> [--json] [--coverage <lcov>]...
 //       [--base-coverage <lcov>]... [--debt <reason>]...
+//       [--incomplete-coverage <reason>]
+//
+// --incomplete-coverage says the --coverage reports miss some test runs (CI:
+// a missing shard, or a file that ran without coverage), so coverage-based
+// violations become warnings (policy.ts, coverageRelief).
 //
 // Call the script, not `make crap-check`, when the exit code matters: make
 // turns every failing recipe into exit 2.
@@ -177,6 +182,7 @@ function main(argv: string[]): number {
       coverage: { type: "string", multiple: true, default: [] },
       "base-coverage": { type: "string", multiple: true, default: [] },
       debt: { type: "string", multiple: true, default: [] },
+      "incomplete-coverage": { type: "string" },
     },
   });
   if (!values.base) throw new Error("--base <ref> is required");
@@ -211,7 +217,8 @@ function main(argv: string[]): number {
   const { findings, totalComplexity } = evaluate(
     scoreBase(root, base, files, values["base-coverage"]),
     score(root, headPaths, values.coverage),
-    changed
+    changed,
+    values["incomplete-coverage"] ?? null
   );
   const debt = [
     ...readDebt(root, base),

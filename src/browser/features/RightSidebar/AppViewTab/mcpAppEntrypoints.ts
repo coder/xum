@@ -82,14 +82,23 @@ function setMcpAppEntrypoints(workspaceId: string, list: readonly McpAppEntrypoi
   emit();
 }
 
-/** An open returned the entry point as it is now (its view may have moved): list that one. */
+/**
+ * An open returned the entry point as it is now (its view may have moved): list that one, in
+ * its place, so the launcher and palette rows do not move. Only a new key goes at the end.
+ */
 function updateMcpAppEntrypoint(workspaceId: string, entrypoint: McpAppEntrypoint) {
   const list = entrypointsByWorkspace.get(workspaceId);
   if (list === undefined) return;
-  setMcpAppEntrypoints(workspaceId, [
-    ...list.filter((listed) => listed.viewKey !== entrypoint.viewKey),
-    entrypoint,
-  ]);
+  setMcpAppEntrypoints(workspaceId, withEntrypoint(list, entrypoint));
+}
+
+/** `list` with `entrypoint` in place of the item of its key, or at the end when it is new. */
+function withEntrypoint(
+  list: readonly McpAppEntrypoint[],
+  entrypoint: McpAppEntrypoint
+): readonly McpAppEntrypoint[] {
+  const index = list.findIndex((item) => item.viewKey === entrypoint.viewKey);
+  return index === -1 ? [...list, entrypoint] : list.with(index, entrypoint);
 }
 
 /** The view an entry point's app tab shows: its stored record is keyed by `viewKey`. */

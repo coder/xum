@@ -65,21 +65,21 @@ export const FIRST_RUN_VIEW_HTML = `<div id="${FIRST_RUN_VIEW_ID}" inert style="
         </div>
         <div class="flex flex-col gap-3">
           <div class="text-foreground flex items-center gap-2 text-sm font-medium">
-            <span class="bg-accent/10 text-accent inline-flex h-8 w-8 items-center justify-center rounded-md"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewbox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-sparkles h-4 w-4" aria-hidden="true"><path d="M11.017 2.814a1 1 0 0 1 1.966 0l1.051 5.558a2 2 0 0 0 1.594 1.594l5.558 1.051a1 1 0 0 1 0 1.966l-5.558 1.051a2 2 0 0 0-1.594 1.594l-1.051 5.558a1 1 0 0 1-1.966 0l-1.051-5.558a2 2 0 0 0-1.594-1.594l-5.558-1.051a1 1 0 0 1 0-1.966l5.558-1.051a2 2 0 0 0 1.594-1.594z"></path><path d="M20 2v4"></path><path d="M22 4h-4"></path><circle cx="4" cy="20" r="2"></circle></svg></span>
+            <span class="bg-accent/10 text-accent-text inline-flex h-8 w-8 items-center justify-center rounded-md"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewbox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-sparkles h-4 w-4" aria-hidden="true"><path d="M11.017 2.814a1 1 0 0 1 1.966 0l1.051 5.558a2 2 0 0 0 1.594 1.594l5.558 1.051a1 1 0 0 1 0 1.966l-5.558 1.051a2 2 0 0 0-1.594 1.594l-1.051 5.558a1 1 0 0 1-1.966 0l-1.051-5.558a2 2 0 0 0-1.594-1.594l-5.558-1.051a1 1 0 0 1 0-1.966l5.558-1.051a2 2 0 0 0 1.594-1.594z"></path><path d="M20 2v4"></path><path d="M22 4h-4"></path><circle cx="4" cy="20" r="2"></circle></svg></span>
             <span>Xum Gateway (evaluation credits)</span>
           </div>
           <div class="text-content-secondary flex flex-col gap-3 text-sm">
-            <p>Xum Gateway enables you to use free AI tokens from <a href="https://coder.com" target="_blank" rel="noopener noreferrer" class="text-accent underline">Coder</a>.</p>
+            <p>Xum Gateway enables you to use free AI tokens from <a href="https://coder.com" target="_blank" rel="noopener noreferrer" class="text-accent-text underline">Coder</a>.</p>
             <p>OSS contributors with GitHub accounts older than 12 months (or GitHub Pro members) can use this to get free evaluation credits.</p>
             <div class="mt-3 flex flex-wrap gap-2">
               <button class="inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-all active:scale-[0.98] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent disabled:pointer-events-none disabled:opacity-50 [&amp;_svg]:pointer-events-none [&amp;_svg]:size-4 [&amp;_svg]:shrink-0 bg-accent text-accent-foreground shadow hover:bg-accent-button-hover h-9 px-4 py-2">Login with Xum Gateway</button>
             </div>
             <p class="mt-3">You can also receive those credits through:</p>
             <ul class="ml-4 list-disc space-y-1">
-              <li>early adopters can request credits tied to their GH logins on our <a href="https://discord.gg/VfZXvtnR" target="_blank" rel="noopener noreferrer" class="text-accent underline">Discord</a></li>
-              <li>vouchers which you can <a href="https://gateway.xum.cdr.dev" target="_blank" rel="noopener noreferrer" class="text-accent underline">claim here</a></li>
+              <li>early adopters can request credits tied to their GH logins on our <a href="https://discord.gg/VfZXvtnR" target="_blank" rel="noopener noreferrer" class="text-accent-text underline">Discord</a></li>
+              <li>vouchers which you can <a href="https://gateway.xum.cdr.dev" target="_blank" rel="noopener noreferrer" class="text-accent-text underline">claim here</a></li>
             </ul>
-            <p class="mt-3">You can enable this in <button type="button" class="text-accent underline">Settings → Providers</button>.</p>
+            <p class="mt-3">You can enable this in <button type="button" class="text-accent-text underline">Settings → Providers</button>.</p>
           </div>
         </div>
       </div>

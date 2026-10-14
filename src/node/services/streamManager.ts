@@ -5,7 +5,6 @@ import {
   checkAssembledRequestBudgetForModel,
   createContextBudgetAnchor,
   estimateAnchoredRequestTokensForModel,
-  isExactAppend,
   type ContextBudgetAnchorRequest,
   estimateToolResultTokensForModel,
 } from "./contextBudgetCounting";
@@ -303,8 +302,6 @@ export interface SettledStepBudget {
   nextRequestTokens?: number;
   /** The appended-message part of `nextRequestTokens`; absent when it was a full count. */
   nextRequestDeltaTokens?: number;
-  /** True only while every budget count since the turn's first step 0 was an exact append. */
-  exactAppendChain?: boolean;
   sessionHistoryAvailable: boolean;
   /** The step's request advertised `new_context`, so the final prompt can be acted on. */
   newContextAvailable: boolean;
@@ -459,8 +456,6 @@ interface StepMessageTracker {
    * reuse the tracker, so their step 0 is not the turn's first request (#5279).
    */
   providerRequestPrepared?: boolean;
-  /** A full count after the turn's first request, or a thinking rebuild, ran (never reset). */
-  exactAppendChainBroken?: boolean;
   /** Present only when Auto set this turn's thinking level; shared across fallback hops. */
   autoThinkingEscalation?: AutoThinkingEscalationState;
   /**
@@ -2918,9 +2913,6 @@ export class StreamManager {
                 );
           const nextRequestTokens = nextRequest?.estimate;
           const nextRequestDeltaTokens = nextRequest?.delta;
-          if (nextRequestDeltaTokens == null && stepTracker) {
-            stepTracker.exactAppendChainBroken = true;
-          }
           const { decision, continuationEntryId } = await request.onStepSettled({
             model: request.modelString,
             usage: normalizeUsage(step.usage),
@@ -2929,8 +2921,6 @@ export class StreamManager {
             toolResultTokens,
             ...(nextRequestTokens != null ? { nextRequestTokens } : {}),
             ...(nextRequestDeltaTokens != null ? { nextRequestDeltaTokens } : {}),
-            exactAppendChain:
-              nextRequestDeltaTokens != null && stepTracker?.exactAppendChainBroken !== true,
             sessionHistoryAvailable: request.tools?.session_history != null,
             newContextAvailable: request.tools?.new_context != null,
             newContextRequested: step.toolResults.some(
@@ -3241,11 +3231,7 @@ export class StreamManager {
         const firstTurnRequest =
           stepTracker != null && stepNumber === 0 && !stepTracker.providerRequestPrepared;
         const thinkingOverride = this.applyPendingThinkingOverride(request, firstTurnRequest);
-        if (stepTracker) {
-          stepTracker.providerRequestPrepared = true;
-          // A thinking change rebuilds the request (mid-turn, or step 0's first-step rebuild).
-          if (thinkingOverride !== undefined) stepTracker.exactAppendChainBroken = true;
-        }
+        if (stepTracker) stepTracker.providerRequestPrepared = true;
         if (escalation && escalationState) {
           // The rebuild clamps to the model's ladder and reports a no-op as "not applicable";
           // only a level that actually changed is provenance, at the level it changed to (a
@@ -3384,15 +3370,6 @@ export class StreamManager {
         if (request.contextBudgetLimit != null) {
           const budgetOptions = { ...budgetRequest, modelContextLimit: request.contextBudgetLimit };
           const anchor = createContextBudgetAnchor(previousRequest, steps.at(-1));
-          // Any full count after the turn's first request breaks the chain; a fallback or retry
-          // hop's step 0 has no anchor.
-          if (
-            stepTracker &&
-            !firstTurnRequest &&
-            (anchor == null || !isExactAppend(budgetRequest, budgetOptions, anchor))
-          ) {
-            stepTracker.exactAppendChainBroken = true;
-          }
           const exceeded = await checkAssembledRequestBudgetForModel(
             budgetRequest,
             budgetOptions,

@@ -423,6 +423,11 @@ type MockMcpTestResult =
   | { success: true; tools: string[]; serverInfo?: MCPServerIdentity; icon?: string }
   | { success: false; error: string };
 
+// Backend commit revisions of the mock's view-domain approvals, shared by every mock client: the
+// renderer's approval store outlives a story and keeps the list with the newest revision
+// (mcpAppViewDomainsStore.ts). Not time-based, since .storybook/preview.tsx freezes Date.
+let mockViewDomainsRevision = 0;
+
 /**
  * Creates a mock ORPC client for Storybook.
  *
@@ -2434,7 +2439,15 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         const view = mcpApps?.views[input.toolCallId];
         return Promise.resolve(
           view
-            ? { success: true as const, data: view }
+            ? {
+                success: true as const,
+                // Read now, like the backend: newer than every approval published so far.
+                data: {
+                  ...view,
+                  approvedDomainsRevision:
+                    view.approvedDomainsRevision ?? ++mockViewDomainsRevision,
+                },
+              }
             : { success: false as const, error: `No view for ${input.toolCallId}` }
         );
       },
@@ -2458,13 +2471,13 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         mockViewDomains.set(key, entry);
         return Promise.resolve({
           success: true as const,
-          data: { approvedDomains: entry.origins },
+          data: { approvedDomains: entry.origins, revision: ++mockViewDomainsRevision },
         });
       },
       listViewDomains: () => Promise.resolve([...mockViewDomains.values()]),
       revokeViewDomains: (input: { projectPath: string; serverName: string }) => {
         mockViewDomains.delete(JSON.stringify([input.projectPath, input.serverName]));
-        return Promise.resolve();
+        return Promise.resolve({ revision: ++mockViewDomainsRevision });
       },
       // Story views are always in the story transcript, so no record lookup finds one.
       getViewRecords: (input: { toolCallIds: string[] }) =>

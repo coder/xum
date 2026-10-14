@@ -171,9 +171,13 @@ export class AIService extends EventEmitter {
     )
   ) {
     super();
-    // Increase max listeners to accommodate multiple concurrent workspace listeners
-    // Each workspace subscribes to stream events, and we expect >10 concurrent workspaces
-    this.setMaxListeners(50);
+    // No listener cap: every live AgentSession adds one listener per forwarded event, and a
+    // session lives from first use of its workspace until archive, removal or shutdown, so the
+    // count tracks how many workspaces this process has touched. Any fixed cap is a false
+    // MaxListenersExceededWarning for a user with many workspaces or sub-agents. A leak (a
+    // disposed session that keeps its listeners) is caught by
+    // workspaceService.sessionListeners.test.ts instead.
+    this.setMaxListeners(0);
     this.workspaceMcpOverridesService =
       workspaceMcpOverridesService ?? new WorkspaceMcpOverridesService(config);
     this.providersConfigStore = providersConfigStore ?? new ProvidersConfigStore(config.rootDir);

@@ -28,6 +28,7 @@ import {
   getWorkspaceMcpOverrides,
   getWorkspacePluginComposition,
   listWorkspaceMcpPrompts,
+  warmWorkspaceMcpServers,
   listWorkspacePluginSlashCommands,
   setWorkspaceMcpOverrides,
 } from "@/node/services/agentPlugins/workspacePluginOperations";
@@ -1840,7 +1841,7 @@ export const router = (authToken?: string) => {
         .output(schemas.mcpApps.listEntrypoints.output)
         .handler(({ context, input, signal }) =>
           listMcpAppEntrypoints(context, input.workspaceId, signal, (workspaceId, warmSignal) =>
-            listWorkspaceMcpPrompts(context, workspaceId, warmSignal)
+            warmWorkspaceMcpServers(context, workspaceId, warmSignal)
           )
         ),
       onEntrypointsChanged: t
@@ -1854,7 +1855,7 @@ export const router = (authToken?: string) => {
         .output(schemas.mcpApps.openEntrypoint.output)
         .handler(({ context, input, signal }) =>
           openMcpAppEntrypoint(context, input, signal, (workspaceId, warmSignal) =>
-            listWorkspaceMcpPrompts(context, workspaceId, warmSignal)
+            warmWorkspaceMcpServers(context, workspaceId, warmSignal)
           )
         ),
     },
