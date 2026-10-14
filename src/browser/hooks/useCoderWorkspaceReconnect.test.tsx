@@ -37,6 +37,8 @@ interface ServerLists {
 let harness: ConnectionHarness;
 /** What the next server lists, or a promise that answers later. */
 let serverLists: ServerLists | Promise<ServerLists>;
+/** When true, the next server's workspace list fails. */
+let workspacesFail = false;
 
 function serverOverrides(): TestApiOverrides<APIClient> {
   const lists = Promise.resolve(serverLists);
@@ -45,7 +47,10 @@ function serverOverrides(): TestApiOverrides<APIClient> {
       getInfo: () => Promise.resolve({ state: "available" as const, version: "2.0.0" }),
       listTemplates: () => lists.then((l) => ({ ok: true as const, templates: l.templates })),
       listPresets: () => lists.then((l) => ({ ok: true as const, presets: l.presets })),
-      listWorkspaces: () => lists.then((l) => ({ ok: true as const, workspaces: l.workspaces })),
+      listWorkspaces: () =>
+        workspacesFail
+          ? Promise.resolve({ ok: false as const, error: "coder list failed" })
+          : lists.then((l) => ({ ok: true as const, workspaces: l.workspaces })),
     },
   };
 }
@@ -87,6 +92,7 @@ describe.each([...GAP_MODES])("useCoderWorkspace across a reconnect (%s)", (mode
       presets: [preset("p1"), preset("p2")],
       workspaces: [workspace("w1")],
     };
+    workspacesFail = false;
     harness = createConnectionHarness(mode, serverOverrides);
   });
 
@@ -232,6 +238,18 @@ describe.each([...GAP_MODES])("useCoderWorkspace across a reconnect (%s)", (mode
     const withNewClient = renders.filter((render) => render.api === newClient);
     expect(withNewClient.length).toBeGreaterThan(0);
     expect(withNewClient.every((render) => render.blocksSend)).toBe(true);
+  });
+
+  // A failed reload cannot tell whether the picked workspace still exists.
+  test("a failed workspace reload keeps the existing-workspace send blocked", async () => {
+    const { view } = renderCoder({ existingWorkspace: true, workspaceName: "w1" });
+    await waitFor(() => expect(view.result.current.blocksSend).toBe(false));
+
+    workspacesFail = true;
+    await harness.drop();
+    harness.reconnect();
+    await waitFor(() => expect(view.result.current.workspacesError).toBe("coder list failed"));
+    expect(view.result.current.blocksSend).toBe(true);
   });
 
   test("a window focus while offline keeps the Coder info and config", async () => {

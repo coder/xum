@@ -322,9 +322,11 @@ export function useCoderWorkspace({
       .listWorkspaces()
       .then((result) => {
         if (!mounted) return;
-        // The oRPC client is a callable proxy: pass it through an updater, or React calls it.
-        setWorkspacesFreshClient(() => api);
         if (result.ok) {
+          // Only a listed answer is fresh: after a failed one, the picked workspace can still be
+          // gone, so the send stays blocked (as a failed branch list keeps it closed, #6055).
+          // The oRPC client is a callable proxy: pass it through an updater, or React calls it.
+          setWorkspacesFreshClient(() => api);
           workspacesShownRef.current = true;
           setExistingWorkspaces(result.workspaces);
           setWorkspacesError(null);
@@ -340,9 +342,8 @@ export function useCoderWorkspace({
         }
       })
       .catch((error) => {
-        // A lost connection leaves the list not fresh: the next client reloads it.
+        // The list stays not fresh. After a lost connection, the next client reloads it.
         if (!mounted || isConnectionLostError(error)) return;
-        setWorkspacesFreshClient(() => api);
         setExistingWorkspaces([]);
         setWorkspacesError(formatCoderListError(error));
       })
