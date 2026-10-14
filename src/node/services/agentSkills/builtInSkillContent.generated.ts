@@ -2399,7 +2399,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "#### Component review",
       "",
-      "Xum loads a skill or MCP server from a managed plugin only after you review that exact version of it. Xum records what you approved at install, at each update, and in a component review. If the skill or server changes later, or if a newer Xum reads more of the plugin than you saw, it stops loading until you review it again.",
+      "Xum loads a skill or MCP server from a managed plugin only after you review that exact version of it. Xum records what you approved at install, at each update, and in a component review. If its reviewed definition changes later, or if a newer Xum reads more of the plugin than you saw, it stops loading until you review it again. For a skill, the definition is its folder in the plugin and its `SKILL.md` frontmatter. A change to the skill's instructions (the `SKILL.md` body) does not need a new review. For an MCP server, the definition is everything Xum starts or connects with, such as the command, arguments, environment, URL and OAuth settings.",
       "",
       "After you upgrade to a Xum version with component review, every managed plugin needs one review. Its skills and MCP servers do not load until then. Xum does not approve them for you, because your earlier approval did not record what you saw.",
       "",
