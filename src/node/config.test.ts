@@ -1387,6 +1387,139 @@ describe("Config", () => {
       });
     }
 
+    // #5929: a degraded load (the backup keeps failing) logs once per distinct content and
+    // retries the backup without scanning the config directory again.
+    (process.getuid?.() === 0 ? it.skip : it)(
+      "logs a failed backup once per distinct content and does not rescan for the same bytes",
+      () => {
+        const contentA = conflictCases[0][1]();
+        const contentB = conflictCases[1][1]();
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        const logged = () =>
+          errorSpy.mock.calls.filter(([message]) => String(message).includes("the backup of"))
+            .length;
+        writeProjects(contentA);
+        // A read-only config dir makes the sidecar write fail. config.json itself stays
+        // writable, so the test can still change its contents.
+        fs.chmodSync(tempDir, 0o500);
+        const readdirSpy = spyOn(fs, "readdirSync");
+        try {
+          config.loadConfigOrDefault();
+          const scans = () =>
+            readdirSpy.mock.calls.filter(([dir]) => String(dir) === tempDir).length;
+          const scansAfterFirstLoad = scans();
+          config.loadConfigOrDefault();
+          expect(scans()).toBe(scansAfterFirstLoad);
+
+          writeProjects(contentB);
+          config.loadConfigOrDefault();
+          writeProjects(contentA);
+          config.loadConfigOrDefault();
+          expect(logged()).toBe(2);
+        } finally {
+          readdirSpy.mockRestore();
+          fs.chmodSync(tempDir, 0o700);
+          errorSpy.mockRestore();
+        }
+      }
+    );
+
+    // #5929: an id-less legacy row in one alias and an id row in another, on one checkout path.
+    describe("an id-less row and an id row on the same path", () => {
+      // StoredPair rows need an id, so this writes the id-less row as plain JSON.
+      function writeLegacyAndIdRows(checkout: string, id: string): void {
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({
+            projects: [
+              ["/home/u/repo/", { workspaces: [{ name: "x", path: checkout }] }],
+              ["/home/u/repo", { workspaces: [{ id, name: "x", path: checkout }] }],
+            ],
+          })
+        );
+      }
+
+      function checkoutPath(): string {
+        return path.join(config.srcDir, "repo", "x");
+      }
+
+      function writeLegacyMetadata(checkout: string, id: string): string {
+        const dir = path.join(
+          config.sessionsDir,
+          config.generateLegacyId("/home/u/repo", checkout)
+        );
+        fs.mkdirSync(dir, { recursive: true });
+        const file = path.join(dir, "metadata.json");
+        fs.writeFileSync(file, JSON.stringify({ id, name: "x", projectPath: "/home/u/repo" }));
+        return file;
+      }
+
+      async function savedIdsOnCheckout(checkout: string): Promise<Array<string | undefined>> {
+        await config.getAllWorkspaceMetadata({ probeCheckouts: false });
+        await flushConfigEdits();
+        return readSavedProjects()
+          .flatMap(([, project]) => project.workspaces)
+          .filter((w) => w.path === checkout)
+          .map((w) => (w as { id?: string }).id);
+      }
+
+      const sameWorkspaceCases: Array<[string, (checkout: string) => string]> = [
+        [
+          "the id row has the legacy id",
+          (checkout) => config.generateLegacyId("/home/u/repo", checkout),
+        ],
+        [
+          "the legacy metadata.json names the id row's id",
+          (checkout) => {
+            writeLegacyMetadata(checkout, "stable-1");
+            return "stable-1";
+          },
+        ],
+      ];
+      for (const [name, idForCheckout] of sameWorkspaceCases) {
+        it(`keeps one row and backs up the original bytes when ${name}`, async () => {
+          const checkout = checkoutPath();
+          const id = idForCheckout(checkout);
+          writeLegacyAndIdRows(checkout, id);
+          const original = fs.readFileSync(path.join(tempDir, "config.json"));
+          const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+          try {
+            expect(await savedIdsOnCheckout(checkout)).toEqual([id]);
+            const backups = aliasConflictBackups();
+            expect(backups).toHaveLength(1);
+            expect(fs.readFileSync(backups[0])).toEqual(original);
+          } finally {
+            errorSpy.mockRestore();
+          }
+        });
+      }
+
+      it("keeps both rows when the legacy row resolves to another id", async () => {
+        const checkout = checkoutPath();
+        writeLegacyAndIdRows(checkout, "stable-1");
+        const ids = await savedIdsOnCheckout(checkout);
+        expect(ids).toHaveLength(2);
+        expect(ids).toContain("stable-1");
+        expect(aliasConflictBackups()).toHaveLength(0);
+      });
+
+      (process.getuid?.() === 0 ? it.skip : it)(
+        "keeps both rows when the legacy metadata.json cannot be read",
+        () => {
+          const checkout = checkoutPath();
+          const metadataFile = writeLegacyMetadata(checkout, "stable-1");
+          fs.chmodSync(metadataFile, 0o000);
+          writeLegacyAndIdRows(checkout, "stable-1");
+          try {
+            const rows = config.loadConfigOrDefault().projects.get("/home/u/repo")?.workspaces;
+            expect(rows?.filter((w) => w.path === checkout)).toHaveLength(2);
+          } finally {
+            fs.chmodSync(metadataFile, 0o600);
+          }
+        }
+      );
+    });
+
     it("gives merged legacy rows without an id distinct workspace ids", async () => {
       const first = { name: "first", path: path.join(config.srcDir, "repo", "first") };
       const second = { name: "second", path: path.join(config.srcDir, "repo", "second") };
