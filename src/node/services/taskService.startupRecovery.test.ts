@@ -638,7 +638,10 @@ describe("TaskService", () => {
               ? ("blocked" as const)
               : id === "crashed"
                 ? ("interrupted" as const)
-                : ("idle" as const)
+                : // The real probe reports a tail that can hold a follow-up.
+                  id === "compacted" || id === "failed-follow-up"
+                  ? ("follow-up" as const)
+                  : ("idle" as const)
           )
         ),
         dispatchPendingCompactionFollowUp,

@@ -3326,6 +3326,14 @@ export class AgentSession {
     return retryRequest;
   }
 
+  private classifyStartupTail(
+    partial: MuxMessage | null,
+    history: MuxMessage[]
+  ): "interrupted" | "follow-up" | "idle" {
+    if (this.hasInterruptedStartupTail(partial, history)) return "interrupted";
+    return mayEndInPendingCompactionFollowUp(history) ? "follow-up" : "idle";
+  }
+
   private hasInterruptedStartupTail(partial: MuxMessage | null, history: MuxMessage[]): boolean {
     if (this.isPendingAskUserQuestion(partial)) return false;
     if (partial?.role === "assistant" && !this.isFinishedStartupPartial(partial, history)) {
@@ -3607,8 +3615,7 @@ export class AgentSession {
       this.isPendingAskUserQuestion(this.getLastNonSystemHistoryMessage(history.data))
     )
       return "question";
-    if (this.hasInterruptedStartupTail(partial, history.data)) return "interrupted";
-    return mayEndInPendingCompactionFollowUp(history.data) ? "follow-up" : "idle";
+    return this.classifyStartupTail(partial, history.data);
   }
 
   ensureStartupAutoRetryCheck(): Promise<void> {
