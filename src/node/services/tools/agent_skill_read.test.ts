@@ -601,6 +601,26 @@ describe("agent_skill_read", () => {
       expect(mappedTargets).toEqual(["alpha:tdd"]);
     });
 
+    it("keeps a project plugin's note apart from a same-named global plugin", async () => {
+      using tempDir = new TestTempDir("test-agent-skill-read-plugin-sibling-same-name");
+      const xumHome = path.join(tempDir.path, "home");
+      const projectRoot = path.join(tempDir.path, "project");
+      await writeGlobalSkill(xumHome, "tdd", { body: "GLOBAL TDD" });
+      // Only the global install ships `tdd`; `pstack:tdd` is not the project plugin's skill.
+      await writePlugin(xumHome, "pstack", { tdd: "GLOBAL PSTACK TDD" });
+      await writePlugin(path.join(projectRoot, ".xum"), "pstack", { main: "PROJECT MAIN" });
+      const config = createTestToolConfig(projectRoot, {
+        xumScope: {
+          type: "project",
+          xumHome,
+          projectRoot,
+          projectStorageAuthority: "host-local",
+        },
+      });
+
+      expect(await readBody(config, "pstack:main")).toBe("PROJECT MAIN");
+    });
+
     it("leaves the body unchanged when no sibling is shadowed", async () => {
       using tempDir = new TestTempDir("test-agent-skill-read-plugin-sibling-none");
       await writeGlobalSkill(tempDir.path, "unrelated", { body: "GLOBAL" });

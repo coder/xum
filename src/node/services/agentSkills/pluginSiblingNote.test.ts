@@ -19,7 +19,12 @@ describe("formatPluginSiblingNote", () => {
       qualifiedSkill("big", `skill-${i}`)
     );
 
-    const note = formatPluginSiblingNote({ pluginName: "big", skillName: "main", skills });
+    const note = formatPluginSiblingNote({
+      pluginName: "big",
+      scope: "global",
+      skillName: "main",
+      skills,
+    });
 
     expect(mappedNames(note)).toEqual(
       skills.slice(0, PLUGIN_SIBLING_NOTE_MAX_SKILLS).map((skill) => skill.name)

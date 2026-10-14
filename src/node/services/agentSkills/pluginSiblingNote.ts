@@ -1,5 +1,5 @@
 import { PLUGIN_SIBLING_NOTE_MAX_SKILLS } from "@/common/constants/toolLimits";
-import type { InvocableSkill, SkillName } from "@/common/types/agentSkill";
+import type { AgentSkillScope, InvocableSkill, SkillName } from "@/common/types/agentSkill";
 import { parseSkillLookupName } from "@/common/utils/agentSkills/skillLookupName";
 import assert from "@/common/utils/assert";
 import type { ResolvedAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
@@ -14,9 +14,13 @@ import type { ResolvedAgentSkill } from "@/node/services/agentSkills/agentSkills
  * `skills` is the invocable list (listInvocableSkills): shadowed plugin skills
  * appear there under `<plugin>:<skill>`, so qualified entries of this plugin are
  * exactly its shadowed siblings. Returns null when there are none.
+ *
+ * `scope` keeps a project plugin apart from a global plugin with the same name:
+ * they are different installs, and the other one's skills are no siblings.
  */
 export function formatPluginSiblingNote(args: {
   pluginName: string;
+  scope: AgentSkillScope;
   skillName: SkillName;
   skills: readonly InvocableSkill[];
 }): string | null {
@@ -28,6 +32,7 @@ export function formatPluginSiblingNote(args: {
     // Only qualified entries of this plugin (never another plugin's); a bare
     // entry won its name, so the bare reference already reaches it.
     if (lookup?.pluginName !== args.pluginName) continue;
+    if (skill.scope !== args.scope) continue;
     if (lookup.skillName === args.skillName) continue;
     siblings.push(lookup.skillName);
   }
@@ -55,6 +60,7 @@ export function pluginSiblingNoteFor(
   if (resolved.pluginName == null) return null;
   return formatPluginSiblingNote({
     pluginName: resolved.pluginName,
+    scope: resolved.package.scope,
     skillName: resolved.package.directoryName,
     skills: skills ?? [],
   });
