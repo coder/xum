@@ -45,6 +45,8 @@ VIOLATION floor-cc     src/x.ts:10-25 normalizeAgentId: CC 3 -> 4 (must not grow
   also a warning (move relief) when the kept functions lost at least as much
   CC as the new functions hold decision points (CC − 1 each), and the new
   function is at most CC 20. A rename gets no relief.
+- With coverage, both reliefs need the new function at CRAP 30 or less. An
+  untested piece above that stays a violation: test it or shrink it.
 - The function name and line range are in the report. Identity is
   `path::namespace::name`, so renaming a function makes it new.
 

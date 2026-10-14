@@ -403,6 +403,40 @@ function serverTokens(tokens: Parameters<OAuthClientProvider["saveTokens"]>[0]):
 }
 
 /**
+ * What one background auth() call read before it writes: the client it refreshes with (its
+ * tokens are saved only while that client is stored), the stored client record (the SDK's
+ * issuer back-stamp may replace only it), and the stored grant it refreshes (see saveTokens
+ * refreshedFrom). An undefined client record means nothing was read yet.
+ */
+interface AuthCallRead {
+  clientId?: string;
+  readClient?: StoredClientIdentity;
+  refreshedFrom?: MCPOAuthTokens;
+}
+
+/**
+ * The reads of each overlapping auth() call on one provider (#6537). Parallel requests that
+ * all get a 401 run auth() at once, and one shared slot let a later call's read replace an
+ * earlier call's. The SDK passes one context object to every provider call of an auth() call,
+ * so the reads are keyed by it. A call without a context uses the latest read, as before.
+ */
+type AuthCallContext = Parameters<OAuthClientProvider["tokens"]>[0];
+
+class AuthCallReads {
+  private readonly byCall = new WeakMap<NonNullable<AuthCallContext>, AuthCallRead>();
+  private latest: AuthCallRead = {};
+
+  record(ctx: AuthCallContext, read: AuthCallRead): void {
+    this.latest = { ...this.latest, ...read };
+    if (ctx !== undefined) this.byCall.set(ctx, { ...this.byCall.get(ctx), ...read });
+  }
+
+  of(ctx: AuthCallContext): AuthCallRead {
+    return (ctx !== undefined ? this.byCall.get(ctx) : undefined) ?? this.latest;
+  }
+}
+
+/**
  * The use-time rule that decides whether stored credentials may serve a server: they belong
  * to the client and the issuer that minted them. A plugin with another provided client, or one
  * that pins another issuer (a second plugin at the same URL, an update, a remove and re-add),
@@ -1938,29 +1972,24 @@ export class McpOauthService {
     oauth?: MCPServerOAuthConfig;
   }): OAuthClientProvider {
     let discoveryState: OAuthDiscoveryState | undefined;
-    // The client a refresh runs with: its tokens are saved only while that client is stored.
-    let refreshedWithClientId: string | undefined;
-    // The stored grant auth() read before it refreshes (see saveTokens refreshedFrom). Only a
-    // read with the SDK's context counts: a transport request reads tokens without one.
-    let refreshedFrom: MCPOAuthTokens | undefined;
-    // The stored client record the refresh read; the SDK's back-stamp may replace only it.
-    // The SDK reads the client before every write; undefined means nothing was read yet.
-    let readClient: StoredClientIdentity | undefined;
+    const calls = new AuthCallReads();
     const pluginState = pluginDiscoveryState(input.oauth);
 
     return {
       tokens: async (ctx) => {
         const tokens = await this.readMatchingTokens(input.serverUrl, input.oauth);
-        if (ctx !== undefined) refreshedFrom = tokens;
+        // Only a read with the SDK's context counts: a transport request reads without one.
+        if (ctx !== undefined) calls.record(ctx, { refreshedFrom: tokens });
         return tokens;
       },
-      saveTokens: async (tokens) => {
+      saveTokens: async (tokens, ctx) => {
+        const read = calls.of(ctx);
         await this.saveTokens({
           serverUrl: input.serverUrl,
           tokens: serverTokens(tokens),
           legacyBinding: deriveAuthorizationServerBinding(discoveryState),
-          clientId: refreshedWithClientId ?? input.oauth?.clientId,
-          refreshedFrom,
+          clientId: read.clientId ?? input.oauth?.clientId,
+          refreshedFrom: read.refreshedFrom,
         });
       },
       saveDiscoveryState: (state) => {
@@ -2002,13 +2031,15 @@ export class McpOauthService {
           redirect_uris: ["http://127.0.0.1/"],
         };
       },
-      clientInformation: async () => {
+      clientInformation: async (ctx) => {
         const creds = await this.getValidStoredCredentials({ serverUrl: input.serverUrl });
         const stored = storedClientUsable(creds, input.oauth)
           ? creds?.clientInformation
           : undefined;
-        refreshedWithClientId = stored?.client_id;
-        readClient = storedClientIdentity(stored);
+        calls.record(ctx, {
+          clientId: stored?.client_id,
+          readClient: storedClientIdentity(stored),
+        });
         // Token refresh re-reads a plugin secret from its consented file.
         const plugin = stored && pluginClient(input.oauth, await readClientSecret(input.oauth));
         return stored && { ...stored, ...plugin };
@@ -2017,7 +2048,7 @@ export class McpOauthService {
       ...(input.oauth?.resource !== undefined
         ? { validateResourceURL: pluginResourceValidator(input.oauth.resource) }
         : {}),
-      saveClientInformation: async (clientInformation) => {
+      saveClientInformation: async (clientInformation, ctx) => {
         await this.saveClientInformation({
           serverUrl: input.serverUrl,
           clientInformation: persistedClientInfo(
@@ -2026,7 +2057,7 @@ export class McpOauthService {
             input.oauth
           ),
           legacyBinding: deriveAuthorizationServerBinding(discoveryState),
-          expectedStoredClient: readClient,
+          expectedStoredClient: calls.of(ctx).readClient,
         });
       },
     };
@@ -2495,7 +2526,9 @@ export class McpOauthService {
     try {
       await this.persistStoreLocked(store);
     } catch (error) {
-      // Store read/repair must never crash the app at startup.
+      // Store read/repair must never crash the app at startup. Keep the in-memory state: the
+      // failed write dropped the cache, and the file still holds what the repair replaces.
+      this.store = store;
       log.warn("[MCP OAuth] Failed to persist store file; continuing with in-memory state", {
         error,
       });
@@ -2509,6 +2542,11 @@ export class McpOauthService {
     await writeFileAtomic(this.storeFilePath, JSON.stringify(store, null, 2), {
       encoding: "utf-8",
       mode: 0o600,
+    }).catch((error: unknown) => {
+      // The caller already changed the cached store: drop it, so the next read reloads the
+      // file. Otherwise a failed sign-out reads as done and a retry would not write it (#6122).
+      this.store = null;
+      throw error;
     });
     // Another process can replace the file right after this write, so a stat here can name
     // its file: reread on the next use instead (the cache is this process's own content).

@@ -82,9 +82,11 @@ import {
   acquirePluginMutationLock,
   bumpContainerMutationEpoch,
   MUTATION_LOCK_FILE,
+  containerHasPendingSignOuts,
   isJournalName,
   JOURNAL_PREFIXES,
   MUTATION_EPOCH_FILE,
+  PENDING_SIGN_OUTS_FILE_NAME,
   PROMOTION_JOURNAL_PREFIX,
   STAGING_DIR_NAME,
   UNINSTALL_JOURNAL_PREFIX,
@@ -183,6 +185,15 @@ const JOURNAL_RECONCILIATION_TIMEOUT_MS = 30_000;
 
 const LS_REMOTE_TIMEOUT_MS = 30_000;
 const CLONE_TIMEOUT_MS = 120_000;
+
+/** Waits for the startup sign-out pass at most timeoutMs, then lets discovery go on. */
+async function waitForPendingSignOuts(
+  pass: Promise<void>,
+  timeoutMs = JOURNAL_RECONCILIATION_TIMEOUT_MS
+): Promise<void> {
+  const settled = await raceWithAbortAndTimeout(pass, { timeoutMs });
+  if (settled.kind === "timeout") log.warn("Pending plugin sign-outs timed out", { timeoutMs });
+}
 
 /** Deterministic JSON with recursively sorted object keys (fingerprinting). */
 function stableStringify(value: unknown): string {
@@ -517,6 +528,29 @@ function createSecretReader(): SecretReader {
   };
 }
 
+/**
+ * Throws on a corrupt record or one of another version. SECURITY: it may name sign-outs that never ran, so it keeps the
+ * discovery fence until the user repairs or deletes it. Reading it as "nothing pending" would
+ * admit the plugin with its old sign-in's tokens.
+ */
+function parsePendingSignOuts(raw: string, file: string): string[] {
+  let record: unknown;
+  try {
+    record = JSON.parse(raw);
+  } catch {
+    record = undefined;
+  }
+  // Another version's record is kept as it is: an upgrade can still finish it.
+  const fields =
+    typeof record === "object" && record !== null ? (record as Record<string, unknown>) : {};
+  const value = fields.version === 1 ? fields.urls : undefined;
+  if (!Array.isArray(value) || !value.every((url) => typeof url === "string"))
+    throw new Error(
+      `The pending plugin sign-out record (${shortenHome(file)}) is corrupt or from another Xum version. Sign out of the plugin MCP servers in Settings, then delete the file.`
+    );
+  return value;
+}
+
 async function readSignIn(
   url: string,
   oauth: MCPServerOAuthConfig | undefined,
@@ -817,7 +851,11 @@ export class AgentPluginInstallService {
       // journal bracket: recovery consumes journals, and reading them first
       // would suppress the very scan whose recovery just succeeded.
       const unhealthySuppression = (await this.reconciliationState) ? [] : [this.containerDir];
+      // The startup pass (setMcpOauthService) is awaited, so the first request sees the plugins.
+      await this.pendingSignOutReady;
       const bracket = await journalDerivedDiscoveryGate(containerPaths);
+      // The bracket keeps the container closed while a sign-out is pending; start finishing it.
+      await this.startPendingSignOutPass();
       return {
         suppressed: [...new Set([...bracket.suppressed, ...unhealthySuppression])],
         confirm: async () => {
@@ -845,10 +883,22 @@ export class AgentPluginInstallService {
    * left unconsumed (failed restore/quarantine, unidentified target tree) —
    * both mean the managed container may hold unreconciled state.
    */
+  /**
+   * Crash recovery, then starts the pending sign-outs. Pending sign-outs do not make recovery
+   * unhealthy: every discovery gate checks the record itself (containerHasPendingSignOuts).
+   */
+  private async recover(): Promise<boolean> {
+    const allConsumed = await this.reconcileJournals();
+    // Started, not awaited: a slow or failed sign-out must not latch journal health (a
+    // timed-out recovery stores false until the next section open). The record is its own fence.
+    await this.startPendingSignOutPass();
+    return allConsumed;
+  }
+
   private async attemptReconcileJournals(context: string): Promise<boolean> {
     let work = this.reconciliationWork;
     if (work === undefined) {
-      const started = this.reconcileJournals().then(
+      const started = this.recover().then(
         (allConsumed) => {
           if (!allConsumed) {
             log.warn(`Plugin journal reconciliation left unresolved journals (${context})`);
@@ -3297,11 +3347,127 @@ export class AgentPluginInstallService {
     }
   }
 
+  private get pendingSignOutsFile(): string {
+    return path.join(this.config.rootDir, PENDING_SIGN_OUTS_FILE_NAME);
+  }
+
+  private async readPendingSignOuts(): Promise<string[]> {
+    try {
+      const file = this.pendingSignOutsFile;
+      return parsePendingSignOuts(await fsPromises.readFile(file, "utf-8"), file);
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) return [];
+      throw error;
+    }
+  }
+
+  private async writePendingSignOuts(urls: string[]): Promise<void> {
+    if (urls.length === 0) {
+      await fsPromises.rm(this.pendingSignOutsFile, { force: true });
+      return;
+    }
+    await writeFileAtomic(this.pendingSignOutsFile, JSON.stringify({ version: 1, urls }), "utf-8");
+  }
+
+  /**
+   * Adds `urls` to the pending sign-outs and returns the ones this call added. Callers hold the
+   * plugin mutation lock. Throws when the write fails: nothing changed yet, and an unrecorded
+   * sign-out would be lost on a crash.
+   */
+  private async recordPendingSignOuts(urls: string[]): Promise<string[]> {
+    if (urls.length === 0) return [];
+    const pending = await this.readPendingSignOuts();
+    const added = urls.filter((url) => !pending.includes(url));
+    if (added.length > 0) await this.writePendingSignOuts([...pending, ...added]);
+    return added;
+  }
+
+  /**
+   * Removes `urls` from the pending sign-outs: they finished, or the update rolled back before
+   * the new tree was live. Best effort: a leftover URL only signs the server out once more.
+   */
+  private async forgetPendingSignOuts(urls: readonly string[]): Promise<void> {
+    if (urls.length === 0) return;
+    try {
+      const pending = await this.readPendingSignOuts();
+      await this.writePendingSignOuts(pending.filter((url) => !urls.includes(url)));
+    } catch (error) {
+      log.warn("Could not update the pending plugin sign-outs", { error: getErrorMessage(error) });
+    }
+  }
+
+  /** Signs out `urls` after an update; the ones that failed stay pending. */
+  private async signOutAndSettle(name: string, urls: string[]): Promise<void> {
+    const done: string[] = [];
+    for (const serverUrl of urls) {
+      if (await this.signOutPluginServer(name, serverUrl)) done.push(serverUrl);
+    }
+    await this.forgetPendingSignOuts(done);
+  }
+
+  private async signOutPluginServer(name: string, serverUrl: string): Promise<boolean> {
+    const result = await this.mcpOauthService?.logout({ serverUrl });
+    if (result?.success === true) return true;
+    log.warn("Could not sign out a plugin MCP server after its sign-in changed", {
+      plugin: name,
+      error: result?.error ?? "sign-in service unavailable",
+    });
+    return false;
+  }
+
+  /**
+   * Finishes the sign-outs that an update recorded but could not complete (#6122). Runs with
+   * crash recovery and from the discovery gate. Without the sign-in service it does nothing.
+   */
+  private async completePendingSignOuts(): Promise<void> {
+    const oauth = this.mcpOauthService;
+    if (oauth === undefined || !(await this.hasPendingSignOuts())) return;
+    await this.runExclusive(async () => {
+      const left: string[] = [];
+      for (const serverUrl of await this.readPendingSignOuts()) {
+        if (!(await oauth.logout({ serverUrl })).success) left.push(serverUrl);
+      }
+      await this.writePendingSignOuts(left);
+    });
+  }
+
+  private hasPendingSignOuts(): Promise<boolean> {
+    return containerHasPendingSignOuts(this.containerDir);
+  }
+
+  /**
+   * Starts a pass that finishes the pending sign-outs, when one is pending and none runs. The
+   * discovery gate never waits for it: it takes the plugin mutation lock, which an update holds
+   * while it stops MCP servers. The journal bracket keeps the container closed meanwhile.
+   */
+  private async startPendingSignOutPass(): Promise<void> {
+    if (this.pendingSignOutPass !== undefined || !(await this.hasPendingSignOuts())) return;
+    this.pendingSignOutPass = this.completePendingSignOuts()
+      .catch((error: unknown) => {
+        log.warn("Could not finish pending plugin sign-outs", { error: getErrorMessage(error) });
+      })
+      .finally(() => {
+        this.pendingSignOutPass = undefined;
+      });
+  }
+
+  private pendingSignOutPass: Promise<void> | undefined;
+
   /** Managed registry entries merged with unmanaged plugins found by global discovery. */
   /** The OAuth service is built in a later DI layer than this service. */
   setMcpOauthService(service: Pick<McpOauthService, "logout" | "credentialKey">): void {
     this.mcpOauthService = service;
+    // The startup pass ran without this service: finish pending sign-outs now, before the
+    // first agent request scans the container.
+    // Bounded like journal recovery: a hung logout (stalled store I/O) must not hang every
+    // discovery request. On timeout discovery goes on, and the journal bracket keeps the
+    // container closed while the sign-out is still pending.
+    const pass = this.startPendingSignOutPass().then(() => this.pendingSignOutPass);
+    this.pendingSignOutReady = waitForPendingSignOuts(pass, this.deps.reconciliationTimeoutMs);
   }
+
+  /** Started by setMcpOauthService. */
+  private pendingSignOutReady: Promise<void> = Promise.resolve();
 
   async list(): Promise<AgentPluginListItem[]> {
     // Section open re-runs crash recovery (the startup pass may have failed
@@ -3312,6 +3478,7 @@ export class AgentPluginInstallService {
     // wait on this fresh attempt (reconcileJournals serializes internally via
     // runExclusive); a success here re-opens a previously suppressed
     // container.
+    await this.pendingSignOutReady;
     await this.reconciliationState;
     this.reconciliationState = this.attemptReconcileJournals("section open");
     await this.reconciliationState;
@@ -4464,6 +4631,9 @@ export class AgentPluginInstallService {
       }
 
       const { stagedDir, plugin } = await this.stageUpdate(entry, targetSha);
+      // Sign-outs this update recorded, and whether its tree went live (see the catch below).
+      let recordedSignOuts: string[] = [];
+      let promoted = false;
       try {
         const targetPath = this.targetPathFor(entry.name);
         // Security: an update must not silently expand what the plugin can
@@ -4485,6 +4655,11 @@ export class AgentPluginInstallService {
             `The update to '${entry.name}' ${changes.map((change) => change.summary).join("; ")}. Updates cannot expand a plugin's capabilities without review — open Settings → Plugins and review the update to confirm it.`
           );
         }
+
+        // Record the sign-outs before anything changes: a crash, or a store write that fails
+        // after the swap, leaves them for the next start (#6122).
+        const resets = [...new Set(signInResets)];
+        recordedSignOuts = await this.recordPendingSignOuts(resets);
 
         await this.removeDir(path.join(stagedDir, ".git"));
 
@@ -4549,6 +4724,7 @@ export class AgentPluginInstallService {
           }
           throw error;
         }
+        promoted = true;
         // The new tree is live. Consume the JOURNAL before the marker, and
         // ENFORCE that ordering: a markerless target with the journal still
         // present is exactly the state recovery must treat as an unidentified
@@ -4679,14 +4855,7 @@ export class AgentPluginInstallService {
           // refreshed with the new client. Signed out, the server asks again.
           // Runs BEFORE the final stop, so a startup that raced the sign-out
           // is invalidated too, and a failing stop cannot skip it.
-          for (const serverUrl of new Set(signInResets)) {
-            const result = await this.mcpOauthService?.logout({ serverUrl });
-            if (result?.success === false)
-              log.warn("Could not sign out a plugin MCP server after its sign-in changed", {
-                plugin: entry.name,
-                error: result.error,
-              });
-          }
+          await this.signOutAndSettle(entry.name, resets);
           await this.deps.mcpServerManager?.stopServersWithKeyPrefix(serverKeyPrefix);
         }
 
@@ -4694,6 +4863,11 @@ export class AgentPluginInstallService {
           `Updated agent plugin '${entry.name}' ${entry.lockedSha.slice(0, 12)} → ${targetSha.slice(0, 12)}`
         );
         return updated;
+      } catch (error) {
+        // Failed before the new tree went live: the old sign-in still applies, so the recorded
+        // sign-outs must not run at the next start.
+        if (!promoted) await this.forgetPendingSignOuts(recordedSignOuts);
+        throw error;
       } finally {
         await this.removeDir(stagedDir);
       }

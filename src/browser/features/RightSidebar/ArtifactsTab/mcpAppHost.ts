@@ -520,10 +520,11 @@ export function createMcpAppHost(options: McpAppHostOptions) {
     },
     /** The view's display mode changed (also from outside the view); notifies once per change. */
     displayModeChanged,
-    sendHostContextChanged(context: Partial<McpAppHostContext>) {
-      // Context changes only make sense once the view has its initial context.
-      if (!initialized) return;
+    /** Returns whether it was sent: changes only make sense once the view has its context. */
+    sendHostContextChanged(context: Partial<McpAppHostContext>): boolean {
+      if (!initialized) return false;
       notify("ui/notifications/host-context-changed", context);
+      return true;
     },
     teardown,
   };
