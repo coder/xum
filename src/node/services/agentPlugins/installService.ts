@@ -4917,6 +4917,10 @@ export class AgentPluginInstallService {
           return { name: entry.name, status: "pinned" };
         }
         try {
+          // Commit-level comparison, also for subpath installs: a monorepo
+          // commit outside the subpath still reads as "update available",
+          // but applying it needs no consent (the staged folder is identical,
+          // so the capability diff is empty).
           // Pass the stored kind: a remote ADDING a same-name branch must
           // not make a still-tracked tag read as "now a branch".
           const resolved = await this.resolveRemoteRef(
@@ -4972,16 +4976,6 @@ export class AgentPluginInstallService {
         `'${entry.name}' is pinned to commit ${entry.lockedSha.slice(0, 12)}; uninstall and reinstall to change it.`
       );
     }
-    if (entry.source.subpath !== undefined) {
-      // The registry schema deliberately preserves subpath entries written
-      // by newer builds (upgrade↔downgrade), but this build clones and
-      // validates only the repository ROOT: updating would swap the
-      // installed subpath snapshot for an unrelated root tree while the
-      // registry keeps claiming the subpath source.
-      throw new Error(
-        `'${entry.name}' was installed from a repository subpath by a newer version of Mux; update it with that version.`
-      );
-    }
     // A retained journal means a previous swap's recovery is unfinished
     // (e.g. the target was occupied by an unidentifiable tree). Refuse
     // BEFORE cloning and comparing capabilities: a new journal would
@@ -5028,9 +5022,11 @@ export class AgentPluginInstallService {
     entry: AgentPluginInstallEntry,
     sha: string
   ): Promise<{ stagedDir: string; plugin: AgentPluginInfo; warnings: string[] }> {
+    // A subpath install tracks the same folder at the new commit; a folder
+    // that disappeared upstream fails here, before any swap.
     const stagedDir = await this.cloneExactSha(entry.source, sha);
     try {
-      const { plugin, warnings } = await this.validateStagedClone(stagedDir);
+      const { plugin, warnings } = await this.validateStagedClone(stagedDir, entry.source.subpath);
       if (plugin.name !== entry.name) {
         // Container-entry names are identity (instanceId, PLUGIN_DATA,
         // workspace overrides hash the path) — never rename on update.

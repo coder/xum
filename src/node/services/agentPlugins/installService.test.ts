@@ -4808,6 +4808,66 @@ describe("AgentPluginInstallService", () => {
       expect(await registry()).toEqual([]);
     });
 
+    test("updates need consent only for changes inside the subpath", async () => {
+      const preview = await service.preview({ input: monoUrl, subpath });
+      await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+      const before = await installedTree();
+
+      // Outside the subpath: new root skill, README and sibling edits.
+      await fsPromises.mkdir(path.join(monoDir, "skills", "root-new"), { recursive: true });
+      await fsPromises.writeFile(
+        path.join(monoDir, "skills", "root-new", "SKILL.md"),
+        "---\nname: root-new\ndescription: New root skill\n---\n\nNew.\n"
+      );
+      await fsPromises.writeFile(path.join(monoDir, "README.md"), "changed\n");
+      await fsPromises.writeFile(path.join(monoDir, "packages", "other", "hooks.js"), "x\n");
+      const outsideHead = await commitAll(monoDir, "outside the plugin folder");
+      const outsideReview = await service.previewUpdate({ name: "demo-plugin" });
+      expect(outsideReview.toSha).toBe(outsideHead);
+      expect(outsideReview.changes).toEqual([]);
+      const updated = await service.update({ name: "demo-plugin" });
+      expect(updated.lockedSha).toBe(outsideHead);
+      expect(updated.source.subpath).toBe(subpath);
+      expect(await installedTree()).toEqual(before);
+
+      // Inside the subpath: a new skill needs the review's consent.
+      await fsPromises.mkdir(path.join(monoDir, subpath, "skills", "sneak"), { recursive: true });
+      await fsPromises.writeFile(
+        path.join(monoDir, subpath, "skills", "sneak", "SKILL.md"),
+        "---\nname: sneak\ndescription: Sneaky\n---\n\nSneak.\n"
+      );
+      const insideHead = await commitAll(monoDir, "inside the plugin folder");
+      await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(/adds skill 'sneak'/);
+      expect(((await registry())[0] as { lockedSha: string }).lockedSha).toBe(outsideHead);
+      const review = await service.previewUpdate({ name: "demo-plugin" });
+      expect(review.changes.map((change) => change.summary).join("; ")).toMatch(
+        /adds skill 'sneak'/
+      );
+      const consented = await service.update({
+        name: "demo-plugin",
+        consent: { fromSha: review.fromSha, toSha: review.toSha },
+      });
+      expect(consented.lockedSha).toBe(insideHead);
+      expect(await installedTree()).toContain("skills/sneak/SKILL.md");
+      expect(await stagingLeftovers()).toEqual([]);
+    });
+
+    test("a subpath that disappears upstream fails the update without touching the install", async () => {
+      const preview = await service.preview({ input: monoUrl, subpath });
+      await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+      const before = await installedTree();
+      const registryBefore = await registry();
+
+      await git(monoDir, "mv", subpath, "packages/renamed");
+      await commitAll(monoDir, "move the plugin folder");
+      const missing = /'packages\/demo' does not exist in .* The plugin folder may have moved/;
+      await expect(service.previewUpdate({ name: "demo-plugin" })).rejects.toThrow(missing);
+      await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(missing);
+      expect(await installedTree()).toEqual(before);
+      expect(await registry()).toEqual(registryBefore);
+      expect(await stagingLeftovers()).toEqual([]);
+    });
+
     test("a subpath folder without a manifest is refused and the error names that folder", async () => {
       // The repo root IS a plugin here, so a root-install message would mislead.
       const error = await service.preview({ input: monoUrl, subpath: "packages/other" }).then(
@@ -4872,27 +4932,6 @@ describe("AgentPluginInstallService", () => {
       expect(await registry()).toEqual([]);
       expect(await stagingLeftovers()).toEqual([]);
     });
-  });
-
-  test("update refuses subpath installs recorded by a newer build", async () => {
-    const preview = await service.preview({ input: remoteDir });
-    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
-
-    // A newer build recorded a monorepo subpath source (the schema preserves
-    // it for upgrade↔downgrade). This build clones only the repository ROOT,
-    // so updating would swap the installed subpath snapshot for an unrelated
-    // root tree while the registry keeps claiming the subpath source.
-    const doc = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
-      plugins: Array<{ source: Record<string, unknown> }>;
-    };
-    doc.plugins[0].source.subpath = "packages/inner-plugin";
-    await fsPromises.writeFile(registryFile(), JSON.stringify(doc));
-
-    await writePluginFixture(remoteDir, { version: "2.0.0" });
-    await commitAll(remoteDir, "upstream moved");
-    await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(
-      /installed from a repository subpath/
-    );
   });
 
   test("an update swap interrupted between rename and promote is restored", async () => {
