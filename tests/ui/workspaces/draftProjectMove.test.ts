@@ -672,9 +672,7 @@ describeIntegration("Creation project selector moves the draft", () => {
       expect(getDraftStore().getView(creationScope(a, sourceDraftId)).nameState).toMatchObject({
         manualName: "kept-name",
       });
-      const saved = await getSharedEnv().services.draftService.get(
-        creationScope(a, sourceDraftId)
-      );
+      const saved = await getSharedEnv().services.draftService.get(creationScope(a, sourceDraftId));
       expect(saved.nameState?.manualName).toBe("kept-name");
     } finally {
       moveSpy.mockRestore();
