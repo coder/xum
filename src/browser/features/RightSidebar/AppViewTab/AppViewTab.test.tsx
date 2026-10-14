@@ -338,11 +338,7 @@ describe("AppViewTabPanel", () => {
         <ThemeProvider forcedTheme="dark">
           <APIProvider client={client}>
             <AppViewTabLabel workspaceId="ws-retry" toolCallId="call-r" />
-            <AppViewTabPanel
-              workspaceId="ws-retry"
-              toolCallId="call-r"
-              onClose={() => undefined}
-            />
+            <AppViewTabPanel workspaceId="ws-retry" toolCallId="call-r" onClose={() => undefined} />
           </APIProvider>
         </ThemeProvider>
       );
