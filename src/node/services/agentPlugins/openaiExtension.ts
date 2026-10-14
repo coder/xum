@@ -98,8 +98,8 @@ const TEXT_CAPS: Partial<Record<keyof OpenAIPluginInterface, number>> = {
   category: 64,
 };
 const RULES: Record<FieldKind, string> = {
-  name: "a non-empty single line without control or direction characters",
-  text: "a string without control or direction characters",
+  name: "a non-empty single line without control, direction or invisible formatting characters",
+  text: "a string without control, direction or invisible formatting characters",
   url: "an https URL (max 2048 characters)",
   color: "a #RRGGBB color",
   path: "a relative path inside the plugin",
@@ -112,18 +112,28 @@ const RULES: Record<FieldKind, string> = {
  * Characters manifest text must not carry. OpenAI's package rules exclude "control characters,
  * Unicode line or paragraph separators, and unsupported invisible formatting characters"
  * (https://developers.openai.com/plugins/deploy/submission-errors): C0 and C1 controls, U+2028
- * and U+2029, and the whole Unicode format category (`\p{Cf}`). Cf holds the direction controls
- * (LRM/RLM/ALM, embeddings/overrides, isolates) and the zero-width characters (U+200B, U+FEFF,
- * soft hyphen), which can make a displayed plugin or developer name look like another (#6162).
- * `longDescription` may break lines with \n only.
+ * and U+2029, and the Unicode format category (`\p{Cf}`). Cf holds the direction controls
+ * (LRM/RLM/ALM, embeddings/overrides, isolates) and the zero-width characters (U+200B, U+2060,
+ * U+FEFF, soft hyphen), which can make a displayed plugin or developer name look like another
+ * (#6162). `longDescription` may break lines with \n only.
  */
 const UNSAFE_TEXT =
   // eslint-disable-next-line no-control-regex -- the control characters are the point
   /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029\p{Cf}]/u;
+/**
+ * The Cf characters normal text needs, removed before the UNSAFE_TEXT test: ZWNJ (U+200C) and
+ * ZWJ (U+200D) shape Persian and Indic spelling and join emoji sequences, and the tag characters
+ * (U+E0020-U+E007F) spell subdivision flag emoji. OpenAI names no exact list, but calls only
+ * "unsupported" formatting characters invalid. A class subtraction (`v` flag) needs ES2024, and
+ * the build targets ES2020.
+ */
+const ALLOWED_FORMAT = /\u200c|\u200d|[\u{e0020}-\u{e007f}]/gu;
+const hasUnsafeText = (value: string): boolean =>
+  UNSAFE_TEXT.test(value.replace(ALLOWED_FORMAT, ""));
 const isText = (value: unknown, max: number, multiline = false): value is string =>
   typeof value === "string" &&
   value.length <= max &&
-  !UNSAFE_TEXT.test(value) &&
+  !hasUnsafeText(value) &&
   (multiline || !value.includes("\n"));
 const isTextList = (value: unknown, count: number, max: number): value is string[] =>
   Array.isArray(value) && value.length <= count && value.every((entry) => isText(entry, max));

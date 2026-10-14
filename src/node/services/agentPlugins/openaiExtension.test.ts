@@ -135,12 +135,31 @@ describe("readOpenAIExtension", () => {
     const read = (iface: Record<string, unknown>) =>
       readOpenAIExtension({ extensions: { "com.openai": { interface: iface } } });
     // ZERO WIDTH SPACE: "Fig\u200bma" looks like "Figma" in Settings.
-    for (const bad of ["Fig\u200bma", "Fig\u200dma", "Fig\ufeffma", "Fig\u00adma", "Fig\u2060ma"]) {
+    for (const bad of ["Fig\u200bma", "Fig\u2064ma", "Fig\ufeffma", "Fig\u00adma", "Fig\u2060ma"]) {
       expect(read({ ...validInterface, developerName: bad }).extension).toEqual({});
     }
     const optional = read({ ...validInterface, longDescription: "Line one\nLine\u200b two" });
     expect(optional.extension?.interface).toEqual(validInterface);
     expect(optional.warnings).toHaveLength(1);
+  });
+
+  test("joiners and emoji tag characters stay allowed; other format characters do not", () => {
+    const read = (iface: Record<string, unknown>) =>
+      readOpenAIExtension({ extensions: { "com.openai": { interface: iface } } });
+    // ZWJ emoji sequence, a Persian name with ZWNJ, and a subdivision flag (tag characters).
+    const scotland = "\u{1f3f4}\u{e0067}\u{e0062}\u{e0073}\u{e0063}\u{e0074}\u{e007f}";
+    for (const good of [
+      "Dev \u{1f469}\u200d\u{1f4bb}",
+      "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645",
+      `Team ${scotland}`,
+    ]) {
+      const result = read({ ...validInterface, displayName: good, developerName: good });
+      expect(result.warnings).toEqual([]);
+      expect(result.extension?.interface?.displayName).toBe(good);
+    }
+    for (const bad of ["Fig\u200bma", "Example\u202eelgooG"]) {
+      expect(read({ ...validInterface, developerName: bad }).extension).toEqual({});
+    }
   });
 
   test("a blank capability drops the capability list with a warning", () => {
