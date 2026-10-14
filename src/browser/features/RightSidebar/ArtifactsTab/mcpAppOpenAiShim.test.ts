@@ -60,6 +60,8 @@ async function runView(
     seed?: McpAppOpenAiSeed;
     /** The host does not answer (yet): what the view sees before any handshake reply. */
     silentHost?: boolean;
+    /** Runs once the host posted the lifecycle, before the view received any of it. */
+    afterLifecyclePosted?: (win: ViewWindow) => void;
   } = {}
 ) {
   const win = new Window({
@@ -135,6 +137,7 @@ async function runView(
     onInitialized: () => {
       host.sendToolInput({ count: 2 });
       host.sendToolResult({ structuredContent: { dice: [3, 5] }, _meta: { seed: 7 } });
+      options.afterLifecyclePosted?.(win);
     },
     log: () => undefined,
   });
@@ -223,7 +226,7 @@ describe("window.openai shim", () => {
       o.requestClose().catch(function () {});
       o.setWidgetState({ a: 1 });
       window.widgetAfter = o.widgetState;
-      o.setOpenInAppUrl({ href: "https://example.com" });
+      window.openInApp = o.setOpenInAppUrl ? "host" : "own link";
       // The Apps SDK feature-detection pattern: no file APIs here, so the view uses its own.
       window.picker = o.selectFiles ? "library" : o.uploadFile ? "upload" : "own input";
       window.modal = o.requestModal ? "host modal" : "own dialog";
@@ -234,7 +237,9 @@ describe("window.openai shim", () => {
     expect((t.win as unknown as { widgetAfter: unknown }).widgetAfter).toEqual({ a: 1 });
     expect((t.win as unknown as { picker: unknown }).picker).toBe("own input");
     expect((t.win as unknown as { modal: unknown }).modal).toBe("own dialog");
-    expect(t.warnings).toHaveLength(2);
+    // Xum does not use the URL, so the member is absent and the widget keeps its own link.
+    expect((t.win as unknown as { openInApp: unknown }).openInApp).toBe("own link");
+    expect(t.warnings).toHaveLength(1);
   });
 
   test("host context is in the globals before any view script reads them", async () => {
@@ -266,13 +271,22 @@ describe("window.openai shim", () => {
   });
 
   /** The view's own MCP Apps client connecting after the shim did (a hybrid view). */
-  function connectStandardClient(t: Awaited<ReturnType<typeof runView>>) {
+  function connectStandardClient(
+    t: { win: ViewWindow },
+    data: Array<{ method?: string; params?: unknown }> = []
+  ) {
     const received: string[] = [];
     const parent = t.win.parent as unknown as { postMessage: (message: unknown) => void };
+    // Like the ext-apps SDK: handlers first, then the transport listener, then initialize.
     t.win.addEventListener("message", (event) => {
-      const { data, source } = event as unknown as { data: { method?: string }; source: unknown };
+      const message = event as unknown as {
+        data: { method?: string; params?: unknown };
+        source: unknown;
+      };
       // The ext-apps SDK's PostMessageTransport accepts only messages from window.parent.
-      if (source === parent && data.method !== undefined) received.push(data.method);
+      if (message.source !== parent || message.data.method === undefined) return;
+      received.push(message.data.method);
+      data.push(structuredClone(message.data));
     });
     parent.postMessage({ jsonrpc: "2.0", id: 99, method: "ui/initialize", params: {} });
     parent.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
@@ -292,6 +306,40 @@ describe("window.openai shim", () => {
       "ui/initialize",
       "ui/notifications/initialized",
     ]);
+  });
+
+  // A hybrid view whose client connects while the lifecycle the shim's handshake took is still
+  // on its way: the client gets it from the host, so the shim must not replay it.
+  test("a client that connects while the lifecycle is in flight gets each message once", async () => {
+    let received: string[] = [];
+    await runView("window.openai.toolOutput;", {
+      afterLifecyclePosted: (win) => {
+        received = connectStandardClient({ win });
+      },
+    });
+    await settle();
+    expect(received).toEqual(["ui/notifications/tool-input", "ui/notifications/tool-result"]);
+  });
+
+  test("a widget that mutates toolOutput does not change what its own client is replayed", async () => {
+    const t = await runView("window.openai.toolOutput;");
+    (t.win.openai.toolOutput as { dice: number[] }).dice.push(99);
+    const data: Array<{ method?: string; params?: unknown }> = [];
+    connectStandardClient(t, data);
+    await settle();
+    expect(data.find((m) => m.method === "ui/notifications/tool-result")?.params).toEqual({
+      structuredContent: { dice: [3, 5] },
+      _meta: { seed: 7 },
+    });
+  });
+
+  // OpenAI's useOpenAiGlobal reads a global, but a widget may only listen for the event.
+  test("a widget that only listens for openai:set_globals still gets its tool data", async () => {
+    const t = await runView(COLLECT_EVENTS);
+    await settle();
+    expect(t.win.events.some((globals) => "toolOutput" in globals)).toBe(true);
+    expect(t.win.openai.toolOutput).toEqual({ dice: [3, 5] });
+    expect(t.posted.filter((m) => m.method === "ui/initialize")).toHaveLength(1);
   });
 
   test("a standard-only view gets the lifecycle once, with no shim handshake", async () => {
