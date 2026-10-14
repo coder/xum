@@ -384,11 +384,21 @@ function storedClientMatches(
   stored: MCPOAuthStoredCredentials | null | undefined,
   config: MCPServerOAuthConfig | undefined
 ): boolean {
+  return storedClientUsable(stored, config) && grantCoversBaseScopes(stored?.tokens?.scope, config);
+}
+
+/**
+ * storedClientMatches without the scope check: whether the stored client may serve a refresh.
+ * After invalid_grant the SDK drops the tokens and retries with the client; refusing it there
+ * would make the SDK register a new client instead of reaching the sign-in-required path.
+ */
+function storedClientUsable(
+  stored: MCPOAuthStoredCredentials | null | undefined,
+  config: MCPServerOAuthConfig | undefined
+): boolean {
   if (config?.clientId !== undefined && stored?.clientInformation?.client_id !== config.clientId)
     return false;
-  return (
-    grantCoversBaseScopes(stored?.tokens?.scope, config) && storedIssuerMatches(stored, config)
-  );
+  return storedIssuerMatches(stored, config);
 }
 
 /** The pinned-issuer part of storedClientMatches. */
@@ -1910,7 +1920,7 @@ export class McpOauthService {
       },
       clientInformation: async () => {
         const creds = await this.getValidStoredCredentials({ serverUrl: input.serverUrl });
-        const stored = storedClientMatches(creds, input.oauth)
+        const stored = storedClientUsable(creds, input.oauth)
           ? creds?.clientInformation
           : undefined;
         refreshedWithClientId = stored?.client_id;
