@@ -228,7 +228,7 @@ describe("HeartbeatSection", () => {
 
 // happy-dom does not deliver React's synthetic onChange for controlled fields, so call the
 // field's React onChange prop directly (same workaround as InstructionsSection.test.tsx).
-function typeIntoTextarea(textarea: HTMLTextAreaElement, value: string) {
+function typeIntoTextarea(textarea: HTMLElement, value: string) {
   const reactPropsKey = Object.keys(textarea).find((key) => key.startsWith("__reactProps"));
   const reactProps = (
     reactPropsKey ? (textarea as unknown as Record<string, unknown>)[reactPropsKey] : null
@@ -322,4 +322,81 @@ describe.each([...GAP_MODES])("HeartbeatSection across a reconnect (%s)", (mode)
     await waitFor(() => expect(promptField.value).toBe("Saved prompt"));
     expect(promptField.disabled).toBe(false);
   });
+});
+
+// A save that answers after the user typed again must not drop the newer edit's mark: the
+// reload after a reconnect would then replace the newer, unsaved text with the server value.
+describe.each([...GAP_MODES])("HeartbeatSection save answers after a newer edit (%s)", (mode) => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    mock.restore();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  const cases = [
+    { name: "prompt", label: "Default heartbeat prompt", saved: "First", newer: "Second" },
+    // An empty interval clears the override (the `intervalMs: null` branch).
+    {
+      name: "cleared interval",
+      label: "Default heartbeat threshold in minutes",
+      saved: "",
+      newer: "15",
+    },
+    { name: "interval", label: "Default heartbeat threshold in minutes", saved: "20", newer: "25" },
+  ] as const;
+
+  test.each(cases.map((testCase) => [testCase.name, testCase] as const))(
+    "keeps the newer %s across the reload",
+    async (_name, testCase) => {
+      const first = createMockAPI({
+        heartbeatDefaultPrompt: "Server prompt",
+        heartbeatDefaultIntervalMs: 45 * 60_000,
+      });
+      let answerSave: (() => void) | null = null;
+      const pendingSave = () => new Promise<void>((resolve) => (answerSave = resolve));
+      first.api.config.updateHeartbeatDefaultPrompt = mock(pendingSave);
+      first.api.config.updateHeartbeatDefaultIntervalMs = mock(pendingSave);
+      mockApi = first.api;
+      const harness = createConnectionHarness(mode, () => mockApi);
+      const view = render(
+        <harness.Wrapper>
+          <TooltipProvider>
+            <ThemeProvider forcedTheme="dark">
+              <HeartbeatSection />
+            </ThemeProvider>
+          </TooltipProvider>
+        </harness.Wrapper>
+      );
+      const field = (await waitFor(() => view.getByLabelText(testCase.label))) as HTMLInputElement;
+      await waitFor(() => expect(["Server prompt", "45"]).toContain(field.value));
+
+      typeIntoTextarea(field, testCase.saved);
+      fireEvent.blur(field);
+      await waitFor(() => expect(answerSave).not.toBeNull());
+      typeIntoTextarea(field, testCase.newer);
+      await act(async () => {
+        answerSave?.();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+
+      mockApi = createMockAPI({
+        heartbeatDefaultPrompt: "Server prompt",
+        heartbeatDefaultIntervalMs: 45 * 60_000,
+      }).api;
+      await harness.drop();
+      harness.reconnect();
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      });
+
+      expect(field.value).toBe(testCase.newer);
+    }
+  );
 });
