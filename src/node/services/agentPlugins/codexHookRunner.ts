@@ -274,7 +274,7 @@ async function runPostToolHooks(
   // Codex: block or continue: false replaces the tool result with the hooks' feedback. The
   // context gathered so far still reaches the model (Codex adds it next to the feedback).
   ctx.result = {
-    error: feedback.map((text) => `[plugin:${registration.pluginName}] ${text}`).join("\n\n"),
+    error: joinCapped(feedback, registration, "\n\n"),
   };
   // A nested caller (mux.load) holds the original output outside ctx.result: it must not hand it
   // on (Codex PRRT_kwDOPxxmWM6r6NnK). That holds for continue: false too, though Codex keeps it
@@ -484,11 +484,20 @@ function lookup(root: unknown, dottedPath: string): unknown {
 const HOOK_CONTEXT_MAX_CHARS = 32 * 1024;
 const HOOK_CONTEXT_CUT_MARKER = "\n[plugin hook context cut]";
 
+/**
+ * One plugin's texts, labeled and joined, cut at HOOK_CONTEXT_MAX_CHARS. Used for context and for
+ * PostToolUse feedback: both reach the model, and up to MAX_PLUGIN_HOOKS hooks can add to them
+ * (Codex PRRT_kwDOPxxmWM6sWuO7).
+ */
+function joinCapped(texts: string[], registration: CodexHookRegistration, separator: string) {
+  const joined = texts.map((text) => `[plugin:${registration.pluginName}] ${text}`).join(separator);
+  return joined.length > HOOK_CONTEXT_MAX_CHARS
+    ? joined.slice(0, HOOK_CONTEXT_MAX_CHARS) + HOOK_CONTEXT_CUT_MARKER
+    : joined;
+}
+
 function joinNotes(notes: string[], registration: CodexHookRegistration): string {
-  const note = notes.map((text) => `[plugin:${registration.pluginName}] ${text}`).join("\n");
-  return note.length > HOOK_CONTEXT_MAX_CHARS
-    ? note.slice(0, HOOK_CONTEXT_MAX_CHARS) + HOOK_CONTEXT_CUT_MARKER
-    : note;
+  return joinCapped(notes, registration, "\n");
 }
 
 function annotate(result: unknown, notes: string[], registration: CodexHookRegistration): unknown {
