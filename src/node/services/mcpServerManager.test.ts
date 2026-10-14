@@ -69,10 +69,7 @@ import {
 import { FakeMcpServers, MCP_STARTUP_TIMEOUT_MS } from "./mcpServerManager.testHarness";
 import { readMcpToolOrigin } from "./agentPlugins/codexToolNames";
 import type { McpOauthService } from "./mcpOauthService";
-import {
-  MCP_APP_CATALOG_CHANGE_MIN_INTERVAL_MS,
-  MCP_APP_TOOL_CALLS_PER_WINDOW,
-} from "@/common/utils/mcpApps";
+import { MCP_APP_TOOL_CALLS_PER_WINDOW } from "@/common/utils/mcpApps";
 
 const PROJECT_PATH = "/tmp/project";
 const WORKSPACE_PATH = "/tmp/workspace";
@@ -1563,43 +1560,6 @@ describe("MCPServerManager", () => {
     config.onToolsListChanged?.();
 
     expect(changed).toEqual([request.workspaceId]);
-  });
-
-  test("a server flooding tools/list_changed causes at most one tick per interval", async () => {
-    using tmp = new DisposableTempDir("mcp-apps-list-changed-flood");
-    manager.setMcpApps({
-      isEnabled: () => true,
-      store: new McpAppResultStore((id) => path.join(tmp.path, id)),
-    });
-    configService.listServers.mockResolvedValue({ apps: stdioConfig("apps-list-flood") });
-    servers.serve("apps-list-flood", { tools: { show: testTool() } });
-    const request = workspaceRequest("apps-list-flood");
-    await manager.getToolsForWorkspace(request);
-    const [config] = (mcpSdk.createMCPClient as unknown as ReturnType<typeof mock>).mock.calls.at(
-      -1
-    ) as [mcpSdk.MCPClientConfig];
-    let ticks = 0;
-    const unsubscribe = manager.onMcpAppCatalogChanged(() => ticks++);
-    const startedAt = Date.now();
-    fakeTimers.useFakeTimers();
-    setSystemTime(new Date(startedAt));
-    try {
-      // Each tick re-lists every MCP App server of the workspace: a burst must not loop that.
-      for (let i = 0; i < 10; i++) config.onToolsListChanged?.();
-      expect(ticks).toBe(1);
-      fakeTimers.advanceTimersByTime(MCP_APP_CATALOG_CHANGE_MIN_INTERVAL_MS - 1);
-      expect(ticks).toBe(1);
-      // The last change of the burst is not lost: one trailing tick follows.
-      fakeTimers.advanceTimersByTime(1);
-      expect(ticks).toBe(2);
-      fakeTimers.advanceTimersByTime(MCP_APP_CATALOG_CHANGE_MIN_INTERVAL_MS * 3);
-      expect(ticks).toBe(2);
-    } finally {
-      unsubscribe();
-      const now = Date.now();
-      fakeTimers.useRealTimers();
-      setSystemTime(new Date(now));
-    }
   });
 
   test("listing entry points refreshes the tool catalog first (tools/list_changed)", async () => {

@@ -25,6 +25,11 @@ import {
   type MCPToolUi,
 } from "@/common/utils/mcpApps";
 import { log } from "@/node/services/log";
+import {
+  MCP_APP_CATALOG_CHANGE_MIN_INTERVAL_MS,
+  MCP_APP_CATALOG_RELIST_MAX_RETRIES,
+} from "@/constants/mcp";
+import { coalesceCatalogChanges } from "./mcpCatalogChanges";
 
 /**
  * MCP client adapter over the official TypeScript SDK v2
@@ -319,18 +324,23 @@ function mcpToModelOutput({
 /**
  * Hand the server's tools/list_changed notifications to `onChanged` (MCPClientConfig), after a
  * re-list: a legacy-era instance has no other catalog refresh, so its entry points and app tool
- * checks would keep the startup listing. A failed re-list still reports the change.
+ * checks would keep the startup listing. Coalesced (coalesceCatalogChanges), so a flood costs
+ * at most one tools/list per interval. Returns the stop for the client's close.
  */
 function reportToolsListChanged(
   client: Client,
   relist: () => Promise<unknown>,
   onChanged: (() => void) | undefined
-): void {
-  if (onChanged === undefined) return;
-  client.setNotificationHandler("notifications/tools/list_changed", async () => {
-    await relist().catch(() => undefined);
-    onChanged();
+): () => void {
+  if (onChanged === undefined) return () => undefined;
+  const changes = coalesceCatalogChanges({
+    relist,
+    report: onChanged,
+    minIntervalMs: MCP_APP_CATALOG_CHANGE_MIN_INTERVAL_MS,
+    maxRetries: MCP_APP_CATALOG_RELIST_MAX_RETRIES,
   });
+  client.setNotificationHandler("notifications/tools/list_changed", () => changes.notify());
+  return changes.dispose;
 }
 
 export async function createMCPClient(config: MCPClientConfig): Promise<MCPClientHandle> {
@@ -360,7 +370,11 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
   // Set once the handle exists. A notification before then needs no re-list: the first tools()
   // call lists the current catalog.
   let relist: () => Promise<unknown> = () => Promise.resolve();
-  reportToolsListChanged(client, () => relist(), config.onToolsListChanged);
+  const stopCatalogChanges = reportToolsListChanged(
+    client,
+    () => relist(),
+    config.onToolsListChanged
+  );
 
   const transport = isHttpTransportConfig(config.transport)
     ? createHttpTransport(config.transport)
@@ -519,7 +533,10 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
         }
       );
     },
-    close: () => client.close(),
+    close: () => {
+      stopCatalogChanges();
+      return client.close();
+    },
   };
   relist = () => handle.tools();
   return handle;

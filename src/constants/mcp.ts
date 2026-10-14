@@ -32,3 +32,13 @@ export const MCP_LAUNCH_INITIATION_FENCE_MS = 2_000;
  * after a sibling's revocation committed.
  */
 export const MCP_STDIO_LAUNCH_FENCE_MS = 15_000;
+
+/**
+ * Shortest time between two re-lists after a server's tools/list_changed (MCP App entry
+ * points). Each re-list is a tools/list to that server and a re-list of the workspace's entry
+ * points, so a server that floods the notification must not drive a loop.
+ */
+export const MCP_APP_CATALOG_CHANGE_MIN_INTERVAL_MS = 5_000;
+
+/** Failed re-lists after one tools/list_changed retried in a row, one per interval. */
+export const MCP_APP_CATALOG_RELIST_MAX_RETRIES = 3;

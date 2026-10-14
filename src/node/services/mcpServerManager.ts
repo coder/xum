@@ -47,7 +47,6 @@ import {
   isAppCallableTool,
   isMcpAppResourceUri,
   isModelVisibleTool,
-  MCP_APP_CATALOG_CHANGE_MIN_INTERVAL_MS,
   MCP_APP_ENTRYPOINT_TITLE_MAX_CHARS,
   MCP_APP_TOOL_CALL_WINDOW_MS,
   MCP_APP_TOOL_CALLS_PER_WINDOW,
@@ -5337,38 +5336,11 @@ export class MCPServerManager {
     workspaceId: string | undefined
   ): { onToolsListChanged?: () => void } {
     if (appResultStore === null || workspaceId === undefined) return {};
-    return { onToolsListChanged: () => this.throttleAppCatalogChange(workspaceId) };
-  }
-
-  /** Per workspace: when the last tick went out, and the trailing tick, if one is scheduled. */
-  private readonly appCatalogTicks = new Map<
-    string,
-    { lastAt: number; trailing: ReturnType<typeof setTimeout> | null }
-  >();
-
-  /**
-   * Tell the listeners at most once per MCP_APP_CATALOG_CHANGE_MIN_INTERVAL_MS per workspace:
-   * each tick re-lists every MCP App server of the workspace, so a server that floods
-   * tools/list_changed must not drive a refresh loop. A change inside the interval schedules one
-   * trailing tick, so the last change is never lost. An entry is one small record per
-   * workspace that ran an MCP Apps server; its timer clears itself.
-   */
-  private throttleAppCatalogChange(workspaceId: string): void {
-    const state = this.appCatalogTicks.get(workspaceId) ?? { lastAt: -Infinity, trailing: null };
-    this.appCatalogTicks.set(workspaceId, state);
-    if (state.trailing !== null) return;
-    const tick = () => {
-      state.trailing = null;
-      state.lastAt = Date.now();
-      for (const listener of [...this.appCatalogListeners]) listener(workspaceId);
+    return {
+      onToolsListChanged: () => {
+        for (const listener of [...this.appCatalogListeners]) listener(workspaceId);
+      },
     };
-    const wait = state.lastAt + MCP_APP_CATALOG_CHANGE_MIN_INTERVAL_MS - Date.now();
-    if (wait <= 0) {
-      tick();
-      return;
-    }
-    state.trailing = setTimeout(tick, wait);
-    state.trailing.unref?.();
   }
 
   /** Effective tool allowlist of a server for MCP Apps calls (read at dispatch). */
