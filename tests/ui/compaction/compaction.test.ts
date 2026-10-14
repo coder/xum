@@ -244,6 +244,8 @@ describe("Compaction UI (mock AI router)", () => {
     let unregister: (() => void) | undefined;
 
     try {
+      await app.chat.startHeldToolTurn("Seed conversation for /compact test");
+
       const manager = getBackgroundProcessManager(app.env);
 
       const toolCallId = "bash-foreground-compact";
@@ -257,6 +259,7 @@ describe("Compaction UI (mock AI router)", () => {
         () => {
           backgrounded = true;
           unregister?.();
+          app.env.services.aiService.releaseMockToolCalls(app.workspaceId);
         }
       );
 
@@ -264,16 +267,6 @@ describe("Compaction UI (mock AI router)", () => {
 
       // Ensure the UI's subscription has observed the foreground bash before sending /compact.
       await waitForForegroundToolCallId(app.env, app.workspaceId, toolCallId);
-
-      const seedMessage = "Seed conversation for /compact test";
-
-      const seedResult = await app.env.orpc.workspace.sendMessage({
-        workspaceId: app.workspaceId,
-        message: seedMessage,
-        options: { model: WORKSPACE_DEFAULTS.model, agentId: WORKSPACE_DEFAULTS.agentId },
-      });
-      expect(seedResult.success).toBe(true);
-      await app.chat.expectTranscriptContains(`Mock response: ${seedMessage}`);
 
       // Send /compact command via the UI (like a user would)
       await app.chat.send("/compact -t 500");
@@ -348,6 +341,8 @@ describe("Compaction UI (mock AI router)", () => {
     let unregister: (() => void) | undefined;
 
     try {
+      await app.chat.startHeldToolTurn("Seed conversation for compaction");
+
       const manager = getBackgroundProcessManager(app.env);
 
       const toolCallId = "bash-foreground";
@@ -361,30 +356,20 @@ describe("Compaction UI (mock AI router)", () => {
         () => {
           backgrounded = true;
           unregister?.();
+          app.env.services.aiService.releaseMockToolCalls(app.workspaceId);
         }
       );
 
       unregister = registration.unregister;
 
-      // Ensure the UI's subscription has observed the foreground bash before streaming starts.
+      // Observe foreground Bash before queueing the follow-up on the held turn.
       await waitForForegroundToolCallId(app.env, app.workspaceId, toolCallId);
 
-      const seedMessage = "Seed conversation for compaction";
-      const triggerMessage = "[force] Trigger force compaction";
-
-      const seedResult = await app.env.orpc.workspace.sendMessage({
-        workspaceId: app.workspaceId,
-        message: seedMessage,
-        options: { model: WORKSPACE_DEFAULTS.model, agentId: WORKSPACE_DEFAULTS.agentId },
-      });
-      expect(seedResult.success).toBe(true);
-      await app.chat.expectTranscriptContains(`Mock response: ${seedMessage}`);
       moveThresholdSlider(FORCE_THRESHOLD_PERCENT);
       await waitForPersistedThreshold(app.env, FORCE_THRESHOLD_PERCENT / 100);
 
-      // Send via the UI path so the foreground bash auto-background logic runs exactly
-      // as it does for real user sends, while backend mid-stream compaction handles the rest.
-      await app.chat.send(triggerMessage);
+      // Queue on a live turn so tool-end input backgrounds Bash before force compaction.
+      await app.chat.send("[force] Trigger force compaction");
 
       await app.chat.expectTranscriptContains("Mock compaction summary:", 60_000);
 

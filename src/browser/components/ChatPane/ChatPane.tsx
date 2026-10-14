@@ -107,10 +107,7 @@ import { useReviews } from "@/browser/hooks/useReviews";
 import { ReviewsBanner } from "../ReviewsBanner/ReviewsBanner";
 import type { ReviewNoteData } from "@/common/types/review";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
-import {
-  useBackgroundBashActions,
-  useBackgroundBashError,
-} from "@/browser/contexts/BackgroundBashContext";
+import { useBackgroundBashError } from "@/browser/contexts/BackgroundBashContext";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import {
   buildEditingStateFromDisplayed,
@@ -361,7 +358,6 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const aggregator = useWorkspaceAggregator(workspaceId);
   const workspaceUsage = useWorkspaceUsage(workspaceId);
   const reviews = useReviews(workspaceId);
-  const { autoBackgroundOnSend } = useBackgroundBashActions();
   const { clearError: clearBackgroundBashError } = useBackgroundBashError();
 
   // Transcript-only workspaces preserve historical chat and usage after the worktree is deleted,
@@ -1136,22 +1132,6 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     handleJumpToBottom();
   }, [handleJumpToBottom]);
 
-  const handleMessageSent = useCallback(
-    (dispatchMode: QueueDispatchMode = "tool-end") => {
-      // Only background foreground bashes for "tool-end" sends (Enter).
-      // "turn-end" sends (Ctrl/Cmd+Enter) let the stream finish naturally —
-      // backgrounding would disrupt a foreground bash the user wants to complete.
-      if (dispatchMode === "tool-end") {
-        autoBackgroundOnSend();
-      }
-
-      // Slash-command send paths still report after backend success; keep this
-      // harmless duplicate pin so those paths also re-arm auto-scroll.
-      handleJumpToBottom();
-    },
-    [autoBackgroundOnSend, handleJumpToBottom]
-  );
-
   const handleClearHistory = useCallback(
     async (percentage = 1.0) => {
       // Clearing acts on the transcript the user sees. The only caller is the /clear slash
@@ -1757,7 +1737,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       onContextSwitchDismiss={handleContextSwitchDismiss}
                       onModelChange={handleModelChange}
                       onMessageSendStarted={handleMessageSendStarted}
-                      onMessageSent={handleMessageSent}
+                      onMessageSent={handleJumpToBottom}
                       onResetContext={handleResetContext}
                       onTruncateHistory={handleClearHistory}
                       editingMessage={editingMessage}

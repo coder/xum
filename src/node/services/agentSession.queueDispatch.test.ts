@@ -12,6 +12,8 @@ import { createMuxMessage, type MuxMessageMetadata } from "@/common/types/messag
 import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
+import { BackgroundProcessManager } from "./backgroundProcessManager";
+import { TestTempDir } from "./tools/testHelpers";
 import type { AgentSession } from "./agentSession";
 import type { CompactionMonitor } from "./compactionMonitor";
 import type { TurnCompletion } from "./streamManager";
@@ -1332,6 +1334,127 @@ describe("AgentSession queued message tool-call dispatch", () => {
         synthetic: true,
       }),
     ],
+  });
+
+  test.each([
+    ["user", "tool-end"],
+    ["user", "turn-end"],
+    ["agent", "tool-end"],
+    ["agent", "turn-end"],
+  ] as const)("%s %s input backgrounds Bash only when dispatchable", async (sender, mode) => {
+    using tempDir = new TestTempDir("queued-bash");
+    const manager = new BackgroundProcessManager(tempDir.path);
+    const workspaceId = "queue-dispatch-bash";
+    const { session, cleanup, aiEmitter } = await createAgentSessionHarness({
+      workspaceId,
+      backgroundProcessManager: manager,
+    });
+    const background = mock(() => undefined);
+    const otherBackground = mock(() => undefined);
+    const foreground = manager.registerForegroundProcess(
+      workspaceId,
+      "bash-1",
+      "test",
+      "test",
+      background
+    );
+    const other = manager.registerForegroundProcess(
+      "other-workspace",
+      "bash-other",
+      "test",
+      "test",
+      otherBackground
+    );
+    try {
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      session.queueMessage(
+        "follow up",
+        { model: TEST_MODEL, agentId: "exec", queueDispatchMode: mode },
+        sender === "agent" ? peerTriggerInternal("agent-msg:sender:bash") : undefined
+      );
+      expect(background).toHaveBeenCalledTimes(mode === "tool-end" ? 1 : 0);
+      expect(otherBackground).not.toHaveBeenCalled();
+    } finally {
+      foreground.unregister();
+      other.unregister();
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("withdrawn input does not background a subsequent Bash registration", async () => {
+    using tempDir = new TestTempDir("withdrawn-queued-bash");
+    const manager = new BackgroundProcessManager(tempDir.path);
+    const workspaceId = "queue-dispatch-withdrawn-bash";
+    const { session, cleanup, aiEmitter } = await createAgentSessionHarness({
+      workspaceId,
+      backgroundProcessManager: manager,
+    });
+    try {
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      const controller = new AbortController();
+      session.queueMessage(
+        "follow up",
+        { model: TEST_MODEL, agentId: "exec" },
+        {
+          ...peerTriggerInternal("agent-msg:sender:withdrawn-bash"),
+          cancelSignal: controller.signal,
+        }
+      );
+      controller.abort();
+      expect(session.hasQueuedMessages()).toBe(false);
+      const background = mock(() => undefined);
+      const foreground = manager.registerForegroundProcess(
+        workspaceId,
+        "bash-late",
+        "test",
+        "test",
+        background
+      );
+      expect(background).not.toHaveBeenCalled();
+      foreground.unregister();
+    } finally {
+      await session.dispose();
+      await cleanup();
+    }
+  });
+
+  test("held user input blocks agent Bash backgrounding until Send now", async () => {
+    using tempDir = new TestTempDir("held-queued-bash");
+    const manager = new BackgroundProcessManager(tempDir.path);
+    const workspaceId = "queue-dispatch-held-bash";
+    const { session, cleanup, aiEmitter } = await createAgentSessionHarness({
+      workspaceId,
+      backgroundProcessManager: manager,
+    });
+    const background = mock(() => undefined);
+    const foreground = manager.registerForegroundProcess(
+      workspaceId,
+      "bash-1",
+      "test",
+      "test",
+      background
+    );
+    try {
+      aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+      session.queueMessage("hold", {
+        model: TEST_MODEL,
+        agentId: "exec",
+        queueDispatchMode: "turn-end",
+      });
+      session.queueMessage(
+        "agent follow up",
+        { model: TEST_MODEL, agentId: "exec", queueDispatchMode: "tool-end" },
+        peerTriggerInternal("agent-msg:sender:held-bash")
+      );
+      expect(background).not.toHaveBeenCalled();
+      session.setQueuedMessageDispatchMode("tool-end");
+      expect(background).toHaveBeenCalledTimes(1);
+    } finally {
+      foreground.unregister();
+      await session.dispose();
+      await cleanup();
+    }
   });
 
   test("a synthetic turn-end entry never cuts a tool boundary and drains at stream-end", async () => {

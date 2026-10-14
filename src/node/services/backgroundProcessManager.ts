@@ -1095,13 +1095,15 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     this.bgOutputDir = bgOutputDir;
   }
 
-  /**
-   * Mark whether a workspace has a queued user message.
-   * Used by bash_output to return early when user has sent a new message.
-   */
+  /** Release Bash waits only when the queue's next dispatchable entry is tool-end. */
   setMessageQueued(workspaceId: string, queued: boolean): void {
     if (queued) {
       this.queuedMessageWorkspaces.add(workspaceId);
+      // User and agent messages share this backend path, even without a mounted chat.
+      // Turn-end holds must let foreground commands finish naturally.
+      this.getForegroundToolCallIds(workspaceId).forEach((toolCallId) =>
+        this.sendToBackground(toolCallId)
+      );
     } else {
       this.queuedMessageWorkspaces.delete(workspaceId);
     }
