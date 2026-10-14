@@ -50,6 +50,7 @@ import { useStableReference, compareMaps } from "./hooks/useStableReference";
 import { CommandRegistryProvider, useCommandRegistry } from "./contexts/CommandRegistryContext";
 import { CommandIds } from "./utils/commandIds";
 import { useOpenTerminal } from "./hooks/useOpenTerminal";
+import { useWindowTitle } from "./hooks/useWindowTitle";
 import { useMinThinkingLevels } from "./hooks/useMinThinkingLevels";
 import type { CommandAction } from "./contexts/CommandRegistryContext";
 import { useTheme, type ThemePreference } from "./contexts/ThemeContext";
@@ -481,21 +482,14 @@ function AppInner() {
 
   // Update window title based on selected workspace
   // URL syncing is now handled by RouterContext
-  useEffect(() => {
-    if (selectedWorkspace) {
-      // Update window title with workspace title (or name for legacy workspaces)
-      const metadata = workspaceMetadata.get(selectedWorkspace.workspaceId);
-      const workspaceTitle = metadata?.title ?? metadata?.name ?? selectedWorkspace.workspaceId;
-      const title = `${workspaceTitle} - ${selectedWorkspace.projectName} - ${XUM_PRODUCT_SLUG}`;
-      // Set document.title locally for browser mode, call backend for Electron
-      document.title = title;
-      void api?.window.setTitle({ title });
-    } else {
-      // Set document.title locally for browser mode, call backend for Electron
-      document.title = XUM_PRODUCT_SLUG;
-      void api?.window.setTitle({ title: XUM_PRODUCT_SLUG });
-    }
-  }, [selectedWorkspace, workspaceMetadata, api]);
+  let windowTitle: string = XUM_PRODUCT_SLUG;
+  if (selectedWorkspace) {
+    // Update window title with workspace title (or name for legacy workspaces)
+    const metadata = workspaceMetadata.get(selectedWorkspace.workspaceId);
+    const workspaceTitle = metadata?.title ?? metadata?.name ?? selectedWorkspace.workspaceId;
+    windowTitle = `${workspaceTitle} - ${selectedWorkspace.projectName} - ${XUM_PRODUCT_SLUG}`;
+  }
+  useWindowTitle(api, windowTitle);
 
   // Validate selected workspace exists and has all required fields
   // Note: workspace validity is now primarily handled by RouterContext deriving
