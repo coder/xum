@@ -56,6 +56,21 @@ interface PaletteGroup {
   items: PaletteItem[];
 }
 
+/** What a select prompt shows instead of options; undefined when it has results. */
+function selectPromptEmptyText(state: {
+  isLoadingOptions: boolean;
+  resultCount: number;
+  optionCount: number;
+  optionsError: string | null;
+}): string | undefined {
+  if (state.isLoadingOptions) return "Loading options...";
+  if (state.resultCount > 0) return undefined;
+  if (state.optionCount > 0) return "No results";
+  return state.optionsError != null
+    ? `Could not load options: ${state.optionsError}`
+    : "No options";
+}
+
 export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext }) => {
   const memoryExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const memoryConsolidationExperimentEnabled = useExperimentValue(
@@ -475,15 +490,12 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
           })),
         },
       ];
-      if (isLoadingOptions) {
-        emptyText = "Loading options...";
-      } else if (rankedOptions.length > 0) {
-        emptyText = undefined;
-      } else if (selectOptions.length > 0) {
-        emptyText = "No results";
-      } else {
-        emptyText = optionsError != null ? `Could not load options: ${optionsError}` : "No options";
-      }
+      emptyText = selectPromptEmptyText({
+        isLoadingOptions,
+        resultCount: rankedOptions.length,
+        optionCount: selectOptions.length,
+        optionsError,
+      });
     } else {
       const typed = query.trim();
       const fallbackHint = currentField.placeholder ?? "Type value and press Enter";
