@@ -205,15 +205,18 @@ test.each([
   });
 });
 
-test("a client that goes away never makes a call cost more than its reservation", async () => {
+test("a client that goes away aborts the call, which keeps its full reservation", async () => {
   const { socketPath, ledger, recorded } = await setup({ deadlineMs: 60_000 });
   await send(socketPath, body("[fake:slow]", { stream: true }), { onData: (req) => req.destroy() });
-  // Bun 1.3.12 cannot see the disconnect (proxy.ts), so there the call runs to its upstream end
-  // and settles. Where the disconnect is seen, the call aborts and keeps its reservation.
+  // The proxy sees the disconnect and aborts the call before its upstream end, so the call
+  // never settles to its usage: it keeps the whole reservation.
   const [record] = await recorded(1);
-  const cost = record.outcome === "settled" ? usageCost(MODEL, FAKE_USAGE) : record.reservedNanoUsd;
-  expect(["settled", "kept"]).toContain(record.outcome);
-  expect(ledger.totals().spentNanoUsd).toBe(cost!);
+  expect(record.outcome).toBe("kept");
+  expect(record.reservedNanoUsd).toBeGreaterThan(0);
+  expect(ledger.totals()).toMatchObject({
+    spentNanoUsd: record.reservedNanoUsd,
+    reservedNanoUsd: 0,
+  });
 });
 
 test("the deadline also bounds a request whose body never completes", async () => {

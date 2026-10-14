@@ -273,13 +273,10 @@ export async function startProxy(options: ProxyOptions) {
     if (calls.size >= MAX_IN_FLIGHT) return refuse(429, "concurrency: too many calls in flight");
     const abort = new AbortController();
     const timer = setTimeout(() => abort.abort(), deadlineMs);
-    // A client that goes away before the response ends aborts the call. Bun 1.3.12's node:http
-    // never reports that (no 'close', writes still succeed; Bun 1.4.2 does), so there the call
-    // runs on to its upstream end, its deadline or close(), and holds its slot until then.
-    // Bun.serve does report it, but it drops duplicate headers, which P2 must see.
-    // Removal trigger: the Bun bump that #4958 blocks. With it, make proxy.test.ts's "a client
-    // that goes away" test strict again (the call aborts and keeps its full reservation) and
-    // run it on the new Bun. On this host Bun 1.3.13 still misses the disconnect; 1.4.2 sees it.
+    // A client that goes away before the response ends aborts the call, which then keeps its
+    // full reservation (proxy.test.ts, "a client that goes away"). Bun 1.3.12's node:http never
+    // reported the disconnect, so this needs Bun 1.4 or later. Bun.serve reports it too, but it
+    // drops duplicate headers, which P2 must see.
     res.on("close", () => res.writableFinished || abort.abort());
     abort.signal.addEventListener("abort", () => res.destroy(), { once: true });
     const call = { abort, done: Promise.resolve() };
