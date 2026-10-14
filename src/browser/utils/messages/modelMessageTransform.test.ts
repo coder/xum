@@ -543,26 +543,31 @@ describe("modelMessageTransform", () => {
       );
     });
 
-    it("keeps every text part of merged messages, and a file-only message's place", () => {
-      const file = { type: "file" as const, mediaType: "image/png", data: "AAAA" };
+    // Text, a PNG, then an SVG inlined as text (inlineSvgAsTextForProvider): the model must see
+    // the parts in the order the user attached them.
+    it("keeps each merged message's parts in order, joining text only across the boundary", () => {
+      const png = { type: "file" as const, mediaType: "image/png", data: "AAAA" };
       const messages: ModelMessage[] = [
         { role: "user", content: [{ type: "text", text: "Context" }] },
         {
           role: "user",
-          content: [
-            { type: "text", text: "Request" },
-            { type: "text", text: "Converted SVG" },
-          ],
+          content: [{ type: "text", text: "Request" }, png, { type: "text", text: "<svg/>" }],
         },
-        { role: "user", content: [file] },
+        { role: "user", content: [png] },
+        { role: "user", content: "Last" },
       ];
 
       const result = transformModelMessages(messages, "anthropic");
-      // A message without text still adds its separator, as before multi-text merging.
       expect(result).toEqual([
         {
           role: "user",
-          content: [{ type: "text", text: "Context\nRequest\nConverted SVG\n" }, file],
+          content: [
+            { type: "text", text: "Context\nRequest" },
+            png,
+            { type: "text", text: "<svg/>" },
+            png,
+            { type: "text", text: "Last" },
+          ],
         },
       ]);
     });
