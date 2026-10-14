@@ -327,11 +327,10 @@ function reportToolsListChanged(
   onChanged: (() => void) | undefined
 ): void {
   if (onChanged === undefined) return;
-  client.setNotificationHandler("notifications/tools/list_changed", () =>
-    relist()
-      .catch(() => undefined)
-      .finally(onChanged)
-  );
+  client.setNotificationHandler("notifications/tools/list_changed", async () => {
+    await relist().catch(() => undefined);
+    onChanged();
+  });
 }
 
 export async function createMCPClient(config: MCPClientConfig): Promise<MCPClientHandle> {
