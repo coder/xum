@@ -60,7 +60,7 @@ function shape(root: Element): string[] {
   const norm = (s: string) => s.replace(/\s+/g, " ").trim();
   return [root, ...Array.from(root.querySelectorAll("*"))].map((el) => {
     const text = Array.from(el.childNodes)
-      .filter((n) => n.nodeType === Node.TEXT_NODE)
+      .filter((n) => n.nodeType === window.Node.TEXT_NODE)
       .map((n) => n.textContent ?? "")
       .join("");
     return `<${el.tagName.toLowerCase()} class="${norm(el.getAttribute("class") ?? "")}">${norm(text)}`;
@@ -69,7 +69,7 @@ function shape(root: Element): string[] {
 
 /** Parses the constant the way the page will: from a <template>, cloned with content.cloneNode. */
 function staticView(): HTMLElement {
-  const doc = new DOMParser().parseFromString(
+  const doc = new window.DOMParser().parseFromString(
     `<template>${FIRST_RUN_VIEW_HTML}</template>`,
     "text/html"
   );
