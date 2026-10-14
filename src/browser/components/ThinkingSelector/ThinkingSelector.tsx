@@ -269,7 +269,7 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
       <button
         type="button"
         data-thinking-selector-trigger
-        className="text-foreground hover:bg-hover focus-visible:bg-hover focus-visible:text-accent flex shrink-0 cursor-pointer items-center gap-0.5 rounded-sm bg-transparent py-0 pr-0.5 text-[11px] font-medium transition-colors focus-visible:outline-none"
+        className="text-foreground hover:bg-hover focus-visible:bg-hover focus-visible:text-accent-text flex shrink-0 cursor-pointer items-center gap-0.5 rounded-sm bg-transparent py-0 pr-0.5 text-[11px] font-medium transition-colors focus-visible:outline-none"
         aria-expanded={isOpen}
         aria-haspopup="listbox"
         aria-label={`Thinking: ${autoActive ? "Auto" : effectiveThinkingLevel}${proModeActive ? ", pro mode" : ""}${cyberModeActive ? ", cyber mode" : ""}${fastModeActive ? ", fast mode" : ""}${ultrafastModeActive ? ", ultrafast mode" : ""}`}
@@ -447,11 +447,11 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
               >
                 <Route
                   aria-hidden
-                  className={cn("h-3 w-3 shrink-0", autoActive ? "text-accent" : "text-muted")}
+                  className={cn("h-3 w-3 shrink-0", autoActive ? "text-accent-text" : "text-muted")}
                 />
                 <span className="text-foreground min-w-0 flex-1">Auto</span>
                 <span className="text-muted shrink-0 text-[10px]">Route by difficulty</span>
-                {autoActive && <Check className="text-accent h-3 w-3 shrink-0" aria-hidden />}
+                {autoActive && <Check className="text-accent-text h-3 w-3 shrink-0" aria-hidden />}
               </button>
             )}
             {props.inheritOption && (
@@ -467,7 +467,9 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
                 onClick={props.inheritOption.onSelect}
               >
                 <span className="text-foreground min-w-0 flex-1">{props.inheritOption.label}</span>
-                {inheritSelected && <Check className="text-accent h-3 w-3 shrink-0" aria-hidden />}
+                {inheritSelected && (
+                  <Check className="text-accent-text h-3 w-3 shrink-0" aria-hidden />
+                )}
               </button>
             )}
             {allowed.map((level) => {
@@ -487,7 +489,7 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
                   onClick={() => props.onThinkingLevelChange(level)}
                 >
                   <span className="text-foreground min-w-0 flex-1">{label}</span>
-                  {selected && <Check className="text-accent h-3 w-3 shrink-0" aria-hidden />}
+                  {selected && <Check className="text-accent-text h-3 w-3 shrink-0" aria-hidden />}
                 </button>
               );
             })}
@@ -557,7 +559,9 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
                       Faster responses at higher cost
                     </span>
                   </span>
-                  {fastModeActive && <Check className="text-accent h-3 w-3 shrink-0" aria-hidden />}
+                  {fastModeActive && (
+                    <Check className="text-accent-text h-3 w-3 shrink-0" aria-hidden />
+                  )}
                 </button>
               )}
 
@@ -581,7 +585,7 @@ export const ThinkingSelectorControl: React.FC<ThinkingSelectorControlProps> = (
                     </span>
                   </span>
                   {ultrafastModeActive && (
-                    <Check className="text-accent h-3 w-3 shrink-0" aria-hidden />
+                    <Check className="text-accent-text h-3 w-3 shrink-0" aria-hidden />
                   )}
                 </button>
               )}

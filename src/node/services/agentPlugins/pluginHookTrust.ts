@@ -89,26 +89,8 @@ async function readTrustFile(
   file: string,
   installedAt: string
 ): Promise<PluginHookTrustRecord | "newer-version"> {
-  let raw: string;
-  try {
-    // O_NONBLOCK + fstat: a FIFO (or a symlink to one) must not hang the read, which can hold
-    // the plugin mutation lock. Only a bounded regular file is read.
-    await using handle = await fs.open(
-      file,
-      fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0)
-    );
-    const stat = await handle.stat();
-    if (!stat.isFile() || stat.size > MAX_TRUST_FILE_BYTES) {
-      log.warn("Plugin hook trust file is not a bounded regular file; trusting no hooks", { file });
-      return {};
-    }
-    raw = await handle.readFile("utf8");
-  } catch (error) {
-    if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) {
-      log.warn("Plugin hook trust file is unreadable; trusting no hooks", { file, error });
-    }
-    return {};
-  }
+  const raw = await readBoundedTrustFile(file);
+  if (raw === undefined) return {};
   let json: unknown;
   try {
     json = JSON.parse(raw);
@@ -118,10 +100,65 @@ async function readTrustFile(
   const parsed = TrustRecordSchema.safeParse(json);
   // Trust recorded for an earlier install under this name never carries over.
   if (parsed.success) return parsed.data.installedAt === installedAt ? parsed.data.hooks : {};
-  const version = isPlainObject(json) ? json.version : undefined;
-  if (typeof version === "number" && version > 1) return "newer-version";
+  if (isNewerVersionFor(json, installedAt)) return "newer-version";
   log.warn("Plugin hook trust file is malformed; trusting no hooks", { file });
   return {};
+}
+
+/** The file's text, or undefined (logged) when it is missing, unreadable or not bounded. */
+async function readBoundedTrustFile(file: string): Promise<string | undefined> {
+  try {
+    // O_NONBLOCK + fstat: a FIFO (or a symlink to one) must not hang the read, which can hold
+    // the plugin mutation lock. Only a bounded regular file is read.
+    await using handle = await fs.open(
+      file,
+      fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0)
+    );
+    const stat = await handle.stat();
+    // The size from fstat can grow before the read: read at most one byte past the limit, so the
+    // limit holds while reading too (Codex PRRT_kwDOPxxmWM6rPrVQ).
+    const buffer = Buffer.alloc(MAX_TRUST_FILE_BYTES + 1);
+    const bytesRead = stat.isFile() ? await readUntilFull(handle, buffer) : Infinity;
+    if (bytesRead > MAX_TRUST_FILE_BYTES) {
+      log.warn("Plugin hook trust file is not a bounded regular file; trusting no hooks", { file });
+      return undefined;
+    }
+    return buffer.toString("utf8", 0, bytesRead);
+  } catch (error) {
+    if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) {
+      log.warn("Plugin hook trust file is unreadable; trusting no hooks", { file, error });
+    }
+    return undefined;
+  }
+}
+
+/**
+ * Read until EOF or until `buffer` is full. One read() can return fewer bytes than asked on some
+ * filesystems, and parsing that prefix would read a valid file as malformed (Codex
+ * PRRT_kwDOPxxmWM6sRsEs).
+ */
+async function readUntilFull(handle: fs.FileHandle, buffer: Buffer): Promise<number> {
+  let total = 0;
+  while (total < buffer.length) {
+    const { bytesRead } = await handle.read(buffer, total, buffer.length - total, total);
+    if (bytesRead === 0) break;
+    total += bytesRead;
+  }
+  return total;
+}
+
+/**
+ * A record in a newer format that can belong to this install. A version-2 record from an
+ * earlier install (a downgrade, then a reinstall) must not block trust changes (Codex
+ * PRRT_kwDOPxxmWM6reh5V). A non-finite or fractional version is malformed (PRRT_kwDOPxxmWM6rPrVO).
+ */
+function isNewerVersionFor(json: unknown, installedAt: string): boolean {
+  if (!isPlainObject(json)) return false;
+  const { version } = json;
+  const otherInstall = typeof json.installedAt === "string" && json.installedAt !== installedAt;
+  return (
+    typeof version === "number" && Number.isSafeInteger(version) && version > 1 && !otherInstall
+  );
 }
 
 export function reviewStateOf(
@@ -166,7 +203,7 @@ export async function setPluginHookTrust(
   const hooks = { ...trust };
   if (decision.state === null) delete hooks[decision.key];
   else hooks[decision.key] = { hash: decision.hash, state: decision.state };
-  await fs.mkdir(path.dirname(file), { recursive: true });
+  await ensureTrustRoot(xumHome);
   // A wrong-kind entry (a directory, a FIFO) read as no trust above. The atomic rename cannot
   // replace a directory, so remove it first: corrupted state must not block every decision.
   // A symlink is removed too: writeFileAtomic resolves it and would overwrite its target, an
@@ -175,11 +212,39 @@ export async function setPluginHookTrust(
   if (existing !== null && !existing.isFile()) {
     await fs.rm(file, { recursive: true, force: true });
   }
-  await writeFileAtomic(file, JSON.stringify({ version: 1, installedAt, hooks }, null, 2));
+  // An explicit mode: writeFileAtomic otherwise keeps the old file's mode, and a trust file with
+  // mode 000 would stay unreadable, so it would trust nothing forever (PRRT_kwDOPxxmWM6sGAiR).
+  await writeFileAtomic(file, JSON.stringify({ version: 1, installedAt, hooks }, null, 2), {
+    mode: 0o600,
+  });
+}
+
+/**
+ * The trust-store root, as a directory. A regular file (or another wrong-kind entry) there is
+ * corrupted state: it is removed, so it cannot fail every trust change with ENOTDIR (Codex
+ * PRRT_kwDOPxxmWM6rb4Tq).
+ */
+async function ensureTrustRoot(xumHome: string): Promise<void> {
+  await removeWrongKindRoot(xumHome);
+  await fs.mkdir(path.join(xumHome, TRUST_DIR), { recursive: true });
+}
+
+/**
+ * Remove the trust-store root when it is not a real directory. `lstat`: a symlink, also one to a
+ * directory, is removed as a link, so no write or delete reaches outside the store (Codex
+ * PRRT_kwDOPxxmWM6sRsEy). `rm` without `recursive` never follows it to its target.
+ */
+async function removeWrongKindRoot(xumHome: string): Promise<void> {
+  const root = path.join(xumHome, TRUST_DIR);
+  const existing = await fs.lstat(root).catch(() => null);
+  if (existing !== null && !existing.isDirectory()) await fs.rm(root, { force: true });
 }
 
 /** Uninstall: a later install under the same name must not inherit trust. */
 export async function removePluginHookTrust(xumHome: string, instanceId: string): Promise<void> {
+  // A wrong-kind root holds no trust: it is corrupted state, and leaving it would fail the rm
+  // below with ENOTDIR.
+  await removeWrongKindRoot(xumHome);
   // recursive: a directory here is malformed state and must not block the uninstall.
   await fs.rm(getPluginHookTrustPath(xumHome, instanceId), { force: true, recursive: true });
 }

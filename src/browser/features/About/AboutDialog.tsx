@@ -476,7 +476,7 @@ export function AboutDialog() {
             href="https://github.com/coder/mux/releases"
             target="_blank"
             rel="noopener noreferrer"
-            className="titlebar-no-drag text-accent inline-block text-xs hover:underline"
+            className="titlebar-no-drag text-accent-text inline-block text-xs hover:underline"
           >
             View all releases
           </a>

@@ -94,7 +94,7 @@ function getChipPresentation(
         summary.dirtyProjectCount > 0
           ? [formatCategoryCount(summary.dirtyProjectCount, "dirty")]
           : [],
-      className: "border-accent/30 text-accent hover:bg-accent/10 hover:text-accent",
+      className: "border-accent/30 text-accent-text hover:bg-accent/10 hover:text-accent-text",
     };
   }
 
@@ -112,7 +112,7 @@ function getChipPresentation(
     primaryLabel: formatRepoCount(summary.totalProjectCount),
     secondaryLabels: [],
     className: isWorking
-      ? "border-accent/30 text-accent hover:bg-accent/10 hover:text-accent"
+      ? "border-accent/30 text-accent-text hover:bg-accent/10 hover:text-accent-text"
       : "border-border-light/40 text-muted-light hover:border-foreground/40 hover:text-foreground",
   };
 }

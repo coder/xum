@@ -266,6 +266,7 @@
     "dist/**/*.br",
     "dist/**/*.gz",
     "dist/assets/**/*",
+    "dist/*-LICENSE.txt",
     "npm-shrinkwrap.json",
     "README.md",
     "LICENSE"

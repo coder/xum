@@ -263,3 +263,54 @@ describe("Bun inlined-const suspects", () => {
     expect(findings[1].bunInlinedConstSuspect).toBeUndefined();
   });
 });
+
+describe("incomplete coverage", () => {
+  const INCOMPLETE = "shard reports missing (5/6 unit, 3/3 integration)";
+
+  test("coverage-based violations warn and say why, complexity-only verdicts stand", () => {
+    const changed = touchedAt(1, 49);
+    const base = [row("f", 5, [1, 9], 1), row("t", 31, [11, 19], 0), row("h", 2, [21, 22], 1)];
+    const head = [
+      row("f", 5, [1, 9], 0.5), // floor-crap
+      row("t", 31, [11, 19], 0), // crap-tax: CRAP 992 unchanged, but 31 at full coverage
+      row("h", 3, [21, 23], 1), // floor-cc
+      row("g", 3, [31, 39], 0), // new function, CRAP 12 but CC 3
+      row("k", 9, [41, 49], 1), // new function, CC 9 > 8 at any coverage
+    ];
+    const complete = evaluate(base, head, changed);
+    const incomplete = evaluate(base, head, changed, INCOMPLETE);
+    const verdicts = (findings: typeof complete.findings) =>
+      findings.map((finding) => [finding.head.name, finding.rule, finding.severity]);
+    expect(verdicts(complete.findings)).toEqual([
+      ["f", "floor-crap", "violation"],
+      ["g", "new-function", "violation"],
+      ["h", "floor-cc", "violation"],
+      ["k", "new-function", "violation"],
+      ["t", "crap-tax", "violation"],
+    ]);
+    expect(verdicts(incomplete.findings)).toEqual([
+      ["f", "floor-crap", "warning"],
+      ["g", "new-function", "warning"],
+      ["h", "floor-cc", "violation"],
+      ["k", "new-function", "violation"],
+      ["t", "crap-tax", "warning"],
+    ]);
+    const relieved = incomplete.findings.find((finding) => finding.head.name === "g");
+    expect(relieved?.message).toContain(INCOMPLETE);
+    expect(relieved?.bunInlinedConstSuspect).toBeUndefined();
+  });
+
+  test("leaves complexity-only reports and existing warnings alone", () => {
+    // Without coverage the rules compare CC, which a missing report cannot change.
+    expect(verdicts([], [row("g", 9, [1, 9])])).toEqual([
+      ["new-function", "violation", `${PATH}::demo.mod::g`],
+    ]);
+    const { findings } = evaluate([], [row("g", 9, [1, 9])], NOTHING_CHANGED, INCOMPLETE);
+    expect(findings.map((finding) => finding.severity)).toEqual(["violation"]);
+    const hotspot = row("t", 31, [1, 9]);
+    const tax = evaluate([hotspot], [hotspot], touchedAt(3), INCOMPLETE).findings;
+    expect(
+      tax.map((finding) => [finding.rule, finding.severity, finding.message.includes("incomplete")])
+    ).toEqual([["crap-tax", "warning", false]]);
+  });
+});

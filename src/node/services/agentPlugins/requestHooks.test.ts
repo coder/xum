@@ -21,6 +21,8 @@ test("a multi-project workspace with an untrusted secondary project runs no Code
     rootDir: "/xum",
     sessionsDir: "/xum/sessions",
     loadConfigOrDefault: () => ({ projects }),
+    // The registered row carries no newer project list: the send's metadata stands.
+    findWorkspace: () => ({}),
   } as unknown as Config;
   const metadata: WorkspaceMetadata = {
     id: "ws-multi",
@@ -58,4 +60,57 @@ test("a multi-project workspace with an untrusted secondary project runs no Code
   expect(codexArgs?.isProjectTrusted()).toBe(false);
   projects.set("/repo/secondary", { workspaces: [], trusted: true });
   expect(codexArgs?.isProjectTrusted()).toBe(true);
+});
+
+test("the per-call gate reads the workspace's projects again, so a project added mid-turn counts", async () => {
+  // Codex PRRT_kwDOPxxmWM6sGAw0: the send's metadata is a snapshot.
+  const projects: ProjectsConfig["projects"] = new Map([
+    ["/repo/primary", { workspaces: [], trusted: true }],
+    ["/repo/added", { workspaces: [] }],
+  ]);
+  let current: { projects?: WorkspaceMetadata["projects"] } | null = {};
+  const config = {
+    rootDir: "/xum",
+    sessionsDir: "/xum/sessions",
+    loadConfigOrDefault: () => ({ projects }),
+    findWorkspace: () => current,
+  } as unknown as Config;
+  const metadata: WorkspaceMetadata = {
+    id: "ws-grow",
+    name: "ws-grow",
+    projectName: "primary",
+    projectPath: "/repo/primary",
+    runtimeConfig: { type: "local" },
+  };
+  let codexArgs: EnsureCodexHooksArgs | undefined;
+  spies.push(
+    spyOn(agentPluginHookService, "ensureWorkspaceHooksForRequest").mockResolvedValue(undefined),
+    spyOn(codexPluginHookService, "ensureWorkspaceHooks").mockImplementation((args) => {
+      codexArgs = args;
+      return Promise.resolve();
+    })
+  );
+
+  await prepareWorkspaceRequestHooks({
+    config,
+    metadata,
+    hostCheckoutRoot: null,
+    journal: sharedDurableEventJournal("/xum/sessions/ws-grow"),
+    mcpServerManager: {
+      callToolForPluginHook: () => Promise.resolve({}),
+      canCallToolForPluginHook: () => true,
+    },
+  });
+
+  expect(codexArgs?.isProjectTrusted()).toBe(true);
+  current = {
+    projects: [
+      { projectPath: "/repo/primary", projectName: "primary" },
+      { projectPath: "/repo/added", projectName: "added" },
+    ],
+  };
+  expect(codexArgs?.isProjectTrusted()).toBe(false);
+  // A workspace that is gone runs no hook.
+  current = null;
+  expect(codexArgs?.isProjectTrusted()).toBe(false);
 });

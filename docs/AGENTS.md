@@ -48,7 +48,8 @@ description: Agent instructions for AI assistants working on the Xum codebase
 - Package manager: bun only. Use `bun install`, `bun add`, `bun run` (which proxies to Make when relevant). Run `bun install` if modules/types go missing.
 - Makefile is source of truth (new commands land there, not `package.json`).
 - Primary targets: `make dev|start|build|lint|lint-fix|fmt|fmt-check|typecheck|test|test-integration|clean|help`.
-- CI runs `make static-check-full`, which adds the targets in its Makefile prerequisites (including docs link checking via `mintlify broken-links`) to `static-check`.
+- `make lint` and `make static-check` lint only the files changed since the merge base with origin/main (all files when lint config, dependencies or tsconfig change). `make lint-full` lints all files and waits while another full lint runs on the machine; use it only when you need full coverage, since one run takes minutes and ~8 GiB.
+- CI runs `make static-check-full`, which lints all files (`lint-full`) and adds the targets in its Makefile prerequisites (including docs link checking via `mintlify broken-links`) to the rest of `static-check`.
 - Xum sources `.xum/tool_env` before every `bash` tool call; in other harnesses, `source .xum/tool_env` first. Use `run_and_report <step_name> <command...>` when running multiple validation steps in one call.
 - Do not pipe/redirect/wrap `run_and_report` output; keep helper markers intact so Xum can show clean step status.
 - CRAP gate: `make crap-check` scores the functions you changed. When it (or the report after an agent `git commit`/`git push`) names a function, read the `crap-gate` skill (`.xum/skills/crap-gate/SKILL.md`) before fixing it.

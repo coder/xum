@@ -81,6 +81,7 @@ import {
 import { showBrowserNotification } from "@/browser/utils/ui/showBrowserNotification";
 import type { DynamicToolPart, DynamicToolPartPending } from "@/common/types/toolParts";
 import type { AgentSkillDescriptor, AgentSkillScope } from "@/common/types/agentSkill";
+import { resolveSkillReadIdentity } from "@/common/utils/agentSkills/skillLookupName";
 import { INIT_HOOK_MAX_LINES } from "@/common/constants/toolLimits";
 import { isDynamicToolPart } from "@/common/types/toolParts";
 import { z } from "zod";
@@ -2805,7 +2806,7 @@ export class StreamingMessageAggregator {
     if (result.success) {
       const skill = result.skill;
       this.trackLoadedSkill({
-        name: skill.frontmatter.name,
+        name: resolveSkillReadIdentity(input, skill.frontmatter.name),
         description: skill.frontmatter.description,
         scope: skill.scope,
       });

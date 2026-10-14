@@ -96,6 +96,10 @@ describe("flattenToolHookValueToEnv", () => {
     });
   });
 
+  it("omits values that contain NUL bytes, which no env var can hold", () => {
+    expect(flattenToolHookValueToEnv({ output: "a\0b", ok: "x" }, "PFX")).toEqual({ PFX_OK: "x" });
+  });
+
   it("emits legacy FILE_PATH alias when canonical PATH is present", () => {
     // After the file_path → path rename, existing hooks may reference
     // MUX_TOOL_INPUT_FILE_PATH. The flattener emits it as an alias.

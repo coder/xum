@@ -1,4 +1,5 @@
 import { log } from "@/node/services/log";
+import type { MCPSettingValue } from "@/common/utils/mcpSettings";
 import {
   afterEach,
   beforeEach,
@@ -1181,6 +1182,84 @@ describe("MCPServerManager", () => {
     expect(manager.getCachedSettings("settings-latest-ws", "cad")).toEqual(values);
   });
 
+  test("settings: a save returns the schema the server shows after the update", async () => {
+    // The server shows "Snap to grid" only once the grid is on.
+    let stored: Record<string, MCPSettingValue> = { grid: false };
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-fresh") });
+    servers.serve("settings-fresh", {
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: (name, args) => {
+          if (name === "s.update") stored = { ...stored, ...(args.set as typeof stored) };
+          const snap =
+            stored.grid === true ? { snap: { type: "boolean", title: "Snap to grid" } } : {};
+          return Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: {
+                type: "object",
+                properties: { grid: { type: "boolean", title: "Grid" }, ...snap },
+              },
+              values: { snap: false, ...stored },
+            },
+          });
+        },
+      },
+    });
+    await manager.getToolsForWorkspace(workspaceRequest("settings-fresh-ws"));
+    const before = await manager.readSettings("settings-fresh-ws", "cad");
+    if (before === null) throw new Error("expected settings");
+    expect(Object.keys(before.properties)).toEqual(["grid"]);
+
+    const after = await manager.saveSettings(
+      "settings-fresh-ws",
+      "cad",
+      { grid: true },
+      before.instanceToken
+    );
+    expect(Object.keys(after.properties)).toEqual(["grid", "snap"]);
+    expect(after.values).toEqual({ grid: true, snap: false });
+    expect(after.instanceToken).toBe(before.instanceToken);
+  });
+
+  test("settings: a save read from a replaced server instance is refused", async () => {
+    const updates: string[] = [];
+    const settingsServer = (id: string) => ({
+      tools: { draw: testTool() },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: (name: string) => {
+          if (name === "s.update") updates.push(id);
+          return Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: { units: { type: "string", title: "Units" } } },
+              values: { units: "in" },
+            },
+          });
+        },
+      },
+    });
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-token-v1") });
+    servers.serve("settings-token-v1", settingsServer("v1"));
+    servers.serve("settings-token-v2", settingsServer("v2"));
+    const request = workspaceRequest("settings-token-ws");
+    await manager.getToolsForWorkspace(request);
+    const read = await manager.readSettings("settings-token-ws", "cad");
+    if (read === null) throw new Error("expected settings");
+
+    // The dialog stays open while the server's configuration is replaced.
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-token-v2") });
+    await manager.getToolsForWorkspace(request);
+    const refused = await manager
+      .saveSettings("settings-token-ws", "cad", { units: "mm" }, read.instanceToken)
+      .catch((error: unknown) => error);
+    expect(refused).toBeInstanceOf(Error);
+    expect(String(refused)).toContain("Reopen");
+    expect(updates).toEqual([]);
+  });
+
   test("settings: a replaced server instance does not keep the old instance's cached values", async () => {
     const settingsServer = (units: string) => ({
       tools: { draw: testTool() },
@@ -1375,6 +1454,8 @@ describe("MCPServerManager", () => {
       resourceUri: "ui://x/view",
       arguments: {},
       result: { content: [{ type: "text", text: "apps-entry" }] },
+      // Marks the record as an entry point's (tool call IDs come from outside).
+      entrypoint: true,
     });
 
     // Another server's tool, or a type the tool does not declare, is refused before any call.
@@ -1408,6 +1489,272 @@ describe("MCPServerManager", () => {
       );
     expect(excluded).toBeInstanceOf(Error);
     expect(calls).toHaveLength(1);
+  });
+
+  test("warming a cold workspace for entry points does not wait for prompts/list", async () => {
+    using tmp = new DisposableTempDir("mcp-apps-entry-warm");
+    manager.setMcpApps({
+      isEnabled: () => true,
+      store: new McpAppResultStore((id) => path.join(tmp.path, id)),
+    });
+    configService.listServers.mockResolvedValue({ apps: stdioConfig("apps-entry-warm") });
+    const listPrompts = mock(() => new Promise<Array<{ name: string }>>(() => undefined));
+    servers.serve("apps-entry-warm", {
+      tools: { show: testTool() },
+      listPrompts,
+      apps: {
+        hasTool: () => true,
+        toolUi: () => undefined,
+        appEntrypoints: () => [
+          { toolName: "board", title: "Board", resourceUri: "ui://x/view", types: ["global"] },
+        ],
+      },
+    });
+    const request = workspaceRequest("apps-entry-warm");
+
+    // The stalled prompts/list would hold this for the prompt-list timeout.
+    await manager.warmWorkspaceServers(request);
+
+    expect(manager.hasWorkspaceRequestOptions(request.workspaceId)).toBe(true);
+    expect(
+      (await manager.listMcpAppEntrypoints(request.workspaceId)).map((entry) => entry.toolName)
+    ).toEqual(["board"]);
+  });
+
+  // Opening a workspace lists its entry points, which warms the servers without prompts/list.
+  // The first send after a Xum restart then served no prompts, so mcp_prompt_get was missing
+  // from that turn's tools and back on the next: the changed tools list made Anthropic reject
+  // the replayed thinking blocks.
+  test("the first send after an entry point warm-up serves the prompt catalog", async () => {
+    using tmp = new DisposableTempDir("mcp-apps-entry-warm-prompts");
+    manager.setMcpApps({
+      isEnabled: () => true,
+      store: new McpAppResultStore((id) => path.join(tmp.path, id)),
+    });
+    configService.listServers.mockResolvedValue({ apps: stdioConfig("apps-entry-warm-prompts") });
+    servers.serve("apps-entry-warm-prompts", {
+      tools: { show: testTool() },
+      listPrompts: () => Promise.resolve([{ name: "review" }]),
+    });
+    const request = workspaceRequest("apps-entry-warm-prompts");
+
+    await manager.warmWorkspaceServers(request);
+    const served = await manager.getToolsForWorkspace(request);
+
+    expect(served.promptDescriptors.map((prompt) => prompt.promptName)).toEqual(["review"]);
+  });
+
+  test("a send never waits again for a server whose prompts/list already failed", async () => {
+    configService.listServers.mockResolvedValue({ cmd: stdioConfig("cmd-failed-prompts") });
+    // The first list fails (a 10 s timeout live). Later lists never settle: if the send
+    // waited for one, this test would time out.
+    let attempts = 0;
+    servers.serve("cmd-failed-prompts", {
+      listPrompts: () => {
+        attempts += 1;
+        return attempts === 1
+          ? Promise.reject(new Error("timed out"))
+          : new Promise<Array<{ name: string }>>(() => undefined);
+      },
+    });
+    const request = workspaceRequest("ws-failed-prompts");
+
+    expect((await manager.getToolsForWorkspace(request)).promptDescriptors).toEqual([]);
+    expect((await manager.getToolsForWorkspace(request)).promptDescriptors).toEqual([]);
+  });
+
+  test("a canceled prompt discovery leaves the next send waiting for the first list", async () => {
+    configService.listServers.mockResolvedValue({ cmd: stdioConfig("cmd-canceled-prompts") });
+    let canceled = false;
+    servers.serve("cmd-canceled-prompts", {
+      listPrompts: (options) => {
+        if (canceled) return Promise.resolve([{ name: "review" }]);
+        return new Promise((_resolve, reject) =>
+          options?.signal?.addEventListener("abort", () => reject(new Error("aborted")))
+        );
+      },
+    });
+    const request = workspaceRequest("ws-canceled-prompts");
+    const controller = new AbortController();
+
+    const discovery = manager.getPromptsForWorkspace(request, { signal: controller.signal });
+    // The composer's discovery started the servers; cancel its prompts/list.
+    while (!manager.hasWorkspaceRequestOptions(request.workspaceId)) await Bun.sleep(1);
+    canceled = true;
+    controller.abort();
+    await discovery.catch(() => undefined);
+
+    const served = await manager.getToolsForWorkspace(request);
+    expect(served.promptDescriptors.map((prompt) => prompt.promptName)).toEqual(["review"]);
+  });
+
+  test("a catalog restored after an idle stop is served without waiting for prompts/list", async () => {
+    const workspaceId = "ws-idle-warm-prompts";
+    const sweepIdleServers = useManagerWithIdleSweep();
+    configService.listServers = mock(() => Promise.resolve({ cmd: stdioConfig("cmd-idle-warm") }));
+    // First connection lists REVIEW. After the idle restart prompts/list never settles: if the
+    // send waited for it, this test would time out.
+    servers.serve("cmd-idle-warm", (attempt) => ({
+      listPrompts: () =>
+        attempt === 1
+          ? Promise.resolve([{ name: "review" }])
+          : new Promise<Array<{ name: string }>>(() => undefined),
+    }));
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+    setSystemTime(new Date(Date.now() + MCP_IDLE_TIMEOUT_MS + 60_000));
+    sweepIdleServers();
+    await manager.warmWorkspaceServers(workspaceRequest(workspaceId));
+    const served = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+    expect(servers.connectCount("cmd-idle-warm")).toBe(2);
+    expect(served.promptDescriptors.map((prompt) => prompt.promptName)).toEqual(["review"]);
+  });
+
+  test("an empty catalog saved by an idle stop of a never-listed server is listed again", async () => {
+    const workspaceId = "ws-idle-unlisted-prompts";
+    const sweepIdleServers = useManagerWithIdleSweep();
+    configService.listServers = mock(() =>
+      Promise.resolve({ cmd: stdioConfig("cmd-idle-unlisted") })
+    );
+    servers.serve("cmd-idle-unlisted", {
+      listPrompts: () => Promise.resolve([{ name: "review" }]),
+    });
+    // Warmed, never sent to, then stopped idle: the saved catalog is the unlisted [].
+    await manager.warmWorkspaceServers(workspaceRequest(workspaceId));
+    setSystemTime(new Date(Date.now() + MCP_IDLE_TIMEOUT_MS + 60_000));
+    sweepIdleServers();
+    await manager.warmWorkspaceServers(workspaceRequest(workspaceId));
+
+    const served = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(servers.connectCount("cmd-idle-unlisted")).toBe(2);
+    expect(served.promptDescriptors.map((prompt) => prompt.promptName)).toEqual(["review"]);
+  });
+
+  test("a server that listed no prompts is not waited for after an idle restart", async () => {
+    const workspaceId = "ws-idle-listed-empty";
+    const sweepIdleServers = useManagerWithIdleSweep();
+    configService.listServers = mock(() => Promise.resolve({ cmd: stdioConfig("cmd-idle-empty") }));
+    // The first connection lists no prompts. After the idle restart prompts/list never
+    // settles: if the send waited for it, this test would time out.
+    servers.serve("cmd-idle-empty", (attempt) => ({
+      listPrompts: () =>
+        attempt === 1 ? Promise.resolve([]) : new Promise<Array<{ name: string }>>(() => undefined),
+    }));
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+    setSystemTime(new Date(Date.now() + MCP_IDLE_TIMEOUT_MS + 60_000));
+    sweepIdleServers();
+    await manager.warmWorkspaceServers(workspaceRequest(workspaceId));
+    const served = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+    expect(servers.connectCount("cmd-idle-empty")).toBe(2);
+    expect(served.promptDescriptors).toEqual([]);
+  });
+
+  test("a workspace removed while the send waits for prompts/list is not started again", async () => {
+    const request = workspaceRequest("ws-removed-during-prompts");
+    configService.listServers.mockResolvedValue({ cmd: stdioConfig("cmd-removed-prompts") });
+    const listing = Promise.withResolvers<void>();
+    const held = Promise.withResolvers<void>();
+    servers.serve("cmd-removed-prompts", {
+      listPrompts: async () => {
+        listing.resolve();
+        await held.promise;
+        return [{ name: "review" }];
+      },
+    });
+    await manager.warmWorkspaceServers(request);
+
+    const sending = manager.getToolsForWorkspace(request);
+    await listing.promise;
+    await manager.stopServers(request.workspaceId);
+    held.resolve();
+    const served = await sending;
+
+    expect(servers.connectCount("cmd-removed-prompts")).toBe(1);
+    expect(served.promptDescriptors).toEqual([]);
+    expect(manager.hasWorkspaceRequestOptions(request.workspaceId)).toBe(false);
+  });
+
+  test("a server added by a warm-up while an older prompt refresh runs is listed for the send", async () => {
+    const request = workspaceRequest("ws-warm-added-prompts");
+    configService.listServers.mockResolvedValue({ a: stdioConfig("cmd-added-a") });
+    const held = Promise.withResolvers<void>();
+    let releaseA: (() => void) | undefined;
+    let listsOfA = 0;
+    servers.serve("cmd-added-a", {
+      listPrompts: async () => {
+        listsOfA += 1;
+        // The second list of A (the second send's background refresh) waits for the test.
+        if (listsOfA === 2) {
+          releaseA = held.resolve;
+          await held.promise;
+        }
+        return [{ name: "a-prompt" }];
+      },
+    });
+    servers.serve("cmd-added-b", { listPrompts: () => Promise.resolve([{ name: "b-prompt" }]) });
+    await manager.getToolsForWorkspace(request);
+    // This send's background refresh of A stays in flight.
+    await manager.getToolsForWorkspace(request);
+    expect(releaseA).toBeDefined();
+
+    configService.listServers.mockResolvedValue({
+      a: stdioConfig("cmd-added-a"),
+      b: stdioConfig("cmd-added-b"),
+    });
+    await manager.warmWorkspaceServers(request);
+    const sending = manager.getToolsForWorkspace(request);
+    await Bun.sleep(1);
+    releaseA?.();
+    const served = await sending;
+
+    expect(served.promptDescriptors.map((prompt) => prompt.promptName).sort()).toEqual([
+      "a-prompt",
+      "b-prompt",
+    ]);
+  });
+
+  test("overlapping opens of one entry point keep the newest open's result", async () => {
+    using tmp = new DisposableTempDir("mcp-apps-entry-order");
+    const store = new McpAppResultStore((id) => path.join(tmp.path, id));
+    manager.setMcpApps({ isEnabled: () => true, store });
+    configService.listServers.mockResolvedValue({ apps: stdioConfig("apps-entry-order") });
+    const pending: Array<(text: string) => void> = [];
+    servers.serve("apps-entry-order", {
+      tools: { show: testTool() },
+      apps: {
+        hasTool: () => true,
+        toolUi: () => undefined,
+        appEntrypoints: () => [
+          { toolName: "board", title: "Board", resourceUri: "ui://x/view", types: ["global"] },
+        ],
+        callToolForApp: () =>
+          new Promise((resolve) => {
+            pending.push((text) => resolve({ content: [{ type: "text", text }] }));
+          }),
+      },
+    });
+    const request = workspaceRequest("apps-entry-order");
+    await manager.getToolsForWorkspace(request);
+
+    // Two windows open the same entry point at once; the call made second finishes first.
+    const opens = [0, 1].map(() =>
+      manager.openMcpAppEntrypoint(request.workspaceId, "apps", "board", "global")
+    );
+    for (let turn = 0; turn < 50 && pending.length < 2; turn++) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect(pending).toHaveLength(2);
+    pending[1]("newer");
+    for (let turn = 0; turn < 50; turn++) await new Promise((resolve) => setImmediate(resolve));
+    pending[0]("older");
+    const [opened] = await Promise.all(opens);
+
+    expect(await store.get(request.workspaceId, opened.viewKey)).toMatchObject({
+      result: { content: [{ type: "text", text: "newer" }] },
+    });
   });
 
   test("a plugin server's label is cleaned of bidi and control characters", async () => {

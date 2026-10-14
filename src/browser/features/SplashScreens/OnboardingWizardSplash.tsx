@@ -123,7 +123,7 @@ function Card(props: {
       }`}
     >
       <div className="text-foreground flex items-center gap-2 text-sm font-medium">
-        <span className="bg-accent/10 text-accent inline-flex h-7 w-7 items-center justify-center rounded-md">
+        <span className="bg-accent/10 text-accent-text inline-flex h-7 w-7 items-center justify-center rounded-md">
           {props.icon}
         </span>
         {props.title}
@@ -635,7 +635,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
                 href="https://coder.com"
                 target="_blank"
                 rel="noopener noreferrer"
-                className="text-accent underline"
+                className="text-accent-text underline"
               >
                 Coder
               </a>
@@ -696,7 +696,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
                         href={MUX_GATEWAY_ORIGIN}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="text-accent underline"
+                        className="text-accent-text underline"
                       >
                         {new URL(MUX_GATEWAY_ORIGIN).host}
                       </a>{" "}
@@ -746,7 +746,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
                   href="https://discord.gg/VfZXvtnR"
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-accent underline"
+                  className="text-accent-text underline"
                 >
                   Discord
                 </a>
@@ -757,7 +757,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
                   href={MUX_GATEWAY_ORIGIN}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-accent underline"
+                  className="text-accent-text underline"
                 >
                   claim here
                 </a>
@@ -768,7 +768,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
               You can enable this in{" "}
               <button
                 type="button"
-                className="text-accent underline"
+                className="text-accent-text underline"
                 onClick={() => openProvidersSettings()}
               >
                 Settings → Providers
@@ -813,7 +813,11 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
                     title={configured ? "Configured" : "Not configured"}
                     onClick={() => openProvidersSettings(provider)}
                   >
-                    <ProviderWithIcon provider={provider} displayName iconClassName="text-accent" />
+                    <ProviderWithIcon
+                      provider={provider}
+                      displayName
+                      iconClassName="text-accent-text"
+                    />
                     <span
                       className={`h-2 w-2 rounded-full ${
                         configured ? "bg-green-500" : "bg-border-medium"
@@ -836,7 +840,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
             Configure keys and endpoints in{" "}
             <button
               type="button"
-              className="text-accent underline"
+              className="text-accent-text underline"
               onClick={() => openProvidersSettings()}
             >
               Settings → Providers
@@ -907,8 +911,8 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
         <>
           <p>
             Agents are file-based definitions (system prompt + tool policy). You can create
-            project-local agents in <code className="text-accent">.xum/agents/*.md</code> or global
-            agents in <code className="text-accent">~/.xum/agents/*.md</code>.
+            project-local agents in <code className="text-accent-text">.xum/agents/*.md</code> or
+            global agents in <code className="text-accent-text">~/.xum/agents/*.md</code>.
           </p>
 
           <div className="mt-3 grid gap-2">
@@ -956,7 +960,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
               Work directly in your project directory.
             </Card>
             <Card icon={<WorktreeIcon size={14} />} title="Worktree">
-              Isolated git worktree under <code className="text-accent">~/.xum/src</code>.
+              Isolated git worktree under <code className="text-accent-text">~/.xum/src</code>.
             </Card>
             <Card icon={<SSHIcon size={14} />} title="SSH">
               Remote clone and commands run on an SSH host.
@@ -987,13 +991,13 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
 
           <div className="mt-3 grid gap-2">
             <Card icon={<Server className="h-4 w-4" />} title="Global config">
-              <code className="text-accent">~/.xum/mcp.jsonc</code>
+              <code className="text-accent-text">~/.xum/mcp.jsonc</code>
             </Card>
             <Card icon={<Server className="h-4 w-4" />} title="Repo overrides">
-              <code className="text-accent">./.xum/mcp.jsonc</code>
+              <code className="text-accent-text">./.xum/mcp.jsonc</code>
             </Card>
             <Card icon={<Server className="h-4 w-4" />} title="Workspace overrides">
-              <code className="text-accent">.xum/mcp.local.jsonc</code>
+              <code className="text-accent-text">.xum/mcp.local.jsonc</code>
             </Card>
           </div>
 
@@ -1025,9 +1029,9 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
           </div>
 
           <p className="mt-3">
-            Tip: type <code className="text-accent">&gt;</code> for commands, press{" "}
+            Tip: type <code className="text-accent-text">&gt;</code> for commands, press{" "}
             <kbd className={KBD_CLASSNAME}>{commandPaletteActionsShortcut}</kbd> to open command
-            mode directly, and use <code className="text-accent">/</code> for slash commands.
+            mode directly, and use <code className="text-accent-text">/</code> for slash commands.
           </p>
         </>
       ),
@@ -1189,7 +1193,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
           className={`flex flex-col gap-3 ${stepEntryClassName(direction, firstRunView.skipStepEntry)}`}
         >
           <div className="text-foreground flex items-center gap-2 text-sm font-medium">
-            <span className="bg-accent/10 text-accent inline-flex h-8 w-8 items-center justify-center rounded-md">
+            <span className="bg-accent/10 text-accent-text inline-flex h-8 w-8 items-center justify-center rounded-md">
               {currentStep.icon}
             </span>
             <span>{currentStep.title}</span>

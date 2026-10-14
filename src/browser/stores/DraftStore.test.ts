@@ -172,6 +172,14 @@ async function waitFor(
   }
 }
 
+/** The message `flush` rejects with, or "" when it resolves. */
+function flushError(store: DraftStore): Promise<string> {
+  return store.flush(WS_SCOPE).then(
+    () => "",
+    (error: unknown) => String(error)
+  );
+}
+
 let cleanupDom: (() => void) | undefined;
 const stores: DraftStore[] = [];
 
@@ -892,5 +900,159 @@ describe("DraftStore", () => {
         (draft) => draftStoreScopeKey(draft.scope) === draftStoreScopeKey(scope)
       )
     ).toBe(false);
+  });
+
+  // #6438: a new backend (another process, its clock behind) numbers its revisions lower. The
+  // store kept the old backend's saved view, and a write reply below that view's revision put
+  // the old text back over what the user had just typed.
+  test("a write reply from a new backend with lower revisions keeps the typed text", async () => {
+    using tempDir = new TestTempDir("draft-store-new-backend");
+    const { config, client } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    store.setText(WS_SCOPE, "text on the old backend");
+    await store.flush(WS_SCOPE);
+
+    // The same drafts on disk, served by a new process whose revisions start lower.
+    const realNow = Date.now;
+    Date.now = () => realNow() - 3_600_000;
+    let service: DraftService;
+    try {
+      service = new DraftService(config);
+    } finally {
+      Date.now = realNow;
+    }
+    const next = createClient(service);
+    store.setClient(next.client);
+    await waitFor(() => next.control.updates === 0 && store.isHydrated());
+
+    store.setText(WS_SCOPE, "typed after the switch");
+    await store.flush(WS_SCOPE);
+    expect(next.control.updates).toBeGreaterThan(0);
+    expect(store.getText(WS_SCOPE)).toBe("typed after the switch");
+    expect((await service.get(WS_SCOPE)).text).toBe("typed after the switch");
+  });
+
+  // #6438, review round 3: an edit saved to a new backend before its snapshot arrived. That
+  // reply was compared with the old backend's view, lost to it, and the old text came back. Each
+  // subscription start forgets the old views, so the reply is taken as it comes.
+  test("an edit saved to a new backend before its snapshot keeps the typed text", async () => {
+    using tempDir = new TestTempDir("draft-store-new-backend-early-write");
+    const { config, client } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    store.setText(WS_SCOPE, "text on the old backend");
+    await store.flush(WS_SCOPE);
+
+    const realNow = Date.now;
+    Date.now = () => realNow() - 3_600_000;
+    let service: DraftService;
+    try {
+      service = new DraftService(config);
+    } finally {
+      Date.now = realNow;
+    }
+    const next = createClient(service);
+    let releaseSnapshot: () => void = () => undefined;
+    next.control.subscribeGate = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    store.setClient(next.client);
+
+    store.setText(WS_SCOPE, "typed after the switch");
+    await store.flush(WS_SCOPE);
+    expect(next.control.updates).toBeGreaterThan(0);
+    expect(store.getText(WS_SCOPE)).toBe("typed after the switch");
+
+    releaseSnapshot();
+    await waitFor(() => store.isHydrated());
+    await store.flush(WS_SCOPE);
+    expect(store.getText(WS_SCOPE)).toBe("typed after the switch");
+    expect((await service.get(WS_SCOPE)).text).toBe("typed after the switch");
+    store.setText(WS_SCOPE, "typed later");
+    await store.flush(WS_SCOPE);
+    expect(store.getText(WS_SCOPE)).toBe("typed later");
+    expect((await service.get(WS_SCOPE)).text).toBe("typed later");
+  });
+
+  // #6438: forgetting the views on a reconnect must not touch what the composer shows.
+  test("a reconnect to the same backend keeps showing the draft until its snapshot", async () => {
+    using tempDir = new TestTempDir("draft-store-reconnect-view");
+    const { client, control } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    store.setText(WS_SCOPE, "saved text");
+    store.setAttachments(WS_SCOPE, [image]);
+    await store.flush(WS_SCOPE);
+
+    store.setClient(null);
+    let releaseSnapshot: () => void = () => undefined;
+    control.subscribeGate = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    store.setClient(client);
+    const view = store.getView(WS_SCOPE);
+    expect([view.text, view.attachments.map(({ id }) => id)]).toEqual(["saved text", ["img-1"]]);
+    releaseSnapshot();
+    await waitFor(() => store.isHydrated());
+    expect(store.getText(WS_SCOPE)).toBe("saved text");
+  });
+
+  // #6438: the reset at a reconnect forgets the backend's views, never an unsaved edit.
+  test("unsaved typing survives a reconnect and is saved after the snapshot", async () => {
+    using tempDir = new TestTempDir("draft-store-reconnect-unsaved");
+    const { client, control, service } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    store.setText(WS_SCOPE, "saved text");
+    await store.flush(WS_SCOPE);
+
+    control.failUpdates = 100;
+    store.setText(WS_SCOPE, "unsaved typing");
+    expect(await flushError(store)).toContain("update failed");
+    store.setClient(null);
+    store.setClient(client);
+    // The snapshot still holds the saved text.
+    await waitFor(() => store.isHydrated());
+    expect(store.getText(WS_SCOPE)).toBe("unsaved typing");
+    control.failUpdates = 0;
+    await store.flush(WS_SCOPE);
+    expect((await service.get(WS_SCOPE)).text).toBe("unsaved typing");
+  });
+
+  // #6438, the same switch with a write in flight: the old backend's late reply confirmed the
+  // edit, so it was never written to the new backend (lost on reload), and its view (the old
+  // backend's higher revision) again outranked every later reply of the new one.
+  test("an edit whose write was in flight when the backend changed reaches the new backend", async () => {
+    using oldDir = new TestTempDir("draft-store-old-backend");
+    using newDir = new TestTempDir("draft-store-switched-backend");
+    const old = await createHarness(oldDir);
+    const store = createStore(old.client);
+    await store.whenReady();
+    let release: () => void = () => undefined;
+    old.control.updateGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    store.setText(WS_SCOPE, "typed during the switch");
+    const inFlight = store.flush(WS_SCOPE).catch(() => undefined);
+    await waitFor(() => old.control.updates === 1);
+
+    const next = await createHarness(newDir);
+    let releaseSnapshot: () => void = () => undefined;
+    next.control.subscribeGate = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    store.setClient(next.client);
+    // The old backend answers before the new one's snapshot.
+    release();
+    await inFlight;
+    releaseSnapshot();
+    await waitFor(() => store.isHydrated());
+    await store.flush(WS_SCOPE);
+    expect((await next.service.get(WS_SCOPE)).text).toBe("typed during the switch");
+
+    store.setText(WS_SCOPE, "typed later");
+    await store.flush(WS_SCOPE);
+    expect(store.getText(WS_SCOPE)).toBe("typed later");
   });
 });

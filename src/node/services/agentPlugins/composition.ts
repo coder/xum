@@ -76,7 +76,7 @@ function markShadowed(entries: WorkspaceCompositionEntry[]): WorkspaceCompositio
 
 function summarizePlugin(plugin: AgentPluginInfo): WorkspaceCompositionPlugin {
   const components: string[] = [
-    ...(plugin.skillsDir !== undefined ? ["skills"] : []),
+    ...(plugin.skillsDirs !== undefined ? ["skills"] : []),
     ...(plugin.mcpConfigPath !== undefined ? ["mcp"] : []),
     ...(plugin.agentsDir !== undefined ? ["agents"] : []),
     ...(plugin.workflowsDir !== undefined ? ["workflows"] : []),

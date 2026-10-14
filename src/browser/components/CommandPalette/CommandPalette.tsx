@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { getErrorMessage } from "@/common/utils/errors";
 import { Command } from "cmdk";
 import { useCommandRegistry } from "@/browser/contexts/CommandRegistryContext";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
-import { getAgentSkillsStore, useAgentSkills } from "@/browser/stores/AgentSkillsStore";
+import { getAgentSkillsStore, useInvocableSkills } from "@/browser/stores/AgentSkillsStore";
 import type { CommandAction } from "@/browser/contexts/CommandRegistryContext";
 import {
   formatKeybind,
@@ -55,6 +56,35 @@ interface PaletteGroup {
   items: PaletteItem[];
 }
 
+/**
+ * What a select prompt shows instead of options; undefined when it has results. `alert` marks a
+ * failed load, which screen readers announce: it appears after the prompt opened.
+ */
+function selectPromptEmptyText(state: {
+  isLoadingOptions: boolean;
+  resultCount: number;
+  optionCount: number;
+  optionsError: string | null;
+}): { text: string | undefined; alert: boolean } {
+  if (state.isLoadingOptions) return { text: "Loading options...", alert: false };
+  if (state.resultCount > 0) return { text: undefined, alert: false };
+  if (state.optionCount > 0) return { text: "No results", alert: false };
+  return state.optionsError != null
+    ? { text: `Could not load options: ${state.optionsError}`, alert: true }
+    : { text: "No options", alert: false };
+}
+
+function PaletteEmptyText(props: { text: string | undefined; alert: boolean }) {
+  return (
+    <div
+      role={props.alert ? "alert" : undefined}
+      className="p-4 text-[13px] text-[var(--color-command-subdued)]"
+    >
+      {props.text ?? "No results"}
+    </div>
+  );
+}
+
 export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext }) => {
   const memoryExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const memoryConsolidationExperimentEnabled = useExperimentValue(
@@ -68,11 +98,11 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
   const commandPanelRef = useRef<HTMLDivElement | null>(null);
   const paletteOpenOriginRef = useRef<HTMLElement | null>(null);
   const { isOpen, initialQuery, close, getActions, addRecent, recent } = useCommandRegistry();
-  const agentSkills = useAgentSkills(
+  const agentSkills = useInvocableSkills(
     isOpen && slashWorkspaceId
       ? { workspaceId: slashWorkspaceId, disableWorkspaceAgents: false }
       : null
-  ).skills;
+  );
   const [query, setQuery] = useState("");
   const [activePrompt, setActivePrompt] = useState<null | {
     title?: string;
@@ -347,6 +377,9 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
     Array<{ id: string; label: string; keywords?: string[] }>
   >([]);
   const [isLoadingOptions, setIsLoadingOptions] = useState(false);
+  // Why the current select prompt has no options: shown in the open palette, where a toast would
+  // render under the overlay.
+  const [optionsError, setOptionsError] = useState<string | null>(null);
 
   const currentField: PromptField | null = activePrompt
     ? (activePrompt.fields[activePrompt.idx] ?? null)
@@ -410,6 +443,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
       }
 
       setIsLoadingOptions(true);
+      setOptionsError(null);
       try {
         const rawOptions = await Promise.resolve(
           currentField.getOptions(activePrompt?.values ?? {})
@@ -426,6 +460,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
         if (!cancelled) {
           console.error("Failed to resolve prompt select options", error);
           setSelectOptions([]);
+          setOptionsError(getErrorMessage(error));
         }
       } finally {
         if (!cancelled) {
@@ -443,6 +478,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
 
   let groups: PaletteGroup[] = generalResults.groups;
   let emptyText: string | undefined = generalResults.emptyText;
+  let emptyIsAlert = false;
 
   if (currentField) {
     const promptTitle = activePrompt?.title ?? currentField.label ?? "Provide details";
@@ -469,15 +505,12 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
           })),
         },
       ];
-      if (isLoadingOptions) {
-        emptyText = "Loading options...";
-      } else if (rankedOptions.length > 0) {
-        emptyText = undefined;
-      } else if (selectOptions.length > 0) {
-        emptyText = "No results";
-      } else {
-        emptyText = "No options";
-      }
+      ({ text: emptyText, alert: emptyIsAlert } = selectPromptEmptyText({
+        isLoadingOptions,
+        resultCount: rankedOptions.length,
+        optionCount: selectOptions.length,
+        optionsError,
+      }));
     } else {
       const typed = query.trim();
       const fallbackHint = currentField.placeholder ?? "Type value and press Enter";
@@ -628,11 +661,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
               })}
             </Command.Group>
           ))}
-          {!hasAnyItems && (
-            <div className="p-4 text-[13px] text-[var(--color-command-subdued)]">
-              {emptyText ?? "No results"}
-            </div>
-          )}
+          {!hasAnyItems && <PaletteEmptyText text={emptyText} alert={emptyIsAlert} />}
         </Command.List>
       </Command>
     </div>

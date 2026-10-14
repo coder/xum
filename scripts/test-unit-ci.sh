@@ -193,11 +193,15 @@ bun_test_retrying_crashes() {
     exit_code=0
     coverage_args=()
     if [[ -n "$coverage_dir" ]]; then
-      rm -f "$coverage_dir/lcov.info"
+      rm -f "$coverage_dir/lcov.info" "$coverage_dir/ran-without-coverage.txt"
       if ((attempt < 3)); then
         coverage_args=(--coverage --coverage-reporter=lcov "--coverage-dir=$coverage_dir")
       else
         echo "::warning::bun crashed twice under coverage on $label; the last attempt runs without coverage"
+        # Quality / CRAP reads this marker (scripts/crap/ci.ts, RAN_WITHOUT_COVERAGE):
+        # the shard's coverage is incomplete, so coverage-based findings only warn.
+        mkdir -p "$coverage_dir"
+        printf '%s\n' "$label" >"$coverage_dir/ran-without-coverage.txt"
       fi
     fi
     # The ${a[@]+...} form expands an empty array under `set -u` on Bash 3.2 (macOS).

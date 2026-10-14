@@ -1145,7 +1145,7 @@ export function ArtifactsPanel(props: {
         <TooltipIfPresent tooltip="Artifacts changed since you looked">
           <span
             aria-label={`${changedPaths.size} changed`}
-            className="text-accent counter-nums flex shrink-0 items-center gap-1 text-[11px]"
+            className="text-accent-text counter-nums flex shrink-0 items-center gap-1 text-[11px]"
           >
             <span className="bg-accent h-1.5 w-1.5 rounded-full" />
             {changedPaths.size}
@@ -1225,7 +1225,7 @@ export function ArtifactsPanel(props: {
             aria-label={annotating ? "Stop annotating" : "Annotate"}
             aria-pressed={annotating}
             onClick={toggleAnnotate}
-            className={`${toolbarButtonClassName} ${annotating ? "text-accent border-accent" : ""}`}
+            className={`${toolbarButtonClassName} ${annotating ? "text-accent-text border-accent" : ""}`}
           >
             {annotating ? (
               <MessageSquareOff className="h-3.5 w-3.5" />
