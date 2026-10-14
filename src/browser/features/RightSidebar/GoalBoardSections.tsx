@@ -70,6 +70,11 @@ function liveClientFor(api: APIClient | null): APIClient {
   return api;
 }
 
+/** A submit waits for the running one, and needs a live client (offline it is disabled). */
+function isSubmitBlocked(busy: boolean, offline: boolean): boolean {
+  return busy || offline;
+}
+
 interface GoalBoardSectionsProps {
   workspaceId: string;
   board: GoalBoardSnapshot;
@@ -119,7 +124,6 @@ interface SectionShellProps {
 
 function SectionShell(props: SectionShellProps) {
   const [isOpen, setIsOpen] = useState(props.defaultOpen);
-  const offline = useLiveAPI() == null;
   return (
     <section className="border-border-light bg-surface-secondary rounded-md border">
       <button
@@ -137,13 +141,7 @@ function SectionShell(props: SectionShellProps) {
         <span className="text-muted lowercase">({props.count})</span>
         {props.trailing && <span className="ml-auto">{props.trailing}</span>}
       </button>
-      {/* Offline the board stays on screen read-only: its actions are server changes. The header
-          above still opens and closes the section. */}
-      {isOpen && (
-        <fieldset disabled={offline} className="border-border-light min-w-0 border-t p-2">
-          {props.children}
-        </fieldset>
-      )}
+      {isOpen && <div className="border-border-light border-t p-2">{props.children}</div>}
     </section>
   );
 }
@@ -325,11 +323,11 @@ interface UpcomingRowProps {
 }
 
 function UpcomingRow(props: UpcomingRowProps) {
+  // Offline the board stays on screen read-only: its row actions are server changes.
   const offline = useLiveAPI() == null;
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: props.goal.goalId,
-    // A reorder is a server change: no drag while offline (the section's fieldset disables the
-    // buttons, not dnd-kit's pointer listeners).
+    // A reorder is a server change: no drag while offline.
     disabled: offline,
   });
   const [isEditing, setIsEditing] = useState(false);
@@ -373,6 +371,7 @@ function UpcomingRow(props: UpcomingRowProps) {
         // row contents are already announced before the handle.
         className="text-muted hover:text-foreground cursor-grab rounded p-0.5 active:cursor-grabbing"
         aria-label={`Reorder ${props.goal.objective}`}
+        disabled={offline}
         {...attributes}
         {...(listeners ?? {})}
       >
@@ -387,6 +386,7 @@ function UpcomingRow(props: UpcomingRowProps) {
       <div className="flex items-center gap-1.5">
         <RowActionButton
           aria-label={`Edit ${props.goal.objective}`}
+          disabled={offline}
           onClick={() => setIsEditing(true)}
         >
           <Pencil className="h-3 w-3" aria-hidden="true" />
@@ -394,6 +394,7 @@ function UpcomingRow(props: UpcomingRowProps) {
         <RowActionButton
           tone="positive"
           aria-label={`Promote ${props.goal.objective}`}
+          disabled={offline}
           onClick={() => void props.onPromote()}
         >
           <Play className="h-3 w-3" aria-hidden="true" />
@@ -402,6 +403,7 @@ function UpcomingRow(props: UpcomingRowProps) {
         <RowActionButton
           tone="destructive"
           aria-label={`Remove ${props.goal.objective}`}
+          disabled={offline}
           onClick={() => void props.onArchive()}
         >
           <Trash2 className="h-3 w-3" aria-hidden="true" />
@@ -418,6 +420,9 @@ interface UpcomingRowEditorProps {
 }
 
 function UpcomingRowEditor(props: UpcomingRowEditorProps) {
+  // Offline the fields and Save are disabled (a save is a server change). Cancel stays: it only
+  // closes the editor.
+  const offline = useLiveAPI() == null;
   const objectiveRef = useRef<HTMLInputElement | null>(null);
   const budgetRef = useRef<HTMLInputElement | null>(null);
   const turnCapRef = useRef<HTMLInputElement | null>(null);
@@ -480,6 +485,7 @@ function UpcomingRowEditor(props: UpcomingRowEditorProps) {
       <input
         ref={objectiveRef}
         aria-label="Goal objective"
+        disabled={offline}
         defaultValue={props.goal.objective}
         className="border-border bg-surface-primary text-foreground focus:border-accent rounded-md border p-1.5 text-sm outline-none"
         autoFocus
@@ -497,6 +503,7 @@ function UpcomingRowEditor(props: UpcomingRowEditorProps) {
         <input
           ref={budgetRef}
           aria-label="Goal budget"
+          disabled={offline}
           defaultValue={
             props.goal.budgetCents == null ? "" : (props.goal.budgetCents / 100).toFixed(2)
           }
@@ -506,6 +513,7 @@ function UpcomingRowEditor(props: UpcomingRowEditorProps) {
         <input
           ref={turnCapRef}
           aria-label="Goal turn cap"
+          disabled={offline}
           defaultValue={props.goal.turnCap == null ? "" : String(props.goal.turnCap)}
           placeholder="turns (blank = no cap)"
           inputMode="numeric"
@@ -514,7 +522,7 @@ function UpcomingRowEditor(props: UpcomingRowEditorProps) {
         <button
           type="button"
           className="bg-accent text-accent-foreground rounded-md px-2 py-1 text-xs disabled:opacity-60"
-          disabled={isSaving}
+          disabled={isSubmitBlocked(isSaving, offline)}
           onClick={() => void submit()}
         >
           {isSaving ? "Saving…" : "Save"}
@@ -574,6 +582,7 @@ function CompletedSection(props: CompletedSectionProps) {
             </span>
             <RowActionButton
               aria-label={`Archive ${entry.goal.objective}`}
+              disabled={api == null}
               onClick={() => void archive(entry.goal.goalId)}
             >
               <Inbox className="h-3 w-3" aria-hidden="true" />
@@ -626,6 +635,7 @@ function ArchivedSection(props: ArchivedSectionProps) {
             <span className="text-foreground line-clamp-1 flex-1">{entry.goal.objective}</span>
             <RowActionButton
               aria-label={`Revive ${entry.goal.objective}`}
+              disabled={api == null}
               onClick={() => void revive(entry.goal.goalId)}
             >
               <ArchiveRestore className="h-3 w-3" aria-hidden="true" />
@@ -749,13 +759,11 @@ function UpcomingAdder(props: UpcomingAdderProps) {
   }
 
   return (
-    <fieldset
-      disabled={api == null}
-      className="border-border-light bg-surface-primary flex min-w-0 flex-col gap-2 rounded-md border p-2"
-    >
+    <div className="border-border-light bg-surface-primary flex flex-col gap-2 rounded-md border p-2">
       <input
         ref={objectiveRef}
         aria-label="Queued goal objective"
+        disabled={api == null}
         placeholder={GOAL_OBJECTIVE_PLACEHOLDER}
         className="border-border bg-surface-primary text-foreground focus:border-accent rounded-md border p-1.5 text-sm outline-none"
         autoFocus
@@ -774,6 +782,7 @@ function UpcomingAdder(props: UpcomingAdderProps) {
         <input
           ref={budgetRef}
           aria-label="Queued goal budget"
+          disabled={api == null}
           // Keep the placeholder aligned with resolveGoalSetIntent's
           // blank-budget behavior so the queued goal uses the limit the
           // user expects.
@@ -787,6 +796,7 @@ function UpcomingAdder(props: UpcomingAdderProps) {
         <input
           ref={turnCapRef}
           aria-label="Queued goal turn cap"
+          disabled={api == null}
           // Show the inherited turn cap before auto-promote so queued
           // goals do not pick up an invisible limit.
           placeholder={
@@ -800,7 +810,7 @@ function UpcomingAdder(props: UpcomingAdderProps) {
         <button
           type="button"
           className="bg-accent text-accent-foreground rounded-md px-2 py-1 text-xs disabled:opacity-60"
-          disabled={isSubmitting}
+          disabled={isSubmitBlocked(isSubmitting, api == null)}
           onClick={() => void submit()}
         >
           {isSubmitting ? "Queuing…" : "Queue goal"}
@@ -821,6 +831,6 @@ function UpcomingAdder(props: UpcomingAdderProps) {
           {error}
         </p>
       )}
-    </fieldset>
+    </div>
   );
 }

@@ -24,12 +24,18 @@ restoreModulesAfterSuite([
     { ...RealBrowserBridgeConnectionModule },
   ],
 ]);
-/** How often BrowserTab disconnected the (stubbed) bridge. */
+/**
+ * How often BrowserTab replaced the (stubbed) bridge: a disconnect, or a connect (which closes the
+ * old socket first). And the session the bridge shows.
+ */
 let bridgeDisconnects = 0;
+let bridgeSession: { sessionName: string; status: "live" } | null = null;
 void mock.module("@/browser/features/RightSidebar/BrowserTab/useBrowserBridgeConnection", () => ({
   useBrowserBridgeConnection: () => ({
-    session: null,
-    connect: () => undefined,
+    session: bridgeSession,
+    connect: () => {
+      bridgeDisconnects += 1;
+    },
     disconnect: () => {
       bridgeDisconnects += 1;
     },
@@ -97,6 +103,7 @@ describe.each([...GAP_MODES])("BrowserTab across a dropped connection (%s)", (mo
   beforeEach(() => {
     cleanupDom = installDom();
     window.localStorage.clear();
+    bridgeSession = null;
     harness = createConnectionHarness(mode, serverOverrides);
     answerSessions = () =>
       Promise.resolve({
@@ -150,7 +157,18 @@ describe.each([...GAP_MODES])("BrowserTab across a dropped connection (%s)", (mo
 
   // The selected session is still listed while offline: dropping its bridge would throw away the
   // shown preview for a connection the reconnect restores.
-  test("does not disconnect the bridge while offline", async () => {
+  // Picking another session offline drops the old bridge: its input must not reach a session
+  // the picker no longer shows.
+  test("keeps the selected session's bridge while offline, and drops it for another pick", async () => {
+    answerSessions = () =>
+      Promise.resolve({
+        sessions: [
+          { sessionName: "alpha", status: "attachable" },
+          { sessionName: "beta", status: "attachable" },
+        ],
+        otherSessions: [],
+      });
+    bridgeSession = { sessionName: "alpha", status: "live" };
     const view = render(<BrowserTab workspaceId="ws-1" projectPath="/project" />, {
       wrapper: Wrapper,
     });
@@ -159,8 +177,11 @@ describe.each([...GAP_MODES])("BrowserTab across a dropped connection (%s)", (mo
 
     await drop();
     expect(bridgeDisconnects).toBe(disconnectsBefore);
-    await reconnect();
-    expect(bridgeDisconnects).toBe(disconnectsBefore);
+
+    fireEvent.click(view.getByText("alpha"));
+    fireEvent.click(view.getByTestId("browser-session-beta"));
+    await flush();
+    expect(bridgeDisconnects).toBeGreaterThan(disconnectsBefore);
   });
 
   test("picking another session while reconnecting clears the previous session's page tabs", async () => {

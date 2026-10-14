@@ -1,6 +1,6 @@
 import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults, type GoalDefaults } from "@/constants/goals";
 import type { APIClient } from "@/browser/contexts/API";
-import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import {
   mergeGoalDefaults,
   resolveGoalSetIntent,
@@ -28,24 +28,26 @@ export function loadGoalDefaults(api: APIClient, workspaceId?: string): Promise<
 }
 
 /**
- * Like `loadGoalDefaults`, but an aborted read (a lost connection) rejects instead of falling
- * back. For a form that shows the defaults: it keeps what it shows, and the next client reads
- * again. A fallback would replace the shown values with the canonical defaults.
+ * Like `loadGoalDefaults`, but a read cut off by a lost connection (ConnectionLostError) rejects
+ * instead of falling back. For a form that shows the defaults: it keeps what it shows, and the
+ * next client reads again. A fallback would replace the shown values with the canonical
+ * defaults. Other failures (a server cancel included) still fall back: no new client retries
+ * them.
  */
 export function loadShownGoalDefaults(api: APIClient, workspaceId?: string): Promise<GoalDefaults> {
   return fetchGoalDefaults(api, workspaceId, true);
 }
 
-/** Decides what a failed read gives: the fallback, or (an abort, when asked) a rejection. */
+/** Decides what a failed read gives: the fallback, or (a lost connection, when asked) a rejection. */
 type FallBack = <T>(error: unknown, fallback: T) => T;
 
 async function fetchGoalDefaults(
   api: APIClient,
   workspaceId: string | undefined,
-  rejectOnAbort: boolean
+  rejectOnConnectionLost: boolean
 ): Promise<GoalDefaults> {
   const fallBack: FallBack = (error, fallback) => {
-    if (rejectOnAbort && isAbortError(error)) throw error;
+    if (rejectOnConnectionLost && isConnectionLostError(error)) throw error;
     return fallback;
   };
   const globalDefaults = await readGlobalGoalDefaults(api, fallBack);

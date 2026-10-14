@@ -73,6 +73,27 @@ function isRetryableBrowserError(error: string | null): boolean {
   );
 }
 
+/**
+ * Whether the connect effect keeps the bridge, disconnects it, or goes on to (re)connect it.
+ * Offline the bridge of the selected session stays (the preview keeps its last frame), and the
+ * new client reruns the effect. Offline a bridge of another session is dropped, so input never
+ * reaches a session the picker no longer shows. Without a listed selection there is nothing to
+ * connect.
+ */
+function bridgeAction(params: {
+  offline: boolean;
+  bridgeSession: BrowserSession | null;
+  selectedSessionName: string | null;
+  selectedSessionListed: boolean;
+}): "keep" | "disconnect" | "connect" {
+  if (params.offline) {
+    return params.bridgeSession?.sessionName === params.selectedSessionName ? "keep" : "disconnect";
+  }
+  return params.selectedSessionName != null && params.selectedSessionListed
+    ? "connect"
+    : "disconnect";
+}
+
 export function shouldBackOffBrowserReconnect(params: {
   selectedSessionName: string;
   session: BrowserSession | null;
@@ -338,10 +359,14 @@ export function BrowserTab(props: BrowserTabProps) {
   ]);
 
   useEffect(() => {
-    // Offline the bridge stays as it is (the preview keeps its last frame): the new client
-    // reruns this effect and reconnects it if needed. Only a missing session disconnects.
-    if (api == null) return;
-    if (selectedSessionName == null || selectedDiscoveredSession == null) {
+    const bridge = bridgeAction({
+      offline: api == null,
+      bridgeSession: session,
+      selectedSessionName,
+      selectedSessionListed: selectedDiscoveredSession != null,
+    });
+    if (bridge === "keep") return;
+    if (bridge === "disconnect" || selectedSessionName == null) {
       lastConnectAttemptRef.current = null;
       disconnect();
       return;

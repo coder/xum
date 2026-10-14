@@ -227,6 +227,20 @@ describe.each([...GAP_MODES])("loaded panes across a dropped connection (%s)", (
     await waitFor(() => expect(view.result.current.defaults.defaultTurnCap).toBe(7));
   });
 
+  // A server cancel on a live socket is no lost connection: no new client reads again, so the
+  // load must finish (with the fallback), not wait forever.
+  test("the effective goal defaults finish a load that the server cancelled", async () => {
+    answerOverride = () => Promise.resolve(turnCapOverride(5));
+    const view = renderHook(() => useGoalDefaults("ws-1"), { wrapper: Wrapper });
+    await waitFor(() => expect(view.result.current.defaults.defaultTurnCap).toBe(5));
+
+    answerOverride = () =>
+      Promise.reject(new DOMException("cancelled by the server", "AbortError"));
+    act(() => view.result.current.reload());
+    await waitFor(() => expect(view.result.current.isLoading).toBe(false));
+    expect(view.result.current.defaults.defaultTurnCap).toBeNull();
+  });
+
   test("the goal defaults keep the override editable while they reload, and an edit wins", async () => {
     answerOverride = () => Promise.resolve(turnCapOverride(5));
     const view = render(<GoalDefaultsSection workspaceId="ws-1" embedded />, {

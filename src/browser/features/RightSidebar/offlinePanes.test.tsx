@@ -248,7 +248,8 @@ describe.each([...GAP_MODES])("panes kept across a dropped connection (%s)", (mo
   });
 
   // Offline the board stays on screen read-only, as other kept panes do: its actions are server
-  // changes, so they are disabled (not "offline" on click). An open editor keeps its text.
+  // changes, so they are disabled (not "offline" on click). An open editor keeps its text and
+  // can still be cancelled.
   test("goal-board actions are disabled while offline, and return after the reconnect", async () => {
     const view = render(
       <GoalBoardSections workspaceId="ws-1" board={goalBoard()} onMutated={noop} />,
@@ -258,17 +259,18 @@ describe.each([...GAP_MODES])("panes kept across a dropped connection (%s)", (mo
     fireEvent.click(view.getByRole("button", { name: /Archived/ }));
     fireEvent.click(view.getByRole("button", { name: "Edit Ship it" }));
     const actions = ["Save", "Revive Old idea", "Queue another goal"];
-    // happy-dom does not apply a disabled fieldset to `disabled`: read the fieldset too.
     const enabledActions = () =>
-      actions.filter((name) => {
-        const button = view.getByRole("button", { name }) as HTMLButtonElement;
-        return !button.disabled && button.closest("fieldset")?.disabled !== true;
-      });
+      actions.filter((name) => !(view.getByRole("button", { name }) as HTMLButtonElement).disabled);
+    const cancel = () =>
+      view.getByRole("button", { name: "Cancel goal edit" }) as HTMLButtonElement;
     expect(enabledActions()).toEqual(actions);
 
     await drop();
     expect(enabledActions()).toEqual([]);
     expect(view.queryByLabelText("Goal objective")).not.toBeNull();
+    // Cancel only closes the editor, so it stays available offline. (happy-dom does not apply a
+    // disabled fieldset to `disabled`: check for one too.)
+    expect(cancel().disabled || cancel().closest("fieldset")?.disabled === true).toBe(false);
     expect(view.queryByText(/Not connected/)).toBeNull();
 
     await reconnect();

@@ -2,7 +2,7 @@ import { useContext, useEffect, useState } from "react";
 
 import { APIContext } from "@/browser/contexts/API";
 import { loadShownGoalDefaults } from "@/browser/utils/goals/resolveGoalSetIntent";
-import { isAbortError } from "@/browser/utils/isAbortError";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { DEFAULT_GOAL_DEFAULTS, type GoalDefaults } from "@/constants/goals";
 
 /**
@@ -23,11 +23,12 @@ export interface UseGoalDefaultsResult {
 }
 
 /**
- * A cancelled load, or an aborted read (a lost connection), keeps the shown values: the next
- * client reads again. Other failures fall back to the canonical defaults.
+ * A cancelled load, or a read cut off by a lost connection, keeps the shown values: the next
+ * client reads again. Other failures (a server cancel included) fall back to the canonical
+ * defaults.
  */
 function keepsShownDefaults(cancelled: boolean, error: unknown): boolean {
-  return cancelled || isAbortError(error);
+  return cancelled || isConnectionLostError(error);
 }
 
 export function useGoalDefaults(workspaceId?: string): UseGoalDefaultsResult {
