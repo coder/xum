@@ -198,6 +198,7 @@ function main(argv: string[]): number {
     "--default-prefix",
     "--no-color",
     "--no-ext-diff",
+    "--no-textconv",
     base,
   ];
   const files = parseNameStatus(git(root, [...diffArgs, "--name-status", "-z"])).filter(

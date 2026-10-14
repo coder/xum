@@ -1,14 +1,8 @@
 #!/usr/bin/env bash
 # CRAP gate for agent `git commit` and `git push` calls. .xum/tool_post calls
-# it with "post"; block mode also needs a .xum/tool_pre that calls it with
-# "pre". See .xum/skills/crap-gate.
-#
-# Warn mode ships no .xum/tool_pre: Xum runs the project's tool_pre instead of
-# the user's ~/.xum/tool_pre, so shipping one would silently drop a user's own
-# pre-hook policy in this repo. Before switching to block, add a tool_pre that
-# also runs the user's hook:
-#   [[ "$XUM_TOOL" == "bash" ]] || exit 0
-#   exec "${0%/*}/../scripts/crap/agent-gate.sh" pre
+# it with "post", and in block mode .xum/tool_pre calls it with "pre". Both
+# hooks then run the user's own ~/.xum hook: Xum runs the project's hook
+# instead of the user's. See .xum/skills/crap-gate.
 #
 # Xum shows a tool_pre's output only when it blocks (non-zero exit), so:
 #   block: tool_pre runs the check and exits 1 on violations; the agent sees
@@ -29,6 +23,10 @@ set -uo pipefail
 phase=${1:-}
 [[ "${XUM_TOOL:-}" == "bash" ]] || exit 0
 [[ "$phase" == "post" || ("$phase" == "pre" && "$CRAP_GATE_MODE" == "block") ]] || exit 0
+# A command that failed (nothing to commit, a rejected push) has nothing to
+# report. This also skips a chain that committed and then failed later
+# (git commit && make test); make crap-check reports that commit.
+[[ "$phase" == "post" && "${XUM_TOOL_RESULT_SUCCESS:-}" == "false" ]] && exit 0
 
 # Every tool call reaches this point, so up to the match below use only bash
 # builtins: no git, bun, uv or other process.
@@ -43,27 +41,50 @@ if [[ -z "$script" && -r "${XUM_TOOL_INPUT_PATH:-}" ]]; then
   script=${script//\\\"/\"}
   script=${script//$'\x01'/\\}
 fi
-# A `git ... commit` or `git ... push` at a command position (string start, a
-# newline, or after ; & | ( { ), so a quoted "git commit" in an echo does not
-# match. Variable assignments and env/command/time/sudo may come first
-# (GIT_EDITOR=true git commit).
-cmd_prefix="([A-Za-z_][A-Za-z0-9_]*=[^[:space:];&|]*[[:space:]]+|(env|command|time|sudo)[[:space:]]+)*"
-git_write="(^|[;&|({"$'\n'"])[[:space:]]*${cmd_prefix}git[[:space:]]([^;&|]*[[:space:]])?(commit|push)([[:space:];&|)]|\$)"
-[[ "$script" =~ $git_write ]] || exit 0
+# A `git commit` or `git push` at a command position (string start, a newline,
+# or after ; & | ( { ), so a quoted "git commit" in an echo does not match.
+# Only git's global options may sit between git and the subcommand, so read-only
+# commands that mention one (git log --grep commit, git show, git diff) do not
+# match. Variable assignments and env/command/time/sudo with their options may
+# come first (GIT_EDITOR=true git commit, env -u GIT_DIR git push).
+q="'"
+word="(\"[^\"]*\"|${q}[^${q}]*${q}|[^[:space:];&|\"${q}]+)+"
+prefix="([A-Za-z_][A-Za-z0-9_]*=(${word})?|env|command|time|sudo|(-[uC]|--unset|--chdir)[[:space:]]+${word}|-[^[:space:];&|]*)[[:space:]]+"
+global="[[:space:]]+((-[Cc]|--git-dir|--work-tree|--namespace|--config-env)[[:space:]]+${word}|-[^[:space:];&|]*)"
+git_write="(^|[;&|({"$'\n'"])[[:space:]]*(${prefix})*git(${global})*[[:space:]]+(commit|push)([[:space:];&|)]|\$)"
+
+# The gate checks the hook's checkout (the workspace). A command that changes
+# directory or points git elsewhere may commit to another repository: cd or
+# pushd at a command position, or a repository selector in a matched command's
+# prefix or git globals (git -c x=y -C dir commit, env -C dir git commit,
+# GIT_DIR=x git push). Text after the subcommand, such as a commit message
+# that mentions cd or -C, does not count.
+selector="(^|[[:space:]])((-C|--chdir|--git-dir|--work-tree)([[:space:]=]|\$)|(GIT_DIR|GIT_WORK_TREE)=)"
+other_dir="(^|[;&|({"$'\n'"])[[:space:]]*(cd|pushd)[[:space:]]"
+writes=0
+pushes=0
+elsewhere=0
+rest=$script
+while [[ "$rest" =~ $git_write ]]; do
+  n=${#BASH_REMATCH[@]}
+  sub=${BASH_REMATCH[n - 2]}
+  matched=${BASH_REMATCH[0]%"$sub${BASH_REMATCH[n - 1]}"}
+  writes=1
+  [[ "$sub" == "push" ]] && pushes=1
+  [[ "$matched" =~ $selector ]] && elsewhere=1
+  # Keep the character after the subcommand, so `git push;git commit` still
+  # finds the second command, and the x stops a bare `^` from matching the text
+  # that follows (git commit -m 'git push').
+  rest=x${rest#*"$matched$sub"}
+done
+((writes)) || exit 0
 
 warn_skip() {
   echo "crap-gate: skipped ($1). The gate never blocks on its own failure."
   exit 0
 }
 
-# The gate checks the hook's checkout (the workspace). A command that changes
-# directory or points git elsewhere may commit to another repository.
-# `cd` counts only at a command position, so a commit message that mentions it
-# does not skip the gate.
-# A repository selector anywhere in a git command's options counts, also after
-# other globals (git -c x=y -C dir commit).
-other_repo="(^|[;&|({"$'\n'"])[[:space:]]*(cd|pushd)[[:space:]]|git[[:space:]]([^;&|]*[[:space:]])?(-C|--git-dir|--work-tree)"
-if [[ "$script" =~ $other_repo ]]; then
+if ((elsewhere)) || [[ "$script" =~ $other_dir ]]; then
   warn_skip "the command may target another checkout; run make crap-check there"
 fi
 
@@ -71,7 +92,7 @@ root=$(git rev-parse --show-toplevel 2>/dev/null) || warn_skip "not in a git che
 base=$(git -C "$root" merge-base origin/main HEAD 2>/dev/null) || warn_skip "no merge-base with origin/main"
 # In warn mode a successful `git push origin main` has already moved
 # origin/main to HEAD, which leaves nothing to compare. Say so instead of passing.
-if [[ "$script" =~ git[[:space:]].*push && "$base" == "$(git -C "$root" rev-parse HEAD)" ]] \
+if ((pushes)) && [[ "$base" == "$(git -C "$root" rev-parse HEAD)" ]] \
   && git -C "$root" diff --quiet HEAD --; then
   warn_skip "origin/main already contains HEAD; run make crap-check BASE=<ref> to check pushed commits"
 fi

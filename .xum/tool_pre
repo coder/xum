@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# .xum/tool_pre - CRAP gate before agent `git commit` / `git push` (block mode
+# only), then the user's own tool_pre (see hook_chain.sh).
+here=${0%/*}
+gate=$here/../scripts/crap/agent-gate.sh
+source "$here/hook_chain.sh"
+
+# The mode is the CRAP_GATE_MODE line in agent-gate.sh. Read it with builtins:
+# in warn mode this hook starts no process before the user's hook.
+mode=""
+if [[ "${XUM_TOOL:-}" == "bash" ]]; then
+  while IFS= read -r line; do
+    if [[ "$line" == CRAP_GATE_MODE=* ]]; then
+      mode=${line#*=}
+      break
+    fi
+  done <"$gate"
+fi
+
+# Xum kills a tool_pre after 10 s, and a killed tool_pre blocks the tool. The
+# gate gets 6 s of that and the user's hook the rest. The gate blocks only with
+# its own verdict (exit 1 and its "blocked" line): a timeout, a crash or a
+# missing timeout command lets the tool run.
+if [[ "$mode" == "block" ]] && timeout_cmd=$(command -v timeout || command -v gtimeout); then
+  report=$("$timeout_cmd" -k 0.5 6 "$gate" pre 2>&1 </dev/null)
+  if [[ $? -eq 1 && "$report" == *"crap-gate: blocked."* ]]; then
+    printf '%s\n' "$report"
+    exit 1
+  fi
+fi
+
+exec_user_hook tool_pre

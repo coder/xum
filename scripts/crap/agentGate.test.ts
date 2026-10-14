@@ -1,5 +1,5 @@
-// Tests scripts/crap/agent-gate.sh (the CRAP gate behind .xum/tool_post)
-// in throwaway git repos, in both modes. Like check.test.ts it needs uv, so
+// Tests scripts/crap/agent-gate.sh (the CRAP gate behind .xum/tool_pre and
+// .xum/tool_post) and those hooks in throwaway git repos, in both modes. Like check.test.ts it needs uv, so
 // `make test-crap-scripts` runs it and Test / Unit skips it.
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -95,9 +95,19 @@ test("block mode stops a regressing commit before it runs, unless it carries Cra
   expect(runGate(gate, "pre", "git commit -am 'grow' -m 'Crap-Debt: needs follow-up'").status).toBe(
     0
   );
-  expect(runGate(gate, "pre", "GIT_EDITOR=true env git commit -am x").status).toBe(1);
-  // A message that mentions cd does not hide the commit from the gate.
+  // Prefixes and git's global options before the subcommand.
+  for (const commit of [
+    "GIT_EDITOR=true env git commit -am x",
+    "env -u GIT_DIR git commit -am x",
+    "env -i PATH=$PATH GIT_AUTHOR_NAME='a b' git commit -am x",
+    "git -c core.editor=true --no-pager commit -am x",
+    "git status; git commit -am x",
+  ]) {
+    expect({ commit, status: runGate(gate, "pre", commit).status }).toEqual({ commit, status: 1 });
+  }
+  // A message that mentions cd or -C does not hide the commit from the gate.
   expect(runGate(gate, "pre", "git commit -am 'document cd usage'").status).toBe(1);
+  expect(runGate(gate, "pre", "git commit -am 'fix git -C handling'").status).toBe(1);
 
   // Over 8 KB, Xum drops XUM_TOOL_INPUT_SCRIPT and the gate reads the JSON input file.
   const input = join(dir, "input.json");
@@ -120,16 +130,41 @@ test("warn mode lets the commit run and reports after it", () => {
   const reported = runGate(gate, "post", "git commit -am 'grow route'");
   expect(reported.status).toBe(0);
   expect(reported.out).toContain("VIOLATION floor-cc     src/route.ts:1-5 route: CC 2 -> 5");
+
+  // A failed command (nothing to commit, a rejected push) gets no report.
+  const failed = runGate(gate, "post", "git commit -am 'grow route'", {
+    ...GIT_ENV,
+    XUM_TOOL_RESULT_SUCCESS: "false",
+  });
+  expect(failed).toEqual({ status: 0, out: "" });
 }, 60_000);
 
 test("other commands skip the check, and a broken gate never blocks", () => {
   const gate = gateIn("block");
-  expect(runGate(gate, "pre", "git log --oneline")).toEqual({ status: 0, out: "" });
-  expect(runGate(gate, "pre", 'echo "do not run git commit yet"')).toEqual({ status: 0, out: "" });
+  for (const readOnly of [
+    "git log --oneline",
+    'echo "do not run git commit yet"',
+    // Read-only commands that mention a write subcommand.
+    "git log --grep commit",
+    "git show HEAD -- push",
+    "git diff commit",
+    "git commit-tree HEAD^{tree}",
+  ]) {
+    expect({ readOnly, ...runGate(gate, "pre", readOnly) }).toEqual({
+      readOnly,
+      status: 0,
+      out: "",
+    });
+  }
   for (const elsewhere of [
     "cd ../other && git commit -am x",
     "git -C ../other commit -am x",
     "git -c color.ui=false -C ../other commit -am x",
+    'git -C "other dir" commit -am x',
+    "git --git-dir=../other/.git commit -am x",
+    "env -C ../other git commit -am x",
+    "GIT_DIR=../other/.git git push",
+    "git commit -am x && git -C ../other push",
   ]) {
     const skipped = runGate(gate, "pre", elsewhere);
     expect(skipped.status).toBe(0);
@@ -189,14 +224,121 @@ test("a scorer that ignores SIGTERM is killed before Xum's hook limit", () => {
   expect(Date.now() - started).toBeLessThan(10_000);
 }, 15_000);
 
-test("warn mode ships no project tool_pre that would replace the user's own", () => {
-  // Xum runs the project's .xum/tool_pre instead of ~/.xum/tool_pre.
-  const mode = /^CRAP_GATE_MODE=(\w+)$/m.exec(
-    readFileSync(join(import.meta.dir, "agent-gate.sh"), "utf8")
-  )?.[1];
-  expect(mode).toBe("warn");
-  expect(existsSync(join(REPO, ".xum/tool_pre"))).toBe(false);
-});
+/**
+ * A project with the shipped .xum hooks and a copy of scripts/crap in the
+ * given mode, so `${0%/*}/../scripts/crap/agent-gate.sh` resolves in the copy.
+ */
+function projectIn(mode: "warn" | "block"): string {
+  const project = join(dir, `project-${mode}`);
+  mkdirSync(join(project, ".xum"), { recursive: true });
+  for (const file of ["tool_pre", "tool_post", "hook_chain.sh"]) {
+    cpSync(join(REPO, ".xum", file), join(project, ".xum", file));
+  }
+  const gate = gateIn(mode);
+  cpSync(dirname(gate), join(project, "scripts/crap"), { recursive: true });
+  return project;
+}
+
+/** The user's Xum home with one hook that prints its name and input, then exits `status`. */
+function userHook(home: string, name: "tool_pre" | "tool_post", status: number): void {
+  mkdirSync(home, { recursive: true });
+  writeFileSync(
+    join(home, name),
+    `#!/usr/bin/env bash\necho "user ${name}: $XUM_TOOL_INPUT_SCRIPT"\nexit ${status}\n`,
+    { mode: 0o755 }
+  );
+}
+
+function runHook(hook: string, script: string, extraEnv: NodeJS.ProcessEnv = {}) {
+  // Without these, the hooks look for the user's hook in the test's own HOME.
+  const { XUM_ROOT: _x, MUX_ROOT: _m, NODE_ENV: _n, ...env } = GIT_ENV;
+  const result = spawnSync(hook, [], {
+    cwd: repo,
+    env: {
+      ...env,
+      HOME: join(dir, "home"),
+      XUM_TOOL: "bash",
+      XUM_TOOL_INPUT_SCRIPT: script,
+      ...extraEnv,
+    },
+    encoding: "utf8",
+  });
+  return { status: result.status, out: result.stdout + result.stderr };
+}
+
+test("the project hooks run the user's own hooks and pass their exit codes through", () => {
+  // Xum runs the project's .xum/tool_pre instead of ~/.xum/tool_pre, so the
+  // shipped hooks must run the user's. Warn mode: no gate before the commit.
+  const pre = join(REPO, ".xum/tool_pre");
+  expect(runHook(pre, "git commit -am x")).toEqual({ status: 0, out: "" });
+  userHook(join(dir, "home/.xum"), "tool_pre", 3);
+  expect(runHook(pre, "git commit -am x")).toEqual({
+    status: 3,
+    out: "user tool_pre: git commit -am x\n",
+  });
+
+  // XUM_ROOT moves the user's home, and a home that is the project's own .xum
+  // does not run the project hook again.
+  userHook(join(dir, "root"), "tool_pre", 4);
+  expect(runHook(pre, "ls", { XUM_ROOT: join(dir, "root") }).status).toBe(4);
+  expect(runHook(pre, "ls", { XUM_ROOT: join(REPO, ".xum") })).toEqual({ status: 0, out: "" });
+
+  // tool_post: the user's hook runs after the project's report, also after a
+  // file tool, whose formatting step returns early without a file path.
+  const post = join(projectIn("warn"), ".xum/tool_post");
+  userHook(join(dir, "home/.xum"), "tool_post", 2);
+  const reported = runHook(post, "git commit -am x");
+  expect(reported.status).toBe(2);
+  expect(reported.out).toContain("VIOLATION floor-cc     src/route.ts:1-5 route: CC 2 -> 5");
+  expect(reported.out).toEndWith("user tool_post: git commit -am x\n");
+  expect(runHook(post, "", { XUM_TOOL: "file_edit_replace_string" })).toEqual({
+    status: 2,
+    out: "user tool_post: \n",
+  });
+}, 60_000);
+
+test("block mode's tool_pre blocks a regression first, and a user block still blocks", () => {
+  const pre = join(projectIn("block"), ".xum/tool_pre");
+  userHook(join(dir, "home/.xum"), "tool_pre", 3);
+
+  const blocked = runHook(pre, "git commit -am x");
+  expect(blocked.status).toBe(1);
+  expect(blocked.out).toContain("VIOLATION floor-cc     src/route.ts:1-5 route: CC 2 -> 5");
+  expect(blocked.out).not.toContain("user tool_pre");
+
+  // The gate passes; the user's hook decides.
+  expect(runHook(pre, "git commit -am x -m 'Crap-Debt: follow-up'")).toEqual({
+    status: 3,
+    out: "user tool_pre: git commit -am x -m 'Crap-Debt: follow-up'\n",
+  });
+  expect(runHook(pre, "ls").status).toBe(3);
+}, 60_000);
+
+test("block mode's tool_pre fails open when the gate hangs or breaks", () => {
+  const pre = join(projectIn("block"), ".xum/tool_pre");
+  userHook(join(dir, "home/.xum"), "tool_pre", 0);
+  // A bun that ignores SIGTERM and outlives Xum's 10 s limit.
+  const stuck = join(dir, "stuck");
+  mkdirSync(stuck);
+  writeFileSync(join(stuck, "bun"), "#!/usr/bin/env bash\ntrap '' TERM\nsleep 12\n", {
+    mode: 0o755,
+  });
+  const started = Date.now();
+  const hung = runHook(pre, "git commit -am x", { PATH: `${stuck}:${process.env.PATH}` });
+  expect(Date.now() - started).toBeLessThan(8_000);
+  expect(hung).toEqual({ status: 0, out: "user tool_pre: git commit -am x\n" });
+
+  // A gate that crashes with exit 1 (not its own verdict) does not block.
+  const gate = join(dirname(pre), "../scripts/crap/agent-gate.sh");
+  writeFileSync(
+    gate,
+    readFileSync(gate, "utf8").replace("set -uo pipefail\n", "set -uo pipefail\nexit 1\n")
+  );
+  expect(runHook(pre, "git commit -am x")).toEqual({
+    status: 0,
+    out: "user tool_pre: git commit -am x\n",
+  });
+}, 20_000);
 
 test("non-commit calls start no process", () => {
   // The hooks run around every tool call. A PATH with only bash makes any
@@ -206,11 +348,14 @@ test("non-commit calls start no process", () => {
   symlinkSync(Bun.which("bash") ?? "/bin/bash", join(onlyBash, "bash"));
   const env = { PATH: onlyBash };
   const shippedGate = join(import.meta.dir, "agent-gate.sh");
+  const blockPre = join(projectIn("block"), ".xum/tool_pre");
   for (const [hook, phase, tool, script] of [
     [shippedGate, "post", "bash", "ls -la && make test"],
     [shippedGate, "post", "file_read", "git commit -am x"],
     [shippedGate, "pre", "bash", "git commit -am x"],
     [join(REPO, ".xum/tool_post"), "", "file_read", ""],
+    [join(REPO, ".xum/tool_pre"), "", "bash", "git commit -am x"],
+    [blockPre, "", "file_read", "git commit -am x"],
   ]) {
     const result = spawnSync(hook, phase ? [phase] : [], {
       cwd: repo,
