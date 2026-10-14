@@ -362,8 +362,11 @@ describe("AgentPluginInstallService hook trust", () => {
     await fsPromises.mkdir(path.dirname(trustFile()), { recursive: true });
     const [hook] = (await service.getHooks({ name: "guard" })).hooks;
     // A valid record that cannot be read: it trusts nothing until the repair.
-    const record = { version: 1, installedAt: await installedAt(), hooks: {} as object };
-    record.hooks = { [hook.key]: { hash: hook.hash, state: "trusted" } };
+    const record = {
+      version: 1,
+      installedAt: await installedAt(),
+      hooks: { [hook.key]: { hash: hook.hash, state: "trusted" } },
+    };
     await fsPromises.writeFile(trustFile(), JSON.stringify(record), { mode: 0o000 });
     expect((await service.getHooks({ name: "guard" })).hooks[0]?.review).toBe("new");
 

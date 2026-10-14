@@ -132,28 +132,33 @@ async function readBoundedTrustFile(file: string): Promise<string | undefined> {
       file,
       fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0)
     );
-    const stat = await handle.stat();
-    if (!stat.isFile() || stat.size > MAX_TRUST_FILE_BYTES) {
-      log.warn("Plugin hook trust file is not a bounded regular file; trusting no hooks", { file });
-      return undefined;
-    }
-    // Sized to the file (runners read it on every hook call), plus one byte: the file can grow
-    // after fstat, and a full buffer means it did. That read is refused, so the limit holds while
-    // reading too (Codex PRRT_kwDOPxxmWM6rPrVQ). Xum's own writes rename a new file into place,
-    // which never changes the open file.
-    const buffer = Buffer.alloc(stat.size + 1);
-    const bytesRead = await readUntilFull(handle, buffer);
-    if (bytesRead > stat.size) {
-      log.warn("Plugin hook trust file grew while it was read; trusting no hooks", { file });
-      return undefined;
-    }
-    return buffer.toString("utf8", 0, bytesRead);
+    return await readOpenTrustFile(handle, file);
   } catch (error) {
     if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) {
       log.warn("Plugin hook trust file is unreadable; trusting no hooks", { file, error });
     }
     return undefined;
   }
+}
+
+/** The open file's text, or undefined (logged) when it is not a bounded regular file. */
+async function readOpenTrustFile(handle: fs.FileHandle, file: string): Promise<string | undefined> {
+  const stat = await handle.stat();
+  if (!stat.isFile() || stat.size > MAX_TRUST_FILE_BYTES) {
+    log.warn("Plugin hook trust file is not a bounded regular file; trusting no hooks", { file });
+    return undefined;
+  }
+  // Sized to the file (runners read it on every hook call), plus one byte: the file can grow
+  // after fstat, and a full buffer means it did. That read is refused, so the limit holds while
+  // reading too (Codex PRRT_kwDOPxxmWM6rPrVQ). Xum's own writes rename a new file into place,
+  // which never changes the open file.
+  const buffer = Buffer.alloc(stat.size + 1);
+  const bytesRead = await readUntilFull(handle, buffer);
+  if (bytesRead > stat.size) {
+    log.warn("Plugin hook trust file grew while it was read; trusting no hooks", { file });
+    return undefined;
+  }
+  return buffer.toString("utf8", 0, bytesRead);
 }
 
 /**
@@ -264,9 +269,10 @@ async function removeWrongKindRoot(xumHome: string): Promise<void> {
   if (existing === null || existing.isDirectory()) return;
   // A symlink set up on purpose is not followed either: trust writes must stay inside Xum home.
   // Its target is kept, but every trust decision in it stops applying, so say so in the log.
-  if (existing.isSymbolicLink()) {
-    log.warn("Plugin hook trust store is a symlink; replacing it with a directory", { root });
-  }
+  log.warn("Plugin hook trust store is not a directory; replacing it", {
+    root,
+    symlink: existing.isSymbolicLink(),
+  });
   await fs.rm(root, { force: true });
 }
 
