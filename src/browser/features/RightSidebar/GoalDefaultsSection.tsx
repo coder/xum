@@ -95,8 +95,18 @@ class GoalOverrideWriter {
     return this.writesByWorkspace.get(workspaceId) ?? 0;
   }
 
+  /**
+   * Each write stores the whole override, so a newer write supersedes an older one. Only the
+   * latest write reports a failure: an older one's error must not stay after a newer success.
+   */
+  private reportFailure(edit: GoalOverrideWrite, write: number, error: unknown): void {
+    if (this.writeCount(edit.workspaceId) === write) edit.onFailed(error);
+  }
+
   write(api: APIClient, edit: GoalOverrideWrite): void {
-    this.writesByWorkspace.set(edit.workspaceId, this.writeCount(edit.workspaceId) + 1);
+    const thisWrite = this.writeCount(edit.workspaceId) + 1;
+    this.writesByWorkspace.set(edit.workspaceId, thisWrite);
+    const onFailed = (error: unknown) => this.reportFailure(edit, thisWrite, error);
     this.chain = this.chain.then(() =>
       api.workspace.goalDefaults
         .set({
@@ -106,7 +116,7 @@ class GoalOverrideWriter {
           alwaysRequireExplicitBudget: edit.override.alwaysRequireExplicitBudget,
         })
         // Notify parent so prefilled create-form inputs can re-read the effective defaults.
-        .then(() => edit.onSaved?.(), edit.onFailed)
+        .then(() => edit.onSaved?.(), onFailed)
     );
   }
 }
@@ -184,16 +194,11 @@ function useWorkspaceGoalOverride(workspaceId: string, onPersist: (() => void) |
     if (liveApi == null) return;
     setOverride(next);
     setSaveError(null);
-    // Each write stores the whole override, so a newer write supersedes an older one. Only the
-    // latest write reports a failure: an older one's error must not stay after it succeeded.
-    const thisWrite = writer.writeCount(workspaceId) + 1;
     writer.write(liveApi, {
       workspaceId,
       override: next,
       onSaved: onPersist,
-      onFailed: (error) => {
-        if (writer.writeCount(workspaceId) === thisWrite) setSaveError(getErrorMessage(error));
-      },
+      onFailed: (error) => setSaveError(getErrorMessage(error)),
     });
   };
 
