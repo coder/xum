@@ -961,8 +961,9 @@ const ComponentReviewNotice: React.FC<{ items: AgentPluginListItem[] | null }> =
     >
       <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
       <span className="break-words">
-        Some plugins have skills or MCP servers that you have not reviewed on this install. Select
-        Review on each plugin marked &quot;needs review&quot; to approve them.
+        Some plugins have skills or MCP servers that you have not reviewed on this install. They do
+        not load until you review them. Select Review on each plugin marked &quot;needs review&quot;
+        to approve them.
       </span>
     </div>
   );
