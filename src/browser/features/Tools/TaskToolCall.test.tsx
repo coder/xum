@@ -513,6 +513,30 @@ describe("TaskToolCall", () => {
       expect(renderCard(pendingResult, [continuationRead]).text).toContain(report);
     });
 
+    test("skips malformed foreground report entries instead of throwing", () => {
+      // A partly corrupted chat.jsonl can hold null or non-object `reports` entries; the
+      // transcript must still render (self-healing), and the valid entry still joins.
+      const corruptResult = {
+        status: "completed",
+        taskIds: ["fg-ok"],
+        reports: [
+          null,
+          "not a report",
+          7,
+          {
+            taskId: "fg-ok",
+            reportMarkdown: firstPage.text,
+            nextCharOffset: firstPage.nextCharOffset,
+          },
+        ],
+      };
+      const linking = computeTaskReportLinking([
+        createToolMessage({ toolName: "task", args: foregroundArgs, result: corruptResult }),
+      ]);
+      expect(linking.reportByTaskId.get("fg-ok")?.reportMarkdown).toBe(firstPage.text);
+      expect(renderCard(corruptResult, []).text).toContain(firstPage.text);
+    });
+
     test("starts a new join when a woken task reports again", () => {
       // The second attempt's first page matches the first attempt's text.
       const secondReport = "Page zero. Fresh end.";

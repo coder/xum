@@ -776,6 +776,14 @@ function recoverTaskGroupTaskIdsFromWorkspaceMetadata(params: {
   );
 }
 
+/**
+ * The entries of a persisted list that are objects. A partly corrupted chat.jsonl can hold a
+ * null entry, and skipping it keeps the card rendering (self-healing).
+ */
+function objectEntries<T>(entries: readonly T[]): T[] {
+  return entries.filter((entry) => typeof entry === "object" && entry !== null);
+}
+
 function collectTaskToolResultDisplayData(result: TaskToolSuccessResult | null): {
   taskIds: string[];
   statusByTaskId: Map<string, string>;
@@ -857,7 +865,7 @@ function collectTaskToolResultDisplayData(result: TaskToolSuccessResult | null):
   }
 
   if ("reports" in result && Array.isArray(result.reports)) {
-    for (const report of result.reports) {
+    for (const report of objectEntries(result.reports)) {
       const taskId = rememberTaskId(report.taskId);
       if (taskId) {
         ownReportsByTaskId.set(taskId, {

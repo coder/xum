@@ -271,9 +271,14 @@ function readForegroundFirstPages(result: unknown): unknown[] {
   const reports = (result as { reports?: unknown }).reports;
   const isCompleted = (result as { status?: unknown }).status === "completed";
   const entries: unknown[] = Array.isArray(reports) ? reports : isCompleted ? [result] : [];
+  // Persisted results can be corrupted (a null or non-object entry): skip those entries so
+  // the transcript still renders (self-healing).
   return entries
-    .filter((entry) => toPageOffset((entry as { nextCharOffset?: unknown }).nextCharOffset) != null)
-    .map((entry) => ({ ...(entry as object), status: "completed" }));
+    .filter(
+      (entry): entry is { nextCharOffset?: unknown } => typeof entry === "object" && entry !== null
+    )
+    .filter((entry) => toPageOffset(entry.nextCharOffset) != null)
+    .map((entry) => ({ ...entry, status: "completed" }));
 }
 
 const DELIVERED_SEND_STATUSES: ReadonlySet<unknown> = new Set([
