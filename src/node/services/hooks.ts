@@ -756,21 +756,25 @@ export async function runPostHook(
       exitCode: result.exitCode ?? -1,
     };
   } catch (err) {
-    // A cancelled tool call (user interrupt, memory intuition deadline) aborts its
-    // post-hook before or during exec. That is expected, so it is not an error.
-    if (context.abortSignal?.aborted) {
-      log.debug("[hooks] Post-hook skipped: tool call aborted", { hookPath });
-    } else {
-      log.error("[hooks] Post-hook execution failed", { hookPath, error: err });
-    }
-    return {
-      success: false,
-      output: `Post-hook failed: ${getErrorMessage(err)}`,
-      exitCode: -1,
-    };
+    return postHookFailure(hookPath, err, context.abortSignal);
   } finally {
     await cleanup();
   }
+}
+
+function postHookFailure(
+  hookPath: string,
+  err: unknown,
+  abortSignal: AbortSignal | undefined
+): PostHookResult {
+  // A cancelled tool call (user interrupt, memory intuition deadline) aborts its
+  // post-hook before or during exec. That is expected, so it is not an error.
+  if (abortSignal?.aborted) {
+    log.debug("[hooks] Post-hook skipped: tool call aborted", { hookPath });
+  } else {
+    log.error("[hooks] Post-hook execution failed", { hookPath, error: err });
+  }
+  return { success: false, output: `Post-hook failed: ${getErrorMessage(err)}`, exitCode: -1 };
 }
 
 /** Helper to prepare tool input (write to file if large) */
