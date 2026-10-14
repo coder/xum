@@ -1,5 +1,5 @@
 import { useCallback } from "react";
-import { useAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
 import { getAppConfigStore, useAppConfig } from "@/browser/stores/AppConfigStore";
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
 import {
@@ -68,7 +68,9 @@ export interface RoutingState {
 }
 
 export function useRouting(): RoutingState {
-  const { api } = useAPI();
+  // The live client only: offline (the last client kept while reconnecting, or none) the write
+  // cannot reach the server, so a route change is refused rather than shown as saved.
+  const api = useLiveAPI();
   const { config: providersConfig } = useProvidersConfig();
   // Shared AppConfigStore (one fetch + one onConfigChanged subscription per
   // app session) instead of per-mount fetches: surfaces render one picker per
@@ -111,10 +113,13 @@ export function useRouting(): RoutingState {
 
   const setRoutePreferences = useCallback(
     (priority: string[], overrides: Record<string, string>) => {
+      // Offline: no optimistic route. It would look saved until the next config load. The
+      // callers' other offline edits are no-ops too (ModelsSection, ProvidersSection).
+      if (api == null) return;
       store.updateOptimistically({ routePriority: priority, routeOverrides: overrides });
       persistRoutePreferences(priority, overrides);
     },
-    [persistRoutePreferences, store]
+    [api, persistRoutePreferences, store]
   );
 
   const setRoutePriority = useCallback(

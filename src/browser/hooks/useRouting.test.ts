@@ -4,6 +4,7 @@ import { GlobalWindow } from "happy-dom";
 import React from "react";
 
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
@@ -233,6 +234,49 @@ describe("useRouting", () => {
     expect(result.current.routePriority).toEqual(["mux-gateway", "direct"]);
 
     await waitFor(() => expect(result.current.routePriority).toEqual(["direct"]));
+  });
+
+  // Offline the write cannot reach the server. An optimistic route would look saved until the
+  // next config load, so the change is refused: nothing optimistic and no write. As in the
+  // callers (Models, Providers), an offline edit is a no-op.
+  test.each([...GAP_MODES])("refuses a route change while offline (%s)", async (mode) => {
+    let writes = 0;
+    updateRoutePreferencesImpl = () => {
+      writes++;
+      return Promise.resolve(undefined);
+    };
+    const harness = createConnectionHarness(mode, () => ({
+      providers: {
+        getConfig: () => Promise.resolve(providersConfig),
+        onConfigChanged: () => Promise.resolve(emptyStream()),
+      },
+      config: {
+        getConfig: () => configGetConfig(),
+        onConfigChanged: () => Promise.resolve(emptyStream()),
+        updateRoutePreferences: () => updateRoutePreferencesImpl(),
+      },
+    }));
+    getProvidersConfigStore().setClient(harness.client);
+    getAppConfigStore().setClient(harness.client);
+
+    const { result } = renderHook(() => useRouting(), { wrapper: harness.Wrapper });
+    await waitFor(() => expect(result.current.routePriority).toEqual(["direct"]));
+
+    await harness.drop();
+    act(() => {
+      result.current.setRoutePriority(["mux-gateway", "direct"]);
+      result.current.setRouteOverride("openai:gpt-5.4", "mux-gateway");
+    });
+    expect(result.current.routePriority).toEqual(["direct"]);
+    expect(result.current.routeOverrides).toEqual({});
+    expect(writes).toBe(0);
+
+    harness.reconnect();
+    act(() => {
+      result.current.setRoutePriority(["mux-gateway", "direct"]);
+    });
+    expect(result.current.routePriority).toEqual(["mux-gateway", "direct"]);
+    await waitFor(() => expect(writes).toBe(1));
   });
 
   test("a preferences-only update does not re-render routing or thinking-floor consumers", async () => {
