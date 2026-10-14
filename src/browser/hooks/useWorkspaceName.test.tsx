@@ -112,4 +112,42 @@ describe("useWorkspaceName persisted draft state", () => {
     await act(() => new Promise((resolve) => setTimeout(resolve, 20)));
     expect(generateMock).toHaveBeenCalledTimes(1);
   });
+
+  describe("handOffGeneration", () => {
+    test("hands an in-flight generation to the caller and drops its late result", async () => {
+      const generation = Promise.withResolvers<Awaited<ReturnType<typeof generateMock>>>();
+      generateMock.mockImplementationOnce(() => generation.promise);
+      const view = renderWorkspaceName("fix the sidebar");
+      await waitFor(() => expect(generateMock).toHaveBeenCalledTimes(1));
+
+      const handedOff: Array<ReturnType<typeof view.result.current.handOffGeneration>> = [];
+      act(() => {
+        handedOff.push(view.result.current.handOffGeneration());
+      });
+      expect(handedOff).toEqual([{ message: "fix the sidebar", candidates: [] }]);
+      expect(view.result.current.isGenerating).toBe(false);
+
+      await act(async () => {
+        generation.resolve({
+          success: true as const,
+          data: { name: "sidebar-a1b2", title: "Fix sidebar", modelUsed: "test:model" },
+        });
+        await generation.promise;
+      });
+      expect(view.result.current.name).toBe("");
+    });
+
+    test("returns null when a name was generated for the current message", async () => {
+      const view = renderWorkspaceName("fix the sidebar");
+      await waitFor(() => expect(view.result.current.name).toBe("quotes-a1b2"));
+      expect(view.result.current.handOffGeneration()).toBeNull();
+    });
+
+    test("returns null for a manual name", () => {
+      const view = renderWorkspaceName("fix the sidebar");
+      act(() => view.result.current.setAutoGenerate(false));
+      act(() => view.result.current.setName("my-feature"));
+      expect(view.result.current.handOffGeneration()).toBeNull();
+    });
+  });
 });

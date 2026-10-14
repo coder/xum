@@ -204,7 +204,9 @@ export async function generateWorkspaceIdentity(
   /** Optional conversation turns context used for regenerate-title prompts. */
   conversationContext?: string,
   /** Optional most recent user message; included as additional context only — not given precedence over older turns. */
-  latestUserMessage?: string
+  latestUserMessage?: string,
+  /** Stops the request in flight and every later candidate (a deadline, or the workspace went away). */
+  abortSignal?: AbortSignal
 ): Promise<Result<GenerateWorkspaceIdentityResult, NameGenerationError>> {
   if (candidates.length === 0) {
     return Err({ type: "unknown", raw: "No model candidates provided for name generation" });
@@ -218,6 +220,9 @@ export async function generateWorkspaceIdentity(
   let lastError: NameGenerationError | null = null;
 
   for (let i = 0; i < maxAttempts; i++) {
+    if (abortSignal?.aborted) {
+      return Err({ type: "unknown", raw: "Name generation was aborted" });
+    }
     const candidate = candidates[i];
     const modelString = candidate.model;
 
@@ -299,6 +304,7 @@ export async function generateWorkspaceIdentity(
       const currentStream = streamText({
         model: pinned.model,
         prompt: buildWorkspaceIdentityPrompt(message, conversationContext, latestUserMessage),
+        abortSignal,
         // Same route/wire receipt as model creation; also pins thinking off
         // explicitly for fallbacks (some providers default to medium otherwise).
         providerOptions: providerOptions as Parameters<typeof streamText>[0]["providerOptions"],

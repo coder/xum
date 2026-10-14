@@ -926,6 +926,56 @@ export class WorktreeManager {
     }
   }
 
+  /**
+   * Rename only the branch of a workspace, leaving its directory and name alone. `git branch -m`
+   * also moves the HEAD of the linked worktree that has the branch checked out and its
+   * `branch.<name>.*` config. It refuses an existing target branch. Deletion finds the branch
+   * through the persisted mapping, so a failed mapping write renames the branch back.
+   */
+  async renameWorkspaceBranch(
+    projectPath: string,
+    workspaceName: string,
+    oldBranchName: string,
+    newBranchName: string,
+    trusted?: boolean
+  ): Promise<{ success: true } | { success: false; error: string }> {
+    cleanStaleLock(projectPath);
+    let noHooksEnv: GitExecOptions;
+    try {
+      noHooksEnv = await this.getGitExecOptions(projectPath, trusted);
+    } catch (error) {
+      return { success: false, error: getErrorMessage(error) };
+    }
+    const renameBranch = async (from: string, to: string) => {
+      using branchProc = execFileAsync(
+        "git",
+        ["-C", projectPath, "branch", "-m", from, to],
+        noHooksEnv
+      );
+      await branchProc.result;
+    };
+    try {
+      await renameBranch(oldBranchName, newBranchName);
+    } catch (error) {
+      return { success: false, error: getErrorMessage(error) };
+    }
+    try {
+      await this.persistWorkspaceBranchMapping(projectPath, workspaceName, newBranchName);
+      return { success: true };
+    } catch (error) {
+      const mappingError = getErrorMessage(error);
+      try {
+        await renameBranch(newBranchName, oldBranchName);
+      } catch (revertError) {
+        return {
+          success: false,
+          error: `${mappingError} (renaming the branch back to ${oldBranchName} failed: ${getErrorMessage(revertError)})`,
+        };
+      }
+      return { success: false, error: mappingError };
+    }
+  }
+
   async canDeleteWorkspaceWithoutForce(
     projectPath: string,
     workspaceName: string,

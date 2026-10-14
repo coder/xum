@@ -89,9 +89,21 @@ export interface WorkspaceNameState {
   setName: (name: string) => void;
 }
 
+/** What workspace.create's nameGeneration needs to name the workspace in the backend. */
+export interface WorkspaceNameGenerationRequest {
+  message: string;
+  candidates: string[];
+}
+
 export interface UseWorkspaceNameReturn extends WorkspaceNameState {
   /** Wait for any pending generation to complete, returns both name and title */
   waitForGeneration: () => Promise<WorkspaceIdentity | null>;
+  /**
+   * Hand the naming to the backend instead of waiting for it: when auto naming has no identity
+   * generated for exactly the current message, cancel the debounced or in-flight request (its
+   * late result must not land in the form) and return the request. Null otherwise.
+   */
+  handOffGeneration: () => WorkspaceNameGenerationRequest | null;
 }
 
 const WorkspaceNamePersistedStateSchema = z.object({
@@ -488,6 +500,20 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     return null;
   }, [autoGenerate, name, generatedIdentity, lastGeneratedFor, message, generateIdentity]);
 
+  const handOffGeneration = useCallback((): WorkspaceNameGenerationRequest | null => {
+    if (!autoGenerate || !message.trim()) return null;
+    if (generatedIdentity && lastGeneratedFor === toStoredMessage(message)) return null;
+    cancelPendingGeneration();
+    return { message, candidates };
+  }, [
+    autoGenerate,
+    message,
+    generatedIdentity,
+    lastGeneratedFor,
+    cancelPendingGeneration,
+    candidates,
+  ]);
+
   return useMemo(
     () => ({
       name,
@@ -500,6 +526,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
       setAutoGenerate: handleSetAutoGenerate,
       setName: setNameManual,
       waitForGeneration,
+      handOffGeneration,
     }),
     [
       name,
@@ -511,6 +538,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
       handleSetAutoGenerate,
       setNameManual,
       waitForGeneration,
+      handOffGeneration,
     ]
   );
 }

@@ -336,7 +336,7 @@ export function useCreationWorkspace({
   });
 
   // Destructure name state functions for use in callbacks
-  const { waitForGeneration } = workspaceNameState;
+  const { waitForGeneration, handOffGeneration, name: shownWorkspaceName } = workspaceNameState;
 
   // The project whose runtimes are shown. Only a new project shows the runtimes as "loading"
   // again: a new client (reconnect) reloads the same project behind the shown values.
@@ -475,15 +475,22 @@ export function useCreationWorkspace({
       let createdWorkspaceId: string | null = null;
 
       try {
+        // A worktree workspace opens without waiting for its name: the backend names it, and
+        // renames its branch before the init hook runs. Other runtimes create the checkout under
+        // the final name, so they wait for it.
+        const nameGeneration =
+          kind !== "scratch" && runtimeSelection.mode === RUNTIME_MODE.WORKTREE
+            ? handOffGeneration()
+            : null;
         // Wait for identity generation to complete (blocks if still in progress)
         // Returns null if generation failed or manual name is empty (error already set in hook)
-        const identity = await waitForGeneration();
-        if (!identity) {
+        const identity = nameGeneration ? null : await waitForGeneration();
+        if (!nameGeneration && !identity) {
           setIsSending(false);
           return { success: false };
         }
 
-        const normalizedTitle = typeof identity.title === "string" ? identity.title.trim() : "";
+        const normalizedTitle = typeof identity?.title === "string" ? identity.title.trim() : "";
         const createTitle = normalizedTitle || undefined;
 
         // Read send options at send time: render state can lag a pick made just
@@ -568,11 +575,12 @@ export function useCreationWorkspace({
             ? await liveApi.workspace.createScratch({ title: createTitle })
             : await liveApi.workspace.create({
                 projectPath,
-                branchName: identity.name,
+                branchName: identity?.name,
                 trunkBranch: settings.trunkBranch,
                 title: createTitle,
                 runtimeConfig,
                 subProjectPath: subProjectPath ?? undefined,
+                ...(nameGeneration ? { nameGeneration } : {}),
               });
 
         if (!createResult.success) {
@@ -588,7 +596,8 @@ export function useCreationWorkspace({
         const { metadata } = createResult;
         createdWorkspaceId = metadata.id;
         // Captured now: the form's name state can change while the rest of this send runs.
-        const submittedName = identity.name;
+        // A handed-off naming leaves the name the form showed at Send (an older message's).
+        const submittedName = identity?.name ?? shownWorkspaceName;
 
         // Best-effort: persist the initial AI settings to the backend immediately so this workspace
         // is portable across devices even before the first stream starts. Initial /goal commands do
@@ -963,6 +972,8 @@ export function useCreationWorkspace({
       settings.reasoningMode,
       settings.trunkBranch,
       waitForGeneration,
+      handOffGeneration,
+      shownWorkspaceName,
       workspaceNameState.autoGenerate,
       message,
       subProjectPath,
