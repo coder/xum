@@ -1122,7 +1122,7 @@ describe("useCreationWorkspace", () => {
       const createRequest = workspaceApi.create.mock.calls[0]?.[0];
       const formRequest = nameGenerationMock.mock.calls[0]?.[0];
       // The form's request still runs, so the create names it for the backend to take over.
-      expect(formRequest?.draftNamingId).toEqual(expect.any(String));
+      expect(typeof formRequest?.draftNamingId).toBe("string");
       expect(createRequest?.nameGeneration).toEqual({
         message: "launch workspace",
         candidates: formRequest?.candidates ?? [],

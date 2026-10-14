@@ -12,7 +12,7 @@ import {
 } from "@/common/constants/storage";
 import { useWorkspaceName } from "./useWorkspaceName";
 
-const generateMock = mock(() =>
+const generateMock = mock((_input: { draftNamingId?: string }) =>
   Promise.resolve({
     success: true as const,
     data: { name: "quotes-a1b2", title: "Quote heavy message", modelUsed: "test:model" },
@@ -125,10 +125,12 @@ describe("useWorkspaceName persisted draft state", () => {
         handedOff.push(view.result.current.handOffGeneration());
       });
       // Named so the backend can take the in-flight request's result over.
+      const inFlightId = generateMock.mock.calls[0]?.[0]?.draftNamingId;
+      expect(typeof inFlightId).toBe("string");
       expect(handedOff[0]?.request).toEqual({
         message: "fix the sidebar",
         candidates: [],
-        draftNamingId: expect.any(String),
+        draftNamingId: inFlightId,
       });
       expect(view.result.current.isGenerating).toBe(false);
 
