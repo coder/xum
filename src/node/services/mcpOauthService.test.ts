@@ -945,6 +945,78 @@ describe("McpOauthService OAuth flows", () => {
     });
   });
 
+  test("two starts with one caller flow ID never both register (#6565)", async () => {
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => (release = resolve));
+    spyOn(mcpConfigService, "listServers").mockImplementation(async () => {
+      await released;
+      return { docs: { transport: "http", url: "https://example.com/mcp", disabled: true } };
+    });
+    const input = {
+      projectPath,
+      serverName: "docs",
+      redirectUri: "https://x/cb",
+      flowId: "caller-flow-id-0123456789",
+    };
+    // Both lookups are pending: the second start must still see the first one's ID.
+    const first = service.startServerFlow(input);
+    expect(await service.startServerFlow(input)).toEqual({
+      success: false,
+      error: "OAuth flow ID already in use",
+    });
+    release();
+    await first;
+  });
+
+  test("a Cancel recorded before the flow deadline no longer refuses a later start (#6565)", async () => {
+    await withAuthServer(async (base) => {
+      spyOn(mcpConfigService, "listServers").mockResolvedValue({
+        docs: { transport: "http", url: `${base}/mcp`, disabled: true, oauth: { clientId: "c" } },
+      });
+      const flowId = "caller-flow-id-0123456789";
+      await service.cancelServerFlow(flowId);
+      // Eleven minutes later (past the 10-minute server flow deadline), nothing else ran.
+      const now = Date.now();
+      const clock = spyOn(Date, "now").mockReturnValue(now + 11 * 60 * 1000);
+      try {
+        const start = await service.startServerFlow({
+          projectPath,
+          serverName: "docs",
+          redirectUri: "https://x/cb",
+          flowId,
+        });
+        expect(start.success && start.data.flowId).toBe(flowId);
+        await service.cancelServerFlow(flowId);
+      } finally {
+        clock.mockRestore();
+      }
+    });
+  });
+
+  test("a flow whose start event failed to send sends no end event either (#6565)", async () => {
+    await withAuthServer(async (base) => {
+      const captured: string[] = [];
+      await service.dispose();
+      service = new McpOauthService(config, mcpConfigService, undefined, {
+        capture: (payload: { event: string }) => {
+          if (payload.event === "mcp_oauth_flow_started") throw new Error("telemetry down");
+          captured.push(payload.event);
+        },
+      } as unknown as TelemetryService);
+      spyOn(mcpConfigService, "listServers").mockResolvedValue({
+        docs: { transport: "http", url: `${base}/mcp`, disabled: true, oauth: { clientId: "c" } },
+      });
+      const start = await service.startServerFlow({
+        projectPath,
+        serverName: "docs",
+        redirectUri: "https://x/cb",
+      });
+      if (!start.success) throw new Error(start.error);
+      await service.cancelServerFlow(start.data.flowId);
+      expect(captured).toEqual([]);
+    });
+  });
+
   test("a token exchange in flight when the user signs out saves nothing", async () => {
     let tokenRequested!: () => void;
     const requested = new Promise<void>((resolve) => (tokenRequested = resolve));

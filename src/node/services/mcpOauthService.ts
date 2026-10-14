@@ -44,6 +44,7 @@ const DEFAULT_SERVER_TIMEOUT_MS = 10 * 60 * 1000;
 const OAUTH_FLOW_CANCELLED = "OAuth flow cancelled";
 /** Caller-generated flow IDs double as the OAuth state, so they must be long and URL-safe. */
 const CALLER_FLOW_ID_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
+const MAX_PRE_CANCELLED_FLOWS = 256;
 const COMPLETED_FLOW_TTL_MS = 60 * 1000;
 /** Shown on the callback page when a sign-out or another sign-in superseded this sign-in. */
 const DROPPED_SIGN_IN_ERROR =
@@ -1049,6 +1050,8 @@ export class McpOauthService {
    * The start refuses such a flow at registration (#6565).
    */
   private readonly preCancelledFlowIds = new Map<string, number>();
+  /** Caller flow IDs of starts that run but have not registered a flow yet. */
+  private readonly startingFlowIds = new Set<string>();
   private readonly telemetryService?: TelemetryService;
 
   constructor(
@@ -1444,9 +1447,15 @@ export class McpOauthService {
     pendingServer?: MCPOAuthPendingServerConfig;
     flowId?: string;
   }): Promise<Result<{ flowId: string; authorizeUrl: string; redirectUri: string }, string>> {
-    const prepared = await this.prepareFlowStart(input);
-    if (!prepared.success) return prepared;
-    const { flowId, server } = prepared.data;
+    return this.withReservedFlowId(input.flowId, (flowId) => this.launchDesktopFlow(input, flowId));
+  }
+
+  private async launchDesktopFlow(
+    input: { projectPath: string; serverName: string; pendingServer?: MCPOAuthPendingServerConfig },
+    flowId: string
+  ): Promise<Result<{ flowId: string; authorizeUrl: string; redirectUri: string }, string>> {
+    const server = await this.prepareFlowStart(input, flowId);
+    if (!server.success) return server;
 
     const { promise: resultPromise, resolve: resolveResult } =
       createDeferred<Result<void, string>>();
@@ -1472,7 +1481,7 @@ export class McpOauthService {
     }
 
     const redirectUri = `http://127.0.0.1:${address.port}/callback`;
-    if (this.preCancelledFlowIds.delete(flowId)) {
+    if (this.takePreCancel(flowId)) {
       await closeServer(serverListener).catch(() => undefined);
       return Err(OAUTH_FLOW_CANCELLED);
     }
@@ -1480,7 +1489,7 @@ export class McpOauthService {
     // Register the flow and start its deadline before any network request, so the deadline,
     // Cancel and a sign-out also end a stalled discovery (#6164).
     const flow: DesktopFlow = {
-      ...this.newFlowBase(input, server, redirectUri),
+      ...this.newFlowBase(input, server.data, redirectUri),
       server: serverListener,
       timeout: setTimeout(() => {
         void this.finishDesktopFlow(flowId, Err("Timed out waiting for OAuth callback"));
@@ -1491,7 +1500,7 @@ export class McpOauthService {
     };
     this.desktopFlows.set(flowId, flow);
 
-    const started = await this.beginAuthorization(flow, server.oauth);
+    const started = await this.beginAuthorization(flow, server.data.oauth);
     if (!started.success) {
       await this.finishDesktopFlow(flowId, started);
       return started;
@@ -1559,8 +1568,7 @@ export class McpOauthService {
       );
       if (flow.settled) return await flow.resultPromise;
 
-      flow.startReported = true;
-      this.captureTelemetry({
+      flow.startReported = this.captureTelemetry({
         event: "mcp_oauth_flow_started",
         properties: {
           transport: flow.transport,
@@ -1627,39 +1635,71 @@ export class McpOauthService {
   }
 
   /**
-   * The flow ID and server of a new sign-in. A Cancel that named the caller's ID while the
-   * server lookup ran refuses the start (see preCancelledFlowIds).
+   * Runs a sign-in start with its flow ID reserved: two starts that send the same caller ID
+   * cannot both pass the availability check while their server lookups run (#6565). Once the
+   * start returns, its flow (if any) is in desktopFlows or serverFlows.
    */
-  private async prepareFlowStart(input: {
-    projectPath: string;
-    serverName: string;
-    pendingServer?: MCPOAuthPendingServerConfig;
-    flowId?: string;
-  }): Promise<Result<{ flowId: string; server: OAuthFlowServer }, string>> {
-    const claimed = this.claimFlowId(input.flowId);
+  private async withReservedFlowId<T>(
+    callerFlowId: string | undefined,
+    run: (flowId: string) => Promise<Result<T, string>>
+  ): Promise<Result<T, string>> {
+    const claimed = this.claimFlowId(callerFlowId);
     if (!claimed.success) return claimed;
+    this.startingFlowIds.add(claimed.data);
+    try {
+      return await run(claimed.data);
+    } finally {
+      this.startingFlowIds.delete(claimed.data);
+    }
+  }
+
+  /**
+   * The server of a new sign-in. A Cancel that named the flow's ID while the server lookup ran
+   * refuses the start (see preCancelledFlowIds).
+   */
+  private async prepareFlowStart(
+    input: { projectPath: string; serverName: string; pendingServer?: MCPOAuthPendingServerConfig },
+    flowId: string
+  ): Promise<Result<OAuthFlowServer, string>> {
     const server = await this.resolveServerForOauthFlow(input);
     if (!server.success) return server;
-    if (this.preCancelledFlowIds.delete(claimed.data)) return Err(OAUTH_FLOW_CANCELLED);
-    return Ok({ flowId: claimed.data, server: server.data });
+    return this.takePreCancel(flowId) ? Err(OAUTH_FLOW_CANCELLED) : server;
   }
 
   /** The caller's flow ID (validated and unused), or a new one when the caller sent none. */
   private claimFlowId(flowId: string | undefined): Result<string, string> {
     if (flowId === undefined) return Ok(crypto.randomUUID());
     if (!CALLER_FLOW_ID_PATTERN.test(flowId)) return Err("Invalid OAuth flow ID");
-    if (this.desktopFlows.has(flowId) || this.serverFlows.has(flowId))
-      return Err("OAuth flow ID already in use");
-    return Ok(flowId);
+    const inUse =
+      this.startingFlowIds.has(flowId) ||
+      this.desktopFlows.has(flowId) ||
+      this.serverFlows.has(flowId);
+    return inUse ? Err("OAuth flow ID already in use") : Ok(flowId);
   }
 
   /** Remembers a Cancel for a flow that is still starting (see preCancelledFlowIds). */
   private recordPreCancel(flowId: string): void {
+    if (!CALLER_FLOW_ID_PATTERN.test(flowId)) return;
+    this.prunePreCancels();
+    // Bounded: a Cancel burst for IDs that never start must not grow the map without limit.
+    const oldest = this.preCancelledFlowIds.keys().next();
+    if (this.preCancelledFlowIds.size >= MAX_PRE_CANCELLED_FLOWS && !oldest.done)
+      this.preCancelledFlowIds.delete(oldest.value);
+    this.preCancelledFlowIds.set(flowId, Date.now());
+  }
+
+  /** True (and consumes the record) when a Cancel named `flowId` within the flow deadline. */
+  private takePreCancel(flowId: string): boolean {
+    this.prunePreCancels();
+    return this.preCancelledFlowIds.delete(flowId);
+  }
+
+  /** Drops pre-cancel records older than the longest flow deadline. */
+  private prunePreCancels(): void {
     const cutoff = Date.now() - DEFAULT_SERVER_TIMEOUT_MS;
     for (const [id, cancelledAt] of this.preCancelledFlowIds) {
       if (cancelledAt < cutoff) this.preCancelledFlowIds.delete(id);
     }
-    if (CALLER_FLOW_ID_PATTERN.test(flowId)) this.preCancelledFlowIds.set(flowId, Date.now());
   }
 
   async startServerFlow(input: {
@@ -1669,9 +1709,20 @@ export class McpOauthService {
     pendingServer?: MCPOAuthPendingServerConfig;
     flowId?: string;
   }): Promise<Result<{ flowId: string; authorizeUrl: string; redirectUri: string }, string>> {
-    const prepared = await this.prepareFlowStart(input);
-    if (!prepared.success) return prepared;
-    const { flowId, server } = prepared.data;
+    return this.withReservedFlowId(input.flowId, (flowId) => this.launchServerFlow(input, flowId));
+  }
+
+  private async launchServerFlow(
+    input: {
+      projectPath: string;
+      serverName: string;
+      redirectUri: string;
+      pendingServer?: MCPOAuthPendingServerConfig;
+    },
+    flowId: string
+  ): Promise<Result<{ flowId: string; authorizeUrl: string; redirectUri: string }, string>> {
+    const server = await this.prepareFlowStart(input, flowId);
+    if (!server.success) return server;
 
     let redirectUri: URL;
     try {
@@ -1689,7 +1740,7 @@ export class McpOauthService {
 
     // Registered before any network request, like the desktop flow (#6164).
     const flow: ServerFlow = {
-      ...this.newFlowBase(input, server, redirectUri.toString()),
+      ...this.newFlowBase(input, server.data, redirectUri.toString()),
       timeout: setTimeout(() => {
         void this.finishServerFlow(flowId, Err("Timed out waiting for OAuth callback"));
       }, DEFAULT_SERVER_TIMEOUT_MS),
@@ -1699,7 +1750,7 @@ export class McpOauthService {
     };
     this.serverFlows.set(flowId, flow);
 
-    const started = await this.beginAuthorization(flow, server.oauth);
+    const started = await this.beginAuthorization(flow, server.data.oauth);
     if (!started.success) {
       await this.finishServerFlow(flowId, started);
       return started;
@@ -1786,12 +1837,15 @@ export class McpOauthService {
     return result;
   }
 
-  private captureTelemetry(payload: Parameters<TelemetryService["capture"]>[0]): void {
+  /** False when capture threw (see OAuthFlowBase.startReported). */
+  private captureTelemetry(payload: Parameters<TelemetryService["capture"]>[0]): boolean {
     try {
       this.telemetryService?.capture(payload);
+      return true;
     } catch (error) {
       // Telemetry must never block or crash OAuth flows.
       log.debug("[MCP OAuth] Failed to capture telemetry", { error });
+      return false;
     }
   }
 
