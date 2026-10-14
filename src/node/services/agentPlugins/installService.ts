@@ -1439,18 +1439,15 @@ export class AgentPluginInstallService {
     subpath?: string
   ): Promise<{ dir: string; sha: string }> {
     const dir = await this.createStagingDir();
-    let sha: string;
     try {
       if (resolved.refType === "commit") {
         await this.fetchExactSha(url, resolved.sha, dir, subpath);
       } else {
         await this.cloneRef(url, resolved.ref, dir, subpath);
       }
-      sha = (await runGit(["-C", dir, "rev-parse", "HEAD"])).trim();
+      const sha = (await runGit(["-C", dir, "rev-parse", "HEAD"])).trim();
       assert(isFullCommitSha(sha), "cloneResolved: rev-parse HEAD must be a full SHA");
-      if (subpath === undefined) {
-        await this.assertStagedTreeWithinQuota(dir);
-      }
+      return { dir: await this.stagedPluginRoot(dir, subpath, url, sha), sha };
     } catch (error) {
       await this.removeDir(dir);
       // A missing or non-folder subpath is a clear user-facing error of its
@@ -1460,9 +1457,6 @@ export class AgentPluginInstallService {
       }
       throw new Error(`Failed to clone ${url}: ${getErrorMessage(error)}`);
     }
-    return subpath === undefined
-      ? { dir, sha }
-      : { dir: await this.extractSubpath(dir, subpath, url, sha), sha };
   }
 
   /**
@@ -1500,14 +1494,29 @@ export class AgentPluginInstallService {
           `The remote moved since the preview (expected ${sha.slice(0, 12)}, got ${head.slice(0, 12)}). Run the preview again.`
         );
       }
-      if (subpath === undefined) {
-        await this.assertStagedTreeWithinQuota(dir);
-      }
+      return await this.stagedPluginRoot(dir, subpath, source.url, sha);
     } catch (error) {
       await this.removeDir(dir);
       throw error instanceof Error ? error : new Error(getErrorMessage(error));
     }
-    return subpath === undefined ? dir : this.extractSubpath(dir, subpath, source.url, sha);
+  }
+
+  /**
+   * The staged plugin root of a verified clone: the whole checkout for a
+   * root install, or only `subpath` (see extractSubpath). Both run the
+   * staged-tree quota and symlink checks on the tree that gets installed.
+   */
+  private async stagedPluginRoot(
+    dir: string,
+    subpath: string | undefined,
+    url: string,
+    sha: string
+  ): Promise<string> {
+    if (subpath === undefined) {
+      await this.assertStagedTreeWithinQuota(dir);
+      return dir;
+    }
+    return this.extractSubpath(dir, subpath, url, sha);
   }
 
   /**
@@ -1532,10 +1541,7 @@ export class AgentPluginInstallService {
       ],
       { diskQuota: this.cloneDiskQuota(dir) }
     );
-    if (subpath !== undefined) {
-      const head = (await runGit(["-C", dir, "rev-parse", "HEAD"])).trim();
-      await this.narrowToSubpath(dir, "HEAD", subpath, url, head);
-    }
+    await this.narrowToSubpath(dir, "HEAD", subpath, url);
   }
 
   private async fetchExactSha(
@@ -1555,9 +1561,7 @@ export class AgentPluginInstallService {
     );
     // Must precede the checkout: a full checkout would materialize (and
     // lazy-fetch) the whole monorepo before narrowing.
-    if (subpath !== undefined) {
-      await this.narrowToSubpath(dir, "FETCH_HEAD", subpath, url, sha);
-    }
+    await this.narrowToSubpath(dir, "FETCH_HEAD", subpath, url);
     await runGit(
       ["-C", dir, "-c", "advice.detachedHead=false", "checkout", "--quiet", "FETCH_HEAD"],
       { diskQuota }
@@ -1572,16 +1576,20 @@ export class AgentPluginInstallService {
    * BEFORE any subpath blob is fetched. `ls-tree` compares exact names, which
    * also defeats case-insensitive filesystem matches (`Pstack` vs `pstack`).
    * Registry entries and direct API sources never passed the parser, so the
-   * subpath is re-validated here.
+   * subpath is re-validated here. A root install (no subpath) keeps the
+   * full checkout.
    */
   private async narrowToSubpath(
     dir: string,
     rev: "HEAD" | "FETCH_HEAD",
-    subpath: string,
-    url: string,
-    sha: string
+    subpath: string | undefined,
+    url: string
   ): Promise<void> {
+    if (subpath === undefined) {
+      return;
+    }
     assertNormalizedSubpath(subpath);
+    const sha = (await runGit(["-C", dir, "rev-parse", rev])).trim();
     const segments = subpath.split("/");
     for (let depth = 1; depth <= segments.length; depth++) {
       const prefix = segments.slice(0, depth).join("/");
