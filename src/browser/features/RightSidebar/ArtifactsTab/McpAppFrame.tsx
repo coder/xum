@@ -316,10 +316,11 @@ function containerDimensionsOf(container: HTMLElement | null, inline: boolean) {
  * - `flush()` sends dimensions that changed since: the host drops updates until the view sent
  *   initialized, so a resize between the two is sent then.
  */
-/** The containerDimensions of a ui/initialize reply's host context, if `message` is one. */
-function postedContainerDimensions(message: unknown): unknown {
+/** Record the containerDimensions a ui/initialize reply carries as sent, if `message` is one. */
+function rememberPostedDimensions(sent: { current: string }, message: unknown) {
   const reply = message as { result?: { hostContext?: { containerDimensions?: unknown } } };
-  return reply.result?.hostContext?.containerDimensions;
+  const dimensions = reply.result?.hostContext?.containerDimensions;
+  if (dimensions !== undefined) sent.current = JSON.stringify(dimensions);
 }
 
 function useContainerDimensionsUpdates(hostRef: { current: McpAppHost | null }, inline: boolean) {
@@ -355,10 +356,7 @@ function useContainerDimensionsUpdates(hostRef: { current: McpAppHost | null }, 
     attach,
     inlineCap,
     current: () => containerDimensionsOf(containerRef.current, inline),
-    posted: (message: unknown) => {
-      const dimensions = postedContainerDimensions(message);
-      if (dimensions !== undefined) sent.current = JSON.stringify(dimensions);
-    },
+    posted: (message: unknown) => rememberPostedDimensions(sent, message),
     flush: () => flushRef.current(),
   };
 }
