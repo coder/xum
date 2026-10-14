@@ -64,7 +64,9 @@ function mapModel(value: unknown): string | undefined {
  * Returns `raw` unchanged when it already uses Xum's format.
  */
 export function mapForeignPluginAgentFrontmatter(
-  raw: Record<string, unknown>
+  raw: Record<string, unknown>,
+  /** The file's agent ID: both ecosystems load a plugin agent without `name` under its filename. */
+  agentId: string
 ): Record<string, unknown> {
   if (isXumFormat(raw)) return raw;
 
@@ -81,6 +83,7 @@ export function mapForeignPluginAgentFrontmatter(
 
   const mapped: Record<string, unknown> = {
     ...raw,
+    name: raw.name ?? agentId,
     // Omitted tools inherit every tool in both ecosystems: Exec is Xum's
     // all-tools agent. Cursor `readonly: true` narrows to Explore (no file
     // edits or task spawning). Explore keeps bash, so it is not fully read-only.

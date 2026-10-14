@@ -107,11 +107,12 @@ Body
 
   describe("plugin source (Claude Code / Cursor format)", () => {
     function parse(frontmatter: string, source?: "plugin") {
+      // The fixture file is agents/file-id.md.
       const content = `---\n${frontmatter}\n---\nBody\n`;
       return parseAgentDefinitionMarkdown({
         content,
         byteSize: Buffer.byteLength(content, "utf-8"),
-        ...(source != null ? { source } : {}),
+        ...(source != null ? { plugin: { agentId: "file-id" } } : {}),
       }).frontmatter;
     }
 
@@ -128,6 +129,15 @@ Body
         subagent: { runnable: true },
         prompt: { append: false },
       });
+    });
+
+    test("a plugin agent without name loads under its file's agent ID", () => {
+      expect(parse("description: d", "plugin").name).toBe("file-id");
+      expect(parse("name: Named\ndescription: d", "plugin").name).toBe("Named");
+      // A Xum-format file still requires name.
+      expect(() => parse("description: d\nbase: exec", "plugin")).toThrow(
+        AgentDefinitionParseError
+      );
     });
 
     test("maps model, effort and readonly", () => {

@@ -26,11 +26,11 @@ function assertObject(value: unknown, message: string): asserts value is Record<
 
 function mapFrontmatterForSource(
   raw: Record<string, unknown>,
-  source: "plugin" | undefined
+  plugin: { agentId: string } | undefined
 ): Record<string, unknown> {
-  if (source !== "plugin") return raw;
+  if (plugin == null) return raw;
   try {
-    return mapForeignPluginAgentFrontmatter(raw);
+    return mapForeignPluginAgentFrontmatter(raw, plugin.agentId);
   } catch (err) {
     throw new AgentDefinitionParseError(getErrorMessage(err));
   }
@@ -43,14 +43,14 @@ function mapFrontmatterForSource(
  * - Enforces the shared 1MB max file size
  * - Requires YAML frontmatter delimited by `---` on its own line at the top
  *
- * `source: "plugin"` maps Claude Code / Cursor format agents to Xum fields
+ * `plugin` (the file's agent ID) maps Claude Code / Cursor format agents to Xum fields
  * (see pluginAgentFormat.ts). Every plugin agent read must pass it, consent
  * fingerprints included, so they describe the policy that actually runs.
  */
 export function parseAgentDefinitionMarkdown(input: {
   content: string;
   byteSize: number;
-  source?: "plugin";
+  plugin?: { agentId: string };
 }): ParsedAgentDefinitionMarkdown {
   if (input.byteSize > MAX_FILE_SIZE) {
     const sizeMB = (input.byteSize / (1024 * 1024)).toFixed(2);
@@ -96,7 +96,7 @@ export function parseAgentDefinitionMarkdown(input: {
   assertObject(raw, "Agent definition YAML frontmatter must be a mapping/object.");
 
   const parsed = AgentDefinitionFrontmatterSchema.safeParse(
-    mapFrontmatterForSource(raw, input.source)
+    mapFrontmatterForSource(raw, input.plugin)
   );
   if (!parsed.success) {
     throw new AgentDefinitionParseError(

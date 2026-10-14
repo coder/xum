@@ -334,8 +334,11 @@ function getAgentIdFromFilename(filename: string): AgentId | null {
 }
 
 /** Plugin agents parse with the Claude Code / Cursor format mapping (pluginAgentFormat.ts). */
-function parseSource(pluginRoot: string | undefined): { source?: "plugin" } {
-  return pluginRoot != null ? { source: "plugin" } : {};
+function parseSource(
+  pluginRoot: string | undefined,
+  agentId: AgentId
+): { plugin?: { agentId: string } } {
+  return pluginRoot != null ? { plugin: { agentId } } : {};
 }
 
 async function readAgentDescriptorFromFile(
@@ -401,7 +404,11 @@ async function readAgentDescriptorFromFile(
   }
 
   try {
-    const parsed = parseAgentDefinitionMarkdown({ content, byteSize, ...parseSource(pluginRoot) });
+    const parsed = parseAgentDefinitionMarkdown({
+      content,
+      byteSize,
+      ...parseSource(pluginRoot, agentId),
+    });
 
     const { selectable } = resolveAgentVisibility(parsed.frontmatter.ui);
 
@@ -746,7 +753,7 @@ async function loadAgentDefinition(
       const parsed = parseAgentDefinitionMarkdown({
         content,
         byteSize,
-        ...parseSource(candidate.pluginRoot),
+        ...parseSource(candidate.pluginRoot, agentId),
       });
 
       const pkg: AgentDefinitionPackage = {

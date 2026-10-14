@@ -2855,6 +2855,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "| Plugin field                         | Xum meaning                                                                         |",
       "| ------------------------------------ | ----------------------------------------------------------------------------------- |",
       "| (always)                             | `base: exec`, `subagent.runnable: true`, `ui.hidden: true`, `prompt.append: false`  |",
+      "| `name` omitted                       | The file name (agent id), as both tools do for plugin agents                        |",
       "| `readonly: true` (Cursor)            | `base: explore` instead (no file edits or task spawning; bash stays)                |",
       "| `model`                              | `ai.model` for an alias or a known Claude ID. Other values use the inherited model. |",
       "| `effort` (Claude Code)               | `ai.thinkingLevel`, when it is a valid thinking level                               |",

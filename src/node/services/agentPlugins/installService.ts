@@ -1880,7 +1880,7 @@ export class AgentPluginInstallService {
         frontmatter = parseAgentDefinitionMarkdown({
           content,
           byteSize: stat.size,
-          source: "plugin",
+          plugin: { agentId: agentIdParse.data },
         }).frontmatter;
       } catch {
         continue;
