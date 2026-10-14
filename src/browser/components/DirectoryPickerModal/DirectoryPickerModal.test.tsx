@@ -141,6 +141,23 @@ describe.each([...GAP_MODES])("DirectoryPickerModal across a reconnect (%s)", (m
     expect(input.value).toBe("/home/b");
   });
 
+  // A click while offline loads nothing, so the reconnect must reload the shown directory.
+  test("a click while offline does not change the directory the reconnect reloads", async () => {
+    const { view, input } = renderPicker();
+    await view.findByText("b");
+
+    await harness.drop();
+    fireEvent.click(view.getByText("b"));
+    await view.findByText("Not connected to server");
+    harness.reconnect();
+    await waitFor(() => expect(listed).toEqual(["/home", "/home"]));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    });
+    expect(listed).not.toContain("/home/b");
+    expect(input.value).toBe("/home");
+  });
+
   // Add Project loads its default clone directory after a reconnect, which changes initialPath.
   test("a new initialPath while open keeps the typed path", async () => {
     const { input, rerender } = renderPicker("~");

@@ -81,7 +81,8 @@ export const DirectoryPickerModal: React.FC<DirectoryPickerModalProps> = ({
   const [showHiddenFiles, setShowHiddenFiles] = useState(false);
   const [selection, setSelection] = useState<Selection>({ index: 0, path: null });
   const treeRef = useRef<HTMLDivElement>(null);
-  // The directory shown, or the last one requested: a reconnect reloads it (#6383).
+  // The directory shown (set on a successful load only): a reconnect reloads it (#6383). A click
+  // while offline loads nothing, so it must not move this.
   const currentPathRef = useRef(initialPath || ".");
   // Whether this open ran its setup, so it runs once per open (#6383): a reconnect (a new client)
   // or a new initialPath while open (Add Project loads its clone default late) must not redo it.
@@ -96,7 +97,6 @@ export const DirectoryPickerModal: React.FC<DirectoryPickerModalProps> = ({
   const loadDirectory = useCallback(
     async (path: string, keepSelection = false) => {
       const seq = ++loadSeqRef.current;
-      currentPathRef.current = path;
       if (!liveApi) {
         setError("Not connected to server");
         return;
@@ -144,6 +144,8 @@ export const DirectoryPickerModal: React.FC<DirectoryPickerModalProps> = ({
     loadedClientRef.current = liveApi;
     if (!isSetUpRef.current) {
       isSetUpRef.current = true;
+      // Opened offline, the reconnect loads the initial directory.
+      currentPathRef.current = initialPath || ".";
       setPathInput(initialPath || "");
       setShowHiddenFiles(false);
       void loadDirectory(initialPath || ".");
