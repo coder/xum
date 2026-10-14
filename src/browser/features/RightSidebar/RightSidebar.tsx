@@ -118,6 +118,7 @@ import {
 import {
   RightSidebarTabStrip,
   getTabName,
+  isSidebarControlTarget,
   type TabDragData,
 } from "@/browser/features/RightSidebar/RightSidebarTabStrip";
 import {
@@ -437,6 +438,32 @@ interface RightSidebarTabsetNodeProps {
   showTabShortcuts: boolean;
 }
 
+/** A tabset pane's root element: using anything inside the pane focuses the pane. */
+const TabsetPaneRoot: React.FC<{
+  tabsetId: string;
+  setLayout: RightSidebarTabsetNodeProps["setLayout"];
+  children: React.ReactNode;
+}> = (props) => {
+  const setFocused = (event: React.SyntheticEvent) => {
+    // The collapse button sits in one pane's strip but acts on the whole sidebar, so Expand
+    // later returns to the pane the user was in.
+    if (isSidebarControlTarget(event.target)) return;
+    props.setLayout((prev) => setFocusedTabset(prev, props.tabsetId));
+  };
+  return (
+    // Keyboard focus moving into a pane (Tab, a launcher or terminal taking focus) focuses it
+    // too, not just a click, so pane-scoped shortcuts act on the pane the user is in.
+    <div
+      className="flex min-h-0 min-w-0 flex-1 flex-col"
+      data-tabset-id={props.tabsetId}
+      onMouseDownCapture={setFocused}
+      onFocusCapture={setFocused}
+    >
+      {props.children}
+    </div>
+  );
+};
+
 const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) => {
   const tabsetBaseId = `${props.baseId}-${props.node.id}`;
   const { api } = useAPI();
@@ -478,10 +505,6 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
   const showDockHints =
     props.isDraggingTab &&
     (isOverContent || isOverTop || isOverBottom || isOverLeft || isOverRight);
-
-  const setFocused = () => {
-    props.setLayout((prev) => setFocusedTabset(prev, props.node.id));
-  };
 
   const selectTab = (tab: TabType) => {
     if (isTerminalTab(tab)) {
@@ -649,14 +672,7 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
   };
 
   return (
-    // Keyboard focus moving into a pane (Tab, a launcher or terminal taking focus) focuses it
-    // too, not just a click, so pane-scoped shortcuts act on the pane the user is in.
-    <div
-      className="flex min-h-0 min-w-0 flex-1 flex-col"
-      data-tabset-id={props.node.id}
-      onMouseDownCapture={setFocused}
-      onFocusCapture={setFocused}
-    >
+    <TabsetPaneRoot tabsetId={props.node.id} setLayout={props.setLayout}>
       <SortableContext items={sortableIds} strategy={rectSortingStrategy}>
         <RightSidebarTabStrip
           ariaLabel="Sidebar views"
@@ -830,7 +846,7 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
           );
         })}
       </div>
-    </div>
+    </TabsetPaneRoot>
   );
 };
 

@@ -191,11 +191,17 @@ const TabCloseButton: React.FC<{
   </button>
 );
 
+/** True inside a strip control that acts on the whole sidebar: using it must not focus its pane. */
+export function isSidebarControlTarget(target: EventTarget): boolean {
+  return target instanceof Element && target.closest("[data-sidebar-control]") != null;
+}
+
 /** Icon button after the tabs ("+", collapse). */
 const StripIconButton: React.FC<{
   label: string;
   shortcut?: string;
   isDesktop: boolean;
+  sidebarControl?: boolean;
   className?: string;
   onClick: () => void;
   children: React.ReactNode;
@@ -204,6 +210,7 @@ const StripIconButton: React.FC<{
     <TooltipTrigger asChild>
       <button
         type="button"
+        data-sidebar-control={props.sidebarControl ? "" : undefined}
         className={cn(
           "text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent flex shrink-0 items-center justify-center rounded-md p-1 transition-colors focus-visible:ring-1",
           props.isDesktop && "titlebar-no-drag",
@@ -305,6 +312,10 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
         // Capped inset: the tabs live in one scrolling row, so the full overlay inset on a
         // narrow pane would shrink that row to zero and hide every tab.
         "border-border-light titlebar-safe-right-capped titlebar-safe-right-gutter-2 flex min-w-0 items-center gap-1 border-b px-2 py-1.5 transition-colors",
+        // With the collapse button, a pane at its minimum width cannot fit both buttons: overflow
+        // on the left (the Panel clips it) so the collapse button stays visible. With room to
+        // spare, the collapse button's ml-auto takes the free space and this has no effect.
+        "has-[[data-sidebar-control]]:justify-end",
         isDesktop && DESKTOP_TITLEBAR_MIN_HEIGHT_CLASS,
         showDropHighlight && "bg-accent/30",
         isDraggingFromHere && "bg-accent/10",
@@ -346,7 +357,9 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
         <StripIconButton
           label="Collapse sidebar"
           isDesktop={isDesktop}
-          className="ml-auto"
+          sidebarControl
+          // Above the phone breakpoint the global 44px touch floor does not apply.
+          className="ml-auto [@media(pointer:coarse)]:min-h-11 [@media(pointer:coarse)]:min-w-11"
           onClick={onCollapseSidebar}
         >
           <PanelRightClose className="h-3.5 w-3.5" />

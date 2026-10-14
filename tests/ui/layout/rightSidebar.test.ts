@@ -566,6 +566,58 @@ describeIntegration("RightSidebar (UI)", () => {
     }
   }, 60_000);
 
+  test("collapsing from the top pane keeps the focused pane for Expand", async () => {
+    const splitLayout: RightSidebarLayoutState = {
+      version: 1,
+      openTabsOnly: true,
+      nextId: 10,
+      root: {
+        type: "split",
+        id: "split-1",
+        direction: "horizontal",
+        sizes: [50, 50],
+        children: [
+          { type: "tabset", id: "tabset-top", tabs: ["review"], activeTab: "review" },
+          { type: "tabset", id: "tabset-bottom", tabs: ["costs"], activeTab: "costs" },
+        ],
+      },
+      focusedTabsetId: "tabset-bottom",
+    };
+    const { view, sidebar, cleanup } = await setupRightSidebarView(() => {
+      updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, false);
+      updatePersistedState(getRightSidebarLayoutKey(workspaceId), splitLayout);
+    });
+
+    try {
+      const collapseButton = await findRequiredElement(
+        sidebar,
+        'button[aria-label="Collapse sidebar"]',
+        "Collapse button not found"
+      );
+      // A real click: mousedown, then focus, then click.
+      fireEvent.mouseDown(collapseButton);
+      collapseButton.focus();
+      fireEvent.mouseUp(collapseButton);
+      fireEvent.click(collapseButton);
+
+      const collapsedSidebar = view.container.querySelector(
+        '[role="complementary"][aria-label="Workspace insights"]'
+      )!;
+      const expandButton = await findRequiredElement(
+        collapsedSidebar,
+        'button[aria-label="Expand sidebar"]',
+        "Expand button not found"
+      );
+      fireEvent.click(expandButton);
+
+      await waitFor(() =>
+        expect(activeTabDescription()).toMatch(/^tab .*-tabset-bottom-panel-costs$/)
+      );
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
   test("the header's stand-in for the overview card expands the sidebar onto its focused tab", async () => {
     const { view, cleanup } = await setupRightSidebarView(() => {
       updatePersistedState(RIGHT_SIDEBAR_COLLAPSED_KEY, true);

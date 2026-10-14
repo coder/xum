@@ -248,3 +248,16 @@ export const Wide: Story = {
     await expect(strip.right - collapse.right).toBeLessThanOrEqual(9);
   },
 };
+export const Cramped: Story = {
+  // A split pane at its minimum width (15% of a 300 px sidebar) has no room for both buttons.
+  args: { width: 45, collapsible: true },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const collapse = canvas
+      .getByRole("button", { name: "Collapse sidebar" })
+      .getBoundingClientRect();
+    const strip = canvas.getByRole("tablist").parentElement!.getBoundingClientRect();
+    await expect(collapse.left).toBeGreaterThanOrEqual(strip.left);
+    await expect(collapse.right).toBeLessThanOrEqual(strip.right);
+  },
+};
