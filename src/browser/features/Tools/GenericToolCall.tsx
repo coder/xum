@@ -89,6 +89,16 @@ const OpenMcpAppViewButton: React.FC<{ workspaceId: string; view: McpAppViewRef 
 };
 
 /**
+ * Whether the card shows the "Open in tab" placeholder instead of a frame: while the view's tab
+ * has it, or always once the view turned out to be fullscreen only.
+ */
+function useMcpAppViewHostedElsewhere(workspaceId: string, toolCallId: string): boolean {
+  const inTab = useMcpAppViewInTab(workspaceId, toolCallId, ["tab"]);
+  const fullscreenOnly = useMcpAppViewFullscreenOnly(workspaceId, toolCallId);
+  return inTab || fullscreenOnly;
+}
+
+/**
  * Expanded body of a call with an app view: the view itself (the spec's inline display mode),
  * with the raw input/output behind a toggle. The raw JSON renders below the view instead of
  * replacing it, so toggling never reloads the view or loses its state. Falls back to the raw
@@ -101,8 +111,7 @@ const McpAppToolDetails: React.FC<{
 }> = (props) => {
   // A failed call's error is in the raw output: show it without a click.
   const [showRaw, setShowRaw] = React.useState(props.view.failed);
-  const inTab = useMcpAppViewInTab(props.workspaceId, props.view.toolCallId, ["tab"]);
-  const fullscreenOnly = useMcpAppViewFullscreenOnly(props.workspaceId, props.view.toolCallId);
+  const elsewhere = useMcpAppViewHostedElsewhere(props.workspaceId, props.view.toolCallId);
   const supported = useMcpAppViewsSupported();
   const { workspaceId, view } = props;
   // An expanded card is where the view goes back to on inline (ui/request-display-mode).
@@ -113,7 +122,7 @@ const McpAppToolDetails: React.FC<{
   if (!supported) return <ToolDetails>{props.raw}</ToolDetails>;
   return (
     <ToolDetails>
-      {inTab || fullscreenOnly ? (
+      {elsewhere ? (
         // One live instance per view: while its tab has it, the card shows this
         // instead of a second frame. Closing the tab brings the view back here, unless the
         // view declared fullscreen only: it is never hosted inline, so the card keeps this.
