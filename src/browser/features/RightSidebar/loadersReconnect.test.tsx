@@ -45,6 +45,8 @@ let answerInstructions: () => Promise<unknown>;
 let answerChatInstructions: () => Promise<unknown>;
 let answerOverride: () => Promise<unknown>;
 let savedOverrides: unknown[] = [];
+/** What each goalDefaults.set answers (after it is recorded in savedOverrides). */
+let answerSet: () => Promise<void> = () => Promise.resolve();
 let savedChatInstructions: Array<{ content: string; enabled: boolean }> = [];
 let failChatSave: Error | null = null;
 
@@ -75,7 +77,7 @@ function serverOverrides(): TestApiOverrides<APIClient> {
         get: () => answerOverride(),
         set: (input: unknown) => {
           savedOverrides.push(input);
-          return Promise.resolve();
+          return answerSet();
         },
       },
     },
@@ -337,6 +339,8 @@ describe("loaded panes of another workspace", () => {
     cleanupDom = installDom();
     window.localStorage.clear();
     harness = createConnectionHarness("kept-gap", serverOverrides);
+    savedOverrides = [];
+    answerSet = () => Promise.resolve();
   });
 
   afterEach(() => {
@@ -360,5 +364,35 @@ describe("loaded panes of another workspace", () => {
     view.rerender(<GoalDefaultsSection workspaceId="ws-2" embedded />);
     await waitFor(() => expect(view.queryByText("Loading…")).not.toBeNull());
     expect(view.queryByLabelText("Workspace default goal turn cap")).toBeNull();
+  });
+
+  // Writes run in order, and each writes the whole override. An older write that failed is
+  // superseded by a newer one that succeeded: its error must not stay on screen.
+  test("an older failed write leaves no error after a newer write succeeded", async () => {
+    answerOverride = () => Promise.resolve(turnCapOverride(5));
+    const view = render(<GoalDefaultsSection workspaceId="ws-1" embedded />, {
+      wrapper: Wrapper,
+    });
+    const turnCap = () =>
+      view.getByLabelText("Workspace default goal turn cap") as HTMLInputElement;
+    await waitFor(() => expect(turnCap().value).toBe("5"));
+
+    let failFirst: ((error: Error) => void) | null = null;
+    const answers = [
+      () => new Promise<void>((_resolve, reject) => (failFirst = reject)),
+      () => Promise.resolve(),
+    ];
+    answerSet = () => answers.shift()?.() ?? Promise.resolve();
+    fireEvent.change(turnCap(), { target: { value: "8" } });
+    fireEvent.blur(turnCap());
+    fireEvent.change(turnCap(), { target: { value: "9" } });
+    fireEvent.blur(turnCap());
+    await waitFor(() => expect(failFirst).not.toBeNull());
+
+    act(() => failFirst?.(new Error("write failed")));
+    await waitFor(() => expect(savedOverrides).toHaveLength(2));
+    await flush();
+    expect(view.queryByText("write failed") == null).toBe(true);
+    expect(turnCap().value).toBe("9");
   });
 });

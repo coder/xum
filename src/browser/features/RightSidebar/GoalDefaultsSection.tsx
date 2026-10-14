@@ -184,11 +184,16 @@ function useWorkspaceGoalOverride(workspaceId: string, onPersist: (() => void) |
     if (liveApi == null) return;
     setOverride(next);
     setSaveError(null);
+    // Each write stores the whole override, so a newer write supersedes an older one. Only the
+    // latest write reports a failure: an older one's error must not stay after it succeeded.
+    const thisWrite = writer.writeCount(workspaceId) + 1;
     writer.write(liveApi, {
       workspaceId,
       override: next,
       onSaved: onPersist,
-      onFailed: (error) => setSaveError(getErrorMessage(error)),
+      onFailed: (error) => {
+        if (writer.writeCount(workspaceId) === thisWrite) setSaveError(getErrorMessage(error));
+      },
     });
   };
 
