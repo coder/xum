@@ -793,5 +793,22 @@ describe("useBoundedTranscriptReveal", () => {
       expect(reveal().toIndex).toBe(props().messages.length);
       expect(props().messages.findIndex((row) => row.id === "v3")).toBe(toIndex - 21);
     });
+
+    test("a regrouping that pulls the start back near the limit is charged to the budget", () => {
+      // 480 of the 500-row budget revealed; a new bundle then spans the start and pulls it back.
+      // 300 rows pass the budget (pause); 10 rows do not (the reveal goes on: charged once only).
+      for (const pulled of [300, 10]) {
+        const { frames, reveal, runFrames, setProps } = renderSlice();
+        runFrames();
+        act(() => reveal().revealMore());
+        for (let step = 0; step < 8; step += 1) act(() => frames.flush());
+        const from = reveal().fromIndex;
+        setProps({ isSafeCut: (i) => bundled(i) && !(i > from - pulled && i <= from) });
+        expect(reveal().fromIndex).toBe(from - pulled);
+        expect(reveal().isRevealPaused).toBe(pulled === 300);
+        expect(frames.hasPending()).toBe(pulled !== 300);
+        cleanup();
+      }
+    });
   });
 });

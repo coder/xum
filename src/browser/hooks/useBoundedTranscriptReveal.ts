@@ -439,19 +439,20 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
       current = { ...current, anchorIndexHint: anchorIndex };
       setState(current);
     }
-    fromIndex = nearestSafeCutAtOrBefore(
-      anchorIndex === -1 ? current.anchorIndexHint : anchorIndex,
-      length,
-      args.isSafeCut
-    );
+    const boundary = anchorIndex === -1 ? current.anchorIndexHint : anchorIndex;
+    fromIndex = nearestSafeCutAtOrBefore(boundary, length, args.isSafeCut);
+    // A boundary pulled back to a bundle head mounts rows outside any step: charge them to the
+    // budget in the same update that moves the anchor (the next step starts from fromIndex).
+    const revealedRows = current.revealedRows + boundary - fromIndex;
     if (fromIndex === 0) {
-      current = { ...current, anchorMessageId: null, anchorIndexHint: 0 };
+      current = { ...current, anchorMessageId: null, anchorIndexHint: 0, revealedRows };
       setState(current);
     } else if (fromIndex < length && args.messages[fromIndex].id !== current.anchorMessageId) {
       current = {
         ...current,
         anchorMessageId: args.messages[fromIndex].id,
         anchorIndexHint: fromIndex,
+        revealedRows,
       };
       setState(current);
     }
