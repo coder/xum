@@ -642,8 +642,12 @@ export class DraftService extends EventEmitter {
         throw new Error(`Draft move refused: project ${dest.projectPath} is not configured`);
       }
       const revision = this.getRevision(draftScopeKey(source));
-      if (stored !== null && revision !== input.sourceRevision) {
-        return { result: "changed", revision };
+      // Only a client that knows of no stored source moves a missing one: after a confirmed
+      // revision, a missing source was deleted or moved away meanwhile (`present` tells it apart
+      // from an edit, which the client retries).
+      const unchangedMissing = stored === null && input.sourceRevision === null;
+      if (!unchangedMissing && revision !== input.sourceRevision) {
+        return { result: "changed", revision, present: stored !== null };
       }
       return this.moveStoredCreation(input, stored ?? emptyStoredDraft());
     });
@@ -659,22 +663,26 @@ export class DraftService extends EventEmitter {
     if (stored.pendingSends.length > 0) {
       throw new Error("Draft move refused: the source draft has pending sends");
     }
-    if (!isStoredDraftEmpty(stored)) await this.persist(dest, this.filePathFor(dest), stored);
-    // Before the list write: writing a missing or damaged list relists every unlisted body.
-    await this.persist(source, this.filePathFor(source), emptyStoredDraft());
     const row: DraftListEntry = {
       projectPath: dest.projectPath,
       draftId: dest.draftId,
       subProjectPath: input.subProjectPath,
       createdAt: input.createdAt,
     };
-    // The destination may hold a synthesized row: its body's relisting after a crashed attempt.
-    const listRevision = await this.mutateList((entries) => [
-      ...entries.filter(
-        (listed) => ![source, dest].some((scope) => isSameListEntry(listed, scope))
-      ),
-      toApiEntry(row),
-    ]);
+    // The bodies are written under the list lock, after its version check: a list this version
+    // must not rewrite (a downgrade) refuses the move before the source goes.
+    const listRevision = await this.mutateList(async (entries) => {
+      if (!isStoredDraftEmpty(stored)) await this.persist(dest, this.filePathFor(dest), stored);
+      // Before the list write: writing a missing or damaged list relists every unlisted body.
+      await this.persist(source, this.filePathFor(source), emptyStoredDraft());
+      // The destination may hold a synthesized row: its body's relisting after a crashed attempt.
+      return [
+        ...entries.filter(
+          (listed) => ![source, dest].some((scope) => isSameListEntry(listed, scope))
+        ),
+        toApiEntry(row),
+      ];
+    });
     return this.movedOutput(dest, listRevision);
   }
 

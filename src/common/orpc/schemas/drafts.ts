@@ -293,7 +293,8 @@ export const DraftMoveCreationInputSchema = z.object({
 
 /**
  * "moved": the destination's stored view and the list revision. "changed": the source changed
- * since `sourceRevision` (its current revision); nothing was written.
+ * since `sourceRevision` (its current revision, and whether a body is stored: a source that is
+ * gone was deleted or moved away); nothing was written.
  */
 export const DraftMoveCreationOutputSchema = z.discriminatedUnion("result", [
   z.object({
@@ -301,7 +302,7 @@ export const DraftMoveCreationOutputSchema = z.discriminatedUnion("result", [
     dest: DraftWriteOutputSchema,
     listRevision: DraftRevisionSchema,
   }),
-  z.object({ result: z.literal("changed"), revision: DraftRevisionSchema }),
+  z.object({ result: z.literal("changed"), revision: DraftRevisionSchema, present: z.boolean() }),
 ]);
 
 /** A creation draft deleted by a project removal (never the default draft). */
