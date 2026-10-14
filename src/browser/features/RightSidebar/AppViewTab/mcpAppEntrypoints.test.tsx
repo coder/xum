@@ -674,8 +674,11 @@ describe("MCP App entry points", () => {
         await openMcpAppEntrypoint(client, "ws-rerun", target, () => undefined);
       });
       await waitFor(() => expect(loads).toBe(2));
-      // Exactly one reload: waitFor alone would also pass on the way to a third load.
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      // Exactly one reload: waitFor alone would also pass on the way to a third load. Flush
+      // React's pending renders and effects, then check that no further load started.
+      await act(async () => {
+        await Promise.resolve();
+      });
       expect(loads).toBe(2);
     } finally {
       restore();

@@ -1,4 +1,3 @@
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import {
   getAppViewTabKey,
   isNewTab,
@@ -6,7 +5,6 @@ import {
   NEW_TAB,
   type TabType,
 } from "@/browser/types/rightSidebar";
-import { RIGHT_SIDEBAR_TAB_KEY } from "@/common/constants/storage";
 
 export type RightSidebarLayoutNode =
   | {
@@ -103,16 +101,6 @@ export function getDefaultRightSidebarLayoutState(activeTab?: TabType): RightSid
       activeTab: tab,
     },
   };
-}
-
-/**
- * The tool explicitly requested for new layouts (RIGHT_SIDEBAR_TAB_KEY), or undefined: then a
- * workspace starts with just the New tab, which guides the user to the tools. Every writer of
- * a workspace's layout parses with it, so a layout saved before the sidebar mounts matches.
- */
-export function readRequestedRightSidebarTab(): TabType | undefined {
-  const raw = readPersistedState<string | null>(RIGHT_SIDEBAR_TAB_KEY, null);
-  return isTabType(raw) ? raw : undefined;
 }
 
 export function parseRightSidebarLayoutState(
