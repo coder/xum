@@ -77,6 +77,12 @@ import {
   type AgentPluginInfo,
 } from "./discovery";
 import { checkLogoImage } from "./imageHeader";
+import {
+  consentForSelection,
+  serverConsentFingerprint,
+  skillConsentFingerprint,
+  type ComponentConsent,
+} from "./componentConsent";
 import type { OpenAIPluginInterface } from "./openaiExtension";
 import {
   acquirePluginMutationLock,
@@ -200,6 +206,8 @@ function stableStringify(value: unknown): string {
 
 /** Preview skill row plus the extra model-visible fields (see collectSkills). */
 type CollectedPluginSkill = AgentPluginPreviewSkill & {
+  /** Load-time consent fingerprint (componentConsent.ts): root-relative dir + whole SKILL.md. */
+  consentFingerprint: string;
   whenToUse?: string;
   advertise?: boolean;
   paths?: string[];
@@ -214,6 +222,37 @@ type CollectedPluginSkill = AgentPluginPreviewSkill & {
  * display rendering is NOT used for comparison because a multi-line description could
  * imitate it.
  */
+/** Every component of an inventory: what a legacy import-all entry (no selection) imports. */
+function fullSelection(
+  inventory: Pick<AgentPluginComponents, "skills" | "mcpServers">
+): AgentPluginImportedComponents {
+  return {
+    skills: inventory.skills.map((skill) => skill.name),
+    mcpServers: inventory.mcpServers.map((server) => server.serverName),
+  };
+}
+
+/** The consent preview showed every component of the pinned SHA (#6498). */
+function consentAtInstall(
+  importedComponents: AgentPluginImportedComponents | undefined,
+  inventory: Pick<AgentPluginComponents, "skills" | "mcpServers"> & {
+    fingerprints: ComponentConsent;
+  }
+): ComponentConsent {
+  return consentForSelection({
+    selection: importedComponents ?? fullSelection(inventory),
+    shown: inventory.fingerprints,
+  });
+}
+
+function omitConsentFingerprint(
+  skill: CollectedPluginSkill
+): Omit<CollectedPluginSkill, "consentFingerprint"> {
+  const { consentFingerprint, ...rest } = skill;
+  assert(consentFingerprint.length > 0, "collected skills carry a consent fingerprint");
+  return rest;
+}
+
 function describeSkillAdvertisement(skill: CollectedPluginSkill): {
   fingerprint: string;
   display: string;
@@ -1971,6 +2010,10 @@ export class AgentPluginInstallService {
         });
         skills.push({
           name: parsed.frontmatter.name,
+          consentFingerprint: skillConsentFingerprint({
+            relativeDir: path.relative(pluginRoot, path.join(skillsDir, dirName)),
+            content,
+          }),
           ...(parsed.frontmatter.description !== undefined
             ? { description: parsed.frontmatter.description }
             : {}),
@@ -2002,9 +2045,9 @@ export class AgentPluginInstallService {
     finalTargetPath: string,
     instanceId: string,
     warnings: string[]
-  ): Promise<AgentPluginPreviewMcpServer[]> {
+  ): Promise<{ previews: AgentPluginPreviewMcpServer[]; fingerprints: Record<string, string> }> {
     if (plugin.mcpConfigPath === undefined) {
-      return [];
+      return { previews: [], fingerprints: {} };
     }
     const { servers, diagnostics } = await loadPluginMcpServers(plugin, {
       xumHome: this.config.rootDir,
@@ -2013,11 +2056,20 @@ export class AgentPluginInstallService {
     warnings.push(...diagnostics.map((d) => d.message));
 
     const rewrite = (value: string): string => value.split(plugin.rootPath).join(finalTargetPath);
-
-    const result: AgentPluginPreviewMcpServer[] = Object.values(servers).map((info) =>
-      this.describeMcpServer(info, rewrite, finalTargetPath)
-    );
-    return result.sort((a, b) => a.serverName.localeCompare(b.serverName));
+    const paths = {
+      rootPath: plugin.rootPath,
+      dataPath: getPluginDataPath(this.config.rootDir, instanceId),
+    };
+    const fingerprints: Record<string, string> = {};
+    const previews: AgentPluginPreviewMcpServer[] = Object.values(servers).map((info) => {
+      const preview = this.describeMcpServer(info, rewrite, finalTargetPath);
+      fingerprints[preview.serverName] = serverConsentFingerprint(info, paths);
+      return preview;
+    });
+    return {
+      previews: previews.sort((a, b) => a.serverName.localeCompare(b.serverName)),
+      fingerprints,
+    };
   }
 
   /**
@@ -2183,7 +2235,7 @@ export class AgentPluginInstallService {
       await this.assertNoCollision(plugin.name);
 
       const skills = await this.collectSkillsFromRoots(plugin, warnings);
-      const mcpServers = await this.collectMcpServers(
+      const { previews: mcpServers } = await this.collectMcpServers(
         plugin,
         targetPath,
         this.instanceIdFor(plugin.name),
@@ -2219,7 +2271,8 @@ export class AgentPluginInstallService {
           ...manifestSummary(plugin.manifest),
           ...(openaiInterface !== undefined ? { interface: openaiInterface } : {}),
         },
-        skills,
+        // Fingerprints stay in the backend: the preview shows what the components do.
+        skills: skills.map((skill) => omitConsentFingerprint(skill)),
         mcpServers,
         ...(hook !== undefined ? { hook } : {}),
         codexHooks: codexHooks.hooks,
@@ -2273,13 +2326,12 @@ export class AgentPluginInstallService {
       try {
         const { plugin } = await this.validateStagedClone(stagedDir);
         const name = plugin.name;
+        const inventory = await this.collectComponents(plugin);
         const importedComponents =
           args.importedComponents === undefined
             ? undefined
-            : this.validateComponentImports(
-                args.importedComponents,
-                await this.collectComponents(plugin)
-              );
+            : this.validateComponentImports(args.importedComponents, inventory);
+        const componentConsent = consentAtInstall(importedComponents, inventory);
         await this.assertNoCollision(name);
         await this.assertNoPendingOverridePrune(name);
         await this.assertNoResidualInstanceState(name);
@@ -2330,6 +2382,7 @@ export class AgentPluginInstallService {
           lockedSha: args.expectedSha,
           installedAt: new Date().toISOString(),
           ...(importedComponents !== undefined ? { importedComponents } : {}),
+          componentConsent,
           manifest: {
             ...(plugin.manifest.version !== undefined ? { version: plugin.manifest.version } : {}),
             ...(plugin.manifest.description !== undefined
@@ -3005,7 +3058,7 @@ export class AgentPluginInstallService {
   private async collectComponents(plugin: AgentPluginInfo) {
     const warnings: string[] = [];
     const skills = await this.collectSkillsFromRoots(plugin, warnings);
-    const mcpServers = await this.collectMcpServers(
+    const { previews: mcpServers, fingerprints } = await this.collectMcpServers(
       { ...plugin, importedComponents: undefined },
       path.join(plugin.containerPath, plugin.dirName),
       computePluginInstanceId(path.join(plugin.containerPath, plugin.dirName)),
@@ -3017,6 +3070,11 @@ export class AgentPluginInstallService {
         ...(description !== undefined ? { description } : {}),
       })),
       mcpServers,
+      /** What this review showed, as consent fingerprints (#6498). Never sent to the renderer. */
+      fingerprints: {
+        skills: Object.fromEntries(skills.map((skill) => [skill.name, skill.consentFingerprint])),
+        mcpServers: fingerprints,
+      } satisfies ComponentConsent,
     };
   }
 
@@ -3041,7 +3099,7 @@ export class AgentPluginInstallService {
 
   private async readInstalledComponents(
     entry: AgentPluginInstallEntry
-  ): Promise<AgentPluginComponents> {
+  ): Promise<AgentPluginComponents & { fingerprints: ComponentConsent }> {
     const pluginDir = this.targetPathFor(entry.name);
     // Pin reads to one tree even if the installed symlink changes A → B → A
     // between the receipt hashes. Only keys/data paths retain the logical identity.
@@ -3135,7 +3193,8 @@ export class AgentPluginInstallService {
     if (gate.suppressed.length > 0) throw changed();
     const entry = (await this.readRegistry("strict")).find((entry) => entry.name === args.name);
     if (entry === undefined) throw new Error(`No managed plugin named '${args.name}'.`);
-    const inventory = await this.readInstalledComponents(entry);
+    const { fingerprints, ...inventory } = await this.readInstalledComponents(entry);
+    assert(fingerprints !== undefined, "installed inventory carries consent fingerprints");
     if ((await gate.confirm()).length > 0) throw changed();
     return inventory;
   }
@@ -3177,12 +3236,15 @@ export class AgentPluginInstallService {
       }
       const importedComponents = this.validateComponentImports(args.importedComponents, inventory);
       // An unchanged legacy import-all selection must keep following future package inventory.
-      const previous = entry.importedComponents ?? {
-        skills: inventory.skills.map((skill) => skill.name),
-        mcpServers: inventory.mcpServers.map((server) => server.serverName),
-      };
+      const previous = entry.importedComponents ?? fullSelection(inventory);
       if (selectionKey(importedComponents) === selectionKey(previous))
         return { data: entry, changed: false };
+      // Only newly added components were shown for consent (#6498 review B1).
+      const componentConsent = consentForSelection({
+        selection: importedComponents,
+        shown: inventory.fingerprints,
+        previous: { selection: previous, consent: entry.componentConsent },
+      });
       await this.writeRegistry(
         envelope,
         rawEntries.map((raw) => {
@@ -3194,10 +3256,11 @@ export class AgentPluginInstallService {
               ...(record.importedComponents as Record<string, unknown>),
               ...importedComponents,
             },
+            componentConsent,
           };
         })
       );
-      return { data: { ...entry, importedComponents }, changed: true };
+      return { data: { ...entry, importedComponents, componentConsent }, changed: true };
     });
     if (!changed) return { data };
     // Persist first and release the mutation lock: reconciliation rediscovers current policy.

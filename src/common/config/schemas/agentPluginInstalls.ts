@@ -94,6 +94,19 @@ export const AgentPluginInstallEntrySchema = z.object({
     })
     .optional(),
   importedComponents: AgentPluginImportedComponentsSchema.optional(),
+  /**
+   * Reviewed fingerprint of each imported component, by name (#6498). A component loads only when
+   * its current fingerprint matches, so a newer build that parses more of the package cannot load
+   * a changed component under an approved name. Top-level, not under importedComponents: older
+   * builds spread importedComponents on save and would keep a nested record stale. Absent on
+   * older installs, which then need a review (no backfill).
+   */
+  componentConsent: z
+    .object({
+      skills: z.record(z.string(), z.string()),
+      mcpServers: z.record(z.string(), z.string()),
+    })
+    .optional(),
   /** Reserved: per-plugin opt-in auto-update. Unused in v1 — updates are badge + manual. */
   autoUpdate: z.boolean().optional(),
 });

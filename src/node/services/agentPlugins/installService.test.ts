@@ -42,6 +42,7 @@ import {
   buildPluginServerKey,
 } from "./mcpConfig";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
+import { skillConsentFingerprint } from "./componentConsent";
 
 /**
  * Lifecycle tests against a real local git "remote". Local-path remotes go
@@ -954,7 +955,20 @@ describe("AgentPluginInstallService", () => {
       { skills: [], mcpServers: [] },
     ]) {
       const result = await service.setComponentsResult({ ...request, importedComponents });
-      expect(result).toEqual({ success: true, data: { ...installed, importedComponents } });
+      // A narrowed selection keeps the install's consent records of the components it keeps.
+      const keep = (records: Record<string, string> | undefined, names: string[]) =>
+        Object.fromEntries(Object.entries(records ?? {}).filter(([name]) => names.includes(name)));
+      expect(result).toEqual({
+        success: true,
+        data: {
+          ...installed,
+          importedComponents,
+          componentConsent: {
+            skills: keep(installed.componentConsent?.skills, importedComponents.skills),
+            mcpServers: keep(installed.componentConsent?.mcpServers, importedComponents.mcpServers),
+          },
+        },
+      });
       const before = await fsPromises.readFile(registryFile(), "utf8");
       expect(
         (await service.setComponentsResult({ ...request, importedComponents: all })).success
@@ -1443,6 +1457,77 @@ describe("AgentPluginInstallService", () => {
       success: true,
       data: { importedComponents: { skills: [], mcpServers: [] } },
     });
+  });
+
+  test("install records the reviewed fingerprint of each imported component (#6498)", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    const installed = await service.install({
+      source: preview.source,
+      expectedSha: preview.lockedSha,
+      importedComponents: { skills: ["greet"], mcpServers: [] },
+    });
+    const content = await fsPromises.readFile(
+      path.join(pluginsDir(), "demo-plugin", "skills", "greet", "SKILL.md"),
+      "utf8"
+    );
+    const greet = skillConsentFingerprint({ relativeDir: "skills/greet", content });
+    expect(installed.componentConsent).toEqual({ skills: { greet }, mcpServers: {} });
+    expect((await service.list())[0]).toMatchObject({ importedSkillCount: 1 });
+    const stored = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<{ componentConsent?: unknown }>;
+    };
+    expect(stored.plugins[0].componentConsent).toEqual(installed.componentConsent);
+  });
+
+  test("a component picker save records consent only for newly added components (#6498)", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({
+      source: preview.source,
+      expectedSha: preview.lockedSha,
+      importedComponents: { skills: ["greet"], mcpServers: [] },
+    });
+    // The kept skill was reviewed at another fingerprint: a picker save must not approve its
+    // current one, because the picker shows names, not a review of what changed.
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<Record<string, unknown>>;
+    };
+    document.plugins[0].componentConsent = {
+      skills: { greet: "reviewed-earlier" },
+      mcpServers: {},
+    };
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+    const inventory = await service.getComponents({ name: "demo-plugin" });
+    expect(inventory).not.toHaveProperty("fingerprints");
+    const saved = await service.setComponents({
+      name: "demo-plugin",
+      expectedLockedSha: inventory.lockedSha,
+      expectedContentHash: inventory.contentHash,
+      expectedImportedComponents: { skills: ["greet"], mcpServers: [] },
+      importedComponents: { skills: ["greet"], mcpServers: ["echo"] },
+    });
+    expect(saved.data.componentConsent?.skills).toEqual({ greet: "reviewed-earlier" });
+    expect(Object.keys(saved.data.componentConsent?.mcpServers ?? {})).toEqual(["echo"]);
+    expect(saved.data.componentConsent?.mcpServers.echo).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test("narrowing a legacy import-all install records no consent (#6498)", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    // Installs from before #6498 have no consent records. Simulate one.
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<Record<string, unknown>>;
+    };
+    delete document.plugins[0].componentConsent;
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+    const inventory = await service.getComponents({ name: "demo-plugin" });
+    const saved = await service.setComponents({
+      name: "demo-plugin",
+      expectedLockedSha: inventory.lockedSha,
+      expectedContentHash: inventory.contentHash,
+      expectedImportedComponents: null,
+      importedComponents: { skills: ["greet"], mcpServers: [] },
+    });
+    expect(saved.data.componentConsent).toEqual({ skills: {}, mcpServers: {} });
   });
 
   test("consent preview discloses symlinked skills and warns on escaping symlinks", async () => {
