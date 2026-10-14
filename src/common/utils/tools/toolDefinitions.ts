@@ -2227,10 +2227,6 @@ export const AgentSkillReadToolResultSchema = z.union([
 ]);
 
 /**
- * Agent Skill read_file tool result.
- * Uses the same shape/limits as file_read.
- */
-/**
  * agent_skill_read_file result: file_read's, plus the plugin sibling note
  * (pluginSiblingNote.ts) for files of a plugin skill. The note is a separate
  * field so `content` line numbers stay exact.

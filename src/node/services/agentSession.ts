@@ -393,9 +393,6 @@ export type { FileState } from "@/node/services/utils/fileChangeTracker";
 
 type GoalInterventionPolicy = NonNullable<SendMessageOptions["goalInterventionPolicy"]>;
 
-// Wake continuations must retain their delegated turn correlation through candidate preparation.
-// An explicit correlation (a workspace-turn-task row, or a wake row that reactivated an inactive
-// sub-agent under a fresh continuation) wins; a plain wake inherits the still-open turn from history.
 /** The skill-storage context a snapshot's readAgentSkill call used. */
 interface SkillLookupContext {
   runtime: Runtime;
@@ -428,6 +425,9 @@ function createPluginSiblingNoteResolver(
   };
 }
 
+// Wake continuations must retain their delegated turn correlation through candidate preparation.
+// An explicit correlation (a workspace-turn-task row, or a wake row that reactivated an inactive
+// sub-agent under a fresh continuation) wins; a plain wake inherits the still-open turn from history.
 function resolveStreamMuxMetadata(
   options: MuxMessageMetadata | undefined,
   retry: MuxMessageMetadata | undefined,
