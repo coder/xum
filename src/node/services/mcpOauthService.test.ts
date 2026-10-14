@@ -828,51 +828,66 @@ describe("McpOauthService OAuth flows", () => {
   // A sign-in's deadline and Cancel must cover authorization-server discovery: a stalled
   // metadata request must not keep the start pending (and the desktop listener bound) (#6164).
   test.each([
-    ["plugin registrationUrl discovery", true],
-    ["SDK discovery", false],
-  ])("a sign-in settled during stalled %s returns at once", async (_label, withRegistrationUrl) => {
-    let stalled!: () => void;
-    const discoveryStalled = new Promise<void>((resolve) => (stalled = resolve));
-    const server = createServer((req, res) => {
-      const pathname = (req.url ?? "/").split("?")[0];
-      if (pathname.startsWith("/.well-known/oauth-authorization-server")) {
-        stalled(); // Never answers until the client gives up.
-        req.on("close", () => res.destroy());
-        return;
-      }
-      res.statusCode = pathname === "/mcp" ? 401 : 404;
-      res.end();
-    });
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    try {
-      const address = server.address();
-      if (!address || typeof address === "string") throw new Error("Failed to bind");
-      const base = `http://127.0.0.1:${address.port}`;
-      spyOn(mcpConfigService, "listServers").mockResolvedValue({
-        docs: {
-          transport: "http",
-          url: `${base}/mcp`,
-          disabled: true,
-          oauth: {
-            clientId: "c",
-            ...(withRegistrationUrl
-              ? {
-                  discovery: { authorizationServerBase: base, registrationUrl: `${base}/register` },
-                }
-              : {}),
-          },
-        },
+    ["plugin registrationUrl discovery", true, false],
+    ["SDK discovery", false, false],
+    ["scope lookup", false, true],
+  ])(
+    "a sign-in settled during stalled %s returns at once",
+    async (_label, withRegistrationUrl, stallScope) => {
+      let stalled!: () => void;
+      const discoveryStalled = new Promise<void>((resolve) => (stalled = resolve));
+      const stalledPath = stallScope ? "/prm" : "/.well-known/oauth-authorization-server";
+      const server = createServer((req, res) => {
+        const pathname = (req.url ?? "/").split("?")[0];
+        if (pathname.startsWith(stalledPath)) {
+          stalled(); // Never answers until the client gives up.
+          req.on("close", () => res.destroy());
+          return;
+        }
+        if (pathname === "/mcp" && stallScope) {
+          // No scope in the challenge: the scope lookup fetches the resource metadata.
+          const prm = `http://${req.headers.host ?? ""}/prm`;
+          res.writeHead(401, { "WWW-Authenticate": `Bearer resource_metadata="${prm}"` });
+          res.end();
+          return;
+        }
+        res.statusCode = pathname === "/mcp" ? 401 : 404;
+        res.end();
       });
-      const starting = service.startDesktopFlow({ projectPath, serverName: "docs" });
-      await discoveryStalled;
-      // The update-time sign-out settles every flow of this server (the deadline does the same).
-      await service.logout({ serverUrl: `${base}/mcp` });
-      expect(await starting).toEqual({ success: false, error: "Signed out" });
-    } finally {
-      server.closeAllConnections();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      try {
+        const address = server.address();
+        if (!address || typeof address === "string") throw new Error("Failed to bind");
+        const base = `http://127.0.0.1:${address.port}`;
+        spyOn(mcpConfigService, "listServers").mockResolvedValue({
+          docs: {
+            transport: "http",
+            url: `${base}/mcp`,
+            disabled: true,
+            oauth: {
+              clientId: "c",
+              ...(withRegistrationUrl
+                ? {
+                    discovery: {
+                      authorizationServerBase: base,
+                      registrationUrl: `${base}/register`,
+                    },
+                  }
+                : {}),
+            },
+          },
+        });
+        const starting = service.startDesktopFlow({ projectPath, serverName: "docs" });
+        await discoveryStalled;
+        // The update-time sign-out settles every flow of this server (the deadline does the same).
+        await service.logout({ serverUrl: `${base}/mcp` });
+        expect(await starting).toEqual({ success: false, error: "Signed out" });
+      } finally {
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
     }
-  });
+  );
 
   test("a token exchange in flight when the user signs out saves nothing", async () => {
     let tokenRequested!: () => void;
@@ -1285,9 +1300,8 @@ describe("McpOauthService OAuth flows", () => {
         await probed;
         // The update's sign-out lands while the flow is still probing.
         await service.logout({ serverUrl: url });
-        releaseProbe();
-        // The flow is registered before its probe, so the sign-out ends it (#6164): the
-        // old-identity flow never reaches the token endpoint.
+        // The flow is registered before its probe, so the sign-out ends it and its probe at
+        // once (#6164): the old-identity flow never reaches the token endpoint.
         expect(await starting).toEqual({ success: false, error: "Signed out" });
         expect(
           await service.getAuthProviderForServer({ serverUrl: url, oauth: configA })

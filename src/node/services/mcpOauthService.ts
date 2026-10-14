@@ -619,7 +619,10 @@ function getBearerChallengeProbeRequests(
 export async function probeServerForBearerChallenge(options: {
   serverUrl: string;
   transport: BearerChallengeProbeTransport;
+  /** A sign-in passes its abortable fetch, so the probe ends when the flow settles. */
+  fetchFn?: FetchLike;
 }): Promise<BearerChallenge | null> {
+  const fetchFn = options.fetchFn ?? fetch;
   const requestUrl = sanitizeServerUrlForRequest(options.serverUrl);
   if (!requestUrl) {
     return null;
@@ -631,10 +634,10 @@ export async function probeServerForBearerChallenge(options: {
   try {
     for (const request of getBearerChallengeProbeRequests(options.transport)) {
       try {
-        const response = await fetch(requestUrl, {
+        const response = await fetchFn(requestUrl, {
           method: request.method,
           headers: request.headers,
-          ...(request.body ? { body: request.body } : {}),
+          body: request.body,
           redirect: "manual",
           signal: abortController.signal,
         });
@@ -675,7 +678,8 @@ export async function probeServerForBearerChallenge(options: {
  * not expose it, and this is one extra GET during an interactive flow.
  */
 export async function resolveOAuthScope(
-  challenge: BearerChallenge | null
+  challenge: BearerChallenge | null,
+  fetchFn: FetchLike = fetch
 ): Promise<string | undefined> {
   if (challenge?.scope) {
     return challenge.scope;
@@ -683,13 +687,13 @@ export async function resolveOAuthScope(
   if (!challenge?.resourceMetadataUrl) {
     return undefined;
   }
-  const scopes = await fetchProtectedResourceScopes(challenge.resourceMetadataUrl);
+  const scopes = await fetchProtectedResourceScopes(challenge.resourceMetadataUrl, fetchFn);
   return scopes.length > 0 ? scopes.join(" ") : undefined;
 }
 
-async function fetchProtectedResourceScopes(url: URL): Promise<string[]> {
+async function fetchProtectedResourceScopes(url: URL, fetchFn: FetchLike): Promise<string[]> {
   try {
-    const response = await fetch(url, {
+    const response = await fetchFn(url, {
       headers: { Accept: "application/json" },
       signal: AbortSignal.timeout(5_000),
     });
@@ -1441,7 +1445,7 @@ export class McpOauthService {
   /**
    * Probes and discovers for a registered flow, then runs the SDK's authorization start.
    * Every request ends when the flow settles (deadline, Cancel, sign-out, shutdown); the result
-   * is then the settled one. The probe and the scope lookup carry their own 5 s timeouts.
+   * is then the settled one. The probe and the scope lookup also keep their own 5 s timeouts.
    */
   private async beginAuthorization(
     flow: OAuthFlowBase,
@@ -1454,6 +1458,7 @@ export class McpOauthService {
       const challenge = await probeServerForBearerChallenge({
         serverUrl: flow.serverUrlForDiscovery,
         transport: flow.transport,
+        fetchFn,
       });
       flow.resourceMetadataUrl = challenge?.resourceMetadataUrl;
       Object.assign(
@@ -1693,7 +1698,7 @@ export class McpOauthService {
     serverUrlForDiscovery: string,
     fetchFn: FetchLike
   ): Promise<Pick<OAuthFlowBase, "scope" | "discoveryState" | "plugin">> {
-    const scope = await resolveOAuthScope(challenge);
+    const scope = await resolveOAuthScope(challenge, fetchFn);
     if (config === undefined) return { scope, discoveryState: undefined };
     const clientSecret = await readClientSecret(config);
     return {
