@@ -472,6 +472,15 @@ function describeConfigToggle(value: boolean | undefined, fallback: string): str
   return value === undefined ? fallback : `Current: ${value ? "On" : "Off"}`;
 }
 
+/** Palette options: managed plugins with components not reviewed on this install (#6498). */
+async function pluginsNeedingReviewOptions(api: BuildSourcesParams["api"]) {
+  const result = await api?.agentPlugins.list();
+  if (!result?.success) return [];
+  return result.data
+    .filter((item) => item.managed && (item.reviewRequiredCount ?? 0) > 0)
+    .map((item) => ({ id: item.name, label: item.name, keywords: [item.name, item.location] }));
+}
+
 export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandAction[]> {
   const actions: Array<() => CommandAction[]> = [];
 
@@ -2370,6 +2379,30 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           ],
           onSubmit: (values) => {
             publishPluginsSectionIntent({ type: "review-hooks", name: values.pluginName });
+            openSettings("plugins");
+          },
+        },
+      },
+      {
+        id: CommandIds.pluginsReviewComponents(),
+        title: "Review Plugin Components…",
+        subtitle: "Approve skills and MCP servers you have not reviewed on this install",
+        section: section.settings,
+        keywords: ["plugin", "components", "review", "approve", "skills", "mcp", "consent"],
+        run: () => undefined,
+        prompt: {
+          title: "Review Plugin Components",
+          fields: [
+            {
+              type: "select",
+              name: "pluginName",
+              label: "Plugin that needs review",
+              placeholder: "Search plugins that need review…",
+              getOptions: () => pluginsNeedingReviewOptions(p.api),
+            },
+          ],
+          onSubmit: (values) => {
+            publishPluginsSectionIntent({ type: "review-components", name: values.pluginName });
             openSettings("plugins");
           },
         },

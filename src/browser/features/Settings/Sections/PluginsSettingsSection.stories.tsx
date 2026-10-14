@@ -801,3 +801,96 @@ export const ThemedLogoLight: Story = {
     }
   },
 };
+
+/** A plugin installed before #6498: its components have no consent records yet. */
+function componentReviewOptions(): MockORPCClientOptions {
+  const item: AgentPluginListItem = { ...MANAGED_ITEM, reviewRequiredCount: 2 };
+  return {
+    agentPlugins: {
+      items: [item],
+      componentReview: {
+        name: item.name,
+        fromSha: item.lockedSha ?? "",
+        toSha: item.lockedSha ?? "",
+        changes: [
+          {
+            summary: "Skill 'grilling' needs review",
+            before: "Not reviewed on this install",
+            after: "Grill the user about a plan or decision.",
+            component: { kind: "skills", name: "grilling", fingerprint: "a".repeat(64) },
+          },
+          {
+            summary: "MCP server 'planner' needs review",
+            before: "Changed since you reviewed it",
+            after:
+              "node ~/.mux/plugins/grill/servers/planner-with-a-very-long-entry-point.js --stdio",
+            component: { kind: "mcpServers", name: "planner", fingerprint: "b".repeat(64) },
+          },
+        ],
+        warnings: [],
+      },
+    },
+  };
+}
+
+async function approveComponents(canvasElement: HTMLElement): Promise<HTMLElement> {
+  const canvas = within(canvasElement);
+  // The row badge and the section notice name the state and the action.
+  await canvas.findByText("needs review");
+  await canvas.findByText(/Select Review on each plugin marked "needs review"/);
+  await userEvent.click(
+    await canvas.findByRole("button", { name: /^Review components of grill$/ })
+  );
+  await canvas.findByText(/Skill 'grilling' needs review/);
+  await canvas.findByText("Changed since you reviewed it");
+  return canvas.findByRole("button", { name: /Approve components/ });
+}
+
+/**
+ * Component review (#6498): the update review panel lists the plugin's unreviewed skills and MCP
+ * servers, and approving clears the badge and the notice.
+ */
+export const ComponentReview: Story = {
+  // Out of Pixel snapshots (snapshot budget, like HooksReview). The play checks the flow.
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <PluginsSectionStoryShell options={componentReviewOptions()}>
+      <PluginsSettingsSection />
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(await approveComponents(canvasElement));
+    await canvas.findByText("Plans, **grilled** <b>hard</b>");
+    if (canvas.queryByText("needs review") !== null) {
+      throw new Error("Approving the review must clear the needs-review badge");
+    }
+    if (canvas.queryByText(/Select Review on each plugin/) !== null) {
+      throw new Error("Approving the review must clear the notice");
+    }
+  },
+};
+
+/** Phone width (390 px): the notice, the badge and the review rows wrap inside the card. */
+export const ComponentReviewPhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: { layout: "fullscreen", pixel: PIXEL_DISABLED },
+  render: () => (
+    <PluginsSectionStoryShell options={componentReviewOptions()}>
+      {/* Fixed phone width so the play's overflow assertion holds in the CI test-runner too. */}
+      <div style={{ width: 390 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const approve = await approveComponents(canvasElement);
+    const card = approve.closest("div[class*='rounded-md']");
+    if (!(card instanceof HTMLElement)) throw new Error("Component review card not found");
+    if (card.scrollWidth > card.clientWidth + 1) {
+      throw new Error("Component review overflows its card at phone width");
+    }
+  },
+};
