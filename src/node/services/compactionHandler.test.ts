@@ -2038,13 +2038,16 @@ describe("CompactionHandler", () => {
         emitter: mockEmitter,
       });
       const pluginHookContext = [{ pluginId: "guard", text: "Ask for a repro first." }];
+      const tailUser = createMuxMessage("u1", "user", "tail question", { pluginHookContext });
+      // chat.jsonl is untrusted: a corrupted extra entry is not copied (PRRT_kwDOPxxmWM6sTcvx).
+      Reflect.set(tailUser.metadata ?? {}, "pluginHookContext", [
+        ...pluginHookContext,
+        { pluginId: 1, text: "x" },
+      ]);
       await seedHistory(
         createMuxMessage("u0", "user", "old head question"),
         createMuxMessage("a0", "assistant", "old head answer"),
-        createMuxMessage("u1", "user", "tail question", {
-          // A corrupted extra entry (PRRT_kwDOPxxmWM6sTcvx) is not copied.
-          pluginHookContext: [...pluginHookContext, { pluginId: 1, text: "x" } as never],
-        }),
+        tailUser,
         createMuxMessage("a1", "assistant", "tail answer"),
         createStampedCompactionRequest("compact-req", 2)
       );
