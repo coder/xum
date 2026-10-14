@@ -250,7 +250,7 @@ export class McpAppResultStore {
       await writeFileAtomic(filePath, JSON.stringify(file));
       const { widgetState: _old, ...known } = read.record;
       // Parsed back from its JSON, so memory holds exactly what the file holds.
-      return stateJson === null ? known : { ...known, widgetState: file.widgetState as unknown };
+      return stateJson === null ? known : { ...known, widgetState: file.widgetState };
     });
     this.remember(workspaceId, updated);
   }
