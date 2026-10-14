@@ -32,6 +32,7 @@ import {
 import {
   MCP_SETTINGS_WORKSPACE_META_KEY,
   boundMCPSettingsToolResult,
+  MAX_MCP_SETTINGS_TOOL_RESULT,
   filterMCPSettingValues,
   parseMCPSettingsReadResult,
   validateMCPSettingValue,
@@ -7968,17 +7969,25 @@ export class MCPServerManager {
   }
 }
 
+/** A CallToolResult content part's text; "" for any other part. */
+function textPartOf(part: unknown): string {
+  if (part === null || typeof part !== "object" || Reflect.get(part, "type") !== "text") return "";
+  return String(Reflect.get(part, "text"));
+}
+
 /** A settings tool action's result for the dialog: its text parts, bounded. */
 function settingsToolResultText(result: MCPRawCallToolResult): { text: string; isError: boolean } {
   const parts: unknown[] = Array.isArray(result.content) ? result.content : [];
-  const text = parts
-    .map((part) =>
-      part !== null && typeof part === "object" && Reflect.get(part, "type") === "text"
-        ? String(Reflect.get(part, "text"))
-        : ""
-    )
-    .filter((part) => part.length > 0)
-    .join("\n");
+  // Collected only up to the bound (one unit past it, so the bound still marks the cut): many
+  // or huge server parts must not build an unbounded string first.
+  let text = "";
+  for (const part of parts) {
+    if (text.length > MAX_MCP_SETTINGS_TOOL_RESULT) break;
+    const partText = textPartOf(part);
+    if (partText === "") continue;
+    const room = MAX_MCP_SETTINGS_TOOL_RESULT + 1 - text.length;
+    text += (text.length > 0 ? "\n" : "") + partText.slice(0, room);
+  }
   return { text: boundMCPSettingsToolResult(text), isError: result.isError === true };
 }
 

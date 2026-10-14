@@ -81,7 +81,7 @@ function RunnableToolRow(props: MCPSettingsToolActionRowProps & { action: MCPSet
             result.isError ? "text-danger-soft" : "text-content-secondary"
           )}
         >
-          {result.text === "" ? "Done" : result.text}
+          {result.text !== "" ? result.text : result.isError ? "Failed" : "Done"}
         </div>
       )}
     </div>

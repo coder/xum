@@ -1,5 +1,9 @@
 import { log } from "@/node/services/log";
-import type { MCPSettingValue, MCPSettingsToolAction } from "@/common/utils/mcpSettings";
+import {
+  MAX_MCP_SETTINGS_TOOL_RESULT,
+  type MCPSettingValue,
+  type MCPSettingsToolAction,
+} from "@/common/utils/mcpSettings";
 import {
   afterEach,
   beforeEach,
@@ -874,6 +878,7 @@ describe("MCPServerManager", () => {
       hidden: { title: "Hidden", readOnly: true, opensApp: false },
     };
     const runs: Array<{ name: string; meta: unknown }> = [];
+    let bigResult = false;
     servers.serve("settings-actions", {
       tools: { draw: testTool() },
       settings: {
@@ -899,6 +904,13 @@ describe("MCPServerManager", () => {
         settingsToolAction: (name) => (Object.hasOwn(actions, name) ? actions[name] : undefined),
         callSettingsActionTool: (name, meta) => {
           runs.push({ name, meta });
+          if (bigResult)
+            return Promise.resolve({
+              content: Array.from({ length: 1000 }, () => ({
+                type: "text" as const,
+                text: "x".repeat(10_000),
+              })),
+            });
           return Promise.resolve({
             content: [
               { type: "text" as const, text: "3 libraries" },
@@ -946,6 +958,12 @@ describe("MCPServerManager", () => {
     // Confirmed, it runs; a tool error reaches the dialog as an error result.
     expect(await run("reset", true)).toEqual({ text: "3 libraries\nsynced", isError: true });
     expect(runs.map((entry) => entry.name)).toEqual(["library", "reset"]);
+    // A huge result is cut to the bound (with a mark), not joined whole first.
+    bigResult = true;
+    const big = await run("library");
+    if (typeof big === "string") throw new Error(big);
+    expect(big.text).toHaveLength(MAX_MCP_SETTINGS_TOOL_RESULT + 1);
+    expect(big.text.endsWith("…")).toBe(true);
   });
 
   test("settings tool actions follow tools/list_changed: the read and the run refresh the catalog", async () => {

@@ -728,6 +728,7 @@ export const WorkspaceMCPServerSettingsToolActions: Story = {
     await expect(
       within(dialog).getByRole("button", { name: /(Fetch|Refresh) Tools/ })
     ).toBeDisabled();
+    await expect(section.getByRole("button", { name: "Run Reset parts" })).toBeDisabled();
     toolActionGate.resolve();
     await expect(section.findByText("cad.library finished")).resolves.toBeInTheDocument();
     await waitFor(() =>
