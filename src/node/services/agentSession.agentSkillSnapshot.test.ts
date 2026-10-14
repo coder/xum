@@ -269,7 +269,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     }
   });
 
-  it("names the skill directory in /skill and $skill snapshots, also after compaction", async () => {
+  it("names the skill directory in /skill and $skill snapshots and in the copies compaction re-injects", async () => {
     // Without the path, models searched the filesystem for the skill's files
     // (and read another agent's copy). Local and worktree bash run on the host.
     const srcBaseDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-agent-skill-src-"));
