@@ -4,6 +4,11 @@ import {
   LEFT_SIDEBAR_COLLAPSED_KEY,
   ONBOARDING_VIEWED_KEY,
 } from "@/common/constants/storage";
+import {
+  LEFT_SIDEBAR_COLLAPSED_WIDTH_PX,
+  LEFT_SIDEBAR_DEFAULT_WIDTH_PX,
+  NARROW_VIEWPORT_MAX_WIDTH_PX,
+} from "@/constants/layout";
 import { VERSION } from "@/version";
 
 /**
@@ -33,8 +38,8 @@ import { VERSION } from "@/version";
  * the live wizard in tags, classes or text.
  *
  * SECURITY AUDIT: trusted server text. Every byte is fixed at build time: it holds no user,
- * request, config or repo data, and nothing may be interpolated into it but FIRST_RUN_VIEW_ID and
- * the build's version (HTML-escaped).
+ * request, config or repo data, and nothing may be interpolated into it but FIRST_RUN_VIEW_ID, the
+ * layout constants the live sidebar uses, and the build's version (HTML-escaped).
  * PR 4 inserts it with `template.content.cloneNode(true)`, never with innerHTML, outerHTML or
  * insertAdjacentHTML.
  */
@@ -44,8 +49,8 @@ export function firstRunViewHtml(gitDescribe: string): string {
   const hide = "{ display: none !important }";
   return `<div id="${FIRST_RUN_VIEW_ID}" inert style="position:fixed;inset:0;z-index:1500;overflow:hidden">
   <style>
-    @media (max-width: 768px) { ${view}:not([data-sidebar="expanded"]) [data-pre="e"], ${view} [data-pre="handle"] ${hide} }
-    @media (min-width: 769px) { ${view}:not([data-sidebar="collapsed"]) [data-pre="c"] ${hide} }
+    @media (max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px) { ${view}:not([data-sidebar="expanded"]) [data-pre="e"], ${view} [data-pre="handle"] ${hide} }
+    @media (min-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX + 1}px) { ${view}:not([data-sidebar="collapsed"]) [data-pre="c"] ${hide} }
     ${view}[data-sidebar="collapsed"] [data-pre="e"], ${view}[data-sidebar="expanded"] [data-pre="c"] ${hide}
     ${view} [data-pre-logo] { color: #000 } :root[data-theme="dark"] ${view} [data-pre-logo], :root[data-theme$="-dark"] ${view} [data-pre-logo] { color: #fff }
   </style>
@@ -53,7 +58,7 @@ export function firstRunViewHtml(gitDescribe: string): string {
     <div class="bg-surface-primary h-full">
       <div class="bg-surface-primary mobile-layout flex h-full overflow-hidden pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]">
         <div class="mobile-overlay fixed inset-0 z-40 hidden before:absolute before:inset-0 before:bg-black/50 before:backdrop-blur-sm" data-pre="e"></div>
-        <div class="h-full bg-sidebar border-r border-border flex flex-col shrink-0 overflow-hidden relative z-20 transition-[width] duration-200 mobile-sidebar" style="width:288px" data-pre="e">
+        <div class="h-full bg-sidebar border-r border-border flex flex-col shrink-0 overflow-hidden relative z-20 transition-[width] duration-200 mobile-sidebar" style="width:${LEFT_SIDEBAR_DEFAULT_WIDTH_PX}px" data-pre="e">
           <div class="bg-sidebar border-border-light font-primary text-muted titlebar-safe-left titlebar-safe-left-gutter-4 flex shrink-0 items-center justify-between border-b px-4 text-[11px] select-none h-8">
             <div class="mr-4 flex min-w-0 flex-1 items-center gap-2">
               <button type="button" class="flex min-w-0 max-w-full cursor-pointer items-center gap-1.5 border-0 bg-transparent p-0 text-left text-inherit transition-opacity"><div class="text-content-secondary min-w-0 flex-1 truncate font-normal tracking-wider text-xs" data-pre-version>${version}</div></button>
@@ -97,7 +102,7 @@ export function firstRunViewHtml(gitDescribe: string): string {
           </div>
           <div class="absolute right-0 top-0 bottom-0 w-0.5 z-10 cursor-col-resize transition-[background] duration-150 bg-border-light hover:bg-accent" data-pre="handle"></div>
         </div>
-        <div class="h-full bg-sidebar border-r border-border flex flex-col shrink-0 overflow-hidden relative z-20 transition-[width] duration-200 mobile-sidebar mobile-sidebar-collapsed" style="width:20px" data-pre="c">
+        <div class="h-full bg-sidebar border-r border-border flex flex-col shrink-0 overflow-hidden relative z-20 transition-[width] duration-200 mobile-sidebar mobile-sidebar-collapsed" style="width:${LEFT_SIDEBAR_COLLAPSED_WIDTH_PX}px" data-pre="c">
           <div class="font-primary bg-surface-primary border-border-light relative flex flex-1 select-none flex-col overflow-hidden border-r">
             <button class="text-muted hover:bg-hover hover:text-foreground flex w-full flex-1 cursor-pointer items-center justify-center bg-transparent p-0 text-xs transition-all duration-200 focus-visible:ring-accent focus-visible:ring-1 focus-visible:ring-inset">»</button>
             <div class="bg-border-light pointer-events-none absolute inset-y-0 right-0 z-40 w-px"></div>
