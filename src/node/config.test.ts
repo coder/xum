@@ -1584,7 +1584,7 @@ describe("Config", () => {
         });
       }
 
-      it("keeps both rows when the two legacy metadata files name different ids", async () => {
+      it("keeps both rows when the two legacy metadata files name different ids", () => {
         const checkout = checkoutPath();
         writeLegacyMetadata(checkout, "stable-1");
         // The old layout's sessions/<checkout basename>/metadata.json names a second identity.
