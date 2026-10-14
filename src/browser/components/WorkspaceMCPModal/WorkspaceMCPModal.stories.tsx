@@ -729,6 +729,8 @@ export const WorkspaceMCPServerSettingsToolActions: Story = {
       within(dialog).getByRole("button", { name: /(Fetch|Refresh) Tools/ })
     ).toBeDisabled();
     await expect(section.getByRole("button", { name: "Run Reset parts" })).toBeDisabled();
+    // The dialog's Save closes it, so it waits too.
+    await expect(within(dialog).getByRole("button", { name: "Save" })).toBeDisabled();
     toolActionGate.resolve();
     await expect(section.findByText("cad.library finished")).resolves.toBeInTheDocument();
     await waitFor(() =>
@@ -746,6 +748,19 @@ export const WorkspaceMCPServerSettingsToolActions: Story = {
     await expect(toolActionRuns[1]).toEqual({ toolName: "cad.reset", confirmed: true });
 
     await expect(section.getByText("Opens in a later version")).toBeInTheDocument();
+    // An unsaved edit blocks the runs: the tool would see the saved settings, not the draft.
+    const zoom = section.getByLabelText("Default zoom setting");
+    await userEvent.clear(zoom);
+    await userEvent.type(zoom, "3");
+    await waitFor(() =>
+      expect(section.getByRole("button", { name: "Run Part library" })).toBeDisabled()
+    );
+    await userEvent.clear(zoom);
+    await userEvent.type(zoom, "2");
+    await waitFor(() =>
+      expect(section.getByRole("button", { name: "Run Part library" })).toBeEnabled()
+    );
+
     await expect(section.getByText("Not available")).toBeInTheDocument();
     await expect(section.queryByRole("button", { name: /Payment method|cad\.export/ })).toBeNull();
   },

@@ -205,7 +205,13 @@ export const MCPServerSettingsSection = React.forwardRef<
                   // A save or refresh replaces the snapshot and remounts this section: a run
                   // started meanwhile would lose its result.
                   // One run at a time: two writing tools must not race on the server.
-                  disabled={saving || props.refreshing || runningTools > 0}
+                  // Unsaved edits block a run too: the tool sees the saved settings, not the draft.
+                  disabled={
+                    saving ||
+                    props.refreshing ||
+                    runningTools > 0 ||
+                    Object.keys(changed).length > 0
+                  }
                   beginRun={() => {
                     setRunningTools((count) => count + 1);
                     const end = props.beginToolRun();

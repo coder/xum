@@ -19,6 +19,7 @@ import { useMCPTestCache } from "@/browser/hooks/useMCPTestCache";
 import {
   applySavedSettings,
   countSettingsSave,
+  isDialogSaveBlocked,
   SettingsRequests,
   type ServerSettingsEntry,
   type SettingsRequestScope,
@@ -473,7 +474,10 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                 <Button variant="ghost" onClick={() => onOpenChange(false)}>
                   Cancel
                 </Button>
-                <Button onClick={() => void handleSave()} disabled={saving}>
+                <Button
+                  onClick={() => void handleSave()}
+                  disabled={isDialogSaveBlocked(saving, savingSettings)}
+                >
                   {saving ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
                   Save
                 </Button>

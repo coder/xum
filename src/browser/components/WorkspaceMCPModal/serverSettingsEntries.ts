@@ -76,6 +76,14 @@ export function settingsErrors(
   return errors;
 }
 
+/**
+ * Whether the dialog's Save waits: it closes the dialog, which would drop the result of an
+ * overrides save, a settings save, or a tool run still in flight (`savingSettings` counts both).
+ */
+export function isDialogSaveBlocked(saving: boolean, savingSettings: Record<string, number>) {
+  return saving || Object.keys(savingSettings).length > 0;
+}
+
 /** Saves in flight per server, after one starts (+1) or settles (-1). A server at 0 has no key. */
 export function countSettingsSave(
   counts: Record<string, number>,
