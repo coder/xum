@@ -194,6 +194,11 @@ export interface ComponentConsent {
   mcpServers: Record<string, string>;
 }
 
+/** The consent of an install without records (every install from before #6498): nothing reviewed. */
+export function noComponentConsent(): ComponentConsent {
+  return { skills: {}, mcpServers: {} };
+}
+
 /** True only when the user reviewed exactly this fingerprint. No record (every older install) means no. */
 export function isComponentConsented(
   consent: ComponentConsent | undefined,
@@ -292,6 +297,16 @@ export interface PluginSkillConsentGate {
   /** Canonical plugin root: skill directories are fingerprinted relative to it. */
   pluginRoot: string;
   consented: Readonly<Record<string, string>>;
+}
+
+/** The skill gate of a discovered plugin. Only managed plugins carry consent records, so get one. */
+export function pluginSkillConsentGate(plugin: {
+  rootPath: string;
+  componentConsent?: ComponentConsent;
+}): PluginSkillConsentGate | undefined {
+  return plugin.componentConsent !== undefined
+    ? { pluginRoot: plugin.rootPath, consented: plugin.componentConsent.skills }
+    : undefined;
 }
 
 /**

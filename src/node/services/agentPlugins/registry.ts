@@ -8,7 +8,7 @@ import {
 import { getErrorMessage } from "@/common/utils/errors";
 import { getOwn } from "@/common/utils/getOwn";
 import { log } from "@/node/services/log";
-import type { ComponentConsent } from "./componentConsent";
+import { noComponentConsent, type ComponentConsent } from "./componentConsent";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 
 export const PLUGIN_REGISTRY_FILE_NAME = "plugins.json";
@@ -83,6 +83,14 @@ export async function readPluginRegistryDocument(
   };
 }
 
+/** The row's plugin name, when it has a valid one. */
+function registryRowName(raw: unknown): string | undefined {
+  const name = AgentPluginInstallEntrySchema.shape.name.safeParse(
+    raw !== null && typeof raw === "object" && "name" in raw ? raw.name : undefined
+  );
+  return name.success ? name.data : undefined;
+}
+
 /** Read once per managed container scan. Corruption must never become legacy import-all. */
 export async function readPluginComponentImports(registryFile: string): Promise<{
   byName: Map<string, AgentPluginImportedComponents | undefined>;
@@ -99,10 +107,8 @@ export async function readPluginComponentImports(registryFile: string): Promise<
     const consentByName = new Map<string, ComponentConsent>();
     let hasUnidentifiedEntries = false;
     for (const raw of rawEntries) {
-      const name = AgentPluginInstallEntrySchema.shape.name.safeParse(
-        raw !== null && typeof raw === "object" && "name" in raw ? raw.name : undefined
-      );
-      if (!name.success) {
+      const name = registryRowName(raw);
+      if (name === undefined) {
         // An unidentified row can own an otherwise unregistered directory, but
         // must not suppress healthy rows whose identity is still known.
         hasUnidentifiedEntries = true;
@@ -111,18 +117,15 @@ export async function readPluginComponentImports(registryFile: string): Promise<
       // Only a complete, valid legacy install may grant import-all. A missing
       // selection on a truncated row is corruption, not legacy consent.
       const parsed = AgentPluginInstallEntrySchema.safeParse(raw);
-      if (!parsed.success || byName.has(name.data)) {
+      if (!parsed.success || byName.has(name)) {
         log.warn(
-          `Ignoring component imports for invalid or duplicate plugin registry entry '${name.data}'`
+          `Ignoring component imports for invalid or duplicate plugin registry entry '${name}'`
         );
-        byName.set(name.data, { skills: [], mcpServers: [] });
-        consentByName.set(name.data, { skills: {}, mcpServers: {} });
+        byName.set(name, { skills: [], mcpServers: [] });
+        consentByName.set(name, noComponentConsent());
       } else {
-        byName.set(name.data, parsed.data.importedComponents);
-        consentByName.set(
-          name.data,
-          parsed.data.componentConsent ?? { skills: {}, mcpServers: {} }
-        );
+        byName.set(name, parsed.data.importedComponents);
+        consentByName.set(name, parsed.data.componentConsent ?? noComponentConsent());
       }
     }
     if (hasUnidentifiedEntries) {
@@ -151,24 +154,32 @@ export interface PluginMcpPolicy {
   consent: Record<string, Record<string, string>> | null;
 }
 
-export function isPluginMcpServerAllowed(
-  plugin: MCPServerPluginProvenance | undefined,
+/**
+ * One managed owner's part of the policy: its selection (null = legacy import-all) and its
+ * reviewed server fingerprints. Undefined when the policy does not cover the owner (fails closed).
+ */
+function ownerMcpPolicy(
+  owner: { registryPath: string; name: string },
   policy: PluginMcpPolicy | undefined
-): boolean {
-  if (plugin?.componentPolicy === undefined) return true;
-  const owner = plugin.componentPolicy;
+): { selected: string[] | null; consented: Record<string, string> | undefined } | undefined {
   if (
     policy?.registryPath !== owner.registryPath ||
     policy.imports == null ||
     !Object.hasOwn(policy.imports, owner.name)
   )
-    return false;
-  const selected = policy.imports[owner.name];
-  if (selected !== null && !selected.includes(plugin.serverName)) return false;
-  // #6498: the server must also be the one the user reviewed. The fingerprint is computed from
-  // the exact server info at load (loadPluginMcpServers), so a parser widening that changes the
-  // server under an approved name fails here.
-  const consented = policy.consent?.[owner.name];
+    return undefined;
+  return { selected: policy.imports[owner.name], consented: policy.consent?.[owner.name] };
+}
+
+/**
+ * #6498: the server must be the one the user reviewed. The fingerprint is computed from the exact
+ * server info at load (loadPluginMcpServers), so a parser widening that changes the server under
+ * an approved name fails here.
+ */
+function isReviewedServer(
+  consented: Record<string, string> | undefined,
+  plugin: MCPServerPluginProvenance
+): boolean {
   return (
     consented !== undefined &&
     plugin.consentFingerprint !== undefined &&
@@ -176,9 +187,41 @@ export function isPluginMcpServerAllowed(
   );
 }
 
+export function isPluginMcpServerAllowed(
+  plugin: MCPServerPluginProvenance | undefined,
+  policy: PluginMcpPolicy | undefined
+): boolean {
+  if (plugin?.componentPolicy === undefined) return true;
+  const owner = ownerMcpPolicy(plugin.componentPolicy, policy);
+  if (owner === undefined) return false;
+  if (owner.selected !== null && !owner.selected.includes(plugin.serverName)) return false;
+  return isReviewedServer(owner.consented, plugin);
+}
+
 /** Key-sorted copy, so equal policies compare equal as JSON (policy revisions). */
 function sortedRecord(record: Record<string, string>): Record<string, string> {
   return Object.fromEntries(Object.entries(record).sort(([a], [b]) => a.localeCompare(b)));
+}
+
+/** The MCP part of one registry read, sorted so equal registries compare equal as JSON. */
+function mcpPolicySnapshot(
+  selection: NonNullable<Awaited<ReturnType<typeof readPluginComponentImports>>>
+): Pick<PluginMcpPolicy, "imports" | "consent"> {
+  return {
+    consent: Object.fromEntries(
+      [...selection.consentByName]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([name, consent]) => [name, sortedRecord(consent.mcpServers)])
+    ),
+    imports: Object.fromEntries(
+      [...selection.byName]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([name, components]) => [
+          name,
+          components === undefined ? null : [...new Set(components.mcpServers)].sort(),
+        ])
+    ),
+  };
 }
 
 export async function readPluginMcpPolicy(registryFile: string): Promise<PluginMcpPolicy> {
@@ -199,25 +242,7 @@ export async function readPluginMcpPolicy(registryFile: string): Promise<PluginM
       throw new Error("Managed plugin owner changed during policy read");
     return {
       registryPath,
-      consent:
-        selection === null
-          ? null
-          : Object.fromEntries(
-              [...selection.consentByName]
-                .sort(([a], [b]) => a.localeCompare(b))
-                .map(([name, consent]) => [name, sortedRecord(consent.mcpServers)])
-            ),
-      imports:
-        selection === null
-          ? null
-          : Object.fromEntries(
-              [...selection.byName]
-                .sort(([a], [b]) => a.localeCompare(b))
-                .map(([name, components]) => [
-                  name,
-                  components === undefined ? null : [...new Set(components.mcpServers)].sort(),
-                ])
-            ),
+      ...(selection === null ? { imports: null, consent: null } : mcpPolicySnapshot(selection)),
     };
   } catch {
     // Failure denies managed provenance only; unmanaged plugins do not consult this policy.
