@@ -48,7 +48,7 @@ import {
  * background timers, and updates never auto-apply.
  */
 
-/** Compact source display, e.g. "github.com/foo/grill @ main". */
+/** Compact source display, e.g. "github.com/foo/grill @ main" or "github.com/cursor/plugins/pstack @ main". */
 function formatSource(item: AgentPluginListItem): string | null {
   if (!item.source) {
     return null;
@@ -58,7 +58,8 @@ function formatSource(item: AgentPluginListItem): string | null {
     .replace(/^git@([^:]+):/, "$1/")
     .replace(/\.git$/, "");
   const ref = item.source.refType === "commit" ? item.source.ref.slice(0, 12) : item.source.ref;
-  return `${url} @ ${ref}`;
+  const subpath = item.source.subpath !== undefined ? `/${item.source.subpath}` : "";
+  return `${url}${subpath} @ ${ref}`;
 }
 
 const Badge: React.FC<{
@@ -557,7 +558,7 @@ const AddPluginPanel: React.FC<{
               id="plugin-source"
               type="text"
               autoFocus
-              placeholder="e.g., owner/repo, owner/repo@v1.2.0, or https://github.com/owner/repo.git"
+              placeholder="e.g., owner/repo, owner/repo/path/to/plugin, owner/repo@v1.2.0, or https://github.com/owner/repo.git"
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
@@ -634,7 +635,9 @@ const AddPluginPanel: React.FC<{
                 have no natural break points and would overflow the card on
                 phone widths. */}
             <p className="text-muted text-[11px] break-all">
-              {preview.source.url} @ {preview.source.ref} →{" "}
+              {preview.source.url}
+              {preview.source.subpath !== undefined ? `/${preview.source.subpath}` : ""} @{" "}
+              {preview.source.ref} →{" "}
               <code className="text-accent-text">{preview.targetPath}</code>
               {preview.manifest.authorName ? ` · by ${preview.manifest.authorName}` : ""}
               {preview.manifest.license ? ` · ${preview.manifest.license}` : ""}
