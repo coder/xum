@@ -66,7 +66,7 @@ export const PLUGIN_HOOK_STATUS_NOTE: Record<PluginHookStatus, string | null> = 
 };
 
 const REVIEW_LABEL: Record<PluginHookReviewState, { text: string; className: string }> = {
-  trusted: { text: "trusted", className: "text-accent" },
+  trusted: { text: "trusted", className: "text-accent-text" },
   disabled: { text: "turned off", className: "text-muted" },
   new: { text: "needs review", className: "text-warning" },
   changed: { text: "changed, needs review", className: "text-warning" },

@@ -30,7 +30,8 @@ import type { DesktopCapability } from "@/common/types/desktop";
 import type { ProjectsConfig } from "@/common/types/project";
 import type { XumToolScope } from "@/common/types/toolScope";
 import type { AgentDefinitionScope } from "@/common/types/agentDefinition";
-import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
+import type { InvocableSkill } from "@/common/types/agentSkill";
+import { listInvocableSkills } from "@/common/utils/agentSkills/skillLookupName";
 import type { InstructionSources } from "@/common/types/instructions";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
@@ -694,7 +695,7 @@ export interface StreamSystemContextResult {
   /** Available subagent definitions for tool descriptions (undefined for subagent workspaces). */
   agentDefinitions: Awaited<ReturnType<typeof discoverAgentDefinitions>> | undefined;
   /** Available skills for tool descriptions. */
-  availableSkills: AgentSkillDescriptor[] | undefined;
+  availableSkills: InvocableSkill[] | undefined;
   /** Exact ancestor plan files surfaced in the prompt and forwarded through tool configuration. */
   ancestorPlanFilePaths: string[];
   /** Instruction snapshot used for the prompt; reuse it for tool-scoped instructions. */
@@ -1091,7 +1092,11 @@ export async function buildStreamSystemContext(
       // Used only for the project-runtime default-roots fallback (skillCtx.roots undefined).
       includeClaudeSkills: opts.claudeSkillsCompatEnabled,
     })
-      .then(requireReachableSkills)
+      .then((discovery) => {
+        requireReachableSkills(discovery);
+        // Shadowed plugin skills join the index under `<plugin>:<skill>`.
+        return listInvocableSkills(discovery);
+      })
       .catch((error: unknown) => {
         // An unreachable host must fail the turn, not silently drop the skills index (#4438).
         if (isRuntimeTransportError(error)) throw error;

@@ -11,6 +11,7 @@ import {
   resolveSkillUserInvocable,
   resolveSkillWhenToUse,
 } from "@/common/orpc/schemas";
+import { resolveSkillPaths } from "@/common/utils/skills/skillPaths";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import type { AgentSkillListToolResult } from "@/common/types/tools";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -138,6 +139,7 @@ async function readSkillDescriptor(
       userInvocable: resolveSkillUserInvocable(parsed.frontmatter),
       argumentHint: parsed.frontmatter["argument-hint"],
       whenToUse: resolveSkillWhenToUse(parsed.frontmatter),
+      paths: resolveSkillPaths(parsed.frontmatter),
     });
 
     if (!descriptorResult.success) {
@@ -294,7 +296,7 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
         ];
         const { plugins } = await discoverAgentPlugins(pluginContainers);
         for (const plugin of plugins) {
-          if (plugin.skillsDir == null) {
+          if (plugin.skillsDirs == null) {
             continue;
           }
           // Project plugin roots keep the repo-symlink posture of other project
@@ -310,12 +312,15 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
             }
           }
           // Per-skill containment anchors at the plugin root (§4.1).
-          roots.push({
-            skillsRoot: plugin.skillsDir,
-            containmentRoot: plugin.rootPath,
-            scope: plugin.scope,
-            importedSkills: plugin.importedComponents?.skills,
-          });
+          const importedSkills = plugin.importedComponents?.skills;
+          roots.push(
+            ...plugin.skillsDirs.map((skillsRoot) => ({
+              skillsRoot,
+              containmentRoot: plugin.rootPath,
+              scope: plugin.scope,
+              importedSkills,
+            }))
+          );
         }
 
         const skills: AgentSkillDescriptor[] = [];

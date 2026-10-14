@@ -768,7 +768,7 @@ const ProjectCloneForm = React.forwardRef<ProjectCloneFormHandle, ProjectCloneFo
             {destinationExistsPath && (
               <button
                 type="button"
-                className="text-accent text-xs underline disabled:opacity-50"
+                className="text-accent-text text-xs underline disabled:opacity-50"
                 onClick={() => void handleAddExistingProject()}
                 disabled={isAddingProject}
               >
