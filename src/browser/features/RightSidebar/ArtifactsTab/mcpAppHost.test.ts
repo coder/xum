@@ -299,6 +299,15 @@ describe("MCP Apps host router", () => {
     cycle.self = cycle;
     await send(cycle);
     await send({ big: BigInt(1) });
+    // JSON would change these (NaN to null, a Map or a Date to an object or a string, an
+    // undefined member dropped), so the stored state would not be what the widget set.
+    for (const changed of [
+      { x: NaN },
+      { m: new Map([[1, 2]]) },
+      { d: new Date(0) },
+      { u: undefined },
+    ])
+      await send(changed);
     await send(null);
     expect(t.widgetStates).toEqual([{ n: 1 }, null]);
   });

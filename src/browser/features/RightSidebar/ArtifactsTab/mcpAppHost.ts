@@ -68,14 +68,44 @@ const LogParams = z.object({ level: z.string().max(32).optional(), data: z.unkno
 /** xum/widget-state: JSON of at most MCP_APP_WIDGET_STATE_MAX_BYTES (the backend's cap too). */
 const WidgetStateParams = z.object({ state: z.unknown().refine(isStorableWidgetState) });
 
-/** JSON within the cap. A cycle or a BigInt (structured-cloneable, not JSON) is not. */
+/**
+ * JSON within the cap, which JSON keeps exactly: no cycle or BigInt (stringify throws), and no
+ * NaN, Infinity, undefined member, Date, Map or other class instance (stringify changes them),
+ * so the stored state is what the widget set.
+ */
 function isStorableWidgetState(state: unknown): boolean {
+  let json: string;
   try {
-    const json = JSON.stringify(state ?? null);
-    return new TextEncoder().encode(json).length <= MCP_APP_WIDGET_STATE_MAX_BYTES;
+    json = JSON.stringify(state ?? null);
   } catch {
     return false;
   }
+  return (
+    new TextEncoder().encode(json).length <= MCP_APP_WIDGET_STATE_MAX_BYTES && isJsonValue(state)
+  );
+}
+
+/** Whether JSON round-trips `value` unchanged. Called after the size check, so it is bounded. */
+function isJsonValue(value: unknown): boolean {
+  switch (typeof value) {
+    case "string":
+    case "boolean":
+      return true;
+    case "number":
+      return Number.isFinite(value);
+    case "object":
+      return value === null || isJsonContainer(value);
+    default:
+      return false;
+  }
+}
+
+/** An array or a plain object (no Date, Map or other class) of JSON values. */
+function isJsonContainer(value: object): boolean {
+  if (Array.isArray(value)) return value.every(isJsonValue);
+  const prototype: unknown = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return false;
+  return Object.values(value).every(isJsonValue);
 }
 const ToolCallParams = z.object({
   name: z.string().min(1).max(256),

@@ -258,8 +258,35 @@ describe("window.openai shim", () => {
       step: 2,
       note: "</script>",
     });
-    // In order, each as the host got it.
+    // In order: the first at once, the newest after the shim's send interval.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await settle();
     expect(t.savedStates).toEqual([{ step: 3 }, { step: 4 }]);
+  });
+
+  test("a burst of setWidgetState calls sends the first at once and the newest last", async () => {
+    // A slider drag: more calls than the document channel's rate limit lets through.
+    const t = await runView(
+      `for (var i = 1; i <= 30; i++) window.openai.setWidgetState({ n: i });
+      window.done = true;`
+    );
+    expect(t.win.done).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await settle();
+    expect(t.savedStates[0]).toEqual({ n: 1 });
+    expect(t.savedStates.at(-1)).toEqual({ n: 30 });
+    expect(t.savedStates.length).toBeLessThan(5);
+  });
+
+  test("seeded widget state round-trips as JSON, also a __proto__ key", async () => {
+    const t = await runView(
+      `var s = window.openai.widgetState;
+      window.result = { own: Object.prototype.hasOwnProperty.call(s, "__proto__"), flag: s.flag };
+      window.done = true;`,
+      { seed: { ...SEED, widgetState: JSON.parse('{"__proto__":{"flag":true}}') as unknown } }
+    );
+    expect(t.win.done).toBe(true);
+    expect((t.win as unknown as { result: unknown }).result).toEqual({ own: true });
   });
 
   test("host context is in the globals before any view script reads them", async () => {

@@ -166,6 +166,13 @@ interface Posted {
   error?: { code: number };
 }
 
+/** The window.openai shim's seed in a view srcdoc (a JSON string the shim parses). */
+function openAiSeedOf(srcdoc: string | null): unknown {
+  const literal = /JSON\.parse\(("(?:[^"\\]|\\.)*")\)/.exec(srcdoc ?? "")?.[1];
+  assert(literal != null, "the srcdoc has no window.openai seed");
+  return JSON.parse(JSON.parse(literal) as string) as unknown;
+}
+
 /** Every message the host posted into the view document. */
 function capturePosted(frame: HTMLIFrameElement): Posted[] {
   const posted: Posted[] = [];
@@ -523,7 +530,9 @@ describe("McpAppFrame", () => {
     let landWrite = () => undefined as void;
     widgetStateWriteGate = new Promise<void>((resolve) => (landWrite = resolve));
     const first = await renderFrame();
-    expect(first.frame.getAttribute("srcdoc")).toContain('"widgetState":{"step":2}');
+    expect(openAiSeedOf(first.frame.getAttribute("srcdoc"))).toMatchObject({
+      widgetState: { step: 2 },
+    });
     postFromView(first.frame, {
       jsonrpc: "2.0",
       method: "xum/widget-state",
@@ -534,7 +543,9 @@ describe("McpAppFrame", () => {
     // record still holds step 2, but the new document starts with step 3.
     first.view.unmount();
     const second = await renderFrame();
-    expect(second.frame.getAttribute("srcdoc")).toContain('"widgetState":{"step":3}');
+    expect(openAiSeedOf(second.frame.getAttribute("srcdoc"))).toMatchObject({
+      widgetState: { step: 3 },
+    });
     landWrite();
     expect(widgetStateWrites).toEqual([{ binding: widgetStateBinding, state: { step: 3 } }]);
   });
@@ -1076,7 +1087,7 @@ describe("McpAppFrame host strips", () => {
     const view = render(tree, { wrapper: Wrapper });
     const frame = await view.findByTestId("mcp-app-frame");
     const srcdoc = frame.getAttribute("srcdoc") ?? "";
-    expect(srcdoc).toContain('"theme":"dark","displayMode":"inline"');
+    expect(openAiSeedOf(srcdoc)).toMatchObject({ theme: "dark", displayMode: "inline" });
     // A resize (or theme change) must not rebuild, and so reload, the view document.
     Object.defineProperty(window, "innerHeight", { value: 333, configurable: true });
     await act(async () => {
