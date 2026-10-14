@@ -19,6 +19,7 @@ import { SettingsProvider } from "@/browser/contexts/SettingsContext";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import type { TestApiOverrides } from "@/browser/testUtils";
 import { GoalDefaultsSection } from "./GoalDefaultsSection";
+import { useGoalDefaults } from "@/browser/utils/goals/useGoalDefaults";
 import { useGoalBoard, type UseGoalBoardResult } from "./useGoalBoard";
 
 /*
@@ -206,6 +207,24 @@ describe.each([...GAP_MODES])("loaded panes across a dropped connection (%s)", (
     nextInstructions.resolve({ files: [], totalTokens: 0 });
     nextChatInstructions.resolve({ content: "be precise", enabled: true });
     await waitFor(() => expect(editor.value).toBe("be precise"));
+  });
+
+  // The create forms prefill from these. A read cut off by the drop must not replace the shown
+  // values with the canonical defaults.
+  test("the effective goal defaults keep their values through a reload the drop cut off", async () => {
+    answerOverride = () => Promise.resolve(turnCapOverride(5));
+    const view = renderHook(() => useGoalDefaults("ws-1"), { wrapper: Wrapper });
+    await waitFor(() => expect(view.result.current.defaults.defaultTurnCap).toBe(5));
+
+    answerOverride = pending;
+    await drop();
+    await reconnect();
+    await drop();
+    expect(view.result.current.defaults.defaultTurnCap).toBe(5);
+
+    answerOverride = () => Promise.resolve(turnCapOverride(7));
+    await reconnect();
+    await waitFor(() => expect(view.result.current.defaults.defaultTurnCap).toBe(7));
   });
 
   test("the goal defaults keep the override editable while they reload, and an edit wins", async () => {
