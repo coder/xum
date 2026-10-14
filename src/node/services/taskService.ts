@@ -144,6 +144,7 @@ import { readPlanFile } from "@/node/utils/runtime/helpers";
 import { resolvePlanFileLocation } from "@/node/utils/runtime/planLocation";
 import {
   coerceNonEmptyString,
+  readTaskParentBranch,
   tryReadGitHeadCommitSha,
   findWorkspaceEntry,
   markChildGoalPauseOwed,
@@ -972,7 +973,6 @@ interface PreparedTaskReservation {
   taskRuntimeConfig: RuntimeConfig;
   parentRuntimeConfig: RuntimeConfig;
   sharedWorkspacePath: string | undefined;
-  parentIsSharedTask: boolean;
   parentBranchName: string | undefined;
   skipInitHook: boolean;
   definitionSource: string | undefined;
@@ -6734,11 +6734,15 @@ export class TaskService implements AgentTaskIntegration {
         !parentIsMultiProject);
     const sharedWorkspacePath = useSharedWorkspace ? parentWorkspacePath : undefined;
     // Branch actually checked out in the parent's checkout (see create() for rationale).
-    const parentIsSharedTask = parentEntry?.workspace.taskIsolation === "none";
-    const parentBranchName = parentIsSharedTask
-      ? (coerceNonEmptyString(parentEntry?.workspace.taskTrunkBranch) ??
-        coerceNonEmptyString(parentMeta.name))
-      : coerceNonEmptyString(parentMeta.name);
+    const parentBranchRead = await this.readCancellable(
+      readTaskParentBranch(parentEntry, parentMeta, () => ({
+        runtime,
+        workspacePath: parentWorkspacePath,
+      })),
+      signal
+    );
+    if (parentBranchRead.kind !== "ok") return Err(progress.interruptedError());
+    const parentBranchName = parentBranchRead.value;
     if (args.isolation === "none" && !useSharedWorkspace) {
       log.debug("Task.createMany: isolation=none not honored; falling back to fork", {
         parentWorkspaceId,
@@ -6882,7 +6886,6 @@ export class TaskService implements AgentTaskIntegration {
       taskRuntimeConfig,
       parentRuntimeConfig,
       sharedWorkspacePath,
-      parentIsSharedTask,
       parentBranchName,
       skipInitHook,
       definitionSource,
@@ -7056,9 +7059,9 @@ export class TaskService implements AgentTaskIntegration {
           : {}),
         // Real branch checked out in the parent's checkout: persisted as taskTrunkBranch and used
         // by orchestrateFork's create-fallback when the fork cannot detect a source branch
-        // (a shared parent's synthetic name never names a real branch). Gated to shared parents
-        // to keep the existing branch-discovery fallback otherwise.
-        ...(plan.parentIsSharedTask && plan.parentBranchName != null
+        // (a shared parent's synthetic name, or an auto-named worktree parent's, names no
+        // branch). Only then: other parents keep the existing branch-discovery fallback.
+        ...(plan.parentBranchName != null && plan.parentBranchName !== plan.parentMeta.name
           ? { preferredTrunkBranch: plan.parentBranchName }
           : {}),
       });
@@ -8695,15 +8698,14 @@ export class TaskService implements AgentTaskIntegration {
       (args.isolation === "none" &&
         runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
         !parentIsMultiProject);
-    // The branch actually checked out in the parent's checkout. When the parent is itself an
-    // isolation: "none" task, parentMeta.name is a synthetic agent workspace name with no real
-    // branch — the shared checkout sits on the parent's own persisted taskTrunkBranch. Persisting
-    // the real branch keeps dequeue fork-fallbacks (preferredTrunkBranch) on an existing base.
-    const parentIsSharedTask = parentEntry?.workspace.taskIsolation === "none";
-    const parentBranchName = parentIsSharedTask
-      ? (coerceNonEmptyString(parentEntry?.workspace.taskTrunkBranch) ??
-        coerceNonEmptyString(parentMeta.name))
-      : coerceNonEmptyString(parentMeta.name);
+    // The branch actually checked out in the parent's checkout (see readTaskParentBranch): an
+    // isolation: "none" parent's name, and an auto-named worktree parent's, name no branch.
+    // Persisting the real branch keeps dequeue fork-fallbacks (preferredTrunkBranch) on an
+    // existing base, and a shared task's review base on the branch its checkout is on.
+    const parentBranchName = await readTaskParentBranch(parentEntry, parentMeta, () => ({
+      runtime,
+      workspacePath: parentWorkspacePath,
+    }));
     if (args.isolation === "none" && !useSharedWorkspace) {
       log.debug("Task.create: isolation=none not honored; falling back to fork", {
         taskId,
@@ -9168,9 +9170,10 @@ export class TaskService implements AgentTaskIntegration {
           parentMetadata: parentMeta,
           allowCreateFallback: true,
           // Create-fallback base when the fork cannot detect a source branch — a shared parent's
-          // synthetic name never names a real branch, so supply the actual checked-out branch.
-          // Gated to shared parents to keep the existing branch-discovery fallback otherwise.
-          ...(parentIsSharedTask && parentBranchName != null
+          // synthetic name, or an auto-named worktree parent's, names no branch, so supply the
+          // actual checked-out branch. Only then: other parents keep the existing
+          // branch-discovery fallback.
+          ...(parentBranchName != null && parentBranchName !== parentMeta.name
             ? { preferredTrunkBranch: parentBranchName }
             : {}),
           trusted:

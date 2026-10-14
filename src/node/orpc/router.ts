@@ -128,8 +128,6 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { normalizeAutoModelRoutingConfig } from "@/common/types/autoModelRouting";
 import { AutoModelRouterTag } from "@/node/services/di/tags";
 
-import { generateWorkspaceIdentity } from "@/node/services/workspaceTitleGenerator";
-
 import {
   createAuthMiddleware,
   extractClientIpAddress,
@@ -1749,16 +1747,7 @@ export const router = (authToken?: string) => {
       generate: t
         .input(schemas.nameGeneration.generate.input)
         .output(schemas.nameGeneration.generate.output)
-        .handler(async ({ context, input }) => {
-          // Pre-creation naming has no workspace yet: the configured naming
-          // agent (model + thinking) still leads; the caller's models only fill
-          // in after the built-in fallbacks.
-          const candidates = await context.workspaceService.getWorkspaceNamingCandidates(
-            undefined,
-            input.candidates
-          );
-          return generateWorkspaceIdentity(input.message, candidates, context.aiService);
-        }),
+        .handler(({ context, input }) => context.workspaceService.generateDraftIdentity(input)),
     },
     coder: {
       getInfo: t

@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { isDeepStrictEqual } from "node:util";
 import {
   minimumDetectableImprovement,
+  QUALIFY_MDI_LIMIT,
   qualifyPage,
   type Qualification,
   type Signal,
@@ -69,12 +70,43 @@ export function serviceWorkerProofFailures(p: {
   return failures;
 }
 
+/** The host state a run records (#6204 item 2): 1-minute load, and PSI `cpu some avg10` (null without PSI). */
+export function hostState(load1: number, pressureCpu: string | null) {
+  const avg10 =
+    pressureCpu === null ? null : Number(/^some avg10=([\d.]+)/m.exec(pressureCpu)?.[1]);
+  assert(avg10 === null || Number.isFinite(avg10), `bad /proc/pressure/cpu: ${pressureCpu}`);
+  return { load1, cpuSomeAvg10: avg10 };
+}
+
 /** Host rule: 1-minute load below 0.75 x CPUs, and PSI `cpu some avg10` below 10 where PSI exists. */
 export function hostIsQuiet(load: number, pressureCpu: string | null, cpus: number): boolean {
   assert(Number.isFinite(load) && cpus > 0, `bad load ${load} or cpus ${cpus}`);
-  const avg10 = pressureCpu === null ? 0 : Number(/^some avg10=([\d.]+)/m.exec(pressureCpu)?.[1]);
-  assert(Number.isFinite(avg10), `bad /proc/pressure/cpu: ${pressureCpu}`);
-  return load < 0.75 * cpus && avg10 < 10;
+  return load < 0.75 * cpus && (hostState(load, pressureCpu).cpuSomeAvg10 ?? 0) < 10;
+}
+
+/**
+ * After the server stops, waits up to 10 s for the run's other processes (`find`) to exit. Survivors get
+ * SIGKILL before the caller frees the lock (#6204 item 7), and the run is invalid: it throws.
+ */
+export async function reapRun(
+  find: () => number[],
+  kill: (pid: number) => void,
+  sleep: (ms: number) => Promise<unknown>
+): Promise<void> {
+  for (let i = 0; find().length > 0; i++) {
+    if (i < 100) {
+      await sleep(100);
+      continue;
+    }
+    const left = find();
+    // Until they are gone, killing what each poll finds (a fork after the first kill too): a process in
+    // uninterruptible I/O can take a while to die, and the lock waits for it.
+    for (let now = left; now.length > 0; now = find()) {
+      now.forEach(kill);
+      await sleep(100);
+    }
+    throw new Error(`processes ${left} outlived the server by 10 s and were killed`);
+  }
 }
 
 /**
@@ -129,12 +161,17 @@ export function qualifyHostPage(blocks: Array<Record<Signal, number[]>>): {
   mdi: Record<Signal, number>;
 } {
   const pooled = (signal: Signal) => blocks.flatMap((b) => b[signal]);
+  const mdi = {
+    ucs: minimumDetectableImprovement(pooled("ucs")),
+    ir: minimumDetectableImprovement(pooled("ir")),
+  };
+  // The published MDI pools every A/A pair, so it must meet the limits too (#6204): a confirmatory
+  // block that passes alone cannot qualify a page whose pooled MDI misses them.
+  const within = mdi.ucs <= QUALIFY_MDI_LIMIT.ucs && mdi.ir <= QUALIFY_MDI_LIMIT.ir;
+  const qualification = qualifyPage(blocks);
   return {
-    qualification: qualifyPage(blocks),
-    mdi: {
-      ucs: minimumDetectableImprovement(pooled("ucs")),
-      ir: minimumDetectableImprovement(pooled("ir")),
-    },
+    qualification: qualification === "qualified" && !within ? "inconclusive" : qualification,
+    mdi,
   };
 }
 

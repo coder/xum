@@ -1784,9 +1784,8 @@ export const workspace = {
     input: z.object({
       projectPath: z.string(),
       /**
-       * Workspace branch name. When omitted, the backend auto-generates a name
-       * based on the trunk branch (e.g., "main-1", "main-2"), similar to how
-       * /fork derives a name from the parent workspace.
+       * Workspace branch name. When omitted, the backend picks the next free
+       * "workspace-N" name (as /new does).
        */
       branchName: z.string().optional(),
       /** Trunk branch to fork from - only required for worktree/SSH runtimes, ignored for local */
@@ -1806,6 +1805,25 @@ export const workspace = {
        * rendered in the UI). Used by orchestration callers for stable identity.
        */
       tags: z.record(WorkspaceTagKeySchema, z.string()).optional(),
+      /**
+       * Name the workspace in the backend after it is announced, so creation does not wait for
+       * the naming model: it opens as "workspace-N", gets the generated title when it arrives,
+       * and its git branch is renamed before the init hook runs (the directory and workspace
+       * name stay). Worktree runtime only; omit `branchName` and `title`.
+       */
+      nameGeneration: z
+        .object({
+          /** The message to name the workspace after. */
+          message: z.string(),
+          /** Caller fallback models, as for nameGeneration.generate. */
+          candidates: z.array(z.string()),
+          /**
+           * The creation form's nameGeneration.generate request for this message, running or
+           * finished: its result names the workspace instead of a second model call.
+           */
+          draftNamingId: z.string().optional(),
+        })
+        .optional(),
     }),
     output: z.discriminatedUnion("success", [
       z.object({ success: z.literal(true), metadata: FrontendWorkspaceMetadataSchema }),
@@ -2779,6 +2797,9 @@ export const workspace = {
 };
 
 export type WorkspaceSendMessageOutput = z.infer<typeof workspace.sendMessage.output>;
+export type WorkspaceNameGenerationRequest = NonNullable<
+  z.infer<typeof workspace.create.input>["nameGeneration"]
+>;
 export type ArchiveLossyUntrackedFilesConfirmation = z.infer<
   typeof ArchiveLossyUntrackedFilesConfirmationSchema
 >;
@@ -3010,6 +3031,11 @@ export const nameGeneration = {
        * first, then these; gateway routing is resolved in createModel.
        */
       candidates: z.array(z.string()),
+      /**
+       * Set by the creation form, unique per request: a workspace.create that hands this request
+       * off (nameGeneration.draftNamingId) takes its result over.
+       */
+      draftNamingId: z.string().optional(),
     }),
     output: ResultSchema(
       z.object({

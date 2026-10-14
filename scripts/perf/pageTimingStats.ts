@@ -15,6 +15,8 @@ export const NO_REGRESSION_LIMIT: Record<Signal, number> = { ucs: 0.25, ir: 0.3 
 // Some runs wait one or two extra throttled round trips (0.56-1.16 s), so every rule tolerates outlier pairs:
 // medians, and for UCS at most 3 of 8 pairs beyond 0.25 s. IR moves in round-trip steps: a wider median.
 const QUALIFY_MEDIAN_LIMIT: Record<Signal, number> = { ucs: 0.1, ir: 0.3 };
+// The owner's rule (#6204): a qualified block must detect a change of this size. One slow pair sets the MDI.
+export const QUALIFY_MDI_LIMIT: Record<Signal, number> = { ucs: 0.25, ir: 0.3 };
 
 function assertBlock(d: number[]) {
   assert(
@@ -46,7 +48,9 @@ export function signalQualifies(signal: Signal, d: number[]): boolean {
 /** A page's A/A blocks in run order: the first block, then one confirmatory block if the first failed. */
 export function qualifyPage(blocks: Array<Record<Signal, number[]>>): Qualification {
   assert(blocks.length === 1 || blocks.length === 2, `1 or 2 A/A blocks, got ${blocks.length}`);
-  const ok = blocks.map((b) => signalQualifies("ucs", b.ucs) && signalQualifies("ir", b.ir));
+  const signalOk = (b: Record<Signal, number[]>, s: Signal) =>
+    signalQualifies(s, b[s]) && minimumDetectableImprovement(b[s]) <= QUALIFY_MDI_LIMIT[s];
+  const ok = blocks.map((b) => signalOk(b, "ucs") && signalOk(b, "ir"));
   assert(
     !(ok[0] && blocks.length === 2),
     "a confirmatory block runs only after a failed first block"
