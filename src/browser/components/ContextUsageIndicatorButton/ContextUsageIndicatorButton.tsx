@@ -81,20 +81,20 @@ function getUsageSliderHint(config: AutoCompactionConfig): string {
 /** Unified auto-compact settings panel */
 const AutoCompactSettings: React.FC<{
   data: TokenMeterData;
+  /** Usage text for the header, from getContextUsageLabels. */
+  summary: string;
+  /** Usage not loaded yet: `data` is empty for lack of data, so hide the limit warning too. */
+  loading: boolean;
   usageConfig?: AutoCompactionConfig;
   idleConfig?: IdleCompactionConfig;
   model?: string;
-}> = ({ data, usageConfig, idleConfig, model }) => {
+}> = ({ data, summary, loading, usageConfig, idleConfig, model }) => {
   const [idleInputValue, setIdleInputValue] = React.useState(idleConfig?.hours?.toString() ?? "24");
 
   // Sync idle input when external hours change
   React.useEffect(() => {
     setIdleInputValue(idleConfig?.hours?.toString() ?? "24");
   }, [idleConfig?.hours]);
-
-  const totalDisplay = formatTokens(data.totalTokens);
-  const maxDisplay = data.maxTokens ? ` / ${formatTokens(data.maxTokens)}` : "";
-  const percentageDisplay = data.maxTokens ? ` (${data.totalPercentage.toFixed(1)}%)` : "";
 
   const showUsageSlider = Boolean(usageConfig && data.maxTokens);
   const isIdleEnabled = idleConfig?.hours !== null && idleConfig?.hours !== undefined;
@@ -121,11 +121,7 @@ const AutoCompactSettings: React.FC<{
       <div>
         <div className="flex items-baseline justify-between">
           <span className="text-foreground font-medium">Context Usage</span>
-          <span className="text-muted text-xs">
-            {totalDisplay}
-            {maxDisplay}
-            {percentageDisplay}
-          </span>
+          <span className="text-muted text-xs">{summary}</span>
         </div>
         {showUsageSlider && usageConfig && (
           <div className="text-muted counter-nums mt-1 text-[10px]">
@@ -184,7 +180,7 @@ const AutoCompactSettings: React.FC<{
       )}
 
       {/* Warning for unknown model limits */}
-      {!data.maxTokens && (
+      {!data.maxTokens && !loading && (
         <div className="text-subtle text-[10px] italic">
           Unknown model limits - showing relative usage only
         </div>
@@ -198,22 +194,31 @@ const AutoCompactSettings: React.FC<{
   );
 };
 
-/** Button labels; a null `compactLabel` means usage is not loaded yet, so no number shows. */
+/**
+ * Button and dialog labels; a null `compactLabel` means usage is not loaded yet, so neither the
+ * button nor the dialog shows a number.
+ */
 function getContextUsageLabels(
   data: TokenMeterData,
   historyLoaded: boolean | undefined
-): { ariaLabel: string; compactLabel: string | null } {
+): { ariaLabel: string; compactLabel: string | null; summary: string } {
   // Cached rows or the pre-replay snapshot already carry usage and show it at once.
   if (historyLoaded === false && data.totalTokens === 0) {
-    return { ariaLabel: "Context usage: loading", compactLabel: null };
+    return { ariaLabel: "Context usage: loading", compactLabel: null, summary: "Loading" };
   }
+  const total = formatTokens(data.totalTokens);
   if (!data.maxTokens) {
-    const total = formatTokens(data.totalTokens);
-    return { ariaLabel: `Context usage: ${total} (unknown limit)`, compactLabel: total };
+    return {
+      ariaLabel: `Context usage: ${total} (unknown limit)`,
+      compactLabel: total,
+      summary: total,
+    };
   }
+  const summary = `${total} / ${formatTokens(data.maxTokens)} (${data.totalPercentage.toFixed(1)}%)`;
   return {
-    ariaLabel: `Context usage: ${formatTokens(data.totalTokens)} / ${formatTokens(data.maxTokens)} (${data.totalPercentage.toFixed(1)}%)`,
+    ariaLabel: `Context usage: ${summary}`,
     compactLabel: `${Math.round(data.totalPercentage)}%`,
+    summary,
   };
 }
 
@@ -232,7 +237,7 @@ export const ContextUsageIndicatorButton: React.FC<ContextUsageIndicatorButtonPr
   // (idle compaction settings should always be accessible when the prop is passed)
   if (data.totalTokens === 0 && !idleCompaction) return null;
 
-  const { ariaLabel, compactLabel } = getContextUsageLabels(data, historyLoaded);
+  const { ariaLabel, compactLabel, summary } = getContextUsageLabels(data, historyLoaded);
 
   return (
     <Dialog>
@@ -320,6 +325,8 @@ export const ContextUsageIndicatorButton: React.FC<ContextUsageIndicatorButtonPr
         </div>
         <AutoCompactSettings
           data={data}
+          summary={summary}
+          loading={compactLabel === null}
           usageConfig={autoCompaction}
           idleConfig={idleCompaction}
           model={model}

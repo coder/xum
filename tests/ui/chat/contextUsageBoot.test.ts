@@ -7,7 +7,7 @@
  */
 
 import "../dom";
-import { waitFor } from "@testing-library/react";
+import { fireEvent, waitFor, within } from "@testing-library/react";
 
 import { installDom } from "../dom";
 import { renderApp } from "../renderReviewPanel";
@@ -77,6 +77,11 @@ describe("Composer context usage before history loads (#6101)", () => {
       // History is still held: the usage is unknown, so no number may show.
       expect(button.getAttribute("aria-label")).not.toMatch(/^Context usage: 0\b/);
       expect(button.querySelector("[data-context-usage-percent]")?.textContent ?? "").toBe("");
+      // The settings dialog opened now must not show a wrong 0 or a limit warning either.
+      fireEvent.click(button);
+      const dialog = await waitFor(() => within(document.body).getByRole("dialog"));
+      expect(within(dialog).getByText("Loading")).toBeTruthy();
+      expect(dialog.textContent ?? "").not.toContain("Unknown model limits");
 
       app.releaseReplay();
       await waitFor(
