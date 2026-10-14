@@ -1136,7 +1136,6 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                               const rowProps = getTranscriptRowProps({
                                 derivations: transcriptRowDerivations,
                                 userMessageNavigationByHistoryId,
-                                messages: renderedMessages,
                                 message: msg,
                                 index,
                               });
