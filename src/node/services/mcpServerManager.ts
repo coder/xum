@@ -3187,9 +3187,14 @@ export class MCPServerManager {
     serve: () => Promise<MCPToolsForWorkspaceResult>
   ): Promise<MCPToolsForWorkspaceResult> {
     const unlistedAtServe = this.hasUnlistedPromptInstances(workspaceId);
+    const stopEpoch = this.workspaceStopEpochs.get(workspaceId) ?? 0;
     const result = await serve();
+    if (!(await this.awaitFirstPromptLists(workspaceId, unlistedAtServe))) return result;
+    // A removal-style stop since the first serve began owns the workspace: never start its
+    // servers again. Return what the first serve returned, as before the wait existed.
+    if ((this.workspaceStopEpochs.get(workspaceId) ?? 0) !== stopEpoch) return result;
     // The second serve also picks up the current entry and enablement.
-    return (await this.awaitFirstPromptLists(workspaceId, unlistedAtServe)) ? serve() : result;
+    return serve();
   }
 
   /**

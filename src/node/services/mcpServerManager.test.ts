@@ -1573,6 +1573,31 @@ describe("MCPServerManager", () => {
     expect(served.promptDescriptors).toEqual([]);
   });
 
+  test("a workspace removed while the send waits for prompts/list is not started again", async () => {
+    const request = workspaceRequest("ws-removed-during-prompts");
+    configService.listServers.mockResolvedValue({ cmd: stdioConfig("cmd-removed-prompts") });
+    const listing = Promise.withResolvers<void>();
+    const held = Promise.withResolvers<void>();
+    servers.serve("cmd-removed-prompts", {
+      listPrompts: async () => {
+        listing.resolve();
+        await held.promise;
+        return [{ name: "review" }];
+      },
+    });
+    await manager.warmWorkspaceServers(request);
+
+    const sending = manager.getToolsForWorkspace(request);
+    await listing.promise;
+    await manager.stopServers(request.workspaceId);
+    held.resolve();
+    const served = await sending;
+
+    expect(servers.connectCount("cmd-removed-prompts")).toBe(1);
+    expect(served.promptDescriptors).toEqual([]);
+    expect(manager.hasWorkspaceRequestOptions(request.workspaceId)).toBe(false);
+  });
+
   test("a server added by a warm-up while an older prompt refresh runs is listed for the send", async () => {
     const request = workspaceRequest("ws-warm-added-prompts");
     configService.listServers.mockResolvedValue({ a: stdioConfig("cmd-added-a") });
