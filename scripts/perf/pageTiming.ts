@@ -9,8 +9,7 @@
  * block for a failed page) and writes qualification.json, which gated runs read with --qualification.
  * For --aa, base and head are two builds of one commit, so build-to-build noise counts as host noise.
  * PAGE_TIMING_LOCK=<file>: one flock hold per run, never per block (the shared dev-host measurement lock).
- * Exit: 0 pass or qualified, 1 a gate failed or the host did not qualify, 2 bad input, 3 an invalid run,
- * 130/143 after Ctrl-C/SIGTERM (which stops the browser and the server, then frees the lock).
+ * Exit: 0 pass or qualified, 1 a gate failed or the host did not qualify, 2 bad input, 3 an invalid run.
  * --out must be a new or empty folder, so a result file in it is always this invocation's.
  * A gated run (--qualification) takes one page: the summary is written only when every page ends.
  */
@@ -21,7 +20,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { parseArgs } from "node:util";
-import { chromium, type Browser } from "playwright";
+import { chromium } from "playwright";
 import { diffSeed, snapshotSeed, writeNeutralSeed } from "./neutralSeed";
 import * as core from "./pageTimingCore";
 import { probe, STATIC_VIEW_ID } from "./pageTimingProbe";
@@ -45,38 +44,15 @@ type Values = Partial<core.Run["values"]>;
 type Host = ReturnType<typeof core.qualifyHostPage>;
 type Common = { page: core.Page; out: string; chrome: string };
 
-/**
- * Ctrl-C or SIGTERM (#6204 item 4) ends the run in progress through its own `finally` blocks, so cleanup
- * keeps its normal order: browser, server, temp folder, then the lock. The handler closes the browsers,
- * ends a flock that still waits, and fails the next wait. Playwright's exit handler kills its browsers.
- */
-let interrupted: NodeJS.Signals | null = null;
-const [browsers, waiters] = [new Set<Browser>(), new Set<number>()]; // waiters: flock process groups
-const signalExit = () => (interrupted === "SIGINT" ? 130 : 143);
-for (const signal of ["SIGINT", "SIGTERM"] as const) {
-  process.once(signal, () => {
-    interrupted = signal;
-    for (const browser of browsers) browser.close().catch(() => {}); // pending calls reject
-    for (const group of waiters) signalIfAlive(-group, "SIGTERM");
-    setTimeout(() => process.exit(signalExit()), 60_000); // a bound, if the unwinding hangs
-  });
-}
-/** A wait the runner gives up on an interrupt (host and health polls; never the reaping of a run). */
-const wait = (ms: number) =>
-  interrupted ? Promise.reject(new Error(`interrupted (${interrupted})`)) : sleep(ms);
-
 /** Holds `flock <file>` while fn runs. The holder exits, and frees the lock, when its stdin closes. */
 async function withLock<T>(fn: () => Promise<T>): Promise<T> {
   const file = process.env.PAGE_TIMING_LOCK;
   if (!file) return fn();
-  // Detached: a terminal's Ctrl-C reaches the whole foreground group, and the lock must outlive it.
-  const lockArgs = ["-w", "3600", file, "sh", "-c", "echo held; exec cat >/dev/null"];
-  const holder = spawn("flock", lockArgs, { detached: true });
+  const holder = spawn("flock", ["-w", "3600", file, "sh", "-c", "echo held; exec cat >/dev/null"]);
   const exited = once(holder, "exit").then(() => null);
-  waiters.add(holder.pid!); // an interrupt ends a flock that still waits: no waiter outlives the runner
-  const held = await Promise.race([once(holder.stdout, "data"), exited]);
-  waiters.delete(holder.pid!);
-  if (held === null) throw new Error(`could not take the lock ${file}`);
+  if ((await Promise.race([once(holder.stdout, "data"), exited])) === null) {
+    throw new Error(`could not take the lock ${file}`);
+  }
   try {
     return await fn();
   } finally {
@@ -129,7 +105,8 @@ async function startServer(tree: string, root: string, home: string, logFile: st
     fetch(`${origin}/health`)
       .then((r) => r.ok)
       .catch(() => false);
-  const stopOnce = async () => {
+  for (let i = 0; i < 120 && !(await up()); i++) await sleep(500);
+  const stop = async () => {
     try {
       process.kill(-server.pid!, "SIGTERM");
     } catch (error) {
@@ -146,14 +123,6 @@ async function startServer(tree: string, root: string, home: string, logFile: st
         throw new Error(`${logFile}: ${String(error)}`);
       });
   };
-  let stopping: Promise<void> | undefined; // the interrupt and the run's own finally both stop it
-  const stop = () => (stopping ??= stopOnce());
-  try {
-    for (let i = 0; i < 120 && !(await up()); i++) await wait(500);
-  } catch (error) {
-    await stop(); // interrupted while the server starts
-    throw error;
-  }
   return { origin, stop };
 }
 
@@ -161,7 +130,7 @@ async function startServer(tree: string, root: string, home: string, logFile: st
 async function measure(o: Common & { tree: string; mode: Signal; name: string }) {
   // One lock hold per run, from seed creation to folder removal, never per block (see the header).
   // Never on a busy host either: runOnQuietHost waits for quiet outside the lock.
-  return core.runOnQuietHost({ isQuiet: hostIsQuietNow, sleep: wait }, withLock, async () => {
+  return core.runOnQuietHost({ isQuiet: hostIsQuietNow, sleep }, withLock, async () => {
     const host = core.hostState(os.loadavg()[0], psi()); // the state runOnQuietHost just accepted
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "page-timing-"));
     const [seedDir, log] = [path.join(tmp, "seed"), path.join(o.out, `${o.name}.server.log`)];
@@ -191,17 +160,8 @@ async function measure(o: Common & { tree: string; mode: Signal; name: string })
 }
 
 async function browse(o: Parameters<typeof measure>[0], url: string) {
-  // A fresh profile. The interrupt handler, not Playwright's, closes the browser (then the server).
-  const launch = {
-    executablePath: o.chrome,
-    headless: true,
-    handleSIGINT: false,
-    handleSIGTERM: false,
-  };
-  const browser = await chromium.launch(launch);
-  browsers.add(browser);
+  const browser = await chromium.launch({ executablePath: o.chrome, headless: true }); // fresh profile
   try {
-    if (interrupted) throw new Error(`interrupted (${interrupted})`); // during the launch
     const context = await browser.newContext(PHONE.context);
     let [workers, fromWorker] = [0, 0];
     context.on("serviceworker", () => workers++);
@@ -234,7 +194,6 @@ async function browse(o: Parameters<typeof measure>[0], url: string) {
     return { url, record, values }; // measure() writes the per-run JSON once the seed check ran
   } finally {
     await browser.close();
-    browsers.delete(browser);
   }
 }
 
@@ -355,9 +314,8 @@ async function main(): Promise<number> {
 
 // A parseArgs error is bad input (2). Any other throw (seed, service worker, timeout, busy host) is 3.
 main().then(
-  (code) => process.exit(interrupted ? signalExit() : code),
+  (code) => process.exit(code),
   (error: unknown) => {
-    if (interrupted) process.exit(signalExit()); // the run unwound: browser, server, folder, lock
     console.error(error);
     process.exit(String((error as { code?: unknown }).code).startsWith("ERR_PARSE_ARGS") ? 2 : 3);
   }

@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { isDeepStrictEqual } from "node:util";
 import {
   minimumDetectableImprovement,
+  QUALIFY_MDI_LIMIT,
   qualifyPage,
   type Qualification,
   type Signal,
@@ -98,9 +99,12 @@ export async function reapRun(
       continue;
     }
     const left = find();
-    left.forEach(kill);
-    // Until they are gone: one in uninterruptible I/O can take a while to die, and the lock waits for it.
-    while (find().length > 0) await sleep(100);
+    // Until they are gone, killing what each poll finds (a fork after the first kill too): a process in
+    // uninterruptible I/O can take a while to die, and the lock waits for it.
+    for (let now = left; now.length > 0; now = find()) {
+      now.forEach(kill);
+      await sleep(100);
+    }
     throw new Error(`processes ${left} outlived the server by 10 s and were killed`);
   }
 }
@@ -157,12 +161,17 @@ export function qualifyHostPage(blocks: Array<Record<Signal, number[]>>): {
   mdi: Record<Signal, number>;
 } {
   const pooled = (signal: Signal) => blocks.flatMap((b) => b[signal]);
+  const mdi = {
+    ucs: minimumDetectableImprovement(pooled("ucs")),
+    ir: minimumDetectableImprovement(pooled("ir")),
+  };
+  // The published MDI pools every A/A pair, so it must meet the limits too (#6204): a confirmatory
+  // block that passes alone cannot qualify a page whose pooled MDI misses them.
+  const within = mdi.ucs <= QUALIFY_MDI_LIMIT.ucs && mdi.ir <= QUALIFY_MDI_LIMIT.ir;
+  const qualification = qualifyPage(blocks);
   return {
-    qualification: qualifyPage(blocks),
-    mdi: {
-      ucs: minimumDetectableImprovement(pooled("ucs")),
-      ir: minimumDetectableImprovement(pooled("ir")),
-    },
+    qualification: qualification === "qualified" && !within ? "inconclusive" : qualification,
+    mdi,
   };
 }
 

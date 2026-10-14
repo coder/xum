@@ -1,6 +1,5 @@
 import { afterAll, expect, test } from "bun:test";
-import { spawn, spawnSync } from "node:child_process";
-import { once } from "node:events";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -54,32 +53,4 @@ test("refuses a --predict key given twice, and a file as --out", () => {
   expect(r.stderr).toContain("duplicate --predict key p1.ucs");
   expect(r.stderr).toContain(`--out ${q} is not a new or empty folder`);
   expect(r.stderr).not.toContain("bad --predict keys");
-}, 60_000);
-
-// #6204 item 4: a signal ends the run in progress through its finally blocks (server, folder, lock).
-// The fake server exits at once, so the signal finds the runner in its host wait or its health wait.
-test("SIGTERM during a run exits 143", async () => {
-  const [t, out] = [tree("d", "<p>1</p>"), path.join(tmp, "signal-out")];
-  const args = [
-    "--chrome",
-    "/bin/true",
-    "--base",
-    t,
-    "--head",
-    t,
-    "--aa",
-    "--pages",
-    "p1",
-    "--out",
-    out,
-  ];
-  const env = { ...process.env, PAGE_TIMING_LOCK: path.join(tmp, "private.lock") };
-  const runner = spawn("node", ["--import", "tsx", "scripts/perf/pageTiming.ts", ...args], {
-    cwd: repo,
-    env,
-  });
-  const exit = once(runner, "exit");
-  while (!fs.existsSync(out)) await new Promise((resolve) => setTimeout(resolve, 100)); // main() runs
-  runner.kill("SIGTERM");
-  expect(await exit).toEqual([143, null]);
 }, 60_000);

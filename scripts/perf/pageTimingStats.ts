@@ -16,7 +16,7 @@ export const NO_REGRESSION_LIMIT: Record<Signal, number> = { ucs: 0.25, ir: 0.3 
 // medians, and for UCS at most 3 of 8 pairs beyond 0.25 s. IR moves in round-trip steps: a wider median.
 const QUALIFY_MEDIAN_LIMIT: Record<Signal, number> = { ucs: 0.1, ir: 0.3 };
 // The owner's rule (#6204): a qualified block must detect a change of this size. One slow pair sets the MDI.
-const QUALIFY_MDI_LIMIT: Record<Signal, number> = { ucs: 0.25, ir: 0.3 };
+export const QUALIFY_MDI_LIMIT: Record<Signal, number> = { ucs: 0.25, ir: 0.3 };
 
 function assertBlock(d: number[]) {
   assert(
