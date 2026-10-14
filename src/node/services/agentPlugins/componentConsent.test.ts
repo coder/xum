@@ -8,14 +8,16 @@ import {
   skillConsentFingerprint,
 } from "./componentConsent";
 
-const roots = { rootPath: "/home/u/.xum/plugins/demo", dataPath: "/home/u/.xum/plugin-data/abc" };
+const root = "/home/u/.xum/plugins/demo";
+const data = "/home/u/.xum/plugin-data/abc";
+const roots = { rootPaths: [root], dataPaths: [data] };
 const stdio: MCPStdioServerInfo = {
   transport: "stdio",
   disabled: false,
   command: "node",
-  args: [`${roots.rootPath}/server.js`],
-  env: { B: "2", A: "1", PLUGIN_DATA: roots.dataPath },
-  cwd: roots.rootPath,
+  args: [`${root}/server.js`],
+  env: { B: "2", A: "1", PLUGIN_DATA: data },
+  cwd: root,
 };
 const remote: MCPHttpServerInfo = {
   transport: "http",
@@ -30,12 +32,13 @@ const remote: MCPHttpServerInfo = {
 describe("serverConsentFingerprint", () => {
   test("is stable across install locations, env order and user-owned fields", () => {
     const fp = serverConsentFingerprint(stdio, roots);
-    const moved = { rootPath: "/srv/staging/demo", dataPath: "/srv/data/xyz" };
+    // A staged review also normalizes the final install path, which a manifest can name.
+    const moved = { rootPaths: ["/srv/staging/demo", root], dataPaths: ["/srv/data/xyz", data] };
     const relocated: MCPStdioServerInfo = {
       ...stdio,
-      args: [`${moved.rootPath}/server.js`],
-      env: { A: "1", PLUGIN_DATA: moved.dataPath, B: "2" },
-      cwd: moved.rootPath,
+      args: ["/srv/staging/demo/server.js"],
+      env: { A: "1", PLUGIN_DATA: data, B: "2" },
+      cwd: root,
       // Owned by the user or the UI, not the plugin.
       disabled: true,
       toolAllowlist: ["one"],
@@ -61,7 +64,7 @@ describe("serverConsentFingerprint", () => {
       { ...stdio, command: "python3" },
       { ...stdio, args: [...(stdio.args ?? []), "--flag"] },
       { ...stdio, env: { ...stdio.env, NODE_OPTIONS: "--require=x" } },
-      { ...stdio, cwd: roots.dataPath },
+      { ...stdio, cwd: data },
     ];
     const prints = new Set(variants.map((variant) => serverConsentFingerprint(variant, roots)));
     expect(prints.size).toBe(variants.length);
@@ -138,6 +141,15 @@ describe("consentForSelection", () => {
     });
     // `a` keeps its old record and `s` stays without one: the picker did not review them.
     expect(consent).toEqual({ skills: { a: "a1", b: "b2" }, mcpServers: {} });
+  });
+
+  test("a component named __proto__ stays an own record", () => {
+    const consent = consentForSelection({
+      selection: { skills: [], mcpServers: ["__proto__"] },
+      shown: { skills: {}, mcpServers: Object.fromEntries([["__proto__", "p1"]]) },
+    });
+    expect(Object.hasOwn(consent.mcpServers, "__proto__")).toBe(true);
+    expect(isComponentConsented(consent, "mcpServers", "__proto__", "p1")).toBe(true);
   });
 
   test("narrowing a legacy import-all entry approves nothing", () => {

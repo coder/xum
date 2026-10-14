@@ -97,7 +97,7 @@ import {
   UPDATE_JOURNAL_PREFIX,
 } from "./journals";
 import { PLUGIN_REGISTRY_FILE_NAME, readPluginRegistryDocument } from "./registry";
-import type { AgentPluginManifest } from "./manifest";
+import { isPlainObject, type AgentPluginManifest } from "./manifest";
 import { hashPluginTree } from "./treeHash";
 import {
   buildPluginServerKey,
@@ -222,6 +222,14 @@ type CollectedPluginSkill = AgentPluginPreviewSkill & {
  * display rendering is NOT used for comparison because a multi-line description could
  * imitate it.
  */
+/**
+ * The raw registry consent with this build's kinds replaced. A newer build may store more kinds,
+ * and a save on this build must keep them (downgrade round-trip).
+ */
+function mergeRawConsent(raw: unknown, consent: ComponentConsent): Record<string, unknown> {
+  return { ...(isPlainObject(raw) ? raw : {}), ...consent };
+}
+
 /** Every component of an inventory: what a legacy import-all entry (no selection) imports. */
 function fullSelection(
   inventory: Pick<AgentPluginComponents, "skills" | "mcpServers">
@@ -2056,19 +2064,23 @@ export class AgentPluginInstallService {
     warnings.push(...diagnostics.map((d) => d.message));
 
     const rewrite = (value: string): string => value.split(plugin.rootPath).join(finalTargetPath);
+    // A staged review must also normalize the final path: a manifest can name it literally.
     const paths = {
-      rootPath: plugin.rootPath,
-      dataPath: getPluginDataPath(this.config.rootDir, instanceId),
+      rootPaths: [plugin.rootPath, finalTargetPath],
+      dataPaths: [getPluginDataPath(this.config.rootDir, instanceId)],
     };
-    const fingerprints: Record<string, string> = {};
-    const previews: AgentPluginPreviewMcpServer[] = Object.values(servers).map((info) => {
+    const entries = Object.values(servers).map((info) => {
       const preview = this.describeMcpServer(info, rewrite, finalTargetPath);
-      fingerprints[preview.serverName] = serverConsentFingerprint(info, paths);
-      return preview;
+      return [preview, serverConsentFingerprint(info, paths)] as const;
     });
     return {
-      previews: previews.sort((a, b) => a.serverName.localeCompare(b.serverName)),
-      fingerprints,
+      previews: entries
+        .map(([preview]) => preview)
+        .sort((a, b) => a.serverName.localeCompare(b.serverName)),
+      // From entries, never by assignment: a server named `__proto__` must stay an own key.
+      fingerprints: Object.fromEntries(
+        entries.map(([preview, fingerprint]) => [preview.serverName, fingerprint])
+      ),
     };
   }
 
@@ -2326,7 +2338,7 @@ export class AgentPluginInstallService {
       try {
         const { plugin } = await this.validateStagedClone(stagedDir);
         const name = plugin.name;
-        const inventory = await this.collectComponents(plugin);
+        const inventory = await this.collectComponents(plugin, this.targetPathFor(name));
         const importedComponents =
           args.importedComponents === undefined
             ? undefined
@@ -3055,13 +3067,20 @@ export class AgentPluginInstallService {
   }
 
   /** Full inventory deliberately ignores saved imports: package update consent stays unchanged. */
-  private async collectComponents(plugin: AgentPluginInfo) {
+  /**
+   * `finalTargetPath` is where the plugin is (or will be) installed. A staged clone passes it so
+   * PLUGIN_DATA and the consent fingerprints match what the installed tree loads.
+   */
+  private async collectComponents(
+    plugin: AgentPluginInfo,
+    finalTargetPath = path.join(plugin.containerPath, plugin.dirName)
+  ) {
     const warnings: string[] = [];
     const skills = await this.collectSkillsFromRoots(plugin, warnings);
     const { previews: mcpServers, fingerprints } = await this.collectMcpServers(
       { ...plugin, importedComponents: undefined },
-      path.join(plugin.containerPath, plugin.dirName),
-      computePluginInstanceId(path.join(plugin.containerPath, plugin.dirName)),
+      finalTargetPath,
+      computePluginInstanceId(finalTargetPath),
       warnings
     );
     return {
@@ -3256,7 +3275,7 @@ export class AgentPluginInstallService {
               ...(record.importedComponents as Record<string, unknown>),
               ...importedComponents,
             },
-            componentConsent,
+            componentConsent: mergeRawConsent(record.componentConsent, componentConsent),
           };
         })
       );

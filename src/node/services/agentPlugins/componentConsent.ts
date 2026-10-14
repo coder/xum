@@ -64,23 +64,36 @@ const OAUTH_FIELDS: Record<keyof MCPServerOAuthConfig, FieldRule> = {
 };
 
 export interface ConsentPaths {
-  /** Plugin root as this load or review sees it (a staged clone or the installed tree). */
-  rootPath: string;
-  /** The instance's PLUGIN_DATA directory. */
-  dataPath: string;
+  /**
+   * Plugin root spellings that mean "this plugin": the tree this load or review reads, plus the
+   * final install path when a review reads a staged clone (a manifest can name it literally).
+   */
+  rootPaths: readonly string[];
+  /** The instance's PLUGIN_DATA directory spellings, the same way. */
+  dataPaths: readonly string[];
 }
 
 /**
  * Replace the plugin root and data directory with tags, so a staged clone and the installed tree
- * hash alike. `%` and `<` are escaped first: a literal `<root>/x` in a manifest must never hash
- * like the plugin's own `x`.
+ * hash alike. Longer spellings go first, and `%` and `<` are escaped in the remaining text: a
+ * literal `<root>/x` in a manifest must never hash like the plugin's own `x`.
  */
 function normalizePaths(value: string, paths: ConsentPaths): string {
-  const escape = (part: string): string => part.replaceAll("%", "%25").replaceAll("<", "%3C");
-  return value
-    .split(paths.rootPath)
-    .map((part) => part.split(paths.dataPath).map(escape).join("<data>"))
-    .join("<root>");
+  const tokens = [
+    ...paths.rootPaths.map((needle) => [needle, "<root>"] as const),
+    ...paths.dataPaths.map((needle) => [needle, "<data>"] as const),
+  ]
+    .filter(([needle]) => needle.length > 0)
+    .sort(([a], [b]) => b.length - a.length);
+  const replace = (text: string, index: number): string => {
+    if (index === tokens.length) return text.replaceAll("%", "%25").replaceAll("<", "%3C");
+    const [needle, tag] = tokens[index];
+    return text
+      .split(needle)
+      .map((part) => replace(part, index + 1))
+      .join(tag);
+  };
+  return replace(value, 0);
 }
 
 function normalizeValue(value: unknown, paths: ConsentPaths): unknown {
@@ -178,18 +191,18 @@ export function consentForSelection(args: {
   shown: ComponentConsent;
   previous?: { selection: ComponentSelection; consent: ComponentConsent | undefined };
 }): ComponentConsent {
-  const records = (kind: keyof ComponentConsent): Record<string, string> => {
-    const result: Record<string, string> = {};
-    for (const name of args.selection[kind]) {
-      const kept = args.previous?.selection[kind].includes(name) === true;
-      const fingerprint = kept
-        ? args.previous?.consent !== undefined
-          ? getOwn(args.previous.consent[kind], name)
-          : undefined
-        : getOwn(args.shown[kind], name);
-      if (fingerprint !== undefined) result[name] = fingerprint;
-    }
-    return result;
-  };
+  // Built from entries, never by assignment: a component named `__proto__` must stay an own key.
+  const records = (kind: keyof ComponentConsent): Record<string, string> =>
+    Object.fromEntries(
+      args.selection[kind].flatMap((name) => {
+        const kept = args.previous?.selection[kind].includes(name) === true;
+        const fingerprint = kept
+          ? args.previous?.consent !== undefined
+            ? getOwn(args.previous.consent[kind], name)
+            : undefined
+          : getOwn(args.shown[kind], name);
+        return fingerprint !== undefined ? [[name, fingerprint] as const] : [];
+      })
+    );
   return { skills: records("skills"), mcpServers: records("mcpServers") };
 }

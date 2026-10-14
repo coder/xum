@@ -1478,6 +1478,32 @@ describe("AgentPluginInstallService", () => {
     expect(stored.plugins[0].componentConsent).toEqual(installed.componentConsent);
   });
 
+  test("a picker save keeps consent fields a newer build wrote (#6498)", async () => {
+    const preview = await service.preview({ input: remoteDir });
+    await service.install({
+      source: preview.source,
+      expectedSha: preview.lockedSha,
+      importedComponents: { skills: ["greet"], mcpServers: [] },
+    });
+    const document = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<{ componentConsent: Record<string, unknown> }>;
+    };
+    document.plugins[0].componentConsent.agents = { helper: "future" };
+    await fsPromises.writeFile(registryFile(), JSON.stringify(document));
+    const inventory = await service.getComponents({ name: "demo-plugin" });
+    await service.setComponents({
+      name: "demo-plugin",
+      expectedLockedSha: inventory.lockedSha,
+      expectedContentHash: inventory.contentHash,
+      expectedImportedComponents: { skills: ["greet"], mcpServers: [] },
+      importedComponents: { skills: ["greet"], mcpServers: ["echo"] },
+    });
+    const stored = JSON.parse(await fsPromises.readFile(registryFile(), "utf8")) as {
+      plugins: Array<{ componentConsent: Record<string, unknown> }>;
+    };
+    expect(stored.plugins[0].componentConsent.agents).toEqual({ helper: "future" });
+  });
+
   test("a component picker save records consent only for newly added components (#6498)", async () => {
     const preview = await service.preview({ input: remoteDir });
     await service.install({
