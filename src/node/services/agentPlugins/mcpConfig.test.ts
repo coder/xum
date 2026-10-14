@@ -276,7 +276,7 @@ describe("loadPluginMcpServers", () => {
     ]);
     // Only names: no host value is read at load time.
     expect(Object.keys(infos[0].env ?? {})).toEqual(["PLUGIN_ROOT", "PLUGIN_DATA"]);
-    expect(diagnostics.map((d) => [d.severity, d.message.match(/server '(\w+)'/)?.[1]])).toEqual([
+    expect(diagnostics.map((d) => [d.severity, /server '(\w+)'/.exec(d.message)?.[1]])).toEqual([
       ["error", "notList"],
       ["error", "remoteSource"],
       ["error", "reserved"],

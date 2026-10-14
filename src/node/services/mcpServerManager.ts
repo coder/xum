@@ -955,18 +955,6 @@ async function mkdirSelfHealing(target: string): Promise<void> {
 }
 
 /**
- * Compose the shell command string and exec options for a stdio server.
- *
- * Servers with `args` set (Agent Plugins) run in argv mode: `command` and each
- * arg are individually shell-quoted, so hostile arg content cannot inject
- * shell syntax. Legacy entries (no `args`) keep raw shell-string behavior.
- *
- * For Agent Plugin servers this also creates the `PLUGIN_DATA` directory,
- * which the spec requires to exist before the subprocess launches (§9.1).
- *
- * Exported for tests.
- */
-/**
  * Codex `env_vars`: copy only the named host variables (unset ones are skipped, as in
  * codex-rs create_env_for_mcp_server). Configured env wins, so PLUGIN_ROOT/PLUGIN_DATA stay put.
  */
@@ -982,6 +970,18 @@ function withForwardedHostEnv(
   return Object.keys(forwarded).length > 0 ? { ...forwarded, ...env } : env;
 }
 
+/**
+ * Compose the shell command string and exec options for a stdio server.
+ *
+ * Servers with `args` set (Agent Plugins) run in argv mode: `command` and each
+ * arg are individually shell-quoted, so hostile arg content cannot inject
+ * shell syntax. Legacy entries (no `args`) keep raw shell-string behavior.
+ *
+ * For Agent Plugin servers this also creates the `PLUGIN_DATA` directory,
+ * which the spec requires to exist before the subprocess launches (§9.1).
+ *
+ * Exported for tests.
+ */
 export async function prepareStdioLaunch(info: MCPStdioServerInfo): Promise<StdioLaunch> {
   const command =
     info.args !== undefined ? [info.command, ...info.args].map(shellQuote).join(" ") : info.command;
