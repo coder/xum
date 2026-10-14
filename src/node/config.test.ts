@@ -1853,6 +1853,43 @@ describe("Config", () => {
     });
   });
 
+  describe("change notifications from another process", () => {
+    // A second Config on the same root stands in for another Xum backend: it shares no
+    // in-memory state with `config`, so only the file watcher can carry its edits over.
+    function nextNotification(target: Config): { promise: Promise<void>; unsubscribe: () => void } {
+      const fired = Promise.withResolvers<void>();
+      const unsubscribe = target.onConfigChanged(() => fired.resolve());
+      return { promise: fired.promise, unsubscribe };
+    }
+
+    it("notifies listeners when another process rewrites config.json", async () => {
+      await config.setUpdateChannel("npm");
+      const next = nextNotification(config);
+      await new Config(tempDir).setUpdateChannel("nightly");
+      await next.promise;
+      next.unsubscribe();
+      expect(config.getUpdateChannel()).toBe("nightly");
+    });
+
+    it("notifies once for its own edit", async () => {
+      await config.setUpdateChannel("npm");
+      let notifications = 0;
+      const unsubscribe = config.onConfigChanged(() => {
+        notifications += 1;
+      });
+      await config.setUpdateChannel("nightly");
+      expect(notifications).toBe(1);
+      // The watcher handles events in order, so once the foreign edit arrives, any echo of
+      // the own edit would have arrived first.
+      const next = nextNotification(config);
+      await new Config(tempDir).setUpdateChannel("npm");
+      await next.promise;
+      next.unsubscribe();
+      expect(notifications).toBe(2);
+      unsubscribe();
+    });
+  });
+
   describe("read-only workspace metadata", () => {
     it("getWorkspaceMetadataById with persistMigrations: false fills defaults without writing", async () => {
       const projectPath = path.join(tempDir, "repo");

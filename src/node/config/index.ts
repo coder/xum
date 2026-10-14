@@ -1408,8 +1408,8 @@ export class Config {
   /**
    * Cheap durable change signal for config.json: one stat, no parse. Any
    * backend's rewrite changes size/mtime (atomic replace also changes the
-   * inode), so a memo built against a previous stamp knows to rebuild —
-   * unlike onConfigChanged, which only fires for THIS process's edits. A
+   * inode), so a memo built against a previous stamp knows to rebuild, even
+   * before onConfigChanged's watcher delivers another backend's edit. A
    * missing/unreadable file yields a distinct stamp.
    */
   configFileStamp(): string {
@@ -1519,11 +1519,76 @@ export class Config {
       .map((workspace) => ({ ...workspace, bestOf: { ...workspace.bestOf } }));
   }
 
+  /**
+   * Fires after every config.json change: this process's own edits (notified right after the
+   * write), and rewrites by another Xum backend (seen through a watch on the config dir).
+   */
   onConfigChanged(callback: () => void): () => void {
     this.emitter.on("configChanged", callback);
+    this.ensureConfigFileWatcher();
     return () => {
       this.emitter.off("configChanged", callback);
+      if (this.emitter.listenerCount("configChanged") === 0) this.closeConfigFileWatcher();
     };
+  }
+
+  /** Watch on the config dir; open only while onConfigChanged has listeners. */
+  private configFileWatcher: fs.FSWatcher | null = null;
+  /**
+   * The config.json stamp the last notification covers. Own saves set it before they
+   * notify, so the watcher's echo of an own save compares equal and stays silent. A stamp
+   * read after a foreign rename that raced an own save is adopted too, but the own save's
+   * notification then fires after that rename, so listeners still re-read the foreign bytes.
+   */
+  private notifiedConfigFileStamp = "missing";
+
+  private ensureConfigFileWatcher(): void {
+    if (this.configFileWatcher != null) return;
+    const configFileName = path.basename(this.configFile);
+    let watcher: fs.FSWatcher;
+    try {
+      // Watch the directory, not the file: atomic saves rename a temp file over config.json,
+      // and a file watch follows the old inode.
+      watcher = fs.watch(this.rootDir, { persistent: false }, (_event, filename) => {
+        // Some platforms omit the filename; treat that as a possible config.json change.
+        if (filename != null && filename !== configFileName) return;
+        this.handleConfigFileEvent();
+      });
+    } catch (error) {
+      // The root dir does not exist before the first save. saveConfig retries after it
+      // creates the dir.
+      log.debug("Config file watcher not started", { rootDir: this.rootDir, error });
+      return;
+    }
+    watcher.on("error", (error) => {
+      log.debug("Config file watcher stopped", { rootDir: this.rootDir, error });
+      if (this.configFileWatcher === watcher) this.closeConfigFileWatcher();
+    });
+    this.configFileWatcher = watcher;
+    // Changes before the watch started are not events: listeners read config when they
+    // subscribe.
+    this.notifiedConfigFileStamp = this.configFileStamp();
+  }
+
+  private closeConfigFileWatcher(): void {
+    this.configFileWatcher?.close();
+    this.configFileWatcher = null;
+  }
+
+  private configSavesInFlight = 0;
+  private configFileEventHeld = false;
+
+  private handleConfigFileEvent(): void {
+    if (this.configSavesInFlight > 0) {
+      this.configFileEventHeld = true;
+      return;
+    }
+    const stamp = this.configFileStamp();
+    // Xum replaces config.json by rename, so it never goes missing between writes. A deleted
+    // file is not an edit to announce: a listener reading it would see defaults.
+    if (stamp === "missing" || stamp === this.notifiedConfigFileStamp) return;
+    this.notifiedConfigFileStamp = stamp;
+    this.notifyConfigChanged();
   }
 
   private deferredChangeNotificationDepth = 0;
@@ -2871,9 +2936,24 @@ export class Config {
       // and the npm write-file-atomic package renamed that truncated file over
       // config.json, which then loaded as an empty registry (coder/xum#4197).
       yield* Effect.tryPromise({
-        try: async () => writeFileAtomic(self.configFile, text, "utf-8"),
+        try: async () => {
+          // The watcher can see the rename before this write's stamp is recorded. It holds
+          // events until then, so the echo of this write compares equal and stays silent.
+          self.configSavesInFlight += 1;
+          try {
+            await writeFileAtomic(self.configFile, text, "utf-8");
+            self.notifiedConfigFileStamp = self.configFileStamp();
+          } finally {
+            self.configSavesInFlight -= 1;
+            if (self.configSavesInFlight === 0 && self.configFileEventHeld) {
+              self.configFileEventHeld = false;
+              self.handleConfigFileEvent();
+            }
+          }
+        },
         catch: (error) => error,
       });
+      if (self.emitter.listenerCount("configChanged") > 0) self.ensureConfigFileWatcher();
       // A competing rename may already have replaced our write; only a fresh read can publish it.
       // Keep a snapshot only if a reader already parsed the file that is on disk now (it read
       // real disk bytes, whoever wrote them), so the first reader after the save does not parse
