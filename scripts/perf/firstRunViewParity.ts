@@ -117,7 +117,13 @@ async function main(): Promise<number> {
   fs.mkdirSync(out, { recursive: true });
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "parity-root-"));
   const server = await startServer(path.resolve(a.tree), root, path.join(out, "server.log"));
-  const browser = await chromium.launch({ executablePath: a.chrome, headless: true });
+  // A route-fulfilled document has no local address space, so Local Network Access would block the
+  // app's WebSocket to 127.0.0.1. pageTiming.ts navigates without fulfill and needs no such flag.
+  const browser = await chromium.launch({
+    executablePath: a.chrome,
+    headless: true,
+    args: ["--disable-features=LocalNetworkAccessChecks"],
+  });
   const results = [];
   let injected = false;
   try {
@@ -146,8 +152,17 @@ async function main(): Promise<number> {
           await route.continue();
         });
         await page.goto(`${server.origin}/`, { waitUntil: "commit" });
-        await page.waitForFunction(() => document.fonts.status === "loaded", null, {
-          timeout: 60_000,
+        // Measure the painted static view: stylesheets applied, then the fonts that layout asked for.
+        // (No named inner functions: tsx's keepNames would wrap them in __name, which the page lacks.)
+        await page.evaluate(async () => {
+          const sheets = "link[rel=stylesheet]";
+          while (![...document.querySelectorAll<HTMLLinkElement>(sheets)].every((l) => l.sheet)) {
+            await new Promise((resolve) => requestAnimationFrame(resolve));
+          }
+          void document.body.offsetHeight; // layout now, so the fonts it needs start loading
+          await document.fonts.ready;
+          for (let i = 0; i < 2; i++)
+            await new Promise((resolve) => requestAnimationFrame(resolve));
         });
         const staticBox = await paragraphBox(page, true);
         if (!staticBox) throw new Error(`${name}: the static view shows no target paragraph`);
