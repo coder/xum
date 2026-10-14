@@ -15,6 +15,7 @@ import {
   setAutoRoutingPick,
   setWorkspaceAgentPick,
   setWorkspaceAiMetadata,
+  snapshotPendingAiSelection,
 } from "@/browser/utils/aiSelectionIntent";
 
 const WS = "intent-ws";
@@ -251,5 +252,21 @@ describe("aiSelectionIntent", () => {
     expect(getWorkspaceAgentId(WS)).toBe("plan");
     expect(getPendingAiSelection(WS, "exec", "model")).toBeUndefined();
     expect(getAutoRoutingPick(WS, "exec", "model")).toBeUndefined();
+  });
+
+  test("copied picks replace the destination's own, so it shows the source's choices", () => {
+    const DEST = "dest-ws";
+    setAutoRoutingPick(WS, "plan", "model", false);
+    markAiSelectionIntent(WS, "reasoningMode", "pro");
+    setAutoRoutingPick(DEST, "plan", "model", true);
+    setAutoRoutingPick(DEST, "plan", "thinkingLevel", true);
+    markAiSelectionIntent(DEST, "serviceTier", "flex");
+
+    snapshotPendingAiSelection(WS)(DEST);
+
+    expect(getAutoRoutingPick(DEST, "plan", "model")).toBe(false);
+    expect(getAutoRoutingPick(DEST, "plan", "thinkingLevel")).toBeUndefined();
+    expect(getPendingAiSelection(DEST, "exec", "reasoningMode")).toBe("pro");
+    expect(getPendingAiSelection(DEST, "exec", "serviceTier")).toBeUndefined();
   });
 });

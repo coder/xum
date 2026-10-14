@@ -279,6 +279,16 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     setError(null);
   }, [persistedKey, cancelPendingGeneration]);
 
+  // A request that settles after unmount must not write its scope's state: a draft moved to
+  // another project migrates that state away, and the write would leave a name behind there.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
   const generateIdentity = useCallback(
     async (forMessage: string): Promise<WorkspaceIdentity | null> => {
       if (!api || !forMessage.trim()) {
@@ -286,6 +296,14 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
       }
 
       const requestId = ++requestIdRef.current;
+      const storeIdentity = (identity: WorkspaceIdentity) => {
+        if (!mountedRef.current) return;
+        setStored((prev) => ({
+          ...prev,
+          generatedIdentity: identity,
+          lastGeneratedFor: toStoredMessage(forMessage),
+        }));
+      };
       setIsGenerating(true);
       setError(null);
 
@@ -319,22 +337,14 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
             title: result.data.title,
           };
 
-          setStored((prev) => ({
-            ...prev,
-            generatedIdentity: identity,
-            lastGeneratedFor: toStoredMessage(forMessage),
-          }));
+          storeIdentity(identity);
 
           safeResolve(identity);
           return identity;
         }
 
         const fallbackIdentity = buildFallbackWorkspaceIdentity(forMessage);
-        setStored((prev) => ({
-          ...prev,
-          generatedIdentity: fallbackIdentity,
-          lastGeneratedFor: toStoredMessage(forMessage),
-        }));
+        storeIdentity(fallbackIdentity);
         setError(null);
         safeResolve(fallbackIdentity);
         return fallbackIdentity;
@@ -343,11 +353,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
           return null;
         }
         const fallbackIdentity = buildFallbackWorkspaceIdentity(forMessage);
-        setStored((prev) => ({
-          ...prev,
-          generatedIdentity: fallbackIdentity,
-          lastGeneratedFor: toStoredMessage(forMessage),
-        }));
+        storeIdentity(fallbackIdentity);
         setError(null);
         safeResolve(fallbackIdentity);
         return fallbackIdentity;
