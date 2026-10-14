@@ -71,6 +71,15 @@ describe("readOpenAIMcpAuth", () => {
     expect(result.warnings[0]).toContain("client.clientId' is required");
   });
 
+  test("custom_header without a headerName is malformed, not unsupported", () => {
+    // OpenAI's auth reference requires headerName for headerScheme custom_header.
+    const result = readOpenAIMcpAuth(withAuth({ type: "api_key", headerScheme: "custom_header" }));
+    expect(result.auth).toEqual({ type: "api_key" });
+    expect(result.warnings).toHaveLength(1);
+    expect(result.warnings[0]).toContain("headerName' is required");
+    expect(result.ignored).toEqual(["type: api_key (no plugin API key storage)"]);
+  });
+
   test("an http endpoint override is kept only for a loopback host", () => {
     const result = readOpenAIMcpAuth(
       withAuth({

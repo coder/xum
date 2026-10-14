@@ -234,13 +234,54 @@ describe("loadPluginMcpServers", () => {
     const plugin = await makePlugin(
       tmp.path,
       "flat",
-      { local: { command: "node", args: ["server.js"] } },
+      {
+        local: { command: "node", args: ["server.js"] },
+        // Codex's plugin parser infers streamable HTTP from a url without a type.
+        remote: { url: "https://a.example.com/mcp" },
+      },
       { fileName: ".mcp.json" }
     );
     const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
     expect(diagnostics).toEqual([]);
     expect(Object.values(servers).map((s) => [s.plugin?.serverName, s.transport])).toEqual([
       ["local", "stdio"],
+      ["remote", "http"],
+    ]);
+  });
+
+  test("the Codex dialect forwards only the host variables that env_vars names", async () => {
+    using tmp = new DisposableTempDir("plugin-mcp");
+    const plugin = await makePlugin(
+      tmp.path,
+      "env-vars",
+      {
+        mcpServers: {
+          // Codex accepts a bare name or { name, source } (codex-rs config mcp_types.rs).
+          named: { command: "node", env_vars: ["API_TOKEN", { name: "REGION", source: "local" }] },
+          notList: { command: "node", env_vars: "API_TOKEN" },
+          // Codex refuses source "remote" for a plugin that runs in the local environment.
+          remoteSource: { command: "node", env_vars: [{ name: "X", source: "remote" }] },
+          reserved: { command: "node", env_vars: ["PLUGIN_DATA"] },
+          badName: { command: "node", env_vars: ["A=B"] },
+          // Codex rejects env_vars on a streamable HTTP server.
+          http: { url: "https://a.example.com/mcp", env_vars: ["API_TOKEN"] },
+        },
+      },
+      { fileName: ".mcp.json" }
+    );
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
+    const infos = Object.values(servers) as MCPStdioServerInfo[];
+    expect(infos.map((s) => [s.plugin?.serverName, s.forwardEnv])).toEqual([
+      ["named", ["API_TOKEN", "REGION"]],
+    ]);
+    // Only names: no host value is read at load time.
+    expect(Object.keys(infos[0].env ?? {})).toEqual(["PLUGIN_ROOT", "PLUGIN_DATA"]);
+    expect(diagnostics.map((d) => [d.severity, d.message.match(/server '(\w+)'/)?.[1]])).toEqual([
+      ["error", "notList"],
+      ["error", "remoteSource"],
+      ["error", "reserved"],
+      ["error", "badName"],
+      ["error", "http"],
     ]);
   });
 
@@ -288,11 +329,13 @@ describe("loadPluginMcpServers", () => {
       mcpDoc({
         http: { type: "http", url: "https://a.example.com" },
         oauth: { type: "streamable-http", url: "https://a.example.com", oauth: {} },
+        untyped: { url: "https://a.example.com" },
+        envVars: { ...STDIO_ENTRY, env_vars: ["API_TOKEN"] },
       })
     );
     const { servers, diagnostics } = await loadPluginMcpServers(dialect, { xumHome: tmp.path });
     expect(servers).toEqual({});
-    expect(diagnostics.map((d) => d.severity)).toEqual(["error", "error"]);
+    expect(diagnostics.map((d) => d.severity)).toEqual(["error", "error", "error", "error"]);
   });
 
   test("skips remote entries with configured headers (redirect conformance) with a warning", async () => {

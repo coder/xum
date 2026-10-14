@@ -9815,6 +9815,36 @@ describe("prepareStdioLaunch", () => {
     );
   });
 
+  test("copies only the host variables forwardEnv names; configured env wins", async () => {
+    const names = ["XUM_TEST_FWD_SET", "XUM_TEST_FWD_UNSET", "XUM_TEST_FWD_SHADOWED"] as const;
+    const saved = names.map((name) => process.env[name]);
+    process.env.XUM_TEST_FWD_SET = "host";
+    delete process.env.XUM_TEST_FWD_UNSET;
+    process.env.XUM_TEST_FWD_SHADOWED = "host";
+    process.env.XUM_TEST_FWD_NOT_NAMED = "host";
+    try {
+      const launch = await prepareStdioLaunch({
+        transport: "stdio",
+        command: "node",
+        args: [],
+        env: { XUM_TEST_FWD_SHADOWED: "configured" },
+        forwardEnv: [...names],
+        disabled: false,
+      });
+      // An unset name is skipped, as in Codex's create_env_for_mcp_server.
+      expect(launch.env).toEqual({
+        XUM_TEST_FWD_SET: "host",
+        XUM_TEST_FWD_SHADOWED: "configured",
+      });
+    } finally {
+      names.forEach((name, index) => {
+        if (saved[index] === undefined) delete process.env[name];
+        else process.env[name] = saved[index];
+      });
+      delete process.env.XUM_TEST_FWD_NOT_NAMED;
+    }
+  });
+
   test("creates the PLUGIN_DATA directory for plugin servers before launch", async () => {
     using tmp = new DisposableTempDir("mcp-plugin-data");
     const dataPath = path.join(tmp.path, "plugin-data", "abc123");

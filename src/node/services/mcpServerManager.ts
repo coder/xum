@@ -966,6 +966,22 @@ async function mkdirSelfHealing(target: string): Promise<void> {
  *
  * Exported for tests.
  */
+/**
+ * Codex `env_vars`: copy only the named host variables (unset ones are skipped, as in
+ * codex-rs create_env_for_mcp_server). Configured env wins, so PLUGIN_ROOT/PLUGIN_DATA stay put.
+ */
+function withForwardedHostEnv(
+  forwardEnv: string[] | undefined,
+  env: Record<string, string> | undefined
+): Record<string, string> | undefined {
+  const forwarded: Record<string, string> = {};
+  for (const name of forwardEnv ?? []) {
+    const value = process.env[name];
+    if (value !== undefined) forwarded[name] = value;
+  }
+  return Object.keys(forwarded).length > 0 ? { ...forwarded, ...env } : env;
+}
+
 export async function prepareStdioLaunch(info: MCPStdioServerInfo): Promise<StdioLaunch> {
   const command =
     info.args !== undefined ? [info.command, ...info.args].map(shellQuote).join(" ") : info.command;
@@ -994,10 +1010,12 @@ export async function prepareStdioLaunch(info: MCPStdioServerInfo): Promise<Stdi
     }
   }
 
+  const env = withForwardedHostEnv(info.forwardEnv, info.env);
+
   return {
     command,
     ...(info.cwd !== undefined ? { cwd: info.cwd } : {}),
-    ...(info.env !== undefined ? { env: info.env } : {}),
+    ...(env !== undefined ? { env } : {}),
   };
 }
 
@@ -4328,6 +4346,8 @@ export class MCPServerManager {
           command: info.command,
           args: info.args ?? null,
           env: info.env ?? null,
+          // JSON.stringify drops it when unset, so other servers keep their signature.
+          forwardEnv: info.forwardEnv,
           cwd: info.cwd ?? null,
         };
         continue;

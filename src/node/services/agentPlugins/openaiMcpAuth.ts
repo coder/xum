@@ -151,6 +151,33 @@ function readClient(
   return client;
 }
 
+/** RFC 9110 token, minus `Host` (it names the server, not a credential). */
+function isHeaderName(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(value) &&
+    value.toLowerCase() !== "host"
+  );
+}
+
+/** `headerScheme` + `headerName` (api_key auth); malformed values become warnings. */
+function readHeaderSettings(
+  raw: Record<string, unknown>,
+  auth: OpenAIMcpAuth,
+  result: ReadOpenAIMcpAuthResult
+): void {
+  if (raw.headerScheme !== undefined) {
+    if (typeof raw.headerScheme === "string" && HEADER_SCHEMES.has(raw.headerScheme))
+      auth.headerScheme = raw.headerScheme as NonNullable<OpenAIMcpAuth["headerScheme"]>;
+    else result.warnings.push(`'${AUTH}.headerScheme' must be bearer, basic or custom_header`);
+  }
+  if (raw.headerName !== undefined) {
+    if (auth.headerScheme === "custom_header" && isHeaderName(raw.headerName))
+      auth.headerName = raw.headerName;
+    else result.warnings.push(`'${AUTH}.headerName' needs headerScheme custom_header; ignoring`);
+  }
+}
+
 /** The parsed auth block; fields the flow cannot use yet go to `result.ignored`. */
 function readAuth(raw: Record<string, unknown>, result: ReadOpenAIMcpAuthResult): void {
   if (typeof raw.type !== "string" || !AUTH_TYPES.has(raw.type)) {
@@ -183,19 +210,12 @@ function readAuth(raw: Record<string, unknown>, result: ReadOpenAIMcpAuthResult)
     if (typeof raw.oidcEnabled === "boolean") auth.oidcEnabled = raw.oidcEnabled;
     else result.warnings.push(`'${AUTH}.oidcEnabled' must be a boolean; ignoring`);
   }
-  if (raw.headerScheme !== undefined) {
-    if (typeof raw.headerScheme === "string" && HEADER_SCHEMES.has(raw.headerScheme))
-      auth.headerScheme = raw.headerScheme as NonNullable<OpenAIMcpAuth["headerScheme"]>;
-    else result.warnings.push(`'${AUTH}.headerScheme' must be bearer, basic or custom_header`);
-  }
-  if (raw.headerName !== undefined) {
-    const valid =
-      auth.headerScheme === "custom_header" &&
-      typeof raw.headerName === "string" &&
-      /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(raw.headerName) &&
-      raw.headerName.toLowerCase() !== "host";
-    if (valid) auth.headerName = raw.headerName as string;
-    else result.warnings.push(`'${AUTH}.headerName' needs headerScheme custom_header; ignoring`);
+  readHeaderSettings(raw, auth, result);
+  // OpenAI's auth reference requires headerName for custom_header, so a missing one is
+  // malformed (a warning), not merely a setting Xum cannot use.
+  if (auth.headerScheme === "custom_header" && raw.headerName === undefined) {
+    result.warnings.push(`'${AUTH}.headerName' is required for headerScheme custom_header`);
+    delete auth.headerScheme;
   }
 
   // Keep in sync with toServerOAuthConfig: name everything it drops.
@@ -250,10 +270,60 @@ function portableCodexCwd(cwd: unknown): unknown {
   return cwd === "." ? "./" : `./${cwd}`;
 }
 
+const RESERVED_ENV_NAMES = new Set<unknown>(["PLUGIN_ROOT", "PLUGIN_DATA"]);
+
+/** A Codex `env_vars` item (codex-rs config mcp_types.rs `McpServerEnvVar`): its name, if valid. */
+function codexEnvVarName(item: unknown): string | undefined {
+  // Codex refuses source "remote" for a plugin that runs in the local environment.
+  const isLocalConfig =
+    isPlainObject(item) &&
+    Object.keys(item).every((key) => key === "name" || key === "source") &&
+    (item.source === undefined || item.source === "local");
+  const name = isLocalConfig ? item.name : item;
+  // An empty name, '=' or NUL can never name an environment variable.
+  return typeof name === "string" && /^[^=\0]+$/.test(name) ? name : undefined;
+}
+
+/**
+ * Codex `env_vars`: host variable names a stdio server receives. Only names are read here:
+ * prepareStdioLaunch copies the values at launch. Codex rejects `env_vars` on a streamable
+ * HTTP server (mcp_types.rs throw_if_set), so any other transport is an error too.
+ */
+function readCodexEnvVars(
+  value: unknown,
+  type: unknown
+): { forwardEnv?: string[]; error?: string } {
+  if (type !== "stdio") return { error: "'env_vars' applies only to stdio servers" };
+  if (!Array.isArray(value)) return { error: "'env_vars' must be an array of variable names" };
+  const names = new Set<string>();
+  for (const [index, item] of value.entries()) {
+    const name = codexEnvVarName(item);
+    if (name === undefined)
+      return { error: `'env_vars[${index}]' must be a variable name or { name, source: "local" }` };
+    // Same §9.2 rule as `env`: the client supplies the reserved variables itself.
+    if (RESERVED_ENV_NAMES.has(name))
+      return { error: `'env_vars[${index}]' must not name reserved variable '${name}'` };
+    names.add(name);
+  }
+  return names.size > 0 ? { forwardEnv: [...names] } : {};
+}
+
+/**
+ * Codex spellings of a transport: `http`/`streamable_http` and a `url` with no `type` are
+ * streamable HTTP, and a `command` with no `type` is stdio (codex-mcp plugin_config.rs).
+ */
+function portableCodexType(entry: Record<string, unknown>): unknown {
+  if (CODEX_STREAMABLE_HTTP_TYPES.has(entry.type)) return "streamable-http";
+  if (entry.type !== undefined) return entry.type;
+  if (typeof entry.command === "string") return "stdio";
+  return typeof entry.url === "string" ? "streamable-http" : undefined;
+}
+
 /**
  * Rewrite one Codex `.mcp.json` server entry into the Agent Plugins shape:
- * `type: "http"` (or `streamable_http`) becomes `streamable-http`, a relative cwd gets
- * its `./` prefix, and `oauth.client_id`, `scopes`
+ * `type: "http"` (or `streamable_http`) becomes `streamable-http`, a `url` with no type
+ * becomes `streamable-http`, a relative cwd gets its `./` prefix, `env_vars` becomes
+ * `forwardEnv` (or an `error` that skips the server), and `oauth.client_id`, `scopes`
  * and `oauth_resource` become an OpenAI `auth` block (an existing inline
  * `auth` wins). Callback settings are only NAMED in `ignored`. The secret
  * value is dropped here; `hasClientSecret` tells the caller to point the
@@ -264,15 +334,21 @@ export function translateCodexMcpEntry(entry: Record<string, unknown>): {
   ignored: string[];
   warnings: string[];
   hasClientSecret?: boolean;
+  /** Host variable names from `env_vars` (stdio only). */
+  forwardEnv?: string[];
+  /** A malformed `env_vars`: the caller skips this server. */
+  error?: string;
 } {
-  const { oauth, scopes, oauth_resource: resource, ...rest } = entry;
+  const { oauth, scopes, oauth_resource: resource, env_vars: envVars, ...rest } = entry;
   const ignored: string[] = [];
   const warnings: string[] = [];
   let hasClientSecret = false;
-  if (CODEX_STREAMABLE_HTTP_TYPES.has(rest.type)) rest.type = "streamable-http";
+  const type = portableCodexType(rest);
+  if (type !== undefined) rest.type = type;
   if (rest.cwd !== undefined) rest.cwd = portableCodexCwd(rest.cwd);
-  // Codex stdio entries carry a `command` and no `type`.
-  if (rest.type === undefined && typeof rest.command === "string") rest.type = "stdio";
+  // Xum reads OAuth settings only on remote servers, and env_vars is stdio-only.
+  if (envVars !== undefined)
+    return { entry: rest, ignored, warnings, ...readCodexEnvVars(envVars, rest.type) };
 
   const auth: Record<string, unknown> = {};
   if (oauth !== undefined) {

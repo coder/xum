@@ -71,6 +71,11 @@ export interface MCPStdioServerInfo extends MCPServerBaseInfo {
   args?: string[];
   /** Extra environment variables injected into the server process. */
   env?: Record<string, string>;
+  /**
+   * Host variable names whose values launch copies into the server env (Codex
+   * `.mcp.json` `env_vars`). Unset names are skipped, and `env` wins on a clash.
+   */
+  forwardEnv?: string[];
   /** Working directory; defaults to the workspace path when unset. */
   cwd?: string;
 }

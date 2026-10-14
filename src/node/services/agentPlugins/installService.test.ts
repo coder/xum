@@ -2718,6 +2718,18 @@ describe("AgentPluginInstallService", () => {
     expect(preview.mcpServers[0].summary).toContain("NODE_OPTIONS='--require=./payload.js'");
   });
 
+  test("consent preview names the host variables a Codex env_vars server receives", async () => {
+    await fsPromises.rm(path.join(remoteDir, "mcp.json"));
+    await fsPromises.writeFile(
+      path.join(remoteDir, ".mcp.json"),
+      JSON.stringify({ mcpServers: { echo: { command: "node", env_vars: ["API_TOKEN"] } } })
+    );
+    await commitAll(remoteDir, "codex env_vars");
+
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.mcpServers[0].summary).toContain("host env: 'API_TOKEN'");
+  });
+
   test("consent preview discloses the stdio working directory", async () => {
     // cwd changes relative script/config resolution (prepareStdioLaunch
     // passes it to the runtime): `node server.js` under cwd=${PLUGIN_DATA}
