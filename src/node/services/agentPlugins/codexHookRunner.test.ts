@@ -643,8 +643,9 @@ describe("PostToolUse", () => {
     }
   });
 
-  test("a block in a second plugin keeps the first plugin's feedback and context", async () => {
-    // Codex PRRT_kwDOPxxmWM6sXQ2G: each plugin is separate middleware on the spine.
+  /** Two plugins (separate middleware), each one PostToolUse hook that blocks with `reason`. */
+  function twoBlockingPlugins(reason: (pluginName: string) => string) {
+    const responses: unknown[] = [];
     const spine = new EventSpine();
     for (const [order, pluginName] of [
       [0, "outer"],
@@ -654,22 +655,31 @@ describe("PostToolUse", () => {
         workspaceId,
         pluginName,
         order,
-        hooks: [hook("PostToolUse")],
+        hooks: [hook("PostToolUse", { input: { out: "${tool_response}" } })],
         deps: {
           isHookAllowed: () => Promise.resolve(true),
           canCallPluginTool: () => true,
-          callPluginTool: () =>
-            Promise.resolve(
+          callPluginTool: (call) => {
+            responses.push(call.input.out);
+            return Promise.resolve(
               json({
                 decision: "block",
-                reason: `${pluginName} says no.`,
+                reason: reason(pluginName),
                 hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: pluginName },
               })
-            ),
+            );
+          },
           notifyUser: () => undefined,
         },
       });
     }
+    return { spine, responses };
+  }
+
+  test("a block in a second plugin keeps the first plugin's feedback and context", async () => {
+    // Codex PRRT_kwDOPxxmWM6sXQ2G: each plugin is separate middleware on the spine.
+    // PRRT_kwDOPxxmWM6sX3yK: both plugins' hooks see the tool's own response.
+    const { spine, responses } = twoBlockingPlugins((pluginName) => `${pluginName} says no.`);
 
     const ctx = await runTool(spine, "file_read", {});
 
@@ -677,6 +687,19 @@ describe("PostToolUse", () => {
       error: "[plugin:inner] inner says no.\n\n[plugin:outer] outer says no.",
       hook_output: "[plugin:inner] inner\n[plugin:outer] outer",
     });
+    expect(responses).toEqual([{ ran: {} }, { ran: {} }]);
+  });
+
+  test("the feedback of several plugins is capped as a whole", async () => {
+    // Codex PRRT_kwDOPxxmWM6sX3yS.
+    // Each plugin's own join stays under its cap; the two together do not.
+    const { spine } = twoBlockingPlugins(() => "r".repeat(20 * 1024));
+
+    const ctx = await runTool(spine, "file_read", {});
+
+    const error = (ctx.result as { error: string }).error;
+    expect(error.length).toBeLessThan(33 * 1024);
+    expect(error.endsWith("[plugin hook context cut]")).toBe(true);
   });
 
   test("the joined feedback of many blocking PostToolUse hooks is capped", async () => {

@@ -259,7 +259,7 @@ async function runPostToolHooks(
   for (const hook of post.filter((candidate) => matches(candidate, ctx.toolName, view))) {
     const output = await invoke(
       hook,
-      { ...toolEvent(), tool_response: ctx.result },
+      { ...toolEvent(), tool_response: toolResponseOf(ctx) },
       "PostToolUse",
       registration,
       parsePostToolUseOutput,
@@ -271,6 +271,19 @@ async function runPostToolHooks(
     if (hookFeedback !== undefined) feedback.push(hookFeedback);
   }
   if (feedback.length > 0) replaceWithFeedback(ctx, feedback, registration);
+}
+
+/**
+ * The tool's own result, as the innermost plugin's PostToolUse saw it. Each plugin is its own
+ * middleware, and an inner plugin's block replaces ctx.result before an outer plugin's hooks
+ * run: every plugin's hooks must still see the same response, as in Codex (Codex
+ * PRRT_kwDOPxxmWM6sX3yK). Keyed by the call's context, so it lives as long as the call.
+ */
+const originalResults = new WeakMap<ToolExecuteContext, unknown>();
+
+function toolResponseOf(ctx: ToolExecuteContext): unknown {
+  if (!originalResults.has(ctx)) originalResults.set(ctx, ctx.result);
+  return originalResults.get(ctx);
 }
 
 /** Replace the tool result with the PostToolUse blockers' feedback (Codex `decision: "block"`). */
@@ -288,7 +301,7 @@ function replaceWithFeedback(
   const previous = ctx.postBlocked === true && isPlainObject(ctx.result) ? ctx.result : undefined;
   ctx.result =
     previous !== undefined && typeof previous.error === "string"
-      ? { ...previous, error: `${previous.error}\n\n${error}` }
+      ? { ...previous, error: capText(`${previous.error}\n\n${error}`) }
       : { error };
   // A nested caller (mux.load) holds the original output outside ctx.result: it must not hand it
   // on (Codex PRRT_kwDOPxxmWM6r6NnK). That holds for continue: false too, though Codex keeps it
@@ -504,10 +517,16 @@ const HOOK_CONTEXT_CUT_MARKER = "\n[plugin hook context cut]";
  * (Codex PRRT_kwDOPxxmWM6sWuO7).
  */
 function joinCapped(texts: string[], registration: CodexHookRegistration, separator: string) {
-  const joined = texts.map((text) => `[plugin:${registration.pluginName}] ${text}`).join(separator);
-  return joined.length > HOOK_CONTEXT_MAX_CHARS
-    ? joined.slice(0, HOOK_CONTEXT_MAX_CHARS) + HOOK_CONTEXT_CUT_MARKER
-    : joined;
+  return capText(
+    texts.map((text) => `[plugin:${registration.pluginName}] ${text}`).join(separator)
+  );
+}
+
+/** The cap of joinCapped, for text that several plugins joined (Codex PRRT_kwDOPxxmWM6sX3yS). */
+function capText(text: string): string {
+  return text.length > HOOK_CONTEXT_MAX_CHARS
+    ? text.slice(0, HOOK_CONTEXT_MAX_CHARS) + HOOK_CONTEXT_CUT_MARKER
+    : text;
 }
 
 function joinNotes(notes: string[], registration: CodexHookRegistration): string {
