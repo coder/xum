@@ -12,7 +12,7 @@ import {
   probeServerForBearerChallenge,
   resolveOAuthScope,
 } from "./mcpOauthService";
-import type { OAuthDiscoveryState } from "@modelcontextprotocol/client";
+import type { OAuthClientProvider, OAuthDiscoveryState } from "@modelcontextprotocol/client";
 import { Ok } from "@/common/types/result";
 import type { MCPServerOAuthConfig } from "@/common/types/mcp";
 import type {
@@ -1411,7 +1411,7 @@ describe("McpOauthService OAuth flows", () => {
 
   // The SDK's auth() reads the tokens with a context before it refreshes; a transport request
   // reads them without one (@modelcontextprotocol/client auth(), StreamableHTTP transport).
-  const authCtx = { issuer: "https://example.com" } as never;
+  const authCtx: Parameters<OAuthClientProvider["tokens"]>[0] = { issuer: "https://example.com" };
 
   test.each([
     ["auth() read only", false],
