@@ -368,6 +368,23 @@ function matchesServerAttachments(
 }
 
 /**
+ * Whether a move's source still holds exactly the text and attachments the move copied. The
+ * attachments are compared by identity: another client may replace one under the same id.
+ */
+function holdsMovedContent(
+  source: Entry,
+  text: string,
+  attachments: readonly ChatAttachment[]
+): boolean {
+  return (
+    source.text === text &&
+    source.payloadsLoaded &&
+    source.attachments.length === attachments.length &&
+    source.attachments.every((attachment, index) => attachment === attachments[index])
+  );
+}
+
+/**
  * Map a legacy localStorage scope id (getDraftScopeId/getPendingScopeId/workspace id) to the
  * store scope that now owns it. Null for ids that never held a draft of a known kind.
  */
@@ -1359,9 +1376,11 @@ export class DraftStore {
   }
 
   /**
-   * Move a draft to another scope (default creation draft -> listed creation draft). The source
-   * is deleted only once the backend confirmed the destination: if that write fails, both stay
-   * (the destination keeps retrying) rather than risking the only persisted copy. Never rejects.
+   * Move a draft to another scope (default creation draft -> listed creation draft, or a creation
+   * draft to another project). The source is deleted only once the backend confirmed the
+   * destination, and only while it still holds what was copied: if that write fails or the source
+   * changed meanwhile, both stay (the destination keeps retrying) rather than risking the only
+   * persisted copy. Never rejects.
    */
   async moveDraft(from: DraftStoreScope, to: DraftStoreScope): Promise<void> {
     const key = draftStoreScopeKey(from);
@@ -1372,27 +1391,21 @@ export class DraftStore {
       if (this.hydrated) await this.deleteDraft(from);
       return;
     }
-    this.setText(to, source.text);
-    // Captured with the copy it describes: an edit during the payload load below must keep the
-    // source (the text was copied before it).
-    const textVersion = source.textVersion;
+    // Copied before the payload load below, so an edit during it keeps the source.
+    const text = source.text;
+    this.setText(to, text);
     if (!(await this.loadPayloadsToMove(from, source))) return;
-    if (source.attachments.length > 0) this.setAttachments(to, source.attachments);
-    const attachmentsVersion = source.attachmentsVersion;
+    const attachments = source.attachments;
+    if (attachments.length > 0) this.setAttachments(to, attachments);
     try {
       await this.flush(to);
     } catch (error) {
       console.warn("Failed to save the moved draft; keeping the source draft:", error);
       return;
     }
-    // An edit of the source meanwhile makes it a different draft: keep it.
-    if (
-      this.entries.get(key) !== source ||
-      source.textVersion !== textVersion ||
-      source.attachmentsVersion !== attachmentsVersion
-    ) {
-      return;
-    }
+    // An edit of the source meanwhile makes it a different draft: keep it. Compared by content,
+    // since another window's edit arrives as a server push, which bumps no local version.
+    if (this.entries.get(key) !== source || !holdsMovedContent(source, text, attachments)) return;
     await this.deleteDraft(from);
   }
 

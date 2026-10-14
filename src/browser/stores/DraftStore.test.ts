@@ -871,6 +871,38 @@ describe("DraftStore", () => {
     expect((await service.get(source)).text).toBe("moving, edited");
   });
 
+  // Another window's edit reaches this one as a server push, which bumps no local version.
+  const remoteEdits: ReadonlyArray<[string, { text?: string; attachments?: DraftAttachment[] }]> = [
+    ["text", { text: "edited elsewhere" }],
+    ["attachments", { attachments: [image] }],
+  ];
+  for (const [field, edit] of remoteEdits) {
+    test(`keeps the source of a move whose ${field} another window edited meanwhile`, async () => {
+      using tempDir = new TestTempDir("draft-store-move-remote-edit");
+      const { projectPath, service, client, control } = await createHarness(tempDir);
+      const source: DraftScope = { kind: "creation", projectPath, draftId: "draft-a" };
+      await service.update({ scope: source, text: "moving" });
+      const store = createStore(client);
+      await store.whenReady();
+
+      let release: () => void = () => undefined;
+      control.updateGate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const moved = store.moveDraft(source, WS_SCOPE);
+      await service.update({ scope: source, ...edit });
+      await waitFor(() => {
+        const view = store.getView(source);
+        return view.text !== "moving" || view.attachmentCount > 0;
+      });
+      release();
+      await moved;
+
+      expect((await service.get(WS_SCOPE)).text).toBe("moving");
+      expect(await service.get(source)).toMatchObject(edit);
+    });
+  }
+
   // The project page opened without a draft id: its text survived a reload in localStorage before
   // drafts moved to the backend. When the first listed draft is created it takes over the text
   // and the attachments, even ones whose payloads have not loaded yet.
