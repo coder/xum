@@ -223,6 +223,43 @@ describe("WorkspaceActionsMenuContent row shortcut keys (#6328)", () => {
     expect(windowKeys).toEqual(["Backspace"]);
   });
 
+  // #6434: a click on the menu's padding or a separator focuses the popover itself, outside the
+  // rows. The key must still act on this menu's workspace, not reach the global handlers.
+  test("a hinted key acts on the menu while focus is on the popover around the rows", () => {
+    const actions = allActions();
+    const popover = document.createElement("div");
+    popover.tabIndex = -1;
+    document.body.appendChild(popover);
+    const onCloseMenu = mock(() => undefined);
+    render(
+      <WorkspaceActionsMenuContent
+        state={sidebarState}
+        actions={actions}
+        isPinned={false}
+        onCloseMenu={onCloseMenu}
+      />,
+      { container: popover }
+    );
+    popover.focus();
+
+    pressKey(toKeyEvent(KEYBINDS.EDIT_WORKSPACE_TITLE));
+    expect(actions.editTitle).toHaveBeenCalledTimes(1);
+    expect(onCloseMenu).toHaveBeenCalledTimes(1);
+    expect(windowKeys).toEqual([]);
+  });
+
+  test("a hinted key typed into a field outside the menu stays with that field", () => {
+    const actions = allActions();
+    renderSidebarMenu(actions);
+    const field = document.createElement("input");
+    document.body.appendChild(field);
+    field.focus();
+
+    pressKey(toKeyEvent(KEYBINDS.EDIT_WORKSPACE_TITLE));
+    expect(actions.editTitle).not.toHaveBeenCalled();
+    expect(windowKeys).toEqual(["F2"]);
+  });
+
   test("other keys still reach the global handlers", () => {
     renderSidebarMenu(allActions());
     pressKey(toKeyEvent(KEYBINDS.NEXT_WORKSPACE));

@@ -1,7 +1,7 @@
-import { stopKeyboardPropagation } from "@/browser/utils/events";
 import {
   formatKeybind,
   isAltGraphPressed,
+  isEditableElement,
   KEYBINDS,
   matchesKeybind,
   type Keybind,
@@ -23,7 +23,7 @@ import {
   Sparkles,
   Square,
 } from "lucide-react";
-import React from "react";
+import React, { useEffect, useRef } from "react";
 import {
   getWorkspaceActionGroups,
   type WorkspaceActionId,
@@ -186,11 +186,13 @@ function getActionRow(id: WorkspaceActionId, props: WorkspaceActionsMenuContentP
  */
 export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentProps> = (props) => {
   const groups = getShownWorkspaceActionGroups(props.state, props.actions);
+  const rootRef = useRef<HTMLDivElement>(null);
+  useRowShortcutKeys(rootRef, groups.flat(), props);
   return (
     // No menu role on purpose: the menu/menuitem pattern also requires roving Tab focus and
     // changes how the sidebar row's long-press handling sees this portal. The Radix Popover
     // stays a dialog of buttons, and the arrow keys are an extra on top of Tab (#6103).
-    <div onKeyDown={(event) => handleMenuKeyDown(event, groups.flat(), props)}>
+    <div ref={rootRef} onKeyDown={handleRowArrowKeys}>
       {groups.map((group, groupIndex) => (
         <React.Fragment key={group[0]}>
           {groupIndex > 0 && (
@@ -224,27 +226,49 @@ const ROW_KEYBINDS = (Object.keys(ACTION_ROWS) as WorkspaceActionId[]).flatMap((
  * row's menu is often not the selected workspace's, and the global handlers act on the selected
  * one, so the menu takes the key before they see it. A row key whose row this menu hides does
  * nothing here (fail closed) instead of reaching the selected workspace.
+ *
+ * The listener sits on the window's capture phase, not on the menu: a click on the menu's padding
+ * or a separator focuses the popover itself, outside the rows, and the key then never passed
+ * through the menu (#6434). It runs before every bubble-phase handler and only while the menu is
+ * mounted, so one listener exists at most.
  */
-function handleRowShortcut(
-  event: React.KeyboardEvent<HTMLElement>,
+function useRowShortcutKeys(
+  rootRef: React.RefObject<HTMLDivElement>,
   shown: WorkspaceActionId[],
   props: WorkspaceActionsMenuContentProps
-): boolean {
-  // Ctrl+Alt chords: AltGr types characters with the same modifiers.
-  if (isAltGraphPressed(event)) return false;
+) {
+  const latestRef = useRef({ shown, props });
+  useEffect(() => {
+    latestRef.current = { shown, props };
+  });
+  useEffect(() => {
+    const handler = (event: KeyboardEvent) => {
+      const root = rootRef.current;
+      if (root) handleRowShortcut(event, root, latestRef.current.shown, latestRef.current.props);
+    };
+    window.addEventListener("keydown", handler, true);
+    return () => window.removeEventListener("keydown", handler, true);
+  }, [rootRef]);
+}
+
+function handleRowShortcut(
+  event: KeyboardEvent,
+  root: HTMLElement,
+  shown: WorkspaceActionId[],
+  props: WorkspaceActionsMenuContentProps
+) {
+  // Ctrl+Alt chords: AltGr types characters with the same modifiers. A field keeps its keys.
+  if (isAltGraphPressed(event) || isEditableElement(event.target)) return;
   const match = ROW_KEYBINDS.find((row) => matchesKeybind(event, row.keybind));
-  if (!match) return false;
+  if (!match) return;
   event.preventDefault();
-  stopKeyboardPropagation(event);
+  event.stopImmediatePropagation();
   // A held key auto-repeats: run the row once (Codex on #6398).
-  if (event.repeat || !shown.includes(match.id)) return true;
-  const rowButton = event.currentTarget.querySelector<HTMLElement>(
-    `[data-workspace-action-row="${match.id}"]`
-  );
-  swallowHeldKey(event.nativeEvent.code || event.key);
+  if (event.repeat || !shown.includes(match.id)) return;
+  const rowButton = root.querySelector<HTMLElement>(`[data-workspace-action-row="${match.id}"]`);
+  swallowHeldKey(event.code || event.key);
   props.onCloseMenu();
-  props.actions[match.id]?.(rowButton ?? event.currentTarget);
-  return true;
+  props.actions[match.id]?.(rowButton ?? root);
 }
 
 /**
@@ -272,14 +296,6 @@ function swallowHeldKey(code: string) {
   window.addEventListener("keydown", swallow, true);
   window.addEventListener("keyup", release, true);
   window.addEventListener("blur", stop);
-}
-
-function handleMenuKeyDown(
-  event: React.KeyboardEvent<HTMLElement>,
-  shown: WorkspaceActionId[],
-  props: WorkspaceActionsMenuContentProps
-) {
-  if (!handleRowShortcut(event, shown, props)) handleRowArrowKeys(event);
 }
 
 // ArrowDown/ArrowUp move focus between the rows and stop at the ends, as in ArtifactVersionMenu.
