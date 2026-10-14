@@ -45,7 +45,8 @@ export const MAX_MCP_SETTING_ENUM_OPTIONS = 100;
 /**
  * Enum budget for one snapshot, over all its settings: per-enum caps alone still let 100
  * settings send 10,000 options of 1,024 characters (about 10 MB over IPC, 10,000 rendered
- * options). Settings past either total are dropped, in declared order. One full enum fits.
+ * options). Settings past either total are dropped, in `Object.entries` order (integer-like
+ * names first, then declaration order). One full enum fits.
  */
 export const MAX_MCP_SETTINGS_ENUM_OPTIONS_TOTAL = 1_000;
 /** Total enum option text of one snapshot, in UTF-16 units (as MAX_TEXT counts). */

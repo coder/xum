@@ -5014,9 +5014,23 @@ export class MCPServerManager {
   async readSettings(
     workspaceId: string,
     serverName: string,
-    /** `noStart`: read only a running instance; never start or restart the server. */
-    options?: { signal?: AbortSignal; timeoutMs?: number; noStart?: boolean }
+    /**
+     * `noStart`: read only a running instance; never start or restart the server.
+     * `afterPendingSaves`: first wait for this server's saves in flight (the dialog's reads: a
+     * dialog reopened during a save must not show the values from before it).
+     */
+    options?: {
+      signal?: AbortSignal;
+      timeoutMs?: number;
+      noStart?: boolean;
+      afterPendingSaves?: boolean;
+    }
   ): Promise<MCPSettingsReadSnapshot | null> {
+    if (options?.afterPendingSaves === true) {
+      const saves = this.pendingSettingsSaves.get(settingsSaveKey(workspaceId, serverName));
+      // A failed save is the save's own error; this read only waits for it.
+      if (saves !== undefined) await Promise.allSettled([...saves]);
+    }
     const noSettings = Symbol("no settings");
     let source: { instance: MCPServerInstance; requestId: number } | undefined;
     const snapshot = await this.invokeServerOperation(
@@ -5042,7 +5056,28 @@ export class MCPServerManager {
       log.warn(`[MCP] Settings of '${serverName}': ${warning}`, { workspaceId });
     assert(source !== undefined, "a settings snapshot comes from a server instance");
     this.cacheSettings(source.instance, workspaceId, source.requestId, snapshot.values);
-    return { ...snapshot, instanceToken: this.settingsInstanceToken(source.instance) };
+    const instanceToken = this.settingsInstanceToken(source.instance);
+    this.rememberSettingsSchema(instanceToken, snapshot);
+    return { ...snapshot, instanceToken };
+  }
+
+  /** Saves in flight per workspace and server (readSettings `afterPendingSaves`). */
+  private readonly pendingSettingsSaves = new Map<string, Set<Promise<unknown>>>();
+
+  /**
+   * The schema each recent instance token was read with, as a hash: a save whose token names a
+   * restarted instance (idle stop, crash restart) still lands when the new instance shows the
+   * same schema. Bounded: the oldest token is forgotten first, and its save is refused.
+   */
+  private readonly settingsSchemaHashes = new Map<string, string>();
+
+  private rememberSettingsSchema(instanceToken: string, snapshot: MCPSettingsSnapshot): void {
+    this.settingsSchemaHashes.delete(instanceToken);
+    this.settingsSchemaHashes.set(instanceToken, settingsSchemaHash(snapshot));
+    if (this.settingsSchemaHashes.size > MAX_REMEMBERED_SETTINGS_SCHEMAS) {
+      const oldest = this.settingsSchemaHashes.keys().next().value;
+      if (oldest !== undefined) this.settingsSchemaHashes.delete(oldest);
+    }
   }
 
   /**
@@ -5057,11 +5092,44 @@ export class MCPServerManager {
     instanceToken: string,
     options?: { signal?: AbortSignal }
   ): Promise<MCPSettingsReadSnapshot> {
+    const key = settingsSaveKey(workspaceId, serverName);
+    const save = this.runSettingsSave(workspaceId, serverName, set, instanceToken, options);
+    const saves = this.pendingSettingsSaves.get(key) ?? new Set<Promise<unknown>>();
+    saves.add(save);
+    this.pendingSettingsSaves.set(key, saves);
+    try {
+      return await save;
+    } finally {
+      saves.delete(save);
+      if (saves.size === 0 && this.pendingSettingsSaves.get(key) === saves)
+        this.pendingSettingsSaves.delete(key);
+    }
+  }
+
+  private async runSettingsSave(
+    workspaceId: string,
+    serverName: string,
+    set: Record<string, MCPSettingValue>,
+    instanceToken: string,
+    options?: { signal?: AbortSignal }
+  ): Promise<MCPSettingsReadSnapshot> {
     // Validate against a fresh read: the renderer's schema can be stale.
     const prior = await this.readSettings(workspaceId, serverName, options);
     if (prior === null) throw new Error(`MCP server '${serverName}' has no settings`);
-    if (prior.instanceToken !== instanceToken) throw staleSettingsInstanceError(serverName);
-    const values = await this.updateSettings(workspaceId, serverName, set, prior, instanceToken);
+    // Another instance (restarted or replaced since the dialog read): the save still lands when
+    // it shows the schema the dialog validated against, else the user must reopen.
+    if (
+      prior.instanceToken !== instanceToken &&
+      this.settingsSchemaHashes.get(instanceToken) !== settingsSchemaHash(prior)
+    )
+      throw staleSettingsInstanceError(serverName);
+    const values = await this.updateSettings(
+      workspaceId,
+      serverName,
+      set,
+      prior,
+      prior.instanceToken
+    );
     try {
       const after = await this.readSettings(workspaceId, serverName, options);
       if (after !== null) return after;
@@ -5084,8 +5152,8 @@ export class MCPServerManager {
     serverName: string,
     set: Record<string, MCPSettingValue>,
     prior: Pick<MCPSettingsSnapshot, "properties" | "values">,
-    /** The instance `prior` came from (saveSettings): another instance refuses the update. */
-    expectedInstanceToken?: string
+    /** The instance `prior` came from: another instance refuses the update. */
+    expectedInstanceToken: string
   ): Promise<Record<string, MCPSettingValue>> {
     const { properties } = prior;
     for (const [name, value] of Object.entries(set)) {
@@ -5130,13 +5198,10 @@ export class MCPServerManager {
     instance: MCPServerInstance,
     workspaceId: string,
     set: Record<string, MCPSettingValue>,
-    expectedInstanceToken: string | undefined
+    expectedInstanceToken: string
   ): Promise<unknown> {
     // The caller validated `set` against the schema of the instance that sent it.
-    if (
-      expectedInstanceToken !== undefined &&
-      this.settingsInstanceToken(instance) !== expectedInstanceToken
-    )
+    if (this.settingsInstanceToken(instance) !== expectedInstanceToken)
       return Promise.reject(staleSettingsInstanceError(instance.name));
     return this.callSettingsTool(instance, workspaceId, "updateTool", { set });
   }
@@ -7831,6 +7896,21 @@ export class MCPServerManager {
       signal.removeEventListener("abort", onAbort);
     }
   }
+}
+
+/** Instance tokens whose settings schema saveSettings remembers (see settingsSchemaHashes). */
+const MAX_REMEMBERED_SETTINGS_SCHEMAS = 256;
+
+function settingsSaveKey(workspaceId: string, serverName: string): string {
+  return `${workspaceId}\0${serverName}`;
+}
+
+/** What a save validates against: the schema and its layout, never the values. */
+function settingsSchemaHash(snapshot: Pick<MCPSettingsSnapshot, "properties" | "layout">): string {
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify([snapshot.properties, snapshot.layout]))
+    .digest("hex");
 }
 
 function staleSettingsInstanceError(serverName: string): Error {

@@ -243,6 +243,9 @@ type McpSettingsReadResult =
   | { success: true; data: MCPSettingsReadSnapshot | { notConnected: true } | null }
   | { success: false; error: string };
 
+const forIpc = (snapshot: MCPSettingsReadSnapshot | null) =>
+  snapshot === null ? null : mcpSettingsSnapshotForIpc(snapshot);
+
 /**
  * `mcp.settings.read` for several servers in one call (concurrently). With `ifConnected`, a
  * server the workspace does not run reads as `{ notConnected: true }`, and a running one is
@@ -250,9 +253,6 @@ type McpSettingsReadResult =
  * runs, so the read never starts or restarts a server (an instance that closed meanwhile
  * fails the read instead).
  */
-const forIpc = (snapshot: MCPSettingsReadSnapshot | null) =>
-  snapshot === null ? null : mcpSettingsSnapshotForIpc(snapshot);
-
 async function readMcpSettingsRoute(
   context: ORPCContext,
   input: { workspaceId: string; serverNames: string[]; ifConnected?: boolean },
@@ -264,7 +264,13 @@ async function readMcpSettingsRoute(
   const readOne = async (serverName: string): Promise<McpSettingsReadResult> => {
     if (input.ifConnected !== true)
       return runMcpSettingsRoute(context, input.workspaceId, signal, async () =>
-        forIpc(await manager.readSettings(input.workspaceId, serverName, { signal, timeoutMs }))
+        forIpc(
+          await manager.readSettings(input.workspaceId, serverName, {
+            signal,
+            timeoutMs,
+            afterPendingSaves: true,
+          })
+        )
       );
     if (!manager.isWorkspaceServerConnected(input.workspaceId, serverName))
       return { success: true, data: { notConnected: true } };
@@ -273,6 +279,7 @@ async function readMcpSettingsRoute(
         signal,
         timeoutMs,
         noStart: true,
+        afterPendingSaves: true,
       });
       return { success: true, data: forIpc(data) };
     } catch (error) {
