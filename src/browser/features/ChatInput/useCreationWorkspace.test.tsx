@@ -21,10 +21,8 @@ import * as ChatCommandsModule from "@/browser/utils/chatCommands";
 import type { ProjectConfig } from "@/common/types/project";
 import {
   getPendingDraftSkillDiscoveryKey,
-  getPendingScopeId,
   getPendingWorkspaceSendErrorKey,
   getProjectScopeId,
-  getWorkspaceNameStateKey,
 } from "@/common/constants/storage";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { DraftEvent, DraftUpdateInput } from "@/common/orpc/schemas/drafts";
@@ -76,6 +74,7 @@ const draftBackend = createTestApiClient({
         revision: Date.now(),
         text: input.text ?? "",
         attachments: (input.attachments ?? []).map(toDraftAttachmentMetadata),
+        ...(input.nameState != null ? { nameState: input.nameState } : {}),
       });
     },
     delete: () => Promise.resolve({ revision: Date.now() }),
@@ -1043,8 +1042,7 @@ describe("useCreationWorkspace", () => {
     // Typing a name in the form: manual mode, then the text.
     act(() => getHook().nameState.setAutoGenerate(false));
     act(() => getHook().nameState.setName("my-feature"));
-    const nameStateKey = getWorkspaceNameStateKey(getPendingScopeId(TEST_PROJECT_PATH));
-    await waitFor(() => expect(window.localStorage.getItem(nameStateKey)).not.toBeNull());
+    expect(pendingDraft().nameState?.manualName).toBe("my-feature");
 
     let handleSendResult: CreationSendResult | undefined;
     await act(async () => {
@@ -1054,7 +1052,7 @@ describe("useCreationWorkspace", () => {
     expect(handleSendResult).toEqual({ success: true });
     expect(workspaceApi.create.mock.calls[0]?.[0]?.branchName).toBe("my-feature");
     // The next visit to the form must not offer the name of the workspace that now exists.
-    expect(window.localStorage.getItem(nameStateKey)).toBeNull();
+    expect(pendingDraft().nameState).toBeNull();
     await waitFor(() => expect(getHook().nameState.name).not.toBe("my-feature"));
   });
 
@@ -1828,8 +1826,7 @@ describe("useCreationWorkspace", () => {
     await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
     act(() => getHook().nameState.setAutoGenerate(false));
     act(() => getHook().nameState.setName("first-feature"));
-    const nameStateKey = getWorkspaceNameStateKey(getPendingScopeId(TEST_PROJECT_PATH));
-    await waitFor(() => expect(window.localStorage.getItem(nameStateKey)).not.toBeNull());
+    expect(pendingDraft().nameState?.manualName).toBe("first-feature");
 
     let sendPromise: Promise<CreationSendResult> | undefined;
     act(() => {
@@ -1861,7 +1858,7 @@ describe("useCreationWorkspace", () => {
     // The deferred clear ran (the creation draft is gone) but left the newer name alone.
     expect(pendingDraft().text).toBe("");
     expect(getHook().nameState.name).toBe("second-feature");
-    expect(window.localStorage.getItem(nameStateKey)).toContain("second-feature");
+    expect(pendingDraft().nameState?.manualName).toBe("second-feature");
   });
 
   test("handleSend sends workflow-looking creation prompts to the agent", async () => {

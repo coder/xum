@@ -11,32 +11,11 @@ import {
   removePersistedStateKeys,
   writePersistedRawString,
 } from "@/browser/hooks/usePersistedState";
-import { boundWorkspaceNamePersistedState } from "@/common/utils/workspaceNameState";
 import {
   MCP_TEST_RESULTS_KEY_PREFIX,
   WORKSPACE_KEY_REGISTRATIONS,
-  getWorkspaceNameStateKey,
   isWorkspaceStorageGcCandidateKey,
 } from "@/common/constants/storage";
-
-/**
- * Older builds stored workspaceNameState unbounded (the whole creation message), and a copy over
- * the destination's budget would live only in memory. Shrink it with its owner's bound; keys
- * without one stay verbatim, so an oversized value keeps its source (see migrateWorkspaceStorage).
- */
-function boundOversizedValue(
-  getKey: (scopeId: string) => string,
-  value: string,
-  maxValueChars: number
-): string {
-  if (value.length <= maxValueChars || getKey !== getWorkspaceNameStateKey) return value;
-  try {
-    const bounded = boundWorkspaceNamePersistedState(JSON.parse(value));
-    return bounded ? JSON.stringify(bounded) : value;
-  } catch {
-    return value;
-  }
-}
 
 /**
  * Copy all workspace-specific localStorage keys from source to destination workspace.
@@ -53,8 +32,7 @@ export function copyWorkspaceStorage(sourceWorkspaceId: string, destWorkspaceId:
     // Values within budget are copied verbatim, so the destination is byte-identical to the source.
     // Legacy migration-only keys (budget 0) are carried along for the destination's own import.
     const write = maxValueChars === 0 ? copyLegacyPersistedRawString : writePersistedRawString;
-    const copy = boundOversizedValue(getKey, value, maxValueChars);
-    if (!write(getKey(destWorkspaceId), copy)) copiedAll = false;
+    if (!write(getKey(destWorkspaceId), value)) copiedAll = false;
   }
   return copiedAll;
 }

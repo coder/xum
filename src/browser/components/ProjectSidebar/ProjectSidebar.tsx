@@ -16,9 +16,7 @@ import { useWorkspaceStoreRaw, type WorkspaceStore } from "@/browser/stores/Work
 import {
   EXPANDED_PROJECTS_KEY,
   MOBILE_LEFT_SIDEBAR_SCROLL_TOP_KEY,
-  getDraftScopeId,
   getWorkspaceLastReadKey,
-  getWorkspaceNameStateKey,
   EXPANDED_OLD_WORKSPACES_KEY,
   EXPANDED_SECTIONS_KEY,
   EXPANDED_COMPLETED_SUB_AGENTS_KEY,
@@ -149,7 +147,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { isMultiProject } from "@/common/utils/multiProject";
 import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_SIDEBAR_SECTION_ID } from "@/common/constants/scratch";
-import { getDraftStore, useDraft } from "@/browser/stores/DraftStore";
+import { getDraftStore, useDraft, type DraftView } from "@/browser/stores/DraftStore";
 import {
   MULTI_PROJECT_CONFIG_KEY,
   MULTI_PROJECT_SIDEBAR_SECTION_ID,
@@ -481,28 +479,9 @@ interface CoalescedWorkspaceListContext {
 // Prevents constant re-renders while still providing timely feedback.
 const DRAFT_PREVIEW_DEBOUNCE_MS = 1000;
 
-function isDraftVisible(
-  projectPath: string,
-  draftId: string,
-  values?: {
-    draftPrompt?: string;
-    workspaceNameState?: unknown;
-    draftAttachmentCount?: number;
-  }
-): boolean {
-  const scopeId = getDraftScopeId(projectPath, draftId);
-  // Text and attachments come from the backend-backed draft store.
-  const draft = getDraftStore().getView({ kind: "creation", projectPath, draftId });
-  const draftPrompt = values?.draftPrompt ?? draft.text;
-  const workspaceNameState =
-    values?.workspaceNameState ??
-    readPersistedState<unknown>(getWorkspaceNameStateKey(scopeId), null);
-  const draftAttachmentCount = values?.draftAttachmentCount ?? draft.attachmentCount;
-
-  const hasTextContent = typeof draftPrompt === "string" && draftPrompt.trim().length > 0;
-  const hasAttachments = draftAttachmentCount > 0;
-  const hasNameState = workspaceNameState !== null;
-  return hasTextContent || hasAttachments || hasNameState;
+/** Whether a creation draft has user-provided content: text, attachments or a workspace name. */
+function isDraftVisible(draft: DraftView): boolean {
+  return draft.text.trim().length > 0 || draft.attachmentCount > 0 || draft.nameState !== null;
 }
 
 /**
@@ -520,16 +499,7 @@ function DraftVisibilityWatcher(props: {
     projectPath: props.projectPath,
     draftId: props.draftId,
   });
-  const [workspaceNameState] = usePersistedState<unknown>(
-    getWorkspaceNameStateKey(getDraftScopeId(props.projectPath, props.draftId)),
-    null,
-    { listener: true }
-  );
-  const isVisible = isDraftVisible(props.projectPath, props.draftId, {
-    draftPrompt: draft.text,
-    workspaceNameState,
-    draftAttachmentCount: draft.attachmentCount,
-  });
+  const isVisible = isDraftVisible(draft);
   const { projectPath, draftId, onVisibilityChange } = props;
   useEffect(() => {
     onVisibilityChange(projectPath, draftId, isVisible);
@@ -538,18 +508,13 @@ function DraftVisibilityWatcher(props: {
 }
 
 function DraftAgentListItemWrapper(props: DraftAgentListItemWrapperProps) {
-  const scopeId = getDraftScopeId(props.projectPath, props.draftId);
-
   const draft = useDraft({
     kind: "creation",
     projectPath: props.projectPath,
     draftId: props.draftId,
   });
   const draftPrompt = draft.text;
-
-  const [workspaceNameState] = usePersistedState<unknown>(getWorkspaceNameStateKey(scopeId), null, {
-    listener: true,
-  });
+  const workspaceNameState = draft.nameState;
 
   // Debounce the preview values to avoid constant sidebar updates while typing.
   const debouncedPrompt = useDebouncedValue(draftPrompt, DRAFT_PREVIEW_DEBOUNCE_MS);
@@ -561,11 +526,7 @@ function DraftAgentListItemWrapper(props: DraftAgentListItemWrapperProps) {
   // so non-empty drafts never become hidden orphans.
   // Uses raw (non-debounced) values so the row appears immediately, while the
   // preview text below still updates at the debounced cadence.
-  const isVisible = isDraftVisible(props.projectPath, props.draftId, {
-    draftPrompt,
-    workspaceNameState,
-    draftAttachmentCount: draft.attachmentCount,
-  });
+  const isVisible = isDraftVisible(draft);
 
   if (!isVisible) {
     return null;
@@ -1812,7 +1773,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   // the visible drafts (#5677). DraftVisibilityWatcher keeps the reactive map current for every
   // draft; the store read covers the render before its first report.
   const isDraftShownInSidebar = (projectPath: string, draftId: string): boolean =>
-    draftVisibilityByProject[projectPath]?.[draftId] ?? isDraftVisible(projectPath, draftId);
+    draftVisibilityByProject[projectPath]?.[draftId] ??
+    isDraftVisible(getDraftStore().getView({ kind: "creation", projectPath, draftId }));
   const getVisibleDraftNumbers = (
     drafts: ReadonlyArray<{ projectPath: string; draftId: string }>
   ): Map<string, number> => {

@@ -13,10 +13,20 @@ import {
   getInputKey,
   getAutoExpandPrefsKey,
   getPendingScopeId,
+  getWorkspaceNameStateKey,
   WORKSPACE_DRAFTS_BY_PROJECT_KEY,
 } from "@/common/constants/storage";
-import type { DraftAttachment, DraftEvent, DraftScope } from "@/common/orpc/schemas/drafts";
-import { DRAFT_STORE_READY_TIMEOUT_MS, MAX_DRAFT_JSON_BYTES } from "@/constants/drafts";
+import type {
+  DraftAttachment,
+  DraftEvent,
+  DraftScope,
+  WorkspaceNamePersistedState,
+} from "@/common/orpc/schemas/drafts";
+import {
+  DEFAULT_CREATION_DRAFT_ID,
+  DRAFT_STORE_READY_TIMEOUT_MS,
+  MAX_DRAFT_JSON_BYTES,
+} from "@/constants/drafts";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
 import { Config } from "@/node/config";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
@@ -35,6 +45,13 @@ function seedLegacyKey(key: string, value: unknown): void {
 
 const WS = "draft-store-ws";
 const WS_SCOPE: DraftScope = { kind: "workspace", workspaceId: WS };
+
+const NAME_STATE: WorkspaceNamePersistedState = {
+  generatedIdentity: { name: "fix-a1b2", title: "Fix the sidebar" },
+  manualName: "",
+  autoGenerate: true,
+  lastGeneratedFor: "fix the sidebar",
+};
 
 const image: DraftAttachment = {
   kind: "provider",
@@ -58,6 +75,8 @@ function createClient(service: DraftService) {
     /** Consumed one per putListEntry call, in call order. */
     listPutGates: [] as Array<Promise<void>>,
     updateGate: null as Promise<void> | null,
+    /** Held after the backend wrote (and pushed) the update, before the reply arrives. */
+    updateReplyGate: null as Promise<void> | null,
     getGate: null as Promise<void> | null,
     subscribeGate: null as Promise<void> | null,
     updates: 0,
@@ -79,7 +98,9 @@ function createClient(service: DraftService) {
         control.failUpdates--;
         throw new Error("update failed");
       }
-      return service.update(input);
+      const reply = await service.update(input);
+      await control.updateReplyGate;
+      return reply;
     },
     delete: async ({ scope }: { scope: DraftScope }) => {
       if (control.failDeletes > 0) {
@@ -505,6 +526,34 @@ describe("DraftStore", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect((await service.getList()).entries).toEqual([]);
     expect(store.getCreationDraftsByProject()[projectPath]).toBeUndefined();
+  });
+
+  test("a delete that waits for a write is not undone by that write's push", async () => {
+    using tempDir = new TestTempDir("draft-store-delete-during-write");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const store = createStore(client);
+    await store.whenReady();
+    const scope: DraftScope = { kind: "creation", projectPath, draftId: "d1" };
+    let sendUpdate: () => void = () => undefined;
+    let sendReply: () => void = () => undefined;
+    control.updateGate = new Promise<void>((resolve) => {
+      sendUpdate = resolve;
+    });
+    control.updateReplyGate = new Promise<void>((resolve) => {
+      sendReply = resolve;
+    });
+    store.setText(scope, "submitted as a workspace");
+    const flushed = store.flush(scope);
+    await waitFor(() => control.updates === 1);
+    const deleted = store.deleteDraft(scope);
+    // The write lands after the delete started, and its push arrives before its reply.
+    sendUpdate();
+    await waitFor(async () => (await service.get(scope)).text.length > 0);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    sendReply();
+    await Promise.all([flushed, deleted]);
+    expect((await service.get(scope)).text).toBe("");
+    expect(store.getView(scope).text).toBe("");
   });
 
   test("replaces a malformed legacy draft list, so its import still completes", async () => {
@@ -1054,5 +1103,83 @@ describe("DraftStore", () => {
     store.setText(WS_SCOPE, "typed later");
     await store.flush(WS_SCOPE);
     expect(store.getText(WS_SCOPE)).toBe("typed later");
+  });
+
+  test("keeps an unsaved name edit over a push, saves it, and shows other windows' names", async () => {
+    using tempDir = new TestTempDir("draft-store-name-state");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const scope: DraftScope = { kind: "creation", projectPath, draftId: "named" };
+    const mine = { ...NAME_STATE, manualName: "this-window", autoGenerate: false };
+    const store = createStore(client);
+    const other = createStore(client);
+    await store.whenReady();
+    await other.whenReady();
+
+    control.updateGate = new Promise(() => undefined);
+    store.setNameState(scope, mine);
+    // Another window saves a name while this window's edit is unsaved: the edit stays shown.
+    await service.update({ scope, nameState: NAME_STATE });
+    await waitFor(() => other.getView(scope).nameState !== null);
+    expect(store.getView(scope).nameState).toEqual(mine);
+
+    control.updateGate = null;
+    await store.flush(scope);
+    expect((await service.get(scope)).nameState).toEqual(mine);
+    await waitFor(() => other.getView(scope).nameState?.manualName === "this-window");
+    // Clearing it removes the name from the body, not the body's text.
+    await service.update({ scope, text: "kept" });
+    store.setNameState(scope, null);
+    await store.flush(scope);
+    expect(await service.get(scope)).toMatchObject({ text: "kept" });
+    expect((await service.get(scope)).nameState).toBeUndefined();
+  });
+
+  test("imports legacy name keys into their drafts and removes a key only once the backend answered", async () => {
+    using tempDir = new TestTempDir("draft-store-legacy-names");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const listed: DraftScope = { kind: "creation", projectPath, draftId: "draft-a" };
+    const defaultScope: DraftScope = {
+      kind: "creation",
+      projectPath,
+      draftId: DEFAULT_CREATION_DRAFT_ID,
+    };
+    const listedKey = getWorkspaceNameStateKey(getDraftScopeId(projectPath, "draft-a"));
+    const pendingKey = getWorkspaceNameStateKey(getPendingScopeId(projectPath));
+    seedLegacyKey(listedKey, NAME_STATE);
+    seedLegacyKey(pendingKey, { ...NAME_STATE, manualName: "default-name", autoGenerate: false });
+
+    control.failImports = 100;
+    const failing = createStore(client);
+    await failing.whenReady();
+    expect(listPersistedKeys("workspaceNameState:").sort()).toEqual([listedKey, pendingKey].sort());
+    // Shown meanwhile, so the name is never lost while its import is retried.
+    expect(failing.getView(listed).nameState).toEqual(NAME_STATE);
+    failing.setClient(null);
+
+    control.failImports = 0;
+    const store = createStore(client);
+    await store.whenReady();
+    expect(listPersistedKeys("workspaceNameState:")).toEqual([]);
+    expect((await service.get(listed)).nameState).toEqual(NAME_STATE);
+    expect((await service.get(defaultScope)).nameState?.manualName).toBe("default-name");
+    expect(store.getView(defaultScope).nameState?.manualName).toBe("default-name");
+  });
+
+  test("moves the workspace name with the draft body", async () => {
+    using tempDir = new TestTempDir("draft-store-move-name");
+    const { projectPath, service, client } = await createHarness(tempDir);
+    const source: DraftScope = {
+      kind: "creation",
+      projectPath,
+      draftId: DEFAULT_CREATION_DRAFT_ID,
+    };
+    const listed: DraftScope = { kind: "creation", projectPath, draftId: "first-listed" };
+    await service.update({ scope: source, nameState: NAME_STATE });
+    const store = createStore(client);
+    await store.whenReady();
+
+    await store.moveDraft(source, listed);
+    expect((await service.get(listed)).nameState).toEqual(NAME_STATE);
+    expect((await service.get(source)).nameState).toBeUndefined();
   });
 });

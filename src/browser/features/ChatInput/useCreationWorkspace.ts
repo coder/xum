@@ -14,15 +14,12 @@ import { buildRuntimeConfig, RUNTIME_MODE } from "@/common/types/runtime";
 import { useDraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
 import { handOffCreationAiSelection } from "@/browser/utils/aiSelectionIntent";
 import { getAutoRouting } from "@/browser/utils/workspaceAiSettingsSync";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import {
-  getPendingScopeId,
-  getDraftScopeId,
   getPendingDraftSkillDiscoveryKey,
   getPendingWorkspaceSendErrorKey,
   getProjectScopeId,
-  getWorkspaceNameStateKey,
 } from "@/common/constants/storage";
 import {
   getAppConfigStore,
@@ -74,6 +71,7 @@ import {
   useWorkspaceName,
   type WorkspaceNameState,
 } from "@/browser/hooks/useWorkspaceName";
+import type { WorkspaceNamePersistedState } from "@/common/orpc/schemas/drafts";
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import {
@@ -257,6 +255,15 @@ async function transferDraftToWorkspace(
     .catch((error: unknown) => console.warn("Failed to save the transferred draft:", error));
 }
 
+/** Whether a default draft's name state holds no name newer than the one just submitted. */
+function holdsOnlySubmittedName(
+  nameState: WorkspaceNamePersistedState | null,
+  submittedName: string
+): boolean {
+  // Trimmed like waitForGeneration trims a typed name before it is submitted.
+  return nameState === null || getNameFromPersistedState(nameState).trim() === submittedName;
+}
+
 /**
  * Hook for managing workspace creation state and logic
  * Handles:
@@ -314,13 +321,16 @@ export function useCreationWorkspace({
     useDraftWorkspaceSettings(projectPath, branches, recommendedTrunk);
   const creationAgentId = resolveCreationAgentId(settings.agentId, agentBaseById);
 
-  // Persist draft workspace name generation state per draft (so multiple drafts don't share a
-  // single auto-naming/manual-name state).
-  const workspaceNameScopeId =
+  // Each creation draft (the project's default one included) stores its own name generation
+  // state in its body, so drafts never share a single auto-naming/manual-name state.
+  const workspaceNameScope =
     projectPath.trim().length > 0
-      ? isDraftId(draftId)
-        ? getDraftScopeId(projectPath, draftId)
-        : getPendingScopeId(projectPath)
+      ? getComposerDraftScope({
+          variant: "creation",
+          workspaceId: null,
+          creationProjectPath: projectPath,
+          pendingDraftId: draftId ?? undefined,
+        })
       : null;
 
   // Project scope ID for reading send options at send time
@@ -332,7 +342,7 @@ export function useCreationWorkspace({
     message,
     debounceMs: 500,
     userModel,
-    scopeId: workspaceNameScopeId,
+    scope: workspaceNameScope,
   });
 
   // Destructure name state functions for use in callbacks
@@ -624,26 +634,25 @@ export function useCreationWorkspace({
             return;
           }
 
-          getDraftStore()
-            .deleteDraft(
-              getComposerDraftScope({
-                variant: "creation",
-                workspaceId: null,
-                creationProjectPath: projectPath,
-                pendingDraftId: draftId ?? undefined,
-              })
-            )
-            .catch(() => undefined);
+          const defaultScope = getComposerDraftScope({
+            variant: "creation",
+            workspaceId: null,
+            creationProjectPath: projectPath,
+            pendingDraftId: draftId ?? undefined,
+          });
           // The default form's typed or generated name belongs to the workspace that now exists:
           // left behind, the next visit offers it again and that create collides with the branch.
-          // Only this key: deleteWorkspaceStorage would drop every key of the pending scope.
           // Only the submitted name: after a failed /goal hand-off save this runs once the command
           // finishes, and the user may have typed the next workspace's name in the form by then.
-          const nameStateKey = getWorkspaceNameStateKey(getPendingScopeId(projectPath));
-          const currentName = getNameFromPersistedState(readPersistedState(nameStateKey, null));
-          // Trimmed like waitForGeneration trims a typed name before it is submitted.
-          if (currentName.trim() === submittedName) {
-            updatePersistedState(nameStateKey, undefined);
+          const nameState = getDraftStore().getView(defaultScope).nameState;
+          if (holdsOnlySubmittedName(nameState, submittedName)) {
+            getDraftStore()
+              .deleteDraft(defaultScope)
+              .catch(() => undefined);
+          } else {
+            // The name is in the draft body: clear the rest and keep the newer name.
+            getDraftStore().setText(defaultScope, "");
+            getDraftStore().setAttachments(defaultScope, []);
           }
         };
 

@@ -216,10 +216,8 @@ export function getAutoExpandPrefsKey(workspaceId: string): string {
 }
 
 /**
- * Get the localStorage key for persisted workspace name-generation state.
- *
- * This is used by the workspace creation flow so drafts can preserve their
- * auto-generated (or manually edited) workspace name independently.
+ * Legacy localStorage key of a creation draft's workspace name state, which now lives in the
+ * draft body on the backend (imported once, see DraftStore.migrateLegacyDrafts).
  *
  * Format: "workspaceNameState:{scopeId}"
  */
@@ -818,9 +816,10 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // Copied on fork.
   // { thinking?, tools?: Record<toolName, boolean> }: one entry per tool the user toggled.
   workspaceKey(getAutoExpandPrefsKey, "ui", true, AUTO_EXPAND_PREFS_MAX_CHARS),
-  // Creation-draft scopes only. ~80 skeleton + generatedIdentity <= ~410 (propose_name: name <= 20
-  // plus suffix, title <= 60) + lastGeneratedFor 2000 + manualName 1024 (workspaceNameState.ts).
-  workspaceKey(getWorkspaceNameStateKey, "draft", true, 4096, "draft"),
+  // Legacy creation-draft name state, now in the draft body on the backend (imported once by
+  // DraftStore.migrateLegacyDrafts, then removed). Never written again, so no budget (0). Still
+  // copied: the legacy pending-draft import moves it to the imported draft's scope first.
+  workspaceKey(getWorkspaceNameStateKey, "draft", true, 0, "draft"),
   // The VS Code webview composer's unsent text. Longer drafts still work for the session (kept in
   // memory); the webview then persists only the last text that fit.
   workspaceKey(getInputKey, "draft", false, 8192, "webview"),

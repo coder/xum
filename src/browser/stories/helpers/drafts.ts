@@ -1,8 +1,8 @@
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import {
   WORKSPACE_DRAFTS_BY_PROJECT_KEY,
   getDraftScopeId,
   getInputKey,
-  getWorkspaceNameStateKey,
 } from "@/common/constants/storage";
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -21,8 +21,8 @@ export interface WorkspaceDraftFixture {
 }
 
 /**
- * Set workspace drafts for a project in localStorage.
- * This seeds the sidebar with UI-only draft placeholders.
+ * Seed workspace drafts for a project: the list and prompts as legacy localStorage keys (imported
+ * on hydration), the workspace names through the DraftStore.
  */
 export function setWorkspaceDrafts(projectPath: string, drafts: WorkspaceDraftFixture[]): void {
   // Set the drafts index
@@ -50,13 +50,18 @@ export function setWorkspaceDrafts(projectPath: string, drafts: WorkspaceDraftFi
       localStorage.setItem(getInputKey(scopeId), JSON.stringify(draft.prompt));
     }
 
-    // Set workspace name state if provided
+    // The name lives in the draft body: set it like the creation form does. Unsaved until the
+    // story's mock backend hydrates the store, which then saves it there.
     if (draft.workspaceName !== undefined) {
-      const nameState = {
-        autoGenerate: false,
-        manualName: draft.workspaceName,
-      };
-      localStorage.setItem(getWorkspaceNameStateKey(scopeId), JSON.stringify(nameState));
+      getDraftStore().setNameState(
+        { kind: "creation", projectPath, draftId: draft.draftId },
+        {
+          generatedIdentity: null,
+          manualName: draft.workspaceName,
+          autoGenerate: false,
+          lastGeneratedFor: "",
+        }
+      );
     }
   }
 }

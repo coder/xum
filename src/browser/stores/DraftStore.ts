@@ -16,6 +16,7 @@ import {
   getInputKey,
   getPendingScopeId,
   getProjectScopeId,
+  getWorkspaceNameStateKey,
   GLOBAL_SCOPE_ID,
   WORKSPACE_DRAFTS_BY_PROJECT_KEY,
 } from "@/common/constants/storage";
@@ -29,9 +30,11 @@ import type {
   DraftListEntry,
   DraftScope,
   DraftSummary,
+  DraftUpdateInput,
   DraftWriteOutput,
   PendingSend,
   SendStatus,
+  WorkspaceNamePersistedState,
 } from "@/common/orpc/schemas/drafts";
 import type { FilePart } from "@/common/orpc/types";
 import {
@@ -50,6 +53,7 @@ import {
   toDraftAttachmentMetadata,
 } from "@/common/utils/drafts";
 import { getErrorMessage } from "@/common/utils/errors";
+import { boundWorkspaceNamePersistedState } from "@/common/utils/workspaceNameState";
 import {
   DEFAULT_CREATION_DRAFT_ID,
   DRAFT_ID_PATTERN,
@@ -117,6 +121,8 @@ export interface DraftView {
    * send failed): the composer stays in its sending state.
    */
   unresolvedSendCount: number;
+  /** A creation draft's workspace name state (useWorkspaceName); null when none was set. */
+  nameState: WorkspaceNamePersistedState | null;
 }
 
 /** A send's acceptance as this window last learned it (see DraftStore.settleSend). */
@@ -191,6 +197,9 @@ interface Entry {
   confirmedTextVersion: number;
   attachmentsVersion: number;
   confirmedAttachmentsVersion: number;
+  nameState: WorkspaceNamePersistedState | null;
+  nameVersion: number;
+  confirmedNameVersion: number;
   flushTimer: ReturnType<typeof setTimeout> | null;
   flushAttempt: number;
   inFlight: Promise<void> | null;
@@ -221,12 +230,7 @@ interface Entry {
    * The newest server view (any push, snapshot or write reply). A field with an unsaved edit
    * keeps the edit; once its write is confirmed, the field takes this view.
    */
-  serverView: {
-    revision: number;
-    text: string;
-    attachments: readonly DraftAttachmentMetadata[];
-    pendingSends: readonly PendingSend[];
-  } | null;
+  serverView: (ServerDraftState & { revision: number }) | null;
   view: DraftView;
 }
 
@@ -239,6 +243,7 @@ const EMPTY_VIEW: DraftView = {
   attachmentCount: 0,
   payloadsLoaded: true,
   unresolvedSendCount: 0,
+  nameState: null,
 };
 /** Automatic retries of an unresolved send per batch (a trigger starts a new batch). */
 const SEND_RETRY_LIMIT = 5;
@@ -255,21 +260,74 @@ export function draftStoreScopeKey(scope: DraftStoreScope): string {
   return scope.kind === "pending" ? `pending:${scope.projectPath}` : draftScopeKey(scope);
 }
 
+/** A draft's state as the backend reports it (push, snapshot or write reply). */
+type ServerDraftState = Pick<
+  DraftWriteOutput,
+  "text" | "attachments" | "pendingSends" | "nameState"
+>;
+
+const EMPTY_SERVER_STATE: ServerDraftState = { text: "", attachments: [] };
+
+/** The fields a write sent (a reply speaks only for those). */
+interface WrittenFields {
+  text: boolean;
+  attachments: boolean;
+  name: boolean;
+}
+
+const ALL_FIELDS: WrittenFields = { text: true, attachments: true, name: true };
+
 /** Marks the field versions a confirmed write sent as saved (only the fields it wrote). */
 function confirmWrite(
   entry: Entry,
-  wrote: { text: boolean; attachments: boolean },
-  versions: { text: number; attachments: number }
+  wrote: WrittenFields,
+  versions: { text: number; attachments: number; name: number }
 ): void {
-  if (wrote.text) {
-    entry.confirmedTextVersion = Math.max(entry.confirmedTextVersion, versions.text);
-  }
-  if (wrote.attachments) {
-    entry.confirmedAttachmentsVersion = Math.max(
-      entry.confirmedAttachmentsVersion,
-      versions.attachments
-    );
-  }
+  entry.confirmedTextVersion = confirmedVersion(
+    entry.confirmedTextVersion,
+    wrote.text,
+    versions.text
+  );
+  entry.confirmedAttachmentsVersion = confirmedVersion(
+    entry.confirmedAttachmentsVersion,
+    wrote.attachments,
+    versions.attachments
+  );
+  entry.confirmedNameVersion = confirmedVersion(
+    entry.confirmedNameVersion,
+    wrote.name,
+    versions.name
+  );
+}
+
+function confirmedVersion(confirmed: number, wrote: boolean, version: number): number {
+  return wrote ? Math.max(confirmed, version) : confirmed;
+}
+
+/** The fields with an unsaved edit that a write may send now, or null when none is due. */
+function dueFields(entry: Entry): WrittenFields | null {
+  const due: WrittenFields = {
+    text: isTextDirty(entry),
+    // An attachment edit waits while payloads load: queued updates (applied onto the loaded
+    // list) may still add to it, and writing it before them could delete attachments.
+    attachments: isAttachmentsDirty(entry) && entry.payloadsLoaded,
+    name: isNameDirty(entry),
+  };
+  return due.text || due.attachments || due.name ? due : null;
+}
+
+/** The update that writes the `wrote` fields of the entry. */
+function updateInputOf(scope: DraftScope, entry: Entry, wrote: WrittenFields): DraftUpdateInput {
+  return {
+    scope,
+    ...(wrote.text ? { text: entry.text } : {}),
+    // The visible part only: the backend keeps what pending sends retain.
+    ...(wrote.attachments ? { attachments: visibleAttachments(entry) } : {}),
+    ...(wrote.name ? { nameState: entry.nameState } : {}),
+    // What this window wrote against: the backend merges what happened to them since. A lost
+    // reply is retried with the same basis, which merges the same way again.
+    ...(entry.basisSends.size > 0 ? { basisSends: [...entry.basisSends.values()] } : {}),
+  };
 }
 
 /**
@@ -295,9 +353,21 @@ function isAttachmentsDirty(entry: Entry): boolean {
   return entry.attachmentsVersion > entry.confirmedAttachmentsVersion;
 }
 
+function isEmptyView(view: DraftView): boolean {
+  return view.text.length === 0 && view.attachmentCount === 0 && view.nameState === null;
+}
+
+function isNameDirty(entry: Entry): boolean {
+  return entry.nameVersion > entry.confirmedNameVersion;
+}
+
+function hasUnsavedEdit(entry: Entry): boolean {
+  return isTextDirty(entry) || isAttachmentsDirty(entry) || isNameDirty(entry);
+}
+
 /** A field has an unsaved edit or a write is in flight: the backend has not merged it yet. */
 function isUnsynced(entry: Entry): boolean {
-  return isTextDirty(entry) || isAttachmentsDirty(entry) || entry.inFlight !== null;
+  return hasUnsavedEdit(entry) || entry.inFlight !== null;
 }
 
 /**
@@ -456,6 +526,26 @@ function readLegacyJson(key: string): unknown {
   }
 }
 
+/**
+ * A legacy `workspaceNameState:<scope>` key's creation draft and bounded value. A pending scope is
+ * the project's default draft. Null when the key cannot be imported (it is then dropped).
+ */
+function parseLegacyNameState(
+  key: string,
+  prefix: string
+): {
+  scope: Extract<DraftScope, { kind: "creation" }>;
+  nameState: WorkspaceNamePersistedState;
+} | null {
+  const legacyScope = legacyScopeFor(key.slice(prefix.length));
+  const scope =
+    legacyScope?.kind === "pending"
+      ? defaultCreationDraftScope(legacyScope.projectPath)
+      : legacyScope;
+  const nameState = boundWorkspaceNamePersistedState(readLegacyJson(key));
+  return scope?.kind === "creation" && nameState !== null ? { scope, nameState } : null;
+}
+
 /** A listed creation draft (a sidebar row under its project); see DraftListEntrySchema. */
 export interface WorkspaceDraft {
   draftId: string;
@@ -528,6 +618,8 @@ export class DraftStore {
    * once its list entry is gone, so nothing else would ever remove its file.
    */
   private readonly pendingDeletes = new Map<string, DraftScope>();
+  /** Deletes waiting for a write or list put to land (see deleteDraft). */
+  private readonly waitingDeletes = new Set<string>();
   /**
    * The creation draft list (sidebar rows), owned by the backend (drafts/list.json). The view
    * overlays puts the list has not reflected yet and hides pending deletes.
@@ -811,6 +903,27 @@ export class DraftStore {
     this.scheduleFlush(entry);
   }
 
+  /**
+   * Set (or clear, with null) a creation draft's workspace name state, saved like the text. Bounded
+   * here as the backend bounds it, so the confirmed value is the one shown.
+   */
+  setNameState(
+    scope: DraftStoreScope,
+    value:
+      | WorkspaceNamePersistedState
+      | null
+      | ((previous: WorkspaceNamePersistedState | null) => WorkspaceNamePersistedState | null)
+  ): void {
+    const entry = this.getOrCreateEntry(scope);
+    const next = typeof value === "function" ? value(entry.nameState) : value;
+    const bounded = next === null ? null : boundWorkspaceNamePersistedState(next);
+    if (JSON.stringify(bounded) === JSON.stringify(entry.nameState)) return;
+    entry.nameState = bounded;
+    entry.nameVersion++;
+    this.recompute(entry);
+    this.scheduleFlush(entry);
+  }
+
   /** #6405: Enter on `text`; keys typed until its send takes it follow it (see Entry.sendMark). */
   markSendStart(scope: DraftStoreScope, text: string): void {
     const entry = this.getOrCreateEntry(scope);
@@ -1075,7 +1188,7 @@ export class DraftStore {
         entry.inFlight = null;
         settle();
       }
-      this.applyWriteReply(entry, reply, { text: true, attachments: false });
+      this.applyWriteReply(entry, reply, { text: true, attachments: false, name: false });
     } catch (error) {
       tracking.issuing.delete(input.sendId);
       if (this.entries.get(key) === entry) {
@@ -1405,14 +1518,24 @@ export class DraftStore {
     const listPut = this.pendingListPuts.get(key)?.sending;
     if (scope.kind === "creation") this.dropListEntry(key);
     // Let a write in flight land first, so it cannot recreate the file after the delete; the same
-    // for a list put, which would relist the draft.
-    await entry?.inFlight;
-    await listPut;
+    // for a list put, which would relist the draft. That write's push must not bring the entry
+    // back meanwhile: the delete would then see an edit and keep the draft.
+    this.waitingDeletes.add(key);
+    try {
+      await entry?.inFlight;
+      await listPut;
+    } finally {
+      this.waitingDeletes.delete(key);
+    }
     if (this.entries.has(key)) return;
     this.pendingDeletes.set(key, scope);
     // A list event while waiting above may have shown the row again; hide it now.
     if (scope.kind === "creation") this.recomputeList();
     await this.sendDelete(key, 0);
+  }
+
+  private isDeleting(key: string): boolean {
+    return this.pendingDeletes.has(key) || this.waitingDeletes.has(key);
   }
 
   private async sendDelete(key: string, attempt: number): Promise<void> {
@@ -1441,11 +1564,12 @@ export class DraftStore {
   async moveDraft(from: DraftStoreScope, to: DraftStoreScope): Promise<void> {
     const key = draftStoreScopeKey(from);
     const source = this.entries.get(key);
-    if (!source || (source.view.text.length === 0 && source.view.attachmentCount === 0)) return;
+    if (!source || isEmptyView(source.view)) return;
     this.setText(to, source.text);
+    this.setNameState(to, source.nameState);
     // Captured with the copy it describes: an edit during the payload load below must keep the
-    // source (the text was copied before it).
-    const textVersion = source.textVersion;
+    // source (the text and name were copied before it).
+    const copiedEdits = source.textVersion + source.nameVersion;
     if (!source.payloadsLoaded) {
       // A hydrated source may not have its attachment payloads yet. Deleting it before they
       // arrive would lose the attachments, so move them once loaded; on failure the source stays.
@@ -1468,7 +1592,7 @@ export class DraftStore {
     // An edit of the source meanwhile makes it a different draft: keep it.
     if (
       this.entries.get(key) !== source ||
-      source.textVersion !== textVersion ||
+      source.textVersion + source.nameVersion !== copiedEdits ||
       source.attachmentsVersion !== attachmentsVersion
     ) {
       return;
@@ -1528,6 +1652,9 @@ export class DraftStore {
       confirmedTextVersion: 0,
       attachmentsVersion: 0,
       confirmedAttachmentsVersion: 0,
+      nameState: null,
+      nameVersion: 0,
+      confirmedNameVersion: 0,
       flushTimer: null,
       flushAttempt: 0,
       inFlight: null,
@@ -1544,6 +1671,7 @@ export class DraftStore {
       // unconfirmed so the next write replaces the whole stored draft, not just the edited field.
       entry.textVersion = 1;
       entry.attachmentsVersion = 1;
+      entry.nameVersion = 1;
     }
     this.entries.set(key, entry);
     return entry;
@@ -1603,6 +1731,7 @@ export class DraftStore {
               const status = tracking.lastStatus.get(sendId);
               return status === "unknown" || status === "failed";
             }).length,
+      nameState: entry.nameState,
     };
     this.notify(key);
   }
@@ -1630,13 +1759,12 @@ export class DraftStore {
    */
   private applyServerState(
     entry: Entry,
-    text: string,
-    attachments: readonly DraftAttachmentMetadata[],
-    pendingSends: readonly PendingSend[],
-    fields: { text: boolean; attachments: boolean } = { text: true, attachments: true }
+    state: ServerDraftState,
+    fields: WrittenFields = ALL_FIELDS
   ): void {
+    const pendingSends = state.pendingSends ?? [];
     if (entry.serverView === null || entry.revision >= entry.serverView.revision) {
-      entry.serverView = { revision: entry.revision, text, attachments, pendingSends };
+      entry.serverView = { ...state, revision: entry.revision };
     }
     // Not a composer field: always the server's (plus sends begun here, not confirmed yet).
     entry.pendingSends = mergePendingSends(entry, pendingSends);
@@ -1649,45 +1777,51 @@ export class DraftStore {
       // so its lookup returns it (not accepted).
       this.triggerSendResolution(entry.scope.workspaceId);
     }
-    if (fields.text && !isTextDirty(entry)) entry.text = text;
+    if (fields.text && !isTextDirty(entry)) entry.text = state.text;
+    if (fields.name && !isNameDirty(entry)) entry.nameState = state.nameState ?? null;
     if (fields.attachments && !isAttachmentsDirty(entry)) {
-      if (attachments.length === 0) {
-        const queued = entry.queuedAttachmentUpdates;
-        entry.attachments = [];
-        entry.attachmentCount = 0;
-        entry.payloadsLoaded = true;
-        entry.queuedAttachmentUpdates = [];
-        entry.payloadGeneration++;
-        // Updates queued for the payloads apply to the (now known) empty list, not dropped.
-        if (queued.length > 0) {
-          this.applyAttachments(
-            entry,
-            queued.reduce<ChatAttachment[]>((current, update) => update(current), [])
-          );
-        }
-      } else if (
-        !entry.payloadsLoaded ||
-        !matchesServerAttachments(entry.attachments, attachments)
-      ) {
-        // New or changed attachments: payloads come from `get`. Meanwhile keep showing the ones
-        // that are still present, so a removal elsewhere does not flash the whole list away.
-        const serverIds = new Set(attachments.map(({ id }) => id));
-        entry.attachments = entry.attachments.filter(({ id }) => serverIds.has(id));
-        entry.attachmentCount = attachments.length;
-        entry.payloadsLoaded = false;
-        entry.payloadGeneration++;
-        if ((this.listeners.get(draftStoreScopeKey(entry.scope))?.size ?? 0) > 0) {
-          this.ensurePayloads(entry.scope).catch((error: unknown) => {
-            console.warn("Failed to load draft attachments:", error);
-          });
-        }
-      }
+      this.applyServerAttachments(entry, state.attachments);
     }
     this.recompute(entry);
     // A change elsewhere can make a refused (too large) unconfirmed edit fit again; that refusal
     // schedules no retry, so try once more. A no-op without an unconfirmed field or when a save
     // is already scheduled.
     if (this.hydrated) this.scheduleFlush(entry);
+  }
+
+  /** The server's attachment list, for a field without an unconfirmed local change. */
+  private applyServerAttachments(
+    entry: Entry,
+    attachments: readonly DraftAttachmentMetadata[]
+  ): void {
+    if (attachments.length === 0) {
+      const queued = entry.queuedAttachmentUpdates;
+      entry.attachments = [];
+      entry.attachmentCount = 0;
+      entry.payloadsLoaded = true;
+      entry.queuedAttachmentUpdates = [];
+      entry.payloadGeneration++;
+      // Updates queued for the payloads apply to the (now known) empty list, not dropped.
+      if (queued.length > 0) {
+        this.applyAttachments(
+          entry,
+          queued.reduce<ChatAttachment[]>((current, update) => update(current), [])
+        );
+      }
+    } else if (!entry.payloadsLoaded || !matchesServerAttachments(entry.attachments, attachments)) {
+      // New or changed attachments: payloads come from `get`. Meanwhile keep showing the ones
+      // that are still present, so a removal elsewhere does not flash the whole list away.
+      const serverIds = new Set(attachments.map(({ id }) => id));
+      entry.attachments = entry.attachments.filter(({ id }) => serverIds.has(id));
+      entry.attachmentCount = attachments.length;
+      entry.payloadsLoaded = false;
+      entry.payloadGeneration++;
+      if ((this.listeners.get(draftStoreScopeKey(entry.scope))?.size ?? 0) > 0) {
+        this.ensurePayloads(entry.scope).catch((error: unknown) => {
+          console.warn("Failed to load draft attachments:", error);
+        });
+      }
+    }
   }
 
   private applySnapshot(drafts: DraftSummary[]): void {
@@ -1698,19 +1832,19 @@ export class DraftStore {
       seen.add(draftStoreScopeKey(summary.scope));
       // Each subscription restarts the revision sequence, so a restarted backend is never ignored.
       entry.revision = summary.revision;
-      this.applyServerState(entry, summary.text, summary.attachments, summary.pendingSends ?? []);
+      this.applyServerState(entry, summary);
     }
     for (const [key, entry] of this.entries) {
       if (entry.scope.kind !== "pending" && !seen.has(key)) {
         entry.revision = Number.NEGATIVE_INFINITY;
-        this.applyServerState(entry, "", [], []);
+        this.applyServerState(entry, EMPTY_SERVER_STATE);
       }
     }
   }
 
   private applyEvent(event: Extract<DraftEvent, { type: "changed" | "deleted" }>): void {
     const key = draftScopeKey(event.scope);
-    if (this.pendingDeletes.has(key)) return;
+    if (this.isDeleting(key)) return;
     const existing = this.entries.get(key);
     // Pushes that trail a newer write reply (or the snapshot) are stale.
     const stale = existing !== undefined && event.revision <= existing.revision;
@@ -1718,12 +1852,20 @@ export class DraftStore {
     if (event.type === "deleted") {
       if (!existing) return;
       existing.revision = event.revision;
-      this.applyServerState(existing, "", [], []);
+      this.applyServerState(existing, EMPTY_SERVER_STATE);
       return;
     }
     const entry = existing ?? this.getOrCreateEntry(event.scope);
     entry.revision = event.revision;
-    this.applyServerState(entry, event.text, event.attachments, event.pendingSends ?? []);
+    this.applyServerState(entry, event);
+  }
+
+  private markHydrated(): void {
+    const wasHydrated = this.hydrated;
+    this.hydrated = true;
+    this.markReady();
+    // `ready` may have come from the timeout: hydration is news to useDraftStoreHydrated.
+    if (!wasHydrated) for (const listener of this.readyListeners) listener();
   }
 
   private startSubscription(client: APIClient): void {
@@ -1765,8 +1907,7 @@ export class DraftStore {
             // every (re)subscription: keys whose import failed are retried, and without keys the
             // scan is cheap.
             await this.migrateLegacyDrafts(client);
-            this.hydrated = true;
-            this.markReady();
+            this.markHydrated();
             for (const entry of this.entries.values()) this.scheduleFlush(entry);
             for (const key of [...this.pendingDeletes.keys()]) {
               this.sendDelete(key, 0).catch(() => undefined);
@@ -1974,6 +2115,59 @@ export class DraftStore {
         }
       }
     }
+    await this.migrateLegacyNameStates(client);
+  }
+
+  /**
+   * One-way migration of the legacy `workspaceNameState:<scope>` keys into the body of their
+   * creation draft: a draft scope, or a pending scope (the project's default draft). Runs after
+   * the text import, which moves a legacy pending draft's name key to the draft it creates. As for
+   * the text: a key is removed only after the backend answered, and on failure it stays and its
+   * name is shown (and saved like an edit) when the draft has none.
+   */
+  private async migrateLegacyNameStates(client: APIClient): Promise<void> {
+    const prefix = getWorkspaceNameStateKey("");
+    let keys: string[];
+    try {
+      keys = listPersistedKeys(prefix);
+    } catch (error) {
+      console.warn(
+        "localStorage is unavailable; skipping the legacy workspace name import:",
+        error
+      );
+      return;
+    }
+    for (const key of keys) {
+      const legacy = parseLegacyNameState(key, prefix);
+      if (legacy === null) {
+        updatePersistedState(key, undefined);
+        continue;
+      }
+      await this.importLegacyNameState(client, key, legacy.scope, legacy.nameState);
+    }
+  }
+
+  private async importLegacyNameState(
+    client: APIClient,
+    key: string,
+    scope: Extract<DraftScope, { kind: "creation" }>,
+    nameState: WorkspaceNamePersistedState
+  ): Promise<void> {
+    try {
+      const reply = await client.drafts.importLegacy({ scope, nameState });
+      if (reply.result === "applied") {
+        const entry = this.getOrCreateEntry(scope);
+        if (reply.revision > entry.revision) {
+          entry.revision = reply.revision;
+          if (!isNameDirty(entry)) entry.nameState = nameState;
+          this.recompute(entry);
+        }
+      }
+      updatePersistedState(key, undefined);
+    } catch (error) {
+      console.warn("Failed to import a legacy workspace name; will retry on next start:", error);
+      if (this.getView(scope).nameState === null) this.setNameState(scope, nameState);
+    }
   }
 
   /**
@@ -2002,7 +2196,7 @@ export class DraftStore {
 
   private scheduleFlush(entry: Entry): void {
     if (entry.scope.kind === "pending" || entry.flushTimer) return;
-    if (!isTextDirty(entry) && !isAttachmentsDirty(entry)) return;
+    if (!hasUnsavedEdit(entry)) return;
     entry.flushTimer = setTimeout(() => {
       entry.flushTimer = null;
       this.flushInBackground(entry);
@@ -2021,7 +2215,7 @@ export class DraftStore {
         clearTimeout(entry.flushTimer);
         entry.flushTimer = null;
       }
-      if (isTextDirty(entry) || isAttachmentsDirty(entry)) this.flushInBackground(entry);
+      if (hasUnsavedEdit(entry)) this.flushInBackground(entry);
     }
   }
 
@@ -2042,10 +2236,11 @@ export class DraftStore {
     const scope = entry.scope;
     if (scope.kind === "pending") return;
     const key = draftScopeKey(scope);
-    // An attachment edit waits while payloads load: queued updates (applied onto the loaded
-    // list) may still add to it, and writing it before them could delete attachments.
-    const attachmentsDue = () => isAttachmentsDirty(entry) && entry.payloadsLoaded;
-    while ((isTextDirty(entry) || attachmentsDue()) && this.entries.get(key) === entry) {
+    for (
+      let wrote = dueFields(entry);
+      wrote !== null && this.entries.get(key) === entry;
+      wrote = dueFields(entry)
+    ) {
       if (entry.inFlight) {
         await entry.inFlight;
         continue;
@@ -2062,38 +2257,24 @@ export class DraftStore {
         this.reportSaveError(entry, key, error);
         throw error;
       }
-      const sendText = isTextDirty(entry);
-      const sendAttachments = attachmentsDue();
-      const textVersion = entry.textVersion;
-      const attachmentsVersion = entry.attachmentsVersion;
+      const versions = {
+        text: entry.textVersion,
+        attachments: entry.attachmentsVersion,
+        name: entry.nameVersion,
+      };
       let settle: () => void = () => undefined;
       entry.inFlight = new Promise<void>((resolve) => {
         settle = resolve;
       });
       let reply: DraftWriteOutput;
       try {
-        reply = await client.drafts.update({
-          scope,
-          ...(sendText ? { text: entry.text } : {}),
-          // The visible part only: the backend keeps what pending sends retain.
-          ...(sendAttachments ? { attachments: visibleAttachments(entry) } : {}),
-          // What this window wrote against: the backend merges what happened to them since. A
-          // lost reply is retried with the same basis, which merges the same way again.
-          ...(entry.basisSends.size > 0 ? { basisSends: [...entry.basisSends.values()] } : {}),
-        });
+        reply = await client.drafts.update(updateInputOf(scope, entry, wrote));
         // A reply of a replaced backend confirms nothing: the edit must reach the current one,
         // so the loop writes it again there (#6438).
         if (this.client !== client) continue;
         entry.flushAttempt = 0;
         entry.failing = false;
-        confirmWrite(
-          entry,
-          { text: sendText, attachments: sendAttachments },
-          {
-            text: textVersion,
-            attachments: attachmentsVersion,
-          }
-        );
+        confirmWrite(entry, wrote, versions);
       } catch (error) {
         this.reportSaveError(entry, key, error);
         // The backend's size refusal (measurable only there while payloads are unloaded) is
@@ -2111,7 +2292,7 @@ export class DraftStore {
         entry.inFlight = null;
         settle();
       }
-      this.applyWriteReply(entry, reply, { text: sendText, attachments: sendAttachments });
+      this.applyWriteReply(entry, reply, wrote);
     }
   }
 
@@ -2133,23 +2314,13 @@ export class DraftStore {
    * the newest server view (this reply, or a push that came after it); the echo push of this
    * write is stale for this window, so the reply is how the merge reaches it.
    */
-  private applyWriteReply(
-    entry: Entry,
-    reply: DraftWriteOutput,
-    wrote: { text: boolean; attachments: boolean }
-  ): void {
+  private applyWriteReply(entry: Entry, reply: DraftWriteOutput, wrote: WrittenFields): void {
     if (this.entries.get(draftStoreScopeKey(entry.scope)) !== entry) return;
     entry.revision = Math.max(entry.revision, reply.revision);
     if (entry.serverView === null || reply.revision >= entry.serverView.revision) {
-      entry.serverView = {
-        revision: reply.revision,
-        text: reply.text,
-        attachments: reply.attachments,
-        pendingSends: reply.pendingSends ?? [],
-      };
+      entry.serverView = reply;
     }
-    const view = entry.serverView;
-    this.applyServerState(entry, view.text, view.attachments, view.pendingSends, wrote);
+    this.applyServerState(entry, entry.serverView, wrote);
   }
 }
 
@@ -2175,6 +2346,12 @@ export function useCreationDraftsByProject(): CreationDraftsByProject {
   return useSyncExternalStore(store.subscribeCreationDrafts, () =>
     store.getCreationDraftsByProject()
   );
+}
+
+/** True once a real snapshot was applied (unlike ready, never set by the readiness timeout). */
+export function useDraftStoreHydrated(): boolean {
+  const store = getDraftStore();
+  return useSyncExternalStore(store.subscribeReady, () => store.isHydrated());
 }
 
 /** True once drafts are hydrated (or hydration failed and the app must not wait for it). */

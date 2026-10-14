@@ -1,21 +1,15 @@
-import { useState, useRef, useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
+import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { useAPI } from "@/browser/contexts/API";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import {
-  createSessionValueStore,
-  truncateStringToChars,
-} from "@/browser/utils/boundedPersistedValue";
-import { getWorkspaceNameStateKey } from "@/common/constants/storage";
-import {
-  WorkspaceNamePersistedStateSchema,
-  type WorkspaceIdentity,
-  type WorkspaceNamePersistedState,
-} from "@/common/orpc/schemas/drafts";
-import {
-  WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS,
-  toStoredMessage,
-} from "@/common/utils/workspaceNameState";
+  draftStoreScopeKey,
+  getDraftStore,
+  useDraft,
+  useDraftStoreHydrated,
+  type DraftStoreScope,
+} from "@/browser/stores/DraftStore";
+import type { WorkspaceIdentity, WorkspaceNamePersistedState } from "@/common/orpc/schemas/drafts";
 import type { NameGenerationError } from "@/common/types/errors";
+import { toStoredMessage } from "@/common/utils/workspaceNameState";
 import {
   validateWorkspaceBranchName,
   validateWorkspaceName,
@@ -57,12 +51,11 @@ export interface UseWorkspaceNameOptions {
   /** User's selected model to try after the configured and built-in naming models */
   userModel?: string;
   /**
-   * Optional storage scope for persisting draft name-generation state.
-   *
-   * When provided (e.g. a draft scopeId), each draft keeps its own auto-naming/manual name state so
-   * switching between drafts doesn't share a single generator or manual-edit mode.
+   * The creation draft whose body stores the name-generation state (DraftStore), so each draft
+   * keeps its own auto-naming/manual name state and the state moves with the draft. Without one
+   * the state is local to the component.
    */
-  scopeId?: string | null;
+  scope?: DraftStoreScope | null;
 }
 
 /** State and actions for workspace name generation, suitable for passing to components */
@@ -88,9 +81,8 @@ export interface UseWorkspaceNameReturn extends WorkspaceNameState {
   waitForGeneration: () => Promise<WorkspaceIdentity | null>;
 }
 
-// Full manual names whose persisted copy is a bounded prefix (see setNameManual), so they stay
-// visible for the rest of the session, also after the creation controls remount.
-const sessionManualNames = createSessionValueStore<{ name: string; persisted: string }>();
+/** Subscribed (never read) when the hook has no draft scope. */
+const NO_DRAFT_SCOPE: DraftStoreScope = { kind: "pending", projectPath: "" };
 
 const DEFAULT_PERSISTED_STATE: WorkspaceNamePersistedState = {
   generatedIdentity: null,
@@ -100,11 +92,9 @@ const DEFAULT_PERSISTED_STATE: WorkspaceNamePersistedState = {
 };
 
 /** The workspace name the creation form shows for persisted name state ("" when none). */
-export function getNameFromPersistedState(state: unknown): string {
-  const parsed = WorkspaceNamePersistedStateSchema.partial().safeParse(state);
-  if (!parsed.success) return "";
-  const { autoGenerate, generatedIdentity, manualName } = parsed.data;
-  return autoGenerate !== false ? (generatedIdentity?.name ?? "") : (manualName ?? "");
+export function getNameFromPersistedState(state: WorkspaceNamePersistedState | null): string {
+  if (state === null) return "";
+  return state.autoGenerate ? (state.generatedIdentity?.name ?? "") : state.manualName;
 }
 
 /**
@@ -115,15 +105,13 @@ export function getNameFromPersistedState(state: unknown): string {
  * For auto-generated identities, prefers title (human-readable) over name (git-safe branch name).
  * This matches how real workspaces display: metadata.title ?? metadata.name.
  */
-export function getDisplayTitleFromPersistedState(state: unknown): string {
-  const parsed = WorkspaceNamePersistedStateSchema.partial().safeParse(state);
-  if (!parsed.success) {
-    return "";
-  }
+export function getDisplayTitleFromPersistedState(
+  state: WorkspaceNamePersistedState | null
+): string {
+  if (state === null) return "";
+  const { autoGenerate, generatedIdentity, manualName } = state;
 
-  const { autoGenerate, generatedIdentity, manualName } = parsed.data;
-
-  if (autoGenerate !== false) {
+  if (autoGenerate) {
     if (!generatedIdentity) {
       return "";
     }
@@ -131,7 +119,44 @@ export function getDisplayTitleFromPersistedState(state: unknown): string {
     return generatedIdentity.title.trim() || generatedIdentity.name;
   }
 
-  return manualName ?? "";
+  return manualName;
+}
+
+/**
+ * Before the drafts load, a backend draft's stored name is unknown: a name generated against the
+ * empty default would replace it once saved.
+ */
+function isBackendDraft(scope: DraftStoreScope | null): boolean {
+  return scope !== null && scope.kind !== "pending";
+}
+
+/** The name state of the creation draft `scope` (DraftStore), or component-local state without one. */
+function useWorkspaceNameStorage(scope: DraftStoreScope | null) {
+  // Always subscribe, but only *use* the draft when a scope is provided.
+  const draft = useDraft(scope ?? NO_DRAFT_SCOPE);
+  const hydrated = useDraftStoreHydrated();
+  const [localState, setLocalState] =
+    useState<WorkspaceNamePersistedState>(DEFAULT_PERSISTED_STATE);
+  // Callers build the scope inline: the setter reads the latest one, so it stays stable.
+  const scopeRef = useRef(scope);
+  scopeRef.current = scope;
+  const setStored = useCallback(
+    (update: (prev: WorkspaceNamePersistedState) => WorkspaceNamePersistedState) => {
+      const current = scopeRef.current;
+      if (current === null) {
+        setLocalState(update);
+        return;
+      }
+      getDraftStore().setNameState(current, (prev) => update(prev ?? DEFAULT_PERSISTED_STATE));
+    },
+    []
+  );
+  return {
+    stored: scope ? (draft.nameState ?? DEFAULT_PERSISTED_STATE) : localState,
+    setStored,
+    scopeKey: scope === null ? null : draftStoreScopeKey(scope),
+    canAutoGenerate: hydrated || !isBackendDraft(scope),
+  };
 }
 
 /**
@@ -142,37 +167,17 @@ export function getDisplayTitleFromPersistedState(state: unknown): string {
  * auto-generation resumes.
  */
 export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspaceNameReturn {
-  const { message, debounceMs = 500, userModel, scopeId } = options;
+  const { message, debounceMs = 500, userModel } = options;
+  const scope = options.scope ?? null;
   const { api } = useAPI();
   const candidates = useMemo(() => buildNameGenCandidates(userModel), [userModel]);
 
-  // Always call usePersistedState, but only *use* it when scopeId is provided.
-  // This prevents draft switching from leaking name state across different creation drafts.
-  const anonymousScopeIdRef = useRef(`__workspaceNameAnon__${Math.random().toString(36).slice(2)}`);
-  const persistedKey = getWorkspaceNameStateKey(scopeId ?? anonymousScopeIdRef.current);
-
-  const [persistedState, setPersistedState] = usePersistedState<WorkspaceNamePersistedState>(
-    persistedKey,
-    DEFAULT_PERSISTED_STATE,
-    { listener: true }
-  );
-  const [localState, setLocalState] =
-    useState<WorkspaceNamePersistedState>(DEFAULT_PERSISTED_STATE);
-
-  const stored = scopeId ? persistedState : localState;
-  const setStored = scopeId ? setPersistedState : setLocalState;
+  const { stored, setStored, scopeKey, canAutoGenerate } = useWorkspaceNameStorage(scope);
 
   const { generatedIdentity, manualName, autoGenerate, lastGeneratedFor } = stored;
 
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState<WorkspaceNameUIError | null>(null);
-  // Only a bounded prefix of a very long typed name persists; the full name stays visible while the
-  // stored value is still that prefix (another tab's edit wins).
-  const sessionManualName = useSyncExternalStore(sessionManualNames.subscribe, () =>
-    sessionManualNames.get(persistedKey)
-  );
-  const displayedManualName =
-    sessionManualName?.persisted === manualName ? sessionManualName.name : manualName;
 
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Message pending in debounce timer (captured at schedule time)
@@ -187,7 +192,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
   } | null>(null);
 
   // Name shown in CreationControls UI: generated name when auto, manual when not
-  const name = autoGenerate ? (generatedIdentity?.name ?? "") : displayedManualName;
+  const name = autoGenerate ? (generatedIdentity?.name ?? "") : manualName;
   // Derived rather than set on keystrokes so a restored invalid name (e.g. a bounded prefix after a
   // restart) is flagged right away instead of failing only on submit.
   const manualNameValidationError =
@@ -218,7 +223,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     cancelPendingGeneration();
     setIsGenerating(false);
     setError(null);
-  }, [persistedKey, cancelPendingGeneration]);
+  }, [scopeKey, cancelPendingGeneration]);
 
   const generateIdentity = useCallback(
     async (forMessage: string): Promise<WorkspaceIdentity | null> => {
@@ -308,7 +313,12 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
     // - Auto-generation is disabled
     // - Message is empty
     // - Already generated for this message
-    if (!autoGenerate || !message.trim() || lastGeneratedFor === toStoredMessage(message)) {
+    if (
+      !canAutoGenerate ||
+      !autoGenerate ||
+      !message.trim() ||
+      lastGeneratedFor === toStoredMessage(message)
+    ) {
       // Clear any pending timer since conditions changed
       if (debounceTimerRef.current) {
         clearTimeout(debounceTimerRef.current);
@@ -340,6 +350,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
       }
     };
   }, [
+    canAutoGenerate,
     message,
     autoGenerate,
     lastGeneratedFor,
@@ -370,15 +381,10 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
 
   const setNameManual = useCallback(
     (newName: string) => {
-      const persisted = truncateStringToChars(newName, WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS);
-      sessionManualNames.set(
-        persistedKey,
-        persisted === newName ? undefined : { name: newName, persisted }
-      );
-      setStored((prev) => ({ ...prev, manualName: persisted }));
+      setStored((prev) => ({ ...prev, manualName: newName }));
       setError(null);
     },
-    [setStored, persistedKey]
+    [setStored]
   );
 
   const waitForGeneration = useCallback(async (): Promise<WorkspaceIdentity | null> => {

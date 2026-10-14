@@ -123,9 +123,9 @@ describe("migrateWorkspaceStorage", () => {
     expect(localStorage.getItem(sourceKey)).toBe(legacyValue);
   });
 
-  // Older builds stored the whole creation message in workspaceNameState; its owner bound shrinks
-  // it, so the moved draft keeps its name state after a restart.
-  test("moves an oversized legacy workspace name state in bounded form", () => {
+  // Older builds stored the whole creation message in workspaceNameState. The legacy key moves
+  // whole (no budget applies to it), and the draft's one-time import bounds it.
+  test("moves an oversized legacy workspace name state for its import", () => {
     const domWindow = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.window = domWindow;
     globalThis.document = domWindow.document;

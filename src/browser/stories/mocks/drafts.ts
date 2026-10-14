@@ -6,6 +6,7 @@ import type {
   DraftScope,
   DraftUpdateInput,
   DraftWriteOutput,
+  WorkspaceNamePersistedState,
 } from "@/common/orpc/schemas/drafts";
 import { takeSentText } from "@/common/utils/composerDraftText";
 import { draftScopeKey, summarizeDraft, toDraftAttachmentMetadata } from "@/common/utils/drafts";
@@ -14,6 +15,7 @@ interface StoredDraft {
   scope: DraftScope;
   text: string;
   attachments: DraftAttachment[];
+  nameState?: WorkspaceNamePersistedState;
   revision: number;
 }
 
@@ -54,17 +56,24 @@ export function createMockDraftsApi() {
     const current = drafts.get(key);
     const text = input.text ?? current?.text ?? "";
     const attachments = input.attachments ?? current?.attachments ?? [];
+    const nameState =
+      input.nameState === undefined ? current?.nameState : (input.nameState ?? undefined);
     revision++;
-    if (text.length === 0 && attachments.length === 0) {
+    if (text.length === 0 && attachments.length === 0 && nameState === undefined) {
       drafts.delete(key);
       emit({ type: "deleted", scope: input.scope, revision });
     } else {
-      const next = { scope: input.scope, text, attachments, revision };
+      const next = { scope: input.scope, text, attachments, nameState, revision };
       drafts.set(key, next);
       emit({ type: "changed", ...summarizeDraft(input.scope, next, revision) });
     }
     // A write's reply carries the stored view (nothing is retained in stories).
-    return { revision, text, attachments: attachments.map(toDraftAttachmentMetadata) };
+    return {
+      revision,
+      text,
+      attachments: attachments.map(toDraftAttachmentMetadata),
+      ...(nameState !== undefined ? { nameState } : {}),
+    };
   };
 
   return {
@@ -74,6 +83,7 @@ export function createMockDraftsApi() {
       return Promise.resolve({
         text: draft?.text ?? "",
         attachments: draft?.attachments ?? [],
+        ...(draft?.nameState !== undefined ? { nameState: draft.nameState } : {}),
         revision: draft?.revision ?? revision,
       });
     },
@@ -94,7 +104,7 @@ export function createMockDraftsApi() {
     setSendReceiver: () => Promise.resolve({ revision, present: false }),
     resolveSends: () => Promise.resolve({ statuses: [] }),
     delete: (input: { scope: DraftScope }) => {
-      const result = write({ scope: input.scope, text: "", attachments: [] });
+      const result = write({ scope: input.scope, text: "", attachments: [], nameState: null });
       const { scope } = input;
       if (scope.kind === "creation") {
         setList(
