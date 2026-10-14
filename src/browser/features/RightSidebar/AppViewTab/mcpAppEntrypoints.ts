@@ -195,8 +195,10 @@ function loadMcpAppEntrypoints(
   if (!api) return;
   setMcpAppEntrypoints(workspaceId, "pending");
   const controller = new AbortController();
-  api.mcpApps
-    .listEntrypoints({ workspaceId }, { signal: controller.signal })
+  // Through a resolved promise, so a client that throws synchronously (disconnected, disposed)
+  // also settles the list empty instead of throwing out of the effect.
+  Promise.resolve()
+    .then(() => api.mcpApps.listEntrypoints({ workspaceId }, { signal: controller.signal }))
     .then((list) => {
       if (!controller.signal.aborted) setMcpAppEntrypoints(workspaceId, list);
     })

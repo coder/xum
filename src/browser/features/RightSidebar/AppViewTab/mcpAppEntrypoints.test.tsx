@@ -136,6 +136,28 @@ describe("MCP App entry points", () => {
     await waitFor(() => expect(result.current).toEqual([]));
   });
 
+  test("a client that throws at once (disconnected) settles the list empty", async () => {
+    const client = createTestApiClient({
+      mcpApps: {
+        listEntrypoints: () => {
+          throw new Error("client disposed");
+        },
+      },
+    });
+    const wrapper = (props: { children: React.ReactNode }) => (
+      <APIProvider client={client}>{props.children}</APIProvider>
+    );
+    // The listing starts in an effect: a synchronous throw there would break the render.
+    const { result } = renderHook(
+      () => {
+        useLoadMcpAppEntrypoints("ws-throws", true);
+        return useMcpAppEntrypoints("ws-throws");
+      },
+      { wrapper }
+    );
+    await waitFor(() => expect(result.current).toEqual([]));
+  });
+
   test("a restored entry point tab waits for the listing, then resolves its view", async () => {
     let release: ((list: McpAppEntrypoint[]) => void) | null = null;
     const client = createTestApiClient({
