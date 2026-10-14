@@ -25,11 +25,12 @@ import { configure } from "storybook/test";
 // explicit `{ timeout }` unless they intentionally want a longer budget.
 // Prevents flakes on CPU-constrained CI runners where React re-renders
 // after userEvent.click can exceed the 1 s default.
-configure({ asyncUtilTimeout: 5000 });
+const STORY_ASYNC_UTIL_TIMEOUT_MS = 5000;
+configure({ asyncUtilTimeout: STORY_ASYNC_UTIL_TIMEOUT_MS });
 // Most story files import the older `@storybook/test`, which bundles its own Testing Library with
 // its own config: without this, their waits kept the 1 s default and timed out on a loaded runner
 // while a lazy chunk or the highlight worker loaded (#6389).
-configureLegacyStorybookTest({ asyncUtilTimeout: 5000 });
+configureLegacyStorybookTest({ asyncUtilTimeout: STORY_ASYNC_UTIL_TIMEOUT_MS });
 
 const PIXEL_STABILITY_CSS = `
   *, *::before, *::after {
