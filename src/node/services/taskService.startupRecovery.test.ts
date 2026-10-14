@@ -1201,6 +1201,62 @@ describe("TaskService", () => {
     expect(messagedWorkspaceIds).not.toContain(streamingTaskId);
   });
 
+  // Archiving stops a task's stream but keeps its taskStatus (see isActiveAgentTaskEntry), and
+  // legacy rows without a taskStatus count as running. Startup used to re-drive such archived rows
+  // on every restart, and the send failed with "Workspace is archived". They stay untouched until
+  // an unarchive or a task_send_message reactivation brings them back.
+  test("startup leaves archived running and legacy tasks untouched", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-archived-running";
+    const archivedRunningId = "child-archived-running";
+    const archivedLegacyId = "child-archived-legacy";
+    const activeRunningId = "child-active-running";
+    const archived = { archivedAt: "2026-08-10T00:00:00.000Z" };
+    const child = { parentWorkspaceId, agentId: "exec", agentType: "exec" };
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        projectWorkspace(projectPath, "archived-running", archivedRunningId, {
+          ...child,
+          ...archived,
+          taskStatus: "running",
+          taskAttemptId: "att_00000000000000a1",
+        }),
+        projectWorkspace(projectPath, "archived-legacy", archivedLegacyId, {
+          ...child,
+          ...archived,
+          taskAttemptId: "att_00000000000000a2",
+        }),
+        projectWorkspace(projectPath, "active-running", activeRunningId, {
+          ...child,
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    await taskService.initialize();
+
+    const messagedWorkspaceIds = (
+      sendMessage as unknown as { mock: { calls: unknown[][] } }
+    ).mock.calls.map((call) => call[0]);
+    expect(messagedWorkspaceIds).toEqual([activeRunningId]);
+    expect(findWorkspaceInConfig(config, archivedRunningId)).toMatchObject({
+      taskStatus: "running",
+      taskAttemptId: "att_00000000000000a1",
+    });
+    const legacy = findWorkspaceInConfig(config, archivedLegacyId);
+    expect(legacy?.taskStatus).toBeUndefined();
+    expect(legacy?.taskAttemptId).toBe("att_00000000000000a2");
+  });
+
   test("recovery does not re-drive a running task whose accepted turn is still preparing", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");

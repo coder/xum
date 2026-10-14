@@ -1197,6 +1197,23 @@ const WORKSPACE_BUSY_IDLE_ONLY_SEND_MESSAGE = "Workspace is busy; idle-only send
 const MULTI_PROJECT_SHARED_ISOLATION_ERROR =
   'isolation: "none" is not supported for multi-project workspaces; omit isolation or pass isolation: "fork" to run the sub-agent in forked checkouts.';
 
+/**
+ * Whether startup recovery re-drives this row: a `running` or `awaiting_report` task (a legacy
+ * row without a taskStatus reads as running) that no other live backend holds a use lease on.
+ * Archived rows are left untouched. Archiving stops a task's stream but keeps its taskStatus (see
+ * isActiveAgentTaskEntry), and every send to an archived workspace is refused, so a re-drive
+ * failed on every restart. An unarchive makes the row an ordinary one again, and a
+ * task_send_message to it unarchives and reactivates it.
+ */
+function isStartupRedriveCandidate(
+  task: AgentTaskWorkspaceEntry,
+  inUseElsewhere: ReadonlySet<string>
+): boolean {
+  if (!task.id || inUseElsewhere.has(task.id)) return false;
+  if (isWorkspaceArchived(task.archivedAt, task.unarchivedAt)) return false;
+  return ["running", "awaiting_report"].includes(task.taskStatus ?? "running");
+}
+
 function isWorkspaceBusyIdleOnlySend(error: unknown): boolean {
   return (
     error != null &&
@@ -5696,11 +5713,8 @@ export class TaskService implements AgentTaskIntegration {
     let config = this.config.loadConfigOrDefault();
     let taskIndex = this.buildAgentTaskIndex(config);
     const startupTasks = () =>
-      this.listAgentTaskWorkspaces(config).filter(
-        (task) =>
-          task.id &&
-          !inUseElsewhere.has(task.id) &&
-          ["running", "awaiting_report"].includes(task.taskStatus ?? "running")
+      this.listAgentTaskWorkspaces(config).filter((task) =>
+        isStartupRedriveCandidate(task, inUseElsewhere)
       );
 
     // Workflow cancellation is authoritative even when a child has its own Stop or question.
