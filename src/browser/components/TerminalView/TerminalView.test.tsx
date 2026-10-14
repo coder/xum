@@ -38,6 +38,8 @@ interface MockRouter {
 
 let cleanupDom: (() => void) | null = null;
 let mockRouter: MockRouter;
+/** A real router, when a test needs its stream handling; the server is still a double. */
+let realRouter: TerminalSessionRouter | null = null;
 let subscribeCallbacks: TerminalSubscribeCallbacks[] = [];
 let terminalInstances: MockTerminal[] = [];
 let unsubscribeMock: ReturnType<typeof mock<() => void>>;
@@ -122,12 +124,13 @@ void mock.module("ghostty-web", () => ({
 }));
 
 void mock.module("@/browser/terminal/TerminalRouterContext", () => ({
-  useTerminalRouter: () => mockRouter,
+  useTerminalRouter: () => realRouter ?? mockRouter,
 }));
 
 import { TerminalView } from "./TerminalView";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { DEFAULT_TERMINAL_BADGE_CONFIG } from "@/common/constants/storage";
+import { TerminalSessionRouter } from "@/browser/terminal/TerminalSessionRouter";
 
 function createRouter(): MockRouter {
   unsubscribeMock = mock(() => undefined);
@@ -174,6 +177,7 @@ describe("TerminalView", () => {
   beforeEach(() => {
     cleanupDom = installDom();
     mockRouter = createRouter();
+    realRouter = null;
     subscribeCallbacks = [];
     terminalInstances = [];
   });
@@ -239,6 +243,52 @@ describe("TerminalView", () => {
     harness.reconnect();
     await waitFor(() => expect(exitSubscriptions).toBe(2));
     expect(onExit).not.toHaveBeenCalled();
+  });
+
+  // #6330: a hidden tab stays mounted but leaves the router. Shown again, it attaches again and
+  // the server sends the full screen with its scrollback, not marked as a replacement. clear()
+  // keeps the scrollback, so written on top, each show repeated every line.
+  test("a tab shown again replaces its screen instead of writing it on top", async () => {
+    const screen = "1\r\n2\r\n3\r\n";
+    let attaches = 0;
+    realRouter = new TerminalSessionRouter(
+      createTestApiClient({
+        terminal: {
+          attach: (_input: unknown, options?: { signal?: AbortSignal }) => {
+            attaches += 1;
+            return Promise.resolve(
+              (async function* () {
+                yield { type: "screenState" as const, data: screen };
+                // The session keeps running until the view leaves.
+                await new Promise((resolve) => options?.signal?.addEventListener("abort", resolve));
+              })()
+            );
+          },
+          onExit: terminalOnExitMock,
+          resize: () => Promise.resolve(),
+        },
+      })
+    );
+    const renderAt = (visible: boolean) => (
+      <TerminalView
+        workspaceId="workspace-1"
+        sessionId="terminal-1"
+        visible={visible}
+        setDocumentTitle={false}
+        autoFocus={false}
+      />
+    );
+    const view = render(renderAt(true), { wrapper: APIWrapper });
+    await waitFor(() => expect(terminalInstances[0]?.calls).toEqual([`write:${screen}`]));
+
+    view.rerender(renderAt(false));
+    view.rerender(renderAt(true));
+    await waitFor(() => expect(attaches).toBe(2));
+    // One write: a full reset (it also drops the scrollback, see writeScreenState.test.ts), then
+    // the screen, so each line shows once.
+    await waitFor(() =>
+      expect(terminalInstances[0]?.calls).toEqual([`write:${screen}`, `write:\x1bc${screen}`])
+    );
   });
 
   test("keeps the router subscription stable when onExit changes", async () => {
