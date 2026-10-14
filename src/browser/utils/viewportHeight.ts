@@ -37,7 +37,8 @@ export function installViewportHeightSync(): () => void {
  * `-webkit-touch-callout` is supported only by iOS WebKit (same probe as the `ios-standalone` variant).
  */
 export function installIosFocusZoomGuard(): void {
-  if (!CSS.supports("-webkit-touch-callout", "none")) return;
+  // jsdom (tests/ui) has no global CSS.
+  if (typeof CSS === "undefined" || !CSS.supports("-webkit-touch-callout", "none")) return;
   const meta = document.querySelector<HTMLMetaElement>('meta[name="viewport"]');
   if (meta == null || /maximum-scale/i.test(meta.content)) return;
   meta.content = `${meta.content}, maximum-scale=1`;

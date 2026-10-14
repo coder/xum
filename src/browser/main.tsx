@@ -37,7 +37,12 @@ try {
 
 installWindowOpenLocalhostProxyNormalization();
 installViewportHeightSync();
-installIosFocusZoomGuard();
+
+try {
+  installIosFocusZoomGuard();
+} catch {
+  // Stopping iOS focus zoom is cosmetic and must never block renderer startup.
+}
 
 initTelemetry();
 // vimEnabled lives in config.json, so the startup event waits for the first config snapshot.
