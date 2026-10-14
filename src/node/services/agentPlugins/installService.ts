@@ -76,6 +76,7 @@ import {
   type AgentPluginInfo,
 } from "./discovery";
 import { checkLogoImage } from "./imageHeader";
+import type { OpenAIPluginInterface } from "./openaiExtension";
 import {
   acquirePluginMutationLock,
   bumpContainerMutationEpoch,
@@ -602,6 +603,21 @@ async function readLogoDataUrl(
 }
 
 /**
+ * The light and dark image paths. OpenAI defines each dark field as the
+ * variant of its own light field (`logoDark` of `logo`, `composerIconDark` of
+ * `composerIcon`), so the dark path comes from the same family as the light
+ * one: a dark composer icon must not replace the listing logo in dark themes.
+ * Only with no light image at all does either dark field stand in.
+ */
+function logoPaths(info: OpenAIPluginInterface): { light?: string; dark?: string } {
+  if (info.logo !== undefined) return { light: info.logo, dark: info.logoDark };
+  if (info.composerIcon !== undefined) {
+    return { light: info.composerIcon, dark: info.composerIconDark };
+  }
+  return { dark: info.logoDark ?? info.composerIconDark };
+}
+
+/**
  * UI projection of the OpenAI `interface`. The renderer picks the logo by
  * theme (`logoDark`/`composerIconDark` are OpenAI's dark-theme variants) and
  * falls back to the other one when a read fails. Budget: at most two
@@ -615,15 +631,11 @@ async function interfaceSummary(
 ): Promise<AgentPluginInterfaceSummary | undefined> {
   const info = plugin.openai?.interface;
   if (info === undefined) return undefined;
-  const logoDataUrl = await readLogoDataUrl(
-    plugin.rootPath,
-    info.logo ?? info.composerIcon,
-    "Plugin logo",
-    warnings
-  );
+  const paths = logoPaths(info);
+  const logoDataUrl = await readLogoDataUrl(plugin.rootPath, paths.light, "Plugin logo", warnings);
   const logoDarkDataUrl = await readLogoDataUrl(
     plugin.rootPath,
-    info.logoDark ?? info.composerIconDark,
+    paths.dark,
     "Plugin dark logo",
     warnings
   );

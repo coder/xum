@@ -2034,9 +2034,21 @@ describe("AgentPluginInstallService", () => {
     expect((await service.list())[0].interface?.logoDarkDataUrl).toBe(darkUrl);
     await service.uninstall({ name: "demo-plugin", deletePluginData: true });
 
-    // composerIconDark stands in for a missing logoDark. Its read fails
-    // (a link out of the plugin root): the light logo stays and a warning names the dark one.
-    await writeInterface({ logo: "./assets/logo.png", composerIconDark: "./assets/escape.png" });
+    // A dark variant pairs with its own light field: the dark composer icon
+    // never replaces the listing logo, but it does pair with a composer icon.
+    const icons = { composerIcon: "./assets/logo.png", composerIconDark: "./assets/logo-dark.png" };
+    await writeInterface({ logo: "./assets/logo.png", ...icons });
+    expect((await service.preview({ input: remoteDir })).manifest.interface).not.toHaveProperty(
+      "logoDarkDataUrl"
+    );
+    await writeInterface(icons);
+    expect((await service.preview({ input: remoteDir })).manifest.interface?.logoDarkDataUrl).toBe(
+      darkUrl
+    );
+
+    // A failed dark read (a link out of the plugin root): the light logo
+    // stays and a warning names the dark one.
+    await writeInterface({ logo: "./assets/logo.png", logoDark: "./assets/escape.png" });
     const failed = await service.preview({ input: remoteDir });
     expect(failed.manifest.interface?.logoDataUrl).toBe(lightUrl);
     expect(failed.manifest.interface?.logoDarkDataUrl).toBeUndefined();
