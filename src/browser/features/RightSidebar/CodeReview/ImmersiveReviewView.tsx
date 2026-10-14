@@ -39,7 +39,7 @@ import {
 } from "./immersiveMinimapMath";
 import { KeycapGroup } from "@/browser/components/Keycap/Keycap";
 import { useTheme } from "@/browser/contexts/ThemeContext";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { formatLineRangeCompact } from "@/browser/utils/review/lineRange";
 import {
   findAdjacentFileHunkId,
@@ -326,6 +326,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
   const hunkJumpRef = useRef(false);
   const pendingJumpSelectAllHunkIdRef = useRef<string | null>(null);
   const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const { theme } = useTheme();
 
   const {
@@ -1475,7 +1476,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
     }
     // The API union supplies api: null while connecting/reconnecting/errored; the
     // already-rendered view keeps its copy affordance, so fail visibly, not silently.
-    if (!api) {
+    if (!liveApi) {
       showCopyFileFeedback("failed", filePath, contentVersion, {
         message: "Copy failed: backend connection unavailable",
       });
@@ -1500,7 +1501,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
       activeFilePathRef.current !== filePath ||
       activeFileContentVersionRef.current !== contentVersion;
     const copyFileContents = async () => {
-      const result = await api.workspace.executeBash({
+      const result = await liveApi.workspace.executeBash({
         workspaceId: props.workspaceId,
         script: buildReadFileScript(filePath, {
           // The IPC bash channel truncates output beyond 1MiB, so cap copies at what

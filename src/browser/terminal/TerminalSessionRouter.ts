@@ -43,6 +43,8 @@ interface SessionState {
   subscribers: Map<number, TerminalSubscriberCallbacks>;
   /** Cached screen state (sent to new subscribers immediately) */
   screenState: string | null;
+  /** Bumped on each screen delivery: a deferred cached delivery checks it, not the text. */
+  screenVersion: number;
   /** Abort controller for the attach and exit streams of the current client */
   abortController: AbortController;
   /** Bumped on each new client: a stream of an older client stops delivering. */
@@ -120,6 +122,7 @@ export class TerminalSessionRouter {
       session = {
         subscribers: new Map(),
         screenState: null,
+        screenVersion: 0,
         abortController: new AbortController(),
         generation: 0,
         replaceNextScreen: false,
@@ -137,12 +140,16 @@ export class TerminalSessionRouter {
 
     // Deliver cached screenState if available (for late subscribers)
     if (session.screenState !== null) {
+      const cached = session.screenState;
+      const cachedVersion = session.screenVersion;
       // Use setTimeout to ensure this happens after the caller has finished setup
       setTimeout(() => {
         const currentSession = this.sessions.get(sessionId);
         const currentCallbacks = currentSession?.subscribers.get(subscriberId);
-        if (currentCallbacks && currentSession && currentSession.screenState !== null) {
-          currentCallbacks.onScreenState(currentSession.screenState);
+        // A newer screen (a reattach) already reached this subscriber through the broadcast:
+        // writing it again would repeat the scrollback, also when its text is the same.
+        if (currentCallbacks && currentSession?.screenVersion === cachedVersion) {
+          currentCallbacks.onScreenState(cached);
         }
       }, 0);
     }
@@ -315,11 +322,36 @@ export class TerminalSessionRouter {
    * (This is used by TerminalView to keep frontend and PTY dimensions in sync.)
    */
   resize(sessionId: string, cols: number, rows: number): Promise<void> {
-    // Offline, the size is kept and sent again once the streams restart.
-    this.sizes.set(sessionId, { cols, rows });
+    const keep = (): void => {
+      this.sizes.set(sessionId, { cols, rows });
+    };
     return this.withClient(
-      () => Promise.resolve(),
-      (api) => api.terminal.resize({ sessionId, cols, rows })
+      // Offline, the size is kept and sent again once the streams restart.
+      () => {
+        keep();
+        return Promise.resolve();
+      },
+      // A failed resize is not kept: the view stays at its old size, so the PTY must too.
+      (api) => api.terminal.resize({ sessionId, cols, rows }).then(keep)
+    );
+  }
+
+  /**
+   * Send a size the view already has (its initial size). Unlike `resize()`, the size is kept
+   * whatever the request does: the view will not go back, so a reattach must replay it, also
+   * when the connection drops while the request is in flight.
+   */
+  syncSize(sessionId: string, cols: number, rows: number): void {
+    this.sizes.set(sessionId, { cols, rows });
+    this.withClient(
+      () => undefined,
+      (api) => {
+        api.terminal
+          .resize({ sessionId, cols, rows })
+          .catch((err: unknown) =>
+            console.debug(`[TerminalRouter] Initial size for ${sessionId} not sent:`, err)
+          );
+      }
     );
   }
 
@@ -445,6 +477,7 @@ export class TerminalSessionRouter {
   /** Cache and broadcast a full screen; the first one after a reattach replaces the old one. */
   private deliverScreen(session: SessionState, state: string): void {
     session.screenState = state;
+    session.screenVersion++;
     const replace = session.replaceNextScreen;
     session.replaceNextScreen = false;
     for (const callbacks of session.subscribers.values()) {

@@ -3,6 +3,8 @@
  *
  * - The sidebar row's settings dialogs are React children of that row. A click on a dialog's
  *   backdrop must not reach the row's own click handler and select the workspace.
+ * - A key that a row's menu hints acts on that row's workspace while the menu is open, not on
+ *   the selected workspace (#6328).
  */
 
 import "../dom";
@@ -96,6 +98,52 @@ describeIntegration("Workspace actions menus (UI)", () => {
         fireEvent.keyDown(dialog, { key: "Escape" });
         await waitFor(() => expect(document.body.textContent).not.toContain(dialogName));
       }
+    } finally {
+      if (otherId) {
+        await app.env.orpc.workspace.remove({ workspaceId: otherId, options: { force: true } });
+      }
+      await app.dispose();
+    }
+  }, 60_000);
+
+  test("the pin key in another row's menu pins that row, not the selected workspace", async () => {
+    const app = await createAppHarness({ branchPrefix: "ui-actions-row-key" });
+    let otherId: string | null = null;
+    try {
+      const other = await createOtherWorkspace(app, "ui-actions-row-key-other");
+      otherId = other.id;
+      const kebab = await waitFor(
+        () => {
+          const found = getRow(app, other.id).querySelector<HTMLElement>(
+            'button[aria-label^="Workspace actions for"]'
+          );
+          if (!found) throw new Error("Row menu not ready");
+          return found;
+        },
+        { timeout: 10_000 }
+      );
+      fireEvent.click(kebab);
+      const pinRow = await waitFor(() => findButton("Pin workspace"));
+      pinRow.focus();
+
+      const pinKey = new window.KeyboardEvent("keydown", {
+        key: "p",
+        code: "KeyP",
+        ctrlKey: true,
+        altKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      // happy-dom infers AltGraph from any Ctrl+Alt chord; model physical Ctrl+Alt here.
+      Object.defineProperty(pinKey, "getModifierState", { value: () => false });
+      fireEvent(pinRow, pinKey);
+
+      const pinnedAt = async (workspaceId: string) =>
+        (await app.env.orpc.workspace.list()).find((ws) => ws.id === workspaceId)?.pinnedAt;
+      await waitFor(async () => expect(await pinnedAt(other.id)).toBeTruthy(), {
+        timeout: 10_000,
+      });
+      expect(await pinnedAt(app.workspaceId)).toBeFalsy();
     } finally {
       if (otherId) {
         await app.env.orpc.workspace.remove({ workspaceId: otherId, options: { force: true } });

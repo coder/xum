@@ -1,5 +1,79 @@
 import { describe, expect, test } from "bun:test";
-import { isAppCallableTool, isModelVisibleTool, parseMCPToolUiMeta } from "./mcpApps";
+import {
+  isAppCallableTool,
+  isModelVisibleTool,
+  MCP_APP_ENTRYPOINT_TITLE_MAX_CHARS,
+  mcpAppEntrypointKey,
+  mcpAppEntrypointTitle,
+  parseMCPAppEntrypoints,
+  parseMCPToolUiMeta,
+} from "./mcpApps";
+
+describe("parseMCPAppEntrypoints", () => {
+  test("keeps global and thread, skips file and unknown types, reads at most three", () => {
+    const entrypoints = (list: unknown) => ({ "openai/ui": { entrypoints: list } });
+    expect(
+      parseMCPAppEntrypoints(
+        entrypoints([
+          { type: "thread" },
+          { type: "file", extensions: [".stl"] },
+          { type: "global" },
+        ])
+      )
+    ).toEqual({ types: ["thread", "global"], skippedFile: true });
+    // The spec allows three; a fourth is ignored. Duplicates collapse.
+    expect(
+      parseMCPAppEntrypoints(
+        entrypoints([{ type: "global" }, { type: "global" }, { type: "nav" }, { type: "thread" }])
+      )
+    ).toEqual({ types: ["global"], skippedFile: false });
+    for (const meta of [undefined, {}, { "openai/ui": [] }, entrypoints("global")]) {
+      expect(parseMCPAppEntrypoints(meta)).toEqual({ types: [], skippedFile: false });
+    }
+  });
+});
+
+describe("mcpAppEntrypointTitle", () => {
+  test("strips bidi and control characters, bounds the length, falls back to the name", () => {
+    // RLO would visually reorder the palette command the user is about to run.
+    expect(mcpAppEntrypointTitle(["Pay\u202e\u0000 \tnow\u2066"], "pay")).toBe("Pay now");
+    const long = mcpAppEntrypointTitle(["x".repeat(500)], "pay");
+    expect(long?.length).toBe(MCP_APP_ENTRYPOINT_TITLE_MAX_CHARS);
+    // A surrogate pair at the cut is dropped, never halved.
+    const emoji = mcpAppEntrypointTitle(
+      [`${"x".repeat(MCP_APP_ENTRYPOINT_TITLE_MAX_CHARS - 1)}\u{1F600}`],
+      "pay"
+    );
+    expect(emoji).toBe("x".repeat(MCP_APP_ENTRYPOINT_TITLE_MAX_CHARS - 1));
+    // Candidates in order (title, annotations.title); one that cleans to nothing is skipped.
+    expect(mcpAppEntrypointTitle(["\u202e\u0007 ", "Annotated"], "pay")).toBe("Annotated");
+    expect(mcpAppEntrypointTitle(["\u202e", undefined], "pay\u202e")).toBe("pay");
+    // Nothing left at all: no title, so the entry point is skipped.
+    expect(mcpAppEntrypointTitle(["\u202e"], "\u0007")).toBeUndefined();
+  });
+});
+
+describe("mcpAppEntrypointKey", () => {
+  test("names one server, tool and type: a colon in a name cannot shift the split", () => {
+    expect(mcpAppEntrypointKey("a", "b:c", "global")).not.toBe(
+      mcpAppEntrypointKey("a:b", "c", "global")
+    );
+    expect(mcpAppEntrypointKey("a", "b", "global")).not.toBe(
+      mcpAppEntrypointKey("a", "b", "thread")
+    );
+  });
+
+  test("encodes any string, including lone surrogates, without throwing or colliding", () => {
+    const lone = "\uD800";
+    const keys = [
+      mcpAppEntrypointKey(`srv${lone}`, "tool", "global"),
+      mcpAppEntrypointKey("srv", `tool${lone}`, "global"),
+      mcpAppEntrypointKey("srv", `tool${"\uDC00"}`, "global"),
+      mcpAppEntrypointKey("srv%", "tool", "global"),
+    ];
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+});
 
 describe("parseMCPToolUiMeta", () => {
   test("reads _meta.ui and defaults visibility to model + app", () => {

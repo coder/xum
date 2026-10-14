@@ -54,8 +54,8 @@ describe("skills_catalog_read", () => {
 
     expect(result.success).toBe(true);
     if (result.success) {
-      expect(result.frontmatter.name).toBe("test-skill");
-      expect(result.frontmatter.description).toContain("test skill");
+      expect(result.frontmatter?.name).toBe("test-skill");
+      expect(result.frontmatter?.description).toContain("test skill");
       expect(result.body).toContain("Test Skill");
       expect(result.url).toContain("test-owner/test-repo");
     }
@@ -85,6 +85,9 @@ describe("skills_catalog_read", () => {
         )) as SkillsCatalogReadToolResult;
         if (!result.success) throw new Error(result.error);
         expect(result.body.length).toBeLessThanOrEqual(TOOL_TEXT_PAGE_MAX_CHARS);
+        // Only the first page carries the (unbounded) frontmatter.
+        if (call === 0) expect(result.frontmatter?.name).toBe("test-skill");
+        else expect(result).not.toHaveProperty("frontmatter");
         pages.push(result.body);
         offset = result.nextCharOffset;
         snapshot = result.snapshot;
@@ -211,8 +214,8 @@ describe("skills_catalog_read", () => {
 
     expect(result.success).toBe(true);
     if (result.success) {
-      expect(result.frontmatter.name).toBe("test-skill");
-      expect(result.frontmatter.description).toContain("test skill");
+      expect(result.frontmatter?.name).toBe("test-skill");
+      expect(result.frontmatter?.description).toContain("test skill");
       expect(result.body).toContain("Test Skill");
       expect(result.url).toContain("test-owner/test-repo");
     }
@@ -240,8 +243,8 @@ describe("skills_catalog_read", () => {
 
     expect(result.success).toBe(true);
     if (result.success) {
-      expect(result.frontmatter.name).toBe("hidden-skill");
-      expect(result.frontmatter.advertise).toBe(false);
+      expect(result.frontmatter?.name).toBe("hidden-skill");
+      expect(result.frontmatter?.advertise).toBe(false);
     }
 
     fetchContentSpy.mockRestore();

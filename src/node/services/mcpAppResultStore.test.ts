@@ -269,6 +269,27 @@ describe("McpAppResultStore model context", () => {
     expect(fsSync.existsSync(sessionDir("gone"))).toBe(false);
   });
 
+  test("a late result for a removed workspace is discarded, never recreating its results", async () => {
+    using tmp = new DisposableTempDir("mcp-app-record-removed");
+    const rootDir = path.join(tmp.path, "root");
+    const sessionDir = await sessionsIn(tmp);
+    const store = new McpAppResultStore(sessionDir, rootDir);
+    // Removal published its tombstone and deleted the session dir; a tool call then settles.
+    const tombstone = workspaceRemovalTombstonePath(rootDir, "gone");
+    await fs.mkdir(path.dirname(tombstone), { recursive: true });
+    await fs.writeFile(tombstone, "{}");
+    await store.record("gone", {
+      toolCallId: "late",
+      serverName: "s",
+      toolName: "t",
+      resourceUri: "ui://s/v",
+      arguments: {},
+      result: { content: [] },
+    });
+    expect(fsSync.existsSync(sessionDir("gone"))).toBe(false);
+    expect(await store.get("gone", "late")).toBeNull();
+  });
+
   test("two backends sharing the file keep each other's views", async () => {
     using tmp = new DisposableTempDir("mcp-app-context");
     const rootDir = path.join(tmp.path, "root");

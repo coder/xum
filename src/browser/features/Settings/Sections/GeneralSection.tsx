@@ -17,7 +17,8 @@ import {
 import { useChatTranscriptFullWidth } from "@/browser/hooks/useChatTranscriptFullWidth";
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { useTranscriptDensity } from "@/browser/hooks/useTranscriptDensity";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { useExperiment, useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import assert from "@/common/utils/assert";
@@ -176,6 +177,10 @@ let compactionStrategyWrites: Promise<void> = Promise.resolve();
 export function GeneralSection() {
   const { themePreference, setTheme } = useTheme();
   const { api } = useAPI();
+  // Offline, the loaded values stay on screen, but the controls that write to the server directly
+  // are disabled: their write could not reach it, and the control must not look saved.
+  const liveApi = useLiveAPI();
+  const offline = liveApi == null;
   const telemetry = useTelemetry();
   const [continuousCompaction, setContinuousCompaction] = useExperiment(
     EXPERIMENT_IDS.CONTINUOUS_COMPACTION
@@ -314,6 +319,8 @@ export function GeneralSection() {
       return;
     }
 
+    // The two archive selects are written together, so they stay disabled (showing the kept
+    // values) until this read answers: a change before it would send a stale value for the other.
     setArchiveSettingsLoaded(false);
     const archiveBehaviorNonce = ++archiveBehaviorLoadNonceRef.current;
     const llmDebugLogsNonce = ++llmDebugLogsLoadNonceRef.current;
@@ -350,7 +357,10 @@ export function GeneralSection() {
           setKeepScreenAwake(keepScreenAwakeSavedRef.current);
         }
       })
-      .catch(() => {
+      .catch((error: unknown) => {
+        // A lost connection is no read failure: the reconnect reads again. The defaults must
+        // not become editable (and saved) in the meantime.
+        if (isConnectionLostError(error)) return;
         if (archiveBehaviorNonce === archiveBehaviorLoadNonceRef.current) {
           // Fall back to the safe defaults already in state so the controls can recover after a
           // config read failure and the next user change can persist a fresh value.
@@ -358,6 +368,9 @@ export function GeneralSection() {
         }
       });
   }, [api]);
+
+  const archiveControlsDisabled =
+    offline || !api?.config?.updateCoderPrefs || !archiveSettingsLoaded;
 
   const queueArchiveBehaviorUpdate = useCallback(() => {
     if (!api?.config?.updateCoderPrefs || !archiveSettingsLoaded) {
@@ -433,7 +446,7 @@ export function GeneralSection() {
   );
 
   const handleChatTranscriptFullWidthChange = (checked: boolean) => {
-    saveConfigOptimistically(api ?? null, { chatTranscriptFullWidth: checked }, (client) => {
+    saveConfigOptimistically(liveApi, { chatTranscriptFullWidth: checked }, (client) => {
       // Chained so a quick toggle back cannot land before the toggle it reverses.
       const update = chatTranscriptFullWidthUpdateChainRef.current.then(() =>
         client.config.updateChatTranscriptFullWidth({ enabled: checked })
@@ -1124,6 +1137,7 @@ export function GeneralSection() {
               <Switch
                 checked={keepScreenAwake}
                 onCheckedChange={handleKeepScreenAwakeChange}
+                disabled={offline}
                 aria-label="Toggle keep screen awake while agents are working"
               />
             </div>
@@ -1147,7 +1161,7 @@ export function GeneralSection() {
               onValueChange={(value) =>
                 handleArchiveBehaviorChange(value as CoderWorkspaceArchiveBehavior)
               }
-              disabled={!api?.config?.updateCoderPrefs || !archiveSettingsLoaded}
+              disabled={archiveControlsDisabled}
             >
               <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
                 <SelectValue />
@@ -1175,7 +1189,7 @@ export function GeneralSection() {
               onValueChange={(value) =>
                 handleWorktreeArchiveBehaviorChange(value as WorktreeArchiveBehavior)
               }
-              disabled={!api?.config?.updateCoderPrefs || !archiveSettingsLoaded}
+              disabled={archiveControlsDisabled}
             >
               <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
                 <SelectValue />
@@ -1248,6 +1262,7 @@ export function GeneralSection() {
             <Switch
               checked={llmDebugLogs}
               onCheckedChange={handleLlmDebugLogsChange}
+              disabled={offline}
               aria-label="Toggle API Debug Logs"
             />
           </div>
@@ -1266,6 +1281,7 @@ export function GeneralSection() {
                   handleSshHostChange(e.target.value)
                 }
                 placeholder={window.location.hostname}
+                disabled={offline}
                 className="border-border-medium bg-background-secondary h-9 w-40"
               />
             </div>
@@ -1290,7 +1306,7 @@ export function GeneralSection() {
               }
               onBlur={handleCloneDirBlur}
               placeholder="~/.xum/projects"
-              disabled={!cloneDirLoaded}
+              disabled={!cloneDirLoaded || offline}
               className="border-border-medium bg-background-secondary h-9 w-80"
             />
           </div>

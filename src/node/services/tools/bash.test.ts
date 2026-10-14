@@ -2822,4 +2822,37 @@ describe("bash tool - background execution", () => {
     await manager.terminateAll();
     tempDir[Symbol.dispose]();
   });
+
+  // `exec` replaces the shell that runs the script. The exit code must still be recorded, or the
+  // process reads "running" until its lifetime timeout kills it.
+  it.skipIf(process.platform === "win32")(
+    "settles a background script that ends with exec",
+    async () => {
+      const tempDir = new TestTempDir("test-bash-bg-exec");
+      const manager = new BackgroundProcessManager(path.join(tempDir.path, "bg-root"));
+      try {
+        const config = createTestToolConfig(tempDir.path);
+        config.backgroundProcessManager = manager;
+        const result = (await createBashTool(config).execute!(
+          {
+            script: "exec sleep 1",
+            timeout_secs: 30,
+            run_in_background: true,
+            display_name: "exec-sleep",
+          },
+          mockToolCallOptions
+        )) as BashToolResult;
+        if (!(result.success && "backgroundProcessId" in result)) {
+          throw new Error("Expected background process ID in result");
+        }
+
+        const output = await manager.getOutput(result.backgroundProcessId, undefined, undefined, 5);
+        expect(output).toMatchObject({ success: true, status: "exited", exitCode: 0 });
+      } finally {
+        await manager.terminateAll();
+        tempDir[Symbol.dispose]();
+      }
+    },
+    15000
+  );
 });

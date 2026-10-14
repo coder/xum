@@ -66,6 +66,12 @@ export function isNonWorkspaceScopeId(scopeId: string): boolean {
 export const UI_THEME_KEY = "uiTheme";
 
 /**
+ * Paint cache for the static first-run view (T3 #5971, C step 2): true once this browser saw the
+ * onboarding wizard marked viewed, so the server's early script loads the app without asking.
+ */
+export const ONBOARDING_VIEWED_KEY = "onboardingWizardViewed";
+
+/**
  * Get the localStorage key for the last selected provider when adding custom models (global)
  * Format: "lastCustomModelProvider"
  */
@@ -870,6 +876,8 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   // Global UI state.
   // Paint cache of appearance.theme for index.html, written by ThemeProvider.
   globalKey(UI_THEME_KEY, "cache", 64),
+  // Paint cache for the first-run view's early script, written by SplashScreenProvider.
+  globalKey(ONBOARDING_VIEWED_KEY, "cache", 8),
   globalKey(ARTIFACTS_SELECTION_KEY, "ui", ARTIFACTS_SELECTION_MAX_CHARS),
   globalKey(LAST_CUSTOM_MODEL_PROVIDER_KEY, "ui", 128),
   // { workspaceId } (older builds also stored paths; readers use only the id).

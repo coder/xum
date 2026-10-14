@@ -15,9 +15,12 @@
  * The dark code stories check every syntax-highlighted token, and every min-dark replacement
  * color, in dark and flexoki-dark on the code block, the diff tints and the review-range
  * highlight (#5983).
+ *
+ * The secondary-text stories check every `--color-secondary` text in dark and flexoki-dark, on
+ * the main surface and in the slash command list (#6021).
  */
 
-import { expect, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "@storybook/test";
 
 import type { ThemeMode } from "@/browser/contexts/ThemeContext";
 import { getRightSidebarLayoutKey, RIGHT_SIDEBAR_TAB_KEY } from "@/common/constants/storage";
@@ -45,6 +48,7 @@ import { createReview } from "./helpers/reviews";
 import { expandLeftSidebar, expandRightSidebar, selectWorkspace } from "./helpers/uiState";
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
+import { createAgentSkillReadTool } from "./mocks/tools";
 import { createMockORPCClient } from "./mocks/orpc";
 import { seedMockReviewState } from "./mocks/reviewState";
 import { createWorkspace, groupWorkspacesByProject, STABLE_TIMESTAMP } from "./mocks/workspaces";
@@ -589,3 +593,66 @@ const statsStory = (theme: ThemeMode): AppStory => ({
 
 export const StatsLight = statsStory("light");
 export const StatsFlexokiLight = statsStory("flexoki-light");
+
+// ─── Dark secondary text (#6021) ─────────────────────────────────────────────────────────────
+
+/**
+ * A chat with two skill tool calls (secondary text on the main surface) and the slash command
+ * list open (secondary descriptions on its darker rows, the lowest-contrast place it renders).
+ */
+function setupSecondaryTextWorkspace() {
+  return setupSimpleChatStory({
+    workspaceId: "ws-dark-secondary",
+    workspaceName: "feature/dark-secondary",
+    projectName: "my-app",
+    messages: [
+      createUserMessage("u1", "Write tests for this component.", {
+        historySequence: 1,
+        timestamp: STABLE_TIMESTAMP - 60_000,
+      }),
+      createAssistantMessage("a1", "Loading the project skills first.", {
+        historySequence: 2,
+        timestamp: STABLE_TIMESTAMP - 50_000,
+        toolCalls: [
+          createAgentSkillReadTool("tc-1", "tests", {
+            description: "Testing doctrine, commands, and test layout conventions",
+            scope: "project",
+          }),
+          createAgentSkillReadTool("tc-2", "react-effects", {
+            description: "Guidelines for when to use (and avoid) useEffect in React",
+            scope: "project",
+          }),
+        ],
+      }),
+    ],
+  });
+}
+
+const darkSecondaryStory = (theme: ThemeMode): AppStory => ({
+  globals: { theme },
+  parameters: lightContract,
+  render: () => <AppWithMocks setup={setupSecondaryTextWorkspace} />,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const composer = await canvas.findByRole("textbox", { name: "Message" }, { timeout: 15_000 });
+    await userEvent.click(composer);
+    await userEvent.keyboard("/");
+    const body = canvasElement.ownerDocument.body;
+    await within(body).findByRole("listbox", { name: "Slash command suggestions" });
+    // The list renders outside the canvas, so check the whole document.
+    const found = await waitFor(
+      () => {
+        const texts = tokenTextContrasts(body, ["--color-secondary"]);
+        // Two tool calls plus the command descriptions; an empty screen must not pass.
+        if (texts.length < 10)
+          throw new Error(`expected 10+ secondary texts, found ${texts.length}`);
+        return texts;
+      },
+      { timeout: 15_000 }
+    );
+    await expectReadable(found.map((entry) => ({ ...entry, label: entry.token })));
+  },
+});
+
+export const SecondaryTextDark = darkSecondaryStory("dark");
+export const SecondaryTextFlexokiDark = darkSecondaryStory("flexoki-dark");

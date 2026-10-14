@@ -458,6 +458,18 @@ export const KEYBINDS = {
   MOVE_PINNED_UP: { key: "ArrowUp", ctrl: true, alt: true },
   MOVE_PINNED_DOWN: { key: "ArrowDown", ctrl: true, alt: true },
 
+  // Workspace actions menu rows (#6328), on the Ctrl+Alt+Shift layer: no other keybind, browser
+  // or common OS shortcut uses these. Physical codes, because macOS Option remaps event.key.
+  // While a row's actions menu is open, the menu handles these keys for its own workspace.
+  /** Fork the current workspace onto a new branch (B = branch) */
+  FORK_WORKSPACE: { key: "b", code: "KeyB", ctrl: true, alt: true, shift: true },
+  /** Stop the current workspace's running devcontainer */
+  STOP_WORKSPACE_RUNTIME: { key: "x", code: "KeyX", ctrl: true, alt: true, shift: true },
+  /** Mark a workspace unread (only in its actions menu: the selected workspace is always read) */
+  MARK_WORKSPACE_UNREAD: { key: "m", code: "KeyM", ctrl: true, alt: true, shift: true },
+  /** Show or hide a workspace's completed sub-agents (only in its actions menu) */
+  TOGGLE_COMPLETED_SUB_AGENTS: { key: "a", code: "KeyA", ctrl: true, alt: true, shift: true },
+
   /** Jump to bottom of chat */
   JUMP_TO_BOTTOM: { key: "G", shift: true },
 

@@ -52,6 +52,42 @@ describe("NEW_SIDEBAR_TAB keybind", () => {
   });
 });
 
+describe("workspace actions menu keybinds (#6328)", () => {
+  const keys = [
+    ["FORK_WORKSPACE", "KeyB", "\u222b"],
+    ["STOP_WORKSPACE_RUNTIME", "KeyX", "\u02db"],
+    ["MARK_WORKSPACE_UNREAD", "KeyM", "\u00c2"],
+    ["TOGGLE_COMPLETED_SUB_AGENTS", "KeyA", "\u00c5"],
+  ] as const;
+
+  test("macOS: Cmd+Option+Shift on the physical key, whatever character Option makes", () => {
+    globalThis.window = { api: { platform: "darwin" } } as unknown as Window & typeof globalThis;
+    for (const [id, code, optionCharacter] of keys) {
+      const chord = { key: optionCharacter, code, altKey: true, shiftKey: true };
+      expect(matchesKeybind(createEvent({ ...chord, metaKey: true }), KEYBINDS[id])).toBe(true);
+      // Option+Shift alone types that character; it must stay text, not a shortcut.
+      expect(matchesKeybind(createEvent(chord), KEYBINDS[id])).toBe(false);
+    }
+  });
+
+  test("Windows/Linux: Ctrl+Alt+Shift, and no chord another keybind uses", () => {
+    globalThis.window = { api: { platform: "linux" } } as unknown as Window & typeof globalThis;
+    for (const [id, code] of keys) {
+      const event = createEvent({
+        key: code.slice(3).toLowerCase(),
+        code,
+        ctrlKey: true,
+        altKey: true,
+        shiftKey: true,
+      });
+      const matching = (Object.keys(KEYBINDS) as Array<keyof typeof KEYBINDS>).filter((other) =>
+        matchesKeybind(event, KEYBINDS[other])
+      );
+      expect(matching).toEqual([id]);
+    }
+  });
+});
+
 describe("COPY_MARKDOWN keybind", () => {
   test("accepts M without modifiers and rejects modified keys", () => {
     expect(matchesKeybind(createEvent({ key: "m" }), KEYBINDS.COPY_MARKDOWN)).toBe(true);

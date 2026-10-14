@@ -13,6 +13,7 @@
  */
 import { IMAGE_TOKEN_ESTIMATE } from "@/common/constants/contextBudget";
 import type { MuxMessage } from "@/common/types/message";
+import { isMediaPart } from "@/common/utils/attachments/toolAttachmentParts";
 import { RLM_COMPACTION_CHARS_PER_TOKEN } from "@/constants/rlmCompaction";
 
 /** Counts one row's tokens; the trim recounts every row it changes. */
@@ -27,17 +28,29 @@ export interface CompactionRowSizingInput {
 
 const MEDIA_MARKER = "[media]";
 const DATA_URL = /^data:[^,]*;base64,/i;
-// SDK and tool media part types whose payload the provider receives as an attachment.
-const MEDIA_PART_TYPES = new Set(["media", "image-data", "file-data", "image-url", "file-url"]);
+const always = () => true;
+/**
+ * SDK and tool media part types whose payload the provider receives as an attachment, each with
+ * the shape that makes it one. A tool "media" item becomes an attachment only with the shape
+ * extractToolMediaAsUserMessages checks (isMediaPart): any other record typed "media" reaches
+ * the provider as tool-result JSON, so its text counts as text.
+ */
+const MEDIA_RECORD_SHAPES = new Map<string, (record: Record<string, unknown>) => boolean>([
+  ["media", isMediaPart],
+  ["image-data", always],
+  ["file-data", always],
+  ["image-url", always],
+  ["file-url", always],
+  ["image", (record) => "image" in record],
+  [
+    "file",
+    (record) => typeof record.mediaType === "string" && ("url" in record || "data" in record),
+  ],
+]);
 
 function isMediaRecord(record: Record<string, unknown>): boolean {
-  if (typeof record.type === "string" && MEDIA_PART_TYPES.has(record.type)) return true;
-  if (record.type === "image" && "image" in record) return true;
-  return (
-    record.type === "file" &&
-    typeof record.mediaType === "string" &&
-    ("url" in record || "data" in record)
-  );
+  const hasShape = typeof record.type === "string" ? MEDIA_RECORD_SHAPES.get(record.type) : null;
+  return hasShape?.(record) === true;
 }
 
 function projectValue(value: unknown, media: { count: number }): unknown {

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowLeft,
   Bot,
@@ -9,7 +9,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import { SplashScreen } from "./SplashScreen";
-import { useOnboardingPause } from "./SplashScreenProvider";
+import { hasFirstRunView, removeFirstRunView, useOnboardingPause } from "./SplashScreenProvider";
 import { DocsLink } from "@/browser/components/DocsLink/DocsLink";
 import { ProviderWithIcon } from "@/browser/components/ProviderIcon/ProviderIcon";
 import {
@@ -28,7 +28,7 @@ import { Button } from "@/browser/components/Button/Button";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { getStoredAuthToken } from "@/browser/components/AuthTokenModal/AuthTokenModal";
 import { getBrowserBackendBaseUrl } from "@/browser/utils/backendBaseUrl";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useRouting } from "@/browser/hooks/useRouting";
@@ -193,6 +193,35 @@ function CommandPalettePreview(props: { shortcut: string }) {
   );
 }
 
+/**
+ * T3 #5971, C step 2: the server's static first-run view (#xum-pre) already shows the gateway step.
+ * The live wizard renders nothing while it loads under that view, then swaps it out in its first
+ * real commit (a layout effect runs before paint). The dialog and overlay never play their entry
+ * animation in this mount: they stay open, so clearing the override later would replay it. The
+ * step skips its entry animation only until the user moves on. A wizard that starts past the
+ * gateway step replaces the view too.
+ */
+function useFirstRunViewHandoff(isLoading: boolean) {
+  const [startsUnderFirstRunView] = useState(hasFirstRunView);
+  const [skipStepEntry, setSkipStepEntry] = useState(startsUnderFirstRunView);
+  useLayoutEffect(() => {
+    if (!isLoading) removeFirstRunView();
+  }, [isLoading]);
+  return {
+    hideWhileLoading: isLoading && startsUnderFirstRunView,
+    skipDialogEntry: startsUnderFirstRunView,
+    skipStepEntry,
+    stopSkipping: () => setSkipStepEntry(false),
+  };
+}
+
+function stepEntryClassName(direction: Direction, skipEntryAnimation: boolean): string {
+  if (skipEntryAnimation) return "";
+  return direction === "forward"
+    ? "animate-in fade-in-0 slide-in-from-right-2"
+    : "animate-in fade-in-0 slide-in-from-left-2";
+}
+
 export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
   const onboardingPause = useOnboardingPause();
   const [stepIndex, setStepIndex] = useState(onboardingPause.paused?.stepIndex ?? 0);
@@ -218,6 +247,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
   const [direction, setDirection] = useState<Direction>("forward");
 
   const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const {
     data: muxGatewayAccountStatus,
     error: muxGatewayAccountError,
@@ -289,18 +319,18 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
       setMuxGatewayServerState(null);
 
       if (isDesktop) {
-        if (!api) {
+        if (!liveApi) {
           setMuxGatewayLoginStatus("error");
           setMuxGatewayLoginError("Xum API not connected.");
           return;
         }
 
         setMuxGatewayLoginStatus("starting");
-        const startResult = await api.muxGatewayOauth.startDesktopFlow();
+        const startResult = await liveApi.muxGatewayOauth.startDesktopFlow();
 
         if (attempt !== muxGatewayLoginAttemptRef.current) {
           if (startResult.success) {
-            void api.muxGatewayOauth.cancelDesktopFlow({ flowId: startResult.data.flowId });
+            void liveApi.muxGatewayOauth.cancelDesktopFlow({ flowId: startResult.data.flowId });
           }
           return;
         }
@@ -322,7 +352,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
           return;
         }
 
-        const waitResult = await api.muxGatewayOauth.waitForDesktopFlow({ flowId });
+        const waitResult = await liveApi.muxGatewayOauth.waitForDesktopFlow({ flowId });
 
         if (attempt !== muxGatewayLoginAttemptRef.current) {
           return;
@@ -429,7 +459,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
       setMuxGatewayLoginStatus("error");
       setMuxGatewayLoginError(message);
     }
-  }, [api, backendBaseUrl, disableMuxGatewayRoute, isDesktop, refreshMuxGatewayAccountStatus]);
+  }, [liveApi, backendBaseUrl, disableMuxGatewayRoute, isDesktop, refreshMuxGatewayAccountStatus]);
 
   useEffect(() => {
     const attempt = muxGatewayLoginAttemptRef.current;
@@ -1042,6 +1072,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
 
   const totalSteps = steps.length;
   const currentStep = steps[stepIndex] ?? steps[0];
+  const firstRunView = useFirstRunViewHandoff(isLoading);
 
   useEffect(() => {
     if (currentStep?.key !== "mux-gateway" && muxGatewayLoginInProgress) {
@@ -1049,7 +1080,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
     }
   }, [cancelMuxGatewayLogin, currentStep?.key, muxGatewayLoginInProgress]);
 
-  if (!currentStep) {
+  if (!currentStep || firstRunView.hideWhileLoading) {
     return null;
   }
 
@@ -1061,6 +1092,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
       return;
     }
     setDirection("back");
+    firstRunView.stopSkipping();
     // Changing steps remounts the project form without its inline error, so
     // clear the stale flag or the "click Next" nudge stays hidden on return.
     setProjectFormHasError(false);
@@ -1072,6 +1104,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
       return;
     }
     setDirection("forward");
+    firstRunView.stopSkipping();
     setProjectFormHasError(false);
     setStepIndex((i) => Math.min(totalSteps - 1, i + 1));
   };
@@ -1090,6 +1123,7 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
         props.onDismiss();
       }}
       dismissLabel={null}
+      skipEntryAnimation={firstRunView.skipDialogEntry}
       footerClassName="justify-between"
       footer={
         <>
@@ -1151,11 +1185,8 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
 
         <div
           key={currentStep.key}
-          className={`flex flex-col gap-3 ${
-            direction === "forward"
-              ? "animate-in fade-in-0 slide-in-from-right-2"
-              : "animate-in fade-in-0 slide-in-from-left-2"
-          }`}
+          data-onboarding-step={currentStep.key}
+          className={`flex flex-col gap-3 ${stepEntryClassName(direction, firstRunView.skipStepEntry)}`}
         >
           <div className="text-foreground flex items-center gap-2 text-sm font-medium">
             <span className="bg-accent/10 text-accent inline-flex h-8 w-8 items-center justify-center rounded-md">

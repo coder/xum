@@ -585,6 +585,9 @@ const TaskToolCompletedReportSchema = z
   .object({
     taskId: z.string(),
     reportMarkdown: z.string(),
+    /** Set when reportMarkdown is the first page of a longer report; note names the next read. */
+    nextCharOffset: z.number().optional(),
+    note: z.string().optional(),
     title: z.string().optional(),
     structuredOutput: z.unknown().optional(),
     planFilePath: z.string().optional(),
@@ -638,6 +641,8 @@ export const TaskToolCompletedResultSchema = z
     taskId: z.string().optional(),
     taskIds: z.array(z.string()).min(1).optional(),
     reportMarkdown: z.string().optional(),
+    /** Set when reportMarkdown is the first page of a longer report (see note). */
+    nextCharOffset: z.number().optional(),
     title: z.string().optional(),
     structuredOutput: z.unknown().optional(),
     planFilePath: z.string().optional(),
@@ -2203,6 +2208,13 @@ export const AgentSkillReadToolResultSchema = z.union([
   z.object({
     success: z.literal(true),
     skill: AgentSkillPackageSchema,
+    // Optional: results persisted before these fields existed lack them.
+    /** Absolute skill directory, valid where the workspace's bash runs. */
+    skillDir: z.string().optional(),
+    /** Agent Plugin skills only: absolute plugin root, valid where bash runs. */
+    pluginRoot: z.string().optional(),
+    /** Why `skillDir` is absent (built-in skill, or files not where bash runs). */
+    skillDirUnavailable: z.string().optional(),
   }),
   z.object({
     success: z.literal(false),
@@ -2794,7 +2806,7 @@ export const TOOL_DEFINITIONS = {
   agent_skill_read: {
     resultSchema: AgentSkillReadToolResultSchema,
     description:
-      "Load a skill's SKILL.md (frontmatter + body) by name; read its other files with agent_skill_read_file.",
+      "Load a skill's SKILL.md (frontmatter + body) by name; read its other files with agent_skill_read_file. skillDir in the result is the skill's absolute directory where bash runs (relative paths in the skill resolve against it); if absent, skillDirUnavailable says why.",
     schema: z
       .object({
         name: SKILL_LOOKUP_NAME_PARAM,

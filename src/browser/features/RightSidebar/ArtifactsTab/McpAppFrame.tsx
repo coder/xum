@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { cn } from "@/common/lib/utils";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useTheme } from "@/browser/contexts/ThemeContext";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
@@ -165,6 +165,11 @@ function inlineMaxHeight(): number {
   return Math.min(INLINE_MAX_HEIGHT, Math.round(window.innerHeight * 0.8));
 }
 
+/** Allow waits for the arming delay and for a live client (offline it would dismiss the prompt). */
+function isAllowDisabled(armed: boolean, liveApi: unknown): boolean {
+  return !armed || liveApi == null;
+}
+
 export function McpAppFrame(props: {
   workspaceId: string;
   view: McpAppViewRef;
@@ -204,11 +209,13 @@ export function McpAppFrame(props: {
   const { toolCallId, serverName, resourceUri } = view;
   // The view's host lives as long as its frame. The API is null while Xum reconnects and a new
   // client afterwards; tearing the host down for either reset the view. So the host calls tools
-  // through the latest client, and a call made while offline fails.
-  const apiRef = useRef(api);
+  // through the latest live client, and a call made while offline fails with its own message
+  // (useAPI() can keep the last client while Xum reconnects).
+  const liveApi = useLiveAPI();
+  const apiRef = useRef(liveApi);
   useEffect(() => {
-    apiRef.current = api;
-  }, [api]);
+    apiRef.current = liveApi;
+  }, [liveApi]);
   // Fetched once per tool call: a reconnect must not fetch it again (a failed refetch replaced a
   // working view with an error). A failed fetch is retried with the next client.
   const viewLoaded = loaded?.toolCallId === toolCallId && loaded.view != null;
@@ -269,10 +276,11 @@ export function McpAppFrame(props: {
   const [domainsPromptId] = useState(newConfirmPromptId);
   const domainsArming = useConfirmArmed(domainsPrompt != null ? domainsPromptId : null);
   const allowDomains = async (origins: string[]) => {
-    if (!api) return;
+    // Offline the prompt stays, with Allow disabled: a failed call would dismiss it for good.
+    if (!liveApi) return;
     try {
       const requestSeq = beginMcpAppViewDomainsRequest();
-      const result = await api.mcpApps.approveViewDomains({
+      const result = await liveApi.mcpApps.approveViewDomains({
         workspaceId,
         toolCallId,
         serverName: boundServerName,
@@ -522,7 +530,7 @@ export function McpAppFrame(props: {
           <button
             type="button"
             // Disabled briefly after the strip appears (confirmArming.ts), like the consent strip.
-            disabled={!domainsArming.armed}
+            disabled={isAllowDisabled(domainsArming.armed, liveApi)}
             onPointerDown={domainsArming.onPointerDown}
             onClick={(event) =>
               domainsArming.guardClick(event, () => void allowDomains(domainsPrompt))

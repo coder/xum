@@ -1,6 +1,7 @@
 import { useContext, useEffect, useState } from "react";
 
 import { APIContext } from "@/browser/contexts/API";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { isActiveWorkflowRunStatus, type WorkflowRunRecord } from "@/common/types/workflow";
 
 const WORKFLOW_RUN_REFRESH_INTERVAL_MS = 2_000;
@@ -40,6 +41,20 @@ export function getNewestWorkflowRunSnapshot(
     return next;
   }
   return compareWorkflowRunSnapshots(current, next) > 0 ? current : next;
+}
+
+/** True when a poll that only follows active runs got a finished run. */
+function isPollingDoneAfter(
+  pollWhileActive: boolean | undefined,
+  pollAfterTerminal: boolean | undefined,
+  nextRun: WorkflowRunRecord | null
+): boolean {
+  return (
+    pollWhileActive === true &&
+    pollAfterTerminal !== true &&
+    nextRun != null &&
+    !isActiveWorkflowRunStatus(nextRun.status)
+  );
 }
 
 export interface UseWorkflowRunByIdResult {
@@ -85,17 +100,15 @@ export function useWorkflowRunById(input: {
         setError(null);
         setLoading(false);
         if (
-          input.pollWhileActive === true &&
-          input.pollAfterTerminal !== true &&
-          nextRun != null &&
-          !isActiveWorkflowRunStatus(nextRun.status) &&
+          isPollingDoneAfter(input.pollWhileActive, input.pollAfterTerminal, nextRun) &&
           interval != null
         ) {
           window.clearInterval(interval);
           interval = null;
         }
       } catch (fetchError) {
-        if (ignore) {
+        // A lost connection is no load failure: keep the shown run, the reconnect polls again.
+        if (ignore || isConnectionLostError(fetchError)) {
           return;
         }
         setError(fetchError instanceof Error ? fetchError.message : "Failed to load workflow run");

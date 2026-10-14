@@ -400,3 +400,186 @@ def test_javascript_files_use_their_own_grammar_for_comments(tmp_path, capsys):
     ran = lcov_file(tmp_path, "ran.info", script, "DA:1,1\nDA:2,1\nDA:3,0\nDA:4,0\nDA:5,0\nDA:6,0\nDA:7,1\n")
 
     assert coverage_of(capsys, tmp_path, script, "step", ran) == 0.6667
+
+
+# The Bun inlined-const bug (see crapper_report.py). REPRO is the bug report's
+# module with a called function between the const and its uncalled user.
+# Bun 1.4.3 with a test that calls only `called` lists lines 2-9 at 0 (blank
+# lines included), so `called` shows no run. A test that calls nothing gives
+# the same report, so a flagged row keeps its 0% score.
+REPRO = """\
+const A = 1;
+const B = 2;
+const C = 3;
+
+export function called(x: number): number {
+  return x * 2;
+}
+
+export function unused(x: number): number {
+  return x + B;
+}
+"""
+REPRO_CALLED_ONLY = "DA:1,12\n" + "".join(f"DA:{line},0\n" for line in range(2, 10))
+# Bun 1.4.3, a test that calls both functions: no bug.
+REPRO_CALLED_BOTH = "DA:1,12\nDA:2,13\nDA:3,12\nDA:5,12\nDA:6,13\nDA:9,12\nDA:10,11\n"
+
+
+def suspects(capsys, root: Path, source: str, *reports: str) -> dict[str, tuple[float, bool]]:
+    relative = write(root, "src/demo/repro.ts", source)
+    paths = [lcov_file(root, f"r{index}.info", relative, records) for index, records in enumerate(reports)]
+    rows = run(capsys, root, *[arg for path in paths for arg in ("--lcov", path)], relative)
+    return {row["name"]: (row["coverage"], row["bunInlinedConstSuspect"]) for row in rows}
+
+
+def test_the_bun_repro_flags_the_function_between_the_const_and_its_uncalled_user(tmp_path, capsys):
+    # `unused` really did not run in that process: its 0% is right, so only
+    # `called` is flagged. Both keep their score.
+    assert suspects(capsys, tmp_path, REPRO, REPRO_CALLED_ONLY) == {
+        "called": (0.0, True),
+        "unused": (0.0, False),
+    }
+
+
+def test_every_inlined_literal_kind_flags(tmp_path, capsys):
+    for value in ('"two"', "-0x1f", "true", "null", "undefined", "`two`", '"two" as const', "(2)", "NaN", "-Infinity"):
+        source = REPRO.replace("const B = 2;", f"const B = {value};")
+        assert suspects(capsys, tmp_path, source, REPRO_CALLED_ONLY)["called"] == (0.0, True), value
+
+
+def test_the_run_starts_on_the_literal_line_and_follows_const_aliases(tmp_path, capsys):
+    called = "export function called(x: number): number {\n  return x * 3;\n}\n"
+    unused = "export function unused(x: number) {\n  return [x, K];\n}\n"
+    # Bun 1.4.3: the `(` line ran, the zeroed run starts at the literal.
+    wrapped = f"const p = 0;\nconst K = (\n  5\n);\n{called}{unused}"
+    report = "DA:1,12\nDA:2,9\n" + "".join(f"DA:{line},0\n" for line in range(3, 9))
+    assert suspects(capsys, tmp_path, wrapped, report)["called"] == (0.0, True)
+    # Bun 1.4.3 propagates K = RAW and zeroes from RAW's line.
+    alias = f"const p = 0;\nconst RAW = 2;\nconst K = RAW;\n{called}{unused}"
+    report = "DA:1,12\n" + "".join(f"DA:{line},0\n" for line in range(2, 8))
+    assert suspects(capsys, tmp_path, alias, report)["called"] == (0.0, True)
+    not_const = alias.replace("const RAW = 2;", "let RAW = 2;")
+    assert suspects(capsys, tmp_path, not_const, report)["called"] == (0.0, False)
+
+
+def test_values_bun_does_not_inline_do_not_flag(tmp_path, capsys):
+    # Bun reports these right; the same zero run here must not flag either.
+    for declaration in ("let B = 2;", "const B = Number(2);", 'const B = "a" + "b";', "const B = 2n;"):
+        source = REPRO.replace("const B = 2;", declaration)
+        assert suspects(capsys, tmp_path, source, REPRO_CALLED_ONLY)["called"] == (0.0, False), declaration
+
+
+def test_an_uncalled_function_that_does_not_use_the_const_does_not_flag(tmp_path, capsys):
+    source = REPRO.replace("return x + B;", "return x + 1;")
+    assert suspects(capsys, tmp_path, source, REPRO_CALLED_ONLY)["called"] == (0.0, False)
+
+
+def test_a_zero_run_that_stops_before_the_user_does_not_flag(tmp_path, capsys):
+    # Lines 7-8 are missing, so the run from the const ends inside `called`.
+    report = "DA:1,12\n" + "".join(f"DA:{line},0\n" for line in (2, 3, 4, 5, 6, 9))
+    assert suspects(capsys, tmp_path, REPRO, report)["called"] == (0.0, False)
+
+
+def test_a_called_user_does_not_flag(tmp_path, capsys):
+    assert suspects(capsys, tmp_path, REPRO, REPRO_CALLED_BOTH) == {
+        "called": (1.0, False),
+        "unused": (1.0, False),
+    }
+
+
+def test_only_full_coverage_from_another_report_clears_the_flag(tmp_path, capsys):
+    # The zeroed report may have run lines that no other report did.
+    ran = "DA:1,12\nDA:2,13\nDA:3,12\nDA:5,12\nDA:6,13\nDA:9,0\n"
+    assert suspects(capsys, tmp_path, REPRO, REPRO_CALLED_ONLY, ran)["called"] == (1.0, False)
+    source = REPRO.replace("  return x * 2;\n", "  if (x > 0) return x;\n  return x * 2;\n")
+    partly = "DA:1,12\nDA:2,13\nDA:3,12\nDA:5,12\nDA:6,13\nDA:7,0\nDA:10,0\n"
+    zeroed = "DA:1,12\n" + "".join(f"DA:{line},0\n" for line in range(2, 11))
+    assert suspects(capsys, tmp_path, source, zeroed, partly)["called"] == (0.6667, True)
+
+
+def test_a_local_const_used_by_an_uncalled_closure_flags_the_function_that_ran(tmp_path, capsys):
+    source = """\
+export function outer(items: number[]): number {
+  const STEP = 3;
+  let total = 0;
+  for (const item of items) {
+    total += item;
+  }
+  const later = () => {
+    return total + STEP;
+  };
+  return total;
+}
+"""
+    # Bun 1.4.3, outer([1, 2]) called: lines 2-7 ran but list 0. The partial
+    # score stays.
+    report = "DA:1,16\nDA:2,0\nDA:3,0\nDA:4,0\nDA:5,0\nDA:6,0\nDA:7,0\nDA:10,12\n"
+    assert suspects(capsys, tmp_path, source, report) == {"outer": (0.2857, True)}
+
+
+def test_a_local_const_after_an_early_return_does_not_flag(tmp_path, capsys):
+    source = """\
+export function outer(items: number[]): number {
+  if (items.length === 0) return 0;
+  const STEP = 3;
+  let total = 0;
+  const later = () => {
+    return total + STEP;
+  };
+  return total;
+}
+"""
+    # Bun 1.4.3, outer([]) called: the early return skipped lines 3-8, so their
+    # zeros are right.
+    report = "DA:1,16\nDA:2,34\nDA:3,0\nDA:4,0\nDA:5,0\nDA:6,0\nDA:8,0\n"
+    assert suspects(capsys, tmp_path, source, report) == {"outer": (0.2857, False)}
+    # Any call before the const may throw, so it does not flag either.
+    called_first = source.replace("  if (items.length === 0) return 0;\n", "  check(items);\n")
+    assert suspects(capsys, tmp_path, called_first, report)["outer"][1] is False
+    # Destructuring can throw, even with a literal value.
+    destructured = source.replace("  if (items.length === 0) return 0;\n", "  const [seen] = 0 as any;\n")
+    assert suspects(capsys, tmp_path, destructured, report)["outer"][1] is False
+    # Literal declarations before it cannot skip it.
+    literal_first = source.replace("  if (items.length === 0) return 0;\n", "  let seen = 0;\n")
+    assert suspects(capsys, tmp_path, literal_first, report)["outer"][1] is True
+
+
+
+def test_an_earlier_declarator_of_the_same_statement_must_not_skip_the_const(tmp_path, capsys):
+    source = """\
+export function outer(items: number[]): number {
+  const first = check(items),
+    STEP = 3;
+  let total = 0;
+  const later = () => {
+    return total + STEP;
+  };
+  return total + first;
+}
+"""
+    # check() threw: line 2 ran, and STEP (line 3) onward never did, so the
+    # zero run from STEP's literal through the closure is a correct report.
+    report = "DA:1,16\nDA:2,10\nDA:3,0\nDA:4,0\nDA:5,0\nDA:6,0\nDA:8,0\n"
+    assert suspects(capsys, tmp_path, source, report)["outer"][1] is False
+    # A literal earlier declarator cannot skip it.
+    literal_first = source.replace("check(items)", "1")
+    assert suspects(capsys, tmp_path, literal_first, report)["outer"][1] is True
+    # Neither can an alias of an earlier literal const.
+    alias_first = source.replace("const first = check(items),", "const raw = 1, first = raw,")
+    assert suspects(capsys, tmp_path, alias_first, report)["outer"][1] is True
+    # An outer const can be shadowed by a later local one: reading it there
+    # throws (temporal dead zone), so it is not safe.
+    shadowed = "const raw = 1;\n" + alias_first.replace("const raw = 1, first = raw,", "const first = raw,").replace(
+        "  return total + first;\n", "  const raw = check(items);\n  return total + first + raw;\n"
+    )
+    # The same report, one line down.
+    hits = ((1, 16), (2, 10), (3, 0), (4, 0), (5, 0), (6, 0), (8, 0))
+    shifted = "".join(f"DA:{line + 1},{count}\n" for line, count in hits)
+    assert suspects(capsys, tmp_path, shadowed, "DA:1,12\n" + shifted)["outer"][1] is False
+
+def test_javascript_sources_flag_too(tmp_path, capsys):
+    # Bun 1.4.3 zeroes a .js module the same way (lines 2-9 at 0).
+    relative = write(tmp_path, "src/demo/repro.js", REPRO.replace(": number", ""))
+    report = lcov_file(tmp_path, "r.info", relative, REPRO_CALLED_ONLY)
+    rows = run(capsys, tmp_path, "--lcov", report, relative)
+    assert {row["name"]: row["bunInlinedConstSuspect"] for row in rows} == {"called": True, "unused": False}

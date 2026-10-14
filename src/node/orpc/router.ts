@@ -52,6 +52,8 @@ import {
 } from "@/node/services/artifactInteractions";
 import {
   callMcpAppTool,
+  listMcpAppEntrypoints,
+  openMcpAppEntrypoint,
   getMcpAppView,
   getMcpAppViewRecords,
   readMcpAppServerResource,
@@ -1396,6 +1398,16 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) =>
           context.agentPluginInstallService.getComponentsResult(input)
         ),
+      getHooks: t
+        .input(schemas.agentPlugins.getHooks.input)
+        .output(schemas.agentPlugins.getHooks.output)
+        .handler(({ context, input }) => context.agentPluginInstallService.getHooksResult(input)),
+      setHookTrust: t
+        .input(schemas.agentPlugins.setHookTrust.input)
+        .output(schemas.agentPlugins.setHookTrust.output)
+        .handler(({ context, input }) =>
+          context.agentPluginInstallService.setHookTrustResult(input)
+        ),
       setComponents: t
         .input(schemas.agentPlugins.setComponents.input)
         .output(schemas.agentPlugins.setComponents.output)
@@ -1822,6 +1834,22 @@ export const router = (authToken?: string) => {
         .input(schemas.mcpApps.revokeViewDomains.input)
         .output(schemas.mcpApps.revokeViewDomains.output)
         .handler(({ context, input }) => revokeMcpAppViewDomains(context, input)),
+      listEntrypoints: t
+        .input(schemas.mcpApps.listEntrypoints.input)
+        .output(schemas.mcpApps.listEntrypoints.output)
+        .handler(({ context, input, signal }) =>
+          listMcpAppEntrypoints(context, input.workspaceId, signal, (workspaceId, warmSignal) =>
+            listWorkspaceMcpPrompts(context, workspaceId, warmSignal)
+          )
+        ),
+      openEntrypoint: t
+        .input(schemas.mcpApps.openEntrypoint.input)
+        .output(schemas.mcpApps.openEntrypoint.output)
+        .handler(({ context, input, signal }) =>
+          openMcpAppEntrypoint(context, input, signal, (workspaceId, warmSignal) =>
+            listWorkspaceMcpPrompts(context, workspaceId, warmSignal)
+          )
+        ),
     },
     // Memory handlers run Effect generators via handlerGen (client aborts
     // interrupt the fiber); the wire contracts are unchanged.

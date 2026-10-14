@@ -134,6 +134,8 @@ export async function saveTestConfig(
     ...overrides,
     migrations: {
       persistentSubagentsDefaulted: true,
+      // Keep explicit test limits (e.g. depth 3) from moving to the raised defaults on load.
+      taskSettingsDefaultsRaised: true,
       ...overrides.migrations,
     },
   }));

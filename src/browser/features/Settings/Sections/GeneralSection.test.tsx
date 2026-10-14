@@ -7,6 +7,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { APIProvider } from "@/browser/contexts/API";
+import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
 import {
   createTestApiClient,
   createTestConfig,
@@ -941,6 +942,75 @@ describe("GeneralSection", () => {
 
     act(() => resolveWrite?.());
     await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
+  });
+
+  // A reconnect reloads the config through the new client. The archive controls keep their
+  // loaded values, but stay disabled until the reload answers: they are written together, so a
+  // change before it would send a stale value for the other one.
+  describe.each([...GAP_MODES])("across a reconnect (%s)", (mode) => {
+    test("keeps the archive values and locks the controls while the reload is pending", async () => {
+      const setup = createMockAPI({ worktreeArchiveBehavior: "delete" });
+      mockApi = setup.api;
+      getAppConfigStore().setClient(createTestApiClient(mockApi));
+      const harness = createConnectionHarness(mode, () => mockApi);
+      const view = render(
+        <harness.Wrapper>
+          <ThemeProvider forcedTheme="dark">
+            <GeneralSection />
+          </ThemeProvider>
+        </harness.Wrapper>
+      );
+      await waitFor(() => {
+        const trigger = getSelectTrigger(view, "Worktree archive behavior");
+        expect(trigger.textContent).toContain("Delete checkout");
+        expect(trigger.hasAttribute("disabled")).toBe(false);
+      });
+
+      mockApi = {
+        ...setup.api,
+        config: { ...setup.api.config, getConfig: () => new Promise(() => undefined) },
+      };
+      await harness.drop();
+      harness.reconnect();
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      });
+
+      const trigger = getSelectTrigger(view, "Worktree archive behavior");
+      expect(trigger.textContent).toContain("Delete checkout");
+      expect(trigger.hasAttribute("disabled")).toBe(true);
+    });
+
+    // Offline the loaded values stay, but a control that writes to the server must not look
+    // usable: its write could not reach the server.
+    test("disables the server-backed controls while offline", async () => {
+      const setup = createMockAPI({ worktreeArchiveBehavior: "delete" });
+      mockApi = setup.api;
+      getAppConfigStore().setClient(createTestApiClient(mockApi));
+      const harness = createConnectionHarness(mode, () => mockApi);
+      const view = render(
+        <harness.Wrapper>
+          <ThemeProvider forcedTheme="dark">
+            <GeneralSection />
+          </ThemeProvider>
+        </harness.Wrapper>
+      );
+      const debugLogs = view.getByRole("switch", { name: "Toggle API Debug Logs" });
+      await waitFor(() => {
+        const trigger = getSelectTrigger(view, "Worktree archive behavior");
+        expect(trigger.hasAttribute("disabled")).toBe(false);
+      });
+      expect(debugLogs.hasAttribute("disabled")).toBe(false);
+
+      await harness.drop();
+      const trigger = getSelectTrigger(view, "Worktree archive behavior");
+      expect(trigger.textContent).toContain("Delete checkout");
+      expect(trigger.hasAttribute("disabled")).toBe(true);
+      expect(debugLogs.hasAttribute("disabled")).toBe(true);
+
+      harness.reconnect();
+      await waitFor(() => expect(debugLogs.hasAttribute("disabled")).toBe(false));
+    });
   });
 
   test("renders the worktree archive behavior copy and loads the saved value", async () => {

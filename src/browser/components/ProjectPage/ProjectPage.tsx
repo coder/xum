@@ -10,12 +10,14 @@ import type { ChatInputAPI, WorkspaceCreatedOptions } from "@/browser/features/C
 import { ProjectMCPOverview } from "../ProjectMCPOverview/ProjectMCPOverview";
 import { ArchivedWorkspaces } from "../ArchivedWorkspaces/ArchivedWorkspaces";
 import { useAPI } from "@/browser/contexts/API";
+import { isStreamFailure } from "@/browser/contexts/connectionLink";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { getErrorMessage } from "@/common/utils/errors";
 import { GitInitBanner } from "../GitInitBanner/GitInitBanner";
 import { ConfiguredProvidersBar } from "../ConfiguredProvidersBar/ConfiguredProvidersBar";
 import { ConfigureProvidersPrompt } from "../ConfigureProvidersPrompt/ConfigureProvidersPrompt";
 import { hasConfiguredProvider, useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
+import { useCreationSendBlocked } from "./useCreationSendBlocked";
 import { AgentsInitBanner } from "../AgentsInitBanner/AgentsInitBanner";
 import {
   usePersistedState,
@@ -156,7 +158,8 @@ const ProjectArchivedWorkspaces: React.FC<{ projectPath: string; projectName: st
           throw new Error("Archived workspace stream ended before its snapshot");
         }
       } catch (err) {
-        if (!controller.signal.aborted) {
+        // A lost connection is no load failure: the reconnect opens the stream again.
+        if (isStreamFailure(err, controller.signal)) {
           console.error("Failed to load archived workspaces:", err);
           setArchivedLoadError(getErrorMessage(err));
         }
@@ -207,6 +210,10 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
   const { api } = useAPI();
   const chatInputRef = useRef<ChatInputAPI | null>(null);
   const pendingAgentsInitSendRef = useRef(false);
+  // #6038: "Run /init" sends through the creation composer, which cannot send while its branch
+  // list loads (or failed). Off until the composer of this scope reports it can send.
+  const creationComposerKey = `${projectPath}:${pendingDraftId ?? "__pending__"}`;
+  const [creationSendBlocked, setCreationSendBlocked] = useCreationSendBlocked(creationComposerKey);
   const [showAgentsInitNudge, setShowAgentsInitNudge] = usePersistedState<boolean>(
     getAgentsInitNudgeKey(projectPath),
     false,
@@ -360,19 +367,21 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
                       <AgentsInitBanner
                         onRunInit={handleRunAgentsInit}
                         onDismiss={handleDismissAgentsInit}
+                        runDisabled={creationSendBlocked}
                       />
                     )}
                     {/* ChatInput for workspace creation. */}
                     <ChatInput
                       // Key by project + draft so project navigation and draft switches both remount
                       // creation-local state (including any in-flight creation send).
-                      key={`${projectPath}:${pendingDraftId ?? "__pending__"}`}
+                      key={creationComposerKey}
                       variant="creation"
                       projectPath={projectPath}
                       projectName={projectName}
                       pendingSubProjectPath={pendingSubProjectPath}
                       pendingDraftId={pendingDraftId}
                       onReady={handleChatReady}
+                      onCreationSendBlockedChange={setCreationSendBlocked}
                       onWorkspaceCreated={onWorkspaceCreated}
                     />
                     {providersLoading ? (

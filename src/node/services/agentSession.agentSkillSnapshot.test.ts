@@ -1,3 +1,4 @@
+import { MAX_AGENT_SKILL_SNAPSHOT_CHARS } from "@/common/constants/attachments";
 import { describe, expect, it, mock, afterEach, spyOn } from "bun:test";
 import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
@@ -51,6 +52,8 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
 
   async function createSessionHarness(args: {
     workspacePath: string;
+    /** Main checkout when it differs from the workspace's own checkout (worktrees). */
+    projectPath?: string;
     workspaceId?: string;
     runtimeConfig?: FrontendWorkspaceMetadata["runtimeConfig"];
     aiServiceOverrides?: Partial<AIService>;
@@ -60,7 +63,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       id: workspaceId,
       name: "ws",
       projectName: "proj",
-      projectPath: args.workspacePath,
+      projectPath: args.projectPath ?? args.workspacePath,
       namedWorkspacePath: args.workspacePath,
       runtimeConfig: args.runtimeConfig ?? { type: "local" },
     } as unknown as FrontendWorkspaceMetadata;
@@ -170,6 +173,99 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
 
     const snapshotText = snapshotMessage.parts.find((p) => p.type === "text")?.text;
     expect(snapshotText).toContain("Project override for init skill.");
+  });
+
+  it("leaves ${CLAUDE_SKILL_DIR} literal and unrun for project skills read from the main checkout", async () => {
+    // A new worktree's first message resolves project skills from the project path
+    // (disableWorkspaceAgents). That copy is not the worktree's, so its path must
+    // not reach the snapshot: bash would run the main checkout's script.
+    const { workspacePath: projectPath } = await createTestWorkspaceWithSkill({
+      skillName: "proj-hello",
+      skillBody:
+        'Run sh ${CLAUDE_SKILL_DIR}/scripts/hello.sh\n!`echo ran-$((20+22)) "${CLAUDE_SKILL_DIR}"`\n!`echo ran-$((40+2)) $CLAUDE_SKILL_DIR`\n!`echo ran-$((41+1)) "$(printenv CLAUDE_SKILL_DIR)"`',
+    });
+    const srcBaseDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-agent-skill-src-"));
+    const worktreePath = path.join(srcBaseDir, "proj", "ws");
+    await fs.mkdir(worktreePath, { recursive: true });
+    const { session, messages } = await createSessionHarness({
+      projectPath,
+      workspacePath: worktreePath,
+      runtimeConfig: { type: "worktree", srcBaseDir },
+      aiServiceOverrides: {
+        isExperimentEnabled: mock((id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT),
+      },
+    });
+
+    const result = await session.sendMessage("do X", {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+      disableWorkspaceAgents: true,
+      muxMetadata: {
+        type: "agent-skill",
+        rawCommand: "/proj-hello",
+        skillName: "proj-hello",
+        scope: "project",
+      },
+    });
+
+    expect(result.success).toBe(true);
+    const snapshotText = getMessageText(messages[0]);
+    expect(snapshotText).toContain("Run sh ${CLAUDE_SKILL_DIR}/scripts/hello.sh");
+    expect(snapshotText).not.toContain(projectPath);
+    // A directive with the unresolved placeholder must not run: the shell would
+    // expand it to "" and hit a path at the filesystem root.
+    expect(snapshotText).not.toContain("ran-42");
+    expect(snapshotText).toContain("not run: CLAUDE_SKILL_DIR has no value");
+  });
+
+  it("tells the model when a slash skill's files are not where bash runs", async () => {
+    // A devcontainer reads skills on the host but runs bash in the container,
+    // the same split as host plugin skills in SSH/Docker workspaces. No tool
+    // result reaches the model for a slash skill, so the snapshot must say it.
+    // Longer than the snapshot cap: the note must survive truncation.
+    const skillBody = `Run sh \${CLAUDE_SKILL_DIR}/scripts/hello.sh\n${"x".repeat(MAX_AGENT_SKILL_SNAPSHOT_CHARS)}`;
+    const offHost = await createTestWorkspaceWithSkill({ skillName: "split-skill", skillBody });
+    const onHost = await createTestWorkspaceWithSkill({ skillName: "split-skill", skillBody });
+    const cases = [
+      {
+        workspacePath: offHost.workspacePath,
+        runtimeConfig: {
+          type: "devcontainer",
+          configPath: ".devcontainer/devcontainer.json",
+        } as const,
+        expectNote: true,
+      },
+      {
+        workspacePath: onHost.workspacePath,
+        runtimeConfig: { type: "local" } as const,
+        expectNote: false,
+      },
+    ];
+
+    for (const testCase of cases) {
+      const { session, messages } = await createSessionHarness({
+        workspacePath: testCase.workspacePath,
+        runtimeConfig: testCase.runtimeConfig,
+      });
+      const result = await session.sendMessage("do X", {
+        model: "anthropic:claude-3-5-sonnet-latest",
+        agentId: "exec",
+        muxMetadata: {
+          type: "agent-skill",
+          rawCommand: "/split-skill",
+          skillName: "split-skill",
+          scope: "project",
+        },
+      });
+
+      expect(result.success).toBe(true);
+      const snapshotText = getMessageText(messages[0]);
+      expect(snapshotText.includes("agent_skill_read_file")).toBe(testCase.expectNote);
+      // The host path is never offered to the off-host bash.
+      expect(snapshotText.includes(testCase.workspacePath)).toBe(!testCase.expectNote);
+      await historyCleanup?.();
+      historyCleanup = undefined;
+    }
   });
 
   it("resolves checkout-level plugin skills for subproject execution paths (agent-plugins)", async () => {
@@ -892,6 +988,42 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     expect(result.success).toBe(true);
     // $1 → "hi" happens before execution, so the command itself sees the argument.
     expect(getMessageText(messages[0])).toContain("```text (output of: echo hi)\nhi\n```");
+  });
+
+  it("runs a bundled script through ${CLAUDE_SKILL_DIR} in a dynamic context directive", async () => {
+    // Shell syntax in the checkout path must stay data: a spliced path would run
+    // `$(echo injected)` and miss the script.
+    const workspacePath = await fs.mkdtemp(path.join(os.tmpdir(), "mux-skill-$(echo injected)-"));
+    const skillDir = path.join(workspacePath, ".mux", "skills", "bundled");
+    await fs.mkdir(skillDir, { recursive: true });
+    await fs.writeFile(
+      path.join(skillDir, "SKILL.md"),
+      '---\nname: bundled\ndescription: Test skill\n---\n\n!`sh "${CLAUDE_SKILL_DIR}/scripts/hello.sh"`\n',
+      "utf-8"
+    );
+    await fs.mkdir(path.join(skillDir, "scripts"), { recursive: true });
+    await fs.writeFile(path.join(skillDir, "scripts", "hello.sh"), "echo bundled-ok\n", "utf-8");
+    const { session, messages } = await createSessionHarness({
+      workspacePath,
+      aiServiceOverrides: {
+        isExperimentEnabled: mock((id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT),
+      },
+    });
+
+    const result = await session.sendMessage("use bundled", {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+      muxMetadata: {
+        type: "agent-skill",
+        rawCommand: "/bundled",
+        skillName: "bundled",
+        scope: "project",
+      },
+    });
+
+    expect(result.success).toBe(true);
+    // The directive ran the skill's own script, located without an install path.
+    expect(getMessageText(messages[0])).toContain("\nbundled-ok\n```");
   });
 
   it("injects dynamic context for inline skill refs (also user-initiated)", async () => {

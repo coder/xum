@@ -43,27 +43,70 @@ function resolveAsset(distDir: string, resolved: string, referrer: string): stri
 
 const ATTRIBUTE = /([^\s="'<>/]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g;
 
+/**
+ * The served "/" of T3 C step 2 (plan section 5.6, PR 4b) has no module script: the early script
+ * adds it, and the modulepreloads, after the static first-run view paints. It reads them from
+ * `<script type="application/json" id="xum-pre-modules">{"script": href, "preload": [href, ...]}`,
+ * which this tool counts like the tags it replaces. PR 4b writes that block, and must keep this
+ * id and shape.
+ */
+export const FIRST_RUN_MODULES_ID = "xum-pre-modules";
+
+function parseAttributes(rest: string): Map<string, string> {
+  const attrs = new Map<string, string>();
+  for (const m of rest.matchAll(ATTRIBUTE)) {
+    attrs.set(m[1].toLowerCase(), m[2] ?? m[3] ?? m[4] ?? "");
+  }
+  return attrs;
+}
+
+/** The hrefs of the deferred module list, or none when the HTML has no such block. */
+function deferredModuleHrefs(html: string): string[] {
+  const hrefs: string[] = [];
+  for (const [, rest, body] of html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)) {
+    if (parseAttributes(rest).get("id") !== FIRST_RUN_MODULES_ID) continue;
+    let list: unknown;
+    try {
+      list = JSON.parse(body);
+    } catch {
+      fail(`#${FIRST_RUN_MODULES_ID} is not JSON`);
+    }
+    const { script, preload } = (list ?? {}) as { script?: unknown; preload?: unknown };
+    const strings = Array.isArray(preload) && preload.every((p) => typeof p === "string");
+    if (typeof script !== "string" || !strings) {
+      fail(`#${FIRST_RUN_MODULES_ID} must be {"script": string, "preload": string[]}`);
+    }
+    hrefs.push(script, ...(preload as string[]));
+  }
+  return hrefs;
+}
+
 function htmlRoots(distDir: string): string[] {
   const indexPath = path.join(distDir, "index.html");
   if (!fs.existsSync(indexPath)) fail(`${indexPath} not found (run make build-renderer first)`);
   const html = fs.readFileSync(indexPath, "utf-8");
   const roots: string[] = [];
+  // vite `base: "./"` writes `./main-<hash>.js`; a leading `/` means the dist root.
+  const resolve = (href: string) =>
+    resolveAsset(
+      distDir,
+      href.startsWith("/") ? path.join(distDir, href) : path.resolve(distDir, href),
+      "index.html"
+    );
   for (const [, tag, rest] of html.matchAll(/<(script|link)\b([^>]*)>/gi)) {
-    const attrs = new Map<string, string>();
-    for (const m of rest.matchAll(ATTRIBUTE)) {
-      attrs.set(m[1].toLowerCase(), m[2] ?? m[3] ?? m[4] ?? "");
-    }
+    const attrs = parseAttributes(rest);
     const isScript = tag.toLowerCase() === "script";
     const isRoot = isScript
       ? attrs.get("type") === "module"
       : attrs.get("rel")?.toLowerCase().split(/\s+/).includes("modulepreload") === true;
     const href = attrs.get(isScript ? "src" : "href");
     if (!isRoot || href == null) continue; // inline boot scripts, stylesheets, icons
-    // vite `base: "./"` writes `./main-<hash>.js`; a leading `/` means the dist root.
-    const target = href.startsWith("/") ? path.join(distDir, href) : path.resolve(distDir, href);
-    roots.push(resolveAsset(distDir, target, "index.html"));
+    roots.push(resolve(href));
   }
-  if (roots.length === 0) fail(`${distDir}/index.html has no module script or modulepreload`);
+  roots.push(...deferredModuleHrefs(html).map(resolve));
+  if (roots.length === 0) {
+    fail(`${distDir}/index.html has no module script, modulepreload or #${FIRST_RUN_MODULES_ID}`);
+  }
   return roots;
 }
 
