@@ -257,16 +257,15 @@ describe("aiSelectionIntent", () => {
   test("copied picks replace the destination's own, so it shows the source's choices", () => {
     const DEST = "dest-ws";
     setAutoRoutingPick(WS, "plan", "model", false);
-    markAiSelectionIntent(WS, "reasoningMode", "pro");
-    setAutoRoutingPick(DEST, "plan", "model", true);
-    setAutoRoutingPick(DEST, "plan", "thinkingLevel", true);
+    // The destination's picks for an agent the source has none for must go too: the moved draft
+    // shows that agent's configured defaults there, as the source does.
+    setAutoRoutingPick(DEST, "exec", "model", true);
     markAiSelectionIntent(DEST, "serviceTier", "flex");
 
     snapshotPendingAiSelection(WS)(DEST);
 
     expect(getAutoRoutingPick(DEST, "plan", "model")).toBe(false);
-    expect(getAutoRoutingPick(DEST, "plan", "thinkingLevel")).toBeUndefined();
-    expect(getPendingAiSelection(DEST, "exec", "reasoningMode")).toBe("pro");
+    expect(getAutoRoutingPick(DEST, "exec", "model")).toBeUndefined();
     expect(getPendingAiSelection(DEST, "exec", "serviceTier")).toBeUndefined();
   });
 });

@@ -220,17 +220,35 @@ describeIntegration("Creation project selector moves the draft", () => {
   test("the bare project page's default draft moves and leaves that page empty", async () => {
     const { view, cleanupDom, a, b } = await openTwoProjects();
     const { container } = view;
+    // Holds workspace name generation, so the source composer's request settles after the move.
+    const workspaceService = getSharedEnv().services.workspaceService;
+    const realCandidates = workspaceService.getWorkspaceNamingCandidates.bind(workspaceService);
+    let releaseNaming!: () => void;
+    const namingReleased = new Promise<void>((resolve) => {
+      releaseNaming = resolve;
+    });
+    const namingCalls: Array<Promise<unknown>> = [];
+    const namingSpy = jest
+      .spyOn(workspaceService, "getWorkspaceNamingCandidates")
+      .mockImplementation((...args) => {
+        const call = namingReleased.then(() => realCandidates(...args));
+        namingCalls.push(call.catch(() => undefined));
+        return call;
+      });
     try {
       // The project row opens a non-empty default draft (the bare project page).
       getDraftStore().setText(defaultCreationDraftScope(a), "default text");
       await getDraftStore().flush(defaultCreationDraftScope(a));
       await openProjectCreationView(view, a);
       await waitFor(() => expect(textareaValue(container)).toBe("default text"), WAIT);
+      await waitFor(() => expect(namingSpy).toHaveBeenCalled(), WAIT);
 
       await moveDraftTo(container, path.basename(b));
 
       await onlyDraftId(b);
       await waitFor(() => expect(textareaValue(container)).toBe("default text"), WAIT);
+      releaseNaming();
+      await Promise.all(namingCalls);
       await waitFor(
         () => expect(getDraftStore().getView(defaultCreationDraftScope(a)).text).toBe(""),
         WAIT
@@ -239,6 +257,8 @@ describeIntegration("Creation project selector moves the draft", () => {
       // No workspace name is left behind either: it would keep A's bare page non-empty.
       expect(readPersistedState(getWorkspaceNameStateKey(getPendingScopeId(a)), null)).toBeNull();
     } finally {
+      releaseNaming();
+      namingSpy.mockRestore();
       await cleanupView(view, cleanupDom);
     }
   }, 90_000);
