@@ -458,7 +458,8 @@ function checkJob(args: string[], o: LaunchOptions) {
   // exact-step repros may use a local build: they reach no real model. By the job kind, not by
   // `driven`: the self-check counts as model-driven. Explore charters, the MCP Apps suite and
   // checkDocker (the preflight of make bug-bash and make mcp-apps-e2e) keep the pinned digest.
-  const exactStep = !selfCheck && !mcpApps && args[0] !== "explore";
+  // A positive check, not "none of the others": a job kind added later must not qualify by default.
+  const exactStep = exactStepRefusal(args, o.cwd, dir) == null;
   const localBuild = o.env.BUGBASH_SANDBOX_BUILD_STALE === "1" && (selfCheck || exactStep);
   return { dir, mcpApps, selfCheck, ai, driven, localBuild };
 }

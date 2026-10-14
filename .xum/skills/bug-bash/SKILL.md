@@ -149,7 +149,8 @@ removes only those whose launcher is provably dead on this boot, and exits 3 whe
 for one. Check that container's `xum.bugbash.owner` and `xum.bugbash.checkout` labels with
 `docker inspect`, then `docker rm -f <id>` it. A SIGKILLed launcher also leaves
 `$TMPDIR/xum-bugbash-sandbox/<checkout>/<job>` and a `xum-bugbash-docker-*` folder in `$TMPDIR`:
-remove both by hand.
+remove both by hand. A run with `BUGBASH_SANDBOX_BUILD_STALE=1` on a stale key leaves a local
+image of about 1.4 GB: remove it with `docker image rm xum-bugbash-sandbox:inputs-<key>`.
 
 ## 5. Triage and verify
 
