@@ -287,6 +287,11 @@ function withPendingSend(current: StoredDraft, updated: PendingSend): StoredDraf
   };
 }
 
+function assertDraftFits(draft: StoredDraft): void {
+  const bytes = draftJsonBytes(draft);
+  if (bytes > MAX_DRAFT_JSON_BYTES) throw new Error(draftTooLargeMessage(bytes));
+}
+
 /** A write's reply: the stored draft's view (DraftWriteOutputSchema). */
 function writeOutput(scope: DraftScope, draft: StoredDraft, revision: number): DraftWriteOutput {
   const { scope: _scope, ...view } = summarizeDraft(
@@ -558,10 +563,7 @@ export class DraftService extends EventEmitter {
         current.pendingSends,
         mergeNameState(current, input)
       );
-      const bytes = draftJsonBytes(next);
-      if (bytes > MAX_DRAFT_JSON_BYTES) {
-        throw new Error(draftTooLargeMessage(bytes));
-      }
+      assertDraftFits(next);
       if (!(await this.hasOwner(scope))) {
         return writeOutput(scope, current, this.getRevision(draftScopeKey(scope)));
       }
@@ -718,28 +720,27 @@ export class DraftService extends EventEmitter {
       text: input.text ?? "",
       attachments: input.attachments ?? [],
     }).draft;
-    const bytes = draftJsonBytes(legacy);
-    if (bytes > MAX_DRAFT_JSON_BYTES) {
-      throw new Error(draftTooLargeMessage(bytes));
-    }
     const imported: StoredDraft = {
       ...legacy,
       pendingSends: [],
       nameState: boundWorkspaceNamePersistedState(input.nameState) ?? undefined,
     };
+    assertDraftFits(imported);
     return this.withWriteLock(scope, async () => {
       const key = draftScopeKey(scope);
       const stored = legacyImportOf(await this.load(scope), imported);
       if (stored === null) {
         return { result: "present", revision: this.getRevision(key) };
       }
+      // A legacy name merged under a stored body (or the reverse) is a new combination.
+      if (stored !== imported) assertDraftFits(stored);
       if (!(await this.hasOwner(scope))) {
         return { result: "orphaned", revision: this.getRevision(key) };
       }
-      if (isStoredDraftEmpty(stored)) {
-        return { result: "applied", revision: this.getRevision(key) };
-      }
-      return { result: "applied", revision: await this.persist(scope, filePath, stored) };
+      const revision = isStoredDraftEmpty(stored)
+        ? this.getRevision(key)
+        : await this.persist(scope, filePath, stored);
+      return { result: "applied", ...writeOutput(scope, stored, revision) };
     });
   }
 
@@ -802,8 +803,7 @@ export class DraftService extends EventEmitter {
         [...current.pendingSends, pendingSend],
         current.nameState
       );
-      const bytes = draftJsonBytes(next);
-      if (bytes > MAX_DRAFT_JSON_BYTES) throw new Error(draftTooLargeMessage(bytes));
+      assertDraftFits(next);
       if (!(await this.hasOwner(scope))) {
         throw new Error(`Draft write refused: workspace ${scope.workspaceId} is not registered`);
       }

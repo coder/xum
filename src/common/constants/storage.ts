@@ -686,6 +686,13 @@ export const TERMINAL_TITLES_MAX_CHARS = 768;
 export const SIDEBAR_EXPANSION_MAP_MAX_CHARS = 16 * 1024;
 /** archivedWorkspaces:{projectPath}: the cache keeps the first archived entries that fit. */
 export const ARCHIVED_WORKSPACES_CACHE_MAX_CHARS = 6 * 1024;
+/** workspaceNameState stores at most this much (serialized) of the message it was generated for. */
+export const WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS = 2000;
+/**
+ * workspaceNameState stores at most this much (serialized) of a typed manual name. Valid names are
+ * at most 64 chars (validateWorkspaceBranchName), so only invalid names are cut.
+ */
+export const WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS = 1024;
 /**
  * Model preferences hold a "provider:modelId" string. Custom model ids are checked against it
  * where they are entered (getModelIdLengthError); built-in ids are far shorter.
@@ -818,7 +825,7 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   workspaceKey(getAutoExpandPrefsKey, "ui", true, AUTO_EXPAND_PREFS_MAX_CHARS),
   // Legacy creation-draft name state, now in the draft body on the backend (imported once by
   // DraftStore.migrateLegacyDrafts, then removed). Never written again, so no budget (0). Still
-  // copied: the legacy pending-draft import moves it to the imported draft's scope first.
+  // copied, so a key not imported yet follows its draft's settings.
   workspaceKey(getWorkspaceNameStateKey, "draft", true, 0, "draft"),
   // The VS Code webview composer's unsent text. Longer drafts still work for the session (kept in
   // memory); the webview then persists only the last text that fit.
