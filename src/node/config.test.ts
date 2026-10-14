@@ -1916,6 +1916,96 @@ describe("Config", () => {
       }
     });
 
+    it("follows a config.json symlink to a sibling file that is pointed at another sibling", async () => {
+      const link = path.join(tempDir, "config.json");
+      fs.writeFileSync(path.join(tempDir, "config.a.json"), JSON.stringify({ projects: [] }));
+      fs.writeFileSync(
+        path.join(tempDir, "config.b.json"),
+        JSON.stringify({ projects: [], updateChannel: "npm" })
+      );
+      fs.symlinkSync(path.join(tempDir, "config.a.json"), link);
+      let notified = Promise.withResolvers<void>();
+      const unsubscribe = config.onConfigChanged(() => notified.resolve());
+      fs.symlinkSync(path.join(tempDir, "config.b.json"), `${link}.tmp`);
+      fs.renameSync(`${link}.tmp`, link);
+      await notified.promise;
+      notified = Promise.withResolvers<void>();
+      await new Config(tempDir).setUpdateChannel("nightly");
+      await notified.promise;
+      unsubscribe();
+      expect(config.getUpdateChannel()).toBe("nightly");
+    });
+
+    it("follows a symlink replaced while the watch starts", async () => {
+      const dirA = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-a-"));
+      const dirB = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-b-"));
+      const link = path.join(tempDir, "config.json");
+      const realWatch = fs.watch;
+      let relinked = false;
+      // The link changes after the target is resolved and before the root watch exists, so no
+      // watch event reports it.
+      const watchSpy = spyOn(fs, "watch").mockImplementation(((
+        ...args: Parameters<typeof fs.watch>
+      ) => {
+        if (!relinked) {
+          relinked = true;
+          fs.symlinkSync(path.join(dirB, "config.json"), `${link}.tmp`);
+          fs.renameSync(`${link}.tmp`, link);
+        }
+        return realWatch(...args);
+      }) as typeof fs.watch);
+      try {
+        fs.writeFileSync(path.join(dirA, "config.json"), JSON.stringify({ projects: [] }));
+        fs.writeFileSync(path.join(dirB, "config.json"), JSON.stringify({ projects: [] }));
+        fs.symlinkSync(path.join(dirA, "config.json"), link);
+        let notifications = 0;
+        let notified = Promise.withResolvers<void>();
+        const unsubscribe = config.onConfigChanged(() => {
+          notifications += 1;
+          notified.resolve();
+        });
+        // The startup check reports the relink itself (another file is config.json now).
+        expect(relinked).toBe(true);
+        expect(notifications).toBe(1);
+        notified = Promise.withResolvers<void>();
+        await new Config(tempDir).setUpdateChannel("nightly");
+        await notified.promise;
+        unsubscribe();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        watchSpy.mockRestore();
+        fs.rmSync(dirA, { recursive: true, force: true });
+        fs.rmSync(dirB, { recursive: true, force: true });
+      }
+    });
+
+    it("stops watching for good once stopWatchingConfigFile runs", () => {
+      const watchers: fs.FSWatcher[] = [];
+      const realWatch = fs.watch;
+      const watchSpy = spyOn(fs, "watch").mockImplementation(((
+        ...args: Parameters<typeof fs.watch>
+      ) => {
+        const watcher = realWatch(...args);
+        watchers.push(watcher);
+        return watcher;
+      }) as typeof fs.watch);
+      try {
+        const unsubscribe = config.onConfigChanged(() => undefined);
+        expect(watchers.length).toBeGreaterThan(0);
+        const closes = watchers.map((watcher) => spyOn(watcher, "close"));
+        config.stopWatchingConfigFile();
+        for (const close of closes) expect(close).toHaveBeenCalledTimes(1);
+        // A later subscriber (a service still running during teardown) starts no new watch.
+        const started = watchers.length;
+        const unsubscribeLate = config.onConfigChanged(() => undefined);
+        expect(watchers.length).toBe(started);
+        unsubscribeLate();
+        unsubscribe();
+      } finally {
+        watchSpy.mockRestore();
+      }
+    });
+
     it("notifies when another process creates the config dir with its first save", async () => {
       const rootDir = path.join(tempDir, "fresh-root");
       const fresh = new Config(rootDir);

@@ -1548,8 +1548,17 @@ export class Config {
   /** The resolved config.json path the target-dir watch follows (see startConfigFileWatchers). */
   private watchedConfigFileTarget: string | null = null;
 
+  /** Set by stopWatchingConfigFile: a disposed backend never watches again. */
+  private configFileWatchStopped = false;
+
+  /** Closes the config.json watches for good (service teardown). Own edits still notify. */
+  stopWatchingConfigFile(): void {
+    this.configFileWatchStopped = true;
+    this.closeConfigFileWatcher();
+  }
+
   private ensureConfigFileWatcher(): void {
-    if (this.configFileWatchers.length > 0) return;
+    if (this.configFileWatchers.length > 0 || this.configFileWatchStopped) return;
     // The baseline comes before the watch: a rewrite between the two then reads as a new
     // stamp in the check below instead of being adopted silently.
     const baseline = this.configFileStamp();
@@ -1563,7 +1572,8 @@ export class Config {
     // Without a watch, writeConfigFileTracked retries after this process's next save.
     if (this.configFileWatchers.length === 0) return;
     this.notifiedConfigFileStamp = baseline;
-    this.handleConfigFileEvent();
+    // Relink-aware: the link can also change between the realpath read and the root watch.
+    this.handleConfigFileEventWithRelink();
   }
 
   private startConfigFileWatchers(): void {
@@ -1572,10 +1582,12 @@ export class Config {
     // a symlinked config.json also needs its target's directory.
     const realFile = this.realConfigFilePath();
     this.watchedConfigFileTarget = realFile;
-    const targets = new Map([[this.rootDir, path.basename(this.configFile)]]);
-    targets.set(path.dirname(realFile), path.basename(realFile));
-    for (const [dir, fileName] of targets) {
-      const watcher = this.watchConfigDir(dir, fileName);
+    // Names per dir: a link to a sibling file shares the root dir with config.json itself.
+    const targets = new Map([[this.rootDir, new Set([path.basename(this.configFile)])]]);
+    const targetDir = path.dirname(realFile);
+    targets.set(targetDir, (targets.get(targetDir) ?? new Set()).add(path.basename(realFile)));
+    for (const [dir, fileNames] of targets) {
+      const watcher = this.watchConfigDir(dir, fileNames);
       if (watcher) this.configFileWatchers.push(watcher);
     }
   }
@@ -1598,12 +1610,12 @@ export class Config {
     }
   }
 
-  private watchConfigDir(dir: string, fileName: string): fs.FSWatcher | null {
+  private watchConfigDir(dir: string, fileNames: ReadonlySet<string>): fs.FSWatcher | null {
     let watcher: fs.FSWatcher;
     try {
       watcher = fs.watch(dir, { persistent: false }, (_event, filename) => {
         // Some platforms omit the filename; treat that as a possible config.json change.
-        if (filename != null && filename !== fileName) return;
+        if (filename != null && !fileNames.has(filename)) return;
         this.handleConfigFileEventWithRelink();
       });
     } catch (error) {
