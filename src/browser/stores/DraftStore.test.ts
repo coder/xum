@@ -34,8 +34,7 @@ import { DraftService } from "@/node/services/draftService";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only: the store runs against the real backend service
 import { TestTempDir } from "@/node/services/tools/testHelpers";
 import { installDom } from "../../../tests/ui/dom";
-import { getComposerDraftScope } from "@/browser/features/ChatInput/useComposerDraft";
-import { DraftStore, draftStoreScopeKey } from "./DraftStore";
+import { DraftStore } from "./DraftStore";
 
 // Older builds wrote these legacy keys; the key registry refuses them now, so seed them the way
 // an older build left them on disk.
@@ -80,6 +79,10 @@ function createClient(service: DraftService) {
     getGate: null as Promise<void> | null,
     subscribeGate: null as Promise<void> | null,
     updates: 0,
+    listPuts: 0,
+    failMoves: 0,
+    /** Held before the backend runs a move. */
+    moveGate: null as Promise<void> | null,
   };
   const drafts = {
     list: () => service.list(),
@@ -116,7 +119,16 @@ function createClient(service: DraftService) {
       }
       return service.importLegacy(input);
     },
+    moveCreation: async (input: Parameters<DraftService["moveCreation"]>[0]) => {
+      await control.moveGate;
+      if (control.failMoves > 0) {
+        control.failMoves--;
+        throw new Error("move failed");
+      }
+      return service.moveCreation(input);
+    },
     putListEntry: async (entry: Parameters<DraftService["putListEntry"]>[0]) => {
+      control.listPuts++;
       await control.listPutGates.shift();
       if (control.failListPuts > 0) {
         control.failListPuts--;
@@ -630,26 +642,6 @@ describe("DraftStore", () => {
     expect((await service.get({ kind: "workspace", workspaceId })).text).toBe("underscored");
   });
 
-  test("moves a draft only after the destination is saved", async () => {
-    using tempDir = new TestTempDir("draft-store-move");
-    const { projectPath, service, client, control } = await createHarness(tempDir);
-    const source: DraftScope = { kind: "creation", projectPath, draftId: "draft-a" };
-    await service.update({ scope: source, text: "moving" });
-    const store = createStore(client);
-    await store.whenReady();
-
-    control.failUpdates = 100;
-    await store.moveDraft(source, WS_SCOPE);
-    // A delete issued before the destination was saved would have landed by now.
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    expect((await service.get(source)).text).toBe("moving");
-
-    control.failUpdates = 0;
-    await store.moveDraft(source, WS_SCOPE);
-    expect((await service.get(WS_SCOPE)).text).toBe("moving");
-    expect((await service.get(source)).text).toBe("");
-  });
-
   test("applies a queued attachment update when the server empties the list meanwhile", async () => {
     using tempDir = new TestTempDir("draft-store-queued-empty");
     const { service, client, control } = await createHarness(tempDir);
@@ -889,68 +881,6 @@ describe("DraftStore", () => {
     expect(listPersistedKeys("input")).toEqual([]);
   });
 
-  test("keeps the source of a move that was edited while its payloads loaded", async () => {
-    using tempDir = new TestTempDir("draft-store-move-edit");
-    const { projectPath, service, client, control } = await createHarness(tempDir);
-    const source: DraftScope = { kind: "creation", projectPath, draftId: "draft-a" };
-    await service.update({ scope: source, text: "moving", attachments: [image] });
-    const store = createStore(client);
-    await store.whenReady();
-
-    let release: () => void = () => undefined;
-    control.getGate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const moved = store.moveDraft(source, WS_SCOPE);
-    store.setText(source, "moving, edited");
-    release();
-    await moved;
-
-    expect(store.getText(source)).toBe("moving, edited");
-    await store.flush(source);
-    expect((await service.get(source)).text).toBe("moving, edited");
-  });
-
-  // The project page opened without a draft id: its text survived a reload in localStorage before
-  // drafts moved to the backend. When the first listed draft is created it takes over the text
-  // and the attachments, even ones whose payloads have not loaded yet.
-  test("saves the default creation composer's draft and moves it, attachments included", async () => {
-    using tempDir = new TestTempDir("draft-store-default-creation");
-    const { projectPath, service, client } = await createHarness(tempDir);
-    const scope = getComposerDraftScope({
-      variant: "creation",
-      workspaceId: null,
-      creationProjectPath: projectPath,
-    });
-    const first = createStore(client);
-    await first.whenReady();
-    first.setText(scope, "typed before reload");
-    first.setAttachments(scope, [image]);
-    await first.flush(scope);
-    first.setClient(null);
-
-    // Reload: a new store hydrates from the backend.
-    const store = createStore(client);
-    await store.whenReady();
-    expect(store.getView(scope)).toMatchObject({
-      text: "typed before reload",
-      attachmentCount: 1,
-      payloadsLoaded: false,
-    });
-
-    const listed: DraftScope = { kind: "creation", projectPath, draftId: "first-listed" };
-    await store.moveDraft(scope, listed);
-    expect(await service.get(listed)).toMatchObject({
-      text: "typed before reload",
-      attachments: [image],
-    });
-    expect(
-      (await service.list()).some(
-        (draft) => draftStoreScopeKey(draft.scope) === draftStoreScopeKey(scope)
-      )
-    ).toBe(false);
-  });
-
   // #6438: a new backend (another process, its clock behind) numbers its revisions lower. The
   // store kept the old backend's saved view, and a write reply below that view's revision put
   // the old text back over what the user had just typed.
@@ -1165,21 +1095,203 @@ describe("DraftStore", () => {
     expect(store.getView(defaultScope).nameState?.manualName).toBe("default-name");
   });
 
-  test("moves the workspace name with the draft body", async () => {
-    using tempDir = new TestTempDir("draft-store-move-name");
-    const { projectPath, service, client } = await createHarness(tempDir);
+  test("moves the default draft in one step and shows the destination at once", async () => {
+    using tempDir = new TestTempDir("draft-store-move-creation");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
     const source: DraftScope = {
       kind: "creation",
       projectPath,
       draftId: DEFAULT_CREATION_DRAFT_ID,
     };
-    const listed: DraftScope = { kind: "creation", projectPath, draftId: "first-listed" };
+    await service.update({ scope: source, text: "typed before reload", attachments: [image] });
     await service.update({ scope: source, nameState: NAME_STATE });
+    // A reload: the source's attachment payloads have not loaded.
     const store = createStore(client);
     await store.whenReady();
+    const row = { projectPath, draftId: "first-listed", subProjectPath: null, createdAt: 5 };
+    const dest: DraftScope = { kind: "creation", projectPath, draftId: "first-listed" };
+    const updatesBefore = control.updates;
 
-    await store.moveDraft(source, listed);
-    expect((await service.get(listed)).nameState).toEqual(NAME_STATE);
-    expect((await service.get(source)).nameState).toBeUndefined();
+    const moved = store.moveCreationDraft(source, row);
+    expect(store.getView(dest)).toMatchObject({
+      text: "typed before reload",
+      attachmentCount: 1,
+      nameState: NAME_STATE,
+    });
+    expect(store.getCreationDraftsByProject()[projectPath]).toEqual([
+      { draftId: "first-listed", subProjectPath: null, createdAt: 5 },
+    ]);
+    expect(await moved).toBe(true);
+
+    expect(await service.get(dest)).toMatchObject({
+      text: "typed before reload",
+      attachments: [image],
+      nameState: NAME_STATE,
+    });
+    expect((await service.get(source)).text).toBe("");
+    expect((await service.getList()).entries).toEqual([row]);
+    // No separate body write or list put: the move did both.
+    expect(control.updates).toBe(updatesBefore);
+    expect(control.listPuts).toBe(0);
+  });
+
+  test("a destination's payload load before the move's reply waits for the move", async () => {
+    using tempDir = new TestTempDir("draft-store-move-payloads");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const source: DraftScope = { kind: "creation", projectPath, draftId: "src" };
+    await service.update({ scope: source, text: "with an image", attachments: [image] });
+    // A reload: the source's attachment payloads have not loaded.
+    const store = createStore(client);
+    await store.whenReady();
+    let release: () => void = () => undefined;
+    control.moveGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const dest: DraftScope = { kind: "creation", projectPath, draftId: "dst" };
+
+    const moved = store.moveCreationDraft(source, {
+      projectPath,
+      draftId: "dst",
+      subProjectPath: null,
+      createdAt: 1,
+    });
+    // The destination's composer loads its payloads while the backend has no destination yet.
+    const loaded = store.ensurePayloads(dest);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    release();
+    await moved;
+    await loaded;
+
+    expect(store.getView(dest)).toMatchObject({ attachmentCount: 1, payloadsLoaded: true });
+    expect(store.getAttachments(dest)).toEqual([image]);
+  });
+
+  test("holds a destination edit until the move's reply and saves it after", async () => {
+    using tempDir = new TestTempDir("draft-store-move-hold");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const source: DraftScope = { kind: "creation", projectPath, draftId: "src" };
+    await service.putListEntry({ projectPath, draftId: "src", subProjectPath: null, createdAt: 1 });
+    await service.update({ scope: source, text: "draft" });
+    const store = createStore(client);
+    await store.whenReady();
+    let release: () => void = () => undefined;
+    control.moveGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const row = { projectPath, draftId: "dst", subProjectPath: null, createdAt: 1 };
+    const dest: DraftScope = { kind: "creation", projectPath, draftId: "dst" };
+
+    const moved = store.moveCreationDraft(source, row);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    store.setText(dest, "draft, edited");
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    expect(control.updates).toBe(0);
+    // The source's row is hidden while the move runs.
+    expect(store.getCreationDraftsByProject()[projectPath]?.map(({ draftId }) => draftId)).toEqual([
+      "dst",
+    ]);
+    release();
+    await moved;
+    await store.flush(dest);
+
+    expect((await service.get(dest)).text).toBe("draft, edited");
+    expect(store.getView(dest).text).toBe("draft, edited");
+  });
+
+  test("moves another window's edit made during the move", async () => {
+    using tempDir = new TestTempDir("draft-store-move-changed");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const source: DraftScope = {
+      kind: "creation",
+      projectPath,
+      draftId: DEFAULT_CREATION_DRAFT_ID,
+    };
+    await service.update({ scope: source, text: "mine" });
+    const store = createStore(client);
+    await store.whenReady();
+    let release: () => void = () => undefined;
+    control.moveGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const dest: DraftScope = { kind: "creation", projectPath, draftId: "dst" };
+
+    const moved = store.moveCreationDraft(source, {
+      projectPath,
+      draftId: "dst",
+      subProjectPath: null,
+      createdAt: 1,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // Another window types into the source after this one flushed it.
+    await service.update({ scope: source, text: "mine and theirs" });
+    control.moveGate = null;
+    release();
+
+    expect(await moved).toBe(true);
+    expect((await service.get(dest)).text).toBe("mine and theirs");
+    expect(store.getView(dest).text).toBe("mine and theirs");
+    expect((await service.get(source)).text).toBe("");
+  });
+
+  test("a failed move keeps an edited destination as its own draft, and the source", async () => {
+    using tempDir = new TestTempDir("draft-store-move-fail-edited");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const source: DraftScope = { kind: "creation", projectPath, draftId: "src" };
+    await service.putListEntry({ projectPath, draftId: "src", subProjectPath: null, createdAt: 1 });
+    await service.update({ scope: source, text: "draft", nameState: NAME_STATE });
+    const store = createStore(client);
+    await store.whenReady();
+    let release: () => void = () => undefined;
+    control.moveGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    control.failMoves = 1;
+    const dest: DraftScope = { kind: "creation", projectPath, draftId: "dst" };
+
+    const moved = store.moveCreationDraft(source, {
+      projectPath,
+      draftId: "dst",
+      subProjectPath: null,
+      createdAt: 2,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    store.setText(dest, "draft, edited");
+    release();
+    expect(await moved).toBe(false);
+    await store.flush(dest);
+    await waitFor(async () => (await service.getList()).entries.length === 2);
+
+    expect(await service.get(dest)).toMatchObject({ text: "draft, edited", nameState: NAME_STATE });
+    expect((await service.get(source)).text).toBe("draft");
+    expect(store.getView(source).text).toBe("draft");
+  });
+
+  test("a failed move without edits drops the destination and shows the source again", async () => {
+    using tempDir = new TestTempDir("draft-store-move-fail");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const source: DraftScope = { kind: "creation", projectPath, draftId: "src" };
+    await service.putListEntry({ projectPath, draftId: "src", subProjectPath: null, createdAt: 1 });
+    await service.update({ scope: source, text: "draft" });
+    const store = createStore(client);
+    await store.whenReady();
+    control.failMoves = 1;
+    const dest: DraftScope = { kind: "creation", projectPath, draftId: "dst" };
+
+    expect(
+      await store.moveCreationDraft(source, {
+        projectPath,
+        draftId: "dst",
+        subProjectPath: null,
+        createdAt: 2,
+      })
+    ).toBe(false);
+
+    expect(store.getView(dest).text).toBe("");
+    expect(store.getView(source).text).toBe("draft");
+    expect(store.getCreationDraftsByProject()[projectPath]?.map(({ draftId }) => draftId)).toEqual([
+      "src",
+    ]);
+    expect((await service.get(source)).text).toBe("draft");
+    expect((await service.getList()).entries.map(({ draftId }) => draftId)).toEqual(["src"]);
   });
 });

@@ -3,6 +3,7 @@ import type {
   DraftBeginSendInput,
   DraftEvent,
   DraftListEntry,
+  DraftMoveCreationInput,
   DraftScope,
   DraftUpdateInput,
   DraftWriteOutput,
@@ -127,6 +128,31 @@ export function createMockDraftsApi() {
             : [...listEntries, entry]
         )
       );
+    },
+    // Stories have one window, so the source never changed: always "moved".
+    moveCreation: (input: DraftMoveCreationInput) => {
+      const source = drafts.get(draftScopeKey(input.source));
+      const dest = write({
+        scope: input.dest,
+        text: source?.text ?? "",
+        attachments: source?.attachments ?? [],
+        nameState: source?.nameState ?? null,
+      });
+      write({ scope: input.source, text: "", attachments: [], nameState: null });
+      const row: DraftListEntry = {
+        projectPath: input.dest.projectPath,
+        draftId: input.dest.draftId,
+        subProjectPath: input.subProjectPath,
+        createdAt: input.createdAt,
+      };
+      const { source: from } = input;
+      const { revision: listRevision } = setList([
+        ...listEntries.filter(
+          (entry) => entry.projectPath !== from.projectPath || entry.draftId !== from.draftId
+        ),
+        row,
+      ]);
+      return Promise.resolve({ result: "moved" as const, dest, listRevision });
     },
     importLegacyList: (input: { entries: DraftListEntry[] }) =>
       Promise.resolve(

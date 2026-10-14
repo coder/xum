@@ -474,6 +474,8 @@ describeIntegration("Draft workspace behavior", () => {
       getDraftStore().setNameState(defaultScope, NAME_STATE);
       await getDraftStore().flush(defaultScope);
 
+      const updates = jest.spyOn(env.services.draftService, "update");
+      const listPuts = jest.spyOn(env.services.draftService, "putListEntry");
       fireEvent.click(newSubProjectChat);
       const [draftId] = await waitForDraftCount(normalizedProjectPath, 1);
       const listedScope: DraftScope = {
@@ -493,9 +495,20 @@ describeIntegration("Draft workspace behavior", () => {
           const source = await env.orpc.drafts.get({ scope: defaultScope });
           expect(source.text).toBe("");
           expect(source.nameState).toBeUndefined();
+          const { entries } = await env.orpc.drafts.getList();
+          expect(entries.find((entry) => entry.draftId === draftId)?.subProjectPath).toBe(
+            subProjectPath
+          );
         },
         { timeout: 10_000 }
       );
+      // One backend step moved the body and listed the row: no write or put of its own.
+      const isListed = (scope: DraftScope) =>
+        scope.kind === "creation" && scope.draftId === draftId;
+      expect(updates.mock.calls.filter(([input]) => isListed(input.scope))).toEqual([]);
+      expect(listPuts.mock.calls.filter(([entry]) => entry.draftId === draftId)).toEqual([]);
+      updates.mockRestore();
+      listPuts.mockRestore();
     } finally {
       await Promise.all(createdScopes.map((scope) => getDraftStore().deleteDraft(scope)));
       if (subProjectPath !== null) await env.orpc.projects.remove({ projectPath: subProjectPath });

@@ -1688,17 +1688,15 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       // One-time migration: if the user has an old per-project pending draft, move it
       // into the first draft scope so it stays accessible.
       // The default creation composer's draft (no draft id) moves into the first listed one.
-      if (existingDrafts.length === 0) {
-        const defaultScope = defaultCreationDraftScope(projectPath);
-        if (!isDefaultCreationDraftEmpty(projectPath)) {
-          // Never rejects; the default draft is deleted only once the new one is saved. Its
-          // workspace name is in its body, so it moves too.
-          getDraftStore()
-            .moveDraft(defaultScope, { kind: "creation", projectPath, draftId })
-            .catch(() => undefined);
-        }
+      if (existingDrafts.length === 0 && !isDefaultCreationDraftEmpty(projectPath)) {
+        // One backend step moves the body (its workspace name included) and lists the row; the
+        // new draft shows the moved content at once.
+        getDraftStore()
+          .moveCreationDraft(defaultCreationDraftScope(projectPath), { projectPath, ...draft })
+          .catch((error: unknown) => console.warn("Failed to move the default draft:", error));
+      } else {
+        getDraftStore().putCreationDraft(projectPath, draft);
       }
-      getDraftStore().putCreationDraft(projectPath, draft);
 
       navigateToProject(projectPath, draftId, { replace: options?.replace });
     },
