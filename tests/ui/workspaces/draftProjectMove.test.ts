@@ -667,6 +667,9 @@ describeIntegration("Creation project selector moves the draft", () => {
       await moveDraftTo(container, path.basename(b));
 
       expect(await moveSpy.mock.results[0]?.value).toBe(false);
+      // The draft stayed in A, so A's draft opens again instead of B's empty page.
+      await waitFor(() => expect(projectSelectorLabel(container)).toBe(path.basename(a)), WAIT);
+      expect(textareaValue(container)).toBe("kept");
       expect(getWorkspaceDraftIds(a)).toEqual([sourceDraftId]);
       expect(getWorkspaceDraftIds(b)).toEqual([]);
       expect(getDraftStore().getView(creationScope(a, sourceDraftId)).nameState).toMatchObject({

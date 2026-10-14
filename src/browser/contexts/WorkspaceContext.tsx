@@ -311,27 +311,34 @@ function setListedDraftSubProject(
   });
 }
 
-/** Lists the moved draft (or, within its owning project, changes its sub-project) and moves it. */
-function applyWorkspaceDraftMove(move: WorkspaceDraftMove, dest: WorkspaceCreationScope) {
+/**
+ * Lists the moved draft (or, within its owning project, changes its sub-project) and moves it.
+ * `moved` settles with the backend move (null when the same draft stays).
+ */
+function applyWorkspaceDraftMove(
+  move: WorkspaceDraftMove,
+  dest: WorkspaceCreationScope
+): { draftId: string; moved: Promise<boolean> | null } {
   const listed = findListedDraft(move.projectPath, move.draftId);
   // A sub-project switch inside the owning project keeps the same draft: the composer is keyed
   // by the owner and draft, so it stays mounted with everything it shows.
   if (move.draftId != null && dest.projectPath === move.projectPath) {
     setListedDraftSubProject(move.projectPath, move.draftId, listed, dest.subProjectPath);
-    return move.draftId;
+    return { draftId: move.draftId, moved: null };
   }
 
   const draftId = createDraftId();
   // One backend step moves the body (its workspace name included) and lists the row; the
   // destination shows the moved content at once. A failed move keeps the source whole.
-  getDraftStore()
-    .moveCreationDraft(creationDraftScope(move.projectPath, move.draftId), {
+  const moved = getDraftStore().moveCreationDraft(
+    creationDraftScope(move.projectPath, move.draftId),
+    {
       projectPath: dest.projectPath,
       draftId,
       subProjectPath: dest.subProjectPath,
       createdAt: listed?.createdAt ?? Date.now(),
-    })
-    .catch((error: unknown) => console.warn("Failed to move the draft:", error));
+    }
+  );
   carryCreationAiSettings({
     sourceProjectPath: move.projectPath,
     destProjectPath: dest.projectPath,
@@ -343,7 +350,7 @@ function applyWorkspaceDraftMove(move: WorkspaceDraftMove, dest: WorkspaceCreati
     draftScopeId: getDraftScopeId(dest.projectPath, draftId),
     runtime: move.runtimePick,
   });
-  return draftId;
+  return { draftId, moved };
 }
 
 const WorkspaceActionsContext = createContext<
@@ -522,6 +529,9 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     pendingDraftId,
   } = useRouter();
   const location = useLocation();
+  // Read when a draft move settles: the route may have changed since it began.
+  const locationKeyRef = useRef(location.key);
+  locationKeyRef.current = location.key;
 
   const workspaceStore = useWorkspaceStoreRaw();
 
@@ -1896,8 +1906,20 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
       const dest = resolveWorkspaceCreationScope(move.destination, userProjects);
       // Read like the composer reads its route: a blank or invalid id edits the default draft.
       const source = { ...move, draftId: listedCreationDraftId(move.draftId) };
-      const draftId = applyWorkspaceDraftMove(source, dest);
+      const startKey = locationKeyRef.current;
+      const { draftId, moved } = applyWorkspaceDraftMove(source, dest);
       navigateToProject(dest.projectPath, draftId, { replace: true });
+      // A failed move leaves the draft in its project: reopen it there, unless the user went
+      // elsewhere meanwhile or edited the destination (which then stays a draft of its own).
+      moved
+        ?.then((ok) => {
+          if (ok || findListedDraft(dest.projectPath, draftId)) return;
+          // On the destination, or still on the source before that navigation rendered.
+          const stayed =
+            locationKeyRef.current === startKey || routedDraftIdRef.current === draftId;
+          if (stayed) navigateToProject(source.projectPath, source.draftId, { replace: true });
+        })
+        .catch((error: unknown) => console.warn("Failed to move the draft:", error));
     },
     [userProjects, navigateToProject]
   );
