@@ -165,67 +165,6 @@ function holdNameGeneration(orpc: OrpcClient) {
   };
 }
 
-/**
- * The app's API client, recording agents.list calls so a test can wait until every answer was
- * handled (as in holdNameGeneration, the caller's await runs before the test's). holdNext() holds
- * the next call until release(): a move lists the destination's agents before navigating, so the
- * next call after holdNext() and a move is the move's, not the destination composer's.
- */
-function trackAgentLists(orpc: OrpcClient) {
-  const calls: Promise<unknown>[] = [];
-  let hold: Promise<void> | null = null;
-  let release: () => void = () => undefined;
-  const agents = new Proxy(orpc.agents, {
-    get(target, key, receiver) {
-      if (key !== "list") return Reflect.get(target, key, receiver) as unknown;
-      return (...args: Parameters<typeof target.list>) => {
-        const gate = hold ?? Promise.resolve();
-        hold = null;
-        const call = gate.then(() => target.list(...args));
-        calls.push(call);
-        return call;
-      };
-    },
-  });
-  const client = new Proxy(orpc, {
-    get(target, key, receiver) {
-      return key === "agents" ? agents : (Reflect.get(target, key, receiver) as unknown);
-    },
-  });
-  return {
-    client,
-    holdNext: () => {
-      hold = new Promise<void>((resolve) => {
-        release = resolve;
-      });
-    },
-    release: () => release(),
-    /** Every call answered and handled (a macrotask runs after the callers' continuations). */
-    allHandled: async () => {
-      await Promise.allSettled(calls);
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    },
-  };
-}
-
-/**
- * Picks A's own agent in-both and starts moving A's draft to B, whose agent differs (exec), with
- * the move's agents.list request for B held until agentLists.release().
- */
-async function startHeldAgentMove(
-  container: HTMLElement,
-  agentLists: ReturnType<typeof trackAgentLists>,
-  a: string,
-  b: string
-): Promise<void> {
-  writeScopedAiDefault(getProjectScopeId(b), "agentId", "exec");
-  await pickAgent(container, a, "in-both");
-  agentLists.holdNext();
-  await pickOption(projectSelector(container)!, path.basename(b));
-  // The selector stays locked while the move waits.
-  await waitFor(() => expect(projectSelector(container)?.disabled).toBe(true), WAIT);
-}
-
 /** The app's API client, reporting an OpenAI key, which voice input needs to transcribe. */
 function withTranscription(orpc: OrpcClient): OrpcClient {
   const providers = new Proxy(orpc.providers, {
@@ -662,116 +601,41 @@ describeIntegration("Creation project selector moves the draft", () => {
     }
   }, 90_000);
 
-  test("a project's own agent moves only to a project that has it", async () => {
+  test("a project's own agent stays behind", async () => {
     const a = getSharedRepoPath();
-    const agentFiles = [
-      await writeAgent(a, "in-both"),
-      await writeAgent(projectB, "in-both"),
-      await writeAgent(a, "only-in-a"),
-    ];
-    const agentLists = trackAgentLists(getSharedEnv().orpc);
-    const { view, cleanupDom, b } = await openTwoProjects(agentLists.client);
+    // Even where the destination has an agent with the same id: it is another definition.
+    const agentFiles = [await writeAgent(a, "in-both"), await writeAgent(projectB, "in-both")];
+    const { view, cleanupDom, b } = await openTwoProjects();
     const { container } = view;
     try {
-      // B's composer was not opened: the move loads B's agents itself.
+      writeScopedAiDefault(getProjectScopeId(b), "agentId", "exec");
       await openProjectCreationView(view, a);
       await pickAgent(container, a, "in-both");
+
       await moveDraftTo(container, path.basename(b));
-      await waitFor(() => expect(readScopeAgentId(getProjectScopeId(b))).toBe("in-both"), WAIT);
 
+      expect(readScopeAgentId(getProjectScopeId(b))).toBe("exec");
+    } finally {
+      await cleanupView(view, cleanupDom);
+      await Promise.all(agentFiles.map((file) => fs.rm(file, { force: true })));
+    }
+  }, 90_000);
+
+  test("plan moves even from a project that defines its own plan agent", async () => {
+    const a = getSharedRepoPath();
+    // Every project has Plan and Exec: these move whatever their source definition.
+    const agentFiles = [await writeAgent(a, "plan")];
+    const { view, cleanupDom, b } = await openTwoProjects();
+    const { container } = view;
+    try {
+      writeScopedAiDefault(getProjectScopeId(b), "agentId", "exec");
       await openProjectCreationView(view, a);
-      await pickAgent(container, a, "only-in-a");
+      await pickAgent(container, a, "plan");
+
       await moveDraftTo(container, path.basename(b));
-      await agentLists.allHandled();
 
-      // B keeps its own agent: B's composer would show only-in-a while a send ran exec.
-      expect(readScopeAgentId(getProjectScopeId(b))).toBe("in-both");
+      expect(readScopeAgentId(getProjectScopeId(b))).toBe("plan");
     } finally {
-      await cleanupView(view, cleanupDom);
-      await Promise.all(agentFiles.map((file) => fs.rm(file, { force: true })));
-    }
-  }, 90_000);
-
-  test("the move opens the destination only once its agents loaded", async () => {
-    const a = getSharedRepoPath();
-    const agentFiles = [await writeAgent(a, "in-both"), await writeAgent(projectB, "in-both")];
-    const agentLists = trackAgentLists(getSharedEnv().orpc);
-    const { view, cleanupDom, b } = await openTwoProjects(agentLists.client);
-    const { container } = view;
-    try {
-      await openProjectCreationView(view, a);
-      await startHeldAgentMove(container, agentLists, a, b);
-
-      // B open before its agents arrived would show its own agent, and a send there would run it.
-      expect(projectSelectorLabel(container)).toBe(path.basename(a));
-      agentLists.release();
-      await waitFor(() => expect(projectSelectorLabel(container)).toBe(path.basename(b)), WAIT);
-      expect(readScopeAgentId(getProjectScopeId(b))).toBe("in-both");
-    } finally {
-      agentLists.release();
-      await cleanupView(view, cleanupDom);
-      await Promise.all(agentFiles.map((file) => fs.rm(file, { force: true })));
-    }
-  }, 90_000);
-
-  test("a send while the move waits for the agents keeps the draft in its project", async () => {
-    const a = getSharedRepoPath();
-    const agentFiles = [await writeAgent(a, "in-both"), await writeAgent(projectB, "in-both")];
-    // A send first waits for the workspace name, so a held name request keeps it in flight.
-    // Never released: the send must not go on to create a workspace.
-    const naming = holdNameGeneration(getSharedEnv().orpc);
-    const agentLists = trackAgentLists(naming.client);
-    const { view, cleanupDom, b } = await openTwoProjects(agentLists.client);
-    const { container } = view;
-    try {
-      await openProjectCreationView(view, a);
-      const draftId = await onlyDraftId(a);
-      getDraftStore().setText(creationScope(a, draftId), "send me");
-      await waitFor(() => expect(naming.calls()).toBeGreaterThan(0), WAIT);
-      await startHeldAgentMove(container, agentLists, a, b);
-      expect(runtimeSelector(container)?.hasAttribute("disabled")).toBe(false);
-
-      fireEvent.click(container.querySelector<HTMLElement>('button[aria-label="Send message"]')!);
-      // The creation controls lock once the send is in flight.
-      await waitFor(
-        () => expect(runtimeSelector(container)?.hasAttribute("disabled")).toBe(true),
-        WAIT
-      );
-      agentLists.release();
-      await agentLists.allHandled();
-
-      expect(projectSelectorLabel(container)).toBe(path.basename(a));
-      expect(getWorkspaceDraftIds(b)).toEqual([]);
-    } finally {
-      agentLists.release();
-      await cleanupView(view, cleanupDom);
-      await Promise.all(agentFiles.map((file) => fs.rm(file, { force: true })));
-    }
-  }, 90_000);
-
-  test("a move that waits for the agents stays put once the user left the draft", async () => {
-    const a = getSharedRepoPath();
-    const agentFiles = [await writeAgent(a, "in-both"), await writeAgent(projectB, "in-both")];
-    const agentLists = trackAgentLists(getSharedEnv().orpc);
-    const { view, cleanupDom, b } = await openTwoProjects(agentLists.client);
-    const { container } = view;
-    try {
-      await openProjectCreationView(view, a);
-      const draftId = await onlyDraftId(a);
-      getDraftStore().setText(creationScope(a, draftId), "left behind");
-      await startHeldAgentMove(container, agentLists, a, b);
-
-      // The user opens B's own new draft: the move must not open its copy in place of it.
-      await openProjectCreationView(view, b);
-      const ownDraftId = await onlyDraftId(b);
-      agentLists.release();
-      await agentLists.allHandled();
-
-      expect(textareaValue(container)).toBe("");
-      expect(getWorkspaceDraftIds(b)).toEqual([ownDraftId]);
-      expect(getWorkspaceDraftIds(a)).toEqual([draftId]);
-    } finally {
-      agentLists.release();
       await cleanupView(view, cleanupDom);
       await Promise.all(agentFiles.map((file) => fs.rm(file, { force: true })));
     }

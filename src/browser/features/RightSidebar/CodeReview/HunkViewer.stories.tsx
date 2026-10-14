@@ -104,7 +104,7 @@ function createStubWorkspaceContextValue(): WorkspaceContextValue {
     beginWorkspaceCreation: () => undefined,
     workspaceDraftsByProject: {},
     createWorkspaceDraft: () => undefined,
-    moveWorkspaceDraft: () => Promise.resolve(),
+    moveWorkspaceDraft: () => undefined,
     openWorkspaceDraft: () => undefined,
     deleteWorkspaceDraft: () => undefined,
     getWorkspaceInfo: () => Promise.resolve(null),
