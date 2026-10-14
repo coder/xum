@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef, type ReactNode, type RefObject } from "react";
 import { AppWindow } from "lucide-react";
 import { mcpServerDisplayName } from "@/common/utils/mcp/pluginServerKey";
 import { McpAppFrame } from "../ArtifactsTab/McpAppFrame";
@@ -7,6 +7,8 @@ import {
   appViewServerNames,
   markMcpAppViewHosted,
   openMcpAppViewTab,
+  setMcpAppViewMaximized,
+  useMcpAppViewMaximized,
   useMcpAppView,
   useMcpAppViewReloadKey,
   useMcpAppViews,
@@ -14,6 +16,10 @@ import {
 } from "../ArtifactsTab/mcpAppViewsStore";
 import { Notice } from "../ArtifactsTab/SourceText";
 import { withEntrypointScope } from "./mcpAppEntrypoints";
+import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
+import { KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
+import { refocusFallenFocus } from "@/browser/utils/ui/refocusFallenFocus";
+import { stopKeyboardPropagation } from "@/browser/utils/events";
 
 /**
  * Shown where a view would otherwise mount a second live instance (its tool card, a tab the
@@ -121,12 +127,107 @@ export function AppViewTabPanel(props: {
     );
   }
   return (
-    <McpAppFrame
-      // A new tool call is a new document, and so is a reload (reloadMcpAppView).
-      key={`${view.toolCallId}:${reloadKey}`}
-      workspaceId={props.workspaceId}
-      view={view}
-      onClose={props.onClose}
-    />
+    <MaximizablePanel workspaceId={props.workspaceId} toolCallId={view.toolCallId}>
+      {(maximized, setMaximized) => (
+        <McpAppFrame
+          // A new tool call is a new document, and so is a reload (reloadMcpAppView).
+          key={`${view.toolCallId}:${reloadKey}`}
+          workspaceId={props.workspaceId}
+          view={view}
+          onClose={props.onClose}
+          maximized={maximized}
+          onToggleMaximized={() => setMaximized(!maximized)}
+        />
+      )}
+    </MaximizablePanel>
   );
+}
+
+/**
+ * The app tab's box, pinned over the window while maximized (#6165). Pinned in place, not moved
+ * into a portal: a portal remounts the frame, which reloads the view and loses its state (the
+ * same reason as Artifacts fullscreen). Everything outside goes inert meanwhile, Escape on the
+ * panel restores it, and closing the tab restores it too.
+ */
+function MaximizablePanel(props: {
+  workspaceId: string;
+  toolCallId: string;
+  children: (maximized: boolean, setMaximized: (next: boolean) => void) => ReactNode;
+}) {
+  const { workspaceId, toolCallId } = props;
+  const maximized = useMcpAppViewMaximized(workspaceId, toolCallId);
+  const setMaximized = (next: boolean) => setMcpAppViewMaximized(workspaceId, toolCallId, next);
+  const panelRef = useRef<HTMLDivElement>(null);
+  usePinnedOverWindow(panelRef, maximized, () => setMaximized(false));
+  // A closed tab must not come back maximized.
+  useEffect(
+    () => () => setMcpAppViewMaximized(workspaceId, toolCallId, false),
+    [workspaceId, toolCallId]
+  );
+  return (
+    <div
+      ref={panelRef}
+      data-testid="app-view-tab-panel"
+      tabIndex={-1}
+      aria-label={maximized ? "Maximized app view" : undefined}
+      // The Artifacts fullscreen shortcut toggles it while focus is in the panel (outside the
+      // view's frame, which keeps its own keys); Escape restores it.
+      onKeyDown={(event) => {
+        if (matchesKeybind(event, KEYBINDS.TOGGLE_ARTIFACT_FULLSCREEN)) {
+          event.preventDefault();
+          setMaximized(!maximized);
+        } else if (maximized && event.key === "Escape") {
+          event.preventDefault();
+          // The panel is not editable, so without this Escape-to-interrupt would also fire.
+          stopKeyboardPropagation(event);
+          setMaximized(false);
+        }
+      }}
+      // z-[1500] matches the shared Dialog layer (and Artifacts fullscreen), so portaled menus
+      // and tooltips stay above it.
+      className={
+        maximized
+          ? "bg-background ios-standalone:top-px fixed inset-0 z-[1500] flex flex-col outline-none"
+          : "flex h-full min-h-0 flex-col outline-none"
+      }
+    >
+      {props.children(maximized, setMaximized)}
+    </div>
+  );
+}
+
+/**
+ * While `active`, the rest of the window is inert, focus that falls out with a removed node
+ * returns to the panel, and the panel leaves the window when it has no box any more (a hidden
+ * sidebar would otherwise leave the app inert behind nothing). Focus returns to the panel after.
+ */
+function usePinnedOverWindow(
+  panelRef: RefObject<HTMLDivElement | null>,
+  active: boolean,
+  onLostBox: () => void
+) {
+  const lostBox = useRef(onLostBox);
+  useEffect(() => {
+    lostBox.current = onLostBox;
+  });
+  useEffect(() => {
+    const panel = panelRef.current;
+    if (!active || panel == null) return;
+    const restore = makeOthersInert(panel);
+    panel.focus();
+    const stopRefocus = refocusFallenFocus(panel);
+    const sizeObserver =
+      typeof ResizeObserver === "function"
+        ? new ResizeObserver(() => {
+            if (panel.getClientRects().length === 0) lostBox.current();
+          })
+        : null;
+    sizeObserver?.observe(panel);
+    return () => {
+      sizeObserver?.disconnect();
+      stopRefocus();
+      restore();
+      if (panel.isConnected) panel.focus();
+    };
+  }, [panelRef, active]);
 }

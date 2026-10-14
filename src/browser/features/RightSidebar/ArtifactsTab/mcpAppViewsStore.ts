@@ -447,6 +447,33 @@ export function reloadMcpAppView(workspaceId: string, toolCallId: string): void 
   emit();
 }
 
+/**
+ * The app tab maximized over the window, per workspace (#6165: the spec's fullscreen display
+ * mode). At most one: maximizing another view restores the first. Session only.
+ */
+const maximizedViews = new Map<string, string>();
+
+/** Maximize the view's app tab over the window, or restore it. */
+export function setMcpAppViewMaximized(
+  workspaceId: string,
+  toolCallId: string,
+  maximized: boolean
+): void {
+  const current = maximizedViews.get(workspaceId) === toolCallId;
+  if (current === maximized) return;
+  if (maximized) maximizedViews.set(workspaceId, toolCallId);
+  else maximizedViews.delete(workspaceId);
+  emit();
+}
+
+export function isMcpAppViewMaximized(workspaceId: string, toolCallId: string): boolean {
+  return maximizedViews.get(workspaceId) === toolCallId;
+}
+
+export function useMcpAppViewMaximized(workspaceId: string, toolCallId: string): boolean {
+  return useSyncExternalStore(subscribe, () => isMcpAppViewMaximized(workspaceId, toolCallId));
+}
+
 /** The view's reload count: part of its frame's key. */
 export function useMcpAppViewReloadKey(workspaceId: string, toolCallId: string): number {
   return useSyncExternalStore(

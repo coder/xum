@@ -264,6 +264,74 @@ describe("AppViewTabPanel", () => {
     }
   });
 
+  // #6165: fullscreen display mode as the spec means it, over the whole window. The panel is
+  // pinned in place (no portal), so the view's frame never reloads.
+  test("Maximize pins the app tab over the window until Restore or Escape", async () => {
+    openMcpAppViewTab("ws-max", {
+      toolCallId: "call-max",
+      serverName: "dice",
+      resourceUri: "ui://dice/board.html",
+      toolName: "show",
+      label: "Board",
+      arguments: {},
+      cancelled: false,
+      failed: false,
+    });
+    const client = createTestApiClient({
+      mcpApps: {
+        getView: () =>
+          Promise.resolve({
+            success: true as const,
+            data: {
+              html: "<p>view</p>",
+              csp: {},
+              prefersBorder: null,
+              resultAvailable: true,
+              result: { content: [] },
+              invocation: null,
+            },
+          }),
+      },
+    });
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <div data-testid="outside">chat</div>
+        <APIProvider client={client}>
+          <AppViewTabPanel workspaceId="ws-max" toolCallId="call-max" onClose={() => undefined} />
+        </APIProvider>
+      </ThemeProvider>
+    );
+    const frame = await view.findByTestId("mcp-app-frame");
+    const panel = () => view.getByTestId("app-view-tab-panel");
+    fireEvent.click(view.getByRole("button", { name: "Maximize view" }));
+    expect(panel().className).toContain("fixed");
+    expect(view.getByTestId("outside").inert).toBe(true);
+    // The same frame, not a remounted one.
+    expect(view.getByTestId("mcp-app-frame")).toBe(frame);
+
+    fireEvent.click(view.getByRole("button", { name: "Restore view" }));
+    expect(panel().className).not.toContain("fixed");
+    expect(view.getByTestId("outside").inert).toBe(false);
+
+    // The keyboard path: the Artifacts fullscreen shortcut toggles it, Escape restores it.
+    fireEvent.keyDown(panel(), { key: "F", shiftKey: true });
+    expect(panel().className).toContain("fixed");
+    // Escape restores the panel only: it must not reach window handlers (Escape-to-interrupt).
+    let windowEscapes = 0;
+    const onWindowKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") windowEscapes++;
+    };
+    window.addEventListener("keydown", onWindowKey);
+    try {
+      fireEvent.keyDown(panel(), { key: "Escape" });
+    } finally {
+      window.removeEventListener("keydown", onWindowKey);
+    }
+    expect(panel().className).not.toContain("fixed");
+    expect(windowEscapes).toBe(0);
+    expect(view.getByTestId("mcp-app-frame")).toBe(frame);
+  });
+
   test("tabs of two plugin installs with one server name show their instance markers", () => {
     for (const [id, key] of [
       ["m1", "plugin:0123456789abcdef:tray"],

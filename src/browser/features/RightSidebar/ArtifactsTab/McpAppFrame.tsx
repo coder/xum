@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { X } from "lucide-react";
+import { Maximize2, Minimize2, X } from "lucide-react";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { cn } from "@/common/lib/utils";
 import { useAPI, useLiveAPI } from "@/browser/contexts/API";
@@ -128,7 +128,34 @@ function consentText(request: McpAppConsentRequest): [string, string, string] {
   }
 }
 
-function McpAppViewHeader(props: { serverName: string; onClose: () => void }) {
+/** Maximizes the app tab over the window, or restores it (#6165). None without a toggle. */
+function MaximizeViewButton(props: { maximized?: boolean; onToggle?: () => void }) {
+  if (props.onToggle == null) return null;
+  const maximized = props.maximized === true;
+  const label = maximized ? "Restore view" : "Maximize view";
+  const Icon = maximized ? Minimize2 : Maximize2;
+  return (
+    <TooltipIfPresent tooltip={label}>
+      <button
+        type="button"
+        aria-label={label}
+        aria-pressed={maximized}
+        onClick={props.onToggle}
+        className="text-muted hover:text-foreground focus-visible:ring-accent flex h-5 w-5 items-center justify-center rounded focus-visible:ring-1"
+      >
+        <Icon className="h-3.5 w-3.5" />
+      </button>
+    </TooltipIfPresent>
+  );
+}
+
+function McpAppViewHeader(props: {
+  serverName: string;
+  onClose: () => void;
+  /** Whether the tab is maximized over the window; undefined when the host offers no maximize. */
+  maximized?: boolean;
+  onToggleMaximized?: () => void;
+}) {
   return (
     <div className="border-border-light flex shrink-0 items-center gap-2 border-b px-3 py-1.5 text-[11px]">
       <span className="text-muted min-w-0 flex-1 truncate">
@@ -137,6 +164,7 @@ function McpAppViewHeader(props: { serverName: string; onClose: () => void }) {
           <span className="text-foreground">{mcpServerDisplayName(props.serverName)}</span>
         </TooltipIfPresent>
       </span>
+      <MaximizeViewButton maximized={props.maximized} onToggle={props.onToggleMaximized} />
       <TooltipIfPresent tooltip="Close view">
         <button
           type="button"
@@ -416,6 +444,9 @@ export function McpAppFrame(props: {
   variant?: McpAppFrameVariant;
   /** Panel only: closes the panel's host (its app tab). */
   onClose?: () => void;
+  /** Panel only: whether its tab is maximized over the window (#6165), and the toggle. */
+  maximized?: boolean;
+  onToggleMaximized?: () => void;
 }) {
   const inline = props.variant === "inline";
   const { api } = useAPI();
@@ -735,7 +766,12 @@ export function McpAppFrame(props: {
   };
 
   const header = inline ? null : (
-    <McpAppViewHeader serverName={serverName} onClose={() => void close()} />
+    <McpAppViewHeader
+      serverName={serverName}
+      onClose={() => void close()}
+      maximized={props.maximized}
+      onToggleMaximized={props.onToggleMaximized}
+    />
   );
 
   if (current == null) return <Notice>Loading…</Notice>;
