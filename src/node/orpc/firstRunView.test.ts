@@ -23,6 +23,8 @@ afterEach(async () => {
   dom = undefined;
 });
 
+// Element checks compare to null in a boolean: a failing expect on an element dumps megabytes.
+
 /** Runs the script on a served "/" (the module list, then the template), with fakes for its inputs. */
 function run(o: { url?: string; viewed?: boolean; token?: string; hidden?: boolean } = {}) {
   dom = new GlobalWindow({
@@ -130,7 +132,7 @@ describe("the early script", () => {
   ])("shows no view and loads the app at once when %s", async (_name, arrange) => {
     const page = run();
     await arrange(page);
-    expect(page.view()).toBeNull();
+    expect(page.view() === null).toBe(true);
     expect(page.apps()).toHaveLength(1);
   });
 
@@ -143,14 +145,14 @@ describe("the early script", () => {
     expect(page.calls).toHaveLength(0);
     expect(page.timers).toHaveLength(0);
     expect(page.apps()).toHaveLength(1);
-    expect(page.view()).toBeNull();
+    expect(page.view() === null).toBe(true);
   });
 
   // Catches a missing visibilitychange listener: a hidden tab runs no frames, so the app never loads.
   test("loads the app at once when the tab turns hidden while the view waits for its frames", async () => {
     const page = run();
     await page.answer([], {});
-    expect(page.view()).not.toBeNull();
+    expect(page.view() === null).toBe(false);
     page.hide();
     expect(page.apps()).toHaveLength(1);
     page.flushFrames();
@@ -164,7 +166,21 @@ describe("the early script", () => {
     page.flushFrames();
     page.flushFrames();
     page.apps()[0].dispatchEvent(new dom!.Event("error"));
-    expect(page.view()).toBeNull();
+    expect(page.view() === null).toBe(true);
+  });
+
+  // Catches an insert that does not wait for the parser: in the <head>, the <template> comes later.
+  test("waits for DOMContentLoaded when the POSTs answer before the template is parsed", async () => {
+    const page = run();
+    const doc = dom!.document;
+    const template = doc.getElementById(FIRST_RUN_TEMPLATE_ID)!;
+    template.remove();
+    Object.defineProperty(doc, "readyState", { get: () => "loading", configurable: true });
+    await page.answer([], {});
+    expect([page.view() === null, page.apps().length]).toEqual([true, 0]);
+    doc.body.append(template);
+    doc.dispatchEvent(new dom!.Event("DOMContentLoaded"));
+    expect(page.view() === null).toBe(false);
   });
 
   // Catches a script that runs on a slashless URL, which the redirect script navigates away from.

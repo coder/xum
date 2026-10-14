@@ -1,4 +1,5 @@
 import { FIRST_RUN_VIEW_ID } from "@/common/constants/firstRunView";
+import { AUTH_TOKEN_KEY, ONBOARDING_VIEWED_KEY } from "@/common/constants/storage";
 
 /**
  * The static first-run view (T3 #5971, Option C step 2, plan section 5.6): a copy of the onboarding
@@ -93,3 +94,86 @@ export const FIRST_RUN_VIEW_HTML = `<div id="${FIRST_RUN_VIEW_ID}" inert style="
     <button type="button" class="text-muted hover:text-foreground absolute top-4 right-4 rounded-sm transition-colors focus:outline-none disabled:pointer-events-none"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewbox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-x h-4 w-4" aria-hidden="true"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg><span class="sr-only">Close</span></button>
   </div>
 </div>`;
+
+/** The <template> that holds FIRST_RUN_VIEW_HTML on the served "/" (PR 4b). */
+export const FIRST_RUN_TEMPLATE_ID = "xum-pre-template";
+
+/**
+ * The app's module script and modulepreloads, as the JSON list the early script loads them from:
+ * `{"script": href, "preload": [href, ...]}`. scripts/perf/firstLoadJs.ts counts the same list
+ * (its FIRST_RUN_MODULES_ID; PR 4b moves this id to src/common/constants/firstRunView.ts).
+ */
+const FIRST_RUN_MODULES_ID = "xum-pre-modules";
+
+/**
+ * The early script (plan section 5.6): JavaScript for an inline <script> on the served "/", after
+ * the slashless redirect, the <base> tag and the module list (PR 4b injects all four). It decides
+ * whether the wizard will open on its gateway step, and only then shows the static view:
+ * 1. The paint-cache key is set (this browser saw the wizard viewed) or the tab is hidden (no frames
+ *    there): load the app at once, with no API call and no view.
+ * 2. Otherwise POST the viewed splash list and the provider config together, with the URL's or the
+ *    stored token. A failure, a 401 (the app then shows its token prompt) or no answer within
+ *    1,000 ms (one abort timer: the deadline of a network call, the script's only timer) loads the
+ *    app with no view, as today.
+ * 3. Show the view when the wizard is not viewed, no provider is configured and no gateway coupon is
+ *    set (OnboardingWizardSplash then opens on the gateway step). Load the app two frames later,
+ *    after the frame that paints the view, or at once when the tab turns hidden.
+ * The app's module script removes the view if it fails to load. The app removes it otherwise.
+ * It holds no request or user data, and inserts the view from a template clone, never as HTML.
+ */
+export const FIRST_RUN_EARLY_SCRIPT = `(() => {
+  const path = location.pathname;
+  if (!path.startsWith("//") && !path.endsWith("/")) return; // the redirect navigates away
+  let loaded = false;
+  const loadApp = () => {
+    if (loaded) return;
+    loaded = true;
+    const list = JSON.parse(document.getElementById(${JSON.stringify(FIRST_RUN_MODULES_ID)}).textContent);
+    for (const href of list.preload) {
+      const link = document.createElement("link");
+      Object.assign(link, { rel: "modulepreload", crossOrigin: "", href });
+      document.head.appendChild(link);
+    }
+    const script = document.createElement("script");
+    Object.assign(script, { type: "module", crossOrigin: "", src: list.script });
+    script.addEventListener("error", () => document.getElementById(${JSON.stringify(FIRST_RUN_VIEW_ID)})?.remove());
+    document.head.appendChild(script);
+  };
+  const read = (key) => {
+    try {
+      return localStorage.getItem(key);
+    } catch {
+      return null;
+    }
+  };
+  if (read(${JSON.stringify(ONBOARDING_VIEWED_KEY)}) === "true" || document.visibilityState === "hidden") return loadApp();
+  document.addEventListener("visibilitychange", () => document.visibilityState === "hidden" && loadApp());
+  const token = new URLSearchParams(location.search).get("token") || read(${JSON.stringify(AUTH_TOKEN_KEY)});
+  const headers = token ? { Authorization: "Bearer " + token } : {};
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), 1000);
+  const post = (route) =>
+    fetch(new URL("api/" + route, document.baseURI), { method: "POST", headers, signal: abort.signal }).then((r) => {
+      if (!r.ok) throw new Error(String(r.status));
+      return r.json();
+    });
+  Promise.all([post("splashScreens/getViewedSplashScreens"), post("providers/getConfig")])
+    .then(([viewed, config]) => {
+      clearTimeout(timer);
+      const providers = Object.values(config ?? {});
+      const show =
+        Array.isArray(viewed) &&
+        !viewed.includes("onboarding-wizard-v1") && // ONBOARDING_WIZARD_SPLASH_ID
+        !providers.some((p) => p?.isConfigured === true) &&
+        config?.["mux-gateway"]?.couponCodeSet !== true;
+      const insert = () => {
+        const template = document.getElementById(${JSON.stringify(FIRST_RUN_TEMPLATE_ID)});
+        if (!show || loaded || !template) return loadApp();
+        document.body.appendChild(template.content.cloneNode(true));
+        requestAnimationFrame(() => requestAnimationFrame(loadApp));
+      };
+      if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", insert);
+      else insert();
+    })
+    .catch(loadApp);
+})();`;
