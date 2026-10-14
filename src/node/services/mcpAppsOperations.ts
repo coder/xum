@@ -246,7 +246,7 @@ export async function listMcpAppEntrypoints(
 ): Promise<McpAppEntrypoint[]> {
   assertMcpAppsEnabled(context);
   await warmServers(workspaceId, signal);
-  return context.mcpServerManager.listMcpAppEntrypoints(workspaceId);
+  return context.mcpServerManager.listMcpAppEntrypoints(workspaceId, signal);
 }
 
 /** Open an entry point (see MCPServerManager.openMcpAppEntrypoint); warms servers like getView. */

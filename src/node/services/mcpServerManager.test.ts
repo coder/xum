@@ -4,11 +4,15 @@ import {
   beforeEach,
   describe,
   expect,
+  jest,
   mock,
   setSystemTime,
   spyOn,
   test,
 } from "bun:test";
+
+// bun-types lags the pinned runtime (bun@1.4.3), which implements advanceTimersByTime.
+const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
 import { createServer } from "http";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -28,6 +32,7 @@ import { createTestPluginInstallEntry } from "./agentPlugins/testFixtures";
 import type { MCPServerInfo } from "@/common/types/mcp";
 import * as mcpSdk from "@/node/services/mcpClient";
 import {
+  MCP_APP_CATALOG_REFRESH_TIMEOUT_MS,
   MCPServerManager,
   effectiveToolAllowlist,
   flattenMcpPrompt,
@@ -1528,6 +1533,120 @@ describe("MCPServerManager", () => {
     expect(
       (await manager.listMcpAppEntrypoints(request.workspaceId)).map((entry) => entry.toolName)
     ).toEqual(["board", "tray"]);
+  });
+
+  test("a stalled tools/list refresh does not hold back listing or opening entry points", async () => {
+    using tmp = new DisposableTempDir("mcp-apps-entry-stall");
+    manager.setMcpApps({
+      isEnabled: () => true,
+      store: new McpAppResultStore((id) => path.join(tmp.path, id)),
+    });
+    configService.listServers.mockResolvedValue({ apps: stdioConfig("apps-entry-stall") });
+    const board = {
+      toolName: "board",
+      title: "Board",
+      resourceUri: "ui://x/view",
+      types: ["global"],
+    };
+    let listings = 0;
+    let calls = 0;
+    servers.serve("apps-entry-stall", {
+      era: "modern",
+      // The startup listing answers; every refresh after it never does.
+      listTools: () =>
+        listings++ === 0
+          ? Promise.resolve({ show: testTool() })
+          : new Promise<never>(() => undefined),
+      apps: {
+        hasTool: () => true,
+        toolUi: () => undefined,
+        appEntrypoints: () => [{ ...board, types: ["global" as const] }],
+        callToolForApp: () => {
+          calls++;
+          return Promise.resolve({ content: [] });
+        },
+      },
+    });
+    const request = workspaceRequest("apps-entry-stall");
+    await manager.getToolsForWorkspace(request);
+    const flush = async () => {
+      for (let turn = 0; turn < 20; turn++) await new Promise((resolve) => setImmediate(resolve));
+    };
+    const startedAt = Date.now();
+    fakeTimers.useFakeTimers();
+    setSystemTime(new Date(startedAt));
+    try {
+      // The route's signal ends the wait at once (no timer fires): the held snapshot is listed.
+      const aborted = new AbortController();
+      const seen: { listed: string[] | null } = { listed: null };
+      void manager.listMcpAppEntrypoints(request.workspaceId, aborted.signal).then((list) => {
+        seen.listed = list.map((entry) => entry.toolName);
+      });
+      await flush();
+      expect(seen.listed).toBeNull();
+      aborted.abort();
+      await flush();
+      expect(seen.listed).toEqual(["board"]);
+      // Without a signal, the refresh timeout ends it.
+      const timed = manager.listMcpAppEntrypoints(request.workspaceId);
+      const opened = manager.openMcpAppEntrypoint(request.workspaceId, "apps", "board", "global");
+      await flush();
+      fakeTimers.advanceTimersByTime(MCP_APP_CATALOG_REFRESH_TIMEOUT_MS);
+      expect((await timed).map((entry) => entry.toolName)).toEqual(["board"]);
+      expect((await opened).toolName).toBe("board");
+    } finally {
+      const now = Date.now();
+      fakeTimers.useRealTimers();
+      setSystemTime(new Date(now));
+    }
+    expect(calls).toBe(1);
+  });
+
+  test("opening an entry point the refreshed catalog no longer has is refused", async () => {
+    using tmp = new DisposableTempDir("mcp-apps-entry-gone");
+    manager.setMcpApps({
+      isEnabled: () => true,
+      store: new McpAppResultStore((id) => path.join(tmp.path, id)),
+    });
+    configService.listServers.mockResolvedValue({ apps: stdioConfig("apps-entry-gone") });
+    const board = {
+      toolName: "board",
+      title: "Board",
+      resourceUri: "ui://x/view",
+      types: ["global"],
+    };
+    // Like the real client: appEntrypoints() reflects the latest tools/list.
+    let served = [board];
+    let listed: typeof served = [];
+    let calls = 0;
+    servers.serve("apps-entry-gone", {
+      era: "modern",
+      listTools: () => {
+        listed = served;
+        return Promise.resolve({ show: testTool() });
+      },
+      apps: {
+        hasTool: () => true,
+        toolUi: () => undefined,
+        appEntrypoints: () => listed.map((tool) => ({ ...tool, types: ["global" as const] })),
+        callToolForApp: () => {
+          calls++;
+          return Promise.resolve({ content: [] });
+        },
+      },
+    });
+    const request = workspaceRequest("apps-entry-gone");
+    await manager.getToolsForWorkspace(request);
+    // tools/list_changed: the server dropped the tool; no send or listing ran since.
+    served = [];
+    const refused = await manager
+      .openMcpAppEntrypoint(request.workspaceId, "apps", "board", "global")
+      .then(
+        () => null,
+        (error: unknown) => error
+      );
+    expect(refused).toBeInstanceOf(Error);
+    expect(calls).toBe(0);
   });
 
   test("idle cleanup retries retired-only failures without another MCP request", async () => {

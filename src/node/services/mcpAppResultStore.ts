@@ -132,8 +132,7 @@ export class McpAppResultStore {
         if (Buffer.byteLength(serialized, "utf8") > MCP_APP_RESULT_MAX_BYTES) return;
       }
       const dir = this.dirFor(workspaceId);
-      await ensurePrivateDir(dir);
-      await writeFileAtomic(path.join(dir, fileNameFor(record.toolCallId)), serialized);
+      if (!(await this.writeRecord(workspaceId, dir, record.toolCallId, serialized))) return;
       // Publish to memory only once the record is durable: a failed write must not leave a
       // record that opens now but vanishes on restart. Before prune, so a prune failure does
       // not hide a record that is already on disk.
@@ -142,6 +141,27 @@ export class McpAppResultStore {
     } catch (error) {
       log.debug("[MCP Apps] Failed to record tool result", { workspaceId, error });
     }
+  }
+
+  /**
+   * A tool call can settle after its workspace was removed (a model call, an entry point open).
+   * Like setModelContext: under the session dir's target lock, which removal holds while it
+   * publishes its tombstone and deletes the dir, a removed workspace's result is discarded
+   * (false) instead of recreating its session dir.
+   */
+  private writeRecord(
+    workspaceId: string,
+    dir: string,
+    toolCallId: string,
+    serialized: string
+  ): Promise<boolean> {
+    return withTargetMutationLock(this.rootDir, path.dirname(dir), async () => {
+      if (this.rootDir !== null && (await isWorkspaceRemovalTombstoned(this.rootDir, workspaceId)))
+        return false;
+      await ensurePrivateDir(dir);
+      await writeFileAtomic(path.join(dir, fileNameFor(toolCallId)), serialized);
+      return true;
+    });
   }
 
   async get(workspaceId: string, toolCallId: string): Promise<McpAppResultRecord | null> {

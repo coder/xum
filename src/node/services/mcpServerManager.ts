@@ -591,6 +591,13 @@ const PENDING_REPAIR_WAIT_MS = 10_000;
  * gate as a whole — not each helper — is bounded.
  */
 const CALL_GATE_TIMEOUT_MS = 30_000;
+
+/**
+ * How long listing or opening MCP App entry points waits for a server's tools/list refresh
+ * (tools/list_changed) before it uses the catalog it holds: one stalled server must not hold
+ * back the launcher. A fresh list answers from the SDK's response cache at once.
+ */
+export const MCP_APP_CATALOG_REFRESH_TIMEOUT_MS = 2_000;
 /** Iterations a served tool call spends waiting for override state to settle before failing closed. */
 const CALL_GATE_MAX_ATTEMPTS = 5;
 
@@ -5156,14 +5163,12 @@ export class MCPServerManager {
    * MCP App entry points of the workspace's enabled, connected servers. The tool allowlist
    * applies (opening one calls the tool); `_meta.ui.visibility` does not (spec).
    */
-  async listMcpAppEntrypoints(workspaceId: string): Promise<McpAppEntrypoint[]> {
+  async listMcpAppEntrypoints(
+    workspaceId: string,
+    signal?: AbortSignal
+  ): Promise<McpAppEntrypoint[]> {
     if (this.mcpApps?.isEnabled() !== true) return [];
-    // The send path refreshes tool catalogs in the background, so after tools/list_changed the
-    // held catalog is stale until the next send. Wait for a refresh here: through the SDK's
-    // response cache a still-fresh list costs no round trip.
-    await Promise.all(
-      this.appInstances(workspaceId).map(({ instance }) => this.refreshInstanceTools(instance))
-    );
+    await this.refreshAppCatalogs(this.appInstances(workspaceId), signal);
     // Read again: the servers can stop or restart while the refresh runs.
     return this.appInstances(workspaceId).flatMap(({ serverName, apps }) => {
       const allowlist = this.appToolAllowlist(workspaceId, serverName);
@@ -5183,6 +5188,26 @@ export class MCPServerManager {
           }))
         );
     });
+  }
+
+  /**
+   * The send path refreshes tool catalogs in the background, so after tools/list_changed the
+   * held catalog is stale until the next send. Wait for a refresh, bounded per server by the
+   * signal and MCP_APP_CATALOG_REFRESH_TIMEOUT_MS: a server that has not answered by then keeps
+   * the catalog it holds. Through the SDK's response cache a still-fresh list costs no round trip.
+   */
+  private async refreshAppCatalogs(
+    instances: ReadonlyArray<{ instance: MCPServerInstance }>,
+    signal: AbortSignal | undefined
+  ): Promise<void> {
+    await Promise.all(
+      instances.map(({ instance }) =>
+        raceWithAbortAndTimeout(this.refreshInstanceTools(instance), {
+          ...(signal !== undefined ? { signal } : {}),
+          timeoutMs: MCP_APP_CATALOG_REFRESH_TIMEOUT_MS,
+        })
+      )
+    );
   }
 
   /** The workspace's enabled, open instances with an MCP Apps connection. */
@@ -5215,6 +5240,12 @@ export class MCPServerManager {
   ): Promise<McpAppEntrypoint> {
     assert(this.mcpApps, "MCP Apps support is not configured");
     const store = this.mcpApps.store;
+    // The dispatch below reads the server's catalog: refresh it first, so an entry point that
+    // tools/list_changed removed is refused. A cold server lists its tools as it starts.
+    await this.refreshAppCatalogs(
+      this.appInstances(workspaceId).filter((app) => app.serverName === serverName),
+      options?.signal
+    );
     // One-shot dispatch, as in callMcpAppTool: an epoch retry must not call the tool twice.
     let dispatched: Promise<McpAppEntrypoint> | null = null;
     return this.invokeServerOperation(

@@ -40,6 +40,17 @@ describe("mcpAppEntrypointKey", () => {
       mcpAppEntrypointKey("a", "b", "thread")
     );
   });
+
+  test("encodes any string, including lone surrogates, without throwing or colliding", () => {
+    const lone = "\uD800";
+    const keys = [
+      mcpAppEntrypointKey(`srv${lone}`, "tool", "global"),
+      mcpAppEntrypointKey("srv", `tool${lone}`, "global"),
+      mcpAppEntrypointKey("srv", `tool${"\uDC00"}`, "global"),
+      mcpAppEntrypointKey("srv%", "tool", "global"),
+    ];
+    expect(new Set(keys).size).toBe(keys.length);
+  });
 });
 
 describe("parseMCPToolUiMeta", () => {
