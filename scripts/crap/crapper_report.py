@@ -309,13 +309,14 @@ def inlined_literal(node):
     return None
 
 
-def runs_whenever_called(body, target) -> bool:
+def runs_whenever_called(body, target, literal_lines) -> bool:
     """Whether nothing in `body` before the declarator `target` can skip it: no return, throw or call.
 
     Every earlier statement, and every earlier declarator of target's own
     statement (`const x = mayThrow(), K = 2`), must declare a plain name (a
-    destructuring pattern can throw) with a literal value (inlined_literal) or
-    none, so the target runs whenever the function does.
+    destructuring pattern can throw) with a value that `literal_lines` resolves
+    (a literal, or an alias of an accepted literal const) or none, so the
+    target runs whenever the function does.
     """
 
     for statement in body.named_children:
@@ -334,7 +335,7 @@ def runs_whenever_called(body, target) -> bool:
             value = declarator.child_by_field_name("value")
             if name is None or name.type != "identifier":
                 return False
-            if value is not None and inlined_literal(value) is None:
+            if value is not None and not literal_lines(value):
                 return False
     return True
 
@@ -353,6 +354,19 @@ def literal_const_scopes(root) -> dict[str, list[tuple[int, object]]]:
     """
 
     consts: dict[str, list[tuple[int, object]]] = {}
+
+    def literal_lines(value) -> list[int]:
+        literal = inlined_literal(value)
+        if literal is not None:
+            return [literal.start_point[0] + 1]
+        if value.type != "identifier":
+            return []
+        return [
+            line
+            for line, target in consts.get(value.text.decode("utf-8"), [])
+            if target.start_byte <= value.start_byte < target.end_byte
+        ]
+
     # descendants() walks in source order, so an alias sees its target.
     for node in descendants(root):
         if node.type != "lexical_declaration" or node.child_count == 0 or node.children[0].type != "const":
@@ -370,20 +384,9 @@ def literal_const_scopes(root) -> dict[str, list[tuple[int, object]]]:
             value = declarator.child_by_field_name("value")
             if name is None or value is None or name.type != "identifier":
                 continue
-            if is_function_body and not runs_whenever_called(scope, declarator):
+            if is_function_body and not runs_whenever_called(scope, declarator, literal_lines):
                 continue
-            literal = inlined_literal(value)
-            if literal is not None:
-                lines = [literal.start_point[0] + 1]
-            elif value.type == "identifier":
-                lines = [
-                    line
-                    for line, target in consts.get(value.text.decode("utf-8"), [])
-                    if target.start_byte <= value.start_byte < target.end_byte
-                ]
-            else:
-                lines = []
-            for line in lines:
+            for line in literal_lines(value):
                 consts.setdefault(name.text.decode("utf-8"), []).append((line, scope))
     return consts
 

@@ -564,6 +564,9 @@ export function outer(items: number[]): number {
     # A literal earlier declarator cannot skip it.
     literal_first = source.replace("check(items)", "1")
     assert suspects(capsys, tmp_path, literal_first, report)["outer"][1] is True
+    # Neither can an alias of an earlier literal const.
+    alias_first = source.replace("const first = check(items),", "const raw = 1, first = raw,")
+    assert suspects(capsys, tmp_path, alias_first, report)["outer"][1] is True
 
 def test_javascript_sources_flag_too(tmp_path, capsys):
     # Bun 1.4.3 zeroes a .js module the same way (lines 2-9 at 0).
