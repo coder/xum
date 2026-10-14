@@ -246,6 +246,8 @@
   --color-accent-dark: hsl(207 90% 38%);
   --color-accent-darker: hsl(204 92% 30%);
   --color-accent-light: hsl(198 100% 70%);
+  /* Unchanged in light themes: the accent already serves as text here (#5946). */
+  --color-accent-text: var(--color-accent);
   --color-accent-foreground: hsl(0 0% 100%); /* preserve contrast on blue buttons in light mode */
 
   --color-success: hsl(122 39% 45%);
@@ -501,6 +503,8 @@
   --color-accent-dark: color-mix(in srgb, var(--color-accent), black 14%);
   --color-accent-darker: color-mix(in srgb, var(--color-accent), black 24%);
   --color-accent-light: color-mix(in srgb, var(--color-accent), white 42%);
+  /* Unchanged in light themes: the accent already serves as text here (#5946). */
+  --color-accent-text: var(--color-accent);
   --color-accent-foreground: #fffcf0; /* high-contrast text on accent buttons */
 
   --color-success: #66800b;
@@ -747,6 +751,9 @@
   --color-accent-button-hover: color-mix(in srgb, var(--color-accent), white 12%);
   --color-accent-darker: color-mix(in srgb, var(--color-accent), black 28%);
   --color-accent-light: color-mix(in srgb, var(--color-accent), white 22%);
+  /* Flexoki blue-300: WCAG AA (4.5:1) on every flexoki-dark surface, down to hover #282726
+     (5.27:1); blue-400 was 3.79:1 there (#5946). */
+  --color-accent-text: #66a0c8;
   --color-accent-foreground: #100f0f; /* maintain WCAG contrast against lighter Flexoki dark accent */
 
   --color-success: #879a39;

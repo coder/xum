@@ -2215,7 +2215,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     if (!isSameEdit()) return;
                     startEditTranscriptRefresh(editMessageId, precondition);
                   }}
-                  className="text-muted hover:text-accent cursor-pointer border-0 bg-transparent p-0 text-[10px] underline transition-colors"
+                  className="text-muted hover:text-accent-text cursor-pointer border-0 bg-transparent p-0 text-[10px] underline transition-colors"
                 >
                   {EDIT_RETRY_REFRESH_LABEL}
                 </button>

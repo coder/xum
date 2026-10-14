@@ -862,7 +862,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
                   href="https://mux.coder.com/config/notifications"
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-accent hover:underline"
+                  className="text-accent-text hover:underline"
                 >
                   Learn more
                 </a>
