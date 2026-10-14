@@ -1021,6 +1021,13 @@ async function runPluginAction(
   }
 }
 
+/** What the section shows after a review confirm: its error, or the saved review's cleanup warning. */
+function confirmMessage(
+  result: { success: true; data: { cleanupWarning?: string } } | { success: false; error: string }
+): string | undefined {
+  return result.success ? result.data.cleanupWarning : result.error;
+}
+
 function useComponentReview(deps: ComponentReviewDeps) {
   const [review, setReview] = useState<AgentPluginUpdateReview | null>(null);
   const open = (name: string) =>
@@ -1047,7 +1054,7 @@ function useComponentReview(deps: ComponentReviewDeps) {
       }
       // Refresh first: its success path clears the error state.
       await deps.refresh();
-      const message = result.success ? result.data.cleanupWarning : result.error;
+      const message = confirmMessage(result);
       if (message !== undefined) deps.setError(message);
     });
   /** A palette "Review Plugin Components" intent, also one that arrived before the section mounted. */
