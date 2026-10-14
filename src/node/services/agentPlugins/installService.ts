@@ -44,7 +44,10 @@ import {
   resolveSkillWhenToUse,
 } from "@/common/orpc/schemas/agentSkill";
 import { resolveSkillPaths } from "@/common/utils/skills/skillPaths";
-import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
+import {
+  parseSkillMarkdown,
+  skillConsentFrontmatter,
+} from "@/node/services/agentSkills/parseSkillMarkdown";
 import { log } from "@/node/services/log";
 import type { MCPServerInfo, MCPServerOAuthConfig } from "@/common/types/mcp";
 import type { McpOauthService } from "@/node/services/mcpOauthService";
@@ -2277,7 +2280,7 @@ export class AgentPluginInstallService {
           name: parsed.frontmatter.name,
           ...skillConsentFields({
             relativeDir: path.relative(pluginRoot, path.join(skillsDir, dirName)),
-            frontmatter: parsed.frontmatter,
+            frontmatter: skillConsentFrontmatter(parsed),
           }),
           ...(parsed.frontmatter.description !== undefined
             ? { description: parsed.frontmatter.description }

@@ -1668,6 +1668,40 @@ describe("agentSkillsService agent plugins", () => {
     });
   });
 
+  // The display name replaces `name` in the parsed frontmatter, so the consent fingerprint must
+  // cover it separately, or an update could change user-visible text without a review.
+  test("a managed plugin skill with a display name needs a new review when the display name changes", async () => {
+    using tmp = new DisposableTempDir("plugin-skill-consent-display-name");
+    const container = path.join(tmp.path, "plugins");
+    const managedDir = await writePlugin(container, "pstack", []);
+    const skillFile = path.join(managedDir, "skills", "poteto-mode", "SKILL.md");
+    const writeName = async (name: string) => {
+      await fs.mkdir(path.dirname(skillFile), { recursive: true });
+      await fs.writeFile(skillFile, `---\nname: ${name}\ndescription: router\n---\nBody\n`);
+    };
+    await writeName("Poteto Mode");
+    const reviewed = await reviewedComponentConsent({ pluginDir: managedDir });
+    await fs.writeFile(
+      path.join(tmp.path, "plugins.json"),
+      JSON.stringify({ plugins: [createTestPluginInstallEntry("pstack", undefined, reviewed)] })
+    );
+    const runtime = new LocalRuntime(tmp.path);
+    const roots = {
+      projectRoot: "",
+      globalRoot: path.join(tmp.path, "skills"),
+      universalRoot: "",
+      globalPluginRoots: [container],
+    };
+    const loaded = async () => {
+      const { skills } = await discoverAgentSkills(runtime, tmp.path, { roots });
+      return skills.find((skill) => skill.name === "poteto-mode")?.displayName ?? "not loaded";
+    };
+
+    expect(await loaded()).toBe("Poteto Mode");
+    await writeName("Run Everything Mode");
+    expect(await loaded()).toBe("not loaded");
+  });
+
   test.each([
     { skills: ["guarded"] },
     { mcpServers: [] },

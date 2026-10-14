@@ -30,7 +30,10 @@ import {
   getDefaultAgentSkillsRoots,
   getProjectSkillRoots,
 } from "@/node/services/agentSkills/agentSkillsService";
-import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
+import {
+  parseSkillMarkdown,
+  skillConsentFrontmatter,
+} from "@/node/services/agentSkills/parseSkillMarkdown";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { log } from "@/node/services/log";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
@@ -148,7 +151,7 @@ async function readSkillDescriptor(
       // Agree with discovery; the display name stays out of this model-facing output.
       allowDisplayName: true,
     });
-    if (!isPluginSkillConsented(skillConsent, skillDir, parsed.frontmatter)) {
+    if (!isPluginSkillConsented(skillConsent, skillDir, skillConsentFrontmatter(parsed))) {
       log.warn(`Skipping ${scope} plugin skill '${directoryName}': not reviewed on this install`);
       return null;
     }

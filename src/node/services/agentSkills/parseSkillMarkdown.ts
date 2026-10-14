@@ -72,6 +72,19 @@ function applyDisplayName(
 }
 
 /**
+ * The frontmatter that plugin skill consent fingerprints (#6498). allowDisplayName moved the raw
+ * `name` out of `frontmatter`, so add it back as `displayName`: a changed display name is
+ * user-visible text and needs a new review. Skills without a display name keep their fingerprint.
+ */
+export function skillConsentFrontmatter(
+  parsed: ParsedSkillMarkdown
+): AgentSkillFrontmatter & { displayName?: string } {
+  return parsed.displayName === undefined
+    ? parsed.frontmatter
+    : { ...parsed.frontmatter, displayName: parsed.displayName };
+}
+
+/**
  * Parse a SKILL.md file into validated frontmatter + markdown body.
  *
  * Defensive constraints:

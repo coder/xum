@@ -54,7 +54,11 @@ import { log } from "@/node/services/log";
 import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
 import { ensureRuntimePathWithinWorkspace } from "@/node/services/tools/runtimeSkillPathUtils";
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
-import { AgentSkillParseError, parseSkillMarkdown } from "./parseSkillMarkdown";
+import {
+  AgentSkillParseError,
+  parseSkillMarkdown,
+  skillConsentFrontmatter,
+} from "./parseSkillMarkdown";
 import { getBuiltInSkillByName, getBuiltInSkillDescriptors } from "./builtInSkillDefinitions";
 import type { ProjectSkillContainment } from "./skillStorageContext";
 import {
@@ -735,7 +739,7 @@ async function readSkillDescriptorFromDir(
       directoryName,
       allowDisplayName: true,
     });
-    if (!isPluginSkillConsented(options?.skillConsent, skillDir, parsed.frontmatter)) {
+    if (!isPluginSkillConsented(options?.skillConsent, skillDir, skillConsentFrontmatter(parsed))) {
       pushInvalidSkill(
         "This plugin skill has not been reviewed on this install, so it does not load.",
         "Open Settings → Plugins and select Review on the plugin."
@@ -1064,7 +1068,7 @@ async function readAgentSkillFromDir(
     allowDisplayName: true,
   });
   // An unreviewed plugin skill reads like a missing one, so a lower-scope skill can serve.
-  if (!isPluginSkillConsented(skillConsent, skillDir, parsed.frontmatter)) return null;
+  if (!isPluginSkillConsented(skillConsent, skillDir, skillConsentFrontmatter(parsed))) return null;
 
   const pkg: AgentSkillPackage = {
     scope,
