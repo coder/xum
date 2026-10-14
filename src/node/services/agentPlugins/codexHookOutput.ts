@@ -95,7 +95,7 @@ const ALLOWED_FIELDS: Record<HookEventName, { top: string[]; specific: string[] 
 export function parsePreToolUseOutput(result: unknown): PreToolUseOutput | null {
   const wire = readWire(result, "PreToolUse");
   if (wire === null) return null;
-  const { raw, specific } = wire;
+  const { raw, specific, unknown } = wire;
   // Codex: any hook-specific decision field means the legacy `decision`/`reason` pair is not
   // consulted (PRRT_kwDOPxxmWM6r6NnG).
   const legacy = preLegacyDecision(raw);
@@ -105,7 +105,7 @@ export function parsePreToolUseOutput(result: unknown): PreToolUseOutput | null 
   // PreToolUse does not support continue: false, stopReason or suppressOutput. Codex voids such an
   // output; Xum still honors its deny (see NO_REASON) and voids the rest: a rewrite, the context
   // (PRRT_kwDOPxxmWM6sSNEa).
-  const unsupported = unsupportedPreToolUseField(raw);
+  const unsupported = unknown ?? unsupportedPreToolUseField(raw);
   const decision: Decision<PreToolUseOutput> =
     unsupported !== undefined && !("denyReason" in chosen) ? { invalid: unsupported } : chosen;
   return withContext(
@@ -181,8 +181,8 @@ function preLegacyDecision(raw: Record<string, unknown>): Decision<PreToolUseOut
 export function parsePostToolUseOutput(result: unknown): PostToolUseOutput | null {
   const wire = readWire(result, "PostToolUse");
   if (wire === null) return null;
-  const { raw, specific } = wire;
-  const invalid = postInvalid(raw, specific);
+  const { raw, specific, unknown } = wire;
+  const invalid = unknown ?? postInvalid(raw, specific);
   const decision: Decision<PostToolUseOutput> =
     raw.continue === false
       ? { stopFeedback: stopFeedback(raw) }
@@ -232,13 +232,27 @@ export function parseUserPromptSubmitOutput(result: unknown): UserPromptSubmitOu
   }
   const wire = readWire(result, "UserPromptSubmit", text);
   if (wire === null) return null;
-  const { raw, specific } = wire;
+  const { raw, specific, unknown } = wire;
   // Codex's only semantic rule here: a block needs a non-empty reason. Such a block fails open
   // and loses its context, also when continue: false stops the prompt. A reason without a
-  // decision is ignored (PRRT_kwDOPxxmWM6sQVfe).
+  // decision is ignored (PRRT_kwDOPxxmWM6sQVfe). An unknown field voids all but a refusal.
   const invalidBlock =
     raw.decision === "block" && trimmed(stringField(raw, "reason")) === undefined;
-  return withContext(raw, promptDecision(raw, invalidBlock), specific, !invalidBlock);
+  return withContext(
+    raw,
+    keepRefusal(promptDecision(raw, invalidBlock), unknown),
+    specific,
+    !invalidBlock && unknown === undefined
+  );
+}
+
+/** An unknown field voids a prompt decision, except a refusal (see Wire). */
+function keepRefusal(
+  decision: Decision<UserPromptSubmitOutput>,
+  unknown: string | undefined
+): Decision<UserPromptSubmitOutput> {
+  const refused = "stopped" in decision || "blockReason" in decision;
+  return unknown !== undefined && !refused ? { invalid: unknown } : decision;
 }
 
 function promptDecision(
@@ -258,7 +272,10 @@ function promptDecision(
 export function parseStopOutput(result: unknown): StopOutput | null {
   const wire = readWire(result, "Stop");
   if (wire === null) return null;
-  const { raw } = wire;
+  const { raw, unknown } = wire;
+  // A Stop continuation or halt is not a refusal of model-controlled input: an unknown field
+  // voids it, as in Codex.
+  if (unknown !== undefined) return { ...common(raw), invalid: unknown };
   const out: StopOutput = common(raw);
   const block = enumField(raw, "decision", ["block"]) === "block";
   const reason = trimmed(stringField(raw, "reason"));
@@ -287,6 +304,17 @@ function withContext<T extends Common & { additionalContext?: string }>(
 }
 
 /**
+ * A parsed output. `unknown` names a field Codex's schema does not list: Codex fails such an
+ * output (deny_unknown_fields). Xum treats it as a semantic error, so an explicit refusal next to
+ * it still applies (Codex security review PRRT_kwDOPxxmWM6sTlti, see NO_REASON).
+ */
+interface Wire {
+  raw: Record<string, unknown>;
+  specific: Record<string, unknown>;
+  unknown?: string;
+}
+
+/**
  * The output object, checked against Codex's schema for `event`. Returns null for an empty
  * result (no text, no structuredContent) and for a result that is not an object (Codex ignores
  * both); throws for a malformed one.
@@ -295,7 +323,7 @@ function readWire(
   result: unknown,
   event: HookEventName,
   text: string | undefined = joinedText(result)
-): { raw: Record<string, unknown>; specific: Record<string, unknown> } | null {
+): Wire | null {
   const raw =
     text !== undefined
       ? parseText(text, event)
@@ -303,8 +331,10 @@ function readWire(
         ? result.structuredContent
         : undefined;
   if (!isPlainObject(raw)) return null;
-  rejectUnknown(raw, ALLOWED_FIELDS[event].top, "output");
   const specific = readSpecific(raw.hookSpecificOutput, event);
+  const unknown =
+    findUnknown(raw, ALLOWED_FIELDS[event].top, "output") ??
+    findUnknown(specific, ALLOWED_FIELDS[event].specific ?? [], "hookSpecificOutput");
   typed(raw, ["continue", "suppressOutput"], "boolean");
   typed(raw, ["stopReason", "systemMessage", "reason"], "string");
   typed(specific, ["permissionDecisionReason", "additionalContext"], "string");
@@ -312,7 +342,7 @@ function readWire(
   // output first (PRRT_kwDOPxxmWM6sQVfa, PRRT_kwDOPxxmWM6sQVfk).
   enumField(raw, "decision", event === "PreToolUse" ? ["approve", "block"] : ["block"]);
   enumField(specific, "permissionDecision", ["allow", "deny", "ask"]);
-  return { raw, specific };
+  return unknown !== undefined ? { raw, specific, unknown } : { raw, specific };
 }
 
 /** JSON text; text that looks like JSON but does not parse is a malformed output. */
@@ -333,7 +363,6 @@ function readSpecific(value: unknown, event: HookEventName): Record<string, unkn
   if (!isPlainObject(value) || value.hookEventName !== event) {
     throw new Error(`hookSpecificOutput is not tagged hookEventName "${event}"`);
   }
-  rejectUnknown(value, allowed, "hookSpecificOutput");
   return value;
 }
 
@@ -366,12 +395,16 @@ function looksLikeJson(text: string): boolean {
   return text.startsWith("{") || text.startsWith("[");
 }
 
-function rejectUnknown(record: Record<string, unknown>, allowed: string[], where: string) {
-  for (const key of Object.keys(record)) {
-    if (!allowed.includes(key)) {
-      throw new Error(`${where} has the unknown field ${JSON.stringify(key).slice(0, 80)}`);
-    }
-  }
+/** The first field the event's Codex schema does not list, as a semantic error message. */
+function findUnknown(
+  record: Record<string, unknown>,
+  allowed: string[],
+  where: string
+): string | undefined {
+  const key = Object.keys(record).find((candidate) => !allowed.includes(candidate));
+  return key !== undefined
+    ? `returned ${where} with the unknown field ${JSON.stringify(key).slice(0, 80)}`
+    : undefined;
 }
 
 /** Codex types every field: a wrong type anywhere makes the whole output malformed. */

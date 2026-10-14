@@ -765,8 +765,10 @@ describe("Codex output rules (output_parser.rs)", () => {
     });
   const stopInput = { messageId: "a1", lastAssistantMessage: "done", stopHookActive: false };
 
-  test("an unknown field makes the output malformed, so it fails open", async () => {
-    const outputs = [
+  test("an unknown field voids the output, but not an explicit deny", async () => {
+    // Codex rejects such an output (deny_unknown_fields). Xum keeps a deny next to it, as for
+    // every semantic error (Codex security review PRRT_kwDOPxxmWM6sTlti).
+    const denies = [
       json({ decision: "block", reason: "x", unexpectedField: true }),
       json({
         hookSpecificOutput: {
@@ -777,10 +779,32 @@ describe("Codex output rules (output_parser.rs)", () => {
         },
       }),
     ];
-    for (const output of outputs) {
+    for (const output of denies) {
       const { spine } = setup([hook("PreToolUse")], () => output);
-      expect((await runTool(spine, "bash", {})).executed).toBe(true);
+      expect((await runTool(spine, "bash", {})).executed).toBe(false);
     }
+    const schema = { type: "object", properties: { script: { type: "string" } } };
+    const rewrite = setup([hook("PreToolUse")], () =>
+      json({
+        unexpectedField: true,
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "allow",
+          updatedInput: { script: "safe" },
+          additionalContext: "Dropped.",
+        },
+      })
+    );
+    expect((await runTool(rewrite.spine, "bash", { script: "ls" }, schema)).result).toEqual({
+      ran: { script: "ls" },
+    });
+    // A Stop continuation is not a refusal: an unknown field voids it.
+    const unknownStop = setup([hook("Stop")], () =>
+      json({ decision: "block", reason: "Again.", unexpectedField: true })
+    );
+    expect(await runTurnStopHooks(unknownStop.spine, workspaceId, stopInput)).toEqual({
+      kind: "none",
+    });
     // Codex's Stop output has no hookSpecificOutput field at all.
     const stop = setup([hook("Stop")], () =>
       json({ decision: "block", reason: "Again.", hookSpecificOutput: { hookEventName: "Stop" } })
