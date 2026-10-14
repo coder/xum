@@ -11,7 +11,7 @@ interface HostWindow {
 
 function openDocument(nonce: string, hostWindow: HostWindow) {
   const events: unknown[] = [];
-  const listeners = new Map<string, () => void>();
+  const listeners = new Map<string, (event?: unknown) => void>();
   const documentWindow: Record<string, unknown> = {
     parent: hostWindow,
     MessageEvent: class {
@@ -24,7 +24,8 @@ function openDocument(nonce: string, hostWindow: HostWindow) {
       events.push(event.init);
       return true;
     },
-    addEventListener: (type: string, listener: () => void) => listeners.set(type, listener),
+    addEventListener: (type: string, listener: (event?: unknown) => void) =>
+      listeners.set(type, listener),
   };
   // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs our own generated script
   (new Function("window", mcpAppDocumentChannelScript(nonce)) as (w: unknown) => void)(
@@ -33,7 +34,13 @@ function openDocument(nonce: string, hostWindow: HostWindow) {
   const parent = documentWindow.parent as {
     postMessage: (message: unknown, origin: string) => void;
   };
-  return { parent, events, hide: () => listeners.get("pagehide")?.() };
+  return {
+    parent,
+    events,
+    hide: () => listeners.get("pagehide")?.(),
+    key: (event: { key: string; shiftKey?: boolean; defaultPrevented?: boolean }) =>
+      listeners.get("keydown")?.({ shiftKey: false, defaultPrevented: false, ...event }),
+  };
 }
 
 /** A host window that hands each announcement to `channel` like McpAppFrame does. */
@@ -45,6 +52,27 @@ function hostFor(channel: ReturnType<typeof createMcpAppDocumentChannel>): HostW
 }
 
 describe("MCP App document channel", () => {
+  // Keys inside the frame never reach the app: a maximized app tab restores on these (#6165).
+  test("Escape and Shift+F the view did not handle reach the host as exit", async () => {
+    const channel = createMcpAppDocumentChannel("ab12");
+    const received: unknown[] = [];
+    let exits = 0;
+    channel.setReceiver({
+      message: (data) => received.push(data),
+      leave: () => undefined,
+      exit: () => exits++,
+    });
+    const view = openDocument("ab12", hostFor(channel));
+    view.key({ key: "Escape" });
+    view.key({ key: "F", shiftKey: true });
+    // The view handled it (its own dialog), or it is another key: no exit.
+    view.key({ key: "Escape", defaultPrevented: true });
+    view.key({ key: "f" });
+    await tick();
+    expect(exits).toBe(2);
+    expect(received).toEqual([]);
+  });
+
   test("view and host talk only over the port of the document that opened it", async () => {
     const channel = createMcpAppDocumentChannel("ab12");
     const received: unknown[] = [];

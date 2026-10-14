@@ -137,6 +137,8 @@ export function AppViewTabPanel(props: {
           onClose={props.onClose}
           maximized={maximized}
           onToggleMaximized={() => setMaximized(!maximized)}
+          // Keys inside the frame never reach the panel's onKeyDown: the frame forwards them.
+          onExitKey={() => setMaximized(false)}
         />
       )}
     </MaximizablePanel>
@@ -170,6 +172,10 @@ function MaximizablePanel(props: {
       data-testid="app-view-tab-panel"
       tabIndex={-1}
       aria-label={maximized ? "Maximized app view" : undefined}
+      // While maximized the rest of the window is inert: announce it as a modal dialog, like
+      // the Artifacts fullscreen panel.
+      role={maximized ? "dialog" : undefined}
+      aria-modal={maximized ? true : undefined}
       // The Artifacts fullscreen shortcut toggles it while focus is in the panel (outside the
       // view's frame, which keeps its own keys); Escape restores it.
       onKeyDown={(event) => {

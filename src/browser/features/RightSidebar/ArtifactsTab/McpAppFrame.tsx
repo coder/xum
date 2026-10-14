@@ -466,6 +466,8 @@ export function McpAppFrame(props: {
   variant?: McpAppFrameVariant;
   /** Panel only: closes the panel's host (its app tab). */
   onClose?: () => void;
+  /** Panel only: Escape or Shift+F inside the view (mcpAppDocumentChannel.ts): restore only. */
+  onExitKey?: () => void;
   /** Panel only: whether its tab is maximized over the window (#6165), and the toggle. */
   maximized?: boolean;
   onToggleMaximized?: () => void;
@@ -590,11 +592,23 @@ export function McpAppFrame(props: {
   const srcDoc = buildMcpAppViewSrcDoc(current, grant, viewDocument);
 
   // Values the long-lived host reads at message time.
-  const latest = useRef({ theme, view, result: current?.view ?? null, onClose: props.onClose });
+  const latest = useRef({
+    theme,
+    view,
+    result: current?.view ?? null,
+    onClose: props.onClose,
+    onExitKey: props.onExitKey,
+  });
   // A layout effect ahead of the host's: a view that initializes at once must get this render's
   // result (onInitialized reads it).
   useLayoutEffect(() => {
-    latest.current = { theme, view, result: current?.view ?? null, onClose: props.onClose };
+    latest.current = {
+      theme,
+      view,
+      result: current?.view ?? null,
+      onClose: props.onClose,
+      onExitKey: props.onExitKey,
+    };
   });
 
   // A layout effect: the listener must be in place before the frame's preamble announces its
@@ -737,6 +751,7 @@ export function McpAppFrame(props: {
         if (!navigatedRef.current) void host.handleMessage(data);
       },
       leave: leaveDocument,
+      exit: () => latest.current.onExitKey?.(),
     });
     const handler = (event: MessageEvent) => {
       const frameWindow = navigatedRef.current ? null : frameRef.current?.contentWindow;
