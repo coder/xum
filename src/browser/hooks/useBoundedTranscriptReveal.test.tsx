@@ -760,11 +760,17 @@ describe("useBoundedTranscriptReveal", () => {
       setProps({ messages: replaced });
       setProps({ messages: props().messages.filter((_, i) => i !== toIndex) });
       expect(reveal().toIndex).toBe(toIndex);
-      // Rows appended later survive while every older newer row and 5 mounted rows go at once.
+      // Replace, append, then delete every older newer row at once: nothing the reader kept
+      // unmounts; the slice ends at the tail (the appended rows).
+      setProps({
+        messages: props().messages.map((row, i) => (i === toIndex - 1 ? { id: "v3" } : row)),
+      });
       setProps({ messages: [...props().messages, ...rows(3, "new")] });
-      const keep = (i: number) => i < toIndex - 5 || i >= LONG - 1;
-      setProps({ messages: props().messages.filter((_, i) => keep(i)) });
-      expect(reveal().toIndex).toBe(toIndex - 10);
+      const gone = (i: number) =>
+        (i >= toIndex - 30 && i < toIndex - 10) || (i >= toIndex && i < LONG - 1);
+      setProps({ messages: props().messages.filter((_, i) => !gone(i)) });
+      expect(reveal().toIndex).toBe(props().messages.length);
+      expect(props().messages.findIndex((row) => row.id === "v3")).toBe(toIndex - 21);
     });
   });
 });

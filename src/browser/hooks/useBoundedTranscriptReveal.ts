@@ -146,17 +146,18 @@ function findRow(rows: readonly RevealRow[], id: string, hint: number): number {
 function storedSliceEnd(state: RevealState, rows: readonly RevealRow[], isSafeCut: IsSafeCut) {
   const { endMessageId: id, endIndexHint: hint, endRows } = state;
   if (id === null) return rows.length;
-  const end = findRow(rows, id, hint);
-  const kept = end === -1 ? endAfterNewestKeptRow(rows, endRows, hint) : end;
-  return nearestSafeCutAtOrBefore(kept, rows.length, isSafeCut);
+  const found = findRow(rows, id, hint);
+  const end = found === -1 ? endAtNearestUnmountedRow(rows, endRows, hint) : found;
+  return end === rows.length ? end : nearestSafeCutAtOrBefore(end, rows.length, isSafeCut);
 }
 
 /**
  * Where the end goes once its row is gone: the nearest still-present row that was unmounted
- * (`endRows[hint+1..]`, so mounted rows replaced since stay mounted), else just after the newest
- * still-present mounted row (`endRows[..hint)`), else 0.
+ * (`endRows[hint+1..]`), so mounted rows replaced since stay mounted. If none survives, every row
+ * the reader had not reached is gone and the slice ends at the tail: what follows the kept rows
+ * is replacements or later appends, and unmounting those could hide rows the reader was reading.
  */
-function endAfterNewestKeptRow(
+function endAtNearestUnmountedRow(
   rows: readonly RevealRow[],
   endRows: readonly RevealRow[],
   hint: number
@@ -166,11 +167,7 @@ function endAfterNewestKeptRow(
     const index = indexById.get(endRows[newer].id);
     if (index !== undefined) return index;
   }
-  for (let kept = hint - 1; kept >= 0; kept -= 1) {
-    const index = indexById.get(endRows[kept].id);
-    if (index !== undefined) return index + 1;
-  }
-  return 0;
+  return rows.length;
 }
 
 /** `state` with its budget-base hint moved to where the base row is now (like the anchor's). */
