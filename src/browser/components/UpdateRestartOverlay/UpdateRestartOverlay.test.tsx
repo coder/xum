@@ -80,7 +80,7 @@ let apiState: { api: APIClient | null; status: "connected" | "reconnecting" } = 
 };
 
 import type { UpdateRestartOverlay as UpdateRestartOverlayComponent } from "./UpdateRestartOverlay";
-import { createTestApiClient } from "@/browser/testUtils";
+import { createTestApiClient, textOf } from "@/browser/testUtils";
 
 // Required after the mocks above so the svg stubs are in place when LoadingScreen evaluates.
 /* eslint-disable @typescript-eslint/no-require-imports, @typescript-eslint/no-unsafe-assignment */
@@ -148,7 +148,7 @@ describe("UpdateRestartOverlay", () => {
 
     before.push({ type: "downloaded", info: { version: "0.29.0" } });
     await flushStream();
-    expect(view.queryByTestId(OVERLAY)).toBeNull();
+    expect(textOf(view.queryByTestId(OVERLAY))).toBeNull();
 
     before.push({ type: "restarting", info: { version: "0.29.0" } });
     await waitFor(() => expect(view.getByTestId(OVERLAY)).toBeTruthy());
@@ -174,7 +174,7 @@ describe("UpdateRestartOverlay", () => {
     await flushStream();
     expect(view.getByTestId(OVERLAY)).toBeTruthy();
     after.push({ type: "idle" });
-    await waitFor(() => expect(view.queryByTestId(OVERLAY)).toBeNull());
+    await waitFor(() => expect(textOf(view.queryByTestId(OVERLAY))).toBeNull());
   });
 
   test("hides again when the install fails after restarting was announced", async () => {
@@ -186,7 +186,7 @@ describe("UpdateRestartOverlay", () => {
     await waitFor(() => expect(view.getByTestId(OVERLAY)).toBeTruthy());
 
     stream.push({ type: "error", phase: "install", message: "activation failed" });
-    await waitFor(() => expect(view.queryByTestId(OVERLAY)).toBeNull());
+    await waitFor(() => expect(textOf(view.queryByTestId(OVERLAY))).toBeNull());
   });
 
   // The App keeps the last client while Xum reconnects (kept-gap), so a drop ends the stream
