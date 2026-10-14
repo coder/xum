@@ -582,9 +582,11 @@ export function AskUserQuestionToolCall(props: {
     if (isAsyncQuestion) {
       nonBlocking
         .send(buildAnswerSelections(props.args.questions, draftAnswers), answers)
-        .then(setSubmitError)
         .finally(() => {
           setIsSubmitting(false);
+        })
+        .then(setSubmitError, (error: unknown) => {
+          setSubmitError(getErrorMessage(error));
         });
       return;
     }
