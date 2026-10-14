@@ -1028,6 +1028,63 @@ describe("MCPServerManager", () => {
     expect(await run("new")).toBe("ran");
   });
 
+  test("settings tool actions fail closed when the catalog refresh stalls or fails", async () => {
+    configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-actions-stall") });
+    // "reset" was read-only; the server makes it writable and then lists slowly or fails.
+    const readOnly = true;
+    let listing: "ok" | "stall" | "fail" = "ok";
+    const runs: string[] = [];
+    servers.serve("settings-actions-stall", {
+      era: "modern",
+      listTools: () => {
+        if (listing === "stall") return new Promise<never>(() => undefined);
+        if (listing === "fail") return Promise.reject(new Error("tools/list failed"));
+        return Promise.resolve({ draw: testTool() });
+      },
+      settings: {
+        settingsCapability: () => ({ readTool: "s.read", updateTool: "s.update" }),
+        callSettingsTool: () =>
+          Promise.resolve({
+            content: [],
+            structuredContent: {
+              schema: { type: "object", properties: {} },
+              values: {},
+              layout: [{ kind: "group", title: "Parts", items: [{ kind: "tool", tool: "reset" }] }],
+            },
+          }),
+        // The held catalog keeps the old flag until a listing completes.
+        settingsToolAction: (name) =>
+          name === "reset" ? { title: "Reset", readOnly, opensApp: false } : undefined,
+        callSettingsActionTool: (name) => {
+          runs.push(name);
+          return Promise.resolve({ content: [] });
+        },
+      },
+    });
+    const workspaceId = "settings-actions-stall-ws";
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const snapshot = await manager.readSettings(workspaceId, "cad");
+    if (snapshot === null) throw new Error("expected settings");
+    const run = () =>
+      manager
+        .runSettingsTool(workspaceId, "cad", "reset", snapshot.instanceToken, { confirmed: false })
+        .then(() => "ran")
+        .catch((error: unknown) => String(error));
+    // The tool became writable, but the listing that would say so fails, or stalls past the
+    // deadline: the stale read-only flag must not let it run without a confirmation.
+    listing = "fail";
+    expect(await run()).toContain("Could not refresh cad's tools; try again");
+    expect(runs).toEqual([]);
+    // A completed refresh runs the action (still read-only here) as before.
+    listing = "ok";
+    expect(await run()).toBe("ran");
+    expect(runs).toEqual(["reset"]);
+    // Last: a stalled listing stays in flight (later refreshes join it until it settles).
+    listing = "stall";
+    expect(await run()).toContain("Could not refresh cad's tools; try again");
+    expect(runs).toEqual(["reset"]);
+  }, 10_000);
+
   test("settings: a server counts as connected only once the workspace started it", async () => {
     configService.listServers.mockResolvedValue({ cad: stdioConfig("settings-connected") });
     servers.serve("settings-connected", { tools: { draw: testTool() } });

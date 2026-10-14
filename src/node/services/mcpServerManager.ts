@@ -1712,7 +1712,7 @@ export class MCPServerManager {
     { started: number; applied: number }
   >();
   /** Dedupes send-path background tool refreshes per instance; see refreshInstanceToolsInBackground. */
-  private readonly toolRefreshesInFlight = new WeakMap<MCPServerInstance, Promise<void>>();
+  private readonly toolRefreshesInFlight = new WeakMap<MCPServerInstance, Promise<boolean>>();
   /**
    * Prompt catalogs of idle-stopped servers, by workspace, with the start
    * config they were fetched under. The restart seeds each restarted
@@ -2563,19 +2563,22 @@ export class MCPServerManager {
 
   /**
    * One deduped tools/list refresh of a modern-era instance; never rejects (a failed refresh
-   * keeps the cached tools). Legacy instances have no refresh and resolve at once.
+   * keeps the cached tools). Resolves false when the refresh failed. Legacy instances have no
+   * refresh and resolve true at once (tools/list_changed re-lists them).
    */
-  private refreshInstanceTools(instance: MCPServerInstance): Promise<void> {
+  private refreshInstanceTools(instance: MCPServerInstance): Promise<boolean> {
     const inFlight = this.toolRefreshesInFlight.get(instance);
     if (inFlight !== undefined) return inFlight;
-    if (instance.isClosed || !instance.refreshTools) return Promise.resolve();
+    if (instance.isClosed || !instance.refreshTools) return Promise.resolve(true);
     const refresh = instance
       .refreshTools()
+      .then(() => true)
       .catch((error: unknown) => {
         log.debug("[MCP] Tool list refresh failed; keeping cached tools", {
           name: instance.name,
           error: getErrorMessage(error),
         });
+        return false;
       })
       .finally(() => {
         if (this.toolRefreshesInFlight.get(instance) === refresh) {
@@ -5212,14 +5215,25 @@ export class MCPServerManager {
   }
 
   /** Refresh the running instance's catalog before a settings action dispatch (bounded). */
+  /**
+   * Refresh the running instance's catalog before a settings action dispatch (bounded). Fails
+   * closed: when the refresh times out or fails, the held catalog can be stale (a tool that
+   * became writable still reads as read-only and would run without the user's confirmation),
+   * so the dispatch is refused instead of falling back to it.
+   */
   private async refreshSettingsActionCatalog(
     workspaceId: string,
     serverName: string,
     signal: AbortSignal | undefined
   ): Promise<void> {
     const instance = this.workspaceServers.get(workspaceId)?.instances.get(serverName);
-    if (instance !== undefined && !instance.isClosed)
-      await this.refreshAppCatalogs([{ instance }], signal);
+    if (instance === undefined || instance.isClosed) return;
+    const refreshed = await raceWithAbortAndTimeout(this.refreshInstanceTools(instance), {
+      ...(signal !== undefined ? { signal } : {}),
+      timeoutMs: MCP_APP_CATALOG_REFRESH_TIMEOUT_MS,
+    });
+    if (refreshed.kind !== "ok" || !refreshed.value)
+      throw new Error(`Could not refresh ${serverName}'s tools; try again`);
   }
 
   /**
