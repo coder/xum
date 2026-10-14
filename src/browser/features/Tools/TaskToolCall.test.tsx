@@ -9,6 +9,7 @@ import { buildDisplayedMessagesForMessage } from "@/browser/utils/messages/displ
 import { NestedToolsContainer } from "./Shared/NestedToolsContainer";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { computeTaskReportLinking } from "@/browser/utils/messages/taskReportLinking";
+import { pageToolText, type ToolTextPage } from "@/common/utils/tools/pageToolText";
 import * as RealWorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import * as RealSubagentTranscriptDialogModule from "@/browser/features/Tools/SubagentTranscriptDialog";
 import * as RealElapsedTimeDisplayModule from "@/browser/features/Tools/Shared/ElapsedTimeDisplay";
@@ -278,6 +279,108 @@ describe("TaskToolCall", () => {
     expect(settings?.textContent).toContain("Opus 5");
     expect(settings?.textContent).toContain("thinking: high");
     expect(settings?.textContent).not.toContain("thinking: low");
+  });
+
+  test("shows every page of a paged report on the spawn card", () => {
+    workspaceContextMock = { workspaceMetadata: new Map() };
+    const agentTaskArgs = {
+      subagent_type: "explore",
+      prompt: "Look around.",
+      title: "Explore task",
+      run_in_background: true,
+    };
+    const spawnResult = { status: "running", taskId: "task-paged", note: "Started." };
+    const awaitPage = (offset: number | undefined, reportMarkdown: string, next?: number) =>
+      createToolMessage({
+        toolName: "task_await",
+        args: { task_ids: ["task-paged"], ...(offset != null ? { offset_chars: offset } : {}) },
+        result: {
+          results: [
+            {
+              status: "completed",
+              taskId: "task-paged",
+              reportMarkdown,
+              ...(next != null ? { nextCharOffset: next } : {}),
+            },
+          ],
+        },
+      });
+    const firstPage = "First page of the report. ";
+    const linking = computeTaskReportLinking([
+      createToolMessage({ toolName: "task", args: agentTaskArgs, result: spawnResult }),
+      awaitPage(undefined, firstPage, firstPage.length),
+      awaitPage(firstPage.length, "Second page of the report."),
+    ]);
+    expect(linking.suppressReportInAwaitTaskIds.has("task-paged")).toBe(true);
+
+    const AgentTaskToolCall = getToolComponent("task", agentTaskArgs, undefined);
+    const view = render(
+      <TooltipProvider>
+        <AgentTaskToolCall
+          args={agentTaskArgs}
+          result={spawnResult}
+          taskReportLinking={linking}
+          status="completed"
+        />
+      </TooltipProvider>
+    );
+    fireEvent.click(view.getByText("task"));
+
+    expect(view.container.textContent).toContain(
+      "First page of the report. Second page of the report."
+    );
+  });
+
+  test("joins a report page at the start the pager rounded to", () => {
+    // offset_chars 10 points inside the emoji's surrogate pair: the pager starts at 9.
+    const report = `${"a".repeat(9)}😀tail`;
+    const first = pageToolText(report, 0, 9);
+    const second = pageToolText(report, 10);
+    expect(second.startCharOffset).toBe(9);
+    const awaitPage = (args: Record<string, unknown>, page: ToolTextPage) =>
+      createToolMessage({
+        toolName: "task_await",
+        args: { task_ids: ["task-pair"], ...args },
+        result: {
+          results: [
+            {
+              status: "completed",
+              taskId: "task-pair",
+              reportMarkdown: page.text,
+              ...(page.startCharOffset != null ? { startCharOffset: page.startCharOffset } : {}),
+            },
+          ],
+        },
+      });
+    const linking = computeTaskReportLinking([
+      createToolMessage({
+        toolName: "task",
+        args: { subagent_type: "explore", prompt: "p", title: "t", run_in_background: true },
+        result: { status: "running", taskId: "task-pair" },
+      }),
+      awaitPage({}, first),
+      awaitPage({ offset_chars: 10 }, second),
+    ]);
+    expect(linking.reportByTaskId.get("task-pair")?.reportMarkdown).toBe(report);
+  });
+
+  test("keeps await rows visible when report pages leave a gap", () => {
+    const linking = computeTaskReportLinking([
+      createToolMessage({
+        toolName: "task",
+        args: { subagent_type: "explore", prompt: "p", title: "t", run_in_background: true },
+        result: { status: "running", taskId: "task-gap" },
+      }),
+      // Only a later page is in the transcript (the first was read in an earlier context).
+      createToolMessage({
+        toolName: "task_await",
+        args: { task_ids: ["task-gap"], offset_chars: 50_000 },
+        result: {
+          results: [{ status: "completed", taskId: "task-gap", reportMarkdown: "Late page." }],
+        },
+      }),
+    ]);
+    expect(linking.suppressReportInAwaitTaskIds.has("task-gap")).toBe(false);
   });
 
   test("falls back to result-carried settings after workspace cleanup", () => {

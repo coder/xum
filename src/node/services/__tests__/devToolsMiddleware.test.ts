@@ -18,6 +18,8 @@ import {
 } from "@/node/services/devToolsHeaderCapture";
 import { createDevToolsMiddleware, extractUsage } from "@/node/services/devToolsMiddleware";
 import { DevToolsService } from "@/node/services/devToolsService";
+import { wrapFetchWithAnthropicCacheControl } from "@/node/services/providerModelFactory";
+import { waitForCondition } from "@/node/services/testDispatchHelpers";
 
 function createTestConfig(opts: { sessionsDir: string; enabled?: boolean }): Config {
   const config = new Config(path.dirname(opts.sessionsDir));
@@ -640,6 +642,99 @@ describe("createDevToolsMiddleware", () => {
       expect(step?.inputTransformations).toEqual([
         entry("messages.3.content.0", "model_binding_mismatch"),
       ]);
+    });
+
+    it("records the cache wrapper's wire facts on the step, through a reload", async () => {
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const service = new DevToolsService(config);
+      const wrapStream = getWrapStream(createDevToolsMiddleware("ws-1", service));
+      const route = { route: "anthropic", modelString: "anthropic:claude-opus-5-5" };
+      // The provider's fetch goes through Xum's cache wrapper with the step's headers.
+      const cachingFetch = wrapFetchWithAnthropicCacheControl(
+        (() => Promise.resolve(new Response("{}"))) as unknown as typeof fetch,
+        "1h",
+        { routeIdentity: route }
+      );
+      const params = createMockParams();
+      const result = await wrapStream({
+        doGenerate: () => Promise.reject(new Error("doGenerate should not be called")),
+        doStream: async () => {
+          await cachingFetch("https://api.anthropic.com/v1/messages", {
+            method: "POST",
+            headers: params.headers as Record<string, string>,
+            body: JSON.stringify({ messages: [] }),
+          });
+          return {
+            stream: new ReadableStream<LanguageModelV4StreamPart>({
+              start(controller) {
+                controller.enqueue({
+                  type: "finish",
+                  finishReason: { unified: "stop", raw: "stop" },
+                  usage: createUsage(5, 2),
+                });
+                controller.close();
+              },
+            }),
+          };
+        },
+        params,
+        model: createMockModel(),
+      });
+      await collectStream(result.stream);
+
+      const reloaded = new DevToolsService(config);
+      const runs = await reloaded.getRuns("ws-1");
+      const step = (await reloaded.getRunWithSteps("ws-1", runs[0].id))?.steps[0];
+      expect(step?.promptCacheWire).toMatchObject({
+        ...route,
+        cacheMarkersInjected: true,
+        dispatched: true,
+      });
+      expect(step?.promptCacheWire?.observedAt).toBeString();
+    });
+
+    it("keeps the wire facts of an OK response when the step aborts before doStream settles", async () => {
+      const config = createTestConfig({ sessionsDir, enabled: true });
+      const service = new DevToolsService(config);
+      const wrapStream = getWrapStream(createDevToolsMiddleware("ws-1", service));
+      const route = { route: "anthropic", modelString: "anthropic:claude-opus-5-5" };
+      const cachingFetch = wrapFetchWithAnthropicCacheControl(
+        (() => Promise.resolve(new Response("{}"))) as unknown as typeof fetch,
+        "1h",
+        { routeIdentity: route }
+      );
+      const abort = new AbortController();
+      const params = { ...createMockParams(), abortSignal: abort.signal };
+      const send = () =>
+        cachingFetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: params.headers as Record<string, string>,
+          body: JSON.stringify({ messages: [] }),
+        });
+      const streaming = wrapStream({
+        doGenerate: () => Promise.reject(new Error("doGenerate should not be called")),
+        doStream: async () => {
+          // Anthropic answered OK (the monitor observed it), then the user stopped the turn
+          // while the provider was still setting up the stream.
+          await send();
+          abort.abort();
+          throw new Error("aborted");
+        },
+        params,
+        model: createMockModel(),
+      });
+      // The provider call rejects after the abort; only the recorded step matters here.
+      await Promise.resolve(streaming).catch(() => undefined);
+
+      // The abort handler finalizes in the background; wait for that update.
+      const readStep = async () => {
+        const runs = await service.getRuns("ws-1");
+        return (await service.getRunWithSteps("ws-1", runs[0].id))?.steps[0];
+      };
+      await waitForCondition(async () => (await readStep())?.error === "Request aborted");
+      const step = await readStep();
+      expect(step?.promptCacheWire).toMatchObject({ ...route, dispatched: true });
+      expect(step?.promptCacheWire?.observedAt).toBeString();
     });
 
     it("does not forward raw chunks when includeRawChunks was not requested", async () => {

@@ -157,7 +157,9 @@ let workerCalls: Set<(error: Error) => void> | null = null;
 // After a start failure: per language, one shared start of the next worker that every request of
 // that language whose worker did not start waits on, then retries once (#6303). Per language, so
 // one grammar's failed recovery does not end another language's wait (#6309).
-const workerRecoveries = new Map<string, Promise<void>>();
+// `waiters` counts the callers still waiting: once all of them abort (their blocks unmounted),
+// the queued start is skipped, so it does not hold live highlights behind a start for nobody.
+const workerRecoveries = new Map<string, { done: Promise<void>; waiters: number }>();
 
 /**
  * Tear down the current worker so the next call to `getWorkerAPI` builds a
@@ -442,15 +444,39 @@ function enqueue<T>(job: () => Promise<T>): Promise<T> {
  * times out too. Shared: the requests that wait on it trigger one more worker start between them,
  * not one each, and a worker that never starts ends the wait instead of looping.
  */
-function whenWorkerRecovered(language: string): Promise<void> {
-  let recovery = workerRecoveries.get(language);
-  if (!recovery) {
-    recovery = enqueue(() => prepareWorker(language)).finally(() => {
-      workerRecoveries.delete(language);
-    });
-    workerRecoveries.set(language, recovery);
-  }
-  return recovery;
+function whenWorkerRecovered(language: string, signal: AbortSignal | undefined): Promise<void> {
+  const entry = workerRecoveries.get(language) ?? startRecovery(language);
+  entry.waiters++;
+  return untilAborted(entry.done, signal).finally(() => {
+    entry.waiters--;
+  });
+}
+
+/** Queues the shared recovery start of `language` (see whenWorkerRecovered). */
+function startRecovery(language: string): { done: Promise<void>; waiters: number } {
+  const entry = { done: Promise.resolve(), waiters: 0 };
+  // Checked when the start reaches the front of the queue: a start already running is not ended,
+  // because the next request of any language would wait for that worker anyway.
+  entry.done = enqueue(() =>
+    entry.waiters > 0 ? prepareWorker(language) : Promise.resolve()
+  ).finally(() => {
+    workerRecoveries.delete(language);
+  });
+  // Its waiters may all have left: an unawaited rejection must not be reported.
+  entry.done.catch(() => undefined);
+  workerRecoveries.set(language, entry);
+  return entry;
+}
+
+/** `promise`, or a rejection with `signal.reason` once the caller aborts first. */
+function untilAborted<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return promise;
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason as Error);
+    if (signal.aborted) return onAbort();
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
 }
 
 /**
@@ -541,7 +567,7 @@ export async function highlightCode(
     // a mounted block then highlights without a remount (#6303).
     if (!isHighlightStartFailure(e)) throw e;
     signal?.throwIfAborted();
-    await whenWorkerRecovered(language);
+    await whenWorkerRecovered(language, signal);
     return requestHighlight(code, language, theme, signal);
   }
 }

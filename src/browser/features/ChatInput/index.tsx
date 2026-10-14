@@ -215,6 +215,8 @@ import {
 } from "./useComposerAttachments";
 import { useComposerDraft } from "./useComposerDraft";
 import { getDraftStore, type SendOutcome } from "@/browser/stores/DraftStore";
+import { useComposerTypingLock } from "./useComposerTypingLock";
+import { useReportCreationSendBlocked } from "./useReportCreationSendBlocked";
 import { assert } from "@/common/utils/assert";
 import { acceptedSendIds, isEditSendAccepted } from "./sendAcceptance";
 import { createSendId } from "@/common/utils/drafts";
@@ -867,6 +869,15 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const isSendInFlight = variant === "creation" ? creationState.isSending || isSending : isSending;
   const sendInFlightBlocksInput =
     variant === "workspace" ? isSendInFlight && !isStreamStarting : isSendInFlight;
+  // #6259: typing stays on once a send has taken its draft; submission waits for it to settle.
+  const typingLock = useComposerTypingLock({
+    variant,
+    sendingCount,
+    isStreamStarting,
+    creationLocksTyping: sendInFlightBlocksInput,
+    inputRef,
+  });
+  const sendLocksTyping = typingLock.locksTyping;
 
   // Coder workspace state - config is owned by selectedRuntime.coder, this hook manages async data
   const currentRuntime = creationState.selectedRuntime;
@@ -895,7 +906,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     variant === "creation" && props.kind !== "scratch"
       ? ({
           branches: creationState.branches,
-          branchesLoaded: creationState.branchesLoaded,
+          branchLoad: creationState.branchLoad,
           trunkBranch: creationState.trunkBranch,
           onTrunkBranchChange: creationState.setTrunkBranch,
           selectedRuntime: creationState.selectedRuntime,
@@ -952,12 +963,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const coderPresetsLoading =
     coderState.enabled && !coderState.coderConfig?.existingWorkspace && coderState.loadingPresets;
   // #6033: the trunk branch stays empty until the branch list loads, and the backend refuses
-  // every runtime except local without one, so a creation send must wait for the list.
+  // every runtime except local without one, so a creation send must wait for the list. A failed
+  // list keeps it closed too (#6055).
   const creationBranchesLoading =
     variant === "creation" &&
     props.kind !== "scratch" &&
-    !creationState.branchesLoaded &&
+    creationState.branchLoad !== "loaded" &&
     creationState.selectedRuntime.mode !== RUNTIME_MODE.LOCAL;
+  useReportCreationSendBlocked(creationBranchesLoading, props);
   const isProcessingAttachments = processingAttachmentCount > 0;
   const hasSendableDraft = hasTypedText || hasImages || hasReviews;
   // Workspace sends/edits mutate history relative to the visible transcript, so they wait for
@@ -2632,6 +2645,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       // typed or a restore put in meanwhile stays (#5226 item 12).
       // Null when the send failed before taking anything (nothing to put back) or succeeded.
       let taken: { text: string } | null = null;
+      let releaseTakenDraft: () => void = () => undefined;
       const putBackTaken = () => {
         if (taken === null) return;
         const { text } = taken;
@@ -2879,6 +2893,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         if (inputRef.current) {
           inputRef.current.style.height = "";
         }
+        // The draft is out of the composer: typing can resume (#6259).
+        releaseTakenDraft = typingLock.markDraftTaken();
 
         props.onMessageSendStarted?.(overrides?.queueDispatchMode ?? "tool-end");
 
@@ -3006,6 +3022,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       };
       await runWithCatchFinally(sendPreparedMessage, restoreDraftOnError, () => {
         setSendingCount((c) => c - 1);
+        releaseTakenDraft();
         setHideReviewsDuringSend(false);
       });
     };
@@ -3385,7 +3402,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                       composerSuggestions.isVisible ? COMMAND_SUGGESTION_KEYS : undefined
                     }
                     placeholder={placeholder}
-                    disabled={!editingMessageForUi && (disabled || sendInFlightBlocksInput)}
+                    disabled={!editingMessageForUi && (disabled || sendLocksTyping)}
                     aria-label={editingMessageForUi ? "Edit message" : "Message"}
                     // No aria-expanded: the textbox role does not allow it (#5951), and a
                     // textarea cannot take role="combobox" without screen readers treating
@@ -3602,7 +3619,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                   >
                     <AttachFileButton
                       onFiles={handleAttachFiles}
-                      disabled={disabled || sendInFlightBlocksInput || !!editingMessageForUi}
+                      disabled={disabled || sendLocksTyping || !!editingMessageForUi}
                     />
                     <VoiceInputButton
                       state={voiceInput.state}
@@ -3610,7 +3627,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                       shouldShowUI={voiceInput.shouldShowUI}
                       requiresSecureContext={voiceInput.requiresSecureContext}
                       onToggle={voiceInput.toggle}
-                      disabled={disabled || sendInFlightBlocksInput}
+                      disabled={disabled || sendLocksTyping}
                       agentColor={agentColor}
                     />
                   </div>

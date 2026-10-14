@@ -12,7 +12,6 @@ import * as ActualRoutingModule from "@/browser/hooks/useRouting";
 import * as SettingsContextModule from "@/browser/contexts/SettingsContext";
 import * as ActualWorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
-import type * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import type {
   AddCustomProviderInput,
   ProviderConfigInfo,
@@ -83,10 +82,10 @@ restoreModulesAfterSuite([
   ["@/browser/contexts/WorkspaceContext", { ...ActualWorkspaceContextModule }],
 ]);
 
-/* eslint-disable @typescript-eslint/no-require-imports */
-const actualWorkspaceContext =
-  require("@/browser/contexts/WorkspaceContext?real=1") as typeof WorkspaceContextModule;
-/* eslint-enable @typescript-eslint/no-require-imports */
+// Snapshot the real exports before the mock below. Do not load a second copy with
+// require("...?real=1"): Bun's LCOV keeps only the last-loaded copy of a file, so the copy would
+// replace WorkspaceContext.test.tsx's coverage of WorkspaceContext.tsx in the shard.
+const actualWorkspaceContext = { ...ActualWorkspaceContextModule };
 
 void mock.module("@/browser/contexts/WorkspaceContext", () => ({
   ...actualWorkspaceContext,
