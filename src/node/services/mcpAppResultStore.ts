@@ -93,6 +93,17 @@ const McpAppModelContextFileSchema = z.object({
   views: z.array(McpAppModelContextSchema),
 });
 
+/** A widget state's JSON (null clears it); throws when it is not JSON or over the cap. */
+function widgetStateJson(state: unknown): string | null {
+  if (state === null) return null;
+  const json = JSON.stringify(state);
+  if (json === undefined) throw new Error("The widget state is not JSON");
+  if (Buffer.byteLength(json, "utf8") > MCP_APP_WIDGET_STATE_MAX_BYTES) {
+    throw new Error("The widget state is too large");
+  }
+  return json;
+}
+
 function fileNameFor(toolCallId: string): string {
   // Tool call IDs come from providers; hash them so they are always safe file names.
   return `${createHash("sha256").update(toolCallId).digest("hex").slice(0, 40)}.json`;
@@ -202,10 +213,7 @@ export class McpAppResultStore {
     recordCreatedAt: number,
     state: unknown
   ): Promise<void> {
-    const stateJson = state === null ? null : JSON.stringify(state);
-    if (stateJson === undefined) throw new Error("The widget state is not JSON");
-    if (stateJson !== null && Buffer.byteLength(stateJson, "utf8") > MCP_APP_WIDGET_STATE_MAX_BYTES)
-      throw new Error("The widget state is too large");
+    const stateJson = widgetStateJson(state);
     const dir = this.dirFor(workspaceId);
     const filePath = path.join(dir, fileNameFor(toolCallId));
     const updated = await withTargetMutationLock(this.rootDir, path.dirname(dir), async () => {

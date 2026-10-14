@@ -138,6 +138,30 @@ function assertMcpAppsEnabled(context: McpAppsContext): void {
   }
 }
 
+/** What a view gets from its result record; without one it opens with tool input only. */
+function viewFieldsOfRecord(record: McpAppResultRecord | null) {
+  if (record === null) {
+    return {
+      resultAvailable: false,
+      result: null,
+      widgetState: null,
+      widgetStateBinding: null,
+      invocation: null,
+    };
+  }
+  return {
+    resultAvailable: record.result !== null,
+    result: record.result,
+    widgetState: record.widgetState ?? null,
+    widgetStateBinding: record.createdAt,
+    invocation: {
+      serverName: record.serverName,
+      toolName: record.toolName,
+      arguments: record.arguments,
+    },
+  };
+}
+
 export async function getMcpAppView(
   context: McpAppsContext,
   input: z.infer<typeof McpAppViewRequestSchema>,
@@ -182,7 +206,6 @@ export async function getMcpAppView(
       input.resourceUri,
       signal !== undefined ? { signal } : undefined
     );
-    const result = record?.result ?? null;
     const boundServerName = record?.serverName ?? input.serverName;
     const approvalProjectPath = await approvalProjectPathOf(
       context,
@@ -193,22 +216,11 @@ export async function getMcpAppView(
       success: true,
       data: {
         ...resource,
-        resultAvailable: result !== null,
-        result,
+        ...viewFieldsOfRecord(record),
         // Taken before the read below: the list read is at least this new.
         approvedDomainsRevision: committedViewDomainsRevision,
         approvedDomains: approvedDomainsIn(context, approvalProjectPath, boundServerName),
         approvalProjectPath,
-        widgetState: record?.widgetState ?? null,
-        widgetStateBinding: record?.createdAt ?? null,
-        invocation:
-          record !== null
-            ? {
-                serverName: record.serverName,
-                toolName: record.toolName,
-                arguments: record.arguments,
-              }
-            : null,
       },
     };
   } catch (error) {
