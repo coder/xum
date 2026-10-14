@@ -20,7 +20,7 @@ describe("readOpenAIExtension", () => {
     expect(warnings).toEqual([]);
     expect(extension).toEqual({
       apps: "./.app.json",
-      hooks: ["./hooks/session.json", { hooks: {} }],
+      hooks: ["./hooks/session.json", { inline: { hooks: {} }, index: 1 }],
       onboardingSkill: "./skills/setup/SKILL.md",
     });
   });

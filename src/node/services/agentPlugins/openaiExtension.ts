@@ -45,8 +45,13 @@ export interface OpenAIPluginInterface {
   screenshots?: string[];
 }
 
-/** One `hooks` entry: a relative hooks-file path or an inline hooks object (kept opaque). */
-export type OpenAIPluginHooksEntry = string | Record<string, unknown>;
+/**
+ * One `hooks` entry: a relative hooks-file path, or an inline hooks object (kept opaque) with its
+ * index in the manifest's list. Inline hooks are labeled `<manifest>#hooks[<index>]`, and those
+ * labels are trust keys: the index is the declared one, so dropping an invalid earlier entry does
+ * not renumber (and so untrust or retrust) the hooks after it (Codex PRRT_kwDOPxxmWM6r6Grs).
+ */
+export type OpenAIPluginHooksEntry = string | { inline: Record<string, unknown>; index: number };
 
 export interface OpenAIPluginExtension {
   /** Relative path to the registered MCP server mapping (`.app.json`). */
@@ -202,9 +207,9 @@ export function normalizeOpenAIRelativePath(value: unknown): string | undefined 
 function readHooks(raw: unknown, warnings: string[]): OpenAIPluginHooksEntry[] {
   const entries: unknown[] = Array.isArray(raw) ? raw : [raw];
   const hooks: OpenAIPluginHooksEntry[] = [];
-  for (const entry of entries) {
+  for (const [index, entry] of entries.entries()) {
     if (isPlainObject(entry)) {
-      hooks.push(entry);
+      hooks.push({ inline: entry, index });
       continue;
     }
     const relative = normalizeOpenAIRelativePath(entry);

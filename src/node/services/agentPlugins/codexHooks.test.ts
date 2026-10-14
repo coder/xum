@@ -176,6 +176,17 @@ describe("loadPluginCodexHooks", () => {
     expect(hooks.map((hook) => hook.source)).toEqual(["plugin.json#hooks[1]"]);
   });
 
+  test("an inline entry keeps its declared index after an invalid entry is dropped", async () => {
+    using tmp = new DisposableTempDir("codex-hooks-inline-index");
+    const document = { hooks: { Stop: [{ hooks: [scan] }] } };
+    // hooks[0] is not a relative path, so discovery drops it.
+    const plugin = await writePlugin(tmp.path, {}, { "com.openai": { hooks: [1, document] } });
+
+    const { hooks } = await loadPluginCodexHooks(plugin);
+
+    expect(hooks.map((hook) => hook.key)).toEqual(["plugin.json#hooks[1]#Stop[0][0]"]);
+  });
+
   test("a com.openai pointer replaces the default file instead of adding to it", async () => {
     using tmp = new DisposableTempDir("codex-hooks-pointer");
     const plugin = await writePlugin(
@@ -445,6 +456,48 @@ describe("loadPluginCodexHooks", () => {
     ]);
     expect(warnings).toHaveLength(4);
     for (const warning of warnings) expect(warning).toMatch(/missing or invalid fields/);
+  });
+
+  test("null matcher and null timeout mean omitted, as Codex's Option fields read them", async () => {
+    using tmp = new DisposableTempDir("codex-hooks-null-fields");
+    const plugin = await writePlugin(tmp.path, {
+      "hooks/hooks.json": {
+        hooks: {
+          PreToolUse: [{ matcher: null, hooks: [{ ...scan, timeout: null }] }, { hooks: [scan] }],
+        },
+      },
+    });
+
+    const { hooks, warnings } = await loadPluginCodexHooks(plugin);
+
+    expect(warnings).toEqual([]);
+    expect(hooks.map((hook) => [hook.matcher, hook.handler])).toEqual([
+      [undefined, { type: "mcp_tool", server: "scanner", tool: "scan", input: scan.input }],
+      [undefined, { type: "mcp_tool", server: "scanner", tool: "scan", input: scan.input }],
+    ]);
+  });
+
+  test("a fractional timeout drops its handler: Codex reads timeout as whole seconds", async () => {
+    using tmp = new DisposableTempDir("codex-hooks-fraction");
+    const plugin = await writePlugin(tmp.path, {
+      "hooks/hooks.json": {
+        hooks: {
+          Stop: [
+            {
+              hooks: [
+                { ...scan, timeout: 1.5 },
+                { ...scan, timeout: 2 },
+              ],
+            },
+          ],
+        },
+      },
+    });
+
+    const { hooks, warnings } = await loadPluginCodexHooks(plugin);
+
+    expect(hooks.map((hook) => hook.key)).toEqual(["hooks/hooks.json#Stop[0][1]"]);
+    expect(warnings).toHaveLength(1);
   });
 
   test("a handler whose input holds a non-finite number is dropped with a warning", async () => {

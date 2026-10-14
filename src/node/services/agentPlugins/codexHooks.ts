@@ -66,6 +66,25 @@ const MAX_PLUGIN_HOOKS = 256;
 /** Warnings kept per plugin: each file can hold ~100k invalid groups, each one a warning. */
 const MAX_HOOK_WARNINGS = 50;
 
+/**
+ * Keeps the first MAX_HOOK_WARNINGS warnings and counts the rest, so a file with ~100k invalid
+ * groups never holds ~100k strings (Codex PRRT_kwDOPxxmWM6rRIkV).
+ */
+class HookWarnings {
+  private readonly kept: string[] = [];
+  private omitted = 0;
+
+  push(warning: string): void {
+    if (this.kept.length < MAX_HOOK_WARNINGS) this.kept.push(warning);
+    else this.omitted++;
+  }
+
+  list(): string[] {
+    const omitted = this.omitted > 0 ? [`${this.omitted} more hook warnings not shown`] : [];
+    return [...this.kept, ...omitted];
+  }
+}
+
 /** A parsed hook; the trust review state is added by pluginHookTrust.ts. */
 export type PluginHookDefinition = Omit<AgentPluginHook, "review">;
 
@@ -87,7 +106,7 @@ export interface PluginHooksLoadResult {
 export async function loadPluginCodexHooks(
   plugin: Pick<AgentPluginInfo, "rootPath" | "openai" | "openaiManifestPath">
 ): Promise<PluginHooksLoadResult> {
-  const warnings: string[] = [];
+  const warnings = new HookWarnings();
   const hooks: PluginHookDefinition[] = [];
   const pointer = plugin.openai?.hooks;
   // Discovery keeps every valid entry; a manifest can repeat one path tens of thousands of times.
@@ -98,15 +117,11 @@ export async function loadPluginCodexHooks(
   }
   const entries = pointer?.slice(0, MAX_HOOK_POINTER_ENTRIES) ?? [DEFAULT_HOOKS_FILE];
   const seenFiles = new Set<string>();
-  let omittedWarnings = 0;
   const inlineSource = path.normalize(plugin.openaiManifestPath ?? PLUGIN_MANIFEST_RELATIVE_PATH);
-  for (const [index, entry] of entries.entries()) {
-    // Trimmed after each entry, so at most one file's warnings are held at a time.
-    omittedWarnings += Math.max(0, warnings.length - MAX_HOOK_WARNINGS);
-    warnings.length = Math.min(warnings.length, MAX_HOOK_WARNINGS);
+  for (const entry of entries) {
     if (hooks.length > MAX_PLUGIN_HOOKS) break;
     if (typeof entry !== "string") {
-      parseHooksDocument(entry, `${inlineSource}#hooks[${index}]`, hooks, warnings);
+      parseHooksDocument(entry.inline, `${inlineSource}#hooks[${entry.index}]`, hooks, warnings);
       continue;
     }
     // A hook key is `<source>#<event>[group][handler]`, and an inline source is
@@ -132,21 +147,19 @@ export async function loadPluginCodexHooks(
     }
     parseHooksDocument(document, path.normalize(entry), hooks, warnings);
   }
-  omittedWarnings += Math.max(0, warnings.length - MAX_HOOK_WARNINGS);
-  warnings.length = Math.min(warnings.length, MAX_HOOK_WARNINGS);
-  if (omittedWarnings > 0) warnings.push(`${omittedWarnings} more hook warnings not shown`);
+  const list = warnings.list();
   if (hooks.length > MAX_PLUGIN_HOOKS) {
-    warnings.push(`More than ${MAX_PLUGIN_HOOKS} hooks; ignoring the rest`);
+    list.push(`More than ${MAX_PLUGIN_HOOKS} hooks; ignoring the rest`);
     hooks.length = MAX_PLUGIN_HOOKS;
   }
-  return { hooks, warnings };
+  return { hooks, warnings: list };
 }
 
 async function readHooksFile(
   rootPath: string,
   relativePath: string,
   isDefault: boolean,
-  warnings: string[]
+  warnings: HookWarnings
 ): Promise<string | undefined> {
   let canonical: string;
   try {
@@ -179,63 +192,59 @@ function parseHooksDocument(
   document: unknown,
   source: string,
   out: PluginHookDefinition[],
-  warnings: string[]
+  warnings: HookWarnings
 ): void {
   if (!isPlainObject(document) || !isPlainObject(document.hooks)) {
     warnings.push(`${source}: expected { "hooks": { <Event>: [...] } }; ignoring it`);
     return;
   }
-  for (const [event, groups] of Object.entries(document.hooks)) {
+  for (const [event, value] of Object.entries(document.hooks)) {
+    const groups = readEventGroups(event, value, source, warnings);
+    if (groups === undefined) continue;
     const mapped = Object.hasOwn(MAPPED_CODEX_HOOK_EVENTS, event);
-    if (!mapped && !IGNORED_CODEX_HOOK_EVENTS.has(event)) {
-      warnings.push(`${source}: unknown hook event '${event}'; ignoring it`);
-      continue;
-    }
-    if (!Array.isArray(groups)) {
-      warnings.push(`${source}: '${event}' must be an array of matcher groups; ignoring it`);
-      continue;
-    }
     for (const [groupIndex, group] of groups.entries()) {
+      // The plugin's hook budget is checked inside each document too (PRRT_kwDOPxxmWM6rRIkV).
+      if (out.length > MAX_PLUGIN_HOOKS) return;
       const groupKey = `${source}#${event}[${groupIndex}]`;
       parseMatcherGroup(group, { source, groupKey, event, mapped }, out, warnings);
     }
   }
 }
 
+/** An event's matcher groups, or undefined (with a warning) for an unknown event or a non-array. */
+function readEventGroups(
+  event: string,
+  groups: unknown,
+  source: string,
+  warnings: HookWarnings
+): unknown[] | undefined {
+  if (!Object.hasOwn(MAPPED_CODEX_HOOK_EVENTS, event) && !IGNORED_CODEX_HOOK_EVENTS.has(event)) {
+    warnings.push(`${source}: unknown hook event '${event}'; ignoring it`);
+    return undefined;
+  }
+  if (!Array.isArray(groups)) {
+    warnings.push(`${source}: '${event}' must be an array of matcher groups; ignoring it`);
+    return undefined;
+  }
+  const list: unknown[] = groups;
+  return list;
+}
+
 function parseMatcherGroup(
   group: unknown,
   where: { source: string; groupKey: string; event: string; mapped: boolean },
   out: PluginHookDefinition[],
-  warnings: string[]
+  warnings: HookWarnings
 ): void {
   const { source, groupKey, event, mapped } = where;
   if (!isPlainObject(group) || !Array.isArray(group.hooks)) {
     warnings.push(`${source}: a '${event}' matcher group needs a "hooks" array; ignoring it`);
     return;
   }
-  // Codex treats "*", "" and an omitted matcher as match-all, and "*" is not a valid regex.
-  // All three become "no matcher", which the runtime matches against every tool. On the events
-  // where Codex ignores the matcher, an invalid one must not drop the group, so it is ignored too.
-  let matcher: string | undefined;
-  if (
-    group.matcher !== undefined &&
-    group.matcher !== "*" &&
-    group.matcher !== "" &&
-    !MATCHERLESS_CODEX_HOOK_EVENTS.has(event)
-  ) {
-    const error =
-      typeof group.matcher === "string" ? hookMatcherError(group.matcher) : "not a string";
-    if (typeof group.matcher !== "string" || error !== undefined) {
-      // Name the matcher: a plugin can have several groups per event, and the warning must say
-      // which one Xum refused.
-      warnings.push(
-        `${source}: a '${event}' matcher is not a valid regex (${String(error)}); ignoring its group ${quoteForWarning(group.matcher)}`
-      );
-      return;
-    }
-    matcher = group.matcher;
-  }
+  const matcher = readGroupMatcher(group.matcher, source, event, warnings);
+  if (matcher === null) return;
   for (const [handlerIndex, raw] of group.hooks.entries()) {
+    if (out.length > MAX_PLUGIN_HOOKS) return;
     const handler = parseHandler(raw, `${source}: '${event}'`, warnings);
     if (handler === undefined) continue;
     let hash: string;
@@ -263,10 +272,42 @@ function parseMatcherGroup(
   }
 }
 
+/**
+ * The group's matcher: undefined for match-all, null (with a warning) when Xum refuses it.
+ *
+ * Codex treats "*", "", null and an omitted matcher as match-all (`matcher: Option<String>`), and
+ * "*" is not a valid regex. All of them become "no matcher", which the runtime matches against
+ * every tool. On the events where Codex ignores the matcher, an invalid one must not drop the
+ * group, so it is ignored too.
+ */
+function readGroupMatcher(
+  matcher: unknown,
+  source: string,
+  event: string,
+  warnings: HookWarnings
+): string | undefined | null {
+  if (
+    matcher == null ||
+    matcher === "*" ||
+    matcher === "" ||
+    MATCHERLESS_CODEX_HOOK_EVENTS.has(event)
+  ) {
+    return undefined;
+  }
+  const error = typeof matcher === "string" ? hookMatcherError(matcher) : "not a string";
+  if (typeof matcher === "string" && error === undefined) return matcher;
+  // Name the matcher: a plugin can have several groups per event, and the warning must say which
+  // one Xum refused.
+  warnings.push(
+    `${source}: a '${event}' matcher is not a valid regex (${String(error)}); ignoring its group ${quoteForWarning(matcher)}`
+  );
+  return null;
+}
+
 function parseHandler(
   raw: unknown,
   where: string,
-  warnings: string[]
+  warnings: HookWarnings
 ): PluginHookHandler | undefined {
   if (!isPlainObject(raw)) {
     warnings.push(`${where}: a hook handler must be an object; ignoring it`);
@@ -289,11 +330,14 @@ function parseHandler(
         invalid = "input";
         break;
       }
-      // Codex raises a timeout below one second (including 0) to one second instead of dropping
-      // the hook. Finite: `1e400` parses to Infinity.
+      // Codex reads `timeout: Option<u64>` (codex-rs/config/src/hook_config.rs): null is the
+      // default, and a fraction or a negative number does not parse. Codex then raises 0 to one
+      // second instead of dropping the hook. Codex drops the whole file on a parse error; Xum
+      // drops only this handler, as for every invalid field. Integer also excludes `1e400`
+      // (Infinity), which JSON and the review RPC cannot carry.
       if (
-        timeout !== undefined &&
-        !(typeof timeout === "number" && Number.isFinite(timeout) && timeout >= 0)
+        timeout != null &&
+        !(typeof timeout === "number" && Number.isSafeInteger(timeout) && timeout >= 0)
       ) {
         invalid = "timeout";
         break;
