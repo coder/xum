@@ -455,6 +455,8 @@ export interface BackgroundProcess {
    * alone can match differently from its whole line.
    */
   unreadLineDecision?: SplitLineDecision;
+  /** The filter (see filterKey) unreadLineDecision was made under; another filter clears it. */
+  unreadLineFilter?: string;
   /** True when the last getOutput read was capped: the next read is paging, not polling. */
   lastReadCapped?: boolean;
   /** Optional write-time monitor that wakes the agent on matching output lines. */
@@ -518,6 +520,8 @@ interface BackgroundOutputPage {
   capped: boolean;
   /** Set when `unread` starts with the tail of a line split by this read or an earlier one. */
   unreadLineDecision: SplitLineDecision | undefined;
+  /** True when this read decided a line longer than the window on its head. */
+  decidedOnHead?: boolean;
 }
 
 /**
@@ -591,6 +595,7 @@ function takeLinePastWindow(
     unread: line.slice(head.length),
     capped: true,
     unreadLineDecision: kept ? "kept" : "dropped",
+    decidedOnHead: decision == null,
   };
 }
 
@@ -635,6 +640,12 @@ function takeLinesWithinByteCap(
   return { shown, rest: [], splitLine: false };
 }
 
+/** Identifies a read's filter mode, so a split line's decision is reused only under it. */
+function filterKey(filter: string | undefined, filterExclude: boolean | undefined): string {
+  if (filter == null) return "";
+  return `${filterExclude === true ? "exclude" : "match"}:${filter}`;
+}
+
 /**
  * The filter arguments of the next-read call. The exact call, filter mode included: a read
  * without filter_exclude would keep the lines this read dropped and drop the ones it kept.
@@ -668,15 +679,24 @@ function formatCappedReadNote(
 
 /**
  * The read window: getOutput holds at most this many bytes of output in memory between reads
- * (plus the few bytes that finish a UTF-8 character). Each handle read loads at most one page
- * (BASH_MAX_TOTAL_BYTES), and only as much as the window has room for, so the cursor never moves
- * back and paging through a log reads each byte once. The bound counts raw bytes from
- * output.log: their decoded text never has more UTF-16 code units than that.
+ * (plus the few bytes that finish a UTF-8 character). An unfiltered read loads at most one page
+ * (BASH_MAX_TOTAL_BYTES), and only as much as the window has room for. A filtered read scans in
+ * larger chunks and drops the lines its filter rejects at once (see scanFilteredOutput). The
+ * cursor never moves back, so paging through a log reads each byte once (a filtered chunk whose
+ * kept lines overflow the window is read again in a smaller read). The bound counts raw bytes
+ * from output.log: their decoded text never has more UTF-16 code units than that.
  */
 const MAX_RETAINED_UNREAD_BYTES = 4 * BASH_MAX_TOTAL_BYTES;
 
-/** Shortest time a filtered getOutput read scans a large log for matches (see nextWaitStep). */
-const MIN_FILTERED_SCAN_MS = 1_000;
+/**
+ * Largest chunk a filtered scan loads per handle read. Each remote read costs exec round trips,
+ * so a sparse filter over a large remote log needs big chunks to finish in one call. The chunk
+ * doubles from one page, so a dense region overflows (and rereads) at most about what it read.
+ */
+const FILTERED_SCAN_CHUNK_BYTES = 1024 * 1024;
+
+/** Said when a filtered read decided a line longer than the window on its head. */
+const DECIDED_ON_HEAD_NOTE = `A line over ${MAX_RETAINED_UNREAD_BYTES} bytes was filtered on its first ${MAX_RETAINED_UNREAD_BYTES} bytes.`;
 
 const OUTPUT_POLL_INTERVAL_MS = 100;
 
@@ -696,6 +716,8 @@ interface OutputWindow {
   status: BackgroundProcess["status"];
   /** True once this call's window held a complete line. */
   sawCompleteLine: boolean;
+  /** True once this call decided a line longer than the window on its head. */
+  decidedOnHead: boolean;
 }
 
 interface OutputWaitOptions {
@@ -732,44 +754,204 @@ function lineRunsOnInWindow(window: OutputWindow): boolean {
   );
 }
 
+/** UTF-8 size of the complete lines in `pending` (everything up to its last "\n"). */
+function completeLineBytes(pending: string): number {
+  return Buffer.byteLength(pending.slice(0, pending.lastIndexOf("\n") + 1), "utf8");
+}
+
+/** A full page of complete lines, or a full window: a filtered read stops reading there. */
+function windowIsFull(pending: string): boolean {
+  return (
+    completeLineBytes(pending) >= BASH_MAX_TOTAL_BYTES ||
+    Buffer.byteLength(pending, "utf8") >= MAX_RETAINED_UNREAD_BYTES
+  );
+}
+
 /**
- * Whether getOutput's wait can stop. Unfiltered: a complete line, or a full window. Filtered:
- * see scanFindsOutput. When the wait goes on, the lines the page would drop are dropped now, so
- * the window has room for the rest of a filtered scan.
+ * Whether getOutput's wait can stop. Unfiltered: a complete line, or a full window. Filtered (the
+ * scan already dropped the rejected lines): a full window, or the page it gives. filter_exclude
+ * waits for a line that is not blank (or a kept split line's tail); the blank lines stay in the
+ * window and are returned with it. filter waits for a matching line or, as before reads were
+ * bounded, for any complete line.
  */
 function windowHasOutputToReturn(window: OutputWindow, options: OutputWaitOptions): boolean {
   if (!options.filtered) return !window.reachedEnd || window.pending.includes("\n");
-  window.sawCompleteLine ||= window.pending.includes("\n");
-  const scan = takeBackgroundOutputPage(
+  if (windowIsFull(window.pending)) return true;
+  const page = takeBackgroundOutputPage(
     window.pending,
     window.status !== "running",
     window.reachedEnd,
     window.decision,
     options.keepLine
   );
-  const found = scanFindsOutput(scan, window, options.filterExclude);
-  if (!found) {
-    window.pending = scan.unread;
-    window.decision = scan.unreadLineDecision;
-  }
-  return found;
+  if (!options.filterExclude) return page.shownLines > 0 || window.sawCompleteLine;
+  return page.output.trim().length > 0 || (window.decision === "kept" && page.shownLines > 0);
+}
+
+/** What a filtered scan keeps of `raw`: see dropRejectedLines. */
+interface FilteredOutput {
+  pending: string;
+  decision: SplitLineDecision | undefined;
+  sawCompleteLine: boolean;
+  decidedOnHead: boolean;
 }
 
 /**
- * Whether the page a filtered window would give ends the wait. filter_exclude waits for a line
- * that is not blank (or a kept split line's tail), so blank lines it drops while waiting are not
- * returned later. filter waits for a matching line, or (as before reads were bounded) any
- * complete line once the window is at the end of the file.
+ * Drop the complete lines of `raw` the page would not return, keeping the rest (and the trailing
+ * fragment) for it. A line longer than the window is decided on its head, whether a chunk holds
+ * all of it (onWindowHead) or the window ends inside it (takeLinePastWindow): dropped, its tail is
+ * dropped too; kept, the page returns it in pieces.
  */
-function scanFindsOutput(
-  scan: BackgroundOutputPage,
+function dropRejectedLines(
+  raw: string,
+  exited: boolean,
+  reachedEnd: boolean,
+  decision: SplitLineDecision | undefined,
+  keepLine: (line: string) => boolean
+): FilteredOutput {
+  const complete = exited && reachedEnd;
+  if (!complete && !raw.includes("\n")) return decideFragment(raw, reachedEnd, decision, keepLine);
+  const lines = raw.split("\n");
+  // On exit at the end of the file the last element is a line too; "" stands in as the fragment.
+  const fragment = complete ? "" : (lines.pop() ?? "");
+  const headFilter = onWindowHead(keepLine);
+  const kept = lines.filter(pageLineFilter(exited, decision, headFilter.keepLine));
+  return {
+    pending: [...kept, fragment].join("\n"),
+    // A kept split line stays the first line; any other decision belonged to a dropped line.
+    decision: decision === "kept" ? "kept" : undefined,
+    sawCompleteLine: true,
+    decidedOnHead: headFilter.decidedOnHead(),
+  };
+}
+
+/** `keepLine` on at most a window's worth of each line, noting when a line was longer. */
+function onWindowHead(keepLine: (line: string) => boolean): {
+  keepLine: (line: string) => boolean;
+  decidedOnHead: () => boolean;
+} {
+  let decidedOnHead = false;
+  return {
+    keepLine: (line) => {
+      if (Buffer.byteLength(line, "utf8") <= MAX_RETAINED_UNREAD_BYTES) return keepLine(line);
+      decidedOnHead = true;
+      return keepLine(truncateUtf8Prefix(line, MAX_RETAINED_UNREAD_BYTES));
+    },
+    decidedOnHead: () => decidedOnHead,
+  };
+}
+
+/** `raw` has no complete line: keep it, unless it fills the window (see dropRejectedLines). */
+function decideFragment(
+  raw: string,
+  reachedEnd: boolean,
+  decision: SplitLineDecision | undefined,
+  keepLine: (line: string) => boolean
+): FilteredOutput {
+  const undecided = { pending: raw, decision, sawCompleteLine: false, decidedOnHead: false };
+  if (reachedEnd || Buffer.byteLength(raw, "utf8") < MAX_RETAINED_UNREAD_BYTES) return undecided;
+  const page = takeLinePastWindow(raw, decision, keepLine);
+  const decidedOnHead = page.decidedOnHead === true;
+  if (page.unreadLineDecision === "kept") return { ...undecided, decidedOnHead };
+  return { pending: "", decision: "dropped", sawCompleteLine: false, decidedOnHead };
+}
+
+/**
+ * A filtered getOutput read: scan output.log from the cursor up to the file size the first read
+ * saw (output that arrives meanwhile waits for the next call), or until the window is full. Each
+ * handle read loads a chunk that doubles up to FILTERED_SCAN_CHUNK_BYTES, and the rejected lines
+ * are dropped at once, so memory stays within the window. A chunk whose kept lines overflow the
+ * window is read again with only the room the window has. Returns false when interrupted.
+ */
+async function scanFilteredOutput(
+  proc: BackgroundProcess,
   window: OutputWindow,
-  filterExclude: boolean
-): boolean {
-  if (filterExclude) {
-    return scan.output.trim().length > 0 || (window.decision === "kept" && scan.shownLines > 0);
+  keepLine: (line: string) => boolean,
+  isInterrupted: () => boolean
+): Promise<boolean> {
+  let chunkBytes = BASH_MAX_TOTAL_BYTES;
+  let targetOffset = Infinity;
+  while (true) {
+    const offset = proc.outputBytesRead;
+    const room = Math.max(1, MAX_RETAINED_UNREAD_BYTES - Buffer.byteLength(window.pending, "utf8"));
+    // Never past the file size the first read saw (plus the bytes that finish a character).
+    const readBytes = Math.max(1, Math.min(chunkBytes, targetOffset - offset));
+    const result = await proc.handle.readOutput(offset, readBytes);
+    assert(result.newOffset >= offset, "BackgroundHandle.readOutput moved the cursor back");
+    targetOffset = Math.min(targetOffset, result.fileSize);
+    const advanced = result.newOffset > offset;
+    const reachedEnd = !advanced || result.newOffset >= result.fileSize;
+    const kept = dropRejectedLines(
+      window.pending + result.content,
+      window.status !== "running",
+      reachedEnd,
+      window.decision,
+      keepLine
+    );
+    if (readBytes > room && Buffer.byteLength(kept.pending, "utf8") > MAX_RETAINED_UNREAD_BYTES) {
+      chunkBytes = room;
+      continue;
+    }
+    proc.outputBytesRead = result.newOffset;
+    commitScannedChunk(window, kept, reachedEnd, result.fileSize);
+    if (reachedEnd || scanReachedStop(window, result.newOffset, targetOffset)) return true;
+    if (isInterrupted()) return false;
+    chunkBytes = Math.min(chunkBytes * 2, FILTERED_SCAN_CHUNK_BYTES);
   }
-  return scan.shownLines > 0 || (window.reachedEnd && window.sawCompleteLine);
+}
+
+/**
+ * The interrupted return shows nothing, so keep what this call read for the next one; otherwise
+ * the next getOutput() would resume past it and silently drop it. This matters now that
+ * task_await aborts a still-pending bash read once min_completed is satisfied. (A filtered scan
+ * has already dropped the lines its filter rejected, as a completed filtered read does.)
+ */
+function keepInterruptedWindow(proc: BackgroundProcess, window: OutputWindow): null {
+  proc.incompleteLineBuffer = window.pending;
+  proc.unreadLineDecision = window.decision;
+  return null;
+}
+
+/** Add DECIDED_ON_HEAD_NOTE when a filtered read decided a line on its head (window or page). */
+function appendDecidedOnHeadNote(
+  note: string | undefined,
+  filtered: boolean,
+  sources: Array<{ decidedOnHead?: boolean }>
+): string | undefined {
+  if (!filtered || !sources.some((source) => source.decidedOnHead === true)) return note;
+  return note == null ? DECIDED_ON_HEAD_NOTE : `${note} ${DECIDED_ON_HEAD_NOTE}`;
+}
+
+/** A filtered scan stops at the file size its first read saw, or with a full window. */
+function scanReachedStop(window: OutputWindow, offset: number, targetOffset: number): boolean {
+  return offset >= targetOffset || windowIsFull(window.pending);
+}
+
+/** Take a scanned chunk's kept output into the window (see scanFilteredOutput). */
+function commitScannedChunk(
+  window: OutputWindow,
+  kept: FilteredOutput,
+  reachedEnd: boolean,
+  fileSize: number
+): void {
+  window.pending = kept.pending;
+  window.decision = kept.decision;
+  window.reachedEnd = reachedEnd;
+  window.fileSize = fileSize;
+  window.sawCompleteLine ||= kept.sawCompleteLine;
+  window.decidedOnHead ||= kept.decidedOnHead;
+}
+
+/** One read of getOutput's wait loop. Returns false when a filtered scan was interrupted. */
+async function readOutputStep(
+  proc: BackgroundProcess,
+  window: OutputWindow,
+  options: OutputWaitOptions,
+  isInterrupted: () => boolean
+): Promise<boolean> {
+  if (options.filtered) return scanFilteredOutput(proc, window, options.keepLine, isInterrupted);
+  await readIntoWindow(proc, window);
+  return true;
 }
 
 /** What getOutput's wait does after a read that found nothing to return. */
@@ -777,12 +959,7 @@ function nextWaitStep(
   window: OutputWindow,
   elapsedMs: number,
   timeoutMs: number
-): "read" | "sleep" | "stop" {
-  // A filtered scan dropped a full window: read the next one now. Scan for a while even at
-  // timeout 0, so a filtered read still searches a large log instead of one window of it.
-  if (!window.reachedEnd) {
-    return elapsedMs < Math.max(timeoutMs, MIN_FILTERED_SCAN_MS) ? "read" : "stop";
-  }
+): "sleep" | "stop" {
   if (window.status !== "running") return "stop";
   return elapsedMs < timeoutMs ? "sleep" : "stop";
 }
@@ -2784,6 +2961,11 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     }
     const keepLine = (line: string) =>
       !filterRegex || filterRegex.test(line) !== (filterExclude === true);
+    // A split line's stored decision holds only under the filter that made it: an unfiltered
+    // read after a filtered one must not skip the tail of a line that filter dropped.
+    const lineFilter = filterKey(filter, filterExclude);
+    if (proc.unreadLineFilter !== lineFilter) proc.unreadLineDecision = undefined;
+    proc.unreadLineFilter = lineFilter;
 
     const startTime = Date.now();
     // File offset where this read's processable content begins (start cursor minus the buffered
@@ -2904,7 +3086,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
           ? ((await this.getProcess(processId))?.exitCode ?? undefined)
           : undefined,
       elapsed_ms: Date.now() - startTime,
-      note,
+      note: appendDecidedOnHeadNote(note, filterRegex != null, [window, page]),
     };
   }
 
@@ -2926,25 +3108,21 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       fileSize: proc.outputBytesRead,
       status: proc.status,
       sawCompleteLine: false,
+      decidedOnHead: false,
     };
+    const isInterrupted = () => this.isWaitInterrupted(options);
 
     // Blocking wait loop: poll for output up to the timeout
     while (true) {
-      await readIntoWindow(proc, window);
-      window.status = await this.refreshedStatus(proc);
-      if (lineRunsOnInWindow(window)) continue;
-      if (windowHasOutputToReturn(window, options)) break;
-      const step = nextWaitStep(window, Date.now() - startTime, options.timeoutMs);
-      if (step === "stop") break;
-      if (this.isWaitInterrupted(options)) {
-        // The interrupted return shows nothing, so keep what this call read for the next one;
-        // otherwise the next getOutput() would resume past it and silently drop it. This matters
-        // now that task_await aborts a still-pending bash read once min_completed is satisfied.
-        proc.incompleteLineBuffer = window.pending;
-        proc.unreadLineDecision = window.decision;
-        return null;
+      if (!(await readOutputStep(proc, window, options, isInterrupted))) {
+        return keepInterruptedWindow(proc, window);
       }
-      if (step === "sleep") await sleepMs(OUTPUT_POLL_INTERVAL_MS);
+      window.status = await this.refreshedStatus(proc);
+      if (!options.filtered && lineRunsOnInWindow(window)) continue;
+      if (windowHasOutputToReturn(window, options)) break;
+      if (nextWaitStep(window, Date.now() - startTime, options.timeoutMs) === "stop") break;
+      if (isInterrupted()) return keepInterruptedWindow(proc, window);
+      await sleepMs(OUTPUT_POLL_INTERVAL_MS);
     }
     await drainAfterExit(proc, window);
     return window;
