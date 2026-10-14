@@ -103,6 +103,7 @@ test("block mode stops a regressing commit before it runs, unless it carries Cra
     "git -c core.editor=true --no-pager commit -am x",
     "git -c user.name=a\\ b commit -am x",
     'git -c user.name="a\\"b" commit -am x',
+    "git \\\n  commit -am x",
     "git status; git commit -am x",
   ]) {
     expect({ commit, status: runGate(gate, "pre", commit).status }).toEqual({ commit, status: 1 });
@@ -165,6 +166,8 @@ test("other commands skip the check, and a broken gate never blocks", () => {
     'git -C "other dir" commit -am x',
     "git --git-dir=../other/.git commit -am x",
     "env -C ../other git commit -am x",
+    "env -C../other git commit -am x",
+    "env --chdir=../other git commit -am x",
     "GIT_DIR=../other/.git git push",
     "git commit -am x && git -C ../other push",
   ]) {

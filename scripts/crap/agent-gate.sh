@@ -44,6 +44,9 @@ if [[ -z "$script" && -r "${XUM_TOOL_INPUT_PATH:-}" ]]; then
   script=${script//\\\"/\"}
   script=${script//$'\x01'/\\}
 fi
+# Bash drops a backslash-newline before it splits words (git \<newline>commit).
+continuation=$'\\\n'
+script=${script//"$continuation"/}
 # A `git commit` or `git push` at a command position (string start, a newline,
 # or after ; & | ( { ), so a quoted "git commit" in an echo does not match.
 # Only git's global options may sit between git and the subcommand, so read-only
@@ -62,7 +65,8 @@ git_write="(^|[;&|({"$'\n'"])[[:space:]]*(${prefix})*git(${global})*[[:space:]]+
 # prefix or git globals (git -c x=y -C dir commit, env -C dir git commit,
 # GIT_DIR=x git push). Text after the subcommand, such as a commit message
 # that mentions cd or -C, does not count.
-selector="(^|[[:space:]])((-C|--chdir|--git-dir|--work-tree)([[:space:]=]|\$)|(GIT_DIR|GIT_WORK_TREE)=)"
+# -C and --chdir may carry the directory attached (env -C../other, --chdir=x).
+selector="(^|[[:space:]])(-C|--chdir|--git-dir([[:space:]=]|\$)|--work-tree([[:space:]=]|\$)|(GIT_DIR|GIT_WORK_TREE)=)"
 other_dir="(^|[;&|({"$'\n'"])[[:space:]]*(cd|pushd)[[:space:]]"
 writes=0
 pushes=0
