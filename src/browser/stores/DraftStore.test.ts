@@ -172,6 +172,14 @@ async function waitFor(
   }
 }
 
+/** The message `flush` rejects with, or "" when it resolves. */
+function flushError(store: DraftStore): Promise<string> {
+  return store.flush(WS_SCOPE).then(
+    () => "",
+    (error: unknown) => String(error)
+  );
+}
+
 let cleanupDom: (() => void) | undefined;
 const stores: DraftStore[] = [];
 
@@ -952,7 +960,7 @@ describe("DraftStore", () => {
     store.setClient(next.client);
 
     store.setText(WS_SCOPE, "typed after the switch");
-    await expect(store.flush(WS_SCOPE)).rejects.toThrow("drafts are not loaded");
+    expect(await flushError(store)).toContain("drafts are not loaded");
     expect(next.control.updates).toBe(0);
     expect(store.getText(WS_SCOPE)).toBe("typed after the switch");
 
@@ -998,7 +1006,7 @@ describe("DraftStore", () => {
 
     control.failUpdates = 100;
     store.setText(WS_SCOPE, "unsaved typing");
-    await expect(store.flush(WS_SCOPE)).rejects.toThrow("update failed");
+    expect(await flushError(store)).toContain("update failed");
     store.setClient(null);
     store.setClient(client);
     // The snapshot still holds the saved text.
