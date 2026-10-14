@@ -1201,6 +1201,56 @@ describe("TaskService", () => {
     expect(messagedWorkspaceIds).not.toContain(streamingTaskId);
   });
 
+  // A legacy row (no taskStatus) is re-driven only for an interrupted tail, a pending compaction
+  // follow-up or pending guidance. Startup used to rotate the attempt of every such row (one full
+  // config.json write each) before it skipped the idle ones: on a large config that alone outlived
+  // the startup step bound (#6511).
+  test("startup skips idle legacy tasks without rotating their attempt", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-legacy-idle";
+    const idleId = "child-legacy-idle";
+    const followUpId = "child-legacy-follow-up";
+    const child = { parentWorkspaceId, agentId: "exec", agentType: "exec" };
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        projectWorkspace(projectPath, "idle", idleId, {
+          ...child,
+          taskAttemptId: "att_00000000000000b1",
+        }),
+        projectWorkspace(projectPath, "follow-up", followUpId, {
+          ...child,
+          taskAttemptId: "att_00000000000000b2",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const dispatchPendingCompactionFollowUp = mock(() => Promise.resolve(Ok(true)));
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+      getStartupRecoveryState: mock((id: string) =>
+        Promise.resolve(id === followUpId ? "follow-up" : "idle")
+      ),
+      dispatchPendingCompactionFollowUp,
+    });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    await taskService.initialize();
+
+    expect(dispatchPendingCompactionFollowUp.mock.calls.map((call) => call[0])).toEqual([
+      followUpId,
+    ]);
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(findWorkspaceInConfig(config, idleId)?.taskAttemptId).toBe("att_00000000000000b1");
+    expect(findWorkspaceInConfig(config, followUpId)?.taskAttemptId).not.toBe(
+      "att_00000000000000b2"
+    );
+  });
+
   // Archiving stops a task's stream but keeps its taskStatus (see isActiveAgentTaskEntry), and
   // legacy rows without a taskStatus count as running. Startup used to re-drive such archived rows
   // on every restart, and the send failed with "Workspace is archived". They stay untouched until
