@@ -505,17 +505,23 @@ function createSecretReader(): SecretReader {
   };
 }
 
-/** The credential URLs an update still has to sign out (raw registry field, #6122). */
-function readPendingSignOuts(rawEntry: unknown): string[] {
-  if (typeof rawEntry !== "object" || rawEntry === null) return [];
-  const value = (rawEntry as { pendingSignOuts?: unknown }).pendingSignOuts;
-  return Array.isArray(value) ? value.filter((url): url is string => typeof url === "string") : [];
-}
+/**
+ * Credential URLs that updates still have to sign out (#6122). Its own file, not a registry
+ * field: an uninstall must not drop it, and the discovery gate checks it with one stat per scan.
+ */
+const PENDING_SIGN_OUTS_FILE_NAME = "plugin-sign-outs-pending.json";
 
-/** The raw entry with these pending sign-outs (the field is dropped when none are left). */
-function withPendingSignOuts(rawEntry: unknown, urls: string[]): unknown {
-  const { pendingSignOuts: _previous, ...rest } = rawEntry as Record<string, unknown>;
-  return urls.length > 0 ? { ...rest, pendingSignOuts: urls } : rest;
+function parsePendingSignOuts(raw: string): string[] {
+  try {
+    const value = (JSON.parse(raw) as { urls?: unknown }).urls;
+    return Array.isArray(value)
+      ? value.filter((url): url is string => typeof url === "string")
+      : [];
+  } catch {
+    // A corrupt record lost its URLs: the next write replaces it (self-healing).
+    log.warn("Ignoring a corrupt pending plugin sign-out record");
+    return [];
+  }
 }
 
 async function readSignIn(
@@ -788,11 +794,15 @@ export class AgentPluginInstallService {
       // would suppress the very scan whose recovery just succeeded.
       const unhealthySuppression = (await this.reconciliationState) ? [] : [this.containerDir];
       const bracket = await journalDerivedDiscoveryGate(containerPaths);
+      const pendingSuppression = await this.pendingSignOutSuppression();
       return {
-        suppressed: [...new Set([...bracket.suppressed, ...unhealthySuppression])],
+        suppressed: [
+          ...new Set([...bracket.suppressed, ...unhealthySuppression, ...pendingSuppression]),
+        ],
         confirm: async () => {
           const stillUnhealthy = (await this.reconciliationState) ? [] : [this.containerDir];
-          return [...new Set([...(await bracket.confirm()), ...stillUnhealthy])];
+          const stillPending = await this.pendingSignOutSuppression();
+          return [...new Set([...(await bracket.confirm()), ...stillUnhealthy, ...stillPending])];
         },
       };
     });
@@ -815,10 +825,14 @@ export class AgentPluginInstallService {
    * left unconsumed (failed restore/quarantine, unidentified target tree) —
    * both mean the managed container may hold unreconciled state.
    */
-  /** Crash recovery, then the pending sign-outs (they may need a restored tree's registry). */
+  /**
+   * Crash recovery, then the pending sign-outs. Pending sign-outs do not make recovery
+   * unhealthy: the discovery gate checks them itself (pendingSignOutSuppression).
+   */
   private async recover(): Promise<boolean> {
     const allConsumed = await this.reconcileJournals();
-    return (await this.completePendingSignOuts()) && allConsumed;
+    await this.completePendingSignOuts();
+    return allConsumed;
   }
 
   private async attemptReconcileJournals(context: string): Promise<boolean> {
@@ -827,7 +841,7 @@ export class AgentPluginInstallService {
       const started = this.recover().then(
         (allConsumed) => {
           if (!allConsumed) {
-            log.warn(`Plugin recovery left unresolved journals or sign-outs (${context})`);
+            log.warn(`Plugin journal reconciliation left unresolved journals (${context})`);
           }
           return allConsumed;
         },
@@ -3231,59 +3245,61 @@ export class AgentPluginInstallService {
     }
   }
 
-  /** Managed registry entries merged with unmanaged plugins found by global discovery. */
-  /** The OAuth service is built in a later DI layer than this service. */
-  /**
-   * Adds `urls` to the entry's pending sign-outs on disk and returns the raw registry with them,
-   * so the update's own registry write keeps them. Throws when the write fails: nothing changed
-   * yet, and an unrecorded sign-out would be lost on a crash.
-   */
-  private async recordPendingSignOuts(
-    envelope: Record<string, unknown>,
-    rawRegistry: unknown[],
-    name: string,
-    urls: string[]
-  ): Promise<unknown[]> {
-    if (urls.length === 0) return rawRegistry;
-    const next = rawRegistry.map((rawEntry) =>
-      this.rawEntryName(rawEntry) === name
-        ? withPendingSignOuts(rawEntry, [...new Set([...readPendingSignOuts(rawEntry), ...urls])])
-        : rawEntry
-    );
-    await this.writeRegistry(envelope, next);
-    return next;
+  private get pendingSignOutsFile(): string {
+    return path.join(this.config.rootDir, PENDING_SIGN_OUTS_FILE_NAME);
+  }
+
+  private async readPendingSignOuts(): Promise<string[]> {
+    try {
+      return parsePendingSignOuts(await fsPromises.readFile(this.pendingSignOutsFile, "utf-8"));
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) return [];
+      throw error;
+    }
+  }
+
+  private async writePendingSignOuts(urls: string[]): Promise<void> {
+    if (urls.length === 0) {
+      await fsPromises.rm(this.pendingSignOutsFile, { force: true });
+      return;
+    }
+    await writeFileAtomic(this.pendingSignOutsFile, JSON.stringify({ version: 1, urls }), "utf-8");
   }
 
   /**
-   * Signs out `urls`, then removes the ones that succeeded from the entry's pending sign-outs.
-   * The failed ones stay for the next start (completePendingSignOuts). The registry update is
-   * best effort: a leftover entry only signs the server out once more.
+   * Adds `urls` to the pending sign-outs and returns the ones this call added. Callers hold the
+   * plugin mutation lock. Throws when the write fails: nothing changed yet, and an unrecorded
+   * sign-out would be lost on a crash.
    */
-  private async signOutAndSettle(name: string, urls: string[]): Promise<void> {
+  private async recordPendingSignOuts(urls: string[]): Promise<string[]> {
+    if (urls.length === 0) return [];
+    const pending = await this.readPendingSignOuts();
+    const added = urls.filter((url) => !pending.includes(url));
+    if (added.length > 0) await this.writePendingSignOuts([...pending, ...added]);
+    return added;
+  }
+
+  /**
+   * Removes `urls` from the pending sign-outs: they finished, or the update rolled back before
+   * the new tree was live. Best effort: a leftover URL only signs the server out once more.
+   */
+  private async forgetPendingSignOuts(urls: readonly string[]): Promise<void> {
     if (urls.length === 0) return;
-    const done = new Set<string>();
-    for (const serverUrl of urls) {
-      if (await this.signOutPluginServer(name, serverUrl)) done.add(serverUrl);
-    }
     try {
-      const { envelope, rawEntries } = await this.readRegistryDocument("strict");
-      await this.writeRegistry(
-        envelope,
-        rawEntries.map((rawEntry) =>
-          this.rawEntryName(rawEntry) === name
-            ? withPendingSignOuts(
-                rawEntry,
-                readPendingSignOuts(rawEntry).filter((url) => !done.has(url))
-              )
-            : rawEntry
-        )
-      );
+      const pending = await this.readPendingSignOuts();
+      await this.writePendingSignOuts(pending.filter((url) => !urls.includes(url)));
     } catch (error) {
-      log.warn("Could not clear finished plugin sign-outs", {
-        plugin: name,
-        error: getErrorMessage(error),
-      });
+      log.warn("Could not update the pending plugin sign-outs", { error: getErrorMessage(error) });
     }
+  }
+
+  /** Signs out `urls` after an update; the ones that failed stay pending. */
+  private async signOutAndSettle(name: string, urls: string[]): Promise<void> {
+    const done: string[] = [];
+    for (const serverUrl of urls) {
+      if (await this.signOutPluginServer(name, serverUrl)) done.push(serverUrl);
+    }
+    await this.forgetPendingSignOuts(done);
   }
 
   private async signOutPluginServer(name: string, serverUrl: string): Promise<boolean> {
@@ -3297,42 +3313,56 @@ export class AgentPluginInstallService {
   }
 
   /**
-   * Finishes the sign-outs that an update recorded but could not complete (#6122). It runs
-   * with crash recovery, so the discovery gate keeps the managed container closed until every
-   * pending sign-out is done: a plugin server never connects with its old sign-in's tokens.
-   * Without the sign-in service yet it fails closed; setMcpOauthService runs it again.
+   * Finishes the sign-outs that an update recorded but could not complete (#6122). Runs with
+   * crash recovery and from the discovery gate. Without the sign-in service it does nothing.
    */
-  private async completePendingSignOuts(): Promise<boolean> {
-    const { rawEntries } = await this.readRegistryDocument("lenient");
-    if (!rawEntries.some((rawEntry) => readPendingSignOuts(rawEntry).length > 0)) return true;
+  private async completePendingSignOuts(): Promise<void> {
     const oauth = this.mcpOauthService;
-    if (oauth === undefined) return false;
-    return this.runExclusive(async () => {
-      const { envelope, rawEntries: current } = await this.readRegistryDocument("strict");
-      let allDone = true;
-      const next: unknown[] = [];
-      for (const rawEntry of current) {
-        const left: string[] = [];
-        for (const serverUrl of readPendingSignOuts(rawEntry)) {
-          if (!(await oauth.logout({ serverUrl })).success) left.push(serverUrl);
-        }
-        allDone &&= left.length === 0;
-        next.push(
-          readPendingSignOuts(rawEntry).length > 0 ? withPendingSignOuts(rawEntry, left) : rawEntry
-        );
+    if (oauth === undefined || !(await this.hasPendingSignOuts())) return;
+    await this.runExclusive(async () => {
+      const left: string[] = [];
+      for (const serverUrl of await this.readPendingSignOuts()) {
+        if (!(await oauth.logout({ serverUrl })).success) left.push(serverUrl);
       }
-      await this.writeRegistry(envelope, next);
-      return allDone;
+      await this.writePendingSignOuts(left);
     });
   }
 
+  /** One stat. Fails closed: a record Xum cannot stat counts as pending. */
+  private async hasPendingSignOuts(): Promise<boolean> {
+    try {
+      await fsPromises.stat(this.pendingSignOutsFile);
+      return true;
+    } catch (error) {
+      return !hasErrorCode(error, "ENOENT");
+    }
+  }
+
+  /**
+   * The discovery gate's part: while a sign-out is pending, the managed container stays closed,
+   * so a plugin server never connects with its old sign-in's tokens. The record is checked on
+   * every scan, so a sibling process that shares the root sees another process's record too.
+   * A pass that finishes the sign-outs starts here when none runs; the gate never waits for it
+   * (it takes the plugin mutation lock, which an update holds while it stops MCP servers).
+   */
+  private async pendingSignOutSuppression(): Promise<string[]> {
+    if (!(await this.hasPendingSignOuts())) return [];
+    this.pendingSignOutPass ??= this.completePendingSignOuts()
+      .catch((error: unknown) => {
+        log.warn("Could not finish pending plugin sign-outs", { error: getErrorMessage(error) });
+      })
+      .finally(() => {
+        this.pendingSignOutPass = undefined;
+      });
+    return [this.containerDir];
+  }
+
+  private pendingSignOutPass: Promise<void> | undefined;
+
+  /** Managed registry entries merged with unmanaged plugins found by global discovery. */
+  /** The OAuth service is built in a later DI layer than this service. */
   setMcpOauthService(service: Pick<McpOauthService, "logout" | "credentialKey">): void {
     this.mcpOauthService = service;
-    // Pending sign-outs wait for this service: finish them before discovery opens (#6122).
-    const previous = this.reconciliationState;
-    this.reconciliationState = previous.then(() =>
-      this.attemptReconcileJournals("sign-in service ready")
-    );
   }
 
   async list(): Promise<AgentPluginListItem[]> {
@@ -4496,6 +4526,9 @@ export class AgentPluginInstallService {
       }
 
       const { stagedDir, plugin } = await this.stageUpdate(entry, targetSha);
+      // Sign-outs this update recorded, and whether its tree went live (see the catch below).
+      let recordedSignOuts: string[] = [];
+      let promoted = false;
       try {
         const targetPath = this.targetPathFor(entry.name);
         // Security: an update must not silently expand what the plugin can
@@ -4521,12 +4554,7 @@ export class AgentPluginInstallService {
         // Record the sign-outs before anything changes: a crash, or a store write that fails
         // after the swap, leaves them for the next start (#6122).
         const resets = [...new Set(signInResets)];
-        const registryForUpdate = await this.recordPendingSignOuts(
-          envelope,
-          rawRegistry,
-          entry.name,
-          resets
-        );
+        recordedSignOuts = await this.recordPendingSignOuts(resets);
 
         await this.removeDir(path.join(stagedDir, ".git"));
 
@@ -4591,6 +4619,7 @@ export class AgentPluginInstallService {
           }
           throw error;
         }
+        promoted = true;
         // The new tree is live. Consume the JOURNAL before the marker, and
         // ENFORCE that ordering: a markerless target with the journal still
         // present is exactly the state recovery must treat as an unidentified
@@ -4679,7 +4708,7 @@ export class AgentPluginInstallService {
         try {
           await this.writeRegistry(
             envelope,
-            registryForUpdate.map((rawEntry) => {
+            rawRegistry.map((rawEntry) => {
               if (this.rawEntryName(rawEntry) !== entry.name) {
                 return rawEntry;
               }
@@ -4729,6 +4758,11 @@ export class AgentPluginInstallService {
           `Updated agent plugin '${entry.name}' ${entry.lockedSha.slice(0, 12)} → ${targetSha.slice(0, 12)}`
         );
         return updated;
+      } catch (error) {
+        // Failed before the new tree went live: the old sign-in still applies, so the recorded
+        // sign-outs must not run at the next start.
+        if (!promoted) await this.forgetPendingSignOuts(recordedSignOuts);
+        throw error;
       } finally {
         await this.removeDir(stagedDir);
       }
