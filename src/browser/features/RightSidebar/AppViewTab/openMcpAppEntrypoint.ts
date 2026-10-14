@@ -8,6 +8,9 @@ import { focusMcpAppViewTab, type McpAppViewRef } from "../ArtifactsTab/mcpAppVi
 import { appViewTabFor } from "./appViewTabs";
 import { entrypointViewRef, openedMcpAppEntrypoint } from "./mcpAppEntrypoints";
 
+/** What an entry point open reports without a backend connection (launcher and palette). */
+export const MCP_APP_ENTRYPOINT_NOT_CONNECTED = "Not connected";
+
 /**
  * Open an entry point in its app tab, or focus the tab it already has. Each entry point has one
  * tab per workspace (its view key names server, tool and type), so a second open only focuses
@@ -24,7 +27,7 @@ export async function openMcpAppEntrypoint(
   show: (view: McpAppViewRef) => void = (view) => focusMcpAppViewTab(workspaceId, view.toolCallId)
 ): Promise<string | null> {
   try {
-    if (await hasStoredTab(api, workspaceId, entrypoint.viewKey)) {
+    if (await hasCurrentTab(api, workspaceId, entrypoint)) {
       show(entrypointViewRef(workspaceId, entrypoint));
       return null;
     }
@@ -43,13 +46,29 @@ export async function openMcpAppEntrypoint(
   }
 }
 
-/** Whether the workspace has a tab for the view and the result store still has its record. */
-async function hasStoredTab(api: APIClient, workspaceId: string, viewKey: string) {
+/**
+ * Whether the workspace has a tab for the entry point and the result store still has its record
+ * for the entry point as it is now. A record naming another server or view (a plugin update moved
+ * the resourceUri) would be refused by getView after a remount, so the entry point runs again.
+ * Records carry the server's display form, which equals the key for every ordinary key; an
+ * unusual key only makes a pick run the entry point again.
+ */
+async function hasCurrentTab(api: APIClient, workspaceId: string, entrypoint: McpAppEntrypoint) {
   const layout = parseRightSidebarLayoutState(
     readPersistedState<unknown>(getRightSidebarLayoutKey(workspaceId), null)
   );
-  if (!collectAllTabs(layout.root).includes(appViewTabFor(viewKey))) return false;
-  const records = await api.mcpApps.getViewRecords({ workspaceId, toolCallIds: [viewKey] });
-  // A failed lookup counts as stored: run the tool again only when the record is known gone.
-  return !records.success || records.data.some((entry) => entry.view !== null);
+  if (!collectAllTabs(layout.root).includes(appViewTabFor(entrypoint.viewKey))) return false;
+  const records = await api.mcpApps.getViewRecords({
+    workspaceId,
+    toolCallIds: [entrypoint.viewKey],
+  });
+  // A failed lookup counts as current: run the tool again only when the record is known stale.
+  return (
+    !records.success ||
+    records.data.some(
+      (entry) =>
+        entry.view?.serverName === entrypoint.serverName &&
+        entry.view.resourceUri === entrypoint.resourceUri
+    )
+  );
 }

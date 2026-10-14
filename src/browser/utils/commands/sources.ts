@@ -48,7 +48,10 @@ import {
   transcriptViews,
   type McpAppViewRef,
 } from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
-import { openMcpAppEntrypoint } from "@/browser/features/RightSidebar/AppViewTab/openMcpAppEntrypoint";
+import {
+  MCP_APP_ENTRYPOINT_NOT_CONNECTED,
+  openMcpAppEntrypoint,
+} from "@/browser/features/RightSidebar/AppViewTab/openMcpAppEntrypoint";
 import type { McpAppEntrypoint } from "@/common/orpc/schemas/mcpApps";
 
 /**
@@ -68,8 +71,9 @@ function entrypointActions(
     section: navigation,
     keywords: ["plugin", "view", "app", "mcp", entrypoint.serverName],
     run: async () => {
-      if (!api) return;
-      const error = await openMcpAppEntrypoint(api, workspaceId, entrypoint);
+      const error = api
+        ? await openMcpAppEntrypoint(api, workspaceId, entrypoint)
+        : MCP_APP_ENTRYPOINT_NOT_CONNECTED;
       if (error !== null) showCommandFeedbackToast({ type: "error", message: error });
     },
   }));

@@ -244,6 +244,32 @@ describe("MCP App entry points", () => {
     expect(shown).toEqual([target.viewKey]);
   });
 
+  test("a picked entry point whose record names another view runs again", async () => {
+    let opens = 0;
+    // A plugin update moved the view: the open tab's record still names the old resourceUri,
+    // which getView would refuse for the current entry point after a remount.
+    const target = { ...entrypoint("Library"), resourceUri: "ui://cad/library-v2" };
+    const client = createTestApiClient({
+      mcpApps: {
+        openEntrypoint: () => {
+          opens += 1;
+          return Promise.resolve({ success: true as const, data: target });
+        },
+        getViewRecords: viewRecords([target.viewKey]),
+      },
+    });
+    updatePersistedState(
+      getRightSidebarLayoutKey("ws-rebound"),
+      selectOrAddTab(getDefaultRightSidebarLayoutState(), appViewTabFor(target.viewKey))
+    );
+    expect(await openMcpAppEntrypoint(client, "ws-rebound", target, () => undefined)).toBeNull();
+    expect(opens).toBe(1);
+    // A record bound to another server is not this entry point's view either.
+    const moved = { ...entrypoint("Library"), serverName: "cad-2" };
+    expect(await openMcpAppEntrypoint(client, "ws-rebound", moved, () => undefined)).toBeNull();
+    expect(opens).toBe(2);
+  });
+
   test("an open shows the entry point the backend returned, not the listed one", async () => {
     const listed = entrypoint("Library");
     const moved = { ...listed, resourceUri: "ui://cad/library-v2", title: "Library v2" };

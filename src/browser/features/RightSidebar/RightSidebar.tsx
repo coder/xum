@@ -134,7 +134,10 @@ import {
   withAppViewTab,
 } from "./AppViewTab/appViewTabs";
 import { useMcpAppEntrypoints } from "./AppViewTab/mcpAppEntrypoints";
-import { openMcpAppEntrypoint } from "./AppViewTab/openMcpAppEntrypoint";
+import {
+  MCP_APP_ENTRYPOINT_NOT_CONNECTED,
+  openMcpAppEntrypoint,
+} from "./AppViewTab/openMcpAppEntrypoint";
 import { ReviewAssistedStatsReporter } from "@/browser/features/RightSidebar/CodeReview/ReviewPanel";
 import {
   NewTabLabel,
@@ -750,7 +753,7 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
               entrypoints={entrypoints}
               onOpenEntrypoint={(entrypoint) =>
                 api == null
-                  ? Promise.resolve("Not connected")
+                  ? Promise.resolve(MCP_APP_ENTRYPOINT_NOT_CONNECTED)
                   : // Like a tool: the app tab replaces this New tab (or the open one is focused).
                     openMcpAppEntrypoint(api, props.workspaceId, entrypoint, (view) =>
                       props.setLayout((prev) =>

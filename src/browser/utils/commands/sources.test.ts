@@ -26,6 +26,7 @@ import {
   type PluginsSectionIntent,
 } from "@/browser/features/Settings/Sections/pluginsSectionIntents";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { MCP_APP_ENTRYPOINT_NOT_CONNECTED } from "@/browser/features/RightSidebar/AppViewTab/openMcpAppEntrypoint";
 import { CommandIds } from "@/browser/utils/commandIds";
 import type { OpenLocalServerResult, RemoteConnectionApi } from "@/common/types/remoteConnection";
 
@@ -2584,6 +2585,35 @@ test("a failed entry point open from the palette shows its error in a toast", as
       await entry?.run();
       expect(events.receivedToasts).toEqual([
         { type: "error", message: "Too many entry point opens" },
+      ]);
+    } finally {
+      events.dispose();
+    }
+  });
+});
+
+test("an entry point picked from the palette while disconnected says so in a toast", async () => {
+  const entrypoint = {
+    serverName: "cad",
+    serverLabel: "cad",
+    toolName: "cad.tray",
+    title: "Parts Tray",
+    resourceUri: "ui://tray/view",
+    type: "global" as const,
+    viewKey: "entrypoint:cad:cad.tray:global",
+  };
+  const actions = getActions({
+    artifactsEnabled: true,
+    mcpAppEntrypoints: [entrypoint],
+    api: null,
+  });
+  const entry = actions.find((a) => a.id === CommandIds.navOpenAppEntrypoint(entrypoint.viewKey));
+  await withTestWindow(async () => {
+    const events = collectCommandEvents();
+    try {
+      await entry?.run();
+      expect(events.receivedToasts).toEqual([
+        { type: "error", message: MCP_APP_ENTRYPOINT_NOT_CONNECTED },
       ]);
     } finally {
       events.dispose();
