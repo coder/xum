@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Usage: scripts/lint.sh [--full] [--fix]
+#
+# Default: ESLint on the files changed since the merge base with origin/main (see
+# scripts/lib/lint_targets.js for why and when it falls back to all files).
+# --full: ESLint on every file, as CI does.
 
 set -e
 
@@ -54,19 +59,68 @@ get_default_eslint_concurrency() {
   fi
 }
 
-ESLINT_CONCURRENCY="${MUX_ESLINT_CONCURRENCY:-$(get_default_eslint_concurrency)}"
+MODE=changed
+FIX_ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --full) MODE=full ;;
+    --fix) FIX_ARGS=(--fix) ;;
+    *)
+      echo "Unknown argument: $arg (expected --full and/or --fix)" >&2
+      exit 2
+      ;;
+  esac
+done
+
 ESLINT_ARGS=(
-  --concurrency "$ESLINT_CONCURRENCY"
   --cache
   --cache-strategy content
   --max-warnings 0
 )
 
-if [ "${1:-}" = "--fix" ]; then
-  echo "Running bun x eslint with --fix (concurrency=$ESLINT_CONCURRENCY)..."
-  bun x eslint "${ESLINT_ARGS[@]}" "${ESLINT_PATTERNS[@]}" --fix
+run_full_lint() {
+  local concurrency="${MUX_ESLINT_CONCURRENCY:-$(get_default_eslint_concurrency)}"
+  echo "Running eslint on all files ($1, concurrency=$concurrency)..."
+  local eslint=(bun x eslint --concurrency "$concurrency" "${ESLINT_ARGS[@]}" "${ESLINT_PATTERNS[@]}" "${FIX_ARGS[@]}")
+  # One full run at a time per machine: each peaks at ~7.6 GiB, and parallel agents running
+  # several at once OOM-killed shared workspaces. XUM_LINT_LOCK=0 skips the wait.
+  if [ "${XUM_LINT_LOCK:-1}" = 0 ]; then
+    "${eslint[@]}"
+  else
+    node "$SCRIPT_DIR/lib/run_exclusive.js" full-lint -- "${eslint[@]}"
+  fi
+}
+
+if [ "$MODE" = full ]; then
+  run_full_lint "--full"
 else
-  echo "Running eslint (concurrency=$ESLINT_CONCURRENCY)..."
-  bun x eslint "${ESLINT_ARGS[@]}" "${ESLINT_PATTERNS[@]}"
+  # A separate assignment so set -e stops on a selection error (e.g. a bad XUM_LINT_BASE).
+  selection="$(node "$SCRIPT_DIR/lib/lint_targets.js")"
+  header="${selection%%$'\n'*}"
+  kind="${header%% *}"
+  detail="${header#* }"
+  if [ "$kind" = full ]; then
+    run_full_lint "$detail"
+  else
+    CHANGED_FILES=()
+    if [[ "$selection" == *$'\n'* ]]; then
+      while IFS= read -r file; do
+        [ -n "$file" ] && CHANGED_FILES+=("$file")
+      done <<<"${selection#*$'\n'}"
+    fi
+    if [ "${#CHANGED_FILES[@]}" -eq 0 ]; then
+      echo "No lintable files changed since ${detail:0:12}; skipping eslint (make lint-full lints all files)."
+      exit 0
+    fi
+    echo "Running eslint on ${#CHANGED_FILES[@]} file(s) changed since ${detail:0:12} (make lint-full lints all files)..."
+    # One worker: worker start-up costs more than it saves on a small file set, and each worker
+    # loads its own copy of the TypeScript program. --no-warn-ignored: a changed file that the
+    # config ignores (e.g. src/browser/main.tsx) must not fail --max-warnings 0.
+    bun x eslint --concurrency "${MUX_ESLINT_CONCURRENCY:-1}" "${ESLINT_ARGS[@]}" --no-warn-ignored \
+      "${CHANGED_FILES[@]}" "${FIX_ARGS[@]}"
+  fi
+fi
+
+if [ "${#FIX_ARGS[@]}" -eq 0 ]; then
   echo "ESLint checks passed!"
 fi
