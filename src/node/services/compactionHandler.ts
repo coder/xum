@@ -58,6 +58,7 @@ import {
 import { createPreservedTailCopyMessageId } from "@/node/services/utils/messageIds";
 import { stripAnthropicThinkingFromTailCopy } from "@/common/utils/compaction/tailCopyThinking";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
+import { readPersistedPluginHookContext } from "@/common/utils/messages/pluginHookContext";
 import {
   mergeLoadedSkillSnapshots,
   extractLoadedSkillSnapshotsFromMessages,
@@ -224,8 +225,9 @@ interface CompactionHandlerOptions {
  * must never copy):
  * - `partial` keeps interrupted-tool sentinels applying.
  * - `muxMetadata` drives provider-side filtering (workflow display rows).
- * - `pluginHookContext`: request building renders a user row's prompt-hook context from its
- *   metadata, so the copy that replaces it must carry it (Codex PRRT_kwDOPxxmWM6rPqxI).
+ *
+ * `pluginHookContext` is copied too, but through its persisted-row reader (see
+ * buildPreservedTailCopy).
  */
 type RowMetadata = NonNullable<MuxMessage["metadata"]>;
 
@@ -240,8 +242,12 @@ const TAIL_COPY_METADATA_KEYS = [
   "kind",
   "fileAtMentionSnapshot",
   "agentSkillSnapshot",
-  "pluginHookContext",
 ] as const satisfies ReadonlyArray<keyof RowMetadata>;
+
+function pluginHookContextOf(source: RowMetadata | undefined): Partial<RowMetadata> {
+  const entries = readPersistedPluginHookContext(source?.pluginHookContext);
+  return entries.length > 0 ? { pluginHookContext: entries } : {};
+}
 
 function pickTailCopyMetadata(source: RowMetadata | undefined): Partial<RowMetadata> {
   if (source === undefined) return {};
@@ -1328,6 +1334,10 @@ export class CompactionHandler {
         synthetic: true,
         rlmPreservedTailCopy: true,
         ...pickTailCopyMetadata(source),
+        // Request building renders a user row's prompt-hook context from its metadata, so the
+        // copy that replaces it must carry it (Codex PRRT_kwDOPxxmWM6rPqxI). chat.jsonl is
+        // untrusted on read: copy only the valid entries under the cap (PRRT_kwDOPxxmWM6sTcvx).
+        ...pluginHookContextOf(source),
         ...(mcpPromptSnapshot !== undefined ? { mcpPromptSnapshot } : {}),
       },
     });
