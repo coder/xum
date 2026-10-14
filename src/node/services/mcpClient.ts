@@ -430,6 +430,10 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
       return tools;
     },
     prompts: async (options) => {
+      // The SDK also returns [] for a server without the prompts capability, but
+      // prints a console.debug line on each call. Xum lists prompts often
+      // (composer, tool descriptions), so that line flooded the server log.
+      if (!client.getServerCapabilities()?.prompts) return [];
       // Cursorless listPrompts() aggregates pages up to ClientOptions.listMaxPages
       // and forwards these options to each request; the integration test covers
       // page two.
