@@ -166,17 +166,23 @@ function useWorkspaceNameStorage(scope: DraftStoreScope | null) {
 }
 
 /**
- * A request that settles after unmount must not write its scope's state: a draft moved to another
- * project migrates that state away, and the write would leave a name behind there.
+ * A request that settles after unmount, or while its draft moves to another project, must not
+ * write the draft's name: the move takes the draft's body, so a name written to the source after
+ * that would keep a draft holding only the name behind. The destination's composer names it.
  */
 function storeGeneratedIdentity(
   mountedRef: { current: boolean },
-  setStored: (update: (prev: WorkspaceNamePersistedState) => WorkspaceNamePersistedState) => void,
+  target: DraftStoreScope | null,
+  setStoredIn: (
+    target: DraftStoreScope | null,
+    update: (prev: WorkspaceNamePersistedState) => WorkspaceNamePersistedState
+  ) => void,
   identity: WorkspaceIdentity,
   forMessage: string
 ): void {
   if (!mountedRef.current) return;
-  setStored((prev) => ({
+  if (target !== null && getDraftStore().isMovingCreationDraft(target)) return;
+  setStoredIn(target, (prev) => ({
     ...prev,
     generatedIdentity: identity,
     lastGeneratedFor: toStoredMessage(forMessage),
@@ -270,12 +276,7 @@ export function useWorkspaceName(options: UseWorkspaceNameOptions): UseWorkspace
 
       const requestId = ++requestIdRef.current;
       const storeIdentity = (identity: WorkspaceIdentity) =>
-        storeGeneratedIdentity(
-          mountedRef,
-          (update) => setStoredIn(target, update),
-          identity,
-          forMessage
-        );
+        storeGeneratedIdentity(mountedRef, target, setStoredIn, identity, forMessage);
       setIsGenerating(true);
       setError(null);
 

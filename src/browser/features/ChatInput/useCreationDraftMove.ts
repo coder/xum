@@ -26,9 +26,11 @@ interface CreationDraftMoveSource {
 export function useCreationDraftMove(source: CreationDraftMoveSource) {
   const { moveWorkspaceDraft } = useWorkspaceActions();
   const hydrated = useDraftStoreHydrated();
-  // The move waits for the backend; meanwhile the draft must not change or move again.
+  // The move waits for the backend; meanwhile the draft must not move again or be sent (the
+  // send would take content the move has already given to the destination).
   const [moving, setMoving] = useState(false);
   return {
+    moving,
     // The move waits for whatever is still on its way into the draft: the drafts themselves
     // (composers may render before they load, and an unloaded draft would move as an empty one),
     // a send in flight takes it, a file being read or a voice transcript is added to the draft it

@@ -17,6 +17,8 @@ export interface CreationSendBlockers {
   coderPresetsLoading: boolean;
   /** The branch list is loading or failed, for a runtime that needs a trunk (#6033, #6055). */
   branchesNotLoaded: boolean;
+  /** The draft is moving to another project (see useCreationDraftMove). */
+  draftMoving: boolean;
 }
 
 /**

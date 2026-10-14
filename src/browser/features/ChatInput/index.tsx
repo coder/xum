@@ -994,6 +994,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       processingAttachments: isProcessingAttachments,
       coderPresetsLoading,
       branchesNotLoaded: creationBranchesLoading,
+      draftMoving: creationDraftMove.moving,
     },
     props
   );
@@ -1019,6 +1020,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     !isProcessingAttachments &&
     !coderPresetsLoading &&
     !creationBranchesLoading &&
+    !creationDraftMove.moving &&
     !transcriptBlocksSend &&
     !editPreconditionInvalidated;
   const runningGoalActive =

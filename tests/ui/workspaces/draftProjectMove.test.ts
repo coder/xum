@@ -87,7 +87,7 @@ async function pickOption(
   fireEvent.click(option);
 }
 
-async function moveDraftTo(container: HTMLElement, label: string): Promise<void> {
+async function startMoveTo(container: HTMLElement, label: string): Promise<void> {
   // Locked until the composer's agents load, among others.
   const trigger = await waitFor(() => {
     const element = projectSelector(container);
@@ -95,6 +95,10 @@ async function moveDraftTo(container: HTMLElement, label: string): Promise<void>
     return element;
   }, WAIT);
   await pickOption(trigger, label);
+}
+
+async function moveDraftTo(container: HTMLElement, label: string): Promise<void> {
+  await startMoveTo(container, label);
   await waitFor(() => expect(projectSelectorLabel(container)).toBe(label), WAIT);
 }
 
@@ -184,6 +188,21 @@ function holdAgentList(orpc: OrpcClient, projectPath: string) {
     },
   });
   return { client, release, calls: () => calls };
+}
+
+/** Holds the backend's creation draft moves until release(). */
+function holdBackendMove() {
+  const draftService = getSharedEnv().services.draftService;
+  const realMove = draftService.moveCreation.bind(draftService);
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const spy = jest.spyOn(draftService, "moveCreation").mockImplementation(async (input) => {
+    await released;
+    return realMove(input);
+  });
+  return { release, calls: () => spy.mock.calls.length, restore: () => spy.mockRestore() };
 }
 
 /** The app's API client, reporting an OpenAI key, which voice input needs to transcribe. */
@@ -605,6 +624,62 @@ describeIntegration("Creation project selector moves the draft", () => {
     } finally {
       await cleanupView(view, cleanupDom);
       restoreVoice();
+    }
+  }, 90_000);
+
+  test("send waits until the draft has moved", async () => {
+    const { view, cleanupDom, a, b } = await openTwoProjects();
+    const { container } = view;
+    const move = holdBackendMove();
+    const sendButton = () =>
+      container.querySelector<HTMLButtonElement>('button[aria-label="Send message"]');
+    try {
+      await openProjectCreationView(view, a);
+      const draftId = await onlyDraftId(a);
+      getDraftStore().setText(creationScope(a, draftId), "sent after the move");
+      await waitFor(() => expect(sendButton()?.disabled).toBe(false), WAIT);
+
+      await startMoveTo(container, path.basename(b));
+      await waitFor(() => expect(move.calls()).toBeGreaterThan(0), WAIT);
+
+      // The backend may already have given the draft to B: a send now would leave it there too.
+      expect(sendButton()?.disabled).toBe(true);
+      move.release();
+      await waitFor(() => expect(projectSelectorLabel(container)).toBe(path.basename(b)), WAIT);
+    } finally {
+      move.release();
+      move.restore();
+      await cleanupView(view, cleanupDom);
+    }
+  }, 90_000);
+
+  test("a name generated while the draft moves leaves no draft behind", async () => {
+    const naming = holdNameGeneration(getSharedEnv().orpc);
+    const { view, cleanupDom, a, b } = await openTwoProjects(naming.client);
+    const { container } = view;
+    const move = holdBackendMove();
+    try {
+      await openProjectCreationView(view, a);
+      const draftId = await onlyDraftId(a);
+      getDraftStore().setText(creationScope(a, draftId), "named while moving");
+      await waitFor(() => expect(naming.calls()).toBeGreaterThan(0), WAIT);
+
+      await startMoveTo(container, path.basename(b));
+      await waitFor(() => expect(move.calls()).toBeGreaterThan(0), WAIT);
+      // The name answers after the move took the draft's body.
+      naming.release();
+      await naming.allAnswered();
+      move.release();
+
+      await waitFor(() => expect(projectSelectorLabel(container)).toBe(path.basename(b)), WAIT);
+      expect(textareaValue(container)).toBe("named while moving");
+      await waitForDraftIds(a, []);
+      expect(getWorkspaceDraftIds(b)).toHaveLength(1);
+    } finally {
+      naming.release();
+      move.release();
+      move.restore();
+      await cleanupView(view, cleanupDom);
     }
   }, 90_000);
 
