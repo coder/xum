@@ -84,15 +84,15 @@ export function resolveSkillDirectory(
 }
 
 /**
- * The note for a user-invoked (slash/inline) skill snapshot whose files are on
- * the Xum host while bash runs elsewhere, or null. agent_skill_read reports the
+ * Append the off-host note to a user-invoked (slash/inline) skill snapshot body
+ * whose files are on the Xum host while bash runs elsewhere. agent_skill_read reports the
  * same reason as skillDirUnavailable, but a snapshot reaches the model without
  * any tool result, so without this note the model would run a bundled script
  * by a path that does not exist where bash runs. Built-in and other-checkout
  * skills get no note: they are not a host-versus-runtime problem.
  */
-export function getSkillDirectoryOffHostNote(dir: SkillDirectory): string | null {
-  return !dir.available && dir.reason === OFF_HOST_REASON ? OFF_HOST_REASON : null;
+export function appendSkillDirectoryOffHostNote(body: string, dir: SkillDirectory): string {
+  return !dir.available && dir.reason === OFF_HOST_REASON ? `${body}\n\n${OFF_HOST_REASON}` : body;
 }
 
 /** Why bash on `workspaceRuntime` cannot use the skill's path, or null when it can. */
