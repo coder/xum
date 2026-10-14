@@ -5054,10 +5054,27 @@ export class MCPServerManager {
    * Resolves once this server's saves in flight settled. The dialog's reads wait for it: a
    * dialog reopened during a save must not show the values from before the save.
    */
-  async settingsSavesSettled(workspaceId: string, serverName: string): Promise<void> {
+  async settingsSavesSettled(
+    workspaceId: string,
+    serverName: string,
+    /**
+     * The read's own deadline and abort: a stalled save (tool calls time out after minutes) must
+     * not hold the dialog's bulk read. Past either, the read goes ahead without waiting.
+     */
+    options: { signal?: AbortSignal; timeoutMs: number }
+  ): Promise<void> {
     const saves = this.pendingSettingsSaves.get(settingsSaveKey(workspaceId, serverName));
+    if (saves === undefined) return;
+    const stop = AbortSignal.any([
+      AbortSignal.timeout(options.timeoutMs),
+      ...(options.signal !== undefined ? [options.signal] : []),
+    ]);
+    const stopped = new Promise<void>((resolve) => {
+      if (stop.aborted) resolve();
+      stop.addEventListener("abort", () => resolve(), { once: true });
+    });
     // A failed save is the save's own error; a read only waits for it.
-    if (saves !== undefined) await Promise.allSettled([...saves]);
+    await Promise.race([Promise.allSettled([...saves]), stopped]);
   }
 
   /**

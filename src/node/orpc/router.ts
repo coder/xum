@@ -263,7 +263,7 @@ async function readMcpSettingsRoute(
   const timeoutMs = MCP_SETTINGS_READ_TIMEOUT_MS;
   const readOne = async (serverName: string): Promise<McpSettingsReadResult> => {
     // A dialog reopened during a save must not show the values from before the save.
-    await manager.settingsSavesSettled(input.workspaceId, serverName);
+    await manager.settingsSavesSettled(input.workspaceId, serverName, { signal, timeoutMs });
     if (input.ifConnected !== true)
       return runMcpSettingsRoute(context, input.workspaceId, signal, async () =>
         forIpc(await manager.readSettings(input.workspaceId, serverName, { signal, timeoutMs }))

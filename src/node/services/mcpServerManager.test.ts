@@ -1363,9 +1363,18 @@ describe("MCPServerManager", () => {
     expect((await manager.readSettings("settings-reopen-ws", "cad"))?.values).toEqual({
       units: "in",
     });
+    // A stalled save holds a read no longer than the read's deadline or abort.
+    await manager.settingsSavesSettled("settings-reopen-ws", "cad", { timeoutMs: 1 });
+    const aborted = new AbortController();
+    const abortedWait = manager.settingsSavesSettled("settings-reopen-ws", "cad", {
+      signal: aborted.signal,
+      timeoutMs: 60_000,
+    });
+    aborted.abort();
+    await abortedWait;
     let settled = false;
     const reopened = manager
-      .settingsSavesSettled("settings-reopen-ws", "cad")
+      .settingsSavesSettled("settings-reopen-ws", "cad", { timeoutMs: 60_000 })
       .then(() => (settled = true));
     await Promise.resolve();
     expect(settled).toBe(false);
@@ -1376,7 +1385,7 @@ describe("MCPServerManager", () => {
       units: "mm",
     });
     // No save in flight: nothing to wait for.
-    await manager.settingsSavesSettled("settings-reopen-ws", "cad");
+    await manager.settingsSavesSettled("settings-reopen-ws", "cad", { timeoutMs: 60_000 });
   });
 
   test("settings: a replaced server instance does not keep the old instance's cached values", async () => {
