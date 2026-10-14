@@ -3,6 +3,7 @@ import "../../../../tests/ui/dom";
 import type { ComponentProps, PropsWithChildren, ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { installDom } from "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
@@ -117,6 +118,13 @@ function menuAction(id: WorkspaceActionId): ((anchorEl: HTMLElement) => void) | 
   return shown.includes(id) ? (props.actions[id] ?? null) : null;
 }
 
+// happy-dom misses React onChange for fireEvent.change, so type for real. Typing over a full
+// selection replaces the value (user-event has no clear() in happy-dom).
+async function typeTitle(input: HTMLElement, text: string) {
+  const length = (input as HTMLInputElement).value.length;
+  await userEvent.type(input, text, { initialSelectionStart: 0, initialSelectionEnd: length });
+}
+
 function resolveArchivePreflight(
   result: { kind: "ready" } | { kind: "confirm-lossy-untracked-files"; paths: string[] } = {
     kind: "ready",
@@ -160,6 +168,10 @@ let archiveWorkspaceMock = mock(
   ): Promise<ArchiveWorkspaceActionResult> => resolveArchiveResult()
 );
 let archiveShowErrorMock = mock(() => undefined);
+let updateWorkspaceTitleMock = mock(
+  (_workspaceId: string, _title: string): Promise<{ success: boolean; error?: string }> =>
+    Promise.resolve({ success: true })
+);
 
 function installWorkspaceMenuBarTestDoubles() {
   preflightArchiveWorkspaceMock = mock(
@@ -172,6 +184,10 @@ function installWorkspaceMenuBarTestDoubles() {
     ): Promise<ArchiveWorkspaceActionResult> => resolveArchiveResult()
   );
   archiveShowErrorMock = mock(() => undefined);
+  updateWorkspaceTitleMock = mock(
+    (_workspaceId: string, _title: string): Promise<{ success: boolean; error?: string }> =>
+      Promise.resolve({ success: true })
+  );
 
   spyOn(APIModule, "useAPI").mockImplementation(
     () => ({ api: mockApi }) as unknown as ReturnType<typeof APIModule.useAPI>
@@ -186,9 +202,10 @@ function installWorkspaceMenuBarTestDoubles() {
   );
   spyOn(WorkspaceContextModule, "useWorkspaceContext").mockImplementation(
     () =>
-      ({ workspaceMetadata }) as unknown as ReturnType<
-        typeof WorkspaceContextModule.useWorkspaceContext
-      >
+      ({
+        workspaceMetadata,
+        updateWorkspaceTitle: updateWorkspaceTitleMock,
+      }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceContext>
   );
   spyOn(ProjectContextModule, "useProjectContext").mockImplementation(
     () =>
@@ -478,6 +495,121 @@ describe("WorkspaceMenuBar archive confirmations", () => {
 
     expect(typeof menuAction("fork")).toBe("function");
     expect(typeof menuAction("immersiveReview")).toBe("function");
+  });
+
+  // The header's title edit (#6328): it renames the menu's workspace, works without a sidebar row,
+  // shows a failed save and gives focus back to the menu trigger.
+  it("edits the title in the header and returns focus to the menu trigger", async () => {
+    const view = render(<WorkspaceMenuBar {...defaultProps} />);
+
+    act(() => {
+      menuAction("editTitle")?.(document.body);
+    });
+    const input = view.getByTestId("workspace-title-input");
+    expect(document.activeElement).toBe(input);
+    await typeTitle(input, "  Renamed  {Enter}");
+
+    await waitFor(() => expect(view.queryByTestId("workspace-title-input")).toBeNull());
+    expect(updateWorkspaceTitleMock).toHaveBeenCalledTimes(1);
+    expect(updateWorkspaceTitleMock).toHaveBeenCalledWith(workspaceId, "Renamed");
+    expect(document.activeElement).toBe(view.getByTestId("workspace-more-actions"));
+  });
+
+  it("keeps the header edit open and shows the error when the save fails", async () => {
+    updateWorkspaceTitleMock.mockImplementation(() =>
+      Promise.resolve({ success: false, error: "Title taken" })
+    );
+    const view = render(<WorkspaceMenuBar {...defaultProps} />);
+
+    act(() => {
+      menuAction("editTitle")?.(document.body);
+    });
+    const input = view.getByTestId("workspace-title-input");
+    await typeTitle(input, "Renamed{Enter}");
+
+    // usePopoverError is one shared double, so the title error lands on the same mock.
+    await waitFor(() =>
+      expect(archiveShowErrorMock).toHaveBeenCalledWith(
+        workspaceId,
+        "Title taken",
+        expect.anything()
+      )
+    );
+    expect(view.getByTestId("workspace-title-input")).toBe(input);
+  });
+
+  it("renames the workspace the edit started for, and a late save leaves the next edit open", async () => {
+    let settleSave: (result: { success: boolean }) => void = () => undefined;
+    updateWorkspaceTitleMock.mockImplementation(
+      () => new Promise((resolve) => (settleSave = resolve))
+    );
+    const view = render(<WorkspaceMenuBar {...defaultProps} />);
+    act(() => {
+      menuAction("editTitle")?.(document.body);
+    });
+    const input = view.getByTestId("workspace-title-input");
+    await typeTitle(input, "Renamed{Enter}");
+
+    // The user moves to another workspace and starts its edit while the first save is pending.
+    view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
+    expect(view.queryByTestId("workspace-title-input")).toBeNull();
+    act(() => {
+      menuAction("editTitle")?.(document.body);
+    });
+    await act(async () => {
+      settleSave({ success: true });
+      await Promise.resolve();
+    });
+
+    expect(updateWorkspaceTitleMock).toHaveBeenCalledWith(workspaceId, "Renamed");
+    expect(view.getByTestId("workspace-title-input")).toBeTruthy();
+  });
+
+  it("ignores Escape while the save is pending, so the field closes only when it settles", async () => {
+    let settleSave: (result: { success: boolean }) => void = () => undefined;
+    updateWorkspaceTitleMock.mockImplementation(
+      () => new Promise((resolve) => (settleSave = resolve))
+    );
+    const view = render(<WorkspaceMenuBar {...defaultProps} />);
+    act(() => {
+      menuAction("editTitle")?.(document.body);
+    });
+    const input = view.getByTestId("workspace-title-input");
+    await typeTitle(input, "Renamed{Enter}");
+
+    // The rename is on its way: Escape must not show it as cancelled.
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(view.getByTestId("workspace-title-input")).toBe(input);
+
+    await act(async () => {
+      settleSave({ success: true });
+      await Promise.resolve();
+    });
+    expect(view.queryByTestId("workspace-title-input")).toBeNull();
+  });
+
+  it("takes F2 only while the sidebar does not render the workspace's row", () => {
+    const view = render(<WorkspaceMenuBar {...defaultProps} />);
+    const row = document.createElement("div");
+    row.setAttribute("data-workspace-id", workspaceId);
+    row.setAttribute("data-workspace-path", "/projects/demo/workspaces/feature-branch");
+    document.body.appendChild(row);
+
+    // The sidebar row edits its own title (SidebarTitleEditKeybinds).
+    fireEvent.keyDown(window, { key: "F2" });
+    expect(view.queryByTestId("workspace-title-input")).toBeNull();
+
+    // Sidebar collapsed, or a collapsed project or section: the header edits it.
+    row.remove();
+    const focused = view.getByRole("button", { name: "Workspace details" });
+    focused.focus();
+    fireEvent.keyDown(focused, { key: "F2" });
+    const input = view.getByTestId("workspace-title-input");
+
+    // Escape gives focus back to the control that had it before F2.
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(view.queryByTestId("workspace-title-input")).toBeNull();
+    expect(document.activeElement).toBe(focused);
   });
 
   it("offers the hidden sidebar as one row, and opens it full-screen", () => {

@@ -153,6 +153,11 @@ export interface StreamErrorPayload {
    * scheduling only; not persisted and not part of the renderer wire payload.
    */
   retryAfterMs?: number;
+  /**
+   * Internal: the model the failed request ran on, which is a refusal fallback after a swap.
+   * The compaction context_exceeded retry plans from it. Not part of the renderer wire payload.
+   */
+  model?: string;
 }
 
 export const createErrorEvent = (workspaceId: string, payload: StreamErrorPayload): ErrorEvent => ({
