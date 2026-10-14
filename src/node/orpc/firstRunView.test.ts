@@ -23,11 +23,16 @@ afterEach(async () => {
   dom = undefined;
 });
 
-// Element checks compare to null in a boolean: a failing expect on an element dumps megabytes.
-
 /** Runs the script on a served "/" (the module list, then the template), with fakes for its inputs. */
 function run(
-  o: { url?: string; viewed?: boolean; token?: string; hidden?: boolean; list?: string } = {}
+  o: {
+    url?: string;
+    viewed?: boolean;
+    token?: string;
+    hidden?: boolean;
+    list?: string;
+    loading?: boolean;
+  } = {}
 ) {
   const window = new GlobalWindow({
     url: o.url ?? "http://127.0.0.1/",
@@ -41,7 +46,9 @@ function run(
   if (o.viewed) window.localStorage.setItem(ONBOARDING_VIEWED_KEY, "true");
   if (o.token) window.localStorage.setItem(AUTH_TOKEN_KEY, o.token);
   let visibility = o.hidden ? "hidden" : "visible";
+  let readyState = o.loading ? "loading" : "complete";
   Object.defineProperty(doc, "visibilityState", { get: () => visibility, configurable: true });
+  Object.defineProperty(doc, "readyState", { get: () => readyState, configurable: true });
   const calls: Call[] = [];
   const timers: Array<{ ms: number; fn: () => void; cleared: boolean }> = [];
   const frames: Array<() => void> = [];
@@ -50,27 +57,23 @@ function run(
       init.signal.addEventListener("abort", () => reject(new Error("aborted")));
       const settle = (status: number, body?: unknown) =>
         resolve({ ok: status === 200, status, json: () => Promise.resolve(body) });
-      calls.push({
-        url: String(url),
-        headers: init.headers,
-        settle,
-        fail: () => reject(new Error("offline")),
-      });
+      const fail = () => reject(new Error("offline"));
+      calls.push({ url: String(url), headers: init.headers, settle, fail });
     });
-  const names = ["document", "location", "localStorage", "fetch", "setTimeout", "clearTimeout"];
-  const fakes = [
-    doc,
-    window.location,
-    window.localStorage,
-    fetchFake,
-    (fn: () => void, ms: number) => timers.push({ ms, fn, cleared: false }) - 1,
-    (id: number) => timers[id] && (timers[id].cleared = true),
-  ];
+  const inputs = {
+    document: doc,
+    location: window.location,
+    localStorage: window.localStorage,
+    fetch: fetchFake,
+    setTimeout: (fn: () => void, ms: number) => timers.push({ ms, fn, cleared: false }) - 1,
+    clearTimeout: (id: number) => timers[id] && (timers[id].cleared = true),
+    requestAnimationFrame: (fn: () => void) => frames.push(fn),
+  };
   // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs the shipped script string itself
-  const script = new Function(...names, "requestAnimationFrame", FIRST_RUN_EARLY_SCRIPT) as (
-    ...args: unknown[]
+  const script = new Function(...Object.keys(inputs), FIRST_RUN_EARLY_SCRIPT) as (
+    ...a: unknown[]
   ) => void;
-  script(...fakes, (fn: () => void) => frames.push(fn));
+  script(...Object.values(inputs)); // element checks below compare to null: a failing element dumps MBs
   // happy-dom's Event, typed as the DOM's for the Document-typed nodes.
   const event = (type: string) => new (window.Event as unknown as typeof Event)(type);
   const settled = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -85,6 +88,7 @@ function run(
       [...doc.querySelectorAll("link[rel=modulepreload]")].map((l) => l.getAttribute("href")),
     event,
     hide: () => ((visibility = "hidden"), doc.dispatchEvent(event("visibilitychange"))),
+    parsed: () => ((readyState = "interactive"), doc.dispatchEvent(event("DOMContentLoaded"))),
     flushFrames: () => frames.splice(0).forEach((fn) => fn()),
     /** Answers both POSTs: the viewed list, then the provider config. */
     answer: async (viewedIds: string[], config: Record<string, unknown>) => {
@@ -171,19 +175,25 @@ describe("the early script", () => {
   });
 
   // Catches an insert that does not wait for the parser (in the <head>, the <template> comes later),
-  // and a stored token that is not sent when the URL has none.
+  // and an untrimmed URL token (a blank one must fall back to the stored token, as the app does).
   test("waits for DOMContentLoaded when the POSTs answer before the template is parsed", async () => {
-    const page = run({ token: "stored" });
+    const page = run({ url: "http://127.0.0.1/?token=%20", token: "stored", loading: true });
     expect(page.calls[0].headers.Authorization).toBe("Bearer stored");
-    const doc = dom!.document;
-    const template = doc.getElementById(FIRST_RUN_TEMPLATE_ID)!;
+    const template = dom!.document.getElementById(FIRST_RUN_TEMPLATE_ID)!;
     template.remove();
-    Object.defineProperty(doc, "readyState", { get: () => "loading", configurable: true });
     await page.answer([], {});
     expect([page.view() === null, page.apps().length]).toEqual([true, 0]);
-    doc.body.append(template);
-    doc.dispatchEvent(new dom!.Event("DOMContentLoaded"));
+    dom!.document.body.append(template);
+    page.parsed();
     expect(page.view() === null).toBe(false);
+  });
+
+  // Catches a module script added while the HTML still parses: it can run before #root exists.
+  test("adds the app's module script only once the HTML is parsed", () => {
+    const page = run({ viewed: true, loading: true });
+    expect([page.preloads().length, page.apps().length]).toEqual([1, 0]);
+    page.parsed();
+    expect(page.apps()).toHaveLength(1);
   });
 
   // Catches an unguarded module list: the throw would leave the view up with no app behind it.

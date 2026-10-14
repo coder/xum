@@ -98,11 +98,7 @@ export const FIRST_RUN_VIEW_HTML = `<div id="${FIRST_RUN_VIEW_ID}" inert style="
 /** The <template> that holds FIRST_RUN_VIEW_HTML on the served "/" (PR 4b). */
 export const FIRST_RUN_TEMPLATE_ID = "xum-pre-template";
 
-/**
- * The app's module script and modulepreloads, as the JSON list the early script loads them from:
- * `{"script": href, "preload": [href, ...]}`. scripts/perf/firstLoadJs.ts counts the same list
- * (its FIRST_RUN_MODULES_ID; PR 4b moves this id to src/common/constants/firstRunView.ts).
- */
+/** `{"script": href, "preload": [href, ...]}`, the app's modules: scripts/perf/firstLoadJs.ts reads it too. */
 const FIRST_RUN_MODULES_ID = "xum-pre-modules";
 
 /**
@@ -126,11 +122,9 @@ export const FIRST_RUN_EARLY_SCRIPT = `(() => {
     try {
       list = JSON.parse(document.getElementById(${JSON.stringify(FIRST_RUN_MODULES_ID)}).textContent);
       if (typeof list.script !== "string" || !Array.isArray(list.preload)) throw new Error("bad list");
-    } catch (error) {
-      // No list, no app to load: at least drop the view, so it does not stay up as if it worked.
+    } catch (error) { // no list, no app to load: at least drop the view
       document.getElementById(${JSON.stringify(FIRST_RUN_VIEW_ID)})?.remove();
-      console.error("first-run view: no usable module list", error);
-      return;
+      return console.error("first-run view: no usable module list", error);
     }
     for (const href of list.preload) {
       const link = document.createElement("link");
@@ -140,18 +134,15 @@ export const FIRST_RUN_EARLY_SCRIPT = `(() => {
     const script = document.createElement("script");
     Object.assign(script, { type: "module", crossOrigin: "", src: list.script });
     script.addEventListener("error", () => document.getElementById(${JSON.stringify(FIRST_RUN_VIEW_ID)})?.remove());
-    document.head.appendChild(script);
+    // Unlike the deferred tag it replaces, a dynamic module runs once loaded: wait for #root.
+    const start = () => document.head.appendChild(script);
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start);
+    else start();
   };
-  const read = (key) => {
-    try {
-      return localStorage.getItem(key);
-    } catch {
-      return null;
-    }
-  };
+  const read = (key) => { try { return localStorage.getItem(key); } catch { return null; } };
   if (read(${JSON.stringify(ONBOARDING_VIEWED_KEY)}) === "true" || document.visibilityState === "hidden") return loadApp();
   document.addEventListener("visibilitychange", () => document.visibilityState === "hidden" && loadApp());
-  const token = new URLSearchParams(location.search).get("token") || read(${JSON.stringify(AUTH_TOKEN_KEY)});
+  const token = new URLSearchParams(location.search).get("token")?.trim() || read(${JSON.stringify(AUTH_TOKEN_KEY)});
   const headers = token ? { Authorization: "Bearer " + token } : {};
   const abort = new AbortController();
   const timer = setTimeout(() => abort.abort(), 1000);
