@@ -2204,6 +2204,9 @@ describe("AgentPluginInstallService", () => {
       await restarted.list();
       expect(await pathExists(path.join(muxRoot, "plugin-sign-outs-pending.json"))).toBe(true);
       expect(await discovered()).toBe(0);
+      // Once the user deletes it, discovery opens again: journal health stayed independent.
+      await fsPromises.rm(path.join(muxRoot, "plugin-sign-outs-pending.json"));
+      expect(await discovered()).toBe(1);
       await Promise.all([failing.dispose(), oauth.dispose()]);
     });
 
@@ -2222,6 +2225,20 @@ describe("AgentPluginInstallService", () => {
       expect(await fsPromises.readFile(file, "utf-8")).toBe(newer);
       expect(await discovered()).toBe(0);
       await Promise.all([failing.dispose(), oauth.dispose()]);
+    });
+
+    test("the first scan after the sign-in service is wired already sees the plugin", async () => {
+      const { failing, result } = await updateWithFailingSignOut(stopStub);
+      await result;
+      await failing.dispose();
+      const restarted = new AgentPluginInstallService(config, {
+        mcpServerManager: stopStub as unknown as MCPServerManager,
+      });
+      const oauth = new McpOauthService(config, new MCPConfigService(config));
+      restarted.setMcpOauthService(oauth);
+      expect(await discovered()).toBe(1);
+      expect(await pendingSignOuts()).toBeUndefined();
+      await oauth.dispose();
     });
 
     test("survives an uninstall of the plugin", async () => {

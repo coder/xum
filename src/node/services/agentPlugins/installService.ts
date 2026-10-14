@@ -799,6 +799,8 @@ export class AgentPluginInstallService {
       // journal bracket: recovery consumes journals, and reading them first
       // would suppress the very scan whose recovery just succeeded.
       const unhealthySuppression = (await this.reconciliationState) ? [] : [this.containerDir];
+      // The startup pass (setMcpOauthService) is awaited, so the first request sees the plugins.
+      await this.pendingSignOutReady;
       const bracket = await journalDerivedDiscoveryGate(containerPaths);
       // The bracket keeps the container closed while a sign-out is pending; start finishing it.
       await this.startPendingSignOutPass();
@@ -835,7 +837,10 @@ export class AgentPluginInstallService {
    */
   private async recover(): Promise<boolean> {
     const allConsumed = await this.reconcileJournals();
-    await this.completePendingSignOuts();
+    // A failure here must not latch journal health: the record is its own fence.
+    await this.completePendingSignOuts().catch((error: unknown) => {
+      log.warn("Could not finish pending plugin sign-outs", { error: getErrorMessage(error) });
+    });
     return allConsumed;
   }
 
@@ -3361,7 +3366,7 @@ export class AgentPluginInstallService {
     this.mcpOauthService = service;
     // The startup pass ran without this service: finish pending sign-outs now, before the
     // first agent request scans the container.
-    this.pendingSignOutReady = this.startPendingSignOutPass();
+    this.pendingSignOutReady = this.startPendingSignOutPass().then(() => this.pendingSignOutPass);
   }
 
   /** Started by setMcpOauthService. */
