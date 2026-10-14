@@ -2556,3 +2556,37 @@ test("an MCP App entry point's palette entry shows its server label and opens it
     { serverName: entrypoint.serverName, toolName: "cad.tray", type: "global" },
   ]);
 });
+
+test("a failed entry point open from the palette shows its error in a toast", async () => {
+  const entrypoint = {
+    serverName: "cad",
+    serverLabel: "cad",
+    toolName: "cad.tray",
+    title: "Parts Tray",
+    resourceUri: "ui://tray/view",
+    type: "global" as const,
+    viewKey: "entrypoint:cad:cad.tray:global",
+  };
+  const actions = getActions({
+    artifactsEnabled: true,
+    mcpAppEntrypoints: [entrypoint],
+    api: createTestApiClient({
+      mcpApps: {
+        openEntrypoint: () =>
+          Promise.resolve({ success: false as const, error: "Too many entry point opens" }),
+      },
+    }),
+  });
+  const entry = actions.find((a) => a.id === CommandIds.navOpenAppEntrypoint(entrypoint.viewKey));
+  await withTestWindow(async () => {
+    const events = collectCommandEvents();
+    try {
+      await entry?.run();
+      expect(events.receivedToasts).toEqual([
+        { type: "error", message: "Too many entry point opens" },
+      ]);
+    } finally {
+      events.dispose();
+    }
+  });
+});

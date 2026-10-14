@@ -52,6 +52,30 @@ import { openMcpAppEntrypoint } from "@/browser/features/RightSidebar/AppViewTab
 import type { McpAppEntrypoint } from "@/common/orpc/schemas/mcpApps";
 
 /**
+ * One palette action per MCP App entry point: opens its app tab (calling the tool with {}) or
+ * focuses the one it has. The palette has closed by then, so a failure shows as a toast.
+ */
+function entrypointActions(
+  api: APIClient | null,
+  workspaceId: string,
+  entrypoints: readonly McpAppEntrypoint[],
+  navigation: string
+): CommandAction[] {
+  return entrypoints.map((entrypoint) => ({
+    id: CommandIds.navOpenAppEntrypoint(entrypoint.viewKey),
+    title: `Open Plugin View: ${entrypoint.title}`,
+    subtitle: entrypoint.serverLabel,
+    section: navigation,
+    keywords: ["plugin", "view", "app", "mcp", entrypoint.serverName],
+    run: async () => {
+      if (!api) return;
+      const error = await openMcpAppEntrypoint(api, workspaceId, entrypoint);
+      if (error !== null) showCommandFeedbackToast({ type: "error", message: error });
+    },
+  }));
+}
+
+/**
  * The workspace's MCP App views (the loaded transcript's, then ones opened this session), each
  * with its detail (appViewDetails).
  */
@@ -940,17 +964,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               ),
               // One per MCP App entry point of an enabled server: opens its app tab (calling
               // the tool with {}) or focuses the one it has.
-              ...(p.mcpAppEntrypoints ?? []).map((entrypoint) => ({
-                id: CommandIds.navOpenAppEntrypoint(entrypoint.viewKey),
-                title: `Open Plugin View: ${entrypoint.title}`,
-                subtitle: entrypoint.serverLabel,
-                section: section.navigation,
-                keywords: ["plugin", "view", "app", "mcp", entrypoint.serverName],
-                run: async () => {
-                  if (!p.api) return;
-                  await openMcpAppEntrypoint(p.api, wsId, entrypoint);
-                },
-              })),
+              ...entrypointActions(p.api, wsId, p.mcpAppEntrypoints ?? [], section.navigation),
               {
                 id: CommandIds.navOpenFileAsArtifact(),
                 title: "Open File as Artifact…",
