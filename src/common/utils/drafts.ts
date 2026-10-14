@@ -78,15 +78,22 @@ function utf8ByteLength(value: string): number {
  * JSON size of a draft in UTF-8 bytes, compared against MAX_DRAFT_JSON_BYTES. Bytes, because the
  * transport limits count bytes: UTF-16 code units undercount non-ASCII text up to 3x.
  */
-export function draftJsonBytes(draft: Draft & { pendingSends?: readonly PendingSend[] }): number {
+export function draftJsonBytes(
+  draft: Draft & {
+    pendingSends?: readonly PendingSend[];
+    nameState?: WorkspaceNamePersistedState;
+  }
+): number {
   return utf8ByteLength(
     JSON.stringify({
       text: draft.text,
       attachments: draft.attachments,
-      // Replay bookkeeping counts too: the file holds it.
+      // Replay bookkeeping and the name state count too: the file holds them.
       ...(draft.pendingSends != null && draft.pendingSends.length > 0
         ? { pendingSends: draft.pendingSends }
         : {}),
+      // Omitted from the JSON when undefined, as in the file.
+      nameState: draft.nameState,
     })
   );
 }

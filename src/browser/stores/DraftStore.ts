@@ -54,7 +54,10 @@ import {
   toDraftAttachmentMetadata,
 } from "@/common/utils/drafts";
 import { getErrorMessage } from "@/common/utils/errors";
-import { boundWorkspaceNamePersistedState } from "@/common/utils/workspaceNameState";
+import {
+  boundWorkspaceNamePersistedState,
+  DEFAULT_WORKSPACE_NAME_STATE,
+} from "@/common/utils/workspaceNameState";
 import {
   DEFAULT_CREATION_DRAFT_ID,
   DRAFT_ID_PATTERN,
@@ -576,6 +579,16 @@ function readLegacyJson(key: string): unknown {
   }
 }
 
+/** A legacy `workspaceNameState:<scope>` key's bounded value; null when it holds no name state. */
+function readLegacyNameState(key: string): WorkspaceNamePersistedState | null {
+  const raw = readLegacyJson(key);
+  // Older builds read the key with a partial schema (and wrote keys holding only some fields), so
+  // a missing field takes its default instead of dropping the typed name.
+  return typeof raw === "object" && raw !== null && !Array.isArray(raw)
+    ? boundWorkspaceNamePersistedState({ ...DEFAULT_WORKSPACE_NAME_STATE, ...raw })
+    : null;
+}
+
 /**
  * A legacy `workspaceNameState:<scope>` key's creation draft and bounded value. A pending scope is
  * the project's default draft. Null when the key cannot be imported (it is then dropped).
@@ -592,7 +605,7 @@ function parseLegacyNameState(
     legacyScope?.kind === "pending"
       ? defaultCreationDraftScope(legacyScope.projectPath)
       : legacyScope;
-  const nameState = boundWorkspaceNamePersistedState(readLegacyJson(key));
+  const nameState = readLegacyNameState(key);
   return scope?.kind === "creation" && nameState !== null ? { scope, nameState } : null;
 }
 
@@ -868,7 +881,7 @@ export class DraftStore {
       if (!merged.has(key)) merged.set(key, entry);
     }
     for (const [key, { entry }] of this.pendingListPuts) merged.set(key, entry);
-    for (const key of this.pendingDeletes.keys()) merged.delete(key);
+    for (const key of [...this.pendingDeletes.keys(), ...this.waitingDeletes]) merged.delete(key);
     const byProject: CreationDraftsByProject = {};
     for (const { projectPath, ...draft } of merged.values()) {
       (byProject[projectPath] ??= []).push(draft);
@@ -1581,10 +1594,12 @@ export class DraftStore {
     } finally {
       this.waitingDeletes.delete(key);
     }
-    if (this.entries.has(key)) return;
+    // Edited again while waiting: the draft stays, and so does any row the list still holds.
+    if (this.entries.has(key)) {
+      if (scope.kind === "creation") this.recomputeList();
+      return;
+    }
     this.pendingDeletes.set(key, scope);
-    // A list event while waiting above may have shown the row again; hide it now.
-    if (scope.kind === "creation") this.recomputeList();
     await this.sendDelete(key, 0);
   }
 
@@ -1939,7 +1954,7 @@ export class DraftStore {
   private applySnapshot(drafts: DraftSummary[]): void {
     const seen = new Set<string>();
     for (const summary of drafts) {
-      if (this.pendingDeletes.has(draftStoreScopeKey(summary.scope))) continue;
+      if (this.isDeleting(draftStoreScopeKey(summary.scope))) continue;
       const entry = this.getOrCreateEntry(summary.scope);
       seen.add(draftStoreScopeKey(summary.scope));
       // Each subscription restarts the revision sequence, so a restarted backend is never ignored.
@@ -2114,6 +2129,8 @@ export class DraftStore {
       console.warn("localStorage is unavailable; skipping the legacy draft import:", error);
       return;
     }
+    // Name keys of legacy pending drafts, imported with their text (into the draft it went to).
+    const pendingNameKeys = new Set<string>();
     for (const scopeId of scopeIds) {
       const inputKey = getInputKey(scopeId);
       const attachmentsKey = getInputAttachmentsKey(scopeId);
@@ -2137,21 +2154,19 @@ export class DraftStore {
               draftId: LEGACY_PENDING_DRAFT_ID,
             }
           : legacyScope;
+      // A pending draft's name goes with its text, not through the settings copy below: when that
+      // copy fails (quota), the name import would take the pending key for the default draft.
+      const nameKey = legacyScope.kind === "pending" ? getWorkspaceNameStateKey(scopeId) : null;
+      if (nameKey !== null) pendingNameKeys.add(nameKey);
+      const nameState = nameKey === null ? null : readLegacyNameState(nameKey);
       try {
-        const reply = await client.drafts.importLegacy({ scope, text, attachments });
-        if (reply.result === "applied") {
-          const entry = this.getOrCreateEntry(scope);
-          if (reply.revision > entry.revision) {
-            entry.revision = reply.revision;
-            if (!isTextDirty(entry)) entry.text = text;
-            if (!isAttachmentsDirty(entry)) {
-              entry.attachments = attachments;
-              entry.attachmentCount = attachments.length;
-              entry.payloadsLoaded = true;
-            }
-            this.recompute(entry);
-          }
-        }
+        const reply = await client.drafts.importLegacy({
+          scope,
+          text,
+          attachments,
+          ...(nameState !== null ? { nameState } : {}),
+        });
+        if (reply.result === "applied") this.applyImportReply(scope, reply, attachments);
         if (legacyScope.kind === "pending" && scope.kind === "creation") {
           if (reply.result !== "orphaned") {
             // Only a list entry leads a composer to the imported draft. Both keys stay until it
@@ -2184,6 +2199,7 @@ export class DraftStore {
             }
           }
           removeKeys();
+          if (nameKey !== null) updatePersistedState(nameKey, undefined);
           if (reply.result !== "orphaned") {
             // Scope-bound composer settings (model, workspace name...) follow the draft, as when
             // createWorkspaceDraft moves the default draft. Best-effort: settings, not the draft.
@@ -2215,29 +2231,46 @@ export class DraftStore {
         removeKeys();
       } catch (error) {
         console.warn("Failed to import a legacy draft; will retry on next start:", error);
-        // The backend could not be consulted, so this bypasses the non-clobber rule on purpose:
-        // if the snapshot has no draft for the scope, show the legacy one and let the normal write
-        // path save it. Otherwise the composer starts empty, the user types, and the next import
-        // answers "present" and drops the legacy keys: a guaranteed loss. The keys stay until a
-        // later import confirms.
-        const existing = this.entries.get(draftStoreScopeKey(scope));
-        if (!existing || (existing.text.length === 0 && existing.attachmentCount === 0)) {
-          this.setText(scope, text);
-          this.setAttachments(scope, attachments);
-        }
+        this.showUnimportedLegacyDraft(scope, text, attachments, nameState);
       }
     }
-    await this.migrateLegacyNameStates(client);
+    await this.migrateLegacyNameStates(client, pendingNameKeys);
+  }
+
+  /**
+   * A legacy draft whose import failed. The backend could not be consulted, so this bypasses the
+   * non-clobber rule on purpose: if the snapshot has no draft for the scope, show the legacy one
+   * and let the normal write path save it. Otherwise the composer starts empty, the user types,
+   * and the next import answers "present" and drops the legacy keys: a guaranteed loss. The keys
+   * stay until a later import confirms.
+   */
+  private showUnimportedLegacyDraft(
+    scope: DraftScope,
+    text: string,
+    attachments: DraftAttachment[],
+    nameState: WorkspaceNamePersistedState | null
+  ): void {
+    const existing = this.entries.get(draftStoreScopeKey(scope));
+    if (!existing || (existing.text.length === 0 && existing.attachmentCount === 0)) {
+      this.setText(scope, text);
+      this.setAttachments(scope, attachments);
+    }
+    if (nameState !== null && this.getView(scope).nameState === null) {
+      this.setNameState(scope, nameState);
+    }
   }
 
   /**
    * One-way migration of the legacy `workspaceNameState:<scope>` keys into the body of their
-   * creation draft: a draft scope, or a pending scope (the project's default draft). Runs after
-   * the text import, which moves a legacy pending draft's name key to the draft it creates. As for
-   * the text: a key is removed only after the backend answered, and on failure it stays and its
-   * name is shown (and saved like an edit) when the draft has none.
+   * creation draft: a draft scope, or a pending scope without legacy text (the project's default
+   * draft). `importedWithText` are the pending drafts' name keys the text import owns. As for the
+   * text: a key is removed only after the backend answered, and on failure it stays and its name
+   * is shown (and saved like an edit) when the draft has none.
    */
-  private async migrateLegacyNameStates(client: APIClient): Promise<void> {
+  private async migrateLegacyNameStates(
+    client: APIClient,
+    importedWithText: ReadonlySet<string>
+  ): Promise<void> {
     const prefix = getWorkspaceNameStateKey("");
     let keys: string[];
     try {
@@ -2250,6 +2283,7 @@ export class DraftStore {
       return;
     }
     for (const key of keys) {
+      if (importedWithText.has(key)) continue;
       const legacy = parseLegacyNameState(key, prefix);
       if (legacy === null) {
         updatePersistedState(key, undefined);
@@ -2267,19 +2301,36 @@ export class DraftStore {
   ): Promise<void> {
     try {
       const reply = await client.drafts.importLegacy({ scope, nameState });
-      if (reply.result === "applied") {
-        const entry = this.getOrCreateEntry(scope);
-        if (reply.revision > entry.revision) {
-          entry.revision = reply.revision;
-          if (!isNameDirty(entry)) entry.nameState = nameState;
-          this.recompute(entry);
-        }
-      }
+      if (reply.result === "applied") this.applyImportReply(scope, reply, []);
       updatePersistedState(key, undefined);
     } catch (error) {
       console.warn("Failed to import a legacy workspace name; will retry on next start:", error);
       if (this.getView(scope).nameState === null) this.setNameState(scope, nameState);
     }
+  }
+
+  /**
+   * An applied legacy import answers with the draft it stored, which may keep the backend's body
+   * or name: applied like a write reply, so the import's own change event (stale once this
+   * revision is applied) cannot be the only way the kept part reaches this window.
+   */
+  private applyImportReply(
+    scope: DraftScope,
+    reply: DraftWriteOutput,
+    legacyAttachments: readonly ChatAttachment[]
+  ): void {
+    const entry = this.getOrCreateEntry(scope);
+    // The legacy payloads are at hand: when the stored attachments are those, none need loading.
+    if (
+      !isAttachmentsDirty(entry) &&
+      legacyAttachments.length > 0 &&
+      matchesServerAttachments(legacyAttachments, reply.attachments)
+    ) {
+      entry.attachments = [...legacyAttachments];
+      entry.attachmentCount = legacyAttachments.length;
+      entry.payloadsLoaded = true;
+    }
+    this.applyWriteReply(entry, reply, ALL_FIELDS);
   }
 
   /**

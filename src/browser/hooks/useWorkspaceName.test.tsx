@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import type { ReactNode } from "react";
+import { startTransition, Suspense, type ReactNode } from "react";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { installDom } from "../../../tests/ui/dom";
 import { APIProvider } from "@/browser/contexts/API";
@@ -99,6 +99,51 @@ describe("useWorkspaceName draft state", () => {
     expect(remounted.result.current.name).toBe("quotes-a1b2");
     await act(() => new Promise((resolve) => setTimeout(resolve, 20)));
     expect(generateMock).toHaveBeenCalledTimes(1);
+  });
+
+  // The draft switch renders the new scope before its effect cancels the request (here the
+  // switch never commits: the new draft suspends), so a reply in between must not follow it.
+  test("a name generated for one draft is never written into the draft switched to", async () => {
+    let reply: (name: string) => void = () => undefined;
+    generateMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          reply = (name) =>
+            resolve({
+              success: true as const,
+              data: { name, title: "Draft one", modelUsed: "test:model" },
+            });
+        })
+    );
+    const other: DraftStoreScope = { ...SCOPE, draftId: "draft-2" };
+    const pending = new Promise<never>(() => undefined);
+    const view = renderHook(
+      (props: { scope: DraftStoreScope; suspend: boolean }) => {
+        const result = useWorkspaceName({ message: "fix it", debounceMs: 1, scope: props.scope });
+        // The Suspense protocol (React 18 has no `use`): a pending render throws its promise.
+        // eslint-disable-next-line @typescript-eslint/only-throw-error
+        if (props.suspend) throw pending;
+        return result;
+      },
+      {
+        initialProps: { scope: { ...SCOPE }, suspend: false },
+        wrapper: (props: { children: ReactNode }) => (
+          <Wrapper>
+            <Suspense fallback={null}>{props.children}</Suspense>
+          </Wrapper>
+        ),
+      }
+    );
+    await waitFor(() => expect(generateMock).toHaveBeenCalledTimes(1));
+    act(() => startTransition(() => view.rerender({ scope: other, suspend: true })));
+    await act(async () => {
+      reply("draft-one-a1b2");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    expect(getDraftStore().getView(other).nameState).toBeNull();
+    expect(getDraftStore().getView(SCOPE).nameState?.generatedIdentity?.name).toBe(
+      "draft-one-a1b2"
+    );
   });
 
   test("another window's name edit replaces the shown name", async () => {
