@@ -2325,8 +2325,8 @@ export class McpOauthService {
    * The identity of the store file the cache was read from (or last written). Another Xum
    * backend can share mcp-oauth.json (XUM_ALLOW_MULTIPLE_INSTANCES) and sign a server out or in
    * there: every use and every write first compares the file's identity and rereads it when it
-   * changed (#6123). Known limit: there is no cross-process lock, so two writes that interleave
-   * between another process's write and this stat can still lose one update.
+   * changed (#6123); after its own write it rereads once. Known limit: there is no
+   * cross-process lock, so two writes that interleave can still lose one update.
    */
   private storeStamp: string | null = null;
 
@@ -2417,7 +2417,8 @@ export class McpOauthService {
       encoding: "utf-8",
       mode: 0o600,
     });
-    // The cache now matches the file this process wrote.
-    this.storeStamp = await this.readStoreStamp();
+    // Another process can replace the file right after this write, so a stat here can name
+    // its file: reread on the next use instead (the cache is this process's own content).
+    this.storeStamp = null;
   }
 }
