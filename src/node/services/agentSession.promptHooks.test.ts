@@ -114,6 +114,53 @@ describe("message.send outcomes", () => {
     expect(h.events.some((event) => event.type === "stream-error")).toBe(false);
   });
 
+  // The cancel check after the hooks runs before their outcome is used, so a cancel during a
+  // slow hook ends the send as canceled whatever the hook decides (agentSession.ts, after
+  // runPluginSendHooks).
+  test.each([
+    ["blocks", blockAll],
+    ["adds context", addContext],
+  ] as const)(
+    "a send canceled while a hook that %s is pending is canceled and writes no row",
+    async (_label, decide) => {
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => (release = resolve));
+      let entered!: () => void;
+      const hookEntered = new Promise<void>((resolve) => (entered = resolve));
+      const { h, streamed } = await setup(() => undefined);
+      unregisters.push(
+        eventSpine.useBefore(
+          "message.send",
+          async (ctx) => {
+            entered();
+            await released;
+            decide(ctx);
+          },
+          { workspaceId }
+        )
+      );
+      const controller = new AbortController();
+      const canceled = mock(() => undefined);
+      const cancelState = { canceledBeforeAcceptance: false };
+
+      const sending = h.session.sendMessage("deploy to prod", options, {
+        acceptanceOrigin: "manual",
+        cancelSignal: controller.signal,
+        onCanceled: canceled,
+        cancelState,
+      });
+      await hookEntered;
+      controller.abort();
+      release();
+
+      expect(await sending).toEqual({ success: true, data: undefined });
+      expect(canceled).toHaveBeenCalledTimes(1);
+      expect(cancelState.canceledBeforeAcceptance).toBe(true);
+      expect(await userRows(h)).toEqual([]);
+      expect(streamed).toEqual([]);
+    }
+  );
+
   test("added context is saved on its user row and leaves the system prompt alone", async () => {
     let addHookContext = true;
     const { h, calls, streamed } = await setup((ctx) => {
