@@ -229,6 +229,20 @@ describe("loadPluginMcpServers", () => {
     }
   });
 
+  test("a server named __proto__ is skipped: its consent could not be stored (#6534)", async () => {
+    using tmp = new DisposableTempDir("plugin-mcp");
+    // JSON.parse makes `__proto__` an own key, as reading the file does.
+    const config = JSON.parse(
+      '{"__proto__": {"command": "node"}, "local": {"command": "node"}}'
+    ) as Record<string, unknown>;
+    const plugin = await makePlugin(tmp.path, "proto", config, { fileName: ".mcp.json" });
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
+    expect(Object.values(servers).map((s) => s.plugin?.serverName)).toEqual(["local"]);
+    expect(diagnostics.map((d) => d.message)).toEqual([
+      expect.stringContaining("server '__proto__'"),
+    ]);
+  });
+
   test("the Codex dialect infers stdio from a command and accepts a flat server map", async () => {
     using tmp = new DisposableTempDir("plugin-mcp");
     const plugin = await makePlugin(

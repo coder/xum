@@ -534,6 +534,16 @@ function normalizeRemoteEntry(
 }
 
 /**
+ * Why a server entry cannot load at all, before dialect handling. `__proto__` is refused because
+ * the registry's consent record (a `z.record`) drops that key on parse (#6534): the server could
+ * never keep its review, so it is skipped with a diagnostic instead of staying unreviewable.
+ */
+function serverEntryShapeError(serverName: string, rawEntry: unknown): string | undefined {
+  if (serverName === "__proto__") return "the server name '__proto__' is reserved";
+  return isPlainObject(rawEntry) ? undefined : "server entry must be an object";
+}
+
+/**
  * Load and normalize a plugin's `mcp.json` into default-disabled Xum server
  * records keyed by `plugin:<instanceId>:<serverName>`. The instance ID
  * defaults to hashing the canonical plugin root; callers pass an explicit
@@ -664,8 +674,9 @@ export async function loadPluginMcpServers(
       });
     };
 
-    if (!isPlainObject(rawEntry)) {
-      reportEntry("error", "server entry must be an object");
+    const shapeError = serverEntryShapeError(serverName, rawEntry);
+    if (shapeError !== undefined) {
+      reportEntry("error", shapeError);
       continue;
     }
     const codex = codexDialect
