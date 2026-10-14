@@ -96,14 +96,17 @@ export function extractMcpAppResource(result: unknown, uri: string): McpAppResou
     );
   }
   const ui = isRecord(content._meta) && isRecord(content._meta.ui) ? content._meta.ui : {};
-  const csp = McpAppCspDeclarationSchema.safeParse(ui.csp ?? {});
+  // Only an absent ui.csp means "not declared": a present null is a malformed declaration.
+  const csp = McpAppCspDeclarationSchema.safeParse(ui.csp === undefined ? {} : ui.csp);
   const alias = McpAppWidgetCspSchema.safeParse(
     (isRecord(content._meta) ? content._meta["openai/widgetCSP"] : undefined) ?? {}
   );
   return {
     html: bytes.toString("utf8"),
-    // A malformed declaration grants nothing rather than failing the whole view.
-    csp: mergeCsp(csp.success ? csp.data : {}, alias.success ? alias.data : {}),
+    // A malformed declaration grants nothing rather than failing the whole view. A declared but
+    // malformed ui.csp also blocks the legacy alias (fail closed, #6181): the server declared the
+    // standard field, which supersedes the alias, and Xum cannot tell which lists it meant.
+    csp: csp.success ? mergeCsp(csp.data, alias.success ? alias.data : {}) : {},
     prefersBorder: typeof ui.prefersBorder === "boolean" ? ui.prefersBorder : null,
   };
 }

@@ -8,11 +8,11 @@ import { useAPI } from "@/browser/contexts/API";
 import { formatKeybind, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { getOwn } from "@/common/utils/getOwn";
 import {
-  validateMCPSettingValue,
   type MCPSettingSchema,
   type MCPSettingValue,
   type MCPSettingsSnapshot,
 } from "@/common/utils/mcpSettings";
+import { settingsErrors } from "./serverSettingsEntries";
 
 interface MCPServerSettingsSectionProps {
   workspaceId: string;
@@ -20,10 +20,16 @@ interface MCPServerSettingsSectionProps {
   snapshot: MCPSettingsSnapshot;
   /**
    * Called when a save starts (it takes the save's settings request); the returned callback
-   * gets the values a successful save returned. The dialog keeps them as the snapshot's
-   * values, so a remount (server toggled off and on) starts from what the server stored.
+   * runs when the save ends, with the values a successful save returned (null on failure).
+   * The dialog keeps them as the snapshot's values, so a remount starts from what the server
+   * stored, and keeps Refresh Tools disabled until the save ends.
    */
-  beginSave: () => (values: MCPSettingsSnapshot["values"]) => void;
+  beginSave: () => (values: MCPSettingsSnapshot["values"] | null) => void;
+  /**
+   * Refresh Tools runs for this server. Its settings read would take a newer request ID than
+   * a save started now, and the save's result would be dropped, so Save waits for it.
+   */
+  refreshing: boolean;
 }
 
 /** Lets the dialog check, at Save time, for edits this section has not saved yet. */
@@ -54,13 +60,12 @@ export const MCPServerSettingsSection = React.forwardRef<
   const changed = Object.fromEntries(
     Object.entries(draft).filter(([name, value]) => getOwn(saved, name) !== value)
   );
-  const errors: Record<string, string> = {};
-  for (const [name, value] of Object.entries(draft)) {
-    const schema = getOwn(properties, name);
-    const message = schema && validateMCPSettingValue(schema, value);
-    if (message) errors[name] = `${schema.title} ${message}`;
-  }
-  const canSave = Object.keys(changed).length > 0 && Object.keys(errors).length === 0 && !saving;
+  const errors = settingsErrors(properties, draft);
+  const canSave =
+    Object.keys(changed).length > 0 &&
+    Object.keys(errors).length === 0 &&
+    !saving &&
+    !props.refreshing;
   // The dialog's Save does not send settings, so it must not close over a pending edit.
   useImperativeHandle(ref, () => ({ hasUnsavedChanges: () => Object.keys(changed).length > 0 }));
 
@@ -70,7 +75,8 @@ export const MCPServerSettingsSection = React.forwardRef<
     if (!api) return;
     setSaving(true);
     setError(null);
-    const onSaved = props.beginSave();
+    const onSettled = props.beginSave();
+    let savedValues: MCPSettingsSnapshot["values"] | null = null;
     try {
       const result = await api.mcp.settings.update({
         workspaceId: props.workspaceId,
@@ -80,7 +86,7 @@ export const MCPServerSettingsSection = React.forwardRef<
       if (result.success) {
         setSaved(result.data);
         setDraft(result.data);
-        onSaved(result.data);
+        savedValues = result.data;
       } else {
         setError(result.error);
         setDraft(saved);
@@ -91,6 +97,7 @@ export const MCPServerSettingsSection = React.forwardRef<
     } finally {
       setNumberText({});
       setSaving(false);
+      onSettled(savedValues);
     }
   };
 

@@ -238,7 +238,7 @@ export const HeldInput: React.FC<HeldInputProps> = (props) => {
                 aria-label="Send unsent message"
                 disabled={pendingAction != null}
                 onClick={() => runAction("send")}
-                className="text-secondary bg-muted/10 hover:bg-hover hover:text-foreground flex h-6 items-center gap-1 rounded-md px-2 font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+                className="text-foreground bg-muted/10 hover:bg-hover flex h-6 items-center gap-1 rounded-md px-2 font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {pendingAction === "send" ? (
                   <Loader2 className="size-3 animate-spin" />

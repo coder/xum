@@ -69,7 +69,7 @@ interface WorkspaceMCPStoryOptions {
   settingsConnected?: string[];
   settingsReads?: string[][];
   settingsReadErrors?: Record<string, string>;
-  settingsUpdateGate?: { promise: Promise<void> };
+  settingsUpdateGate?: { promise: Promise<void> } | Array<{ promise: Promise<void> }>;
   settingsFirstReadGate?: { promise: Promise<void> };
   testGate?: { promise: Promise<void> };
 }
@@ -946,6 +946,143 @@ export const WorkspaceMCPServerSettingsUnsavedOnSave: Story = {
   },
 };
 
+/**
+ * Switching a server off keeps its settings draft: switched back on, the edit is still there,
+ * and while it is off the dialog's Save still says the edit is unsaved.
+ */
+export const WorkspaceMCPServerSettingsDraftAcrossToggle: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => renderWorkspaceMCPModal(settingsStoryOptions()),
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    const section = within(await modal.findByTestId("mcp-server-settings"));
+    const zoom = section.getByLabelText("Default zoom setting");
+    await userEvent.clear(zoom);
+    await userEvent.type(zoom, "3");
+    const toggle = modal.getByRole("switch", { name: "Toggle cad MCP server" });
+    await userEvent.click(toggle);
+    await waitFor(() => expect(section.getByLabelText("Default zoom setting")).not.toBeVisible());
+    await userEvent.click(modal.getByRole("button", { name: "Save" }));
+    await expect(modal.findByText(/Unsaved settings for cad/)).resolves.toBeInTheDocument();
+    await userEvent.click(toggle);
+    const shown = within(await modal.findByTestId("mcp-server-settings"));
+    await expect(shown.getByLabelText("Default zoom setting")).toHaveValue(3);
+  },
+};
+
+const refreshDuringSaveGate = storyGate();
+
+/**
+ * Refresh Tools reads settings too. While a save is in flight that read could show the
+ * pre-save values and drop the save's result, so Refresh Tools waits for the save.
+ */
+export const WorkspaceMCPServerSettingsRefreshDuringSave: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () =>
+    renderWorkspaceMCPModal({
+      ...settingsStoryOptions(),
+      settingsUpdateGate: refreshDuringSaveGate,
+    }),
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    await userEvent.click(await modal.findByRole("button", { name: "Fetch Tools" }));
+    const refresh = await modal.findByRole("button", { name: "Refresh Tools" });
+    await waitFor(() => expect(refresh).toBeEnabled());
+    const section = within(await modal.findByTestId("mcp-server-settings"));
+    const zoom = section.getByLabelText("Default zoom setting");
+    await userEvent.clear(zoom);
+    await userEvent.type(zoom, "3");
+    await userEvent.click(section.getByRole("button", { name: "Save settings" }));
+    await waitFor(() => expect(zoom).toBeDisabled());
+    await expect(refresh).toBeDisabled();
+    refreshDuringSaveGate.open();
+    await waitFor(() => expect(refresh).toBeEnabled());
+    await expect(section.getByLabelText("Default zoom setting")).toHaveValue(3);
+  },
+};
+
+const saveDuringRefreshGate = storyGate();
+
+/** The reverse order: while Refresh Tools runs (its settings read follows), Save settings waits. */
+export const WorkspaceMCPServerSettingsSaveDuringRefresh: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () =>
+    renderWorkspaceMCPModal({ ...settingsStoryOptions(), testGate: saveDuringRefreshGate }),
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    const section = within(await modal.findByTestId("mcp-server-settings"));
+    const zoom = section.getByLabelText("Default zoom setting");
+    await userEvent.clear(zoom);
+    await userEvent.type(zoom, "3");
+    const save = section.getByRole("button", { name: "Save settings" });
+    await waitFor(() => expect(save).toBeEnabled());
+    await userEvent.click(modal.getByRole("button", { name: "Fetch Tools" }));
+    await waitFor(() => expect(save).toBeDisabled());
+    saveDuringRefreshGate.open();
+    await expect(modal.findByRole("button", { name: "Refresh Tools" })).resolves.toBeEnabled();
+  },
+};
+
+const overlapFirstSave = storyGate();
+const overlapSecondSave = storyGate();
+
+/**
+ * A save started after a close and reopen overlaps one from before it: Refresh Tools stays
+ * disabled until both settle, not only the first.
+ */
+export const WorkspaceMCPServerSettingsOverlappingSaves: Story = {
+  parameters: { pixel: PIXEL_DISABLED },
+  render: () => (
+    <WorkspaceMCPModalStoryShell
+      setup={() =>
+        setupWorkspaceMCPModalStory({
+          ...settingsStoryOptions(),
+          settingsUpdateGate: [overlapFirstSave, overlapSecondSave],
+        })
+      }
+    >
+      <ReopenableWorkspaceMCPModal />
+    </WorkspaceMCPModalStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const saveZoom = async (zoom: string) => {
+      const section = within(
+        await within(await findWorkspaceMCPDialog(canvasElement)).findByTestId(
+          "mcp-server-settings"
+        )
+      );
+      const input = section.getByLabelText("Default zoom setting");
+      await userEvent.clear(input);
+      await userEvent.type(input, zoom);
+      await userEvent.click(section.getByRole("button", { name: "Save settings" }));
+      await waitFor(() => expect(input).toBeDisabled());
+    };
+    await saveZoom("3");
+    await userEvent.click(
+      within(await findWorkspaceMCPDialog(canvasElement)).getByRole("button", { name: "Cancel" })
+    );
+    await waitFor(() =>
+      expect(queryWorkspaceMCPDialog(canvasElement.ownerDocument)).not.toBeInTheDocument()
+    );
+    await userEvent.click(
+      within(canvasElement).getByRole("button", { name: "Open workspace MCP" })
+    );
+    await saveZoom("4");
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+    const fetchTools = modal.getByRole("button", { name: "Fetch Tools" });
+    await expect(fetchTools).toBeDisabled();
+    overlapFirstSave.open();
+    await overlapFirstSave.promise;
+    // The first save's result reaches the dialog in microtasks, and React commits its state
+    // update before the next frame paints. Two frames: the settle and its commit.
+    for (let frame = 0; frame < 2; frame++)
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+    await expect(fetchTools).toBeDisabled();
+    overlapSecondSave.open();
+    await waitFor(() => expect(fetchTools).toBeEnabled());
+  },
+};
+
 /** Pick `option` in a Radix select (its list renders in a portal). */
 async function chooseSetting(
   canvasElement: HTMLElement,
@@ -1004,7 +1141,7 @@ export const WorkspaceMCPServerSettingsReopen: Story = {
 
 /**
  * After a save, the saved value is the form's base: choosing the previous value
- * again is a change, also after the section remounts (server toggled off and on).
+ * again is a change, also after the server is toggled off and on.
  */
 export const WorkspaceMCPServerSettingsOldValueAgain: Story = {
   parameters: { pixel: PIXEL_DISABLED },
@@ -1014,10 +1151,11 @@ export const WorkspaceMCPServerSettingsOldValueAgain: Story = {
     const modal = within(await findWorkspaceMCPDialog(canvasElement));
     const toggle = modal.getByRole("switch", { name: "Toggle cad MCP server" });
     await userEvent.click(toggle);
-    await waitFor(() => expect(modal.queryByTestId("mcp-server-settings")).toBeNull());
+    await waitFor(() => expect(modal.getByTestId("mcp-server-settings")).not.toBeVisible());
     await userEvent.click(toggle);
 
     const section = within(await modal.findByTestId("mcp-server-settings"));
+    await waitFor(() => expect(section.getByLabelText("Units setting")).toBeVisible());
     await expect(section.getByLabelText("Units setting")).toHaveTextContent("in");
     await chooseSetting(canvasElement, section.getByLabelText("Units setting"), "mm");
     await waitFor(() =>

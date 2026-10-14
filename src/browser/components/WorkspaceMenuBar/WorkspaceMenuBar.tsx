@@ -83,6 +83,7 @@ import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/r
 import { focusRightSidebarTab } from "@/browser/utils/rightSidebarTabFocus";
 import type { TabType } from "@/browser/types/rightSidebar";
 import { useAgentSkills, useAgentSkillsLoaded } from "@/browser/stores/AgentSkillsStore";
+import { listInvocableSkills } from "@/common/utils/agentSkills/skillLookupName";
 
 interface WorkspaceMenuBarProps {
   workspaceId: string;
@@ -862,7 +863,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
                   href="https://mux.coder.com/config/notifications"
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-accent hover:underline"
+                  className="text-accent-text hover:underline"
                 >
                   Learn more
                 </a>
@@ -872,7 +873,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         </Popover>
         <SkillIndicator
           loadedSkills={loadedSkills}
-          availableSkills={skillList.skills}
+          availableSkills={listInvocableSkills(skillList)}
           invalidSkills={skillList.invalidSkills}
           unavailableSources={skillList.unavailableSources}
           skillLoadErrors={skillLoadErrors}

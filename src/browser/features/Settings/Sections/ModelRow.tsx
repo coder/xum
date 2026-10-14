@@ -156,7 +156,7 @@ function ContextWindowSlider(props: {
           <span
             className={cn(
               "rounded-full px-1.5 py-0.5 font-mono text-[10px] leading-none font-bold transition-colors",
-              props.enabled ? "bg-accent/20 text-accent" : "text-muted"
+              props.enabled ? "bg-accent/20 text-accent-text" : "text-muted"
             )}
           >
             1M
@@ -317,7 +317,7 @@ export function ModelRow(props: ModelRowProps) {
                 size="icon"
                 onClick={props.onSaveEdit}
                 disabled={props.saving}
-                className="text-accent hover:text-accent-dark h-6 w-6"
+                className="text-accent-text hover:text-accent-dark h-6 w-6"
                 title="Save changes (Enter)"
               >
                 <Check className="h-3.5 w-3.5" />

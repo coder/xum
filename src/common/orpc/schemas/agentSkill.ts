@@ -15,6 +15,19 @@ export const SkillNameSchema = z
   .max(64)
   .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
 
+/**
+ * Skill lookup name: a bare skill name, or `<plugin>:<skill>` for an Agent Plugin's
+ * skill (Claude Code's plugin namespace convention). Plugin names cannot contain `:`,
+ * so it is an unambiguous separator. Lookahead-free (no `.refine`) because tool input
+ * schemas go to OpenAI strict mode; parseSkillLookupName enforces the full plugin-name
+ * grammar (`--`, `..`, Windows reserved names, 64-char cap).
+ */
+export const SkillLookupNameSchema = z
+  .string()
+  .min(1)
+  .max(129)
+  .regex(/^(?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?:)?[a-z0-9]+(?:-[a-z0-9]+)*$/);
+
 export const AgentSkillFrontmatterSchema = z.object({
   name: SkillNameSchema,
   description: z.string().min(1).max(1024),
@@ -161,4 +174,9 @@ export const AgentSkillListResultSchema = z.object({
   skills: z.array(AgentSkillDescriptorSchema),
   invalidSkills: z.array(AgentSkillIssueSchema),
   unavailableSources: z.array(AgentSkillUnavailableSourceSchema),
+  /**
+   * Plugin skills whose bare name lost to a higher-precedence skill. Each stays
+   * reachable as `<pluginName>:<name>`. Omitted when empty.
+   */
+  shadowedPluginSkills: z.array(AgentSkillDescriptorSchema).optional(),
 });

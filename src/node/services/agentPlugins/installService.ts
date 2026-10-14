@@ -1576,7 +1576,7 @@ export class AgentPluginInstallService {
     const hook = this.collectHook(plugin);
     const readSecret = createSecretReader();
     const skills = new Map<string, { fingerprint: string; display: string }>();
-    for (const skill of await this.collectSkills(plugin, warnings)) {
+    for (const skill of await this.collectSkillsFromRoots(plugin, warnings)) {
       skills.set(skill.name, describeSkillAdvertisement(skill));
     }
     const agents = new Map<string, string>();
@@ -1903,14 +1903,34 @@ export class AgentPluginInstallService {
    * advertise gates that visibility entirely, so the update capability
    * fingerprint must cover them (the oRPC preview schema strips the extras).
    */
-  private async collectSkills(
-    plugin: Pick<AgentPluginInfo, "rootPath" | "skillsDir">,
+  private async collectSkillsFromRoots(
+    plugin: Pick<AgentPluginInfo, "rootPath" | "skillsDirs">,
     warnings: string[]
   ): Promise<CollectedPluginSkill[]> {
-    const skillsDir = plugin.skillsDir;
-    if (skillsDir === undefined) {
-      return [];
+    const skills: CollectedPluginSkill[] = [];
+    for (const skillsDir of plugin.skillsDirs ?? []) {
+      for (const skill of await this.collectSkills(plugin.rootPath, skillsDir, warnings)) {
+        // Runtime discovery keeps the first skill of a name (roots in declared order), so the
+        // preview must not promise the later one (#6121).
+        if (skills.some((earlier) => earlier.name === skill.name)) {
+          warnings.push(
+            `${path.relative(plugin.rootPath, skillsDir)}/${skill.name}: an earlier skills root has a skill with this name; it will not load`
+          );
+          continue;
+        }
+        skills.push(skill);
+      }
     }
+    return skills;
+  }
+
+  /** One skills root of collectSkillsFromRoots. Warnings name the root by its plugin-relative path. */
+  private async collectSkills(
+    pluginRoot: string,
+    skillsDir: string,
+    warnings: string[]
+  ): Promise<CollectedPluginSkill[]> {
+    const label = path.relative(pluginRoot, skillsDir);
     const skills: CollectedPluginSkill[] = [];
     let entries: string[] = [];
     try {
@@ -1934,13 +1954,13 @@ export class AgentPluginInstallService {
         // allowMissing (matching runtime assertSkillDirValid): resolve through
         // the symlinked dir even when SKILL.md is absent, so an escaping
         // symlink fails containment instead of hiding behind ENOENT.
-        containedSkillPath = await ensurePluginPathContained(plugin.rootPath, skillPath, {
+        containedSkillPath = await ensurePluginPathContained(pluginRoot, skillPath, {
           allowMissing: true,
         });
       } catch (error) {
         if (!hasErrorCode(error, "ENOENT")) {
           warnings.push(
-            `skills/${dirName}: ${error instanceof PluginGitPathError ? "resolves into the plugin's .git directory" : "resolves outside the plugin root"}; it will not load`
+            `${label}/${dirName}: ${error instanceof PluginGitPathError ? "resolves into the plugin's .git directory" : "resolves outside the plugin root"}; it will not load`
           );
         }
         // ENOENT (unresolvable path) → not a skill dir; skip silently.
@@ -1961,7 +1981,7 @@ export class AgentPluginInstallService {
       // never-loading skill as a capability addition.
       const dirNameParsed = SkillNameSchema.safeParse(dirName);
       if (!dirNameParsed.success) {
-        warnings.push(`skills/${dirName}: invalid skill directory name; it will not load`);
+        warnings.push(`${label}/${dirName}: invalid skill directory name; it will not load`);
         continue;
       }
       // Size-check BEFORE reading (mirroring runtime discovery): the parse
@@ -1969,7 +1989,7 @@ export class AgentPluginInstallService {
       // identical guard in collectAgentFiles.
       if (stat.size > MAX_FILE_SIZE) {
         warnings.push(
-          `skills/${dirName}: SKILL.md is too large (${stat.size} bytes; max ${MAX_FILE_SIZE}); it will not load`
+          `${label}/${dirName}: SKILL.md is too large (${stat.size} bytes; max ${MAX_FILE_SIZE}); it will not load`
         );
         continue;
       }
@@ -1996,7 +2016,7 @@ export class AgentPluginInstallService {
           paths: resolveSkillPaths(parsed.frontmatter),
         });
       } catch (error) {
-        warnings.push(`skills/${dirName}: ${getErrorMessage(error)}`);
+        warnings.push(`${label}/${dirName}: ${getErrorMessage(error)}`);
       }
     }
     return skills;
@@ -2193,7 +2213,7 @@ export class AgentPluginInstallService {
       const targetPath = this.targetPathFor(plugin.name);
       await this.assertNoCollision(plugin.name);
 
-      const skills = await this.collectSkills(plugin, warnings);
+      const skills = await this.collectSkillsFromRoots(plugin, warnings);
       const mcpServers = await this.collectMcpServers(
         plugin,
         targetPath,
@@ -3015,7 +3035,7 @@ export class AgentPluginInstallService {
   /** Full inventory deliberately ignores saved imports: package update consent stays unchanged. */
   private async collectComponents(plugin: AgentPluginInfo) {
     const warnings: string[] = [];
-    const skills = await this.collectSkills(plugin, warnings);
+    const skills = await this.collectSkillsFromRoots(plugin, warnings);
     const mcpServers = await this.collectMcpServers(
       { ...plugin, importedComponents: undefined },
       path.join(plugin.containerPath, plugin.dirName),
