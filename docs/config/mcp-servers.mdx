@@ -79,9 +79,10 @@ This is not a sandbox. A plugin server runs as your OS user, so it can still rea
 A plugin stdio server receives only these variables:
 
 1. The variables its MCP configuration sets in `env`, plus `PLUGIN_ROOT` and `PLUGIN_DATA`.
-2. These host variables, when they are set: `HOME`, `LOGNAME`, `PATH`, `SHELL`, `USER`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `TZ` and `__CF_USER_TEXT_ENCODING`. On Windows, the core system variables (`PATH`, `PATHEXT`, `SYSTEMROOT`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `TEMP`, `TMP` and similar) and `HOME`.
-3. CA bundle paths: `SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `GIT_SSL_CAINFO`, `CARGO_HTTP_CAINFO`, `PIP_CERT`, `BUNDLE_SSL_CA_CERT`, `npm_config_cafile` and `NPM_CONFIG_CAFILE`.
-4. Variables that Xum sets for every command it runs, so that tools do not wait for input: `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `EDITOR` and `VISUAL` set to `true`, and `GIT_TERMINAL_PROMPT` set to `0`. These values replace the same names in the plugin's `env`.
+2. The host variables a Codex `.mcp.json` server names in `env_vars`, when they are set on the host. The consent preview lists these names, and adding a name needs a new review. A value in `env` wins over a host variable with the same name.
+3. These host variables, when they are set: `HOME`, `LOGNAME`, `PATH`, `SHELL`, `USER`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `TZ` and `__CF_USER_TEXT_ENCODING`. On Windows, the core system variables (`PATH`, `PATHEXT`, `SYSTEMROOT`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `TEMP`, `TMP` and similar) and `HOME`.
+4. CA bundle paths: `SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `GIT_SSL_CAINFO`, `CARGO_HTTP_CAINFO`, `PIP_CERT`, `BUNDLE_SSL_CA_CERT`, `npm_config_cafile` and `NPM_CONFIG_CAFILE`.
+5. Variables that Xum sets for every command it runs, so that tools do not wait for input: `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `EDITOR` and `VISUAL` set to `true`, and `GIT_TERMINAL_PROMPT` set to `0`. These values replace the same names in the plugin's `env`.
 
 Xum also removes these names from every command it runs, even when the plugin's `env` sets them: `AGENT_BROWSER_SESSION`, `AGENT_BROWSER_STREAM_PORT`, `XUM_VENDORED_BIN_DIR`, `MUX_VENDORED_BIN_DIR` and `CHROME_DESKTOP`. It also removes Xum's own `bin` directory from `PATH`.
 
@@ -89,7 +90,7 @@ Xum does not pass any other variable. This includes proxy variables (`HTTP_PROXY
 
 To give a plugin server another variable:
 
-1. The plugin publisher sets it in the server's `env` in the plugin's MCP configuration.
+1. The plugin publisher sets a fixed value in the server's `env`, or, in a Codex `.mcp.json`, names a host variable in `env_vars` so that its value is passed from your environment.
 2. You cannot add a variable to a plugin server from Xum settings. Xum has no per-server environment override for plugin servers. Local edits to a managed plugin are lost on the next update.
 3. If you need a variable now, configure the same command as your own server in `mcp.jsonc`. Your own servers inherit your full environment.
 

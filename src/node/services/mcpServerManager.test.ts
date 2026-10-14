@@ -10487,6 +10487,52 @@ describe("prepareStdioLaunch", () => {
     }
   });
 
+  test("a plugin server receives its env_vars names on top of the minimal host env (#6487)", async () => {
+    using tmp = new DisposableTempDir("mcp-plugin-forward-env");
+    const saved = [process.env.XUM_TEST_FWD_NAMED, process.env.XUM_TEST_FWD_OTHER];
+    process.env.XUM_TEST_FWD_NAMED = "forwarded";
+    process.env.XUM_TEST_FWD_OTHER = "not-named";
+    try {
+      const launch = await prepareStdioLaunch({
+        transport: "stdio",
+        command: 'printf "%s|%s" "${XUM_TEST_FWD_NAMED-unset}" "${XUM_TEST_FWD_OTHER-unset}"',
+        env: { PLUGIN_DATA: path.join(tmp.path, "data") },
+        forwardEnv: ["XUM_TEST_FWD_NAMED"],
+        disabled: false,
+        plugin: {
+          pluginName: "demo",
+          serverName: "srv",
+          sourceScope: "global",
+          sourceLocation: "plugins/demo",
+        },
+      });
+      // Launch the way startStdioInstance does: the real host-local runtime and these options.
+      const stream = await runtimeFactory
+        .createRuntime({ type: "local", srcBaseDir: tmp.path })
+        .exec(launch.command, {
+          cwd: tmp.path,
+          env: launch.env,
+          hostEnv: launch.hostEnv,
+          timeout: 5,
+        });
+      await stream.stdin.close();
+      const [stdout, exitCode] = await Promise.all([
+        new Response(stream.stdout).text(),
+        stream.exitCode,
+      ]);
+      expect(exitCode).toBe(0);
+      expect(stdout).toBe("forwarded|unset");
+    } finally {
+      for (const [name, value] of [
+        ["XUM_TEST_FWD_NAMED", saved[0]],
+        ["XUM_TEST_FWD_OTHER", saved[1]],
+      ] as const) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+
   test("creates the PLUGIN_DATA directory for plugin servers before launch", async () => {
     using tmp = new DisposableTempDir("mcp-plugin-data");
     const dataPath = path.join(tmp.path, "plugin-data", "abc123");
