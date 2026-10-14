@@ -86,34 +86,36 @@ function entrypointActions(
     };
     // An entry point's tab is keyed by its view key. Open only focuses that tab while its
     // record is current, so a failed load needs this action to retry from the keyboard.
-    const reload = reloadAppViewAction(workspaceId, entrypoint.viewKey, {
+    const reload = reloadAppViewActions(workspaceId, entrypoint.viewKey, {
       title: `Reload Plugin View: ${entrypoint.title}`,
       subtitle,
       section: navigation,
       keywords: ["plugin", "view", "app", "mcp", "reload", "retry", entrypoint.serverName],
     });
-    return reload == null ? [open] : [open, reload];
+    return [open, ...reload];
   });
 }
 
 /**
  * "Reload" for an app tab that is open (after a failed load, or a stuck view): remounts the
- * tab's frame, which loads the view again, and focuses the tab. Null when no tab is open.
+ * tab's frame, which loads the view again, and focuses the tab. Empty when no tab is open.
  */
-function reloadAppViewAction(
+function reloadAppViewActions(
   workspaceId: string,
   toolCallId: string,
   action: Pick<CommandAction, "title" | "subtitle" | "section" | "keywords">
-): CommandAction | null {
-  if (!hasTab(readRightSidebarLayout(workspaceId), appViewTabFor(toolCallId))) return null;
-  return {
-    ...action,
-    id: CommandIds.navReloadAppView(toolCallId),
-    run: () => {
-      reloadMcpAppView(workspaceId, toolCallId);
-      focusMcpAppViewTab(workspaceId, toolCallId);
+): CommandAction[] {
+  if (!hasTab(readRightSidebarLayout(workspaceId), appViewTabFor(toolCallId))) return [];
+  return [
+    {
+      ...action,
+      id: CommandIds.navReloadAppView(toolCallId),
+      run: () => {
+        reloadMcpAppView(workspaceId, toolCallId);
+        focusMcpAppViewTab(workspaceId, toolCallId);
+      },
     },
-  };
+  ];
 }
 
 /**
@@ -577,13 +579,13 @@ function appViewActions(
       run: () => openMcpAppViewTab(wsId, view),
     };
     // The keyboard path to an open tab's Reload.
-    const reload = reloadAppViewAction(wsId, view.toolCallId, {
+    const reload = reloadAppViewActions(wsId, view.toolCallId, {
       title: `Reload App View: ${view.label}`,
       subtitle,
       section: navigationSection,
       keywords: ["app", "view", "mcp", "reload", "retry", view.serverName],
     });
-    return reload == null ? [open] : [open, reload];
+    return [open, ...reload];
   });
 }
 

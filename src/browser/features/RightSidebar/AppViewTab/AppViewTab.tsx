@@ -126,30 +126,11 @@ export function AppViewTabPanel(props: {
   if (view === "loading") return <Notice>Loading…</Notice>;
   if (view == null) {
     return (
-      <div className="flex flex-col items-start gap-2 p-4 text-xs">
-        <span className="text-muted">
-          {lookupFailed ? "This view could not be loaded." : "This view is no longer available."}
-        </span>
-        <div className="flex gap-2">
-          {lookupFailed && (
-            // The record request failed (not a missing record): asking again can find the view.
-            <button
-              type="button"
-              onClick={() => reloadMcpAppView(workspaceId, viewKey)}
-              className="border-border-light focus-visible:ring-accent rounded border px-2 py-0.5 focus-visible:ring-1"
-            >
-              Reload
-            </button>
-          )}
-          <button
-            type="button"
-            onClick={props.onClose}
-            className="border-border-light focus-visible:ring-accent rounded border px-2 py-0.5 focus-visible:ring-1"
-          >
-            Close
-          </button>
-        </div>
-      </div>
+      <AppViewUnavailable
+        lookupFailed={lookupFailed}
+        onReload={() => reloadMcpAppView(workspaceId, viewKey)}
+        onClose={props.onClose}
+      />
     );
   }
   return (
@@ -161,5 +142,44 @@ export function AppViewTabPanel(props: {
       onClose={props.onClose}
       onReload={() => reloadMcpAppView(props.workspaceId, view.toolCallId)}
     />
+  );
+}
+
+/**
+ * An app tab without its view: gone (only Close), or its record lookup failed (Reload too,
+ * since asking again can find it).
+ */
+function AppViewUnavailable(props: {
+  lookupFailed: boolean;
+  onReload: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="flex flex-col items-start gap-2 p-4 text-xs">
+      <span className="text-muted">
+        {props.lookupFailed
+          ? "This view could not be loaded."
+          : "This view is no longer available."}
+      </span>
+      <div className="flex gap-2">
+        {props.lookupFailed && (
+          // The record request failed (not a missing record): asking again can find the view.
+          <button
+            type="button"
+            onClick={props.onReload}
+            className="border-border-light focus-visible:ring-accent rounded border px-2 py-0.5 focus-visible:ring-1"
+          >
+            Reload
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={props.onClose}
+          className="border-border-light focus-visible:ring-accent rounded border px-2 py-0.5 focus-visible:ring-1"
+        >
+          Close
+        </button>
+      </div>
+    </div>
   );
 }
