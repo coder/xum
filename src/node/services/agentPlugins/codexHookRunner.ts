@@ -19,7 +19,11 @@
  * as the around-middleware unwinds, so in reverse plugin order (Codex promises no order at all).
  */
 import assert from "node:assert";
-import type { EventSpine, ToolExecuteContext } from "@/node/services/events/eventSpine";
+import type {
+  EventSpine,
+  ToolExecuteContext,
+  TurnStopContext,
+} from "@/node/services/events/eventSpine";
 import { getErrorMessage } from "@/common/utils/errors";
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/client/validators/ajv";
 import { effectiveHookTimeoutSeconds } from "@/constants/pluginHooks";
@@ -159,7 +163,7 @@ export function registerCodexPluginHooks(
               { cwd: ctx.cwd }
             );
             if (output === null) continue;
-            if (output.halt !== undefined) ctx.halted = { pluginName: registration.pluginName };
+            if (output.halt !== undefined) haltTurn(ctx, output.halt, registration);
             else if (output.continueWith !== undefined)
               ctx.continueReasons.push(output.continueWith);
           }
@@ -306,6 +310,19 @@ function replaceWithFeedback(
   // apart from a block: the hook replaced the output the model sees, so a nested call must not
   // return it either (Codex security review PRRT_kwDOPxxmWM6sQaTG).
   ctx.postBlocked = true;
+}
+
+/**
+ * A Stop hook's `continue: false` ends the turn. Codex shows its `stopReason` to the user as a
+ * Stop entry (hooks/src/events/stop.rs; Codex PRRT_kwDOPxxmWM6rgpoD). The model never sees it.
+ */
+function haltTurn(
+  ctx: TurnStopContext,
+  halt: { stopReason?: string },
+  registration: CodexHookRegistration
+): void {
+  ctx.halted = { pluginName: registration.pluginName };
+  if (halt.stopReason !== undefined) registration.deps.notifyUser(halt.stopReason);
 }
 
 function applyUpdatedInput(
