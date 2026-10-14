@@ -4,6 +4,7 @@ import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import { execFileSync } from "node:child_process";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import assert from "@/common/utils/assert";
 import * as jsonc from "jsonc-parser";
 
@@ -4457,7 +4458,7 @@ describe("AgentPluginInstallService", () => {
     );
     await commitAll(remoteDir, "escaping-but-resolving hook link");
     await expect(service.update({ name: "demo-plugin" })).rejects.toThrow(
-      /escapes the repository root/
+      /escapes the plugin folder/
     );
   });
 
@@ -4731,6 +4732,146 @@ describe("AgentPluginInstallService", () => {
     await expect(service.preview({ input: remoteDir })).rejects.toThrow(
       /reserved file name|does not resolve/
     );
+  });
+
+  describe("monorepo subpath installs", () => {
+    let monoDir: string;
+    let monoUrl: string;
+    const subpath = "packages/demo";
+    const installedTree = async (): Promise<string[]> =>
+      (
+        await fsPromises.readdir(path.join(pluginsDir(), "demo-plugin"), {
+          recursive: true,
+          withFileTypes: true,
+        })
+      )
+        .filter((entry) => !entry.isDirectory())
+        .map((entry) =>
+          path.relative(
+            path.join(pluginsDir(), "demo-plugin"),
+            path.join(entry.parentPath, entry.name)
+          )
+        )
+        .sort();
+
+    beforeEach(async () => {
+      monoDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-plugin-mono-"));
+      await initRemote(monoDir);
+      // Staging fetches with --filter=blob:none, which local-path remotes
+      // ignore; a file:// URL plus allowFilter in the remote's OWN config
+      // (staging runs with global/system git config disabled) makes the
+      // fixture take the real partial-clone path.
+      await git(monoDir, "config", "uploadpack.allowFilter", "true");
+      await git(monoDir, "config", "uploadpack.allowAnySHA1InWant", "true");
+      monoUrl = pathToFileURL(monoDir).href;
+      // The repo ROOT is a different plugin: staging the root instead of the
+      // subpath would surface 'root-plugin' and its skill.
+      await fsPromises.writeFile(
+        path.join(monoDir, "plugin.json"),
+        JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "root-plugin" })
+      );
+      await fsPromises.mkdir(path.join(monoDir, "skills", "root-only"), { recursive: true });
+      await fsPromises.writeFile(
+        path.join(monoDir, "skills", "root-only", "SKILL.md"),
+        "---\nname: root-only\ndescription: Root skill\n---\n\nRoot.\n"
+      );
+      await fsPromises.writeFile(path.join(monoDir, "README.md"), "monorepo\n");
+      await fsPromises.mkdir(path.join(monoDir, "packages", "other"), { recursive: true });
+      await fsPromises.writeFile(path.join(monoDir, "packages", "other", "notes.md"), "other\n");
+      await fsPromises.mkdir(path.join(monoDir, subpath), { recursive: true });
+      await writePluginFixture(path.join(monoDir, subpath));
+      await commitAll(monoDir, "init monorepo");
+    });
+
+    afterEach(async () => {
+      await fsPromises.rm(monoDir, { recursive: true, force: true });
+    });
+
+    test("installs only the subpath folder, records it, and uninstalls", async () => {
+      const preview = await service.preview({ input: monoUrl, subpath: `${subpath}/` });
+      expect(preview.manifest.name).toBe("demo-plugin");
+      expect(preview.skills.map((skill) => skill.name)).toEqual(["greet"]);
+      expect(preview.source.subpath).toBe(subpath);
+
+      const entry = await service.install({
+        source: preview.source,
+        expectedSha: preview.lockedSha,
+      });
+      expect(entry.source.subpath).toBe(subpath);
+      expect((await registry())[0]).toMatchObject({ source: { subpath } });
+      // Only the subtree is installed: no root files, sibling folders or .git.
+      expect(await installedTree()).toEqual(["mcp.json", "plugin.json", "skills/greet/SKILL.md"]);
+      expect(await stagingLeftovers()).toEqual([]);
+
+      await service.uninstall({ name: "demo-plugin", deletePluginData: false });
+      expect(await pathExists(path.join(pluginsDir(), "demo-plugin"))).toBe(false);
+      expect(await registry()).toEqual([]);
+    });
+
+    test("a subpath folder without a manifest is refused and the error names that folder", async () => {
+      // The repo root IS a plugin here, so a root-install message would mislead.
+      const error = await service.preview({ input: monoUrl, subpath: "packages/other" }).then(
+        () => null,
+        (err: unknown) => err
+      );
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toContain("'packages/other'");
+      expect((error as Error).message).not.toContain("repository root");
+      expect(await stagingLeftovers()).toEqual([]);
+    });
+
+    test("rejects subpaths that escape the plugin folder", async () => {
+      // Direct API sources bypass the parser; install re-validates.
+      const preview = await service.preview({ input: monoUrl, subpath });
+      for (const bad of ["../x", "packages/../..", ".git", "/abs"]) {
+        await expect(
+          service.install({
+            source: { ...preview.source, subpath: bad },
+            expectedSha: preview.lockedSha,
+          })
+        ).rejects.toThrow(/plugin subpath|absolute path|\.git folder/);
+      }
+      await expect(
+        service.install({
+          source: { ...preview.source, subpath: `${subpath}/` },
+          expectedSha: preview.lockedSha,
+        })
+      ).rejects.toThrow(/not normalized/);
+      await expect(
+        service.preview({ input: "cursor/plugins/pstack", subpath: "other" })
+      ).rejects.toThrow(/Conflicting subpaths/);
+
+      // A path level that is a symlink or a file, not a git tree.
+      await fsPromises.symlink(subpath, path.join(monoDir, "link"));
+      await fsPromises.symlink("demo", path.join(monoDir, "packages", "alias"));
+      await commitAll(monoDir, "symlinked plugin folders");
+      await expect(service.preview({ input: monoUrl, subpath: "link" })).rejects.toThrow(
+        /'link' is a symbolic link/
+      );
+      await expect(service.preview({ input: monoUrl, subpath: "link/skills" })).rejects.toThrow(
+        /'link' is a symbolic link/
+      );
+      await expect(service.preview({ input: monoUrl, subpath: "packages/alias" })).rejects.toThrow(
+        /'packages\/alias' is a symbolic link/
+      );
+      await expect(service.preview({ input: monoUrl, subpath: "README.md" })).rejects.toThrow(
+        /'README.md' is a file/
+      );
+
+      // A relative link inside the subtree that leaves it (while staying
+      // inside the repo) would read different content after install. The
+      // target is a repo-root file, which the cone-mode sparse checkout DOES
+      // materialize, so only the check on the extracted folder rejects it.
+      await fsPromises.symlink("../../README.md", path.join(monoDir, subpath, "shared"));
+      await commitAll(monoDir, "link out of the plugin folder");
+      await expect(service.preview({ input: monoUrl, subpath })).rejects.toThrow(
+        /escapes the plugin folder|does not resolve/
+      );
+
+      expect(await pathExists(path.join(pluginsDir(), "demo-plugin"))).toBe(false);
+      expect(await registry()).toEqual([]);
+      expect(await stagingLeftovers()).toEqual([]);
+    });
   });
 
   test("update refuses subpath installs recorded by a newer build", async () => {
@@ -5996,8 +6137,10 @@ describe("AgentPluginInstallService", () => {
       await fsPromises.rm(notPlugin, { recursive: true, force: true });
     }
 
-    // Subpath installs are parsed but rejected in v1.
-    await expect(service.preview({ input: remoteDir, subpath: "sub" })).rejects.toThrow(/v2/);
+    // A subpath that is not in the repository.
+    await expect(service.preview({ input: remoteDir, subpath: "sub" })).rejects.toThrow(
+      /'sub' does not exist in /
+    );
 
     // Unknown ref.
     await expect(service.preview({ input: remoteDir, ref: "does-not-exist" })).rejects.toThrow(

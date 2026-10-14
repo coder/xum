@@ -125,6 +125,7 @@ import {
 import {
   assertNoAgentPluginUrlCredentials,
   isFullCommitSha,
+  normalizeAgentPluginSubpath,
   parseAgentPluginSourceInput,
 } from "./sourceInput";
 
@@ -602,6 +603,77 @@ async function runGit(
     return withDiskQuotaWatchdog(diskQuota, (signal) => run(signal));
   }
   return run();
+}
+
+/**
+ * Extra `git clone` flags for a monorepo subpath install: a partial clone
+ * (no blobs up front) that starts with a sparse checkout, so only the
+ * subpath's files (plus the few files directly on its parent levels) are
+ * ever downloaded. `--no-checkout` + `sparse-checkout set` would leave an
+ * EMPTY tree, hence `--sparse`.
+ */
+function sparseCloneFlags(subpath: string | undefined): string[] {
+  return subpath === undefined ? [] : ["--filter=blob:none", "--sparse"];
+}
+
+/** `git fetch` counterpart of sparseCloneFlags (the sparse checkout is set before checkout). */
+function partialFetchFlags(subpath: string | undefined): string[] {
+  return subpath === undefined ? [] : ["--filter=blob:none"];
+}
+
+/** Git tree-entry modes that are not folders, for the subpath error. Other modes are files. */
+const NON_FOLDER_GIT_MODE_KINDS: Readonly<Record<string, string>> = {
+  "120000": "a symbolic link",
+  "160000": "a git submodule",
+};
+
+/** Mode of the entry named exactly `name` in `git ls-tree -z` output, if any. */
+function lsTreeEntryMode(output: string, name: string): string | undefined {
+  for (const record of output.split("\0")) {
+    const match = /^(\d{6}) \S+ [0-9a-f]+\t([\s\S]*)$/.exec(record);
+    if (match !== null && match[2] === name) {
+      return match[1];
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Subpath for preview(): from the shorthand or the separate API argument
+ * (normalized), refusing two different ones (mirrors the ref conflict).
+ */
+function resolvePreviewSubpath(
+  parsedSubpath: string | undefined,
+  rawExplicit: string | undefined
+): string | undefined {
+  const explicit = rawExplicit?.trim() ? normalizeAgentPluginSubpath(rawExplicit) : undefined;
+  if (explicit !== undefined && parsedSubpath !== undefined && parsedSubpath !== explicit) {
+    throw new Error(
+      `Conflicting subpaths: '${parsedSubpath}' in the source and '${explicit}' in the subpath field.`
+    );
+  }
+  return parsedSubpath ?? explicit;
+}
+
+/** Throws unless `subpath` is absent or already in normalizeAgentPluginSubpath form. */
+function assertNormalizedSubpath(subpath: string | undefined): void {
+  if (subpath !== undefined && normalizeAgentPluginSubpath(subpath) !== subpath) {
+    throw new Error(`The plugin subpath '${subpath}' is not normalized. Run the preview again.`);
+  }
+}
+
+/** A plugin subpath that is missing or not a real folder at the staged commit (shown unwrapped). */
+class AgentPluginSubpathError extends Error {}
+
+function subpathNotAFolder(
+  subpath: string,
+  url: string,
+  prefix: string,
+  kind: string
+): AgentPluginSubpathError {
+  return new AgentPluginSubpathError(
+    `'${subpath}' is not a folder in ${url} ('${prefix}' is ${kind}). Subpath installs need a real folder.`
+  );
 }
 
 /** Max simultaneous `git ls-remote` processes during an update check. */
@@ -1596,7 +1668,7 @@ export class AgentPluginInstallService {
             resolvedTarget === rootReal || resolvedTarget.startsWith(rootReal + path.sep);
           if (!path.isAbsolute(rawTarget) && !withinStagedRoot) {
             throw new Error(
-              `The repository ships a relative symbolic link that escapes the repository root (${relative}). Such links resolve differently after install than during the consent preview, so they are rejected.`
+              `The repository ships a relative symbolic link that escapes the plugin folder (${relative}). Such links resolve differently after install than during the consent preview, so they are rejected.`
             );
           }
           if (
@@ -1618,38 +1690,33 @@ export class AgentPluginInstallService {
     }
   }
 
-  /** Shallow-clone `resolved` into a fresh staging dir; returns { dir, sha } with sha = HEAD. */
+  /**
+   * Shallow-clone `resolved` into a fresh staging dir; returns { dir, sha }
+   * with sha = HEAD. With `subpath`, the clone is partial + sparse and the
+   * returned dir is ONLY that folder (see extractSubpath).
+   */
   private async cloneResolved(
     url: string,
-    resolved: ResolvedRemoteRef
+    resolved: ResolvedRemoteRef,
+    subpath?: string
   ): Promise<{ dir: string; sha: string }> {
     const dir = await this.createStagingDir();
     try {
       if (resolved.refType === "commit") {
-        await this.fetchExactSha(url, resolved.sha, dir);
+        await this.fetchExactSha(url, resolved.sha, dir, subpath);
       } else {
-        await runGit(
-          [
-            "clone",
-            "--depth",
-            "1",
-            "--single-branch",
-            "--branch",
-            resolved.ref,
-            "-c",
-            "advice.detachedHead=false",
-            url,
-            dir,
-          ],
-          { diskQuota: this.cloneDiskQuota(dir) }
-        );
+        await this.cloneRef(url, resolved.ref, dir, subpath);
       }
       const sha = (await runGit(["-C", dir, "rev-parse", "HEAD"])).trim();
       assert(isFullCommitSha(sha), "cloneResolved: rev-parse HEAD must be a full SHA");
-      await this.assertStagedTreeWithinQuota(dir);
-      return { dir, sha };
+      return { dir: await this.stagedPluginRoot(dir, subpath, url, sha), sha };
     } catch (error) {
       await this.removeDir(dir);
+      // A missing or non-folder subpath is a clear user-facing error of its
+      // own, not a git failure: keep it out of the "Failed to clone" wrapping.
+      if (error instanceof AgentPluginSubpathError) {
+        throw error;
+      }
       throw new Error(`Failed to clone ${url}: ${getErrorMessage(error)}`);
     }
   }
@@ -1658,14 +1725,21 @@ export class AgentPluginInstallService {
    * Clone exactly `sha` (what the user consented to). Prefers a direct SHA
    * fetch (GitHub allows it); falls back to cloning the tracking ref and
    * verifying HEAD still matches, so a remote that moved between preview and
-   * install fails loudly instead of installing unreviewed content.
+   * install fails loudly instead of installing unreviewed content. A
+   * `source.subpath` stages only that folder (see extractSubpath).
    */
   private async cloneExactSha(source: AgentPluginGitSource, sha: string): Promise<string> {
+    const subpath = source.subpath;
     const dir = await this.createStagingDir();
     try {
       try {
-        await this.fetchExactSha(source.url, sha, dir);
-      } catch {
+        await this.fetchExactSha(source.url, sha, dir, subpath);
+      } catch (error) {
+        // The commit WAS fetched; its tree just lacks the folder. The
+        // tracking-ref clone below would only reach the same verdict.
+        if (error instanceof AgentPluginSubpathError) {
+          throw error;
+        }
         if (source.refType === "commit") {
           throw new Error(`Could not fetch commit ${sha} from ${source.url}.`);
         }
@@ -1674,21 +1748,7 @@ export class AgentPluginInstallService {
         await this.removeDir(dir);
         await fsPromises.mkdir(dir, { recursive: true });
         this.activeStagingPaths.add(dir);
-        await runGit(
-          [
-            "clone",
-            "--depth",
-            "1",
-            "--single-branch",
-            "--branch",
-            source.ref,
-            "-c",
-            "advice.detachedHead=false",
-            source.url,
-            dir,
-          ],
-          { diskQuota: this.cloneDiskQuota(dir) }
-        );
+        await this.cloneRef(source.url, source.ref, dir, subpath);
       }
       const head = (await runGit(["-C", dir, "rev-parse", "HEAD"])).trim();
       if (head !== sha) {
@@ -1696,23 +1756,182 @@ export class AgentPluginInstallService {
           `The remote moved since the preview (expected ${sha.slice(0, 12)}, got ${head.slice(0, 12)}). Run the preview again.`
         );
       }
-      await this.assertStagedTreeWithinQuota(dir);
-      return dir;
+      return await this.stagedPluginRoot(dir, subpath, source.url, sha);
     } catch (error) {
       await this.removeDir(dir);
       throw error instanceof Error ? error : new Error(getErrorMessage(error));
     }
   }
 
-  private async fetchExactSha(url: string, sha: string, dir: string): Promise<void> {
+  /**
+   * The staged plugin root of a verified clone: the whole checkout for a
+   * root install, or only `subpath` (see extractSubpath). Both run the
+   * staged-tree quota and symlink checks on the tree that gets installed.
+   */
+  private async stagedPluginRoot(
+    dir: string,
+    subpath: string | undefined,
+    url: string,
+    sha: string
+  ): Promise<string> {
+    if (subpath === undefined) {
+      await this.assertStagedTreeWithinQuota(dir);
+      return dir;
+    }
+    return this.extractSubpath(dir, subpath, url, sha);
+  }
+
+  /**
+   * Shallow-clone branch or tag `ref`. With `subpath`, the clone is partial
+   * and sparse and gets narrowed to the folder; callers still verify HEAD
+   * against the SHA they expect before using the tree.
+   */
+  private async cloneRef(url: string, ref: string, dir: string, subpath?: string): Promise<void> {
+    await runGit(
+      [
+        "clone",
+        "--depth",
+        "1",
+        "--single-branch",
+        ...sparseCloneFlags(subpath),
+        "--branch",
+        ref,
+        "-c",
+        "advice.detachedHead=false",
+        url,
+        dir,
+      ],
+      { diskQuota: this.cloneDiskQuota(dir) }
+    );
+    await this.narrowToSubpath(dir, "HEAD", subpath, url);
+  }
+
+  private async fetchExactSha(
+    url: string,
+    sha: string,
+    dir: string,
+    subpath?: string
+  ): Promise<void> {
     const diskQuota = this.cloneDiskQuota(dir);
     await runGit(["init", "--quiet", dir]);
     await runGit(["-C", dir, "remote", "add", "origin", url]);
-    await runGit(["-C", dir, "fetch", "--depth", "1", "origin", sha], { diskQuota });
+    // `init` + `fetch --filter` configures the promisor remote on its own, so
+    // the sparse checkout below can lazy-fetch just the subpath's blobs.
+    await runGit(
+      ["-C", dir, "fetch", "--depth", "1", ...partialFetchFlags(subpath), "origin", sha],
+      { diskQuota }
+    );
+    // Must precede the checkout: a full checkout would materialize (and
+    // lazy-fetch) the whole monorepo before narrowing.
+    await this.narrowToSubpath(dir, "FETCH_HEAD", subpath, url);
     await runGit(
       ["-C", dir, "-c", "advice.detachedHead=false", "checkout", "--quiet", "FETCH_HEAD"],
       { diskQuota }
     );
+  }
+
+  /**
+   * Check that every level of `subpath` is a real folder in `rev`, then
+   * narrow the staging clone's sparse checkout (cone mode) to it.
+   *
+   * SECURITY: each level must be a git tree object (mode 040000), checked
+   * BEFORE any subpath blob is fetched. `ls-tree` compares exact names, which
+   * also defeats case-insensitive filesystem matches (`Pstack` vs `pstack`).
+   * Registry entries and direct API sources never passed the parser, so the
+   * subpath is re-validated here.
+   */
+  private async narrowToSubpath(
+    dir: string,
+    rev: "HEAD" | "FETCH_HEAD",
+    subpath: string | undefined,
+    url: string
+  ): Promise<void> {
+    if (subpath === undefined) {
+      return;
+    }
+    assertNormalizedSubpath(subpath);
+    const sha = (await runGit(["-C", dir, "rev-parse", rev])).trim();
+    const segments = subpath.split("/");
+    for (let depth = 1; depth <= segments.length; depth++) {
+      const prefix = segments.slice(0, depth).join("/");
+      // -z: NUL-terminated, unquoted names. --literal-pathspecs: no `:(magic)`.
+      const output = await runGit([
+        "--literal-pathspecs",
+        "-C",
+        dir,
+        "ls-tree",
+        "-z",
+        rev,
+        "--",
+        prefix,
+      ]);
+      const mode = lsTreeEntryMode(output, prefix);
+      if (mode === undefined) {
+        throw new AgentPluginSubpathError(
+          `'${subpath}' does not exist in ${url} at ${sha.slice(0, 12)}. The plugin folder may have moved or been removed upstream.`
+        );
+      }
+      if (mode !== "040000") {
+        throw subpathNotAFolder(subpath, url, prefix, NON_FOLDER_GIT_MODE_KINDS[mode] ?? "a file");
+      }
+    }
+    // Lazy-fetches the subpath's blobs, so it carries the clone quota.
+    await runGit(["-C", dir, "sparse-checkout", "set", "--cone", "--", subpath], {
+      diskQuota: this.cloneDiskQuota(dir),
+    });
+  }
+
+  /**
+   * Turn a sparse monorepo clone into a staged plugin root that holds ONLY
+   * `subpath` (already checked by narrowToSubpath). Every later step
+   * (validation, consent preview, update capability diff, promote,
+   * receipts) treats the staged dir as the plugin root, so consent and
+   * update reviews cover exactly this folder: upstream commits that only
+   * touch files outside it stage an identical tree and need no consent.
+   *
+   * The lstat walk on the checkout is a second guard behind the git tree
+   * check. The quota/symlink walk runs on the EXTRACTED dir after the clone
+   * is gone, so a relative link that escapes the subtree (even if it stays
+   * inside the repo) is rejected like a link escaping the repo root.
+   * Always consumes `cloneDir`: it is removed on every path.
+   */
+  private async extractSubpath(
+    cloneDir: string,
+    subpath: string,
+    url: string,
+    sha: string
+  ): Promise<string> {
+    const pluginDir = `${cloneDir}-plugin`;
+    try {
+      const segments = subpath.split("/");
+      for (let depth = 1; depth <= segments.length; depth++) {
+        const prefix = segments.slice(0, depth).join("/");
+        const stat = await fsPromises.lstat(path.join(cloneDir, prefix)).catch(() => undefined);
+        if (stat === undefined) {
+          throw new AgentPluginSubpathError(
+            `'${subpath}' was not checked out from ${url} at ${sha.slice(0, 12)}. Try again.`
+          );
+        }
+        if (!stat.isDirectory()) {
+          throw subpathNotAFolder(
+            subpath,
+            url,
+            prefix,
+            stat.isSymbolicLink() ? "a symbolic link" : "a file"
+          );
+        }
+      }
+      await this.renameIntoStaging(path.join(cloneDir, subpath), pluginDir);
+    } finally {
+      await this.removeDir(cloneDir);
+    }
+    try {
+      await this.assertStagedTreeWithinQuota(pluginDir);
+      return pluginDir;
+    } catch (error) {
+      await this.removeDir(pluginDir);
+      throw error;
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -1724,7 +1943,10 @@ export class AgentPluginInstallService {
    * a staged clone. Throws user-facing errors for non-plugins, including a
    * clear message for Claude Code plugin/marketplace repos (explicit non-goal).
    */
-  private async validateStagedClone(stagedDir: string): Promise<{
+  private async validateStagedClone(
+    stagedDir: string,
+    subpath?: string
+  ): Promise<{
     plugin: AgentPluginInfo;
     warnings: string[];
   }> {
@@ -1739,11 +1961,13 @@ export class AgentPluginInstallService {
         (await pathExists(path.join(stagedDir, ".claude-plugin", "marketplace.json")))
       ) {
         throw new Error(
-          "This repository is a Claude Code plugin or marketplace (found .claude-plugin/). Mux implements the vendor-neutral Agent Plugins 1.0.0 format and cannot install Claude Code collections."
+          "This repository is a Claude Code plugin or marketplace (found .claude-plugin/). Mux implements the vendor-neutral Agent Plugins 1.0.0 format and cannot install Claude Code collections. If an Agent Plugin lives in one of its folders, install it as owner/repo/path/to/plugin."
         );
       }
       throw new Error(
-        "No plugin.json (or .codex-plugin/plugin.json) found at the repository root. The repo is not an Agent Plugin — if the plugin lives in a subdirectory, monorepo subpath installs land in v2."
+        subpath === undefined
+          ? "No plugin.json (or .codex-plugin/plugin.json) found at the repository root. The repo is not an Agent Plugin — if the plugin lives in a subdirectory, install it as owner/repo/path/to/plugin."
+          : `No plugin.json (or .codex-plugin/plugin.json) found in '${subpath}'. The folder is not an Agent Plugin.`
       );
     }
 
@@ -2505,18 +2729,12 @@ export class AgentPluginInstallService {
       );
     }
     const ref = parsed.ref ?? (explicitRef.length > 0 ? explicitRef : undefined);
-    const subpath = parsed.subpath ?? (args.subpath?.trim() ? args.subpath.trim() : undefined);
-    if (subpath !== undefined) {
-      // Approved v1 scope: the descriptor grammar knows subpaths, installs don't.
-      throw new Error(
-        "Monorepo subpath installs land in v2. Point at a repo whose root is the plugin."
-      );
-    }
+    const subpath = resolvePreviewSubpath(parsed.subpath, args.subpath);
 
     const resolved = await this.resolveRemoteRef(parsed.url, ref);
-    const { dir: stagedDir, sha } = await this.cloneResolved(parsed.url, resolved);
+    const { dir: stagedDir, sha } = await this.cloneResolved(parsed.url, resolved, subpath);
     try {
-      const { plugin, warnings } = await this.validateStagedClone(stagedDir);
+      const { plugin, warnings } = await this.validateStagedClone(stagedDir, subpath);
       const targetPath = this.targetPathFor(plugin.name);
       await this.assertNoCollision(plugin.name);
 
@@ -2549,6 +2767,7 @@ export class AgentPluginInstallService {
         url: parsed.url,
         ref: resolved.ref,
         refType: resolved.refType,
+        ...(subpath !== undefined ? { subpath } : {}),
       };
       return {
         source,
@@ -2603,14 +2822,15 @@ export class AgentPluginInstallService {
     // parser, and this URL is persisted to plugins.json and rendered in
     // Settings.
     assertNoAgentPluginUrlCredentials(args.source.url);
-    if (args.source.subpath !== undefined) {
-      throw new Error("Monorepo subpath installs land in v2.");
-    }
+    // Same reasoning for the subpath: it is persisted and decides which
+    // folder becomes the plugin root, so a direct API source must already be
+    // in the normalized form preview() returns.
+    assertNormalizedSubpath(args.source.subpath);
 
     return this.runExclusive(async () => {
       const stagedDir = await this.cloneExactSha(args.source, args.expectedSha);
       try {
-        const { plugin } = await this.validateStagedClone(stagedDir);
+        const { plugin } = await this.validateStagedClone(stagedDir, args.source.subpath);
         const name = plugin.name;
         const inventory = await this.collectComponents(plugin, this.targetPathFor(name));
         const importedComponents =

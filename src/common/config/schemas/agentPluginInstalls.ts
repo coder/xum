@@ -42,9 +42,9 @@ export const AgentPluginGitSourceSchema = z.object({
    */
   refType: z.enum(["branch", "tag", "commit"]),
   /**
-   * Repo-relative directory of the plugin for monorepo installs. Parsed and
-   * persisted from day one so the descriptor grammar is stable, but v1
-   * rejects subpath installs (sparse-checkout staging lands in v2).
+   * Repo-relative directory of the plugin for monorepo installs (normalized
+   * `a/b/c`). Only this folder is fetched (sparse checkout) and installed as
+   * the plugin root; updates track the same folder at the new commit.
    */
   subpath: z.string().optional(),
 });
