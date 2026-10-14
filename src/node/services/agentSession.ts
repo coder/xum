@@ -1036,13 +1036,18 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   captureRequestAssemblySnapshot?(
     workspaceId: string
   ): Promise<Result<RequestAssemblySnapshot, SendMessageError>>;
-  /** Whether any message.send hook is registered (lets a send skip work done only for hooks). */
-  hasMessageSendHooks?(): boolean;
+  /**
+   * Load the workspace's lazy hooks and report whether a message.send hook applies to it (lets a
+   * send skip work done only for hooks).
+   */
+  prepareMessageSendHooks?(workspaceId: string): Promise<boolean>;
   /** The message.send prompt-hook chain (see agentPlugins/promptHooks.ts). Absent: no hooks. */
   runMessageSendHooks?(
     workspaceId: string,
     input: MessageSendHookInput,
-    cancelSignal?: AbortSignal
+    cancelSignal?: AbortSignal,
+    /** prepareMessageSendHooks already loaded the lazy hooks for this send: skip the reload. */
+    hooksLoaded?: boolean
   ): Promise<MessageSendHookOutcome>;
   /** The turn.stop prompt-hook chain (see agentPlugins/promptHooks.ts). Absent: no hooks. */
   runTurnStopHooks?(
@@ -4669,6 +4674,25 @@ export class AgentSession {
   }
 
   /**
+   * Whether a message.send hook applies to this workspace, after loading its lazy hooks.
+   * Undefined when the send has no send IDs: only the accepted-send check needs it early, and the
+   * hook run loads the hooks itself.
+   */
+  private async readSendHooksPresent(sendIdentities: SendIdentity[]): Promise<boolean | undefined> {
+    if (sendIdentities.length === 0) return undefined;
+    return this.aiService.prepareMessageSendHooks?.(this.workspaceId);
+  }
+
+  /** The message.send runner, or undefined when the session has none or a load found no hook. */
+  private sendHookRunner(
+    hooksPresent: boolean | undefined
+  ): AgentSessionAIService["runMessageSendHooks"] {
+    return hooksPresent === false
+      ? undefined
+      : this.aiService.runMessageSendHooks?.bind(this.aiService);
+  }
+
+  /**
    * Run the message.send prompt hooks once for this message. A compaction request's own text
    * never reaches them, only the user text it carries (see the compaction branch below). A send
    * that already ran them (an on-send compaction follow-up) skips them.
@@ -4681,7 +4705,12 @@ export class AgentSession {
     message: string,
     muxMetadata: unknown,
     internal: SendMessageInternalOptions | undefined,
-    acceptanceOrigin: TurnAcceptanceOrigin
+    acceptanceOrigin: TurnAcceptanceOrigin,
+    /**
+     * readSendHooksPresent's result: false skips the chain, true skips its reload (Codex
+     * PRRT_kwDOPxxmWM6sVlZG: a broken hooks.js must not cost its evaluation timeout twice).
+     */
+    hooksPresent?: boolean
   ): Promise<
     MessageSendHookOutcome & {
       /** The hooks checked the request's follow-up; its outcome travels with the follow-up. */
@@ -4694,7 +4723,7 @@ export class AgentSession {
         ? { kind: "context", entries: applied.context }
         : { kind: "none" };
     }
-    const runMessageSendHooks = this.aiService.runMessageSendHooks?.bind(this.aiService);
+    const runMessageSendHooks = this.sendHookRunner(hooksPresent);
     if (runMessageSendHooks == null) return { kind: "none" };
     const canBlock = internal?.synthetic !== true && acceptanceOrigin === "manual";
     // A turn.stop continuation never reaches the hooks (see skipPromptHooks).
@@ -4707,7 +4736,8 @@ export class AgentSession {
           origin: resolveMessageSendOrigin(muxMetadata, internal, acceptanceOrigin),
           canBlock,
         },
-        internal?.cancelSignal
+        internal?.cancelSignal,
+        hooksPresent === true
       );
     if (!isCompactionRequestMetadata(muxMetadata))
       return this.assertSendHookOutcome(await run(message), canBlock);
@@ -5058,8 +5088,9 @@ export class AgentSession {
       return known.success && this.settleKnownSendIds(known.data, attempt)?.success === true;
     };
     // Checked before the hooks run, so their side effects (logs, notifications) do not repeat
-    // for such a retry. History is read only when hooks exist.
-    if (this.aiService.hasMessageSendHooks?.() === true && (await sendIdsAlreadyAccepted())) {
+    // for such a retry. History is read only when hooks exist, after the lazy hooks loaded.
+    const sendHooksPresent = await this.readSendHooksPresent(sendIdentities);
+    if (sendHooksPresent === true && (await sendIdsAlreadyAccepted())) {
       return Ok(undefined);
     }
 
@@ -5070,7 +5101,9 @@ export class AgentSession {
       message,
       options?.muxMetadata,
       internal,
-      attempt.acceptanceOrigin
+      attempt.acceptanceOrigin,
+      // The load above ran once for this send: the chain does not repeat it.
+      sendHooksPresent
     );
     if (await cancelBeforeAcceptance()) {
       return Ok(undefined);

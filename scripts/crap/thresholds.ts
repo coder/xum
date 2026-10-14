@@ -37,6 +37,21 @@ export function netExtractionRelief(baseTotalCc: number, headTotalCc: number): b
 }
 
 /**
+ * Both reliefs also cap a new function's CRAP at this when coverage scores it:
+ * above it the finding stays a violation. Without the cap an untested CC 20
+ * piece (CRAP 420) only warned. It is the CRAP tax stage, so a relieved piece
+ * never starts life as a hotspot, and it follows the stage down. With coverage
+ * CRAP >= CC, so this also caps a net-extraction piece's CC. A CC-only score
+ * (the hook, no --coverage) is not capped.
+ */
+export const RELIEF_MAX_CRAP = CRAP_TAX_STAGE;
+
+/** True when relief may apply to a new function with this CRAP (null: no coverage data). */
+export function reliefAllowsCrap(crap: number | null): boolean {
+  return crap === null || crap <= RELIEF_MAX_CRAP;
+}
+
+/**
  * Move relief caps a moved step at this CC. It stops a PR from moving a whole
  * hotspot body into a new function, which would reset its history. Natural
  * lifecycle steps in the hotspots measure CC 10-20.
