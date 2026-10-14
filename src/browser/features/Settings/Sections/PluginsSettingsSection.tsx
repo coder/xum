@@ -1025,6 +1025,9 @@ function useComponentReview(deps: ComponentReviewDeps) {
   const [review, setReview] = useState<AgentPluginUpdateReview | null>(null);
   const open = (name: string) =>
     runPluginAction(deps, name, async (api) => {
+      // Close a panel that is open for another plugin first: if this preview fails, the old panel
+      // must not stay actionable under this plugin's error.
+      setReview(null);
       const preview = await api.agentPlugins.previewComponentReview({ name });
       if (!preview.success) return deps.setError(preview.error);
       const hasRows = preview.data.changes.length > 0;
@@ -1044,7 +1047,8 @@ function useComponentReview(deps: ComponentReviewDeps) {
       }
       // Refresh first: its success path clears the error state.
       await deps.refresh();
-      if (!result.success) deps.setError(result.error);
+      const message = result.success ? result.data.cleanupWarning : result.error;
+      if (message !== undefined) deps.setError(message);
     });
   /** A palette "Review Plugin Components" intent, also one that arrived before the section mounted. */
   const openFromIntent = (intent: PluginsSectionIntent | null) => {

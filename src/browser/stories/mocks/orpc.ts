@@ -1395,16 +1395,18 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         return Promise.resolve({
           success: true,
           data: {
-            name: item.name,
-            scope: "global" as const,
-            source: item.source ?? {
-              type: "git" as const,
-              url: "",
-              ref: "main",
-              refType: "branch" as const,
+            entry: {
+              name: item.name,
+              scope: "global" as const,
+              source: item.source ?? {
+                type: "git" as const,
+                url: "",
+                ref: "main",
+                refType: "branch" as const,
+              },
+              lockedSha: input.expectedLockedSha,
+              installedAt: item.installedAt ?? new Date().toISOString(),
             },
-            lockedSha: input.expectedLockedSha,
-            installedAt: item.installedAt ?? new Date().toISOString(),
           },
         });
       },
