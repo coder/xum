@@ -41,8 +41,8 @@ let approveDeferred: Array<(approvedDomains: string[], revision: number) => void
 let revision = Date.now() * 1000;
 // The view's stored widget state and its record binding (getView), and the writes it gets.
 let widgetState: unknown = null;
-let widgetStateBinding: number | null = null;
-let widgetStateWrites: Array<{ binding: number; state: unknown }> = [];
+let widgetStateBinding: string | null = null;
+let widgetStateWrites: Array<{ binding: string; state: unknown }> = [];
 // When set, setWidgetState answers only once it settles (a write in flight).
 let widgetStateWriteGate: Promise<void> | null = null;
 let toolCalls: Array<{
@@ -89,7 +89,7 @@ function serverApi(): TestApiOverrides<APIClient> {
           data: { approvedDomains: input.origins, revision: ++revision },
         });
       },
-      setWidgetState: (input: { binding: number; state: unknown }) => {
+      setWidgetState: (input: { binding: string; state: unknown }) => {
         widgetStateWrites.push({ binding: input.binding, state: input.state });
         return (widgetStateWriteGate ?? Promise.resolve()).then(() => ({
           success: true as const,
@@ -519,7 +519,7 @@ describe("McpAppFrame", () => {
   test("widget state is stored for the view instance, and a remount starts with the latest", async () => {
     invocation = { serverName: "charts-raw", toolName: "show_chart", arguments: {} };
     widgetState = { step: 2 };
-    widgetStateBinding = ++revision;
+    widgetStateBinding = `record-${++revision}`;
     let landWrite = () => undefined as void;
     widgetStateWriteGate = new Promise<void>((resolve) => (landWrite = resolve));
     const first = await renderFrame();

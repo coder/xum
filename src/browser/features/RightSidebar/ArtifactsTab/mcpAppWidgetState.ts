@@ -7,8 +7,8 @@ import { getErrorMessage } from "@/common/utils/errors";
  * each view's state in its result record (McpAppResultStore.setWidgetState), so it survives a
  * collapse, a move to the tab and an app restart, and goes with the record.
  *
- * SECURITY: a view instance is its workspace, tool call and result record. The record's creation
- * time (`binding`, from getView) is part of every key here and of every backend write, so a new
+ * SECURITY: a view instance is its workspace, tool call and result record. The record's random
+ * binding (from getView) is part of every key here and of every backend write, so a new
  * record under a reused tool call ID never sees an older view's state, and a late write of the
  * older view is refused.
  *
@@ -21,7 +21,7 @@ export interface McpAppWidgetStateTarget {
   toolCallId: string;
   /** The result record's server (the backend checks it like a model-context update). */
   serverName: string;
-  binding: number;
+  binding: string;
   /** The state getView read from the record. */
   stored: unknown;
 }

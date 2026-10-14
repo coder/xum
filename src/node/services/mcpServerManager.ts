@@ -5181,7 +5181,7 @@ export class MCPServerManager {
   async setMcpAppWidgetState(
     workspaceId: string,
     toolCallId: string,
-    binding: number,
+    binding: string,
     state: unknown
   ): Promise<void> {
     assert(this.mcpApps, "MCP Apps support is not configured");

@@ -135,7 +135,8 @@ describe("MCP App widget state", () => {
     const result = await getMcpAppView(ctx, request(), undefined, noWarm);
     if (!result.success) throw new Error(result.error);
     expect(result.data.widgetState).toEqual({ step: 2 });
-    expect(result.data.widgetStateBinding).toBe(RECORD.createdAt);
+    // A record from before instanceId existed is bound by its creation time.
+    expect(result.data.widgetStateBinding).toBe("created:1");
     // Without a record there is no instance to keep state for.
     const none = await getMcpAppView(context(null).ctx, request(), undefined, noWarm);
     expect(none.success && [none.data.widgetState, none.data.widgetStateBinding]).toEqual([
@@ -153,12 +154,12 @@ describe("MCP App widget state", () => {
       writes.push(args);
       return Promise.resolve();
     };
-    const write = { workspaceId: "ws", toolCallId: "call-1", binding: 1, state: { a: 1 } };
+    const write = { workspaceId: "ws", toolCallId: "call-1", binding: "b1", state: { a: 1 } };
     expect(await setMcpAppWidgetState(ctx, { ...write, serverName: "charts" })).toEqual({
       success: true,
       data: {},
     });
-    expect(writes).toEqual([["ws", "call-1", 1, { a: 1 }]]);
+    expect(writes).toEqual([["ws", "call-1", "b1", { a: 1 }]]);
     expect((await setMcpAppWidgetState(ctx, { ...write, serverName: "other" })).success).toBe(
       false
     );

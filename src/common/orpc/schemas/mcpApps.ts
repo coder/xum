@@ -49,10 +49,10 @@ export const McpAppViewSchema = z.object({
    */
   widgetState: z.unknown().optional(),
   /**
-   * What binds widget-state writes to this view's result record (its creation time); null
-   * without a record. A write with an older binding is refused (#6178).
+   * What binds widget-state writes to this view's result record (random per record); null
+   * without a record. A write with another record's binding is refused (#6178).
    */
-  widgetStateBinding: z.number().nullable().optional(),
+  widgetStateBinding: z.string().nullable().optional(),
   /**
    * The tool call the side-store record names: its server, server-local tool name and the
    * sanitized arguments the server received. When present the view is bound to it (toolInfo,
@@ -148,7 +148,7 @@ export const McpAppWidgetStateRequestSchema = z.object({
   workspaceId: z.string().min(1),
   toolCallId: z.string().min(1),
   serverName: z.string().min(1),
-  binding: z.number(),
+  binding: z.string().min(1),
   /** JSON of at most MCP_APP_WIDGET_STATE_MAX_BYTES; null clears it. */
   state: z.unknown(),
 });

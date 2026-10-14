@@ -14,6 +14,7 @@ import {
   MCP_APP_RESULT_DIR,
   MCP_APP_RESULT_MAX_BYTES,
   MCP_APP_RESULT_MAX_PER_WORKSPACE,
+  mcpAppWidgetStateBindingOf,
   McpAppResultStore,
 } from "./mcpAppResultStore";
 import { DisposableTempDir } from "./tempDir";
@@ -330,14 +331,14 @@ describe("McpAppResultStore widget state", () => {
     await store.record("ws", entry("c1"));
     const record = await store.get("ws", "c1");
     if (!record) throw new Error("expected the record");
-    await store.setWidgetState("ws", "c1", record.createdAt, { step: 2 });
+    await store.setWidgetState("ws", "c1", mcpAppWidgetStateBindingOf(record), { step: 2 });
     expect((await store.get("ws", "c1"))?.widgetState).toEqual({ step: 2 });
     // A new store reads the state from disk, like a restarted backend.
     expect((await new McpAppResultStore(sessionDirIn(tmp)).get("ws", "c1"))?.widgetState).toEqual({
       step: 2,
     });
     // null clears it.
-    await store.setWidgetState("ws", "c1", record.createdAt, null);
+    await store.setWidgetState("ws", "c1", mcpAppWidgetStateBindingOf(record), null);
     expect((await store.get("ws", "c1"))?.widgetState).toBeUndefined();
   });
 
@@ -347,16 +348,17 @@ describe("McpAppResultStore widget state", () => {
     await store.record("ws", entry("c1"));
     const first = await store.get("ws", "c1");
     if (!first) throw new Error("expected the record");
-    await store.setWidgetState("ws", "c1", first.createdAt, { secret: true });
-    await Bun.sleep(2);
+    await store.setWidgetState("ws", "c1", mcpAppWidgetStateBindingOf(first), { secret: true });
     // A later stream reuses the ID for another server's view.
     await store.record("ws", { ...entry("c1"), serverName: "other" });
     const second = await new McpAppResultStore(sessionDirIn(tmp)).get("ws", "c1");
     expect(second?.widgetState).toBeUndefined();
     // A late write from the old view is refused: its record is gone.
-    expect(await refused(store.setWidgetState("ws", "c1", first.createdAt, { secret: true }))).toBe(
-      true
-    );
+    expect(
+      await refused(
+        store.setWidgetState("ws", "c1", mcpAppWidgetStateBindingOf(first), { secret: true })
+      )
+    ).toBe(true);
     expect((await store.get("ws", "c1"))?.widgetState).toBeUndefined();
   });
 
@@ -367,8 +369,12 @@ describe("McpAppResultStore widget state", () => {
     const record = await store.get("ws", "c1");
     if (!record) throw new Error("expected the record");
     const big = { text: "x".repeat(MCP_APP_WIDGET_STATE_MAX_BYTES) };
-    expect(await refused(store.setWidgetState("ws", "c1", record.createdAt, big))).toBe(true);
-    expect(await refused(store.setWidgetState("ws", "missing", record.createdAt, {}))).toBe(true);
+    expect(
+      await refused(store.setWidgetState("ws", "c1", mcpAppWidgetStateBindingOf(record), big))
+    ).toBe(true);
+    expect(
+      await refused(store.setWidgetState("ws", "missing", mcpAppWidgetStateBindingOf(record), {}))
+    ).toBe(true);
     expect((await store.get("ws", "c1"))?.widgetState).toBeUndefined();
   });
 
@@ -378,7 +384,7 @@ describe("McpAppResultStore widget state", () => {
     await store.record("ws", entry("old"));
     const old = await store.get("ws", "old");
     if (!old) throw new Error("expected the record");
-    await store.setWidgetState("ws", "old", old.createdAt, { kept: false });
+    await store.setWidgetState("ws", "old", mcpAppWidgetStateBindingOf(old), { kept: false });
     const dir = path.join(tmp.path, "ws", MCP_APP_RESULT_DIR);
     // Make the record the oldest file, then push it past the cap.
     for (const name of await fs.readdir(dir)) await fs.utimes(path.join(dir, name), 1, 1);

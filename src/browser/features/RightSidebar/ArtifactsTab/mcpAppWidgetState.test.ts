@@ -7,8 +7,8 @@ import {
   saveMcpAppWidgetState,
 } from "./mcpAppWidgetState";
 
-/** A getView result of a view whose result record was created at `binding`. */
-function loadedView(binding: number | null, widgetState: unknown = null): McpAppView {
+/** A getView result of a view whose result record has `binding`. */
+function loadedView(binding: string | null, widgetState: unknown = null): McpAppView {
   return {
     html: "<p/>",
     csp: {},
@@ -23,10 +23,10 @@ function loadedView(binding: number | null, widgetState: unknown = null): McpApp
 
 /** An API whose setWidgetState calls wait until the test settles them. */
 function deferredApi() {
-  const writes: Array<{ state: unknown; binding: number; settle: (ok: boolean) => void }> = [];
+  const writes: Array<{ state: unknown; binding: string; settle: (ok: boolean) => void }> = [];
   const api = {
     mcpApps: {
-      setWidgetState: (input: { state: unknown; binding: number }) =>
+      setWidgetState: (input: { state: unknown; binding: string }) =>
         new Promise((resolve) =>
           writes.push({
             state: input.state,
@@ -45,7 +45,7 @@ const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 describe("MCP App widget state", () => {
   test("writes reach the backend in order, and a newer pending write replaces an older one", async () => {
     const { api, writes } = deferredApi();
-    const target = mcpAppWidgetStateTarget("ws-order", "c1", loadedView(10));
+    const target = mcpAppWidgetStateTarget("ws-order", "c1", loadedView("r10"));
     saveMcpAppWidgetState(api, target, { n: 1 });
     saveMcpAppWidgetState(api, target, { n: 2 });
     saveMcpAppWidgetState(api, target, { n: 3 });
@@ -55,32 +55,32 @@ describe("MCP App widget state", () => {
     writes[0].settle(true);
     await flush();
     expect(writes.map((w) => w.state)).toEqual([{ n: 1 }, { n: 3 }]);
-    expect(writes.every((w) => w.binding === 10)).toBe(true);
+    expect(writes.every((w) => w.binding === "r10")).toBe(true);
   });
 
   test("a new document starts with the latest state, even while its write is in flight", async () => {
     const { api, writes } = deferredApi();
-    const target = mcpAppWidgetStateTarget("ws-remount", "c1", loadedView(10, { n: 0 }));
+    const target = mcpAppWidgetStateTarget("ws-remount", "c1", loadedView("r10", { n: 0 }));
     saveMcpAppWidgetState(api, target, { n: 5 });
     await flush();
     // The frame unmounted and mounted again before the write landed: getView still has n: 0.
-    const remounted = mcpAppWidgetStateTarget("ws-remount", "c1", loadedView(10, { n: 0 }));
+    const remounted = mcpAppWidgetStateTarget("ws-remount", "c1", loadedView("r10", { n: 0 }));
     expect(mcpAppWidgetStateSeed({ nonce: "doc-2" }, remounted)).toEqual({ n: 5 });
     writes[0].settle(true);
   });
 
   test("a new record under a reused tool call ID gets only its own stored state", async () => {
     const { api } = deferredApi();
-    saveMcpAppWidgetState(api, mcpAppWidgetStateTarget("ws-reuse", "c1", loadedView(10)), {
+    saveMcpAppWidgetState(api, mcpAppWidgetStateTarget("ws-reuse", "c1", loadedView("r10")), {
       secret: true,
     });
-    const reused = mcpAppWidgetStateTarget("ws-reuse", "c1", loadedView(20));
+    const reused = mcpAppWidgetStateTarget("ws-reuse", "c1", loadedView("r20"));
     expect(mcpAppWidgetStateSeed({ nonce: "doc-reuse" }, reused)).toBeNull();
   });
 
   test("a document keeps the seed it was built with, so later writes do not reload it", async () => {
     const { api } = deferredApi();
-    const target = mcpAppWidgetStateTarget("ws-doc", "c1", loadedView(10, { n: 1 }));
+    const target = mcpAppWidgetStateTarget("ws-doc", "c1", loadedView("r10", { n: 1 }));
     expect(mcpAppWidgetStateSeed({ nonce: "doc-a" }, target)).toEqual({ n: 1 });
     saveMcpAppWidgetState(api, target, { n: 2 });
     expect(mcpAppWidgetStateSeed({ nonce: "doc-a" }, target)).toEqual({ n: 1 });

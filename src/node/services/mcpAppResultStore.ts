@@ -1,4 +1,4 @@
-import { createHash } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import * as fs from "fs/promises";
 import * as path from "path";
 import { z } from "zod";
@@ -45,6 +45,12 @@ const McpAppResultRecordSchema = z.object({
   /** Raw CallToolResult, or null when it was too large to keep. */
   result: z.unknown().nullable(),
   createdAt: z.number(),
+  /**
+   * Random per record (record() writes a new one each time): the view instance this record
+   * belongs to. Widget-state writes name it (mcpAppWidgetStateBindingOf). Absent on records
+   * written before it existed.
+   */
+  instanceId: z.string().min(1).optional(),
   /**
    * Written by an entry point open (MCPServerManager.openMcpAppEntrypoint), never by a tool
    * call. A restored tab whose entry point is gone is then unavailable, not a tool call's view.
@@ -104,6 +110,14 @@ function widgetStateJson(state: unknown): string | null {
   return json;
 }
 
+/**
+ * What a view's widget-state writes name to reach its own record: the record's random
+ * instanceId, or its creation time for a record written before instanceId existed.
+ */
+export function mcpAppWidgetStateBindingOf(record: McpAppResultRecord): string {
+  return record.instanceId ?? `created:${record.createdAt}`;
+}
+
 function fileNameFor(toolCallId: string): string {
   // Tool call IDs come from providers; hash them so they are always safe file names.
   return `${createHash("sha256").update(toolCallId).digest("hex").slice(0, 40)}.json`;
@@ -154,10 +168,15 @@ export class McpAppResultStore {
   /** Record a tool result. Never throws: a failed write only means the view opens without it. */
   async record(
     workspaceId: string,
-    input: Omit<McpAppResultRecord, "version" | "createdAt">
+    input: Omit<McpAppResultRecord, "version" | "createdAt" | "instanceId">
   ): Promise<void> {
     try {
-      let record: McpAppResultRecord = { version: 1, createdAt: Date.now(), ...input };
+      let record: McpAppResultRecord = {
+        version: 1,
+        createdAt: Date.now(),
+        instanceId: randomUUID(),
+        ...input,
+      };
       let serialized = JSON.stringify(record);
       if (Buffer.byteLength(serialized, "utf8") > MCP_APP_RESULT_MAX_BYTES) {
         record = { ...record, result: null };
@@ -198,7 +217,8 @@ export class McpAppResultStore {
   }
 
   /**
-   * Store the widget state of the view of record `toolCallId` written at `recordCreatedAt`; null
+   * Store the widget state of the view of record `toolCallId` whose binding
+   * (mcpAppWidgetStateBindingOf) is `binding`; null
    * clears it. Throws when that record is gone (pruned, removed, or replaced by a new record under
    * a reused tool call ID), so a late write of an old view never reaches the new one, and when the
    * state is over MCP_APP_WIDGET_STATE_MAX_BYTES.
@@ -210,7 +230,7 @@ export class McpAppResultStore {
   async setWidgetState(
     workspaceId: string,
     toolCallId: string,
-    recordCreatedAt: number,
+    binding: string,
     state: unknown
   ): Promise<void> {
     const stateJson = widgetStateJson(state);
@@ -220,7 +240,7 @@ export class McpAppResultStore {
       if (this.rootDir !== null && (await isWorkspaceRemovalTombstoned(this.rootDir, workspaceId)))
         throw new Error(`Widget state refused: workspace ${workspaceId} was removed`);
       const record = await this.readRecord(filePath, toolCallId);
-      if (record?.createdAt !== recordCreatedAt) {
+      if (record === null || mcpAppWidgetStateBindingOf(record) !== binding) {
         throw new Error("Widget state refused: the view's result record is gone");
       }
       const { widgetState: _previous, ...rest } = record;

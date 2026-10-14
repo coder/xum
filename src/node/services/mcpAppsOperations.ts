@@ -30,7 +30,7 @@ import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { isSystemProjectEntry } from "@/common/utils/systemProjects";
 import type { ORPCContext } from "@/node/orpc/context";
 import { buildMcpToolName } from "@/common/utils/tools/mcpToolName";
-import type { McpAppResultRecord } from "./mcpAppResultStore";
+import { mcpAppWidgetStateBindingOf, type McpAppResultRecord } from "./mcpAppResultStore";
 import { displayConnectionKey } from "./mcpServerIdentity";
 
 export type McpAppsContext = Pick<
@@ -153,7 +153,7 @@ function viewFieldsOfRecord(record: McpAppResultRecord | null) {
     resultAvailable: record.result !== null,
     result: record.result,
     widgetState: record.widgetState ?? null,
-    widgetStateBinding: record.createdAt,
+    widgetStateBinding: mcpAppWidgetStateBindingOf(record),
     invocation: {
       serverName: record.serverName,
       toolName: record.toolName,
