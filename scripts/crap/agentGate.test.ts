@@ -309,26 +309,22 @@ test("the project hooks run the user's own hooks and pass their exit codes throu
   userHook(join(dir, "home/.mux"), "tool_pre", 7);
   expect(runHook(pre, "ls", { ...home, XUM_RUNTIME: "ssh" }).status).toBe(7);
 
-  // Leftover homes, as Xum's getXumHome() picks them: a leftover ~/.mux, and
-  // the home an empty ~/.xum's .legacy-fallback marker names.
+  // Leftover homes are not looked up: a user whose only home is ~/.mux keeps
+  // today's behavior, and the project hook skips their hook.
   const legacy = join(dir, "legacy");
-  userHook(join(legacy, ".mux"), "tool_pre", 5);
-  expect(runHook(pre, "ls", { HOME: legacy, XUM_ROOT: "" }).status).toBe(5);
-  // A devcontainer takes ~/.xum as is, with no leftover-home fallback.
-  expect(runHook(pre, "ls", { HOME: legacy, XUM_ROOT: "", XUM_RUNTIME: "devcontainer" })).toEqual({
-    status: 0,
-    out: "",
-  });
-  const marked = join(dir, "marked");
-  mkdirSync(join(marked, ".xum"), { recursive: true });
-  writeFileSync(join(marked, ".xum.legacy-fallback"), ".cmux\n");
-  userHook(join(marked, ".cmux"), "tool_pre", 6);
-  expect(runHook(pre, "ls", { HOME: marked, XUM_ROOT: "" }).status).toBe(6);
-  // Xum ignores a symlinked marker, so the hook does too.
-  rmSync(join(marked, ".xum.legacy-fallback"));
-  writeFileSync(join(dir, "marker"), ".cmux\n");
-  symlinkSync(join(dir, "marker"), join(marked, ".xum.legacy-fallback"));
-  expect(runHook(pre, "ls", { HOME: marked, XUM_ROOT: "" })).toEqual({ status: 0, out: "" });
+  userHook(join(legacy, ".mux"), "tool_post", 5);
+  expect(
+    runHook(join(dirname(pre), "tool_post"), "", {
+      HOME: legacy,
+      XUM_ROOT: "",
+      XUM_TOOL: "file_read",
+    })
+  ).toEqual({ status: 0, out: "" });
+
+  // A relative XUM_ROOT skips the user's hook (Xum resolves it from the app's
+  // working directory, which the hook cannot know).
+  userHook(join(repo, "relative-root"), "tool_pre", 8);
+  expect(runHook(pre, "ls", { XUM_ROOT: "relative-root" })).toEqual({ status: 0, out: "" });
 
   // XUM_ROOT moves the user's home, and a home that is the project's own .xum
   // does not run the project hook again.
