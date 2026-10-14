@@ -76,7 +76,10 @@ describe("CommandPalette inline goal prompts", () => {
     });
     fireEvent.click(view.getByRole("button", { name: "Open palette" }));
     fireEvent.click(await view.findByText("Pick something"));
-    await view.findByText(/Could not load options: backend busy/);
+    // An alert: the failure appears after the prompt opened, so screen readers announce it.
+    expect((await view.findByRole("alert")).textContent).toContain(
+      "Could not load options: backend busy"
+    );
   });
 
   test("guest Escape leaves the host palette open", async () => {

@@ -56,19 +56,33 @@ interface PaletteGroup {
   items: PaletteItem[];
 }
 
-/** What a select prompt shows instead of options; undefined when it has results. */
+/**
+ * What a select prompt shows instead of options; undefined when it has results. `alert` marks a
+ * failed load, which screen readers announce: it appears after the prompt opened.
+ */
 function selectPromptEmptyText(state: {
   isLoadingOptions: boolean;
   resultCount: number;
   optionCount: number;
   optionsError: string | null;
-}): string | undefined {
-  if (state.isLoadingOptions) return "Loading options...";
-  if (state.resultCount > 0) return undefined;
-  if (state.optionCount > 0) return "No results";
+}): { text: string | undefined; alert: boolean } {
+  if (state.isLoadingOptions) return { text: "Loading options...", alert: false };
+  if (state.resultCount > 0) return { text: undefined, alert: false };
+  if (state.optionCount > 0) return { text: "No results", alert: false };
   return state.optionsError != null
-    ? `Could not load options: ${state.optionsError}`
-    : "No options";
+    ? { text: `Could not load options: ${state.optionsError}`, alert: true }
+    : { text: "No options", alert: false };
+}
+
+function PaletteEmptyText(props: { text: string | undefined; alert: boolean }) {
+  return (
+    <div
+      role={props.alert ? "alert" : undefined}
+      className="p-4 text-[13px] text-[var(--color-command-subdued)]"
+    >
+      {props.text ?? "No results"}
+    </div>
+  );
 }
 
 export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext }) => {
@@ -464,6 +478,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
 
   let groups: PaletteGroup[] = generalResults.groups;
   let emptyText: string | undefined = generalResults.emptyText;
+  let emptyIsAlert = false;
 
   if (currentField) {
     const promptTitle = activePrompt?.title ?? currentField.label ?? "Provide details";
@@ -490,12 +505,12 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
           })),
         },
       ];
-      emptyText = selectPromptEmptyText({
+      ({ text: emptyText, alert: emptyIsAlert } = selectPromptEmptyText({
         isLoadingOptions,
         resultCount: rankedOptions.length,
         optionCount: selectOptions.length,
         optionsError,
-      });
+      }));
     } else {
       const typed = query.trim();
       const fallbackHint = currentField.placeholder ?? "Type value and press Enter";
@@ -646,11 +661,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
               })}
             </Command.Group>
           ))}
-          {!hasAnyItems && (
-            <div className="p-4 text-[13px] text-[var(--color-command-subdued)]">
-              {emptyText ?? "No results"}
-            </div>
-          )}
+          {!hasAnyItems && <PaletteEmptyText text={emptyText} alert={emptyIsAlert} />}
         </Command.List>
       </Command>
     </div>
