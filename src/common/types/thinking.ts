@@ -545,6 +545,18 @@ export const GEMINI_THINKING_BUDGETS: Record<ThinkingLevel, number> = {
   xhigh: 16384, // Same as high - Gemini doesn't support xhigh
   max: 16384,
 } as const;
+
+/** Gemini 3+ thinkingLevel per Xum level; Gemini has no xhigh/max, so both map to high. */
+export const GEMINI_THINKING_LEVELS: Record<
+  Exclude<ThinkingLevel, "off">,
+  "low" | "medium" | "high"
+> = {
+  low: "low",
+  medium: "medium",
+  high: "high",
+  xhigh: "high",
+  max: "high",
+};
 export const OPENROUTER_REASONING_EFFORT: Record<
   ThinkingLevel,
   "low" | "medium" | "high" | undefined

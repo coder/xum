@@ -3520,16 +3520,11 @@ export function getToolSchemas(): Record<string, ToolSchema> {
  */
 export function supportsGoogleNativeToolsWithFunctionTools(modelId: string): boolean {
   const bareModelId = modelId.split("/").pop() ?? modelId;
-  if (bareModelId.startsWith("gemini-4-argon")) {
-    // Argon documents Search grounding and URL context alongside function calling, and
-    // @ai-sdk/google gives every post-2.x Gemini ID the mixed native/function serialization
-    // (includeServerSideToolInvocations). Other Gemini 4 IDs stay off until documented.
-    return true;
-  }
-  const match = /^gemini-(\d+)(?:[.-]|$)/.exec(bareModelId);
-  if (!match) return false;
-  const major = Number.parseInt(match[1], 10);
-  return major === 3;
+  // Gemini 4 Argon documents Search grounding and URL context alongside function calling,
+  // and @ai-sdk/google gives every post-2.x Gemini ID the mixed native/function
+  // serialization (includeServerSideToolInvocations). Other Gemini 4 IDs stay off until
+  // their docs list the same tools.
+  return /^gemini-(?:3(?:[.-]|$)|4-argon)/.test(bareModelId);
 }
 
 /**

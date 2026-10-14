@@ -76,14 +76,26 @@ export function isGeminiFlashMinimalRejectingModelName(modelName: string): boole
 }
 
 /**
+ * True for Gemini models whose thinking levels are only low/medium/high, so Xum cannot
+ * expose "off": Gemini 3.8 Flash (rejects minimal) and Gemini 4 Argon (documents no
+ * minimal level and defaults to medium).
+ * @param modelName Provider model ID without the provider prefix.
+ */
+function isGeminiLowMediumHighModelName(modelName: string): boolean {
+  return (
+    isGeminiFlashMinimalRejectingModelName(modelName) ||
+    modelName.trim().toLowerCase().startsWith("gemini-4-argon")
+  );
+}
+
+/**
  * Returns the thinking policy for a given model.
  *
  * Rules:
  * - openai:gpt-6-astra / openai:gpt-6.1-sol → ["low", "medium", "high", "xhigh", "max"]
  *   (native max; the API rejects "none", so reasoning cannot be disabled)
  * - openai:gpt-6-luna → ["off", "low", "medium", "high", "xhigh", "max"] (6 levels)
- * - Gemini 3.8 Flash → ["low", "medium", "high"] (API rejects minimal, so no "off")
- * - Gemini 4 Argon → ["low", "medium", "high"] (no minimal level, so no "off")
+ * - Gemini 3.8 Flash / Gemini 4 Argon → ["low", "medium", "high"] (no minimal, so no "off")
  * - Older Gemini Flash chat variants → ["off", "low", "medium", "high"]
  * - gemini-3 Pro variants → ["low", "high"] (thinking level only)
  * - xai:grok-4.7 / xai:grok-4.6 → ["low", "medium", "high", "xhigh"] (reasoning cannot be disabled)
@@ -168,20 +180,15 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
     return ["off", "low", "medium", "high", "xhigh", "max"];
   }
 
-  // Gemini 3.8 Flash rejects "minimal", so thinking cannot be disabled; "off" clamps to "low".
-  if (isGeminiFlashMinimalRejectingModelName(withoutProviderNamespace)) {
+  // Gemini 3.8 Flash and Gemini 4 Argon have no "minimal" level, so thinking cannot be
+  // disabled; "off" clamps to "low".
+  if (isGeminiLowMediumHighModelName(withoutProviderNamespace)) {
     return ["low", "medium", "high"];
   }
 
   // Older Gemini Flash chat models support minimal/low/medium/high. Xum exposes minimal as "off".
   if (isGeminiFlashThinkingLevelModelName(withoutProviderNamespace)) {
     return ["off", "low", "medium", "high"];
-  }
-
-  // Gemini 4 Argon documents thinking levels low, medium (its default), and high; it has
-  // no "minimal", so thinking cannot be disabled and "off" clamps to "low".
-  if (withoutProviderNamespace.startsWith("gemini-4-argon")) {
-    return ["low", "medium", "high"];
   }
 
   // Gemini 3 Pro only supports "low" and "high" reasoning levels
@@ -345,10 +352,11 @@ export function resolveEffectiveThinkingLevel(
   const capabilityModel = resolveModelForMetadata(modelString, providersConfig ?? null);
   // Gemini 3.8 Flash rejects "minimal" and GPT-6 Astra rejects "none", so an
   // unset/"off" level must clamp here too; otherwise the tracked level would say
-  // "off" while the adapter sends "low".
+  // "off" while the adapter sends "low". Gemini 4 Argon has no "off" either: an
+  // unclamped "off" sends no thinkingConfig and Argon thinks at its medium default.
   return ALWAYS_ON_FIVE_LEVEL_MODELS.some((matches) => matches(capabilityModel)) ||
     isGlm53Model(capabilityModel) ||
-    isGeminiFlashMinimalRejectingModelName(stripModelProviderPrefixes(capabilityModel))
+    isGeminiLowMediumHighModelName(stripModelProviderPrefixes(capabilityModel))
     ? enforceThinkingPolicy(capabilityModel, level)
     : level;
 }
