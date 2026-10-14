@@ -94,78 +94,81 @@ export function parsePreToolUseOutput(result: unknown): PreToolUseOutput | null 
   const wire = readWire(result, "PreToolUse");
   if (wire === null) return null;
   const { raw, specific } = wire;
-  const out: PreToolUseOutput = common(raw);
-  const decision = enumField(raw, "decision", ["approve", "block"]);
-  const permissionDecision = enumField(specific, "permissionDecision", ["allow", "deny", "ask"]);
-  const permissionDecisionReason = stringField(specific, "permissionDecisionReason");
-  const updatedInput = specific.updatedInput ?? undefined;
+  const universal = unsupportedUniversal(raw, "PreToolUse", { allowContinueFalse: false });
   // Codex: any hook-specific decision field means the legacy `decision`/`reason` pair is not
   // consulted (PRRT_kwDOPxxmWM6r6NnG).
-  const useSpecific =
-    permissionDecision !== undefined ||
-    permissionDecisionReason !== undefined ||
-    updatedInput !== undefined;
-  out.invalid = unsupportedUniversal(raw, "PreToolUse", { allowContinueFalse: false });
-  if (out.invalid === undefined) {
-    if (useSpecific) {
-      if (updatedInput !== undefined && permissionDecision !== "allow") {
-        out.invalid = "returned updatedInput without permissionDecision allow";
-      } else if (permissionDecision === "allow" && updatedInput === undefined) {
-        out.invalid = "returned unsupported permissionDecision allow";
-      } else if (permissionDecision === "ask") {
-        out.invalid = "returned unsupported permissionDecision ask";
-      } else if (permissionDecision === "deny") {
-        const reason = trimmed(permissionDecisionReason);
-        if (reason === undefined) out.invalid = "returned deny without a non-empty reason";
-        else out.denyReason = reason;
-      } else if (permissionDecision === undefined) {
-        out.invalid = "returned permissionDecisionReason without permissionDecision";
-      } else {
-        out.updatedInput = updatedInput;
-      }
-    } else if (decision === "approve") {
-      out.invalid = "returned unsupported decision approve";
-    } else if (decision === "block") {
-      const reason = trimmed(stringField(raw, "reason"));
-      if (reason === undefined) out.invalid = "returned decision block without a non-empty reason";
-      else out.denyReason = reason;
-    } else if (raw.reason != null) {
-      out.invalid = "returned reason without decision";
-    }
+  const decision: Decision<PreToolUseOutput> =
+    universal !== undefined
+      ? { invalid: universal }
+      : hasSpecificDecision(specific)
+        ? preSpecificDecision(specific)
+        : preLegacyDecision(raw);
+  return withContext(raw, decision, specific);
+}
+
+function hasSpecificDecision(specific: Record<string, unknown>): boolean {
+  return ["permissionDecision", "permissionDecisionReason", "updatedInput"].some(
+    (field) => specific[field] != null
+  );
+}
+
+function preSpecificDecision(specific: Record<string, unknown>): Decision<PreToolUseOutput> {
+  const permissionDecision = enumField(specific, "permissionDecision", ["allow", "deny", "ask"]);
+  const updatedInput: unknown = specific.updatedInput;
+  if (updatedInput != null) {
+    return permissionDecision === "allow"
+      ? { updatedInput }
+      : { invalid: "returned updatedInput without permissionDecision allow" };
   }
-  if (out.invalid === undefined) {
-    out.additionalContext = trimmed(stringField(specific, "additionalContext"));
+  switch (permissionDecision) {
+    case "allow":
+    case "ask":
+      return { invalid: `returned unsupported permissionDecision ${permissionDecision}` };
+    case "deny":
+      return requireReason(stringField(specific, "permissionDecisionReason"), (denyReason) => ({
+        denyReason,
+      }));
+    default:
+      return { invalid: "returned permissionDecisionReason without permissionDecision" };
   }
-  return compact(out);
+}
+
+function preLegacyDecision(raw: Record<string, unknown>): Decision<PreToolUseOutput> {
+  switch (enumField(raw, "decision", ["approve", "block"])) {
+    case "approve":
+      return { invalid: "returned unsupported decision approve" };
+    case "block":
+      return requireReason(stringField(raw, "reason"), (denyReason) => ({ denyReason }));
+    default:
+      return raw.reason != null ? { invalid: "returned reason without decision" } : {};
+  }
 }
 
 export function parsePostToolUseOutput(result: unknown): PostToolUseOutput | null {
   const wire = readWire(result, "PostToolUse");
   if (wire === null) return null;
   const { raw, specific } = wire;
-  const out: PostToolUseOutput = common(raw);
-  const block = enumField(raw, "decision", ["block"]) === "block";
-  const reason = trimmed(stringField(raw, "reason"));
-  const stopReason = trimmed(stringField(raw, "stopReason"));
-  out.invalid = unsupportedUniversal(raw, "PostToolUse", { allowContinueFalse: true });
-  if (out.invalid === undefined && specific.updatedMCPToolOutput != null) {
-    out.invalid = "returned unsupported updatedMCPToolOutput";
+  return withContext(raw, postDecision(raw, specific), specific);
+}
+
+function postDecision(
+  raw: Record<string, unknown>,
+  specific: Record<string, unknown>
+): Decision<PostToolUseOutput> {
+  const universal = unsupportedUniversal(raw, "PostToolUse", { allowContinueFalse: true });
+  if (universal !== undefined) return { invalid: universal };
+  if (specific.updatedMCPToolOutput != null) {
+    return { invalid: "returned unsupported updatedMCPToolOutput" };
   }
-  const continues = raw.continue !== false;
   // Codex checks continue: false first; the other rules apply only to a continuing hook.
-  if (out.invalid === undefined && continues) {
-    if (block && reason === undefined) {
-      out.invalid = "returned decision block without a non-empty reason";
-    } else if (!block && raw.reason != null) {
-      out.invalid = "returned reason without decision";
-    }
+  if (raw.continue === false) {
+    const feedback = trimmed(stringField(raw, "reason")) ?? trimmed(stringField(raw, "stopReason"));
+    return { stopFeedback: feedback ?? "PostToolUse hook stopped execution" };
   }
-  if (out.invalid === undefined) {
-    if (!continues) out.stopFeedback = reason ?? stopReason ?? "PostToolUse hook stopped execution";
-    else if (block) out.blockReason = reason;
-    out.additionalContext = trimmed(stringField(specific, "additionalContext"));
+  if (enumField(raw, "decision", ["block"]) === "block") {
+    return requireReason(stringField(raw, "reason"), (blockReason) => ({ blockReason }));
   }
-  return compact(out);
+  return raw.reason != null ? { invalid: "returned reason without decision" } : {};
 }
 
 export function parseUserPromptSubmitOutput(result: unknown): UserPromptSubmitOutput | null {
@@ -180,24 +183,17 @@ export function parseUserPromptSubmitOutput(result: unknown): UserPromptSubmitOu
   const wire = readWire(result, "UserPromptSubmit", text);
   if (wire === null) return null;
   const { raw, specific } = wire;
-  const out: UserPromptSubmitOutput = common(raw);
+  return withContext(raw, promptDecision(raw), specific);
+}
+
+function promptDecision(raw: Record<string, unknown>): Decision<UserPromptSubmitOutput> {
   const block = enumField(raw, "decision", ["block"]) === "block";
-  const reason = trimmed(stringField(raw, "reason"));
-  const stopReason = trimmed(stringField(raw, "stopReason"));
-  const invalidBlock = block && reason === undefined;
-  // Codex keeps the context unless the block is invalid, and checks continue: false first.
-  if (!invalidBlock) out.additionalContext = trimmed(stringField(specific, "additionalContext"));
   if (raw.continue === false) {
-    out.stopped = true;
     // Codex shows stopReason for a stopped prompt (PRRT_kwDOPxxmWM6rb29w).
-    const why = stopReason ?? reason;
-    if (why !== undefined) out.blockReason = why;
-  } else if (invalidBlock) {
-    out.invalid = "returned decision block without a non-empty reason";
-  } else if (block) {
-    out.blockReason = reason;
+    const why = trimmed(stringField(raw, "stopReason")) ?? trimmed(stringField(raw, "reason"));
+    return why !== undefined ? { stopped: true, blockReason: why } : { stopped: true };
   }
-  return compact(out);
+  return block ? requireReason(stringField(raw, "reason"), (blockReason) => ({ blockReason })) : {};
 }
 
 export function parseStopOutput(result: unknown): StopOutput | null {
@@ -218,6 +214,30 @@ export function parseStopOutput(result: unknown): StopOutput | null {
   return compact(out);
 }
 
+type Decision<T> = Omit<T, "systemMessage" | "additionalContext">;
+
+/** Codex: a block or deny needs a non-empty reason, else the output is invalid (fails open). */
+function requireReason<T>(
+  reason: string | undefined,
+  build: (text: string) => T
+): T | { invalid: string } {
+  const text = trimmed(reason);
+  return text === undefined
+    ? { invalid: "returned a block without a non-empty reason" }
+    : build(text);
+}
+
+/** systemMessage always; additionalContext only when the output is valid (Codex). */
+function withContext<T extends Common & { additionalContext?: string }>(
+  raw: Record<string, unknown>,
+  decision: Decision<T>,
+  specific: Record<string, unknown>
+): T {
+  const context =
+    "invalid" in decision ? undefined : trimmed(stringField(specific, "additionalContext"));
+  return compact({ ...common(raw), ...decision, additionalContext: context } as T);
+}
+
 /**
  * The output object, checked against Codex's schema for `event`. Returns null for an empty
  * result (no text, no structuredContent) and for a result that is not an object (Codex ignores
@@ -228,32 +248,41 @@ function readWire(
   event: HookEventName,
   text: string | undefined = joinedText(result)
 ): { raw: Record<string, unknown>; specific: Record<string, unknown> } | null {
-  let raw: unknown = isPlainObject(result) ? result.structuredContent : undefined;
-  if (text !== undefined) {
-    try {
-      raw = JSON.parse(text);
-    } catch {
-      if (looksLikeJson(text)) throw new Error(`returned invalid ${event} JSON output`);
-      return null;
-    }
-  }
+  const raw =
+    text !== undefined
+      ? parseText(text, event)
+      : isPlainObject(result)
+        ? result.structuredContent
+        : undefined;
   if (!isPlainObject(raw)) return null;
-  const allowed = ALLOWED_FIELDS[event];
-  rejectUnknown(raw, allowed.top, "output");
-  // Codex requires hookSpecificOutput.hookEventName to name this event.
-  const specificRaw = raw.hookSpecificOutput;
-  if (specificRaw != null) {
-    if (allowed.specific === null) throw new Error("hookSpecificOutput is not a Stop field");
-    if (!isPlainObject(specificRaw) || specificRaw.hookEventName !== event) {
-      throw new Error(`hookSpecificOutput is not tagged hookEventName "${event}"`);
-    }
-    rejectUnknown(specificRaw, allowed.specific, "hookSpecificOutput");
-  }
-  const specific = isPlainObject(specificRaw) ? specificRaw : {};
+  rejectUnknown(raw, ALLOWED_FIELDS[event].top, "output");
+  const specific = readSpecific(raw.hookSpecificOutput, event);
   typed(raw, ["continue", "suppressOutput"], "boolean");
   typed(raw, ["stopReason", "systemMessage", "reason"], "string");
   typed(specific, ["permissionDecisionReason", "additionalContext"], "string");
   return { raw, specific };
+}
+
+/** JSON text; text that looks like JSON but does not parse is a malformed output. */
+function parseText(text: string, event: HookEventName): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    if (looksLikeJson(text)) throw new Error(`returned invalid ${event} JSON output`);
+    return undefined;
+  }
+}
+
+/** Codex requires hookSpecificOutput.hookEventName to name this event. */
+function readSpecific(value: unknown, event: HookEventName): Record<string, unknown> {
+  if (value == null) return {};
+  const allowed = ALLOWED_FIELDS[event].specific;
+  if (allowed === null) throw new Error(`hookSpecificOutput is not a ${event} field`);
+  if (!isPlainObject(value) || value.hookEventName !== event) {
+    throw new Error(`hookSpecificOutput is not tagged hookEventName "${event}"`);
+  }
+  rejectUnknown(value, allowed, "hookSpecificOutput");
+  return value;
 }
 
 /**
@@ -265,18 +294,20 @@ function joinedText(result: unknown): string | undefined {
   if (!isPlainObject(result)) throw new Error("the MCP result is not an object");
   if (result.isError === true) throw new Error("the MCP tool returned an error");
   const content: unknown[] = Array.isArray(result.content) ? result.content : [];
-  let length = 0;
-  const parts: string[] = [];
-  for (const part of content) {
-    if (!isPlainObject(part) || part.type !== "text" || typeof part.text !== "string") continue;
-    length += part.text.length + 1;
-    if (length > HOOK_RESULT_MAX_CHARS) {
-      throw new Error(`the result is over ${HOOK_RESULT_MAX_CHARS} characters`);
-    }
-    parts.push(part.text);
+  const parts = content.flatMap(textOf);
+  // Joined length (one newline between parts), checked before joining or parsing.
+  const length = parts.reduce((sum, part) => sum + part.length + 1, 0);
+  if (length > HOOK_RESULT_MAX_CHARS) {
+    throw new Error(`the result is over ${HOOK_RESULT_MAX_CHARS} characters`);
   }
   const joined = parts.join("\n").trim();
   return joined.length > 0 ? joined : undefined;
+}
+
+function textOf(part: unknown): string[] {
+  return isPlainObject(part) && part.type === "text" && typeof part.text === "string"
+    ? [part.text]
+    : [];
 }
 
 function looksLikeJson(text: string): boolean {
@@ -336,7 +367,7 @@ function common(raw: Record<string, unknown>): Common {
 }
 
 function trimmed(value: string | undefined): string | undefined {
-  return value !== undefined && value.trim() ? cut(value) : undefined;
+  return value?.trim() ? cut(value) : undefined;
 }
 
 function cut(text: string): string {
