@@ -233,8 +233,7 @@ export interface ToolConfiguration {
   taskService?: TaskService;
   workspaceTurnManager?: WorkspaceTurnManager;
   /**
-   * Catalog for the models_list tool: the models selectable under the current
-   * configuration (same pipeline as the composer picker), in task.model form.
+   * Catalog for the models_list tool, in task.model form; picker hiding does not apply.
    * Re-reads live config on every call — no cache. Absent in contexts without a
    * backend config (tests, refinement), where the tool reports unavailability.
    */

@@ -212,7 +212,6 @@ export function useModelsFromSettings() {
     [hiddenModels, providerHiddenModels]
   );
 
-  // Shared with the backend models_list tool so the picker and the tool cannot drift.
   const models = useMemo(
     () =>
       computeSelectableModels({

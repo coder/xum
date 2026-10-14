@@ -5324,9 +5324,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     appConfig = { ...baseAppConfig, routePriority: ["direct", "bedrock"] };
     expect(modelIds()).toEqual(anthropicBuiltIns);
 
-    // 4. A model hidden in config.json disappears.
-    appConfig = { ...appConfig, hiddenModels: [KNOWN_MODELS.SONNET.id] };
-    expect(modelIds()).toEqual(anthropicBuiltIns.filter((id) => id !== KNOWN_MODELS.SONNET.id));
+    // Hiding a model only changes the picker, not whether tasks can use it.
+    appConfig = { ...appConfig, hiddenModels: anthropicBuiltIns };
+    expect(modelIds()).toEqual(anthropicBuiltIns);
   });
 
   // #5086: Sonnet 5.5 "off" is between_tools at a pinned effort; after an effort
