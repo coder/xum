@@ -1,6 +1,8 @@
 "use strict";
 
-// Chooses what `make lint` checks: only the files this branch changed, or everything.
+// Chooses what the linters check. `--all` prints every lintable file for oxlint, which checks the
+// whole repo in seconds. Without it, chooses what type-aware ESLint checks: only the files this
+// branch changed, or everything.
 //
 // A cold type-aware ESLint run over the whole repo peaks at ~7.6 GiB and takes minutes, and every
 // new worktree starts without an ESLint cache. Several agents doing that at once OOM-killed shared
@@ -9,9 +11,11 @@
 // change in one file can surface type-aware findings in files the branch did not touch.
 
 const { execFileSync } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
 
 // Must match ESLINT_PATTERNS in scripts/lint.sh: files outside them have no type-aware parser
-// setup, so ESLint fails on them instead of skipping them.
+// setup, so ESLint fails on them instead of skipping them. oxlint checks the same files.
 const LINT_FILE_PATTERNS = [
   /^src\/.+\.tsx?$/,
   /^tests\/.+\.tsx?$/,
@@ -24,6 +28,7 @@ const LINT_FILE_PATTERNS = [
 // trustworthy: the lint config and its inputs, dependencies, and the compiler settings.
 const FULL_LINT_TRIGGERS = [
   /^eslint\.config\.mjs$/,
+  /^eslint-local-rules\.mjs$/,
   /^package\.json$/,
   /^bun\.lock$/,
   /^tsconfig[^/]*\.json$/,
@@ -100,6 +105,19 @@ function listChangedFiles(cwd, base) {
 }
 
 /**
+ * Every lintable file in the working tree: tracked files that still exist plus untracked files
+ * that are not ignored, sorted.
+ */
+function listAllLintFiles(cwd) {
+  const files = git(["ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd)
+    .split("\0")
+    .filter((file) => LINT_FILE_PATTERNS.some((re) => re.test(file)))
+    // A tracked file deleted in the working tree is still listed by --cached.
+    .filter((file) => fs.existsSync(path.join(cwd, file)));
+  return [...new Set(files)].sort();
+}
+
+/**
  * Prints the selection for scripts/lint.sh. The first line is `full <reason>` or
  * `files <base>`; for `files`, one path per following line.
  */
@@ -116,11 +134,23 @@ function main(cwd = process.cwd(), env = process.env) {
   return [`files ${base}`, ...selection.files].join("\n") + "\n";
 }
 
-module.exports = { LINT_FILE_PATTERNS, FULL_LINT_TRIGGERS, selectLintTargets, resolveBase, main };
+module.exports = {
+  LINT_FILE_PATTERNS,
+  FULL_LINT_TRIGGERS,
+  selectLintTargets,
+  resolveBase,
+  listAllLintFiles,
+  main,
+};
 
 if (require.main === module) {
   try {
-    process.stdout.write(main());
+    if (process.argv.includes("--all")) {
+      const files = listAllLintFiles(process.cwd());
+      process.stdout.write(files.length > 0 ? files.join("\n") + "\n" : "");
+    } else {
+      process.stdout.write(main());
+    }
   } catch (error) {
     process.stderr.write(
       `lint_targets: ${error instanceof Error ? error.message : String(error)}\n`

@@ -9,6 +9,7 @@ type Selection = { mode: "full"; reason: string } | { mode: "files"; files: stri
 interface LintTargetsModule {
   selectLintTargets(changedFiles: string[], removedFiles?: string[]): Selection;
   main(cwd: string, env: Record<string, string | undefined>): string;
+  listAllLintFiles(cwd: string): string[];
 }
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports -- plain CommonJS script helper with no ESM entry
@@ -43,6 +44,7 @@ describe("lint target selection", () => {
 
   it.each([
     "eslint.config.mjs",
+    "eslint-local-rules.mjs",
     "package.json",
     "bun.lock",
     "tsconfig.json",
@@ -178,5 +180,20 @@ describe("lint target git discovery", () => {
     git("branch", "-q", "-m", "main", "trunk");
 
     expect(run()).toEqual(["full no merge base with origin/main or main"]);
+  });
+
+  it("lists every lintable file in the working tree for oxlint", () => {
+    fs.rmSync(path.join(repo, "src/deleted.ts"));
+    write("tests/untracked.test.ts");
+    write("src/ignored.ts");
+    write(".gitignore", "src/ignored.ts\n");
+    write("docs/page.md", "# page\n");
+
+    expect(lintTargets.listAllLintFiles(repo)).toEqual([
+      "src/edited.ts",
+      "src/kept.ts",
+      "src/renamed.ts",
+      "tests/untracked.test.ts",
+    ]);
   });
 });

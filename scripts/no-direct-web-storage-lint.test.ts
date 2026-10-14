@@ -3,7 +3,7 @@ import { Linter } from "eslint";
 import tseslint from "typescript-eslint";
 import config from "../eslint.config.mjs";
 
-// The rule is defined inline in eslint.config.mjs; lint snippets with only that rule enabled.
+// The rule is defined in eslint-local-rules.mjs; lint snippets with only that rule enabled.
 const localPlugin = (config as { plugins?: Record<string, unknown> }[]).find(
   (entry) => entry.plugins?.local !== undefined
 )?.plugins?.local;
