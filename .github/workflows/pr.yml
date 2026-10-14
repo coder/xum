@@ -401,6 +401,10 @@ jobs:
     continue-on-error: ${{ vars.CRAP_MODE != 'block' }}
     timeout-minutes: 10
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Read the PR's current labels (CRAP report step).
+      pull-requests: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -444,12 +448,20 @@ jobs:
           # Integration shards skip their tests without backend or browser changes.
           INTEGRATION_RAN: ${{ needs.changes.outputs.backend == 'true' || needs.changes.outputs.browser == 'true' }}
           CRAP_MODE: ${{ vars.CRAP_MODE }}
-          CRAP_DEBT_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'crap-debt') }}
+          # A re-run reuses the original event payload, so read the label live:
+          # crap-debt-label.yml re-runs this job when crap-debt is added or
+          # removed. If the API call fails, fall back to the payload's labels.
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_DEBT_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'crap-debt') }}
         run: |
           if ! command -v bun >/dev/null; then
             echo "::warning title=CRAP::bun setup failed, so no CRAP report"
             exit 0
           fi
+          CRAP_DEBT_LABEL=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq 'any(.labels[]; .name == "crap-debt")') ||
+            CRAP_DEBT_LABEL=$EVENT_DEBT_LABEL
+          export CRAP_DEBT_LABEL
           bun scripts/crap/ci.ts
 
   test-storybook:

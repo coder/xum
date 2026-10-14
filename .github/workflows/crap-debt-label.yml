@@ -1,0 +1,59 @@
+name: CRAP debt label
+
+# Re-run Quality / CRAP (pr.yml) when the crap-debt label is added or removed,
+# so its findings match the label. pr.yml does not listen for label events
+# itself: its concurrency group would cancel a running CI and rerun every job
+# on each label change. The re-run job reads the label live (see the CRAP
+# report step), because a re-run reuses the original event payload.
+#
+# Fork PRs get a read-only GITHUB_TOKEN that cannot re-run jobs, so this
+# workflow skips them: a maintainer re-runs Quality / CRAP by hand there.
+
+on:
+  pull_request:
+    types: [labeled, unlabeled]
+
+# The latest label change wins.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  rerun-crap:
+    name: Re-run Quality / CRAP
+    if: >-
+      github.event.label.name == 'crap-debt' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    # Covers waiting for a pr.yml run still in progress (its jobs time out
+    # within 20 minutes after they start).
+    timeout-minutes: 45
+    permissions:
+      actions: write
+    steps:
+      - name: Re-run the latest Quality / CRAP job
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          run_id=$(gh run list --workflow pr.yml --event pull_request --commit "$HEAD_SHA" \
+            --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+          if [[ -z "$run_id" ]]; then
+            echo "No PR run for $HEAD_SHA yet: its Quality / CRAP job will read the label."
+            exit 0
+          fi
+          # GitHub re-runs a job only once its whole run has finished. If the
+          # job has not run yet, the wait is harmless and the re-run repeats it.
+          gh run watch "$run_id" --interval 30 >/dev/null || true
+          job_id=$(gh run view "$run_id" --json jobs \
+            --jq '.jobs[] | select(.name == "Quality / CRAP") | .databaseId')
+          if [[ -z "$job_id" ]]; then
+            echo "Run $run_id has no Quality / CRAP job."
+            exit 0
+          fi
+          gh run rerun "$run_id" --job "$job_id"
+          echo "Re-ran Quality / CRAP: $GITHUB_SERVER_URL/$GH_REPO/actions/runs/$run_id"
