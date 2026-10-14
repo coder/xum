@@ -593,6 +593,23 @@ describe("DraftStore", () => {
     expect((await service.get(source)).text).toBe("");
   });
 
+  test("keeps a draft moved before the drafts loaded, when it only looked empty", async () => {
+    using tempDir = new TestTempDir("draft-store-move-unloaded");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const source: DraftScope = { kind: "creation", projectPath, draftId: "draft-a" };
+    await service.update({ scope: source, text: "not loaded yet" });
+    let releaseSubscribe: () => void = () => undefined;
+    control.subscribeGate = new Promise<void>((resolve) => {
+      releaseSubscribe = resolve;
+    });
+    const store = createStore(client);
+
+    await store.moveDraft(source, { kind: "creation", projectPath, draftId: "draft-b" });
+    releaseSubscribe();
+    await store.whenReady();
+    expect((await service.get(source)).text).toBe("not loaded yet");
+  });
+
   test("applies a queued attachment update when the server empties the list meanwhile", async () => {
     using tempDir = new TestTempDir("draft-store-queued-empty");
     const { service, client, control } = await createHarness(tempDir);

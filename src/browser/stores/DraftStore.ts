@@ -1366,7 +1366,12 @@ export class DraftStore {
   async moveDraft(from: DraftStoreScope, to: DraftStoreScope): Promise<void> {
     const key = draftStoreScopeKey(from);
     const source = this.entries.get(key);
-    if (!source || (source.view.text.length === 0 && source.view.attachmentCount === 0)) return;
+    if (!source || (source.view.text.length === 0 && source.view.attachmentCount === 0)) {
+      // Nothing to move, so a listed source would stay behind empty. Before the drafts load, a
+      // draft with content has no entry yet and only looks empty: keep it.
+      if (this.hydrated) await this.deleteDraft(from);
+      return;
+    }
     this.setText(to, source.text);
     // Captured with the copy it describes: an edit during the payload load below must keep the
     // source (the text was copied before it).

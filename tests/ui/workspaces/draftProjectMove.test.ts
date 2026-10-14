@@ -293,7 +293,7 @@ describeIntegration("Creation project selector moves the draft", () => {
       await moveDraftTo(view.container, path.basename(b));
 
       await onlyDraftId(b);
-      // The DraftStore leaves an empty source alone, so the move deletes its list entry itself.
+      // An empty source has nothing to move, but its row must not stay behind.
       await waitForDraftIds(a, []);
       expect(getWorkspaceAiSelection(getProjectScopeId(b)).model).toBe(KNOWN_MODELS.HAIKU.id);
     } finally {

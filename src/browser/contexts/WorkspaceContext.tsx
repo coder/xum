@@ -340,16 +340,13 @@ function setListedDraftSubProject(
 }
 
 /** Lists the moved draft (or, within its owning project, changes its sub-project) and moves it. */
-function applyWorkspaceDraftMove(
-  move: WorkspaceDraftMove,
-  dest: WorkspaceCreationScope
-): { draftId: string; sourceEmpty: boolean } {
+function applyWorkspaceDraftMove(move: WorkspaceDraftMove, dest: WorkspaceCreationScope) {
   const listed = findListedDraft(move.projectPath, move.draftId);
   // A sub-project switch inside the owning project keeps the same draft: the composer is keyed
   // by the owner and draft, so it stays mounted with everything it shows.
   if (move.draftId != null && dest.projectPath === move.projectPath) {
     setListedDraftSubProject(move.projectPath, move.draftId, listed, dest.subProjectPath);
-    return { draftId: move.draftId, sourceEmpty: false };
+    return move.draftId;
   }
 
   const draftId = createDraftId();
@@ -358,9 +355,10 @@ function applyWorkspaceDraftMove(
     subProjectPath: dest.subProjectPath,
     createdAt: listed?.createdAt ?? Date.now(),
   });
-  const source = creationDraftSource(move.projectPath, move.draftId);
-  const sourceView = getDraftStore().getView(source.scope);
-  moveCreationDraftBody(source, { projectPath: dest.projectPath, draftId });
+  moveCreationDraftBody(creationDraftSource(move.projectPath, move.draftId), {
+    projectPath: dest.projectPath,
+    draftId,
+  });
   carryCreationAiSettings(move.projectPath, dest.projectPath);
   handOffCreationRuntime({
     sourceProjectPath: move.projectPath,
@@ -368,7 +366,7 @@ function applyWorkspaceDraftMove(
     draftScopeId: getDraftScopeId(dest.projectPath, draftId),
     runtime: move.runtimePick,
   });
-  return { draftId, sourceEmpty: sourceView.text.length === 0 && sourceView.attachmentCount === 0 };
+  return draftId;
 }
 
 const WorkspaceActionsContext = createContext<
@@ -1921,14 +1919,9 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
   const moveWorkspaceDraft = useCallback(
     (move: WorkspaceDraftMove) => {
       const dest = resolveWorkspaceCreationScope(move.destination, userProjects);
-      const moved = applyWorkspaceDraftMove(move, dest);
-      // moveDraft leaves an empty source alone, but its list entry must not stay behind.
-      if (moved.sourceEmpty && move.draftId != null) {
-        deleteWorkspaceDraft(move.projectPath, move.draftId);
-      }
-      navigateToProject(dest.projectPath, moved.draftId, { replace: true });
+      navigateToProject(dest.projectPath, applyWorkspaceDraftMove(move, dest), { replace: true });
     },
-    [userProjects, navigateToProject, deleteWorkspaceDraft]
+    [userProjects, navigateToProject]
   );
 
   // Split into two context values so metadata-Map churn doesn't re-render
