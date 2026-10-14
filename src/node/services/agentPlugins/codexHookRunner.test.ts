@@ -265,7 +265,7 @@ describe("PreToolUse", () => {
         error: "Tool call blocked by plugin 'guard' hook: x",
       });
     }
-    // Without a deny, the unsupported field voids the output (its rewrite does not apply).
+    // Without a deny, the unsupported field voids the rewrite, which denies the call (#6166).
     const rewrite = setup([hook("PreToolUse")], () =>
       json({
         continue: false,
@@ -277,8 +277,7 @@ describe("PreToolUse", () => {
       })
     );
     const schema = { type: "object", properties: { script: { type: "string" } } };
-    const ran = await runTool(rewrite.spine, "bash", { script: "ls" }, schema);
-    expect(ran.result).toEqual({ ran: { script: "ls" } });
+    expect((await runTool(rewrite.spine, "bash", { script: "ls" }, schema)).executed).toBe(false);
   });
 
   test("a deny keeps its own context and the context of earlier hooks", async () => {
@@ -818,9 +817,8 @@ describe("Codex output rules (output_parser.rs)", () => {
         },
       })
     );
-    expect((await runTool(rewrite.spine, "bash", { script: "ls" }, schema)).result).toEqual({
-      ran: { script: "ls" },
-    });
+    // A voided rewrite denies the call (Xum-stricter than Codex, which runs the original).
+    expect((await runTool(rewrite.spine, "bash", { script: "ls" }, schema)).executed).toBe(false);
     // A Stop continuation is not a refusal: an unknown field voids it.
     const unknownStop = setup([hook("Stop")], () =>
       json({ decision: "block", reason: "Again.", unexpectedField: true })
@@ -858,7 +856,7 @@ describe("Codex output rules (output_parser.rs)", () => {
     }
   });
 
-  test("suppressOutput voids a rewrite and the context, but not a deny or block", async () => {
+  test("suppressOutput voids a rewrite (the call is denied) and the context", async () => {
     const schema = { type: "object", properties: { script: { type: "string" } } };
     const pre = setup([hook("PreToolUse")], () =>
       json({
@@ -871,9 +869,10 @@ describe("Codex output rules (output_parser.rs)", () => {
         },
       })
     );
-    expect((await runTool(pre.spine, "bash", { script: "ls" }, schema)).result).toEqual({
-      ran: { script: "ls" },
-    });
+    // Running the original would bypass a guard that allowed only its rewrite (#6166).
+    const denied = await runTool(pre.spine, "bash", { script: "ls" }, schema);
+    expect(denied.executed).toBe(false);
+    expect(JSON.stringify(denied.blocked?.result)).toContain("voids its rewrite");
     const post = setup([hook("PostToolUse")], () =>
       json({
         suppressOutput: true,

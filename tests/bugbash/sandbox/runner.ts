@@ -4,9 +4,10 @@
  * after a job. launch.ts is its entry point.
  *
  * The trust anchor is the digest in image.json, which a reviewed pull request sets. The runner
- * pulls only `name@digest` and never builds. It refuses when the inputs key of this checkout
- * (`build.sh --key`) differs from image.json: that image was built for other inputs, and a
- * person must publish a new one (workflow "Bug-bash sandbox image") and update image.json.
+ * pulls only `name@digest`. It refuses when the inputs key of this checkout (`build.sh --key`)
+ * differs from image.json: that image was built for other inputs, and a person must publish a
+ * new one (workflow "Bug-bash sandbox image") and update image.json. The one exception is a
+ * local build for the jobs that the launcher allows (ensureImage's `localBuild`).
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import type { Readable } from "node:stream";
@@ -16,6 +17,8 @@ import * as path from "node:path";
 
 const ROOT = fs.realpathSync(path.resolve(import.meta.dir, "../../.."));
 export const IMAGE = "ghcr.io/coder/xum-bugbash-sandbox";
+/** How long build.sh gets for a local image: a fresh build with no cache. */
+const BUILD_MS = 25 * 60_000;
 /** How long a child gets after SIGTERM before SIGKILL. */
 const KILL_AFTER_MS = 5_000;
 /** How long the `docker run` client gets to exit after its lifeline (stdin) closed. */
@@ -134,21 +137,30 @@ export class Session {
     else stop.addEventListener("abort", () => this.#stop(String(stop.reason)), { once: true });
   }
 
-  /** The pinned image, pulled when missing, as `name@digest`. */
-  async ensureImage(): Promise<string> {
+  /**
+   * The pinned image, pulled when missing, as `name@digest`. With `localBuild` and a stale key
+   * only, a local image of this checkout instead, as its image ID. A matching key always
+   * takes the pinned image.
+   */
+  async ensureImage(options: { localBuild?: boolean } = {}): Promise<string> {
     const lock = readImageLock(this.#root);
     const key = await this.#checkoutKey();
-    if (key !== lock.inputsKey)
+    const stale = key !== lock.inputsKey;
+    if (stale && options.localBuild !== true)
       throw new Refusal(
         `stale image: image.json has inputs key ${lock.inputsKey.slice(0, 16)}, this checkout ` +
           `${key.slice(0, 16)}. Publish a new image, then update tests/bugbash/sandbox/image.json.`
       );
     await this.#connect();
     this.#checkArchitecture();
-    const ref = `${lock.image}@${lock.digest}`;
-    // An empty list with exit 0 means absent. Any failure refuses: it is not "absent".
-    const listed = await this.#must(["images", "--no-trunc", "--quiet", ref], 15_000);
-    if (listed.stdout === "") await this.#must(["pull", "--quiet", ref], 10 * 60_000);
+    let ref = `${lock.image}@${lock.digest}`;
+    if (stale) ref = await this.#localImage(key);
+    else {
+      // An empty list with exit 0 means absent. Any failure refuses: it is not "absent".
+      const listed = await this.#must(["images", "--no-trunc", "--quiet", ref], 15_000);
+      if (listed.stdout === "") await this.#must(["pull", "--quiet", ref], 10 * 60_000);
+    }
+    // The same label check for both: the image must carry the key of this checkout.
     const inspect = ["image", "inspect", "--format", "{{json .Config.Labels}}", ref];
     const labels = JSON.parse((await this.#must(inspect, 15_000)).stdout) as Record<
       string,
@@ -418,6 +430,28 @@ export class Session {
       if (this.#groups.size === 0 || Date.now() >= end) return [...this.#groups];
       await Bun.sleep(50);
     }
+  }
+
+  /**
+   * A pull request that changes the image inputs has no published image yet (only main
+   * publishes), so build.sh builds one from its committed source into the local Docker. It runs
+   * with the private client config: no registry login, and nothing is pushed. A present image
+   * under build.sh's local tag is reused: the self-check runs three jobs, then CI runs the repros.
+   */
+  async #localImage(key: string): Promise<string> {
+    const tag = `xum-bugbash-sandbox:inputs-${key}`; // build.sh's local tag
+    let id = (await this.#must(["images", "--no-trunc", "--quiet", tag], 15_000)).stdout;
+    if (id === "") {
+      this.#log(`stale image key: building ${tag} with build.sh (up to 25 minutes)`);
+      const script = path.join(this.#root, "tests/bugbash/sandbox/build.sh");
+      const built = await this.#job(script, [], this.#client!, BUILD_MS);
+      // The tail only: the error holds the whole build log.
+      if (!built.ok)
+        throw new Refusal(`build.sh: ${built.error.split("\n").slice(-20).join("\n")}`);
+      id = built.stdout;
+    }
+    if (!/^sha256:[0-9a-f]{64}$/.test(id)) throw new Refusal(`${tag}: unexpected image ID ${id}`);
+    return id;
   }
 
   async #checkoutKey(): Promise<string> {

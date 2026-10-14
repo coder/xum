@@ -256,13 +256,15 @@ function mcpAppViewDocumentKey(loaded: Loaded | null, grant: McpAppCspGrant | nu
 function buildMcpAppViewSrcDoc(
   loaded: Loaded | null,
   grant: McpAppCspGrant | null,
-  viewDocument: { nonce: string } | null,
-  openAiSeed: McpAppOpenAiSeed
+  viewDocument: { nonce: string; openAiSeed: McpAppOpenAiSeed } | null
 ): string | null {
   if (loaded?.view == null || grant == null || viewDocument == null) return null;
   return finalizeSandboxedDocument(parseArtifactHtml(loaded.view.html), {
     csp: buildMcpAppCsp(grant.granted),
-    bridgeScript: [mcpAppPreambleScript(viewDocument.nonce), mcpAppOpenAiShimScript(openAiSeed)],
+    bridgeScript: [
+      mcpAppPreambleScript(viewDocument.nonce),
+      mcpAppOpenAiShimScript(viewDocument.openAiSeed),
+    ],
   });
 }
 
@@ -270,19 +272,99 @@ function buildMcpAppViewSrcDoc(
  * One nonce and host channel per loaded view document (mcpAppDocumentChannel.ts): a new grant,
  * tool call or Reload loads a new one. Kept across host rebuilds of the same document, which
  * announces itself only once. Null until the first render with a document.
+ *
+ * The window.openai seed (the host context the globals start with) is taken when the document
+ * is first built, so a theme change while getView runs is in it. It stays fixed for that
+ * document: a theme change or a resize must not rebuild (reload) it; host-context-changed tells
+ * the view instead.
  */
-function useMcpAppViewDocument(documentKey: string | null, frameKey: number) {
+function useMcpAppViewDocument(
+  documentKey: string | null,
+  frameKey: number,
+  makeSeed: () => McpAppOpenAiSeed
+) {
   const key = documentKey == null ? null : `${frameKey}:${documentKey}`;
   const [loaded, setLoaded] = useState<{
     key: string;
     nonce: string;
     channel: McpAppDocumentChannel;
+    openAiSeed: McpAppOpenAiSeed;
   } | null>(null);
   if (key != null && loaded?.key !== key) {
     const nonce = newMcpAppDocumentNonce();
-    setLoaded({ key, nonce, channel: createMcpAppDocumentChannel(nonce) });
+    setLoaded({ key, nonce, channel: createMcpAppDocumentChannel(nonce), openAiSeed: makeSeed() });
   }
   return loaded?.key === key ? loaded : null;
+}
+
+/** The view container's size, as the view sees it (containerDimensions in the host context). */
+function containerDimensionsOf(container: HTMLElement | null, inline: boolean) {
+  return {
+    width: container?.clientWidth ?? 0,
+    // An inline container is as tall as the frame, so its own height is no limit.
+    maxHeight: inline ? inlineMaxHeight() : (container?.clientHeight ?? 0),
+  };
+}
+
+/**
+ * Tells the view when its container dimensions change (window resize, or the container itself:
+ * a sidebar drag), so window.openai.maxHeight and the standard containerDimensions follow.
+ *
+ * - `attach` is the container's ref. A callback ref, because the container mounts only after
+ *   getView answered, and the observer must follow it. Stable: React calls a ref again whenever
+ *   its identity changes.
+ * - `inlineCap` is the inline container's height cap, kept equal to the maxHeight the view is
+ *   told (a resize updates both).
+ * - `current()` reads the dimensions for a host context (the ui/initialize reply, or a display
+ *   mode request). It records nothing: most reads are not posted to the view.
+ * - `posted(message)` records the dimensions a message posted to the view carries (the
+ *   ui/initialize reply), so only what the view was actually sent counts as sent.
+ * - `flush()` sends dimensions that changed since: the host drops updates until the view sent
+ *   initialized, so a resize between the two is sent then.
+ */
+/** Record the containerDimensions a ui/initialize reply carries as sent, if `message` is one. */
+function rememberPostedDimensions(sent: { current: string }, message: unknown) {
+  const reply = message as { result?: { hostContext?: { containerDimensions?: unknown } } };
+  const dimensions = reply.result?.hostContext?.containerDimensions;
+  if (dimensions !== undefined) sent.current = JSON.stringify(dimensions);
+}
+
+function useContainerDimensionsUpdates(hostRef: { current: McpAppHost | null }, inline: boolean) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [container, setContainer] = useState<HTMLDivElement | null>(null);
+  const [inlineCap, setInlineCap] = useState(inlineMaxHeight);
+  const [attach] = useState(() => (element: HTMLDivElement | null) => {
+    containerRef.current = element;
+    setContainer(element);
+  });
+  const sent = useRef("");
+  const flushRef = useRef(() => undefined as void);
+  useEffect(() => {
+    const update = () => {
+      setInlineCap(inlineMaxHeight());
+      const containerDimensions = containerDimensionsOf(container, inline);
+      const next = JSON.stringify(containerDimensions);
+      if (next === sent.current) return;
+      if (hostRef.current?.sendHostContextChanged({ containerDimensions }) === true) {
+        sent.current = next;
+      }
+    };
+    flushRef.current = update;
+    window.addEventListener("resize", update);
+    const observer = typeof ResizeObserver === "function" ? new ResizeObserver(update) : null;
+    if (container != null) observer?.observe(container);
+    return () => {
+      window.removeEventListener("resize", update);
+      observer?.disconnect();
+    };
+  }, [hostRef, container, inline]);
+  return {
+    attach,
+    inlineCap,
+    current: () => containerDimensionsOf(containerRef.current, inline),
+    posted: (message: unknown) => rememberPostedDimensions(sent, message),
+    flush: () => flushRef.current(),
+  };
 }
 
 /** The domain prompt's text: the origins, and the project that keeps the approval. */
@@ -358,15 +440,6 @@ export function McpAppFrame(props: {
   const [domainsDismissed, setDomainsDismissed] = useState<string>();
   const { theme: themeMode } = useTheme();
   const theme: "light" | "dark" = isLightThemeMode(themeMode) ? "light" : "dark";
-  // The window.openai globals start with this host context. Fixed at mount: a theme change or
-  // a resize must not rebuild (reload) the view document; host-context-changed tells the view.
-  const [openAiSeed] = useState(() => ({
-    theme,
-    displayMode: props.variant === "inline" ? "inline" : "fullscreen",
-    locale: navigator.language,
-    platform: hostPlatform(),
-    maxHeight: props.variant === "inline" ? inlineMaxHeight() : null,
-  }));
   const [loaded, setLoaded] = useState<Loaded | null>(null);
   const [consent, setConsent] = useState<PendingConsent | null>(null);
   // Set synchronously with `consent`, so a request arriving before the re-render sees the strip.
@@ -374,8 +447,8 @@ export function McpAppFrame(props: {
   const consentArming = useConfirmArmed(consent?.id ?? null);
   const [height, setHeight] = useState<number | null>(null);
   const frameRef = useRef<HTMLIFrameElement | null>(null);
-  const containerRef = useRef<HTMLDivElement | null>(null);
   const hostRef = useRef<McpAppHost | null>(null);
+  const dimensions = useContainerDimensionsUpdates(hostRef, inline);
   const { workspaceId, view } = props;
   const { toolCallId, serverName, resourceUri } = view;
   // The view's host lives as long as its frame. The API is null while Xum reconnects and a new
@@ -471,12 +544,17 @@ export function McpAppFrame(props: {
   const documentKey = mcpAppViewDocumentKey(current, grant);
   const guard = useFrameNavigationGuard(documentKey);
   const { navigatedRef, leave: leaveDocument } = guard;
-  const viewDocument = useMcpAppViewDocument(documentKey, guard.frameKey);
-  // The document starts with this view instance's last widget state (mcpAppWidgetState.ts).
-  const srcDoc = buildMcpAppViewSrcDoc(current, grant, viewDocument, {
-    ...openAiSeed,
-    widgetState: widgetStateSeedOf(workspaceId, current, viewDocument),
-  });
+  // The window.openai globals start with this host context (useMcpAppViewDocument), and with
+  // this view instance's last widget state (mcpAppWidgetState.ts).
+  const viewDocument = useMcpAppViewDocument(documentKey, guard.frameKey, () => ({
+    theme,
+    displayMode: inline ? "inline" : "fullscreen",
+    locale: navigator.language,
+    platform: hostPlatform(),
+    maxHeight: inline ? inlineMaxHeight() : null,
+    widgetState: widgetStateSeedOf(workspaceId, current, null),
+  }));
+  const srcDoc = buildMcpAppViewSrcDoc(current, grant, viewDocument);
 
   // Values the long-lived host reads at message time.
   const latest = useRef({ theme, view, result: current?.view ?? null, onClose: props.onClose });
@@ -498,11 +576,7 @@ export function McpAppFrame(props: {
       // is the view's fullscreen, its tool card the inline mode. A move mounts a new instance.
       displayMode: inline ? "inline" : "fullscreen",
       availableDisplayModes: ["inline", "fullscreen"],
-      containerDimensions: {
-        width: containerRef.current?.clientWidth ?? 0,
-        // An inline container is as tall as the frame, so its own height is no limit.
-        maxHeight: inline ? inlineMaxHeight() : (containerRef.current?.clientHeight ?? 0),
-      },
+      containerDimensions: dimensions.current(),
       locale: navigator.language,
       timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       platform: hostPlatform(),
@@ -521,7 +595,9 @@ export function McpAppFrame(props: {
       grantedCsp: grant.granted,
       // Never into a frame that navigated away from the view (frameNavigationGuard.tsx).
       postToView: (message) => {
-        if (!navigatedRef.current) channel.post(message);
+        if (navigatedRef.current) return;
+        channel.post(message);
+        dimensions.posted(message);
       },
       getHostContext,
       callTool: async (toolName, args, consented) => {
@@ -597,6 +673,7 @@ export function McpAppFrame(props: {
         if (currentView.cancelled) {
           host.sendToolCancelled(currentView.failed ? "failed" : "interrupted");
         } else if (result?.resultAvailable) host.sendToolResult(result.result);
+        dimensions.flush();
       },
       // Fullscreen from the card opens (or focuses) the view's tab, which takes over as its one
       // live instance; inline from the tab closes the tab, and the view returns to its card.
@@ -747,9 +824,9 @@ export function McpAppFrame(props: {
       )}
       {guard.navigated && <FrameNavigatedNotice onReload={guard.reload} />}
       <div
-        ref={containerRef}
+        ref={dimensions.attach}
         className={inline ? "overflow-auto" : "min-h-0 flex-1 overflow-auto"}
-        style={inline ? { maxHeight: inlineMaxHeight() } : undefined}
+        style={inline ? { maxHeight: dimensions.inlineCap } : undefined}
       >
         {/* SECURITY AUDIT: MCP Apps view sink (see the component comment). sandbox stays exactly
             ARTIFACT_IFRAME_SANDBOX, srcdoc carries the view CSP meta first in <head>, and no
