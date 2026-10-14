@@ -4555,6 +4555,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "1. The variables its MCP configuration sets in `env`, plus `PLUGIN_ROOT` and `PLUGIN_DATA`.",
       "2. These host variables, when they are set: `HOME`, `LOGNAME`, `PATH`, `SHELL`, `USER`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `TZ` and `__CF_USER_TEXT_ENCODING`. On Windows, the core system variables (`PATH`, `PATHEXT`, `SYSTEMROOT`, `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `TEMP`, `TMP` and similar) and `HOME`.",
       "3. CA bundle paths: `SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `GIT_SSL_CAINFO`, `CARGO_HTTP_CAINFO`, `PIP_CERT`, `BUNDLE_SSL_CA_CERT`, `npm_config_cafile` and `NPM_CONFIG_CAFILE`.",
+      "4. Variables that Xum sets for every command it runs, so that tools do not wait for input: `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `EDITOR` and `VISUAL` set to `true`, and `GIT_TERMINAL_PROMPT` set to `0`. These values replace the same names in the plugin's `env`.",
       "",
       "Xum does not pass any other variable. This includes proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY`), because a proxy URL can contain a password. It also includes package-manager and version-manager variables such as `NVM_DIR`, `VOLTA_HOME`, `npm_config_registry`, `UV_*` and `XDG_CACHE_HOME`. A plugin server that starts through `npx` or `uvx` behind a proxy, or that needs a token, fails until it gets the variable another way.",
       "",

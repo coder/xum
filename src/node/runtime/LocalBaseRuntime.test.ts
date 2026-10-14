@@ -148,21 +148,26 @@ describe("LocalBaseRuntime.exec PATH handling", () => {
       process.env.MUX_VENDORED_BIN_DIR = vendoredBinDir;
       process.env.AGENT_BROWSER_SESSION = "mux-leaked-session";
 
-      const stream = await runtime.exec(
-        'printf "%s\\n" "${AGENT_BROWSER_SESSION-unset}" && mux-path-probe',
-        {
-          cwd: os.tmpdir(),
-          timeout: 5,
-          env: { PATH: `${vendoredBinDir}:${tempBinDir}:/usr/bin:/bin` },
-        }
-      );
-      const [stdout, exitCode] = await Promise.all([
-        readStreamAsString(stream.stdout),
-        stream.exitCode,
-      ]);
+      // #6509: the minimal host env drops the vendored-bin pointer, but PATH
+      // sanitization must still see it.
+      for (const hostEnv of ["inherit", "minimal"] as const) {
+        const stream = await runtime.exec(
+          'printf "%s\\n" "${AGENT_BROWSER_SESSION-unset}" && mux-path-probe',
+          {
+            cwd: os.tmpdir(),
+            timeout: 5,
+            env: { PATH: `${vendoredBinDir}:${tempBinDir}:/usr/bin:/bin` },
+            hostEnv,
+          }
+        );
+        const [stdout, exitCode] = await Promise.all([
+          readStreamAsString(stream.stdout),
+          stream.exitCode,
+        ]);
 
-      expect(exitCode).toBe(0);
-      expect(stdout.trim()).toBe("unset\ncaller-path");
+        expect(exitCode).toBe(0);
+        expect(stdout.trim()).toBe("unset\ncaller-path");
+      }
     } finally {
       if (originalVendoredBinDir == null) {
         delete process.env.MUX_VENDORED_BIN_DIR;

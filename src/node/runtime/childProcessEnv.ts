@@ -52,9 +52,17 @@ export function sanitizeXumChildPath(
   return sanitizedEntries.join(path.delimiter);
 }
 
-export function sanitizeXumChildEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+/**
+ * `pointerEnv` is where the vendored-bin pointer is looked up. It defaults to
+ * `env`; pass the full host env when `env` is a reduced base (#6509), which
+ * drops the pointer but must still lose the vendored PATH entries.
+ */
+export function sanitizeXumChildEnv(
+  env: NodeJS.ProcessEnv,
+  pointerEnv: NodeJS.ProcessEnv = env
+): NodeJS.ProcessEnv {
   const sanitizedEnv: NodeJS.ProcessEnv = { ...env };
-  const sanitizedPath = sanitizeXumChildPath(env.PATH ?? env.Path, env);
+  const sanitizedPath = sanitizeXumChildPath(env.PATH ?? env.Path, pointerEnv);
 
   for (const key of CHILD_ENV_KEYS_TO_STRIP) {
     delete sanitizedEnv[key];
