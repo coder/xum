@@ -584,6 +584,26 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     expect(updateWorkspaceTitleMock.mock.calls).toEqual([[workspaceId, "Renamed"]]);
   });
 
+  it("reports an emptied title in the shared toast when the workspace changes under the field", async () => {
+    const toast = spyOn(FeedbackToastModule, "showFeedbackToast").mockImplementation(
+      () => undefined
+    );
+    const view = render(<WorkspaceMenuBar {...defaultProps} />);
+    act(() => {
+      menuAction("editTitle")?.(document.body);
+    });
+    await typeTitle(view.getByTestId("workspace-title-input"), "{Backspace}");
+
+    view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
+
+    expect(updateWorkspaceTitleMock).not.toHaveBeenCalled();
+    expect(toast).toHaveBeenCalledWith({
+      type: "error",
+      title: "Could not rename the workspace",
+      message: "Title cannot be empty",
+    });
+  });
+
   // StrictMode mounts effects twice in development: the first unmount must not save or close.
   it("keeps the field open under StrictMode's dev remount", () => {
     const view = render(

@@ -189,7 +189,8 @@ function useTitleDraft(props: WorkspaceHeaderTitleInputProps) {
     if (phaseRef.current !== "editing") return;
     const title = draft.trim();
     if (title === props.initialTitle.trim()) return finish();
-    if (!title) return showError("Title cannot be empty");
+    // After a workspace switch this runs with the field gone: the toast must say why (Codex on #6461).
+    if (!title) return reportSaveError(mountedRef.current, "Title cannot be empty", showError);
     phaseRef.current = "saving";
     const result = await updateWorkspaceTitle(props.workspaceId, title);
     if (result.success) return finish();
