@@ -1,6 +1,18 @@
 import { createAssistantMessageId } from "@/node/services/utils/messageIds";
-import { eventSpine, type RequestAssemblySnapshot } from "./events/eventSpine";
+import {
+  eventSpine,
+  type RequestAssemblySnapshot,
+  type TurnStopContext,
+} from "./events/eventSpine";
+import { codexPluginHookService } from "./agentPlugins/codexHookService";
 import { prepareWorkspaceRequestHooks } from "./agentPlugins/requestHooks";
+import {
+  runMessageSendHooks,
+  runTurnStopHooks,
+  type MessageSendHookInput,
+  type MessageSendHookOutcome,
+  type TurnStopHookOutcome,
+} from "./agentPlugins/promptHooks";
 import * as path from "path";
 import { EventEmitter } from "events";
 import * as fs from "fs/promises";
@@ -494,8 +506,74 @@ export class AIService extends EventEmitter {
       metadata: metadata.data,
       hostCheckoutRoot: runtimeContext.data.hostCheckoutRoot,
       journal: this.durableEventJournalFor(workspaceId),
+      mcpServerManager: this.turnRequestBuilderBindings.mcpServerManager,
     });
     return Ok(eventSpine.captureRequestAssembly(workspaceId));
+  }
+
+  hasMessageSendHooks(): boolean {
+    return eventSpine.hasMiddleware("message.send");
+  }
+
+  /**
+   * Run the message.send prompt-hook chain for one new message (fail-open). Loads the
+   * workspace's lazy hooks first (the same setup as request building), so the first send after a
+   * restart sees them too.
+   */
+  async runMessageSendHooks(
+    workspaceId: string,
+    input: MessageSendHookInput,
+    cancelSignal?: AbortSignal
+  ): Promise<MessageSendHookOutcome> {
+    const snapshot = await this.captureRequestAssemblySnapshot(workspaceId).catch(
+      (error: unknown) => {
+        log.warn("Prompt hooks: hook setup failed; running the hooks already loaded", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+        return null;
+      }
+    );
+    if (snapshot?.success === false) {
+      log.debug("Prompt hooks: hook setup skipped", { workspaceId, error: snapshot.error });
+    }
+    // Codex UserPromptSubmit hooks call their plugin's MCP server, which the turn only starts
+    // after this chain: start it first (the turn's own startup, bounded), or the first prompt
+    // after a restart misses the hooks. A canceled send ends this wait; the hooks still run, so a
+    // send whose cancellation is disabled cannot skip them.
+    await codexPluginHookService.prepareForPromptHooks(
+      workspaceId,
+      (signal) => this.turnRequestBuilder.startWorkspaceMcpServers(workspaceId, signal),
+      cancelSignal
+    );
+    // After the setup above, so the check sees the hooks it loaded.
+    const cwd = eventSpine.hasMiddleware("message.send")
+      ? await this.resolvePromptHookCwd(workspaceId)
+      : undefined;
+    return runMessageSendHooks(eventSpine, workspaceId, { ...input, cwd });
+  }
+
+  /** Run the turn.stop prompt-hook chain for one finished turn (fail-open). */
+  async runTurnStopHooks(
+    workspaceId: string,
+    input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive">
+  ): Promise<TurnStopHookOutcome> {
+    const cwd = eventSpine.hasMiddleware("turn.stop")
+      ? await this.resolvePromptHookCwd(workspaceId)
+      : undefined;
+    return runTurnStopHooks(eventSpine, workspaceId, { ...input, cwd });
+  }
+
+  /** The workspace path prompt hooks see as `cwd` (the tools' cwd); undefined when unreadable. */
+  private async resolvePromptHookCwd(workspaceId: string): Promise<string | undefined> {
+    try {
+      const metadata = await this.getWorkspaceMetadata(workspaceId);
+      if (!metadata.success) return undefined;
+      const context = this.createWorkspaceRuntimeContext(workspaceId, metadata.data);
+      return context.success ? context.data.workspacePath : undefined;
+    } catch {
+      return undefined; // fail open: the hook runs without cwd
+    }
   }
 
   releaseMockStreamStartGate(workspaceId: string): void {

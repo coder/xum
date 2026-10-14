@@ -75,6 +75,9 @@ const CLAUDE_SKILLS_ROOT = "~/.claude/skills";
 // Agent Plugins containers: discovery-only, host-local, lowest precedence
 // within each scope. Write tools never target plugin roots.
 const UNIVERSAL_PLUGINS_ROOT = UNIVERSAL_AGENT_PLUGINS_CONTAINER;
+// Host Xum home in tilde form: the host LocalRuntime maps it to the configured
+// home (XUM_ROOT, dev suffix) when plugin containers are resolved.
+const HOST_XUM_HOME = "~/.xum";
 
 export interface AgentSkillsRoots {
   projectRoot: string;
@@ -94,6 +97,12 @@ export interface AgentSkillsRoots {
   projectPluginRoots?: string[];
   /** Agent Plugins container dirs, e.g. ~/.xum/plugins (read-only). */
   globalPluginRoots?: string[];
+  /**
+   * Host Xum home that owns the plugin registry (import receipts). When absent,
+   * it is derived from globalRoot, which is only valid when globalRoot is a host
+   * path. Remote runtimes set it because their globalRoot can be a remote path.
+   */
+  pluginManagedHome?: string;
 }
 
 function getProjectDirectories(
@@ -179,8 +188,12 @@ export function getDefaultAgentSkillsRoots(
     // Claude roots are added only when the experiment is enabled so the default
     // (off) behavior stays byte-identical to the pre-experiment scan order.
     ...(options?.includeClaudeSkills ? { globalClaudeRoot: CLAUDE_SKILLS_ROOT } : {}),
-    // Agent Plugins discovery is host-filesystem-only (v1), so remote runtimes
-    // never get plugin containers.
+    // Agent Plugins discovery reads the host filesystem only. Remote runtimes
+    // (SSH/Docker) get the GLOBAL host plugin containers, read through a host
+    // LocalRuntime, so a plugin installed on the Xum host works in every
+    // workspace. They get no project plugin containers: a remote checkout is
+    // not on the host filesystem. The registry owner is the host Xum home,
+    // never a path derived from the remote globalRoot (Docker: /var/mux).
     ...(!(runtime instanceof RemoteRuntime)
       ? {
           projectPluginRoots: [
@@ -191,7 +204,10 @@ export function getDefaultAgentSkillsRoots(
           ],
           globalPluginRoots: [`${runtime.getXumHome()}/plugins`, UNIVERSAL_PLUGINS_ROOT],
         }
-      : {}),
+      : {
+          globalPluginRoots: [`${HOST_XUM_HOME}/plugins`, UNIVERSAL_PLUGINS_ROOT],
+          pluginManagedHome: HOST_XUM_HOME,
+        }),
   };
 }
 
@@ -292,6 +308,11 @@ async function buildPluginScanCandidates(args: {
   return candidates;
 }
 
+/** Host Xum home that owns the plugin registry; see AgentSkillsRoots.pluginManagedHome. */
+function getPluginManagedHome(roots: AgentSkillsRoots): string | undefined {
+  return roots.pluginManagedHome ?? (roots.globalRoot ? path.dirname(roots.globalRoot) : undefined);
+}
+
 async function buildScanCandidates(
   runtime: Runtime,
   workspacePath: string,
@@ -300,7 +321,7 @@ async function buildScanCandidates(
 ): Promise<AgentSkillScanCandidate[]> {
   const globalRuntime = resolveGlobalRuntime(runtime, workspacePath);
   // Both scans can encounter the configured home, e.g. a project rooted at the user's home.
-  const managedHome = roots.globalRoot ? path.dirname(roots.globalRoot) : undefined;
+  const managedHome = getPluginManagedHome(roots);
 
   // Plugin skills sit at the lowest precedence within each scope, after the
   // standard (and .claude compat) roots of that scope.

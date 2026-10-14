@@ -22,6 +22,9 @@ import assert from "node:assert";
 import type { Tool } from "ai";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
+import { extractToolJsonSchema } from "@/common/utils/tools/extractToolJsonSchema";
+import { readMcpToolOrigin } from "@/node/services/agentPlugins/codexToolNames";
+import { unsanitizedTool } from "@/common/utils/tools/schemaSanitizer";
 import type { Runtime } from "@/node/runtime/Runtime";
 import type { WithHookOutput, MayHaveHookOutput } from "@/common/types/tools";
 import {
@@ -135,6 +138,9 @@ export function withHooks<TParameters, TResult>(
       args,
       config,
       abortSignal,
+      // The full schema: OpenAI requests carry a sanitized copy that drops constraints.
+      inputJsonSchema: () => extractToolJsonSchema(unsanitizedTool(tool)),
+      mcpOrigin: readMcpToolOrigin(tool),
       execute: (currentArgs) =>
         Promise.resolve(executeFn.call(tool, currentArgs, options) as TResult | Promise<TResult>),
     });
@@ -164,6 +170,10 @@ export async function runThroughToolHookPipeline<TArgs, TResult>(input: {
   args: TArgs;
   config: HookConfig;
   abortSignal?: AbortSignal;
+  /** See ToolExecuteContext.inputJsonSchema. */
+  inputJsonSchema?: () => unknown;
+  /** See ToolExecuteContext.mcpOrigin. */
+  mcpOrigin?: { serverName: string; toolName: string };
   execute: (args: TArgs) => Promise<TResult>;
 }): Promise<ToolHookPipelineOutcome<TResult>> {
   const { toolName, config } = input;
@@ -180,6 +190,8 @@ export async function runThroughToolHookPipeline<TArgs, TResult>(input: {
       env: config.env,
     },
     abortSignal: input.abortSignal,
+    ...(input.inputJsonSchema != null ? { inputJsonSchema: input.inputJsonSchema } : {}),
+    ...(input.mcpOrigin != null ? { mcpOrigin: input.mcpOrigin } : {}),
     executed: false,
   };
 
@@ -197,6 +209,11 @@ export async function runThroughToolHookPipeline<TArgs, TResult>(input: {
     ctx.executed,
     `tool.execute middleware for ${toolName} neither executed nor blocked the tool`
   );
+  // A post hook blocked the output: the result is its feedback (what the model sees, unchanged
+  // for an ordinary tool call), and a nested caller must not use the output it captured.
+  if (ctx.postBlocked) {
+    return { blocked: true, result: ctx.result };
+  }
   return { blocked: false, result: ctx.result as TResult };
 }
 

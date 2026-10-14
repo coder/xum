@@ -80,7 +80,9 @@ function InstructionsTabImpl(props: InstructionsTabProps) {
       <div className="min-h-0 flex-1 overflow-y-auto">
         <ChatInstructionsPanel workspaceId={props.workspaceId} />
         {error && <ErrorBanner message={error} />}
-        {!error && !loading && data?.files.length === 0 && <EmptyState />}
+        {/* Not gated on `loading`: a reload (refresh, or a new API client after a reconnect)
+            keeps the empty state on screen, as it keeps a file list. */}
+        {!error && data?.files.length === 0 && <EmptyState />}
         {data && data.files.length > 0 && <InstructionsBody data={data} />}
         {loading && !data && <LoadingState />}
       </div>

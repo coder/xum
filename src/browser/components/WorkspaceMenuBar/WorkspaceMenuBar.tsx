@@ -58,14 +58,16 @@ import { WorkspaceActionsMenuContent } from "../WorkspaceActionsMenuContent/Work
 import {
   forkWorkspaceFromMenu,
   getErrorAnchor,
+  requestGenerateWorkspaceTitle,
   stopWorkspaceRuntime,
 } from "../WorkspaceActionsMenuContent/workspaceActionHandlers";
+import { useHeaderTitleEdit, WorkspaceHeaderTitle } from "./WorkspaceHeaderTitle";
 import { WorkspaceTerminalIcon } from "../icons/WorkspaceTerminalIcon/WorkspaceTerminalIcon";
 import { ArchiveIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 
 import { SkillIndicator } from "../SkillIndicator/SkillIndicator";
 import { WorkspaceLinks } from "../WorkspaceLinks/WorkspaceLinks";
-import { useAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
 
 import { useWorkspaceActions, useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
@@ -150,7 +152,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   onOpenSidebar,
   sidebarFullscreen = false,
 }) => {
-  const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const { preflightArchiveWorkspace, archiveWorkspace, archivingWorkspaceIds, setWorkspacePinned } =
     useWorkspaceActions();
   const isArchiving = archivingWorkspaceIds.has(workspaceId);
@@ -198,6 +200,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const moreActionsButtonRef = useRef<HTMLButtonElement | null>(null);
   const menuBarRef = useRef<HTMLDivElement | null>(null);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
+  const titleEdit = useHeaderTitleEdit(workspaceId, moreActionsButtonRef);
   const archiveError = usePopoverError();
   const forkError = usePopoverError();
   const stopRuntimeError = usePopoverError();
@@ -482,12 +485,12 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
 
   const handleForkWorkspace = async (anchorEl: HTMLElement) => {
     const anchor = getErrorAnchor(anchorEl);
-    const error = await forkWorkspaceFromMenu(api, workspaceId);
+    const error = await forkWorkspaceFromMenu(liveApi, workspaceId);
     if (error) forkError.showError(workspaceId, error, anchor);
   };
 
   const handleStopRuntime = async () => {
-    const error = await stopWorkspaceRuntime(api, runtimeStatusStore, workspaceId);
+    const error = await stopWorkspaceRuntime(liveApi, runtimeStatusStore, workspaceId);
     if (error) {
       stopRuntimeError.showError(workspaceId, error, getErrorAnchor(moreActionsButtonRef.current));
     }
@@ -627,6 +630,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         onClick={(event: React.MouseEvent<HTMLDivElement>) => {
           event.stopPropagation();
         }}
+        onCloseAutoFocus={titleEdit.onMenuCloseAutoFocus}
       >
         {/* Keep MCP configuration in the more actions menu to keep the workspace menu bar lean. */}
         <WorkspaceActionsMenuContent
@@ -640,6 +644,8 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
             isRightSidebarHidden: timelineSidebarHidden,
           }}
           actions={{
+            editTitle: titleEdit.start,
+            generateTitle: () => requestGenerateWorkspaceTitle(workspaceId),
             configureMcp: () => setMcpModalOpen(true),
             configureHeartbeat: () => setHeartbeatModalOpen(true),
             configureMessaging: () => setUnrelatedMessagingWorkspaceId(workspaceId),
@@ -707,9 +713,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
             <TooltipContent>Open sidebar ({formatKeybind(KEYBINDS.TOGGLE_SIDEBAR)})</TooltipContent>
           </Tooltip>
         )}
-        <span className="min-w-0 truncate text-sm" data-testid="workspace-title">
-          {workspaceTitle ?? workspaceName}
-        </span>
+        <WorkspaceHeaderTitle
+          workspaceId={workspaceId}
+          title={workspaceTitle ?? workspaceName}
+          edit={titleEdit}
+        />
         {/* Touch and keyboard users need a focusable control for workspace details. */}
         <Popover open={detailsPopoverOpen} onOpenChange={setDetailsPopoverOpen}>
           <Tooltip

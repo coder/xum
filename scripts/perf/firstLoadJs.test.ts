@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
+import { FIRST_RUN_MODULES_ID } from "./firstLoadJs";
 
 const SCRIPT = path.join(import.meta.dir, "firstLoadJs.ts");
 const FIXTURE = path.join(import.meta.dir, "fixtures", "firstLoadJs");
@@ -73,5 +74,54 @@ describe("firstLoadJs", () => {
     const noMap = await runScript([dir, "--forbid", "node_modules/lazy-only/"]);
     expect(noMap.exitCode).toBe(2);
     expect(noMap.stderr).toContain("deep-EEEEEEEE.js has no source map");
+  });
+
+  // Catches a deferred-list reader that changes today's result: for example, one that fails when an
+  // index.html has no deferred list, or adds roots that the module script and preloads do not have.
+  test("a normal index.html without a deferred module list keeps today's report", async () => {
+    const { exitCode, stdout, stderr } = await runScript([dir]);
+    expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+    expect(stdout).toBe(
+      [
+        "file                    raw KiB      br KiB      gz KiB ",
+        "main-AAAAAAAA.js            0.3         0.3*        0.3*",
+        "shared-BBBBBBBB.js          0.1         0.1*        0.1*",
+        "deep-EEEEEEEE.js            0.0         0.0*        0.0*",
+        "total (3 files)             0.4         0.4         0.4 ",
+        "* no precompressed sibling: xum server sends the raw file",
+        "",
+      ].join("\n")
+    );
+  });
+
+  // Catches a reader that ignores the early script's deferred list (T3 C step 2, PR 4b): the
+  // served "/" then has no module script, and the tool would fail or count nothing.
+  test("the early script's deferred module list gives the same first load", async () => {
+    const normal = JSON.parse((await runScript([dir, "--json"])).stdout) as { files: unknown };
+    const list = JSON.stringify({
+      script: "./main-AAAAAAAA.js",
+      preload: ["./shared-BBBBBBBB.js"],
+    });
+    await fs.writeFile(
+      path.join(dir, "index.html"),
+      `<!doctype html><html><head><script>window.__boot = true;</script>` +
+        `<script type="application/json" id="${FIRST_RUN_MODULES_ID}">${list}</script>` +
+        `<link rel="stylesheet" href="./main-DDDDDDDD.css" /></head><body></body></html>`
+    );
+    const deferred = await runScript([dir, "--json"]);
+    expect(deferred.exitCode, deferred.stderr).toBe(0);
+    expect((JSON.parse(deferred.stdout) as { files: unknown }).files).toEqual(normal.files);
+  });
+
+  // Catches a reader that trusts any JSON: a list of the wrong shape must stop the run (exit 2),
+  // not report a first load without the app's entry.
+  test("a deferred module list of the wrong shape is unusable input", async () => {
+    await fs.writeFile(
+      path.join(dir, "index.html"),
+      `<script type="application/json" id="${FIRST_RUN_MODULES_ID}">{"script":["./main-AAAAAAAA.js"]}</script>`
+    );
+    const bad = await runScript([dir]);
+    expect(bad.exitCode).toBe(2);
+    expect(bad.stderr).toContain(FIRST_RUN_MODULES_ID);
   });
 });

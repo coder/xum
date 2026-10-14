@@ -11,6 +11,7 @@ import {
   type CompactionFollowUpRequest,
   type MuxMessage,
   type MuxMessageMetadata,
+  type PluginHookContextEntry,
 } from "@/common/types/message";
 import type { GoalSyntheticMessageKind, TaskTurnKind } from "@/constants/goals";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
@@ -27,6 +28,9 @@ export function buildAutoCompactionFollowUp(params: {
   muxMetadata?: MuxMessageMetadata;
   workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
   autoModelRouting?: AutoModelRoutingRecord;
+  /** The diverted send already ran the message.send prompt hooks (see the field doc). */
+  pluginSendHooksApplied?: true;
+  pluginHookContext?: PluginHookContextEntry[];
 }): CompactionFollowUpRequest {
   const followUp: CompactionFollowUpRequest = {
     text: params.messageText,
@@ -68,6 +72,14 @@ export function buildAutoCompactionFollowUp(params: {
 
   if (params.autoModelRouting) {
     followUp.autoModelRouting = params.autoModelRouting;
+  }
+
+  if (params.pluginSendHooksApplied === true) {
+    followUp.pluginSendHooksApplied = true;
+  }
+
+  if (params.pluginHookContext != null && params.pluginHookContext.length > 0) {
+    followUp.pluginHookContext = params.pluginHookContext;
   }
 
   return followUp;

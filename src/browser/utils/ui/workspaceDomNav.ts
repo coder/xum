@@ -27,6 +27,14 @@ export function getVisibleWorkspaceIds(): string[] {
 }
 
 /**
+ * The sidebar renders this workspace's row: its sidebar is open and no collapsed project or
+ * section hides it. F2 edits the title in that row, else in the workspace header (#6328).
+ */
+export function isWorkspaceRowRendered(workspaceId: string): boolean {
+  return getVisibleWorkspaceIds().includes(workspaceId);
+}
+
+/**
  * Given a workspace that is about to be removed (archived / deleted), return
  * the ID of the workspace the user should land on next.
  *

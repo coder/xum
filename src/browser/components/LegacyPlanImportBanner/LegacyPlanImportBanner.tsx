@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { FileInput, Loader2 } from "lucide-react";
 import { ChatDockSurface } from "@/browser/components/ChatPane/chatDockColumn";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useOptionalCommandRegistry } from "@/browser/contexts/CommandRegistryContext";
 import { useOptionalWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import { refetchPostCompactionState } from "@/browser/hooks/usePostCompactionState";
@@ -26,7 +26,7 @@ export interface LegacyPlanImportNoticeProps {
  * The backend copies it (never replacing an existing plan) and leaves the legacy file in place.
  */
 export const LegacyPlanImportNotice: React.FC<LegacyPlanImportNoticeProps> = (props) => {
-  const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const registerSource = useOptionalCommandRegistry()?.registerSource;
   const [importing, setImporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -39,7 +39,7 @@ export const LegacyPlanImportNotice: React.FC<LegacyPlanImportNoticeProps> = (pr
 
   const importPlan = async () => {
     if (inFlightRef.current) return;
-    if (!api) {
+    if (!liveApi) {
       setError("Not connected to the backend");
       return;
     }
@@ -47,7 +47,7 @@ export const LegacyPlanImportNotice: React.FC<LegacyPlanImportNoticeProps> = (pr
     setImporting(true);
     setError(null);
     try {
-      const result = await api.workspace.importLegacyPlan({ workspaceId: props.workspaceId });
+      const result = await liveApi.workspace.importLegacyPlan({ workspaceId: props.workspaceId });
       if (!result.success) {
         setError(result.error);
       } else if (result.data.status === "nothing_to_import") {

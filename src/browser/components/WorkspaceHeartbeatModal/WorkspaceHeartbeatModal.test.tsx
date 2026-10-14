@@ -119,6 +119,7 @@ describe("WorkspaceHeartbeatModal", () => {
             ? createHeartbeatSettings()
             : (settingsByWorkspaceId.get(workspaceId) ?? createHeartbeatSettings()),
         isLoading: hookIsLoading,
+        isReloading: false,
         isSaving: hookIsSaving,
         error: hookError,
         globalDefaultPrompt: undefined,

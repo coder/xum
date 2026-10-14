@@ -373,6 +373,26 @@ describe("StreamManager - fallback construction callbacks", () => {
 });
 
 describe("StreamManager - default refusal fallback chains", () => {
+  test("an error after a fallback swap names the fallback model", async () => {
+    // AgentSession plans the compaction context_exceeded retry from this model: the fallback's
+    // window was the one too small, not the refused model's.
+    const { prepare, chain } = preparedFallback();
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: scriptedStreamText([
+        { chunks: [REFUSAL_FINISH], usage: NO_USAGE },
+        { chunks: [{ type: "error", error: new Error("prompt is too long") }], usage: NO_USAGE },
+      ]),
+    });
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId: "ws-fallback-error-model",
+      modelString: KNOWN_MODELS.SONNET.id,
+      modelFallback: { chain, prepare },
+    });
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(completion.status).toBe("failed");
+    expect(completion.status === "failed" ? completion.streamError.model : null).toBe(chain[0]);
+  });
+
   test("a refused Sonnet 5.5 turn recovers on Sonnet 5 through the shipped default chain", async () => {
     // Anthropic's own server-side cyber fallback for Sonnet 5.5 retries on
     // Sonnet 5 (#5087); the shipped client-side chain mirrors it.

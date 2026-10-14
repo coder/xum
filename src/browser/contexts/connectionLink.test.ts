@@ -313,6 +313,15 @@ describe("ConnectionLink", () => {
       expect(isConnectionLostError(thrown.value)).toBe(true);
     });
 
+    test("throw() after detach() throws the given error at once", async () => {
+      const { link, iterator } = await openHangingStream();
+      link.detach();
+      const failure = new Error("consumer failed");
+      const thrown = settleState(iterator.throw!(failure));
+      await flush();
+      expect(thrown).toEqual({ status: "rejected", value: failure });
+    });
+
     test("a stream that opens after detach() is returned, not leaked", async () => {
       const link = new ConnectionLink();
       const inner = controlledLink();

@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { useAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyCompactionOverrides } from "@/browser/utils/messages/compactionOptions";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
@@ -36,7 +36,7 @@ export function useResumeStream(
   messages: DisplayedMessage[],
   agentId?: string
 ): UseResumeStreamResult {
-  const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const [error, setError] = useState<string | null>(null);
   const [isResuming, setIsResuming] = useState(false);
 
@@ -54,7 +54,7 @@ export function useResumeStream(
   }
 
   const resume = async (): Promise<void> => {
-    if (!api) {
+    if (!liveApi) {
       setError("Not connected to server");
       return;
     }
@@ -81,7 +81,7 @@ export function useResumeStream(
         options = applyCompactionOverrides(options, lastUserMessage.compactionRequest.parsed);
       }
 
-      const result = await api.workspace.resumeStream({ workspaceId, options });
+      const result = await liveApi.workspace.resumeStream({ workspaceId, options });
       if (!result.success) {
         const formatted = formatSendMessageError(result.error);
         applyIfCurrent(() =>

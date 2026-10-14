@@ -16,6 +16,8 @@ import {
 } from "@/node/runtime/streamUtils";
 import { MAX_FILE_SIZE, resolvePathWithinCwd, validateFileSize } from "./fileCommon";
 import { KERNEL_LOAD_PREVIEW_CHARS } from "@/constants/kernelOutput";
+import { extractToolJsonSchema } from "@/common/utils/tools/extractToolJsonSchema";
+import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { runThroughToolHookPipeline, type HookConfig } from "./withHooks";
 
 /** Full content + bounded model-visible summary of one loaded file. */
@@ -47,6 +49,27 @@ export type KernelFileLoader = (args: {
    */
   abortSignal?: AbortSignal;
 }) => Promise<KernelLoadedFile>;
+
+/** file_read's input schema without its range fields: the arguments mux.load can honor. */
+function kernelLoadInputJsonSchema(): unknown {
+  const schema = extractToolJsonSchema({ inputSchema: TOOL_DEFINITIONS.file_read.schema });
+  assert(
+    typeof schema === "object" && schema !== null && "properties" in schema,
+    "file_read has an object input schema"
+  );
+  const {
+    offset: _offset,
+    limit: _limit,
+    ...properties
+  } = schema.properties as Record<string, unknown>;
+  const required = "required" in schema && Array.isArray(schema.required) ? schema.required : [];
+  return {
+    ...schema,
+    properties,
+    required: required.filter((name: unknown) => name !== "offset" && name !== "limit"),
+    additionalProperties: false,
+  };
+}
 
 /**
  * Build the loader from the same cwd/runtime pair the file tools use, so
@@ -138,6 +161,11 @@ export function createKernelFileLoader(config: {
       args: { path },
       config: hooks,
       abortSignal,
+      // file_read's own schema: a hook's allowed rewrite is checked against it, as for the tool.
+      // Path only: the load always reads the whole file, so a rewrite that narrows the read to
+      // a range must fail validation (and so be denied) instead of loading the whole file anyway
+      // (Codex PRRT_kwDOPxxmWM6rb3ih).
+      inputJsonSchema: kernelLoadInputJsonSchema,
       execute: async (currentArgs) => {
         // Middleware may rewrite args; honor the rewritten path, but never
         // read from a shape a middleware corrupted.

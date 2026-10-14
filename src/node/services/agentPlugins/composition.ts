@@ -35,9 +35,11 @@ export interface BuildWorkspaceCompositionArgs {
   /**
    * Host checkout root anchoring plugin containers, or null for off-host
    * runtimes (SSH/Docker). Plugin discovery is host-filesystem-only and
-   * production never loads plugin containers off-host, so a null suppresses
-   * it — passing the remote workspacePath instead would report host files
-   * production never loads.
+   * production loads no project plugin containers off-host, so a null
+   * suppresses the plugin summaries (MCP servers, slash commands, hooks) —
+   * passing the remote workspacePath instead would report host files
+   * production never loads. Global host plugin skills and agents still load
+   * off-host, and the runtime-based skill/agent loaders below report them.
    */
   hostCheckoutRoot: string | null;
   xumHome: string;
@@ -159,7 +161,8 @@ export async function buildWorkspaceComposition(
   // below intentionally keep execution-path defaults — production derives
   // their plugin containers from the discovery path, so checkout-anchoring
   // them here would report artifacts production never loads. Like production,
-  // these runtime-based loaders skip plugin roots for RemoteRuntime only.
+  // these runtime-based loaders give RemoteRuntime only the global host plugin
+  // roots (no project plugin roots).
   const defaultSkillRoots =
     args.hostCheckoutRoot != null
       ? getDefaultAgentSkillsRoots(args.runtime, args.workspacePath)

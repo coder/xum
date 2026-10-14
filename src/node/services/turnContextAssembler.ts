@@ -22,6 +22,7 @@ import {
 import type { Instructions, ModelMessage, SystemModelMessage, Tool } from "ai";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { excludeKeepRecentTailForCompactionRequest } from "@/common/utils/messages/keepRecentTail";
+import type { CountCompactionRowTokens } from "@/common/utils/messages/compactionRowSizing";
 import { trimCompactionInput } from "@/common/utils/messages/trimCompactionInput";
 import { createCompactionRowCounter, projectCompactionInput } from "./compactionInputSizing";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
@@ -81,6 +82,7 @@ import {
   type AnthropicCacheTtl,
 } from "@/common/utils/ai/cacheStrategy";
 import { prepareMessagesForProvider } from "./messagePipeline";
+import { renderPluginHookContextForProvider } from "@/node/utils/messages/renderPluginHookContextForProvider";
 
 const keepContextRow = (message: MuxMessage) =>
   !isModelHiddenMessage(message) && !message.metadata?.contextBudgetRejected;
@@ -286,16 +288,32 @@ function tagUserRowsWithHistoryItemIds(messages: MuxMessage[]): MuxMessage[] {
 async function trimToCompactionInputBudget(
   messages: MuxMessage[],
   budgetTokens: number | undefined,
-  modelString: string
+  modelString: string,
+  requestContextMessage: MuxMessage | undefined
 ): Promise<MuxMessage[]> {
   if (budgetTokens == null) return messages;
+  const countRow = createCompactionRowCounter(modelString);
   const sized = projectCompactionInput(messages);
   const trim = await trimCompactionInput(
     sized,
-    budgetTokens,
-    createCompactionRowCounter(modelString)
+    await historyShareOfBudget(budgetTokens, requestContextMessage, countRow),
+    countRow
   );
   return trim.messages === sized ? messages : trim.messages;
+}
+
+/**
+ * The request-only context (MCP Apps) is inserted after the trim but sent with the history, so
+ * it takes its share of the budget first. At least 1 token is left: the trim then cuts all it
+ * can, and the context_exceeded retry decides the rest.
+ */
+async function historyShareOfBudget(
+  budgetTokens: number,
+  requestContextMessage: MuxMessage | undefined,
+  countRow: CountCompactionRowTokens
+): Promise<number> {
+  const contextTokens = requestContextMessage ? await countRow(requestContextMessage) : 0;
+  return Math.max(1, budgetTokens - contextTokens);
 }
 
 export async function assemblePromptPayload(
@@ -306,10 +324,20 @@ export async function assemblePromptPayload(
     options.providerForMessages,
     options.effectiveThinkingLevel
   );
+  // Prompt-hook context renders BEFORE the compaction trim: the trim counts each row's parts, not
+  // its metadata, so unrendered context (up to PLUGIN_HOOK_CONTEXT_MAX_CHARS per user row) would
+  // pass the budget and then grow the request past it in messagePipeline. Rendered rows drop
+  // the metadata, so messagePipeline's own pass renders nothing twice. It also renders before the
+  // token-budget [id: ...] tag, which must stay last.
+  const renderHookContextFirst =
+    options.compactionInputBudgetTokens != null || options.tagHistoryItemIds === true;
   const providerRequestMessages = await trimToCompactionInputBudget(
-    prepared.providerRequestMessages,
+    renderHookContextFirst
+      ? renderPluginHookContextForProvider(prepared.providerRequestMessages)
+      : prepared.providerRequestMessages,
     options.compactionInputBudgetTokens,
-    options.modelString
+    options.modelString,
+    options.requestContextMessage
   );
   let messages = await prepareMessagesForProvider({
     messagesWithSentinel: addInterruptedSentinel(

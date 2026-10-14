@@ -1,14 +1,16 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { CopyButton } from "../CopyButton/CopyButton";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "../Dialog/Dialog";
 import { DetailContent } from "@/browser/features/Tools/Shared/ToolPrimitives";
 import { useAPI } from "@/browser/contexts/API";
 import { useBackgroundProcesses } from "@/browser/stores/BackgroundBashStore";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import {
   appendLiveBashOutputChunk,
   type LiveBashOutputInternal,
 } from "@/browser/utils/messages/liveBashOutputBuffer";
 import { BASH_TRUNCATE_MAX_TOTAL_BYTES } from "@/common/constants/toolLimits";
+import { getErrorMessage } from "@/common/utils/errors";
 
 const BACKGROUND_BASH_INITIAL_TAIL_BYTES = 64_000;
 const BACKGROUND_BASH_POLL_INTERVAL_MS = 500;
@@ -47,10 +49,24 @@ export const BackgroundBashOutputDialog: React.FC<BackgroundBashOutputDialogProp
         )}
       </DialogHeader>
 
-      <BackgroundBashOutputViewer workspaceId={props.workspaceId} processId={props.processId} />
+      {/* Keyed by the process, so another process starts from an empty viewer, while a new API
+          client (a reconnect) only re-runs the viewer's read and keeps the output it shows. */}
+      <BackgroundBashOutputViewer
+        key={`${props.workspaceId}:${props.processId}`}
+        workspaceId={props.workspaceId}
+        processId={props.processId}
+      />
     </DialogContent>
   </Dialog>
 );
+
+/** The output pane: "Loading…" until the first read, then the output or a placeholder. */
+function outputPaneText(state: { isLoading: boolean; text: string; hasError: boolean }): string {
+  if (state.isLoading) return "Loading…";
+  if (state.text.length > 0) return state.text;
+  // The error shows above the pane; an empty pane under it reads better than "No output yet".
+  return state.hasError ? "" : "No output yet";
+}
 
 const BackgroundBashOutputViewer: React.FC<{ workspaceId: string; processId: string }> = (
   props
@@ -69,18 +85,23 @@ const BackgroundBashOutputViewer: React.FC<{ workspaceId: string; processId: str
   const [truncatedStart, setTruncatedStart] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  // True once a read landed: the viewer then shows output (or "No output yet"), not "Loading…".
+  const hasReadRef = useRef(false);
 
   useEffect(() => {
-    setOutput(undefined);
-    setStatus("running");
-    setTruncatedStart(false);
+    // No reset of the shown output here: the first read below replaces it.
     setError(null);
-    setIsLoading(true);
 
     if (!api) {
+      // Nothing can load without a client: a fresh viewer shows only the error, not a "Loading…"
+      // that never ends. A viewer that already read keeps its output.
       setIsLoading(false);
       setError("API unavailable");
       return;
+    }
+    // Until the first read lands, the viewer shows "Loading…" (also after an offline start).
+    if (!hasReadRef.current) {
+      setIsLoading(true);
     }
 
     let cancelled = false;
@@ -109,8 +130,12 @@ const BackgroundBashOutputViewer: React.FC<{ workspaceId: string; processId: str
         }
 
         setStatus(result.data.status);
-        if (result.data.truncatedStart) {
-          setTruncatedStart(true);
+        // The first read is a fresh tail (the only read that can be truncated at its start), so
+        // it replaces any output kept from an earlier run (a reconnect); later reads append.
+        if (offset === undefined) {
+          setTruncatedStart(result.data.truncatedStart);
+          setOutput(undefined);
+          hasReadRef.current = true;
         }
 
         offset = result.data.nextOffset;
@@ -133,12 +158,18 @@ const BackgroundBashOutputViewer: React.FC<{ workspaceId: string; processId: str
       }
     };
 
-    // A rejected read (e.g. a lost server connection) stops polling with the error shown instead
-    // of escaping as an unhandled rejection; reopening the dialog starts a fresh read.
+    // A rejected read stops polling with the error shown instead of escaping as an unhandled
+    // rejection; reopening the dialog starts a fresh read. Only a lost connection
+    // (ConnectionLostError) shows no error and keeps the output: the next client polls again. A
+    // server cancel on a live socket is a plain AbortError, and no new client would ever re-run
+    // this poll, so it shows its error.
     run().catch((err: unknown) => {
       if (cancelled) return;
+      // A viewer that already read keeps its output for the next client. A fresh one (its first
+      // read cut off) shows the error, not a "Loading…" with nothing behind it.
+      if (isConnectionLostError(err) && hasReadRef.current) return;
       setIsLoading(false);
-      setError(err instanceof Error ? err.message : String(err));
+      setError(getErrorMessage(err));
     });
 
     return () => {
@@ -184,7 +215,7 @@ const BackgroundBashOutputViewer: React.FC<{ workspaceId: string; processId: str
           min-h keeps a visible pane for "No output yet" while still letting very
           short windows shrink it instead of clipping it at the dialog edge. */}
       <DetailContent className="max-h-none min-h-24 flex-1 px-2 py-1.5">
-        {isLoading ? "Loading…" : text.length > 0 ? text : error ? "" : "No output yet"}
+        {outputPaneText({ isLoading, text, hasError: error != null })}
       </DetailContent>
     </div>
   );

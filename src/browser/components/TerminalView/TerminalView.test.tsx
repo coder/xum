@@ -9,6 +9,7 @@ import { APIProvider } from "@/browser/contexts/API";
 import * as RealGhosttyModule from "ghostty-web";
 import * as RealTerminalRouterContextModule from "@/browser/terminal/TerminalRouterContext";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
 
 interface TerminalSubscribeCallbacks {
   onOutput: (data: string) => void;
@@ -31,6 +32,7 @@ interface MockRouter {
     typeof mock<(sessionId: string, callbacks: TerminalSubscribeCallbacks) => () => void>
   >;
   resize: ReturnType<typeof mock<(sessionId: string, cols: number, rows: number) => Promise<void>>>;
+  syncSize: ReturnType<typeof mock<(sessionId: string, cols: number, rows: number) => void>>;
   sendInput: ReturnType<typeof mock<(sessionId: string, data: string) => void>>;
 }
 
@@ -137,6 +139,7 @@ function createRouter(): MockRouter {
       return unsubscribeMock;
     }),
     resize: mock((_sessionId: string, _cols: number, _rows: number) => Promise.resolve()),
+    syncSize: mock((_sessionId: string, _cols: number, _rows: number) => undefined),
     sendInput: mock((_sessionId: string, _data: string) => undefined),
   };
 }
@@ -199,6 +202,43 @@ describe("TerminalView", () => {
     // The view keeps its one subscription: no new subscribe, no clear.
     expect(mockRouter.subscribe).toHaveBeenCalledTimes(1);
     expect(terminal?.clear).toHaveBeenCalledTimes(1);
+  });
+
+  // After the switch the client stays the same while Xum reconnects, so the exit stream fails
+  // with ConnectionLostError instead of being aborted by a new client: that is not an exit.
+  test.each([...GAP_MODES])("a lost connection does not end the terminal (%s)", async (mode) => {
+    let exitSubscriptions = 0;
+    const harness = createConnectionHarness(mode, () => ({
+      terminal: {
+        onExit: () => {
+          exitSubscriptions += 1;
+          return Promise.resolve(
+            (async function* (): AsyncGenerator<number, void, unknown> {
+              await new Promise(() => undefined); // the process keeps running
+              yield 0;
+            })()
+          );
+        },
+      },
+    }));
+    const onExit = mock((_exitCode: number) => undefined);
+    render(
+      <TerminalView
+        workspaceId="workspace-1"
+        sessionId="terminal-1"
+        visible
+        setDocumentTitle={false}
+        autoFocus={false}
+        onExit={onExit}
+      />,
+      { wrapper: harness.Wrapper }
+    );
+    await waitFor(() => expect(exitSubscriptions).toBe(1));
+
+    await harness.drop();
+    harness.reconnect();
+    await waitFor(() => expect(exitSubscriptions).toBe(2));
+    expect(onExit).not.toHaveBeenCalled();
   });
 
   test("keeps the router subscription stable when onExit changes", async () => {

@@ -11,7 +11,9 @@ import { DisposableTempDir } from "./tempDir";
 import {
   getMcpAppView,
   getMcpAppViewRecords,
+  listMcpAppEntrypoints,
   MCP_APP_TOOL_RESULT_MAX_BYTES,
+  openMcpAppEntrypoint,
   approveMcpAppViewDomains,
   listMcpAppViewDomains,
   type McpAppsContext,
@@ -526,5 +528,35 @@ describe("getMcpAppViewRecords", () => {
     const { ctx } = context(null);
     const result = await viewRecord(ctx, { workspaceId: "ws", toolCallId: "call-1" });
     expect(result).toEqual({ success: true, data: null });
+  });
+});
+
+describe("MCP App entry points", () => {
+  test("listing starts servers first (a just-enabled server is listed); opening reports errors", async () => {
+    const order: string[] = [];
+    const ctx = {
+      experimentsService: { isExperimentEnabled: () => true },
+      config: NO_PROJECTS,
+      mcpServerManager: {
+        hasWorkspaceRequestOptions: () => true,
+        listMcpAppEntrypoints: (workspaceId: string) => {
+          order.push(`list:${workspaceId}`);
+          return [];
+        },
+        openMcpAppEntrypoint: () => Promise.reject(new Error("not connected")),
+      },
+    } as unknown as McpAppsContext;
+    await listMcpAppEntrypoints(ctx, "ws", undefined, (workspaceId) => {
+      order.push(`warm:${workspaceId}`);
+      return Promise.resolve([]);
+    });
+    expect(order).toEqual(["warm:ws", "list:ws"]);
+    const opened = await openMcpAppEntrypoint(
+      ctx,
+      { workspaceId: "ws", serverName: "charts", toolName: "board", type: "global" },
+      undefined,
+      noWarm
+    );
+    expect(opened).toEqual({ success: false, error: "not connected" });
   });
 });

@@ -1,8 +1,17 @@
 import React from "react";
-import { MessagesSquare, Terminal as TerminalIcon, type LucideIcon } from "lucide-react";
+import {
+  AppWindow,
+  LayoutGrid,
+  MessagesSquare,
+  Terminal as TerminalIcon,
+  type LucideIcon,
+} from "lucide-react";
+import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
+import type { McpAppEntrypoint } from "@/common/orpc/schemas/mcpApps";
 import { cn } from "@/common/lib/utils";
 import { formatKeybind, KEYBINDS, type Keybind } from "@/browser/utils/ui/keybinds";
 import { TAB_REGISTRY, type BaseTabType } from "./Tabs";
+import { mcpAppEntrypointDescription } from "./AppViewTab/mcpAppEntrypoints";
 
 /** Tools with a global shortcut of their own; the launcher shows it as a hint. */
 const TOOL_KEYBINDS: Partial<Record<BaseTabType, Keybind>> = {
@@ -23,7 +32,27 @@ interface NewTabLauncherProps {
    */
   autoFocus: boolean;
   onAutoFocusConsumed: () => void;
+  /** MCP App entry points of the workspace's enabled servers (artifacts experiment). */
+  entrypoints?: readonly McpAppEntrypoint[];
+  /**
+   * Open (or focus) an entry point's app tab; resolves to an error message or null. The open
+   * must apply its result only while `isCurrent()`: a later pick in this launcher, or its
+   * unmount (the New tab went away), makes it stale.
+   */
+  onOpenEntrypoint?: (
+    entrypoint: McpAppEntrypoint,
+    isCurrent: () => boolean
+  ) => Promise<string | null>;
 }
+
+/**
+ * Entry point rows use a fixed lucide icon per type. Remote icons (a tool's `icons` or the
+ * server's) are not shown: they would load attacker-chosen URLs into the renderer.
+ */
+const ENTRYPOINT_ICONS: Record<McpAppEntrypoint["type"], LucideIcon> = {
+  global: LayoutGrid,
+  thread: AppWindow,
+};
 
 /**
  * The New tab (Codex-style empty tab): instead of showing every tool as an idle tab, the strip
@@ -33,6 +62,31 @@ interface NewTabLauncherProps {
 export const NewTabLauncher: React.FC<NewTabLauncherProps> = (props) => {
   const listRef = React.useRef<HTMLDivElement>(null);
   const { autoFocus, onAutoFocusConsumed } = props;
+  const [opening, setOpening] = React.useState<string | null>(null);
+  const [openError, setOpenError] = React.useState<string | null>(null);
+  // Counts picks: an entry point open applies its result only if no later pick (or unmount)
+  // bumped it meanwhile. Other rows stay enabled while an open runs.
+  const pickRef = React.useRef(0);
+  const picked = (run: () => void) => () => {
+    pickRef.current += 1;
+    run();
+  };
+  React.useEffect(
+    () => () => {
+      pickRef.current += 1;
+    },
+    []
+  );
+  const openEntrypoint = async (entrypoint: McpAppEntrypoint) => {
+    if (props.onOpenEntrypoint == null) return;
+    const pick = ++pickRef.current;
+    const isCurrent = () => pickRef.current === pick;
+    setOpening(entrypoint.viewKey);
+    setOpenError(null);
+    const error = await props.onOpenEntrypoint(entrypoint, isCurrent);
+    setOpening(null);
+    if (isCurrent()) setOpenError(error);
+  };
 
   // Moving DOM focus is a side effect on the rendered rows, so it runs after commit.
   React.useEffect(() => {
@@ -75,7 +129,7 @@ export const NewTabLauncher: React.FC<NewTabLauncherProps> = (props) => {
               name={reg.name}
               description={reg.description}
               shortcut={keybind ? formatKeybind(keybind) : undefined}
-              onClick={() => props.onOpenTool(tool)}
+              onClick={picked(() => props.onOpenTool(tool))}
             />
           );
         })}
@@ -84,7 +138,7 @@ export const NewTabLauncher: React.FC<NewTabLauncherProps> = (props) => {
           name="Terminal"
           description="Run commands in this workspace"
           shortcut={formatKeybind(KEYBINDS.OPEN_TERMINAL)}
-          onClick={props.onOpenTerminal}
+          onClick={picked(props.onOpenTerminal)}
         />
         {props.onOpenSideChat != null && (
           <LauncherRow
@@ -92,9 +146,31 @@ export const NewTabLauncher: React.FC<NewTabLauncherProps> = (props) => {
             name="Side chat"
             description="Ask separately with this conversation as context"
             shortcut="/side"
-            onClick={props.onOpenSideChat}
+            onClick={picked(props.onOpenSideChat)}
             disabled={props.creatingSideChat}
           />
+        )}
+        {props.entrypoints != null && props.entrypoints.length > 0 && (
+          <>
+            <h3 className="text-muted mt-3 px-2 text-[11px] font-medium">Plugin views</h3>
+            {props.entrypoints.map((entrypoint) => (
+              <LauncherRow
+                key={entrypoint.viewKey}
+                Icon={ENTRYPOINT_ICONS[entrypoint.type]}
+                name={entrypoint.title}
+                // Never the raw server key (a plugin's carries an internal instance ID).
+                description={mcpAppEntrypointDescription(entrypoint)}
+                singleLineDescription
+                onClick={() => void openEntrypoint(entrypoint)}
+                disabled={opening !== null}
+              />
+            ))}
+            {openError != null && (
+              <p role="alert" className="text-error px-2 text-[11px] break-words">
+                {openError}
+              </p>
+            )}
+          </>
         )}
       </div>
     </div>
@@ -108,6 +184,8 @@ const LauncherRow: React.FC<{
   shortcut?: string;
   onClick: () => void;
   disabled?: boolean;
+  /** One line with an ellipsis; the shared Tooltip shows the full text. */
+  singleLineDescription?: boolean;
 }> = (props) => {
   // The tool name is the row's accessible name; the description is read as its description.
   const descriptionId = React.useId();
@@ -129,9 +207,17 @@ const LauncherRow: React.FC<{
       />
       <span className="flex min-w-0 flex-1 flex-col">
         <span className="text-foreground truncate text-xs font-medium">{props.name}</span>
-        <span id={descriptionId} className="text-muted text-[11px] leading-snug">
-          {props.description}
-        </span>
+        {props.singleLineDescription === true ? (
+          <TooltipIfPresent tooltip={props.description}>
+            <span id={descriptionId} className="text-muted truncate text-[11px] leading-snug">
+              {props.description}
+            </span>
+          </TooltipIfPresent>
+        ) : (
+          <span id={descriptionId} className="text-muted text-[11px] leading-snug">
+            {props.description}
+          </span>
+        )}
       </span>
       {props.shortcut != null && (
         <kbd className="mobile-hide-shortcut-hints text-muted mt-0.5 shrink-0 font-sans text-[10px] max-[768px]:hidden">

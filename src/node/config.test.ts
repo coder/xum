@@ -14,6 +14,10 @@ import {
 import { acquireProcessFileLock } from "./utils/concurrency/fileLock";
 import { AppConfigOnDiskSchema } from "@/common/config/schemas/appConfigOnDisk";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
+import {
+  PREVIOUS_TASK_SETTINGS_DEFAULTS,
+  TASK_SETTINGS_LIMITS,
+} from "@/common/config/schemas/taskSettings";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS } from "@/common/constants/workspace";
@@ -783,6 +787,96 @@ describe("Config", () => {
     });
   });
 
+  describe("raised task-limit defaults migration", () => {
+    const writeTaskSettings = (
+      taskSettings: Record<string, unknown> | undefined,
+      migrations?: Record<string, boolean>
+    ) => {
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({ projects: [], taskSettings, migrations })
+      );
+    };
+    const readPersisted = () =>
+      JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        taskSettings?: { maxParallelAgentTasks?: number; maxTaskNestingDepth?: number };
+        migrations?: { taskSettingsDefaultsRaised?: boolean };
+      };
+
+    it("moves limits Xum wrote at the previous defaults to the new defaults once", async () => {
+      writeTaskSettings({ ...PREVIOUS_TASK_SETTINGS_DEFAULTS });
+
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.taskSettings?.maxParallelAgentTasks).toBe(
+        TASK_SETTINGS_LIMITS.maxParallelAgentTasks.default
+      );
+      expect(loaded.taskSettings?.maxTaskNestingDepth).toBe(
+        TASK_SETTINGS_LIMITS.maxTaskNestingDepth.default
+      );
+
+      await flushConfigEdits();
+      const persisted = readPersisted();
+      expect(persisted.taskSettings?.maxParallelAgentTasks).toBe(
+        TASK_SETTINGS_LIMITS.maxParallelAgentTasks.default
+      );
+      expect(persisted.taskSettings?.maxTaskNestingDepth).toBe(
+        TASK_SETTINGS_LIMITS.maxTaskNestingDepth.default
+      );
+      expect(persisted.migrations?.taskSettingsDefaultsRaised).toBe(true);
+    });
+
+    it.each([
+      [8, 2],
+      [64, 4],
+      // One field at the old default, the other explicit: only the old default moves.
+      [PREVIOUS_TASK_SETTINGS_DEFAULTS.maxParallelAgentTasks, 1],
+    ] as const)("keeps an explicit choice (%d parallel, depth %d)", async (parallel, depth) => {
+      writeTaskSettings({ maxParallelAgentTasks: parallel, maxTaskNestingDepth: depth });
+
+      config.loadConfigOrDefault();
+      await flushConfigEdits();
+
+      const persisted = readPersisted();
+      const expectedParallel =
+        parallel === PREVIOUS_TASK_SETTINGS_DEFAULTS.maxParallelAgentTasks
+          ? TASK_SETTINGS_LIMITS.maxParallelAgentTasks.default
+          : parallel;
+      expect(persisted.taskSettings?.maxParallelAgentTasks).toBe(expectedParallel);
+      expect(persisted.taskSettings?.maxTaskNestingDepth).toBe(depth);
+      expect(new Config(tempDir).loadConfigOrDefault().taskSettings?.maxTaskNestingDepth).toBe(
+        depth
+      );
+    });
+
+    it("keeps the previous default values a user sets after the migration ran", () => {
+      writeTaskSettings(
+        { ...PREVIOUS_TASK_SETTINGS_DEFAULTS },
+        { taskSettingsDefaultsRaised: true }
+      );
+
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.taskSettings?.maxParallelAgentTasks).toBe(
+        PREVIOUS_TASK_SETTINGS_DEFAULTS.maxParallelAgentTasks
+      );
+      expect(loaded.taskSettings?.maxTaskNestingDepth).toBe(
+        PREVIOUS_TASK_SETTINGS_DEFAULTS.maxTaskNestingDepth
+      );
+    });
+
+    it("gives a fresh install the new defaults and records the migration on first save", async () => {
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.taskSettings?.maxParallelAgentTasks).toBe(
+        TASK_SETTINGS_LIMITS.maxParallelAgentTasks.default
+      );
+      expect(loaded.taskSettings?.maxTaskNestingDepth).toBe(
+        TASK_SETTINGS_LIMITS.maxTaskNestingDepth.default
+      );
+
+      await flushConfigEdits();
+      expect(readPersisted().migrations?.taskSettingsDefaultsRaised).toBe(true);
+    });
+  });
+
   describe("loadConfigOrDefault with trailing slash migration", () => {
     it("should strip trailing slashes from project paths on load", () => {
       // Create config file with trailing slashes in project paths
@@ -1104,12 +1198,24 @@ describe("Config", () => {
       ]);
     });
 
-    // A conflicting group (two different rows with the same id) keeps
-    // the loader's previous result: `new Map(stripped pairs)`, the last entry at the position of
-    // the first. This oracle is that expression, so the test pins "no change" for conflicts
-    // (#5929 tracks a lossless design).
-    function previousLoaderResult(stored: StoredPair[]): StoredPair[] {
-      return [...new Map(stored.map(([key, project]) => [key.replace(/\/+$/, ""), project]))];
+    // A conflicting group holds two different rows with the same id. The merge keeps every other
+    // row, and keeps the last alias's variant of the conflicting row. A sidecar keeps the original
+    // bytes, with every variant (#5929).
+    function aliasConflictBackups(): string[] {
+      return fs
+        .readdirSync(tempDir)
+        .filter((name) => name.startsWith("config.json.alias-conflict-"))
+        .map((name) => path.join(tempDir, name));
+    }
+
+    /** The variant of `id` that the last stored entry holding it has. */
+    function lastVariant(stored: StoredPair[], id: string): StoredRow {
+      const variant = stored
+        .flatMap(([, project]) => project.workspaces)
+        .filter((w) => w.id === id)
+        .at(-1);
+      if (variant === undefined) throw new Error(`no stored row with id ${id}`);
+      return variant;
     }
 
     // Builders: row() needs the per-test config, which exists only inside a test.
@@ -1161,13 +1267,120 @@ describe("Config", () => {
       ],
     ];
     for (const [name, buildStored] of conflictCases) {
-      it(`keeps the previous loader result for ${name}`, async () => {
+      it(`keeps the last variant and backs up the original bytes for ${name}`, async () => {
+        const stored = buildStored();
+        writeProjects(stored);
+        const original = fs.readFileSync(path.join(tempDir, "config.json"));
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          await flushConfigEdits();
+          const saved = readSavedProjects().flatMap(([, project]) => project.workspaces);
+          expect(saved.filter((w) => w.id === "ws-same")).toEqual([lastVariant(stored, "ws-same")]);
+
+          const backups = aliasConflictBackups();
+          expect(backups).toHaveLength(1);
+          expect(fs.readFileSync(backups[0])).toEqual(original);
+          expect(fs.statSync(backups[0]).mode & 0o777).toBe(0o600);
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
+    }
+
+    it("reuses one backup when the same conflicting bytes load again", () => {
+      writeProjects(conflictCases[0][1]());
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      try {
+        config.loadConfigOrDefault();
+        new Config(tempDir).loadConfigOrDefault();
+        expect(aliasConflictBackups()).toHaveLength(1);
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+
+    (process.getuid?.() === 0 ? it.skip : it)(
+      "keeps config.json and refuses edits while the conflict backup fails",
+      async () => {
+        const stored = conflictCases[0][1]();
+        writeProjects(stored);
+        const configFile = path.join(tempDir, "config.json");
+        const original = fs.readFileSync(configFile);
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        // A read-only config dir makes the sidecar write fail.
+        fs.chmodSync(tempDir, 0o500);
+        try {
+          // Reads get the merged view, not the defaults a failed load returns.
+          const ids = config.loadConfigOrDefault().projects.get("/home/u/repo")?.workspaces;
+          expect(ids?.map((w) => w.id).sort()).toEqual(["ws-one", "ws-same", "ws-two"]);
+          const blocked = await config.setUpdateChannel("nightly").then(
+            () => null,
+            (error: unknown) => error
+          );
+          expect(String(blocked)).toContain("could not back them up");
+          expect(fs.readFileSync(configFile)).toEqual(original);
+          // The load is not cached, so every read retries the backup, but the same bytes and
+          // error log once.
+          const logged = () =>
+            errorSpy.mock.calls.filter(([message]) => String(message).includes("the backup of"))
+              .length;
+          const before = logged();
+          config.loadConfigOrDefault();
+          config.loadConfigOrDefault();
+          expect(before).toBe(1);
+          expect(logged()).toBe(1);
+        } finally {
+          fs.chmodSync(tempDir, 0o700);
+        }
+        try {
+          // The next load backs the bytes up, and the edit goes through.
+          await config.setUpdateChannel("nightly");
+          expect(aliasConflictBackups()).toHaveLength(1);
+          expect(new Config(tempDir).getUpdateChannel()).toBe("nightly");
+        } finally {
+          errorSpy.mockRestore();
+        }
+      }
+    );
+
+    (process.getuid?.() === 0 ? it.skip : it)(
+      "lets edits through again once the conflicting config is gone",
+      async () => {
+        writeProjects(conflictCases[0][1]());
+        const configFile = path.join(tempDir, "config.json");
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        fs.chmodSync(tempDir, 0o500);
+        try {
+          config.loadConfigOrDefault();
+        } finally {
+          fs.chmodSync(tempDir, 0o700);
+        }
+        try {
+          // The user moves the conflicting file aside: nothing is left to protect.
+          fs.renameSync(configFile, path.join(tempDir, "moved-aside.json"));
+          await config.setUpdateChannel("nightly");
+          expect(new Config(tempDir).getUpdateChannel()).toBe("nightly");
+        } finally {
+          errorSpy.mockRestore();
+        }
+      }
+    );
+
+    // #5929 repro: a same-id conflict must not cost the rows that only one alias holds.
+    for (const [name, buildStored] of conflictCases) {
+      it(`keeps the rows outside the conflict for ${name}`, async () => {
         const stored = buildStored();
         writeProjects(stored);
         const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
         try {
           await flushConfigEdits();
-          expect(readSavedProjects()).toEqual(previousLoaderResult(stored));
+          const storedIds = new Set(
+            stored.flatMap(([, project]) => project.workspaces.map((w) => w.id))
+          );
+          const savedIds = new Set(
+            readSavedProjects().flatMap(([, project]) => project.workspaces.map((w) => w.id))
+          );
+          expect([...savedIds].sort()).toEqual([...storedIds].sort());
         } finally {
           errorSpy.mockRestore();
         }

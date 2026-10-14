@@ -109,9 +109,23 @@ function getReportPageOffset(result: unknown, args: unknown): number {
 }
 
 /**
+ * Whether a page with more text after it (nextCharOffset) repeats the text already joined at
+ * its offset: the agent reread an earlier page, so the later pages it read stay joined.
+ */
+function isRereadPage(
+  previous: string | undefined,
+  page: string,
+  offset: number,
+  hasMore: boolean
+) {
+  return hasMore && previous?.startsWith(page, offset) === true;
+}
+
+/**
  * Join a report page onto the report read so far. A page at offset 0 starts the report over;
- * a page at or before the end replaces the text from its offset on (a page read twice). A page
- * past the end leaves a gap: null, and the caller keeps the await rows visible instead.
+ * a page at or before the end replaces the text from its offset on (the last page, or another
+ * report under the same task ID). A page past the end leaves a gap: null, and the caller keeps
+ * the await rows visible instead.
  */
 function joinReportPage(previous: string | undefined, page: string, offset: number) {
   if (offset === 0) return page;
@@ -206,6 +220,119 @@ function readReportAiSettings(r: {
   };
 }
 
+/** Report joins in progress, across the transcript's tool calls in history order. */
+interface ReportJoinState {
+  reportByTaskId: Map<string, LinkedTaskReport>;
+  /** Tasks whose pages left a gap: their await rows keep showing each page. */
+  incompleteReportTaskIds: Set<string>;
+  /**
+   * Tasks the agent sent a message to after their last report. A reused task ID reports again
+   * after task_send_message wakes it, and agent reports carry no attempt ID, so the next page
+   * starts a new join instead of matching the previous attempt's text.
+   */
+  newAttemptTaskIds: Set<string>;
+}
+
+/**
+ * Join one completed report page (a task_await result entry, or a foreground task result's
+ * first page) into reportByTaskId.
+ */
+function linkReportPage(r: unknown, args: unknown, state: ReportJoinState): void {
+  const page = readCompletedAwaitReport(r);
+  if (page == null) return;
+  const pageOffset = getReportPageOffset(r, args);
+  const newAttempt = state.newAttemptTaskIds.has(page.taskId);
+  const previous = newAttempt ? undefined : state.reportByTaskId.get(page.taskId)?.reportMarkdown;
+  const hasMore = toPageOffset((r as { nextCharOffset?: unknown }).nextCharOffset) != null;
+  if (isRereadPage(previous, page.reportMarkdown, pageOffset, hasMore)) return;
+  const joined = joinReportPage(previous, page.reportMarkdown, pageOffset);
+  if (joined == null) {
+    state.incompleteReportTaskIds.add(page.taskId);
+    return;
+  }
+  state.newAttemptTaskIds.delete(page.taskId);
+  // Only a join that reaches the report's end clears a gap: a first page read after a later
+  // one does not cover the later page, so its await row stays visible.
+  if (!hasMore) state.incompleteReportTaskIds.delete(page.taskId);
+  // Last-wins (history order)
+  state.reportByTaskId.set(page.taskId, { ...page, reportMarkdown: joined });
+}
+
+/**
+ * The first pages a foreground `task` result returned (entries with nextCharOffset), shaped
+ * like task_await entries. Later task_await pages join onto them, so the card can show the
+ * whole report even when the agent never reread page 0.
+ */
+function readForegroundFirstPages(result: unknown): unknown[] {
+  if (typeof result !== "object" || result === null) return [];
+  // A best-of group whose other candidates were backgrounded, interrupted or timed out has a
+  // pending aggregate status, but each `reports` entry is still a completed report. Only a
+  // single-task result needs its own completed status.
+  const reports = (result as { reports?: unknown }).reports;
+  const isCompleted = (result as { status?: unknown }).status === "completed";
+  const entries: unknown[] = Array.isArray(reports) ? reports : isCompleted ? [result] : [];
+  // Persisted results can be corrupted (a null or non-object entry): skip those entries so
+  // the transcript still renders (self-healing).
+  return entries
+    .filter(
+      (entry): entry is { nextCharOffset?: unknown } => typeof entry === "object" && entry !== null
+    )
+    .filter((entry) => toPageOffset(entry.nextCharOffset) != null)
+    .map((entry) => ({ ...entry, status: "completed" }));
+}
+
+const DELIVERED_SEND_STATUSES: ReadonlySet<unknown> = new Set([
+  "accepted",
+  "queued",
+  "reactivated",
+]);
+
+/** The task ID a delivered task_send_message woke, else null. */
+function getDeliveredSendTaskId(result: unknown): string | null {
+  if (typeof result !== "object" || result === null) return null;
+  if (!DELIVERED_SEND_STATUSES.has((result as { status?: unknown }).status)) return null;
+  const taskId = (result as { taskId?: unknown }).taskId;
+  return typeof taskId === "string" && taskId.trim().length > 0 ? taskId.trim() : null;
+}
+
+type ToolMessage = Extract<DisplayedMessage, { type: "tool" }>;
+
+/**
+ * How each tool that carries or resets a report feeds the report joins. A Map, not an object
+ * literal: a persisted toolName such as "__proto__" or "constructor" must miss, not resolve to
+ * an Object.prototype member and throw while the transcript renders.
+ */
+const REPORT_JOIN_HANDLERS = new Map<string, (msg: ToolMessage, state: ReportJoinState) => void>([
+  [
+    "task",
+    (msg, state) => {
+      for (const page of readForegroundFirstPages(msg.result))
+        linkReportPage(page, undefined, state);
+    },
+  ],
+  [
+    "task_send_message",
+    (msg, state) => {
+      const taskId = getDeliveredSendTaskId(msg.result);
+      if (taskId != null) state.newAttemptTaskIds.add(taskId);
+    },
+  ],
+  [
+    "task_await",
+    (msg, state) => {
+      const results = (msg.result as { results?: unknown } | null | undefined)?.results;
+      if (!Array.isArray(results)) return;
+      for (const r of results) linkReportPage(r, msg.args, state);
+    },
+  ],
+]);
+
+/** Feed one tool message into the report joins. */
+function linkToolMessage(msg: DisplayedMessage, state: ReportJoinState): void {
+  if (msg.type !== "tool") return;
+  REPORT_JOIN_HANDLERS.get(msg.toolName)?.(msg, state);
+}
+
 /**
  * Render-time helper that links completed task reports (from `task_await`) back to the
  * original `task` tool call that spawned the background work.
@@ -249,38 +376,15 @@ export function computeTaskReportLinking(messages: DisplayedMessage[]): TaskRepo
     }
   }
 
-  // Second pass: collect completed reports from `task_await` results.
-  const reportByTaskId = new Map<string, LinkedTaskReport>();
-  // Tasks whose pages left a gap: their await rows keep showing each page.
-  const incompleteReportTaskIds = new Set<string>();
-  for (const msg of messages) {
-    if (msg.type !== "tool" || msg.toolName !== "task_await") continue;
-
-    const rawResult = msg.result;
-    if (typeof rawResult !== "object" || rawResult === null) continue;
-    if (!("results" in rawResult)) continue;
-
-    const results = (rawResult as { results?: unknown }).results;
-    if (!Array.isArray(results)) continue;
-
-    for (const r of results) {
-      const page = readCompletedAwaitReport(r);
-      if (page == null) continue;
-      const pageOffset = getReportPageOffset(r, msg.args);
-      const joined = joinReportPage(
-        reportByTaskId.get(page.taskId)?.reportMarkdown,
-        page.reportMarkdown,
-        pageOffset
-      );
-      if (joined == null) {
-        incompleteReportTaskIds.add(page.taskId);
-        continue;
-      }
-      if (pageOffset === 0) incompleteReportTaskIds.delete(page.taskId);
-      // Last-wins (history order)
-      reportByTaskId.set(page.taskId, { ...page, reportMarkdown: joined });
-    }
-  }
+  // Second pass: collect completed reports from `task_await` results (and the first pages of
+  // paged foreground `task` results), in history order.
+  const state: ReportJoinState = {
+    reportByTaskId: new Map(),
+    incompleteReportTaskIds: new Set(),
+    newAttemptTaskIds: new Set(),
+  };
+  for (const msg of messages) linkToolMessage(msg, state);
+  const { reportByTaskId, incompleteReportTaskIds } = state;
 
   // If a task has both a visible spawn card and a non-empty report, suppress the report
   // duplication under `task_await`.

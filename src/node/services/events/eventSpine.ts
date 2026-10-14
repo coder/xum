@@ -28,6 +28,7 @@ import { EventEmitter } from "node:events";
 import type { Tool } from "ai";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { log } from "@/node/services/log";
+import { getErrorMessage } from "@/common/utils/errors";
 
 // ---------------------------------------------------------------------------
 // Observer events (read-only fan-out)
@@ -42,6 +43,8 @@ export interface ObserverEventMap {
    * lifecycle is observer-only for now; a waterfall variant can be added when a
    * mutating consumer lands. */
   "session.start": { workspaceId: string };
+  /** A plugin hook's systemMessage for the user (AgentSession shows it; never the model). */
+  "plugin.hook.notice": { workspaceId: string; pluginName: string; message: string };
   "session.end": { workspaceId: string };
   "stream.start": { workspaceId: string; messageId: string };
   "stream.end": { workspaceId: string; messageId: string };
@@ -69,6 +72,10 @@ export interface ToolExecuteContext {
   args: unknown;
   readonly host: ToolExecutionHost;
   readonly abortSignal?: AbortSignal;
+  /** The tool's input JSON schema, when the caller holds the Tool (validates hook rewrites). */
+  readonly inputJsonSchema?: () => unknown;
+  /** Server and original name of an MCP tool (Codex hooks match `mcp__<server>__<tool>`). */
+  readonly mcpOrigin?: { serverName: string; toolName: string };
   /** Set by the terminal after the tool actually executed. */
   executed: boolean;
   /** Set by the terminal; mutable after next() returns (middleware may augment). */
@@ -79,6 +86,14 @@ export interface ToolExecuteContext {
    * must not call next().
    */
   blocked?: { result: unknown };
+  /**
+   * Set by middleware AFTER the tool ran, when a post hook blocks its result (Codex PostToolUse
+   * `decision: "block"`). The model still sees `result` (the hook's feedback replaces the
+   * output), but a nested caller that runs the tool on its own behalf (mux.load, memory index
+   * authorization) must treat the call as blocked and keep the original output from its caller:
+   * runThroughToolHookPipeline reports it as a block.
+   */
+  postBlocked?: true;
 }
 
 export interface RequestAssembleContext {
@@ -109,10 +124,56 @@ export interface CompactionPrepareContext {
   readonly reason: "on-send" | "mid-stream" | "continuous-eager";
 }
 
+/**
+ * Why Xum is sending a message (prompt-hook input). Derived by AgentSession from the send's own
+ * provenance signals (see resolveMessageSendOrigin).
+ */
+export type MessageSendOrigin = "user" | "task" | "goal" | "plan-review" | "system";
+
+/**
+ * `message.send` (the Codex UserPromptSubmit event): middleware sees each new message before Xum
+ * saves it. A compaction request's own prompt never reaches it (only texts queued behind it). It
+ * cannot rewrite the text (Codex hooks cannot either); it may add model-visible context for this
+ * turn, or block the send.
+ */
+export interface MessageSendContext {
+  readonly workspaceId: string;
+  readonly origin: MessageSendOrigin;
+  readonly text: string;
+  /** The workspace path (Codex common field `cwd`), when Xum could resolve it. */
+  readonly cwd?: string;
+  /** Appended by middleware, in chain order; saved on the user row (pluginHookContext). */
+  readonly additionalContext: Array<{ pluginId: string; text: string }>;
+  /** Set to refuse the send. useBefore skips the rest of the chain (first block wins). */
+  blocked?: { pluginName: string; reason: string };
+}
+
+/**
+ * `turn.stop` (the Codex Stop event): middleware sees each turn that finished normally, before
+ * Xum picks the next turn. Every consumer runs (none can skip the rest). Interrupted, failed and
+ * compaction turns never reach it, and neither do sub-agent turns (Codex SubagentStop).
+ */
+export interface TurnStopContext {
+  readonly workspaceId: string;
+  readonly messageId: string;
+  /** The workspace path (Codex common field `cwd`), when Xum could resolve it. */
+  readonly cwd?: string;
+  /** The reply's trailing text, or null when the turn ended on a tool call or without text. */
+  readonly lastAssistantMessage: string | null;
+  /** True when Stop already continued this turn (Codex stop_hook_active). */
+  readonly stopHookActive: boolean;
+  /** Continuation prompts (Codex `decision: "block"` reasons), in chain order. */
+  readonly continueReasons: string[];
+  /** Set by a consumer whose output said `continue: false`: it overrides every continuation. */
+  halted?: { pluginName: string };
+}
+
 export interface WaterfallPointMap {
   "tool.execute": ToolExecuteContext;
   "request.assemble": RequestAssembleContext;
   "compaction.prepare": CompactionPrepareContext;
+  "message.send": MessageSendContext;
+  "turn.stop": TurnStopContext;
 }
 
 export type WaterfallNext = () => Promise<void>;
@@ -131,7 +192,7 @@ interface Registration {
   preservesToolset: boolean;
 }
 
-/** Duck-check for contexts that support blocking (currently tool.execute). */
+/** Duck-check for contexts that support blocking (tool.execute, message.send). */
 function isBlocked(ctx: unknown): boolean {
   return (
     typeof ctx === "object" &&
@@ -238,7 +299,20 @@ export class EventSpine {
     return this.use(
       point,
       async (ctx, next) => {
-        await callback(ctx);
+        if (point === "message.send") {
+          // message.send consumers are independent plugin guards: one that throws is logged and
+          // skipped, so it cannot end the chain before a later plugin's block. Isolated here
+          // because only the spine dispatches per consumer; runMessageSendHooks sees one chain.
+          try {
+            await callback(ctx);
+          } catch (error) {
+            log.warn("Prompt hooks: a message.send consumer failed; running the next one", {
+              error: getErrorMessage(error),
+            });
+          }
+        } else {
+          await callback(ctx);
+        }
         if (!isBlocked(ctx)) {
           await next();
         }

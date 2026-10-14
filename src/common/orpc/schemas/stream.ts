@@ -1,5 +1,6 @@
 import { StreamStopCauseSchema } from "@/common/types/streamStopCause";
 import { z } from "zod";
+import { stripClientPluginSendHookFields } from "@/common/utils/messages/pluginSendHookFields";
 import { ServiceTierSchema } from "../../config/schemas/providersConfig";
 import { MCPToolCallDisplaySchema } from "./mcp";
 import { AgentDefinitionScopeSchema, AgentIdSchema } from "./agentDefinition";
@@ -692,6 +693,17 @@ export const GoalBudgetLimitedEventSchema = z.object({
   message: z.string(),
 });
 
+/**
+ * A plugin hook's `systemMessage` (Codex: "surfaced as a warning in the UI"). Live only: it is never
+ * saved to chat.jsonl and never sent to the model.
+ */
+export const PluginHookNoticeEventSchema = z.object({
+  type: z.literal("plugin-hook-notice"),
+  workspaceId: z.string(),
+  plugin: z.string(),
+  message: z.string(),
+});
+
 /** Wire shape of ArtifactInteractionMetadata (Artifacts M5b), for queued-message projections. */
 export const ArtifactInteractionMetadataSchema = z.object({
   id: z.string(),
@@ -858,6 +870,7 @@ export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
   // Error events
   ErrorEventSchema,
   GoalBudgetLimitedEventSchema,
+  PluginHookNoticeEventSchema,
   // Usage and queue events
   UsageDeltaEventSchema,
   SessionUsageDeltaEventSchema,
@@ -1039,7 +1052,9 @@ export const SendMessageOptionsSchema = z.object({
     .array(z.string())
     .optional()
     .meta({ description: "Tool names delegated back to ACP clients for this request" }),
-  muxMetadata: z.any().optional(), // Black box
+  // Black box, except one prompt-hook field only Xum may set: a client-supplied "hooks already
+  // ran" flag on a compaction follow-up would skip message.send.
+  muxMetadata: z.any().transform(stripClientPluginSendHookFields).optional(),
   /**
    * When true, skip persisting AI settings (e.g., for one-shot or compaction sends).
    */

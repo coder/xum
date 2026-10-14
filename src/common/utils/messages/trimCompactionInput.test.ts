@@ -270,6 +270,65 @@ describe("trimCompactionInput", () => {
     expect(trim.omittedToolResults).toBe(1);
   });
 
+  it("counts a record typed media without the media shape as text", async () => {
+    // No data or mediaType: extractToolMediaAsUserMessages leaves it in the tool-result JSON,
+    // so the provider receives its 40k characters as text, not as one attachment.
+    const messages: MuxMessage[] = [
+      createMuxMessage("m-user", "user", "describe"),
+      {
+        id: "m-assistant",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "m-call",
+            toolName: "mcp_tool",
+            input: {},
+            state: "output-available",
+            output: { type: "content", value: [{ type: "media", text: "x".repeat(40_000) }] },
+          },
+        ],
+      },
+      createMuxMessage("n-user", "user", "next"),
+      createMuxMessage("n-answer", "assistant", "ok"),
+      COMPACTION_REQUEST,
+    ];
+    const trim = await trimCompactionInput(messages, 5_000);
+    expect(trim.omittedTurns + trim.omittedToolResults).toBeGreaterThan(0);
+  });
+
+  it("states the size of the result alone in its placeholder, not of the call's input", async () => {
+    const messages: MuxMessage[] = [
+      createMuxMessage("w-user", "user", "write"),
+      {
+        id: "w-assistant",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "w-call",
+            toolName: "file_write",
+            // About 10k tokens of input, which stays in the request.
+            input: { content: "i".repeat(40_000) },
+            state: "output-available",
+            // About 1k tokens of output, which the placeholder replaces.
+            output: { content: "o".repeat(4_000) },
+          },
+        ],
+      },
+      createMuxMessage("n-user", "user", "next"),
+      createMuxMessage("n-answer", "assistant", "ok"),
+      COMPACTION_REQUEST,
+    ];
+    // Over the budget by less than the output: one placeholder fits it.
+    const trim = await trimCompactionInput(messages, tokensOf(messages) - 500);
+    expect(trim).toMatchObject({ omittedToolResults: 1, omittedTurns: 0 });
+    const placeholder = String(outputOf(trim.messages, "w"));
+    const tokens = Number(/about (\d+) tokens/.exec(placeholder)?.[1]);
+    expect(tokens).toBeGreaterThan(900);
+    expect(tokens).toBeLessThan(1_200);
+  });
+
   it("keeps the turn boundary of a reasoning-only row it removes", async () => {
     // A stream that crashed early left an assistant row with only reasoning between u2 and u3.
     const messages: MuxMessage[] = [

@@ -13,7 +13,11 @@ export const BASH_TRUNCATE_MAX_FILE_BYTES = 1024 * 1024; // 1MB file limit (same
 // tmpfile policy limits (AI agent only)
 export const BASH_MAX_LINE_BYTES = 1024; // 1KB per line for AI agent
 
-export const MAX_TODOS = 7; // Maximum number of TODO items in a list
+// Maximum number of TODO items in a list. Playbook routers (e.g. pstack) copy a playbook's 8-9
+// steps into the list before any task items, so 7 overflowed before the agent added its own work.
+// 15 fits a 9-step playbook plus a few task items while keeping the summarization pressure the
+// original cap (PR #261) added to stop 50+ item lists from costing ~2,500 tokens per update.
+export const MAX_TODOS = 15;
 
 // Init hook output limits (prevents OOM/freeze with large rsync output)
 // Keep only the most recent lines (tail), drop older lines
@@ -23,6 +27,9 @@ export const INIT_HOOK_MAX_LINES = 500;
 export const WEB_FETCH_TIMEOUT_SECS = 15; // curl timeout
 export const WEB_FETCH_MAX_OUTPUT_BYTES = 64 * 1024; // 64KB markdown output
 export const WEB_FETCH_MAX_HTML_BYTES = 5 * 1024 * 1024; // 5MB HTML input (curl --max-filesize)
+// Pinned addresses tried per request when the earlier ones are unreachable (#5977). A
+// hostname can return many addresses: each attempt is one curl process in the runtime.
+export const WEB_FETCH_MAX_ADDRESS_ATTEMPTS = 3;
 
 // Page size for long text a tool returns whole from storage (task_await reports, catalog
 // skill bodies). Since #6268 the rebuild no longer cuts tool strings at 12,000 chars, so this is

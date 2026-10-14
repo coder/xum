@@ -1,7 +1,7 @@
 import React, { useRef, useState } from "react";
 import { Check, Loader2, TriangleAlert, Trash2 } from "lucide-react";
 import { ChatDockSurface } from "@/browser/components/ChatPane/chatDockColumn";
-import { useAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
 import {
   useConfirmDialog,
   type ConfirmDialogOptions,
@@ -41,7 +41,7 @@ export interface DelegatedCreationInterruptedNoticeProps {
 export const DelegatedCreationInterruptedNotice: React.FC<
   DelegatedCreationInterruptedNoticeProps
 > = (props) => {
-  const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const [pendingAction, setPendingAction] = useState<BannerAction | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   // Synchronous guard: a second click can land before the disabled state renders.
@@ -79,8 +79,8 @@ export const DelegatedCreationInterruptedNotice: React.FC<
 
   const keep = () =>
     run("keep", async () => {
-      if (!api) return "Not connected to the backend";
-      const result = await api.workspace.keepInterruptedDelegatedWorkspace({
+      if (!liveApi) return "Not connected to the backend";
+      const result = await liveApi.workspace.keepInterruptedDelegatedWorkspace({
         workspaceId: props.workspaceId,
       });
       return result.success ? null : result.error;

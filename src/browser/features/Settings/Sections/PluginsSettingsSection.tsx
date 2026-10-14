@@ -31,6 +31,11 @@ import {
   subscribePluginsSectionIntents,
   type PluginsSectionIntent,
 } from "./pluginsSectionIntents";
+import {
+  describePluginHookHandler,
+  PLUGIN_HOOK_STATUS_NOTE,
+  PluginHooksPanel,
+} from "./PluginHooksPanel";
 
 /**
  * Settings → Plugins (global scope only).
@@ -695,6 +700,34 @@ const AddPluginPanel: React.FC<{
             </div>
           )}
 
+          {preview.codexHooks.length > 0 && (
+            <div>
+              <h4 className="text-foreground mb-1 text-xs font-medium">
+                hooks.json hooks ({preview.codexHooks.length})
+              </h4>
+              {/* Install trusts none of them (Codex trust per hash): consent must say so. */}
+              <p className="text-muted mb-1 text-xs">
+                None of these run until you trust each one in Settings → Plugins.
+              </p>
+              <ul className="space-y-1">
+                {preview.codexHooks.map((hook) => (
+                  <li key={hook.key} className="text-xs break-all">
+                    <span className="text-foreground font-mono">{hook.event}</span>
+                    {hook.matcher !== undefined && (
+                      <span className="text-muted font-mono"> ({hook.matcher})</span>
+                    )}
+                    <span className="text-muted">
+                      {" "}
+                      — {describePluginHookHandler(hook.handler)}
+                      {PLUGIN_HOOK_STATUS_NOTE[hook.status] != null &&
+                        `. ${PLUGIN_HOOK_STATUS_NOTE[hook.status] ?? ""}`}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
           {preview.hook && (
             <div>
               <h4 className="text-foreground mb-1 text-xs font-medium">Hooks</h4>
@@ -894,6 +927,9 @@ export const PluginsSettingsSection: React.FC = () => {
   const [componentsTarget, setComponentsTarget] = useState<string | null>(
     initialIntent?.type === "manage-components" ? initialIntent.name : null
   );
+  const [hooksTarget, setHooksTarget] = useState<string | null>(
+    initialIntent?.type === "review-hooks" ? initialIntent.name : null
+  );
   const [installSucceeded, setInstallSucceeded] = useState(false);
   /** Name of the plugin with an update/uninstall in flight. */
   const [busyPlugin, setBusyPlugin] = useState<string | null>(null);
@@ -983,6 +1019,9 @@ export const PluginsSettingsSection: React.FC = () => {
           break;
         case "manage-components":
           setComponentsTarget(intent.name);
+          break;
+        case "review-hooks":
+          setHooksTarget(intent.name);
           break;
         case "confirm-uninstall":
           setUninstallTarget(intent.name);
@@ -1249,6 +1288,20 @@ export const PluginsSettingsSection: React.FC = () => {
                             Manage components
                           </Button>
                         )}
+                        {item.present && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-7 px-2 text-xs"
+                            disabled={busyPlugin !== null}
+                            onClick={() =>
+                              setHooksTarget(hooksTarget === item.name ? null : item.name)
+                            }
+                            aria-label={`Review hooks for ${item.name}`}
+                          >
+                            Hooks
+                          </Button>
+                        )}
                         {updateAvailable && (
                           <Button
                             variant="outline"
@@ -1295,6 +1348,15 @@ export const PluginsSettingsSection: React.FC = () => {
                       name={item.name}
                       onSaved={refresh}
                       onClose={() => setComponentsTarget(null)}
+                    />
+                  )}
+                  {item.managed && item.present && hooksTarget === item.name && (
+                    <PluginHooksPanel
+                      // Keyed by the installed commit too: an update (here or from the palette)
+                      // remounts the panel, so it never shows the old hooks and trust states.
+                      key={`${item.name}@${item.lockedSha ?? ""}`}
+                      name={item.name}
+                      onClose={() => setHooksTarget(null)}
                     />
                   )}
                   {item.managed && updateReview?.name === item.name && (

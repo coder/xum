@@ -2,6 +2,8 @@ import { z } from "zod";
 import {
   MCP_APP_MODEL_CONTEXT_MAX_BYTES,
   MCP_APP_READ_URI_MAX_CHARS,
+  MCP_APP_TOOL_CALL_WINDOW_MS,
+  MCP_APP_TOOL_CALLS_PER_WINDOW,
 } from "@/common/utils/mcpApps";
 import type { McpAppToolCallResult } from "@/common/orpc/schemas/mcpApps";
 import { createBridgeRateLimiter } from "./artifactBridge";
@@ -26,12 +28,6 @@ const INVALID_REQUEST = -32600;
 const INVALID_PARAMS = -32602;
 const REQUEST_FAILED = -32000;
 
-/**
- * View-initiated tools/call + resources/read budget (shared: both reach the server), on top of
- * the frame's message rate limit.
- */
-const TOOL_CALLS_PER_WINDOW = 5;
-const TOOL_CALL_WINDOW_MS = 10_000;
 /**
  * Largest serialized arguments (UTF-8 bytes) of a call the user is asked to allow. The strip
  * shows the arguments in full; anything bigger cannot be reviewed, so it is declined without
@@ -208,7 +204,10 @@ export function clampMcpAppHeight(height: number): number {
 }
 
 export function createMcpAppHost(options: McpAppHostOptions) {
-  const allowServerRequest = createBridgeRateLimiter(TOOL_CALLS_PER_WINDOW, TOOL_CALL_WINDOW_MS);
+  const allowServerRequest = createBridgeRateLimiter(
+    MCP_APP_TOOL_CALLS_PER_WINDOW,
+    MCP_APP_TOOL_CALL_WINDOW_MS
+  );
   const pendingHostRequests = new Map<string, (ok: boolean) => void>();
   let nextHostRequestId = 1;
   /**

@@ -28,6 +28,7 @@ import { cn } from "@/common/lib/utils";
 import { formatNameGenerationError } from "@/common/utils/errors/formatNameGenerationError";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
+import type { BranchLoadStatus } from "./branchListLoad";
 import { DocsLink } from "@/browser/components/DocsLink/DocsLink";
 import {
   RUNTIME_CHOICE_UI,
@@ -96,8 +97,8 @@ function NameErrorDisplay(props: { error: Extract<WorkspaceNameUIError, { kind: 
 
 interface CreationControlsProps {
   branches: string[];
-  /** Whether branches have finished loading (to distinguish loading vs non-git repo) */
-  branchesLoaded: boolean;
+  /** Where the branch list stands; only a loaded empty list means a non-git repo (#6055). */
+  branchLoad: BranchLoadStatus;
   trunkBranch: string;
   onTrunkBranchChange: (branch: string) => void;
   /** Currently selected runtime (discriminated union: SSH has host, Docker has image) */
@@ -435,6 +436,51 @@ export function RuntimeButtonGroup(props: RuntimeButtonGroupProps) {
  * Prominent controls shown above the input during workspace creation.
  * Displays project name as header, workspace name with magic wand, and runtime/branch selectors.
  */
+/**
+ * The "from" branch picker: a skeleton while the list loads, the select once it loaded, and a short
+ * notice when the list failed (#6055). A failed list keeps Send off for every runtime except Local;
+ * reopening the project retries.
+ */
+function SourceBranchPicker(props: {
+  branchLoad: BranchLoadStatus;
+  trunkBranch: string;
+  onTrunkBranchChange: (branch: string) => void;
+  disabled: boolean;
+  branchOptions: string[];
+}) {
+  if (props.branchLoad === "loading") {
+    return <Skeleton className="h-7 w-full rounded md:w-[140px]" />;
+  }
+  if (props.branchLoad === "failed") {
+    return (
+      <span className="text-error text-xs" role="status">
+        Could not load branches
+      </span>
+    );
+  }
+  return (
+    <RadixSelect
+      value={props.trunkBranch}
+      onValueChange={props.onTrunkBranchChange}
+      disabled={props.disabled}
+    >
+      <SelectTrigger
+        className={cn(INLINE_CONTROL_CLASSES, "w-full md:w-[140px]")}
+        aria-label="Select source branch"
+      >
+        <SelectValue placeholder="Select source branch" />
+      </SelectTrigger>
+      <SelectContent className="border-border-medium">
+        {props.branchOptions.map((branch) => (
+          <SelectItem key={branch} value={branch}>
+            {branch}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </RadixSelect>
+  );
+}
+
 function CreationControlsContent(props: CreationControlsProps) {
   usePerfRenderMarker("chat-input.creation-controls");
   const { nameState, runtimeAvailabilityState } = props;
@@ -469,7 +515,7 @@ function CreationControlsContent(props: CreationControlsProps) {
   const isNonGitRepo =
     (availabilityMap?.worktree?.available === false &&
       availabilityMap.worktree.reason === "Requires git repository") ||
-    (props.branchesLoaded && props.branches.length === 0);
+    (props.branchLoad === "loaded" && props.branches.length === 0);
 
   const branchOptions =
     props.trunkBranch && !props.branches.includes(props.trunkBranch)
@@ -812,29 +858,13 @@ function CreationControlsContent(props: CreationControlsProps) {
                 Source Branch
               </label>
               <GitBranch className="text-muted-foreground h-3.5 w-3.5 shrink-0" />
-              {props.branchesLoaded ? (
-                <RadixSelect
-                  value={props.trunkBranch}
-                  onValueChange={props.onTrunkBranchChange}
-                  disabled={isBranchSelectorDisabled}
-                >
-                  <SelectTrigger
-                    className={cn(INLINE_CONTROL_CLASSES, "w-full md:w-[140px]")}
-                    aria-label="Select source branch"
-                  >
-                    <SelectValue placeholder="Select source branch" />
-                  </SelectTrigger>
-                  <SelectContent className="border-border-medium">
-                    {branchOptions.map((branch) => (
-                      <SelectItem key={branch} value={branch}>
-                        {branch}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </RadixSelect>
-              ) : (
-                <Skeleton className="h-7 w-full rounded md:w-[140px]" />
-              )}
+              <SourceBranchPicker
+                branchLoad={props.branchLoad}
+                trunkBranch={props.trunkBranch}
+                onTrunkBranchChange={props.onTrunkBranchChange}
+                disabled={isBranchSelectorDisabled}
+                branchOptions={branchOptions}
+              />
             </div>
           </div>
           {/* end mobile row wrapper */}
@@ -1077,7 +1107,7 @@ export function CreationControls(props: CreationControlsProps) {
   return (
     <CreationControlsContent
       branches={props.branches}
-      branchesLoaded={props.branchesLoaded}
+      branchLoad={props.branchLoad}
       trunkBranch={props.trunkBranch}
       onTrunkBranchChange={props.onTrunkBranchChange}
       selectedRuntime={props.selectedRuntime}

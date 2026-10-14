@@ -136,7 +136,8 @@ export type SkillsCatalogReadToolResult =
       owner: string;
       repo: string;
       path: string;
-      frontmatter: AgentSkillFrontmatter;
+      /** On the first page only (no offset_chars). */
+      frontmatter?: AgentSkillFrontmatter;
       body: string;
       url: string;
       /** Set when body is one page of a longer body (see offset_chars). */
