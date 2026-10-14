@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Sourced by .xum/tool_pre and .xum/tool_post. Xum runs a project hook instead
 # of the user's hook of the same name in the Xum home (~/.xum), because the
 # first hook file found wins. So these hooks run the user's hook last, through

@@ -5,7 +5,6 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import {
   cpSync,
-  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -251,7 +250,10 @@ function userHook(home: string, name: "tool_pre" | "tool_post", status: number):
 
 function runHook(hook: string, script: string, extraEnv: NodeJS.ProcessEnv = {}) {
   // Without these, the hooks look for the user's hook in the test's own HOME.
-  const { XUM_ROOT: _x, MUX_ROOT: _m, NODE_ENV: _n, ...env } = GIT_ENV;
+  const env: NodeJS.ProcessEnv = { ...GIT_ENV };
+  delete env.XUM_ROOT;
+  delete env.MUX_ROOT;
+  delete env.NODE_ENV;
   const result = spawnSync(hook, [], {
     cwd: repo,
     env: {
