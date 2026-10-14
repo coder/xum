@@ -1,11 +1,15 @@
 // Quality / CRAP (.github/workflows/pr.yml): run check.ts on the PR with every
 // downloaded shard LCOV, then write a step summary and warning annotations.
-// The job is informational, so this script always exits 0: a violation, a
-// missing artifact or a broken scorer is reported, never a failed check.
+// In warn mode (the default) this script always exits 0. In block mode
+// (CRAP_MODE=block, from the repo variable) it exits 1 when violations remain
+// (exitCode). A missing artifact or a broken scorer never blocks: a missing
+// report only makes coverage-based findings warn, and a tool error exits 0.
 //
 // Env: BASE_REF, LCOV_DIR (one folder per `crap-lcov-<lane>-<shard>` artifact),
-// EXPECTED_UNIT and EXPECTED_INTEGRATION (shard counts), CRAP_DEBT_LABEL
-// ("true" when the PR has the crap-debt label), GITHUB_STEP_SUMMARY.
+// EXPECTED_UNIT and EXPECTED_INTEGRATION (shard counts), INTEGRATION_RAN
+// ("false" when the changes job skipped integration tests), CRAP_MODE,
+// CRAP_DEBT_LABEL ("true" when the PR has the crap-debt label),
+// GITHUB_STEP_SUMMARY.
 import { spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
@@ -15,6 +19,34 @@ export interface CheckReport {
   findings: Finding[];
   debt: DebtUse[];
   ok: boolean;
+}
+
+export type CrapMode = "warn" | "block";
+
+/** Block mode only for the exact value "block": anything else, unset included, warns. */
+export function crapMode(value: string | undefined): CrapMode {
+  return value === "block" ? "block" : "warn";
+}
+
+/** 1 only in block mode with a report that has violations; a tool error (no report) never blocks. */
+export function exitCode(mode: CrapMode, report: CheckReport | null): number {
+  return mode === "block" && report !== null && !report.ok ? 1 : 0;
+}
+
+/**
+ * Shard counts the report needs to be complete. Integration shards run tests
+ * only when the PR changes backend or browser files (pr.yml test-integration),
+ * so when the changes job says they skip, none is expected and the report
+ * still counts as complete.
+ */
+export function expectedShards(env: Record<string, string | undefined>): {
+  unit: number;
+  integration: number;
+} {
+  return {
+    unit: Number(env.EXPECTED_UNIT ?? 0),
+    integration: env.INTEGRATION_RAN === "false" ? 0 : Number(env.EXPECTED_INTEGRATION ?? 0),
+  };
 }
 
 export interface CoverageStatus {
@@ -96,12 +128,13 @@ export function summary(
   report: CheckReport | null,
   status: CoverageStatus,
   expected: { unit: number; integration: number },
-  toolError: string
+  toolError: string,
+  mode: CrapMode = "warn"
 ): string {
   const coverage = `${status.partial ? "Partial coverage" : "Coverage"}: ${status.unit}/${expected.unit} unit and ${status.integration}/${expected.integration} integration shard reports.`;
   const incomplete = incompleteCoverageReason(status, expected);
   const lines = [
-    "## Quality / CRAP (informational)",
+    mode === "block" ? "## Quality / CRAP (block mode)" : "## Quality / CRAP (warn mode: informational)",
     "",
     coverage,
     ...(incomplete === null
@@ -184,12 +217,10 @@ export function lcovFiles(dir: string): {
   return { artifacts, files, withoutCoverage };
 }
 
-function main(): void {
+function main(): number {
   const env = process.env;
-  const expected = {
-    unit: Number(env.EXPECTED_UNIT ?? 0),
-    integration: Number(env.EXPECTED_INTEGRATION ?? 0),
-  };
+  const mode = crapMode(env.CRAP_MODE);
+  const expected = expectedShards(env);
   const { artifacts, files, withoutCoverage } = lcovFiles(env.LCOV_DIR ?? "coverage-shards");
   const status = coverageStatus(artifacts, expected, withoutCoverage);
   const args = [join(import.meta.dir, "check.ts"), "--base", env.BASE_REF ?? "", "--json"];
@@ -205,15 +236,17 @@ function main(): void {
   if (report === null)
     console.log(`::warning title=CRAP::crap-check failed: ${escapeData(toolError.trim())}`);
   for (const finding of report?.findings ?? []) console.log(annotation(finding));
-  const text = summary(report, status, expected, toolError);
+  const text = summary(report, status, expected, toolError, mode);
   console.log(text);
   if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, text);
+  return exitCode(mode, report);
 }
 
 if (import.meta.main) {
   try {
-    main();
+    process.exitCode = main();
   } catch (error) {
+    // A crash in this script is a tool error: it never blocks, in either mode.
     console.log(`::warning title=CRAP::Quality / CRAP failed: ${escapeData(String(error))}`);
   }
 }
